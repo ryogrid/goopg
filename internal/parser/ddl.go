@@ -628,6 +628,22 @@ func (p *parser) parseCreate() (Stmt, error) {
 			schemaName = tok.Value
 			p.advance()
 		}
+		var authRole string
+		if p.acceptIdentKeyword("authorization") {
+			if tok := p.cur(); tok.Kind == TokenIdent || tok.Kind == TokenKeyword || tok.Kind == TokenQuotedIdent {
+				authRole = strings.ToLower(tok.Value)
+				p.advance()
+			}
+		}
+		var subElemSchema string
+		var hasSubElem bool
+		if tok := p.cur(); tok.Kind == TokenKeyword && strings.EqualFold(tok.Value, "create") {
+			subElemSchema, hasSubElem = p.captureCreateSchemaSubElementSchema()
+		}
+		// The parser has no grammar for CREATE SCHEMA's element list
+		// (SEQUENCE/TABLE/VIEW/INDEX/TRIGGER/GRANT sub-commands) — skip
+		// whatever captureCreateSchemaSubElementSchema above did not already
+		// consume, same as before M0134-0115.
 		for {
 			tok := p.cur()
 			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -635,7 +651,8 @@ func (p *parser) parseCreate() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SCHEMA", ObjType: "schema", ObjName: ObjectName{Name: schemaName}}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SCHEMA", ObjType: "schema", ObjName: ObjectName{Name: schemaName},
+			SchemaAuthRole: authRole, SchemaSubElementSchema: subElemSchema, SchemaHasSubElement: hasSubElem}, nil
 	// CREATE EXTENSION name [WITH] [SCHEMA s] [VERSION v] [CASCADE] — inserts a
 	// pg_extension row (e.g. amcheck). M0110-0003.
 	case p.acceptIdentKeyword("extension"):
@@ -646,6 +663,76 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return p.parseCreateTablespaceTail(t.Pos)
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, TRIGGER, EXTENSION, or TABLESPACE after CREATE")
+}
+
+// captureCreateSchemaSubElementSchema is called with p positioned at a
+// CREATE SCHEMA statement's embedded `CREATE <element>` sub-command (cur()
+// is the "create" keyword). It advances past enough of that sub-command to
+// find its target object name and reports the name's schema qualification
+// (ObjectName.Schema from parseObjectName), or hasTarget=false when the
+// element kind isn't one of the SEQUENCE/TABLE/VIEW/INDEX ON/TRIGGER ON
+// forms create_schema.sql exercises, or the target carried no explicit
+// qualification. Any tokens not consumed here are swept up by the caller's
+// existing skip-to-semicolon loop — goopg has no execution path for the
+// sub-command itself (M0134-0009/M0134-0115), only this schema-mismatch
+// check (parse_utilcmd.c's setSchemaName).
+func (p *parser) captureCreateSchemaSubElementSchema() (schema string, hasTarget bool) {
+	p.advance() // consume "create"
+	kindTok := p.cur()
+	kind := strings.ToLower(kindTok.Value)
+	switch kind {
+	case "sequence", "table", "view":
+		p.advance()
+		if strings.EqualFold(p.cur().Value, "if") {
+			p.advance()
+			if strings.EqualFold(p.cur().Value, "not") {
+				p.advance()
+			}
+			if strings.EqualFold(p.cur().Value, "exists") {
+				p.advance()
+			}
+		}
+		name, err := p.parseObjectName()
+		if err != nil || name.Schema == "" {
+			return "", false
+		}
+		return name.Schema, true
+	case "index":
+		p.advance()
+		if strings.EqualFold(p.cur().Value, "concurrently") {
+			p.advance()
+		}
+		if tok := p.cur(); !strings.EqualFold(tok.Value, "on") && (tok.Kind == TokenIdent || tok.Kind == TokenQuotedIdent) {
+			p.advance() // optional index name
+		}
+		if !strings.EqualFold(p.cur().Value, "on") {
+			return "", false
+		}
+		p.advance()
+		name, err := p.parseObjectName()
+		if err != nil || name.Schema == "" {
+			return "", false
+		}
+		return name.Schema, true
+	case "trigger":
+		p.advance()
+		for {
+			tok := p.cur()
+			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+				return "", false
+			}
+			if tok.Kind == TokenKeyword && strings.EqualFold(tok.Value, "on") {
+				p.advance()
+				name, err := p.parseObjectName()
+				if err != nil || name.Schema == "" {
+					return "", false
+				}
+				return name.Schema, true
+			}
+			p.advance()
+		}
+	}
+	return "", false
 }
 
 // scanUserMappingForServer loosely scans the tail of a
@@ -2327,6 +2414,7 @@ func (p *parser) parseCreateEventTriggerTail(pos int) (Stmt, error) {
 				return nil, p.errAtCur("expected '(' after IN")
 			}
 			stmt.FilterVar = filterVar.Value
+			stmt.FilterVars = append(stmt.FilterVars, filterVar.Value)
 			for {
 				if p.cur().Kind != TokenStringLit {
 					return nil, p.errAtCur("expected string literal in filter value list")
@@ -3757,6 +3845,29 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		}
 		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, MethodPos: methodPos, KeyCols: keyCols, KeyColPos: keyColPos, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 	}
+	// Optional table_access_method_clause: `USING <access_method>`. PG's
+	// gram.y OptTableElementList production order is OptInherit
+	// OptPartitionSpec table_access_method_clause OptWith OnCommitOption
+	// OptTableSpace, so USING lands here — between PARTITION BY and WITH.
+	// This arm previously omitted it entirely (only the PARTITION-OF child
+	// arm at :3546 and CREATE MATERIALIZED VIEW's tail had it), so any plain
+	// `CREATE TABLE t (...) USING <am>` — including `USING heap`, the
+	// explicit-default spelling pg_dump/psql regress emit — 42601'd with
+	// "syntax error at or near "using"" before reaching WITH/TABLESPACE.
+	// goopg has a single real storage engine (heap); like the partition-child
+	// arm, the access method name is accepted and discarded here — relam
+	// stays at its default and pg_dump emits no USING clause for a plain
+	// heap-AM table. A non-heap AM registered via CREATE ACCESS METHOD (e.g.
+	// this file's own `heap_psql`, whose HANDLER is heap_tableam_handler —
+	// i.e. it IS the heap AM under an alias) round-trips identically to
+	// `heap` today; a genuinely distinct custom table access method would
+	// still need real storage-layer dispatch, which this slice does not add.
+	// M0134-0155.
+	if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
+		if _, err := p.parseIdent(); err != nil {
+			return nil, err
+		}
+	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()
 		if err != nil {
@@ -4226,6 +4337,13 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 				_, _ = p.parseColumnNameList()
 				_ = p.acceptSymbol(")")
 			}
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUsing:
+			// table_access_method_clause on the empty-column-list arm
+			// (`CREATE TABLE t () USING <am>`) — sibling of the main
+			// non-empty-column arm's USING handling added alongside it.
+			// M0134-0155.
+			p.advance()
+			_, _ = p.parseIdent()
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith:
 			p.advance()
 			// WITH OIDS (no parens) is a syntax error in PG; only WITH (oids) is accepted.
@@ -4366,8 +4484,12 @@ func (p *parser) parsePartitionBoundValues() ([]Expr, error) {
 // storage on the catalog column. PG accepts "pglz", "lz4", and "default"
 // (case-insensitive); "default" resets attcompression to '\0' (the
 // default_toast_compression GUC applies) and is recorded as the empty string, so
-// no SET COMPRESSION clause is dumped. Any other / empty token also normalizes to
-// "" — goopg does not enforce the method, this is dump-fidelity only.
+// no SET COMPRESSION clause is dumped. An empty input also normalizes to "".
+// Any other token is passed through lowercased (identifiers are already
+// lexer-lowercased when unquoted) rather than silently discarded to "" — the
+// executor validates it against GetAttributeCompression's rules
+// (validateColumnCompression, tablecmds.c:22043-22076) and raises "invalid
+// compression method" (22023) for anything unrecognized. M0134-0105.
 // DU-002 slice 183.
 func normalizeCompressionMethod(method string) string {
 	switch strings.ToLower(method) {
@@ -4375,8 +4497,10 @@ func normalizeCompressionMethod(method string) string {
 		return "pglz"
 	case "lz4":
 		return "lz4"
-	default:
+	case "", "default":
 		return ""
+	default:
+		return strings.ToLower(method)
 	}
 }
 
@@ -5528,6 +5652,21 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 							if v, err := p.parseIntLit(); err == nil {
 								stmt.PagesPerRange = int(v)
 							}
+							continue
+						}
+					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "buffering" {
+					// GiST enum storage parameter (on/off/auto). Record the raw
+					// lowercased value verbatim (including invalid ones) so
+					// execCreateIndex can raise PG's exact enum-validation error;
+					// an unrecognized value here is a semantic error, not a parse
+					// error, in real PG. M0134-0127.
+					p.advance() // consume "buffering"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if p.cur().Kind == TokenIdent {
+							stmt.Buffering = strings.ToLower(p.cur().Value)
+							p.advance()
 							continue
 						}
 					}
@@ -10325,7 +10464,13 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 	// Look for AS ENUM; anything else is consumed as a stub.
 	if !p.acceptKeyword(KwAs) {
 		// No AS — consume until ';' or EOF (composite-type without AS, or
-		// other non-enum forms). Return a non-enum stub.
+		// other non-enum forms). Return a non-enum stub. A `(` immediately
+		// following the name distinguishes the "base type" option-list form
+		// (`CREATE TYPE name (input = ..., ...)`) from the bare shell form
+		// (`CREATE TYPE name;`) — see CreateTypeStmt.HasOptions. M0134-0116.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			stmt.HasOptions = true
+		}
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break

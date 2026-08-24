@@ -2565,6 +2565,28 @@ func nodeReferencesOuter(n Node) bool {
 		// WITH ORDINALITY wraps the underlying SRF node; unwrap so a
 		// correlated argument is still detected under the wrapper.
 		return nodeReferencesOuter(x.Child)
+	case *ScalarFuncScan:
+		// A user-defined non-SETOF routine used as a FROM source, e.g.
+		// `FROM t, LATERAL f(t.col)`; the arg resolves to a plain
+		// *ColumnRef against the left sibling's schema (same convention as
+		// PgGetPublicationTables above) and scalarFuncScanOp reads
+		// ctx.OuterRows-independent BindLateralOuter instead. M0134-0126.
+		if fc, ok := x.Func.(*FuncCall); ok {
+			for _, a := range fc.Args {
+				if exprContainsColumnRef(a) {
+					return true
+				}
+			}
+		}
+		return false
+	case *UserSrfScan:
+		// Same as *ScalarFuncScan, for the SETOF sibling. M0134-0126.
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	}
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
@@ -4558,6 +4580,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_get_catalog_foreign_keys") {
+		return planPgGetCatalogForeignKeys(rv, sourceIdx)
+	}
 	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
 		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
 	}
@@ -4650,7 +4675,22 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		if rs := cat.Routines(); rs != nil {
 			cands := rs.LookupByName(parser.ObjectName{Name: tf.Name})
 			for _, r := range cands {
-				ctx := &resolveContext{}
+				// Wire lateral siblings + outer-scope parent chain so
+				// correlated references (e.g. `lateral f(t.col)`, or a bare
+				// column from an earlier FROM item / VALUES row / SRF)
+				// resolve — mirrors the generate_series /
+				// pg_options_to_table arg-context construction above.
+				// M0134-0126.
+				ctx := &resolveContext{cat: cat, parent: planParent}
+				if lateralCtx != nil {
+					if lateralCtx.parent == nil {
+						cp := *lateralCtx
+						cp.parent = planParent
+						ctx = &cp
+					} else {
+						ctx = lateralCtx
+					}
+				}
 				resolvedArgs := make([]Expr, len(tf.Args))
 				for i, a := range tf.Args {
 					re, err := resolveExpr(a, ctx)
@@ -5388,6 +5428,36 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgGetCatalogForeignKeys routes a FROM-clause invocation of
+// pg_get_catalog_foreign_keys() into a PgGetCatalogForeignKeys plan node.
+// M0134-0146.
+func planPgGetCatalogForeignKeys(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_get_catalog_foreign_keys"
+	}
+	colNames := []string{"fktable", "fkcols", "pktable", "pkcols", "is_array", "is_opt"}
+	colTypes := []catalog.Type{
+		{Name: "regclass"},
+		{Name: "text", IsArray: true},
+		{Name: "regclass"},
+		{Name: "text", IsArray: true},
+		{Name: "bool"},
+		{Name: "bool"},
+	}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: colTypes[i], SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: colTypes[i], Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgGetCatalogForeignKeys{pos: tf.Pos(), schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -11967,7 +12037,25 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 			}
 			return "array", exprType(e)
 		}
-		return fc.Name, exprType(e)
+		// array_slice is the lowered form of arr[lower:upper]. PG's
+		// FigureColnameInternal (parse_target.c T_A_Indirection) skips pure
+		// subscripts/slices entirely (no field-name String in the
+		// indirection list) and recurses into the base expression's own
+		// name — e.g. `(array_agg(x))[1:2]` labels as "array_agg", not a
+		// name derived from the slice itself. M0134-0079.
+		if fc.Name == "array_slice" && len(fc.Args) > 0 {
+			name, _ := targetMeta(fc.Args[0], t)
+			return name, exprType(e)
+		}
+		// PostgreSQL's FigureColnameInternal uses only the function's own
+		// name (parse_target.c: strVal(llast(fc->funcname))), never any
+		// schema qualifier — e.g. pg_catalog.set_config(...) labels as
+		// "set_config", not "pg_catalog.set_config". M0134-0144.
+		label := fc.Name
+		if idx := strings.LastIndexByte(label, '.'); idx >= 0 {
+			label = label[idx+1:]
+		}
+		return label, exprType(e)
 	}
 	// CASE expression: PostgreSQL's FigureColname() tries ELSE first, then
 	// each WHEN result, then falls back to "case". M0097-0065.
@@ -12738,6 +12826,18 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "numeric"}
 		case "power", "exp", "ln", "log", "sqrt":
 			return catalog.Type{Name: "float8"}
+		case "radius", "diameter":
+			// radius(circle)/diameter(circle) → float8 (circle_radius /
+			// circle_diameter, geo_ops.c). Without this arm the FuncCall
+			// falls through to "unknown", which psql renders left-justified
+			// (text-like, no right-justify padding) instead of numeric —
+			// same category of gap as pg_notification_queue_usage above
+			// (M0134-0091). M0134-0098.
+			return catalog.Type{Name: "float8"}
+		case "center":
+			// center(circle)/center(box) → point (circle_center /
+			// box_center, geo_ops.c). M0134-0098.
+			return catalog.Type{Name: "point"}
 		case "uuid_extract_version":
 			return catalog.Type{Name: "int2"}
 		case "uuid_extract_timestamp":
@@ -12749,6 +12849,13 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		case "random", "random_normal", "drandom":
 			// random() → float8 in [0,1). M0097-0042.
+			return catalog.Type{Name: "float8"}
+		case "pg_notification_queue_usage":
+			// pg_notification_queue_usage() → float8 in [0,1] (async.c). Without
+			// this arm the FuncCall falls through to "unknown", which psql
+			// renders left-justified (text-like) instead of right-justified
+			// numeric — diverges from the PG oracle's `async.sql` expected
+			// output even though the runtime value is correct. M0134-0091.
 			return catalog.Type{Name: "float8"}
 		case "generate_series":
 			// generate_series returns int4 for int4 args or integer literals (PG overload rules).
@@ -13693,6 +13800,32 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	case *parser.ArraySubscriptExpr:
+		if x.IsSlice {
+			// expr[lower:upper] — array slice access. Convert to
+			// array_slice(base, lower, upper) with either bound possibly
+			// a NullConst literal marking "omitted" (defaults to that
+			// dimension's actual bound at eval time). M0134-0079.
+			base, err := resolveExpr(x.Base, ctx)
+			if err != nil {
+				return nil, err
+			}
+			var lower, upper Expr = Expr(&NullConst{pos: x.Pos()}), Expr(&NullConst{pos: x.Pos()})
+			if x.Index != nil {
+				lower, err = resolveExpr(x.Index, ctx)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if x.Upper != nil {
+				upper, err = resolveExpr(x.Upper, ctx)
+				if err != nil {
+					return nil, err
+				}
+			}
+			sl := &FuncCall{pos: x.Pos(), Name: "array_slice", Args: []Expr{base, lower, upper}}
+			sl.ReturnType = exprType(base).Name
+			return sl, nil
+		}
 		// expr[index] — array element access. Convert to array_subscript(base, index)
 		// so the executor can handle it without a new plan node type. M0097-0003.
 		base, err := resolveExpr(x.Base, ctx)
@@ -13757,7 +13890,39 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 			level++
 		}
 	}
-	return nil, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+	pe := &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+	// Unqualified miss: PG's errorMissingColumn (parse_relation.c) still
+	// scans the local FROM-clause namespace for a near-miss and hints with
+	// the RTE-qualified name of the match, even though the original
+	// reference carried no qualifier — e.g. `SELECT real_nam` against
+	// `FROM t AS x(real_name)` hints `"x.real_name"`. M0134-0120.
+	if x.Table == "" && x.Schema == "" {
+		if hint := suggestColumnHintAllBindings(ctx, x.Column); hint != "" {
+			pe.Hint = hint
+		}
+	}
+	return nil, pe
+}
+
+// suggestColumnHintAllBindings scans the local (non-qualifiedOnly) FROM-clause
+// bindings of ctx for a column whose name is within edit distance 1 of want,
+// returning the first match's suggestColumnHint text (qualified with the
+// binding's alias, or its underlying table name when unaliased). Returns ""
+// when nothing close enough is found. M0134-0120.
+func suggestColumnHintAllBindings(ctx *resolveContext, want string) string {
+	for _, b := range ctx.bindings {
+		if b.qualifiedOnly {
+			continue
+		}
+		qualifier := b.alias
+		if qualifier == "" {
+			qualifier = b.table.Name
+		}
+		if hint := suggestColumnHint(b.table.Columns, qualifier, want); hint != "" {
+			return hint
+		}
+	}
+	return ""
 }
 
 // resolveColumnRefAt tries to resolve x against a single
@@ -14778,27 +14943,33 @@ func suggestColumnHint(cols []catalog.Column, qualifier, want string) string {
 // columnEditDistance1 returns true when a and b differ by at most one
 // insertion, deletion, or substitution (single edit distance ≤ 1).
 func columnEditDistance1(a, b string) bool {
-	la, lb := len(a), len(b)
+	// Compare by rune, not byte: PG's varstr_levenshtein (fuzzystrmatch's
+	// engine, reused by errorMissingColumn's ruleutils suggestion) measures
+	// CHARACTER distance, so a single non-ASCII character inserted/removed
+	// (e.g. "real_name" vs "real§_name", § = 2 UTF-8 bytes) must still count
+	// as edit distance 1, not 2. M0134-0120.
+	ra, rb := []rune(a), []rune(b)
+	la, lb := len(ra), len(rb)
 	if la == lb {
 		diff := 0
-		for i := range a {
-			if a[i] != b[i] {
+		for i := range ra {
+			if ra[i] != rb[i] {
 				diff++
 			}
 		}
 		return diff == 1
 	}
 	if la > lb {
-		a, b, la, lb = b, a, lb, la
+		ra, rb, la, lb = rb, ra, lb, la
 	}
 	// la < lb; if lb-la > 1 can't be edit-1
 	if lb-la > 1 {
 		return false
 	}
 	// deletion from b gives a
-	for i := range b {
-		candidate := b[:i] + b[i+1:]
-		if candidate == a {
+	for i := range rb {
+		candidate := append(append([]rune{}, rb[:i]...), rb[i+1:]...)
+		if string(candidate) == string(ra) {
 			return true
 		}
 	}

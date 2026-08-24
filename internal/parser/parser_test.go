@@ -297,6 +297,73 @@ func TestParseShowSetReset(t *testing.T) {
 			t.Fatalf("unexpected: %+v", s)
 		}
 	})
+	// M0134-0155: SET ROLE is dispatched via PG's generic_set grammar
+	// (gram.y:1656-1693 `var_name TO var_list | var_name '=' var_list`), so
+	// the TO/= separator spellings must parse identically to the bare form.
+	t.Run("set role to name", func(t *testing.T) {
+		stmts, err := Parse("SET ROLE TO some_role")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Default || s.Name != "role" || s.Value != "some_role" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set role equals name", func(t *testing.T) {
+		stmts, err := Parse("SET ROLE = some_role")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Default || s.Name != "role" || s.Value != "some_role" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set role to default", func(t *testing.T) {
+		stmts, err := Parse("SET ROLE TO DEFAULT")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if !s.Default || s.Name != "role" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set session authorization name", func(t *testing.T) {
+		stmts, err := Parse("SET SESSION AUTHORIZATION alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Default || s.Local || s.Name != "session_authorization" || s.Value != "alice" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	// M0134-0155: SESSION AUTHORIZATION deliberately has NO generic_set
+	// grammar upstream (gram.y:1764/:1774 dedicated productions accept only a
+	// bare rolename or DEFAULT), so the TO/= spellings are 42601 syntax
+	// errors in PG 18.3 (oracle-verified) and must stay rejected here.
+	t.Run("set session authorization rejects TO", func(t *testing.T) {
+		if _, err := Parse("SET SESSION AUTHORIZATION TO alice"); err == nil {
+			t.Fatal("SET SESSION AUTHORIZATION TO alice: want parse error, got none")
+		}
+	})
+	t.Run("set local session authorization name", func(t *testing.T) {
+		stmts, err := Parse("SET LOCAL SESSION AUTHORIZATION bob")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Default || !s.Local || s.Name != "session_authorization" || s.Value != "bob" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set local session authorization rejects equals", func(t *testing.T) {
+		if _, err := Parse("SET LOCAL SESSION AUTHORIZATION = bob"); err == nil {
+			t.Fatal("SET LOCAL SESSION AUTHORIZATION = bob: want parse error, got none")
+		}
+	})
 	t.Run("set role default", func(t *testing.T) {
 		stmts, err := Parse("SET ROLE DEFAULT")
 		if err != nil {

@@ -195,3 +195,160 @@ def escape_embedded_pipes(cell_text: str) -> str:
     which makes the operation idempotent.
     """
     return _BARE_PIPE.sub(r"\\|", cell_text)
+
+
+# ---------------------------------------------------------------------------
+# Raw-HTML escaping
+# ---------------------------------------------------------------------------
+#
+# A GFM table cell is inline content, so a ``<tag>`` written in prose is
+# parsed as *raw HTML*, not as text.  Two things then go wrong on GitHub:
+#
+# * A placeholder whose name is not a real element — ``base/<db>/2611``,
+#   ``REINDEX INDEX <name>`` — is dropped by GitHub's HTML sanitizer, so the
+#   rendered cell silently loses the word.
+# * A placeholder whose name *is* a real element — ``<table>_<col>_check`` —
+#   is kept, and an unbalanced ``<table>`` opens a NESTED table inside the
+#   cell that swallows every following row of the outer table.  One such
+#   cell breaks the whole rest of the document's rendering.
+#
+# The repair is to write the ``<`` as ``&lt;``: GitHub then renders the
+# placeholder literally and no element is opened.  Backtick spans are left
+# alone — inline code is parsed before raw HTML, so ``` `<table>` ``` is
+# already safe.
+
+# Inline elements an author may legitimately hand-write inside a cell.
+_INLINE_HTML_ALLOWLIST = frozenset(
+    {
+        "a", "b", "br", "code", "del", "em", "i", "img", "ins", "kbd",
+        "mark", "s", "small", "strong", "sub", "sup", "u",
+    }
+)
+
+# CommonMark raw-HTML forms: open/close tag, comment, processing
+# instruction, declaration, CDATA.
+_HTML_LIKE = re.compile(
+    r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*?)?/?>"
+    r"|<!--.*?-->"
+    r"|<[?!][^>]*>",
+    re.DOTALL,
+)
+
+# An autolink (``<https://…>``, ``<user@host>``) is legitimate markdown and
+# must survive untouched, even though it matches the tag pattern above.
+_AUTOLINK = re.compile(
+    r"<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^<>\s]*>"
+    r"|<[^<>\s@]+@[^<>\s@.]+\.[^<>\s@]+>"
+)
+
+_TAG_NAME = re.compile(r"</?([A-Za-z][A-Za-z0-9-]*)")
+
+
+# Elements GitHub's sanitizer keeps.  A stray one of these does not just
+# vanish — it opens a real element inside the cell, and an unbalanced
+# ``<table>`` swallows every following row of the outer table.
+_SANITIZER_KEEPS = frozenset(
+    {
+        "table", "thead", "tbody", "tfoot", "tr", "td", "th", "col",
+        "colgroup", "caption", "div", "p", "span", "ul", "ol", "li", "dl",
+        "dt", "dd", "pre", "blockquote", "details", "summary", "hr",
+        "h1", "h2", "h3", "h4", "h5", "h6", "figure", "figcaption",
+    }
+)
+
+
+def raw_html_tag_names(cell_text: str) -> list[str]:
+    """Return the lowercased names of the tags ``escape_html_tags`` rewrites.
+
+    Callers use it to say *why* a cell is broken: a name in
+    ``_SANITIZER_KEEPS`` opens an element that damages the rows after it,
+    while any other name is silently deleted from the rendered cell.
+    """
+    names: list[str] = []
+    for start, text in _escapable_html_spans(cell_text):
+        del start
+        name_match = _TAG_NAME.match(text)
+        names.append(name_match.group(1).lower() if name_match else "")
+    return names
+
+
+def is_structural_html(name: str) -> bool:
+    """Return True if *name* survives GitHub's sanitizer as a real element."""
+    return name in _SANITIZER_KEEPS
+
+
+def _escapable_html_spans(cell_text: str) -> list[tuple[int, str]]:
+    """Return (offset, text) for every raw-HTML run that must be escaped."""
+    if "<" not in cell_text:
+        return []
+
+    protected = _find_backtick_spans(cell_text)
+    found: list[tuple[int, str]] = []
+    for match in _HTML_LIKE.finditer(cell_text):
+        start = match.start()
+        if any(lo <= start < hi for lo, hi in protected):
+            continue
+        if _AUTOLINK.match(cell_text, start, match.end()):
+            continue
+        name_match = _TAG_NAME.match(match.group(0))
+        if name_match and name_match.group(1).lower() in _INLINE_HTML_ALLOWLIST:
+            continue
+        found.append((start, match.group(0)))
+    return found
+
+
+def escape_html_tags(cell_text: str) -> str:
+    """Escape raw-HTML-looking ``<…>`` runs in *cell_text* as ``&lt;…>``.
+
+    Only the opening ``<`` is rewritten; a bare ``>`` carries no meaning in
+    inline context, so leaving it alone keeps the diff minimal and makes the
+    operation idempotent (``&lt;table>`` no longer matches).
+
+    Left untouched: backtick code spans, markdown autolinks, and the
+    hand-written inline elements in ``_INLINE_HTML_ALLOWLIST``.
+    """
+    escape_at = [start for start, _ in _escapable_html_spans(cell_text)]
+    if not escape_at:
+        return cell_text
+
+    out: list[str] = []
+    prev = 0
+    for pos in escape_at:
+        out.append(cell_text[prev:pos])
+        out.append("&lt;")
+        prev = pos + 1
+    out.append(cell_text[prev:])
+    return "".join(out)
+
+
+def has_code_span(text: str) -> bool:
+    """Return True if *text* contains at least one backtick code span."""
+    return bool(_find_backtick_spans(text))
+
+
+def separator_space_positions(text: str) -> list[int]:
+    """Return the offsets of spaces where a lost ``|`` could be re-inserted.
+
+    A well-formed separator is written `` | ``, so when the ``|`` alone is
+    dropped the boundary survives as ordinary whitespace between two words.
+    Only spaces OUTSIDE backtick spans qualify: a separator can never have
+    stood inside `` `code` ``, and splitting there would tear a code span in
+    half.  Spaces belonging to an escaped ``\\|`` are excluded for the same
+    reason.
+    """
+    protected = _find_backtick_spans(text)
+    escaped = _find_escaped_pipe_positions(text)
+    blocked = set()
+    for pos in escaped:
+        blocked.update({pos - 1, pos, pos + 1, pos + 2})
+
+    positions: list[int] = []
+    for idx, ch in enumerate(text):
+        if ch not in " \t":
+            continue
+        if idx in blocked:
+            continue
+        if any(lo <= idx < hi for lo, hi in protected):
+            continue
+        positions.append(idx)
+    return positions

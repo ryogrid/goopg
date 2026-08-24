@@ -165,6 +165,57 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = "invalid input syntax for type tid: \"" + v + "\""
 			sqlCode = "22P02"
 		}
+	case "line":
+		// line: agrees with the typed-literal/coercion path, same
+		// parseLineLiteral, including its SQLSTATE-differentiated overflow
+		// (22003) and semantic-validation (A/B-zero, non-distinct-points)
+		// error text. M0134-0136.
+		if _, _, _, lerr := parseLineLiteral(v); lerr != nil {
+			message = lerr.Message
+			sqlCode = lerr.Code
+		}
+	case "lseg":
+		// lseg: agrees with the column-coercion path, same parseLsegLiteral.
+		// M0134-0137.
+		if _, _, _, _, lerr := parseLsegLiteral(v); lerr != nil {
+			message = lerr.Message
+			sqlCode = lerr.Code
+		}
+	case "path":
+		// path: agrees with the column-coercion path, same parsePathLiteral.
+		// M0134-0149.
+		if _, _, perr := parsePathLiteral(v); perr != nil {
+			message = perr.Message
+			sqlCode = perr.Code
+		}
+	case "point":
+		// point: agrees with the column-coercion path, same
+		// parsePointLiteral. M0134-0150.
+		if _, _, perr := parsePointLiteral(v); perr != nil {
+			message = perr.Message
+			sqlCode = perr.Code
+		}
+	case "polygon":
+		// polygon: agrees with the column-coercion path, same
+		// parsePolygonLiteral. M0134-0151.
+		if _, perr := parsePolygonLiteral(v); perr != nil {
+			message = perr.Message
+			sqlCode = perr.Code
+		}
+	case "macaddr":
+		// macaddr: agrees with the column-coercion path, same
+		// parseMacaddrLiteral. M0134-0138.
+		if _, _, _, _, _, _, merr := parseMacaddrLiteral(v); merr != nil {
+			message = merr.Message
+			sqlCode = merr.Code
+		}
+	case "macaddr8":
+		// macaddr8: agrees with the column-coercion path, same
+		// parseMacaddr8Literal. M0134-0139.
+		if _, _, _, _, _, _, _, _, merr := parseMacaddr8Literal(v); merr != nil {
+			message = merr.Message
+			sqlCode = merr.Code
+		}
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)

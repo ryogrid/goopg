@@ -742,7 +742,8 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 		case *FromUnnest, *GenerateSeries, *GenerateSubscripts,
 			*UserSrfScan, *ScalarFuncScan, *PgPartitionTree, *PgOptionsToTable,
 			*PgInputErrorInfo, *PgGetPublicationTables,
-			*PgAvailableWalSummaries, *PgGetSequenceData, *VerifyHeapam:
+			*PgAvailableWalSummaries, *PgGetSequenceData, *VerifyHeapam,
+			*PgGetCatalogForeignKeys:
 			// FROM-clause set-returning / table functions are leaf
 			// nodes that contribute output columns but carry no
 			// scanKey to remap. Advance `off` by their output width

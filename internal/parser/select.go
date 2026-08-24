@@ -1876,14 +1876,42 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 		if t := p.cur(); t.Kind == TokenSymbol && t.Value == "[" {
 			pos := t.Pos
 			p.advance() // consume '['
-			idx, err := p.parseExpr()
-			if err != nil {
-				return nil, err
+			// Array slice `expr[lower:upper]` (M0134-0079, gram.y
+			// `indirection_el`): either bound may be omitted
+			// (`[:upper]`, `[lower:]`, `[:]`), so only parse an
+			// operand when it isn't immediately the ':' separator or
+			// the closing ']'.
+			curSym := func(sym string) bool {
+				c := p.cur()
+				return c.Kind == TokenSymbol && c.Value == sym
+			}
+			var lower, upper Expr
+			if !curSym(":") && !curSym("]") {
+				var err error
+				lower, err = p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+			}
+			if curSym(":") {
+				p.advance() // consume ':'
+				if !curSym("]") {
+					var err error
+					upper, err = p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+				}
+				if !p.acceptSymbol("]") {
+					return nil, p.errAtCur("expected ']' after array slice")
+				}
+				left = &ArraySubscriptExpr{pos: pos, Base: left, IsSlice: true, Index: lower, Upper: upper}
+				continue
 			}
 			if !p.acceptSymbol("]") {
 				return nil, p.errAtCur("expected ']' after array subscript")
 			}
-			left = &ArraySubscriptExpr{pos: pos, Base: left, Index: idx}
+			left = &ArraySubscriptExpr{pos: pos, Base: left, Index: lower}
 			continue
 		}
 		// `expr COLLATE collation_name` — a high-precedence postfix in
@@ -2253,6 +2281,19 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				}
 				// IS <something> — not yet supported;
 				// the caller will see an error on the next token.
+			}
+		}
+		// `expr ISNULL` / `expr NOTNULL` — historical postfix synonyms for
+		// `expr IS [NOT] NULL` (M0134-0112, kwlist.h TYPE_FUNC_NAME_KEYWORD;
+		// gram.y a_expr ISNULL / a_expr NOTNULL). Same precedence tier as
+		// `IS NULL` above.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenKeyword && (t.Keyword == KwIsnull || t.Keyword == KwNotnull) {
+				pos := t.Pos
+				negated := t.Keyword == KwNotnull
+				p.advance()
+				left = &IsNullExpr{pos: pos, Operand: left, Negated: negated}
+				continue
 			}
 		}
 
@@ -3007,6 +3048,9 @@ func (p *parser) parsePrimary() (Expr, error) {
 	case TokenStringLit:
 		p.advance()
 		return &StringConst{pos: t.Pos, Value: t.Value}, nil
+	case TokenBitStringLit:
+		p.advance()
+		return decodeBitStringLit(t)
 	case TokenParam:
 		p.advance()
 		n, err := strconv.Atoi(t.Value)
@@ -3180,7 +3224,36 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		"float4", "float8", "real",
 		"numeric", "decimal",
 		"text", "varchar", "char", "bpchar",
-		"name", "oid", "pg_lsn":
+		"name", "oid", "pg_lsn",
+		// txid_snapshot/pg_snapshot 'string' cast syntax (M0134-0080), used
+		// by txid.sql: `txid_snapshot '1000...:1000...:1000...'`.
+		"txid_snapshot", "pg_snapshot",
+		// box 'string' cast syntax (M0134-0094), e.g. `box '(2,2),(0,0)'`.
+		"box",
+		// circle 'string' cast syntax (M0134-0098), e.g. `circle '<(0,0),5>'`.
+		"circle",
+		// point/line 'string' cast syntax (M0134-0136), e.g.
+		// `point '(3,1)'`, `line '{0,-1,5}'` — needed so `line(point '(x,y)',
+		// point '(x,y)')` parses as two typed-literal function arguments,
+		// not two bare column references.
+		"point", "line",
+		// lseg/path 'string' cast syntax (M0134-0150), e.g.
+		// `p.f1 <@ path '[(0,0),(-10,0),(-10,10)]'` (point.sql) — both
+		// already have real parsers (parseLsegLiteral/parsePathLiteral,
+		// M0134-0137/-0149) but were missing from this whitelist, so a bare
+		// `path '...'`/`lseg '...'` in an expression context parsed as two
+		// unrelated tokens instead of one typed literal.
+		"lseg", "path",
+		// polygon 'string' cast syntax (M0134-0151), e.g.
+		// `p |>> polygon '((300,300),(400,600),(600,500),(700,200))'`
+		// (polygon.sql) — same sibling gap lseg/path had: parsePolygonLiteral
+		// exists but polygon was missing from this whitelist, so a bare
+		// `polygon '...'` in expression context parsed as two unrelated
+		// tokens instead of one typed literal.
+		"polygon",
+		// json/jsonb 'string' cast syntax (M0134-0133), e.g.
+		// `json '{"a": 1}' -> 'a'` used throughout json_encoding.sql.
+		"json", "jsonb":
 		// Handle multi-word type names: "TIME WITH TIME ZONE 'lit'" and
 		// "TIMESTAMP WITH TIME ZONE 'lit'" / "WITHOUT TIME ZONE 'lit'".
 		// Layout: peek(0)=cur(time/timestamp) peek(1)=with/without peek(2)=time peek(3)=zone peek(4)=string

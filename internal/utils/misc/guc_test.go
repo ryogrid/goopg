@@ -179,6 +179,46 @@ func TestSessionLayering(t *testing.T) {
 	}
 }
 
+// TestSessionResetRestoresStartupValue covers design 0134-0075: RESET
+// restores the session-start (startup-packet / environment, PG PGC_S_CLIENT)
+// value — PG's reset_val — not the compiled BootVal. A user SET on top must
+// not overwrite the startup value, and RESET must restore it.
+func TestSessionResetRestoresStartupValue(t *testing.T) {
+	r := BuildDefaultRegistry()
+
+	// Startup-packet value present: SetStartup, then a user SET on top, then
+	// RESET must land back on the session-start value, not the global default.
+	sess := NewSessionRegistry(r)
+	if err := sess.SetStartup("datestyle", "Postgres, MDY"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Set("datestyle", "ymd", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, eff, _ := sess.Get("datestyle"); eff != "Postgres, YMD" {
+		t.Fatalf("after SET datestyle=ymd on top of startup: got %q, want %q", eff, "Postgres, YMD")
+	}
+	if err := sess.Reset("datestyle"); err != nil {
+		t.Fatal(err)
+	}
+	if _, eff, _ := sess.Get("datestyle"); eff != "Postgres, MDY" {
+		t.Errorf("after SetStartup+Set+Reset: got %q, want %q (session-start value)", eff, "Postgres, MDY")
+	}
+
+	// No startup value: RESET falls through to the global default exactly as
+	// before — a plain SET must never pollute the startup map.
+	sess2 := NewSessionRegistry(r)
+	if err := sess2.Set("datestyle", "ymd", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess2.Reset("datestyle"); err != nil {
+		t.Fatal(err)
+	}
+	if _, eff, _ := sess2.Get("datestyle"); eff != "ISO, MDY" {
+		t.Errorf("after Set+Reset (no startup): got %q, want %q (global default)", eff, "ISO, MDY")
+	}
+}
+
 func TestReportableHookFires(t *testing.T) {
 	r := BuildDefaultRegistry()
 	sess := NewSessionRegistry(r)

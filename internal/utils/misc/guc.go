@@ -9,6 +9,21 @@ import (
 	"strings"
 )
 
+// ValidationError is returned by Variable.Set/canonicalize(From) when a
+// value fails GUC-specific validation and PostgreSQL would attach a HINT
+// alongside the ERROR (e.g. an enum GUC's "Available values: ..." list —
+// postgres/src/backend/utils/misc/guc.c's PGC_ENUM branch of
+// set_config_option). Error() returns just Msg so existing callers that
+// only look at the message keep working unchanged; a caller that can
+// surface a HINT (e.g. the wire protocol's ExecError.Hint) should
+// `errors.As` for this type instead.
+type ValidationError struct {
+	Msg  string
+	Hint string
+}
+
+func (e *ValidationError) Error() string { return e.Msg }
+
 // Type is the value type of a GUC. Mirrors guc.c's PGC_BOOL / PGC_INT /
 // PGC_REAL / PGC_STRING / PGC_ENUM.
 type Type int
@@ -319,8 +334,15 @@ func (v *Variable) canonicalizeFrom(current, value string) (string, error) {
 				return "off", nil
 			}
 		}
-		return "", fmt.Errorf("invalid value %q for enum (valid: %s)",
-			value, strings.Join(v.EnumOptions, ", "))
+		// Matches guc.c's set_config_option PGC_ENUM branch exactly:
+		// `invalid value for parameter "<name>": "<value>"` as the ERROR,
+		// `Available values: <opt>, <opt>, ....` as a SEPARATE HINT (not
+		// baked into the message) — see config_enum_lookup_by_name /
+		// config_enum_get_options in postgres/src/backend/utils/misc/guc.c.
+		return "", &ValidationError{
+			Msg:  fmt.Sprintf("invalid value for parameter %q: %q", v.Name, value),
+			Hint: "Available values: " + strings.Join(v.EnumOptions, ", ") + ".",
+		}
 	}
 	return value, nil
 }

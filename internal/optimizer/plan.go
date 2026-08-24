@@ -1778,6 +1778,21 @@ type PgAvailableWalSummaries struct {
 func (n *PgAvailableWalSummaries) Pos() int       { return n.pos }
 func (n *PgAvailableWalSummaries) Output() Schema { return n.schema }
 
+// PgGetCatalogForeignKeys implements pg_get_catalog_foreign_keys() as a
+// FROM-clause SRF. Returns one row per compiled-in system-catalog FK
+// relationship (fktable regclass, fkcols text[], pktable regclass, pkcols
+// text[], is_array bool, is_opt bool) — a static table mirroring PG's
+// genbki-generated sys_fk_relationships[] (postgres/src/include/catalog/
+// system_fk_info.h). Used by oidjoins.sql to self-check catalog FK
+// integrity. M0134-0146.
+type PgGetCatalogForeignKeys struct {
+	pos    int
+	schema Schema
+}
+
+func (n *PgGetCatalogForeignKeys) Pos() int       { return n.pos }
+func (n *PgGetCatalogForeignKeys) Output() Schema { return n.schema }
+
 // ScalarFuncScan returns a single row from a scalar function call used in
 // the FROM clause (e.g. `FROM parse_ident(...) AS a`). The function result
 // is returned as a single column named ColName with type ColType. M0097-0003.

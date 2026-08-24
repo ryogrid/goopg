@@ -1,39 +1,45 @@
-Task: M0134-0071 (equivclass.sql) — Bucket A (`LANGUAGE internal` CREATE
-FUNCTION) landed and committed `f70edc85`; case PARKED (not flipped to pass).
+Task just completed: M0134-0155 (psql.sql) — sized live + scoped fixes
+landed, committed f2d54e226 on regress-renumbering (loop #46 had been
+killed mid-gate by the operator; this session finished and landed its WIP).
 
-Landed: `internal/executor/operators_ddl.go` `execCreateFunction`/`execCreateProcedure`
-allowlist now admit `internal`; new `catalog.LookupBuiltinProcByProname`
-(name→OID reverse of `pgProcNamesByOID`) binds `AS '<name>'` (unknown → 42883,
-PG `fmgr_internal_validator` `pg_proc.c:746/770-771`); `plpgsql_runtime.go`
-`dispatchStoredRoutineByLanguage` gains a real `case "internal"` →
-`dispatchInternalFunction` (int8eq/ne/lt/le/gt/ge, btint8cmp, int8in/out,
-hashint8; strict; Datum-level — no coercion needed for `like int8` aliases);
-`hash_partition.go` `pgHashInt8` (PG `hashfunc.c:84`). Design
-`docs/design/m0134-0071-language-internal-function.md` + README index; test
-`internal/executor/create_function_language_internal_test.go`.
+What landed: (1) SET ROLE TO/= generic_set spellings end-to-end — parser
+role arm (= is TokenOperator, NOT acceptSymbol; first cut was silently
+broken until new parser subtests caught it) + query.go/extended.go fast
+paths via stripSetToOrEquals. (2) SESSION AUTHORIZATION deliberately
+rejects TO/= (gram.y:1764/:1774 only; oracle-verified): setAuthzGenericSetForm
+routes those from both protocols' fast paths to the parser for the true 42601.
+(3) NEW shared-core rule surfaced by oracle-diff: PARSE-time errors inside an
+explicit txn now abort the block (connTx.Fail at dispatch.go parse-error
+return + dispatch_extended.go qerr return; mirrors M0132-S5); empty
+statements stay allowed in aborted blocks (#17983 parity,
+allowedInAbortedBlock). (4) CREATE TABLE (...) USING <am> accepted-and-
+discarded, both parseCreateTableTail arms. Harness: pg-oracle-diff.sh
+--auto-start fixed (initdb -q removed — PG 18.3 has no -q; -U "$USER_"
+pinned). Tests: TestStripSetToOrEquals, TestFastPathGenericSetSpellings,
+TestParseErrorAbortsTransactionBlock, TestParseCreateTableUsingAccessMethod,
+parser SET subtests.
 
-Result: equivclass **594 → 573 diff lines, 40 → 28 `^+ERROR`** (10 `language
-internal` + 2 cross-type `only boolean operators` cleared). CSV row stays
-`failed`/`pass_required=no`; no `make regen-testport`.
+Gates run: units PASS (43 pkgs), full postmaster pkg PASS under cap,
+parser PASS, regen-testport + check-testport-inventory PASS, commit-hook
+pgbench smoke PASS, 16-statement oracle-diff vs PG 18.3 matches except ONE
+character (error text echoes lowercased 'to' vs scan.c raw-source 'TO').
 
-Key finding (re-attribution): the 13 `incompatible operand types` errors are an
-INDEPENDENT analyzer gap, NOT a cascade of the internal-language wall — the
-BinaryOp type-check (`analyzer.go:1359-1362`/`:3186`) is a builtin name-switch
-with no user-operator lookup, so `int8 = int8alias1` (a user operator) is never
-resolved. Largest contained next slice (16/28 remaining). Bucket C (built-in
-`integer_ops` opfamily rows) is second. Both ledgered 2026-08-22.
+Residual psql.sql gaps ledgered (.ralph/deferral_ledger.md M0134-0155):
+63 goopg-side ERRORs over >=6 subsystems — role-does-not-exist x14,
+syntax-error x11 (incl. "unsupported statement (got X)" template divergence),
+spurious NOT NULL x6, permission-denied-create-role x5, function-missing x5,
+table-permission denials x9 (M0134-0154 ACL core), pg_roles.rolinherit x2.
+Highest-leverage follow-up remains the ACL-check core (PUBLIC fallback +
+RoleIsMemberOf walk) per M0134-0154's recommendation.
 
-Next step: M0134-0072 (temp.sql) — regress-sql `failed`, not yet sized. Same
-pattern: researcher sizes (run `scripts/pg-regress-runner.sh --verbose temp`),
-then pick the largest contained slice, design + implement.
+NEXT LOOP: per Current Priority banner + task-ID-ascending, work
+**M0134-0156 (psql_crosstab.sql)** next.
 
-Gates run this loop: researcher ran the regress runner twice (deterministic, 594
-lines, exit 1); implementer `go test ./internal/executor/` + `./internal/catalog/`
-PASS, `go build ./...` PASS, regress 594→573/40→28; pre-commit pgbench smoke
-PASS (0 failed, `f70edc85`).
-
-Delegation: researcher m0134-0071-equivclass-sizing DONE; implementer
-m0134-0071-internal-lang DONE (report delivered inline — the harness blocked the
-`report.md` Write). No open brief.
+Peer-session WIP still present, leave uncommitted: .ralphrc, progress.json,
+analysis/postgres-oracle-compatibility-report.md, ci/logs/launch.log,
+docs/wiki/getting-started.md, docs/wiki/modules/catalog.md,
+internal/executor/operators_recursive_cte.go (nil-guard for o.ctx.Ctx),
+postgres symlink, third-party/tpcds-postgres submodule,
+analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt.
 
 In-flight: none.

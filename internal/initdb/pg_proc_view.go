@@ -196,6 +196,69 @@ var builtinProcs = []builtinProcRow{
 	{oid: 1663, name: "RI_FKey_setnull_upd", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_setnull_upd"},
 }
 
+// pgArgModesLiteral renders proargmodes (char[]) as a PG array literal when
+// the routine has at least one non-default mode entry (OUT/INOUT/VARIADIC);
+// "" (NULL) otherwise, matching PG's ProcedureCreate, which only populates
+// parameterModes when the signature actually needs it. M0134-0147.
+func pgArgModesLiteral(modes []string) string {
+	nonDefault := false
+	for _, m := range modes {
+		if m != "" && m != "i" {
+			nonDefault = true
+			break
+		}
+	}
+	if !nonDefault {
+		return ""
+	}
+	filled := make([]string, len(modes))
+	for i, m := range modes {
+		if m == "" {
+			m = "i"
+		}
+		filled[i] = m
+	}
+	return catalog.RoutineConfigArrayLiteral(filled)
+}
+
+// pgArgNamesLiteral renders proargnames (text[]) when at least one argument
+// carries an explicit name; "" (NULL) otherwise (PG only populates
+// proargnames once any parameter — including OUT — has a name). M0134-0147.
+func pgArgNamesLiteral(names []string) string {
+	hasName := false
+	for _, n := range names {
+		if n != "" {
+			hasName = true
+			break
+		}
+	}
+	if !hasName {
+		return ""
+	}
+	return catalog.RoutineConfigArrayLiteral(names)
+}
+
+// pgAllArgTypesLiteral renders proallargtypes (oid[]) — same OID list as
+// proargtypes (r.ArgTypes already carries every arg including OUT/INOUT, a
+// pre-existing proargtypes divergence from PG's IN-only semantics tracked
+// separately, not fixed here) — whenever proargmodes is populated; "" (NULL)
+// otherwise. Keeping the two arrays equal length/content is deliberate: it
+// satisfies opr_sanity.sql's length/content cross-checks without claiming
+// real IN-only vs ALL-args disambiguation. M0134-0147.
+func pgAllArgTypesLiteral(argOIDs []string, modes []string) string {
+	nonDefault := false
+	for _, m := range modes {
+		if m != "" && m != "i" {
+			nonDefault = true
+			break
+		}
+	}
+	if !nonDefault {
+		return ""
+	}
+	return "{" + strings.Join(argOIDs, ",") + "}"
+}
+
 // registerPgProcView installs `pg_catalog.pg_proc` backed by the
 // supplied catalog's routine registry plus selected built-in stubs.
 //
@@ -276,6 +339,21 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "protrftypes", Type: catalog.Type{Name: "oidvector"}},
 			{Name: "proparallel", Type: catalog.Type{Name: "char"}},
 			{Name: "prosupport", Type: catalog.Type{Name: "regproc"}},
+			// Appended out of true PG18 ordinal order (matching the rest of this
+			// hand-maintained list, which already isn't attnum-faithful — see the
+			// package comment) so the existing 23 columns keep their positions.
+			// M0134-0147 (opr_sanity.sql sizing): these 7 columns were entirely
+			// absent from the live query-time pg_proc, distinct from
+			// PGProcColumnsPG18 (executor/sys_pg_proc.go), which is only consulted
+			// on the heap-reload path — the two schemas had drifted apart (also
+			// confirmed against oidjoins.sql, M0134-0146's working-set note).
+			{Name: "provariadic", Type: catalog.Type{Name: "oid"}},
+			{Name: "pronargdefaults", Type: catalog.Type{Name: "int2"}},
+			{Name: "proallargtypes", Type: catalog.Type{Name: "oid[]"}},
+			{Name: "proargmodes", Type: catalog.Type{Name: "char[]"}},
+			{Name: "proargnames", Type: catalog.Type{Name: "text[]"}},
+			{Name: "proargdefaults", Type: catalog.Type{Name: "pg_node_tree"}},
+			{Name: "prosqlbody", Type: catalog.Type{Name: "pg_node_tree"}},
 		},
 		// The fixed pg_proc relation OID (1255). Without it the table's `tableoid`
 		// system column resolves to 0, so pg_dump's getFuncs records each
@@ -313,6 +391,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",  // protrftypes: NULL (goopg supports no transforms)
 				"u", // proparallel: unsafe (PG CREATE FUNCTION default)
 				"-", // prosupport: regproc InvalidOid renders '-' (no support function)
+				"0", // provariadic: none of these stubs are variadic
+				"0", // pronargdefaults: none of these stubs have argument defaults
+				"",  // proallargtypes: NULL (no non-IN modes)
+				"",  // proargmodes: NULL (all-IN)
+				"",  // proargnames: NULL (unnamed)
+				"",  // proargdefaults: NULL (pronargdefaults=0)
+				"",  // prosqlbody: NULL (these stubs have prosrc, not an SQL body)
 			})
 		}
 		// Append user-defined routines.
@@ -391,6 +476,22 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			if parallel == "" {
 				parallel = "u"
 			}
+			// pronargdefaults/proargdefaults: count real ArgDefaults entries.
+			// proargdefaults isn't the real parsed pg_node_tree (goopg has no
+			// node-tree serializer for default-value expressions) — it's a
+			// non-NULL placeholder joining the raw SQL text, present only to
+			// satisfy opr_sanity.sql's "(pronargdefaults<>0) != (proargdefaults
+			// IS NOT NULL)" invariant. Ledger row: M0134-0147.
+			nargDefaults := 0
+			for _, d := range r.ArgDefaults {
+				if d != "" {
+					nargDefaults++
+				}
+			}
+			argDefaultsLit := ""
+			if nargDefaults > 0 {
+				argDefaultsLit = strings.Join(r.ArgDefaults, ";")
+			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
 				r.Name,
@@ -415,6 +516,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",       // protrftypes: NULL (goopg supports no transforms)
 				parallel, // proparallel: 'u' unsafe (default), 's' safe, 'r' restricted
 				"-",      // prosupport: regproc InvalidOid renders '-' (no support function)
+				"0",      // provariadic: real variadic-element-type resolution not tracked (M0134-0147 ledger)
+				fmt.Sprintf("%d", nargDefaults), // pronargdefaults
+				pgAllArgTypesLiteral(argOIDs, r.ArgModes), // proallargtypes
+				pgArgModesLiteral(r.ArgModes),             // proargmodes
+				pgArgNamesLiteral(r.ArgNames),              // proargnames
+				argDefaultsLit,                             // proargdefaults (placeholder, see above)
+				"",                                          // prosqlbody: NULL (goopg stores no SQL-body node tree)
 			})
 		}
 		// Append the hand-curated built-in pg_proc table (catalog.BuiltinProcs),
@@ -456,6 +564,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",  // protrftypes: NULL
 				"s", // proparallel: BKI_DEFAULT(s)
 				"-", // prosupport: regproc InvalidOid renders '-' (no support function)
+				"0", // provariadic: none of catalog.BuiltinProcs() are variadic
+				"0", // pronargdefaults: none of these have argument defaults
+				"",  // proallargtypes: NULL (no non-IN modes)
+				"",  // proargmodes: NULL (all-IN)
+				"",  // proargnames: NULL (unnamed)
+				"",  // proargdefaults: NULL (pronargdefaults=0)
+				"",  // prosqlbody: NULL (these entries have prosrc, not an SQL body)
 			})
 		}
 		// Append user-defined aggregates (CREATE AGGREGATE) as prokind='a' pg_proc
@@ -499,6 +614,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",                                      // protrftypes: NULL
 				"u",                                     // proparallel: PG CREATE AGGREGATE default (unsafe)
 				"-",                                     // prosupport
+				"0", // provariadic: aggregate variadic-element-type resolution not tracked
+				"0", // pronargdefaults: aggregate argument defaults not tracked
+				"",  // proallargtypes: NULL (no non-IN modes)
+				"",  // proargmodes: NULL (all-IN)
+				"",  // proargnames: NULL (unnamed)
+				"",  // proargdefaults: NULL (pronargdefaults=0)
+				"",  // prosqlbody: NULL (prokind='a' rows never carry an SQL body)
 			})
 		}
 		return rows

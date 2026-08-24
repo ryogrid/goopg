@@ -1710,6 +1710,12 @@ type CreateIndexStmt struct {
 	// pg_get_indexdef can re-emit `WITH (pages_per_range='N')`. Valid range
 	// 1–131072. DU-002 slice 222.
 	PagesPerRange int
+	// Buffering captures the GiST `WITH (buffering=on|off|auto)` enum storage
+	// parameter, lowercased, exactly as written. Empty means unset (PG default
+	// "auto"). Validated at execution time (execCreateIndex) against the enum
+	// {on, off, auto} — an unrecognized value raises PG's exact
+	// "invalid value for enum option \"buffering\"" 22023 error. M0134-0127.
+	Buffering string
 	// AutoSummarize captures the BRIN `WITH (autosummarize=on|off)` boolean
 	// storage parameter (summarize the previous range when a new page range is
 	// created). nil means unset (PG default OFF); a non-nil pointer records the
@@ -2307,6 +2313,26 @@ type CompatNoopStmt struct {
 	FDWHandlerGiven   bool
 	FDWValidatorFunc  *ObjectName
 	FDWValidatorGiven bool
+	// SchemaAuthRole carries a CREATE SCHEMA statement's `AUTHORIZATION
+	// <role_spec>` role token verbatim (lowercased keywords for
+	// CURRENT_ROLE/CURRENT_USER/SESSION_USER/USER resolve at execCompatNoop
+	// time against the live session, since the parser has no session
+	// access). "" means no AUTHORIZATION clause. Tag == "CREATE SCHEMA" only.
+	// M0134-0115.
+	SchemaAuthRole string
+	// SchemaSubElementSchema / SchemaHasSubElement carry the schema
+	// qualification of the single embedded `CREATE <element>` sub-command a
+	// CREATE SCHEMA statement may include (SEQUENCE/TABLE/VIEW/INDEX ON/
+	// TRIGGER ON — parse_utilcmd.c's transformCreateSchemaStmtElements
+	// checks every element in the list; goopg has no execution path for any
+	// of them, so only the schema-qualification MISMATCH check is ported).
+	// SchemaHasSubElement is true whenever a sub-command was present;
+	// SchemaSubElementSchema is "" when that sub-command's target carried no
+	// explicit schema qualification (never a mismatch — PG defaults an
+	// unqualified name to the enclosing schema). Tag == "CREATE SCHEMA" only.
+	// M0134-0115.
+	SchemaSubElementSchema string
+	SchemaHasSubElement    bool
 	// CastContext / CastMethod carry a CREATE CAST statement's pg_cast.castcontext
 	// and castmethod. Context is "e" explicit (default), "a" assignment, "i"
 	// implicit. Method is "b" binary (WITHOUT FUNCTION), "i" INOUT (WITH INOUT),
@@ -2944,9 +2970,14 @@ type CreateEventTriggerStmt struct {
 	Event string
 	// FilterVar is the WHEN clause's filter-variable name ("tag" is the only
 	// one PostgreSQL recognises today); "" if there is no WHEN clause.
-	FilterVar string
-	Tags      []string // WHEN <FilterVar> IN (...) values, unquoted
-	FuncName  ObjectName
+	// Last-write-wins across multiple AND-joined clauses — kept only for
+	// back-compat with existing single-clause callers; use FilterVars for the
+	// full clause-order sequence (needed to detect a duplicate filter
+	// variable the way event_trigger.c's CreateEventTrigger does).
+	FilterVar  string
+	FilterVars []string // one entry per WHEN <var> IN (...) clause, in source order
+	Tags       []string // WHEN <FilterVar> IN (...) values, unquoted
+	FuncName   ObjectName
 }
 
 func (s *CreateEventTriggerStmt) Pos() int  { return s.pos }
@@ -3832,6 +3863,16 @@ type CreateTypeStmt struct {
 	// qualification dropped). Empty means "use the subtype's own default
 	// collation" (or InvalidOid for a non-collatable subtype).
 	RangeCollationName string
+	// HasOptions marks the "base type" stub form `CREATE TYPE name (opt =
+	// val, ...)` — as opposed to the bare shell form `CREATE TYPE name;`
+	// with no parenthesized option list. PG's DefineType (typecmds.c
+	// ~236-278) treats these two spellings differently for duplicate/
+	// missing-shell detection: a bare `CREATE TYPE name;` always errors
+	// 42710 "already exists" if any type (shell or fully defined) of that
+	// name is present, while `CREATE TYPE name (...)` errors 42710 "does
+	// not exist" (with a shell-first hint) if no shell is present yet, or
+	// silently fills in an existing shell. M0134-0116.
+	HasOptions bool
 }
 
 func (s *CreateTypeStmt) Pos() int  { return s.pos }

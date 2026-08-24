@@ -133,7 +133,10 @@ func validateDefaultExpr(e parser.Expr, pos int, ctx *Context) error {
 		if err := validateDefaultExpr(v.Base, pos, ctx); err != nil {
 			return err
 		}
-		return validateDefaultExpr(v.Index, pos, ctx)
+		if err := validateDefaultExpr(v.Index, pos, ctx); err != nil {
+			return err
+		}
+		return validateDefaultExpr(v.Upper, pos, ctx)
 	case *parser.ExtractExpr:
 		return validateDefaultExpr(v.Source, pos, ctx)
 	}

@@ -34,6 +34,14 @@ type TupleSlot interface {
 	// access any column afterwards. No-op for slots that don't
 	// own backing storage (VirtualSlot, BatchRefSlot).
 	Release()
+
+	// TID returns the slot's carried self-tid (block, offset) and
+	// whether it is valid. A heap-scan slot stamps it (seqScanOp,
+	// operators_storage.go:2076-2078, propagated through projectOp
+	// operators.go:369-377); synthesized slots (values/aggregates)
+	// return ok=false. M0134-0074: used by materializeCursor to
+	// capture per-row tids for WHERE CURRENT OF resolution.
+	TID() (block uint32, off uint16, ok bool)
 }
 
 // SlotView is the read-only column interface that evalExprSlot
@@ -113,6 +121,12 @@ func (s *MaterializedSlot) Materialize() *MaterializedSlot {
 // Release to releaseRow() at the slot's lifetime boundary.
 func (s *MaterializedSlot) Release() {}
 
+// TID implements TupleSlot. Returns the ctid stamped by seqScanOp for
+// CTIDExpr (M0097-0038); slots without a carried ctid report ok=false.
+func (s *MaterializedSlot) TID() (block uint32, off uint16, ok bool) {
+	return s.ctidBlock, s.ctidOff, s.hasCTID
+}
+
 // VirtualSlot references column positions across one or more
 // source slots. Stage A defines the type for forward
 // compatibility; the actual operator wiring (filterOp /
@@ -178,6 +192,12 @@ func (s *VirtualSlot) Materialize() *MaterializedSlot {
 // the source slots. The operator pipeline contract (M0070+) will
 // require sources to outlive their VirtualSlot consumers.
 func (s *VirtualSlot) Release() {}
+
+// TID implements TupleSlot. A VirtualSlot references columns across
+// source slots and carries no ctid of its own — report ok=false.
+func (s *VirtualSlot) TID() (block uint32, off uint16, ok bool) {
+	return 0, 0, false
+}
 
 // asSlot wraps a Row in a MaterializedSlot for return at the
 // Operator.Next() boundary (M0071-0010 Stage B). nil row →

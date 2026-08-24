@@ -1199,7 +1199,11 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		_ = sess.SetInternal("is_superuser", "on")
 	}
 
-	// Apply generic startup-packet GUC settings. PostgreSQL's
+	// Apply generic startup-packet GUC settings. These values are the
+	// session-start values (PG's PGC_S_CLIENT source) and become the per-session
+	// RESET target — use SetStartup, not Set, so a later RESET restores the
+	// startup-packet value rather than the compiled default (design
+	// 0134-0075-guc-reset-session-start-value). PostgreSQL's
 	// ProcessStartupPacket (backend_startup.c ~line 770-790) treats every
 	// startup-packet key other than user/database/options/replication/_pq_.*
 	// as a GUC name=value pair (port->guc_options), and separately parses the
@@ -1219,10 +1223,10 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		if strings.HasPrefix(name, "_pq_.") {
 			continue
 		}
-		_ = sess.Set(name, val, false)
+		_ = sess.SetStartup(name, val)
 	}
 	for name, val := range parsePGOptions(params["options"]) {
-		_ = sess.Set(name, val, false)
+		_ = sess.SetStartup(name, val)
 	}
 
 	// Now wire the per-session ParameterStatus emitter so subsequent

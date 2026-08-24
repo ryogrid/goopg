@@ -164,3 +164,50 @@ func TestScalarFuncScanFrom_NoRegression(t *testing.T) {
 		t.Fatalf("parse_ident regression: got %d rows, want 1 (rows=%v)", len(piRows), piRows)
 	}
 }
+
+// TestScalarFuncScanFrom_LateralArgResolvesAgainstLeftFromItem pins the
+// M0134-0126 fix end-to-end: a user-defined FROM-clause function argument
+// that correlates against an earlier FROM item — `FROM t, LATERAL f(t.col)`
+// — must both PLAN (arg resolves against the left sibling's schema, not an
+// empty context) and EXECUTE (the arg evaluates per outer row via
+// BindLateralOuter, not against a nil slot). Before the fix this raised
+// "column ... does not exist" at plan time; a naive fix that only patched
+// planning would still panic/misbehave at runtime with a nil-slot column
+// lookup. Covers both the SETOF (UserSrfScan) and non-SETOF (ScalarFuncScan)
+// plan-node shapes, reproduced originally via gin.sql's
+// `lateral explain_query_json(... || query)`.
+func TestScalarFuncScanFrom_LateralArgResolvesAgainstLeftFromItem(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE zz_lat_probe (query text)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO zz_lat_probe VALUES ('a'), ('b')`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	// Non-SETOF (ScalarFuncScan).
+	if err := runDDL(t, ctx, `CREATE FUNCTION zz_lat_scalar(x text) RETURNS text LANGUAGE sql AS $$ SELECT x $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION zz_lat_scalar: %v", err)
+	}
+	scalarRows := runQuery(t, ctx, `SELECT js FROM zz_lat_probe, LATERAL zz_lat_scalar(zz_lat_probe.query) js ORDER BY 1`)
+	if len(scalarRows) != 2 || scalarRows[0][0].StringValue() != "a" || scalarRows[1][0].StringValue() != "b" {
+		t.Fatalf("scalar lateral arg: got %v, want [[a] [b]]", scalarRows)
+	}
+
+	// SETOF (UserSrfScan), implicit LATERAL correlation (no LATERAL keyword).
+	if err := runDDL(t, ctx, `CREATE FUNCTION zz_lat_setof(x text) RETURNS SETOF text LANGUAGE sql AS $$ SELECT x || '1' UNION ALL SELECT x || '2' $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION zz_lat_setof: %v", err)
+	}
+	setofRows := runQuery(t, ctx, `SELECT js FROM zz_lat_probe, zz_lat_setof(zz_lat_probe.query) js ORDER BY 1`)
+	want := []string{"a1", "a2", "b1", "b2"}
+	if len(setofRows) != len(want) {
+		t.Fatalf("setof lateral arg: got %d rows %v, want %d", len(setofRows), setofRows, len(want))
+	}
+	for i, w := range want {
+		if setofRows[i][0].StringValue() != w {
+			t.Errorf("setof lateral arg: row %d = %q, want %q", i, setofRows[i][0].StringValue(), w)
+		}
+	}
+}

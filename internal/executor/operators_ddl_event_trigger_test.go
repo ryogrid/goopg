@@ -42,6 +42,48 @@ func TestCreateEventTriggerRegistersRow(t *testing.T) {
 	}
 }
 
+// TestCreateEventTriggerLoginSetsDatHasLoginEvt pins
+// pg_database.dathasloginevt (M0134-0123): PostgreSQL sets this bit at
+// CREATE EVENT TRIGGER ... ON login / ALTER EVENT TRIGGER ... ENABLE time
+// (SetDatabaseHasLoginEventTriggers, event_trigger.c:390-414) so monitoring
+// queries can tell whether login events are wired up without a firing
+// engine having ever run. goopg has no firing engine (DU-002), but the flag
+// itself only reflects registration state and is computed live from the
+// event trigger registry, so it must still flip true/false correctly.
+func TestCreateEventTriggerLoginSetsDatHasLoginEvt(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	hasLoginEvt := func() bool {
+		rows := runQuery(t, ctx, `SELECT dathasloginevt FROM pg_database WHERE datname = 'postgres'`)
+		if len(rows) != 1 {
+			t.Fatalf("pg_database WHERE datname='postgres': got %d rows, want 1", len(rows))
+		}
+		return rows[0][0].BoolValue()
+	}
+
+	if got := hasLoginEvt(); got {
+		t.Fatalf("dathasloginevt before CREATE EVENT TRIGGER = %v, want false", got)
+	}
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION on_login_proc() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE EVENT TRIGGER on_login_trigger ON login EXECUTE PROCEDURE on_login_proc()`); err != nil {
+		t.Fatalf("CREATE EVENT TRIGGER ... ON login: %v", err)
+	}
+	if got := hasLoginEvt(); !got {
+		t.Fatalf("dathasloginevt after CREATE EVENT TRIGGER ON login = %v, want true", got)
+	}
+
+	if err := runDDL(t, ctx, `ALTER EVENT TRIGGER on_login_trigger DISABLE`); err != nil {
+		t.Fatalf("ALTER EVENT TRIGGER ... DISABLE: %v", err)
+	}
+	if got := hasLoginEvt(); got {
+		t.Fatalf("dathasloginevt after disabling the only login trigger = %v, want false", got)
+	}
+}
+
 // TestCreateEventTriggerDuplicateNameErrors pins PG's 42710 duplicate_object
 // behavior for a repeated trigger name.
 func TestCreateEventTriggerDuplicateNameErrors(t *testing.T) {
@@ -124,6 +166,59 @@ func TestCreateEventTriggerNonSuperuserErrors(t *testing.T) {
 	if ee.Code != "42501" {
 		t.Errorf("Code=%q want 42501", ee.Code)
 	}
+	if got := im.ListEventTriggers(); len(got) != 0 {
+		t.Errorf("ListEventTriggers=%v want empty (CREATE must have been rejected)", got)
+	}
+}
+
+// TestCreateEventTriggerNonSuperuserHint pins the HINT PG attaches to the
+// 42501 error above (errhint("Must be superuser to create an event
+// trigger."), event_trigger.c) — M0134-0122.
+func TestCreateEventTriggerNonSuperuserHint(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION et_func() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterRole("app_owner")
+	ctx.NonSuperuserRole = "app_owner"
+
+	err := runDDL(t, ctx, `CREATE EVENT TRIGGER et1 ON ddl_command_start EXECUTE FUNCTION et_func()`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Hint != "Must be superuser to create an event trigger." {
+		t.Errorf("Hint=%q want the PG hint text", ee.Hint)
+	}
+}
+
+// TestCreateEventTriggerDuplicateFilterVarErrors pins
+// error_duplicate_filter_variable (event_trigger.c): two AND-joined `tag IN
+// (...)` clauses in the same WHEN must raise "filter variable \"tag\"
+// specified more than once" (42601) instead of silently merging their tag
+// lists — M0134-0122 (event_trigger.sql).
+func TestCreateEventTriggerDuplicateFilterVarErrors(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION et_func() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	err := runDDL(t, ctx, `CREATE EVENT TRIGGER et1 ON ddl_command_start WHEN TAG IN ('create table') AND TAG IN ('CREATE FUNCTION') EXECUTE FUNCTION et_func()`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42601" {
+		t.Errorf("Code=%q want 42601", ee.Code)
+	}
+	if ee.Message != `filter variable "tag" specified more than once` {
+		t.Errorf("Message=%q", ee.Message)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
 	if got := im.ListEventTriggers(); len(got) != 0 {
 		t.Errorf("ListEventTriggers=%v want empty (CREATE must have been rejected)", got)
 	}

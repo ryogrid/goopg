@@ -88,7 +88,7 @@ func TestValidateCreateCast(t *testing.T) {
 				ArgTypes:   []string{tc.source, tc.target},
 				CastMethod: tc.method,
 			}
-			err := validateCreateCast(s, tc.routine)
+			err := validateCreateCast(s, tc.routine, nil)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("expected success, got error: %v", err)

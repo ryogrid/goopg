@@ -53,6 +53,42 @@ func TestParseCreateAccessMethodErrors(t *testing.T) {
 	}
 }
 
+// TestParseCreateTableUsingAccessMethod pins the table_access_method_clause
+// on plain CREATE TABLE (`USING <am>`), M0134-0155. PG's gram.y
+// OptTableElementList production order is OptInherit OptPartitionSpec
+// table_access_method_clause OptWith OnCommitOption OptTableSpace, so USING
+// sits between the column list / PARTITION BY and WITH — both arms of
+// parseCreateTableTail (non-empty column list and the empty-column-list
+// suffix arm) must accept and discard it (goopg has a single heap storage
+// engine; pg_dump/psql regress emit `USING heap` for explicit-default
+// spellings).
+func TestParseCreateTableUsingAccessMethod(t *testing.T) {
+	cases := []struct {
+		sql      string
+		wantCols int
+	}{
+		{"CREATE TABLE using_am_plain (i int) USING heap", 1},
+		{"CREATE TABLE using_am_with_opts (i int) USING heap WITH (fillfactor=70)", 1},
+		{"CREATE TABLE using_am_empty () USING heap", 0},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		if len(stmts) != 1 {
+			t.Fatalf("%s: len=%d want 1", c.sql, len(stmts))
+		}
+		ct, ok := stmts[0].(*CreateTableStmt)
+		if !ok {
+			t.Fatalf("%s: type=%T want *CreateTableStmt", c.sql, stmts[0])
+		}
+		if len(ct.Columns) != c.wantCols {
+			t.Errorf("%s: Columns=%d want %d", c.sql, len(ct.Columns), c.wantCols)
+		}
+	}
+}
+
 // TestParseDropAccessMethod pins `DROP ACCESS METHOD [IF EXISTS] name`
 // routing through the shared DropCompatStmt (execDropCompat's "access
 // method" case). This form already parsed generically before this loop

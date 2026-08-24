@@ -2340,6 +2340,13 @@ func (p *parser) parseSet() (Stmt, error) {
 		if p.acceptKeyword(KwSession) {
 			if p.acceptIdentKeyword("authorization") {
 				s.Name = "session_authorization"
+				// NOTE: no TO/= separator here — unlike SET ROLE, SESSION
+				// AUTHORIZATION has NO generic_set grammar upstream
+				// (gram.y:1764/:1774 dedicated productions accept only a bare
+				// rolename or DEFAULT), so `SET [LOCAL] SESSION
+				// AUTHORIZATION TO x` / `= x` is a 42601 syntax error in PG
+				// 18.3 (oracle-verified). Accepting it here would diverge.
+				// M0134-0155.
 				if p.acceptKeyword(KwDefault) {
 					s.Default = true
 				} else {
@@ -2356,6 +2363,9 @@ func (p *parser) parseSet() (Stmt, error) {
 		// "authorization" is not a keyword in goopg so it parses as an ident.
 		if p.acceptIdentKeyword("authorization") {
 			s.Name = "session_authorization"
+			// No TO/= separator — see the SET LOCAL SESSION AUTHORIZATION
+			// arm above (no generic_set grammar upstream; oracle-verified
+			// 42601). M0134-0155.
 			// consume DEFAULT or the role name
 			if p.acceptKeyword(KwDefault) {
 				s.Default = true
@@ -2376,6 +2386,20 @@ func (p *parser) parseSet() (Stmt, error) {
 	if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "role" {
 		p.advance() // consume "role"
 		s.Name = "role"
+		// Optional TO/= separator — `SET ROLE` is dispatched via PG's
+		// generic_set grammar (`var_name TO var_list | var_name '=' var_list`,
+		// gram.y:1656-1693) same as SESSION AUTHORIZATION above, so `SET ROLE
+		// TO x` / `SET ROLE = x` must parse identically to `SET ROLE x`.
+		// Previously unhandled: `SET ROLE TO x` 42601'd outright via this
+		// parser path, and the sibling string-matching fast paths
+		// (server/query.go, extended.go) silently stored the literal garbage
+		// role name "TO x" instead of erroring or parsing correctly — see
+		// stripSetToOrEquals's doc comment for the corruption this caused.
+		// M0134-0155.
+		p.acceptKeyword(KwTo)
+		if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+			p.advance()
+		}
 		if p.acceptKeyword(KwDefault) {
 			s.Default = true
 		} else {

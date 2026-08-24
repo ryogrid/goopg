@@ -78,6 +78,20 @@ def _render_block(
         return "\n".join(block.lines)
 
 
+def _warn_unrepaired(unrepaired: list) -> None:
+    """Print the findings the tool deliberately did not rewrite."""
+    if not unrepaired:
+        return
+    print(
+        f"{len(unrepaired)} issue(s) need manual repair:", file=sys.stderr
+    )
+    for fix in unrepaired:
+        print(
+            f"  Line {fix.line}, col {fix.column}: [{fix.type}] {fix.detail}",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the mdtablefix CLI.
 
@@ -117,6 +131,8 @@ def main(argv: list[str] | None = None) -> None:
                 has_malformed = True
                 all_fixes.extend(repaired.fixes)
 
+    unrepaired = [f for f in all_fixes if not f.repaired]
+
     # ---- write report (before any mode may exit) ---------------------
     if args.report:
         report_data = build_report(args.file, all_fixes)
@@ -127,13 +143,20 @@ def main(argv: list[str] | None = None) -> None:
     # ---- output -------------------------------------------------------
     if mode == "check":
         for fix in all_fixes:
+            mark = "" if fix.repaired else " NEEDS MANUAL REPAIR:"
             print(
-                f"Line {fix.line}, col {fix.column}: [{fix.type}] {fix.detail}",
+                f"Line {fix.line}, col {fix.column}: "
+                f"[{fix.type}]{mark} {fix.detail}",
                 file=sys.stderr,
             )
         if all_fixes:
             print(
-                f"\nFound {len(all_fixes)} issue(s) in {args.file}.",
+                f"\nFound {len(all_fixes)} issue(s) in {args.file}"
+                + (
+                    f" ({len(unrepaired)} need manual repair)."
+                    if unrepaired
+                    else "."
+                ),
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -151,6 +174,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.stdout.write(output)
         if not output.endswith("\n"):
             sys.stdout.write("\n")
+        _warn_unrepaired(unrepaired)
         sys.exit(1 if has_malformed else 0)
 
     if mode == "inplace":
@@ -158,11 +182,15 @@ def main(argv: list[str] | None = None) -> None:
             fh.write(output)
             if not output.endswith("\n"):
                 fh.write("\n")
+        repaired_count = len(all_fixes) - len(unrepaired)
         if has_malformed:
-            print(f"Repaired {len(all_fixes)} issue(s) in {args.file}.")
+            print(f"Repaired {repaired_count} issue(s) in {args.file}.")
         else:
             print(f"No issues found in {args.file}.")
-        sys.exit(0)
+        _warn_unrepaired(unrepaired)
+        # A leftover unrepairable finding must not read as success: the file
+        # still renders wrong and a human has to touch it.
+        sys.exit(1 if unrepaired else 0)
 
 
 if __name__ == "__main__":

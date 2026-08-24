@@ -141,6 +141,8 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwNatural: KwCatTypeFunc,
 	KwOuter:   KwCatTypeFunc,
 	KwIs:      KwCatTypeFunc,
+	KwIsnull:  KwCatTypeFunc,
+	KwNotnull: KwCatTypeFunc,
 	KwLike:    KwCatTypeFunc,
 	KwIlike:   KwCatTypeFunc,
 	KwSimilar: KwCatTypeFunc,

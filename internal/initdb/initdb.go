@@ -6202,8 +6202,15 @@ func pgAttrColDefs() []catalog.Column {
 		// here made the decoder hand back the raw blob as a KindString (pg_dump then
 		// failed to parse the ACL). Mirrors pg_type.typacl. M0119-0004-ACLHEAP.
 		{Name: "attacl", Type: catalog.Type{Name: "aclitem[]"}},
-		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
-		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
+		// attoptions/attfdwoptions are `text[]` per
+		// postgres/src/include/catalog/pg_attribute.h:175,178 (`text
+		// attoptions[1]`/`text attfdwoptions[1]`) — a one-element varlena
+		// array, not a scalar text column. misc_sanity.sql's toast-table
+		// sanity check joins pg_class/pg_attribute and casts atttypid::regtype,
+		// so a scalar `text` here (typid 25) instead of the array (typid 1009)
+		// silently changed which rows the query reports. M0134-0142.
+		{Name: "attoptions", Type: catalog.Type{Name: "text[]"}},
+		{Name: "attfdwoptions", Type: catalog.Type{Name: "text[]"}},
 		// attmissingval is `anyarray` (OID 2277) per
 		// postgres/src/include/catalog/pg_attribute.h:184 — the fast-default
 		// value is a one-element ArrayType (StoreAttrMissingVal, heap.c:2030),

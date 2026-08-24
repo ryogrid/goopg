@@ -64,7 +64,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, connTx.NonSuperuserRole, sess); handled {
 				return res, qerr
 			}
-			if res, qerr, handled := s.tryCompatNoopExtended(query); handled {
+			if res, qerr, handled := s.tryCompatNoopExtended(query, connTx.NonSuperuserRole, connTx.SessionUser); handled {
 				return res, qerr
 			}
 			msg, extra := syntaxErrorMsg(err)
@@ -78,6 +78,14 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 				case libpq.FieldHint:
 					qerr.Hint = f.Value
 				}
+			}
+			// M0134-0155: a PARSE-time error inside an explicit transaction
+			// aborts the block (25P02 for subsequent statements) — same
+			// postgres.c semantics as the simple-query path's parse-error
+			// gate and this file's M0132-S5 execution-error gates.
+			if connTx != nil && connTx.InExplicit() {
+				connTx.Fail()
+				connTx.ReleasePinnedSnapshotOnFail(s.cfg.TxnMgr)
 			}
 			return nil, qerr
 		}
@@ -650,7 +658,7 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName, actingRole st
 		}
 		return &extendedQueryResult{CommandTag: databaseDDLCommandTag(query), Notice: notice}, nil, true
 	}
-	if handled, herr := s.tryHandleRoleDDL(query, dbName, resolveCurrentGUC); handled {
+	if handled, herr := s.tryHandleRoleDDL(query, dbName, resolveCurrentGUC, actingRole); handled {
 		if herr != nil {
 			return nil, &extendedQueryError{Code: roleErrorSQLState(herr), Message: herr.Error(), Detail: roleErrorDetail(herr)}, true
 		}
@@ -683,14 +691,14 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName, actingRole st
 //
 // Returns handled=false when query does not match any compatNoopCommandTag
 // prefix, so the caller falls through to its normal syntax-error path.
-func (s *Server) tryCompatNoopExtended(query string) (*extendedQueryResult, *extendedQueryError, bool) {
+func (s *Server) tryCompatNoopExtended(query string, actingRole, sessionUser string) (*extendedQueryResult, *extendedQueryError, bool) {
 	tag, ok := compatNoopCommandTag(query)
 	if !ok {
 		return nil, nil, false
 	}
 	if tag == "CREATE SCHEMA" {
-		if werr := s.registerCompatNoopSchema(query); werr != nil {
-			return nil, &extendedQueryError{Code: errcodes.SystemError, Message: werr.Error()}, true
+		if werr := s.registerCompatNoopSchema(query, actingRole, sessionUser); werr != nil {
+			return nil, &extendedQueryError{Code: compatNoopSchemaErrorCode(werr), Message: werr.Error()}, true
 		}
 	}
 	return &extendedQueryResult{CommandTag: tag}, nil, true

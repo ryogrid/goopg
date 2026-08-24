@@ -70,6 +70,12 @@ export LD_LIBRARY_PATH="${PG_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PG_ABS_SRCDIR="${REGRESS_SQL%/*}"   # postgres/src/test/regress (holds data/ and regress.so)
 export PG_LIBDIR="${REGRESS_SQL%/*}"
 export PG_DLSUFFIX=".so"
+# pg_regress.c:735 also exports PG_ABS_BUILDDIR = outputdir (server-side COPY
+# TO/FROM 'filename' tests like copyencoding.sql write under
+# ${outputdir}/results/); without it :abs_builddir stays a literal, unset psql
+# variable and every such COPY fails to open the resulting bogus path.
+export PG_ABS_BUILDDIR="${REGRESS_SQL%/*}"
+mkdir -p "${PG_ABS_BUILDDIR}/results"
 
 # Export the same session-format env vars pg_regress sets before invoking each
 # test's psql client (postgres/src/test/regress/pg_regress.c:783-796), so the
@@ -306,6 +312,24 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     else
         echo "pg-regress-runner: running create_aggregate.sql (user-defined aggregates for aggregates.sql)..."
         "${PSQL[@]}" -f "${REGRESS_SQL}/create_aggregate.sql" >/dev/null 2>&1 || true
+    fi
+    # amutils.sql's own header names its prerequisites explicitly ("amutils
+    # depends on geometry, create_index_spgist, hash_index, brin" —
+    # postgres/src/test/regress/parallel_schedule:79) — it reads indexes
+    # (gcircleind, sp_radix_ind/sp_quad_ind, hash_i4_index, brinidx) those
+    # four files create rather than creating any of its own. Gated on
+    # amutils being requested (unlike the four prereqs above, nothing else
+    # in QUICK_TESTS/the named-test set needs this heavier quartet run
+    # every time). M0134-0090.
+    if is_named_test "amutils"; then
+        for prereq in geometry create_index_spgist hash_index brin; do
+            if is_named_test "${prereq}"; then
+                echo "pg-regress-runner: skipping ${prereq}.sql prerequisite (it is also the requested named test — will run once, as the test itself)"
+            else
+                echo "pg-regress-runner: running ${prereq}.sql (amutils.sql index prerequisite)..."
+                timeout 300 "${PSQL[@]}" -f "${REGRESS_SQL}/${prereq}.sql" >/dev/null 2>&1 || true
+            fi
+        done
     fi
     echo "pg-regress-runner: setup done."
 fi

@@ -157,6 +157,14 @@ func pgHashUint32Extended(k uint32, seed uint64) uint64 {
 	return (uint64(b) << 32) | uint64(c)
 }
 
+// pgHashUint32 is hash_bytes_uint32 from hashfn.c — the non-extended,
+// 32-bit-result sibling of pgHashUint32Extended, i.e. its low 32 bits with
+// seed 0. Base primitive for the SQL-callable hashint2/hashint4/hashoid/
+// hashchar family (evalHashFunc, expr.go). M0134-0128.
+func pgHashUint32(k uint32) uint32 {
+	return uint32(pgHashUint32Extended(k, 0))
+}
+
 // computeHashPartitionRowHash folds the hash of every non-NULL HASH partition
 // key column into a single 64-bit row hash, mirroring PG's
 // satisfies_hash_partition()/compute_partition_hash_value() in

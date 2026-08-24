@@ -1,13 +1,16 @@
 package executor
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // TestInsertRuntimeUniqueViolationRaises23505 pins the M0100-0005r fix:
@@ -200,6 +203,98 @@ func TestIsLiveForUniqueCheck_SelfXactDeleteIsDead(t *testing.T) {
 	}
 	if got := isLiveForUniqueCheck(ctx, priorXID, otherXID); !got {
 		t.Fatalf("isLiveForUniqueCheck(xmin=prior-committed, xmax=other-active) = false; want true (concurrent delete, not yet committed)")
+	}
+}
+
+// TestUniqueCheckWait_SubXidSelfNoDeadlock pins the M0134-0077 Bucket A fix
+// (docs/design/m0134-0077-unique-check-subxid-self-wait.md): a duplicate-key
+// INSERT whose conflicting tuple was stamped by the session's own *sub*-XID
+// (the `SAVEPOINT x; INSERT …; INSERT …` shape that hung transactions.sql at
+// file line 344) must be classified as a live self-conflict and raise 23505,
+// not enter uniqueCheckWithWait's WaitForXID branch. The per-statement
+// ctx.Tx.XID is rebuilt from the top-level transaction (dispatch.go:316) while
+// EffectiveWriterXID stamps the row with the current sub-XID, so the old
+// `xmin == ctx.Tx.XID` test missed the sub-XID and blocked forever on goopg's
+// own subtransaction.
+func TestUniqueCheckWait_SubXidSelfNoDeadlock(t *testing.T) {
+	ctx, tbl, cols, cleanup := uniqueCheckFixture(t)
+	defer cleanup()
+
+	// 1. Classification unit checks (deterministic, no timing): the fixture's
+	// INSERTs ran under the session's top-level XID; register a synthetic
+	// sub-XID of it (as execSavepoint does) and check both siblings.
+	topXID, err := ctx.TxnMgr.AssignXID(ctx.Tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx.Tx.XID = topXID
+	subXID := topXID + 100
+	ctx.TxnMgr.RegisterSubXid(subXID, topXID)
+
+	otherTx, err := ctx.TxnMgr.Begin(ctx.Tx.Isolation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherXID, err := ctx.TxnMgr.AssignXID(otherTx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !xidIsSelf(ctx, subXID) {
+		t.Fatalf("xidIsSelf(subXID=%d) = false; want true (sub-XID of own top-level xact)", subXID)
+	}
+	if xidIsSelf(ctx, otherXID) {
+		t.Fatalf("xidIsSelf(otherXID=%d) = true; want false (foreign in-flight xact)", otherXID)
+	}
+	if !isLiveForUniqueCheck(ctx, subXID, storage.InvalidTransactionID) {
+		t.Fatal("isLiveForUniqueCheck(xmin=own-subXID, xmax=invalid) = false; want true (live duplicate)")
+	}
+
+	// 2. Drive the uniqueness probe itself against a tuple whose xmin is our
+	// own sub-XID (the strongest form). Guard the wait with a bounded ctx.Ctx
+	// so a regression fails fast instead of hanging the suite.
+	insert := func(id int64, label string) {
+		t.Helper()
+		advanceStmtCounter(ctx)
+		op, err := Build(&optimizer.Insert{
+			Table:       tbl,
+			Source:      &optimizer.Values{Rows: [][]optimizer.Expr{{&optimizer.IntegerConst{Value: id}, &optimizer.StringConst{Value: label}}}},
+			ColumnIndex: []int{0, 1},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatal(err)
+		}
+		_, err = op.Next()
+		_ = op.Close()
+		if err != nil && err != EOF {
+			t.Fatalf("insert id=%d: %v", id, err)
+		}
+	}
+
+	// Stamp a fresh row with the sub-XID (EffectiveWriterXID inside an open
+	// savepoint), then restore the per-statement top-level context.
+	ctx.Tx.XID = subXID
+	insert(7, "sub")
+	ctx.Tx.XID = topXID
+
+	guard, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx.Ctx = guard
+
+	start := time.Now()
+	err = checkUniqueIndexesForInsert(ctx, tbl, cols, Row{NewIntDatum(7), NewStringDatum("dup")}, 0)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("unique check took %v; wait branch blocked on our own sub-XID (M0134-0077 regression)", elapsed)
+	}
+	if err == nil {
+		t.Fatal("checkUniqueIndexesForInsert(dup id=7) returned nil; want 23505 (live self sub-XID conflict)")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "23505" {
+		t.Fatalf("want *ExecError 23505, got %T %v", err, err)
 	}
 }
 

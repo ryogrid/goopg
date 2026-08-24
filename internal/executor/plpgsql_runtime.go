@@ -160,7 +160,7 @@ func (f *plpgsqlFrame) isRecordVar(name string) bool {
 // Mirrors PostgreSQL's expanded-record representation; shared by SELECT … INTO
 // (bindSelectIntoRow) and the record FOR-loop binding. M0118-0008
 // (plpgsql-toast assign3/4/5/6).
-func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, frame *plpgsqlFrame) {
+func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, frame *plpgsqlFrame, ctx *Context) {
 	name := strings.ToLower(varName)
 	for i, sc := range schema {
 		colKey := "_" + name + "_" + strings.ToLower(sc.Name)
@@ -187,7 +187,23 @@ func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, fr
 	cf := make([]catalog.CompositeField, len(schema))
 	for i, sc := range schema {
 		if i < len(row) && !row[i].IsNull() {
-			parts[i] = row[i].Format()
+			d := row[i]
+			// A regclass-typed field must flatten to its resolved relation
+			// name, not the bare catalog OID — this composite text is the
+			// ONLY representation `fk.field` dot-access re-derives its value
+			// from (lowerPLpgSQLExpr's *parser.ColumnRef composite-field
+			// branch), and it recovers types purely by sniffing whether the
+			// substring parses as an integer. Left unresolved, any regclass
+			// OID collapses to a bare IntegerConst on read, breaking both
+			// `fk.field::text` and RAISE '%' formatting (surfaced by
+			// pg_get_catalog_foreign_keys()'s fktable/pktable columns).
+			// M0134-0146.
+			if strings.EqualFold(sc.Type.Name, "regclass") && d.Kind == KindInt && ctx != nil && ctx.Catalog != nil {
+				connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+				parts[i] = regclassOIDToName(ctx, connDBOid, uint32(d.Int))
+			} else {
+				parts[i] = d.Format()
+			}
 		}
 		cf[i] = catalog.CompositeField{Name: sc.Name, ColType: sc.Type.Name}
 	}
@@ -204,7 +220,7 @@ func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, fr
 //   - multiple targets bind result columns positionally to scalar variables.
 //
 // A missing column yields NULL. M0118-0008 (plpgsql-toast).
-func bindSelectIntoRow(targets []string, row Row, schema optimizer.Schema, frame *plpgsqlFrame) {
+func bindSelectIntoRow(targets []string, row Row, schema optimizer.Schema, frame *plpgsqlFrame, ctx *Context) {
 	if len(targets) == 0 {
 		return
 	}
@@ -228,7 +244,7 @@ func bindSelectIntoRow(targets []string, row Row, schema optimizer.Schema, frame
 				return
 			}
 		}
-		bindRecordRowComposite(name, row, schema, frame)
+		bindRecordRowComposite(name, row, schema, frame, ctx)
 		return
 	}
 	for i, tgt := range targets {
@@ -310,12 +326,31 @@ func routineArgTypesStr(r *catalog.Routine) string {
 	return strings.Join(names, ", ")
 }
 
+// maxRoutineCallDepth bounds nested stored-routine calls (Context.RoutineDepth)
+// to keep a self- or mutually-recursive SQL/PL/pgSQL function from smashing
+// the Go goroutine stack — see the Context.RoutineDepth doc comment. PG's
+// equivalent (check_stack_depth) trips at whatever depth the platform's
+// max_stack_depth GUC (default 2MB) permits, which in practice is on the
+// order of a few thousand nested calls for a simple recursive SQL function;
+// this cap is set in the same range, comfortably above any legitimate
+// recursion depth exercised by the regress suite (plpgsql_control.sql's
+// deepest test recurses well under 100 levels) while triggering long before
+// Go's default 1GB max goroutine stack is at risk.
+const maxRoutineCallDepth = 2000
+
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	// Procedures cannot be called via SELECT - only via CALL.
 	if r.IsProcedure {
 		return NullDatum, &ExecError{Code: "42809", Pos: pos,
 			Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, routineArgTypesStr(r)),
 			Hint:    "To call a procedure, use CALL."}
+	}
+	if ctx != nil {
+		ctx.RoutineDepth++
+		defer func() { ctx.RoutineDepth-- }()
+		if ctx.RoutineDepth > maxRoutineCallDepth {
+			return Datum{}, &ExecError{Code: "54001", Pos: pos, Message: "stack depth limit exceeded"}
+		}
 	}
 	// Cumulative function statistics (pgstat). When the calling session's
 	// track_functions GUC enables it, time the call and accumulate one
@@ -1937,7 +1972,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				return Datum{}, flowNone, &ExecError{Code: "P0003", Message: "query returned more than one row"}
 			}
 		}
-		bindSelectIntoRow(s.Targets, firstRow, schema, frame)
+		bindSelectIntoRow(s.Targets, firstRow, schema, frame, ctx)
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.ForSelectStmt:
@@ -2035,7 +2070,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				// was the value length, not the composite length. M0118-0008
 				// (plpgsql-toast assign5/6).
 				if frame.isRecordVar(varName) {
-					bindRecordRowComposite(varName, row, schema, frame)
+					bindRecordRowComposite(varName, row, schema, frame, ctx)
 				} else if len(schema) == 1 {
 					if idx, ok := frame.indexByName[varName]; ok {
 						if len(row) > 0 {
@@ -2602,6 +2637,27 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		if err != nil {
 			return nil, err
 		}
+		if x.IsSlice {
+			// array[lower:upper] slice read (M0134-0079). Either bound may
+			// be omitted; mirror the planner's resolveExpr convention of
+			// stamping a NullConst so the shared array_slice evaluator
+			// defaults it to that dimension's actual bound.
+			lower := optimizer.Expr(&optimizer.NullConst{})
+			if x.Index != nil {
+				lower, err = lowerPLpgSQLExpr(x.Index, frame)
+				if err != nil {
+					return nil, err
+				}
+			}
+			upper := optimizer.Expr(&optimizer.NullConst{})
+			if x.Upper != nil {
+				upper, err = lowerPLpgSQLExpr(x.Upper, frame)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return &optimizer.FuncCall{Name: "array_slice", Args: []optimizer.Expr{arr, lower, upper}}, nil
+		}
 		sub, err := lowerPLpgSQLExpr(x.Index, frame)
 		if err != nil {
 			return nil, err
@@ -2908,11 +2964,20 @@ func injectTriggerVars(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) {
 //   - (newRow, true, nil): trigger returned a row (BEFORE triggers use this)
 //   - (nil, true, nil): trigger returned NULL (skip the row)
 //   - (nil, false, err): execution error
+//   - (nil, false, nil): trigger not executed (non-plpgsql — row proceeds
+//     unmodified)
 //
-// M0096-0012.
+// M0096-0012; M0134-0078 B7.
 func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Context) (Row, bool, error) {
 	if strings.ToLower(r.Language) != "plpgsql" {
-		return nil, true, nil // non-plpgsql trigger: pass-through
+		// Non-plpgsql trigger (e.g. LANGUAGE C): goopg has no C executor, so it
+		// cannot run the body. Skip it and let the row proceed unmodified —
+		// ok==false sends fireTriggers down its `!ok → continue` pass-through.
+		// ok==true here would be read as "RETURN NULL → suppress the row", which
+		// is wrong for a trigger we never executed (matches the
+		// lookupTriggerRoutine == nil → skip stance). M0134-0078 B7;
+		// postgres/src/backend/commands/trigger.c ExecCallTriggerFunc.
+		return nil, false, nil
 	}
 	block, err := plpgsql.Parse(r.Body)
 	if err != nil {

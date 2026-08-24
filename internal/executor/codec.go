@@ -164,10 +164,17 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	// read, so `'{"b":1,"a":2}'::jsonb` renders `{"a": 2, "b": 1}`. goopg stored
 	// the text verbatim; canonicalising here makes a jsonb column hold the same
 	// text PG would show, and adds the 22P02 validation the bare pass-through
-	// was missing. `json` (text) is deliberately untouched — it preserves the
-	// input spelling.
+	// was missing. `json` (text) is deliberately left with its input spelling
+	// untouched (no re-serialisation) but still validated for syntax — must
+	// agree with evalCast's `::json` arm (Hard-won Rule #2). M0134-0120.
 	if tname == "jsonb" {
 		return canonicalizeJSONB(s)
+	}
+	if tname == "json" {
+		if err := validateJSONText(s); err != nil {
+			return "", err
+		}
+		return s, nil
 	}
 
 	// The declared length of a varchar(n)/char(n) counts CHARACTERS, not bytes:
@@ -233,8 +240,167 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			}
 			s = stripped
 		}
+	} else if tname == "bit" {
+		// bit(n): fixed-length, EXACT bit count — no padding/truncation on
+		// assignment. Mirrors varbit.c bit_in's binary-digit scan (only '0'/
+		// '1' accepted, ERRCODE_INVALID_TEXT_REPRESENTATION 22P02 on anything
+		// else) followed by the exact-length check (ERRCODE_STRING_DATA_
+		// LENGTH_MISMATCH 22026 when atttypmod is set and bitlen != atttypmod).
+		// A B'...'/X'...' literal (decodeBitStringLit, internal/parser/expr.go)
+		// already validated its own digit set at parse time, but this is the
+		// single chokepoint every OTHER path into a bit(n) column also passes
+		// through — a plain string literal (`'10'::bit(11)`, implicit
+		// assignment coercion) or a computed text value never went through the
+		// parser's literal decoder at all. M0134-0092.
+		if err := validateBitDigits(s); err != nil {
+			return "", err
+		}
+		if len(t.Args) > 0 {
+			n := int(t.Args[0])
+			if len(s) != n {
+				return "", &ExecError{Code: "22026",
+					Message: fmt.Sprintf("bit string length %d does not match type bit(%d)", len(s), n)}
+			}
+		}
+	} else if tname == "varbit" || tname == "bit varying" {
+		// bit varying(n): like bit(n) but the length check is an upper bound
+		// (ERRCODE_STRING_DATA_RIGHT_TRUNCATION 22001, "too long"), not an
+		// exact match — varbit.c varbit_in's `bitlen > atttypmod` arm.
+		if err := validateBitDigits(s); err != nil {
+			return "", err
+		}
+		if len(t.Args) > 0 {
+			n := int(t.Args[0])
+			if len(s) > n {
+				return "", &ExecError{Code: "22001",
+					Message: fmt.Sprintf("bit string too long for type bit varying(%d)", n)}
+			}
+		}
+	} else if tname == "box" {
+		// box: validate + canonicalize on assignment, mirroring box_in
+		// (postgres/src/backend/utils/adt/geo_ops.c) — the single chokepoint
+		// every path into a box column shares (plain string literal,
+		// implicit coercion, computed text value), not just a `box '...'`
+		// typed literal (which routes through evalTypedStringLit instead,
+		// same parseBoxLiteral). Previously a box column was raw-varlena
+		// pass-through: any string, well-formed or not, was stored
+		// verbatim with no reordering of corners. M0134-0094.
+		hx, hy, lx, ly, ok := parseBoxLiteral(s)
+		if !ok {
+			return "", &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type box: %q", s)}
+		}
+		s = boxCanonicalText(hx, hy, lx, ly)
+	} else if tname == "circle" {
+		// circle: validate + canonicalize on assignment, mirroring circle_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box above. M0134-0098.
+		cx, cy, r, ok := parseCircleLiteral(s)
+		if !ok {
+			return "", &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type circle: %q", s)}
+		}
+		s = circleCanonicalText(cx, cy, r)
+	} else if tname == "line" {
+		// line: validate + canonicalize on assignment, mirroring line_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box/circle above. M0134-0136.
+		la, lb, lc, lerr := parseLineLiteral(s)
+		if lerr != nil {
+			return "", lerr
+		}
+		s = lineCanonicalText(la, lb, lc)
+	} else if tname == "lseg" {
+		// lseg: validate + canonicalize on assignment, mirroring lseg_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box/circle/line above — but lseg_in has no coefficient
+		// form and no distinct-points check (unlike line). M0134-0137.
+		x1, y1, x2, y2, lerr := parseLsegLiteral(s)
+		if lerr != nil {
+			return "", lerr
+		}
+		s = lsegCanonicalText(x1, y1, x2, y2)
+	} else if tname == "path" {
+		// path: validate + canonicalize on assignment, mirroring path_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box/circle/line/lseg above. Previously a path column
+		// was raw-varlena pass-through: any string, well-formed or not, was
+		// stored verbatim with no open/closed normalization. M0134-0149.
+		pts, closed, perr := parsePathLiteral(s)
+		if perr != nil {
+			return "", perr
+		}
+		s = pathCanonicalText(pts, closed)
+	} else if tname == "point" {
+		// point: validate + canonicalize on assignment, mirroring point_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box/circle/line/lseg/path above. Unlike those, point
+		// had NO parser at all before this — a raw-varlena pass-through
+		// accepting any string verbatim (garbage like "asdfasdf" or
+		// "(10.0 10.0)" was stored unchanged). M0134-0150.
+		px, py, perr := parsePointLiteral(s)
+		if perr != nil {
+			return "", perr
+		}
+		s = pointCanonicalText(px, py)
+	} else if tname == "polygon" {
+		// polygon: validate + canonicalize on assignment, mirroring poly_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box/circle/line/lseg/path/point above. polygon had NO
+		// parser at all before this — a raw-varlena pass-through accepting
+		// any string verbatim. M0134-0151.
+		pts, perr := parsePolygonLiteral(s)
+		if perr != nil {
+			return "", perr
+		}
+		s = polygonCanonicalText(pts)
+	} else if tname == "inet" || tname == "cidr" {
+		// inet/cidr: validate + canonicalize on assignment, mirroring PG's
+		// network_in/network_out (postgres/src/backend/utils/adt/network.c),
+		// same chokepoint pattern as box/circle above. M0134-0130.
+		out, eerr := normalizeInetCidrText(s, tname == "cidr")
+		if eerr != nil {
+			return "", eerr
+		}
+		s = out
+	} else if tname == "macaddr" {
+		// macaddr: validate + canonicalize on assignment, mirroring
+		// macaddr_in/macaddr_out (postgres/src/backend/utils/adt/mac.c), same
+		// chokepoint pattern as box/circle/line/lseg/inet above. Previously a
+		// macaddr column was raw-varlena pass-through: any string was stored
+		// verbatim, so '08-00-2b-01-02-03' and '08:00:2b:01:02:03' compared
+		// unequal and 'not even close' inserted cleanly. M0134-0138.
+		a, b2, c, d, e, f, merr := parseMacaddrLiteral(s)
+		if merr != nil {
+			return "", merr
+		}
+		s = macaddrCanonicalText(a, b2, c, d, e, f)
+	} else if tname == "macaddr8" {
+		// macaddr8: validate + canonicalize on assignment, mirroring
+		// macaddr8_in/macaddr8_out (postgres/src/backend/utils/adt/mac8.c),
+		// same chokepoint pattern as macaddr above — previously zero
+		// executor support at all. M0134-0139.
+		a, b2, c, d, e, f, g, h, merr := parseMacaddr8Literal(s)
+		if merr != nil {
+			return "", merr
+		}
+		s = macaddr8CanonicalText(a, b2, c, d, e, f, g, h)
 	}
 	return s, nil
+}
+
+// validateBitDigits checks that s contains only '0'/'1' characters, matching
+// varbit.c bit_in/varbit_in's binary-digit scan. Reports the first offending
+// character with PG's exact wording and SQLSTATE (22P02,
+// ERRCODE_INVALID_TEXT_REPRESENTATION).
+func validateBitDigits(s string) error {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '0' && s[i] != '1' {
+			return &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("%q is not a valid binary digit", string(s[i]))}
+		}
+	}
+	return nil
 }
 
 // pgBoolIn reproduces PostgreSQL's boolean input conversion —
@@ -2085,8 +2251,44 @@ func pgUnsignedIDFromDatum(d Datum, typeName string, bits int) (uint64, error) {
 	case KindInt:
 		v = d.Int
 	case KindString:
+		s := strings.TrimSpace(d.StringValue())
+		// xid/xid8's own *in functions (xidin/xid8in) route through
+		// uint32in_subr/uint64in_subr, which call strto[u]l(s, &endptr, 0) —
+		// base 0, so octal ("0NNN") and hex ("0xNNN") literals are valid
+		// alongside decimal (postgres/src/backend/utils/adt/numutils.c:985-992,
+		// xid.c:187-201). coerceStringToInt64 (below) is decimal-only, which
+		// is right for oid/regproc's typed-literal path elsewhere but wrong
+		// here for xid/xid8: an `INSERT INTO t(x xid8) VALUES ('0x2a')` (a
+		// string literal implicitly coerced into the column at heap-encode
+        // time, NOT through evalCast's `'…'::xid8` parseXid8) previously
+		// raised a spurious 22003 "out of range" instead of decoding the hex.
+		// M0134-0087 (xid.sql sizing) — the CastExpr path (evalCast, expr.go)
+		// already had working parseXid/parseXid8; this was the sibling gap
+		// (pattern_sibling_paths_must_agree).
+		if typeName == "xid" || typeName == "xid8" {
+			if s == "-1" {
+				v = -1 // two's-complement image of all-ones, correct for both widths
+				break
+			}
+			if bits == 32 {
+				n, err := parseXid(s)
+				if err != nil {
+					return 0, &ExecError{Code: "22P02",
+						Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, s)}
+				}
+				v = int64(n)
+			} else {
+				n, err := parseXid8(s)
+				if err != nil {
+					return 0, &ExecError{Code: "22P02",
+						Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, s)}
+				}
+				v = int64(n)
+			}
+			break
+		}
 		var err error
-		v, err = coerceStringToInt64(d.StringValue(), typeName)
+		v, err = coerceStringToInt64(s, typeName)
 		if err != nil {
 			return 0, err
 		}

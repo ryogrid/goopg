@@ -214,6 +214,41 @@ func regprocedureNamePart(s string) string {
 	return s
 }
 
+// regoperatorNameAndArgs splits a `'name(left,right)'::regoperator` input
+// into its operator symbol and two argument-type spellings, mirroring
+// parseNameAndArgTypes' 2-arg case for regoperatorin (postgres/src/backend/
+// utils/adt/regproc.c:639-676) — unlike regprocedureNamePart's deliberate
+// name-only leniency, the operator's (left,right) pair is REQUIRED here to
+// disambiguate an overloaded symbol (alter_operator.sql declares both
+// `=== (boolean, boolean)` and `=== (boolean, real)`; resolving by name alone
+// would pick the wrong one). `NONE` denotes a missing operand of a unary
+// operator (leftType=="" / rightType==""), matching format_operator's own
+// output spelling. ok=false for anything not shaped like `name(a,b)` — a bare
+// name (no parens) or a single-argument list falls through to the caller's
+// existing numeric-OID/unresolved handling, matching regoperatorin's
+// "missing argument" case loosely (goopg does not special-case that error
+// message). M0134-0089.
+func regoperatorNameAndArgs(s string) (name, leftType, rightType string, ok bool) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 || !strings.HasSuffix(s, ")") {
+		return "", "", "", false
+	}
+	argsPart := s[open+1 : len(s)-1]
+	parts := strings.Split(argsPart, ",")
+	if len(parts) != 2 {
+		return "", "", "", false
+	}
+	leftType = strings.TrimSpace(parts[0])
+	rightType = strings.TrimSpace(parts[1])
+	if strings.EqualFold(leftType, "NONE") {
+		leftType = ""
+	}
+	if strings.EqualFold(rightType, "NONE") {
+		rightType = ""
+	}
+	return strings.TrimSpace(s[:open]), leftType, rightType, true
+}
+
 func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum, error) {
 	if v.Kind != KindString {
 		// numeric literal / already-OID datum — the heap arm range-checks.
@@ -312,6 +347,16 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		}
 		if bp, found := catalog.LookupBuiltinProc(fn); found {
 			return NewIntDatum(int64(bp.OID)), nil
+		}
+		// CREATE AGGREGATE routines never land in the Routines() registry
+		// (they live in their own userAggregates map — see
+		// InMemory.RegisterUserAggregate) even though writeAggregateCatalogRows
+		// gives them a real pg_proc heap row with prokind='a'. Without this
+		// fallback, `'myavg'::regproc` (and any pg_aggregate query keyed off
+		// it, per create_aggregate.sql) misses despite the pg_proc row being
+		// visible to a plain SELECT. M0134-0108.
+		if agg, ok := ctx.Catalog.LookupUserAggregateByName(fn); ok {
+			return NewIntDatum(int64(agg.OID)), nil
 		}
 		return NullDatum, &ExecError{Code: "42883", Pos: pos,
 			Message: fmt.Sprintf("function %q does not exist", raw)}
@@ -554,6 +599,17 @@ func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func
 				if r := rs.LookupByOID(oid); r != nil {
 					return regOutQualified(r.Schema, r.Name, qualify(r.Schema))
 				}
+			}
+			// CREATE AGGREGATE routines live in their own userAggregates map,
+			// not Routines() — sibling of regIdentifierInput's/CastExpr's
+			// input-side fallback just above (Hard-won Rule #2). Without this,
+			// an aggfnoid::regproc render (create_aggregate.sql's catalog
+			// SELECTs) falls through to the raw-OID pass-through below instead
+			// of PG's resolved name. M0134-0108. UserAggregate carries no
+			// per-object schema today, so this always renders bare/unqualified
+			// (matching the common public-schema case the test exercises).
+			if agg, ok := cat.LookupUserAggregateByOID(oid); ok {
+				return pgQuoteIdent(agg.Name)
 			}
 		}
 	case "regprocedure":

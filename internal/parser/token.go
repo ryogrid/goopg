@@ -20,6 +20,14 @@ const (
 	// NUMERIC waits on the type system.
 	TokenNumericLit
 	TokenStringLit
+	// TokenBitStringLit covers both bit-string (B'...') and hex-string
+	// (X'...') literals (PG SQL99 bit-type literal syntax; scan.l's
+	// xbstart/xhstart, gram.y AexprConst BCONST/XCONST). Value carries a
+	// leading marker byte ('b' or 'x', mirroring scan.l's own convention
+	// of prefixing addlitchar('b'|'x', ...) onto the buffer) followed by
+	// the raw, unvalidated source digits — decodeBitStringLit in select.go
+	// validates and decodes it. M0134-0092.
+	TokenBitStringLit
 	TokenParam // $N
 	TokenSymbol
 	TokenOperator
@@ -249,6 +257,12 @@ const (
 
 	// M0097-0014: CHECK constraints.
 	KwCheck Keyword = "check"
+
+	// M0134-0112: postfix `expr ISNULL` / `expr NOTNULL` — historical
+	// PostgreSQL synonyms for `expr IS [NOT] NULL` (kwlist.h: both
+	// TYPE_FUNC_NAME_KEYWORD, gram.y a_expr ISNULL / a_expr NOTNULL).
+	KwIsnull  Keyword = "isnull"
+	KwNotnull Keyword = "notnull"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -402,6 +416,8 @@ var keywords = map[string]Keyword{
 	"matched":      KwMatched,
 	"trigger":      KwTrigger,
 	"check":        KwCheck,
+	"isnull":       KwIsnull,
+	"notnull":      KwNotnull,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

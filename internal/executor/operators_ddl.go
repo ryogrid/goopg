@@ -748,6 +748,31 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 		if uc.Provider == 'i' {
 			uc.Rules = s.Rules
 		}
+		// DefineCollation calls builtin_validate_locale (pg_locale.c:1510) for
+		// the builtin provider before the pg_collation insert: only "C",
+		// "C.UTF-8"/"C.UTF8" (canonicalized to "C.UTF-8"), and
+		// "PG_UNICODE_FAST" are recognized — anything else (e.g. "unicode",
+		// "C_UTF8") raises 22023 "invalid locale name %s for builtin
+		// provider" instead of silently registering. goopg previously
+		// accepted any spelling, so `CREATE COLLATION regress_pg_unicode_fast
+		// (provider = builtin, locale = 'unicode')` -- meant to fail per
+		// collate.utf8.sql -- succeeded and left a bogus row behind,
+		// desyncing the following CREATE COLLATION with "already exists"
+		// (M0134-0102). goopg always runs UTF8 (per internal/initdb/locale.go
+		// resolveLocale), so the encoding-vs-locale cross-check
+		// (pg_locale.c:1528-1533, requiring UTF8 for C.UTF-8/PG_UNICODE_FAST)
+		// can never fire and is not reproduced here.
+		if uc.Provider == 'b' {
+			switch uc.Locale {
+			case "C":
+			case "C.UTF-8", "C.UTF8":
+				uc.Locale = "C.UTF-8"
+			case "PG_UNICODE_FAST":
+			default:
+				return &ExecError{Code: "22023", Pos: s.Pos(),
+					Message: fmt.Sprintf("invalid locale name %q for builtin provider", uc.Locale)}
+			}
+		}
 	}
 	if _, err := im.CreateCollation(uc, schema, s.IfNotExists, dbOid); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
@@ -1263,15 +1288,27 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 // commandTagBehavior in cmdtag_table.go).
 func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
 	if o.ctx.NonSuperuserRole != "" {
-		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create event trigger %q", s.Name)}
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create event trigger %q", s.Name), Hint: "Must be superuser to create an event trigger."}
 	}
 	switch s.Event {
 	case "ddl_command_start", "ddl_command_end", "sql_drop", "login", "table_rewrite":
 	default:
 		return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized event name %q", s.Event)}
 	}
-	if s.FilterVar != "" && s.FilterVar != "tag" {
-		return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized filter variable %q", s.FilterVar)}
+	// Validate filter conditions in clause-appearance order, mirroring
+	// CreateEventTrigger's foreach(lc, stmt->whenclause) loop
+	// (event_trigger.c): the first unrecognized filter variable wins, and a
+	// second "tag" clause reports "specified more than once" rather than
+	// silently merging its values into the first (M0134-0122).
+	sawTag := false
+	for _, fv := range s.FilterVars {
+		if !strings.EqualFold(fv, "tag") {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized filter variable %q", fv)}
+		}
+		if sawTag {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("filter variable %q specified more than once", fv)}
+		}
+		sawTag = true
 	}
 	if len(s.Tags) > 0 && s.Event == "login" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tag filtering is not supported for login event triggers"}
@@ -1438,6 +1475,29 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	return nil
 }
 
+// builtinAMHandlerFuncs maps the 7 built-in access-method handler function
+// names (postgres/src/include/catalog/pg_proc.dat) to their fixed pg_proc
+// OID and AM kind ("i"=index, "t"=table) — the same OIDs
+// internal/initdb/pg_proc_seed_data.go seeds at bootstrap (duplicated here,
+// leaf-package style, because internal/executor cannot import internal/initdb;
+// see pg_proc_names_generated.go's header for the established precedent).
+// goopg has no pluggable storage-engine registry — Routines() only holds
+// CREATE FUNCTION routines — so a CREATE ACCESS METHOD ... HANDLER clause
+// naming a built-in handler (create_am.sql's "gist2 ... HANDLER gisthandler")
+// must resolve against this table instead.
+var builtinAMHandlerFuncs = map[string]struct {
+	OID    uint32
+	AMType string
+}{
+	"heap_tableam_handler": {3, "t"},
+	"bthandler":            {330, "i"},
+	"hashhandler":          {331, "i"},
+	"gisthandler":          {332, "i"},
+	"ginhandler":           {333, "i"},
+	"spghandler":           {334, "i"},
+	"brinhandler":          {335, "i"},
+}
+
 // resolveAccessMethodHandlerFunc mirrors lookup_am_handler_func
 // (postgres/src/backend/commands/amcmds.c): the handler must be a routine
 // taking exactly one argument of type "internal" (LookupFuncName(handler_name,
@@ -1466,6 +1526,14 @@ func resolveAccessMethodHandlerFunc(rs *catalog.Routines, funcName parser.Object
 			return 0, &ExecError{Code: "42809", Message: fmt.Sprintf("function %s must return type %s", funcName.String(), expectedRet)}
 		}
 		return r.OID, nil
+	}
+	if funcName.Schema == "" || strings.EqualFold(funcName.Schema, "pg_catalog") {
+		if h, ok := builtinAMHandlerFuncs[strings.ToLower(funcName.Name)]; ok {
+			if h.AMType != amType {
+				return 0, &ExecError{Code: "42809", Message: fmt.Sprintf("function %s must return type %s", funcName.String(), expectedRet)}
+			}
+			return h.OID, nil
+		}
 	}
 	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(internal) does not exist", funcName.String())}
 }
@@ -1675,6 +1743,75 @@ func validateColumnStorage(cat catalog.Catalog, col catalog.Column) *ExecError {
 		Code:    "0A000",
 		Message: fmt.Sprintf("column data type %s can only have storage PLAIN", pgFormatTypeName(col.Type.Name)),
 	}
+}
+
+// validateColumnCompression enforces GetAttributeCompression
+// (postgres/src/backend/commands/tablecmds.c:22043-22076) at both CREATE
+// TABLE time and `ALTER COLUMN ... SET COMPRESSION` time: a non-default
+// method name must be "pglz" or "lz4" (22023 "invalid compression method"
+// otherwise), and a non-default method may only be set on a TOAST-aware
+// column type (0A000 "column data type %s does not support compression" —
+// the same columnTypeStorageCode('p') non-toastable test validateColumnStorage
+// uses). col.Compression == "" (unset, or `SET COMPRESSION default`) always
+// passes. M0134-0105.
+func validateColumnCompression(cat catalog.Catalog, col catalog.Column) *ExecError {
+	if col.Compression == "" {
+		return nil
+	}
+	if col.Compression != "pglz" && col.Compression != "lz4" {
+		return &ExecError{
+			Code:    "22023",
+			Message: fmt.Sprintf("invalid compression method %q", col.Compression),
+		}
+	}
+	if columnTypeStorageCode(cat, col) != 'p' {
+		return nil
+	}
+	return &ExecError{
+		Code:    "0A000",
+		Message: fmt.Sprintf("column data type %s does not support compression", pgFormatTypeName(col.Type.Name)),
+	}
+}
+
+// validateColumnCollation rejects an inline `COLLATE <name>` clause on a
+// column whose type carries no typcollation — PostgreSQL only lets you
+// specify a collation for text/varchar/bpchar/name (and domains/arrays over
+// them); everything else (int, bool, numeric, …) errors 42804 before the
+// collation name is even looked up (transformColumnType,
+// parse_utilcmd.c:4044-4067: "collations are not supported by type %s").
+// declaredTypeName is the ORIGINAL user-written type spelling (e.g. "int"),
+// used verbatim in the error message the way format_type_be reports the
+// column's own declared type; resolvedTypeName is the domain-resolved base
+// type name used to look up collatability (a domain over text is collatable
+// even though the domain's own name isn't a recognized OID). M0134-0101.
+func validateColumnCollation(collation, declaredTypeName, resolvedTypeName string, pos int) *ExecError {
+	if collation == "" {
+		return nil
+	}
+	if columnTypeIsCollatable(resolvedTypeName) {
+		return nil
+	}
+	return &ExecError{
+		Code:    "42804",
+		Pos:     pos,
+		Message: fmt.Sprintf("collations are not supported by type %s", pgFormatTypeName(declaredTypeName)),
+	}
+}
+
+// columnTypeIsCollatable reports whether typName's pg_type.typcollation is
+// non-zero — the same base-type set goopg's other typcollation resolvers
+// special-case (pgTypeofDisplayName in internal/optimizer/planner.go;
+// rangeSubtypeIsCollatable in internal/catalog/catalog.go): text, varchar,
+// bpchar, and name. Arrays inherit their element type's collatability (an
+// int4[] column's Type.Name is the unsuffixed element name "int4" per the
+// ColumnType.IsArray convention, so no separate array case is needed here;
+// the caller already passes the element name).
+func columnTypeIsCollatable(typName string) bool {
+	switch catalog.TypeNameToOID(typName) {
+	case catalog.OIDText, catalog.OIDVarChar, catalog.OIDBpChar, catalog.OIDName:
+		return true
+	}
+	return false
 }
 
 // columnTypeStorageCode returns the intrinsic pg_type typstorage character for
@@ -2182,6 +2319,19 @@ afterExistsCheck:
 			if verr := validateColumnStorage(o.ctx.Catalog, col); verr != nil {
 				return verr
 			}
+			// A declared COMPRESSION method must be "pglz"/"lz4" and the column
+			// type must be TOAST-aware — GetAttributeCompression
+			// (tablecmds.c:22043-22076). M0134-0105.
+			if verr := validateColumnCompression(o.ctx.Catalog, col); verr != nil {
+				return verr
+			}
+			// An inline `COLLATE` clause on a non-collatable column type (e.g.
+			// `a int COLLATE "C"`) is 42804 — transformColumnType
+			// (parse_utilcmd.c:4044-4067) rejects it before the collation name is
+			// even resolved. M0134-0101.
+			if verr := validateColumnCollation(c.Collation, c.Type.Name, typeName, c.Pos()); verr != nil {
+				return verr
+			}
 			merged, err := mergeExplicitColumnIntoInherited(col)
 			if err != nil {
 				return err
@@ -2380,6 +2530,16 @@ afterExistsCheck:
 				if verr := validateColumnStorage(o.ctx.Catalog, catalog.Column{
 					Type:    catalog.Type{Name: typeName, Args: c.Type.Args, IsArray: c.Type.IsArray},
 					Storage: c.Storage,
+				}); verr != nil {
+					return verr
+				}
+			}
+			// Same COMPRESSION-method/type-toastability check as the
+			// BodyOrder addCol path. M0134-0105.
+			if c.Compression != "" {
+				if verr := validateColumnCompression(o.ctx.Catalog, catalog.Column{
+					Type:        catalog.Type{Name: typeName, Args: c.Type.Args, IsArray: c.Type.IsArray},
+					Compression: c.Compression,
 				}); verr != nil {
 					return verr
 				}
@@ -4671,6 +4831,7 @@ func collectCheckExprColumns(e parser.Expr, out *[]string) {
 	case *parser.ArraySubscriptExpr:
 		collectCheckExprColumns(n.Base, out)
 		collectCheckExprColumns(n.Index, out)
+		collectCheckExprColumns(n.Upper, out)
 	}
 }
 
@@ -7306,7 +7467,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE INDEX requires Pool in Context"}
 	}
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	// M0134-0085: was o.ctx.Catalog.LookupTable(s.Table, ...) directly, with no
+	// search_path fallback for an unqualified table name — an unqualified
+	// `CREATE INDEX ON t(...)` under a non-default `SET search_path` always
+	// raised a spurious 42P01 even though the table existed in the searched
+	// schema (confirmed live: SELECT/DROP TABLE resolved the same name fine
+	// via lookupTableWithSearch/its DROP-TABLE-local twin, only this site and
+	// CREATE TRIGGER's sibling below skipped the fallback). lookupTableWithSearch
+	// is the same search-path-walking helper execAlterTable already uses.
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.String())}
 	}
@@ -7329,6 +7498,19 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		return &ExecError{Code: "22023", Pos: s.Pos(),
 			Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", s.Fillfactor),
 			Detail:  "Valid values are between \"10\" and \"100\"."}
+	}
+	// GiST `WITH (buffering=...)` enum storage parameter. goopg doesn't build a
+	// buffering-aware GiST tree, but PG validates the enum unconditionally
+	// (reloptions.c parse_one_reloption) before any index build starts, so an
+	// invalid value must reject the CREATE INDEX rather than silently succeed —
+	// a prior version of this code had no check at all, so
+	// `WITH (buffering=invalid_value)` silently created the index, breaking a
+	// following same-name CREATE INDEX with a spurious "already exists" instead
+	// of the invalid_value error real PG raises (gist.sql, M0134-0127).
+	if s.Buffering != "" && s.Buffering != "on" && s.Buffering != "off" && s.Buffering != "auto" {
+		return &ExecError{Code: "22023", Pos: s.Pos(),
+			Message: fmt.Sprintf("invalid value for enum option \"buffering\": %s", s.Buffering),
+			Detail:  "Valid values are \"on\", \"off\", and \"auto\"."}
 	}
 	// gin_pending_list_limit (GIN integer storage parameter, kB) range-validated
 	// like PG: min 64, max MAX_KILOBYTES (INT_MAX/1024). DU-002 slice 221.
@@ -10226,6 +10408,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				changed := false
 				for i := range tbl.Columns {
 					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						// Same COMPRESSION-method/type-toastability check as
+						// CREATE TABLE's addCol path (GetAttributeCompression,
+						// tablecmds.c:22043-22076/18781). M0134-0105.
+						if verr := validateColumnCompression(o.ctx.Catalog, catalog.Column{
+							Type:        tbl.Columns[i].Type,
+							Compression: act.CompressionType,
+						}); verr != nil {
+							return verr
+						}
 						tbl.Columns[i].Compression = act.CompressionType
 						changed = true
 						break
@@ -11391,7 +11582,26 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	if stmt.Only && o.hasInheritanceChildren(tbl) {
 		return &ExecError{Code: "42P16", Pos: 0, Message: "column must be added to child tables too"}
 	}
-	if col.NotNull {
+	// M0134-0085: PostgreSQL has no "empty tables only" restriction for
+	// `ADD COLUMN ... NOT NULL` at all (postgres/src/backend/commands/
+	// tablecmds.c ATExecAddColumn, ~7217-7500) — that error string does not
+	// exist anywhere in the PG source. With a constant DEFAULT, ATExecAddColumn
+	// records attmissingval (the "fast default" backfill goopg already
+	// implements below via constDefaultDatum/MissingValue) and NOT NULL is
+	// satisfied for every pre-existing row without a rewrite or scan. Only
+	// when NO usable default exists does PG have to validate the constraint
+	// against existing data, and even then it raises a different, later
+	// error ("column %s of relation %s contains null values",
+	// tablecmds.c:6458) rather than refusing outright — so the guard here
+	// must gate on "no fast-default value", not on "table is non-empty".
+	colTypeForDefault := catalog.Type{Name: strings.ToLower(col.Type.Name), Args: append([]int64(nil), col.Type.Args...)}
+	addColMissingValue, hasAddColMissingValue := Datum{}, false
+	if col.DefaultExpr != nil {
+		if d, ok := constDefaultDatum(col.DefaultExpr, colTypeForDefault); ok && !d.IsNull() {
+			addColMissingValue, hasAddColMissingValue = d, true
+		}
+	}
+	if col.NotNull && !hasAddColMissingValue {
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		n, err := o.ctx.Pool.NBlocks(rel)
 		if err != nil {
@@ -11417,7 +11627,7 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	}
 	newCol := catalog.Column{
 		Name:        col.Name,
-		Type:        catalog.Type{Name: strings.ToLower(col.Type.Name), Args: append([]int64(nil), col.Type.Args...)},
+		Type:        colTypeForDefault,
 		NotNull:     col.NotNull,
 		DefaultExpr: col.DefaultExpr,
 	}
@@ -11426,10 +11636,8 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	// record the Datum on the column. The heap decoder uses it to fill the
 	// column for rows that pre-date this ALTER (storedNatts < new ordinal),
 	// so existing rows surface the default without a table rewrite. M0097-0077.
-	if col.DefaultExpr != nil {
-		if d, ok := constDefaultDatum(col.DefaultExpr, newCol.Type); ok && !d.IsNull() {
-			newCol.MissingValue = d
-		}
+	if hasAddColMissingValue {
+		newCol.MissingValue = addColMissingValue
 	}
 	if err := o.addColumnRecursive(tbl, newCol, act, stmt, true); err != nil {
 		return err
@@ -14940,6 +15148,140 @@ func cidrDefaultV4Mask(first byte, nOctets int) int {
 	return bits
 }
 
+// normalizeInetCidrText validates and canonicalises an inet/cidr text literal
+// at the input boundary, mirroring PG's network_in + network_out (postgres/
+// src/backend/utils/adt/network.c:74-158). This is the single chokepoint every
+// path into an inet/cidr COLUMN shares (coerceTextLikeDatum's inet/cidr arm,
+// codec.go — the box/circle canonicalize-on-assignment precedent, M0134-0094/
+// -0098). Unlike box/circle, inet/cidr have no case in evalCast either: an
+// explicit `::inet`/`::cidr` cast on a bare string constant is comparatively
+// rare in the regress corpus and goopg's plain string-literal path already
+// round-trips the input unchanged there, matching the box/circle precedent of
+// leaving the explicit-cast boundary unvalidated for now (ledgered).
+//
+// Previously goopg stored inet/cidr values as raw, unnormalised text: no
+// classful-default-mask expansion ('10' input never became '10.0.0.0/8'), no
+// canonical non-abbreviated output form, and no "bits set to right of mask"
+// validation for cidr at all — every SELECT of a cidr/inet column showed
+// whatever string was typed in, not PG's canonical network_out rendering.
+func normalizeInetCidrText(s string, isCidr bool) (string, *ExecError) {
+	typName := "inet"
+	if isCidr {
+		typName = "cidr"
+	}
+	family, addr, bits, err := parseInetKeyText(s, isCidr)
+	if err != nil {
+		return "", &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typName, s)}
+	}
+	if isCidr {
+		masked := maskInetAddr(addr, bits)
+		for i := range addr {
+			if masked[i] != addr[i] {
+				return "", &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid cidr value: %q", s),
+					Detail:  "Value has bits set to right of mask."}
+			}
+		}
+	}
+	return formatInetAddr(family, addr, bits, isCidr), nil
+}
+
+// formatInetAddr renders an (family, address, bits) triple in PG's canonical
+// inet/cidr text form — pg_inet_net_ntop (postgres/src/port/inet_net_ntop.c)
+// plus network_out's "for CIDR, add /n if not present" step (network.c:
+// 150-157, which is why cidr always shows a mask, even /32, unlike inet).
+func formatInetAddr(family byte, addr []byte, bits int, isCidr bool) string {
+	var s string
+	if family == 2 { // PGSQL_AF_INET
+		s = formatInetV4(addr, bits)
+	} else {
+		s = formatInetV6(addr, bits)
+	}
+	if isCidr && !strings.Contains(s, "/") {
+		s += fmt.Sprintf("/%d", bits)
+	}
+	return s
+}
+
+// formatInetV4 mirrors inet_net_ntop_ipv4 (inet_net_ntop.c:113-152): always
+// prints all four octets regardless of mask length, and omits "/bits" only
+// when bits == 32 (a full-width mask means "just an address").
+func formatInetV4(addr []byte, bits int) string {
+	s := fmt.Sprintf("%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3])
+	if bits != 32 {
+		s += fmt.Sprintf("/%d", bits)
+	}
+	return s
+}
+
+// formatInetV6 mirrors inet_net_ntop_ipv6 (inet_net_ntop.c:177-278): standard
+// "::"-compressed hex-group form, with one PG-specific wrinkle — a run of
+// zero words long enough to reach word index 6 (the last 32 bits) triggers an
+// embedded dotted-decimal tail for those last 4 bytes, UNCONDITIONALLY (not
+// just for the well-known ::ffff:a.b.c.d v4-mapped form Go's net.IP.String()
+// recognises) whenever the leading run is exactly 6 words, or 7 words with a
+// nonzero last word, or 5 words with word[5] == 0xffff. This is why goopg
+// cannot reuse net.IP.String() here: Go collapses ::ffff:1.2.3.4 to the bare
+// "1.2.3.4" and renders ::4.3.2.1 as "::403:201" (pure hex groups) — both
+// wrong for PG's inet/cidr output.
+func formatInetV6(addr []byte, bits int) string {
+	var words [8]uint16
+	for i := 0; i < 16; i++ {
+		words[i/2] |= uint16(addr[i]) << uint((1-(i%2))*8)
+	}
+	bestBase, bestLen := -1, 0
+	curBase, curLen := -1, 0
+	for i := 0; i < 8; i++ {
+		if words[i] == 0 {
+			if curBase == -1 {
+				curBase, curLen = i, 1
+			} else {
+				curLen++
+			}
+		} else if curBase != -1 {
+			if bestBase == -1 || curLen > bestLen {
+				bestBase, bestLen = curBase, curLen
+			}
+			curBase = -1
+		}
+	}
+	if curBase != -1 && (bestBase == -1 || curLen > bestLen) {
+		bestBase, bestLen = curBase, curLen
+	}
+	if bestBase != -1 && bestLen < 2 {
+		bestBase = -1
+	}
+
+	var sb strings.Builder
+	for i := 0; i < 8; i++ {
+		if bestBase != -1 && i >= bestBase && i < bestBase+bestLen {
+			if i == bestBase {
+				sb.WriteByte(':')
+			}
+			continue
+		}
+		if i != 0 {
+			sb.WriteByte(':')
+		}
+		if i == 6 && bestBase == 0 && (bestLen == 6 ||
+			(bestLen == 7 && words[7] != 1) ||
+			(bestLen == 5 && words[5] == 0xffff)) {
+			sb.WriteString(fmt.Sprintf("%d.%d.%d.%d", addr[12], addr[13], addr[14], addr[15]))
+			break
+		}
+		sb.WriteString(fmt.Sprintf("%x", words[i]))
+	}
+	if bestBase != -1 && bestBase+bestLen == 8 {
+		sb.WriteByte(':')
+	}
+	s := sb.String()
+	if bits != 128 {
+		s += fmt.Sprintf("/%d", bits)
+	}
+	return s
+}
+
 // maskInetAddr zeroes the host bits of `addr` to the right of `bits`, yielding
 // the network-prefix component of the inet key.
 func maskInetAddr(addr []byte, bits int) []byte {
@@ -16819,6 +17161,15 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		for _, r := range routines {
 			oid := r.OID
 			if err := rs.RenameRoutine(r, s.RenameTo); err != nil {
+				if errors.Is(err, catalog.ErrRoutineNameConflict) {
+					// Mirrors PG's IsThereFunctionInNamespace() (functioncmds.c),
+					// called before ALTER FUNCTION/PROCEDURE/ROUTINE RENAME TO
+					// re-keys pg_proc: reject instead of silently displacing the
+					// existing routine of the same name+signature.
+					argList := routineArgListStr(argTypes)
+					return &ExecError{Code: "42723", Pos: s.Pos(),
+						Message: fmt.Sprintf("function %s%s already exists in schema %q", s.RenameTo, argList, r.Schema)}
+				}
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
 			// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
@@ -16864,6 +17215,11 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		for _, r := range routines {
 			oid := r.OID
 			if err := rs.SetSchema(r, s.NewSchema); err != nil {
+				if errors.Is(err, catalog.ErrRoutineNameConflict) {
+					argList := routineArgListStr(argTypes)
+					return &ExecError{Code: "42723", Pos: s.Pos(),
+						Message: fmt.Sprintf("function %s%s already exists in schema %q", r.Name, argList, s.NewSchema)}
+				}
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
 			_ = oid
@@ -18505,8 +18861,15 @@ func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog
 }
 
 // execCreateTrigger registers a trigger on a table. M0096-0012.
+//
+// M0134-0085: this and the other 7 trigger-DDL functions below (DROP/ALTER/
+// ENABLE/DISABLE TRIGGER) all previously called o.ctx.Catalog.LookupTable
+// directly with no search_path fallback for an unqualified table name —
+// switched to lookupTableWithSearch (same fallback SELECT/DROP TABLE/
+// execAlterTable already get) so `SET search_path = s; CREATE TRIGGER ...
+// ON t ...` resolves `t` in schema `s` instead of raising a spurious 42P01.
 func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
@@ -18563,7 +18926,7 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 // row-level security — this is schema fidelity only, mirroring the RLS ENABLE
 // flag landed in DU-002 slice 322. DU-002 slice 323.
 func (o *ddlOp) execCreatePolicy(s *parser.CreatePolicyStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
@@ -18628,7 +18991,7 @@ func (o *ddlOp) execCreatePolicy(s *parser.CreatePolicyStmt) error {
 // execDropPolicy removes a row-level security policy from its table. DU-002
 // slice 323.
 func (o *ddlOp) execDropPolicy(s *parser.DropPolicyStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", s.Table.Name))
@@ -18663,7 +19026,7 @@ func (o *ddlOp) execDropPolicy(s *parser.DropPolicyStmt) error {
 // fidelity only; the rule has no runtime effect beyond the COPY-DML rule-kind
 // bookkeeping the CompatNoop path also performed. DU-002 slice 324.
 func (o *ddlOp) execCreateRule(s *parser.CreateRuleStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
@@ -18717,7 +19080,7 @@ func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", sc)}
 		}
 	}
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", s.Table.Name))
@@ -18749,7 +19112,7 @@ func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 // execDropRule handles DROP RULE. Rules are not implemented; always reports
 // "rule does not exist".
 func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
-	_, tblOk := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	_, tblOk := o.lookupTableWithSearch(s.Table)
 	if !tblOk {
 		// When the table is schema-qualified and the schema is not a built-in,
 		// PG emits "schema X does not exist" rather than a rule/relation error.
@@ -18782,7 +19145,7 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 			im.UnregisterTableRules(s.Table.Name)
 			// Drop any modelled DO-NOTHING RuleInfo so it stops being dumped via
 			// pg_rewrite → pg_get_ruledef. DU-002 slice 324.
-			if tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && tbl != nil {
+			if tbl, ok := o.lookupTableWithSearch(s.Table); ok && tbl != nil {
 				filtered := tbl.Rules[:0]
 				for _, r := range tbl.Rules {
 					if r.Name == s.Name {
@@ -18808,7 +19171,7 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 // RenameRewriteRule (including the reserved-name check for "_RETURN", the
 // view SELECT rule, and the duplicate-name collision check). M0134-0065.
 func (o *ddlOp) execAlterRuleRename(s *parser.AlterRuleRenameStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
@@ -19855,6 +20218,24 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					Message: fmt.Sprintf("cannot drop role %s because it is required by the database system", roleName)}
 			}
 			exists := o.ctx.Catalog.RoleExists(roleName)
+			// checkSharedDependencies (postgres/src/backend/catalog/
+			// pg_shdepend.c ~660-870) — refuse the drop while roleName
+			// still holds a table/database ACL grant or owns a table.
+			// Bounded port: see RoleDropDependencyDescriptions's doc
+			// comment (catalog.go) for exactly which dependency shapes are
+			// (and are not) covered. IF EXISTS does not bypass this check
+			// in real PG when the role does exist — only the "does not
+			// exist" branch below is IF-EXISTS-conditional.
+			if exists {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					if deps := im.RoleDropDependencyDescriptions(roleName); len(deps) > 0 {
+						return &ExecError{Code: "2BP01", Pos: s.Pos(),
+							Message: fmt.Sprintf("role %q cannot be dropped because some objects depend on it", roleName),
+							Detail:  strings.Join(deps, "\n"),
+						}
+					}
+				}
+			}
 			if s.IfExists {
 				if !exists {
 					o.ctx.AddNotice(fmt.Sprintf("role %q does not exist, skipping", name.Name))
@@ -19922,8 +20303,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// Canonicalize type names (int → integer, etc.).
 		fromCanon := dropCompatCanonicalType(fromType)
 		toCanon := dropCompatCanonicalType(toType)
-		// Validate unknown types only when they don't look like schema-qualified names.
-		if fromSchema == "" && fromCanon == "" {
+		// Validate unknown types only when they don't look like schema-qualified
+		// names, and only after also checking the user type registries
+		// (enum/domain/composite — the last of which also covers "base" types
+		// created via CREATE TYPE's I/O-function form, since execCreateType
+		// falls back to RegisterCompositeType for them). Without this check a
+		// user-defined cast target/source type (e.g. `DROP CAST (text AS
+		// mytype)`) falsely raised "type does not exist" purely because
+		// dropCompatCanonicalType only recognizes PG's builtin names.
+		// M0134-0110.
+		im, _ := o.ctx.Catalog.(*catalog.InMemory)
+		if fromSchema == "" && fromCanon == "" && !isKnownUserType(im, fromType) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", fromType))
 				return nil
@@ -19931,7 +20321,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", fromType)}
 		}
-		if toSchema == "" && toCanon == "" {
+		if toSchema == "" && toCanon == "" && !isKnownUserType(im, toType) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", toType))
 				return nil
@@ -20547,8 +20937,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					if uc := im.FindConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); uc != nil {
 						convOID = uc.OID
 					}
-					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) && convOID != 0 {
-						deleteConversionCatalogRow(o.ctx, convOID)
+					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+						if convOID != 0 {
+							deleteConversionCatalogRow(o.ctx, convOID)
+						}
+						// M0134-0106: must return here, mirroring the
+						// text-search-dictionary/-configuration cases below.
+						// Without it, a successful drop fell through to the
+						// DropCompatObject gate, which is keyed by the
+						// CREATE-time name string (schema-qualified, e.g.
+						// "public.mydef") while DROP CONVERSION supplies the
+						// bare name — the mismatch made a real, successful
+						// drop raise a spurious "conversion ... does not
+						// exist" (real PG: DropConversionById always
+						// succeeds once name resolution finds the object).
+						im.DropCompatObject(objType, s.Names[0].String())
+						return nil
 					}
 				}
 				if objType == "text search dictionary" {
@@ -20764,18 +21168,71 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	return nil
 }
 
-// castTypeOIDMatch reports whether two type-name spellings denote the same type
-// for CREATE CAST validation. Built-in aliases (integer/int4, boolean/bool, …)
-// are compared by OID via catalog.TypeNameToOID; user/unknown types (OID 0) fall
-// back to a case-insensitive name comparison. goopg does not model
-// binary-coercibility beyond identity, so this is an identity test — PG's
-// IsBinaryCoercibleWithCast additionally accepts an existing binary cast (see
-// the slice-398 deferral ledger row).
-func castTypeOIDMatch(a, b string) bool {
-	if oa, ob := catalog.TypeNameToOID(a), catalog.TypeNameToOID(b); oa != 0 && ob != 0 {
-		return oa == ob
+// castTypeOIDMatch compares two type names for CREATE CAST's argument/return
+// and same-type checks. im is the live catalog (nil in unit tests exercising
+// only builtin types); it is consulted first via resolveUserTypeOID so a
+// user-defined type (CREATE TYPE, including the base/"shell" form) resolves
+// to its own OID instead of falling through catalog.TypeNameToOID's "unknown
+// name" default (OIDText), which previously made every user type falsely
+// compare equal to `text`. M0134-0110. Beyond OID identity, this also accepts
+// an existing WITHOUT FUNCTION/WITH INOUT user cast between a and b as a
+// match — mirroring PG's IsBinaryCoercibleWithCast (cast.c), which lets a
+// WITH FUNCTION cast's argument/return type be merely binary-coercible to
+// (not identical to) the declared source/target, closing the slice-398
+// deferral ledger row's binary-coercibility gap.
+func castTypeOIDMatch(im *catalog.InMemory, a, b string) bool {
+	oa, ob := castResolveTypeOID(im, a), castResolveTypeOID(im, b)
+	if oa != 0 && ob != 0 {
+		if oa == ob {
+			return true
+		}
+	} else if strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b)) {
+		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+	return castUserBinaryCoercible(im, a, b)
+}
+
+// castUserBinaryCoercible reports whether a registered user CREATE CAST …
+// WITHOUT FUNCTION (pg_cast.castmethod 'b') links a and b in either
+// direction — mirroring PG's IsBinaryCoercible, which only a real binary
+// cast satisfies (a WITH INOUT cast still runs the type's own I/O functions,
+// so it is not binary-coercible). PG additionally special-cases domains and
+// a handful of hard-wired pairs (anyarray, etc.); those are out of scope
+// here — only the explicit-cast-registry form CREATE CAST test cases
+// exercise.
+func castUserBinaryCoercible(im *catalog.InMemory, a, b string) bool {
+	if im == nil {
+		return false
+	}
+	if cs := im.CastByTypes(a, b); cs != nil && cs.Method == "b" {
+		return true
+	}
+	if cs := im.CastByTypes(b, a); cs != nil && cs.Method == "b" {
+		return true
+	}
+	return false
+}
+
+// castResolveTypeOID resolves a CREATE CAST source/target/argument type name
+// to its pg_type OID: user registries first (enum/domain/composite — the
+// last of which also covers CREATE TYPE's base/I/O-function form), then the
+// builtin name table. Unlike a bare catalog.TypeNameToOID call, this returns
+// 0 — not the OIDText safe fallback — for a name that matches neither, so an
+// unrecognized name never wrongly compares equal to `text`. The only name
+// catalog.TypeNameToOID's switch statement itself maps to OIDText is the
+// literal "text" case; every other input reaches that value only through its
+// default arm, which is exactly what the EqualFold guard below distinguishes.
+func castResolveTypeOID(im *catalog.InMemory, name string) uint32 {
+	if im != nil {
+		if oid, kind := resolveUserTypeOID(im, name); kind != typeKindNone {
+			return oid
+		}
+	}
+	oid := catalog.TypeNameToOID(name)
+	if oid != catalog.OIDText || strings.EqualFold(strings.TrimSpace(name), "text") {
+		return oid
+	}
+	return 0
 }
 
 // validateCreateConversionEncodings mirrors the encoding-name checks PostgreSQL
@@ -20892,9 +21349,14 @@ func builtinProcMatchesConversionSig(b catalog.BuiltinProc) bool {
 // in CreateCast (src/backend/commands/functioncmds.c). routine is the resolved
 // WITH FUNCTION routine, or nil for WITHOUT FUNCTION / WITH INOUT (or a WITH
 // FUNCTION reference that did not resolve, which keeps the slice-397 lenient
-// register-anyway behaviour). All errors use SQLSTATE 42P17
-// (invalid_object_definition), matching PG. DU-002 slice 398.
-func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) error {
+// register-anyway behaviour). im is the live catalog (nil in unit tests that
+// only exercise builtin types) — needed so a user-defined source/target type
+// (CREATE CAST over a CREATE TYPE'd type) resolves to its real OID instead of
+// falling through catalog.TypeNameToOID's "unknown name" safe default, which
+// is OIDText and previously made every user type falsely compare equal to
+// `text`. All errors use SQLSTATE 42P17 (invalid_object_definition), matching
+// PG. DU-002 slice 398, M0134-0110.
+func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine, im *catalog.InMemory) error {
 	source, target := s.ArgTypes[0], s.ArgTypes[1]
 	nargs := 0
 	if routine != nil {
@@ -20911,7 +21373,7 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) erro
 		if nargs < 1 || nargs > 3 {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must take one to three arguments"}
 		}
-		if !castTypeOIDMatch(source, inArgs[0].Name) {
+		if !castTypeOIDMatch(im, source, inArgs[0].Name) {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "argument of cast function must match or be binary-coercible from source data type"}
 		}
 		if nargs > 1 && catalog.TypeNameToOID(inArgs[1].Name) != catalog.OIDInt4 {
@@ -20920,7 +21382,7 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) erro
 		if nargs > 2 && catalog.TypeNameToOID(inArgs[2].Name) != catalog.OIDBool {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "third argument of cast function must be type boolean"}
 		}
-		if !castTypeOIDMatch(routine.ReturnType.Name, target) {
+		if !castTypeOIDMatch(im, routine.ReturnType.Name, target) {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "return data type of cast function must match or be binary-coercible to target data type"}
 		}
 		if routine.IsProcedure || routine.IsWindow {
@@ -20932,10 +21394,25 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) erro
 	}
 	// Allow source and target types to be the same only for length-coercion
 	// functions; PG assumes a multi-arg (>= 2) function does length coercion.
-	if castTypeOIDMatch(source, target) && nargs < 2 {
+	if castTypeOIDMatch(im, source, target) && nargs < 2 {
 		return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "source data type and target data type are the same"}
 	}
 	return nil
+}
+
+// isKnownUserType reports whether name resolves to a user-registered type in
+// one of the enum/domain/composite registries (resolveUserTypeOID) — the
+// last of which also covers "base" types created via CREATE TYPE's
+// INPUT/OUTPUT-function form, since execCreateType registers those through
+// RegisterCompositeType too. Used to distinguish a genuinely unknown type
+// name from a known user type that simply isn't in the builtin name tables
+// (dropCompatCanonicalType, catalog.TypeNameToOID). M0134-0110.
+func isKnownUserType(im *catalog.InMemory, name string) bool {
+	if im == nil {
+		return false
+	}
+	_, kind := resolveUserTypeOID(im, name)
+	return kind != typeKindNone
 }
 
 // resolveOperatorSupportFunc resolves a CREATE/ALTER OPERATOR RESTRICT=/JOIN=
@@ -21324,6 +21801,27 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// resolved before registering (mirrors CreateForeignDataWrapper's
 		// parse_func_options running before the catalog insert) so a bad
 		// HANDLER/VALIDATOR name raises 42883/42809 without creating the FDW.
+		//
+		// Ordering mirrors PG's CreateForeignDataWrapper
+		// (postgres/src/backend/commands/foreigncmds.c ~586-603): superuser
+		// check first, then the already-exists check, both ahead of the
+		// handler/validator resolution below. Unlike the LEAKPROOF/event-
+		// trigger sibling checks (which treat any non-"postgres"
+		// NonSuperuserRole as non-superuser — a known convention gap, see
+		// the M0134-0124 deferral-ledger row), this one consults the
+		// role's actual SUPERUSER attribute via catalog.IsSuperuser so a
+		// `SET SESSION AUTHORIZATION <role-created-with-SUPERUSER>` session
+		// (e.g. foreign_data.sql's regress_foreign_data_user) is correctly
+		// treated as a superuser. M0134-0124.
+		if role := o.ctx.NonSuperuserRole; role != "" {
+			oid, ok := im.RoleOID(role)
+			if !ok || !im.IsSuperuser(oid) {
+				return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create foreign-data wrapper %q", s.ObjName.String()), Hint: "Must be superuser to create a foreign-data wrapper."}
+			}
+		}
+		if _, found := im.LookupForeignDataWrapper(s.ObjName.String()); found {
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: fmt.Sprintf("foreign-data wrapper %q already exists", s.ObjName.String())}
+		}
 		var handlerOID, validatorOID uint32
 		if s.FDWHandlerFunc != nil {
 			oid, rerr := resolveFDWHandlerFunc(im.Routines(), *s.FDWHandlerFunc)
@@ -21398,7 +21896,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			if rightArg == "" {
 				return &ExecError{Code: "42P13", Pos: s.Pos(),
 					Message: "operator right argument type must be specified",
-					Hint:    "Postfix operators are not supported."}
+					Detail:  "Postfix operators are not supported."}
 			}
 			var funcOID uint32
 			var funcRetType string
@@ -21629,7 +22127,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 			// Enforce PG's CREATE CAST argument/return-type rules
 			// (functioncmds.c CreateCast) before registering. DU-002 slice 398.
-			if err := validateCreateCast(s, routine); err != nil {
+			if err := validateCreateCast(s, routine, im); err != nil {
 				return err
 			}
 			cs := im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod, funcOID)
@@ -21649,9 +22147,39 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 		}
 	case "schema":
+		// Resolve the schema being created: an explicit name wins, otherwise
+		// (AUTHORIZATION-only form) the schema defaults to the authorized
+		// role's name, resolved against the live session for
+		// CURRENT_ROLE/CURRENT_USER/USER/SESSION_USER (PG parity: gram.y's
+		// OptSchemaName / CreateSchemaStmtStart, transformCreateSchemaStmt).
+		// M0134-0115.
+		schemaName := s.ObjName.Name
+		if schemaName == "" && s.SchemaAuthRole != "" {
+			switch s.SchemaAuthRole {
+			case "current_role", "current_user", "user":
+				schemaName = o.ctx.EffectiveUserName()
+			case "session_user":
+				schemaName = o.ctx.SessionUserName()
+			default:
+				schemaName = s.SchemaAuthRole
+			}
+		}
+		// PG parity (parse_utilcmd.c's setSchemaName, ERRCODE_INVALID_SCHEMA_
+		// DEFINITION / 42P15): every schema-qualified object name inside a
+		// `CREATE SCHEMA ... CREATE <element> ...` sub-command must match the
+		// schema being created, or the WHOLE statement fails before anything
+		// (not even the schema itself) is created. goopg has no execution
+		// path for the sub-command itself (REFACTOR-tier, M0134-0009), so
+		// this is the only enforcement available for it.
+		if s.SchemaHasSubElement && s.SchemaSubElementSchema != "" && schemaName != "" &&
+			s.SchemaSubElementSchema != schemaName {
+			return &ExecError{Code: "42P15", Pos: s.Pos(), Message: fmt.Sprintf(
+				"CREATE specifies a schema (%s) different from the one being created (%s)",
+				s.SchemaSubElementSchema, schemaName)}
+		}
 		// Register user-created schema so schema-qualified queries resolve correctly.
-		if s.ObjName.Name != "" {
-			im.RegisterSchema(s.ObjName.Name)
+		if schemaName != "" {
+			im.RegisterSchema(schemaName)
 			// B1.1 (doc 02c §1): persist the schema PG-style — a real
 			// pg_namespace heap INSERT + index entries (the WAL stream
 			// carries XLOG_HEAP_INSERT + 2× XLOG_BTREE_INSERT_LEAF, exactly
@@ -21659,10 +22187,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// generic heap reload. Replaces the bespoke
 			// RecordKindCreateSchema record (M0110-0003, retired).
 			if o.ctx.Pool != nil {
-				oid := im.SchemaOID(s.ObjName.Name)
-				owner := im.SchemaOwnerOID(s.ObjName.Name)
-				if err := syncSchemaToCatalogHeap(o.ctx, im, s.ObjName.Name, oid, owner); err != nil {
-					im.UnregisterSchema(s.ObjName.Name)
+				oid := im.SchemaOID(schemaName)
+				owner := im.SchemaOwnerOID(schemaName)
+				if err := syncSchemaToCatalogHeap(o.ctx, im, schemaName, oid, owner); err != nil {
+					im.UnregisterSchema(schemaName)
 					return fmt.Errorf("create-schema catalog heap: %w", err)
 				}
 			}
@@ -22797,6 +23325,19 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				Message: fmt.Sprintf("collation %q for encoding %q does not exist", s.ObjName.String(), "UTF8")}
 		}
 		im.SetComment(oidPgCollation, uc.OID, 0, s.Description)
+	case "conversion":
+		// Conversions live in pg_conversion (classoid 2607, DU-002 slice 399).
+		// This case was entirely missing — the switch's implicit no-op
+		// fallthrough let `COMMENT ON CONVERSION <nonexistent> IS '...'`
+		// silently succeed instead of raising PG's 42704 "conversion ...
+		// does not exist" (GetCommentObjectAddress, objectaddress.c), sized
+		// out of M0134-0106 (conversion.sql).
+		uconv := im.FindConversion(s.ObjName.Name, s.ObjName.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+		if uconv == nil || uconv.OID == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("conversion %q does not exist", s.ObjName.String())}
+		}
+		im.SetComment(pgConversionRelOID, uconv.OID, 0, s.Description)
 	case "cast":
 		// Casts live in pg_cast (classoid 2605). pg_dump's dumpCast keys the
 		// comment lookup on the cast's catalogId (tableoid=pg_cast=2605) and
@@ -24051,6 +24592,28 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				o.ctx.PendingCreatedComposites[strings.ToLower(s.Name)] = true
 			}
 		} else {
+			// Bare shell form (`CREATE TYPE name;`, HasOptions==false): PG's
+			// DefineType (typecmds.c ~236-266) always errors 42710 "already
+			// exists" if any type of that name (shell or fully defined) is
+			// already registered — CREATE TYPE never silently re-creates an
+			// existing shell. The option-list form (`CREATE TYPE name (input
+			// = ..., ...)`, HasOptions==true) is intentionally NOT given the
+			// mirror-image "errors if no shell exists yet" check here: goopg
+			// has no CREATE FUNCTION-triggered auto-shell side effect (PG's
+			// TypeShellMake call from parse_type.c's typenameType lookup
+			// failure), so several of this file's own base types (`widget`,
+			// `city_budget`, `base_type`) reach this form with no real
+			// pre-existing shell in goopg's registry despite being valid,
+			// shell-first-created types in the oracle; enforcing the
+			// pre-existing-shell requirement here would turn "does not
+			// exist" false negatives into false positives that break these
+			// types outright for the rest of the file. M0134-0116.
+			if !s.HasOptions {
+				if existing := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid); existing != nil {
+					return &ExecError{Code: "42710", Pos: s.Pos(),
+						Message: fmt.Sprintf("type %q already exists", s.Name)}
+				}
+			}
 			cat.RegisterCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 			if ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid); ct != nil {
 				ct.Owner = o.currentDDLOwnerOID()

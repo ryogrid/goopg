@@ -144,7 +144,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// Peel the leading role statement off, handle it, then recurse on the
 		// remainder so every statement runs. M0118-0008.
 		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
-			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName, resolveCurrentGUC); handled {
+			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName, resolveCurrentGUC, connTx.NonSuperuserRole); handled {
 				if herr != nil {
 					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 				}
@@ -161,7 +161,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
-		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName, resolveCurrentGUC); handled {
+		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName, resolveCurrentGUC, connTx.NonSuperuserRole); handled {
 			if herr != nil {
 				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 			}
@@ -182,8 +182,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		if first, rest, tag, ok := splitLeadingCompatNoopDDL(sql); ok {
 			if tag == "CREATE SCHEMA" {
-				if werr := s.registerCompatNoopSchema(first); werr != nil {
-					return s.writeQueryError(w, errcodes.SystemError, werr.Error())
+				if werr := s.registerCompatNoopSchema(first, connTx.NonSuperuserRole, connTx.SessionUser); werr != nil {
+					return s.writeQueryError(w, compatNoopSchemaErrorCode(werr), werr.Error())
 				}
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
@@ -200,8 +200,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		if !isMultiStatementSQL(sql) {
 			if tag, ok := compatNoopCommandTag(sql); ok {
 				if tag == "CREATE SCHEMA" {
-					if werr := s.registerCompatNoopSchema(sql); werr != nil {
-						return s.writeQueryError(w, errcodes.SystemError, werr.Error())
+					if werr := s.registerCompatNoopSchema(sql, connTx.NonSuperuserRole, connTx.SessionUser); werr != nil {
+						return s.writeQueryError(w, compatNoopSchemaErrorCode(werr), werr.Error())
 					}
 				}
 				if err := w.WriteCommandComplete(tag); err != nil {
@@ -209,6 +209,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 				}
 				return w.ReadyForQuery()
 			}
+		}
+		// M0134-0155: a PARSE-time error inside an explicit transaction
+		// aborts the block too — PostgreSQL rejects any subsequent
+		// statement with 25P02 until ROLLBACK (postgres.c's error handler
+		// aborts on ANY statement error, not just executor ones).
+		// Mirrors the M0132-S5 plan-error gate below; before this,
+		// `BEGIN; <syntax error>; SELECT 1` left the block live.
+		if connTx != nil && connTx.InExplicit() {
+			connTx.Fail()
+			connTx.ReleasePinnedSnapshotOnFail(s.cfg.TxnMgr)
 		}
 		msg, extra := syntaxErrorMsg(err)
 		return s.writeQueryError(w, syntaxErrorCode(err), msg, extra...)
@@ -1103,7 +1113,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// plan, cache, then execute.
 		var precached optimizer.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -1953,12 +1963,42 @@ func splitLeadingCompatNoopDDL(sql string) (first, rest, tag string, ok bool) {
 // registers and persists identically regardless of which protocol the
 // client used. M0119-0004-ACLHEAP follow-up (loop #86, item (3) of the
 // loop #84 row).
-func (s *Server) registerCompatNoopSchema(sql string) error {
+func (s *Server) registerCompatNoopSchema(sql string, actingRole, sessionUser string) error {
+	norm := normalizeCompatSQL(sql)
+	// PG parity (parse_utilcmd.c transformCreateSchemaStmt/setSchemaName,
+	// ERRCODE_INVALID_SCHEMA_DEFINITION): every schema-qualified object name
+	// inside a `CREATE SCHEMA ... CREATE <element> ...` sub-command must
+	// match the schema being created, or the WHOLE statement fails — nothing
+	// (not even the schema itself) gets created. Checked before any catalog
+	// mutation below. The goopg parser has no grammar for CREATE SCHEMA's
+	// sub-command list at all (M0134-0009/M0134-0115), so this text-level
+	// check is the only enforcement available; it does not attempt to
+	// execute a schema-matching sub-command (REFACTOR-tier, deferred).
+	if hdr, ok := parseCreateSchemaHeader(norm); ok && hdr.subCmd != "" {
+		if targetSchema, hasTarget := createSchemaSubElementSchema(hdr.subCmd); hasTarget {
+			owning := hdr.schemaName
+			if owning == "" {
+				owning = resolveSchemaAuthRole(hdr.authRole, actingRole, sessionUser)
+			}
+			if owning != "" && targetSchema != owning {
+				return &schemaQualMismatchError{msg: fmt.Sprintf(
+					"CREATE specifies a schema (%s) different from the one being created (%s)",
+					targetSchema, owning)}
+			}
+		}
+	}
 	if s.cfg.Catalog == nil {
 		return nil
 	}
-	norm := normalizeCompatSQL(sql)
 	schemaName := schemaNameFromCreate(norm)
+	if schemaName == "" {
+		if hdr, ok := parseCreateSchemaHeader(norm); ok {
+			schemaName = hdr.schemaName
+			if schemaName == "" {
+				schemaName = resolveSchemaAuthRole(hdr.authRole, actingRole, sessionUser)
+			}
+		}
+	}
 	if schemaName == "" {
 		return nil
 	}
@@ -1993,6 +2033,151 @@ func schemaNameFromCreate(norm string) string {
 		return ""
 	}
 	return extractFirstSQLIdent("", rest)
+}
+
+// schemaQualMismatchError signals CREATE SCHEMA's schema-qualification
+// mismatch check (PG's setSchemaName, ERRCODE_INVALID_SCHEMA_DEFINITION /
+// 42P15) — distinct from the generic errcodes.SystemError the rest of
+// registerCompatNoopSchema's callers use, so compatNoopSchemaErrorCode can
+// pick the right SQLSTATE for the wire error. M0134-0115.
+type schemaQualMismatchError struct{ msg string }
+
+func (e *schemaQualMismatchError) Error() string { return e.msg }
+
+// compatNoopSchemaErrorCode picks the SQLSTATE for a registerCompatNoopSchema
+// failure: schemaQualMismatchError maps to 42P15 (invalid_schema_definition,
+// matching real PG's setSchemaName ereport), anything else keeps the prior
+// generic errcodes.SystemError behavior.
+func compatNoopSchemaErrorCode(err error) errcodes.Code {
+	if _, ok := err.(*schemaQualMismatchError); ok {
+		return errcodes.InvalidSchemaDefinition
+	}
+	return errcodes.SystemError
+}
+
+// createSchemaHeader is the parsed head of a `CREATE SCHEMA [name]
+// [AUTHORIZATION role] [CREATE <element> ...]` statement the goopg parser
+// does not recognise (no grammar for the sub-command list at all,
+// M0134-0009/M0134-0115) — enough to run PG's schema-qualification-mismatch
+// check without executing the sub-command.
+type createSchemaHeader struct {
+	schemaName string // "" when unspecified (AUTHORIZATION-only form: name = role)
+	authRole   string // "" when no AUTHORIZATION clause is present
+	subCmd     string // trailing "create ..." sub-element text, "" if none
+}
+
+// parseCreateSchemaHeader parses norm (already normalizeCompatSQL'd: single-
+// spaced, lowercased outside literals) as a CREATE SCHEMA statement head.
+// Mirrors gram.y's OptSchemaName/OptSchemaEltList shape closely enough for
+// the single-sub-command forms create_schema.sql exercises.
+func parseCreateSchemaHeader(norm string) (createSchemaHeader, bool) {
+	if norm != "create schema" && !strings.HasPrefix(norm, "create schema ") {
+		return createSchemaHeader{}, false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(norm, "create schema"))
+	var hdr createSchemaHeader
+	if !strings.HasPrefix(rest, "authorization ") {
+		ident, tail := consumeSQLIdent(rest)
+		if ident != "" {
+			hdr.schemaName = ident
+			rest = tail
+		}
+	}
+	if strings.HasPrefix(rest, "authorization ") {
+		rest = strings.TrimSpace(rest[len("authorization "):])
+		ident, tail := consumeSQLIdent(rest)
+		hdr.authRole = ident
+		rest = tail
+	}
+	if strings.HasPrefix(rest, "create ") {
+		hdr.subCmd = rest
+	}
+	return hdr, true
+}
+
+// consumeSQLIdent reads one leading SQL identifier (quoted or unquoted) off
+// s and returns it along with the trimmed remainder — extractFirstSQLIdent's
+// sibling, but also reporting how much of s the identifier consumed so
+// callers can keep parsing the rest of the statement.
+func consumeSQLIdent(s string) (ident, rest string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	if s[0] == '"' {
+		end := strings.Index(s[1:], "\"")
+		if end < 0 {
+			return s[1:], ""
+		}
+		return s[1 : end+1], strings.TrimSpace(s[end+2:])
+	}
+	end := strings.IndexAny(s, " \t\n\r;,")
+	if end < 0 {
+		return s, ""
+	}
+	return s[:end], strings.TrimSpace(s[end:])
+}
+
+// resolveSchemaAuthRole resolves a CREATE SCHEMA AUTHORIZATION clause's role
+// token to a concrete role name: CURRENT_ROLE/CURRENT_USER/USER resolve to
+// the session's active role (actingRole, i.e. connTx.NonSuperuserRole — ""
+// means no active SET ROLE, so fall back to the login/session user),
+// SESSION_USER resolves to sessionUser directly, and anything else is
+// already a literal role name.
+func resolveSchemaAuthRole(authRole, actingRole, sessionUser string) string {
+	switch authRole {
+	case "current_role", "current_user", "user":
+		if actingRole != "" {
+			return actingRole
+		}
+		return sessionUser
+	case "session_user":
+		return sessionUser
+	default:
+		return authRole
+	}
+}
+
+// createSchemaSubElementSchema extracts the schema-qualification of the
+// object name targeted by a single embedded CREATE <element> sub-command
+// (the SEQUENCE/TABLE/VIEW/INDEX-ON/TRIGGER-ON forms create_schema.sql
+// exercises — parse_utilcmd.c's transformCreateSchemaStmtElements checks
+// every element type in the sub-command list, but goopg parses none of
+// them, so only the single-element case that reaches here is covered).
+// hasTarget is false when the referenced name carries no explicit schema
+// qualification (unqualified names default silently to the enclosing
+// schema in real PG — never a mismatch) or the sub-command shape isn't
+// recognised.
+func createSchemaSubElementSchema(subCmd string) (schema string, hasTarget bool) {
+	fields := strings.Fields(subCmd)
+	if len(fields) < 2 || fields[0] != "create" {
+		return "", false
+	}
+	var target string
+	switch fields[1] {
+	case "sequence", "table", "view":
+		idx := 2
+		if idx+2 < len(fields) && fields[idx] == "if" && fields[idx+1] == "not" && fields[idx+2] == "exists" {
+			idx += 3
+		}
+		if idx < len(fields) {
+			target = fields[idx]
+		}
+	case "index", "trigger":
+		for i := 2; i < len(fields); i++ {
+			if fields[i] == "on" && i+1 < len(fields) {
+				target = fields[i+1]
+				break
+			}
+		}
+	default:
+		return "", false
+	}
+	dot := strings.Index(target, ".")
+	if dot <= 0 {
+		return "", false
+	}
+	return target[:dot], true
 }
 
 func normalizeCompatSQL(sql string) string {
@@ -2947,6 +3132,18 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 	if handled, err := s.execTwoPhaseStmt(w, ctx, stmt, connTx, autoCommitPtr); handled {
 		return err
 	}
+	// M0134-0074: resolve WHERE CURRENT OF at dispatch time. The cursor's
+	// current tid is substituted as a concrete `ctid = '(block,off)'` equality
+	// that flows through the existing ctid-string-equality path — no
+	// optimizer/executor change. The tid is statement-scoped, so CURRENT OF
+	// statements bypass the plan cache (see isCurrentOfDML at the cache site).
+	// EXPLAIN (ANALYZE ...) wraps the DML in an ExplainStmt — tidscan.sql runs
+	// every CURRENT OF statement under EXPLAIN ANALYZE — and optimizer.Plan
+	// recursively plans the ExplainStmt's Inner (planner.go:260), so resolving
+	// the inner DML's Where before the Plan call below covers both forms.
+	if err := s.resolveCurrentOfInStmt(connTx, stmt); err != nil {
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+	}
 	var node optimizer.Node
 	if len(cachedNode) > 0 && cachedNode[0] != nil {
 		node = cachedNode[0]
@@ -3482,6 +3679,21 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 				s.cfg.Catalog, !publicSchemaVisible(getSetting), argVisible)...)
 		}
 		return d.AppendValueText(dst)
+	case "xid8":
+		// xid8 is a 64-bit UNSIGNED transaction ID (xid8out, xid.c) but
+		// goopg's Datum.Int carries it as a signed int64 (e.g. the wrapped
+		// literal '-1'::xid8 stores the two's-complement bit pattern for
+		// 2^64-1). The default AppendValueText below does a plain SIGNED
+		// strconv.AppendInt and would render such a value as "-1" instead of
+		// "18446744073709551615" — the same unsigned-vs-signed mismatch the
+		// binary/COPY encoders already avoid via pgUnsignedIDFromDatum
+		// (internal/executor/codec.go); this is the TEXT-protocol twin,
+		// M0134-0087 (xid.sql sizing) uncovering the same class the
+		// binary path fixed earlier without extending it here.
+		if d.Kind == executor.KindInt {
+			return strconv.AppendUint(dst, uint64(d.Int), 10)
+		}
+		return d.AppendValueText(dst)
 	default:
 		return d.AppendValueText(dst)
 	}
@@ -3794,8 +4006,12 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 		rowsToSend = cur.Rows[start:end]
 		if fetchAll {
 			cur.Pos = total // EOF
+			cur.AtEnd = true // FETCH ALL always ends at EOF (M0134-0074)
 		} else {
 			cur.Pos = end
+			// Past-end forward fetch returned nothing → positioned past the
+			// last row (M0134-0074).
+			cur.AtEnd = (len(rowsToSend) == 0)
 		}
 	} else if fetchAll {
 		// FETCH BACKWARD ALL: includes the current row (index cur.Pos-1).
@@ -3812,9 +4028,11 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 		}
 		rowsToSend = rev
 		cur.Pos = 0 // BOF
+		cur.AtEnd = false // BACKWARD moves toward BOF, not EOF (M0134-0074)
 	} else {
 		// FETCH BACKWARD n (finite): exclude the current row (index cur.Pos-1) from the
 		// window — it was already returned by the preceding fetch. M0134-0056.
+		cur.AtEnd = false // BACKWARD moves toward BOF, not EOF (M0134-0074)
 		if cur.Pos == 0 {
 			// already at BOF, nothing precedes
 			rowsToSend = nil
@@ -3911,6 +4129,7 @@ func (s *Server) materializeCursor(ectx *executor.Context, cur *cursorEntry, cur
 
 	cur.Schema = op.Schema()
 	cur.Rows = nil
+	cur.TIDs = nil
 	for {
 		slot, nextErr := op.Next()
 		if nextErr == executor.EOF {
@@ -3925,9 +4144,98 @@ func (s *Server) materializeCursor(ectx *executor.Context, cur *cursorEntry, cur
 			cloned := make(executor.Row, len(row))
 			copy(cloned, row)
 			cur.Rows = append(cur.Rows, cloned)
+			// Capture the slot's carried self-tid for WHERE CURRENT OF
+			// resolution (M0134-0074), in lockstep with Rows. A zero
+			// tid is stored when the slot does not carry one (synthesized
+			// rows) — CURRENT OF on such a row is a pre-existing gap.
+			block, off, ok := slot.TID()
+			tid := storage.ItemPointer{}
+			if ok {
+				tid.Block = storage.BlockNumber(block)
+				tid.Offset = off
+			}
+			cur.TIDs = append(cur.TIDs, tid)
 		}
 	}
 	cur.Pos = 0
+	cur.AtEnd = false
 	cur.Materialized = true
 	return nil
+}
+
+// resolveCurrentOf resolves a WHERE CURRENT OF cursor reference to a concrete
+// `ctid = '(block,off)'` equality on the cursor's current row. Mirrors PG's
+// execCurrentOf (postgres/src/backend/executor/execCurrent.c:44,65-70,134-139):
+// an unknown cursor raises 34000 (ERRCODE_UNDEFINED_CURSOR) and a cursor
+// before the first row or past the last row raises 24000
+// (ERRCODE_INVALID_CURSOR_STATE). M0134-0074.
+func (s *Server) resolveCurrentOf(connTx *connTxState, name string) (parser.Expr, error) {
+	cur, ok := connTx.cursorLookup(name)
+	if !ok {
+		return nil, &executor.ExecError{Code: "34000", Message: fmt.Sprintf("cursor %q does not exist", name)}
+	}
+	if cur.Pos == 0 || cur.AtEnd {
+		return nil, &executor.ExecError{Code: "24000", Message: fmt.Sprintf("cursor %q is not positioned on a row", name)}
+	}
+	tid := cur.TIDs[cur.Pos-1]
+	return &parser.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &parser.ColumnRef{Column: "ctid"},
+		Right: &parser.StringConst{Value: fmt.Sprintf("(%d,%d)", tid.Block, tid.Offset)},
+	}, nil
+}
+
+// resolveCurrentOfInStmt resolves the WHERE CURRENT OF clause (if any) on an
+// UPDATE/DELETE to a concrete `ctid = '(block,off)'` equality, mutating the
+// DML's Where field in place. EXPLAIN (ANALYZE ...) wraps the DML in an
+// ExplainStmt (tidscan.sql does this for every CURRENT OF statement); the
+// inner DML is planned by the same optimizer.Plan call in the caller
+// (planner.go:260 ExplainStmt → Plan(s.Inner)), so resolving before that call
+// covers both the bare and EXPLAIN-wrapped forms. Returns nil when stmt
+// carries no CURRENT OF clause. M0134-0074.
+func (s *Server) resolveCurrentOfInStmt(connTx *connTxState, stmt parser.Stmt) error {
+	inner := stmt
+	if es, ok := stmt.(*parser.ExplainStmt); ok {
+		inner = es.Inner
+	}
+	switch d := inner.(type) {
+	case *parser.UpdateStmt:
+		if d.CurrentOf == "" {
+			return nil
+		}
+		where, err := s.resolveCurrentOf(connTx, d.CurrentOf)
+		if err != nil {
+			return err
+		}
+		d.Where = where
+	case *parser.DeleteStmt:
+		if d.CurrentOf == "" {
+			return nil
+		}
+		where, err := s.resolveCurrentOf(connTx, d.CurrentOf)
+		if err != nil {
+			return err
+		}
+		d.Where = where
+	}
+	return nil
+}
+
+// isCurrentOfDML reports whether stmt is an UPDATE or DELETE with a WHERE
+// CURRENT OF clause, unwrapping an EXPLAIN wrapper. Such statements carry a
+// statement-scoped tid resolution and must never be served from the
+// cross-session plan cache (the cursor position changes between executions).
+// M0134-0074.
+func isCurrentOfDML(stmt parser.Stmt) bool {
+	inner := stmt
+	if es, ok := stmt.(*parser.ExplainStmt); ok {
+		inner = es.Inner
+	}
+	switch d := inner.(type) {
+	case *parser.UpdateStmt:
+		return d.CurrentOf != ""
+	case *parser.DeleteStmt:
+		return d.CurrentOf != ""
+	}
+	return false
 }

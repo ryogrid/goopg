@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"math"
@@ -17,6 +18,7 @@ import (
 	"math/bits"
 	mathrand "math/rand"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -33,6 +36,7 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/mb"
 )
 
 // sessionPRNG is the per-process random-number generator used by random(),
@@ -155,6 +159,16 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "trigger"
 	case 2281:
 		return "internal"
+	case 194:
+		// pg_node_tree: server-internal parse/plan-tree text representation
+		// (pg_class.relpartbound, pg_attrdef.adbin's sibling columns), bare
+		// name like the other pseudo-types above. M0134-0142 (misc_sanity.sql
+		// atttypid::regtype).
+		return "pg_node_tree"
+	case 2277:
+		// anyarray: polymorphic pseudo-type, bare name (pg_attribute.attmissingval).
+		// M0134-0142.
+		return "anyarray"
 	case 2950:
 		return "uuid"
 	case 3220:
@@ -354,6 +368,45 @@ func evalExpr(e optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 // fast-path early-return ahead of the type switch — saves the
 // 12-arm type-test sequence on the hot path. evalExprSlot cum
 // CPU at M0073-final was 68.68 % cum; this hoist trims dispatch.
+// regclassOIDToName resolves a pg_class-family OID to the text an
+// `oid::regclass` cast would render (matches PG's regclassout,
+// postgres/src/backend/utils/adt/regproc.c). Shared by the CastExpr
+// `regclass` arm below and by bindRecordRowComposite (M0134-0146), which
+// must apply the same resolution when flattening a regclass-typed record
+// field into composite text — otherwise a plpgsql `FOR rec IN SELECT ...`
+// record field carrying a bare catalog OID (e.g. pg_get_catalog_foreign_
+// keys()'s fktable/pktable columns) prints as a raw integer instead of the
+// relation name.
+func regclassOIDToName(ctx *Context, connDBOid uint32, oid uint32) string {
+	// InvalidOid (0) renders as "-", matching PG's regclassout. Without this
+	// guard a `reltoastrelid::regclass` for a table with no TOAST relation
+	// (reltoastrelid = 0) matches the first virtual relation whose OID is
+	// unset (also 0), e.g. information_schema.routines. M0118-0008
+	// (reindex-concurrently-toast probing).
+	if oid == 0 {
+		return "-"
+	}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		if tbl, found := im.LookupTableByOID(oid, connDBOid); found && tbl != nil {
+			return tbl.Name
+		}
+		// Synthetic TOAST relation OIDs (parent OID + 100M) live only in the
+		// virtual pg_class builder, not c.tables, so reconstruct the
+		// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
+		// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
+		if name, found := im.ToastRelName(oid, connDBOid); found {
+			return name
+		}
+	}
+	// Also resolve index OIDs to index names. M0097-0023.
+	for _, idx := range ctx.Catalog.AllIndexes(connDBOid) {
+		if idx.OID == oid {
+			return idx.Name
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
 func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	// Fast path: ColumnRef. M0074-0001 hoist.
 	if cref, ok := e.(*optimizer.ColumnRef); ok {
@@ -578,6 +631,17 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				if bp, found := catalog.LookupBuiltinProc(name); found {
 					return NewIntDatum(int64(bp.OID)), nil
 				}
+				// CREATE AGGREGATE routines never land in the Routines()
+				// registry (they live in their own userAggregates map — see
+				// InMemory.RegisterUserAggregate) even though
+				// writeAggregateCatalogRows gives them a real pg_proc heap
+				// row with prokind='a'. Sibling of regIdentifierInput's
+				// identical fallback (Hard-won Rule #2) — without it
+				// `'myavg'::regproc` misses despite the pg_proc row being
+				// visible to a plain SELECT. M0134-0108.
+				if agg, ok := ctx.Catalog.LookupUserAggregateByName(name); ok {
+					return NewIntDatum(int64(agg.OID)), nil
+				}
 				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", raw)}
 			}
 			// An OID input (oid→regproc/regprocedure) renders via
@@ -667,6 +731,44 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			// instead of a bare OID. Only user-defined operators are
 			// resolvable (goopg has no builtin-operator catalog — deferred,
 			// see the ledger). DU-002 (M0119-0004) slice 411.
+			// A `'name(left,right)'::regoperator` STRING input is the reverse
+			// direction — regoperatorin (regproc.c) — and must resolve to the
+			// operator's numeric OID (not a rendered name string) so
+			// `WHERE objid = '===(bool,bool)'::regoperator` compares
+			// correctly against an oid-typed column; mirrors the `regclass`
+			// CastExpr arm's identical asymmetry (KindInt to name string,
+			// KindString to raw OID), confirmed against a live PG 18.3 oracle
+			// via alter_operator.sql. Only the 2-arg `name(a,b)` shape is
+			// handled (regoperatorNameAndArgs) — a bare name with no parens
+			// falls through to the unresolved `return v, nil` below
+			// unchanged, same as before this fix. `regoper` (no arg list at
+			// all) is NOT handled here; it stays on the pre-fix pass-through
+			// path — a bare-name lookup would still need ambiguity detection
+			// this slice doesn't add. M0134-0089.
+			if v.Kind == KindString && strings.EqualFold(x.TargetType, "regoperator") && ctx != nil && ctx.Catalog != nil {
+				raw := strings.TrimSpace(v.StringValue())
+				if oid, perr := strconv.ParseUint(raw, 10, 32); perr == nil {
+					return NewIntDatum(int64(oid)), nil
+				}
+				if name, leftType, rightType, ok := regoperatorNameAndArgs(raw); ok {
+					if im, ok2 := ctx.Catalog.(*catalog.InMemory); ok2 {
+						var leftOID, rightOID uint32
+						if leftType != "" {
+							leftOID = catalog.TypeNameToOID(leftType)
+						}
+						if rightType != "" {
+							rightOID = catalog.TypeNameToOID(rightType)
+						}
+						if op, found := im.LookupUserOperatorByNameAndTypeOIDs(name, leftOID, rightOID); found {
+							return NewIntDatum(int64(op.OID)), nil
+						}
+					}
+					if bop, found := catalog.LookupBuiltinOperator(name, leftType, rightType); found {
+						return NewIntDatum(int64(bop.OID)), nil
+					}
+					return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("operator does not exist: %s", raw)}
+				}
+			}
 			if v.Kind == KindInt {
 				oid := v.Int
 				if oid == 0 {
@@ -822,33 +924,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 			switch v.Kind {
 			case KindInt:
-				// InvalidOid (0) renders as "-", matching PG's regclassout
-				// (src/backend/utils/adt/regproc.c). Without this guard a
-				// `reltoastrelid::regclass` for a table with no TOAST relation
-				// (reltoastrelid = 0) matches the first virtual relation whose
-				// OID is unset (also 0), e.g. information_schema.routines.
-				// M0118-0008 (reindex-concurrently-toast probing).
-				if v.Int == 0 {
-					return NewStringDatum("-"), nil
-				}
-				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if tbl, found := im.LookupTableByOID(uint32(v.Int), connDBOid); found && tbl != nil {
-						return NewStringDatum(tbl.Name), nil
-					}
-					// Synthetic TOAST relation OIDs (parent OID + 100M) live only in
-					// the virtual pg_class builder, not c.tables, so reconstruct the
-					// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
-					// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
-					if name, found := im.ToastRelName(uint32(v.Int), connDBOid); found {
-						return NewStringDatum(name), nil
-					}
-				}
-				// Also resolve index OIDs to index names. M0097-0023.
-				for _, idx := range ctx.Catalog.AllIndexes(connDBOid) {
-					if idx.OID == uint32(v.Int) {
-						return NewStringDatum(idx.Name), nil
-					}
-				}
+				return NewStringDatum(regclassOIDToName(ctx, connDBOid, uint32(v.Int))), nil
 			case KindString:
 				// Shared SplitIdentifierString port: a quoted relation name
 				// (`'"My Table"'::regclass`) must be unquoted before the catalog
@@ -942,6 +1018,30 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		castTargetType := x.TargetType
 		if castTargetType == "char" && x.Typmod > 0 {
 			castTargetType = "bpchar"
+		}
+		// integer::bit(n) / integer::bit varying(n): PG's bitfromint4/
+		// bitfromint8 (pg_cast int4→bit castfunc bit(int4,int4), varbit.c)
+		// convert the two's-complement register value into its binary-digit
+		// string, NOT a decimal rendering — evalCast has no int→bit arm at
+		// all today (falls through to a generic stringify, so `5::bit(32)`
+		// silently printed "5" instead of 32 zero/one digits). Handled here,
+		// ahead of evalCastTyped, because the bit width lives in x.Typmod,
+		// which evalCastTyped's (targetType, sourceType) signature has no
+		// slot for. Every hash*()::bit(32) probe in hash_func.sql routes
+		// through this path. M0134-0128.
+		if v.Kind == KindInt && (strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
+			srcWidth := 32
+			switch strings.ToLower(x.SourceType) {
+			case "int8", "bigint":
+				srcWidth = 64
+			case "int2", "smallint":
+				srcWidth = 16
+			}
+			n := int(x.Typmod)
+			if n <= 0 {
+				n = 1
+			}
+			return NewStringDatum(intToBitTypmodString(v.Int, srcWidth, n)), nil
 		}
 		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
 		if err != nil {
@@ -1313,10 +1413,26 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 		}
 		return NewBoolDatum(!d.BoolValue()), nil
 	case parser.OpBitNot:
-		if d.Kind != KindInt {
-			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator ~ requires integer operand"}
+		if d.Kind == KindInt {
+			return Datum{Kind: KindInt, Int: ^d.Int}, nil
 		}
-		return Datum{Kind: KindInt, Int: ^d.Int}, nil
+		// macaddr_not (mac.c): `~b` bitwise-complements each of the 6 octets.
+		// goopg backs macaddr with its canonical text form, so detect the
+		// literal shape (same pattern as the point << >> detection below).
+		// M0134-0138.
+		if d.Kind == KindString {
+			if a, b, c, dd, e, f, merr := parseMacaddrLiteral(d.StringValue()); merr == nil {
+				return NewStringDatum(macaddrCanonicalText(^a&0xff, ^b&0xff, ^c&0xff, ^dd&0xff, ^e&0xff, ^f&0xff)), nil
+			}
+			// macaddr8_not (mac8.c): `~b` bitwise-complements each of the 8
+			// octets. Tried after the 6-octet form above (a colon-separated
+			// 8-field literal never matches parseMacaddrLiteral, which fails
+			// on trailing garbage). M0134-0139.
+			if a, b, c, dd, e, f, g, h, merr := parseMacaddr8Literal(d.StringValue()); merr == nil {
+				return NewStringDatum(macaddr8CanonicalText(^a&0xff, ^b&0xff, ^c&0xff, ^dd&0xff, ^e&0xff, ^f&0xff, ^g&0xff, ^h&0xff)), nil
+			}
+		}
+		return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator ~ requires integer operand"}
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown unary operator %s", op)}
 }
@@ -1797,6 +1913,30 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 				}
 			}
 		}
+		// macaddr_and/macaddr_or (mac.c): `b & mac` / `b | mac` combine each of
+		// the 6 octets. Same text-shape detection as the point << >> and
+		// macaddr ~ cases above. M0134-0138.
+		if (op == parser.OpBitAnd || op == parser.OpBitOr) && left.Kind == KindString && right.Kind == KindString {
+			if la, lb, lc, ld, le, lf, lerr := parseMacaddrLiteral(left.StringValue()); lerr == nil {
+				if ra, rb, rc, rd, re, rf, rerr := parseMacaddrLiteral(right.StringValue()); rerr == nil {
+					if op == parser.OpBitAnd {
+						return NewStringDatum(macaddrCanonicalText(la&ra, lb&rb, lc&rc, ld&rd, le&re, lf&rf)), nil
+					}
+					return NewStringDatum(macaddrCanonicalText(la|ra, lb|rb, lc|rc, ld|rd, le|re, lf|rf)), nil
+				}
+			}
+			// macaddr8_and/macaddr8_or (mac8.c): `b & mac8` / `b | mac8`
+			// combine each of the 8 octets. Tried after the 6-octet form
+			// above. M0134-0139.
+			if la, lb, lc, ld, le, lf, lg, lh, lerr := parseMacaddr8Literal(left.StringValue()); lerr == nil {
+				if ra, rb, rc, rd, re, rf, rg, rh, rerr := parseMacaddr8Literal(right.StringValue()); rerr == nil {
+					if op == parser.OpBitAnd {
+						return NewStringDatum(macaddr8CanonicalText(la&ra, lb&rb, lc&rc, ld&rd, le&re, lf&rf, lg&rg, lh&rh)), nil
+					}
+					return NewStringDatum(macaddr8CanonicalText(la|ra, lb|rb, lc|rc, ld|rd, le|re, lf|rf, lg|rg, lh|rh)), nil
+				}
+			}
+		}
 		// Bitwise operators: require integer operands. M0097-0003.
 		if left.Kind != KindInt || right.Kind != KindInt {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
@@ -1869,7 +2009,21 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 			return NewBoolDatum(evalArraySetOp(op, ls, rs)), nil
 		}
 		aur, all, aok := parseBoxText(ls)
+		if !aok {
+			// point <@ box (point_box.c: on_pb / box_contain_pt dispatch by
+			// operand type; goopg has no separate point/box Datum kinds, so
+			// fall back from box-vs-box to a degenerate box{pt,pt} when the
+			// left operand parses as a bare point instead. M0134-0111.
+			if pt, pok := parsePointText(ls); pok {
+				aur, all, aok = pt, pt, true
+			}
+		}
 		bur, bll, bok := parseBoxText(rs)
+		if !bok {
+			if pt, pok := parsePointText(rs); pok {
+				bur, bll, bok = pt, pt, true
+			}
+		}
 		if !aok || !bok {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s: invalid box value", op)}
 		}
@@ -2177,6 +2331,1055 @@ func parseBoxText(s string) (ur, ll [2]float64, ok bool) {
 		return
 	}
 	return p1, p2, true
+}
+
+// parseBoxLiteral reproduces box_in's parsing (via path_decode/pair_decode,
+// postgres/src/backend/utils/adt/geo_ops.c) closely enough to give the same
+// accept/reject verdict and the same corner values on every case exercised by
+// box.sql: it accepts two coordinate pairs with an optional outer wrapper
+// paren (single, e.g. "(x1,y1,x2,y2)", or doubled, e.g.
+// "((x1,y1),(x2,y2))") and per-point optional parens, requires the ENTIRE
+// string to be consumed (box_in passes a nil endptr, so trailing garbage like
+// "(1,2,3,4) x" is rejected), and reorders the two points into (high, low) —
+// PG swaps per-axis so high >= low on each of x and y independently, which is
+// NOT simply "swap the two points" when the box is degenerate/crossed.
+// M0134-0094: this is the single chokepoint a box(n) column's assignment
+// coercion, a `box '...'` typed literal, and pg_input_is_valid('...','box')
+// all share; distinct from parseBoxText above, which parses an
+// already-canonical "(x,y),(x,y)" string for the exclusion-constraint path
+// and does not validate or reorder.
+func parseBoxLiteral(s string) (hx, hy, lx, ly float64, ok bool) {
+	skipWS := func(t string) string {
+		return strings.TrimLeft(t, " \t\n\r\v\f")
+	}
+	s = skipWS(s)
+	if s == "" {
+		return
+	}
+	// '<' is the open-path delimiter; box never accepts it (opentype=false).
+	if s[0] == '<' {
+		return
+	}
+	depth := 0
+	if s[0] == '(' {
+		cp := skipWS(s[1:])
+		if cp != "" && cp[0] == '(' {
+			depth++
+			s = cp
+		} else if strings.Count(s, "(") == 1 {
+			depth++
+			s = cp
+		}
+	}
+
+	var pts [2][2]float64
+	for i := 0; i < 2; i++ {
+		x, y, rest, okPair := pairDecode(s)
+		if !okPair {
+			return
+		}
+		s = rest
+		if s != "" && s[0] == ',' {
+			s = s[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if s != "" && s[0] == ')' {
+			depth--
+			s = skipWS(s[1:])
+		} else {
+			return
+		}
+	}
+	if s != "" {
+		return
+	}
+
+	hx, lx = pts[0][0], pts[1][0]
+	if lx > hx {
+		hx, lx = lx, hx
+	}
+	hy, ly = pts[0][1], pts[1][1]
+	if ly > hy {
+		hy, ly = ly, hy
+	}
+	return hx, hy, lx, ly, true
+}
+
+// pairDecode parses one "(x,y)" or "x,y" coordinate pair (pair_decode in
+// geo_ops.c), returning the unconsumed remainder of s.
+func pairDecode(s string) (x, y float64, rest string, ok bool) {
+	s = strings.TrimLeft(s, " \t\n\r\v\f")
+	hasDelim := s != "" && s[0] == '('
+	if hasDelim {
+		s = s[1:]
+	}
+	x, s, ok = singleDecode(s)
+	if !ok {
+		return 0, 0, "", false
+	}
+	if s == "" || s[0] != ',' {
+		return 0, 0, "", false
+	}
+	s = s[1:]
+	y, s, ok = singleDecode(s)
+	if !ok {
+		return 0, 0, "", false
+	}
+	if hasDelim {
+		if s == "" || s[0] != ')' {
+			return 0, 0, "", false
+		}
+		s = strings.TrimLeft(s[1:], " \t\n\r\v\f")
+	}
+	return x, y, s, true
+}
+
+// singleDecode parses the longest valid float8 prefix of s (single_decode in
+// geo_ops.c, which itself calls float8in_internal — strtod plus PG's
+// NaN/Infinity/Inf fallback spellings, float.c:395-511), skips trailing
+// whitespace after the number (float8in_internal does the same before
+// returning its endptr — geo_ops.sql's whitespace-padded circle literals
+// like " 1 , 3 , 5 " rely on this), and returns the unconsumed remainder.
+func singleDecode(s string) (float64, string, bool) {
+	s = strings.TrimLeft(s, " \t\n\r\v\f")
+	// C99 NaN/Infinity/Inf spellings, case-insensitive, with optional sign
+	// on the Infinity/Inf forms (float8in_internal's strtod-failure
+	// fallback path).
+	for _, kw := range []struct {
+		text string
+		val  float64
+	}{
+		{"NaN", math.NaN()},
+		{"+Infinity", math.Inf(1)},
+		{"-Infinity", math.Inf(-1)},
+		{"Infinity", math.Inf(1)},
+		{"+Inf", math.Inf(1)},
+		{"-Inf", math.Inf(-1)},
+		{"Inf", math.Inf(1)},
+	} {
+		if len(s) >= len(kw.text) && strings.EqualFold(s[:len(kw.text)], kw.text) {
+			rest := strings.TrimLeft(s[len(kw.text):], " \t\n\r\v\f")
+			return kw.val, rest, true
+		}
+	}
+	i := 0
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	digitsBefore := i
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	digitsBefore = i - digitsBefore
+	digitsAfter := 0
+	if i < len(s) && s[i] == '.' {
+		i++
+		start := i
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		digitsAfter = i - start
+	}
+	if digitsBefore == 0 && digitsAfter == 0 {
+		return 0, "", false
+	}
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		j := i + 1
+		if j < len(s) && (s[j] == '+' || s[j] == '-') {
+			j++
+		}
+		k := j
+		for k < len(s) && s[k] >= '0' && s[k] <= '9' {
+			k++
+		}
+		if k > j {
+			i = k
+		}
+	}
+	v, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil {
+		return 0, "", false
+	}
+	rest := strings.TrimLeft(s[i:], " \t\n\r\v\f")
+	return v, rest, true
+}
+
+// boxCanonicalText formats a box's high/low corners exactly as box_out does
+// (path_encode(PATH_NONE, 2, &high) — "(hx,hy),(lx,ly)", each coordinate via
+// float8out's Ryu-based shortest-roundtrip formatting). M0134-0094.
+func boxCanonicalText(hx, hy, lx, ly float64) string {
+	return fmt.Sprintf("(%s,%s),(%s,%s)",
+		PGFloatOut(hx, 64), PGFloatOut(hy, 64), PGFloatOut(lx, 64), PGFloatOut(ly, 64))
+}
+
+// parseCircleLiteral reproduces circle_in's parsing (geo_ops.c) closely
+// enough to give the same accept/reject verdict and the same center/radius
+// values on every case exercised by circle.sql: the canonical
+// "<(x,y),r>" form, an un-bracketed "(x,y),r" / "((x,y),r)" form, and the
+// "quick entry" flat "x,y,r" form (no wrapping delimiters at all) are all
+// accepted; a negative radius (but NOT NaN — PG accepts NaN, since `NaN < 0`
+// is false under IEEE comparison) is rejected, and the ENTIRE string must be
+// consumed (circle_in passes a nil endptr, so trailing garbage like
+// "<(100,200),10> x" is rejected) just like parseBoxLiteral above, whose
+// pairDecode/singleDecode helpers this reuses. M0134-0098.
+func parseCircleLiteral(s string) (x, y, radius float64, ok bool) {
+	skipWS := func(t string) string {
+		return strings.TrimLeft(t, " \t\n\r\v\f")
+	}
+	s = skipWS(s)
+	if s == "" {
+		return
+	}
+	depth := 0
+	if s[0] == '<' {
+		depth++
+		s = s[1:]
+	} else if s[0] == '(' {
+		// If there are two left parens, consume the first one.
+		cp := skipWS(s[1:])
+		if cp != "" && cp[0] == '(' {
+			depth++
+			s = cp
+		}
+	}
+
+	// pair_decode will consume parens around the pair, if any.
+	var okPair bool
+	x, y, s, okPair = pairDecode(s)
+	if !okPair {
+		return 0, 0, 0, false
+	}
+	if s != "" && s[0] == ',' {
+		s = s[1:]
+	}
+
+	var okRadius bool
+	radius, s, okRadius = singleDecode(s)
+	if !okRadius {
+		return 0, 0, 0, false
+	}
+	// We have to accept NaN — `radius < 0.0` is false when radius is NaN.
+	if radius < 0.0 {
+		return 0, 0, 0, false
+	}
+
+	for depth > 0 {
+		if s != "" && (s[0] == ')' || (s[0] == '>' && depth == 1)) {
+			depth--
+			s = skipWS(s[1:])
+		} else {
+			return 0, 0, 0, false
+		}
+	}
+	if s != "" {
+		return 0, 0, 0, false
+	}
+	return x, y, radius, true
+}
+
+// circleCanonicalText formats a circle's center/radius exactly as
+// circle_out does — "<(x,y),r>" — each field via pair_encode/single_encode
+// (float8out's Ryu-based shortest-roundtrip formatting). M0134-0098.
+func circleCanonicalText(x, y, radius float64) string {
+	return fmt.Sprintf("<(%s,%s),%s>", PGFloatOut(x, 64), PGFloatOut(y, 64), PGFloatOut(radius, 64))
+}
+
+// lineSingleDecode is single_decode (float8in_internal via strtod, geo_ops.c)
+// specialized for the line parsers below: unlike singleDecode (used by
+// parseBoxLiteral/parseCircleLiteral, which never need to distinguish a
+// syntax error from an out-of-range one), this returns a *typed* ExecError
+// so a float8 literal like "1e400" reports PG's dedicated overflow SQLSTATE
+// (22003, "\"1e400\" is out of range for type double precision",
+// float.c:484-489) rather than colliding with the generic 22P02 "invalid
+// input syntax for type line" every other malformed token uses. M0134-0136.
+func lineSingleDecode(s string) (val float64, rest string, errOut *ExecError) {
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	for _, kw := range []struct {
+		text string
+		val  float64
+	}{
+		{"NaN", math.NaN()},
+		{"+Infinity", math.Inf(1)},
+		{"-Infinity", math.Inf(-1)},
+		{"Infinity", math.Inf(1)},
+		{"+Inf", math.Inf(1)},
+		{"-Inf", math.Inf(-1)},
+		{"Inf", math.Inf(1)},
+	} {
+		if len(t) >= len(kw.text) && strings.EqualFold(t[:len(kw.text)], kw.text) {
+			return kw.val, strings.TrimLeft(t[len(kw.text):], " \t\n\r\v\f"), nil
+		}
+	}
+	i := 0
+	if i < len(t) && (t[i] == '+' || t[i] == '-') {
+		i++
+	}
+	digitsBefore := i
+	for i < len(t) && t[i] >= '0' && t[i] <= '9' {
+		i++
+	}
+	digitsBefore = i - digitsBefore
+	digitsAfter := 0
+	if i < len(t) && t[i] == '.' {
+		i++
+		start := i
+		for i < len(t) && t[i] >= '0' && t[i] <= '9' {
+			i++
+		}
+		digitsAfter = i - start
+	}
+	if digitsBefore == 0 && digitsAfter == 0 {
+		return 0, "", &ExecError{Code: "22P02"}
+	}
+	if i < len(t) && (t[i] == 'e' || t[i] == 'E') {
+		j := i + 1
+		if j < len(t) && (t[j] == '+' || t[j] == '-') {
+			j++
+		}
+		k := j
+		for k < len(t) && t[k] >= '0' && t[k] <= '9' {
+			k++
+		}
+		if k > j {
+			i = k
+		}
+	}
+	token := t[:i]
+	v, err := strconv.ParseFloat(token, 64)
+	if err != nil {
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) && numErr.Err == strconv.ErrRange && (v == 0 || math.IsInf(v, 0)) {
+			return 0, "", &ExecError{Code: "22003",
+				Message: fmt.Sprintf("%q is out of range for type double precision", token)}
+		}
+		return 0, "", &ExecError{Code: "22P02"}
+	}
+	return v, strings.TrimLeft(t[i:], " \t\n\r\v\f"), nil
+}
+
+// linePairDecode is pair_decode (geo_ops.c) built on lineSingleDecode, used
+// by parseLineLiteral's two-point form. M0134-0136.
+func linePairDecode(s string) (x, y float64, rest string, errOut *ExecError) {
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	hasDelim := t != "" && t[0] == '('
+	if hasDelim {
+		t = t[1:]
+	}
+	x, t, errOut = lineSingleDecode(t)
+	if errOut != nil {
+		return 0, 0, "", errOut
+	}
+	if t == "" || t[0] != ',' {
+		return 0, 0, "", &ExecError{Code: "22P02"}
+	}
+	t = t[1:]
+	y, t, errOut = lineSingleDecode(t)
+	if errOut != nil {
+		return 0, 0, "", errOut
+	}
+	if hasDelim {
+		if t == "" || t[0] != ')' {
+			return 0, 0, "", &ExecError{Code: "22P02"}
+		}
+		t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+	}
+	return x, y, t, nil
+}
+
+// lineSlope is point_sl (geo_ops.c): the slope of the segment through two
+// points, Inf for a vertical segment (equal x) and 0 for a horizontal one
+// (equal y, checked before the general division so a horizontal segment
+// never depends on floating-point division producing an exact zero).
+// M0134-0136.
+func lineSlope(x1, y1, x2, y2 float64) float64 {
+	if x1 == x2 {
+		return math.Inf(1)
+	}
+	if y1 == y2 {
+		return 0
+	}
+	return (y1 - y2) / (x1 - x2)
+}
+
+// lineConstruct is line_construct (geo_ops.c): fill A/B/C from a point on
+// the line plus its slope — vertical (Inf slope) becomes "x = C", horizontal
+// (zero slope) becomes "y = C", otherwise "mx - y + yinter = 0". M0134-0136.
+func lineConstruct(px, py, slope float64) (a, b, c float64) {
+	if math.IsInf(slope, 0) {
+		return -1.0, 0.0, px
+	}
+	if slope == 0 {
+		return 0.0, -1.0, py
+	}
+	c = py - slope*px
+	if c == 0 {
+		c = 0
+	}
+	return slope, -1.0, c
+}
+
+// parseLineLiteral reproduces line_in's parsing (postgres/src/backend/utils/
+// adt/geo_ops.c line_in/line_decode/path_decode/line_construct/point_sl)
+// closely enough to give the same accept/reject verdict — including the
+// SQLSTATE-differentiated float8-overflow case (22003) and the two
+// semantic-validation messages line_in itself raises ("A and B cannot both
+// be zero" for the brace coefficient form, "must be two distinct points" for
+// the two-point form) rather than the single generic 22P02 syntax error
+// every other malformed token gets — and the same A/B/C coefficients, on
+// every case exercised by line.sql. Two input shapes are accepted: the
+// canonical "{A,B,C}" coefficient form, and any two-point form path_decode
+// also accepts for lseg/path ("(x,y),(x,y)", "((x,y),(x,y))",
+// "[(x,y),(x,y)]", or the bare "x,y,x,y" quick-entry form). M0134-0136.
+func parseLineLiteral(s string) (a, b, c float64, errOut *ExecError) {
+	orig := s
+	syntaxErr := func() (float64, float64, float64, *ExecError) {
+		return 0, 0, 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type line: %q", orig)}
+	}
+	fillMsg := func(e *ExecError) *ExecError {
+		if e != nil && e.Message == "" {
+			return &ExecError{Code: e.Code,
+				Message: fmt.Sprintf("invalid input syntax for type line: %q", orig)}
+		}
+		return e
+	}
+
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	if t == "" {
+		return syntaxErr()
+	}
+	if t[0] == '{' {
+		rest := t[1:]
+		var av, bv, cv float64
+		var derr *ExecError
+		av, rest, derr = lineSingleDecode(rest)
+		if derr != nil {
+			return 0, 0, 0, fillMsg(derr)
+		}
+		if rest == "" || rest[0] != ',' {
+			return syntaxErr()
+		}
+		bv, rest, derr = lineSingleDecode(rest[1:])
+		if derr != nil {
+			return 0, 0, 0, fillMsg(derr)
+		}
+		if rest == "" || rest[0] != ',' {
+			return syntaxErr()
+		}
+		cv, rest, derr = lineSingleDecode(rest[1:])
+		if derr != nil {
+			return 0, 0, 0, fillMsg(derr)
+		}
+		if rest == "" || rest[0] != '}' {
+			return syntaxErr()
+		}
+		rest = strings.TrimLeft(rest[1:], " \t\n\r\v\f")
+		if rest != "" {
+			return syntaxErr()
+		}
+		if av == 0 && bv == 0 {
+			return 0, 0, 0, &ExecError{Code: "22P02",
+				Message: "invalid line specification: A and B cannot both be zero"}
+		}
+		return av, bv, cv, nil
+	}
+
+	// Two-point form (path_decode with opentype=true, npts=2): an optional
+	// '[' or (single/doubled) '(' wrapper, then two coordinate pairs.
+	// M0134-0137: extracted to pathDecodeTwoPoints, shared with
+	// parseLsegLiteral (lseg_in uses this exact grammar, undecorated by any
+	// brace coefficient form).
+	pts, derr := pathDecodeTwoPoints(t)
+	if derr != nil {
+		return 0, 0, 0, fillMsg(derr)
+	}
+
+	if pts[0][0] == pts[1][0] && pts[0][1] == pts[1][1] {
+		return 0, 0, 0, &ExecError{Code: "22P02",
+			Message: "invalid line specification: must be two distinct points"}
+	}
+	slope := lineSlope(pts[0][0], pts[0][1], pts[1][0], pts[1][1])
+	av, bv, cv := lineConstruct(pts[0][0], pts[0][1], slope)
+	return av, bv, cv, nil
+}
+
+// lineCanonicalText formats a line's A/B/C coefficients exactly as line_out
+// does — "{A,B,C}" — each via float8out's Ryu-based shortest-roundtrip
+// formatting. M0134-0136.
+func lineCanonicalText(a, b, c float64) string {
+	return fmt.Sprintf("{%s,%s,%s}", PGFloatOut(a, 64), PGFloatOut(b, 64), PGFloatOut(c, 64))
+}
+
+// pathDecodeTwoPoints implements path_decode's two-point-pair grammar
+// (postgres/src/backend/utils/adt/geo_ops.c path_decode, opentype=true,
+// npts=2): an optional '[' or (single/doubled) '(' wrapper, then two
+// coordinate pairs. Shared by parseLineLiteral's two-point form and
+// parseLsegLiteral (lseg_in uses this exact grammar with no coefficient
+// form of its own). Errors carry an empty Message for the generic
+// syntax-error case — the caller fills in its own type name — and a real
+// Message already set for the 22003 float8-overflow case (lineSingleDecode's
+// own text is type-agnostic). M0134-0137.
+func pathDecodeTwoPoints(s string) (pts [2][2]float64, errOut *ExecError) {
+	t := s
+	depth := 0
+	if t != "" && t[0] == '[' {
+		depth++
+		t = t[1:]
+	} else if t != "" && t[0] == '(' {
+		cp := strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		if cp != "" && cp[0] == '(' {
+			depth++
+			t = cp
+		} else if strings.Count(t, "(") == 1 {
+			depth++
+			t = cp
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		x, y, rest, derr := linePairDecode(t)
+		if derr != nil {
+			return pts, derr
+		}
+		t = rest
+		if t != "" && t[0] == ',' {
+			t = t[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if t != "" && (t[0] == ')' || t[0] == ']') {
+			depth--
+			t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		} else {
+			return pts, &ExecError{Code: "22P02"}
+		}
+	}
+	if t != "" {
+		return pts, &ExecError{Code: "22P02"}
+	}
+	return pts, nil
+}
+
+// parseLsegLiteral reproduces lseg_in's parsing (postgres/src/backend/utils/
+// adt/geo_ops.c lseg_in → path_decode(str, true, 2, &lseg->p[0], ...)) — the
+// same two-point grammar as parseLineLiteral's two-point form (bare/
+// parenthesized/bracketed "x,y,x,y"). Unlike line there is no "{A,B,C}"
+// coefficient form and no distinct-points check: lseg_in stores the two
+// points directly (statlseg_construct doesn't validate them at all), so
+// e.g. '[(1,1),(1,1)]' is a valid (degenerate) lseg. M0134-0137.
+func parseLsegLiteral(s string) (x1, y1, x2, y2 float64, errOut *ExecError) {
+	orig := s
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	pts, derr := pathDecodeTwoPoints(t)
+	if derr != nil {
+		msg := derr.Message
+		if msg == "" {
+			msg = fmt.Sprintf("invalid input syntax for type lseg: %q", orig)
+		}
+		return 0, 0, 0, 0, &ExecError{Code: derr.Code, Message: msg}
+	}
+	return pts[0][0], pts[0][1], pts[1][0], pts[1][1], nil
+}
+
+// lsegCanonicalText formats an lseg's two endpoints exactly as lseg_out
+// does — path_encode(PATH_OPEN, 2, ...) — "[(x1,y1),(x2,y2)]", each
+// coordinate via float8out's Ryu-based shortest-roundtrip formatting.
+// M0134-0137.
+func lsegCanonicalText(x1, y1, x2, y2 float64) string {
+	return fmt.Sprintf("[(%s,%s),(%s,%s)]", PGFloatOut(x1, 64), PGFloatOut(y1, 64), PGFloatOut(x2, 64), PGFloatOut(y2, 64))
+}
+
+// parsePathLiteral reproduces path_in's parsing (postgres/src/backend/utils/
+// adt/geo_ops.c path_in/path_decode/pair_count) closely enough to give the
+// same accept/reject verdict, the same points, and the same open/closed flag
+// on every case exercised by path.sql. Two outer wrappers are recognized: a
+// single leading '(' with no other '(' anywhere else in the string (the
+// "quick entry" wrapped form, e.g. "(1,2,3,4)") is stripped by path_in
+// itself before path_decode runs; path_decode then recognizes '[' (open),
+// a doubled '((' (closed with an extra wrapper), or no wrapper at all
+// (bare "1,2,3,4" or singly-wrapped "(1,2),(3,4)"). The point count is
+// pre-computed from the total comma count exactly as pair_count does — an
+// even (or zero) comma count is rejected before any point parsing is
+// attempted, matching path_in's "invalid input syntax" for inputs like
+// "[]" (zero commas) or a single lone point with no comma at all.
+// M0134-0149.
+func parsePathLiteral(s string) (points [][2]float64, closed bool, errOut *ExecError) {
+	orig := s
+	syntaxErr := func() ([][2]float64, bool, *ExecError) {
+		return nil, false, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type path: %q", orig)}
+	}
+
+	// pair_count returns -1 (npts<=0, i.e. invalid) unless the total comma
+	// count is odd and positive; an even (including zero) count is rejected
+	// here before any point parsing is attempted.
+	ndelim := strings.Count(s, ",")
+	if ndelim%2 == 0 {
+		return syntaxErr()
+	}
+	npts := (ndelim + 1) / 2
+
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	outerDepth := 0
+	if t != "" && t[0] == '(' && strings.LastIndexByte(t, '(') == 0 {
+		t = t[1:]
+		outerDepth++
+	}
+
+	// path_decode(t, opentype=true, npts, ...)
+	isopen := false
+	depth := 0
+	if t != "" && t[0] == '[' {
+		isopen = true
+		depth++
+		t = t[1:]
+	} else if t != "" && t[0] == '(' {
+		cp := strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		if cp != "" && cp[0] == '(' {
+			depth++
+			t = cp
+		} else if strings.LastIndexByte(t, '(') == 0 {
+			depth++
+			t = cp
+		}
+	}
+
+	pts := make([][2]float64, npts)
+	for i := 0; i < npts; i++ {
+		x, y, rest, derr := linePairDecode(t)
+		if derr != nil {
+			if derr.Message == "" {
+				return syntaxErr()
+			}
+			return nil, false, &ExecError{Code: derr.Code, Message: derr.Message}
+		}
+		t = rest
+		if t != "" && t[0] == ',' {
+			t = t[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if t != "" && (t[0] == ')' || (t[0] == ']' && isopen && depth == 1)) {
+			depth--
+			t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		} else {
+			return syntaxErr()
+		}
+	}
+
+	if outerDepth >= 1 {
+		if t == "" || t[0] != ')' {
+			return syntaxErr()
+		}
+		t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+	}
+	if t != "" {
+		return syntaxErr()
+	}
+
+	return pts, !isopen, nil
+}
+
+// pathCanonicalText formats a path's points exactly as path_out does —
+// path_encode(closed ? PATH_CLOSED : PATH_OPEN, npts, pt) — "((x,y),...)"
+// for a closed path, "[(x,y),...]" for an open one, each coordinate via
+// float8out's Ryu-based shortest-roundtrip formatting. M0134-0149.
+func pathCanonicalText(points [][2]float64, closed bool) string {
+	var b strings.Builder
+	if closed {
+		b.WriteByte('(')
+	} else {
+		b.WriteByte('[')
+	}
+	for i, p := range points {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('(')
+		b.WriteString(PGFloatOut(p[0], 64))
+		b.WriteByte(',')
+		b.WriteString(PGFloatOut(p[1], 64))
+		b.WriteByte(')')
+	}
+	if closed {
+		b.WriteByte(')')
+	} else {
+		b.WriteByte(']')
+	}
+	return b.String()
+}
+
+// parsePointLiteral is point_in (geo_ops.c) — a single pair_decode call with
+// endptr_p==NULL, so unlike linePairDecode's callers (path/line/lseg, which
+// consume one pair out of a larger multi-point string and hand the rest back
+// to their own wrapper-delimiter logic), point_in requires the ENTIRE string
+// to be consumed by the one pair: optional leading '(' requires a matching
+// trailing ')', and no other form of trailing text is tolerated ("(10.0,
+// 10.0) x" and "10.0,10.0" are both rejected — see pair_decode's own
+// `else if (*str != '\0') goto fail`). Point had no PG-faithful parser at
+// all before this (unlike box/circle/line/lseg/path, which each had their
+// own M0134 slice); it was a raw-varlena pass-through accepting any string
+// verbatim. M0134-0150.
+func parsePointLiteral(s string) (x, y float64, errOut *ExecError) {
+	x, y, rest, derr := linePairDecode(s)
+	if derr != nil {
+		if derr.Message == "" {
+			return 0, 0, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type point: %q", s)}
+		}
+		return 0, 0, derr
+	}
+	if rest != "" {
+		return 0, 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type point: %q", s)}
+	}
+	return x, y, nil
+}
+
+// pointCanonicalText formats a point exactly as point_out does —
+// path_encode(PATH_NONE, 1, pt), i.e. a single "(x,y)" pair with no outer
+// wrapper delimiter. M0134-0150.
+func pointCanonicalText(x, y float64) string {
+	var b strings.Builder
+	b.WriteByte('(')
+	b.WriteString(PGFloatOut(x, 64))
+	b.WriteByte(',')
+	b.WriteString(PGFloatOut(y, 64))
+	b.WriteByte(')')
+	return b.String()
+}
+
+// parsePolygonLiteral reproduces poly_in's parsing (postgres/src/backend/
+// utils/adt/geo_ops.c poly_in/path_decode/pair_count) — poly_in computes
+// npts via the same pair_count as path_in, then calls path_decode with
+// opentype=false and endptr_p==NULL. opentype=false means a leading '['
+// (the "open path" delimiter) is rejected outright rather than accepted
+// as an open form — a polygon is always closed, unlike path. Also unlike
+// path_in, poly_in does NOT strip a single leading paren before calling
+// path_decode (that "quick entry" unwrap is path_in-specific); the sole
+// wrapper polygon accepts is path_decode's own doubled-paren "((...))"
+// detection. endptr_p==NULL means, like point_in, the entire string must
+// be consumed — no trailing text tolerated. polygon had zero parsing at
+// all before this: a raw-varlena pass-through accepting any string
+// verbatim. M0134-0151.
+func parsePolygonLiteral(s string) (points [][2]float64, errOut *ExecError) {
+	orig := s
+	syntaxErr := func() ([][2]float64, *ExecError) {
+		return nil, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type polygon: %q", orig)}
+	}
+
+	// pair_count: even (including zero) comma count is rejected up front.
+	ndelim := strings.Count(s, ",")
+	if ndelim%2 == 0 {
+		return syntaxErr()
+	}
+	npts := (ndelim + 1) / 2
+
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	// path_decode(str, opentype=false, ...): a leading '[' is the "open
+	// path" delimiter, rejected outright since opentype is false here.
+	if t != "" && t[0] == '[' {
+		return syntaxErr()
+	}
+	depth := 0
+	if t != "" && t[0] == '(' {
+		cp := strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		if cp != "" && cp[0] == '(' {
+			depth++
+			t = cp
+		} else if strings.LastIndexByte(t, '(') == 0 {
+			depth++
+			t = cp
+		}
+	}
+
+	pts := make([][2]float64, npts)
+	for i := 0; i < npts; i++ {
+		x, y, rest, derr := linePairDecode(t)
+		if derr != nil {
+			if derr.Message == "" {
+				return syntaxErr()
+			}
+			return nil, &ExecError{Code: derr.Code, Message: derr.Message}
+		}
+		t = rest
+		if t != "" && t[0] == ',' {
+			t = t[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if t != "" && t[0] == ')' {
+			depth--
+			t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		} else {
+			return syntaxErr()
+		}
+	}
+	if t != "" {
+		return syntaxErr()
+	}
+
+	return pts, nil
+}
+
+// polygonCanonicalText formats a polygon's points exactly as poly_out
+// does — path_encode(PATH_CLOSED, npts, p) — "((x,y),...)", each
+// coordinate via float8out's Ryu-based shortest-roundtrip formatting.
+// M0134-0151.
+func polygonCanonicalText(points [][2]float64) string {
+	return pathCanonicalText(points, true)
+}
+
+// macScanCandidate is one of macaddr_in's 7 sscanf format strings
+// (postgres/src/backend/utils/adt/mac.c:71-90), reduced to its two variable
+// dimensions: the shared field width (0 = unbounded "%x", 2 = "%2x") and the
+// 5 inter-field separators (0 = the two fields are adjacent, no literal to
+// match). M0134-0138.
+type macScanCandidate struct {
+	width int
+	seps  [5]byte
+}
+
+var macScanCandidates = []macScanCandidate{
+	{0, [5]byte{':', ':', ':', ':', ':'}},  // "%x:%x:%x:%x:%x:%x"
+	{0, [5]byte{'-', '-', '-', '-', '-'}},  // "%x-%x-%x-%x-%x-%x"
+	{2, [5]byte{0, 0, ':', 0, 0}},          // "%2x%2x%2x:%2x%2x%2x"
+	{2, [5]byte{0, 0, '-', 0, 0}},          // "%2x%2x%2x-%2x%2x%2x"
+	{2, [5]byte{0, '.', 0, '.', 0}},        // "%2x%2x.%2x%2x.%2x%2x"
+	{2, [5]byte{0, '-', 0, '-', 0}},        // "%2x%2x-%2x%2x-%2x%2x"
+	{2, [5]byte{0, 0, 0, 0, 0}},            // "%2x%2x%2x%2x%2x%2x"
+}
+
+// hexDigitValue returns the numeric value of a single hex digit character
+// and whether c is one. Shared by macScanOne's per-field scan.
+func hexDigitValue(c byte) (int, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0'), true
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10, true
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10, true
+	}
+	return 0, false
+}
+
+// macScanOne attempts one macScanCandidate against str, mirroring C sscanf's
+// per-conversion whitespace-skip on %x (but not on the literal separators,
+// which are never whitespace here) and the trailing "%1s" junk check: any
+// non-whitespace character left over after the 6th field means the whole
+// format failed to match (sscanf's %1s would have consumed it, making
+// count==7, which macaddr_in also rejects).
+func macScanOne(str string, cand macScanCandidate) (vals [6]int, ok bool) {
+	i, n := 0, len(str)
+	skipSpace := func() {
+		for i < n {
+			switch str[i] {
+			case ' ', '\t', '\n', '\v', '\f', '\r':
+				i++
+			default:
+				return
+			}
+		}
+	}
+	readHex := func() (int, bool) {
+		skipSpace()
+		start, val, cnt := i, 0, 0
+		for i < n {
+			d, isHex := hexDigitValue(str[i])
+			if !isHex {
+				break
+			}
+			if cand.width > 0 && cnt >= cand.width {
+				break
+			}
+			val = val*16 + d
+			cnt++
+			i++
+		}
+		if cnt == 0 {
+			i = start
+			return 0, false
+		}
+		return val, true
+	}
+	for idx := 0; idx < 6; idx++ {
+		v, okf := readHex()
+		if !okf {
+			return vals, false
+		}
+		vals[idx] = v
+		if idx < 5 && cand.seps[idx] != 0 {
+			if i >= n || str[i] != cand.seps[idx] {
+				return vals, false
+			}
+			i++
+		}
+	}
+	skipSpace()
+	if i < n {
+		return vals, false // trailing garbage — sscanf's %1s junk match
+	}
+	return vals, true
+}
+
+// parseMacaddrLiteral reproduces macaddr_in (postgres/src/backend/utils/adt/
+// mac.c:55-114): try each of 7 sscanf formats in order until one matches all
+// 6 octets with nothing left over, then range-check each octet to 0..255 —
+// only the two unbounded colon/dash forms can overrun that range (the %2x
+// forms cap each field at 2 hex digits, i.e. at most 0xff). Returns a non-nil
+// *ExecError (distinct SQLSTATEs, matching mac.c's two ereturn sites) on
+// failure. M0134-0138.
+func parseMacaddrLiteral(str string) (a, b, c, d, e, f int, errOut *ExecError) {
+	for _, cand := range macScanCandidates {
+		vals, ok := macScanOne(str, cand)
+		if !ok {
+			continue
+		}
+		for _, v := range vals {
+			if v < 0 || v > 255 {
+				return 0, 0, 0, 0, 0, 0, &ExecError{Code: "22003",
+					Message: fmt.Sprintf("invalid octet value in \"macaddr\" value: %q", str)}
+			}
+		}
+		return vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], nil
+	}
+	return 0, 0, 0, 0, 0, 0, &ExecError{Code: "22P02",
+		Message: fmt.Sprintf("invalid input syntax for type macaddr: %q", str)}
+}
+
+// macaddrCanonicalText formats a MAC address exactly as macaddr_out does —
+// "%02x:%02x:%02x:%02x:%02x:%02x" (mac.c:120-132). M0134-0138.
+func macaddrCanonicalText(a, b, c, d, e, f int) string {
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", a, b, c, d, e, f)
+}
+
+// macaddrTruncOctets zeroes the last 3 octets, matching macaddr_trunc
+// (mac.c:341-356) — used by trunc(macaddr).
+func macaddrTruncOctets(a, b, c, _, _, _ int) (int, int, int, int, int, int) {
+	return a, b, c, 0, 0, 0
+}
+
+// parseMacaddr8Literal reproduces macaddr8_in (postgres/src/backend/utils/
+// adt/mac8.c:96-232). Unlike macaddr_in's 7-format sscanf cascade, this is a
+// single greedy scanner: read a byte as exactly 2 hex digits at a time (no
+// field-width variants), optionally followed by one of ':' '-' '.' as a
+// separator — once a separator character is seen it must be used
+// consistently for every remaining byte pair, but mixing "no separator" with
+// "a separator" between different byte pairs is also rejected implicitly (an
+// immediate next hex digit is read as part of the next byte, not as a
+// missing separator). Exactly 6 or 8 bytes are accepted; a 6-byte (EUI-48)
+// address is auto-widened to EUI-64 by inserting 0xFF/0xFE as the 4th/5th
+// octets and shifting the trailing three bytes down (same conversion
+// macaddrtomacaddr8 performs explicitly). M0134-0139.
+func parseMacaddr8Literal(str string) (a, b, c, d, e, f, g, h int, errOut *ExecError) {
+	fail := func() (int, int, int, int, int, int, int, int, *ExecError) {
+		return 0, 0, 0, 0, 0, 0, 0, 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type macaddr8: %q", str)}
+	}
+	n := len(str)
+	p := 0
+	for p < n && isRegIdentSpace(str[p]) {
+		p++
+	}
+	var by [8]int
+	count := 0
+	var spacer byte
+	for p < n && p+1 < n { // C: while (*ptr && *(ptr+1))
+		hi, hok := hexDigitValue(str[p])
+		lo, lok := hexDigitValue(str[p+1])
+		if !hok || !lok {
+			return fail()
+		}
+		count++
+		if count > 8 {
+			return fail()
+		}
+		by[count-1] = hi*16 + lo
+		p += 2
+		if p < n {
+			switch str[p] {
+			case ':', '-', '.':
+				if spacer == 0 {
+					spacer = str[p]
+				} else if spacer != str[p] {
+					return fail()
+				}
+				p++
+			}
+		}
+		if count == 6 || count == 8 {
+			if p < n && isRegIdentSpace(str[p]) {
+				p++
+				for p < n && isRegIdentSpace(str[p]) {
+					p++
+				}
+				if p < n {
+					return fail()
+				}
+			}
+		}
+	}
+	if count == 6 {
+		by[7], by[6], by[5] = by[5], by[4], by[3]
+		by[3], by[4] = 0xFF, 0xFE
+	} else if count != 8 {
+		return fail()
+	}
+	return by[0], by[1], by[2], by[3], by[4], by[5], by[6], by[7], nil
+}
+
+// macaddr8CanonicalText formats an 8-byte MAC address exactly as
+// macaddr8_out does — "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x"
+// (mac8.c:233-251). M0134-0139.
+func macaddr8CanonicalText(a, b, c, d, e, f, g, h int) string {
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x", a, b, c, d, e, f, g, h)
+}
+
+// macaddr8TruncOctets zeroes the last 5 octets keeping only the 3-byte OUI
+// prefix, matching macaddr8_trunc (mac8.c:476-497) — used by
+// trunc(macaddr8). Note this differs from macaddr's trunc, which keeps 3 of
+// 6 octets; macaddr8_trunc keeps 3 of 8.
+func macaddr8TruncOctets(a, b, c, _, _, _, _, _ int) (int, int, int, int, int, int, int, int) {
+	return a, b, c, 0, 0, 0, 0, 0
+}
+
+// macaddr8Set7BitOctets sets the 2nd-lowest bit of the first octet, matching
+// macaddr8_set7bit (mac8.c:499-521) — used to convert a MAC address to the
+// modified EUI-64 form used in IPv6 addresses.
+func macaddr8Set7BitOctets(a, b, c, d, e, f, g, h int) (int, int, int, int, int, int, int, int) {
+	return a | 0x02, b, c, d, e, f, g, h
+}
+
+// macaddr8ToMacaddrOctets reproduces macaddr8tomacaddr (mac8.c:544-566):
+// the 4th/5th octets must be exactly 0xFF/0xFE (the EUI-48-in-EUI-64
+// convention) or the conversion is out of range. Returns errOut non-nil on
+// failure.
+func macaddr8ToMacaddrOctets(a, b, c, d, e, f, g, h int) (ra, rb, rc, rd, re, rf int, errOut *ExecError) {
+	if d != 0xFF || e != 0xFE {
+		return 0, 0, 0, 0, 0, 0, &ExecError{Code: "22003",
+			Message: "macaddr8 data out of range to convert to macaddr",
+			Hint: "Only addresses that have FF and FE as values in the 4th and 5th bytes from the left, " +
+				"for example xx:xx:xx:ff:fe:xx:xx:xx, are eligible to be converted from macaddr8 to macaddr."}
+	}
+	return a, b, c, f, g, h, nil
+}
+
+// macaddrToMacaddr8Octets reproduces macaddrtomacaddr8 (mac8.c:523-542):
+// widen a 6-octet macaddr to macaddr8 by inserting 0xFF/0xFE as the 4th/5th
+// octets, same shift parseMacaddr8Literal applies to a bare 6-byte literal.
+func macaddrToMacaddr8Octets(a, b, c, d, e, f int) (int, int, int, int, int, int, int, int) {
+	return a, b, c, 0xFF, 0xFE, d, e, f
 }
 
 // evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
@@ -3758,6 +4961,121 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 			return NewTimestampTZDatum(t), nil
 		}
 		return NewTimeDatum(t), nil
+	case "txid_snapshot", "pg_snapshot":
+		// M0134-0080: mirrors parse_snapshot (xid8funcs.c) — xmin/xmax/xip
+		// must all parse, xmin<=xmax, each xip in [xmin,xmax) and
+		// non-decreasing (duplicates collapsed). The error always names
+		// "pg_snapshot" regardless of which spelling was cast, matching
+		// upstream's hardcoded errmsg.
+		norm, ok := parsePgSnapshot(x.Value)
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", x.Value)}
+		}
+		return NewStringDatum(norm), nil
+	case "box":
+		// M0134-0094: `box '...'` shares the same validate+canonicalize
+		// chokepoint as a box(n) column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parseBoxLiteral.
+		hx, hy, lx, ly, ok := parseBoxLiteral(x.Value)
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type box: %q", x.Value)}
+		}
+		return NewStringDatum(boxCanonicalText(hx, hy, lx, ly)), nil
+	case "circle":
+		// M0134-0098: `circle '...'` shares the same validate+canonicalize
+		// chokepoint as a circle(n) column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parseCircleLiteral.
+		cx, cy, r, ok := parseCircleLiteral(x.Value)
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type circle: %q", x.Value)}
+		}
+		return NewStringDatum(circleCanonicalText(cx, cy, r)), nil
+	case "line":
+		// M0134-0136: `line '...'` shares the same validate+canonicalize
+		// chokepoint as a line column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parseLineLiteral.
+		la, lb, lc, lerr := parseLineLiteral(x.Value)
+		if lerr != nil {
+			ee := *lerr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(lineCanonicalText(la, lb, lc)), nil
+	case "lseg":
+		// M0134-0150: `lseg '...'` shares the same validate+canonicalize
+		// chokepoint as an lseg column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parseLsegLiteral.
+		// Previously missing from this switch (fell through to the bottom
+		// default arm, returning the raw string unvalidated) even though
+		// M0134-0137 already landed the parser.
+		x1, y1, x2, y2, lerr := parseLsegLiteral(x.Value)
+		if lerr != nil {
+			ee := *lerr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(lsegCanonicalText(x1, y1, x2, y2)), nil
+	case "path":
+		// M0134-0150: `path '...'` shares the same validate+canonicalize
+		// chokepoint as a path column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parsePathLiteral.
+		// Previously missing from this switch even though M0134-0149
+		// already landed the parser.
+		pts, closed, perr := parsePathLiteral(x.Value)
+		if perr != nil {
+			ee := *perr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(pathCanonicalText(pts, closed)), nil
+	case "point":
+		// M0134-0150: `point '...'` shares the same validate+canonicalize
+		// chokepoint as a point column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parsePointLiteral.
+		px, py, perr := parsePointLiteral(x.Value)
+		if perr != nil {
+			ee := *perr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(pointCanonicalText(px, py)), nil
+	case "polygon":
+		// M0134-0151: `polygon '...'` shares the same validate+canonicalize
+		// chokepoint as a polygon column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parsePolygonLiteral.
+		pts, perr := parsePolygonLiteral(x.Value)
+		if perr != nil {
+			ee := *perr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(polygonCanonicalText(pts)), nil
+	case "jsonb":
+		// M0134-0133: `jsonb '...'` must share the same validate+canonicalize
+		// chokepoint as `::jsonb` (the `case "jsonb"` arm of evalCast, above) —
+		// twin input boundaries for jsonb (Hard-won Rule #2).
+		canon, err := canonicalizeJSONB(x.Value)
+		if err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+			}
+			return Datum{}, err
+		}
+		return NewStringDatum(canon), nil
+	case "json":
+		// M0134-0133: `json '...'` preserves the input spelling verbatim (no
+		// re-serialisation, unlike `jsonb` above) but still validates JSON
+		// syntax at the input boundary, mirroring `::json`'s evalCast arm.
+		if err := validateJSONText(x.Value); err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+			}
+			return Datum{}, err
+		}
+		return NewStringDatum(x.Value), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
 		// M0097-0017: enum/domain type casts return the string value as-is.
@@ -3876,6 +5194,186 @@ func roundFloat4ToInt(d Datum, pos int) (int64, error) {
 		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
 	}
 	return int64(rounded), nil
+}
+
+// evalHashFunc dispatches the scalar/extended SQL hash-function pair named by
+// `name` (see the evalFuncCall case list above). All ten families are STRICT
+// (PG: proisstrict) — a NULL primary argument returns NULL without
+// evaluating the seed. The *extended siblings return bigint (the full
+// pgHashUint32Extended/pgHashBytesExtended 64-bit result); the plain siblings
+// return int4 (the low 32 bits, matching hash_uint32/hash_bytes's C uint32
+// return type — PG relies on this for cross-type hash-join compatibility
+// between int2/int4/int8, hence hashint8's fold-to-32-bit-key trick below).
+// M0134-0128.
+func evalHashFunc(name string, x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: fmt.Sprintf("function %s() does not exist", name)}
+	}
+	v, err := evalExprSlot(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if v.IsNull() {
+		return NullDatum, nil
+	}
+	extended := strings.HasSuffix(name, "extended")
+	var seed uint64
+	if extended && len(x.Args) > 1 {
+		sd, serr := evalExprSlot(x.Args[1], slot, ctx)
+		if serr != nil {
+			return Datum{}, serr
+		}
+		if sd.IsNull() {
+			return NullDatum, nil
+		}
+		seed = uint64(sd.Int)
+	}
+	typeErr := func() (Datum, error) {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: fmt.Sprintf("function %s does not exist", name)}
+	}
+	uint32Result := func(key uint32) (Datum, error) {
+		if extended {
+			return Datum{Kind: KindInt, Int: int64(pgHashUint32Extended(key, seed))}, nil
+		}
+		return Datum{Kind: KindInt, Int: int64(int32(pgHashUint32(key)))}, nil
+	}
+	bytesResult := func(b []byte) (Datum, error) {
+		h := pgHashBytesExtended(b, seed)
+		if extended {
+			return Datum{Kind: KindInt, Int: int64(h)}, nil
+		}
+		return Datum{Kind: KindInt, Int: int64(int32(uint32(h)))}, nil
+	}
+	base := strings.TrimSuffix(name, "extended")
+	switch base {
+	case "hashint2":
+		if v.Kind != KindInt {
+			return typeErr()
+		}
+		return uint32Result(uint32(int32(int16(v.Int))))
+	case "hashint4":
+		if v.Kind != KindInt {
+			return typeErr()
+		}
+		return uint32Result(uint32(int32(v.Int)))
+	case "hashoid":
+		if v.Kind != KindInt {
+			return typeErr()
+		}
+		return uint32Result(uint32(v.Int))
+	case "hashchar":
+		if v.Kind != KindString {
+			return typeErr()
+		}
+		s := v.StringValue()
+		var b byte
+		if len(s) > 0 {
+			b = s[0]
+		}
+		return uint32Result(uint32(int32(int8(b))))
+	case "hashint8":
+		// hashint8/hashint8extended (hashfunc.c): fold to a 32-bit key
+		// compatible with hashint4/hashint2 for cross-type hash joins — xor
+		// the high half into the low half, complementing the high half first
+		// when negative. Mirrors pgHashInt8's own derivation (M0134-0071).
+		if v.Kind != KindInt {
+			return typeErr()
+		}
+		val := v.Int
+		lohalf := uint32(val)
+		hihalf := uint32(val >> 32)
+		if val >= 0 {
+			lohalf ^= hihalf
+		} else {
+			lohalf ^= ^hihalf
+		}
+		return uint32Result(lohalf)
+	case "hashfloat4", "hashfloat8":
+		f, ok := datumToFloat64(v)
+		if !ok {
+			return typeErr()
+		}
+		// -0/0 and every NaN bit pattern must hash identically (hashfloat4/8,
+		// hashfunc.c): zero short-circuits to 0 (or the bare seed, for the
+		// extended form — hash_any_extended's own zero-length-independent
+		// seed passthrough), NaN is normalized to a canonical value first.
+		if f == 0 {
+			if extended {
+				return Datum{Kind: KindInt, Int: int64(seed)}, nil
+			}
+			return Datum{Kind: KindInt, Int: 0}, nil
+		}
+		if math.IsNaN(f) {
+			f = math.NaN()
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(f))
+		return bytesResult(buf[:])
+	case "hashname", "hashtext", "hashbpchar":
+		if v.Kind != KindString {
+			return typeErr()
+		}
+		return bytesResult([]byte(v.StringValue()))
+	}
+	return typeErr()
+}
+
+// intToBitTypmodString converts an integer's two's-complement bit pattern
+// into an n-digit '0'/'1' string, mirroring PG's bitfromint4/bitfromint8
+// (postgres/src/backend/utils/adt/varbit.c): when n is within the source
+// integer's width the low n bits are taken verbatim (no sign handling —
+// PG's destbitsleft==srcbitsleft case falls straight to the whole/fractional
+// -byte copy loops); when n exceeds the source width the extra high-order
+// digits are the sign bit repeated (arithmetic-shift sign extension — PG's
+// zero/one-fill loop plus its `val |= ((uint)-1) << ...` fractional-byte
+// sign-fill collapse to exactly this once the byte-level bookkeeping is
+// removed). srcWidth is 16/32/64 for int2/int4/int8 sources. M0134-0128.
+func intToBitTypmodString(val int64, srcWidth, n int) string {
+	if n <= 0 {
+		n = 1
+	}
+	var full uint64
+	var sign bool
+	switch srcWidth {
+	case 16:
+		full = uint64(uint16(int16(val)))
+		sign = int16(val) < 0
+	case 32:
+		full = uint64(uint32(int32(val)))
+		sign = int32(val) < 0
+	default:
+		full = uint64(val)
+		sign = val < 0
+	}
+	var b strings.Builder
+	b.Grow(n)
+	if n > srcWidth {
+		fillBit := byte('0')
+		if sign {
+			fillBit = '1'
+		}
+		for i := 0; i < n-srcWidth; i++ {
+			b.WriteByte(fillBit)
+		}
+		for i := srcWidth - 1; i >= 0; i-- {
+			b.WriteByte(bitDigit(full, i))
+		}
+	} else {
+		for i := n - 1; i >= 0; i-- {
+			b.WriteByte(bitDigit(full, i))
+		}
+	}
+	return b.String()
+}
+
+// bitDigit renders bit i (0 = least significant) of full as '0' or '1'.
+func bitDigit(full uint64, i int) byte {
+	if full&(uint64(1)<<uint(i)) != 0 {
+		return '1'
+	}
+	return '0'
 }
 
 // datumToFloat64 converts any numeric Datum kind to float64.
@@ -4648,6 +6146,56 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		default:
 			return d, nil
 		}
+	case "xid", "xid8":
+		// M0134-0087 (xid.sql sizing): evalCast had NO case for xid/xid8 at
+		// all, so `'…'::xid`/`'…'::xid8` (and an implicit cast into an
+		// xid/xid8 COLUMN, e.g. `INSERT INTO t(x xid8) VALUES ('0x2a')`) fell
+		// through to the bottom default arm and returned the input datum
+		// UNCHANGED — no octal/hex parsing, no range validation, no 22P02 on
+		// garbage input ('asdf'::xid silently "succeeded" as the string
+		// "asdf"). This mirrors the CastExpr-vs-TypedStringLit split the
+		// pattern_sibling_paths_must_agree memory warns about: the `xid
+		// '42'` TypedStringLit form (evalTypedStringLit, above) already had
+		// working parseXid/parseXid8 logic; `'42'::xid` (CastExpr, this
+		// function) did not share it.
+		bits := 32
+		typeName := "xid"
+		wrapped := int64(uint32(0xffffffff)) // -1 special case, 32-bit
+		if targetType == "xid8" {
+			bits = 64
+			typeName = "xid8"
+			wrapped = -1 // int64(-1) bit-for-bit equals uint64 2^64-1
+		}
+		switch d.Kind {
+		case KindInt:
+			if bits == 32 {
+				// xid8::xid truncates to the low 32 bits (xid8toxid /
+				// XidFromFullTransactionId, postgres/src/backend/utils/adt/xid.c:187-191).
+				return Datum{Kind: KindInt, Int: int64(uint32(uint64(d.Int)))}, nil
+			}
+			return d, nil
+		case KindString:
+			v := strings.TrimSpace(d.StringValue())
+			if v == "-1" {
+				return Datum{Kind: KindInt, Int: wrapped}, nil
+			}
+			var n uint64
+			var err error
+			if bits == 32 {
+				var n32 uint32
+				n32, err = parseXid(v)
+				n = uint64(n32)
+			} else {
+				n, err = parseXid8(v)
+			}
+			if err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, d.StringValue())}
+			}
+			return Datum{Kind: KindInt, Int: int64(n)}, nil
+		default:
+			return d, nil
+		}
 	case "pg_lsn":
 		switch d.Kind {
 		case KindString:
@@ -4839,6 +6387,21 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
 		}
 		return d, nil
+	case "txid_snapshot", "pg_snapshot":
+		// M0134-0080: `::txid_snapshot`/`::pg_snapshot` and CAST(...) route
+		// here (evalCastTyped falls back to evalCast); the `txid_snapshot
+		// '...'` typed-literal spelling has its own arm in
+		// evalTypedStringLit, kept in sync with this one. Mirrors
+		// parse_snapshot (xid8funcs.c) — see parsePgSnapshot.
+		if d.Kind == KindString {
+			norm, ok := parsePgSnapshot(d.StringValue())
+			if !ok {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", d.StringValue())}
+			}
+			return NewStringDatum(norm), nil
+		}
+		return d, nil
 	case "numeric", "decimal":
 		// Cast to numeric: validate string inputs, pass through numeric/int as-is.
 		// M0097-0056: prevents 'foo'::numeric from succeeding silently.
@@ -4873,6 +6436,66 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
 				Message: fmt.Sprintf("cannot cast type %v to numeric", d.Kind)}
 		}
+	case "point":
+		// `'...'::point` had NO case here at all — fell through to the
+		// bottom default arm and returned the input datum UNCHANGED (same
+		// sibling-gap shape M0134-0087 found for xid/xid8: TypedStringLit
+		// spellings validate, CastExpr spellings don't). Must agree with
+		// coerceTextLikeDatum's point arm — both call parsePointLiteral.
+		// M0134-0150.
+		if s, ok := datumAsString(d); ok {
+			px, py, perr := parsePointLiteral(s)
+			if perr != nil {
+				ee := *perr
+				ee.Pos = pos
+				return Datum{}, &ee
+			}
+			return NewStringDatum(pointCanonicalText(px, py)), nil
+		}
+		return d, nil
+	case "lseg":
+		// `'...'::lseg` had NO case here at all — same sibling gap as point
+		// above. Must agree with coerceTextLikeDatum's lseg arm.
+		// M0134-0150.
+		if s, ok := datumAsString(d); ok {
+			x1, y1, x2, y2, lerr := parseLsegLiteral(s)
+			if lerr != nil {
+				ee := *lerr
+				ee.Pos = pos
+				return Datum{}, &ee
+			}
+			return NewStringDatum(lsegCanonicalText(x1, y1, x2, y2)), nil
+		}
+		return d, nil
+	case "path":
+		// `'...'::path` had NO case here at all — same sibling gap as point
+		// above. Must agree with coerceTextLikeDatum's path arm.
+		// M0134-0150.
+		if s, ok := datumAsString(d); ok {
+			pts, closed, perr := parsePathLiteral(s)
+			if perr != nil {
+				ee := *perr
+				ee.Pos = pos
+				return Datum{}, &ee
+			}
+			return NewStringDatum(pathCanonicalText(pts, closed)), nil
+		}
+		return d, nil
+	case "polygon":
+		// `'...'::polygon` had NO case here at all, and no parser at all
+		// anywhere until this loop. Must agree with coerceTextLikeDatum's
+		// polygon arm and evalTypedStringLit's polygon arm — both call
+		// parsePolygonLiteral. M0134-0151.
+		if s, ok := datumAsString(d); ok {
+			pts, perr := parsePolygonLiteral(s)
+			if perr != nil {
+				ee := *perr
+				ee.Pos = pos
+				return Datum{}, &ee
+			}
+			return NewStringDatum(polygonCanonicalText(pts)), nil
+		}
+		return d, nil
 	case "jsonb":
 		// `::jsonb` canonicalises the text the same way a jsonb column does
 		// (coerceTextLikeDatum's jsonb arm) — the two are the twin input
@@ -4887,6 +6510,82 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, err
 			}
 			return NewStringDatum(canon), nil
+		}
+		return d, nil
+	case "json":
+		// `::json` preserves the input spelling verbatim (no re-serialisation,
+		// unlike `::jsonb` above) but still validates JSON syntax at the input
+		// boundary — coerceTextLikeDatum's `json` column-storage path must
+		// agree (Hard-won Rule #2). Unlike most 22P02 casts, PG's json parser
+		// reports this via DETAIL/CONTEXT (json_ereport_error), never a LINE/^
+		// position marker — so, unlike the numeric/int2/etc. arms above,
+		// ee.Pos is deliberately left at its zero value here (the wire layer
+		// only emits LINE when Pos > 0). M0134-0120.
+		if s, ok := datumAsString(d); ok {
+			if err := validateJSONText(s); err != nil {
+				return Datum{}, err
+			}
+		}
+		return d, nil
+	case "macaddr":
+		// `::macaddr` validates + canonicalizes the same way a macaddr column
+		// does (coerceTextLikeDatum's macaddr arm), but also accepts a
+		// macaddr8-shaped (8-octet) source — macaddr8tomacaddr (mac8.c:
+		// 544-566) — which requires the 4th/5th octets be exactly 0xFF/0xFE.
+		// Previously this whole cast was an unvalidated pass-through
+		// (`return d, nil` at the bottom of this switch). M0134-0139.
+		if s, ok := datumAsString(d); ok {
+			if a, b, c, dd, e, f, merr := parseMacaddrLiteral(s); merr == nil {
+				return NewStringDatum(macaddrCanonicalText(a, b, c, dd, e, f)), nil
+			}
+			if a, b, c, dd, e, f, g, h, merr := parseMacaddr8Literal(s); merr == nil {
+				ra, rb, rc, rd, re, rf, cerr := macaddr8ToMacaddrOctets(a, b, c, dd, e, f, g, h)
+				if cerr != nil {
+					cerr.Pos = pos
+					return Datum{}, cerr
+				}
+				return NewStringDatum(macaddrCanonicalText(ra, rb, rc, rd, re, rf)), nil
+			}
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type macaddr: %q", s)}
+		}
+		return d, nil
+	case "macaddr8":
+		// `::macaddr8` validates + canonicalizes the same way a macaddr8
+		// column does (coerceTextLikeDatum's macaddr8 arm). A plain
+		// macaddr-shaped (6-octet) source is widened via macaddrtomacaddr8
+		// (mac8.c:523-542); parseMacaddr8Literal on its own already performs
+		// the identical widening for a bare 6-byte literal, so a genuine
+		// 8-octet source and a widened 6-octet source share one parse path.
+		// Previously this whole cast was an unvalidated pass-through.
+		// M0134-0139.
+		if s, ok := datumAsString(d); ok {
+			if a, b, c, dd, e, f, merr := parseMacaddrLiteral(s); merr == nil {
+				wa, wb, wc, wd, we, wf, wg, wh := macaddrToMacaddr8Octets(a, b, c, dd, e, f)
+				return NewStringDatum(macaddr8CanonicalText(wa, wb, wc, wd, we, wf, wg, wh)), nil
+			}
+			if a, b, c, dd, e, f, g, h, merr := parseMacaddr8Literal(s); merr == nil {
+				return NewStringDatum(macaddr8CanonicalText(a, b, c, dd, e, f, g, h)), nil
+			}
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type macaddr8: %q", s)}
+		}
+		return d, nil
+	case "jsonpath":
+		// `::jsonpath` re-lexes/re-prints double-quoted string escapes the
+		// same way PG's jsonpath scanner+printer round-trip does
+		// (jsonpath_encoding.go) but does not implement the rest of PG's
+		// jsonpath grammar — path navigation, filters, and operators pass
+		// through unvalidated. M0134-0134.
+		if s, ok := datumAsString(d); ok {
+			rewritten, err := rewriteJSONPathText(s)
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			return NewStringDatum(rewritten), nil
 		}
 		return d, nil
 	}
@@ -4989,41 +6688,120 @@ func parseXid(s string) (uint32, error) {
 	return uint32(n), err
 }
 
-// parseXid8 parses an xid8 value (unsigned 64-bit). M0097-0018.
+// parseXid8 parses an xid8 value (unsigned 64-bit). Accepts decimal, octal
+// (0NNN), hex (0xNNN) — matching xid8in's uint64in_subr, which calls
+// strtou64(s, &endptr, 0) (base 0 = C's octal/hex/decimal auto-detect,
+// postgres/src/backend/utils/adt/numutils.c:985-992). M0097-0018;
+// octal support added M0134-0087 (parseXid already had it; this was the
+// sibling gap — pattern_sibling_paths_must_agree).
 func parseXid8(s string) (uint64, error) {
 	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
 		return strconv.ParseUint(s[2:], 16, 64)
 	}
+	if len(s) > 1 && s[0] == '0' {
+		return strconv.ParseUint(s[1:], 8, 64)
+	}
 	return strconv.ParseUint(s, 10, 64)
 }
 
-// parsePgSnapshotValid returns true if s is a valid pg_snapshot literal.
-// Format: xmin:xmax[:xip,...]  M0097-0018.
-func parsePgSnapshotValid(s string) bool {
+// parsePgSnapshot parses and validates a pg_snapshot/txid_snapshot text
+// literal, mirroring parse_snapshot (xid8funcs.c). Format: xmin:xmax[:xip,...].
+// On success returns the canonical form: xip values must be non-decreasing,
+// with equal-valued duplicates collapsed (matching buf_add_txid's "skip
+// duplicates" and the reject of any xip that goes backward). M0134-0080
+// widens the original M0097-0018 form (which never rejected an out-of-order
+// or zero xmin/xmax and never deduplicated) to match upstream exactly.
+func parsePgSnapshot(s string) (string, bool) {
+	xmin, xmax, xips, ok := parsePgSnapshotParts(s)
+	if !ok {
+		return "", false
+	}
+	return formatPgSnapshot(xmin, xmax, xips), true
+}
+
+// parsePgSnapshotParts is parsePgSnapshot's validating parse, exposing the
+// three fields separately for txid_snapshot_xmin/xmax/txid_visible_in_snapshot
+// (M0134-0080) instead of re-parsing the canonical string those callers would
+// otherwise have to re-split.
+func parsePgSnapshotParts(s string) (xmin, xmax uint64, xips []uint64, ok bool) {
 	parts := strings.SplitN(s, ":", 3)
 	if len(parts) < 2 {
-		return false
+		return 0, 0, nil, false
 	}
 	xmin, err1 := strconv.ParseUint(parts[0], 10, 64)
 	xmax, err2 := strconv.ParseUint(parts[1], 10, 64)
-	if err1 != nil || err2 != nil {
-		return false
-	}
-	if xmin > xmax {
-		return false
+	// FullTransactionIdIsValid checks TransactionIdIsValid on the LOW 32 BITS
+	// only (XidFromFullTransactionId): a FullTransactionId packs epoch (high
+	// 32 bits) : xid (low 32 bits), and it's the xid half that must be
+	// nonzero — the full 64-bit value itself can be nonzero while still being
+	// "invalid" this way, e.g. 9223372036854775808 (0x8000000000000000) has a
+	// zero low half. goopg's own TransactionID has no epoch packing, but
+	// txid_snapshot/pg_snapshot's on-the-wire text form must still reject
+	// exactly what upstream rejects.
+	if err1 != nil || err2 != nil || uint32(xmin) == 0 || uint32(xmax) == 0 || xmin > xmax {
+		return 0, 0, nil, false
 	}
 	if len(parts) == 3 && parts[2] != "" {
+		var last uint64
+		haveLast := false
 		for _, xip := range strings.Split(parts[2], ",") {
 			v, err := strconv.ParseUint(xip, 10, 64)
 			if err != nil {
-				return false
+				return 0, 0, nil, false
 			}
 			if v < xmin || v >= xmax {
-				return false
+				return 0, 0, nil, false
 			}
+			if haveLast && v < last {
+				return 0, 0, nil, false
+			}
+			if !haveLast || v != last {
+				xips = append(xips, v)
+			}
+			last = v
+			haveLast = true
 		}
 	}
-	return true
+	return xmin, xmax, xips, true
+}
+
+// formatPgSnapshot renders xmin:xmax[:xip,...] — the pg_snapshot_out /
+// txid_current_snapshot canonical text form. M0134-0080.
+func formatPgSnapshot(xmin, xmax uint64, xips []uint64) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d:%d:", xmin, xmax)
+	for i, v := range xips {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%d", v)
+	}
+	return b.String()
+}
+
+// dedupSortedUint64 collapses adjacent equal values in an ascending-sorted
+// slice, in place. Used by txid_current_snapshot to match sort_snapshot's
+// "also remove duplicates" step (xid8funcs.c) when the in-progress array
+// happens to contain the same xid twice. M0134-0080.
+func dedupSortedUint64(s []uint64) []uint64 {
+	if len(s) < 2 {
+		return s
+	}
+	out := s[:1]
+	for _, v := range s[1:] {
+		if v != out[len(out)-1] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// parsePgSnapshotValid returns true if s is a valid pg_snapshot literal.
+// Format: xmin:xmax[:xip,...]. Thin wrapper over parsePgSnapshot for callers
+// (pg_input_is_valid) that only need the boolean. M0097-0018.
+func parsePgSnapshotValid(s string) bool {
+	_, ok := parsePgSnapshot(s)
+	return ok
 }
 
 // resolveRegclassOID evaluates a regclass/oid argument to its underlying OID.
@@ -5569,6 +7347,21 @@ func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error)
 	// For time-of-day source types, validate and handle allowed fields only. M0097-0004.
 	srcType := strings.ToLower(x.SourceTypeName)
 	isTimeOnly := srcType == "time" || srcType == "timetz"
+	// M0134-0076: a timestamptz source extracts in the session TimeZone — PG's
+	// timestamptz_part passes NULL zone to timestamp2tm, which means
+	// session_timezone (postgres/src/backend/utils/adt/timestamp.c:5824). Every
+	// other source kind keeps its stored wall clock; epoch is zone-independent
+	// (Unix()), so it needs no special-casing.
+	if srcType == "timestamptz" {
+		u = u.In(sessionTimeZoneLocation(timeZoneFromCtx(ctx)))
+	}
+	// TIMESTAMP_NOT_FINITE arms (timestamp.c:5794): oscillating units → NULL,
+	// monotonically-increasing units → ±Infinity.
+	if src.IsTimestampNotFinite() {
+		if d, handled := extractNonFiniteField(field, src.IsTimestampPosInf()); handled {
+			return d, nil
+		}
+	}
 	switch field {
 	case "second", "seconds":
 		// EXTRACT returns numeric: (tm_sec*1e6 + fsec) / 1e6 at scale 6
@@ -5576,9 +7369,18 @@ func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error)
 		// prints `40.500000` not `40.5`.
 		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
 		return int64DivFastToNumeric(usec, 6), nil
-	case "milliseconds", "millisecond":
+	case "milliseconds", "millisecond", "msec":
+		// msec is the datetktbl alias for DTK_MILLISEC (datetime.c). Sibling of
+		// evalDatePart's identical arm — they must agree. M0134-0076.
 		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
 		return int64DivFastToNumeric(usec, 3), nil
+	case "microseconds", "microsecond", "usec":
+		// usec is the datetktbl alias for DTK_MICROSEC. Unlike milliseconds/
+		// seconds, DTK_MICROSEC stores a plain intresult (timestamp.c:5557) and
+		// returns int64_to_numeric — an INTEGER numeric (scale 0), so PG prints
+		// `1000000` not `1000000.000000` (timestamptz.out extract block).
+		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
+		return int64DivFastToNumeric(usec, 0), nil
 	case "epoch":
 		// EXTRACT returns numeric (retnumeric=true), so the display scale is
 		// preserved. PG's epoch is source-type dependent (timestamp_part /
@@ -5604,6 +7406,19 @@ func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error)
 			return int64DivFastToNumeric(epochMicros, 6), nil
 		}
 	case "timezone", "timezone_hour", "timezone_minute":
+		if srcType == "timestamptz" {
+			// Session offset, seconds east of UTC (DTK_TZ arms,
+			// timestamp.c:5831-5841; Go's Zone() uses the same sign convention).
+			_, off := u.Zone()
+			switch field {
+			case "timezone":
+				return Datum{Kind: KindInt, Int: int64(off)}, nil
+			case "timezone_hour":
+				return Datum{Kind: KindInt, Int: int64(off / 3600)}, nil
+			case "timezone_minute":
+				return Datum{Kind: KindInt, Int: int64((off % 3600) / 60)}, nil
+			}
+		}
 		if srcType == "time" {
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unit %q not supported for type time without time zone", field)}
@@ -5648,6 +7463,12 @@ func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error)
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unit %q not recognized for type %s", field, typeName)}
 		}
+	}
+	if field == "julian" {
+		// DTK_JULIAN (timestamp.c:5651): a fractional day, returned numeric like
+		// the other fractional fields (the "msec"/"usec"/"julian" aliases land
+		// here rather than in extractTimestampField, which returns int64).
+		return newNumericFromFloat(julianNumber(u)), nil
 	}
 	n, err := extractTimestampField(x.Field, u, x.Pos())
 	if err != nil {
@@ -5808,68 +7629,139 @@ func intervalUnitError(field string, pos int) (Datum, error) {
 // calendar field from a UTC timestamp. Shared by evalExtract and
 // evalDatePart.
 func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
-	u := t.UTC()
+	// M0134-0076: the caller (evalExtract/evalDatePart) passes t already
+	// zone-adjusted for a timestamptz source; this helper no longer strips the
+	// zone with .UTC(). A plain timestamp/date/time/timetz keeps its wall clock.
 	switch field {
 	case "year":
-		return int64(u.Year()), nil
+		return int64(t.Year()), nil
 	case "month":
-		return int64(u.Month()), nil
+		return int64(t.Month()), nil
 	case "day":
-		return int64(u.Day()), nil
+		return int64(t.Day()), nil
 	case "hour":
-		return int64(u.Hour()), nil
+		return int64(t.Hour()), nil
 	case "minute":
-		return int64(u.Minute()), nil
+		return int64(t.Minute()), nil
 	case "second":
-		return int64(u.Second()), nil
+		return int64(t.Second()), nil
 	case "dow":
-		return int64(u.Weekday()), nil // Sunday=0, matches upstream
+		return int64(t.Weekday()), nil // Sunday=0, matches upstream
 	case "doy":
-		return int64(u.YearDay()), nil
+		return int64(t.YearDay()), nil
 	case "epoch":
-		return u.Unix(), nil
+		return t.Unix(), nil
 	case "quarter":
-		return int64((int(u.Month())-1)/3 + 1), nil
+		return int64((int(t.Month())-1)/3 + 1), nil
 	// M0097-0004: additional calendar fields.
 	case "week", "isoweek":
-		_, week := u.ISOWeek()
+		_, week := t.ISOWeek()
 		return int64(week), nil
 	case "isoyear":
-		year, _ := u.ISOWeek()
+		year, _ := t.ISOWeek()
 		return int64(year), nil
 	case "isodow":
-		wd := u.Weekday()
+		wd := t.Weekday()
 		if wd == 0 {
 			wd = 7 // ISO: Sunday = 7
 		}
 		return int64(wd), nil
 	case "decade":
-		y := int64(u.Year())
+		y := int64(t.Year())
 		if y >= 0 {
 			return y / 10, nil
 		}
 		return (y - 9) / 10, nil
 	case "century":
-		y := int64(u.Year())
+		y := int64(t.Year())
 		if y > 0 {
 			return (y + 99) / 100, nil
 		}
 		return -((-y + 99) / 100), nil
 	case "millennium":
-		y := int64(u.Year())
+		y := int64(t.Year())
 		if y > 0 {
 			return (y + 999) / 1000, nil
 		}
 		return -((-y + 999) / 1000), nil
-	case "microseconds", "microsecond":
-		return int64(u.Second())*1_000_000 + int64(u.Nanosecond()/1000), nil
-	case "milliseconds", "millisecond":
-		return int64(u.Second())*1000 + int64(u.Nanosecond()/1_000_000), nil
-	case "timezone", "timezone_hour", "timezone_minute":
-		return 0, nil // goopg v0 is UTC-only
+	case "microseconds", "microsecond", "usec":
+		return int64(t.Second())*1_000_000 + int64(t.Nanosecond()/1000), nil
+	case "milliseconds", "millisecond", "msec":
+		return int64(t.Second())*1000 + int64(t.Nanosecond()/1_000_000), nil
+	// timezone/timezone_hour/timezone_minute are owned by the callers, which
+	// know the source type (timestamptz → session offset, else 22023). M0134-0076.
 	default:
 		return 0, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("date field %q is not supported in v0", field)}
 	}
+}
+
+// sessionTimeZoneLocation resolves the session's TimeZone GUC to a
+// *time.Location with exactly the renderer's semantics (sessionLocation,
+// internal/utils/misc/timestamptz_out.go:37): "" → UTC, and any spelling Go's
+// tzdata does not know (POSIX-style fixed offsets like "+05:30") falls back to
+// UTC — so EXTRACT/date_part and FormatTimestampTZ always agree. M0134-0076.
+func sessionTimeZoneLocation(zone string) *time.Location {
+	if zone == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(zone)
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}
+
+// julianNumber ports DTK_JULIAN (postgres/src/backend/utils/adt/timestamp.c:5651):
+// date2j(year,mon,day) + (hour*3600 + min*60 + sec + fsec)/86400 — the Julian day
+// number plus the fraction of the day elapsed since midday. t carries the fields
+// in the session zone (timestamptz) or the stored wall clock. The callers return
+// it as numeric (EXTRACT) / float8 (date_part), like the other fractional fields.
+func julianNumber(t time.Time) float64 {
+	year, month, day := t.Date()
+	jd := date2j(year, int(month), day)
+	f := (float64(t.Hour()*3600+t.Minute()*60+t.Second())*1e9 + float64(t.Nanosecond())) / 86400e9
+	return float64(jd) + f
+}
+
+// date2j ports PostgreSQL's Gregorian day-number function
+// (postgres/src/backend/utils/adt/datetime.c:296). PG feeds it tm_year, the
+// astronomical year (1 BC = 0), which is exactly Go's time.Year() convention.
+func date2j(year, month, day int) int {
+	if month > 2 {
+		month += 1
+		year += 4800
+	} else {
+		month += 13
+		year += 4799
+	}
+	century := year / 100
+	julian := year*365 - 32167
+	julian += year/4 - century + century/4
+	julian += 7834*month/256 + day
+	return julian
+}
+
+// extractNonFiniteField ports the TIMESTAMP_NOT_FINITE arms of
+// NonFiniteTimestampTzPart (postgres/src/backend/utils/adt/timestamp.c:5441),
+// reached by both callers for ±infinity timestamps and dates (NewTimestampInfinity
+// and NewDateInfinity both carry Int=±MaxInt64): oscillating units return NULL,
+// monotonically-increasing units return ±Infinity. handled=false means the field
+// is not one of those arms, so the caller falls through to normal extraction
+// (which raises the same unit error it would for a finite input).
+func extractNonFiniteField(field string, positive bool) (Datum, bool) {
+	switch field {
+	case "microseconds", "microsecond", "milliseconds", "millisecond",
+		"msec", "usec", "second", "seconds", "minute", "hour", "day", "month",
+		"quarter", "week", "isoweek", "dow", "isodow", "doy",
+		"timezone", "timezone_hour", "timezone_minute":
+		return NullDatum, true
+	case "year", "decade", "century", "millennium", "isoyear", "julian", "epoch":
+		if positive {
+			return NewStringDatum("Infinity"), true
+		}
+		return NewStringDatum("-Infinity"), true
+	}
+	return Datum{}, false
 }
 
 // evalDatePart implements PostgreSQL's `date_part(text, timestamp)`
@@ -5905,13 +7797,31 @@ func evalDatePart(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	}
 	// Fractional-second fields return float8 (numeric), like evalExtract. M0097-0004.
 	u := src.TimeValue().UTC()
+	// M0134-0076: sibling of evalExtract — a timestamptz source extracts in the
+	// session TimeZone (timestamp.c:5824); other kinds keep their stored wall
+	// clock. Discriminator is the datum's TimeSub tag, since a FuncCall carries
+	// no declared source type.
+	if src.IsTimestampTZ() {
+		u = u.In(sessionTimeZoneLocation(timeZoneFromCtx(ctx)))
+	}
 	field := strings.ToLower(strings.TrimSpace(fieldArg.StringValue()))
+	// TIMESTAMP_NOT_FINITE arms (timestamp.c:5794).
+	if src.IsTimestampNotFinite() {
+		if d, handled := extractNonFiniteField(field, src.IsTimestampPosInf()); handled {
+			return d, nil
+		}
+	}
 	switch field {
 	case "second", "seconds":
 		f := float64(u.Second()) + float64(u.Nanosecond())/1e9
 		return newNumericFromFloat(f), nil
-	case "milliseconds", "millisecond":
+	case "milliseconds", "millisecond", "msec":
+		// msec/usec are the datetktbl aliases (datetime.c), sibling of
+		// evalExtract's identical arms — they must agree. M0134-0076.
 		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
+		return newNumericFromFloat(f), nil
+	case "microseconds", "microsecond", "usec":
+		f := float64(u.Second())*1_000_000 + float64(u.Nanosecond())/1000.0
 		return newNumericFromFloat(f), nil
 	case "epoch":
 		// date_part returns float8 (retnumeric=false) → trailing zeros stripped.
@@ -5926,6 +7836,27 @@ func evalDatePart(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		epochMicros := u.Unix()*1_000_000 + int64(u.Nanosecond())/1000
 		return newNumericFromFloat(float64(epochMicros)/1e6), nil
+	case "julian":
+		// DTK_JULIAN (timestamp.c:5651), returned float8 like the other
+		// fractional fields.
+		return newNumericFromFloat(julianNumber(u)), nil
+	case "timezone", "timezone_hour", "timezone_minute":
+		if src.IsTimestampTZ() {
+			// Session offset, seconds east of UTC (timestamp.c:5831-5841).
+			_, off := u.Zone()
+			switch field {
+			case "timezone":
+				return Datum{Kind: KindInt, Int: int64(off)}, nil
+			case "timezone_hour":
+				return Datum{Kind: KindInt, Int: int64(off / 3600)}, nil
+			case "timezone_minute":
+				return Datum{Kind: KindInt, Int: int64((off % 3600) / 60)}, nil
+			}
+		}
+		// A zone-less timestamp/date has no offset to report. PG rejects with
+		// 0A000 (timestamp.c:5683-5691); goopg keeps evalExtract's 22023.
+		return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+			Message: fmt.Sprintf("unit %q not supported for type timestamp without time zone", field)}
 	}
 	n, err := extractTimestampField(field, u, x.Pos())
 	if err != nil {
@@ -9497,24 +11428,34 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// M0119-0006 (40th slice).
 		return NewTimestampTZDatum(ctx.Now), nil
 	case "current_date":
+		// Tag the result TimeSubDate (M0134-0084): current_date shares the
+		// KindTime carrier with timestamp, and NewTimeDatum leaves TimeSub
+		// unset, so `current_date::text` rendered the full "YYYY-MM-DD
+		// 00:00:00" timestamp shape instead of a bare date — the reason
+		// `date(now())::text = current_date::text` (expressions.sql) always
+		// compared unequal regardless of the actual day. NewDateDatum is the
+		// same site every other date-producing path already uses.
 		t := ctx.Now.UTC()
-		return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
+		return NewDateDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 	case "current_time":
 		// Returns time-of-day anchored at epoch, matching parseTimeString convention.
-		// Accepts optional precision arg: current_time(N) truncates microseconds.
+		// Accepts optional precision arg: current_time(N) rounds the fractional
+		// seconds the same way `::time(N)` does — roundTimeDatumToPrecision
+		// (AdjustTimeForTypmod, date.c:1710) ROUNDS, it does not truncate.
+		// M0134-0084: the previous floor-via-integer-division here disagreed
+		// with the CastExpr Typmod path on any nanosecond value that rounds up,
+		// making `now()::time(3) = current_time(3)`-shaped comparisons flaky
+		// (they only matched when the discarded digits happened to floor and
+		// round to the same value).
 		t := ctx.Now.UTC()
-		ns := t.Nanosecond()
+		d := NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
-			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
-				factor := int64(1)
-				for i := int64(0); i < 6-prec.Int; i++ {
-					factor *= 10
-				}
-				ns = (ns / (int(factor) * 1000)) * (int(factor) * 1000)
+			if err == nil && prec.Kind == KindInt {
+				d = roundTimeDatumToPrecision(d, prec.Int)
 			}
 		}
-		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
+		return d, nil
 	case "current_catalog":
 		return NewStringDatum("postgres"), nil
 	case "pg_client_encoding":
@@ -9866,9 +11807,12 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// pg_notify(channel text, payload text) → void: the SQL-function form of
 		// the NOTIFY statement. Buffers a notification (delivered to LISTENers at
 		// the current transaction's commit) via ctx.QueueNotify, which the server
-		// wires to the connection's notify buffer. A NULL payload is treated as
-		// the empty payload (matching NOTIFY without a payload). A NULL/empty
-		// channel is a no-op here. Returns void (empty value). M0118-0009.
+		// wires to the connection's notify buffer. A NULL channel/payload is
+		// treated as the empty string, matching pg_notify(PG_FUNCTION_ARGS)
+		// (postgres/src/backend/commands/async.c:556-576), which then feeds
+		// Async_Notify's length checks (async.c:604-621): an empty channel name
+		// or one whose length reaches NAMEDATALEN (64, i.e. 63+ bytes) errors
+		// with ERRCODE_INVALID_PARAMETER_VALUE. M0118-0009, M0134-0091.
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
@@ -9876,8 +11820,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if err != nil {
 			return NullDatum, err
 		}
-		if chArg.IsNull() {
-			return NullDatum, nil
+		channel := ""
+		if !chArg.IsNull() {
+			channel = chArg.StringValue()
 		}
 		payload := ""
 		if len(x.Args) >= 2 {
@@ -9889,8 +11834,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				payload = pArg.StringValue()
 			}
 		}
+		if channel == "" {
+			// Async_Notify's ereport has no errposition() call, so PG attaches
+			// no cursor position to this error — Pos stays 0 (no LINE/^
+			// pointer on the wire). M0134-0070/M0134-0091.
+			return NullDatum, &ExecError{Code: "22023", Message: "channel name cannot be empty"}
+		}
+		if len(channel) >= 64 {
+			return NullDatum, &ExecError{Code: "22023", Message: "channel name too long"}
+		}
 		if ctx != nil && ctx.QueueNotify != nil {
-			ctx.QueueNotify(chArg.StringValue(), payload)
+			ctx.QueueNotify(channel, payload)
 		}
 		// pg_notify returns void — a non-NULL empty value (like the advisory-lock
 		// builtins), so `count(pg_notify(...))` counts every row (PostgreSQL's
@@ -10222,6 +12176,72 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		return NullDatum, nil
 
+	case "array_slice":
+		// Array slice access: arr[lower:upper] (1-based, inclusive, both
+		// bounds optional — the planner stamps an omitted bound as a
+		// NullConst literal). PG's array_ref (arrayfuncs.c) clamps an
+		// out-of-range bound to the array's actual bound rather than
+		// erroring, and lower > upper yields an empty array — never NULL
+		// or an error. M0134-0079.
+		if len(x.Args) == 3 {
+			arr, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() {
+				return NullDatum, nil
+			}
+			sv := arr.StringValue()
+			elems := splitArrayElements(sv)
+			if elems == nil {
+				// Not array-literal text (e.g. a fixed-length pseudo-array
+				// type) — slicing isn't defined for it; fall back to NULL
+				// rather than mis-splitting arbitrary text.
+				return NullDatum, nil
+			}
+			bound := func(argExpr optimizer.Expr, deflt int) (int, error) {
+				if _, isNull := argExpr.(*optimizer.NullConst); isNull {
+					return deflt, nil
+				}
+				d, err := evalExprSlot(argExpr, slot, ctx)
+				if err != nil {
+					return 0, err
+				}
+				if d.IsNull() {
+					return deflt, nil
+				}
+				return int(d.Int), nil
+			}
+			lower, err := bound(x.Args[1], 1)
+			if err != nil {
+				return NullDatum, err
+			}
+			upper, err := bound(x.Args[2], len(elems))
+			if err != nil {
+				return NullDatum, err
+			}
+			if lower < 1 {
+				lower = 1
+			}
+			if upper > len(elems) {
+				upper = len(elems)
+			}
+			if lower > upper {
+				return NewStringDatum("{}"), nil
+			}
+			var sb strings.Builder
+			sb.WriteByte('{')
+			for i := lower; i <= upper; i++ {
+				if i > lower {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(elems[i-1])
+			}
+			sb.WriteByte('}')
+			return NewStringDatum(sb.String()), nil
+		}
+		return NullDatum, nil
+
 	case "array_upper":
 		// array_upper(anyarray, int) → int: upper bound of specified dimension (1-based).
 		// For 1-D arrays, returns the number of elements (lower is always 1).
@@ -10311,6 +12331,26 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if len(elems) == 0 {
 				return NullDatum, nil
 			}
+			return NewIntDatum(int64(len(elems))), nil
+		}
+		return NullDatum, nil
+
+	case "cardinality":
+		// cardinality(anyarray) → int: total number of elements across all
+		// dimensions (postgres/src/backend/utils/adt/array_userfuncs.c
+		// array_cardinality → ArrayGetNItems). Unlike array_length, takes no
+		// dimension argument and returns 0 (not NULL) for an empty array;
+		// NULL input still yields NULL. goopg arrays are 1-D only, so this is
+		// just the element count.
+		if len(x.Args) == 1 {
+			arr, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arr.StringValue())
 			return NewIntDatum(int64(len(elems))), nil
 		}
 		return NullDatum, nil
@@ -10529,6 +12569,51 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// path and pg_input_error_info. M0134-0070.
 				_, err := byteaIn(v, 0)
 				return NewBoolDatum(err == nil), nil
+			case "box":
+				// M0134-0094: agrees with the typed-literal/coercion path,
+				// same parseBoxLiteral.
+				_, _, _, _, ok := parseBoxLiteral(v)
+				return NewBoolDatum(ok), nil
+			case "circle":
+				// M0134-0098: agrees with the typed-literal/coercion path,
+				// same parseCircleLiteral.
+				_, _, _, ok := parseCircleLiteral(v)
+				return NewBoolDatum(ok), nil
+			case "line":
+				// M0134-0136: agrees with the typed-literal/coercion path,
+				// same parseLineLiteral.
+				_, _, _, lerr := parseLineLiteral(v)
+				return NewBoolDatum(lerr == nil), nil
+			case "lseg":
+				// M0134-0137: agrees with the column-coercion path, same
+				// parseLsegLiteral.
+				_, _, _, _, lerr := parseLsegLiteral(v)
+				return NewBoolDatum(lerr == nil), nil
+			case "path":
+				// M0134-0149: agrees with the column-coercion path, same
+				// parsePathLiteral.
+				_, _, perr := parsePathLiteral(v)
+				return NewBoolDatum(perr == nil), nil
+			case "point":
+				// M0134-0150: agrees with the column-coercion path, same
+				// parsePointLiteral.
+				_, _, perr := parsePointLiteral(v)
+				return NewBoolDatum(perr == nil), nil
+			case "polygon":
+				// M0134-0151: agrees with the column-coercion path, same
+				// parsePolygonLiteral.
+				_, perr := parsePolygonLiteral(v)
+				return NewBoolDatum(perr == nil), nil
+			case "macaddr":
+				// M0134-0138: agrees with the column-coercion path, same
+				// parseMacaddrLiteral.
+				_, _, _, _, _, _, merr := parseMacaddrLiteral(v)
+				return NewBoolDatum(merr == nil), nil
+			case "macaddr8":
+				// M0134-0139: agrees with the column-coercion path, same
+				// parseMacaddr8Literal.
+				_, _, _, _, _, _, _, _, merr := parseMacaddr8Literal(v)
+				return NewBoolDatum(merr == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
@@ -10571,7 +12656,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					return NullDatum, aerr
 				}
 				ts := shifted.TimeValue()
-				uuidV7Ns = ts.UnixNano()
+				u, genErr := genUUIDv7FromTime(ts)
+				if genErr != nil {
+					return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: "uuidv7: " + genErr.Error()}
+				}
+				return NewStringDatum(u), nil
 			} else {
 				uuidV7Ns = uuidV7RealTimeNs()
 			}
@@ -10981,6 +13070,124 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return NewStringDatum(buildIndexDefString(idx)), nil
 		}
 		return NullDatum, nil
+
+	case "pg_indexam_has_property":
+		// pg_indexam_has_property(am_oid, propname) → bool — AM-wide
+		// capability probe (postgres/src/backend/utils/adt/amutils.c).
+		// M0134-0090.
+		if len(x.Args) < 2 {
+			return NullDatum, nil
+		}
+		amArg, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		propArg, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if amArg.IsNull() || propArg.IsNull() {
+			return NullDatum, nil
+		}
+		amOID, ok := resolveOIDArg(amArg)
+		if !ok {
+			return NullDatum, nil
+		}
+		amName, ok := catalog.AccessMethodNameByOID(amOID)
+		if !ok {
+			return NullDatum, nil
+		}
+		return indexAMAMLevelProperty(amName, propArg.StringValue()).toDatum(), nil
+
+	case "pg_index_has_property":
+		// pg_index_has_property(index_oid, propname) → bool — index-wide
+		// capability probe. M0134-0090.
+		if len(x.Args) < 2 {
+			return NullDatum, nil
+		}
+		idxArg, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		propArg, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if idxArg.IsNull() || propArg.IsNull() {
+			return NullDatum, nil
+		}
+		idxOID, ok := resolveOIDArg(idxArg)
+		if !ok {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		idx, found := im.LookupIndexByOID(idxOID)
+		if !found {
+			return NullDatum, nil
+		}
+		return indexAMIndexLevelProperty(indexAMNameForCapabilityLookup(idx), propArg.StringValue()).toDatum(), nil
+
+	case "pg_index_column_has_property":
+		// pg_index_column_has_property(index_oid, colno, propname) → bool —
+		// per-column capability probe (indoption ASC/DESC/NULLS bits +
+		// per-AM column flags). M0134-0090.
+		if len(x.Args) < 3 {
+			return NullDatum, nil
+		}
+		idxArg, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		colArg, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		propArg, err := evalExprSlot(x.Args[2], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if idxArg.IsNull() || colArg.IsNull() || propArg.IsNull() {
+			return NullDatum, nil
+		}
+		idxOID, ok := resolveOIDArg(idxArg)
+		if !ok {
+			return NullDatum, nil
+		}
+		var attno int
+		if colArg.Kind == KindInt {
+			attno = int(colArg.Int)
+		} else {
+			v, err := strconv.ParseInt(strings.TrimSpace(colArg.StringValue()), 10, 32)
+			if err != nil {
+				return NullDatum, nil
+			}
+			attno = int(v)
+		}
+		// "Reject attno 0 immediately" — amutils.c's pg_index_column_has_property.
+		if attno <= 0 {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		idx, found := im.LookupIndexByOID(idxOID)
+		if !found {
+			return NullDatum, nil
+		}
+		natts := len(idx.Columns) + len(idx.IncludeColumns)
+		if attno > natts {
+			return NullDatum, nil
+		}
+		amName := indexAMNameForCapabilityLookup(idx)
+		c, ok := catalog.IndexAMCapabilityByName(amName)
+		if !ok {
+			return NullDatum, nil
+		}
+		return indexAMColumnLevelProperty(amName, c, idx, attno, propArg.StringValue()).toDatum(), nil
 
 	case "pg_get_statisticsobjdef":
 		// pg_get_statisticsobjdef(oid) → text — reconstructs CREATE STATISTICS DDL.
@@ -11554,6 +13761,28 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// Returns the relation for a given filenode. Stub: returns NULL.
 		return NullDatum, nil
 
+	case "macaddr8_set7bit":
+		// macaddr8_set7bit(macaddr8) → macaddr8 (mac8.c:499-521): sets the
+		// 2nd-lowest bit of the first octet, converting a MAC address to the
+		// modified EUI-64 form used to build an IPv6 interface identifier.
+		// M0134-0139.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			if s, ok := datumAsString(av); ok {
+				if a, b, c, d, e, f, g, h, merr := parseMacaddr8Literal(s); merr == nil {
+					a, b, c, d, e, f, g, h = macaddr8Set7BitOctets(a, b, c, d, e, f, g, h)
+					return NewStringDatum(macaddr8CanonicalText(a, b, c, d, e, f, g, h)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
 	case "point":
 		// point(x, y) → text "(x,y)" — minimal geometric point. M0097-0023.
 		if len(x.Args) == 2 {
@@ -11595,6 +13824,185 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					llx := math.Min(p1[0], p2[0])
 					lly := math.Min(p1[1], p2[1])
 					return NewStringDatum(fmt.Sprintf("(%g,%g),(%g,%g)", urx, ury, llx, lly)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "line":
+		// line(point, point) → line "{A,B,C}" — line_construct_pp in
+		// geo_ops.c: build the infinite line through both points, raising
+		// the same "must be two distinct points" error line_in's two-point
+		// input form raises. M0134-0136.
+		if len(x.Args) == 2 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			bv, berr := evalExprSlot(x.Args[1], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if berr != nil {
+				return Datum{}, berr
+			}
+			if av.IsNull() || bv.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			bs, bok := datumAsString(bv)
+			if aok && bok {
+				p1, ok1 := parsePointText(as)
+				p2, ok2 := parsePointText(bs)
+				if ok1 && ok2 {
+					if p1[0] == p2[0] && p1[1] == p2[1] {
+						// No Pos: unlike the typed-literal ('...' cast) and
+						// column-coercion cases above, PG raises this error
+						// at EXECUTION time (line_construct_pp is a real
+						// function call, not a parse-analysis-time literal
+						// coercion), so psql's LINE-position echo does not
+						// apply here — line.sql's expected output confirms
+						// no "LINE N:" annotation for this exact case.
+						// M0134-0136.
+						return Datum{}, &ExecError{Code: "22P02",
+							Message: "invalid line specification: must be two distinct points"}
+					}
+					slope := lineSlope(p1[0], p1[1], p2[0], p2[1])
+					la, lb, lc := lineConstruct(p1[0], p1[1], slope)
+					return NewStringDatum(lineCanonicalText(la, lb, lc)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "lseg":
+		// lseg(point, point) → lseg "[(x1,y1),(x2,y2)]" — lseg_construct /
+		// statlseg_construct in geo_ops.c: unlike line_construct_pp, this
+		// stores the two points directly with no distinct-points check.
+		// M0134-0137.
+		if len(x.Args) == 2 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			bv, berr := evalExprSlot(x.Args[1], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if berr != nil {
+				return Datum{}, berr
+			}
+			if av.IsNull() || bv.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			bs, bok := datumAsString(bv)
+			if aok && bok {
+				p1, ok1 := parsePointText(as)
+				p2, ok2 := parsePointText(bs)
+				if ok1 && ok2 {
+					return NewStringDatum(lsegCanonicalText(p1[0], p1[1], p2[0], p2[1])), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "isopen", "isclosed":
+		// isopen(path)/isclosed(path) → bool — path_isopen/path_isclosed in
+		// geo_ops.c: a thin wrapper reading the stored open/closed flag, no
+		// re-parsing or point-count logic of its own. M0134-0149.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				_, closed, perr := parsePathLiteral(as)
+				if perr == nil {
+					wantClosed := name == "isclosed"
+					return NewBoolDatum(closed == wantClosed), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "pclose", "popen":
+		// pclose(path)/popen(path) → path — path_close/path_open in
+		// geo_ops.c: return a copy of the path with the open/closed flag
+		// forced, points and point count unchanged. M0134-0149.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				pts, _, perr := parsePathLiteral(as)
+				if perr == nil {
+					return NewStringDatum(pathCanonicalText(pts, name == "pclose")), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "center":
+		// center(circle) → point "(x,y)" — circle_center in geo_ops.c.
+		// M0134-0098.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				cx, cy, _, ok := parseCircleLiteral(as)
+				if ok {
+					return NewStringDatum(fmt.Sprintf("(%s,%s)", PGFloatOut(cx, 64), PGFloatOut(cy, 64))), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "radius":
+		// radius(circle) → float8 — circle_radius in geo_ops.c. M0134-0098.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				_, _, r, ok := parseCircleLiteral(as)
+				if ok {
+					return floatTextDatum(PGFloatOut(r, 64)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "diameter":
+		// diameter(circle) → float8, 2*radius — circle_diameter in
+		// geo_ops.c. M0134-0098.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				_, _, r, ok := parseCircleLiteral(as)
+				if ok {
+					return floatTextDatum(PGFloatOut(2*r, 64)), nil
 				}
 			}
 		}
@@ -12355,6 +14763,19 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			return NewStringDatum(string(runes[start:])), nil
 		}
+	case "starts_with":
+		// starts_with(text, prefix) → bool (varlena.c text_starts_with,
+		// pg_proc oid 3696). Registered in the catalog but had no evaluator
+		// — every call fell through to the "function does not exist" 42883
+		// default below. M0134-0111.
+		if len(x.Args) == 2 {
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			p, e2 := evalExprSlot(x.Args[1], slot, ctx)
+			if e1 != nil || e2 != nil || s.IsNull() || p.IsNull() {
+				return NullDatum, nil
+			}
+			return NewBoolDatum(strings.HasPrefix(s.StringValue(), p.StringValue())), nil
+		}
 	case "reverse":
 		if len(x.Args) == 1 {
 			s, err := evalExprSlot(x.Args[0], slot, ctx)
@@ -12803,6 +15224,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
+			// PG: round(±Infinity) = ±Infinity for both float8 and numeric
+			// (dround / numeric_round). The julian/epoch infinity results of
+			// EXTRACT/date_part are carried as the strings "Infinity"/"-Infinity"
+			// (no numeric-Infinity wire type in goopg) — pass them through instead
+			// of ParseFloat/FormatFloat, which would mangle them to "+Inf"/"-Inf".
+			// The regress extract/date_part blocks round() the julian column
+			// (timestamptz.sql) and expect ±Infinity on the infinity rows
+			// (timestamptz.out:1341-1342, 1187-1188). M0134-0076.
+			if s := v.Format(); s == "Infinity" || s == "-Infinity" {
+				return v, nil
+			}
 			scale := int64(0)
 			if len(x.Args) >= 2 {
 				sc, serr := evalExprSlot(x.Args[1], slot, ctx)
@@ -12834,6 +15266,23 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			if v.Kind == KindInt {
 				return v, nil
+			}
+			// macaddr_trunc (mac.c): trunc(macaddr) zeroes the last 3 octets.
+			// Detected the same way as the ~/&/| macaddr operators above —
+			// there is no static type tag on Datum, only the text shape.
+			// M0134-0138.
+			if v.Kind == KindString {
+				if a, b, c, d, e, f, merr := parseMacaddrLiteral(v.StringValue()); merr == nil {
+					a, b, c, d, e, f = macaddrTruncOctets(a, b, c, d, e, f)
+					return NewStringDatum(macaddrCanonicalText(a, b, c, d, e, f)), nil
+				}
+				// macaddr8_trunc (mac8.c): trunc(macaddr8) keeps only the
+				// 3-byte OUI prefix. Tried after the 6-octet form above.
+				// M0134-0139.
+				if a, b, c, d, e, f, g, h, merr := parseMacaddr8Literal(v.StringValue()); merr == nil {
+					a, b, c, d, e, f, g, h = macaddr8TruncOctets(a, b, c, d, e, f, g, h)
+					return NewStringDatum(macaddr8CanonicalText(a, b, c, d, e, f, g, h)), nil
+				}
 			}
 			f, ferr := strconv.ParseFloat(v.Format(), 64)
 			if ferr != nil {
@@ -13945,6 +16394,45 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			return NewStringDatum(strconv.FormatUint(uint64(uint32(v.Int)), 8)), nil
 		}
+	case "float4send":
+		// float4send(real) -> bytea: the binary-protocol send function,
+		// pq_sendfloat4 (postgres/src/backend/utils/adt/float.c:350) — the
+		// IEEE-754 bits reinterpreted as uint32 and packed big-endian
+		// (pqformat.c:252), 4 bytes, no text involved. Callable directly
+		// from SQL (float4.sql exercises it to bit-check float4in/float4out
+		// round-tripping); goopg previously only reached this encoding via
+		// the FORMAT binary COPY/wire path (copy_binary.go's "float4" arm),
+		// never as a standalone scalar function. M0134-0153.
+		if len(x.Args) == 1 {
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			f, ferr := pgFloatFromDatum(v, 32)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			b := make([]byte, 4)
+			binary.BigEndian.PutUint32(b, math.Float32bits(float32(f)))
+			return NewBytesDatum(b), nil
+		}
+	case "float8send":
+		// float8send(double precision) -> bytea: sibling of float4send
+		// above, pq_sendfloat8 (float.c:567), 8-byte big-endian IEEE-754.
+		// M0134-0153.
+		if len(x.Args) == 1 {
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			f, ferr := pgFloatFromDatum(v, 64)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			b := make([]byte, 8)
+			binary.BigEndian.PutUint64(b, math.Float64bits(f))
+			return NewBytesDatum(b), nil
+		}
 	case "get_byte":
 		// get_byte(bytea, int4) -> int4 (postgres/src/backend/utils/adt/
 		// varlena.c:3310-3329 byteaGetByte). M0134-0070.
@@ -14188,6 +16676,69 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unrecognized encoding: %q", fmtArg.Format())}
 		}
+	case "convert_from":
+		// convert_from(bytea, src_encoding name) -> text: decode src_encoding
+		// bytes into the server encoding (always UTF8 here). Port of
+		// pg_convert_from (postgres/src/backend/utils/adt/mbutils.c).
+		// Resolution goes through mb.BuiltinLookup, the same bootstrap-only
+		// conversion set maybeConvertCellsForClientEncoding uses for
+		// client_encoding — a CREATE CONVERSION-registered proc is not yet
+		// consulted (M0122-0008 scope note, carried forward). M0134-0121.
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		src, serr := evalExprSlot(x.Args[0], slot, ctx)
+		if serr != nil || src.IsNull() {
+			return NullDatum, nil
+		}
+		encArg, eerr := evalExprSlot(x.Args[1], slot, ctx)
+		if eerr != nil || encArg.IsNull() {
+			return NullDatum, nil
+		}
+		raw := src.BytesValue()
+		if src.Kind != KindBytes {
+			b, berr := byteaIn(src.StringValue(), x.Pos())
+			if berr != nil {
+				return NullDatum, berr
+			}
+			raw = b
+		}
+		srcEnc := catalog.EncodingNameToID(encArg.StringValue())
+		if srcEnc < 0 {
+			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid encoding name %q", encArg.StringValue())}
+		}
+		converted, cerr := mb.DoEncodingConversion(raw, srcEnc, mb.PG_UTF8, mb.BuiltinLookup)
+		if cerr != nil {
+			return NullDatum, &ExecError{Code: "22021", Pos: x.Pos(), Message: cerr.Error()}
+		}
+		return NewStringDatum(string(converted)), nil
+	case "convert_to":
+		// convert_to(text, dest_encoding name) -> bytea: encode server-
+		// encoding (UTF8) text into dest_encoding bytes. Port of
+		// pg_convert_to (postgres/src/backend/utils/adt/mbutils.c). Same
+		// mb.BuiltinLookup scope note as convert_from. M0134-0121.
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		src, serr := evalExprSlot(x.Args[0], slot, ctx)
+		if serr != nil || src.IsNull() {
+			return NullDatum, nil
+		}
+		encArg, eerr := evalExprSlot(x.Args[1], slot, ctx)
+		if eerr != nil || encArg.IsNull() {
+			return NullDatum, nil
+		}
+		destEnc := catalog.EncodingNameToID(encArg.StringValue())
+		if destEnc < 0 {
+			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid encoding name %q", encArg.StringValue())}
+		}
+		converted, cerr := mb.DoEncodingConversion([]byte(src.StringValue()), mb.PG_UTF8, destEnc, mb.BuiltinLookup)
+		if cerr != nil {
+			return NullDatum, &ExecError{Code: "22021", Pos: x.Pos(), Message: cerr.Error()}
+		}
+		return NewBytesDatum(converted), nil
 	case "crc32":
 		// crc32(bytea) -> int8. Standard CRC-32 (IEEE/zlib polynomial).
 		// PG oracle: pg_crc.c:106-116 (crc32_bytea) —
@@ -14495,6 +17046,122 @@ case "pg_char_to_encoding":
 			return Datum{Kind: KindInt, Int: int64(ctx.Tx.XID)}, nil
 		}
 		return Datum{Kind: KindInt, Int: 0}, nil
+	// txid_current_if_assigned() → xid8: same as pg_current_xact_id() but
+	// returns NULL instead of assigning a new xid. M0134-0080 (pg_proc OID
+	// 3348, handler pg_current_xact_id_if_assigned, xid8funcs.c).
+	case "txid_current_if_assigned":
+		if ctx.Tx.XID != 0 {
+			return Datum{Kind: KindInt, Int: int64(ctx.Tx.XID)}, nil
+		}
+		return NullDatum, nil
+	// txid_current_snapshot() → pg_snapshot: the statement's active
+	// snapshot rendered in xmin:xmax:xip,... form. Mirrors pg_current_snapshot
+	// (xid8funcs.c), reading ctx.Snap directly rather than the procarray (v0
+	// has no separate GetActiveSnapshot() call). M0134-0080 (pg_proc OID 2944).
+	case "txid_current_snapshot":
+		xmin := uint64(ctx.Snap.Xmin)
+		xmax := uint64(ctx.Snap.Xmax)
+		var xips []uint64
+		for _, ip := range ctx.Snap.InProgress {
+			v := uint64(ip)
+			if v >= xmin && v < xmax {
+				xips = append(xips, v)
+			}
+		}
+		sort.Slice(xips, func(i, j int) bool { return xips[i] < xips[j] })
+		xips = dedupSortedUint64(xips)
+		return NewStringDatum(formatPgSnapshot(xmin, xmax, xips)), nil
+	// txid_snapshot_xmin(pg_snapshot) / txid_snapshot_xmax(pg_snapshot) → xid8.
+	// Mirrors pg_snapshot_xmin/pg_snapshot_xmax (xid8funcs.c). M0134-0080
+	// (pg_proc OID 2945/2946).
+	case "txid_snapshot_xmin", "txid_snapshot_xmax":
+		if len(x.Args) != 1 {
+			return NullDatum, nil
+		}
+		argD, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || argD.IsNull() {
+			return NullDatum, err
+		}
+		xmin, xmax, _, ok := parsePgSnapshotParts(argD.StringValue())
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", argD.StringValue())}
+		}
+		if name == "txid_snapshot_xmin" {
+			return Datum{Kind: KindInt, Int: int64(xmin)}, nil
+		}
+		return Datum{Kind: KindInt, Int: int64(xmax)}, nil
+	// txid_visible_in_snapshot(xid8, pg_snapshot) → bool. Mirrors
+	// pg_visible_in_snapshot/is_visible_fxid (xid8funcs.c). M0134-0080
+	// (pg_proc OID 2948).
+	case "txid_visible_in_snapshot":
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		valD, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || valD.IsNull() {
+			return NullDatum, err
+		}
+		snapD, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil || snapD.IsNull() {
+			return NullDatum, err
+		}
+		xmin, xmax, xips, ok := parsePgSnapshotParts(snapD.StringValue())
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", snapD.StringValue())}
+		}
+		value := uint64(valD.Int)
+		var visible bool
+		switch {
+		case value < xmin:
+			visible = true
+		case value >= xmax:
+			visible = false
+		default:
+			visible = true
+			for _, ip := range xips {
+				if ip == value {
+					visible = false
+					break
+				}
+			}
+		}
+		return NewBoolDatum(visible), nil
+	// txid_status(xid8) → text: 'in progress' / 'committed' / 'aborted', or
+	// NULL for a too-old xid whose CLOG entry has been truncated (unmodelled
+	// in goopg — see the M0134-0080 deferral ledger row), or ERROR for an xid
+	// that has not been assigned yet. Mirrors pg_xact_status/
+	// TransactionIdInRecentPast (xid8funcs.c). M0134-0080 (pg_proc OID 3360).
+	case "txid_status":
+		if len(x.Args) != 1 {
+			return NullDatum, nil
+		}
+		argD, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || argD.IsNull() {
+			return NullDatum, err
+		}
+		xid := storage.TransactionID(argD.Int)
+		if xid == storage.InvalidTransactionID {
+			return NullDatum, nil
+		}
+		if xid >= transam.FirstNormalTransactionID && ctx.TxnMgr != nil && xid >= ctx.TxnMgr.NextXID() {
+			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("transaction ID %d is in the future", int64(xid))}
+		}
+		if ctx.TxnMgr == nil {
+			return NullDatum, nil
+		}
+		switch ctx.TxnMgr.ClassifyXID(xid) {
+		case transam.XidVisInProgress:
+			return NewStringDatum("in progress"), nil
+		case transam.XidVisCommitted:
+			return NewStringDatum("committed"), nil
+		case transam.XidVisAborted:
+			return NewStringDatum("aborted"), nil
+		default:
+			return NullDatum, nil
+		}
 	case "clock_timestamp":
 		// prorettype 1184 (timestamptz), like the now() family. M0119-0006.
 		return NewTimestampTZDatum(ctx.Now), nil
@@ -14502,22 +17169,32 @@ case "pg_char_to_encoding":
 		return NewStringDatum(ctx.Now.Format("Mon Jan 02 15:04:05.000000 2006 UTC")), nil
 	case "localtime":
 		// Returns time-of-day anchored at epoch (same storage convention as current_time).
-		// Accepts optional precision arg: localtime(N) truncates microseconds.
+		// Accepts optional precision arg: localtime(N) rounds the fractional
+		// seconds via roundTimeDatumToPrecision, matching the `::time(N)`
+		// CastExpr path (AdjustTimeForTypmod ROUNDS, it does not truncate —
+		// see the current_time case above, M0134-0084: the previous
+		// floor-via-integer-division here is what made
+		// `now()::time(N)::text = localtime(N)::text` (expressions.sql) flaky).
 		t := ctx.Now.UTC()
-		ns := t.Nanosecond()
+		d := NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
-			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
-				factor := int64(1)
-				for i := int64(0); i < 6-prec.Int; i++ {
-					factor *= 10
-				}
-				ns = (ns / (int(factor) * 1000)) * (int(factor) * 1000)
+			if err == nil && prec.Kind == KindInt {
+				d = roundTimeDatumToPrecision(d, prec.Int)
 			}
 		}
-		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
+		return d, nil
 	case "localtimestamp":
-		return NewTimeDatum(ctx.Now), nil
+		// M0134-0084: localtimestamp is the plain-`timestamp` sibling of now()
+		// (prorettype 1083 vs now()'s 1184) and must equal `now()::timestamp`
+		// — PG derives both from the same transaction-start instant converted
+		// into the session TimeZone (timestamptz_timestamp, date.c). The
+		// `::timestamp` CastExpr path already applies that conversion
+		// (misc.TimestampTZToTimestamp, M0119-0006 40th slice); this bare
+		// FuncCall previously skipped it and returned the raw UTC instant
+		// relabelled as local wall clock, silently off by the zone's UTC
+		// offset whenever TimeZone != UTC.
+		return NewTimeDatum(misc.TimestampTZToTimestamp(ctx.Now, timeZoneFromCtx(ctx))), nil
 	case "pg_is_in_recovery":
 		return NewBoolDatum(ctx.IsStandby), nil
 	case "pg_promote":
@@ -14753,6 +17430,28 @@ case "pg_char_to_encoding":
 		}
 		c, _ := relStats.peekStaging(sessionStatsID(ctx), oid)
 		return NewIntDatum(c.tuplesInserted), nil
+
+	// hashint2/hashint4/hashint8/hashoid/hashchar/hashfloat4/hashfloat8/
+	// hashname/hashtext/hashbpchar and their *extended siblings — PG's
+	// SQL-callable hash-index support functions (access/hash/hashfunc.c,
+	// utils/adt/hashfunc.c). pg_proc already seeded these OIDs (they show up
+	// in \df and hash-opclass FUNCTION 1/2 lookups) but no scalar dispatch
+	// existed, so any direct SELECT hashint4(...) call fell through to the
+	// generic 42883 "does not exist". Reuses the Jenkins-hash primitives
+	// hash_partition.go already ports PG-faithfully (pgHashUint32Extended /
+	// pgHashBytesExtended / pgHashInt8, M0097-0027 + M0134-0071) — this slice
+	// is pure wiring, not new hash-algorithm work. M0134-0128 (hash_func.sql).
+	// hash_numeric/hash_array/hash_record/hash_range/hash_multirange/
+	// hash_aclitem/hashmacaddr[8]/hashinet/time_hash/timetz_hash/
+	// interval_hash/timestamp_hash/uuid_hash/pg_lsn_hash/hashenum/
+	// hashoidvector/jsonb_hash need type-specific canonical-byte encoders
+	// this loop didn't build — deferred, ledger row 2026-08-24 M0134-0128.
+	case "hashint2", "hashint2extended", "hashint4", "hashint4extended",
+		"hashint8", "hashint8extended", "hashoid", "hashoidextended",
+		"hashchar", "hashcharextended", "hashfloat4", "hashfloat4extended",
+		"hashfloat8", "hashfloat8extended", "hashname", "hashnameextended",
+		"hashtext", "hashtextextended", "hashbpchar", "hashbpcharextended":
+		return evalHashFunc(name, x, slot, ctx)
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.
@@ -16473,7 +19172,16 @@ func parseTextArray(s string) []string {
 	var elems []string
 	i := 0
 	for i < len(inner) {
-		if inner[i] == '"' {
+		// PG's ReadArrayStr (postgres/src/backend/utils/adt/arrayfuncs.c)
+		// skips leading whitespace before each element, so a raw literal
+		// like '{"(0,0)", "(0,0)"}' (space after the comma) still yields
+		// two elements, not a mis-split third. Without this skip, the
+		// unquoted branch below would swallow the leading space AND the
+		// following element's opening quote as one bogus element.
+		for i < len(inner) && inner[i] == ' ' {
+			i++
+		}
+		if i < len(inner) && inner[i] == '"' {
 			// Quoted element.
 			i++
 			var sb strings.Builder
@@ -17382,8 +20090,26 @@ func uuidV7RealTimeNs() int64 {
 // genUUIDv7 generates a UUIDv7 from the given nanosecond timestamp.
 // rand_a (bytes 6-7) carries 12 bits of sub-ms precision (RFC 9562 Method 3).
 func genUUIDv7(ns int64) (string, error) {
-	ms := ns / 1_000_000
-	subNs := ns % 1_000_000 // nanoseconds within the millisecond (0..999999)
+	return genUUIDv7FromMs(ns/1_000_000, ns%1_000_000)
+}
+
+// genUUIDv7FromTime is like genUUIDv7 but derives the ms-since-epoch and
+// sub-ms-nanosecond components from a time.Time via ts.Unix()/ts.Nanosecond()
+// instead of ts.UnixNano(). ts.UnixNano() is undefined/overflows for dates
+// before 1678 or after 2262 (int64 nanoseconds can only span ~292 years);
+// uuidv7(interval) accepts an arbitrary shift (uuid.sql exercises years
+// 1970..10888), so it must not route through UnixNano. ts.Unix() (int64
+// seconds) has no realistic overflow at those ranges.
+func genUUIDv7FromTime(ts time.Time) (string, error) {
+	ms := ts.Unix()*1_000 + int64(ts.Nanosecond())/1_000_000
+	subNs := int64(ts.Nanosecond()) % 1_000_000
+	return genUUIDv7FromMs(ms, subNs)
+}
+
+// genUUIDv7FromMs builds a UUIDv7 from ms-since-epoch and the nanosecond
+// remainder within that millisecond (0..999999). Shared by genUUIDv7 (real
+// time, ns-based) and genUUIDv7FromTime (arbitrary time.Time, overflow-safe).
+func genUUIDv7FromMs(ms int64, subNs int64) (string, error) {
 	var b [16]byte
 	b[0] = byte(ms >> 40)
 	b[1] = byte(ms >> 32)

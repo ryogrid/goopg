@@ -322,6 +322,16 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
 		upper == "SET LOCAL SESSION AUTHORIZATION":
 		if connTx != nil {
+			if setAuthzGenericSetForm(matchable[len("SET LOCAL SESSION AUTHORIZATION"):]) {
+				// SESSION AUTHORIZATION has no generic_set grammar upstream
+				// (gram.y:1764/:1774 dedicated productions: bare rolename or
+				// DEFAULT only — unlike SET ROLE, which also parses through
+				// generic_set because ROLE is an unreserved keyword), so
+				// `TO x` / `= x` must reach the real parser for PG's 42601
+				// "syntax error at or near ..." instead of being applied as
+				// a role name. M0134-0155.
+				return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+			}
 			role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
 			role = strings.Trim(role, `"'`)
 			connTx.SnapshotLocalRoleIfNeeded(true)
@@ -340,7 +350,7 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// SESSION AUTHORIZATION" case above.
 	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
 		if connTx != nil {
-			role := strings.TrimSpace(matchable[len("SET LOCAL ROLE"):])
+			role := stripSetToOrEquals(matchable[len("SET LOCAL ROLE"):])
 			role = strings.Trim(role, `"'`)
 			connTx.SnapshotLocalRoleIfNeeded(true)
 			applySetRole(connTx, role)
@@ -358,6 +368,12 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	case strings.HasPrefix(upper, "SET SESSION AUTHORIZATION "),
 		upper == "SET SESSION AUTHORIZATION":
 		if connTx != nil {
+			if setAuthzGenericSetForm(matchable[len("SET SESSION AUTHORIZATION"):]) {
+				// See the SET LOCAL SESSION AUTHORIZATION case above: no
+				// generic_set grammar upstream; parse for the true 42601.
+				// M0134-0155.
+				return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+			}
 			// Extract the role name after "SET SESSION AUTHORIZATION ".
 			role := strings.TrimSpace(matchable[len("SET SESSION AUTHORIZATION"):])
 			role = strings.Trim(role, `"'`)
@@ -376,7 +392,7 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// DEFAULT / the bootstrap superuser restore full privileges.
 	case strings.HasPrefix(upper, "SET ROLE "), upper == "SET ROLE":
 		if connTx != nil {
-			role := strings.TrimSpace(matchable[len("SET ROLE"):])
+			role := stripSetToOrEquals(matchable[len("SET ROLE"):])
 			role = strings.Trim(role, `"'`)
 			applySetRole(connTx, role)
 			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
@@ -495,6 +511,20 @@ func (s *Server) handleShowAll(w *libpq.FrameWriter, sess *misc.SessionRegistry)
 	return w.ReadyForQuery()
 }
 
+// gucSetErrorFields unwraps a SET-time GUC validation error, splitting the
+// ERROR message from an attached HINT (e.g. an enum GUC's "Available
+// values: ..." list — postgres/src/backend/utils/misc/guc.c's PGC_ENUM
+// branch of set_config_option attaches this as a separate errhint(), not
+// baked into the primary message). Non-ValidationError failures pass their
+// Error() text through unchanged with no extra fields.
+func gucSetErrorFields(err error) (msg, hint string) {
+	var verr *misc.ValidationError
+	if errors.As(err, &verr) {
+		return verr.Msg, verr.Hint
+	}
+	return err.Error(), ""
+}
+
 // handleSet applies a SET / SET LOCAL statement. Body is the text after
 // the keyword: "name = value", "name TO value", or "name value".
 func (s *Server) handleSet(w *libpq.FrameWriter, sess *misc.SessionRegistry, body string, isLocal bool) error {
@@ -504,12 +534,61 @@ func (s *Server) handleSet(w *libpq.FrameWriter, sess *misc.SessionRegistry, bod
 			fmt.Sprintf("could not parse SET statement: %q", body))
 	}
 	if err := sess.Set(name, value, isLocal); err != nil {
-		return s.writeQueryError(w, errcodes.InvalidParameterValue, err.Error())
+		msg, hint := gucSetErrorFields(err)
+		if hint == "" {
+			return s.writeQueryError(w, errcodes.InvalidParameterValue, msg)
+		}
+		return s.writeQueryError(w, errcodes.InvalidParameterValue, msg, libpq.ErrorField{Code: libpq.FieldHint, Value: hint})
 	}
 	if err := w.WriteCommandComplete("SET"); err != nil {
 		return err
 	}
 	return w.ReadyForQuery()
+}
+
+// stripSetToOrEquals removes an optional "TO " or "=" separator from the
+// front of s, mirroring PG's generic_set grammar (gram.y:1656-1693:
+// `var_name TO var_list | var_name '=' var_list`, both also accepted for
+// `var_name TO DEFAULT`/`var_name '=' DEFAULT`). SET ROLE is matched as a
+// fixed-prefix fast path below rather than going through splitSet's generic
+// name/value split, and because ROLE is an unreserved keyword upstream it
+// ALSO parses through generic_set (gram.y:1754 dedicated bare-form prod +
+// generic_set fallback), so the ROLE call sites need this normalization
+// applied to their already-prefix-stripped remainder before treating it as
+// the target role name. Without this, `SET ROLE TO x` silently stored the
+// literal garbage role name "TO x" instead of "x" — a non-empty,
+// never-matching NonSuperuserRole that permanently (until the next explicit
+// SET/RESET ROLE) denied every CREATEROLE-gated privilege check for the
+// *real* superuser session. NOTE: this deliberately does NOT apply to SET
+// [LOCAL] SESSION AUTHORIZATION — those have no generic_set grammar upstream
+// (see setAuthzGenericSetForm). M0134-0155.
+func stripSetToOrEquals(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "=")
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(strings.ToUpper(s), "TO ") {
+		s = strings.TrimSpace(s[3:])
+	} else if strings.EqualFold(s, "to") {
+		s = ""
+	}
+	return s
+}
+
+// setAuthzGenericSetForm reports whether rest — the text following a
+// "SET [LOCAL] SESSION AUTHORIZATION" prefix — begins with one of PG's
+// generic_set separators ("=" or TO), i.e. a spelling that looks like
+// `SET ... SESSION AUTHORIZATION TO x` / `= x`. Those spellings are syntax
+// errors upstream (no generic_set production for SESSION AUTHORIZATION,
+// gram.y:1764/:1774; oracle-verified 42601 on PG 18.3), so the wire fast
+// paths must not apply them as role names — callers hand such statements to
+// the parser-driven path for the genuine error instead. M0134-0155.
+func setAuthzGenericSetForm(rest string) bool {
+	rest = strings.TrimSpace(rest)
+	if strings.HasPrefix(rest, "=") {
+		return true
+	}
+	return len(rest) >= 2 && strings.EqualFold(rest[:2], "to") &&
+		(len(rest) == 2 || rest[2] == ' ' || rest[2] == '\t')
 }
 
 // splitSet splits "name = value", "name TO value", or "name value" into
