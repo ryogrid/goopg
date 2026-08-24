@@ -1463,6 +1463,29 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	return nil
 }
 
+// builtinAMHandlerFuncs maps the 7 built-in access-method handler function
+// names (postgres/src/include/catalog/pg_proc.dat) to their fixed pg_proc
+// OID and AM kind ("i"=index, "t"=table) — the same OIDs
+// internal/initdb/pg_proc_seed_data.go seeds at bootstrap (duplicated here,
+// leaf-package style, because internal/executor cannot import internal/initdb;
+// see pg_proc_names_generated.go's header for the established precedent).
+// goopg has no pluggable storage-engine registry — Routines() only holds
+// CREATE FUNCTION routines — so a CREATE ACCESS METHOD ... HANDLER clause
+// naming a built-in handler (create_am.sql's "gist2 ... HANDLER gisthandler")
+// must resolve against this table instead.
+var builtinAMHandlerFuncs = map[string]struct {
+	OID    uint32
+	AMType string
+}{
+	"heap_tableam_handler": {3, "t"},
+	"bthandler":            {330, "i"},
+	"hashhandler":          {331, "i"},
+	"gisthandler":          {332, "i"},
+	"ginhandler":           {333, "i"},
+	"spghandler":           {334, "i"},
+	"brinhandler":          {335, "i"},
+}
+
 // resolveAccessMethodHandlerFunc mirrors lookup_am_handler_func
 // (postgres/src/backend/commands/amcmds.c): the handler must be a routine
 // taking exactly one argument of type "internal" (LookupFuncName(handler_name,
@@ -1491,6 +1514,14 @@ func resolveAccessMethodHandlerFunc(rs *catalog.Routines, funcName parser.Object
 			return 0, &ExecError{Code: "42809", Message: fmt.Sprintf("function %s must return type %s", funcName.String(), expectedRet)}
 		}
 		return r.OID, nil
+	}
+	if funcName.Schema == "" || strings.EqualFold(funcName.Schema, "pg_catalog") {
+		if h, ok := builtinAMHandlerFuncs[strings.ToLower(funcName.Name)]; ok {
+			if h.AMType != amType {
+				return 0, &ExecError{Code: "42809", Message: fmt.Sprintf("function %s must return type %s", funcName.String(), expectedRet)}
+			}
+			return h.OID, nil
+		}
 	}
 	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(internal) does not exist", funcName.String())}
 }

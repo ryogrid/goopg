@@ -1,76 +1,69 @@
-Task just completed: M0134-0106 (conversion.sql) — sized live against PG 18.3
-oracle: **PARKED** (case genuinely `failed`, 613-line diff / 0% parity, three
-contained validation/catalog fixes shipped).
+Task just completed: M0134-0109 (create_am.sql) — sized live against PG
+18.3 oracle: PARKED (case genuinely `failed`, 0% parity).
 
-Landed three independent catalog-registry bugs:
-1. `CREATE DEFAULT CONVERSION` had no encoding-pair uniqueness check — ported
-   `FindDefaultConversion` (postgres/src/backend/catalog/pg_conversion.c:66-79)
-   into `catalog.InMemory.CreateConversion` (internal/catalog/catalog.go): a
-   second default conversion for the same (namespace, for-encoding,
-   to-encoding) triple now raises "default conversion for %s to %s already
-   exists", independent of name (previously silently accepted regardless).
-2. `COMMENT ON CONVERSION` had NO case at all in execCommentOn's switch
-   (internal/executor/operators_ddl.go) — silently no-op'd for both existing
-   and nonexistent conversion names. Added a case resolving via
-   im.FindConversion, storing under pgConversionRelOID (2607); raises 42704
-   on a nonexistent name.
-3. `DROP CONVERSION` on a real conversion fell through past a successful
-   im.DropConversion() call (missing `return nil`) into a DropCompatObject
-   gate keyed by a MISMATCHED name spelling (schema-qualified at CREATE time
-   "public.mydef" vs bare at DROP time "mydef") — the mismatch made a
-   genuinely successful drop raise a false "does not exist". Fixed by adding
-   the early return, mirroring the sibling text-search-dictionary/
-   -configuration branches in the same switch that already did this right.
+Landed one contained fix:
+`CREATE ACCESS METHOD ... HANDLER <builtin>` (gisthandler, heap_tableam_handler,
+bthandler, hashhandler, ginhandler, spghandler, brinhandler) raised a false
+42883 "function does not exist" even though all 7 are seeded pg_proc rows —
+`resolveAccessMethodHandlerFunc` (internal/executor/operators_ddl.go) only
+searched `catalog.Routines()` (the CREATE FUNCTION registry); goopg has no
+pluggable-storage-engine registry so built-ins were never in it. Added a
+small leaf-package `builtinAMHandlerFuncs` name->{OID,AMType} table as a
+fallback (same import-cycle-driven duplication pattern as
+pg_proc_names_generated.go). Verified all 6 positive/negative
+handler-resolution lines byte-for-byte against create_am.out.
 
-613 -> 602 diff lines, 2 -> 1 `^-ERROR`. Design doc
-docs/design/m0134-0106-conversion-catalog-fixes.md, README.md indexed.
-Ledger row appended (.ralph/deferral_ledger.md, 2026-08-24, M0134-0106) — the
-dominant remaining bucket (~85% of diff) is test_conv(), a table-valued
-wrapper around two LANGUAGE C harness functions (test_enc_setup,
-test_enc_conversion) that goopg can neither parse (CREATE FUNCTION requires
-explicit RETURNS; PG derives RECORD from OUT params) nor execute (no
-C-extension dynamic-loading engine exists anywhere in goopg) — REFACTOR-tier,
-no contained slice available. CSV row flipped not-tried -> failed via
-`make regen-testport`. fix_plan.md M0134-0106 marked [x].
-
-Committed and pushed to origin/regress-renumbering — see git log for the
-commit sha (committed at end of this loop).
-
-Nightly filing: checked ci/logs/action-items.md at loop start — same run
-(20260824-013441, sha e7495e712dda) as prior 12 loops, both AI- items already
-filed (fix_plan.md lines ~1286/~1312: AdvisoryLock repeat regression + units/
-internal/executor regression). No new filing needed this loop.
+CSV row (create_am.sql) flipped not-tried -> failed via `make regen-testport`
+(genuinely failed, stays not-pass-required). Design doc
+docs/design/m0134-0109-create-am-handler-resolution.md, README.md indexed.
+fix_plan.md M0134-0109 marked [x] PARKED. Ledger row appended
+(.ralph/deferral_ledger.md, M0134-0109): CREATE TABLE/MATERIALIZED VIEW
+... USING <am> has ZERO parser support at all (syntax error), plus
+ALTER TABLE/MATVIEW SET ACCESS METHOD, default_table_access_method
+enforcement, partitioned-table AM inheritance, AM pg_depend tracking, and
+a real opclass over the excluded GiST AM — multi-milestone storage-
+pluggability feature, correctly out of contained-fix scope.
 
 NEXT LOOP: per the Current Priority banner in .ralph/fix_plan.md, continue
-M0134 top-to-bottom — next unworked item is **M0134-0107 (copyencoding.sql)**.
-Standing recommendation (carried across several loops, still open, still not
-selected because the banner's straight top-to-bottom order wins absent
-explicit re-prioritization):
+M0134 top-to-bottom — next unworked item is **M0134-0110**.
+
+Standing recommendation (carried across several loops, still open):
 1. brin_summarize_range/brin_desummarize_range unimplemented, blocks 3 files
    (M0134-0095/-0096/-0097 PARKs).
 2. A collation-execution-registry gap recurs across FIVE parked files
-   (M0134-0099/-0100/-0101/-0102, ICU/libc/builtin providers all share "no
-   locale-aware comparator wired into comparison/sort") — a strong unifying
-   candidate if a loop gets reassigned to infra work.
+   (M0134-0099/-0100/-0101/-0102).
 3. bucket (5) from M0134-0102: internal/executor/expr.go length/upper/lower/
-   octet_length/etc. swallow a nested function-not-found error into NULL
-   instead of propagating 42883 (systemic, cross-file, needs its own
-   verification pass across the whole regress-port suite before editing).
-4. The ctid/tableoid system-column pattern (CTIDExpr, 13-file wiring, from
-   M0134-0104) is a template a future loop could generalize to
-   cmin/cmax/xmin/xmax — the MVCC storage side is already 100% done/verified.
-5. NEW this loop: a LANGUAGE C dynamic-extension-loading gap (M0134-0106) —
-   no C-extension loader exists anywhere in goopg; only exposed once so far
-   but likely to recur across the remaining regress files that use PG's own
-   `regress.so` test-harness functions.
+   etc. swallow a nested function-not-found error into NULL instead of
+   propagating 42883 (systemic, cross-file).
+4. The ctid/tableoid system-column pattern (13-file wiring, M0134-0104) is a
+   template a future loop could generalize to cmin/cmax/xmin/xmax.
+5. LANGUAGE C dynamic-extension-loading gap (M0134-0106) — no C-extension
+   loader exists anywhere in goopg.
+6. EUC_JP/UTF8 (and likely other EUC_*/SJIS/BIG5/GBK pairs) real Unicode
+   mapping tables are unported (~11k lines of upstream .map data,
+   M0134-0107) — structural-only validators are landed but genuine
+   non-ASCII round-trip conversion is not.
+7. `CREATE TABLE ... USING <am>` (table-AM selection clause) has zero
+   parser support anywhere (NEW this loop, M0134-0109) — a future
+   table/index-AM-pluggability milestone would need: parser grammar for
+   USING on CREATE TABLE/CREATE TABLE AS/CREATE MATERIALIZED VIEW,
+   ALTER TABLE/MATVIEW SET ACCESS METHOD as a new AlterTable subcommand,
+   default_table_access_method GUC enforcement, and relam/pg_depend
+   plumbing at table-creation time.
 
-Gates run: go build ./... clean; RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh PASS (all unit packages, cache mostly warm);
-make regen-testport clean; make check-testport-inventory PASS; make
-ralph-state-guard PASS (auto-repaired the same benign stale status/progress
-running-vs-completed mismatch seen in prior loops, then confirmed
-consistent). Pre-commit hook's pgbench smoke runs automatically at commit
-time (mandatory, never bypassed).
+Gates run: go build ./... clean; go test ./internal/catalog/...
+./internal/executor/... PASS; RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh PASS (all unit packages, ~440s cold
+internal/initdb run — toolchain/branch state, not a regression); make
+regen-testport clean (had to fix a stray comma in my own CSV rationale
+text that broke the field count — caught by check-testport-inventory);
+make check-testport-inventory PASS; make ralph-state-guard PASS
+(auto-repaired the same benign stale status/progress running-vs-completed
+mismatch seen in prior loops, then confirmed consistent). Pre-commit
+hook's pgbench smoke will run automatically at commit time (mandatory,
+never bypassed).
 
-In-flight: none. No throwaway server was left running — pg-regress-runner.sh
-manages its own goopg instance and stopped cleanly after each invocation.
+In-flight: none. Throwaway test server (/tmp/amtest-data, port 5533,
+GOOPG_CG_UNIT=amtest) was stopped cleanly via `goopg stop` before commit —
+verified no orphan process remains (only a shell-snapshot subprocess
+matched the grep, not a goopg server).
