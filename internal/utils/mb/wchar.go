@@ -7,9 +7,15 @@
 // Subsequent slices add more encoding pairs following the same pattern.
 package mb
 
+import (
+	"fmt"
+	"strings"
+)
+
 // PG encoding IDs (mirrors postgres/src/include/mb/pg_wchar.h).
 const (
 	PG_SQL_ASCII = 0
+	PG_EUC_JP    = 1
 	PG_UTF8      = 6
 	PG_LATIN1    = 8
 	PG_LATIN2    = 14
@@ -103,14 +109,39 @@ func pgUTF8IsLegal(source []byte, length int) bool {
 
 // ErrInvalidEncoding is returned when a source byte sequence is not
 // valid in the claimed encoding. SQLSTATE 22021.
+//
+// Bytes, when non-empty, carries the offending byte sequence so Error()
+// can render PG's "0xNN 0xNN ..." trailer (report_invalid_encoding_int,
+// postgres/src/backend/utils/mb/mbutils.c:1832) — up to 8 bytes, matching
+// PG's fixed-size buffer. Byte/Len are the older single-byte form kept
+// for the existing LATIN1/LATIN2 call sites; a caller that has the full
+// failing sequence should prefer Bytes.
 type ErrInvalidEncoding struct {
 	Encoding string
 	Byte     byte
 	Len      int
+	Bytes    []byte
 }
 
 func (e *ErrInvalidEncoding) Error() string {
-	return "invalid byte sequence for encoding " + e.Encoding
+	seq := e.Bytes
+	if len(seq) == 0 {
+		seq = []byte{e.Byte}
+	}
+	if len(seq) > 8 {
+		seq = seq[:8]
+	}
+	var b strings.Builder
+	b.WriteString("invalid byte sequence for encoding \"")
+	b.WriteString(e.Encoding)
+	b.WriteString("\": ")
+	for i, c := range seq {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "0x%02x", c)
+	}
+	return b.String()
 }
 
 // ErrUntranslatableChar is returned when a character cannot be

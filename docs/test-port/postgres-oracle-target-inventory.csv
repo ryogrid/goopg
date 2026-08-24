@@ -32,7 +32,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/copy.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/copy2.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/copydml.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/copyencoding.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/copyencoding.sql,pass,yes,-,"M0134-0107: sized live against PG 18.3 — scripts/pg-regress-runner.sh --verbose copyencoding: 100% parity. Three landed gaps: (1) COPY TO/FROM 'file' (server-side, no leading backslash) was entirely unimplemented for the TO direction (RunCopyTo actively rejected CopyEndpointFile) — added RunCopyToFile mirroring RunCopyFromFile, wired into both the top-level and inline COPY dispatch in internal/postmaster/copy.go; (2) COPY FROM's ENCODING option (and client_encoding GUC fallback) was parsed/validated but never applied — CopyFromExecutor now resolves a source PG encoding and runs mb.DoEncodingConversion on each raw line before decoding; (3) EUC_JP had no conversion proc registered in internal/utils/mb — added a structural-grammar verifier (pg_eucjp_verifychar port) so invalid EUC_JP byte sequences raise the same SQLSTATE 22021 message PG does; genuinely valid non-ASCII EUC_JP characters raise 22028 untranslatable instead of emitting wrong bytes, since the real JIS X0208/0212 Unicode mapping tables are not yet ported (deferred, see ledger). Also fixed scripts/pg-regress-runner.sh: PG_ABS_BUILDDIR was never exported (pg_regress.c:735), so :abs_builddir stayed an unset psql var and broke every COPY ... TO/FROM :'file' regress case, not just this one."
 ,regress-sql,regress,postgres/src/test/regress/sql/copyselect.sql,pass,yes,-,Passes via TestPort_RegressSuite/copyselect (M0097-0024)
 ,regress-sql,regress,postgres/src/test/regress/sql/create_aggregate.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/create_am.sql,not-tried,no,-,
@@ -238,7 +238,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-expected,regress,postgres/src/test/regress/expected/collate.utf8_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/collate.windows.win1252_1.out,pass,yes,-,M0134-0103: this is the expected variant matched (self-skip path); see collate.windows.win1252.sql rationale.
 ,regress-expected,regress,postgres/src/test/regress/expected/compression_1.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/copyencoding_1.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/copyencoding_1.out,pass,yes,-,M0134-0107: non-UTF8-server-encoding variant of copyencoding.out (the file self-skips via `getdatabaseencoding() <> 'UTF8'`); see copyencoding.sql rationale.
 ,regress-expected,regress,postgres/src/test/regress/expected/encoding_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/euc_kr_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/float4-misrounded-input.out,not-tried,no,-,

@@ -10,6 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/utils/mb"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 )
@@ -55,7 +56,43 @@ func RunCopyTo(ctx *Context, plan *optimizer.Copy, emit func([]byte) error) (cou
 	if err := rejectFileEndpoint(plan); err != nil {
 		return 0, false, err
 	}
+	return runCopyToCore(ctx, plan, emit)
+}
 
+// RunCopyToFile implements server-side `COPY ... TO 'filepath'`: it opens
+// the file for writing and drives the same row-encoding path RunCopyTo
+// uses for STDOUT, so the two endpoints stay byte-for-byte identical
+// (aside from the wire CopyData framing, which a real file has no need
+// of). Mirrors RunCopyFromFile's counterpart on the read side. M0134-0107.
+func RunCopyToFile(ctx *Context, plan *optimizer.Copy) (int64, error) {
+	if plan == nil || plan.Direction != optimizer.CopyTo {
+		return 0, &ExecError{Code: "XX000", Message: "RunCopyToFile: plan is nil or not CopyTo"}
+	}
+	if plan.Endpoint != optimizer.CopyEndpointFile || plan.Filename == "" {
+		return 0, &ExecError{Code: "XX000", Message: "RunCopyToFile: not a file endpoint"}
+	}
+	f, err := os.Create(plan.Filename)
+	if err != nil {
+		return 0, &ExecError{Code: "58P01", Pos: plan.Pos(),
+			Message: fmt.Sprintf("could not open file \"%s\" for writing: %s", plan.Filename, err)}
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	count, _, err := runCopyToCore(ctx, plan, func(line []byte) error {
+		_, werr := w.Write(line)
+		return werr
+	})
+	if err != nil {
+		return count, err
+	}
+	if ferr := w.Flush(); ferr != nil {
+		return count, &ExecError{Code: "58030", Pos: plan.Pos(), Message: fmt.Sprintf("could not write to file \"%s\": %s", plan.Filename, ferr)}
+	}
+	return count, nil
+}
+
+func runCopyToCore(ctx *Context, plan *optimizer.Copy, emit func([]byte) error) (count int64, binary bool, err error) {
 	binary = IsBinaryFormat(plan.Options)
 	var format copyToFormat
 	if !binary {
@@ -178,6 +215,11 @@ type CopyFromExecutor struct {
 	plan   *optimizer.Copy
 	cols   []catalog.Column // table's full column list, in declared order
 	rowsIn int64
+	// lineNo is the 1-based physical line counter PG's CONTEXT message
+	// reports ("COPY tbl, line N", copyfromparse.c CopyFromErrorCallback).
+	// Incremented once per PushLine call, matching cur_lineno's per-line
+	// bump — HEADER's discarded first line counts too, same as upstream.
+	lineNo int64
 	// format carries the text/CSV knobs (delimiter, quote, escape, NULL
 	// string, header) parsed from the option list. The same struct drives
 	// COPY TO; input and output MUST read the option list identically or a
@@ -194,6 +236,17 @@ type CopyFromExecutor struct {
 	// binary path state
 	binaryBuf        []byte
 	binaryHeaderSeen bool
+
+	// srcEnc is the resolved PG encoding ID that incoming raw lines must be
+	// converted FROM (into the UTF8 server encoding) before decoding, or -1
+	// when no conversion is needed (UTF8 source, or the encoding could not
+	// be resolved — matching PG's "no proc needed" fast paths in
+	// pg_do_encoding_conversion). Resolved once per statement in
+	// newCopyFromExecutor from the COPY ENCODING option, falling back to
+	// the session's client_encoding GUC — mirrors PG's ProcessCopyOptions /
+	// BeginCopyFrom precedence (options.c: an explicit ENCODING option wins
+	// over client_encoding for that one COPY). M0134-0107.
+	srcEnc int32
 
 	// missing[i]=true when column i is absent from the COPY column list
 	// (PG copyfrom.c defmap: only columns NOT in the list get a default —
@@ -233,9 +286,48 @@ func NewCopyFromExecutor(ctx *Context, plan *optimizer.Copy) (*CopyFromExecutor,
 // checks, so the file endpoint (RunCopyFromFile) and the STDIN endpoint
 // share one option-interpretation site. They previously diverged by
 // construction: each hand-built the struct and read only the NULL option.
+// resolveCopyFromEncoding returns the PG encoding ID that COPY FROM must
+// convert incoming bytes from, or -1 when the source is already UTF8 (the
+// only server encoding goopg supports) and no conversion is needed. An
+// explicit COPY ... ENCODING 'name' option takes precedence over the
+// session's client_encoding GUC, matching PG's BeginCopyFrom (copyfromparse.c
+// consults cstate->file_encoding, which ProcessCopyOptions seeds from the
+// ENCODING DefElem when present, else pg_get_client_encoding()).
+func resolveCopyFromEncoding(opts []parser.CopyOption, getSetting func(string) (string, bool)) int32 {
+	name := ""
+	for _, o := range opts {
+		if strings.EqualFold(o.Name, "encoding") {
+			name = o.Value
+			break
+		}
+	}
+	if name == "" && getSetting != nil {
+		if v, ok := getSetting("client_encoding"); ok {
+			name = v
+		}
+	}
+	if name == "" {
+		return -1
+	}
+	upper := strings.ToUpper(name)
+	if upper == "UTF8" || upper == "UNICODE" {
+		return -1
+	}
+	id := catalog.EncodingNameToID(upper)
+	if id <= 0 { // -1 unknown, 0 SQL_ASCII (any byte string is valid — no conversion)
+		return -1
+	}
+	return id
+}
+
 func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
 	format := copyToFormatFromOptions(plan.Options)
 	cols := plan.Table.Columns
+
+	srcEnc := int32(-1)
+	if ctx != nil {
+		srcEnc = resolveCopyFromEncoding(plan.Options, ctx.GetSetting)
+	}
 
 	// missing[i]=true for every target column not in the COPY column list
 	// (defaults to "all missing" for a bare `COPY tbl FROM ...` with no
@@ -273,6 +365,7 @@ func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
 		headerPending:    format.hasHeader(),
 		missing:          missing,
 		needsConstraints: needsConstraints,
+		srcEnc:           srcEnc,
 	}
 }
 
@@ -282,6 +375,7 @@ func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
 // so PushLine can legitimately insert nothing and buffer instead; call
 // Finish at end-of-stream to catch a record left unterminated.
 func (c *CopyFromExecutor) PushLine(line []byte) error {
+	c.lineNo++
 	if c.headerPending {
 		// HEADER on input discards the first line (copyfromparse.c
 		// NextCopyFrom, cstate->cur_lineno == 1 arm). Applies to TEXT
@@ -289,14 +383,33 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 		c.headerPending = false
 		return nil
 	}
+	if c.srcEnc >= 0 {
+		converted, err := mb.DoEncodingConversion(line, c.srcEnc, mb.PG_UTF8, mb.BuiltinLookup)
+		if err != nil {
+			return &ExecError{Code: "22021", Pos: c.plan.Pos(), Message: err.Error(), Context: c.copyContext()}
+		}
+		line = converted
+	}
 	if c.format.csv {
 		return c.pushCsvLine(line)
 	}
 	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx))
 	if err != nil {
-		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err)}
+		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err), Context: c.copyContext()}
 	}
 	return c.insertSourceRow(src)
+}
+
+// copyContext renders PG's CONTEXT line for a COPY FROM error —
+// "COPY <table>, line <N>" (copyfromparse.c CopyFromErrorCallback, the
+// no-column-name-known case; a column-specific variant exists upstream
+// but nothing in this executor identifies which column failed yet).
+func (c *CopyFromExecutor) copyContext() string {
+	name := ""
+	if c.plan != nil && c.plan.Table != nil {
+		name = c.plan.Table.Name
+	}
+	return fmt.Sprintf("COPY %s, line %d", name, c.lineNo)
 }
 
 // pushCsvLine feeds one physical line into the CSV reader, re-joining a

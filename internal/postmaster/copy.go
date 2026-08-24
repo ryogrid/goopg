@@ -224,6 +224,31 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 
 	switch plan.Direction {
 	case optimizer.CopyTo:
+		if plan.Endpoint == optimizer.CopyEndpointFile {
+			// Server-side COPY TO 'file': write file directly, no wire
+			// CopyOutResponse/CopyData framing. M0134-0107.
+			count, err := executor.RunCopyToFile(ectx, plan)
+			if err != nil {
+				_ = s.cfg.TxnMgr.Rollback(tx)
+				if wErr := s.writeQueryError(w, execErrCode(err), execErrMsg(err)); wErr != nil {
+					return nil, wErr
+				}
+				return nil, nil
+			}
+			if cErr := ectx.CommitTransaction(tx); cErr != nil {
+				if wErr := s.writeQueryError(w, errcodes.SystemError, cErr.Error()); wErr != nil {
+					return nil, wErr
+				}
+				return nil, nil
+			}
+			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
+				return nil, err
+			}
+			if err := w.ReadyForQuery(); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
 		count, errorSent, err := s.runCopyToStream(w, ectx, plan)
 		if err != nil {
 			_ = s.cfg.TxnMgr.Rollback(tx)
@@ -255,7 +280,7 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 			count, err := executor.RunCopyFromFile(ectx, plan)
 			if err != nil {
 				_ = s.cfg.TxnMgr.Rollback(tx)
-				if wErr := s.writeQueryError(w, execErrCode(err), execErrMsg(err)); wErr != nil {
+				if wErr := s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...); wErr != nil {
 					return nil, wErr
 				}
 				return nil, nil
@@ -333,6 +358,15 @@ func (s *Server) runInlineCopy(r *libpq.FrameReader, w *libpq.FrameWriter, ectx 
 
 	switch plan.Direction {
 	case optimizer.CopyTo:
+		if plan.Endpoint == optimizer.CopyEndpointFile {
+			// Server-side COPY TO 'file' writes on the server with no wire
+			// interaction, so it works inline. M0134-0107.
+			count, err := executor.RunCopyToFile(ectx, plan)
+			if err != nil {
+				return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+			}
+			return w.WriteCommandComplete(fmt.Sprintf("COPY %d", count))
+		}
 		count, errorSent, err := s.runCopyToStream(w, ectx, plan)
 		if err != nil {
 			// runCopyToStream already wrote ErrorResponse + RFQ on a
@@ -350,7 +384,7 @@ func (s *Server) runInlineCopy(r *libpq.FrameReader, w *libpq.FrameWriter, ectx 
 			// wire interaction, so it works inline.
 			count, err := executor.RunCopyFromFile(ectx, plan)
 			if err != nil {
-				return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+				return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 			}
 			return w.WriteCommandComplete(fmt.Sprintf("COPY %d", count))
 		}

@@ -70,6 +70,12 @@ export LD_LIBRARY_PATH="${PG_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PG_ABS_SRCDIR="${REGRESS_SQL%/*}"   # postgres/src/test/regress (holds data/ and regress.so)
 export PG_LIBDIR="${REGRESS_SQL%/*}"
 export PG_DLSUFFIX=".so"
+# pg_regress.c:735 also exports PG_ABS_BUILDDIR = outputdir (server-side COPY
+# TO/FROM 'filename' tests like copyencoding.sql write under
+# ${outputdir}/results/); without it :abs_builddir stays a literal, unset psql
+# variable and every such COPY fails to open the resulting bogus path.
+export PG_ABS_BUILDDIR="${REGRESS_SQL%/*}"
+mkdir -p "${PG_ABS_BUILDDIR}/results"
 
 # Export the same session-format env vars pg_regress sets before invoking each
 # test's psql client (postgres/src/test/regress/pg_regress.c:783-796), so the
