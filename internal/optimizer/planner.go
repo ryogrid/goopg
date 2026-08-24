@@ -4580,6 +4580,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_get_catalog_foreign_keys") {
+		return planPgGetCatalogForeignKeys(rv, sourceIdx)
+	}
 	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
 		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
 	}
@@ -5425,6 +5428,36 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgGetCatalogForeignKeys routes a FROM-clause invocation of
+// pg_get_catalog_foreign_keys() into a PgGetCatalogForeignKeys plan node.
+// M0134-0146.
+func planPgGetCatalogForeignKeys(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_get_catalog_foreign_keys"
+	}
+	colNames := []string{"fktable", "fkcols", "pktable", "pkcols", "is_array", "is_opt"}
+	colTypes := []catalog.Type{
+		{Name: "regclass"},
+		{Name: "text", IsArray: true},
+		{Name: "regclass"},
+		{Name: "text", IsArray: true},
+		{Name: "bool"},
+		{Name: "bool"},
+	}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: colTypes[i], SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: colTypes[i], Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgGetCatalogForeignKeys{pos: tf.Pos(), schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

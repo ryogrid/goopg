@@ -368,6 +368,45 @@ func evalExpr(e optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 // fast-path early-return ahead of the type switch — saves the
 // 12-arm type-test sequence on the hot path. evalExprSlot cum
 // CPU at M0073-final was 68.68 % cum; this hoist trims dispatch.
+// regclassOIDToName resolves a pg_class-family OID to the text an
+// `oid::regclass` cast would render (matches PG's regclassout,
+// postgres/src/backend/utils/adt/regproc.c). Shared by the CastExpr
+// `regclass` arm below and by bindRecordRowComposite (M0134-0146), which
+// must apply the same resolution when flattening a regclass-typed record
+// field into composite text — otherwise a plpgsql `FOR rec IN SELECT ...`
+// record field carrying a bare catalog OID (e.g. pg_get_catalog_foreign_
+// keys()'s fktable/pktable columns) prints as a raw integer instead of the
+// relation name.
+func regclassOIDToName(ctx *Context, connDBOid uint32, oid uint32) string {
+	// InvalidOid (0) renders as "-", matching PG's regclassout. Without this
+	// guard a `reltoastrelid::regclass` for a table with no TOAST relation
+	// (reltoastrelid = 0) matches the first virtual relation whose OID is
+	// unset (also 0), e.g. information_schema.routines. M0118-0008
+	// (reindex-concurrently-toast probing).
+	if oid == 0 {
+		return "-"
+	}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		if tbl, found := im.LookupTableByOID(oid, connDBOid); found && tbl != nil {
+			return tbl.Name
+		}
+		// Synthetic TOAST relation OIDs (parent OID + 100M) live only in the
+		// virtual pg_class builder, not c.tables, so reconstruct the
+		// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
+		// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
+		if name, found := im.ToastRelName(oid, connDBOid); found {
+			return name
+		}
+	}
+	// Also resolve index OIDs to index names. M0097-0023.
+	for _, idx := range ctx.Catalog.AllIndexes(connDBOid) {
+		if idx.OID == oid {
+			return idx.Name
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
 func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	// Fast path: ColumnRef. M0074-0001 hoist.
 	if cref, ok := e.(*optimizer.ColumnRef); ok {
@@ -885,33 +924,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 			switch v.Kind {
 			case KindInt:
-				// InvalidOid (0) renders as "-", matching PG's regclassout
-				// (src/backend/utils/adt/regproc.c). Without this guard a
-				// `reltoastrelid::regclass` for a table with no TOAST relation
-				// (reltoastrelid = 0) matches the first virtual relation whose
-				// OID is unset (also 0), e.g. information_schema.routines.
-				// M0118-0008 (reindex-concurrently-toast probing).
-				if v.Int == 0 {
-					return NewStringDatum("-"), nil
-				}
-				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if tbl, found := im.LookupTableByOID(uint32(v.Int), connDBOid); found && tbl != nil {
-						return NewStringDatum(tbl.Name), nil
-					}
-					// Synthetic TOAST relation OIDs (parent OID + 100M) live only in
-					// the virtual pg_class builder, not c.tables, so reconstruct the
-					// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
-					// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
-					if name, found := im.ToastRelName(uint32(v.Int), connDBOid); found {
-						return NewStringDatum(name), nil
-					}
-				}
-				// Also resolve index OIDs to index names. M0097-0023.
-				for _, idx := range ctx.Catalog.AllIndexes(connDBOid) {
-					if idx.OID == uint32(v.Int) {
-						return NewStringDatum(idx.Name), nil
-					}
-				}
+				return NewStringDatum(regclassOIDToName(ctx, connDBOid, uint32(v.Int))), nil
 			case KindString:
 				// Shared SplitIdentifierString port: a quoted relation name
 				// (`'"My Table"'::regclass`) must be unquoted before the catalog

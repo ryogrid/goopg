@@ -67,6 +67,8 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		return maybeInstrument(p, newPgGetPublicationTablesOp(p)), nil
 	case *optimizer.PgAvailableWalSummaries:
 		return maybeInstrument(p, newPgAvailableWalSummariesOp(p)), nil
+	case *optimizer.PgGetCatalogForeignKeys:
+		return maybeInstrument(p, newPgGetCatalogForeignKeysOp(p)), nil
 	case *optimizer.PgGetSequenceData:
 		return maybeInstrument(p, newPgGetSequenceDataOp(p)), nil
 	case *optimizer.PgSequenceParameters:

@@ -160,7 +160,7 @@ func (f *plpgsqlFrame) isRecordVar(name string) bool {
 // Mirrors PostgreSQL's expanded-record representation; shared by SELECT … INTO
 // (bindSelectIntoRow) and the record FOR-loop binding. M0118-0008
 // (plpgsql-toast assign3/4/5/6).
-func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, frame *plpgsqlFrame) {
+func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, frame *plpgsqlFrame, ctx *Context) {
 	name := strings.ToLower(varName)
 	for i, sc := range schema {
 		colKey := "_" + name + "_" + strings.ToLower(sc.Name)
@@ -187,7 +187,23 @@ func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, fr
 	cf := make([]catalog.CompositeField, len(schema))
 	for i, sc := range schema {
 		if i < len(row) && !row[i].IsNull() {
-			parts[i] = row[i].Format()
+			d := row[i]
+			// A regclass-typed field must flatten to its resolved relation
+			// name, not the bare catalog OID — this composite text is the
+			// ONLY representation `fk.field` dot-access re-derives its value
+			// from (lowerPLpgSQLExpr's *parser.ColumnRef composite-field
+			// branch), and it recovers types purely by sniffing whether the
+			// substring parses as an integer. Left unresolved, any regclass
+			// OID collapses to a bare IntegerConst on read, breaking both
+			// `fk.field::text` and RAISE '%' formatting (surfaced by
+			// pg_get_catalog_foreign_keys()'s fktable/pktable columns).
+			// M0134-0146.
+			if strings.EqualFold(sc.Type.Name, "regclass") && d.Kind == KindInt && ctx != nil && ctx.Catalog != nil {
+				connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+				parts[i] = regclassOIDToName(ctx, connDBOid, uint32(d.Int))
+			} else {
+				parts[i] = d.Format()
+			}
 		}
 		cf[i] = catalog.CompositeField{Name: sc.Name, ColType: sc.Type.Name}
 	}
@@ -204,7 +220,7 @@ func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, fr
 //   - multiple targets bind result columns positionally to scalar variables.
 //
 // A missing column yields NULL. M0118-0008 (plpgsql-toast).
-func bindSelectIntoRow(targets []string, row Row, schema optimizer.Schema, frame *plpgsqlFrame) {
+func bindSelectIntoRow(targets []string, row Row, schema optimizer.Schema, frame *plpgsqlFrame, ctx *Context) {
 	if len(targets) == 0 {
 		return
 	}
@@ -228,7 +244,7 @@ func bindSelectIntoRow(targets []string, row Row, schema optimizer.Schema, frame
 				return
 			}
 		}
-		bindRecordRowComposite(name, row, schema, frame)
+		bindRecordRowComposite(name, row, schema, frame, ctx)
 		return
 	}
 	for i, tgt := range targets {
@@ -1956,7 +1972,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				return Datum{}, flowNone, &ExecError{Code: "P0003", Message: "query returned more than one row"}
 			}
 		}
-		bindSelectIntoRow(s.Targets, firstRow, schema, frame)
+		bindSelectIntoRow(s.Targets, firstRow, schema, frame, ctx)
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.ForSelectStmt:
@@ -2054,7 +2070,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				// was the value length, not the composite length. M0118-0008
 				// (plpgsql-toast assign5/6).
 				if frame.isRecordVar(varName) {
-					bindRecordRowComposite(varName, row, schema, frame)
+					bindRecordRowComposite(varName, row, schema, frame, ctx)
 				} else if len(schema) == 1 {
 					if idx, ok := frame.indexByName[varName]; ok {
 						if len(row) > 0 {
