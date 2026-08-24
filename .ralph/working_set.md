@@ -1,50 +1,46 @@
-Task just completed: M0134-0142 (misc_sanity.sql) — PARKED, two contained
-fixes shipped. Committing now.
+Task just completed: M0134-0143 (money.sql) — sized live, PARKED, no code
+shipped. Committing now.
 
-What landed: ran `scripts/pg-regress-runner.sh --verbose misc_sanity` live for
-the first time (was `not-tried`): 0/1 PASS, 0% parity, 72-line diff. Two
-independent CONTAINED bugs found and fixed:
-1. `pg_attribute.attoptions`/`attfdwoptions` were declared scalar `text`
-   (typid 25) in `pgAttrColDefs` (`internal/initdb/initdb.go:6205-6206`)
-   instead of PG's actual `text[]` (typid 1009) per
-   `postgres/src/include/catalog/pg_attribute.h:175,178`
-   (`text attoptions[1]`/`text attfdwoptions[1]`) — a real catalog-shape bug,
-   not cosmetic.
-2. `oidToBuiltinTypeName` (`internal/executor/expr.go:78`), the table backing
-   `::regtype` name resolution, had no entries for OID 194 (`pg_node_tree`)
-   or OID 2277 (`anyarray`) — both fell through to the raw-numeric-OID
-   fallback. Added both as bare pseudo-type names (matching PG's
-   `format_type` convention for other pseudo-types like `internal`).
+What landed: ran `scripts/pg-regress-runner.sh --verbose money` live for the
+first time (was `not-tried`): 0/1 PASS, 0% parity, 691-line diff. Root cause:
+the `money`/`cash` OID (790) is registered in `pg_type`/`pg_proc` for
+catalog-lookup purposes (all `cash_*` builtins appear in
+`pg_proc_names_generated.go`'s name table) but has ZERO real Go
+implementation behind any of them — `cash_in`/`cash_out`/arithmetic/
+`cashlarger`/`cashsmaller`/`cash_words` are bare name-table rows with no
+handler. A `money` value falls through `evalCast`'s catch-all pass-through
+(standing item 20) as an undecorated int8/numeric: `'123'::money` stores/
+prints bare `123` not `$123.00` (no cent scaling, no `$`/comma cash_out
+formatting), `m + '123'` raises `operator + requires numeric operands`
+(zero arithmetic operators), no overflow detection at the documented
++92233720368547758.07/-92233720368547758.08 int64-cents bounds, no
+pg_input_is_valid/pg_input_error_info wiring, no rounding-to-nearest-cent on
+extra-precision input.
 
-Diff went 72 -> 69 lines (both fixes confirmed live in the diff shrink).
-Remaining 69-line diff, all REFACTOR-tier / cross-file gaps, PARKED:
-- `pg_shdepend` relation doesn't exist at all (42P01) — standing item #11
-  (pg_shdepend-shaped object-enumeration engine), confirmed a 4th time.
-- No generic system-catalog TOAST-table registration: `pgClassReltoastrelidFor`
-  (`internal/initdb/initdb.go:6130`) special-cases ONLY `pg_rewrite`; every
-  other nailed catalog hardcodes `reltoastrelid=0`. Real PG's `pg_type` HAS a
-  toast table (DECLARE_TOAST), so its `typacl`/`typdefault`/`typdefaultbin`
-  varlena columns don't show in this sanity check — goopg's `pg_type` shows
-  them spuriously. NEW discovery this loop, not previously ledgered as its
-  own item (candidate #23 for the standing recommendation list below).
-- `pg_authid.rolpassword`/`pg_largeobject.data`/`pg_largeobject_metadata.lomacl`/
-  `pg_replication_origin.roname` are PG's accepted no-toast exceptions and
-  expected in the output; goopg is missing `pg_largeobject`/
-  `pg_largeobject_metadata`/`pg_replication_origin` catalogs entirely
-  (already ledgered under M0134-0135) and may be missing
-  `pg_authid.rolpassword`.
+Decision: PARK, not implement. This is a from-scratch type implementation
+(storage/parsing/output/arithmetic/overflow/functions with locale-shaped
+semantics) — same size/shape class as the already-parked geometry-type gap
+(standing item 5), not a bounded single-slice fix like box/circle/line/lseg/
+macaddr/macaddr8 were (those only needed I/O-function + cast wiring on top
+of an EXISTING partial type; money has no partial type to extend). Resume
+point recorded in the ledger: `parseCashLiteral`/`cashOut` in
+`internal/executor/expr.go` (port of `cash_in`/`cash_out`,
+`postgres/src/backend/utils/adt/cash.c`) plus the full `cash_*`
+arithmetic/comparison/function family dispatched the same way point/box/
+circle/macaddr8 operator families are (runtime Kind-sniffing, no static
+type tag on Datum).
 
 CSV flipped `not-tried` -> `failed`, pass_required stays `no`. Ledger row
-appended (`.ralph/deferral_ledger.md`, 2026-08-25, M0134-0142). No dedicated
-design doc — this is a two-line catalog-shape correction, not a new
-subsystem (same precedent as M0134-0140's un-designed catalog fix).
+appended (`.ralph/deferral_ledger.md`, 2026-08-25, M0134-0143). No dedicated
+design doc — this is a sizing-only park with zero code shipped (same
+precedent as M0134-0141's memoize.sql park).
 
 NEXT LOOP: per the Current Priority banner, continue M0134 top-to-bottom —
-next unworked item is **M0134-0143 (money.sql)**. Size it live first
-(`scripts/pg-regress-runner.sh --verbose money`). No strong prior.
+next unworked item is **M0134-0144 (namespace.sql)**. Size it live first
+(`scripts/pg-regress-runner.sh --verbose namespace`). No strong prior.
 
 Standing recommendation, carried across several loops (unchanged except new
-item 23):
+item 24):
 1. GIN/GiST/SPGiST physical-index plan integration — Seq Scan not
    Index/Index-Only Scan because the AM is catalog-only.
 2. btree v0 opclass generality (`internal/executor/operators_ddl.go:15810`
@@ -58,9 +54,9 @@ item 23):
 8. BETWEEN-vs-comparison-operator precedence bug (M0134-0113).
 9. RAISE INFO/LOG/DEBUG collapse to hardcoded NOTICE wire severity.
 10. `::json` cast DETAIL/CONTEXT truncation text (json_errdetail port).
-11. pg_shdepend-shaped object-enumeration/CASCADE engine — CONFIRMED A 4TH
-    TIME (M0134-0142, this loop). Single most-recurring blocker across
-    M0134; strongest candidate for its own milestone.
+11. pg_shdepend-shaped object-enumeration/CASCADE engine — confirmed 4 times
+    (M0134-0142). Single most-recurring blocker across M0134; strongest
+    candidate for its own milestone.
 12. `CREATE CONVERSION`-registered procs never consulted by convert_from/to.
 13. DDL-event-trigger firing engine + `session_replication_role` GUC.
 14. `NonSuperuserRole != ""` "is superuser" convention wrong for non-"postgres"
@@ -76,28 +72,29 @@ item 23):
     `partitionChildren` (only fixed for the child side, M0134-0140).
 22. LATERAL outer-column-ref bug (memoize.sql bonus discovery) — narrow,
     potentially real, independent of Memoize/parallel.
-23. NEW this loop: no generic system-catalog TOAST-table registration —
+23. No generic system-catalog TOAST-table registration —
     `pgClassReltoastrelidFor` special-cases only `pg_rewrite`; every other
-    nailed catalog's `reltoastrelid` is hardcoded 0, which will keep
-    surfacing as spurious "missing toast table" rows in any future sanity
-    check that cross-references `pg_class.reltoastrelid` with `pg_attribute`
-    varlena columns (misc_sanity.sql's `pg_type` case this loop).
+    nailed catalog's `reltoastrelid` is hardcoded 0.
+24. NEW this loop: `money`/`cash` type entirely unimplemented — no
+    `cash_in`/`cash_out`/arithmetic/comparison/functions behind the
+    catalog-registered OID; falls through evalCast's catch-all pass-through
+    as bare int8/numeric with zero cent scaling. Same size/shape as the
+    geometry-type gap (item 5); resume point in the M0134-0143 ledger row.
 
-Gates run this loop: scripts/pg-regress-runner.sh --verbose misc_sanity
-(live sizing + verification, 72->69 lines); go build ./... PASS;
-RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS (all
-packages); scripts/tpch-spotcheck.sh PASS (Q12=2 rows 17.75s, Q13=35 rows
-7.53s); make regen-testport PASS; make check-testport-inventory PASS;
-make ralph-state-guard: to run before final status.
+Gates run this loop: scripts/pg-regress-runner.sh --verbose money (live
+sizing, 691-line diff, 0% parity); go build ./... PASS; make regen-testport
+PASS; make check-testport-inventory PASS; make ralph-state-guard: to run
+before final status. No Go source touched this loop (docs/CSV/ledger/
+fix_plan only) so ralph-precommit-test.sh/tpch-spotcheck.sh were not
+re-run (no executable code changed; last run PASS in M0134-0142's loop).
 
 In-flight: none.
 
-Note: a concurrent peer session's WIP was present in the tree again this
-loop (.ralph/progress.json, .ralphrc, analysis/postgres-oracle-compatibility-
+Note: a concurrent peer session's WIP may still be present in the tree
+(.ralph/progress.json, .ralphrc, analysis/postgres-oracle-compatibility-
 report.md, ci/logs/launch.log, ci/logs/scheduler.log,
 docs/wiki/getting-started.md, internal/executor/operators_recursive_cte.go,
 postgres (untracked convenience symlink), third-party/tpcds-postgres,
 analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt,
-docs/wiki/modules/catalog.md) and was deliberately left untouched/
-uncommitted — only this loop's own files were staged and committed by
-explicit pathspec.
+docs/wiki/modules/catalog.md) — deliberately left untouched/uncommitted;
+only this loop's own files were staged and committed by explicit pathspec.
