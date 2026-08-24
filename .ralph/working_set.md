@@ -1,62 +1,68 @@
-Task just completed: M0134-0146 (oidjoins.sql) — sized live, PARKED, two real
-fixes landed (not sizing-only). Committed (725007de0).
+Task just completed: M0134-0147 (opr_sanity.sql) — sized live, PARKED, one real
+fix landed (not sizing-only). Committed (bc6a1ff04).
 
 What landed:
-1. `pg_get_catalog_foreign_keys()` implemented end-to-end — was registered in
-   pg_proc seed data with ZERO handler (`0A000: table-valued function ... not
-   supported`). Added a 219-row static SRF (`internal/executor/
-   pg_catalog_fk_data.go`, transcribed verbatim from `postgres/src/include/
-   catalog/system_fk_info.h`'s genbki-generated `sys_fk_relationships[]`)
-   plus a `PgGetCatalogForeignKeys` plan node (`internal/optimizer/plan.go`)
-   wired through `planTableFuncRangeVar`/`joinlayout.go`/`executor.go`,
-   mirroring the existing `pg_available_wal_summaries` FROM-clause-SRF
-   pattern.
-2. Fixed a genuine cross-cutting plpgsql bug the SRF exposed: a
-   regclass-typed record field (`FOR rec IN SELECT ... LOOP`) collapsed to
-   its bare catalog OID digits on `rec.field`/`rec.field::text`/RAISE `%`
-   access — `bindRecordRowComposite` flattened it via `Datum.Format()` and
-   `lowerPLpgSQLExpr`'s `*parser.ColumnRef` composite-field branch
-   re-derives a fake type by sniffing whether the flattened text parses as
-   an integer. Extracted the existing CastExpr regclass-resolution logic
-   (`internal/executor/expr.go`) into a reusable `regclassOIDToName(ctx,
-   connDBOid, oid)` helper, threaded `ctx *Context` through
-   `bindRecordRowComposite`/`bindSelectIntoRow` (previously ctx-less) to
-   reach it. Verified live: oidjoins.sql now runs 4 correct NOTICE lines
-   with resolved catalog names (`pg_proc`, `pg_namespace`, ...) before
-   diverging.
+Fixed the exact resume point M0134-0146 left: pg_proc's live/queryable schema
+(`registerPgProcView`, `internal/initdb/pg_proc_view.go`) was missing 7 real
+PG18 columns present in its heap-encode twin (`PGProcColumnsPG18()`,
+`internal/executor/sys_pg_proc.go`) — `provariadic`/`pronargdefaults`/
+`proallargtypes`/`proargmodes`/`proargnames`/`proargdefaults`/`prosqlbody`.
+Added all 7 to the virtual table's `Columns` list and populated them across
+all 4 row-building blocks (builtin stubs, user routines,
+`catalog.BuiltinProcs()`, user aggregates). `proargmodes`/`proargnames`/
+`proallargtypes` carry REAL per-routine data (from `Routine.ArgModes`/
+`ArgNames`/`ArgTypes`) via 3 new helpers in pg_proc_view.go
+(`pgArgModesLiteral`/`pgArgNamesLiteral`/`pgAllArgTypesLiteral`).
+`provariadic` stays constant 0 and `prosqlbody` constant NULL everywhere
+(both real remaining gaps, ledgered). `pronargdefaults`/`proargdefaults` are
+a real count / non-NULL placeholder pair kept mutually consistent (NOT the
+real parsed pg_node_tree — a placeholder to satisfy opr_sanity.sql's
+NULL-ness invariant).
 
-Remaining gap (independent, systemic, NOT sized further this loop):
-`pg_proc`'s live/queryable column set is missing 6 real PG18 columns
-present in its own heap-encode schema — `PGProcColumnsPG18()`
-(`internal/executor/sys_pg_proc.go:29-62`) declares all 30 PG18 columns
-including `provariadic`/`pronargdefaults`/`proargmodes`/`proargnames`/
-`proargdefaults`/`prosqlbody`, but live `SELECT provariadic FROM pg_proc`
-42703s and `SELECT * FROM pg_proc` returns only 23 columns — confirmed via
-`pg_attribute` for `'pg_proc'::regclass` not listing `provariadic` at all.
-The heap-encode schema and the query-time-resolvable schema for pg_proc
-have drifted apart. oidjoins.sql's DO block iterates all 219 catalog-FK
-rows via dynamic EXECUTE, so this is very likely NOT isolated to pg_proc —
-expect the same missing-column pattern to recur across several of the
-~40 other catalogs the sweep touches.
+Verified live, TWO independent regress files improved by the same fix:
+- opr_sanity.sql: every "column ... does not exist" divergence gone (only
+  unrelated `amvalidate` gap remains). Diff 1886→1833 lines.
+- oidjoins.sql (M0134-0146's file): 219-row FK sweep went from diverging at
+  check #5 to running ALL 219 checks clean — new unrelated divergence at the
+  very LAST check (pg_subscription_rel.srrelid, "operator = has incompatible
+  operand types oid and oid[]" — 42804, NOT a pg_proc issue, not yet
+  triaged). CSV row for oidjoins.sql updated in place (rationale only, no
+  status change — still `failed`/`pass_required=no`, sweep still doesn't
+  complete 100% clean).
 
-CSV stays `not-tried` -> `failed` (NOT `pass` — sweep still doesn't
-complete clean), `pass_required` stays `no`. Ledger row appended
-(`.ralph/deferral_ledger.md`, 2026-08-25, M0134-0146).
+Remaining pg_proc gaps (ledgered, NOT this loop's scope):
+1. `provariadic` always 0 — no real variadic-element-type resolution
+   (ANYOID/ANYELEMENTOID/ANYCOMPATIBLEOID/array-element special cases). Will
+   make opr_sanity's "variadic type ⟺ variadic argument" check fail once a
+   user VARIADIC function is exercised (proargmodes now correctly says 'v',
+   provariadic never does).
+2. `prosqlbody` always NULL — no SQL-body node-tree serializer (matches
+   standing gap already noted at `internal/executor/expr.go:13838`).
+3. `proargdefaults` placeholder text, not real parsed node-tree.
+4. `proallargtypes` = same OIDs as `proargtypes` (since `Routine.ArgTypes`
+   already isn't IN-only — a SEPARATE pre-existing divergence from PG's
+   real IN-only `proargtypes` semantics, not touched this loop).
+5. opr_sanity.sql's remaining ~1833-line diff covers ~90 OTHER
+   catalog-consistency assertions (opclass/opfamily/amop/amproc
+   completeness, pg_amvalidate, index sanity) not yet triaged individually.
+
+CSV: oidjoins.sql rationale updated (no status change). opr_sanity.sql
+flipped `not-tried` → `failed` (NOT `pass`), `pass_required` stays `no`.
+Ledger row appended (`.ralph/deferral_ledger.md`, 2026-08-25, M0134-0147).
 
 NEXT LOOP: per the Current Priority banner, continue M0134 top-to-bottom —
-next unworked item is **M0134-0147 (opr_sanity.sql)**. Size it live first
-(`scripts/pg-regress-runner.sh --verbose opr_sanity`). No strong prior.
+next unworked item is **M0134-0148 (password.sql)**. Size it live first
+(`scripts/pg-regress-runner.sh --verbose password`). No strong prior.
 
-Separately, a concrete resume point for M0134-0146 itself (optional, not
-next-in-line per the banner's top-to-bottom order, but worth a future loop):
-find and unify/backfill pg_proc's queryable-column builder against
-`PGProcColumnsPG18()` (`internal/executor/sys_pg_proc.go`), then re-run
-`scripts/pg-regress-runner.sh --verbose oidjoins` to find the
-next-divergent catalog/column pair, repeating until the 219-row sweep is
-clean or the remaining gaps are fully catalogued.
+Separately, a concrete resume point for M0134-0147 itself (optional, not
+next-in-line per the banner's top-to-bottom order): re-run
+`scripts/pg-regress-runner.sh --verbose oidjoins` and chase the new
+pg_subscription_rel.srrelid oid/oid[] type-mismatch error (last of the 219
+FK checks) — likely a small, isolated bug distinct from the pg_proc
+column-drift work.
 
 Standing recommendation, carried across several loops (unchanged, no new
-item this loop beyond the pg_proc column-drift note above):
+item this loop beyond the pg_proc sub-gaps noted above):
 1. GIN/GiST/SPGiST physical-index plan integration — Seq Scan not
    Index/Index-Only Scan because the AM is catalog-only.
 2. btree v0 opclass generality (`internal/executor/operators_ddl.go:15810`
@@ -99,30 +105,36 @@ item this loop beyond the pg_proc column-drift note above):
 27. `CREATE PUBLICATION ... FOR TABLES IN SCHEMA` unparsed; real support
     needs a new `pg_publication_namespace` catalog +
     `logicalwalsender.go:373-377` schema-membership filter.
-28. NEW this loop: pg_proc's live/queryable column set has drifted from its
-    own heap-encode schema (`PGProcColumnsPG18()`) — 6 PG18 columns
-    (provariadic/pronargdefaults/proargmodes/proargnames/proargdefaults/
-    prosqlbody) declared but not query-resolvable. Likely the first of
-    several similar per-catalog drifts.
+28. pg_proc's provariadic/prosqlbody/proargdefaults still not real
+    (see the 5 remaining-gap items above) — resolved-enough for now, but
+    a real fix needs a node-tree serializer + variadic-element resolver.
+29. `Routine.ArgTypes` conflates IN-only and ALL-args (OUT/INOUT included) —
+    makes `proargtypes` wrong for any OUT-param function; would need a
+    parse-time split at `internal/executor/operators_ddl.go` ~16540/17330.
 
-Gates run this loop: scripts/pg-regress-runner.sh --verbose oidjoins (live,
-before AND after the fixes — 0/1 PASS both times, diff shrank from
-"immediate error" to "4 correct lines then divergence at check #5"); go
-build ./... PASS; RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
-PASS (all packages, some cached); scripts/tpch-spotcheck.sh PASS (fresh
-capped server, Q12=2/Q13=35 canonical); TPC-DS SF0.5 gate BLOCKED this loop
-— `scripts/tpcds-sf05-regression.sh sweep` refused with "FATAL: the nightly
-CI batch is running (ci/batch)" (concurrent resource-lock guard, not
-forced — the change is orthogonal to any TPC-DS query shape, no TPC-DS
-query uses plpgsql DO blocks or pg_get_catalog_foreign_keys); make
-regen-testport PASS; make check-testport-inventory PASS; pre-commit hook
-pgbench smoke PASS (TPC-B 331 tps / simple-update 623 tps / select-only
-12317 tps, 0 failed); make ralph-state-guard: self-repaired (standard
-between-loop marker reconciliation), passed after repair.
+Gates run this loop: scripts/pg-regress-runner.sh --verbose opr_sanity (live,
+before AND after — 1886→1833-line diff, all column-does-not-exist errors
+gone); scripts/pg-regress-runner.sh --verbose oidjoins (live, before/after —
+219/219 checks now execute, new unrelated last-check divergence); go build
+./... PASS; go test ./internal/initdb/... -run TestPgProcView PASS (16/16);
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS (all
+packages, some cached); scripts/tpch-spotcheck.sh PASS (fresh capped server,
+Q12=2/Q13=35 canonical); TestPort_PgDumpConnectionSetup FAILED but confirmed
+PRE-EXISTING via git-stash bisect (unrelated CREATE CAST bytea->text 42P17
+error, not a regression from this loop's change); TPC-DS SF0.5 gate BLOCKED
+this loop — `scripts/tpcds-sf05-regression.sh sweep` refused with "FATAL: the
+nightly CI batch is running" (concurrent resource-lock guard, not forced —
+change is orthogonal to any TPC-DS query shape); make regen-testport PASS
+(after fixing a CSV-quoting mistake — commas in an unquoted rationale field
+broke the parser, fixed by switching to semicolons per the file's existing
+convention); make check-testport-inventory PASS; pre-commit hook pgbench
+smoke PASS (select-only 12379 tps, 0 failed); make ralph-state-guard:
+self-repaired (standard between-loop marker reconciliation), passed after
+repair.
 
 In-flight: none. (TPC-DS SF0.5 gate was blocked by a concurrent nightly
-batch, not abandoned mid-run — nothing to resume; re-run it in a future
-loop once the nightly lane is idle, per the practice-card mandate for
+batch, not abandoned mid-run — nothing to resume; re-run it in a future loop
+once the nightly lane is idle, per the practice-card mandate for
 planner/executor changes, if time allows.)
 
 Note: a concurrent peer session's WIP may still be present in the tree
