@@ -21949,9 +21949,39 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 		}
 	case "schema":
+		// Resolve the schema being created: an explicit name wins, otherwise
+		// (AUTHORIZATION-only form) the schema defaults to the authorized
+		// role's name, resolved against the live session for
+		// CURRENT_ROLE/CURRENT_USER/USER/SESSION_USER (PG parity: gram.y's
+		// OptSchemaName / CreateSchemaStmtStart, transformCreateSchemaStmt).
+		// M0134-0115.
+		schemaName := s.ObjName.Name
+		if schemaName == "" && s.SchemaAuthRole != "" {
+			switch s.SchemaAuthRole {
+			case "current_role", "current_user", "user":
+				schemaName = o.ctx.EffectiveUserName()
+			case "session_user":
+				schemaName = o.ctx.SessionUserName()
+			default:
+				schemaName = s.SchemaAuthRole
+			}
+		}
+		// PG parity (parse_utilcmd.c's setSchemaName, ERRCODE_INVALID_SCHEMA_
+		// DEFINITION / 42P15): every schema-qualified object name inside a
+		// `CREATE SCHEMA ... CREATE <element> ...` sub-command must match the
+		// schema being created, or the WHOLE statement fails before anything
+		// (not even the schema itself) is created. goopg has no execution
+		// path for the sub-command itself (REFACTOR-tier, M0134-0009), so
+		// this is the only enforcement available for it.
+		if s.SchemaHasSubElement && s.SchemaSubElementSchema != "" && schemaName != "" &&
+			s.SchemaSubElementSchema != schemaName {
+			return &ExecError{Code: "42P15", Pos: s.Pos(), Message: fmt.Sprintf(
+				"CREATE specifies a schema (%s) different from the one being created (%s)",
+				s.SchemaSubElementSchema, schemaName)}
+		}
 		// Register user-created schema so schema-qualified queries resolve correctly.
-		if s.ObjName.Name != "" {
-			im.RegisterSchema(s.ObjName.Name)
+		if schemaName != "" {
+			im.RegisterSchema(schemaName)
 			// B1.1 (doc 02c §1): persist the schema PG-style — a real
 			// pg_namespace heap INSERT + index entries (the WAL stream
 			// carries XLOG_HEAP_INSERT + 2× XLOG_BTREE_INSERT_LEAF, exactly
@@ -21959,10 +21989,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// generic heap reload. Replaces the bespoke
 			// RecordKindCreateSchema record (M0110-0003, retired).
 			if o.ctx.Pool != nil {
-				oid := im.SchemaOID(s.ObjName.Name)
-				owner := im.SchemaOwnerOID(s.ObjName.Name)
-				if err := syncSchemaToCatalogHeap(o.ctx, im, s.ObjName.Name, oid, owner); err != nil {
-					im.UnregisterSchema(s.ObjName.Name)
+				oid := im.SchemaOID(schemaName)
+				owner := im.SchemaOwnerOID(schemaName)
+				if err := syncSchemaToCatalogHeap(o.ctx, im, schemaName, oid, owner); err != nil {
+					im.UnregisterSchema(schemaName)
 					return fmt.Errorf("create-schema catalog heap: %w", err)
 				}
 			}

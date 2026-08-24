@@ -182,8 +182,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		if first, rest, tag, ok := splitLeadingCompatNoopDDL(sql); ok {
 			if tag == "CREATE SCHEMA" {
-				if werr := s.registerCompatNoopSchema(first); werr != nil {
-					return s.writeQueryError(w, errcodes.SystemError, werr.Error())
+				if werr := s.registerCompatNoopSchema(first, connTx.NonSuperuserRole, connTx.SessionUser); werr != nil {
+					return s.writeQueryError(w, compatNoopSchemaErrorCode(werr), werr.Error())
 				}
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
@@ -200,8 +200,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		if !isMultiStatementSQL(sql) {
 			if tag, ok := compatNoopCommandTag(sql); ok {
 				if tag == "CREATE SCHEMA" {
-					if werr := s.registerCompatNoopSchema(sql); werr != nil {
-						return s.writeQueryError(w, errcodes.SystemError, werr.Error())
+					if werr := s.registerCompatNoopSchema(sql, connTx.NonSuperuserRole, connTx.SessionUser); werr != nil {
+						return s.writeQueryError(w, compatNoopSchemaErrorCode(werr), werr.Error())
 					}
 				}
 				if err := w.WriteCommandComplete(tag); err != nil {
@@ -1953,12 +1953,42 @@ func splitLeadingCompatNoopDDL(sql string) (first, rest, tag string, ok bool) {
 // registers and persists identically regardless of which protocol the
 // client used. M0119-0004-ACLHEAP follow-up (loop #86, item (3) of the
 // loop #84 row).
-func (s *Server) registerCompatNoopSchema(sql string) error {
+func (s *Server) registerCompatNoopSchema(sql string, actingRole, sessionUser string) error {
+	norm := normalizeCompatSQL(sql)
+	// PG parity (parse_utilcmd.c transformCreateSchemaStmt/setSchemaName,
+	// ERRCODE_INVALID_SCHEMA_DEFINITION): every schema-qualified object name
+	// inside a `CREATE SCHEMA ... CREATE <element> ...` sub-command must
+	// match the schema being created, or the WHOLE statement fails — nothing
+	// (not even the schema itself) gets created. Checked before any catalog
+	// mutation below. The goopg parser has no grammar for CREATE SCHEMA's
+	// sub-command list at all (M0134-0009/M0134-0115), so this text-level
+	// check is the only enforcement available; it does not attempt to
+	// execute a schema-matching sub-command (REFACTOR-tier, deferred).
+	if hdr, ok := parseCreateSchemaHeader(norm); ok && hdr.subCmd != "" {
+		if targetSchema, hasTarget := createSchemaSubElementSchema(hdr.subCmd); hasTarget {
+			owning := hdr.schemaName
+			if owning == "" {
+				owning = resolveSchemaAuthRole(hdr.authRole, actingRole, sessionUser)
+			}
+			if owning != "" && targetSchema != owning {
+				return &schemaQualMismatchError{msg: fmt.Sprintf(
+					"CREATE specifies a schema (%s) different from the one being created (%s)",
+					targetSchema, owning)}
+			}
+		}
+	}
 	if s.cfg.Catalog == nil {
 		return nil
 	}
-	norm := normalizeCompatSQL(sql)
 	schemaName := schemaNameFromCreate(norm)
+	if schemaName == "" {
+		if hdr, ok := parseCreateSchemaHeader(norm); ok {
+			schemaName = hdr.schemaName
+			if schemaName == "" {
+				schemaName = resolveSchemaAuthRole(hdr.authRole, actingRole, sessionUser)
+			}
+		}
+	}
 	if schemaName == "" {
 		return nil
 	}
@@ -1993,6 +2023,151 @@ func schemaNameFromCreate(norm string) string {
 		return ""
 	}
 	return extractFirstSQLIdent("", rest)
+}
+
+// schemaQualMismatchError signals CREATE SCHEMA's schema-qualification
+// mismatch check (PG's setSchemaName, ERRCODE_INVALID_SCHEMA_DEFINITION /
+// 42P15) — distinct from the generic errcodes.SystemError the rest of
+// registerCompatNoopSchema's callers use, so compatNoopSchemaErrorCode can
+// pick the right SQLSTATE for the wire error. M0134-0115.
+type schemaQualMismatchError struct{ msg string }
+
+func (e *schemaQualMismatchError) Error() string { return e.msg }
+
+// compatNoopSchemaErrorCode picks the SQLSTATE for a registerCompatNoopSchema
+// failure: schemaQualMismatchError maps to 42P15 (invalid_schema_definition,
+// matching real PG's setSchemaName ereport), anything else keeps the prior
+// generic errcodes.SystemError behavior.
+func compatNoopSchemaErrorCode(err error) errcodes.Code {
+	if _, ok := err.(*schemaQualMismatchError); ok {
+		return errcodes.InvalidSchemaDefinition
+	}
+	return errcodes.SystemError
+}
+
+// createSchemaHeader is the parsed head of a `CREATE SCHEMA [name]
+// [AUTHORIZATION role] [CREATE <element> ...]` statement the goopg parser
+// does not recognise (no grammar for the sub-command list at all,
+// M0134-0009/M0134-0115) — enough to run PG's schema-qualification-mismatch
+// check without executing the sub-command.
+type createSchemaHeader struct {
+	schemaName string // "" when unspecified (AUTHORIZATION-only form: name = role)
+	authRole   string // "" when no AUTHORIZATION clause is present
+	subCmd     string // trailing "create ..." sub-element text, "" if none
+}
+
+// parseCreateSchemaHeader parses norm (already normalizeCompatSQL'd: single-
+// spaced, lowercased outside literals) as a CREATE SCHEMA statement head.
+// Mirrors gram.y's OptSchemaName/OptSchemaEltList shape closely enough for
+// the single-sub-command forms create_schema.sql exercises.
+func parseCreateSchemaHeader(norm string) (createSchemaHeader, bool) {
+	if norm != "create schema" && !strings.HasPrefix(norm, "create schema ") {
+		return createSchemaHeader{}, false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(norm, "create schema"))
+	var hdr createSchemaHeader
+	if !strings.HasPrefix(rest, "authorization ") {
+		ident, tail := consumeSQLIdent(rest)
+		if ident != "" {
+			hdr.schemaName = ident
+			rest = tail
+		}
+	}
+	if strings.HasPrefix(rest, "authorization ") {
+		rest = strings.TrimSpace(rest[len("authorization "):])
+		ident, tail := consumeSQLIdent(rest)
+		hdr.authRole = ident
+		rest = tail
+	}
+	if strings.HasPrefix(rest, "create ") {
+		hdr.subCmd = rest
+	}
+	return hdr, true
+}
+
+// consumeSQLIdent reads one leading SQL identifier (quoted or unquoted) off
+// s and returns it along with the trimmed remainder — extractFirstSQLIdent's
+// sibling, but also reporting how much of s the identifier consumed so
+// callers can keep parsing the rest of the statement.
+func consumeSQLIdent(s string) (ident, rest string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	if s[0] == '"' {
+		end := strings.Index(s[1:], "\"")
+		if end < 0 {
+			return s[1:], ""
+		}
+		return s[1 : end+1], strings.TrimSpace(s[end+2:])
+	}
+	end := strings.IndexAny(s, " \t\n\r;,")
+	if end < 0 {
+		return s, ""
+	}
+	return s[:end], strings.TrimSpace(s[end:])
+}
+
+// resolveSchemaAuthRole resolves a CREATE SCHEMA AUTHORIZATION clause's role
+// token to a concrete role name: CURRENT_ROLE/CURRENT_USER/USER resolve to
+// the session's active role (actingRole, i.e. connTx.NonSuperuserRole — ""
+// means no active SET ROLE, so fall back to the login/session user),
+// SESSION_USER resolves to sessionUser directly, and anything else is
+// already a literal role name.
+func resolveSchemaAuthRole(authRole, actingRole, sessionUser string) string {
+	switch authRole {
+	case "current_role", "current_user", "user":
+		if actingRole != "" {
+			return actingRole
+		}
+		return sessionUser
+	case "session_user":
+		return sessionUser
+	default:
+		return authRole
+	}
+}
+
+// createSchemaSubElementSchema extracts the schema-qualification of the
+// object name targeted by a single embedded CREATE <element> sub-command
+// (the SEQUENCE/TABLE/VIEW/INDEX-ON/TRIGGER-ON forms create_schema.sql
+// exercises — parse_utilcmd.c's transformCreateSchemaStmtElements checks
+// every element type in the sub-command list, but goopg parses none of
+// them, so only the single-element case that reaches here is covered).
+// hasTarget is false when the referenced name carries no explicit schema
+// qualification (unqualified names default silently to the enclosing
+// schema in real PG — never a mismatch) or the sub-command shape isn't
+// recognised.
+func createSchemaSubElementSchema(subCmd string) (schema string, hasTarget bool) {
+	fields := strings.Fields(subCmd)
+	if len(fields) < 2 || fields[0] != "create" {
+		return "", false
+	}
+	var target string
+	switch fields[1] {
+	case "sequence", "table", "view":
+		idx := 2
+		if idx+2 < len(fields) && fields[idx] == "if" && fields[idx+1] == "not" && fields[idx+2] == "exists" {
+			idx += 3
+		}
+		if idx < len(fields) {
+			target = fields[idx]
+		}
+	case "index", "trigger":
+		for i := 2; i < len(fields); i++ {
+			if fields[i] == "on" && i+1 < len(fields) {
+				target = fields[i+1]
+				break
+			}
+		}
+	default:
+		return "", false
+	}
+	dot := strings.Index(target, ".")
+	if dot <= 0 {
+		return "", false
+	}
+	return target[:dot], true
 }
 
 func normalizeCompatSQL(sql string) string {

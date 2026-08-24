@@ -64,7 +64,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, connTx.NonSuperuserRole, sess); handled {
 				return res, qerr
 			}
-			if res, qerr, handled := s.tryCompatNoopExtended(query); handled {
+			if res, qerr, handled := s.tryCompatNoopExtended(query, connTx.NonSuperuserRole, connTx.SessionUser); handled {
 				return res, qerr
 			}
 			msg, extra := syntaxErrorMsg(err)
@@ -683,14 +683,14 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName, actingRole st
 //
 // Returns handled=false when query does not match any compatNoopCommandTag
 // prefix, so the caller falls through to its normal syntax-error path.
-func (s *Server) tryCompatNoopExtended(query string) (*extendedQueryResult, *extendedQueryError, bool) {
+func (s *Server) tryCompatNoopExtended(query string, actingRole, sessionUser string) (*extendedQueryResult, *extendedQueryError, bool) {
 	tag, ok := compatNoopCommandTag(query)
 	if !ok {
 		return nil, nil, false
 	}
 	if tag == "CREATE SCHEMA" {
-		if werr := s.registerCompatNoopSchema(query); werr != nil {
-			return nil, &extendedQueryError{Code: errcodes.SystemError, Message: werr.Error()}, true
+		if werr := s.registerCompatNoopSchema(query, actingRole, sessionUser); werr != nil {
+			return nil, &extendedQueryError{Code: compatNoopSchemaErrorCode(werr), Message: werr.Error()}, true
 		}
 	}
 	return &extendedQueryResult{CommandTag: tag}, nil, true

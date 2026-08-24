@@ -628,6 +628,22 @@ func (p *parser) parseCreate() (Stmt, error) {
 			schemaName = tok.Value
 			p.advance()
 		}
+		var authRole string
+		if p.acceptIdentKeyword("authorization") {
+			if tok := p.cur(); tok.Kind == TokenIdent || tok.Kind == TokenKeyword || tok.Kind == TokenQuotedIdent {
+				authRole = strings.ToLower(tok.Value)
+				p.advance()
+			}
+		}
+		var subElemSchema string
+		var hasSubElem bool
+		if tok := p.cur(); tok.Kind == TokenKeyword && strings.EqualFold(tok.Value, "create") {
+			subElemSchema, hasSubElem = p.captureCreateSchemaSubElementSchema()
+		}
+		// The parser has no grammar for CREATE SCHEMA's element list
+		// (SEQUENCE/TABLE/VIEW/INDEX/TRIGGER/GRANT sub-commands) — skip
+		// whatever captureCreateSchemaSubElementSchema above did not already
+		// consume, same as before M0134-0115.
 		for {
 			tok := p.cur()
 			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -635,7 +651,8 @@ func (p *parser) parseCreate() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SCHEMA", ObjType: "schema", ObjName: ObjectName{Name: schemaName}}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SCHEMA", ObjType: "schema", ObjName: ObjectName{Name: schemaName},
+			SchemaAuthRole: authRole, SchemaSubElementSchema: subElemSchema, SchemaHasSubElement: hasSubElem}, nil
 	// CREATE EXTENSION name [WITH] [SCHEMA s] [VERSION v] [CASCADE] — inserts a
 	// pg_extension row (e.g. amcheck). M0110-0003.
 	case p.acceptIdentKeyword("extension"):
@@ -646,6 +663,76 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return p.parseCreateTablespaceTail(t.Pos)
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, TRIGGER, EXTENSION, or TABLESPACE after CREATE")
+}
+
+// captureCreateSchemaSubElementSchema is called with p positioned at a
+// CREATE SCHEMA statement's embedded `CREATE <element>` sub-command (cur()
+// is the "create" keyword). It advances past enough of that sub-command to
+// find its target object name and reports the name's schema qualification
+// (ObjectName.Schema from parseObjectName), or hasTarget=false when the
+// element kind isn't one of the SEQUENCE/TABLE/VIEW/INDEX ON/TRIGGER ON
+// forms create_schema.sql exercises, or the target carried no explicit
+// qualification. Any tokens not consumed here are swept up by the caller's
+// existing skip-to-semicolon loop — goopg has no execution path for the
+// sub-command itself (M0134-0009/M0134-0115), only this schema-mismatch
+// check (parse_utilcmd.c's setSchemaName).
+func (p *parser) captureCreateSchemaSubElementSchema() (schema string, hasTarget bool) {
+	p.advance() // consume "create"
+	kindTok := p.cur()
+	kind := strings.ToLower(kindTok.Value)
+	switch kind {
+	case "sequence", "table", "view":
+		p.advance()
+		if strings.EqualFold(p.cur().Value, "if") {
+			p.advance()
+			if strings.EqualFold(p.cur().Value, "not") {
+				p.advance()
+			}
+			if strings.EqualFold(p.cur().Value, "exists") {
+				p.advance()
+			}
+		}
+		name, err := p.parseObjectName()
+		if err != nil || name.Schema == "" {
+			return "", false
+		}
+		return name.Schema, true
+	case "index":
+		p.advance()
+		if strings.EqualFold(p.cur().Value, "concurrently") {
+			p.advance()
+		}
+		if tok := p.cur(); !strings.EqualFold(tok.Value, "on") && (tok.Kind == TokenIdent || tok.Kind == TokenQuotedIdent) {
+			p.advance() // optional index name
+		}
+		if !strings.EqualFold(p.cur().Value, "on") {
+			return "", false
+		}
+		p.advance()
+		name, err := p.parseObjectName()
+		if err != nil || name.Schema == "" {
+			return "", false
+		}
+		return name.Schema, true
+	case "trigger":
+		p.advance()
+		for {
+			tok := p.cur()
+			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+				return "", false
+			}
+			if tok.Kind == TokenKeyword && strings.EqualFold(tok.Value, "on") {
+				p.advance()
+				name, err := p.parseObjectName()
+				if err != nil || name.Schema == "" {
+					return "", false
+				}
+				return name.Schema, true
+			}
+			p.advance()
+		}
+	}
+	return "", false
 }
 
 // scanUserMappingForServer loosely scans the tail of a

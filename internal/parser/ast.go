@@ -2307,6 +2307,26 @@ type CompatNoopStmt struct {
 	FDWHandlerGiven   bool
 	FDWValidatorFunc  *ObjectName
 	FDWValidatorGiven bool
+	// SchemaAuthRole carries a CREATE SCHEMA statement's `AUTHORIZATION
+	// <role_spec>` role token verbatim (lowercased keywords for
+	// CURRENT_ROLE/CURRENT_USER/SESSION_USER/USER resolve at execCompatNoop
+	// time against the live session, since the parser has no session
+	// access). "" means no AUTHORIZATION clause. Tag == "CREATE SCHEMA" only.
+	// M0134-0115.
+	SchemaAuthRole string
+	// SchemaSubElementSchema / SchemaHasSubElement carry the schema
+	// qualification of the single embedded `CREATE <element>` sub-command a
+	// CREATE SCHEMA statement may include (SEQUENCE/TABLE/VIEW/INDEX ON/
+	// TRIGGER ON — parse_utilcmd.c's transformCreateSchemaStmtElements
+	// checks every element in the list; goopg has no execution path for any
+	// of them, so only the schema-qualification MISMATCH check is ported).
+	// SchemaHasSubElement is true whenever a sub-command was present;
+	// SchemaSubElementSchema is "" when that sub-command's target carried no
+	// explicit schema qualification (never a mismatch — PG defaults an
+	// unqualified name to the enclosing schema). Tag == "CREATE SCHEMA" only.
+	// M0134-0115.
+	SchemaSubElementSchema string
+	SchemaHasSubElement    bool
 	// CastContext / CastMethod carry a CREATE CAST statement's pg_cast.castcontext
 	// and castmethod. Context is "e" explicit (default), "a" assignment, "i"
 	// implicit. Method is "b" binary (WITHOUT FUNCTION), "i" INOUT (WITH INOUT),
