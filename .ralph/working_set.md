@@ -1,39 +1,33 @@
-Task just completed: M0134-0139 (macaddr8.sql) — CONTAINED fix shipped, PARKED.
-diff 420 lines (0% parity) → 29 lines, 2 residual `^+ERROR` (both the
-already-ledgered btree-opclass-generality gap). Committed and pushed.
+Task just completed: M0134-0140 (maintain_every.sql) — CLOSED, real fix,
+100% parity (was 0%, 15-line diff). Committed (608a2bb8) and pushed.
 
-What landed: `parseMacaddr8Literal` (`internal/executor/expr.go`) — a
-faithful port of `macaddr8_in` (`mac8.c:96-232`), structurally different
-from `macaddr_in`'s 7-format sscanf cascade: a single greedy scanner reading
-exactly 2 hex digits per byte, tracking one optional consistent separator
-(`:`/`-`/`.`), accepting 6 or 8 bytes with 6-to-8 EUI-64 auto-widening
-(FF/FE inserted as the 4th/5th octets). Sizing also surfaced a previously-
-unknown, second gap `macaddr.sql` never exercised: `::macaddr`/`::macaddr8`
-CAST were BOTH unvalidated pass-throughs in `evalCast` (no case existed for
-either target — confirmed live, `evalCast`'s trailing `return d, nil`
-silently accepted garbage). Fixed both directions via new
-`macaddr8ToMacaddrOctets`/`macaddrToMacaddr8Octets` helpers (port
-`macaddr8tomacaddr`/`macaddrtomacaddr8`, mac8.c:523-566). Wired into
-column-assignment coercion (codec.go), `pg_input_is_valid`/
-`pg_input_error_info`, `~`/`&`/`|` bitwise ops and `trunc()` (tried after the
-6-octet macaddr form in each shared dispatch site), new `macaddr8_set7bit()`
-function. Confirmed no regression on macaddr.sql(33)/box.sql(722)/
-circle.sql(51)/line.sql(55)/lseg.sql(27)/point.sql(531)/inet.sql(1298). New
-test `internal/executor/macaddr8_literal_test.go` (3 subtests, all PASS).
+What landed: two-part catalog bug in `internal/catalog/catalog.go`:
+1. `pg_class.relhassubclass` (virtual pg_class builder, ~line 7418) only
+   OR'd `partitionChildren[t.OID]` — never `inheritanceChildren[t.OID]` —
+   so a plain `CREATE TABLE ... INHERITS (parent)` never flipped the
+   parent's relhassubclass to 't' at all.
+2. Fixing #1 surfaced a second, independent bug: `DropTable` (~line 20995)
+   never unlinked a dropped child's OID from its parent's
+   `inheritanceChildren`/`partitionChildren` list, so relhassubclass stayed
+   stuck at 't' forever after `DROP TABLE <child>` (PG's RemoveInheritance
+   deletes the pg_inherits row as part of DROP's dependency scan; goopg has
+   no pg_inherits heap, so the fix unlinks the in-memory edge directly in
+   DropTable). Handled both classic INHERITS (via `InheritsParentOIDs`) and
+   ATTACH PARTITION (full sweep of `partitionChildren` by value, since
+   `Table.PartitionParentOID` stays 0 for ATTACHed children — same pattern
+   `PartitionParentOf` already uses).
 
-Design `docs/design/m0134-0139-macaddr8-cast-and-literal.md`, indexed in
-README.md. Ledger row: `.ralph/deferral_ledger.md` 2026-08-24 M0134-0139
-(residual gap #1 = same coerceTextLikeDatum Pos-threading LINE-echo gap as
-M0134-0136/-0137/-0138; residual gap #2 = btree v0 opclass generality on
-macaddr8, already tracked under M0134-0060/-0067/-0138's ledger rows, not
-newly discovered here).
+No new test file — `scripts/pg-regress-runner.sh maintain_every` is the
+coverage; CSV flipped not-tried→pass, pass_required=yes. No deferral-ledger
+row (genuine full fix, not a shortcut/partial). Confirmed no regression via
+git-stash-diff on inherit.sql (3300-line pre-existing failure byte-identical
+with/without the change, zero relhassubclass mentions) plus live re-checks
+of alter_table/create_table_like/partition_join/partition_prune (all
+pre-existing failures, unrelated).
 
 NEXT LOOP: per the Current Priority banner, continue M0134 top-to-bottom —
-next unworked item is **M0134-0140 (`maintain_every.sql`)**. Size it live
-first (scripts/pg-regress-runner.sh --verbose maintain_every). No strong
-prior — unrelated to the geometry/network-address-family cluster just
-closed (box/circle/line/lseg/point/inet/macaddr/macaddr8, 8 files in a row);
-expect a fresh root-cause investigation.
+next unworked item is **M0134-0141 (`memoize.sql`)**. Size it live first
+(scripts/pg-regress-runner.sh --verbose memoize). No strong prior.
 
 Standing recommendation, carried across several loops (unchanged this loop):
 1. GIN/GiST/SPGiST physical-index plan integration — every predicate on
@@ -41,10 +35,9 @@ Standing recommendation, carried across several loops (unchanged this loop):
    because the AM is catalog-only. Strongest candidate for a dedicated
    milestone.
 2. btree v0 opclass generality (`internal/executor/operators_ddl.go:15810`
-   `isSupportedBTreeKeyType` + `btree_scalar_keys.go`) — NOW CONFIRMED a
-   FIFTH time (M0134-0060/-0067/-0138/this-loop's macaddr8.sql), hard-codes
-   a fixed type set with no generic per-type comparator dispatch. Strong
-   candidate for a dedicated milestone alongside item 1.
+   `isSupportedBTreeKeyType` + `btree_scalar_keys.go`) — confirmed a fifth
+   time across M0134 macaddr/macaddr8/etc. Strong candidate for a dedicated
+   milestone alongside item 1.
 3. Geometry type-system gap — box/circle/line/lseg now `*_in`-faithful;
    path/polygon still raw-varlena pass-through. geometry.sql (M0134-0125)
    remains blocked on the unlexed geometric operator family.
@@ -59,8 +52,8 @@ Standing recommendation, carried across several loops (unchanged this loop):
 8. `::json` cast DETAIL/CONTEXT truncation text (json_errdetail port) —
    M0134-0120, unfixed.
 9. pg_shdepend-shaped object-enumeration/CASCADE engine — CONFIRMED A
-   THIRD TIME (M0134-0124), after M0134-0117/-0118. Single most-recurring
-   blocker across M0134; strong candidate for its own milestone. Resume:
+   THIRD TIME (M0134-0124). Single most-recurring blocker across M0134;
+   strong candidate for its own milestone. Resume:
    `catalog.InMemory.RoleDropDependencyDescriptions`.
 10. `CREATE CONVERSION`-registered procs never consulted by convert_from/
     convert_to (M0122-0008, M0134-0121).
@@ -79,44 +72,44 @@ Standing recommendation, carried across several loops (unchanged this loop):
 17. `coerceTextLikeDatum` (codec.go) never threads `ExecError.Pos` through
     to its callers, so psql's client-side "LINE N: ...\n  ^" echo never
     fires for box/circle/line/lseg/macaddr/macaddr8/inet/bit(n) literal-
-    validation errors raised during INSERT VALUES evaluation. Cross-cutting,
-    touches every INSERT/UPDATE/COPY call site.
-18. Geometry-family `*_in` closure now covers box/circle/line/lseg (4/6 core
-    geo types). path/polygon remain raw-varlena pass-through.
-19. Network-address-family `*_in` closure now covers inet/cidr/macaddr/
-    macaddr8 — ALL FOUR network types now have real validation. This
-    cluster is CLOSED as a recurring item.
+    validation errors raised during INSERT VALUES evaluation.
+18-19. Geometry / network-address-family `*_in` closures — see prior loops.
 20. `evalCast`'s catch-all `return d, nil` (unknown-type pass-through) has
     now been shown to hide real validation gaps twice (macaddr/macaddr8) —
-    worth a systematic audit of which type names still fall through it
-    silently rather than raising 42704/22P02.
+    worth a systematic audit.
+21. NEW this loop: `DropTable` never scrubs `inheritanceChildren`/
+    `partitionChildren` entries pointing to the dropped table when it is
+    itself a PARENT (only when it's a child, just fixed). If a parent with
+    live children is dropped (e.g. via CASCADE), those maps still carry
+    dangling child-OID lists keyed by the now-gone parent OID — harmless
+    for relhassubclass (parent row is gone) but worth auditing if any other
+    consumer of `partitionChildren`/`inheritanceChildren` assumes keys are
+    always live tables.
 
-Gates run this loop: go build ./... PASS; go test -run TestMacaddr8
-./internal/executor/ PASS (3 subtests); scripts/pg-regress-runner.sh
-macaddr8 420→29 diff lines, 2 `^+ERROR` (both pre-existing, sizing +
-fix verified live); scripts/pg-regress-runner.sh macaddr/box/circle/line/
-lseg/point/inet re-checked for regression, all held steady
-(33/722/51/55/27/531/1298); make regen-testport PASS; make
+Gates run this loop: go build ./... PASS; go test ./internal/catalog/...
+./internal/executor/... PASS; scripts/pg-regress-runner.sh maintain_every
+0%→100% parity (verified live before/after); git-stash-diff regression
+check on inherit.sql (byte-identical 3300-line diff, confirms pre-existing
+not a new break); live re-check of alter_table/create_table_like/
+partition_join/partition_prune (all pre-existing failures, no
+relhassubclass mentions); make regen-testport PASS; make
 check-testport-inventory PASS; RALPH_PRECOMMIT_SCOPE=units
 scripts/ralph-precommit-test.sh PASS (all packages); scripts/tpch-spotcheck.sh
-PASS (Q12=2 rows 18.46s, Q13=35 rows 7.92s, 28.6s query-phase wall);
+PASS (Q12=2 rows 16.78s, Q13=35 rows 8.05s, 27.5s query-phase wall);
 pre-commit hook's pgbench smoke ran automatically at commit time and PASSED
-(339 TPS simple-update, 12520 TPS select-only — both "0 failed"); make
-ralph-state-guard: ran, PASS.
+(342 TPS simple-update, 12761 TPS select-only — both "0 failed"); make
+ralph-state-guard: to be run before status block.
 
 In-flight: none.
 
 Note: a concurrent peer session's WIP was present in the tree again this
-loop (.ralph/progress.json, .ralphrc, analysis/deferral-ledger-summary-*,
-ci/logs/launch.log, ci/logs/scheduler.log, docs/wiki/getting-started.md,
-docs/wiki/modules/catalog.md, internal/executor/operators_recursive_cte.go,
-postgres (untracked convenience symlink), third-party/tpcds-postgres,
-dl_summary_session.txt, docs/test-port/upstream-isolation-coverage.md,
-docs/test-port/upstream-tap-coverage.md) and was deliberately left
-untouched/uncommitted — only this loop's own files were staged and
-committed by explicit pathspec.
-
-M-NIGHTLY: re-checked at loop start — `ci/logs/action-items.md`'s 2 items
-(20260824-013441-001/-002) were already filed in fix_plan.md by a prior
-loop (confirmed via grep, "Nightly run 20260824-013441 ... filed
-2026-08-24" section present); nothing new to file this loop.
+loop (.ralph/progress.json, .ralphrc, ci/logs/launch.log,
+ci/logs/scheduler.log, docs/wiki/getting-started.md,
+docs/test-port/upstream-isolation-coverage.md,
+docs/test-port/upstream-tap-coverage.md,
+internal/executor/operators_recursive_cte.go, postgres (untracked
+convenience symlink), third-party/tpcds-postgres,
+analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt,
+docs/wiki/modules/catalog.md) and was deliberately left untouched/
+uncommitted — only this loop's own files were staged and committed by
+explicit pathspec.
