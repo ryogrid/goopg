@@ -495,6 +495,20 @@ func (s *Server) handleShowAll(w *libpq.FrameWriter, sess *misc.SessionRegistry)
 	return w.ReadyForQuery()
 }
 
+// gucSetErrorFields unwraps a SET-time GUC validation error, splitting the
+// ERROR message from an attached HINT (e.g. an enum GUC's "Available
+// values: ..." list — postgres/src/backend/utils/misc/guc.c's PGC_ENUM
+// branch of set_config_option attaches this as a separate errhint(), not
+// baked into the primary message). Non-ValidationError failures pass their
+// Error() text through unchanged with no extra fields.
+func gucSetErrorFields(err error) (msg, hint string) {
+	var verr *misc.ValidationError
+	if errors.As(err, &verr) {
+		return verr.Msg, verr.Hint
+	}
+	return err.Error(), ""
+}
+
 // handleSet applies a SET / SET LOCAL statement. Body is the text after
 // the keyword: "name = value", "name TO value", or "name value".
 func (s *Server) handleSet(w *libpq.FrameWriter, sess *misc.SessionRegistry, body string, isLocal bool) error {
@@ -504,7 +518,11 @@ func (s *Server) handleSet(w *libpq.FrameWriter, sess *misc.SessionRegistry, bod
 			fmt.Sprintf("could not parse SET statement: %q", body))
 	}
 	if err := sess.Set(name, value, isLocal); err != nil {
-		return s.writeQueryError(w, errcodes.InvalidParameterValue, err.Error())
+		msg, hint := gucSetErrorFields(err)
+		if hint == "" {
+			return s.writeQueryError(w, errcodes.InvalidParameterValue, msg)
+		}
+		return s.writeQueryError(w, errcodes.InvalidParameterValue, msg, libpq.ErrorField{Code: libpq.FieldHint, Value: hint})
 	}
 	if err := w.WriteCommandComplete("SET"); err != nil {
 		return err

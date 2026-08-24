@@ -1,12 +1,14 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // utilitySettingsOp executes SHOW / SET / RESET statements inside the
@@ -22,6 +24,18 @@ type utilitySettingsOp struct {
 }
 
 func newUtilitySettingsOp(p *optimizer.Utility) *utilitySettingsOp { return &utilitySettingsOp{plan: p} }
+
+// execErrorFromGUCError wraps a SET-time validation error for the wire
+// protocol, preserving the HINT PostgreSQL attaches to some GUC failures
+// (e.g. an enum's "Available values: ..." list) instead of collapsing it
+// into the bare ERROR message.
+func execErrorFromGUCError(pos int, err error) *ExecError {
+	var verr *misc.ValidationError
+	if errors.As(err, &verr) {
+		return &ExecError{Code: "22023", Pos: pos, Message: verr.Msg, Hint: verr.Hint}
+	}
+	return &ExecError{Code: "22023", Pos: pos, Message: err.Error()}
+}
 
 func (o *utilitySettingsOp) Schema() optimizer.Schema { return o.plan.Output() }
 func (o *utilitySettingsOp) Open(ctx *Context) error {
@@ -103,7 +117,7 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SET is not supported in this executor context"}
 		}
 		if err := o.ctx.SetSetting(stmt.Name, stmt.Value, stmt.Local); err != nil {
-			return nil, &ExecError{Code: "22023", Pos: stmt.Pos(), Message: err.Error()}
+			return nil, execErrorFromGUCError(stmt.Pos(), err)
 		}
 		return nil, EOF
 	case *parser.ResetStmt:

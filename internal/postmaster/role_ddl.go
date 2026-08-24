@@ -82,7 +82,9 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		// NOLOGIN (postgres/src/backend/commands/user.c CreateRole).
 		// Explicit LOGIN/NOLOGIN below overrides.
 		attrs := catalog.RoleAttrs{CanLogin: strings.HasPrefix(norm, "create user "), ConnLimit: -1}
-		applyRoleAttrOptions(sql, norm, &attrs, resolveCurrent)
+		if err := applyRoleAttrOptions(sql, norm, name, &attrs, resolveCurrent); err != nil {
+			return true, err
+		}
 		if acting != "" {
 			if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
 				if err := checkCreateRolePrivileges(im, acting, attrs); err != nil {
@@ -138,7 +140,9 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 				attrs = cur
 			}
 		}
-		applyRoleAttrOptions(sql, norm, &attrs, resolveCurrent)
+		if err := applyRoleAttrOptions(sql, norm, name, &attrs, resolveCurrent); err != nil {
+			return true, err
+		}
 		if acting != "" && isInMem {
 			if err := checkAlterRoleAttrPrivileges(im, acting, norm); err != nil {
 				return true, err
@@ -308,6 +312,19 @@ func (s *Server) renameRole(name, newName string) error {
 		return roleAlreadyExistsErr(newName)
 	}
 	im, isInMem := s.cfg.Catalog.(*catalog.InMemory)
+	// MD5 secrets are salted with the role name (pg_md5_encrypt(password +
+	// rolname)), so a rename invalidates the stored verifier outright — PG
+	// clears rolpassword whenever the pre-rename secret is MD5-shaped
+	// (postgres/src/backend/commands/user.c RenameRole, "MD5 password
+	// cleared because of role rename" NOTICE — the NOTICE text itself is not
+	// yet wired to the wire protocol from this call site; ledgered
+	// M0134-0148, same gap as encryptRolePassword's WARNING).
+	clearMD5OnRename := isInMem
+	if clearMD5OnRename {
+		if a, ok := im.LookupRoleAttrs(name); !ok || a.CredType != 2 {
+			clearMD5OnRename = false
+		}
+	}
 	if isInMem && !im.RenameRole(name, newName) {
 		return roleDoesNotExistErr(name)
 	}
@@ -315,8 +332,17 @@ func (s *Server) renameRole(name, newName string) error {
 	delete(s.roles, name)
 	s.roles[strings.ToLower(newName)] = struct{}{}
 	s.rolesMu.Unlock()
+	if clearMD5OnRename {
+		if a, ok := im.LookupRoleAttrs(newName); ok {
+			a.CredType = 0
+			a.Secret = ""
+			im.SetRoleAttrs(newName, a)
+		}
+	}
 	if store, ok := s.cfg.UserStore.(*auth.MapUserStore); ok && store != nil {
-		if cred, found := store.Lookup(strings.ToLower(name)); found {
+		if clearMD5OnRename {
+			store.Remove(strings.ToLower(name))
+		} else if cred, found := store.Lookup(strings.ToLower(name)); found {
 			store.Set(strings.ToLower(newName), cred)
 			store.Remove(strings.ToLower(name))
 		}
@@ -353,7 +379,7 @@ func isReservedRoleName(name string) bool {
 // IN ROLE/ADMIN/ROLE/USER/SYSID (membership + the legacy numeric-OID clause)
 // remain unrecognised and ignored, matching the handler's historical
 // accept-and-ignore behaviour for options outside RoleAttrs' scope.
-func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs, resolveCurrent currentGUCResolver) {
+func applyRoleAttrOptions(sql, norm, role string, attrs *catalog.RoleAttrs, resolveCurrent currentGUCResolver) error {
 	if strings.Contains(norm, " nosuperuser") {
 		attrs.Superuser = false
 	} else if strings.Contains(norm, " superuser") {
@@ -390,27 +416,148 @@ func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs, resolveCur
 	if v, ok := extractRoleValidUntil(sql, norm); ok {
 		attrs.ValidUntil = v
 	}
-	if pw, kind, ok := extractRolePassword(sql, norm); ok {
-		switch kind {
-		case rolePasswordNull:
+	if pw, isNull, ok := extractRolePassword(sql, norm); ok {
+		if isNull {
 			attrs.CredType = 0
 			attrs.Secret = ""
-		case rolePasswordSCRAM:
-			attrs.CredType = 3
-			attrs.Secret = pw
-		case rolePasswordMD5:
-			attrs.CredType = 2
-			attrs.Secret = pw
-		default: // plaintext — shadow into a SCRAM verifier like PG's
-			// encrypt_password under password_encryption='scram-sha-256'.
-			sec, err := auth.NewSCRAMSecretWithIterations(pw, resolveScramIterations(resolveCurrent))
+		} else if passwordVerifiesEmpty(role, pw) {
+			// PG never stores a password that resolves to the empty string —
+			// libpq treats an empty password as "no password" and would never
+			// even attempt to authenticate with it, so storing one would
+			// silently lock the account for libpq clients while other
+			// clients might still try it (postgres/src/backend/commands/
+			// user.c CreateRole/AlterRole, "empty string is not a valid
+			// password" NOTICE — the NOTICE text itself is not yet wired to
+			// the wire protocol from this call site; ledgered M0134-0148).
+			attrs.CredType = 0
+			attrs.Secret = ""
+		} else {
+			secret, credType, err := encryptRolePassword(role, pw, resolveCurrent)
 			if err != nil {
-				return
+				return err
 			}
-			attrs.CredType = 3
-			attrs.Secret = sec.String()
+			attrs.CredType = credType
+			attrs.Secret = secret
 		}
 	}
+	return nil
+}
+
+// encryptRolePassword mirrors PostgreSQL's encrypt_password (postgres/src/
+// backend/libpq/crypt.c): a secret that already LOOKS like a real MD5 or
+// SCRAM-SHA-256 verifier (classifyPasswordSecret validates the exact shape,
+// not just a prefix) cannot be reversed, so it is stored verbatim regardless
+// of the target encryption; anything else is freshly hashed to whatever
+// password_encryption currently names. The over-512-byte guard mirrors
+// crypt.c's MAX_ENCRYPTED_PASSWORD_LEN check (out-of-line TOAST storage
+// would break pre-database-selection authentication). The MD5-deprecation
+// WARNING crypt.c also emits here is not yet wired to the wire protocol from
+// this call site — ledgered M0134-0148, same NOTICE-plumbing gap as the
+// empty-password case above.
+func encryptRolePassword(role, password string, resolveCurrent currentGUCResolver) (secret string, credType byte, err error) {
+	switch classifyPasswordSecret(password) {
+	case rolePasswordMD5:
+		secret, credType = password, 2
+	case rolePasswordSCRAM:
+		secret, credType = password, 3
+	default:
+		if strings.EqualFold(resolvePasswordEncryption(resolveCurrent), "md5") {
+			secret = auth.MD5Shadow(password, role)
+			credType = 2
+		} else {
+			sec, serr := auth.NewSCRAMSecretWithIterations(password, resolveScramIterations(resolveCurrent))
+			if serr != nil {
+				return "", 0, serr
+			}
+			secret = sec.String()
+			credType = 3
+		}
+	}
+	// The length cap applies uniformly — including to an already-encrypted
+	// secret stored verbatim — matching crypt.c's encrypt_password, which
+	// checks strlen(encrypted_password) AFTER either branch, not just the
+	// freshly-hashed one (out-of-line TOAST storage would break
+	// pre-database-selection authentication).
+	if len(secret) > 512 {
+		return "", 0, &roleError{
+			code:   errcodes.ProgramLimitExceeded,
+			msg:    "encrypted password is too long",
+			detail: "Encrypted passwords must be no longer than 512 bytes.",
+		}
+	}
+	return secret, credType, nil
+}
+
+// resolvePasswordEncryption reads the calling session's live
+// password_encryption GUC (postgres/src/backend/commands/user.c CreateRole/
+// AlterRole read Password_encryption when hashing a plaintext PASSWORD),
+// falling back to PG's own default ("scram-sha-256") whenever no
+// session/GUC is available.
+func resolvePasswordEncryption(resolveCurrent currentGUCResolver) string {
+	if resolveCurrent == nil {
+		return "scram-sha-256"
+	}
+	val, ok := resolveCurrent("password_encryption")
+	if !ok || val == "" {
+		return "scram-sha-256"
+	}
+	return val
+}
+
+// passwordVerifiesEmpty mirrors plain_crypt_verify(role, password, "", …)
+// as used by CreateRole/AlterRole's empty-password guard (postgres/src/
+// backend/libpq/crypt.c): it decides whether a user-supplied PASSWORD value
+// — plaintext OR already pre-encrypted — actually represents an empty
+// password, which PG refuses to store in any form.
+func passwordVerifiesEmpty(role, password string) bool {
+	switch classifyPasswordSecret(password) {
+	case rolePasswordMD5:
+		return password == auth.MD5Shadow("", role)
+	case rolePasswordSCRAM:
+		secret, err := auth.ParseSCRAMSecret(password)
+		if err != nil {
+			return false
+		}
+		return secret.VerifySCRAMSecretFromPassword("")
+	default:
+		return password == ""
+	}
+}
+
+// classifyPasswordSecret mirrors get_password_type (postgres/src/backend/
+// libpq/crypt.c): a secret is only "already encrypted" if it is a REAL MD5
+// hash (exactly "md5" + 32 lowercase-hex chars — a shape check, not a
+// prefix check) or a REAL SCRAM-SHA-256 verifier that fully parses
+// (iteration count, salt, and both 32-byte keys all well-formed). Anything
+// that merely looks like one of those shapes without actually being valid
+// (garbage trailing an "md5..." prefix, an "SCRAM-SHA-256$…" string with a
+// malformed body) is PLAINTEXT and gets freshly hashed, exactly like
+// upstream re-hashes a bogus lookalike instead of storing it verbatim.
+func classifyPasswordSecret(secret string) rolePasswordKind {
+	if isValidMD5PasswordHash(secret) {
+		return rolePasswordMD5
+	}
+	if _, err := auth.ParseSCRAMSecret(secret); err == nil {
+		return rolePasswordSCRAM
+	}
+	return rolePasswordPlain
+}
+
+// isValidMD5PasswordHash checks the exact MD5_PASSWD_LEN/MD5_PASSWD_CHARSET
+// shape from postgres/src/include/common/md5.h: "md5" followed by exactly
+// 32 lowercase hex digits. A prefix-only check (as this file used before)
+// misclassifies e.g. "md5012345678901234567890123456789zz" (trailing
+// garbage) as an already-encrypted secret instead of re-hashing it.
+func isValidMD5PasswordHash(secret string) bool {
+	if len(secret) != 35 || !strings.HasPrefix(secret, "md5") {
+		return false
+	}
+	for _, c := range secret[3:] {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveScramIterations reads the calling session's live scram_iterations
@@ -447,29 +594,33 @@ const (
 // extractRolePassword finds `[ENCRYPTED] PASSWORD 'secret'` (or PASSWORD
 // NULL) in a CREATE/ALTER ROLE statement. The keyword is located on the
 // normalised string; the literal's bytes are read from the ORIGINAL sql
-// (case-preserved), handling doubled-single-quote escapes.
-func extractRolePassword(sql, norm string) (secret string, kind rolePasswordKind, ok bool) {
+// (case-preserved), handling doubled-single-quote escapes. It does NOT
+// classify the secret's encryption shape — that is classifyPasswordSecret's
+// job (called by encryptRolePassword/passwordVerifiesEmpty), matching
+// PostgreSQL's separation of parsing the PASSWORD clause from
+// get_password_type's format sniffing.
+func extractRolePassword(sql, norm string) (secret string, isNull bool, ok bool) {
 	idx := strings.Index(norm, " password ")
 	if idx < 0 {
-		return "", 0, false
+		return "", false, false
 	}
 	rest := strings.TrimSpace(norm[idx+len(" password "):])
 	if rest == "null" || strings.HasPrefix(rest, "null ") || strings.HasPrefix(rest, "null;") {
-		return "", rolePasswordNull, true
+		return "", true, true
 	}
 	if !strings.HasPrefix(rest, "'") {
-		return "", 0, false
+		return "", false, false
 	}
 	// Locate the literal in the ORIGINAL sql: the first quote after the
 	// (case-insensitive) password keyword.
 	lowSQL := strings.ToLower(sql)
 	kw := strings.Index(lowSQL, "password")
 	if kw < 0 {
-		return "", 0, false
+		return "", false, false
 	}
 	open := strings.Index(sql[kw:], "'")
 	if open < 0 {
-		return "", 0, false
+		return "", false, false
 	}
 	start := kw + open + 1
 	// SQL single-quote escaping: '' inside the literal is a literal quote.
@@ -487,14 +638,7 @@ func extractRolePassword(sql, norm string) (secret string, kind rolePasswordKind
 		b.WriteByte(sql[i])
 		i++
 	}
-	secret = b.String()
-	switch {
-	case strings.HasPrefix(secret, "SCRAM-SHA-256$"):
-		return secret, rolePasswordSCRAM, true
-	case len(secret) == 35 && strings.HasPrefix(secret, "md5"):
-		return secret, rolePasswordMD5, true
-	}
-	return secret, rolePasswordPlain, true
+	return b.String(), false, true
 }
 
 // extractRoleConnLimit finds `CONNECTION LIMIT <n>` in a CREATE/ALTER ROLE

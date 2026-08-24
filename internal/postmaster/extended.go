@@ -555,7 +555,8 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 			return nil, &extendedQueryError{Code: errcodes.SyntaxError, Message: fmt.Sprintf("could not parse SET statement: %q", body)}
 		}
 		if err := sess.Set(name, value, true); err != nil {
-			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
+			msg, hint := gucSetErrorFields(err)
+			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: msg, Hint: hint}
 		}
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	// SET SESSION AUTHORIZATION name — track non-superuser role for privilege
@@ -586,7 +587,8 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 			return nil, &extendedQueryError{Code: errcodes.SyntaxError, Message: fmt.Sprintf("could not parse SET statement: %q", body)}
 		}
 		if err := sess.Set(name, value, false); err != nil {
-			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
+			msg, hint := gucSetErrorFields(err)
+			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: msg, Hint: hint}
 		}
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case upper == "RESET ALL":
