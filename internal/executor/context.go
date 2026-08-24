@@ -41,6 +41,26 @@ type Context struct {
 	// passes through here.
 	MaxRows int
 
+	// RoutineDepth counts nested stored-routine invocations currently on
+	// the Go call stack (executeStoredRoutine increments/decrements it
+	// around each call). A self-recursive SQL/PL/pgSQL function such as
+	// `create function infinite_recurse() ... as 'select infinite_recurse()'`
+	// would otherwise recurse through evalStoredRoutineFuncCall →
+	// executeSQLRoutine → optimizer.Plan/Build → evalFuncCall → ... forever,
+	// smashing the goroutine stack — a Go runtime "stack overflow" is a
+	// fatal, unrecoverable process crash, not a catchable panic, so it takes
+	// the whole server down with the client's connection. PostgreSQL instead
+	// polls the C stack pointer against max_stack_depth on every function
+	// call (check_stack_depth, postgres/src/backend/utils/misc/stack_depth.c)
+	// and raises 54001 "stack depth limit exceeded" once the runaway depth
+	// is detected — goopg has no C-stack-pointer equivalent to poll, so this
+	// counts logical call depth instead and raises the same SQLSTATE. Because
+	// executeSQLRoutine/executePLpgSQLRoutine each build their child Context
+	// via `*child = *ctx`, the running count is carried forward by value at
+	// every recursion level, exactly like a real stack depth would be.
+	// M0134-0131 (infinite_recurse.sql).
+	RoutineDepth int
+
 	// Mctx is the statement-level memory context (M0107-0001).
 	// Operators acquire child ExprContexts from it for per-row
 	// scratch; nil disables mctx-backed arena Datums (tests that

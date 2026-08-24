@@ -310,12 +310,31 @@ func routineArgTypesStr(r *catalog.Routine) string {
 	return strings.Join(names, ", ")
 }
 
+// maxRoutineCallDepth bounds nested stored-routine calls (Context.RoutineDepth)
+// to keep a self- or mutually-recursive SQL/PL/pgSQL function from smashing
+// the Go goroutine stack — see the Context.RoutineDepth doc comment. PG's
+// equivalent (check_stack_depth) trips at whatever depth the platform's
+// max_stack_depth GUC (default 2MB) permits, which in practice is on the
+// order of a few thousand nested calls for a simple recursive SQL function;
+// this cap is set in the same range, comfortably above any legitimate
+// recursion depth exercised by the regress suite (plpgsql_control.sql's
+// deepest test recurses well under 100 levels) while triggering long before
+// Go's default 1GB max goroutine stack is at risk.
+const maxRoutineCallDepth = 2000
+
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	// Procedures cannot be called via SELECT - only via CALL.
 	if r.IsProcedure {
 		return NullDatum, &ExecError{Code: "42809", Pos: pos,
 			Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, routineArgTypesStr(r)),
 			Hint:    "To call a procedure, use CALL."}
+	}
+	if ctx != nil {
+		ctx.RoutineDepth++
+		defer func() { ctx.RoutineDepth-- }()
+		if ctx.RoutineDepth > maxRoutineCallDepth {
+			return Datum{}, &ExecError{Code: "54001", Pos: pos, Message: "stack depth limit exceeded"}
+		}
 	}
 	// Cumulative function statistics (pgstat). When the calling session's
 	// track_functions GUC enables it, time the call and accumulate one
