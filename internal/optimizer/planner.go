@@ -12014,7 +12014,15 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 			name, _ := targetMeta(fc.Args[0], t)
 			return name, exprType(e)
 		}
-		return fc.Name, exprType(e)
+		// PostgreSQL's FigureColnameInternal uses only the function's own
+		// name (parse_target.c: strVal(llast(fc->funcname))), never any
+		// schema qualifier — e.g. pg_catalog.set_config(...) labels as
+		// "set_config", not "pg_catalog.set_config". M0134-0144.
+		label := fc.Name
+		if idx := strings.LastIndexByte(label, '.'); idx >= 0 {
+			label = label[idx+1:]
+		}
+		return label, exprType(e)
 	}
 	// CASE expression: PostgreSQL's FigureColname() tries ELSE first, then
 	// each WHEN result, then falls back to "case". M0097-0065.
