@@ -2726,44 +2726,12 @@ func parseLineLiteral(s string) (a, b, c float64, errOut *ExecError) {
 
 	// Two-point form (path_decode with opentype=true, npts=2): an optional
 	// '[' or (single/doubled) '(' wrapper, then two coordinate pairs.
-	depth := 0
-	if t[0] == '[' {
-		depth++
-		t = t[1:]
-	} else if t[0] == '(' {
-		cp := strings.TrimLeft(t[1:], " \t\n\r\v\f")
-		if cp != "" && cp[0] == '(' {
-			depth++
-			t = cp
-		} else if strings.Count(t, "(") == 1 {
-			depth++
-			t = cp
-		}
-	}
-
-	var pts [2][2]float64
-	for i := 0; i < 2; i++ {
-		x, y, rest, derr := linePairDecode(t)
-		if derr != nil {
-			return 0, 0, 0, fillMsg(derr)
-		}
-		t = rest
-		if t != "" && t[0] == ',' {
-			t = t[1:]
-		}
-		pts[i] = [2]float64{x, y}
-	}
-
-	for depth > 0 {
-		if t != "" && (t[0] == ')' || t[0] == ']') {
-			depth--
-			t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
-		} else {
-			return syntaxErr()
-		}
-	}
-	if t != "" {
-		return syntaxErr()
+	// M0134-0137: extracted to pathDecodeTwoPoints, shared with
+	// parseLsegLiteral (lseg_in uses this exact grammar, undecorated by any
+	// brace coefficient form).
+	pts, derr := pathDecodeTwoPoints(t)
+	if derr != nil {
+		return 0, 0, 0, fillMsg(derr)
 	}
 
 	if pts[0][0] == pts[1][0] && pts[0][1] == pts[1][1] {
@@ -2780,6 +2748,87 @@ func parseLineLiteral(s string) (a, b, c float64, errOut *ExecError) {
 // formatting. M0134-0136.
 func lineCanonicalText(a, b, c float64) string {
 	return fmt.Sprintf("{%s,%s,%s}", PGFloatOut(a, 64), PGFloatOut(b, 64), PGFloatOut(c, 64))
+}
+
+// pathDecodeTwoPoints implements path_decode's two-point-pair grammar
+// (postgres/src/backend/utils/adt/geo_ops.c path_decode, opentype=true,
+// npts=2): an optional '[' or (single/doubled) '(' wrapper, then two
+// coordinate pairs. Shared by parseLineLiteral's two-point form and
+// parseLsegLiteral (lseg_in uses this exact grammar with no coefficient
+// form of its own). Errors carry an empty Message for the generic
+// syntax-error case — the caller fills in its own type name — and a real
+// Message already set for the 22003 float8-overflow case (lineSingleDecode's
+// own text is type-agnostic). M0134-0137.
+func pathDecodeTwoPoints(s string) (pts [2][2]float64, errOut *ExecError) {
+	t := s
+	depth := 0
+	if t != "" && t[0] == '[' {
+		depth++
+		t = t[1:]
+	} else if t != "" && t[0] == '(' {
+		cp := strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		if cp != "" && cp[0] == '(' {
+			depth++
+			t = cp
+		} else if strings.Count(t, "(") == 1 {
+			depth++
+			t = cp
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		x, y, rest, derr := linePairDecode(t)
+		if derr != nil {
+			return pts, derr
+		}
+		t = rest
+		if t != "" && t[0] == ',' {
+			t = t[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if t != "" && (t[0] == ')' || t[0] == ']') {
+			depth--
+			t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		} else {
+			return pts, &ExecError{Code: "22P02"}
+		}
+	}
+	if t != "" {
+		return pts, &ExecError{Code: "22P02"}
+	}
+	return pts, nil
+}
+
+// parseLsegLiteral reproduces lseg_in's parsing (postgres/src/backend/utils/
+// adt/geo_ops.c lseg_in → path_decode(str, true, 2, &lseg->p[0], ...)) — the
+// same two-point grammar as parseLineLiteral's two-point form (bare/
+// parenthesized/bracketed "x,y,x,y"). Unlike line there is no "{A,B,C}"
+// coefficient form and no distinct-points check: lseg_in stores the two
+// points directly (statlseg_construct doesn't validate them at all), so
+// e.g. '[(1,1),(1,1)]' is a valid (degenerate) lseg. M0134-0137.
+func parseLsegLiteral(s string) (x1, y1, x2, y2 float64, errOut *ExecError) {
+	orig := s
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	pts, derr := pathDecodeTwoPoints(t)
+	if derr != nil {
+		msg := derr.Message
+		if msg == "" {
+			msg = fmt.Sprintf("invalid input syntax for type lseg: %q", orig)
+		}
+		return 0, 0, 0, 0, &ExecError{Code: derr.Code, Message: msg}
+	}
+	return pts[0][0], pts[0][1], pts[1][0], pts[1][1], nil
+}
+
+// lsegCanonicalText formats an lseg's two endpoints exactly as lseg_out
+// does — path_encode(PATH_OPEN, 2, ...) — "[(x1,y1),(x2,y2)]", each
+// coordinate via float8out's Ryu-based shortest-roundtrip formatting.
+// M0134-0137.
+func lsegCanonicalText(x1, y1, x2, y2 float64) string {
+	return fmt.Sprintf("[(%s,%s),(%s,%s)]", PGFloatOut(x1, 64), PGFloatOut(y1, 64), PGFloatOut(x2, 64), PGFloatOut(y2, 64))
 }
 
 // evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
@@ -11831,6 +11880,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// same parseLineLiteral.
 				_, _, _, lerr := parseLineLiteral(v)
 				return NewBoolDatum(lerr == nil), nil
+			case "lseg":
+				// M0134-0137: agrees with the column-coercion path, same
+				// parseLsegLiteral.
+				_, _, _, _, lerr := parseLsegLiteral(v)
+				return NewBoolDatum(lerr == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
@@ -13062,6 +13116,35 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					slope := lineSlope(p1[0], p1[1], p2[0], p2[1])
 					la, lb, lc := lineConstruct(p1[0], p1[1], slope)
 					return NewStringDatum(lineCanonicalText(la, lb, lc)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "lseg":
+		// lseg(point, point) → lseg "[(x1,y1),(x2,y2)]" — lseg_construct /
+		// statlseg_construct in geo_ops.c: unlike line_construct_pp, this
+		// stores the two points directly with no distinct-points check.
+		// M0134-0137.
+		if len(x.Args) == 2 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			bv, berr := evalExprSlot(x.Args[1], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if berr != nil {
+				return Datum{}, berr
+			}
+			if av.IsNull() || bv.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			bs, bok := datumAsString(bv)
+			if aok && bok {
+				p1, ok1 := parsePointText(as)
+				p2, ok2 := parsePointText(bs)
+				if ok1 && ok2 {
+					return NewStringDatum(lsegCanonicalText(p1[0], p1[1], p2[0], p2[1])), nil
 				}
 			}
 		}

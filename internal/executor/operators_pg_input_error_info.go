@@ -174,6 +174,13 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = lerr.Message
 			sqlCode = lerr.Code
 		}
+	case "lseg":
+		// lseg: agrees with the column-coercion path, same parseLsegLiteral.
+		// M0134-0137.
+		if _, _, _, _, lerr := parseLsegLiteral(v); lerr != nil {
+			message = lerr.Message
+			sqlCode = lerr.Code
+		}
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)

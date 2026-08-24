@@ -310,6 +310,16 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			return "", lerr
 		}
 		s = lineCanonicalText(la, lb, lc)
+	} else if tname == "lseg" {
+		// lseg: validate + canonicalize on assignment, mirroring lseg_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box/circle/line above — but lseg_in has no coefficient
+		// form and no distinct-points check (unlike line). M0134-0137.
+		x1, y1, x2, y2, lerr := parseLsegLiteral(s)
+		if lerr != nil {
+			return "", lerr
+		}
+		s = lsegCanonicalText(x1, y1, x2, y2)
 	} else if tname == "inet" || tname == "cidr" {
 		// inet/cidr: validate + canonicalize on assignment, mirroring PG's
 		// network_in/network_out (postgres/src/backend/utils/adt/network.c),
