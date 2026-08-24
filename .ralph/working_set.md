@@ -1,120 +1,122 @@
-Task just completed: M0134-0136 (line.sql) — CONTAINED fix shipped, PARKED.
-diff 754 lines (0% parity) → 55 lines, 0 residual `^ERROR`/`^-ERROR`
-mismatches (all remaining diff is the already-ledgered box/circle-shared
-psql LINE-echo gap). Committed and pushed.
+Task just completed: M0134-0139 (macaddr8.sql) — CONTAINED fix shipped, PARKED.
+diff 420 lines (0% parity) → 29 lines, 2 residual `^+ERROR` (both the
+already-ledgered btree-opclass-generality gap). Committed and pushed.
 
-What landed: `parseLineLiteral` (`internal/executor/expr.go`) — faithful
-port of PG's `line_in`/`line_decode`/`path_decode`/`line_construct`/
-`point_sl` (`geo_ops.c:950-1130`), both the `{A,B,C}` brace form and the
-two-point form, with SQLSTATE-differentiated float8-overflow (22003 vs
-generic 22P02) and line_in's two semantic messages ("A and B cannot both be
-zero" / "must be two distinct points"). Wired into `coerceTextLikeDatum`
-(codec.go), `evalTypedStringLit` (`line '...'`), `pg_input_is_valid`/
-`pg_input_error_info`, and a new `line(point,point)` constructor function.
-Also added `point`/`line` to the parser's `tryTypedLiteral` keyword
-whitelist (`internal/parser/select.go`) — this was a parser-wide gap
-(`point '(x,y)'` didn't parse as an expression at all, not just inside a
-function call); verified no regression on box.sql/circle.sql/point.sql/
-lseg.sql.
+What landed: `parseMacaddr8Literal` (`internal/executor/expr.go`) — a
+faithful port of `macaddr8_in` (`mac8.c:96-232`), structurally different
+from `macaddr_in`'s 7-format sscanf cascade: a single greedy scanner reading
+exactly 2 hex digits per byte, tracking one optional consistent separator
+(`:`/`-`/`.`), accepting 6 or 8 bytes with 6-to-8 EUI-64 auto-widening
+(FF/FE inserted as the 4th/5th octets). Sizing also surfaced a previously-
+unknown, second gap `macaddr.sql` never exercised: `::macaddr`/`::macaddr8`
+CAST were BOTH unvalidated pass-throughs in `evalCast` (no case existed for
+either target — confirmed live, `evalCast`'s trailing `return d, nil`
+silently accepted garbage). Fixed both directions via new
+`macaddr8ToMacaddrOctets`/`macaddrToMacaddr8Octets` helpers (port
+`macaddr8tomacaddr`/`macaddrtomacaddr8`, mac8.c:523-566). Wired into
+column-assignment coercion (codec.go), `pg_input_is_valid`/
+`pg_input_error_info`, `~`/`&`/`|` bitwise ops and `trunc()` (tried after the
+6-octet macaddr form in each shared dispatch site), new `macaddr8_set7bit()`
+function. Confirmed no regression on macaddr.sql(33)/box.sql(722)/
+circle.sql(51)/line.sql(55)/lseg.sql(27)/point.sql(531)/inet.sql(1298). New
+test `internal/executor/macaddr8_literal_test.go` (3 subtests, all PASS).
 
-Design `docs/design/m0134-0136-line-typed-literal.md`, indexed in
-README.md. Ledger row: `.ralph/deferral_ledger.md` 2026-08-24 M0134-0136
-(residual gap: coerceTextLikeDatum never threads ExecError.Pos through to
-callers, so psql's client-side "LINE N: ...\n  ^" echo never fires for
-box/circle/line/inet/bit(n) literal-validation errors raised during INSERT
-VALUES evaluation — cross-cutting, touches every coerceTextLikeDatum call
-site across INSERT/UPDATE/COPY, out of scope for this slice).
+Design `docs/design/m0134-0139-macaddr8-cast-and-literal.md`, indexed in
+README.md. Ledger row: `.ralph/deferral_ledger.md` 2026-08-24 M0134-0139
+(residual gap #1 = same coerceTextLikeDatum Pos-threading LINE-echo gap as
+M0134-0136/-0137/-0138; residual gap #2 = btree v0 opclass generality on
+macaddr8, already tracked under M0134-0060/-0067/-0138's ledger rows, not
+newly discovered here).
 
 NEXT LOOP: per the Current Priority banner, continue M0134 top-to-bottom —
-next unworked item is **M0134-0137 (`lseg.sql`)**. Size it live first per
-the established pattern. Strong prior: this is the SAME geometry
-type-system family as box/circle/line — `lseg_in`-faithful parsing
-(`lseg.c` equivalent in geo_ops.c) is likely the same shape of contained
-fix (a `parseLsegLiteral` mirroring `parseLineLiteral`'s two-point-form
-logic almost exactly, since LSEG's on-disk form IS a two-point pair with
-no coefficient form). Check `pg_input_error_info('[(1,2),(3)]', 'lseg')`
-from this loop's own `lseg.sql` probe run (see below) — it already showed
-`invalid input syntax for type lseg: "[(1,2),(3)]"` as the expected PG
-message, confirming lseg_in also needs a dedicated validator.
+next unworked item is **M0134-0140 (`maintain_every.sql`)**. Size it live
+first (scripts/pg-regress-runner.sh --verbose maintain_every). No strong
+prior — unrelated to the geometry/network-address-family cluster just
+closed (box/circle/line/lseg/point/inet/macaddr/macaddr8, 8 files in a row);
+expect a fresh root-cause investigation.
 
-Standing recommendation, carried across several loops (unchanged this loop
-except appending #17 for line.sql's residual Pos-threading gap):
-1. GIN/GiST/SPGiST physical-index plan integration (confirmed across THREE
-   files: gin.sql, create_index_spgist.sql, gist.sql) — every predicate on
+Standing recommendation, carried across several loops (unchanged this loop):
+1. GIN/GiST/SPGiST physical-index plan integration — every predicate on
    these three index AMs EXPLAINs Seq Scan not Index/Index-Only Scan
    because the AM is catalog-only. Strongest candidate for a dedicated
    milestone.
-2. Geometry type-system gap — box (M0134-0094 DONE)/circle (M0134-0098
-   DONE)/line (M0134-0136 DONE, this loop) are now `*_in`-faithful; point/
-   lseg/path/polygon still raw-varlena pass-through. **lseg.sql (0137) is
-   the natural next pickup, same template.** Operator lexer family (`?-`,
-   `?|`, `@@`, `#`, `<->`, `<@`, `@>`, etc.) still entirely unlexed —
-   box.sql/circle.sql/geometry.sql/gist.sql shared blocker, resume points
-   in `docs/design/m0134-0125-geometry-sizing.md`.
-3. LANGUAGE C dynamic-extension loading gap — recurs across M0134-0106,
+2. btree v0 opclass generality (`internal/executor/operators_ddl.go:15810`
+   `isSupportedBTreeKeyType` + `btree_scalar_keys.go`) — NOW CONFIRMED a
+   FIFTH time (M0134-0060/-0067/-0138/this-loop's macaddr8.sql), hard-codes
+   a fixed type set with no generic per-type comparator dispatch. Strong
+   candidate for a dedicated milestone alongside item 1.
+3. Geometry type-system gap — box/circle/line/lseg now `*_in`-faithful;
+   path/polygon still raw-varlena pass-through. geometry.sql (M0134-0125)
+   remains blocked on the unlexed geometric operator family.
+4. LANGUAGE C dynamic-extension loading gap — recurs across M0134-0106,
    -0116, -0120, -0129, create_operator/create_type adjacent files.
-4. Collation-execution-registry gap recurs across FIVE parked files
+5. Collation-execution-registry gap recurs across FIVE parked files
    (M0134-0099/-0100/-0101/-0102).
-5. BETWEEN-vs-comparison-operator precedence bug (M0134-0113) — silently
+6. BETWEEN-vs-comparison-operator precedence bug (M0134-0113) — silently
    wrong for ANY query today, cross-cutting.
-6. RAISE INFO/LOG/DEBUG collapse to hardcoded NOTICE wire severity
+7. RAISE INFO/LOG/DEBUG collapse to hardcoded NOTICE wire severity
    (M0134-0113, ~18 call sites in plpgsql_runtime.go).
-7. `::json` cast DETAIL/CONTEXT truncation text (json_errdetail port) —
+8. `::json` cast DETAIL/CONTEXT truncation text (json_errdetail port) —
    M0134-0120, unfixed.
-8. pg_shdepend-shaped object-enumeration/CASCADE engine — CONFIRMED A
+9. pg_shdepend-shaped object-enumeration/CASCADE engine — CONFIRMED A
    THIRD TIME (M0134-0124), after M0134-0117/-0118. Single most-recurring
    blocker across M0134; strong candidate for its own milestone. Resume:
-   `catalog.InMemory.RoleDropDependencyDescriptions`
-   (`internal/catalog/catalog.go`).
-9. `CREATE CONVERSION`-registered procs never consulted by convert_from/
-   convert_to (M0122-0008, M0134-0121).
-10. DDL-event-trigger firing engine + `session_replication_role` GUC
-    (M0134-0122/-0123) — second-most-recurring blocker.
-11. `NonSuperuserRole != ""` "is superuser" convention is wrong for any
-    non-"postgres"-named `CREATE ROLE ... SUPERUSER` role — worth a
-    dedicated sweep.
-12. inet.sql (M0134-0130) left 11 pg_proc-seeded-but-undispatched scalar
-    functions — low-effort follow-on wiring in evalFuncCall, following
-    evalHashFunc's pattern exactly.
-13. pg_init_privs (M0134-0132) is a reconstruction, not a real bootstrap
-    snapshot — resume point is a `c.initPrivs` one-time snapshot map.
-14. json_encoding.sql (M0134-0133) surrogate-pair/NUL-escape validation —
-    the M0134-0134 lexer (jsonpath_encoding.go) can close it.
-15. jsonpath's own grammar is entirely unimplemented — M0134-0134 only
-    fixed string-escape lexing. REFACTOR-tier, own milestone.
+   `catalog.InMemory.RoleDropDependencyDescriptions`.
+10. `CREATE CONVERSION`-registered procs never consulted by convert_from/
+    convert_to (M0122-0008, M0134-0121).
+11. DDL-event-trigger firing engine + `session_replication_role` GUC
+    (M0134-0122/-0123).
+12. `NonSuperuserRole != ""` "is superuser" convention is wrong for any
+    non-"postgres"-named `CREATE ROLE ... SUPERUSER` role.
+13. inet.sql (M0134-0130) left 11 pg_proc-seeded-but-undispatched scalar
+    functions — low-effort follow-on wiring in evalFuncCall.
+14. pg_init_privs (M0134-0132) is a reconstruction, not a real bootstrap
+    snapshot.
+15. jsonpath's own grammar is entirely unimplemented — REFACTOR-tier, own
+    milestone.
 16. Full PostgreSQL Large Object facility (M0134-0135) — entirely
     unimplemented, own milestone candidate.
-17. **NEW this loop**: `coerceTextLikeDatum` (codec.go) never threads
-    `ExecError.Pos` through to its callers, so psql's client-side
-    "LINE N: ...\n  ^" echo never fires for box/circle/line/inet/bit(n)
-    literal-validation errors raised during INSERT VALUES evaluation
-    (residual diff on box.sql/circle.sql/line.sql, all M0134 park cases).
-    Cross-cutting, touches every INSERT/UPDATE/COPY call site — resume
-    point in `.ralph/deferral_ledger.md` 2026-08-24 M0134-0136.
+17. `coerceTextLikeDatum` (codec.go) never threads `ExecError.Pos` through
+    to its callers, so psql's client-side "LINE N: ...\n  ^" echo never
+    fires for box/circle/line/lseg/macaddr/macaddr8/inet/bit(n) literal-
+    validation errors raised during INSERT VALUES evaluation. Cross-cutting,
+    touches every INSERT/UPDATE/COPY call site.
+18. Geometry-family `*_in` closure now covers box/circle/line/lseg (4/6 core
+    geo types). path/polygon remain raw-varlena pass-through.
+19. Network-address-family `*_in` closure now covers inet/cidr/macaddr/
+    macaddr8 — ALL FOUR network types now have real validation. This
+    cluster is CLOSED as a recurring item.
+20. `evalCast`'s catch-all `return d, nil` (unknown-type pass-through) has
+    now been shown to hide real validation gaps twice (macaddr/macaddr8) —
+    worth a systematic audit of which type names still fall through it
+    silently rather than raising 42704/22P02.
 
-Gates run this loop: go build ./... PASS; scripts/pg-regress-runner.sh
-line 754→55 diff lines, 0 ^ERROR/^-ERROR (sizing + fix verified live);
-scripts/pg-regress-runner.sh box/circle/point/lseg re-checked for
-regression, all held steady or improved slightly (box 738→722, circle 51
-unchanged, point/lseg unchanged); make regen-testport PASS; make
+Gates run this loop: go build ./... PASS; go test -run TestMacaddr8
+./internal/executor/ PASS (3 subtests); scripts/pg-regress-runner.sh
+macaddr8 420→29 diff lines, 2 `^+ERROR` (both pre-existing, sizing +
+fix verified live); scripts/pg-regress-runner.sh macaddr/box/circle/line/
+lseg/point/inet re-checked for regression, all held steady
+(33/722/51/55/27/531/1298); make regen-testport PASS; make
 check-testport-inventory PASS; RALPH_PRECOMMIT_SCOPE=units
 scripts/ralph-precommit-test.sh PASS (all packages); scripts/tpch-spotcheck.sh
-PASS (Q12=2 rows 17.97s, Q13=35 rows 8.68s, 26.7s query-phase wall);
-pre-commit hook's pgbench smoke ran automatically at commit time (see
-commit for result); make ralph-state-guard: TBD (run before finishing).
+PASS (Q12=2 rows 18.46s, Q13=35 rows 7.92s, 28.6s query-phase wall);
+pre-commit hook's pgbench smoke ran automatically at commit time and PASSED
+(339 TPS simple-update, 12520 TPS select-only — both "0 failed"); make
+ralph-state-guard: ran, PASS.
 
 In-flight: none.
 
 Note: a concurrent peer session's WIP was present in the tree again this
-loop (.ralph/progress.json, .ralphrc, analysis/*, ci/logs/launch.log,
-ci/logs/scheduler.log, docs/wiki/*, internal/executor/
-operators_recursive_cte.go, postgres (untracked convenience directory/
-symlink), third-party/tpcds-postgres, plus untracked files
-analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt,
-docs/wiki/modules/catalog.md) and was deliberately left untouched/
-uncommitted — only this loop's own files were staged and committed by
-explicit pathspec.
+loop (.ralph/progress.json, .ralphrc, analysis/deferral-ledger-summary-*,
+ci/logs/launch.log, ci/logs/scheduler.log, docs/wiki/getting-started.md,
+docs/wiki/modules/catalog.md, internal/executor/operators_recursive_cte.go,
+postgres (untracked convenience symlink), third-party/tpcds-postgres,
+dl_summary_session.txt, docs/test-port/upstream-isolation-coverage.md,
+docs/test-port/upstream-tap-coverage.md) and was deliberately left
+untouched/uncommitted — only this loop's own files were staged and
+committed by explicit pathspec.
 
-M-NIGHTLY: re-checked at loop start — `ci/logs/action-items.md` run
-20260824-013441 (2 items) is the same run ID prior loops already confirmed
-filed in fix_plan.md; nothing new to file this loop.
+M-NIGHTLY: re-checked at loop start — `ci/logs/action-items.md`'s 2 items
+(20260824-013441-001/-002) were already filed in fix_plan.md by a prior
+loop (confirmed via grep, "Nightly run 20260824-013441 ... filed
+2026-08-24" section present); nothing new to file this loop.
