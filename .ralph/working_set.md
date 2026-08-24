@@ -92,8 +92,7 @@ go build ./... PASS; go test ./internal/optimizer/... ./internal/executor/...
 (targeted + full package) PASS; RALPH_PRECOMMIT_SCOPE=units
 scripts/ralph-precommit-test.sh PASS (all packages); scripts/tpch-spotcheck.sh
 PASS (Q12=2 rows, Q13=35 rows, 35.3s wall); make check-testport-inventory
-PASS; make regen-testport PASS; make ralph-state-guard: TODO — run before
-final commit.
+PASS; make regen-testport PASS; make ralph-state-guard: found the same benign stale clean-exit-marker status/progress mismatch as prior loops, auto-repaired to progress=in_progress; pre-commit hook's pgbench smoke ran automatically at commit time — PASS (337/623/12657 TPS across the 3 pgbench transaction types). Commit 74b698c1, pushed to origin/regress-renumbering.
 
 In-flight: none.
 
