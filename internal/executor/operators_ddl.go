@@ -24394,6 +24394,28 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				o.ctx.PendingCreatedComposites[strings.ToLower(s.Name)] = true
 			}
 		} else {
+			// Bare shell form (`CREATE TYPE name;`, HasOptions==false): PG's
+			// DefineType (typecmds.c ~236-266) always errors 42710 "already
+			// exists" if any type of that name (shell or fully defined) is
+			// already registered — CREATE TYPE never silently re-creates an
+			// existing shell. The option-list form (`CREATE TYPE name (input
+			// = ..., ...)`, HasOptions==true) is intentionally NOT given the
+			// mirror-image "errors if no shell exists yet" check here: goopg
+			// has no CREATE FUNCTION-triggered auto-shell side effect (PG's
+			// TypeShellMake call from parse_type.c's typenameType lookup
+			// failure), so several of this file's own base types (`widget`,
+			// `city_budget`, `base_type`) reach this form with no real
+			// pre-existing shell in goopg's registry despite being valid,
+			// shell-first-created types in the oracle; enforcing the
+			// pre-existing-shell requirement here would turn "does not
+			// exist" false negatives into false positives that break these
+			// types outright for the rest of the file. M0134-0116.
+			if !s.HasOptions {
+				if existing := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid); existing != nil {
+					return &ExecError{Code: "42710", Pos: s.Pos(),
+						Message: fmt.Sprintf("type %q already exists", s.Name)}
+				}
+			}
 			cat.RegisterCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 			if ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid); ct != nil {
 				ct.Owner = o.currentDDLOwnerOID()

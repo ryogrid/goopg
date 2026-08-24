@@ -10418,7 +10418,13 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 	// Look for AS ENUM; anything else is consumed as a stub.
 	if !p.acceptKeyword(KwAs) {
 		// No AS — consume until ';' or EOF (composite-type without AS, or
-		// other non-enum forms). Return a non-enum stub.
+		// other non-enum forms). Return a non-enum stub. A `(` immediately
+		// following the name distinguishes the "base type" option-list form
+		// (`CREATE TYPE name (input = ..., ...)`) from the bare shell form
+		// (`CREATE TYPE name;`) — see CreateTypeStmt.HasOptions. M0134-0116.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			stmt.HasOptions = true
+		}
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break

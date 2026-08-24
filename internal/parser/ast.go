@@ -3852,6 +3852,16 @@ type CreateTypeStmt struct {
 	// qualification dropped). Empty means "use the subtype's own default
 	// collation" (or InvalidOid for a non-collatable subtype).
 	RangeCollationName string
+	// HasOptions marks the "base type" stub form `CREATE TYPE name (opt =
+	// val, ...)` — as opposed to the bare shell form `CREATE TYPE name;`
+	// with no parenthesized option list. PG's DefineType (typecmds.c
+	// ~236-278) treats these two spellings differently for duplicate/
+	// missing-shell detection: a bare `CREATE TYPE name;` always errors
+	// 42710 "already exists" if any type (shell or fully defined) of that
+	// name is present, while `CREATE TYPE name (...)` errors 42710 "does
+	// not exist" (with a shell-first hint) if no shell is present yet, or
+	// silently fills in an existing shell. M0134-0116.
+	HasOptions bool
 }
 
 func (s *CreateTypeStmt) Pos() int  { return s.pos }
