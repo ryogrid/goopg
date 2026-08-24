@@ -1920,7 +1920,21 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 			return NewBoolDatum(evalArraySetOp(op, ls, rs)), nil
 		}
 		aur, all, aok := parseBoxText(ls)
+		if !aok {
+			// point <@ box (point_box.c: on_pb / box_contain_pt dispatch by
+			// operand type; goopg has no separate point/box Datum kinds, so
+			// fall back from box-vs-box to a degenerate box{pt,pt} when the
+			// left operand parses as a bare point instead. M0134-0111.
+			if pt, pok := parsePointText(ls); pok {
+				aur, all, aok = pt, pt, true
+			}
+		}
 		bur, bll, bok := parseBoxText(rs)
+		if !bok {
+			if pt, pok := parsePointText(rs); pok {
+				bur, bll, bok = pt, pt, true
+			}
+		}
 		if !aok || !bok {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s: invalid box value", op)}
 		}
@@ -13291,6 +13305,19 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				start = 0
 			}
 			return NewStringDatum(string(runes[start:])), nil
+		}
+	case "starts_with":
+		// starts_with(text, prefix) → bool (varlena.c text_starts_with,
+		// pg_proc oid 3696). Registered in the catalog but had no evaluator
+		// — every call fell through to the "function does not exist" 42883
+		// default below. M0134-0111.
+		if len(x.Args) == 2 {
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			p, e2 := evalExprSlot(x.Args[1], slot, ctx)
+			if e1 != nil || e2 != nil || s.IsNull() || p.IsNull() {
+				return NullDatum, nil
+			}
+			return NewBoolDatum(strings.HasPrefix(s.StringValue(), p.StringValue())), nil
 		}
 	case "reverse":
 		if len(x.Args) == 1 {

@@ -1,31 +1,41 @@
-Task just completed: M0134-0109 (create_am.sql) — sized live against PG
-18.3 oracle: PARKED (case genuinely `failed`, 0% parity).
+Task just completed: M0134-0111 (create_index_spgist.sql) — sized live
+against PG 18.3 oracle: PARKED (case genuinely `failed`, diff 1576→1516
+lines / 0% parity).
 
-Landed one contained fix:
-`CREATE ACCESS METHOD ... HANDLER <builtin>` (gisthandler, heap_tableam_handler,
-bthandler, hashhandler, ginhandler, spghandler, brinhandler) raised a false
-42883 "function does not exist" even though all 7 are seeded pg_proc rows —
-`resolveAccessMethodHandlerFunc` (internal/executor/operators_ddl.go) only
-searched `catalog.Routines()` (the CREATE FUNCTION registry); goopg has no
-pluggable-storage-engine registry so built-ins were never in it. Added a
-small leaf-package `builtinAMHandlerFuncs` name->{OID,AMType} table as a
-fallback (same import-cycle-driven duplication pattern as
-pg_proc_names_generated.go). Verified all 6 positive/negative
-handler-resolution lines byte-for-byte against create_am.out.
+Landed two contained fixes:
+1. `point <@ box` / `box @> point` containment (internal/executor/expr.go,
+   the `parser.OpContainedBy`/`OpContains`/`OpOverlap` arm from M0097-0023)
+   only ever attempted box-vs-box parsing (`parseBoxText` both sides) — a
+   bare point operand always hard-errored "invalid box value", even in the
+   file's pure-seqscan section that needs no index. Fixed via a
+   `parsePointText` fallback (treat point as degenerate box, equal corners
+   — existing containment formulas need no further branching).
+2. `starts_with(text, text)` (pg_proc oid 3696) — catalog-registered
+   (isKnownBuiltinFunction) but zero `evalFuncCall` dispatch arm; added
+   beside the existing `left`/`right` cases.
 
-CSV row (create_am.sql) flipped not-tried -> failed via `make regen-testport`
-(genuinely failed, stays not-pass-required). Design doc
-docs/design/m0134-0109-create-am-handler-resolution.md, README.md indexed.
-fix_plan.md M0134-0109 marked [x] PARKED. Ledger row appended
-(.ralph/deferral_ledger.md, M0134-0109): CREATE TABLE/MATERIALIZED VIEW
-... USING <am> has ZERO parser support at all (syntax error), plus
-ALTER TABLE/MATVIEW SET ACCESS METHOD, default_table_access_method
-enforcement, partitioned-table AM inheritance, AM pg_depend tracking, and
-a real opclass over the excluded GiST AM — multi-milestone storage-
-pluggability feature, correctly out of contained-fix scope.
+Both covered by new unit tests: internal/executor/geometry_containment_test.go
+(TestEvalPointBoxContainment), internal/executor/starts_with_test.go
+(TestEvalStartsWith).
+
+Design docs/design/m0134-0111-create-index-spgist-sizing.md, README.md
+indexed. fix_plan.md M0134-0111 marked [x] PARKED. Ledger row appended
+(.ralph/deferral_ledger.md, M0134-0111): two independent multi-file gaps
+left the case at 0% parity —
+(a) the operator lexer (internal/parser/lexer.go:548-575) only recognizes a
+    hardcoded 2/3-char operator whitelist, not PG's real graphic-operator-
+    char grammar (scan.l), so `<<|`, `|>>`, `~=`, `~<~`, `~<=~`, `~>=~`,
+    `~>~`, `^@` all fail as syntax errors — SYSTEMIC, not SP-GiST-specific;
+    likely affects other already-parked/not-tried M0134 cases too (not yet
+    swept).
+(b) SP-GiST (internal/executor/amutils.go, operators_ddl.go:7537-7543) is
+    catalog-metadata-only, same class as GiST/BRIN — zero physical
+    quad-tree/kd-tree/radix-tree storage anywhere, so every
+    indexscan/bitmapscan EXPLAIN plan in the file diverges to Seq Scan.
 
 NEXT LOOP: per the Current Priority banner in .ralph/fix_plan.md, continue
-M0134 top-to-bottom — next unworked item is **M0134-0110**.
+M0134 top-to-bottom — next unworked item is **M0134-0112
+(create_misc.sql)**.
 
 Standing recommendation (carried across several loops, still open):
 1. brin_summarize_range/brin_desummarize_range unimplemented, blocks 3 files
@@ -39,31 +49,28 @@ Standing recommendation (carried across several loops, still open):
    template a future loop could generalize to cmin/cmax/xmin/xmax.
 5. LANGUAGE C dynamic-extension-loading gap (M0134-0106) — no C-extension
    loader exists anywhere in goopg.
-6. EUC_JP/UTF8 (and likely other EUC_*/SJIS/BIG5/GBK pairs) real Unicode
-   mapping tables are unported (~11k lines of upstream .map data,
-   M0134-0107) — structural-only validators are landed but genuine
-   non-ASCII round-trip conversion is not.
-7. `CREATE TABLE ... USING <am>` (table-AM selection clause) has zero
-   parser support anywhere (NEW this loop, M0134-0109) — a future
-   table/index-AM-pluggability milestone would need: parser grammar for
-   USING on CREATE TABLE/CREATE TABLE AS/CREATE MATERIALIZED VIEW,
-   ALTER TABLE/MATVIEW SET ACCESS METHOD as a new AlterTable subcommand,
-   default_table_access_method GUC enforcement, and relam/pg_depend
-   plumbing at table-creation time.
+6. EUC_JP/UTF8 real Unicode mapping tables unported (M0134-0107).
+7. `CREATE TABLE ... USING <am>` has zero parser support (M0134-0109).
+8. `::` cast evaluator never consults pg_cast for user-defined casts
+   (M0134-0110).
+9. NEW this loop (M0134-0111): the operator-lexer whitelist gap
+   (internal/parser/lexer.go:548-575, hardcoded 2/3-char switch instead of
+   PG's general graphic-operator-char grammar) is itself a template gap
+   worth a future dedicated milestone — likely blocks other not-yet-sized
+   M0134 cases that use non-whitelisted operator spellings (not spot-checked
+   against other parked/not-tried rows yet).
 
-Gates run: go build ./... clean; go test ./internal/catalog/...
-./internal/executor/... PASS; RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh PASS (all unit packages, ~440s cold
+Gates run: go build ./... clean; go test ./internal/executor/...
+./internal/parser/... PASS (new TestEvalPointBoxContainment,
+TestEvalStartsWith green); RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh PASS (all unit packages, ~458s cold
 internal/initdb run — toolchain/branch state, not a regression); make
-regen-testport clean (had to fix a stray comma in my own CSV rationale
-text that broke the field count — caught by check-testport-inventory);
-make check-testport-inventory PASS; make ralph-state-guard PASS
-(auto-repaired the same benign stale status/progress running-vs-completed
-mismatch seen in prior loops, then confirmed consistent). Pre-commit
-hook's pgbench smoke will run automatically at commit time (mandatory,
-never bypassed).
+regen-testport clean; make check-testport-inventory PASS; make
+ralph-state-guard PASS (auto-repaired the same benign stale
+running-vs-completed status/progress mismatch seen in prior loops, then
+confirmed consistent). Pre-commit hook's pgbench smoke runs automatically at
+commit time — mandatory, never bypassed.
 
-In-flight: none. Throwaway test server (/tmp/amtest-data, port 5533,
-GOOPG_CG_UNIT=amtest) was stopped cleanly via `goopg stop` before commit —
-verified no orphan process remains (only a shell-snapshot subprocess
-matched the grep, not a goopg server).
+In-flight: none. No throwaway test servers were started this loop (sizing
+used scripts/pg-regress-runner.sh's own managed throwaway cluster, which
+cleans itself up).

@@ -1308,7 +1308,7 @@ had just landed). Item -002 is a repeat of the already-open
 AI-20260822-001356-003 row above (see that row's update). Triage each per the
 M-NIGHTLY selection rule before working (re-run the repro at HEAD first).
 
-- [ ] **units/internal/executor —
+- [x] **units/internal/executor —
       TestRecursiveUnionCapsRunawaySingleIteration nil-deref (AI-20260824-013441-001)**
       — new tonight: `go test -timeout 10m ./internal/executor/` panicked
       (SIGSEGV, nil pointer) inside `(*recursiveUnionOp).Next`
@@ -1316,21 +1316,23 @@ M-NIGHTLY selection rule before working (re-run the repro at HEAD first).
       `o.ctx.Ctx.Err()`) while running
       `TestRecursiveUnionCapsRunawaySingleIteration`
       (`operators_recursive_cte_iteration_cap_test.go`, added by M0134-0086,
-      commit `8de8ab80`). **Investigated same loop, did not reproduce**: the
-      single test standalone (`go test -run
-      '^TestRecursiveUnionCapsRunawaySingleIteration$' -v
-      ./internal/executor/`), the whole package with `-count=1`, and 3×
-      `-count=1 -race` runs of the whole package all PASS clean — no data
-      race flagged. Repro command matches exactly what nightly ran (single
-      package, not `./...`), so cross-package concurrency isn't the trigger;
-      suspect nightly-host memory/GC pressure (many ci/batch stages
-      contending for RAM concurrently, see `cgroup_high_below_gomemlimit_throttle_trap`
-      memory note) corrupting the stack/heap at the exact moment of that
-      `Ctx.Err()` call, but this is unconfirmed — no repro captured to
-      inspect further. Evidence: `ci/logs/20260824-013441/units/go-test.log`.
-      Leave open as a suspected flake; re-open investigation only if it
-      recurs in a future nightly run (if it does, capture host memory
-      pressure at the failure moment, not just the stack trace).
+      commit `8de8ab80`). A prior loop investigated and could not reproduce
+      (single-test, whole-package, and 3×`-race` runs all PASS clean),
+      leaving it open as a suspected flake. **FIXED this loop**: rather than
+      chase the exact trigger for `o.ctx.Ctx` being nil, brought line 163 in
+      line with the established convention every other cancellation-check
+      call site in this package already follows (`operators.go:551`,
+      `join_nl_stream.go:190`, `operators_join_agg.go:1420`, 12+ more) —
+      guard with `if o.ctx.Ctx != nil` before calling `.Err()`, so a nil
+      `context.Context` (unit-test / non-network caller) skips the
+      cancellation check instead of panicking, matching sibling behavior
+      exactly. Verified: `go test -run
+      '^TestRecursiveUnionCapsRunawaySingleIteration$' -v ./internal/executor/`
+      PASS, and the whole `./internal/executor/` package PASS
+      (`GOOPG_CG_UNIT=fixexec-test scripts/goopg-test-run.sh go test -timeout
+      10m ./internal/executor/`). Evidence:
+      `ci/logs/20260824-013441/units/go-test.log`. This closes the units gate
+      the M0134 milestone's own precommit test depends on.
 
 ## M0130 — Cluster-directory compat with PG 18.3 + PG physical replication (filed 2026-08-09)
 
@@ -7091,7 +7093,7 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [x] **M0134-0108 — create_aggregate.sql** — regress-sql `not-tried`, sized live: **PARKED 2026-08-24** (case genuinely `failed`, 249→234-line diff / 0% parity). Shipped two contained sibling-path fixes: (1) `regproc`/`regprocedure` cast resolution (both `internal/executor/reg_identifier.go`'s `regIdentifierInput` and its duplicate in `expr.go`'s `CastExpr` arm) and OID→name rendering (`regOutShared`) never consulted the `InMemory.userAggregates` registry CREATE AGGREGATE populates — added `catalog.Catalog.LookupUserAggregateByOID` and wired it into all three sites, fixing `'myavg'::REGPROC` and every `pg_aggregate` catalog SELECT keyed off it; (2) `catalog.TypeNameToOID` had no case for the `internal` pseudo-type (already seeded in pg_type at OID 2281) — added `OIDInternal` constant + case, fixing `aggtranstype::regtype` rendering `text` instead of `internal`. Design `docs/design/m0134-0108-create-aggregate-regproc-fixes.md`. Dominant remaining buckets (six, largest first): SERIALFUNC/DESERIALFUNC/PARALLEL/moving-aggregate options parsed then discarded (no `CreateAggregateStmt` fields), zero validation for serialfunc/deserialfunc/combinefunc signature mismatches or parallel-safety values, `CREATE OR REPLACE AGGREGATE` has no change-detection (return-type/kind), `COMMENT ON AGGREGATE` isn't even a parser case, `\da` mis-renders ordered-set aggregate result/arg types, quoted-identifier legacy attribute spellings silently accepted instead of warning+erroring. Ledger row: `.ralph/deferral_ledger.md`, 2026-08-24, M0134-0108. CSV row flipped `not-tried` → `failed` via `make regen-testport`. Next M0134 task to select: **M0134-0109**.
 - [x] **M0134-0109 — create_am.sql** — regress-sql `not-tried`, sized live: **PARKED 2026-08-24** (case genuinely `failed`, 0% parity). Fixed `resolveAccessMethodHandlerFunc` (`internal/executor/operators_ddl.go`) to resolve PG's 7 built-in AM handler function names (`heap_tableam_handler`/`bthandler`/`hashhandler`/`gisthandler`/`ginhandler`/`spghandler`/`brinhandler`) via a new `builtinAMHandlerFuncs` leaf-package table — previously only `Routines()` (CREATE FUNCTION registry) was searched, so `CREATE ACCESS METHOD gist2 TYPE INDEX HANDLER gisthandler` raised a false 42883; verified all 6 positive/negative handler-resolution lines byte-for-byte against `create_am.out`. PARKED — dominant remaining gap: `CREATE TABLE/... USING <am>` has zero parser support at all, plus `ALTER TABLE ... SET ACCESS METHOD`, partitioned-table AM inheritance, `default_table_access_method` enforcement, AM `pg_depend` tracking, and a real opclass over the excluded GiST AM — a multi-milestone storage-pluggability feature, not a contained fix. Design `docs/design/m0134-0109-create-am-handler-resolution.md`. Ledger row: `.ralph/deferral_ledger.md`, 2026-08-24, M0134-0109. CSV row flipped `not-tried` → `failed` via `make regen-testport`. Next M0134 task to select: **M0134-0110**.
 - [x] **M0134-0110 — create_cast.sql** — regress-sql `not-tried`, sized live: **PARKED 2026-08-24** (case genuinely `failed`, 119→106-line diff / 0% parity). Fixed `castTypeOIDMatch`/`validateCreateCast` (`internal/executor/operators_ddl.go`): the pure `catalog.TypeNameToOID(string)` helper's "unknown name" default (`OIDText`) collapsed every user-defined type to `text`'s OID, so `CREATE CAST (text AS mytype) WITHOUT FUNCTION` always false-rejected as "source and target are the same" and `DROP CAST (text AS mytype)` always false-rejected as "type does not exist". Root cause: `catalog.InMemory.RegisterCompositeType` (the bare-name registrar for base/shell `CREATE TYPE`) only wrote the boolean `compositeTypeNames` map, never the OID-bearing `compositeTypes` map any lookup reads — fixed with a real `*CompositeType` OID allocation (one call site). Also added `castUserBinaryCoercible` (mirrors PG's `IsBinaryCoercibleWithCast`) so a `WITH FUNCTION` cast's arg/return type may match via an already-registered `WITHOUT FUNCTION` cast, closing a gap the function's own doc comment had flagged. Design `docs/design/m0134-0110-create-cast-user-type-resolution.md`. PARKED — dominant remaining gap: the `::` cast evaluator never consults the user-cast/`pg_cast` registry at all (no cast-existence check, no cast-context enforcement, no `WITH FUNCTION` dispatch at execution time) plus missing `pg_depend` rows for casts — REFACTOR-tier expression-evaluator feature. Ledger row: `.ralph/deferral_ledger.md`, 2026-08-24, M0134-0110. CSV row flipped `not-tried` → `failed` via `make regen-testport`. Next M0134 task to select: **M0134-0111**.
-- [ ] **M0134-0111 — create_index_spgist.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+- [x] **M0134-0111 — create_index_spgist.sql** — regress-sql `not-tried`, sized live: **PARKED 2026-08-24** (case genuinely `failed`, diff 1576→1516 lines / 0% parity). Landed two contained fixes: `point <@ box`/`box @> point` containment dispatch (`internal/executor/expr.go`'s `OpContainedBy`/`OpContains`/`OpOverlap` arm only ever attempted box-vs-box parsing — fixed via a `parsePointText` fallback treating a point as a degenerate box) and `starts_with(text, text)` (pg_proc oid 3696, catalog-registered but had zero `evalFuncCall` dispatch arm). PARKED — dominant remaining gaps: (a) the operator lexer (`internal/parser/lexer.go:548-575`) only recognizes a hardcoded 2/3-char whitelist, not PG's real graphic-operator-char grammar, so `<<|`/`|>>`/`~=`/`~<~`/`~<=~`/`~>=~`/`~>~`/`^@` all fail as syntax errors — systemic, cross-cutting; (b) SP-GiST is catalog-metadata-only (same class as GiST/BRIN), zero physical quad-tree/kd-tree/radix-tree storage anywhere. Design `docs/design/m0134-0111-create-index-spgist-sizing.md`. Ledger row: `.ralph/deferral_ledger.md`, 2026-08-24, M0134-0111. CSV row flipped `not-tried` → `failed` via `make regen-testport`. Next M0134 task to select: **M0134-0112**.
 - [ ] **M0134-0112 — create_misc.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0113 — create_operator.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0114 — create_role.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
