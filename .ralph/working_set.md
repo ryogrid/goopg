@@ -1,85 +1,84 @@
-Task just completed: M0134-0114 (create_role.sql) — sized live against PG 18.3
-oracle via scripts/pg-regress-runner.sh: PARKED (diff 259→204 lines, still 0%
-parity — single-test suite, not fully green).
+Task just completed: M0134-0116 (create_type.sql) — sized live against PG 18.3
+oracle via scripts/pg-regress-runner.sh: PARKED (diff 417→405 lines, `^-ERROR`
+17→15, `^+ERROR` 8→8 unchanged — no new false positives).
 
-Root cause: goopg's CREATE ROLE/ALTER ROLE/DROP ROLE run entirely through a
-text-substitution intercept (internal/postmaster/role_ddl.go's
-tryHandleRoleDDL, ahead of the parser, which has no role-DDL grammar) and had
-ZERO privilege enforcement — at least 4 independent root-cause buckets.
+Root cause: two independent REFACTOR-tier gaps dominate the file: (1) no
+`LANGUAGE C` dynamic-extension loader (standing M0134-0106 gap) blocking
+`widget`/`city_budget`/`pt_in_widget` and everything downstream; (2) goopg's
+`CREATE TYPE` base/shell-type arm (`internal/parser/ddl.go`'s
+`parseCreateType`, `internal/executor/operators_ddl.go`'s `execCreateType`) is
+a near-total stub — no option-list parsing, no I/O-function validation, no
+default-value application, no pg_depend tracking, no ALTER TYPE semantics.
 
-Landed: ported PG's CreateRole/AlterRole permission gates
-(postgres/src/backend/commands/user.c) into two new functions in
-internal/postmaster/role_ddl.go:
-- checkCreateRolePrivileges — non-superuser needs CREATEROLE to create any
-  role, can never hand out SUPERUSER, can only hand out
-  CREATEDB/REPLICATION/BYPASSRLS if it holds that attribute itself.
-- checkAlterRoleAttrPrivileges — touching SUPERUSER always requires
-  superuser; touching CREATEDB/REPLICATION/BYPASSRLS requires the actor hold
-  it.
-Wired via a new variadic `actingRole ...string` trailing param on
-tryHandleRoleDDL, passed from the two real wire-dispatch call sites
-(internal/postmaster/dispatch.go, dispatch_extended.go).
+Landed one contained fix within that stub:
+- internal/parser/ast.go: `CreateTypeStmt` gained `HasOptions bool`.
+- internal/parser/ddl.go: `parseCreateType` detects whether `(` follows the
+  type name (bare shell vs. base-type-with-options spelling).
+- internal/executor/operators_ddl.go: bare-shell branch (`CREATE TYPE name;`)
+  now errors `42710 type "%s" already exists` against any pre-existing type
+  of that name, matching PG's `DefineType` (typecmds.c ~236-266) — previously
+  `RegisterCompositeType` was unconditionally idempotent.
 
-Design docs/design/m0134-0114-create-role-sizing.md, README.md indexed.
-fix_plan.md M0134-0114 marked [x] PARKED. Ledger row appended
-(.ralph/deferral_ledger.md, M0134-0114): remaining gaps —
-(1) ADMIN-OPTION-on-target-role + object-ownership enforcement for
-    ALTER/RENAME/DROP ROLE and DROP/ALTER...OWNER TO (goopg's
-    operators_ddl_role_membership.go already has IsAdminOfRole but
-    role_ddl.go doesn't consult it — likely the next-cheapest bucket).
-(2) REASSIGN OWNED BY has zero parser support at all.
-(3) createrole_self_grant GUC + automatic self-grant semantics unimplemented.
-(4) SYSID backward-compat NOTICE missing (no notice channel in
-    tryHandleRoleDDL's return shape).
+A mirror-image "options spelling requires a pre-existing shell" check was
+tried and REVERTED — it fixed one more `^-ERROR` line but introduced two
+`^+ERROR` false positives (`widget`/`city_budget`, created via options
+spelling with no preceding bare shell, since goopg lacks PG's `CREATE
+FUNCTION`-triggered auto-shell side effect), a net regression (417→422 vs.
+417→405). Documented in the design doc rather than landed — a real trap for
+whoever revisits this: don't re-add that check without also modeling the
+auto-shell side effect first.
+
+Design docs/design/m0134-0116-create-type-sizing.md, README.md indexed.
+fix_plan.md M0134-0116 marked [x] PARKED. Ledger row appended
+(.ralph/deferral_ledger.md, M0134-0116). CSV flipped not-tried→failed via
+`make regen-testport`. Commit 9b03c653 (NOT pushed yet this loop — push next
+loop or on request).
 
 NEXT LOOP: per the Current Priority banner in .ralph/fix_plan.md, continue
-M0134 top-to-bottom — next unworked item is **M0134-0115
-(create_schema.sql)**.
+M0134 top-to-bottom — next unworked item is **M0134-0117** (database.sql).
 
 Standing recommendation (carried across several loops, still open — see prior
-working_set snapshots / deferral ledger for full detail on each):
-1. brin_summarize_range/brin_desummarize_range unimplemented (M0134-0095/-
-   0096/-0097 PARKs).
+working_set snapshots / deferral ledger for full detail on each; unchanged
+this loop, trimmed to the highest-value entries):
+1. LANGUAGE C dynamic-extension loading gap (M0134-0106) — no loader exists;
+   now confirmed blocking BOTH create_operator-adjacent and create_type.sql
+   C-function types. Worth promoting to its own milestone — it recurs.
 2. Collation-execution-registry gap recurs across FIVE parked files
    (M0134-0099/-0100/-0101/-0102).
-3. expr.go length/upper/lower/etc. swallow nested function-not-found errors
-   into NULL instead of 42883 (M0134-0102 bucket 5, systemic).
-4. ctid/tableoid system-column pattern (M0134-0104) generalizes to
-   cmin/cmax/xmin/xmax.
-5. LANGUAGE C dynamic-extension loading gap (M0134-0106) — no loader exists.
-6. EUC_JP/UTF8 real Unicode mapping tables unported (M0134-0107).
-7. `CREATE TABLE ... USING <am>` has zero parser support (M0134-0109).
-8. `::` cast evaluator never consults pg_cast for user-defined casts
-   (M0134-0110).
-9. Operator-lexer whitelist gap (internal/parser/lexer.go:548-575, hardcoded
-   2/3-char switch vs PG's general graphic-operator-char grammar) —
-   M0134-0111, worth a dedicated milestone.
-10. ALTER TABLE RENAME COLUMN inheritance recursion missing entirely
-    (M0134-0112).
-11. RAISE INFO/LOG/DEBUG collapse to hardcoded NOTICE wire severity
-    (M0134-0113, ~18-call-site blast radius in plpgsql_runtime.go).
-12. BETWEEN-vs-comparison-operator precedence bug (M0134-0113) — silently
-    wrong for ANY query today, cross-cutting, candidate for a standalone
-    bug-hunt loop.
-13. NEW this loop: role-DDL privilege enforcement (M0134-0114) was FULLY
-    ABSENT before this loop — the two landed checks cover attribute
-    giveaway only; ADMIN-OPTION/ownership enforcement (item 1 above) is
-    the natural next slice and likely recurs across other not-yet-sized
-    M0134 role/privilege-adjacent cases (e.g. GRANT/REVOKE-heavy files).
+3. BETWEEN-vs-comparison-operator precedence bug (M0134-0113) — silently
+   wrong for ANY query today, cross-cutting, candidate for a standalone
+   bug-hunt loop.
+4. RAISE INFO/LOG/DEBUG collapse to hardcoded NOTICE wire severity
+   (M0134-0113, ~18-call-site blast radius in plpgsql_runtime.go).
+5. ADMIN-OPTION/ownership enforcement for ALTER/RENAME/DROP ROLE
+   (M0134-0114 remainder) — role_ddl.go doesn't consult
+   operators_ddl_role_membership.go's IsAdminOfRole.
+6. CREATE SCHEMA's embedded sub-command execution (M0134-0115 remainder) —
+   no AST/dispatch path exists for the nested CREATE TABLE/SEQUENCE/etc.
+   inside CREATE SCHEMA; REFACTOR-tier, also partially unblocks M0134-0009.
+7. NEW this loop: goopg's CREATE TYPE base/shell-type executor is a
+   near-total stub (M0134-0116 remainder) — no option-list parsing (input/
+   output/internallength/alignment/storage/etc.), no I/O-function arg/return
+   type validation, no dependency tracking for DROP CASCADE, no ALTER TYPE
+   support, and no auto-shell side effect from CREATE FUNCTION referencing an
+   undeclared type name. REFACTOR-tier, own milestone candidate — this is a
+   bigger gap than a single regress file suggests since user-defined base
+   types are a real PG feature surface.
 
-Gates run (subagent-reported): go build ./... clean; go test
+Gates run this loop (subagent-reported): go build ./... clean; go test
 ./internal/parser/... ./internal/executor/... ./internal/postmaster/... PASS;
-RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS; make
-regen-testport clean; make check-testport-inventory PASS; make
-ralph-state-guard PASS (auto-repaired a stale status/progress mismatch, then
-confirmed consistent). Pre-commit hook's pgbench smoke ran automatically at
-commit time — PASS. Commit 2d392628 pushed to origin/regress-renumbering.
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS; pre-commit
+hook's pgbench smoke ran automatically at commit time — PASS. No
+executor/planner cost-model change, so tpch-spotcheck.sh was not required
+(none run). make ralph-state-guard PASS this loop (auto-repaired a stale
+status/progress mismatch from the prior loop's clean-exit marker — same
+pattern as last loop — then confirmed consistent).
 
 In-flight: none.
 
 Note: a concurrent peer session's WIP was present in the tree this loop
-(.ralphrc, docs/wiki/*, ci/logs/*, analysis/*,
+(.ralph/progress.json, .ralphrc, analysis/*, ci/logs/*, docs/wiki/*,
 internal/executor/operators_recursive_cte.go, third-party/tpcds-postgres,
 untracked `postgres` symlink) and was deliberately left untouched/
-uncommitted — only the M0134-0114 files were staged and committed by
-explicit pathspec.
+uncommitted — only the M0134-0116 files were staged and committed by
+explicit pathspec by the subagent that did the work.
