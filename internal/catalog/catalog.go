@@ -19014,7 +19014,14 @@ func (c *InMemory) RegisterUserOperator(schema, name, leftType, rightType string
 }
 
 // DropUserOperator removes a user-defined operator from the registry.
-// Returns true if one was found and removed. DU-002 (M0119-0004).
+// Returns true if one was found and removed. Mirrors PG's
+// RemoveOperatorById/OperatorUpd (postgres/src/backend/catalog/pg_operator.c
+// ~671-820, called with isDelete=true): before deleting, null out the
+// dropped operator's OID from any sibling operator's CommutatorOID/
+// NegatorOID that still points back at it — otherwise pg_operator.oprcom/
+// oprnegate on the surviving sibling dangles at a now-nonexistent OID
+// (M0134-0119, drop_operator.sql's two catalog-integrity SELECTs). DU-002
+// (M0119-0004).
 func (c *InMemory) DropUserOperator(schema, name, leftType, rightType string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -19022,11 +19029,37 @@ func (c *InMemory) DropUserOperator(schema, name, leftType, rightType string) bo
 		return false
 	}
 	key := userOperatorKey(schema, name, leftType, rightType)
-	if _, ok := c.userOperators[key]; ok {
-		delete(c.userOperators, key)
-		return true
+	op, ok := c.userOperators[key]
+	if !ok {
+		return false
 	}
-	return false
+	// OperatorUpd(baseId=op.OID, commId=op.CommutatorOID, negId=op.NegatorOID,
+	// isDelete=true): the commutator/negator operators this one points to
+	// each get their own back-reference to op.OID cleared, unless they are
+	// self-referential (commutator/negator of themselves), matching PG's
+	// "own commutator is itself" isDelete short-circuit.
+	if op.CommutatorOID != 0 && op.CommutatorOID != op.OID {
+		if t := c.userOperatorByOIDLocked(op.CommutatorOID); t != nil && t.CommutatorOID == op.OID {
+			t.CommutatorOID = 0
+		}
+	}
+	if op.NegatorOID != 0 && op.NegatorOID != op.OID {
+		if t := c.userOperatorByOIDLocked(op.NegatorOID); t != nil && t.NegatorOID == op.OID {
+			t.NegatorOID = 0
+		}
+	}
+	delete(c.userOperators, key)
+	return true
+}
+
+// userOperatorByOIDLocked finds a UserOperator by OID. Caller must hold c.mu.
+func (c *InMemory) userOperatorByOIDLocked(oid uint32) *UserOperator {
+	for _, op := range c.userOperators {
+		if op.OID == oid {
+			return op
+		}
+	}
+	return nil
 }
 
 // RegisterUserOperatorDuringRecovery is the idempotent version of
@@ -20192,6 +20225,38 @@ var builtinProcsByName = map[string]BuiltinProc{
 		OID: 65, Name: "int4eq", Namespace: 11,
 		RetType:  "bool",
 		ArgTypes: []string{"int4", "int4"},
+		Volatile: "i",
+	},
+	// int8eq/int8ne/int8lt/int8gt are the FUNCTION a drop_operator.sql-style
+	// CREATE OPERATOR fixture references (mirrors PG's own "="/"<>"/"<"/">"
+	// operators over int8, pg_operator.dat oids 467-470 -> oprcode
+	// int8eq/int8ne/int8lt/int8gt). Curated so CREATE OPERATOR's
+	// negator/commutator boolean-return validation (OperatorValidateParams,
+	// operatorcmds.c) can resolve funcRetType instead of falling through to
+	// the empty default and misfiring "only boolean operators can have
+	// negators" against a genuinely boolean-returning function. M0134-0119.
+	"int8eq": {
+		OID: 467, Name: "int8eq", Namespace: 11,
+		RetType:  "bool",
+		ArgTypes: []string{"int8", "int8"},
+		Volatile: "i",
+	},
+	"int8ne": {
+		OID: 468, Name: "int8ne", Namespace: 11,
+		RetType:  "bool",
+		ArgTypes: []string{"int8", "int8"},
+		Volatile: "i",
+	},
+	"int8lt": {
+		OID: 469, Name: "int8lt", Namespace: 11,
+		RetType:  "bool",
+		ArgTypes: []string{"int8", "int8"},
+		Volatile: "i",
+	},
+	"int8gt": {
+		OID: 470, Name: "int8gt", Namespace: 11,
+		RetType:  "bool",
+		ArgTypes: []string{"int8", "int8"},
 		Volatile: "i",
 	},
 	// btint4cmp is int4's real btree "support function 1" (three-way
