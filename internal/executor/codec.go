@@ -331,6 +331,18 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			return "", perr
 		}
 		s = pathCanonicalText(pts, closed)
+	} else if tname == "point" {
+		// point: validate + canonicalize on assignment, mirroring point_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box/circle/line/lseg/path above. Unlike those, point
+		// had NO parser at all before this — a raw-varlena pass-through
+		// accepting any string verbatim (garbage like "asdfasdf" or
+		// "(10.0 10.0)" was stored unchanged). M0134-0150.
+		px, py, perr := parsePointLiteral(s)
+		if perr != nil {
+			return "", perr
+		}
+		s = pointCanonicalText(px, py)
 	} else if tname == "inet" || tname == "cidr" {
 		// inet/cidr: validate + canonicalize on assignment, mirroring PG's
 		// network_in/network_out (postgres/src/backend/utils/adt/network.c),

@@ -3237,6 +3237,13 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		// point '(x,y)')` parses as two typed-literal function arguments,
 		// not two bare column references.
 		"point", "line",
+		// lseg/path 'string' cast syntax (M0134-0150), e.g.
+		// `p.f1 <@ path '[(0,0),(-10,0),(-10,10)]'` (point.sql) — both
+		// already have real parsers (parseLsegLiteral/parsePathLiteral,
+		// M0134-0137/-0149) but were missing from this whitelist, so a bare
+		// `path '...'`/`lseg '...'` in an expression context parsed as two
+		// unrelated tokens instead of one typed literal.
+		"lseg", "path",
 		// json/jsonb 'string' cast syntax (M0134-0133), e.g.
 		// `json '{"a": 1}' -> 'a'` used throughout json_encoding.sql.
 		"json", "jsonb":

@@ -3016,6 +3016,46 @@ func pathCanonicalText(points [][2]float64, closed bool) string {
 	return b.String()
 }
 
+// parsePointLiteral is point_in (geo_ops.c) — a single pair_decode call with
+// endptr_p==NULL, so unlike linePairDecode's callers (path/line/lseg, which
+// consume one pair out of a larger multi-point string and hand the rest back
+// to their own wrapper-delimiter logic), point_in requires the ENTIRE string
+// to be consumed by the one pair: optional leading '(' requires a matching
+// trailing ')', and no other form of trailing text is tolerated ("(10.0,
+// 10.0) x" and "10.0,10.0" are both rejected — see pair_decode's own
+// `else if (*str != '\0') goto fail`). Point had no PG-faithful parser at
+// all before this (unlike box/circle/line/lseg/path, which each had their
+// own M0134 slice); it was a raw-varlena pass-through accepting any string
+// verbatim. M0134-0150.
+func parsePointLiteral(s string) (x, y float64, errOut *ExecError) {
+	x, y, rest, derr := linePairDecode(s)
+	if derr != nil {
+		if derr.Message == "" {
+			return 0, 0, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type point: %q", s)}
+		}
+		return 0, 0, derr
+	}
+	if rest != "" {
+		return 0, 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type point: %q", s)}
+	}
+	return x, y, nil
+}
+
+// pointCanonicalText formats a point exactly as point_out does —
+// path_encode(PATH_NONE, 1, pt), i.e. a single "(x,y)" pair with no outer
+// wrapper delimiter. M0134-0150.
+func pointCanonicalText(x, y float64) string {
+	var b strings.Builder
+	b.WriteByte('(')
+	b.WriteString(PGFloatOut(x, 64))
+	b.WriteByte(',')
+	b.WriteString(PGFloatOut(y, 64))
+	b.WriteByte(')')
+	return b.String()
+}
+
 // macScanCandidate is one of macaddr_in's 7 sscanf format strings
 // (postgres/src/backend/utils/adt/mac.c:71-90), reduced to its two variable
 // dimensions: the shared field width (0 = unbounded "%x", 2 = "%2x") and the
@@ -4880,6 +4920,44 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 			return Datum{}, &ee
 		}
 		return NewStringDatum(lineCanonicalText(la, lb, lc)), nil
+	case "lseg":
+		// M0134-0150: `lseg '...'` shares the same validate+canonicalize
+		// chokepoint as an lseg column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parseLsegLiteral.
+		// Previously missing from this switch (fell through to the bottom
+		// default arm, returning the raw string unvalidated) even though
+		// M0134-0137 already landed the parser.
+		x1, y1, x2, y2, lerr := parseLsegLiteral(x.Value)
+		if lerr != nil {
+			ee := *lerr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(lsegCanonicalText(x1, y1, x2, y2)), nil
+	case "path":
+		// M0134-0150: `path '...'` shares the same validate+canonicalize
+		// chokepoint as a path column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parsePathLiteral.
+		// Previously missing from this switch even though M0134-0149
+		// already landed the parser.
+		pts, closed, perr := parsePathLiteral(x.Value)
+		if perr != nil {
+			ee := *perr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(pathCanonicalText(pts, closed)), nil
+	case "point":
+		// M0134-0150: `point '...'` shares the same validate+canonicalize
+		// chokepoint as a point column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parsePointLiteral.
+		px, py, perr := parsePointLiteral(x.Value)
+		if perr != nil {
+			ee := *perr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(pointCanonicalText(px, py)), nil
 	case "jsonb":
 		// M0134-0133: `jsonb '...'` must share the same validate+canonicalize
 		// chokepoint as `::jsonb` (the `case "jsonb"` arm of evalCast, above) —
@@ -6263,6 +6341,51 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
 				Message: fmt.Sprintf("cannot cast type %v to numeric", d.Kind)}
 		}
+	case "point":
+		// `'...'::point` had NO case here at all — fell through to the
+		// bottom default arm and returned the input datum UNCHANGED (same
+		// sibling-gap shape M0134-0087 found for xid/xid8: TypedStringLit
+		// spellings validate, CastExpr spellings don't). Must agree with
+		// coerceTextLikeDatum's point arm — both call parsePointLiteral.
+		// M0134-0150.
+		if s, ok := datumAsString(d); ok {
+			px, py, perr := parsePointLiteral(s)
+			if perr != nil {
+				ee := *perr
+				ee.Pos = pos
+				return Datum{}, &ee
+			}
+			return NewStringDatum(pointCanonicalText(px, py)), nil
+		}
+		return d, nil
+	case "lseg":
+		// `'...'::lseg` had NO case here at all — same sibling gap as point
+		// above. Must agree with coerceTextLikeDatum's lseg arm.
+		// M0134-0150.
+		if s, ok := datumAsString(d); ok {
+			x1, y1, x2, y2, lerr := parseLsegLiteral(s)
+			if lerr != nil {
+				ee := *lerr
+				ee.Pos = pos
+				return Datum{}, &ee
+			}
+			return NewStringDatum(lsegCanonicalText(x1, y1, x2, y2)), nil
+		}
+		return d, nil
+	case "path":
+		// `'...'::path` had NO case here at all — same sibling gap as point
+		// above. Must agree with coerceTextLikeDatum's path arm.
+		// M0134-0150.
+		if s, ok := datumAsString(d); ok {
+			pts, closed, perr := parsePathLiteral(s)
+			if perr != nil {
+				ee := *perr
+				ee.Pos = pos
+				return Datum{}, &ee
+			}
+			return NewStringDatum(pathCanonicalText(pts, closed)), nil
+		}
+		return d, nil
 	case "jsonb":
 		// `::jsonb` canonicalises the text the same way a jsonb column does
 		// (coerceTextLikeDatum's jsonb arm) — the two are the twin input
@@ -12360,6 +12483,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// M0134-0149: agrees with the column-coercion path, same
 				// parsePathLiteral.
 				_, _, perr := parsePathLiteral(v)
+				return NewBoolDatum(perr == nil), nil
+			case "point":
+				// M0134-0150: agrees with the column-coercion path, same
+				// parsePointLiteral.
+				_, _, perr := parsePointLiteral(v)
 				return NewBoolDatum(perr == nil), nil
 			case "macaddr":
 				// M0134-0138: agrees with the column-coercion path, same
