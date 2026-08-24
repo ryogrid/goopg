@@ -341,6 +341,16 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			return "", merr
 		}
 		s = macaddrCanonicalText(a, b2, c, d, e, f)
+	} else if tname == "macaddr8" {
+		// macaddr8: validate + canonicalize on assignment, mirroring
+		// macaddr8_in/macaddr8_out (postgres/src/backend/utils/adt/mac8.c),
+		// same chokepoint pattern as macaddr above — previously zero
+		// executor support at all. M0134-0139.
+		a, b2, c, d, e, f, g, h, merr := parseMacaddr8Literal(s)
+		if merr != nil {
+			return "", merr
+		}
+		s = macaddr8CanonicalText(a, b2, c, d, e, f, g, h)
 	}
 	return s, nil
 }

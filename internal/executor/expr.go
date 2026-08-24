@@ -1401,6 +1401,13 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 			if a, b, c, dd, e, f, merr := parseMacaddrLiteral(d.StringValue()); merr == nil {
 				return NewStringDatum(macaddrCanonicalText(^a&0xff, ^b&0xff, ^c&0xff, ^dd&0xff, ^e&0xff, ^f&0xff)), nil
 			}
+			// macaddr8_not (mac8.c): `~b` bitwise-complements each of the 8
+			// octets. Tried after the 6-octet form above (a colon-separated
+			// 8-field literal never matches parseMacaddrLiteral, which fails
+			// on trailing garbage). M0134-0139.
+			if a, b, c, dd, e, f, g, h, merr := parseMacaddr8Literal(d.StringValue()); merr == nil {
+				return NewStringDatum(macaddr8CanonicalText(^a&0xff, ^b&0xff, ^c&0xff, ^dd&0xff, ^e&0xff, ^f&0xff, ^g&0xff, ^h&0xff)), nil
+			}
 		}
 		return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator ~ requires integer operand"}
 	}
@@ -1893,6 +1900,17 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 						return NewStringDatum(macaddrCanonicalText(la&ra, lb&rb, lc&rc, ld&rd, le&re, lf&rf)), nil
 					}
 					return NewStringDatum(macaddrCanonicalText(la|ra, lb|rb, lc|rc, ld|rd, le|re, lf|rf)), nil
+				}
+			}
+			// macaddr8_and/macaddr8_or (mac8.c): `b & mac8` / `b | mac8`
+			// combine each of the 8 octets. Tried after the 6-octet form
+			// above. M0134-0139.
+			if la, lb, lc, ld, le, lf, lg, lh, lerr := parseMacaddr8Literal(left.StringValue()); lerr == nil {
+				if ra, rb, rc, rd, re, rf, rg, rh, rerr := parseMacaddr8Literal(right.StringValue()); rerr == nil {
+					if op == parser.OpBitAnd {
+						return NewStringDatum(macaddr8CanonicalText(la&ra, lb&rb, lc&rc, ld&rd, le&re, lf&rf, lg&rg, lh&rh)), nil
+					}
+					return NewStringDatum(macaddr8CanonicalText(la|ra, lb|rb, lc|rc, ld|rd, le|re, lf|rf, lg|rg, lh|rh)), nil
 				}
 			}
 		}
@@ -2981,6 +2999,118 @@ func macaddrCanonicalText(a, b, c, d, e, f int) string {
 // (mac.c:341-356) — used by trunc(macaddr).
 func macaddrTruncOctets(a, b, c, _, _, _ int) (int, int, int, int, int, int) {
 	return a, b, c, 0, 0, 0
+}
+
+// parseMacaddr8Literal reproduces macaddr8_in (postgres/src/backend/utils/
+// adt/mac8.c:96-232). Unlike macaddr_in's 7-format sscanf cascade, this is a
+// single greedy scanner: read a byte as exactly 2 hex digits at a time (no
+// field-width variants), optionally followed by one of ':' '-' '.' as a
+// separator — once a separator character is seen it must be used
+// consistently for every remaining byte pair, but mixing "no separator" with
+// "a separator" between different byte pairs is also rejected implicitly (an
+// immediate next hex digit is read as part of the next byte, not as a
+// missing separator). Exactly 6 or 8 bytes are accepted; a 6-byte (EUI-48)
+// address is auto-widened to EUI-64 by inserting 0xFF/0xFE as the 4th/5th
+// octets and shifting the trailing three bytes down (same conversion
+// macaddrtomacaddr8 performs explicitly). M0134-0139.
+func parseMacaddr8Literal(str string) (a, b, c, d, e, f, g, h int, errOut *ExecError) {
+	fail := func() (int, int, int, int, int, int, int, int, *ExecError) {
+		return 0, 0, 0, 0, 0, 0, 0, 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type macaddr8: %q", str)}
+	}
+	n := len(str)
+	p := 0
+	for p < n && isRegIdentSpace(str[p]) {
+		p++
+	}
+	var by [8]int
+	count := 0
+	var spacer byte
+	for p < n && p+1 < n { // C: while (*ptr && *(ptr+1))
+		hi, hok := hexDigitValue(str[p])
+		lo, lok := hexDigitValue(str[p+1])
+		if !hok || !lok {
+			return fail()
+		}
+		count++
+		if count > 8 {
+			return fail()
+		}
+		by[count-1] = hi*16 + lo
+		p += 2
+		if p < n {
+			switch str[p] {
+			case ':', '-', '.':
+				if spacer == 0 {
+					spacer = str[p]
+				} else if spacer != str[p] {
+					return fail()
+				}
+				p++
+			}
+		}
+		if count == 6 || count == 8 {
+			if p < n && isRegIdentSpace(str[p]) {
+				p++
+				for p < n && isRegIdentSpace(str[p]) {
+					p++
+				}
+				if p < n {
+					return fail()
+				}
+			}
+		}
+	}
+	if count == 6 {
+		by[7], by[6], by[5] = by[5], by[4], by[3]
+		by[3], by[4] = 0xFF, 0xFE
+	} else if count != 8 {
+		return fail()
+	}
+	return by[0], by[1], by[2], by[3], by[4], by[5], by[6], by[7], nil
+}
+
+// macaddr8CanonicalText formats an 8-byte MAC address exactly as
+// macaddr8_out does — "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x"
+// (mac8.c:233-251). M0134-0139.
+func macaddr8CanonicalText(a, b, c, d, e, f, g, h int) string {
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x", a, b, c, d, e, f, g, h)
+}
+
+// macaddr8TruncOctets zeroes the last 5 octets keeping only the 3-byte OUI
+// prefix, matching macaddr8_trunc (mac8.c:476-497) — used by
+// trunc(macaddr8). Note this differs from macaddr's trunc, which keeps 3 of
+// 6 octets; macaddr8_trunc keeps 3 of 8.
+func macaddr8TruncOctets(a, b, c, _, _, _, _, _ int) (int, int, int, int, int, int, int, int) {
+	return a, b, c, 0, 0, 0, 0, 0
+}
+
+// macaddr8Set7BitOctets sets the 2nd-lowest bit of the first octet, matching
+// macaddr8_set7bit (mac8.c:499-521) — used to convert a MAC address to the
+// modified EUI-64 form used in IPv6 addresses.
+func macaddr8Set7BitOctets(a, b, c, d, e, f, g, h int) (int, int, int, int, int, int, int, int) {
+	return a | 0x02, b, c, d, e, f, g, h
+}
+
+// macaddr8ToMacaddrOctets reproduces macaddr8tomacaddr (mac8.c:544-566):
+// the 4th/5th octets must be exactly 0xFF/0xFE (the EUI-48-in-EUI-64
+// convention) or the conversion is out of range. Returns errOut non-nil on
+// failure.
+func macaddr8ToMacaddrOctets(a, b, c, d, e, f, g, h int) (ra, rb, rc, rd, re, rf int, errOut *ExecError) {
+	if d != 0xFF || e != 0xFE {
+		return 0, 0, 0, 0, 0, 0, &ExecError{Code: "22003",
+			Message: "macaddr8 data out of range to convert to macaddr",
+			Hint: "Only addresses that have FF and FE as values in the 4th and 5th bytes from the left, " +
+				"for example xx:xx:xx:ff:fe:xx:xx:xx, are eligible to be converted from macaddr8 to macaddr."}
+	}
+	return a, b, c, f, g, h, nil
+}
+
+// macaddrToMacaddr8Octets reproduces macaddrtomacaddr8 (mac8.c:523-542):
+// widen a 6-octet macaddr to macaddr8 by inserting 0xFF/0xFE as the 4th/5th
+// octets, same shift parseMacaddr8Literal applies to a bare 6-byte literal.
+func macaddrToMacaddr8Octets(a, b, c, d, e, f int) (int, int, int, int, int, int, int, int) {
+	return a, b, c, 0xFF, 0xFE, d, e, f
 }
 
 // evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
@@ -6017,6 +6147,50 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if err := validateJSONText(s); err != nil {
 				return Datum{}, err
 			}
+		}
+		return d, nil
+	case "macaddr":
+		// `::macaddr` validates + canonicalizes the same way a macaddr column
+		// does (coerceTextLikeDatum's macaddr arm), but also accepts a
+		// macaddr8-shaped (8-octet) source — macaddr8tomacaddr (mac8.c:
+		// 544-566) — which requires the 4th/5th octets be exactly 0xFF/0xFE.
+		// Previously this whole cast was an unvalidated pass-through
+		// (`return d, nil` at the bottom of this switch). M0134-0139.
+		if s, ok := datumAsString(d); ok {
+			if a, b, c, dd, e, f, merr := parseMacaddrLiteral(s); merr == nil {
+				return NewStringDatum(macaddrCanonicalText(a, b, c, dd, e, f)), nil
+			}
+			if a, b, c, dd, e, f, g, h, merr := parseMacaddr8Literal(s); merr == nil {
+				ra, rb, rc, rd, re, rf, cerr := macaddr8ToMacaddrOctets(a, b, c, dd, e, f, g, h)
+				if cerr != nil {
+					cerr.Pos = pos
+					return Datum{}, cerr
+				}
+				return NewStringDatum(macaddrCanonicalText(ra, rb, rc, rd, re, rf)), nil
+			}
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type macaddr: %q", s)}
+		}
+		return d, nil
+	case "macaddr8":
+		// `::macaddr8` validates + canonicalizes the same way a macaddr8
+		// column does (coerceTextLikeDatum's macaddr8 arm). A plain
+		// macaddr-shaped (6-octet) source is widened via macaddrtomacaddr8
+		// (mac8.c:523-542); parseMacaddr8Literal on its own already performs
+		// the identical widening for a bare 6-byte literal, so a genuine
+		// 8-octet source and a widened 6-octet source share one parse path.
+		// Previously this whole cast was an unvalidated pass-through.
+		// M0134-0139.
+		if s, ok := datumAsString(d); ok {
+			if a, b, c, dd, e, f, merr := parseMacaddrLiteral(s); merr == nil {
+				wa, wb, wc, wd, we, wf, wg, wh := macaddrToMacaddr8Octets(a, b, c, dd, e, f)
+				return NewStringDatum(macaddr8CanonicalText(wa, wb, wc, wd, we, wf, wg, wh)), nil
+			}
+			if a, b, c, dd, e, f, g, h, merr := parseMacaddr8Literal(s); merr == nil {
+				return NewStringDatum(macaddr8CanonicalText(a, b, c, dd, e, f, g, h)), nil
+			}
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type macaddr8: %q", s)}
 		}
 		return d, nil
 	case "jsonpath":
@@ -12042,6 +12216,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// parseMacaddrLiteral.
 				_, _, _, _, _, _, merr := parseMacaddrLiteral(v)
 				return NewBoolDatum(merr == nil), nil
+			case "macaddr8":
+				// M0134-0139: agrees with the column-coercion path, same
+				// parseMacaddr8Literal.
+				_, _, _, _, _, _, _, _, merr := parseMacaddr8Literal(v)
+				return NewBoolDatum(merr == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
@@ -13187,6 +13366,28 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	case "pg_filenode_relation":
 		// pg_filenode_relation(tablespace oid, filenode oid) → regclass
 		// Returns the relation for a given filenode. Stub: returns NULL.
+		return NullDatum, nil
+
+	case "macaddr8_set7bit":
+		// macaddr8_set7bit(macaddr8) → macaddr8 (mac8.c:499-521): sets the
+		// 2nd-lowest bit of the first octet, converting a MAC address to the
+		// modified EUI-64 form used to build an IPv6 interface identifier.
+		// M0134-0139.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			if s, ok := datumAsString(av); ok {
+				if a, b, c, d, e, f, g, h, merr := parseMacaddr8Literal(s); merr == nil {
+					a, b, c, d, e, f, g, h = macaddr8Set7BitOctets(a, b, c, d, e, f, g, h)
+					return NewStringDatum(macaddr8CanonicalText(a, b, c, d, e, f, g, h)), nil
+				}
+			}
+		}
 		return NullDatum, nil
 
 	case "point":
@@ -14636,6 +14837,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				if a, b, c, d, e, f, merr := parseMacaddrLiteral(v.StringValue()); merr == nil {
 					a, b, c, d, e, f = macaddrTruncOctets(a, b, c, d, e, f)
 					return NewStringDatum(macaddrCanonicalText(a, b, c, d, e, f)), nil
+				}
+				// macaddr8_trunc (mac8.c): trunc(macaddr8) keeps only the
+				// 3-byte OUI prefix. Tried after the 6-octet form above.
+				// M0134-0139.
+				if a, b, c, d, e, f, g, h, merr := parseMacaddr8Literal(v.StringValue()); merr == nil {
+					a, b, c, d, e, f, g, h = macaddr8TruncOctets(a, b, c, d, e, f, g, h)
+					return NewStringDatum(macaddr8CanonicalText(a, b, c, d, e, f, g, h)), nil
 				}
 			}
 			f, ferr := strconv.ParseFloat(v.Format(), 64)
