@@ -69,14 +69,23 @@ venv/bin/python -m tools.mdtablefix --report report.json --check file.md
      shape, and they need opposite treatment.  A row the author simply
      ended early is padded with trailing empty cells.  A row whose
      separator was deleted *mid-line* — leaving two columns fused in one
-     over-long cell — is reported as an unrepairable `lost_separator`
-     and left byte-identical: GFM already pads short rows by itself, so
-     appending an empty cell changes nothing about the rendering and only
-     silences the report.  The two are told apart by the surrounding rows
+     over-long cell — is **re-split**: padding it at the end would change
+     nothing on GitHub (GFM pads short rows by itself) and would only
+     silence the report.  The two are told apart by the surrounding rows
      (does some cell exceed its own column's width by a real share of the
      next column's, and is the column that padding would leave empty
-     normally populated?).  The split point is not recoverable from the
-     text, so a human has to re-insert the `|`.
+     normally populated?).
+
+     The boundary is recovered from those same rows.  A dropped separator
+     leaves no marker — ` | ` becomes a plain space — so every space in
+     the fused cell is scored by how far the two halves it would produce
+     sit from the two columns' median widths, and the best-scoring space
+     wins.  It must land within ~30% of the pair's combined width (never
+     tighter than 24 characters) or the row is left byte-identical and
+     reported as `lost_separator` **NEEDS MANUAL REPAIR** — a table whose
+     columns have no typical width cannot be reconstructed by any means.
+     A repaired split is still reported, quoting both sides of the new
+     boundary so it can be eyeballed in the `--check` output.
    - *Unescaped pipes*: every literal `|` left inside a cell — **including
      pipes inside backtick code spans** — is escaped to `\|`, because GFM
      honors only `\|` as a literal pipe in a table.  GitHub strips the

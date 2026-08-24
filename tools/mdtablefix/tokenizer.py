@@ -319,3 +319,36 @@ def escape_html_tags(cell_text: str) -> str:
         prev = pos + 1
     out.append(cell_text[prev:])
     return "".join(out)
+
+
+def has_code_span(text: str) -> bool:
+    """Return True if *text* contains at least one backtick code span."""
+    return bool(_find_backtick_spans(text))
+
+
+def separator_space_positions(text: str) -> list[int]:
+    """Return the offsets of spaces where a lost ``|`` could be re-inserted.
+
+    A well-formed separator is written `` | ``, so when the ``|`` alone is
+    dropped the boundary survives as ordinary whitespace between two words.
+    Only spaces OUTSIDE backtick spans qualify: a separator can never have
+    stood inside `` `code` ``, and splitting there would tear a code span in
+    half.  Spaces belonging to an escaped ``\\|`` are excluded for the same
+    reason.
+    """
+    protected = _find_backtick_spans(text)
+    escaped = _find_escaped_pipe_positions(text)
+    blocked = set()
+    for pos in escaped:
+        blocked.update({pos - 1, pos, pos + 1, pos + 2})
+
+    positions: list[int] = []
+    for idx, ch in enumerate(text):
+        if ch not in " \t":
+            continue
+        if idx in blocked:
+            continue
+        if any(lo <= idx < hi for lo, hi in protected):
+            continue
+        positions.append(idx)
+    return positions

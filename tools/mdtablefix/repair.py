@@ -5,9 +5,9 @@ Repair strategies:
   right-to-left, escaping the pipe between merged cells as ``\\|``.
 - **Undersplit** (too few columns): either a *lost separator* — a ``|``
   deleted from the middle of the row, which merged two columns into one
-  over-long cell — or a genuinely short row.  The first is reported and
-  left alone (the split point is unrecoverable), the second is padded with
-  trailing empty cells.
+  over-long cell — or a genuinely short row.  The first is re-split at the
+  word boundary the neighbouring rows' column widths point at; the second
+  is padded with trailing empty cells.
 - **Raw HTML**: a ``<tag>``-shaped run in a cell is entity-escaped so it
   renders literally instead of being swallowed (``<db>``) or opening a
   nested element that eats the rest of the table (``<table>``).
@@ -21,8 +21,10 @@ from .models import Cell, Fix, Row, Table
 from .tokenizer import (
     escape_embedded_pipes,
     escape_html_tags,
+    has_code_span,
     is_structural_html,
     raw_html_tag_names,
+    separator_space_positions,
     tokenize_row,
 )
 
@@ -262,29 +264,53 @@ def _repair_oversplit_row(row: Row, expected: int, table: Table) -> None:
 def _repair_undersplit_row(
     row: Row, expected: int, table: Table, profile: _ColumnProfile
 ) -> None:
-    """Repair — or, for a lost separator, only report — a short row.
+    """Repair a short row — by re-splitting it, or by padding it.
 
     Padding is right for a row an author simply ended early.  It is WRONG
     for a row whose separator was deleted mid-line: there the text of two
-    columns sits fused in one cell, appending an empty cell at the end
+    columns sits fused in one cell, and appending an empty cell at the end
     changes nothing about how GitHub renders it (GFM pads short rows by
-    itself), and the "repair" merely silences the report.  That case is
-    reported as an unrepairable ``lost_separator`` and the row is left
-    byte-identical, so the finding survives into every later run.
+    itself), so the "repair" would only silence the report.
+
+    A fused row is therefore re-split (see ``_plan_lost_separator``).  Only
+    when no boundary fits well enough is the row left byte-identical and
+    reported as needing a human — that finding then survives into every
+    later run instead of being papered over.
     """
-    lost_at = _find_lost_separator(row, expected, profile)
-    if lost_at is not None:
-        left = row.cells[lost_at].content
+    plan = _plan_lost_separator(row, expected, profile)
+    if plan is not None:
+        idx, left, right = plan
+        row.cells[idx] = Cell(content=left, is_code=has_code_span(left))
+        row.cells.insert(idx + 1, Cell(content=right, is_code=has_code_span(right)))
         table.fixes.append(
             Fix(
                 type="lost_separator",
                 line=row.line_number,
-                column=lost_at + 1,
+                column=idx + 1,
                 detail=(
-                    f"Column {lost_at + 1} and {lost_at + 2} are fused into "
-                    "one cell — a `|` separator is missing, not a trailing "
-                    "cell. Re-insert it by hand; the split point cannot be "
-                    f"recovered from the text. Cell: {_excerpt(left)}"
+                    f"Re-inserted the `|` lost between columns {idx + 1} and "
+                    f"{idx + 2}; the boundary is placed where this table's "
+                    "own column widths say it belongs — CHECK IT: "
+                    f"…{_excerpt(left, 40, tail=True)} | "
+                    f"{_excerpt(right, 40, head=True)}…"
+                ),
+            )
+        )
+        return
+
+    fused = _find_fused_cell(row, expected, profile)
+    if fused is not None:
+        table.fixes.append(
+            Fix(
+                type="lost_separator",
+                line=row.line_number,
+                column=fused + 1,
+                detail=(
+                    f"Column {fused + 1} and {fused + 2} are fused into one "
+                    "cell — a `|` separator is missing, not a trailing cell "
+                    "— but no word boundary in it matches the widths of the "
+                    "other rows, so the split point had to be left to a "
+                    f"human. Cell: {_excerpt(row.cells[fused].content)}"
                 ),
                 repaired=False,
             )
@@ -292,7 +318,7 @@ def _repair_undersplit_row(
         return
 
     missing = expected - len(row.cells)
-    for idx in range(missing):
+    for _ in range(missing):
         col = len(row.cells) + 1
         row.cells.append(Cell(content="", is_code=False))
         table.fixes.append(
@@ -305,7 +331,7 @@ def _repair_undersplit_row(
         )
 
 
-def _find_lost_separator(
+def _find_fused_cell(
     row: Row, expected: int, profile: _ColumnProfile
 ) -> int | None:
     """Return the index of the cell that swallowed a separator, or None.
@@ -318,8 +344,7 @@ def _find_lost_separator(
     2. The column that padding would leave empty is normally populated,
        so an empty cell there would be an anomaly in its own right.
 
-    The widest offender relative to its column wins; ties do not matter
-    because the finding is diagnostic, not a rewrite.
+    The widest offender relative to its column wins.
     """
     if len(row.cells) != expected - 1:
         return None
@@ -338,9 +363,82 @@ def _find_lost_separator(
     return best
 
 
-def _excerpt(text: str, width: int = 60) -> str:
-    """Return a short, single-line quotation of *text* for a message."""
+def _plan_lost_separator(
+    row: Row, expected: int, profile: _ColumnProfile
+) -> tuple[int, str, str] | None:
+    """Locate the lost ``|`` and return (cell index, left text, right text).
+
+    The generator that drops a separator drops the ``|`` and its padding
+    together, so the boundary survives only as ordinary whitespace between
+    two words — there is no marker left to find.  What IS left is the rest
+    of the table: every other row says how wide these two columns run.  So
+    each space in the fused cell is scored by how far the two halves it
+    would produce sit from those two medians, and the best-scoring space is
+    the boundary.
+
+    The score is in characters, so the acceptance bar is stated the same
+    way: the winning split must land within ~30% of the pair's combined
+    width (never tighter than 24 characters, which keeps narrow columns
+    from being impossible to satisfy).  On the row this was written for the
+    winner scored 2 against a bar of 51, with the runner-up six times
+    worse — a fit that loose would have to be, since a table whose columns
+    have no typical width cannot be reconstructed by any means.
+
+    Returns None when nothing clears the bar; the caller then reports the
+    row instead of guessing.
+    """
+    fused = _find_fused_cell(row, expected, profile)
+    if fused is None:
+        return None
+
+    med_left = profile.median_len[fused]
+    med_right = profile.median_len[fused + 1]
+    split = _best_split(row.cells[fused].content, med_left, med_right)
+    if split is None:
+        return None
+
+    cost, left, right = split
+    if cost > max(24.0, 0.30 * (med_left + med_right)):
+        return None
+    return fused, left, right
+
+
+def _best_split(
+    text: str, med_left: float, med_right: float
+) -> tuple[float, str, str] | None:
+    """Return (cost, left, right) for the best word boundary in *text*.
+
+    Cost is the total character-count deviation of the two halves from the
+    two column medians.  Boundaries inside backtick spans or inside an
+    escaped ``\\|`` are not candidates, and a split that would empty either
+    half is rejected.
+    """
+    best: tuple[float, str, str] | None = None
+    for pos in separator_space_positions(text):
+        left = text[:pos].rstrip()
+        right = text[pos:].lstrip()
+        if not left or not right:
+            continue
+        cost = abs(len(left) - med_left) + abs(len(right) - med_right)
+        if best is None or cost < best[0]:
+            best = (cost, left, right)
+    return best
+
+
+def _excerpt(
+    text: str, width: int = 60, tail: bool = False, head: bool = False
+) -> str:
+    """Return a short, single-line quotation of *text* for a message.
+
+    With *tail* / *head* one end is shown verbatim instead of an elided
+    middle — used to print the two sides of a reconstructed boundary, where
+    only the characters adjoining it matter.
+    """
     flat = " ".join(text.split())
+    if tail:
+        return flat[-width:]
+    if head:
+        return flat[:width]
     if len(flat) <= width:
         return repr(flat)
     half = width // 2 - 2

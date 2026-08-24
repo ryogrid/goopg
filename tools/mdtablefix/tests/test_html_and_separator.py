@@ -8,7 +8,8 @@ rendered output is wrong, which is why the pipe-centric passes missed them:
   inside the cell so that every following row nests inside it;
 * a column separator deleted from the middle of a row, fusing two columns
   into one cell.  Padding the row at the END — what the tool used to do —
-  changes nothing on GitHub, so this one is reported, not rewritten.
+  changes nothing on GitHub, so the row is re-split instead, at the word
+  boundary the neighbouring rows' column widths point at.
 """
 
 from __future__ import annotations
@@ -100,7 +101,7 @@ class TestHtmlTagRepair(unittest.TestCase):
 
 
 class TestLostSeparator(unittest.TestCase):
-    """A separator deleted mid-row is reported, never silently padded."""
+    """A separator deleted mid-row is re-inserted, never silently padded."""
 
     # Column 3 is populated and ~30 chars wide on every well-formed row, so
     # a short row whose column-2 cell has clearly absorbed one of those is a
@@ -111,19 +112,51 @@ class TestLostSeparator(unittest.TestCase):
         "| - | third resume point yyy | why the work was deferred now |",
     ]
 
-    def test_fused_row_is_reported_not_padded(self):
+    def test_fused_row_is_re_split_at_the_right_boundary(self):
         fused = (
             "| - | resume point text here why the work was deferred now |"
         )
         table = repair_table(build_table(*self.WELL_FORMED, fused))
         row = table.data_rows[-1]
-        # Left byte-identical: no empty cell appended, so the finding is
-        # re-reported on every later run until a human fixes it.
+        self.assertEqual(len(row.cells), 3)
+        self.assertEqual(row.cells[1].content, "resume point text here")
+        self.assertEqual(row.cells[2].content, "why the work was deferred now")
+        fix = next(f for f in table.fixes if f.type == "lost_separator")
+        self.assertTrue(fix.repaired)
+        self.assertEqual(fix.column, 2)
+        self.assertEqual([f for f in table.fixes if f.type == "missing_cell"], [])
+
+    def test_re_split_is_lossless_and_idempotent(self):
+        """The repair only turns one space into ` | `, and settles there."""
+        fused = (
+            "| - | resume point text here why the work was deferred now |"
+        )
+        table = repair_table(build_table(*self.WELL_FORMED, fused))
+        cells = [c.content for c in table.data_rows[-1].cells]
+        self.assertEqual(
+            " ".join(cells[1:]),
+            "resume point text here why the work was deferred now",
+        )
+        rebuilt = "| " + " | ".join(cells) + " |"
+        again = repair_table(build_table(*self.WELL_FORMED, rebuilt))
+        self.assertEqual(
+            [c.content for c in again.data_rows[-1].cells], cells
+        )
+        self.assertEqual(
+            [f for f in again.fixes if f.type == "lost_separator"], []
+        )
+
+    def test_unsplittable_cell_is_reported_for_a_human(self):
+        """No word boundary fits → report, do not guess and do not pad."""
+        # One unbroken token: the only candidate boundaries are the spaces
+        # around it, and both leave a half wildly off its column's width.
+        fused = "| - | " + "x" * 60 + " y |"
+        table = repair_table(build_table(*self.WELL_FORMED, fused))
+        row = table.data_rows[-1]
         self.assertEqual(len(row.cells), 2)
         fix = next(f for f in table.fixes if f.type == "lost_separator")
         self.assertFalse(fix.repaired)
-        self.assertEqual(fix.column, 2)
-        self.assertEqual([f for f in table.fixes if f.type == "missing_cell"], [])
+        self.assertIn("left to a", fix.detail)
 
     def test_genuinely_short_row_is_still_padded(self):
         short = "| - | tiny |"
