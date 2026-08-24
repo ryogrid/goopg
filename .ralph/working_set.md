@@ -1,59 +1,69 @@
-Task just completed: M0134-0128 (hash_func.sql) — sized live, PARKED, two
-contained fixes shipped.
+Task just completed: M0134-0129 (indirect_toast.sql) — sized live, PARKED,
+one major contained fix shipped (a real data-corruption bug, not a display
+bug).
 
-`scripts/pg-regress-runner.sh hash_func`: 0% parity, diff 447→317 lines
-(374-line expected output). Unusual shape among M0134 cases: every query is
-a self-consistency check (`WHERE hash != extended0 OR hash == extended1`
-expecting 0 rows) — no fixed hash values pinned, so any internally-consistent
-extended/non-extended pair passes regardless of exact bit-for-bit PG match
-(though this implementation does match, since it reuses hash_partition.go's
-already-PG-faithful primitives).
+`scripts/pg-regress-runner.sh indirect_toast`: 0% parity, diff 184→25 lines
+(86% reduction). Discovery: `UPDATE ... SET f1 = '-'||f1||'-'` on a TOASTed
+column evaluated the RHS against `scanMatching`'s raw (never-detoasted) row
+(`internal/executor/operators_storage.go`), so the concatenation
+stringified the 12-byte `KindToastPointer` datum via `AppendValueText`'s
+`?datum kind=N?` fallback and durably wrote that garbage back as the
+column's real new value — confirmed via VACUUM FREEZE + fresh SELECT that
+this was on-disk corruption, not just a RETURNING-display artifact.
 
-Two independent contained fixes landed:
-1. `integer::bit(n)` cast had ZERO support (blocked every statement in the
-   file) — `5::bit(32)` silently stringified to "5" instead of PG's 32-digit
-   binary string. Added `intToBitTypmodString` (internal/executor/expr.go,
-   mirrors PG's bitfromint4/bitfromint8: low-N-bits copy when typmod fits the
-   source width, sign-extension otherwise) wired into the CastExpr eval site
-   ahead of evalCastTyped (bit width lives in x.Typmod, which
-   evalCastTyped's two-string signature has no slot for).
-2. hashint2/4/8/oid/char/float4/float8/name/text/bpchar + their *extended
-   siblings were pg_proc-seeded but had ZERO scalar-call dispatch (42883
-   even for hashint8, which already has a Go impl only reachable via
-   LANGUAGE INTERNAL routine bodies, plpgsql_runtime.go). Added
-   evalHashFunc (internal/executor/expr.go) wired from 10 new case labels in
-   evalFuncCall's switch, reusing hash_partition.go's Jenkins-hash primitives
-   (pgHashUint32Extended/pgHashBytesExtended/pgHashInt8, M0097-0027 +
-   M0134-0071) — pure wiring, no new algorithm work. Added one new primitive
-   pgHashUint32 (hash_partition.go).
+Fixed four sites (all `internal/executor/operators_storage.go`):
+1. `scanMatching`'s WHERE-predicate eval — lazily-detoasted eval-only row.
+2. `updateOp`'s non-inherit-child SET-expression loop — same pattern; the
+   unset-column passthrough branch still copies the RAW `row[i]`, so an
+   untouched out-of-line column keeps its existing TOAST pointer instead of
+   being needlessly re-toasted (matches PG's behaviour — the exact
+   invariant this test file is named for).
+3. `updateOp`'s inheritance-child branch — detoast BEFORE
+   `remapChildRowToParent` (pointers are scoped to the child's own TOAST
+   relation).
+4. `updateOp.appendUpdateRetRowWithFrom` (RETURNING projection) — detoast
+   `newRow` before evaluating `o.plan.Returning`; this is what fixed the
+   *first* UPDATE in the file (no SET-clause touching f1/f2 at all).
 
-New tests: TestHashFuncScalarFamily (13 subtests), TestIntToBitTypmodCast
-(internal/executor/hash_func_scalar_test.go).
+Second-order regression found+fixed mid-loop: once SET-expr results carry
+their real (large) value, `tryApplyHOTUpdate`'s in-place HOT-update path
+had zero re-toast step (unlike `writeHeapRowReturning`) and hit `ERROR:
+tuple too large for line pointer` — added the missing
+`ToastLargeColumnsIfNeeded` call there too.
 
-Design `docs/design/m0134-0128-hash-func-scalar-family.md`, indexed in
-README.md. Ledger row: `.ralph/deferral_ledger.md` 2026-08-24 M0134-0128.
+New test: `TestToastUpdateSetSelfReferenceDetoasts`
+(`internal/executor/toast_update_selfref_test.go`).
+
+Design `docs/design/m0134-0129-toast-update-selfref.md`, indexed in
+README.md. Ledger row: `.ralph/deferral_ledger.md` 2026-08-24 M0134-0129.
 CSV flipped `not-tried` → `failed` via `make regen-testport`. fix_plan.md
-M0134-0128 marked [x] with full summary.
+M0134-0129 marked [x] with full summary.
 
-Deferred (18 more hash-function families, each needs type-specific
-canonical-byte encoding or a general type→hash-proc dispatch mechanism):
-hashmacaddr/hashmacaddr8/hashinet, hash_numeric (needs PG's base-10000
-digit/weight extraction — goopg's numeric Datum isn't stored that way),
-hash_array/hash_record/hash_range/hash_multirange (need a generic runtime
-type→hash-proc dispatch — only precedent is LookupOpClassHashFunc, opclass-
-scoped only), hashoidvector, hash_aclitem, hashenum (needs the enum label's
-assigned OID — goopg's KindEnum Datum only carries {SortOrder,Label}),
-time_hash/timetz_hash/interval_hash/timestamp_hash, uuid_hash, pg_lsn_hash,
-jsonb_hash. Also noted in passing (NOT this task's scope): `-'NaN'::float4`/
-`-'NaN'::float8` raises a spurious "operator unary - requires integer or
-numeric" — pre-existing unrelated evaluator bug surfaced by this file's
-float special-case probes.
+Deferred (ledger row, resume point recorded): the SAME TOAST-self-reference
+bug class was fixed ONLY for the plain (non-FROM, non-index-probe,
+may-be-inherit-child) `updateOp` scan path. `updateOp.updateWithFrom`
+(UPDATE ... FROM), `updateOp.updateViaIndex` (single-key B-tree probe), and
+`deleteOp`'s scan callbacks each have differently-shaped row-handling code
+that was NOT audited this loop — a `DELETE ... WHERE substring(toasted_col,
+...) = ...` or `UPDATE ... FROM ... SET toasted_col = toasted_col ||
+other` likely hits the identical bug today. Resume: grep
+`operators_storage.go` for `evalExpr(o.plan.Set[` (the `updateWithFrom`
+occurrence) and the `deleteOp` scanMatching callbacks; apply the same
+lazily-detoasted-eval-row pattern.
+
+Remaining 25-line diff in indirect_toast.sql itself is the file's
+`make_tuple_indirect` LANGUAGE C helper — unchanged standing blocker
+(M0134-0106/-0116/-0120 dynamic-extension-loading gap).
 
 NEXT LOOP: per the Current Priority banner, continue M0134 top-to-bottom —
-next unworked item is **M0134-0129 — indirect_toast.sql**. Size it live
-first per the established pattern (run pg-regress-runner, read the diff,
-check whether the root cause is a shared/already-tracked blocker before
-assuming fresh work).
+next unworked item is **M0134-0130 — inet.sql**. Size it live first per the
+established pattern (run pg-regress-runner, read the diff, check whether
+the root cause is a shared/already-tracked blocker before assuming fresh
+work). Also worth a quick look: given this loop found the TOAST-self-
+reference bug class is NOT limited to indirect_toast.sql, a future loop
+could productively spend a slot auditing `updateWithFrom`/`updateViaIndex`/
+`deleteOp` directly (see Deferred above) rather than waiting for another
+regress file to surface it.
 
 Standing recommendation, carried across several loops (unchanged this loop):
 1. **GIN/GiST/SPGiST physical-index plan integration** — confirmed across
@@ -66,7 +76,7 @@ Standing recommendation, carried across several loops (unchanged this loop):
    gist.sql shared blocker, resume points in
    `docs/design/m0134-0125-geometry-sizing.md`.
 3. LANGUAGE C dynamic-extension loading gap — recurs across M0134-0106,
-   -0116, -0120, create_operator/create_type adjacent files.
+   -0116, -0120, -0129, create_operator/create_type adjacent files.
 4. Collation-execution-registry gap recurs across FIVE parked files
    (M0134-0099/-0100/-0101/-0102).
 5. BETWEEN-vs-comparison-operator precedence bug (M0134-0113) — silently
@@ -88,30 +98,33 @@ Standing recommendation, carried across several loops (unchanged this loop):
     non-"postgres"-named `CREATE ROLE ... SUPERUSER` role — worth a
     dedicated sweep.
 
-Gates run this loop: scripts/pg-regress-runner.sh hash_func (sizing run, 0/1,
-before and after the fix — 447→317 diff lines); go build ./... PASS; go test
-./internal/executor/... ./internal/parser/... PASS (includes 2 new test
-funcs, 15 subtests); RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
-PASS (all packages, cold internal/initdb 435s + cmd/goopg 77s, rest cached);
-scripts/tpch-spotcheck.sh PASS (Q12=2 rows 21.9s, Q13=35 rows 8.1s, 31.8s
-query-phase wall); make check-testport-inventory PASS; make regen-testport
-PASS; make ralph-state-guard: found the same benign stale clean-exit-marker
-status/progress mismatch as prior loops, auto-repaired to progress=in_progress;
-pre-commit hook's pgbench smoke will run automatically at commit time.
+Gates run this loop: scripts/pg-regress-runner.sh indirect_toast (sizing
+run, 0/1, before and after the fix — 184→25 diff lines); minimal repro via
+a throwaway cgroup-capped server + psql (verified each of the four fix
+sites individually before running the full regress case); go build ./...
+PASS; go test ./internal/executor/... PASS (includes 1 new test func);
+scripts/tpch-spotcheck.sh PASS (Q12=2 rows 20.4s, Q13=35 rows 7.6s, 29.8s
+query-phase wall); RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
+PASS (all packages, cold internal/initdb 428s + cmd/goopg 75s, rest cached);
+make check-testport-inventory PASS; make regen-testport PASS; pre-commit
+hook's pgbench smoke ran automatically at commit time and PASSED (TPC-B
+337 TPS, simple-update 623 TPS, select-only 12446 TPS — all zero failed
+transactions); make ralph-state-guard: found the same benign stale
+clean-exit-marker status/progress mismatch as prior loops, auto-repaired to
+progress=in_progress.
 
 In-flight: none.
 
 Note: a concurrent peer session's WIP was present in the tree again this
 loop (.ralph/progress.json, .ralphrc, analysis/*, ci/logs/launch.log,
 ci/logs/scheduler.log, docs/wiki/*,
-internal/executor/operators_recursive_cte.go, postgres (untracked convenience
-symlink), third-party/tpcds-postgres, plus new untracked files
+internal/executor/operators_recursive_cte.go, postgres (untracked
+convenience symlink), third-party/tpcds-postgres, plus untracked files
 analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt) and was
 deliberately left untouched/uncommitted — only this loop's own files were
 staged and committed by explicit pathspec.
 
-M-NIGHTLY: not re-checked this loop (working_set.md is written after the
-main task; nightly triage happens at loop start per the standing rule — no
-new ci/logs/action-items.md run observed to differ from the prior loop's
-already-filed 20260824-013441 run during this loop's brief look at the
-directory).
+M-NIGHTLY: re-checked at loop start — `ci/logs/action-items.md` run
+20260824-013441 (2 items) was already filed in fix_plan.md by a prior loop
+(confirmed via grep for the run ID at fix_plan.md:1303); nothing new to
+file this loop.
