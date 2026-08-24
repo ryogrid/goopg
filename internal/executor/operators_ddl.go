@@ -20059,6 +20059,24 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					Message: fmt.Sprintf("cannot drop role %s because it is required by the database system", roleName)}
 			}
 			exists := o.ctx.Catalog.RoleExists(roleName)
+			// checkSharedDependencies (postgres/src/backend/catalog/
+			// pg_shdepend.c ~660-870) — refuse the drop while roleName
+			// still holds a table/database ACL grant or owns a table.
+			// Bounded port: see RoleDropDependencyDescriptions's doc
+			// comment (catalog.go) for exactly which dependency shapes are
+			// (and are not) covered. IF EXISTS does not bypass this check
+			// in real PG when the role does exist — only the "does not
+			// exist" branch below is IF-EXISTS-conditional.
+			if exists {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					if deps := im.RoleDropDependencyDescriptions(roleName); len(deps) > 0 {
+						return &ExecError{Code: "2BP01", Pos: s.Pos(),
+							Message: fmt.Sprintf("role %q cannot be dropped because some objects depend on it", roleName),
+							Detail:  strings.Join(deps, "\n"),
+						}
+					}
+				}
+			}
 			if s.IfExists {
 				if !exists {
 					o.ctx.AddNotice(fmt.Sprintf("role %q does not exist, skipping", name.Name))

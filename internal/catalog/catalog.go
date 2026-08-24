@@ -16241,6 +16241,68 @@ func (c *InMemory) RenameRole(oldName, newName string) bool {
 	return true
 }
 
+// RoleDropDependencyDescriptions is a bounded port of pg_shdepend's
+// checkSharedDependencies (postgres/src/backend/catalog/pg_shdepend.c
+// ~660-870), invoked by DROP ROLE/USER/GROUP to refuse the drop with PG's
+// `role "%s" cannot be dropped because some objects depend on it` /
+// per-line DETAIL when roleName still holds a non-owner ACL grant or owns a
+// table. Only the two dependency shapes goopg's `tableACLs`/`Table.Owner`
+// registries can currently answer are covered: SHARED_DEPENDENCY_ACL
+// ("privileges for table/database X", via the OID-keyed tableACLs store
+// GRANT/REVOKE already maintain — shared between tables and databases, see
+// execDatabaseACLChange's doc comment) and SHARED_DEPENDENCY_OWNER for
+// tables ("owner of table X", via Table.Owner). Sequence/schema/function/
+// type ownership and default-privilege ownership are NOT tracked here (no
+// per-object-kind owner registry exists yet for those kinds) — ledgered as
+// a REFACTOR-tier follow-up (M0134-0118). Results are returned in OID order
+// (ACL dependents first, then ownership dependents), which is a reasonable
+// approximation of PG's shared_dependency_comparator sort for the
+// single-object-type cases this covers, but is not a full port of that
+// comparator (classid-then-objid across every dependency kind at once).
+func (c *InMemory) RoleDropDependencyDescriptions(roleName string) []string {
+	role := strings.ToLower(strings.TrimSpace(roleName))
+	if role == "" || role == aclOwnerRole {
+		return nil
+	}
+	c.mu.RLock()
+	var aclOids []uint32
+	for oid, byRole := range c.tableACLs {
+		// A privilege's boolean value records its WITH GRANT OPTION flag
+		// (GrantTablePrivilegeWithGrantOption: `privs[priv] = privs[priv] ||
+		// withGrantOption`), not whether it is held at all — the key's mere
+		// presence in the map is the grant. An empty privs map is dropped
+		// entirely by RevokeTablePrivilege, so a non-empty map here always
+		// means at least one live grant.
+		if privs, ok := byRole[role]; ok && len(privs) > 0 {
+			aclOids = append(aclOids, oid)
+		}
+	}
+	dbNameByOid := make(map[uint32]string, len(c.databaseOid))
+	for name, oid := range c.databaseOid {
+		dbNameByOid[oid] = name
+	}
+	c.mu.RUnlock()
+	sort.Slice(aclOids, func(i, j int) bool { return aclOids[i] < aclOids[j] })
+
+	var descs []string
+	for _, oid := range aclOids {
+		if t, _, ok := c.LookupTableByOIDAllDBs(oid); ok {
+			descs = append(descs, "privileges for table "+t.Name)
+			continue
+		}
+		if name, ok := dbNameByOid[oid]; ok {
+			descs = append(descs, "privileges for database "+name)
+			continue
+		}
+	}
+	for _, t := range c.AllTables() {
+		if strings.EqualFold(t.Owner, roleName) {
+			descs = append(descs, "owner of table "+t.Name)
+		}
+	}
+	return descs
+}
+
 // RoleOID returns the OID minted for a registered role, resolving the seeded
 // bootstrap superuser (`postgres`, OID 10 = BOOTSTRAP_SUPERUSERID) which is not
 // stored in the user-role map, and PG18's 16 built-in "pg_*" predefined roles

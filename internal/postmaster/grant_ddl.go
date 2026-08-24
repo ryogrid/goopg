@@ -199,7 +199,7 @@ func (s *Server) tryRecordTableGrant(stmt string, actingRole string) error {
 		return nil
 	}
 	tables := splitGrantList(objPart)
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	for _, t := range tables {
 		on := objectNameFromIdent(t)
 		tbl, ok := s.cfg.Catalog.LookupTable(on)
@@ -331,7 +331,7 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 		return
 	}
 	tables := splitGrantList(objPart)
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	for _, t := range tables {
 		on := objectNameFromIdent(t)
 		tbl, ok := s.cfg.Catalog.LookupTable(on)
@@ -376,7 +376,7 @@ func (s *Server) recordSchemaGrant(objPart, rolePart, privPart string, withGrant
 		return
 	}
 	schemas := splitGrantList(objPart)
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	for _, sc := range schemas {
 		oid := s.cfg.Catalog.SchemaOID(strings.Trim(strings.TrimSpace(sc), `"`))
 		if oid == 0 {
@@ -401,7 +401,7 @@ func (s *Server) recordSchemaRevoke(objPart, rolePart, privPart string) {
 		return
 	}
 	schemas := splitGrantList(objPart)
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	for _, sc := range schemas {
 		oid := s.cfg.Catalog.SchemaOID(strings.Trim(strings.TrimSpace(sc), `"`))
 		if oid == 0 {
@@ -440,7 +440,7 @@ func (s *Server) recordForeignServerGrant(objPart, rolePart, privPart string, wi
 		return
 	}
 	servers := splitGrantList(objPart)
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	for _, srv := range servers {
 		oid := s.cfg.Catalog.ForeignServerOID(strings.Trim(strings.TrimSpace(srv), `"`))
 		if oid == 0 {
@@ -466,7 +466,7 @@ func (s *Server) recordForeignServerRevoke(objPart, rolePart, privPart string) {
 		return
 	}
 	servers := splitGrantList(objPart)
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	for _, srv := range servers {
 		oid := s.cfg.Catalog.ForeignServerOID(strings.Trim(strings.TrimSpace(srv), `"`))
 		if oid == 0 {
@@ -503,7 +503,7 @@ func (s *Server) recordForeignDataWrapperGrant(objPart, rolePart, privPart strin
 		return
 	}
 	fdws := splitGrantList(objPart)
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	for _, fdw := range fdws {
 		oid := s.cfg.Catalog.ForeignDataWrapperOID(strings.Trim(strings.TrimSpace(fdw), `"`))
 		if oid == 0 {
@@ -529,7 +529,7 @@ func (s *Server) recordForeignDataWrapperRevoke(objPart, rolePart, privPart stri
 		return
 	}
 	fdws := splitGrantList(objPart)
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	for _, fdw := range fdws {
 		oid := s.cfg.Catalog.ForeignDataWrapperOID(strings.Trim(strings.TrimSpace(fdw), `"`))
 		if oid == 0 {
@@ -580,7 +580,7 @@ func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string, withGra
 	if !hasExecute {
 		return
 	}
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	if len(roles) == 0 {
 		return
 	}
@@ -624,7 +624,7 @@ func (s *Server) recordFunctionRevoke(objPart, rolePart, privPart string) {
 	if !hasExecute {
 		return
 	}
-	roles := splitGrantList(rolePart)
+	roles := splitRoleGrantList(rolePart)
 	if len(roles) == 0 {
 		return
 	}
@@ -722,6 +722,24 @@ func splitGrantList(list string) []string {
 		}
 	}
 	return out
+}
+
+// splitRoleGrantList is splitGrantList for a GRANT/REVOKE role_specification
+// list, additionally stripping gram.y's legacy per-item `GROUP` keyword
+// (RoleSpec: `[GROUP] role_name` — a no-op PostgreSQL keeps for backward
+// compatibility, e.g. `GRANT … TO GROUP some_role`). Without this, `TO GROUP
+// regress_dep_group` records a grant under the literal role name "group
+// regress_dep_group" instead of "regress_dep_group", so a later `REVOKE …
+// FROM GROUP regress_dep_group` or `DROP GROUP regress_dep_group` dependency
+// check never finds it. M0134-0118.
+func splitRoleGrantList(list string) []string {
+	items := splitGrantList(list)
+	for i, v := range items {
+		if rest, ok := cutLeadingKeyword(v, "group"); ok {
+			items[i] = strings.TrimSpace(rest)
+		}
+	}
+	return items
 }
 
 // splitFunctionList splits a comma-separated list of routine signatures while

@@ -161,6 +161,15 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		}
 		// Capture the OID before the registry removal — the heap DELETE
 		// (B4.5) stamps the pg_authid row by oid.
+		//
+		// NOTE: this "drop role/user/group" arm is dead for the actual
+		// wire-protocol DROP ROLE/USER/GROUP statement — that parses as a
+		// generic parser.DropCompatStmt and is handled entirely by
+		// executor's execDropCompat (operators_ddl.go), which is also
+		// where RoleDropDependencyDescriptions is wired in (see there for
+		// the live dependency-check call site; root-0021's dispatch.go
+		// comment documents the same bypass for OnRoleDropped). This arm
+		// only still fires for tests that call tryHandleRoleDDL directly.
 		var oid uint32
 		if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
 			oid, _ = im.RoleOID(name)
@@ -863,6 +872,7 @@ func roleDoesNotExistErr(name string) error {
 func roleAlreadyExistsErr(name string) error {
 	return &roleError{code: errcodes.DuplicateObject, msg: "role \"" + name + "\" already exists"}
 }
+
 
 // reservedRoleNameErr builds PG's 42939-shaped "reserved role name" error
 // (RenameRole's IsReservedName check, user.c: names starting with "pg_" are
