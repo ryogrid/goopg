@@ -1,76 +1,85 @@
-Task just completed: M0134-0111 (create_index_spgist.sql) — sized live
-against PG 18.3 oracle: PARKED (case genuinely `failed`, diff 1576→1516
-lines / 0% parity).
+Task just completed: M0134-0114 (create_role.sql) — sized live against PG 18.3
+oracle via scripts/pg-regress-runner.sh: PARKED (diff 259→204 lines, still 0%
+parity — single-test suite, not fully green).
 
-Landed two contained fixes:
-1. `point <@ box` / `box @> point` containment (internal/executor/expr.go,
-   the `parser.OpContainedBy`/`OpContains`/`OpOverlap` arm from M0097-0023)
-   only ever attempted box-vs-box parsing (`parseBoxText` both sides) — a
-   bare point operand always hard-errored "invalid box value", even in the
-   file's pure-seqscan section that needs no index. Fixed via a
-   `parsePointText` fallback (treat point as degenerate box, equal corners
-   — existing containment formulas need no further branching).
-2. `starts_with(text, text)` (pg_proc oid 3696) — catalog-registered
-   (isKnownBuiltinFunction) but zero `evalFuncCall` dispatch arm; added
-   beside the existing `left`/`right` cases.
+Root cause: goopg's CREATE ROLE/ALTER ROLE/DROP ROLE run entirely through a
+text-substitution intercept (internal/postmaster/role_ddl.go's
+tryHandleRoleDDL, ahead of the parser, which has no role-DDL grammar) and had
+ZERO privilege enforcement — at least 4 independent root-cause buckets.
 
-Both covered by new unit tests: internal/executor/geometry_containment_test.go
-(TestEvalPointBoxContainment), internal/executor/starts_with_test.go
-(TestEvalStartsWith).
+Landed: ported PG's CreateRole/AlterRole permission gates
+(postgres/src/backend/commands/user.c) into two new functions in
+internal/postmaster/role_ddl.go:
+- checkCreateRolePrivileges — non-superuser needs CREATEROLE to create any
+  role, can never hand out SUPERUSER, can only hand out
+  CREATEDB/REPLICATION/BYPASSRLS if it holds that attribute itself.
+- checkAlterRoleAttrPrivileges — touching SUPERUSER always requires
+  superuser; touching CREATEDB/REPLICATION/BYPASSRLS requires the actor hold
+  it.
+Wired via a new variadic `actingRole ...string` trailing param on
+tryHandleRoleDDL, passed from the two real wire-dispatch call sites
+(internal/postmaster/dispatch.go, dispatch_extended.go).
 
-Design docs/design/m0134-0111-create-index-spgist-sizing.md, README.md
-indexed. fix_plan.md M0134-0111 marked [x] PARKED. Ledger row appended
-(.ralph/deferral_ledger.md, M0134-0111): two independent multi-file gaps
-left the case at 0% parity —
-(a) the operator lexer (internal/parser/lexer.go:548-575) only recognizes a
-    hardcoded 2/3-char operator whitelist, not PG's real graphic-operator-
-    char grammar (scan.l), so `<<|`, `|>>`, `~=`, `~<~`, `~<=~`, `~>=~`,
-    `~>~`, `^@` all fail as syntax errors — SYSTEMIC, not SP-GiST-specific;
-    likely affects other already-parked/not-tried M0134 cases too (not yet
-    swept).
-(b) SP-GiST (internal/executor/amutils.go, operators_ddl.go:7537-7543) is
-    catalog-metadata-only, same class as GiST/BRIN — zero physical
-    quad-tree/kd-tree/radix-tree storage anywhere, so every
-    indexscan/bitmapscan EXPLAIN plan in the file diverges to Seq Scan.
+Design docs/design/m0134-0114-create-role-sizing.md, README.md indexed.
+fix_plan.md M0134-0114 marked [x] PARKED. Ledger row appended
+(.ralph/deferral_ledger.md, M0134-0114): remaining gaps —
+(1) ADMIN-OPTION-on-target-role + object-ownership enforcement for
+    ALTER/RENAME/DROP ROLE and DROP/ALTER...OWNER TO (goopg's
+    operators_ddl_role_membership.go already has IsAdminOfRole but
+    role_ddl.go doesn't consult it — likely the next-cheapest bucket).
+(2) REASSIGN OWNED BY has zero parser support at all.
+(3) createrole_self_grant GUC + automatic self-grant semantics unimplemented.
+(4) SYSID backward-compat NOTICE missing (no notice channel in
+    tryHandleRoleDDL's return shape).
 
 NEXT LOOP: per the Current Priority banner in .ralph/fix_plan.md, continue
-M0134 top-to-bottom — next unworked item is **M0134-0112
-(create_misc.sql)**.
+M0134 top-to-bottom — next unworked item is **M0134-0115
+(create_schema.sql)**.
 
-Standing recommendation (carried across several loops, still open):
-1. brin_summarize_range/brin_desummarize_range unimplemented, blocks 3 files
-   (M0134-0095/-0096/-0097 PARKs).
-2. A collation-execution-registry gap recurs across FIVE parked files
+Standing recommendation (carried across several loops, still open — see prior
+working_set snapshots / deferral ledger for full detail on each):
+1. brin_summarize_range/brin_desummarize_range unimplemented (M0134-0095/-
+   0096/-0097 PARKs).
+2. Collation-execution-registry gap recurs across FIVE parked files
    (M0134-0099/-0100/-0101/-0102).
-3. bucket (5) from M0134-0102: internal/executor/expr.go length/upper/lower/
-   etc. swallow a nested function-not-found error into NULL instead of
-   propagating 42883 (systemic, cross-file).
-4. The ctid/tableoid system-column pattern (13-file wiring, M0134-0104) is a
-   template a future loop could generalize to cmin/cmax/xmin/xmax.
-5. LANGUAGE C dynamic-extension-loading gap (M0134-0106) — no C-extension
-   loader exists anywhere in goopg.
+3. expr.go length/upper/lower/etc. swallow nested function-not-found errors
+   into NULL instead of 42883 (M0134-0102 bucket 5, systemic).
+4. ctid/tableoid system-column pattern (M0134-0104) generalizes to
+   cmin/cmax/xmin/xmax.
+5. LANGUAGE C dynamic-extension loading gap (M0134-0106) — no loader exists.
 6. EUC_JP/UTF8 real Unicode mapping tables unported (M0134-0107).
 7. `CREATE TABLE ... USING <am>` has zero parser support (M0134-0109).
 8. `::` cast evaluator never consults pg_cast for user-defined casts
    (M0134-0110).
-9. NEW this loop (M0134-0111): the operator-lexer whitelist gap
-   (internal/parser/lexer.go:548-575, hardcoded 2/3-char switch instead of
-   PG's general graphic-operator-char grammar) is itself a template gap
-   worth a future dedicated milestone — likely blocks other not-yet-sized
-   M0134 cases that use non-whitelisted operator spellings (not spot-checked
-   against other parked/not-tried rows yet).
+9. Operator-lexer whitelist gap (internal/parser/lexer.go:548-575, hardcoded
+   2/3-char switch vs PG's general graphic-operator-char grammar) —
+   M0134-0111, worth a dedicated milestone.
+10. ALTER TABLE RENAME COLUMN inheritance recursion missing entirely
+    (M0134-0112).
+11. RAISE INFO/LOG/DEBUG collapse to hardcoded NOTICE wire severity
+    (M0134-0113, ~18-call-site blast radius in plpgsql_runtime.go).
+12. BETWEEN-vs-comparison-operator precedence bug (M0134-0113) — silently
+    wrong for ANY query today, cross-cutting, candidate for a standalone
+    bug-hunt loop.
+13. NEW this loop: role-DDL privilege enforcement (M0134-0114) was FULLY
+    ABSENT before this loop — the two landed checks cover attribute
+    giveaway only; ADMIN-OPTION/ownership enforcement (item 1 above) is
+    the natural next slice and likely recurs across other not-yet-sized
+    M0134 role/privilege-adjacent cases (e.g. GRANT/REVOKE-heavy files).
 
-Gates run: go build ./... clean; go test ./internal/executor/...
-./internal/parser/... PASS (new TestEvalPointBoxContainment,
-TestEvalStartsWith green); RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh PASS (all unit packages, ~458s cold
-internal/initdb run — toolchain/branch state, not a regression); make
+Gates run (subagent-reported): go build ./... clean; go test
+./internal/parser/... ./internal/executor/... ./internal/postmaster/... PASS;
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS; make
 regen-testport clean; make check-testport-inventory PASS; make
-ralph-state-guard PASS (auto-repaired the same benign stale
-running-vs-completed status/progress mismatch seen in prior loops, then
-confirmed consistent). Pre-commit hook's pgbench smoke runs automatically at
-commit time — mandatory, never bypassed.
+ralph-state-guard PASS (auto-repaired a stale status/progress mismatch, then
+confirmed consistent). Pre-commit hook's pgbench smoke ran automatically at
+commit time — PASS. Commit 2d392628 pushed to origin/regress-renumbering.
 
-In-flight: none. No throwaway test servers were started this loop (sizing
-used scripts/pg-regress-runner.sh's own managed throwaway cluster, which
-cleans itself up).
+In-flight: none.
+
+Note: a concurrent peer session's WIP was present in the tree this loop
+(.ralphrc, docs/wiki/*, ci/logs/*, analysis/*,
+internal/executor/operators_recursive_cte.go, third-party/tpcds-postgres,
+untracked `postgres` symlink) and was deliberately left untouched/
+uncommitted — only the M0134-0114 files were staged and committed by
+explicit pathspec.
