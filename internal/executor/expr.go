@@ -16394,6 +16394,45 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			return NewStringDatum(strconv.FormatUint(uint64(uint32(v.Int)), 8)), nil
 		}
+	case "float4send":
+		// float4send(real) -> bytea: the binary-protocol send function,
+		// pq_sendfloat4 (postgres/src/backend/utils/adt/float.c:350) — the
+		// IEEE-754 bits reinterpreted as uint32 and packed big-endian
+		// (pqformat.c:252), 4 bytes, no text involved. Callable directly
+		// from SQL (float4.sql exercises it to bit-check float4in/float4out
+		// round-tripping); goopg previously only reached this encoding via
+		// the FORMAT binary COPY/wire path (copy_binary.go's "float4" arm),
+		// never as a standalone scalar function. M0134-0153.
+		if len(x.Args) == 1 {
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			f, ferr := pgFloatFromDatum(v, 32)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			b := make([]byte, 4)
+			binary.BigEndian.PutUint32(b, math.Float32bits(float32(f)))
+			return NewBytesDatum(b), nil
+		}
+	case "float8send":
+		// float8send(double precision) -> bytea: sibling of float4send
+		// above, pq_sendfloat8 (float.c:567), 8-byte big-endian IEEE-754.
+		// M0134-0153.
+		if len(x.Args) == 1 {
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			f, ferr := pgFloatFromDatum(v, 64)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			b := make([]byte, 8)
+			binary.BigEndian.PutUint64(b, math.Float64bits(f))
+			return NewBytesDatum(b), nil
+		}
 	case "get_byte":
 		// get_byte(bytea, int4) -> int4 (postgres/src/backend/utils/adt/
 		// varlena.c:3310-3329 byteaGetByte). M0134-0070.
