@@ -12,13 +12,23 @@ class Fix:
 
     Attributes:
         type: Kind of repair.  Cell-level: escaped_pipe, missing_cell,
-            extra_cell.  Structural (whole-row / whole-table): blank_line
+            extra_cell, html_tag (a raw ``<tag>`` was entity-escaped).
+            Structural (whole-row / whole-table): blank_line
             (a body-splitting blank line was removed), missing_outer_pipe
             (a row's leading or trailing ``|`` was restored).
+            Diagnostic-only: lost_separator — a column separator was
+            deleted from the middle of the row, merging two columns into
+            one cell.  The original split point is unrecoverable from the
+            text, so this one is reported but NOT repaired.
         line: 1-based line number in the original document.
         column: 1-based column index where the repair was applied.
             Structural fixes use column 1.
         detail: Human-readable explanation of the repair.
+        repaired: False for diagnostic-only findings that the tool cannot
+            fix on its own; such a finding keeps ``--check`` red and makes
+            ``--fix`` / ``--inplace`` exit non-zero, and — because the row
+            is left byte-identical — it is re-reported on every later run
+            until a human repairs it.
     """
 
     type: Literal[
@@ -27,10 +37,13 @@ class Fix:
         "extra_cell",
         "blank_line",
         "missing_outer_pipe",
+        "html_tag",
+        "lost_separator",
     ]
     line: int
     column: int
     detail: str
+    repaired: bool = True
 
 
 @dataclasses.dataclass

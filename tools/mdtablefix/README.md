@@ -1,8 +1,9 @@
 # mdtablefix
 
-Detect and repair malformed GitHub-Flavored Markdown (GFM) tables whose
-cells contain **unescaped pipe characters** (`|`) that break the rendered
-column structure on GitHub.
+Detect and repair GitHub-Flavored Markdown (GFM) tables that render wrong on
+GitHub — most often because a cell contains an **unescaped pipe** (`|`) that
+splits it into extra columns, but also because a cell contains **raw HTML**
+or because a **column separator went missing mid-row**.
 
 The key GFM fact this tool is built around: a table row is split into cells
 on its pipes **before** the cell contents are parsed as inline Markdown.
@@ -64,15 +65,42 @@ venv/bin/python -m tools.mdtablefix --report report.json --check file.md
      merged right-to-left, escaping the pipe between merged cells as `\|`
      (GFM silently discards cells past the header's column count, so
      merging is what keeps the text visible at all).
-   - *Undersplit* (too few columns): pad with trailing empty cells.
+   - *Undersplit* (too few columns): two different defects share this
+     shape, and they need opposite treatment.  A row the author simply
+     ended early is padded with trailing empty cells.  A row whose
+     separator was deleted *mid-line* — leaving two columns fused in one
+     over-long cell — is reported as an unrepairable `lost_separator`
+     and left byte-identical: GFM already pads short rows by itself, so
+     appending an empty cell changes nothing about the rendering and only
+     silences the report.  The two are told apart by the surrounding rows
+     (does some cell exceed its own column's width by a real share of the
+     next column's, and is the column that padding would leave empty
+     normally populated?).  The split point is not recoverable from the
+     text, so a human has to re-insert the `|`.
    - *Unescaped pipes*: every literal `|` left inside a cell — **including
      pipes inside backtick code spans** — is escaped to `\|`, because GFM
      honors only `\|` as a literal pipe in a table.  GitHub strips the
      backslash when rendering, so `` `if a \|\| b` `` displays as
      `if a || b` in a single cell.  This pass is idempotent — already-escaped
      `\|` sequences are left untouched.
+   - *Raw HTML*: a `<tag>`-shaped run in a cell is entity-escaped to
+     `&lt;tag>`.  A GFM table cell is inline content, so `<db>` in
+     `base/<db>/2611` is parsed as raw HTML and **deleted** by GitHub's
+     sanitizer — the word vanishes from the rendered cell.  Worse, a
+     placeholder that happens to name a real element (`<table>_<col>_check`)
+     is *kept*, opening an unbalanced element that nests **every following
+     row of the table inside that one cell**.  Backtick spans, markdown
+     autolinks (`<https://…>`) and hand-written inline elements (`<br>`,
+     `<sub>`, `<kbd>`, …) are left alone.
 4. **Format** the repaired table with column-width alignment, preserving
    the original alignment markers (`:---`, `:---:`, `---:`).
+
+## Exit codes
+
+`--check` exits 1 when anything was found.  `--fix` exits 1 when the
+document needed repairs.  `--inplace` exits 0 once the file is clean, and
+**1 when an unrepairable finding is left** — the file still renders wrong
+and a human has to touch it, so it must not read as success.
 
 ## Example
 
