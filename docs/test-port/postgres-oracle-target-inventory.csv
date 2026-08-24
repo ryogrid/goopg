@@ -90,7 +90,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/index_including_gist.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/indexing.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/indirect_toast.sql,failed,no,-,M0134-0129 sizing: 0% parity diff 184→25 lines after fixing UPDATE SET-clause self-reference TOAST detoast; remaining diff is the LANGUAGE C dynamic-extension loading gap (make_tuple_indirect) — PARKED
-,regress-sql,regress,postgres/src/test/regress/sql/inet.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/inet.sql,failed,no,-,M0134-0130 sizing: 0% parity diff 1397->1298 lines after adding inet/cidr column-assignment canonicalization (normalizeInetCidrText -- classful-default-mask expansion for cidr; PG-canonical non-abbreviated dotted-quad/IPv6 output; CIDR host-bit validation); remaining diff is 11 pg_proc-seeded-but-undispatched scalar functions (host/abbrev/broadcast/network/masklen/netmask/hostmask/inet_merge/inet_same_family + cidr()/inet() cast funcs) plus the << <<= >> >>= && ~ & operator family -- PARKED
 ,regress-sql,regress,postgres/src/test/regress/sql/infinite_recurse.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/inherit.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/init_privs.sql,not-tried,no,-,

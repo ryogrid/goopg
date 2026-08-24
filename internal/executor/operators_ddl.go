@@ -15148,6 +15148,140 @@ func cidrDefaultV4Mask(first byte, nOctets int) int {
 	return bits
 }
 
+// normalizeInetCidrText validates and canonicalises an inet/cidr text literal
+// at the input boundary, mirroring PG's network_in + network_out (postgres/
+// src/backend/utils/adt/network.c:74-158). This is the single chokepoint every
+// path into an inet/cidr COLUMN shares (coerceTextLikeDatum's inet/cidr arm,
+// codec.go — the box/circle canonicalize-on-assignment precedent, M0134-0094/
+// -0098). Unlike box/circle, inet/cidr have no case in evalCast either: an
+// explicit `::inet`/`::cidr` cast on a bare string constant is comparatively
+// rare in the regress corpus and goopg's plain string-literal path already
+// round-trips the input unchanged there, matching the box/circle precedent of
+// leaving the explicit-cast boundary unvalidated for now (ledgered).
+//
+// Previously goopg stored inet/cidr values as raw, unnormalised text: no
+// classful-default-mask expansion ('10' input never became '10.0.0.0/8'), no
+// canonical non-abbreviated output form, and no "bits set to right of mask"
+// validation for cidr at all — every SELECT of a cidr/inet column showed
+// whatever string was typed in, not PG's canonical network_out rendering.
+func normalizeInetCidrText(s string, isCidr bool) (string, *ExecError) {
+	typName := "inet"
+	if isCidr {
+		typName = "cidr"
+	}
+	family, addr, bits, err := parseInetKeyText(s, isCidr)
+	if err != nil {
+		return "", &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typName, s)}
+	}
+	if isCidr {
+		masked := maskInetAddr(addr, bits)
+		for i := range addr {
+			if masked[i] != addr[i] {
+				return "", &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid cidr value: %q", s),
+					Detail:  "Value has bits set to right of mask."}
+			}
+		}
+	}
+	return formatInetAddr(family, addr, bits, isCidr), nil
+}
+
+// formatInetAddr renders an (family, address, bits) triple in PG's canonical
+// inet/cidr text form — pg_inet_net_ntop (postgres/src/port/inet_net_ntop.c)
+// plus network_out's "for CIDR, add /n if not present" step (network.c:
+// 150-157, which is why cidr always shows a mask, even /32, unlike inet).
+func formatInetAddr(family byte, addr []byte, bits int, isCidr bool) string {
+	var s string
+	if family == 2 { // PGSQL_AF_INET
+		s = formatInetV4(addr, bits)
+	} else {
+		s = formatInetV6(addr, bits)
+	}
+	if isCidr && !strings.Contains(s, "/") {
+		s += fmt.Sprintf("/%d", bits)
+	}
+	return s
+}
+
+// formatInetV4 mirrors inet_net_ntop_ipv4 (inet_net_ntop.c:113-152): always
+// prints all four octets regardless of mask length, and omits "/bits" only
+// when bits == 32 (a full-width mask means "just an address").
+func formatInetV4(addr []byte, bits int) string {
+	s := fmt.Sprintf("%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3])
+	if bits != 32 {
+		s += fmt.Sprintf("/%d", bits)
+	}
+	return s
+}
+
+// formatInetV6 mirrors inet_net_ntop_ipv6 (inet_net_ntop.c:177-278): standard
+// "::"-compressed hex-group form, with one PG-specific wrinkle — a run of
+// zero words long enough to reach word index 6 (the last 32 bits) triggers an
+// embedded dotted-decimal tail for those last 4 bytes, UNCONDITIONALLY (not
+// just for the well-known ::ffff:a.b.c.d v4-mapped form Go's net.IP.String()
+// recognises) whenever the leading run is exactly 6 words, or 7 words with a
+// nonzero last word, or 5 words with word[5] == 0xffff. This is why goopg
+// cannot reuse net.IP.String() here: Go collapses ::ffff:1.2.3.4 to the bare
+// "1.2.3.4" and renders ::4.3.2.1 as "::403:201" (pure hex groups) — both
+// wrong for PG's inet/cidr output.
+func formatInetV6(addr []byte, bits int) string {
+	var words [8]uint16
+	for i := 0; i < 16; i++ {
+		words[i/2] |= uint16(addr[i]) << uint((1-(i%2))*8)
+	}
+	bestBase, bestLen := -1, 0
+	curBase, curLen := -1, 0
+	for i := 0; i < 8; i++ {
+		if words[i] == 0 {
+			if curBase == -1 {
+				curBase, curLen = i, 1
+			} else {
+				curLen++
+			}
+		} else if curBase != -1 {
+			if bestBase == -1 || curLen > bestLen {
+				bestBase, bestLen = curBase, curLen
+			}
+			curBase = -1
+		}
+	}
+	if curBase != -1 && (bestBase == -1 || curLen > bestLen) {
+		bestBase, bestLen = curBase, curLen
+	}
+	if bestBase != -1 && bestLen < 2 {
+		bestBase = -1
+	}
+
+	var sb strings.Builder
+	for i := 0; i < 8; i++ {
+		if bestBase != -1 && i >= bestBase && i < bestBase+bestLen {
+			if i == bestBase {
+				sb.WriteByte(':')
+			}
+			continue
+		}
+		if i != 0 {
+			sb.WriteByte(':')
+		}
+		if i == 6 && bestBase == 0 && (bestLen == 6 ||
+			(bestLen == 7 && words[7] != 1) ||
+			(bestLen == 5 && words[5] == 0xffff)) {
+			sb.WriteString(fmt.Sprintf("%d.%d.%d.%d", addr[12], addr[13], addr[14], addr[15]))
+			break
+		}
+		sb.WriteString(fmt.Sprintf("%x", words[i]))
+	}
+	if bestBase != -1 && bestBase+bestLen == 8 {
+		sb.WriteByte(':')
+	}
+	s := sb.String()
+	if bits != 128 {
+		s += fmt.Sprintf("/%d", bits)
+	}
+	return s
+}
+
 // maskInetAddr zeroes the host bits of `addr` to the right of `bits`, yielding
 // the network-prefix component of the inet key.
 func maskInetAddr(addr []byte, bits int) []byte {
