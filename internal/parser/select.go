@@ -2283,6 +2283,19 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				// the caller will see an error on the next token.
 			}
 		}
+		// `expr ISNULL` / `expr NOTNULL` — historical postfix synonyms for
+		// `expr IS [NOT] NULL` (M0134-0112, kwlist.h TYPE_FUNC_NAME_KEYWORD;
+		// gram.y a_expr ISNULL / a_expr NOTNULL). Same precedence tier as
+		// `IS NULL` above.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenKeyword && (t.Keyword == KwIsnull || t.Keyword == KwNotnull) {
+				pos := t.Pos
+				negated := t.Keyword == KwNotnull
+				p.advance()
+				left = &IsNullExpr{pos: pos, Operand: left, Negated: negated}
+				continue
+			}
+		}
 
 		// `expr = ANY|SOME (array[...])` — desugar to `expr IN (...)`.
 		// `expr != ANY|SOME (array[...])` / `expr <> ANY|SOME (...)` — desugar to
