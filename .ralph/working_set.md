@@ -1,68 +1,57 @@
-Task just completed: M0134-0147 (opr_sanity.sql) — sized live, PARKED, one real
-fix landed (not sizing-only). Committed (bc6a1ff04).
+Task just completed: M0134-0149 (path.sql) — sized live, PARKED, real fix
+shipped (not sizing-only). Committed (64b9f9a24).
 
-What landed:
-Fixed the exact resume point M0134-0146 left: pg_proc's live/queryable schema
-(`registerPgProcView`, `internal/initdb/pg_proc_view.go`) was missing 7 real
-PG18 columns present in its heap-encode twin (`PGProcColumnsPG18()`,
-`internal/executor/sys_pg_proc.go`) — `provariadic`/`pronargdefaults`/
-`proallargtypes`/`proargmodes`/`proargnames`/`proargdefaults`/`prosqlbody`.
-Added all 7 to the virtual table's `Columns` list and populated them across
-all 4 row-building blocks (builtin stubs, user routines,
-`catalog.BuiltinProcs()`, user aggregates). `proargmodes`/`proargnames`/
-`proallargtypes` carry REAL per-routine data (from `Routine.ArgModes`/
-`ArgNames`/`ArgTypes`) via 3 new helpers in pg_proc_view.go
-(`pgArgModesLiteral`/`pgArgNamesLiteral`/`pgAllArgTypesLiteral`).
-`provariadic` stays constant 0 and `prosqlbody` constant NULL everywhere
-(both real remaining gaps, ledgered). `pronargdefaults`/`proargdefaults` are
-a real count / non-NULL placeholder pair kept mutually consistent (NOT the
-real parsed pg_node_tree — a placeholder to satisfy opr_sanity.sql's
-NULL-ness invariant).
+What landed: `path` was a raw-varlena pass-through with zero validation, the
+same state box/circle/line/lseg were in before their own M0134 slices
+(M0134-0094/-0098/-0136/-0137). Added `parsePathLiteral`
+(`internal/executor/expr.go`), a faithful port of `path_in`/`path_decode`/
+`pair_count` (`postgres/src/backend/utils/adt/geo_ops.c`) — point count
+pre-computed from the total comma count exactly as `pair_count` does (an
+even/zero count rejects immediately, explaining `'[]'`'s error before any
+point parsing starts), a single true-leading `'('` stripped as `path_in`'s
+own outer wrapper (tracked as a SEPARATE `outerDepth` from `path_decode`'s
+own `'['`/doubled-`'(('` wrapper-depth variable — conflating the two was
+the first draft's bug, caught before commit), reusing the already-shared
+`linePairDecode`/`lineSingleDecode` primitives (same ones `parseLineLiteral`/
+`parseLsegLiteral` use via `pathDecodeTwoPoints`) for the per-point float8
+decode since path's coordinate-pair grammar is npts-count-agnostic. New
+`pathCanonicalText` mirrors `path_out`'s `path_encode`. Wired into the same
+4 chokepoints as every prior geometry type: `coerceTextLikeDatum`
+(`internal/executor/codec.go`), `pg_input_is_valid`/`pg_input_error_info`
+(`expr.go` switch on `name` + `operators_pg_input_error_info.go`), and the
+function-call dispatch switch in `evalFuncCall` (also keyed on `name`, NOT
+`funcName` — a wrong-variable-name typo caught by the build before commit)
+for `isopen`/`isclosed`/`pclose`/`popen`, which `pg_proc` already had OIDs
+1430/1431/1433/1434 for but zero dispatch (`function isopen does not
+exist` etc.).
 
-Verified live, TWO independent regress files improved by the same fix:
-- opr_sanity.sql: every "column ... does not exist" divergence gone (only
-  unrelated `amvalidate` gap remains). Diff 1886→1833 lines.
-- oidjoins.sql (M0134-0146's file): 219-row FK sweep went from diverging at
-  check #5 to running ALL 219 checks clean — new unrelated divergence at the
-  very LAST check (pg_subscription_rel.srrelid, "operator = has incompatible
-  operand types oid and oid[]" — 42804, NOT a pg_proc issue, not yet
-  triaged). CSV row for oidjoins.sql updated in place (rationale only, no
-  status change — still `failed`/`pass_required=no`, sweep still doesn't
-  complete 100% clean).
+Verified live: path.sql 111-line diff -> 31-line diff (0% -> still `failed`
+but every remaining line, without exception, is the box.sql/circle.sql/
+line.sql/lseg.sql-shared psql LINE-position-echo gap — `coerceTextLikeDatum`
+never threads `ExecError.Pos` through to the wire-protocol error position,
+so INSERT-time syntax errors lack the `LINE N: ...\n  ^` echo psql renders).
+No new ledger row: this is the SAME gap the prior four geometry slices
+already recorded (standing recommendation item #19 below).
 
-Remaining pg_proc gaps (ledgered, NOT this loop's scope):
-1. `provariadic` always 0 — no real variadic-element-type resolution
-   (ANYOID/ANYELEMENTOID/ANYCOMPATIBLEOID/array-element special cases). Will
-   make opr_sanity's "variadic type ⟺ variadic argument" check fail once a
-   user VARIADIC function is exercised (proargmodes now correctly says 'v',
-   provariadic never does).
-2. `prosqlbody` always NULL — no SQL-body node-tree serializer (matches
-   standing gap already noted at `internal/executor/expr.go:13838`).
-3. `proargdefaults` placeholder text, not real parsed node-tree.
-4. `proallargtypes` = same OIDs as `proargtypes` (since `Routine.ArgTypes`
-   already isn't IN-only — a SEPARATE pre-existing divergence from PG's
-   real IN-only `proargtypes` semantics, not touched this loop).
-5. opr_sanity.sql's remaining ~1833-line diff covers ~90 OTHER
-   catalog-consistency assertions (opclass/opfamily/amop/amproc
-   completeness, pg_amvalidate, index sanity) not yet triaged individually.
-
-CSV: oidjoins.sql rationale updated (no status change). opr_sanity.sql
-flipped `not-tried` → `failed` (NOT `pass`), `pass_required` stays `no`.
-Ledger row appended (`.ralph/deferral_ledger.md`, 2026-08-25, M0134-0147).
+CSV: path.sql flipped `not-tried` → `failed`, `pass_required` stays `no`.
+fix_plan.md M0134-0149 marked PARKED with full landed/deferred summary.
+Design: `docs/design/m0134-0149-path-typed-literal.md` (new), indexed in
+`docs/design/README.md`.
 
 NEXT LOOP: per the Current Priority banner, continue M0134 top-to-bottom —
-next unworked item is **M0134-0148 (password.sql)**. Size it live first
-(`scripts/pg-regress-runner.sh --verbose password`). No strong prior.
+next unworked item is **M0134-0150 (point.sql)**. Size it live first
+(`scripts/pg-regress-runner.sh --verbose point`). Strong prior: point is the
+MOST FUNDAMENTAL geometry type (every other geometry type's parser —
+box/circle/line/lseg/path — calls into point-pair decoding), so point.sql
+may already be closer to green than the compound types were, OR it may
+reveal that `point` itself still has gaps the compound-type parsers papered
+over with their own local point-pair decoders. Check whether `point` has a
+`coerceTextLikeDatum` chokepoint case yet (grep tname == "point" in
+codec.go) before assuming — unlike box/circle/line/lseg/path, `point` was
+NOT in the box/circle/line/lseg/path parity-audit list in this loop.
 
-Separately, a concrete resume point for M0134-0147 itself (optional, not
-next-in-line per the banner's top-to-bottom order): re-run
-`scripts/pg-regress-runner.sh --verbose oidjoins` and chase the new
-pg_subscription_rel.srrelid oid/oid[] type-mismatch error (last of the 219
-FK checks) — likely a small, isolated bug distinct from the pg_proc
-column-drift work.
-
-Standing recommendation, carried across several loops (unchanged, no new
-item this loop beyond the pg_proc sub-gaps noted above):
+Standing recommendation, carried across several loops (item #19 grew this
+loop's remaining-gap explanation; unchanged otherwise):
 1. GIN/GiST/SPGiST physical-index plan integration — Seq Scan not
    Index/Index-Only Scan because the AM is catalog-only.
 2. btree v0 opclass generality (`internal/executor/operators_ddl.go:15810`
@@ -70,7 +59,9 @@ item this loop beyond the pg_proc sub-gaps noted above):
 3. Memoize plan-node type — entirely unimplemented (M0134-0141).
 4. Real parallel-worker query execution — recurs across M0134-0008/-0023/
    -0141.
-5. Geometry type-system gap — path/polygon still raw-varlena pass-through.
+5. Geometry type-system gap — SHRINKING: box/circle/line/lseg/path now all
+   have real validate+canonicalize chokepoints (M0134-0094/-0098/-0136/
+   -0137/-0149); point/polygon still need auditing (next task).
 6. LANGUAGE C dynamic-extension loading gap.
 7. Collation-execution-registry gap (5 parked files).
 8. BETWEEN-vs-comparison-operator precedence bug (M0134-0113).
@@ -88,7 +79,15 @@ item this loop beyond the pg_proc sub-gaps noted above):
 17. jsonpath's own grammar entirely unimplemented.
 18. Full PostgreSQL Large Object facility (M0134-0135) — own milestone.
 19. `coerceTextLikeDatum` never threads `ExecError.Pos` — psql LINE echo gap
-    shared by box/circle/line/lseg/macaddr/macaddr8/inet/bit(n).
+    shared by box/circle/line/lseg/path/macaddr/macaddr8/inet/bit(n). NOW
+    CONFIRMED 5 TIMES on the geometry family alone (box/circle/line/lseg/
+    path) — every one of those 5 cases' ENTIRE residual diff is exactly
+    this gap. Strong candidate for the next contained slice: thread `Pos`
+    through the INSERT/UPDATE/COPY literal-coercion call path into
+    `coerceTextLikeDatum`'s error returns, then wire `Pos` into the
+    wire-protocol ErrorResponse (dispatch.go's existing error-send path
+    already understands `ExecError.Pos` — grep confirmed for a prior similar
+    case, e.g. parser-level errors already echo LINE N correctly).
 20. `evalCast`'s catch-all pass-through hides real validation gaps.
 21. `DropTable` on a PARENT never scrubs `inheritanceChildren`/
     `partitionChildren` (only fixed for the child side, M0134-0140).
@@ -106,36 +105,25 @@ item this loop beyond the pg_proc sub-gaps noted above):
     needs a new `pg_publication_namespace` catalog +
     `logicalwalsender.go:373-377` schema-membership filter.
 28. pg_proc's provariadic/prosqlbody/proargdefaults still not real
-    (see the 5 remaining-gap items above) — resolved-enough for now, but
-    a real fix needs a node-tree serializer + variadic-element resolver.
+    (M0134-0147's 5 remaining-gap items).
 29. `Routine.ArgTypes` conflates IN-only and ALL-args (OUT/INOUT included) —
-    makes `proargtypes` wrong for any OUT-param function; would need a
-    parse-time split at `internal/executor/operators_ddl.go` ~16540/17330.
+    makes `proargtypes` wrong for any OUT-param function.
+30. `tryHandleRoleDDL` has no wire-protocol notice sink — blocks 3 role-DDL
+    NOTICE/WARNING messages in password.sql (M0134-0148's deferral; item #9
+    covers a related but distinct RAISE-severity gap).
 
-Gates run this loop: scripts/pg-regress-runner.sh --verbose opr_sanity (live,
-before AND after — 1886→1833-line diff, all column-does-not-exist errors
-gone); scripts/pg-regress-runner.sh --verbose oidjoins (live, before/after —
-219/219 checks now execute, new unrelated last-check divergence); go build
-./... PASS; go test ./internal/initdb/... -run TestPgProcView PASS (16/16);
-RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS (all
-packages, some cached); scripts/tpch-spotcheck.sh PASS (fresh capped server,
-Q12=2/Q13=35 canonical); TestPort_PgDumpConnectionSetup FAILED but confirmed
-PRE-EXISTING via git-stash bisect (unrelated CREATE CAST bytea->text 42P17
-error, not a regression from this loop's change); TPC-DS SF0.5 gate BLOCKED
-this loop — `scripts/tpcds-sf05-regression.sh sweep` refused with "FATAL: the
-nightly CI batch is running" (concurrent resource-lock guard, not forced —
-change is orthogonal to any TPC-DS query shape); make regen-testport PASS
-(after fixing a CSV-quoting mistake — commas in an unquoted rationale field
-broke the parser, fixed by switching to semicolons per the file's existing
-convention); make check-testport-inventory PASS; pre-commit hook pgbench
-smoke PASS (select-only 12379 tps, 0 failed); make ralph-state-guard:
-self-repaired (standard between-loop marker reconciliation), passed after
-repair.
+Gates run this loop: go build ./... PASS; GOOPG_CG_UNIT=path-test
+scripts/goopg-test-run.sh go test -timeout 10m ./internal/executor/ PASS
+(7.0s); RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS
+(all packages, some cached, initdb 439.9s); scripts/pg-regress-runner.sh
+--verbose path (live, before/after — 111→31-line diff, 0 residual
+^ERROR/^-ERROR); make regen-testport / make check-testport-inventory PASS;
+pre-commit hook pgbench smoke PASS (select-only 12697 tps, 0 failed);
+make ralph-state-guard: found+repaired 1 stale-marker inconsistency
+(progress.json's "completed" was the prior loop's clean-exit marker, not
+project completion — reconciled to "in_progress"), then verified consistent.
 
-In-flight: none. (TPC-DS SF0.5 gate was blocked by a concurrent nightly
-batch, not abandoned mid-run — nothing to resume; re-run it in a future loop
-once the nightly lane is idle, per the practice-card mandate for
-planner/executor changes, if time allows.)
+In-flight: none.
 
 Note: a concurrent peer session's WIP may still be present in the tree
 (.ralph/progress.json, .ralphrc, analysis/postgres-oracle-compatibility-
@@ -145,3 +133,12 @@ postgres (untracked convenience symlink), third-party/tpcds-postgres,
 analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt,
 docs/wiki/modules/catalog.md) — deliberately left untouched/uncommitted;
 only this loop's own files were staged and committed by explicit pathspec.
+
+M-NIGHTLY note: `ci/logs/action-items.md` (run 20260824-013441, 2 items) was
+checked this loop — both already filed in fix_plan.md (§"Nightly run
+20260824-013441"): AI-...-001 already closed [x] by a prior loop;
+AI-...-002 is a duplicate of the still-open AI-20260822-001356-003
+(`TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary`, now re-failed 3
+nights running) — left unselected per the banner (M0134 outranks M-NIGHTLY
+selection while M0134 has remaining unparked top-to-bottom tasks and this
+item doesn't break a build/gate M0134 depends on).
