@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"math"
@@ -2523,6 +2524,264 @@ func circleCanonicalText(x, y, radius float64) string {
 	return fmt.Sprintf("<(%s,%s),%s>", PGFloatOut(x, 64), PGFloatOut(y, 64), PGFloatOut(radius, 64))
 }
 
+// lineSingleDecode is single_decode (float8in_internal via strtod, geo_ops.c)
+// specialized for the line parsers below: unlike singleDecode (used by
+// parseBoxLiteral/parseCircleLiteral, which never need to distinguish a
+// syntax error from an out-of-range one), this returns a *typed* ExecError
+// so a float8 literal like "1e400" reports PG's dedicated overflow SQLSTATE
+// (22003, "\"1e400\" is out of range for type double precision",
+// float.c:484-489) rather than colliding with the generic 22P02 "invalid
+// input syntax for type line" every other malformed token uses. M0134-0136.
+func lineSingleDecode(s string) (val float64, rest string, errOut *ExecError) {
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	for _, kw := range []struct {
+		text string
+		val  float64
+	}{
+		{"NaN", math.NaN()},
+		{"+Infinity", math.Inf(1)},
+		{"-Infinity", math.Inf(-1)},
+		{"Infinity", math.Inf(1)},
+		{"+Inf", math.Inf(1)},
+		{"-Inf", math.Inf(-1)},
+		{"Inf", math.Inf(1)},
+	} {
+		if len(t) >= len(kw.text) && strings.EqualFold(t[:len(kw.text)], kw.text) {
+			return kw.val, strings.TrimLeft(t[len(kw.text):], " \t\n\r\v\f"), nil
+		}
+	}
+	i := 0
+	if i < len(t) && (t[i] == '+' || t[i] == '-') {
+		i++
+	}
+	digitsBefore := i
+	for i < len(t) && t[i] >= '0' && t[i] <= '9' {
+		i++
+	}
+	digitsBefore = i - digitsBefore
+	digitsAfter := 0
+	if i < len(t) && t[i] == '.' {
+		i++
+		start := i
+		for i < len(t) && t[i] >= '0' && t[i] <= '9' {
+			i++
+		}
+		digitsAfter = i - start
+	}
+	if digitsBefore == 0 && digitsAfter == 0 {
+		return 0, "", &ExecError{Code: "22P02"}
+	}
+	if i < len(t) && (t[i] == 'e' || t[i] == 'E') {
+		j := i + 1
+		if j < len(t) && (t[j] == '+' || t[j] == '-') {
+			j++
+		}
+		k := j
+		for k < len(t) && t[k] >= '0' && t[k] <= '9' {
+			k++
+		}
+		if k > j {
+			i = k
+		}
+	}
+	token := t[:i]
+	v, err := strconv.ParseFloat(token, 64)
+	if err != nil {
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) && numErr.Err == strconv.ErrRange && (v == 0 || math.IsInf(v, 0)) {
+			return 0, "", &ExecError{Code: "22003",
+				Message: fmt.Sprintf("%q is out of range for type double precision", token)}
+		}
+		return 0, "", &ExecError{Code: "22P02"}
+	}
+	return v, strings.TrimLeft(t[i:], " \t\n\r\v\f"), nil
+}
+
+// linePairDecode is pair_decode (geo_ops.c) built on lineSingleDecode, used
+// by parseLineLiteral's two-point form. M0134-0136.
+func linePairDecode(s string) (x, y float64, rest string, errOut *ExecError) {
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	hasDelim := t != "" && t[0] == '('
+	if hasDelim {
+		t = t[1:]
+	}
+	x, t, errOut = lineSingleDecode(t)
+	if errOut != nil {
+		return 0, 0, "", errOut
+	}
+	if t == "" || t[0] != ',' {
+		return 0, 0, "", &ExecError{Code: "22P02"}
+	}
+	t = t[1:]
+	y, t, errOut = lineSingleDecode(t)
+	if errOut != nil {
+		return 0, 0, "", errOut
+	}
+	if hasDelim {
+		if t == "" || t[0] != ')' {
+			return 0, 0, "", &ExecError{Code: "22P02"}
+		}
+		t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+	}
+	return x, y, t, nil
+}
+
+// lineSlope is point_sl (geo_ops.c): the slope of the segment through two
+// points, Inf for a vertical segment (equal x) and 0 for a horizontal one
+// (equal y, checked before the general division so a horizontal segment
+// never depends on floating-point division producing an exact zero).
+// M0134-0136.
+func lineSlope(x1, y1, x2, y2 float64) float64 {
+	if x1 == x2 {
+		return math.Inf(1)
+	}
+	if y1 == y2 {
+		return 0
+	}
+	return (y1 - y2) / (x1 - x2)
+}
+
+// lineConstruct is line_construct (geo_ops.c): fill A/B/C from a point on
+// the line plus its slope — vertical (Inf slope) becomes "x = C", horizontal
+// (zero slope) becomes "y = C", otherwise "mx - y + yinter = 0". M0134-0136.
+func lineConstruct(px, py, slope float64) (a, b, c float64) {
+	if math.IsInf(slope, 0) {
+		return -1.0, 0.0, px
+	}
+	if slope == 0 {
+		return 0.0, -1.0, py
+	}
+	c = py - slope*px
+	if c == 0 {
+		c = 0
+	}
+	return slope, -1.0, c
+}
+
+// parseLineLiteral reproduces line_in's parsing (postgres/src/backend/utils/
+// adt/geo_ops.c line_in/line_decode/path_decode/line_construct/point_sl)
+// closely enough to give the same accept/reject verdict — including the
+// SQLSTATE-differentiated float8-overflow case (22003) and the two
+// semantic-validation messages line_in itself raises ("A and B cannot both
+// be zero" for the brace coefficient form, "must be two distinct points" for
+// the two-point form) rather than the single generic 22P02 syntax error
+// every other malformed token gets — and the same A/B/C coefficients, on
+// every case exercised by line.sql. Two input shapes are accepted: the
+// canonical "{A,B,C}" coefficient form, and any two-point form path_decode
+// also accepts for lseg/path ("(x,y),(x,y)", "((x,y),(x,y))",
+// "[(x,y),(x,y)]", or the bare "x,y,x,y" quick-entry form). M0134-0136.
+func parseLineLiteral(s string) (a, b, c float64, errOut *ExecError) {
+	orig := s
+	syntaxErr := func() (float64, float64, float64, *ExecError) {
+		return 0, 0, 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type line: %q", orig)}
+	}
+	fillMsg := func(e *ExecError) *ExecError {
+		if e != nil && e.Message == "" {
+			return &ExecError{Code: e.Code,
+				Message: fmt.Sprintf("invalid input syntax for type line: %q", orig)}
+		}
+		return e
+	}
+
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	if t == "" {
+		return syntaxErr()
+	}
+	if t[0] == '{' {
+		rest := t[1:]
+		var av, bv, cv float64
+		var derr *ExecError
+		av, rest, derr = lineSingleDecode(rest)
+		if derr != nil {
+			return 0, 0, 0, fillMsg(derr)
+		}
+		if rest == "" || rest[0] != ',' {
+			return syntaxErr()
+		}
+		bv, rest, derr = lineSingleDecode(rest[1:])
+		if derr != nil {
+			return 0, 0, 0, fillMsg(derr)
+		}
+		if rest == "" || rest[0] != ',' {
+			return syntaxErr()
+		}
+		cv, rest, derr = lineSingleDecode(rest[1:])
+		if derr != nil {
+			return 0, 0, 0, fillMsg(derr)
+		}
+		if rest == "" || rest[0] != '}' {
+			return syntaxErr()
+		}
+		rest = strings.TrimLeft(rest[1:], " \t\n\r\v\f")
+		if rest != "" {
+			return syntaxErr()
+		}
+		if av == 0 && bv == 0 {
+			return 0, 0, 0, &ExecError{Code: "22P02",
+				Message: "invalid line specification: A and B cannot both be zero"}
+		}
+		return av, bv, cv, nil
+	}
+
+	// Two-point form (path_decode with opentype=true, npts=2): an optional
+	// '[' or (single/doubled) '(' wrapper, then two coordinate pairs.
+	depth := 0
+	if t[0] == '[' {
+		depth++
+		t = t[1:]
+	} else if t[0] == '(' {
+		cp := strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		if cp != "" && cp[0] == '(' {
+			depth++
+			t = cp
+		} else if strings.Count(t, "(") == 1 {
+			depth++
+			t = cp
+		}
+	}
+
+	var pts [2][2]float64
+	for i := 0; i < 2; i++ {
+		x, y, rest, derr := linePairDecode(t)
+		if derr != nil {
+			return 0, 0, 0, fillMsg(derr)
+		}
+		t = rest
+		if t != "" && t[0] == ',' {
+			t = t[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if t != "" && (t[0] == ')' || t[0] == ']') {
+			depth--
+			t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		} else {
+			return syntaxErr()
+		}
+	}
+	if t != "" {
+		return syntaxErr()
+	}
+
+	if pts[0][0] == pts[1][0] && pts[0][1] == pts[1][1] {
+		return 0, 0, 0, &ExecError{Code: "22P02",
+			Message: "invalid line specification: must be two distinct points"}
+	}
+	slope := lineSlope(pts[0][0], pts[0][1], pts[1][0], pts[1][1])
+	av, bv, cv := lineConstruct(pts[0][0], pts[0][1], slope)
+	return av, bv, cv, nil
+}
+
+// lineCanonicalText formats a line's A/B/C coefficients exactly as line_out
+// does — "{A,B,C}" — each via float8out's Ryu-based shortest-roundtrip
+// formatting. M0134-0136.
+func lineCanonicalText(a, b, c float64) string {
+	return fmt.Sprintf("{%s,%s,%s}", PGFloatOut(a, 64), PGFloatOut(b, 64), PGFloatOut(c, 64))
+}
+
 // evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
 // operands and rewrites Pattern into PostgreSQL's standard backslash-escape
 // convention, so the caller (evalBinary's LIKE/ILIKE arm, via
@@ -4134,6 +4393,17 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 				Message: fmt.Sprintf("invalid input syntax for type circle: %q", x.Value)}
 		}
 		return NewStringDatum(circleCanonicalText(cx, cy, r)), nil
+	case "line":
+		// M0134-0136: `line '...'` shares the same validate+canonicalize
+		// chokepoint as a line column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parseLineLiteral.
+		la, lb, lc, lerr := parseLineLiteral(x.Value)
+		if lerr != nil {
+			ee := *lerr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(lineCanonicalText(la, lb, lc)), nil
 	case "jsonb":
 		// M0134-0133: `jsonb '...'` must share the same validate+canonicalize
 		// chokepoint as `::jsonb` (the `case "jsonb"` arm of evalCast, above) —
@@ -11556,6 +11826,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// same parseCircleLiteral.
 				_, _, _, ok := parseCircleLiteral(v)
 				return NewBoolDatum(ok), nil
+			case "line":
+				// M0134-0136: agrees with the typed-literal/coercion path,
+				// same parseLineLiteral.
+				_, _, _, lerr := parseLineLiteral(v)
+				return NewBoolDatum(lerr == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
@@ -12744,6 +13019,49 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					llx := math.Min(p1[0], p2[0])
 					lly := math.Min(p1[1], p2[1])
 					return NewStringDatum(fmt.Sprintf("(%g,%g),(%g,%g)", urx, ury, llx, lly)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "line":
+		// line(point, point) → line "{A,B,C}" — line_construct_pp in
+		// geo_ops.c: build the infinite line through both points, raising
+		// the same "must be two distinct points" error line_in's two-point
+		// input form raises. M0134-0136.
+		if len(x.Args) == 2 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			bv, berr := evalExprSlot(x.Args[1], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if berr != nil {
+				return Datum{}, berr
+			}
+			if av.IsNull() || bv.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			bs, bok := datumAsString(bv)
+			if aok && bok {
+				p1, ok1 := parsePointText(as)
+				p2, ok2 := parsePointText(bs)
+				if ok1 && ok2 {
+					if p1[0] == p2[0] && p1[1] == p2[1] {
+						// No Pos: unlike the typed-literal ('...' cast) and
+						// column-coercion cases above, PG raises this error
+						// at EXECUTION time (line_construct_pp is a real
+						// function call, not a parse-analysis-time literal
+						// coercion), so psql's LINE-position echo does not
+						// apply here — line.sql's expected output confirms
+						// no "LINE N:" annotation for this exact case.
+						// M0134-0136.
+						return Datum{}, &ExecError{Code: "22P02",
+							Message: "invalid line specification: must be two distinct points"}
+					}
+					slope := lineSlope(p1[0], p1[1], p2[0], p2[1])
+					la, lb, lc := lineConstruct(p1[0], p1[1], slope)
+					return NewStringDatum(lineCanonicalText(la, lb, lc)), nil
 				}
 			}
 		}

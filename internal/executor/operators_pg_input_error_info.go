@@ -165,6 +165,15 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = "invalid input syntax for type tid: \"" + v + "\""
 			sqlCode = "22P02"
 		}
+	case "line":
+		// line: agrees with the typed-literal/coercion path, same
+		// parseLineLiteral, including its SQLSTATE-differentiated overflow
+		// (22003) and semantic-validation (A/B-zero, non-distinct-points)
+		// error text. M0134-0136.
+		if _, _, _, lerr := parseLineLiteral(v); lerr != nil {
+			message = lerr.Message
+			sqlCode = lerr.Code
+		}
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)

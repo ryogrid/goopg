@@ -3232,6 +3232,11 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		"box",
 		// circle 'string' cast syntax (M0134-0098), e.g. `circle '<(0,0),5>'`.
 		"circle",
+		// point/line 'string' cast syntax (M0134-0136), e.g.
+		// `point '(3,1)'`, `line '{0,-1,5}'` — needed so `line(point '(x,y)',
+		// point '(x,y)')` parses as two typed-literal function arguments,
+		// not two bare column references.
+		"point", "line",
 		// json/jsonb 'string' cast syntax (M0134-0133), e.g.
 		// `json '{"a": 1}' -> 'a'` used throughout json_encoding.sql.
 		"json", "jsonb":
