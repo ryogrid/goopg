@@ -2164,6 +2164,11 @@ type Catalog interface {
 	// LookupUserAggregateByName looks up a user-defined aggregate by lower-case name.
 	// Returns nil, false if not found.
 	LookupUserAggregateByName(name string) (*UserAggregate, bool)
+	// LookupUserAggregateByOID looks up a user-defined aggregate by its
+	// pg_proc OID (the same OID writeAggregateCatalogRows stamps into the
+	// aggregate's pg_proc/pg_aggregate heap rows). Returns nil, false if not
+	// found. M0134-0108.
+	LookupUserAggregateByOID(oid uint32) (*UserAggregate, bool)
 	// RenameUserAggregate renames an existing user-defined aggregate.
 	// Returns false if the old name is not found.
 	RenameUserAggregate(oldName, newName string) bool
@@ -4352,6 +4357,21 @@ func (c *InMemory) LookupUserAggregateByName(name string) (*UserAggregate, bool)
 	defer c.mu.RUnlock()
 	a, ok := c.userAggregates[strings.ToLower(name)]
 	return a, ok
+}
+
+// LookupUserAggregateByOID looks up a user-defined aggregate by its pg_proc
+// OID. The registry is small (user-created aggregates only) and unindexed
+// by OID, so this is a linear scan — mirrors LookupUserOperatorByOID's same
+// tradeoff for an equally small registry. M0134-0108.
+func (c *InMemory) LookupUserAggregateByOID(oid uint32) (*UserAggregate, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, a := range c.userAggregates {
+		if a.OID == oid {
+			return a, true
+		}
+	}
+	return nil, false
 }
 
 // RenameUserAggregate renames an existing user-defined aggregate. M0097-0035.

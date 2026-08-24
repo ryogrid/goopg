@@ -165,6 +165,14 @@ const (
 	OIDRegnamespace  uint32 = 4089
 	OIDRegrole       uint32 = 4096
 	OIDRegcollation  uint32 = 4191
+	// OIDInternal is the "internal" pseudo-type (pg_type.h) — the conventional
+	// aggregate transition-state type for accumulators too complex to
+	// represent as a plain SQL value (e.g. numeric_avg_accum). Seeded in
+	// pg_type at 2281 (initdb/pg_type_seed_data.go); TypeNameToOID previously
+	// had no case for it, so `stype = internal` silently fell back to
+	// OIDText(25) and `aggtranstype::regtype` rendered "text" instead of
+	// "internal" (create_aggregate.sql, M0134-0108).
+	OIDInternal uint32 = 2281
 	// DU-002 slice 81: the legacy OID/int2 vector types. int2vector is a
 	// space-separated list of int2 (used internally for pg_index.indkey);
 	// oidvector a space-separated list of oid (pg_proc.proargtypes). Both are
@@ -1645,6 +1653,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDUUID
 	case "oid":
 		return OIDOID
+	case "internal":
+		return OIDInternal
 	case "json":
 		return OIDJSON
 	case "jsonb":

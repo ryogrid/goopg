@@ -348,6 +348,16 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		if bp, found := catalog.LookupBuiltinProc(fn); found {
 			return NewIntDatum(int64(bp.OID)), nil
 		}
+		// CREATE AGGREGATE routines never land in the Routines() registry
+		// (they live in their own userAggregates map — see
+		// InMemory.RegisterUserAggregate) even though writeAggregateCatalogRows
+		// gives them a real pg_proc heap row with prokind='a'. Without this
+		// fallback, `'myavg'::regproc` (and any pg_aggregate query keyed off
+		// it, per create_aggregate.sql) misses despite the pg_proc row being
+		// visible to a plain SELECT. M0134-0108.
+		if agg, ok := ctx.Catalog.LookupUserAggregateByName(fn); ok {
+			return NewIntDatum(int64(agg.OID)), nil
+		}
 		return NullDatum, &ExecError{Code: "42883", Pos: pos,
 			Message: fmt.Sprintf("function %q does not exist", raw)}
 	case "regrole":
@@ -589,6 +599,17 @@ func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func
 				if r := rs.LookupByOID(oid); r != nil {
 					return regOutQualified(r.Schema, r.Name, qualify(r.Schema))
 				}
+			}
+			// CREATE AGGREGATE routines live in their own userAggregates map,
+			// not Routines() — sibling of regIdentifierInput's/CastExpr's
+			// input-side fallback just above (Hard-won Rule #2). Without this,
+			// an aggfnoid::regproc render (create_aggregate.sql's catalog
+			// SELECTs) falls through to the raw-OID pass-through below instead
+			// of PG's resolved name. M0134-0108. UserAggregate carries no
+			// per-object schema today, so this always renders bare/unqualified
+			// (matching the common public-schema case the test exercises).
+			if agg, ok := cat.LookupUserAggregateByOID(oid); ok {
+				return pgQuoteIdent(agg.Name)
 			}
 		}
 	case "regprocedure":

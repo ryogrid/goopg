@@ -580,6 +580,17 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				if bp, found := catalog.LookupBuiltinProc(name); found {
 					return NewIntDatum(int64(bp.OID)), nil
 				}
+				// CREATE AGGREGATE routines never land in the Routines()
+				// registry (they live in their own userAggregates map — see
+				// InMemory.RegisterUserAggregate) even though
+				// writeAggregateCatalogRows gives them a real pg_proc heap
+				// row with prokind='a'. Sibling of regIdentifierInput's
+				// identical fallback (Hard-won Rule #2) — without it
+				// `'myavg'::regproc` misses despite the pg_proc row being
+				// visible to a plain SELECT. M0134-0108.
+				if agg, ok := ctx.Catalog.LookupUserAggregateByName(name); ok {
+					return NewIntDatum(int64(agg.OID)), nil
+				}
 				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", raw)}
 			}
 			// An OID input (oid→regproc/regprocedure) renders via
