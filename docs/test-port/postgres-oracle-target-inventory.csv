@@ -108,7 +108,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonb_jsonpath.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonpath.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonpath_encoding.sql,pass,yes,-,M0134-0134: 100% parity via scripts/pg-regress-runner.sh jsonpath_encoding; new evalCast jsonpath arm (internal/executor/jsonpath_encoding.go) hand-ports jsonpath_scan.l's string-escape lexer + printJsonPathItem's re-escape; see TestJSONPathTypedLiteralEscapes (internal/executor/jsonpath_encoding_test.go)
-,regress-sql,regress,postgres/src/test/regress/sql/largeobject.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/largeobject.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0134-0135 sizing; entire large-object subsystem unimplemented
 ,regress-sql,regress,postgres/src/test/regress/sql/limit.sql,pass,yes,-,PASS via TestPort_RegressSuite — lateral OFFSET outer-ref fix (M0097-0126)
 ,regress-sql,regress,postgres/src/test/regress/sql/line.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/lock.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
