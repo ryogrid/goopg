@@ -426,6 +426,74 @@ func classifyDatabaseDDL(sql string) (databaseDDLKind, string) {
 	return databaseDDLNone, ""
 }
 
+// databaseRenameFromAlter recognises the `ALTER DATABASE <name> RENAME TO
+// <newname>` form and extracts both names, mirroring roleRenameFromAlter
+// (role_ddl.go). ok is false for any other ALTER DATABASE shape (the
+// SET/RESET config form handled by parseAlterDatabaseConfig, CONNECTION
+// LIMIT, OWNER TO, IS_TEMPLATE, TABLESPACE, ...), which keep falling through
+// to the pre-existing compatNoopCommandTag no-op absorption unchanged.
+// M0134-0117.
+func databaseRenameFromAlter(norm string) (name, newName string, ok bool) {
+	const prefix = "alter database "
+	if !strings.HasPrefix(norm, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(norm[len(prefix):])
+	name = extractFirstSQLIdent(norm, rest)
+	if name == "" {
+		return "", "", false
+	}
+	pos := strings.Index(rest, name)
+	if pos < 0 {
+		return "", "", false
+	}
+	tail := strings.TrimSpace(rest[pos+len(name):])
+	if !strings.HasPrefix(tail, "rename to ") {
+		return "", "", false
+	}
+	tail = strings.TrimSpace(tail[len("rename to "):])
+	newName = extractFirstSQLIdent(norm, tail)
+	if newName == "" {
+		return "", "", false
+	}
+	return name, newName, true
+}
+
+// renameDatabase implements `ALTER DATABASE <name> RENAME TO <newname>`,
+// mirroring PostgreSQL's RenameDatabase (postgres/src/backend/commands/
+// dbcommands.c): database-exists (3D000), currently-open-database
+// (0A000/FeatureNotSupported — "current database cannot be renamed", the
+// check RenameDatabase runs before touching the catalog), and
+// new-name-already-exists (42710) checks, then re-keys the catalog database
+// registry (preserving the oid). liveDBName is the calling connection's own
+// database (tryHandleDatabaseDDL's parameter of the same name), needed for
+// the currently-open-database check. Not modelled here (see the deferral
+// ledger): the superuser/CREATEDB-and-owner privilege check PG runs before
+// the rename (like every other database-DDL privilege check in this
+// handler, accept-and-ignore today), and re-syncing the shared pg_database
+// heap row's datname column (sys_pg_database.go) — goopg's own `SELECT *
+// FROM pg_database` is served from the registry via VirtualRows, so this
+// only affects a real-PG standby streaming goopg's WAL. M0134-0117.
+func (s *Server) renameDatabase(name, newName, liveDBName string) error {
+	im, isInMem := s.cfg.Catalog.(*catalog.InMemory)
+	if !isInMem || im == nil {
+		return &databaseDDLError{code: errcodes.SystemError, msg: "database rename requires an in-memory catalog"}
+	}
+	if !im.HasDatabase(name) {
+		return &databaseDDLError{code: errcodes.UndefinedObject, msg: fmt.Sprintf("database %q does not exist", name)}
+	}
+	if strings.EqualFold(name, liveDBName) {
+		return &databaseDDLError{code: errcodes.FeatureNotSupported, msg: "current database cannot be renamed"}
+	}
+	if im.HasDatabase(newName) {
+		return &databaseDDLError{code: errcodes.DuplicateObject, msg: fmt.Sprintf("database %q already exists", newName)}
+	}
+	if !im.RenameDatabase(name, newName) {
+		return &databaseDDLError{code: errcodes.UndefinedObject, msg: fmt.Sprintf("database %q does not exist", name)}
+	}
+	return nil
+}
+
 // dropDatabaseForceRe matches the trailing `[ [ WITH ] ( FORCE ) ]` clause of
 // a DROP DATABASE statement (gram.y's createdb_opt_list analog, reused for
 // DROP DATABASE) — the only option this bypass recognises. Any other
@@ -562,6 +630,9 @@ func extractFirstIdentifierSpan(s string) (name string, end int) {
 // upstream's tag.
 func databaseDDLCommandTag(sql string) string {
 	if _, ok := parseAlterDatabaseConfig(sql); ok {
+		return "ALTER DATABASE"
+	}
+	if _, _, ok := databaseRenameFromAlter(normalizeCompatSQL(sql)); ok {
 		return "ALTER DATABASE"
 	}
 	kind, _ := classifyDatabaseDDL(sql)
@@ -1414,6 +1485,9 @@ func (s *Server) actingRoleIsSuperuser(actingRole string) bool {
 func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole string, resolveCurrent currentGUCResolver) (bool, string, error) {
 	if op, ok := parseAlterDatabaseConfig(sql); ok {
 		return s.applyAlterDatabaseConfig(op, liveDBName, resolveCurrent)
+	}
+	if oldName, newName, ok := databaseRenameFromAlter(normalizeCompatSQL(sql)); ok {
+		return true, "", s.renameDatabase(oldName, newName, liveDBName)
 	}
 	kind, name := classifyDatabaseDDL(sql)
 	if kind == databaseDDLNone {

@@ -5212,6 +5212,42 @@ func (c *InMemory) DropDatabase(name string) error {
 	return nil
 }
 
+// RenameDatabase re-keys a registered database's registry entries (the
+// databases/databaseConnLimit/databaseEncoding/databaseOwner/databaseOid
+// maps) from oldName to newName, preserving its oid — mirrors RenameRole's
+// treatment of the parallel role registry. Per-database state keyed by oid
+// rather than name (e.g. databaseConfig, the pg_db_role_setting store) needs
+// no change here since the oid itself is unchanged. Returns false when
+// oldName is unregistered (caller should raise "database does not exist");
+// callers are responsible for the pre-checks RenameDatabase itself doesn't
+// duplicate (new-name-already-exists). M0134-0117.
+func (c *InMemory) RenameDatabase(oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.databases[oldName] {
+		return false
+	}
+	delete(c.databases, oldName)
+	c.databases[newName] = true
+	if v, ok := c.databaseConnLimit[oldName]; ok {
+		delete(c.databaseConnLimit, oldName)
+		c.databaseConnLimit[newName] = v
+	}
+	if v, ok := c.databaseEncoding[oldName]; ok {
+		delete(c.databaseEncoding, oldName)
+		c.databaseEncoding[newName] = v
+	}
+	if v, ok := c.databaseOwner[oldName]; ok {
+		delete(c.databaseOwner, oldName)
+		c.databaseOwner[newName] = v
+	}
+	if v, ok := c.databaseOid[oldName]; ok {
+		delete(c.databaseOid, oldName)
+		c.databaseOid[newName] = v
+	}
+	return true
+}
+
 // DatabaseOwner returns the `pg_database.datdba` OID recorded for name via
 // CreateDatabase/RegisterDatabaseDuringRecovery, or BootstrapSuperuserOID if
 // none was ever recorded (the bootstrap postgres/template0/template1 rows,
