@@ -2565,6 +2565,28 @@ func nodeReferencesOuter(n Node) bool {
 		// WITH ORDINALITY wraps the underlying SRF node; unwrap so a
 		// correlated argument is still detected under the wrapper.
 		return nodeReferencesOuter(x.Child)
+	case *ScalarFuncScan:
+		// A user-defined non-SETOF routine used as a FROM source, e.g.
+		// `FROM t, LATERAL f(t.col)`; the arg resolves to a plain
+		// *ColumnRef against the left sibling's schema (same convention as
+		// PgGetPublicationTables above) and scalarFuncScanOp reads
+		// ctx.OuterRows-independent BindLateralOuter instead. M0134-0126.
+		if fc, ok := x.Func.(*FuncCall); ok {
+			for _, a := range fc.Args {
+				if exprContainsColumnRef(a) {
+					return true
+				}
+			}
+		}
+		return false
+	case *UserSrfScan:
+		// Same as *ScalarFuncScan, for the SETOF sibling. M0134-0126.
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	}
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
@@ -4650,7 +4672,22 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		if rs := cat.Routines(); rs != nil {
 			cands := rs.LookupByName(parser.ObjectName{Name: tf.Name})
 			for _, r := range cands {
-				ctx := &resolveContext{}
+				// Wire lateral siblings + outer-scope parent chain so
+				// correlated references (e.g. `lateral f(t.col)`, or a bare
+				// column from an earlier FROM item / VALUES row / SRF)
+				// resolve — mirrors the generate_series /
+				// pg_options_to_table arg-context construction above.
+				// M0134-0126.
+				ctx := &resolveContext{cat: cat, parent: planParent}
+				if lateralCtx != nil {
+					if lateralCtx.parent == nil {
+						cp := *lateralCtx
+						cp.parent = planParent
+						ctx = &cp
+					} else {
+						ctx = lateralCtx
+					}
+				}
 				resolvedArgs := make([]Expr, len(tf.Args))
 				for i, a := range tf.Args {
 					re, err := resolveExpr(a, ctx)

@@ -7,9 +7,10 @@ package executor
 import "github.com/goopg/goopg/internal/optimizer"
 
 type scalarFuncScanOp struct {
-	plan *optimizer.ScalarFuncScan
-	ctx  *Context
-	done bool
+	plan      *optimizer.ScalarFuncScan
+	ctx       *Context
+	outerSlot SlotView
+	done      bool
 }
 
 func newScalarFuncScanOp(p *optimizer.ScalarFuncScan) *scalarFuncScanOp {
@@ -17,15 +18,27 @@ func newScalarFuncScanOp(p *optimizer.ScalarFuncScan) *scalarFuncScanOp {
 }
 
 func (o *scalarFuncScanOp) Schema() optimizer.Schema { return o.plan.Output() }
-func (o *scalarFuncScanOp) Open(ctx *Context) error { o.ctx = ctx; return nil }
-func (o *scalarFuncScanOp) Close() error             { return nil }
+
+// BindLateralOuter binds the outer row's slot for lateral arg evaluation.
+// Called by joinOp before each per-outer-row Open when this scan sits on the
+// right of a Join.Lateral == true (e.g. `FROM t, LATERAL f(t.col)` for a
+// user-defined scalar/composite function). Mirrors pgGetSequenceDataOp.
+// M0134-0126.
+func (o *scalarFuncScanOp) BindLateralOuter(slot SlotView) { o.outerSlot = slot }
+
+func (o *scalarFuncScanOp) Open(ctx *Context) error {
+	o.ctx = ctx
+	o.done = false
+	return nil
+}
+func (o *scalarFuncScanOp) Close() error { return nil }
 
 func (o *scalarFuncScanOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
 	o.done = true
-	val, err := evalExpr(o.plan.Func, nil, o.ctx)
+	val, err := evalExprSlot(o.plan.Func, o.outerSlot, o.ctx)
 	if err != nil {
 		return nil, err
 	}

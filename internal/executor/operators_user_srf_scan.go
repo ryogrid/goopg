@@ -10,10 +10,11 @@ import (
 // It calls evalSQLFunctionSetof / evalPLpgSQLFunctionSetof and emits each
 // returned value as one row. M0097-0153.
 type userSrfScanOp struct {
-	plan *optimizer.UserSrfScan
-	ctx  *Context
-	rows []Datum
-	idx  int
+	plan      *optimizer.UserSrfScan
+	ctx       *Context
+	outerSlot SlotView
+	rows      []Datum
+	idx       int
 }
 
 func newUserSrfScanOp(p *optimizer.UserSrfScan) *userSrfScanOp {
@@ -24,12 +25,18 @@ func (o *userSrfScanOp) Schema() optimizer.Schema {
 	return o.plan.Output()
 }
 
+// BindLateralOuter binds the outer row's slot for lateral arg evaluation.
+// Called by joinOp before each per-outer-row Open when this scan sits on the
+// right of a Join.Lateral == true (e.g. `FROM t, LATERAL f(t.col)` for a
+// user-defined SETOF function). Mirrors pgGetSequenceDataOp. M0134-0126.
+func (o *userSrfScanOp) BindLateralOuter(slot SlotView) { o.outerSlot = slot }
+
 func (o *userSrfScanOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	r := o.plan.Routine
 	args := make([]Datum, len(o.plan.Args))
 	for i, argExpr := range o.plan.Args {
-		d, err := evalExprSlot(argExpr, nil, ctx)
+		d, err := evalExprSlot(argExpr, o.outerSlot, ctx)
 		if err != nil {
 			return err
 		}

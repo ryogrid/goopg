@@ -1459,6 +1459,62 @@ func TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem(t *testing.T) {
 	}
 }
 
+// TestPlanUserFuncLateralArgResolvesAgainstLeftFromItem pins the M0134-0126
+// fix: a user-defined function invoked in the FROM clause (implicit or
+// explicit LATERAL) with an argument that is a correlated reference to an
+// earlier FROM item — e.g. `FROM t, LATERAL f(t.col)` — must resolve that
+// argument against the left sibling's schema, same as the already-supported
+// builtin SRFs (pg_get_publication_tables, verify_heapam,
+// pg_get_sequence_data). Before the fix, planTableFuncRangeVar's
+// user-defined-routine branch resolved args against an EMPTY
+// *resolveContext{} (ignoring lateralCtx entirely), so ANY correlated
+// argument to ANY user-defined FROM-clause function raised "column ... does
+// not exist" — reproduced with both scalar (non-SETOF) and SETOF routines,
+// unrelated to gin.sql itself (which merely exposed it via
+// `lateral explain_query_json(... || query)`). Covers both the SETOF
+// (UserSrfScan) and non-SETOF (ScalarFuncScan) plan-node shapes.
+func TestPlanUserFuncLateralArgResolvesAgainstLeftFromItem(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		returnsSet bool
+	}{
+		{"setof", true},
+		{"scalar", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := catalog.NewInMemory()
+			if _, err := c.CreateTable(parser.ObjectName{Name: "t_probe"}, []catalog.Column{
+				{Name: "query", Type: catalog.Type{Name: "text"}, Ordinal: 0},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Routines().Create(&catalog.Routine{
+				Name:       "myfunc",
+				ArgNames:   []string{"x"},
+				ArgTypes:   []catalog.Type{{Name: "text"}},
+				ReturnType: catalog.Type{Name: "text"},
+				ReturnsSet: tc.returnsSet,
+				Language:   "sql",
+				Body:       "SELECT x",
+			}, false); err != nil {
+				t.Fatalf("Create routine: %v", err)
+			}
+			sql := `SELECT js FROM t_probe, LATERAL myfunc(t_probe.query) js`
+			plan, err := Plan(parseOne(t, sql), c)
+			if err != nil {
+				t.Fatalf("Plan: %v", err)
+			}
+			out := plan.Output()
+			if len(out) != 1 || !strings.EqualFold(out[0].Name, "js") {
+				t.Fatalf("expected single output column 'js', got %+v", out)
+			}
+			if !planTreeHasLateralJoin(plan) {
+				t.Fatalf("expected a Lateral Join in the plan tree, got none:\n%s", plan)
+			}
+		})
+	}
+}
+
 // planTreeHasLateralJoin reports whether any Join in the plan tree has
 // Lateral == true. Helper for TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem.
 func planTreeHasLateralJoin(n Node) bool {
