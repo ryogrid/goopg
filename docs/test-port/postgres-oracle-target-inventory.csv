@@ -70,7 +70,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/fast_default.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/float4.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/float8.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/foreign_data.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/foreign_data.sql,failed,no,-,"Sized live M0134-0124 (2026-08-24); PARKED — 0% parity; landed CREATE FOREIGN DATA WRAPPER already-exists + superuser-attribute checks; needs pg_shdepend-shaped dependency/CASCADE engine, pg_user_mapping catalog, FDW option-duplicate validation, ALTER FDW syntax/option validation, owner tracking, partition-attach NOT NULL propagation, see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/foreign_key.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/functional_deps.sql,pass,yes,-,Passes via TestPort_RegressSuite/functional_deps (M0097-0036d)
 ,regress-sql,regress,postgres/src/test/regress/sql/generated_stored.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

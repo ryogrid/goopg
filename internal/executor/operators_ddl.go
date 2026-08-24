@@ -21654,6 +21654,27 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// resolved before registering (mirrors CreateForeignDataWrapper's
 		// parse_func_options running before the catalog insert) so a bad
 		// HANDLER/VALIDATOR name raises 42883/42809 without creating the FDW.
+		//
+		// Ordering mirrors PG's CreateForeignDataWrapper
+		// (postgres/src/backend/commands/foreigncmds.c ~586-603): superuser
+		// check first, then the already-exists check, both ahead of the
+		// handler/validator resolution below. Unlike the LEAKPROOF/event-
+		// trigger sibling checks (which treat any non-"postgres"
+		// NonSuperuserRole as non-superuser — a known convention gap, see
+		// the M0134-0124 deferral-ledger row), this one consults the
+		// role's actual SUPERUSER attribute via catalog.IsSuperuser so a
+		// `SET SESSION AUTHORIZATION <role-created-with-SUPERUSER>` session
+		// (e.g. foreign_data.sql's regress_foreign_data_user) is correctly
+		// treated as a superuser. M0134-0124.
+		if role := o.ctx.NonSuperuserRole; role != "" {
+			oid, ok := im.RoleOID(role)
+			if !ok || !im.IsSuperuser(oid) {
+				return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create foreign-data wrapper %q", s.ObjName.String()), Hint: "Must be superuser to create a foreign-data wrapper."}
+			}
+		}
+		if _, found := im.LookupForeignDataWrapper(s.ObjName.String()); found {
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: fmt.Sprintf("foreign-data wrapper %q already exists", s.ObjName.String())}
+		}
 		var handlerOID, validatorOID uint32
 		if s.FDWHandlerFunc != nil {
 			oid, rerr := resolveFDWHandlerFunc(im.Routines(), *s.FDWHandlerFunc)
