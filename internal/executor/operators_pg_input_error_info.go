@@ -181,6 +181,13 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = lerr.Message
 			sqlCode = lerr.Code
 		}
+	case "path":
+		// path: agrees with the column-coercion path, same parsePathLiteral.
+		// M0134-0149.
+		if _, _, perr := parsePathLiteral(v); perr != nil {
+			message = perr.Message
+			sqlCode = perr.Code
+		}
 	case "macaddr":
 		// macaddr: agrees with the column-coercion path, same
 		// parseMacaddrLiteral. M0134-0138.

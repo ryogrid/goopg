@@ -320,6 +320,17 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			return "", lerr
 		}
 		s = lsegCanonicalText(x1, y1, x2, y2)
+	} else if tname == "path" {
+		// path: validate + canonicalize on assignment, mirroring path_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box/circle/line/lseg above. Previously a path column
+		// was raw-varlena pass-through: any string, well-formed or not, was
+		// stored verbatim with no open/closed normalization. M0134-0149.
+		pts, closed, perr := parsePathLiteral(s)
+		if perr != nil {
+			return "", perr
+		}
+		s = pathCanonicalText(pts, closed)
 	} else if tname == "inet" || tname == "cidr" {
 		// inet/cidr: validate + canonicalize on assignment, mirroring PG's
 		// network_in/network_out (postgres/src/backend/utils/adt/network.c),

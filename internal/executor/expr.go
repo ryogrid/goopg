@@ -2894,6 +2894,128 @@ func lsegCanonicalText(x1, y1, x2, y2 float64) string {
 	return fmt.Sprintf("[(%s,%s),(%s,%s)]", PGFloatOut(x1, 64), PGFloatOut(y1, 64), PGFloatOut(x2, 64), PGFloatOut(y2, 64))
 }
 
+// parsePathLiteral reproduces path_in's parsing (postgres/src/backend/utils/
+// adt/geo_ops.c path_in/path_decode/pair_count) closely enough to give the
+// same accept/reject verdict, the same points, and the same open/closed flag
+// on every case exercised by path.sql. Two outer wrappers are recognized: a
+// single leading '(' with no other '(' anywhere else in the string (the
+// "quick entry" wrapped form, e.g. "(1,2,3,4)") is stripped by path_in
+// itself before path_decode runs; path_decode then recognizes '[' (open),
+// a doubled '((' (closed with an extra wrapper), or no wrapper at all
+// (bare "1,2,3,4" or singly-wrapped "(1,2),(3,4)"). The point count is
+// pre-computed from the total comma count exactly as pair_count does — an
+// even (or zero) comma count is rejected before any point parsing is
+// attempted, matching path_in's "invalid input syntax" for inputs like
+// "[]" (zero commas) or a single lone point with no comma at all.
+// M0134-0149.
+func parsePathLiteral(s string) (points [][2]float64, closed bool, errOut *ExecError) {
+	orig := s
+	syntaxErr := func() ([][2]float64, bool, *ExecError) {
+		return nil, false, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type path: %q", orig)}
+	}
+
+	// pair_count returns -1 (npts<=0, i.e. invalid) unless the total comma
+	// count is odd and positive; an even (including zero) count is rejected
+	// here before any point parsing is attempted.
+	ndelim := strings.Count(s, ",")
+	if ndelim%2 == 0 {
+		return syntaxErr()
+	}
+	npts := (ndelim + 1) / 2
+
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	outerDepth := 0
+	if t != "" && t[0] == '(' && strings.LastIndexByte(t, '(') == 0 {
+		t = t[1:]
+		outerDepth++
+	}
+
+	// path_decode(t, opentype=true, npts, ...)
+	isopen := false
+	depth := 0
+	if t != "" && t[0] == '[' {
+		isopen = true
+		depth++
+		t = t[1:]
+	} else if t != "" && t[0] == '(' {
+		cp := strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		if cp != "" && cp[0] == '(' {
+			depth++
+			t = cp
+		} else if strings.LastIndexByte(t, '(') == 0 {
+			depth++
+			t = cp
+		}
+	}
+
+	pts := make([][2]float64, npts)
+	for i := 0; i < npts; i++ {
+		x, y, rest, derr := linePairDecode(t)
+		if derr != nil {
+			if derr.Message == "" {
+				return syntaxErr()
+			}
+			return nil, false, &ExecError{Code: derr.Code, Message: derr.Message}
+		}
+		t = rest
+		if t != "" && t[0] == ',' {
+			t = t[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if t != "" && (t[0] == ')' || (t[0] == ']' && isopen && depth == 1)) {
+			depth--
+			t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		} else {
+			return syntaxErr()
+		}
+	}
+
+	if outerDepth >= 1 {
+		if t == "" || t[0] != ')' {
+			return syntaxErr()
+		}
+		t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+	}
+	if t != "" {
+		return syntaxErr()
+	}
+
+	return pts, !isopen, nil
+}
+
+// pathCanonicalText formats a path's points exactly as path_out does —
+// path_encode(closed ? PATH_CLOSED : PATH_OPEN, npts, pt) — "((x,y),...)"
+// for a closed path, "[(x,y),...]" for an open one, each coordinate via
+// float8out's Ryu-based shortest-roundtrip formatting. M0134-0149.
+func pathCanonicalText(points [][2]float64, closed bool) string {
+	var b strings.Builder
+	if closed {
+		b.WriteByte('(')
+	} else {
+		b.WriteByte('[')
+	}
+	for i, p := range points {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('(')
+		b.WriteString(PGFloatOut(p[0], 64))
+		b.WriteByte(',')
+		b.WriteString(PGFloatOut(p[1], 64))
+		b.WriteByte(')')
+	}
+	if closed {
+		b.WriteByte(')')
+	} else {
+		b.WriteByte(']')
+	}
+	return b.String()
+}
+
 // macScanCandidate is one of macaddr_in's 7 sscanf format strings
 // (postgres/src/backend/utils/adt/mac.c:71-90), reduced to its two variable
 // dimensions: the shared field width (0 = unbounded "%x", 2 = "%2x") and the
@@ -12234,6 +12356,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// parseLsegLiteral.
 				_, _, _, _, lerr := parseLsegLiteral(v)
 				return NewBoolDatum(lerr == nil), nil
+			case "path":
+				// M0134-0149: agrees with the column-coercion path, same
+				// parsePathLiteral.
+				_, _, perr := parsePathLiteral(v)
+				return NewBoolDatum(perr == nil), nil
 			case "macaddr":
 				// M0134-0138: agrees with the column-coercion path, same
 				// parseMacaddrLiteral.
@@ -13526,6 +13653,51 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				p2, ok2 := parsePointText(bs)
 				if ok1 && ok2 {
 					return NewStringDatum(lsegCanonicalText(p1[0], p1[1], p2[0], p2[1])), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "isopen", "isclosed":
+		// isopen(path)/isclosed(path) → bool — path_isopen/path_isclosed in
+		// geo_ops.c: a thin wrapper reading the stored open/closed flag, no
+		// re-parsing or point-count logic of its own. M0134-0149.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				_, closed, perr := parsePathLiteral(as)
+				if perr == nil {
+					wantClosed := name == "isclosed"
+					return NewBoolDatum(closed == wantClosed), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "pclose", "popen":
+		// pclose(path)/popen(path) → path — path_close/path_open in
+		// geo_ops.c: return a copy of the path with the open/closed flag
+		// forced, points and point count unchanged. M0134-0149.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				pts, _, perr := parsePathLiteral(as)
+				if perr == nil {
+					return NewStringDatum(pathCanonicalText(pts, name == "pclose")), nil
 				}
 			}
 		}
