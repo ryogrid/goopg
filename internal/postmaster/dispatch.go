@@ -144,7 +144,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// Peel the leading role statement off, handle it, then recurse on the
 		// remainder so every statement runs. M0118-0008.
 		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
-			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName, resolveCurrentGUC); handled {
+			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName, resolveCurrentGUC, connTx.NonSuperuserRole); handled {
 				if herr != nil {
 					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 				}
@@ -161,7 +161,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
-		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName, resolveCurrentGUC); handled {
+		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName, resolveCurrentGUC, connTx.NonSuperuserRole); handled {
 			if herr != nil {
 				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 			}

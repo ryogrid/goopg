@@ -51,7 +51,18 @@ import (
 //   - handled=true, err=nil:   statement was handled successfully
 //   - handled=true, err!=nil:  statement was handled but failed (e.g. role not found)
 //   - handled=false, err=nil:  not a role DDL statement; caller should continue
-func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent currentGUCResolver) (bool, error) {
+// actingRole is variadic (not a plain trailing string) so the ~30 existing
+// direct-call test sites that predate the M0134-0114 privilege-attribute
+// checks below keep compiling unchanged — omitting it defaults to "", the
+// connTx.NonSuperuserRole convention for "the bootstrap superuser", which
+// bypasses every check exactly as those tests' pre-existing behavior
+// assumed. Only the wire-dispatch call sites (dispatch.go,
+// dispatch_extended.go) pass the caller's real effective role.
+func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent currentGUCResolver, actingRole ...string) (bool, error) {
+	acting := ""
+	if len(actingRole) > 0 {
+		acting = actingRole[0]
+	}
 	norm := normalizeCompatSQL(sql)
 	switch {
 	case strings.HasPrefix(norm, "create role "), strings.HasPrefix(norm, "create user "),
@@ -72,6 +83,13 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		// Explicit LOGIN/NOLOGIN below overrides.
 		attrs := catalog.RoleAttrs{CanLogin: strings.HasPrefix(norm, "create user "), ConnLimit: -1}
 		applyRoleAttrOptions(sql, norm, &attrs, resolveCurrent)
+		if acting != "" {
+			if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+				if err := checkCreateRolePrivileges(im, acting, attrs); err != nil {
+					return true, err
+				}
+			}
+		}
 		s.registerRole(name)
 		// Also register in catalog so executor-level DROP ROLE IF EXISTS can check.
 		if s.cfg.Catalog != nil {
@@ -121,6 +139,11 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 			}
 		}
 		applyRoleAttrOptions(sql, norm, &attrs, resolveCurrent)
+		if acting != "" && isInMem {
+			if err := checkAlterRoleAttrPrivileges(im, acting, norm); err != nil {
+				return true, err
+			}
+		}
 		if isInMem {
 			im.SetRoleAttrs(name, attrs)
 		}
@@ -850,6 +873,123 @@ func reservedRoleNameErr(name string) error {
 		code:   errcodes.ReservedName,
 		msg:    "role name \"" + name + "\" is reserved",
 		detail: "Role names starting with \"pg_\" are reserved.",
+	}
+}
+
+// checkCreateRolePrivileges ports the CREATEROLE-privilege gate from
+// CreateRole (postgres/src/backend/commands/user.c ~313-343, "Check some
+// permissions first"): a non-superuser actingRole must itself hold
+// CREATEROLE to create ANY role at all, and beyond that may only hand a new
+// role SUPERUSER/CREATEDB/REPLICATION/BYPASSRLS if it holds that exact
+// attribute itself — SUPERUSER can never be handed out by a non-superuser,
+// full stop, matching user.c's unconditional `if (issuper)` (no matching
+// "unless you have SUPERUSER yourself" escape hatch, unlike the other
+// three). Callers only invoke this when actingRole != "" (the
+// connTx.NonSuperuserRole convention for "not the bootstrap superuser");
+// "" bypasses the whole gate here, exactly mirroring
+// `if (!superuser_arg(currentUserId))` wrapping this entire block upstream.
+// An actingRole with no recorded RoleAttrs (LookupRoleAttrs miss) fails
+// closed as "no privileges" rather than skipping the check, since every
+// live session's effective role is registered in practice by the time DDL
+// runs. M0134-0114.
+func checkCreateRolePrivileges(im *catalog.InMemory, actingRole string, newAttrs catalog.RoleAttrs) error {
+	curAttrs, found := im.LookupRoleAttrs(actingRole)
+	if !found {
+		curAttrs = catalog.RoleAttrs{}
+	}
+	if curAttrs.Superuser {
+		return nil
+	}
+	if !curAttrs.CreateRole {
+		return &roleError{
+			code:   errcodes.InsufficientPrivilege,
+			msg:    "permission denied to create role",
+			detail: "Only roles with the CREATEROLE attribute may create roles.",
+		}
+	}
+	if newAttrs.Superuser {
+		return createOrAlterRoleAttrDeniedErr("create", "SUPERUSER")
+	}
+	if newAttrs.CreateDB && !curAttrs.CreateDB {
+		return createOrAlterRoleAttrDeniedErr("create", "CREATEDB")
+	}
+	if newAttrs.Replication && !curAttrs.Replication {
+		return createOrAlterRoleAttrDeniedErr("create", "REPLICATION")
+	}
+	if newAttrs.BypassRLS && !curAttrs.BypassRLS {
+		return createOrAlterRoleAttrDeniedErr("create", "BYPASSRLS")
+	}
+	return nil
+}
+
+// checkAlterRoleAttrPrivileges ports the simple, non-ownership-scoped half
+// of AlterRole's permission gate (user.c ~757-816): touching the SUPERUSER
+// attribute at all — SUPERUSER or NOSUPERUSER, regardless of the role's
+// CURRENT superuser status — always requires actingRole itself be
+// superuser (`!superuser() && dissuper`), and once past that, touching
+// CREATEDB/REPLICATION/BYPASSRLS (again: either polarity) requires
+// actingRole hold that same attribute itself
+// (`dcreatedb && !have_createdb_privilege()` etc).
+//
+// This deliberately does NOT port the surrounding CREATEROLE+ADMIN-OPTION-
+// on-target gate (upstream's `if (!have_createrole_privilege() ||
+// !is_admin_of_role(currentUserId, roleid))` block, which additionally
+// requires ADMIN OPTION on the specific target role for ANY attribute
+// change) — that needs role-ownership/admin-option tracking the text-
+// substitution ALTER ROLE path here does not have; ledgered as a follow-up
+// (M0134-0114 deferral ledger row). norm is the already-lower-cased,
+// trimmed ALTER ROLE statement text; attribute presence is detected the
+// same substring way applyRoleAttrOptions itself parses values, so the two
+// stay in lockstep by construction.
+func checkAlterRoleAttrPrivileges(im *catalog.InMemory, actingRole, norm string) error {
+	curAttrs, found := im.LookupRoleAttrs(actingRole)
+	if !found {
+		curAttrs = catalog.RoleAttrs{}
+	}
+	if curAttrs.Superuser {
+		return nil
+	}
+	if alterRoleTouchesAttr(norm, "superuser") {
+		return createOrAlterRoleAttrDeniedErr("alter", "SUPERUSER")
+	}
+	if alterRoleTouchesAttr(norm, "createdb") && !curAttrs.CreateDB {
+		return createOrAlterRoleAttrDeniedErr("alter", "CREATEDB")
+	}
+	if alterRoleTouchesAttr(norm, "replication") && !curAttrs.Replication {
+		return createOrAlterRoleAttrDeniedErr("alter", "REPLICATION")
+	}
+	if alterRoleTouchesAttr(norm, "bypassrls") && !curAttrs.BypassRLS {
+		return createOrAlterRoleAttrDeniedErr("alter", "BYPASSRLS")
+	}
+	return nil
+}
+
+// alterRoleTouchesAttr reports whether norm's ALTER ROLE attribute list
+// mentions attr in either polarity (e.g. "superuser" or "nosuperuser") —
+// mirrors applyRoleAttrOptions' own `strings.Contains(norm, " no"+attr)` /
+// `strings.Contains(norm, " "+attr)` pair, since PG treats naming an
+// attribute at all (any value) as "touched" for permission purposes.
+func alterRoleTouchesAttr(norm, attr string) bool {
+	return strings.Contains(norm, " "+attr) || strings.Contains(norm, " no"+attr)
+}
+
+// createOrAlterRoleAttrDeniedErr builds the shared "Only roles with the X
+// attribute may VERB roles/this role with/the X attribute" 42501 errdetail
+// user.c emits at every one of these 8 near-identical call sites (4 in
+// CreateRole, 4 in AlterRole) — the two verbs/phrasings differ only in
+// "create"/"alter" and "roles with"/"change the".
+func createOrAlterRoleAttrDeniedErr(verb, attr string) error {
+	if verb == "create" {
+		return &roleError{
+			code:   errcodes.InsufficientPrivilege,
+			msg:    "permission denied to create role",
+			detail: fmt.Sprintf("Only roles with the %s attribute may create roles with the %s attribute.", attr, attr),
+		}
+	}
+	return &roleError{
+		code:   errcodes.InsufficientPrivilege,
+		msg:    "permission denied to alter role",
+		detail: fmt.Sprintf("Only roles with the %s attribute may change the %s attribute.", attr, attr),
 	}
 }
 

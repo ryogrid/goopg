@@ -650,7 +650,7 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName, actingRole st
 		}
 		return &extendedQueryResult{CommandTag: databaseDDLCommandTag(query), Notice: notice}, nil, true
 	}
-	if handled, herr := s.tryHandleRoleDDL(query, dbName, resolveCurrentGUC); handled {
+	if handled, herr := s.tryHandleRoleDDL(query, dbName, resolveCurrentGUC, actingRole); handled {
 		if herr != nil {
 			return nil, &extendedQueryError{Code: roleErrorSQLState(herr), Message: herr.Error(), Detail: roleErrorDetail(herr)}, true
 		}
