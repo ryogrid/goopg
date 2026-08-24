@@ -1288,15 +1288,27 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 // commandTagBehavior in cmdtag_table.go).
 func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
 	if o.ctx.NonSuperuserRole != "" {
-		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create event trigger %q", s.Name)}
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create event trigger %q", s.Name), Hint: "Must be superuser to create an event trigger."}
 	}
 	switch s.Event {
 	case "ddl_command_start", "ddl_command_end", "sql_drop", "login", "table_rewrite":
 	default:
 		return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized event name %q", s.Event)}
 	}
-	if s.FilterVar != "" && s.FilterVar != "tag" {
-		return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized filter variable %q", s.FilterVar)}
+	// Validate filter conditions in clause-appearance order, mirroring
+	// CreateEventTrigger's foreach(lc, stmt->whenclause) loop
+	// (event_trigger.c): the first unrecognized filter variable wins, and a
+	// second "tag" clause reports "specified more than once" rather than
+	// silently merging its values into the first (M0134-0122).
+	sawTag := false
+	for _, fv := range s.FilterVars {
+		if !strings.EqualFold(fv, "tag") {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized filter variable %q", fv)}
+		}
+		if sawTag {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("filter variable %q specified more than once", fv)}
+		}
+		sawTag = true
 	}
 	if len(s.Tags) > 0 && s.Event == "login" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tag filtering is not supported for login event triggers"}

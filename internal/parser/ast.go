@@ -2964,9 +2964,14 @@ type CreateEventTriggerStmt struct {
 	Event string
 	// FilterVar is the WHEN clause's filter-variable name ("tag" is the only
 	// one PostgreSQL recognises today); "" if there is no WHEN clause.
-	FilterVar string
-	Tags      []string // WHEN <FilterVar> IN (...) values, unquoted
-	FuncName  ObjectName
+	// Last-write-wins across multiple AND-joined clauses — kept only for
+	// back-compat with existing single-clause callers; use FilterVars for the
+	// full clause-order sequence (needed to detect a duplicate filter
+	// variable the way event_trigger.c's CreateEventTrigger does).
+	FilterVar  string
+	FilterVars []string // one entry per WHEN <var> IN (...) clause, in source order
+	Tags       []string // WHEN <FilterVar> IN (...) values, unquoted
+	FuncName   ObjectName
 }
 
 func (s *CreateEventTriggerStmt) Pos() int  { return s.pos }

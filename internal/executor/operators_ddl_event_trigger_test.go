@@ -129,6 +129,59 @@ func TestCreateEventTriggerNonSuperuserErrors(t *testing.T) {
 	}
 }
 
+// TestCreateEventTriggerNonSuperuserHint pins the HINT PG attaches to the
+// 42501 error above (errhint("Must be superuser to create an event
+// trigger."), event_trigger.c) — M0134-0122.
+func TestCreateEventTriggerNonSuperuserHint(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION et_func() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterRole("app_owner")
+	ctx.NonSuperuserRole = "app_owner"
+
+	err := runDDL(t, ctx, `CREATE EVENT TRIGGER et1 ON ddl_command_start EXECUTE FUNCTION et_func()`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Hint != "Must be superuser to create an event trigger." {
+		t.Errorf("Hint=%q want the PG hint text", ee.Hint)
+	}
+}
+
+// TestCreateEventTriggerDuplicateFilterVarErrors pins
+// error_duplicate_filter_variable (event_trigger.c): two AND-joined `tag IN
+// (...)` clauses in the same WHEN must raise "filter variable \"tag\"
+// specified more than once" (42601) instead of silently merging their tag
+// lists — M0134-0122 (event_trigger.sql).
+func TestCreateEventTriggerDuplicateFilterVarErrors(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION et_func() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	err := runDDL(t, ctx, `CREATE EVENT TRIGGER et1 ON ddl_command_start WHEN TAG IN ('create table') AND TAG IN ('CREATE FUNCTION') EXECUTE FUNCTION et_func()`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42601" {
+		t.Errorf("Code=%q want 42601", ee.Code)
+	}
+	if ee.Message != `filter variable "tag" specified more than once` {
+		t.Errorf("Message=%q", ee.Message)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	if got := im.ListEventTriggers(); len(got) != 0 {
+		t.Errorf("ListEventTriggers=%v want empty (CREATE must have been rejected)", got)
+	}
+}
+
 // TestCreateEventTriggerTagValidation pins validate_ddl_tags/
 // validate_table_rewrite_tags (event_trigger.c), verified against a real
 // PG 18.3 instance: an unrecognized tag on a ddl_command_*/sql_drop trigger

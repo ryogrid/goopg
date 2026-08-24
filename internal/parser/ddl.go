@@ -2414,6 +2414,7 @@ func (p *parser) parseCreateEventTriggerTail(pos int) (Stmt, error) {
 				return nil, p.errAtCur("expected '(' after IN")
 			}
 			stmt.FilterVar = filterVar.Value
+			stmt.FilterVars = append(stmt.FilterVars, filterVar.Value)
 			for {
 				if p.cur().Kind != TokenStringLit {
 					return nil, p.errAtCur("expected string literal in filter value list")
