@@ -210,6 +210,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 				return w.ReadyForQuery()
 			}
 		}
+		// M0134-0155: a PARSE-time error inside an explicit transaction
+		// aborts the block too — PostgreSQL rejects any subsequent
+		// statement with 25P02 until ROLLBACK (postgres.c's error handler
+		// aborts on ANY statement error, not just executor ones).
+		// Mirrors the M0132-S5 plan-error gate below; before this,
+		// `BEGIN; <syntax error>; SELECT 1` left the block live.
+		if connTx != nil && connTx.InExplicit() {
+			connTx.Fail()
+			connTx.ReleasePinnedSnapshotOnFail(s.cfg.TxnMgr)
+		}
 		msg, extra := syntaxErrorMsg(err)
 		return s.writeQueryError(w, syntaxErrorCode(err), msg, extra...)
 	}

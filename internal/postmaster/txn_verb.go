@@ -137,6 +137,15 @@ const abortedBlockMessage = "current transaction is aborted, commands ignored un
 // rolls back, and COMMIT/ROLLBACK PREPARED of an unknown gid reports "does not
 // exist" rather than 25P02.
 func allowedInAbortedBlock(upper string) bool {
+	// Empty statements (";" alone after normalizeSimpleQuery strips it, or a
+	// whitespace-only query) are not commands at all: upstream's 25P02 check
+	// sits inside exec_simple_query's per-parsetree loop, so a statement that
+	// parses to nothing never reaches it — EmptyQueryResponse is returned even
+	// in the aborted state (bug #17983 regression coverage in upstream
+	// psql.sql exercises exactly this). M0134-0155.
+	if strings.Trim(upper, "; \t") == "" {
+		return true
+	}
 	for _, p := range []string{"COMMIT", "ROLLBACK", "ABORT", "END", "PREPARE TRANSACTION"} {
 		if upper == p || strings.HasPrefix(upper, p+" ") || strings.HasPrefix(upper, p+";") {
 			return true

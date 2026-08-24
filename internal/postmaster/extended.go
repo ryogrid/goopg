@@ -538,6 +538,13 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	// as a GUC name, erroring with "unrecognized configuration parameter").
 	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
 		upper == "SET LOCAL SESSION AUTHORIZATION":
+		if setAuthzGenericSetForm(matchable[len("SET LOCAL SESSION AUTHORIZATION"):]) {
+			// No generic_set grammar upstream for SESSION AUTHORIZATION
+			// (gram.y:1764/:1774: bare rolename or DEFAULT only), so TO/=
+			// spellings must reach the parser-driven path for PG's 42601
+			// instead of being applied as a garbage role name. M0134-0155.
+			return s.executeExtendedQueryViaExecutor(ctx, sess, query, params, procNum, dbName, connTx)
+		}
 		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET LOCAL SESSION AUTHORIZATION", true)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	// SET LOCAL ROLE rolename — must be checked before the generic "SET LOCAL "
@@ -564,6 +571,10 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	// doesn't mis-parse "SESSION AUTHORIZATION name". M0119-0004.
 	case strings.HasPrefix(upper, "SET SESSION AUTHORIZATION "),
 		upper == "SET SESSION AUTHORIZATION":
+		if setAuthzGenericSetForm(matchable[len("SET SESSION AUTHORIZATION"):]) {
+			// See the SET LOCAL SESSION AUTHORIZATION case above. M0134-0155.
+			return s.executeExtendedQueryViaExecutor(ctx, sess, query, params, procNum, dbName, connTx)
+		}
 		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET SESSION AUTHORIZATION", false)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	// SET ROLE rolename — track the effective role for privilege checks. Must
@@ -764,7 +775,7 @@ func setSessionAuthorizationFastPath(sess *misc.SessionRegistry, connTx *connTxS
 	if connTx == nil {
 		return
 	}
-	role := strings.TrimSpace(matchable[len(prefix):])
+	role := stripSetToOrEquals(matchable[len(prefix):])
 	role = strings.Trim(role, `"'`)
 	connTx.SnapshotLocalRoleIfNeeded(local)
 	applySetSessionAuthorization(connTx, role)
@@ -778,7 +789,7 @@ func setRoleFastPath(sess *misc.SessionRegistry, connTx *connTxState, matchable,
 	if connTx == nil {
 		return
 	}
-	role := strings.TrimSpace(matchable[len(prefix):])
+	role := stripSetToOrEquals(matchable[len(prefix):])
 	role = strings.Trim(role, `"'`)
 	connTx.SnapshotLocalRoleIfNeeded(local)
 	applySetRole(connTx, role)

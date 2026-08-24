@@ -3845,6 +3845,29 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		}
 		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, MethodPos: methodPos, KeyCols: keyCols, KeyColPos: keyColPos, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 	}
+	// Optional table_access_method_clause: `USING <access_method>`. PG's
+	// gram.y OptTableElementList production order is OptInherit
+	// OptPartitionSpec table_access_method_clause OptWith OnCommitOption
+	// OptTableSpace, so USING lands here — between PARTITION BY and WITH.
+	// This arm previously omitted it entirely (only the PARTITION-OF child
+	// arm at :3546 and CREATE MATERIALIZED VIEW's tail had it), so any plain
+	// `CREATE TABLE t (...) USING <am>` — including `USING heap`, the
+	// explicit-default spelling pg_dump/psql regress emit — 42601'd with
+	// "syntax error at or near "using"" before reaching WITH/TABLESPACE.
+	// goopg has a single real storage engine (heap); like the partition-child
+	// arm, the access method name is accepted and discarded here — relam
+	// stays at its default and pg_dump emits no USING clause for a plain
+	// heap-AM table. A non-heap AM registered via CREATE ACCESS METHOD (e.g.
+	// this file's own `heap_psql`, whose HANDLER is heap_tableam_handler —
+	// i.e. it IS the heap AM under an alias) round-trips identically to
+	// `heap` today; a genuinely distinct custom table access method would
+	// still need real storage-layer dispatch, which this slice does not add.
+	// M0134-0155.
+	if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
+		if _, err := p.parseIdent(); err != nil {
+			return nil, err
+		}
+	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()
 		if err != nil {
@@ -4314,6 +4337,13 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 				_, _ = p.parseColumnNameList()
 				_ = p.acceptSymbol(")")
 			}
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUsing:
+			// table_access_method_clause on the empty-column-list arm
+			// (`CREATE TABLE t () USING <am>`) — sibling of the main
+			// non-empty-column arm's USING handling added alongside it.
+			// M0134-0155.
+			p.advance()
+			_, _ = p.parseIdent()
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith:
 			p.advance()
 			// WITH OIDS (no parens) is a syntax error in PG; only WITH (oids) is accepted.

@@ -79,6 +79,14 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 					qerr.Hint = f.Value
 				}
 			}
+			// M0134-0155: a PARSE-time error inside an explicit transaction
+			// aborts the block (25P02 for subsequent statements) — same
+			// postgres.c semantics as the simple-query path's parse-error
+			// gate and this file's M0132-S5 execution-error gates.
+			if connTx != nil && connTx.InExplicit() {
+				connTx.Fail()
+				connTx.ReleasePinnedSnapshotOnFail(s.cfg.TxnMgr)
+			}
 			return nil, qerr
 		}
 		// Per-statement query logging (GOOPG_LOG_STATEMENT), extended protocol.

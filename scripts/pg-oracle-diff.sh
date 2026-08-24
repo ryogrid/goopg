@@ -131,7 +131,12 @@ start_servers() {
 
     echo "pg-oracle-diff: initialising data dirs..."
     "${REPO_ROOT}/bin/goopg" init -D "${GOOPG_DATADIR}"
-    initdb -D "${PG_DATADIR}" --no-sync -q
+    # No -q: PG 18.3's initdb has no quiet option (it never did upstream);
+    # --no-sync alone is the supported throwaway-cluster spelling. -U pins
+    # the superuser to $USER_ (default postgres): without it initdb names
+    # the superuser after the OS user and every later -U "$USER_" connect
+    # dies with "role does not exist".
+    initdb -D "${PG_DATADIR}" --no-sync -U "${USER_}"
 
     echo "pg-oracle-diff: starting goopg on :${GOOPG_PORT}..."
     GOOPG_CG_UNIT="oracle-diff-goopg" \
