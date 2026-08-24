@@ -3231,7 +3231,10 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		// box 'string' cast syntax (M0134-0094), e.g. `box '(2,2),(0,0)'`.
 		"box",
 		// circle 'string' cast syntax (M0134-0098), e.g. `circle '<(0,0),5>'`.
-		"circle":
+		"circle",
+		// json/jsonb 'string' cast syntax (M0134-0133), e.g.
+		// `json '{"a": 1}' -> 'a'` used throughout json_encoding.sql.
+		"json", "jsonb":
 		// Handle multi-word type names: "TIME WITH TIME ZONE 'lit'" and
 		// "TIMESTAMP WITH TIME ZONE 'lit'" / "WITHOUT TIME ZONE 'lit'".
 		// Layout: peek(0)=cur(time/timestamp) peek(1)=with/without peek(2)=time peek(3)=zone peek(4)=string

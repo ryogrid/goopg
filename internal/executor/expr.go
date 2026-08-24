@@ -4134,6 +4134,29 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 				Message: fmt.Sprintf("invalid input syntax for type circle: %q", x.Value)}
 		}
 		return NewStringDatum(circleCanonicalText(cx, cy, r)), nil
+	case "jsonb":
+		// M0134-0133: `jsonb '...'` must share the same validate+canonicalize
+		// chokepoint as `::jsonb` (the `case "jsonb"` arm of evalCast, above) —
+		// twin input boundaries for jsonb (Hard-won Rule #2).
+		canon, err := canonicalizeJSONB(x.Value)
+		if err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+			}
+			return Datum{}, err
+		}
+		return NewStringDatum(canon), nil
+	case "json":
+		// M0134-0133: `json '...'` preserves the input spelling verbatim (no
+		// re-serialisation, unlike `jsonb` above) but still validates JSON
+		// syntax at the input boundary, mirroring `::json`'s evalCast arm.
+		if err := validateJSONText(x.Value); err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+			}
+			return Datum{}, err
+		}
+		return NewStringDatum(x.Value), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
 		// M0097-0017: enum/domain type casts return the string value as-is.

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestCanonicalizeJSONB pins canonicalizeJSONB against PG 18.3's jsonb_out
@@ -109,5 +110,45 @@ func TestJSONBCastAndColumnAreTwins(t *testing.T) {
 	}
 	if jsonCol != raw {
 		t.Errorf("coerceTextLikeDatum json = %q, want verbatim %q", jsonCol, raw)
+	}
+}
+
+// TestJSONTypedStringLitMatchesCast pins evalTypedStringLit's `json`/`jsonb`
+// arms (M0134-0133) as a third twin alongside evalCast's `::json`/`::jsonb`
+// and coerceTextLikeDatum's column-coercion arms tested above: `json 'raw'`
+// and `jsonb 'raw'` (the SQL-standard typed-literal form used throughout
+// json_encoding.sql, e.g. `json '{ "a": 1 }' -> 'a'`) must validate/canonicalise
+// identically to the `::` cast (Hard-won Rule #2 — sibling input boundaries).
+func TestJSONTypedStringLitMatchesCast(t *testing.T) {
+	raw := `{"b":1,"a":2}`
+	wantCanon := `{"a": 2, "b": 1}`
+
+	jsonbLit, err := evalTypedStringLit(&optimizer.TypedStringLit{Type: "jsonb", Value: raw}, nil)
+	if err != nil {
+		t.Fatalf("evalTypedStringLit(jsonb): %v", err)
+	}
+	if jsonbLit.StringValue() != wantCanon {
+		t.Errorf("evalTypedStringLit(jsonb) = %q, want canonical %q", jsonbLit.StringValue(), wantCanon)
+	}
+
+	jsonLit, err := evalTypedStringLit(&optimizer.TypedStringLit{Type: "json", Value: raw}, nil)
+	if err != nil {
+		t.Fatalf("evalTypedStringLit(json): %v", err)
+	}
+	if jsonLit.StringValue() != raw {
+		t.Errorf("evalTypedStringLit(json) = %q, want verbatim %q", jsonLit.StringValue(), raw)
+	}
+
+	// Malformed input must raise the same 22P02 both the cast and the typed
+	// literal produce (validateJSONText/canonicalizeJSONB are shared).
+	if _, err := evalTypedStringLit(&optimizer.TypedStringLit{Type: "json", Value: "not json"}, nil); err == nil {
+		t.Error("evalTypedStringLit(json, malformed) succeeded, want 22P02")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "22P02" {
+		t.Errorf("evalTypedStringLit(json, malformed) error = %v, want ExecError 22P02", err)
+	}
+	if _, err := evalTypedStringLit(&optimizer.TypedStringLit{Type: "jsonb", Value: "not json"}, nil); err == nil {
+		t.Error("evalTypedStringLit(jsonb, malformed) succeeded, want 22P02")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "22P02" {
+		t.Errorf("evalTypedStringLit(jsonb, malformed) error = %v, want ExecError 22P02", err)
 	}
 }

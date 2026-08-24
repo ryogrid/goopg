@@ -103,7 +103,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/join.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/join_hash.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/json.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/json_encoding.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/json_encoding.sql,failed,no,-,M0134-0133 sizing: 0% parity to 0 false-positive errors after fixing json/jsonb typed-literal parsing (tryTypedLiteral whitelist gap -- json '...'/jsonb '...' hit a hard syntax error); remaining diff is UTF-16 surrogate-pair lexing plus NUL-escape-to-text rejection -- both need a hand-ported JSON string-escape lexer -- PARKED
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonb.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonb_jsonpath.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonpath.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
