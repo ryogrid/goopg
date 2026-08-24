@@ -1,68 +1,43 @@
-Task just completed: M0134-0130 (inet.sql) — sized live, PARKED, one
-contained fix shipped (a real correctness/type-system gap, not a display
-bug).
+Task just completed: M0134-0131 (infinite_recurse.sql) — FULL PASS, not a
+PARK. 100% parity (0% → 100%).
 
-`scripts/pg-regress-runner.sh inet`: 0% parity, diff 1397→1298 lines.
-Discovery: `inet`/`cidr` columns had ZERO input canonicalization or output
-formatting anywhere — a literal like `'10'::cidr` was stored and re-emitted
-verbatim as raw text, never expanded to PG's canonical `10.0.0.0/8`
-(classful-default-mask expansion), and cidr's "bits set to right of mask"
-validation didn't exist at all (`'192.168.1.2/30'` was silently accepted
-instead of raising `22P02`).
+`scripts/pg-regress-runner.sh infinite_recurse`: was 0% parity ("server
+closed the connection unexpectedly" — a Go process crash). Root cause: a
+self-recursive `LANGUAGE sql` function (`create function infinite_recurse()
+as 'select infinite_recurse()'`) recursed unbounded through
+`evalStoredRoutineFuncCall` → `executeSQLRoutine` → `optimizer.Plan`/`Build`
+→ `evalFuncCall` → back to `evalStoredRoutineFuncCall`, smashing the Go
+goroutine stack. A Go "stack overflow" is a FATAL, unrecoverable process
+crash (not a catchable panic via recover()) — it takes the whole server
+down, unlike PG's clean `54001 stack depth limit exceeded` (PG's
+`check_stack_depth`, `postgres/src/backend/utils/misc/stack_depth.c`, polls
+the C stack pointer on every function call — goopg has no equivalent
+primitive since Go doesn't expose a cheap current-stack-depth read).
 
-Fixed: added `normalizeInetCidrText`/`formatInetAddr`/`formatInetV4`/
-`formatInetV6` (`internal/executor/operators_ddl.go`), a faithful Go port
-of PG's `network_in` (postgres/src/backend/utils/adt/network.c) +
-`pg_inet_net_ntop` (postgres/src/port/inet_net_ntop.c), reusing the
-existing btree-key parser (`parseInetKeyText`/`cidrDefaultV4Mask`/
-`maskInetAddr`, M0134-0002 C5). Go's `net.IP.String()` could NOT be
-reused for IPv6: PG's embedded-dotted-decimal-tail rule fires for any
-6-word leading zero run (or 7 with nonzero last word, or 5 with
-word[5]==0xffff), not just Go's recognized `::ffff:a.b.c.d` — confirmed
-live Go collapses `::ffff:1.2.3.4`→`1.2.3.4` and renders
-`::4.3.2.1`→`::403:201` (pure hex groups), both wrong for PG.
+Fixed: added `Context.RoutineDepth` (`internal/executor/context.go`),
+incremented/checked/decremented around every `executeStoredRoutine` call
+(`internal/executor/plpgsql_runtime.go`, the single dispatch point both
+`executeSQLRoutine` and `executePLpgSQLRoutine` go through) — capped at
+`maxRoutineCallDepth=2000`, raising the same `54001`/"stack depth limit
+exceeded" PG emits. Both LANGUAGE sql and plpgsql build their child
+`Context` via `*child = *ctx`, so the running depth threads through
+recursion by value at every level, mirroring a real stack depth without
+any extra plumbing needed.
 
-Wired into `coerceTextLikeDatum` (`internal/executor/codec.go`) — the
-box/circle canonicalize-on-assignment chokepoint (M0134-0094/-0098) —
-deliberately NOT into `evalCast` (matching that same precedent: explicit
-`::inet`/`::cidr` casts on bare constants stay unvalidated, same as
-box/circle never validating their own explicit-cast boundary).
-
-New test: `TestNormalizeInetCidrText` (14 subtests,
-`internal/executor/inet_cidr_normalize_test.go`).
-
-Design `docs/design/m0134-0130-inet-cidr-normalization.md`, indexed in
-README.md. Ledger row: `.ralph/deferral_ledger.md` 2026-08-24 M0134-0130.
-CSV flipped `not-tried` → `failed` via `make regen-testport`. fix_plan.md
-M0134-0130 marked [x] with full summary.
-
-Deferred (ledger row, resume points recorded):
-1. 11 `pg_proc`-seeded-but-undispatched scalar functions dominate the
-   remaining diff: `host`/`abbrev`/`broadcast`/`network`/`masklen`/
-   `netmask`/`hostmask`/`inet_merge`/`inet_same_family`/`cidr(text)`/
-   `inet(text)`. Same shape as hash_func.sql's gap (M0134-0128) — each
-   reduces to the primitives THIS loop already built
-   (`formatInetAddr`/`parseInetKeyText`/`maskInetAddr`), so it's low-effort
-   follow-on wiring in `evalFuncCall` (`internal/executor/expr.go`),
-   following the `evalHashFunc` pattern exactly.
-2. `<<`/`<<=`/`>>`/`>>=`/`&&`/`~`/`&` inet/cidr operators are entirely
-   unparsed — no lexer tokens exist yet (`internal/parser/token.go`/
-   `lexer.go`), not just missing backend functions.
-3. No cidr↔inet implicit comparison coercion (`WHERE c = i` raises
-   "operator = has incompatible operand types"; PG coerces both to inet).
-
-Remaining 99 diff lines beyond what #1-#3 would fix are smaller/unsized —
-not audited in detail this loop.
+Design `docs/design/m0134-0131-routine-call-depth-guard.md`, indexed in
+README.md. Ledger row: `.ralph/deferral_ledger.md` 2026-08-24 M0134-0131
+(the guard only covers the executeStoredRoutine call path — other
+potential unbounded-recursion sites, e.g. trigger recursion, remain
+unguarded; apply the same ctx.RoutineDepth++ / defer decrement / threshold
+pattern if one is found to actually crash). CSV flipped `not-tried` →
+`pass`/`pass_required=yes` via `make regen-testport`. fix_plan.md
+M0134-0131 marked [x] with full summary.
 
 NEXT LOOP: per the Current Priority banner, continue M0134 top-to-bottom —
-next unworked item is **M0134-0131 — infinite_recurse.sql**. Size it live
-first per the established pattern (run pg-regress-runner, read the diff,
-check whether the root cause is a shared/already-tracked blocker before
-assuming fresh work). Also worth a quick look: item #1 above (11 inet
-scalar functions) is comparatively low-effort and self-contained — a
-future loop could productively spend a slot wiring it directly rather
-than waiting for another regress file to surface it, similar to how
-M0134-0128's hash-function wiring was scoped.
+next unworked item is **M0134-0132 — init_privs.sql**. Size it live first
+per the established pattern (run pg-regress-runner, read the diff, check
+whether the root cause is a shared/already-tracked blocker before assuming
+fresh work).
 
 Standing recommendation, carried across several loops (unchanged this loop):
 1. **GIN/GiST/SPGiST physical-index plan integration** — confirmed across
@@ -96,33 +71,33 @@ Standing recommendation, carried across several loops (unchanged this loop):
 11. `NonSuperuserRole != ""` "is superuser" convention is wrong for any
     non-"postgres"-named `CREATE ROLE ... SUPERUSER` role — worth a
     dedicated sweep.
+12. inet.sql (M0134-0130) left 11 pg_proc-seeded-but-undispatched scalar
+    functions (host/abbrev/broadcast/network/masklen/netmask/hostmask/
+    inet_merge/inet_same_family/cidr()/inet()) — low-effort follow-on
+    wiring in evalFuncCall, following evalHashFunc's pattern exactly.
 
-Gates run this loop: scripts/pg-regress-runner.sh inet (sizing run, 0/1,
-before and after the fix — 1397→1298 diff lines); minimal repro via a
-throwaway cgroup-capped server + psql against the real
-postgres/src/test/regress/sql/inet.sql (confirmed byte-match canonical
-form + correct 22P02 errors); go build ./... PASS; go test
-./internal/executor/... PASS (includes 1 new test func, 14 subtests);
-scripts/tpch-spotcheck.sh PASS (Q12=2 rows 18.4s, Q13=35 rows 7.5s, 27.9s
-query-phase wall); RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
-PASS (all packages, cold internal/initdb 429s + cmd/goopg 76s, rest
-cached); make check-testport-inventory PASS; make regen-testport PASS;
-pre-commit hook's pgbench smoke ran automatically at commit time and
-PASSED (TPC-B 312 TPS, simple-update 633 TPS, select-only 12665 TPS — all
-zero failed transactions); make ralph-state-guard: found the same benign
-stale clean-exit-marker status/progress mismatch as prior loops,
+Gates run this loop: scripts/pg-regress-runner.sh infinite_recurse (0/1 →
+1/1, 100% parity after the fix); go build ./... PASS; go test
+./internal/executor/... PASS; scripts/tpch-spotcheck.sh PASS (Q12=2 rows
+18.4s, Q13=35 rows 7.3s, 27.7s query-phase wall); RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh PASS (all packages, cold internal/initdb
+435s + cmd/goopg 76s, rest cached); make check-testport-inventory PASS;
+make regen-testport PASS; pre-commit hook's pgbench smoke ran automatically
+at commit time and PASSED (TPC-B 340 TPS, simple-update 622 TPS, select-only
+12549 TPS — all zero failed transactions); make ralph-state-guard: found the
+same benign stale clean-exit-marker status/progress mismatch as prior loops,
 auto-repaired to progress=in_progress.
 
 In-flight: none.
 
 Note: a concurrent peer session's WIP was present in the tree again this
-loop (.ralph/progress.json, .ralphrc, analysis/*, ci/logs/launch.log,
-ci/logs/scheduler.log, docs/wiki/*,
-internal/executor/operators_recursive_cte.go, postgres (untracked
-convenience symlink), third-party/tpcds-postgres, plus untracked files
-analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt) and
-was deliberately left untouched/uncommitted — only this loop's own files
-were staged and committed by explicit pathspec.
+loop (.ralphrc, analysis/*, ci/logs/launch.log, ci/logs/scheduler.log,
+docs/wiki/*, internal/executor/operators_recursive_cte.go, postgres
+(untracked convenience symlink), third-party/tpcds-postgres, plus untracked
+files analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt,
+docs/wiki/modules/catalog.md) and was deliberately left untouched/
+uncommitted — only this loop's own files were staged and committed by
+explicit pathspec.
 
 M-NIGHTLY: re-checked at loop start — `ci/logs/action-items.md` run
 20260824-013441 (2 items) was already filed in fix_plan.md by a prior loop
