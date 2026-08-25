@@ -33,10 +33,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   reproducibility check (`make gen-parser` twice ⇒ zero diff); seeded-conflict
   test proving the gate fires; lexer-conformance checklist vs scan.l
   (05 #4/#12 fixtures).
-- [ ] **P0.7 Perf baselines** (review finding): micro-benchmarks for Parse/
+- [x] **P0.7 Perf baselines** (review finding): micro-benchmarks for Parse/
   ParseExpr (SELECT-heavy / DDL-heavy / expr-heavy inputs); record ns/op +
   allocs/op as the flip-comparison baseline (04-testing §3).
-- [ ] **P0.8 Dispatch plumbing**: token splitter (top-level ';' over opaque
+- [x] **P0.8 Dispatch plumbing**: token splitter (top-level ';' over opaque
   dollar-quote-safe tokens, base offsets preserved), route() table scaffold
   incl. ident-led case-insensitive matching, '(' entry, WITH
   follower-keyword scanner (03 §2); hook wired at the named production site

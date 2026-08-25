@@ -135,6 +135,14 @@ func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
 // some Value strings by reference (arena release would dangle them). mc is now
 // a no-op retained for source compatibility; tokens always come from the
 // heap-backed tokenSlicePool. See docs/design/0107-0003d-token-pool-gc-safety.md.
+// RouteBatch is the parser-rewrite dispatch hook (docs/design/not_ralph/
+// 03-strangler-migration.md §2): when non-nil it receives the freshly lexed
+// token slice and either owns the whole batch (handled=true, stmts valid) or
+// declines (handled=false → the legacy recursive-descent path below runs).
+// Wired by production startup code to sqlparser.RouteBatch; nil in tests and
+// by default, which keeps behavior identical to pre-rewrite Parse.
+var RouteBatch func(toks []Token) (stmts []Stmt, handled bool, err error)
+
 func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 	var sctx *mmgr.Context
 	if len(mc) > 0 {
@@ -157,6 +165,31 @@ func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 			tokenSlicePool.Put(sp)
 		}
 		return nil, err
+	}
+
+	// Parser-rewrite routing hook (docs/design/not_ralph/03-strangler-
+	// migration.md §2). Nil by default = all-legacy, so this is inert until
+	// postmaster/server main wires sqlparser's implementation in. When the
+	// batch routes (every fragment's class ported + gated), the new LALR
+	// parser owns it wholesale; mixed batches stay legacy by design.
+	//
+	// POOL OWNERSHIP: `toks` borrows from tokenSlicePool. Only paths that
+	// RETURN from inside this hook may Put the slice — declining must fall
+	// through WITHOUT Put so the legacy body below keeps sole ownership and
+	// performs its own Put on each exit (a premature Put here handed the
+	// backing array to a concurrent lexInto mid-parse; pgbench smoke caught
+	// it as cross-client token corruption).
+	if RouteBatch != nil {
+		stmts, handled, rerr := RouteBatch(toks)
+		if handled || rerr != nil {
+			if sp != nil {
+				tokenSlicePool.Put(sp)
+			}
+			if rerr != nil {
+				return nil, rerr
+			}
+			return stmts, nil
+		}
 	}
 
 	// parser struct is 32 bytes; stack allocation is free. M0107-0003.
