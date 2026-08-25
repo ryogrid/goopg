@@ -159,6 +159,10 @@ func TestDifferentialSelectCore(t *testing.T) {
 		"SELECT * FROM ROWS FROM(generate_series(1, 2)) WITH ORDINALITY",
 		"SELECT * FROM LATERAL generate_series(1, 2) g",
 		"SELECT * FROM LATERAL (SELECT x FROM gen_tab) AS g",
+		"SELECT a, b FROM t GROUP BY a, b",
+		"SELECT a FROM t GROUP BY a HAVING a > 5",
+		"SELECT dept, sal FROM emp GROUP BY dept HAVING sal > 100 AND dept <> 0 ORDER BY dept LIMIT 4",
+		"SELECT DISTINCT ON (a, b) c FROM t ORDER BY a, b",
 	}
 	for _, sql := range cases {
 		legacy, yacc, err := diffParse(sql)
@@ -211,3 +215,5 @@ func TestKnownDiffSelectAll(t *testing.T) {
 		t.Fatal("legacy unexpectedly accepts SELECT ALL; update the known-diffs table")
 	}
 }
+
+

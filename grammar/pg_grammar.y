@@ -61,7 +61,7 @@
 %type <fexpr>	table_ref
 %type <rvar>	base_table_ref
 %type <jspec>	join_outer
-%type <node>	join_qual_opt opt_derived_alias opt_with_ordinality
+%type <node>	join_qual_opt opt_derived_alias group_clause opt_with_ordinality
 %type <node>	func_table_expr
 %type <rfes>	row_from_list
 %type <rfe>	row_from_entry_one
@@ -70,7 +70,9 @@
 %type <exprs>	opt_func_arg_list func_arg_list
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
-%type <expr>	a_expr c_expr where_clause
+%type <expr>	a_expr c_expr where_clause having_clause
+%type <exprs>	expr_list group_by_list
+%type <expr>	group_by_item
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
 %type <sortbys>	opt_sort_clause sort_by_list
 %type <sortby>	SortBy
@@ -142,7 +144,7 @@ paren_pos:
 /* with later P1 sub-phases (TODO P1.3); their absence here is what keeps */
 /* unrouted inputs failing cleanly toward the legacy parser. */
 simple_select:
-		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause opt_sort_clause opt_select_limit
+		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause group_clause having_clause opt_sort_clause opt_select_limit
 			{
 				s := parser.NewSelectStmt($2)
 				if di, ok := $3.(*distinctInfo); ok && di != nil {
@@ -161,8 +163,12 @@ simple_select:
 					}
 				}
 				s.Where = $6
-				s.OrderBy = $7
-				if sl, ok := $8.(*selectLimit); ok && sl != nil {
+				if gc, ok := $7.(*groupClause); ok && gc != nil {
+					s.GroupBy = gc.list
+				}
+				s.Having = $8
+				s.OrderBy = $9
+				if sl, ok := $10.(*selectLimit); ok && sl != nil {
 					s.Limit = sl.count
 					s.Offset = sl.offset
 					s.WithTies = sl.withTies
@@ -354,6 +360,14 @@ opt_all_distinct:
 	| DISTINCT
 			{
 				$$ = &distinctInfo{distinct: true}
+			}
+	| DISTINCT ON '(' expr_list ')'
+			{
+				// distinct_clause ON form, gram.y :13213. LEGACY QUIRK:
+				// parseSelect leaves Distinct=false when DistinctOn is set
+				// (dump-verified) even though the ast.go comment claims
+				// otherwise — mirror legacy until cutover.
+				$$ = &distinctInfo{on: $4}
 			}
 
 /* opt_target_list / target_list — gram.y :13505ish / :17246. */
@@ -776,6 +790,59 @@ opt_alias_ident:
 		/* empty */ { $$ = "" }
 	| AS ColId        { $$ = $2 }
 	| ColId           { $$ = $1 }
+
+/* group_clause / group_by_list / group_by_item — gram.y :13456-13484.
+   P1.3 subset: plain a_expr items. empty_grouping_set / CUBE / ROLLUP /
+   GROUPING SETS carry legacy expansion machinery and are tracked as TODO
+   P1.3a; set_quantifier (GROUP BY DISTINCT/ALL, PG18) is a documented
+   legacy divergence (legacy parser rejects it) — see difftest_known_diffs. */
+group_clause:
+		/* empty */
+			{
+				$$ = nil
+			}
+	| GROUP_P BY group_by_list
+			{
+				$$ = &groupClause{list: $3}
+			}
+
+group_by_list:
+		group_by_item
+			{
+				$$ = []parser.Expr{$1}
+			}
+	| group_by_list ',' group_by_item
+			{
+				$$ = append($1, $3)
+			}
+
+group_by_item:
+		a_expr
+			{
+				$$ = $1
+			}
+
+/* having_clause — gram.y :13522. */
+having_clause:
+		/* empty */
+			{
+				$$ = nil
+			}
+	| HAVING a_expr
+			{
+				$$ = $2
+			}
+
+/* expr_list — gram.y :13944ish; reused by DISTINCT ON and later waves. */
+expr_list:
+		a_expr
+			{
+				$$ = []parser.Expr{$1}
+			}
+	| expr_list ',' a_expr
+			{
+				$$ = append($1, $3)
+			}
 
 /* where_clause — gram.y :14074. */
 where_clause:

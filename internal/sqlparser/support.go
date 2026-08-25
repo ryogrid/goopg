@@ -263,3 +263,8 @@ func splitFuncName(q qname) *funcTable {
 	name := q.parts[len(q.parts)-1]
 	return &funcTable{schema: schema, name: name}
 }
+
+// groupClause carries the GROUP BY result into simple_select's action.
+type groupClause struct {
+	list []parser.Expr
+}

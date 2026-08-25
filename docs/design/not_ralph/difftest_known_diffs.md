@@ -11,3 +11,8 @@ behavior via goopg_ext.y rule + note.
 | `SELECT ALL a` | syntax error ("expected expression (got all)") | accepted (`opt_all_clause`) | accepted | same shape as above; pinned by TestKnownDiffSelectAll. |
 
 Add rows only with a test pinning BOTH sides.
+
+Shared gaps (both parsers reject an accepted-upstream construct) are NOT
+known-diffs rows — they belong to TODO sub-items (e.g. GROUP BY
+DISTINCT/ALL set_quantifier lives under P1.3a with the grouping-set
+constructs).

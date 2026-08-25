@@ -57,7 +57,8 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   wrapped as synthetic SELECT (legacy tryParseParenJoin :1454-1466).
 - [x] **P1.2b FROM func tables**: `func(args)` range items +
   `ROWS FROM(...)` WITH ORDINALITY (legacy TableFuncRef/parseRowsFrom).
-- [ ] **P1.3 grouping & distinct**: GROUP BY, HAVING, DISTINCT [ON].
+- [x] **P1.3 grouping & distinct**: GROUP BY, HAVING, DISTINCT ON (legacy
+  quirk mirrored: ON form leaves Distinct=false; dump-pinned).
 - [ ] **P1.4 window functions**: WINDOW clause, OVER (partition/order/
   frame specs). Flip SELECT core routing incl. '(' parenthesized queries.
 - [x] **P1.5 order/limit**: ORDER BY, LIMIT/OFFSET, FETCH FIRST, targeting
