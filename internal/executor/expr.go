@@ -29,6 +29,7 @@ import (
 
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
@@ -18053,6 +18054,13 @@ func evalPgSleep(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, err
 	}
 	if d < 0 {
 		d = 0
+	}
+	// Deliberate sleep: upstream reports Timeout:PgSleep for the duration
+	// (misc.c pg_sleep → WaitLatch). Covers both the ctx-aware select and
+	// the bare time.Sleep fallback.
+	if ctx.Activity != nil {
+		ctx.Activity.WaitEventStart(ctx.ProcNum, activity.WaitTypeTimeout, activity.WaitPgSleep)
+		defer ctx.Activity.WaitEventEnd(ctx.ProcNum)
 	}
 	if ctx.Ctx != nil {
 		select {
