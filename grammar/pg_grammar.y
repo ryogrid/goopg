@@ -1722,6 +1722,29 @@ name_or_call:
 				_ = ft
 				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
 			}
+	| qualified_name '(' '*' ')' filter_clause
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Filter = $5.(parser.Expr)
+				$$ = fc
+			}
+	| qualified_name '(' '*' ')' filter_clause OVER ColId
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Filter = $5.(parser.Expr)
+				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $7)
+				$$ = fc
+			}
+	| qualified_name '(' '*' ')' filter_clause OVER '(' opt_window_spec ')'
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Filter = $5.(parser.Expr)
+				fc.Over = $8
+				$$ = fc
+			}
 	| qualified_name '(' '*' ')' OVER ColId
 			{
 				ft := splitFuncName($1)
