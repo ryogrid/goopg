@@ -189,6 +189,17 @@ func TestDifferentialSelectCore(t *testing.T) {
 		"SELECT a NOT BETWEEN 1 AND 5 FROM t",
 		"SELECT a BETWEEN SYMMETRIC 5 AND 1 FROM t",
 		"SELECT a NOT BETWEEN SYMMETRIC 1 AND 5 FROM t",
+		"SELECT a FROM t WHERE b IN (1, 2, 3)",
+		"SELECT a FROM t WHERE b NOT IN (1, 2)",
+		"SELECT a FROM t WHERE b = ANY(1)",
+		"SELECT name FROM t WHERE name LIKE 'A%'",
+		"SELECT name FROM t WHERE name LIKE 'A%' ESCAPE '!'",
+		"SELECT name FROM t WHERE name NOT LIKE 'B_'",
+		"SELECT name FROM t WHERE name ILIKE 'a%'",
+		"SELECT name FROM t WHERE name NOT ILIKE 'b_' ESCAPE '#'",
+		"SELECT name FROM t WHERE name SIMILAR TO 'A[0-9]+'",
+		"SELECT name FROM t WHERE name NOT SIMILAR TO 'B_'",
+		"SELECT a || b FROM t",
 	}
 	for _, sql := range cases {
 		legacy, yacc, err := diffParse(sql)

@@ -1,8 +1,10 @@
 package sqlparser
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/goopg/goopg/internal/utils/adt/similarto"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -378,4 +380,53 @@ func buildBetween(left parser.Expr, low, high parser.Expr, negated, symmetric bo
 		return parser.NewUnaryOp(pos, parser.OpNot, tree)
 	}
 	return tree
+}
+
+// similarToLiteralValue mirrors select.go:4000.
+func similarToLiteralValue(e parser.Expr) (value string, isNull bool, ok bool) {
+	switch x := e.(type) {
+	case *parser.StringConst:
+		return x.Value, false, true
+	case *parser.NullConst:
+		return "", true, true
+	}
+	return "", false, false
+}
+
+// buildSimilarTo ports select.go:4031 constant folding for SIMILAR TO.
+func buildSimilarTo(l yyLexer, left, pattern, escape parser.Expr, pos int, negate bool) parser.Expr {
+	patVal, patNull, patOK := similarToLiteralValue(pattern)
+	escVal, escNull, escOK := similarto.DefaultEscape, false, true
+	if escape != nil {
+		escVal, escNull, escOK = similarToLiteralValue(escape)
+	}
+	if !patOK || !escOK {
+		return parser.NewSimilarToPattern(pos, left, pattern, escape, negate)
+	}
+	if patNull || escNull {
+		return parser.NewNullConst(pos)
+	}
+	if err := similarto.ValidateEscape(escVal); err != nil {
+		if ls, ok2 := l.(*lexerState); ok2 && ls.err == nil {
+			ls.err = &parser.SyntaxError{Raw: true, Code: "22025", Message: "invalid escape string", Hint: "Escape string must be empty or one character."}
+		}
+		return parser.NewNullConst(pos)
+	}
+	converted := similarto.Convert(patVal, escVal)
+	op := parser.OpRegexMatch
+	if negate {
+		op = parser.OpRegexNoMatch
+	}
+	return parser.NewBinaryOp(pos, op, left, parser.NewTypedStringLit(pos, "text", converted))
+}
+
+// binOp maps an operator spelling to its OpCode; unknown spellings raise a hard error.
+func binOp(l yyLexer, s string) parser.OpCode {
+	if op := parser.ParseBinaryOp(s); op != parser.OpUnknown {
+		return op
+	}
+	if ls, ok := l.(*lexerState); ok && ls.err == nil {
+		ls.err = &parser.SyntaxError{Message: fmt.Sprintf("unsupported operator %q", s), Raw: true, Pos: ls.lastConsumedPos()}
+	}
+	return parser.OpUnknown
 }

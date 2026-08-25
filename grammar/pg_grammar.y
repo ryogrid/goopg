@@ -81,6 +81,7 @@
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause having_clause b_expr
+%type <str>	subq_op
 %type <exprs>	expr_list group_by_list
 %type <expr>	group_by_item
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
@@ -1165,6 +1166,139 @@ a_expr:
 			{
 				$$ = parser.NewIsNullExpr($1.Pos(), $1, true)
 			}
+	/* Generic operator terminal — gram.y `a_expr Op a_expr` (%left Op).
+	   Covers || << >> ~* !~ <@ @> && -> ->> #> #>> and any future
+	   multi-character spelling routed here by the adapter. */
+	| a_expr Op a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
+			}
+	/* op ANY/SOME/ALL — gram.y :15150ff quantified comparisons via
+	   subquery_Op subset. */
+	| a_expr subq_op ANY '(' expr_list ')'
+			{
+				op := binOp(yylex, $2)
+				anyOp := op
+				if anyOp == parser.OpEq {
+					anyOp = 0 // OpUnknown: =ANY is same as IN
+				}
+				_ = op
+				$$ = parser.NewInExpr($1.Pos(), $1, false, anyOp, false, nil, $5)
+			}
+	| a_expr subq_op SOME '(' expr_list ')'
+			{
+				op := binOp(yylex, $2)
+				anyOp := op
+				if anyOp == parser.OpEq {
+					anyOp = 0 // OpUnknown: =ANY is same as IN
+				}
+				_ = op
+				$$ = parser.NewInExpr($1.Pos(), $1, false, anyOp, false, nil, $5)
+			}
+	| a_expr subq_op ALL '(' expr_list ')'
+			{
+				anyOp := binOp(yylex, $2)
+				allFlag := true
+				_ = allFlag
+				$$ = parser.NewInExpr($1.Pos(), $1, false, anyOp, true, nil, $5)
+			}
+	| a_expr subq_op ANY '(' SelectStmt ')'
+			{
+				sub, _ := $5.(*parser.SelectStmt)
+				if sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), false, sub, nil)
+			}
+	| a_expr subq_op ALL '(' SelectStmt ')'
+			{
+				sub, _ := $5.(*parser.SelectStmt)
+				if sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, sub, nil)
+			}
+
+	/* [NOT] SIMILAR TO [+ ESCAPE] — gram.y :15080-15115; constant folding
+	   via buildSimilarTo (legacy buildSimilarTo parity). */
+	| a_expr SIMILAR TO a_expr %prec SIMILAR
+			{
+				$$ = buildSimilarTo(yylex, $1, $4, nil, $1.Pos(), false)
+			}
+	| a_expr SIMILAR TO a_expr ESCAPE a_expr %prec SIMILAR
+			{
+				$$ = buildSimilarTo(yylex, $1, $4, $6, $1.Pos(), false)
+			}
+	| a_expr NOT_LA SIMILAR TO a_expr %prec NOT_LA
+			{
+				$$ = buildSimilarTo(yylex, $1, $5, nil, $1.Pos(), true)
+			}
+	| a_expr NOT_LA SIMILAR TO a_expr ESCAPE a_expr %prec NOT_LA
+			{
+				$$ = buildSimilarTo(yylex, $1, $5, $7, $1.Pos(), true)
+			}
+
+	/* [NOT] LIKE / ILIKE [+ ESCAPE] — gram.y :15080ff. ESCAPE wraps the
+	   pattern in LikeEscapePattern (legacy parity). */
+	| a_expr LIKE a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLike, $1, $3)
+			}
+	| a_expr NOT_LA LIKE a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNotLike, $1, $4)
+			}
+	| a_expr ILIKE a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpILike, $1, $3)
+			}
+	| a_expr NOT_LA ILIKE a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNotILike, $1, $4)
+			}
+	| a_expr LIKE a_expr ESCAPE a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLike, $1, parser.NewLikeEscapePattern($3.Pos(), $3, $5))
+			}
+	| a_expr NOT_LA LIKE a_expr ESCAPE a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNotLike, $1, parser.NewLikeEscapePattern($4.Pos(), $4, $6))
+			}
+	| a_expr ILIKE a_expr ESCAPE a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpILike, $1, parser.NewLikeEscapePattern($3.Pos(), $3, $5))
+			}
+	| a_expr NOT_LA ILIKE a_expr ESCAPE a_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNotILike, $1, parser.NewLikeEscapePattern($4.Pos(), $4, $6))
+			}
+
+	/* [NOT] IN — gram.y :15130ff in_expr (list and subquery forms). */
+	| a_expr IN_P '(' expr_list ')'
+			{
+				$$ = parser.NewInExpr($1.Pos(), $1, false, 0, false, nil, $4)
+			}
+	| a_expr NOT_LA IN_P '(' expr_list ')'
+			{
+				$$ = parser.NewInExpr($1.Pos(), $1, true, 0, false, nil, $5)
+			}
+	| a_expr IN_P '(' SelectStmt ')'
+			{
+				sub, _ := $4.(*parser.SelectStmt)
+				if sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				$$ = parser.NewInExpr($1.Pos(), $1, false, 0, false, sub, nil)
+			}
+	| a_expr NOT_LA IN_P '(' SelectStmt ')'
+			{
+				sub, _ := $5.(*parser.SelectStmt)
+				if sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				$$ = parser.NewInExpr($1.Pos(), $1, true, 0, false, sub, nil)
+			}
+
 	/* [NOT] BETWEEN [SYMMETRIC] — gram.y :15190ff with b_expr operands;
 	   desugars via buildBetween (legacy parseBetweenTail parity). */
 	| a_expr BETWEEN b_expr AND b_expr %prec BETWEEN
@@ -1276,6 +1410,28 @@ b_expr:
 			{
 				$$ = $2
 			}
+
+/* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
+   before ANY/SOME/ALL. Char literals + named terminals. */
+subq_op:
+		Op        { $$ = $1 }
+	| '='           { $$ = "=" }
+	| '<'           { $$ = "<" }
+	| '>'           { $$ = ">" }
+	| LESS_EQUALS    { $$ = "<=" }
+	| GREATER_EQUALS { $$ = ">=" }
+	| NOT_EQUALS     { $$ = "<>" }
+
+/* Identifier context aliases/* Identifier context aliases/* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
+   before ANY/SOME/ALL. Char literals + named terminals. */
+subq_op:
+		Op        { $$ = $1 }
+	| '='           { $$ = "=" }
+	| '<'           { $$ = "<" }
+	| '>'           { $$ = ">" }
+	| LESS_EQUALS    { $$ = "<=" }
+	| GREATER_EQUALS { $$ = ">=" }
+	| NOT_EQUALS     { $$ = "<>" }
 
 /* Identifier context aliases/* Identifier context aliases — gram.y :17632-17720. Generated lists come */
 /* from kwlists_gen.y. */

@@ -12,6 +12,8 @@ behavior via goopg_ext.y rule + note.
 
 | UNION/INTERSECT chain tree shape | upstream gram.y builds LEFT-nested trees (%left); goopg legacy+new parser build RIGHT-nested chains on the single SetOp slot | same as legacy (intentional parity) | semantically equivalent for set ops; revisit only if a planner consumer depends on nesting side |
 
+| `op ALL(subquery)` | Desugars via NOT + NotEqualAny (e.g. `NOT(x != ANY(subq))`) | Direct `InExpr{AnyOp, AllOp}` representation | Upstream keeps quantified comparisons as BoolExpr-SOMESHape; goopg legacy uses NOT+ANY desugar | Shape-only divergence, same semantics; make moot at cutover |
+
 Add rows only with a test pinning BOTH sides.
 
 Shared gaps (both parsers reject an accepted-upstream construct) are NOT

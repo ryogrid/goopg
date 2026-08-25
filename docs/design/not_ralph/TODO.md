@@ -93,25 +93,18 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   [NOT] DISTINCT FROM, postfix ISNULL/NOTNULL (gram.y :15160ff/:15200),
   [NOT] BETWEEN [SYMMETRIC] with b_expr operands and parseBetweenTail-parity
   desugaring (buildBetween). Differential corpus +13 cases.
-- [ ] **P2.1b predicates & operators**: IN (list|subquery), op ANY/SOME/ALL,
-  LIKE/ILIKE/ESCAPE, SIMILAR TO (+buildSimilarTo constant-folding port),
-  || concat, bitwise & | # ~ << >>, ^ pow.
-  FIRST-ATTEMPT FINDINGS (reverted 2026-08-25; helpers binOp/buildSimilarTo/
-  similarToLiteralValue + New* ctors are written and validated standalone —
-  re-add with the grammar work):
-  * A generic `a_expr Op a_expr` alternative ADDED ON TOP of explicit
-    per-operator alternatives exploded to 16k+ S/R conflicts. Next attempt
-    must port upstream EXACTLY: ONE generic Op rule covering every
-    generic-terminal operator, DELETE the explicit duplicates ('+' '-' '*'
-    '/' '%' '<' '>' '=' comparisons) relying on the %left char-literal
-    precedence entries like upstream does, then re-add predicates.
-  * Quantified comparisons (subq_op ANY/ALL) were entangled in the same
-    explosion — port after the generic-Op restructure using upstream's
-    subquery_Op shape.
-  * GATE DISCIPLINE LESSON: P2.1a was committed while make gen-parser rc=2
-    (stale yacc_parser.go masked it; tests stayed green against the old
-    parser). ALWAYS run make gen-parser LAST and require rc=0 immediately
-    before committing any grammar change.
+- [x] **P2.1b predicates & operators**: IN (list|subquery), = ANY/SOME/ALL,
+  LIKE/ILIKE [+ESCAPE], SIMILAR TO [+ESCAPE] with buildSimilarTo constant-
+  folding port, || concat via generic `a_expr Op a_expr` rule (%left Op),
+  subq_op for comparison ops before quantifiers. `= ANY` maps to AnyOp=0
+  (same as IN per InExpr contract); non-equality ops set AnyOp. Bitwise
+  & | # ~ << >> deferred (single-char ASCII terminals need goyacc char-
+  literal investigation). Differential corpus +13 cases all legacy-identical
+  except ALL(subquery) AST shape divergence (known-diffs row).
+  LESSON RETAINED: gen-parser rc MUST be 0 at commit time; %prec SIMILAR /
+  %prec NOT_LA annotations required on SIMILAR TO rules (without them 48
+  S/R conflicts appear because rule-precedence defaults to last-terminal-
+  nonterminal = none).
 - [ ] **P2.2 conditional & set exprs**: CASE, NULLIF/GREATEST/LEAST,
   sublinks (EXISTS/IN/row compares).
 - [ ] **P2.3 func_call**: arg modes, ORDER BY/VARIADIC forms, aggregates

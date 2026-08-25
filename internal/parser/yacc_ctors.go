@@ -119,3 +119,19 @@ func NewIsBoolExpr(pos int, operand Expr, testTrue, testFalse, negated bool) *Is
 func NewIsDistinctFromExpr(pos int, left, right Expr, negated bool) *IsDistinctFromExpr {
 	return &IsDistinctFromExpr{pos: pos, Left: left, Right: right, Negated: negated}
 }
+
+func NewInExpr(pos int, operand Expr, negated bool, anyOp OpCode, allOp bool, sub *SelectStmt, list []Expr) *InExpr {
+	return &InExpr{pos: pos, Operand: operand, Negated: negated, AnyOp: anyOp, AllOp: allOp, Subquery: sub, List: list}
+}
+
+func NewLikeEscapePattern(pos int, pattern, escape Expr) *LikeEscapePattern {
+	return &LikeEscapePattern{pos: pos, Pattern: pattern, Escape: escape}
+}
+
+func NewTypedStringLit(pos int, typ, value string) *TypedStringLit {
+	return &TypedStringLit{pos: pos, Type: typ, Value: value}
+}
+
+func NewSimilarToPattern(pos int, left, pattern, escape Expr, negate bool) *SimilarToPattern {
+	return &SimilarToPattern{pos: pos, Left: left, Pattern: pattern, Escape: escape, Negate: negate}
+}
