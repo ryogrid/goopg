@@ -121,6 +121,16 @@ func (l *lexerState) Lex(lval *yySymType) int {
 	return res.term
 }
 
+// knownTypeNames maps bare identifiers that act as typed-literal prefixes
+// (gram.y Typename 'string') to their canonical type name. When followed by
+// SCONST, the identifier is consumed as part of the literal.
+var knownTypeNames = map[string]string{
+	"date":      "date",
+	"time":      "time",
+	"timestamp": "timestamp",
+	"interval":  "interval",
+}
+
 // next returns the next terminal after base_yylex substitution.
 func (l *lexerState) next() lexResult {
 	if l.pushed {
@@ -128,6 +138,20 @@ func (l *lexerState) next() lexResult {
 		return l.pushedR
 	}
 	cur := l.raw()
+
+	// Typed-literal normalization: IDENT(type-name) + SCONST → SCONST only.
+	// The type context is inferred by the analyzer from surrounding usage,
+	// matching how legacy handles these constructs.
+	if cur.term == resolve("IDENT") {
+		lower := strings.ToLower(cur.str)
+		if _, isType := knownTypeNames[lower]; isType {
+			if nxt := l.peek(); nxt.term == resolve("SCONST") {
+				l.i++ // consume the SCONST too
+				return lexResult{term: resolve("SCONST"), str: nxt.str, pos: cur.pos, text: cur.text + " " + nxt.text}
+			}
+		}
+	}
+
 	if rule, ok := substFor(cur.term); ok {
 		if rule.followers[l.peek().term] {
 			cur.term = rule.subst

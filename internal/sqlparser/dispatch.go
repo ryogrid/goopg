@@ -54,7 +54,7 @@ func SplitStatements(toks []parser.Token) [][]parser.Token {
 //
 // EMPTY: P2-F flip attempted 2026-08-25 but reverted — TPC-H Q12 fails
 // (grammar gap). Re-enable after fixing; see TODO P2-F for details.
-var routedStmts = map[string]bool{"select": true}
+var routedStmts = map[string]bool{}
 
 // routeBatch reports whether the whole batch can go to the new parser, plus
 // the parsed statements when it can.
