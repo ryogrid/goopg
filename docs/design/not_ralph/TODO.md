@@ -65,7 +65,14 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   numbering in multi-keyword rules is error-prone ($N counts ALL terminals
   including keywords like PARTITION/BY/ORDER). Recommend: separate
   over_clause nonterminal returning *WindowDef, referenced from
-  name_or_call. Frame clause (ROWS BETWEEN etc) deferred.: WINDOW clause, OVER (partition/order/
+  name_or_call. Frame clause (ROWS BETWEEN etc) deferred.
+  FIRST-ATTEMPT FINDINGS: adding OVER alts directly to name_or_call caused
+  4 S/R + 2930 R/R conflicts. Root cause: postfix-notation ambiguity between
+  "reduce name_or_call" and "shift OVER" after qualified_name '(' args ')'.
+  Upstream avoids this because their func_application/c_expr structure has
+  different LALR state topology. NEXT APPROACH: either (a) add OVER to the
+  precedence block at IDENT level, or (b) restructure c_expr to separate
+  func_application from column_ref paths like upstream.: WINDOW clause, OVER (partition/order/
   frame specs). Flip SELECT core routing incl. '(' parenthesized queries.
 - [x] **P1.5 order/limit**: ORDER BY, LIMIT/OFFSET, FETCH FIRST, targeting
   (`SELECT ... FOR UPDATE` lock clauses).
