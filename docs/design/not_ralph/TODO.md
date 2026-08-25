@@ -83,8 +83,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   structural cleanup.
 - [ ] **P2-F SELECT-family FLIP — ATTEMPTED, REVERTED**: enabling
   `routedStmts["select"]` passed units (44 pkgs) but TPC-H Q12 FAILed.
-  Root cause: grammar gap in Q12's construct (needs investigation — likely
-  a type name, interval, or operator form not yet ported). WITH follower
+  ROOT CAUSE FOUND: Q12 uses `date '1994-01-01'` TYPED LITERAL syntax
+  (gram.y Typename SCONST). New parser lacks this rule; sees DATE_P as
+  ColId then fails on unexpected SCONST. Fix: add typed-literal rules
+  (DATE_P/TIME_P/TIMESTAMP/INTERVAL + SCONST → TypedStringLit) to c_expr. WITH follower
   scan IS implemented and working (withFollowerRouted). Investigation update: Q12 parses correctly via ParseOne AND passes
   differential corpus (date literals work). Issue is in the ROUTING
   PIPELINE integration (parser.Parse→hook→routeBatch path), NOT grammar.
