@@ -151,7 +151,16 @@ func NewInListExpr(pos int, operand Expr, negated bool, list []Expr) *InExpr {
 }
 
 func NewFuncCall(pos int, name ObjectName, args []Expr, star bool) *FuncCall {
-	return &FuncCall{pos: pos, Name: name, Args: args, Star: star}
+	fc := &FuncCall{pos: pos, Name: name, Args: args, Star: star}
+	// Legacy parity (parser/select.go:4875): one Variadic flag PER ARG;
+	// the star path never appends (Variadic stays nil). The dump/diff
+	// surface distinguishes []bool{false} from nil.
+	if !star {
+		for range args {
+			fc.Variadic = append(fc.Variadic, false)
+		}
+	}
+	return fc
 }
 
 func SetDistinct(fc *FuncCall) *FuncCall { fc.Distinct = true; return fc }
@@ -185,4 +194,26 @@ func NewExtractExpr(pos int, field string, source Expr) *ExtractExpr {
 // parsed via ParseIntervalBody (embedded-string `interval '<body>'` form).
 func NewIntervalLitPre(pos int, months, days int32, micros int64) *IntervalLit {
 	return &IntervalLit{pos: pos, PreComputed: true, PreMonths: months, PreDays: days, PreMicros: micros}
+}
+
+// NewArrayConstructorExpr builds ARRAY[e1, ..., en] (legacy parity).
+func NewArrayConstructorExpr(pos int, elements []Expr) *ArrayConstructorExpr {
+	return &ArrayConstructorExpr{pos: pos, Elements: elements}
+}
+
+// NewArraySubqueryExpr builds ARRAY(SELECT ...) (legacy parity).
+func NewArraySubqueryExpr(pos int, inner *SelectStmt) *ArraySubqueryExpr {
+	return &ArraySubqueryExpr{pos: pos, Inner: inner}
+}
+
+// NewArraySubscriptExpr builds base[i] or base[l:u] / base[:u] / base[l:] /
+// base[:] slices (legacy parity).
+func NewArraySubscriptExpr(pos int, base Expr, isSlice bool, index, upper Expr) *ArraySubscriptExpr {
+	return &ArraySubscriptExpr{pos: pos, Base: base, IsSlice: isSlice, Index: index, Upper: upper}
+}
+
+// NewIntervalLitQualified builds the Form-1 `interval '<body>' <qualifier>`
+// literal: Unit carries the LOW field of an optional `<hi> TO <lo>` range.
+func NewIntervalLitQualified(pos int, body, unit string, hasPrec bool, prec int) *IntervalLit {
+	return &IntervalLit{pos: pos, Value: body, Unit: unit, Qualified: true, HasPrec: hasPrec, Prec: prec}
 }

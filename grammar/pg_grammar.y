@@ -94,6 +94,8 @@
 %type <str>		first_or_next
 %type <str>	ColId ColLabel BareColLabel first_or_next opt_alias_ident
 %type <wd>	opt_window_spec
+%type <fr>	opt_frame_tail
+%type <node>	part_frame_extent part_frame_bound part_frame_excl
 %type <nwd>	window_definition
 %type <nwds>	opt_window_clause window_definition_list
 %type <node>	row_or_rows_opt row_or_rows
@@ -1043,29 +1045,101 @@ window_definition:
 			}
 
 opt_window_spec:
-		/* empty */
+		opt_frame_tail
 			{
-				$$ = parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				if fr := $1; fr != nil {
+					wd.Frame = fr
+				}
+				$$ = wd
 			}
-	| PARTITION BY expr_list
+	| PARTITION BY expr_list opt_frame_tail
 			{
 				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
 				wd.PartitionBy = $3
+				if fr := $4; fr != nil {
+					wd.Frame = fr
+				}
 				$$ = wd
 			}
-	| ORDER BY sort_by_list
+	| ORDER BY sort_by_list opt_frame_tail
 			{
 				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
 				wd.OrderBy = $3
+				if fr := $4; fr != nil {
+					wd.Frame = fr
+				}
 				$$ = wd
 			}
-	| PARTITION BY expr_list ORDER BY sort_by_list
+	| PARTITION BY expr_list ORDER BY sort_by_list opt_frame_tail
 			{
 				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
 				wd.PartitionBy = $3
 				wd.OrderBy = $6
+				if fr := $7; fr != nil {
+					wd.Frame = fr
+				}
 				$$ = wd
 			}
+
+/* opt_frame_tail / frame extent+bound+exclusion — gram.y :13560ff subset.
+   Carriers live in support.go (partFrame*); only FrameModeRows reaches the
+   executor today — RANGE/GROUPS parse structurally and the analyzer rejects
+   them upstream-parity (0A000). */
+opt_frame_tail:
+		/* empty */
+			{
+				$$ = nil
+			}
+	| ROWS part_frame_extent part_frame_excl
+			{
+				$$ = finishFrame(parser.FrameModeRows, $2.(*partFrameExtent), $3.(*partFrameExcl))
+			}
+	| RANGE part_frame_extent part_frame_excl
+			{
+				$$ = finishFrame(parser.FrameModeRange, $2.(*partFrameExtent), $3.(*partFrameExcl))
+			}
+	| GROUPS part_frame_extent part_frame_excl
+			{
+				$$ = finishFrame(parser.FrameModeGroups, $2.(*partFrameExtent), $3.(*partFrameExcl))
+			}
+
+part_frame_extent:
+		part_frame_bound
+			{
+				fp := $1.(*partFrameBound)
+				$$ = &partFrameExtent{start: fp.k, startOff: fp.off, end: parser.FrameBoundCurrentRow, hasBetween: false}
+			}
+	| BETWEEN part_frame_bound AND part_frame_bound
+			{
+				s := $2.(*partFrameBound)
+				e := $4.(*partFrameBound)
+				$$ = &partFrameExtent{start: s.k, startOff: s.off, end: e.k, endOff: e.off, hasBetween: true}
+			}
+
+part_frame_bound:
+		UNBOUNDED PRECEDING
+			{ $$ = &partFrameBound{k: parser.FrameBoundUnboundedPreceding} }
+	| UNBOUNDED FOLLOWING
+			{ $$ = &partFrameBound{k: parser.FrameBoundUnboundedFollowing} }
+	| CURRENT_P ROW
+			{ $$ = &partFrameBound{k: parser.FrameBoundCurrentRow} }
+	| a_expr PRECEDING
+			{ $$ = &partFrameBound{k: parser.FrameBoundOffsetPreceding, off: $1} }
+	| a_expr FOLLOWING
+			{ $$ = &partFrameBound{k: parser.FrameBoundOffsetFollowing, off: $1} }
+
+part_frame_excl:
+		/* empty */
+			{ $$ = &partFrameExcl{} }
+	| EXCLUDE CURRENT_P ROW
+			{ $$ = &partFrameExcl{x: parser.FrameExcludeCurrentRow} }
+	| EXCLUDE GROUP_P
+			{ $$ = &partFrameExcl{x: parser.FrameExcludeGroup} }
+	| EXCLUDE TIES
+			{ $$ = &partFrameExcl{x: parser.FrameExcludeTies} }
+	| EXCLUDE NO OTHERS
+			{ $$ = &partFrameExcl{} }
 
 /* CASE WHEN ... THEN ... [ELSE ...] END — gram.y :15464 case_expr subset.
    The simple form (CASE operand WHEN val THEN ...) is deferred until
@@ -1335,6 +1409,29 @@ a_expr:
 				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, []int64{int64($5), int64($7)})
 			}
 
+	/* Subscripts — gram.y :15040ff opt_slice_bound forms: base[i],
+	   base[l:u], base[:u], base[l:], base[:] (M0097 array slice parity). */
+	| a_expr '[' a_expr ']'
+			{
+				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, false, $3, nil)
+			}
+	| a_expr '[' a_expr ':' a_expr ']'
+			{
+				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, true, $3, $5)
+			}
+	| a_expr '[' ':' a_expr ']'
+			{
+				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, true, nil, $4)
+			}
+	| a_expr '[' a_expr ':' ']'
+			{
+				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, true, $3, nil)
+			}
+	| a_expr '[' ':' ']'
+			{
+				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, true, nil, nil)
+			}
+
 	/* [NOT] SIMILAR TO [+ ESCAPE] — gram.y :15080-15115; constant folding
 	   via buildSimilarTo (legacy buildSimilarTo parity). */
 	| a_expr SIMILAR TO a_expr %prec SIMILAR
@@ -1474,6 +1571,51 @@ c_expr:
 				typ, val := typedLitParts($1)
 				$$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), typ, val)
 			}
+	| ARRAY '[' opt_func_call_args ']'
+			{
+				args := $3
+				if args == nil {
+					args = []parser.Expr{}
+				}
+				$$ = parser.NewArrayConstructorExpr(yylex.(*lexerState).lastConsumedPos(), args)
+			}
+	| ARRAY '(' SelectStmt ')'
+			{
+				sub, _ := $3.(*parser.SelectStmt)
+				if sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				sub.Parenthesized = true
+				$$ = parser.NewArraySubqueryExpr(yylex.(*lexerState).lastConsumedPos(), sub)
+			}
+	| INTERVAL SCONST YEAR_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "year", "", -1) }
+	| INTERVAL SCONST MONTH_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "month", "", -1) }
+	| INTERVAL SCONST DAY_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "day", "", -1) }
+	| INTERVAL SCONST HOUR_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "hour", "", -1) }
+	| INTERVAL SCONST MINUTE_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "minute", "", -1) }
+	| INTERVAL SCONST SECOND_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "second", "", -1) }
+	| INTERVAL SCONST YEAR_P TO MONTH_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "year", "month", -1) }
+	| INTERVAL SCONST DAY_P TO HOUR_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "day", "hour", -1) }
+	| INTERVAL SCONST DAY_P TO MINUTE_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "day", "minute", -1) }
+	| INTERVAL SCONST DAY_P TO SECOND_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "day", "second", -1) }
+	| INTERVAL SCONST HOUR_P TO MINUTE_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "hour", "minute", -1) }
+	| INTERVAL SCONST HOUR_P TO SECOND_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "hour", "second", -1) }
+	| INTERVAL SCONST MINUTE_P TO SECOND_P
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "minute", "second", -1) }
+	| INTERVAL SCONST SECOND_P '(' ICONST ')'
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "second", "", $5) }
 	| EXTRACT '(' extract_field FROM a_expr ')'
 			{
 				$$ = parser.NewExtractExpr(yylex.(*lexerState).lastConsumedPos(), $3, $5)
@@ -1587,6 +1729,21 @@ name_or_call:
 				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
 				$$ = fc
 			}
+	| qualified_name '(' '*' ')' OVER '(' opt_window_spec ')'
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Over = $7
+				$$ = fc
+			}
+	| qualified_name '(' DISTINCT expr_list ')' OVER '(' opt_window_spec ')'
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				fc.Over = $8
+				$$ = fc
+			}
 	| qualified_name '(' DISTINCT expr_list ')'
 			{
 				ft := splitFuncName($1)
@@ -1610,34 +1767,47 @@ name_or_call:
 				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER '(' ')'
+	| qualified_name '(' opt_func_call_args ')' OVER '(' opt_frame_tail ')'
 			{
 				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
-				fc.Over = parser.NewWindowDef(0)
+				wd := parser.NewWindowDef(0)
+				if fr := $7; fr != nil {
+					wd.Frame = fr
+				}
+				fc.Over = wd
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER '(' PARTITION BY expr_list ')'
+	| qualified_name '(' opt_func_call_args ')' OVER '(' PARTITION BY expr_list opt_frame_tail ')'
 			{
 				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
 				wd := parser.NewWindowDef(0)
 				wd.PartitionBy = $9
+				if fr := $10; fr != nil {
+					wd.Frame = fr
+				}
 				fc.Over = wd
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER '(' ORDER BY sort_by_list ')'
+	| qualified_name '(' opt_func_call_args ')' OVER '(' ORDER BY sort_by_list opt_frame_tail ')'
 			{
 				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
 				wd := parser.NewWindowDef(0)
 				wd.OrderBy = $9
+				if fr := $10; fr != nil {
+					wd.Frame = fr
+				}
 				fc.Over = wd
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER '(' PARTITION BY expr_list ORDER BY sort_by_list ')'
+	| qualified_name '(' opt_func_call_args ')' OVER '(' PARTITION BY expr_list ORDER BY sort_by_list opt_frame_tail ')'
 			{
 				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
 				wd := parser.NewWindowDef(0)
 				wd.PartitionBy = $9
 				wd.OrderBy = $12
+				if fr := $13; fr != nil {
+					wd.Frame = fr
+				}
 				fc.Over = wd
 				$$ = fc
 			}

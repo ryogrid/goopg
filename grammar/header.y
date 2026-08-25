@@ -49,6 +49,7 @@ import (
 	qn     qname            // dotted-name carrier (support.go)
 	node   any              // multi-value carriers like distinctInfo
 	wd     *parser.WindowDef
+	fr     *parser.WindowFrame
 	nwd    parser.NamedWindowDef
 	nwds   []parser.NamedWindowDef
 	list   []any            // heterogeneous lists, mirroring PG's untyped List

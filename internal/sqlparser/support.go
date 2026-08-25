@@ -447,6 +447,36 @@ type caseBody struct {
 
 func lowerIdent(s string) string { return strings.ToLower(s) }
 
+// intervalRangeOK mirrors legacy intervalRangeLowField: valid `<hi> TO <lo>`
+// pairs for the interval typmod qualifier. The stored Unit is the LOW field.
+var intervalRangeOK = map[[2]string]bool{
+	{"year", "month"}: true,
+	{"day", "hour"}: true, {"day", "minute"}: true, {"day", "second"}: true,
+	{"hour", "minute"}: true, {"hour", "second"}: true,
+	{"minute", "second"}: true,
+}
+
+// buildIntervalQualified builds the Form-1 `interval '<body>' <qualifier>`
+// IntervalLit (legacy tryIntervalTypmodQualifier parity): Value keeps the raw
+// body, Unit carries the low field of the range, precision clamps at 6.
+func buildIntervalQualified(pos int, body, hi, lo string, prec int) parser.Expr {
+	unit := hi
+	if lo != "" {
+		if !intervalRangeOK[[2]string{hi, lo}] {
+			unit = hi // invalid pair: caller grammar never produces one
+		} else {
+			unit = lo
+		}
+	}
+	hasPrec := prec >= 0
+	if !hasPrec {
+		prec = 0 // legacy parity: Prec stays 0 when HasPrec is false
+	} else if prec > 6 {
+		prec = 6 // MAX_INTERVAL_PRECISION clamp
+	}
+	return parser.NewIntervalLitQualified(pos, body, unit, hasPrec, prec)
+}
+
 // buildIntervalLit mirrors legacy tryTypedLiteral's embedded-string form
 // (`interval '<body>'`): parse the body into interval components at AST-build
 // time so the executor sees an IntervalLit datum, not text.
@@ -464,4 +494,37 @@ func typedLitParts(s string) (typ, val string) {
 		return s[:i], s[i+1:]
 	}
 	return "", s
+}
+
+// partFrameBound / partFrameExtent / partFrameExcl are grammar carriers for
+// window frame clauses (support-carrier pattern: joinSpec, distinctInfo).
+type partFrameBound struct {
+	k   parser.FrameBoundKind
+	off parser.Expr
+}
+
+type partFrameExtent struct {
+	start      parser.FrameBoundKind
+	startOff   parser.Expr
+	end        parser.FrameBoundKind
+	endOff     parser.Expr
+	hasBetween bool
+}
+
+type partFrameExcl struct {
+	x parser.FrameExclusion
+}
+
+// finishFrame assembles the WindowFrame from the parsed parts. A single-bound
+// extent (no BETWEEN) defaults EndKind to CURRENT ROW, matching gram.y.
+func finishFrame(mode parser.FrameMode, ext *partFrameExtent, ex *partFrameExcl) *parser.WindowFrame {
+	return &parser.WindowFrame{
+		Mode:       mode,
+		StartKind:  ext.start,
+		StartOffset: ext.startOff,
+		EndKind:    ext.end,
+		EndOffset:  ext.endOff,
+		Exclusion:  ex.x,
+		HasBetween: ext.hasBetween,
+	}
 }
