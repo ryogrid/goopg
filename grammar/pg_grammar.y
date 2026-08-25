@@ -1413,6 +1413,15 @@ c_expr:
 			{
 				$$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "interval", $2)
 			}
+	| '(' SelectStmt ')'
+			{
+				sub, _ := $2.(*parser.SelectStmt)
+				if sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				sub.Parenthesized = true
+				$$ = parser.NewScalarSublinkExpr(yylex.(*lexerState).lastConsumedPos(), sub)
+			}
 
 	| name_or_call
 			{
