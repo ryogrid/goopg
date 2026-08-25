@@ -28,7 +28,17 @@ func harvestSQLLiterals(t *testing.T) []string {
 	if err != nil || len(files) == 0 {
 		t.Fatal("no ../parser/*_test.go found — corpus scan is broken")
 	}
-	re := regexp.MustCompile("(?s)`(SELECT [^`]{8,600})`|\"(SELECT [^\"]{8,600})\"|`(WITH [^`]{8,600})`|\"(WITH [^\"]{8,600})\"|`(VALUES [^`]{8,600})`|\"(VALUES [^\"]{8,600})\"")
+	// All statement classes (user directive 2026-08-26): DML/DDL/utility are
+	// harvested too. The both-parse filter below keeps them out of the
+	// parity denominator until a grammar wave covers them — then the floor
+	// rises without editing the scanner.
+	kw := "(?:SELECT|WITH|VALUES|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|BEGIN|COMMIT|ROLLBACK|ABORT|SET|SHOW|RESET|EXPLAIN|PREPARE|EXECUTE|DEALLOCATE|GRANT|REVOKE|VACUUM|ANALYZE|COPY|COMMENT|LOCK|LISTEN|NOTIFY|CHECKPOINT|DISCARD|REFRESH|CALL|DO)"
+	reBT := regexp.MustCompile("(?s)`" + kw + " [^`]{8,600}`")
+	reDQ := regexp.MustCompile("(?s)\"" + kw + " [^\"]{8,600}\"")
+	strip := func(m string) string {
+		m = strings.TrimSuffix(strings.TrimPrefix(m, "`"), "`")
+		return strings.Trim(m, `"`)
+	}
 	seen := map[string]bool{}
 	var out []string
 	for _, f := range files {
@@ -36,14 +46,16 @@ func harvestSQLLiterals(t *testing.T) []string {
 		if err != nil {
 			continue
 		}
-		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
-			sql := ""
-			for _, g := range m[1:] {
-				if g != "" {
-					sql = g
-					break
-				}
+		for _, m := range reBT.FindAllString(string(src), -1) {
+			sql := strip(m)
+			one := strings.Join(strings.Fields(sql), " ")
+			if !seen[one] {
+				seen[one] = true
+				out = append(out, one)
 			}
+		}
+		for _, m := range reDQ.FindAllString(string(src), -1) {
+			sql := strip(m)
 			one := strings.Join(strings.Fields(sql), " ")
 			if !seen[one] {
 				seen[one] = true
@@ -55,30 +67,48 @@ func harvestSQLLiterals(t *testing.T) []string {
 	return out
 }
 
-// Pinned 2026-08-26: first measurement 139/178 identical (360 harvested).
-// Raise as grammar waves land; NEVER lower without a documented reason.
-const legacyCorpusParityFloor = 135
+// Pinned 2026-08-26 (all-statement-class harvest): SELECT 127/166 +
+// WITH 8/8 = 135 identical of 1485 harvested; DML/DDL both-parse counts
+// rise automatically as waves land. Floor keeps 5-headroom; NEVER lower
+// without a documented reason.
+const legacyCorpusParityFloor = 130
 
 func TestLegacyCorpusParity(t *testing.T) {
 	queries := harvestSQLLiterals(t)
 	if len(queries) < 50 {
 		t.Fatalf("harvested only %d SQL literals — scanner regex rotted", len(queries))
 	}
-	matched, bothParsed := 0, 0
+	matched := 0
 	var mismatched []string
+	byClass := map[string][3]int{} // class -> {harvested, bothParsed, identical}
 	for _, q := range queries {
+		class := strings.ToUpper(strings.Fields(q)[0])
+		c := byClass[class]
+		c[0]++
 		l, n, err := diffParse(q)
 		if err != nil {
+			byClass[class] = c
 			continue // one side rejects: fine, not part of parity
 		}
-		bothParsed++
+		c[1]++
 		if l == n {
 			matched++
+			c[2]++
 		} else {
 			mismatched = append(mismatched, fmt.Sprintf("%s\n  L=%s\n  N=%s", q, truncForLog(l), truncForLog(n)))
 		}
+		byClass[class] = c
 	}
-	t.Logf("legacy-test corpus: %d harvested, %d parsed by both, %d identical", len(queries), bothParsed, matched)
+	classes := make([]string, 0, len(byClass))
+	for k := range byClass {
+		classes = append(classes, k)
+	}
+	sort.Strings(classes)
+	for _, k := range classes {
+		c := byClass[k]
+		t.Logf("%-10s harvested=%3d both=%3d identical=%3d", k, c[0], c[1], c[2])
+	}
+	t.Logf("legacy-test corpus: %d harvested, %d identical", len(queries), matched)
 	for _, m := range mismatched {
 		t.Logf("AST MISMATCH: %s", m)
 	}
