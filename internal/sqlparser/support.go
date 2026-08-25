@@ -1,6 +1,8 @@
 package sqlparser
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -184,4 +186,80 @@ func lerr(yylex yyLexer, msg string, pos int) {
 	if l.err == nil {
 		l.err = &parser.SyntaxError{Message: msg, Raw: true, Pos: pos}
 	}
+}
+
+// knownSRF mirrors parseRangeVar's builtin list (select.go:1487-1497);
+// builtins get lowercased canonical names, everything else passes through
+// as written.
+var knownSRF = map[string]bool{
+	"generate_series": true, "pg_input_error_info": true, "parse_ident": true,
+	"pg_get_publication_tables": true, "pg_available_wal_summaries": true,
+	"verify_heapam": true, "unnest": true, "generate_subscripts": true,
+	"pg_options_to_table": true, "ts_token_type": true,
+}
+
+// funcTableName replicates legacy name normalization (:1499-1528): known
+// builtins are canonicalized lowercase; other functions keep their source
+// spelling; schema qualifiers are dropped either way.
+func funcTableName(schema, name string) string {
+	if knownSRF[strings.ToLower(name)] {
+		return strings.ToLower(name)
+	}
+	_ = schema // qualifier discarded; dispatch is by bare name
+	return name
+}
+
+// rowsFromName renders RowsFromEntry.Name the way ObjectName.String() does
+// for parseRowsFrom (:5247 area): dotted when qualified.
+func rowsFromName(parts []string) string {
+	return strings.Join(parts, ".")
+}
+
+// syntheticParenSelect wraps a grouped FROM item into `SELECT * FROM ...`
+// exactly like tryParseParenJoin (:1199-1208). Note Parenthesized stays
+// FALSE there — the wrapper is structural, not user-parenthesized.
+func syntheticParenSelect(pos int, fe parser.FromExpr) *parser.SelectStmt {
+	s := parser.NewSelectStmt(pos)
+	s.Targets = []parser.ResTarget{parser.NewResTarget(pos, "", parser.NewStarExpr(pos, "", ""))}
+	s.From = flattenFrom(fe)
+	s.FromExprs = []parser.FromExpr{fe}
+	return s
+}
+
+// flattenFrom extracts Base plus every join right side.
+func flattenFrom(fe parser.FromExpr) []parser.RangeVar {
+	out := []parser.RangeVar{fe.Base}
+	for _, j := range fe.Joins {
+		out = append(out, j.Right)
+	}
+	return out
+}
+
+func newTableFuncRef(pos int, name string, args []parser.Expr, ord bool, rows []parser.RowsFromEntry) *parser.TableFuncRef {
+	return parser.NewTableFuncRef(pos, name, args, ord, rows)
+}
+
+// WITH ORDINALITY presence sentinels (opt_with_ordinality).
+const (
+	ordNo  = 0
+	ordYes = 1
+)
+
+// funcTable couples a TableFuncRef with its source schema qualifier so the
+// consumer can populate RangeVar{Schema, Name:""} like legacy does
+// (select.go:1474-1566 builds RangeVar from obj first).
+type funcTable struct {
+	ref    *parser.TableFuncRef
+	schema string
+	name   string
+}
+
+// splitFuncName extracts (schema, name) from a dotted qualified name.
+func splitFuncName(q qname) *funcTable {
+	schema := ""
+	if len(q.parts) >= 2 {
+		schema = q.parts[len(q.parts)-2]
+	}
+	name := q.parts[len(q.parts)-1]
+	return &funcTable{schema: schema, name: name}
 }

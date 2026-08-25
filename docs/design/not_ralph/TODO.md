@@ -53,9 +53,9 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   flat JoinExpr chain per legacy parseFromItem shape, ONLY limiter,
   subquery-in-FROM w/ AS/bare alias + column-alias list + synthetic
   __sq_ fallback, LATERAL flag, Parenthesized marking on derived selects.
-- [ ] **P1.2a FROM paren join groups**: `FROM (T1 JOIN T2 ON ...) AS x`
+- [x] **P1.2a FROM paren join groups**: `FROM (T1 JOIN T2 ON ...) AS x`
   wrapped as synthetic SELECT (legacy tryParseParenJoin :1454-1466).
-- [ ] **P1.2b FROM func tables**: `func(args)` range items +
+- [x] **P1.2b FROM func tables**: `func(args)` range items +
   `ROWS FROM(...)` WITH ORDINALITY (legacy TableFuncRef/parseRowsFrom).
 - [ ] **P1.3 grouping & distinct**: GROUP BY, HAVING, DISTINCT [ON].
 - [ ] **P1.4 window functions**: WINDOW clause, OVER (partition/order/

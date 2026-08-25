@@ -29,6 +29,10 @@ import (
 	fexpr   parser.FromExpr
 	fexprs  []parser.FromExpr
 	jspec   *joinSpec
+	exprs   []parser.Expr
+	tfr     *parser.TableFuncRef
+	rfes    []parser.RowsFromEntry
+	rfe     parser.RowsFromEntry
 	strs   []string         // identifier lists
 	qn     qname            // dotted-name carrier (support.go)
 	node   any              // multi-value carriers like distinctInfo

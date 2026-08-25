@@ -91,3 +91,7 @@ func NewSortBy(pos int, expr Expr, desc bool, usingOp string) SortBy {
 func NewJoinExpr(pos int, jt JoinType, natural bool, right RangeVar, on Expr, using []string) JoinExpr {
 	return JoinExpr{pos: pos, Type: jt, Natural: natural, Right: right, On: on, Using: using}
 }
+
+func NewTableFuncRef(pos int, name string, args []Expr, withOrdinality bool, rows []RowsFromEntry) *TableFuncRef {
+	return &TableFuncRef{pos: pos, Name: name, Args: args, WithOrdinality: withOrdinality, RowsFuncs: rows}
+}

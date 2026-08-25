@@ -151,6 +151,14 @@ func TestDifferentialSelectCore(t *testing.T) {
 		"SELECT * FROM (SELECT id FROM users) u (user_id)",
 		"SELECT * FROM LATERAL (SELECT x FROM gen_tab) AS g",
 		"SELECT o.orderkey FROM orders o JOIN lineitem l ON o.orderkey = l.l_orderkey WHERE o.totalprice > 1000 ORDER BY o.orderdate DESC LIMIT 5",
+		"SELECT * FROM (t1 JOIN t2 ON t1.a = t2.a) AS x",
+		"SELECT * FROM (t1 CROSS JOIN t2) AS xj (c1, c2)",
+		"SELECT * FROM generate_series(1, 3)",
+		"SELECT * FROM generate_series(1,3) WITH ORDINALITY AS g(n)",
+		"SELECT * FROM pg_catalog.pg_get_publication_tables(NULL) pub",
+		"SELECT * FROM ROWS FROM(generate_series(1, 2)) WITH ORDINALITY",
+		"SELECT * FROM LATERAL generate_series(1, 2) g",
+		"SELECT * FROM LATERAL (SELECT x FROM gen_tab) AS g",
 	}
 	for _, sql := range cases {
 		legacy, yacc, err := diffParse(sql)

@@ -53,7 +53,7 @@
 
 %type <stmts>	root stmt_list
 %type <stmt>	stmt SelectStmt simple_select
-%type <p>	select_pos
+%type <p>	select_pos paren_pos
 %type <node>	opt_all_distinct
 %type <targets>	opt_target_list target_list
 %type <rt>	target_el
@@ -61,8 +61,13 @@
 %type <fexpr>	table_ref
 %type <rvar>	base_table_ref
 %type <jspec>	join_outer
-%type <node>	opt_lateral join_qual_opt opt_derived_alias
+%type <node>	join_qual_opt opt_derived_alias opt_with_ordinality
+%type <node>	func_table_expr
+%type <rfes>	row_from_list
+%type <rfe>	row_from_entry_one
+
 %type <strs>	col_alias_list
+%type <exprs>	opt_func_arg_list func_arg_list
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause
@@ -120,6 +125,13 @@ SelectStmt:
 /* select_pos captures the SELECT token's byte position via the adapter's */
 /* prev-token tracking (goyacc has no @$; see 02 §5). */
 select_pos:
+		/* empty */
+			{
+				$$ = yylex.(*lexerState).lastConsumedPos()
+			}
+
+// paren_pos captures the '(' byte offset for FROM paren groups.
+paren_pos:
 		/* empty */
 			{
 				$$ = yylex.(*lexerState).lastConsumedPos()
@@ -578,7 +590,38 @@ base_table_ref:
 				rv.Only = true
 				$$ = rv
 			}
-	| opt_lateral '(' SelectStmt ')' opt_derived_alias
+	| '(' paren_pos table_ref ')' opt_derived_alias
+			{
+				fe := $3
+				lateral := false
+				alias := ""
+				var cols []string
+				if da, ok2 := $5.(*derivedAlias); ok2 && da != nil {
+					alias, cols = da.alias, da.cols
+					lateral = da.lateral
+				}
+				sub := syntheticParenSelect($2, fe)
+				$$ = derivedRangeVar(yylex.(*lexerState), $2, sub, alias, cols, lateral)
+			}
+	| '(' SelectStmt ')' opt_derived_alias
+			{
+				sub, ok := $2.(*parser.SelectStmt)
+				if !ok {
+					lerr(yylex, "subquery in FROM did not produce SELECT", yylex.(*lexerState).lastConsumedPos())
+					sub = parser.NewSelectStmt(0)
+				}
+				sub.Parenthesized = true
+				pos := sub.Pos()
+				lateral := false
+				alias := ""
+				var cols []string
+				if da, ok2 := $4.(*derivedAlias); ok2 && da != nil {
+					alias, cols = da.alias, da.cols
+					lateral = da.lateral
+				}
+				$$ = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
+			}
+	| LATERAL_P '(' SelectStmt ')' opt_derived_alias
 			{
 				sub, ok := $3.(*parser.SelectStmt)
 				if !ok {
@@ -590,20 +633,113 @@ base_table_ref:
 				// planner stops flattening at such branches.
 				sub.Parenthesized = true
 				pos := sub.Pos()
-				lateral := false
+				lateral := true
 				alias := ""
 				var cols []string
 				if da, ok2 := $5.(*derivedAlias); ok2 && da != nil {
 					alias, cols = da.alias, da.cols
-					lateral = da.lateral || $1 == latYes
+					lateral = lateral || da.lateral
 				}
 				$$ = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
 			}
 
-/* opt_lateral — LATERAL_P presence marker. */
-opt_lateral:
-		/* empty */ { $$ = latNo }
-	| LATERAL_P        { $$ = latYes }
+	| func_table_expr opt_derived_alias
+			{
+				lateral := false
+				alias := ""
+				var cols []string
+				if da, ok := $2.(*derivedAlias); ok && da != nil {
+					alias, cols = da.alias, da.cols
+					lateral = da.lateral
+				}
+				ft, _ := $1.(*funcTable)
+				if ft == nil {
+					ft = &funcTable{ref: parser.NewTableFuncRef(0, "__missing__", nil, false, nil)}
+				}
+				rv := parser.NewRangeVar(ft.ref.Pos(), ft.schema, "", alias)
+				rv.TableFunc = ft.ref
+				rv.Lateral = lateral
+				rv.Columns = cols
+				$$ = rv
+			}
+	| LATERAL_P func_table_expr opt_derived_alias
+			{
+				lateral := false
+				alias := ""
+				var cols []string
+				if da, ok := $3.(*derivedAlias); ok && da != nil {
+					alias, cols = da.alias, da.cols
+					lateral = da.lateral
+				}
+				ft, _ := $2.(*funcTable)
+				if ft == nil {
+					ft = &funcTable{ref: parser.NewTableFuncRef(0, "__missing__", nil, false, nil)}
+				}
+				rv := parser.NewRangeVar(ft.ref.Pos(), ft.schema, "", alias)
+				rv.TableFunc = ft.ref
+				rv.Lateral = lateral
+				rv.Columns = cols
+				$$ = rv
+			}
+
+/* func_table_expr — gram.y func_table :13930ish subset: name(args)
+   [WITH ORDINALITY] and ROWS FROM(name(args), ...) [WITH ORDINALITY].
+   Name normalization per legacy select.go:1499-1528. */
+func_table_expr:
+		qualified_name '(' opt_func_arg_list ')'
+			{
+				ft := splitFuncName($1)
+				ft.ref = newTableFuncRef($1.pos, funcTableName(ft.schema, ft.name), $3, false, nil)
+				$$ = ft
+			}
+	| qualified_name '(' opt_func_arg_list ')' WITH_LA ORDINALITY
+			{
+				ft := splitFuncName($1)
+				ft.ref = newTableFuncRef($1.pos, funcTableName(ft.schema, ft.name), $3, true, nil)
+				$$ = ft
+			}
+	| ROWS FROM '(' row_from_list ')' opt_with_ordinality
+			{
+				ord := $6 == ordYes
+				$$ = &funcTable{ref: newTableFuncRef(0, "", nil, ord, $4)}
+			}
+
+/* opt_ordinality — gram.y :14069: WITH_LA (base_yylex substitutes
+   WITH->WITH_LA before ORDINALITY), keeping this optional clause
+   conflict-free against WITH-led continuations. */
+opt_with_ordinality:
+		/* empty */ { $$ = ordNo }
+	| WITH_LA ORDINALITY { $$ = ordYes }
+
+row_from_list:
+		row_from_entry_one
+			{
+				$$ = []parser.RowsFromEntry{$1}
+			}
+	| row_from_list ',' row_from_entry_one
+			{
+				$$ = append($1, $3)
+			}
+
+row_from_entry_one:
+		qualified_name '(' opt_func_arg_list ')'
+			{
+				$$ = parser.RowsFromEntry{Name: rowsFromName($1.parts), Args: $3}
+			}
+
+opt_func_arg_list:
+		/* empty */ { $$ = nil }
+	| func_arg_list { $$ = $1 }
+
+func_arg_list:
+		a_expr
+			{
+				$$ = []parser.Expr{$1}
+			}
+	| func_arg_list ',' a_expr
+			{
+				$$ = append($1, $3)
+			}
 
 /* opt_derived_alias — AS alias / bare IDENT / +column list; missing alias
    triggers the synthetic __sq_<pos> fallback (legacy :1427-1432 mirrors
