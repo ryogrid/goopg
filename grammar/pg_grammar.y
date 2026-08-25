@@ -57,8 +57,13 @@
 %type <node>	opt_all_distinct
 %type <targets>	opt_target_list target_list
 %type <rt>	target_el
-%type <rvars>	from_list opt_from_clause
-%type <rvar>	table_ref relation_expr_opt_alias
+%type <fexprs>	from_list opt_from_clause
+%type <fexpr>	table_ref
+%type <rvar>	base_table_ref
+%type <jspec>	join_outer
+%type <node>	opt_lateral join_qual_opt opt_derived_alias
+%type <strs>	col_alias_list
+%type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
@@ -66,7 +71,7 @@
 %type <sortby>	SortBy
 %type <expr>	select_limit_value select_offset_value select_fetch_first_value
 %type <str>		first_or_next
-%type <str>	ColId ColLabel BareColLabel first_or_next
+%type <str>	ColId ColLabel BareColLabel first_or_next opt_alias_ident
 %type <node>	row_or_rows_opt row_or_rows
 
 %%
@@ -133,12 +138,15 @@ simple_select:
 					s.DistinctOn = di.on
 				}
 				s.Targets = $4
-				s.From = $5
-				// Legacy parity: parseFromList always fills FromExprs, even
-				// for a plain single relation with no JOIN chain — the
-				// planner reads join structure from here.
-				for _, rv := range $5 {
-					s.FromExprs = append(s.FromExprs, parser.NewFromExpr(rv.Pos(), rv, nil))
+				// Flatten each comma-item into legacy's dual representation:
+				// s.From carries Base plus every JoinExpr.Right; s.FromExprs
+				// preserves the JOIN chains (planner reads structure here).
+				for _, fe := range $5 {
+					s.FromExprs = append(s.FromExprs, fe)
+					s.From = append(s.From, fe.Base)
+					for _, jn := range fe.Joins {
+						s.From = append(s.From, jn.Right)
+					}
 				}
 				s.Where = $6
 				s.OrderBy = $7
@@ -401,23 +409,146 @@ opt_from_clause:
 from_list:
 		table_ref
 			{
-				$$ = []parser.RangeVar{$1}
+				$$ = []parser.FromExpr{$1}
 			}
 	| from_list ',' table_ref
 			{
 				$$ = append($1, $3)
 			}
 
-/* table_ref — gram.y :13600 area, P1.1 subset: plain relations with */
-/* optional alias. JOINs/subqueries/LATERAL arrive with TODO P1.2. */
+/* table_ref — gram.y :13600 area. Shape note: upstream nests joined tables
+   as a tree; goopg's AST flattens each comma-item into ONE FromExpr with an
+   ordered Joins chain (parseFromItem, select.go:1250-1269), so this port
+   reduces left-recursively and appends JoinExpr entries instead of building
+   nested nodes. JOIN's high precedence (block above) preserves upstream
+   associativity and delimits ON expressions. */
 table_ref:
-		relation_expr_opt_alias
+		base_table_ref
 			{
-				$$ = $1
+				$$ = parser.NewFromExpr($1.Pos(), $1, nil)
+			}
+	| table_ref join_outer base_table_ref join_qual_opt
+			{
+				spec := $2
+				q := joinQual{}
+				if jq, ok := $4.(*joinQual); ok && jq != nil {
+					q = *jq
+				}
+				j := buildJoin(yylex.(*lexerState), spec, $3, q)
+				$$.Joins = append($1.Joins, j)
 			}
 
-/* relation_expr_opt_alias — gram.y :13976-13997 (bare alias relies on the */
-/* SET/IDENT precedence entries above, exactly as upstream). */
+/* join_outer — gram.y :13840-13975 prefix alternatives collapsed into one
+   carrier. Reduction happens after the prefix's LAST keyword, so
+   lastConsumedPos lands on the JOIN token (differs from upstream @1 only
+   for NATURAL-prefixed spellings; content dumps unaffected). */
+join_outer:
+		JOIN
+			{
+				$$ = newJoinSpec(false, "inner")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| INNER_P JOIN
+			{
+				$$ = newJoinSpec(false, "inner")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| NATURAL JOIN
+			{
+				$$ = newJoinSpec(true, "inner")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| LEFT OUTER_P JOIN
+			{
+				$$ = newJoinSpec(false, "left")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| LEFT JOIN
+			{
+				$$ = newJoinSpec(false, "left")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| RIGHT OUTER_P JOIN
+			{
+				$$ = newJoinSpec(false, "right")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| RIGHT JOIN
+			{
+				$$ = newJoinSpec(false, "right")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| FULL OUTER_P JOIN
+			{
+				$$ = newJoinSpec(false, "full")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| FULL JOIN
+			{
+				$$ = newJoinSpec(false, "full")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| NATURAL LEFT OUTER_P JOIN
+			{
+				$$ = newJoinSpec(true, "left")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| NATURAL LEFT JOIN
+			{
+				$$ = newJoinSpec(true, "left")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| NATURAL RIGHT OUTER_P JOIN
+			{
+				$$ = newJoinSpec(true, "right")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| NATURAL RIGHT JOIN
+			{
+				$$ = newJoinSpec(true, "right")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| NATURAL FULL OUTER_P JOIN
+			{
+				$$ = newJoinSpec(true, "full")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| NATURAL FULL JOIN
+			{
+				$$ = newJoinSpec(true, "full")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+	| CROSS JOIN
+			{
+				$$ = newJoinSpec(false, "cross")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
+
+/* join_qual_opt — ON a_expr | USING '(' cols ')' | none (NATURAL/CROSS). */
+join_qual_opt:
+		/* empty */
+			{
+				$$ = nil
+			}
+	| ON a_expr
+			{
+				$$ = &joinQual{on: $2}
+			}
+	| USING '(' col_alias_list ')'
+			{
+				$$ = &joinQual{using: $3}
+			}
+
+col_alias_list:
+		ColId
+			{
+				$$ = []string{$1}
+			}
+	| col_alias_list ',' ColId
+			{
+				$$ = append($1, $3)
+			}
+
 relation_expr_opt_alias:
 		qualified_name %prec UMINUS
 			{
@@ -431,6 +562,84 @@ relation_expr_opt_alias:
 			{
 				$$ = rangeVarFromName($1, $3)
 			}
+
+/* base_table_ref — gram.y :13600 alternatives, P1.2 subset: plain relation
+   (+ONLY inheritance limiter) and parenthesised subquery with the
+   mandatory-in-practice alias (:1416-1452). Parenthesised join groups and
+   function tables remain explicit P1.2 TODO sub-items. */
+base_table_ref:
+		relation_expr_opt_alias
+			{
+				$$ = $1
+			}
+	| ONLY qualified_name opt_alias_ident
+			{
+				rv := rangeVarFromName($2, $3)
+				rv.Only = true
+				$$ = rv
+			}
+	| opt_lateral '(' SelectStmt ')' opt_derived_alias
+			{
+				sub, ok := $3.(*parser.SelectStmt)
+				if !ok {
+					lerr(yylex, "subquery in FROM did not produce SELECT", yylex.(*lexerState).lastConsumedPos())
+					sub = parser.NewSelectStmt(0)
+				}
+				// Legacy parseParenthesisedSelectStmt marks every
+				// paren-wrapped select Parenthesized=true (:1396-1402);
+				// planner stops flattening at such branches.
+				sub.Parenthesized = true
+				pos := sub.Pos()
+				lateral := false
+				alias := ""
+				var cols []string
+				if da, ok2 := $5.(*derivedAlias); ok2 && da != nil {
+					alias, cols = da.alias, da.cols
+					lateral = da.lateral || $1 == latYes
+				}
+				$$ = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
+			}
+
+/* opt_lateral — LATERAL_P presence marker. */
+opt_lateral:
+		/* empty */ { $$ = latNo }
+	| LATERAL_P        { $$ = latYes }
+
+/* opt_derived_alias — AS alias / bare IDENT / +column list; missing alias
+   triggers the synthetic __sq_<pos> fallback (legacy :1427-1432 mirrors
+   PG16). Bare-ident form accepts plain IDENT only (isAliasStart subset;
+   unreserved-keyword aliases arrive with generated BareColLabel wiring at
+   the next sub-phase if any corpus case needs them). */
+opt_derived_alias:
+		/* empty */
+			{
+				$$ = &derivedAlias{}
+			}
+	| AS ColId
+			{
+				$$ = &derivedAlias{alias: $2}
+			}
+	| IDENT
+			{
+				$$ = &derivedAlias{alias: $1}
+			}
+	| AS ColId '(' col_alias_list ')'
+			{
+				$$ = &derivedAlias{alias: $2, cols: $4}
+			}
+	| ColId '(' col_alias_list ')'
+			{
+				$$ = &derivedAlias{alias: $1, cols: $3}
+			}
+	| IDENT '(' col_alias_list ')'
+			{
+				$$ = &derivedAlias{alias: $1, cols: $3}
+			}
+
+opt_alias_ident:
+		/* empty */ { $$ = "" }
+	| AS ColId        { $$ = $2 }
+	| ColId           { $$ = $1 }
 
 /* where_clause — gram.y :14074. */
 where_clause:

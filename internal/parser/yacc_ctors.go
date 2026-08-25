@@ -87,3 +87,7 @@ func NewFromExpr(pos int, base RangeVar, joins []JoinExpr) FromExpr {
 func NewSortBy(pos int, expr Expr, desc bool, usingOp string) SortBy {
 	return SortBy{pos: pos, Expr: expr, Desc: desc, UsingOp: usingOp}
 }
+
+func NewJoinExpr(pos int, jt JoinType, natural bool, right RangeVar, on Expr, using []string) JoinExpr {
+	return JoinExpr{pos: pos, Type: jt, Natural: natural, Right: right, On: on, Using: using}
+}

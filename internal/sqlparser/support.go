@@ -85,3 +85,101 @@ func gateSyntaxError(l *lexerState, msg, hint string) {
 		l.err = &parser.SyntaxError{Message: msg, Hint: hint, Raw: true, Pos: l.lastConsumedPos()}
 	}
 }
+// joinSpec carries the join-type prefix of a JOIN clause (NATURAL? LEFT?
+// CROSS? ...) before the right-hand table ref.
+type joinSpec struct {
+	jt      parser.JoinType
+	natural bool
+	pos     int // byte offset of the LAST keyword of the join prefix
+}
+
+// newJoinSpec maps the grammar's spelling to JoinType + natural flag,
+// mirroring parseJoinClause's switch (select.go:1276-1313).
+func newJoinSpec(natural bool, kind string) *joinSpec {
+	jt := parser.JoinInner
+	switch kind {
+	case "left":
+		jt = parser.JoinLeft
+	case "right":
+		jt = parser.JoinRight
+	case "full":
+		jt = parser.JoinFull
+	case "cross":
+		jt = parser.JoinCross
+	}
+	return &joinSpec{jt: jt, natural: natural}
+}
+
+// joinQual carries a join qualifier pair (ON expr | USING cols | neither).
+type joinQual struct {
+	on    parser.Expr
+	using []string
+}
+
+// buildJoin assembles one JoinExpr and validates the qualifier combination
+// exactly like parseJoinClause (:1329-1360): NATURAL CROSS JOIN rejected;
+// NATURAL implies no ON/USING; everything else REQUIRES ON or USING.
+func buildJoin(l *lexerState, spec *joinSpec, right parser.RangeVar, q joinQual) parser.JoinExpr {
+	j := parser.NewJoinExpr(spec.pos, spec.jt, spec.natural, right, q.on, q.using)
+	if spec.jt == parser.JoinCross && spec.natural {
+		l.err = &parser.SyntaxError{Message: "NATURAL CROSS JOIN is not supported", Raw: true, Pos: spec.pos}
+		return j
+	}
+	if !spec.natural && spec.jt != parser.JoinCross && q.on == nil && len(q.using) == 0 {
+		l.err = &parser.SyntaxError{Message: "expected ON or USING in JOIN", Raw: true, Pos: spec.pos}
+	}
+	return j
+}
+
+// derivedRangeVar mirrors parseRangeVar's subquery arm (:1416-1452):
+// mandatory-in-practice alias with a synthetic __sq_<pos-hex> fallback and
+// the optional column-alias list.
+func derivedRangeVar(l *lexerState, pos int, sub *parser.SelectStmt, alias string, cols []string, lateral bool) parser.RangeVar {
+	if alias == "" {
+		alias = "__sq_" + strconvFormatHex(pos)
+	}
+	// NewRangeVar seeds the unexported pos ('(' position, matching legacy);
+	// Subquery/Lateral/Columns are exported and set directly.
+	rv := parser.NewRangeVar(pos, "", "", alias)
+	rv.Subquery = sub
+	rv.Lateral = lateral
+	rv.Columns = cols
+	return rv
+}
+
+func strconvFormatHex(v int) string {
+	const digits = "0123456789abcdef"
+	if v == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = digits[v&0xf]
+		v >>= 4
+	}
+	return string(buf[i:])
+}
+// LATERAL presence sentinels for opt_lateral (compares against $1 == latYes
+// in the derived-table action).
+const (
+	latNo  = 0
+	latYes = 1
+)
+
+// derivedAlias carries the optional alias/column-list after a FROM
+// subquery's closing paren.
+type derivedAlias struct {
+	alias   string
+	cols    []string
+	lateral bool
+}
+
+// lerr records a mid-parse hard error (first wins), like gateSyntaxError.
+func lerr(yylex yyLexer, msg string, pos int) {
+	l := yylex.(*lexerState)
+	if l.err == nil {
+		l.err = &parser.SyntaxError{Message: msg, Raw: true, Pos: pos}
+	}
+}

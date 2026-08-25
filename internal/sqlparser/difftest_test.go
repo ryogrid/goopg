@@ -136,6 +136,21 @@ func TestDifferentialSelectCore(t *testing.T) {
 		"SELECT a FROM t FETCH NEXT ROWS ONLY",
 		"SELECT a FROM t FETCH FIRST 10 ROWS WITH TIES",
 		"SELECT a FROM t WHERE x > 0 ORDER BY b LIMIT 3 OFFSET 1",
+		"SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
+		"SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id",
+		"SELECT * FROM t1 LEFT OUTER JOIN t2 ON t1.id = t2.id",
+		"SELECT * FROM t1 RIGHT JOIN t2 USING (id)",
+		"SELECT * FROM t1 FULL JOIN t2 ON t1.a = t2.b AND t1.c > 5",
+		"SELECT * FROM t1 CROSS JOIN t2",
+		"SELECT * FROM t1 NATURAL JOIN t2",
+		"SELECT * FROM a NATURAL LEFT JOIN b JOIN c ON a.x = c.x",
+		"SELECT * FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.b = t3.b",
+		"SELECT * FROM t1, t2, t3 WHERE t1.a = t2.a",
+		"SELECT * FROM ONLY parent_tab",
+		"SELECT * FROM (SELECT id, name FROM users) AS u",
+		"SELECT * FROM (SELECT id FROM users) u (user_id)",
+		"SELECT * FROM LATERAL (SELECT x FROM gen_tab) AS g",
+		"SELECT o.orderkey FROM orders o JOIN lineitem l ON o.orderkey = l.l_orderkey WHERE o.totalprice > 1000 ORDER BY o.orderdate DESC LIMIT 5",
 	}
 	for _, sql := range cases {
 		legacy, yacc, err := diffParse(sql)
