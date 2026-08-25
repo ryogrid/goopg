@@ -114,10 +114,9 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   ORDER BY/VARIADIC/FILTER/WITHIN GROUP deferred to P2.3b. Known S/R on '('
   = func-call vs paren-expr, default-shift correct; gate refined to allow
   exactly this 1 known conflict.
-- [x] **P2.4 casts (partial)**: `a_expr :: ColId` → CastExpr (simple type
-  names; schema-qualified and typmod args deferred — qualified_name in cast
-  target caused 2951 R/R conflicts due to LALR state merging with column-
-  ref path). $n params already handled via PARAM token. ARRAY[]/ROW()
+- [x] **P2.4 casts**: `::` cast + CAST(expr AS ColId) both ported.
+  Schema-qualified + typmod args deferred (qualified_name in cast target =
+  2951 R/R). $n params already handled via PARAM token. ARRAY[]/ROW()
   deferred to P2.4b.
 - [ ] **P2.5 type names**: Typename port incl. arrays, SETOF, intervals,
   character variants; flip ParseExpr to new parser; run plpgsql suite.
