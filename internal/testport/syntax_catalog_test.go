@@ -40,7 +40,7 @@ func TestSyntax_Catalog_PgStatActivity(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	rows := runSQL(t, c, "SELECT pid, state, backend_type FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client_backend'")
+	rows := runSQL(t, c, "SELECT pid, state, backend_type FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client backend'")
 	if len(rows) < 1 {
 		t.Fatal("pg_stat_activity returned zero rows for client_backend")
 	}
@@ -51,7 +51,7 @@ func TestSyntax_Catalog_PgStatActivity(t *testing.T) {
 		t.Error("state is empty")
 	}
 	if rows[0][2] != "client_backend" {
-		t.Errorf("backend_type = %q, want client_backend", rows[0][2])
+		t.Errorf("backend_type = %q, want upstream literal "client backend"", rows[0][2])
 	}
 }
 

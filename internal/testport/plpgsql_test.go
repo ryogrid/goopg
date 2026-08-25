@@ -310,7 +310,7 @@ func TestPort_PgStatActivity(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	rows := runSQL(t, c, "SELECT pid, state, backend_type, application_name FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client_backend'")
+	rows := runSQL(t, c, "SELECT pid, state, backend_type, application_name FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client backend'")
 	if len(rows) == 0 {
 		// If no client_backend rows (e.g. hidden by walwriter etc.), check any row.
 		rows = runSQL(t, c, "SELECT pid, state, backend_type, application_name FROM pg_catalog.pg_stat_activity LIMIT 1")
@@ -327,7 +327,7 @@ func TestPort_PgStatActivity(t *testing.T) {
 		t.Error("state is empty")
 	}
 	if row[2] != "client_backend" {
-		t.Errorf("backend_type = %q, want client_backend", row[2])
+		t.Errorf("backend_type = %q, want upstream literal "client backend"", row[2])
 	}
 }
 

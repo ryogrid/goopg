@@ -1308,9 +1308,15 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			}
 		}
 	}
-	// Update pg_stat_activity to idle after successful execution.
+	// Update pg_stat_activity after successful execution: upstream parks as
+	// STATE_IDLE when no transaction block is open and
+	// STATE_IDLEINTRANSACTION otherwise (postgres.c main loop).
 	if reg := s.cfg.Activity; reg != nil && connTx != nil {
-		reg.UpdateState(connTx.ProcNum, "idle", "")
+		state := "idle"
+		if connTx.InExplicit() {
+			state = "idle in transaction"
+		}
+		reg.UpdateState(connTx.ProcNum, state, "")
 	}
 	if autoCommit {
 		if err := ectx.CommitTransaction(tx); err != nil {
