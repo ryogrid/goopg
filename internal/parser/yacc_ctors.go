@@ -156,3 +156,7 @@ func NewFuncCall(pos int, name ObjectName, args []Expr, star bool) *FuncCall {
 
 func SetDistinct(fc *FuncCall) *FuncCall { fc.Distinct = true; return fc }
 func SetOrderBy(fc *FuncCall, ob []SortBy) *FuncCall { fc.OrderBy = ob; return fc }
+
+func NewCastExpr(pos int, operand Expr, typ ObjectName, typmods []int64) *CastExpr {
+	return &CastExpr{pos: pos, Operand: operand, Type: typ, Typmods: typmods}
+}

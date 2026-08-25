@@ -1258,6 +1258,15 @@ a_expr:
 				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, sub, nil)
 			}
 
+	| a_expr TYPECAST ColId
+			{
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, nil)
+			}
+	| a_expr TYPECAST ColId
+			{
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, nil)
+			}
+
 	/* [NOT] SIMILAR TO [+ ESCAPE] — gram.y :15080-15115; constant folding
 	   via buildSimilarTo (legacy buildSimilarTo parity). */
 	| a_expr SIMILAR TO a_expr %prec SIMILAR
