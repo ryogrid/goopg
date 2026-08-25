@@ -82,7 +82,7 @@
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call
-%type <node>	cse_wl when_then
+%type <node>	cse_wl when_then filter_clause within_group_clause
 %type <exprs>	opt_func_call_args
 %type <str>	subq_op
 %type <exprs>	expr_list group_by_list
@@ -1509,6 +1509,48 @@ name_or_call:
 				fc.Distinct = true
 				$$ = fc
 			}
+	| qualified_name '(' opt_func_call_args ')' filter_clause
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3, false)
+				fc.Filter = $5.(parser.Expr)
+				$$ = fc
+			}
+	| qualified_name '(' opt_func_call_args ')' within_group_clause
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3, false)
+				if wg, ok := $5.([]parser.SortBy); ok {
+					fc.WithinGroup = wg
+				}
+				$$ = fc
+			}
+	| qualified_name '(' DISTINCT expr_list ')' within_group_clause
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				if wg, ok := $6.([]parser.SortBy); ok {
+					fc.WithinGroup = wg
+				}
+				$$ = fc
+			}
+
+/* filter_clause / within_group_clause — gram.y :15230ff */
+filter_clause:
+		FILTER '(' WHERE a_expr ')'
+			{
+				$$ = $4
+			}
+
+within_group_clause:
+		WITHIN GROUP_P '(' ORDER BY sort_by_list ')'
+			{
+				$$ = $5
+			}
 
 /* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
    before ANY/SOME/ALL. Char literals + named terminals. */
@@ -1555,6 +1597,19 @@ name_or_call:
 				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
 				$$ = fc
+			}
+
+/* filter_clause / within_group_clause — gram.y :15230ff */
+filter_clause:
+		FILTER '(' WHERE a_expr ')'
+			{
+				$$ = $4
+			}
+
+within_group_clause:
+		WITHIN GROUP_P '(' ORDER BY sort_by_list ')'
+			{
+				$$ = $5
 			}
 
 /* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
