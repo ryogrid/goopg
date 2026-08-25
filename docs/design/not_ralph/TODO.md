@@ -216,8 +216,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   [+tz], double precision, char/character/nchar [varying], bit [varying]
   alternatives). Legacy parity details: float(p<=24)->float4 folding into the
   NAME (typmod dropped), bare char stamps Typmods=[1] via typmodsFor helper,
-  bare nchar->"character". Remaining: schema-qualified targets, array-typmod
-  forms, SETOF, then flip ParseExpr + plpgsql suite.
+  bare nchar->"character". Schema-qualified targets + array suffixes landed same day
+  (castType carrier; "int[]" folds into Name; gate now allows known S/Rs on
+  '(' '.' '['). Remaining: SETOF (function-return only), ParseExpr flip +
+  plpgsql suite.
   TRAP FOUND 2026-08-26: naive multi-word additions (::double precision,
   ::timestamp with time zone) collide R/R with the ColId cast-target path
   because every type word is ALSO a col_name/unreserved keyword. Upstream

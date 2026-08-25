@@ -71,8 +71,8 @@ func harvestSQLLiterals(t *testing.T) []string {
 // WITH 8/8 = 135 identical of 1485 harvested; DML/DDL both-parse counts
 // rise automatically as waves land. Floor keeps 5-headroom; NEVER lower
 // without a documented reason.
-// 2026-08-26 P2.5 cast targets landed: SELECT 137/174, WITH 8/8 = 145.
-const legacyCorpusParityFloor = 140
+// 2026-08-26 P2.5 part2 (qualified + array-suffix casts): 147 total.
+const legacyCorpusParityFloor = 142
 
 func TestLegacyCorpusParity(t *testing.T) {
 	queries := harvestSQLLiterals(t)

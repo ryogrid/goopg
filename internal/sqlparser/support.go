@@ -477,6 +477,18 @@ func buildIntervalQualified(pos int, body, hi, lo string, prec int) parser.Expr 
 	return parser.NewIntervalLitQualified(pos, body, unit, hasPrec, prec)
 }
 
+// castType carries a cast-target type name through the grammar: optional
+// leading schema plus the (possibly array-suffixed) type name.
+type castType struct{ schema, name string }
+
+// withArrays appends n "[]" pairs the way legacy folds them into Name.
+func (c castType) withArrays(n int) castType {
+	for i := 0; i < n; i++ {
+		c.name += "[]"
+	}
+	return c
+}
+
 // typmodsFor applies legacy's bare-type stamps at cast sites: bare "char"
 // carries the bpchar length-1 typmod (ddl.go M0134-0070 note); everything
 // else passes the grammar's typmods through untouched.

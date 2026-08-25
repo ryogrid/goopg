@@ -85,7 +85,9 @@
 %type <node>	cse_wl when_then filter_clause within_group_clause
 %type <exprs>	opt_func_call_args
 %type <str>	subq_op extract_field
-%type <str>	cast_target opt_tzmark double_tail cast_ident character_word
+%type <str>	opt_tzmark double_tail cast_ident character_word
+%type <ct>	cast_target cast_typename
+%type <ival>	opt_array_tail
 %type <exprs>	expr_list group_by_list
 %type <expr>	group_by_item
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
@@ -1397,20 +1399,20 @@ a_expr:
 				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, sub, nil)
 			}
 
-	| a_expr TYPECAST cast_target
+	| a_expr TYPECAST cast_typename
 			{
-				nm := $3
+				nm := $3.name
 				if nm == "float" {
 					nm = "float8"
 				}
 				tm := typmodsFor(nm, nil, 0)
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: nm}, tm)
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: nm}, tm)
 			}
-	| a_expr TYPECAST cast_target '(' ICONST ')'
+	| a_expr TYPECAST cast_typename '(' ICONST ')'
 			{
-				nm := $3
+				nm := $3.name
 				tm := []int64{int64($5)}
-				if nm == "float" {
+				if nm == "float" && len($3.schema) == 0 {
 					if $5 <= 24 {
 						nm, tm = "float4", nil // legacy folds the precision into the type name
 					} else {
@@ -1418,12 +1420,12 @@ a_expr:
 					}
 				}
 				tm = typmodsFor(nm, tm, 1)
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: nm}, tm)
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: nm}, tm)
 			}
-	| a_expr TYPECAST cast_target '(' ICONST ',' ICONST ')'
+	| a_expr TYPECAST cast_typename '(' ICONST ',' ICONST ')'
 			{
-				tm := typmodsFor($3, []int64{int64($5), int64($7)}, 2)
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, tm)
+				tm := typmodsFor($3.name, []int64{int64($5), int64($7)}, 2)
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: $3.name}, tm)
 			}
 
 	/* Subscripts — gram.y :15040ff opt_slice_bound forms: base[i],
@@ -1651,9 +1653,9 @@ c_expr:
 			{
 				$$ = $1
 			}
-	| CAST '(' a_expr AS cast_target ')'
+	| CAST '(' a_expr AS cast_typename ')'
 			{
-				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Name: $5}, nil)
+				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: $5.name}, typmodsFor($5.name, nil, 0))
 			}
 /* b_expr — gram.y :15040ff subset: the operand grammar for predicates that
    must not swallow AND/BETWEEN/IN/LIKE keywords. Kept name-identical to
@@ -1968,25 +1970,39 @@ extract_field:
    array-typmod forms stay deferred (TODO P2.5). */
 cast_target:
 		cast_ident
-			{ $$ = $1 }
+			{ $$ = castType{name: $1} }
 	| DOUBLE_P double_tail
-			{ $$ = "float8" }
+			{ $$ = castType{name: "float8"} }
 	| character_word VARYING
-			{ $$ = "varchar" }
+			{ $$ = castType{name: "varchar"} }
 	| NATIONAL character_word VARYING
-			{ $$ = "varchar" }
+			{ $$ = castType{name: "varchar"} }
 	| character_word
-			{ $$ = lowerIdent($1) }
+			{ $$ = castType{name: lowerIdent($1)} }
 	| NATIONAL character_word
-			{ $$ = "character" }
+			{ $$ = castType{name: "character"} }
 	| BIT VARYING
-			{ $$ = "varbit" }
+			{ $$ = castType{name: "varbit"} }
 	| BIT
-			{ $$ = "bit" }
+			{ $$ = castType{name: "bit"} }
 	| TIME opt_tzmark
-			{ $$ = tzJoin("time", $2) }
+			{ $$ = castType{name: tzJoin("time", $2)} }
 	| TIMESTAMP opt_tzmark
-			{ $$ = tzJoin("timestamp", $2) }
+			{ $$ = castType{name: tzJoin("timestamp", $2)} }
+	| IDENT '.' ColId
+			{ $$ = castType{schema: $1, name: $3} }
+
+/* cast_typename — cast_target plus optional array suffixes ("int[]" folds
+   into Name, legacy parity). */
+cast_typename:
+		cast_target opt_array_tail
+			{
+				$$ = $1.withArrays($2)
+			}
+
+opt_array_tail:
+		/* empty */          { $$ = 0 }
+	| '[' ']' opt_array_tail { $$ = $3 + 1 }
 
 character_word:
 		CHARACTER  { $$ = "character" }
