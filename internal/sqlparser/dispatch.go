@@ -52,9 +52,10 @@ func SplitStatements(toks []parser.Token) [][]parser.Token {
 // ident-led statements (start/discard/fetch/move/close/refresh/grant/revoke/
 // listen/notify/unlisten/lock) via TokenIdent, matched case-insensitively.
 //
-// EMPTY: P2-F flip attempted 2026-08-25 but reverted — TPC-H Q12 fails
-// (grammar gap). Re-enable after fixing; see TODO P2-F for details.
-var routedStmts = map[string]bool{}
+// select: P2-F flip. Grammar coverage floor enforced by
+// TestTPCHGrammarCoverage (19/22); typed-literal normalization handles
+// date/time/timestamp/interval SCONST forms.
+var routedStmts = map[string]bool{"select": true}
 
 // routeBatch reports whether the whole batch can go to the new parser, plus
 // the parsed statements when it can.

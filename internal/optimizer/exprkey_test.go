@@ -168,6 +168,7 @@ var allExprTypes = []parser.Expr{
 	&parser.ParamRef{},
 	&parser.PartitionRangeBoundKeyword{},
 	&parser.RowExpr{},
+	&parser.ScalarSublinkExpr{},
 	&parser.SimilarToPattern{},
 	&parser.StarExpr{},
 	&parser.StringConst{},

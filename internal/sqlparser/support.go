@@ -446,3 +446,22 @@ type caseBody struct {
 // dedicated ScalarSublink Expr node type (P2.2 remainder).
 
 func lowerIdent(s string) string { return strings.ToLower(s) }
+
+// buildIntervalLit mirrors legacy tryTypedLiteral's embedded-string form
+// (`interval '<body>'`): parse the body into interval components at AST-build
+// time so the executor sees an IntervalLit datum, not text.
+func buildIntervalLit(pos int, body string) parser.Expr {
+	if m, d, us, ok := parser.ParseIntervalBody(body); ok {
+		return parser.NewIntervalLitPre(pos, m, d, us)
+	}
+	return parser.NewTypedStringLit(pos, "interval", body)
+}
+
+// typedLitParts splits the adapter's folded TYPEDLIT payload "type\x1fvalue"
+// back into its type name and literal text.
+func typedLitParts(s string) (typ, val string) {
+	if i := strings.IndexByte(s, 0x1f); i >= 0 {
+		return s[:i], s[i+1:]
+	}
+	return "", s
+}

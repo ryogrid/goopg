@@ -128,7 +128,6 @@ var knownTypeNames = map[string]string{
 	"date":      "date",
 	"time":      "time",
 	"timestamp": "timestamp",
-	"interval":  "interval",
 }
 
 // next returns the next terminal after base_yylex substitution.
@@ -139,15 +138,20 @@ func (l *lexerState) next() lexResult {
 	}
 	cur := l.raw()
 
-	// Typed-literal normalization: IDENT(type-name) + SCONST → SCONST only.
-	// The type context is inferred by the analyzer from surrounding usage,
-	// matching how legacy handles these constructs.
-	if cur.term == resolve("IDENT") {
-		lower := strings.ToLower(cur.str)
-		if _, isType := knownTypeNames[lower]; isType {
+	// Typed-literal normalization: IDENT(type-name) + SCONST → TYPEDLIT
+	// (synthetic terminal; type rides in str). Mirrors legacy TypedStringLit.
+	// time/timestamp/interval are kwlist COL_NAME keywords (TIME/TIMESTAMP/
+	// INTERVAL terminals); date is a plain IDENT. Match on text either way.
+	lower := strings.ToLower(cur.str)
+	if _, isKw := knownTypeNames[lower]; isKw {
+		if cur.term == resolve("IDENT") || cur.term == resolve("TIME") ||
+			cur.term == resolve("TIMESTAMP") || cur.term == resolve("INTERVAL") {
 			if nxt := l.peek(); nxt.term == resolve("SCONST") {
 				l.i++ // consume the SCONST too
-				return lexResult{term: resolve("SCONST"), str: nxt.str, pos: cur.pos, text: cur.text + " " + nxt.text}
+				// Fold to one synthetic terminal so c_expr can build a
+				// TypedStringLit (legacy parity) instead of a bare string —
+				// `date 'X' + interval 'Y'` needs the type for + resolution.
+				return lexResult{term: resolve("TYPEDLIT"), str: knownTypeNames[lower] + "\x1f" + nxt.str, pos: cur.pos, text: cur.text + " " + nxt.text}
 			}
 		}
 	}

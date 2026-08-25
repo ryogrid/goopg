@@ -133,6 +133,38 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   NOTE: differential test passes because BOTH parsers produce same AST
   (both happen to succeed via different paths).
 
+### Session 2026-08-26 (P2-F real flip + conflict hygiene)
+
+- [x] **GATE ANCHOR BUG (critical)**: the conflict gate grepped y.output with
+  `^[0-9]+:` but goyacc pads some state numbers with a leading space, so 3928
+  of HEAD's 3929 conflicts were invisible. Root causes found and removed:
+  a stale duplicated block at file end (opt_func_call_args/name_or_call/
+  filter_clause/within_group_clause/subq_op all defined twice) plus a
+  duplicated `a_expr TYPECAST ColId` alternative inside a_expr itself.
+  Grammar is now genuinely clean: 2 S/R both on '(' (func-call/extract vs
+  paren), 0 R/R. Gate now requires ALL conflicts to be on '(' instead of a
+  magic count.
+- [x] **P1.4 COMPLETION**: OVER ColId bare refs (args/star/DISTINCT variants),
+  WINDOW window_definition_list clause, opt_window_spec flat alternatives.
+  NOTE: `count(*) FILTER/WITHIN GROUP` still missing (star variant has no
+  postfix continuations).
+- [x] **P2.1c EXTRACT** landed for real: EXTRACT '(' extract_field FROM
+  a_expr ')' + datetime extract_field list via lowerIdent helper.
+- [x] **TYPED-LITERAL REWORK**: adapter no longer collapses date/time/timestamp
+  SCONST to bare strings; it folds to a synthetic %token TYPEDLIT whose str is
+  "type\x1fvalue", and c_expr builds TypedStringLit (legacy parity). interval
+  goes through its kwlist keyword rule and buildIntervalLit → IntervalLit
+  PreComputed via exported ParseIntervalBody (legacy produced IntervalLit, not
+  TypedStringLit — the difference broke `date 'X' + interval 'Y'` with
+  "operator + requires integer operands").
+- [x] **P2-F FLIP (real)**: routedStmts["select"]=true. Gates: units PASS,
+  tpch-spotcheck Q12 rows=2 / Q13 rows=35 PASS through the live server.
+  TestTPCHGrammarCoverage floor 19/22 added as a permanent unit gate.
+- [ ] **Deferred**: interval 'N' <unit> qualified form (interval '90 day'
+  embedded form works; trailing-qualifier form is a syntax error in the yacc
+  grammar); timestamp WITH/WITHOUT time zone literals; char(N) '...' literals;
+  count(*) FILTER.
+
 ## P2 — Expressions
 
 - [x] **P2.1a IS family + BETWEEN**: IS [NOT] NULL / TRUE / FALSE / UNKNOWN /

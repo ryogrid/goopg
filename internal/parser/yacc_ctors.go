@@ -184,3 +184,13 @@ func (*ScalarSublinkExpr) exprNode()  {}
 func NewScalarSublinkExpr(pos int, sub *SelectStmt) *ScalarSublinkExpr {
 	return &ScalarSublinkExpr{pos: pos, Sub: sub}
 }
+
+func NewExtractExpr(pos int, field string, source Expr) *ExtractExpr {
+	return &ExtractExpr{pos: pos, Field: field, Source: source}
+}
+
+// NewIntervalLitPre builds the PreComputed form of IntervalLit from components
+// parsed via ParseIntervalBody (embedded-string `interval '<body>'` form).
+func NewIntervalLitPre(pos int, months, days int32, micros int64) *IntervalLit {
+	return &IntervalLit{pos: pos, PreComputed: true, PreMonths: months, PreDays: days, PreMicros: micros}
+}

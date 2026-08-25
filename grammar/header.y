@@ -13,6 +13,13 @@ import (
 
 %}
 
+/* TYPEDLIT — synthetic terminal for the typed-literal forms the adapter
+   folds (IDENT date/time/timestamp + SCONST; gram.y AexprConst Typename
+   Sconst). str carries "type\x1fvalue"; see typedLitParts in support.go.
+   interval is NOT folded here: it is a real kwlist keyword and goes through
+   the grammar's INTERVAL SCONST rule. */
+%token <str> TYPEDLIT
+
 %union {
 	str    string           // IDENT / SCONST / keyword text / Op value ...
 	ival   int              // ICONST / PARAM numbers

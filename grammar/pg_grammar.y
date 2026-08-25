@@ -1467,7 +1467,12 @@ c_expr:
 			}
 	| INTERVAL SCONST
 			{
-				$$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "interval", $2)
+				$$ = buildIntervalLit(yylex.(*lexerState).lastConsumedPos(), $2)
+			}
+	| TYPEDLIT
+			{
+				typ, val := typedLitParts($1)
+				$$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), typ, val)
 			}
 	| EXTRACT '(' extract_field FROM a_expr ')'
 			{
