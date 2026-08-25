@@ -85,6 +85,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   date/time/timestamp/interval + SCONST → SCONST only) fixed the Q12 gap.
   routedStmts["select"]=true; units 44 pkgs PASS; tpch-spotcheck Q12+Q13
   PASS. WITH follower scan working. Gate: differential corpus +16 cases.
+- [x] **P2-F POST-FLIP BASELINE**: regress-runner 4/52 PASS (7.7% parity)
+  with select routing active. Expected low — most regress cases use
+  constructs not yet ported (type names, DDL, operators, etc.). Track this
+  number as grammar waves add coverage.
 - [ ] **P2-F SUPPLEMENT** (post-flip improvements): VALUES/TABLE statement
   forms (P1.7a), window OVER() (needs P2.3b FILTER/WITHIN GROUP), remaining
   type-name coverage. These enhance but do not block the flip.
