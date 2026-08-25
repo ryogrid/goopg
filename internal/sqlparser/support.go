@@ -85,6 +85,7 @@ func gateSyntaxError(l *lexerState, msg, hint string) {
 		l.err = &parser.SyntaxError{Message: msg, Hint: hint, Raw: true, Pos: l.lastConsumedPos()}
 	}
 }
+
 // joinSpec carries the join-type prefix of a JOIN clause (NATURAL? LEFT?
 // CROSS? ...) before the right-hand table ref.
 type joinSpec struct {
@@ -161,6 +162,7 @@ func strconvFormatHex(v int) string {
 	}
 	return string(buf[i:])
 }
+
 // LATERAL presence sentinels for opt_lateral (compares against $1 == latYes
 // in the derived-table action).
 const (
