@@ -30,17 +30,6 @@ func TestSplitStatements(t *testing.T) {
 	}
 }
 
-// TestRouteBatchSelective pins routing behavior: currently inert (empty set),
-// will become selective when P2-F flip lands.
-func TestRouteBatchInert(t *testing.T) {
-	for _, sql := range []string{"SELECT 1", "BEGIN", ""} {
-		toks, _ := parser.Lex(sql)
-		_, handled, _ := routeBatch(toks)
-		if handled {
-			t.Fatalf("%q: unexpectedly routed with empty routedStmts", sql)
-		}
-	}
-}
 
 // TestRouteBatchWholeBatchOrLegacy pins the whole-batch rule: one routed +
 // one unrouted statement must decline the ENTIRE batch (mixed batches stay

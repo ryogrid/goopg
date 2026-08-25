@@ -87,10 +87,15 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   (gram.y Typename SCONST). New parser lacks this rule; sees DATE_P as
   ColId then fails on unexpected SCONST. Fix: add typed-literal rules
   (DATE_P/TIME_P/TIMESTAMP/INTERVAL + SCONST → TypedStringLit) to c_expr. WITH follower
-  scan IS implemented and working (withFollowerRouted). Investigation update: Q12 parses correctly via ParseOne AND passes
-  differential corpus (date literals work). Issue is in the ROUTING
-  PIPELINE integration (parser.Parse→hook→routeBatch path), NOT grammar.
-  Next: debug routeBatch/SplitStatements/ParseOne flow with actual Q12.
+  scan IS implemented and working (withFollowerRouted). Investigation DEEPENED: Q12 passes ParseOne, routeBatch, AND
+  parser.Parse in Go tests. But fails through the LIVE SERVER (rebuilt
+  binary, routing enabled). The error is identical: syntax error at
+  "1994-01-01" col=421 (42601). This means the server's code path diverges
+  from the test path — possibly the query goes through a DIFFERENT parse
+  entry point (dispatchSimpleQueryViaExecutor vs parser.Parse), or the
+  wire-protocol layer transforms the SQL before it reaches Parse.
+  NEXT: live-debug by connecting psql to a flipped goopg server and running
+  Q12 manually to capture the full stack trace.
 
 ## P2 — Expressions
 
