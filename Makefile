@@ -196,6 +196,24 @@ ralph-state-guard:
 check-testport-inventory:
 	go test -run TestOnDiskInventoryCSVValidates ./internal/testport/framework/
 
+# Regenerate the goyacc LALR parser from grammar/*.y (parser-rewrite project,
+# docs/design/not_ralph/). Generated artifacts are committed; run in the same
+# commit that edits the grammar. The conflict grep is LOAD-BEARING: goyacc
+# exits 0 even with unresolved conflicts, and upstream gram.y is %expect 0.
+GOYACC := go run golang.org/x/tools/cmd/goyacc
+
+.PHONY: gen-parser
+gen-parser:
+	go run ./cmd/gen-kwlist-go -tokens-out grammar/tokens_gen.y
+	mkdir -p tmp
+	cat grammar/header.y grammar/tokens_gen.y grammar/pg_grammar.y grammar/goopg_ext.y > tmp/goopg_grammar.y
+	printf '\n%%%%\n' >> tmp/goopg_grammar.y
+	cd internal/sqlparser && $(GOYACC) -o yacc_parser.go -v y.output ../../tmp/goopg_grammar.y 2> yacc_stderr.txt \
+		|| { cat yacc_stderr.txt; exit 1; }
+	if grep -q 'conflicts:' internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output 2>/dev/null; then \
+		echo 'ERROR: grammar conflicts — upstream is %expect 0; restructure, never resolve silently'; exit 1; fi
+	rm -f internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output
+
 # Regenerate every derived doc from the consolidated inventory CSV. Run in the
 # same commit that edits the CSV so the renders never drift from the authority.
 regen-testport:

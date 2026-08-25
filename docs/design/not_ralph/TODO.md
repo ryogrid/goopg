@@ -15,18 +15,18 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   rows matching `^\s*PG_KEYWORD("`, comments excluded — + category array +
   bare_label_keyword flag + name→token map). Provenance header. Unit test:
   count == upstream, categories spot-checked, no duplicates.
-- [ ] **P0.3 Error-helper relocation** (review finding): move
-  syntaxErrorMsg/syntaxErrorCode from internal/postmaster into a leaf spot
-  in internal/parser; postmaster consumes from there. Behavior-preserving;
-  postmaster tests stay green.
-- [ ] **P0.4 Package scaffold**: `internal/sqlparser` with `yyLexer`
+- [x] **P0.3 Error-helper relocation — REVISED, no move needed**: analysis
+  showed sqlparser only needs to PRODUCE *parser.SyntaxError values (it
+  already carries Pos/Message/Raw/Code/Hint); postmaster's formatting
+  helpers stay put and keep consuming them. Layering concern dissolved.
+- [x] **P0.4 Package scaffold**: `internal/sqlparser` with `yyLexer`
   adapter over existing lexer (incl. named-operator splitting per 05 #11);
   error shim through the relocated helpers; entry point takes TOKEN SLICES:
   `ParseOne(stmtTokens []Token, baseOffset int)` — no string re-lexing.
-- [ ] **P0.5 base_yylex filter port** (`base_yylex.go`): _LA substitutions +
+- [x] **P0.5 base_yylex filter port** (`base_yylex.go`): _LA substitutions +
   UESCAPE triple (+ stubbed MODE_* branch), table-driven tests for every
   substitution pair and UESCAPE validation error.
-- [ ] **P0.6 Skeleton grammar & build**: `grammar/header.y` (prologue) +
+- [x] **P0.6 Skeleton grammar & build**: `grammar/header.y` (prologue) +
   `grammar/pg_grammar.y` (verbatim precedence block :824-903, minimal
   `stmt:` core) + empty `grammar/goopg_ext.y`; Makefile `gen-parser` target
   with MANDATORY conflict grep (fails on 'conflicts:' in y.output/stderr);

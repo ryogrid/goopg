@@ -19,6 +19,12 @@
 
 ## Known upstream quirks to respect (found while surveying)
 
+* **goyacc Lex contract (P0-verified)**: NAMED terminals return their
+  declared sequential number (yylex1 maps via yyTok3); CHAR-LITERAL
+  terminals return the **ASCII code** (yylex1 maps via yyTok1[ascii] —
+  yyToknames prints "'c'" entries whose sequential numbers are NOT parser
+  values); EOF returns **<= 0** (yylex1 substitutes yyTok1[0]). Getting any
+  of these wrong yields silent syntax errors or $unk misroutes.
 * `%expect 0` upstream; goyacc ignores `%expect` entirely — our zero-conflict
   guarantee comes ONLY from the build-time conflict grep (risk #1).
 * Keyword categories are grammar-side lists — FIVE of them including
