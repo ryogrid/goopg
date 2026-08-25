@@ -56,7 +56,13 @@
 
 %type <stmts>	root stmt_list
 %type <stmt>	stmt SelectStmt simple_select base_select
-%type <node>	opt_setop_tail setop_op
+%type <node>	setop_tail setop_op
+%type <b>	opt_recursive
+%type <ctes>	cte_list
+%type <node>	cte_item
+%type <str>	opt_materialized
+%type <withc>	with_clause
+%type <node>	opt_with_clause
 %type <b>	set_quantifier
 %type <p>	select_pos
 %type <node>	opt_all_distinct
@@ -71,12 +77,14 @@
 %type <rfes>	row_from_list
 %type <rfe>	row_from_entry_one
 
-%type <strs>	col_alias_list
+%type <strs>	col_alias_list cte_col_list
 %type <exprs>	opt_func_arg_list func_arg_list
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause having_clause
 %type <exprs>	expr_list group_by_list
+%type <vrows>	VALUES_rows_tail
+%type <exprs>	VALUES_row
 %type <expr>	group_by_item
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
 %type <sortbys>	opt_sort_clause sort_by_list sort_clause
@@ -129,10 +137,30 @@ stmt:
 // on the innermost RHS first; foldSetOps lifts them outward when that RHS
 // is not explicitly parenthesized (M0097-0024/M0097-0042).
 SelectStmt:
-		base_select opt_setop_tail
+		/* TERMINAL-ESCAPE RULE: this alternative must exist so the
+		   cte_item -> SelectStmt -> with_clause cycle has a terminal-only
+		   derivation; without it goyacc reports never-derives for the whole
+		   chain. */
+		base_select setop_tail
 			{
-				base, _ := $1.(*parser.SelectStmt)
+				base, ok := $1.(*parser.SelectStmt)
+				if !ok || base == nil {
+					base = parser.NewSelectStmt(0)
+				}
 				tail := $2.(*setopChain)
+				$$ = foldSetOps(base, tail.pairs)
+			}
+	| with_clause base_select setop_tail
+			{
+				base, ok := $2.(*parser.SelectStmt)
+				if !ok || base == nil {
+					base = parser.NewSelectStmt(0)
+				}
+				if wc := $1; wc != nil {
+					// Legacy: With attaches to the OUTERMOST select only.
+					base.With = wc
+				}
+				tail := $3.(*setopChain)
 				$$ = foldSetOps(base, tail.pairs)
 			}
 
@@ -150,8 +178,46 @@ base_select:
 				}
 				$$ = m
 			}
+	| VALUES VALUES_row VALUES_rows_tail opt_sort_clause opt_select_limit
+			{
+				rows := append([][]parser.Expr{$2}, $3...)
+				m := newValuesSelect(0, rows)
+				if sl, ok := $5.(*selectLimit); ok && sl != nil {
+					m.Limit = sl.count
+					m.Offset = sl.offset
+					m.WithTies = sl.withTies
+				}
+				m.OrderBy = $4
+				$$ = m
+			}
+	| TABLE qualified_name opt_sort_clause opt_select_limit
+			{
+				s := tableSelect(0, $2)
+				s.OrderBy = $3
+				if sl, ok := $4.(*selectLimit); ok && sl != nil {
+					s.Limit = sl.count
+					s.Offset = sl.offset
+					s.WithTies = sl.withTies
+				}
+				$$ = s
+			}
 
-opt_setop_tail:
+VALUES_row:
+		'(' expr_list ')'
+			{
+				$$ = $2
+			}
+
+VALUES_rows_tail:
+		/* empty */
+			{ $$ = nil }
+	| VALUES_rows_tail ',' VALUES_row
+			{
+				$$ = append($1, $3)
+			}
+
+
+setop_tail:
 		/* empty */
 			{
 				$$ = &setopChain{}
@@ -908,6 +974,62 @@ sort_clause:
 			}
 
 /* having_clause — gram.y :13522. */
+opt_with_clause:
+		/* empty */ { $$ = nil }
+	| with_clause     { $$ = $1 }
+
+with_clause:
+		WITH opt_recursive cte_list
+			{
+				$$ = parser.NewWithClause(0, $2, $3)
+			}
+
+opt_recursive:
+		/* empty */ { $$ = false }
+	| RECURSIVE      { $$ = true }
+
+cte_list:
+		cte_item
+			{
+				ci, _ := $1.(*cteItem)
+				if ci == nil || ci.cte == nil {
+					ci = &cteItem{cte: parser.NewCommonTableExpr(0, "", nil, nil)}
+				}
+				$$ = []*parser.CommonTableExpr{ci.cte}
+			}
+	| cte_list ',' cte_item
+			{
+				ci, _ := $3.(*cteItem)
+				if ci == nil || ci.cte == nil {
+					ci = &cteItem{cte: parser.NewCommonTableExpr(0, "", nil, nil)}
+				}
+				$$ = append($1, ci.cte)
+			}
+
+/* cte_item — gram.y :13030ish subset: SELECT body only (DML bodies arrive
+   with P3). MATERIALIZED markers per M0097-0047. */
+cte_item:
+		ColId cte_col_list AS opt_materialized '(' SelectStmt ')'
+			{
+				sub, ok := $6.(*parser.SelectStmt)
+				if !ok || sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				mat := $4
+				cte := parser.NewCommonTableExpr(0, $1, $2, sub)
+				cte.Materialized = mat
+				$$ = &cteItem{cte: cte}
+			}
+
+cte_col_list:
+		/* empty */           { $$ = nil }
+	| '(' col_alias_list ')'  { $$ = $2 }
+
+opt_materialized:
+		/* empty */    { $$ = "" }
+	| MATERIALIZED         { $$ = "materialized" }
+	| NOT MATERIALIZED     { $$ = "not materialized" }
+
 having_clause:
 		/* empty */
 			{

@@ -99,3 +99,11 @@ func NewTableFuncRef(pos int, name string, args []Expr, withOrdinality bool, row
 func NewSetOpClause(pos int, typ SetOpType, all bool, right *SelectStmt) *SetOpClause {
 	return &SetOpClause{pos: pos, Type: typ, All: all, Right: right}
 }
+
+func NewWithClause(pos int, recursive bool, ctes []*CommonTableExpr) *WithClause {
+	return &WithClause{pos: pos, Recursive: recursive, CTEs: ctes}
+}
+
+func NewCommonTableExpr(pos int, name string, cols []string, query *SelectStmt) *CommonTableExpr {
+	return &CommonTableExpr{pos: pos, Name: name, Columns: cols, Query: query}
+}

@@ -323,3 +323,33 @@ func foldSetOps(base *parser.SelectStmt, pairs []setopPair) *parser.SelectStmt {
 	}
 	return base
 }
+
+// newValuesSelect builds the VALUES statement form (legacy parseValuesSelect,
+// select.go:41-70): SelectStmt{ValuesRows} with no Targets.
+func newValuesSelect(pos int, rows [][]parser.Expr) *parser.SelectStmt {
+	s := parser.NewSelectStmt(pos)
+	s.ValuesRows = rows
+	return s
+}
+
+// tableSelect builds the TABLE t shorthand (legacy :144-158): SELECT * FROM t.
+func tableSelect(pos int, q qname) *parser.SelectStmt {
+	schema, name := "", ""
+	if len(q.parts) == 1 {
+		name = q.parts[0]
+	} else {
+		schema, name = q.parts[len(q.parts)-2], q.parts[len(q.parts)-1]
+	}
+	star := parser.NewStarExpr(pos, "", "")
+	rt := parser.NewResTarget(pos, "", star) // legacy leaves ResTarget.pos zero here
+	rv := parser.NewRangeVar(q.pos, schema, name, "")
+	s := parser.NewSelectStmt(pos)
+	s.Targets = []parser.ResTarget{rt}
+	fe := parser.NewFromExpr(rv.Pos(), rv, nil)
+	s.From = []parser.RangeVar{rv}
+	s.FromExprs = []parser.FromExpr{fe}
+	return s
+}
+
+// cteItem carries a built CTE through a node-typed union field.
+type cteItem struct{ cte *parser.CommonTableExpr }

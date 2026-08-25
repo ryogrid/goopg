@@ -71,9 +71,15 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   (legacy parity, dump-pinned) whereas upstream %left builds LEFT trees —
   semantically equivalent for associative set ops; documented in
   difftest_known_diffs.md.
-- [ ] **P1.7 CTEs**: WITH [RECURSIVE], materialization hints; TABLE/VALUES
-  statement forms. Flip full SELECT family routing (WITH routes by follower
-  keyword — SELECT only until P3).
+- [x] **P1.7 CTEs**: WITH [RECURSIVE], cte_col_list, AS MATERIALIZED /
+  NOT MATERIALIZED markers; TABLE/VALUES statement forms (VALUES gets the
+  full base_select sort/limit/set-op tail). Grammar landed; routing NOT
+  flipped yet (see P2-F).
+- [ ] **P2-F SELECT-family FLIP** (moved from P1.4/P1.7 — preconditions
+  grew): requires P1.4 window OVER() AND P2 expressions (FuncCall/casts/
+  sublinks) so routed SELECTs cannot regress on real queries. Flip
+  routedStmts {select,table,values,(,with-follower-scan}; gates: differential
+  corpus + parser pkg + units + regress-runner ≥ baseline + tpch-spotcheck.
 
 ## P2 — Expressions
 

@@ -33,6 +33,9 @@ import (
 	exprs   []parser.Expr
 	tfr     *parser.TableFuncRef
 	rfes    []parser.RowsFromEntry
+	vrows   [][]parser.Expr
+	ctes    []*parser.CommonTableExpr
+	withc   *parser.WithClause
 	rfe     parser.RowsFromEntry
 	strs   []string         // identifier lists
 	qn     qname            // dotted-name carrier (support.go)

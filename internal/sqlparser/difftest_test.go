@@ -170,6 +170,18 @@ func TestDifferentialSelectCore(t *testing.T) {
 		"SELECT 1 UNION SELECT 2 UNION SELECT 3",
 		"SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 ORDER BY 1 LIMIT 5",
 		"SELECT a FROM t WHERE x > 0 GROUP BY a HAVING a > 2 ORDER BY a LIMIT 3",
+		"WITH cte AS (SELECT a FROM t) SELECT * FROM cte",
+		"WITH cte AS (SELECT a FROM t), cte2 AS (SELECT b FROM u) SELECT * FROM cte, cte2",
+		"WITH cte (x, y) AS (SELECT a, b FROM t) SELECT x FROM cte",
+		"WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM t WHERE n < 5) SELECT n FROM t",
+		"WITH cte AS MATERIALIZED (SELECT a FROM t) SELECT * FROM cte",
+		"WITH cte AS NOT MATERIALIZED (SELECT a FROM t) SELECT * FROM cte",
+		"VALUES (1, 2)",
+		"VALUES (1, 'a'), (2, 'b')",
+		"VALUES (1) ORDER BY column1 DESC LIMIT 2",
+		"VALUES (1) UNION SELECT 2 ORDER BY 1 LIMIT 1",
+		"TABLE t",
+		"TABLE s.t",
 	}
 	for _, sql := range cases {
 		legacy, yacc, err := diffParse(sql)
