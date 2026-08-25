@@ -135,6 +135,13 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 
 ### Session 2026-08-26 (P2-F real flip + conflict hygiene)
 
+- [x] **USER DIRECTIVE — regress parity NOT a metric for now**: the pg-regress
+  clean baseline is 2/52 (varchar+comments) post-flip; measurement itself is
+  sound on fresh throwaway instances, but routing flipped the failure classes
+  from "engine gap" to "grammar coverage", so the number tracks wave progress,
+  not product health. Do NOT chase it; TPC-H spotcheck stays THE gate until
+  the DDL/utility waves land.
+
 - [x] **GATE ANCHOR BUG (critical)**: the conflict gate grepped y.output with
   `^[0-9]+:` but goyacc pads some state numbers with a leading space, so 3928
   of HEAD's 3929 conflicts were invisible. Root causes found and removed:
@@ -165,10 +172,12 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   ctor); ScalarSublinkExpr type deleted — analyzer/planner/executor already
   speak SubqueryExpr, so Q2/Q4/Q11/Q16/Q17/Q18 subquery forms execute live
   (verified: Q4 EXISTS=1062945, Q11 having-subquery rows, Q17, Q18 IN).
-- [ ] **Deferred**: interval 'N' <unit> qualified form (interval '90 day'
+- [x] **Deferred items landed 2026-08-26 evening**: interval 'N' <unit>
+  qualified form (interval '90 day'
   embedded form works; trailing-qualifier form is a syntax error in the yacc
   grammar); timestamp WITH/WITHOUT time zone literals; char(N) '...' literals;
-  count(*) FILTER.
+  count(*) FILTER — FILTER still open; arrays/subscripts/frames/Variadic
+  parity landed as P2.4b (commit b8c87689d).
 
 ## P2 — Expressions
 
@@ -203,6 +212,15 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   deferred to P2.4b.
 - [ ] **P2.5 type names**: Typename port incl. arrays, SETOF, intervals,
   character variants; flip ParseExpr to new parser; run plpgsql suite.
+  TRAP FOUND 2026-08-26: naive multi-word additions (::double precision,
+  ::timestamp with time zone) collide R/R with the ColId cast-target path
+  because every type word is ALSO a col_name/unreserved keyword. Upstream
+  escapes via a dedicated type_function_name keyword class that excludes
+  these tokens; porting that means introducing a restricted cast-target
+  identifier class (IDENT+unreserved only) plus explicit token alternatives
+  for int/integer/bigint/smallint/real/float/numeric/decimal/boolean/
+  interval/time/timestamp — enumerate FIRST, then add multi-word forms, or
+  the gate will (correctly) reject the grammar.
 
 ## P3 — DML writes
 
