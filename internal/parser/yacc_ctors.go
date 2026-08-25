@@ -164,3 +164,8 @@ func NewCastExpr(pos int, operand Expr, typ ObjectName, typmods []int64) *CastEx
 func NewCollateExpr(pos int, operand Expr, collation string) *CollateExpr {
 	return &CollateExpr{pos: pos, Operand: operand, CollationName: collation}
 }
+
+func NewWindowDef(pos int) *WindowDef { return &WindowDef{pos: pos} }
+func NewBareWindowRef(pos int, name string) *WindowDef {
+	return &WindowDef{pos: pos, RefName: name, IsBareRef: true}
+}
