@@ -16,6 +16,7 @@ Worktree: `.claude/waitevent-impl`. The upstream oracle lives at
 | [02-goopg-current-state.md](02-goopg-current-state.md) | Current goopg implementation, hot-path cost / GC analysis, existing probe inventory |
 | [03-design.md](03-design.md) | Detailed design: PG→goopg probe mapping, gap fixes, zero-allocation discipline |
 | [04-execution-plan.md](04-execution-plan.md) | Phased execution plan with gates and risks |
+| [05-results.md](05-results.md) | Observed distributions, live probe demonstrations, pprof correlation |
 | [TODO.md](TODO.md) | Work-plan checklist |
 
 ## Verdict up front
