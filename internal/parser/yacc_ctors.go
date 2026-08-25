@@ -160,3 +160,7 @@ func SetOrderBy(fc *FuncCall, ob []SortBy) *FuncCall { fc.OrderBy = ob; return f
 func NewCastExpr(pos int, operand Expr, typ ObjectName, typmods []int64) *CastExpr {
 	return &CastExpr{pos: pos, Operand: operand, Type: typ, Typmods: typmods}
 }
+
+func NewCollateExpr(pos int, operand Expr, collation string) *CollateExpr {
+	return &CollateExpr{pos: pos, Operand: operand, CollationName: collation}
+}

@@ -1208,6 +1208,10 @@ a_expr:
 	/* Generic operator terminal — gram.y `a_expr Op a_expr` (%left Op).
 	   Covers || << >> ~* !~ <@ @> && -> ->> #> #>> and any future
 	   multi-character spelling routed here by the adapter. */
+	| a_expr COLLATE ColId
+			{
+				$$ = parser.NewCollateExpr($1.Pos(), $1, $3)
+			}
 	| a_expr Op a_expr
 			{
 				$$ = parser.NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
