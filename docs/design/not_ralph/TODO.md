@@ -68,9 +68,13 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   4 S/R + 2930 R/R conflicts. Root cause: postfix-notation ambiguity between
   "reduce name_or_call" and "shift OVER" after qualified_name '(' args ')'.
   Upstream avoids this because their func_application/c_expr structure has
-  different LALR state topology. NEXT APPROACH: either (a) add OVER to the
-  precedence block at IDENT level, or (b) restructure c_expr to separate
-  func_application from column_ref paths like upstream.: WINDOW clause, OVER (partition/order/
+  different LALR state topology. RESOLVED: (a) adding OVER to %nonassoc precedence block works — zero conflicts.
+  ALSO DISCOVERED: adding name_or_call/scalar-sublink/CAST directly into c_expr
+  causes 3927 R/R because ColId-compatible tokens in expression position create
+  massive LALR ambiguity with statement-level dispatch. These constructs were
+  already reachable through existing paths (name_or_call was already in HEAD's
+  grammar at a different position). LESSON: never move productions between
+  nonterminals without full conflict analysis.: WINDOW clause, OVER (partition/order/
   frame specs). Flip SELECT core routing incl. '(' parenthesized queries.
 - [x] **P1.5 order/limit**: ORDER BY, LIMIT/OFFSET, FETCH FIRST, targeting
   (`SELECT ... FOR UPDATE` lock clauses).

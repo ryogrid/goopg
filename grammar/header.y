@@ -7,6 +7,7 @@
 package sqlparser
 
 import (
+
 	"github.com/goopg/goopg/internal/parser"
 )
 
