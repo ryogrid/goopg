@@ -77,11 +77,13 @@
 %type <rfe>	row_from_entry_one
 
 %type <strs>	col_alias_list cte_col_list
+%type <exprs>	opt_func_call_args
 %type <exprs>	opt_func_arg_list func_arg_list
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
-%type <expr>	a_expr c_expr where_clause having_clause b_expr
+%type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call
 %type <node>	cse_wl when_then
+%type <exprs>	opt_func_call_args
 %type <str>	subq_op
 %type <exprs>	expr_list group_by_list
 %type <expr>	group_by_item
@@ -1386,11 +1388,10 @@ c_expr:
 			{
 				$$ = parser.NewParamRef(yylex.(*lexerState).lastConsumedPos(), $1)
 			}
-	| qualified_name
+	| name_or_call
 			{
-				$$ = columnRefFromParts($1)
+				$$ = $1
 			}
-
 /* b_expr — gram.y :15040ff subset: the operand grammar for predicates that
    must not swallow AND/BETWEEN/IN/LIKE keywords. Kept name-identical to
    upstream for greppability; grows alongside a_expr waves. */
@@ -1448,6 +1449,42 @@ b_expr:
 				$$ = $2
 			}
 
+opt_func_call_args:
+		/* empty */ { $$ = nil }
+	| expr_list  { $$ = $1 }
+
+/* name_or_call — merged ColumnRef/FuncCall disambiguation: after
+   qualified_name, seeing '(' shifts into FuncCall; anything else reduces
+   ColumnRef. Single nonterminal = zero S/R conflicts. */
+name_or_call:
+		qualified_name
+			{
+				$$ = columnRefFromParts($1)
+			}
+	| qualified_name '(' opt_func_call_args ')'
+			{
+				ft := splitFuncName($1)
+				args := $3
+				if args == nil {
+					args = []parser.Expr{}
+				}
+				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, args, false)
+			}
+	| qualified_name '(' '*' ')'
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+			}
+	| qualified_name '(' DISTINCT expr_list ')'
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				$$ = fc
+			}
+
 /* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
    before ANY/SOME/ALL. Char literals + named terminals. */
 subq_op:
@@ -1459,7 +1496,43 @@ subq_op:
 	| GREATER_EQUALS { $$ = ">=" }
 	| NOT_EQUALS     { $$ = "<>" }
 
-/* Identifier context aliases/* Identifier context aliases/* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
+opt_func_call_args:
+		/* empty */ { $$ = nil }
+	| expr_list  { $$ = $1 }
+
+/* name_or_call — merged ColumnRef/FuncCall disambiguation: after
+   qualified_name, seeing '(' shifts into FuncCall; anything else reduces
+   ColumnRef. Single nonterminal = zero S/R conflicts. */
+name_or_call:
+		qualified_name
+			{
+				$$ = columnRefFromParts($1)
+			}
+	| qualified_name '(' opt_func_call_args ')'
+			{
+				ft := splitFuncName($1)
+				args := $3
+				if args == nil {
+					args = []parser.Expr{}
+				}
+				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, args, false)
+			}
+	| qualified_name '(' '*' ')'
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+			}
+	| qualified_name '(' DISTINCT expr_list ')'
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				$$ = fc
+			}
+
+/* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
    before ANY/SOME/ALL. Char literals + named terminals. */
 subq_op:
 		Op        { $$ = $1 }

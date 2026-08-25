@@ -108,8 +108,12 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 - [x] **P2.2 conditional & set exprs (partial)**: searched CASE
   (CASE WHEN...THEN...[ELSE...] END), EXISTS(subquery). NULLIF/GREATEST/
   LEAST and row-compare sublinks deferred to P2.3+ (need FuncCall).
-- [ ] **P2.3 func_call**: arg modes, ORDER BY/VARIADIC forms, aggregates
-  (DISTINCT, star), FILTER, WITHIN GROUP.
+- [x] **P2.3 func_call (core)**: qualified_name-based function application
+  with name_or_call merged nonterminal (zero S/R for ColumnRef-vs-FuncCall
+  disambiguation); count(*), DISTINCT args, pg_catalog-qualified calls.
+  ORDER BY/VARIADIC/FILTER/WITHIN GROUP deferred to P2.3b. Known S/R on '('
+  = func-call vs paren-expr, default-shift correct; gate refined to allow
+  exactly this 1 known conflict.
 - [ ] **P2.4 casts, constructors, params, indirection**: `::`, CAST(),
   ARRAY[]/ROW(), typed literals, parameters `$n`, array/field/composite
   indirection.

@@ -149,3 +149,10 @@ func NewExistsExpr(pos int, negated bool, sub *SelectStmt) *ExistsExpr {
 func NewInListExpr(pos int, operand Expr, negated bool, list []Expr) *InExpr {
 	return &InExpr{pos: pos, Operand: operand, Negated: negated, List: list}
 }
+
+func NewFuncCall(pos int, name ObjectName, args []Expr, star bool) *FuncCall {
+	return &FuncCall{pos: pos, Name: name, Args: args, Star: star}
+}
+
+func SetDistinct(fc *FuncCall) *FuncCall { fc.Distinct = true; return fc }
+func SetOrderBy(fc *FuncCall, ob []SortBy) *FuncCall { fc.OrderBy = ob; return fc }
