@@ -210,8 +210,14 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   Schema-qualified + typmod args deferred (qualified_name in cast target =
   2951 R/R). $n params already handled via PARAM token. ARRAY[]/ROW()
   deferred to P2.4b.
-- [ ] **P2.5 type names**: Typename port incl. arrays, SETOF, intervals,
-  character variants; flip ParseExpr to new parser; run plpgsql suite.
+- [~] **P2.5 type names (in progress)**: 2026-08-26 cast_target landed —
+  zero-conflict architecture per the trap note below (cast_ident enumerates
+  single-word types EXCLUDING multi-word starters; dedicated TIME/TIMESTAMP
+  [+tz], double precision, char/character/nchar [varying], bit [varying]
+  alternatives). Legacy parity details: float(p<=24)->float4 folding into the
+  NAME (typmod dropped), bare char stamps Typmods=[1] via typmodsFor helper,
+  bare nchar->"character". Remaining: schema-qualified targets, array-typmod
+  forms, SETOF, then flip ParseExpr + plpgsql suite.
   TRAP FOUND 2026-08-26: naive multi-word additions (::double precision,
   ::timestamp with time zone) collide R/R with the ColId cast-target path
   because every type word is ALSO a col_name/unreserved keyword. Upstream

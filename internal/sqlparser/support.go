@@ -477,6 +477,25 @@ func buildIntervalQualified(pos int, body, hi, lo string, prec int) parser.Expr 
 	return parser.NewIntervalLitQualified(pos, body, unit, hasPrec, prec)
 }
 
+// typmodsFor applies legacy's bare-type stamps at cast sites: bare "char"
+// carries the bpchar length-1 typmod (ddl.go M0134-0070 note); everything
+// else passes the grammar's typmods through untouched.
+func typmodsFor(name string, given []int64, _ int) []int64 {
+	if name == "char" && len(given) == 0 {
+		return []int64{1}
+	}
+	return given
+}
+
+// tzJoin appends the tz suffix for cast targets: "time"+"tz" -> "timetz",
+// "timestamp"+"" -> "timestamp" (legacy parseMultiWordTypeName parity).
+func tzJoin(base, mark string) string {
+	if mark == "tz" {
+		return base + "tz"
+	}
+	return base
+}
+
 // buildIntervalLit mirrors legacy tryTypedLiteral's embedded-string form
 // (`interval '<body>'`): parse the body into interval components at AST-build
 // time so the executor sees an IntervalLit datum, not text.

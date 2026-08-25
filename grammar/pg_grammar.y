@@ -85,6 +85,7 @@
 %type <node>	cse_wl when_then filter_clause within_group_clause
 %type <exprs>	opt_func_call_args
 %type <str>	subq_op extract_field
+%type <str>	cast_target opt_tzmark double_tail cast_ident character_word
 %type <exprs>	expr_list group_by_list
 %type <expr>	group_by_item
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
@@ -1396,17 +1397,33 @@ a_expr:
 				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, sub, nil)
 			}
 
-	| a_expr TYPECAST ColId
+	| a_expr TYPECAST cast_target
 			{
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, nil)
+				nm := $3
+				if nm == "float" {
+					nm = "float8"
+				}
+				tm := typmodsFor(nm, nil, 0)
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: nm}, tm)
 			}
-	| a_expr TYPECAST ColId '(' ICONST ')'
+	| a_expr TYPECAST cast_target '(' ICONST ')'
 			{
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, []int64{int64($5)})
+				nm := $3
+				tm := []int64{int64($5)}
+				if nm == "float" {
+					if $5 <= 24 {
+						nm, tm = "float4", nil // legacy folds the precision into the type name
+					} else {
+						nm, tm = "float8", nil
+					}
+				}
+				tm = typmodsFor(nm, tm, 1)
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: nm}, tm)
 			}
-	| a_expr TYPECAST ColId '(' ICONST ',' ICONST ')'
+	| a_expr TYPECAST cast_target '(' ICONST ',' ICONST ')'
 			{
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, []int64{int64($5), int64($7)})
+				tm := typmodsFor($3, []int64{int64($5), int64($7)}, 2)
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, tm)
 			}
 
 	/* Subscripts — gram.y :15040ff opt_slice_bound forms: base[i],
@@ -1634,7 +1651,7 @@ c_expr:
 			{
 				$$ = $1
 			}
-	| CAST '(' a_expr AS ColId ')'
+	| CAST '(' a_expr AS cast_target ')'
 			{
 				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Name: $5}, nil)
 			}
@@ -1943,3 +1960,65 @@ extract_field:
 	| HOUR_P           { $$ = "hour" }
 	| MINUTE_P         { $$ = "minute" }
 	| SECOND_P         { $$ = "second" }
+
+/* cast_target — P2.5 slice of gram.y Typename for cast positions (:: and CAST).
+   Zero-conflict architecture: tokens starting multi-word forms are EXCLUDED
+   from cast_ident so each input has exactly one derivation. Canonicalization
+   mirrors legacy parseMultiWordTypeName (ddl.go:5278). Schema-qualified and
+   array-typmod forms stay deferred (TODO P2.5). */
+cast_target:
+		cast_ident
+			{ $$ = $1 }
+	| DOUBLE_P double_tail
+			{ $$ = "float8" }
+	| character_word VARYING
+			{ $$ = "varchar" }
+	| NATIONAL character_word VARYING
+			{ $$ = "varchar" }
+	| character_word
+			{ $$ = lowerIdent($1) }
+	| NATIONAL character_word
+			{ $$ = "character" }
+	| BIT VARYING
+			{ $$ = "varbit" }
+	| BIT
+			{ $$ = "bit" }
+	| TIME opt_tzmark
+			{ $$ = tzJoin("time", $2) }
+	| TIMESTAMP opt_tzmark
+			{ $$ = tzJoin("timestamp", $2) }
+
+character_word:
+		CHARACTER  { $$ = "character" }
+	| CHAR_P      { $$ = "char" }
+	| NCHAR       { $$ = "character" } /* legacy: bare nchar aliases character */
+
+double_tail:
+		/* empty */ { $$ = "double" }
+	| PRECISION    { $$ = "precision" }
+
+opt_tzmark:
+		/* empty */             { $$ = "" }
+	| WITH_LA TIME ZONE       { $$ = "tz" }
+	| WITHOUT_LA TIME ZONE    { $$ = "" }
+
+/* cast_ident — single-word type names legal bare in cast position. Enumerates
+   col_name type tokens + unreserved ones legacy accepts; EXCLUDES every
+   starter of the multi-word alternatives above so lookahead never has two
+   derivations (the P2.5 trap documented in TODO). */
+cast_ident:
+		IDENT        { $$ = $1 }
+	| VARCHAR       { $$ = "varchar" }
+	| TEXT_P        { $$ = "text" }
+	| NAME_P        { $$ = "name" }
+	| BIGINT        { $$ = "bigint" }
+	| INT_P         { $$ = "int" }
+	| INTEGER       { $$ = "integer" }
+	| SMALLINT      { $$ = "smallint" }
+	| FLOAT_P       { $$ = "float" }
+	| REAL          { $$ = "real" }
+	| NUMERIC       { $$ = "numeric" }
+	| DECIMAL_P     { $$ = "decimal" }
+	| BOOLEAN_P     { $$ = "boolean" }
+	| INTERVAL      { $$ = "interval" }
+
