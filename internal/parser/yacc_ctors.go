@@ -95,3 +95,7 @@ func NewJoinExpr(pos int, jt JoinType, natural bool, right RangeVar, on Expr, us
 func NewTableFuncRef(pos int, name string, args []Expr, withOrdinality bool, rows []RowsFromEntry) *TableFuncRef {
 	return &TableFuncRef{pos: pos, Name: name, Args: args, WithOrdinality: withOrdinality, RowsFuncs: rows}
 }
+
+func NewSetOpClause(pos int, typ SetOpType, all bool, right *SelectStmt) *SetOpClause {
+	return &SetOpClause{pos: pos, Type: typ, All: all, Right: right}
+}

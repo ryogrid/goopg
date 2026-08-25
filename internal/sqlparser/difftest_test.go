@@ -163,6 +163,13 @@ func TestDifferentialSelectCore(t *testing.T) {
 		"SELECT a FROM t GROUP BY a HAVING a > 5",
 		"SELECT dept, sal FROM emp GROUP BY dept HAVING sal > 100 AND dept <> 0 ORDER BY dept LIMIT 4",
 		"SELECT DISTINCT ON (a, b) c FROM t ORDER BY a, b",
+		"SELECT a FROM t1 UNION SELECT b FROM t2",
+		"SELECT a FROM t1 UNION ALL SELECT b FROM t2",
+		"SELECT a FROM t1 INTERSECT SELECT b FROM t2",
+		"SELECT a FROM t1 EXCEPT ALL SELECT b FROM t2",
+		"SELECT 1 UNION SELECT 2 UNION SELECT 3",
+		"SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 ORDER BY 1 LIMIT 5",
+		"SELECT a FROM t WHERE x > 0 GROUP BY a HAVING a > 2 ORDER BY a LIMIT 3",
 	}
 	for _, sql := range cases {
 		legacy, yacc, err := diffParse(sql)
@@ -215,5 +222,3 @@ func TestKnownDiffSelectAll(t *testing.T) {
 		t.Fatal("legacy unexpectedly accepts SELECT ALL; update the known-diffs table")
 	}
 }
-
-

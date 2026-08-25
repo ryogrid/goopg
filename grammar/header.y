@@ -15,6 +15,7 @@ import (
 %union {
 	str    string           // IDENT / SCONST / keyword text / Op value ...
 	ival   int              // ICONST / PARAM numbers
+	b      bool             // set_quantifier ALL flag etc
 	p      int              // byte position threading (see select_pos helper)
 	stmt   parser.Stmt      // single-statement productions
 	stmts  []parser.Stmt    // statement lists (root)

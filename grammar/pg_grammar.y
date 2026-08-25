@@ -22,9 +22,12 @@
 %token LESS_EQUALS GREATER_EQUALS NOT_EQUALS
 %token NOT_LA NULLS_LA WITH_LA WITHOUT_LA FORMAT_LA
 
-/* Precedence: lowest to highest — VERBATIM port of gram.y :824-903 */
-%left		UNION EXCEPT
-%left		INTERSECT
+/* Precedence: lowest to highest — port of gram.y :824-903 WITH ONE DEVIATION:
+   the %left UNION/INTERSECT/EXCEPT entries are REMOVED because goopg's AST
+   is right-recursive single-slot (legacy parity) and set-op chaining is
+   expressed structurally (setop_tail), not via precedence. Everything else
+   is verbatim. */
+
 %left		OR
 %left		AND
 %right		NOT
@@ -52,8 +55,10 @@
 %left		JOIN CROSS LEFT FULL RIGHT INNER_P NATURAL
 
 %type <stmts>	root stmt_list
-%type <stmt>	stmt SelectStmt simple_select
-%type <p>	select_pos paren_pos
+%type <stmt>	stmt SelectStmt simple_select base_select
+%type <node>	opt_setop_tail setop_op
+%type <b>	set_quantifier
+%type <p>	select_pos
 %type <node>	opt_all_distinct
 %type <targets>	opt_target_list target_list
 %type <rt>	target_el
@@ -74,7 +79,7 @@
 %type <exprs>	expr_list group_by_list
 %type <expr>	group_by_item
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
-%type <sortbys>	opt_sort_clause sort_by_list
+%type <sortbys>	opt_sort_clause sort_by_list sort_clause
 %type <sortby>	SortBy
 %type <expr>	select_limit_value select_offset_value select_fetch_first_value
 %type <str>		first_or_next
@@ -118,11 +123,89 @@ stmt:
 
 /* SelectStmt — gram.y :12823 (P1.1 routes the parenthesised-select wrapper */
 /* through the same path later; TODO P1.6). */
+// SelectStmt — legacy recursive-descent shape: a base SELECT (with its own
+// optional sort/limit), then an optional right-recursive set-op tail whose
+// RHS is a FULL SelectStmt. Trailing ORDER BY/LIMIT/OFFSET therefore land
+// on the innermost RHS first; foldSetOps lifts them outward when that RHS
+// is not explicitly parenthesized (M0097-0024/M0097-0042).
 SelectStmt:
-		simple_select
+		base_select opt_setop_tail
 			{
-				$$ = $1
+				base, _ := $1.(*parser.SelectStmt)
+				tail := $2.(*setopChain)
+				$$ = foldSetOps(base, tail.pairs)
 			}
+
+// base_select — simple_select plus its trailing sort/limit (gram.y
+// select_clause sort_clause / select_limit combinations, subset).
+base_select:
+		simple_select opt_sort_clause opt_select_limit
+			{
+				m := $1.(*parser.SelectStmt)
+				m.OrderBy = $2
+				if sl, ok := $3.(*selectLimit); ok && sl != nil {
+					m.Limit = sl.count
+					m.Offset = sl.offset
+					m.WithTies = sl.withTies
+				}
+				$$ = m
+			}
+
+opt_setop_tail:
+		/* empty */
+			{
+				$$ = &setopChain{}
+			}
+	| setop_op SelectStmt
+			{
+				op := $1.(*opSpec)
+				rt, _ := $2.(*parser.SelectStmt)
+				$$ = &setopChain{pairs: []setopPair{{op: op, right: rt}}}
+			}
+
+setop_op:
+		UNION
+			{
+				$$ = &opSpec{typ: parser.SetOpUnion, pos: yylex.(*lexerState).lastConsumedPos()}
+			}
+	| UNION ALL
+			{
+				$$ = &opSpec{typ: parser.SetOpUnion, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
+			}
+	| UNION DISTINCT
+			{
+				$$ = &opSpec{typ: parser.SetOpUnion, pos: yylex.(*lexerState).lastConsumedPos()}
+			}
+	| INTERSECT
+			{
+				$$ = &opSpec{typ: parser.SetOpIntersect, pos: yylex.(*lexerState).lastConsumedPos()}
+			}
+	| INTERSECT ALL
+			{
+				$$ = &opSpec{typ: parser.SetOpIntersect, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
+			}
+	| EXCEPT
+			{
+				$$ = &opSpec{typ: parser.SetOpExcept, pos: yylex.(*lexerState).lastConsumedPos()}
+			}
+	| EXCEPT ALL
+			{
+				$$ = &opSpec{typ: parser.SetOpExcept, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
+			}
+
+// select_with_parens — gram.y :12828-12831. goopg addition: mark
+// Parenthesized=true (legacy parseParenthesisedSelectStmt stamps it;
+// planner stops flattening there, M0097-0042).
+// select_clause — gram.y :12922-12926.
+// select_no_parens — gram.y :12837-12920 subset (locking clauses arrive
+// with P6; with_clause with P1.7). Set-op alternatives resolve via the
+// UNION/INTERSECT/EXCEPT %left declarations exactly like upstream, and
+// makeSetOp builds legacy's single-SetOp-slot shape.
+// set_quantifier — gram.y :13459ff companion (empty = DISTINCT default).
+set_quantifier:
+		/* empty */ { $$ = false }
+	| ALL             { $$ = true }
+	| DISTINCT        { $$ = false }
 
 /* select_pos captures the SELECT token's byte position via the adapter's */
 /* prev-token tracking (goyacc has no @$; see 02 §5). */
@@ -132,19 +215,13 @@ select_pos:
 				$$ = yylex.(*lexerState).lastConsumedPos()
 			}
 
-// paren_pos captures the '(' byte offset for FROM paren groups.
-paren_pos:
-		/* empty */
-			{
-				$$ = yylex.(*lexerState).lastConsumedPos()
-			}
 
 /* simple_select — gram.y :12935, P1.1 subset: SELECT [ALL|DISTINCT] */
 /* targets [FROM ...] [WHERE ...]. into/group/having/window clauses arrive */
 /* with later P1 sub-phases (TODO P1.3); their absence here is what keeps */
 /* unrouted inputs failing cleanly toward the legacy parser. */
 simple_select:
-		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause group_clause having_clause opt_sort_clause opt_select_limit
+		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause group_clause having_clause
 			{
 				s := parser.NewSelectStmt($2)
 				if di, ok := $3.(*distinctInfo); ok && di != nil {
@@ -167,13 +244,10 @@ simple_select:
 					s.GroupBy = gc.list
 				}
 				s.Having = $8
-				s.OrderBy = $9
-				if sl, ok := $10.(*selectLimit); ok && sl != nil {
-					s.Limit = sl.count
-					s.Offset = sl.offset
-					s.WithTies = sl.withTies
-				}
 				$$ = s
+				// NOTE: ORDER BY / LIMIT / OFFSET live one level up, in
+				// select_no_parens (gram.y :12916 comment) — a set-op RHS
+				// must not swallow them.
 			}
 
 // opt_sort_clause / sort_by_list / SortBy — gram.y :13196-13220.
@@ -604,18 +678,22 @@ base_table_ref:
 				rv.Only = true
 				$$ = rv
 			}
-	| '(' paren_pos table_ref ')' opt_derived_alias
+	| '(' table_ref ')' opt_derived_alias
 			{
-				fe := $3
+				fe := $2
 				lateral := false
 				alias := ""
 				var cols []string
-				if da, ok2 := $5.(*derivedAlias); ok2 && da != nil {
+				if da, ok2 := $4.(*derivedAlias); ok2 && da != nil {
 					alias, cols = da.alias, da.cols
 					lateral = da.lateral
 				}
-				sub := syntheticParenSelect($2, fe)
-				$$ = derivedRangeVar(yylex.(*lexerState), $2, sub, alias, cols, lateral)
+				// Group-start position approximated by the base item's own
+				// position (legacy uses the '(' offset; a paren_pos mid-rule
+				// here created an unresolvable S/R against nested groups).
+				pos := fe.Base.Pos()
+				sub := syntheticParenSelect(pos, fe)
+				$$ = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
 			}
 	| '(' SelectStmt ')' opt_derived_alias
 			{
@@ -820,6 +898,13 @@ group_by_item:
 		a_expr
 			{
 				$$ = $1
+			}
+
+/* sort_clause — gram.y :13196 (mandatory ORDER BY variant). */
+sort_clause:
+		ORDER BY sort_by_list
+			{
+				$$ = $3
 			}
 
 /* having_clause — gram.y :13522. */

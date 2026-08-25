@@ -268,3 +268,58 @@ func splitFuncName(q qname) *funcTable {
 type groupClause struct {
 	list []parser.Expr
 }
+
+// setop machinery types live here so grammar actions stay tiny.
+type opSpec struct {
+	typ parser.SetOpType
+	all bool
+	pos int
+}
+
+type setopPair struct {
+	op    *opSpec
+	right *parser.SelectStmt
+}
+
+type setopChain struct {
+	pairs []setopPair
+}
+
+// foldSetOps nests the chain right-to-left onto each left select's single
+// SetOp slot, reproducing legacy's recursive parseSelect shape
+// (A U B U C => A{Right:B{Right:C}}), INCLUDING the trailer lift: an inner
+// RHS greedily takes its own ORDER BY/LIMIT/OFFSET (base_select), so each
+// fold lifts them out to the left when present there and the RHS is not
+// explicitly parenthesized (M0097-0024 / M0097-0042).
+func foldSetOps(base *parser.SelectStmt, pairs []setopPair) *parser.SelectStmt {
+	if len(pairs) == 0 {
+		return base
+	}
+	node := pairs[len(pairs)-1].right
+	for i := len(pairs) - 1; i >= 0; i-- {
+		pr := pairs[i]
+		if i < len(pairs)-1 {
+			node = pr.right
+		}
+		left := base
+		if i > 0 {
+			left = pr.right
+		}
+		left.SetOp = parser.NewSetOpClause(pr.op.pos, pr.op.typ, pr.op.all, node)
+		if right := node; right != nil && !right.Parenthesized {
+			if len(left.OrderBy) == 0 && len(right.OrderBy) != 0 {
+				left.OrderBy = right.OrderBy
+				right.OrderBy = nil
+			}
+			if left.Limit == nil && right.Limit != nil {
+				left.Limit = right.Limit
+				right.Limit = nil
+			}
+			if left.Offset == nil && right.Offset != nil {
+				left.Offset = right.Offset
+				right.Offset = nil
+			}
+		}
+	}
+	return base
+}

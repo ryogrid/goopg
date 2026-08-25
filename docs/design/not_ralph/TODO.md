@@ -63,7 +63,14 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   frame specs). Flip SELECT core routing incl. '(' parenthesized queries.
 - [x] **P1.5 order/limit**: ORDER BY, LIMIT/OFFSET, FETCH FIRST, targeting
   (`SELECT ... FOR UPDATE` lock clauses).
-- [ ] **P1.6 set operations**: UNION/INTERSECT/EXCEPT (+ALL), parens nesting.
+- [x] **P1.6 set operations**: UNION/INTERSECT/EXCEPT (+ALL/DISTINCT),
+  unbounded chains, trailing ORDER/LIMIT binding to the outermost node.
+  EXECUTION-NOTE: done before P1.4 — window OVER() needs FuncCall (P2.3),
+  while set-ops were self-contained on the current expression subset.
+  Shape note: goopg AST nests chains RIGHTWARD on the single SetOp slot
+  (legacy parity, dump-pinned) whereas upstream %left builds LEFT trees —
+  semantically equivalent for associative set ops; documented in
+  difftest_known_diffs.md.
 - [ ] **P1.7 CTEs**: WITH [RECURSIVE], materialization hints; TABLE/VALUES
   statement forms. Flip full SELECT family routing (WITH routes by follower
   keyword — SELECT only until P3).
