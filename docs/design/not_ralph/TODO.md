@@ -94,8 +94,15 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   from the test path — possibly the query goes through a DIFFERENT parse
   entry point (dispatchSimpleQueryViaExecutor vs parser.Parse), or the
   wire-protocol layer transforms the SQL before it reaches Parse.
-  NEXT: live-debug by connecting psql to a flipped goopg server and running
-  Q12 manually to capture the full stack trace.
+  LIVE-SERVER REPRO CONFIRMED: `SELECT date '1994-01-01'` fails with
+  "syntax error at or near 1994-01-01". Root cause precisely identified:
+  `date` is NOT in kwlist.h (not a keyword token) → arrives as IDENT
+  → ColId→qualified_name→ColumnRef, then SCONST follows unmatched.
+  FIX NEEDED: add typed-literal grammar rule for IDENT SCONST pattern
+  (date/time/timestamp/interval prefixes) OR handle in adapter by mapping
+  known type-name idents before SCONST to a dedicated terminal.
+  NOTE: differential test passes because BOTH parsers produce same AST
+  (both happen to succeed via different paths).
 
 ## P2 — Expressions
 
