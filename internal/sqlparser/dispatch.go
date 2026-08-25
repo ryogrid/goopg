@@ -172,3 +172,29 @@ func fragmentBase(parent, frag []parser.Token) int {
 func RouteBatch(toks []parser.Token) ([]parser.Stmt, bool, error) {
 	return routeBatch(toks)
 }
+
+// RouteExpr is the production wiring point for parser.RouteExprBatch: it
+// parses a bare expression by wrapping the token slice in a synthetic SELECT
+// target (prepended token carries Pos-7 so the real tokens keep their source
+// offsets — expression node positions stay byte-exact for plpgsql carets).
+// A wrapped parse that leaves residue outside Targets[0] maps to legacy's
+// trailing-tokens diagnostic.
+func RouteExpr(toks []parser.Token) (parser.Expr, bool, error) {
+	if len(toks) == 0 {
+		return nil, false, nil
+	}
+	prep := make([]parser.Token, 0, len(toks)+2)
+	prep = append(prep, parser.Token{Kind: parser.TokenKeyword, Value: "select", Pos: toks[0].Pos - 7})
+	prep = append(prep, toks...)
+	stmts, err := ParseOne(prep, 0)
+	if err != nil {
+		return nil, true, err
+	}
+	sel, ok := stmts[0].(*parser.SelectStmt)
+	if !ok || len(sel.Targets) != 1 || sel.From != nil || sel.Where != nil ||
+		len(sel.WindowClause) != 0 || sel.SetOp != nil || len(sel.ValuesRows) != 0 ||
+		len(sel.OrderBy) != 0 || sel.GroupBy != nil || sel.Having != nil {
+		return nil, true, &parser.SyntaxError{Message: "unexpected trailing tokens after expression"}
+	}
+	return sel.Targets[0].Expr, true, nil
+}

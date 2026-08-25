@@ -105,6 +105,16 @@ func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
 	p.tokens = toks
 	p.idx = 0
 
+	if RouteExprBatch != nil {
+		if e, handled, herr := RouteExprBatch(toks); handled {
+			tokenSlicePool.Put(sp)
+			if herr != nil {
+				return nil, herr
+			}
+			return e, nil
+		}
+	}
+
 	expr, err := p.parseExpr()
 	// Check trailing tokens BEFORE returning to pool.
 	var trailingErr error
@@ -142,6 +152,13 @@ func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
 // Wired by production startup code to sqlparser.RouteBatch; nil in tests and
 // by default, which keeps behavior identical to pre-rewrite Parse.
 var RouteBatch func(toks []Token) (stmts []Stmt, handled bool, err error)
+
+// RouteExprBatch is ParseExpr's counterpart of RouteBatch: when non-nil it
+// gets every expression token slice ParseExpr lexes and either owns it
+// (handled=true) or declines (handled=false → the legacy path below runs).
+// Wired alongside RouteBatch by postmaster; nil by default keeps ParseExpr
+// fully legacy.
+var RouteExprBatch func(toks []Token) (expr Expr, handled bool, err error)
 
 func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 	var sctx *mmgr.Context

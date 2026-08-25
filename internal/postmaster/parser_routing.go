@@ -17,4 +17,5 @@ import (
 
 func init() {
 	parser.RouteBatch = sqlparser.RouteBatch
+	parser.RouteExprBatch = sqlparser.RouteExpr
 }
