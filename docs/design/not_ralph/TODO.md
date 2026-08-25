@@ -85,8 +85,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   `routedStmts["select"]` passed units (44 pkgs) but TPC-H Q12 FAILed.
   Root cause: grammar gap in Q12's construct (needs investigation — likely
   a type name, interval, or operator form not yet ported). WITH follower
-  scan IS implemented and working (withFollowerRouted). Next: identify Q12
-  gap via differential test with the actual Q12 SQL, fix, re-attempt flip.
+  scan IS implemented and working (withFollowerRouted). Investigation update: Q12 parses correctly via ParseOne AND passes
+  differential corpus (date literals work). Issue is in the ROUTING
+  PIPELINE integration (parser.Parse→hook→routeBatch path), NOT grammar.
+  Next: debug routeBatch/SplitStatements/ParseOne flow with actual Q12.
 
 ## P2 — Expressions
 
@@ -100,8 +102,8 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   subq_op for comparison ops before quantifiers. `= ANY` maps to AnyOp=0
   (same as IN per InExpr contract); non-equality ops set AnyOp. Bitwise
   & | # ~ << >> deferred (single-char ASCII terminals need goyacc char-
-  literal investigation). Differential corpus +13 cases all legacy-identical
-  except ALL(subquery) AST shape divergence (known-diffs row).
+  literal investigation). Differential corpus +15 cases (incl. date literals) all
+  legacy-identical except ALL(subquery) AST shape divergence.
   LESSON RETAINED: gen-parser rc MUST be 0 at commit time; %prec SIMILAR /
   %prec NOT_LA annotations required on SIMILAR TO rules (without them 48
   S/R conflicts appear because rule-precedence defaults to last-terminal-
