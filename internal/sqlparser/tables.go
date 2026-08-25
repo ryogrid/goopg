@@ -38,24 +38,21 @@ var keywordByText = func() map[string]keywordDef {
 }()
 
 var (
-	nameToNum       = make(map[string]int, len(yyToknames))
+	nameToNum       = make(map[string]int, len(genTokenNums))
 	keywordTokenNum = make(map[string]int, len(keywordDefs))
 
 	// unresolved records terminal names referenced by our tables but absent
 	// from the generated grammar — must stay empty (asserted by tests).
 	unresolved []string
 
-	yyUnkCode = 3 // "$unk" in yyToknames; asserted at init below
+	yyUnkCode = 3 // "$unk" printing index; asserted at init below
 )
 
 func init() {
-	if len(yyToknames) < 3 || yyToknames[0] != "$end" || yyToknames[2] != "$unk" {
-		panic("sqlparser: generated parser layout unexpected (yyToknames head)")
-	}
-	for num, name := range yyToknames {
-		num++ // yyToknames[c-1] is token number c
+	for name, num := range genTokenNums {
 		nameToNum[name] = num
 	}
+	delete(nameToNum, "yyEofCode")
 	for _, d := range keywordDefs {
 		if num, ok := nameToNum[d.Token]; ok {
 			keywordTokenNum[d.Token] = num

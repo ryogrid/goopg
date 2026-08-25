@@ -204,12 +204,13 @@ GOYACC := go run golang.org/x/tools/cmd/goyacc
 
 .PHONY: gen-parser
 gen-parser:
-	go run ./cmd/gen-kwlist-go -tokens-out grammar/tokens_gen.y
+	go run ./cmd/gen-kwlist-go -tokens-out grammar/tokens_gen.y -kwlists-out grammar/kwlists_gen.y
 	mkdir -p tmp
-	cat grammar/header.y grammar/tokens_gen.y grammar/pg_grammar.y grammar/goopg_ext.y > tmp/goopg_grammar.y
+	cat grammar/header.y grammar/tokens_gen.y grammar/pg_grammar.y grammar/kwlists_gen.y grammar/goopg_ext.y > tmp/goopg_grammar.y
 	printf '\n%%%%\n' >> tmp/goopg_grammar.y
 	cd internal/sqlparser && $(GOYACC) -o yacc_parser.go -v y.output ../../tmp/goopg_grammar.y 2> yacc_stderr.txt \
 		|| { cat yacc_stderr.txt; exit 1; }
+	go run ./cmd/gen-tokennums-go
 	if grep -q 'conflicts:' internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output 2>/dev/null; then \
 		echo 'ERROR: grammar conflicts — upstream is %expect 0; restructure, never resolve silently'; exit 1; fi
 	rm -f internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output

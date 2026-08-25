@@ -62,15 +62,18 @@ func TestRouteBatchWholeBatchOrLegacy(t *testing.T) {
 	defer delete(routedStmts, "select")
 	routedStmts["select"] = true
 
-	// Both fragments routed → batch routes; the skeleton grammar then errors
-	// on real SQL (expected at P0 — proves the new parser owns it).
+	// Both fragments routed → batch routes to the new parser (since P1.1,
+	// SELECT core parses, so this is a full success path).
 	toks, _ := parser.Lex("SELECT 1; SELECT 2;")
-	_, handled, err := routeBatch(toks)
+	stmts, handled, err := routeBatch(toks)
 	if !handled {
 		t.Fatal("all-routed batch declined")
 	}
-	if err == nil {
-		t.Fatal("all-routed batch should hit skeleton's syntax error")
+	if err != nil {
+		t.Fatalf("all-routed batch: %v", err)
+	}
+	if len(stmts) != 2 {
+		t.Fatalf("all-routed batch produced %d statements, want 2", len(stmts))
 	}
 
 	// Mixed batch → declines wholesale.

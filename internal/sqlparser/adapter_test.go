@@ -40,22 +40,22 @@ func TestParseOneEmptyInput(t *testing.T) {
 	}
 }
 
-// TestParseOneGarbageErrors pins the error contract on a statement the
-// skeleton does not support yet: *parser.SyntaxError, PG-style wording, and
-// absolute byte position preserved.
+// TestParseOneGarbageErrors pins the error contract on a statement class
+// not yet ported (INSERT arrives in P3): *parser.SyntaxError, PG-style
+// wording, and absolute byte position preserved.
 //
 // Known divergence (ledgered for the P2 lexer-conformance fixtures): the
 // legacy lexer lowercases keyword text in Token.Value, so the echoed token
 // reads "select" where scan.c would echo the raw source spelling "SELECT".
 // The adapter will recover raw source slices when statements carry them.
 func TestParseOneGarbageErrors(t *testing.T) {
-	toks, err := parser.Lex("SELECT")
+	toks, err := parser.Lex("INSERT INTO t VALUES (1)")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, perr := ParseOne(toks, 0)
 	if perr == nil {
-		t.Fatal("SELECT: want syntax error from skeleton grammar, got none")
+		t.Fatal("INSERT: want syntax error (not yet ported), got none")
 	}
 	se, ok := perr.(*parser.SyntaxError)
 	if !ok {
@@ -64,7 +64,7 @@ func TestParseOneGarbageErrors(t *testing.T) {
 	if se.Pos != 0 {
 		t.Errorf("Pos = %d, want 0", se.Pos)
 	}
-	if want := `syntax error at or near "select"`; se.Error() != want {
+	if want := `syntax error at or near "insert"`; se.Error() != want {
 		t.Errorf("message = %q, want %q", se.Error(), want)
 	}
 }

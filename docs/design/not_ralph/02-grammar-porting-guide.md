@@ -78,6 +78,7 @@ Terminal typing follows gram.y exactly (`%token <str> IDENT FCONST SCONST
 | `@1` / `@$` | **goyacc has no built-in location tracking and no `@$`** — positions ride in the union (`pos int` fields). Rules with default actions inherit `$1`'s pos naturally; rules WITH explicit actions must seed `pos` themselves (typically from the first meaningful member, e.g. `$$.pos = $2.pos`) — mirror what upstream's `@n` reads actually consume |
 | `parser_errposition(@n)` inside actions | not needed — positions ride on nodes; error paths use the shim (01-architecture §6) |
 | C convenience calls (`makeString`, `makeIntConst`, ...) | tiny helpers in `support.go`, named identically (`makeString(v)`) so actions stay diffable against upstream text |
+| `makeNode(X)` (sets unexported pos) | `parser.NewX(pos, ...)` constructors in `internal/parser/yacc_ctors.go` — the sanctioned seam for seeding unexported position fields from the grammar package |
 
 Style rules:
 

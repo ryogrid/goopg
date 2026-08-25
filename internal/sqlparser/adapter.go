@@ -39,11 +39,17 @@ type lexerState struct {
 
 	lastText string // original-case source text, for error wording
 	lastPos  int    // absolute Pos of last returned token
+	prevPos  int    // absolute Pos of the token before that (mid-rule pos capture)
 
 	// base_yylex one-token pushback (base_yylex.go)
 	pushed  bool
 	pushedR lexResult
 }
+
+// lastConsumedPos is the byte offset of the most recently CONSUMED-but-one
+// token — used by grammar mid-rule helpers like select_pos, which run right
+// after the keyword whose position they need.
+func (l *lexerState) lastConsumedPos() int { return l.prevPos }
 
 // lexResult is one mapped terminal plus its semantic values and position.
 type lexResult struct {
@@ -90,12 +96,13 @@ func eofPos(toks []parser.Token) int {
 // (base_yylex.go) on top of the raw token mapping.
 func (l *lexerState) Lex(lval *yySymType) int {
 	res := l.next()
+	l.prevPos = l.lastPos
 	lval.str = res.str
 	lval.ival = res.ival
-	lval.pos = res.pos
+	lval.p = res.pos
 	l.lastText = res.text
 	l.lastPos = res.pos
-	if res.term == 0 || res.term == yyErrCode {
+	if res.term <= 0 {
 		l.lastText = ""
 	}
 	return res.term
@@ -167,6 +174,12 @@ func (l *lexerState) mapToken(i int) lexResult {
 	case parser.TokenOperator:
 		if name, ok := namedOperator[t.Value]; ok {
 			return lexResult{term: resolve(name), str: t.Value, pos: t.Pos, text: t.Value}
+		}
+		if len(t.Value) == 1 {
+			// scan.l's {self} set: single-char operators are char-literal
+			// terminals upstream — ASCII code per the yylex1 contract
+			// (tables.go). The legacy lexer emits them as TokenOperator.
+			return lexResult{term: int(t.Value[0]), str: t.Value, pos: t.Pos, text: t.Value}
 		}
 		return lexResult{term: resolve("Op"), str: t.Value, pos: t.Pos, text: t.Value}
 	case parser.TokenSymbol:

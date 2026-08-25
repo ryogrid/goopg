@@ -45,7 +45,7 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 
 ## P1 — SELECT family
 
-- [ ] **P1.1 select core**: simple_select_no_parens basics — targets, FROM
+- [x] **P1.1 select core**: simple_select_no_parens basics — targets, FROM
   one relation, WHERE. Differential harness lands here (difftest corpus
   extractor).
 - [ ] **P1.2 FROM clause**: joins (inner/left/right/full/cross/natural),
