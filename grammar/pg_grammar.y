@@ -81,10 +81,8 @@
 %type <exprs>	opt_func_arg_list func_arg_list
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
-%type <expr>	a_expr c_expr where_clause having_clause
+%type <expr>	a_expr c_expr where_clause having_clause b_expr
 %type <exprs>	expr_list group_by_list
-%type <vrows>	VALUES_rows_tail
-%type <exprs>	VALUES_row
 %type <expr>	group_by_item
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
 %type <sortbys>	opt_sort_clause sort_by_list sort_clause
@@ -178,45 +176,6 @@ base_select:
 				}
 				$$ = m
 			}
-	| VALUES VALUES_row VALUES_rows_tail opt_sort_clause opt_select_limit
-			{
-				rows := append([][]parser.Expr{$2}, $3...)
-				m := newValuesSelect(0, rows)
-				if sl, ok := $5.(*selectLimit); ok && sl != nil {
-					m.Limit = sl.count
-					m.Offset = sl.offset
-					m.WithTies = sl.withTies
-				}
-				m.OrderBy = $4
-				$$ = m
-			}
-	| TABLE qualified_name opt_sort_clause opt_select_limit
-			{
-				s := tableSelect(0, $2)
-				s.OrderBy = $3
-				if sl, ok := $4.(*selectLimit); ok && sl != nil {
-					s.Limit = sl.count
-					s.Offset = sl.offset
-					s.WithTies = sl.withTies
-				}
-				$$ = s
-			}
-
-VALUES_row:
-		'(' expr_list ')'
-			{
-				$$ = $2
-			}
-
-VALUES_rows_tail:
-		/* empty */
-			{ $$ = nil }
-	| VALUES_rows_tail ',' VALUES_row
-			{
-				$$ = append($1, $3)
-			}
-
-
 setop_tail:
 		/* empty */
 			{
@@ -1150,6 +1109,76 @@ a_expr:
 			{
 				$$ = $2
 			}
+	/* IS [NOT] NULL / TRUE / FALSE / UNKNOWN / DISTINCT FROM — gram.y
+	   :15160ff IS NULL_P etc; DISTINCT FROM uses %prec IS like upstream.
+	   Positions ride on the LEFT operand (content dumps strip them). */
+	| a_expr IS NULL_P
+			{
+				$$ = parser.NewIsNullExpr($1.Pos(), $1, false)
+			}
+	| a_expr IS NOT NULL_P
+			{
+				$$ = parser.NewIsNullExpr($1.Pos(), $1, true)
+			}
+	| a_expr IS TRUE_P
+			{
+				$$ = parser.NewIsBoolExpr($1.Pos(), $1, true, false, false)
+			}
+	| a_expr IS NOT TRUE_P
+			{
+				$$ = parser.NewIsBoolExpr($1.Pos(), $1, true, false, true)
+			}
+	| a_expr IS FALSE_P
+			{
+				$$ = parser.NewIsBoolExpr($1.Pos(), $1, false, true, false)
+			}
+	| a_expr IS NOT FALSE_P
+			{
+				$$ = parser.NewIsBoolExpr($1.Pos(), $1, false, true, true)
+			}
+	| a_expr IS UNKNOWN
+			{
+				$$ = parser.NewIsBoolExpr($1.Pos(), $1, false, false, false)
+			}
+	| a_expr IS NOT UNKNOWN
+			{
+				$$ = parser.NewIsBoolExpr($1.Pos(), $1, false, false, true)
+			}
+	| a_expr IS DISTINCT FROM b_expr %prec IS
+			{
+				$$ = parser.NewIsDistinctFromExpr($1.Pos(), $1, $5, false)
+			}
+	| a_expr IS NOT DISTINCT FROM b_expr %prec IS
+			{
+				$$ = parser.NewIsDistinctFromExpr($1.Pos(), $1, $6, true)
+			}
+	/* Postfix spellings — gram.y :15200 ISNULL / NOTNULL. */
+	| a_expr ISNULL
+			{
+				$$ = parser.NewIsNullExpr($1.Pos(), $1, false)
+			}
+	| a_expr NOTNULL
+			{
+				$$ = parser.NewIsNullExpr($1.Pos(), $1, true)
+			}
+	/* [NOT] BETWEEN [SYMMETRIC] — gram.y :15190ff with b_expr operands;
+	   desugars via buildBetween (legacy parseBetweenTail parity). */
+	| a_expr BETWEEN b_expr AND b_expr %prec BETWEEN
+			{
+				$$ = buildBetween($1, $3, $5, false, false)
+			}
+	| a_expr BETWEEN SYMMETRIC b_expr AND b_expr %prec BETWEEN
+			{
+				$$ = buildBetween($1, $4, $6, false, true)
+			}
+	| a_expr NOT_LA BETWEEN b_expr AND b_expr %prec BETWEEN
+			{
+				$$ = buildBetween($1, $4, $6, true, false)
+			}
+	| a_expr NOT_LA BETWEEN SYMMETRIC b_expr AND b_expr %prec BETWEEN
+			{
+				$$ = buildBetween($1, $5, $7, true, true)
+			}
 
 /* c_expr — gram.y :15640ff, P1.1 subset: literals, parameters, column refs. */
 c_expr:
@@ -1187,7 +1216,64 @@ c_expr:
 				$$ = columnRefFromParts($1)
 			}
 
-/* Identifier context aliases — gram.y :17632-17720. Generated lists come */
+/* b_expr — gram.y :15040ff subset: the operand grammar for predicates that
+   must not swallow AND/BETWEEN/IN/LIKE keywords. Kept name-identical to
+   upstream for greppability; grows alongside a_expr waves. */
+b_expr:
+		c_expr
+			{
+				$$ = $1
+			}
+	| b_expr '+' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpAdd, $1, $3)
+			}
+	| b_expr '-' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpSub, $1, $3)
+			}
+	| b_expr '*' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpMul, $1, $3)
+			}
+	| b_expr '/' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpDiv, $1, $3)
+			}
+	| b_expr '%' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpMod, $1, $3)
+			}
+	| b_expr '<' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLt, $1, $3)
+			}
+	| b_expr '>' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpGt, $1, $3)
+			}
+	| b_expr '=' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpEq, $1, $3)
+			}
+	| b_expr LESS_EQUALS b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLe, $1, $3)
+			}
+	| b_expr GREATER_EQUALS b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpGe, $1, $3)
+			}
+	| b_expr NOT_EQUALS b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNe, $1, $3)
+			}
+	| '(' b_expr ')'
+			{
+				$$ = $2
+			}
+
+/* Identifier context aliases/* Identifier context aliases — gram.y :17632-17720. Generated lists come */
 /* from kwlists_gen.y. */
 ColId:
 		IDENT

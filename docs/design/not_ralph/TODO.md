@@ -75,6 +75,12 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   NOT MATERIALIZED markers; TABLE/VALUES statement forms (VALUES gets the
   full base_select sort/limit/set-op tail). Grammar landed; routing NOT
   flipped yet (see P2-F).
+- [ ] **P1.7a VALUES/TABLE statement forms**: requires upstream's clause-
+  level split (sort/limit ONLY at select_no_parens; VALUES/TABLE inside
+  simple_select without trailing clauses) — attaching them to a base_select
+  wrapper that carries its own opt_sort/opt_select_limit produced S/R
+  against WITH RECURSIVE and '(' contexts. Port together with the P2-F
+  structural cleanup.
 - [ ] **P2-F SELECT-family FLIP** (moved from P1.4/P1.7 — preconditions
   grew): requires P1.4 window OVER() AND P2 expressions (FuncCall/casts/
   sublinks) so routed SELECTs cannot regress on real queries. Flip
@@ -83,9 +89,13 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 
 ## P2 — Expressions
 
-- [ ] **P2.1 operator expressions**: a_expr operators w/ full precedence,
-  IS/ISNULL, BETWEEN, IN, LIKE/ILIKE/SIMILAR family, ANY/ALL/SOME, quantified
-  comparisons.
+- [x] **P2.1a IS family + BETWEEN**: IS [NOT] NULL / TRUE / FALSE / UNKNOWN /
+  [NOT] DISTINCT FROM, postfix ISNULL/NOTNULL (gram.y :15160ff/:15200),
+  [NOT] BETWEEN [SYMMETRIC] with b_expr operands and parseBetweenTail-parity
+  desugaring (buildBetween). Differential corpus +13 cases.
+- [ ] **P2.1b predicates & operators**: IN (list|subquery), op ANY/SOME/ALL,
+  LIKE/ILIKE/ESCAPE, SIMILAR TO (+buildSimilarTo constant-folding port),
+  || concat, bitwise & | # ~ << >>, ^ pow.
 - [ ] **P2.2 conditional & set exprs**: CASE, NULLIF/GREATEST/LEAST,
   sublinks (EXISTS/IN/row compares).
 - [ ] **P2.3 func_call**: arg modes, ORDER BY/VARIADIC forms, aggregates

@@ -107,3 +107,15 @@ func NewWithClause(pos int, recursive bool, ctes []*CommonTableExpr) *WithClause
 func NewCommonTableExpr(pos int, name string, cols []string, query *SelectStmt) *CommonTableExpr {
 	return &CommonTableExpr{pos: pos, Name: name, Columns: cols, Query: query}
 }
+
+func NewIsNullExpr(pos int, operand Expr, negated bool) *IsNullExpr {
+	return &IsNullExpr{pos: pos, Operand: operand, Negated: negated}
+}
+
+func NewIsBoolExpr(pos int, operand Expr, testTrue, testFalse, negated bool) *IsBoolExpr {
+	return &IsBoolExpr{pos: pos, Operand: operand, TestTrue: testTrue, TestFalse: testFalse, Negated: negated}
+}
+
+func NewIsDistinctFromExpr(pos int, left, right Expr, negated bool) *IsDistinctFromExpr {
+	return &IsDistinctFromExpr{pos: pos, Left: left, Right: right, Negated: negated}
+}

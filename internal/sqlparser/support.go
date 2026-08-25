@@ -324,13 +324,6 @@ func foldSetOps(base *parser.SelectStmt, pairs []setopPair) *parser.SelectStmt {
 	return base
 }
 
-// newValuesSelect builds the VALUES statement form (legacy parseValuesSelect,
-// select.go:41-70): SelectStmt{ValuesRows} with no Targets.
-func newValuesSelect(pos int, rows [][]parser.Expr) *parser.SelectStmt {
-	s := parser.NewSelectStmt(pos)
-	s.ValuesRows = rows
-	return s
-}
 
 // tableSelect builds the TABLE t shorthand (legacy :144-158): SELECT * FROM t.
 func tableSelect(pos int, q qname) *parser.SelectStmt {
@@ -353,3 +346,36 @@ func tableSelect(pos int, q qname) *parser.SelectStmt {
 
 // cteItem carries a built CTE through a node-typed union field.
 type cteItem struct{ cte *parser.CommonTableExpr }
+
+// buildBetween desugars `[NOT] BETWEEN [SYMMETRIC] low AND high` exactly
+// like parseBetweenTail (select.go:4134-4160):
+//
+//	x >= low AND x <= high
+//	SYMMETRIC: (x>=low AND x<=high) OR (x>=high AND x<=low)
+//	NOT: NOT(<the above>)
+func buildBetween(left parser.Expr, low, high parser.Expr, negated, symmetric bool) parser.Expr {
+	pos := left.Pos()
+	ge := func(a, b parser.Expr) parser.Expr {
+		return parser.NewBinaryOp(pos, parser.OpGe, a, b)
+	}
+	le := func(a, b parser.Expr) parser.Expr {
+		return parser.NewBinaryOp(pos, parser.OpLe, a, b)
+	}
+	and := func(a, b parser.Expr) parser.Expr {
+		return parser.NewBinaryOp(pos, parser.OpAnd, a, b)
+	}
+	or := func(a, b parser.Expr) parser.Expr {
+		return parser.NewBinaryOp(pos, parser.OpOr, a, b)
+	}
+
+	var tree parser.Expr
+	if symmetric {
+		tree = or(and(ge(left, low), le(left, high)), and(ge(left, high), le(left, low)))
+	} else {
+		tree = and(ge(left, low), le(left, high))
+	}
+	if negated {
+		return parser.NewUnaryOp(pos, parser.OpNot, tree)
+	}
+	return tree
+}
