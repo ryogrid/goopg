@@ -37,7 +37,7 @@
 %nonassoc	ESCAPE			/* ESCAPE must be just above LIKE/ILIKE/SIMILAR */
 %nonassoc	UNBOUNDED NESTED /* ideally would have same precedence as IDENT */
 %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
-			SET KEYS OBJECT_P SCALAR VALUE_P WITH WITHOUT PATH
+			SET KEYS OBJECT_P SCALAR VALUE_P WITH WITHOUT PATH OVER
 %left		Op OPERATOR		/* multi-character ops and user-defined operators */
 %left		'+' '-'
 %left		'*' '/' '%'
@@ -1507,6 +1507,37 @@ name_or_call:
 				_ = ft
 				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
+				$$ = fc
+			}
+	| qualified_name '(' opt_func_call_args ')' OVER '(' ')'
+			{
+				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
+				fc.Over = parser.NewWindowDef(0)
+				$$ = fc
+			}
+	| qualified_name '(' opt_func_call_args ')' OVER '(' PARTITION BY expr_list ')'
+			{
+				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
+				wd := parser.NewWindowDef(0)
+				wd.PartitionBy = $9
+				fc.Over = wd
+				$$ = fc
+			}
+	| qualified_name '(' opt_func_call_args ')' OVER '(' ORDER BY sort_by_list ')'
+			{
+				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
+				wd := parser.NewWindowDef(0)
+				wd.OrderBy = $9
+				fc.Over = wd
+				$$ = fc
+			}
+	| qualified_name '(' opt_func_call_args ')' OVER '(' PARTITION BY expr_list ORDER BY sort_by_list ')'
+			{
+				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
+				wd := parser.NewWindowDef(0)
+				wd.PartitionBy = $9
+				wd.OrderBy = $12
+				fc.Over = wd
 				$$ = fc
 			}
 	| qualified_name '(' opt_func_call_args ')' filter_clause
