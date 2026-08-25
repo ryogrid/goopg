@@ -105,9 +105,9 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   %prec NOT_LA annotations required on SIMILAR TO rules (without them 48
   S/R conflicts appear because rule-precedence defaults to last-terminal-
   nonterminal = none).
-- [x] **P2.2 conditional & set exprs (partial)**: searched CASE
-  (CASE WHEN...THEN...[ELSE...] END), EXISTS(subquery). NULLIF/GREATEST/
-  LEAST and row-compare sublinks deferred to P2.3+ (need FuncCall).
+- [x] **P2.2 conditional & set exprs**: searched CASE, EXISTS(subquery),
+  NULLIF/GREATEST/LEAST (COL_NAME_KEYWORDs already route through generic
+  FuncCall). Row-compare sublinks deferred to P3.
 - [x] **P2.3 func_call (core)**: qualified_name-based function application
   with name_or_call merged nonterminal (zero S/R for ColumnRef-vs-FuncCall
   disambiguation); count(*), DISTINCT args, pg_catalog-qualified calls.
