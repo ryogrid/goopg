@@ -59,7 +59,13 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   `ROWS FROM(...)` WITH ORDINALITY (legacy TableFuncRef/parseRowsFrom).
 - [x] **P1.3 grouping & distinct**: GROUP BY, HAVING, DISTINCT ON (legacy
   quirk mirrored: ON form leaves Distinct=false; dump-pinned).
-- [ ] **P1.4 window functions**: WINDOW clause, OVER (partition/order/
+- [ ] **P1.4 window functions (OVER clause)**: FuncCall infrastructure ready
+  (fc.Over field exists). Grammar needs: OVER '(' [PARTITION BY exprs]
+  [ORDER BY sortlist] ')' and OVER ColId bare-ref forms. CAREFUL: element
+  numbering in multi-keyword rules is error-prone ($N counts ALL terminals
+  including keywords like PARTITION/BY/ORDER). Recommend: separate
+  over_clause nonterminal returning *WindowDef, referenced from
+  name_or_call. Frame clause (ROWS BETWEEN etc) deferred.: WINDOW clause, OVER (partition/order/
   frame specs). Flip SELECT core routing incl. '(' parenthesized queries.
 - [x] **P1.5 order/limit**: ORDER BY, LIMIT/OFFSET, FETCH FIRST, targeting
   (`SELECT ... FOR UPDATE` lock clauses).
