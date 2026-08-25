@@ -1401,6 +1401,10 @@ c_expr:
 			{
 				$$ = $1
 			}
+	| CAST '(' a_expr AS ColId ')'
+			{
+				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Name: $5}, nil)
+			}
 /* b_expr — gram.y :15040ff subset: the operand grammar for predicates that
    must not swallow AND/BETWEEN/IN/LIKE keywords. Kept name-identical to
    upstream for greppability; grows alongside a_expr waves. */
