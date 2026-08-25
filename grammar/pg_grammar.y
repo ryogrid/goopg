@@ -84,7 +84,7 @@
 %type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call
 %type <node>	cse_wl when_then filter_clause within_group_clause
 %type <exprs>	opt_func_call_args
-%type <str>	subq_op
+%type <str>	subq_op extract_field
 %type <exprs>	expr_list group_by_list
 %type <expr>	group_by_item
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
@@ -93,6 +93,9 @@
 %type <expr>	select_limit_value select_offset_value select_fetch_first_value
 %type <str>		first_or_next
 %type <str>	ColId ColLabel BareColLabel first_or_next opt_alias_ident
+%type <wd>	opt_window_spec
+%type <nwd>	window_definition
+%type <nwds>	opt_window_clause window_definition_list
 %type <node>	row_or_rows_opt row_or_rows
 
 %%
@@ -249,7 +252,7 @@ select_pos:
 /* with later P1 sub-phases (TODO P1.3); their absence here is what keeps */
 /* unrouted inputs failing cleanly toward the legacy parser. */
 simple_select:
-		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause group_clause having_clause
+		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause group_clause having_clause opt_window_clause
 			{
 				s := parser.NewSelectStmt($2)
 				if di, ok := $3.(*distinctInfo); ok && di != nil {
@@ -272,6 +275,9 @@ simple_select:
 					s.GroupBy = gc.list
 				}
 				s.Having = $8
+				if len($9) > 0 {
+					s.WindowClause = $9
+				}
 				$$ = s
 				// NOTE: ORDER BY / LIMIT / OFFSET live one level up, in
 				// select_no_parens (gram.y :12916 comment) — a set-op RHS
@@ -1007,6 +1013,60 @@ having_clause:
 				$$ = $2
 			}
 
+/* opt_window_clause / window_definition — gram.y :13470ff subset. Flat
+   alternatives mirror the inline-OVER variants in name_or_call; frame
+   clauses (ROWS/RANGE ...) arrive with a later wave. */
+opt_window_clause:
+		/* empty */
+			{
+				$$ = nil
+			}
+	| WINDOW window_definition_list
+			{
+				$$ = $2
+			}
+
+window_definition_list:
+		window_definition
+			{
+				$$ = []parser.NamedWindowDef{$1}
+			}
+	| window_definition_list ',' window_definition
+			{
+				$$ = append($1, $3)
+			}
+
+window_definition:
+		ColId AS '(' opt_window_spec ')'
+			{
+				$$ = parser.NamedWindowDef{Name: $1, Def: $4}
+			}
+
+opt_window_spec:
+		/* empty */
+			{
+				$$ = parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+			}
+	| PARTITION BY expr_list
+			{
+				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				wd.PartitionBy = $3
+				$$ = wd
+			}
+	| ORDER BY sort_by_list
+			{
+				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				wd.OrderBy = $3
+				$$ = wd
+			}
+	| PARTITION BY expr_list ORDER BY sort_by_list
+			{
+				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				wd.PartitionBy = $3
+				wd.OrderBy = $6
+				$$ = wd
+			}
+
 /* CASE WHEN ... THEN ... [ELSE ...] END — gram.y :15464 case_expr subset.
    The simple form (CASE operand WHEN val THEN ...) is deferred until
    P2.3 func_call lands; searched form covers TPC-H Q12/Q13. */cse_wl:
@@ -1274,10 +1334,6 @@ a_expr:
 			{
 				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, []int64{int64($5), int64($7)})
 			}
-	| a_expr TYPECAST ColId
-			{
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, nil)
-			}
 
 	/* [NOT] SIMILAR TO [+ ESCAPE] — gram.y :15080-15115; constant folding
 	   via buildSimilarTo (legacy buildSimilarTo parity). */
@@ -1413,6 +1469,10 @@ c_expr:
 			{
 				$$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "interval", $2)
 			}
+	| EXTRACT '(' extract_field FROM a_expr ')'
+			{
+				$$ = parser.NewExtractExpr(yylex.(*lexerState).lastConsumedPos(), $3, $5)
+			}
 	| '(' SelectStmt ')'
 			{
 				sub, _ := $2.(*parser.SelectStmt)
@@ -1515,12 +1575,34 @@ name_or_call:
 				_ = ft
 				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
 			}
+	| qualified_name '(' '*' ')' OVER ColId
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
+				$$ = fc
+			}
 	| qualified_name '(' DISTINCT expr_list ')'
 			{
 				ft := splitFuncName($1)
 				_ = ft
 				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
+				$$ = fc
+			}
+	| qualified_name '(' DISTINCT expr_list ')' OVER ColId
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $7)
+				$$ = fc
+			}
+	| qualified_name '(' opt_func_call_args ')' OVER ColId
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3, false)
+				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
 				$$ = fc
 			}
 	| qualified_name '(' opt_func_call_args ')' OVER '(' ')'
@@ -1608,67 +1690,7 @@ subq_op:
 	| GREATER_EQUALS { $$ = ">=" }
 	| NOT_EQUALS     { $$ = "<>" }
 
-opt_func_call_args:
-		/* empty */ { $$ = nil }
-	| expr_list  { $$ = $1 }
-
-/* name_or_call — merged ColumnRef/FuncCall disambiguation: after
-   qualified_name, seeing '(' shifts into FuncCall; anything else reduces
-   ColumnRef. Single nonterminal = zero S/R conflicts. */
-name_or_call:
-		qualified_name
-			{
-				$$ = columnRefFromParts($1)
-			}
-	| qualified_name '(' opt_func_call_args ')'
-			{
-				ft := splitFuncName($1)
-				args := $3
-				if args == nil {
-					args = []parser.Expr{}
-				}
-				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, args, false)
-			}
-	| qualified_name '(' '*' ')'
-			{
-				ft := splitFuncName($1)
-				_ = ft
-				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
-			}
-	| qualified_name '(' DISTINCT expr_list ')'
-			{
-				ft := splitFuncName($1)
-				_ = ft
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
-				fc.Distinct = true
-				$$ = fc
-			}
-
-/* filter_clause / within_group_clause — gram.y :15230ff */
-filter_clause:
-		FILTER '(' WHERE a_expr ')'
-			{
-				$$ = $4
-			}
-
-within_group_clause:
-		WITHIN GROUP_P '(' ORDER BY sort_by_list ')'
-			{
-				$$ = $5
-			}
-
-/* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
-   before ANY/SOME/ALL. Char literals + named terminals. */
-subq_op:
-		Op        { $$ = $1 }
-	| '='           { $$ = "=" }
-	| '<'           { $$ = "<" }
-	| '>'           { $$ = ">" }
-	| LESS_EQUALS    { $$ = "<=" }
-	| GREATER_EQUALS { $$ = ">=" }
-	| NOT_EQUALS     { $$ = "<>" }
-
-/* Identifier context aliases/* Identifier context aliases — gram.y :17632-17720. Generated lists come */
+/* Identifier context aliases — gram.y :17632-17720. Generated lists come */
 /* from kwlists_gen.y. */
 ColId:
 		IDENT
@@ -1711,3 +1733,15 @@ BareColLabel:
 			{
 				$$ = $1
 			}
+
+/* extract_field — gram.y :14085 extract_list subset (the datetime fields
+   TPC-H uses; full list arrives with P2.5). Lowercased via helper so the
+   grammar prologue needs no extra import. */
+extract_field:
+		IDENT            { $$ = lowerIdent($1) }
+	| YEAR_P           { $$ = "year" }
+	| MONTH_P          { $$ = "month" }
+	| DAY_P            { $$ = "day" }
+	| HOUR_P           { $$ = "hour" }
+	| MINUTE_P         { $$ = "minute" }
+	| SECOND_P         { $$ = "second" }

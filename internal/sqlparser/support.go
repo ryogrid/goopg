@@ -444,3 +444,5 @@ type caseBody struct {
 
 // scalarSub is reserved for future use when internal/parser gains a
 // dedicated ScalarSublink Expr node type (P2.2 remainder).
+
+func lowerIdent(s string) string { return strings.ToLower(s) }

@@ -211,11 +211,14 @@ gen-parser:
 	cd internal/sqlparser && $(GOYACC) -o yacc_parser.go -v y.output ../../tmp/goopg_grammar.y 2> yacc_stderr.txt \
 		|| { cat yacc_stderr.txt; exit 1; }
 	go run ./cmd/gen-tokennums-go
-	@conflicts=$$(grep -cE '^[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null || echo 999); \
-	if [ "$$conflicts" -gt 1 ]; then \
-		echo "ERROR: $$conflicts grammar conflicts (max 1 allowed = known '(' S/R)"; exit 1; fi; \
-	if [ "$$conflicts" -eq 1 ] && grep -q 'on .(.' internal/sqlparser/y.output 2>/dev/null; then \
-		echo 'NOTE: 1 known S/R on ( = func_call vs paren-expr'; fi
+	@conflicts=$$(grep -cE '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null || echo 999); \
+	if [ "$$conflicts" -gt 2 ]; then \
+		echo "ERROR: $$conflicts grammar conflicts (max 2 = known '(' S/Rs)"; exit 1; fi; \
+	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null | grep -vc 'on .(.' ); \
+	if [ "$$nonparen" -gt 0 ]; then \
+		echo "ERROR: $$nonparen conflict(s) NOT on '(' — inspect y.output"; exit 1; fi; \
+	if [ "$$conflicts" -ge 1 ]; then \
+		echo 'NOTE: '"$$conflicts"' known S/R(s) on ( = func_call/extract vs paren-expr'; fi
 	rm -f internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output
 
 # Regenerate every derived doc from the consolidated inventory CSV. Run in the
