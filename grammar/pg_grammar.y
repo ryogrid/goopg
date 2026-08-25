@@ -57,7 +57,6 @@
 %type <stmts>	root stmt_list
 %type <stmt>	stmt SelectStmt simple_select base_select
 %type <node>	setop_tail setop_op
-%type <b>	opt_recursive
 %type <ctes>	cte_list
 %type <node>	cte_item
 %type <str>	opt_materialized
@@ -937,15 +936,20 @@ opt_with_clause:
 		/* empty */ { $$ = nil }
 	| with_clause     { $$ = $1 }
 
+/* Two flat alternatives instead of an optional opt_recursive prefix: the
+   optional form creates an S/R on RECURSIVE (it is an UNRESERVED keyword,
+   so it also starts cte_item's ColId); splitting lets LALR decide purely
+   from the lookahead with zero conflicts (upstream parity: gram.y :13005
+   uses the same two-alternative spelling). */
 with_clause:
-		WITH opt_recursive cte_list
+		WITH cte_list
 			{
-				$$ = parser.NewWithClause(0, $2, $3)
+				$$ = parser.NewWithClause(0, false, $2)
 			}
-
-opt_recursive:
-		/* empty */ { $$ = false }
-	| RECURSIVE      { $$ = true }
+	| WITH RECURSIVE cte_list
+			{
+				$$ = parser.NewWithClause(0, true, $3)
+			}
 
 cte_list:
 		cte_item

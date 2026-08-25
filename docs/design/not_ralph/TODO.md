@@ -96,6 +96,22 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 - [ ] **P2.1b predicates & operators**: IN (list|subquery), op ANY/SOME/ALL,
   LIKE/ILIKE/ESCAPE, SIMILAR TO (+buildSimilarTo constant-folding port),
   || concat, bitwise & | # ~ << >>, ^ pow.
+  FIRST-ATTEMPT FINDINGS (reverted 2026-08-25; helpers binOp/buildSimilarTo/
+  similarToLiteralValue + New* ctors are written and validated standalone —
+  re-add with the grammar work):
+  * A generic `a_expr Op a_expr` alternative ADDED ON TOP of explicit
+    per-operator alternatives exploded to 16k+ S/R conflicts. Next attempt
+    must port upstream EXACTLY: ONE generic Op rule covering every
+    generic-terminal operator, DELETE the explicit duplicates ('+' '-' '*'
+    '/' '%' '<' '>' '=' comparisons) relying on the %left char-literal
+    precedence entries like upstream does, then re-add predicates.
+  * Quantified comparisons (subq_op ANY/ALL) were entangled in the same
+    explosion — port after the generic-Op restructure using upstream's
+    subquery_Op shape.
+  * GATE DISCIPLINE LESSON: P2.1a was committed while make gen-parser rc=2
+    (stale yacc_parser.go masked it; tests stayed green against the old
+    parser). ALWAYS run make gen-parser LAST and require rc=0 immediately
+    before committing any grammar change.
 - [ ] **P2.2 conditional & set exprs**: CASE, NULLIF/GREATEST/LEAST,
   sublinks (EXISTS/IN/row compares).
 - [ ] **P2.3 func_call**: arg modes, ORDER BY/VARIADIC forms, aggregates
