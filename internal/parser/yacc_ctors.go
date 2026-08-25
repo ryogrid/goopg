@@ -170,19 +170,11 @@ func NewBareWindowRef(pos int, name string) *WindowDef {
 	return &WindowDef{pos: pos, RefName: name, IsBareRef: true}
 }
 
-// ScalarSublinkExpr represents `( SELECT ... )` used as an expression value.
-// The analyzer converts this into a subplan node that produces one row and
-// one column.
-type ScalarSublinkExpr struct {
-	pos int
-	Sub *SelectStmt
-}
-
-func (e *ScalarSublinkExpr) Pos() int { return e.pos }
-func (*ScalarSublinkExpr) exprNode()  {}
-
-func NewScalarSublinkExpr(pos int, sub *SelectStmt) *ScalarSublinkExpr {
-	return &ScalarSublinkExpr{pos: pos, Sub: sub}
+// NewSubqueryExpr wraps a SELECT used as an expression value (scalar
+// subquery). Legacy parity: analyzer/planner/executor already speak
+// *SubqueryExpr, so the yacc grammar emits it instead of inventing a node.
+func NewSubqueryExpr(pos int, inner *SelectStmt) *SubqueryExpr {
+	return &SubqueryExpr{pos: pos, Inner: inner}
 }
 
 func NewExtractExpr(pos int, field string, source Expr) *ExtractExpr {

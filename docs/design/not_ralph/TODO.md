@@ -160,6 +160,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 - [x] **P2-F FLIP (real)**: routedStmts["select"]=true. Gates: units PASS,
   tpch-spotcheck Q12 rows=2 / Q13 rows=35 PASS through the live server.
   TestTPCHGrammarCoverage floor 19/22 added as a permanent unit gate.
+- [x] **ScalarSublinkExpr RETIRED**: the yacc grammar now emits legacy's
+  *parser.SubqueryExpr for `( SELECT ... )` expression values (NewSubqueryExpr
+  ctor); ScalarSublinkExpr type deleted — analyzer/planner/executor already
+  speak SubqueryExpr, so Q2/Q4/Q11/Q16/Q17/Q18 subquery forms execute live
+  (verified: Q4 EXISTS=1062945, Q11 having-subquery rows, Q17, Q18 IN).
 - [ ] **Deferred**: interval 'N' <unit> qualified form (interval '90 day'
   embedded form works; trailing-qualifier form is a syntax error in the yacc
   grammar); timestamp WITH/WITHOUT time zone literals; char(N) '...' literals;

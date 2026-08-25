@@ -1485,7 +1485,7 @@ c_expr:
 					sub = parser.NewSelectStmt(0)
 				}
 				sub.Parenthesized = true
-				$$ = parser.NewScalarSublinkExpr(yylex.(*lexerState).lastConsumedPos(), sub)
+				$$ = parser.NewSubqueryExpr(yylex.(*lexerState).lastConsumedPos(), sub)
 			}
 
 	| name_or_call

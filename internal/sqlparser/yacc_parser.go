@@ -5381,7 +5381,7 @@ yydefault:
 				sub = parser.NewSelectStmt(0)
 			}
 			sub.Parenthesized = true
-			yyVAL.expr = parser.NewScalarSublinkExpr(yylex.(*lexerState).lastConsumedPos(), sub)
+			yyVAL.expr = parser.NewSubqueryExpr(yylex.(*lexerState).lastConsumedPos(), sub)
 		}
 	case 241:
 		yyDollar = yyS[yypt-1 : yypt+1]
