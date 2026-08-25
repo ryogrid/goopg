@@ -211,7 +211,8 @@ gen-parser:
 	cd internal/sqlparser && $(GOYACC) -o yacc_parser.go -v y.output ../../tmp/goopg_grammar.y 2> yacc_stderr.txt \
 		|| { cat yacc_stderr.txt; exit 1; }
 	go run ./cmd/gen-tokennums-go
-	if grep -q 'conflicts:' internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output 2>/dev/null; then \
+	if grep -qE 'conflicts: *[1-9]' internal/sqlparser/yacc_stderr.txt 2>/dev/null || \
+	   grep -qE '^[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null; then \
 		echo 'ERROR: grammar conflicts — upstream is %expect 0; restructure, never resolve silently'; exit 1; fi
 	rm -f internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output
 

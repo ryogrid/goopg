@@ -61,7 +61,13 @@
 %type <rvar>	table_ref relation_expr_opt_alias
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause
-%type <str>	ColId ColLabel BareColLabel
+%type <node>	opt_select_limit select_limit limit_clause offset_clause
+%type <sortbys>	opt_sort_clause sort_by_list
+%type <sortby>	SortBy
+%type <expr>	select_limit_value select_offset_value select_fetch_first_value
+%type <str>		first_or_next
+%type <str>	ColId ColLabel BareColLabel first_or_next
+%type <node>	row_or_rows_opt row_or_rows
 
 %%
 
@@ -119,7 +125,7 @@ select_pos:
 /* with later P1 sub-phases (TODO P1.3); their absence here is what keeps */
 /* unrouted inputs failing cleanly toward the legacy parser. */
 simple_select:
-		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause
+		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause opt_sort_clause opt_select_limit
 			{
 				s := parser.NewSelectStmt($2)
 				if di, ok := $3.(*distinctInfo); ok && di != nil {
@@ -135,7 +141,181 @@ simple_select:
 					s.FromExprs = append(s.FromExprs, parser.NewFromExpr(rv.Pos(), rv, nil))
 				}
 				s.Where = $6
+				s.OrderBy = $7
+				if sl, ok := $8.(*selectLimit); ok && sl != nil {
+					s.Limit = sl.count
+					s.Offset = sl.offset
+					s.WithTies = sl.withTies
+				}
 				$$ = s
+			}
+
+// opt_sort_clause / sort_by_list / SortBy — gram.y :13196-13220.
+opt_sort_clause:
+		/* empty */
+			{
+				$$ = nil
+			}
+	| ORDER BY sort_by_list
+			{
+				$$ = $3
+			}
+
+sort_by_list:
+		SortBy
+			{
+				$$ = []parser.SortBy{$1}
+			}
+	| sort_by_list ',' SortBy
+			{
+				$$ = append($1, $3)
+			}
+
+SortBy:
+		a_expr
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+			}
+	| a_expr ASC
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+			}
+	| a_expr DESC
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, true, "")
+			}
+	| a_expr ASC NULLS_LA FIRST_P
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				v := true
+				$$.NullsFirst = &v
+			}
+	| a_expr ASC NULLS_LA LAST_P
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				v := false
+				$$.NullsFirst = &v
+			}
+	| a_expr DESC NULLS_LA FIRST_P
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, true, "")
+				v := true
+				$$.NullsFirst = &v
+			}
+	| a_expr DESC NULLS_LA LAST_P
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, true, "")
+				v := false
+				$$.NullsFirst = &v
+			}
+
+// opt_select_limit/select_limit/limit_clause/offset_clause — gram.y
+// :13261-13360. The LIMIT #,# form reproduces upstream's in-action error.
+opt_select_limit:
+		/* empty */
+			{
+				$$ = nil
+			}
+	| select_limit
+			{
+				$$ = $1
+			}
+
+select_limit:
+		limit_clause offset_clause
+			{
+				lc := $1.(*selectLimit)
+				lc.offset = $2.(*selectLimit).offset
+				lc.set = true
+				$$ = lc
+			}
+	| offset_clause limit_clause
+			{
+				lc := $2.(*selectLimit)
+				lc.offset = $1.(*selectLimit).offset
+				lc.set = true
+				$$ = lc
+			}
+	| limit_clause
+			{
+				$$ = $1
+			}
+	| offset_clause
+			{
+				$$ = $1
+			}
+
+limit_clause:
+		LIMIT select_limit_value
+			{
+				$$ = &selectLimit{count: $2, set: true}
+			}
+	| LIMIT select_limit_value ',' select_offset_value
+			{
+				gateSyntaxError(yylex.(*lexerState),
+					"LIMIT #,# syntax is not supported",
+					"Use separate LIMIT and OFFSET clauses.")
+				$$ = &selectLimit{set: true}
+			}
+	| FETCH first_or_next select_fetch_first_value row_or_rows ONLY
+			{
+				$$ = &selectLimit{count: $3, set: true}
+			}
+	| FETCH first_or_next row_or_rows ONLY
+			{
+				// Omitted count defaults to 1 (gram.y :13346 alt).
+				$$ = &selectLimit{count: parser.NewIntegerConst(0, 1), set: true}
+			}
+	| FETCH first_or_next select_fetch_first_value row_or_rows WITH TIES
+			{
+				$$ = &selectLimit{count: $3, withTies: true, set: true}
+			}
+
+offset_clause:
+		OFFSET select_offset_value row_or_rows_opt
+			{
+				$$ = &selectLimit{offset: $2, set: true}
+			}
+
+row_or_rows_opt:
+		/* empty */ { $$ = nil }
+	| ROW         { $$ = nil }
+	| ROWS        { $$ = nil }
+
+row_or_rows:
+		ROW  { $$ = nil }
+	| ROWS { $$ = nil }
+
+first_or_next:
+		FIRST_P { $$ = "" }
+	| NEXT     { $$ = "" }
+
+select_limit_value:
+		a_expr
+			{
+				$$ = $1
+			}
+
+select_offset_value:
+		a_expr
+			{
+				$$ = $1
+			}
+
+// select_fetch_first_value — gram.y :13346ff: c_expr or signed ICONST/FCONST.
+select_fetch_first_value:
+		c_expr
+			{
+				$$ = $1
+			}
+	| '-' ICONST
+			{
+				e := parser.NewIntegerConst(yylex.(*lexerState).lastConsumedPos(), int64(-$2))
+				$$ = e
+			}
+	| '-' FCONST
+			{
+				$$ = parser.NewNumericConst(yylex.(*lexerState).lastConsumedPos(), "-"+$2)
 			}
 
 /* opt_all_clause/distinct_clause collapsed into one carrier — upstream */

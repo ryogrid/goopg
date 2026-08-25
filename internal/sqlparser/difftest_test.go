@@ -123,6 +123,19 @@ func TestDifferentialSelectCore(t *testing.T) {
 		"SELECT a FROM t WHERE x > 1",
 		"SELECT DISTINCT a, b FROM t WHERE c <> 3",
 		"SELECT (1+2)*3 AS nine FROM t",
+		"SELECT a FROM t ORDER BY b",
+		"SELECT a FROM t ORDER BY b DESC",
+		"SELECT a FROM t ORDER BY b ASC NULLS FIRST",
+		"SELECT a FROM t ORDER BY b DESC NULLS LAST",
+		"SELECT a FROM t ORDER BY b, c DESC, 1",
+		"SELECT a FROM t LIMIT 10",
+		"SELECT a FROM t LIMIT 10 OFFSET 5",
+		"SELECT a FROM t OFFSET 5 ROWS",
+		"SELECT a FROM t OFFSET 5 LIMIT 2",
+		"SELECT a FROM t FETCH FIRST 10 ROWS ONLY",
+		"SELECT a FROM t FETCH NEXT ROWS ONLY",
+		"SELECT a FROM t FETCH FIRST 10 ROWS WITH TIES",
+		"SELECT a FROM t WHERE x > 0 ORDER BY b LIMIT 3 OFFSET 1",
 	}
 	for _, sql := range cases {
 		legacy, yacc, err := diffParse(sql)

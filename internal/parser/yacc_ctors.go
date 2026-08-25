@@ -84,3 +84,6 @@ func NewSelectStmt(pos int) *SelectStmt { return &SelectStmt{pos: pos} }
 func NewFromExpr(pos int, base RangeVar, joins []JoinExpr) FromExpr {
 	return FromExpr{pos: pos, Base: base, Joins: joins}
 }
+func NewSortBy(pos int, expr Expr, desc bool, usingOp string) SortBy {
+	return SortBy{pos: pos, Expr: expr, Desc: desc, UsingOp: usingOp}
+}

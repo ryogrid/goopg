@@ -53,7 +53,7 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 - [ ] **P1.3 grouping & distinct**: GROUP BY, HAVING, DISTINCT [ON].
 - [ ] **P1.4 window functions**: WINDOW clause, OVER (partition/order/
   frame specs). Flip SELECT core routing incl. '(' parenthesized queries.
-- [ ] **P1.5 order/limit**: ORDER BY, LIMIT/OFFSET, FETCH FIRST, targeting
+- [x] **P1.5 order/limit**: ORDER BY, LIMIT/OFFSET, FETCH FIRST, targeting
   (`SELECT ... FOR UPDATE` lock clauses).
 - [ ] **P1.6 set operations**: UNION/INTERSECT/EXCEPT (+ALL), parens nesting.
 - [ ] **P1.7 CTEs**: WITH [RECURSIVE], materialization hints; TABLE/VALUES

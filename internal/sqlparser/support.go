@@ -68,3 +68,20 @@ func foldNegate(e parser.Expr) parser.Expr {
 		return parser.NewUnaryOp(e.Pos(), parser.OpUnaryNeg, e)
 	}
 }
+
+// selectLimit carries opt_select_limit's result (gram.y :13261 SelectLimit).
+type selectLimit struct {
+	count    parser.Expr // LIMIT n / FETCH n
+	offset   parser.Expr // OFFSET n
+	withTies bool        // FETCH ... WITH TIES
+	set      bool
+}
+
+// gateSyntaxError records a mid-parse hard error (the LIMIT #,# shape,
+// gram.y :13290-13296 raises ereport from inside an action). The parser
+// keeps reducing; ParseOne surfaces the recorded error afterwards.
+func gateSyntaxError(l *lexerState, msg, hint string) {
+	if l.err == nil {
+		l.err = &parser.SyntaxError{Message: msg, Hint: hint, Raw: true, Pos: l.lastConsumedPos()}
+	}
+}

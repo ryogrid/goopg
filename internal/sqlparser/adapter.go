@@ -46,6 +46,19 @@ type lexerState struct {
 	pushedR lexResult
 }
 
+// applyNulls applies an opt_nulls_order marker ("f"/"l") to a SortBy value
+// stored in the union (NullsFirst nil = default).
+func (l *lexerState) applyNulls(sb parser.SortBy, marker string) {
+	switch marker {
+	case "f":
+		v := true
+		sb.NullsFirst = &v
+	case "l":
+		v := false
+		sb.NullsFirst = &v
+	}
+}
+
 // lastConsumedPos is the byte offset of the most recently CONSUMED-but-one
 // token — used by grammar mid-rule helpers like select_pos, which run right
 // after the keyword whose position they need.

@@ -22,7 +22,9 @@ import (
 	targets []parser.ResTarget
 	rt     parser.ResTarget
 	rvar   parser.RangeVar
-	rvars  []parser.RangeVar
+	rvars   []parser.RangeVar
+	sortbys []parser.SortBy
+	sortby  parser.SortBy
 	strs   []string         // identifier lists
 	qn     qname            // dotted-name carrier (support.go)
 	node   any              // multi-value carriers like distinctInfo
