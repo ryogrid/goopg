@@ -89,7 +89,8 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   with select routing active. Expected low — most regress cases use
   constructs not yet ported (type names, DDL, operators, etc.). Track this
   number as grammar waves add coverage.
-- [ ] **P2-F SUPPLEMENT** (post-flip improvements): VALUES/TABLE statement
+- [ ] **P3 INSERT (first attempt reverted)**: adding `INSERT INTO qualified_name VALUES...` as a top-level stmt alternative produced 3927 R/R conflicts because `qualified_name` in the INSERT target position conflicts with `qualified_name` in expression contexts (name_or_call). Fix requires either: (a) dedicated nonterminal for the INSERT target that excludes expression contexts, or (b) restructuring so DML statements are dispatched BEFORE expression-level parsing begins (upstream approach — DML rules live at the stmt level, never inside a_expr).
+- [ ] **P3 DML (post-flip improvements): VALUES/TABLE statement
   forms (P1.7a), window OVER() (needs P2.3b FILTER/WITHIN GROUP), remaining
   type-name coverage. These enhance but do not block the flip.
 - [ ] **P2-F ATTEMPT HISTORY** (superseded by successful flip above): enabling
