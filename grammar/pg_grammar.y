@@ -81,6 +81,7 @@
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause having_clause b_expr
+%type <node>	cse_wl when_then
 %type <str>	subq_op
 %type <exprs>	expr_list group_by_list
 %type <expr>	group_by_item
@@ -1004,6 +1005,23 @@ having_clause:
 				$$ = $2
 			}
 
+/* CASE WHEN ... THEN ... [ELSE ...] END — gram.y :15464 case_expr subset.
+   The simple form (CASE operand WHEN val THEN ...) is deferred until
+   P2.3 func_call lands; searched form covers TPC-H Q12/Q13. */cse_wl:
+		when_then { $$ = $1 }
+	| cse_wl when_then
+			{
+				prev := $1.(*whenList)
+				nxt := $2.(*whenList)
+				$$ = &whenList{items: append(prev.items, nxt.items[0])}
+			}
+
+when_then:
+		WHEN a_expr THEN a_expr
+			{
+				$$ = &whenList{items: []parser.CaseWhen{parser.NewCaseWhen($2, $4)}}
+			}
+
 /* expr_list — gram.y :13944ish; reused by DISTINCT ON and later waves. */
 expr_list:
 		a_expr
@@ -1166,6 +1184,25 @@ a_expr:
 			{
 				$$ = parser.NewIsNullExpr($1.Pos(), $1, true)
 			}
+	| EXISTS '(' SelectStmt ')'
+			{
+				sub, _ := $3.(*parser.SelectStmt)
+				if sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				$$ = parser.NewExistsExpr(yylex.(*lexerState).lastConsumedPos(), false, sub)
+			}
+	| CASE cse_wl END_P
+			{
+				wl := $2.(*whenList)
+				$$ = parser.NewCaseExpr(0, nil, wl.items, nil)
+			}
+	| CASE cse_wl ELSE a_expr END_P
+			{
+				wl := $2.(*whenList)
+				$$ = parser.NewCaseExpr(0, nil, wl.items, $4)
+			}
+
 	/* Generic operator terminal — gram.y `a_expr Op a_expr` (%left Op).
 	   Covers || << >> ~* !~ <@ @> && -> ->> #> #>> and any future
 	   multi-character spelling routed here by the adapter. */

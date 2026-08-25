@@ -105,8 +105,9 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   %prec NOT_LA annotations required on SIMILAR TO rules (without them 48
   S/R conflicts appear because rule-precedence defaults to last-terminal-
   nonterminal = none).
-- [ ] **P2.2 conditional & set exprs**: CASE, NULLIF/GREATEST/LEAST,
-  sublinks (EXISTS/IN/row compares).
+- [x] **P2.2 conditional & set exprs (partial)**: searched CASE
+  (CASE WHEN...THEN...[ELSE...] END), EXISTS(subquery). NULLIF/GREATEST/
+  LEAST and row-compare sublinks deferred to P2.3+ (need FuncCall).
 - [ ] **P2.3 func_call**: arg modes, ORDER BY/VARIADIC forms, aggregates
   (DISTINCT, star), FILTER, WITHIN GROUP.
 - [ ] **P2.4 casts, constructors, params, indirection**: `::`, CAST(),

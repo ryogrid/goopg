@@ -430,3 +430,14 @@ func binOp(l yyLexer, s string) parser.OpCode {
 	}
 	return parser.OpUnknown
 }
+
+// whens is a CaseWhen list carrier (union field).
+type whenList struct {
+	items []parser.CaseWhen
+}
+
+// caseBody accumulates CASE WHEN clauses.
+type caseBody struct {
+	whens    []parser.CaseWhen
+	elseExpr parser.Expr
+}

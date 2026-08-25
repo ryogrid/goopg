@@ -135,3 +135,17 @@ func NewTypedStringLit(pos int, typ, value string) *TypedStringLit {
 func NewSimilarToPattern(pos int, left, pattern, escape Expr, negate bool) *SimilarToPattern {
 	return &SimilarToPattern{pos: pos, Left: left, Pattern: pattern, Escape: escape, Negate: negate}
 }
+
+func NewCaseWhen(when, then Expr) CaseWhen { return CaseWhen{When: when, Then: then} }
+
+func NewCaseExpr(pos int, operand Expr, whens []CaseWhen, elseExpr Expr) *CaseExpr {
+	return &CaseExpr{pos: pos, Operand: operand, Whens: whens, Else: elseExpr}
+}
+
+func NewExistsExpr(pos int, negated bool, sub *SelectStmt) *ExistsExpr {
+	return &ExistsExpr{pos: pos, Negated: negated, Subquery: sub}
+}
+
+func NewInListExpr(pos int, operand Expr, negated bool, list []Expr) *InExpr {
+	return &InExpr{pos: pos, Operand: operand, Negated: negated, List: list}
+}
