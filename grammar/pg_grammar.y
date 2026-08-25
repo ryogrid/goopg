@@ -1409,6 +1409,11 @@ c_expr:
 			{
 				$$ = parser.NewParamRef(yylex.(*lexerState).lastConsumedPos(), $1)
 			}
+	| INTERVAL SCONST
+			{
+				$$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "interval", $2)
+			}
+
 	| name_or_call
 			{
 				$$ = $1

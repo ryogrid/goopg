@@ -59,13 +59,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   `ROWS FROM(...)` WITH ORDINALITY (legacy TableFuncRef/parseRowsFrom).
 - [x] **P1.3 grouping & distinct**: GROUP BY, HAVING, DISTINCT ON (legacy
   quirk mirrored: ON form leaves Distinct=false; dump-pinned).
-- [ ] **P1.4 window functions (OVER clause)**: FuncCall infrastructure ready
-  (fc.Over field exists). Grammar needs: OVER '(' [PARTITION BY exprs]
-  [ORDER BY sortlist] ')' and OVER ColId bare-ref forms. CAREFUL: element
-  numbering in multi-keyword rules is error-prone ($N counts ALL terminals
-  including keywords like PARTITION/BY/ORDER). Recommend: separate
-  over_clause nonterminal returning *WindowDef, referenced from
-  name_or_call. Frame clause (ROWS BETWEEN etc) deferred.
+- [x] **P1.4 window functions (OVER clause)**: OVER alternatives added to
+  name_or_call with OVER in %nonassoc precedence block (IDENT level) —
+  resolves S/R by precedence (shift wins). Supports OVER(), OVER(PARTITION
+  BY ..), OVER(ORDER BY ..), OVER(PARTITION BY .. ORDER BY ..). Frame
+  clause deferred. Corpus +3 cases all legacy-identical.
   FIRST-ATTEMPT FINDINGS: adding OVER alts directly to name_or_call caused
   4 S/R + 2930 R/R conflicts. Root cause: postfix-notation ambiguity between
   "reduce name_or_call" and "shift OVER" after qualified_name '(' args ')'.

@@ -441,3 +441,6 @@ type caseBody struct {
 	whens    []parser.CaseWhen
 	elseExpr parser.Expr
 }
+
+// scalarSub is reserved for future use when internal/parser gains a
+// dedicated ScalarSublink Expr node type (P2.2 remainder).
