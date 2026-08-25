@@ -52,7 +52,8 @@ func SplitStatements(toks []parser.Token) [][]parser.Token {
 // ident-led statements (start/discard/fetch/move/close/refresh/grant/revoke/
 // listen/notify/unlisten/lock) via TokenIdent, matched case-insensitively.
 //
-// EMPTY at P0 by design: infrastructure is inert until P1 flips SELECT.
+// EMPTY: P2-F flip attempted 2026-08-25 but reverted — TPC-H Q12 fails
+// (grammar gap). Re-enable after fixing; see TODO P2-F for details.
 var routedStmts = map[string]bool{}
 
 // routeBatch reports whether the whole batch can go to the new parser, plus
@@ -84,23 +85,59 @@ func fragmentRouted(frag []parser.Token) bool {
 	if t == nil {
 		return false // empty fragments stay legacy
 	}
-	var key string
 	switch t.Kind {
-	case parser.TokenKeyword:
-		key = strings.ToLower(t.Value)
-	case parser.TokenQuotedIdent:
-		// A quoted "select" is an identifier named select, not the keyword.
+	case parser.TokenKeyword, parser.TokenIdent:
+		key := strings.ToLower(t.Value)
+		if key == "with" {
+			return withFollowerRouted(frag)
+		}
+		return routedStmts[key]
+	case parser.TokenSymbol:
+		if t.Value == "(" {
+			return routedStmts["select"]
+		}
 		return false
-	case parser.TokenIdent:
-		// Ident-led statements (start/discard/fetch/...) match
-		// case-insensitively on the identifier text.
-		key = strings.ToLower(t.Value)
 	default:
-		// '(' parenthesized queries will join at P1.4; nothing else routes.
 		return false
 	}
-	return routedStmts[key]
 }
+
+// withFollowerRouted scans past the balanced-paren CTE list after WITH and
+// checks whether the FOLLOWER keyword (SELECT/INSERT/etc) is routed.
+// Returns false if the leading token is not WITH or if the scan hits an
+// unexpected token.
+// withFollowerRouted scans past WITH tracking paren depth and returns true
+// iff any keyword at depth 0 is in routedStmts. The CTE bodies are inside
+// parens (depth > 0) so they're skipped naturally; the main query keyword
+// (SELECT/INSERT/etc) appears at depth 0 after the last CTE body closes.
+func withFollowerRouted(toks []parser.Token) bool {
+	depth := 0
+	for i := 1; i < len(toks); i++ { // skip WITH
+		tok := toks[i]
+		if tok.Kind == parser.TokenSymbol {
+			switch tok.Value {
+			case "(":
+				depth++
+			case ")":
+				depth--
+			}
+			continue
+		}
+		if depth > 0 || tok.Kind != parser.TokenKeyword {
+			continue
+		}
+		kw := strings.ToLower(tok.Value)
+		switch kw {
+		case "as":
+			continue // part of cte definition
+		default:
+			return routedStmts[kw]
+		}
+	}
+	return false
+}
+
+
 
 func firstMeaningful(frag []parser.Token) *parser.Token {
 	for i := range frag {

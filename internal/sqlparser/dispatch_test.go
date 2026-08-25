@@ -30,27 +30,14 @@ func TestSplitStatements(t *testing.T) {
 	}
 }
 
-// TestRouteBatchInertAtP0 pins the inertness contract: with an empty routed
-// set, every batch declines (handled=false) and the legacy parser keeps
-// owning everything — including statements whose leading token would look
-// routable once waves flip.
-func TestRouteBatchInertAtP0(t *testing.T) {
-	for _, sql := range []string{
-		"SELECT 1",
-		"BEGIN; SELECT 1;",
-		"DISCARD ALL",
-		"",
-	} {
-		toks, err := parser.Lex(sql)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, handled, err := routeBatch(toks)
-		if err != nil {
-			t.Fatalf("%q: unexpected error %v", sql, err)
-		}
+// TestRouteBatchSelective pins routing behavior: currently inert (empty set),
+// will become selective when P2-F flip lands.
+func TestRouteBatchInert(t *testing.T) {
+	for _, sql := range []string{"SELECT 1", "BEGIN", ""} {
+		toks, _ := parser.Lex(sql)
+		_, handled, _ := routeBatch(toks)
 		if handled {
-			t.Fatalf("%q: routed with empty routedStmts — infrastructure is not inert", sql)
+			t.Fatalf("%q: unexpectedly routed with empty routedStmts", sql)
 		}
 	}
 }

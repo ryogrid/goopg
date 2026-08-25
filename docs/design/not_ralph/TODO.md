@@ -81,11 +81,12 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   wrapper that carries its own opt_sort/opt_select_limit produced S/R
   against WITH RECURSIVE and '(' contexts. Port together with the P2-F
   structural cleanup.
-- [ ] **P2-F SELECT-family FLIP** (moved from P1.4/P1.7 — preconditions
-  grew): requires P1.4 window OVER() AND P2 expressions (FuncCall/casts/
-  sublinks) so routed SELECTs cannot regress on real queries. Flip
-  routedStmts {select,table,values,(,with-follower-scan}; gates: differential
-  corpus + parser pkg + units + regress-runner ≥ baseline + tpch-spotcheck.
+- [ ] **P2-F SELECT-family FLIP — ATTEMPTED, REVERTED**: enabling
+  `routedStmts["select"]` passed units (44 pkgs) but TPC-H Q12 FAILed.
+  Root cause: grammar gap in Q12's construct (needs investigation — likely
+  a type name, interval, or operator form not yet ported). WITH follower
+  scan IS implemented and working (withFollowerRouted). Next: identify Q12
+  gap via differential test with the actual Q12 SQL, fix, re-attempt flip.
 
 ## P2 — Expressions
 
