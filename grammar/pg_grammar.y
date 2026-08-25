@@ -1266,6 +1266,14 @@ a_expr:
 			{
 				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, nil)
 			}
+	| a_expr TYPECAST ColId '(' ICONST ')'
+			{
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, []int64{int64($5)})
+			}
+	| a_expr TYPECAST ColId '(' ICONST ',' ICONST ')'
+			{
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, []int64{int64($5), int64($7)})
+			}
 	| a_expr TYPECAST ColId
 			{
 				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Name: $3}, nil)
