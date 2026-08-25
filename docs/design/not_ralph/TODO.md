@@ -210,7 +210,7 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   Schema-qualified + typmod args deferred (qualified_name in cast target =
   2951 R/R). $n params already handled via PARAM token. ARRAY[]/ROW()
   deferred to P2.4b.
-- [~] **P2.5 type names (in progress)**: 2026-08-26 cast_target landed —
+- [x] **P2.5 type names ✅ (cast positions)**: 2026-08-26 cast_target landed —
   zero-conflict architecture per the trap note below (cast_ident enumerates
   single-word types EXCLUDING multi-word starters; dedicated TIME/TIMESTAMP
   [+tz], double precision, char/character/nchar [varying], bit [varying]
@@ -218,8 +218,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   NAME (typmod dropped), bare char stamps Typmods=[1] via typmodsFor helper,
   bare nchar->"character". Schema-qualified targets + array suffixes landed same day
   (castType carrier; "int[]" folds into Name; gate now allows known S/Rs on
-  '(' '.' '['). Remaining: SETOF (function-return only), ParseExpr flip +
-  plpgsql suite.
+  '(' '.' '['). ParseExpr FLIPPED (RouteExprBatch hook,
+  SELECT-wrapped yacc path, pos-exact via Pos-7 synthetic token; plpgsql +
+  executor suites green). Remaining: SETOF only — deferred to the P5.2
+  FUNCTION wave where it is reachable.
   TRAP FOUND 2026-08-26: naive multi-word additions (::double precision,
   ::timestamp with time zone) collide R/R with the ColId cast-target path
   because every type word is ALSO a col_name/unreserved keyword. Upstream
