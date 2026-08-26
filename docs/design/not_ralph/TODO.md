@@ -300,6 +300,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 - [ ] **P4.2 CREATE TABLE table options**: PARTITION BY / PARTITION OF,
   INHERITS, USING access method, WITH options, ON COMMIT, TABLESPACE,
   AS query, IF NOT EXISTS.
+- [~] **P4.3 ALTER TABLE v0 (2026-08-26, flipped)**: single-action ADD
+  COLUMN / ADD PRIMARY KEY / DROP COLUMN / ALTER COLUMN TYPE / RENAME TO +
+  [IF EXISTS] [ONLY]; alter via second-keyword dispatch. Gate pins 13
+  known S/Rs (IF_P x5). Multi-action lists, SET/DROP DEFAULT/NOT NULL,
+  DROP CONSTRAINT, OWNER TO, SET SCHEMA, partition actions deferred.
 - [ ] **P4.3 ALTER TABLE**: full action list goopg supports.
 - [~] **P4.4 partial (2026-08-26)**: DROP TABLE (IF EXISTS, multi-name,
   CASCADE/RESTRICT) + TRUNCATE (TABLE kw, multi-name, RESTART/CONTINUE
