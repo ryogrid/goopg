@@ -280,9 +280,52 @@ opt_drop_if_exists:
    arrive with the next slice. END is a reserved keyword; the rest route via
    routedStmts keys. */
 tx_begin:
-		BEGIN_P                 { $$ = parser.NewBeginStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| BEGIN_P WORK             { $$ = parser.NewBeginStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| START TRANSACTION        { $$ = parser.NewBeginStmt(yylex.(*lexerState).lastConsumedPos()) }
+		BEGIN_P begin_pos opt_tx_modes
+			{
+				m := $3.(*txModes)
+				b := parser.NewBeginStmt($2)
+				b.IsolationLevel, b.ReadOnly, b.Deferrable = m.iso, m.ro, m.def
+				$$ = b
+			}
+	| BEGIN_P WORK begin_pos opt_tx_modes
+			{
+				m := $4.(*txModes)
+				b := parser.NewBeginStmt($3)
+				b.IsolationLevel, b.ReadOnly, b.Deferrable = m.iso, m.ro, m.def
+				$$ = b
+			}
+	| START TRANSACTION begin_pos opt_tx_modes
+			{
+				m := $4.(*txModes)
+				b := parser.NewBeginStmt($3)
+				b.IsolationLevel, b.ReadOnly, b.Deferrable = m.iso, m.ro, m.def
+				$$ = b
+			}
+
+begin_pos:
+		/* empty */   { $$ = yylex.(*lexerState).lastConsumedPos() }
+
+opt_tx_modes:
+		/* empty */      { $$ = &txModes{} }
+	| tx_mode_list       { $$ = $1 }
+
+tx_mode_list:
+		tx_mode                  { $$ = $1 }
+	| tx_mode_list ',' tx_mode   { $$ = $1 }
+
+tx_mode:
+		ISOLATION LEVEL iso_level     { i := &txModes{}; i.iso = $3.(string); $$ = i }
+	| READ ONLY                         { i := &txModes{}; i.ro = true; $$ = i }
+	| READ WRITE                       { $$ = &txModes{} }
+	| DEFERRABLE                       { i := &txModes{}; i.def = true; $$ = i }
+	| NOT_LA DEFERRABLE                { $$ = &txModes{} }
+	| TRANSACTION                      { $$ = &txModes{} }
+
+iso_level:
+		SERIALIZABLE                    { $$ = "serializable" }
+	| REPEATABLE READ                   { $$ = "repeatable read" }
+	| READ COMMITTED                    { $$ = "read committed" }
+	| READ UNCOMMITTED                  { $$ = "read uncommitted" }
 
 tx_commit:
 		COMMIT                  { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }

@@ -63,7 +63,7 @@
 %type <withc>	with_clause
 %type <node>	opt_with_clause
 %type <b>	set_quantifier opt_if_exists_drop opt_restart opt_if_not_exists opt_unique opt_drop_if_exists
-%type <p>	select_pos
+%type <p>	select_pos begin_pos
 %type <node>	opt_all_distinct
 %type <targets>	opt_target_list target_list
 %type <rt>	target_el
@@ -129,7 +129,7 @@
 %type <node>	part_frame_extent part_frame_bound part_frame_excl
 %type <nwd>	window_definition
 %type <nwds>	opt_window_clause window_definition_list
-%type <node>	row_or_rows_opt row_or_rows
+%type <node>	row_or_rows_opt row_or_rows opt_tx_modes tx_mode_list tx_mode iso_level
 
 %%
 

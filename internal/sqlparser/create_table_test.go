@@ -33,6 +33,9 @@ func TestCreateTableV0(t *testing.T) {
 		"DROP INDEX IF EXISTS i CASCADE",
 		"BEGIN", "BEGIN WORK", "START TRANSACTION",
 		"COMMIT", "END", "ROLLBACK", "ABORT",
+		"BEGIN ISOLATION LEVEL SERIALIZABLE",
+		"BEGIN READ ONLY",
+		"START TRANSACTION ISOLATION LEVEL READ COMMITTED",
 	} {
 		sts, err := parser.Parse(q)
 		if err != nil {

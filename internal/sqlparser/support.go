@@ -754,3 +754,10 @@ func splitKV(kv string) []string {
 
 // upperIdent uppercases (PARTITION BY strategy word).
 func upperIdent(s string) string { return strings.ToUpper(s) }
+
+// txModes accumulates BEGIN/START TRANSACTION mode clauses.
+type txModes struct {
+	iso string
+	ro  bool
+	def bool
+}
