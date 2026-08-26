@@ -2520,17 +2520,19 @@ update_core:
 					$$ = parser.NewUpdateStmt(0, rv, $5, $6, w.expr)
 				}
 			}
-	| ONLY qualified_name opt_upd_alias SET update_set_list opt_upd_from upd_where
+	/* The leading UPDATE keyword was MISSING from this alternative, so
+	   `UPDATE ONLY t SET ...` could never reduce. */
+	| UPDATE ONLY qualified_name opt_upd_alias SET update_set_list opt_upd_from upd_where
 			{
-				rv := rangeVarFromName($2, $3)
+				rv := rangeVarFromName($3, $4)
 				rv.Only = true
-				w := $7.(*updWhere)
+				w := $8.(*updWhere)
 				if w.currentOf != "" {
-					u := parser.NewUpdateStmt(0, rv, $5, $6, nil)
+					u := parser.NewUpdateStmt(0, rv, $6, $7, nil)
 					parser.SetUpdateWhereCurrentOf(u, w.currentOf)
 					$$ = u
 				} else {
-					$$ = parser.NewUpdateStmt(0, rv, $5, $6, w.expr)
+					$$ = parser.NewUpdateStmt(0, rv, $6, $7, w.expr)
 				}
 			}
 	| with_clause UPDATE qualified_name opt_upd_alias SET update_set_list opt_upd_from upd_where
@@ -2563,8 +2565,12 @@ upd_from_list:
 		qualified_name                     { $$ = []parser.RangeVar{rangeVarFromName($1, "")} }
 	| upd_from_list ',' qualified_name    { $$ = append($1, rangeVarFromName($3, "")) }
 
+/* upd_where / del_where — the empty alternative was MISSING, so an
+   unqualified `UPDATE t SET x = 1` or `DELETE FROM t` was a syntax error on
+   the routed path even though both are everyday SQL. */
 upd_where:
-		WHERE a_expr                { $$ = &updWhere{expr: $2} }
+		/* empty */                 { $$ = &updWhere{} }
+	| WHERE a_expr                  { $$ = &updWhere{expr: $2} }
 	| WHERE CURRENT_P OF ColId     { $$ = &updWhere{currentOf: $4} }
 
 /* delete_stmt — P3.3 (gram.y :17560 subset): [WITH] DELETE FROM [ONLY] name
@@ -2627,7 +2633,8 @@ opt_using_list:
 	| USING upd_from_list    { $$ = $2 }
 
 del_where:
-		WHERE a_expr                { $$ = &updWhere{expr: $2} }
+		/* empty */                 { $$ = &updWhere{} }
+	| WHERE a_expr                  { $$ = &updWhere{expr: $2} }
 	| WHERE CURRENT_P OF ColId     { $$ = &updWhere{currentOf: $4} }
 
 
