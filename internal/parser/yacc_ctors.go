@@ -408,3 +408,18 @@ func NewDropViewStmt(pos int, ifExists bool, names []ObjectName, behavior DropBe
 func NewCreateMatViewStmt(name ObjectName, aliases []string, q *SelectStmt) *CreateMatViewStmt {
 	return &CreateMatViewStmt{pos: 0, Name: name, ColumnAliases: aliases, Query: q}
 }
+
+// NewRefreshMatViewStmt builds REFRESH MATERIALIZED VIEW (P5.1). The struct's
+// pos is unexported, so the grammar cannot compose it directly.
+func NewRefreshMatViewStmt(pos int, name ObjectName) *RefreshMatViewStmt {
+	return &RefreshMatViewStmt{pos: pos, Name: name}
+}
+
+// NewDropCompatStmt builds the DROP compatibility-stub shape (ast.go:2043).
+// DROP MATERIALIZED VIEW takes this path in the legacy parser rather than
+// DropViewStmt (ddl.go:6329-6369), with the two-word ObjType. The optional
+// ArgTypes/UsingMethod/CastTypes/Transform* fields stay nil/"" — canonDump
+// distinguishes nil from an empty slice, so do not initialise them.
+func NewDropCompatStmt(pos int, objType string, ifExists bool, names []ObjectName, behavior DropBehavior) *DropCompatStmt {
+	return &DropCompatStmt{pos: pos, ObjType: objType, IfExists: ifExists, Names: names, Behavior: behavior}
+}

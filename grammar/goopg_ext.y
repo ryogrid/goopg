@@ -142,7 +142,7 @@ opt_create_modifier:
 
 opt_if_not_exists:
 		/* empty */       { $$ = false }
-	| IF_P NOT_LA EXISTS  { $$ = true }
+	| IF_P NOT EXISTS  { $$ = true } /* gram.y opt_if_not_exists: plain NOT */
 
 table_element_list:
 		table_element                           { $$ = []*tableElem{$1.(*tableElem)} }
@@ -426,7 +426,7 @@ tx_mode:
 	| READ ONLY                         { i := &txModes{}; i.ro = true; $$ = i }
 	| READ WRITE                       { $$ = &txModes{} }
 	| DEFERRABLE                       { i := &txModes{}; i.def = true; $$ = i }
-	| NOT_LA DEFERRABLE                { $$ = &txModes{} }
+	| NOT DEFERRABLE                   { $$ = &txModes{} } /* gram.y transaction_mode_item */
 	| TRANSACTION                      { $$ = &txModes{} }
 
 iso_level:
@@ -736,6 +736,36 @@ create_matview_stmt:
 				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).spanEnd())
 				cv.WithNoData = $10
 				$$ = cv
+			}
+
+/* refresh_matview_stmt / drop_matview_stmt — P5.1 (gram.y RefreshMatViewStmt
+   and the DropStmt MATERIALIZED VIEW arm).
+
+   Legacy (internal/parser/ddl.go:2847) treats MATERIALIZED and VIEW as
+   optional after REFRESH; we require both, which is upstream-correct —
+   `REFRESH` leads no other statement in PostgreSQL.
+
+   DROP MATERIALIZED VIEW does NOT produce a DropViewStmt: legacy
+   (ddl.go:6329-6369) emits DropCompatStmt with the two-word ObjType
+   "materialized view". Verified by probing the legacy parser before writing
+   these actions. */
+refresh_matview_stmt:
+		REFRESH MATERIALIZED VIEW opt_concurrently qualified_name opt_with_data
+			{
+				st := parser.NewRefreshMatViewStmt(0, objectNameFromQn($5))
+				st.Concurrently = $4
+				st.WithNoData = $6
+				$$ = st
+			}
+
+opt_concurrently:
+		/* empty */    { $$ = false }
+	| CONCURRENTLY     { $$ = true }
+
+drop_matview_stmt:
+		DROP MATERIALIZED VIEW opt_if_exists_drop drop_name_list opt_drop_behavior
+			{
+				$$ = parser.NewDropCompatStmt(0, "materialized view", $4, $5, dropBehavior($6))
 			}
 
 opt_with_data:

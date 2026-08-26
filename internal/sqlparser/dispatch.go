@@ -71,6 +71,9 @@ var routedStmts = map[string]bool{
 	"set": true,
 	"show": true,
 	"reset": true,
+	// P5.1 — REFRESH leads no other statement in PostgreSQL, so the single
+	// refresh_matview_stmt alternative covers the whole keyword.
+	"refresh": true,
 	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 
@@ -169,7 +172,7 @@ func withFollowerRouted(toks []parser.Token) bool {
 var routedCreatePairs = map[string]map[string]bool{
 	"create": {"table": true, "index": true, "view": true, "materialized": true},
 	"alter":  {"table": true},
-	"drop":   {"table": true, "index": true, "view": true},
+	"drop":   {"table": true, "index": true, "view": true, "materialized": true}, // P5.1
 }
 
 // secondKeywordRouted reports whether the fragment's first+second keyword

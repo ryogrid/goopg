@@ -439,7 +439,33 @@ follows is what the audit left OPEN.
 
 ## P5 — DDL wave 2 (everything else CREATE/ALTER/DROP)
 
-- [ ] **P5.1 SEQUENCE / VIEW / MATERIALIZED VIEW / REFRESH**
+- [~] **P5.1 REFRESH / DROP MATERIALIZED VIEW (2026-08-27, flipped)**:
+  `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]` via
+  `routedStmts["refresh"]`, and `DROP MATERIALIZED VIEW [IF EXISTS] names
+  [CASCADE|RESTRICT]` via the drop-pair "materialized". DROP emits
+  `DropCompatStmt` with the two-word ObjType "materialized view", NOT
+  `DropViewStmt` — legacy takes that path at `internal/parser/ddl.go:6329`.
+  Gate pins 16 known S/Rs (IF_P x9, the ninth `opt_if_exists_drop` user).
+  Live-verified: refresh re-runs the query (count 3 -> 4), `DROP ... IF EXISTS`
+  on a missing matview emits the NOTICE, multi-name DROP works.
+  **Fixed while landing it — the NOT/NOT_LA split was wrong in both
+  directions.** `EXISTS` had been added to base_yylex's NOT_LA follower set
+  (upstream parser.c has only BETWEEN/IN_P/LIKE/ILIKE/SIMILAR) so that
+  `opt_if_not_exists: IF_P NOT_LA EXISTS` would reduce — which made every
+  ordinary `NOT EXISTS (...)` a syntax error on the routed SELECT path. The
+  upstream-correct fix is an exact follower set plus plain `NOT` in the two
+  rules that had been spelled `NOT_LA` (`opt_if_not_exists`,
+  `transaction_mode_item`'s `NOT DEFERRABLE`, which had never been reachable).
+  `TestNotLookaheadParity` now pins both directions.
+  Still legacy: `ALTER MATERIALIZED VIEW`, `CREATE MATERIALIZED VIEW` with
+  `USING <am>` / `WITH (opts)` / `TABLESPACE`.
+- [ ] **P5.1 SEQUENCE** (CREATE / ALTER / DROP SEQUENCE)
+- [ ] **Command tags for matview DDL are `OK`, not PG's.** Observed live:
+  `CREATE MATERIALIZED VIEW` should answer `SELECT <n>` and
+  `REFRESH MATERIALIZED VIEW` should answer `REFRESH MATERIALIZED VIEW`; goopg
+  answers `OK` for both. Executor-side and pre-existing (the parser emits an
+  AST byte-identical to legacy), so it is NOT a parser-migration item — filed
+  here only because this wave is what surfaced it.
 - [ ] **P5.2 FUNCTION / PROCEDURE / AGGREGATE** (dollar-quoted bodies)
 - [ ] **P5.3 OPERATOR family / CAST / COLLATION / CONVERSION / TRANSFORM**
 - [ ] **P5.4 TYPE / DOMAIN / ENUM / EXTENSION / STATISTICS /

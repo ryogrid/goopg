@@ -97,6 +97,8 @@
 %type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
+%type <stmt>	refresh_matview_stmt drop_matview_stmt
+%type <b>	opt_concurrently
 %type <stmt>	tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
@@ -242,6 +244,14 @@ stmt:
 				$$ = $1
 			}
 	| create_matview_stmt
+			{
+				$$ = $1
+			}
+	| refresh_matview_stmt
+			{
+				$$ = $1
+			}
+	| drop_matview_stmt
 			{
 				$$ = $1
 			}
