@@ -423,3 +423,10 @@ func NewRefreshMatViewStmt(pos int, name ObjectName) *RefreshMatViewStmt {
 func NewDropCompatStmt(pos int, objType string, ifExists bool, names []ObjectName, behavior DropBehavior) *DropCompatStmt {
 	return &DropCompatStmt{pos: pos, ObjType: objType, IfExists: ifExists, Names: names, Behavior: behavior}
 }
+
+// NewLockingClause builds one `FOR { UPDATE | NO KEY UPDATE | SHARE |
+// KEY SHARE } [OF rel, ...] [NOWAIT | SKIP LOCKED]` clause (gram.y
+// for_locking_item). Mirrors parseLockingClause (select.go:576).
+func NewLockingClause(pos int, strength LockStrength, targets []string, wait LockWaitPolicy) *LockingClause {
+	return &LockingClause{pos: pos, Strength: strength, Targets: targets, WaitPolicy: wait}
+}

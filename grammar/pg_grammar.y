@@ -97,6 +97,8 @@
 %type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
+%type <node>	opt_for_locking for_locking_clause for_locking_item for_locking_strength opt_lock_wait_policy
+%type <strs>	opt_locked_rels
 %type <stmt>	refresh_matview_stmt drop_matview_stmt
 %type <b>	opt_concurrently
 %type <stmt>	tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
@@ -294,7 +296,20 @@ SelectStmt:
 // base_select — simple_select plus its trailing sort/limit (gram.y
 // select_clause sort_clause / select_limit combinations, subset).
 base_select:
-		simple_select opt_sort_clause opt_select_limit
+		simple_select opt_sort_clause
+			{
+				m := $1.(*parser.SelectStmt)
+				m.OrderBy = $2
+				$$ = m
+			}
+	/* gram.y select_no_parens splits the limit/locking tail into two
+	   alternatives whose LEADING part is non-optional, so the decision after
+	   opt_sort_clause is on distinct terminals (FOR vs LIMIT/OFFSET/FETCH).
+	   Writing it as `opt_select_limit opt_for_locking` plus a second
+	   `for_locking_clause select_limit` instead costs one S/R on FOR, which
+	   goyacc silently resolves by shifting — i.e. it would demand a LIMIT after
+	   every FOR UPDATE. */
+	| simple_select opt_sort_clause select_limit opt_for_locking
 			{
 				m := $1.(*parser.SelectStmt)
 				m.OrderBy = $2
@@ -303,8 +318,61 @@ base_select:
 					m.Offset = sl.offset
 					m.WithTies = sl.withTies
 				}
+				m.Locking, _ = $4.([]*parser.LockingClause)
 				$$ = m
 			}
+	| simple_select opt_sort_clause for_locking_clause opt_select_limit
+			{
+				m := $1.(*parser.SelectStmt)
+				m.OrderBy = $2
+				m.Locking, _ = $3.([]*parser.LockingClause)
+				if sl, ok := $4.(*selectLimit); ok && sl != nil {
+					m.Limit = sl.count
+					m.Offset = sl.offset
+					m.WithTies = sl.withTies
+				}
+				$$ = m
+			}
+
+/* for_locking_clause — gram.y :13300ff. `FOR UPDATE` and friends were absent
+   from this grammar entirely (SelectStmt.Locking existed on the AST but no
+   production ever built one), so every row-locking SELECT was a syntax error
+   on the routed path: 23 upstream isolation specs. */
+opt_for_locking:
+		/* empty */          { $$ = nil }
+	| for_locking_clause     { $$ = $1 }
+
+for_locking_clause:
+		for_locking_item
+			{
+				$$ = []*parser.LockingClause{$1.(*parser.LockingClause)}
+			}
+	| for_locking_clause for_locking_item
+			{
+				$$ = append($1.([]*parser.LockingClause), $2.(*parser.LockingClause))
+			}
+
+for_locking_item:
+		for_locking_strength opt_locked_rels opt_lock_wait_policy
+			{
+				$$ = parser.NewLockingClause(yylex.(*lexerState).lastConsumedPos(),
+					$1.(parser.LockStrength), $2, $3.(parser.LockWaitPolicy))
+			}
+
+for_locking_strength:
+		FOR UPDATE            { $$ = parser.LockStrengthForUpdate }
+	| FOR SHARE               { $$ = parser.LockStrengthForShare }
+	| FOR NO KEY UPDATE       { $$ = parser.LockStrengthForNoKeyUpdate }
+	| FOR KEY SHARE           { $$ = parser.LockStrengthForKeyShare }
+
+opt_locked_rels:
+		/* empty */           { $$ = nil }
+	| OF colid_list           { $$ = $2 }
+
+opt_lock_wait_policy:
+		/* empty */           { $$ = parser.LockWaitBlock }
+	| NOWAIT                  { $$ = parser.LockWaitNoWait }
+	| SKIP LOCKED             { $$ = parser.LockWaitSkipLocked }
 setop_tail:
 		/* empty */
 			{

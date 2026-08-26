@@ -489,12 +489,17 @@ its verdicts are real.
 
 ### Root causes, by how many tests they block
 
-- [ ] **`FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE`
-  locking clauses are NOT IN THE GRAMMAR AT ALL** — 23 isolation specs, and
-  `Locking`/`FOR UPDATE` has zero occurrences in `grammar/pg_grammar.y`.
-  TODO's P1.5 entry claims "order/limit/FOR UPDATE" landed; it did not.
-  `base_select` is `simple_select opt_sort_clause opt_select_limit` with no
-  locking clause. `SelectStmt.Locking` exists on the AST. **Highest-value fix.**
+- [x] **DONE 2026-08-27 — `FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` /
+  `FOR KEY SHARE` locking clauses.** They were absent from the grammar ENTIRELY
+  (`Locking` had zero occurrences in `pg_grammar.y`) even though
+  `SelectStmt.Locking` has existed on the AST since M0021 and the P1.5 entry
+  claimed they landed. Ported with `OF rel, ...`, `NOWAIT`, `SKIP LOCKED` and
+  multiple clauses. `base_select` adopts gram.y's three-alternative split so
+  the limit may come before OR after the locking clause (the upstream
+  skip-locked specs use the latter) — writing it as
+  `opt_select_limit opt_for_locking` plus a `for_locking_clause select_limit`
+  alternative instead costs one S/R on FOR that goyacc resolves by shifting,
+  which would silently demand a LIMIT after every FOR UPDATE. Pin stays 16.
 - [ ] **Constraint attribute trailers** — ~20 testport tests.
   `[NOT] DEFERRABLE`, `INITIALLY DEFERRED|IMMEDIATE` on column- AND table-level
   UNIQUE / PRIMARY KEY / FOREIGN KEY / EXCLUDE; `UNIQUE NULLS NOT DISTINCT
