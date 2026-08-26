@@ -334,3 +334,36 @@ tx_commit:
 tx_rollback:
 		ROLLBACK                { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
 	| ABORT_P                   { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
+
+/* set/show/reset — P6.2 (gram.y VariableSetStmt / VariableShowStmt /
+   VariableResetStmt subsets). Value keeps the RAW source span from after
+   the '=' / TO up to the statement's last token (legacy parity: quotes are
+   NOT re-added, comma lists stay textual). DEFAULT and RESET/SHOW ALL are
+   separate shapes. SET TIME ZONE / FROM CURRENT arrive later. */
+set_stmt:
+		SET set_scope ColId set_eq_to DEFAULT
+			{
+				$$ = parser.NewSetStmt(yylex.(*lexerState).lastConsumedPos(), $2, $3, "", true)
+			}
+	| SET set_scope ColId set_eq_to { yylex.(*lexerState).markSpanStart() } expr_list
+			{
+				_ = $6
+				$$ = parser.NewSetStmt(0, $2, $3, yylex.(*lexerState).spanText(), false)
+			}
+
+set_scope:
+		/* empty */   { $$ = false }
+	| SESSION          { $$ = false }
+	| LOCAL            { $$ = true }
+
+set_eq_to:
+		'='           { $$ = "=" }
+	| TO              { $$ = "to" }
+
+show_stmt:
+		SHOW ALL       { $$ = parser.NewShowStmt(0, true, "") }
+	| SHOW ColId       { $$ = parser.NewShowStmt(0, false, $2) }
+
+reset_stmt:
+		RESET ALL      { $$ = parser.NewResetStmt(0, true, "") }
+	| RESET ColId      { $$ = parser.NewResetStmt(0, false, $2) }

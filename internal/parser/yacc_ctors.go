@@ -343,3 +343,18 @@ func NewDropIndexStmt(pos int, concurrent, ifExists bool, names []ObjectName, be
 func NewBeginStmt(pos int) *BeginStmt  { return &BeginStmt{pos: pos} }
 func NewCommitStmt(pos int) *CommitStmt { return &CommitStmt{pos: pos} }
 func NewRollbackStmt(pos int) *RollbackStmt { return &RollbackStmt{pos: pos} }
+
+// NewSetStmt builds the P6.2 SET shape (raw textual value).
+func NewSetStmt(pos int, local bool, name, value string, def bool) *SetStmt {
+	return &SetStmt{pos: pos, Local: local, Name: name, Value: value, Default: def}
+}
+
+// NewShowStmt builds SHOW [ALL] name.
+func NewShowStmt(pos int, all bool, name string) *ShowStmt {
+	return &ShowStmt{pos: pos, All: all, Name: name}
+}
+
+// NewResetStmt builds RESET name|ALL.
+func NewResetStmt(pos int, all bool, name string) *ResetStmt {
+	return &ResetStmt{pos: pos, All: all, Name: name}
+}

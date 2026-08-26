@@ -68,6 +68,9 @@ var routedStmts = map[string]bool{
 	"rollback": true,
 	"abort": true,
 	"end": true,
+	"set": true,
+	"show": true,
+	"reset": true,
 	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 

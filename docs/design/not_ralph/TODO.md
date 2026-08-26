@@ -333,6 +333,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   Transaction modes (ISOLATION LEVEL, READ ONLY/WRITE, DEFERRABLE) next.
 - [ ] **P6.1 Transactions**: BEGIN/START/COMMIT/END/ROLLBACK/ABORT/
   SAVEPOINT/RELEASE/ROLLBACK TO/PREPARE TRANSACTION.
+- [~] **P6.2 SET/SHOW/RESET v0 (2026-08-26, flipped)**: bare + SESSION/
+  LOCAL scopes, '='|TO, DEFAULT, comma-list values as RAW source span
+  (spanText), SHOW ALL/name, RESET ALL/name. Gate pins 12 known S/Rs
+  (+SESSION/LOCAL optional-scope class). SET TIME ZONE / FROM CURRENT /
+  transaction-scoped SET CONSTRAINTS deferred.
 - [ ] **P6.2 SET / SHOW / RESET** (incl. SESSION|LOCAL forms, TIME ZONE,
   ROLE, SESSION AUTHORIZATION paths per M0134-0155 semantics).
 - [ ] **P6.3 Cursors & prepared stmts**: DECLARE/FETCH/MOVE/CLOSE,

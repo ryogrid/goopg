@@ -36,6 +36,12 @@ func TestCreateTableV0(t *testing.T) {
 		"BEGIN ISOLATION LEVEL SERIALIZABLE",
 		"BEGIN READ ONLY",
 		"START TRANSACTION ISOLATION LEVEL READ COMMITTED",
+		"SET x = 1",
+		"SET x TO 'v'",
+		"SET SESSION x = 1",
+		"SET LOCAL x = off",
+		"SET search_path TO a, b",
+		"SHOW x", "SHOW ALL", "RESET x", "RESET ALL",
 	} {
 		sts, err := parser.Parse(q)
 		if err != nil {
