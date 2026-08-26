@@ -31,6 +31,8 @@ func TestCreateTableV0(t *testing.T) {
 		"CREATE INDEX IF NOT EXISTS i ON t USING btree (a)",
 		"DROP INDEX i",
 		"DROP INDEX IF EXISTS i CASCADE",
+		"BEGIN", "BEGIN WORK", "START TRANSACTION",
+		"COMMIT", "END", "ROLLBACK", "ABORT",
 	} {
 		sts, err := parser.Parse(q)
 		if err != nil {

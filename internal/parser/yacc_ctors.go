@@ -337,3 +337,9 @@ func NewCreateIndexStmt(pos int, unique, ifNotExists bool, name string, table Ob
 func NewDropIndexStmt(pos int, concurrent, ifExists bool, names []ObjectName, behavior DropBehavior) *DropIndexStmt {
 	return &DropIndexStmt{pos: pos, Concurrent: concurrent, IfExists: ifExists, Names: names, Behavior: behavior}
 }
+
+// NewBeginStmt / NewCommitStmt / NewRollbackStmt build the P6.1 v0
+// transaction shapes (bare forms; ISOLATION LEVEL etc. arrive later).
+func NewBeginStmt(pos int) *BeginStmt  { return &BeginStmt{pos: pos} }
+func NewCommitStmt(pos int) *CommitStmt { return &CommitStmt{pos: pos} }
+func NewRollbackStmt(pos int) *RollbackStmt { return &RollbackStmt{pos: pos} }

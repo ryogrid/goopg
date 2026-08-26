@@ -61,6 +61,13 @@ var routedStmts = map[string]bool{
 	"update": true, // P3.2
 	"delete": true, // P3.3
 	"truncate": true, // P4.4
+	// P6.1 v0 transaction keywords:
+	"begin": true,
+	"start": true,
+	"commit": true,
+	"rollback": true,
+	"abort": true,
+	"end": true,
 	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 

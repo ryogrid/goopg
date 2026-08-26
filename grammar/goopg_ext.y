@@ -274,3 +274,20 @@ drop_index_stmt:
 opt_drop_if_exists:
 		/* empty */    { $$ = false }
 	| IF_P EXISTS      { $$ = true }
+
+/* tx_stmts — P6.1 v0: bare BEGIN/START TRANSACTION/COMMIT/END/ROLLBACK/
+   ABORT. Transaction modes (ISOLATION LEVEL, READ ONLY/WRITE, DEFERRABLE)
+   arrive with the next slice. END is a reserved keyword; the rest route via
+   routedStmts keys. */
+tx_begin:
+		BEGIN_P                 { $$ = parser.NewBeginStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| BEGIN_P WORK             { $$ = parser.NewBeginStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| START TRANSACTION        { $$ = parser.NewBeginStmt(yylex.(*lexerState).lastConsumedPos()) }
+
+tx_commit:
+		COMMIT                  { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| END_P                     { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
+
+tx_rollback:
+		ROLLBACK                { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| ABORT_P                   { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }

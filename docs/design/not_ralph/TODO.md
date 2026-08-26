@@ -326,6 +326,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 
 ## P6 — Utility statements
 
+- [~] **P6.1 Transactions v0 (2026-08-26, flipped)**: bare BEGIN / BEGIN
+  WORK / START TRANSACTION / COMMIT / END / ROLLBACK / ABORT landed and
+  routed (routedStmts += begin/start/commit/rollback/abort/end; END is the
+  reserved-token leader). Live-verified commit-persistence and rollback.
+  Transaction modes (ISOLATION LEVEL, READ ONLY/WRITE, DEFERRABLE) next.
 - [ ] **P6.1 Transactions**: BEGIN/START/COMMIT/END/ROLLBACK/ABORT/
   SAVEPOINT/RELEASE/ROLLBACK TO/PREPARE TRANSACTION.
 - [ ] **P6.2 SET / SHOW / RESET** (incl. SESSION|LOCAL forms, TIME ZONE,

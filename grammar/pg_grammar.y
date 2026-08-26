@@ -93,7 +93,7 @@
 %type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
-%type <stmt>	create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core
+%type <stmt>	tx_begin tx_commit tx_rollback create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
 %type <str>	str_pair
@@ -195,6 +195,18 @@ stmt:
 				$$ = $1
 			}
 	| drop_index_stmt
+			{
+				$$ = $1
+			}
+	| tx_begin
+			{
+				$$ = $1
+			}
+	| tx_commit
+			{
+				$$ = $1
+			}
+	| tx_rollback
 			{
 				$$ = $1
 			}
