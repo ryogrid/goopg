@@ -287,7 +287,13 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   options / INHERITS / PARTITION BY / AS SELECT attempted via an open
   left-recursive option list -> 29 conflicts (each option keyword fights the
   empty-reduce). NEXT APPROACH: upstream's FIXED clause order as one flat
-  rule (optwith optimherits partitionspec as-select), not open composition, partitioning, INHERITS, OF type, AS SELECT,
+  rule (optwith optimherits partitionspec as-select), not open composition. ATTEMPTED 2026-08-26 evening: layered optional stages
+  (opt_ct_after_with/inherits/partition chain) STILL produced conflicts +
+  cascading type-check whack-a-mole; slice REVERTED to pinned-green state.
+  Root difficulty unresolved — next attempt must start from a MINIMAL
+  repro (single WITH-only tail) and grow one clause at a time, verifying
+  goyacc output at each step. Suspect interaction between the ')' closing
+  table_element_list and downstream statement-level expectations., partitioning, INHERITS, OF type, AS SELECT,
   TEMP/UNLOGGED/IF NOT EXISTS, then the dispatch refinement + flip.
 - [ ] **P4.1 CREATE TABLE columns+constraints**: column defs (types, DEFAULT,
   NOT NULL, GENERATED, collation), column + table-level constraints.
