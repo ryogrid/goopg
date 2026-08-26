@@ -234,3 +234,43 @@ with_value:
 	| FALSE_P    { $$ = "false" }
 	| ON         { $$ = "on" }
 	| OFF        { $$ = "off" }
+
+/* create_index_stmt / drop_index_stmt — P4.4 (gram.y IndexStmt / DropStmt
+   subsets). v0: plain column keys (expressions, DESC/NULLS, opclasses and
+   CONCURRENTLY arrive later); ColOrders/ColExprs filled with per-column
+   defaults for legacy dump parity. */
+create_index_stmt:
+		CREATE opt_unique INDEX opt_if_not_exists ColId ON qualified_name opt_using_method '(' index_col_list ')'
+			{
+				nm := $7.parts
+				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
+				if len(nm) > 1 {
+					tbl.Schema = nm[len(nm)-2]
+				}
+				$$ = parser.NewCreateIndexStmt(0, $2, $4, $5, tbl, $8, $10)
+			}
+
+opt_unique:
+		/* empty */  { $$ = false }
+	| UNIQUE        { $$ = true }
+
+opt_using_method:
+		/* empty */      { $$ = "" }
+	| USING ColId        { $$ = $2 }
+
+index_col_list:
+		index_col                     { $$ = []string{$1} }
+	| index_col_list ',' index_col   { $$ = append($1, $3) }
+
+index_col:
+		ColId                         { $$ = $1 }
+
+drop_index_stmt:
+		DROP INDEX opt_drop_if_exists drop_name_list opt_drop_behavior
+			{
+				$$ = parser.NewDropIndexStmt(0, false, $3, $4, dropBehavior($5))
+			}
+
+opt_drop_if_exists:
+		/* empty */    { $$ = false }
+	| IF_P EXISTS      { $$ = true }

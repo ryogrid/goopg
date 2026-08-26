@@ -305,7 +305,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   CASCADE/RESTRICT) + TRUNCATE (TABLE kw, multi-name, RESTART/CONTINUE
   IDENTITY, behavior) landed AND flipped — drop via second-keyword dispatch
   ("drop table"), truncate direct. Gate now pins 7 known S/Rs ('(' x2,
-  '[' x2, ON, IF_P x2 optional-empty class). CREATE/DROP INDEX still open.
+  '[' x2, ON, IF_P x2 optional-empty class). CREATE/DROP INDEX landed same day (v0: plain column keys; CONCURRENTLY,
+  expressions, DESC/opclasses deferred). routedCreatePairs now maps
+  create/drop -> {table,index}. Gate pins 10 known S/Rs (IF_P x4 from the
+  four optional IF EXISTS clauses).
 - [ ] **P4.4 DROP TABLE / TRUNCATE / INDEXes**: CREATE/DROP INDEX incl.
   partial/expression/concurrent flags. Flip wave-1 routing; initdb replay.
 

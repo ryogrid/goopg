@@ -154,8 +154,8 @@ func withFollowerRouted(toks []parser.Token) bool {
 
 // routedCreatePairs maps leading keyword -> set of ported second keywords.
 var routedCreatePairs = map[string]map[string]bool{
-	"create": {"table": true},
-	"drop":   {"table": true},
+	"create": {"table": true, "index": true},
+	"drop":   {"table": true, "index": true},
 }
 
 // secondKeywordRouted reports whether the fragment's first+second keyword

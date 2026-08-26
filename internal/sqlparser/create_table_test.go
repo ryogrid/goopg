@@ -26,6 +26,11 @@ func TestCreateTableV0(t *testing.T) {
 		"CREATE TABLE t (a int references o(id) on delete cascade)",
 		"CREATE TABLE t (a int, check (a < 10))",
 		"CREATE TABLE t (a int, b int, foreign key (b) references o (id) on update set null)",
+		"CREATE INDEX i ON t (a)",
+		"CREATE UNIQUE INDEX i ON t (a, b)",
+		"CREATE INDEX IF NOT EXISTS i ON t USING btree (a)",
+		"DROP INDEX i",
+		"DROP INDEX IF EXISTS i CASCADE",
 	} {
 		sts, err := parser.Parse(q)
 		if err != nil {

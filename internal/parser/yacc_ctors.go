@@ -308,3 +308,32 @@ func NewDropTableStmt(pos int, ifExists bool, names []ObjectName, behavior DropB
 func NewTruncateStmt(pos int, names []ObjectName, only []bool, behavior DropBehavior, restart bool) *TruncateStmt {
 	return &TruncateStmt{pos: pos, Names: names, Only: only, Behavior: behavior, RestartIdentity: restart}
 }
+
+// NewTableConstraintDef builds a named table-level PK/UNIQUE constraint.
+func NewTableConstraintDef(name string, cols []string, isPrimary bool) *TableConstraintDef {
+	return &TableConstraintDef{Name: name, Columns: cols, IsPrimary: isPrimary}
+}
+
+// NewPartitionByClause builds the PARTITION BY descriptor.
+func NewPartitionByClause(method string, keyCols []string) *PartitionByClause {
+	return &PartitionByClause{Method: method, KeyCols: keyCols}
+}
+
+// NewCreateIndexStmt builds the P4.4 CREATE INDEX shape (plain column keys;
+// expressions / DESC / opclasses arrive later).
+func NewCreateIndexStmt(pos int, unique, ifNotExists bool, name string, table ObjectName, method string, cols []string) *CreateIndexStmt {
+	orders := make([]IndexColOrder, len(cols))
+	for i := range orders {
+		orders[i] = IndexColOrder{}
+	}
+	exprs := make([]Expr, len(cols))
+	return &CreateIndexStmt{
+		pos: pos, Unique: unique, IfNotExists: ifNotExists, Name: name,
+		Table: table, Method: method, Columns: cols, ColOrders: orders, ColExprs: exprs,
+	}
+}
+
+// NewDropIndexStmt builds the P4.4 DROP INDEX shape.
+func NewDropIndexStmt(pos int, concurrent, ifExists bool, names []ObjectName, behavior DropBehavior) *DropIndexStmt {
+	return &DropIndexStmt{pos: pos, Concurrent: concurrent, IfExists: ifExists, Names: names, Behavior: behavior}
+}

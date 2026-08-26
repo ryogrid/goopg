@@ -62,7 +62,7 @@
 %type <str>	opt_materialized
 %type <withc>	with_clause
 %type <node>	opt_with_clause
-%type <b>	set_quantifier opt_if_exists_drop opt_restart opt_if_not_exists
+%type <b>	set_quantifier opt_if_exists_drop opt_restart opt_if_not_exists opt_unique opt_drop_if_exists
 %type <p>	select_pos
 %type <node>	opt_all_distinct
 %type <targets>	opt_target_list target_list
@@ -89,9 +89,11 @@
 %type <str>	opt_tzmark double_tail cast_ident character_word opt_upd_alias
 %type <vrows>	values_rows
 %type <node>	opt_create_modifier opt_TRUNCATE_kw
+%type <strs>	index_col_list
+%type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
-%type <stmt>	create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core
+%type <stmt>	create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
 %type <str>	str_pair
@@ -104,7 +106,7 @@
 %type <expr>	opt_update_where
 %type <ctt>	opt_ct_tail
 %type <strs>	str_pair_list
-%type <str>	str_pair with_value
+%type <str>	str_pair with_value opt_using_method
 %type <node>	upd_where del_where
 %type <strs>
 %type <rvars>	opt_upd_from opt_using_list
@@ -185,6 +187,14 @@ stmt:
 				$$ = $1
 			}
 	| truncate_stmt
+			{
+				$$ = $1
+			}
+	| create_index_stmt
+			{
+				$$ = $1
+			}
+	| drop_index_stmt
 			{
 				$$ = $1
 			}
