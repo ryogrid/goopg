@@ -2403,24 +2403,38 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// M0107-0005: capture walProcNum (int32) for atomic WaitEventStart.
 	if walWriter != nil {
 		walWriter.OnWALSync = func() {
+			// Attribute the wait to the CALLING goroutine's own slot:
+			// FlushUpTo runs synchronously on the committing backend's
+			// goroutine (backend-driven flush — there is no dedicated
+			// writer goroutine), and upstream surfaces exactly this wait as
+			// IO:WALSync on the COMMITTER via XLogFlush. Per-goroutine
+			// resolution makes every parked committer light up its own
+			// pg_stat_activity row instead of collapsing into one shared
+			// background entry. Fall back to the fixed walwriter slot for
+			// unregistered callers (the background-walwriter loop, tests).
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitWALSync)
+				return
+			}
 			if act != nil {
 				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALSync)
 			}
 		}
 		walWriter.OnWALSyncDone = func() {
-			if act == nil {
+			reg, procNum, ok := activity.LookupCurrentGoroutine()
+			if !ok && act != nil {
+				reg, procNum = act, walProcNum
+			}
+			if !ok {
 				return
 			}
-			d := act.WaitEventEnd(walProcNum)
-			// fsync_time (pg_stat_io): FlushUpTo runs synchronously on the
-			// calling backend's own goroutine (SetCurrentGoroutine was
-			// called for it at connection setup — server.go), so
-			// LookupTrackedGoroutine correctly reports *that backend's*
-			// own track_io_timing setting, unlike walProcNum above (a
-			// fixed background slot shared by every committing backend,
-			// only suitable for the wait_event display, not per-session
-			// gating). Mirrors storage.Pool's OnPinDone gating exactly.
-			if _, _, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			// fsync_time (pg_stat_io): gate on the calling backend's OWN
+			// track_io_timing setting (SetCurrentGoroutine was called for
+			// it at connection setup — server.go), unlike the old
+			// fixed-slot attribution. Mirrors storage.Pool's OnPinDone
+			// gating exactly.
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
 				walWriter.AddFsyncTimeNanos(int64(d))
 			}
 		}

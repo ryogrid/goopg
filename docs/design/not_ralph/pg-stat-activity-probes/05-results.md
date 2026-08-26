@@ -121,3 +121,44 @@ Interpretation:
    postmaster/server.go:1140). They shrink toward zero with finer probe
    placement (setting the idle state inside the read-park window) but are
    harmless at this granularity.
+
+## Addendum — WAL persistence waits were invisible, then fixed (2026-08-26)
+
+Review question: "why doesn't WAL flush time show up in the tables?" Answer:
+fdatasync WAS being issued — goopg uses backend-driven group commit
+(`Writer.FlushUpTo` runs write+fdatasync synchronously in the COMMITTING
+backend's goroutine; there is no dedicated writer goroutine,
+xlog/writer.go:267-270) — and probe hooks existed (`OnWALSync` /
+`OnWALSyncDone`), but initdb/open.go wired them to the fixed background
+walwriter procNum. Every committer's wait therefore collapsed into one
+shared background row and vanished from client-backend sampling.
+
+Fix: resolve identity per call via `activity.LookupCurrentGoroutine()` in
+both callbacks (fallback: the fixed walwriter slot for unregistered callers)
+— upstream parity, where XLogFlush surfaces `IO:WALSync` on the COMMITTER.
+Per-connection state itself was never in question: the registry keeps a slot
+per connection (procNum) and the view returns one row per client backend.
+
+Re-run after the fix — `-N -c 50 -j 8 -T 45 -s 10`, 421,388 txns / 9,370 tps,
+4,401 backend-samples / 89 sweeps:
+
+| samples | % of total | state | wait_event_type | wait_event |
+|---:|---:|---|---|---|
+| 2530 | 57.5% | active | IO | WALSync |
+| 1076 | 24.5% | active | (none) | (none) |
+| 251 | 5.7% | idle in transaction | Client | ClientRead |
+| 154 | 3.5% | idle in transaction | (none) | (none) |
+| 122 | 2.8% | idle | Client | ClientRead |
+| 95 | 2.2% | idle in transaction | Client | ClientWrite |
+| 84 | 1.9% | active | Lock | relation |
+| 57 | 1.3% | idle | (none) | (none) |
+| 18 | 0.4% | active | Client | ClientWrite |
+| 14 | 0.3% | idle | Client | ClientWrite |
+
+Reading: with correct attribution, **WAL durability is the single largest
+non-CPU consumer (~75% of non-on-CPU time)** — committers either hold
+writeMu doing the fdatasync or park in `acquireOrWait` as group-commit
+losers, all inside the WALSync window. Throughput is unchanged (9,175 →
+9,370 tps): the wait was always being paid, it just was not attributable.
+The earlier tables' "on-CPU 77%" was inflated by exactly this attribution
+gap; treat the pre-fix distributions as client-side-only views.
