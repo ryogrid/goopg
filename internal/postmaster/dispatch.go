@@ -3,6 +3,7 @@ package postmaster
 import (
 	"context"
 	"errors"
+	"os"
 	"fmt"
 	"runtime"
 	"runtime/debug"
@@ -58,6 +59,38 @@ var queriesWithoutFreeCounter int64
 // × hours = far below 10 000) while eliminating the pgbench overhead.
 const queriesPerForcedFree = 10_000
 
+// ——— Forced-GC feature flag (user request: make the explicit GC triggers
+// switchable and ship them DISABLED) ———
+//
+// forcedGCEnabledFlag gates the ENTIRE maybeForceGCAfterCommit body,
+// including its condition checks: when cleared, neither the per-query
+// counter nor ReadMemStats/HeapInuse sampling ever runs, and no
+// runtime.GC()/debug.FreeOSMemory is issued from this path. Default is
+// OFF; operators re-enable with GOOPG_FORCED_GC=on|true|1 (env read once
+// at init) or programmatically via SetForcedGCEnabled.
+var forcedGCEnabledFlag atomic.Bool
+
+func init() {
+	forcedGCEnabledFlag.Store(parseForcedGCEnv(os.Getenv("GOOPG_FORCED_GC")))
+}
+
+// parseForcedGCEnv interprets the GOOPG_FORCED_GC environment value.
+// Anything other than an affirmative token leaves the trigger disabled.
+func parseForcedGCEnv(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "on", "true", "1", "yes":
+		return true
+	}
+	return false
+}
+
+// SetForcedGCEnabled flips the forced-GC trigger at runtime (tests, future
+// control-plane wiring).
+func SetForcedGCEnabled(v bool) { forcedGCEnabledFlag.Store(v) }
+
+// forcedGCEnabled reports whether explicit commit-path GC triggers may run.
+func forcedGCEnabled() bool { return forcedGCEnabledFlag.Load() }
+
 // maybeForceGCAfterCommit triggers `runtime.GC()` +
 // `debug.FreeOSMemory()` at the end of a Query message when
 // either:
@@ -69,6 +102,12 @@ const queriesPerForcedFree = 10_000
 // only called when the counter says a GC round is due — keeping the common
 // sub-threshold path to a single atomic operation.
 func maybeForceGCAfterCommit() {
+	if !forcedGCEnabled() {
+		// Flag-disabled: skip BOTH the condition bookkeeping (counter bump)
+		// and any GC/FreeOSMemory work — the call becomes a single atomic
+		// load on the hot path.
+		return
+	}
 	n := atomic.AddInt64(&queriesWithoutFreeCounter, 1)
 	if n < queriesPerForcedFree {
 		return // fast path: single atomic add, no STW
