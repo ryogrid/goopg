@@ -215,6 +215,12 @@ type Config struct {
 	// STOPIMMEDIATE behave like a graceful STOP. (M0110-0004 / RW-002 b.)
 	OnStopImmediate func() error
 
+	// ApplyCheckpointGUCs, when set (production wiring in cmd/goopg), reapplies
+	// checkpoint_timeout / max_wal_size / checkpoint_completion_target /
+	// full_page_writes from the registry to the live runtime after a config
+	// reload (parity bundle D-2).
+	ApplyCheckpointGUCs func()
+
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
 	AutovacuumLauncher *autovacuum.Launcher
@@ -832,6 +838,9 @@ func (s *Server) reloadConfig() {
 		s.cfg.Logger.Warn("control: reload", "issue", w)
 	}
 	s.cfg.Logger.Info("control: reload complete", "path", s.cfg.ConfigPath, "changed", result.Changed, "warnings", len(result.Warnings))
+	if s.cfg.ApplyCheckpointGUCs != nil {
+		s.cfg.ApplyCheckpointGUCs()
+	}
 }
 
 func (s *Server) stopControlPlane() {

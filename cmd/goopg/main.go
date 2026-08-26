@@ -751,7 +751,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// development convenience. A future reload path will reapply
 	// this when the GUC changes — today the registry value is
 	// frozen at startup.
-	if rt != nil && rt.Checkpointer != nil {
+	applyCheckpointGUCs := func() {
+		if rt == nil || rt.Checkpointer == nil {
+			return
+		}
 		registry := cfg.Registry
 		if registry == nil {
 			registry = misc.BuildDefaultRegistry()
@@ -777,42 +780,44 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		if v, ok := registry.Get("full_page_writes"); ok && rt.Pool != nil {
 			rt.Pool.SetFullPageWrites(v.Display() == "on")
 		}
+	}
+	applyCheckpointGUCs()
+	cfg.ApplyCheckpointGUCs = applyCheckpointGUCs
 
-		// Slot-aware WAL retention. Wired here (rather than inside
-		// initdb.Open) because the GUC values that govern its
-		// behaviour — `max_slot_wal_keep_size` — only finish loading
-		// once the postgresql.conf entries have been applied to the
-		// registry. The retainer's own logger is the per-process
-		// slog so retention events show up next to the rest of the
-		// startup chatter.
-		if rt.WAL != nil {
-			retainer := &xlog.SlotAwareRetainer{
-				Writer: rt.WAL,
-				Slots:  rt.Slots,
-				Logger: logger,
-				// M0122-0009 follow-up: let RemoveOldSegmentsWithEstimate's
-				// XLOGfileslop-style sizing grow past the min_wal_size
-				// floor under sustained write volume (capped at
-				// max_wal_size, wired into rt.WAL's Config above via
-				// WALMaxSize).
-				CheckPointDistanceEstimateFn: rt.Checkpointer.CheckPointDistanceEstimate,
-			}
-			if v, ok := registry.Get("checkpoint_completion_target"); ok {
-				if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
-					retainer.CompletionTarget = f
-				}
-			}
-			if v, ok := registry.Get("max_slot_wal_keep_size"); ok {
-				// Stored in MB (matching upstream guc_tables.c). -1
-				// is the unlimited sentinel.
-				if mb, err := strconv.Atoi(v.Display()); err == nil {
-					if mb > 0 {
-						retainer.MaxSlotKeepBytes = int64(mb) * 1024 * 1024
-					}
-				}
-			}
-			rt.Checkpointer.SetRetainer(retainer)
+	// Slot-aware WAL retention. Wired here (rather than inside
+	// initdb.Open) because the GUC values that govern its
+	// behaviour — `max_slot_wal_keep_size` — only finish loading
+	// once the postgresql.conf entries have been applied to the
+	// registry. The retainer's own logger is the per-process
+	// slog so retention events show up next to the rest of the
+	// startup chatter.
+	if rt != nil && rt.WAL != nil {
+		retainer := &xlog.SlotAwareRetainer{
+			Writer: rt.WAL,
+			Slots:  rt.Slots,
+			Logger: logger,
+			// M0122-0009 follow-up: let RemoveOldSegmentsWithEstimate's
+			// XLOGfileslop-style sizing grow past the min_wal_size
+			// floor under sustained write volume (capped at
+			// max_wal_size, wired into rt.WAL's Config above via
+			// WALMaxSize).
+			CheckPointDistanceEstimateFn: rt.Checkpointer.CheckPointDistanceEstimate,
 		}
+		if v, ok := cfg.Registry.Get("checkpoint_completion_target"); ok {
+			if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
+				retainer.CompletionTarget = f
+			}
+		}
+		if v, ok := cfg.Registry.Get("max_slot_wal_keep_size"); ok {
+			// Stored in MB (matching upstream guc_tables.c). -1
+			// is the unlimited sentinel.
+			if mb, err := strconv.Atoi(v.Display()); err == nil {
+				if mb > 0 {
+					retainer.MaxSlotKeepBytes = int64(mb) * 1024 * 1024
+				}
+			}
+		}
+		rt.Checkpointer.SetRetainer(retainer)
 	}
 
 	// Run the periodic checkpointer alongside the server. SIGTERM /
