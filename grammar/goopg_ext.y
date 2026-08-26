@@ -16,7 +16,7 @@
    CHECK / FK / named constraints / WITH / partitioning arrive in later P4
    slices. */
 create_table_stmt:
-		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' table_element_list ')'
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' table_element_list ')' opt_ct_tail
 			{
 				elems := $7.([]*tableElem)
 				var cols []parser.ColumnDef
@@ -62,6 +62,20 @@ create_table_stmt:
 				}
 				ct.IfNotExists = $4
 				ct.TableUniques = uqs
+				tail := $9
+				_ = tail
+				for _, kv := range tail.withKv {
+					if ct.With == nil {
+						ct.With = map[string]string{}
+					}
+					parts := splitKV(kv)
+					if len(parts) == 2 {
+						ct.With[parts[0]] = parts[1]
+					}
+				}
+				ct.Inherits = tail.inherits
+				ct.PartitionBy = tail.partition
+				ct.SelectSource = tail.asSelect
 				$$ = ct
 			}
 
@@ -122,6 +136,25 @@ col_type_name:
    subsets). DROP uses the two-keyword dispatch ("drop table"); TRUNCATE
    routes on its own leading keyword. ONLY-per-table and RESTART IDENTITY
    forms arrive with a later slice. */
+create_table_stmt_as:
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name AS SelectStmt
+			{
+				sel, _ := $7.(*parser.SelectStmt)
+				nm := $5.parts
+				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
+				if len(nm) > 1 {
+					tbl.Schema = nm[len(nm)-2]
+				}
+				ct := parser.NewCreateTableStmt(0, tbl, nil, nil)
+				if pfx := $2.(*createPrefix); pfx != nil {
+					ct.Temporary = pfx.temporary
+					ct.Unlogged = pfx.unlogged
+				}
+				ct.IfNotExists = $4
+				ct.SelectSource = sel
+				$$ = ct
+			}
+
 drop_table_stmt:
 		DROP TABLE opt_if_exists_drop drop_name_list opt_drop_behavior
 			{
@@ -160,3 +193,44 @@ opt_restart:
 	| RESTART IDENTITY_P       { $$ = true }
 	| CONTINUE_P IDENTITY_P   { $$ = false }
 
+
+/* opt_ct_tail — trailing options v2: flat keyword-distinct alternatives. */
+opt_ct_tail:
+		/* empty */     { $$ = &ctTail{} }
+	| WITH '(' str_pair_list ')'
+			{ i := &ctTail{}; i.withKv = $3; $$ = i }
+	| INHERITS '(' drop_name_list ')'
+			{ i := &ctTail{}; i.inherits = $3; $$ = i }
+	| AS SelectStmt
+			{
+				sel, _ := $2.(*parser.SelectStmt)
+				i := &ctTail{}; i.asSelect = sel; $$ = i
+			}
+	| PARTITION BY ColId '(' colid_list ')'
+			{
+				pb := parser.NewPartitionByClause(upperIdent($3), nil)
+				for _, c := range $5 {
+					pb.KeyCols = append(pb.KeyCols, c)
+					pb.OpClasses = append(pb.OpClasses, "")
+					pb.Collations = append(pb.Collations, "")
+				}
+				i := &ctTail{}; i.partition = pb; $$ = i
+			}
+
+str_pair_list:
+		str_pair                    { $$ = []string{$1} }
+	| str_pair_list ',' str_pair    { $$ = append($1, $3) }
+
+str_pair:
+		ColId '=' with_value        { $$ = $1 + "=" + $3 }
+
+with_value:
+		SCONST   { $$ = $1 }
+	| ICONST     { $$ = yylex.(*lexerState).lastText }
+
+	| FCONST     { $$ = yylex.(*lexerState).lastText }
+
+	| TRUE_P     { $$ = "true" }
+	| FALSE_P    { $$ = "false" }
+	| ON         { $$ = "on" }
+	| OFF        { $$ = "off" }

@@ -635,6 +635,19 @@ type createTail struct {
 	asSelect  *parser.SelectStmt
 }
 
+// withMap folds accumulated WITH pairs into the map shape CreateTableStmt
+// carries (nil when no pairs).
+func (t *createTail) withMap() map[string]string {
+	if len(t.withPairs) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(t.withPairs))
+	for _, pr := range t.withPairs {
+		m[pr[0]] = pr[1]
+	}
+	return m
+}
+
 // partKey is one PARTITION BY key element.
 type partKey struct {
 	name string
@@ -725,3 +738,19 @@ func applyFkAction(a *fkActs, n *namedFkAct) *fkActs {
 	}
 	return a
 }
+
+// ctTail carries trailing CREATE TABLE options (v2 flat alternatives).
+type ctTail struct {
+	withKv    []string
+	inherits  []parser.ObjectName
+	partition *parser.PartitionByClause
+	asSelect  *parser.SelectStmt
+}
+
+// splitKV splits a "key=value" WITH-pair string (first '=' only).
+func splitKV(kv string) []string {
+	return strings.SplitN(kv, "=", 2)
+}
+
+// upperIdent uppercases (PARTITION BY strategy word).
+func upperIdent(s string) string { return strings.ToUpper(s) }

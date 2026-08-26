@@ -20,3 +20,10 @@ Shared gaps (both parsers reject an accepted-upstream construct) are NOT
 known-diffs rows — they belong to TODO sub-items (e.g. GROUP BY
 DISTINCT/ALL set_quantifier lives under P1.3a with the grouping-set
 constructs).
+
+
+## P4.1 CREATE TABLE ... PARTITION BY (2026-08-26)
+
+PartitionByClause.MethodPos / KeyColPos are 0 in the yacc parser (legacy
+captures real byte offsets). Method and KeyCols match; positions feed only
+error carets. Revisit when position-faithful partition keys are needed.

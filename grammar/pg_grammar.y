@@ -91,8 +91,10 @@
 %type <node>	opt_create_modifier opt_TRUNCATE_kw
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
-%type <stmt>	drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core
+%type <stmt>	create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
+%type <strs>	str_pair_list
+%type <str>	str_pair
 %type <isrc>	insert_source
 %type <oct>	opt_arbiter
 %type <ualist> update_set_list
@@ -100,6 +102,9 @@
 %type <strs>	opt_ref_cols
 %type <node>	opt_fk_actions fk_actions fk_action fk_kw
 %type <expr>	opt_update_where
+%type <ctt>	opt_ct_tail
+%type <strs>	str_pair_list
+%type <str>	str_pair with_value
 %type <node>	upd_where del_where
 %type <strs>
 %type <rvars>	opt_upd_from opt_using_list
@@ -171,6 +176,7 @@ stmt:
 				$$ = $1
 			}
 	| create_table_stmt
+	| create_table_stmt_as
 			{
 				$$ = $1
 			}
