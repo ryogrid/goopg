@@ -298,3 +298,13 @@ func NewColumnDef(name string, ct ColumnType) *ColumnDef {
 func NewCreateTableStmt(pos int, name ObjectName, cols []ColumnDef, pk []string) *CreateTableStmt {
 	return &CreateTableStmt{pos: pos, Name: name, Columns: cols, PrimaryKey: pk, With: map[string]string{}}
 }
+
+// NewDropTableStmt builds the P4.4 DROP TABLE shape.
+func NewDropTableStmt(pos int, ifExists bool, names []ObjectName, behavior DropBehavior) *DropTableStmt {
+	return &DropTableStmt{pos: pos, IfExists: ifExists, Names: names, Behavior: behavior}
+}
+
+// NewTruncateStmt builds the P4.4 TRUNCATE shape.
+func NewTruncateStmt(pos int, names []ObjectName, only []bool, behavior DropBehavior, restart bool) *TruncateStmt {
+	return &TruncateStmt{pos: pos, Names: names, Only: only, Behavior: behavior, RestartIdentity: restart}
+}

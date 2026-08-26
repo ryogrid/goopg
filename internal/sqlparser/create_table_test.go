@@ -15,6 +15,10 @@ func TestCreateTableV0(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS t (a int)",
 		"CREATE TEMP TABLE tt (a int)",
 		"CREATE UNLOGGED TABLE uu (a int)",
+		"DROP TABLE t",
+		"DROP TABLE IF EXISTS a, b CASCADE",
+		"TRUNCATE t",
+		"TRUNCATE TABLE a, b RESTART IDENTITY",
 	} {
 		sts, err := parser.Parse(q)
 		if err != nil {

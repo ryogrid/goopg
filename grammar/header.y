@@ -53,6 +53,7 @@ import (
 	fr     *parser.WindowFrame
 	ct     castType
 	isrc   *insSrc
+	onames []parser.ObjectName
 	oc     *parser.OnConflictClause
 	oct    *parser.OnConflictTarget
 	ualist []parser.UpdateAssign

@@ -625,3 +625,24 @@ type createPrefix struct {
 	temporary bool
 	unlogged  bool
 }
+
+// dropBehavior maps the trailing CASCADE/RESTRICT keyword ("" = default).
+func dropBehavior(s string) parser.DropBehavior {
+	if s == "cascade" {
+		return parser.DropCascade
+	}
+	return parser.DropDefault
+}
+
+// objectNameFromQn converts the grammar's dotted-name carrier into an
+// ObjectName (last part = name, previous = schema).
+func objectNameFromQn(q qname) parser.ObjectName {
+	var o parser.ObjectName
+	if n := len(q.parts); n > 0 {
+		o.Name = q.parts[n-1]
+		if n > 1 {
+			o.Schema = q.parts[n-2]
+		}
+	}
+	return o
+}

@@ -287,6 +287,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   INHERITS, USING access method, WITH options, ON COMMIT, TABLESPACE,
   AS query, IF NOT EXISTS.
 - [ ] **P4.3 ALTER TABLE**: full action list goopg supports.
+- [~] **P4.4 partial (2026-08-26)**: DROP TABLE (IF EXISTS, multi-name,
+  CASCADE/RESTRICT) + TRUNCATE (TABLE kw, multi-name, RESTART/CONTINUE
+  IDENTITY, behavior) landed AND flipped — drop via second-keyword dispatch
+  ("drop table"), truncate direct. Gate now pins 7 known S/Rs ('(' x2,
+  '[' x2, ON, IF_P x2 optional-empty class). CREATE/DROP INDEX still open.
 - [ ] **P4.4 DROP TABLE / TRUNCATE / INDEXes**: CREATE/DROP INDEX incl.
   partial/expression/concurrent flags. Flip wave-1 routing; initdb replay.
 

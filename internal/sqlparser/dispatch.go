@@ -60,6 +60,7 @@ var routedStmts = map[string]bool{
 	"insert": true, // P3.1
 	"update": true, // P3.2
 	"delete": true, // P3.3
+	"truncate": true, // P4.4
 	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 
@@ -98,10 +99,10 @@ func fragmentRouted(frag []parser.Token) bool {
 		if key == "with" {
 			return withFollowerRouted(frag)
 		}
-		if key == "create" {
-			// "create" leads every DDL class; route only the ported ones by
+		if key == "create" || key == "drop" {
+			// These lead many DDL classes; route only ported pairs by
 			// inspecting the SECOND meaningful keyword.
-			return createClassRouted(frag)
+			return secondKeywordRouted(frag, key)
 		}
 		return routedStmts[key]
 	case parser.TokenSymbol:
@@ -151,9 +152,19 @@ func withFollowerRouted(toks []parser.Token) bool {
 
 
 
-// createClassRouted reports whether a CREATE-led fragment's second keyword
-// names a ported DDL class. Unported classes stay legacy.
-func createClassRouted(frag []parser.Token) bool {
+// routedCreatePairs maps leading keyword -> set of ported second keywords.
+var routedCreatePairs = map[string]map[string]bool{
+	"create": {"table": true},
+	"drop":   {"table": true},
+}
+
+// secondKeywordRouted reports whether the fragment's first+second keyword
+// pair names a ported DDL class. Unported classes stay legacy.
+func secondKeywordRouted(frag []parser.Token, key string) bool {
+	allowed := routedCreatePairs[key]
+	if allowed == nil {
+		return false
+	}
 	var second string
 	found := false
 	for _, tok := range frag[1:] {
@@ -167,11 +178,7 @@ func createClassRouted(frag []parser.Token) bool {
 	if !found {
 		return false
 	}
-	switch second {
-	case "table":
-		return true // P4.1 v0
-	}
-	return false
+	return allowed[second]
 }
 
 func firstMeaningful(frag []parser.Token) *parser.Token {

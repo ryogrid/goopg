@@ -98,3 +98,46 @@ col_type_name:
 		cast_typename                            { $$ = &typeWithArgs{ct: $1} }
 	| col_type_name '(' ICONST ')'               { $1.(*typeWithArgs).args = []int64{int64($3)}; $$ = $1 }
 	| col_type_name '(' ICONST ',' ICONST ')'    { $1.(*typeWithArgs).args = []int64{int64($3), int64($5)}; $$ = $1 }
+
+
+/* drop_table_stmt / truncate_stmt — P4.4 (gram.y DropStmt / TruncateStmt
+   subsets). DROP uses the two-keyword dispatch ("drop table"); TRUNCATE
+   routes on its own leading keyword. ONLY-per-table and RESTART IDENTITY
+   forms arrive with a later slice. */
+drop_table_stmt:
+		DROP TABLE opt_if_exists_drop drop_name_list opt_drop_behavior
+			{
+				$$ = parser.NewDropTableStmt(0, $3, $4, dropBehavior($5))
+			}
+
+opt_if_exists_drop:
+		/* empty */   { $$ = false }
+	| IF_P EXISTS     { $$ = true }
+
+drop_name_list:
+		qualified_name                         { $$ = []parser.ObjectName{objectNameFromQn($1)} }
+	| drop_name_list ',' qualified_name        { $$ = append($1, objectNameFromQn($3)) }
+
+opt_drop_behavior:
+		/* empty */  { $$ = "" }
+	| CASCADE       { $$ = "cascade" }
+	| RESTRICT      { $$ = "restrict" }
+
+truncate_stmt:
+		TRUNCATE opt_TRUNCATE_kw drop_name_list opt_restart opt_drop_behavior
+			{
+				onl := make([]bool, len($3))
+				for i := range onl {
+					onl[i] = false
+				}
+				$$ = parser.NewTruncateStmt(0, $3, onl, dropBehavior($5), $4)
+			}
+
+opt_TRUNCATE_kw:
+		/* empty */  { _ = 0 }
+	| TABLE          { _ = 0 }
+
+opt_restart:
+		/* empty */            { $$ = false }
+	| RESTART IDENTITY_P       { $$ = true }
+	| CONTINUE_P IDENTITY_P   { $$ = false }
