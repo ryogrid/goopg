@@ -619,3 +619,9 @@ type typeWithArgs struct {
 	ct   castType
 	args []int64
 }
+
+// createPrefix carries CREATE [TEMP|TEMPORARY|UNLOGGED] modifiers.
+type createPrefix struct {
+	temporary bool
+	unlogged  bool
+}

@@ -72,7 +72,7 @@ func harvestSQLLiterals(t *testing.T) []string {
 // rise automatically as waves land. Floor keeps 5-headroom; NEVER lower
 // without a documented reason.
 // 2026-08-26 P4.1 v0 (CREATE TABLE basic forms): 167 total.
-const legacyCorpusParityFloor = 163
+const legacyCorpusParityFloor = 165
 
 func TestLegacyCorpusParity(t *testing.T) {
 	queries := harvestSQLLiterals(t)

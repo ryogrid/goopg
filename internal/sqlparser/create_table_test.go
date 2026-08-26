@@ -12,6 +12,9 @@ func TestCreateTableV0(t *testing.T) {
 		"CREATE TABLE t (a int, b text)",
 		"CREATE TABLE t (a int primary key, b text not null default 'x')",
 		"CREATE TABLE t (a int, b text, primary key (a))",
+		"CREATE TABLE IF NOT EXISTS t (a int)",
+		"CREATE TEMP TABLE tt (a int)",
+		"CREATE UNLOGGED TABLE uu (a int)",
 	} {
 		sts, err := parser.Parse(q)
 		if err != nil {

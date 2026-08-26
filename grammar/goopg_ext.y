@@ -16,9 +16,9 @@
    CHECK / FK / named constraints / WITH / partitioning arrive in later P4
    slices. */
 create_table_stmt:
-		CREATE TABLE qualified_name '(' table_element_list ')'
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' table_element_list ')'
 			{
-				elems := $5.([]*tableElem)
+				elems := $7.([]*tableElem)
 				var cols []parser.ColumnDef
 				var pk []string
 				var uqs [][]string
@@ -38,15 +38,34 @@ create_table_stmt:
 						uqs = append(uqs, e.uq...)
 					}
 				}
-				nm := $3.parts
+				nm := $5.parts
 	tbl := parser.ObjectName{Name: nm[len(nm)-1]}
 	if len(nm) > 1 {
 		tbl.Schema = nm[len(nm)-2]
 	}
-	ct := parser.NewCreateTableStmt(0, tbl, cols, pk)
+ 	ct := parser.NewCreateTableStmt(0, tbl, cols, pk)
+				for _, c := range cols {
+					ct.BodyOrder = append(ct.BodyOrder, c.Name)
+				}
+				if pfx := $2.(*createPrefix); pfx != nil {
+					ct.Temporary = pfx.temporary
+					ct.Unlogged = pfx.unlogged
+				}
+				ct.IfNotExists = $4
 				ct.TableUniques = uqs
 				$$ = ct
 			}
+
+/* opt_create_modifier — TEMP/TEMPORARY/UNLOGGED between CREATE and TABLE. */
+opt_create_modifier:
+		/* empty */   { $$ = (*createPrefix)(nil) }
+	| TEMP            { $$ = &createPrefix{temporary: true} }
+	| TEMPORARY       { $$ = &createPrefix{temporary: true} }
+	| UNLOGGED        { $$ = &createPrefix{unlogged: true} }
+
+opt_if_not_exists:
+		/* empty */       { $$ = false }
+	| IF_P NOT_LA EXISTS  { $$ = true }
 
 table_element_list:
 		table_element                           { $$ = []*tableElem{$1.(*tableElem)} }

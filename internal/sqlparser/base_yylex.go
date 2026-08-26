@@ -29,7 +29,7 @@ func initSubstRules() {
 	groups := map[string][]string{
 		"FORMAT":  {"JSON"},
 		"VALUES": {"("},
-		"NOT":     {"BETWEEN", "IN_P", "LIKE", "ILIKE", "SIMILAR"},
+		"NOT":     {"BETWEEN", "EXISTS", "IN_P", "LIKE", "ILIKE", "SIMILAR"},
 		"NULLS_P": {"FIRST_P", "LAST_P"},
 		"WITH":    {"TIME", "ORDINALITY"},
 		"WITHOUT": {"TIME"},
