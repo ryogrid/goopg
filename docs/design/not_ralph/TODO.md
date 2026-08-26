@@ -90,12 +90,15 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   NOT MATERIALIZED markers; TABLE/VALUES statement forms (VALUES gets the
   full base_select sort/limit/set-op tail). Grammar landed; routing NOT
   flipped yet (see P2-F).
-- [ ] **P1.7a VALUES/TABLE statement forms**: requires upstream's clause-
-  level split (sort/limit ONLY at select_no_parens; VALUES/TABLE inside
-  simple_select without trailing clauses) — attaching them to a base_select
-  wrapper that carries its own opt_sort/opt_select_limit produced S/R
-  against WITH RECURSIVE and '(' contexts. Port together with the P2-F
-  structural cleanup.
+- [x] **P1.7a VALUES/TABLE statement forms ✅**: landed as simple_select
+  alternatives (inheriting base_select's sort/limit + setop tail — no clause-
+  split needed after all). VALUES uses the upstream _LA mechanism: adapter
+  substitutes VALUES_LA when '(' follows (new synthetic token; also first
+  char-literal follower support in initSubstRules — "(" resolves via the
+  yylex1 ASCII contract), avoiding the col_name_keyword:VALUES R/R. TABLE
+  desugars to SELECT * FROM per gram.y :12968. Beyond-legacy capability:
+  WITH..TABLE and set-ops over VALUES parse (upstream-correct; legacy
+  rejects both). Parity 147->148; floor 145.
 - [x] **P2-F SELECT-family FLIP ✅**: typed-literal normalization (IDENT
   date/time/timestamp/interval + SCONST → SCONST only) fixed the Q12 gap.
   routedStmts["select"]=true; units 44 pkgs PASS; tpch-spotcheck Q12+Q13

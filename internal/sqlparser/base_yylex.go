@@ -20,6 +20,7 @@ var substRules []substRule
 func initSubstRules() {
 	pairs := []struct{ cur, la string }{
 		{"FORMAT", "FORMAT_LA"},
+		{"VALUES", "VALUES_LA"},
 		{"NOT", "NOT_LA"},
 		{"NULLS_P", "NULLS_LA"},
 		{"WITH", "WITH_LA"},
@@ -27,6 +28,7 @@ func initSubstRules() {
 	}
 	groups := map[string][]string{
 		"FORMAT":  {"JSON"},
+		"VALUES": {"("},
 		"NOT":     {"BETWEEN", "IN_P", "LIKE", "ILIKE", "SIMILAR"},
 		"NULLS_P": {"FIRST_P", "LAST_P"},
 		"WITH":    {"TIME", "ORDINALITY"},
@@ -42,7 +44,13 @@ func initSubstRules() {
 		}
 		followers := make(map[int]bool, len(groups[p.cur]))
 		for _, f := range groups[p.cur] {
-			if n, ok := nameToNum[f]; ok {
+			n, ok := nameToNum[f]
+			if !ok && len(f) == 1 {
+				// Char-literal terminal: ASCII code per the yylex1 contract
+				// (no named const exists for it in tokennums_gen.go).
+				n, ok = int(f[0]), true
+			}
+			if ok {
 				followers[n] = true
 			}
 		}

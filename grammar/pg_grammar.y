@@ -86,6 +86,7 @@
 %type <exprs>	opt_func_call_args
 %type <str>	subq_op extract_field
 %type <str>	opt_tzmark double_tail cast_ident character_word
+%type <vrows>	values_rows
 %type <ct>	cast_target cast_typename
 %type <ival>	opt_array_tail
 %type <exprs>	expr_list group_by_list
@@ -289,6 +290,25 @@ simple_select:
 				// must not swallow them.
 			}
 
+	| VALUES_LA values_rows
+			{
+				// lastConsumedPos is the VALUES keyword itself (select_pos
+				// equivalent without the mid-rule empty that would merge
+				// this state with col_name_keyword: VALUES).
+				s := parser.NewSelectStmt(yylex.(*lexerState).lastConsumedPos())
+				s.ValuesRows = $2
+				$$ = s
+			}
+	| TABLE qualified_name
+			{
+				// gram.y :12968 desugars TABLE <rel> to SELECT * FROM <rel>.
+				s := parser.NewSelectStmt(yylex.(*lexerState).lastConsumedPos())
+				rv := rangeVarFromName($2, "")
+				s.Targets = []parser.ResTarget{parser.NewResTarget(0, "", parser.NewStarExpr(0, "", ""))}
+				s.From = []parser.RangeVar{rv}
+				s.FromExprs = []parser.FromExpr{{Base: rv}}
+				$$ = s
+			}
 // opt_sort_clause / sort_by_list / SortBy — gram.y :13196-13220.
 opt_sort_clause:
 		/* empty */
@@ -2038,3 +2058,15 @@ cast_ident:
 	| BOOLEAN_P     { $$ = "boolean" }
 	| INTERVAL      { $$ = "interval" }
 
+
+/* values_rows — gram.y :13035 values_clause LIST subset: rows are '(' expr_list ')'
+   comma-separated; single-row VALUES and multi-type rows inherit the same shape. */
+values_rows:
+		'(' expr_list ')'
+			{
+				$$ = [][]parser.Expr{$2}
+			}
+	| values_rows ',' '(' expr_list ')'
+			{
+				$$ = append($1, $4)
+			}

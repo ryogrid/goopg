@@ -19,6 +19,7 @@ import (
    interval is NOT folded here: it is a real kwlist keyword and goes through
    the grammar's INTERVAL SCONST rule. */
 %token <str> TYPEDLIT
+%token <str> VALUES_LA
 
 %union {
 	str    string           // IDENT / SCONST / keyword text / Op value ...
