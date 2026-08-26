@@ -178,6 +178,17 @@ silently compared against the wrong number).
 So: adding a statement that uses `opt_if_not_exists` legitimately bumps the
 pin by exactly 1 (`IF_P`). Any other new conflict token = your bug.
 
+**A rule ends at the next `IDENT ':'`, not at a `;`** — this grammar uses no
+rule terminators. Inserting a new nonterminal in the MIDDLE of an existing
+rule therefore silently reassigns that rule's remaining alternatives to the
+new one, with no warning from goyacc. This happened in `2a55eff04` (the FK
+helper rules landed inside `col_constraint`, orphaning its `PRIMARY KEY`,
+`UNIQUE` and `DEFAULT` alternatives onto `fk_kw`) and disabled column-level
+PRIMARY KEY/UNIQUE/DEFAULT in the routed CREATE TABLE path — plus made
+`ON DELETE PRIMARY KEY` panic on a type assertion. **Append new alternatives
+to a rule directly under its existing ones, and after any insertion re-read
+the rule you inserted into, end to end.**
+
 **R/R (reduce/reduce) conflicts are almost always your bug.** Historical
 causes in this repo:
 
@@ -249,8 +260,18 @@ Parse(input)
 ## 9. Test gates
 
 - Fast iteration (~0.05 s): `go test ./internal/sqlparser/` —
-  `TestLegacyCorpusParity` (pinned floor 170; bump when a wave converts
-  diffs to identical), differential suites, `tpch_coverage_test.go`.
+  `TestLegacyCorpusParity` (floor is in the CODE — `corpus_parity_test.go`
+  `legacyCorpusParityFloor`, currently **218** against a measured 223; this
+  doc said "170" for a week because commit `2a55eff04`'s message claimed a
+  floor bump it never made. Read the constant, never a doc), differential
+  suites, `tpch_coverage_test.go` (floor 22/22).
+- The floor is a **regression guard, not a target**: re-pin it to
+  `measured − 5` in every wave that raises parity, and NEVER lower it to make
+  a diff go away — document the diff in `difftest_known_diffs.md` instead.
+- `diffParse` must call `ParseOneSrc`, never `ParseOne`. `ParseOne` leaves
+  `lexerState.src` empty, so every raw-source span (`RawDef`, `CheckExpr`,
+  SET values) silently compares as `""` on the yacc side and the harness
+  cannot see that whole class of field.
 - Planner/executor-touching changes additionally: `scripts/tpch-spotcheck.sh`
   (fresh capped server; canonical Q12/Q13 row counts).
 - **Never pass `-count=1` to a gate** — it defeats the test-result cache.
@@ -266,7 +287,9 @@ Parse(input)
 - Stage by explicit pathspec (`git add -A -- grammar/ internal/sqlparser/ ...`)
   — a concurrent Ralph loop's WIP may be present. Never bare `git add -A`.
 - Never `git commit --no-verify` — the hook runs the pgbench smoke.
-- Push both branches: `regress-renumbering` and `parse-refac`.
+- Push `parse-refac` ONLY. `regress-renumbering` is the Ralph loop's working
+  branch (M0134); the earlier wave pushed parser commits onto it, which mixes
+  two unrelated tracks.
 
 ---
 

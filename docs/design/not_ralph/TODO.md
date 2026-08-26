@@ -330,7 +330,23 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   CreateTableStmt.PartitionOf). NOTE: unit tests must wire
   parser.RouteBatch = RouteBatch explicitly (postmaster init is not linked
   into test binaries).
-- [x] **P4.3 ALTER TABLE v1 COMPLETE (2026-08-26)**: all executor-relevant
+- [~] **P4.3 ALTER TABLE v1 — GRAMMAR landed, routing was NEVER LIVE.**
+  Corrected 2026-08-27: `fragmentRouted` (`internal/sqlparser/dispatch.go`) only
+  delegated `create`/`drop` to `secondKeywordRouted`, and `"alter"` is not in
+  `routedStmts`, so every ALTER TABLE fell through to the legacy parser. The
+  `routedCreatePairs["alter"]["table"]` entry and all eight P4.2/P4.3 "flip"
+  commits were dead code that had never executed. Sizing before enabling it:
+  the legacy test corpus carries **138 distinct ALTER TABLE forms** and the
+  grammar covers roughly 20, and `routeBatch` does not fall back after routing
+  — a wholesale flip turns the other ~118 into hard 42601s. Enable via an
+  action-leader allowlist in the dispatcher (same strangler shape as
+  `routedCreatePairs`), widened only alongside the matching grammar
+  alternative and a differential case. Known field bugs to fix in the same
+  commit: `DROP CONSTRAINT` and `VALIDATE CONSTRAINT` set `OldConstraintName`
+  (reserved for RENAME CONSTRAINT) instead of `ConstraintName`, `DROP
+  CONSTRAINT` misses `IfExists`/`Restrict`, and `ADD COLUMN` misses
+  `NotNullExplicit`.
+  Original entry: all executor-relevant
   actions — ADD COLUMN/PK/FK/CHECK, DROP COLUMN/CONSTRAINT, ALTER COLUMN
   TYPE/SET DEFAULT/DROP DEFAULT/SET|DROP NOT NULL, RENAME TO/COLUMN,
   VALIDATE CONSTRAINT, REPLICA IDENTITY (f/n/d/i), OWNER TO, SET SCHEMA,
@@ -349,6 +365,57 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   four optional IF EXISTS clauses).
 - [ ] **P4.4 DROP TABLE / TRUNCATE / INDEXes**: CREATE/DROP INDEX incl.
   partial/expression/concurrent flags. Flip wave-1 routing; initdb replay.
+
+## Audit findings 2026-08-27 (first honest pgbench-smoke run)
+
+The previous wave landed every parser commit with `git commit --no-verify`, so
+the pre-commit pgbench smoke had not run since the P3.1 INSERT flip. Running it
+found one blocker; repairing the differential harness found five more defects in
+ALREADY-ROUTED statement classes. All six are fixed (see the P2.6 commit); what
+follows is what the audit left OPEN.
+
+- [ ] **`TestCreateTableV0` and `TestInsertOnConflictReturning` assert nothing.**
+  Both `t.Logf` on parse failure and `fmt.Printf` the result, and neither wires
+  `parser.RouteBatch = RouteBatch`, so they run entirely through the LEGACY
+  parser. Every DDL/utility wave from P4.1 to P6.2 therefore has ZERO enforced
+  differential coverage. Convert both to `diffParse` + `t.Errorf` (the shape
+  `values_table_test.go` and `cast_target_test.go` already use).
+- [ ] **Table-level unnamed `CHECK (...)` and `FOREIGN KEY (...) REFERENCES ...`
+  have no grammar.** Only the column-level forms are ported (`pg_grammar.y`
+  `col_constraint`), so
+  `CREATE TABLE t (a int, b int, foreign key (b) references o (id))` is a syntax
+  error on the routed path. `FOREIGN` is one of the reserved tokens no
+  production consumes (see the reachability item below).
+- [ ] **Named table constraints are parsed and then dropped.**
+  `table_element`'s `CONSTRAINT ColId {PRIMARY KEY|UNIQUE|CHECK}` alternatives
+  fill `tableElem.namedPk` / `namedUq` / `check` / `checkName`, but
+  `create_table_stmt`'s element loop only consumes `e.pk` and `e.uq`.
+- [ ] **Reserved-keyword reachability is unaudited.** 22 of the 78
+  `reserved_keyword`s and 8 of the 23 `type_func_name_keyword`s are never
+  referenced by any hand-written production, so they are unreachable and any
+  routed statement using one is a guaranteed syntax error — exactly how the
+  CURRENT_TIMESTAMP blocker happened. Still unreachable and relevant:
+  `FOREIGN` (above), `VARIADIC` (legacy fills `FuncCall.Variadic`),
+  `INITIALLY` (`DEFERRABLE INITIALLY DEFERRED`), `ASYMMETRIC`
+  (`BETWEEN ASYMMETRIC`), `BOTH`/`LEADING`/`TRAILING`/`PLACING` (the SQL
+  standard `TRIM`/`OVERLAY` forms — `TRIM`/`OVERLAY`/`POSITION`/`SUBSTRING`
+  special syntax is absent from the grammar entirely). The rest belong to
+  statement classes not yet ported. **Worth mechanising as a test** that
+  asserts each such token is either consumed by a production or on an explicit
+  not-yet-ported allowlist.
+- [ ] **`name_or_call` coerces nil args to `[]parser.Expr{}`** for
+  `qualified_name '(' opt_func_call_args ')'`, so every zero-arg call (`now()`,
+  `pg_backend_pid()`, `current_database()`) renders `Args=[]` where legacy
+  renders `∅`. A latent parity diff for the whole zero-arg call class; the new
+  `func_expr_common_subexpr` deliberately does NOT copy it.
+- [ ] **`pg_get_viewdef` returns empty on the live server.** Seen during the P5
+  CREATE VIEW slice and never recorded. The parser side is now testable
+  (`diffParse` uses `ParseOneSrc`, so `RawDef` is actually compared). Repro:
+  drop and recreate the view on a FRESH cluster, then
+  `SELECT pg_get_viewdef('v'::regclass)`. Storage is
+  `internal/executor/operators_ddl.go:6291` (`vt.ViewDef = s.RawDef`), read-back
+  is `internal/executor/expr.go:11569`. Leading suspects: catalog rows written
+  before `5cf25672a` fixed `RawDef`, or the name-vs-OID lookup path.
 
 ## P5 — DDL wave 2 (everything else CREATE/ALTER/DROP)
 

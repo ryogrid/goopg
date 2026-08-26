@@ -158,6 +158,22 @@ scripts/pg-regress-runner.sh -v int4 float8    # specific tests, show diff on fa
 # see postgres/src/test/recovery/t/ and postgres/src/test/subscription/t/
 ```
 
+## Parser code (goyacc migration)
+
+The SQL parser is mid-migration from the hand-written recursive-descent
+parser (`internal/parser`) to a goyacc-generated LALR parser
+(`internal/sqlparser`, grammar in `grammar/*.y`), via the strangler dispatch
+in `internal/sqlparser/dispatch.go`. Before touching ANYTHING in `grammar/`,
+`internal/sqlparser/`, or parser routing, read:
+
+1. `docs/design/not_ralph/06-goyacc-parser-playbook.md` — build loop, goyacc
+   error decoder, `$n` arithmetic rules, conflict-gate discipline, span
+   capture cookbook, routing, step-by-step recipe for new statement classes
+2. `docs/design/not_ralph/TODO.md` — current wave status, conflict pin,
+   known diffs, deferred slices
+3. `docs/design/not_ralph/02-grammar-porting-guide.md` and
+   `03-strangler-migration.md` — background and strategy
+
 ## Lint and format
 
 ```bash
