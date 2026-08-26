@@ -558,6 +558,7 @@ alter_table_action:
 				ct := $4.(*typeWithArgs)
 				cd := parser.NewColumnDef($3, parser.NewColumnType(ct.ct.schema, ct.ct.name, ct.args, false))
 				cd.NotNull = cc.notNull
+				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
 				a := parser.NewATAction(parser.AlterTableAddColumn)
 				a.Column = *cd
@@ -589,10 +590,17 @@ alter_table_action:
 				a.NewName = $3
 				$$ = a
 			}
-	| DROP CONSTRAINT ColId opt_drop_behavior
+	| DROP CONSTRAINT opt_if_exists_drop ColId opt_drop_behavior
 			{
+				// ConstraintName, NOT OldConstraintName — the latter is
+				// RENAME CONSTRAINT's field and is the only one the executor
+				// reads there (operators_ddl.go:10035), so this action used
+				// to drop nothing. Restrict defaults to TRUE and is cleared
+				// only by CASCADE (legacy ddl.go:9851-9862).
 				a := parser.NewATAction(parser.AlterTableDropConstraint)
-				a.OldConstraintName = $3
+				a.ConstraintName = $4
+				a.IfExists = $3
+				a.Restrict = $5 != "cascade"
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId SET DEFAULT a_expr
@@ -629,8 +637,9 @@ alter_table_action:
 			}
 	| VALIDATE CONSTRAINT ColId
 			{
+				// ConstraintName, not OldConstraintName (legacy ddl.go:9960).
 				a := parser.NewATAction(parser.AlterTableValidateConstraint)
-				a.OldConstraintName = $3
+				a.ConstraintName = $3
 				$$ = a
 			}
 	| REPLICA IDENTITY_P FULL

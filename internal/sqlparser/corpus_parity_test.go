@@ -77,7 +77,9 @@ func harvestSQLLiterals(t *testing.T) []string {
 // misattached to fk_kw, column CHECK/REFERENCES plumbing), the NOT_LA
 // follower-set fix (NOT EXISTS), and diffParse switching to ParseOneSrc so
 // raw-source spans are actually compared. Floor keeps the usual 5 headroom.
-const legacyCorpusParityFloor = 218
+// 2026-08-27 (ALTER narrow flip): 229 after the DROP/VALIDATE CONSTRAINT
+// ConstraintName fixes and ADD COLUMN NotNullExplicit.
+const legacyCorpusParityFloor = 224
 
 func TestLegacyCorpusParity(t *testing.T) {
 	queries := harvestSQLLiterals(t)

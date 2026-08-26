@@ -109,9 +109,12 @@ func fragmentRouted(frag []parser.Token) bool {
 		if key == "with" {
 			return withFollowerRouted(frag)
 		}
-		if key == "create" || key == "drop" {
+		if key == "create" || key == "drop" || key == "alter" {
 			// These lead many DDL classes; route only ported pairs by
-			// inspecting the SECOND meaningful keyword.
+			// inspecting the SECOND meaningful keyword. "alter" was missing
+			// here until 2026-08-27, so routedCreatePairs["alter"] and the
+			// whole alter_table_stmt grammar were dead code that had never
+			// executed despite eight commits claiming a routing flip.
 			return secondKeywordRouted(frag, key)
 		}
 		return routedStmts[key]
@@ -198,12 +201,257 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 		}
 	}
 	if modifierSeen {
-		return allowed["table"] == true && false || false // TEMP-prefixed non-table stays legacy
+		// CREATE TEMP|TEMPORARY|UNLOGGED <kind> stays LEGACY: the shared
+		// modifier prefix creates irreducible S/R conflicts with
+		// create_table_stmt (TODO.md P5 v0). Note the loop above breaks on the
+		// first non-skip word, so `second` is the MODIFIER here, never the
+		// object kind — a wave that wants to route CREATE TEMP TABLE has to
+		// fix the loop as well as this return. (Was written as
+		// `allowed["table"] == true && false || false`, a constant-false
+		// tautology that happened to have the right behaviour.)
+		return false
 	}
 	if !found {
 		return false
 	}
-	return allowed[second]
+	if !allowed[second] {
+		return false
+	}
+	if key == "alter" && second == "table" {
+		return alterTableActionsRouted(frag)
+	}
+	return true
+}
+
+// routedAlterTableActions names the ALTER TABLE actions that
+// grammar/goopg_ext.y's alter_table_action (and the whole-statement
+// alter_table_stmt alternatives) actually cover. The key is the action's
+// leading word, optionally plus its second word where the first alone is
+// ambiguous.
+//
+// WHY AN ALLOWLIST AND NOT A PLAIN ROUTING FLIP: the legacy parser accepts
+// ~138 distinct ALTER TABLE forms; this grammar covers about 20. routeBatch
+// does NOT fall back to legacy once a fragment is routed (see :91-95) — it
+// surfaces the yacc error — so routing the statement class wholesale would
+// turn every uncovered action into a hard 42601. This is the same strangler
+// shape as routedCreatePairs, one level deeper.
+//
+// Widen this set ONLY together with the matching grammar alternative AND a
+// differential case in alter_table_test.go. TestAlterTableRoutingIsNarrow
+// mechanically proves that everything not listed here stays on legacy.
+var routedAlterTableActions = map[string]bool{
+	"add column":          true,
+	"add primary":         true, // ADD PRIMARY KEY (cols)
+	"add <col>":           true, // bare ADD colname type
+	"drop column":         true,
+	"drop constraint":     true,
+	"alter column type":   true,
+	"alter column set":    true, // SET DEFAULT / SET NOT NULL only (checked below)
+	"alter column drop":   true, // DROP DEFAULT / DROP NOT NULL only (checked below)
+	"rename to":           true,
+	"rename column":       true,
+	"validate constraint": true,
+	"replica identity":    true,
+	"attach partition":    true,
+	"detach partition":    true,
+	// whole-statement forms (alter_table_stmt, not alter_action_list)
+	"owner to":   true,
+	"set schema": true,
+	"set logged": true,
+	"set (":      true,
+}
+
+// alterTableActionsRouted reports whether EVERY comma-separated action in an
+// ALTER TABLE fragment is one the grammar covers. A single uncovered action
+// sends the whole statement to legacy.
+func alterTableActionsRouted(frag []parser.Token) bool {
+	words := actionWords(frag)
+	if len(words) == 0 {
+		return false
+	}
+	for _, act := range splitTopLevelCommas(words) {
+		if !alterActionRouted(act) {
+			return false
+		}
+	}
+	return true
+}
+
+// actionWords returns the lowercased word/symbol sequence following
+// `ALTER TABLE [IF EXISTS] [ONLY] <qualified_name>`.
+func actionWords(frag []parser.Token) []string {
+	var w []string
+	for _, t := range frag {
+		switch t.Kind {
+		case parser.TokenKeyword, parser.TokenIdent:
+			w = append(w, strings.ToLower(t.Value))
+		case parser.TokenSymbol, parser.TokenOperator:
+			w = append(w, t.Value)
+		default:
+			w = append(w, "\x00lit") // literals: placeholder, never a keyword
+		}
+	}
+	i := 0
+	eat := func(s string) bool {
+		if i < len(w) && w[i] == s {
+			i++
+			return true
+		}
+		return false
+	}
+	if !eat("alter") || !eat("table") {
+		return nil
+	}
+	if eat("if") {
+		eat("exists")
+	}
+	eat("only")
+	// qualified_name: ident ('.' ident)*
+	if i >= len(w) {
+		return nil
+	}
+	i++
+	for i+1 < len(w) && w[i] == "." {
+		i += 2
+	}
+	return w[i:]
+}
+
+// splitTopLevelCommas splits an action list on commas at paren depth 0.
+func splitTopLevelCommas(w []string) [][]string {
+	var out [][]string
+	depth, start := 0, 0
+	for i, t := range w {
+		switch t {
+		case "(":
+			depth++
+		case ")":
+			depth--
+		case ",":
+			if depth == 0 {
+				out = append(out, w[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, w[start:])
+}
+
+// alterActionRouted classifies one action's leading words against
+// routedAlterTableActions. Anything it does not positively recognise stays
+// legacy — the safe direction.
+func alterActionRouted(a []string) bool {
+	if len(a) == 0 {
+		return false
+	}
+	at := func(n int) string {
+		if n < len(a) {
+			return a[n]
+		}
+		return ""
+	}
+	switch a[0] {
+	case "add":
+		switch at(1) {
+		case "column":
+			if at(2) == "if" {
+				return false // ADD COLUMN IF NOT EXISTS: no grammar
+			}
+			return routedAlterTableActions["add column"]
+		case "primary":
+			return routedAlterTableActions["add primary"]
+		case "constraint", "foreign", "check", "unique", "exclude", "if", "not", "generated":
+			return false // ADD CONSTRAINT / FK / CHECK / UNIQUE / EXCLUDE: no grammar
+		default:
+			// bare `ADD colname type` — alter_table_action's opt_COLUMN arm.
+			return routedAlterTableActions["add <col>"]
+		}
+	case "drop":
+		switch at(1) {
+		case "column":
+			if at(2) == "if" {
+				return false // DROP COLUMN IF EXISTS: no grammar
+			}
+			return routedAlterTableActions["drop column"]
+		case "constraint":
+			return routedAlterTableActions["drop constraint"]
+		default:
+			// Bare `DROP colname` is legal SQL but the grammar's DROP arm
+			// requires the COLUMN keyword.
+			return false
+		}
+	case "alter":
+		i := 1
+		if at(i) == "column" {
+			i++
+		}
+		if at(i) == "" {
+			return false
+		}
+		i++ // the column name
+		switch at(i) {
+		case "type":
+			// TYPE t USING expr is not covered.
+			for _, t := range a[i:] {
+				if t == "using" {
+					return false
+				}
+			}
+			return routedAlterTableActions["alter column type"]
+		case "set":
+			if at(i+1) == "default" || at(i+1) == "not" {
+				return routedAlterTableActions["alter column set"]
+			}
+			return false // SET STATISTICS / STORAGE / COMPRESSION / (attopts)
+		case "drop":
+			if at(i+1) == "default" || at(i+1) == "not" {
+				return routedAlterTableActions["alter column drop"]
+			}
+			return false // DROP IDENTITY / EXPRESSION
+		default:
+			return false
+		}
+	case "rename":
+		switch at(1) {
+		case "to":
+			return routedAlterTableActions["rename to"]
+		case "constraint":
+			return false
+		default:
+			// RENAME [COLUMN] old TO new
+			return routedAlterTableActions["rename column"]
+		}
+	case "validate":
+		return at(1) == "constraint" && routedAlterTableActions["validate constraint"]
+	case "replica":
+		return at(1) == "identity" && routedAlterTableActions["replica identity"]
+	case "attach":
+		return at(1) == "partition" && routedAlterTableActions["attach partition"]
+	case "detach":
+		// DETACH PARTITION p CONCURRENTLY / FINALIZE are not covered.
+		return at(1) == "partition" && len(a) == 3 && routedAlterTableActions["detach partition"]
+	case "owner":
+		// OWNER TO CURRENT_USER|SESSION_USER|CURRENT_ROLE cannot reduce: the
+		// grammar's target is ColId, which excludes reserved keywords.
+		switch at(2) {
+		case "current_user", "session_user", "current_role":
+			return false
+		}
+		return at(1) == "to" && routedAlterTableActions["owner to"]
+	case "set":
+		switch at(1) {
+		case "schema":
+			return routedAlterTableActions["set schema"]
+		case "logged", "unlogged":
+			return routedAlterTableActions["set logged"]
+		case "(":
+			return routedAlterTableActions["set ("]
+		default:
+			return false // SET TABLESPACE / ACCESS METHOD / WITH(OUT) ...
+		}
+	default:
+		return false
+	}
 }
 
 func firstMeaningful(frag []parser.Token) *parser.Token {
