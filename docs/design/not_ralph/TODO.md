@@ -237,7 +237,7 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 
 ## P3 — DML writes
 
-- [~] **P3.1 INSERT v0 LANDED 2026-08-26 (grammar only; routing INERT)**:
+- [~] **P3.1 INSERT v0 LANDED 2026-08-26 (grammar only; routing FLIPPED (createClassRouted two-keyword dispatch: "create"+"table" only))**:
   insert_stmt = [with_clause] INSERT INTO name [(cols)] source where source
   is SelectStmt (bare VALUES select converts to InsertStmt.Rows, legacy
   shape) or DEFAULT VALUES. KEY INSIGHT: the historic 3927 R/R was an
@@ -273,7 +273,7 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 ## P4 — DDL wave 1 (tables)
 
 - [~] **P4.1 CREATE TABLE v0 landed 2026-08-26 (grammar in goopg_ext.y;
-  routing INERT — "create" leads every DDL class so flipping needs
+  routing FLIPPED (createClassRouted two-keyword dispatch: "create"+"table" only) — "create" leads every DDL class so flipping needs
   two-keyword dispatch first)**: column defs (name + cast_typename type incl.
   typmods via col_type_name wrapper + NOT NULL / PRIMARY KEY / UNIQUE /
   DEFAULT), table-level PRIMARY KEY (cols) and UNIQUE (cols). Legacy shapes
