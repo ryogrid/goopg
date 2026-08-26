@@ -741,6 +741,12 @@ func applyFkAction(a *fkActs, n *namedFkAct) *fkActs {
 
 // ctTail carries trailing CREATE TABLE options (v2 flat alternatives).
 type ctTail struct {
+	partOf    parser.ObjectName
+	fromVals  []parser.Expr
+	toVals    []parser.Expr
+	inVals    []parser.Expr
+	bDefault  bool
+
 	withKv    []string
 	inherits  []parser.ObjectName
 	partition *parser.PartitionByClause
@@ -760,4 +766,9 @@ type txModes struct {
 	iso string
 	ro  bool
 	def bool
+}
+
+type partBound struct {
+	from, to, inVals []parser.Expr
+	isDefault        bool
 }

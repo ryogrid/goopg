@@ -305,6 +305,26 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   [IF EXISTS] [ONLY]; alter via second-keyword dispatch. Gate pins 13
   known S/Rs (IF_P x5). Multi-action lists, SET/DROP DEFAULT/NOT NULL,
   DROP CONSTRAINT, OWNER TO, SET SCHEMA, partition actions deferred.
+- [~] **P4.3b DONE + bare-name create alt (2026-08-26)**: PARTITION OF rides
+  opt_ct_tail(_noas); new bare `CREATE TABLE name opt_ct_tail_noas` alternative
+  covers column-less creates (PARTITION OF / INHERITS / WITH / PARTITION BY
+  without a coldef list). opt_ct_tail_noas excludes AS to avoid R/R with the
+  pre-existing create_table_stmt_as rule (conflicts stay 13).
+  KNOWN EXECUTOR GAP (pre-existing, not parser): INSERT into partitioned
+  parent fails "no partition of relation found" even with valid bounds.
+- [~] **P4.3b CREATE TABLE ... PARTITION OF (2026-08-26)**: rides opt_ct_tail
+  (PARTITION OF qn + RANGE/IN/DEFAULT bounds via partBound carrier →
+  CreateTableStmt.PartitionOf). NOTE: unit tests must wire
+  parser.RouteBatch = RouteBatch explicitly (postmaster init is not linked
+  into test binaries).
+- [x] **P4.3 ALTER TABLE v1 COMPLETE (2026-08-26)**: all executor-relevant
+  actions — ADD COLUMN/PK/FK/CHECK, DROP COLUMN/CONSTRAINT, ALTER COLUMN
+  TYPE/SET DEFAULT/DROP DEFAULT/SET|DROP NOT NULL, RENAME TO/COLUMN,
+  VALIDATE CONSTRAINT, REPLICA IDENTITY (f/n/d/i), OWNER TO, SET SCHEMA,
+  SET (reloptions), SET LOGGED|UNLOGGED, multi-action comma lists,
+  ATTACH/DETACH PARTITION (RANGE/IN/DEFAULT; CONCURRENTLY unsupported by
+  legacy too). pos fields of partition actions are 0 vs legacy child-name
+  offset (error-position only).
 - [ ] **P4.3 ALTER TABLE**: full action list goopg supports.
 - [~] **P4.4 partial (2026-08-26)**: DROP TABLE (IF EXISTS, multi-name,
   CASCADE/RESTRICT) + TRUNCATE (TABLE kw, multi-name, RESTART/CONTINUE

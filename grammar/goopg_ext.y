@@ -75,8 +75,56 @@ create_table_stmt:
 				}
 				ct.Inherits = tail.inherits
 				ct.PartitionBy = tail.partition
+				if tail.partOf.Name != "" {
+					ct.PartitionOf = parser.NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
+				}
 				ct.SelectSource = tail.asSelect
 				$$ = ct
+			}
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name opt_ct_tail_noas
+			{
+				nm := $5.parts
+				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
+				if len(nm) > 1 {
+					tbl.Schema = nm[len(nm)-2]
+				}
+				ct := parser.NewCreateTableStmt(0, tbl, nil, nil)
+				ct.IfNotExists = $4
+				if pfx := $2.(*createPrefix); pfx != nil {
+					ct.Temporary = pfx.temporary
+					ct.Unlogged = pfx.unlogged
+				}
+				tail := $6
+				for _, kv := range tail.withKv {
+					if ct.With == nil {
+						ct.With = map[string]string{}
+					}
+					parts := splitKV(kv)
+					if len(parts) == 2 {
+						ct.With[parts[0]] = parts[1]
+					}
+				}
+				ct.Inherits = tail.inherits
+				ct.PartitionBy = tail.partition
+				if tail.partOf.Name != "" {
+					ct.PartitionOf = parser.NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
+				}
+				ct.SelectSource = tail.asSelect
+				$$ = ct
+			}
+
+part_bound_spec2:
+		FOR VALUES IN_P '(' expr_list ')'
+			{
+				$$ = &partBound{inVals: $5}
+			}
+	| FOR VALUES FROM '(' expr_list ')' TO '(' expr_list ')'
+			{
+				$$ = &partBound{from: $5, to: $9}
+			}
+	| DEFAULT
+			{
+				$$ = &partBound{isDefault: true}
 			}
 
 /* opt_create_modifier — TEMP/TEMPORARY/UNLOGGED between CREATE and TABLE. */
@@ -215,6 +263,48 @@ opt_ct_tail:
 					pb.Collations = append(pb.Collations, "")
 				}
 				i := &ctTail{}; i.partition = pb; $$ = i
+			}
+	| PARTITION OF qualified_name part_bound_spec2
+			{
+				nm := $3.parts
+				par := parser.ObjectName{Name: nm[len(nm)-1]}
+				if len(nm) > 1 {
+					par.Schema = nm[len(nm)-2]
+				}
+				i := &ctTail{}
+				i.partOf = par
+				b := $4.(*partBound)
+				i.fromVals, i.toVals, i.inVals, i.bDefault = b.from, b.to, b.inVals, b.isDefault
+				$$ = i
+			}
+opt_ct_tail_noas:
+		/* empty */     { $$ = &ctTail{} }
+	| WITH '(' str_pair_list ')'
+			{ i := &ctTail{}; i.withKv = $3; $$ = i }
+	| INHERITS '(' drop_name_list ')'
+			{ i := &ctTail{}; i.inherits = $3; $$ = i }
+	| PARTITION BY ColId '(' colid_list ')'
+			{
+				pb := parser.NewPartitionByClause(upperIdent($3), nil)
+				for _, c := range $5 {
+					pb.KeyCols = append(pb.KeyCols, c)
+					pb.OpClasses = append(pb.OpClasses, "")
+					pb.Collations = append(pb.Collations, "")
+				}
+				i := &ctTail{}; i.partition = pb; $$ = i
+			}
+	| PARTITION OF qualified_name part_bound_spec2
+			{
+				nm := $3.parts
+				par := parser.ObjectName{Name: nm[len(nm)-1]}
+				if len(nm) > 1 {
+					par.Schema = nm[len(nm)-2]
+				}
+				i := &ctTail{}
+				i.partOf = par
+				b := $4.(*partBound)
+				i.fromVals, i.toVals, i.inVals, i.bDefault = b.from, b.to, b.inVals, b.isDefault
+				$$ = i
 			}
 
 str_pair_list:
@@ -549,6 +639,22 @@ alter_table_action:
 				a.ReplicaIdentityMode = "i"
 				a.ReplicaIdentityIndex = $5
 				$$ = a
+			}
+	| ATTACH PARTITION qualified_name FOR VALUES IN_P '(' expr_list ')'
+			{
+				$$ = parser.NewATAttachPartition(0, objectNameFromQn($3), nil, nil, $8, false)
+			}
+	| ATTACH PARTITION qualified_name FOR VALUES FROM '(' expr_list ')' TO '(' expr_list ')'
+			{
+				$$ = parser.NewATAttachPartition(0, objectNameFromQn($3), $8, $12, nil, false)
+			}
+	| ATTACH PARTITION qualified_name DEFAULT
+			{
+				$$ = parser.NewATAttachPartition(0, objectNameFromQn($3), nil, nil, nil, true)
+			}
+	| DETACH PARTITION qualified_name
+			{
+				$$ = parser.NewATDetachPartition(0, objectNameFromQn($3))
 			}
 
 opt_COLUMN:

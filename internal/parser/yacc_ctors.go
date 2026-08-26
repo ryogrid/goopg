@@ -368,3 +368,28 @@ func NewAlterTableStmt(pos int, name ObjectName) *AlterTableStmt {
 func NewATAction(kind AlterTableActionKind) *AlterTableAction {
 	return &AlterTableAction{pos: 0, Kind: kind}
 }
+
+// NewATAttachPartition builds ATTACH PARTITION (Kind=5) with bounds.
+func NewATAttachPartition(pos int, parent ObjectName, fromVals, toVals, inVals []Expr, isDefault bool) *AlterTableAction {
+	poc := &PartitionOfClause{pos: pos, Parent: parent, FromValues: fromVals, ToValues: toVals, InValues: inVals, Default: isDefault}
+	return &AlterTableAction{pos: pos, Kind: AlterTableAttachPartition, AttachPartitionOf: poc}
+}
+
+// NewATDetachPartition builds DETACH PARTITION (Kind=6).
+func NewATDetachPartition(pos int, child ObjectName) *AlterTableAction {
+	return &AlterTableAction{pos: pos, Kind: AlterTableDetachPartition, DetachPartitionChild: child}
+}
+
+// NewCreateTablePartOf builds CREATE TABLE name [(cols)] PARTITION OF parent
+// with bounds. colDefs may be empty.
+func NewCreateTablePartOf(name ObjectName, colDefs []ColumnDef, parent ObjectName, fromVals, toVals, inVals []Expr, isDefault bool) *CreateTableStmt {
+	poc := &PartitionOfClause{pos: 0, Parent: parent, FromValues: fromVals, ToValues: toVals, InValues: inVals, Default: isDefault}
+	st := NewCreateTableStmt(0, name, colDefs, nil)
+	st.PartitionOf = poc
+	return st
+}
+
+// NewPartitionOfClause builds the PARTITION OF parent FOR VALUES clause.
+func NewPartitionOfClause(parent ObjectName, fromVals, toVals, inVals []Expr, isDefault bool) *PartitionOfClause {
+	return &PartitionOfClause{pos: 0, Parent: parent, FromValues: fromVals, ToValues: toVals, InValues: inVals, Default: isDefault}
+}

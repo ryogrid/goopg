@@ -88,7 +88,7 @@
 %type <str>	subq_op extract_field
 %type <str>	opt_tzmark double_tail cast_ident character_word opt_upd_alias
 %type <vrows>	values_rows
-%type <node>	opt_create_modifier opt_TRUNCATE_kw alter_table_action alter_action_list
+%type <node>	opt_create_modifier opt_TRUNCATE_kw alter_table_action alter_action_list part_bound_spec2
 %type <b>	opt_ONLY_kw
 %type <node>	opt_COLUMN
 %type <strs>	index_col_list
@@ -107,7 +107,7 @@
 %type <strs>	opt_ref_cols
 %type <node>	opt_fk_actions fk_actions fk_action fk_kw
 %type <expr>	opt_update_where
-%type <ctt>	opt_ct_tail
+%type <ctt>	opt_ct_tail opt_ct_tail_noas
 %type <strs>	str_pair_list
 %type <str>	str_pair with_value opt_using_method
 %type <node>	upd_where del_where
