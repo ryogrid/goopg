@@ -520,6 +520,17 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			// Idle skip (xlog.c:7005–7019): a timeout checkpoint that would
+			// start at the same WAL position as the last completed one is a
+			// no-op upstream — nothing to flush, redo unchanged. Skip when
+			// nothing has been written since the last anchor. FORCE /
+			// shutdown / volume paths never take this shortcut.
+			if vr != nil {
+				start := c.lastCheckpointStartLSN.Load()
+				if start != 0 && vr.WrittenLSN() <= start {
+					continue
+				}
+			}
 			if err := c.runCheckpoint(ctx, true, false); err != nil {
 				c.cfg.Logger.Warn("checkpoint failed", "err", err)
 			}
