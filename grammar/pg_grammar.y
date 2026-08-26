@@ -1919,11 +1919,12 @@ name_or_call:
 	| qualified_name '(' opt_func_call_args ')'
 			{
 				ft := splitFuncName($1)
-				args := $3
-				if args == nil {
-					args = []parser.Expr{}
-				}
-				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, args, false)
+				// Pass $3 through NIL. Legacy's parseFuncCallTail returns on the
+				// empty-parens path without touching fc.Args (select.go:4778), so
+				// `now()` is Args=∅; coercing to []parser.Expr{} made every
+				// non-OVER zero-arg call a parity diff. The OVER alternatives
+				// below already pass $3 straight through.
+				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3, false)
 			}
 	| qualified_name '(' '*' ')'
 			{
@@ -2296,7 +2297,7 @@ opt_on_conflict:
 
 opt_arbiter:
 		/* empty */               { $$ = nil }
-	| '(' colid_list ')'          { $$ = parser.NewOnConflictTarget($2, "", nil) }
+	| '(' colid_list ')'          { $$ = onConflictColumnTarget($2) } /* Exprs stays parallel to Columns */
 	| ON CONSTRAINT ColId { $$ = parser.NewOnConflictTarget(nil, $3, nil) }
 
 update_set_list:

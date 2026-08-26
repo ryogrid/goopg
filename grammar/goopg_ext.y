@@ -419,7 +419,7 @@ opt_tx_modes:
 
 tx_mode_list:
 		tx_mode                  { $$ = $1 }
-	| tx_mode_list ',' tx_mode   { $$ = $1 }
+	| tx_mode_list ',' tx_mode   { $$ = mergeTxModes($1.(*txModes), $3.(*txModes)) } /* $$ = $1 dropped every mode after the first */
 
 tx_mode:
 		ISOLATION LEVEL iso_level     { i := &txModes{}; i.iso = $3.(string); $$ = i }
@@ -444,19 +444,23 @@ tx_rollback:
 	| ABORT_P                   { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
 
 /* set/show/reset — P6.2 (gram.y VariableSetStmt / VariableShowStmt /
-   VariableResetStmt subsets). Value keeps the RAW source span from after
-   the '=' / TO up to the statement's last token (legacy parity: quotes are
-   NOT re-added, comma lists stay textual). DEFAULT and RESET/SHOW ALL are
+   VariableResetStmt subsets). Value is the legacy token-atom join, NOT a
+   source span: each value token's decoded text joined with ", " (see
+   setValueAtoms / internal/parser/parser.go:3056), so quotes are stripped. DEFAULT and RESET/SHOW ALL are
    separate shapes. SET TIME ZONE / FROM CURRENT arrive later. */
 set_stmt:
 		SET set_scope ColId set_eq_to DEFAULT
 			{
 				$$ = parser.NewSetStmt(yylex.(*lexerState).lastConsumedPos(), $2, $3, "", true)
 			}
-	| SET set_scope ColId set_eq_to { yylex.(*lexerState).markSpanStart() } expr_list
+	| SET set_scope ColId set_eq_to expr_list
 			{
-				_ = $6
-				$$ = parser.NewSetStmt(0, $2, $3, yylex.(*lexerState).spanText(), false)
+				_ = $5
+				// spanTextUpTo(spanEnd()), NOT spanText(): at the statement-final
+				// reduce the lookahead is EOF and Lex zeroes lastPos/lastText, so
+				// spanText()'s end landed at 0 and EVERY routed `SET name = value`
+				// stored an empty value (search_path, timezone, work_mem included).
+				$$ = parser.NewSetStmt(0, $2, $3, yylex.(*lexerState).setValueAtoms(), false)
 			}
 
 set_scope:
@@ -778,7 +782,11 @@ opt_with_data:
 with_data_kw:
 		WITH
 			{
+				// The WITH token's own START is the body's exclusive end, and
+				// unlike prevPos+len(prevText) it is quote-safe: prevText is the
+				// DECODED token text, so a body ending in a literal ('x') cut
+				// inside the quotes and produced RawDef="SELECT '".
 				l := yylex.(*lexerState)
-				l.endMark = l.prevPos + len(l.prevText)
+				l.endMark = l.lastPos
 				_ = 0
 			}

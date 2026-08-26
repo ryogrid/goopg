@@ -79,7 +79,10 @@ func harvestSQLLiterals(t *testing.T) []string {
 // raw-source spans are actually compared. Floor keeps the usual 5 headroom.
 // 2026-08-27 (ALTER narrow flip): 229 after the DROP/VALIDATE CONSTRAINT
 // ConstraintName fixes and ADD COLUMN NotNullExplicit.
-const legacyCorpusParityFloor = 224
+// 2026-08-27 (routed AST-carrier fixes): 247 after the SET value, ON CONFLICT
+// arbiter Exprs, transaction-mode-list, zero-arg FuncCall.Args and
+// fragEndPos/endMark quoted-tail repairs.
+const legacyCorpusParityFloor = 242
 
 func TestLegacyCorpusParity(t *testing.T) {
 	queries := harvestSQLLiterals(t)

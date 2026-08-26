@@ -160,18 +160,91 @@ func (l *lexerState) errAsError() error {
 
 // fragEndPos returns the exclusive end offset of the fragment's last real
 // token (a trailing ';' contributes its START, so the span excludes it).
+//
+// Prefer a delimiter's POSITION over the last token's Pos+len(Value): Value is
+// the DECODED text, so a trailing quoted literal ('64MB' -> Value "64MB") or
+// quoted identifier under-counts by its quotes and truncates the span. Both
+// delimiters are exact: the lexer appends an EOF token whose Pos is the end of
+// input, and a fragment that ends at ';' has the ';' Pos.
 func fragEndPos(src string, toks []parser.Token) int {
+	eof := -1
 	for i := len(toks) - 1; i >= 0; i-- {
 		t := toks[i]
 		if t.Kind == parser.TokenEOF {
+			eof = t.Pos // end of input; only whitespace can follow the last token
 			continue
 		}
 		if t.Value == ";" {
-			return t.Pos
+			return t.Pos // trailing ';' is excluded from the span
 		}
-		return t.Pos + len(t.Value)
+		if eof >= 0 {
+			return eof // exact, and quote-safe (TrimSpace drops the gap)
+		}
+		return t.Pos + len(t.Value) // no delimiter available: best effort
 	}
 	return len(src)
+}
+
+// setValueAtoms reconstructs a SET statement's value the way legacy does.
+//
+// This is NOT a raw source span: internal/parser/parseSetValueAtoms
+// (parser.go:3056) walks the value tokens and joins their DECODED text with
+// ", ". So `SET work_mem = '64MB'` yields `64MB` — quotes stripped — while
+// `SET search_path TO public, pg_catalog` yields the two atoms rejoined. A
+// source span matches only by accident, whenever the input already has single
+// spaces and no quotes.
+//
+// Scanning the token slice also sidesteps the mid-rule markSpanStart() this
+// rule used to use, which is not lookahead-stable: in `SET name = value` the
+// parser has already consumed the first value token to decide the set_eq_to
+// reduce, so peek() pointed one token PAST the value — `SET x = 1` captured ""
+// (peek was EOF) and `SET search_path TO public, pg_catalog` captured
+// ", pg_catalog". Every routed SET was therefore storing a wrong value.
+//
+// The GUC name is a ColId and can be neither '=' nor TO, so the first
+// occurrence of either is always the separator.
+func (l *lexerState) setValueAtoms() string {
+	i := 0
+	for ; i < len(l.toks); i++ {
+		t := l.toks[i]
+		if t.Kind == parser.TokenOperator && t.Value == "=" {
+			break
+		}
+		if (t.Kind == parser.TokenKeyword || t.Kind == parser.TokenIdent) && strings.EqualFold(t.Value, "to") {
+			break
+		}
+	}
+	if i >= len(l.toks) {
+		return ""
+	}
+	var atoms []string
+	for i++; i < len(l.toks); i++ {
+		t := l.toks[i]
+		switch t.Kind {
+		case parser.TokenIntLit, parser.TokenNumericLit, parser.TokenStringLit,
+			parser.TokenIdent, parser.TokenQuotedIdent, parser.TokenKeyword:
+			atoms = append(atoms, t.Value)
+		case parser.TokenOperator:
+			// Leading minus on a numeric value (legacy parser.go:3075-3085).
+			if t.Value == "-" && i+1 < len(l.toks) {
+				n := l.toks[i+1]
+				if n.Kind == parser.TokenIntLit || n.Kind == parser.TokenNumericLit {
+					atoms = append(atoms, "-"+n.Value)
+					i++
+					continue
+				}
+			}
+			return strings.Join(atoms, ", ")
+		case parser.TokenSymbol:
+			if t.Value == "," {
+				continue
+			}
+			return strings.Join(atoms, ", ")
+		default:
+			return strings.Join(atoms, ", ")
+		}
+	}
+	return strings.Join(atoms, ", ")
 }
 
 func eofPos(toks []parser.Token) int {

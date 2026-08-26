@@ -767,6 +767,44 @@ type txModes struct {
 	def bool
 }
 
+// onConflictColumnTarget builds an `ON CONFLICT (cols)` arbiter with the Exprs
+// slice legacy keeps PARALLEL to Columns — one entry per column, nil for a
+// plain name, non-nil only for an expression column (internal/parser/dml.go
+// parseConflictTargetColumnList). Leaving it nil made every column arbiter
+// diverge as Exprs=∅ vs legacy's [∅]; NewOnConflictTarget's third parameter is
+// `where`, not the expression list, so it has to be filled in afterwards.
+func onConflictColumnTarget(cols []string) *parser.OnConflictTarget {
+	t := parser.NewOnConflictTarget(cols, "", nil)
+	t.Exprs = make([]parser.Expr, len(cols))
+	return t
+}
+
+// mergeTxModes folds a later transaction_mode_item into the accumulated set.
+// `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` used to keep only the first
+// item because tx_mode_list's recursive alternative returned $1 unchanged, so
+// every mode after the comma was silently dropped on the routed path. Later
+// items win, matching legacy's sequential assignment (internal/parser/ddl.go
+// transaction-mode loop); READ WRITE / NOT DEFERRABLE carry the zero value and
+// therefore correctly leave the accumulated flags alone.
+func mergeTxModes(acc, next *txModes) *txModes {
+	if next == nil {
+		return acc
+	}
+	if acc == nil {
+		return next
+	}
+	if next.iso != "" {
+		acc.iso = next.iso
+	}
+	if next.ro {
+		acc.ro = true
+	}
+	if next.def {
+		acc.def = true
+	}
+	return acc
+}
+
 type partBound struct {
 	from, to, inVals []parser.Expr
 	isDefault        bool
