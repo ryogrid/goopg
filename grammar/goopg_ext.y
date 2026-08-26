@@ -373,14 +373,24 @@ reset_stmt:
    RENAME TO. Multi-action lists, DROP DEFAULT/NOT NULL, SET forms and
    partition actions arrive in later slices. */
 alter_table_stmt:
-		ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name alter_table_action
+		ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name alter_action_list
 			{
-				at := $6.(*parser.AlterTableAction)
+				acts := $6.([]parser.AlterTableAction)
 				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
-				st.Actions = []parser.AlterTableAction{*at}
+				st.Actions = acts
 				$$ = st
+			}
+
+alter_action_list:
+		alter_table_action
+			{
+				$$ = []parser.AlterTableAction{*($1.(*parser.AlterTableAction))}
+			}
+	| alter_action_list ',' alter_table_action
+			{
+				$$ = append($$.([]parser.AlterTableAction), *($3.(*parser.AlterTableAction)))
 			}
 
 opt_ONLY_kw:
