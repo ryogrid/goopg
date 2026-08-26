@@ -82,6 +82,14 @@ func (l *lexerState) spanText() string {
 	return strings.TrimSpace(l.src[l.spanStart:end])
 }
 
+// spanTextCloseParen captures a raw span whose body is immediately followed
+// by the ')' the rule has already shifted (CHECK (expr), and any future
+// parenthesised body). spanText() would run to the END of that ')' and
+// return "a > 0)"; the ')' START is the body's exclusive end. Verified
+// against the legacy captureSrcSpan output for column- and table-level
+// CHECK in TestCheckConstraintSpanParity.
+func (l *lexerState) spanTextCloseParen() string { return l.spanTextUpTo(l.lastPos) }
+
 // spanEnd returns endMark when set, else fragEnd (covers stmts with a
 // trailing optional clause that must stay out of the captured span).
 func (l *lexerState) spanEnd() int {

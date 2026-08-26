@@ -98,7 +98,12 @@ func diffParse(sql string) (legacy, yacc string, err error) {
 	if err != nil {
 		return "", "", fmt.Errorf("lex: %w", err)
 	}
-	nstmts, err := ParseOne(toks, 0)
+	// ParseOneSrc, not ParseOne: routeBatch (dispatch.go:91) always calls the
+	// src-carrying entry point, and every raw-source span rule (view RawDef,
+	// CHECK text, SET values) returns "" when lexerState.src is empty. Using
+	// ParseOne here made the harness structurally blind to that whole class —
+	// a column-level CHECK compared equal while dropping its expression.
+	nstmts, err := ParseOneSrc(sql, toks)
 	if err != nil {
 		return "", "", fmt.Errorf("yacc: %w", err)
 	}

@@ -614,7 +614,6 @@ type tableElem struct {
 
 // colConstraints accumulates a column's constraint suffix in CREATE TABLE.
 type colConstraints struct {
-	args       []int64
 	notNull    bool
 	primary    bool
 	unique     bool

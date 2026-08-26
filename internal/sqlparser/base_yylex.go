@@ -29,7 +29,13 @@ func initSubstRules() {
 	groups := map[string][]string{
 		"FORMAT":  {"JSON"},
 		"VALUES": {"("},
-		"NOT":     {"BETWEEN", "EXISTS", "IN_P", "LIKE", "ILIKE", "SIMILAR"},
+		// EXACTLY upstream's set (parser.c base_yylex: BETWEEN, IN_P, LIKE,
+		// ILIKE, SIMILAR). EXISTS was here by mistake: it made `NOT EXISTS`
+		// lex as NOT_LA EXISTS, and NOT_LA only appears in the
+		// `a_expr NOT_LA BETWEEN|IN|LIKE...` alternatives, so every
+		// `NOT EXISTS (...)` was a syntax error on the routed SELECT path
+		// (TPC-H Q21 and Q22 among them).
+		"NOT":     {"BETWEEN", "IN_P", "LIKE", "ILIKE", "SIMILAR"},
 		"NULLS_P": {"FIRST_P", "LAST_P"},
 		"WITH":    {"TIME", "ORDINALITY"},
 		"WITHOUT": {"TIME"},

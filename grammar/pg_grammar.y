@@ -83,6 +83,8 @@
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call
+%type <expr>	func_expr_common_subexpr
+%type <str>	sql_value_func_name
 %type <node>	cse_wl when_then filter_clause within_group_clause
 %type <exprs>	opt_func_call_args
 %type <str>	subq_op extract_field
@@ -1782,6 +1784,59 @@ c_expr:
 			{
 				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: $5.name}, typmodsFor($5.name, nil, 0))
 			}
+	| func_expr_common_subexpr
+			{
+				$$ = $1
+			}
+
+/* func_expr_common_subexpr — gram.y :15812ff, restricted to the SQL value
+   functions (the niladic "no-parens" family). goopg's AST has no
+   SQLValueFunction node: the legacy parser emits a plain zero-arg FuncCall
+   carrying the lower-cased name (internal/parser/select.go:4729-4731,
+   classified by IsNoParenFuncName at :4753), so the actions below must
+   reproduce that shape byte-for-byte or the differential harness diffs.
+
+   These tokens are RESERVED, so ColId/ColLabel exclude them and nothing
+   else in the grammar consumed them — before this rule every one of them
+   was unreachable, which is what broke `INSERT INTO pgbench_history
+   (..., mtime) VALUES (..., CURRENT_TIMESTAMP)` once INSERT was routed
+   (P3.1). SYSTEM_USER is deliberately ABSENT: IsNoParenFuncName does not
+   list it, so legacy treats it as a bare identifier and adding it here
+   would create a parity diff, not fix one.
+
+   The call form covers both `current_timestamp()` (legacy: parseFuncCallTail
+   returns immediately on ')' leaving Args and Variadic nil) and the
+   precision form `current_timestamp(3)` (Args=[IntegerConst],
+   Variadic=[false] — what NewFuncCall appends for a non-star call). Passing
+   $3 straight through preserves the nil, which name_or_call deliberately
+   does NOT do; matching legacy is what matters here. */
+func_expr_common_subexpr:
+		sql_value_func_name
+			{
+				$$ = parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: $1}, nil, false)
+			}
+	| sql_value_func_name '(' opt_func_call_args ')'
+			{
+				$$ = parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: $1}, $3, false)
+			}
+
+/* sql_value_func_name — the exact eleven names IsNoParenFuncName accepts.
+   Keep this list and internal/parser/select.go:4753-4762 in sync: they are
+   sibling paths (encode/decode-style) and a name present in only one of
+   them is a silent parity diff. */
+sql_value_func_name:
+		CURRENT_TIMESTAMP	{ $$ = "current_timestamp" }
+	| CURRENT_DATE		{ $$ = "current_date" }
+	| CURRENT_TIME		{ $$ = "current_time" }
+	| LOCALTIMESTAMP	{ $$ = "localtimestamp" }
+	| LOCALTIME		{ $$ = "localtime" }
+	| CURRENT_USER		{ $$ = "current_user" }
+	| SESSION_USER		{ $$ = "session_user" }
+	| USER			{ $$ = "user" }
+	| CURRENT_ROLE		{ $$ = "current_role" }
+	| CURRENT_CATALOG	{ $$ = "current_catalog" }
+	| CURRENT_SCHEMA	{ $$ = "current_schema" }
+
 /* b_expr — gram.y :15040ff subset: the operand grammar for predicates that
    must not swallow AND/BETWEEN/IN/LIKE keywords. Kept name-identical to
    upstream for greppability; grows alongside a_expr waves. */
@@ -2432,14 +2487,29 @@ col_constraints:
 					cc.unique = true
 				case "def":
 					cc.defExpr = k.expr
+				case "check":
+					cc.checkText = k.text // column-level CHECK carries no name
+				case "fk":
+					cc.fk = k.fk
 				}
 				$$ = cc
 			}
 
 col_constraint:
 		NOT NULL_P        { $$ = &colConstraint{kind: "nn"} }
+	/* PRIMARY KEY / UNIQUE / DEFAULT used to sit at the END of fk_kw below:
+	   the FK rules (opt_ref_cols … fk_kw) were inserted between REFERENCES
+	   and these three alternatives, so yacc read them as fk_kw alternatives.
+	   Effects, all live because CREATE TABLE is routed: `a int primary key`,
+	   `a int unique` and `a int default 0` were syntax errors, and
+	   `ON DELETE PRIMARY KEY` PANICKED applyFkAction with an interface
+	   conversion (*colConstraint is not parser.FKAction). Keep new
+	   col_constraint alternatives ABOVE the FK helper rules. */
+	| PRIMARY KEY         { $$ = &colConstraint{kind: "pk"} }
+	| UNIQUE              { $$ = &colConstraint{kind: "uq"} }
+	| DEFAULT a_expr      { $$ = &colConstraint{kind: "def", expr: $2} }
 	| CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
-			{ $$ = &colConstraint{kind: "check", text: yylex.(*lexerState).spanText()} }
+			{ $$ = &colConstraint{kind: "check", text: yylex.(*lexerState).spanTextCloseParen()} }
 	| REFERENCES qualified_name opt_ref_cols opt_fk_actions
 			{
 				i := &colConstraint{kind: "fk"}
@@ -2470,6 +2540,3 @@ fk_kw:
 	| NO ACTION              { $$ = parser.FKActionNoAction }
 	| SET NULL_P             { $$ = parser.FKActionSetNull }
 	| SET DEFAULT            { $$ = parser.FKActionSetDefault }
-	| PRIMARY KEY         { $$ = &colConstraint{kind: "pk"} }
-	| UNIQUE              { $$ = &colConstraint{kind: "uq"} }
-	| DEFAULT a_expr      { $$ = &colConstraint{kind: "def", expr: $2} }

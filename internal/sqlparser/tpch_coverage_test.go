@@ -30,9 +30,12 @@ func TestTPCHGrammarCoverage(t *testing.T) {
 			ok++
 		}
 	}
-	// Q7/Q8/Q9 (complex FROM-subquery waves) and Q15 (CREATE VIEW DDL) are
-	// the documented remaining gaps; 19/22 is today's floor.
-	if ok < 19 {
-		t.Fatalf("TPC-H grammar coverage %d/22 < floor 19", ok)
+	// 2026-08-27: all 22 parse. The last two holdouts (Q21/Q22) were not a
+	// grammar gap at all — EXISTS had been added to the NOT_LA follower set
+	// in base_yylex.go, which upstream's parser.c does not do, so every
+	// `NOT EXISTS (...)` was a syntax error. Floor is now the full set: a
+	// drop here means a real regression, not an unported wave.
+	if ok < 22 {
+		t.Fatalf("TPC-H grammar coverage %d/22 < floor 22", ok)
 	}
 }

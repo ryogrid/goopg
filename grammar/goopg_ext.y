@@ -27,7 +27,7 @@ create_table_stmt:
 					case e.col != nil:
 						c := e.col
 						cd := parser.NewColumnDef(c.name, parser.NewColumnType(c.schema, c.typ, c.args, c.isArray))
-						cd.NotNull = c.notNull
+						cd.NotNull = c.notNull || c.primary
 						cd.NotNullExplicit = c.notNull
 						cd.Primary = c.primary
 						cd.Unique = c.unique
@@ -42,6 +42,12 @@ create_table_stmt:
 							cd.OnUpdate = c.fkInfo.onUp
 						}
 						cols = append(cols, *cd)
+						if c.primary {
+							// Legacy records a column-level PRIMARY KEY in the
+							// statement's PrimaryKey list as well as on the
+							// ColumnDef; downstream DDL reads the list.
+							pk = append(pk, c.name)
+						}
 					default:
 						pk = append(pk, e.pk...)
 						uqs = append(uqs, e.uq...)
@@ -150,8 +156,20 @@ table_element:
 				cs.schema, cs.typ = tw.ct.schema, tw.ct.name
 				cs.isArray = len(cs.typ) >= 2 && cs.typ[len(cs.typ)-2:] == "[]"
 				cc := $3.(*colConstraints)
-				cs.args, cs.notNull, cs.primary, cs.unique, cs.defExpr =
-					cc.args, cc.notNull, cc.primary, cc.unique, cc.defExpr
+				// The typmod lives on the TYPE carrier, not the constraint
+				// carrier: `col_type_name '(' ICONST ')'` stashes it in
+				// tw.args. Reading it from cc dropped every column typmod
+				// (char(22) -> char, numeric(10,2) -> numeric) while the two
+				// sibling ALTER TABLE sites below (:541, :565) read tw.args
+				// correctly — a classic sibling-path divergence. CREATE TABLE
+				// is routed, so this silently created unconstrained columns.
+				cs.args = tw.args
+				cs.notNull, cs.primary, cs.unique, cs.defExpr =
+					cc.notNull, cc.primary, cc.unique, cc.defExpr
+				// create_table_stmt (:33-42) already consumes these two, but
+				// nothing ever produced them: column-level CHECK and
+				// REFERENCES parsed cleanly and were then silently dropped.
+				cs.checkText, cs.fkInfo = cc.checkText, cc.fk
 				$$ = &tableElem{col: cs}
 			}
 	| PRIMARY KEY pk_cols   { $$ = &tableElem{pk: $3} }
@@ -164,7 +182,7 @@ table_element:
 	| CONSTRAINT ColId UNIQUE uq_cols
 			{ $$ = &tableElem{namedUq: parser.NewTableConstraintDef($2, $4, false)} }
 	| CONSTRAINT ColId CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
-			{ $$ = &tableElem{check: yylex.(*lexerState).spanText(), checkName: $2} }
+			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen(), checkName: $2} }
 
 pk_cols:
 		'(' colid_list ')'   { $$ = $2 }
