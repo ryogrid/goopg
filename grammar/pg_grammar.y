@@ -569,6 +569,21 @@ SortBy:
 			{
 				$$ = parser.NewSortBy($1.Pos(), $1, true, "")
 			}
+	/* NULLS FIRST|LAST without an explicit ASC/DESC — gram.y's sortby is
+	   `a_expr opt_asc_desc opt_nulls_order`, so both parts are optional
+	   independently. */
+	| a_expr NULLS_LA FIRST_P
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				v := true
+				$$.NullsFirst = &v
+			}
+	| a_expr NULLS_LA LAST_P
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				v := false
+				$$.NullsFirst = &v
+			}
 	| a_expr ASC NULLS_LA FIRST_P
 			{
 				$$ = parser.NewSortBy($1.Pos(), $1, false, "")

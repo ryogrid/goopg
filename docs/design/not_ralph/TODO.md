@@ -456,6 +456,46 @@ follows is what the audit left OPEN.
   is `internal/executor/expr.go:11569`. Leading suspects: catalog rows written
   before `5cf25672a` fixed `RawDef`, or the name-vs-OID lookup path.
 
+## Remaining routed-surface gaps, ranked (measured 2026-08-27)
+
+Method: bulk-parse every SQL fragment of the upstream corpora through BOTH
+parsers and keep only the cases legacy accepts and the yacc parser rejects.
+Those are migration regressions by construction (the legacy parser's SQL
+surface is unchanged since before the routing flip — see the verdict below).
+
+**Isolation specs: 1690 steps checked, 115 -> 10 over this session.** What is
+left there: an expression index (`ON t((f(k)))`), MERGE inside a CTE, a
+subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
+
+**Must-pass regress: 2409 routed fragments, 222 still failing across 27 of the
+59 cases.** Ranked by fragments blocked:
+
+- [ ] **Index column surface (~42)** — expression columns
+  (`USING btree (f())`, `((a + b))`), per-column opclass (`(seqno float8_ops)`),
+  `ON ONLY t`, and `WITH (fillfactor = 10)`. `index_col` is `%type <str>` today,
+  so expression columns need `CreateIndexStmt.ColExprs` threading, not just a
+  grammar alternative.
+- [ ] **`AS <reserved keyword>` aliases (~33)** — `SELECT true AS true`.
+  gram.y's ColLabel admits reserved_keyword; ours stops at
+  type_func_name_keyword. **Measured: adding the whole list costs 12
+  reduce/reduce, and even TRUE_P/FALSE_P alone costs 6** — goyacc merges this
+  AS with the AS of CREATE VIEW / CTE / CAST, and the boolean literals also
+  collide with `c_expr: TRUE_P`. Same root cause and same fix as the
+  parenthesized-set-op deferral below: the SelectStmt/AS restructure.
+- [ ] **`VARIADIC` call arguments (~19)** — `f(variadic array[1,2]::int[])`.
+  `FuncCall.Variadic` exists on the AST; VARIADIC is one of the reserved
+  tokens no production consumes.
+- [ ] **Row-constructor comparison (~14)** — `WHERE (a, b) > ('x', 0)`.
+- [ ] **`ALTER TABLE ... ADD PRIMARY KEY USING INDEX name` (~14)**.
+- [ ] **Subpartitioning (~7)** — `PARTITION OF p FOR VALUES ... PARTITION BY LIST (c)`.
+- [ ] **`SET SESSION AUTHORIZATION name` (~6)**.
+- [ ] Smaller: `COPY ... (subquery)` forms, `CREATE TABLE ... (LIKE t ...)`,
+  `GENERATED ... AS`, JSON constructors, `~`/`&`/`=>` operator spellings.
+
+Note a chunk of the 222 are regress cases' DELIBERATE syntax errors (e.g.
+`select distinct from pg_database;`), where erroring is correct and only the
+message text differs — those are not missing grammar.
+
 ## ⚠️ VERIFICATION VERDICT 2026-08-27 — the migration is BELOW pre-migration level
 
 The first full `make nightly-batch` since routing went live
@@ -465,8 +505,8 @@ spotcheck is GREEN (Q12=2, Q13=34), but:
 
 | suite | pre-migration | now |
 |---|---|---|
-| isolation strict specs | **0 FAIL** (2026-08-25 nightly) | **64 FAIL** of 245 |
-| regress must-pass (59) | not measurable — the 08-25 run wedged and was killed, so Go never printed subtest verdicts | **40 not passing** (28 FAIL, 12 SKIP) |
+| isolation strict specs | **0 FAIL** (2026-08-25 nightly) | 64 -> 41 -> **7 FAIL** of 245 |
+| regress must-pass (59) | not measurable — the 08-25 run wedged and was killed, so Go never printed subtest verdicts | 40 -> **38 not passing** |
 | TPC-DS syntax errors | **0** (2026-08-25) | 6 → **1** after this session's fixes (+3 known dsqgen artefacts) |
 | TPC-H Q12/Q13 spotcheck | 2 / 34 | **2 / 34 ✅** |
 
