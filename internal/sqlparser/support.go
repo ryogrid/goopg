@@ -820,6 +820,28 @@ func namedTableConstraint(name string, cols []string, isPrimary bool, incl []str
 	return d
 }
 
+// arbiterFromExprs turns an `ON CONFLICT ( ... )` item list into the legacy
+// column/expression split. Parsing every item as an a_expr and classifying
+// afterwards avoids the ColId-vs-a_expr ambiguity a two-alternative item rule
+// would introduce: a bare unqualified ColumnRef IS the column form
+// (Columns[i]=name, Exprs[i]=nil), anything else is an expression column
+// (Columns[i]="", Exprs[i]=expr) — internal/parser/dml.go
+// parseConflictTargetColumnList.
+func arbiterFromExprs(items []parser.Expr) *parser.OnConflictTarget {
+	cols := make([]string, len(items))
+	exprs := make([]parser.Expr, len(items))
+	for i, e := range items {
+		if cr, ok := e.(*parser.ColumnRef); ok && cr.Schema == "" && cr.Table == "" {
+			cols[i] = cr.Column
+			continue
+		}
+		exprs[i] = e
+	}
+	t := parser.NewOnConflictTarget(cols, "", nil)
+	t.Exprs = exprs
+	return t
+}
+
 // onConflictColumnTarget builds an `ON CONFLICT (cols)` arbiter with the Exprs
 // slice legacy keeps PARALLEL to Columns — one entry per column, nil for a
 // plain name, non-nil only for an expression column (internal/parser/dml.go

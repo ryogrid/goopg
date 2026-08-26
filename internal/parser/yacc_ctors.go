@@ -453,3 +453,7 @@ func NewRollbackPreparedStmt(pos int, gid string) *RollbackPreparedStmt {
 func NewRollbackToSavepointStmt(pos int, name string) *RollbackToSavepointStmt {
 	return &RollbackToSavepointStmt{pos: pos, Name: name}
 }
+
+// NewDefaultMarker builds the `DEFAULT` placeholder that may appear in an
+// INSERT ... VALUES row (gram.y's DEFAULT in insert_column_item lists).
+func NewDefaultMarker(pos int) *DefaultMarker { return &DefaultMarker{pos: pos} }

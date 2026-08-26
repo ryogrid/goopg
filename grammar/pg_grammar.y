@@ -97,12 +97,15 @@
 %type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
+%type <node>	opt_table_element_list opt_index_where
 %type <node>	opt_constr_attrs
 %type <str>	constr_attr
 %type <strs>	opt_include
 %type <b>	opt_unique_nnd
 %type <node>	opt_for_locking for_locking_clause for_locking_item for_locking_strength opt_lock_wait_policy
 %type <strs>	opt_locked_rels
+%type <exprs>	values_item_list
+%type <expr>	values_item
 %type <str>	set_guc_name set_value_list set_value_atom
 %type <b>	opt_transaction opt_savepoint_kw
 %type <stmt>	set_transaction_stmt
@@ -2382,14 +2385,24 @@ cast_ident:
 /* values_rows — gram.y :13035 values_clause LIST subset: rows are '(' expr_list ')'
    comma-separated; single-row VALUES and multi-type rows inherit the same shape. */
 values_rows:
-		'(' expr_list ')'
+		'(' values_item_list ')'
 			{
 				$$ = [][]parser.Expr{$2}
 			}
-	| values_rows ',' '(' expr_list ')'
+	| values_rows ',' '(' values_item_list ')'
 			{
 				$$ = append($1, $4)
 			}
+
+/* values_item — a VALUES row may carry the DEFAULT placeholder
+   (`INSERT INTO t VALUES (1, DEFAULT)`), which is not an a_expr. */
+values_item_list:
+		values_item                          { $$ = []parser.Expr{$1} }
+	| values_item_list ',' values_item       { $$ = append($1, $3) }
+
+values_item:
+		a_expr    { $$ = $1 }
+	| DEFAULT     { $$ = parser.NewDefaultMarker(yylex.(*lexerState).lastConsumedPos()) }
 
 /* insert_stmt — P3.1 v0 (gram.y :17213 insert_rest subset): [WITH ctes]
    INSERT INTO name [(cols)] source where source is VALUES_LA rows / SelectStmt /
@@ -2446,7 +2459,7 @@ opt_on_conflict:
 
 opt_arbiter:
 		/* empty */               { $$ = nil }
-	| '(' colid_list ')'          { $$ = onConflictColumnTarget($2) } /* Exprs stays parallel to Columns */
+	| '(' expr_list ')'           { $$ = arbiterFromExprs($2) } /* items may be expressions, not just names */
 	| ON CONSTRAINT ColId { $$ = parser.NewOnConflictTarget(nil, $3, nil) }
 
 update_set_list:

@@ -16,7 +16,7 @@
    CHECK / FK / named constraints / WITH / partitioning arrive in later P4
    slices. */
 create_table_stmt:
-		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' table_element_list ')' opt_ct_tail
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' opt_table_element_list ')' opt_ct_tail
 			{
 				elems := $7.([]*tableElem)
 				var cols []parser.ColumnDef
@@ -222,6 +222,12 @@ opt_create_modifier:
 opt_if_not_exists:
 		/* empty */       { $$ = false }
 	| IF_P NOT EXISTS  { $$ = true } /* gram.y opt_if_not_exists: plain NOT */
+
+/* opt_table_element_list — `CREATE TABLE c () INHERITS (p)` is legal and the
+   isolation specs use it; the list used to be mandatory. */
+opt_table_element_list:
+		/* empty */                 { $$ = []*tableElem(nil) }
+	| table_element_list            { $$ = $1 }
 
 table_element_list:
 		table_element                           { $$ = []*tableElem{$1.(*tableElem)} }
@@ -471,7 +477,7 @@ with_value:
    CONCURRENTLY arrive later); ColOrders/ColExprs filled with per-column
    defaults for legacy dump parity. */
 create_index_stmt:
-		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists ColId ON qualified_name opt_using_method '(' index_col_list ')' opt_include
+		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists ColId ON qualified_name opt_using_method '(' index_col_list ')' opt_include opt_index_where
 			{
 				nm := $8.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -481,8 +487,16 @@ create_index_stmt:
 				ix := parser.NewCreateIndexStmt(0, $2, $5, $6, tbl, $9, $11)
 				ix.Concurrently = $4
 				ix.IncludeColumns = $13
+				if p, _ := $14.(parser.Expr); p != nil {
+					ix.HasPredicate = true
+					ix.Predicate = p
+				}
 				$$ = ix
 			}
+
+opt_index_where:
+		/* empty */        { $$ = (parser.Expr)(nil) }
+	| WHERE a_expr         { $$ = $2 }
 
 opt_unique:
 		/* empty */  { $$ = false }

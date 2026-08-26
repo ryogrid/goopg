@@ -314,6 +314,21 @@ var knownTypeNames = map[string]string{
 	"date":      "date",
 	"time":      "time",
 	"timestamp": "timestamp",
+	// gram.y allows ANY Typename before a string literal (`text 'x'`,
+	// `json '{}'`). This list is deliberately EXACTLY legacy's accepted set
+	// (measured, not guessed): widening it would make the routed parser accept
+	// statements the pre-migration parser rejected, which is a behaviour change
+	// even though PostgreSQL itself allows them. legacy additionally rejects
+	// jsonpath, uuid, bytea, money, inet, cidr, macaddr, macaddr8, xml,
+	// tsvector, tsquery and varbit — see TODO.md.
+	"text": "text", "varchar": "varchar", "bpchar": "bpchar",
+	"bool": "bool", "boolean": "boolean",
+	"json": "json", "jsonb": "jsonb",
+	"numeric": "numeric", "int2": "int2", "int4": "int4", "int8": "int8",
+	"float4": "float4", "float8": "float8", "oid": "oid", "name": "name",
+	"point": "point", "line": "line", "lseg": "lseg", "box": "box",
+	"path": "path", "polygon": "polygon", "circle": "circle",
+	"pg_lsn": "pg_lsn", "timestamptz": "timestamptz", "timetz": "timetz",
 }
 
 // next returns the next terminal after base_yylex substitution.
@@ -330,8 +345,13 @@ func (l *lexerState) next() lexResult {
 	// INTERVAL terminals); date is a plain IDENT. Match on text either way.
 	lower := strings.ToLower(cur.str)
 	if _, isKw := knownTypeNames[lower]; isKw {
-		if cur.term == resolve("IDENT") || cur.term == resolve("TIME") ||
-			cur.term == resolve("TIMESTAMP") || cur.term == resolve("INTERVAL") {
+		// Match on TEXT, not on a fixed terminal set: most type names are
+		// col_name_keywords with terminals of their own (TEXT_P, JSON, ...),
+		// so an IDENT/TIME/TIMESTAMP-only check folded `date '...'` but not
+		// `text '...'` or `json '...'`. The SCONST lookahead is what makes this
+		// unambiguous — no valid statement has a column reference or alias
+		// immediately followed by a string literal.
+		if cur.term > 0 {
 			if nxt := l.peek(); nxt.term == resolve("SCONST") {
 				l.i++ // consume the SCONST too
 				// Fold to one synthetic terminal so c_expr can build a
