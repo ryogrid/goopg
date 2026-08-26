@@ -162,3 +162,49 @@ losers, all inside the WALSync window. Throughput is unchanged (9,175 →
 9,370 tps): the wait was always being paid, it just was not attributable.
 The earlier tables' "on-CPU 77%" was inflated by exactly this attribution
 gap; treat the pre-fix distributions as client-side-only views.
+
+## Addendum 2 — probe audit: track_io_timing was suppressing IO waits entirely (2026-08-26)
+
+Follow-up review asked whether the WAL attribution bug had siblings. Audit of
+every WaitEventStart/End site found one more systemic defect and cleared the
+rest:
+
+- **Correct attribution already**: relation locks (`executor/context.go`,
+  ExecContext procNum), hash spill (`spill.go`, registry captured at
+  construction from the running goroutine), client read/write
+  (`postmaster/server.go`, per-connection closure), plus all choke-point
+  probes added in this bundle.
+- **Defect (fixed)**: every pool/storage/AIO hook (`OnPinWait/OnFlushWait/
+  OnExtendWait/OnBackendWriteback*`, `OnRead|Write|Extend|SyncWait/Done`,
+  aioEngine `OnWaitStart/End`) gated its whole body on
+  `LookupTrackedGoroutine()`, whose fast-path flag is seeded by
+  track_io_timing. With the GUC at its default OFF, **no DataFile*/AIO/
+  BufferPin wait event could ever be emitted** — upstream reports these
+  waits unconditionally and uses the GUC only for pg_stat_io *_time.
+  Fix: wait-event windows now resolve identity per firing via
+  `LookupCurrentGoroutine()` and always emit; only the *_time accumulation
+  remains gated on the backend's track_io_timing.
+
+Deterministic proof: during concurrent pgbench + repeated `CHECKPOINT`,
+client backends now show `active | IO | DataFileSync` (12 samples) — a path
+that could not report before. Full re-run `-N -c 50 -j 8 -T 45 -s 10`
+(429,691 txns / 9,548 tps, 4,401 backend-samples / 89 sweeps):
+
+| samples | % of total | state | wait_event_type | wait_event |
+|---:|---:|---|---|---|
+| 2413 | 54.8% | active | IO | WALSync |
+| 1182 | 26.9% | active | (none) | (none) |
+| 276 | 6.3% | idle in transaction | Client | ClientRead |
+| 146 | 3.3% | idle in transaction | (none) | (none) |
+| 102 | 2.3% | idle | Client | ClientRead |
+| 101 | 2.3% | idle in transaction | Client | ClientWrite |
+| 75 | 1.7% | active | Lock | relation |
+| 60 | 1.4% | idle | (none) | (none) |
+| 27 | 0.6% | active | Client | ClientWrite |
+| 18 | 0.4% | idle | Client | ClientWrite |
+| 1 | 0.02% | active | IO | DataFileRead |
+
+The lone DataFileRead row is itself evidence: a cold cache-miss read
+surfacing as a client-backend wait was impossible before the fix. tps moved
+9,370 → 9,548 (noise range); the added per-I/O goroutine lookup costs tens
+of ns against real syscalls and is invisible in pprof.

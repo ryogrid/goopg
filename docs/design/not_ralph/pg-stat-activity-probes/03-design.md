@@ -23,8 +23,8 @@ sampling-based profiling inside the server.
 | advisory lock wait | `Lock:advisory` | `executor/advisory.go` wait loop | **add (G3)** |
 | `pg_sleep` (`misc.c`) | `Timeout:PgSleep` | `executor/expr.go: evalPgSleep` | **add (G2)** |
 | LWLock acquisition (`lwlock.c`) | `LWLock:*` | Go mutex/cond parks | policy: not mapped (§4) |
-| buffer pin wait | `BufferPin:BufferPin` | bufpool pin callback | done |
-| `md.c`/`fd.c`/`slru.c`/AIO IO | `IO:*` | storage-manager + AIO callbacks (`initdb/open.go`) | done |
+| buffer pin wait | `BufferPin:BufferPin` | bufpool pin callback | done; emission decoupled from track_io_timing (probe-audit fix) |
+| `md.c`/`fd.c`/`slru.c`/AIO IO | `IO:*` | storage-manager + AIO callbacks (`initdb/open.go`) | done; windows now fire regardless of track_io_timing, only *_time stays gated (probe-audit fix); WAL flush attributed per committer |
 | WAL flush/write (`xlog.c`) | `IO:WALSync/WALWrite` | wal writer callbacks | done |
 | hash spill tmp files | `IO:BuffileRead/Write` | `executor/spill.go` | done |
 | `pqcomm.c` secure_read/write | `Client:ClientRead/Write` | `postmaster/server.go` conn loop | done |

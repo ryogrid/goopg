@@ -785,54 +785,59 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	mgr.OnBlockWritten = func(rel storage.RelFileNode, blk storage.BlockNumber) {
 		pool.InvalidateBlock(storage.BufferTag{Rel: rel, Block: blk})
 	}
-	// M0092-0005: BufferPin wait-event hook. Wired unconditionally (not
-	// gated on the boot-time TrackIOTiming value) so a runtime `SET
-	// track_io_timing` takes effect without a server restart; the hook
-	// body's LookupTrackedGoroutine call is itself gated on act's
-	// fast-path flag, keeping the default-off cost to a single atomic
-	// load rather than the goroutine-map lookup (M0122-0003 follow-up).
-	// M0107-0005: use LookupCurrentGoroutine (procNum) instead of
-	// LookupGoroutine (Registry+pid) so WaitEventStart is atomic.
+	// M0092-0005 / M0107-0005 / probe-audit 2026-08-26: BufferPin wait-event
+	// hook. Wired unconditionally so a runtime `SET track_io_timing` takes
+	// effect without a server restart. Wait-event WINDOWS are emitted for
+	// every registered backend (upstream reports waits regardless of
+	// track_io_timing); only the *_time accumulations stay gated via
+	// LookupTrackedGoroutine's fast-path flag, keeping the default-off
+	// timing cost to a single atomic load.
 	pool.OnPinWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeBufferPin, activity.WaitBufferPin)
 		}
 	}
 	pool.OnPinDone = func() {
-		// M0122-0003: WaitEventEnd's returned duration is real wall-clock
-		// time only when track_io_timing gated this pair on (the
-		// LookupTrackedGoroutine ok-branch), so accumulating it here
-		// unconditionally within this branch matches upstream's "zero
-		// unless track_io_timing is enabled" pg_stat_io.read_time semantics.
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		// The WAIT-EVENT window is emitted for every registered backend
+		// regardless of track_io_timing (upstream reports IO waits
+		// unconditionally); only the read_time ACCUMULATION stays gated on
+		// the backend's track_io_timing, matching pg_stat_io's "zero
+		// unless enabled" semantics (M0122-0003).
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			d := reg.WaitEventEnd(procNum)
-			pool.AddReadTimeNanos(int64(d))
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
+				pool.AddReadTimeNanos(int64(d))
+			}
 		}
 	}
 	// write_time's OnPinWait/OnPinDone analogue: brackets evictVictim's
 	// dirty-victim flushSlot call (M0122-0003 pg_stat_io follow-up).
 	pool.OnFlushWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
 	pool.OnFlushDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			d := reg.WaitEventEnd(procNum)
-			pool.AddWriteTimeNanos(int64(d))
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
+				pool.AddWriteTimeNanos(int64(d))
+			}
 		}
 	}
 	// extend_time's OnFlushWait/OnFlushDone analogue: brackets PinNew's
 	// mgr.Extend call (M0122-0003 pg_stat_io follow-up).
 	pool.OnExtendWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
 		}
 	}
 	pool.OnExtendDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			d := reg.WaitEventEnd(procNum)
-			pool.AddExtendTimeNanos(int64(d))
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
+				pool.AddExtendTimeNanos(int64(d))
+			}
 		}
 	}
 	// writeback's OnFlushWait/OnFlushDone analogues, one per context
@@ -849,14 +854,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// writeback wait visible in pg_stat_activity (writeback simplification
 	// 3, resolved: see deferral ledger).
 	pool.OnBackendWritebackWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
 	pool.OnBackendWritebackDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			d := reg.WaitEventEnd(procNum)
-			pool.AddBackendWritebackTimeNanos(int64(d))
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
+				pool.AddBackendWritebackTimeNanos(int64(d))
+			}
 		}
 	}
 	pool.OnBgwriterWritebackWait = func() {
@@ -2334,67 +2341,66 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity can
-	// report blocking reasons. Wired unconditionally (not gated on the
-	// boot-time TrackIOTiming value) so a runtime `SET track_io_timing`
-	// takes effect without a server restart; each hook body's
-	// LookupTrackedGoroutine call is itself gated on act's fast-path
-	// flag, so the default-off cost stays a single atomic load rather
-	// than the goroutine-map lookup (M0092-0005 original rationale;
-	// M0122-0003 runtime-SET follow-up). M0107-0005: use
-	// LookupCurrentGoroutine (procNum) for atomic WaitEventStart instead
-	// of LookupGoroutine (mutex).
+	// report blocking reasons. Wired unconditionally so a runtime `SET
+	// track_io_timing` takes effect without a server restart. Probe-audit
+	// fix 2026-08-26: wait-event WINDOWS now resolve the calling backend on
+	// every firing (LookupCurrentGoroutine) and are emitted regardless of
+	// track_io_timing — upstream parity; previously they were silently
+	// suppressed whenever track_io_timing was off because the bodies were
+	// gated on LookupTrackedGoroutine's fast-path flag. Only *_time
+	// accumulations remain gated on that flag (single atomic load when off).
 	if opts.TrackIOTiming {
 		act.EnableTrackIOTimingFastPath()
 	}
 	if aioEngine != nil {
 		aioEngine.OnWaitStart = func() {
-			if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitAIO)
 			}
 		}
 		aioEngine.OnWaitEnd = func() {
-			if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 				reg.WaitEventEnd(procNum)
 			}
 		}
 	}
 	mgr.OnReadWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileRead)
 		}
 	}
 	mgr.OnReadDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventEnd(procNum)
 		}
 	}
 	mgr.OnWriteWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
 	mgr.OnWriteDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventEnd(procNum)
 		}
 	}
 	mgr.OnExtendWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
 		}
 	}
 	mgr.OnExtendDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventEnd(procNum)
 		}
 	}
 	mgr.OnSyncWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileSync)
 		}
 	}
 	mgr.OnSyncDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventEnd(procNum)
 		}
 	}
