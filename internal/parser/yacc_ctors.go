@@ -358,3 +358,13 @@ func NewShowStmt(pos int, all bool, name string) *ShowStmt {
 func NewResetStmt(pos int, all bool, name string) *ResetStmt {
 	return &ResetStmt{pos: pos, All: all, Name: name}
 }
+
+// NewAlterTableStmt builds the P4.2 shell (actions appended by the grammar).
+func NewAlterTableStmt(pos int, name ObjectName) *AlterTableStmt {
+	return &AlterTableStmt{pos: pos, Name: name}
+}
+
+// NewATAction builds one ALTER TABLE action of the given kind.
+func NewATAction(kind AlterTableActionKind) *AlterTableAction {
+	return &AlterTableAction{pos: 0, Kind: kind}
+}

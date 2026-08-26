@@ -367,3 +367,65 @@ show_stmt:
 reset_stmt:
 		RESET ALL      { $$ = parser.NewResetStmt(0, true, "") }
 	| RESET ColId      { $$ = parser.NewResetStmt(0, false, $2) }
+
+/* alter_table_stmt — P4.2 v0 (gram.y AlterTableStmt subset): single action
+   of ADD COLUMN / ADD PRIMARY KEY / DROP COLUMN / ALTER COLUMN TYPE /
+   RENAME TO. Multi-action lists, DROP DEFAULT/NOT NULL, SET forms and
+   partition actions arrive in later slices. */
+alter_table_stmt:
+		ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name alter_table_action
+			{
+				at := $6.(*parser.AlterTableAction)
+				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st.IfExists = $3
+				st.Only = $4
+				st.Actions = []parser.AlterTableAction{*at}
+				$$ = st
+			}
+
+opt_ONLY_kw:
+		/* empty */  { $$ = false }
+	| ONLY           { $$ = true }
+
+alter_table_action:
+		ADD_P opt_COLUMN ColId col_type_name col_constraints
+			{
+				cc := $5.(*colConstraints)
+				ct := $4.(*typeWithArgs)
+				cd := parser.NewColumnDef($3, parser.NewColumnType(ct.ct.schema, ct.ct.name, ct.args, false))
+				cd.NotNull = cc.notNull
+				cd.DefaultExpr = cc.defExpr
+				a := parser.NewATAction(parser.AlterTableAddColumn)
+				a.Column = *cd
+				$$ = a
+			}
+	| ADD_P PRIMARY KEY pk_cols
+			{
+				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
+				a.Columns = $4
+				$$ = a
+			}
+	| DROP COLUMN ColId
+			{
+				a := parser.NewATAction(parser.AlterTableDropColumn)
+				a.ColumnName = $3
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId TYPE_P col_type_name
+			{
+				ct := $5.(*typeWithArgs)
+				a := parser.NewATAction(parser.AlterTableAlterColumnType)
+				a.ColumnName = $3
+				a.NewType = parser.NewColumnType(ct.ct.schema, ct.ct.name, ct.args, false)
+				$$ = a
+			}
+	| RENAME TO ColId
+			{
+				a := parser.NewATAction(parser.AlterTableRenameTable)
+				a.NewName = $3
+				$$ = a
+			}
+
+opt_COLUMN:
+		/* empty */  { _ = 0 }
+	| COLUMN         { _ = 0 }

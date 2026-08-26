@@ -165,6 +165,7 @@ func withFollowerRouted(toks []parser.Token) bool {
 // routedCreatePairs maps leading keyword -> set of ported second keywords.
 var routedCreatePairs = map[string]map[string]bool{
 	"create": {"table": true, "index": true},
+	"alter":  {"table": true},
 	"drop":   {"table": true, "index": true},
 }
 

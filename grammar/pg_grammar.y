@@ -88,12 +88,14 @@
 %type <str>	subq_op extract_field
 %type <str>	opt_tzmark double_tail cast_ident character_word opt_upd_alias
 %type <vrows>	values_rows
-%type <node>	opt_create_modifier opt_TRUNCATE_kw
+%type <node>	opt_create_modifier opt_TRUNCATE_kw alter_table_action
+%type <b>	opt_ONLY_kw
+%type <node>	opt_COLUMN
 %type <strs>	index_col_list
 %type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
-%type <stmt>	tx_begin tx_commit tx_rollback create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt
+%type <stmt>	tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt
 
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
@@ -222,6 +224,10 @@ stmt:
 				$$ = $1
 			}
 	| reset_stmt
+			{
+				$$ = $1
+			}
+	| alter_table_stmt
 			{
 				$$ = $1
 			}
