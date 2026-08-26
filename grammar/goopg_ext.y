@@ -59,9 +59,6 @@ table_element:
 				tw := $2.(*typeWithArgs)
 				cs.schema, cs.typ = tw.ct.schema, tw.ct.name
 				cs.isArray = len(cs.typ) >= 2 && cs.typ[len(cs.typ)-2:] == "[]"
-				if cs.isArray {
-					cs.typ = cs.typ[:len(cs.typ)-2]
-				}
 				cc := $3.(*colConstraints)
 				cs.args, cs.notNull, cs.primary, cs.unique, cs.defExpr =
 					cc.args, cc.notNull, cc.primary, cc.unique, cc.defExpr

@@ -60,6 +60,7 @@ var routedStmts = map[string]bool{
 	"insert": true, // P3.1
 	"update": true, // P3.2
 	"delete": true, // P3.3
+	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 
 // routeBatch reports whether the whole batch can go to the new parser, plus
@@ -96,6 +97,11 @@ func fragmentRouted(frag []parser.Token) bool {
 		key := strings.ToLower(t.Value)
 		if key == "with" {
 			return withFollowerRouted(frag)
+		}
+		if key == "create" {
+			// "create" leads every DDL class; route only the ported ones by
+			// inspecting the SECOND meaningful keyword.
+			return createClassRouted(frag)
 		}
 		return routedStmts[key]
 	case parser.TokenSymbol:
@@ -144,6 +150,29 @@ func withFollowerRouted(toks []parser.Token) bool {
 }
 
 
+
+// createClassRouted reports whether a CREATE-led fragment's second keyword
+// names a ported DDL class. Unported classes stay legacy.
+func createClassRouted(frag []parser.Token) bool {
+	var second string
+	found := false
+	for _, tok := range frag[1:] {
+		if tok.Kind != parser.TokenKeyword && tok.Kind != parser.TokenIdent {
+			continue
+		}
+		second = strings.ToLower(tok.Value)
+		found = true
+		break
+	}
+	if !found {
+		return false
+	}
+	switch second {
+	case "table":
+		return true // P4.1 v0
+	}
+	return false
+}
 
 func firstMeaningful(frag []parser.Token) *parser.Token {
 	for i := range frag {
