@@ -512,6 +512,44 @@ alter_table_action:
 				a.ColumnName = $3
 				$$ = a
 			}
+	| RENAME opt_COLUMN ColId TO ColId
+			{
+				a := parser.NewATAction(parser.AlterTableRenameColumn)
+				a.OldColumnName = $3
+				a.NewName = $5
+				$$ = a
+			}
+	| VALIDATE CONSTRAINT ColId
+			{
+				a := parser.NewATAction(parser.AlterTableValidateConstraint)
+				a.OldConstraintName = $3
+				$$ = a
+			}
+	| REPLICA IDENTITY_P FULL
+			{
+				a := parser.NewATAction(parser.AlterTableReplicaIdentity)
+				a.ReplicaIdentityMode = "f"
+				$$ = a
+			}
+	| REPLICA IDENTITY_P NOTHING
+			{
+				a := parser.NewATAction(parser.AlterTableReplicaIdentity)
+				a.ReplicaIdentityMode = "n"
+				$$ = a
+			}
+	| REPLICA IDENTITY_P DEFAULT
+			{
+				a := parser.NewATAction(parser.AlterTableReplicaIdentity)
+				a.ReplicaIdentityMode = "d"
+				$$ = a
+			}
+	| REPLICA IDENTITY_P USING INDEX ColId
+			{
+				a := parser.NewATAction(parser.AlterTableReplicaIdentity)
+				a.ReplicaIdentityMode = "i"
+				a.ReplicaIdentityIndex = $5
+				$$ = a
+			}
 
 opt_COLUMN:
 		/* empty */  { _ = 0 }
