@@ -97,8 +97,13 @@
 %type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
+%type <node>	opt_constr_attrs
+%type <str>	constr_attr
+%type <strs>	opt_include
+%type <b>	opt_unique_nnd
 %type <node>	opt_for_locking for_locking_clause for_locking_item for_locking_strength opt_lock_wait_policy
 %type <strs>	opt_locked_rels
+%type <stmt>	set_transaction_stmt
 %type <stmt>	refresh_matview_stmt drop_matview_stmt
 %type <b>	opt_concurrently
 %type <stmt>	tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
@@ -233,6 +238,10 @@ stmt:
 			{
 				$$ = $1
 			}
+	| set_transaction_stmt
+			{
+				$$ = $1
+			}
 	| alter_table_stmt
 			{
 				$$ = $1
@@ -333,6 +342,31 @@ base_select:
 				}
 				$$ = m
 			}
+
+/* Table-level constraint trailers — gram.y ConstraintAttributeSpec,
+   opt_unique_null_treatment and opt_c_include. The AST has carried every
+   field since DU-002 (TableUniqueDeferrable, TableUniqueIncludes,
+   PrimaryKeyInclude, TableConstraintDef.NullsNotDistinct, ...); only the
+   grammar was missing, so `UNIQUE (a) INCLUDE (b)` and
+   `... DEFERRABLE INITIALLY DEFERRED` were syntax errors on a routed
+   CREATE TABLE. */
+opt_constr_attrs:
+		/* empty */                    { $$ = (*constrAttrs)(nil) }
+	| opt_constr_attrs constr_attr     { a, _ := $1.(*constrAttrs); $$ = mergeConstrAttr(a, $2) }
+
+constr_attr:
+		DEFERRABLE          { $$ = "deferrable" }
+	| NOT DEFERRABLE        { $$ = "not_deferrable" }
+	| INITIALLY DEFERRED    { $$ = "initially_deferred" }
+	| INITIALLY IMMEDIATE   { $$ = "initially_immediate" }
+
+opt_include:
+		/* empty */                   { $$ = nil }
+	| INCLUDE '(' colid_list ')'      { $$ = $3 }
+
+opt_unique_nnd:
+		/* empty */                   { $$ = false }
+	| NULLS_P NOT DISTINCT            { $$ = true }
 
 /* for_locking_clause — gram.y :13300ff. `FOR UPDATE` and friends were absent
    from this grammar entirely (SelectStmt.Locking existed on the AST but no
@@ -2615,6 +2649,18 @@ col_constraints:
 					cc.checkText = k.text // column-level CHECK carries no name
 				case "fk":
 					cc.fk = k.fk
+				case "uq_nnd":
+					cc.unique, cc.nullsNotDistinct = true, true
+				case "attr_deferrable":
+					cc.deferrable = true
+				case "attr_not_deferrable":
+					cc.deferrable, cc.initiallyDeferred = false, false
+				case "attr_initially_deferred":
+					// INITIALLY DEFERRED implies DEFERRABLE (legacy
+					// parseConstraintDeferrable, internal/parser/ddl.go).
+					cc.deferrable, cc.initiallyDeferred = true, true
+				case "attr_initially_immediate":
+					cc.initiallyDeferred = false
 				}
 				$$ = cc
 			}
@@ -2631,6 +2677,15 @@ col_constraint:
 	   col_constraint alternatives ABOVE the FK helper rules. */
 	| PRIMARY KEY         { $$ = &colConstraint{kind: "pk"} }
 	| UNIQUE              { $$ = &colConstraint{kind: "uq"} }
+	| UNIQUE NULLS_P NOT DISTINCT { $$ = &colConstraint{kind: "uq_nnd"} }
+	/* ConstraintAttr — gram.y ColConstraint's own alternatives, NOT a trailer
+	   on each constraint element. Making them siblings in this loop is what
+	   keeps `NOT NULL` and `NOT DEFERRABLE` separable with one token of
+	   lookahead: after shifting NOT, NULL_P and DEFERRABLE pick the arm. */
+	| DEFERRABLE          { $$ = &colConstraint{kind: "attr_deferrable"} }
+	| NOT DEFERRABLE      { $$ = &colConstraint{kind: "attr_not_deferrable"} }
+	| INITIALLY DEFERRED  { $$ = &colConstraint{kind: "attr_initially_deferred"} }
+	| INITIALLY IMMEDIATE { $$ = &colConstraint{kind: "attr_initially_immediate"} }
 	| DEFAULT a_expr      { $$ = &colConstraint{kind: "def", expr: $2} }
 	| CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
 			{ $$ = &colConstraint{kind: "check", text: yylex.(*lexerState).spanTextCloseParen()} }

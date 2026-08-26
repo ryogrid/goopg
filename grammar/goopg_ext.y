@@ -27,6 +27,8 @@ create_table_stmt:
 				var named []parser.TableConstraintDef
 				var namedChecks []parser.PartitionCheckConstraint
 				var fks []parser.TableForeignKeyDef
+				var pkIncl []string
+				var pkDeferrable, pkInitiallyDeferred bool
 				var checks []string
 				var checkNoInherit, checkNotEnforced []bool
 				for _, e := range elems {
@@ -38,6 +40,22 @@ create_table_stmt:
 						cd.NotNullExplicit = c.notNull
 						cd.Primary = c.primary
 						cd.Unique = c.unique
+						cd.UniqueNullsNotDistinct = c.nullsNotDistinct
+						// The attrs attach to whichever constraint the column
+						// actually declared (legacy threads pointers to the
+						// specific flag pair).
+						if c.unique {
+							cd.UniqueDeferrable = c.deferrable
+							cd.UniqueInitiallyDeferred = c.initiallyDeferred
+						}
+						if c.primary {
+							cd.PrimaryDeferrable = c.deferrable
+							cd.PrimaryInitiallyDeferred = c.initiallyDeferred
+						}
+						if c.fkInfo != nil {
+							cd.FKDeferrable = c.deferrable
+							cd.FKInitiallyDeferred = c.initiallyDeferred
+						}
 						cd.DefaultExpr = c.defExpr
 						if c.checkText != "" {
 							cd.CheckExpr = c.checkText
@@ -57,16 +75,26 @@ create_table_stmt:
 						}
 					default:
 						pk = append(pk, e.pk...)
+						if len(e.pk) > 0 {
+							pkIncl = e.pkIncl
+							if a := e.pkAttrs; a != nil {
+								pkDeferrable, pkInitiallyDeferred = a.deferrable, a.initiallyDeferred
+							}
+						}
 						for _, u := range e.uq {
 							// TableUniques has four PARALLEL slices; legacy
 							// appends to all five per anonymous UNIQUE
 							// (internal/parser/ddl.go:3958-4016), and canonDump
 							// distinguishes ∅ from [false].
 							uqs = append(uqs, u)
-							uqIncludes = append(uqIncludes, nil)
-							uqNullsNotDistinct = append(uqNullsNotDistinct, false)
-							uqDeferrable = append(uqDeferrable, false)
-							uqInitiallyDeferred = append(uqInitiallyDeferred, false)
+							uqIncludes = append(uqIncludes, e.uqIncl)
+							uqNullsNotDistinct = append(uqNullsNotDistinct, e.uqNND)
+							def, initDef := false, false
+							if a := e.uqAttrs; a != nil {
+								def, initDef = a.deferrable, a.initiallyDeferred
+							}
+							uqDeferrable = append(uqDeferrable, def)
+							uqInitiallyDeferred = append(uqInitiallyDeferred, initDef)
 						}
 						if e.fkDef != nil {
 							fks = append(fks, *e.fkDef)
@@ -113,6 +141,9 @@ create_table_stmt:
 				ct.NamedConstraints = named
 				ct.TableNamedChecks = namedChecks
 				ct.TableForeignKeys = fks
+				ct.PrimaryKeyInclude = pkIncl
+				ct.PrimaryKeyDeferrable = pkDeferrable
+				ct.PrimaryKeyInitiallyDeferred = pkInitiallyDeferred
 				ct.TableChecks = checks
 				ct.TableCheckNoInherit = checkNoInherit
 				ct.TableCheckNotEnforced = checkNotEnforced
@@ -218,17 +249,24 @@ table_element:
 				// nothing ever produced them: column-level CHECK and
 				// REFERENCES parsed cleanly and were then silently dropped.
 				cs.checkText, cs.fkInfo = cc.checkText, cc.fk
+				cs.nullsNotDistinct = cc.nullsNotDistinct
+				cs.deferrable, cs.initiallyDeferred = cc.deferrable, cc.initiallyDeferred
 				$$ = &tableElem{col: cs}
 			}
-	| PRIMARY KEY pk_cols   { $$ = &tableElem{pk: $3} }
-	| UNIQUE uq_cols        { $$ = &tableElem{uq: [][]string{$2}} } /* $2 used to be discarded */
-	| CONSTRAINT ColId PRIMARY KEY pk_cols
+	| PRIMARY KEY pk_cols opt_include opt_constr_attrs
+			{ a, _ := $5.(*constrAttrs); $$ = &tableElem{pk: $3, pkIncl: $4, pkAttrs: a} }
+	| UNIQUE opt_unique_nnd uq_cols opt_include opt_constr_attrs
+			{ a, _ := $5.(*constrAttrs); $$ = &tableElem{uq: [][]string{$3}, uqNND: $2, uqIncl: $4, uqAttrs: a} }
+	| CONSTRAINT ColId PRIMARY KEY pk_cols opt_include opt_constr_attrs
 			{
-				d := parser.NewTableConstraintDef($2, $5, true)
-				$$ = &tableElem{pk: $5, namedPk: d}
+				a, _ := $7.(*constrAttrs)
+				$$ = &tableElem{pk: $5, namedPk: namedTableConstraint($2, $5, true, $6, false, a)}
 			}
-	| CONSTRAINT ColId UNIQUE uq_cols
-			{ $$ = &tableElem{namedUq: parser.NewTableConstraintDef($2, $4, false)} }
+	| CONSTRAINT ColId UNIQUE opt_unique_nnd uq_cols opt_include opt_constr_attrs
+			{
+				a, _ := $7.(*constrAttrs)
+				$$ = &tableElem{namedUq: namedTableConstraint($2, $5, false, $6, $4, a)}
+			}
 	| CONSTRAINT ColId CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
 			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen(), checkName: $2} }
 	/* Anonymous table-level CHECK and FOREIGN KEY (gram.y TableConstraint).
@@ -239,26 +277,34 @@ table_element:
 	   (cols) and NO INHERIT still fall to legacy — see TODO.md P4.1. */
 	| CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
 			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen()} }
-	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions
+	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions opt_constr_attrs
 			{
-				$$ = &tableElem{fkDef: &parser.TableForeignKeyDef{
+				fk := &parser.TableForeignKeyDef{
 					Columns:    $4,
 					RefTable:   objectNameFromQn($7),
 					RefColumns: $8,
 					OnDelete:   $9.(*fkActs).del,
 					OnUpdate:   $9.(*fkActs).up,
-				}}
+				}
+				if a, _ := $10.(*constrAttrs); a != nil {
+					fk.Deferrable, fk.InitiallyDeferred = a.deferrable, a.initiallyDeferred
+				}
+				$$ = &tableElem{fkDef: fk}
 			}
-	| CONSTRAINT ColId FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions
+	| CONSTRAINT ColId FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions opt_constr_attrs
 			{
-				$$ = &tableElem{fkDef: &parser.TableForeignKeyDef{
+				fk := &parser.TableForeignKeyDef{
 					Name:       $2,
 					Columns:    $6,
 					RefTable:   objectNameFromQn($9),
 					RefColumns: $10,
 					OnDelete:   $11.(*fkActs).del,
 					OnUpdate:   $11.(*fkActs).up,
-				}}
+				}
+				if a, _ := $12.(*constrAttrs); a != nil {
+					fk.Deferrable, fk.InitiallyDeferred = a.deferrable, a.initiallyDeferred
+				}
+				$$ = &tableElem{fkDef: fk}
 			}
 
 pk_cols:
@@ -425,14 +471,17 @@ with_value:
    CONCURRENTLY arrive later); ColOrders/ColExprs filled with per-column
    defaults for legacy dump parity. */
 create_index_stmt:
-		CREATE opt_unique INDEX opt_if_not_exists ColId ON qualified_name opt_using_method '(' index_col_list ')'
+		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists ColId ON qualified_name opt_using_method '(' index_col_list ')' opt_include
 			{
-				nm := $7.parts
+				nm := $8.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
 				if len(nm) > 1 {
 					tbl.Schema = nm[len(nm)-2]
 				}
-				$$ = parser.NewCreateIndexStmt(0, $2, $4, $5, tbl, $8, $10)
+				ix := parser.NewCreateIndexStmt(0, $2, $5, $6, tbl, $9, $11)
+				ix.Concurrently = $4
+				ix.IncludeColumns = $13
+				$$ = ix
 			}
 
 opt_unique:
@@ -451,9 +500,9 @@ index_col:
 		ColId                         { $$ = $1 }
 
 drop_index_stmt:
-		DROP INDEX opt_drop_if_exists drop_name_list opt_drop_behavior
+		DROP INDEX opt_concurrently opt_drop_if_exists drop_name_list opt_drop_behavior
 			{
-				$$ = parser.NewDropIndexStmt(0, false, $3, $4, dropBehavior($5))
+				$$ = parser.NewDropIndexStmt(0, $3, $4, $5, dropBehavior($6))
 			}
 
 opt_drop_if_exists:
@@ -538,6 +587,16 @@ set_stmt:
 				// spanText()'s end landed at 0 and EVERY routed `SET name = value`
 				// stored an empty value (search_path, timezone, work_mem included).
 				$$ = parser.NewSetStmt(0, $2, $3, yylex.(*lexerState).setValueAtoms(), false)
+			}
+
+/* SET [SESSION|LOCAL] TRANSACTION <modes> — gram.y TransactionStmt. Reuses
+   tx_mode_list, so ISOLATION LEVEL / READ ONLY|WRITE / [NOT] DEFERRABLE all
+   parse; only the isolation level reaches the AST, as in legacy. */
+set_transaction_stmt:
+		SET set_scope TRANSACTION tx_mode_list
+			{
+				m := $4.(*txModes)
+				$$ = parser.NewSetTransactionStmt(0, m.iso, $2)
 			}
 
 set_scope:

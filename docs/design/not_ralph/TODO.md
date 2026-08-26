@@ -500,16 +500,20 @@ its verdicts are real.
   `opt_select_limit opt_for_locking` plus a `for_locking_clause select_limit`
   alternative instead costs one S/R on FOR that goyacc resolves by shifting,
   which would silently demand a LIMIT after every FOR UPDATE. Pin stays 16.
-- [ ] **Constraint attribute trailers** — ~20 testport tests.
-  `[NOT] DEFERRABLE`, `INITIALLY DEFERRED|IMMEDIATE` on column- AND table-level
-  UNIQUE / PRIMARY KEY / FOREIGN KEY / EXCLUDE; `UNIQUE NULLS NOT DISTINCT
-  (cols)`; `... INCLUDE (cols)`. The AST already carries every field
-  (`UniqueDeferrable`, `UniqueInitiallyDeferred`, `PrimaryDeferrable`,
-  `UniqueNullsNotDistinct`, `FKDeferrable`, `TableUniqueIncludes`, …).
-  Repro: `CREATE TABLE t (i integer UNIQUE DEFERRABLE, x text)`.
-- [ ] **`SET TRANSACTION ISOLATION LEVEL ...`** — 6 isolation specs.
-  `set_stmt` only has the `SET name = value` shapes.
-- [ ] **`CREATE INDEX CONCURRENTLY` / `DROP INDEX CONCURRENTLY`** — 2 specs.
+- [x] **DONE 2026-08-27 — constraint attribute trailers.** `[NOT] DEFERRABLE`,
+  `INITIALLY DEFERRED|IMMEDIATE`, `NULLS NOT DISTINCT` and `INCLUDE (cols)` on
+  column- and table-level UNIQUE / PRIMARY KEY / FOREIGN KEY, named and
+  anonymous. Ported the gram.y way: **ConstraintAttr is a SIBLING alternative
+  of the col_constraint loop, not a trailer on each element** — that is what
+  keeps `NOT NULL` and `NOT DEFERRABLE` separable with one token of lookahead,
+  so the pin stayed at 16. EXCLUDE constraints remain unported.
+- [x] **DONE 2026-08-27 — `SET [LOCAL] TRANSACTION <modes>`**, reusing
+  `tx_mode_list` so ISOLATION LEVEL / READ ONLY|WRITE / [NOT] DEFERRABLE all
+  parse; only the isolation level reaches the AST, as in legacy.
+- [x] **DONE 2026-08-27 — `CREATE|DROP INDEX CONCURRENTLY` and
+  `CREATE INDEX ... INCLUDE (cols)`.** (Legacy itself rejects
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, so that combination is a legacy
+  limitation, not a porting gap.)
 - [ ] **A PARENTHESIZED select as a set-operation operand** — TPC-DS Q87.
   Full analysis and resume point below.
 

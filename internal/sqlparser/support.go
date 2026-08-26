@@ -589,6 +589,9 @@ type colSpec struct {
 	typ      string
 	args     []int64
 	isArray  bool
+	nullsNotDistinct  bool
+	deferrable        bool
+	initiallyDeferred bool
 	notNull  bool
 	primary  bool
 	unique   bool
@@ -606,6 +609,11 @@ type tableElem struct {
 	fkDef      *parser.TableForeignKeyDef
 	namedPk    *parser.TableConstraintDef
 	namedUq    *parser.TableConstraintDef
+	uqIncl     []string
+	uqNND      bool
+	uqAttrs    *constrAttrs
+	pkIncl     []string
+	pkAttrs    *constrAttrs
 	withPairs  [][2]string
 	inherits   []parser.ObjectName
 	asSelect   *parser.SelectStmt
@@ -614,6 +622,14 @@ type tableElem struct {
 
 // colConstraints accumulates a column's constraint suffix in CREATE TABLE.
 type colConstraints struct {
+	// deferrable / initiallyDeferred accumulate the ConstraintAttr items
+	// (gram.y ConstraintAttr), which upstream collects as SIBLING alternatives
+	// of the same col_constraint loop rather than as a trailer on each
+	// constraint — that is what keeps `NOT NULL` and `NOT DEFERRABLE`
+	// LALR(1)-separable. nullsNotDistinct is UNIQUE's opt_unique_null_treatment.
+	deferrable        bool
+	initiallyDeferred bool
+	nullsNotDistinct  bool
 	notNull    bool
 	primary    bool
 	unique     bool
@@ -765,6 +781,43 @@ type txModes struct {
 	iso string
 	ro  bool
 	def bool
+}
+
+// constrAttrs carries a table-level constraint's ConstraintAttributeSpec
+// (gram.y): [NOT] DEFERRABLE / INITIALLY DEFERRED|IMMEDIATE. INITIALLY DEFERRED
+// implies DEFERRABLE, matching legacy's parseConstraintDeferrable.
+type constrAttrs struct {
+	deferrable        bool
+	initiallyDeferred bool
+}
+
+func mergeConstrAttr(acc *constrAttrs, kind string) *constrAttrs {
+	if acc == nil {
+		acc = &constrAttrs{}
+	}
+	switch kind {
+	case "deferrable":
+		acc.deferrable = true
+	case "not_deferrable":
+		acc.deferrable, acc.initiallyDeferred = false, false
+	case "initially_deferred":
+		acc.deferrable, acc.initiallyDeferred = true, true
+	case "initially_immediate":
+		acc.initiallyDeferred = false
+	}
+	return acc
+}
+
+// namedTableConstraint builds a CONSTRAINT-named table-level PK/UNIQUE with
+// its INCLUDE list, NULLS NOT DISTINCT flag and ConstraintAttributeSpec.
+func namedTableConstraint(name string, cols []string, isPrimary bool, incl []string, nnd bool, a *constrAttrs) *parser.TableConstraintDef {
+	d := parser.NewTableConstraintDef(name, cols, isPrimary)
+	d.IncludeColumns = incl
+	d.NullsNotDistinct = nnd
+	if a != nil {
+		d.Deferrable, d.InitiallyDeferred = a.deferrable, a.initiallyDeferred
+	}
+	return d
 }
 
 // onConflictColumnTarget builds an `ON CONFLICT (cols)` arbiter with the Exprs

@@ -430,3 +430,11 @@ func NewDropCompatStmt(pos int, objType string, ifExists bool, names []ObjectNam
 func NewLockingClause(pos int, strength LockStrength, targets []string, wait LockWaitPolicy) *LockingClause {
 	return &LockingClause{pos: pos, Strength: strength, Targets: targets, WaitPolicy: wait}
 }
+
+// NewSetTransactionStmt builds `SET [LOCAL] TRANSACTION <modes>` (gram.y
+// TransactionStmt's SET TRANSACTION arm). Only the isolation level reaches the
+// AST; READ ONLY/WRITE and DEFERRABLE are accepted and discarded, matching
+// legacy parseSetTransaction.
+func NewSetTransactionStmt(pos int, isolation string, local bool) *SetTransactionStmt {
+	return &SetTransactionStmt{pos: pos, IsolationLevel: isolation, Local: local}
+}
