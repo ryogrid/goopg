@@ -22,6 +22,12 @@ create_table_stmt:
 				var cols []parser.ColumnDef
 				var pk []string
 				var uqs [][]string
+				var uqIncludes [][]string
+				var uqNullsNotDistinct, uqDeferrable, uqInitiallyDeferred []bool
+				var named []parser.TableConstraintDef
+				var namedChecks []parser.PartitionCheckConstraint
+				var checks []string
+				var checkNoInherit, checkNotEnforced []bool
 				for _, e := range elems {
 					switch {
 					case e.col != nil:
@@ -50,7 +56,35 @@ create_table_stmt:
 						}
 					default:
 						pk = append(pk, e.pk...)
-						uqs = append(uqs, e.uq...)
+						for _, u := range e.uq {
+							// TableUniques has four PARALLEL slices; legacy
+							// appends to all five per anonymous UNIQUE
+							// (internal/parser/ddl.go:3958-4016), and canonDump
+							// distinguishes ∅ from [false].
+							uqs = append(uqs, u)
+							uqIncludes = append(uqIncludes, nil)
+							uqNullsNotDistinct = append(uqNullsNotDistinct, false)
+							uqDeferrable = append(uqDeferrable, false)
+							uqInitiallyDeferred = append(uqInitiallyDeferred, false)
+						}
+						if e.namedPk != nil {
+							named = append(named, *e.namedPk)
+						}
+						if e.namedUq != nil {
+							named = append(named, *e.namedUq)
+						}
+						if e.check != "" {
+							if e.checkName != "" {
+								// CONSTRAINT c CHECK (...) -> TableNamedChecks,
+								// and legacy does NOT touch the anonymous
+								// parallel slices for it (ddl.go:4191-4238).
+								namedChecks = append(namedChecks, parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check})
+							} else {
+								checks = append(checks, e.check)
+								checkNoInherit = append(checkNoInherit, false)
+								checkNotEnforced = append(checkNotEnforced, false)
+							}
+						}
 					}
 				}
 				nm := $5.parts
@@ -68,6 +102,15 @@ create_table_stmt:
 				}
 				ct.IfNotExists = $4
 				ct.TableUniques = uqs
+				ct.TableUniqueIncludes = uqIncludes
+				ct.TableUniqueNullsNotDistinct = uqNullsNotDistinct
+				ct.TableUniqueDeferrable = uqDeferrable
+				ct.TableUniqueInitiallyDeferred = uqInitiallyDeferred
+				ct.NamedConstraints = named
+				ct.TableNamedChecks = namedChecks
+				ct.TableChecks = checks
+				ct.TableCheckNoInherit = checkNoInherit
+				ct.TableCheckNotEnforced = checkNotEnforced
 				tail := $9
 				_ = tail
 				for _, kv := range tail.withKv {
@@ -173,7 +216,7 @@ table_element:
 				$$ = &tableElem{col: cs}
 			}
 	| PRIMARY KEY pk_cols   { $$ = &tableElem{pk: $3} }
-	| UNIQUE uq_cols        { $$ = &tableElem{} }
+	| UNIQUE uq_cols        { $$ = &tableElem{uq: [][]string{$2}} } /* $2 used to be discarded */
 	| CONSTRAINT ColId PRIMARY KEY pk_cols
 			{
 				d := parser.NewTableConstraintDef($2, $5, true)
