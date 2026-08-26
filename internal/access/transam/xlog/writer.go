@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/port/gls"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/activity/stats"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -376,6 +377,14 @@ type Writer struct {
 	OnWALWrite func()
 	OnWALSync  func()
 
+	// OnWALWriteDone pairs with OnWALWrite — called immediately after the
+	// ring→segment drain completes (success or error), mirroring
+	// OnWALSyncDone's balance guarantee. Since the probe-audit split, the
+	// commit path emits WALWrite for the park/drain phases and WALSync only
+	// around the fdatasync barrier (PG WAIT_EVENT_WAL_WRITE /
+	// WAIT_EVENT_WAL_SYNC).
+	OnWALWriteDone func()
+
 	// OnWALSyncDone pairs with OnWALSync — called immediately after
 	// the fdatasync completes (success or error) so observability
 	// code can balance every WaitEventStart with a WaitEventEnd.
@@ -498,9 +507,6 @@ type state struct {
 	sysID      uint64
 	tli        uint32
 
-	// onWALWrite is an optional hook called before each WAL page
-	// write in writeAt. Set by NewWriter from the Writer's OnWALWrite.
-	onWALWrite func()
 
 	// core is the slice B stripe writer core, mounted by NewWriter and
 	// shared with Writer.core (same pointer). state.append's PG-compat
@@ -597,7 +603,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 	w.drainedLSNAtomic.Store(st.drainedLSN)
 	st.drainedLSNMirror = &w.drainedLSNAtomic
 	st.onAppend = w.notifyAppend
-	st.onWALWrite = cfg.OnWALWrite
+	w.OnWALWrite = cfg.OnWALWrite
 	w.core = newStripeWriterCore(
 		uint64(cfg.SegmentSize),
 		uint64(st.writePos),
@@ -964,12 +970,11 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 	if lsn <= w.flushedLSNAtomic.Load() {
 		return nil
 	}
-	if w.OnWALSync != nil {
-		w.OnWALSync()
-	}
-	if w.OnWALSyncDone != nil {
-		defer w.OnWALSyncDone()
-	}
+	// Wait-event windows are NOT wrapped around the whole flush here:
+	// flushUpToBackend/flushWindows emit the finer-grained upstream split —
+	// IO:WALWrite for parking on WAL machinery and the write drain,
+	// IO:WALSync for the fdatasync barrier (PG WAIT_EVENT_WAL_WRITE /
+	// WAIT_EVENT_WAL_SYNC).
 	return w.flushUpToBackend(lsn)
 }
 
@@ -988,12 +993,33 @@ func (w *Writer) flushUpToBackend(lsn uint64) error {
 	// contiguous tail back below lsn, so we must let it publish first. Done
 	// outside writeMu so the flusher never blocks fast-path appends (RLock)
 	// while draining — that is what keeps commits batching (04 §4.4).
+	// Waiting for in-flight stripe inserts to publish is committer-side WAL
+	// wait time; upstream surfaces it as LWLock:WALInsert. writeMu here is
+	// not an anonymous mutex — it IS the WAL write lock, so reporting its
+	// queue with the real tranche name mirrors upstream exactly (the
+	// 03-design §4 no-anonymous-LWLock policy does not apply to named
+	// resources).
+	if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		reg.WaitEventStart(procNum, activity.WaitTypeLWLock, activity.WaitWALInsert)
+	}
 	frontier := st.waitInsertionsToFinish(lsn)
+	if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		reg.WaitEventEnd(procNum)
+	}
 	for {
 		if lsn <= w.flushedLSNAtomic.Load() {
 			return nil // covered by another holder's flush
 		}
+		// Parking here = waiting for another committer's write+fdatasync to
+		// release the WAL write lock. Upstream shows exactly this as
+		// LWLock:WALWriteLock (a named tranche), so emit the real class/name.
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeLWLock, activity.WaitWALWriteLock)
+		}
 		held, err := st.writeMu.acquireOrWait(w.done)
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
+		}
 		if err != nil {
 			return err // ErrClosed
 		}
@@ -1035,7 +1061,7 @@ func (w *Writer) flushAsHolder(lsn, frontier uint64) (err error) {
 	if t := st.publishedFrontier(); t > frontier {
 		frontier = t
 	}
-	err = st.xlogWrite(writeRqst{write: frontier, flush: frontier})
+	err = w.flushWindows(st, writeRqst{write: frontier, flush: frontier})
 	if err != nil {
 		w.stickyErr.Store(&flushErr{err: err})
 		return err
@@ -1046,6 +1072,32 @@ func (w *Writer) flushAsHolder(lsn, frontier uint64) (err error) {
 		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, st.flushedLSN, lsn)
 	}
 	return nil
+}
+
+// flushWindows performs a holder flush with the two physical phases bracketed
+// by separate upstream-style wait events: IO:WALWrite around the ring→segment
+// pwrite drain (PG XLogWrite / WAIT_EVENT_WAL_WRITE) and IO:WALSync around the
+// fdatasync barrier (WAIT_EVENT_WAL_SYNC). Each hook pair is sequential and
+// balanced on every path, including stage errors.
+func (w *Writer) flushWindows(st *state, rq writeRqst) error {
+	if w.OnWALWrite != nil {
+		w.OnWALWrite()
+	}
+	err := st.walWriteStage(rq)
+	if w.OnWALWriteDone != nil {
+		w.OnWALWriteDone()
+	}
+	if err != nil {
+		return err
+	}
+	if w.OnWALSync != nil {
+		w.OnWALSync()
+	}
+	err = st.walSyncStage(rq)
+	if w.OnWALSyncDone != nil {
+		w.OnWALSyncDone()
+	}
+	return err
 }
 
 // BackgroundWrite is the background walwriter's periodic pre-write+flush, the
@@ -1073,12 +1125,8 @@ func (w *Writer) BackgroundWrite() error {
 	if frontier == 0 || frontier <= w.flushedLSNAtomic.Load() {
 		return nil // nothing new to make durable
 	}
-	if w.OnWALSync != nil {
-		w.OnWALSync()
-	}
-	if w.OnWALSyncDone != nil {
-		defer w.OnWALSyncDone()
-	}
+	// Same fine-grained event split as the commit path: flushWindows inside
+	// backgroundFlushLocked emits IO:WALWrite / IO:WALSync separately.
 	return w.backgroundFlushLocked(frontier)
 }
 
@@ -1103,7 +1151,7 @@ func (w *Writer) backgroundFlushLocked(frontier uint64) (err error) {
 	if t := st.publishedFrontier(); t > frontier {
 		frontier = t
 	}
-	err = st.xlogWrite(writeRqst{write: frontier, flush: frontier})
+	err = w.flushWindows(st, writeRqst{write: frontier, flush: frontier})
 	if err != nil {
 		w.stickyErr.Store(&flushErr{err: err})
 		return err
@@ -2163,7 +2211,20 @@ type writeRqst struct {
 // it is behavior-identical to the pre-slice-2 flushUpTo. In the backend-driven
 // model (slice 3+) the caller holds the WAL write lock and passes a widened
 // frontier; the walwriter (slice 4) and the overflow drain pass rq.flush == 0.
+// xlogWrite composes the two physical stages; the wait-event-instrumented
+// paths call walWriteStage / walSyncStage separately via Writer.flushWindows so
+// IO:WALWrite and IO:WALSync are reported distinctly (PG WAIT_EVENT_WAL_WRITE /
+// WAIT_EVENT_WAL_SYNC).
 func (s *state) xlogWrite(rq writeRqst) error {
+	if err := s.walWriteStage(rq); err != nil {
+		return err
+	}
+	return s.walSyncStage(rq)
+}
+
+// walWriteStage is Stage 1 of xlogWrite: bound rq.write, drain ring bytes to
+// segment files (pwrite), publish the OS-cache frontier (PG logWriteResult).
+func (s *state) walWriteStage(rq writeRqst) error {
 	if rq.write == 0 {
 		return nil
 	}
@@ -2180,19 +2241,26 @@ func (s *state) xlogWrite(rq writeRqst) error {
 		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, writtenLSN, rq.write)
 	}
 
-	// --- Stage 1: drain ring bytes ≤ rq.write to segment files (pwrite) ---
 	// (M0013-0001) No-op when walBuf is nil or already drained past rq.write.
 	if rq.write > s.drainedLSN {
 		if err := s.drainBufferUpTo(rq.write); err != nil {
 			return err
 		}
 	}
-	// Publish the OS-cache write frontier (PG logWriteResult). Single writer at
-	// a time (writer goroutine today; the write-lock holder in slice 3+).
+	// Single writer at a time (writer goroutine today; the write-lock holder
+	// in slice 3+).
 	if s.drainedLSNMirror != nil {
 		s.drainedLSNMirror.Store(s.drainedLSN)
 	}
+	return nil
+}
 
+// walSyncStage is Stage 2 of xlogWrite: fdatasync dirty segments ≤ rq.flush
+// and publish the durable frontier AFTER the sync (PG logFlushResult).
+func (s *state) walSyncStage(rq writeRqst) error {
+	if rq.write == 0 {
+		return nil
+	}
 	// --- Stage 2: fdatasync dirty segments ≤ rq.flush (skipped when write-only) ---
 	if rq.flush == 0 {
 		return nil
@@ -2470,9 +2538,11 @@ func recycleSegmentFile(oldPath, newPath string, size int64) error {
 }
 
 func (s *state) writeAt(pos int64, buf []byte) error {
-	if s.onWALWrite != nil {
-		s.onWALWrite()
-	}
+	// NOTE: the IO:WALWrite wait-event window is owned by the Writer level
+	// (flushWindows / acquireOrWait park wrappers), which brackets WHOLE
+	// drain phases with balanced OnWALWrite/OnWALWriteDone pairs. Firing a
+	// bare Start here would be unbalanced and would clobber the outer
+	// window's packed slot value.
 	for len(buf) > 0 {
 		segNo := uint64(pos / s.cfg.SegmentSize)
 		segOff := pos % s.cfg.SegmentSize

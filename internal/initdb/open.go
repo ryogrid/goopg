@@ -441,9 +441,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		PageHeaders: true,
 		SystemID:    systemID,
 		TimelineID:  tli,
-		// M0107-0005: closure-captures walProcNum (int32) for the atomic
-		// hot path; no goroutine map lookup and no mutex.
+		// M0107-0005: closure-captures walProcNum (int32) as the FALLBACK
+		// slot for unregistered callers. Probe-audit fix 2026-08-26: the
+		// primary attribution is the CALLING goroutine's own slot — the
+		// commit path parks/drains inside this hook on committer
+		// goroutines, and upstream reports WALWrite on the waiting backend.
 		OnWALWrite: func() {
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitWALWrite)
+				return
+			}
 			if act != nil {
 				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALWrite)
 			}
@@ -2424,6 +2431,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			}
 			if act != nil {
 				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALSync)
+			}
+		}
+		walWriter.OnWALWriteDone = func() {
+			// Balances OnWALWrite (drain/park phases). No fsync_time
+			// accumulation here — that clock is the fdatasync barrier only
+			// and stays on OnWALSyncDone.
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
+				return
+			}
+			if act != nil {
+				act.WaitEventEnd(walProcNum)
 			}
 		}
 		walWriter.OnWALSyncDone = func() {

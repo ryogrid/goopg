@@ -25,7 +25,9 @@ sampling-based profiling inside the server.
 | LWLock acquisition (`lwlock.c`) | `LWLock:*` | Go mutex/cond parks | policy: not mapped (§4) |
 | buffer pin wait | `BufferPin:BufferPin` | bufpool pin callback | done; emission decoupled from track_io_timing (probe-audit fix) |
 | `md.c`/`fd.c`/`slru.c`/AIO IO | `IO:*` | storage-manager + AIO callbacks (`initdb/open.go`) | done; windows now fire regardless of track_io_timing, only *_time stays gated (probe-audit fix); WAL flush attributed per committer |
-| WAL flush/write (`xlog.c`) | `IO:WALSync/WALWrite` | wal writer callbacks | done |
+| WAL write drain (`XLogWrite` pwrite) | `IO:WALWrite` | `Writer.flushWindows` stage 1 | done (split from the old whole-flush window) |
+| WAL fdatasync barrier (`XLogFlush`) | `IO:WALSync` | `Writer.flushWindows` stage 2, per COMMITTER | done (attribution fix) |
+| committers parked on the WAL write lock / insert stripes | `LWLock:WALWriteLock` / `LWLock:WALInsert` | `flushUpToBackend` parks (`acquireOrWait`, `waitInsertionsToFinish`) | done — first LWLock-class emitters; named tranches with real upstream identity, per the §4 amendment |
 | hash spill tmp files | `IO:BuffileRead/Write` | `executor/spill.go` | done |
 | `pqcomm.c` secure_read/write | `Client:ClientRead/Write` | `postmaster/server.go` conn loop | done |
 | main-loop states (`postgres.c`) | state column | `postmaster/dispatch.go` active/idle wiring + session txn transitions | done |
@@ -131,6 +133,13 @@ Why goopg does not mirror the LWLock tier 1:1:
    lookups, proc-array scans, registry maps) — the working analog of
    upstream's spinlock tier, which upstream also deliberately keeps out of
    pg_stat_activity.
+
+Amendment (probe-audit follow-up): the "no LWLock events" decision applies
+to ANONYMOUS struct mutexes. Where a Go lock is the direct analog of a named
+upstream tranche — the WAL write lock (`writeMu` ≈ `WALWriteLock`) and the
+insert-stripe wait (≈ `WALInsert`) — reporting `LWLock:<tranche>` at that one
+choke point is exactly the lwlock.c pattern (report at the primitive with
+known identity), not the noise case this policy was written against.
 
 Residual risk this policy accepts, and its coverage: nothing prevents a
 future holder from parking many goroutines for a long time under a plain

@@ -208,3 +208,42 @@ The lone DataFileRead row is itself evidence: a cold cache-miss read
 surfacing as a client-backend wait was impossible before the fix. tps moved
 9,370 → 9,548 (noise range); the added per-I/O goroutine lookup costs tens
 of ns against real syscalls and is invisible in pprof.
+
+## Addendum 3 — WALWrite/WALSync split, then corrected labeling (2026-08-26)
+
+Review challenged the post-split distribution ("WALWrite cannot exceed
+WALSync: pwrite only copies into page cache, fdatasync waits for the device").
+Correct — the 57% labeled WALWrite after the mechanical split was NOT pwrite
+time: it was committers PARKED inside `acquireOrWait` queueing for the WAL
+write lock, which I had mislabeled as IO:WALWrite to keep them visible.
+
+Relabeled per upstream semantics: those parks are `LWLock:WALWriteLock`
+(writeMu IS the named WAL write lock, direct analog of the upstream tranche;
+likewise stripe-wait = `LWLock:WALInsert`), leaving IO:WALWrite for the
+actual drain/pwrite phase and IO:WALSync for the fdatasync barrier. These
+are the bundle's first LWLock-class emitters, added at named choke points —
+consistent with §4 as amended.
+
+Final run `-N -c 50 -j 8 -T 45 -s 10` (417,277 txns / 9,277 tps, 4,401
+backend-samples / 89 sweeps):
+
+| samples | % of total | state | wait_event_type | wait_event |
+|---:|---:|---|---|---|
+| 2342 | 53.2% | active | LWLock | WALWriteLock |
+| 1172 | 26.6% | active | (none) | (none) |
+| 314 | 7.1% | idle in transaction | Client | ClientRead |
+| 146 | 3.3% | idle in transaction | (none) | (none) |
+| 122 | 2.8% | idle | Client | ClientRead |
+| 91 | 2.1% | idle in transaction | Client | ClientWrite |
+| 83 | 1.9% | active | IO | WALSync |
+| 57 | 1.3% | active | Lock | relation |
+| 32 | 0.7% | idle | (none) | (none) |
+| 21 | 0.5% | active | Client | ClientWrite |
+| 19 | 0.4% | idle | Client | ClientWrite |
+| 2 | 0.05% | active | IO | AIO |
+
+The shape now matches both physics and vanilla-PG field behavior: queueing
+on the WAL write lock dominates committer wait time; true IO:WALWrite does
+not even reach sampling resolution (pwrite into page cache); IO:WALSync is
+real but small here because group-commit batches amortize one fdatasync
+across many committers on this WSL2 host. tps stayed in the 9.3–9.5k band.
