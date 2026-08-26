@@ -394,23 +394,41 @@ found one blocker; repairing the differential harness found five more defects in
 ALREADY-ROUTED statement classes. All six are fixed (see the P2.6 commit); what
 follows is what the audit left OPEN.
 
-- [ ] **`TestCreateTableV0` and `TestInsertOnConflictReturning` assert nothing.**
+- [x] **DONE 2026-08-27 — `TestCreateTableV0` and `TestInsertOnConflictReturning` assert nothing.**
+  Both are now `diffParse` gates with three buckets (must-match / yacc-only /
+  both-reject) plus a guard that `parser.RouteBatch` is nil so the legacy leg
+  cannot self-compare. All 85 literals match after the fixes below; only
+  `CREATE TABLE c (a int) WITH (...) PARTITION BY RANGE (a)` stays rejected by
+  both (opt_ct_tail is flat and cannot compose WITH with PARTITION BY).
+  Original entry:
   Both `t.Logf` on parse failure and `fmt.Printf` the result, and neither wires
   `parser.RouteBatch = RouteBatch`, so they run entirely through the LEGACY
   parser. Every DDL/utility wave from P4.1 to P6.2 therefore has ZERO enforced
   differential coverage. Convert both to `diffParse` + `t.Errorf` (the shape
   `values_table_test.go` and `cast_target_test.go` already use).
-- [ ] **Table-level unnamed `CHECK (...)` and `FOREIGN KEY (...) REFERENCES ...`
-  have no grammar.** Only the column-level forms are ported (`pg_grammar.y`
+- [x] **DONE 2026-08-27 — table-level `CHECK` / `FOREIGN KEY` ported** (anonymous
+  and `CONSTRAINT name FOREIGN KEY`), reusing opt_ref_cols / opt_fk_actions;
+  conflict pin unmoved at 16. Still on legacy and tracked here: `MATCH FULL`,
+  `[NOT] DEFERRABLE [INITIALLY ...]`, `NOT VALID`, `[NOT] ENFORCED`,
+  `ON DELETE SET (cols)`, `NO INHERIT`, `INCLUDE (...)`.
+  Original entry: Only the column-level forms are ported (`pg_grammar.y`
   `col_constraint`), so
   `CREATE TABLE t (a int, b int, foreign key (b) references o (id))` is a syntax
   error on the routed path. `FOREIGN` is one of the reserved tokens no
   production consumes (see the reachability item below).
-- [ ] **Named table constraints are parsed and then dropped.**
+- [x] **DONE 2026-08-27 — named table constraints wired**, along with the
+  anonymous `UNIQUE (cols)` carrier that discarded its columns outright (so
+  `TableUniques` was always nil on the routed path) and all the parallel
+  slices canonDump compares. Original entry:
   `table_element`'s `CONSTRAINT ColId {PRIMARY KEY|UNIQUE|CHECK}` alternatives
   fill `tableElem.namedPk` / `namedUq` / `check` / `checkName`, but
   `create_table_stmt`'s element loop only consumes `e.pk` and `e.uq`.
-- [ ] **Reserved-keyword reachability is unaudited.** 22 of the 78
+- [x] **DONE 2026-08-27 — `TestReservedKeywordsReachable`** asserts every
+  `reserved_keyword` / `type_func_name_keyword` token is either consumed by a
+  hand-written production or on the `notYetPortedKeywords` allowlist (18
+  entries today; `FOREIGN` dropped off when the table-level FK landed). It also
+  fails on STALE entries, so closing a hole forces the allowlist update in the
+  same commit — both directions negative-tested. Original entry: 22 of the 78
   `reserved_keyword`s and 8 of the 23 `type_func_name_keyword`s are never
   referenced by any hand-written production, so they are unreachable and any
   routed statement using one is a guaranteed syntax error — exactly how the
@@ -423,7 +441,8 @@ follows is what the audit left OPEN.
   statement classes not yet ported. **Worth mechanising as a test** that
   asserts each such token is either consumed by a production or on an explicit
   not-yet-ported allowlist.
-- [ ] **`name_or_call` coerces nil args to `[]parser.Expr{}`** for
+- [x] **DONE 2026-08-27 — `name_or_call` nil-args coercion removed.**
+  Original entry: for
   `qualified_name '(' opt_func_call_args ')'`, so every zero-arg call (`now()`,
   `pg_backend_pid()`, `current_database()`) renders `Args=[]` where legacy
   renders `∅`. A latent parity diff for the whole zero-arg call class; the new
@@ -436,6 +455,29 @@ follows is what the audit left OPEN.
   `internal/executor/operators_ddl.go:6291` (`vt.ViewDef = s.RawDef`), read-back
   is `internal/executor/expr.go:11569`. Leading suspects: catalog rows written
   before `5cf25672a` fixed `RawDef`, or the name-vs-OID lookup path.
+
+### Found while consuming the audit list (2026-08-27) — all FIXED
+
+Five more AST-carrier defects on already-routed classes, none of them a parse
+failure (each produced a well-formed statement carrying the wrong value, which
+is why every gate stayed green):
+
+- **Every routed `SET name = value` stored the WRONG value.** The mid-rule
+  `markSpanStart()` is not lookahead-stable — the parser has already consumed
+  the first value token to decide the `set_eq_to` reduce, so `peek()` pointed
+  one token past it: `SET x = 1` stored `""`, `SET search_path TO public,
+  pg_catalog` stored `", pg_catalog"`. The port was also wrong in kind: legacy
+  joins the value tokens' DECODED text with `", "` (parseSetValueAtoms,
+  parser.go:3056), so a source span matches only by accident.
+- **`ON CONFLICT (cols)` dropped `OnConflictTarget.Exprs`**, which legacy keeps
+  parallel to `Columns`.
+- **`tx_mode_list` dropped every mode after a comma** — `BEGIN ISOLATION LEVEL
+  SERIALIZABLE, READ ONLY` started a READ WRITE transaction.
+- **Raw spans truncated on a quoted tail.** `fragEndPos` used the last token's
+  `Pos+len(Value)`, but `Value` is DECODED, so a trailing `'x'` under-counted
+  by its quotes; the `with_data_kw` end marker had the same bug.
+  **Lesson for future span work: never size a span from a token's `Value`
+  length — use a delimiter's position.**
 
 ## P5 — DDL wave 2 (everything else CREATE/ALTER/DROP)
 

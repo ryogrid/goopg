@@ -1,13 +1,28 @@
 package sqlparser
 
 import (
-	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// TestCreateTableV0 is the DDL/utility differential gate.
+//
+// It used to assert NOTHING: it parsed each statement with parser.Parse, logged
+// any error with t.Logf and fmt.Printf'd the dump. Since parser.RouteBatch is
+// nil in unit tests that meant it exercised only the LEGACY parser and could
+// never fail — which is why every wave from P4.1 (CREATE TABLE) through P6.2
+// (SET/SHOW/RESET) shipped with zero enforced coverage, and how the dropped
+// column typmods, the orphaned PRIMARY KEY/UNIQUE/DEFAULT alternatives and the
+// missing table-level CHECK/FOREIGN KEY all stayed invisible.
+//
+// diffParse compares the two parsers directly, so parser.RouteBatch must stay
+// nil or the legacy leg would become a self-comparison — asserted below.
 func TestCreateTableV0(t *testing.T) {
+	if parser.RouteBatch != nil {
+		t.Fatal("parser.RouteBatch is set; diffParse's legacy leg would self-compare")
+	}
 	for _, q := range []string{
 		"CREATE TABLE t (a int, b text)",
 		"CREATE TABLE t (a int primary key, b text not null default 'x')",
@@ -37,7 +52,6 @@ func TestCreateTableV0(t *testing.T) {
 		"ALTER TABLE t ALTER COLUMN a TYPE bigint",
 		"ALTER TABLE t RENAME TO t2",
 		"ALTER TABLE t ADD COLUMN c int, ADD COLUMN d text",
-		"ALTER TABLE t DROP COLUMN c, ALTER COLUMN a TYPE bigint, RENAME TO t2",
 		"ALTER TABLE t ALTER COLUMN a SET DEFAULT 5",
 		"ALTER TABLE t ALTER COLUMN a SET NOT NULL",
 		"ALTER TABLE t ALTER COLUMN a DROP NOT NULL",
@@ -57,10 +71,8 @@ func TestCreateTableV0(t *testing.T) {
 		"ALTER TABLE t ATTACH PARTITION c FOR VALUES IN (1, 2)",
 		"ALTER TABLE t ATTACH PARTITION c DEFAULT",
 		"ALTER TABLE t DETACH PARTITION c",
-		"CREATE TABLE c (a int) PARTITION OF p FOR VALUES FROM (1) TO (10)",
 		"CREATE TABLE c PARTITION OF p FOR VALUES IN (1, 2)",
 		"CREATE TABLE c PARTITION OF p DEFAULT",
-		"CREATE TABLE c (a int) WITH (fillfactor=70) PARTITION BY RANGE (a)",
 		"CREATE VIEW v AS SELECT 1",
 		"CREATE OR REPLACE VIEW s.v (a, b) AS SELECT 1, 2",
 		"DROP VIEW IF EXISTS v CASCADE",
@@ -68,8 +80,13 @@ func TestCreateTableV0(t *testing.T) {
 		"CREATE MATERIALIZED VIEW mv AS SELECT 1",
 		"CREATE MATERIALIZED VIEW IF NOT EXISTS s.mv (a, b) AS SELECT 1, 2 WITH NO DATA",
 		"CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH DATA",
-		"BEGIN", "BEGIN WORK", "START TRANSACTION",
-		"COMMIT", "END", "ROLLBACK", "ABORT",
+		"BEGIN",
+		"BEGIN WORK",
+		"START TRANSACTION",
+		"COMMIT",
+		"END",
+		"ROLLBACK",
+		"ABORT",
 		"BEGIN ISOLATION LEVEL SERIALIZABLE",
 		"BEGIN READ ONLY",
 		"START TRANSACTION ISOLATION LEVEL READ COMMITTED",
@@ -78,13 +95,46 @@ func TestCreateTableV0(t *testing.T) {
 		"SET SESSION x = 1",
 		"SET LOCAL x = off",
 		"SET search_path TO a, b",
-		"SHOW x", "SHOW ALL", "RESET x", "RESET ALL",
+		"SHOW x",
+		"SHOW ALL",
+		"RESET x",
+		"RESET ALL",
 	} {
-		sts, err := parser.Parse(q)
+		assertParity(t, q)
+	}
+
+	// Accepted by the yacc grammar but REJECTED by legacy. Kept as coverage
+	// that the new parser handles them; parity is not assertable.
+	for _, q := range []string{
+		"ALTER TABLE t DROP COLUMN c, ALTER COLUMN a TYPE bigint, RENAME TO t2",
+		"CREATE TABLE c (a int) PARTITION OF p FOR VALUES FROM (1) TO (10)",
+	} {
+		toks, err := parser.Lex(q)
 		if err != nil {
-			t.Logf("%q ERR %v", q, err)
+			t.Errorf("lex %q: %v", q, err)
 			continue
 		}
-		fmt.Printf("%q -> %s\n", q, dumpStmts(sts))
+		if _, err := ParseOneSrc(q, toks); err != nil {
+			t.Errorf("yacc-only case regressed %q: %v", q, err)
+		}
+		if _, err := parser.Parse(q); err == nil {
+			t.Errorf("%q now parses in legacy too — move it to the parity list", q)
+		}
+	}
+
+	// Rejected by BOTH parsers. opt_ct_tail is a flat single-clause rule, so it
+	// cannot compose WITH (...) with PARTITION BY; legacy cannot either.
+	// Tracked in docs/design/not_ralph/TODO.md (P4.1 open-option-list tail).
+	for _, q := range []string{
+		"CREATE TABLE c (a int) WITH (fillfactor=70) PARTITION BY RANGE (a)",
+	} {
+		_, _, err := diffParse(q)
+		if err == nil {
+			t.Errorf("%q now parses on both sides — promote it to the parity list", q)
+			continue
+		}
+		if !strings.HasPrefix(err.Error(), "legacy:") {
+			t.Errorf("%q: expected the legacy leg to reject first, got %v", q, err)
+		}
 	}
 }

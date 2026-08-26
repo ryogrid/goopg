@@ -1,12 +1,11 @@
 package sqlparser
 
-import (
-	"fmt"
-	"testing"
+import "testing"
 
-	"github.com/goopg/goopg/internal/parser"
-)
-
+// TestInsertOnConflictReturning — like TestCreateTableV0 this asserted nothing
+// (t.Logf + fmt.Printf through the legacy parser only), which is how the
+// dropped OnConflictTarget.Exprs slice stayed invisible. See
+// TestOnConflictArbiterParity for that defect's dedicated pin.
 func TestInsertOnConflictReturning(t *testing.T) {
 	for _, q := range []string{
 		"INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
@@ -17,11 +16,6 @@ func TestInsertOnConflictReturning(t *testing.T) {
 		"INSERT INTO t VALUES (1) RETURNING *",
 		"INSERT INTO t VALUES (1) RETURNING id, v + 1 AS nv",
 	} {
-		sts, err := parser.Parse(q)
-		if err != nil {
-			t.Logf("%q ERR %v", q, err)
-			continue
-		}
-		fmt.Printf("%q -> %s\n", q, dumpStmts(sts))
+		assertParity(t, q)
 	}
 }
