@@ -203,18 +203,53 @@ func fragEndPos(src string, toks []parser.Token) int {
 //
 // The GUC name is a ColId and can be neither '=' nor TO, so the first
 // occurrence of either is always the separator.
-func (l *lexerState) setValueAtoms() string {
-	i := 0
-	for ; i < len(l.toks); i++ {
-		t := l.toks[i]
-		if t.Kind == parser.TokenOperator && t.Value == "=" {
-			break
-		}
-		if (t.Kind == parser.TokenKeyword || t.Kind == parser.TokenIdent) && strings.EqualFold(t.Value, "to") {
-			break
+// setValueIsDefault reports whether a SET statement's value is the bare
+// DEFAULT keyword (as opposed to the string literal 'default', which legacy
+// keeps as a value). Only the token KIND separates them, which is why this
+// cannot be a grammar alternative without a reduce/reduce against the
+// permissive value list.
+func (l *lexerState) setValueIsDefault() bool {
+	i := l.setValueStart()
+	if i < 0 || i >= len(l.toks) {
+		return false
+	}
+	t := l.toks[i]
+	if t.Kind != parser.TokenKeyword && t.Kind != parser.TokenIdent {
+		return false
+	}
+	if !strings.EqualFold(t.Value, "default") {
+		return false
+	}
+	// must be the ONLY value token
+	for j := i + 1; j < len(l.toks); j++ {
+		if l.toks[j].Kind != parser.TokenEOF && l.toks[j].Value != ";" {
+			return false
 		}
 	}
-	if i >= len(l.toks) {
+	return true
+}
+
+// setValueStart returns the index of the first value token (after '=' / TO),
+// or -1. The GUC name is a ColId and can be neither, so the first occurrence
+// of either is always the separator.
+func (l *lexerState) setValueStart() int {
+	for i, t := range l.toks {
+		if t.Kind == parser.TokenOperator && t.Value == "=" {
+			return i + 1
+		}
+		if (t.Kind == parser.TokenKeyword || t.Kind == parser.TokenIdent) && strings.EqualFold(t.Value, "to") {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+func (l *lexerState) setValueAtoms() string {
+	if l.setValueIsDefault() {
+		return "" // legacy records Default=true and leaves Value empty
+	}
+	i := l.setValueStart() - 1
+	if i < 0 {
 		return ""
 	}
 	var atoms []string

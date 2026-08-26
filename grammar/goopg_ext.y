@@ -514,14 +514,7 @@ opt_drop_if_exists:
    arrive with the next slice. END is a reserved keyword; the rest route via
    routedStmts keys. */
 tx_begin:
-		BEGIN_P begin_pos opt_tx_modes
-			{
-				m := $3.(*txModes)
-				b := parser.NewBeginStmt($2)
-				b.IsolationLevel, b.ReadOnly, b.Deferrable = m.iso, m.ro, m.def
-				$$ = b
-			}
-	| BEGIN_P WORK begin_pos opt_tx_modes
+		BEGIN_P opt_transaction begin_pos opt_tx_modes
 			{
 				m := $4.(*txModes)
 				b := parser.NewBeginStmt($3)
@@ -553,7 +546,6 @@ tx_mode:
 	| READ WRITE                       { $$ = &txModes{} }
 	| DEFERRABLE                       { i := &txModes{}; i.def = true; $$ = i }
 	| NOT DEFERRABLE                   { $$ = &txModes{} } /* gram.y transaction_mode_item */
-	| TRANSACTION                      { $$ = &txModes{} }
 
 iso_level:
 		SERIALIZABLE                    { $$ = "serializable" }
@@ -562,12 +554,30 @@ iso_level:
 	| READ UNCOMMITTED                  { $$ = "read uncommitted" }
 
 tx_commit:
-		COMMIT                  { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| END_P                     { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
+		COMMIT opt_transaction  { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| END_P opt_transaction     { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| COMMIT PREPARED SCONST    { $$ = parser.NewCommitPreparedStmt(yylex.(*lexerState).lastConsumedPos(), $3) }
 
 tx_rollback:
-		ROLLBACK                { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| ABORT_P                   { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
+		ROLLBACK opt_transaction { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| ABORT_P opt_transaction    { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| ROLLBACK PREPARED SCONST   { $$ = parser.NewRollbackPreparedStmt(yylex.(*lexerState).lastConsumedPos(), $3) }
+	| ROLLBACK opt_transaction TO opt_savepoint_kw ColId
+			{ $$ = parser.NewRollbackToSavepointStmt(yylex.(*lexerState).lastConsumedPos(), $5) }
+
+/* opt_transaction — gram.y's `opt_transaction: WORK | TRANSACTION | empty`.
+   TRANSACTION used to be a tx_mode instead, which made `BEGIN TRANSACTION
+   ISOLATION LEVEL ...` unparseable: TRANSACTION was consumed as the first
+   mode and the parser then wanted a comma before ISOLATION. 22 isolation
+   spec steps. */
+opt_transaction:
+		/* empty */   { $$ = false }
+	| WORK            { $$ = false }
+	| TRANSACTION     { $$ = false }
+
+opt_savepoint_kw:
+		/* empty */   { $$ = false }
+	| SAVEPOINT       { $$ = false }
 
 /* set/show/reset — P6.2 (gram.y VariableSetStmt / VariableShowStmt /
    VariableResetStmt subsets). Value is the legacy token-atom join, NOT a
@@ -575,19 +585,47 @@ tx_rollback:
    setValueAtoms / internal/parser/parser.go:3056), so quotes are stripped. DEFAULT and RESET/SHOW ALL are
    separate shapes. SET TIME ZONE / FROM CURRENT arrive later. */
 set_stmt:
-		SET set_scope ColId set_eq_to DEFAULT
+		SET set_scope set_guc_name set_eq_to set_value_list
 			{
-				$$ = parser.NewSetStmt(yylex.(*lexerState).lastConsumedPos(), $2, $3, "", true)
+				// One alternative, not two: `SET x = DEFAULT` differs from
+				// `SET x = 'default'` only by token KIND, which the grammar
+				// cannot see — a separate DEFAULT alternative would reduce/reduce
+				// against the permissive value list below. setValueIsDefault
+				// inspects the token instead.
+				l := yylex.(*lexerState)
+				$$ = parser.NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
 			}
-	| SET set_scope ColId set_eq_to expr_list
-			{
-				_ = $5
-				// spanTextUpTo(spanEnd()), NOT spanText(): at the statement-final
-				// reduce the lookahead is EOF and Lex zeroes lastPos/lastText, so
-				// spanText()'s end landed at 0 and EVERY routed `SET name = value`
-				// stored an empty value (search_path, timezone, work_mem included).
-				$$ = parser.NewSetStmt(0, $2, $3, yylex.(*lexerState).setValueAtoms(), false)
-			}
+
+/* set_guc_name — GUCs may be dotted (`SET spec.session = 1`), which plain
+   ColId could not express. */
+set_guc_name:
+		ColId                 { $$ = $1 }
+	| ColId '.' ColId         { $$ = $1 + "." + $3 }
+
+/* set_value_list — legacy's parseSetValueAtoms accepts ANY keyword or literal
+   as a value atom (`SET debug_parallel_query = on`, `SET x = off`), so this
+   deliberately does NOT reuse expr_list: ON and friends are reserved and can
+   never be an a_expr. Only the parse shape matters here; the VALUE itself is
+   rebuilt from the tokens by setValueAtoms. */
+set_value_list:
+		set_value_atom                        { $$ = $1 }
+	| set_value_list ',' set_value_atom       { $$ = $1 }
+
+set_value_atom:
+		ColLabel        { $$ = $1 }
+	/* This grammar's ColLabel omits reserved_keyword (upstream's includes it),
+	   so the reserved words that show up as GUC VALUES are listed explicitly.
+	   Widening ColLabel instead would mark every reserved keyword "reachable"
+	   and blind TestReservedKeywordsReachable. */
+	| ON            { $$ = "on" }
+	| DEFAULT       { $$ = "default" }
+	| TRUE_P        { $$ = "true" }
+	| FALSE_P       { $$ = "false" }
+	| SCONST            { $$ = $1 }
+	| ICONST            { $$ = "" }
+	| FCONST            { $$ = $1 }
+	| '-' ICONST        { $$ = "" }
+	| '-' FCONST        { $$ = $2 }
 
 /* SET [SESSION|LOCAL] TRANSACTION <modes> — gram.y TransactionStmt. Reuses
    tx_mode_list, so ISOLATION LEVEL / READ ONLY|WRITE / [NOT] DEFERRABLE all

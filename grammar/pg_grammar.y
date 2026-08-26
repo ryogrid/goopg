@@ -103,6 +103,8 @@
 %type <b>	opt_unique_nnd
 %type <node>	opt_for_locking for_locking_clause for_locking_item for_locking_strength opt_lock_wait_policy
 %type <strs>	opt_locked_rels
+%type <str>	set_guc_name set_value_list set_value_atom
+%type <b>	opt_transaction opt_savepoint_kw
 %type <stmt>	set_transaction_stmt
 %type <stmt>	refresh_matview_stmt drop_matview_stmt
 %type <b>	opt_concurrently

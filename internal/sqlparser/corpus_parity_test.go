@@ -88,7 +88,8 @@ func harvestSQLLiterals(t *testing.T) []string {
 // 2026-08-27 (FOR UPDATE locking clauses): 266.
 // 2026-08-27 (constraint attrs, INCLUDE, index CONCURRENTLY, SET TRANSACTION): 314.
 // 2026-08-27 (unqualified UPDATE/DELETE): 316.
-const legacyCorpusParityFloor = 311
+// 2026-08-27 (transaction forms + SET value surface): 321.
+const legacyCorpusParityFloor = 316
 
 func TestLegacyCorpusParity(t *testing.T) {
 	queries := harvestSQLLiterals(t)

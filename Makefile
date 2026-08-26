@@ -212,9 +212,9 @@ gen-parser:
 		|| { cat yacc_stderr.txt; exit 1; }
 	go run ./cmd/gen-tokennums-go
 	@conflicts=$$(grep -cE '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null || echo 999); \
-	if [ "$$conflicts" -ne 16 ]; then \
-		echo "ERROR: $$conflicts grammar conflicts (expected exactly 16 known: IF_P x9 = one per opt_if_exists_drop/opt_if_not_exists user, '(' x2 = func_call/extract vs paren, '[' x2 = subscript, ON = join, SESSION + LOCAL = optional SET scope). Keep this message in sync with the number above."; exit 1; fi; \
-	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null | grep -vE "on '\\('" | grep -vE "on '\\.'" | grep -vE "on '\\['" | grep -vE "on ON" | grep -vE "on IF_P" | grep -vE "on NOT" | grep -vE "on SESSION" | grep -vE "on LOCAL" | grep -c .); \
+	if [ "$$conflicts" -ne 17 ]; then \
+		echo "ERROR: $$conflicts grammar conflicts (expected exactly 17 known: IF_P x9, SAVEPOINT = ROLLBACK TO [SAVEPOINT] name (SAVEPOINT is unreserved so it is also a valid ColId; shift wins, keyword form, matching PG) = one per opt_if_exists_drop/opt_if_not_exists user, '(' x2 = func_call/extract vs paren, '[' x2 = subscript, ON = join, SESSION + LOCAL = optional SET scope). Keep this message in sync with the number above."; exit 1; fi; \
+	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null | grep -vE "on '\\('" | grep -vE "on '\\.'" | grep -vE "on '\\['" | grep -vE "on ON" | grep -vE "on IF_P" | grep -vE "on NOT" | grep -vE "on SESSION" | grep -vE "on LOCAL" | grep -vE "on SAVEPOINT" | grep -c .); \
 	if [ "$$nonparen" -gt 0 ]; then \
 		echo "ERROR: $$nonparen conflict(s) NOT on the known set ('(' '.' '[' ON IF_P NOT SESSION LOCAL) — inspect y.output"; exit 1; fi; \
 	if [ "$$conflicts" -ge 1 ]; then \

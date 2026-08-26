@@ -438,3 +438,18 @@ func NewLockingClause(pos int, strength LockStrength, targets []string, wait Loc
 func NewSetTransactionStmt(pos int, isolation string, local bool) *SetTransactionStmt {
 	return &SetTransactionStmt{pos: pos, IsolationLevel: isolation, Local: local}
 }
+
+// NewCommitPreparedStmt / NewRollbackPreparedStmt / NewRollbackToSavepointStmt
+// build the two-phase-commit and savepoint-rollback statements (gram.y
+// TransactionStmt). All three carry an unexported pos.
+func NewCommitPreparedStmt(pos int, gid string) *CommitPreparedStmt {
+	return &CommitPreparedStmt{pos: pos, Gid: gid}
+}
+
+func NewRollbackPreparedStmt(pos int, gid string) *RollbackPreparedStmt {
+	return &RollbackPreparedStmt{pos: pos, Gid: gid}
+}
+
+func NewRollbackToSavepointStmt(pos int, name string) *RollbackToSavepointStmt {
+	return &RollbackToSavepointStmt{pos: pos, Name: name}
+}
