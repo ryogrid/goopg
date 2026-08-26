@@ -93,19 +93,56 @@ New event names (`transactionid` exists already) are added to the init-time
 maps in `registry.go` only if absent. No string constants reach the hot path
 at runtime; `packWaitStrings` keeps returning a packed uint32.
 
-## 4. Policy: why LWLock stays unmapped
+## 4. Policy: why there is no blanket LWLock mapping
 
-PG reports `LWLock:*` because those waits are long-lived kernel futex parks
-inside shared-memory spinlock/lwlock code — observable and meaningful.
-goopg's equivalents are Go mutex/channel parks scheduled by the runtime;
-they are (a) typically sub-microsecond, and (b) not attributable to a named
-resource without adding instrumentation cost to primitives used by every
-query. Reporting them would produce noise classes with no upstream
-counterpart. Decision: emit
-**no** LWLock events; document that active backends between blocking probes
-are "on CPU", matching PG's NULL wait_event. Revisit only if a specific
-long-park site (e.g. bufpool eviction storm) needs visibility — it would be
-added as its own named event, not as LWLock.
+What upstream actually does (three tiers):
+
+- **Spinlocks** (`src/include/storage/s_lock.h`): no wait event on
+  acquisition — they are designed to bound the protected section to a few
+  instructions and busy-wait otherwise. Only the backoff sleep inside the
+  spin loop surfaces, as `Timeout:SpinDelay`
+  (`storage/lmgr/s_lock.c:148`).
+- **LWLocks**: reported, yes — from ONE choke point inside the primitive
+  itself (`storage/lmgr/lwlock.c:739`,
+  `pgstat_report_wait_start(PG_WAIT_LWLOCK | lock->tranche)`), so every
+  caller inherits per-resource names for free. Note that LWLocks are not
+  inherently short: `WALWriteLock` is held across an entire WAL flush, which
+  is precisely why reporting them matters upstream. "Shared-memory lock" is
+  therefore not synonymous with "short wait".
+- **Heavyweight locks**: `ProcSleep` → class `Lock` (see 01 §3).
+
+Why goopg does not mirror the LWLock tier 1:1:
+
+1. There is no central analog to instrument once. Upstream's value comes
+   from lwlock.c being a single function that knows each lock's tranche
+   identity. goopg's corresponding critical sections are anonymous
+   `sync.Mutex`/`RWMutex`/channel parks on individual structs, carrying no
+   resource name. Reproducing tranche-style reporting would mean either
+   hand-wrapping every site (instrumentation on primitives every query
+   touches) or introducing a central instrumented lock type (hot-path
+   refactor of storage internals) — significant cost for signal whose
+   duration distribution is unproven.
+2. The potentially-long waits goopg actually has are already individually
+   named at their natural choke points: storage/AIO/WAL IO callbacks,
+   relation locks, `WaitForXID`, advisory, client read/write, buffer pin,
+   hash spill. These are the analogs of upstream's long-held tiers
+   (IO-bound and heavyweight-lock classes).
+3. What remains under raw mutexes is bounded bookkeeping (buffer-table
+   lookups, proc-array scans, registry maps) — the working analog of
+   upstream's spinlock tier, which upstream also deliberately keeps out of
+   pg_stat_activity.
+
+Residual risk this policy accepts, and its coverage: nothing prevents a
+future holder from parking many goroutines for a long time under a plain
+struct mutex (the WALWriteLock lesson applies — long holds are possible).
+The policy handles this empirically instead of preventively: set
+`GOOPG_MUTEX_PROFILE_RATE` / `GOOPG_BLOCK_PROFILE_RATE` and read the pprof
+mutex/block profiles to detect unexpectedly long or contended parks; a site
+proven significant is promoted to its own named event AT THAT SITE (exactly
+the way `WaitForXID` and advisory were wired in this work), never folded
+into a synthetic "LWLock" class that would have no upstream name
+counterpart. Decision: emit **no** LWLock events today; active backends
+between blocking probes show NULL wait_event (= on-CPU), matching PG.
 
 ## 5. Invariants & testing
 
