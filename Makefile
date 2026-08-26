@@ -212,11 +212,11 @@ gen-parser:
 		|| { cat yacc_stderr.txt; exit 1; }
 	go run ./cmd/gen-tokennums-go
 	@conflicts=$$(grep -cE '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null || echo 999); \
-	if [ "$$conflicts" -ne 4 ]; then \
-		echo "ERROR: $$conflicts grammar conflicts (expected exactly 4 known: '(' x2, '[' x2)"; exit 1; fi; \
-	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null | grep -vE "on '\('|\.'|\['" | grep -c .); \
+	if [ "$$conflicts" -ne 5 ]; then \
+		echo "ERROR: $$conflicts grammar conflicts (expected exactly 5 known: '(' x2, '[' x2, 'ON' join-vs-arbiter)"; exit 1; fi; \
+	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null | grep -vE "on '\\('" | grep -vE "on '\\.'" | grep -vE "on '\\['" | grep -vE "on ON" | grep -c .); \
 	if [ "$$nonparen" -gt 0 ]; then \
-		echo "ERROR: $$nonparen conflict(s) NOT on '('/')'.'/'[' — inspect y.output"; exit 1; fi; \
+		echo "ERROR: $$nonparen conflict(s) NOT on the known set ('(' '.' '[' ON) — inspect y.output"; exit 1; fi; \
 	if [ "$$conflicts" -ge 1 ]; then \
 		echo 'NOTE: '"$$conflicts"' known S/R(s) on (/./[ = func_call/extract vs paren, qualified cast target'; fi
 	rm -f internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output

@@ -87,8 +87,14 @@
 %type <str>	subq_op extract_field
 %type <str>	opt_tzmark double_tail cast_ident character_word
 %type <vrows>	values_rows
-%type <stmt>	insert_stmt
+%type <stmt>	insert_stmt insert_core
 %type <isrc>	insert_source
+%type <oct>	opt_arbiter
+%type <ualist> update_set_list
+%type <ua>	update_assign
+%type <expr>	opt_update_where
+%type <oc>	opt_on_conflict
+%type <targets>	opt_returning
 %type <strs>	opt_ins_cols colid_list
 %type <ct>	cast_target cast_typename
 %type <ival>	opt_array_tail
@@ -2084,6 +2090,17 @@ values_rows:
    VALUES rides VALUES_LA so the DML site shares the expression-site's
    conflict-free treatment of the col_name keyword. */
 insert_stmt:
+		insert_core opt_on_conflict opt_returning
+			{
+				is := $1.(*parser.InsertStmt)
+				is.OnConflict = $2
+				if len($3) > 0 {
+					parser.NewInsertReturning(is, $3)
+				}
+				$$ = is
+			}
+
+insert_core:
 		INSERT INTO qualified_name opt_ins_cols insert_source
 			{
 				src := $5
@@ -2109,6 +2126,40 @@ insert_stmt:
 				is.With = $1
 				$$ = is
 			}
+
+/* opt_on_conflict — gram.y :17275 subset: all arbiter spellings + both
+   actions; DO UPDATE SET supports single- and table-qualified columns. */
+opt_on_conflict:
+		/* empty */
+			{ $$ = nil }
+	| ON CONFLICT opt_arbiter DO NOTHING
+			{ $$ = parser.NewOnConflictClause($3, parser.OnConflictNothing, nil, nil) }
+	| ON CONFLICT opt_arbiter DO UPDATE SET update_set_list opt_update_where
+			{ $$ = parser.NewOnConflictClause($3, parser.OnConflictUpdate, $7, $8) }
+
+opt_arbiter:
+		/* empty */               { $$ = nil }
+	| '(' colid_list ')'          { $$ = parser.NewOnConflictTarget($2, "", nil) }
+	| ON CONSTRAINT ColId { $$ = parser.NewOnConflictTarget(nil, $3, nil) }
+
+update_set_list:
+		update_assign                   { $$ = []parser.UpdateAssign{$1} }
+	| update_set_list ',' update_assign { $$ = append($1, $3) }
+
+update_assign:
+		ColId '=' a_expr
+			{ $$ = *parser.NewUpdateAssign($1, "", nil, $3) }
+	| ColId '.' ColId '=' a_expr
+			{ $$ = *parser.NewUpdateAssign($3, $1, nil, $5) }
+
+opt_update_where:
+		/* empty */   { $$ = nil }
+	| WHERE a_expr    { $$ = $2 }
+
+/* opt_returning — gram.y :17340 returning_clause. */
+opt_returning:
+		/* empty */               { $$ = nil }
+	| RETURNING opt_target_list   { $$ = $2 }
 
 opt_ins_cols:
 		/* empty */  { $$ = nil }

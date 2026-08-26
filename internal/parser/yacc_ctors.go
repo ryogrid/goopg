@@ -237,3 +237,25 @@ func SetInsertDefaultValues(is *InsertStmt) *InsertStmt {
 	is.DefaultValues = true
 	return is
 }
+
+// NewInsertReturning attaches a RETURNING target list to an INSERT.
+func NewInsertReturning(is *InsertStmt, ret []ResTarget) *InsertStmt {
+	is.Returning = ret
+	return is
+}
+
+// NewOnConflictTarget builds the conflict arbiter (columns form, constraint
+// form, or index-inference WHERE).
+func NewOnConflictTarget(columns []string, constraint string, where Expr) *OnConflictTarget {
+	return &OnConflictTarget{pos: 0, Columns: columns, Constraint: constraint, Where: where}
+}
+
+// NewUpdateAssign builds one DO UPDATE SET entry.
+func NewUpdateAssign(column, tableQualifier string, columns []string, expr Expr) *UpdateAssign {
+	return &UpdateAssign{pos: 0, Column: column, TableQualifier: tableQualifier, Columns: columns, Expr: expr}
+}
+
+// NewOnConflictClause assembles the ON CONFLICT tail for an INSERT.
+func NewOnConflictClause(target *OnConflictTarget, action OnConflictAction, set []UpdateAssign, where Expr) *OnConflictClause {
+	return &OnConflictClause{pos: 0, Target: target, Action: action, UpdateSet: set, UpdateWhere: where}
+}

@@ -245,8 +245,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   parsing INSERT's source AS a select_stmt (upstream shape) merges zero
   hostile states; conflicts stay at the pinned 4. insSrc carrier +
   NewInsertStmt/SetInsertSelect/SetInsertDefaultValues ctors. Parity: INSERT
-  6/6 identical (+7 corpus total → 155). Remaining: ON CONFLICT, RETURNING,
-  routing flip for the insert class.
+  6/6 identical (+7 corpus total → 155). ON CONFLICT (all arbiter spellings,
+  DO NOTHING / DO UPDATE SET [WHERE]) and RETURNING landed same day; known
+  S/R on 'ON' added to gate allowlist (join-ON vs insert-arbiter; shift=
+  join wins, correct inside FROM). Remaining: routing flip for the insert
+  class.
 - [ ] **P3.1 INSERT**: VALUES/SELECT source, ON CONFLICT (index inference,
   DO NOTHING/UPDATE), RETURNING, OVERRIDING.
 - [ ] **P3.2 UPDATE**: FROM joins, WHERE CURRENT OF, SET list forms.

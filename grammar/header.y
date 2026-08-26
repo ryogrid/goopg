@@ -53,6 +53,10 @@ import (
 	fr     *parser.WindowFrame
 	ct     castType
 	isrc   *insSrc
+	oc     *parser.OnConflictClause
+	oct    *parser.OnConflictTarget
+	ualist []parser.UpdateAssign
+	ua     parser.UpdateAssign
 	nwd    parser.NamedWindowDef
 	nwds   []parser.NamedWindowDef
 	list   []any            // heterogeneous lists, mirroring PG's untyped List
