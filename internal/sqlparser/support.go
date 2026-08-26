@@ -567,3 +567,10 @@ type insSrc struct {
 	sel  *parser.SelectStmt
 	def  bool
 }
+
+// updWhere carries UPDATE's WHERE tail: a plain expression or the CURRENT OF
+// cursor form (mutually exclusive).
+type updWhere struct {
+	expr      parser.Expr
+	currentOf string
+}

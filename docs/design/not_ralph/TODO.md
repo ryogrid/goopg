@@ -254,7 +254,14 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   tpch-spotcheck Q12/Q13 PASS; units suite green. P3.1 COMPLETE.
 - [ ] **P3.1 INSERT**: VALUES/SELECT source, ON CONFLICT (index inference,
   DO NOTHING/UPDATE), RETURNING, OVERRIDING.
-- [ ] **P3.2 UPDATE**: FROM joins, WHERE CURRENT OF, SET list forms.
+- [x] **P3.2 UPDATE ✅ (2026-08-26, flipped)**: update_core x3 (plain / ONLY /
+  WITH-prefixed) with opt_upd_alias — bare aliases restricted to IDENT so
+  the unreserved SET keyword cannot be captured as an alias (6th known S/R
+  class dodged structurally, gate stays at 5). SET reuses the ON CONFLICT
+  assign productions; FROM takes a plain range-var list (join-FROM
+  deferred); WHERE expr | CURRENT OF cursor via updWhere carrier;
+  RETURNING reuses opt_target_list. Live-verified single + FROM-join
+  updates through the routed path; corpus parity 162, floor 158.
 - [ ] **P3.3 DELETE / MERGE**: USING joins; MERGE WHEN [NOT] MATCHED actions.
   Flip DML routing; WITH follower routing extends to INSERT/UPDATE/DELETE.
 

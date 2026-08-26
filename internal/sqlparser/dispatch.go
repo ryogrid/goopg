@@ -57,7 +57,8 @@ func SplitStatements(toks []parser.Token) [][]parser.Token {
 // date/time/timestamp/interval SCONST forms.
 var routedStmts = map[string]bool{
 	"select": true,
-	"insert": true, // P3.1: full grammar landed (ON CONFLICT/RETURNING incl.)
+	"insert": true, // P3.1
+	"update": true, // P3.2
 }
 
 // routeBatch reports whether the whole batch can go to the new parser, plus

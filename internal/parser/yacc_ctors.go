@@ -259,3 +259,15 @@ func NewUpdateAssign(column, tableQualifier string, columns []string, expr Expr)
 func NewOnConflictClause(target *OnConflictTarget, action OnConflictAction, set []UpdateAssign, where Expr) *OnConflictClause {
 	return &OnConflictClause{pos: 0, Target: target, Action: action, UpdateSet: set, UpdateWhere: where}
 }
+
+// NewUpdateStmt builds the P3.2 UPDATE shape.
+func NewUpdateStmt(pos int, target RangeVar, set []UpdateAssign, from []RangeVar, where Expr) *UpdateStmt {
+	return &UpdateStmt{pos: pos, Target: target, Set: set, From: from, Where: where}
+}
+
+// SetUpdateWhereCurrentOf switches the WHERE clause to CURRENT OF.
+func SetUpdateWhereCurrentOf(u *UpdateStmt, cursor string) *UpdateStmt {
+	u.Where = nil
+	u.CurrentOf = cursor
+	return u
+}

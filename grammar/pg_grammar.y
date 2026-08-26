@@ -85,14 +85,17 @@
 %type <node>	cse_wl when_then filter_clause within_group_clause
 %type <exprs>	opt_func_call_args
 %type <str>	subq_op extract_field
-%type <str>	opt_tzmark double_tail cast_ident character_word
+%type <str>	opt_tzmark double_tail cast_ident character_word opt_upd_alias
 %type <vrows>	values_rows
-%type <stmt>	insert_stmt insert_core
+%type <stmt>	update_stmt update_core insert_stmt insert_core
 %type <isrc>	insert_source
 %type <oct>	opt_arbiter
 %type <ualist> update_set_list
 %type <ua>	update_assign
 %type <expr>	opt_update_where
+%type <node>	upd_where
+%type <rvars>	opt_upd_from
+%type <rvars>	upd_from_list
 %type <oc>	opt_on_conflict
 %type <targets>	opt_returning
 %type <strs>	opt_ins_cols colid_list
@@ -148,6 +151,10 @@ stmt:
 				$$ = $1
 			}
 	| insert_stmt
+			{
+				$$ = $1
+			}
+	| update_stmt
 			{
 				$$ = $1
 			}
@@ -2187,3 +2194,77 @@ insert_source:
 			}
 	| DEFAULT VALUES
 			{ i := &insSrc{def: true}; $$ = i }
+
+/* update_stmt — P3.2 (gram.y :17400 subset): [WITH] UPDATE [ONLY] name
+   [alias] SET assignments [FROM tables] WHERE expr|CURRENT OF cursor
+   [RETURNING]. SET reuses the ON CONFLICT assign productions; FROM is a
+   plain range-var list (joins in UPDATE FROM stay deferred). */
+update_stmt:
+		update_core opt_returning
+			{
+				u := $1.(*parser.UpdateStmt)
+				if len($2) > 0 {
+					u.Returning = $2
+				}
+				$$ = u
+			}
+
+update_core:
+		UPDATE qualified_name opt_upd_alias SET update_set_list opt_upd_from upd_where
+			{
+				rv := rangeVarFromName($2, $3)
+				w := $7.(*updWhere)
+				if w.currentOf != "" {
+					u := parser.NewUpdateStmt(0, rv, $5, $6, nil)
+					parser.SetUpdateWhereCurrentOf(u, w.currentOf)
+					$$ = u
+				} else {
+					$$ = parser.NewUpdateStmt(0, rv, $5, $6, w.expr)
+				}
+			}
+	| ONLY qualified_name opt_upd_alias SET update_set_list opt_upd_from upd_where
+			{
+				rv := rangeVarFromName($2, $3)
+				rv.Only = true
+				w := $7.(*updWhere)
+				if w.currentOf != "" {
+					u := parser.NewUpdateStmt(0, rv, $5, $6, nil)
+					parser.SetUpdateWhereCurrentOf(u, w.currentOf)
+					$$ = u
+				} else {
+					$$ = parser.NewUpdateStmt(0, rv, $5, $6, w.expr)
+				}
+			}
+	| with_clause UPDATE qualified_name opt_upd_alias SET update_set_list opt_upd_from upd_where
+			{
+				rv := rangeVarFromName($3, $4)
+				w := $8.(*updWhere)
+				var u *parser.UpdateStmt
+				if w.currentOf != "" {
+					u = parser.NewUpdateStmt(0, rv, $6, $7, nil)
+					parser.SetUpdateWhereCurrentOf(u, w.currentOf)
+				} else {
+					u = parser.NewUpdateStmt(0, rv, $6, $7, w.expr)
+				}
+				u.With = $1
+				$$ = u
+			}
+
+/* opt_upd_alias — bare aliases restricted to plain IDENT so the SET keyword
+   cannot be captured as an alias (unreserved-keyword aliases need AS). */
+opt_upd_alias:
+		/* empty */   { $$ = "" }
+	| AS ColId         { $$ = $2 }
+	| IDENT            { $$ = $1 }
+
+opt_upd_from:
+		/* empty */                       { $$ = nil }
+	| FROM upd_from_list               { $$ = $2 }
+
+upd_from_list:
+		qualified_name                     { $$ = []parser.RangeVar{rangeVarFromName($1, "")} }
+	| upd_from_list ',' qualified_name    { $$ = append($1, rangeVarFromName($3, "")) }
+
+upd_where:
+		WHERE a_expr                { $$ = &updWhere{expr: $2} }
+	| WHERE CURRENT_P OF ColId     { $$ = &updWhere{currentOf: $4} }
