@@ -41,7 +41,7 @@ func TestRouteBatchWholeBatchOrLegacy(t *testing.T) {
 	// Both fragments routed → batch routes to the new parser (since P1.1,
 	// SELECT core parses, so this is a full success path).
 	toks, _ := parser.Lex("SELECT 1; SELECT 2;")
-	stmts, handled, err := routeBatch(toks)
+	stmts, handled, err := routeBatch("", toks)
 	if !handled {
 		t.Fatal("all-routed batch declined")
 	}
@@ -54,7 +54,7 @@ func TestRouteBatchWholeBatchOrLegacy(t *testing.T) {
 
 	// Mixed batch → declines wholesale.
 	toks, _ = parser.Lex("SELECT 1; DISCARD ALL;")
-	_, handled, rerr := routeBatch(toks)
+	_, handled, rerr := routeBatch("", toks)
 	if handled || rerr != nil {
 		t.Fatalf("mixed batch: handled=%v err=%v, want false/nil", handled, rerr)
 	}

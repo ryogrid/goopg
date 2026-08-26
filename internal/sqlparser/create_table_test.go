@@ -19,6 +19,10 @@ func TestCreateTableV0(t *testing.T) {
 		"DROP TABLE IF EXISTS a, b CASCADE",
 		"TRUNCATE t",
 		"TRUNCATE TABLE a, b RESTART IDENTITY",
+		"CREATE TABLE t (a int check (a > 0))",
+		"CREATE TABLE t (a int references o(id) on delete cascade)",
+		"CREATE TABLE t (a int, check (a < 10))",
+		"CREATE TABLE t (a int, b int, foreign key (b) references o (id) on update set null)",
 	} {
 		sts, err := parser.Parse(q)
 		if err != nil {

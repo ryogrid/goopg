@@ -278,7 +278,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   typmods via col_type_name wrapper + NOT NULL / PRIMARY KEY / UNIQUE /
   DEFAULT), table-level PRIMARY KEY (cols) and UNIQUE (cols). Legacy shapes
   dump-identical (3 probe forms); corpus parity unchanged (its CREATE
-  literals use unported clauses — will climb with later slices). Remaining: CHECK/FK/named
+  literals use unported clauses — will climb with later slices). Remaining: CHECK/FK landed
+  (CheckExpr = RAW SOURCE span via lexerState.src plumbing: RouteBatch/
+  RouteExprBatch now carry src; markSpanStart/spanText replicate legacy
+  captureSrcSpan. FK column+table-level incl. ON DELETE/UPDATE actions;
+  known S/R on NOT = DEFAULT-expr vs SET-DEFAULT, shift correct), named
   constraints, WITH options, partitioning, INHERITS, OF type, AS SELECT,
   TEMP/UNLOGGED/IF NOT EXISTS, then the dispatch refinement + flip.
 - [ ] **P4.1 CREATE TABLE columns+constraints**: column defs (types, DEFAULT,

@@ -578,6 +578,12 @@ type updWhere struct {
 // colSpec carries one CREATE TABLE column definition before conversion to
 // parser.ColumnDef (grammar carrier pattern).
 type colSpec struct {
+	checkText string
+	fkInfo    *fkInfo
+	refTable parser.ObjectName
+	refCols  []string
+	onDel    parser.FKAction
+	onUp     parser.FKAction
 	name     string
 	schema   string
 	typ      string
@@ -592,23 +598,29 @@ type colSpec struct {
 // tableElem is one element of a CREATE TABLE parens list: a column spec or a
 // table-level PRIMARY KEY / UNIQUE marker.
 type tableElem struct {
-	col *colSpec
-	pk  []string
-	uq  [][]string
+	col   *colSpec
+	pk    []string
+	uq    [][]string
+	check string
+	fkDef *parser.TableForeignKeyDef
 }
 
 // colConstraints accumulates a column's constraint suffix in CREATE TABLE.
 type colConstraints struct {
-	args    []int64
-	notNull bool
-	primary bool
-	unique  bool
-	defExpr parser.Expr
+	args      []int64
+	notNull   bool
+	primary   bool
+	unique    bool
+	defExpr   parser.Expr
+	checkText string
+	fk        *fkInfo
 }
 
 // colConstraint is one parsed column-constraint keyword group.
 type colConstraint struct {
-	kind string // "nn" | "pk" | "uq" | "def"
+	kind string // "nn" | "pk" | "uq" | "def" | "check" | "fk"
+	text string          // check: raw source span
+	fk   *fkInfo         // fk: referenced table/cols + actions
 	expr parser.Expr
 }
 
@@ -645,4 +657,38 @@ func objectNameFromQn(q qname) parser.ObjectName {
 		}
 	}
 	return o
+}
+
+// fkActs accumulates ON DELETE / ON UPDATE referential actions.
+type fkActs struct {
+	del parser.FKAction
+	up  parser.FKAction
+}
+
+// colConstraint kinds: "nn" | "pk" | "uq" | "def" | "check" | "fk".
+
+// fkInfo carries a column-level FK target parsed inline.
+type fkInfo struct {
+	refTable parser.ObjectName
+	refCols  []string
+	onDel    parser.FKAction
+	onUp     parser.FKAction
+}
+
+// namedFkAct is one ON DELETE/UPDATE referential action occurrence.
+type namedFkAct struct {
+	del bool
+	up  bool
+	act parser.FKAction
+}
+
+// applyFkAction folds an action occurrence into the accumulator.
+func applyFkAction(a *fkActs, n *namedFkAct) *fkActs {
+	if n.del {
+		a.del = n.act
+	}
+	if n.up {
+		a.up = n.act
+	}
+	return a
 }

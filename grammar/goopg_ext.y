@@ -32,6 +32,15 @@ create_table_stmt:
 						cd.Primary = c.primary
 						cd.Unique = c.unique
 						cd.DefaultExpr = c.defExpr
+						if c.checkText != "" {
+							cd.CheckExpr = c.checkText
+						}
+						if c.fkInfo != nil {
+							cd.RefTable = c.fkInfo.refTable
+							cd.RefColumns = c.fkInfo.refCols
+							cd.OnDelete = c.fkInfo.onDel
+							cd.OnUpdate = c.fkInfo.onUp
+						}
 						cols = append(cols, *cd)
 					default:
 						pk = append(pk, e.pk...)

@@ -31,6 +31,8 @@ import (
 // lexerState implements the goyacc yyLexer interface over a pre-split token
 // subslice. Absolute byte positions are preserved end to end.
 type lexerState struct {
+	src       string // original SQL text (ParseOneSrc); "" = span capture off
+	spanStart int
 	toks []parser.Token // this statement's tokens (absolute Pos)
 	i    int            // next raw index into toks
 
@@ -64,6 +66,19 @@ func (l *lexerState) applyNulls(sb parser.SortBy, marker string) {
 // after the keyword whose position they need.
 func (l *lexerState) lastConsumedPos() int { return l.prevPos }
 
+// markSpanStart records where a raw-span capture begins (next token pos).
+func (l *lexerState) markSpanStart() { l.spanStart = l.peek().pos }
+
+// spanText returns src[spanStart:end-of-last-consumed-token], trimmed like
+// legacy captureSrcSpan. Empty when src was unavailable.
+func (l *lexerState) spanText() string {
+	end := l.lastPos + len(l.lastText)
+	if l.src == "" || l.spanStart < 0 || end < l.spanStart || end > len(l.src) {
+		return ""
+	}
+	return strings.TrimSpace(l.src[l.spanStart:end])
+}
+
 // lexResult is one mapped terminal plus its semantic values and position.
 type lexResult struct {
 	term int
@@ -77,6 +92,20 @@ type lexResult struct {
 // grammar. toks must carry absolute byte positions (the dispatch splitter
 // guarantees this); baseOffset documents the slice origin and is currently
 // redundant because positions are already absolute.
+// ParseOneSrc parses one fragment with the ORIGINAL SQL text available for
+// raw-span capture (CHECK constraint bodies etc.).
+func ParseOneSrc(src string, toks []parser.Token) ([]parser.Stmt, error) {
+	l := &lexerState{toks: toks, src: src}
+	l.lastPos = eofPos(toks)
+	if yyParse(l) != 0 {
+		if l.err != nil {
+			return nil, l.err
+		}
+		return nil, &parser.SyntaxError{Message: "syntax error", Raw: true}
+	}
+	return l.out, l.errAsError()
+}
+
 func ParseOne(toks []parser.Token, baseOffset int) ([]parser.Stmt, error) {
 	_ = baseOffset
 	l := &lexerState{toks: toks}

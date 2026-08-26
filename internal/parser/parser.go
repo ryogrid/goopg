@@ -104,9 +104,10 @@ func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
 	var p parser
 	p.tokens = toks
 	p.idx = 0
+	p.src = input
 
 	if RouteExprBatch != nil {
-		if e, handled, herr := RouteExprBatch(toks); handled {
+		if e, handled, herr := RouteExprBatch(p.src, toks); handled {
 			tokenSlicePool.Put(sp)
 			if herr != nil {
 				return nil, herr
@@ -151,14 +152,14 @@ func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
 // declines (handled=false → the legacy recursive-descent path below runs).
 // Wired by production startup code to sqlparser.RouteBatch; nil in tests and
 // by default, which keeps behavior identical to pre-rewrite Parse.
-var RouteBatch func(toks []Token) (stmts []Stmt, handled bool, err error)
+var RouteBatch func(src string, toks []Token) (stmts []Stmt, handled bool, err error)
 
 // RouteExprBatch is ParseExpr's counterpart of RouteBatch: when non-nil it
 // gets every expression token slice ParseExpr lexes and either owns it
 // (handled=true) or declines (handled=false → the legacy path below runs).
 // Wired alongside RouteBatch by postmaster; nil by default keeps ParseExpr
 // fully legacy.
-var RouteExprBatch func(toks []Token) (expr Expr, handled bool, err error)
+var RouteExprBatch func(src string, toks []Token) (expr Expr, handled bool, err error)
 
 func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 	var sctx *mmgr.Context
@@ -197,7 +198,7 @@ func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 	// backing array to a concurrent lexInto mid-parse; pgbench smoke caught
 	// it as cross-client token corruption).
 	if RouteBatch != nil {
-		stmts, handled, rerr := RouteBatch(toks)
+		stmts, handled, rerr := RouteBatch(input, toks)
 		if handled || rerr != nil {
 			if sp != nil {
 				tokenSlicePool.Put(sp)

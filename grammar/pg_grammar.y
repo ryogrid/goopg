@@ -97,6 +97,8 @@
 %type <oct>	opt_arbiter
 %type <ualist> update_set_list
 %type <ua>	update_assign
+%type <strs>	opt_ref_cols
+%type <node>	opt_fk_actions fk_actions fk_action fk_kw
 %type <expr>	opt_update_where
 %type <node>	upd_where del_where
 %type <strs>
@@ -2375,6 +2377,38 @@ col_constraints:
 
 col_constraint:
 		NOT NULL_P        { $$ = &colConstraint{kind: "nn"} }
+	| CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
+			{ $$ = &colConstraint{kind: "check", text: yylex.(*lexerState).spanText()} }
+	| REFERENCES qualified_name opt_ref_cols opt_fk_actions
+			{
+				i := &colConstraint{kind: "fk"}
+				i.fk = &fkInfo{refTable: objectNameFromQn($2), refCols: $3, onDel: $4.(*fkActs).del, onUp: $4.(*fkActs).up}
+				$$ = i
+			}
+
+opt_ref_cols:
+		/* empty */       { $$ = nil }
+	| '(' colid_list ')'  { $$ = $2 }
+
+opt_fk_actions:
+		/* empty */      { $$ = &fkActs{} }
+	| fk_actions         { $$ = $1 }
+
+fk_actions:
+		fk_action                  { i := &fkActs{}; $$ = applyFkAction(i, $1.(*namedFkAct)) }
+	| fk_actions fk_action         { $$ = applyFkAction($1.(*fkActs), $2.(*namedFkAct)) }
+
+fk_action:
+		ON DELETE_P fk_kw    { $$ = &namedFkAct{del: true, act: $3.(parser.FKAction)} }
+	| ON UPDATE SET fk_kw    { $$ = &namedFkAct{up: true, act: $4.(parser.FKAction)} }
+	| ON UPDATE fk_kw        { $$ = &namedFkAct{up: true, act: $3.(parser.FKAction)} }
+
+fk_kw:
+		CASCADE              { $$ = parser.FKActionCascade }
+	| RESTRICT               { $$ = parser.FKActionRestrict }
+	| NO ACTION              { $$ = parser.FKActionNoAction }
+	| SET NULL_P             { $$ = parser.FKActionSetNull }
+	| SET DEFAULT            { $$ = parser.FKActionSetDefault }
 	| PRIMARY KEY         { $$ = &colConstraint{kind: "pk"} }
 	| UNIQUE              { $$ = &colConstraint{kind: "uq"} }
 	| DEFAULT a_expr      { $$ = &colConstraint{kind: "def", expr: $2} }

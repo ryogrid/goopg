@@ -66,7 +66,7 @@ var routedStmts = map[string]bool{
 
 // routeBatch reports whether the whole batch can go to the new parser, plus
 // the parsed statements when it can.
-func routeBatch(toks []parser.Token) ([]parser.Stmt, bool, error) {
+func routeBatch(src string, toks []parser.Token) ([]parser.Stmt, bool, error) {
 	frags := SplitStatements(toks)
 	if len(frags) == 0 {
 		return nil, false, nil // let legacy decide what an empty batch means
@@ -78,7 +78,7 @@ func routeBatch(toks []parser.Token) ([]parser.Stmt, bool, error) {
 	}
 	var all []parser.Stmt
 	for _, f := range frags {
-		stmts, err := ParseOne(f, fragmentBase(toks, f))
+		stmts, err := ParseOneSrc(src, f)
 		if err != nil {
 			return nil, true, err
 		}
@@ -210,8 +210,8 @@ func fragmentBase(parent, frag []parser.Token) int {
 // RouteBatch is the production wiring point: postmaster assigns
 // parser.RouteBatch = sqlparser.RouteBatch at startup. See the hook doc in
 // internal/parser for the contract.
-func RouteBatch(toks []parser.Token) ([]parser.Stmt, bool, error) {
-	return routeBatch(toks)
+func RouteBatch(src string, toks []parser.Token) ([]parser.Stmt, bool, error) {
+	return routeBatch(src, toks)
 }
 
 // RouteExpr is the production wiring point for parser.RouteExprBatch: it
@@ -220,10 +220,11 @@ func RouteBatch(toks []parser.Token) ([]parser.Stmt, bool, error) {
 // offsets — expression node positions stay byte-exact for plpgsql carets).
 // A wrapped parse that leaves residue outside Targets[0] maps to legacy's
 // trailing-tokens diagnostic.
-func RouteExpr(toks []parser.Token) (parser.Expr, bool, error) {
+func RouteExpr(src string, toks []parser.Token) (parser.Expr, bool, error) {
 	if len(toks) == 0 {
 		return nil, false, nil
 	}
+	_ = src
 	prep := make([]parser.Token, 0, len(toks)+2)
 	prep = append(prep, parser.Token{Kind: parser.TokenKeyword, Value: "select", Pos: toks[0].Pos - 7})
 	prep = append(prep, toks...)
