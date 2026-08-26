@@ -292,12 +292,49 @@
 #------------------------------------------------------------------------------
 
 #vacuum_cost_delay = 0                  # 0-100 ms; 0 disables cost-based delay
+#vacuum_cost_limit = 200                # 1-10000
+#vacuum_cost_page_hit = 1               # 0-10000
+#vacuum_cost_page_miss = 2              # 0-10000
+#vacuum_cost_page_dirty = 20            # 0-10000
 #vacuum_truncate = on                   # accepted; goopg's VACUUM never
                                         # truncates trailing empty pages yet
+#vacuum_freeze_table_age = 150000000    # 0-2000000000 xids
+#vacuum_failsafe_age = 1600000000       # 0-2100000000 xids
+#vacuum_multixact_freeze_table_age = 150000000  # 0-2000000000 multixacts
+#vacuum_multixact_freeze_max_age = 400000000    # 1000000-5000000000 multixacts
+#vacuum_multixact_failsafe_age = 1500000000     # 0-2100000000 multixacts
 #autovacuum_worker_slots = 16           # 1-262143; accepted, goopg has no
                                         # autovacuum worker pool
                                         # (change requires restart)
 #autovacuum_freeze_max_age = 200000000  # 100000-2000000000 xids
+                                        # (change requires restart)
+
+#------------------------------------------------------------------------------
+# AUTOVACUUM PARAMETERS (parity bundle: consumed by the launcher where noted)
+#------------------------------------------------------------------------------
+
+#autovacuum = on                        # enables the autovacuum launcher
+#autovacuum_naptime = 60                # 1-2147483 s between launcher sweeps
+#autovacuum_vacuum_threshold = 50       # min dead tuples before vacuum
+#autovacuum_vacuum_scale_factor = 0.2   # fraction of table size added to threshold
+#autovacuum_vacuum_insert_threshold = 1000      # min inserted rows before vacuum
+#autovacuum_vacuum_insert_scale_factor = 0.2    # fraction of table size added
+#autovacuum_analyze_threshold = 50      # min row modifications before analyze
+#autovacuum_analyze_scale_factor = 0.1  # fraction of table size added to threshold
+#autovacuum_vacuum_max_threshold = 200000000    # cap on the effective vacuum threshold
+#autovacuum_vacuum_cost_delay = 2       # -1-100 ms (overrides vacuum_cost_delay)
+#autovacuum_vacuum_cost_limit = -1      # -1 means use vacuum_cost_limit
+#log_autovacuum_min_duration = 600000   # -1-2147483647 ms; -1 disables logging
+
+#------------------------------------------------------------------------------
+# AUTOVACUUM REGISTERED-INERT (accepted for operator parity, not yet enforced)
+#------------------------------------------------------------------------------
+
+#autovacuum_max_workers = 3             # 1-262143; goopg runs a single worker
+                                        # (change requires restart)
+#autovacuum_work_mem = -1               # KB; -1 uses maintenance_work_mem
+                                        # (change requires restart)
+#autovacuum_multixact_freeze_max_age = 4000000000 # 1000000-5000000000 multixacts
                                         # (change requires restart)
 
 

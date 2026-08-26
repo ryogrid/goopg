@@ -48,6 +48,14 @@ var AdvisoryLockRowsFunc func() [][]string
 // M0100-0006b.
 var VirtualSpecLockRowsFunc func() [][]string
 
+// UserTableTriggerStatsFunc is optionally set by the executor to supply the
+// autovacuum-trigger counters for one relation OID: (nDeadTup,
+// nModSinceAnalyze, nInsSinceVacuum) as decimal strings. pg_stat_user_tables
+// renders "0" for every column when unset or when the function reports an
+// absent relation. Kept here (not executor-side) because the view rows are
+// built in this package; the executor owns the live counters.
+var UserTableTriggerStatsFunc func(oid uint32) (dead, mod, ins string)
+
 // SeqParams carries one sequence's pg_sequence parameter row, supplied by the
 // executor (which owns the runtime sequence registry) so the catalog can build
 // pg_sequence rows without importing the executor package. M0110-0001 (DU-002
@@ -7801,6 +7809,10 @@ func (c *InMemory) PGStatTablesRowsForDBOid(dbOid uint32, scope StatTableScope) 
 		if t.Stats != nil {
 			nLiveTup = strconv.FormatInt(t.Stats.RowCount, 10)
 		}
+		deadTup, modSince, insSince := "0", "0", "0"
+		if UserTableTriggerStatsFunc != nil {
+			deadTup, modSince, insSince = UserTableTriggerStatsFunc(t.OID)
+		}
 		N := VirtualNull
 		out = append(out, []string{
 			strconv.Itoa(int(t.OID)), // 0:  relid
@@ -7817,10 +7829,10 @@ func (c *InMemory) PGStatTablesRowsForDBOid(dbOid uint32, scope StatTableScope) 
 			"0",                      // 11: n_tup_del
 			"0",                      // 12: n_tup_hot_upd
 			"0",                      // 13: n_tup_newpage_upd
-			nLiveTup,                 // 14: n_live_tup (reltuples estimate)
-			"0",                      // 15: n_dead_tup
-			"0",                      // 16: n_mod_since_analyze
-			"0",                      // 17: n_ins_since_vacuum
+			nLiveTup,   // 14: n_live_tup (reltuples estimate)
+			deadTup,    // 15: n_dead_tup
+			modSince,   // 16: n_mod_since_analyze
+			insSince,   // 17: n_ins_since_vacuum
 			N,                        // 18: last_vacuum
 			N,                        // 19: last_autovacuum
 			N,                        // 20: last_analyze

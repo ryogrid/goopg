@@ -17373,6 +17373,8 @@ case "pg_char_to_encoding":
 		"pg_stat_get_tuples_deleted",
 		"pg_stat_get_live_tuples",
 		"pg_stat_get_dead_tuples",
+		"pg_stat_get_ins_since_vacuum",
+		"pg_stat_get_mod_since_analyze",
 		"pg_stat_get_vacuum_count":
 		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
@@ -17403,8 +17405,22 @@ case "pg_char_to_encoding":
 			if v < 0 {
 				v = 0 // PG clamps live-tuple estimate to non-negative
 			}
-		case "pg_stat_get_dead_tuples":
-			v = c.deltaDead
+		case "pg_stat_get_dead_tuples",
+			"pg_stat_get_ins_since_vacuum",
+			"pg_stat_get_mod_since_analyze":
+			// Read from the shared trigger store, NOT the tiered counters:
+			// these three feed autovacuum decisions and must reflect DML
+			// immediately (pending only reaches shared on an explicit
+			// flush), and VACUUM/ANALYZE reset them in place.
+			d, i, m := relStats.triggerSnapshot(oid)
+			switch name {
+			case "pg_stat_get_dead_tuples":
+				v = d
+			case "pg_stat_get_ins_since_vacuum":
+				v = i
+			default:
+				v = m
+			}
 			if v < 0 {
 				v = 0
 			}

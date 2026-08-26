@@ -9,21 +9,28 @@ package vacuum
 
 import (
 	"errors"
+	"time"
 
-	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/storage"
 )
 
 // Stats summarises the outcome of one Vacuum invocation across every
 // block in the relation.
 type Stats struct {
-	Pages        int // blocks visited
-	Live         int // tuples that survived this pass
-	Dead         int // tuples reclaimed (LP_NORMAL -> LP_UNUSED)
-	Frozen       int // tuples whose xmin was rewritten to FrozenTransactionID
-	OldestXmin   storage.TransactionID
-	NewFrozenXID storage.TransactionID // lowest unfrozen xmin after this pass (0 if all frozen)
+	Pages  int // blocks visited
+	Live   int // tuples that survived this pass
+	Dead   int // tuples reclaimed (LP_NORMAL -> LP_UNUSED)
+	Frozen int // tuples whose xmin was rewritten to FrozenTransactionID
+	// SkippedAllVisible / SkippedAllFrozen count blocks jumped by the VM
+	// skip. Callers must not advance relfrozenxid when SkippedAllVisible > 0
+	// on a non-aggressive pass (vacuumlazy.c skippedallvis guard); all-frozen
+	// skips never stall advancement.
+	SkippedAllVisible int
+	SkippedAllFrozen  int
+	OldestXmin        storage.TransactionID
+	NewFrozenXID      storage.TransactionID // lowest unfrozen xmin after this pass (0 if all frozen)
 	// DeadTIDs is the list of heap (block, offset) pointers that were
 	// reclaimed in this pass. Index vacuum uses these to remove stale
 	// index entries (M0047-0002).
@@ -39,6 +46,18 @@ type VacuumOptions struct {
 	// VM, when non-nil, gets ALL_VISIBLE bits set per page after the prune
 	// so index-only scans can skip heap fetches (M0046-0004).
 	VM *storage.VisibilityMap
+	// Cost-based throttling (upstream vacuum_cost_* family). Zero delay
+	// disables pacing entirely (PG default for manual VACUUM).
+	CostDelayMS   int64
+	CostLimit     int64
+	CostPageHit   int64
+	CostPageMiss  int64
+	CostPageDirty int64
+	// Aggressive forces a full scan of every block, ignoring VM skips —
+	// upstream's cutoff-driven escalation / DISABLE_PAGE_SKIPPING
+	// (vacuumlazy.c:793–800). Anti-wraparound autovacuum and VACUUM (FREEZE)
+	// set this.
+	Aggressive bool
 	// FreezeBelow, when > 0, activates tuple freezing (M0046-0005).
 	// Any tuple with xmin < FreezeBelow is rewritten to FrozenTransactionID
 	// so XID wraparound cannot make it invisible.
@@ -105,7 +124,24 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 	}
 	stats := Stats{OldestXmin: horizon}
 	logPrune := pool.LogHeapPruneOpt()
+	var costSeen map[storage.BlockNumber]bool
+	var costBalance int64
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		// VM skip (upstream heap_vac_scan_next_block): a non-aggressive pass
+		// jumps all-visible blocks entirely — EXCEPT the final block, which
+		// upstream always scans for tail-truncation decisions
+		// (access/heap/vacuumlazy.c:1726–1729). All-frozen skips are counted
+		// separately so they do not stall relfrozenxid advancement.
+		isLastBlock := blk == nBlocks-1
+		if !opts.Aggressive && opts.VM != nil && !isLastBlock &&
+			opts.VM.AllVisible(rel, blk) {
+			if opts.VM.AllFrozen(rel, blk) {
+				stats.SkippedAllFrozen++
+			} else {
+				stats.SkippedAllVisible++
+			}
+			continue
+		}
 		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
 			return stats, err
@@ -198,14 +234,47 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 		if opts.FSM != nil {
 			opts.FSM.RecordFreeSpaceForPage(rel, blk, page)
 		}
-		// Set ALL_VISIBLE in VM (M0046-0004).
+		// Update VM bits (M0046-0004 + probe-audit two-bit extension):
+		// ALL_VISIBLE when every remaining tuple is visible to the horizon;
+		// additionally ALL_FROZEN when the freeze pass ran and every live
+		// tuple sits at-or-below this pass's freeze cutoff.
 		if opts.VM != nil {
-			if storage.PageAllVisible(page, horizon) {
+			switch {
+			case opts.FreezeBelow > 0 && storage.PageAllFrozen(page, opts.FreezeBelow):
+				opts.VM.SetAllFrozen(rel, blk)
+			case storage.PageAllVisible(page, horizon):
 				opts.VM.SetAllVisible(rel, blk)
-			} else {
+			default:
 				opts.VM.ClearBlock(rel, blk)
 			}
 		}
+		// Cost-based throttling (vacuum.c:2472–2490): accumulate per-page
+		// cost; when over the limit, sleep a proportional slice capped at
+		// 4×delay. First touch in this pass counts as a miss (page had to
+		// come from disk), later touches as hits.
+		if opts.CostDelayMS > 0 {
+			if costSeen == nil {
+				costSeen = make(map[storage.BlockNumber]bool)
+			}
+			c := opts.CostPageHit
+			if !costSeen[blk] {
+				c = opts.CostPageMiss
+				costSeen[blk] = true
+			}
+			if pageDirty {
+				c += opts.CostPageDirty
+			}
+			costBalance += c
+			if costBalance >= opts.CostLimit {
+				d := opts.CostDelayMS * costBalance / opts.CostLimit
+				if d > 4*opts.CostDelayMS {
+					d = 4 * opts.CostDelayMS
+				}
+				time.Sleep(time.Duration(d) * time.Millisecond)
+				costBalance = 0
+			}
+		}
+
 		slot.Unlock()
 		pool.Unpin(slot)
 		stats.Pages++

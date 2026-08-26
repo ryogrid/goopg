@@ -983,3 +983,16 @@ func sortDatumsAscending(ds []Datum) error {
 	})
 	return firstErr
 }
+
+// AnalyzeRelationSampled runs the executor-grade sampled analyzer for one
+// relation without an executor Context: upstream-default stats target,
+// wall-clock-seeded reservoir, full column stats (NDistinct/NullFrac/MCV/
+// histogram/correlation). The autovacuum launcher calls this instead of the
+// simplified commands/vacuum.Analyze so autoanalyze produces planner-grade
+// statistics. pg_statistic heap persistence still requires a Context and is
+// therefore skipped here; the catalog TableStats sidecar (which the planner
+// consumes via internal/optimizer/relsize.go) IS updated by the caller.
+func AnalyzeRelationSampled(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
+	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget,
+		rand.New(rand.NewSource(time.Now().UnixNano())), nil, nil)
+}

@@ -113,13 +113,13 @@ func TestVMRedoBitsRoundTripThroughForkParser(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	visible := parseVMPage(page)
+	masks := parseVMPage(page)
 	for _, blk := range []BlockNumber{0, 2, 9, 100} {
-		if !visible[blk] {
+		if masks[blk]&VMAllVisible == 0 {
 			t.Fatalf("parseVMPage lost block %d — redo and the fork writer disagree on layout", blk)
 		}
 	}
-	if visible[1] || visible[3] || visible[99] {
+	if masks[1] != 0 || masks[3] != 0 || masks[99] != 0 {
 		t.Fatal("parseVMPage sees bits redo never set")
 	}
 }

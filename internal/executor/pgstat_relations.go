@@ -34,6 +34,7 @@ package executor
 // matching PostgreSQL, where pg_stat_get_numscans of a dropped relation reads 0.
 
 import (
+	"strconv"
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -74,9 +75,26 @@ type relXactCounters struct {
 	deletedPreTruncDrop  int64
 }
 
+// relTriggerCounters holds the three autovacuum-trigger accumulators for one
+// relation OID: dead tuples, inserts-since-vacuum and modifications-since-
+// analyze (upstream PgStat_TableStatus fields of the same names). Unlike the
+// tiered counters above, these are written DIRECTLY into the shared store at
+// DML time (no pending/staging round-trip): the autovacuum launcher must read
+// fresh values from another goroutine, and pending only reaches shared on an
+// explicit flush that nothing periodic performs. Transactional precision is
+// deliberately traded for launcher visibility — aborted transactions leave
+// bumps behind, the same class of approximation upstream's own triggers make
+// (docs/design/not_ralph/vacuum-autovacuum-parity/03-design.md F4).
+type relTriggerCounters struct {
+	dead int64 // updated+deleted since last vacuum (n_dead_tup)
+	ins  int64 // inserted since last vacuum   (n_ins_since_vacuum)
+	mod  int64 // inserted+updated+deleted since last analyze (n_mod_since_analyze)
+}
+
 // relationStatsManager is the process-global cumulative relation-stats store.
 type relationStatsManager struct {
 	mu       sync.Mutex
+	triggers map[uint32]*relTriggerCounters         // autovacuum-trigger inputs
 	shared   map[uint32]*relStatCounters            // flushed, cluster-global
 	pending  map[uint64]map[uint32]*relStatCounters // per-session, not yet flushed
 	staging  map[uint64]map[uint32]*relXactCounters // per-session current-transaction
@@ -85,6 +103,7 @@ type relationStatsManager struct {
 
 func newRelationStatsManager() *relationStatsManager {
 	return &relationStatsManager{
+		triggers: make(map[uint32]*relTriggerCounters),
 		shared:   make(map[uint32]*relStatCounters),
 		pending:  make(map[uint64]map[uint32]*relStatCounters),
 		staging:  make(map[uint64]map[uint32]*relXactCounters),
@@ -93,6 +112,89 @@ func newRelationStatsManager() *relationStatsManager {
 }
 
 var relStats = newRelationStatsManager()
+
+// init wires the autovacuum-trigger counters into catalog's
+// pg_stat_user_tables renderer (same import-cycle-avoidance pattern as
+// AdvisoryLockRowsFunc). Formatted here so the catalog package stays
+// dependency-free.
+func init() {
+	catalog.UserTableTriggerStatsFunc = func(oid uint32) (dead, mod, ins string) {
+		// triggerSnapshot returns (dead, ins, mod) — mind the order swap.
+		d, i, m := relStats.triggerSnapshot(oid)
+		return strconv.FormatInt(d, 10), strconv.FormatInt(m, 10), strconv.FormatInt(i, 10)
+	}
+}
+
+// triggersFor returns (creating if needed) the shared trigger counters for an
+// OID. Caller must hold m.mu.
+func (m *relationStatsManager) triggersFor(oid uint32) *relTriggerCounters {
+	c := m.triggers[oid]
+	if c == nil {
+		c = &relTriggerCounters{}
+		m.triggers[oid] = c
+	}
+	return c
+}
+
+// bumpTriggers records DML-driven trigger deltas straight into the shared
+// store (see relTriggerCounters doc): insert bumps ins+mod, update bumps
+// dead+mod, delete bumps dead+mod.
+func (m *relationStatsManager) bumpTriggers(oid uint32, dead, ins, mod int64) {
+	if oid == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bumpTriggersLocked(oid, dead, ins, mod)
+}
+
+func (m *relationStatsManager) bumpTriggersLocked(oid uint32, dead, ins, mod int64) {
+	if oid == 0 || (dead == 0 && ins == 0 && mod == 0) {
+		return
+	}
+	c := m.triggersFor(oid)
+	c.dead += dead
+	c.ins += ins
+	c.mod += mod
+}
+
+// resetVacuumTriggers zeroes n_dead_tup / n_ins_since_vacuum after a
+// successful VACUUM of the relation (pgstat_relation_vacuum_rel).
+func (m *relationStatsManager) resetVacuumTriggers(oid uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c := m.triggers[oid]; c != nil {
+		c.dead = 0
+		c.ins = 0
+	}
+}
+
+// resetAnalyzeTriggers zeroes n_mod_since_analyze after a successful ANALYZE
+// (pgstat_relation_analyze).
+func (m *relationStatsManager) resetAnalyzeTriggers(oid uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c := m.triggers[oid]; c != nil {
+		c.mod = 0
+	}
+}
+
+// truncateTriggersLocked forgets every counter after TRUNCATE (rows are
+// gone). Caller must hold m.mu (recordTruncate already runs under it).
+func (m *relationStatsManager) truncateTriggersLocked(oid uint32) {
+	delete(m.triggers, oid)
+}
+
+// triggerSnapshot reads the three counters for one OID (zeros when absent).
+func (m *relationStatsManager) triggerSnapshot(oid uint32) (dead, ins, mod int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.triggers[oid]
+	if c == nil {
+		return 0, 0, 0
+	}
+	return c.dead, c.ins, c.mod
+}
 
 // pendingFor returns (creating if needed) the pending counter for a session+OID.
 // Caller must hold m.mu.
@@ -169,6 +271,7 @@ func (m *relationStatsManager) recordInsert(sessionID uint64, oid uint32, n int6
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stagingFor(sessionID, oid).tuplesInserted += n
+	m.bumpTriggersLocked(oid, 0, n, n)
 }
 
 // recordUpdate stages n updated tuples for the current transaction
@@ -180,6 +283,7 @@ func (m *relationStatsManager) recordUpdate(sessionID uint64, oid uint32, n int6
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stagingFor(sessionID, oid).tuplesUpdated += n
+	m.bumpTriggersLocked(oid, n, 0, n)
 }
 
 // recordDelete stages n deleted tuples for the current transaction
@@ -191,6 +295,7 @@ func (m *relationStatsManager) recordDelete(sessionID uint64, oid uint32, n int6
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stagingFor(sessionID, oid).tuplesDeleted += n
+	m.bumpTriggersLocked(oid, n, 0, n)
 }
 
 // recordTruncate stages a TRUNCATE (pgstat_count_truncate): it saves the
@@ -208,6 +313,7 @@ func (m *relationStatsManager) recordTruncate(sessionID uint64, oid uint32) {
 	x.tuplesInserted = 0
 	x.tuplesUpdated = 0
 	x.tuplesDeleted = 0
+	m.truncateTriggersLocked(oid)
 }
 
 // saveTruncDropCounters mirrors save_truncdrop_counters: record the current
@@ -511,4 +617,23 @@ func tableOIDFromCatalog(t *catalog.Table) uint32 {
 		return 0
 	}
 	return t.OID
+}
+
+// TriggerSnapshot returns (nDeadTup, nInsSinceVacuum, nModSinceAnalyze) for a
+// relation OID — exported for the autovacuum launcher's trigger formula.
+func TriggerSnapshot(oid uint32) (dead, ins, mod int64) {
+	return relStats.triggerSnapshot(oid)
+}
+
+// ResetVacuumTriggers zeroes n_dead_tup / n_ins_since_vacuum after a
+// successful VACUUM (exported for the autovacuum launcher).
+func ResetVacuumTriggers(oid uint32) { relStats.resetVacuumTriggers(oid) }
+
+// ResetAnalyzeTriggers zeroes n_mod_since_analyze after a successful ANALYZE
+// (exported for the autovacuum launcher).
+func ResetAnalyzeTriggers(oid uint32) { relStats.resetAnalyzeTriggers(oid) }
+
+// BumpTriggersForTest is a test hook matching bumpTriggers.
+func BumpTriggersForTest(oid uint32, dead, ins, mod int64) {
+	relStats.bumpTriggers(oid, dead, ins, mod)
 }

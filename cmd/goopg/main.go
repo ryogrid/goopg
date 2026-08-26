@@ -34,6 +34,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/postmaster"
+	"github.com/goopg/goopg/internal/postmaster/autovacuum"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -586,6 +587,23 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// set rather than a wrong one — which is the same answer a
 		// truncated-away multixact gives upstream.
 		cfg.MultiXact = multixact.NewStoreAt(multixact.MultiXactId(rt.NextMultiXact))
+
+		// Autovacuum launcher (vacuum parity bundle): started when the
+		// `autovacuum` GUC is on (upstream default), sweeping every
+		// autovacuum_naptime seconds and reading its trigger thresholds from
+		// the same registry so SET/postgresql.conf take effect.
+		if boolGUC(registry, "autovacuum", true) {
+			napSec := intGUC(registry, "autovacuum_naptime", 60)
+			l := autovacuum.NewLauncher(rt.Pool, rt.TxnMgr, rt.Catalog)
+			l.FSM = rt.FSM
+			l.VM = rt.VM
+			l.MultiXact = cfg.MultiXact
+			l.GUCs = registry
+			l.NapInterval = time.Duration(napSec) * time.Second
+			cfg.AutovacuumLauncher = l
+			logger.Info("autovacuum launcher enabled",
+				"event", "autovacuum_launcher_enabled", "naptime_s", napSec)
+		}
 		// M0131-S18.4: publish the allocator's next-to-assign MultiXactId
 		// into every checkpoint (record + pg_control). Before this the
 		// encoder wrote a literal 1, so a cluster that had combined row

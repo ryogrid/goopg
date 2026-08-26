@@ -327,7 +327,7 @@ func TestPort_PgStatActivity(t *testing.T) {
 		t.Error("state is empty")
 	}
 	if row[2] != "client_backend" {
-		t.Errorf("backend_type = %q, want upstream literal "client backend"", row[2])
+		t.Errorf("backend_type = %q, want upstream literal %q", row[2], "client backend")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -33,25 +34,38 @@ func TestNeedsVacuumRespectsAutovacuumEnabledReloption(t *testing.T) {
 	l := NewLauncher(nil, nil, cat)
 
 	tbl := &catalog.Table{
-		Schema: "public",
+		OID: 202, Schema: "public",
 		Name:   "t",
 		Stats:  &catalog.TableStats{RowCount: 100},
 	}
 
+	// Formula-based triggers: RowCount alone no longer fires; the dead-tuple
+	// counter must cross threshold + scale_factor·reltuples (50+0.2·100=70).
+	executor.BumpTriggersForTest(tbl.OID, 100, 0, 0)
 	if !l.needsVacuum(tbl) {
-		t.Fatalf("needsVacuum: expected true with no reloption set and RowCount>0")
+		t.Fatalf("needsVacuum: expected true with dead=100 > 50+0.2*100")
 	}
+	if l.needsAnalyze(tbl) {
+		t.Fatalf("needsAnalyze: expected false with mod=0 <= 50+0.1*100")
+	}
+	executor.ResetVacuumTriggers(tbl.OID)
+	executor.BumpTriggersForTest(tbl.OID, 0, 0, 200)
 	if !l.needsAnalyze(tbl) {
-		t.Fatalf("needsAnalyze: expected true with no reloption set")
+		t.Fatalf("needsAnalyze: expected true with mod=200 > 50+0.1*100")
 	}
+	executor.ResetAnalyzeTriggers(tbl.OID)
 
 	tbl.AutovacuumEnabledSet = true
 	tbl.AutovacuumEnabled = false
-	if l.needsVacuum(tbl) {
-		t.Fatalf("needsVacuum: expected false when autovacuum_enabled=false")
-	}
-	if l.needsAnalyze(tbl) {
-		t.Fatalf("needsAnalyze: expected false when autovacuum_enabled=false")
+	executor.BumpTriggersForTest(tbl.OID, 500, 0, 500)
+	defer executor.ResetVacuumTriggers(tbl.OID)
+	defer executor.ResetAnalyzeTriggers(tbl.OID)
+	// needsVacuum is now purely NUMERIC (parity bundle F4): the
+	// autovacuum_enabled=off bypass lives in the tick() caller, matching
+	// autovacuum.c where relation_needs_vacanalyze computes thresholds and
+	// the "ignore if at risk" override happens around it.
+	if !l.needsVacuum(tbl) {
+		t.Fatalf("needsVacuum: expected true with dead=500 > 70 regardless of reloption")
 	}
 
 	tbl.AutovacuumEnabled = true
