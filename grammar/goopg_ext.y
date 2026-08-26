@@ -26,6 +26,7 @@ create_table_stmt:
 				var uqNullsNotDistinct, uqDeferrable, uqInitiallyDeferred []bool
 				var named []parser.TableConstraintDef
 				var namedChecks []parser.PartitionCheckConstraint
+				var fks []parser.TableForeignKeyDef
 				var checks []string
 				var checkNoInherit, checkNotEnforced []bool
 				for _, e := range elems {
@@ -66,6 +67,9 @@ create_table_stmt:
 							uqNullsNotDistinct = append(uqNullsNotDistinct, false)
 							uqDeferrable = append(uqDeferrable, false)
 							uqInitiallyDeferred = append(uqInitiallyDeferred, false)
+						}
+						if e.fkDef != nil {
+							fks = append(fks, *e.fkDef)
 						}
 						if e.namedPk != nil {
 							named = append(named, *e.namedPk)
@@ -108,6 +112,7 @@ create_table_stmt:
 				ct.TableUniqueInitiallyDeferred = uqInitiallyDeferred
 				ct.NamedConstraints = named
 				ct.TableNamedChecks = namedChecks
+				ct.TableForeignKeys = fks
 				ct.TableChecks = checks
 				ct.TableCheckNoInherit = checkNoInherit
 				ct.TableCheckNotEnforced = checkNotEnforced
@@ -226,6 +231,35 @@ table_element:
 			{ $$ = &tableElem{namedUq: parser.NewTableConstraintDef($2, $4, false)} }
 	| CONSTRAINT ColId CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
 			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen(), checkName: $2} }
+	/* Anonymous table-level CHECK and FOREIGN KEY (gram.y TableConstraint).
+	   CHECK and FOREIGN are reserved keywords, so they cannot start the
+	   `ColId col_type_name …` column alternative and the element-start decision
+	   stays on distinct terminals. Only the plain forms are ported: MATCH FULL,
+	   [NOT] DEFERRABLE [INITIALLY …], NOT VALID, [NOT] ENFORCED, ON DELETE SET
+	   (cols) and NO INHERIT still fall to legacy — see TODO.md P4.1. */
+	| CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
+			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen()} }
+	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions
+			{
+				$$ = &tableElem{fkDef: &parser.TableForeignKeyDef{
+					Columns:    $4,
+					RefTable:   objectNameFromQn($7),
+					RefColumns: $8,
+					OnDelete:   $9.(*fkActs).del,
+					OnUpdate:   $9.(*fkActs).up,
+				}}
+			}
+	| CONSTRAINT ColId FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions
+			{
+				$$ = &tableElem{fkDef: &parser.TableForeignKeyDef{
+					Name:       $2,
+					Columns:    $6,
+					RefTable:   objectNameFromQn($9),
+					RefColumns: $10,
+					OnDelete:   $11.(*fkActs).del,
+					OnUpdate:   $11.(*fkActs).up,
+				}}
+			}
 
 pk_cols:
 		'(' colid_list ')'   { $$ = $2 }

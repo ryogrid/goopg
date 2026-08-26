@@ -34,6 +34,21 @@ func TestTableConstraintParity(t *testing.T) {
 		"CREATE TABLE t (a int, b int, CONSTRAINT u UNIQUE (a, b))",
 		"CREATE TABLE t (a int, CONSTRAINT ck CHECK (a > 0))",
 		"CREATE TABLE t (a text, CONSTRAINT ck CHECK (a <> 'x'))",
+		// table-level CHECK and FOREIGN KEY — no grammar until 2026-08-27, so
+		// `CREATE TABLE t (a int, b int, FOREIGN KEY (b) REFERENCES o (id))`
+		// was a hard syntax error on the routed path. FOREIGN was one of the
+		// reserved tokens no production consumed (TestReservedKeywordsReachable).
+		"CREATE TABLE t (a int, CHECK (a > 0))",
+		"CREATE TABLE t (a int, check (a < 10))",
+		"CREATE TABLE t (a text, CHECK (a <> 'x'))",
+		"CREATE TABLE t (a int, CHECK (a > 0), UNIQUE (a))",
+		"CREATE TABLE t (a int, b int, FOREIGN KEY (b) REFERENCES o (id))",
+		"CREATE TABLE t (a int, b int, FOREIGN KEY (b) REFERENCES o)",
+		"CREATE TABLE t (a int, b int, FOREIGN KEY (a, b) REFERENCES o (x, y))",
+		"CREATE TABLE t (a int, b int, FOREIGN KEY (b) REFERENCES o (id) ON DELETE CASCADE)",
+		"CREATE TABLE t (a int, b int, foreign key (b) references o (id) on update set null)",
+		"CREATE TABLE t (a int, b int, CONSTRAINT fk FOREIGN KEY (b) REFERENCES o (id))",
+		"CREATE TABLE t (a int, b int, PRIMARY KEY (a), FOREIGN KEY (b) REFERENCES o (id))",
 		// mixed with column-level constraints
 		"CREATE TABLE t (a int PRIMARY KEY, b int, CONSTRAINT u UNIQUE (b))",
 		"CREATE TABLE t (a int NOT NULL, b int DEFAULT 0, UNIQUE (a), CONSTRAINT ck CHECK (b >= 0))",
