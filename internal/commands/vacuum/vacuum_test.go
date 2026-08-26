@@ -375,3 +375,48 @@ func TestVacuumVMSkipAndAllFrozenBits(t *testing.T) {
 		t.Fatalf("post-freeze stats = %+v, want SkippedAllFrozen=%d Pages=1", st, nBlocks-1)
 	}
 }
+
+// TestVacuumTailTruncation pins parity E2: with Truncate enabled, trailing
+// all-empty blocks are dropped from the relation file (and the WAL hook, when
+// wired, fires before the physical shrink).
+func TestVacuumTailTruncation(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+
+	mvccMgr := transam.NewManager()
+	tx1, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
+	mvccMgr.Commit(tx1)
+
+	const nBlocks = 6
+	if _, err := pool.ExtendRelationBatch(rel, nBlocks); err != nil {
+		t.Fatalf("ExtendRelationBatch: %v", err)
+	}
+	// Populate only blocks 0 and 1; 2..5 stay empty.
+	for b := storage.BlockNumber(0); b < 2; b++ {
+		live := storage.NewHeapTuple(xid1, storage.InvalidTransactionID, []byte("v"))
+		addTuple(t, pool, rel, b, live)
+	}
+
+	var walCalls int
+	pool.SetLogSmgrTruncateTo(func(rel storage.RelFileNode, keep storage.BlockNumber) error {
+		walCalls++
+		return nil
+	})
+
+	if n, _ := pool.NBlocks(rel); int(n) != nBlocks {
+		t.Fatalf("pre-truncate nblocks=%d want %d", n, nBlocks)
+	}
+	st, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{Truncate: true})
+	if err != nil {
+		t.Fatalf("vacuum: %v", err)
+	}
+	n, _ := pool.NBlocks(rel)
+	if n != 2 {
+		t.Fatalf("post-truncate nblocks=%d want 2 (stats=%+v)", n, st)
+	}
+	if walCalls != 1 {
+		t.Fatalf("wal truncate calls=%d want 1", walCalls)
+	}
+}

@@ -211,6 +211,7 @@ func (l *Launcher) runVacuum(log *slog.Logger, tbl *catalog.Table,
 
 	vo := vacuum.VacuumOptions{
 		FSM: l.FSM, VM: l.VM, FreezeBelow: freezeBelow, Aggressive: aggressive,
+		Truncate: true, FailsafeAge: p.failsafeAge,
 	}
 	// Cost pacing: autovacuum_vacuum_cost_delay defaults to 2 ms upstream;
 	// limit -1 defers to vacuum_cost_limit (200).
@@ -290,6 +291,7 @@ type avParams struct {
 	freezeMaxAge   int64
 	freezeMinAge   int64
 	freezeTableAge int64
+	failsafeAge    int64
 }
 
 func (l *Launcher) params() avParams {
@@ -299,6 +301,7 @@ func (l *Launcher) params() avParams {
 		insThresh: 1000, insScale: 0.2,
 		maxThreshold: 200_000_000,
 		freezeMaxAge: 200_000_000, freezeMinAge: 50_000_000, freezeTableAge: 150_000_000,
+		failsafeAge: 1_600_000_000,
 	}
 	g := func(name string) (int64, bool) {
 		if l.GUCs == nil {
@@ -354,6 +357,9 @@ func (l *Launcher) params() avParams {
 	}
 	if v, ok := g("vacuum_freeze_min_age"); ok && v >= 0 {
 		p.freezeMinAge = v
+	}
+	if v, ok := g("vacuum_failsafe_age"); ok && v > 0 {
+		p.failsafeAge = v
 	}
 	if v, ok := g("vacuum_freeze_table_age"); ok && v > 0 {
 		fta := v

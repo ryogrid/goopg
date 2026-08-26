@@ -7,11 +7,11 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/storage/lmgr"
-	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/commands/vacuum"
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 )
 
 // defaultAutovacuumFreezeMaxAge mirrors upstream's boot value (200M XIDs);
@@ -142,10 +142,27 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		}
 		return tableAge >= freezeTableAge
 	}
+	// vacuum_truncate is a BOOL GUC ("on"/"off"); default on like upstream.
+	truncate := true
+	if o.ctx != nil && o.ctx.GetSetting != nil {
+		if raw, ok := o.ctx.GetSetting("vacuum_truncate"); ok {
+			switch strings.ToLower(strings.TrimSpace(raw)) {
+			case "off", "false", "0", "no":
+				truncate = false
+			}
+		}
+	}
+	if vs.NoTruncate {
+		truncate = false
+	}
+	failsafeAge, _ := o.lookupGUCInt("vacuum_failsafe_age")
+
 	opts := vacuum.VacuumOptions{
 		FSM:         o.ctx.FSM,
 		VM:          o.ctx.VM,
 		FreezeBelow: freezeBelow,
+		Truncate:    truncate,
+		FailsafeAge: failsafeAge,
 	}
 	if d, ok := o.lookupGUCInt("vacuum_cost_delay"); ok && d > 0 {
 		opts.CostDelayMS = d

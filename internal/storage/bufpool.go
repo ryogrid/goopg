@@ -151,6 +151,8 @@ type Pool struct {
 	logHeapUpdate LogHeapUpdateFunc
 	// logHeapPruneOpt emits an opportunistic page-pruning WAL record.
 	logHeapPruneOpt LogHeapPruneOptFunc
+	// logSmgrTruncateTo emits the truncate-to-N WAL record (parity E2).
+	logSmgrTruncateTo func(rel RelFileNode, keep BlockNumber) error
 	// logSmgrCreate emits a relation-file creation WAL record. A9: carries the
 	// creating transaction's xid (0 for bootstrap/non-transactional creates) so
 	// the PG xl_smgr_create record is byte-faithful and routes to decoded replay.
@@ -657,7 +659,10 @@ type PoolConfig struct {
 	LogHeapUpdate            LogHeapUpdateFunc
 	LogHeapPruneOpt          LogHeapPruneOptFunc
 	LogSmgrCreate            func(rel RelFileNode, xid TransactionID) error
-	LogChangeRecord          func(payload []byte) (LSN, error)
+	// LogSmgrTruncateTo emits the truncate-to-N WAL record BEFORE the
+	// physical file shrink (WAL-first, upstream XLOG_SMGR_TRUNCATE order).
+	LogSmgrTruncateTo func(rel RelFileNode, keep BlockNumber) error
+	LogChangeRecord   func(payload []byte) (LSN, error)
 
 	// Logger receives FPI emission failures. nil means slog.Default().
 	Logger *slog.Logger
@@ -840,6 +845,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapHotUpdate:         cfg.LogHeapHotUpdate,
 		logHeapUpdate:            cfg.LogHeapUpdate,
 		logHeapPruneOpt:          cfg.LogHeapPruneOpt,
+		logSmgrTruncateTo:        cfg.LogSmgrTruncateTo,
 		logSmgrCreate:            cfg.LogSmgrCreate,
 		logChangeRecord:          cfg.LogChangeRecord,
 		logger:                   logger,
@@ -1344,6 +1350,29 @@ func (p *Pool) Prefetch(tag BufferTag) {
 }
 
 // InvalidateRel evicts every slot currently bound to rel.
+// TruncateRelationTail drops all blocks >= keep for rel: WAL-first (when the
+// LogSmgrTruncateTo hook is wired), then buffer invalidation for the removed
+// range, then the physical smgr truncate. Idempotent when the relation is
+// already <= keep blocks.
+func (p *Pool) TruncateRelationTail(rel RelFileNode, keep BlockNumber) error {
+	oldN, err := p.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if keep >= oldN {
+		return nil
+	}
+	if p.logSmgrTruncateTo != nil {
+		if err := p.logSmgrTruncateTo(rel, keep); err != nil {
+			return err
+		}
+	}
+	for b := keep; b < oldN; b++ {
+		p.InvalidateBlock(BufferTag{Rel: rel, Block: b})
+	}
+	return p.mgr.TruncateRelationTo(rel, keep)
+}
+
 func (p *Pool) InvalidateRel(rel RelFileNode) {
 	for i := range p.slots {
 		s := &p.slots[i]
@@ -2775,4 +2804,10 @@ func (p *Pool) WriteDirtyPages(maxPages int) int {
 		s.contentMu.RUnlock()
 	}
 	return written
+}
+
+// SetLogSmgrTruncateTo installs the truncate-to-N WAL emitter hook (test
+// and bootstrap wiring).
+func (p *Pool) SetLogSmgrTruncateTo(fn func(rel RelFileNode, keep BlockNumber) error) {
+	p.logSmgrTruncateTo = fn
 }

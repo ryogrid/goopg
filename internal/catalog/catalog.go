@@ -56,6 +56,34 @@ var VirtualSpecLockRowsFunc func() [][]string
 // built in this package; the executor owns the live counters.
 var UserTableTriggerStatsFunc func(oid uint32) (dead, mod, ins string)
 
+// RelAllVisibleFunc is optionally set by initdb/bootstrap to report the
+// relation's VM-derived all-visible block count (pg_class.relallvisible).
+var RelAllVisibleFunc func(dbOid, relOid uint32) int32
+
+// relAllVisibleFor renders the relallvisible column for one table via the
+// bootstrap-provided hook; "0" when unavailable.
+func (c *InMemory) relAllVisibleCell(t *Table) string {
+	if c == nil || t == nil {
+		return "0"
+	}
+	dbOid := c.dbOid
+	if t.DBOid != 0 && t.DBOid != DefaultDBOid {
+		dbOid = t.DBOid
+	}
+	relOID := t.OID
+	if t.RelFileNodeOID != 0 {
+		relOID = t.RelFileNodeOID
+	}
+	return relAllVisibleFor(dbOid, relOID)
+}
+
+func relAllVisibleFor(dbOid, relOid uint32) string {
+	if RelAllVisibleFunc == nil {
+		return "0"
+	}
+	return strconv.FormatInt(int64(RelAllVisibleFunc(dbOid, relOid)), 10)
+}
+
 // SeqParams carries one sequence's pg_sequence parameter row, supplied by the
 // executor (which owns the runtime sequence registry) so the catalog can build
 // pg_sequence rows without importing the executor package. M0110-0001 (DU-002
@@ -1353,10 +1381,10 @@ type Trigger struct {
 	// counter at CREATE TRIGGER time. pg_dump's getTriggers selects
 	// pg_get_triggerdef(t.oid, false), so a zero OID means the trigger is
 	// invisible to pg_dump (predates OID tracking). DU-002 slice 319.
-	OID        uint32
-	TableOID   uint32
-	Timing     TriggerTiming
-	Events     []string // "insert", "update", "delete", "truncate"
+	OID      uint32
+	TableOID uint32
+	Timing   TriggerTiming
+	Events   []string // "insert", "update", "delete", "truncate"
 	// UpdateColumns is the optional `UPDATE OF col1, col2` column list of a
 	// column-specific UPDATE trigger; empty for every other form. pg_dump's
 	// pg_get_triggerdef appends ` OF <cols>` right after the UPDATE event and
@@ -1386,11 +1414,11 @@ type Trigger struct {
 	// `WHEN (…)` between FOR EACH and EXECUTE FUNCTION; PG stores it as a node tree
 	// in pg_trigger.tgqual. goopg keeps the parsed expression for dump fidelity
 	// only — the condition is not evaluated at trigger-firing time. DU-002 slice 329.
-	WhenExpr           parser.Expr
-	ForEachRow         bool
-	FuncName           string // function/procedure name (unschemed)
-	FuncSchema         string
-	Args               []string // trigger function arguments (TG_ARGV)
+	WhenExpr   parser.Expr
+	ForEachRow bool
+	FuncName   string // function/procedure name (unschemed)
+	FuncSchema string
+	Args       []string // trigger function arguments (TG_ARGV)
 }
 
 // triggerUpdateColAttrs renders a column-specific UPDATE trigger's column list
@@ -1508,13 +1536,13 @@ type ForeignKey struct {
 	// Auto-assigned at DDL time using PG's convention <table>_<col>_fkey when
 	// no explicit CONSTRAINT name is given. A zero OID / empty Name means the
 	// FK predates constraint-catalog tracking and is invisible to pg_dump. DU-002 slice 51.
-	Name              string
-	OID               uint32
-	Columns           []string // columns in THIS table
-	RefTable          string   // referenced table name (unschemed)
-	RefColumns        []string // referenced columns (empty = use parent PK)
-	OnDelete          parser.FKAction
-	OnUpdate          parser.FKAction
+	Name       string
+	OID        uint32
+	Columns    []string // columns in THIS table
+	RefTable   string   // referenced table name (unschemed)
+	RefColumns []string // referenced columns (empty = use parent PK)
+	OnDelete   parser.FKAction
+	OnUpdate   parser.FKAction
 	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
 	// subset of Columns — PG15 pg_constraint.confdelsetcols. Empty means the
 	// whole key. pg_get_constraintdef appends ` (col, …)` after the ON DELETE
@@ -1701,7 +1729,7 @@ type TableStats struct {
 type ColumnStats struct {
 	NDistinct int64      `json:"ndistinct,omitempty"`
 	NullFrac  float64    `json:"null_frac,omitempty"`
-	AvgWidth  float64    `json:"avg_width,omitempty"`   // stawidth (average width in bytes of variable payload per non-null value)
+	AvgWidth  float64    `json:"avg_width,omitempty"` // stawidth (average width in bytes of variable payload per non-null value)
 	MCV       []MCVEntry `json:"mcv,omitempty"`
 	Histogram []string   `json:"histogram,omitempty"`
 
@@ -3735,7 +3763,7 @@ const FirstUserOID uint32 = 16384
 
 // VirtualNull is the sentinel a VirtualRows cell uses to denote SQL NULL for a
 // column type whose empty string is a legitimate non-NULL value (most notably
-// `text`: an empty `collicurules` / `collcollate` must read as NULL, not '').
+// `text`: an empty `collicurules` / `collcollate` must read as NULL, not ”).
 // planner.TypedVirtualCell maps this sentinel to a NULL constant before any
 // type-specific parsing. The byte sequence cannot collide with a real catalog
 // value (NUL-delimited marker). Sibling decoders (the executor's
@@ -3908,9 +3936,9 @@ func NewInMemory() *InMemory {
 			// public object into pg_toast. pg_toast=99 also matches initdb.go's
 			// pgNamespaceInitialEntries and the "pg_toast namespace (OID 99)"
 			// assumption baked into the TOAST virtual-row builders.
-			"pg_catalog":         11,
-			"public":             2200,
-			"pg_toast":           99,
+			"pg_catalog": 11,
+			"public":     2200,
+			"pg_toast":   99,
 			// information_schema is NOT a bootstrap namespace: initdb creates it
 			// while running information_schema.sql, so its OID comes from the
 			// post-bootstrap counter (FirstUnpinnedObjectId = 12000) and is fixed
@@ -4040,7 +4068,6 @@ func (c *InMemory) LookupStatistics(name string) (*StatisticsObject, bool) {
 	obj, ok := c.statisticsObjs[key]
 	return obj, ok
 }
-
 
 // SetStatisticsTarget records the statistics target for the named extended
 // statistics object (ALTER STATISTICS ... SET STATISTICS n). A nil target
@@ -5336,8 +5363,8 @@ func (c *InMemory) PGStatDatabaseRows() [][]string {
 		for i := range r {
 			r[i] = "0" // int/float counter columns default to a faithful 0
 		}
-		r[0] = datid   // datid oid
-		r[1] = datname // datname name
+		r[0] = datid        // datid oid
+		r[1] = datname      // datname name
 		r[17] = VirtualNull // checksum_last_failure timestamptz — never failed
 		r[29] = VirtualNull // stats_reset timestamptz — never reset
 		return r
@@ -6608,7 +6635,6 @@ func verboseIntervalOffset(totalSecs int) string {
 	return b.String()
 }
 
-
 // PGClassRowsForDBOid builds the pg_class row-set for dbOid's own tables/
 // indexes (M0122-0007 4e: per-connection pg_class scoping). Composite-type
 // and pg_class-self rows stay global — composite types aren't
@@ -6720,12 +6746,12 @@ func (c *InMemory) PGConstraintRowsForDBOid(dbOid uint32) [][]string {
 				continue
 			}
 			row := make([]string, 26)
-			row[0] = fmt.Sprintf("%d", nc.OID)  // oid
-			row[1] = nc.Name                    // conname
-			row[2] = "2200"                     // connamespace (public)
-			row[3] = "c"                        // contype = check
-			row[4] = "f"                        // condeferrable
-			row[5] = "f"                        // condeferred
+			row[0] = fmt.Sprintf("%d", nc.OID) // oid
+			row[1] = nc.Name                   // conname
+			row[2] = "2200"                    // connamespace (public)
+			row[3] = "c"                       // contype = check
+			row[4] = "f"                       // condeferrable
+			row[5] = "f"                       // condeferred
 			if nc.NotValid || nc.NotEnforced {
 				// convalidated='f' — either explicitly added NOT VALID, or
 				// NOT ENFORCED (real PG's ATAddCheckNNConstraint sets
@@ -6996,10 +7022,10 @@ func (c *InMemory) PGConstraintRowsForDBOid(dbOid uint32) [][]string {
 			} else {
 				row[14] = "s" // confmatchtype = MATCH SIMPLE (default)
 			}
-			row[15] = "t"                               // conislocal
-			row[16] = "0"                               // coninhcount
-			row[17] = "f"                               // connoinherit
-			row[18] = "f"                               // conperiod
+			row[15] = "t" // conislocal
+			row[16] = "0" // coninhcount
+			row[17] = "f" // connoinherit
+			row[18] = "f" // conperiod
 			row[19] = "{" + strings.Join(conkey, ",") + "}"
 			row[20] = "{" + strings.Join(confkey, ",") + "}"
 			if len(confdelsetcols) > 0 {
@@ -7240,493 +7266,493 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 	out := make([][]string, 0, len(c.ns(dbOid).tables)+len(c.ns(dbOid).indexes))
 	for _, k := range keys {
 		t := c.ns(dbOid).tables[k]
-			if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
-				// Skip system-catalog virtual tables (pg_class, pg_locks, etc.)
-				// but include user views (t.View != nil), materialized views, and
-				// user sequences (relkind='S'). Sequences are virtual tables too,
-				// but unlike system catalogs they must be discoverable by pg_dump's
-				// getTables (which selects relkind IN ('r','S','v','c','m','f','p'))
-				// so the sequence is dumped via dumpSequence. M0110-0001 (DU-002
-				// slice 116).
-				continue
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			// Skip system-catalog virtual tables (pg_class, pg_locks, etc.)
+			// but include user views (t.View != nil), materialized views, and
+			// user sequences (relkind='S'). Sequences are virtual tables too,
+			// but unlike system catalogs they must be discoverable by pg_dump's
+			// getTables (which selects relkind IN ('r','S','v','c','m','f','p'))
+			// so the sequence is dumped via dumpSequence. M0110-0001 (DU-002
+			// slice 116).
+			continue
+		}
+		relkind := "r"
+		// relam: heap (2) for ordinary relations; 0 for sequences. PG sets
+		// pg_class.relam=0 for sequences (RELKIND_HAS_TABLE_AM excludes
+		// RELKIND_SEQUENCE — see pg_class.h: sequences use the heap AM only at
+		// the relcache level, not via pg_class.relam). This is load-bearing for
+		// pg_amcheck parity: its relation CTE selects only relations with
+		// relam=HEAP_TABLE_AM_OID for heap verification, so relam=0 keeps the
+		// storage-less virtual sequence out of verify_heapam (which would fail).
+		// M0110-0001 (DU-002 slice 116).
+		relam := "2"
+		if t.IsSequence {
+			relkind = "S"
+			relam = "0"
+		} else if t.View != nil && !t.IsMatView {
+			relkind = "v"
+		} else if t.IsMatView {
+			relkind = "m"
+		} else if t.PartitionMethod != "" && t.PartitionParentOID == 0 {
+			relkind = "p"
+		} else if t.ForeignServerName != "" {
+			relkind = "f"
+		}
+		populated := "t"
+		if t.IsMatView && !t.IsPopulated {
+			populated = "f"
+		}
+		// Resolve namespace OID from the schema registry.
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		nsOID := c.schemas[strings.ToLower(schema)]
+		if nsOID == 0 {
+			nsOID = 2200 // default to public
+		}
+		// A temporary relation lives in its owning session's per-backend
+		// namespace (pg_temp_<id>), not public — mirrors PostgreSQL so a
+		// `WHERE relnamespace = pg_my_temp_schema()` scan finds it (and finds
+		// nothing once it is cleaned up). M0118-0009 (temp-schema-cleanup,
+		// design 0118-0091). Falls back to the schema OID for legacy
+		// session-less temp relations (TempOwner == "").
+		if t.Temp && t.TempOwner != "" {
+			if tns := c.tempNamespaceOIDLocked(t.TempOwner); tns != 0 {
+				nsOID = tns
 			}
-			relkind := "r"
-			// relam: heap (2) for ordinary relations; 0 for sequences. PG sets
-			// pg_class.relam=0 for sequences (RELKIND_HAS_TABLE_AM excludes
-			// RELKIND_SEQUENCE — see pg_class.h: sequences use the heap AM only at
-			// the relcache level, not via pg_class.relam). This is load-bearing for
-			// pg_amcheck parity: its relation CTE selects only relations with
-			// relam=HEAP_TABLE_AM_OID for heap verification, so relam=0 keeps the
-			// storage-less virtual sequence out of verify_heapam (which would fail).
-			// M0110-0001 (DU-002 slice 116).
-			relam := "2"
-			if t.IsSequence {
-				relkind = "S"
-				relam = "0"
-			} else if t.View != nil && !t.IsMatView {
-				relkind = "v"
-			} else if t.IsMatView {
-				relkind = "m"
-			} else if t.PartitionMethod != "" && t.PartitionParentOID == 0 {
-				relkind = "p"
-			} else if t.ForeignServerName != "" {
-				relkind = "f"
+		}
+		hasIdx := "f"
+		if len(c.ns(dbOid).byTable[t.OID]) > 0 {
+			hasIdx = "t"
+		}
+		isPartition := "f"
+		if t.PartitionParentOID != 0 {
+			isPartition = "t"
+		}
+		// Build relpartbound: "FOR VALUES ..." string for partition children.
+		partBound := ""
+		if t.PartitionParentOID != 0 && len(t.PartitionBounds) > 0 {
+			partBound = FormatPartitionBound(t.PartitionBounds[0])
+		}
+		relpers := "p"
+		if t.Unlogged {
+			relpers = "u"
+		} else if t.Temp {
+			relpers = "t"
+		}
+		// relchecks must equal the number of contype='c' rows pg_constraint
+		// emits for this table (the visible, named+OID'd CHECK constraints).
+		// pg_dump gates its per-table CHECK query on relchecks>0 and then
+		// asserts the row count matches exactly (getTableAttrs), so a 0 here
+		// silently drops every CHECK from the dumped CREATE TABLE. M0110-0001.
+		relchecks := 0
+		for _, nc := range t.NamedChecks {
+			if nc.Name != "" && nc.OID != 0 {
+				relchecks++
 			}
-			populated := "t"
-			if t.IsMatView && !t.IsPopulated {
-				populated = "f"
+		}
+		// reloptions surfaces the table's storage parameters as a text[]
+		// array literal (`{fillfactor=70}`). Empty → "" → planner maps it to
+		// SQL NULL (DU-002 slice 47), so a plain table emits no WITH clause;
+		// a non-empty one round-trips through pg_dump as `WITH
+		// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). BuildTableReloptions
+		// is the single source of truth (shared with executor.buildUserPGClassRow's
+		// heap-persisted row, M0119-0004) so the two never drift apart.
+		reloptions := BuildTableReloptions(t)
+		// reltoastrelid: PG auto-creates a TOAST relation for every ordinary
+		// table / materialized view with at least one toastable (varlena)
+		// column (needs_toast_table, src/backend/catalog/toasting.c), plus
+		// any table carrying explicit `toast.*` storage parameters. Point
+		// reltoastrelid at the synthesized pg_toast_<oid> row emitted below
+		// so `reltoastrelid::regclass` resolves and pg_dump's toast LEFT JOIN
+		// re-emits the `toast.*` reloptions. Partitioned parents (relkind='p',
+		// no storage), views, sequences and foreign tables never get one.
+		// DU-002 slice 224 + M0118-0008 TOAST-exposure slice 1 (0118-0084).
+		// Auto-exposure is restricted to USER relations (OID >= 16384):
+		// goopg serves system catalogs virtually with no real heap storage,
+		// so attaching a reltoastrelid to e.g. pg_type/pg_attribute would make
+		// pg_amcheck follow the join and fail to open the non-existent toast
+		// heap. Explicit toast.* reloptions only ever land on user tables.
+		// hasToastRel is computed by tableHasToastRelation (shared with
+		// ToastRelName so exposure and regclass rendering stay in sync). The
+		// relkind 'r'/'m' filter lives inside that helper.
+		hasToastRel := tableHasToastRelation(t)
+		reltoastrelid := "0"
+		if hasToastRel {
+			reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
+		}
+		// relpages / reltuples: 0 until VACUUM or ANALYZE has run (Stats==nil),
+		// then the persisted block count and live-tuple estimate. Mirrors
+		// pg_class — a freshly created, never-analyzed relation reads back as
+		// relpages=0 / reltuples=-1 in real PG, but goopg has historically
+		// surfaced 0 here, so keep 0 for the unanalyzed case to avoid churning
+		// every catalog-reading test; populate the real counts once Stats lands.
+		// M0118-0008 (vacuum-no-cleanup-lock).
+		relpages := "0"
+		reltuples := "0"
+		if t.Stats != nil {
+			relpages = strconv.Itoa(t.Stats.Pages)
+			reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
+		}
+		replIdent := ReplIdentOrDefault(t.ReplicaIdentity) // relreplident (DU-002 slice 305)
+		// relhastriggers gates pg_dump's getTriggers: a table whose
+		// relhastriggers='f' is excluded from the tbloids array, so pg_dump
+		// never probes pg_trigger for it and the trigger is silently dropped.
+		// Project 't' whenever the table owns at least one trigger. DU-002 slice 319.
+		relHasTriggers := "f"
+		if len(t.Triggers) > 0 {
+			relHasTriggers = "t"
+		}
+		// relhasrules is true for a plain view whose pg_rewrite _RETURN rule
+		// was written with a canonical PG18 pg_node_tree ev_action (M0123-S3
+		// sub-slice 2c). RuleIsCanonical is only ever set on user views, so
+		// system-catalog virtual relations (RuleIsCanonical=false) stay 'f'.
+		// This mirrors the heap pg_class row buildUserPGClassRow writes so
+		// goopg's own introspection and the streamed catalog agree.
+		relHasRules := boolToPGChar(t.RuleIsCanonical)
+		// relacl — NULL until a GRANT records non-owner privileges, then the
+		// materialized aclitem[] (owner full + each grantee). pg_dump's
+		// getTables reads this directly and re-emits GRANTs (buildACLCommands,
+		// client-side). DU-002 slice 331. Sequences (relkind 'S') render with
+		// the sequence privilege set / owner default "rwU" so a GRANT … ON
+		// SEQUENCE round-trips against acldefault('s', owner). DU-002 slice 333.
+		// reloftype: the composite type OID for a typed table (`CREATE TABLE
+		// name OF type`), "0" otherwise. Hoisted to a local so the row literal
+		// keeps its single-token column width (and comment alignment). DU-002 slice 374.
+		relOfType := strconv.Itoa(int(t.OfTypeOID))
+		relacl := c.relaclTextLocked(t.OID)
+		if t.IsSequence {
+			relacl = c.relaclTextLockedSeq(t.OID)
+		}
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)),        // 0:  oid
+			t.Name,                          // 1:  relname
+			strconv.Itoa(int(nsOID)),        // 2:  relnamespace
+			"0",                             // 3:  reltype
+			relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
+			"10",                            // 5:  relowner (bootstrap superuser)
+			relam,                           // 6:  relam (heap=2; 0 for sequences)
+			strconv.Itoa(int(t.OID)),        // 7:  relfilenode
+			strconv.Itoa(int(t.Tablespace)), // 8:  reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
+			relpages,                        // 9:  relpages
+			reltuples,                       // 10: reltuples
+			c.relAllVisibleCell(t),          // 11: relallvisible
+			"0",                             // 12: relallfrozen
+			reltoastrelid,                   // 13: reltoastrelid
+			hasIdx,                          // 14: relhasindex
+			"f",                             // 15: relisshared
+			relpers,                         // 16: relpersistence
+			relkind,                         // 17: relkind
+			strconv.Itoa(len(t.Columns)),    // 18: relnatts
+			strconv.Itoa(relchecks),         // 19: relchecks
+			relHasRules,                     // 20: relhasrules
+			relHasTriggers,                  // 21: relhastriggers
+			func() string {
+				if len(c.partitionChildren[t.OID]) > 0 || len(c.inheritanceChildren[t.OID]) > 0 {
+					return "t"
+				}
+				return "f"
+			}(), // 22: relhassubclass
+			boolToPGChar(t.RowSecurity),      // 23: relrowsecurity (DU-002 slice 322)
+			boolToPGChar(t.ForceRowSecurity), // 24: relforcerowsecurity (DU-002 slice 322)
+			populated,                        // 25: relispopulated
+			replIdent,                        // 26: relreplident
+			isPartition,                      // 27: relispartition
+			"0",                              // 28: relrewrite
+			"0",                              // 29: relfrozenxid
+			"1",                              // 30: relminmxid
+			relacl,                           // 31: relacl (NULL until a table GRANT, slice 331)
+			reloptions,                       // 32: reloptions ({fillfactor=N} or NULL)
+			partBound,                        // 33: relpartbound
+		})
+		// Synthesize the TOAST relation (relkind='t') whenever the table owns
+		// one (hasToastRel: a toastable column or explicit `toast.*` reloptions).
+		// pg_dump joins to it via reltoastrelid and reads its reloptions (stored
+		// WITHOUT the `toast.` prefix), re-emitting them as `WITH (toast.<opt>='…')`.
+		// The TOAST row is filtered out of pg_dump's getTables WHERE
+		// (relkind IN r/S/v/c/m/f/p — not 't') so it is never dumped as an
+		// object; it exists only as a join target. Named pg_toast_<oid> in
+		// the pg_toast namespace (OID 99), mirroring PG. DU-002 slice 224 +
+		// M0118-0008 TOAST-exposure slice 1 (0118-0084).
+		if hasToastRel {
+			toastOID := int(t.OID) + toastRelidOffset
+			// reloptions is NULL unless the table set explicit toast.* params.
+			toastReloptions := ""
+			if len(t.ToastReloptions) > 0 {
+				toastReloptions = arrayTextLiteral(t.ToastReloptions)
 			}
-			// Resolve namespace OID from the schema registry.
-			schema := t.Schema
+			out = append(out, []string{
+				strconv.Itoa(toastOID), // 0:  oid
+				// relname honours an ALTER … RENAME override (slice 4).
+				c.toastDisplayNameLocked(uint32(toastOID), "pg_toast_"+strconv.Itoa(int(t.OID))), // 1:  relname
+				"99",                   // 2:  relnamespace (pg_toast)
+				"0",                    // 3:  reltype
+				"0",                    // 4:  reloftype
+				"10",                   // 5:  relowner
+				"0",                    // 6:  relam
+				strconv.Itoa(toastOID), // 7:  relfilenode
+				"0",                    // 8:  reltablespace
+				"0",                    // 9:  relpages
+				"0",                    // 10: reltuples
+				c.relAllVisibleCell(t), // 11: relallvisible
+				"0",                    // 12: relallfrozen
+				"0",                    // 13: reltoastrelid
+				"t",                    // 14: relhasindex (pg_toast_<oid>_index)
+				"f",                    // 15: relisshared
+				relpers,                // 16: relpersistence (inherits the table's)
+				"t",                    // 17: relkind (TOAST)
+				"3",                    // 18: relnatts (chunk_id, chunk_seq, chunk_data)
+				"0",                    // 19: relchecks
+				"f",                    // 20: relhasrules
+				"f",                    // 21: relhastriggers
+				"f",                    // 22: relhassubclass
+				"f",                    // 23: relrowsecurity
+				"f",                    // 24: relforcerowsecurity
+				"t",                    // 25: relispopulated
+				"n",                    // 26: relreplident
+				"f",                    // 27: relispartition
+				"0",                    // 28: relrewrite
+				"0",                    // 29: relfrozenxid
+				"1",                    // 30: relminmxid
+				"",                     // 31: relacl (NULL)
+				toastReloptions,        // 32: reloptions ({autovacuum_enabled=false})
+				"",                     // 33: relpartbound
+			})
+			// Synthesize the TOAST relation's unique btree index
+			// pg_toast_<oid>_index (relkind='i'), mirroring the index PG
+			// auto-creates on every TOAST relation's (chunk_id, chunk_seq).
+			// Lives in the pg_toast namespace (OID 99); the matching pg_index
+			// row (indexrelid=toastIdxOID, indrelid=toastOID) is emitted by the
+			// pg_index virtual builder. Isolation specs locate it via
+			// `indexrelid::regclass` from pg_index. M0118-0008 TOAST-exposure
+			// slice 3.
+			toastIdxOID := int(t.OID) + toastIndexOidOffset
+			out = append(out, []string{
+				strconv.Itoa(toastIdxOID), // 0:  oid
+				// relname honours an ALTER INDEX … RENAME override (slice 4).
+				c.toastDisplayNameLocked(uint32(toastIdxOID), "pg_toast_"+strconv.Itoa(int(t.OID))+"_index"), // 1:  relname
+				"99",                      // 2:  relnamespace (pg_toast)
+				"0",                       // 3:  reltype
+				"0",                       // 4:  reloftype
+				"10",                      // 5:  relowner
+				"403",                     // 6:  relam (btree)
+				strconv.Itoa(toastIdxOID), // 7:  relfilenode
+				"0",                       // 8:  reltablespace
+				"0",                       // 9:  relpages
+				"-1",                      // 10: reltuples (-1 = unknown for indexes)
+				c.relAllVisibleCell(t),    // 11: relallvisible
+				"0",                       // 12: relallfrozen
+				"0",                       // 13: reltoastrelid
+				"f",                       // 14: relhasindex
+				"f",                       // 15: relisshared
+				relpers,                   // 16: relpersistence (inherits the table's)
+				"i",                       // 17: relkind (index)
+				"2",                       // 18: relnatts (chunk_id, chunk_seq)
+				"0",                       // 19: relchecks
+				"f",                       // 20: relhasrules
+				"f",                       // 21: relhastriggers
+				"f",                       // 22: relhassubclass
+				"f",                       // 23: relrowsecurity
+				"f",                       // 24: relforcerowsecurity
+				"t",                       // 25: relispopulated
+				"n",                       // 26: relreplident
+				"f",                       // 27: relispartition
+				"0",                       // 28: relrewrite
+				"0",                       // 29: relfrozenxid
+				"1",                       // 30: relminmxid
+				"",                        // 31: relacl (NULL)
+				"",                        // 32: reloptions (NULL)
+				"",                        // 33: relpartbound
+			})
+		}
+	}
+	// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
+	idxKeys := make([]string, 0, len(c.ns(dbOid).indexes))
+	for k := range c.ns(dbOid).indexes {
+		idxKeys = append(idxKeys, k)
+	}
+	sort.Strings(idxKeys)
+	for _, k := range idxKeys {
+		idx := c.ns(dbOid).indexes[k]
+		// Resolve namespace from the index's table.
+		idxNsOID := uint32(2200)
+		if idx.Table != nil {
+			schema := idx.Table.Schema
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := c.schemas[strings.ToLower(schema)]
-			if nsOID == 0 {
-				nsOID = 2200 // default to public
-			}
-			// A temporary relation lives in its owning session's per-backend
-			// namespace (pg_temp_<id>), not public — mirrors PostgreSQL so a
-			// `WHERE relnamespace = pg_my_temp_schema()` scan finds it (and finds
-			// nothing once it is cleaned up). M0118-0009 (temp-schema-cleanup,
-			// design 0118-0091). Falls back to the schema OID for legacy
-			// session-less temp relations (TempOwner == "").
-			if t.Temp && t.TempOwner != "" {
-				if tns := c.tempNamespaceOIDLocked(t.TempOwner); tns != 0 {
-					nsOID = tns
-				}
-			}
-			hasIdx := "f"
-			if len(c.ns(dbOid).byTable[t.OID]) > 0 {
-				hasIdx = "t"
-			}
-			isPartition := "f"
-			if t.PartitionParentOID != 0 {
-				isPartition = "t"
-			}
-			// Build relpartbound: "FOR VALUES ..." string for partition children.
-			partBound := ""
-			if t.PartitionParentOID != 0 && len(t.PartitionBounds) > 0 {
-				partBound = FormatPartitionBound(t.PartitionBounds[0])
-			}
-			relpers := "p"
-			if t.Unlogged {
-				relpers = "u"
-			} else if t.Temp {
-				relpers = "t"
-			}
-			// relchecks must equal the number of contype='c' rows pg_constraint
-			// emits for this table (the visible, named+OID'd CHECK constraints).
-			// pg_dump gates its per-table CHECK query on relchecks>0 and then
-			// asserts the row count matches exactly (getTableAttrs), so a 0 here
-			// silently drops every CHECK from the dumped CREATE TABLE. M0110-0001.
-			relchecks := 0
-			for _, nc := range t.NamedChecks {
-				if nc.Name != "" && nc.OID != 0 {
-					relchecks++
-				}
-			}
-			// reloptions surfaces the table's storage parameters as a text[]
-			// array literal (`{fillfactor=70}`). Empty → "" → planner maps it to
-			// SQL NULL (DU-002 slice 47), so a plain table emits no WITH clause;
-			// a non-empty one round-trips through pg_dump as `WITH
-			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). BuildTableReloptions
-			// is the single source of truth (shared with executor.buildUserPGClassRow's
-			// heap-persisted row, M0119-0004) so the two never drift apart.
-			reloptions := BuildTableReloptions(t)
-			// reltoastrelid: PG auto-creates a TOAST relation for every ordinary
-			// table / materialized view with at least one toastable (varlena)
-			// column (needs_toast_table, src/backend/catalog/toasting.c), plus
-			// any table carrying explicit `toast.*` storage parameters. Point
-			// reltoastrelid at the synthesized pg_toast_<oid> row emitted below
-			// so `reltoastrelid::regclass` resolves and pg_dump's toast LEFT JOIN
-			// re-emits the `toast.*` reloptions. Partitioned parents (relkind='p',
-			// no storage), views, sequences and foreign tables never get one.
-			// DU-002 slice 224 + M0118-0008 TOAST-exposure slice 1 (0118-0084).
-			// Auto-exposure is restricted to USER relations (OID >= 16384):
-			// goopg serves system catalogs virtually with no real heap storage,
-			// so attaching a reltoastrelid to e.g. pg_type/pg_attribute would make
-			// pg_amcheck follow the join and fail to open the non-existent toast
-			// heap. Explicit toast.* reloptions only ever land on user tables.
-			// hasToastRel is computed by tableHasToastRelation (shared with
-			// ToastRelName so exposure and regclass rendering stay in sync). The
-			// relkind 'r'/'m' filter lives inside that helper.
-			hasToastRel := tableHasToastRelation(t)
-			reltoastrelid := "0"
-			if hasToastRel {
-				reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
-			}
-			// relpages / reltuples: 0 until VACUUM or ANALYZE has run (Stats==nil),
-			// then the persisted block count and live-tuple estimate. Mirrors
-			// pg_class — a freshly created, never-analyzed relation reads back as
-			// relpages=0 / reltuples=-1 in real PG, but goopg has historically
-			// surfaced 0 here, so keep 0 for the unanalyzed case to avoid churning
-			// every catalog-reading test; populate the real counts once Stats lands.
-			// M0118-0008 (vacuum-no-cleanup-lock).
-			relpages := "0"
-			reltuples := "0"
-			if t.Stats != nil {
-				relpages = strconv.Itoa(t.Stats.Pages)
-				reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
-			}
-			replIdent := ReplIdentOrDefault(t.ReplicaIdentity) // relreplident (DU-002 slice 305)
-			// relhastriggers gates pg_dump's getTriggers: a table whose
-			// relhastriggers='f' is excluded from the tbloids array, so pg_dump
-			// never probes pg_trigger for it and the trigger is silently dropped.
-			// Project 't' whenever the table owns at least one trigger. DU-002 slice 319.
-			relHasTriggers := "f"
-			if len(t.Triggers) > 0 {
-				relHasTriggers = "t"
-			}
-			// relhasrules is true for a plain view whose pg_rewrite _RETURN rule
-			// was written with a canonical PG18 pg_node_tree ev_action (M0123-S3
-			// sub-slice 2c). RuleIsCanonical is only ever set on user views, so
-			// system-catalog virtual relations (RuleIsCanonical=false) stay 'f'.
-			// This mirrors the heap pg_class row buildUserPGClassRow writes so
-			// goopg's own introspection and the streamed catalog agree.
-			relHasRules := boolToPGChar(t.RuleIsCanonical)
-			// relacl — NULL until a GRANT records non-owner privileges, then the
-			// materialized aclitem[] (owner full + each grantee). pg_dump's
-			// getTables reads this directly and re-emits GRANTs (buildACLCommands,
-			// client-side). DU-002 slice 331. Sequences (relkind 'S') render with
-			// the sequence privilege set / owner default "rwU" so a GRANT … ON
-			// SEQUENCE round-trips against acldefault('s', owner). DU-002 slice 333.
-			// reloftype: the composite type OID for a typed table (`CREATE TABLE
-			// name OF type`), "0" otherwise. Hoisted to a local so the row literal
-			// keeps its single-token column width (and comment alignment). DU-002 slice 374.
-			relOfType := strconv.Itoa(int(t.OfTypeOID))
-			relacl := c.relaclTextLocked(t.OID)
-			if t.IsSequence {
-				relacl = c.relaclTextLockedSeq(t.OID)
-			}
-			out = append(out, []string{
-				strconv.Itoa(int(t.OID)),        // 0:  oid
-				t.Name,                          // 1:  relname
-				strconv.Itoa(int(nsOID)),        // 2:  relnamespace
-				"0",                             // 3:  reltype
-				relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
-				"10",                            // 5:  relowner (bootstrap superuser)
-				relam,                           // 6:  relam (heap=2; 0 for sequences)
-				strconv.Itoa(int(t.OID)),        // 7:  relfilenode
-				strconv.Itoa(int(t.Tablespace)), // 8:  reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
-				relpages,                        // 9:  relpages
-				reltuples,                       // 10: reltuples
-				"0",                             // 11: relallvisible
-				"0",                             // 12: relallfrozen
-				reltoastrelid,                   // 13: reltoastrelid
-				hasIdx,                          // 14: relhasindex
-				"f",                             // 15: relisshared
-				relpers,                         // 16: relpersistence
-				relkind,                         // 17: relkind
-				strconv.Itoa(len(t.Columns)),    // 18: relnatts
-				strconv.Itoa(relchecks),         // 19: relchecks
-				relHasRules,                     // 20: relhasrules
-				relHasTriggers,                  // 21: relhastriggers
-				func() string {
-					if len(c.partitionChildren[t.OID]) > 0 || len(c.inheritanceChildren[t.OID]) > 0 {
-						return "t"
-					}
-					return "f"
-				}(), // 22: relhassubclass
-				boolToPGChar(t.RowSecurity),      // 23: relrowsecurity (DU-002 slice 322)
-				boolToPGChar(t.ForceRowSecurity), // 24: relforcerowsecurity (DU-002 slice 322)
-				populated,                        // 25: relispopulated
-				replIdent,                        // 26: relreplident
-				isPartition, // 27: relispartition
-				"0",         // 28: relrewrite
-				"0",         // 29: relfrozenxid
-				"1",         // 30: relminmxid
-				relacl,      // 31: relacl (NULL until a table GRANT, slice 331)
-				reloptions,  // 32: reloptions ({fillfactor=N} or NULL)
-				partBound,   // 33: relpartbound
-			})
-			// Synthesize the TOAST relation (relkind='t') whenever the table owns
-			// one (hasToastRel: a toastable column or explicit `toast.*` reloptions).
-			// pg_dump joins to it via reltoastrelid and reads its reloptions (stored
-			// WITHOUT the `toast.` prefix), re-emitting them as `WITH (toast.<opt>='…')`.
-			// The TOAST row is filtered out of pg_dump's getTables WHERE
-			// (relkind IN r/S/v/c/m/f/p — not 't') so it is never dumped as an
-			// object; it exists only as a join target. Named pg_toast_<oid> in
-			// the pg_toast namespace (OID 99), mirroring PG. DU-002 slice 224 +
-			// M0118-0008 TOAST-exposure slice 1 (0118-0084).
-			if hasToastRel {
-				toastOID := int(t.OID) + toastRelidOffset
-				// reloptions is NULL unless the table set explicit toast.* params.
-				toastReloptions := ""
-				if len(t.ToastReloptions) > 0 {
-					toastReloptions = arrayTextLiteral(t.ToastReloptions)
-				}
-				out = append(out, []string{
-					strconv.Itoa(toastOID), // 0:  oid
-					// relname honours an ALTER … RENAME override (slice 4).
-					c.toastDisplayNameLocked(uint32(toastOID), "pg_toast_"+strconv.Itoa(int(t.OID))), // 1:  relname
-					"99",                   // 2:  relnamespace (pg_toast)
-					"0",                    // 3:  reltype
-					"0",                    // 4:  reloftype
-					"10",                   // 5:  relowner
-					"0",                    // 6:  relam
-					strconv.Itoa(toastOID), // 7:  relfilenode
-					"0",                    // 8:  reltablespace
-					"0",                    // 9:  relpages
-					"0",                    // 10: reltuples
-					"0",                    // 11: relallvisible
-					"0",                    // 12: relallfrozen
-					"0",                    // 13: reltoastrelid
-					"t",                    // 14: relhasindex (pg_toast_<oid>_index)
-					"f",                    // 15: relisshared
-					relpers,                // 16: relpersistence (inherits the table's)
-					"t",                    // 17: relkind (TOAST)
-					"3",                    // 18: relnatts (chunk_id, chunk_seq, chunk_data)
-					"0",                    // 19: relchecks
-					"f",                    // 20: relhasrules
-					"f",                    // 21: relhastriggers
-					"f",                    // 22: relhassubclass
-					"f",                    // 23: relrowsecurity
-					"f",                    // 24: relforcerowsecurity
-					"t",                    // 25: relispopulated
-					"n",                    // 26: relreplident
-					"f",                    // 27: relispartition
-					"0",                    // 28: relrewrite
-					"0",                    // 29: relfrozenxid
-					"1",                    // 30: relminmxid
-					"",                     // 31: relacl (NULL)
-					toastReloptions,        // 32: reloptions ({autovacuum_enabled=false})
-					"",                     // 33: relpartbound
-				})
-				// Synthesize the TOAST relation's unique btree index
-				// pg_toast_<oid>_index (relkind='i'), mirroring the index PG
-				// auto-creates on every TOAST relation's (chunk_id, chunk_seq).
-				// Lives in the pg_toast namespace (OID 99); the matching pg_index
-				// row (indexrelid=toastIdxOID, indrelid=toastOID) is emitted by the
-				// pg_index virtual builder. Isolation specs locate it via
-				// `indexrelid::regclass` from pg_index. M0118-0008 TOAST-exposure
-				// slice 3.
-				toastIdxOID := int(t.OID) + toastIndexOidOffset
-				out = append(out, []string{
-					strconv.Itoa(toastIdxOID), // 0:  oid
-					// relname honours an ALTER INDEX … RENAME override (slice 4).
-					c.toastDisplayNameLocked(uint32(toastIdxOID), "pg_toast_"+strconv.Itoa(int(t.OID))+"_index"), // 1:  relname
-					"99",                      // 2:  relnamespace (pg_toast)
-					"0",                       // 3:  reltype
-					"0",                       // 4:  reloftype
-					"10",                      // 5:  relowner
-					"403",                     // 6:  relam (btree)
-					strconv.Itoa(toastIdxOID), // 7:  relfilenode
-					"0",                       // 8:  reltablespace
-					"0",                       // 9:  relpages
-					"-1",                      // 10: reltuples (-1 = unknown for indexes)
-					"0",                       // 11: relallvisible
-					"0",                       // 12: relallfrozen
-					"0",                       // 13: reltoastrelid
-					"f",                       // 14: relhasindex
-					"f",                       // 15: relisshared
-					relpers,                   // 16: relpersistence (inherits the table's)
-					"i",                       // 17: relkind (index)
-					"2",                       // 18: relnatts (chunk_id, chunk_seq)
-					"0",                       // 19: relchecks
-					"f",                       // 20: relhasrules
-					"f",                       // 21: relhastriggers
-					"f",                       // 22: relhassubclass
-					"f",                       // 23: relrowsecurity
-					"f",                       // 24: relforcerowsecurity
-					"t",                       // 25: relispopulated
-					"n",                       // 26: relreplident
-					"f",                       // 27: relispartition
-					"0",                       // 28: relrewrite
-					"0",                       // 29: relfrozenxid
-					"1",                       // 30: relminmxid
-					"",                        // 31: relacl (NULL)
-					"",                        // 32: reloptions (NULL)
-					"",                        // 33: relpartbound
-				})
+			if oid := c.schemas[strings.ToLower(schema)]; oid != 0 {
+				idxNsOID = oid
 			}
 		}
-		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
-		idxKeys := make([]string, 0, len(c.ns(dbOid).indexes))
-		for k := range c.ns(dbOid).indexes {
-			idxKeys = append(idxKeys, k)
+		// Determine relam for index: btree=403, hash=405, gist=783, gin=2742, spgist=4000, brin=3580.
+		idxRelam := "403" // default btree
+		if idx.Method == "hash" {
+			idxRelam = "405"
 		}
-		sort.Strings(idxKeys)
-		for _, k := range idxKeys {
-			idx := c.ns(dbOid).indexes[k]
-			// Resolve namespace from the index's table.
-			idxNsOID := uint32(2200)
-			if idx.Table != nil {
-				schema := idx.Table.Schema
-				if schema == "" {
-					schema = "public"
-				}
-				if oid := c.schemas[strings.ToLower(schema)]; oid != 0 {
-					idxNsOID = oid
-				}
+		idxPers := "p"
+		if idx.Table != nil {
+			if idx.Table.Unlogged {
+				idxPers = "u"
+			} else if idx.Table.Temp {
+				idxPers = "t"
 			}
-			// Determine relam for index: btree=403, hash=405, gist=783, gin=2742, spgist=4000, brin=3580.
-			idxRelam := "403" // default btree
-			if idx.Method == "hash" {
-				idxRelam = "405"
-			}
-			idxPers := "p"
-			if idx.Table != nil {
-				if idx.Table.Unlogged {
-					idxPers = "u"
-				} else if idx.Table.Temp {
-					idxPers = "t"
-				}
-			}
-			// 'I' = partitioned index (has partition children); 'i' = regular index.
-			hasIdxChildren := len(c.indexPartitionChildren[idx.OID]) > 0
-			idxRelkind := "i"
-			if hasIdxChildren {
-				idxRelkind = "I"
-			}
-			idxHasSubclass := "f"
-			if hasIdxChildren {
-				idxHasSubclass = "t"
-			}
-			// Index reloptions: `WITH (fillfactor=N[, deduplicate_items=on|off])`.
-			// pg_dump reads this via `t.reloptions AS indreloptions` (the index's
-			// own pg_class row) and re-emits `CREATE INDEX … WITH (…)`. Empty
-			// (NULL) when unset so a plain index dumps byte-identically. Options
-			// are joined in declaration-stable order (fillfactor first), mirroring
-			// the array order PG stores. DU-002 slices 218/219.
-			idxReloptions := BuildIndexReloptions(idx)
-			// reltablespace: 0 = default; explicit CREATE/ALTER INDEX ...
-			// TABLESPACE otherwise. Hoisted to a local so the row literal
-			// below keeps its single-token column width (and comment
-			// alignment), same convention as relOfType above. M0122-0007.
-			idxTablespace := strconv.Itoa(int(idx.Tablespace))
-			out = append(out, []string{
-				strconv.Itoa(int(idx.OID)),  // 0:  oid
-				idx.Name,                    // 1:  relname
-				strconv.Itoa(int(idxNsOID)), // 2:  relnamespace
-				"0",                         // 3:  reltype
-				"0",                         // 4:  reloftype
-				"10",                        // 5:  relowner
-				idxRelam,                    // 6:  relam
-				strconv.Itoa(int(idx.OID)),  // 7:  relfilenode
-				idxTablespace,               // 8:  reltablespace
-				"0",                         // 9:  relpages
-				"-1",                        // 10: reltuples (-1 = unknown for indexes)
-				"0",                         // 11: relallvisible
-				"0",                         // 12: relallfrozen
-				"0",                         // 13: reltoastrelid
-				"f",                         // 14: relhasindex
-				"f",                         // 15: relisshared
-				idxPers,                     // 16: relpersistence
-				idxRelkind,                  // 17: relkind
-				"0",                         // 18: relnatts
-				"0",                         // 19: relchecks
-				"f",                         // 20: relhasrules
-				"f",                         // 21: relhastriggers
-				idxHasSubclass,              // 22: relhassubclass
-				"f",                         // 23: relrowsecurity
-				"f",                         // 24: relforcerowsecurity
-				"t",                         // 25: relispopulated
-				"n",                         // 26: relreplident
-				"f",                         // 27: relispartition
-				"0",                         // 28: relrewrite
-				"0",                         // 29: relfrozenxid
-				"1",                         // 30: relminmxid
-				"",                          // 31: relacl (NULL)
-				idxReloptions,               // 32: reloptions ({fillfactor=N} or NULL)
-				"",                          // 33: relpartbound
-			})
 		}
-		// Emit the implicit relation (relkind='c') backing each composite type
-		// (`CREATE TYPE x AS (...)`). pg_dump's getTypes reads
-		// `(SELECT relkind FROM pg_class WHERE oid = typrelid)`, and
-		// selectDumpableType keeps the type only when that relkind is 'c'
-		// (RELKIND_COMPOSITE_TYPE) — otherwise the type is treated as a table
-		// rowtype and skipped. The companion pg_attribute field rows are
-		// heap-backed (written by syncCompositeTypeToCatalogHeap); pg_class is
-		// virtual, so the relation must be surfaced here too. A composite-type
-		// relation has no storage and no access method (relam=0, relfilenode=0).
-		// DU-002 slice 243.
-		ctKeys := make([]string, 0, len(c.compositeTypes))
-		for k := range c.compositeTypes {
-			ctKeys = append(ctKeys, k)
+		// 'I' = partitioned index (has partition children); 'i' = regular index.
+		hasIdxChildren := len(c.indexPartitionChildren[idx.OID]) > 0
+		idxRelkind := "i"
+		if hasIdxChildren {
+			idxRelkind = "I"
 		}
-		sort.Strings(ctKeys)
-		for _, k := range ctKeys {
-			ct := c.compositeTypes[k]
-			out = append(out, []string{
-				strconv.Itoa(int(ct.RelOID)), // 0:  oid
-				ct.Name,                      // 1:  relname
-				"2200",                       // 2:  relnamespace (public)
-				strconv.Itoa(int(ct.OID)),    // 3:  reltype (the composite pg_type OID)
-				"0",                          // 4:  reloftype
-				"10",                         // 5:  relowner
-				"0",                          // 6:  relam (no access method)
-				"0",                          // 7:  relfilenode (no storage)
-				"0",                          // 8:  reltablespace
-				"0",                          // 9:  relpages
-				"0",                          // 10: reltuples
-				"0",                          // 11: relallvisible
-				"0",                          // 12: relallfrozen
-				"0",                          // 13: reltoastrelid
-				"f",                          // 14: relhasindex
-				"f",                          // 15: relisshared
-				"p",                          // 16: relpersistence
-				"c",                          // 17: relkind (composite type)
-				strconv.Itoa(len(ct.Fields)), // 18: relnatts
-				"0",                          // 19: relchecks
-				"f",                          // 20: relhasrules
-				"f",                          // 21: relhastriggers
-				"f",                          // 22: relhassubclass
-				"f",                          // 23: relrowsecurity
-				"f",                          // 24: relforcerowsecurity
-				"t",                          // 25: relispopulated
-				"n",                          // 26: relreplident (no storage)
-				"f",                          // 27: relispartition
-				"0",                          // 28: relrewrite
-				"0",                          // 29: relfrozenxid (InvalidTransactionId)
-				"0",                          // 30: relminmxid
-				"",                           // 31: relacl (NULL)
-				"",                           // 32: reloptions (NULL)
-				"",                           // 33: relpartbound
-			})
+		idxHasSubclass := "f"
+		if hasIdxChildren {
+			idxHasSubclass = "t"
 		}
-		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
-		// PostgreSQL's pg_class is a real heap table; oid::int8 queries like
-		//   SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'
-		// must return 1259. M0097-0029.
+		// Index reloptions: `WITH (fillfactor=N[, deduplicate_items=on|off])`.
+		// pg_dump reads this via `t.reloptions AS indreloptions` (the index's
+		// own pg_class row) and re-emits `CREATE INDEX … WITH (…)`. Empty
+		// (NULL) when unset so a plain index dumps byte-identically. Options
+		// are joined in declaration-stable order (fillfactor first), mirroring
+		// the array order PG stores. DU-002 slices 218/219.
+		idxReloptions := BuildIndexReloptions(idx)
+		// reltablespace: 0 = default; explicit CREATE/ALTER INDEX ...
+		// TABLESPACE otherwise. Hoisted to a local so the row literal
+		// below keeps its single-token column width (and comment
+		// alignment), same convention as relOfType above. M0122-0007.
+		idxTablespace := strconv.Itoa(int(idx.Tablespace))
 		out = append(out, []string{
-			"1259",     // 0:  oid
-			"pg_class", // 1:  relname
-			"11",       // 2:  relnamespace (pg_catalog OID=11)
-			"0",        // 3:  reltype
-			"0",        // 4:  reloftype
-			"10",       // 5:  relowner
-			"2",        // 6:  relam (heap)
-			"1259",     // 7:  relfilenode
-			"0",        // 8:  reltablespace
-			"0",        // 9:  relpages
-			"0",        // 10: reltuples
-			"0",        // 11: relallvisible
-			"0",        // 12: relallfrozen
-			"0",        // 13: reltoastrelid
-			"t",        // 14: relhasindex
-			"t",        // 15: relisshared (pg_class is a shared catalog)
-			"p",        // 16: relpersistence
-			"r",        // 17: relkind
-			"34",       // 18: relnatts (34 columns, PG18-canonical)
-			"0",        // 19: relchecks
-			"f",        // 20: relhasrules
-			"f",        // 21: relhastriggers
-			"f",        // 22: relhassubclass
-			"f",        // 23: relrowsecurity
-			"f",        // 24: relforcerowsecurity
-			"t",        // 25: relispopulated
-			"n",        // 26: relreplident
-			"f",        // 27: relispartition
-			"0",        // 28: relrewrite
-			"0",        // 29: relfrozenxid
-			"1",        // 30: relminmxid
-			"",         // 31: relacl (NULL)
-			"",         // 32: reloptions (NULL)
-			"",         // 33: relpartbound
+			strconv.Itoa(int(idx.OID)),  // 0:  oid
+			idx.Name,                    // 1:  relname
+			strconv.Itoa(int(idxNsOID)), // 2:  relnamespace
+			"0",                         // 3:  reltype
+			"0",                         // 4:  reloftype
+			"10",                        // 5:  relowner
+			idxRelam,                    // 6:  relam
+			strconv.Itoa(int(idx.OID)),  // 7:  relfilenode
+			idxTablespace,               // 8:  reltablespace
+			"0",                         // 9:  relpages
+			"-1",                        // 10: reltuples (-1 = unknown for indexes)
+			"0",                         // 11: relallvisible (indexes: none)
+			"0",                         // 12: relallfrozen
+			"0",                         // 13: reltoastrelid
+			"f",                         // 14: relhasindex
+			"f",                         // 15: relisshared
+			idxPers,                     // 16: relpersistence
+			idxRelkind,                  // 17: relkind
+			"0",                         // 18: relnatts
+			"0",                         // 19: relchecks
+			"f",                         // 20: relhasrules
+			"f",                         // 21: relhastriggers
+			idxHasSubclass,              // 22: relhassubclass
+			"f",                         // 23: relrowsecurity
+			"f",                         // 24: relforcerowsecurity
+			"t",                         // 25: relispopulated
+			"n",                         // 26: relreplident
+			"f",                         // 27: relispartition
+			"0",                         // 28: relrewrite
+			"0",                         // 29: relfrozenxid
+			"1",                         // 30: relminmxid
+			"",                          // 31: relacl (NULL)
+			idxReloptions,               // 32: reloptions ({fillfactor=N} or NULL)
+			"",                          // 33: relpartbound
 		})
-		return out
+	}
+	// Emit the implicit relation (relkind='c') backing each composite type
+	// (`CREATE TYPE x AS (...)`). pg_dump's getTypes reads
+	// `(SELECT relkind FROM pg_class WHERE oid = typrelid)`, and
+	// selectDumpableType keeps the type only when that relkind is 'c'
+	// (RELKIND_COMPOSITE_TYPE) — otherwise the type is treated as a table
+	// rowtype and skipped. The companion pg_attribute field rows are
+	// heap-backed (written by syncCompositeTypeToCatalogHeap); pg_class is
+	// virtual, so the relation must be surfaced here too. A composite-type
+	// relation has no storage and no access method (relam=0, relfilenode=0).
+	// DU-002 slice 243.
+	ctKeys := make([]string, 0, len(c.compositeTypes))
+	for k := range c.compositeTypes {
+		ctKeys = append(ctKeys, k)
+	}
+	sort.Strings(ctKeys)
+	for _, k := range ctKeys {
+		ct := c.compositeTypes[k]
+		out = append(out, []string{
+			strconv.Itoa(int(ct.RelOID)), // 0:  oid
+			ct.Name,                      // 1:  relname
+			"2200",                       // 2:  relnamespace (public)
+			strconv.Itoa(int(ct.OID)),    // 3:  reltype (the composite pg_type OID)
+			"0",                          // 4:  reloftype
+			"10",                         // 5:  relowner
+			"0",                          // 6:  relam (no access method)
+			"0",                          // 7:  relfilenode (no storage)
+			"0",                          // 8:  reltablespace
+			"0",                          // 9:  relpages
+			"0",                          // 10: reltuples
+			"0",                          // 11: relallvisible (composite: no storage)
+			"0",                          // 12: relallfrozen
+			"0",                          // 13: reltoastrelid
+			"f",                          // 14: relhasindex
+			"f",                          // 15: relisshared
+			"p",                          // 16: relpersistence
+			"c",                          // 17: relkind (composite type)
+			strconv.Itoa(len(ct.Fields)), // 18: relnatts
+			"0",                          // 19: relchecks
+			"f",                          // 20: relhasrules
+			"f",                          // 21: relhastriggers
+			"f",                          // 22: relhassubclass
+			"f",                          // 23: relrowsecurity
+			"f",                          // 24: relforcerowsecurity
+			"t",                          // 25: relispopulated
+			"n",                          // 26: relreplident (no storage)
+			"f",                          // 27: relispartition
+			"0",                          // 28: relrewrite
+			"0",                          // 29: relfrozenxid (InvalidTransactionId)
+			"0",                          // 30: relminmxid
+			"",                           // 31: relacl (NULL)
+			"",                           // 32: reloptions (NULL)
+			"",                           // 33: relpartbound
+		})
+	}
+	// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
+	// PostgreSQL's pg_class is a real heap table; oid::int8 queries like
+	//   SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'
+	// must return 1259. M0097-0029.
+	out = append(out, []string{
+		"1259",     // 0:  oid
+		"pg_class", // 1:  relname
+		"11",       // 2:  relnamespace (pg_catalog OID=11)
+		"0",        // 3:  reltype
+		"0",        // 4:  reloftype
+		"10",       // 5:  relowner
+		"2",        // 6:  relam (heap)
+		"1259",     // 7:  relfilenode
+		"0",        // 8:  reltablespace
+		"0",        // 9:  relpages
+		"0",        // 10: reltuples
+		"0",        // 11: relallvisible (view/matview: none)
+		"0",        // 12: relallfrozen
+		"0",        // 13: reltoastrelid
+		"t",        // 14: relhasindex
+		"t",        // 15: relisshared (pg_class is a shared catalog)
+		"p",        // 16: relpersistence
+		"r",        // 17: relkind
+		"34",       // 18: relnatts (34 columns, PG18-canonical)
+		"0",        // 19: relchecks
+		"f",        // 20: relhasrules
+		"f",        // 21: relhastriggers
+		"f",        // 22: relhassubclass
+		"f",        // 23: relrowsecurity
+		"f",        // 24: relforcerowsecurity
+		"t",        // 25: relispopulated
+		"n",        // 26: relreplident
+		"f",        // 27: relispartition
+		"0",        // 28: relrewrite
+		"0",        // 29: relfrozenxid
+		"1",        // 30: relminmxid
+		"",         // 31: relacl (NULL)
+		"",         // 32: reloptions (NULL)
+		"",         // 33: relpartbound
+	})
+	return out
 }
 
 // StatTableScope selects which relations PGStatTablesRowsForDBOid emits, mirroring
@@ -7829,10 +7855,10 @@ func (c *InMemory) PGStatTablesRowsForDBOid(dbOid uint32, scope StatTableScope) 
 			"0",                      // 11: n_tup_del
 			"0",                      // 12: n_tup_hot_upd
 			"0",                      // 13: n_tup_newpage_upd
-			nLiveTup,   // 14: n_live_tup (reltuples estimate)
-			deadTup,    // 15: n_dead_tup
-			modSince,   // 16: n_mod_since_analyze
-			insSince,   // 17: n_ins_since_vacuum
+			nLiveTup,                 // 14: n_live_tup (reltuples estimate)
+			deadTup,                  // 15: n_dead_tup
+			modSince,                 // 16: n_mod_since_analyze
+			insSince,                 // 17: n_ins_since_vacuum
 			N,                        // 18: last_vacuum
 			N,                        // 19: last_autovacuum
 			N,                        // 20: last_analyze
@@ -8501,24 +8527,24 @@ func (c *InMemory) registerSystemTables() {
 				oid, // oid: conventional database OID (M0097-0021)
 				n,
 				strconv.FormatUint(uint64(c.DatabaseOwner(n)), 10), // datdba: real owner OID (M0122-0007), default BootstrapSuperuserOID (10)
-				"6", // encoding: 6 = UTF8
+				"6",          // encoding: 6 = UTF8
 				datallowconn, // datallowconn: allow connections
 				// datconnlimit: runtime override via `UPDATE pg_database SET
 				// datconnlimit = ...` (SetDatabaseConnLimit), default -1 = no
 				// limit (PG's pg_database.h default). vacuumdb/pg_amcheck
 				// filter on `datconnlimit <> -2`.
 				strconv.FormatInt(int64(c.DatabaseConnLimit(n)), 10),
-				datistemplate, // datistemplate: true for template0/template1
-				datFrozenStr,  // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2
-				"1",           // datminmxid: FirstMultiXactId bootstrap floor
-				"1663",        // dattablespace: pg_default (goopg v0 has no per-DB tablespace override)
-				"C",           // datcollate: fresh `initdb --locale=C` bootstrap value
-				"C",           // datctype: fresh `initdb --locale=C` bootstrap value
-				"c",           // datlocprovider: 'c' = libc (bootstrap default provider)
-				VirtualNull,   // datlocale: NULL under the libc provider
-				VirtualNull,   // daticurules: NULL (no ICU rules)
-				VirtualNull,   // datcollversion: NULL (recomputed on restore, mirrors pg_collation)
-				datacl,        // datacl: GRANT/REVOKE … ON DATABASE … projection (M0119-0004-ACLHEAP)
+				datistemplate,  // datistemplate: true for template0/template1
+				datFrozenStr,   // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2
+				"1",            // datminmxid: FirstMultiXactId bootstrap floor
+				"1663",         // dattablespace: pg_default (goopg v0 has no per-DB tablespace override)
+				"C",            // datcollate: fresh `initdb --locale=C` bootstrap value
+				"C",            // datctype: fresh `initdb --locale=C` bootstrap value
+				"c",            // datlocprovider: 'c' = libc (bootstrap default provider)
+				VirtualNull,    // datlocale: NULL under the libc provider
+				VirtualNull,    // daticurules: NULL (no ICU rules)
+				VirtualNull,    // datcollversion: NULL (recomputed on restore, mirrors pg_collation)
+				datacl,         // datacl: GRANT/REVOKE … ON DATABASE … projection (M0119-0004-ACLHEAP)
 				dathasloginevt, // dathasloginevt: any non-disabled `ON login` event trigger registered (M0134-0123)
 			})
 		}
@@ -10463,12 +10489,12 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(casts))
 		for _, cs := range casts {
 			out = append(out, []string{
-				strconv.FormatUint(uint64(cs.OID), 10),                // oid
+				strconv.FormatUint(uint64(cs.OID), 10),                       // oid
 				strconv.FormatUint(uint64(TypeNameToOID(cs.SourceType)), 10), // castsource
 				strconv.FormatUint(uint64(TypeNameToOID(cs.TargetType)), 10), // casttarget
-				strconv.FormatUint(uint64(cs.FuncOID), 10),            // castfunc (0 unless WITH FUNCTION)
-				cs.Context,                                            // castcontext
-				cs.Method,                                             // castmethod
+				strconv.FormatUint(uint64(cs.FuncOID), 10),                   // castfunc (0 unless WITH FUNCTION)
+				cs.Context, // castcontext
+				cs.Method,  // castmethod
 			})
 		}
 		return out
@@ -10501,11 +10527,11 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(transforms))
 		for _, tf := range transforms {
 			out = append(out, []string{
-				strconv.FormatUint(uint64(tf.OID), 10),                    // oid
+				strconv.FormatUint(uint64(tf.OID), 10),                     // oid
 				strconv.FormatUint(uint64(TypeNameToOID(tf.TypeName)), 10), // trftype
 				strconv.FormatUint(uint64(LanguageNameToOID(tf.Lang)), 10), // trflang
-				strconv.FormatUint(uint64(tf.FromFuncOID), 10),            // trffromsql (0 unless resolved)
-				strconv.FormatUint(uint64(tf.ToFuncOID), 10),              // trftosql (0 unless resolved)
+				strconv.FormatUint(uint64(tf.FromFuncOID), 10),             // trffromsql (0 unless resolved)
+				strconv.FormatUint(uint64(tf.ToFuncOID), 10),               // trftosql (0 unless resolved)
 			})
 		}
 		return out
@@ -10631,8 +10657,8 @@ func (c *InMemory) registerSystemTables() {
 				rightOID = TypeNameToOID(op.RightType)
 			}
 			out = append(out, []string{
-				strconv.FormatUint(uint64(op.OID), 10),                     // oid
-				op.Name,                                                   // oprname
+				strconv.FormatUint(uint64(op.OID), 10), // oid
+				op.Name,                                // oprname
 				strconv.FormatUint(uint64(op.NamespaceOIDOrDefault()), 10), // oprnamespace
 				strconv.FormatUint(uint64(op.OwnerOrDefault()), 10),        // oprowner
 				oprkind,                                  // oprkind
@@ -10640,7 +10666,7 @@ func (c *InMemory) registerSystemTables() {
 				boolToPGChar(op.CanHash),                 // oprcanhash
 				strconv.FormatUint(uint64(leftOID), 10),  // oprleft
 				strconv.FormatUint(uint64(rightOID), 10), // oprright
-				"0", // oprresult (not modeled; pg_dump never reads this column)
+				"0",                                      // oprresult (not modeled; pg_dump never reads this column)
 				strconv.FormatUint(uint64(op.CommutatorOID), 10), // oprcom
 				strconv.FormatUint(uint64(op.NegatorOID), 10),    // oprnegate
 				strconv.FormatUint(uint64(op.FuncOID), 10),       // oprcode
@@ -10705,9 +10731,9 @@ func (c *InMemory) registerSystemTables() {
 		out = append(out, builtinRows...)
 		for _, oc := range classes {
 			out = append(out, []string{
-				strconv.FormatUint(uint64(oc.OID), 10),                     // oid
-				strconv.FormatUint(uint64(oc.Method), 10),                  // opcmethod
-				oc.Name,                                                    // opcname
+				strconv.FormatUint(uint64(oc.OID), 10),    // oid
+				strconv.FormatUint(uint64(oc.Method), 10), // opcmethod
+				oc.Name, // opcname
 				strconv.FormatUint(uint64(oc.NamespaceOIDOrDefault()), 10), // opcnamespace
 				strconv.FormatUint(uint64(oc.OwnerOrDefault()), 10),        // opcowner
 				strconv.FormatUint(uint64(oc.FamilyOID), 10),               // opcfamily
@@ -10749,9 +10775,9 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(fams))
 		for _, f := range fams {
 			out = append(out, []string{
-				strconv.FormatUint(uint64(f.OID), 10),                     // oid
-				strconv.FormatUint(uint64(f.Method), 10),                  // opfmethod
-				f.Name,                                                    // opfname
+				strconv.FormatUint(uint64(f.OID), 10),    // oid
+				strconv.FormatUint(uint64(f.Method), 10), // opfmethod
+				f.Name,                                   // opfname
 				strconv.FormatUint(uint64(f.NamespaceOIDOrDefault()), 10), // opfnamespace
 				strconv.FormatUint(uint64(f.OwnerOrDefault()), 10),        // opfowner
 			})
@@ -10977,9 +11003,9 @@ func (c *InMemory) registerSystemTables() {
 				}
 				for seq, dictOID := range m.DictOIDs {
 					rows = append(rows, []string{
-						strconv.FormatUint(uint64(uc.OID), 10), // mapcfg
-						strconv.Itoa(tokID),                    // maptokentype
-						strconv.Itoa(seq + 1),                  // mapseqno (1-based)
+						strconv.FormatUint(uint64(uc.OID), 10),  // mapcfg
+						strconv.Itoa(tokID),                     // maptokentype
+						strconv.Itoa(seq + 1),                   // mapseqno (1-based)
 						strconv.FormatUint(uint64(dictOID), 10), // mapdict
 					})
 				}
@@ -11330,13 +11356,13 @@ func (c *InMemory) registerSystemTables() {
 				tags = arrayTextLiteral(et.Tags)
 			}
 			out = append(out, []string{
-				strconv.FormatUint(uint64(et.OID), 10),     // oid
-				et.Name,                                    // evtname
-				et.Event,                                   // evtevent
-				strconv.FormatUint(uint64(owner), 10),      // evtowner
+				strconv.FormatUint(uint64(et.OID), 10), // oid
+				et.Name,                                // evtname
+				et.Event,                               // evtevent
+				strconv.FormatUint(uint64(owner), 10),  // evtowner
 				strconv.FormatUint(uint64(et.FuncOID), 10), // evtfoid
-				et.Enabled,                                 // evtenabled
-				tags,                                       // evttags text[] ("{...}" or "" for NULL)
+				et.Enabled, // evtenabled
+				tags,       // evttags text[] ("{...}" or "" for NULL)
 			})
 		}
 		return out
@@ -13342,35 +13368,35 @@ func (c *InMemory) CreateExtension(name, schema, version, database string, ifNot
 	return nil
 }
 
+// DropExtension removes a runtime pg_extension entry (DROP EXTENSION).
+// The caller (execDropCompat) has already validated the extension exists and
+// captured its OID for heap cleanup.
+func (c *InMemory) DropExtension(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.extensions, strings.ToLower(name))
+}
 
-	// DropExtension removes a runtime pg_extension entry (DROP EXTENSION).
-	// The caller (execDropCompat) has already validated the extension exists and
-	// captured its OID for heap cleanup.
-	func (c *InMemory) DropExtension(name string) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		delete(c.extensions, strings.ToLower(name))
+// CreateExtensionDuringRecovery re-registers an extension at startup from the
+// pg_extension heap (M0130-S3). Unlike CreateExtension (which mints a new OID
+// via nextOID++), this records the pg_extension-derived OID verbatim so the
+// reloaded extensions match their on-disk OIDs.
+func (c *InMemory) CreateExtensionDuringRecovery(name, schema, version, database string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.extensions[lc]; ok {
+		return // already registered
 	}
+	c.extensions[lc] = &extensionRow{
+		oid:      oid,
+		name:     name,
+		schema:   schema,
+		version:  version,
+		database: database,
+	}
+}
 
-	// CreateExtensionDuringRecovery re-registers an extension at startup from the
-	// pg_extension heap (M0130-S3). Unlike CreateExtension (which mints a new OID
-	// via nextOID++), this records the pg_extension-derived OID verbatim so the
-	// reloaded extensions match their on-disk OIDs.
-	func (c *InMemory) CreateExtensionDuringRecovery(name, schema, version, database string, oid uint32) {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		lc := strings.ToLower(name)
-		if _, ok := c.extensions[lc]; ok {
-			return // already registered
-		}
-		c.extensions[lc] = &extensionRow{
-			oid:      oid,
-			name:     name,
-			schema:   schema,
-			version:  version,
-			database: database,
-		}
-	}
 // ExtensionOID returns the runtime pg_extension OID for the named extension, or
 // 0 if no extension by that name is installed. Used by COMMENT ON EXTENSION to
 // key the pg_description row on the extension's catalog OID (classoid 3079) so
@@ -13948,14 +13974,14 @@ func (c *InMemory) PGConversionRowsForDBOid(dbOid uint32) [][]string {
 			}
 		}
 		out = append(out, []string{
-			strconv.FormatUint(uint64(cv.OID), 10),          // oid
-			cv.Name,                                          // conname
+			strconv.FormatUint(uint64(cv.OID), 10), // oid
+			cv.Name,                                // conname
 			strconv.FormatUint(uint64(cv.NamespaceOID), 10), // connamespace
 			strconv.FormatUint(uint64(cv.Owner), 10),        // conowner
 			strconv.FormatInt(int64(cv.ForEncoding), 10),    // conforencoding
 			strconv.FormatInt(int64(cv.ToEncoding), 10),     // contoencoding
-			conproc,                                          // conproc (regproc text)
-			condefault,                                       // condefault
+			conproc,    // conproc (regproc text)
+			condefault, // condefault
 		})
 	}
 	return out
@@ -14081,7 +14107,7 @@ func (c *InMemory) PGTSDictRowsForDBOid(dbOid uint32) [][]string {
 	dicts := c.ListUserTSDictsForDBOid(dbOid)
 	rows := make([][]string, 0, len(dicts)+1)
 	rows = append(rows, []string{
-		strconv.FormatUint(uint64(BuiltinTSDictOID["simple"]), 10),   // oid
+		strconv.FormatUint(uint64(BuiltinTSDictOID["simple"]), 10), // oid
 		"simple", // dictname
 		"11",     // dictnamespace (pg_catalog OID=11)
 		"10",     // dictowner (bootstrap superuser)
@@ -14814,8 +14840,8 @@ func (c *InMemory) PGTSConfigRowsForDBOid(dbOid uint32) [][]string {
 	rows := make([][]string, 0, len(cfgs))
 	for _, uc := range cfgs {
 		rows = append(rows, []string{
-			strconv.FormatUint(uint64(uc.OID), 10),          // oid
-			uc.Name,                                         // cfgname
+			strconv.FormatUint(uint64(uc.OID), 10), // oid
+			uc.Name,                                // cfgname
 			strconv.FormatUint(uint64(uc.NamespaceOID), 10), // cfgnamespace
 			strconv.FormatUint(uint64(uc.Owner), 10),        // cfgowner
 			strconv.FormatUint(uint64(uc.Parser), 10),       // cfgparser
@@ -15258,10 +15284,10 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 			classOrFamilyDeptype = "a"
 		}
 		rows = append(rows, []string{
-			"2602", // 0: classid    = pg_amop
+			"2602",                                // 0: classid    = pg_amop
 			strconv.FormatUint(uint64(m.OID), 10), // 1: objid  = amop entry OID
-			"0",    // 2: objsubid
-			"2617", // 3: refclassid = pg_operator
+			"0",                                   // 2: objsubid
+			"2617",                                // 3: refclassid = pg_operator
 			strconv.FormatUint(uint64(m.OperOID), 10), // 4: refobjid = operator OID
 			"0",        // 5: refobjsubid
 			refDeptype, // 6: deptype = NORMAL (hard) or AUTO (loose)
@@ -15353,42 +15379,42 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 			continue
 		}
 		rows = append(rows, []string{
-			"2616", // 0: classid    = pg_opclass
+			"2616",                                 // 0: classid    = pg_opclass
 			strconv.FormatUint(uint64(oc.OID), 10), // 1: objid = opclass OID
-			"0",    // 2: objsubid
-			"2753", // 3: refclassid = pg_opfamily
+			"0",                                    // 2: objsubid
+			"2753",                                 // 3: refclassid = pg_opfamily
 			strconv.FormatUint(uint64(oc.FamilyOID), 10), // 4: refobjid = owning family OID
 			"0", // 5: refobjsubid
 			"a", // 6: deptype = AUTO
 		})
 	}
 
-		// Table inheritance (CREATE TABLE child INHERITS (parent)): each
-		// parent→child edge records a NORMAL ('n') pg_depend row so pg_dump's
-		// dependency-based topological sort outputs parent tables before
-		// children. PostgreSQL's StoreCatalogInheritance
-		// (src/backend/commands/tablecmds.c) records this as:
-		//   classid = pg_class, objid = child_oid, objsubid = 0
-		//   refclassid = pg_class, refobjid = parent_oid, refobjsubid = 0
-		//   deptype = 'n' (DEPENDENCY_NORMAL)
-		// DU-002 (M0119-0004): fixes pg_dump output ordering for inherited
-		// tables when a per-database-namespace catalog is in use.
-		for _, t := range c.ns(dbOid).tables {
-			if len(t.InheritsParentOIDs) == 0 {
-				continue
-			}
-			for _, parentOID := range t.InheritsParentOIDs {
-				rows = append(rows, []string{
-					"1259",                          // 0: classid    = pg_class
-					strconv.Itoa(int(t.OID)),        // 1: objid      = child table OID
-					"0",                             // 2: objsubid
-					"1259",                          // 3: refclassid = pg_class
-					strconv.Itoa(int(parentOID)),    // 4: refobjid   = parent table OID
-					"0",                             // 5: refobjsubid
-					"n",                             // 6: deptype    = NORMAL
-				})
-			}
+	// Table inheritance (CREATE TABLE child INHERITS (parent)): each
+	// parent→child edge records a NORMAL ('n') pg_depend row so pg_dump's
+	// dependency-based topological sort outputs parent tables before
+	// children. PostgreSQL's StoreCatalogInheritance
+	// (src/backend/commands/tablecmds.c) records this as:
+	//   classid = pg_class, objid = child_oid, objsubid = 0
+	//   refclassid = pg_class, refobjid = parent_oid, refobjsubid = 0
+	//   deptype = 'n' (DEPENDENCY_NORMAL)
+	// DU-002 (M0119-0004): fixes pg_dump output ordering for inherited
+	// tables when a per-database-namespace catalog is in use.
+	for _, t := range c.ns(dbOid).tables {
+		if len(t.InheritsParentOIDs) == 0 {
+			continue
 		}
+		for _, parentOID := range t.InheritsParentOIDs {
+			rows = append(rows, []string{
+				"1259",                       // 0: classid    = pg_class
+				strconv.Itoa(int(t.OID)),     // 1: objid      = child table OID
+				"0",                          // 2: objsubid
+				"1259",                       // 3: refclassid = pg_class
+				strconv.Itoa(int(parentOID)), // 4: refobjid   = parent table OID
+				"0",                          // 5: refobjsubid
+				"n",                          // 6: deptype    = NORMAL
+			})
+		}
+	}
 
 	// CREATE OPERATOR: makeOperatorDependencies (pg_operator.c) records a
 	// NORMAL ('n') dependency from the operator onto its namespace, left/
@@ -15419,9 +15445,9 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 			return
 		}
 		rows = append(rows, []string{
-			"2617", // 0: classid    = pg_operator
+			"2617",                                // 0: classid    = pg_operator
 			strconv.FormatUint(uint64(opOID), 10), // 1: objid = operator OID
-			"0",    // 2: objsubid
+			"0",                                   // 2: objsubid
 			strconv.FormatUint(uint64(refClassOID), 10), // 3: refclassid
 			strconv.FormatUint(uint64(refObjOID), 10),   // 4: refobjid
 			"0", // 5: refobjsubid
@@ -15675,9 +15701,9 @@ func (c *InMemory) PGTriggerRowsForDBOid(dbOid uint32) [][]string {
 				}
 			}
 			row[10] = tgconstraint                      // tgconstraint
-			row[11] = tgdeferrable                       // tgdeferrable
-			row[12] = tginitdeferred                     // tginitdeferred
-			row[13] = fmt.Sprintf("%d", len(trig.Args))  // tgnargs
+			row[11] = tgdeferrable                      // tgdeferrable
+			row[12] = tginitdeferred                    // tginitdeferred
+			row[13] = fmt.Sprintf("%d", len(trig.Args)) // tgnargs
 			// tgattr (int2vector→int2[], space-separated like pg_index.indkey):
 			// the 1-based attnums of an `UPDATE OF col1, col2` column list, or
 			// empty for every non-column-specific trigger. DU-002 slice 326.
@@ -18758,7 +18784,7 @@ func (c *InMemory) PGUserMappingsRowsForDBOid(dbOid uint32) [][]string {
 			umuser = oid
 		}
 		out = append(out, []string{
-			strconv.FormatUint(uint64(m.OID), 10),                                  // umid
+			strconv.FormatUint(uint64(m.OID), 10),                                // umid
 			strconv.FormatUint(uint64(c.ForeignServerOID(m.SrvName, dbOid)), 10), // srvid
 			m.SrvName,                              // srvname
 			strconv.FormatUint(uint64(umuser), 10), // umuser
@@ -22706,9 +22732,9 @@ func (c *InMemory) LookupCompositeTypeByArrayOID(oid uint32) (*CompositeType, bo
 // pgOpclassEntry list (executor/catalog cannot import initdb — import
 // cycle — see pgTypeColumnsPG18 for the same duplication pattern).
 type builtinOpclassInfo struct {
-	OID      uint32
-	Name     string
-	Family   uint32
+	OID       uint32
+	Name      string
+	Family    uint32
 	IntypeOID uint32
 }
 
@@ -22795,10 +22821,10 @@ func builtinOpclassRowByOID(oid uint32) ([]string, bool) {
 		return []string{
 			strconv.FormatUint(uint64(oc.OID), 10),               // oid
 			strconv.FormatUint(uint64(btreeAccessMethodOID), 10), // opcmethod
-			oc.Name,                                    // opcname
-			"11",                                        // opcnamespace = pg_catalog
-			"10",                                        // opcowner = bootstrap superuser
-			strconv.FormatUint(uint64(oc.Family), 10),   // opcfamily
+			oc.Name, // opcname
+			"11",    // opcnamespace = pg_catalog
+			"10",    // opcowner = bootstrap superuser
+			strconv.FormatUint(uint64(oc.Family), 10),    // opcfamily
 			strconv.FormatUint(uint64(oc.IntypeOID), 10), // opcintype
 			"t", // opcdefault
 			"0", // opckeytype

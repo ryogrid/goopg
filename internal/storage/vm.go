@@ -216,3 +216,21 @@ func PageAllFrozen(p Page, freezeBelow TransactionID) bool {
 	}
 	return true
 }
+
+// CountAllVisible returns the number of blocks with the ALL_VISIBLE bit set
+// for rel (pg_class.relallvisible). 0 for nil receiver.
+func (v *VisibilityMap) CountAllVisible(rel RelFileNode) int32 {
+	if v == nil {
+		return 0
+	}
+	key := vmKeyFor(rel)
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	n := int32(0)
+	for _, mask := range v.pages[key] {
+		if mask&VMAllVisible != 0 {
+			n++
+		}
+	}
+	return n
+}

@@ -516,6 +516,7 @@ const (
 	roleGrantOptSetSpecified     = 1 << 4
 	roleGrantOptSetValue         = 1 << 5
 )
+
 // EncodeXactAssignment encodes a subxact XID assignment record (M0050-0003).
 // parentXid is the top-level transaction; subXids lists the subxact XIDs
 // that are now children of parentXid. Replay calls Manager.RegisterSubXid
@@ -1190,6 +1191,52 @@ func DecodeSmgrCreate(payload []byte) (rel storage.RelFileNode, err error) {
 		Fork:   storage.ForkNumber(payload[9]),
 	}
 	return
+}
+
+// RecordKindSmgrTruncateTo logs a truncation to an explicit block count
+// (parity bundle E2: vacuum tail truncation needs to-N, not just to-0).
+const RecordKindSmgrTruncateTo byte = 18
+
+// EncodeSmgrTruncateTo encodes a truncate-to-N record:
+// kind(1) db(4) rel(4) fork(1) nblocks(4 LE).
+func EncodeSmgrTruncateTo(rel storage.RelFileNode, nBlocks uint32) []byte {
+	out := make([]byte, smgrRecordSize+4)
+	out[0] = RecordKindSmgrTruncateTo
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], nBlocks)
+	return out
+}
+
+// DecodeSmgrTruncateTo decodes a truncate-to-N record payload.
+func DecodeSmgrTruncateTo(payload []byte) (rel storage.RelFileNode, nBlocks uint32, err error) {
+	if len(payload) < smgrRecordSize+4 {
+		err = fmt.Errorf("wal: invalid smgr-truncate-to payload len %d (want %d)", len(payload), smgrRecordSize+4)
+		return
+	}
+	if payload[0] != RecordKindSmgrTruncateTo {
+		err = fmt.Errorf("wal: record kind %d is not smgr-truncate-to", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	nBlocks = binary.LittleEndian.Uint32(payload[10:14])
+	return
+}
+
+func replaySmgrTruncateTo(mgr *storage.Manager, payload []byte) error {
+	rel, nBlocks, err := DecodeSmgrTruncateTo(payload)
+	if err != nil {
+		return err
+	}
+	if rel.Fork != storage.MainFork {
+		return nil // auxiliary forks have no tail-truncation semantics yet
+	}
+	return mgr.TruncateRelationTo(rel, storage.BlockNumber(nBlocks))
 }
 
 // EncodeSmgrTruncate encodes a relation-file truncation record.
@@ -2308,6 +2355,11 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	case RecordKindSmgrTruncateTo:
+		if err := replaySmgrTruncateTo(mgr, r.Payload); err != nil {
+			return false, err
+		}
+		return true, nil
 	default:
 		return false, fmt.Errorf("unsupported kind %d", r.Payload[0])
 	}
@@ -2328,6 +2380,7 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindBtreeMarkPageHalfDead,
 		RecordKindHeapFreeze,
 		RecordKindHeapUpdate,
+		RecordKindSmgrTruncateTo,
 		RecordKindHeapMultiInsert,
 		RecordKindHeapVisible,
 		RecordKindBtreeReusePage,

@@ -49,9 +49,14 @@ dead-tuple/mod-count accounting, autoanalyze upgraded to the sampled
 analyzer, cost-based throttling, missing GUC registrations + sample-file
 sync, relallvisible publish.
 
-Documented deferrals (not this task): VACUUM FULL physical rewrite, CLUSTER
-physical reorder, partitioned-parent inherited stats aggregation,
-vacuum_failsafe_age emergency machinery, eager scanning, parallel vacuum.
+Follow-up round also implemented: tail truncation (WAL-first,
+RecordKindSmgrTruncateTo), relallvisible publish, failsafe escalation,
+partitioned-parent row/page rollup.
+
+Still deferred deliberately: VACUUM FULL / CLUSTER physical rewrites (require
+transactional relfilenode-swap WAL machinery — a dedicated milestone; doing
+them without it would be crash-unsafe), multixact freeze bookkeeping,
+eager scanning, parallel vacuum workers, parent-level column-stat merges.
 
 ## Implementation status
 

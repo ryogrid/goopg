@@ -14,14 +14,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/goopg/goopg/internal/utils/activity"
-	"github.com/goopg/goopg/internal/storage/aio"
-	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/access/transam/control"
-	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/access/transam"
-	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/storage/aio"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // Runtime is the bundle of long-lived handles a running goopg
@@ -2269,14 +2269,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 
-	// M0130-S3: restore runtime CREATE EXTENSION entries from the pg_extension
-	// heap so installed extensions are visible after a restart.
-	if err := reloadUserExtensionsFromHeap(mgr, cat, clog); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: pg_extension reload: %w", err)
-	}
+		// M0130-S3: restore runtime CREATE EXTENSION entries from the pg_extension
+		// heap so installed extensions are visible after a restart.
+		if err := reloadUserExtensionsFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: pg_extension reload: %w", err)
+		}
 		return nil, fmt.Errorf("goopg: pg_collation reload: %w", err)
 	}
 	if err := reloadUserConversionsFromHeap(mgr, cat, clog); err != nil {
@@ -2513,6 +2513,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: vm load: %w", err)
+	}
+
+	// Parity bundle E3: publish relallvisible into pg_class view rows.
+	catalog.RelAllVisibleFunc = func(dbOid, relOid uint32) int32 {
+		return rt.VM.CountAllVisible(storage.RelFileNode{DBOid: dbOid, RelOid: relOid})
 	}
 
 	// M0130-S1: load persistent FSM state from per-relation. Same shape /
@@ -3154,10 +3159,10 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		}
 
 		tbl := &catalog.Table{
-			Schema:         schema,
-			Name:           tr.RelName,
-			Columns:        cols,
-			OID:            tr.OID,
+			Schema:  schema,
+			Name:    tr.RelName,
+			Columns: cols,
+			OID:     tr.OID,
 			// M0125-0043: the sibling of the CREATE-TABLE site in
 			// internal/executor/operators_ddl.go — this used to reload
 			// `SmallDimension` from the literal relation names "region" /

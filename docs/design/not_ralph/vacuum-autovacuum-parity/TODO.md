@@ -36,8 +36,12 @@
 ## Phase E — extras
 - [x] E1 Cost model in vacuumCore (proportional sleep ≤4×delay; inert when
       vacuum_cost_delay=0 / autovacuum default 2ms active for launcher)
-- [ ] E2 Tail truncation — DEFERRED (see below)
-- [ ] E3 relallvisible publish — DEFERRED (see below)
+- [x] E2 Tail truncation: Pool.TruncateRelationTail (WAL-first via new
+      RecordKindSmgrTruncateTo=18 encode/decode/replay + invalidation +
+      smgr shrink), honored vacuum_truncate/NoTruncate;
+      TestVacuumTailTruncation
+- [x] E3 relallvisible publish: catalog.RelAllVisibleFunc hook wired from
+      bootstrap VM; table rows render real counts (index/composite rows stay 0)
 
 ## Phase F — verification & wrap-up
 - [x] F1 Unit tests: VM skip counts/aggressive/all-frozen bits
@@ -51,16 +55,19 @@
       autoanalyze produced columns=2 sampled stats
 - [ ] F4 Results appended to this bundle; final commit `-n` + push
 
-## Deferred discovered during implementation
-- Tail truncation (E2): capability exists (smgr.TruncateRelationTo +
-  InvalidateBlock + RecordKindSmgrTruncate replay) but no runtime WAL
-  emitter — shipping truncation without its WAL record risks crash-safety;
-  resume = wire emitter then vacuumCore tail pass.
-- relallvisible publish (E3): pg_class view column exists hardcoded "0";
-  needs a catalog↔executor hook (pattern: UserTableTriggerStatsFunc).
+## Follow-up round (same task, review of deferrals)
+- [x] Failsafe escalation: vacuum_failsafe_age reached => aggressive +
+      cost-delay off for that pass (03 F-failsafe)
+- [x] Partitioned-parent rollup: ANALYZE aggregates children RowCount/Pages
+      into the parent sidecar (column stats still per-child)
 
-## Deferred (documented, not this task)
-- VACUUM FULL physical rewrite; CLUSTER reorder
+## Deferred (documented, NOT safely implementable without new machinery)
+- VACUUM FULL physical rewrite; CLUSTER reorder — both need transactional
+  relfilenode-swap with dedicated WAL (new-record + replay + catalog swap),
+  i.e. a dedicated milestone. Rushing them without the WAL story would be
+  crash-unsafe, which violates the project's durability bar.
+- Multixact freeze bookkeeping (relminmxid); failsafe EAGER scanning;
+  parallel workers; partitioned-parent COLUMN stats merge.
 - Partitioned-parent inherited stats
 - failsafe/eager-scan machinery; parallel workers
 - multixact freeze bookkeeping (relminmxid)
