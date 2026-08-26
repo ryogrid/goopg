@@ -598,23 +598,56 @@ type colSpec struct {
 // tableElem is one element of a CREATE TABLE parens list: a column spec or a
 // table-level PRIMARY KEY / UNIQUE marker.
 type tableElem struct {
-	col   *colSpec
-	pk    []string
-	uq    [][]string
-	check string
-	fkDef *parser.TableForeignKeyDef
+	col        *colSpec
+	pk         []string
+	uq         [][]string
+	check      string
+	checkName  string
+	fkDef      *parser.TableForeignKeyDef
+	namedPk    *parser.TableConstraintDef
+	namedUq    *parser.TableConstraintDef
+	withPairs  [][2]string
+	inherits   []parser.ObjectName
+	asSelect   *parser.SelectStmt
+	partition  *parser.PartitionByClause
 }
 
 // colConstraints accumulates a column's constraint suffix in CREATE TABLE.
 type colConstraints struct {
-	args      []int64
-	notNull   bool
-	primary   bool
-	unique    bool
-	defExpr   parser.Expr
-	checkText string
-	fk        *fkInfo
+	args       []int64
+	notNull    bool
+	primary    bool
+	unique     bool
+	defExpr    parser.Expr
+	checkText  string
+	checkName  string
+	nnName     string
+	uqName     string
+	fk         *fkInfo
 }
+
+// createTail accumulates trailing CREATE TABLE options (WITH/INHERITS/
+// PARTITION BY/AS).
+type createTail struct {
+	withPairs [][2]string
+	inherits  []parser.ObjectName
+	partition *parser.PartitionByClause
+	asSelect  *parser.SelectStmt
+}
+
+// partKey is one PARTITION BY key element.
+type partKey struct {
+	name string
+	pos  int
+	expr parser.Expr
+}
+
+// partMethod carries the PARTITION BY strategy word + its byte position.
+type partMethod struct {
+	method string
+	pos    int
+}
+
 
 // colConstraint is one parsed column-constraint keyword group.
 type colConstraint struct {

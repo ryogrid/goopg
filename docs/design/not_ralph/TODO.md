@@ -282,8 +282,12 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   (CheckExpr = RAW SOURCE span via lexerState.src plumbing: RouteBatch/
   RouteExprBatch now carry src; markSpanStart/spanText replicate legacy
   captureSrcSpan. FK column+table-level incl. ON DELETE/UPDATE actions;
-  known S/R on NOT = DEFAULT-expr vs SET-DEFAULT, shift correct), named
-  constraints, WITH options, partitioning, INHERITS, OF type, AS SELECT,
+  known S/R on NOT = DEFAULT-expr vs SET-DEFAULT, shift correct), NAMED column/table
+  constraints (CONSTRAINT name NOT NULL/PK/UNIQUE/CHECK) landed; WITH
+  options / INHERITS / PARTITION BY / AS SELECT attempted via an open
+  left-recursive option list -> 29 conflicts (each option keyword fights the
+  empty-reduce). NEXT APPROACH: upstream's FIXED clause order as one flat
+  rule (optwith optimherits partitionspec as-select), not open composition, partitioning, INHERITS, OF type, AS SELECT,
   TEMP/UNLOGGED/IF NOT EXISTS, then the dispatch refinement + flip.
 - [ ] **P4.1 CREATE TABLE columns+constraints**: column defs (types, DEFAULT,
   NOT NULL, GENERATED, collation), column + table-level constraints.

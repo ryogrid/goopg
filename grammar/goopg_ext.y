@@ -94,6 +94,15 @@ table_element:
 			}
 	| PRIMARY KEY pk_cols   { $$ = &tableElem{pk: $3} }
 	| UNIQUE uq_cols        { $$ = &tableElem{} }
+	| CONSTRAINT ColId PRIMARY KEY pk_cols
+			{
+				d := parser.NewTableConstraintDef($2, $5, true)
+				$$ = &tableElem{pk: $5, namedPk: d}
+			}
+	| CONSTRAINT ColId UNIQUE uq_cols
+			{ $$ = &tableElem{namedUq: parser.NewTableConstraintDef($2, $4, false)} }
+	| CONSTRAINT ColId CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
+			{ $$ = &tableElem{check: yylex.(*lexerState).spanText(), checkName: $2} }
 
 pk_cols:
 		'(' colid_list ')'   { $$ = $2 }
@@ -150,3 +159,4 @@ opt_restart:
 		/* empty */            { $$ = false }
 	| RESTART IDENTITY_P       { $$ = true }
 	| CONTINUE_P IDENTITY_P   { $$ = false }
+

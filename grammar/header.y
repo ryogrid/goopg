@@ -54,6 +54,7 @@ import (
 	ct     castType
 	isrc   *insSrc
 	onames []parser.ObjectName
+	wp     [2]string
 	oc     *parser.OnConflictClause
 	oct    *parser.OnConflictTarget
 	ualist []parser.UpdateAssign
