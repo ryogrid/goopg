@@ -538,18 +538,39 @@ all now FIXED, plus one deferred:
 - [ ] **DEFERRED — a PARENTHESIZED select cannot be a set-operation operand.**
   `((SELECT ...) EXCEPT (SELECT ...))` fails at the operator, though the
   unparenthesized `(SELECT ... EXCEPT SELECT ...)` parses. Legacy accepts both.
-  Affects TPC-DS Q87 (and `query_0.sql`).
-  **Resume point:** upstream layers this as `select_clause: simple_select |
-  select_with_parens` with `select_with_parens: '(' select_no_parens ')' | '('
-  select_with_parens ')'`, and has `table_ref` consume `select_with_parens`
-  DIRECTLY. Two attempts were made and reverted:
-  grafting `'(' SelectStmt ')'` onto `simple_select` gives 18 S/R + 2 R/R
-  (`((SELECT 1))` becomes genuinely ambiguous — table_ref's paren vs
-  simple_select's); adopting the full upstream layering and rewiring `table_ref`
-  and the `LATERAL` arm gives 21 S/R + 1 R/R, because `'(' table_ref ')'` and
-  `select_with_parens` then compete on the same leading `(`. The remaining
-  tension is that existing `'(' table_ref ')'` group rule — resolve it (or fold
-  it into `select_with_parens`) BEFORE retrying. Conflict pin is 16.
+  Affects TPC-DS Q87 and `query_0.sql` — 1 of 99 sweep queries.
+
+  **Diagnosis (2026-08-27, third attempt — this is the useful part).** Upstream
+  layers this as `select_clause: simple_select | select_with_parens` with
+  `select_with_parens: '(' select_no_parens ')' | '(' select_with_parens ')'`,
+  and `c_expr: select_with_parens %prec UMINUS`. Porting that layering to this
+  grammar produces exactly TWO reduce/reduce conflicts, and **they pull in
+  opposite directions**, which is why no local edit resolves both:
+
+  - `state 1113: select_clause: select_with_parens.` vs
+    `c_expr: select_with_parens.` on `')'` — wants c_expr to NOT share the
+    nonterminal.
+  - `state 1902: select_with_parens: '(' SelectStmt ')'.` vs
+    `base_table_ref: '(' SelectStmt ')'. opt_derived_alias` — wants
+    base_table_ref to share it (i.e. consume `select_with_parens` directly).
+
+  Attempts and their exact costs, so none is repeated: grafting
+  `'(' SelectStmt ')'` onto `simple_select` = 18 S/R + 2 R/R; full upstream
+  layering incl. the recursive `'(' select_with_parens ')'` plus rewiring
+  `table_ref`/`LATERAL` = 21 S/R + 1 R/R; layering WITHOUT the recursive
+  alternative = 18 S/R + 2 R/R; additionally collapsing `c_expr`'s own
+  `'(' SelectStmt ')'` into `select_with_parens` = still 18 S/R + 2 R/R
+  (it moves the conflict from the productions to the nonterminal, states above).
+
+  **Resume point:** the root cause is that this grammar reaches a parenthesized
+  select from THREE places — expression (`c_expr`), FROM item
+  (`base_table_ref`), and statement (`SelectStmt`) — which LALR merges into one
+  state, whereas upstream's `simple_select` carries the set-op rules itself
+  (`select_clause UNION ... select_clause`) and so never puts `select_clause` at
+  statement start. Porting upstream's set-op placement INTO `simple_select` —
+  replacing goopg's `SelectStmt: select_clause setop_tail` shape — is the
+  change that would make the layering fit; it is a restructure of SelectStmt /
+  base_select / setop_tail, not a local edit. Conflict pin is 16.
 
 ### Found while consuming the audit list (2026-08-27) — all FIXED
 
