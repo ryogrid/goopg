@@ -247,3 +247,24 @@ on the WAL write lock dominates committer wait time; true IO:WALWrite does
 not even reach sampling resolution (pwrite into page cache); IO:WALSync is
 real but small here because group-commit batches amortize one fdatasync
 across many committers on this WSL2 host. tps stayed in the 9.3–9.5k band.
+
+## Addendum 4 — WAL-buffer insertion contention instrumented (2026-08-26)
+
+Per review, the WAL-buffer insert path now reports contention on its own:
+each of the 8 per-stripe insertion mutexes (`stripe_append.go`, direct analog
+of upstream's WALInsertLock tranches, NUM_XLOGINSERT_LOCKS = 8) is taken via
+`lockStripeWithEvent`, which uses a TryLock fast path and emits
+`LWLock:WALInsert` for the calling backend only when the fast path misses —
+zero added cost when uncontended, events exactly when a goroutine is about
+to park. Unit test `TestStripeInsertWaitReportsLWLockWALInsert` drives a real
+park behind a held stripe and asserts the snapshot shows LWLock/WALInsert
+mid-wait, cleared after acquisition.
+
+Live sampling note: at -c 50 and even -c 150, stripe hold times (buffer
+memcpy + LSN reserve) stay below the 500 ms sampling resolution, so no
+WALInsert rows appear in the pgbench distributions — mirroring vanilla PG,
+where WALInsert waits surface mainly under fat/slow inserts rather than
+simple-update. The wait itself was always paid invisibly; it is now recorded
+whenever it exceeds an instant. Final c50 run unchanged in shape:
+LWLock:WALWriteLock 48.6% (2139), on-CPU 31.9% (1403), IO:WALSync 1.9% (82),
+9,367 tps.

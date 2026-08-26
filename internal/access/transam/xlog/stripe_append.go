@@ -1,6 +1,32 @@
 package xlog
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/goopg/goopg/internal/utils/activity"
+)
+
+// lockStripeWithEvent takes one WAL-insert stripe lock and reports
+// LWLock:WALInsert for the calling backend ONLY when the uncontended TryLock
+// fast path misses — i.e., the goroutine is genuinely about to park behind
+// another inserter. These per-stripe mutexes are the direct analog of
+// upstream's WALInsertLock tranches (appendLockStripes == 8), so the wait
+// uses the real LWLock class/tranche name at its single choke point
+// (docs/design/not_ralph/pg-stat-activity-probes/03-design §4 amendment).
+// Identity resolves per call from goroutine-local registration;
+// unregistered callers (background workers, tests) skip probing.
+func lockStripeWithEvent(l *paddedMutex) {
+	if l.mu.TryLock() {
+		return
+	}
+	if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		reg.WaitEventStart(procNum, activity.WaitTypeLWLock, activity.WaitWALInsert)
+	}
+	l.mu.Lock()
+	if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		reg.WaitEventEnd(procNum)
+	}
+}
 
 // stripeAppend is the writer-side append composer for M0107-0007 slice B
 // (Phase D4 — 8-stripe WAL insert locks per
@@ -138,7 +164,7 @@ func stripeAppend(
 	}
 
 	stripe := stripeForProcNum(procNum)
-	locks.locks[stripe].mu.Lock()
+	lockStripeWithEvent(&locks.locks[stripe])
 	defer locks.locks[stripe].mu.Unlock()
 	// END marker before unlock (LIFO defer order): the drain-side
 	// tailPublisher can stop capping safeTail at this stripe's start
@@ -275,7 +301,7 @@ func stripeAppendBuild(
 	}
 
 	stripe := stripeForProcNum(procNum)
-	locks.locks[stripe].mu.Lock()
+	lockStripeWithEvent(&locks.locks[stripe])
 	defer locks.locks[stripe].mu.Unlock()
 	// END marker before unlock (LIFO defer order) — same contract as
 	// stripeAppend: drain-side tailPublisher must be unblocked even

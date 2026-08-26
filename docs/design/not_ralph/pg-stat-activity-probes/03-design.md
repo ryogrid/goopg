@@ -27,7 +27,9 @@ sampling-based profiling inside the server.
 | `md.c`/`fd.c`/`slru.c`/AIO IO | `IO:*` | storage-manager + AIO callbacks (`initdb/open.go`) | done; windows now fire regardless of track_io_timing, only *_time stays gated (probe-audit fix); WAL flush attributed per committer |
 | WAL write drain (`XLogWrite` pwrite) | `IO:WALWrite` | `Writer.flushWindows` stage 1 | done (split from the old whole-flush window) |
 | WAL fdatasync barrier (`XLogFlush`) | `IO:WALSync` | `Writer.flushWindows` stage 2, per COMMITTER | done (attribution fix) |
-| committers parked on the WAL write lock / insert stripes | `LWLock:WALWriteLock` / `LWLock:WALInsert` | `flushUpToBackend` parks (`acquireOrWait`, `waitInsertionsToFinish`) | done — first LWLock-class emitters; named tranches with real upstream identity, per the §4 amendment |
+| committers parked on the WAL write lock | `LWLock:WALWriteLock` | `flushUpToBackend` park (`acquireOrWait`) | done — first LWLock-class emitters; named tranches with real upstream identity, per the §4 amendment |
+| committers waiting for in-flight stripe inserts to publish | `LWLock:WALInsert` | `flushUpToBackend` (`waitInsertionsToFinish`) | done |
+| WAL-record insertion into WAL buffers (stripe lock) | `LWLock:WALInsert` | `lockStripeWithEvent` around each per-stripe mutex (`stripe_append.go`; TryLock fast path — fires only on genuine contention) | done |
 | hash spill tmp files | `IO:BuffileRead/Write` | `executor/spill.go` | done |
 | `pqcomm.c` secure_read/write | `Client:ClientRead/Write` | `postmaster/server.go` conn loop | done |
 | main-loop states (`postgres.c`) | state column | `postmaster/dispatch.go` active/idle wiring + session txn transitions | done |
