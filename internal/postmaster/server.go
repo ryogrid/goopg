@@ -721,22 +721,14 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 	}
 	cl.OnStop = func() error {
 		s.cfg.Logger.Info("control: stop requested")
-		// M0089-0003: take an implicit shutdown checkpoint before
-		// cancelling the run context so users don't have to chain
-		// `goopg checkpoint && goopg stop` to preserve writes.
-		// Failures here are logged but don't block shutdown — the
-		// next graceful start still picks up the WAL via replay,
-		// and a non-graceful start now tolerates a torn tail per
-		// M0088-0001.
-		if s.cfg.Checkpointer != nil {
-			s.cfg.Logger.Info("shutdown checkpoint start")
-			if err := s.cfg.Checkpointer.CheckpointNow(); err != nil {
-				s.cfg.Logger.Warn("shutdown checkpoint failed",
-					"err", err)
-			} else {
-				s.cfg.Logger.Info("shutdown checkpoint complete")
-			}
-		}
+		// Parity note (checkpoint-fpi bundle D-4): upstream performs exactly
+		// ONE shutdown checkpoint inside ShutdownXLOG
+		// (xlog.c:6640–6680, IS_SHUTDOWN|IMMEDIATE). The former extra
+		// CheckpointNow here produced two records per graceful stop and is
+		// gone; Close's CheckpointShutdown remains the single final
+		// checkpoint and stamps pg_control State = DB_SHUTDOWNED
+		// synchronously before process exit (M0110-0004 / RW-002), so
+		// `goopg stop` durability is unchanged.
 		// Set the graceful deadline before cancelling so Run()
 		// bounds its connWG.Wait(). A zero ShutdownDeadline
 		// (backward-compat for embedded/test servers) means
