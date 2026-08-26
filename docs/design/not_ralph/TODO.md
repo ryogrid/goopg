@@ -248,8 +248,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   6/6 identical (+7 corpus total → 155). ON CONFLICT (all arbiter spellings,
   DO NOTHING / DO UPDATE SET [WHERE]) and RETURNING landed same day; known
   S/R on 'ON' added to gate allowlist (join-ON vs insert-arbiter; shift=
-  join wins, correct inside FROM). Remaining: routing flip for the insert
-  class.
+  join wins, correct inside FROM). ROUTING FLIPPED same day
+  (routedStmts["insert"]=true): live-verified multi-row INSERT, column lists,
+  ON CONFLICT DO NOTHING / DO UPDATE SET..RETURNING through the goyacc path;
+  tpch-spotcheck Q12/Q13 PASS; units suite green. P3.1 COMPLETE.
 - [ ] **P3.1 INSERT**: VALUES/SELECT source, ON CONFLICT (index inference,
   DO NOTHING/UPDATE), RETURNING, OVERRIDING.
 - [ ] **P3.2 UPDATE**: FROM joins, WHERE CURRENT OF, SET list forms.

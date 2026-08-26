@@ -55,7 +55,10 @@ func SplitStatements(toks []parser.Token) [][]parser.Token {
 // select: P2-F flip. Grammar coverage floor enforced by
 // TestTPCHGrammarCoverage (19/22); typed-literal normalization handles
 // date/time/timestamp/interval SCONST forms.
-var routedStmts = map[string]bool{"select": true}
+var routedStmts = map[string]bool{
+	"select": true,
+	"insert": true, // P3.1: full grammar landed (ON CONFLICT/RETURNING incl.)
+}
 
 // routeBatch reports whether the whole batch can go to the new parser, plus
 // the parsed statements when it can.
