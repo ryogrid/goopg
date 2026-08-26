@@ -41,6 +41,7 @@ type lexerState struct {
 
 	lastText string // original-case source text, for error wording
 	lastPos  int    // absolute Pos of last returned token
+	fragEnd  int    // exclusive end offset of fragment's last real token; trailing ';' excluded
 	prevPos  int    // absolute Pos of the token before that (mid-rule pos capture)
 
 	// base_yylex one-token pushback (base_yylex.go)
@@ -106,6 +107,7 @@ type lexResult struct {
 func ParseOneSrc(src string, toks []parser.Token) ([]parser.Stmt, error) {
 	l := &lexerState{toks: toks, src: src}
 	l.lastPos = eofPos(toks)
+	l.fragEnd = fragEndPos(src, toks)
 	if yyParse(l) != 0 {
 		if l.err != nil {
 			return nil, l.err
@@ -133,6 +135,22 @@ func (l *lexerState) errAsError() error {
 		return l.err
 	}
 	return nil
+}
+
+// fragEndPos returns the exclusive end offset of the fragment's last real
+// token (a trailing ';' contributes its START, so the span excludes it).
+func fragEndPos(src string, toks []parser.Token) int {
+	for i := len(toks) - 1; i >= 0; i-- {
+		t := toks[i]
+		if t.Kind == parser.TokenEOF {
+			continue
+		}
+		if t.Value == ";" {
+			return t.Pos
+		}
+		return t.Pos + len(t.Value)
+	}
+	return len(src)
 }
 
 func eofPos(toks []parser.Token) int {

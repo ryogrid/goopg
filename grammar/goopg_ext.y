@@ -673,7 +673,7 @@ create_view_stmt:
 				sel := $8.(*parser.SelectStmt)
 				cv := parser.NewCreateViewStmt(v, $5, sel)
 				cv.OrReplace = $2
-				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).peek().pos)
+				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).fragEnd)
 				$$ = cv
 			}
 

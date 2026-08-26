@@ -309,9 +309,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   qn [(cols)] AS select routed via create-pair "view". TEMP/UNLOGGED VIEW
   intentionally NOT routed (modifier-prefix S/R ambiguity with create-table;
   secondKeywordRouted falls back to legacy when TEMP|TEMPORARY|UNLOGGED
-  precedes the object kind). KNOWN-DIFF: RawDef (view body source span) is
-  empty in yacc path — lexerState.last*/peek are zeroed at stmt-final reduce;
-  needs an end-of-body position carrier (pg_get_viewdef affected).
+  precedes the object kind). RawDef now exact via fragEndPos
+  (fragment-end carrier: last real token end, trailing ';' excluded) — EOF
+  short-circuit zeroes lexer last*/peek at stmt-final reduce, so use the
+  fragment carrier instead of peek().
 - [~] **P4.3b DONE + bare-name create alt (2026-08-26)**: PARTITION OF rides
   opt_ct_tail(_noas); new bare `CREATE TABLE name opt_ct_tail_noas` alternative
   covers column-less creates (PARTITION OF / INHERITS / WITH / PARTITION BY
