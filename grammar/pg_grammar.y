@@ -59,6 +59,7 @@
 %type <node>	setop_tail setop_op
 %type <ctes>	cte_list
 %type <node>	cte_item
+%type <stmt>	cte_dml_body
 %type <str>	opt_materialized
 %type <withc>	with_clause
 %type <node>	opt_with_clause
@@ -97,6 +98,7 @@
 %type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
+%type <str>	opt_index_name
 %type <node>	opt_table_element_list opt_index_where
 %type <node>	opt_constr_attrs
 %type <str>	constr_attr
@@ -1245,6 +1247,24 @@ cte_item:
 				cte.Materialized = mat
 				$$ = &cteItem{cte: cte}
 			}
+	/* Data-modifying CTEs — gram.y common_table_expr's PreparableStmt body.
+	   CommonTableExpr.DMLBody has existed on the AST all along; only the
+	   grammar restricted the body to SelectStmt, so
+	   `WITH u AS (UPDATE ... RETURNING ...) INSERT ...` was a syntax error on
+	   the routed path. INSERT/UPDATE/DELETE start with distinct reserved
+	   keywords, so this costs no conflict. */
+	| ColId cte_col_list AS opt_materialized '(' cte_dml_body ')'
+			{
+				cte := parser.NewCommonTableExpr(0, $1, $2, nil)
+				cte.Materialized = $4
+				cte.DMLBody = $6.(parser.Stmt)
+				$$ = &cteItem{cte: cte}
+			}
+
+cte_dml_body:
+		insert_stmt   { $$ = $1 }
+	| update_stmt     { $$ = $1 }
+	| delete_stmt     { $$ = $1 }
 
 cte_col_list:
 		/* empty */           { $$ = nil }
@@ -1855,6 +1875,19 @@ c_expr:
 				typ, val := typedLitParts($1)
 				$$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), typ, val)
 			}
+	/* Multi-word typed literals — gram.y ConstDatetime Sconst. The lexer's
+	   TYPEDLIT fold needs the SCONST to follow the type name IMMEDIATELY, so
+	   `TIMESTAMP WITH TIME ZONE '...'` cannot fold and needs real productions.
+	   WITH/WITHOUT arrive as WITH_LA/WITHOUT_LA because base_yylex substitutes
+	   them when TIME follows. */
+	| TIMESTAMP WITH_LA TIME ZONE SCONST
+			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timestamptz", $5) }
+	| TIMESTAMP WITHOUT_LA TIME ZONE SCONST
+			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timestamp", $5) }
+	| TIME WITH_LA TIME ZONE SCONST
+			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timetz", $5) }
+	| TIME WITHOUT_LA TIME ZONE SCONST
+			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "time", $5) }
 	| ARRAY '[' opt_func_call_args ']'
 			{
 				args := $3
@@ -2469,6 +2502,9 @@ update_set_list:
 update_assign:
 		ColId '=' a_expr
 			{ $$ = *parser.NewUpdateAssign($1, "", nil, $3) }
+	/* `SET col = DEFAULT` — the DEFAULT placeholder is not an a_expr. */
+	| ColId '=' DEFAULT
+			{ $$ = *parser.NewUpdateAssign($1, "", nil, parser.NewDefaultMarker(yylex.(*lexerState).lastConsumedPos())) }
 	| ColId '.' ColId '=' a_expr
 			{ $$ = *parser.NewUpdateAssign($3, $1, nil, $5) }
 

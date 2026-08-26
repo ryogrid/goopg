@@ -477,7 +477,7 @@ with_value:
    CONCURRENTLY arrive later); ColOrders/ColExprs filled with per-column
    defaults for legacy dump parity. */
 create_index_stmt:
-		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists ColId ON qualified_name opt_using_method '(' index_col_list ')' opt_include opt_index_where
+		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON qualified_name opt_using_method '(' index_col_list ')' opt_include opt_index_where
 			{
 				nm := $8.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -493,6 +493,12 @@ create_index_stmt:
 				}
 				$$ = ix
 			}
+
+/* opt_index_name — `CREATE INDEX ON t (a)` lets the server pick the name. ON
+   is reserved and therefore never a ColId, so the empty case is unambiguous. */
+opt_index_name:
+		/* empty */        { $$ = "" }
+	| ColId                { $$ = $1 }
 
 opt_index_where:
 		/* empty */        { $$ = (parser.Expr)(nil) }
@@ -553,6 +559,9 @@ opt_tx_modes:
 tx_mode_list:
 		tx_mode                  { $$ = $1 }
 	| tx_mode_list ',' tx_mode   { $$ = mergeTxModes($1.(*txModes), $3.(*txModes)) } /* $$ = $1 dropped every mode after the first */
+	/* gram.y's transaction_mode_list makes the comma OPTIONAL:
+	   `BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE`. */
+	| tx_mode_list tx_mode       { $$ = mergeTxModes($1.(*txModes), $2.(*txModes)) }
 
 tx_mode:
 		ISOLATION LEVEL iso_level     { i := &txModes{}; i.iso = $3.(string); $$ = i }
@@ -609,6 +618,12 @@ set_stmt:
 				l := yylex.(*lexerState)
 				$$ = parser.NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
 			}
+
+	/* SET [LOCAL] ROLE name — legacy records it as a plain SetStmt named
+	   "role" with no '='/TO, so setValueAtoms (which scans for the separator)
+	   cannot recover the value; it comes from the item directly. */
+	| SET set_scope ROLE set_value_atom
+			{ $$ = parser.NewSetStmt(0, $2, "role", $4, false) }
 
 /* set_guc_name — GUCs may be dotted (`SET spec.session = 1`), which plain
    ColId could not express. */
