@@ -456,6 +456,61 @@ follows is what the audit left OPEN.
   is `internal/executor/expr.go:11569`. Leading suspects: catalog rows written
   before `5cf25672a` fixed `RawDef`, or the name-vs-OID lookup path.
 
+## ⚠️ VERIFICATION VERDICT 2026-08-27 — the migration is BELOW pre-migration level
+
+The first full `make nightly-batch` since routing went live
+(`run_id=20260827-052222`, sha `846d651d`) says the routed surface is **not** at
+pre-migration parity. units / race / pgbench pass and the TPC-H silent-regression
+spotcheck is GREEN (Q12=2, Q13=34), but:
+
+| suite | pre-migration | now |
+|---|---|---|
+| isolation strict specs | **0 FAIL** (2026-08-25 nightly) | **64 FAIL** of 245 |
+| regress must-pass (59) | not measurable — the 08-25 run wedged and was killed, so Go never printed subtest verdicts | **40 not passing** (28 FAIL, 12 SKIP) |
+| TPC-DS syntax errors | **0** (2026-08-25) | 6 → **1** after this session's fixes (+3 known dsqgen artefacts) |
+| TPC-H Q12/Q13 spotcheck | 2 / 34 | **2 / 34 ✅** |
+
+**Methodology note — why no baseline worktree was needed.** The intended
+baseline `f5613d73f` (parent of the first permanent routing flip `ae1516857`)
+**does not build**: its committed `internal/sqlparser/yacc_parser.go` references
+`parser.NewExtractExpr`, which does not exist in `internal/parser` at that
+commit. It does not matter, because `git diff f5613d73f..HEAD -- internal/parser/`
+touches only `parser.go` (the RouteBatch/RouteExprBatch hooks) and
+`yacc_ctors.go` (additive constructors): **the legacy parser's SQL surface is
+unchanged**. Before routing every statement went to legacy, so pre-migration
+behaviour IS current legacy behaviour — which is exactly what `diffParse`'s
+legacy leg measures. Every "legacy=true yacc=false" below is therefore a
+migration regression by construction.
+
+Also note the nightly's own testport stage has been red since 2026-08-23 for an
+unrelated reason (it caps memory at 6G/8G/GOMEMLIMIT=5GiB, the regress suite
+wedges and is killed at the 2h12m Go deadline). This run completed in 1088s, so
+its verdicts are real.
+
+### Root causes, by how many tests they block
+
+- [ ] **`FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE`
+  locking clauses are NOT IN THE GRAMMAR AT ALL** — 23 isolation specs, and
+  `Locking`/`FOR UPDATE` has zero occurrences in `grammar/pg_grammar.y`.
+  TODO's P1.5 entry claims "order/limit/FOR UPDATE" landed; it did not.
+  `base_select` is `simple_select opt_sort_clause opt_select_limit` with no
+  locking clause. `SelectStmt.Locking` exists on the AST. **Highest-value fix.**
+- [ ] **Constraint attribute trailers** — ~20 testport tests.
+  `[NOT] DEFERRABLE`, `INITIALLY DEFERRED|IMMEDIATE` on column- AND table-level
+  UNIQUE / PRIMARY KEY / FOREIGN KEY / EXCLUDE; `UNIQUE NULLS NOT DISTINCT
+  (cols)`; `... INCLUDE (cols)`. The AST already carries every field
+  (`UniqueDeferrable`, `UniqueInitiallyDeferred`, `PrimaryDeferrable`,
+  `UniqueNullsNotDistinct`, `FKDeferrable`, `TableUniqueIncludes`, …).
+  Repro: `CREATE TABLE t (i integer UNIQUE DEFERRABLE, x text)`.
+- [ ] **`SET TRANSACTION ISOLATION LEVEL ...`** — 6 isolation specs.
+  `set_stmt` only has the `SET name = value` shapes.
+- [ ] **`CREATE INDEX CONCURRENTLY` / `DROP INDEX CONCURRENTLY`** — 2 specs.
+- [ ] **A PARENTHESIZED select as a set-operation operand** — TPC-DS Q87.
+  Full analysis and resume point below.
+
+`ci/logs/20260827-052222/` holds the evidence: `testport/go-test.log`,
+`testport/regress-diffs/`, `tpcds/run.log`, `summary.md`.
+
 ### Found by the first post-migration nightly (2026-08-27)
 
 The nightly's TPC-DS stage went from 0 errors (2026-08-25, pre-flip) to 6
