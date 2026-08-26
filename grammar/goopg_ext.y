@@ -435,6 +435,37 @@ alter_table_action:
 				a.NewName = $3
 				$$ = a
 			}
+	| DROP CONSTRAINT ColId opt_drop_behavior
+			{
+				a := parser.NewATAction(parser.AlterTableDropConstraint)
+				a.OldConstraintName = $3
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId SET DEFAULT a_expr
+			{
+				a := parser.NewATAction(parser.AlterTableSetDefault)
+				a.ColumnName = $3
+				a.DefaultExpr = $6
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId DROP DEFAULT
+			{
+				a := parser.NewATAction(parser.AlterTableDropDefault)
+				a.ColumnName = $3
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId SET NOT NULL_P
+			{
+				a := parser.NewATAction(parser.AlterTableSetNotNull)
+				a.ColumnName = $3
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId DROP NOT NULL_P
+			{
+				a := parser.NewATAction(parser.AlterTableDropNotNull)
+				a.ColumnName = $3
+				$$ = a
+			}
 
 opt_COLUMN:
 		/* empty */  { _ = 0 }
