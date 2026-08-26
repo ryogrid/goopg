@@ -212,8 +212,8 @@ gen-parser:
 		|| { cat yacc_stderr.txt; exit 1; }
 	go run ./cmd/gen-tokennums-go
 	@conflicts=$$(grep -cE '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null || echo 999); \
-	if [ "$$conflicts" -ne 13 ]; then \
-		echo "ERROR: $$conflicts grammar conflicts (expected exactly 13 known: '(' x2, '[' x2, 'ON', 'IF_P' x2, 'NOT' default-vs-fk)"; exit 1; fi; \
+	if [ "$$conflicts" -ne 14 ]; then \
+		echo "ERROR: $$conflicts grammar conflicts (expected exactly 14 known: '(' x2, '[' x2, 'ON', 'IF_P' x2, 'NOT' default-vs-fk)"; exit 1; fi; \
 	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null | grep -vE "on '\\('" | grep -vE "on '\\.'" | grep -vE "on '\\['" | grep -vE "on ON" | grep -vE "on IF_P" | grep -vE "on NOT" | grep -vE "on SESSION" | grep -vE "on LOCAL" | grep -c .); \
 	if [ "$$nonparen" -gt 0 ]; then \
 		echo "ERROR: $$nonparen conflict(s) NOT on the known set ('(' '.' '[' ON) — inspect y.output"; exit 1; fi; \

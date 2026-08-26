@@ -166,7 +166,7 @@ func withFollowerRouted(toks []parser.Token) bool {
 var routedCreatePairs = map[string]map[string]bool{
 	"create": {"table": true, "index": true, "view": true},
 	"alter":  {"table": true},
-	"drop":   {"table": true, "index": true},
+	"drop":   {"table": true, "index": true, "view": true},
 }
 
 // secondKeywordRouted reports whether the fragment's first+second keyword

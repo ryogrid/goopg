@@ -684,3 +684,10 @@ opt_or_replace:
 opt_name_list_p:
 		/* empty */          { $$ = []string(nil) }
 	| '(' colid_list ')'     { $$ = $2 }
+
+/* drop_view_stmt — P5 v0: DROP VIEW [IF EXISTS] name [, …] [CASCADE|RESTRICT] */
+drop_view_stmt:
+		DROP VIEW opt_if_exists_drop drop_name_list opt_drop_behavior
+			{
+				$$ = parser.NewDropViewStmt(0, $3, $4, dropBehavior($5))
+			}

@@ -398,3 +398,8 @@ func NewPartitionOfClause(parent ObjectName, fromVals, toVals, inVals []Expr, is
 func NewCreateViewStmt(name ObjectName, cols []string, q *SelectStmt) *CreateViewStmt {
 	return &CreateViewStmt{pos: 0, Name: name, Columns: cols, Query: q}
 }
+
+// NewDropViewStmt builds the P5 DROP VIEW shape.
+func NewDropViewStmt(pos int, ifExists bool, names []ObjectName, behavior DropBehavior) *DropViewStmt {
+	return &DropViewStmt{pos: pos, IfExists: ifExists, Names: names, Behavior: behavior}
+}
