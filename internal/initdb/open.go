@@ -1884,6 +1884,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// each checkpoint so PG standbys can always attach. Uses
 		// WithRelCacheInitLock to prevent TOCTOU races with concurrent
 		// backend startup reading the init files.
+		PostReleaseFn: func() int {
+			if mgr == nil {
+				return 0
+			}
+			return mgr.ReleaseForgotten()
+		},
 		PostCheckpointFn: func() error {
 			if abs == "" {
 				return nil

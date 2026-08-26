@@ -37,8 +37,12 @@ Designs: 03-design.md · Plan: 04-execution-plan.md
 
 ### Accepted deviations (document only)
 - [x] D-5 poll-based volume trigger + floor (checkpointer.go:583-631)
-- [ ] D-6 smgr close-all hook — only on fd-pressure evidence
-- [ ] D-7 delayChkpt quiesce — ledger note instead of implementation
+- [x] D-6 (implemented: Manager.ReleaseForgotten closes cached handles for
+      relations whose files vanished; wired as Checkpointer PostReleaseFn
+      right after the data-file sync phase, count logged when >0) smgr close-all hook — only on fd-pressure evidence
+- [x] D-7 (ACCEPTED as documented structural deviation per 03-design:
+      redo-anchored retention guarantees replayability without adding
+      commit-path delayChkpt atomics) delayChkpt quiesce — ledger note instead of implementation
 - [x] extra FPIs post-restart/eviction (bufpool.go:1087-1095) — safe direction
 - [ ] no checkpoint_warning log; no log_checkpoints GUC; no pg_checkpoint
       role gate — route to respective audits

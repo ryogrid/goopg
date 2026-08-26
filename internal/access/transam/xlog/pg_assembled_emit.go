@@ -1440,3 +1440,17 @@ func DecodeXLogClogZeroPage(mainData []byte) (pageno int64, err error) {
 	pageno = int64(binary.LittleEndian.Uint64(mainData[0:8]))
 	return
 }
+
+// EncodeXLogFPWChangePG builds the pre-assembled envelope for an
+// XLOG_FPW_CHANGE record (parity bundle D-3): opcode xlogXLogFPWChange (0x80,
+// already decoded benignly at pg_xlog_decode.go:209) with a one-byte payload
+// carrying the new full_page_writes state. Upstream emits this on every
+// runtime toggle so standbys/backup tooling can detect FPW-disabled spans
+// (xlog.c:8253-8259).
+func EncodeXLogFPWChangePG(fpw bool) ([]byte, error) {
+	body := []byte{0}
+	if fpw {
+		body[0] = 1
+	}
+	return framePGAssembled(RmgrXLog, xlogXLogFPWChange, 0, body), nil
+}

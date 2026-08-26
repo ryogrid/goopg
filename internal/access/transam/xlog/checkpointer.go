@@ -191,6 +191,13 @@ type CheckpointerConfig struct {
 	// M0106-0011 follow-up (b).
 	PostCheckpointFn func() error
 
+	// PostReleaseFn, when non-nil, runs right AFTER the data-file sync
+	// phase of every checkpoint (parity bundle D-6): closes cached smgr
+	// handles for relations whose backing files vanished since the last
+	// checkpoint (upstream smgrdestroyall, checkpointer.c:488-490).
+	// Non-fatal errors are logged like sibling hooks.
+	PostReleaseFn func() int
+
 	// TruncateCLOGFn, when non-nil, is called at the end of each successful
 	// checkpoint AFTER the checkpoint marker is durable, to truncate CLOG
 	// (pg_xact) up to the conservative oldest-safe XID (G1). Wiring truncation
@@ -1042,6 +1049,11 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	// M0106-0011 follow-up (b): call the post-checkpoint hook (when wired)
 	// to regenerate pg_internal.init after crash-recovery WAL replay may
 	// have unlinked it via RecordKindXactCommitInval. Non-fatal.
+	if c.cfg.PostReleaseFn != nil {
+		if n := c.cfg.PostReleaseFn(); n > 0 {
+			c.cfg.Logger.Info("checkpoint: released forgotten relation handles", "count", n)
+		}
+	}
 	if c.cfg.PostCheckpointFn != nil {
 		if err := c.cfg.PostCheckpointFn(); err != nil {
 			c.cfg.Logger.Warn("post-checkpoint init file refresh failed", "err", err)

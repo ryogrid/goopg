@@ -778,7 +778,27 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 		if v, ok := registry.Get("full_page_writes"); ok && rt.Pool != nil {
-			rt.Pool.SetFullPageWrites(v.Display() == "on")
+			want := v.Display() == "on"
+			if want != rt.Pool.FullPageWrites() {
+				// Parity bundle D-3: emit XLOG_FPW_CHANGE around the flip,
+				// upstream ordering (xlog.c:8233-8267) — ON flips the flag
+				// FIRST then logs; OFF logs FIRST then flips — so a crash
+				// never leaves a logged state that disagrees with the flag
+				// for records assembled after it.
+				payload, err := xlog.EncodeXLogFPWChangePG(want)
+				if err == nil {
+					appendFirst := !want // OFF: record first, then flip
+					if appendFirst {
+						_, _, _ = rt.WAL.Append(payload)
+					}
+					rt.Pool.SetFullPageWrites(want)
+					if !appendFirst {
+						_, _, _ = rt.WAL.Append(payload)
+					}
+				} else {
+					rt.Pool.SetFullPageWrites(want)
+				}
+			}
 		}
 	}
 	applyCheckpointGUCs()
