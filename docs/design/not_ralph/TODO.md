@@ -237,6 +237,16 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 
 ## P3 — DML writes
 
+- [~] **P3.1 INSERT v0 LANDED 2026-08-26 (grammar only; routing INERT)**:
+  insert_stmt = [with_clause] INSERT INTO name [(cols)] source where source
+  is SelectStmt (bare VALUES select converts to InsertStmt.Rows, legacy
+  shape) or DEFAULT VALUES. KEY INSIGHT: the historic 3927 R/R was an
+  artifact of the hidden-duplicate grammar — on today's clean grammar,
+  parsing INSERT's source AS a select_stmt (upstream shape) merges zero
+  hostile states; conflicts stay at the pinned 4. insSrc carrier +
+  NewInsertStmt/SetInsertSelect/SetInsertDefaultValues ctors. Parity: INSERT
+  6/6 identical (+7 corpus total → 155). Remaining: ON CONFLICT, RETURNING,
+  routing flip for the insert class.
 - [ ] **P3.1 INSERT**: VALUES/SELECT source, ON CONFLICT (index inference,
   DO NOTHING/UPDATE), RETURNING, OVERRIDING.
 - [ ] **P3.2 UPDATE**: FROM joins, WHERE CURRENT OF, SET list forms.

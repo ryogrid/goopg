@@ -217,3 +217,23 @@ func NewArraySubscriptExpr(pos int, base Expr, isSlice bool, index, upper Expr) 
 func NewIntervalLitQualified(pos int, body, unit string, hasPrec bool, prec int) *IntervalLit {
 	return &IntervalLit{pos: pos, Value: body, Unit: unit, Qualified: true, HasPrec: hasPrec, Prec: prec}
 }
+
+// NewInsertStmt builds the v0 INSERT shape (VALUES rows; SELECT/DEFAULTS via
+// the setters below). ON CONFLICT / RETURNING arrive with later P3 stages.
+func NewInsertStmt(pos int, target RangeVar, columns []string, rows [][]Expr) *InsertStmt {
+	return &InsertStmt{pos: pos, Target: target, Columns: columns, Rows: rows}
+}
+
+// SetInsertSelect switches an INSERT to the `INSERT ... SELECT` form.
+func SetInsertSelect(is *InsertStmt, sel *SelectStmt) *InsertStmt {
+	is.Rows = nil
+	is.Select = sel
+	return is
+}
+
+// SetInsertDefaultValues switches an INSERT to DEFAULT VALUES.
+func SetInsertDefaultValues(is *InsertStmt) *InsertStmt {
+	is.Rows = nil
+	is.DefaultValues = true
+	return is
+}

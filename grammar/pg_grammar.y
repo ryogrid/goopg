@@ -87,6 +87,9 @@
 %type <str>	subq_op extract_field
 %type <str>	opt_tzmark double_tail cast_ident character_word
 %type <vrows>	values_rows
+%type <stmt>	insert_stmt
+%type <isrc>	insert_source
+%type <strs>	opt_ins_cols colid_list
 %type <ct>	cast_target cast_typename
 %type <ival>	opt_array_tail
 %type <exprs>	expr_list group_by_list
@@ -135,6 +138,10 @@ stmt_list:
 
 stmt:
 		SelectStmt
+			{
+				$$ = $1
+			}
+	| insert_stmt
 			{
 				$$ = $1
 			}
@@ -2070,3 +2077,62 @@ values_rows:
 			{
 				$$ = append($1, $4)
 			}
+
+/* insert_stmt — P3.1 v0 (gram.y :17213 insert_rest subset): [WITH ctes]
+   INSERT INTO name [(cols)] source where source is VALUES_LA rows / SelectStmt /
+   DEFAULT VALUES. ON CONFLICT + RETURNING arrive with later P3 stages.
+   VALUES rides VALUES_LA so the DML site shares the expression-site's
+   conflict-free treatment of the col_name keyword. */
+insert_stmt:
+		INSERT INTO qualified_name opt_ins_cols insert_source
+			{
+				src := $5
+				is := parser.NewInsertStmt(0, rangeVarFromName($3, ""), $4, src.rows)
+				if src.sel != nil {
+					parser.SetInsertSelect(is, src.sel)
+				}
+				if src.def {
+					parser.SetInsertDefaultValues(is)
+				}
+				$$ = is
+			}
+	| with_clause INSERT INTO qualified_name opt_ins_cols insert_source
+			{
+				src := $6
+				is := parser.NewInsertStmt(0, rangeVarFromName($4, ""), $5, src.rows)
+				if src.sel != nil {
+					parser.SetInsertSelect(is, src.sel)
+				}
+				if src.def {
+					parser.SetInsertDefaultValues(is)
+				}
+				is.With = $1
+				$$ = is
+			}
+
+opt_ins_cols:
+		/* empty */  { $$ = nil }
+	| '(' colid_list ')' { $$ = $2 }
+
+colid_list:
+		ColId                    { $$ = []string{$1} }
+	| colid_list ',' ColId       { $$ = append($1, $3) }
+
+insert_source:
+		SelectStmt
+			{
+				// Upstream parses INSERT's source as a full select_stmt; a
+				// bare VALUES select converts to Rows here so analyzer/
+				// executor see legacy's InsertStmt.Rows shape.
+				sel, _ := $1.(*parser.SelectStmt)
+				i := &insSrc{}
+				if sel != nil && len(sel.ValuesRows) > 0 {
+					i.rows = sel.ValuesRows
+					sel.ValuesRows = nil
+				} else if sel != nil {
+					i.sel = sel
+				}
+				$$ = i
+			}
+	| DEFAULT VALUES
+			{ i := &insSrc{def: true}; $$ = i }

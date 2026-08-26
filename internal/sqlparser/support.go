@@ -559,3 +559,11 @@ func finishFrame(mode parser.FrameMode, ext *partFrameExtent, ex *partFrameExcl)
 		HasBetween: ext.hasBetween,
 	}
 }
+
+// insSrc carries the INSERT source triple (values rows | select | defaults)
+// from insert_source to insert_stmt's action (grammar carrier pattern).
+type insSrc struct {
+	rows [][]parser.Expr
+	sel  *parser.SelectStmt
+	def  bool
+}

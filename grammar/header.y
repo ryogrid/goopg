@@ -52,6 +52,7 @@ import (
 	wd     *parser.WindowDef
 	fr     *parser.WindowFrame
 	ct     castType
+	isrc   *insSrc
 	nwd    parser.NamedWindowDef
 	nwds   []parser.NamedWindowDef
 	list   []any            // heterogeneous lists, mirroring PG's untyped List
