@@ -330,7 +330,27 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   CreateTableStmt.PartitionOf). NOTE: unit tests must wire
   parser.RouteBatch = RouteBatch explicitly (postmaster init is not linked
   into test binaries).
-- [~] **P4.3 ALTER TABLE v1 — GRAMMAR landed, routing was NEVER LIVE.**
+- [~] **P4.3 ALTER TABLE — routing LIVE 2026-08-27 via a narrow action
+  allowlist.** `routedAlterTableActions` + `alterTableActionsRouted`
+  (`internal/sqlparser/dispatch.go`) route a statement only when EVERY
+  comma-separated action is one the grammar covers: 31 of the corpus's 153
+  forms go to yacc, 122 stay on legacy. `TestAlterTableRoutingIsNarrow`
+  (`internal/sqlparser/alter_table_test.go`) asserts every corpus form is
+  either not routed or routed AND legacy-identical, so "routed but
+  unparseable" is unreachable. **Widen the allowlist only together with the
+  matching grammar alternative** — the gate will fail otherwise. Still
+  unported and deliberately left on legacy, in corpus-frequency order:
+  `ADD [CONSTRAINT name] {PRIMARY KEY|UNIQUE|CHECK|FOREIGN KEY|EXCLUDE}` (31
+  forms), `ALTER COLUMN {SET STATISTICS|STORAGE|COMPRESSION|(attopts)}` and
+  identity actions (25), `ALTER CONSTRAINT` + `RENAME CONSTRAINT` (12),
+  `ENABLE|DISABLE {TRIGGER|RULE|ROW LEVEL SECURITY}` + `FORCE|NO FORCE` (10),
+  `CLUSTER ON` / `SET WITHOUT CLUSTER` / `SET TABLESPACE` / `SET ACCESS
+  METHOD` / `INHERIT` / `NO INHERIT` / `OF` / `NOT OF` (15), plus
+  `ADD COLUMN IF NOT EXISTS`, `DROP COLUMN IF EXISTS`, `ALTER COLUMN TYPE ...
+  USING`, `DETACH PARTITION ... CONCURRENTLY|FINALIZE`, and `OWNER TO
+  CURRENT_USER|SESSION_USER|CURRENT_ROLE` (the grammar's target is `ColId`,
+  which excludes reserved keywords).
+  Historical note — GRAMMAR landed 2026-08-26, routing was NEVER LIVE:
   Corrected 2026-08-27: `fragmentRouted` (`internal/sqlparser/dispatch.go`) only
   delegated `create`/`drop` to `secondKeywordRouted`, and `"alter"` is not in
   `routedStmts`, so every ALTER TABLE fell through to the legacy parser. The
@@ -341,11 +361,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   — a wholesale flip turns the other ~118 into hard 42601s. Enable via an
   action-leader allowlist in the dispatcher (same strangler shape as
   `routedCreatePairs`), widened only alongside the matching grammar
-  alternative and a differential case. Known field bugs to fix in the same
-  commit: `DROP CONSTRAINT` and `VALIDATE CONSTRAINT` set `OldConstraintName`
-  (reserved for RENAME CONSTRAINT) instead of `ConstraintName`, `DROP
-  CONSTRAINT` misses `IfExists`/`Restrict`, and `ADD COLUMN` misses
-  `NotNullExplicit`.
+  alternative and a differential case. The three field bugs found while sizing
+  it (`DROP CONSTRAINT` and `VALIDATE CONSTRAINT` writing `OldConstraintName`
+  instead of `ConstraintName`; `DROP CONSTRAINT` missing `IfExists`/`Restrict`;
+  `ADD COLUMN` missing `NotNullExplicit`) were FIXED in the same commit as the
+  flip.
   Original entry: all executor-relevant
   actions — ADD COLUMN/PK/FK/CHECK, DROP COLUMN/CONSTRAINT, ALTER COLUMN
   TYPE/SET DEFAULT/DROP DEFAULT/SET|DROP NOT NULL, RENAME TO/COLUMN,
