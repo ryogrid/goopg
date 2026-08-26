@@ -382,6 +382,52 @@ alter_table_stmt:
 				st.Actions = acts
 				$$ = st
 			}
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name OWNER TO ColId
+			{
+				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st.IfExists = $3
+				st.Only = $4
+				st.OwnerTo = $8
+				$$ = st
+			}
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name SET SCHEMA ColId
+			{
+				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st.IfExists = $3
+				st.Only = $4
+				st.SetSchema = $8
+				$$ = st
+			}
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name SET LOGGED
+			{
+				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st.IfExists = $3
+				st.SetLogged = "logged"
+				$$ = st
+			}
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name SET UNLOGGED
+			{
+				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st.IfExists = $3
+				st.SetLogged = "unlogged"
+				$$ = st
+			}
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name SET '(' str_pair_list ')'
+			{
+				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st.IfExists = $3
+				a := parser.NewATAction(parser.AlterTableSetReloptions)
+				m := map[string]string{}
+				for _, kv := range $8 {
+					parts := splitKV(kv)
+					if len(parts) == 2 {
+						m[parts[0]] = parts[1]
+					}
+				}
+				a.With = m
+				st.Actions = []parser.AlterTableAction{*a}
+				$$ = st
+			}
 
 alter_action_list:
 		alter_table_action
