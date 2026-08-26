@@ -403,3 +403,8 @@ func NewCreateViewStmt(name ObjectName, cols []string, q *SelectStmt) *CreateVie
 func NewDropViewStmt(pos int, ifExists bool, names []ObjectName, behavior DropBehavior) *DropViewStmt {
 	return &DropViewStmt{pos: pos, IfExists: ifExists, Names: names, Behavior: behavior}
 }
+
+// NewCreateMatViewStmt builds the P5 CREATE MATERIALIZED VIEW shape.
+func NewCreateMatViewStmt(name ObjectName, aliases []string, q *SelectStmt) *CreateMatViewStmt {
+	return &CreateMatViewStmt{pos: 0, Name: name, ColumnAliases: aliases, Query: q}
+}

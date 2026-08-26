@@ -305,6 +305,11 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   [IF EXISTS] [ONLY]; alter via second-keyword dispatch. Gate pins 13
   known S/Rs (IF_P x5). Multi-action lists, SET/DROP DEFAULT/NOT NULL,
   DROP CONSTRAINT, OWNER TO, SET SCHEMA, partition actions deferred.
+- [~] **P5 v0b CREATE MATERIALIZED VIEW (2026-08-26, flipped)**: CREATE
+  MATERIALIZED VIEW [IF NOT EXISTS] qn [(aliases)] AS select [WITH [NO] DATA]
+  via create-pair "materialized". WITH DATA is excluded from RawDef via the
+  with_data_kw marker (post-WITH-shift pin: endMark = prevPos+len(prevText) —
+  the select body's last token end). Gate pins 15 known S/Rs (IF_P x7).
 - [~] **P5 v0 CREATE VIEW (2026-08-26, flipped)**: CREATE [OR REPLACE] VIEW
   qn [(cols)] AS select routed via create-pair "view". TEMP/UNLOGGED VIEW
   intentionally NOT routed (modifier-prefix S/R ambiguity with create-table;

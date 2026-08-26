@@ -40,8 +40,10 @@ type lexerState struct {
 	err *parser.SyntaxError // first error wins
 
 	lastText string // original-case source text, for error wording
+	prevText string // text of the token before lastText
 	lastPos  int    // absolute Pos of last returned token
 	fragEnd  int    // exclusive end offset of fragment's last real token; trailing ';' excluded
+	endMark  int    // optional explicit span end (>=0); set by with_data_kw
 	prevPos  int    // absolute Pos of the token before that (mid-rule pos capture)
 
 	// base_yylex one-token pushback (base_yylex.go)
@@ -80,6 +82,15 @@ func (l *lexerState) spanText() string {
 	return strings.TrimSpace(l.src[l.spanStart:end])
 }
 
+// spanEnd returns endMark when set, else fragEnd (covers stmts with a
+// trailing optional clause that must stay out of the captured span).
+func (l *lexerState) spanEnd() int {
+	if l.endMark >= 0 {
+		return l.endMark
+	}
+	return l.fragEnd
+}
+
 // spanTextUpTo captures src[spanStart:end] trimmed like legacy captureSrcSpan;
 // end is an exclusive byte offset (e.g. the lookahead token's position).
 func (l *lexerState) spanTextUpTo(end int) string {
@@ -108,6 +119,7 @@ func ParseOneSrc(src string, toks []parser.Token) ([]parser.Stmt, error) {
 	l := &lexerState{toks: toks, src: src}
 	l.lastPos = eofPos(toks)
 	l.fragEnd = fragEndPos(src, toks)
+	l.endMark = -1
 	if yyParse(l) != 0 {
 		if l.err != nil {
 			return nil, l.err
@@ -121,6 +133,7 @@ func ParseOne(toks []parser.Token, baseOffset int) ([]parser.Stmt, error) {
 	_ = baseOffset
 	l := &lexerState{toks: toks}
 	l.lastPos = eofPos(toks)
+	l.endMark = -1
 	if yyParse(l) != 0 {
 		if l.err != nil {
 			return nil, l.err
@@ -166,6 +179,7 @@ func eofPos(toks []parser.Token) int {
 func (l *lexerState) Lex(lval *yySymType) int {
 	res := l.next()
 	l.prevPos = l.lastPos
+	l.prevText = l.lastText
 	lval.str = res.str
 	lval.ival = res.ival
 	lval.p = res.pos

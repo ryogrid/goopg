@@ -691,3 +691,37 @@ drop_view_stmt:
 			{
 				$$ = parser.NewDropViewStmt(0, $3, $4, dropBehavior($5))
 			}
+
+/* create_matview_stmt — P5 v0: CREATE MATERIALIZED VIEW [IF NOT EXISTS] qn
+   [(aliases)] AS select [WITH [NO] DATA]. USING/WITH (opts)/TABLESPACE
+   deferred (legacy fallback covers them via the modifier-fallback rule). */
+create_matview_stmt:
+		CREATE MATERIALIZED VIEW opt_if_not_exists qualified_name opt_name_list_p AS { yylex.(*lexerState).markSpanStart() } SelectStmt opt_with_data
+			{
+				nm := $5.parts
+				v := parser.ObjectName{Name: nm[len(nm)-1]}
+				if len(nm) > 1 {
+					v.Schema = nm[len(nm)-2]
+				}
+				sel := $9.(*parser.SelectStmt)
+				cv := parser.NewCreateMatViewStmt(v, $6, sel)
+				cv.IfNotExists = $4
+				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).spanEnd())
+				cv.WithNoData = $10
+				$$ = cv
+			}
+
+opt_with_data:
+		/* empty */      { $$ = false }
+	| with_data_kw DATA_P            { $$ = false }
+	| with_data_kw NO DATA_P         { $$ = true }
+
+/* with_data_kw shifts WITH then pins the span end to the END of the token
+   preceding WITH (the select body's last token). */
+with_data_kw:
+		WITH
+			{
+				l := yylex.(*lexerState)
+				l.endMark = l.prevPos + len(l.prevText)
+				_ = 0
+			}
