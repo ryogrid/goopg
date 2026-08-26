@@ -272,6 +272,15 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 
 ## P4 — DDL wave 1 (tables)
 
+- [~] **P4.1 CREATE TABLE v0 landed 2026-08-26 (grammar in goopg_ext.y;
+  routing INERT — "create" leads every DDL class so flipping needs
+  two-keyword dispatch first)**: column defs (name + cast_typename type incl.
+  typmods via col_type_name wrapper + NOT NULL / PRIMARY KEY / UNIQUE /
+  DEFAULT), table-level PRIMARY KEY (cols) and UNIQUE (cols). Legacy shapes
+  dump-identical (3 probe forms); corpus parity unchanged (its CREATE
+  literals use unported clauses — will climb with later slices). Remaining: CHECK/FK/named
+  constraints, WITH options, partitioning, INHERITS, OF type, AS SELECT,
+  TEMP/UNLOGGED/IF NOT EXISTS, then the dispatch refinement + flip.
 - [ ] **P4.1 CREATE TABLE columns+constraints**: column defs (types, DEFAULT,
   NOT NULL, GENERATED, collation), column + table-level constraints.
 - [ ] **P4.2 CREATE TABLE table options**: PARTITION BY / PARTITION OF,

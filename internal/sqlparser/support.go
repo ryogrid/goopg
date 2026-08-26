@@ -574,3 +574,48 @@ type updWhere struct {
 	expr      parser.Expr
 	currentOf string
 }
+
+// colSpec carries one CREATE TABLE column definition before conversion to
+// parser.ColumnDef (grammar carrier pattern).
+type colSpec struct {
+	name     string
+	schema   string
+	typ      string
+	args     []int64
+	isArray  bool
+	notNull  bool
+	primary  bool
+	unique   bool
+	defExpr  parser.Expr
+}
+
+// tableElem is one element of a CREATE TABLE parens list: a column spec or a
+// table-level PRIMARY KEY / UNIQUE marker.
+type tableElem struct {
+	col *colSpec
+	pk  []string
+	uq  [][]string
+}
+
+// colConstraints accumulates a column's constraint suffix in CREATE TABLE.
+type colConstraints struct {
+	args    []int64
+	notNull bool
+	primary bool
+	unique  bool
+	defExpr parser.Expr
+}
+
+// colConstraint is one parsed column-constraint keyword group.
+type colConstraint struct {
+	kind string // "nn" | "pk" | "uq" | "def"
+	expr parser.Expr
+}
+
+// tableElem is one CREATE TABLE parens element: a column or a table-level
+// PRIMARY KEY / UNIQUE marker.
+// typeWithArgs pairs a cast-typename with parenthesised typmod args.
+type typeWithArgs struct {
+	ct   castType
+	args []int64
+}

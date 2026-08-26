@@ -283,3 +283,18 @@ func SetDeleteWhereCurrentOf(d *DeleteStmt, cursor string) *DeleteStmt {
 	d.CurrentOf = cursor
 	return d
 }
+
+// NewColumnType builds a column type (CREATE TABLE positions).
+func NewColumnType(schema, name string, args []int64, isArray bool) ColumnType {
+	return ColumnType{Schema: schema, Name: name, Args: args, IsArray: isArray}
+}
+
+// NewColumnDef builds one column definition.
+func NewColumnDef(name string, ct ColumnType) *ColumnDef {
+	return &ColumnDef{pos: 0, Name: name, Type: ct}
+}
+
+// NewCreateTableStmt assembles the P4.1 v0 CREATE TABLE shape.
+func NewCreateTableStmt(pos int, name ObjectName, cols []ColumnDef, pk []string) *CreateTableStmt {
+	return &CreateTableStmt{pos: pos, Name: name, Columns: cols, PrimaryKey: pk, With: map[string]string{}}
+}

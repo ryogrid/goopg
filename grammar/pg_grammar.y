@@ -87,13 +87,15 @@
 %type <str>	subq_op extract_field
 %type <str>	opt_tzmark double_tail cast_ident character_word opt_upd_alias
 %type <vrows>	values_rows
-%type <stmt>	delete_stmt delete_core update_stmt update_core insert_stmt insert_core
+%type <stmt>	create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core
+%type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <isrc>	insert_source
 %type <oct>	opt_arbiter
 %type <ualist> update_set_list
 %type <ua>	update_assign
 %type <expr>	opt_update_where
 %type <node>	upd_where del_where
+%type <strs>	pk_cols uq_cols
 %type <rvars>	opt_upd_from opt_using_list
 %type <rvars>	upd_from_list
 %type <oc>	opt_on_conflict
@@ -159,6 +161,10 @@ stmt:
 				$$ = $1
 			}
 	| delete_stmt
+			{
+				$$ = $1
+			}
+	| create_table_stmt
 			{
 				$$ = $1
 			}
@@ -2335,3 +2341,28 @@ opt_using_list:
 del_where:
 		WHERE a_expr                { $$ = &updWhere{expr: $2} }
 	| WHERE CURRENT_P OF ColId     { $$ = &updWhere{currentOf: $4} }
+
+
+col_constraints:
+		/* empty */                    { $$ = &colConstraints{} }
+	| col_constraints col_constraint
+			{
+				cc := $1.(*colConstraints)
+				switch k := $2.(*colConstraint); k.kind {
+				case "nn":
+					cc.notNull = true
+				case "pk":
+					cc.primary = true
+				case "uq":
+					cc.unique = true
+				case "def":
+					cc.defExpr = k.expr
+				}
+				$$ = cc
+			}
+
+col_constraint:
+		NOT NULL_P        { $$ = &colConstraint{kind: "nn"} }
+	| PRIMARY KEY         { $$ = &colConstraint{kind: "pk"} }
+	| UNIQUE              { $$ = &colConstraint{kind: "uq"} }
+	| DEFAULT a_expr      { $$ = &colConstraint{kind: "def", expr: $2} }
