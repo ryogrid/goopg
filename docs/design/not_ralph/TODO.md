@@ -305,6 +305,13 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   [IF EXISTS] [ONLY]; alter via second-keyword dispatch. Gate pins 13
   known S/Rs (IF_P x5). Multi-action lists, SET/DROP DEFAULT/NOT NULL,
   DROP CONSTRAINT, OWNER TO, SET SCHEMA, partition actions deferred.
+- [~] **P5 v0 CREATE VIEW (2026-08-26, flipped)**: CREATE [OR REPLACE] VIEW
+  qn [(cols)] AS select routed via create-pair "view". TEMP/UNLOGGED VIEW
+  intentionally NOT routed (modifier-prefix S/R ambiguity with create-table;
+  secondKeywordRouted falls back to legacy when TEMP|TEMPORARY|UNLOGGED
+  precedes the object kind). KNOWN-DIFF: RawDef (view body source span) is
+  empty in yacc path — lexerState.last*/peek are zeroed at stmt-final reduce;
+  needs an end-of-body position carrier (pg_get_viewdef affected).
 - [~] **P4.3b DONE + bare-name create alt (2026-08-26)**: PARTITION OF rides
   opt_ct_tail(_noas); new bare `CREATE TABLE name opt_ct_tail_noas` alternative
   covers column-less creates (PARTITION OF / INHERITS / WITH / PARTITION BY

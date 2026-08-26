@@ -79,6 +79,15 @@ func (l *lexerState) spanText() string {
 	return strings.TrimSpace(l.src[l.spanStart:end])
 }
 
+// spanTextUpTo captures src[spanStart:end] trimmed like legacy captureSrcSpan;
+// end is an exclusive byte offset (e.g. the lookahead token's position).
+func (l *lexerState) spanTextUpTo(end int) string {
+	if l.src == "" || l.spanStart < 0 || end < l.spanStart || end > len(l.src) {
+		return ""
+	}
+	return strings.TrimSpace(l.src[l.spanStart:end])
+}
+
 // lexResult is one mapped terminal plus its semantic values and position.
 type lexResult struct {
 	term int

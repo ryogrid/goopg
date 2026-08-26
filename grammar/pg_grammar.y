@@ -76,7 +76,7 @@
 %type <rfes>	row_from_list
 %type <rfe>	row_from_entry_one
 
-%type <strs>	pk_cols uq_cols col_alias_list cte_col_list
+%type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
 %type <exprs>	opt_func_call_args
 %type <exprs>	opt_func_arg_list func_arg_list
@@ -89,13 +89,13 @@
 %type <str>	opt_tzmark double_tail cast_ident character_word opt_upd_alias
 %type <vrows>	values_rows
 %type <node>	opt_create_modifier opt_TRUNCATE_kw alter_table_action alter_action_list part_bound_spec2
-%type <b>	opt_ONLY_kw
+%type <b>	opt_ONLY_kw opt_or_replace
 %type <node>	opt_COLUMN
 %type <strs>	index_col_list
 %type <str>	index_col
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
-%type <stmt>	tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt
+%type <stmt>	tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt
 
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
@@ -228,6 +228,10 @@ stmt:
 				$$ = $1
 			}
 	| alter_table_stmt
+			{
+				$$ = $1
+			}
+	| create_view_stmt
 			{
 				$$ = $1
 			}

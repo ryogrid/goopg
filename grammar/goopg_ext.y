@@ -660,3 +660,27 @@ alter_table_action:
 opt_COLUMN:
 		/* empty */  { _ = 0 }
 	| COLUMN         { _ = 0 }
+
+/* create_view_stmt — P5 v0: CREATE [OR REPLACE] [TEMP] VIEW name [(cols)] AS select */
+create_view_stmt:
+		CREATE opt_or_replace VIEW qualified_name opt_name_list_p AS { yylex.(*lexerState).markSpanStart() } SelectStmt
+			{
+				nm := $4.parts
+				v := parser.ObjectName{Name: nm[len(nm)-1]}
+				if len(nm) > 1 {
+					v.Schema = nm[len(nm)-2]
+				}
+				sel := $8.(*parser.SelectStmt)
+				cv := parser.NewCreateViewStmt(v, $5, sel)
+				cv.OrReplace = $2
+				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).peek().pos)
+				$$ = cv
+			}
+
+opt_or_replace:
+		/* empty */  { $$ = false }
+	| OR REPLACE    { $$ = true }
+
+opt_name_list_p:
+		/* empty */          { $$ = []string(nil) }
+	| '(' colid_list ')'     { $$ = $2 }

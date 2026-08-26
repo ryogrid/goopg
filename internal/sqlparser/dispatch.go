@@ -164,7 +164,7 @@ func withFollowerRouted(toks []parser.Token) bool {
 
 // routedCreatePairs maps leading keyword -> set of ported second keywords.
 var routedCreatePairs = map[string]map[string]bool{
-	"create": {"table": true, "index": true},
+	"create": {"table": true, "index": true, "view": true},
 	"alter":  {"table": true},
 	"drop":   {"table": true, "index": true},
 }
@@ -178,13 +178,27 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 	}
 	var second string
 	found := false
+	skip := map[string]bool{"or": true, "replace": true}
+	modifierSeen := false
 	for _, tok := range frag[1:] {
 		if tok.Kind != parser.TokenKeyword && tok.Kind != parser.TokenIdent {
 			continue
 		}
-		second = strings.ToLower(tok.Value)
-		found = true
-		break
+		w := strings.ToLower(tok.Value)
+		if !found {
+			if w == "temp" || w == "temporary" || w == "unlogged" {
+				modifierSeen = true // CREATE TEMP <kind>: grammar covers table only
+			}
+			if skip[w] {
+				continue
+			}
+			second = w
+			found = true
+			break
+		}
+	}
+	if modifierSeen {
+		return allowed["table"] == true && false || false // TEMP-prefixed non-table stays legacy
 	}
 	if !found {
 		return false

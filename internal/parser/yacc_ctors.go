@@ -393,3 +393,8 @@ func NewCreateTablePartOf(name ObjectName, colDefs []ColumnDef, parent ObjectNam
 func NewPartitionOfClause(parent ObjectName, fromVals, toVals, inVals []Expr, isDefault bool) *PartitionOfClause {
 	return &PartitionOfClause{pos: 0, Parent: parent, FromValues: fromVals, ToValues: toVals, InValues: inVals, Default: isDefault}
 }
+
+// NewCreateViewStmt builds CREATE VIEW (P5 v0).
+func NewCreateViewStmt(name ObjectName, cols []string, q *SelectStmt) *CreateViewStmt {
+	return &CreateViewStmt{pos: 0, Name: name, Columns: cols, Query: q}
+}
