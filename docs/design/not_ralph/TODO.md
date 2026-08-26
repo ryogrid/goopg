@@ -262,7 +262,12 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
   deferred); WHERE expr | CURRENT OF cursor via updWhere carrier;
   RETURNING reuses opt_target_list. Live-verified single + FROM-join
   updates through the routed path; corpus parity 162, floor 158.
-- [ ] **P3.3 DELETE / MERGE**: USING joins; MERGE WHEN [NOT] MATCHED actions.
+- [x] **P3.3 DELETE ✅ (2026-08-26, flipped)**: [WITH] DELETE FROM [ONLY]
+  name [alias] [USING tables] WHERE expr|CURRENT OF [RETURNING]; alias uses
+  the IDENT-only bare form, USING rides upd_from_list. Live-verified
+  WHERE + USING joins through the routed path. MERGE deferred to a later
+  wave (rare in corpora; WHEN [NOT] MATCHED machinery is self-contained).
+  Parity 164, floor 160.
   Flip DML routing; WITH follower routing extends to INSERT/UPDATE/DELETE.
 
 ## P4 — DDL wave 1 (tables)

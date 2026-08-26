@@ -59,6 +59,7 @@ var routedStmts = map[string]bool{
 	"select": true,
 	"insert": true, // P3.1
 	"update": true, // P3.2
+	"delete": true, // P3.3
 }
 
 // routeBatch reports whether the whole batch can go to the new parser, plus

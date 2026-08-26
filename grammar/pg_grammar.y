@@ -87,14 +87,14 @@
 %type <str>	subq_op extract_field
 %type <str>	opt_tzmark double_tail cast_ident character_word opt_upd_alias
 %type <vrows>	values_rows
-%type <stmt>	update_stmt update_core insert_stmt insert_core
+%type <stmt>	delete_stmt delete_core update_stmt update_core insert_stmt insert_core
 %type <isrc>	insert_source
 %type <oct>	opt_arbiter
 %type <ualist> update_set_list
 %type <ua>	update_assign
 %type <expr>	opt_update_where
-%type <node>	upd_where
-%type <rvars>	opt_upd_from
+%type <node>	upd_where del_where
+%type <rvars>	opt_upd_from opt_using_list
 %type <rvars>	upd_from_list
 %type <oc>	opt_on_conflict
 %type <targets>	opt_returning
@@ -155,6 +155,10 @@ stmt:
 				$$ = $1
 			}
 	| update_stmt
+			{
+				$$ = $1
+			}
+	| delete_stmt
 			{
 				$$ = $1
 			}
@@ -2266,5 +2270,68 @@ upd_from_list:
 	| upd_from_list ',' qualified_name    { $$ = append($1, rangeVarFromName($3, "")) }
 
 upd_where:
+		WHERE a_expr                { $$ = &updWhere{expr: $2} }
+	| WHERE CURRENT_P OF ColId     { $$ = &updWhere{currentOf: $4} }
+
+/* delete_stmt — P3.3 (gram.y :17560 subset): [WITH] DELETE FROM [ONLY] name
+   [alias] [USING tables] WHERE expr|CURRENT OF cursor [RETURNING]. Alias
+   uses the IDENT-only bare form (USING is unreserved — same dodge as
+   UPDATE's SET). */
+delete_stmt:
+		delete_core opt_returning
+			{
+				d := $1.(*parser.DeleteStmt)
+				if len($2) > 0 {
+					d.Returning = $2
+				}
+				$$ = d
+			}
+
+delete_core:
+		DELETE_P FROM qualified_name opt_upd_alias opt_using_list del_where
+			{
+				rv := rangeVarFromName($3, $4)
+				w := $6.(*updWhere)
+				if w.currentOf != "" {
+					d := parser.NewDeleteStmt(0, rv, $5, nil)
+					parser.SetDeleteWhereCurrentOf(d, w.currentOf)
+					$$ = d
+				} else {
+					$$ = parser.NewDeleteStmt(0, rv, $5, w.expr)
+				}
+			}
+	| DELETE_P FROM ONLY qualified_name opt_upd_alias opt_using_list del_where
+			{
+				rv := rangeVarFromName($4, $5)
+				rv.Only = true
+				w := $7.(*updWhere)
+				if w.currentOf != "" {
+					d := parser.NewDeleteStmt(0, rv, $6, nil)
+					parser.SetDeleteWhereCurrentOf(d, w.currentOf)
+					$$ = d
+				} else {
+					$$ = parser.NewDeleteStmt(0, rv, $6, w.expr)
+				}
+			}
+	| with_clause DELETE_P FROM qualified_name opt_upd_alias opt_using_list del_where
+			{
+				rv := rangeVarFromName($4, $5)
+				w := $7.(*updWhere)
+				var d *parser.DeleteStmt
+				if w.currentOf != "" {
+					d = parser.NewDeleteStmt(0, rv, $6, nil)
+					parser.SetDeleteWhereCurrentOf(d, w.currentOf)
+				} else {
+					d = parser.NewDeleteStmt(0, rv, $6, w.expr)
+				}
+				d.With = $1
+				$$ = d
+			}
+
+opt_using_list:
+		/* empty */            { $$ = nil }
+	| USING upd_from_list    { $$ = $2 }
+
+del_where:
 		WHERE a_expr                { $$ = &updWhere{expr: $2} }
 	| WHERE CURRENT_P OF ColId     { $$ = &updWhere{currentOf: $4} }

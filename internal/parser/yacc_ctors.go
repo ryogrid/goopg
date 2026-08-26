@@ -271,3 +271,15 @@ func SetUpdateWhereCurrentOf(u *UpdateStmt, cursor string) *UpdateStmt {
 	u.CurrentOf = cursor
 	return u
 }
+
+// NewDeleteStmt builds the P3.3 DELETE shape (Using tables supported).
+func NewDeleteStmt(pos int, target RangeVar, using []RangeVar, where Expr) *DeleteStmt {
+	return &DeleteStmt{pos: pos, Target: target, Using: using, Where: where}
+}
+
+// SetDeleteWhereCurrentOf switches the WHERE clause to CURRENT OF.
+func SetDeleteWhereCurrentOf(d *DeleteStmt, cursor string) *DeleteStmt {
+	d.Where = nil
+	d.CurrentOf = cursor
+	return d
+}
