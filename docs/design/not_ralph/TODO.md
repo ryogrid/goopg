@@ -456,6 +456,37 @@ follows is what the audit left OPEN.
   is `internal/executor/expr.go:11569`. Leading suspects: catalog rows written
   before `5cf25672a` fixed `RawDef`, or the name-vs-OID lookup path.
 
+### Found by the first post-migration nightly (2026-08-27)
+
+The nightly's TPC-DS stage went from 0 errors (2026-08-25, pre-flip) to 6
+syntax errors. Root-caused to three grammar holes on the ROUTED SELECT path,
+all now FIXED, plus one deferred:
+
+- **`CAST(x AS t(p,s))` had no typmod alternatives** while the `::` spelling has
+  had them since P2.5 — a sibling-path divergence. Broke TPC-DS
+  Q18/Q49/Q61/Q75/Q90.
+- **The simple `CASE operand WHEN value THEN ...` form was missing entirely**
+  (only the searched form existed), so ordinary, very common SQL was a syntax
+  error. `NewCaseExpr` had always taken an operand — only the grammar lacked it.
+- **A bare derived-table alias accepted only `IDENT`**, not any unreserved
+  keyword, so TPC-DS Q90's `(...) at, (...) pt` failed.
+
+- [ ] **DEFERRED — a PARENTHESIZED select cannot be a set-operation operand.**
+  `((SELECT ...) EXCEPT (SELECT ...))` fails at the operator, though the
+  unparenthesized `(SELECT ... EXCEPT SELECT ...)` parses. Legacy accepts both.
+  Affects TPC-DS Q87 (and `query_0.sql`).
+  **Resume point:** upstream layers this as `select_clause: simple_select |
+  select_with_parens` with `select_with_parens: '(' select_no_parens ')' | '('
+  select_with_parens ')'`, and has `table_ref` consume `select_with_parens`
+  DIRECTLY. Two attempts were made and reverted:
+  grafting `'(' SelectStmt ')'` onto `simple_select` gives 18 S/R + 2 R/R
+  (`((SELECT 1))` becomes genuinely ambiguous — table_ref's paren vs
+  simple_select's); adopting the full upstream layering and rewiring `table_ref`
+  and the `LATERAL` arm gives 21 S/R + 1 R/R, because `'(' table_ref ')'` and
+  `select_with_parens` then compete on the same leading `(`. The remaining
+  tension is that existing `'(' table_ref ')'` group rule — resolve it (or fold
+  it into `select_with_parens`) BEFORE retrying. Conflict pin is 16.
+
 ### Found while consuming the audit list (2026-08-27) — all FIXED
 
 Five more AST-carrier defects on already-routed classes, none of them a parse

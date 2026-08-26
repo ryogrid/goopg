@@ -84,7 +84,8 @@ func harvestSQLLiterals(t *testing.T) []string {
 // fragEndPos/endMark quoted-tail repairs.
 // 2026-08-27 (table-level constraints wired): 250.
 // 2026-08-27 (table-level CHECK / FOREIGN KEY ported): 252.
-const legacyCorpusParityFloor = 247
+// 2026-08-27 (CAST typmods, simple CASE, keyword aliases): 255.
+const legacyCorpusParityFloor = 250
 
 func TestLegacyCorpusParity(t *testing.T) {
 	queries := harvestSQLLiterals(t)

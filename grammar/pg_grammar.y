@@ -1023,8 +1023,11 @@ opt_derived_alias:
 			{
 				$$ = &derivedAlias{alias: $2}
 			}
-	| IDENT
+	| ColId
 			{
+				// ColId, not IDENT: a bare derived-table alias may be any
+				// UNRESERVED keyword, and those lex as TokenKeyword rather than
+				// IDENT. TPC-DS Q90 aliases its subqueries `at` and `pt`.
 				$$ = &derivedAlias{alias: $1}
 			}
 	| AS ColId '(' col_alias_list ')'
@@ -1282,7 +1285,9 @@ part_frame_excl:
 			{ $$ = &partFrameExcl{} }
 
 /* CASE WHEN ... THEN ... [ELSE ...] END — gram.y :15464 case_expr subset.
-   The simple form (CASE operand WHEN val THEN ...) is deferred until
+   Both forms are supported: the searched form and the simple form
+   (CASE operand WHEN val THEN ...). Historical note — the simple form was
+   deferred until
    P2.3 func_call lands; searched form covers TPC-H Q12/Q13. */cse_wl:
 		when_then { $$ = $1 }
 	| cse_wl when_then
@@ -1477,6 +1482,22 @@ a_expr:
 			{
 				wl := $2.(*whenList)
 				$$ = parser.NewCaseExpr(0, nil, wl.items, $4)
+			}
+	/* SIMPLE form: CASE operand WHEN value THEN ... (gram.y case_expr's
+	   case_arg). NewCaseExpr has always taken an operand — only the grammar
+	   was missing, so `CASE x WHEN 1 THEN 2 END` was a syntax error on the
+	   routed SELECT path in every shape. WHEN is a reserved keyword and cannot
+	   start an a_expr, so the operand is LALR(1)-unambiguous against the
+	   searched form above. */
+	| CASE a_expr cse_wl END_P
+			{
+				wl := $3.(*whenList)
+				$$ = parser.NewCaseExpr(0, $2, wl.items, nil)
+			}
+	| CASE a_expr cse_wl ELSE a_expr END_P
+			{
+				wl := $3.(*whenList)
+				$$ = parser.NewCaseExpr(0, $2, wl.items, $5)
 			}
 
 	/* Generic operator terminal — gram.y `a_expr Op a_expr` (%left Op).
@@ -1793,6 +1814,30 @@ c_expr:
 	| CAST '(' a_expr AS cast_typename ')'
 			{
 				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: $5.name}, typmodsFor($5.name, nil, 0))
+			}
+	/* CAST(x AS t(n)) / CAST(x AS t(p,s)) — SIBLING of the `a_expr TYPECAST
+	   cast_typename '(' ... ')'` alternatives, which have carried typmods since
+	   P2.5. Only the '::' spelling did: `CAST(x AS decimal(15,4))` was a syntax
+	   error, and SELECT is routed, so it broke five TPC-DS queries
+	   (Q18/Q49/Q61/Q75/Q90). Float-precision folding is kept identical to the
+	   TYPECAST arm — legacy collapses float(p) into float4/float8. */
+	| CAST '(' a_expr AS cast_typename '(' ICONST ')' ')'
+			{
+				nm := $5.name
+				tm := []int64{int64($7)}
+				if nm == "float" && len($5.schema) == 0 {
+					if $7 <= 24 {
+						nm, tm = "float4", nil
+					} else {
+						nm, tm = "float8", nil
+					}
+				}
+				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: nm}, typmodsFor(nm, tm, 1))
+			}
+	| CAST '(' a_expr AS cast_typename '(' ICONST ',' ICONST ')' ')'
+			{
+				tm := typmodsFor($5.name, []int64{int64($7), int64($9)}, 2)
+				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: $5.name}, tm)
 			}
 	| func_expr_common_subexpr
 			{
