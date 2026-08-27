@@ -147,7 +147,7 @@ create_table_stmt:
 								// CONSTRAINT c CHECK (...) -> TableNamedChecks,
 								// and legacy does NOT touch the anonymous
 								// parallel slices for it (ddl.go:4191-4238).
-								namedChecks = append(namedChecks, parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check, NoInherit: e.checkNoInh})
+								namedChecks = append(namedChecks, parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check, NoInherit: e.checkNoInh, NotEnforced: e.checkNotEnf})
 							} else {
 								checks = append(checks, e.check)
 								checkNoInherit = append(checkNoInherit, e.checkNoInh)
@@ -849,8 +849,10 @@ ct_tail_item:
 			{ i := &ctTail{}; i.onCommit = "delete rows"; $$ = i }
 	| ON COMMIT DROP
 			{ i := &ctTail{}; i.onCommit = "drop"; $$ = i }
+	/* PRESERVE ROWS is the DEFAULT, and legacy records an EMPTY string for it
+	   rather than the words. */
 	| ON COMMIT PRESERVE ROWS
-			{ i := &ctTail{}; i.onCommit = "preserve rows"; $$ = i }
+			{ $$ = &ctTail{} }
 	| PARTITION BY ColId '(' part_elem_list ')'
 			{
 				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
@@ -1160,7 +1162,7 @@ set_stmt:
 	   "role" with no '='/TO, so setValueAtoms (which scans for the separator)
 	   cannot recover the value; it comes from the item directly. */
 	| SET set_scope ROLE set_value_atom
-			{ $$ = parser.NewSetStmt(0, $2, "role", $4, false) }
+			{ $$ = roleSetStmt($2, $4, isDefaultKeywordAt(yylex, $<p>4)) }
 
 	/* SET [LOCAL|SESSION] TIME ZONE v — gram.y's own set_rest alternative,
 	   normalised by legacy to the GUC "timezone". TIME is a col_name_keyword

@@ -1976,6 +1976,15 @@ func viewReloptions(cv *parser.CreateViewStmt, kvs []string) {
 			}
 		}
 		switch strings.ToLower(name) {
+		case "check_option":
+			// `WITH (check_option[=local|cascaded])` is the reloption spelling
+			// of `WITH [LOCAL|CASCADED] CHECK OPTION`; a bare name means
+			// cascaded, and the value may be quoted.
+			opt := strings.ToLower(strings.Trim(val, "'"))
+			if !hasVal || opt == "" {
+				opt = "cascaded"
+			}
+			cv.CheckOption = opt
 		case "security_barrier":
 			v := b
 			cv.SecurityBarrier = &v
@@ -3298,7 +3307,10 @@ func buildView(l yyLexer, orReplace bool, modifier any, q qname, cols []string, 
 	viewReloptions(cv, with)
 	st := l.(*lexerState)
 	co, _ := check.(*checkOpt)
-	if co != nil {
+	// The trailing WITH CHECK OPTION only OVERWRITES what the reloption list
+	// may already have set: viewReloptions runs first, and an absent trailer
+	// carries an empty string that would erase `WITH (check_option = ...)`.
+	if co != nil && co.opt != "" {
 		cv.CheckOption = co.opt
 		if co.pos >= 0 {
 			// RawDef stops at WITH: legacy's span excludes the option.
@@ -3728,4 +3740,33 @@ func isQuotedIdentAt(l yyLexer, pos int) bool {
 		}
 	}
 	return false
+}
+
+// roleSetStmt builds `SET [LOCAL] ROLE x`. `SET ROLE DEFAULT` is the reset
+// form: legacy records Default=true with an EMPTY value, exactly as the
+// generic `SET x = DEFAULT` path does.
+func roleSetStmt(local bool, v string, isDefault bool) parser.Stmt {
+	if isDefault {
+		return parser.NewSetStmt(0, local, "role", "", true)
+	}
+	return parser.NewSetStmt(0, local, "role", v, false)
+}
+
+// castTo builds a CAST target the way legacy's cast path does: `float` and
+// `float(p)` collapse into float4/float8 (array suffix preserved), a bare
+// char/character takes the implicit length of 1 — and a QUOTED name takes
+// NEITHER, because it denotes a user type.
+func castTo(l yyLexer, operand parser.Expr, ct castType, extra []int64, pos int) parser.Expr {
+	name, args := ct.name, ct.args
+	if len(extra) > 0 {
+		args = extra
+	}
+	quoted := isQuotedIdentAt(l, pos)
+	if ct.schema == "" && !quoted {
+		name, args, _ = parser.NormalizeFloatTypeName(name, args)
+	}
+	if !quoted {
+		args = typmodsFor(name, args, len(args))
+	}
+	return parser.NewCastExpr(operand.Pos(), operand, parser.ObjectName{Schema: ct.schema, Name: name}, args)
 }

@@ -2514,15 +2514,10 @@ a_expr:
 
 	| a_expr TYPECAST cast_typename
 			{
-				nm := $3.name
-				if nm == "float" {
-					nm = "float8"
-				}
 				// $3.args is the datetime targets' INLINE typmod
 				// (`timestamp(3) with time zone`), which cannot ride the
 				// trailing `'(' ICONST ')'` alternatives below.
-				tm := typmodsFor(nm, $3.args, len($3.args))
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: nm}, tm)
+				$$ = castTo(yylex, $1, $3, nil, $<p>3)
 			}
 	| a_expr TYPECAST cast_typename '(' ICONST ')'
 			{
@@ -2656,9 +2651,16 @@ a_expr:
 	| a_expr BETWEEN SYMMETRIC b_expr AND b_expr %prec BETWEEN
 			{
 				$$ = buildBetween($1, $4, $6, false, true)
-			}	| a_expr BETWEEN ASYMMETRIC b_expr AND b_expr %prec BETWEEN
+			}
+	/* ASYMMETRIC is the explicit spelling of the DEFAULT, so it desugars like
+	   the bare form, not like SYMMETRIC. */
+	| a_expr BETWEEN ASYMMETRIC b_expr AND b_expr %prec BETWEEN
 			{
-				$$ = buildBetween($1, $4, $6, false, true)
+				$$ = buildBetween($1, $4, $6, false, false)
+			}
+	| a_expr NOT_LA BETWEEN ASYMMETRIC b_expr AND b_expr %prec BETWEEN
+			{
+				$$ = buildBetween($1, $5, $7, true, false)
 			}
 	| a_expr NOT_LA BETWEEN b_expr AND b_expr %prec BETWEEN
 			{
@@ -2775,6 +2777,11 @@ c_expr:
 				l.lastIntervalNode, l.lastIntervalRaw = e, $2
 				$$ = e
 			}
+	/* GROUPING(a, b) — the SQL-standard pseudo-function, which legacy gives
+	   its OWN node rather than a FuncCall. GROUPING is a col_name_keyword, so
+	   it cannot reach name_or_call's IDENT path. */
+	| GROUPING '(' expr_list ')'
+			{ $$ = parser.NewGroupingCall($<p>1, $3) }
 	| TYPEDLIT
 			{
 				typ, val := typedLitParts($1)
@@ -2872,7 +2879,7 @@ c_expr:
 			}
 	| CAST '(' a_expr AS cast_typename ')'
 			{
-				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: $5.name}, typmodsFor($5.name, $5.args, len($5.args)))
+				$$ = castTo(yylex, $3, $5, nil, $<p>5)
 			}
 	/* CAST(x AS t(n)) / CAST(x AS t(p,s)) — SIBLING of the `a_expr TYPECAST
 	   cast_typename '(' ... ')'` alternatives, which have carried typmods since

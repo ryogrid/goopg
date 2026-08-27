@@ -52,7 +52,14 @@ func TestLegacyCorpusRejects(t *testing.T) {
 // 2026-08-28: 37 -> 29 after FK NOT VALID / NOT ENFORCED were RECORDED rather
 // than dropped, `CONSTRAINT n UNIQUE NULLS NOT DISTINCT` kept its name, and a
 // quoted `"float"` stopped taking the float8 normalisation.
-const legacyCorpusDivergenceCeiling = 29
+// 2026-08-28: 29 -> 15 after BETWEEN ASYMMETRIC stopped desugaring like
+// SYMMETRIC, `SET ROLE DEFAULT` became a Default=true reset, every cast target
+// started going through one normaliser (so `CAST(3 AS float)` is float8 and a
+// quoted `"char"` takes no implicit typmod), ON COMMIT PRESERVE ROWS went back
+// to the empty string legacy records for the default, `WITH (check_option=…)`
+// stopped being erased by the absent trailing clause, GROUPING(a,b) got its
+// own node, and a named table CHECK kept its NOT ENFORCED.
+const legacyCorpusDivergenceCeiling = 15
 
 func TestLegacyCorpusDivergence(t *testing.T) {
 	n := 0

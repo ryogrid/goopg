@@ -926,3 +926,9 @@ func NewNotifyStmt(pos int, channel, payload string, hasPayload bool) *NotifyStm
 func NewUnlistenStmt(pos int, channel string, all bool) *UnlistenStmt {
 	return &UnlistenStmt{pos: pos, Channel: channel, All: all}
 }
+
+// NewGroupingCall builds the SQL-standard `GROUPING(expr, ...)` pseudo-function,
+// which legacy represents with its own node rather than a FuncCall.
+func NewGroupingCall(pos int, args []Expr) *GroupingCall {
+	return &GroupingCall{pos: pos, Args: args}
+}
