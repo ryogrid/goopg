@@ -477,22 +477,38 @@ with_value:
    CONCURRENTLY arrive later); ColOrders/ColExprs filled with per-column
    defaults for legacy dump parity. */
 create_index_stmt:
-		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON qualified_name opt_using_method '(' index_col_list ')' opt_include opt_index_where
+		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON opt_ONLY_kw qualified_name opt_using_method '(' index_col_list ')' opt_include opt_index_with opt_index_where
 			{
-				nm := $8.parts
+				nm := $9.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
 				if len(nm) > 1 {
 					tbl.Schema = nm[len(nm)-2]
 				}
-				ix := parser.NewCreateIndexStmt(0, $2, $5, $6, tbl, $9, $11)
+				elems := $12.([]indexElem)
+				cols := make([]string, len(elems))
+				exprs := make([]parser.Expr, len(elems))
+				orders := make([]parser.IndexColOrder, len(elems))
+				for i, e := range elems {
+					cols[i], exprs[i], orders[i] = e.name, e.expr, e.order
+				}
+				ix := parser.NewCreateIndexStmt(0, $2, $5, $6, tbl, $10, cols)
+				ix.ColExprs = exprs
+				ix.ColOrders = orders
 				ix.Concurrently = $4
-				ix.IncludeColumns = $13
-				if p, _ := $14.(parser.Expr); p != nil {
+				ix.OnOnly = $8
+				ix.IncludeColumns = $14
+				ix.Fillfactor = $15
+				if p, _ := $16.(parser.Expr); p != nil {
 					ix.HasPredicate = true
 					ix.Predicate = p
 				}
 				$$ = ix
 			}
+
+/* opt_index_with — only fillfactor reaches the AST, as in legacy. */
+opt_index_with:
+		/* empty */                   { $$ = 0 }
+	| WITH '(' str_pair_list ')'      { $$ = fillfactorFrom($3) }
 
 /* opt_index_name — `CREATE INDEX ON t (a)` lets the server pick the name. ON
    is reserved and therefore never a ColId, so the empty case is unambiguous. */
@@ -513,11 +529,49 @@ opt_using_method:
 	| USING ColId        { $$ = $2 }
 
 index_col_list:
-		index_col                     { $$ = []string{$1} }
-	| index_col_list ',' index_col   { $$ = append($1, $3) }
+		index_col                     { $$ = []indexElem{$1.(indexElem)} }
+	| index_col_list ',' index_col   { $$ = append($1.([]indexElem), $3.(indexElem)) }
 
+/* index_col — gram.y index_elem. A key may be a NAME, a bare function call or
+   a parenthesised expression, each with an optional opclass / ASC|DESC /
+   NULLS order. Parsing the key as an a_expr and classifying in Go avoids the
+   ColId-vs-expression ambiguity that three explicit alternatives would carry. */
 index_col:
-		ColId                         { $$ = $1 }
+		name_or_call opt_index_collate opt_index_opclass opt_index_dir opt_index_nulls
+			{
+				$$ = newIndexElem($1, $2, $3, $4, $5.(*bool))
+			}
+	| '(' a_expr ')' opt_index_collate opt_index_opclass opt_index_dir opt_index_nulls
+			{
+				$$ = newIndexElem($2, $4, $5, $6, $7.(*bool))
+			}
+
+/* COLLATE is handled here, not via `a_expr COLLATE ColId`: legacy records a
+   collated key as Columns[i]=name with ColOrders[i].Collation set, not as a
+   CollateExpr, and the key form below is name_or_call rather than a_expr
+   precisely so a trailing opclass ColId cannot be mistaken for a continuation
+   of an expression (VARYING / FILTER / YEAR ... all did). */
+opt_index_collate:
+		/* empty */   { $$ = "" }
+	| COLLATE ColId   { $$ = $2 }
+
+/* IDENT, not ColId: an opclass name is always a real identifier
+   (float8_ops, text_pattern_ops), and ColId also admits FILTER and WITHIN,
+   which are exactly the tokens that continue a function-call key
+   (`f() FILTER (...)`, `f() WITHIN GROUP (...)`) — 4 shift/reduce conflicts. */
+opt_index_opclass:
+		/* empty */   { $$ = "" }
+	| IDENT           { $$ = $1 }
+
+opt_index_dir:
+		/* empty */   { $$ = false }
+	| ASC             { $$ = false }
+	| DESC            { $$ = true }
+
+opt_index_nulls:
+		/* empty */              { $$ = (*bool)(nil) }
+	| NULLS_LA FIRST_P           { v := true; $$ = &v }
+	| NULLS_LA LAST_P            { v := false; $$ = &v }
 
 drop_index_stmt:
 		DROP INDEX opt_concurrently opt_drop_if_exists drop_name_list opt_drop_behavior

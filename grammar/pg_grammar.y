@@ -94,8 +94,10 @@
 %type <node>	opt_create_modifier opt_TRUNCATE_kw alter_table_action alter_action_list part_bound_spec2
 %type <b>	opt_ONLY_kw opt_or_replace opt_with_data
 %type <node>	opt_COLUMN
-%type <strs>	index_col_list
-%type <str>	index_col
+%type <node>	index_col_list index_col opt_index_nulls
+%type <str>	opt_index_opclass opt_index_collate
+%type <b>	opt_index_dir
+%type <ival>	opt_index_with
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
 %type <str>	opt_index_name

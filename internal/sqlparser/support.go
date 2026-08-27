@@ -820,6 +820,64 @@ func namedTableConstraint(name string, cols []string, isPrimary bool, incl []str
 	return d
 }
 
+// fillfactorFrom pulls the fillfactor out of a CREATE INDEX `WITH (...)` list.
+// Only fillfactor reaches the AST, as in legacy; other storage parameters are
+// accepted and discarded.
+func fillfactorFrom(kvs []string) int {
+	for _, kv := range kvs {
+		parts := splitKV(kv)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "fillfactor") {
+			continue
+		}
+		n := 0
+		for _, c := range parts[1] {
+			if c < '0' || c > '9' {
+				return 0
+			}
+			n = n*10 + int(c-'0')
+		}
+		return n
+	}
+	return 0
+}
+
+// indexElem is one CREATE INDEX key column: either a NAME or an EXPRESSION,
+// plus its per-column ordering options. Legacy keeps Columns / ColExprs /
+// ColOrders as three PARALLEL slices, with Columns[i]=="" marking an
+// expression column (internal/parser/ddl.go).
+type indexElem struct {
+	name  string
+	expr  parser.Expr
+	order parser.IndexColOrder
+}
+
+// newIndexElem classifies a parsed key item. Parsing every item as an a_expr
+// and classifying afterwards avoids the ColId-vs-expression ambiguity a
+// two-alternative rule would introduce — the same trick arbiterFromExprs uses.
+//
+// A collation may arrive either from index_col's own opt_index_collate (the
+// name form) or, for the parenthesised expression form, as a CollateExpr that
+// a_expr already absorbed; legacy records both as ColOrders[i].Collation
+// rather than as a CollateExpr node, so the wrapper is unwrapped here.
+func newIndexElem(e parser.Expr, collation, opclass string, desc bool, nullsFirst *bool) indexElem {
+	el := indexElem{order: parser.IndexColOrder{Descending: desc, OpClass: opclass, Collation: collation}}
+	if ce, ok := e.(*parser.CollateExpr); ok {
+		el.order.Collation = ce.CollationName
+		e = ce.Operand
+	}
+	if cr, ok := e.(*parser.ColumnRef); ok && cr.Schema == "" && cr.Table == "" {
+		el.name = cr.Column
+	} else {
+		el.expr = e
+	}
+	// DESC implies NULLS FIRST unless the clause says otherwise (PG default).
+	el.order.NullsFirst = desc
+	if nullsFirst != nil {
+		el.order.NullsFirst = *nullsFirst
+	}
+	return el
+}
+
 // arbiterFromExprs turns an `ON CONFLICT ( ... )` item list into the legacy
 // column/expression split. Parsing every item as an a_expr and classifying
 // afterwards avoids the ColId-vs-a_expr ambiguity a two-alternative item rule
