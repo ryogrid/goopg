@@ -79,9 +79,11 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
-%type <str>	sort_using_op constr_name
+%type <str>	sort_using_op constr_name opt_part_opclass
+%type <node>	part_elem part_elem_list
+
 %type <strs>	constr_name_list
-%type <b>	constraints_set_mode opt_no_inherit
+%type <b>	constraints_set_mode opt_no_inherit opt_ctas_with_data
 %type <node>	trunc_name_list trunc_name
 %type <exprs>	opt_func_call_args
 %type <node>	opt_call_args call_arg_list call_arg
@@ -1729,6 +1731,14 @@ a_expr:
 			{
 				$$ = parser.NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
 			}
+	/* Prefix operator — gram.y `qual_Op a_expr %prec Op`. '-' and '+' arrive
+	   as char terminals and have their own alternatives above, so the only
+	   spelling that reaches here and that legacy also takes (select.go:3025)
+	   is '~'; prefixOp rejects the rest rather than silently widening. */
+	| Op a_expr %prec Op
+			{
+				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), prefixOp(yylex, $1), $2)
+			}
 	/* op ANY/SOME/ALL — gram.y :15150ff quantified comparisons via
 	   subquery_Op subset. */
 	| a_expr subq_op ANY '(' expr_list ')'
@@ -2185,6 +2195,26 @@ b_expr:
 	| '(' b_expr ')'
 			{
 				$$ = $2
+			}
+	/* b_expr's own unary signs and generic operator — gram.y gives b_expr the
+	   same four (`'+' b_expr`, `'-' b_expr`, `b_expr qual_Op b_expr`,
+	   `qual_Op b_expr`). Without them BETWEEN, whose operands are b_expr,
+	   rejected every signed bound: `BETWEEN -1e6 AND 1e6`. */
+	| '-' b_expr %prec UMINUS
+			{
+				$$ = foldNegate($2)
+			}
+	| '+' b_expr %prec UMINUS
+			{
+				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), parser.OpUnaryPos, $2)
+			}
+	| b_expr Op b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
+			}
+	| Op b_expr %prec Op
+			{
+				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), prefixOp(yylex, $1), $2)
 			}
 
 opt_func_call_args:

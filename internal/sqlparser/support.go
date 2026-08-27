@@ -60,6 +60,14 @@ func rangeVarFromName(q qname, alias string) parser.RangeVar {
 // foldNegate mirrors gram.y's doNegate (:10874): unary minus applied
 // directly to a numeric literal folds INTO the constant instead of building
 // a UnaryOp node.
+//
+// This DIVERGES from legacy, which never folds — `SELECT -1`,
+// `INSERT INTO t VALUES (-1)`, `LIMIT -1` and `FOR VALUES FROM (-1)` all build
+// UnaryOp{OpUnaryNeg, IntegerConst{1}} there. The divergence is deliberate and
+// pre-existing: difftest_known_diffs.md rules it "(b)-inverted — yacc is RIGHT,
+// made moot at cutover", pinned on both sides by TestKnownDiffUnaryMinusFold.
+// b_expr's new unary-sign alternatives inherit it, which is why BETWEEN's
+// signed bounds fold too; that is consistent, not a new divergence.
 func foldNegate(e parser.Expr) parser.Expr {
 	switch v := e.(type) {
 	case *parser.IntegerConst:
@@ -677,19 +685,6 @@ func (t *createTail) withMap() map[string]string {
 	return m
 }
 
-// partKey is one PARTITION BY key element.
-type partKey struct {
-	name string
-	pos  int
-	expr parser.Expr
-}
-
-// partMethod carries the PARTITION BY strategy word + its byte position.
-type partMethod struct {
-	method string
-	pos    int
-}
-
 
 // colConstraint is one parsed column-constraint keyword group.
 type colConstraint struct {
@@ -1153,4 +1148,61 @@ type tableNotNull struct {
 	name      string
 	col       string
 	noInherit bool
+}
+
+// prefixOp maps a prefix operator token to its OpCode. Legacy's prefix set is
+// exactly {-, +, NOT, ~} (internal/parser/select.go:3005-3031); '-', '+' and
+// NOT reach the grammar as their own terminals, so '~' is the only spelling
+// that arrives here. Anything else is rejected rather than silently accepted:
+// widening past legacy is a behaviour change, not a port.
+func prefixOp(l yyLexer, s string) parser.OpCode {
+	if s == "~" {
+		return parser.OpBitNot
+	}
+	if ls, ok := l.(*lexerState); ok && ls.err == nil {
+		ls.err = &parser.SyntaxError{Message: fmt.Sprintf("operator does not exist: %s", s), Raw: true, Pos: ls.lastConsumedPos()}
+	}
+	return parser.OpUnknown
+}
+
+// partKey is one entry of a PARTITION BY key list.
+type partKey struct {
+	name      string      // plain column key; "" for an expression key
+	pos       int         // byte offset of the column token; 0 for an expression key
+	expr      parser.Expr // expression key; nil for a plain column key
+	opClass   string
+	collation string
+}
+
+// newPartKey classifies one part_elem the way newIndexElem classifies an index
+// key: a bare ColumnRef is a COLUMN key (recorded by name, with its position
+// for M0134-0016b errposition), anything else is an EXPRESSION key. A COLLATE
+// that rode in on the expression is unwrapped into its own field, because
+// legacy records it in Collations rather than as a CollateExpr.
+func newPartKey(e parser.Expr, pos int, collation, opClass string) partKey {
+	k := partKey{collation: collation, opClass: opClass}
+	if ce, ok := e.(*parser.CollateExpr); ok {
+		k.collation = ce.CollationName
+		e = ce.Operand
+	}
+	if cr, ok := e.(*parser.ColumnRef); ok && cr.Schema == "" && cr.Table == "" {
+		k.name, k.pos = cr.Column, pos
+	} else {
+		k.expr = e
+	}
+	return k
+}
+
+// partitionByFrom assembles the five parallel slices PartitionByClause keeps.
+func partitionByFrom(method string, methodPos int, keys []partKey) *parser.PartitionByClause {
+	pb := parser.NewPartitionByClause(upperIdent(method), nil)
+	pb.MethodPos = methodPos
+	for _, k := range keys {
+		pb.KeyCols = append(pb.KeyCols, k.name)
+		pb.KeyColPos = append(pb.KeyColPos, k.pos)
+		pb.KeyExprs = append(pb.KeyExprs, k.expr)
+		pb.OpClasses = append(pb.OpClasses, k.opClass)
+		pb.Collations = append(pb.Collations, k.collation)
+	}
+	return pb
 }

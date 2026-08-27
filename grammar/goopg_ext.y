@@ -454,7 +454,30 @@ col_type_name:
    routes on its own leading keyword. ONLY-per-table and RESTART IDENTITY
    forms arrive with a later slice. */
 create_table_stmt_as:
-		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name AS SelectStmt
+	/* CTAS with an explicit COLUMN-ALIAS list: `CREATE TABLE t (a, b) AS
+	   SELECT ...`. These are aliases, not column definitions — they carry no
+	   type — so they land in ColumnAliases, and the parenthesised
+	   opt_table_element_list rule (:19) cannot take them. */
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' colid_list ')' AS SelectStmt opt_ctas_with_data
+			{
+				sel, _ := $10.(*parser.SelectStmt)
+				nm := $5.parts
+				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
+				if len(nm) > 1 {
+					tbl.Schema = nm[len(nm)-2]
+				}
+				ct := parser.NewCreateTableStmt(0, tbl, nil, nil)
+				if pfx := $2.(*createPrefix); pfx != nil {
+					ct.Temporary = pfx.temporary
+					ct.Unlogged = pfx.unlogged
+				}
+				ct.IfNotExists = $4
+				ct.ColumnAliases = $7
+				ct.SelectSource = sel
+				ct.WithNoData = $11
+				$$ = ct
+			}
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name AS SelectStmt opt_ctas_with_data
 			{
 				sel, _ := $7.(*parser.SelectStmt)
 				nm := $5.parts
@@ -469,8 +492,17 @@ create_table_stmt_as:
 				}
 				ct.IfNotExists = $4
 				ct.SelectSource = sel
+				ct.WithNoData = $8
 				$$ = ct
 			}
+
+/* Plain WITH [NO] DATA for CTAS. Deliberately NOT opt_with_data, whose
+   with_data_kw carries a span-end side effect that exists only to pin a
+   materialized view's RawDef; CreateTableStmt keeps no raw body. */
+opt_ctas_with_data:
+		/* empty */      { $$ = false }
+	| WITH DATA_P        { $$ = false }
+	| WITH NO DATA_P     { $$ = true }
 
 drop_table_stmt:
 		DROP TABLE opt_if_exists_drop drop_name_list opt_drop_behavior
@@ -524,6 +556,37 @@ trunc_name:
 				$$ = &truncTargets{names: []parser.ObjectName{objectNameFromQn($2)}, only: []bool{true}}
 			}
 
+/* Partition keys — gram.y part_elem. A key is a column name, a function call,
+   or a parenthesised expression, each with an optional COLLATE and an optional
+   operator class. The shape mirrors index_col (:739) deliberately, for the same
+   reason: with a bare a_expr key, a trailing opclass ColId is indistinguishable
+   from a continuation of the expression. Only colid_list was ported, so both
+   expression keys and opclasses were hard 42601s, and MethodPos / KeyColPos —
+   which M0134-0016b errposition reporting reads — were left at zero even for
+   plain column keys.
+
+   Positions come from $<p>N, NOT from lastConsumedPos(). The lexer stamps
+   lval.p on every token (adapter.go:302) and goyacc's default action copies the
+   whole symbol struct from $1, so p propagates up through ColId and
+   qualified_name untouched and $<p>N is the exact offset of symbol N's first
+   terminal. lastConsumedPos() is prevPos, which is only correct when the parser
+   happened to read a lookahead before the reduce — here it did not, and both
+   MethodPos and KeyColPos came out one token early. */
+part_elem:
+		name_or_call opt_index_collate opt_part_opclass
+			{ $$ = newPartKey($1, $<p>1, $2, $3) }
+	| '(' a_expr ')' opt_index_collate opt_part_opclass
+			{ $$ = newPartKey($2, 0, $4, $5) }
+
+part_elem_list:
+		part_elem                       { $$ = []partKey{$1.(partKey)} }
+	| part_elem_list ',' part_elem      { $$ = append($1.([]partKey), $3.(partKey)) }
+
+/* IDENT rather than ColId, for the reason spelled out at opt_index_opclass. */
+opt_part_opclass:
+		/* empty */   { $$ = "" }
+	| IDENT           { $$ = $1 }
+
 opt_no_inherit:
 		/* empty */   { $$ = false }
 	| NO INHERIT      { $$ = true }
@@ -562,15 +625,9 @@ opt_ct_tail:
 				sel, _ := $2.(*parser.SelectStmt)
 				i := &ctTail{}; i.asSelect = sel; $$ = i
 			}
-	| PARTITION BY ColId '(' colid_list ')'
+	| PARTITION BY ColId '(' part_elem_list ')'
 			{
-				pb := parser.NewPartitionByClause(upperIdent($3), nil)
-				for _, c := range $5 {
-					pb.KeyCols = append(pb.KeyCols, c)
-					pb.OpClasses = append(pb.OpClasses, "")
-					pb.Collations = append(pb.Collations, "")
-				}
-				i := &ctTail{}; i.partition = pb; $$ = i
+				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
 			}
 	| PARTITION OF qualified_name part_bound_spec2
 			{
@@ -592,15 +649,9 @@ opt_ct_tail_noas:
 			{ i := &ctTail{}; i.withKv = $3; $$ = i }
 	| INHERITS '(' drop_name_list ')'
 			{ i := &ctTail{}; i.inherits = $3; $$ = i }
-	| PARTITION BY ColId '(' colid_list ')'
+	| PARTITION BY ColId '(' part_elem_list ')'
 			{
-				pb := parser.NewPartitionByClause(upperIdent($3), nil)
-				for _, c := range $5 {
-					pb.KeyCols = append(pb.KeyCols, c)
-					pb.OpClasses = append(pb.OpClasses, "")
-					pb.Collations = append(pb.Collations, "")
-				}
-				i := &ctTail{}; i.partition = pb; $$ = i
+				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
 			}
 	| PARTITION OF qualified_name part_bound_spec2
 			{
@@ -938,6 +989,11 @@ show_stmt:
 reset_stmt:
 		RESET ALL      { $$ = parser.NewResetStmt(0, true, "") }
 	| RESET ColId      { $$ = parser.NewResetStmt(0, false, $2) }
+	/* RESET SESSION AUTHORIZATION — gram.y's dedicated VariableResetStmt
+	   alternative. AUTHORIZATION is a reserved keyword, so `RESET ColId`
+	   cannot reach it; legacy normalises the pair to the GUC's real name. */
+	| RESET SESSION AUTHORIZATION
+			{ $$ = parser.NewResetStmt(0, false, "session_authorization") }
 
 /* alter_table_stmt — P4.2 v0 (gram.y AlterTableStmt subset): single action
    of ADD COLUMN / ADD PRIMARY KEY / DROP COLUMN / ALTER COLUMN TYPE /
