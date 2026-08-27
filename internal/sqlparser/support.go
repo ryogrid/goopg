@@ -814,6 +814,7 @@ func applyFkAction(a *fkActs, n *namedFkAct) *fkActs {
 // ctTail carries trailing CREATE TABLE options (v2 flat alternatives).
 type ctTail struct {
 	partOf    parser.ObjectName
+	partOfElems []*partOfElem // PARTITION OF ... ( elements )
 	fromVals  []parser.Expr
 	toVals    []parser.Expr
 	inVals    []parser.Expr
@@ -938,8 +939,9 @@ const likeAllOpts = ":+defaults:+identity:+generated:+constraints:+indexes:+comm
 
 // excludeElem is one `col WITH op` item of an EXCLUDE constraint.
 type excludeElem struct {
-	col string
-	op  string
+	col  string
+	op   string
+	cols []string // a parenthesised element: every identifier token inside, as legacy records it
 }
 
 // newExclusionConstraint builds the TableConstraintDef legacy produces for an
@@ -947,10 +949,14 @@ type excludeElem struct {
 // ExclusionOp (the first), and defaults Method to "btree" when USING is
 // omitted (internal/parser/ddl.go).
 func newExclusionConstraint(name, method string, elems []excludeElem, incl []string, where parser.Expr, a *constrAttrs) *parser.TableConstraintDef {
-	cols := make([]string, len(elems))
+	var cols []string
 	op := ""
-	for i, e := range elems {
-		cols[i] = e.col
+	for _, e := range elems {
+		if e.cols != nil {
+			cols = append(cols, e.cols...)
+		} else {
+			cols = append(cols, e.col)
+		}
 		if op == "" {
 			op = e.op
 		}
@@ -1035,6 +1041,17 @@ func callFuncExpr(pos int, name parser.ObjectName, ca *callArgs) *parser.FuncCal
 	}
 	fc := parser.NewFuncCall(pos, name, ca.exprs, false)
 	fc.Variadic = ca.variadic
+	if name.Schema == "" {
+		switch strings.ToLower(name.Name) {
+		case "substring", "overlay", "position":
+			// Legacy builds these as SPECIAL FORMS whichever way they are
+			// spelled — `substring(x, 1, 2)` included — and never touches
+			// Variadic. The keyword rules cannot own the comma spelling
+			// (they would reduce/reduce against this path), so the
+			// name-based call blanks it here.
+			fc.Variadic = nil
+		}
+	}
 	return fc
 }
 
@@ -1479,4 +1496,140 @@ func tokenJoinLower(l yyLexer, from, to int) string {
 		parts = append(parts, v)
 	}
 	return strings.Join(parts, " ")
+}
+
+// parenExcludeElem reproduces legacy's reading of a PARENTHESISED exclusion
+// element, `(c2::circle) WITH &&` (ddl.go, the EXCLUDE token loop): it never
+// parses the expression — it records every identifier token inside the parens
+// as a column name and takes the FIRST operator token it meets as the
+// element's operator, so `(c2::circle) WITH &&` yields Columns [c2 circle] and
+// ExclusionOp "::". Reproduced from the token stream, bug for bug, because the
+// AST is the migration's contract.
+func parenExcludeElem(l yyLexer, from, to int, withOp string) excludeElem {
+	el := excludeElem{op: withOp, cols: []string{}}
+	ls, ok := l.(*lexerState)
+	if !ok {
+		return el
+	}
+	firstOp := ""
+	for _, tk := range ls.toks {
+		if tk.Pos < from || tk.Pos >= to {
+			continue
+		}
+		switch tk.Kind {
+		case parser.TokenIdent, parser.TokenKeyword:
+			el.cols = append(el.cols, strings.ToLower(tk.Value))
+		case parser.TokenOperator:
+			if firstOp == "" {
+				firstOp = tk.Value
+			}
+		}
+	}
+	if firstOp != "" {
+		el.op = firstOp
+	}
+	return el
+}
+
+// bitStringConst reproduces legacy decodeBitStringLit (expr.go:54): the
+// lexer's Value carries a marker byte ('b' or 'x') ahead of the body; a binary
+// body is kept verbatim and a hex body is expanded to four bits per digit.
+// Both become a plain StringConst.
+func bitStringConst(pos int, v string) parser.Expr {
+	if v == "" {
+		return parser.NewStringConst(pos, "")
+	}
+	marker, body := v[0], v[1:]
+	if marker != 'x' {
+		return parser.NewStringConst(pos, body)
+	}
+	var out strings.Builder
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		var d byte
+		switch {
+		case c >= '0' && c <= '9':
+			d = c - '0'
+		case c >= 'A' && c <= 'F':
+			d = c - 'A' + 10
+		case c >= 'a' && c <= 'f':
+			d = c - 'a' + 10
+		}
+		for bit := 3; bit >= 0; bit-- {
+			if d&(1<<uint(bit)) != 0 {
+				out.WriteByte('1')
+			} else {
+				out.WriteByte('0')
+			}
+		}
+	}
+	return parser.NewStringConst(pos, out.String())
+}
+
+// mergeCtTail folds one CREATE TABLE trailing clause into the accumulated
+// tail: option lists and INHERITS append, PARTITION BY / PARTITION OF replace.
+func mergeCtTail(dst, src *ctTail) *ctTail {
+	dst.withKv = append(dst.withKv, src.withKv...)
+	dst.inherits = append(dst.inherits, src.inherits...)
+	if src.partition != nil {
+		dst.partition = src.partition
+	}
+	if src.partOf.Name != "" {
+		dst.partOf = src.partOf
+		dst.fromVals, dst.toVals, dst.inVals, dst.bDefault = src.fromVals, src.toVals, src.inVals, src.bDefault
+		dst.modulus, dst.remainder, dst.isHash = src.modulus, src.remainder, src.isHash
+		dst.partOfElems = src.partOfElems
+	}
+	return dst
+}
+
+// viewReloptions applies a CREATE VIEW `WITH (...)` list the way legacy's
+// parseViewOptions does: security_barrier / security_invoker become *bool
+// (present without a value = true; a value goes through the reloption boolean
+// spellings), everything else is ignored.
+func viewReloptions(cv *parser.CreateViewStmt, kvs []string) {
+	for _, kv := range kvs {
+		name, val, hasVal := kv, "", false
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			name, val, hasVal = kv[:i], kv[i+1:], true
+		}
+		b := true
+		if hasVal {
+			switch strings.ToLower(val) {
+			case "true", "on", "yes", "1", "t", "y":
+				b = true
+			default:
+				b = false
+			}
+		}
+		switch strings.ToLower(name) {
+		case "security_barrier":
+			v := b
+			cv.SecurityBarrier = &v
+		case "security_invoker":
+			v := b
+			cv.SecurityInvoker = &v
+		}
+	}
+}
+
+// nonNilExprs is the ARRAY[...] element-list convention: an empty constructor
+// carries an empty slice, never nil.
+func nonNilExprs(e []parser.Expr) []parser.Expr {
+	if e == nil {
+		return []parser.Expr{}
+	}
+	return e
+}
+
+// insertTarget reproduces a legacy quirk of `INSERT INTO t AS alias (cols)`:
+// with an alias present, the column list is recorded as the RangeVar's
+// alias column list and InsertStmt.Columns stays nil.
+func insertTarget(q qname, alias string, cols []string) (parser.RangeVar, []string) {
+	rv := rangeVarFromName(q, alias)
+	if alias != "" && cols != nil {
+		rv.Columns = cols
+		return rv, nil
+	}
+	return rv, cols
 }

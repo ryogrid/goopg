@@ -16,7 +16,7 @@
    CHECK / FK / named constraints / WITH / partitioning arrive in later P4
    slices. */
 create_table_stmt:
-		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' opt_table_element_list ')' opt_table_am opt_ct_tail opt_tablespace
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' opt_table_element_list ')' ct_tail_list opt_tablespace
 			{
 				elems := $7.([]*tableElem)
 				var cols []parser.ColumnDef
@@ -188,8 +188,8 @@ create_table_stmt:
 				ct.TableHasNoInheritCheck = hasNoInheritCheck
 				ct.TableCheckNoInherit = checkNoInherit
 				ct.TableCheckNotEnforced = checkNotEnforced
-				tail := $10
-				ct.Tablespace = $11
+				tail := $9
+				ct.Tablespace = $10
 				_ = tail
 				for _, kv := range tail.withKv {
 					if ct.With == nil {
@@ -205,11 +205,12 @@ create_table_stmt:
 				if tail.partOf.Name != "" {
 					ct.PartitionOf = parser.NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
 					parser.SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
+					applyPartOfElems(ct.PartitionOf, tail.partOfElems)
 				}
 				ct.SelectSource = tail.asSelect
 				$$ = ct
 			}
-	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name opt_ct_tail_noas opt_tablespace
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name ct_tail_list opt_tablespace
 			{
 				nm := $5.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -238,27 +239,27 @@ create_table_stmt:
 				if tail.partOf.Name != "" {
 					ct.PartitionOf = parser.NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
 					parser.SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
+					applyPartOfElems(ct.PartitionOf, tail.partOfElems)
 				}
 				ct.SelectSource = tail.asSelect
 				$$ = ct
 			}
 
-	/* CREATE TABLE c PARTITION OF p ( elements ) bound — gram.y's
-	   OptTypedTableElementList on a partition. Legacy keeps the elements on the
-	   PartitionOfClause (ddl.go:3290-3410) rather than as columns. */
-	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name PARTITION OF qualified_name '(' partof_elem_list ')' part_bound_spec2 opt_subpartition_by
+	/* Plain CTAS, `CREATE TABLE t [USING am] [WITH (...)] AS query`, lives HERE
+	   over ct_tail_list rather than in create_table_stmt_as: its optional
+	   USING / WITH prefix and the no-column CREATE's tail start in the same
+	   state, and two separate rules for them reduce/reduce on WITH. */
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name ct_tail_list AS ctas_source opt_ctas_with_data
 			{
+				src := $8.(*ctasSrc)
 				ct := parser.NewCreateTableStmt(0, objectNameFromQn($5), nil, nil)
 				if pfx := $2.(*createPrefix); pfx != nil {
 					ct.Temporary = pfx.temporary
 					ct.Unlogged = pfx.unlogged
 				}
 				ct.IfNotExists = $4
-				b := $12.(*partBound)
-				ct.PartitionOf = parser.NewPartitionOfClause(objectNameFromQn($8), b.from, b.to, b.inVals, b.isDefault)
-				parser.SetPartitionOfHashBound(ct.PartitionOf, b.modulus, b.remainder, b.isHash)
-				applyPartOfElems(ct.PartitionOf, $10.([]*partOfElem))
-				ct.PartitionBy, _ = $13.(*parser.PartitionByClause)
+				ct.SelectSource, ct.ExecuteSource = src.sel, src.exec
+				ct.WithNoData = $9
 				$$ = ct
 			}
 	/* Typed table — `CREATE TABLE t OF type [( col WITH OPTIONS ... )]`
@@ -469,6 +470,7 @@ exclude_elem_list:
 
 exclude_elem:
 		ColId WITH exclude_op                 { $$ = excludeElem{col: $1, op: $3} }
+	| '(' a_expr ')' WITH exclude_op          { $$ = parenExcludeElem(yylex, $<p>2, $<p>3, $5) }
 
 /* The exclusion operator is a bare operator token: single-char comparisons are
    char terminals, everything else (&&, @>, ...) arrives as Op. */
@@ -490,6 +492,10 @@ pk_cols:
 
 uq_cols:
 		'(' colid_list ')'   { $$ = $2 }
+	/* `UNIQUE (valid_at WITHOUT OVERLAPS)` — legacy's column-list loop takes
+	   the two keywords as two more COLUMN NAMES. Reproduced as-is; the AST is
+	   the contract. */
+	| '(' colid_list WITHOUT OVERLAPS ')'   { $$ = append($2, "without", "overlaps") }
 
 /* col_type_name — cast_typename plus optional typmod args; arrays ride
    cast_typename's own suffix and are re-detected in the action. */
@@ -508,9 +514,9 @@ create_table_stmt_as:
 	   SELECT ...`. These are aliases, not column definitions — they carry no
 	   type — so they land in ColumnAliases, and the parenthesised
 	   opt_table_element_list rule (:19) cannot take them. */
-		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' colid_list ')' AS ctas_source opt_ctas_with_data
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' colid_list ')' opt_table_am opt_ctas_with AS ctas_source opt_ctas_with_data
 			{
-				src := $10.(*ctasSrc)
+				src := $12.(*ctasSrc)
 				nm := $5.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
 				if len(nm) > 1 {
@@ -524,25 +530,7 @@ create_table_stmt_as:
 				ct.IfNotExists = $4
 				ct.ColumnAliases = $7
 				ct.SelectSource, ct.ExecuteSource = src.sel, src.exec
-				ct.WithNoData = $11
-				$$ = ct
-			}
-	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name AS ctas_source opt_ctas_with_data
-			{
-				src := $7.(*ctasSrc)
-				nm := $5.parts
-				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
-				if len(nm) > 1 {
-					tbl.Schema = nm[len(nm)-2]
-				}
-				ct := parser.NewCreateTableStmt(0, tbl, nil, nil)
-				if pfx := $2.(*createPrefix); pfx != nil {
-					ct.Temporary = pfx.temporary
-					ct.Unlogged = pfx.unlogged
-				}
-				ct.IfNotExists = $4
-				ct.SelectSource, ct.ExecuteSource = src.sel, src.exec
-				ct.WithNoData = $8
+				ct.WithNoData = $13
 				$$ = ct
 			}
 
@@ -564,6 +552,13 @@ ctas_source:
 opt_execute_params:
 		/* empty */         { $$ = nil }
 	| '(' expr_list ')'     { $$ = $2 }
+
+/* CTAS's own `WITH (reloptions)` before AS — distinct from WITH [NO] DATA
+   after the query. Legacy parses and keeps the pairs (the AST's With map is
+   not part of the parity contract). */
+opt_ctas_with:
+		/* empty */                    { _ = 0 }
+	| WITH '(' str_pair_list ')'       { _ = 0 }
 
 /* Plain WITH [NO] DATA for CTAS. Deliberately NOT opt_with_data, whose
    with_data_kw carries a span-end side effect that exists only to pin a
@@ -759,19 +754,30 @@ opt_restart:
 
 
 /* opt_ct_tail — trailing options v2: flat keyword-distinct alternatives. */
-opt_ct_tail:
-		/* empty */     { $$ = &ctTail{} }
-	| WITH '(' str_pair_list ')'
+/* ct_tail_list — CREATE TABLE's trailing clauses, COMPOSABLE: gram.y lets
+   OptInherit, OptPartitionSpec, OptWith and the rest follow one another in any
+   order, and the regress corpus writes `PARTITION BY LIST (a) WITH
+   (fillfactor=100)` 65 times. The old single-clause tail could not. Items
+   append (WITH, INHERITS) or replace (PARTITION ...). A PARTITION OF item no
+   longer carries its own sub-PARTITION BY: the following list item is it. */
+ct_tail_list:
+		/* empty */                 { $$ = &ctTail{} }
+	| ct_tail_list ct_tail_item     { $$ = mergeCtTail($1, $2) }
+
+ct_tail_item:
+		WITH '(' str_pair_list ')'
 			{ i := &ctTail{}; i.withKv = $3; $$ = i }
 	| INHERITS '(' drop_name_list ')'
 			{ i := &ctTail{}; i.inherits = $3; $$ = i }
 	| WITHOUT OIDS
 			{ $$ = &ctTail{} }
+	| USING ColId
+			{ $$ = &ctTail{} } /* access method: parsed and dropped, as legacy */
 	| PARTITION BY ColId '(' part_elem_list ')'
 			{
 				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
 			}
-	| PARTITION OF qualified_name part_bound_spec2 opt_subpartition_by
+	| PARTITION OF qualified_name part_bound_spec2
 			{
 				nm := $3.parts
 				par := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -783,34 +789,22 @@ opt_ct_tail:
 				b := $4.(*partBound)
 				i.fromVals, i.toVals, i.inVals, i.bDefault = b.from, b.to, b.inVals, b.isDefault
 				i.modulus, i.remainder, i.isHash = b.modulus, b.remainder, b.isHash
-				i.partition, _ = $5.(*parser.PartitionByClause)
 				$$ = i
 			}
-opt_ct_tail_noas:
-		/* empty */     { $$ = &ctTail{} }
-	| WITH '(' str_pair_list ')'
-			{ i := &ctTail{}; i.withKv = $3; $$ = i }
-	| INHERITS '(' drop_name_list ')'
-			{ i := &ctTail{}; i.inherits = $3; $$ = i }
-	| WITHOUT OIDS
-			{ $$ = &ctTail{} }
-	| PARTITION BY ColId '(' part_elem_list ')'
+	/* `PARTITION OF p ( elements ) bound` — gram.y's OptTypedTableElementList
+	   on a partition. Legacy keeps the elements on the PartitionOfClause, not
+	   as columns (ddl.go:3290-3410). A tail ITEM, not its own statement
+	   alternative: as an alternative it shifts PARTITION before the no-column
+	   CREATE's empty tail can reduce, and every plain `PARTITION OF p FOR
+	   VALUES ...` then dies on FOR. */
+	| PARTITION OF qualified_name '(' partof_elem_list ')' part_bound_spec2
 			{
-				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
-			}
-	| PARTITION OF qualified_name part_bound_spec2 opt_subpartition_by
-			{
-				nm := $3.parts
-				par := parser.ObjectName{Name: nm[len(nm)-1]}
-				if len(nm) > 1 {
-					par.Schema = nm[len(nm)-2]
-				}
 				i := &ctTail{}
-				i.partOf = par
-				b := $4.(*partBound)
+				i.partOf = objectNameFromQn($3)
+				b := $7.(*partBound)
 				i.fromVals, i.toVals, i.inVals, i.bDefault = b.from, b.to, b.inVals, b.isDefault
 				i.modulus, i.remainder, i.isHash = b.modulus, b.remainder, b.isHash
-				i.partition, _ = $5.(*parser.PartitionByClause)
+				i.partOfElems = $5.([]*partOfElem)
 				$$ = i
 			}
 
@@ -819,7 +813,9 @@ str_pair_list:
 	| str_pair_list ',' str_pair    { $$ = append($1, $3) }
 
 str_pair:
-		ColId '=' with_value        { $$ = $1 + "=" + $3 }
+		ColId '=' with_value               { $$ = $1 + "=" + $3 }
+	| ColId '.' ColId '=' with_value       { $$ = $1 + "." + $3 + "=" + $5 }   /* toast.autovacuum_enabled = off */
+	| ColId                                { $$ = $1 }                           /* WITH (security_barrier) */
 
 with_value:
 		SCONST   { $$ = $1 }
@@ -830,7 +826,7 @@ with_value:
 	| TRUE_P     { $$ = "true" }
 	| FALSE_P    { $$ = "false" }
 	| ON         { $$ = "on" }
-	| OFF        { $$ = "off" }
+	| ColId      { $$ = $1 } /* covers off, heap, ... */
 
 /* create_index_stmt / drop_index_stmt — P4.4 (gram.y IndexStmt / DropStmt
    subsets). v0: plain column keys (expressions, DESC/NULLS, opclasses and
@@ -1072,6 +1068,10 @@ set_stmt:
 	   plain SetStmt named "session_authorization". */
 	| SET set_scope AUTHORIZATION set_value_atom
 			{ $$ = sessionAuthzStmt(yylex.(*lexerState), $2, $4) }
+	/* `SET LOCAL SESSION AUTHORIZATION x` — LOCAL scope plus the SESSION that
+	   is part of the GUC's own spelling. Legacy: SetStmt{Local, session_authorization}. */
+	| SET LOCAL SESSION AUTHORIZATION set_value_atom
+			{ $$ = sessionAuthzStmt(yylex.(*lexerState), true, $5) }
 
 	/* SET [LOCAL] ROLE name — legacy records it as a plain SetStmt named
 	   "role" with no '='/TO, so setValueAtoms (which scans for the separator)
@@ -1368,19 +1368,24 @@ opt_COLUMN:
 
 /* create_view_stmt — P5 v0: CREATE [OR REPLACE] [TEMP] VIEW name [(cols)] AS select */
 create_view_stmt:
-		CREATE opt_or_replace VIEW qualified_name opt_name_list_p AS { yylex.(*lexerState).markSpanStart() } select_bare
+		CREATE opt_or_replace VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } select_bare
 			{
 				nm := $4.parts
 				v := parser.ObjectName{Name: nm[len(nm)-1]}
 				if len(nm) > 1 {
 					v.Schema = nm[len(nm)-2]
 				}
-				sel := $8.(*parser.SelectStmt)
+				sel := $9.(*parser.SelectStmt)
 				cv := parser.NewCreateViewStmt(v, $5, sel)
 				cv.OrReplace = $2
+				viewReloptions(cv, $6)
 				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).fragEnd)
 				$$ = cv
 			}
+
+opt_view_with:
+		/* empty */                    { $$ = []string(nil) }
+	| WITH '(' str_pair_list ')'       { $$ = $3 }
 
 opt_or_replace:
 		/* empty */  { $$ = false }
@@ -1401,18 +1406,18 @@ drop_view_stmt:
    [(aliases)] AS select [WITH [NO] DATA]. USING/WITH (opts)/TABLESPACE
    deferred (legacy fallback covers them via the modifier-fallback rule). */
 create_matview_stmt:
-		CREATE MATERIALIZED VIEW opt_if_not_exists qualified_name opt_name_list_p AS { yylex.(*lexerState).markSpanStart() } select_bare opt_with_data
+		CREATE MATERIALIZED VIEW opt_if_not_exists qualified_name opt_name_list_p opt_table_am AS { yylex.(*lexerState).markSpanStart() } select_bare opt_with_data
 			{
 				nm := $5.parts
 				v := parser.ObjectName{Name: nm[len(nm)-1]}
 				if len(nm) > 1 {
 					v.Schema = nm[len(nm)-2]
 				}
-				sel := $9.(*parser.SelectStmt)
+				sel := $10.(*parser.SelectStmt)
 				cv := parser.NewCreateMatViewStmt(v, $6, sel)
 				cv.IfNotExists = $4
 				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).spanEnd())
-				cv.WithNoData = $10
+				cv.WithNoData = $11
 				$$ = cv
 			}
 

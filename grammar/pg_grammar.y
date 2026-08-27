@@ -79,7 +79,11 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
-%type <str>	opt_tablespace opt_idx_tablespace check_body
+%type <strs>	opt_view_with
+%type <ctt>	ct_tail_list ct_tail_item
+%type <str>	opt_tablespace opt_idx_tablespace check_body opt_ins_alias
+%type <expr>	func_arg_expr
+%type <exprs>	array_expr array_expr_list substr_list overlay_list position_list
 %type <exprs>	trim_list
 %type <str>	sort_using_op constr_name func_name_keyword opt_part_opclass
 %type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause paren_tail partof_elem partof_elem_list partof_col_opts opt_of_col_opts of_col_opt of_col_opt_list opt_identity_seq_opts identity_seq_opt_list identity_seq_opt
@@ -144,7 +148,7 @@
 %type <strs>	opt_ref_cols
 %type <node>	opt_fk_actions fk_actions fk_action fk_kw
 %type <expr>	opt_update_where
-%type <ctt>	opt_ct_tail opt_ct_tail_noas
+%type <ctt>
 %type <strs>	str_pair_list
 %type <str>	str_pair with_value opt_using_method
 %type <node>	upd_where del_where
@@ -803,6 +807,40 @@ check_body:
 		CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
 			{ $$ = yylex.(*lexerState).spanTextCloseParen() }
 
+array_expr:
+		'[' expr_list ']'          { $$ = $2 }
+	| '[' array_expr_list ']'      { $$ = $2 }
+	| '[' ']'                      { $$ = nil }
+
+array_expr_list:
+		array_expr
+			{ $$ = []parser.Expr{parser.NewArrayConstructorExpr($<p>1, $1)} }
+	| array_expr_list ',' array_expr
+			{ $$ = append($1, parser.NewArrayConstructorExpr($<p>3, $3)) }
+
+/* SQL-standard argument spellings of SUBSTRING / OVERLAY / POSITION —
+   gram.y substr_list / overlay_list / position_list. Legacy rewrites each into
+   an ordinary call (position's operands REVERSED: position(hay, needle)) built
+   as a special form, so Variadic stays nil — hence specialFormCall. The
+   comma-spelled calls `substring(x, 1, 2)` are the SAME special form there,
+   so the keyword rules take them too (the keyword shifts '(' ahead of the
+   ColId call path, which would otherwise carry Variadic flags). */
+substr_list:
+		a_expr FROM a_expr                 { $$ = []parser.Expr{$1, $3} }
+	| a_expr FROM a_expr FOR a_expr        { $$ = []parser.Expr{$1, $3, $5} }
+	| expr_list                            { $$ = $1 }
+
+overlay_list:
+		a_expr PLACING a_expr FROM a_expr              { $$ = []parser.Expr{$1, $3, $5} }
+	| a_expr PLACING a_expr FROM a_expr FOR a_expr     { $$ = []parser.Expr{$1, $3, $5, $7} }
+	| expr_list                                        { $$ = $1 }
+
+position_list:
+		b_expr IN_P b_expr                 { $$ = []parser.Expr{$3, $1} }
+	/* b_expr first in both alternatives, so the reduce after the first
+	   argument is the same either way; an a_expr here would reduce/reduce. */
+	| b_expr ',' expr_list                 { $$ = append([]parser.Expr{$1}, $3...) }
+
 sort_using_op:
 		exclude_op        { $$ = $1 }
 	| ColId               { $$ = $1 }
@@ -1425,12 +1463,20 @@ opt_func_arg_list:
 		/* empty */ { $$ = nil }
 	| func_arg_list { $$ = $1 }
 
+/* func_arg_expr — gram.y :16160: a positional argument or a named one
+   (`name => value`, `name := value`). Legacy DROPS the name and keeps the
+   value, as call_arg does for expression-position calls. */
+func_arg_expr:
+		a_expr                          { $$ = $1 }
+	| a_expr EQUALS_GREATER a_expr      { $$ = $3 }
+	| a_expr COLON_EQUALS a_expr        { $$ = $3 }
+
 func_arg_list:
-		a_expr
+		func_arg_expr
 			{
 				$$ = []parser.Expr{$1}
 			}
-	| func_arg_list ',' a_expr
+	| func_arg_list ',' func_arg_expr
 			{
 				$$ = append($1, $3)
 			}
@@ -1632,7 +1678,28 @@ window_definition:
 			}
 
 opt_window_spec:
-		opt_frame_tail
+	/* An existing window name first — gram.y opt_existing_window_name — with
+	   its own frame or ORDER BY (`OVER (w RANGE BETWEEN ...)`). */
+		ColId opt_frame_tail
+			{
+				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				wd.RefName = $1
+				if fr := $2; fr != nil {
+					wd.Frame = fr
+				}
+				$$ = wd
+			}
+	| ColId ORDER BY sort_by_list opt_frame_tail
+			{
+				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				wd.RefName = $1
+				wd.OrderBy = $4
+				if fr := $5; fr != nil {
+					wd.Frame = fr
+				}
+				$$ = wd
+			}
+	| opt_frame_tail
 			{
 				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
 				if fr := $1; fr != nil {
@@ -1991,6 +2058,17 @@ a_expr:
 			}
 	/* op ANY/SOME/ALL — gram.y :15150ff quantified comparisons via
 	   subquery_Op subset. */
+	/* LIKE / ILIKE quantified over a list — legacy folds these into the IN
+	   shape with the pattern operator as AnyOp (OpLike / OpNotLike / OpILike),
+	   exactly like `op ANY`. */
+	| a_expr LIKE ANY '(' expr_list ')'
+			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpLike, nil, $5, $<p>5) }
+	| a_expr NOT_LA LIKE ANY '(' expr_list ')'
+			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpNotLike, nil, $6, $<p>6) }
+	| a_expr ILIKE ANY '(' expr_list ')'
+			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpILike, nil, $5, $<p>5) }
+	| a_expr LIKE ALL '(' expr_list ')'
+			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpLike, true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
 	| a_expr subq_op ANY '(' expr_list ')'
 			{
 				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), nil, $5, $<p>5)
@@ -2229,6 +2307,13 @@ c_expr:
 				}
 				$$ = parser.NewStarExpr($1.pos, schema, table)
 			}
+	/* B'...' / X'...' — the adapter delivers both as BCONST with legacy's
+	   marker byte in the value; bitStringConst reproduces decodeBitStringLit
+	   (a plain StringConst, hex expanded to bits). */
+	| BCONST
+			{
+				$$ = bitStringConst($<p>1, $1)
+			}
 	| ICONST
 			{
 				/* $1 is already the parsed integer (adapter fills ival). */
@@ -2284,13 +2369,13 @@ c_expr:
 			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timetz", $5) }
 	| TIME WITHOUT_LA TIME ZONE SCONST
 			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "time", $5) }
-	| ARRAY '[' opt_func_call_args ']'
+	/* ARRAY[...] — gram.y array_expr: the inner brackets nest WITHOUT the
+	   keyword (`array[[1,2],[3,4]]`), and legacy builds nested
+	   ArrayConstructorExpr for them. */
+	| ARRAY array_expr
 			{
-				args := $3
-				if args == nil {
-					args = []parser.Expr{}
-				}
-				$$ = parser.NewArrayConstructorExpr(yylex.(*lexerState).lastConsumedPos(), args)
+				// An empty ARRAY[] carries a NIL element list, as legacy does.
+				$$ = parser.NewArrayConstructorExpr(yylex.(*lexerState).lastConsumedPos(), $2)
 			}
 	/* ARRAY(select) — legacy parses the body with parseSelect inside its own
 	   parens, so it is neither Parenthesized nor allowed to start with '('. */
@@ -2408,6 +2493,12 @@ c_expr:
    $3 straight through preserves the nil, which name_or_call deliberately
    does NOT do; matching legacy is what matters here. */
 func_expr_common_subexpr:
+		SUBSTRING '(' substr_list ')'
+			{ $$ = specialFormCall($<p>1, "substring", $3) }
+	| OVERLAY '(' overlay_list ')'
+			{ $$ = specialFormCall($<p>1, "overlay", $3) }
+	| POSITION '(' position_list ')'
+			{ $$ = specialFormCall($<p>1, "position", $3) }
 	/* TRIM — gram.y :15900ff. The direction keyword picks the target function
 	   (btrim / ltrim / rtrim) and trim_list REVERSES the operands: the string
 	   to trim ends up first and the trim characters after it, because gram.y
@@ -2415,7 +2506,7 @@ func_expr_common_subexpr:
 	   port has to as well. Note `TRIM(x)` and `TRIM(x, y)` are NOT accepted by
 	   legacy — trim_list's bare expr_list alternative is what covers the
 	   FROM-less spelling upstream, and legacy simply requires the FROM. */
-		TRIM '(' BOTH trim_list ')'
+	| TRIM '(' BOTH trim_list ')'
 			{
 				$$ = specialFormCall($<p>1, "btrim", $4)
 			}
@@ -2707,6 +2798,32 @@ name_or_call:
 				fc.Over = wd
 				$$ = fc
 			}
+	/* An existing window name first — gram.y opt_existing_window_name — with
+	   its own frame: `OVER (w RANGE BETWEEN ...)`. These alternatives spell
+	   the spec inline, so opt_window_spec's ColId forms do not reach them. */
+	| qualified_name '(' opt_call_args ')' OVER '(' ColId opt_frame_tail ')'
+			{
+				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
+				wd := parser.NewWindowDef(0)
+				wd.RefName = $7
+				if fr := $8; fr != nil {
+					wd.Frame = fr
+				}
+				fc.Over = wd
+				$$ = fc
+			}
+	| qualified_name '(' opt_call_args ')' OVER '(' ColId ORDER BY sort_by_list opt_frame_tail ')'
+			{
+				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
+				wd := parser.NewWindowDef(0)
+				wd.RefName = $7
+				wd.OrderBy = $10
+				if fr := $11; fr != nil {
+					wd.Frame = fr
+				}
+				fc.Over = wd
+				$$ = fc
+			}
 	| qualified_name '(' opt_call_args ')' OVER '(' PARTITION BY expr_list ORDER BY sort_by_list opt_frame_tail ')'
 			{
 				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
@@ -2727,6 +2844,16 @@ name_or_call:
 				ft := splitFuncName($1)
 				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				fc.OrderBy = $6
+				$$ = fc
+			}
+	/* expr_list, like the other DISTINCT alternatives — a call_arg_list here
+	   reduce/reduces against them on ','. */
+	| qualified_name '(' DISTINCT expr_list ORDER BY sort_by_list ')'
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				fc.OrderBy = $7
 				$$ = fc
 			}
 	| qualified_name '(' opt_call_args ')' filter_clause
@@ -2988,10 +3115,11 @@ insert_stmt:
    select as a column list. With both spelled out, '(' is shifted either way
    and the SECOND token (ColId vs SELECT) decides. */
 insert_core:
-		INSERT INTO qualified_name insert_rest
+		INSERT INTO qualified_name opt_ins_alias insert_rest
 			{
-				src := $4.(*insRest)
-				is := parser.NewInsertStmt(0, rangeVarFromName($3, ""), src.cols, src.src.rows)
+				src := $5.(*insRest)
+				rv, cols := insertTarget($3, $4, src.cols)
+				is := parser.NewInsertStmt(0, rv, cols, src.src.rows)
 				if src.src.sel != nil {
 					parser.SetInsertSelect(is, src.src.sel)
 				}
@@ -3000,10 +3128,11 @@ insert_core:
 				}
 				$$ = is
 			}
-	| with_clause INSERT INTO qualified_name insert_rest
+	| with_clause INSERT INTO qualified_name opt_ins_alias insert_rest
 			{
-				src := $5.(*insRest)
-				is := parser.NewInsertStmt(0, rangeVarFromName($4, ""), src.cols, src.src.rows)
+				src := $6.(*insRest)
+				rv, cols := insertTarget($4, $5, src.cols)
+				is := parser.NewInsertStmt(0, rv, cols, src.src.rows)
 				if src.src.sel != nil {
 					parser.SetInsertSelect(is, src.src.sel)
 				}
@@ -3027,6 +3156,12 @@ opt_on_conflict:
 opt_arbiter:
 		/* empty */               { $$ = nil }
 	| '(' expr_list ')'           { $$ = arbiterFromExprs($2) } /* items may be expressions, not just names */
+	| '(' expr_list ')' WHERE a_expr
+			{
+				t := arbiterFromExprs($2)
+				t.Where = $5
+				$$ = t
+			}
 	| ON CONSTRAINT ColId { $$ = parser.NewOnConflictTarget(nil, $3, nil) }
 
 update_set_list:
@@ -3053,6 +3188,12 @@ opt_returning:
 	   requires at least one item, and so does legacy — sharing the optional
 	   form here would make the yacc parser accept a bare RETURNING. */
 	| RETURNING target_list   { $$ = $2 }
+
+/* gram.y insert_target: the alias needs AS, so it cannot be mistaken for a
+   column list or a parenthesised source. */
+opt_ins_alias:
+		/* empty */   { $$ = "" }
+	| AS ColId        { $$ = $2 }
 
 insert_rest:
 		insert_source                       { $$ = &insRest{src: $1} }

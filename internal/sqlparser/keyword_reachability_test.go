@@ -29,14 +29,13 @@ var notYetPortedKeywords = map[string]string{
 	"ANALYZE":     "P6.5 VACUUM/ANALYZE",
 	"ASYMMETRIC":  "BETWEEN ASYMMETRIC (only SYMMETRIC is ported)",
 	"GRANT":       "P6.6 GRANT/REVOKE",
-	"PLACING":     "OVERLAY(... PLACING ... FROM ...)",
 	"SYSTEM_USER": "DELIBERATE AND PERMANENT: parser.IsNoParenFuncName does not list it, so legacy treats it as a bare identifier. Adding it to sql_value_func_name would CREATE a parity diff, not fix one (see grammar/pg_grammar.y func_expr_common_subexpr).",
 
 	// type_func_name_keyword
 	"BINARY":        "COPY ... BINARY / BINARY cursors (P6.3, P6.5)",
 	"COLLATION":     "CREATE COLLATION and COLLATION FOR (plain COLLATE is reachable)",
 	"FREEZE":        "P6.5 VACUUM FREEZE",
-	"OVERLAPS":      "the OVERLAPS predicate",
+	"OVERLAPS":      "row OVERLAPS row (:15162) — uq_cols's WITHOUT OVERLAPS does not count, see blindRules",
 	"VERBOSE":       "P6.4 EXPLAIN VERBOSE / P6.5 VACUUM VERBOSE (func_name_keyword does not count — see blindRules)",
 	"TABLESAMPLE":   "P1.2 FROM ... TABLESAMPLE",
 }
@@ -132,7 +131,13 @@ var upperToken = regexp.MustCompile(`\b[A-Z][A-Z0-9_]*\b`)
 // clause, OVERLAPS' operator, BINARY's cast modifier or FREEZE's COPY option
 // exist. Counting them would silently retire allowlist entries for features
 // that are still unported — exactly the blinding this gate exists to prevent.
-var blindRules = map[string]bool{"func_name_keyword": true}
+var blindRules = map[string]bool{
+	"func_name_keyword": true,
+	// uq_cols spells `UNIQUE (c WITHOUT OVERLAPS)` only to reproduce legacy's
+	// misreading of the two words as column names; the row OVERLAPS operator
+	// is still unported.
+	"uq_cols": true,
+}
 
 var ruleHead = regexp.MustCompile(`^([a-z_][A-Za-z0-9_]*):`)
 
