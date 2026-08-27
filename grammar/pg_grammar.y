@@ -104,6 +104,8 @@
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
 %type <str>	opt_index_name
+%type <node>	exclude_elem_list exclude_elem opt_exclude_where
+%type <str>	exclude_op
 %type <node>	opt_table_element_list opt_index_where
 %type <node>	opt_constr_attrs
 %type <str>	constr_attr

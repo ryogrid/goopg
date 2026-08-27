@@ -515,8 +515,10 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   `SET LOCAL AUTHORIZATION`.
 - [x] **DONE 2026-08-27 — hash partition bounds** (`FOR VALUES WITH (modulus m,
   remainder r)`) and **opclass option lists** (`int4_ops(foo=1)`).
-- [ ] **`EXCLUDE USING btree (c WITH =)` constraints (~13)** — a table
-  constraint kind not ported at all.
+- [x] **DONE 2026-08-27 — EXCLUDE constraints** (`EXCLUDE [USING m] (col WITH
+  op, ...) [INCLUDE (...)] [WHERE (pred)]` plus constraint attrs), anonymous to
+  TableExclusions and named to NamedConstraints. Legacy keeps the columns as a
+  list but only ONE ExclusionOp (the first) and defaults Method to "btree".
 - [ ] Smaller: `COPY ... (subquery)` forms, `CREATE TABLE ... (LIKE t ...)`,
   `GENERATED ... AS`, JSON constructors, `~`/`&`/`=>` operator spellings.
 

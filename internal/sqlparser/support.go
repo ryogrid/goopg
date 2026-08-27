@@ -609,6 +609,7 @@ type tableElem struct {
 	fkDef      *parser.TableForeignKeyDef
 	namedPk    *parser.TableConstraintDef
 	namedUq    *parser.TableConstraintDef
+	exclusion  *parser.TableConstraintDef
 	uqIncl     []string
 	uqNND      bool
 	uqAttrs    *constrAttrs
@@ -873,6 +874,40 @@ func fillfactorFrom(kvs []string) int {
 		return n
 	}
 	return 0
+}
+
+// excludeElem is one `col WITH op` item of an EXCLUDE constraint.
+type excludeElem struct {
+	col string
+	op  string
+}
+
+// newExclusionConstraint builds the TableConstraintDef legacy produces for an
+// EXCLUDE constraint. Legacy keeps the columns as a list but only ONE
+// ExclusionOp (the first), and defaults Method to "btree" when USING is
+// omitted (internal/parser/ddl.go).
+func newExclusionConstraint(name, method string, elems []excludeElem, incl []string, where parser.Expr, a *constrAttrs) *parser.TableConstraintDef {
+	cols := make([]string, len(elems))
+	op := ""
+	for i, e := range elems {
+		cols[i] = e.col
+		if op == "" {
+			op = e.op
+		}
+	}
+	if method == "" {
+		method = "btree"
+	}
+	d := parser.NewTableConstraintDef(name, cols, false)
+	d.IsExclusion = true
+	d.ExclusionOp = op
+	d.Method = method
+	d.IncludeColumns = incl
+	d.ExclusionWhere = where
+	if a != nil {
+		d.Deferrable, d.InitiallyDeferred = a.deferrable, a.initiallyDeferred
+	}
+	return d
 }
 
 // callArgs carries a function call's argument list plus the per-argument

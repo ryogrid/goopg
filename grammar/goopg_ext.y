@@ -25,6 +25,7 @@ create_table_stmt:
 				var uqIncludes [][]string
 				var uqNullsNotDistinct, uqDeferrable, uqInitiallyDeferred []bool
 				var named []parser.TableConstraintDef
+				var exclusions []parser.TableConstraintDef
 				var namedChecks []parser.PartitionCheckConstraint
 				var fks []parser.TableForeignKeyDef
 				var pkIncl []string
@@ -105,6 +106,9 @@ create_table_stmt:
 						if e.namedUq != nil {
 							named = append(named, *e.namedUq)
 						}
+						if e.exclusion != nil {
+							exclusions = append(exclusions, *e.exclusion)
+						}
 						if e.check != "" {
 							if e.checkName != "" {
 								// CONSTRAINT c CHECK (...) -> TableNamedChecks,
@@ -139,6 +143,7 @@ create_table_stmt:
 				ct.TableUniqueDeferrable = uqDeferrable
 				ct.TableUniqueInitiallyDeferred = uqInitiallyDeferred
 				ct.NamedConstraints = named
+				ct.TableExclusions = exclusions
 				ct.TableNamedChecks = namedChecks
 				ct.TableForeignKeys = fks
 				ct.PrimaryKeyInclude = pkIncl
@@ -285,6 +290,21 @@ table_element:
 				a, _ := $7.(*constrAttrs)
 				$$ = &tableElem{namedUq: namedTableConstraint($2, $5, false, $6, $4, a)}
 			}
+	/* EXCLUDE constraints — gram.y ExclusionConstraintElem. Anonymous ones go
+	   to TableExclusions, named ones to NamedConstraints, both as a
+	   TableConstraintDef with IsExclusion set. */
+	| EXCLUDE opt_using_method '(' exclude_elem_list ')' opt_include opt_exclude_where opt_constr_attrs
+			{
+				a, _ := $8.(*constrAttrs)
+				w, _ := $7.(parser.Expr) // opt_exclude_where boxes an untyped nil
+				$$ = &tableElem{exclusion: newExclusionConstraint("", $2, $4.([]excludeElem), $6, w, a)}
+			}
+	| CONSTRAINT ColId EXCLUDE opt_using_method '(' exclude_elem_list ')' opt_include opt_exclude_where opt_constr_attrs
+			{
+				a, _ := $10.(*constrAttrs)
+				w, _ := $9.(parser.Expr)
+				$$ = &tableElem{namedUq: newExclusionConstraint($2, $4, $6.([]excludeElem), $8, w, a)}
+			}
 	| CONSTRAINT ColId CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
 			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen(), checkName: $2} }
 	/* Anonymous table-level CHECK and FOREIGN KEY (gram.y TableConstraint).
@@ -324,6 +344,28 @@ table_element:
 				}
 				$$ = &tableElem{fkDef: fk}
 			}
+
+exclude_elem_list:
+		exclude_elem                          { $$ = []excludeElem{$1.(excludeElem)} }
+	| exclude_elem_list ',' exclude_elem      { $$ = append($1.([]excludeElem), $3.(excludeElem)) }
+
+exclude_elem:
+		ColId WITH exclude_op                 { $$ = excludeElem{col: $1, op: $3} }
+
+/* The exclusion operator is a bare operator token: single-char comparisons are
+   char terminals, everything else (&&, @>, ...) arrives as Op. */
+exclude_op:
+		Op              { $$ = $1 }
+	| '='             { $$ = "=" }
+	| '<'             { $$ = "<" }
+	| '>'             { $$ = ">" }
+	| LESS_EQUALS     { $$ = "<=" }
+	| GREATER_EQUALS  { $$ = ">=" }
+	| NOT_EQUALS      { $$ = "<>" }
+
+opt_exclude_where:
+		/* empty */        { $$ = (parser.Expr)(nil) }
+	| WHERE '(' a_expr ')' { $$ = $3 }
 
 pk_cols:
 		'(' colid_list ')'   { $$ = $2 }
