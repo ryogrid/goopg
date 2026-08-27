@@ -2816,3 +2816,362 @@ do_stmt:
 	/* Legacy accepts ONLY `DO <dollar-quoted body>` — no LANGUAGE clause on
 	   either side ("expected dollar-quoted string for DO body"). */
 		DO SCONST            { $$ = parser.NewDoStmt($<p>1, "plpgsql", $2) }
+
+/* ============================================================================
+   P5.6 — CREATE / DROP TRIGGER, COMMENT ON, ALTER FUNCTION / PROCEDURE /
+   ROUTINE. 42 + 18 unrouted regress fragments plus COMMENT ON.
+
+   Almost every word in a trigger definition is an ORDINARY IDENTIFIER in
+   goopg's lexer — BEFORE, AFTER, INSTEAD, EACH, ROW, STATEMENT, REFERENCING,
+   OLD, NEW are all acceptIdentKeyword calls in ddl.go — so they arrive as
+   ColIds and the rules discriminate on their text rather than on distinct
+   terminals. The trigger function's arguments are NOT expressions either:
+   legacy keeps each literal's raw text and re-renders integers.
+   ========================================================================= */
+
+create_trigger_stmt:
+		CREATE TRIGGER ColId trig_timing trig_events ON qualified_name
+		opt_trig_referencing opt_trig_foreach opt_trig_when
+		EXECUTE trig_func '(' opt_trig_args ')'
+			{ $$ = buildTrigger($<p>1, $3, objectNameFromQn($7), false, $4, $5, nil, $8, $9, $10, objectNameFromQn($12), $14) }
+	/* CONSTRAINT triggers additionally take the [NOT] DEFERRABLE trailer, and
+	   ONLY they do: parseCreateTriggerTail reads it under `if isConstraint`. */
+	| CREATE CONSTRAINT TRIGGER ColId trig_timing trig_events ON qualified_name
+		opt_constr_defer opt_trig_referencing opt_trig_foreach opt_trig_when
+		EXECUTE trig_func '(' opt_trig_args ')'
+			{ $$ = buildTrigger($<p>1, $4, objectNameFromQn($8), true, $5, $6, $9, $10, $11, $12, objectNameFromQn($14), $16) }
+
+trig_timing:
+		ColId              { $$ = trigTiming($1) }
+	/* INSTEAD OF — OF is a reserved keyword and can never be a ColId. */
+	| ColId OF             { $$ = trigTiming($1) }
+
+trig_events:
+		trig_event                        { $$ = appendTrigEvent(nil, $1.(*trigEvent)) }
+	| trig_events OR trig_event           { $$ = appendTrigEvent($1, $3.(*trigEvent)) }
+
+trig_event:
+		INSERT               { $$ = &trigEvent{name: "insert"} }
+	| DELETE_P               { $$ = &trigEvent{name: "delete"} }
+	| TRUNCATE               { $$ = &trigEvent{name: "truncate"} }
+	| UPDATE                 { $$ = &trigEvent{name: "update"} }
+	| UPDATE OF colid_list   { $$ = &trigEvent{name: "update", cols: $3} }
+
+opt_constr_defer:
+		/* empty */                        { $$ = (*constrDefer)(nil) }
+	| constr_defer_words                   { $$ = $1 }
+
+constr_defer_words:
+		DEFERRABLE opt_initially           { $$ = &constrDefer{deferrable: true, initDeferred: $2} }
+	| NOT DEFERRABLE opt_initially         { $$ = &constrDefer{deferrable: false, initDeferred: $3} }
+	| INITIALLY ColId                      { $$ = &constrDefer{initDeferred: initiallyDeferred($2)} }
+
+opt_initially:
+		/* empty */       { $$ = false }
+	| INITIALLY ColId     { $$ = initiallyDeferred($2) }
+
+/* REFERENCING OLD|NEW TABLE [AS] name [ ... ] — OLD and NEW are plain
+   identifiers here, so the pair is one ColId followed by TABLE. */
+opt_trig_referencing:
+		/* empty */                       { $$ = []any(nil) }
+	| REFERENCING trig_transitions        { $$ = $2 }
+
+trig_transitions:
+		trig_transition                   { $$ = []any{$1} }
+	| trig_transitions trig_transition    { $$ = append(asAnySlice($1), $2) }
+
+/* OLD and NEW have their OWN terminals even though they are unreserved (and so
+   also ColIds). Writing this as `ColId TABLE ...` made the list ambiguous with
+   the EXECUTE that follows it — EXECUTE is unreserved too, so it could start
+   another transition — and shift won, which would have eaten the EXECUTE. */
+trig_transition:
+		OLD TABLE opt_AS_kw ColId       { $$ = trigTransition("old", $4) }
+	| NEW TABLE opt_AS_kw ColId         { $$ = trigTransition("new", $4) }
+
+/* Spelled out rather than `FOR opt_EACH_kw ColId`: an empty nonterminal after
+   FOR reduces before EACH is visible. */
+opt_trig_foreach:
+		/* empty */             { $$ = (*trigForEach)(nil) }
+	| FOR ColId                 { $$ = trigForEachOf($2) }
+	| FOR EACH ColId            { $$ = trigForEachOf($3) }
+
+opt_trig_when:
+		/* empty */             { $$ = (parser.Expr)(nil) }
+	| WHEN '(' a_expr ')'       { $$ = $3 }
+
+/* EXECUTE [FUNCTION|PROCEDURE] name — the optional keyword is spelled into
+   three alternatives so nothing reduces empty right after EXECUTE. */
+trig_func:
+		qualified_name             { $$ = $1 }
+	| FUNCTION qualified_name      { $$ = $2 }
+	| PROCEDURE qualified_name     { $$ = $2 }
+
+/* Legacy's argument scan keeps string, numeric and identifier literals and
+   SKIPS anything else, so the list is deliberately loose. */
+opt_trig_args:
+		/* empty */                  { $$ = []string(nil) }
+	| trig_arg_list                  { $$ = $1 }
+
+trig_arg_list:
+		trig_arg                     { $$ = []string{$1} }
+	| trig_arg_list ',' trig_arg     { $$ = append($1, $3) }
+
+trig_arg:
+		SCONST          { $$ = $1 }
+	| ICONST            { $$ = parser.CanonicalTriggerIntArg(strconv.FormatInt(int64($1), 10)) }
+	| FCONST            { $$ = $1 }
+	| ColId             { $$ = $1 }
+
+drop_trigger_stmt:
+		DROP TRIGGER opt_if_exists_drop ColId ON qualified_name opt_drop_behavior
+			{ $$ = parser.NewDropTriggerStmt($<p>1, $4, objectNameFromQn($6), $3) }
+
+/* ---------------------------------------------------------------------------
+   COMMENT ON <kind> <name> IS { 'text' | NULL }. The object-kind vocabulary is
+   exactly parser.go parseCommentOnTail's switch; an unlisted kind falls
+   through there to a different handler, so this grammar must not accept one.
+   --------------------------------------------------------------------------- */
+
+comment_stmt:
+		COMMENT ON comment_target IS comment_text
+			{
+				cs := $3.(*parser.CommentOnStmt)
+				cs.Description = $5
+				$$ = commentAt($<p>1, cs)
+			}
+
+comment_text:
+		SCONST      { $$ = $1 }
+	| NULL_P        { $$ = "" }
+
+comment_target:
+		TABLE qualified_name          { $$ = parser.NewCommentOnStmt(0, "table", objectNameFromQn($2), "") }
+	| INDEX qualified_name            { $$ = parser.NewCommentOnStmt(0, "index", objectNameFromQn($2), "") }
+	| VIEW qualified_name             { $$ = parser.NewCommentOnStmt(0, "view", objectNameFromQn($2), "") }
+	| SEQUENCE qualified_name         { $$ = parser.NewCommentOnStmt(0, "sequence", objectNameFromQn($2), "") }
+	| TYPE_P qualified_name           { $$ = parser.NewCommentOnStmt(0, "type", objectNameFromQn($2), "") }
+	| DOMAIN_P qualified_name         { $$ = parser.NewCommentOnStmt(0, "domain", objectNameFromQn($2), "") }
+	| SCHEMA qualified_name           { $$ = parser.NewCommentOnStmt(0, "schema", objectNameFromQn($2), "") }
+	| EXTENSION qualified_name        { $$ = parser.NewCommentOnStmt(0, "extension", objectNameFromQn($2), "") }
+	| COLLATION qualified_name        { $$ = parser.NewCommentOnStmt(0, "collation", objectNameFromQn($2), "") }
+	| SERVER qualified_name           { $$ = parser.NewCommentOnStmt(0, "server", objectNameFromQn($2), "") }
+	| STATISTICS qualified_name       { $$ = parser.NewCommentOnStmt(0, "statistics", objectNameFromQn($2), "") }
+	| MATERIALIZED VIEW qualified_name { $$ = parser.NewCommentOnStmt(0, "materialized view", objectNameFromQn($3), "") }
+	| ACCESS METHOD qualified_name    { $$ = parser.NewCommentOnStmt(0, "access method", objectNameFromQn($3), "") }
+	| FOREIGN TABLE qualified_name    { $$ = parser.NewCommentOnStmt(0, "foreign table", objectNameFromQn($3), "") }
+	| FOREIGN DATA_P WRAPPER qualified_name { $$ = parser.NewCommentOnStmt(0, "foreign data wrapper", objectNameFromQn($4), "") }
+	/* COLUMN's name is split at the LAST dot: `COMMENT ON COLUMN t.c` records
+	   ObjName{Name:"t"} and SubName "c", while `s.t.c` keeps the schema. */
+	| COLUMN qualified_name           { $$ = commentColumn($2) }
+	/* These five name the object by a bare name plus its table. */
+	| CONSTRAINT ColId ON qualified_name
+			{ $$ = commentConstraint($2, false, objectNameFromQn($4)) }
+	| CONSTRAINT ColId ON DOMAIN_P qualified_name
+			{ $$ = commentConstraint($2, true, objectNameFromQn($5)) }
+	| TRIGGER ColId ON qualified_name { $$ = parser.NewCommentOnStmt(0, "trigger", objectNameFromQn($4), $2) }
+	| POLICY ColId ON qualified_name  { $$ = parser.NewCommentOnStmt(0, "policy", objectNameFromQn($4), $2) }
+	| RULE ColId ON qualified_name    { $$ = parser.NewCommentOnStmt(0, "rule", objectNameFromQn($4), $2) }
+	| CAST '(' fn_type AS fn_type ')' { $$ = commentCast(typeNameOf($3), typeNameOf($5)) }
+	| FUNCTION qualified_name opt_comment_args
+			{
+				cs := parser.NewCommentOnStmt(0, "function", objectNameFromQn($2), "")
+				cs.Args = $3
+				$$ = cs
+			}
+
+/* An ABSENT arg list is nil, an empty `()` is a non-nil empty slice — the same
+   distinction DROP FUNCTION draws. */
+opt_comment_args:
+		/* empty */                  { $$ = []parser.FunctionArg(nil) }
+	| '(' opt_func_args ')'          { $$ = $2 }
+
+/* ---------------------------------------------------------------------------
+   ALTER FUNCTION / PROCEDURE / ROUTINE. The attribute list overlaps CREATE's
+   (common_func_opt_item) but stores POINTERS, so an unwritten attribute stays
+   distinguishable from one written with its default value.
+   --------------------------------------------------------------------------- */
+
+alter_function_stmt:
+		ALTER alter_routine_kind qualified_name opt_comment_args alter_fn_actions
+			{
+				kind := $2
+				st := parser.NewAlterFunctionStmt($<p>1, objectNameFromQn($3), $4, kind == "procedure", kind == "routine")
+				applyAlterFnActions(st, $5)
+				$$ = st
+			}
+
+alter_routine_kind:
+		FUNCTION      { $$ = "function" }
+	| PROCEDURE       { $$ = "procedure" }
+	| ROUTINE         { $$ = "routine" }
+
+alter_fn_actions:
+		/* empty */                          { $$ = []any(nil) }
+	| alter_fn_actions alter_fn_action       { $$ = append($1, $2) }
+
+alter_fn_action:
+		IMMUTABLE                    { $$ = alterFnVolatile("i") }
+	| STABLE                         { $$ = alterFnVolatile("s") }
+	| VOLATILE                       { $$ = alterFnVolatile("v") }
+	| STRICT_P                       { $$ = alterFnStrict(true) }
+	| CALLED ON NULL_P INPUT_P       { $$ = alterFnStrict(false) }
+	| RETURNS NULL_P ON NULL_P INPUT_P { $$ = alterFnStrict(true) }
+	| LEAKPROOF                      { $$ = alterFnLeakproof(true) }
+	| NOT LEAKPROOF                  { $$ = alterFnLeakproof(false) }
+	| SECURITY DEFINER               { $$ = alterFnSecurity(true) }
+	| SECURITY INVOKER               { $$ = alterFnSecurity(false) }
+	/* EXTERNAL SECURITY ... records NOTHING on an ALTER: legacy's attribute
+	   loop only recognises the bare `security` word and sends the EXTERNAL
+	   spelling through consumeFunctionAttribute, which drops it. CREATE keeps
+	   both spellings — the two paths genuinely disagree. */
+	| EXTERNAL SECURITY DEFINER      { $$ = alterFnNoop() }
+	| EXTERNAL SECURITY INVOKER      { $$ = alterFnNoop() }
+	/* PARALLEL / COST / ROWS / SUPPORT / WINDOW are consumed and DISCARDED:
+	   AlterFunctionStmt has no field for any of them. */
+	| PARALLEL ColId                 { $$ = alterFnNoop() }
+	| COST fn_number                 { $$ = alterFnNoop() }
+	| ROWS fn_number                 { $$ = alterFnNoop() }
+	| SUPPORT qualified_name         { $$ = alterFnNoop() }
+	| WINDOW                         { $$ = alterFnNoop() }
+	| OWNER TO alter_fn_owner        { $$ = alterFnOwner($3) }
+	| RENAME TO ColId                { $$ = alterFnRename($3) }
+	/* `SET SCHEMA x` is NOT a separate alternative: SCHEMA is an unreserved
+	   keyword and therefore also a config name, so spelling it out was 394
+	   shift/reduce conflicts — one per token that can start a ColId. The two
+	   forms are told apart in the action instead, which is what legacy does
+	   (ddl.go peeks for the word "schema" after SET). */
+	| SET fn_config_name fn_config_value
+			{
+				n, v := $2, $3
+				if eqFold(n, "schema") {
+					$$ = alterFnSchema(v)
+				} else {
+					$$ = alterFnConfig(parser.NewFunctionConfigOp(false, false, n, v), v != fnConfigUnset)
+				}
+			}
+	| RESET ALL                      { $$ = alterFnConfig(parser.NewFunctionConfigOp(false, true, "", ""), true) }
+	| RESET fn_config_name           { $$ = alterFnConfig(parser.NewFunctionConfigOp(true, false, $2, ""), true) }
+
+/* CURRENT_USER / SESSION_USER / CURRENT_ROLE all collapse to the sentinel
+   "current_user", and so does an unparsable name (ddl.go's else branch). */
+alter_fn_owner:
+		ColId          { $$ = alterFnOwnerName($1) }
+	| CURRENT_USER     { $$ = "current_user" }
+	| SESSION_USER     { $$ = "current_user" }
+	| CURRENT_ROLE     { $$ = "current_user" }
+
+/* ============================================================================
+   P5.7 — the DROP family. Every remaining DROP class in legacy is a plain
+   `DROP <kind> [IF EXISTS] <names> [CASCADE|RESTRICT]` that produces a
+   DropCompatStmt tagged with the kind, plus five that have their own node.
+   None of them is a skip-to-semicolon compat form, so all of them get a real
+   grammar here.
+   ========================================================================= */
+
+drop_misc_stmt:
+		DROP drop_compat_kind opt_if_exists_drop drop_name_list opt_drop_behavior
+			{ $$ = parser.NewDropCompatStmt($<p>1, $2, $3, $4, dropBehavior($5)) }
+	/* AGGREGATE and OPERATOR carry a signature; the names list is single. */
+	/* An aggregate keeps only its FIRST argument type (the AST comment on
+	   DropCompatStmt.ArgTypes says so, and parseDropAggregate reads one). */
+	| DROP AGGREGATE opt_if_exists_drop qualified_name '(' drop_arg_types ')' opt_drop_behavior
+			{ $$ = dropWithArgs($<p>1, "aggregate", $3, $4, firstArg($6), dropBehavior($8)) }
+	| DROP OPERATOR opt_if_exists_drop any_operator_name '(' drop_arg_types ')' opt_drop_behavior
+			{ $$ = dropWithArgs($<p>1, "operator", $3, $4, $6, dropBehavior($8)) }
+	| DROP OPERATOR opclass_or_family opt_if_exists_drop qualified_name USING ColId opt_drop_behavior
+			{
+				st := parser.NewDropCompatStmt($<p>1, $3, $4, []parser.ObjectName{objectNameFromQn($5)}, dropBehavior($8))
+				parser.SetDropCompatExtras(st, nil, $7, nil, "", "")
+				$$ = st
+			}
+	| DROP CAST opt_if_exists_drop '(' fn_type AS fn_type ')' opt_drop_behavior
+			{
+				st := parser.NewDropCompatStmt($<p>1, "cast", $3, nil, dropBehavior($9))
+				parser.SetDropCompatExtras(st, nil, "", []string{typeNameOf($5), typeNameOf($7)}, "", "")
+				$$ = st
+			}
+	| DROP TRANSFORM opt_if_exists_drop FOR fn_type LANGUAGE ColId opt_drop_behavior
+			{
+				st := parser.NewDropCompatStmt($<p>1, "transform", $3, nil, dropBehavior($8))
+				parser.SetDropCompatExtras(st, nil, "", nil, typeNameOf($5), lowerIdent($7))
+				$$ = st
+			}
+	/* The five kinds with their own AST node. RULE and POLICY name an object
+	   ON a table; the other three take a bare name. */
+	| DROP RULE opt_if_exists_drop ColId ON qualified_name opt_drop_behavior
+			{ $$ = parser.NewDropRuleStmt($<p>1, $4, objectNameFromQn($6), $3) }
+	| DROP POLICY opt_if_exists_drop ColId ON qualified_name opt_drop_behavior
+			{ $$ = parser.NewDropPolicyStmt($<p>1, $4, objectNameFromQn($6), $3) }
+	| DROP PUBLICATION opt_if_exists_drop ColId opt_drop_behavior
+			{ $$ = parser.NewDropPublicationStmt($<p>1, $4, $3) }
+	| DROP SUBSCRIPTION opt_if_exists_drop ColId opt_drop_behavior
+			{ $$ = parser.NewDropSubscriptionStmt($<p>1, $4, $3) }
+	| DROP TABLESPACE opt_if_exists_drop ColId opt_drop_behavior
+			{ $$ = parser.NewDropTablespaceStmt($<p>1, $4, $3) }
+
+opclass_or_family:
+		CLASS      { $$ = "operator class" }
+	| FAMILY       { $$ = "operator family" }
+
+/* The kind words that reach DropCompatStmt verbatim. Multi-word kinds are
+   spelled out because their AST string joins them with a single space. */
+drop_compat_kind:
+		SEQUENCE               { $$ = "sequence" }
+	| SCHEMA                   { $$ = "schema" }
+	| EXTENSION                { $$ = "extension" }
+	| STATISTICS               { $$ = "statistics" }
+	| COLLATION                { $$ = "collation" }
+	| SERVER                   { $$ = "server" }
+	| CONVERSION_P             { $$ = "conversion" }
+	| EVENT TRIGGER            { $$ = "event trigger" }
+	| ACCESS METHOD            { $$ = "access method" }
+	| FOREIGN TABLE            { $$ = "foreign table" }
+	/* Legacy spells this kind with a HYPHEN, unlike every other one. */
+	| FOREIGN DATA_P WRAPPER   { $$ = "foreign-data wrapper" }
+	| TEXT_P SEARCH ColId      { $$ = "text search " + lowerIdent($3) }
+
+/* An operator name is not an identifier, and it is not ONE token either: the
+   lexer splits `===` into three separate `=` tokens (scan.l's {self} set is
+   per-character), so legacy's parseOperatorRefName joins the run back up. The
+   run rule is reachable only after DROP OPERATOR, where nothing else can
+   follow, so it costs no conflict in expression context. */
+any_operator_name:
+		op_run                 { $$ = qname{parts: []string{$1}} }
+	| ColId '.' op_run         { $$ = qname{parts: []string{$1, $3}} }
+
+op_run:
+		op_char                { $$ = $1 }
+	| op_run op_char           { $$ = $1 + $2 }
+
+/* scan.l's {self} characters arrive as char terminals, everything else as Op,
+   and the handful of two-character operators as their own named terminals. */
+op_char:
+		Op                 { $$ = $1 }
+	| '+'                  { $$ = "+" }
+	| '-'                  { $$ = "-" }
+	| '*'                  { $$ = "*" }
+	| '/'                  { $$ = "/" }
+	| '%'                  { $$ = "%" }
+	| '^'                  { $$ = "^" }
+	| '<'                  { $$ = "<" }
+	| '>'                  { $$ = ">" }
+	| '='                  { $$ = "=" }
+	/* These carry their ORIGINAL text: `!=` and `<>` are the same terminal but
+	   an operator NAME keeps the spelling it was written with, so `!====`
+	   must not come back as `<>===`. */
+	| LESS_EQUALS          { $$ = $1 }
+	| GREATER_EQUALS       { $$ = $1 }
+	| NOT_EQUALS           { $$ = $1 }
+
+/* NONE is the "no operand" spelling for a prefix operator and stores "". */
+drop_arg_types:
+		drop_arg_type                        { $$ = []string{$1} }
+	| drop_arg_types ',' drop_arg_type       { $$ = append($1, $3) }
+
+drop_arg_type:
+		fn_type      { $$ = typeNameOf($1) }
+	/* NONE is stored as the WORD, not as an empty slot: legacy reads it with
+	   the same identifier path every other argument type takes. */
+	| NONE           { $$ = "none" }
+	/* `DROP AGGREGATE a(*)` — the any-signature spelling. */
+	| '*'            { $$ = "*" }

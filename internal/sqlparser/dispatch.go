@@ -100,6 +100,8 @@ var routedStmts = map[string]bool{
 	"merge": true,
 	// P5.5 — DO leads no other statement.
 	"do": true,
+	// P5.6
+	"comment": true,
 	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 
@@ -140,6 +142,9 @@ func fragmentRouted(frag []parser.Token) bool {
 		}
 		if key == "explain" {
 			return explainInnerRouted(frag)
+		}
+		if key == "comment" {
+			return commentRouted(frag)
 		}
 		if key == "create" || key == "drop" || key == "alter" {
 			// These lead many DDL classes; route only ported pairs by
@@ -245,11 +250,22 @@ func explainInnerRouted(frag []parser.Token) bool {
 var routedCreatePairs = map[string]map[string]bool{
 	"create": {"table": true, "index": true, "view": true, "materialized": true,
 		"function": true, "procedure": true, // P5.2
-		"type": true, "domain": true, "sequence": true}, // P5.5
-	"alter": {"table": true},
+		"type": true, "domain": true, "sequence": true, // P5.5
+		"trigger": true, "constraint": true}, // P5.6 ("constraint" = CREATE CONSTRAINT TRIGGER)
+	"alter": {"table": true,
+		"function": true, "procedure": true, "routine": true}, // P5.6
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
-		"type": true, "domain": true}, // P5.5
+		"type": true, "domain": true, // P5.5
+		"trigger": true, // P5.6
+		// P5.7 — the rest of the DROP family. Every one of these is a plain
+		// name-list form in legacy, not a skip-to-semicolon compat scan.
+		"sequence": true, "schema": true, "extension": true, "statistics": true,
+		"collation": true, "server": true, "conversion": true, "event": true,
+		"access": true, "foreign": true, "text": true, "aggregate": true,
+		"operator": true, "cast": true, "transform": true, "rule": true,
+		"policy": true, "publication": true, "subscription": true,
+		"tablespace": true},
 }
 
 // secondKeywordRouted reports whether the fragment's first+second keyword
@@ -303,6 +319,44 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 		return createRoutineRouted(frag)
 	}
 	return true
+}
+
+// commentRouted gates COMMENT ON by its object kind. parseCommentOnTail's
+// switch covers a fixed vocabulary and falls through to a bare
+// CompatNoopStmt{Tag:"COMMENT"} for anything else — and that fallback is a
+// skip-to-semicolon scan, which a grammar cannot reproduce without accepting
+// arbitrary token soup. So the ported kinds route and the rest stay legacy,
+// where they already work.
+//
+// The list is exactly comment_target's alternatives in goopg_ext.y; widen the
+// two together.
+var commentKinds = map[string]bool{
+	"table": true, "index": true, "column": true, "constraint": true,
+	"trigger": true, "policy": true, "rule": true, "statistics": true,
+	"view": true, "sequence": true, "materialized": true, "type": true,
+	"domain": true, "collation": true, "access": true, "server": true,
+	"foreign": true, "extension": true, "cast": true, "function": true,
+	"schema": true,
+}
+
+func commentRouted(frag []parser.Token) bool {
+	// frag[0] is COMMENT; the kind is the word after ON.
+	sawOn := false
+	for _, tok := range frag[1:] {
+		if tok.Kind != parser.TokenKeyword && tok.Kind != parser.TokenIdent {
+			continue
+		}
+		w := strings.ToLower(tok.Value)
+		if !sawOn {
+			if w != "on" {
+				return false // COMMENT must be followed by ON
+			}
+			sawOn = true
+			continue
+		}
+		return commentKinds[w]
+	}
+	return false
 }
 
 // createRoutineRouted vetoes the two CREATE FUNCTION / PROCEDURE sub-forms the

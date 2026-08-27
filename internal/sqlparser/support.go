@@ -2956,3 +2956,239 @@ func twoItemAS(l yyLexer, pos int) bool {
 	}
 	return false
 }
+
+// trigEvent is one INSERT / UPDATE [OF cols] / DELETE / TRUNCATE entry of a
+// trigger's event list. The column list belongs to UPDATE only, and legacy
+// accumulates every event's columns into ONE flat UpdateColumns slice.
+type trigEvent struct {
+	name string
+	cols []string
+}
+
+func appendTrigEvent(list any, one *trigEvent) []any {
+	l, _ := list.([]any)
+	return append(l, any(one))
+}
+
+// constrDefer carries a CONSTRAINT trigger's [NOT] DEFERRABLE / INITIALLY
+// trailer, which only the CONSTRAINT form reads.
+type constrDefer struct {
+	deferrable   bool
+	initDeferred bool
+}
+
+func initiallyDeferred(word string) bool { return strings.EqualFold(word, "deferred") }
+
+// trigForEach carries FOR [EACH] ROW|STATEMENT. A nil pointer means the clause
+// was absent, which legacy leaves as ForEachRow=false — the same value
+// STATEMENT gives, so the two are indistinguishable in the AST.
+type trigForEach struct{ row bool }
+
+func trigForEachOf(word string) *trigForEach {
+	return &trigForEach{row: strings.EqualFold(word, "row")}
+}
+
+// trigTiming maps BEFORE / AFTER / INSTEAD to the AST's enum. An unrecognised
+// word yields 0, which the statement rule turns into legacy's error.
+func trigTiming(word string) int {
+	switch strings.ToLower(word) {
+	case "before":
+		return int(parser.TriggerBefore)
+	case "after":
+		return int(parser.TriggerAfter)
+	case "instead":
+		return int(parser.TriggerInsteadOf)
+	}
+	return 0
+}
+
+// trigTransition is one REFERENCING entry; which side it names is decided by
+// its first word, and an unrecognised word is legacy's "expected OLD or NEW".
+type trigTransition2 struct {
+	old  bool
+	new_ bool
+	name string
+}
+
+func trigTransition(side, name string) any {
+	switch strings.ToLower(side) {
+	case "old":
+		return &trigTransition2{old: true, name: name}
+	case "new":
+		return &trigTransition2{new_: true, name: name}
+	}
+	return &trigTransition2{name: name}
+}
+
+// buildTrigger assembles CREATE [CONSTRAINT] TRIGGER from the pieces the
+// grammar collected. Everything here mirrors parseCreateTriggerTail's field
+// assignments; nothing is inferred.
+func buildTrigger(pos int, name string, table parser.ObjectName, isConstraint bool,
+	timing int, events any, deferAny any, refs any,
+	eachAny any, when parser.Expr, fn parser.ObjectName, args []string) parser.Stmt {
+	st := parser.NewCreateTriggerStmt(pos, name, table, isConstraint)
+	st.Timing = parser.TriggerTiming(timing)
+	defer_, _ := deferAny.(*constrDefer)
+	each, _ := eachAny.(*trigForEach)
+	for _, raw := range asAnySlice(events) {
+		e, ok := raw.(*trigEvent)
+		if !ok {
+			continue
+		}
+		st.Events = append(st.Events, e.name)
+		st.UpdateColumns = append(st.UpdateColumns, e.cols...)
+	}
+	if defer_ != nil {
+		st.Deferrable, st.InitDeferred = defer_.deferrable, defer_.initDeferred
+	}
+	for _, raw := range asAnySlice(refs) {
+		r, ok := raw.(*trigTransition2)
+		if !ok {
+			continue
+		}
+		if r.old {
+			st.OldTransitionTable = r.name
+		} else if r.new_ {
+			st.NewTransitionTable = r.name
+		}
+	}
+	if each != nil {
+		st.ForEachRow = each.row
+	}
+	st.WhenExpr = when
+	st.FuncName = fn
+	st.FuncArgs = args
+	return st
+}
+
+func asAnySlice(v any) []any {
+	l, _ := v.([]any)
+	return l
+}
+
+// commentAt re-stamps a COMMENT ON statement with its real position: the
+// object-kind rule builds the node before the statement's position is known,
+// and CommentOnStmt.pos is unexported.
+func commentAt(pos int, cs *parser.CommentOnStmt) parser.Stmt {
+	out := parser.NewCommentOnStmt(pos, cs.ObjKind, cs.ObjName, cs.SubName)
+	out.Args, out.CastSource, out.CastTarget, out.Description = cs.Args, cs.CastSource, cs.CastTarget, cs.Description
+	return out
+}
+
+// commentColumn splits `COMMENT ON COLUMN a.b[.c]` the way parseCommentOnTail
+// does: the LAST component is the column, and a two-part name leaves the schema
+// empty rather than treating the first part as one.
+func commentColumn(q qname) *parser.CommentOnStmt {
+	parts := q.parts
+	if len(parts) < 2 {
+		return parser.NewCommentOnStmt(0, "column", parser.ObjectName{}, strings.Join(parts, "."))
+	}
+	col := parts[len(parts)-1]
+	rest := parts[:len(parts)-1]
+	name := parser.ObjectName{Name: rest[len(rest)-1]}
+	if len(rest) > 1 {
+		name.Schema = rest[len(rest)-2]
+	}
+	return parser.NewCommentOnStmt(0, "column", name, col)
+}
+
+// commentConstraint — `ON DOMAIN` switches the kind, which is the only place
+// the two constraint flavours differ.
+func commentConstraint(name string, onDomain bool, table parser.ObjectName) *parser.CommentOnStmt {
+	kind := "constraint"
+	if onDomain {
+		kind = "domain constraint"
+	}
+	return parser.NewCommentOnStmt(0, kind, table, name)
+}
+
+func commentCast(src, dst string) *parser.CommentOnStmt {
+	cs := parser.NewCommentOnStmt(0, "cast", parser.ObjectName{}, "")
+	cs.CastSource, cs.CastTarget = src, dst
+	return cs
+}
+
+// alterFnOp is one ALTER FUNCTION action, applied in written order.
+type alterFnOp func(*parser.AlterFunctionStmt)
+
+func alterFnVolatile(v string) alterFnOp {
+	s := v
+	return func(a *parser.AlterFunctionStmt) { a.Volatile = &s }
+}
+
+func alterFnStrict(v bool) alterFnOp {
+	b := v
+	return func(a *parser.AlterFunctionStmt) { a.Strict = &b }
+}
+
+func alterFnLeakproof(v bool) alterFnOp {
+	b := v
+	return func(a *parser.AlterFunctionStmt) { a.Leakproof = &b }
+}
+
+func alterFnSecurity(v bool) alterFnOp {
+	b := v
+	return func(a *parser.AlterFunctionStmt) { a.SecurityDefiner = &b }
+}
+
+func alterFnNoop() alterFnOp { return func(*parser.AlterFunctionStmt) {} }
+
+func alterFnOwner(name string) alterFnOp {
+	n := name
+	return func(a *parser.AlterFunctionStmt) { a.NewOwner = n }
+}
+
+// alterFnOwnerName maps the three self-referential role spellings to the
+// sentinel legacy stores for them.
+func alterFnOwnerName(name string) string {
+	switch strings.ToLower(name) {
+	case "current_user", "session_user", "current_role":
+		return "current_user"
+	}
+	return name
+}
+
+func alterFnRename(name string) alterFnOp {
+	n := name
+	return func(a *parser.AlterFunctionStmt) { a.RenameTo = n }
+}
+
+func alterFnSchema(name string) alterFnOp {
+	n := name
+	return func(a *parser.AlterFunctionStmt) { a.NewSchema = n }
+}
+
+// alterFnConfig records a SET/RESET clause. keep is false for the two forms
+// legacy drops (`FROM CURRENT`, `TO DEFAULT`).
+func alterFnConfig(op parser.FunctionConfigOp, keep bool) alterFnOp {
+	if !keep {
+		return alterFnNoop()
+	}
+	o := op
+	return func(a *parser.AlterFunctionStmt) { a.ConfigOps = append(a.ConfigOps, o) }
+}
+
+func applyAlterFnActions(st *parser.AlterFunctionStmt, v any) {
+	for _, raw := range asAnySlice(v) {
+		if f, ok := raw.(alterFnOp); ok {
+			f(st)
+		}
+	}
+}
+
+// dropWithArgs builds the DROP AGGREGATE / DROP OPERATOR shape: one name plus
+// a signature stored in ArgTypes.
+func dropWithArgs(pos int, kind string, ifExists bool, q qname, args []string, behavior parser.DropBehavior) parser.Stmt {
+	st := parser.NewDropCompatStmt(pos, kind, ifExists, []parser.ObjectName{objectNameFromQn(q)}, behavior)
+	parser.SetDropCompatExtras(st, args, "", nil, "", "")
+	return st
+}
+
+// firstArg keeps only the head of a signature list, which is what a
+// DropCompatStmt records for an aggregate.
+func firstArg(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	return args[:1]
+}

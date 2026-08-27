@@ -752,3 +752,61 @@ func NewCreateSequenceStmt(pos int, name ObjectName, temp, unlogged, ifNotExists
 func NewDoStmt(pos int, language, body string) *DoStmt {
 	return &DoStmt{pos: pos, Language: language, Body: body}
 }
+
+// ---------------------------------------------------------------------------
+// P5.6 trigger / comment / ALTER FUNCTION
+// ---------------------------------------------------------------------------
+
+func NewCreateTriggerStmt(pos int, name string, table ObjectName, isConstraint bool) *CreateTriggerStmt {
+	return &CreateTriggerStmt{pos: pos, Name: name, Table: table, IsConstraint: isConstraint}
+}
+
+func NewDropTriggerStmt(pos int, name string, table ObjectName, ifExists bool) *DropTriggerStmt {
+	return &DropTriggerStmt{pos: pos, Name: name, Table: table, IfExists: ifExists}
+}
+
+func NewCommentOnStmt(pos int, kind string, name ObjectName, subName string) *CommentOnStmt {
+	return &CommentOnStmt{pos: pos, ObjKind: kind, ObjName: name, SubName: subName}
+}
+
+func NewAlterFunctionStmt(pos int, name ObjectName, args []FunctionArg, isProcedure, isRoutine bool) *AlterFunctionStmt {
+	return &AlterFunctionStmt{pos: pos, Name: name, Args: args, IsProcedure: isProcedure, IsRoutine: isRoutine}
+}
+
+// CanonicalTriggerIntArg exposes canonicalTriggerIntArg: a trigger function's
+// integer argument is stored re-rendered from its parsed value (so `007`
+// becomes `7`), while every other literal keeps its raw text.
+func CanonicalTriggerIntArg(lexeme string) string { return canonicalTriggerIntArg(lexeme) }
+
+// ---------------------------------------------------------------------------
+// P5.7 the DROP family
+// ---------------------------------------------------------------------------
+
+func NewDropRuleStmt(pos int, name string, table ObjectName, ifExists bool) *DropRuleStmt {
+	return &DropRuleStmt{pos: pos, Name: name, Table: table, IfExists: ifExists}
+}
+
+func NewDropPolicyStmt(pos int, name string, table ObjectName, ifExists bool) *DropPolicyStmt {
+	return &DropPolicyStmt{pos: pos, Name: name, Table: table, IfExists: ifExists}
+}
+
+func NewDropPublicationStmt(pos int, name string, ifExists bool) *DropPublicationStmt {
+	return &DropPublicationStmt{pos: pos, Name: name, IfExists: ifExists}
+}
+
+func NewDropSubscriptionStmt(pos int, name string, ifExists bool) *DropSubscriptionStmt {
+	return &DropSubscriptionStmt{pos: pos, Name: name, IfExists: ifExists}
+}
+
+func NewDropTablespaceStmt(pos int, name string, ifExists bool) *DropTablespaceStmt {
+	return &DropTablespaceStmt{pos: pos, Name: name, IfExists: ifExists}
+}
+
+// SetDropCompatExtras fills the per-kind extras of a DropCompatStmt: argument
+// types (AGGREGATE / OPERATOR), the access method (OPERATOR CLASS / FAMILY),
+// the cast pair, and the transform pair. They stay nil/"" unless the kind
+// actually has them, which canonDump distinguishes.
+func SetDropCompatExtras(s *DropCompatStmt, argTypes []string, usingMethod string, castTypes []string, transformType, transformLang string) {
+	s.ArgTypes, s.UsingMethod, s.CastTypes = argTypes, usingMethod, castTypes
+	s.TransformType, s.TransformLang = transformType, transformLang
+}
