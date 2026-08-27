@@ -129,6 +129,21 @@ create_table_stmt:
 							nnNames = append(nnNames, e.notNull.name)
 							nnCols = append(nnCols, e.notNull.col)
 							nnNoInherit = append(nnNoInherit, e.notNull.noInherit)
+							// Legacy ALSO emits a ColumnDef with an EMPTY type
+							// for the standalone item — but ONLY when the
+							// column has no definition of its own in the same
+							// list, where the NOT NULL is just an attribute of
+							// an existing column instead.
+							if !elemsDefineColumn(elems, e.notNull.col) {
+							ncd := parser.NewColumnDef(e.notNull.col, parser.NewColumnType("", "", nil, false))
+							// NotNullExplicit stays FALSE: legacy sets it only
+							// for a NOT NULL written on the column itself.
+							ncd.NotNull = true
+							ncd.NotNullNoInherit = e.notNull.noInherit
+							ncd.NotNullConstraintName = e.notNull.name
+							cols = append(cols, *ncd)
+							bodyOrder = append(bodyOrder, e.notNull.col)
+							}
 						}
 						if e.like != nil {
 							likes = append(likes, *e.like)
@@ -288,9 +303,12 @@ part_bound_spec2:
 			{
 				$$ = &partBound{inVals: $5}
 			}
+	/* A range bound's elements are NOT plain expressions: bare MINVALUE and
+	   MAXVALUE are sentinels with their own node, and both are unreserved
+	   words that a_expr would otherwise read as column references. */
 	| FOR VALUES FROM '(' expr_list ')' TO '(' expr_list ')'
 			{
-				$$ = &partBound{from: $5, to: $9}
+				$$ = &partBound{from: partBoundValues(yylex, $5), to: partBoundValues(yylex, $9)}
 			}
 	/* MODULUS / REMAINDER are not kwlist keywords in this build, so they arrive
 	   as plain IDENTs; the action validates the spelling. */
@@ -2986,7 +3004,10 @@ comment_target:
 	| TRIGGER ColId ON qualified_name { $$ = parser.NewCommentOnStmt(0, "trigger", objectNameFromQn($4), $2) }
 	| POLICY ColId ON qualified_name  { $$ = parser.NewCommentOnStmt(0, "policy", objectNameFromQn($4), $2) }
 	| RULE ColId ON qualified_name    { $$ = parser.NewCommentOnStmt(0, "rule", objectNameFromQn($4), $2) }
-	| CAST '(' fn_type AS fn_type ')' { $$ = commentCast(typeNameOf($3), typeNameOf($5)) }
+	/* The cast's type names are stored as WRITTEN, not as the normalised
+	   name: legacy's parseCastTypeName joins the raw tokens, so
+	   `character varying` stays that and does not become varchar. */
+	| CAST '(' fn_type AS fn_type ')' { $$ = commentCast(rawTypeSpan(yylex, $<p>3), rawTypeSpan(yylex, $<p>5)) }
 	| FUNCTION qualified_name opt_comment_args
 			{
 				cs := parser.NewCommentOnStmt(0, "function", objectNameFromQn($2), "")

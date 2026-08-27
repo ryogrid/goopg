@@ -441,6 +441,11 @@ func joinLegacyTokens(l yyLexer, from, to int) string {
 // similarto converter; a NULL pattern or escape folds to NULL; a non-literal
 // operand is the same error legacy raises.
 func substringSimilar(l yyLexer, pos int, str, pat, esc parser.Expr) parser.Expr {
+	// A NULL subject makes the whole call NULL, before the pattern is even
+	// looked at (legacy buildSubstringSimilar).
+	if _, strNull, strOK := literalValue(str); strOK && strNull {
+		return parser.NewNullConst(pos)
+	}
 	patVal, patNull, patOK := literalValue(pat)
 	escVal, escNull, escOK := literalValue(esc)
 	ls, _ := l.(*lexerState)
@@ -2827,7 +2832,10 @@ func rawTypeSpan(l yyLexer, from int) string {
 			// TYPE attribute subcommand (parseAttrTypeTokens stops on all
 			// three), and none of them can be part of a type name.
 			switch strings.ToLower(t.Value) {
-			case "collate", "cascade", "restrict":
+			// COLLATE opens the next clause, CASCADE / RESTRICT end an ALTER
+			// TYPE attribute subcommand, and AS separates a cast's two type
+			// names — none can be part of a type name itself.
+			case "collate", "cascade", "restrict", "as":
 				return strings.Join(parts, " ")
 			}
 		}
@@ -3698,28 +3706,46 @@ func applyOfElements(ct *parser.CreateTableStmt, v any) {
 		if e == nil {
 			continue
 		}
-		switch {
-		case e.ofCol != nil:
+		// Independent ifs, not a switch: the CREATE TABLE element loop is a
+		// sequence too, and a NAMED primary key populates BOTH the named list
+		// and PrimaryKey.
+		if e.ofCol != nil {
 			ct.OfTypeColumnOptions = append(ct.OfTypeColumnOptions, *e.ofCol)
-		case e.pk != nil:
+		}
+		if e.pk != nil {
 			ct.PrimaryKey = e.pk
-		case e.namedPk != nil:
+		}
+		if e.namedPk != nil {
 			ct.NamedConstraints = append(ct.NamedConstraints, *e.namedPk)
-		case e.namedUq != nil:
+		}
+		if e.namedUq != nil {
 			ct.NamedConstraints = append(ct.NamedConstraints, *e.namedUq)
-		case e.uq != nil:
-			ct.TableUniques = append(ct.TableUniques, e.uq...)
-		case e.fkDef != nil:
+		}
+		for _, u := range e.uq {
+			// The five unique lists are PARALLEL: every entry needs a slot in
+			// each of them.
+			def, initDef := false, false
+			if e.uqAttrs != nil {
+				def, initDef = e.uqAttrs.deferrable, e.uqAttrs.initiallyDeferred
+			}
+			ct.TableUniques = append(ct.TableUniques, u)
+			ct.TableUniqueIncludes = append(ct.TableUniqueIncludes, e.uqIncl)
+			ct.TableUniqueNullsNotDistinct = append(ct.TableUniqueNullsNotDistinct, e.uqNND)
+			ct.TableUniqueDeferrable = append(ct.TableUniqueDeferrable, def)
+			ct.TableUniqueInitiallyDeferred = append(ct.TableUniqueInitiallyDeferred, initDef)
+		}
+		if e.fkDef != nil {
 			ct.TableForeignKeys = append(ct.TableForeignKeys, *e.fkDef)
-		case e.check != "":
+		}
+		if e.check != "" {
 			if e.checkName != "" {
 				ct.TableNamedChecks = append(ct.TableNamedChecks,
-					parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check, NoInherit: e.checkNoInh})
-				continue
+					parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check, NoInherit: e.checkNoInh, NotEnforced: e.checkNotEnf})
+			} else {
+				ct.TableChecks = append(ct.TableChecks, e.check)
+				ct.TableCheckNoInherit = append(ct.TableCheckNoInherit, e.checkNoInh)
+				ct.TableCheckNotEnforced = append(ct.TableCheckNotEnforced, e.checkNotEnf)
 			}
-			ct.TableChecks = append(ct.TableChecks, e.check)
-			ct.TableCheckNoInherit = append(ct.TableCheckNoInherit, e.checkNoInh)
-			ct.TableCheckNotEnforced = append(ct.TableCheckNotEnforced, e.checkNotEnf)
 		}
 	}
 }
@@ -3769,4 +3795,58 @@ func castTo(l yyLexer, operand parser.Expr, ct castType, extra []int64, pos int)
 		args = typmodsFor(name, args, len(args))
 	}
 	return parser.NewCastExpr(operand.Pos(), operand, parser.ObjectName{Schema: ct.schema, Name: name}, args)
+}
+
+// partBoundValues turns the bare words MINVALUE and MAXVALUE in a range
+// partition bound into the sentinel node legacy builds for them. Both are
+// UNRESERVED, so a grammar rule for them is reduce/reduce-ambiguous with
+// unreserved_keyword -> ColId -> a_expr (4 conflicts, measured); recognising
+// them after the fact costs nothing and is just as precise, because the only
+// other reading — a column actually named minvalue — is not legal in a bound
+// anyway. A QUOTED "minvalue" is left alone: quoting is what upstream uses to
+// name such a column, and the token carries that distinction.
+func partBoundValues(l yyLexer, exprs []parser.Expr) []parser.Expr {
+	for i, e := range exprs {
+		cr, ok := e.(*parser.ColumnRef)
+		if !ok || cr.Schema != "" || cr.Table != "" {
+			continue
+		}
+		isMax := strings.EqualFold(cr.Column, "maxvalue")
+		if !isMax && !strings.EqualFold(cr.Column, "minvalue") {
+			continue
+		}
+		if isQuotedIdentAt(l, cr.Pos()) {
+			continue
+		}
+		exprs[i] = parser.NewPartitionRangeBoundKeyword(cr.Pos(), isMax)
+	}
+	return exprs
+}
+
+// elemsDefineColumn reports whether the element list defines a column of this
+// name. A standalone `NOT NULL <col>` item is a column ENTRY when the column
+// has no definition of its own, and merely an attribute of one when it does.
+func elemsDefineColumn(elems []*tableElem, name string) bool {
+	for _, e := range elems {
+		if e != nil && e.col != nil && strings.EqualFold(e.col.name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// substringCall builds SUBSTRING(...). The three-argument SQL:1999 spelling
+// `SUBSTRING(str FROM pattern FOR escape)` means the SIMILAR form when BOTH
+// trailing operands are string-or-NULL literals — PG disambiguates it from
+// `FROM start FOR count` by overload resolution at plan time, which goopg has
+// no machinery for, so legacy constant-folds it and so does this.
+func substringCall(l yyLexer, pos int, args []parser.Expr) parser.Expr {
+	if len(args) == 3 {
+		if _, _, ok1 := literalValue(args[1]); ok1 {
+			if _, _, ok2 := literalValue(args[2]); ok2 {
+				return substringSimilar(l, pos, args[0], args[1], args[2])
+			}
+		}
+	}
+	return specialFormCall(pos, "substring", args)
 }

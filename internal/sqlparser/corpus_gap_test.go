@@ -45,21 +45,13 @@ func TestLegacyCorpusRejects(t *testing.T) {
 }
 
 // legacyCorpusDivergenceCeiling is a RATCHET, not a target: it may only ever
-// go down. The remaining entries are the AST-shape differences left over the
-// legacy test corpus for routed classes — a mix of documented known-diffs
-// (the unary-minus fold) and unfixed gaps.
+// go down, and the test fails in BOTH directions so a drop has to be recorded
+// here rather than silently absorbed.
 //
-// 2026-08-28: 37 -> 29 after FK NOT VALID / NOT ENFORCED were RECORDED rather
-// than dropped, `CONSTRAINT n UNIQUE NULLS NOT DISTINCT` kept its name, and a
-// quoted `"float"` stopped taking the float8 normalisation.
-// 2026-08-28: 29 -> 15 after BETWEEN ASYMMETRIC stopped desugaring like
-// SYMMETRIC, `SET ROLE DEFAULT` became a Default=true reset, every cast target
-// started going through one normaliser (so `CAST(3 AS float)` is float8 and a
-// quoted `"char"` takes no implicit typmod), ON COMMIT PRESERVE ROWS went back
-// to the empty string legacy records for the default, `WITH (check_option=…)`
-// stopped being erased by the absent trailing clause, GROUPING(a,b) got its
-// own node, and a named table CHECK kept its NOT ENFORCED.
-const legacyCorpusDivergenceCeiling = 15
+// It is now ZERO: over the 1,485 statements harvested from internal/parser's
+// own tests, every one the dispatcher routes produces a byte-identical AST in
+// both parsers. Getting there was 37 -> 29 -> 15 -> 0 across P7.1a/b/c.
+const legacyCorpusDivergenceCeiling = 0
 
 func TestLegacyCorpusDivergence(t *testing.T) {
 	n := 0

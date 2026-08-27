@@ -932,3 +932,11 @@ func NewUnlistenStmt(pos int, channel string, all bool) *UnlistenStmt {
 func NewGroupingCall(pos int, args []Expr) *GroupingCall {
 	return &GroupingCall{pos: pos, Args: args}
 }
+
+// NewPartitionRangeBoundKeyword builds the MINVALUE / MAXVALUE sentinel a
+// range partition bound uses. Legacy gives it its own node rather than a
+// column reference, which is what makes `FROM (MINVALUE, 1)` distinguishable
+// from a column actually named minvalue.
+func NewPartitionRangeBoundKeyword(pos int, isMax bool) *PartitionRangeBoundKeyword {
+	return &PartitionRangeBoundKeyword{pos: pos, IsMax: isMax}
+}

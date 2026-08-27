@@ -2932,8 +2932,13 @@ c_expr:
    $3 straight through preserves the nil, which name_or_call deliberately
    does NOT do; matching legacy is what matters here. */
 func_expr_common_subexpr:
+	/* `SUBSTRING(str FROM pattern FOR escape)` is the SQL:1999 spelling of the
+	   SIMILAR form, and PG tells it apart from `FROM start FOR count` by
+	   overload resolution at plan time. goopg has no such machinery, so legacy
+	   constant-folds it when BOTH operands are string-or-NULL literals; the
+	   fold has to happen here for the same reason. */
 		SUBSTRING '(' substr_list ')'
-			{ $$ = specialFormCall($<p>1, "substring", $3) }
+			{ $$ = substringCall(yylex, $<p>1, $3) }
 	| SUBSTRING '(' a_expr SIMILAR a_expr ESCAPE a_expr ')'
 			{ $$ = substringSimilar(yylex, $<p>1, $3, $5, $7) }
 	| OVERLAY '(' overlay_list ')'
@@ -3488,6 +3493,9 @@ extract_field:
    reaching cast_ident instead. */
 interval_qual:
 		iv_field                              { $$ = ivQual{hi: $1, prec: -1} }
+	/* A single field may carry its own precision (`interval second(2)`), which
+	   is NOT the same as `interval(2)`: the range mask differs. */
+	| iv_field '(' ICONST ')'                 { $$ = ivQual{hi: $1, prec: $3} }
 	| iv_field TO iv_field                    { $$ = ivQual{hi: $1, lo: $3, prec: -1} }
 	| iv_field TO iv_field '(' ICONST ')'     { $$ = ivQual{hi: $1, lo: $3, prec: $5} }
 
