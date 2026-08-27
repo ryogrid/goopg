@@ -510,3 +510,20 @@ func (l *lexerState) Error(msg string) {
 func pgQuote(s string) string {
 	return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
 }
+
+// directArrayAt reports whether the token at absolute position pos is the
+// ARRAY keyword immediately followed by '[' — parseAnyTail's literal test for
+// the `ANY (ARRAY[...])` unwrap. Positions come from $<p>N, so a miss means the
+// list started with something else (a '(' for instance).
+func (l *lexerState) directArrayAt(pos int) bool {
+	for i, tk := range l.toks {
+		if tk.Pos != pos {
+			continue
+		}
+		if tk.Kind != parser.TokenIdent || !strings.EqualFold(tk.Value, "array") {
+			return false
+		}
+		return i+1 < len(l.toks) && l.toks[i+1].Kind == parser.TokenSymbol && l.toks[i+1].Value == "["
+	}
+	return false
+}

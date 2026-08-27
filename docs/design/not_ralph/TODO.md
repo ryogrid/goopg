@@ -540,27 +540,54 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   `DELETE ... USING` aliases, six keyword typed-literal prefixes, keyword
   function names (`left(...)`), counted datetime types, and `SELECT ... INTO`.
 
-**Must-pass regress fragment count: 222 -> 188 -> 157 -> 103 -> 84 -> 33 -> 26.**
+**Must-pass regress fragment count: 222 -> 188 -> 157 -> 103 -> 84 -> 33 -> 26 -> 13.**
 
 The measurement harness was also corrected mid-session: it now discards any
 fragment the LEGACY parser rejects too, so the regress files' DELIBERATE syntax
 errors (`select distinct from pg_database;`, `select;`, the copydml cases) no
 longer inflate the count. Roughly 33 of the original 222 were that noise.
 
-**Of the 26 that remain, 24 are the two structurally blocked items** below
-(parenthesised set-op operands 14, row constructors 10). The other two are
-GROUPING SETS, which is an unported feature rather than a missing production,
-and `VALUES(n.*)` — whole-row expansion as an EXPRESSION — whose cost is
-recorded in the grammar next to `c_expr` (20 reduce/reduce, all of them the
-pre-existing a_expr/b_expr split).
+**Of the 13 that remain, 10 are row constructors** (the one structural blocker
+left, below). The other three are GROUPING SETS, which is an unported feature
+rather than a missing production; `VALUES(n.*)` — whole-row expansion as an
+EXPRESSION — whose cost is recorded in the grammar next to `c_expr` (20
+reduce/reduce, all of them the pre-existing a_expr/b_expr split); and
+`GENERATED ALWAYS AS IDENTITY (START WITH ...)` sequence options.
 
-### The two structural blockers, diagnosed exactly (2026-08-27)
+### The structural blockers (2026-08-27)
 
-**Parenthesised set-op operands (14)** — `(SELECT ...) UNION ALL (SELECT ...)`.
-Adding `simple_select: paren_select`, with ONE shared `'(' SelectStmt ')'` rule
-feeding all three consumers (which is the least-conflict spelling — giving each
-consumer its own copy is worse), leaves exactly TWO reduce/reduce conflicts,
-both on `')'`:
+- [x] **DONE 2026-08-27 — parenthesised set-op operands (14).** Landed as
+  upstream's three-tier layering (`SelectStmt` / `select_with_parens` /
+  `select_no_parens`, plus `select_bare` for legacy's parseSelect, which
+  refuses a leading '('), with legacy's WRAPPER-node shape reproduced exactly
+  (`parenGroup`): `(S)` alone is S stamped; anything after the ')' hangs off a
+  fresh node whose `SetOpOperand` is S. Cost: ONE shift/reduce on ')' (nested
+  derived-table parens, shift is the legacy parse) — no reduce/reduce at all,
+  for precisely the reason recorded below: with no bare
+  `select_no_parens: select_with_parens` alternative, the nested-paren case is
+  a SHIFT against the c_expr reduce and `%prec UMINUS` settles it.
+
+  Two things fell out of sharing `select_with_parens` across every subquery
+  site. First, legacy is NOT uniform about stamping `Parenthesized` on a single
+  pair of parens — derived tables and set-op right operands stamp; scalar
+  subqueries, EXISTS, IN, ANY and CTE bodies do not — and the old scalar-
+  subquery action stamped unconditionally, so every `SELECT (SELECT ...)` had
+  been a silent parity diff. Second, INSERT's optional column list had to be
+  inlined into the source alternative (gram.y does the same): once the source
+  may start with '(', an EMPTY `opt_ins_cols` reduction on '(' fights the shift
+  and the shift would parse `INSERT INTO t (SELECT 1)` as a column list.
+
+  While there: `= ANY` / `<> ANY` / SOME desugaring on subqueries (the list
+  path already did it), and parseAnyTail's `ANY (ARRAY[...])` element splice,
+  whose test is TOKEN-literal (`((ARRAY[1]))` stays wrapped) and is therefore
+  reproduced from the token stream rather than the AST. Corpus parity 393 ->
+  434 across the batch.
+
+  The original diagnosis, kept for the record:
+
+  Adding `simple_select: paren_select`, with ONE shared `'(' SelectStmt ')'` rule
+  feeding all three consumers, leaves exactly TWO reduce/reduce conflicts,
+  both on `')'`:
 
     state 1131  simple_select: paren_select.  vs  c_expr: paren_select.
     state 1916  simple_select: paren_select.  vs  base_table_ref: paren_select.opt_derived_alias
@@ -579,9 +606,9 @@ select_with_parens, with the set-op alternatives taking select_clause — so the
 parenthesised operand never enters simple_select at all. That is a structural
 rewrite of the SELECT core and should be done deliberately, not piecemeal.
 
-**Row constructors (10)** — unchanged from the measurement above: 12
-reduce/reduce, all `a_expr: c_expr` vs `b_expr: c_expr`. Resolve the
-a_expr/b_expr split first.
+- [ ] **Row constructors (10)** — unchanged from the measurement above: 12
+  reduce/reduce, all `a_expr: c_expr` vs `b_expr: c_expr`. Resolve the
+  a_expr/b_expr split first. Now the LAST structural blocker.
 
 ## ⚠️ VERIFICATION VERDICT 2026-08-27 — the migration is BELOW pre-migration level
 

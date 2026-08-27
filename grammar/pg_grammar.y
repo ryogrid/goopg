@@ -55,7 +55,7 @@
 %left		JOIN CROSS LEFT FULL RIGHT INNER_P NATURAL
 
 %type <stmts>	root stmt_list
-%type <stmt>	stmt SelectStmt simple_select base_select
+%type <stmt>	stmt SelectStmt simple_select base_select select_with_parens select_no_parens select_bare
 %type <node>	setop_tail setop_op
 %type <ctes>	cte_list
 %type <node>	cte_item
@@ -81,7 +81,8 @@
 %type <onames>	drop_name_list
 %type <exprs>	trim_list
 %type <str>	sort_using_op constr_name func_name_keyword opt_part_opclass
-%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause
+%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause paren_tail
+%type <expr>	opt_paren_limit opt_paren_offset
 %type <exprs>	opt_execute_params
 
 %type <strs>	constr_name_list
@@ -152,7 +153,8 @@
 %type <rvars>	upd_from_list
 %type <oc>	opt_on_conflict
 %type <targets>	opt_returning
-%type <strs>	opt_ins_cols colid_list
+%type <strs>	colid_list
+%type <node>	insert_rest
 %type <ct>	cast_target cast_typename
 %type <ival>	opt_array_tail
 %type <exprs>	expr_list group_by_list
@@ -303,7 +305,94 @@ stmt:
 // RHS is a FULL SelectStmt. Trailing ORDER BY/LIMIT/OFFSET therefore land
 // on the innermost RHS first; foldSetOps lifts them outward when that RHS
 // is not explicitly parenthesized (M0097-0024/M0097-0042).
+/* The three tiers mirror gram.y :12823-12900 (SelectStmt / select_with_parens
+   / select_no_parens) and exist for ONE reason: a parenthesised select must
+   not be reducible to a complete statement while the parser still sits inside
+   the parentheses. When it was (`simple_select: paren_select`, measured
+   2026-08-27), `( (SELECT 1) . )` could reduce EITHER to a statement (for the
+   outer select-parens) OR to c_expr (for the outer `'(' a_expr ')'`) — two
+   reduce/reduce conflicts on ')' that rule order breaks the wrong way,
+   killing `f((SELECT 1))`. In this layering the nested-paren case is a SHIFT
+   (`'(' select_with_parens ')'`) against the c_expr reduce, and
+   `%prec UMINUS` on the c_expr alternative lets ')' win it.
+
+   Legacy shapes reproduced (parseParenthesisedSelectStmt, select.go:1007):
+     (S)                 -> S, Parenthesized=true, no wrapper
+     ((S))               -> same (stamping is idempotent)
+     (S) UNION T / (S) ORDER BY / LIMIT / OFFSET
+                         -> a fresh WRAPPER stmt {SetOpOperand: S(paren)} that
+                            carries the set-op and the trailing clauses, with
+                            ORDER BY / LIMIT / OFFSET lifted off a BARE right
+                            branch exactly as foldSetOps lifts them.
+   select_bare is legacy's parseSelect: NO leading '(' — CREATE VIEW's body and
+   CTAS's source reject `AS (SELECT 1)` there, so they take select_bare. */
 SelectStmt:
+		select_no_parens %prec UMINUS
+			{
+				$$ = $1
+			}
+	| select_with_parens %prec UMINUS
+			{
+				s := $1.(*parser.SelectStmt)
+				s.Parenthesized = true
+				$$ = s
+			}
+
+select_with_parens:
+		'(' select_no_parens ')'
+			{
+				$$ = $2
+			}
+	| '(' select_with_parens ')'
+			{
+				s := $2.(*parser.SelectStmt)
+				s.Parenthesized = true
+				$$ = s
+			}
+
+select_no_parens:
+		select_bare
+			{
+				$$ = $1
+			}
+	| select_with_parens paren_tail
+			{
+				$$ = parenGroup($<p>1, $1.(*parser.SelectStmt), $2.(*parenTail))
+			}
+
+/* What may follow a parenthesised left operand: legacy's
+   trailingClauseFollowsParens (select.go:982) admits exactly UNION /
+   INTERSECT / EXCEPT / ORDER / LIMIT / OFFSET, in that fixed order and with
+   plain a_expr limits — no FETCH, no FOR, no LIMIT ALL, no OFFSET-then-LIMIT.
+   Wider than that would ACCEPT statements the legacy parser rejects. */
+paren_tail:
+		setop_op SelectStmt
+			{
+				rt, _ := $2.(*parser.SelectStmt)
+				$$ = &parenTail{op: $1.(*opSpec), right: rt}
+			}
+	| ORDER BY sort_by_list opt_paren_limit opt_paren_offset
+			{
+				$$ = &parenTail{orderBy: $3, limit: $4, offset: $5}
+			}
+	| LIMIT a_expr opt_paren_offset
+			{
+				$$ = &parenTail{limit: $2, offset: $3}
+			}
+	| OFFSET a_expr
+			{
+				$$ = &parenTail{offset: $2}
+			}
+
+opt_paren_limit:
+		/* empty */     { $$ = (parser.Expr)(nil) }
+	| LIMIT a_expr      { $$ = $2 }
+
+opt_paren_offset:
+		/* empty */     { $$ = (parser.Expr)(nil) }
+	| OFFSET a_expr     { $$ = $2 }
+
+select_bare:
 		/* TERMINAL-ESCAPE RULE: this alternative must exist so the
 		   cte_item -> SelectStmt -> with_clause cycle has a terminal-only
 		   derivation; without it goyacc reports never-derives for the whole
@@ -1173,9 +1262,9 @@ base_table_ref:
 				sub := syntheticParenSelect(pos, fe)
 				$$ = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
 			}
-	| '(' SelectStmt ')' opt_derived_alias
+	| select_with_parens opt_derived_alias
 			{
-				sub, ok := $2.(*parser.SelectStmt)
+				sub, ok := $1.(*parser.SelectStmt)
 				if !ok {
 					lerr(yylex, "subquery in FROM did not produce SELECT", yylex.(*lexerState).lastConsumedPos())
 					sub = parser.NewSelectStmt(0)
@@ -1185,15 +1274,15 @@ base_table_ref:
 				lateral := false
 				alias := ""
 				var cols []string
-				if da, ok2 := $4.(*derivedAlias); ok2 && da != nil {
+				if da, ok2 := $2.(*derivedAlias); ok2 && da != nil {
 					alias, cols = da.alias, da.cols
 					lateral = da.lateral
 				}
 				$$ = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
 			}
-	| LATERAL_P '(' SelectStmt ')' opt_derived_alias
+	| LATERAL_P select_with_parens opt_derived_alias
 			{
-				sub, ok := $3.(*parser.SelectStmt)
+				sub, ok := $2.(*parser.SelectStmt)
 				if !ok {
 					lerr(yylex, "subquery in FROM did not produce SELECT", yylex.(*lexerState).lastConsumedPos())
 					sub = parser.NewSelectStmt(0)
@@ -1206,7 +1295,7 @@ base_table_ref:
 				lateral := true
 				alias := ""
 				var cols []string
-				if da, ok2 := $5.(*derivedAlias); ok2 && da != nil {
+				if da, ok2 := $3.(*derivedAlias); ok2 && da != nil {
 					alias, cols = da.alias, da.cols
 					lateral = lateral || da.lateral
 				}
@@ -1429,9 +1518,9 @@ cte_list:
 /* cte_item — gram.y :13030ish subset: SELECT body only (DML bodies arrive
    with P3). MATERIALIZED markers per M0097-0047. */
 cte_item:
-		ColId cte_col_list AS opt_materialized '(' SelectStmt ')'
+		ColId cte_col_list AS opt_materialized select_with_parens
 			{
-				sub, ok := $6.(*parser.SelectStmt)
+				sub, ok := $5.(*parser.SelectStmt)
 				if !ok || sub == nil {
 					sub = parser.NewSelectStmt(0)
 				}
@@ -1791,9 +1880,9 @@ a_expr:
 			{
 				$$ = parser.NewIsNullExpr($1.Pos(), $1, true)
 			}
-	| EXISTS '(' SelectStmt ')'
+	| EXISTS select_with_parens
 			{
-				sub, _ := $3.(*parser.SelectStmt)
+				sub, _ := $2.(*parser.SelectStmt)
 				if sub == nil {
 					sub = parser.NewSelectStmt(0)
 				}
@@ -1873,42 +1962,35 @@ a_expr:
 	   subquery_Op subset. */
 	| a_expr subq_op ANY '(' expr_list ')'
 			{
-				op := binOp(yylex, $2)
-				anyOp := op
-				if anyOp == parser.OpEq {
-					anyOp = 0 // OpUnknown: =ANY is same as IN
-				}
-				_ = op
-				$$ = parser.NewInExpr($1.Pos(), $1, false, anyOp, false, nil, $5)
+				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), nil, $5, $<p>5)
 			}
 	| a_expr subq_op SOME '(' expr_list ')'
 			{
-				op := binOp(yylex, $2)
-				anyOp := op
-				if anyOp == parser.OpEq {
-					anyOp = 0 // OpUnknown: =ANY is same as IN
-				}
-				_ = op
-				$$ = parser.NewInExpr($1.Pos(), $1, false, anyOp, false, nil, $5)
+				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), nil, $5, $<p>5)
 			}
 	| a_expr subq_op ALL '(' expr_list ')'
 			{
-				anyOp := binOp(yylex, $2)
-				allFlag := true
-				_ = allFlag
-				$$ = parser.NewInExpr($1.Pos(), $1, false, anyOp, true, nil, $5)
+				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, nil, unwrapAnyArray(yylex, $5, $<p>5))
 			}
-	| a_expr subq_op ANY '(' SelectStmt ')'
+	| a_expr subq_op ANY select_with_parens
 			{
-				sub, _ := $5.(*parser.SelectStmt)
+				sub, _ := $4.(*parser.SelectStmt)
 				if sub == nil {
 					sub = parser.NewSelectStmt(0)
 				}
-				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), false, sub, nil)
+				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), sub, nil, 0)
 			}
-	| a_expr subq_op ALL '(' SelectStmt ')'
+	| a_expr subq_op SOME select_with_parens
 			{
-				sub, _ := $5.(*parser.SelectStmt)
+				sub, _ := $4.(*parser.SelectStmt)
+				if sub == nil {
+					sub = parser.NewSelectStmt(0)
+				}
+				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), sub, nil, 0)
+			}
+	| a_expr subq_op ALL select_with_parens
+			{
+				sub, _ := $4.(*parser.SelectStmt)
 				if sub == nil {
 					sub = parser.NewSelectStmt(0)
 				}
@@ -2033,17 +2115,17 @@ a_expr:
 			{
 				$$ = parser.NewInExpr($1.Pos(), $1, true, 0, false, nil, $5)
 			}
-	| a_expr IN_P '(' SelectStmt ')'
+	| a_expr IN_P select_with_parens
 			{
-				sub, _ := $4.(*parser.SelectStmt)
+				sub, _ := $3.(*parser.SelectStmt)
 				if sub == nil {
 					sub = parser.NewSelectStmt(0)
 				}
 				$$ = parser.NewInExpr($1.Pos(), $1, false, 0, false, sub, nil)
 			}
-	| a_expr NOT_LA IN_P '(' SelectStmt ')'
+	| a_expr NOT_LA IN_P select_with_parens
 			{
-				sub, _ := $5.(*parser.SelectStmt)
+				sub, _ := $4.(*parser.SelectStmt)
 				if sub == nil {
 					sub = parser.NewSelectStmt(0)
 				}
@@ -2141,13 +2223,14 @@ c_expr:
 				}
 				$$ = parser.NewArrayConstructorExpr(yylex.(*lexerState).lastConsumedPos(), args)
 			}
-	| ARRAY '(' SelectStmt ')'
+	/* ARRAY(select) — legacy parses the body with parseSelect inside its own
+	   parens, so it is neither Parenthesized nor allowed to start with '('. */
+	| ARRAY '(' select_bare ')'
 			{
 				sub, _ := $3.(*parser.SelectStmt)
 				if sub == nil {
 					sub = parser.NewSelectStmt(0)
 				}
-				sub.Parenthesized = true
 				$$ = parser.NewArraySubqueryExpr(yylex.(*lexerState).lastConsumedPos(), sub)
 			}
 	| INTERVAL SCONST YEAR_P
@@ -2182,13 +2265,18 @@ c_expr:
 			{
 				$$ = parser.NewExtractExpr(yylex.(*lexerState).lastConsumedPos(), $3, $5)
 			}
-	| '(' SelectStmt ')'
+	/* Scalar subquery. %prec UMINUS is what lets ')' SHIFT (nested parens,
+	   `((SELECT 1))`) over reducing to c_expr — gram.y :16220 does the same.
+	   No stamp: legacy's scalar-subquery path calls parseSelect inside its own
+	   parens, so `SELECT (SELECT 1)` is Parenthesized=false there and only a
+	   NESTED paren marks it; the previous action stamped unconditionally and
+	   every scalar subquery was a silent parity diff. */
+	| select_with_parens %prec UMINUS
 			{
-				sub, _ := $2.(*parser.SelectStmt)
+				sub, _ := $1.(*parser.SelectStmt)
 				if sub == nil {
 					sub = parser.NewSelectStmt(0)
 				}
-				sub.Parenthesized = true
 				$$ = parser.NewSubqueryExpr(yylex.(*lexerState).lastConsumedPos(), sub)
 			}
 
@@ -2827,27 +2915,34 @@ insert_stmt:
 				$$ = is
 			}
 
+/* insert_rest folds the optional column list INTO the source alternative
+   instead of an empty opt_ins_cols nonterminal — gram.y :12210 does the same,
+   and for the same reason: once the source may be a parenthesised select
+   (`INSERT INTO t (SELECT 1)`), an EMPTY column-list reduction on '(' fights
+   the shift of '(' for `(a, b)`, and the shift that wins would parse the
+   select as a column list. With both spelled out, '(' is shifted either way
+   and the SECOND token (ColId vs SELECT) decides. */
 insert_core:
-		INSERT INTO qualified_name opt_ins_cols insert_source
+		INSERT INTO qualified_name insert_rest
 			{
-				src := $5
-				is := parser.NewInsertStmt(0, rangeVarFromName($3, ""), $4, src.rows)
-				if src.sel != nil {
-					parser.SetInsertSelect(is, src.sel)
+				src := $4.(*insRest)
+				is := parser.NewInsertStmt(0, rangeVarFromName($3, ""), src.cols, src.src.rows)
+				if src.src.sel != nil {
+					parser.SetInsertSelect(is, src.src.sel)
 				}
-				if src.def {
+				if src.src.def {
 					parser.SetInsertDefaultValues(is)
 				}
 				$$ = is
 			}
-	| with_clause INSERT INTO qualified_name opt_ins_cols insert_source
+	| with_clause INSERT INTO qualified_name insert_rest
 			{
-				src := $6
-				is := parser.NewInsertStmt(0, rangeVarFromName($4, ""), $5, src.rows)
-				if src.sel != nil {
-					parser.SetInsertSelect(is, src.sel)
+				src := $5.(*insRest)
+				is := parser.NewInsertStmt(0, rangeVarFromName($4, ""), src.cols, src.src.rows)
+				if src.src.sel != nil {
+					parser.SetInsertSelect(is, src.src.sel)
 				}
-				if src.def {
+				if src.src.def {
 					parser.SetInsertDefaultValues(is)
 				}
 				is.With = $1
@@ -2894,9 +2989,9 @@ opt_returning:
 	   form here would make the yacc parser accept a bare RETURNING. */
 	| RETURNING target_list   { $$ = $2 }
 
-opt_ins_cols:
-		/* empty */  { $$ = nil }
-	| '(' colid_list ')' { $$ = $2 }
+insert_rest:
+		insert_source                       { $$ = &insRest{src: $1} }
+	| '(' colid_list ')' insert_source     { $$ = &insRest{cols: $2, src: $4} }
 
 colid_list:
 		ColId                    { $$ = []string{$1} }

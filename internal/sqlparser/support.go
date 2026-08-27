@@ -1280,3 +1280,97 @@ func intoWrap(l yyLexer, s parser.Stmt) parser.Stmt {
 	ct.SelectSource = sel
 	return ct
 }
+
+// parenTail is what follows a parenthesised left operand — a set operation,
+// or a trailing ORDER BY / LIMIT / OFFSET.
+type parenTail struct {
+	op      *opSpec
+	right   *parser.SelectStmt
+	orderBy []parser.SortBy
+	limit   parser.Expr
+	offset  parser.Expr
+}
+
+// parenGroup reproduces legacy parseParenthesisedSelectStmt's wrapper
+// (select.go:1043): the parenthesised query is stamped and hung under a FRESH
+// node as SetOpOperand, and everything written after the ')' attaches to that
+// node — never into the operand. A bare (unparenthesised) right branch of the
+// set operation gives up its trailing ORDER BY / LIMIT / OFFSET to the wrapper,
+// the same lift foldSetOps applies.
+func parenGroup(pos int, inner *parser.SelectStmt, t *parenTail) *parser.SelectStmt {
+	inner.Parenthesized = true
+	grp := parser.NewSelectStmt(pos)
+	grp.SetOpOperand = inner
+	if t.op != nil {
+		grp.SetOp = parser.NewSetOpClause(t.op.pos, t.op.typ, t.op.all, t.right)
+		if r := t.right; r != nil && !r.Parenthesized {
+			if grp.OrderBy == nil && r.OrderBy != nil {
+				grp.OrderBy, r.OrderBy = r.OrderBy, nil
+			}
+			if grp.Limit == nil && r.Limit != nil {
+				grp.Limit, r.Limit = r.Limit, nil
+			}
+			if grp.Offset == nil && r.Offset != nil {
+				grp.Offset, r.Offset = r.Offset, nil
+			}
+		}
+		return grp
+	}
+	grp.OrderBy, grp.Limit, grp.Offset = t.orderBy, t.limit, t.offset
+	return grp
+}
+
+// insRest carries INSERT's optional column list together with its source.
+type insRest struct {
+	cols []string
+	src  *insSrc
+}
+
+// quantifiedAny builds `x op ANY|SOME (...)` the way legacy does
+// (select.go:2300-2323, parseAnyTail): `= ANY` IS `IN` (AnyOp stays
+// OpUnknown), `<> ANY` / `!= ANY` is the IN shape flagged NotEqualAny (an OR of
+// inequalities — deliberately NOT NOT IN, which is an AND), and any other
+// operator is carried as AnyOp. The same desugaring applies whether the right
+// side is a list or a subquery; before this helper only the list path did it.
+func quantifiedAny(l yyLexer, pos int, left parser.Expr, op parser.OpCode, sub *parser.SelectStmt, list []parser.Expr, listPos int) parser.Expr {
+	anyOp := op
+	notEq := false
+	switch op {
+	case parser.OpEq:
+		anyOp = parser.OpUnknown
+	case parser.OpNe:
+		anyOp, notEq = parser.OpUnknown, true
+	}
+	ie := parser.NewInExpr(pos, left, false, anyOp, false, sub, unwrapAnyArray(l, list, listPos))
+	ie.NotEqualAny = notEq
+	return ie
+}
+
+// unwrapAnyArray reproduces parseAnyTail's treatment of `ANY (ARRAY[...])`
+// (select.go:2574-2606): when the right side is a DIRECT array constructor,
+// legacy splices its elements into InExpr.List and DISCARDS any trailing
+// `::type[]` casts. Legacy's test is TOKEN-literal — the two tokens after the
+// '(' are ARRAY and '[' — so `((ARRAY[1]))` stays an ordinary expression
+// there. The AST alone cannot tell those apart (the grammar's `'(' a_expr ')'`
+// leaves no node), which is why the check goes back to the token stream at
+// listPos, the position of the list's first terminal.
+func unwrapAnyArray(l yyLexer, list []parser.Expr, listPos int) []parser.Expr {
+	if len(list) != 1 {
+		return list
+	}
+	if ls, ok := l.(*lexerState); ok && !ls.directArrayAt(listPos) {
+		return list
+	}
+	e := list[0]
+	for {
+		c, ok := e.(*parser.CastExpr)
+		if !ok {
+			break
+		}
+		e = c.Operand
+	}
+	if ac, ok := e.(*parser.ArrayConstructorExpr); ok && len(ac.Elements) > 0 {
+		return ac.Elements
+	}
+	return list
+}

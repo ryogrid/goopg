@@ -501,7 +501,7 @@ create_table_stmt_as:
    goopg's AST carries both on CreateTableStmt, so one nonterminal serves both
    the plain and the column-alias spellings instead of doubling them. */
 ctas_source:
-		SelectStmt
+		select_bare
 			{
 				sel, _ := $1.(*parser.SelectStmt)
 				$$ = &ctasSrc{sel: sel}
@@ -647,7 +647,7 @@ opt_ct_tail:
 			{ i := &ctTail{}; i.withKv = $3; $$ = i }
 	| INHERITS '(' drop_name_list ')'
 			{ i := &ctTail{}; i.inherits = $3; $$ = i }
-	| AS SelectStmt
+	| AS select_bare
 			{
 				sel, _ := $2.(*parser.SelectStmt)
 				i := &ctTail{}; i.asSelect = sel; $$ = i
@@ -1246,7 +1246,7 @@ opt_COLUMN:
 
 /* create_view_stmt — P5 v0: CREATE [OR REPLACE] [TEMP] VIEW name [(cols)] AS select */
 create_view_stmt:
-		CREATE opt_or_replace VIEW qualified_name opt_name_list_p AS { yylex.(*lexerState).markSpanStart() } SelectStmt
+		CREATE opt_or_replace VIEW qualified_name opt_name_list_p AS { yylex.(*lexerState).markSpanStart() } select_bare
 			{
 				nm := $4.parts
 				v := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -1279,7 +1279,7 @@ drop_view_stmt:
    [(aliases)] AS select [WITH [NO] DATA]. USING/WITH (opts)/TABLESPACE
    deferred (legacy fallback covers them via the modifier-fallback rule). */
 create_matview_stmt:
-		CREATE MATERIALIZED VIEW opt_if_not_exists qualified_name opt_name_list_p AS { yylex.(*lexerState).markSpanStart() } SelectStmt opt_with_data
+		CREATE MATERIALIZED VIEW opt_if_not_exists qualified_name opt_name_list_p AS { yylex.(*lexerState).markSpanStart() } select_bare opt_with_data
 			{
 				nm := $5.parts
 				v := parser.ObjectName{Name: nm[len(nm)-1]}
