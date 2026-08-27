@@ -485,15 +485,17 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   AS with the AS of CREATE VIEW / CTE / CAST, and the boolean literals also
   collide with `c_expr: TRUE_P`. Same root cause and same fix as the
   parenthesized-set-op deferral below: the SelectStmt/AS restructure.
-- [ ] **`VARIADIC` call arguments (~19)** — `f(variadic array[1,2]::int[])`.
-  `FuncCall.Variadic` exists on the AST; VARIADIC is one of the reserved tokens
-  no production consumes. **Sized 2026-08-27:** needs `opt_func_call_args`
-  retyped from `<exprs>` to a carrier holding the per-argument variadic flags,
-  which touches all 13 of its use sites; adding a competing
-  `qualified_name '(' variadic_args ')'` alternative instead conflicts on the
-  shared prefix. Note legacy also EXPANDS `VARIADIC array[a,b]` into individual
-  args each flagged variadic (select.go:4815-4875) — reproduce that, not just
-  the flag.
+- [x] **DONE 2026-08-27 — `VARIADIC` call arguments**, plus the aggregate
+  `ORDER BY` inside a call (`array_agg(a ORDER BY b)`) that surfaced with it.
+  The name_or_call alternatives moved from the plain `opt_func_call_args`
+  ([]Expr) to a carrier holding the per-argument flags; all eight share the
+  `qualified_name '('` prefix so they had to move together, while ARRAY[...]
+  and the SQL value functions kept the plain list. The subtle half is legacy's
+  EXPANSION — `f(VARIADIC array[a,b])` becomes two individually-flagged
+  arguments, and with a `::int[]` cast the ELEMENT type is pushed onto each
+  expanded element as its own cast; reproducing only the flag yields a
+  silently different Variadic slice.
+
 - [ ] **Row-constructor comparison (~14)** — `WHERE (a, b) > ('x', 0)`.
   **Measured 2026-08-27:** `c_expr: '(' a_expr ',' expr_list ')'` (spelled to
   need two items so it cannot collide with `'(' a_expr ')'` grouping) still

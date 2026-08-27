@@ -34,7 +34,6 @@ var notYetPortedKeywords = map[string]string{
 	"PLACING":     "OVERLAY(... PLACING ... FROM ...)",
 	"SYSTEM_USER": "DELIBERATE AND PERMANENT: parser.IsNoParenFuncName does not list it, so legacy treats it as a bare identifier. Adding it to sql_value_func_name would CREATE a parity diff, not fix one (see grammar/pg_grammar.y func_expr_common_subexpr).",
 	"TRAILING":    "TRIM(TRAILING ... FROM ...)",
-	"VARIADIC":    "VARIADIC call arguments; legacy fills FuncCall.Variadic",
 
 	// type_func_name_keyword
 	"BINARY":        "COPY ... BINARY / BINARY cursors (P6.3, P6.5)",

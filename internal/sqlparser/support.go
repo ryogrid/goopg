@@ -875,6 +875,74 @@ func fillfactorFrom(kvs []string) int {
 	return 0
 }
 
+// callArgs carries a function call's argument list plus the per-argument
+// VARIADIC flags, which FuncCall.Variadic keeps PARALLEL to Args.
+//
+// This exists rather than reusing opt_func_call_args (a plain []Expr) because
+// VARIADIC has to attach to an individual argument. Only the name_or_call
+// alternatives switch to it — they all share the `qualified_name '('` prefix,
+// so they must move together — while ARRAY[...] and the SQL value functions,
+// which cannot take VARIADIC, keep the plain list.
+type callArgs struct {
+	exprs    []parser.Expr
+	variadic []bool
+}
+
+// callArg is one parsed argument before it joins the list.
+type callArg struct {
+	expr     parser.Expr
+	variadic bool
+}
+
+// appendCallArg adds one argument, reproducing legacy's VARIADIC array
+// EXPANSION: `f(VARIADIC array[a,b])` becomes two arguments, each flagged
+// variadic, rather than one array argument (internal/parser/select.go
+// parseFuncCallTail, :4815-4875). Callers that skip the expansion produce a
+// silently different Variadic slice.
+func appendCallArg(acc *callArgs, a callArg) *callArgs {
+	if acc == nil {
+		acc = &callArgs{}
+	}
+	if a.variadic {
+		// `VARIADIC array[a,b]::int[]` — legacy strips the array suffix and
+		// pushes the ELEMENT type onto each expanded element as its own cast
+		// (select.go:4846-4860), so the cast has to be unwrapped before the
+		// expansion and re-applied afterwards.
+		elemCast := ""
+		expr := a.expr
+		if ce, ok := expr.(*parser.CastExpr); ok {
+			if _, isArr := ce.Operand.(*parser.ArrayConstructorExpr); isArr {
+				elemCast = strings.TrimSuffix(ce.Type.Name, "[]")
+				expr = ce.Operand
+			}
+		}
+		if arr, ok := expr.(*parser.ArrayConstructorExpr); ok {
+			for _, el := range arr.Elements {
+				if elemCast != "" {
+					el = parser.NewCastExpr(el.Pos(), el, parser.ObjectName{Name: elemCast}, nil)
+				}
+				acc.exprs = append(acc.exprs, el)
+				acc.variadic = append(acc.variadic, true)
+			}
+			return acc
+		}
+	}
+	acc.exprs = append(acc.exprs, a.expr)
+	acc.variadic = append(acc.variadic, a.variadic)
+	return acc
+}
+
+// callFuncExpr builds a FuncCall from a callArgs carrier. NewFuncCall fills
+// Variadic with one false per argument; the explicit flags replace that.
+func callFuncExpr(pos int, name parser.ObjectName, ca *callArgs) *parser.FuncCall {
+	if ca == nil {
+		return parser.NewFuncCall(pos, name, nil, false)
+	}
+	fc := parser.NewFuncCall(pos, name, ca.exprs, false)
+	fc.Variadic = ca.variadic
+	return fc
+}
+
 // eqFold is strings.EqualFold, exposed for grammar actions (the generated
 // parser does not import strings).
 func eqFold(a, b string) bool { return strings.EqualFold(a, b) }

@@ -80,6 +80,7 @@
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
 %type <exprs>	opt_func_call_args
+%type <node>	opt_call_args call_arg_list call_arg
 %type <exprs>	opt_func_arg_list func_arg_list
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
@@ -2112,6 +2113,21 @@ opt_func_call_args:
 		/* empty */ { $$ = nil }
 	| expr_list  { $$ = $1 }
 
+/* opt_call_args — the name_or_call argument list, which unlike
+   opt_func_call_args may carry VARIADIC per argument (gram.y func_arg_expr /
+   func_arg_list). ARRAY[...] and the SQL value functions keep the plain list. */
+opt_call_args:
+		/* empty */                    { $$ = (*callArgs)(nil) }
+	| call_arg_list                    { $$ = $1 }
+
+call_arg_list:
+		call_arg                       { $$ = appendCallArg(nil, $1.(callArg)) }
+	| call_arg_list ',' call_arg       { $$ = appendCallArg($1.(*callArgs), $3.(callArg)) }
+
+call_arg:
+		a_expr                         { $$ = callArg{expr: $1} }
+	| VARIADIC a_expr                  { $$ = callArg{expr: $2, variadic: true} }
+
 /* name_or_call — merged ColumnRef/FuncCall disambiguation: after
    qualified_name, seeing '(' shifts into FuncCall; anything else reduces
    ColumnRef. Single nonterminal = zero S/R conflicts. */
@@ -2120,7 +2136,7 @@ name_or_call:
 			{
 				$$ = columnRefFromParts($1)
 			}
-	| qualified_name '(' opt_func_call_args ')'
+	| qualified_name '(' opt_call_args ')'
 			{
 				ft := splitFuncName($1)
 				// Pass $3 through NIL. Legacy's parseFuncCallTail returns on the
@@ -2128,7 +2144,7 @@ name_or_call:
 				// `now()` is Args=∅; coercing to []parser.Expr{} made every
 				// non-OVER zero-arg call a parity diff. The OVER alternatives
 				// below already pass $3 straight through.
-				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3, false)
+				$$ = callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 			}
 	| qualified_name '(' '*' ')'
 			{
@@ -2197,16 +2213,16 @@ name_or_call:
 				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $7)
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER ColId
+	| qualified_name '(' opt_call_args ')' OVER ColId
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3, false)
+				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER '(' opt_frame_tail ')'
+	| qualified_name '(' opt_call_args ')' OVER '(' opt_frame_tail ')'
 			{
-				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
+				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
 				wd := parser.NewWindowDef(0)
 				if fr := $7; fr != nil {
 					wd.Frame = fr
@@ -2214,9 +2230,9 @@ name_or_call:
 				fc.Over = wd
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER '(' PARTITION BY expr_list opt_frame_tail ')'
+	| qualified_name '(' opt_call_args ')' OVER '(' PARTITION BY expr_list opt_frame_tail ')'
 			{
-				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
+				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
 				wd := parser.NewWindowDef(0)
 				wd.PartitionBy = $9
 				if fr := $10; fr != nil {
@@ -2225,9 +2241,9 @@ name_or_call:
 				fc.Over = wd
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER '(' ORDER BY sort_by_list opt_frame_tail ')'
+	| qualified_name '(' opt_call_args ')' OVER '(' ORDER BY sort_by_list opt_frame_tail ')'
 			{
-				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
+				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
 				wd := parser.NewWindowDef(0)
 				wd.OrderBy = $9
 				if fr := $10; fr != nil {
@@ -2236,9 +2252,9 @@ name_or_call:
 				fc.Over = wd
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' OVER '(' PARTITION BY expr_list ORDER BY sort_by_list opt_frame_tail ')'
+	| qualified_name '(' opt_call_args ')' OVER '(' PARTITION BY expr_list ORDER BY sort_by_list opt_frame_tail ')'
 			{
-				fc := parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3, false)
+				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
 				wd := parser.NewWindowDef(0)
 				wd.PartitionBy = $9
 				wd.OrderBy = $12
@@ -2248,19 +2264,29 @@ name_or_call:
 				fc.Over = wd
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' filter_clause
+	/* Aggregate ORDER BY inside the call — gram.y's func_application
+	   `func_name '(' func_arg_list opt_sort_clause ')'`. Legacy records it as
+	   FuncCall.OrderBy (select.go:4878-4893). */
+	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')'
+			{
+				ft := splitFuncName($1)
+				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.OrderBy = $6
+				$$ = fc
+			}
+	| qualified_name '(' opt_call_args ')' filter_clause
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3, false)
+				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				fc.Filter = $5.(parser.Expr)
 				$$ = fc
 			}
-	| qualified_name '(' opt_func_call_args ')' within_group_clause
+	| qualified_name '(' opt_call_args ')' within_group_clause
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3, false)
+				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				if wg, ok := $5.([]parser.SortBy); ok {
 					fc.WithinGroup = wg
 				}
