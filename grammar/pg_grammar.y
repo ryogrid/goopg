@@ -79,9 +79,10 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
+%type <str>	opt_tablespace opt_idx_tablespace check_body
 %type <exprs>	trim_list
 %type <str>	sort_using_op constr_name func_name_keyword opt_part_opclass
-%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause paren_tail opt_identity_seq_opts identity_seq_opt_list identity_seq_opt
+%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause paren_tail partof_elem partof_elem_list partof_col_opts opt_of_col_opts of_col_opt of_col_opt_list opt_identity_seq_opts identity_seq_opt_list identity_seq_opt
 %type <i64>	signed_iconst
 %type <expr>	opt_paren_limit opt_paren_offset
 %type <exprs>	opt_execute_params
@@ -795,6 +796,12 @@ signed_iconst:
 		ICONST          { $$ = int64($1) }
 	| '-' ICONST        { $$ = -int64($2) }
 	| '+' ICONST        { $$ = int64($2) }
+
+/* check_body — `CHECK ( a_expr )` with its raw source span captured at the
+   reduce, before any trailer (NO INHERIT) is consumed. */
+check_body:
+		CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
+			{ $$ = yylex.(*lexerState).spanTextCloseParen() }
 
 sort_using_op:
 		exclude_op        { $$ = $1 }
@@ -3233,15 +3240,27 @@ col_constraints:
 				cc := $1.(*colConstraints)
 				switch k := $2.(*colConstraint); k.kind {
 				case "nn":
-					cc.notNull = true
+					cc.notNull, cc.nnName = true, k.name
+				case "nn_noinh":
+					cc.notNull, cc.nnNoInherit, cc.nnName = true, true, k.name
 				case "pk":
-					cc.primary = true
+					cc.primary = true // legacy drops a CONSTRAINT name here
 				case "uq":
-					cc.unique = true
+					cc.unique, cc.uqName = true, k.name
 				case "def":
-					cc.defExpr = k.expr
+					// Legacy DROPS a named default outright
+					// (`CONSTRAINT df DEFAULT 1` leaves DefaultExpr nil).
+					if k.name == "" {
+						cc.defExpr = k.expr
+					}
 				case "check":
-					cc.checkText = k.text // column-level CHECK carries no name
+					cc.checkText, cc.checkName = k.text, k.name
+				case "check_noinh":
+					cc.checkText, cc.checkName, cc.checkNoInherit = k.text, k.name, true
+				case "collate":
+					cc.collation = k.text
+				case "compression":
+					cc.compression = k.text
 				case "fk":
 					cc.fk = k.fk
 				case "uq_nnd":
@@ -3270,6 +3289,22 @@ col_constraints:
 
 col_constraint:
 		NOT NULL_P        { $$ = &colConstraint{kind: "nn"} }
+	| NOT NULL_P NO INHERIT { $$ = &colConstraint{kind: "nn_noinh"} }
+	/* `CONSTRAINT name` prefix — gram.y ColConstraint. Legacy records the name
+	   only for NOT NULL, UNIQUE and CHECK; on PRIMARY KEY, DEFAULT and
+	   REFERENCES it is parsed and dropped, which the merge above mirrors. */
+	| CONSTRAINT ColId col_constraint
+			{
+				c := $3.(*colConstraint)
+				c.name = $2
+				$$ = c
+			}
+	/* COLLATE and COMPRESSION ride the same qualifier loop as the constraints
+	   (gram.y puts COLLATE in ColQualList; COMPRESSION sits just before it).
+	   ColId, not a_expr, so `DEFAULT x COLLATE "C"` keeps binding the COLLATE
+	   into the DEFAULT expression exactly as it did before. */
+	| COLLATE ColId       { $$ = &colConstraint{kind: "collate", text: $2} }
+	| COMPRESSION ColId   { $$ = &colConstraint{kind: "compression", text: $2} }
 	/* PRIMARY KEY / UNIQUE / DEFAULT used to sit at the END of fk_kw below:
 	   the FK rules (opt_ref_cols … fk_kw) were inserted between REFERENCES
 	   and these three alternatives, so yacc read them as fk_kw alternatives.
@@ -3312,9 +3347,22 @@ col_constraint:
 	| NOT DEFERRABLE      { $$ = &colConstraint{kind: "attr_not_deferrable"} }
 	| INITIALLY DEFERRED  { $$ = &colConstraint{kind: "attr_initially_deferred"} }
 	| INITIALLY IMMEDIATE { $$ = &colConstraint{kind: "attr_initially_immediate"} }
-	| DEFAULT a_expr      { $$ = &colConstraint{kind: "def", expr: $2} }
-	| CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
-			{ $$ = &colConstraint{kind: "check", text: yylex.(*lexerState).spanTextCloseParen()} }
+	/* %prec Op (below COLLATE): `DEFAULT 'x' COLLATE "C"` binds the COLLATE
+	   into the default expression, which is legacy's greedy parseExpr
+	   behaviour; a column-level COLLATE must precede DEFAULT to be one. */
+	| DEFAULT a_expr %prec Op { $$ = &colConstraint{kind: "def", expr: $2} }
+	/* ONE check_body for both spellings: two alternatives sharing the prefix
+	   and each carrying its own mid-rule markSpanStart() would be two
+	   distinct empty nonterminals reducible at the same point — the 420-
+	   reduce/reduce trap generated columns hit, and 1329 here. */
+	| check_body opt_no_inherit
+			{
+				k := "check"
+				if $2 {
+					k = "check_noinh"
+				}
+				$$ = &colConstraint{kind: k, text: $1}
+			}
 	| REFERENCES qualified_name opt_ref_cols opt_fk_actions
 			{
 				i := &colConstraint{kind: "fk"}

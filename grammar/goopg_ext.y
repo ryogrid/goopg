@@ -16,7 +16,7 @@
    CHECK / FK / named constraints / WITH / partitioning arrive in later P4
    slices. */
 create_table_stmt:
-		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' opt_table_element_list ')' opt_ct_tail
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' opt_table_element_list ')' opt_table_am opt_ct_tail opt_tablespace
 			{
 				elems := $7.([]*tableElem)
 				var cols []parser.ColumnDef
@@ -35,6 +35,7 @@ create_table_stmt:
 				var checks []string
 				var checkNoInherit, checkNotEnforced []bool
 				var nnNames, nnCols []string
+				hasNoInheritCheck := false
 				var nnNoInherit []bool
 				for _, e := range elems {
 					switch {
@@ -52,6 +53,7 @@ create_table_stmt:
 						cd.IdentityColumn = c.identity
 						cd.IdentityAlways = c.identityAlways
 						applyIdentityOpts(cd, c.identitySeq)
+						copyColConstraints(cd, c.collation, c.compression, c.nnName, c.uqName, c.checkName, c.nnNoInherit, c.checkNoInherit)
 						// The attrs attach to whichever constraint the column
 						// actually declared (legacy threads pointers to the
 						// specific flag pair).
@@ -142,11 +144,14 @@ create_table_stmt:
 								// CONSTRAINT c CHECK (...) -> TableNamedChecks,
 								// and legacy does NOT touch the anonymous
 								// parallel slices for it (ddl.go:4191-4238).
-								namedChecks = append(namedChecks, parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check})
+								namedChecks = append(namedChecks, parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check, NoInherit: e.checkNoInh})
 							} else {
 								checks = append(checks, e.check)
-								checkNoInherit = append(checkNoInherit, false)
+								checkNoInherit = append(checkNoInherit, e.checkNoInh)
 								checkNotEnforced = append(checkNotEnforced, false)
+							}
+							if e.checkNoInh {
+								hasNoInheritCheck = true
 							}
 						}
 					}
@@ -180,9 +185,11 @@ create_table_stmt:
 				ct.TableNotNullCols = nnCols
 				ct.TableNotNullNoInherit = nnNoInherit
 				ct.TableChecks = checks
+				ct.TableHasNoInheritCheck = hasNoInheritCheck
 				ct.TableCheckNoInherit = checkNoInherit
 				ct.TableCheckNotEnforced = checkNotEnforced
-				tail := $9
+				tail := $10
+				ct.Tablespace = $11
 				_ = tail
 				for _, kv := range tail.withKv {
 					if ct.With == nil {
@@ -202,7 +209,7 @@ create_table_stmt:
 				ct.SelectSource = tail.asSelect
 				$$ = ct
 			}
-	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name opt_ct_tail_noas
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name opt_ct_tail_noas opt_tablespace
 			{
 				nm := $5.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -216,6 +223,7 @@ create_table_stmt:
 					ct.Unlogged = pfx.unlogged
 				}
 				tail := $6
+				ct.Tablespace = $7
 				for _, kv := range tail.withKv {
 					if ct.With == nil {
 						ct.With = map[string]string{}
@@ -232,6 +240,40 @@ create_table_stmt:
 					parser.SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
 				}
 				ct.SelectSource = tail.asSelect
+				$$ = ct
+			}
+
+	/* CREATE TABLE c PARTITION OF p ( elements ) bound — gram.y's
+	   OptTypedTableElementList on a partition. Legacy keeps the elements on the
+	   PartitionOfClause (ddl.go:3290-3410) rather than as columns. */
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name PARTITION OF qualified_name '(' partof_elem_list ')' part_bound_spec2 opt_subpartition_by
+			{
+				ct := parser.NewCreateTableStmt(0, objectNameFromQn($5), nil, nil)
+				if pfx := $2.(*createPrefix); pfx != nil {
+					ct.Temporary = pfx.temporary
+					ct.Unlogged = pfx.unlogged
+				}
+				ct.IfNotExists = $4
+				b := $12.(*partBound)
+				ct.PartitionOf = parser.NewPartitionOfClause(objectNameFromQn($8), b.from, b.to, b.inVals, b.isDefault)
+				parser.SetPartitionOfHashBound(ct.PartitionOf, b.modulus, b.remainder, b.isHash)
+				applyPartOfElems(ct.PartitionOf, $10.([]*partOfElem))
+				ct.PartitionBy, _ = $13.(*parser.PartitionByClause)
+				$$ = ct
+			}
+	/* Typed table — `CREATE TABLE t OF type [( col WITH OPTIONS ... )]`
+	   (gram.y :4020). The options are ColumnDefs with an EMPTY type. */
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name OF qualified_name opt_of_col_opts
+			{
+				ct := parser.NewCreateTableStmt(0, objectNameFromQn($5), nil, nil)
+				if pfx := $2.(*createPrefix); pfx != nil {
+					ct.Temporary = pfx.temporary
+					ct.Unlogged = pfx.unlogged
+				}
+				ct.IfNotExists = $4
+				ot := objectNameFromQn($7)
+				ct.OfType = &ot
+				ct.OfTypeColumnOptions, _ = $8.([]parser.ColumnDef)
 				$$ = ct
 			}
 
@@ -306,6 +348,9 @@ table_element:
 				cs.deferrable, cs.initiallyDeferred = cc.deferrable, cc.initiallyDeferred
 				cs.genExpr, cs.genAlways, cs.genVirtual = cc.genExpr, cc.genAlways, cc.genVirtual
 				cs.identity, cs.identityAlways, cs.identitySeq = cc.identity, cc.identityAlways, cc.identitySeq
+				cs.checkName, cs.nnName, cs.uqName = cc.checkName, cc.nnName, cc.uqName
+				cs.collation, cs.compression = cc.collation, cc.compression
+				cs.nnNoInherit, cs.checkNoInherit = cc.nnNoInherit, cc.checkNoInherit
 				$$ = &tableElem{col: cs}
 			}
 	| PRIMARY KEY pk_cols opt_include opt_constr_attrs
@@ -358,16 +403,20 @@ table_element:
 			{ $$ = &tableElem{notNull: &tableNotNull{col: $3, noInherit: $4}} }
 	| CONSTRAINT ColId NOT NULL_P ColId opt_no_inherit
 			{ $$ = &tableElem{notNull: &tableNotNull{name: $2, col: $5, noInherit: $6}} }
-	| CONSTRAINT ColId CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
-			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen(), checkName: $2} }
+	| CONSTRAINT ColId check_body opt_no_inherit
+			{ $$ = &tableElem{check: $3, checkName: $2, checkNoInh: $4} }
 	/* Anonymous table-level CHECK and FOREIGN KEY (gram.y TableConstraint).
 	   CHECK and FOREIGN are reserved keywords, so they cannot start the
 	   `ColId col_type_name …` column alternative and the element-start decision
 	   stays on distinct terminals. Only the plain forms are ported: MATCH FULL,
 	   [NOT] DEFERRABLE [INITIALLY …], NOT VALID, [NOT] ENFORCED, ON DELETE SET
 	   (cols) and NO INHERIT still fall to legacy — see TODO.md P4.1. */
-	| CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
-			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen()} }
+	| check_body opt_no_inherit
+			{ $$ = &tableElem{check: $1, checkNoInh: $2} }
+	/* Legacy accepts NOT VALID only BEHIND NO INHERIT on a CREATE TABLE check
+	   (and drops it); a bare `CHECK (...) NOT VALID` is a syntax error there. */
+	| check_body NO INHERIT NOT VALID
+			{ $$ = &tableElem{check: $1, checkNoInh: true} }
 	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions opt_constr_attrs
 			{
 				fk := &parser.TableForeignKeyDef{
@@ -524,6 +573,74 @@ opt_ctas_with_data:
 	| WITH DATA_P        { $$ = false }
 	| WITH NO DATA_P     { $$ = true }
 
+partof_elem_list:
+		partof_elem                        { $$ = []*partOfElem{$1.(*partOfElem)} }
+	| partof_elem_list ',' partof_elem     { $$ = append($1.([]*partOfElem), $3.(*partOfElem)) }
+
+partof_elem:
+		CONSTRAINT ColId CHECK '(' a_expr ')'
+			{
+				// Legacy stores the check as a TOKEN JOIN, not a source span.
+				$$ = &partOfElem{hasCheck: true, checkName: $2, checkExpr: tokenJoinLower(yylex, $<p>5, $<p>6)}
+			}
+	| CHECK '(' a_expr ')'
+			{ $$ = &partOfElem{hasCheck: true} } /* anonymous: accepted and dropped, as legacy does */
+	| ColId opt_with_options partof_col_opts
+			{
+				el := $3.(*partOfElem)
+				el.col = $1
+				$$ = el
+			}
+
+opt_with_options:
+		/* empty */      { _ = 0 }
+	| WITH OPTIONS       { _ = 0 }
+
+partof_col_opts:
+		/* empty */                                  { $$ = &partOfElem{} }
+	| partof_col_opts NOT NULL_P                     { el := $1.(*partOfElem); el.notNull = true; $$ = el }
+	| partof_col_opts UNIQUE                         { el := $1.(*partOfElem); el.unique = true; $$ = el }
+	| partof_col_opts DEFAULT a_expr                 { el := $1.(*partOfElem); el.def, el.hasDef = $3, true; $$ = el }
+	| partof_col_opts GENERATED ALWAYS AS '(' a_expr ')' STORED
+			{
+				el := $1.(*partOfElem)
+				el.genExpr, el.hasGen = tokenJoinLower(yylex, $<p>6, $<p>7), true
+				$$ = el
+			}
+
+opt_of_col_opts:
+		/* empty */                    { $$ = []parser.ColumnDef(nil) }
+	| '(' of_col_opt_list ')'          { $$ = $2 }
+
+of_col_opt_list:
+		of_col_opt                       { $$ = []parser.ColumnDef{$1.(parser.ColumnDef)} }
+	| of_col_opt_list ',' of_col_opt     { $$ = append($1.([]parser.ColumnDef), $3.(parser.ColumnDef)) }
+
+of_col_opt:
+		ColId WITH OPTIONS col_constraints
+			{
+				cc := $4.(*colConstraints)
+				cd := parser.NewColumnDef($1, parser.NewColumnType("", "", nil, false))
+				cd.NotNull = cc.notNull
+				cd.NotNullExplicit = cc.notNull
+				cd.DefaultExpr = cc.defExpr
+				$$ = *cd
+			}
+
+/* Trailing clauses legacy accepts on CREATE TABLE. USING <am> and WITHOUT
+   OIDS are parsed and DROPPED there (no AST field); TABLESPACE is kept. */
+opt_table_am:
+		/* empty */   { _ = 0 }
+	| USING ColId     { _ = 0 }
+
+opt_tablespace:
+		/* empty */         { $$ = "" }
+	| TABLESPACE ColId      { $$ = $2 }
+
+opt_idx_tablespace:
+		/* empty */         { $$ = "" }
+	| TABLESPACE ColId      { $$ = $2 }
+
 drop_table_stmt:
 		DROP TABLE opt_if_exists_drop drop_name_list opt_drop_behavior
 			{
@@ -648,11 +765,8 @@ opt_ct_tail:
 			{ i := &ctTail{}; i.withKv = $3; $$ = i }
 	| INHERITS '(' drop_name_list ')'
 			{ i := &ctTail{}; i.inherits = $3; $$ = i }
-	| AS select_bare
-			{
-				sel, _ := $2.(*parser.SelectStmt)
-				i := &ctTail{}; i.asSelect = sel; $$ = i
-			}
+	| WITHOUT OIDS
+			{ $$ = &ctTail{} }
 	| PARTITION BY ColId '(' part_elem_list ')'
 			{
 				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
@@ -678,6 +792,8 @@ opt_ct_tail_noas:
 			{ i := &ctTail{}; i.withKv = $3; $$ = i }
 	| INHERITS '(' drop_name_list ')'
 			{ i := &ctTail{}; i.inherits = $3; $$ = i }
+	| WITHOUT OIDS
+			{ $$ = &ctTail{} }
 	| PARTITION BY ColId '(' part_elem_list ')'
 			{
 				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
@@ -721,7 +837,7 @@ with_value:
    CONCURRENTLY arrive later); ColOrders/ColExprs filled with per-column
    defaults for legacy dump parity. */
 create_index_stmt:
-		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON opt_ONLY_kw qualified_name opt_using_method '(' index_col_list ')' opt_include opt_index_with opt_index_where
+		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON opt_ONLY_kw qualified_name opt_using_method '(' index_col_list ')' opt_include opt_index_with opt_idx_tablespace opt_index_where
 			{
 				nm := $9.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -747,7 +863,8 @@ create_index_stmt:
 				ix.OnOnly = $8
 				ix.IncludeColumns = $14
 				ix.Fillfactor = $15
-				if p, _ := $16.(parser.Expr); p != nil {
+				ix.Tablespace = $16
+				if p, _ := $17.(parser.Expr); p != nil {
 					ix.HasPredicate = true
 					ix.Predicate = p
 				}
@@ -1114,6 +1231,7 @@ alter_table_action:
 				// is routed.
 				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
 				applyIdentityOpts(cd, cc.identitySeq)
+				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit)
 				a := parser.NewATAction(parser.AlterTableAddColumn)
 				a.Column = *cd
 				$$ = a
@@ -1229,17 +1347,15 @@ alter_table_action:
 				a.ReplicaIdentityIndex = $5
 				$$ = a
 			}
-	| ATTACH PARTITION qualified_name FOR VALUES IN_P '(' expr_list ')'
+	/* ATTACH PARTITION takes the SAME bound spec as CREATE TABLE ... PARTITION
+	   OF, hash bounds included — three hand-spelled copies had left
+	   `FOR VALUES WITH (MODULUS m, REMAINDER r)` unreachable here. */
+	| ATTACH PARTITION qualified_name part_bound_spec2
 			{
-				$$ = parser.NewATAttachPartition(0, objectNameFromQn($3), nil, nil, $8, false)
-			}
-	| ATTACH PARTITION qualified_name FOR VALUES FROM '(' expr_list ')' TO '(' expr_list ')'
-			{
-				$$ = parser.NewATAttachPartition(0, objectNameFromQn($3), $8, $12, nil, false)
-			}
-	| ATTACH PARTITION qualified_name DEFAULT
-			{
-				$$ = parser.NewATAttachPartition(0, objectNameFromQn($3), nil, nil, nil, true)
+				b := $4.(*partBound)
+				a := parser.NewATAttachPartition(0, objectNameFromQn($3), b.from, b.to, b.inVals, b.isDefault)
+				parser.SetPartitionOfHashBound(a.AttachPartitionOf, b.modulus, b.remainder, b.isHash)
+				$$ = a
 			}
 	| DETACH PARTITION qualified_name
 			{

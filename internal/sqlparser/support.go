@@ -627,6 +627,9 @@ type colSpec struct {
 	primary  bool
 	unique   bool
 	defExpr  parser.Expr
+	checkName, nnName, uqName string
+	collation, compression    string
+	nnNoInherit, checkNoInherit bool
 }
 
 // tableElem is one element of a CREATE TABLE parens list: a column spec or a
@@ -653,6 +656,7 @@ type tableElem struct {
 	asSelect   *parser.SelectStmt
 	partition  *parser.PartitionByClause
 	notNull    *tableNotNull
+	checkNoInh bool // table-level CHECK ... NO INHERIT
 }
 
 // colConstraints accumulates a column's constraint suffix in CREATE TABLE.
@@ -679,6 +683,10 @@ type colConstraints struct {
 	checkName  string
 	nnName     string
 	uqName     string
+	collation   string
+	compression string
+	nnNoInherit    bool
+	checkNoInherit bool
 	fk         *fkInfo
 }
 
@@ -707,11 +715,12 @@ func (t *createTail) withMap() map[string]string {
 
 // colConstraint is one parsed column-constraint keyword group.
 type colConstraint struct {
-	kind string // "nn" | "pk" | "uq" | "def" | "check" | "fk"
-	text string          // check: raw source span
+	kind string // "nn" | "pk" | "uq" | "def" | "check" | "fk" | ...
+	text string          // check: raw source span; collate/compression: the name
 	fk   *fkInfo         // fk: referenced table/cols + actions
 	expr parser.Expr
 	seq  *identityOpts   // identity_*: the `(START WITH n ...)` option list
+	name string          // `CONSTRAINT name` prefix; legacy keeps it only for NOT NULL / UNIQUE / CHECK
 }
 
 // identityOpts carries an identity column's sequence options — legacy's
@@ -1395,4 +1404,79 @@ func unwrapAnyArray(l yyLexer, list []parser.Expr, listPos int) []parser.Expr {
 		return ac.Elements
 	}
 	return list
+}
+
+// copyColConstraints moves the constraint carrier's per-column fields onto a
+// ColumnDef. It is the ONE place both CREATE TABLE and ALTER TABLE ADD COLUMN
+// go through for the fields added since 2026-08-27, so the two siblings cannot
+// drift again the way identity did.
+func copyColConstraints(cd *parser.ColumnDef, collation, compression, nnName, uqName, checkName string, nnNoInherit, checkNoInherit bool) {
+	cd.Collation, cd.Compression = collation, compression
+	cd.NotNullConstraintName, cd.UniqueConstraintName, cd.CheckConstraintName = nnName, uqName, checkName
+	cd.NotNullNoInherit, cd.CheckNoInherit = nnNoInherit, checkNoInherit
+}
+
+// partOfElem is one entry of `CREATE TABLE c PARTITION OF p ( ... )`. Legacy
+// keeps these on the PartitionOfClause rather than as columns (ddl.go:3290-
+// 3410): a named CHECK, and per-column NOT NULL / UNIQUE / DEFAULT / GENERATED
+// overrides. An anonymous CHECK is accepted and DROPPED there.
+type partOfElem struct {
+	col       string
+	notNull   bool
+	unique    bool
+	def       parser.Expr
+	hasDef    bool
+	genExpr   string
+	hasGen    bool
+	checkName string
+	checkExpr string
+	hasCheck  bool
+}
+
+func applyPartOfElems(poc *parser.PartitionOfClause, elems []*partOfElem) {
+	for _, e := range elems {
+		switch {
+		case e.hasCheck:
+			if e.checkName != "" {
+				poc.CheckConstraints = append(poc.CheckConstraints, parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.checkExpr})
+			}
+		default:
+			if e.notNull {
+				poc.NotNullColumns = append(poc.NotNullColumns, e.col)
+			}
+			if e.unique {
+				poc.UniqueColumns = append(poc.UniqueColumns, e.col)
+			}
+			if e.hasDef {
+				poc.ColDefaults = append(poc.ColDefaults, parser.PartitionColDefault{ColName: e.col, Expr: e.def})
+			}
+			if e.hasGen {
+				poc.ColGeneratedExprs = append(poc.ColGeneratedExprs, parser.PartitionColGenerated{ColName: e.col, Expr: e.genExpr})
+			}
+		}
+	}
+}
+
+// tokenJoinLower reproduces legacy's token-join expression text
+// (joinGeneratedExprTokens / the PARTITION OF check capture): every token's
+// decoded Value between the two absolute positions, space-separated, keywords
+// and identifiers lower-cased, string literals kept as their content without
+// quotes — `upper ( a ) = X`.
+func tokenJoinLower(l yyLexer, from, to int) string {
+	ls, ok := l.(*lexerState)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, tk := range ls.toks {
+		if tk.Pos < from || tk.Pos >= to {
+			continue
+		}
+		v := tk.Value
+		if tk.Kind != parser.TokenStringLit {
+			v = strings.ToLower(v)
+		}
+		parts = append(parts, v)
+	}
+	return strings.Join(parts, " ")
 }
