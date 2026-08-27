@@ -255,13 +255,16 @@ var routedCreatePairs = map[string]map[string]bool{
 	"create": {"table": true, "index": true, "view": true, "materialized": true,
 		"function": true, "procedure": true, // P5.2
 		"type": true, "domain": true, "sequence": true, // P5.5
-		"trigger": true, "constraint": true}, // P5.6 ("constraint" = CREATE CONSTRAINT TRIGGER)
+		"trigger": true, "constraint": true, // P5.6 ("constraint" = CREATE CONSTRAINT TRIGGER)
+		"extension": true, "policy": true}, // P5.9
 	"alter": {"table": true,
-		"function": true, "procedure": true, "routine": true}, // P5.6
+		"function": true, "procedure": true, "routine": true, // P5.6
+		"schema": true}, // P5.9
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
 		"type": true, "domain": true, // P5.5
 		"trigger": true, // P5.6
+		"database": true, // P5.9
 		// P5.7 — the rest of the DROP family. Every one of these is a plain
 		// name-list form in legacy, not a skip-to-semicolon compat scan.
 		"sequence": true, "schema": true, "extension": true, "statistics": true,

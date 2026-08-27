@@ -3248,3 +3248,26 @@ func rewriteIndirectionStars(l yyLexer, s *parser.SelectStmt) error {
 	}
 	return nil
 }
+
+// extOp is one CREATE EXTENSION option, applied in written order.
+type extOp func(*parser.CreateExtensionStmt)
+
+func extSchema(name string) extOp {
+	n := name
+	return func(e *parser.CreateExtensionStmt) { e.Schema = n }
+}
+
+func extVersion(v string) extOp {
+	s := v
+	return func(e *parser.CreateExtensionStmt) { e.Version = s }
+}
+
+func extCascade() extOp { return func(e *parser.CreateExtensionStmt) { e.Cascade = true } }
+
+func applyExtOpts(st *parser.CreateExtensionStmt, v any) {
+	for _, raw := range asAnySlice(v) {
+		if f, ok := raw.(extOp); ok {
+			f(st)
+		}
+	}
+}

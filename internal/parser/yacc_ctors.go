@@ -818,3 +818,24 @@ func SetDropCompatExtras(s *DropCompatStmt, argTypes []string, usingMethod strin
 func NewIndirectionStar(pos int, source Expr) *IndirectionStar {
 	return &IndirectionStar{pos: pos, Source: source}
 }
+
+// ---------------------------------------------------------------------------
+// P5.9 the small remaining DDL classes
+// ---------------------------------------------------------------------------
+
+func NewAlterSchemaStmt(pos int, name, action, newName, newOwner string) *AlterSchemaStmt {
+	return &AlterSchemaStmt{pos: pos, Name: name, Action: action, NewName: newName, NewOwner: newOwner}
+}
+
+func NewCreateExtensionStmt(pos int, name string, ifNotExists bool) *CreateExtensionStmt {
+	return &CreateExtensionStmt{pos: pos, Name: name, IfNotExists: ifNotExists}
+}
+
+func NewCreateStatisticsStmt(pos int, name, from ObjectName, ifNotExists bool, kinds, cols []string) *CreateStatisticsStmt {
+	return &CreateStatisticsStmt{pos: pos, Name: name, FromTable: from, IfNotExists: ifNotExists, Kinds: kinds, Columns: cols}
+}
+
+func NewCreatePolicyStmt(pos int, name string, table ObjectName) *CreatePolicyStmt {
+	// Permissive and "all" are the defaults an omitted AS / FOR clause leaves.
+	return &CreatePolicyStmt{pos: pos, Name: name, Table: table, Permissive: true, Command: "all"}
+}

@@ -85,7 +85,11 @@
 %type <ival>	trig_timing
 %type <b>	opt_initially
 %type <expr>	opt_trig_when
-%type <strs>	opt_trig_args trig_arg_list drop_arg_types
+%type <strs>	opt_trig_args trig_arg_list drop_arg_types opt_policy_to policy_role_list
+%type <str>	ext_name opt_policy_as opt_policy_for
+%type <nodes>	ext_opts
+%type <node>	ext_opt
+%type <expr>	opt_policy_using opt_policy_check
 %type <str>	drop_compat_kind opclass_or_family drop_arg_type op_run op_char
 %type <qn>	any_operator_name
 %type <str>	trig_arg comment_text alter_routine_kind alter_fn_owner
@@ -184,7 +188,7 @@
 %type <stmt>	set_transaction_stmt
 %type <stmt>	refresh_matview_stmt drop_matview_stmt
 %type <b>	opt_concurrently
-%type <stmt>	explainable_stmt merge_stmt drop_misc_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
+%type <stmt>	explainable_stmt merge_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
@@ -416,6 +420,22 @@ explainable_stmt:
 				$$ = $1
 			}
 	| call_stmt
+			{
+				$$ = $1
+			}
+	| drop_database_stmt
+			{
+				$$ = $1
+			}
+	| create_extension_stmt
+			{
+				$$ = $1
+			}
+	| alter_schema_stmt
+			{
+				$$ = $1
+			}
+	| create_policy_stmt
 			{
 				$$ = $1
 			}

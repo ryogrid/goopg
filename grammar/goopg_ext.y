@@ -3164,3 +3164,93 @@ drop_arg_type:
 	| NONE           { $$ = "none" }
 	/* `DROP AGGREGATE a(*)` — the any-signature spelling. */
 	| '*'            { $$ = "*" }
+
+/* ============================================================================
+   P5.9 — DROP DATABASE, CREATE EXTENSION, ALTER SCHEMA, CREATE POLICY.
+
+   These four have clean, fully-specified ASTs. The rest of the remaining DDL
+   splits into two other groups, neither of which belongs here: the classes
+   goopg parses ABOVE parser.Parse (role DDL, GRANT/REVOKE — parser.Parse
+   REJECTS `CREATE ROLE r` outright), and the parse-and-ignore compat classes
+   whose legacy handler is a token walk ending in parseSkipToSemicolon, which a
+   grammar cannot reproduce without accepting arbitrary token soup.
+   ========================================================================= */
+
+drop_database_stmt:
+		DROP DATABASE opt_if_exists_drop drop_name_list opt_drop_behavior
+			{ $$ = parser.NewDropCompatStmt($<p>1, "database", $3, $4, dropBehavior($5)) }
+
+/* The extension NAME and every option value take a string literal as well as
+   an identifier, and legacy stores the RAW token value either way. */
+create_extension_stmt:
+		CREATE EXTENSION opt_if_not_exists ext_name opt_WITH_kw ext_opts
+			{
+				st := parser.NewCreateExtensionStmt($<p>1, $4, $3)
+				applyExtOpts(st, $6)
+				$$ = st
+			}
+
+ext_name:
+		ColId       { $$ = $1 }
+	| SCONST        { $$ = $1 }
+
+ext_opts:
+		/* empty */          { $$ = []any(nil) }
+	| ext_opts ext_opt       { $$ = append($1, $2) }
+
+ext_opt:
+		SCHEMA ext_name      { $$ = extSchema($2) }
+	| VERSION_P ext_name     { $$ = extVersion($2) }
+	| CASCADE                { $$ = extCascade() }
+
+/* Real PostgreSQL has exactly two ALTER SCHEMA forms (schemacmds.c's
+   RenameSchema / AlterSchemaOwner) and so does legacy. */
+alter_schema_stmt:
+		ALTER SCHEMA ColId RENAME TO ColId
+			{ $$ = parser.NewAlterSchemaStmt($<p>1, $3, "rename", $6, "") }
+	| ALTER SCHEMA ColId OWNER TO alter_fn_owner
+			{ $$ = parser.NewAlterSchemaStmt($<p>1, $3, "owner", "", $6) }
+
+create_policy_stmt:
+		CREATE POLICY ColId ON qualified_name opt_policy_as opt_policy_for
+		opt_policy_to opt_policy_using opt_policy_check
+			{
+				st := parser.NewCreatePolicyStmt($<p>1, $3, objectNameFromQn($5))
+				if $6 != "" {
+					st.Permissive = $6 == "permissive"
+				}
+				if $7 != "" {
+					st.Command = $7
+				}
+				st.Roles = $8
+				st.Using, st.WithCheck = $9, $10
+				$$ = st
+			}
+
+opt_policy_as:
+		/* empty */   { $$ = "" }
+	| AS ColId        { $$ = lowerIdent($2) }
+
+opt_policy_for:
+		/* empty */   { $$ = "" }
+	| FOR ALL         { $$ = "all" }
+	| FOR SELECT      { $$ = "select" }
+	| FOR INSERT      { $$ = "insert" }
+	| FOR UPDATE      { $$ = "update" }
+	| FOR DELETE_P    { $$ = "delete" }
+
+opt_policy_to:
+		/* empty */          { $$ = []string(nil) }
+	| TO policy_role_list    { $$ = $2 }
+
+policy_role_list:
+		ColId                          { $$ = []string{$1} }
+	| policy_role_list ',' ColId       { $$ = append($1, $3) }
+
+opt_policy_using:
+		/* empty */                 { $$ = (parser.Expr)(nil) }
+	| USING '(' a_expr ')'          { $$ = $3 }
+
+opt_policy_check:
+		/* empty */                 { $$ = (parser.Expr)(nil) }
+	| WITH CHECK '(' a_expr ')'     { $$ = $4 }

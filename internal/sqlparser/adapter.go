@@ -402,7 +402,7 @@ func (l *lexerState) next() lexResult {
 	// it. The fold makes the grammar do the same: the body is opaque, the
 	// terminal carries both paren positions, and the rule joins the tokens
 	// between them. `WITH CHECK OPTION` is untouched (no '(' follows).
-	if cur.term == resolve("CHECK") && cur.term > 0 {
+	if cur.term == resolve("CHECK") && cur.term > 0 && !l.checkFollowsWith() {
 		if nxt := l.peek(); nxt.term == int('(') {
 			depth := 0
 			for j := l.i; j < len(l.toks); j++ {
@@ -429,6 +429,21 @@ func (l *lexerState) next() lexResult {
 		}
 	}
 	return cur
+}
+
+// checkFollowsWith reports whether the CHECK just consumed was preceded by
+// WITH. `WITH CHECK (expr)` is CREATE POLICY's row filter and its body is a
+// real expression, not the opaque token join a constraint's CHECK body is — so
+// the fold must not swallow it. (`WITH CHECK OPTION` needs no guard: no paren
+// follows it, which is what the fold keys on.)
+func (l *lexerState) checkFollowsWith() bool {
+	// l.i - 1 is the CHECK itself: it has already been consumed.
+	if l.i < 2 {
+		return false
+	}
+	p := l.toks[l.i-2]
+	return (p.Kind == parser.TokenKeyword || p.Kind == parser.TokenIdent) &&
+		strings.EqualFold(p.Value, "with")
 }
 
 // peek maps the next raw token WITHOUT consuming it (a pure function of the
