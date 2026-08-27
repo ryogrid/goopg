@@ -478,13 +478,19 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   YEAR_P / SECOND_P — 14 S/R), and the opclass must be IDENT rather than ColId
   (ColId admits FILTER and WITHIN, the very tokens that continue a
   function-call key — 4 more S/R).
-- [ ] **`AS <reserved keyword>` aliases (~33)** — `SELECT true AS true`.
-  gram.y's ColLabel admits reserved_keyword; ours stops at
-  type_func_name_keyword. **Measured: adding the whole list costs 12
-  reduce/reduce, and even TRUE_P/FALSE_P alone costs 6** — goyacc merges this
-  AS with the AS of CREATE VIEW / CTE / CAST, and the boolean literals also
-  collide with `c_expr: TRUE_P`. Same root cause and same fix as the
-  parenthesized-set-op deferral below: the SelectStmt/AS restructure.
+- [x] **DONE 2026-08-27 — `AS <reserved keyword>` aliases (~33).** The earlier
+  measurement (12 R/R for the whole list, 6 for TRUE_P/FALSE_P alone) blamed
+  the wrong culprit: it is NOT `c_expr: TRUE_P` and NOT the SelectStmt/AS
+  restructure. ColLabel's OTHER user is `set_value_atom` (goopg_ext.y), which
+  lists ON / DEFAULT / TRUE_P / FALSE_P explicitly PRECISELY BECAUSE ColLabel
+  lacked them — widening ColLabel duplicates those four alternatives and every
+  duplicate is a reduce/reduce. Deleting the explicit four along with the
+  widening drops 12 R/R to one S/R, and that last one is real: `SET ROLE TO x`
+  becomes ambiguous because TO is then a candidate VALUE for SET ROLE. So the
+  widening lives in a separate `as_col_label` nonterminal used ONLY by
+  target_el — zero conflicts, set_value_atom untouched. It does not blind
+  TestReservedKeywordsReachable: that scanner reads literal tokens out of the
+  hand-written .y files and never expands the generated reserved_keyword.
 - [x] **DONE 2026-08-27 — `VARIADIC` call arguments**, plus the aggregate
   `ORDER BY` inside a call (`array_agg(a ORDER BY b)`) that surfaced with it.
   The name_or_call alternatives moved from the plain `opt_func_call_args`
@@ -503,10 +509,10 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   the row constructor merely EXPOSES the pre-existing a_expr/b_expr split.
   Resolve that split first.
 - [x] **DONE 2026-08-27 — `ALTER TABLE ... ADD PRIMARY KEY USING INDEX name`.**
-- [ ] **Subpartitioning (~7)** — `PARTITION OF p FOR VALUES ... PARTITION BY
-  LIST (c)`. Blocked by the same flat `opt_ct_tail` that prevents composing
-  `WITH (...)` with `PARTITION BY` (P4.1 note above): the tail is a single
-  clause, so two of them cannot follow one another.
+- [x] **DONE 2026-08-27 — subpartitioning (~7)** (`PARTITION OF p FOR VALUES
+  ... PARTITION BY LIST (c)`). Not actually blocked by the flat `opt_ct_tail`:
+  an `opt_subpartition_by` tail on the PARTITION OF alternative costs zero
+  conflicts, and ctTail already carried both fields.
 - [x] **DONE 2026-08-27 — `SET [SESSION] AUTHORIZATION name|DEFAULT`.** A
   separate `AUTHORIZATION DEFAULT` alternative reduce/reduces against
   set_value_atom's own DEFAULT (14 conflicts), and the atom text is "default"
@@ -519,17 +525,63 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   op, ...) [INCLUDE (...)] [WHERE (pred)]` plus constraint attrs), anonymous to
   TableExclusions and named to NamedConstraints. Legacy keeps the columns as a
   list but only ONE ExclusionOp (the first) and defaults Method to "btree".
-- [ ] Smaller: `COPY ... (subquery)` forms, `CREATE TABLE ... (LIKE t ...)`,
-  `GENERATED ... AS`, JSON constructors, `~`/`&`/`=>` operator spellings.
+- [x] **DONE 2026-08-27 — everything else that was measurable.** In rough
+  order landed: table-level `CHECK` / `FOREIGN KEY`, `SET CONSTRAINTS`,
+  table-level `NOT NULL col [NO INHERIT]`, the empty target list
+  (`SELECT FROM t`, `SELECT`), alias column lists (`FROM t AS f(a, b)`),
+  `ORDER BY x USING op`, `TRUNCATE ONLY`, `FETCH FIRST ROWS WITH TIES` and
+  `FETCH FIRST (expr)`, `CREATE TABLE (LIKE ...)`, CTAS column aliases and
+  `WITH [NO] DATA`, CTAS `AS EXECUTE`, full PARTITION BY key elements
+  (expressions, opclasses, COLLATE, plus MethodPos/KeyColPos),
+  `RESET SESSION AUTHORIZATION`, prefix `~` and b_expr's unary signs,
+  `AS <reserved>` labels, TRIM, the inheritance star (`FROM person*`),
+  json/xml/path cast targets, `ADD PRIMARY KEY ... INCLUDE`, `AT TIME ZONE` /
+  `AT LOCAL`, the interval Form-2 ordering fix, `UPDATE ... FROM` /
+  `DELETE ... USING` aliases, six keyword typed-literal prefixes, keyword
+  function names (`left(...)`), counted datetime types, and `SELECT ... INTO`.
 
-**Progress on the must-pass regress fragment count: 222 -> 188 -> (this batch).**
-Roughly 33 of the remainder are the regress files' DELIBERATE syntax errors,
-where erroring is correct and only the message text differs — those will never
-be fixed by adding grammar.
+**Must-pass regress fragment count: 222 -> 188 -> 157 -> 103 -> 84 -> 33 -> 26.**
 
-Note a chunk of the 222 are regress cases' DELIBERATE syntax errors (e.g.
-`select distinct from pg_database;`), where erroring is correct and only the
-message text differs — those are not missing grammar.
+The measurement harness was also corrected mid-session: it now discards any
+fragment the LEGACY parser rejects too, so the regress files' DELIBERATE syntax
+errors (`select distinct from pg_database;`, `select;`, the copydml cases) no
+longer inflate the count. Roughly 33 of the original 222 were that noise.
+
+**Of the 26 that remain, 24 are the two structurally blocked items** below
+(parenthesised set-op operands 14, row constructors 10). The other two are
+GROUPING SETS, which is an unported feature rather than a missing production,
+and `VALUES(n.*)` — whole-row expansion as an EXPRESSION — whose cost is
+recorded in the grammar next to `c_expr` (20 reduce/reduce, all of them the
+pre-existing a_expr/b_expr split).
+
+### The two structural blockers, diagnosed exactly (2026-08-27)
+
+**Parenthesised set-op operands (14)** — `(SELECT ...) UNION ALL (SELECT ...)`.
+Adding `simple_select: paren_select`, with ONE shared `'(' SelectStmt ')'` rule
+feeding all three consumers (which is the least-conflict spelling — giving each
+consumer its own copy is worse), leaves exactly TWO reduce/reduce conflicts,
+both on `')'`:
+
+    state 1131  simple_select: paren_select.  vs  c_expr: paren_select.
+    state 1916  simple_select: paren_select.  vs  base_table_ref: paren_select.opt_derived_alias
+
+Every OTHER lookahead already resolves correctly on its own — UNION / INTERSECT
+/ EXCEPT / ORDER / LIMIT / OFFSET / FETCH / FOR all reduce to simple_select,
+which is exactly what the 14 fragments need. `')'` cannot be resolved by
+precedence: %prec steers shift/reduce, not reduce/reduce, and upstream's
+`c_expr: select_with_parens %prec UMINUS` (tried) changes nothing. yacc breaks
+reduce/reduce by RULE ORDER, and simple_select is declared far earlier than
+c_expr, so simple_select wins `')'` — which BREAKS `SELECT f((SELECT 1))` and
+every other doubly-parenthesised subquery.
+
+The fix is upstream's layering — select_no_parens / select_clause /
+select_with_parens, with the set-op alternatives taking select_clause — so the
+parenthesised operand never enters simple_select at all. That is a structural
+rewrite of the SELECT core and should be done deliberately, not piecemeal.
+
+**Row constructors (10)** — unchanged from the measurement above: 12
+reduce/reduce, all `a_expr: c_expr` vs `b_expr: c_expr`. Resolve the
+a_expr/b_expr split first.
 
 ## ⚠️ VERIFICATION VERDICT 2026-08-27 — the migration is BELOW pre-migration level
 
@@ -540,10 +592,37 @@ spotcheck is GREEN (Q12=2, Q13=34), but:
 
 | suite | pre-migration | now |
 |---|---|---|
-| isolation strict specs | **0 FAIL** (2026-08-25 nightly) | 64 -> 41 -> **7 FAIL** of 245 |
-| regress must-pass (59) | not measurable — the 08-25 run wedged and was killed, so Go never printed subtest verdicts | 40 -> **38 not passing** |
+| isolation strict specs | **0 FAIL** (2026-08-25 nightly) | 64 -> 41 -> 7 -> 6 -> **3 FAIL** of 245 |
+| regress must-pass (59) | not measurable — the 08-25 run wedged and was killed, so Go never printed subtest verdicts | 40 -> 38 -> 19 -> **15 not passing** |
 | TPC-DS syntax errors | **0** (2026-08-25) | 6 → **1** after this session's fixes (+3 known dsqgen artefacts) |
-| TPC-H Q12/Q13 spotcheck | 2 / 34 | **2 / 34 ✅** |
+| TPC-H Q12/Q13 spotcheck | 2 / 34 | **2 / 34 ✅** (re-run after the interval-node fix) |
+| whole testport FAIL count | — | 170 -> 135 -> 69 -> 53 -> **28** |
+
+### Testport end state 2026-08-27 (clean single run, 20G/24G cap)
+
+28 failures, and the composition matters more than the count:
+
+- **4 were already red before the migration** and are not parser work:
+  `TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary`,
+  `TestPort_PgDumpConnectionSetup`, `TestPort_PgAmcheck002Nonesuch`,
+  `TestPort_PgAmcheck005OpclassDamage`.
+- **3 isolation specs** remain: `IsolationMergeMatchRecheck`,
+  `IsolationPartialIndex`, `IsolationPredicateGin`.
+- **1 is a recorded parser deferral**:
+  `ZeroColumnJoinDoesNotCrashBackend/lateral_values` needs `VALUES(n.*)`,
+  whose 20-reduce/reduce cost is documented in the grammar.
+- **15 regress cases**, plus `PgoutputInteropGoopgToPG` and
+  `CreateTableInheritsNoInheritCheckNotPropagated`.
+
+Eight regress cases were fixed this session (boolean, case,
+create_function_sql, hash_part, int2, int4, partition_aggregate, prepare) and
+six appeared (portals_p2, select_distinct, select_into, truncate, union,
+varchar). The six are NOT regressions — they are cases whose statements now
+PARSE, so they run further and diverge on OUTPUT instead of stopping at 42601.
+Verified two of them: `truncate` diverges on inheritance-aware TRUNCATE
+semantics and a missing relation (executor-level, no syntax error in the diff),
+and `varchar` PASSES when run alone, so its failure in the full sweep is
+suite-order state rather than anything the parser does.
 
 **Methodology note — why no baseline worktree was needed.** The intended
 baseline `f5613d73f` (parent of the first permanent routing flip `ae1516857`)
