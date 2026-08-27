@@ -3292,6 +3292,15 @@ update_assign:
 			{ $$ = *parser.NewUpdateAssign($1, "", nil, parser.NewDefaultMarker(yylex.(*lexerState).lastConsumedPos())) }
 	| ColId '.' ColId '=' a_expr
 			{ $$ = *parser.NewUpdateAssign($3, $1, nil, $5) }
+	/* Multi-column form `(c1, c2) = (e1, e2)` / `= (subquery)` / `= ROW(...)`
+	   — gram.y set_clause's `'(' set_target_list ')' '=' a_expr`. The RHS is
+	   whatever the expression grammar makes of it: a RowExpr for `(1, 2)`, a
+	   SubqueryExpr for a select, a FuncCall for ROW(...). One legacy detail:
+	   a single parenthesised value `(a) = (1)` is a one-element RowExpr there,
+	   which the expression grammar cannot tell from `1` — multiSetRHS checks
+	   the token stream for the '('. */
+	| '(' colid_list ')' '=' a_expr
+			{ $$ = *parser.NewUpdateAssign("", "", $2, multiSetRHS(yylex, $5, $<p>5)) }
 
 opt_update_where:
 		/* empty */   { $$ = nil }

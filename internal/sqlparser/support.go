@@ -1893,3 +1893,25 @@ type checkOpt struct {
 	opt string
 	pos int
 }
+
+// multiSetRHS reproduces legacy's reading of a multi-column SET's right-hand
+// side: a parenthesised list is always a RowExpr there, even with one element,
+// while the expression grammar collapses `(1)` to `1`. The token at the RHS's
+// first position says which was written.
+func multiSetRHS(l yyLexer, e parser.Expr, pos int) parser.Expr {
+	switch e.(type) {
+	case *parser.RowExpr, *parser.SubqueryExpr:
+		return e
+	}
+	if ls, ok := l.(*lexerState); ok {
+		for _, tk := range ls.toks {
+			if tk.Pos == pos {
+				if tk.Kind == parser.TokenSymbol && tk.Value == "(" {
+					return parser.NewRowExpr(pos, []parser.Expr{e})
+				}
+				break
+			}
+		}
+	}
+	return e
+}

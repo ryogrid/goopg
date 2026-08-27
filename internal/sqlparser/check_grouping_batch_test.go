@@ -120,3 +120,24 @@ func TestSmallFormsBatchF(t *testing.T) {
 		assertParity(t, q)
 	}
 }
+
+// TestMultiColumnSet pins `UPDATE ... SET (c1, c2) = (...)`, the last real
+// cluster in the full regress corpus (34 fragments). The RHS is whatever the
+// expression grammar makes of it — RowExpr, SubqueryExpr, ROW(...) call —
+// except that a parenthesised single value is a one-element RowExpr, as legacy
+// records it (decided from the token stream, since `(1)` collapses to `1`).
+func TestMultiColumnSet(t *testing.T) {
+	for _, q := range []string{
+		"UPDATE t SET (a, b) = (1, 2)",
+		"UPDATE t SET (a, b) = (SELECT 1, 2)",
+		"UPDATE inhpar i SET (f1, f2) = (SELECT i.f1, i.f2 || '-' FROM int4_tbl LIMIT 1)",
+		"UPDATE t SET (a) = (1)",
+		"UPDATE t SET (a, b) = ROW(1, 2)",
+		"UPDATE t SET a = 1, (b, c) = (2, 3)",
+		"INSERT INTO t VALUES (1) ON CONFLICT (k) DO UPDATE SET (a, b) = (2, 3)",
+		"UPDATE t SET a = 1",
+		"UPDATE t SET a = DEFAULT",
+	} {
+		assertParity(t, q)
+	}
+}
