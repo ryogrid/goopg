@@ -1083,6 +1083,122 @@ The biggest remaining blocks and what they need:
   (44), alter function (18), alter index (10), drop sequence (10), drop rule
   (9), comment on, copy, create policy.
 
+## P7.1 dry run (2026-08-28) — the cutover's real scope, measured
+
+**P7.0 landed**: 742 parity goldens are captured (testdata/parity_goldens.txt),
+so the cutover has an oracle that does not depend on the legacy parser. That
+was the documented prerequisite for P7.2 and it is done.
+
+**P7.1 was then attempted and REVERTED**, deliberately, because the dry run
+answered a question no measurement so far could. The move itself is
+straightforward — only 6 package-level name collisions, no non-test basename
+collisions, and `\bparser\.([A-Z])` is a safe qualifier-stripping rule because
+every cross-package reference is to an exported name. It compiled after
+resolving:
+
+- `KeywordCategory` — legacy's 4-value enum and the GENERATED kwlist one are
+  different types with the same name; rename the generated one (and its
+  generator, cmd/gen-kwlist-go).
+- `RouteBatch` / `RouteExprBatch` — the hook variables become unnecessary once
+  the packages are one; Parse calls routeBatch directly and
+  internal/postmaster/parser_routing.go is deleted.
+- `rollupAlternatives` / `similarToLiteralValue` — identical duplicates, drop
+  the grammar's copies. `cubeAlternatives` / `sortUsingIsDesc` — DIFFERENT
+  implementations, so the grammar's must be renamed, not merged.
+- `tpch_coverage_test.go` must become an external `parser_test` package
+  (internal/testutil/tpch imports internal/parser).
+- **diffParse's legacy leg must call a new `parseLegacyOnly`**, because in one
+  package `Parse` always routes and the comparison would silently become a
+  self-comparison. This one is load-bearing: without it the whole differential
+  suite passes while testing nothing.
+
+### What the dry run found
+
+`internal/parser`'s own 112-file test suite has ALWAYS exercised the LEGACY
+parser, because the dispatch hook is wired by internal/postmaster and nothing
+else imports it. Merging the packages points those tests at the new parser for
+the first time, and **73 of them fail (50 top-level tests, 23 subtests)**.
+
+Spot-checks show the failures are a genuine mix, not an artefact:
+
+| example | verdict |
+|---|---|
+| `SELECT -2^2` shape | the DOCUMENTED unary-minus known-diff — legacy's own test asserts legacy's shape |
+| `ORDER BY a COLLATE pg_catalog."C"` | real gap: qualified collation name |
+| `x LIKE SOME (ARRAY[...])` | real gap: SOME as an ANY synonym in the LIKE family |
+| `SELECT char(20) 'characters'` | real gap: typmod'd typed string literal |
+| `ALTER TYPE t RENAME ATTRIBUTE a TO b` | real gap: a missing ALTER TYPE action |
+| bare `MINVALUE`/`MAXVALUE` in a partition bound | real gap: PartitionRangeBoundKeyword |
+
+So the regress corpus — which drove every wave up to P5.14 and now shows ZERO
+yacc-side rejects over 13,031 routed fragments — is NOT a sufficient oracle on
+its own. `internal/parser`'s unit tests cover forms it never exercises, and
+they are the real remaining scope of the migration.
+
+### Resume point
+
+1. Work the 73 failures down to zero WITHOUT merging the packages, by adding
+   each failing statement to the differential corpus in internal/sqlparser
+   (they are ordinary assertParity cases). Triage each as known-diff or gap
+   first; the known-diffs need a ledger row, not a fix.
+2. Only then redo the P7.1 move — it is mechanical and the recipe above is
+   complete.
+3. Then P7.2 (delete the legacy statement parsers, keeping the compat token
+   walks and the lexer/AST/error machinery) and P7.3 (final gates).
+
+The failing top-level tests, for the resumed session:
+
+- `TestAlterConstraintNotValidRejected`
+- `TestAlterTypeMultiSubcommandParsing`
+- `TestAlterTypeRenameAttributeParsing`
+- `TestColNameKeywordsAsColumnNamesDoD`
+- `TestCreateTableOfTypeEmptyColumnList`
+- `TestCreateTableOfTypeMixedColumnAndTableConstraint`
+- `TestCreateTableOfTypeTableConstraintAccepted`
+- `TestCreateTableV0`
+- `TestParseBetweenAsymmetricDesugar`
+- `TestParseBitStringLiteralInvalidDigit`
+- `TestParseCTASOnCommit`
+- `TestParseCastCharDisambiguation`
+- `TestParseCastFloatAlias`
+- `TestParseCharTypmodLiteral`
+- `TestParseCheckNotEnforced`
+- `TestParseCollatePostfix`
+- `TestParseColumnConstraintDuplicateEnforced`
+- `TestParseColumnConstraintMisplacedEnforced`
+- `TestParseColumnDefCollation`
+- `TestParseColumnNamedUniqueNullsNotDistinct`
+- `TestParseColumnTypeFloatPrecisionErrors`
+- `TestParseColumnUniqueNullsNotDistinct`
+- `TestParseCommentOnCast`
+- `TestParseCopyQueryColumnListRejected`
+- `TestParseCopyQueryFromRejected`
+- `TestParseCopySyntaxErrors`
+- `TestParseCreateIndexColCollation`
+- `TestParseCreateTableSignedReloption`
+- `TestParseCreateTableWithOidsParsesAndFlags`
+- `TestParseCreateTempTableOnCommitEmptyListInherits`
+- `TestParseCreateTempTableOnCommitPreserveRowsNoop`
+- `TestParseCreateViewCheckOptionReloptionForm`
+- `TestParseDDLSyntaxErrors`
+- `TestParseExplainAnalyzeVerbose`
+- `TestParseFKNotEnforcedCreateTableTime`
+- `TestParseFloatAliasQuotedIsUserType`
+- `TestParseFloatArrayAlias`
+- `TestParseGroupingFuncCall`
+- `TestParseIntervalColumnTypmod`
+- `TestParseLikeFamilyAnyAll`
+- `TestParseShowSetReset`
+- `TestParseStandaloneNotNullColumnConstraint`
+- `TestParseSubstringFromForConstantFold`
+- `TestParseSubstringSimilarNullPropagation`
+- `TestParseSubstringSimilarTooManySeparators`
+- `TestParseSyntaxErrorAtOrNearWording`
+- `TestParseTableNamedUniqueNullsNotDistinct`
+- `TestParseTableUniqueNullsNotDistinct`
+- `TestPartitionRangeBoundKeywordDistinctFromStringConst`
+- `TestPowPrecedenceAndAssociativity`
+
 ## P7 — Cutover & deletion
 
 - [ ] **P7.1 Move generated sources into internal/parser; delete
