@@ -869,6 +869,7 @@ with_value:
 	| FALSE_P    { $$ = "false" }
 	| ON         { $$ = "on" }
 	| ColId      { $$ = $1 } /* covers off, heap, ... */
+	| '-' with_value { $$ = "-" + $2 } /* n_distinct = -0.5 */
 
 /* create_index_stmt / drop_index_stmt — P4.4 (gram.y IndexStmt / DropStmt
    subsets). v0: plain column keys (expressions, DESC/NULLS, opclasses and
@@ -1186,52 +1187,62 @@ reset_stmt:
    RENAME TO. Multi-action lists, DROP DEFAULT/NOT NULL, SET forms and
    partition actions arrive in later slices. */
 alter_table_stmt:
-		ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name alter_action_list
+		ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star alter_action_list
 			{
-				acts := $6.([]parser.AlterTableAction)
+				acts := $7.([]parser.AlterTableAction)
 				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
 				st.Actions = acts
 				$$ = st
 			}
-	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name OWNER TO ColId
+	/* ENABLE / DISABLE [ALWAYS|REPLICA] TRIGGER — legacy records only a
+	   statement-level flag, with no action and no trigger name. */
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star trigger_toggle
 			{
 				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
-				st.OwnerTo = $8
+				st.EnableDisableTrigger = true
 				$$ = st
 			}
-	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name SET SCHEMA ColId
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star OWNER TO ColId
 			{
 				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
-				st.SetSchema = $8
+				st.OwnerTo = $9
 				$$ = st
 			}
-	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name SET LOGGED
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star SET SCHEMA ColId
+			{
+				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st.IfExists = $3
+				st.Only = $4
+				st.SetSchema = $9
+				$$ = st
+			}
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star SET LOGGED
 			{
 				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.SetLogged = "logged"
 				$$ = st
 			}
-	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name SET UNLOGGED
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star SET UNLOGGED
 			{
 				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.SetLogged = "unlogged"
 				$$ = st
 			}
-	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name SET '(' str_pair_list ')'
+	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star SET '(' str_pair_list ')'
 			{
 				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				a := parser.NewATAction(parser.AlterTableSetReloptions)
 				m := map[string]string{}
-				for _, kv := range $8 {
+				for _, kv := range $9 {
 					parts := splitKV(kv)
 					if len(parts) == 2 {
 						m[parts[0]] = parts[1]
@@ -1257,7 +1268,47 @@ opt_ONLY_kw:
 	| ONLY           { $$ = true }
 
 alter_table_action:
-		ADD_P opt_COLUMN ColId col_type_name col_constraints
+	/* The column form is spelled FOUR ways rather than with opt_COLUMN /
+	   opt_if_not_exists, so no EMPTY nonterminal reduces right after ADD: with
+	   one, `ADD EXCLUDE` had to choose between the constraint keyword and a
+	   column named "exclude" a token too early (1 shift/reduce). Shifting the
+	   name and deciding on the NEXT token keeps both spellings. */
+		ADD_P ColId col_type_name col_constraints
+			{
+				cc := $4.(*colConstraints)
+				ct := $3.(*typeWithArgs)
+				cd := parser.NewColumnDef($2, parser.NewColumnType(ct.ct.schema, ct.ct.name, ct.args, false))
+				cd.NotNull = cc.notNull
+				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
+				cd.DefaultExpr = cc.defExpr
+				// CHECK and REFERENCES were dropped here as well — the same
+				// sibling-path divergence as identity below.
+				cd.CheckExpr = cc.checkText
+				if cc.fk != nil {
+					cd.RefTable = cc.fk.refTable
+					cd.RefColumns = cc.fk.refCols
+					cd.OnDelete = cc.fk.onDel
+					cd.OnUpdate = cc.fk.onUp
+					cd.OnDeleteSetCols = cc.fk.delSetCols
+					cd.FKMatchFull = cc.fk.matchFull
+				}
+				// Identity was silently DROPPED here while CREATE TABLE kept
+				// it — the classic sibling-path divergence, and `add column`
+				// is routed.
+				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
+				applyIdentityOpts(cd, cc.identitySeq)
+				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit, cc.checkNotEnforced, cc.storage)
+				a := parser.NewATAction(parser.AlterTableAddColumn)
+				a.Column = *cd
+				$$ = a
+			}
+	/* ADD [CONSTRAINT name] <table constraint> — gram.y AlterTableCmd's
+	   `ADD_P TableConstraint`. One at_constraint nonterminal serves the named
+	   and unnamed spellings; legacy keeps the name in ConstraintName for every
+	   kind. Spelled as two ADD alternatives rather than an optional name so no
+	   EMPTY nonterminal has to reduce right after ADD, which would collide
+	   with the column form's own leading ColId. */
+	| ADD_P COLUMN ColId col_type_name col_constraints
 			{
 				cc := $5.(*colConstraints)
 				ct := $4.(*typeWithArgs)
@@ -1286,32 +1337,112 @@ alter_table_action:
 				a.Column = *cd
 				$$ = a
 			}
-	/* `ADD PRIMARY KEY USING INDEX i` promotes an existing unique index. */
-	| ADD_P PRIMARY KEY USING INDEX ColId
+	/* ADD [CONSTRAINT name] <table constraint> — gram.y AlterTableCmd's
+	   `ADD_P TableConstraint`. One at_constraint nonterminal serves the named
+	   and unnamed spellings; legacy keeps the name in ConstraintName for every
+	   kind. Spelled as two ADD alternatives rather than an optional name so no
+	   EMPTY nonterminal has to reduce right after ADD, which would collide
+	   with the column form's own leading ColId. */
+	| ADD_P IF_P NOT EXISTS ColId col_type_name col_constraints
 			{
-				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
-				a.UsingIndexName = $6
+				cc := $7.(*colConstraints)
+				ct := $6.(*typeWithArgs)
+				cd := parser.NewColumnDef($5, parser.NewColumnType(ct.ct.schema, ct.ct.name, ct.args, false))
+				cd.NotNull = cc.notNull
+				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
+				cd.DefaultExpr = cc.defExpr
+				// CHECK and REFERENCES were dropped here as well — the same
+				// sibling-path divergence as identity below.
+				cd.CheckExpr = cc.checkText
+				if cc.fk != nil {
+					cd.RefTable = cc.fk.refTable
+					cd.RefColumns = cc.fk.refCols
+					cd.OnDelete = cc.fk.onDel
+					cd.OnUpdate = cc.fk.onUp
+					cd.OnDeleteSetCols = cc.fk.delSetCols
+					cd.FKMatchFull = cc.fk.matchFull
+				}
+				// Identity was silently DROPPED here while CREATE TABLE kept
+				// it — the classic sibling-path divergence, and `add column`
+				// is routed.
+				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
+				applyIdentityOpts(cd, cc.identitySeq)
+				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit, cc.checkNotEnforced, cc.storage)
+				a := parser.NewATAction(parser.AlterTableAddColumn)
+				a.IfExists = true
+				a.Column = *cd
 				$$ = a
 			}
-	| ADD_P PRIMARY KEY pk_cols opt_include
+	/* ADD [CONSTRAINT name] <table constraint> — gram.y AlterTableCmd's
+	   `ADD_P TableConstraint`. One at_constraint nonterminal serves the named
+	   and unnamed spellings; legacy keeps the name in ConstraintName for every
+	   kind. Spelled as two ADD alternatives rather than an optional name so no
+	   EMPTY nonterminal has to reduce right after ADD, which would collide
+	   with the column form's own leading ColId. */
+	| ADD_P COLUMN IF_P NOT EXISTS ColId col_type_name col_constraints
 			{
-				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
-				a.Columns = $4
-				a.IncludeColumns = $5
+				cc := $8.(*colConstraints)
+				ct := $7.(*typeWithArgs)
+				cd := parser.NewColumnDef($6, parser.NewColumnType(ct.ct.schema, ct.ct.name, ct.args, false))
+				cd.NotNull = cc.notNull
+				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
+				cd.DefaultExpr = cc.defExpr
+				// CHECK and REFERENCES were dropped here as well — the same
+				// sibling-path divergence as identity below.
+				cd.CheckExpr = cc.checkText
+				if cc.fk != nil {
+					cd.RefTable = cc.fk.refTable
+					cd.RefColumns = cc.fk.refCols
+					cd.OnDelete = cc.fk.onDel
+					cd.OnUpdate = cc.fk.onUp
+					cd.OnDeleteSetCols = cc.fk.delSetCols
+					cd.FKMatchFull = cc.fk.matchFull
+				}
+				// Identity was silently DROPPED here while CREATE TABLE kept
+				// it — the classic sibling-path divergence, and `add column`
+				// is routed.
+				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
+				applyIdentityOpts(cd, cc.identitySeq)
+				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit, cc.checkNotEnforced, cc.storage)
+				a := parser.NewATAction(parser.AlterTableAddColumn)
+				a.IfExists = true
+				a.Column = *cd
 				$$ = a
 			}
-	| DROP COLUMN ColId opt_drop_behavior
+	/* ADD [CONSTRAINT name] <table constraint> — gram.y AlterTableCmd's
+	   `ADD_P TableConstraint`. One at_constraint nonterminal serves the named
+	   and unnamed spellings; legacy keeps the name in ConstraintName for every
+	   kind. Spelled as two ADD alternatives rather than an optional name so no
+	   EMPTY nonterminal has to reduce right after ADD, which would collide
+	   with the column form's own leading ColId. */
+	| ADD_P at_constraint
+			{ $$ = $2 }
+	| ADD_P CONSTRAINT ColId at_constraint
+			{
+				a := $4.(*parser.AlterTableAction)
+				a.ConstraintName = $3
+				$$ = a
+			}
+	| DROP opt_COLUMN ColId opt_drop_behavior
 			{
 				a := parser.NewATAction(parser.AlterTableDropColumn)
 				a.ColumnName = $3 // CASCADE / RESTRICT: parsed and dropped, as legacy
 				$$ = a
 			}
-	| ALTER opt_COLUMN ColId TYPE_P col_type_name
+	| DROP opt_COLUMN IF_P EXISTS ColId opt_drop_behavior
+			{
+				a := parser.NewATAction(parser.AlterTableDropColumn)
+				a.ColumnName = $5
+				a.IfExists = true
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId TYPE_P col_type_name opt_at_using
 			{
 				ct := $5.(*typeWithArgs)
 				a := parser.NewATAction(parser.AlterTableAlterColumnType)
 				a.ColumnName = $3
 				a.NewType = parser.NewColumnType(ct.ct.schema, ct.ct.name, ct.args, false)
+				a.UsingExpr, _ = $6.(parser.Expr)
 				$$ = a
 			}
 	| RENAME TO ColId
@@ -1400,6 +1531,151 @@ alter_table_action:
 	/* ATTACH PARTITION takes the SAME bound spec as CREATE TABLE ... PARTITION
 	   OF, hash bounds included — three hand-spelled copies had left
 	   `FOR VALUES WITH (MODULUS m, REMAINDER r)` unreachable here. */
+	/* ALTER [COLUMN] name <sub-action> — the remaining gram.y
+	   AlterTableCmd column forms. DROP EXPRESSION / DROP IDENTITY / SET
+	   GENERATED / ADD GENERATED are accepted and recorded as NoOp, which is
+	   what legacy does with them. */
+	| ALTER opt_COLUMN ColId SET STATISTICS signed_iconst
+			{
+				a := parser.NewATAction(parser.AlterTableSetStatistics)
+				a.ColumnName = $3
+				a.CheckExpr = atStatValue($6) // legacy stores the number as TEXT
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId SET STORAGE ColId
+			{
+				a := parser.NewATAction(parser.AlterTableSetStorage)
+				a.ColumnName, a.StorageType = $3, $6
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId SET COMPRESSION ColId
+			{
+				a := parser.NewATAction(parser.AlterTableSetCompression)
+				a.ColumnName, a.CompressionType = $3, $6
+				$$ = a
+			}
+	/* `SET COMPRESSION default` — legacy records an EMPTY method for it. */
+	| ALTER opt_COLUMN ColId SET COMPRESSION DEFAULT
+			{
+				a := parser.NewATAction(parser.AlterTableSetCompression)
+				a.ColumnName = $3
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId SET '(' str_pair_list ')'
+			{
+				a := parser.NewATAction(parser.AlterTableAlterColumnSet)
+				a.ColumnName, a.SetOptions = $3, $6
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId RESET '(' str_pair_list ')'
+			{
+				a := parser.NewATAction(parser.AlterTableAlterColumnReset)
+				a.ColumnName, a.SetOptions = $3, $6
+				$$ = a
+			}
+	| ALTER opt_COLUMN ColId DROP EXPRESSION opt_if_exists_drop
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	/* SET EXPRESSION / SET DATA TYPE / the identity-sequence tweaks are all
+	   NoOp in legacy — note SET DATA TYPE differs from plain TYPE, which does
+	   record AlterColumnType. Reproduced as legacy has it. */
+	| ALTER opt_COLUMN ColId SET EXPRESSION AS '(' a_expr ')'
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| ALTER opt_COLUMN ColId SET DATA_P TYPE_P col_type_name opt_at_using
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| ALTER opt_COLUMN ColId RESTART opt_restart_with
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| ALTER opt_COLUMN ColId SET identity_seq_opt
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| ALTER opt_COLUMN ColId SET GENERATED ALWAYS seq_tweaks
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| ALTER opt_COLUMN ColId SET GENERATED BY DEFAULT seq_tweaks
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| ALTER opt_COLUMN ColId DROP IDENTITY_P opt_if_exists_drop
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| ALTER opt_COLUMN ColId ADD_P GENERATED ALWAYS AS IDENTITY_P opt_identity_seq_opts
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| ALTER opt_COLUMN ColId ADD_P GENERATED BY DEFAULT AS IDENTITY_P opt_identity_seq_opts
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	/* ALTER CONSTRAINT name [NOT] DEFERRABLE [INITIALLY ...] — legacy records
+	   the three flags plus a marker that a deferrability clause was written. */
+	| ALTER CONSTRAINT ColId at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAlterConstraint)
+				a.ConstraintName = $3
+				$$ = applyAlterConstraint(a, mustATTail($4))
+			}
+	/* Table-level SET / RESET / CLUSTER. RESET's option names are DROPPED by
+	   legacy at table level, though the per-column RESET above keeps them. */
+	| RESET '(' str_pair_list ')'
+			{ $$ = parser.NewATAction(parser.AlterTableResetReloptions) }
+	| SET ACCESS METHOD ColId
+			{
+				a := parser.NewATAction(parser.AlterTableSetAccessMethod)
+				a.AccessMethodName = $4
+				$$ = a
+			}
+	| SET TABLESPACE ColId
+			{
+				a := parser.NewATAction(parser.AlterTableSetTablespace)
+				a.TablespaceName = $3
+				$$ = a
+			}
+	| SET WITHOUT OIDS
+			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+	| SET WITHOUT CLUSTER
+			{ $$ = parser.NewATAction(parser.AlterTableSetWithoutCluster) }
+	| CLUSTER ON ColId
+			{
+				a := parser.NewATAction(parser.AlterTableClusterOn)
+				a.ClusterIndexName = $3
+				$$ = a
+			}
+	| RENAME CONSTRAINT ColId TO ColId
+			{
+				a := parser.NewATAction(parser.AlterTableRenameConstraint)
+				a.OldConstraintName, a.NewName = $3, $5
+				$$ = a
+			}
+	| INHERIT qualified_name
+			{
+				a := parser.NewATAction(parser.AlterTableInherit)
+				a.InheritParent = objectNameFromQn($2)
+				$$ = a
+			}
+	| NO INHERIT qualified_name
+			{
+				a := parser.NewATAction(parser.AlterTableNoInherit)
+				a.InheritParent = objectNameFromQn($3)
+				$$ = a
+			}
+	| OF qualified_name
+			{
+				a := parser.NewATAction(parser.AlterTableAddOf)
+				a.OfType = objectNameFromQn($2)
+				$$ = a
+			}
+	| NOT OF
+			{ $$ = parser.NewATAction(parser.AlterTableDropOf) }
+	| ENABLE_P rule_state RULE ColId
+			{
+				a := parser.NewATAction(parser.AlterTableEnableDisableRule)
+				a.RuleName, a.RuleEnabledState = $4, byte($2)
+				$$ = a
+			}
+	| DISABLE_P RULE ColId
+			{
+				a := parser.NewATAction(parser.AlterTableEnableDisableRule)
+				a.RuleName, a.RuleEnabledState = $3, byte('D')
+				$$ = a
+			}
+	| ENABLE_P ROW LEVEL SECURITY
+			{ $$ = parser.NewATAction(parser.AlterTableEnableRowSecurity) }
+	| DISABLE_P ROW LEVEL SECURITY
+			{ $$ = parser.NewATAction(parser.AlterTableDisableRowSecurity) }
+	| FORCE ROW LEVEL SECURITY
+			{ $$ = parser.NewATAction(parser.AlterTableForceRowSecurity) }
+	| NO FORCE ROW LEVEL SECURITY
+			{ $$ = parser.NewATAction(parser.AlterTableNoForceRowSecurity) }
 	| ATTACH PARTITION qualified_name part_bound_spec2
 			{
 				b := $4.(*partBound)
@@ -1407,10 +1683,132 @@ alter_table_action:
 				parser.SetPartitionOfHashBound(a.AttachPartitionOf, b.modulus, b.remainder, b.isHash)
 				$$ = a
 			}
-	| DETACH PARTITION qualified_name
+	| DETACH PARTITION qualified_name opt_detach_tail
 			{
-				$$ = parser.NewATDetachPartition(0, objectNameFromQn($3))
+				a := parser.NewATDetachPartition(0, objectNameFromQn($3))
+				a.DetachConcurrently = $4
+				$$ = a
 			}
+
+/* One table constraint as ALTER TABLE ADD takes it. Every alternative ends in
+   at_constr_tail, the FLAT trailing-word list (see atConstrTail). */
+at_constraint:
+		PRIMARY KEY pk_cols opt_include at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
+				a.Columns, a.IncludeColumns = $3, $4
+				$$ = applyATTail(a, mustATTail($5))
+			}
+	| PRIMARY KEY USING INDEX ColId at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
+				a.UsingIndexName = $5
+				$$ = applyATTail(a, mustATTail($6))
+			}
+	| UNIQUE uq_cols opt_include at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAddUnique)
+				a.Columns, a.IncludeColumns = $2, $3
+				$$ = applyATTail(a, mustATTail($4))
+			}
+	| UNIQUE USING INDEX ColId at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAddUnique)
+				a.UsingIndexName = $4
+				$$ = applyATTail(a, mustATTail($5))
+			}
+	| check_body at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAddCheck)
+				a.CheckExpr = $1
+				$$ = applyATCheckTail(a, mustATTail($2))
+			}
+	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_match opt_fk_actions at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAddForeignKey)
+				a.Columns = $4
+				a.RefTable, a.RefColumns = objectNameFromQn($7), $8
+				a.MatchFull = $9
+				acts := $10.(*fkActs)
+				a.OnDelete, a.OnUpdate, a.OnDeleteSetCols = acts.del, acts.up, acts.delSetCols
+				$$ = applyATTail(a, mustATTail($11))
+			}
+	| EXCLUDE opt_using_method '(' exclude_elem_list ')' opt_include opt_exclude_where at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAddExclude)
+				d := newExclusionConstraint("", $2, $4.([]excludeElem), $6, nil, nil)
+				a.Columns, a.ExclusionOp, a.ExclusionMethod = d.Columns, d.ExclusionOp, d.Method
+				a.ExclusionWhere, _ = $7.(parser.Expr)
+				$$ = applyATTail(a, mustATTail($8))
+			}
+	| NOT NULL_P ColId at_constr_tail
+			{
+				a := parser.NewATAction(parser.AlterTableAddNotNull)
+				a.ColumnName = $3
+				$$ = applyATTail(a, mustATTail($4))
+			}
+
+/* `USING expr` on a column type change. */
+/* DETACH PARTITION's tail — CONCURRENTLY is recorded, FINALIZE is not (legacy
+   accepts and drops it). */
+/* `ALTER TABLE e_star* ...` — the inheritance star, consumed and recorded
+   nowhere, exactly as in a FROM clause. */
+opt_inh_star:
+		/* empty */   { _ = 0 }
+	| '*'             { _ = 0 }
+
+trigger_toggle:
+		ENABLE_P opt_trigger_mode TRIGGER trigger_target       { _ = 0 }
+	| DISABLE_P TRIGGER trigger_target                        { _ = 0 }
+
+opt_trigger_mode:
+		/* empty */   { _ = 0 }
+	| ALWAYS          { _ = 0 }
+	| REPLICA         { _ = 0 }
+
+trigger_target:
+		ColId         { _ = 0 }
+	| ALL             { _ = 0 }
+	| USER            { _ = 0 }
+
+/* Identity tweaks that may follow SET GENERATED, and a bare RESTART. */
+/* relrewrite state codes, as pg_rewrite stores them. */
+rule_state:
+		/* empty */   { $$ = int('O') }
+	| ALWAYS          { $$ = int('A') }
+	| REPLICA         { $$ = int('R') }
+
+seq_tweaks:
+		/* empty */                   { _ = 0 }
+	| seq_tweaks SET identity_seq_opt { _ = 0 }
+	| seq_tweaks identity_seq_opt     { _ = 0 }
+	| seq_tweaks RESTART opt_restart_with { _ = 0 }
+
+opt_restart_with:
+		/* empty */          { _ = 0 }
+	| WITH signed_iconst     { _ = 0 }
+	| signed_iconst          { _ = 0 }
+
+opt_detach_tail:
+		/* empty */     { $$ = false }
+	| CONCURRENTLY      { $$ = true }
+	| FINALIZE          { $$ = false }
+
+opt_at_using:
+		/* empty */    { $$ = (parser.Expr)(nil) }
+	| USING a_expr     { $$ = $2 }
+
+at_constr_tail:
+		/* empty */                        { $$ = (*atConstrTail)(nil) }
+	| at_constr_tail DEFERRABLE            { $$ = mergeATTail(mustATTail($1), "deferrable") }
+	| at_constr_tail NOT DEFERRABLE        { $$ = mergeATTail(mustATTail($1), "not_deferrable") }
+	| at_constr_tail INITIALLY DEFERRED    { $$ = mergeATTail(mustATTail($1), "initially_deferred") }
+	| at_constr_tail INITIALLY IMMEDIATE   { $$ = mergeATTail(mustATTail($1), "initially_immediate") }
+	| at_constr_tail NOT VALID             { $$ = mergeATTail(mustATTail($1), "not_valid") }
+	| at_constr_tail NOT ENFORCED          { $$ = mergeATTail(mustATTail($1), "not_enforced") }
+	| at_constr_tail ENFORCED              { $$ = mergeATTail(mustATTail($1), "enforced") }
+	| at_constr_tail NO INHERIT            { $$ = mergeATTail(mustATTail($1), "no_inherit") }
+	| at_constr_tail INHERIT               { $$ = mergeATTail(mustATTail($1), "inherit") }
 
 opt_COLUMN:
 		/* empty */  { _ = 0 }

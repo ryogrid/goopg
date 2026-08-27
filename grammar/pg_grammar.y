@@ -79,6 +79,10 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
+%type <node>	at_constraint at_constr_tail
+%type <expr>	opt_at_using
+%type <b>	opt_detach_tail
+%type <ival>	rule_state
 %type <exprs>	arbiter_elem_list
 %type <expr>	arbiter_elem
 %type <node>	explain_opt_list explain_opt

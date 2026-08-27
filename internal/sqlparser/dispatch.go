@@ -364,6 +364,9 @@ func actionWords(frag []parser.Token) []string {
 	for i+1 < len(w) && w[i] == "." {
 		i += 2
 	}
+	if i < len(w) && w[i] == "*" {
+		i++ // the inheritance star, `ALTER TABLE e_star* ...`
+	}
 	return w[i:]
 }
 
@@ -402,36 +405,21 @@ func alterActionRouted(a []string) bool {
 	}
 	switch a[0] {
 	case "add":
+		// Every ADD form the grammar has: a column (with or without the
+		// COLUMN keyword and IF NOT EXISTS) and every table constraint.
 		switch at(1) {
-		case "column":
-			if at(2) == "if" {
-				return false // ADD COLUMN IF NOT EXISTS: no grammar
-			}
-			return routedAlterTableActions["add column"]
-		case "primary":
-			return routedAlterTableActions["add primary"]
-		case "constraint", "foreign", "check", "unique", "exclude", "if", "not", "generated":
-			return false // ADD CONSTRAINT / FK / CHECK / UNIQUE / EXCLUDE: no grammar
-		default:
-			// bare `ADD colname type` — alter_table_action's opt_COLUMN arm.
-			return routedAlterTableActions["add <col>"]
-		}
-	case "drop":
-		switch at(1) {
-		case "column":
-			if at(2) == "if" {
-				return false // DROP COLUMN IF EXISTS: no grammar
-			}
-			return routedAlterTableActions["drop column"]
-		case "constraint":
-			return routedAlterTableActions["drop constraint"]
-		default:
-			// Bare `DROP colname` is legal SQL but the grammar's DROP arm
-			// requires the COLUMN keyword.
+		case "generated":
 			return false
 		}
+		return true
+	case "drop":
+		// DROP [COLUMN] [IF EXISTS] name, DROP CONSTRAINT [IF EXISTS] name.
+		return true
 	case "alter":
 		i := 1
+		if at(i) == "constraint" {
+			return true // ALTER CONSTRAINT name <deferrability>
+		}
 		if at(i) == "column" {
 			i++
 		}
@@ -440,64 +428,52 @@ func alterActionRouted(a []string) bool {
 		}
 		i++ // the column name
 		switch at(i) {
-		case "type":
-			// TYPE t USING expr is not covered.
-			for _, t := range a[i:] {
-				if t == "using" {
-					return false
-				}
-			}
-			return routedAlterTableActions["alter column type"]
-		case "set":
-			if at(i+1) == "default" || at(i+1) == "not" {
-				return routedAlterTableActions["alter column set"]
-			}
-			return false // SET STATISTICS / STORAGE / COMPRESSION / (attopts)
-		case "drop":
-			if at(i+1) == "default" || at(i+1) == "not" {
-				return routedAlterTableActions["alter column drop"]
-			}
-			return false // DROP IDENTITY / EXPRESSION
+		case "type", "set", "drop", "reset", "add":
+			// SET/DROP OPTIONS (foreign tables) has no grammar.
+			return at(i+1) != "options"
 		default:
 			return false
 		}
 	case "rename":
-		switch at(1) {
-		case "to":
-			return routedAlterTableActions["rename to"]
-		case "constraint":
-			return false
-		default:
-			// RENAME [COLUMN] old TO new
-			return routedAlterTableActions["rename column"]
-		}
+		return true // TO / [COLUMN] old TO new / CONSTRAINT old TO new
 	case "validate":
-		return at(1) == "constraint" && routedAlterTableActions["validate constraint"]
+		return at(1) == "constraint"
 	case "replica":
-		return at(1) == "identity" && routedAlterTableActions["replica identity"]
+		return at(1) == "identity"
 	case "attach":
-		return at(1) == "partition" && routedAlterTableActions["attach partition"]
+		return at(1) == "partition"
 	case "detach":
-		// DETACH PARTITION p CONCURRENTLY / FINALIZE are not covered.
-		return at(1) == "partition" && len(a) == 3 && routedAlterTableActions["detach partition"]
+		return at(1) == "partition"
+	case "inherit", "of":
+		return true
+	case "not":
+		return at(1) == "of"
+	case "cluster":
+		return at(1) == "on"
+	case "reset":
+		return at(1) == "("
+	case "enable", "disable", "force":
+		// TRIGGER is a statement-level flag; ROW LEVEL SECURITY is an action.
+		// RULE has no grammar.
+		return at(1) == "trigger" || at(1) == "row" || at(1) == "always" || at(1) == "replica"
+	case "no":
+		return at(1) == "inherit" || (at(1) == "force" && at(2) == "row")
 	case "owner":
-		// OWNER TO CURRENT_USER|SESSION_USER|CURRENT_ROLE cannot reduce: the
-		// grammar's target is ColId, which excludes reserved keywords.
 		switch at(2) {
 		case "current_user", "session_user", "current_role":
 			return false
 		}
-		return at(1) == "to" && routedAlterTableActions["owner to"]
+		return at(1) == "to"
 	case "set":
 		switch at(1) {
-		case "schema":
-			return routedAlterTableActions["set schema"]
-		case "logged", "unlogged":
-			return routedAlterTableActions["set logged"]
-		case "(":
-			return routedAlterTableActions["set ("]
+		case "schema", "logged", "unlogged", "(", "tablespace":
+			return true
+		case "access":
+			return at(2) == "method"
+		case "without":
+			return at(2) == "oids" || at(2) == "cluster"
 		default:
-			return false // SET TABLESPACE / ACCESS METHOD / WITH(OUT) ...
+			return false
 		}
 	default:
 		return false

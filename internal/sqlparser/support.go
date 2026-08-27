@@ -1,6 +1,7 @@
 package sqlparser
 
 import (
+	"strconv"
 	"fmt"
 	"strings"
 
@@ -1999,4 +2000,98 @@ func applyExplainOpts(l yyLexer, pos int, opts []*explainOpt) parser.ExplainOpti
 		}
 	}
 	return o
+}
+
+// atConstrTail carries an ALTER TABLE constraint's trailing words. They are one
+// FLAT left-recursive list rather than opt_constr_attrs + opt_not_valid,
+// because NOT is followed by DEFERRABLE, VALID or ENFORCED and a two-part tail
+// cannot tell them apart with one token of lookahead.
+type atConstrTail struct {
+	deferrable, initiallyDeferred bool
+	hasDeferrability              bool
+	notValid                      bool
+	enforced, hasEnforceability   bool
+	noInherit, hasInheritability  bool
+}
+
+func mergeATTail(t *atConstrTail, w string) *atConstrTail {
+	if t == nil {
+		t = &atConstrTail{}
+	}
+	switch w {
+	case "deferrable":
+		t.deferrable, t.hasDeferrability = true, true
+	case "not_deferrable":
+		t.deferrable, t.initiallyDeferred, t.hasDeferrability = false, false, true
+	case "initially_deferred":
+		t.deferrable, t.initiallyDeferred, t.hasDeferrability = true, true, true
+	case "initially_immediate":
+		t.initiallyDeferred, t.hasDeferrability = false, true
+	case "not_valid":
+		t.notValid = true
+	case "not_enforced":
+		t.enforced, t.hasEnforceability = false, true
+	case "enforced":
+		t.enforced, t.hasEnforceability = true, true
+	case "no_inherit":
+		t.noInherit, t.hasInheritability = true, true
+	case "inherit":
+		t.noInherit, t.hasInheritability = false, true
+	}
+	return t
+}
+
+// atAction builds a bare ALTER TABLE action of the given kind.
+func atAction(k parser.AlterTableActionKind) *parser.AlterTableAction {
+	return parser.NewATAction(k)
+}
+
+// applyATTail copies the trailing words onto the action.
+func applyATTail(a *parser.AlterTableAction, t *atConstrTail) *parser.AlterTableAction {
+	if t == nil {
+		return a
+	}
+	a.Deferrable, a.InitiallyDeferred = t.deferrable, t.initiallyDeferred
+	a.NotValid, a.NoInherit = t.notValid, t.noInherit
+	if t.hasEnforceability && !t.enforced {
+		a.FKNotEnforced = true
+	}
+	return a
+}
+
+// applyATCheckTail is applyATTail for a CHECK, whose enforcement flag lives in
+// CheckNotEnforced rather than FKNotEnforced.
+func applyATCheckTail(a *parser.AlterTableAction, t *atConstrTail) *parser.AlterTableAction {
+	applyATTail(a, t)
+	if t != nil {
+		a.FKNotEnforced = false
+		a.CheckNotEnforced = t.hasEnforceability && !t.enforced
+	}
+	return a
+}
+
+// applyAlterConstraint maps the same tail onto ALTER CONSTRAINT's own flags,
+// each category carrying its own "was written" marker.
+func applyAlterConstraint(a *parser.AlterTableAction, t *atConstrTail) *parser.AlterTableAction {
+	if t == nil {
+		return a
+	}
+	a.AlterConstraintDeferrable = t.deferrable
+	a.AlterConstraintInitiallyDeferred = t.initiallyDeferred
+	a.AlterConstraintHasDeferrability = t.hasDeferrability
+	a.AlterConstraintEnforced = t.enforced
+	a.AlterConstraintHasEnforceability = t.hasEnforceability
+	a.AlterConstraintNoInherit = t.noInherit
+	a.AlterConstraintHasInheritability = t.hasInheritability
+	return a
+}
+
+// atStatValue renders SET STATISTICS' number the way legacy stores it — as a
+// STRING in CheckExpr, not a number field.
+func atStatValue(n int64) string { return strconv.FormatInt(n, 10) }
+
+// mustATTail coerces the boxed (possibly nil) tail carrier.
+func mustATTail(v any) *atConstrTail {
+	t, _ := v.(*atConstrTail)
+	return t
 }
