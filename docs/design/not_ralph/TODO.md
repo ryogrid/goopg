@@ -695,6 +695,32 @@ spotcheck is GREEN (Q12=2, Q13=34), but:
 | TPC-H Q12/Q13 spotcheck | 2 / 34 | **2 / 34 ✅** (re-run after the interval-node fix) |
 | whole testport FAIL count | — | 170 -> 135 -> 69 -> 53 -> 28 -> **15** |
 
+### ALTER TABLE action wave 2026-08-27 (`ce592d915`, P4.2)
+
+The largest unrouted class after EXPLAIN: 712 fragments across 44 actions,
+now 6. Every action the regress and isolation corpora use is ported, and
+routedAlterTableActions became a description of the grammar rather than a
+short exception list. Corpus parity 550 -> 646; routed regress fragments
+39,493; must-pass still 0 rejects; testport UNCHANGED at 15 FAIL.
+
+Two shapes were forced by conflicts and are worth remembering:
+
+- The constraint's trailing words are ONE FLAT left-recursive list. NOT is
+  followed by DEFERRABLE, VALID or ENFORCED, so a split tail cannot decide
+  with one token of lookahead — the same lesson as the table-level CHECK
+  trailer — and flattening is also what lets the corpus's orders compose
+  (`NOT VALID NO INHERIT`, `NOT DEFERRABLE ENFORCED`).
+- The ADD column form is spelled four ways instead of using opt_COLUMN /
+  opt_if_not_exists: with an empty nonterminal reducing right after ADD,
+  `ADD EXCLUDE` had to choose between the constraint keyword and a column
+  named "exclude" one token too early.
+
+Legacy quirks reproduced: SET DATA TYPE is a NoOp there while plain TYPE
+records AlterColumnType; table-level RESET drops its option names while the
+per-column RESET keeps them; SET COMPRESSION default records an EMPTY method;
+ENABLE / DISABLE TRIGGER is a statement-level flag with no action and no
+trigger name.
+
 ### EXPLAIN routed 2026-08-27 (`82b75a727`, P6.4)
 
 Routed only when the wrapped statement would be (explainInnerRouted), so
