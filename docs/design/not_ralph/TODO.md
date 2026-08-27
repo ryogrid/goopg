@@ -695,6 +695,14 @@ spotcheck is GREEN (Q12=2, Q13=34), but:
 | TPC-H Q12/Q13 spotcheck | 2 / 34 | **2 / 34 ✅** (re-run after the interval-node fix) |
 | whole testport FAIL count | — | 170 -> 135 -> 69 -> 53 -> 28 -> **15** |
 
+### EXPLAIN routed 2026-08-27 (`82b75a727`, P6.4)
+
+Routed only when the wrapped statement would be (explainInnerRouted), so
+unported inner classes stay on legacy. +1,919 regress fragments; must-pass 0
+rejects over 2,782; parity 550. The clean testport run after the flip is
+UNCHANGED at 15 FAIL — the regress files lean on `EXPLAIN (COSTS OFF)`, so
+this was the run that could have moved.
+
 ### Routing widened 2026-08-27 (`29d3b9bc9`): TEMP/UNLOGGED TABLE, UNIQUE INDEX, WITH RECURSIVE
 
 Three dispatcher decisions, not grammar gaps: a stale "conflicts" rationale
