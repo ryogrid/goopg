@@ -695,6 +695,21 @@ spotcheck is GREEN (Q12=2, Q13=34), but:
 | TPC-H Q12/Q13 spotcheck | 2 / 34 | **2 / 34 ✅** (re-run after the interval-node fix) |
 | whole testport FAIL count | — | 170 -> 135 -> 69 -> 53 -> 28 -> **15** |
 
+### Routing widened 2026-08-27 (`29d3b9bc9`): TEMP/UNLOGGED TABLE, UNIQUE INDEX, WITH RECURSIVE
+
+Three dispatcher decisions, not grammar gaps: a stale "conflicts" rationale
+refused every CREATE modifier, UNIQUE was taken as the object kind, and
+withFollowerRouted returned `routedStmts["recursive"]` (false) for every
+recursive CTE. +684 regress and +12 isolation fragments now route; must-pass
+stays at 0 rejects; the clean testport run after the flip is UNCHANGED at 15
+FAIL (same 15 cases). Two old dispatch tests were also un-routing SELECT for
+every later test (`defer delete(routedStmts, "select")`) — fixed to restore.
+
+Remaining unrouted classes by corpus frequency (regress + isolation): EXPLAIN
+2013, ALTER TABLE actions outside the allowlist 851, CREATE FUNCTION 384 /
+DROP FUNCTION 383, CREATE TRIGGER 373, GRANT 325, ANALYZE 306, MERGE 277,
+COPY 273, FETCH 264, VACUUM 212, roles 340, CREATE TYPE 174, REINDEX 147.
+
 ### Testport end state after the full-corpus sweep (2026-08-27, clean foreground run)
 
 15 failures: 4 pre-migration reds (`TestSyntax_AdvisoryLock_...`,
