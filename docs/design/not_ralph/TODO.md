@@ -547,9 +547,62 @@ fragment the LEGACY parser rejects too, so the regress files' DELIBERATE syntax
 errors (`select distinct from pg_database;`, `select;`, the copydml cases) no
 longer inflate the count. Roughly 33 of the original 222 were that noise.
 
-**The ONE fragment that remains is GROUPING SETS** — an unported feature
-rather than a missing production. Both structural blockers are gone (below),
-and so are `VALUES(n.*)` and the identity sequence options.
+**Must-pass regress: ZERO legacy-accepts/yacc-rejects fragments remain.** The
+last one, GROUPING SETS, landed with the full-corpus sweep below. Both
+structural blockers are gone, and so are `VALUES(n.*)` and the identity
+sequence options.
+
+### Full regress corpus sweep (2026-08-27)
+
+Once the must-pass set was exhausted the same harness was pointed at EVERY
+regress file — 36,066 routed fragments, not just the 2,567 of the 59 must-pass
+cases. Legacy-accepts / yacc-rejects: **801 -> 625 -> 299 -> 135 -> 101**,
+across five commits (`10fff5077` partition element lists and column qualifiers;
+`6bb72f3d1` composable CREATE TABLE tail, SQL-standard function forms, bit
+literals; `9ef17c8d5` opaque CHECK bodies, GROUPING SETS expansion, FK options;
+`dcd1b9350` multi-column SET). Corpus parity over the same span: 463 -> 523.
+Conflict pin 23 -> 28, every addition in an already-allowlisted class.
+
+Three findings from that sweep worth knowing before touching these areas again:
+
+- **CHECK bodies are opaque in legacy.** parseCheckExpr never parses the
+  expression; it stores a PLAIN space join of the tokens between the parens
+  (`( y ) . a > 0`). The adapter now folds `CHECK ( ... )` into one CHECKBODY
+  terminal. Legacy has THREE different token joins — plain (checks),
+  joinGeneratedExprTokens (generated columns, with spacing rules), and a
+  lower-cased unquoted one (partition-of checks) — and support.go carries all
+  three, named for their legacy originals.
+- **Trailers that start with NOT must be list items, not rule suffixes.**
+  `CHECK (...) . NOT` cannot tell NOT ENFORCED from a following NOT NULL with
+  one token of lookahead; gram.y's ConstraintAttributeSpec is a separate item
+  for exactly this reason. Same lesson as generated columns' mid-rule actions:
+  two alternatives sharing a prefix and each carrying their own `{ ... }` are
+  two distinct empty nonterminals reducible at the same point (1329 R/R on the
+  first cut of the table-check trailer).
+- **CREATE TABLE's tail had to become a LIST.** The flat single-clause tail
+  could not spell `PARTITION BY ... WITH (...)` (65 fragments). Two things were
+  forced by conflicts once it composed: the PARTITION OF-with-elements form is
+  a tail item, not a statement alternative (as an alternative it shifts
+  PARTITION before the no-column CREATE's empty tail can reduce — 900
+  fragments broke on the first cut), and the plain CTAS lives over the same
+  tail rather than in create_table_stmt_as.
+
+**Not ported, recorded — the 101 that remain:**
+
+| fragments | form | why |
+|---|---|---|
+| 53 | `(f(x)).*` | legacy rewrites it into a synthetic `__irs_N` FROM item numbered from a PROCESS-GLOBAL counter, so its AST is not reproducible run to run |
+| 18 | `AS "Confucius' Birthday"` | harness noise: the corpus splitter's quote handling, not a parser gap |
+| 7 | `x IS JSON` | legacy reads it as `x AS json` (a legacy bug) |
+| 6 | `ORDER BY c USING ~<~` | legacy's lexer splits multi-char operators and re-concatenates them; the adapter sees `~` `<` `~` |
+| 3 | `EXCLUDE ... (a WITH -\|-)` | same split-operator issue |
+| 2 | `33 * ANY (...)` | legacy reads `any(...)` as a function call after a non-comparison operator |
+| 2 | MERGE inside a CTE | MERGE is unported |
+| 2 | typed-table element lists with table constraints | `OF type (id WITH OPTIONS PRIMARY KEY, UNIQUE (name))` |
+| ~8 | singletons | `char(20) 'x'`, `::INTERVAL DAY TO MINUTE`, `WITH ordinality AS (...)` (the WITH_LA substitution eats a CTE named ordinality), `percentile_cont(p ORDER BY p) WITHIN GROUP`, a FILTER-after-WITHIN-GROUP, `CREATE TABLE t (col) ON COMMIT ... AS SELECT` |
+
+One legacy defect deliberately NOT reproduced (difftest_known_diffs.md, pinned
+both sides): a NOT NULL written after a column CHECK is lost by legacy.
 
 ### The structural blockers (2026-08-27)
 
@@ -636,13 +689,24 @@ spotcheck is GREEN (Q12=2, Q13=34), but:
 
 | suite | pre-migration | now |
 |---|---|---|
-| isolation strict specs | **0 FAIL** (2026-08-25 nightly) | 64 -> 41 -> 7 -> 6 -> **3 FAIL** of 245 |
+| isolation strict specs | **0 FAIL** (2026-08-25 nightly) | 64 -> 41 -> 7 -> 6 -> 3 -> **2 FAIL** of 245 |
 | regress must-pass (59) | not measurable — the 08-25 run wedged and was killed, so Go never printed subtest verdicts | 40 -> 38 -> 19 -> **15 not passing** |
 | TPC-DS syntax errors | **0** (2026-08-25) | 6 → **1** after this session's fixes (+3 known dsqgen artefacts) |
 | TPC-H Q12/Q13 spotcheck | 2 / 34 | **2 / 34 ✅** (re-run after the interval-node fix) |
-| whole testport FAIL count | — | 170 -> 135 -> 69 -> 53 -> **28** |
+| whole testport FAIL count | — | 170 -> 135 -> 69 -> 53 -> 28 -> **15** |
 
-### Testport end state 2026-08-27 (clean single run, 20G/24G cap)
+### Testport end state after the full-corpus sweep (2026-08-27, clean foreground run)
+
+15 failures: 4 pre-migration reds (`TestSyntax_AdvisoryLock_...`,
+`TestPort_PgDumpConnectionSetup`, and the two isolation specs
+`IsolationMergeMatchRecheck` / `IsolationPredicateGin` that were red before the
+sweep), `PgoutputInteropGoopgToPG`, and 9 regress cases — char, dbsize, errors,
+int8, limit, numerology, partition_info, select_into, union — all of which now
+PARSE and diverge on OUTPUT (executor-level), none on 42601. The 13 cases that
+cleared since the previous run (28 FAIL) include every one of the six that had
+"appeared" then because they were newly parsing.
+
+### Testport end state 2026-08-27 (clean single run, 20G/24G cap) — earlier
 
 28 failures, and the composition matters more than the count:
 
