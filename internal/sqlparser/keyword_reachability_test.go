@@ -37,8 +37,8 @@ var notYetPortedKeywords = map[string]string{
 	"COLLATION":     "CREATE COLLATION and COLLATION FOR (plain COLLATE is reachable)",
 	"FREEZE":        "P6.5 VACUUM FREEZE",
 	"OVERLAPS":      "the OVERLAPS predicate",
+	"VERBOSE":       "P6.4 EXPLAIN VERBOSE / P6.5 VACUUM VERBOSE (func_name_keyword does not count — see blindRules)",
 	"TABLESAMPLE":   "P1.2 FROM ... TABLESAMPLE",
-	"VERBOSE":       "P6.4 EXPLAIN VERBOSE / P6.5 VACUUM VERBOSE",
 }
 
 // TestReservedKeywordsReachable asserts every reserved / type_func_name
@@ -125,11 +125,23 @@ func parseKeywordLists(t *testing.T, path string) map[string][]string {
 var blockComment = regexp.MustCompile(`(?s)/\*.*?\*/`)
 var upperToken = regexp.MustCompile(`\b[A-Z][A-Z0-9_]*\b`)
 
+// blindRules are rule bodies whose token mentions do NOT count as evidence
+// that a keyword's real grammar is ported. func_name_keyword enumerates the
+// type_func_name_keyword class purely so those words can be used as FUNCTION
+// NAMES (`left('ahoj', 2)`); it says nothing about whether TABLESAMPLE's
+// clause, OVERLAPS' operator, BINARY's cast modifier or FREEZE's COPY option
+// exist. Counting them would silently retire allowlist entries for features
+// that are still unported — exactly the blinding this gate exists to prevent.
+var blindRules = map[string]bool{"func_name_keyword": true}
+
+var ruleHead = regexp.MustCompile(`^([a-z_][A-Za-z0-9_]*):`)
+
 // handWrittenGrammarTokens collects every uppercase token mentioned in the
 // HAND-WRITTEN grammar files. The generated kwlists/tokens files are excluded
 // (they mention every keyword by construction), and so is every line starting
 // with '%': the %token / %nonassoc precedence declarations would otherwise
-// make all 469 keywords look referenced.
+// make all 469 keywords look referenced. Rule bodies named in blindRules are
+// skipped for the reason given there.
 func handWrittenGrammarTokens(t *testing.T, dir string) map[string]bool {
 	t.Helper()
 	used := map[string]bool{}
@@ -139,8 +151,14 @@ func handWrittenGrammarTokens(t *testing.T, dir string) map[string]bool {
 			t.Fatalf("read %s: %v", name, err)
 		}
 		text := blockComment.ReplaceAllString(string(src), " ")
+		blind := false
 		for _, line := range strings.Split(text, "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "%") {
+			trimmed := strings.TrimSpace(line)
+			// A rule header at column 0 starts a new rule body.
+			if m := ruleHead.FindStringSubmatch(line); m != nil {
+				blind = blindRules[m[1]]
+			}
+			if blind || strings.HasPrefix(trimmed, "%") {
 				continue
 			}
 			for _, tok := range upperToken.FindAllString(line, -1) {

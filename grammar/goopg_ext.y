@@ -444,7 +444,7 @@ uq_cols:
 /* col_type_name — cast_typename plus optional typmod args; arrays ride
    cast_typename's own suffix and are re-detected in the action. */
 col_type_name:
-		cast_typename                            { $$ = &typeWithArgs{ct: $1} }
+		cast_typename                            { $$ = &typeWithArgs{ct: $1, args: $1.args} }
 	| col_type_name '(' ICONST ')'               { $1.(*typeWithArgs).args = []int64{int64($3)}; $$ = $1 }
 	| col_type_name '(' ICONST ',' ICONST ')'    { $1.(*typeWithArgs).args = []int64{int64($3), int64($5)}; $$ = $1 }
 
@@ -458,9 +458,9 @@ create_table_stmt_as:
 	   SELECT ...`. These are aliases, not column definitions — they carry no
 	   type — so they land in ColumnAliases, and the parenthesised
 	   opt_table_element_list rule (:19) cannot take them. */
-		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' colid_list ')' AS SelectStmt opt_ctas_with_data
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' colid_list ')' AS ctas_source opt_ctas_with_data
 			{
-				sel, _ := $10.(*parser.SelectStmt)
+				src := $10.(*ctasSrc)
 				nm := $5.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
 				if len(nm) > 1 {
@@ -473,13 +473,13 @@ create_table_stmt_as:
 				}
 				ct.IfNotExists = $4
 				ct.ColumnAliases = $7
-				ct.SelectSource = sel
+				ct.SelectSource, ct.ExecuteSource = src.sel, src.exec
 				ct.WithNoData = $11
 				$$ = ct
 			}
-	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name AS SelectStmt opt_ctas_with_data
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name AS ctas_source opt_ctas_with_data
 			{
-				sel, _ := $7.(*parser.SelectStmt)
+				src := $7.(*ctasSrc)
 				nm := $5.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
 				if len(nm) > 1 {
@@ -491,10 +491,29 @@ create_table_stmt_as:
 					ct.Unlogged = pfx.unlogged
 				}
 				ct.IfNotExists = $4
-				ct.SelectSource = sel
+				ct.SelectSource, ct.ExecuteSource = src.sel, src.exec
 				ct.WithNoData = $8
 				$$ = ct
 			}
+
+/* CTAS's source: a query, or a PREPARED STATEMENT. gram.y keeps the latter in
+   a separate CreateTableAsStmt-producing rule (ExecuteStmt with into set);
+   goopg's AST carries both on CreateTableStmt, so one nonterminal serves both
+   the plain and the column-alias spellings instead of doubling them. */
+ctas_source:
+		SelectStmt
+			{
+				sel, _ := $1.(*parser.SelectStmt)
+				$$ = &ctasSrc{sel: sel}
+			}
+	| EXECUTE ColId opt_execute_params
+			{
+				$$ = &ctasSrc{exec: parser.NewExecuteStmt($<p>1, $2, $3)}
+			}
+
+opt_execute_params:
+		/* empty */         { $$ = nil }
+	| '(' expr_list ')'     { $$ = $2 }
 
 /* Plain WITH [NO] DATA for CTAS. Deliberately NOT opt_with_data, whose
    with_data_kw carries a span-end side effect that exists only to pin a

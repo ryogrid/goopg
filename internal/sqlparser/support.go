@@ -487,7 +487,14 @@ func buildIntervalQualified(pos int, body, hi, lo string, prec int) parser.Expr 
 
 // castType carries a cast-target type name through the grammar: optional
 // leading schema plus the (possibly array-suffixed) type name.
-type castType struct{ schema, name string }
+// castType carries a parsed type name. args is the INLINE typmod, used only by
+// the datetime targets: `time(2) with time zone` puts its precision BEFORE the
+// tz mark, so col_type_name's trailing `'(' ICONST ')'` suffix cannot reach it
+// and the production has to carry it itself.
+type castType struct {
+	schema, name string
+	args         []int64
+}
 
 // withArrays appends n "[]" pairs the way legacy folds them into Name.
 func (c castType) withArrays(n int) castType {
@@ -1242,4 +1249,34 @@ func tzZone(l yyLexer, zone parser.Expr) parser.Expr {
 		return zone
 	}
 	return parser.NewStringConst(zone.Pos(), ls.lastIntervalRaw)
+}
+
+// ctasSrc carries CREATE TABLE ... AS's source, which is either a query or a
+// prepared statement. Exactly one field is non-nil.
+type ctasSrc struct {
+	sel  *parser.SelectStmt
+	exec *parser.ExecuteStmt
+}
+
+// intoWrap turns `SELECT ... INTO name` into the CreateTableStmt legacy builds
+// for it. The INTO target was recorded against the simple_select's SelectStmt
+// (see lexerState.intoFor); the wrap happens here, at the SelectStmt rule, so
+// the captured query already carries ORDER BY / LIMIT.
+func intoWrap(l yyLexer, s parser.Stmt) parser.Stmt {
+	ls, ok := l.(*lexerState)
+	if !ok || ls.intoFor == nil {
+		return s
+	}
+	sel, _ := s.(*parser.SelectStmt)
+	if sel == nil {
+		return s
+	}
+	tgt, ok := ls.intoFor[sel]
+	if !ok {
+		return s
+	}
+	delete(ls.intoFor, sel)
+	ct := parser.NewCreateTableStmt(0, tgt, nil, nil)
+	ct.SelectSource = sel
+	return ct
 }

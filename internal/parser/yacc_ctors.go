@@ -491,3 +491,10 @@ func NewSetConstraintsStmt(pos int, all bool, names []string, deferred bool) *Se
 func SplitEmbeddedInterval(body string) (value, unit string, ok bool) {
 	return splitEmbeddedInterval(body)
 }
+
+// NewExecuteStmt builds `EXECUTE name [(params)]`. The goyacc parser needs it
+// only as CREATE TABLE ... AS EXECUTE's source; the standalone EXECUTE
+// statement is not routed.
+func NewExecuteStmt(pos int, name string, params []Expr) *ExecuteStmt {
+	return &ExecuteStmt{pos: pos, Name: name, Params: params}
+}

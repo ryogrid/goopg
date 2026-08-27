@@ -80,8 +80,9 @@
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
 %type <exprs>	trim_list
-%type <str>	sort_using_op constr_name opt_part_opclass
-%type <node>	part_elem part_elem_list opt_subpartition_by
+%type <str>	sort_using_op constr_name func_name_keyword opt_part_opclass
+%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause
+%type <exprs>	opt_execute_params
 
 %type <strs>	constr_name_list
 %type <b>	constraints_set_mode opt_no_inherit opt_ctas_with_data
@@ -201,7 +202,13 @@ stmt_list:
 stmt:
 		SelectStmt
 			{
-				$$ = $1
+				// `SELECT ... INTO name` becomes a CreateTableStmt. The wrap
+				// happens HERE and not at the SelectStmt rule, because every
+				// consumer of SelectStmt — CREATE VIEW's body, a derived
+				// table, a CTE — asserts the concrete *parser.SelectStmt, and
+				// handing one of them a CreateTableStmt panics. INTO is only
+				// legal on a top-level statement anyway.
+				$$ = intoWrap(yylex, $1)
 			}
 	| insert_stmt
 			{
@@ -526,7 +533,7 @@ select_pos:
 /* with later P1 sub-phases (TODO P1.3); their absence here is what keeps */
 /* unrouted inputs failing cleanly toward the legacy parser. */
 simple_select:
-		SELECT select_pos opt_all_distinct opt_target_list opt_from_clause where_clause group_clause having_clause opt_window_clause
+		SELECT select_pos opt_all_distinct opt_target_list into_clause opt_from_clause where_clause group_clause having_clause opt_window_clause
 			{
 				s := parser.NewSelectStmt($2)
 				if di, ok := $3.(*distinctInfo); ok && di != nil {
@@ -537,27 +544,36 @@ simple_select:
 				// Flatten each comma-item into legacy's dual representation:
 				// s.From carries Base plus every JoinExpr.Right; s.FromExprs
 				// preserves the JOIN chains (planner reads structure here).
-				for _, fe := range $5 {
+				for _, fe := range $6 {
 					s.FromExprs = append(s.FromExprs, fe)
 					s.From = append(s.From, fe.Base)
 					for _, jn := range fe.Joins {
 						s.From = append(s.From, jn.Right)
 					}
 				}
-				s.Where = $6
-				if gc, ok := $7.(*groupClause); ok && gc != nil {
+				s.Where = $7
+				if gc, ok := $8.(*groupClause); ok && gc != nil {
 					s.GroupBy = gc.list
 				}
-				s.Having = $8
-				if len($9) > 0 {
-					s.WindowClause = $9
+				s.Having = $9
+				if len($10) > 0 {
+					s.WindowClause = $10
+				}
+				// SELECT ... INTO is CREATE TABLE ... AS in disguise; the
+				// wrap happens at the SelectStmt rule, once ORDER BY / LIMIT
+				// have been attached, so only the target is recorded here.
+				if tgt, ok := $5.(*parser.ObjectName); ok && tgt != nil {
+					l := yylex.(*lexerState)
+					if l.intoFor == nil {
+						l.intoFor = map[*parser.SelectStmt]parser.ObjectName{}
+					}
+					l.intoFor[s] = *tgt
 				}
 				$$ = s
 				// NOTE: ORDER BY / LIMIT / OFFSET live one level up, in
 				// select_no_parens (gram.y :12916 comment) — a set-op RHS
 				// must not swallow them.
 			}
-
 	| VALUES_LA values_rows
 			{
 				// lastConsumedPos is the VALUES keyword itself (select_pos
@@ -604,6 +620,45 @@ sort_by_list:
    keyword and then chokes on '(' — so porting that alternative would ACCEPT
    MORE than legacy. Pinned to what legacy takes: symbol operators (shared with
    exclude_op) plus a plain or schema-qualified operator name. */
+func_name_keyword:
+		AUTHORIZATION  { $$ = "authorization" }
+	| BINARY           { $$ = "binary" }
+	| COLLATION        { $$ = "collation" }
+	| CONCURRENTLY     { $$ = "concurrently" }
+	| CROSS            { $$ = "cross" }
+	| FREEZE           { $$ = "freeze" }
+	| FULL             { $$ = "full" }
+	| ILIKE            { $$ = "ilike" }
+	| INNER_P          { $$ = "inner" }
+	| IS               { $$ = "is" }
+	| ISNULL           { $$ = "isnull" }
+	| JOIN             { $$ = "join" }
+	| LEFT             { $$ = "left" }
+	| LIKE             { $$ = "like" }
+	| NATURAL          { $$ = "natural" }
+	| NOTNULL          { $$ = "notnull" }
+	| OUTER_P          { $$ = "outer" }
+	| OVERLAPS         { $$ = "overlaps" }
+	| RIGHT            { $$ = "right" }
+	| SIMILAR          { $$ = "similar" }
+	| TABLESAMPLE      { $$ = "tablesample" }
+	| VERBOSE          { $$ = "verbose" }
+
+/* into_clause — gram.y :12986. Legacy takes only `INTO [TABLE] name`; its
+   TEMP / UNLOGGED / TABLESPACE variants are NOT accepted there
+   (`SELECT a INTO TEMP x` is a syntax error), so they stay out. */
+into_clause:
+		/* empty */                      { $$ = (*parser.ObjectName)(nil) }
+	| INTO opt_into_table qualified_name
+			{
+				n := objectNameFromQn($3)
+				$$ = &n
+			}
+
+opt_into_table:
+		/* empty */   { _ = 0 }
+	| TABLE           { _ = 0 }
+
 sort_using_op:
 		exclude_op        { $$ = $1 }
 	| ColId               { $$ = $1 }
@@ -783,6 +838,14 @@ select_fetch_first_value:
 		c_expr
 			{
 				$$ = $1
+			}
+	/* A parenthesised expression — upstream reaches it because gram.y's c_expr
+	   owns `'(' a_expr ')' opt_indirection`, while this grammar hangs that
+	   alternative off a_expr instead, leaving c_expr unable to start with '('.
+	   `FETCH FIRST (NULL+1) ROWS WITH TIES` is the spelling limit.sql uses. */
+	| '(' a_expr ')'
+			{
+				$$ = $2
 			}
 	| '-' ICONST
 			{
@@ -1858,7 +1921,10 @@ a_expr:
 				if nm == "float" {
 					nm = "float8"
 				}
-				tm := typmodsFor(nm, nil, 0)
+				// $3.args is the datetime targets' INLINE typmod
+				// (`timestamp(3) with time zone`), which cannot ride the
+				// trailing `'(' ICONST ')'` alternatives below.
+				tm := typmodsFor(nm, $3.args, len($3.args))
 				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: nm}, tm)
 			}
 	| a_expr TYPECAST cast_typename '(' ICONST ')'
@@ -2132,7 +2198,7 @@ c_expr:
 			}
 	| CAST '(' a_expr AS cast_typename ')'
 			{
-				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: $5.name}, typmodsFor($5.name, nil, 0))
+				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: $5.name}, typmodsFor($5.name, $5.args, len($5.args)))
 			}
 	/* CAST(x AS t(n)) / CAST(x AS t(p,s)) — SIBLING of the `a_expr TYPECAST
 	   cast_typename '(' ... ')'` alternatives, which have carried typmods since
@@ -2351,7 +2417,24 @@ call_arg:
    qualified_name, seeing '(' shifts into FuncCall; anything else reduces
    ColumnRef. Single nonterminal = zero S/R conflicts. */
 name_or_call:
-		qualified_name
+	/* gram.y's func_name is type_function_name, which ADMITS
+	   type_func_name_keyword; ColId does not, so `left('ahoj', 2)` and
+	   `right(...)` were hard 42601s. Only the CALL form is added: legacy reads
+	   a BARE `left` as a column reference, so routing the bare spelling here
+	   too would change its node rather than fix an error.
+
+	   The list is spelled out rather than reusing the generated
+	   type_func_name_keyword nonterminal, and omits exactly one token from it:
+	   CURRENT_SCHEMA, which is ALSO a sql_value_func_name. Reusing the
+	   generated list makes that token reducible two ways and costs a
+	   reduce/reduce conflict — resolved correctly by rule order, but the
+	   conflict gate does not admit reduce/reduce. TestFuncNameKeywordListInSync
+	   pins this list against kwlists_gen.y so it cannot drift. */
+		func_name_keyword '(' opt_call_args ')'
+			{
+				$$ = callFuncExpr($<p>1, parser.ObjectName{Name: lowerIdent($1)}, $3.(*callArgs))
+			}
+	| qualified_name
 			{
 				$$ = columnRefFromParts($1)
 			}
@@ -2641,6 +2724,13 @@ cast_target:
 			{ $$ = castType{name: tzJoin("time", $2)} }
 	| TIMESTAMP opt_tzmark
 			{ $$ = castType{name: tzJoin("timestamp", $2)} }
+	/* gram.y ConstDatetime's counted forms. The precision sits BEFORE the tz
+	   mark, so col_type_name's trailing typmod suffix cannot express them and
+	   `time(2) with time zone` was a hard 42601. */
+	| TIME '(' ICONST ')' opt_tzmark
+			{ $$ = castType{name: tzJoin("time", $5), args: []int64{int64($3)}} }
+	| TIMESTAMP '(' ICONST ')' opt_tzmark
+			{ $$ = castType{name: tzJoin("timestamp", $5), args: []int64{int64($3)}} }
 	| IDENT '.' ColId
 			{ $$ = castType{schema: $1, name: $3} }
 

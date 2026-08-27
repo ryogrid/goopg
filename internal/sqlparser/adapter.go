@@ -58,6 +58,12 @@ type lexerState struct {
 	// match.
 	lastIntervalNode parser.Expr
 	lastIntervalRaw  string
+
+	// intoFor maps a simple_select's SelectStmt to the `SELECT ... INTO name`
+	// target recorded for it. Keyed by POINTER rather than kept in a single
+	// slot because the INTO clause is parsed BEFORE the FROM list, so an outer
+	// select's target is already recorded when an inner subquery reduces.
+	intoFor map[*parser.SelectStmt]parser.ObjectName
 	prevPos  int    // absolute Pos of the token before that (mid-rule pos capture)
 
 	// base_yylex one-token pushback (base_yylex.go)
