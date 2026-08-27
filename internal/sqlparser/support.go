@@ -761,6 +761,9 @@ type ctTail struct {
 	toVals    []parser.Expr
 	inVals    []parser.Expr
 	bDefault  bool
+	modulus   int64
+	remainder int64
+	isHash    bool
 
 	withKv    []string
 	inherits  []parser.ObjectName
@@ -872,6 +875,18 @@ func fillfactorFrom(kvs []string) int {
 	return 0
 }
 
+// eqFold is strings.EqualFold, exposed for grammar actions (the generated
+// parser does not import strings).
+func eqFold(a, b string) bool { return strings.EqualFold(a, b) }
+
+// opClassRef is a per-column operator class plus whether it carried an option
+// list. Legacy surfaces the option-carrying case separately, in
+// CreateIndexStmt.OpClassWithOptions.
+type opClassRef struct {
+	name        string
+	withOptions bool
+}
+
 // indexElem is one CREATE INDEX key column: either a NAME or an EXPRESSION,
 // plus its per-column ordering options. Legacy keeps Columns / ColExprs /
 // ColOrders as three PARALLEL slices, with Columns[i]=="" marking an
@@ -880,6 +895,10 @@ type indexElem struct {
 	name  string
 	expr  parser.Expr
 	order parser.IndexColOrder
+	// optsOpClass is the opclass NAME when it carried an option list
+	// (`int4_ops(foo=1)`). CreateIndexStmt records only the first such name,
+	// in OpClassWithOptions; the options themselves are discarded, as in legacy.
+	optsOpClass string
 }
 
 // newIndexElem classifies a parsed key item. Parsing every item as an a_expr
@@ -890,8 +909,11 @@ type indexElem struct {
 // name form) or, for the parenthesised expression form, as a CollateExpr that
 // a_expr already absorbed; legacy records both as ColOrders[i].Collation
 // rather than as a CollateExpr node, so the wrapper is unwrapped here.
-func newIndexElem(e parser.Expr, collation, opclass string, desc bool, nullsFirst *bool) indexElem {
-	el := indexElem{order: parser.IndexColOrder{Descending: desc, OpClass: opclass, Collation: collation}}
+func newIndexElem(e parser.Expr, collation string, opclass opClassRef, desc bool, nullsFirst *bool) indexElem {
+	el := indexElem{order: parser.IndexColOrder{Descending: desc, OpClass: opclass.name, Collation: collation}}
+	if opclass.withOptions {
+		el.optsOpClass = opclass.name
+	}
 	if ce, ok := e.(*parser.CollateExpr); ok {
 		el.order.Collation = ce.CollationName
 		e = ce.Operand
@@ -972,4 +994,9 @@ func mergeTxModes(acc, next *txModes) *txModes {
 type partBound struct {
 	from, to, inVals []parser.Expr
 	isDefault        bool
+	// modulus/remainder carry the HASH partition bound
+	// (`FOR VALUES WITH (modulus 4, remainder 0)`); PartitionOfClause keeps
+	// them as a third mutually exclusive shape alongside IN and FROM/TO.
+	modulus, remainder int64
+	isHash             bool
 }

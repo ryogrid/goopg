@@ -95,7 +95,9 @@
 %type <b>	opt_ONLY_kw opt_or_replace opt_with_data
 %type <node>	opt_COLUMN
 %type <node>	index_col_list index_col opt_index_nulls
-%type <str>	opt_index_opclass opt_index_collate
+%type <str>	opt_index_collate
+%type <node>	opt_index_opclass
+%type <ival>	opclass_opt_list opclass_opt
 %type <b>	opt_index_dir
 %type <ival>	opt_index_with
 %type <str>	opt_drop_behavior

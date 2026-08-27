@@ -162,6 +162,7 @@ create_table_stmt:
 				ct.PartitionBy = tail.partition
 				if tail.partOf.Name != "" {
 					ct.PartitionOf = parser.NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
+					parser.SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
 				}
 				ct.SelectSource = tail.asSelect
 				$$ = ct
@@ -193,6 +194,7 @@ create_table_stmt:
 				ct.PartitionBy = tail.partition
 				if tail.partOf.Name != "" {
 					ct.PartitionOf = parser.NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
+					parser.SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
 				}
 				ct.SelectSource = tail.asSelect
 				$$ = ct
@@ -206,6 +208,16 @@ part_bound_spec2:
 	| FOR VALUES FROM '(' expr_list ')' TO '(' expr_list ')'
 			{
 				$$ = &partBound{from: $5, to: $9}
+			}
+	/* MODULUS / REMAINDER are not kwlist keywords in this build, so they arrive
+	   as plain IDENTs; the action validates the spelling. */
+	| FOR VALUES WITH '(' IDENT ICONST ',' IDENT ICONST ')'
+			{
+				m, r := int64($6), int64($9)
+				if !eqFold($5, "modulus") || !eqFold($8, "remainder") {
+					lerr(yylex, "expected MODULUS m, REMAINDER r", yylex.(*lexerState).lastConsumedPos())
+				}
+				$$ = &partBound{modulus: m, remainder: r, isHash: true}
 			}
 	| DEFAULT
 			{
@@ -422,6 +434,7 @@ opt_ct_tail:
 				i.partOf = par
 				b := $4.(*partBound)
 				i.fromVals, i.toVals, i.inVals, i.bDefault = b.from, b.to, b.inVals, b.isDefault
+				i.modulus, i.remainder, i.isHash = b.modulus, b.remainder, b.isHash
 				$$ = i
 			}
 opt_ct_tail_noas:
@@ -451,6 +464,7 @@ opt_ct_tail_noas:
 				i.partOf = par
 				b := $4.(*partBound)
 				i.fromVals, i.toVals, i.inVals, i.bDefault = b.from, b.to, b.inVals, b.isDefault
+				i.modulus, i.remainder, i.isHash = b.modulus, b.remainder, b.isHash
 				$$ = i
 			}
 
@@ -488,12 +502,17 @@ create_index_stmt:
 				cols := make([]string, len(elems))
 				exprs := make([]parser.Expr, len(elems))
 				orders := make([]parser.IndexColOrder, len(elems))
+				withOpts := ""
 				for i, e := range elems {
 					cols[i], exprs[i], orders[i] = e.name, e.expr, e.order
+					if withOpts == "" {
+						withOpts = e.optsOpClass
+					}
 				}
 				ix := parser.NewCreateIndexStmt(0, $2, $5, $6, tbl, $10, cols)
 				ix.ColExprs = exprs
 				ix.ColOrders = orders
+				ix.OpClassWithOptions = withOpts
 				ix.Concurrently = $4
 				ix.OnOnly = $8
 				ix.IncludeColumns = $14
@@ -539,11 +558,11 @@ index_col_list:
 index_col:
 		name_or_call opt_index_collate opt_index_opclass opt_index_dir opt_index_nulls
 			{
-				$$ = newIndexElem($1, $2, $3, $4, $5.(*bool))
+				$$ = newIndexElem($1, $2, $3.(opClassRef), $4, $5.(*bool))
 			}
 	| '(' a_expr ')' opt_index_collate opt_index_opclass opt_index_dir opt_index_nulls
 			{
-				$$ = newIndexElem($2, $4, $5, $6, $7.(*bool))
+				$$ = newIndexElem($2, $4, $5.(opClassRef), $6, $7.(*bool))
 			}
 
 /* COLLATE is handled here, not via `a_expr COLLATE ColId`: legacy records a
@@ -560,8 +579,19 @@ opt_index_collate:
    which are exactly the tokens that continue a function-call key
    (`f() FILTER (...)`, `f() WITHIN GROUP (...)`) — 4 shift/reduce conflicts. */
 opt_index_opclass:
-		/* empty */   { $$ = "" }
-	| IDENT           { $$ = $1 }
+		/* empty */                        { $$ = opClassRef{} }
+	| IDENT                                { $$ = opClassRef{name: $1} }
+	/* `int4_ops(foo=1)` — the option list is accepted and discarded; legacy
+	   records only that the opclass HAD options, in OpClassWithOptions. */
+	| IDENT '(' opclass_opt_list ')'       { $$ = opClassRef{name: $1, withOptions: true} }
+
+opclass_opt_list:
+		opclass_opt                        { $$ = 0 }
+	| opclass_opt_list ',' opclass_opt     { $$ = 0 }
+
+opclass_opt:
+		ColId '=' set_value_atom           { $$ = 0 }
+	| ColId                                { $$ = 0 }
 
 opt_index_dir:
 		/* empty */   { $$ = false }

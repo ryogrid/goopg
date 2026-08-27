@@ -511,8 +511,17 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   for the bare keyword and the literal `'default'` alike, so the distinction is
   made on the token KIND in `sessionAuthzStmt`. Legacy itself rejects
   `SET LOCAL AUTHORIZATION`.
+- [x] **DONE 2026-08-27 — hash partition bounds** (`FOR VALUES WITH (modulus m,
+  remainder r)`) and **opclass option lists** (`int4_ops(foo=1)`).
+- [ ] **`EXCLUDE USING btree (c WITH =)` constraints (~13)** — a table
+  constraint kind not ported at all.
 - [ ] Smaller: `COPY ... (subquery)` forms, `CREATE TABLE ... (LIKE t ...)`,
   `GENERATED ... AS`, JSON constructors, `~`/`&`/`=>` operator spellings.
+
+**Progress on the must-pass regress fragment count: 222 -> 188 -> (this batch).**
+Roughly 33 of the remainder are the regress files' DELIBERATE syntax errors,
+where erroring is correct and only the message text differs — those will never
+be fixed by adding grammar.
 
 Note a chunk of the 222 are regress cases' DELIBERATE syntax errors (e.g.
 `select distinct from pg_database;`), where erroring is correct and only the

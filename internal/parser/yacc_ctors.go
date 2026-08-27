@@ -460,3 +460,12 @@ func NewDefaultMarker(pos int) *DefaultMarker { return &DefaultMarker{pos: pos} 
 
 // NewRowExpr builds a row constructor `(a, b, ...)` (gram.y's implicit_row).
 func NewRowExpr(pos int, elems []Expr) *RowExpr { return &RowExpr{pos: pos, Elems: elems} }
+
+// SetPartitionOfHashBound applies a HASH partition bound
+// (`FOR VALUES WITH (modulus m, remainder r)`) to an already-built clause.
+func SetPartitionOfHashBound(c *PartitionOfClause, modulus, remainder int64, isHash bool) {
+	if !isHash {
+		return
+	}
+	c.Modulus, c.Remainder, c.IsHash = modulus, remainder, true
+}
