@@ -5033,7 +5033,7 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				}
 			}
 		default:
-			return p.resolveColumnNotNull(col, nnOccurrences)
+			return resolveColumnNotNull(col, nnOccurrences)
 		}
 	}
 }
@@ -5060,7 +5060,7 @@ type colNotNullOccurrence struct {
 // INHERIT raises the *plural* "conflicting NO INHERIT declarations for
 // not-null constraints on column %q" (E2, 42601); an unnamed first
 // constraint adopts a later explicit name. M0134-0005k.
-func (p *parser) resolveColumnNotNull(col *ColumnDef, occurrences []colNotNullOccurrence) error {
+func resolveColumnNotNull(col *ColumnDef, occurrences []colNotNullOccurrence) error {
 	if len(occurrences) == 0 {
 		return nil
 	}

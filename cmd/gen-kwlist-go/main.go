@@ -5,7 +5,7 @@
 //
 //	text, terminal name, category, label kind)
 //
-// Output: internal/sqlparser/keywords_gen.go
+// Output: internal/parser/keywords_gen.go
 //
 // The generated table deliberately stores the TERMINAL NAME as a string, not
 // its numeric value: token numbers are assigned by goyacc when the grammar
@@ -40,7 +40,7 @@ type row struct {
 func main() {
 	kwlist := flag.String("kwlist", "postgres/src/include/parser/kwlist.h",
 		"path to the read-only oracle kwlist.h")
-	out := flag.String("out", "internal/sqlparser/keywords_gen.go",
+	out := flag.String("out", "internal/parser/keywords_gen.go",
 		"output Go file path")
 	tokensOut := flag.String("tokens-out", "",
 		"optional path for a goyacc %token <str> declaration block (grammar/tokens_gen.y)")
@@ -87,17 +87,17 @@ func main() {
 // postgres/src/include/parser/kwlist.h — see docs/design/not_ralph/.
 // Regenerate: go run ./cmd/gen-kwlist-go
 
-package sqlparser
+package parser
 
-// KeywordCategory mirrors kwlist.h's four category codes. Categories are
+// KwCategory mirrors kwlist.h's four category codes. Categories are
 // GRAMMATICAL metadata (upstream encodes them via the five list-nonterminals
 // unreserved_keyword / col_name_keyword / type_func_name_keyword /
 // reserved_keyword / bare_label_keyword); the lexer itself returns the
 // keyword token regardless of category.
-type KeywordCategory uint8
+type KwCategory uint8
 
 const (
-	CatUnreserved   KeywordCategory = iota // UNRESERVED_KEYWORD
+	CatUnreserved   KwCategory = iota // UNRESERVED_KEYWORD
 	CatColName                             // COL_NAME_KEYWORD
 	CatTypeFuncName                        // TYPE_FUNC_NAME_KEYWORD
 	CatReserved                            // RESERVED_KEYWORD
@@ -119,7 +119,7 @@ const (
 type keywordDef struct {
 	Text     string
 	Token    string
-	Category KeywordCategory
+	Category KwCategory
 	Label    KeywordLabel
 }
 

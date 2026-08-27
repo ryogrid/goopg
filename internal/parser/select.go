@@ -4478,6 +4478,18 @@ func (p *parser) buildSubstringSimilar(str, pattern, escape Expr, pos int) (Expr
 	if strNull || patNull || escNull {
 		return &NullConst{pos: pos}, nil
 	}
+	return foldSubstringSimilar(str, patVal, escVal, pos)
+}
+
+// foldSubstringSimilar is the half of buildSubstringSimilar that runs once the
+// three operands are known to be non-NULL literals: validate the escape,
+// convert the SQL:1999 pattern, fold to a 2-arg substring(). It is a free
+// function because the goyacc grammar needs the same behaviour and cannot
+// reach a *parser — and its own copy had quietly dropped BOTH SQLSTATEs
+// (22025 with its HINT, and 2200C) plus the Pos: -1 convention, so the same
+// input produced a 42601 there. Pos is -1 because the fold has no token to
+// point at; that matches buildSimilarTo.
+func foldSubstringSimilar(str Expr, patVal, escVal string, pos int) (Expr, error) {
 	if err := similarto.ValidateEscape(escVal); err != nil {
 		return nil, &SyntaxError{
 			Pos: -1, Raw: true, Code: "22025",

@@ -8,7 +8,7 @@
 // validated against the full upstream gram.y (0 conflicts, 6,501 states;
 // docs/design/not_ralph/02-grammar-porting-guide.md §1). Bump deliberately,
 // rerun the conflict-gate check, and update the pinned-version note in
-// internal/sqlparser's gen-parser target when you do.
+// internal/parser's gen-parser target when you do.
 package tools
 
 import (

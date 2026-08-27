@@ -19,17 +19,17 @@ create_table_stmt:
 		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' opt_table_element_list ')' ct_tail_list opt_tablespace
 			{
 				elems := $7.([]*tableElem)
-				var cols []parser.ColumnDef
+				var cols []ColumnDef
 				var pk []string
 				var uqs [][]string
 				var uqIncludes [][]string
 				var uqNullsNotDistinct, uqDeferrable, uqInitiallyDeferred []bool
-				var named []parser.TableConstraintDef
-				var exclusions []parser.TableConstraintDef
-				var likes []parser.ObjectName
+				var named []TableConstraintDef
+				var exclusions []TableConstraintDef
+				var likes []ObjectName
 				var bodyOrder []string
-				var namedChecks []parser.PartitionCheckConstraint
-				var fks []parser.TableForeignKeyDef
+				var namedChecks []PartitionCheckConstraint
+				var fks []TableForeignKeyDef
 				var pkIncl []string
 				var pkDeferrable, pkInitiallyDeferred bool
 				var checks []string
@@ -41,7 +41,7 @@ create_table_stmt:
 					switch {
 					case e.col != nil:
 						c := e.col
-						cd := parser.NewColumnDef(c.name, parser.NewColumnType(c.schema, c.typ, c.args, c.isArray))
+						cd := NewColumnDefAt(c.namePos, c.typePos, c.name, NewColumnType(c.schema, c.typ, c.args, c.isArray))
 						cd.NotNull = c.notNull || c.primary
 						cd.NotNullExplicit = c.notNull
 						cd.Primary = c.primary
@@ -54,6 +54,7 @@ create_table_stmt:
 						cd.IdentityAlways = c.identityAlways
 						applyIdentityOpts(cd, c.identitySeq)
 						copyColConstraints(cd, c.collation, c.compression, c.nnName, c.uqName, c.checkName, c.nnNoInherit, c.checkNoInherit, c.checkNotEnforced, c.storage)
+						applyNotNullOccurrences(yylex, cd, c.nnOccur)
 						// The attrs attach to whichever constraint the column
 						// actually declared (legacy threads pointers to the
 						// specific flag pair).
@@ -135,7 +136,7 @@ create_table_stmt:
 							// list, where the NOT NULL is just an attribute of
 							// an existing column instead.
 							if !elemsDefineColumn(elems, e.notNull.col) {
-							ncd := parser.NewColumnDef(e.notNull.col, parser.NewColumnType("", "", nil, false))
+							ncd := NewColumnDef(e.notNull.col, NewColumnType("", "", nil, false))
 							// NotNullExplicit stays FALSE: legacy sets it only
 							// for a NOT NULL written on the column itself.
 							ncd.NotNull = true
@@ -162,7 +163,7 @@ create_table_stmt:
 								// CONSTRAINT c CHECK (...) -> TableNamedChecks,
 								// and legacy does NOT touch the anonymous
 								// parallel slices for it (ddl.go:4191-4238).
-								namedChecks = append(namedChecks, parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check, NoInherit: e.checkNoInh, NotEnforced: e.checkNotEnf})
+								namedChecks = append(namedChecks, PartitionCheckConstraint{Name: e.checkName, Expr: e.check, NoInherit: e.checkNoInh, NotEnforced: e.checkNotEnf})
 							} else {
 								checks = append(checks, e.check)
 								checkNoInherit = append(checkNoInherit, e.checkNoInh)
@@ -174,12 +175,8 @@ create_table_stmt:
 						}
 					}
 				}
-				nm := $5.parts
-	tbl := parser.ObjectName{Name: nm[len(nm)-1]}
-	if len(nm) > 1 {
-		tbl.Schema = nm[len(nm)-2]
-	}
- 	ct := parser.NewCreateTableStmt(0, tbl, cols, pk)
+				tbl := objectNameFromQn($5)
+ 	ct := NewCreateTableStmt(0, tbl, cols, pk)
 				ct.BodyOrder = bodyOrder
 				if pfx := $2.(*createPrefix); pfx != nil {
 					ct.Temporary = pfx.temporary
@@ -210,20 +207,12 @@ create_table_stmt:
 				ct.Tablespace = $10
 				ct.OnCommit = tail.onCommit
 				_ = tail
-				for _, kv := range tail.withKv {
-					if ct.With == nil {
-						ct.With = map[string]string{}
-					}
-					parts := splitKV(kv)
-					if len(parts) == 2 {
-						ct.With[parts[0]] = parts[1]
-					}
-				}
+				applyCtWith(ct, tail.withKv)
 				ct.Inherits = tail.inherits
 				ct.PartitionBy = tail.partition
 				if tail.partOf.Name != "" {
-					ct.PartitionOf = parser.NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
-					parser.SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
+					ct.PartitionOf = NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
+					SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
 					applyPartOfElems(ct.PartitionOf, tail.partOfElems)
 				}
 				ct.SelectSource = tail.asSelect
@@ -231,12 +220,8 @@ create_table_stmt:
 			}
 	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name ct_tail_list opt_tablespace
 			{
-				nm := $5.parts
-				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
-				if len(nm) > 1 {
-					tbl.Schema = nm[len(nm)-2]
-				}
-				ct := parser.NewCreateTableStmt(0, tbl, nil, nil)
+				tbl := objectNameFromQn($5)
+				ct := NewCreateTableStmt(0, tbl, nil, nil)
 				ct.IfNotExists = $4
 				if pfx := $2.(*createPrefix); pfx != nil {
 					ct.Temporary = pfx.temporary
@@ -245,23 +230,25 @@ create_table_stmt:
 				tail := $6
 				ct.Tablespace = $7
 				ct.OnCommit = tail.onCommit
-				for _, kv := range tail.withKv {
-					if ct.With == nil {
-						ct.With = map[string]string{}
-					}
-					parts := splitKV(kv)
-					if len(parts) == 2 {
-						ct.With[parts[0]] = parts[1]
-					}
-				}
+				applyCtWith(ct, tail.withKv)
 				ct.Inherits = tail.inherits
 				ct.PartitionBy = tail.partition
 				if tail.partOf.Name != "" {
-					ct.PartitionOf = parser.NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
-					parser.SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
+					ct.PartitionOf = NewPartitionOfClause(tail.partOf, tail.fromVals, tail.toVals, tail.inVals, tail.bDefault)
+					SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
 					applyPartOfElems(ct.PartitionOf, tail.partOfElems)
 				}
 				ct.SelectSource = tail.asSelect
+				/* This arm exists for the column-list-LESS spellings —
+				   PARTITION OF and the tails. A CREATE TABLE with NO column
+				   list and NO partition parent is not one of gram.y's three
+				   CreateStmt alternatives: `CREATE TABLE t` and
+				   `CREATE TABLE t WITH (fillfactor=70)` are syntax errors, and
+				   an empty ct_tail_list made them parse. ddl.go says
+				   "expected '(' ". */
+				if ct.PartitionOf == nil {
+					raiseErr(yylex, &SyntaxError{Pos: lastTokPos(yylex), Message: "expected '(' (got end of input)"})
+				}
 				$$ = ct
 			}
 
@@ -272,7 +259,7 @@ create_table_stmt:
 	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name ct_tail_list AS ctas_source opt_ctas_with_data
 			{
 				src := $8.(*ctasSrc)
-				ct := parser.NewCreateTableStmt(0, objectNameFromQn($5), nil, nil)
+				ct := NewCreateTableStmt(0, objectNameFromQn($5), nil, nil)
 				if pfx := $2.(*createPrefix); pfx != nil {
 					ct.Temporary = pfx.temporary
 					ct.Unlogged = pfx.unlogged
@@ -286,7 +273,7 @@ create_table_stmt:
 	   (gram.y :4020). The options are ColumnDefs with an EMPTY type. */
 	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name OF qualified_name opt_of_elements
 			{
-				ct := parser.NewCreateTableStmt(0, objectNameFromQn($5), nil, nil)
+				ct := NewCreateTableStmt(0, objectNameFromQn($5), nil, nil)
 				if pfx := $2.(*createPrefix); pfx != nil {
 					ct.Temporary = pfx.temporary
 					ct.Unlogged = pfx.unlogged
@@ -349,14 +336,14 @@ table_element_list:
 table_element:
 		ColId col_type_name col_constraints
 			{
-				cs := &colSpec{name: $1}
+				cs := &colSpec{name: $1, namePos: $<p>1, typePos: $<p>2}
 				tw := $2.(*typeWithArgs)
 				// cast_typename folds the array brackets INTO the name
 				// (castType.withArrays); ColumnType keeps them in a separate
 				// flag with the ELEMENT name, so they must be split back out.
 				// Detecting the suffix without stripping it left `text[]` as a
 				// type literally named "text[]" on 36 regress fragments.
-				ct := colTypeOf(tw)
+				ct := colTypeOf(yylex, tw)
 				cs.schema, cs.typ, cs.isArray = ct.Schema, ct.Name, ct.IsArray
 				cc := $3.(*colConstraints)
 				// The typmod lives on the TYPE carrier, not the constraint
@@ -382,6 +369,7 @@ table_element:
 				cs.collation, cs.compression = cc.collation, cc.compression
 				cs.nnNoInherit, cs.checkNoInherit = cc.nnNoInherit, cc.checkNoInherit
 				cs.checkNotEnforced, cs.storage = cc.checkNotEnforced, cc.storage
+				cs.nnOccur = cc.nnOccur
 				$$ = &tableElem{col: cs}
 			}
 	| PRIMARY KEY pk_cols opt_include opt_constr_attrs
@@ -414,13 +402,13 @@ table_element:
 	| EXCLUDE opt_using_method '(' exclude_elem_list ')' opt_include opt_exclude_where opt_constr_attrs
 			{
 				a, _ := $8.(*constrAttrs)
-				w, _ := $7.(parser.Expr) // opt_exclude_where boxes an untyped nil
+				w, _ := $7.(Expr) // opt_exclude_where boxes an untyped nil
 				$$ = &tableElem{exclusion: newExclusionConstraint("", $2, $4.([]excludeElem), $6, w, a)}
 			}
 	| CONSTRAINT ColId EXCLUDE opt_using_method '(' exclude_elem_list ')' opt_include opt_exclude_where opt_constr_attrs
 			{
 				a, _ := $10.(*constrAttrs)
-				w, _ := $9.(parser.Expr)
+				w, _ := $9.(Expr)
 				$$ = &tableElem{namedUq: newExclusionConstraint($2, $4, $6.([]excludeElem), $8, w, a)}
 			}
 	/* Table-level NOT NULL (PG 18's TableConstraint `NOT NULL columnname
@@ -448,7 +436,7 @@ table_element:
 	   (and drops it); a bare `CHECK (...) NOT VALID` is a syntax error there. */
 	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_match opt_fk_actions opt_constr_attrs
 			{
-				fk := &parser.TableForeignKeyDef{
+				fk := &TableForeignKeyDef{
 					Columns:         $4,
 					RefTable:        objectNameFromQn($7),
 					RefColumns:      $8,
@@ -465,7 +453,7 @@ table_element:
 			}
 	| CONSTRAINT ColId FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_match opt_fk_actions opt_constr_attrs
 			{
-				fk := &parser.TableForeignKeyDef{
+				fk := &TableForeignKeyDef{
 					Name:            $2,
 					Columns:         $6,
 					RefTable:        objectNameFromQn($9),
@@ -518,7 +506,7 @@ exclude_op:
 	| NOT_EQUALS      { $$ = "<>" }
 
 opt_exclude_where:
-		/* empty */        { $$ = (parser.Expr)(nil) }
+		/* empty */        { $$ = (Expr)(nil) }
 	| WHERE '(' a_expr ')' { $$ = $3 }
 
 pk_cols:
@@ -570,12 +558,8 @@ create_table_stmt_as:
 		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' colid_list ')' ct_tail_list AS ctas_source opt_ctas_with_data
 			{
 				src := $11.(*ctasSrc)
-				nm := $5.parts
-				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
-				if len(nm) > 1 {
-					tbl.Schema = nm[len(nm)-2]
-				}
-				ct := parser.NewCreateTableStmt(0, tbl, nil, nil)
+				tbl := objectNameFromQn($5)
+				ct := NewCreateTableStmt(0, tbl, nil, nil)
 				if pfx := $2.(*createPrefix); pfx != nil {
 					ct.Temporary = pfx.temporary
 					ct.Unlogged = pfx.unlogged
@@ -595,12 +579,12 @@ create_table_stmt_as:
 ctas_source:
 		select_bare
 			{
-				sel, _ := $1.(*parser.SelectStmt)
+				sel, _ := $1.(*SelectStmt)
 				$$ = &ctasSrc{sel: sel}
 			}
 	| EXECUTE ColId opt_execute_params
 			{
-				$$ = &ctasSrc{exec: parser.NewExecuteStmt($<p>1, $2, $3)}
+				$$ = &ctasSrc{exec: NewExecuteStmt($<p>1, $2, $3)}
 			}
 
 opt_execute_params:
@@ -679,14 +663,14 @@ of_element_list:
 	| of_element_list ',' of_element     { $$ = append($1, $3.(*tableElem)) }
 
 of_element:
-		of_col_opt        { cd := $1.(parser.ColumnDef); $$ = &tableElem{ofCol: &cd} }
+		of_col_opt        { cd := $1.(ColumnDef); $$ = &tableElem{ofCol: &cd} }
 	| table_element       { $$ = $1 }
 
 of_col_opt:
 		ColId WITH OPTIONS col_constraints
 			{
 				cc := $4.(*colConstraints)
-				cd := parser.NewColumnDef($1, parser.NewColumnType("", "", nil, false))
+				cd := NewColumnDef($1, NewColumnType("", "", nil, false))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull
 				cd.DefaultExpr = cc.defExpr
@@ -703,12 +687,6 @@ opt_tablespace:
 		/* empty */         { $$ = "" }
 	| TABLESPACE ColId      { $$ = $2 }
 
-/* NULLS [NOT] DISTINCT on a unique index — gram.y opt_unique_null_treatment. */
-opt_idx_nnd:
-		/* empty */               { $$ = false }
-	| NULLS_P DISTINCT            { $$ = false }
-	| NULLS_P NOT DISTINCT        { $$ = true }
-
 opt_idx_tablespace:
 		/* empty */         { $$ = "" }
 	| TABLESPACE ColId      { $$ = $2 }
@@ -716,7 +694,7 @@ opt_idx_tablespace:
 drop_table_stmt:
 		DROP TABLE opt_if_exists_drop drop_name_list opt_drop_behavior
 			{
-				$$ = parser.NewDropTableStmt(0, $3, $4, dropBehavior($5))
+				$$ = NewDropTableStmt(0, $3, $4, dropBehavior($5))
 			}
 
 opt_if_exists_drop:
@@ -724,7 +702,7 @@ opt_if_exists_drop:
 	| IF_P EXISTS     { $$ = true }
 
 drop_name_list:
-		qualified_name                         { $$ = []parser.ObjectName{objectNameFromQn($1)} }
+		qualified_name                         { $$ = []ObjectName{objectNameFromQn($1)} }
 	| drop_name_list ',' qualified_name        { $$ = append($1, objectNameFromQn($3)) }
 
 opt_drop_behavior:
@@ -736,7 +714,7 @@ truncate_stmt:
 		TRUNCATE opt_TRUNCATE_kw trunc_name_list opt_restart opt_drop_behavior
 			{
 				tt := $3.(*truncTargets)
-				$$ = parser.NewTruncateStmt(0, tt.names, tt.only, dropBehavior($5), $4)
+				$$ = NewTruncateStmt(0, tt.names, tt.only, dropBehavior($5), $4)
 			}
 
 /* TRUNCATE's relation list is NOT drop_name_list: each entry carries its own
@@ -758,18 +736,18 @@ trunc_name_list:
 trunc_name:
 		qualified_name
 			{
-				$$ = &truncTargets{names: []parser.ObjectName{objectNameFromQn($1)}, only: []bool{false}}
+				$$ = &truncTargets{names: []ObjectName{objectNameFromQn($1)}, only: []bool{false}}
 			}
 	| ONLY qualified_name
 			{
-				$$ = &truncTargets{names: []parser.ObjectName{objectNameFromQn($2)}, only: []bool{true}}
+				$$ = &truncTargets{names: []ObjectName{objectNameFromQn($2)}, only: []bool{true}}
 			}
 
 /* A partition may itself be partitioned: `... PARTITION OF p FOR VALUES ...
    PARTITION BY RANGE (c)`. gram.y hangs OptPartitionSpec off the same
    CreateStmt as the bound, and ctTail already carries both fields. */
 opt_subpartition_by:
-		/* empty */   { $$ = (*parser.PartitionByClause)(nil) }
+		/* empty */   { $$ = (*PartitionByClause)(nil) }
 	| PARTITION BY ColId '(' part_elem_list ')'
 			{ $$ = partitionByFrom($3, $<p>3, $5.([]partKey)) }
 
@@ -877,11 +855,7 @@ ct_tail_item:
 			}
 	| PARTITION OF qualified_name part_bound_spec2
 			{
-				nm := $3.parts
-				par := parser.ObjectName{Name: nm[len(nm)-1]}
-				if len(nm) > 1 {
-					par.Schema = nm[len(nm)-2]
-				}
+				par := objectNameFromQn($3)
 				i := &ctTail{}
 				i.partOf = par
 				b := $4.(*partBound)
@@ -913,7 +887,7 @@ str_pair_list:
 str_pair:
 		ColId '=' with_value               { $$ = $1 + "=" + $3 }
 	| ColId '.' ColId '=' with_value       { $$ = $1 + "." + $3 + "=" + $5 }   /* toast.autovacuum_enabled = off */
-	| ColId                                { $$ = $1 }                           /* WITH (security_barrier) */
+	| ColId                                { $$ = $1 }                           /* WITH (security_barrier); RESET (n_distinct) */
 
 with_value:
 		SCONST   { $$ = $1 }
@@ -926,26 +900,24 @@ with_value:
 	| ON         { $$ = "on" }
 	| ColId      { $$ = $1 } /* covers off, heap, ... */
 	| '-' with_value { $$ = "-" + $2 } /* n_distinct = -0.5 */
-	/* An explicit plus sign is legal too (`autovacuum_vacuum_cost_delay = +5`)
-	   and legacy keeps it in the stored text. */
-	| '+' with_value { $$ = "+" + $2 }
+	/* An explicit plus sign is legal (`autovacuum_vacuum_cost_delay = +5`) but
+	   is NOT kept: ddl.go's reloption scanner records a sign only for '-', so
+	   the stored text is "5". Only '-' is meaningful downstream (the valid
+	   floor of log_autovacuum_min_duration is -1). */
+	| '+' with_value { $$ = $2 }
 
 /* create_index_stmt / drop_index_stmt — P4.4 (gram.y IndexStmt / DropStmt
    subsets). v0: plain column keys (expressions, DESC/NULLS, opclasses and
    CONCURRENTLY arrive later); ColOrders/ColExprs filled with per-column
    defaults for legacy dump parity. */
 create_index_stmt:
-		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON opt_ONLY_kw qualified_name opt_using_method '(' index_col_list ')' opt_include opt_idx_nnd opt_index_with opt_idx_tablespace opt_index_where
+		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON opt_ONLY_kw qualified_name opt_using_method '(' index_col_list ')' opt_include idx_tail_list opt_index_where
 			{
-				nm := $9.parts
-				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
-				if len(nm) > 1 {
-					tbl.Schema = nm[len(nm)-2]
-				}
+				tbl := objectNameFromQn($9)
 				elems := $12.([]indexElem)
 				cols := make([]string, len(elems))
-				exprs := make([]parser.Expr, len(elems))
-				orders := make([]parser.IndexColOrder, len(elems))
+				exprs := make([]Expr, len(elems))
+				orders := make([]IndexColOrder, len(elems))
 				withOpts := ""
 				for i, e := range elems {
 					cols[i], exprs[i], orders[i] = e.name, e.expr, e.order
@@ -953,17 +925,18 @@ create_index_stmt:
 						withOpts = e.optsOpClass
 					}
 				}
-				ix := parser.NewCreateIndexStmt(0, $2, $5, $6, tbl, $10, cols)
+				ix := NewCreateIndexStmt(0, $2, $5, $6, tbl, $10, cols)
 				ix.ColExprs = exprs
 				ix.ColOrders = orders
 				ix.OpClassWithOptions = withOpts
 				ix.Concurrently = $4
 				ix.OnOnly = $8
 				ix.IncludeColumns = $14
-				ix.NullsNotDistinct = $15
-				applyIndexOpts(ix, $16)
-				ix.Tablespace = $17
-				if p, _ := $18.(parser.Expr); p != nil {
+				tl := $15.(*idxTail)
+				ix.NullsNotDistinct = tl.nnd
+				applyIndexOpts(ix, tl.opts)
+				ix.Tablespace = tl.tablespace
+				if p, _ := $16.(Expr); p != nil {
 					ix.HasPredicate = true
 					ix.Predicate = p
 				}
@@ -979,6 +952,21 @@ opt_index_with:
 		/* empty */                   { $$ = (*indexOpts)(nil) }
 	| WITH '(' str_pair_list ')'      { $$ = indexOptsFrom($3) }
 
+/* The three tail clauses in ANY ORDER, not the fixed sequence gram.y spells
+   out. ddl.go scans them in a loop, so it accepts
+   `WITH (...) NULLS NOT DISTINCT` — which upstream's fixed order does not —
+   and goopg's own index-recovery DDL is written that way. A flat repeatable
+   list matches the scanner and costs no conflict. */
+idx_tail_list:
+		/* empty */                       { $$ = &idxTail{} }
+	| idx_tail_list idx_tail_item         { $$ = mergeIdxTail($1.(*idxTail), $2.(*idxTail)) }
+
+idx_tail_item:
+		NULLS_P DISTINCT                  { $$ = &idxTail{} }
+	| NULLS_P NOT DISTINCT                { $$ = &idxTail{nnd: true} }
+	| WITH '(' str_pair_list ')'          { $$ = &idxTail{opts: indexOptsFrom($3)} }
+	| TABLESPACE ColId                    { $$ = &idxTail{tablespace: $2} }
+
 /* opt_index_name — `CREATE INDEX ON t (a)` lets the server pick the name. ON
    is reserved and therefore never a ColId, so the empty case is unambiguous. */
 opt_index_name:
@@ -986,7 +974,7 @@ opt_index_name:
 	| ColId                { $$ = $1 }
 
 opt_index_where:
-		/* empty */        { $$ = (parser.Expr)(nil) }
+		/* empty */        { $$ = (Expr)(nil) }
 	| WHERE a_expr         { $$ = $2 }
 
 opt_unique:
@@ -1059,7 +1047,7 @@ opt_index_nulls:
 drop_index_stmt:
 		DROP INDEX opt_concurrently opt_drop_if_exists drop_name_list opt_drop_behavior
 			{
-				$$ = parser.NewDropIndexStmt(0, $3, $4, $5, dropBehavior($6))
+				$$ = NewDropIndexStmt(0, $3, $4, $5, dropBehavior($6))
 			}
 
 opt_drop_if_exists:
@@ -1074,14 +1062,14 @@ tx_begin:
 		BEGIN_P opt_transaction begin_pos opt_tx_modes
 			{
 				m := $4.(*txModes)
-				b := parser.NewBeginStmt($3)
+				b := NewBeginStmt($3)
 				b.IsolationLevel, b.ReadOnly, b.Deferrable = m.iso, m.ro, m.def
 				$$ = b
 			}
 	| START TRANSACTION begin_pos opt_tx_modes
 			{
 				m := $4.(*txModes)
-				b := parser.NewBeginStmt($3)
+				b := NewBeginStmt($3)
 				b.IsolationLevel, b.ReadOnly, b.Deferrable = m.iso, m.ro, m.def
 				$$ = b
 			}
@@ -1114,16 +1102,16 @@ iso_level:
 	| READ UNCOMMITTED                  { $$ = "read uncommitted" }
 
 tx_commit:
-		COMMIT opt_transaction  { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| END_P opt_transaction     { $$ = parser.NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| COMMIT PREPARED SCONST    { $$ = parser.NewCommitPreparedStmt(yylex.(*lexerState).lastConsumedPos(), $3) }
+		COMMIT opt_transaction  { $$ = NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| END_P opt_transaction     { $$ = NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| COMMIT PREPARED SCONST    { $$ = NewCommitPreparedStmt(yylex.(*lexerState).lastConsumedPos(), $3) }
 
 tx_rollback:
-		ROLLBACK opt_transaction { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| ABORT_P opt_transaction    { $$ = parser.NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| ROLLBACK PREPARED SCONST   { $$ = parser.NewRollbackPreparedStmt(yylex.(*lexerState).lastConsumedPos(), $3) }
+		ROLLBACK opt_transaction { $$ = NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| ABORT_P opt_transaction    { $$ = NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
+	| ROLLBACK PREPARED SCONST   { $$ = NewRollbackPreparedStmt(yylex.(*lexerState).lastConsumedPos(), $3) }
 	| ROLLBACK opt_transaction TO opt_savepoint_kw ColId
-			{ $$ = parser.NewRollbackToSavepointStmt(yylex.(*lexerState).lastConsumedPos(), $5) }
+			{ $$ = NewRollbackToSavepointStmt(yylex.(*lexerState).lastConsumedPos(), $5) }
 
 /* opt_transaction — gram.y's `opt_transaction: WORK | TRANSACTION | empty`.
    TRANSACTION used to be a tx_mode instead, which made `BEGIN TRANSACTION
@@ -1152,9 +1140,9 @@ set_stmt:
 	   LAST component, matching parseQualifiedConstraintName (parser.go:3028),
 	   which overwrites rather than appends. */
 		SET CONSTRAINTS ALL constraints_set_mode
-			{ $$ = parser.NewSetConstraintsStmt(0, true, nil, $4) }
+			{ $$ = NewSetConstraintsStmt(0, true, nil, $4) }
 	| SET CONSTRAINTS constr_name_list constraints_set_mode
-			{ $$ = parser.NewSetConstraintsStmt(0, false, $3, $4) }
+			{ $$ = NewSetConstraintsStmt(0, false, $3, $4) }
 	| SET set_scope set_guc_name set_eq_to set_value_list
 			{
 				// One alternative, not two: `SET x = DEFAULT` differs from
@@ -1163,7 +1151,7 @@ set_stmt:
 				// against the permissive value list below. setValueIsDefault
 				// inspects the token instead.
 				l := yylex.(*lexerState)
-				$$ = parser.NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
+				$$ = NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
 			}
 
 	/* SET [SESSION|LOCAL] AUTHORIZATION name|DEFAULT. SESSION is consumed by
@@ -1231,7 +1219,7 @@ set_transaction_stmt:
 		SET set_scope TRANSACTION tx_mode_list
 			{
 				m := $4.(*txModes)
-				$$ = parser.NewSetTransactionStmt(0, m.iso, $2)
+				$$ = NewSetTransactionStmt(0, m.iso, $2)
 			}
 
 set_scope:
@@ -1244,19 +1232,19 @@ set_eq_to:
 	| TO              { $$ = "to" }
 
 show_stmt:
-		SHOW ALL       { $$ = parser.NewShowStmt(0, true, "") }
-	| SHOW set_guc_name { $$ = parser.NewShowStmt(0, false, $2) }
-	| SHOW TIME ZONE   { $$ = parser.NewShowStmt(0, false, "timezone") }
+		SHOW ALL       { $$ = NewShowStmt(0, true, "") }
+	| SHOW set_guc_name { $$ = NewShowStmt(0, false, $2) }
+	| SHOW TIME ZONE   { $$ = NewShowStmt(0, false, "timezone") }
 
 reset_stmt:
-		RESET ALL      { $$ = parser.NewResetStmt(0, true, "") }
-	| RESET set_guc_name { $$ = parser.NewResetStmt(0, false, $2) }
-	| RESET TIME ZONE    { $$ = parser.NewResetStmt(0, false, "timezone") }
+		RESET ALL      { $$ = NewResetStmt(0, true, "") }
+	| RESET set_guc_name { $$ = NewResetStmt(0, false, $2) }
+	| RESET TIME ZONE    { $$ = NewResetStmt(0, false, "timezone") }
 	/* RESET SESSION AUTHORIZATION — gram.y's dedicated VariableResetStmt
 	   alternative. AUTHORIZATION is a reserved keyword, so `RESET ColId`
 	   cannot reach it; legacy normalises the pair to the GUC's real name. */
 	| RESET SESSION AUTHORIZATION
-			{ $$ = parser.NewResetStmt(0, false, "session_authorization") }
+			{ $$ = NewResetStmt(0, false, "session_authorization") }
 
 /* alter_table_stmt — P4.2 v0 (gram.y AlterTableStmt subset): single action
    of ADD COLUMN / ADD PRIMARY KEY / DROP COLUMN / ALTER COLUMN TYPE /
@@ -1265,8 +1253,8 @@ reset_stmt:
 alter_table_stmt:
 		ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star alter_action_list
 			{
-				acts := $7.([]parser.AlterTableAction)
-				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				acts := $7.([]AlterTableAction)
+				st := NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
 				st.Actions = acts
@@ -1276,7 +1264,7 @@ alter_table_stmt:
 	   statement-level flag, with no action and no trigger name. */
 	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star trigger_toggle
 			{
-				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st := NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
 				st.EnableDisableTrigger = true
@@ -1284,7 +1272,7 @@ alter_table_stmt:
 			}
 	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star OWNER TO ColId
 			{
-				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st := NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
 				st.OwnerTo = $9
@@ -1292,7 +1280,7 @@ alter_table_stmt:
 			}
 	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star SET SCHEMA ColId
 			{
-				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st := NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
 				st.SetSchema = $9
@@ -1300,23 +1288,23 @@ alter_table_stmt:
 			}
 	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star SET LOGGED
 			{
-				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st := NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.SetLogged = "logged"
 				$$ = st
 			}
 	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star SET UNLOGGED
 			{
-				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st := NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.SetLogged = "unlogged"
 				$$ = st
 			}
 	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star SET '(' str_pair_list ')'
 			{
-				st := parser.NewAlterTableStmt(0, objectNameFromQn($5))
+				st := NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
-				a := parser.NewATAction(parser.AlterTableSetReloptions)
+				a := NewATActionAt(AlterTableSetReloptions, $<p>7)
 				m := map[string]string{}
 				for _, kv := range $9 {
 					parts := splitKV(kv)
@@ -1325,18 +1313,18 @@ alter_table_stmt:
 					}
 				}
 				a.With = m
-				st.Actions = []parser.AlterTableAction{*a}
+				st.Actions = []AlterTableAction{*a}
 				$$ = st
 			}
 
 alter_action_list:
 		alter_table_action
 			{
-				$$ = []parser.AlterTableAction{*($1.(*parser.AlterTableAction))}
+				$$ = []AlterTableAction{*($1.(*AlterTableAction))}
 			}
 	| alter_action_list ',' alter_table_action
 			{
-				$$ = append($$.([]parser.AlterTableAction), *($3.(*parser.AlterTableAction)))
+				$$ = append($$.([]AlterTableAction), *($3.(*AlterTableAction)))
 			}
 
 opt_ONLY_kw:
@@ -1353,7 +1341,7 @@ alter_table_action:
 			{
 				cc := $4.(*colConstraints)
 				ct := $3.(*typeWithArgs)
-				cd := parser.NewColumnDef($2, colTypeOf(ct))
+				cd := NewColumnDefAt($<p>2, $<p>3, $2, colTypeOf(yylex, ct))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
@@ -1374,7 +1362,8 @@ alter_table_action:
 				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
 				applyIdentityOpts(cd, cc.identitySeq)
 				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit, cc.checkNotEnforced, cc.storage)
-				a := parser.NewATAction(parser.AlterTableAddColumn)
+				applyNotNullOccurrences(yylex, cd, cc.nnOccur)
+				a := NewATActionAt(AlterTableAddColumn, $<p>2)
 				a.Column = *cd
 				$$ = a
 			}
@@ -1388,7 +1377,7 @@ alter_table_action:
 			{
 				cc := $5.(*colConstraints)
 				ct := $4.(*typeWithArgs)
-				cd := parser.NewColumnDef($3, colTypeOf(ct))
+				cd := NewColumnDefAt($<p>3, $<p>4, $3, colTypeOf(yylex, ct))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
@@ -1409,7 +1398,8 @@ alter_table_action:
 				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
 				applyIdentityOpts(cd, cc.identitySeq)
 				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit, cc.checkNotEnforced, cc.storage)
-				a := parser.NewATAction(parser.AlterTableAddColumn)
+				applyNotNullOccurrences(yylex, cd, cc.nnOccur)
+				a := NewATActionAt(AlterTableAddColumn, $<p>2)
 				a.Column = *cd
 				$$ = a
 			}
@@ -1423,7 +1413,7 @@ alter_table_action:
 			{
 				cc := $7.(*colConstraints)
 				ct := $6.(*typeWithArgs)
-				cd := parser.NewColumnDef($5, colTypeOf(ct))
+				cd := NewColumnDefAt($<p>5, $<p>6, $5, colTypeOf(yylex, ct))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
@@ -1444,7 +1434,8 @@ alter_table_action:
 				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
 				applyIdentityOpts(cd, cc.identitySeq)
 				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit, cc.checkNotEnforced, cc.storage)
-				a := parser.NewATAction(parser.AlterTableAddColumn)
+				applyNotNullOccurrences(yylex, cd, cc.nnOccur)
+				a := NewATActionAt(AlterTableAddColumn, $<p>2)
 				a.IfExists = true
 				a.Column = *cd
 				$$ = a
@@ -1459,7 +1450,7 @@ alter_table_action:
 			{
 				cc := $8.(*colConstraints)
 				ct := $7.(*typeWithArgs)
-				cd := parser.NewColumnDef($6, colTypeOf(ct))
+				cd := NewColumnDefAt($<p>6, $<p>7, $6, colTypeOf(yylex, ct))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
@@ -1480,7 +1471,8 @@ alter_table_action:
 				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
 				applyIdentityOpts(cd, cc.identitySeq)
 				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit, cc.checkNotEnforced, cc.storage)
-				a := parser.NewATAction(parser.AlterTableAddColumn)
+				applyNotNullOccurrences(yylex, cd, cc.nnOccur)
+				a := NewATActionAt(AlterTableAddColumn, $<p>2)
 				a.IfExists = true
 				a.Column = *cd
 				$$ = a
@@ -1491,23 +1483,26 @@ alter_table_action:
 	   kind. Spelled as two ADD alternatives rather than an optional name so no
 	   EMPTY nonterminal has to reduce right after ADD, which would collide
 	   with the column form's own leading ColId. */
+	/* ddl.go anchors an ADD-constraint action at the token right AFTER ADD —
+	   the constraint keyword, or CONSTRAINT for the named spelling — so the
+	   position is stamped here, where that token is on the stack. */
 	| ADD_P at_constraint
-			{ $$ = $2 }
+			{ $$ = atActionAt($2, $<p>2) }
 	| ADD_P CONSTRAINT ColId at_constraint
 			{
-				a := $4.(*parser.AlterTableAction)
+				a := atActionAt($4, $<p>2)
 				a.ConstraintName = $3
 				$$ = a
 			}
 	| DROP opt_COLUMN ColId opt_drop_behavior
 			{
-				a := parser.NewATAction(parser.AlterTableDropColumn)
+				a := NewATActionAt(AlterTableDropColumn, $<p>3)
 				a.ColumnName = $3 // CASCADE / RESTRICT: parsed and dropped, as legacy
 				$$ = a
 			}
 	| DROP opt_COLUMN IF_P EXISTS ColId opt_drop_behavior
 			{
-				a := parser.NewATAction(parser.AlterTableDropColumn)
+				a := NewATActionAt(AlterTableDropColumn, $<p>5)
 				a.ColumnName = $5
 				a.IfExists = true
 				$$ = a
@@ -1515,15 +1510,15 @@ alter_table_action:
 	| ALTER opt_COLUMN ColId TYPE_P col_type_name opt_at_using
 			{
 				ct := $5.(*typeWithArgs)
-				a := parser.NewATAction(parser.AlterTableAlterColumnType)
+				a := NewATActionAt(AlterTableAlterColumnType, $<p>3)
 				a.ColumnName = $3
-				a.NewType = colTypeOf(ct)
-				a.UsingExpr, _ = $6.(parser.Expr)
+				a.NewType = colTypeOf(yylex, ct)
+				a.UsingExpr, _ = $6.(Expr)
 				$$ = a
 			}
 	| RENAME TO ColId
 			{
-				a := parser.NewATAction(parser.AlterTableRenameTable)
+				a := NewATActionAt(AlterTableRenameTable, $<p>3)
 				a.NewName = $3
 				$$ = a
 			}
@@ -1534,7 +1529,7 @@ alter_table_action:
 				// reads there (operators_ddl.go:10035), so this action used
 				// to drop nothing. Restrict defaults to TRUE and is cleared
 				// only by CASCADE (legacy ddl.go:9851-9862).
-				a := parser.NewATAction(parser.AlterTableDropConstraint)
+				a := NewATActionAt(AlterTableDropConstraint, $<p>4)
 				a.ConstraintName = $4
 				a.IfExists = $3
 				a.Restrict = $5 != "cascade"
@@ -1542,32 +1537,32 @@ alter_table_action:
 			}
 	| ALTER opt_COLUMN ColId SET DEFAULT a_expr
 			{
-				a := parser.NewATAction(parser.AlterTableSetDefault)
+				a := NewATAction(AlterTableSetDefault)
 				a.ColumnName = $3
 				a.DefaultExpr = $6
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId DROP DEFAULT
 			{
-				a := parser.NewATAction(parser.AlterTableDropDefault)
+				a := NewATAction(AlterTableDropDefault)
 				a.ColumnName = $3
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId SET NOT NULL_P
 			{
-				a := parser.NewATAction(parser.AlterTableSetNotNull)
+				a := NewATAction(AlterTableSetNotNull)
 				a.ColumnName = $3
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId DROP NOT NULL_P
 			{
-				a := parser.NewATAction(parser.AlterTableDropNotNull)
+				a := NewATAction(AlterTableDropNotNull)
 				a.ColumnName = $3
 				$$ = a
 			}
 	| RENAME opt_COLUMN ColId TO ColId
 			{
-				a := parser.NewATAction(parser.AlterTableRenameColumn)
+				a := NewATActionAt(AlterTableRenameColumn, $<p>3)
 				a.OldColumnName = $3
 				a.NewName = $5
 				$$ = a
@@ -1575,31 +1570,31 @@ alter_table_action:
 	| VALIDATE CONSTRAINT ColId
 			{
 				// ConstraintName, not OldConstraintName (legacy ddl.go:9960).
-				a := parser.NewATAction(parser.AlterTableValidateConstraint)
+				a := NewATActionAt(AlterTableValidateConstraint, $<p>3)
 				a.ConstraintName = $3
 				$$ = a
 			}
 	| REPLICA IDENTITY_P FULL
 			{
-				a := parser.NewATAction(parser.AlterTableReplicaIdentity)
+				a := NewATActionAt(AlterTableReplicaIdentity, $<p>1)
 				a.ReplicaIdentityMode = "f"
 				$$ = a
 			}
 	| REPLICA IDENTITY_P NOTHING
 			{
-				a := parser.NewATAction(parser.AlterTableReplicaIdentity)
+				a := NewATActionAt(AlterTableReplicaIdentity, $<p>1)
 				a.ReplicaIdentityMode = "n"
 				$$ = a
 			}
 	| REPLICA IDENTITY_P DEFAULT
 			{
-				a := parser.NewATAction(parser.AlterTableReplicaIdentity)
+				a := NewATActionAt(AlterTableReplicaIdentity, $<p>1)
 				a.ReplicaIdentityMode = "d"
 				$$ = a
 			}
 	| REPLICA IDENTITY_P USING INDEX ColId
 			{
-				a := parser.NewATAction(parser.AlterTableReplicaIdentity)
+				a := NewATActionAt(AlterTableReplicaIdentity, $<p>1)
 				a.ReplicaIdentityMode = "i"
 				a.ReplicaIdentityIndex = $5
 				$$ = a
@@ -1613,155 +1608,172 @@ alter_table_action:
 	   what legacy does with them. */
 	| ALTER opt_COLUMN ColId SET STATISTICS signed_iconst
 			{
-				a := parser.NewATAction(parser.AlterTableSetStatistics)
+				a := NewATAction(AlterTableSetStatistics)
 				a.ColumnName = $3
 				a.CheckExpr = atStatValue($6) // legacy stores the number as TEXT
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId SET STORAGE ColId
 			{
-				a := parser.NewATAction(parser.AlterTableSetStorage)
+				a := NewATAction(AlterTableSetStorage)
 				a.ColumnName, a.StorageType = $3, $6
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId SET COMPRESSION ColId
 			{
-				a := parser.NewATAction(parser.AlterTableSetCompression)
+				a := NewATAction(AlterTableSetCompression)
 				a.ColumnName, a.CompressionType = $3, $6
 				$$ = a
 			}
 	/* `SET COMPRESSION default` — legacy records an EMPTY method for it. */
 	| ALTER opt_COLUMN ColId SET COMPRESSION DEFAULT
 			{
-				a := parser.NewATAction(parser.AlterTableSetCompression)
+				a := NewATAction(AlterTableSetCompression)
 				a.ColumnName = $3
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId SET '(' str_pair_list ')'
 			{
-				a := parser.NewATAction(parser.AlterTableAlterColumnSet)
+				a := NewATAction(AlterTableAlterColumnSet)
 				a.ColumnName, a.SetOptions = $3, $6
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId RESET '(' str_pair_list ')'
 			{
-				a := parser.NewATAction(parser.AlterTableAlterColumnReset)
+				a := NewATAction(AlterTableAlterColumnReset)
 				a.ColumnName, a.SetOptions = $3, $6
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId DROP EXPRESSION opt_if_exists_drop
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	/* SET EXPRESSION / SET DATA TYPE / the identity-sequence tweaks are all
 	   NoOp in legacy — note SET DATA TYPE differs from plain TYPE, which does
 	   record AlterColumnType. Reproduced as legacy has it. */
 	| ALTER opt_COLUMN ColId SET EXPRESSION AS '(' a_expr ')'
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| ALTER opt_COLUMN ColId SET DATA_P TYPE_P col_type_name opt_at_using
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| ALTER opt_COLUMN ColId RESTART opt_restart_with
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| ALTER opt_COLUMN ColId SET identity_seq_opt
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| ALTER opt_COLUMN ColId SET GENERATED ALWAYS seq_tweaks
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| ALTER opt_COLUMN ColId SET GENERATED BY DEFAULT seq_tweaks
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| ALTER opt_COLUMN ColId DROP IDENTITY_P opt_if_exists_drop
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| ALTER opt_COLUMN ColId ADD_P GENERATED ALWAYS AS IDENTITY_P opt_identity_seq_opts
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| ALTER opt_COLUMN ColId ADD_P GENERATED BY DEFAULT AS IDENTITY_P opt_identity_seq_opts
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	/* ALTER CONSTRAINT name [NOT] DEFERRABLE [INITIALLY ...] — legacy records
 	   the three flags plus a marker that a deferrability clause was written. */
 	| ALTER CONSTRAINT ColId at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAlterConstraint)
+				a := NewATActionAt(AlterTableAlterConstraint, $<p>3)
 				a.ConstraintName = $3
-				$$ = applyAlterConstraint(a, mustATTail($4))
+				t := mustATTail($4)
+				/* gram.y:2672-2676 rejects CAS_NOT_VALID inside
+				   ConstraintAttributeSpec when the spec belongs to ALTER
+				   CONSTRAINT — a PARSE-time 0A000, not an executor check. */
+				if t.notValid {
+					raiseErr(yylex, &SyntaxError{
+						Pos: t.notValidPos, Raw: true, Code: "0A000",
+						Message: "constraints cannot be altered to be NOT VALID",
+					})
+				}
+				$$ = applyAlterConstraint(a, t)
 			}
-	/* Table-level SET / RESET / CLUSTER. RESET's option names are DROPPED by
-	   legacy at table level, though the per-column RESET above keeps them. */
+	/* Table-level SET / RESET / CLUSTER. RESET's option names ride in With,
+	   the same map SET fills — ddl.go:10051 builds both kinds through one
+	   `AlterTableAction{pos: pos, Kind: kind, With: opts}`. Dropping them
+	   made `RESET (parallel_workers)` a no-op that left the reloption in
+	   pg_class. */
 	| RESET '(' str_pair_list ')'
-			{ $$ = parser.NewATAction(parser.AlterTableResetReloptions) }
+			{
+				a := NewATActionAt(AlterTableResetReloptions, $<p>1)
+				a.With = strPairMap($3)
+				$$ = a
+			}
 	| SET ACCESS METHOD ColId
 			{
-				a := parser.NewATAction(parser.AlterTableSetAccessMethod)
+				a := NewATActionAt(AlterTableSetAccessMethod, $<p>1)
 				a.AccessMethodName = $4
 				$$ = a
 			}
 	| SET TABLESPACE ColId
 			{
-				a := parser.NewATAction(parser.AlterTableSetTablespace)
+				a := NewATActionAt(AlterTableSetTablespace, $<p>3)
 				a.TablespaceName = $3
 				$$ = a
 			}
 	| SET WITHOUT OIDS
-			{ $$ = parser.NewATAction(parser.AlterTableNoOp) }
+			{ $$ = NewATAction(AlterTableNoOp) }
 	| SET WITHOUT CLUSTER
-			{ $$ = parser.NewATAction(parser.AlterTableSetWithoutCluster) }
+			{ $$ = NewATActionAt(AlterTableSetWithoutCluster, $<p>1) }
 	| CLUSTER ON ColId
 			{
-				a := parser.NewATAction(parser.AlterTableClusterOn)
+				a := NewATActionAt(AlterTableClusterOn, $<p>1)
 				a.ClusterIndexName = $3
 				$$ = a
 			}
 	| RENAME CONSTRAINT ColId TO ColId
 			{
-				a := parser.NewATAction(parser.AlterTableRenameConstraint)
+				a := NewATActionAt(AlterTableRenameConstraint, $<p>3)
 				a.OldConstraintName, a.NewName = $3, $5
 				$$ = a
 			}
 	| INHERIT qualified_name
 			{
-				a := parser.NewATAction(parser.AlterTableInherit)
+				a := NewATAction(AlterTableInherit)
 				a.InheritParent = objectNameFromQn($2)
 				$$ = a
 			}
 	| NO INHERIT qualified_name
 			{
-				a := parser.NewATAction(parser.AlterTableNoInherit)
+				a := NewATAction(AlterTableNoInherit)
 				a.InheritParent = objectNameFromQn($3)
 				$$ = a
 			}
 	| OF qualified_name
 			{
-				a := parser.NewATAction(parser.AlterTableAddOf)
+				a := NewATAction(AlterTableAddOf)
 				a.OfType = objectNameFromQn($2)
 				$$ = a
 			}
 	| NOT OF
-			{ $$ = parser.NewATAction(parser.AlterTableDropOf) }
+			{ $$ = NewATAction(AlterTableDropOf) }
 	| ENABLE_P rule_state RULE ColId
 			{
-				a := parser.NewATAction(parser.AlterTableEnableDisableRule)
+				a := NewATAction(AlterTableEnableDisableRule)
 				a.RuleName, a.RuleEnabledState = $4, byte($2)
 				$$ = a
 			}
 	| DISABLE_P RULE ColId
 			{
-				a := parser.NewATAction(parser.AlterTableEnableDisableRule)
+				a := NewATAction(AlterTableEnableDisableRule)
 				a.RuleName, a.RuleEnabledState = $3, byte('D')
 				$$ = a
 			}
 	| ENABLE_P ROW LEVEL SECURITY
-			{ $$ = parser.NewATAction(parser.AlterTableEnableRowSecurity) }
+			{ $$ = NewATAction(AlterTableEnableRowSecurity) }
 	| DISABLE_P ROW LEVEL SECURITY
-			{ $$ = parser.NewATAction(parser.AlterTableDisableRowSecurity) }
+			{ $$ = NewATAction(AlterTableDisableRowSecurity) }
 	| FORCE ROW LEVEL SECURITY
-			{ $$ = parser.NewATAction(parser.AlterTableForceRowSecurity) }
+			{ $$ = NewATAction(AlterTableForceRowSecurity) }
 	| NO FORCE ROW LEVEL SECURITY
-			{ $$ = parser.NewATAction(parser.AlterTableNoForceRowSecurity) }
+			{ $$ = NewATAction(AlterTableNoForceRowSecurity) }
 	| ATTACH PARTITION qualified_name part_bound_spec2
 			{
 				b := $4.(*partBound)
-				a := parser.NewATAttachPartition(0, objectNameFromQn($3), b.from, b.to, b.inVals, b.isDefault)
-				parser.SetPartitionOfHashBound(a.AttachPartitionOf, b.modulus, b.remainder, b.isHash)
+				a := NewATAttachPartition(0, objectNameFromQn($3), b.from, b.to, b.inVals, b.isDefault)
+				SetPartitionOfHashBound(a.AttachPartitionOf, b.modulus, b.remainder, b.isHash)
 				$$ = a
 			}
 	| DETACH PARTITION qualified_name opt_detach_tail
 			{
-				a := parser.NewATDetachPartition(0, objectNameFromQn($3))
+				a := NewATDetachPartition(0, objectNameFromQn($3))
 				a.DetachConcurrently = $4
 				$$ = a
 			}
@@ -1771,37 +1783,37 @@ alter_table_action:
 at_constraint:
 		PRIMARY KEY pk_cols opt_include at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
+				a := NewATActionAt(AlterTableAddPrimaryKey, $<p>1)
 				a.Columns, a.IncludeColumns = $3, $4
 				$$ = applyATTail(a, mustATTail($5))
 			}
 	| PRIMARY KEY USING INDEX ColId at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
+				a := NewATActionAt(AlterTableAddPrimaryKey, $<p>1)
 				a.UsingIndexName = $5
 				$$ = applyATTail(a, mustATTail($6))
 			}
 	| UNIQUE uq_cols opt_include at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAddUnique)
+				a := NewATActionAt(AlterTableAddUnique, $<p>1)
 				a.Columns, a.IncludeColumns = $2, $3
 				$$ = applyATTail(a, mustATTail($4))
 			}
 	| UNIQUE USING INDEX ColId at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAddUnique)
+				a := NewATActionAt(AlterTableAddUnique, $<p>1)
 				a.UsingIndexName = $4
 				$$ = applyATTail(a, mustATTail($5))
 			}
 	| check_body at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAddCheck)
+				a := NewATActionAt(AlterTableAddCheck, $<p>1)
 				a.CheckExpr = $1
 				$$ = applyATCheckTail(a, mustATTail($2))
 			}
 	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_match opt_fk_actions at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAddForeignKey)
+				a := NewATActionAt(AlterTableAddForeignKey, $<p>1)
 				a.Columns = $4
 				a.RefTable, a.RefColumns = objectNameFromQn($7), $8
 				a.MatchFull = $9
@@ -1811,15 +1823,15 @@ at_constraint:
 			}
 	| EXCLUDE opt_using_method '(' exclude_elem_list ')' opt_include opt_exclude_where at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAddExclude)
+				a := NewATActionAt(AlterTableAddExclude, $<p>1)
 				d := newExclusionConstraint("", $2, $4.([]excludeElem), $6, nil, nil)
 				a.Columns, a.ExclusionOp, a.ExclusionMethod = d.Columns, d.ExclusionOp, d.Method
-				a.ExclusionWhere, _ = $7.(parser.Expr)
+				a.ExclusionWhere, _ = $7.(Expr)
 				$$ = applyATTail(a, mustATTail($8))
 			}
 	| NOT NULL_P ColId at_constr_tail
 			{
-				a := parser.NewATAction(parser.AlterTableAddNotNull)
+				a := NewATActionAt(AlterTableAddNotNull, $<p>1)
 				a.ColumnName = $3
 				$$ = applyATTail(a, mustATTail($4))
 			}
@@ -1871,7 +1883,7 @@ opt_detach_tail:
 	| FINALIZE          { $$ = false }
 
 opt_at_using:
-		/* empty */    { $$ = (parser.Expr)(nil) }
+		/* empty */    { $$ = (Expr)(nil) }
 	| USING a_expr     { $$ = $2 }
 
 at_constr_tail:
@@ -1880,7 +1892,10 @@ at_constr_tail:
 	| at_constr_tail NOT DEFERRABLE        { $$ = mergeATTail(mustATTail($1), "not_deferrable") }
 	| at_constr_tail INITIALLY DEFERRED    { $$ = mergeATTail(mustATTail($1), "initially_deferred") }
 	| at_constr_tail INITIALLY IMMEDIATE   { $$ = mergeATTail(mustATTail($1), "initially_immediate") }
-	| at_constr_tail NOT VALID             { $$ = mergeATTail(mustATTail($1), "not_valid") }
+	/* NOT VALID is LEGAL here — `ALTER TABLE t ADD CHECK (...) NOT VALID`
+	   shares this tail. Only ALTER CONSTRAINT rejects it, and that check
+	   therefore lives in that arm, not in this shared rule. */
+	| at_constr_tail NOT VALID             { $$ = mergeATTailAt(mustATTail($1), "not_valid", $<p>2) }
 	| at_constr_tail NOT ENFORCED          { $$ = mergeATTail(mustATTail($1), "not_enforced") }
 	| at_constr_tail ENFORCED              { $$ = mergeATTail(mustATTail($1), "enforced") }
 	| at_constr_tail NO INHERIT            { $$ = mergeATTail(mustATTail($1), "no_inherit") }
@@ -1927,7 +1942,7 @@ opt_name_list_p:
 drop_view_stmt:
 		DROP VIEW opt_if_exists_drop drop_name_list opt_drop_behavior
 			{
-				$$ = parser.NewDropViewStmt(0, $3, $4, dropBehavior($5))
+				$$ = NewDropViewStmt(0, $3, $4, dropBehavior($5))
 			}
 
 /* create_matview_stmt — P5 v0: CREATE MATERIALIZED VIEW [IF NOT EXISTS] qn
@@ -1936,13 +1951,9 @@ drop_view_stmt:
 create_matview_stmt:
 		CREATE MATERIALIZED VIEW opt_if_not_exists qualified_name opt_name_list_p opt_table_am AS { yylex.(*lexerState).markSpanStart() } select_bare opt_with_data
 			{
-				nm := $5.parts
-				v := parser.ObjectName{Name: nm[len(nm)-1]}
-				if len(nm) > 1 {
-					v.Schema = nm[len(nm)-2]
-				}
-				sel := $10.(*parser.SelectStmt)
-				cv := parser.NewCreateMatViewStmt(v, $6, sel)
+				v := objectNameFromQn($5)
+				sel := $10.(*SelectStmt)
+				cv := NewCreateMatViewStmt(v, $6, sel)
 				cv.IfNotExists = $4
 				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).spanEnd())
 				cv.WithNoData = $11
@@ -1963,7 +1974,7 @@ create_matview_stmt:
 refresh_matview_stmt:
 		REFRESH MATERIALIZED VIEW opt_concurrently qualified_name opt_with_data
 			{
-				st := parser.NewRefreshMatViewStmt(0, objectNameFromQn($5))
+				st := NewRefreshMatViewStmt(0, objectNameFromQn($5))
 				st.Concurrently = $4
 				st.WithNoData = $6
 				$$ = st
@@ -1976,7 +1987,7 @@ opt_concurrently:
 drop_matview_stmt:
 		DROP MATERIALIZED VIEW opt_if_exists_drop drop_name_list opt_drop_behavior
 			{
-				$$ = parser.NewDropCompatStmt(0, "materialized view", $4, $5, dropBehavior($6))
+				$$ = NewDropCompatStmt(0, "materialized view", $4, $5, dropBehavior($6))
 			}
 
 opt_with_data:
@@ -2021,7 +2032,7 @@ create_function_stmt:
 					yylex.(*lexerState).raise(msg, raw, at)
 					return 1
 				}
-				st := parser.NewCreateFunctionStmt($<p>1, $2, objectNameFromQn($4), $6)
+				st := NewCreateFunctionStmt($<p>1, $2, objectNameFromQn($4), $6)
 				r := $9.(*fnReturn)
 				st.ReturnType, st.ReturnsSet, st.ReturnsTable = r.typ, r.setof, r.table
 				if r.table {
@@ -2039,29 +2050,29 @@ create_function_stmt:
 					yylex.(*lexerState).raise(msg, raw, at)
 					return 1
 				}
-				st := parser.NewCreateProcedureStmt($<p>1, $2, objectNameFromQn($4), $6)
+				st := NewCreateProcedureStmt($<p>1, $2, objectNameFromQn($4), $6)
 				$$ = applyProcAttrs(st, a)
 			}
 
 fn_return:
 		fn_type
-			{ $$ = &fnReturn{typ: colTypeOf($1.(*typeWithArgs))} }
+			{ $$ = &fnReturn{typ: colTypeOf(yylex, $1.(*typeWithArgs))} }
 	| SETOF fn_type
-			{ $$ = &fnReturn{typ: colTypeOf($2.(*typeWithArgs)), setof: true} }
+			{ $$ = &fnReturn{typ: colTypeOf(yylex, $2.(*typeWithArgs)), setof: true} }
 	/* Legacy records RETURNS TABLE as `SETOF record` plus the columns folded
 	   into trailing OUT arguments (function.go), not as a distinct type. */
 	| TABLE '(' func_arg_list_p ')'
-			{ $$ = &fnReturn{typ: parser.NewColumnType("", "record", nil, false), setof: true, table: true, cols: $3} }
+			{ $$ = &fnReturn{typ: NewColumnType("", "record", nil, false), setof: true, table: true, cols: $3} }
 
 /* An absent list and an empty one are different in the AST: legacy returns nil
    for "no parens at all" (DROP FUNCTION f) and a non-nil empty slice for `()`. */
 opt_func_args:
-		/* empty */        { $$ = []parser.FunctionArg{} }
+		/* empty */        { $$ = []FunctionArg{} }
 	| func_arg_list_p      { $$ = $1 }
 
 func_arg_list_p:
-		func_arg                        { $$ = []parser.FunctionArg{$1.(parser.FunctionArg)} }
-	| func_arg_list_p ',' func_arg      { $$ = append($1, $3.(parser.FunctionArg)) }
+		func_arg                        { $$ = []FunctionArg{$1.(FunctionArg)} }
+	| func_arg_list_p ',' func_arg      { $$ = append($1, $3.(FunctionArg)) }
 
 /* [mode] [name] type [ {DEFAULT|=} expr ]. The name is optional AND a mode
    keyword may precede it, so the four combinations are spelled out: hiding
@@ -2069,17 +2080,17 @@ func_arg_list_p:
    `(` and decide one token too early. */
 func_arg:
 		fn_type opt_arg_default
-			{ $$ = parser.NewFunctionArg("", parser.FuncArgIn, false, colTypeOf($1.(*typeWithArgs)), $2) }
+			{ $$ = NewFunctionArg("", FuncArgIn, false, colTypeOf(yylex, $1.(*typeWithArgs)), $2) }
 	| fn_param_name fn_type opt_arg_default
-			{ $$ = parser.NewFunctionArg($1, parser.FuncArgIn, false, colTypeOf($2.(*typeWithArgs)), $3) }
+			{ $$ = NewFunctionArg($1, FuncArgIn, false, colTypeOf(yylex, $2.(*typeWithArgs)), $3) }
 	| fn_arg_mode fn_type opt_arg_default
-			{ $$ = parser.NewFunctionArg("", parser.FuncArgMode($1), true, colTypeOf($2.(*typeWithArgs)), $3) }
+			{ $$ = NewFunctionArg("", FuncArgMode($1), true, colTypeOf(yylex, $2.(*typeWithArgs)), $3) }
 	| fn_arg_mode fn_param_name fn_type opt_arg_default
-			{ $$ = parser.NewFunctionArg($2, parser.FuncArgMode($1), true, colTypeOf($3.(*typeWithArgs)), $4) }
+			{ $$ = NewFunctionArg($2, FuncArgMode($1), true, colTypeOf(yylex, $3.(*typeWithArgs)), $4) }
 	/* `name mode type` (`a OUT int`) as well as `mode name type`: legacy
 	   accepts both orderings (function.go parseFunctionArg). */
 	| fn_param_name fn_arg_mode fn_type opt_arg_default
-			{ $$ = parser.NewFunctionArg($1, parser.FuncArgMode($2), true, colTypeOf($3.(*typeWithArgs)), $4) }
+			{ $$ = NewFunctionArg($1, FuncArgMode($2), true, colTypeOf(yylex, $3.(*typeWithArgs)), $4) }
 
 /* gram.y's param_name is type_function_name, NOT ColId: OUT_P and INOUT are
    col_name_keywords, so a ColId here would be reduce/reduce-ambiguous with
@@ -2097,10 +2108,10 @@ fn_type:
 	| TRIGGER           { $$ = &typeWithArgs{ct: castType{name: "trigger"}} }
 
 fn_arg_mode:
-		IN_P        { $$ = int(parser.FuncArgIn) }
-	| OUT_P         { $$ = int(parser.FuncArgOut) }
-	| INOUT         { $$ = int(parser.FuncArgInout) }
-	| VARIADIC      { $$ = int(parser.FuncArgVariadic) }
+		IN_P        { $$ = int(FuncArgIn) }
+	| OUT_P         { $$ = int(FuncArgOut) }
+	| INOUT         { $$ = int(FuncArgInout) }
+	| VARIADIC      { $$ = int(FuncArgVariadic) }
 
 opt_arg_default:
 		/* empty */        { $$ = nil }
@@ -2181,12 +2192,12 @@ fn_attr:
 					   no GUC snapshot to capture (function.go
 					   parseFunctionConfigSetClause returns ok=false). */
 					if v != fnConfigUnset {
-						a.configOps = append(a.configOps, parser.NewFunctionConfigOp(false, false, n, v))
+						a.configOps = append(a.configOps, NewFunctionConfigOp(false, false, n, v))
 					}
 				}
 			}
-	| RESET ALL                   { $$ = func(a *fnAttrs) { a.configOps = append(a.configOps, parser.NewFunctionConfigOp(false, true, "", "")) } }
-	| RESET fn_config_name        { n := $2; $$ = func(a *fnAttrs) { a.configOps = append(a.configOps, parser.NewFunctionConfigOp(true, false, n, "")) } }
+	| RESET ALL                   { $$ = func(a *fnAttrs) { a.configOps = append(a.configOps, NewFunctionConfigOp(false, true, "", "")) } }
+	| RESET fn_config_name        { n := $2; $$ = func(a *fnAttrs) { a.configOps = append(a.configOps, NewFunctionConfigOp(true, false, n, "")) } }
 
 fn_number:
 		signed_iconst   { $$ = atStatValue($1) }
@@ -2230,43 +2241,43 @@ fn_eq_to:
 drop_function_stmt:
 		DROP FUNCTION opt_if_exists_drop fn_drop_item fn_drop_extras opt_drop_behavior
 			{
-				it := $4.(*parser.DropFunctionItem)
-				$$ = parser.NewDropFunctionStmt($<p>1, $3, it.Name, it.Args, fnDropBehavior($6), $5)
+				it := $4.(*DropFunctionItem)
+				$$ = NewDropFunctionStmt($<p>1, $3, it.Name, it.Args, fnDropBehavior($6), $5)
 			}
 	| DROP PROCEDURE opt_if_exists_drop fn_drop_item fn_drop_extras opt_drop_behavior
 			{
-				it := $4.(*parser.DropFunctionItem)
+				it := $4.(*DropFunctionItem)
 				/* ObjKind is set for ROUTINE only; DROP PROCEDURE leaves it empty
 				   (ddl.go:5948 is the sole writer). */
-				$$ = parser.NewDropProcedureStmt($<p>1, $3, it.Name, dropProcNames($5), it.Args, fnDropBehavior($6), "")
+				$$ = NewDropProcedureStmt($<p>1, $3, it.Name, dropProcNames($5), it.Args, fnDropBehavior($6), "")
 			}
 	| DROP ROUTINE opt_if_exists_drop fn_drop_item fn_drop_extras opt_drop_behavior
 			{
-				it := $4.(*parser.DropFunctionItem)
-				$$ = parser.NewDropProcedureStmt($<p>1, $3, it.Name, dropProcNames($5), it.Args, fnDropBehavior($6), "routine")
+				it := $4.(*DropFunctionItem)
+				$$ = NewDropProcedureStmt($<p>1, $3, it.Name, dropProcNames($5), it.Args, fnDropBehavior($6), "routine")
 			}
 
 fn_drop_item:
 		qualified_name
-			{ $$ = &parser.DropFunctionItem{Name: objectNameFromQn($1)} }
+			{ $$ = &DropFunctionItem{Name: objectNameFromQn($1)} }
 	| qualified_name '(' opt_func_args ')'
-			{ $$ = &parser.DropFunctionItem{Name: objectNameFromQn($1), Args: $3} }
+			{ $$ = &DropFunctionItem{Name: objectNameFromQn($1), Args: $3} }
 
 fn_drop_extras:
-		/* empty */                        { $$ = []parser.DropFunctionItem(nil) }
-	| fn_drop_extras ',' fn_drop_item      { $$ = append($1, *$3.(*parser.DropFunctionItem)) }
+		/* empty */                        { $$ = []DropFunctionItem(nil) }
+	| fn_drop_extras ',' fn_drop_item      { $$ = append($1, *$3.(*DropFunctionItem)) }
 
 call_stmt:
 		CALL qualified_name
-			{ $$ = parser.NewCallStmt($<p>1, objectNameFromQn($2), nil, nil) }
+			{ $$ = NewCallStmt($<p>1, objectNameFromQn($2), nil, nil) }
 	| CALL qualified_name '(' opt_call_named_args ')'
 			{
 				ca := $4.(*namedCallArgs)
-				$$ = parser.NewCallStmt($<p>1, objectNameFromQn($2), ca.exprs, ca.names())
+				$$ = NewCallStmt($<p>1, objectNameFromQn($2), ca.exprs, ca.names())
 			}
 
 opt_call_named_args:
-		/* empty */                { $$ = &namedCallArgs{exprs: []parser.Expr{}} }
+		/* empty */                { $$ = &namedCallArgs{exprs: []Expr{}} }
 	| call_named_arg_list          { $$ = $1 }
 
 call_named_arg_list:
@@ -2298,37 +2309,37 @@ call_named_arg:
    ========================================================================= */
 
 savepoint_stmt:
-		SAVEPOINT ColId          { $$ = parser.NewSavepointStmt($<p>1, $2) }
+		SAVEPOINT ColId          { $$ = NewSavepointStmt($<p>1, $2) }
 	/* SAVEPOINT is unreserved and therefore also a ColId, which is exactly the
 	   pinned S/R conflict on RELEASE: shift keeps the keyword reading. */
-	| RELEASE SAVEPOINT ColId    { $$ = parser.NewReleaseSavepointStmt($<p>1, $3) }
-	| RELEASE ColId              { $$ = parser.NewReleaseSavepointStmt($<p>1, $2) }
+	| RELEASE SAVEPOINT ColId    { $$ = NewReleaseSavepointStmt($<p>1, $3) }
+	| RELEASE ColId              { $$ = NewReleaseSavepointStmt($<p>1, $2) }
 
 checkpoint_stmt:
-		CHECKPOINT               { $$ = parser.NewCheckpointStmt($<p>1) }
+		CHECKPOINT               { $$ = NewCheckpointStmt($<p>1) }
 
 /* DISCARD ALL is a legacy REJECT ("syntax error at or near \"all\""), so ALL
    is not an alternative here; TEMPORARY normalises to TEMP. */
 discard_stmt:
-		DISCARD PLANS            { $$ = parser.NewDiscardStmt($<p>1, "PLANS") }
-	| DISCARD SEQUENCES          { $$ = parser.NewDiscardStmt($<p>1, "SEQUENCES") }
-	| DISCARD TEMP               { $$ = parser.NewDiscardStmt($<p>1, "TEMP") }
-	| DISCARD TEMPORARY          { $$ = parser.NewDiscardStmt($<p>1, "TEMP") }
+		DISCARD PLANS            { $$ = NewDiscardStmt($<p>1, "PLANS") }
+	| DISCARD SEQUENCES          { $$ = NewDiscardStmt($<p>1, "SEQUENCES") }
+	| DISCARD TEMP               { $$ = NewDiscardStmt($<p>1, "TEMP") }
+	| DISCARD TEMPORARY          { $$ = NewDiscardStmt($<p>1, "TEMP") }
 
 deallocate_stmt:
-		DEALLOCATE ColId             { $$ = parser.NewDeallocateStmt($<p>1, $2) }
-	| DEALLOCATE PREPARE ColId       { $$ = parser.NewDeallocateStmt($<p>1, $3) }
-	| DEALLOCATE ALL                 { $$ = parser.NewDeallocateStmt($<p>1, "") }
-	| DEALLOCATE PREPARE ALL         { $$ = parser.NewDeallocateStmt($<p>1, "") }
+		DEALLOCATE ColId             { $$ = NewDeallocateStmt($<p>1, $2) }
+	| DEALLOCATE PREPARE ColId       { $$ = NewDeallocateStmt($<p>1, $3) }
+	| DEALLOCATE ALL                 { $$ = NewDeallocateStmt($<p>1, "") }
+	| DEALLOCATE PREPARE ALL         { $$ = NewDeallocateStmt($<p>1, "") }
 
 prepare_stmt:
 		PREPARE ColId opt_prep_types AS stmt
-			{ $$ = parser.NewPrepareStmt($<p>1, $2, $3, $5) }
+			{ $$ = NewPrepareStmt($<p>1, $2, $3, $5) }
 	/* PREPARE TRANSACTION 'gid' is a different statement sharing the keyword
 	   (parser.go parsePrepare); TRANSACTION is reserved and never a ColId, so
 	   the two cannot be confused. */
 	| PREPARE TRANSACTION SCONST
-			{ $$ = parser.NewPrepareTransactionStmt($<p>1, $3) }
+			{ $$ = NewPrepareTransactionStmt($<p>1, $3) }
 
 /* The declared parameter types are recorded as their plain names; nil when no
    list was written, which is why this is not an `opt_paren_list` of strings. */
@@ -2341,12 +2352,12 @@ prep_type_list:
 	| prep_type_list ',' fn_type         { $$ = append($1, typeNameOf($3)) }
 
 execute_stmt:
-		EXECUTE ColId                        { $$ = parser.NewExecuteStmt($<p>1, $2, nil) }
-	| EXECUTE ColId '(' opt_func_call_args ')' { $$ = parser.NewExecuteStmt($<p>1, $2, $4) }
+		EXECUTE ColId                        { $$ = NewExecuteStmt($<p>1, $2, nil) }
+	| EXECUTE ColId '(' opt_func_call_args ')' { $$ = NewExecuteStmt($<p>1, $2, $4) }
 
 close_stmt:
-		CLOSE ColId              { $$ = parser.NewCloseStmt($<p>1, $2) }
-	| CLOSE ALL                  { $$ = parser.NewCloseStmt($<p>1, "") }
+		CLOSE ColId              { $$ = NewCloseStmt($<p>1, $2) }
+	| CLOSE ALL                  { $$ = NewCloseStmt($<p>1, "") }
 
 /* DECLARE name [NO] SCROLL CURSOR [WITH|WITHOUT HOLD] FOR <stmt>. gram.y also
    accepts BINARY / INSENSITIVE / ASENSITIVE here; legacy rejects all three
@@ -2358,9 +2369,9 @@ close_stmt:
 declare_stmt:
 		DECLARE ColId opt_cursor_scroll CURSOR opt_cursor_hold FOR SelectStmt
 			{
-				sel, _ := $7.(*parser.SelectStmt)
+				sel, _ := $7.(*SelectStmt)
 				checkStrayInto(yylex, sel, "SELECT ... INTO is not allowed here", false)
-				$$ = parser.NewDeclareCursorStmt($<p>1, $2, $7)
+				$$ = NewDeclareCursorStmt($<p>1, $2, $7)
 			}
 
 opt_cursor_scroll:
@@ -2415,9 +2426,9 @@ cursor_ref:
 analyze_stmt:
 		analyze_kw opt_vacuum_opts opt_vacuum_targets
 			{
-				v := $2.(*parser.VacuumStmt)
+				v := $2.(*VacuumStmt)
 				tg := $3.(*vacTargets)
-				$$ = parser.NewAnalyzeStmt($<p>1, v.Verbose, v.SkipLocked, tg.names, tg.cols)
+				$$ = NewAnalyzeStmt($<p>1, v.Verbose, v.SkipLocked, tg.names, tg.cols)
 			}
 
 analyze_kw:
@@ -2445,18 +2456,18 @@ opt_vacuum_opts:
 	| '(' vacuum_opt_list ')'            { $$ = $2 }
 
 vacuum_kw_opts:
-		/* empty */                      { $$ = parser.NewVacuumStmt(0) }
-	| vacuum_kw_opts vacuum_kw_opt       { v := $1.(*parser.VacuumStmt); $2.(func(*parser.VacuumStmt))(v); $$ = v }
+		/* empty */                      { $$ = NewVacuumStmt(0) }
+	| vacuum_kw_opts vacuum_kw_opt       { v := $1.(*VacuumStmt); $2.(func(*VacuumStmt))(v); $$ = v }
 
 vacuum_kw_opt:
-		VERBOSE      { $$ = func(v *parser.VacuumStmt) { v.Verbose = true } }
-	| analyze_kw     { $$ = func(v *parser.VacuumStmt) { v.Analyze = true } }
-	| FULL           { $$ = func(v *parser.VacuumStmt) { v.Full = true } }
-	| FREEZE         { $$ = func(v *parser.VacuumStmt) { v.Freeze = true } }
+		VERBOSE      { $$ = func(v *VacuumStmt) { v.Verbose = true } }
+	| analyze_kw     { $$ = func(v *VacuumStmt) { v.Analyze = true } }
+	| FULL           { $$ = func(v *VacuumStmt) { v.Full = true } }
+	| FREEZE         { $$ = func(v *VacuumStmt) { v.Freeze = true } }
 
 vacuum_opt_list:
-		vacuum_opt                          { v := parser.NewVacuumStmt(0); $1.(func(*parser.VacuumStmt))(v); $$ = v }
-	| vacuum_opt_list ',' vacuum_opt        { v := $1.(*parser.VacuumStmt); $3.(func(*parser.VacuumStmt))(v); $$ = v }
+		vacuum_opt                          { v := NewVacuumStmt(0); $1.(func(*VacuumStmt))(v); $$ = v }
+	| vacuum_opt_list ',' vacuum_opt        { v := $1.(*VacuumStmt); $3.(func(*VacuumStmt))(v); $$ = v }
 
 /* ONE name+value rule, not one alternative per option: `VERBOSE`, `VERBOSE
    true` and `skip_locked` would otherwise be three productions whose first
@@ -2501,7 +2512,7 @@ vacuum_target:
    accepted. IF EXISTS is parsed and discarded, as in legacy. */
 reindex_stmt:
 		REINDEX opt_reindex_opts opt_concurrently reindex_kind opt_concurrently opt_if_exists_drop qualified_name
-			{ $$ = parser.NewReindexStmt($<p>1, $2, $3 || $5, $4, qnText($7)) }
+			{ $$ = NewReindexStmt($<p>1, $2, $3 || $5, $4, qnText($7)) }
 
 opt_reindex_opts:
 		/* empty */                    { $$ = false }
@@ -2525,9 +2536,9 @@ reindex_kind:
 /* CLUSTER takes NO parenthesised option list in legacy ("expected identifier
    (got (")" ), only the bare VERBOSE keyword. */
 cluster_stmt:
-		CLUSTER opt_verbose_kw                                { $$ = parser.NewClusterStmt($<p>1, $2, nil, "") }
+		CLUSTER opt_verbose_kw                                { $$ = NewClusterStmt($<p>1, $2, nil, "") }
 	| CLUSTER opt_verbose_kw qualified_name opt_cluster_using
-			{ n := objectNameFromQn($3); $$ = parser.NewClusterStmt($<p>1, $2, &n, $4) }
+			{ n := objectNameFromQn($3); $$ = NewClusterStmt($<p>1, $2, &n, $4) }
 
 opt_verbose_kw:
 		/* empty */   { $$ = false }
@@ -2541,24 +2552,24 @@ opt_cluster_using:
    relation an unqualified one does — legacy parses and drops the keyword. */
 lock_stmt:
 		LOCK_P opt_TABLE_kw lock_rel_list opt_lock_mode opt_nowait
-			{ $$ = parser.NewLockTableStmt($<p>1, $3, $4, $5) }
+			{ $$ = NewLockTableStmt($<p>1, $3, $4, $5) }
 
 opt_TABLE_kw:
 		/* empty */   { }
 	| TABLE           { }
 
 lock_rel_list:
-		lock_rel                        { $$ = []parser.LockTableRelation{$1} }
+		lock_rel                        { $$ = []LockTableRelation{$1} }
 	| lock_rel_list ',' lock_rel        { $$ = append($1, $3) }
 
 lock_rel:
-		opt_ONLY_kw qualified_name      { n := objectNameFromQn($2); $$ = parser.NewLockTableRelation(n.Schema, n.Name) }
+		opt_ONLY_kw qualified_name      { n := objectNameFromQn($2); $$ = NewLockTableRelation(n.Schema, n.Name) }
 
 opt_lock_mode:
 		/* empty */                     { $$ = "AccessExclusiveLock" }
 	| IN_P lock_mode_words MODE
 			{
-				n, ok := parser.LockModeName($2)
+				n, ok := LockModeName($2)
 				if !ok {
 					yylex.Error("unrecognised lock mode")
 					return 1
@@ -2597,7 +2608,7 @@ opt_nowait:
 
 merge_stmt:
 		MERGE opt_INTO_kw base_table_ref USING base_table_ref ON a_expr merge_when_list opt_returning
-			{ $$ = parser.NewMergeStmt($<p>1, $3, $5, $7, $8, $9) }
+			{ $$ = NewMergeStmt($<p>1, $3, $5, $7, $8, $9) }
 
 opt_INTO_kw:
 		/* empty */   { }
@@ -2605,7 +2616,7 @@ opt_INTO_kw:
 
 /* Legacy loops `for p.cur() == WHEN`, so an empty clause list is accepted. */
 merge_when_list:
-		/* empty */                        { $$ = []*parser.MergeWhenClause(nil) }
+		/* empty */                        { $$ = []*MergeWhenClause(nil) }
 	| merge_when_list merge_when_clause    { $$ = append($1, $2) }
 
 merge_when_clause:
@@ -2618,8 +2629,8 @@ merge_when_clause:
 			}
 
 merge_match:
-		MATCHED                      { $$ = parser.NewMergeWhenClause(0, true, false, false) }
-	| NOT MATCHED                    { $$ = parser.NewMergeWhenClause(0, false, false, false) }
+		MATCHED                      { $$ = NewMergeWhenClause(0, true, false, false) }
+	| NOT MATCHED                    { $$ = NewMergeWhenClause(0, false, false, false) }
 	| NOT MATCHED BY ColId           { $$ = mergeNotMatchedBy($4) }
 
 opt_merge_and:
@@ -2627,19 +2638,19 @@ opt_merge_and:
 	| AND a_expr      { $$ = $2 }
 
 merge_action:
-		UPDATE SET update_set_list        { $$ = &mergeAction{kind: parser.MergeActionUpdate, assigns: $3} }
-	| DELETE_P                            { $$ = &mergeAction{kind: parser.MergeActionDelete} }
-	| DO NOTHING                          { $$ = &mergeAction{kind: parser.MergeActionDoNothing} }
+		UPDATE SET update_set_list        { $$ = &mergeAction{kind: MergeActionUpdate, assigns: $3} }
+	| DELETE_P                            { $$ = &mergeAction{kind: MergeActionDelete} }
+	| DO NOTHING                          { $$ = &mergeAction{kind: MergeActionDoNothing} }
 	/* VALUES_LA, not VALUES: base_yylex substitutes the lookahead variant
 	   whenever VALUES is followed by '(' (base_yylex.go), so the plain token
 	   never reaches this position. `DEFAULT VALUES` below keeps plain VALUES
 	   because no paren follows it. */
 	| INSERT merge_ins_cols VALUES_LA '(' expr_list ')'
-			{ $$ = &mergeAction{kind: parser.MergeActionInsert, cols: $2, vals: $5} }
+			{ $$ = &mergeAction{kind: MergeActionInsert, cols: $2, vals: $5} }
 	/* DEFAULT VALUES leaves InsertValues nil, which is how the executor tells
 	   the two apart. */
 	| INSERT merge_ins_cols DEFAULT VALUES
-			{ $$ = &mergeAction{kind: parser.MergeActionInsert, cols: $2} }
+			{ $$ = &mergeAction{kind: MergeActionInsert, cols: $2} }
 
 merge_ins_cols:
 		/* empty */             { $$ = []string(nil) }
@@ -2658,29 +2669,29 @@ merge_ins_cols:
 create_type_stmt:
 	/* Shell type: `CREATE TYPE t` records the name and nothing else. */
 		CREATE TYPE_P qualified_name
-			{ $$ = parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3)) }
+			{ $$ = NewCreateTypeStmt($<p>1, objectNameFromQn($3)) }
 	/* Base type: legacy sets ONLY HasOptions and skips the whole list. */
 	| CREATE TYPE_P qualified_name '(' type_opt_list ')'
 			{
-				st := parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3))
+				st := NewCreateTypeStmt($<p>1, objectNameFromQn($3))
 				st.HasOptions = true
 				$$ = st
 			}
 	| CREATE TYPE_P qualified_name AS ENUM_P '(' enum_val_list ')'
 			{
-				st := parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3))
+				st := NewCreateTypeStmt($<p>1, objectNameFromQn($3))
 				st.IsEnum, st.EnumValues = true, $7
 				$$ = st
 			}
 	| CREATE TYPE_P qualified_name AS '(' type_field_list ')'
 			{
-				st := parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3))
+				st := NewCreateTypeStmt($<p>1, objectNameFromQn($3))
 				st.IsComposite, st.CompositeFields = true, $6
 				$$ = st
 			}
 	| CREATE TYPE_P qualified_name AS RANGE '(' range_opt_list ')'
 			{
-				st := parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3))
+				st := NewCreateTypeStmt($<p>1, objectNameFromQn($3))
 				st.IsRange = true
 				applyRangeOpts(st, $7)
 				$$ = st
@@ -2693,7 +2704,7 @@ enum_val_list:
 	| enum_val_list ',' SCONST       { $$ = append($1, $3) }
 
 type_field_list:
-		type_field                        { $$ = []parser.TypeField{$1} }
+		type_field                        { $$ = []TypeField{$1} }
 	| type_field_list ',' type_field      { $$ = append($1, $3) }
 
 /* ColType is the RAW token join legacy stores, not a rendered type name:
@@ -2702,7 +2713,7 @@ type_field_list:
    parseCreateType's inner scan does. */
 type_field:
 		ColId col_type_name opt_field_collate
-			{ $$ = parser.NewTypeField(lowerIdent($1), rawTypeSpan(yylex, $<p>2), $3) }
+			{ $$ = NewTypeField(lowerIdent($1), rawTypeSpan(yylex, $<p>2), $3) }
 
 opt_field_collate:
 		/* empty */          { $$ = "" }
@@ -2758,11 +2769,11 @@ range_opt_value:
 
 drop_type_stmt:
 		DROP TYPE_P opt_if_exists_drop drop_name_list opt_drop_behavior
-			{ $$ = parser.NewDropTypeStmt($<p>1, $4, $3, $5 == "cascade") }
+			{ $$ = NewDropTypeStmt($<p>1, $4, $3, $5 == "cascade") }
 
 drop_domain_stmt:
 		DROP DOMAIN_P opt_if_exists_drop drop_name_list opt_drop_behavior
-			{ $$ = parser.NewDropDomainStmt($<p>1, $4, $3, $5 == "cascade") }
+			{ $$ = NewDropDomainStmt($<p>1, $4, $3, $5 == "cascade") }
 
 /* AS is optional (`CREATE DOMAIN d int`), and the base type is stored as a
    NAME plus separate typmod args, not as a ColumnType. */
@@ -2770,7 +2781,7 @@ create_domain_stmt:
 		CREATE DOMAIN_P qualified_name opt_AS_kw col_type_name domain_constraints
 			{
 				tw := $5.(*typeWithArgs)
-				ct := colTypeOf(tw)
+				ct := colTypeOf(yylex, tw)
 				nm := ct.Name
 				if ct.Schema != "" {
 					nm = ct.Schema + "." + ct.Name
@@ -2778,7 +2789,7 @@ create_domain_stmt:
 				if ct.IsArray {
 					nm += "[]"
 				}
-				st := parser.NewCreateDomainStmt($<p>1, objectNameFromQn($3), nm, ct.Args)
+				st := NewCreateDomainStmt($<p>1, objectNameFromQn($3), nm, ct.Args)
 				applyDomainConstraints(st, $6)
 				$$ = st
 			}
@@ -2808,7 +2819,7 @@ create_sequence_stmt:
 				if pfx != nil {
 					temp, unlogged = pfx.temporary, pfx.unlogged
 				}
-				st := parser.NewCreateSequenceStmt($<p>1, objectNameFromQn($5), temp, unlogged, $4)
+				st := NewCreateSequenceStmt($<p>1, objectNameFromQn($5), temp, unlogged, $4)
 				applySeqOpts(st, $6)
 				$$ = st
 			}
@@ -2848,7 +2859,7 @@ seq_owner:
 do_stmt:
 	/* Legacy accepts ONLY `DO <dollar-quoted body>` — no LANGUAGE clause on
 	   either side ("expected dollar-quoted string for DO body"). */
-		DO SCONST            { $$ = parser.NewDoStmt($<p>1, "plpgsql", $2) }
+		DO SCONST            { $$ = NewDoStmt($<p>1, "plpgsql", $2) }
 
 /* ============================================================================
    P5.6 — CREATE / DROP TRIGGER, COMMENT ON, ALTER FUNCTION / PROCEDURE /
@@ -2929,7 +2940,7 @@ opt_trig_foreach:
 	| FOR EACH ColId            { $$ = trigForEachOf($3) }
 
 opt_trig_when:
-		/* empty */             { $$ = (parser.Expr)(nil) }
+		/* empty */             { $$ = (Expr)(nil) }
 	| WHEN '(' a_expr ')'       { $$ = $3 }
 
 /* EXECUTE [FUNCTION|PROCEDURE] name — the optional keyword is spelled into
@@ -2951,13 +2962,13 @@ trig_arg_list:
 
 trig_arg:
 		SCONST          { $$ = $1 }
-	| ICONST            { $$ = parser.CanonicalTriggerIntArg(strconv.FormatInt(int64($1), 10)) }
+	| ICONST            { $$ = CanonicalTriggerIntArg(strconv.FormatInt(int64($1), 10)) }
 	| FCONST            { $$ = $1 }
 	| ColId             { $$ = $1 }
 
 drop_trigger_stmt:
 		DROP TRIGGER opt_if_exists_drop ColId ON qualified_name opt_drop_behavior
-			{ $$ = parser.NewDropTriggerStmt($<p>1, $4, objectNameFromQn($6), $3) }
+			{ $$ = NewDropTriggerStmt($<p>1, $4, objectNameFromQn($6), $3) }
 
 /* ---------------------------------------------------------------------------
    COMMENT ON <kind> <name> IS { 'text' | NULL }. The object-kind vocabulary is
@@ -2968,7 +2979,7 @@ drop_trigger_stmt:
 comment_stmt:
 		COMMENT ON comment_target IS comment_text
 			{
-				cs := $3.(*parser.CommentOnStmt)
+				cs := $3.(*CommentOnStmt)
 				cs.Description = $5
 				$$ = commentAt($<p>1, cs)
 			}
@@ -2978,21 +2989,21 @@ comment_text:
 	| NULL_P        { $$ = "" }
 
 comment_target:
-		TABLE qualified_name          { $$ = parser.NewCommentOnStmt(0, "table", objectNameFromQn($2), "") }
-	| INDEX qualified_name            { $$ = parser.NewCommentOnStmt(0, "index", objectNameFromQn($2), "") }
-	| VIEW qualified_name             { $$ = parser.NewCommentOnStmt(0, "view", objectNameFromQn($2), "") }
-	| SEQUENCE qualified_name         { $$ = parser.NewCommentOnStmt(0, "sequence", objectNameFromQn($2), "") }
-	| TYPE_P qualified_name           { $$ = parser.NewCommentOnStmt(0, "type", objectNameFromQn($2), "") }
-	| DOMAIN_P qualified_name         { $$ = parser.NewCommentOnStmt(0, "domain", objectNameFromQn($2), "") }
-	| SCHEMA qualified_name           { $$ = parser.NewCommentOnStmt(0, "schema", objectNameFromQn($2), "") }
-	| EXTENSION qualified_name        { $$ = parser.NewCommentOnStmt(0, "extension", objectNameFromQn($2), "") }
-	| COLLATION qualified_name        { $$ = parser.NewCommentOnStmt(0, "collation", objectNameFromQn($2), "") }
-	| SERVER qualified_name           { $$ = parser.NewCommentOnStmt(0, "server", objectNameFromQn($2), "") }
-	| STATISTICS qualified_name       { $$ = parser.NewCommentOnStmt(0, "statistics", objectNameFromQn($2), "") }
-	| MATERIALIZED VIEW qualified_name { $$ = parser.NewCommentOnStmt(0, "materialized view", objectNameFromQn($3), "") }
-	| ACCESS METHOD qualified_name    { $$ = parser.NewCommentOnStmt(0, "access method", objectNameFromQn($3), "") }
-	| FOREIGN TABLE qualified_name    { $$ = parser.NewCommentOnStmt(0, "foreign table", objectNameFromQn($3), "") }
-	| FOREIGN DATA_P WRAPPER qualified_name { $$ = parser.NewCommentOnStmt(0, "foreign data wrapper", objectNameFromQn($4), "") }
+		TABLE qualified_name          { $$ = NewCommentOnStmt(0, "table", objectNameFromQn($2), "") }
+	| INDEX qualified_name            { $$ = NewCommentOnStmt(0, "index", objectNameFromQn($2), "") }
+	| VIEW qualified_name             { $$ = NewCommentOnStmt(0, "view", objectNameFromQn($2), "") }
+	| SEQUENCE qualified_name         { $$ = NewCommentOnStmt(0, "sequence", objectNameFromQn($2), "") }
+	| TYPE_P qualified_name           { $$ = NewCommentOnStmt(0, "type", objectNameFromQn($2), "") }
+	| DOMAIN_P qualified_name         { $$ = NewCommentOnStmt(0, "domain", objectNameFromQn($2), "") }
+	| SCHEMA qualified_name           { $$ = NewCommentOnStmt(0, "schema", objectNameFromQn($2), "") }
+	| EXTENSION qualified_name        { $$ = NewCommentOnStmt(0, "extension", objectNameFromQn($2), "") }
+	| COLLATION qualified_name        { $$ = NewCommentOnStmt(0, "collation", objectNameFromQn($2), "") }
+	| SERVER qualified_name           { $$ = NewCommentOnStmt(0, "server", objectNameFromQn($2), "") }
+	| STATISTICS qualified_name       { $$ = NewCommentOnStmt(0, "statistics", objectNameFromQn($2), "") }
+	| MATERIALIZED VIEW qualified_name { $$ = NewCommentOnStmt(0, "materialized view", objectNameFromQn($3), "") }
+	| ACCESS METHOD qualified_name    { $$ = NewCommentOnStmt(0, "access method", objectNameFromQn($3), "") }
+	| FOREIGN TABLE qualified_name    { $$ = NewCommentOnStmt(0, "foreign table", objectNameFromQn($3), "") }
+	| FOREIGN DATA_P WRAPPER qualified_name { $$ = NewCommentOnStmt(0, "foreign data wrapper", objectNameFromQn($4), "") }
 	/* COLUMN's name is split at the LAST dot: `COMMENT ON COLUMN t.c` records
 	   ObjName{Name:"t"} and SubName "c", while `s.t.c` keeps the schema. */
 	| COLUMN qualified_name           { $$ = commentColumn($2) }
@@ -3001,16 +3012,16 @@ comment_target:
 			{ $$ = commentConstraint($2, false, objectNameFromQn($4)) }
 	| CONSTRAINT ColId ON DOMAIN_P qualified_name
 			{ $$ = commentConstraint($2, true, objectNameFromQn($5)) }
-	| TRIGGER ColId ON qualified_name { $$ = parser.NewCommentOnStmt(0, "trigger", objectNameFromQn($4), $2) }
-	| POLICY ColId ON qualified_name  { $$ = parser.NewCommentOnStmt(0, "policy", objectNameFromQn($4), $2) }
-	| RULE ColId ON qualified_name    { $$ = parser.NewCommentOnStmt(0, "rule", objectNameFromQn($4), $2) }
+	| TRIGGER ColId ON qualified_name { $$ = NewCommentOnStmt(0, "trigger", objectNameFromQn($4), $2) }
+	| POLICY ColId ON qualified_name  { $$ = NewCommentOnStmt(0, "policy", objectNameFromQn($4), $2) }
+	| RULE ColId ON qualified_name    { $$ = NewCommentOnStmt(0, "rule", objectNameFromQn($4), $2) }
 	/* The cast's type names are stored as WRITTEN, not as the normalised
 	   name: legacy's parseCastTypeName joins the raw tokens, so
 	   `character varying` stays that and does not become varchar. */
 	| CAST '(' fn_type AS fn_type ')' { $$ = commentCast(rawTypeSpan(yylex, $<p>3), rawTypeSpan(yylex, $<p>5)) }
 	| FUNCTION qualified_name opt_comment_args
 			{
-				cs := parser.NewCommentOnStmt(0, "function", objectNameFromQn($2), "")
+				cs := NewCommentOnStmt(0, "function", objectNameFromQn($2), "")
 				cs.Args = $3
 				$$ = cs
 			}
@@ -3018,7 +3029,7 @@ comment_target:
 /* An ABSENT arg list is nil, an empty `()` is a non-nil empty slice — the same
    distinction DROP FUNCTION draws. */
 opt_comment_args:
-		/* empty */                  { $$ = []parser.FunctionArg(nil) }
+		/* empty */                  { $$ = []FunctionArg(nil) }
 	| '(' opt_func_args ')'          { $$ = $2 }
 
 /* ---------------------------------------------------------------------------
@@ -3031,7 +3042,7 @@ alter_function_stmt:
 		ALTER alter_routine_kind qualified_name opt_comment_args alter_fn_actions
 			{
 				kind := $2
-				st := parser.NewAlterFunctionStmt($<p>1, objectNameFromQn($3), $4, kind == "procedure", kind == "routine")
+				st := NewAlterFunctionStmt($<p>1, objectNameFromQn($3), $4, kind == "procedure", kind == "routine")
 				applyAlterFnActions(st, $5)
 				$$ = st
 			}
@@ -3082,11 +3093,11 @@ alter_fn_action:
 				if eqFold(n, "schema") {
 					$$ = alterFnSchema(v)
 				} else {
-					$$ = alterFnConfig(parser.NewFunctionConfigOp(false, false, n, v), v != fnConfigUnset)
+					$$ = alterFnConfig(NewFunctionConfigOp(false, false, n, v), v != fnConfigUnset)
 				}
 			}
-	| RESET ALL                      { $$ = alterFnConfig(parser.NewFunctionConfigOp(false, true, "", ""), true) }
-	| RESET fn_config_name           { $$ = alterFnConfig(parser.NewFunctionConfigOp(true, false, $2, ""), true) }
+	| RESET ALL                      { $$ = alterFnConfig(NewFunctionConfigOp(false, true, "", ""), true) }
+	| RESET fn_config_name           { $$ = alterFnConfig(NewFunctionConfigOp(true, false, $2, ""), true) }
 
 /* CURRENT_USER / SESSION_USER / CURRENT_ROLE all collapse to the sentinel
    "current_user", and so does an unparsable name (ddl.go's else branch). */
@@ -3106,7 +3117,7 @@ alter_fn_owner:
 
 drop_misc_stmt:
 		DROP drop_compat_kind opt_if_exists_drop drop_name_list opt_drop_behavior
-			{ $$ = parser.NewDropCompatStmt($<p>1, $2, $3, $4, dropBehavior($5)) }
+			{ $$ = NewDropCompatStmt($<p>1, $2, $3, $4, dropBehavior($5)) }
 	/* AGGREGATE and OPERATOR carry a signature; the names list is single. */
 	/* An aggregate keeps only its FIRST argument type (the AST comment on
 	   DropCompatStmt.ArgTypes says so, and parseDropAggregate reads one). */
@@ -3116,34 +3127,34 @@ drop_misc_stmt:
 			{ $$ = dropWithArgs($<p>1, "operator", $3, $4, $6, dropBehavior($8)) }
 	| DROP OPERATOR opclass_or_family opt_if_exists_drop qualified_name USING ColId opt_drop_behavior
 			{
-				st := parser.NewDropCompatStmt($<p>1, $3, $4, []parser.ObjectName{objectNameFromQn($5)}, dropBehavior($8))
-				parser.SetDropCompatExtras(st, nil, $7, nil, "", "")
+				st := NewDropCompatStmt($<p>1, $3, $4, []ObjectName{objectNameFromQn($5)}, dropBehavior($8))
+				SetDropCompatExtras(st, nil, $7, nil, "", "")
 				$$ = st
 			}
 	| DROP CAST opt_if_exists_drop '(' fn_type AS fn_type ')' opt_drop_behavior
 			{
-				st := parser.NewDropCompatStmt($<p>1, "cast", $3, nil, dropBehavior($9))
-				parser.SetDropCompatExtras(st, nil, "", []string{typeNameOf($5), typeNameOf($7)}, "", "")
+				st := NewDropCompatStmt($<p>1, "cast", $3, nil, dropBehavior($9))
+				SetDropCompatExtras(st, nil, "", []string{typeNameOf($5), typeNameOf($7)}, "", "")
 				$$ = st
 			}
 	| DROP TRANSFORM opt_if_exists_drop FOR fn_type LANGUAGE ColId opt_drop_behavior
 			{
-				st := parser.NewDropCompatStmt($<p>1, "transform", $3, nil, dropBehavior($8))
-				parser.SetDropCompatExtras(st, nil, "", nil, typeNameOf($5), lowerIdent($7))
+				st := NewDropCompatStmt($<p>1, "transform", $3, nil, dropBehavior($8))
+				SetDropCompatExtras(st, nil, "", nil, typeNameOf($5), lowerIdent($7))
 				$$ = st
 			}
 	/* The five kinds with their own AST node. RULE and POLICY name an object
 	   ON a table; the other three take a bare name. */
 	| DROP RULE opt_if_exists_drop ColId ON qualified_name opt_drop_behavior
-			{ $$ = parser.NewDropRuleStmt($<p>1, $4, objectNameFromQn($6), $3) }
+			{ $$ = NewDropRuleStmt($<p>1, $4, objectNameFromQn($6), $3) }
 	| DROP POLICY opt_if_exists_drop ColId ON qualified_name opt_drop_behavior
-			{ $$ = parser.NewDropPolicyStmt($<p>1, $4, objectNameFromQn($6), $3) }
+			{ $$ = NewDropPolicyStmt($<p>1, $4, objectNameFromQn($6), $3) }
 	| DROP PUBLICATION opt_if_exists_drop ColId opt_drop_behavior
-			{ $$ = parser.NewDropPublicationStmt($<p>1, $4, $3) }
+			{ $$ = NewDropPublicationStmt($<p>1, $4, $3) }
 	| DROP SUBSCRIPTION opt_if_exists_drop ColId opt_drop_behavior
-			{ $$ = parser.NewDropSubscriptionStmt($<p>1, $4, $3) }
+			{ $$ = NewDropSubscriptionStmt($<p>1, $4, $3) }
 	| DROP TABLESPACE opt_if_exists_drop ColId opt_drop_behavior
-			{ $$ = parser.NewDropTablespaceStmt($<p>1, $4, $3) }
+			{ $$ = NewDropTablespaceStmt($<p>1, $4, $3) }
 
 opclass_or_family:
 		CLASS      { $$ = "operator class" }
@@ -3218,7 +3229,7 @@ drop_arg_type:
 
    These four have clean, fully-specified ASTs. The rest of the remaining DDL
    splits into two other groups, neither of which belongs here: the classes
-   goopg parses ABOVE parser.Parse (role DDL, GRANT/REVOKE — parser.Parse
+   goopg parses ABOVE Parse (role DDL, GRANT/REVOKE — Parse
    REJECTS `CREATE ROLE r` outright), and the parse-and-ignore compat classes
    whose legacy handler is a token walk ending in parseSkipToSemicolon, which a
    grammar cannot reproduce without accepting arbitrary token soup.
@@ -3226,14 +3237,14 @@ drop_arg_type:
 
 drop_database_stmt:
 		DROP DATABASE opt_if_exists_drop drop_name_list opt_drop_behavior
-			{ $$ = parser.NewDropCompatStmt($<p>1, "database", $3, $4, dropBehavior($5)) }
+			{ $$ = NewDropCompatStmt($<p>1, "database", $3, $4, dropBehavior($5)) }
 
 /* The extension NAME and every option value take a string literal as well as
    an identifier, and legacy stores the RAW token value either way. */
 create_extension_stmt:
 		CREATE EXTENSION opt_if_not_exists ext_name opt_WITH_kw ext_opts
 			{
-				st := parser.NewCreateExtensionStmt($<p>1, $4, $3)
+				st := NewCreateExtensionStmt($<p>1, $4, $3)
 				applyExtOpts(st, $6)
 				$$ = st
 			}
@@ -3255,15 +3266,15 @@ ext_opt:
    RenameSchema / AlterSchemaOwner) and so does legacy. */
 alter_schema_stmt:
 		ALTER SCHEMA ColId RENAME TO ColId
-			{ $$ = parser.NewAlterSchemaStmt($<p>1, $3, "rename", $6, "") }
+			{ $$ = NewAlterSchemaStmt($<p>1, $3, "rename", $6, "") }
 	| ALTER SCHEMA ColId OWNER TO alter_fn_owner
-			{ $$ = parser.NewAlterSchemaStmt($<p>1, $3, "owner", "", $6) }
+			{ $$ = NewAlterSchemaStmt($<p>1, $3, "owner", "", $6) }
 
 create_policy_stmt:
 		CREATE POLICY ColId ON qualified_name opt_policy_as opt_policy_for
 		opt_policy_to opt_policy_using opt_policy_check
 			{
-				st := parser.NewCreatePolicyStmt($<p>1, $3, objectNameFromQn($5))
+				st := NewCreatePolicyStmt($<p>1, $3, objectNameFromQn($5))
 				if $6 != "" {
 					st.Permissive = $6 == "permissive"
 				}
@@ -3296,11 +3307,11 @@ policy_role_list:
 	| policy_role_list ',' ColId       { $$ = append($1, $3) }
 
 opt_policy_using:
-		/* empty */                 { $$ = (parser.Expr)(nil) }
+		/* empty */                 { $$ = (Expr)(nil) }
 	| USING '(' a_expr ')'          { $$ = $3 }
 
 opt_policy_check:
-		/* empty */                 { $$ = (parser.Expr)(nil) }
+		/* empty */                 { $$ = (Expr)(nil) }
 	| WITH CHECK '(' a_expr ')'     { $$ = $4 }
 
 /* ============================================================================
@@ -3315,9 +3326,7 @@ opt_policy_check:
 alter_sequence_stmt:
 		ALTER SEQUENCE opt_if_exists_drop qualified_name alter_seq_opts
 			{
-				st := parser.NewAlterSequenceStmt($<p>1, objectNameFromQn($4), $3)
-				applyAlterSeqOpts(st, $5)
-				$$ = st
+				$$ = buildAlterSequence($<p>1, objectNameFromQn($4), $3, $5)
 			}
 
 alter_seq_opts:
@@ -3343,11 +3352,21 @@ alter_seq_opt:
 	| SET LOGGED                              { $$ = altSeqLogged("logged") }
 	| SET UNLOGGED                            { $$ = altSeqLogged("unlogged") }
 	| OWNED BY seq_owner                      { $$ = altSeqOwnedBy($3) }
+	/* RENAME / OWNER TO / SET SCHEMA are RELATION operations, not sequence
+	   options: ddl.go routes all three to an AlterTableStmt carrying
+	   TagOverride "ALTER SEQUENCE" (a sequence IS a relation, and the three
+	   actions are shared with tables), and AlterSequenceStmt has no field for
+	   any of them. They are alternatives HERE rather than separate statement
+	   arms so SET keeps a single decision point — SET SCHEMA as its own arm
+	   was reduce/reduce against SET LOGGED. */
+	| RENAME TO ColId                         { $$ = altSeqRelOp("rename", $3) }
+	| OWNER TO alter_fn_owner                 { $$ = altSeqRelOp("owner", $3) }
+	| SET SCHEMA ColId                        { $$ = altSeqRelOp("schema", $3) }
 
 alter_type_stmt:
 		ALTER TYPE_P qualified_name alter_type_action
 			{
-				st := parser.NewAlterTypeStmt($<p>1, objectNameFromQn($3))
+				st := NewAlterTypeStmt($<p>1, objectNameFromQn($3))
 				$4.(alterTypeOp)(st)
 				$$ = st
 			}
@@ -3374,11 +3393,11 @@ attr_cmd_list:
 
 attr_cmd:
 		ADD_P ATTRIBUTE attr_name fn_type opt_field_collate opt_drop_behavior
-			{ $$ = parser.NewAlterTypeAttrCmd("add", lowerIdent($3), rawTypeSpan(yylex, $<p>4), $5, false) }
+			{ $$ = NewAlterTypeAttrCmd("add", lowerIdent($3), rawTypeSpan(yylex, $<p>4), $5, false) }
 	| DROP ATTRIBUTE opt_if_exists_drop attr_name opt_drop_behavior
-			{ $$ = parser.NewAlterTypeAttrCmd("drop", lowerIdent($4), "", "", $3) }
+			{ $$ = NewAlterTypeAttrCmd("drop", lowerIdent($4), "", "", $3) }
 	| ALTER ATTRIBUTE attr_name opt_set_data TYPE_P fn_type opt_field_collate opt_drop_behavior
-			{ $$ = parser.NewAlterTypeAttrCmd("alter", lowerIdent($3), rawTypeSpan(yylex, $<p>6), $7, false) }
+			{ $$ = NewAlterTypeAttrCmd("alter", lowerIdent($3), rawTypeSpan(yylex, $<p>6), $7, false) }
 
 /* Legacy reads an attribute name with parseIdent, which takes any TokenIdent —
    and goopg's lexer emits ONLY as one, so `ADD ATTRIBUTE only int` is legal
@@ -3408,9 +3427,13 @@ alter_domain_action:
 	| DROP NOT NULL_P                         { $$ = altDomAction("dropnotnull") }
 	| SET DEFAULT a_expr                      { e := $3; $$ = altDomDefault(e) }
 	| DROP DEFAULT                            { $$ = altDomAction("dropdefault") }
-	| ADD_P check_body                        { $$ = altDomAddCheck(yylex, "", $<p>2) }
-	| ADD_P CONSTRAINT ColId check_body       { $$ = altDomAddCheck(yylex, $3, $<p>4) }
-	| DROP CONSTRAINT opt_if_exists_drop ColId { $$ = altDomDropConstraint($3, $4) }
+	/* NOT VALID rides the domain constraint too (gram.y AlterDomainStmt's
+	   ConstraintAttributeSpec); legacy parses and drops it. */
+	| ADD_P check_body opt_constr_attrs               { $$ = altDomAddCheck(yylex, "", $<p>2) }
+	| ADD_P CONSTRAINT ColId check_body opt_constr_attrs { $$ = altDomAddCheck(yylex, $3, $<p>4) }
+	/* The drop behaviour is parsed and DROPPED — AlterDomainStmt has no field
+	   for it, and ddl.go consumes the word the same way. */
+	| DROP CONSTRAINT opt_if_exists_drop ColId opt_drop_behavior { $$ = altDomDropConstraint($3, $4) }
 	| RENAME CONSTRAINT ColId TO ColId        { $$ = altDomRenameConstraint($3, $5) }
 	| RENAME TO ColId                         { $$ = altDomRenameTo($3) }
 	| OWNER TO alter_fn_owner                 { $$ = altDomOwner($3) }
@@ -3429,10 +3452,15 @@ alter_domain_action:
 copy_stmt:
 		COPY qualified_name opt_copy_cols copy_dir copy_endpoint opt_copy_opts
 			{
-				st := parser.NewCopyStmt($<p>1)
+				st := NewCopyStmt($<p>1)
 				st.Table, st.Columns = objectNameFromQn($2), $3
-				st.Direction = parser.CopyDirection($4)
+				st.Direction = CopyDirection($4)
 				ep := $5.(*copyEndpoint)
+				/* The endpoint is only legal in ONE direction, and the check
+				   needs both — so it lives here, not in copy_endpoint, which
+				   reduces before the direction is on the stack. copy.go
+				   raises the same two messages. */
+				checkCopyEndpointDir(yylex, st.Direction, ep, $<p>5)
 				st.Endpoint, st.Filename = ep.kind, ep.name
 				st.Options = $6
 				$$ = st
@@ -3441,9 +3469,9 @@ copy_stmt:
 	   error rather than an explanatory one. */
 	| COPY '(' copy_inner ')' TO copy_endpoint opt_copy_opts
 			{
-				st := parser.NewCopyStmt($<p>1)
-				st.Direction = parser.CopyTo
-				if sel, ok := $3.(*parser.SelectStmt); ok {
+				st := NewCopyStmt($<p>1)
+				st.Direction = CopyTo
+				if sel, ok := $3.(*SelectStmt); ok {
 					st.Query = sel
 				} else {
 					st.QueryDML = $3
@@ -3465,8 +3493,8 @@ opt_copy_cols:
 	| '(' colid_list ')'        { $$ = $2 }
 
 copy_dir:
-		FROM      { $$ = int(parser.CopyFrom) }
-	| TO          { $$ = int(parser.CopyTo) }
+		FROM      { $$ = int(CopyFrom) }
+	| TO          { $$ = int(CopyTo) }
 
 /* STDIN / STDOUT / PROGRAM arrive as ordinary identifiers (legacy compares
    t.Value), so they are ColIds rather than terminals; which of them is legal
@@ -3474,27 +3502,27 @@ copy_dir:
 copy_endpoint:
 		ColId              { $$ = copyEndpointWord(yylex, $1, $<p>1) }
 	| ColId SCONST         { $$ = copyEndpointProgram(yylex, $1, $2, $<p>1) }
-	| SCONST               { $$ = &copyEndpoint{kind: parser.CopyEndpointFile, name: $1} }
+	| SCONST               { $$ = &copyEndpoint{kind: CopyEndpointFile, name: $1} }
 
 /* WITH is optional before BOTH option forms: legacy consumes it and then
    checks for '(' , so `WITH DELIMITER ','` is the bare trail with a WITH in
    front of it. */
 opt_copy_opts:
-		/* empty */                        { $$ = []parser.CopyOption(nil) }
+		/* empty */                        { $$ = []CopyOption(nil) }
 	| WITH '(' copy_opt_list ')'           { $$ = $3 }
 	| '(' copy_opt_list ')'                { $$ = $2 }
 	| WITH copy_trail_list                 { $$ = $2 }
 	| copy_trail_list                      { $$ = $1 }
 
 copy_opt_list:
-		copy_opt                           { $$ = []parser.CopyOption{$1} }
+		copy_opt                           { $$ = []CopyOption{$1} }
 	| copy_opt_list ',' copy_opt           { $$ = append($1, $3) }
 
 copy_opt:
-		copy_opt_name                          { $$ = parser.NewCopyOption($<p>1, $1) }
-	| copy_opt_name '*'                        { $$ = parser.CopyOptionStar(parser.NewCopyOption($<p>1, $1)) }
-	| copy_opt_name '(' colid_list ')'         { $$ = parser.CopyOptionCols(parser.NewCopyOption($<p>1, $1), $3) }
-	| copy_opt_name copy_opt_value             { $$ = parser.CopyOptionValue(parser.NewCopyOption($<p>1, $1), $2) }
+		copy_opt_name                          { $$ = NewCopyOption($<p>1, $1) }
+	| copy_opt_name '*'                        { $$ = CopyOptionStar(NewCopyOption($<p>1, $1)) }
+	| copy_opt_name '(' colid_list ')'         { $$ = CopyOptionCols(NewCopyOption($<p>1, $1), $3) }
+	| copy_opt_name copy_opt_value             { $$ = CopyOptionValue(NewCopyOption($<p>1, $1), $2) }
 
 /* Both the NAME and the VALUE take ANY keyword: legacy's parseCopyOption
    accepts a bare TokenIdent-or-TokenKeyword for each, which is how
@@ -3515,18 +3543,18 @@ copy_trail_list:
 	| copy_trail_list copy_trail_item      { $$ = append($1, $2...) }
 
 copy_trail_item:
-		BINARY            { $$ = []parser.CopyOption{parser.NewCopyOption($<p>1, "binary")} }
-	| copy_trail_flag     { $$ = []parser.CopyOption{parser.NewCopyOption($<p>1, $1)} }
+		BINARY            { $$ = []CopyOption{NewCopyOption($<p>1, "binary")} }
+	| copy_trail_flag     { $$ = []CopyOption{NewCopyOption($<p>1, $1)} }
 	| copy_trail_str SCONST
-			{ $$ = []parser.CopyOption{parser.CopyOptionValue(parser.NewCopyOption($<p>1, $1), $2)} }
+			{ $$ = []CopyOption{CopyOptionValue(NewCopyOption($<p>1, $1), $2)} }
 	| FORCE QUOTE '*'
-			{ $$ = []parser.CopyOption{parser.CopyOptionStar(parser.NewCopyOption($<p>1, "force_quote"))} }
+			{ $$ = []CopyOption{CopyOptionStar(NewCopyOption($<p>1, "force_quote"))} }
 	| FORCE QUOTE colid_list
-			{ $$ = []parser.CopyOption{parser.CopyOptionCols(parser.NewCopyOption($<p>1, "force_quote"), $3)} }
+			{ $$ = []CopyOption{CopyOptionCols(NewCopyOption($<p>1, "force_quote"), $3)} }
 	| FORCE NOT NULL_P colid_list
-			{ $$ = []parser.CopyOption{parser.CopyOptionCols(parser.NewCopyOption($<p>1, "force_not_null"), $4)} }
+			{ $$ = []CopyOption{CopyOptionCols(NewCopyOption($<p>1, "force_not_null"), $4)} }
 	| FORCE NULL_P colid_list
-			{ $$ = []parser.CopyOption{parser.CopyOptionCols(parser.NewCopyOption($<p>1, "force_null"), $3)} }
+			{ $$ = []CopyOption{CopyOptionCols(NewCopyOption($<p>1, "force_null"), $3)} }
 
 copy_trail_flag:
 		CSV        { $$ = "csv" }
@@ -3552,8 +3580,8 @@ alter_index_stmt:
 	   records the statistics target as TEXT, not as an integer. */
 		ALTER INDEX qualified_name ALTER opt_COLUMN alter_idx_col SET STATISTICS signed_iconst
 			{
-				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
-				a := parser.NewATAction(parser.AlterTableSetStatistics)
+				st := NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
+				a := NewATActionAt(AlterTableSetStatistics, $<p>1)
 				a.ColumnName, a.CheckExpr = $6, atStatValue($9)
 				st.Actions = append(st.Actions, *a)
 				$$ = st
@@ -3562,24 +3590,24 @@ alter_index_stmt:
 	   TABLE's identical spelling which records it in SetOptions. */
 	| ALTER INDEX qualified_name ALTER opt_COLUMN alter_idx_col SET '(' str_pair_list ')'
 			{
-				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
-				a := parser.NewATAction(parser.AlterTableAlterColumnSet)
+				st := NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
+				a := NewATActionAt(AlterTableAlterColumnSet, $<p>1)
 				a.ColumnName = $6
 				st.Actions = append(st.Actions, *a)
 				$$ = st
 			}
 	| ALTER INDEX qualified_name SET TABLESPACE ColId
 			{
-				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "ALTER INDEX")
-				a := parser.NewATAction(parser.AlterTableSetTablespace)
+				st := NewAlterIndexStmt($<p>1, objectNameFromQn($3), "ALTER INDEX")
+				a := NewATActionAt(AlterTableSetTablespace, $<p>3)
 				a.TablespaceName = $6
 				st.Actions = append(st.Actions, *a)
 				$$ = st
 			}
 	| ALTER INDEX qualified_name SET '(' str_pair_list ')'
 			{
-				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
-				a := parser.NewATAction(parser.AlterIndexSetReloptions)
+				st := NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
+				a := NewATActionAt(AlterIndexSetReloptions, $<p>1)
 				a.With = strPairMap($6)
 				st.Actions = append(st.Actions, *a)
 				$$ = st
@@ -3589,16 +3617,16 @@ alter_index_stmt:
 	| ALTER INDEX qualified_name ATTACH PARTITION qualified_name
 			{
 				parent := objectNameFromQn($3)
-				st := parser.NewAlterIndexStmt($<p>1, parent, "")
-				a := parser.NewATAction(parser.AlterIndexAttachPartition)
+				st := NewAlterIndexStmt($<p>1, parent, "")
+				a := NewATActionAt(AlterIndexAttachPartition, $<p>1)
 				a.ConstraintName, a.ChildIndexName = parent.Name, objectNameFromQn($6).Name
 				st.Actions = append(st.Actions, *a)
 				$$ = st
 			}
 	| ALTER INDEX qualified_name RENAME TO ColId
 			{
-				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "ALTER INDEX")
-				a := parser.NewATAction(parser.AlterTableRenameTable)
+				st := NewAlterIndexStmt($<p>1, objectNameFromQn($3), "ALTER INDEX")
+				a := NewATActionAt(AlterTableRenameTable, $<p>3)
 				a.NewName = $6
 				st.Actions = append(st.Actions, *a)
 				$$ = st
@@ -3618,7 +3646,7 @@ alter_idx_col:
 alter_view_stmt:
 		ALTER VIEW opt_if_exists_drop qualified_name alter_view_action
 			{
-				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($4), "ALTER VIEW")
+				st := NewAlterIndexStmt($<p>1, objectNameFromQn($4), "ALTER VIEW")
 				st.IfExists = $3
 				$5.(alterViewOp)(st)
 				$$ = st
@@ -3640,22 +3668,22 @@ alter_view_action:
    ========================================================================= */
 
 listen_stmt:
-		LISTEN ColId              { $$ = parser.NewListenStmt($<p>1, $2) }
+		LISTEN ColId              { $$ = NewListenStmt($<p>1, $2) }
 
 notify_stmt:
-		NOTIFY ColId              { $$ = parser.NewNotifyStmt($<p>1, $2, "", false) }
-	| NOTIFY ColId ',' SCONST     { $$ = parser.NewNotifyStmt($<p>1, $2, $4, true) }
+		NOTIFY ColId              { $$ = NewNotifyStmt($<p>1, $2, "", false) }
+	| NOTIFY ColId ',' SCONST     { $$ = NewNotifyStmt($<p>1, $2, $4, true) }
 
 unlisten_stmt:
-		UNLISTEN ColId            { $$ = parser.NewUnlistenStmt($<p>1, $2, false) }
-	| UNLISTEN '*'                { $$ = parser.NewUnlistenStmt($<p>1, "", true) }
+		UNLISTEN ColId            { $$ = NewUnlistenStmt($<p>1, $2, false) }
+	| UNLISTEN '*'                { $$ = NewUnlistenStmt($<p>1, "", true) }
 
 /* Only SET SCHEMA has a real AST; legacy answers every other ALTER
    MATERIALIZED VIEW form with a CompatNoopStmt, so the dispatcher gates on it. */
 alter_matview_stmt:
 		ALTER MATERIALIZED VIEW qualified_name SET SCHEMA ColId
 			{
-				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($4), "ALTER MATERIALIZED VIEW")
+				st := NewAlterIndexStmt($<p>1, objectNameFromQn($4), "ALTER MATERIALIZED VIEW")
 				st.SetSchema = $7
 				$$ = st
 			}

@@ -666,11 +666,14 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 	}
 	switch c.ConstType {
 	case OidInt4, OidInt8:
-		v := int64FromByvalWord(c.Datum)
-		if v < 0 {
-			return &parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.IntegerConst{Value: -v}}, nil
-		}
-		return &parser.IntegerConst{Value: v}, nil
+		// A negative value is ONE IntegerConst, not UnaryOp over a positive
+		// one. That shape is what resolve→Rebuild→re-resolve has to be a
+		// fixed point of, and the fixed point moved with P7.1: gram.y's
+		// AexprConst folds the sign into the constant, so `DEFAULT -1` now
+		// parses as IntegerConst{-1}. The UnaryOp form was the old
+		// recursive-descent parser's shape, and rebuilding into it made the
+		// pg_node_tree round-trip render `'-1'::integer`.
+		return &parser.IntegerConst{Value: int64FromByvalWord(c.Datum)}, nil
 	case OidInt2:
 		// An int2 Const only arises from folding an unknown-type string literal
 		// (`'5'::int2` / `col int2 DEFAULT '5'`) — a bare integer literal is int4 and

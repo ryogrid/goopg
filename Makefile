@@ -208,18 +208,18 @@ gen-parser:
 	mkdir -p tmp
 	cat grammar/header.y grammar/tokens_gen.y grammar/pg_grammar.y grammar/kwlists_gen.y grammar/goopg_ext.y > tmp/goopg_grammar.y
 	printf '\n%%%%\n' >> tmp/goopg_grammar.y
-	cd internal/sqlparser && $(GOYACC) -o yacc_parser.go -v y.output ../../tmp/goopg_grammar.y 2> yacc_stderr.txt \
+	cd internal/parser && $(GOYACC) -o yacc_parser.go -v y.output ../../tmp/goopg_grammar.y 2> yacc_stderr.txt \
 		|| { cat yacc_stderr.txt; exit 1; }
 	go run ./cmd/gen-tokennums-go
-	@conflicts=$$(grep -cE '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null || echo 999); \
+	@conflicts=$$(grep -cE '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/parser/y.output 2>/dev/null || echo 999); \
 	if [ "$$conflicts" -ne 59 ]; then \
 		echo "ERROR: $$conflicts grammar conflicts (expected exactly 59 known: IF_P x32, SAVEPOINT = ROLLBACK TO [SAVEPOINT] name (SAVEPOINT is unreserved so it is also a valid ColId; shift wins, keyword form, matching PG) = one per opt_if_exists_drop/opt_if_not_exists user, '(' x13 = EXISTS/EXTRACT/TRIM/SUBSTRING/OVERLAY/POSITION/GROUPING/ROLLUP+CUBE keyword-call vs the same word as a ColId, plus TIME/TIMESTAMP '(' prec ')' vs col_type_name's trailing typmod (shift wins; both spellings yield the same Args), '[' x2 = subscript, ')' x1 = nested derived-table parens FROM ((SELECT ..)) x shift into select_with_parens rather than reduce an empty opt_derived_alias -- shift is the legacy parse, ON x2 = join ON, and DISTINCT.ON '(' vs reducing an empty opt_target_list (shift wins in both, so DISTINCT ON keeps binding), SESSION x2 + LOCAL + CONSTRAINTS = keyword form vs empty set_scope after SET (the second SESSION is SET LOCAL SESSION AUTHORIZATION), all shift, matching PG, IN_P x1 = a function argument's DEFAULT expression vs `x IN (...)` -- shift wins, so the IN belongs to the default expression, which is legacy's parse; SAVEPOINT x1 covers RELEASE SAVEPOINT name too, COLLATE x1 = a domain DEFAULT expression's own COLLATE vs the domain-level one -- shift wins, so it binds to the expression, which is legacy's parse, EXECUTE x1 = a trigger's FOR EACH vs EACH read as the ROW/STATEMENT word itself -- shift wins, which is the FOR EACH ROW reading, CLASS + FAMILY x1 each = DROP OPERATOR CLASS|FAMILY vs reducing an empty opt_if_exists_drop before an operator name -- shift wins, so the two-word kind is kept). Keep this message in sync with the number above."; exit 1; fi; \
-	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null | grep -vE "on '\\('" | grep -vE "on '\\.'" | grep -vE "on '\\['" | grep -vE "on '\\)'" | grep -vE "on ON" | grep -vE "on IF_P" | grep -vE "on NOT" | grep -vE "on SESSION" | grep -vE "on LOCAL" | grep -vE "on CONSTRAINTS" | grep -vE "on SAVEPOINT" | grep -vE "on IN_P" | grep -vE "on COLLATE" | grep -vE "on EXECUTE" | grep -vE "on CLASS" | grep -vE "on FAMILY" | grep -c .); \
+	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/parser/y.output 2>/dev/null | grep -vE "on '\\('" | grep -vE "on '\\.'" | grep -vE "on '\\['" | grep -vE "on '\\)'" | grep -vE "on ON" | grep -vE "on IF_P" | grep -vE "on NOT" | grep -vE "on SESSION" | grep -vE "on LOCAL" | grep -vE "on CONSTRAINTS" | grep -vE "on SAVEPOINT" | grep -vE "on IN_P" | grep -vE "on COLLATE" | grep -vE "on EXECUTE" | grep -vE "on CLASS" | grep -vE "on FAMILY" | grep -c .); \
 	if [ "$$nonparen" -gt 0 ]; then \
 		echo "ERROR: $$nonparen conflict(s) NOT on the known set ('(' ')' '.' '[' ON IF_P NOT SESSION LOCAL CONSTRAINTS SAVEPOINT IN_P COLLATE EXECUTE CLASS FAMILY) — inspect y.output"; exit 1; fi; \
 	if [ "$$conflicts" -ge 1 ]; then \
 		echo 'NOTE: '"$$conflicts"' known S/R(s) on (/./[ = func_call/extract vs paren, qualified cast target'; fi
-	rm -f internal/sqlparser/yacc_stderr.txt internal/sqlparser/y.output
+	rm -f internal/parser/yacc_stderr.txt internal/parser/y.output
 
 # Regenerate every derived doc from the consolidated inventory CSV. Run in the
 # same commit that edits the CSV so the renders never drift from the authority.

@@ -74,6 +74,12 @@ func (e *SyntaxError) Error() string {
 //
 // mc follows the same contract as Parse: it is a retained no-op (see Parse).
 func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
+	return parseExprBatch(input, true, mc...)
+}
+
+// parseExprBatch is ParseExpr's parseBatch: useYacc=false forces the legacy
+// leg, for the differential tests only. See parseLegacyOnly.
+func parseExprBatch(input string, useYacc bool, mc ...*mmgr.Context) (Expr, error) {
 	var sctx *mmgr.Context
 	if len(mc) > 0 {
 		sctx = mc[0]
@@ -106,8 +112,8 @@ func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
 	p.idx = 0
 	p.src = input
 
-	if RouteExprBatch != nil {
-		if e, handled, herr := RouteExprBatch(p.src, toks); handled {
+	if useYacc {
+		if e, handled, herr := routeExpr(p.src, toks); handled {
 			tokenSlicePool.Put(sp)
 			if herr != nil {
 				return nil, herr
@@ -146,22 +152,26 @@ func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
 // some Value strings by reference (arena release would dangle them). mc is now
 // a no-op retained for source compatibility; tokens always come from the
 // heap-backed tokenSlicePool. See docs/design/0107-0003d-token-pool-gc-safety.md.
-// RouteBatch is the parser-rewrite dispatch hook (docs/design/not_ralph/
-// 03-strangler-migration.md §2): when non-nil it receives the freshly lexed
-// token slice and either owns the whole batch (handled=true, stmts valid) or
-// declines (handled=false → the legacy recursive-descent path below runs).
-// Wired by production startup code to sqlparser.RouteBatch; nil in tests and
-// by default, which keeps behavior identical to pre-rewrite Parse.
-var RouteBatch func(src string, toks []Token) (stmts []Stmt, handled bool, err error)
-
-// RouteExprBatch is ParseExpr's counterpart of RouteBatch: when non-nil it
-// gets every expression token slice ParseExpr lexes and either owns it
-// (handled=true) or declines (handled=false → the legacy path below runs).
-// Wired alongside RouteBatch by postmaster; nil by default keeps ParseExpr
-// fully legacy.
-var RouteExprBatch func(src string, toks []Token) (expr Expr, handled bool, err error)
-
+// Parse is the single entry point. It lexes the batch and offers it to the
+// LALR parser (routeBatch); a batch every fragment of whose class is ported
+// is owned by it wholesale, and anything else falls through to the legacy
+// recursive-descent body below. Before P7.1 these two parsers lived in
+// separate packages joined by a function-pointer hook wired from postmaster;
+// they are one package now, so the call is direct.
+//
+// parseLegacyOnly forces the fall-through. It exists ONLY for the
+// differential tests: with both parsers in one package, a diffParse whose
+// "legacy" leg called Parse would compare the yacc parser against itself and
+// pass while testing nothing.
 func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
+	return parseBatch(input, true, mc...)
+}
+
+func parseLegacyOnly(input string) ([]Stmt, error) {
+	return parseBatch(input, false)
+}
+
+func parseBatch(input string, useYacc bool, mc ...*mmgr.Context) ([]Stmt, error) {
 	var sctx *mmgr.Context
 	if len(mc) > 0 {
 		sctx = mc[0]
@@ -197,8 +207,8 @@ func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 	// performs its own Put on each exit (a premature Put here handed the
 	// backing array to a concurrent lexInto mid-parse; pgbench smoke caught
 	// it as cross-client token corruption).
-	if RouteBatch != nil {
-		stmts, handled, rerr := RouteBatch(input, toks)
+	if useYacc {
+		stmts, handled, rerr := routeBatch(input, toks)
 		if handled || rerr != nil {
 			if sp != nil {
 				tokenSlicePool.Put(sp)
@@ -1049,26 +1059,36 @@ func (p *parser) errAtCur(msg string) error {
 // say nothing more.
 func (p *parser) errSyntaxAtCur() error {
 	t := p.cur()
-	near := t.Value
-	if t.Kind == TokenEOF {
-		near = "end of input"
-	} else if t.Kind == TokenIdent {
+	return &SyntaxError{Pos: t.Pos, Message: nearTextOf(t)}
+}
+
+// nearTextOf returns the text PG's scanner_yyerror echoes after "at or near"
+// for a token: its RAW SOURCE spelling. A string literal keeps its quotes with
+// embedded ones doubled, a quoted identifier likewise; a plain identifier is
+// bare. This is SyntaxError.Message's contract — Error() adds the wrapper — so
+// both parsers must build it the same way or a caller that reads the field
+// (rather than the formatted string) sees two different shapes.
+func nearTextOf(t Token) string {
+	switch t.Kind {
+	case TokenEOF:
+		return "end of input"
+	case TokenIdent:
 		// PG lexes some words as keywords (e.g. OIDS) and prints them uppercase
 		// in "syntax error at or near" messages. Mirror that for known soft keywords.
 		switch strings.ToLower(t.Value) {
 		case "oids":
-			near = strings.ToUpper(t.Value)
+			return strings.ToUpper(t.Value)
 		}
-	} else if t.Kind == TokenStringLit {
-		// PG's scanner_yyerror echoes the raw source text of the offending
-		// token (postgres/src/backend/parser/scan.c scanner_yyerror), so a
-		// string literal's "near" text is its quoted source form — not the
-		// decoded value — with embedded quotes doubled.
-		near = "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
-	} else if t.Kind == TokenQuotedIdent {
-		near = "\"" + strings.ReplaceAll(t.Value, "\"", "\"\"") + "\""
+		return t.Value
+	case TokenStringLit:
+		// postgres/src/backend/parser/scan.c scanner_yyerror echoes the raw
+		// source text, so the "near" text is the QUOTED source form, not the
+		// decoded value.
+		return "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
+	case TokenQuotedIdent:
+		return "\"" + strings.ReplaceAll(t.Value, "\"", "\"\"") + "\""
 	}
-	return &SyntaxError{Pos: t.Pos, Message: near}
+	return t.Value
 }
 
 // expectKeyword consumes the current token if it's the named keyword;

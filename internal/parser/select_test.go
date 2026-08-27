@@ -122,7 +122,13 @@ func TestPowPrecedenceAndAssociativity(t *testing.T) {
 		// highest to lowest") lists unary +/- above ^, and gram.y's UMINUS
 		// token (line 891) is declared after '^' (line 887), i.e. higher
 		// precedence, so -2 reduces before ^ is shifted): -2^2 == (-2)^2.
-		{"SELECT -2^2", "((- 2) ^ 2)"},
+		// P7.1: the SHAPE is unchanged — still (-2)^2, not -(2^2) — but the
+		// sign is now folded into the constant instead of riding a UnaryOp
+		// node. That is the documented unary-minus known-diff
+		// (difftest_known_diffs.md; TestKnownDiffUnaryMinusFold), matching
+		// gram.y's AexprConst, and it is what Parse returns now that Parse is
+		// the LALR parser.
+		{"SELECT -2^2", "(-2 ^ 2)"},
 	}
 	for _, c := range cases {
 		stmts, err := Parse(c.in)

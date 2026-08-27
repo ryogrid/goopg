@@ -65,6 +65,10 @@
 %type <node>	opt_with_clause
 %type <b>	set_quantifier opt_if_exists_drop opt_restart opt_if_not_exists opt_unique opt_drop_if_exists
 %type <p>	select_pos begin_pos
+%type <node>	idx_tail_list idx_tail_item
+%type <str>	opt_existing_window_name
+%type <exprs>	opt_partition_clause
+%type <sortbys>	opt_window_sort
 %type <node>	opt_all_distinct
 %type <targets>	opt_target_list target_list
 %type <rt>	target_el
@@ -140,7 +144,7 @@
 %type <str>	explain_opt_name explain_opt_value
 %type <node>	group_by_item group_by_list gs_list gs_elem fk_set_act opt_check_option tbl_check_tail
 %type <strs>	opt_fk_set_cols
-%type <b>	opt_fk_match opt_enforced opt_gen_storage opt_idx_nnd
+%type <b>	opt_fk_match opt_enforced opt_gen_storage
 %type <strs>	opt_view_with
 %type <ctt>	ct_tail_list ct_tail_item
 %type <str>	opt_tablespace opt_idx_tablespace check_body opt_ins_alias
@@ -249,7 +253,7 @@
 %%
 
 /* root / stmt_list — gram.y :961 stmtmulti (statement-per-';' batch), */
-/* adapted: the start production hands the finished []parser.Stmt to the */
+/* adapted: the start production hands the finished []Stmt to the */
 /* lexer state instead of returning a node list. */
 root:
 		/* empty */
@@ -282,7 +286,7 @@ stmt:
 stmt_list:
 		stmt
 			{
-				$$ = []parser.Stmt{$1}
+				$$ = []Stmt{$1}
 			}
 	| stmt_list ';' stmt
 			{
@@ -303,41 +307,41 @@ explainable_stmt:
 	   parseExplainOneOption does. */
 		EXPLAIN explainable_stmt
 			{
-				$$ = parser.NewExplainStmt($<p>1, parser.ExplainOptions{}, $2)
+				$$ = NewExplainStmt($<p>1, ExplainOptions{}, $2)
 			}
 	| EXPLAIN ANALYZE explainable_stmt
 			{
-				o := parser.ExplainOptions{Analyze: true}
+				o := ExplainOptions{Analyze: true}
 				o.Set.Analyze = true
-				$$ = parser.NewExplainStmt($<p>1, o, $3)
+				$$ = NewExplainStmt($<p>1, o, $3)
 			}
 	| EXPLAIN VERBOSE explainable_stmt
 			{
-				o := parser.ExplainOptions{Verbose: true}
+				o := ExplainOptions{Verbose: true}
 				o.Set.Verbose = true
-				$$ = parser.NewExplainStmt($<p>1, o, $3)
+				$$ = NewExplainStmt($<p>1, o, $3)
 			}
 	| EXPLAIN ANALYZE VERBOSE explainable_stmt
 			{
-				o := parser.ExplainOptions{Analyze: true, Verbose: true}
+				o := ExplainOptions{Analyze: true, Verbose: true}
 				o.Set.Analyze, o.Set.Verbose = true, true
-				$$ = parser.NewExplainStmt($<p>1, o, $4)
+				$$ = NewExplainStmt($<p>1, o, $4)
 			}	| EXPLAIN VERBOSE ANALYZE explainable_stmt
 			{
-				o := parser.ExplainOptions{Analyze: true, Verbose: true}
+				o := ExplainOptions{Analyze: true, Verbose: true}
 				o.Set.Analyze, o.Set.Verbose = true, true
-				$$ = parser.NewExplainStmt($<p>1, o, $4)
+				$$ = NewExplainStmt($<p>1, o, $4)
 			}
 	| EXPLAIN '(' explain_opt_list ')' stmt
 			{
-				$$ = parser.NewExplainStmt($<p>1, applyExplainOpts(yylex, $<p>1, $3.([]*explainOpt)), $5)
+				$$ = NewExplainStmt($<p>1, applyExplainOpts(yylex, $<p>1, $3.([]*explainOpt)), $5)
 			}
 	| SelectStmt
 			{
 				// `SELECT ... INTO name` becomes a CreateTableStmt. The wrap
 				// happens HERE and not at the SelectStmt rule, because every
 				// consumer of SelectStmt — CREATE VIEW's body, a derived
-				// table, a CTE — asserts the concrete *parser.SelectStmt, and
+				// table, a CTE — asserts the concrete *SelectStmt, and
 				// handing one of them a CreateTableStmt panics. INTO is only
 				// legal on a top-level statement anyway.
 				$$ = intoWrap(yylex, $1)
@@ -630,7 +634,7 @@ SelectStmt:
 			}
 	| select_with_parens %prec UMINUS
 			{
-				s := $1.(*parser.SelectStmt)
+				s := $1.(*SelectStmt)
 				s.Parenthesized = true
 				$$ = s
 			}
@@ -642,7 +646,7 @@ select_with_parens:
 			}
 	| '(' select_with_parens ')'
 			{
-				s := $2.(*parser.SelectStmt)
+				s := $2.(*SelectStmt)
 				s.Parenthesized = true
 				$$ = s
 			}
@@ -654,7 +658,7 @@ select_no_parens:
 			}
 	| select_with_parens paren_tail
 			{
-				$$ = parenGroup($<p>1, $1.(*parser.SelectStmt), $2.(*parenTail))
+				$$ = parenGroup($<p>1, $1.(*SelectStmt), $2.(*parenTail))
 			}
 
 /* What may follow a parenthesised left operand: legacy's
@@ -665,7 +669,7 @@ select_no_parens:
 paren_tail:
 		setop_op SelectStmt
 			{
-				rt, _ := $2.(*parser.SelectStmt)
+				rt, _ := $2.(*SelectStmt)
 				$$ = &parenTail{op: $1.(*opSpec), right: rt}
 			}
 	| ORDER BY sort_by_list opt_paren_limit opt_paren_offset
@@ -682,11 +686,11 @@ paren_tail:
 			}
 
 opt_paren_limit:
-		/* empty */     { $$ = (parser.Expr)(nil) }
+		/* empty */     { $$ = (Expr)(nil) }
 	| LIMIT a_expr      { $$ = $2 }
 
 opt_paren_offset:
-		/* empty */     { $$ = (parser.Expr)(nil) }
+		/* empty */     { $$ = (Expr)(nil) }
 	| OFFSET a_expr     { $$ = $2 }
 
 select_bare:
@@ -696,18 +700,18 @@ select_bare:
 		   chain. */
 		base_select setop_tail
 			{
-				base, ok := $1.(*parser.SelectStmt)
+				base, ok := $1.(*SelectStmt)
 				if !ok || base == nil {
-					base = parser.NewSelectStmt(0)
+					base = NewSelectStmt(0)
 				}
 				tail := $2.(*setopChain)
 				$$ = foldSetOps(base, tail.pairs)
 			}
 	| with_clause base_select setop_tail
 			{
-				base, ok := $2.(*parser.SelectStmt)
+				base, ok := $2.(*SelectStmt)
 				if !ok || base == nil {
-					base = parser.NewSelectStmt(0)
+					base = NewSelectStmt(0)
 				}
 				if wc := $1; wc != nil {
 					// Legacy: With attaches to the OUTERMOST select only.
@@ -722,7 +726,7 @@ select_bare:
 base_select:
 		simple_select opt_sort_clause
 			{
-				m := $1.(*parser.SelectStmt)
+				m := $1.(*SelectStmt)
 				m.OrderBy = $2
 				if err := rewriteIndirectionStars(yylex, m); err != nil {
 					return 1
@@ -738,21 +742,21 @@ base_select:
 	   every FOR UPDATE. */
 	| simple_select opt_sort_clause select_limit opt_for_locking
 			{
-				m := $1.(*parser.SelectStmt)
+				m := $1.(*SelectStmt)
 				m.OrderBy = $2
 				if sl, ok := $3.(*selectLimit); ok && sl != nil {
 					m.Limit = sl.count
 					m.Offset = sl.offset
 					m.WithTies = sl.withTies
 				}
-				m.Locking, _ = $4.([]*parser.LockingClause)
+				m.Locking, _ = $4.([]*LockingClause)
 				$$ = m
 			}
 	| simple_select opt_sort_clause for_locking_clause opt_select_limit
 			{
-				m := $1.(*parser.SelectStmt)
+				m := $1.(*SelectStmt)
 				m.OrderBy = $2
-				m.Locking, _ = $3.([]*parser.LockingClause)
+				m.Locking, _ = $3.([]*LockingClause)
 				if sl, ok := $4.(*selectLimit); ok && sl != nil {
 					m.Limit = sl.count
 					m.Offset = sl.offset
@@ -806,34 +810,34 @@ opt_for_locking:
 for_locking_clause:
 		for_locking_item
 			{
-				$$ = []*parser.LockingClause{$1.(*parser.LockingClause)}
+				$$ = []*LockingClause{$1.(*LockingClause)}
 			}
 	| for_locking_clause for_locking_item
 			{
-				$$ = append($1.([]*parser.LockingClause), $2.(*parser.LockingClause))
+				$$ = append($1.([]*LockingClause), $2.(*LockingClause))
 			}
 
 for_locking_item:
 		for_locking_strength opt_locked_rels opt_lock_wait_policy
 			{
-				$$ = parser.NewLockingClause(yylex.(*lexerState).lastConsumedPos(),
-					$1.(parser.LockStrength), $2, $3.(parser.LockWaitPolicy))
+				$$ = NewLockingClause(yylex.(*lexerState).lastConsumedPos(),
+					$1.(LockStrength), $2, $3.(LockWaitPolicy))
 			}
 
 for_locking_strength:
-		FOR UPDATE            { $$ = parser.LockStrengthForUpdate }
-	| FOR SHARE               { $$ = parser.LockStrengthForShare }
-	| FOR NO KEY UPDATE       { $$ = parser.LockStrengthForNoKeyUpdate }
-	| FOR KEY SHARE           { $$ = parser.LockStrengthForKeyShare }
+		FOR UPDATE            { $$ = LockStrengthForUpdate }
+	| FOR SHARE               { $$ = LockStrengthForShare }
+	| FOR NO KEY UPDATE       { $$ = LockStrengthForNoKeyUpdate }
+	| FOR KEY SHARE           { $$ = LockStrengthForKeyShare }
 
 opt_locked_rels:
 		/* empty */           { $$ = nil }
 	| OF colid_list           { $$ = $2 }
 
 opt_lock_wait_policy:
-		/* empty */           { $$ = parser.LockWaitBlock }
-	| NOWAIT                  { $$ = parser.LockWaitNoWait }
-	| SKIP LOCKED             { $$ = parser.LockWaitSkipLocked }
+		/* empty */           { $$ = LockWaitBlock }
+	| NOWAIT                  { $$ = LockWaitNoWait }
+	| SKIP LOCKED             { $$ = LockWaitSkipLocked }
 setop_tail:
 		/* empty */
 			{
@@ -842,38 +846,38 @@ setop_tail:
 	| setop_op SelectStmt
 			{
 				op := $1.(*opSpec)
-				rt, _ := $2.(*parser.SelectStmt)
+				rt, _ := $2.(*SelectStmt)
 				$$ = &setopChain{pairs: []setopPair{{op: op, right: rt}}}
 			}
 
 setop_op:
 		UNION
 			{
-				$$ = &opSpec{typ: parser.SetOpUnion, pos: yylex.(*lexerState).lastConsumedPos()}
+				$$ = &opSpec{typ: SetOpUnion, pos: yylex.(*lexerState).lastConsumedPos()}
 			}
 	| UNION ALL
 			{
-				$$ = &opSpec{typ: parser.SetOpUnion, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
+				$$ = &opSpec{typ: SetOpUnion, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
 			}
 	| UNION DISTINCT
 			{
-				$$ = &opSpec{typ: parser.SetOpUnion, pos: yylex.(*lexerState).lastConsumedPos()}
+				$$ = &opSpec{typ: SetOpUnion, pos: yylex.(*lexerState).lastConsumedPos()}
 			}
 	| INTERSECT
 			{
-				$$ = &opSpec{typ: parser.SetOpIntersect, pos: yylex.(*lexerState).lastConsumedPos()}
+				$$ = &opSpec{typ: SetOpIntersect, pos: yylex.(*lexerState).lastConsumedPos()}
 			}
 	| INTERSECT ALL
 			{
-				$$ = &opSpec{typ: parser.SetOpIntersect, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
+				$$ = &opSpec{typ: SetOpIntersect, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
 			}
 	| EXCEPT
 			{
-				$$ = &opSpec{typ: parser.SetOpExcept, pos: yylex.(*lexerState).lastConsumedPos()}
+				$$ = &opSpec{typ: SetOpExcept, pos: yylex.(*lexerState).lastConsumedPos()}
 			}
 	| EXCEPT ALL
 			{
-				$$ = &opSpec{typ: parser.SetOpExcept, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
+				$$ = &opSpec{typ: SetOpExcept, all: true, pos: yylex.(*lexerState).lastConsumedPos()}
 			}
 
 // select_with_parens — gram.y :12828-12831. goopg addition: mark
@@ -933,7 +937,13 @@ select_pos:
 simple_select:
 		SELECT select_pos opt_all_distinct opt_target_list into_clause opt_from_clause where_clause group_clause having_clause opt_window_clause
 			{
-				s := parser.NewSelectStmt($2)
+				/* ZERO, deliberately. ddl.go/select.go never stamp a
+				   SelectStmt position — every legacy SELECT carries pos 0 —
+				   and select_pos's lastConsumedPos() did not even yield the
+				   SELECT keyword: this rule is a default reduction, so it
+				   returned the offset PAST THE END of the statement (8 for
+				   `SELECT 1`). A wrong caret is worse than none. */
+				s := NewSelectStmt(0)
 				if di, ok := $3.(*distinctInfo); ok && di != nil {
 					s.Distinct = di.distinct
 					s.DistinctOn = di.on
@@ -964,7 +974,7 @@ simple_select:
 				if tgt, ok := $5.(*intoTarget); ok && tgt != nil {
 					l := yylex.(*lexerState)
 					if l.intoFor == nil {
-						l.intoFor = map[*parser.SelectStmt]*intoTarget{}
+						l.intoFor = map[*SelectStmt]*intoTarget{}
 					}
 					l.intoFor[s] = tgt
 				}
@@ -975,21 +985,19 @@ simple_select:
 			}
 	| VALUES_LA values_rows
 			{
-				// lastConsumedPos is the VALUES keyword itself (select_pos
-				// equivalent without the mid-rule empty that would merge
-				// this state with col_name_keyword: VALUES).
-				s := parser.NewSelectStmt(yylex.(*lexerState).lastConsumedPos())
+				// Zero, like every other SelectStmt legacy builds.
+				s := NewSelectStmt(0)
 				s.ValuesRows = $2
 				$$ = s
 			}
 	| TABLE qualified_name
 			{
 				// gram.y :12968 desugars TABLE <rel> to SELECT * FROM <rel>.
-				s := parser.NewSelectStmt(yylex.(*lexerState).lastConsumedPos())
+				s := NewSelectStmt(0)
 				rv := rangeVarFromName($2, "")
-				s.Targets = []parser.ResTarget{parser.NewResTarget(0, "", parser.NewStarExpr(0, "", ""))}
-				s.From = []parser.RangeVar{rv}
-				s.FromExprs = []parser.FromExpr{{Base: rv}}
+				s.Targets = []ResTarget{NewResTarget(0, "", NewStarExpr(0, "", ""))}
+				s.From = []RangeVar{rv}
+				s.FromExprs = []FromExpr{{Base: rv}}
 				$$ = s
 			}
 // opt_sort_clause / sort_by_list / SortBy — gram.y :13196-13220.
@@ -1006,7 +1014,7 @@ opt_sort_clause:
 sort_by_list:
 		SortBy
 			{
-				$$ = []parser.SortBy{$1}
+				$$ = []SortBy{$1}
 			}
 	| sort_by_list ',' SortBy
 			{
@@ -1120,9 +1128,9 @@ array_expr:
 
 array_expr_list:
 		array_expr
-			{ $$ = []parser.Expr{parser.NewArrayConstructorExpr($<p>1, $1)} }
+			{ $$ = []Expr{NewArrayConstructorExpr($<p>1, $1)} }
 	| array_expr_list ',' array_expr
-			{ $$ = append($1, parser.NewArrayConstructorExpr($<p>3, $3)) }
+			{ $$ = append($1, NewArrayConstructorExpr($<p>3, $3)) }
 
 /* SQL-standard argument spellings of SUBSTRING / OVERLAY / POSITION —
    gram.y substr_list / overlay_list / position_list. Legacy rewrites each into
@@ -1132,20 +1140,20 @@ array_expr_list:
    so the keyword rules take them too (the keyword shifts '(' ahead of the
    ColId call path, which would otherwise carry Variadic flags). */
 substr_list:
-		a_expr FROM a_expr                 { $$ = []parser.Expr{$1, $3} }
-	| a_expr FROM a_expr FOR a_expr        { $$ = []parser.Expr{$1, $3, $5} }
+		a_expr FROM a_expr                 { $$ = []Expr{$1, $3} }
+	| a_expr FROM a_expr FOR a_expr        { $$ = []Expr{$1, $3, $5} }
 	| expr_list                            { $$ = $1 }
 
 overlay_list:
-		a_expr PLACING a_expr FROM a_expr              { $$ = []parser.Expr{$1, $3, $5} }
-	| a_expr PLACING a_expr FROM a_expr FOR a_expr     { $$ = []parser.Expr{$1, $3, $5, $7} }
+		a_expr PLACING a_expr FROM a_expr              { $$ = []Expr{$1, $3, $5} }
+	| a_expr PLACING a_expr FROM a_expr FOR a_expr     { $$ = []Expr{$1, $3, $5, $7} }
 	| expr_list                                        { $$ = $1 }
 
 position_list:
-		b_expr IN_P b_expr                 { $$ = []parser.Expr{$3, $1} }
+		b_expr IN_P b_expr                 { $$ = []Expr{$3, $1} }
 	/* b_expr first in both alternatives, so the reduce after the first
 	   argument is the same either way; an a_expr here would reduce/reduce. */
-	| b_expr ',' expr_list                 { $$ = append([]parser.Expr{$1}, $3...) }
+	| b_expr ',' expr_list                 { $$ = append([]Expr{$1}, $3...) }
 
 explain_opt_list:
 		explain_opt                        { $$ = []*explainOpt{$1.(*explainOpt)} }
@@ -1180,7 +1188,7 @@ explain_opt_value:
    COLLATE and operator class. Legacy DROPS both (the opclass here, the
    COLLATE in arbiterFromExprs), so only the expression survives. */
 arbiter_elem_list:
-		arbiter_elem                        { $$ = []parser.Expr{$1} }
+		arbiter_elem                        { $$ = []Expr{$1} }
 	| arbiter_elem_list ',' arbiter_elem    { $$ = append($1, $3) }
 
 arbiter_elem:
@@ -1195,15 +1203,15 @@ sort_using_op:
 SortBy:
 		a_expr
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($1.Pos(), $1, false, "")
 			}
 	| a_expr ASC
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($1.Pos(), $1, false, "")
 			}
 	| a_expr DESC
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, true, "")
+				$$ = NewSortBy($1.Pos(), $1, true, "")
 			}
 	/* NULLS FIRST|LAST without an explicit ASC/DESC — gram.y's sortby is
 	   `a_expr opt_asc_desc opt_nulls_order`, so both parts are optional
@@ -1211,53 +1219,53 @@ SortBy:
 	/* ORDER BY x USING op — gram.y sortby's first alternative. */
 	| a_expr USING sort_using_op
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+				$$ = NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
 			}
 	| a_expr USING sort_using_op NULLS_LA FIRST_P
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+				$$ = NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
 				v := true
 				$$.NullsFirst = &v
 			}
 	| a_expr USING sort_using_op NULLS_LA LAST_P
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+				$$ = NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
 				v := false
 				$$.NullsFirst = &v
 			}
 	| a_expr NULLS_LA FIRST_P
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($1.Pos(), $1, false, "")
 				v := true
 				$$.NullsFirst = &v
 			}
 	| a_expr NULLS_LA LAST_P
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($1.Pos(), $1, false, "")
 				v := false
 				$$.NullsFirst = &v
 			}
 	| a_expr ASC NULLS_LA FIRST_P
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($1.Pos(), $1, false, "")
 				v := true
 				$$.NullsFirst = &v
 			}
 	| a_expr ASC NULLS_LA LAST_P
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($1.Pos(), $1, false, "")
 				v := false
 				$$.NullsFirst = &v
 			}
 	| a_expr DESC NULLS_LA FIRST_P
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, true, "")
+				$$ = NewSortBy($1.Pos(), $1, true, "")
 				v := true
 				$$.NullsFirst = &v
 			}
 	| a_expr DESC NULLS_LA LAST_P
 			{
-				$$ = parser.NewSortBy($1.Pos(), $1, true, "")
+				$$ = NewSortBy($1.Pos(), $1, true, "")
 				v := false
 				$$.NullsFirst = &v
 			}
@@ -1318,12 +1326,12 @@ limit_clause:
 			{
 				/* Countless form: the row count defaults to one
 				   (gram.y makeIntConst(1, -1)). */
-				$$ = &selectLimit{count: parser.NewIntegerConst(0, 1), withTies: true, set: true}
+				$$ = &selectLimit{count: NewIntegerConst(0, 1), withTies: true, set: true}
 			}
 	| FETCH first_or_next row_or_rows ONLY
 			{
 				// Omitted count defaults to 1 (gram.y :13346 alt).
-				$$ = &selectLimit{count: parser.NewIntegerConst(0, 1), set: true}
+				$$ = &selectLimit{count: NewIntegerConst(0, 1), set: true}
 			}
 	| FETCH first_or_next select_fetch_first_value row_or_rows WITH TIES
 			{
@@ -1369,12 +1377,12 @@ select_fetch_first_value:
 			}
 	| '-' ICONST
 			{
-				e := parser.NewIntegerConst(yylex.(*lexerState).lastConsumedPos(), int64(-$2))
+				e := NewIntegerConst(yylex.(*lexerState).lastConsumedPos(), int64(-$2))
 				$$ = e
 			}
 	| '-' FCONST
 			{
-				$$ = parser.NewNumericConst(yylex.(*lexerState).lastConsumedPos(), "-"+$2)
+				$$ = NewNumericConst(yylex.(*lexerState).lastConsumedPos(), "-"+$2)
 			}
 
 /* opt_all_clause/distinct_clause collapsed into one carrier — upstream */
@@ -1422,7 +1430,7 @@ opt_target_list:
 target_list:
 		target_el
 			{
-				$$ = []parser.ResTarget{$1}
+				$$ = []ResTarget{$1}
 			}
 	| target_list ',' target_el
 			{
@@ -1434,20 +1442,20 @@ target_list:
 target_el:
 		a_expr AS as_col_label
 			{
-				$$ = parser.NewResTarget($1.Pos(), $3, $1)
+				$$ = NewResTarget($1.Pos(), $3, $1)
 			}
 	| a_expr BareColLabel
 			{
-				$$ = parser.NewResTarget($1.Pos(), $2, $1)
+				$$ = NewResTarget($1.Pos(), $2, $1)
 			}
 	| a_expr
 			{
-				$$ = parser.NewResTarget($1.Pos(), "", $1)
+				$$ = NewResTarget($1.Pos(), "", $1)
 			}
 	| '*'
 			{
 				p := yylex.(*lexerState).lastConsumedPos()
-				$$ = parser.NewResTarget(p, "", parser.NewStarExpr(p, "", ""))
+				$$ = NewResTarget(p, "", NewStarExpr(p, "", ""))
 			}
 
 
@@ -1465,7 +1473,7 @@ opt_from_clause:
 from_list:
 		table_ref
 			{
-				$$ = []parser.FromExpr{$1}
+				$$ = []FromExpr{$1}
 			}
 	| from_list ',' table_ref
 			{
@@ -1481,7 +1489,7 @@ from_list:
 table_ref:
 		base_table_ref
 			{
-				$$ = parser.NewFromExpr($1.Pos(), $1, nil)
+				$$ = NewFromExpr($1.Pos(), $1, nil)
 			}
 	| table_ref join_outer base_table_ref join_qual_opt
 			{
@@ -1688,10 +1696,10 @@ base_table_ref:
 			}
 	| select_with_parens opt_derived_alias
 			{
-				sub, ok := $1.(*parser.SelectStmt)
+				sub, ok := $1.(*SelectStmt)
 				if !ok {
 					lerr(yylex, "subquery in FROM did not produce SELECT", yylex.(*lexerState).lastConsumedPos())
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
 				sub.Parenthesized = true
 				pos := sub.Pos()
@@ -1706,10 +1714,10 @@ base_table_ref:
 			}
 	| LATERAL_P select_with_parens opt_derived_alias
 			{
-				sub, ok := $2.(*parser.SelectStmt)
+				sub, ok := $2.(*SelectStmt)
 				if !ok {
 					lerr(yylex, "subquery in FROM did not produce SELECT", yylex.(*lexerState).lastConsumedPos())
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
 				// Legacy parseParenthesisedSelectStmt marks every
 				// paren-wrapped select Parenthesized=true (:1396-1402);
@@ -1737,9 +1745,9 @@ base_table_ref:
 				}
 				ft, _ := $1.(*funcTable)
 				if ft == nil {
-					ft = &funcTable{ref: parser.NewTableFuncRef(0, "__missing__", nil, false, nil)}
+					ft = &funcTable{ref: NewTableFuncRef(0, "__missing__", nil, false, nil)}
 				}
-				rv := parser.NewRangeVar(ft.ref.Pos(), ft.schema, "", alias)
+				rv := NewRangeVar(ft.ref.Pos(), ft.schema, "", alias)
 				rv.TableFunc = ft.ref
 				rv.Lateral = lateral
 				rv.Columns = cols
@@ -1756,9 +1764,9 @@ base_table_ref:
 				}
 				ft, _ := $2.(*funcTable)
 				if ft == nil {
-					ft = &funcTable{ref: parser.NewTableFuncRef(0, "__missing__", nil, false, nil)}
+					ft = &funcTable{ref: NewTableFuncRef(0, "__missing__", nil, false, nil)}
 				}
-				rv := parser.NewRangeVar(ft.ref.Pos(), ft.schema, "", alias)
+				rv := NewRangeVar(ft.ref.Pos(), ft.schema, "", alias)
 				rv.TableFunc = ft.ref
 				rv.Lateral = lateral
 				rv.Columns = cols
@@ -1797,7 +1805,7 @@ opt_with_ordinality:
 row_from_list:
 		row_from_entry_one
 			{
-				$$ = []parser.RowsFromEntry{$1}
+				$$ = []RowsFromEntry{$1}
 			}
 	| row_from_list ',' row_from_entry_one
 			{
@@ -1807,7 +1815,7 @@ row_from_list:
 row_from_entry_one:
 		qualified_name '(' opt_func_arg_list ')'
 			{
-				$$ = parser.RowsFromEntry{Name: rowsFromName($1.parts), Args: $3}
+				$$ = RowsFromEntry{Name: rowsFromName($1.parts), Args: $3}
 			}
 
 opt_func_arg_list:
@@ -1826,7 +1834,7 @@ func_arg_expr:
 func_arg_list:
 		func_arg_expr
 			{
-				$$ = []parser.Expr{$1}
+				$$ = []Expr{$1}
 			}
 	| func_arg_list ',' func_arg_expr
 			{
@@ -1911,7 +1919,7 @@ group_by_item:
 			}
 	| '(' ')'
 			{
-				$$ = &groupItem{alts: [][]parser.Expr{{}}, construct: true}
+				$$ = &groupItem{alts: [][]Expr{{}}, construct: true}
 			}
 	| ROLLUP '(' expr_list ')'
 			{
@@ -1933,7 +1941,7 @@ group_by_item:
 			}
 	| GROUPING SETS '(' gs_list ')'
 			{
-				alts := $4.([][]parser.Expr)
+				alts := $4.([][]Expr)
 				$$ = &groupItem{flat: flattenUnits(alts), alts: alts, construct: true}
 			}
 
@@ -1941,18 +1949,18 @@ group_by_item:
    CUBE expand in place, `()` is the empty set, `(a, b)` is a RowExpr. */
 gs_list:
 		gs_elem                  { $$ = $1 }
-	| gs_list ',' gs_elem        { $$ = append($1.([][]parser.Expr), $3.([][]parser.Expr)...) }
+	| gs_list ',' gs_elem        { $$ = append($1.([][]Expr), $3.([][]Expr)...) }
 
 gs_elem:
 		a_expr
 			{
-				if r, ok := $1.(*parser.RowExpr); ok {
-					$$ = [][]parser.Expr{r.Elems}
+				if r, ok := $1.(*RowExpr); ok {
+					$$ = [][]Expr{r.Elems}
 				} else {
-					$$ = [][]parser.Expr{{$1}}
+					$$ = [][]Expr{{$1}}
 				}
 			}
-	| '(' ')'                          { $$ = [][]parser.Expr{{}} }
+	| '(' ')'                          { $$ = [][]Expr{{}} }
 	| ROLLUP '(' expr_list ')'         { $$ = rollupAlternatives(groupingUnits($3)) }
 	| CUBE '(' expr_list ')'           { $$ = cubeAlternatives(groupingUnits($3)) }
 
@@ -1976,11 +1984,11 @@ opt_with_clause:
 with_clause:
 		WITH cte_list
 			{
-				$$ = parser.NewWithClause(0, false, $2)
+				$$ = NewWithClause($<p>1, false, $2)
 			}
 	| WITH RECURSIVE cte_list
 			{
-				$$ = parser.NewWithClause(0, true, $3)
+				$$ = NewWithClause($<p>1, true, $3)
 			}
 
 cte_list:
@@ -1988,15 +1996,15 @@ cte_list:
 			{
 				ci, _ := $1.(*cteItem)
 				if ci == nil || ci.cte == nil {
-					ci = &cteItem{cte: parser.NewCommonTableExpr(0, "", nil, nil)}
+					ci = &cteItem{cte: NewCommonTableExpr(0, "", nil, nil)}
 				}
-				$$ = []*parser.CommonTableExpr{ci.cte}
+				$$ = []*CommonTableExpr{ci.cte}
 			}
 	| cte_list ',' cte_item
 			{
 				ci, _ := $3.(*cteItem)
 				if ci == nil || ci.cte == nil {
-					ci = &cteItem{cte: parser.NewCommonTableExpr(0, "", nil, nil)}
+					ci = &cteItem{cte: NewCommonTableExpr(0, "", nil, nil)}
 				}
 				$$ = append($1, ci.cte)
 			}
@@ -2006,12 +2014,12 @@ cte_list:
 cte_item:
 		ColId cte_col_list AS opt_materialized select_with_parens
 			{
-				sub, ok := $5.(*parser.SelectStmt)
+				sub, ok := $5.(*SelectStmt)
 				if !ok || sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
 				mat := $4
-				cte := parser.NewCommonTableExpr(0, $1, $2, sub)
+				cte := NewCommonTableExpr($<p>1, $1, $2, sub)
 				cte.Materialized = mat
 				$$ = &cteItem{cte: cte}
 			}
@@ -2023,9 +2031,9 @@ cte_item:
 	   keywords, so this costs no conflict. */
 	| ColId cte_col_list AS opt_materialized '(' cte_dml_body ')'
 			{
-				cte := parser.NewCommonTableExpr(0, $1, $2, nil)
+				cte := NewCommonTableExpr($<p>1, $1, $2, nil)
 				cte.Materialized = $4
-				cte.DMLBody = $6.(parser.Stmt)
+				cte.DMLBody = $6.(Stmt)
 				$$ = &cteItem{cte: cte}
 			}
 
@@ -2070,7 +2078,7 @@ opt_window_clause:
 window_definition_list:
 		window_definition
 			{
-				$$ = []parser.NamedWindowDef{$1}
+				$$ = []NamedWindowDef{$1}
 			}
 	| window_definition_list ',' window_definition
 			{
@@ -2080,72 +2088,42 @@ window_definition_list:
 window_definition:
 		ColId AS '(' opt_window_spec ')'
 			{
-				$$ = parser.NamedWindowDef{Name: $1, Def: $4}
+				$$ = NamedWindowDef{Name: $1, Def: $4}
 			}
 
+/* Upstream's window_specification shape, verbatim (gram.y :16417): ONE rule
+   of four optional parts, not the cross-product of spellings.
+   The cross-product cannot express `OVER (w PARTITION BY x)` at all: after
+   the name, deciding between reducing an empty frame tail and shifting
+   PARTITION is an IDENT-vs-PARTITION pair, and both sit on the SAME
+   %nonassoc level (tokens_gen/pg_grammar precedence block), so yacc resolves
+   it to an ERROR — the state table shows the shift, and the parse still
+   fails. `%prec Op` on the empty name is exactly how gram.y:16446 dodges it. */
 opt_window_spec:
-	/* An existing window name first — gram.y opt_existing_window_name — with
-	   its own frame or ORDER BY (`OVER (w RANGE BETWEEN ...)`). */
-		ColId opt_frame_tail
+		opt_existing_window_name opt_partition_clause opt_window_sort opt_frame_tail
 			{
-				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				wd := NewWindowDef(yylex.(*lexerState).lastConsumedPos())
 				wd.RefName = $1
-				if fr := $2; fr != nil {
-					wd.Frame = fr
-				}
-				$$ = wd
-			}
-	| ColId ORDER BY sort_by_list opt_frame_tail
-			{
-				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
-				wd.RefName = $1
-				wd.OrderBy = $4
-				if fr := $5; fr != nil {
-					wd.Frame = fr
-				}
-				$$ = wd
-			}
-	| opt_frame_tail
-			{
-				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
-				if fr := $1; fr != nil {
-					wd.Frame = fr
-				}
-				$$ = wd
-			}
-	| PARTITION BY expr_list opt_frame_tail
-			{
-				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
-				wd.PartitionBy = $3
-				if fr := $4; fr != nil {
-					wd.Frame = fr
-				}
-				$$ = wd
-			}
-	| ORDER BY sort_by_list opt_frame_tail
-			{
-				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
+				wd.PartitionBy = $2
 				wd.OrderBy = $3
 				if fr := $4; fr != nil {
 					wd.Frame = fr
 				}
 				$$ = wd
 			}
-	| PARTITION BY expr_list ORDER BY sort_by_list opt_frame_tail
-			{
-				wd := parser.NewWindowDef(yylex.(*lexerState).lastConsumedPos())
-				wd.PartitionBy = $3
-				wd.OrderBy = $6
-				if fr := $7; fr != nil {
-					wd.Frame = fr
-				}
-				$$ = wd
-			}
 
-/* opt_frame_tail / frame extent+bound+exclusion — gram.y :13560ff subset.
-   Carriers live in support.go (partFrame*); only FrameModeRows reaches the
-   executor today — RANGE/GROUPS parse structurally and the analyzer rejects
-   them upstream-parity (0A000). */
+opt_existing_window_name:
+		ColId                { $$ = $1 }
+	| /* empty */ %prec Op   { $$ = "" }
+
+opt_partition_clause:
+		PARTITION BY expr_list   { $$ = $3 }
+	| /* empty */                { $$ = nil }
+
+opt_window_sort:
+		ORDER BY sort_by_list    { $$ = $3 }
+	| /* empty */                { $$ = nil }
+
 opt_frame_tail:
 		/* empty */
 			{
@@ -2153,22 +2131,22 @@ opt_frame_tail:
 			}
 	| ROWS part_frame_extent part_frame_excl
 			{
-				$$ = finishFrame(parser.FrameModeRows, $2.(*partFrameExtent), $3.(*partFrameExcl))
+				$$ = finishFrame(FrameModeRows, $2.(*partFrameExtent), $3.(*partFrameExcl))
 			}
 	| RANGE part_frame_extent part_frame_excl
 			{
-				$$ = finishFrame(parser.FrameModeRange, $2.(*partFrameExtent), $3.(*partFrameExcl))
+				$$ = finishFrame(FrameModeRange, $2.(*partFrameExtent), $3.(*partFrameExcl))
 			}
 	| GROUPS part_frame_extent part_frame_excl
 			{
-				$$ = finishFrame(parser.FrameModeGroups, $2.(*partFrameExtent), $3.(*partFrameExcl))
+				$$ = finishFrame(FrameModeGroups, $2.(*partFrameExtent), $3.(*partFrameExcl))
 			}
 
 part_frame_extent:
 		part_frame_bound
 			{
 				fp := $1.(*partFrameBound)
-				$$ = &partFrameExtent{start: fp.k, startOff: fp.off, end: parser.FrameBoundCurrentRow, hasBetween: false}
+				$$ = &partFrameExtent{start: fp.k, startOff: fp.off, end: FrameBoundCurrentRow, hasBetween: false}
 			}
 	| BETWEEN part_frame_bound AND part_frame_bound
 			{
@@ -2179,25 +2157,25 @@ part_frame_extent:
 
 part_frame_bound:
 		UNBOUNDED PRECEDING
-			{ $$ = &partFrameBound{k: parser.FrameBoundUnboundedPreceding} }
+			{ $$ = &partFrameBound{k: FrameBoundUnboundedPreceding} }
 	| UNBOUNDED FOLLOWING
-			{ $$ = &partFrameBound{k: parser.FrameBoundUnboundedFollowing} }
+			{ $$ = &partFrameBound{k: FrameBoundUnboundedFollowing} }
 	| CURRENT_P ROW
-			{ $$ = &partFrameBound{k: parser.FrameBoundCurrentRow} }
+			{ $$ = &partFrameBound{k: FrameBoundCurrentRow} }
 	| a_expr PRECEDING
-			{ $$ = &partFrameBound{k: parser.FrameBoundOffsetPreceding, off: $1} }
+			{ $$ = &partFrameBound{k: FrameBoundOffsetPreceding, off: $1} }
 	| a_expr FOLLOWING
-			{ $$ = &partFrameBound{k: parser.FrameBoundOffsetFollowing, off: $1} }
+			{ $$ = &partFrameBound{k: FrameBoundOffsetFollowing, off: $1} }
 
 part_frame_excl:
 		/* empty */
 			{ $$ = &partFrameExcl{} }
 	| EXCLUDE CURRENT_P ROW
-			{ $$ = &partFrameExcl{x: parser.FrameExcludeCurrentRow} }
+			{ $$ = &partFrameExcl{x: FrameExcludeCurrentRow} }
 	| EXCLUDE GROUP_P
-			{ $$ = &partFrameExcl{x: parser.FrameExcludeGroup} }
+			{ $$ = &partFrameExcl{x: FrameExcludeGroup} }
 	| EXCLUDE TIES
-			{ $$ = &partFrameExcl{x: parser.FrameExcludeTies} }
+			{ $$ = &partFrameExcl{x: FrameExcludeTies} }
 	| EXCLUDE NO OTHERS
 			{ $$ = &partFrameExcl{} }
 
@@ -2217,14 +2195,14 @@ part_frame_excl:
 when_then:
 		WHEN a_expr THEN a_expr
 			{
-				$$ = &whenList{items: []parser.CaseWhen{parser.NewCaseWhen($2, $4)}}
+				$$ = &whenList{items: []CaseWhen{NewCaseWhen($2, $4)}}
 			}
 
 /* expr_list — gram.y :13944ish; reused by DISTINCT ON and later waves. */
 expr_list:
 		a_expr
 			{
-				$$ = []parser.Expr{$1}
+				$$ = []Expr{$1}
 			}
 	| expr_list ',' a_expr
 			{
@@ -2248,7 +2226,14 @@ where_clause:
 qualified_name:
 		ColId
 			{
-				$$ = qname{parts: []string{$1}, pos: yylex.(*lexerState).lastConsumedPos()}
+				/* $<p>1, NOT lastConsumedPos(): this rule is a DEFAULT
+				   reduction in many states, so the lookahead has not been
+				   read and lastConsumedPos points one token too far back —
+				   every FuncCall built from a func_name carried the position
+				   of whatever preceded the name (0 for `select rank(...)`).
+				   $<p>1 is the ColId's own captured offset and is correct
+				   whether or not a lookahead was taken. */
+				$$ = qname{parts: []string{$1}, pos: $<p>1}
 			}
 	| qualified_name '.' ColId
 			{
@@ -2264,65 +2249,65 @@ a_expr:
 			}
 	| a_expr '+' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpAdd, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpAdd, $1, $3)
 			}
 	| a_expr '-' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpSub, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpSub, $1, $3)
 			}
 	| a_expr '*' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpMul, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpMul, $1, $3)
 			}
 	| a_expr '/' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpDiv, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpDiv, $1, $3)
 			}
 	| a_expr '%' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpMod, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpMod, $1, $3)
 			}
 	/* Exponentiation. '^' is in scan.l's {self} set and has a %left entry, but
 	   no production ever consumed it, so `a ^ b` was a syntax error. */
 	| a_expr '^' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), binOp(yylex, "^"), $1, $3)
+				$$ = NewBinaryOp($1.Pos(), binOp(yylex, "^"), $1, $3)
 			}
 	| a_expr '<' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLt, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpLt, $1, $3)
 			}
 	| a_expr '>' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpGt, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpGt, $1, $3)
 			}
 	| a_expr '=' a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpEq, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpEq, $1, $3)
 			}
 	| a_expr LESS_EQUALS a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLe, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpLe, $1, $3)
 			}
 	| a_expr GREATER_EQUALS a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpGe, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpGe, $1, $3)
 			}
 	| a_expr NOT_EQUALS a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNe, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpNe, $1, $3)
 			}
 	| a_expr AND a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpAnd, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpAnd, $1, $3)
 			}
 	| a_expr OR a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpOr, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpOr, $1, $3)
 			}
 	| NOT a_expr
 			{
-				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), parser.OpNot, $2)
+				$$ = NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), OpNot, $2)
 			}
 	| '-' a_expr %prec UMINUS
 			{
@@ -2330,77 +2315,77 @@ a_expr:
 			}
 	| '+' a_expr %prec UMINUS
 			{
-				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), parser.OpUnaryPos, $2)
+				$$ = NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), OpUnaryPos, $2)
 			}
 	/* IS [NOT] NULL / TRUE / FALSE / UNKNOWN / DISTINCT FROM — gram.y
 	   :15160ff IS NULL_P etc; DISTINCT FROM uses %prec IS like upstream.
 	   Positions ride on the LEFT operand (content dumps strip them). */
 	| a_expr IS NULL_P
 			{
-				$$ = parser.NewIsNullExpr($1.Pos(), $1, false)
+				$$ = NewIsNullExpr($1.Pos(), $1, false)
 			}
 	| a_expr IS NOT NULL_P
 			{
-				$$ = parser.NewIsNullExpr($1.Pos(), $1, true)
+				$$ = NewIsNullExpr($1.Pos(), $1, true)
 			}
 	| a_expr IS TRUE_P
 			{
-				$$ = parser.NewIsBoolExpr($1.Pos(), $1, true, false, false)
+				$$ = NewIsBoolExpr($1.Pos(), $1, true, false, false)
 			}
 	| a_expr IS NOT TRUE_P
 			{
-				$$ = parser.NewIsBoolExpr($1.Pos(), $1, true, false, true)
+				$$ = NewIsBoolExpr($1.Pos(), $1, true, false, true)
 			}
 	| a_expr IS FALSE_P
 			{
-				$$ = parser.NewIsBoolExpr($1.Pos(), $1, false, true, false)
+				$$ = NewIsBoolExpr($1.Pos(), $1, false, true, false)
 			}
 	| a_expr IS NOT FALSE_P
 			{
-				$$ = parser.NewIsBoolExpr($1.Pos(), $1, false, true, true)
+				$$ = NewIsBoolExpr($1.Pos(), $1, false, true, true)
 			}
 	| a_expr IS UNKNOWN
 			{
-				$$ = parser.NewIsBoolExpr($1.Pos(), $1, false, false, false)
+				$$ = NewIsBoolExpr($1.Pos(), $1, false, false, false)
 			}
 	| a_expr IS NOT UNKNOWN
 			{
-				$$ = parser.NewIsBoolExpr($1.Pos(), $1, false, false, true)
+				$$ = NewIsBoolExpr($1.Pos(), $1, false, false, true)
 			}
 	| a_expr IS DISTINCT FROM b_expr %prec IS
 			{
-				$$ = parser.NewIsDistinctFromExpr($1.Pos(), $1, $5, false)
+				$$ = NewIsDistinctFromExpr($1.Pos(), $1, $5, false)
 			}
 	| a_expr IS NOT DISTINCT FROM b_expr %prec IS
 			{
-				$$ = parser.NewIsDistinctFromExpr($1.Pos(), $1, $6, true)
+				$$ = NewIsDistinctFromExpr($1.Pos(), $1, $6, true)
 			}
 	/* Postfix spellings — gram.y :15200 ISNULL / NOTNULL. */
 	| a_expr ISNULL
 			{
-				$$ = parser.NewIsNullExpr($1.Pos(), $1, false)
+				$$ = NewIsNullExpr($1.Pos(), $1, false)
 			}
 	| a_expr NOTNULL
 			{
-				$$ = parser.NewIsNullExpr($1.Pos(), $1, true)
+				$$ = NewIsNullExpr($1.Pos(), $1, true)
 			}
 	| EXISTS select_with_parens
 			{
-				sub, _ := $2.(*parser.SelectStmt)
+				sub, _ := $2.(*SelectStmt)
 				if sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
-				$$ = parser.NewExistsExpr(yylex.(*lexerState).lastConsumedPos(), false, sub)
+				$$ = NewExistsExpr(yylex.(*lexerState).lastConsumedPos(), false, sub)
 			}
 	| CASE cse_wl END_P
 			{
 				wl := $2.(*whenList)
-				$$ = parser.NewCaseExpr(0, nil, wl.items, nil)
+				$$ = NewCaseExpr(0, nil, wl.items, nil)
 			}
 	| CASE cse_wl ELSE a_expr END_P
 			{
 				wl := $2.(*whenList)
-				$$ = parser.NewCaseExpr(0, nil, wl.items, $4)
+				$$ = NewCaseExpr(0, nil, wl.items, $4)
 			}
 	/* SIMPLE form: CASE operand WHEN value THEN ... (gram.y case_expr's
 	   case_arg). NewCaseExpr has always taken an operand — only the grammar
@@ -2411,12 +2396,12 @@ a_expr:
 	| CASE a_expr cse_wl END_P
 			{
 				wl := $3.(*whenList)
-				$$ = parser.NewCaseExpr(0, $2, wl.items, nil)
+				$$ = NewCaseExpr(0, $2, wl.items, nil)
 			}
 	| CASE a_expr cse_wl ELSE a_expr END_P
 			{
 				wl := $3.(*whenList)
-				$$ = parser.NewCaseExpr(0, $2, wl.items, $5)
+				$$ = NewCaseExpr(0, $2, wl.items, $5)
 			}
 
 	/* Generic operator terminal — gram.y `a_expr Op a_expr` (%left Op).
@@ -2424,7 +2409,7 @@ a_expr:
 	   multi-character spelling routed here by the adapter. */
 	| a_expr COLLATE collation_name
 			{
-				$$ = parser.NewCollateExpr($1.Pos(), $1, $3)
+				$$ = NewCollateExpr($1.Pos(), $1, $3)
 			}
 	/* AT TIME ZONE / AT LOCAL — gram.y :15540ff. Both are rewritten into a
 	   timezone() call with the ZONE argument FIRST (gram.y builds
@@ -2444,15 +2429,15 @@ a_expr:
 	   legacy's binding exactly. */
 	| a_expr AT TIME ZONE a_expr %prec Op
 			{
-				$$ = specialFormCall($1.Pos(), "timezone", []parser.Expr{tzZone(yylex, $5), $1})
+				$$ = specialFormCall($1.Pos(), "timezone", []Expr{tzZone(yylex, $5), $1})
 			}
 	| a_expr AT LOCAL %prec Op
 			{
-				$$ = specialFormCall($1.Pos(), "timezone", []parser.Expr{$1})
+				$$ = specialFormCall($1.Pos(), "timezone", []Expr{$1})
 			}
 	| a_expr Op a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
+				$$ = NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
 			}
 	/* Prefix operator — gram.y `qual_Op a_expr %prec Op`. '-' and '+' arrive
 	   as char terminals and have their own alternatives above, so the only
@@ -2460,7 +2445,7 @@ a_expr:
 	   is '~'; prefixOp rejects the rest rather than silently widening. */
 	| Op a_expr %prec Op
 			{
-				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), prefixOp(yylex, $1), $2)
+				$$ = NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), prefixOp(yylex, $1), $2)
 			}
 	/* op ANY/SOME/ALL — gram.y :15150ff quantified comparisons via
 	   subquery_Op subset. */
@@ -2472,9 +2457,9 @@ a_expr:
 	   half of them (NOT ILIKE ANY / ALL / SOME, and every SOME) were simply
 	   missing. */
 	| a_expr like_op any_or_some '(' expr_list ')'
-			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpCode($2), nil, $5, $<p>5) }
+			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, OpCode($2), nil, $5, $<p>5) }
 	| a_expr like_op ALL '(' expr_list ')'
-			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpCode($2), true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
+			{ $$ = NewInExpr($1.Pos(), $1, false, OpCode($2), true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
 	| a_expr subq_op ANY '(' expr_list ')'
 			{
 				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), nil, $5, $<p>5)
@@ -2485,31 +2470,31 @@ a_expr:
 			}
 	| a_expr subq_op ALL '(' expr_list ')'
 			{
-				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, nil, unwrapAnyArray(yylex, $5, $<p>5))
+				$$ = NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, nil, unwrapAnyArray(yylex, $5, $<p>5))
 			}
 	| a_expr subq_op ANY select_with_parens
 			{
-				sub, _ := $4.(*parser.SelectStmt)
+				sub, _ := $4.(*SelectStmt)
 				if sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
 				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), sub, nil, 0)
 			}
 	| a_expr subq_op SOME select_with_parens
 			{
-				sub, _ := $4.(*parser.SelectStmt)
+				sub, _ := $4.(*SelectStmt)
 				if sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
 				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), sub, nil, 0)
 			}
 	| a_expr subq_op ALL select_with_parens
 			{
-				sub, _ := $4.(*parser.SelectStmt)
+				sub, _ := $4.(*SelectStmt)
 				if sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
-				$$ = parser.NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, sub, nil)
+				$$ = NewInExpr($1.Pos(), $1, false, binOp(yylex, $2), true, sub, nil)
 			}
 
 	| a_expr TYPECAST cast_typename
@@ -2521,45 +2506,40 @@ a_expr:
 			}
 	| a_expr TYPECAST cast_typename '(' ICONST ')'
 			{
-				nm := $3.name
-				tm := []int64{int64($5)}
-				if nm == "float" && len($3.schema) == 0 {
-					if $5 <= 24 {
-						nm, tm = "float4", nil // legacy folds the precision into the type name
-					} else {
-						nm, tm = "float8", nil
-					}
-				}
-				tm = typmodsFor(nm, tm, 1)
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: nm}, tm)
+				/* castTo, NOT an inline float fold: this arm carried its own
+				   copy that folded float(p) without opt_float's two range
+				   checks, so `'3'::float(54)` silently became float8 and
+				   `float(0)` became float4 — both hard 22023 errors upstream.
+				   One implementation, one behaviour. */
+				$$ = castTo(yylex, $1, $3, []int64{int64($5)}, $<p>3)
 			}
 	| a_expr TYPECAST cast_typename '(' ICONST ',' ICONST ')'
 			{
 				tm := typmodsFor($3.name, []int64{int64($5), int64($7)}, 2)
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: $3.name}, tm)
+				$$ = NewCastExpr($1.Pos(), $1, ObjectName{Schema: $3.schema, Name: $3.name}, tm)
 			}
 
 	/* Subscripts — gram.y :15040ff opt_slice_bound forms: base[i],
 	   base[l:u], base[:u], base[l:], base[:] (M0097 array slice parity). */
 	| a_expr '[' a_expr ']'
 			{
-				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, false, $3, nil)
+				$$ = NewArraySubscriptExpr($1.Pos(), $1, false, $3, nil)
 			}
 	| a_expr '[' a_expr ':' a_expr ']'
 			{
-				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, true, $3, $5)
+				$$ = NewArraySubscriptExpr($1.Pos(), $1, true, $3, $5)
 			}
 	| a_expr '[' ':' a_expr ']'
 			{
-				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, true, nil, $4)
+				$$ = NewArraySubscriptExpr($1.Pos(), $1, true, nil, $4)
 			}
 	| a_expr '[' a_expr ':' ']'
 			{
-				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, true, $3, nil)
+				$$ = NewArraySubscriptExpr($1.Pos(), $1, true, $3, nil)
 			}
 	| a_expr '[' ':' ']'
 			{
-				$$ = parser.NewArraySubscriptExpr($1.Pos(), $1, true, nil, nil)
+				$$ = NewArraySubscriptExpr($1.Pos(), $1, true, nil, nil)
 			}
 
 	/* [NOT] SIMILAR TO [+ ESCAPE] — gram.y :15080-15115; constant folding
@@ -2585,61 +2565,61 @@ a_expr:
 	   pattern in LikeEscapePattern (legacy parity). */
 	| a_expr LIKE a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLike, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpLike, $1, $3)
 			}
 	| a_expr NOT_LA LIKE a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNotLike, $1, $4)
+				$$ = NewBinaryOp($1.Pos(), OpNotLike, $1, $4)
 			}
 	| a_expr ILIKE a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpILike, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpILike, $1, $3)
 			}
 	| a_expr NOT_LA ILIKE a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNotILike, $1, $4)
+				$$ = NewBinaryOp($1.Pos(), OpNotILike, $1, $4)
 			}
 	| a_expr LIKE a_expr ESCAPE a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLike, $1, parser.NewLikeEscapePattern($3.Pos(), $3, $5))
+				$$ = NewBinaryOp($1.Pos(), OpLike, $1, NewLikeEscapePattern($3.Pos(), $3, $5))
 			}
 	| a_expr NOT_LA LIKE a_expr ESCAPE a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNotLike, $1, parser.NewLikeEscapePattern($4.Pos(), $4, $6))
+				$$ = NewBinaryOp($1.Pos(), OpNotLike, $1, NewLikeEscapePattern($4.Pos(), $4, $6))
 			}
 	| a_expr ILIKE a_expr ESCAPE a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpILike, $1, parser.NewLikeEscapePattern($3.Pos(), $3, $5))
+				$$ = NewBinaryOp($1.Pos(), OpILike, $1, NewLikeEscapePattern($3.Pos(), $3, $5))
 			}
 	| a_expr NOT_LA ILIKE a_expr ESCAPE a_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNotILike, $1, parser.NewLikeEscapePattern($4.Pos(), $4, $6))
+				$$ = NewBinaryOp($1.Pos(), OpNotILike, $1, NewLikeEscapePattern($4.Pos(), $4, $6))
 			}
 
 	/* [NOT] IN — gram.y :15130ff in_expr (list and subquery forms). */
 	| a_expr IN_P '(' expr_list ')'
 			{
-				$$ = parser.NewInExpr($1.Pos(), $1, false, 0, false, nil, $4)
+				$$ = NewInExpr($1.Pos(), $1, false, 0, false, nil, $4)
 			}
 	| a_expr NOT_LA IN_P '(' expr_list ')'
 			{
-				$$ = parser.NewInExpr($1.Pos(), $1, true, 0, false, nil, $5)
+				$$ = NewInExpr($1.Pos(), $1, true, 0, false, nil, $5)
 			}
 	| a_expr IN_P select_with_parens
 			{
-				sub, _ := $3.(*parser.SelectStmt)
+				sub, _ := $3.(*SelectStmt)
 				if sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
-				$$ = parser.NewInExpr($1.Pos(), $1, false, 0, false, sub, nil)
+				$$ = NewInExpr($1.Pos(), $1, false, 0, false, sub, nil)
 			}
 	| a_expr NOT_LA IN_P select_with_parens
 			{
-				sub, _ := $4.(*parser.SelectStmt)
+				sub, _ := $4.(*SelectStmt)
 				if sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
-				$$ = parser.NewInExpr($1.Pos(), $1, true, 0, false, sub, nil)
+				$$ = NewInExpr($1.Pos(), $1, true, 0, false, sub, nil)
 			}
 
 	/* [NOT] BETWEEN [SYMMETRIC] — gram.y :15190ff with b_expr operands;
@@ -2701,7 +2681,7 @@ c_expr:
 	   the '(' — legacy stamps it from the same token. */
 	| '(' a_expr ')' '.' '*'
 			{
-				$$ = parser.NewIndirectionStar($<p>1, $2)
+				$$ = NewIndirectionStar($<p>1, $2)
 			}
 	/* Implicit row constructor — gram.y implicit_row (:16632), spelled with a
 	   mandatory second element so it cannot collide with grouping parens.
@@ -2710,7 +2690,7 @@ c_expr:
 	   rejects indirection on either, so none is offered. */
 	| '(' expr_list ',' a_expr ')'
 			{
-				$$ = parser.NewRowExpr($<p>1, append($2, $4))
+				$$ = NewRowExpr($<p>1, append($2, $4))
 			}
 	/* `tbl.*` as an EXPRESSION — whole-row expansion: VALUES(n.*), f(n.*).
 	   gram.y reaches it through columnref's indirection. Only ONE rule may
@@ -2725,54 +2705,58 @@ c_expr:
 				if len(parts) > 1 {
 					schema = parts[len(parts)-2]
 				}
-				$$ = parser.NewStarExpr($1.pos, schema, table)
+				$$ = NewStarExpr($1.pos, schema, table)
 			}
 	/* B'...' / X'...' — the adapter delivers both as BCONST with legacy's
 	   marker byte in the value; bitStringConst reproduces decodeBitStringLit
 	   (a plain StringConst, hex expanded to bits). */
 	| BCONST
 			{
-				$$ = bitStringConst($<p>1, $1)
+				$$ = bitStringConst(yylex, $<p>1, $1)
 			}
 	| ICONST
 			{
 				/* $1 is already the parsed integer (adapter fills ival). */
-				$$ = parser.NewIntegerConst(yylex.(*lexerState).lastConsumedPos(), int64($1))
+				$$ = NewIntegerConst(yylex.(*lexerState).lastConsumedPos(), int64($1))
 			}
 	| FCONST
 			{
-				$$ = parser.NewNumericConst(yylex.(*lexerState).lastConsumedPos(), $1)
+				$$ = NewNumericConst(yylex.(*lexerState).lastConsumedPos(), $1)
 			}
 	| SCONST
 			{
-				$$ = parser.NewStringConst(yylex.(*lexerState).lastConsumedPos(), $1)
+				$$ = NewStringConst(yylex.(*lexerState).lastConsumedPos(), $1)
 			}
 	| TRUE_P
 			{
-				$$ = parser.NewBooleanConst(yylex.(*lexerState).lastConsumedPos(), true)
+				$$ = NewBooleanConst(yylex.(*lexerState).lastConsumedPos(), true)
 			}
 	| FALSE_P
 			{
-				$$ = parser.NewBooleanConst(yylex.(*lexerState).lastConsumedPos(), false)
+				$$ = NewBooleanConst(yylex.(*lexerState).lastConsumedPos(), false)
 			}
 	| NULL_P
 			{
-				$$ = parser.NewNullConst(yylex.(*lexerState).lastConsumedPos())
+				$$ = NewNullConst(yylex.(*lexerState).lastConsumedPos())
 			}
 	| PARAM
 			{
-				$$ = parser.NewParamRef(yylex.(*lexerState).lastConsumedPos(), $1)
+				$$ = NewParamRef(yylex.(*lexerState).lastConsumedPos(), $1)
 			}
 	/* interval(p) 'body' — a precision typmod BEFORE the literal. Legacy
 	   records it as the Qualified form with unit "second" and the precision. */
 	| INTERVAL '(' ICONST ')' SCONST
 			{
-				$$ = parser.NewIntervalLitQualified($<p>1, $5, "second", true, $3)
+				$$ = NewIntervalLitQualified($<p>1, $5, "second", true, $3)
 			}
 	| INTERVAL SCONST
 			{
 				l := yylex.(*lexerState)
 				e := buildIntervalLit(l.lastConsumedPos(), $2)
+				if e == nil {
+					raiseErr(yylex, &SyntaxError{Pos: l.lastConsumedPos(), Message: "'" + strings.ReplaceAll($2, "'", "''") + "'"})
+					e = NewNullConst(l.lastConsumedPos())
+				}
 				// Remember the raw body for AT TIME ZONE — see lastIntervalNode.
 				l.lastIntervalNode, l.lastIntervalRaw = e, $2
 				$$ = e
@@ -2781,11 +2765,11 @@ c_expr:
 	   its OWN node rather than a FuncCall. GROUPING is a col_name_keyword, so
 	   it cannot reach name_or_call's IDENT path. */
 	| GROUPING '(' expr_list ')'
-			{ $$ = parser.NewGroupingCall($<p>1, $3) }
+			{ $$ = NewGroupingCall($<p>1, $3) }
 	| TYPEDLIT
 			{
 				typ, val := typedLitParts($1)
-				$$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), typ, val)
+				$$ = NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), typ, val)
 			}
 	/* Multi-word typed literals — gram.y ConstDatetime Sconst. The lexer's
 	   TYPEDLIT fold needs the SCONST to follow the type name IMMEDIATELY, so
@@ -2793,30 +2777,30 @@ c_expr:
 	   WITH/WITHOUT arrive as WITH_LA/WITHOUT_LA because base_yylex substitutes
 	   them when TIME follows. */
 	| TIMESTAMP WITH_LA TIME ZONE SCONST
-			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timestamptz", $5) }
+			{ $$ = NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timestamptz", $5) }
 	| TIMESTAMP WITHOUT_LA TIME ZONE SCONST
-			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timestamp", $5) }
+			{ $$ = NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timestamp", $5) }
 	| TIME WITH_LA TIME ZONE SCONST
-			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timetz", $5) }
+			{ $$ = NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "timetz", $5) }
 	| TIME WITHOUT_LA TIME ZONE SCONST
-			{ $$ = parser.NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "time", $5) }
+			{ $$ = NewTypedStringLit(yylex.(*lexerState).lastConsumedPos(), "time", $5) }
 	/* ARRAY[...] — gram.y array_expr: the inner brackets nest WITHOUT the
 	   keyword (`array[[1,2],[3,4]]`), and legacy builds nested
 	   ArrayConstructorExpr for them. */
 	| ARRAY array_expr
 			{
 				// An empty ARRAY[] carries a NIL element list, as legacy does.
-				$$ = parser.NewArrayConstructorExpr(yylex.(*lexerState).lastConsumedPos(), $2)
+				$$ = NewArrayConstructorExpr(yylex.(*lexerState).lastConsumedPos(), $2)
 			}
 	/* ARRAY(select) — legacy parses the body with parseSelect inside its own
 	   parens, so it is neither Parenthesized nor allowed to start with '('. */
 	| ARRAY '(' select_bare ')'
 			{
-				sub, _ := $3.(*parser.SelectStmt)
+				sub, _ := $3.(*SelectStmt)
 				if sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
-				$$ = parser.NewArraySubqueryExpr(yylex.(*lexerState).lastConsumedPos(), sub)
+				$$ = NewArraySubqueryExpr(yylex.(*lexerState).lastConsumedPos(), sub)
 			}
 	| INTERVAL SCONST YEAR_P
 			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "year", "", -1) }
@@ -2856,7 +2840,7 @@ c_expr:
 			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "minute", "second", $7) }
 	| EXTRACT '(' extract_field FROM a_expr ')'
 			{
-				$$ = parser.NewExtractExpr(yylex.(*lexerState).lastConsumedPos(), $3, $5)
+				$$ = NewExtractExpr(yylex.(*lexerState).lastConsumedPos(), $3, $5)
 			}
 	/* Scalar subquery. %prec UMINUS is what lets ')' SHIFT (nested parens,
 	   `((SELECT 1))`) over reducing to c_expr — gram.y :16220 does the same.
@@ -2866,11 +2850,14 @@ c_expr:
 	   every scalar subquery was a silent parity diff. */
 	| select_with_parens %prec UMINUS
 			{
-				sub, _ := $1.(*parser.SelectStmt)
+				sub, _ := $1.(*SelectStmt)
 				if sub == nil {
-					sub = parser.NewSelectStmt(0)
+					sub = NewSelectStmt(0)
 				}
-				$$ = parser.NewSubqueryExpr(yylex.(*lexerState).lastConsumedPos(), sub)
+				/* $<p>1 — the opening paren of select_with_parens, which is
+				   where ddl.go/select.go anchor a scalar subquery.
+				   lastConsumedPos() lands PAST the closing paren here. */
+				$$ = NewSubqueryExpr($<p>1, sub)
 			}
 
 	| name_or_call
@@ -2889,21 +2876,12 @@ c_expr:
 	   TYPECAST arm — legacy collapses float(p) into float4/float8. */
 	| CAST '(' a_expr AS cast_typename '(' ICONST ')' ')'
 			{
-				nm := $5.name
-				tm := []int64{int64($7)}
-				if nm == "float" && len($5.schema) == 0 {
-					if $7 <= 24 {
-						nm, tm = "float4", nil
-					} else {
-						nm, tm = "float8", nil
-					}
-				}
-				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: nm}, typmodsFor(nm, tm, 1))
+				$$ = castTo(yylex, $3, $5, []int64{int64($7)}, $<p>5)
 			}
 	| CAST '(' a_expr AS cast_typename '(' ICONST ',' ICONST ')' ')'
 			{
 				tm := typmodsFor($5.name, []int64{int64($7), int64($9)}, 2)
-				$$ = parser.NewCastExpr($3.Pos(), $3, parser.ObjectName{Schema: $5.schema, Name: $5.name}, tm)
+				$$ = NewCastExpr($3.Pos(), $3, ObjectName{Schema: $5.schema, Name: $5.name}, tm)
 			}
 	| func_expr_common_subexpr
 			{
@@ -2970,11 +2948,11 @@ func_expr_common_subexpr:
 			}
 	| sql_value_func_name
 			{
-				$$ = parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: $1}, nil, false)
+				$$ = NewFuncCall(yylex.(*lexerState).lastConsumedPos(), ObjectName{Name: $1}, nil, false)
 			}
 	| sql_value_func_name '(' opt_func_call_args ')'
 			{
-				$$ = parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: $1}, $3, false)
+				$$ = NewFuncCall(yylex.(*lexerState).lastConsumedPos(), ObjectName{Name: $1}, $3, false)
 			}
 
 /* sql_value_func_name — the exact eleven names IsNoParenFuncName accepts.
@@ -3014,47 +2992,47 @@ b_expr:
 			}
 	| b_expr '+' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpAdd, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpAdd, $1, $3)
 			}
 	| b_expr '-' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpSub, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpSub, $1, $3)
 			}
 	| b_expr '*' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpMul, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpMul, $1, $3)
 			}
 	| b_expr '/' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpDiv, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpDiv, $1, $3)
 			}
 	| b_expr '%' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpMod, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpMod, $1, $3)
 			}
 	| b_expr '<' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLt, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpLt, $1, $3)
 			}
 	| b_expr '>' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpGt, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpGt, $1, $3)
 			}
 	| b_expr '=' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpEq, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpEq, $1, $3)
 			}
 	| b_expr LESS_EQUALS b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpLe, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpLe, $1, $3)
 			}
 	| b_expr GREATER_EQUALS b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpGe, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpGe, $1, $3)
 			}
 	| b_expr NOT_EQUALS b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNe, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpNe, $1, $3)
 			}
 	/* b_expr's own unary signs and generic operator — gram.y gives b_expr the
 	   same four (`'+' b_expr`, `'-' b_expr`, `b_expr qual_Op b_expr`,
@@ -3066,29 +3044,25 @@ b_expr:
 			}
 	| '+' b_expr %prec UMINUS
 			{
-				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), parser.OpUnaryPos, $2)
+				$$ = NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), OpUnaryPos, $2)
 			}
 	/* gram.y b_expr also has TYPECAST; POSITION's operands are b_expr, and
 	   strings.sql writes POSITION('x'::bytea IN ''::bytea). */
 	| b_expr TYPECAST cast_typename
 			{
-				nm := $3.name
-				if nm == "float" {
-					nm = "float8"
-				}
-				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: nm}, typmodsFor(nm, $3.args, len($3.args)))
+				$$ = castTo(yylex, $1, $3, nil, $<p>3)
 			}
 	| b_expr '^' b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), parser.OpPow, $1, $3)
+				$$ = NewBinaryOp($1.Pos(), OpPow, $1, $3)
 			}
 	| b_expr Op b_expr
 			{
-				$$ = parser.NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
+				$$ = NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
 			}
 	| Op b_expr %prec Op
 			{
-				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), prefixOp(yylex, $1), $2)
+				$$ = NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), prefixOp(yylex, $1), $2)
 			}
 
 opt_func_call_args:
@@ -3136,7 +3110,7 @@ name_or_call:
 	   pins this list against kwlists_gen.y so it cannot drift. */
 		func_name_keyword '(' opt_call_args ')'
 			{
-				$$ = callFuncExpr($<p>1, parser.ObjectName{Name: lowerIdent($1)}, $3.(*callArgs))
+				$$ = callFuncExpr($<p>1, ObjectName{Name: lowerIdent($1)}, $3.(*callArgs))
 			}
 	| qualified_name
 			{
@@ -3147,58 +3121,58 @@ name_or_call:
 				ft := splitFuncName($1)
 				// Pass $3 through NIL. Legacy's parseFuncCallTail returns on the
 				// empty-parens path without touching fc.Args (select.go:4778), so
-				// `now()` is Args=∅; coercing to []parser.Expr{} made every
+				// `now()` is Args=∅; coercing to []Expr{} made every
 				// non-OVER zero-arg call a parity diff. The OVER alternatives
 				// below already pass $3 straight through.
-				$$ = callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				$$ = callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 			}
 	| qualified_name '(' '*' ')'
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				$$ = parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				$$ = NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
 			}
 	| qualified_name '(' '*' ')' filter_clause
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
-				fc.Filter = $5.(parser.Expr)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Filter = $5.(Expr)
 				$$ = fc
 			}
 	| qualified_name '(' '*' ')' filter_clause OVER ColId
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
-				fc.Filter = $5.(parser.Expr)
-				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $7)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Filter = $5.(Expr)
+				fc.Over = NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $7)
 				$$ = fc
 			}
 	| qualified_name '(' '*' ')' filter_clause OVER '(' opt_window_spec ')'
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
-				fc.Filter = $5.(parser.Expr)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Filter = $5.(Expr)
 				fc.Over = $8
 				$$ = fc
 			}
 	| qualified_name '(' '*' ')' OVER ColId
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
-				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc.Over = NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
 				$$ = fc
 			}
 	| qualified_name '(' '*' ')' OVER '(' opt_window_spec ')'
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, nil, true)
 				fc.Over = $7
 				$$ = fc
 			}
 	| qualified_name '(' DISTINCT expr_list ')' OVER '(' opt_window_spec ')'
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
 				fc.Over = $8
 				$$ = fc
@@ -3207,111 +3181,70 @@ name_or_call:
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
 				$$ = fc
 			}
 	| qualified_name '(' DISTINCT expr_list ')' filter_clause
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
-				fc.Filter, _ = $6.(parser.Expr)
+				fc.Filter, _ = $6.(Expr)
 				$$ = fc
 			}
 	| qualified_name '(' DISTINCT expr_list ')' OVER ColId
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
-				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $7)
+				fc.Over = NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $7)
 				$$ = fc
 			}
 	| qualified_name '(' opt_call_args ')' OVER ColId
 			{
 				ft := splitFuncName($1)
-				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
-				fc.Over = parser.NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.Over = NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $6)
 				$$ = fc
 			}
-	| qualified_name '(' opt_call_args ')' OVER '(' opt_frame_tail ')'
+	/* ONE arm over opt_window_spec, replacing six hand-inlined spellings of
+	   the same window body. The cross-product was missing exactly one cell —
+	   `OVER (w PARTITION BY x)` — and that form has to PARSE so parse-analysis
+	   can raise "cannot override PARTITION BY clause of window w". gram.y has
+	   a single window_specification for the same reason. */
+	| qualified_name '(' opt_call_args ')' OVER '(' opt_window_spec ')'
 			{
-				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
-				wd := parser.NewWindowDef(0)
-				if fr := $7; fr != nil {
-					wd.Frame = fr
-				}
-				fc.Over = wd
+				ft := splitFuncName($1)
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.Over = $7
 				$$ = fc
 			}
-	| qualified_name '(' opt_call_args ')' OVER '(' PARTITION BY expr_list opt_frame_tail ')'
-			{
-				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
-				wd := parser.NewWindowDef(0)
-				wd.PartitionBy = $9
-				if fr := $10; fr != nil {
-					wd.Frame = fr
-				}
-				fc.Over = wd
-				$$ = fc
-			}
-	| qualified_name '(' opt_call_args ')' OVER '(' ORDER BY sort_by_list opt_frame_tail ')'
-			{
-				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
-				wd := parser.NewWindowDef(0)
-				wd.OrderBy = $9
-				if fr := $10; fr != nil {
-					wd.Frame = fr
-				}
-				fc.Over = wd
-				$$ = fc
-			}
-	/* An existing window name first — gram.y opt_existing_window_name — with
-	   its own frame: `OVER (w RANGE BETWEEN ...)`. These alternatives spell
-	   the spec inline, so opt_window_spec's ColId forms do not reach them. */
-	| qualified_name '(' opt_call_args ')' OVER '(' ColId opt_frame_tail ')'
-			{
-				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
-				wd := parser.NewWindowDef(0)
-				wd.RefName = $7
-				if fr := $8; fr != nil {
-					wd.Frame = fr
-				}
-				fc.Over = wd
-				$$ = fc
-			}
-	| qualified_name '(' opt_call_args ')' OVER '(' ColId ORDER BY sort_by_list opt_frame_tail ')'
-			{
-				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
-				wd := parser.NewWindowDef(0)
-				wd.RefName = $7
-				wd.OrderBy = $10
-				if fr := $11; fr != nil {
-					wd.Frame = fr
-				}
-				fc.Over = wd
-				$$ = fc
-			}
-	| qualified_name '(' opt_call_args ')' OVER '(' PARTITION BY expr_list ORDER BY sort_by_list opt_frame_tail ')'
-			{
-				fc := callFuncExpr(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: splitFuncName($1).name}, $3.(*callArgs))
-				wd := parser.NewWindowDef(0)
-				wd.PartitionBy = $9
-				wd.OrderBy = $12
-				if fr := $13; fr != nil {
-					wd.Frame = fr
-				}
-				fc.Over = wd
-				$$ = fc
-			}
-	/* Aggregate ORDER BY inside the call — gram.y's func_application
-	   `func_name '(' func_arg_list opt_sort_clause ')'`. Legacy records it as
-	   FuncCall.OrderBy (select.go:4878-4893). */
 	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')'
 			{
 				ft := splitFuncName($1)
-				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				fc.OrderBy = $6
+				$$ = fc
+			}
+	/* ... and with a window on top. gram.y reaches this through one
+	   func_application feeding over_clause; here every combination is its own
+	   alternative, so the OVER pair needs writing out or
+	   `sum(x ORDER BY y) OVER ()` is a syntax error. */
+	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')' OVER '(' opt_window_spec ')'
+			{
+				ft := splitFuncName($1)
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.OrderBy = $6
+				fc.Over = $10
+				$$ = fc
+			}
+	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')' OVER ColId
+			{
+				ft := splitFuncName($1)
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.OrderBy = $6
+				fc.Over = NewBareWindowRef(yylex.(*lexerState).lastConsumedPos(), $9)
 				$$ = fc
 			}
 	/* expr_list, like the other DISTINCT alternatives — a call_arg_list here
@@ -3319,7 +3252,7 @@ name_or_call:
 	| qualified_name '(' DISTINCT expr_list ORDER BY sort_by_list ')'
 			{
 				ft := splitFuncName($1)
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
 				fc.OrderBy = $7
 				$$ = fc
@@ -3328,25 +3261,25 @@ name_or_call:
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
-				fc.Filter = $5.(parser.Expr)
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.Filter = $5.(Expr)
 				$$ = fc
 			}
 	| qualified_name '(' opt_call_args ')' filter_clause OVER ColId
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
-				fc.Filter = $5.(parser.Expr)
-				fc.Over = parser.NewBareWindowRef(0, $7)
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.Filter = $5.(Expr)
+				fc.Over = NewBareWindowRef(0, $7)
 				$$ = fc
 			}
 	| qualified_name '(' opt_call_args ')' filter_clause OVER '(' opt_window_spec ')'
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
-				fc.Filter = $5.(parser.Expr)
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.Filter = $5.(Expr)
 				fc.Over = $8
 				$$ = fc
 			}
@@ -3354,8 +3287,8 @@ name_or_call:
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
-				if wg, ok := $5.([]parser.SortBy); ok {
+				fc := callFuncExpr($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				if wg, ok := $5.([]SortBy); ok {
 					fc.WithinGroup = wg
 				}
 				$$ = fc
@@ -3364,9 +3297,9 @@ name_or_call:
 			{
 				ft := splitFuncName($1)
 				_ = ft
-				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc := NewFuncCall($1.pos, ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
-				if wg, ok := $6.([]parser.SortBy); ok {
+				if wg, ok := $6.([]SortBy); ok {
 					fc.WithinGroup = wg
 				}
 				$$ = fc
@@ -3382,7 +3315,14 @@ filter_clause:
 within_group_clause:
 		WITHIN GROUP_P '(' ORDER BY sort_by_list ')'
 			{
-				$$ = $5
+				/* $6, not $5: WITHIN=1 GROUP=2 '('=3 ORDER=4 BY=5 list=6.
+				   $5 is the BY keyword, so the type assertion at every call
+				   site silently failed and FuncCall.WithinGroup stayed empty
+				   — `rank(...) WITHIN GROUP (ORDER BY x)` parsed as a plain
+				   rank() call and resolved to "function rank does not
+				   exist". canonDump does print WithinGroup; no parity case
+				   covered the form. */
+				$$ = $6
 			}
 
 /* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
@@ -3442,10 +3382,10 @@ ColLabel:
    only the LAST component, so `pg_catalog."C"` and `"C"` are the same value. */
 /* The pattern operator of a quantified LIKE, as its AST Op. */
 like_op:
-		LIKE              { $$ = int(parser.OpLike) }
-	| ILIKE               { $$ = int(parser.OpILike) }
-	| NOT_LA LIKE         { $$ = int(parser.OpNotLike) }
-	| NOT_LA ILIKE        { $$ = int(parser.OpNotILike) }
+		LIKE              { $$ = int(OpLike) }
+	| ILIKE               { $$ = int(OpILike) }
+	| NOT_LA LIKE         { $$ = int(OpNotLike) }
+	| NOT_LA ILIKE        { $$ = int(OpNotILike) }
 
 /* SOME is upstream's synonym for ANY (gram.y sub_type). */
 any_or_some:
@@ -3543,7 +3483,7 @@ cast_target:
 	   hard 42601 in EVERY routed position: column definitions and casts alike. */
 	| INTERVAL interval_qual
 			{
-				c, cl, ok := parser.IntervalQualTypmods($2.hi, $2.lo, $2.prec)
+				c, cl, ok := IntervalQualTypmods($2.hi, $2.lo, $2.prec)
 				if !ok {
 					yylex.Error("invalid interval field combination")
 					return 1
@@ -3612,7 +3552,7 @@ cast_ident:
 values_rows:
 		'(' values_item_list ')'
 			{
-				$$ = [][]parser.Expr{$2}
+				$$ = [][]Expr{$2}
 			}
 	| values_rows ',' '(' values_item_list ')'
 			{
@@ -3622,12 +3562,12 @@ values_rows:
 /* values_item — a VALUES row may carry the DEFAULT placeholder
    (`INSERT INTO t VALUES (1, DEFAULT)`), which is not an a_expr. */
 values_item_list:
-		values_item                          { $$ = []parser.Expr{$1} }
+		values_item                          { $$ = []Expr{$1} }
 	| values_item_list ',' values_item       { $$ = append($1, $3) }
 
 values_item:
 		a_expr    { $$ = $1 }
-	| DEFAULT     { $$ = parser.NewDefaultMarker(yylex.(*lexerState).lastConsumedPos()) }
+	| DEFAULT     { $$ = NewDefaultMarker(yylex.(*lexerState).lastConsumedPos()) }
 
 /* insert_stmt — P3.1 v0 (gram.y :17213 insert_rest subset): [WITH ctes]
    INSERT INTO name [(cols)] source where source is VALUES_LA rows / SelectStmt /
@@ -3637,10 +3577,10 @@ values_item:
 insert_stmt:
 		insert_core opt_on_conflict opt_returning
 			{
-				is := $1.(*parser.InsertStmt)
+				is := $1.(*InsertStmt)
 				is.OnConflict = $2
 				if len($3) > 0 {
-					parser.NewInsertReturning(is, $3)
+					NewInsertReturning(is, $3)
 				}
 				$$ = is
 			}
@@ -3657,12 +3597,12 @@ insert_core:
 			{
 				src := $5.(*insRest)
 				rv, cols := insertTarget($3, $4, src.cols)
-				is := parser.NewInsertStmt(0, rv, cols, src.src.rows)
+				is := NewInsertStmt(0, rv, cols, src.src.rows)
 				if src.src.sel != nil {
-					parser.SetInsertSelect(is, src.src.sel)
+					SetInsertSelect(is, src.src.sel)
 				}
 				if src.src.def {
-					parser.SetInsertDefaultValues(is)
+					SetInsertDefaultValues(is)
 				}
 				$$ = is
 			}
@@ -3670,12 +3610,12 @@ insert_core:
 			{
 				src := $6.(*insRest)
 				rv, cols := insertTarget($4, $5, src.cols)
-				is := parser.NewInsertStmt(0, rv, cols, src.src.rows)
+				is := NewInsertStmt(0, rv, cols, src.src.rows)
 				if src.src.sel != nil {
-					parser.SetInsertSelect(is, src.src.sel)
+					SetInsertSelect(is, src.src.sel)
 				}
 				if src.src.def {
-					parser.SetInsertDefaultValues(is)
+					SetInsertDefaultValues(is)
 				}
 				is.With = $1
 				$$ = is
@@ -3687,9 +3627,9 @@ opt_on_conflict:
 		/* empty */
 			{ $$ = nil }
 	| ON CONFLICT opt_arbiter DO NOTHING
-			{ $$ = parser.NewOnConflictClause($3, parser.OnConflictNothing, nil, nil) }
+			{ $$ = NewOnConflictClause($3, OnConflictNothing, nil, nil) }
 	| ON CONFLICT opt_arbiter DO UPDATE SET update_set_list opt_update_where
-			{ $$ = parser.NewOnConflictClause($3, parser.OnConflictUpdate, $7, $8) }
+			{ $$ = NewOnConflictClause($3, OnConflictUpdate, $7, $8) }
 
 opt_arbiter:
 		/* empty */               { $$ = nil }
@@ -3700,20 +3640,20 @@ opt_arbiter:
 				t.Where = $5
 				$$ = t
 			}
-	| ON CONSTRAINT ColId { $$ = parser.NewOnConflictTarget(nil, $3, nil) }
+	| ON CONSTRAINT ColId { $$ = NewOnConflictTarget(nil, $3, nil) }
 
 update_set_list:
-		update_assign                   { $$ = []parser.UpdateAssign{$1} }
+		update_assign                   { $$ = []UpdateAssign{$1} }
 	| update_set_list ',' update_assign { $$ = append($1, $3) }
 
 update_assign:
 		ColId '=' a_expr
-			{ $$ = *parser.NewUpdateAssign($1, "", nil, $3) }
+			{ $$ = *NewUpdateAssign($1, "", nil, $3) }
 	/* `SET col = DEFAULT` — the DEFAULT placeholder is not an a_expr. */
 	| ColId '=' DEFAULT
-			{ $$ = *parser.NewUpdateAssign($1, "", nil, parser.NewDefaultMarker(yylex.(*lexerState).lastConsumedPos())) }
+			{ $$ = *NewUpdateAssign($1, "", nil, NewDefaultMarker(yylex.(*lexerState).lastConsumedPos())) }
 	| ColId '.' ColId '=' a_expr
-			{ $$ = *parser.NewUpdateAssign($3, $1, nil, $5) }
+			{ $$ = *NewUpdateAssign($3, $1, nil, $5) }
 	/* Multi-column form `(c1, c2) = (e1, e2)` / `= (subquery)` / `= ROW(...)`
 	   — gram.y set_clause's `'(' set_target_list ')' '=' a_expr`. The RHS is
 	   whatever the expression grammar makes of it: a RowExpr for `(1, 2)`, a
@@ -3722,7 +3662,7 @@ update_assign:
 	   which the expression grammar cannot tell from `1` — multiSetRHS checks
 	   the token stream for the '('. */
 	| '(' colid_list ')' '=' a_expr
-			{ $$ = *parser.NewUpdateAssign("", "", $2, multiSetRHS(yylex, $5, $<p>5)) }
+			{ $$ = *NewUpdateAssign("", "", $2, multiSetRHS(yylex, $5, $<p>5)) }
 
 opt_update_where:
 		/* empty */   { $$ = nil }
@@ -3756,7 +3696,7 @@ insert_source:
 				// Upstream parses INSERT's source as a full select_stmt; a
 				// bare VALUES select converts to Rows here so analyzer/
 				// executor see legacy's InsertStmt.Rows shape.
-				sel, _ := $1.(*parser.SelectStmt)
+				sel, _ := $1.(*SelectStmt)
 				i := &insSrc{}
 				if sel != nil && len(sel.ValuesRows) > 0 {
 					i.rows = sel.ValuesRows
@@ -3776,7 +3716,7 @@ insert_source:
 update_stmt:
 		update_core opt_returning
 			{
-				u := $1.(*parser.UpdateStmt)
+				u := $1.(*UpdateStmt)
 				if len($2) > 0 {
 					u.Returning = $2
 				}
@@ -3789,11 +3729,11 @@ update_core:
 				rv := rangeVarFromName($2, $3)
 				w := $7.(*updWhere)
 				if w.currentOf != "" {
-					u := parser.NewUpdateStmt(0, rv, $5, $6, nil)
-					parser.SetUpdateWhereCurrentOf(u, w.currentOf)
+					u := NewUpdateStmt(0, rv, $5, $6, nil)
+					SetUpdateWhereCurrentOf(u, w.currentOf)
 					$$ = u
 				} else {
-					$$ = parser.NewUpdateStmt(0, rv, $5, $6, w.expr)
+					$$ = NewUpdateStmt(0, rv, $5, $6, w.expr)
 				}
 			}
 	/* The leading UPDATE keyword was MISSING from this alternative, so
@@ -3804,23 +3744,23 @@ update_core:
 				rv.Only = true
 				w := $8.(*updWhere)
 				if w.currentOf != "" {
-					u := parser.NewUpdateStmt(0, rv, $6, $7, nil)
-					parser.SetUpdateWhereCurrentOf(u, w.currentOf)
+					u := NewUpdateStmt(0, rv, $6, $7, nil)
+					SetUpdateWhereCurrentOf(u, w.currentOf)
 					$$ = u
 				} else {
-					$$ = parser.NewUpdateStmt(0, rv, $6, $7, w.expr)
+					$$ = NewUpdateStmt(0, rv, $6, $7, w.expr)
 				}
 			}
 	| with_clause UPDATE qualified_name opt_upd_alias SET update_set_list opt_upd_from upd_where
 			{
 				rv := rangeVarFromName($3, $4)
 				w := $8.(*updWhere)
-				var u *parser.UpdateStmt
+				var u *UpdateStmt
 				if w.currentOf != "" {
-					u = parser.NewUpdateStmt(0, rv, $6, $7, nil)
-					parser.SetUpdateWhereCurrentOf(u, w.currentOf)
+					u = NewUpdateStmt(0, rv, $6, $7, nil)
+					SetUpdateWhereCurrentOf(u, w.currentOf)
 				} else {
-					u = parser.NewUpdateStmt(0, rv, $6, $7, w.expr)
+					u = NewUpdateStmt(0, rv, $6, $7, w.expr)
 				}
 				u.With = $1
 				$$ = u
@@ -3845,7 +3785,7 @@ opt_upd_from:
    `UPDATE t SET ... FROM u b WHERE ...` was a hard 42601. Shared by both
    statements, exactly as before. */
 upd_from_list:
-		base_table_ref                     { $$ = []parser.RangeVar{$1} }
+		base_table_ref                     { $$ = []RangeVar{$1} }
 	| upd_from_list ',' base_table_ref    { $$ = append($1, $3) }
 
 /* upd_where / del_where — the empty alternative was MISSING, so an
@@ -3863,7 +3803,7 @@ upd_where:
 delete_stmt:
 		delete_core opt_returning
 			{
-				d := $1.(*parser.DeleteStmt)
+				d := $1.(*DeleteStmt)
 				if len($2) > 0 {
 					d.Returning = $2
 				}
@@ -3876,11 +3816,11 @@ delete_core:
 				rv := rangeVarFromName($3, $4)
 				w := $6.(*updWhere)
 				if w.currentOf != "" {
-					d := parser.NewDeleteStmt(0, rv, $5, nil)
-					parser.SetDeleteWhereCurrentOf(d, w.currentOf)
+					d := NewDeleteStmt(0, rv, $5, nil)
+					SetDeleteWhereCurrentOf(d, w.currentOf)
 					$$ = d
 				} else {
-					$$ = parser.NewDeleteStmt(0, rv, $5, w.expr)
+					$$ = NewDeleteStmt(0, rv, $5, w.expr)
 				}
 			}
 	| DELETE_P FROM ONLY qualified_name opt_upd_alias opt_using_list del_where
@@ -3889,23 +3829,23 @@ delete_core:
 				rv.Only = true
 				w := $7.(*updWhere)
 				if w.currentOf != "" {
-					d := parser.NewDeleteStmt(0, rv, $6, nil)
-					parser.SetDeleteWhereCurrentOf(d, w.currentOf)
+					d := NewDeleteStmt(0, rv, $6, nil)
+					SetDeleteWhereCurrentOf(d, w.currentOf)
 					$$ = d
 				} else {
-					$$ = parser.NewDeleteStmt(0, rv, $6, w.expr)
+					$$ = NewDeleteStmt(0, rv, $6, w.expr)
 				}
 			}
 	| with_clause DELETE_P FROM qualified_name opt_upd_alias opt_using_list del_where
 			{
 				rv := rangeVarFromName($4, $5)
 				w := $7.(*updWhere)
-				var d *parser.DeleteStmt
+				var d *DeleteStmt
 				if w.currentOf != "" {
-					d = parser.NewDeleteStmt(0, rv, $6, nil)
-					parser.SetDeleteWhereCurrentOf(d, w.currentOf)
+					d = NewDeleteStmt(0, rv, $6, nil)
+					SetDeleteWhereCurrentOf(d, w.currentOf)
 				} else {
-					d = parser.NewDeleteStmt(0, rv, $6, w.expr)
+					d = NewDeleteStmt(0, rv, $6, w.expr)
 				}
 				d.With = $1
 				$$ = d
@@ -3926,11 +3866,28 @@ col_constraints:
 	| col_constraints col_constraint
 			{
 				cc := $1.(*colConstraints)
-				switch k := $2.(*colConstraint); k.kind {
+				k := $2.(*colConstraint)
+				/* Every non-attribute element becomes the one a following
+				   [NOT] ENFORCED binds to (parse_utilcmd.c's lastprimarycon).
+				   CHECK and FOREIGN KEY are the only two that accept it. */
+				switch k.kind {
+				case "attr_deferrable", "attr_not_deferrable", "attr_initially_deferred",
+					"attr_initially_immediate", "attr_enforced", "attr_not_enforced",
+					"attr_not_valid", "collate", "compression", "storage":
+				case "check", "check_noinh":
+					noteConstraintElem(cc, "check")
+				case "fk":
+					noteConstraintElem(cc, "fk")
+				default:
+					noteConstraintElem(cc, k.kind)
+				}
+				switch k.kind {
 				case "nn":
 					cc.notNull, cc.nnName = true, k.name
+					cc.nnOccur = append(cc.nnOccur, colNotNullOccurrence{name: k.name, pos: $<p>2})
 				case "nn_noinh":
 					cc.notNull, cc.nnNoInherit, cc.nnName = true, true, k.name
+					cc.nnOccur = append(cc.nnOccur, colNotNullOccurrence{name: k.name, noInherit: true, pos: $<p>2})
 				case "pk":
 					cc.primary = true // legacy drops a CONSTRAINT name here
 				case "uq":
@@ -3948,16 +3905,20 @@ col_constraints:
 				case "attr_not_enforced":
 					// The attribute binds to the constraint it FOLLOWS: after a
 					// REFERENCES it is the FK's, otherwise the CHECK's.
-					if cc.lastWasFK {
-						cc.fkNotEnforced = true
-					} else {
-						cc.checkNotEnforced = true
+					if noteEnforcedAttr(yylex, cc, true, $<p>2) {
+						if cc.lastWasFK {
+							cc.fkNotEnforced = true
+						} else {
+							cc.checkNotEnforced = true
+						}
 					}
 				case "attr_enforced":
-					if cc.lastWasFK {
-						cc.fkNotEnforced = false
-					} else {
-						cc.checkNotEnforced = false
+					if noteEnforcedAttr(yylex, cc, false, $<p>2) {
+						if cc.lastWasFK {
+							cc.fkNotEnforced = false
+						} else {
+							cc.checkNotEnforced = false
+						}
 					}
 				case "attr_not_valid":
 					cc.fkNotValid = true
@@ -4022,7 +3983,7 @@ col_constraint:
 	   Effects, all live because CREATE TABLE is routed: `a int primary key`,
 	   `a int unique` and `a int default 0` were syntax errors, and
 	   `ON DELETE PRIMARY KEY` PANICKED applyFkAction with an interface
-	   conversion (*colConstraint is not parser.FKAction). Keep new
+	   conversion (*colConstraint is not FKAction). Keep new
 	   col_constraint alternatives ABOVE the FK helper rules. */
 	| PRIMARY KEY         { $$ = &colConstraint{kind: "pk"} }
 	| UNIQUE              { $$ = &colConstraint{kind: "uq"} }
@@ -4113,15 +4074,15 @@ fk_actions:
 	| fk_actions fk_action         { $$ = applyFkAction($1.(*fkActs), $2.(*namedFkAct)) }
 
 fk_action:
-		ON DELETE_P fk_kw    { $$ = &namedFkAct{del: true, act: $3.(parser.FKAction)} }
+		ON DELETE_P fk_kw    { $$ = &namedFkAct{del: true, act: $3.(FKAction)} }
 	| ON DELETE_P fk_set_act
 			{
 				sa := $3.(*namedFkAct)
 				sa.del = true
 				$$ = sa
 			}
-	| ON UPDATE SET fk_kw    { $$ = &namedFkAct{up: true, act: $4.(parser.FKAction)} }
-	| ON UPDATE fk_kw        { $$ = &namedFkAct{up: true, act: $3.(parser.FKAction)} }
+	| ON UPDATE SET fk_kw    { $$ = &namedFkAct{up: true, act: $4.(FKAction)} }
+	| ON UPDATE fk_kw        { $$ = &namedFkAct{up: true, act: $3.(FKAction)} }
 	| ON UPDATE fk_set_act
 			{
 				sa := $3.(*namedFkAct)
@@ -4133,8 +4094,8 @@ fk_action:
    (`ON DELETE SET NULL (cols)`, PG 15) does not shift/reduce against the
    keyword-only reduce. Legacy keeps the list for ON DELETE only. */
 fk_set_act:
-		SET NULL_P opt_fk_set_cols       { $$ = &namedFkAct{act: parser.FKActionSetNull, setCols: $3} }
-	| SET DEFAULT opt_fk_set_cols        { $$ = &namedFkAct{act: parser.FKActionSetDefault, setCols: $3} }
+		SET NULL_P opt_fk_set_cols       { $$ = &namedFkAct{act: FKActionSetNull, setCols: $3} }
+	| SET DEFAULT opt_fk_set_cols        { $$ = &namedFkAct{act: FKActionSetDefault, setCols: $3} }
 
 opt_fk_set_cols:
 		/* empty */         { $$ = nil }
@@ -4157,6 +4118,6 @@ opt_gen_storage:
 	| VIRTUAL         { $$ = true }
 
 fk_kw:
-		CASCADE              { $$ = parser.FKActionCascade }
-	| RESTRICT               { $$ = parser.FKActionRestrict }
-	| NO ACTION              { $$ = parser.FKActionNoAction }
+		CASCADE              { $$ = FKActionCascade }
+	| RESTRICT               { $$ = FKActionRestrict }
+	| NO ACTION              { $$ = FKActionNoAction }

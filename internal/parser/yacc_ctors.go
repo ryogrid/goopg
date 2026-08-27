@@ -302,6 +302,16 @@ func NewColumnDef(name string, ct ColumnType) *ColumnDef {
 	return &ColumnDef{pos: 0, Name: name, Type: ct}
 }
 
+// NewColumnDefAt is NewColumnDef with the two positions ddl.go's
+// parseColumnDef records: the column NAME's offset on the ColumnDef and the
+// TYPE name's on its ColumnType. Both are errpositions — a failed DEFAULT or
+// a bad type reports one of them — and canonDump shows neither, so the whole
+// differential suite passed with both at 0.
+func NewColumnDefAt(namePos, typePos int, name string, ct ColumnType) *ColumnDef {
+	ct.pos = typePos
+	return &ColumnDef{pos: namePos, Name: name, Type: ct}
+}
+
 // NewCreateTableStmt assembles the P4.1 v0 CREATE TABLE shape.
 func NewCreateTableStmt(pos int, name ObjectName, cols []ColumnDef, pk []string) *CreateTableStmt {
 	return &CreateTableStmt{pos: pos, Name: name, Columns: cols, PrimaryKey: pk, With: map[string]string{}}
@@ -375,6 +385,18 @@ func NewAlterTableStmt(pos int, name ObjectName) *AlterTableStmt {
 // NewATAction builds one ALTER TABLE action of the given kind.
 func NewATAction(kind AlterTableActionKind) *AlterTableAction {
 	return &AlterTableAction{pos: 0, Kind: kind}
+}
+
+// NewATActionAt is NewATAction with the source position ddl.go anchors the
+// action at. AlterTableAction.pos IS the errposition the executor reports for
+// a failed ALTER (column-name and constraint-name diagnostics both read it),
+// and canonDump prints no positions — so every action the grammar built
+// carried pos 0 and the differential suite could not see it. The anchor is
+// per-kind and irregular in ddl.go (the new name for RENAME TO, the OLD name
+// for RENAME COLUMN, the keyword for SET/RESET, nothing at all for the
+// per-column SET/DROP actions); each call site below mirrors its own.
+func NewATActionAt(kind AlterTableActionKind, pos int) *AlterTableAction {
+	return &AlterTableAction{pos: pos, Kind: kind}
 }
 
 // NewATAttachPartition builds ATTACH PARTITION (Kind=5) with bounds.

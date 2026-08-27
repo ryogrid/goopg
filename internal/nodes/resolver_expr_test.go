@@ -155,7 +155,13 @@ func TestResolveRebuildRoundTrip(t *testing.T) {
 }
 
 // TestRebuildNegativeConstShape confirms a negative int Const rebuilds to the
-// parser's canonical `-N` shape (UnaryOp over a positive IntegerConst).
+// parser's canonical `-N` shape — ONE IntegerConst carrying the sign.
+//
+// It used to assert UnaryOp over a positive literal, which was the old
+// recursive-descent parser's shape. gram.y's AexprConst folds the sign into
+// the constant, so that is what `mustParse("-7")` produces now, and Rebuild
+// has to agree or resolve→Rebuild→re-resolve stops being a fixed point (the
+// pg_node_tree round-trip rendered `'-7'::integer`). P7.1.
 func TestRebuildNegativeConstShape(t *testing.T) {
 	n, err := ResolveExpr(mustParse(t, "-7"), OidInt4)
 	if err != nil {
@@ -165,13 +171,9 @@ func TestRebuildNegativeConstShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rebuild: %v", err)
 	}
-	u, ok := ast.(*parser.UnaryOp)
-	if !ok || u.Op != parser.OpUnaryNeg {
-		t.Fatalf("want UnaryOp{-}, got %T", ast)
-	}
-	lit, ok := u.Operand.(*parser.IntegerConst)
-	if !ok || lit.Value != 7 {
-		t.Fatalf("want IntegerConst{7}, got %+v", u.Operand)
+	lit, ok := ast.(*parser.IntegerConst)
+	if !ok || lit.Value != -7 {
+		t.Fatalf("want IntegerConst{-7}, got %#v", ast)
 	}
 }
 

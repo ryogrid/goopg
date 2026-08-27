@@ -4,7 +4,7 @@ import (
     "testing"
 )
 
-func TestSortByUsing(t *testing.T) {
+func TestSortByUsingDescFlag(t *testing.T) {
     stmts, err := Parse("SELECT 1 ORDER BY 1 USING >")
     if err != nil {
         t.Fatalf("Parse error: %v", err)

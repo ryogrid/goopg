@@ -1201,8 +1201,10 @@ The failing top-level tests, for the resumed session:
 
 ## P7 — Cutover & deletion
 
-- [ ] **P7.1 Move generated sources into internal/parser; delete
-  internal/sqlparser; external import paths unchanged.**
+- [x] **P7.1 Move generated sources into internal/parser; delete
+  internal/sqlparser; external import paths unchanged.** DONE 2026-08-28.
+  The move itself was the recipe above, verbatim. What it cost was the 73
+  failures the dry run predicted — worked to ZERO, see "P7.1 landing" below.
 - [ ] **P7.2 Delete legacy recursive-descent files** (select.go, ddl.go,
   dml.go, expr.go, function.go, copy.go, alter/interval parse helpers),
   prune parser.go drivers (keep Parse/ParseExpr entries, token pool, error
@@ -1215,3 +1217,152 @@ The failing top-level tests, for the resumed session:
 - [x] Docs reviewed by agent reviewers; findings folded back (2026-08-25:
   architecture reviewer + grammar/tooling reviewer, both APPROVE-WITH-
   CHANGES; all BLOCKER/MAJOR findings incorporated above).
+
+## P7.1 landing (2026-08-28)
+
+The packages are one. `internal/sqlparser` no longer exists; `Parse` calls
+`routeBatch` directly and `internal/postmaster/parser_routing.go` — the
+function-pointer hook that existed only to join two packages — is deleted.
+`parseLegacyOnly` / `parseExprBatch(useYacc=false)` are the differential
+suite's legacy leg, and they are load-bearing: without them `diffParse` would
+compare the LALR parser to itself and the entire suite would pass while
+testing nothing.
+
+The 73 predicted failures resolved into four groups, and only the first was
+mechanical:
+
+**1. Tests asserting LEGACY's shape through `Parse`.** `Parse` is the LALR
+parser now, so the four `TestKnownDiff*` pins and `TestCreateTableV0`'s
+yacc-only list had to read `parseLegacyOnly`. No behaviour change.
+
+**2. One structural mismatch behind five failures.** `SyntaxError` was being
+built two different ways: legacy put the offending token's raw spelling in
+`Message` and let `Error()` add the wrapper; the yacc side put the whole
+sentence in `Message` with `Raw: true`. The rendered strings matched, so
+nothing caught it — but every caller that reads the FIELD (the COPY tests,
+the "at or near" wording test) saw two shapes. Both now go through one
+`nearTextOf`, which is also where the quoting lives: a string literal keeps
+its quotes, a quoted identifier keeps its, a plain identifier is bare.
+
+**3. Six genuine gaps, four of them the same bug.** Four were sibling copies
+that had drifted from the implementation they were copied from — the recurring
+failure mode in this repo, and each copy was the LAX one:
+
+| copy | what it dropped |
+|---|---|
+| three inline float folds in the grammar | `opt_float`'s two range checks, so `'3'::float(54)` silently became float8 and `float(0)` became float4 |
+| `bitStringConst` | all digit validation — `b'2'` and `x'Z'` decoded the bad digit as zero instead of raising 22P02 |
+| the yacc `SUBSTRING ... SIMILAR` fold | both SQLSTATEs (22025 with its HINT, and 2200C) and the `Pos: -1` convention |
+| the two CREATE TABLE `WITH` loops | the `oids` derivation, in both copies |
+
+All four now call the one implementation. The other two gaps were missing
+checks: `[NOT] ENFORCED` needed `transformConstraintAttrs`' misplaced/duplicate
+pair (in upstream's order, with the counter resetting per constraint element),
+and a CREATE TABLE with neither a column list nor a partition parent is not one
+of gram.y's three `CreateStmt` alternatives — an empty `ct_tail_list` had made
+`CREATE TABLE t` parse.
+
+**4. Three tests that pinned legacy being WRONG.** `CREATE TABLE t (user text)`
+and `(verbose text)` are syntax errors upstream — `kwlist.h:480` makes `user`
+RESERVED and `:491` makes `verbose` TYPE_FUNC_NAME, and `ColId` reaches
+neither. goopg's hand-written lexer simply never classified them. Refusing them
+is a compatibility FIX, so they are named in `stricterThanLegacy` rather than
+counted as gaps. `SELECT -2^2` was the third, and it was never a precedence
+bug: both parsers build `(-2)^2` (UMINUS is declared after `^`, gram.y:891 vs
+:887), and the only difference is the documented sign fold.
+
+Ratchets after the move: `TestLegacyCorpusRejects` 0, `TestLegacyCorpusDivergence`
+0 with the six known-diff statements named individually — raising the ceiling
+instead would have made a seventh divergence invisible. The harvester now skips
+prose containing `...`, which it was reading out of doc comments and feeding in
+as SQL.
+
+### P7.1 follow-up: the packages' OTHER test suite, and node positions
+
+Merging the packages pointed `internal/executor`'s tests at the LALR parser
+for the first time too — same cause as internal/parser's own suite: the
+routing hook was wired by `internal/postmaster`'s `init()`, so any test binary
+that did not link postmaster ran all-legacy. 32 executor tests failed. They
+resolved into eight root causes, and two were data-corruption bugs that no
+gate would have caught:
+
+- **Integer literals SATURATED.** `strconv.Atoi`'s error was dropped in the
+  ICONST path, and Atoi saturates — so `SELECT 9223372036854775808` returned
+  MaxInt64 and `99999999999999999999::int8` returned a value instead of
+  raising 22003. scan.l's `process_integer_literal` re-delivers a literal that
+  does not fit as FCONST; the boundary is int64 here rather than upstream's
+  int32 because goopg's `IntegerConst` is int64 and the legacy lexer draws the
+  line there. This also silently fixed a "dropped pairs" failure in the
+  big-numeric hash-join test.
+- **`WITHIN GROUP (ORDER BY …)` was dropped**: `within_group_clause` returned
+  `$5` — the BY keyword — instead of `$6`, so the type assertion at every call
+  site failed quietly and `rank(…) WITHIN GROUP (…)` resolved as a plain
+  `rank()` call: "function rank does not exist".
+
+The rest: malformed interval bodies were accepted (`interval '1days2hours'`
+fell through to a TypedStringLit instead of erroring), ALTER SEQUENCE's three
+RELATION operations were missing entirely (they become an `AlterTableStmt`
+with `TagOverride`, not sequence options), ALTER DOMAIN was missing NOT VALID
+and a drop behaviour and was routing `SET SCHEMA` — which legacy answers with
+a CompatNoopStmt — table-level `RESET (…)` dropped its option names, `character[]`
+never got bpchar's implicit length-1 typmod (so it came out `"char"[]`, OID
+1002 instead of 1014), and column-level NOT NULL had no conflict algorithm.
+
+**Node positions were a structural blind spot.** `canonDump` prints no
+positions, so the entire differential suite — 723 goldens, the regress corpus,
+the legacy corpus — compared equal while the LALR parser built nodes with
+pos 0 or with the wrong token's offset. Positions are not cosmetic: they ARE
+the errposition in the wire ErrorResponse, and psql draws its caret from them.
+
+`TestPositionParity` (internal/parser/pos_parity_test.go) closes it: it walks
+both ASTs by reflection and compares every `pos` field. It reported **2058**
+statements on the day it was written. The systemic causes fixed since:
+
+| cause | effect |
+|---|---|
+| `qualified_name` used `lastConsumedPos()` | that rule is a DEFAULT reduction, so no lookahead had been read and the position was one token too far back — **every FuncCall in the language** carried the offset of whatever preceded the name (0 for `select rank(...)`). `$<p>1` is correct either way. |
+| `objectNameFromQn` dropped `qname.pos`, and six copies of the same "nm := $N.parts" block open-coded it | every CREATE TABLE / VIEW / INDEX name at 0 |
+| `NewColumnDef` / `NewATAction` never took a position | 340 ColumnDefs and 29 ALTER actions at 0 — the actual errposition for a failed ALTER |
+| `select_pos` stamped a SelectStmt position | legacy leaves it ZERO, and `lastConsumedPos()` there returned the offset PAST THE END of the statement (8 for `SELECT 1`). A wrong caret is worse than none. |
+
+Count now **1179**, ratcheted in both directions. The remainder is a long tail
+inside the expression grammar (StarExpr, BinaryOp, CastExpr, IntervalLit),
+each needing the same treatment: replace `lastConsumedPos()` with the captured
+`$<p>N` of the token legacy anchors on.
+
+**Lesson for the harness**: `lastConsumedPos()` is only correct where the rule
+is guaranteed to have taken a lookahead. Prefer `$<p>N`.
+
+### P7.1 follow-up 2: three more suites the merge pointed at the new parser
+
+`internal/parser/analyzer` and `internal/initdb` were in the same position as
+`internal/executor` — no postmaster link, so no routing hook, so they had
+always run all-legacy. Four gaps, and two were the same shape:
+
+**A hand-expanded cross-product loses a cell.** The plain-arguments
+`OVER (...)` case was written as SIX inlined alternatives —
+`opt_frame_tail`, `PARTITION BY …`, `ORDER BY …`, `ColId …`,
+`ColId ORDER BY …`, `PARTITION BY … ORDER BY …` — and the missing seventh
+was `ColId PARTITION BY …`. `OVER (w PARTITION BY x)` MUST parse: "cannot
+override PARTITION BY clause of window w" is a parse-ANALYSIS error, so a
+42601 there is wrong. gram.y has one `window_specification` of four optional
+parts for exactly this reason, and the rules are now that shape. Note the
+state table alone was misleading: it showed PARTITION shifting after the
+name, because the failure was in a DIFFERENT arm that never reached
+`opt_window_spec` at all.
+
+Also missing: `sum(x ORDER BY y) OVER ()` — the aggregate-ORDER-BY arm had no
+OVER pair — and CREATE INDEX's tail clauses in any order. ddl.go SCANS the
+tail in a loop, so it takes `WITH (…) NULLS NOT DISTINCT`, which gram.y's
+fixed `opt_include opt_unique_null_treatment opt_reloptions` order does not —
+and goopg's own index-recovery DDL is written that way. A flat repeatable
+`idx_tail_list` matches the scanner and costs no conflict.
+
+**A fixed point moved.** `nodes.rebuildConst` turned a negative int4/int8
+Const back into `UnaryOp(-, IntegerConst)` because that was the old parser's
+shape and resolve→Rebuild→re-resolve had to be a fixed point. gram.y's
+AexprConst folds the sign into the constant, so the fixed point is now
+`IntegerConst{-1}` — rebuilding into the old shape made the pg_node_tree
+round-trip render `'-1'::integer` instead of `-1`. Anything else that was
+written to be a fixed point of the legacy AST is worth re-checking the same
+way.

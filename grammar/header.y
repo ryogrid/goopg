@@ -4,12 +4,11 @@
 /* goopg_ext.y → closing "%%". */
 %{
 
-package sqlparser
+package parser
 
 import (
 	"strconv"
-
-	"github.com/goopg/goopg/internal/parser"
+	"strings"
 )
 
 %}
@@ -32,54 +31,54 @@ import (
 	i64    int64            // signed integer literals in option lists
 	b      bool             // set_quantifier ALL flag etc
 	p      int              // byte position threading (see select_pos helper)
-	stmt   parser.Stmt      // single-statement productions
-	stmts  []parser.Stmt    // statement lists (root)
-	expr   parser.Expr      // expression productions
-	targets []parser.ResTarget
-	rt     parser.ResTarget
-	rvar   parser.RangeVar
-	rvars   []parser.RangeVar
-	sortbys []parser.SortBy
-	sortby  parser.SortBy
-	joins   []parser.JoinExpr
-	fexpr   parser.FromExpr
-	fexprs  []parser.FromExpr
+	stmt   Stmt      // single-statement productions
+	stmts  []Stmt    // statement lists (root)
+	expr   Expr      // expression productions
+	targets []ResTarget
+	rt     ResTarget
+	rvar   RangeVar
+	rvars   []RangeVar
+	sortbys []SortBy
+	sortby  SortBy
+	joins   []JoinExpr
+	fexpr   FromExpr
+	fexprs  []FromExpr
 	jspec   *joinSpec
-	exprs   []parser.Expr
-	tfr     *parser.TableFuncRef
-	rfes    []parser.RowsFromEntry
-	vrows   [][]parser.Expr
-	ctes    []*parser.CommonTableExpr
-	withc   *parser.WithClause
-	rfe     parser.RowsFromEntry
+	exprs   []Expr
+	tfr     *TableFuncRef
+	rfes    []RowsFromEntry
+	vrows   [][]Expr
+	ctes    []*CommonTableExpr
+	withc   *WithClause
+	rfe     RowsFromEntry
 	strs   []string         // identifier lists
 	qn     qname            // dotted-name carrier (support.go)
 	node   any              // multi-value carriers like distinctInfo
-	wd     *parser.WindowDef
-	fr     *parser.WindowFrame
+	wd     *WindowDef
+	fr     *WindowFrame
 	ct     castType
 	isrc   *insSrc
-	onames []parser.ObjectName
-	fargs  []parser.FunctionArg
+	onames []ObjectName
+	fargs  []FunctionArg
 	ivq    ivQual
-	lrels  []parser.LockTableRelation
-	lrel   parser.LockTableRelation
-	mwc    *parser.MergeWhenClause
-	mwcs   []*parser.MergeWhenClause
-	tflds  []parser.TypeField
-	tfld   parser.TypeField
+	lrels  []LockTableRelation
+	lrel   LockTableRelation
+	mwc    *MergeWhenClause
+	mwcs   []*MergeWhenClause
+	tflds  []TypeField
+	tfld   TypeField
 	nodes  []any
-	copts  []parser.CopyOption
+	copts  []CopyOption
 	telems []*tableElem
-	copt   parser.CopyOption
-	fitems []parser.DropFunctionItem
+	copt   CopyOption
+	fitems []DropFunctionItem
 	ctt    *ctTail
 	wp     [2]string
-	oc     *parser.OnConflictClause
-	oct    *parser.OnConflictTarget
-	ualist []parser.UpdateAssign
-	ua     parser.UpdateAssign
-	nwd    parser.NamedWindowDef
-	nwds   []parser.NamedWindowDef
+	oc     *OnConflictClause
+	oct    *OnConflictTarget
+	ualist []UpdateAssign
+	ua     UpdateAssign
+	nwd    NamedWindowDef
+	nwds   []NamedWindowDef
 	list   []any            // heterogeneous lists, mirroring PG's untyped List
 }
