@@ -81,7 +81,8 @@
 %type <onames>	drop_name_list
 %type <exprs>	trim_list
 %type <str>	sort_using_op constr_name func_name_keyword opt_part_opclass
-%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause paren_tail
+%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause paren_tail opt_identity_seq_opts identity_seq_opt_list identity_seq_opt
+%type <i64>	signed_iconst
 %type <expr>	opt_paren_limit opt_paren_offset
 %type <exprs>	opt_execute_params
 
@@ -748,6 +749,53 @@ opt_into_table:
 		/* empty */   { _ = 0 }
 	| TABLE           { _ = 0 }
 
+/* Identity sequence options — gram.y OptParenthesizedSeqOptList / SeqOptElem,
+   restricted to what legacy's identity parser takes (ddl.go:4715-4755):
+   START [WITH] n, INCREMENT [BY] n, MINVALUE n, MAXVALUE n, CACHE n, CYCLE,
+   and NO MINVALUE / NO MAXVALUE / NO CYCLE, in any order, signed integers
+   only. (Legacy also swallows a bare NO; not reproduced — it is a typo.) */
+opt_identity_seq_opts:
+		/* empty */                  { $$ = (*identityOpts)(nil) }
+	| '(' identity_seq_opt_list ')'  { $$ = $2 }
+
+identity_seq_opt_list:
+		identity_seq_opt
+			{
+				o := &identityOpts{}
+				$1.(func(*identityOpts))(o)
+				$$ = o
+			}
+	| identity_seq_opt_list identity_seq_opt
+			{
+				o := $1.(*identityOpts)
+				$2.(func(*identityOpts))(o)
+				$$ = o
+			}
+
+identity_seq_opt:
+		START opt_with_kw signed_iconst   { n := $3; $$ = func(o *identityOpts) { o.start = n } }
+	| INCREMENT opt_by_kw signed_iconst   { n := $3; $$ = func(o *identityOpts) { o.inc = &n } }
+	| MINVALUE signed_iconst              { n := $2; $$ = func(o *identityOpts) { o.min = &n } }
+	| MAXVALUE signed_iconst              { n := $2; $$ = func(o *identityOpts) { o.max = &n } }
+	| CACHE signed_iconst                 { n := $2; $$ = func(o *identityOpts) { o.cache = &n } }
+	| CYCLE                               { $$ = func(o *identityOpts) { o.cycle = true } }
+	| NO MINVALUE                         { $$ = func(o *identityOpts) {} }
+	| NO MAXVALUE                         { $$ = func(o *identityOpts) {} }
+	| NO CYCLE                            { $$ = func(o *identityOpts) { o.cycle = false } }
+
+opt_with_kw:
+		/* empty */   { _ = 0 }
+	| WITH            { _ = 0 }
+
+opt_by_kw:
+		/* empty */   { _ = 0 }
+	| BY              { _ = 0 }
+
+signed_iconst:
+		ICONST          { $$ = int64($1) }
+	| '-' ICONST        { $$ = -int64($2) }
+	| '+' ICONST        { $$ = int64($2) }
+
 sort_using_op:
 		exclude_op        { $$ = $1 }
 	| ColId               { $$ = $1 }
@@ -928,14 +976,6 @@ select_fetch_first_value:
 			{
 				$$ = $1
 			}
-	/* A parenthesised expression — upstream reaches it because gram.y's c_expr
-	   owns `'(' a_expr ')' opt_indirection`, while this grammar hangs that
-	   alternative off a_expr instead, leaving c_expr unable to start with '('.
-	   `FETCH FIRST (NULL+1) ROWS WITH TIES` is the spelling limit.sql uses. */
-	| '(' a_expr ')'
-			{
-				$$ = $2
-			}
 	| '-' ICONST
 			{
 				e := parser.NewIntegerConst(yylex.(*lexerState).lastConsumedPos(), int64(-$2))
@@ -1018,19 +1058,7 @@ target_el:
 				p := yylex.(*lexerState).lastConsumedPos()
 				$$ = parser.NewResTarget(p, "", parser.NewStarExpr(p, "", ""))
 			}
-	| qualified_name '.' '*'
-			{
-				// gram.y :17287 target_el qualified star (table.*).
-				parts := $1.parts
-				schema, table := "", ""
-				switch n := len(parts); {
-				case n == 1:
-					table = parts[0]
-				case n >= 2:
-					schema, table = parts[n-2], parts[n-1]
-				}
-				$$ = parser.NewResTarget($1.pos, "", parser.NewStarExpr($1.pos, schema, table))
-			}
+
 
 /* from_clause — gram.y :13598. */
 opt_from_clause:
@@ -1824,10 +1852,6 @@ a_expr:
 			{
 				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), parser.OpUnaryPos, $2)
 			}
-	| '(' a_expr ')'
-			{
-				$$ = $2
-			}
 	/* IS [NOT] NULL / TRUE / FALSE / UNKNOWN / DISTINCT FROM — gram.y
 	   :15160ff IS NULL_P etc; DISTINCT FROM uses %prec IS like upstream.
 	   Positions ride on the LEFT operand (content dumps strip them). */
@@ -2160,7 +2184,45 @@ c_expr:
 	   a_expr/b_expr c_expr split rather than anything about the star itself.
 	   Target-list `tbl.*` is unaffected — it has its own target_el
 	   alternative (:839). Cost recorded in docs/design/not_ralph/TODO.md. */
-		ICONST
+	/* The parenthesised expression lives HERE, in c_expr, as gram.y :15540 has
+	   it — not in a_expr and b_expr as two separate copies, which is where
+	   this grammar kept it until 2026-08-27. That split was the "a_expr/b_expr
+	   c_expr split" behind every reduce/reduce measurement on this file: with
+	   two paren rules the parser had to decide, right after '(', whether the
+	   inside was an a_expr or a b_expr, and any third rule sharing the prefix
+	   (a row constructor, `tbl.*`) collided with both. With one rule here the
+	   row constructor beside it merely shares a prefix state and the decision
+	   is made on ',' versus ')'. b_expr reaches this through `b_expr: c_expr`,
+	   so `BETWEEN (x) AND y` still parses. */
+		'(' a_expr ')'
+			{
+				$$ = $2
+			}
+	/* Implicit row constructor — gram.y implicit_row (:16632), spelled with a
+	   mandatory second element so it cannot collide with grouping parens.
+	   Legacy builds RowExpr for this form and a plain `row(...)` FuncCall for
+	   the explicit ROW(...) spelling (name_or_call already does that); it
+	   rejects indirection on either, so none is offered. */
+	| '(' expr_list ',' a_expr ')'
+			{
+				$$ = parser.NewRowExpr($<p>1, append($2, $4))
+			}
+	/* `tbl.*` as an EXPRESSION — whole-row expansion: VALUES(n.*), f(n.*).
+	   gram.y reaches it through columnref's indirection. Only ONE rule may
+	   spell it: target_el used to carry its own copy, and the two reduced in
+	   the same state — 21 reduce/reduce, one per token that can follow a
+	   target entry. target_el now reaches it through a_expr like everything
+	   else, and builds the same StarExpr it always did. */
+	| qualified_name '.' '*'
+			{
+				parts := $1.parts
+				schema, table := "", parts[len(parts)-1]
+				if len(parts) > 1 {
+					schema = parts[len(parts)-2]
+				}
+				$$ = parser.NewStarExpr($1.pos, schema, table)
+			}
+	| ICONST
 			{
 				/* $1 is already the parsed integer (adapter fills ival). */
 				$$ = parser.NewIntegerConst(yylex.(*lexerState).lastConsumedPos(), int64($1))
@@ -2449,10 +2511,6 @@ b_expr:
 	| b_expr NOT_EQUALS b_expr
 			{
 				$$ = parser.NewBinaryOp($1.Pos(), parser.OpNe, $1, $3)
-			}
-	| '(' b_expr ')'
-			{
-				$$ = $2
 			}
 	/* b_expr's own unary signs and generic operator — gram.y gives b_expr the
 	   same four (`'+' b_expr`, `'-' b_expr`, `b_expr qual_Op b_expr`,
@@ -3203,9 +3261,9 @@ col_constraints:
 				case "gen_virtual":
 					cc.genAlways, cc.genExpr, cc.genVirtual = true, k.text, true
 				case "identity_always":
-					cc.identity, cc.identityAlways = true, true
+					cc.identity, cc.identityAlways, cc.identitySeq = true, true, k.seq
 				case "identity_default":
-					cc.identity, cc.identityAlways = true, false
+					cc.identity, cc.identityAlways, cc.identitySeq = true, false, k.seq
 				}
 				$$ = cc
 			}
@@ -3246,10 +3304,10 @@ col_constraint:
 				}
 				$$ = &colConstraint{kind: k, text: yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).genSpanEnd)}
 			}
-	| GENERATED ALWAYS AS IDENTITY_P
-			{ $$ = &colConstraint{kind: "identity_always"} }
-	| GENERATED BY DEFAULT AS IDENTITY_P
-			{ $$ = &colConstraint{kind: "identity_default"} }
+	| GENERATED ALWAYS AS IDENTITY_P opt_identity_seq_opts
+			{ $$ = &colConstraint{kind: "identity_always", seq: $5.(*identityOpts)} }
+	| GENERATED BY DEFAULT AS IDENTITY_P opt_identity_seq_opts
+			{ $$ = &colConstraint{kind: "identity_default", seq: $6.(*identityOpts)} }
 	| DEFERRABLE          { $$ = &colConstraint{kind: "attr_deferrable"} }
 	| NOT DEFERRABLE      { $$ = &colConstraint{kind: "attr_not_deferrable"} }
 	| INITIALLY DEFERRED  { $$ = &colConstraint{kind: "attr_initially_deferred"} }

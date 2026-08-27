@@ -622,6 +622,7 @@ type colSpec struct {
 	genVirtual        bool
 	identity          bool
 	identityAlways    bool
+	identitySeq       *identityOpts
 	notNull  bool
 	primary  bool
 	unique   bool
@@ -669,6 +670,7 @@ type colConstraints struct {
 	genVirtual        bool
 	identity          bool
 	identityAlways    bool
+	identitySeq       *identityOpts
 	notNull    bool
 	primary    bool
 	unique     bool
@@ -709,6 +711,26 @@ type colConstraint struct {
 	text string          // check: raw source span
 	fk   *fkInfo         // fk: referenced table/cols + actions
 	expr parser.Expr
+	seq  *identityOpts   // identity_*: the `(START WITH n ...)` option list
+}
+
+// identityOpts carries an identity column's sequence options — legacy's
+// ColumnDef.Identity{Start,Increment,Min,Max,Cache,Cycle}. Start is a plain
+// int64 (0 = unset) and the rest are pointers, exactly as the AST has them.
+type identityOpts struct {
+	start                 int64
+	inc, min, max, cache *int64
+	cycle                 bool
+}
+
+// applyIdentityOpts copies the option list onto the column.
+func applyIdentityOpts(cd *parser.ColumnDef, o *identityOpts) {
+	if o == nil {
+		return
+	}
+	cd.IdentityStart = o.start
+	cd.IdentityIncrement, cd.IdentityMin, cd.IdentityMax, cd.IdentityCache = o.inc, o.min, o.max, o.cache
+	cd.IdentityCycle = o.cycle
 }
 
 // tableElem is one CREATE TABLE parens element: a column or a table-level

@@ -51,6 +51,7 @@ create_table_stmt:
 						cd.GeneratedVirtual = c.genVirtual
 						cd.IdentityColumn = c.identity
 						cd.IdentityAlways = c.identityAlways
+						applyIdentityOpts(cd, c.identitySeq)
 						// The attrs attach to whichever constraint the column
 						// actually declared (legacy threads pointers to the
 						// specific flag pair).
@@ -304,7 +305,7 @@ table_element:
 				cs.nullsNotDistinct = cc.nullsNotDistinct
 				cs.deferrable, cs.initiallyDeferred = cc.deferrable, cc.initiallyDeferred
 				cs.genExpr, cs.genAlways, cs.genVirtual = cc.genExpr, cc.genAlways, cc.genVirtual
-				cs.identity, cs.identityAlways = cc.identity, cc.identityAlways
+				cs.identity, cs.identityAlways, cs.identitySeq = cc.identity, cc.identityAlways, cc.identitySeq
 				$$ = &tableElem{col: cs}
 			}
 	| PRIMARY KEY pk_cols opt_include opt_constr_attrs
@@ -1108,6 +1109,11 @@ alter_table_action:
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
+				// Identity was silently DROPPED here while CREATE TABLE kept
+				// it — the classic sibling-path divergence, and `add column`
+				// is routed.
+				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
+				applyIdentityOpts(cd, cc.identitySeq)
 				a := parser.NewATAction(parser.AlterTableAddColumn)
 				a.Column = *cd
 				$$ = a

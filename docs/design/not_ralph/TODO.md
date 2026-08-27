@@ -540,19 +540,16 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   `DELETE ... USING` aliases, six keyword typed-literal prefixes, keyword
   function names (`left(...)`), counted datetime types, and `SELECT ... INTO`.
 
-**Must-pass regress fragment count: 222 -> 188 -> 157 -> 103 -> 84 -> 33 -> 26 -> 13.**
+**Must-pass regress fragment count: 222 -> 188 -> 157 -> 103 -> 84 -> 33 -> 26 -> 13 -> 1.**
 
 The measurement harness was also corrected mid-session: it now discards any
 fragment the LEGACY parser rejects too, so the regress files' DELIBERATE syntax
 errors (`select distinct from pg_database;`, `select;`, the copydml cases) no
 longer inflate the count. Roughly 33 of the original 222 were that noise.
 
-**Of the 13 that remain, 10 are row constructors** (the one structural blocker
-left, below). The other three are GROUPING SETS, which is an unported feature
-rather than a missing production; `VALUES(n.*)` — whole-row expansion as an
-EXPRESSION — whose cost is recorded in the grammar next to `c_expr` (20
-reduce/reduce, all of them the pre-existing a_expr/b_expr split); and
-`GENERATED ALWAYS AS IDENTITY (START WITH ...)` sequence options.
+**The ONE fragment that remains is GROUPING SETS** — an unported feature
+rather than a missing production. Both structural blockers are gone (below),
+and so are `VALUES(n.*)` and the identity sequence options.
 
 ### The structural blockers (2026-08-27)
 
@@ -606,9 +603,29 @@ select_with_parens, with the set-op alternatives taking select_clause — so the
 parenthesised operand never enters simple_select at all. That is a structural
 rewrite of the SELECT core and should be done deliberately, not piecemeal.
 
-- [ ] **Row constructors (10)** — unchanged from the measurement above: 12
-  reduce/reduce, all `a_expr: c_expr` vs `b_expr: c_expr`. Resolve the
-  a_expr/b_expr split first. Now the LAST structural blocker.
+- [x] **DONE 2026-08-27 — row constructors (10), and the a_expr/b_expr split
+  itself.** The "split" was two separate copies of the parenthesised
+  expression — `a_expr: '(' a_expr ')'` and `b_expr: '(' b_expr ')'` — where
+  gram.y :15540 keeps ONE in c_expr. With two, the parser had to decide right
+  after '(' whether the inside was an a_expr or a b_expr, and any third rule
+  sharing the prefix collided with both; that is what every "12 reduce/reduce,
+  all a_expr: c_expr vs b_expr: c_expr" measurement on this file was. Moving
+  the single copy into c_expr (b_expr reaches it via `b_expr: c_expr`) and
+  hanging gram.y's implicit_row beside it costs ZERO conflicts. Legacy shape
+  reproduced: RowExpr for `(a, b)`, a plain row(...) FuncCall for ROW(...),
+  no indirection on either.
+
+- [x] **DONE 2026-08-27 — `VALUES(n.*)` / `f(n.*)`.** The recorded "20
+  reduce/reduce, the a_expr/b_expr split" was wrong on the cause: re-measured
+  after the split was gone it was still 21, all in one state — target_el
+  carried its OWN `qualified_name '.' '*'` copy that reduced in the same state
+  as c_expr's, one conflict per token that can follow a target entry. Only
+  c_expr spells it now; target_el reaches it through a_expr. Zero conflicts.
+
+- [x] **DONE 2026-08-27 — identity sequence options** (`GENERATED ... AS
+  IDENTITY (START WITH n INCREMENT BY n MINVALUE n MAXVALUE n CACHE n [NO]
+  CYCLE)`), on both the CREATE TABLE column and the ALTER TABLE ADD COLUMN
+  sibling — which had been dropping identity altogether.
 
 ## ⚠️ VERIFICATION VERDICT 2026-08-27 — the migration is BELOW pre-migration level
 

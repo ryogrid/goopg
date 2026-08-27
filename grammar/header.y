@@ -24,6 +24,7 @@ import (
 %union {
 	str    string           // IDENT / SCONST / keyword text / Op value ...
 	ival   int              // ICONST / PARAM numbers
+	i64    int64            // signed integer literals in option lists
 	b      bool             // set_quantifier ALL flag etc
 	p      int              // byte position threading (see select_pos helper)
 	stmt   parser.Stmt      // single-statement productions
