@@ -3558,3 +3558,29 @@ alter_index_stmt:
 alter_idx_col:
 		ColId       { $$ = $1 }
 	| ICONST        { $$ = strconv.FormatInt(int64($1), 10) }
+
+/* ============================================================================
+   P5.13 — ALTER VIEW. Like ALTER INDEX it produces an AlterTableStmt, but it
+   tags EVERY form "ALTER VIEW" and it supports IF EXISTS. Anything outside the
+   seven forms below falls through in legacy to a skip-to-semicolon no-op, so
+   the dispatcher gates on the action word.
+   ========================================================================= */
+
+alter_view_stmt:
+		ALTER VIEW opt_if_exists_drop qualified_name alter_view_action
+			{
+				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($4), "ALTER VIEW")
+				st.IfExists = $3
+				$5.(alterViewOp)(st)
+				$$ = st
+			}
+
+alter_view_action:
+		RENAME TO ColId                       { $$ = altViewRenameTo($3) }
+	| RENAME opt_COLUMN ColId TO ColId        { $$ = altViewRenameCol($3, $5) }
+	| OWNER TO alter_fn_owner                 { $$ = altViewOwner($3) }
+	| SET SCHEMA ColId                        { $$ = altViewSetSchema($3) }
+	| SET '(' str_pair_list ')'               { $$ = altViewReloptions($3, false) }
+	| RESET '(' str_pair_list ')'             { $$ = altViewReloptions($3, true) }
+	| ALTER opt_COLUMN ColId SET DEFAULT a_expr { $$ = altViewSetDefault($3, $6) }
+	| ALTER opt_COLUMN ColId DROP DEFAULT     { $$ = altViewDropDefault($3) }

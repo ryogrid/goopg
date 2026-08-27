@@ -3582,3 +3582,63 @@ func strPairMap(kvs []string) map[string]string {
 	}
 	return out
 }
+
+// alterViewOp is one ALTER VIEW action, applied to the AlterTableStmt legacy
+// builds for the statement.
+type alterViewOp func(*parser.AlterTableStmt)
+
+func altViewAction(kind parser.AlterTableActionKind, fill func(*parser.AlterTableAction)) alterViewOp {
+	return func(st *parser.AlterTableStmt) {
+		a := parser.NewATAction(kind)
+		if fill != nil {
+			fill(a)
+		}
+		st.Actions = append(st.Actions, *a)
+	}
+}
+
+func altViewRenameTo(name string) alterViewOp {
+	n := name
+	return altViewAction(parser.AlterTableRenameTable, func(a *parser.AlterTableAction) { a.NewName = n })
+}
+
+func altViewRenameCol(old, new_ string) alterViewOp {
+	o, n := old, new_
+	return altViewAction(parser.AlterTableRenameColumn, func(a *parser.AlterTableAction) {
+		a.OldColumnName, a.NewName = o, n
+	})
+}
+
+// altViewOwner — OwnerTo lives on the STATEMENT, not on an action, and the
+// three self-referential role spellings collapse to the "current_user"
+// sentinel (alter_fn_owner has already done that mapping).
+func altViewOwner(owner string) alterViewOp {
+	o := owner
+	return func(st *parser.AlterTableStmt) { st.OwnerTo = o }
+}
+
+func altViewSetSchema(name string) alterViewOp {
+	n := name
+	return func(st *parser.AlterTableStmt) { st.SetSchema = n }
+}
+
+func altViewReloptions(kvs []string, reset bool) alterViewOp {
+	opts := strPairMap(kvs)
+	kind := parser.AlterTableSetReloptions
+	if reset {
+		kind = parser.AlterTableResetReloptions
+	}
+	return altViewAction(kind, func(a *parser.AlterTableAction) { a.With = opts })
+}
+
+func altViewSetDefault(col string, e parser.Expr) alterViewOp {
+	c := col
+	return altViewAction(parser.AlterTableSetDefault, func(a *parser.AlterTableAction) {
+		a.ColumnName, a.DefaultExpr = c, e
+	})
+}
+
+func altViewDropDefault(col string) alterViewOp {
+	c := col
+	return altViewAction(parser.AlterTableDropDefault, func(a *parser.AlterTableAction) { a.ColumnName = c })
+}

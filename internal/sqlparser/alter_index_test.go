@@ -29,3 +29,25 @@ func TestAlterIndex(t *testing.T) {
 	assertNotRouted(t, "ALTER INDEX IF EXISTS i RENAME TO j")
 	assertNotRouted(t, "ALTER INDEX i DEPENDS ON EXTENSION e")
 }
+
+// TestAlterView pins P5.13 — ALTER VIEW. Like ALTER INDEX it produces an
+// AlterTableStmt, but it tags EVERY form "ALTER VIEW" and it takes IF EXISTS.
+// OwnerTo lives on the STATEMENT rather than on an action, and the three
+// self-referential role spellings collapse to the "current_user" sentinel.
+func TestAlterView(t *testing.T) {
+	for _, q := range []string{
+
+		"ALTER VIEW v OWNER TO r", "ALTER VIEW v OWNER TO CURRENT_USER",
+		"ALTER VIEW v RENAME TO w", "ALTER VIEW IF EXISTS v RENAME TO w",
+		"ALTER VIEW v RENAME COLUMN a TO b", "ALTER VIEW v RENAME a TO b",
+		"ALTER VIEW v SET (security_barrier=true)", "ALTER VIEW v RESET (security_barrier)",
+		"ALTER VIEW v SET SCHEMA s",
+		"ALTER VIEW v ALTER COLUMN a SET DEFAULT 1", "ALTER VIEW v ALTER a DROP DEFAULT",
+		"ALTER VIEW s.v OWNER TO r",
+		} {
+		assertParity(t, q)
+	}
+	// Outside these seven forms legacy falls through to a skip-to-semicolon
+	// no-op, so the rest stays on the legacy path.
+	assertNotRouted(t, "ALTER VIEW v DEPENDS ON EXTENSION e")
+}

@@ -266,7 +266,8 @@ var routedCreatePairs = map[string]map[string]bool{
 		"function": true, "procedure": true, "routine": true, // P5.6
 		"schema": true, // P5.9
 		"sequence": true, "type": true, "domain": true, // P5.10
-		"index": true}, // P5.12
+		"index": true, // P5.12
+		"view": true}, // P5.13
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
 		"type": true, "domain": true, // P5.5
@@ -337,6 +338,9 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 	}
 	if key == "alter" && second == "index" {
 		return alterIndexRouted(frag)
+	}
+	if key == "alter" && second == "view" {
+		return alterViewRouted(frag)
 	}
 	return true
 }
@@ -453,6 +457,36 @@ func alterIndexRouted(frag []parser.Token) bool {
 		seen++
 		if seen == 2 {
 			return alterIndexActions[strings.ToLower(tok.Value)]
+		}
+	}
+	return false
+}
+
+// alterViewActions names the ALTER VIEW actions the grammar covers; legacy
+// falls through to a skip-to-semicolon no-op for the rest. Unlike ALTER INDEX,
+// ALTER VIEW takes IF EXISTS, so the scan skips that pair first.
+var alterViewActions = map[string]bool{
+	"rename": true, "owner": true, "set": true, "reset": true, "alter": true,
+}
+
+func alterViewRouted(frag []parser.Token) bool {
+	// frag is ALTER VIEW [IF EXISTS] <name> <action> ...; the name may be dotted.
+	rest := frag[2:]
+	if len(rest) >= 2 && strings.EqualFold(rest[0].Value, "if") && strings.EqualFold(rest[1].Value, "exists") {
+		rest = rest[2:]
+	}
+	seen := 0
+	for _, tok := range rest {
+		if tok.Kind == parser.TokenSymbol && tok.Value == "." {
+			seen = 0 // a dot means the name continues
+			continue
+		}
+		if tok.Kind != parser.TokenKeyword && tok.Kind != parser.TokenIdent {
+			continue
+		}
+		seen++
+		if seen == 2 {
+			return alterViewActions[strings.ToLower(tok.Value)]
 		}
 	}
 	return false
