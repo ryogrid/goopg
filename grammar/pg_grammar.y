@@ -81,7 +81,7 @@
 %type <onames>	drop_name_list
 %type <node>	group_by_item group_by_list gs_list gs_elem fk_set_act opt_check_option tbl_check_tail
 %type <strs>	opt_fk_set_cols
-%type <b>	opt_fk_match opt_enforced opt_gen_storage
+%type <b>	opt_fk_match opt_enforced opt_gen_storage opt_idx_nnd
 %type <strs>	opt_view_with
 %type <ctt>	ct_tail_list ct_tail_item
 %type <str>	opt_tablespace opt_idx_tablespace check_body opt_ins_alias
@@ -2488,6 +2488,14 @@ c_expr:
 			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "minute", "second", -1) }
 	| INTERVAL SCONST SECOND_P '(' ICONST ')'
 			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "second", "", $5) }
+	/* `<field> TO SECOND(p)` — the range form with a fractional-seconds
+	   precision on its trailing field (interval.sql writes it 11 times). */
+	| INTERVAL SCONST DAY_P TO SECOND_P '(' ICONST ')'
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "day", "second", $7) }
+	| INTERVAL SCONST HOUR_P TO SECOND_P '(' ICONST ')'
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "hour", "second", $7) }
+	| INTERVAL SCONST MINUTE_P TO SECOND_P '(' ICONST ')'
+			{ $$ = buildIntervalQualified(yylex.(*lexerState).lastConsumedPos(), $2, "minute", "second", $7) }
 	| EXTRACT '(' extract_field FROM a_expr ')'
 			{
 				$$ = parser.NewExtractExpr(yylex.(*lexerState).lastConsumedPos(), $3, $5)

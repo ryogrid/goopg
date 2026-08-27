@@ -35,7 +35,16 @@ func TestSplitStatements(t *testing.T) {
 // one unrouted statement must decline the ENTIRE batch (mixed batches stay
 // legacy until per-fragment mixing lands).
 func TestRouteBatchWholeBatchOrLegacy(t *testing.T) {
-	defer delete(routedStmts, "select")
+	// Restore, never delete: SELECT is routed by default now, and deleting
+	// the entry here un-routed it for every test that ran after this one.
+	prev, had := routedStmts["select"]
+	defer func() {
+		if had {
+			routedStmts["select"] = prev
+		} else {
+			delete(routedStmts, "select")
+		}
+	}()
 	routedStmts["select"] = true
 
 	// Both fragments routed → batch routes to the new parser (since P1.1,
@@ -63,7 +72,16 @@ func TestRouteBatchWholeBatchOrLegacy(t *testing.T) {
 // TestQuotedIdentIsNotKeyword pins the ident-routing guard: a QUOTED
 // "select" is an identifier, never the keyword.
 func TestQuotedIdentIsNotKeyword(t *testing.T) {
-	defer delete(routedStmts, "select")
+	// Restore, never delete: SELECT is routed by default now, and deleting
+	// the entry here un-routed it for every test that ran after this one.
+	prev, had := routedStmts["select"]
+	defer func() {
+		if had {
+			routedStmts["select"] = prev
+		} else {
+			delete(routedStmts, "select")
+		}
+	}()
 	routedStmts["select"] = true
 	toks, _ := parser.Lex(`"select" 1`) // nonsense SQL; only routing matters
 	if fragmentRouted(SplitStatements(toks)[0]) {

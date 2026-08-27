@@ -157,8 +157,11 @@ func withFollowerRouted(toks []parser.Token) bool {
 		}
 		kw := strings.ToLower(tok.Value)
 		switch kw {
-		case "as":
-			continue // part of cte definition
+		case "as", "recursive", "materialized", "not":
+			// Words of the WITH clause itself: `WITH RECURSIVE`, `AS [NOT]
+			// MATERIALIZED (`. RECURSIVE used to reach the default arm, so
+			// EVERY recursive CTE — routedStmts["recursive"] — stayed legacy.
+			continue
 		default:
 			return routedStmts[kw]
 		}
@@ -193,7 +196,14 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 		w := strings.ToLower(tok.Value)
 		if !found {
 			if w == "temp" || w == "temporary" || w == "unlogged" {
-				modifierSeen = true // CREATE TEMP <kind>: grammar covers table only
+				// CREATE TEMP|TEMPORARY|UNLOGGED <kind>: the grammar's
+				// opt_create_modifier covers TABLE (every CREATE TABLE
+				// alternative takes it); no other kind takes a modifier yet.
+				modifierSeen = true
+				continue
+			}
+			if w == "unique" && key == "create" {
+				continue // CREATE UNIQUE INDEX: opt_unique on create_index_stmt
 			}
 			if skip[w] {
 				continue
@@ -203,19 +213,11 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 			break
 		}
 	}
-	if modifierSeen {
-		// CREATE TEMP|TEMPORARY|UNLOGGED <kind> stays LEGACY: the shared
-		// modifier prefix creates irreducible S/R conflicts with
-		// create_table_stmt (TODO.md P5 v0). Note the loop above breaks on the
-		// first non-skip word, so `second` is the MODIFIER here, never the
-		// object kind — a wave that wants to route CREATE TEMP TABLE has to
-		// fix the loop as well as this return. (Was written as
-		// `allowed["table"] == true && false || false`, a constant-false
-		// tautology that happened to have the right behaviour.)
-		return false
-	}
 	if !found {
 		return false
+	}
+	if modifierSeen && second != "table" {
+		return false // CREATE TEMP VIEW / SEQUENCE / ...: stays legacy
 	}
 	if !allowed[second] {
 		return false

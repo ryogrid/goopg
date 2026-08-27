@@ -510,6 +510,7 @@ col_type_name:
 		cast_typename                            { $$ = &typeWithArgs{ct: $1, args: $1.args} }
 	| col_type_name '(' ICONST ')'               { $1.(*typeWithArgs).args = []int64{int64($3)}; $$ = $1 }
 	| col_type_name '(' ICONST ',' ICONST ')'    { $1.(*typeWithArgs).args = []int64{int64($3), int64($5)}; $$ = $1 }
+	| col_type_name '(' ICONST ',' ICONST ',' ICONST ')'    { $1.(*typeWithArgs).args = []int64{int64($3), int64($5), int64($7)}; $$ = $1 }
 
 
 /* drop_table_stmt / truncate_stmt — P4.4 (gram.y DropStmt / TruncateStmt
@@ -521,9 +522,9 @@ create_table_stmt_as:
 	   SELECT ...`. These are aliases, not column definitions — they carry no
 	   type — so they land in ColumnAliases, and the parenthesised
 	   opt_table_element_list rule (:19) cannot take them. */
-		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' colid_list ')' opt_table_am opt_ctas_with AS ctas_source opt_ctas_with_data
+		CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name '(' colid_list ')' ct_tail_list AS ctas_source opt_ctas_with_data
 			{
-				src := $12.(*ctasSrc)
+				src := $11.(*ctasSrc)
 				nm := $5.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
 				if len(nm) > 1 {
@@ -537,7 +538,8 @@ create_table_stmt_as:
 				ct.IfNotExists = $4
 				ct.ColumnAliases = $7
 				ct.SelectSource, ct.ExecuteSource = src.sel, src.exec
-				ct.WithNoData = $13
+				ct.WithNoData = $12
+				ct.OnCommit = $9.onCommit
 				$$ = ct
 			}
 
@@ -646,6 +648,12 @@ opt_table_am:
 opt_tablespace:
 		/* empty */         { $$ = "" }
 	| TABLESPACE ColId      { $$ = $2 }
+
+/* NULLS [NOT] DISTINCT on a unique index — gram.y opt_unique_null_treatment. */
+opt_idx_nnd:
+		/* empty */               { $$ = false }
+	| NULLS_P DISTINCT            { $$ = false }
+	| NULLS_P NOT DISTINCT        { $$ = true }
 
 opt_idx_tablespace:
 		/* empty */         { $$ = "" }
@@ -867,7 +875,7 @@ with_value:
    CONCURRENTLY arrive later); ColOrders/ColExprs filled with per-column
    defaults for legacy dump parity. */
 create_index_stmt:
-		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON opt_ONLY_kw qualified_name opt_using_method '(' index_col_list ')' opt_include opt_index_with opt_idx_tablespace opt_index_where
+		CREATE opt_unique INDEX opt_concurrently opt_if_not_exists opt_index_name ON opt_ONLY_kw qualified_name opt_using_method '(' index_col_list ')' opt_include opt_idx_nnd opt_index_with opt_idx_tablespace opt_index_where
 			{
 				nm := $9.parts
 				tbl := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -892,9 +900,10 @@ create_index_stmt:
 				ix.Concurrently = $4
 				ix.OnOnly = $8
 				ix.IncludeColumns = $14
-				ix.Fillfactor = $15
-				ix.Tablespace = $16
-				if p, _ := $17.(parser.Expr); p != nil {
+				ix.NullsNotDistinct = $15
+				ix.Fillfactor = $16
+				ix.Tablespace = $17
+				if p, _ := $18.(parser.Expr); p != nil {
 					ix.HasPredicate = true
 					ix.Predicate = p
 				}
