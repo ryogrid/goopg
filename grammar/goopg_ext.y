@@ -53,7 +53,7 @@ create_table_stmt:
 						cd.IdentityColumn = c.identity
 						cd.IdentityAlways = c.identityAlways
 						applyIdentityOpts(cd, c.identitySeq)
-						copyColConstraints(cd, c.collation, c.compression, c.nnName, c.uqName, c.checkName, c.nnNoInherit, c.checkNoInherit)
+						copyColConstraints(cd, c.collation, c.compression, c.nnName, c.uqName, c.checkName, c.nnNoInherit, c.checkNoInherit, c.checkNotEnforced, c.storage)
 						// The attrs attach to whichever constraint the column
 						// actually declared (legacy threads pointers to the
 						// specific flag pair).
@@ -78,6 +78,8 @@ create_table_stmt:
 							cd.RefColumns = c.fkInfo.refCols
 							cd.OnDelete = c.fkInfo.onDel
 							cd.OnUpdate = c.fkInfo.onUp
+							cd.OnDeleteSetCols = c.fkInfo.delSetCols
+							cd.FKMatchFull = c.fkInfo.matchFull
 						}
 						cols = append(cols, *cd)
 						bodyOrder = append(bodyOrder, c.name)
@@ -148,7 +150,7 @@ create_table_stmt:
 							} else {
 								checks = append(checks, e.check)
 								checkNoInherit = append(checkNoInherit, e.checkNoInh)
-								checkNotEnforced = append(checkNotEnforced, false)
+								checkNotEnforced = append(checkNotEnforced, e.checkNotEnf)
 							}
 							if e.checkNoInh {
 								hasNoInheritCheck = true
@@ -190,6 +192,7 @@ create_table_stmt:
 				ct.TableCheckNotEnforced = checkNotEnforced
 				tail := $9
 				ct.Tablespace = $10
+				ct.OnCommit = tail.onCommit
 				_ = tail
 				for _, kv := range tail.withKv {
 					if ct.With == nil {
@@ -225,6 +228,7 @@ create_table_stmt:
 				}
 				tail := $6
 				ct.Tablespace = $7
+				ct.OnCommit = tail.onCommit
 				for _, kv := range tail.withKv {
 					if ct.With == nil {
 						ct.With = map[string]string{}
@@ -352,6 +356,7 @@ table_element:
 				cs.checkName, cs.nnName, cs.uqName = cc.checkName, cc.nnName, cc.uqName
 				cs.collation, cs.compression = cc.collation, cc.compression
 				cs.nnNoInherit, cs.checkNoInherit = cc.nnNoInherit, cc.checkNoInherit
+				cs.checkNotEnforced, cs.storage = cc.checkNotEnforced, cc.storage
 				$$ = &tableElem{col: cs}
 			}
 	| PRIMARY KEY pk_cols opt_include opt_constr_attrs
@@ -404,45 +409,47 @@ table_element:
 			{ $$ = &tableElem{notNull: &tableNotNull{col: $3, noInherit: $4}} }
 	| CONSTRAINT ColId NOT NULL_P ColId opt_no_inherit
 			{ $$ = &tableElem{notNull: &tableNotNull{name: $2, col: $5, noInherit: $6}} }
-	| CONSTRAINT ColId check_body opt_no_inherit
-			{ $$ = &tableElem{check: $3, checkName: $2, checkNoInh: $4} }
+	| CONSTRAINT ColId check_body tbl_check_tail
+			{ t := $4.(*tblCheckTail); $$ = &tableElem{check: $3, checkName: $2, checkNoInh: t.noInherit, checkNotEnf: t.notEnforced} }
 	/* Anonymous table-level CHECK and FOREIGN KEY (gram.y TableConstraint).
 	   CHECK and FOREIGN are reserved keywords, so they cannot start the
 	   `ColId col_type_name …` column alternative and the element-start decision
 	   stays on distinct terminals. Only the plain forms are ported: MATCH FULL,
 	   [NOT] DEFERRABLE [INITIALLY …], NOT VALID, [NOT] ENFORCED, ON DELETE SET
 	   (cols) and NO INHERIT still fall to legacy — see TODO.md P4.1. */
-	| check_body opt_no_inherit
-			{ $$ = &tableElem{check: $1, checkNoInh: $2} }
+	| check_body tbl_check_tail
+			{ t := $2.(*tblCheckTail); $$ = &tableElem{check: $1, checkNoInh: t.noInherit, checkNotEnf: t.notEnforced} }
 	/* Legacy accepts NOT VALID only BEHIND NO INHERIT on a CREATE TABLE check
 	   (and drops it); a bare `CHECK (...) NOT VALID` is a syntax error there. */
-	| check_body NO INHERIT NOT VALID
-			{ $$ = &tableElem{check: $1, checkNoInh: true} }
-	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions opt_constr_attrs
+	| FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_match opt_fk_actions opt_constr_attrs
 			{
 				fk := &parser.TableForeignKeyDef{
-					Columns:    $4,
-					RefTable:   objectNameFromQn($7),
-					RefColumns: $8,
-					OnDelete:   $9.(*fkActs).del,
-					OnUpdate:   $9.(*fkActs).up,
+					Columns:         $4,
+					RefTable:        objectNameFromQn($7),
+					RefColumns:      $8,
+					MatchFull:       $9,
+					OnDelete:        $10.(*fkActs).del,
+					OnUpdate:        $10.(*fkActs).up,
+					OnDeleteSetCols: $10.(*fkActs).delSetCols,
 				}
-				if a, _ := $10.(*constrAttrs); a != nil {
+				if a, _ := $11.(*constrAttrs); a != nil {
 					fk.Deferrable, fk.InitiallyDeferred = a.deferrable, a.initiallyDeferred
 				}
 				$$ = &tableElem{fkDef: fk}
 			}
-	| CONSTRAINT ColId FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_actions opt_constr_attrs
+	| CONSTRAINT ColId FOREIGN KEY '(' colid_list ')' REFERENCES qualified_name opt_ref_cols opt_fk_match opt_fk_actions opt_constr_attrs
 			{
 				fk := &parser.TableForeignKeyDef{
-					Name:       $2,
-					Columns:    $6,
-					RefTable:   objectNameFromQn($9),
-					RefColumns: $10,
-					OnDelete:   $11.(*fkActs).del,
-					OnUpdate:   $11.(*fkActs).up,
+					Name:            $2,
+					Columns:         $6,
+					RefTable:        objectNameFromQn($9),
+					RefColumns:      $10,
+					MatchFull:       $11,
+					OnDelete:        $12.(*fkActs).del,
+					OnUpdate:        $12.(*fkActs).up,
+					OnDeleteSetCols: $12.(*fkActs).delSetCols,
 				}
-				if a, _ := $12.(*constrAttrs); a != nil {
+				if a, _ := $13.(*constrAttrs); a != nil {
 					fk.Deferrable, fk.InitiallyDeferred = a.deferrable, a.initiallyDeferred
 				}
 				$$ = &tableElem{fkDef: fk}
@@ -573,12 +580,13 @@ partof_elem_list:
 	| partof_elem_list ',' partof_elem     { $$ = append($1.([]*partOfElem), $3.(*partOfElem)) }
 
 partof_elem:
-		CONSTRAINT ColId CHECK '(' a_expr ')'
+		CONSTRAINT ColId CHECKBODY
 			{
-				// Legacy stores the check as a TOKEN JOIN, not a source span.
-				$$ = &partOfElem{hasCheck: true, checkName: $2, checkExpr: tokenJoinLower(yylex, $<p>5, $<p>6)}
+				// Legacy stores the check as a LOWER-CASED token join here (unlike
+				// a column check's join, which keeps string quotes).
+				$$ = &partOfElem{hasCheck: true, checkName: $2, checkExpr: tokenJoinLower(yylex, $<p>3+1, $3)}
 			}
-	| CHECK '(' a_expr ')'
+	| CHECKBODY
 			{ $$ = &partOfElem{hasCheck: true} } /* anonymous: accepted and dropped, as legacy does */
 	| ColId opt_with_options partof_col_opts
 			{
@@ -595,13 +603,20 @@ partof_col_opts:
 		/* empty */                                  { $$ = &partOfElem{} }
 	| partof_col_opts NOT NULL_P                     { el := $1.(*partOfElem); el.notNull = true; $$ = el }
 	| partof_col_opts UNIQUE                         { el := $1.(*partOfElem); el.unique = true; $$ = el }
-	| partof_col_opts DEFAULT a_expr                 { el := $1.(*partOfElem); el.def, el.hasDef = $3, true; $$ = el }
+	| partof_col_opts DEFAULT a_expr %prec Op        { el := $1.(*partOfElem); el.def, el.hasDef = $3, true; $$ = el }
 	| partof_col_opts GENERATED ALWAYS AS '(' a_expr ')' STORED
 			{
 				el := $1.(*partOfElem)
 				el.genExpr, el.hasGen = tokenJoinLower(yylex, $<p>6, $<p>7), true
 				$$ = el
 			}
+	/* Accepted and DROPPED by legacy on a partition's element list. */
+	| partof_col_opts GENERATED ALWAYS AS '(' a_expr ')' VIRTUAL          { $$ = $1 }
+	| partof_col_opts GENERATED ALWAYS AS '(' a_expr ')'                  { $$ = $1 }
+	| partof_col_opts GENERATED ALWAYS AS IDENTITY_P opt_identity_seq_opts { $$ = $1 }
+	| partof_col_opts COLLATE ColId                                       { $$ = $1 }
+	| partof_col_opts PRIMARY KEY                                         { $$ = $1 }
+	| partof_col_opts CHECKBODY                                           { $$ = $1 }
 
 opt_of_col_opts:
 		/* empty */                    { $$ = []parser.ColumnDef(nil) }
@@ -743,6 +758,19 @@ constr_name:
 		ColId              { $$ = $1 }
 	| ColId '.' ColId      { $$ = $3 }
 
+/* A table-level CHECK's trailer, FLAT: every spelling in one nonterminal so
+   `NO INHERIT . NOT` shifts once for both NOT VALID and NOT ENFORCED instead
+   of reducing an optional NO INHERIT first. Legacy accepts NOT VALID only
+   behind NO INHERIT on CREATE TABLE, and drops it. */
+tbl_check_tail:
+		/* empty */                       { $$ = &tblCheckTail{} }
+	| NO INHERIT                          { $$ = &tblCheckTail{noInherit: true} }
+	| NO INHERIT NOT VALID                { $$ = &tblCheckTail{noInherit: true} }
+	| NO INHERIT NOT ENFORCED             { $$ = &tblCheckTail{noInherit: true, notEnforced: true} }
+	| NO INHERIT ENFORCED                 { $$ = &tblCheckTail{noInherit: true} }
+	| NOT ENFORCED                        { $$ = &tblCheckTail{notEnforced: true} }
+	| ENFORCED                            { $$ = &tblCheckTail{} }
+
 opt_TRUNCATE_kw:
 		/* empty */  { _ = 0 }
 	| TABLE          { _ = 0 }
@@ -773,6 +801,12 @@ ct_tail_item:
 			{ $$ = &ctTail{} }
 	| USING ColId
 			{ $$ = &ctTail{} } /* access method: parsed and dropped, as legacy */
+	| ON COMMIT DELETE_P ROWS
+			{ i := &ctTail{}; i.onCommit = "delete rows"; $$ = i }
+	| ON COMMIT DROP
+			{ i := &ctTail{}; i.onCommit = "drop"; $$ = i }
+	| ON COMMIT PRESERVE ROWS
+			{ i := &ctTail{}; i.onCommit = "preserve rows"; $$ = i }
 	| PARTITION BY ColId '(' part_elem_list ')'
 			{
 				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
@@ -916,10 +950,6 @@ index_col:
 /* gen_storage — STORED | VIRTUAL. Also pins the generated expression's span
    end, because by the time the outer action runs the ')' is no longer the last
    consumed token. */
-gen_storage:
-		STORED    { yylex.(*lexerState).genSpanEnd = yylex.(*lexerState).prevPos; $$ = false }
-	| VIRTUAL     { yylex.(*lexerState).genSpanEnd = yylex.(*lexerState).prevPos; $$ = true }
-
 opt_index_collate:
 		/* empty */   { $$ = "" }
 	| COLLATE ColId   { $$ = $2 }
@@ -1226,12 +1256,23 @@ alter_table_action:
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
+				// CHECK and REFERENCES were dropped here as well — the same
+				// sibling-path divergence as identity below.
+				cd.CheckExpr = cc.checkText
+				if cc.fk != nil {
+					cd.RefTable = cc.fk.refTable
+					cd.RefColumns = cc.fk.refCols
+					cd.OnDelete = cc.fk.onDel
+					cd.OnUpdate = cc.fk.onUp
+					cd.OnDeleteSetCols = cc.fk.delSetCols
+					cd.FKMatchFull = cc.fk.matchFull
+				}
 				// Identity was silently DROPPED here while CREATE TABLE kept
 				// it — the classic sibling-path divergence, and `add column`
 				// is routed.
 				cd.IdentityColumn, cd.IdentityAlways = cc.identity, cc.identityAlways
 				applyIdentityOpts(cd, cc.identitySeq)
-				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit)
+				copyColConstraints(cd, cc.collation, cc.compression, cc.nnName, cc.uqName, cc.checkName, cc.nnNoInherit, cc.checkNoInherit, cc.checkNotEnforced, cc.storage)
 				a := parser.NewATAction(parser.AlterTableAddColumn)
 				a.Column = *cd
 				$$ = a
@@ -1250,10 +1291,10 @@ alter_table_action:
 				a.IncludeColumns = $5
 				$$ = a
 			}
-	| DROP COLUMN ColId
+	| DROP COLUMN ColId opt_drop_behavior
 			{
 				a := parser.NewATAction(parser.AlterTableDropColumn)
-				a.ColumnName = $3
+				a.ColumnName = $3 // CASCADE / RESTRICT: parsed and dropped, as legacy
 				$$ = a
 			}
 	| ALTER opt_COLUMN ColId TYPE_P col_type_name
@@ -1368,7 +1409,7 @@ opt_COLUMN:
 
 /* create_view_stmt — P5 v0: CREATE [OR REPLACE] [TEMP] VIEW name [(cols)] AS select */
 create_view_stmt:
-		CREATE opt_or_replace VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } select_bare
+		CREATE opt_or_replace VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } select_bare opt_check_option
 			{
 				nm := $4.parts
 				v := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -1379,9 +1420,24 @@ create_view_stmt:
 				cv := parser.NewCreateViewStmt(v, $5, sel)
 				cv.OrReplace = $2
 				viewReloptions(cv, $6)
-				cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).fragEnd)
+				co := $10.(*checkOpt)
+				cv.CheckOption = co.opt
+				if co.pos >= 0 {
+					// RawDef stops at WITH: legacy's span excludes the option.
+					cv.RawDef = yylex.(*lexerState).spanTextUpTo(co.pos)
+				} else {
+					cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).fragEnd)
+				}
 				$$ = cv
 			}
+
+/* WITH [CASCADED|LOCAL] CHECK OPTION — legacy records "cascaded" for the
+   bare form. */
+opt_check_option:
+		/* empty */                       { $$ = &checkOpt{pos: -1} }
+	| WITH CHECK OPTION                   { $$ = &checkOpt{opt: "cascaded", pos: $<p>1} }
+	| WITH CASCADED CHECK OPTION          { $$ = &checkOpt{opt: "cascaded", pos: $<p>1} }
+	| WITH LOCAL CHECK OPTION             { $$ = &checkOpt{opt: "local", pos: $<p>1} }
 
 opt_view_with:
 		/* empty */                    { $$ = []string(nil) }

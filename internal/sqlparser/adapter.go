@@ -355,6 +355,8 @@ var knownTypeNames = map[string]string{
 	// national character, which therefore stay out.
 	"char": "char", "decimal": "decimal", "integer": "integer",
 	"smallint": "smallint", "bigint": "bigint", "real": "real",
+	// Snapshot types (txid.sql / xid.sql); legacy accepts both as prefixes.
+	"txid_snapshot": "txid_snapshot", "pg_snapshot": "pg_snapshot",
 }
 
 // scanSelfChars is scan.l's {self} set verbatim
@@ -390,6 +392,33 @@ func (l *lexerState) next() lexResult {
 				// TypedStringLit (legacy parity) instead of a bare string —
 				// `date 'X' + interval 'Y'` needs the type for + resolution.
 				return lexResult{term: resolve("TYPEDLIT"), str: knownTypeNames[lower] + "\x1f" + nxt.str, pos: cur.pos, text: cur.text + " " + nxt.text}
+			}
+		}
+	}
+
+	// CHECK ( ... ) -> CHECKBODY. Legacy's parseCheckExpr never parses the
+	// body — it collects the tokens up to the matching ')' and stores their
+	// join — so `CHECK ((y).a > 0)` is legal there while a_expr would reject
+	// it. The fold makes the grammar do the same: the body is opaque, the
+	// terminal carries both paren positions, and the rule joins the tokens
+	// between them. `WITH CHECK OPTION` is untouched (no '(' follows).
+	if cur.term == resolve("CHECK") && cur.term > 0 {
+		if nxt := l.peek(); nxt.term == int('(') {
+			depth := 0
+			for j := l.i; j < len(l.toks); j++ {
+				tk := l.toks[j]
+				if tk.Kind != parser.TokenSymbol {
+					continue
+				}
+				if tk.Value == "(" {
+					depth++
+				} else if tk.Value == ")" {
+					depth--
+					if depth == 0 {
+						l.i = j + 1
+						return lexResult{term: resolve("CHECKBODY"), pos: nxt.pos, ival: tk.Pos, text: "check"}
+					}
+				}
 			}
 		}
 	}

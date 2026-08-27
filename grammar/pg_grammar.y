@@ -79,6 +79,9 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
+%type <node>	group_by_item group_by_list gs_list gs_elem fk_set_act opt_check_option tbl_check_tail
+%type <strs>	opt_fk_set_cols
+%type <b>	opt_fk_match opt_enforced opt_gen_storage
 %type <strs>	opt_view_with
 %type <ctt>	ct_tail_list ct_tail_item
 %type <str>	opt_tablespace opt_idx_tablespace check_body opt_ins_alias
@@ -114,7 +117,7 @@
 %type <str>	opt_index_collate
 %type <node>	opt_index_opclass
 %type <ival>	opclass_opt_list opclass_opt
-%type <b>	opt_index_dir gen_storage
+%type <b>	opt_index_dir
 %type <ival>	opt_index_with
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
@@ -163,8 +166,8 @@
 %type <node>	insert_rest
 %type <ct>	cast_target cast_typename
 %type <ival>	opt_array_tail
-%type <exprs>	expr_list group_by_list
-%type <expr>	group_by_item
+%type <exprs>	expr_list
+%type <expr>
 %type <node>	opt_select_limit select_limit limit_clause offset_clause
 %type <sortbys>	opt_sort_clause sort_by_list sort_clause
 %type <sortby>	SortBy
@@ -649,6 +652,7 @@ simple_select:
 				s.Where = $7
 				if gc, ok := $8.(*groupClause); ok && gc != nil {
 					s.GroupBy = gc.list
+					s.GroupingSets = gc.sets
 				}
 				s.Having = $9
 				if len($10) > 0 {
@@ -804,8 +808,8 @@ signed_iconst:
 /* check_body — `CHECK ( a_expr )` with its raw source span captured at the
    reduce, before any trailer (NO INHERIT) is consumed. */
 check_body:
-		CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
-			{ $$ = yylex.(*lexerState).spanTextCloseParen() }
+		CHECKBODY
+			{ $$ = joinCheckTokens(yylex, $<p>1, $1) }
 
 array_expr:
 		'[' expr_list ']'          { $$ = $2 }
@@ -1168,6 +1172,11 @@ join_outer:
 				$$ = newJoinSpec(true, "inner")
 				$$.pos = yylex.(*lexerState).lastConsumedPos()
 			}
+	| NATURAL INNER_P JOIN
+			{
+				$$ = newJoinSpec(true, "inner")
+				$$.pos = yylex.(*lexerState).lastConsumedPos()
+			}
 	| LEFT OUTER_P JOIN
 			{
 				$$ = newJoinSpec(false, "left")
@@ -1470,6 +1479,7 @@ func_arg_expr:
 		a_expr                          { $$ = $1 }
 	| a_expr EQUALS_GREATER a_expr      { $$ = $3 }
 	| a_expr COLON_EQUALS a_expr        { $$ = $3 }
+	| VARIADIC a_expr                   { $$ = $2 } /* legacy keeps the array unflagged on a table function */
 
 func_arg_list:
 		func_arg_expr
@@ -1532,24 +1542,77 @@ group_clause:
 			}
 	| GROUP_P BY group_by_list
 			{
-				$$ = &groupClause{list: $3}
+				$$ = buildGroupClause($<p>3, $3.([]*groupItem))
 			}
 
 group_by_list:
 		group_by_item
 			{
-				$$ = []parser.Expr{$1}
+				$$ = []*groupItem{$1.(*groupItem)}
 			}
 	| group_by_list ',' group_by_item
 			{
-				$$ = append($1, $3)
+				$$ = append($1.([]*groupItem), $3.(*groupItem))
 			}
 
+/* group_by_item — gram.y group_by_item: plain expression, ROLLUP / CUBE
+   / GROUPING SETS constructs, and the empty grouping set. Legacy expands the
+   constructs at PARSE time (parseGroupByElems): the flat GroupBy list keeps
+   every expression in order, duplicates included, and GroupingSets holds the
+   cartesian product of each element's alternatives. A parenthesised operand
+   `(a, b)` arrives from the expression grammar as a RowExpr and is one unit,
+   which is what legacy's own operand loop produces. */
 group_by_item:
 		a_expr
 			{
-				$$ = $1
+				$$ = plainGroupItem($1)
 			}
+	| '(' ')'
+			{
+				$$ = &groupItem{alts: [][]parser.Expr{{}}, construct: true}
+			}
+	| ROLLUP '(' expr_list ')'
+			{
+				u := groupingUnits($3)
+				$$ = &groupItem{flat: flattenUnits(u), alts: rollupAlternatives(u), construct: true}
+			}
+	| ROLLUP '(' ')'
+			{
+				$$ = &groupItem{alts: rollupAlternatives(nil), construct: true}
+			}
+	| CUBE '(' expr_list ')'
+			{
+				u := groupingUnits($3)
+				$$ = &groupItem{flat: flattenUnits(u), alts: cubeAlternatives(u), construct: true}
+			}
+	| CUBE '(' ')'
+			{
+				$$ = &groupItem{alts: cubeAlternatives(nil), construct: true}
+			}
+	| GROUPING SETS '(' gs_list ')'
+			{
+				alts := $4.([][]parser.Expr)
+				$$ = &groupItem{flat: flattenUnits(alts), alts: alts, construct: true}
+			}
+
+/* One GROUPING SETS operand contributes one or more sets: nested ROLLUP /
+   CUBE expand in place, `()` is the empty set, `(a, b)` is a RowExpr. */
+gs_list:
+		gs_elem                  { $$ = $1 }
+	| gs_list ',' gs_elem        { $$ = append($1.([][]parser.Expr), $3.([][]parser.Expr)...) }
+
+gs_elem:
+		a_expr
+			{
+				if r, ok := $1.(*parser.RowExpr); ok {
+					$$ = [][]parser.Expr{r.Elems}
+				} else {
+					$$ = [][]parser.Expr{{$1}}
+				}
+			}
+	| '(' ')'                          { $$ = [][]parser.Expr{{}} }
+	| ROLLUP '(' expr_list ')'         { $$ = rollupAlternatives(groupingUnits($3)) }
+	| CUBE '(' expr_list ')'           { $$ = cubeAlternatives(groupingUnits($3)) }
 
 /* sort_clause — gram.y :13196 (mandatory ORDER BY variant). */
 sort_clause:
@@ -2069,6 +2132,10 @@ a_expr:
 			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpILike, nil, $5, $<p>5) }
 	| a_expr LIKE ALL '(' expr_list ')'
 			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpLike, true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
+	| a_expr NOT_LA LIKE ALL '(' expr_list ')'
+			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpNotLike, true, nil, unwrapAnyArray(yylex, $6, $<p>6)) }
+	| a_expr ILIKE ALL '(' expr_list ')'
+			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpILike, true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
 	| a_expr subq_op ANY '(' expr_list ')'
 			{
 				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), nil, $5, $<p>5)
@@ -2343,6 +2410,12 @@ c_expr:
 			{
 				$$ = parser.NewParamRef(yylex.(*lexerState).lastConsumedPos(), $1)
 			}
+	/* interval(p) 'body' — a precision typmod BEFORE the literal. Legacy
+	   records it as the Qualified form with unit "second" and the precision. */
+	| INTERVAL '(' ICONST ')' SCONST
+			{
+				$$ = parser.NewIntervalLitQualified($<p>1, $5, "second", true, $3)
+			}
 	| INTERVAL SCONST
 			{
 				l := yylex.(*lexerState)
@@ -2495,6 +2568,8 @@ c_expr:
 func_expr_common_subexpr:
 		SUBSTRING '(' substr_list ')'
 			{ $$ = specialFormCall($<p>1, "substring", $3) }
+	| SUBSTRING '(' a_expr SIMILAR a_expr ESCAPE a_expr ')'
+			{ $$ = substringSimilar(yylex, $<p>1, $3, $5, $7) }
 	| OVERLAY '(' overlay_list ')'
 			{ $$ = specialFormCall($<p>1, "overlay", $3) }
 	| POSITION '(' position_list ')'
@@ -2621,6 +2696,20 @@ b_expr:
 	| '+' b_expr %prec UMINUS
 			{
 				$$ = parser.NewUnaryOp(yylex.(*lexerState).lastConsumedPos(), parser.OpUnaryPos, $2)
+			}
+	/* gram.y b_expr also has TYPECAST; POSITION's operands are b_expr, and
+	   strings.sql writes POSITION('x'::bytea IN ''::bytea). */
+	| b_expr TYPECAST cast_typename
+			{
+				nm := $3.name
+				if nm == "float" {
+					nm = "float8"
+				}
+				$$ = parser.NewCastExpr($1.Pos(), $1, parser.ObjectName{Schema: $3.schema, Name: nm}, typmodsFor(nm, $3.args, len($3.args)))
+			}
+	| b_expr '^' b_expr
+			{
+				$$ = parser.NewBinaryOp($1.Pos(), parser.OpPow, $1, $3)
 			}
 	| b_expr Op b_expr
 			{
@@ -2751,6 +2840,14 @@ name_or_call:
 				fc.Distinct = true
 				$$ = fc
 			}
+	| qualified_name '(' DISTINCT expr_list ')' filter_clause
+			{
+				ft := splitFuncName($1)
+				fc := parser.NewFuncCall($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				fc.Filter, _ = $6.(parser.Expr)
+				$$ = fc
+			}
 	| qualified_name '(' DISTINCT expr_list ')' OVER ColId
 			{
 				ft := splitFuncName($1)
@@ -2862,6 +2959,24 @@ name_or_call:
 				_ = ft
 				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				fc.Filter = $5.(parser.Expr)
+				$$ = fc
+			}
+	| qualified_name '(' opt_call_args ')' filter_clause OVER ColId
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.Filter = $5.(parser.Expr)
+				fc.Over = parser.NewBareWindowRef(0, $7)
+				$$ = fc
+			}
+	| qualified_name '(' opt_call_args ')' filter_clause OVER '(' opt_window_spec ')'
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				fc := callFuncExpr($1.pos, parser.ObjectName{Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.Filter = $5.(parser.Expr)
+				fc.Over = $8
 				$$ = fc
 			}
 	| qualified_name '(' opt_call_args ')' within_group_clause
@@ -3059,6 +3174,7 @@ cast_ident:
 	| DECIMAL_P     { $$ = "decimal" }
 	| BOOLEAN_P     { $$ = "boolean" }
 	| INTERVAL      { $$ = "interval" }
+	| UNKNOWN       { $$ = "unknown" }
 	/* Keyword-tokenised type names. Measured against legacy, json / xml / path
 	   are the ONLY three names it accepts in cast position that do not already
 	   arrive as IDENT — every other candidate (jsonb, bytea, uuid, inet,
@@ -3398,6 +3514,14 @@ col_constraints:
 					cc.checkText, cc.checkName = k.text, k.name
 				case "check_noinh":
 					cc.checkText, cc.checkName, cc.checkNoInherit = k.text, k.name, true
+				case "attr_not_enforced":
+					cc.checkNotEnforced = true
+				case "attr_enforced":
+					cc.checkNotEnforced = false
+				case "null":
+					// nothing to record
+				case "storage":
+					cc.storage = k.text
 				case "collate":
 					cc.collation = k.text
 				case "compression":
@@ -3465,20 +3589,26 @@ col_constraint:
 	   expression is a RAW SOURCE SPAN in legacy (like CHECK), so it uses the
 	   same markSpanStart / spanTextCloseParen pair. IDENTITY option lists
 	   (START WITH / INCREMENT BY / ...) are not ported yet; see TODO.md. */
-	| GENERATED ALWAYS AS '(' { yylex.(*lexerState).markSpanStart() } a_expr ')' gen_storage
+	/* The expression text is legacy's TOKEN JOIN (joinGeneratedExprTokens),
+	   not a source span, and the storage word is optional — PG 18 defaults a
+	   generated column to VIRTUAL, and so does legacy. No mid-rule action any
+	   more: the join takes the two paren positions. */
+	| GENERATED ALWAYS AS '(' a_expr ')' opt_gen_storage
 			{
-				// ONE alternative with ONE mid-rule action. Writing STORED and
-				// VIRTUAL as two alternatives that each carry their own
-				// `{ markSpanStart() }` gives goyacc two DISTINCT empty
-				// nonterminals reducible at the same point — 420 reduce/reduce.
-				// The span must also be captured BEFORE gen_storage shifts, so
-				// spanTextCloseParen is called here, after ')' but with the
-				// storage keyword already read as lookahead.
+				k := "gen"
+				if $7 {
+					k = "gen_virtual"
+				}
+				$$ = &colConstraint{kind: k, text: joinLegacyTokens(yylex, $<p>4, $<p>6)}
+			}
+	/* GENERATED BY DEFAULT AS (expr): legacy records it exactly like ALWAYS. */
+	| GENERATED BY DEFAULT AS '(' a_expr ')' opt_gen_storage
+			{
 				k := "gen"
 				if $8 {
 					k = "gen_virtual"
 				}
-				$$ = &colConstraint{kind: k, text: yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).genSpanEnd)}
+				$$ = &colConstraint{kind: k, text: joinLegacyTokens(yylex, $<p>5, $<p>7)}
 			}
 	| GENERATED ALWAYS AS IDENTITY_P opt_identity_seq_opts
 			{ $$ = &colConstraint{kind: "identity_always", seq: $5.(*identityOpts)} }
@@ -3504,10 +3634,19 @@ col_constraint:
 				}
 				$$ = &colConstraint{kind: k, text: $1}
 			}
-	| REFERENCES qualified_name opt_ref_cols opt_fk_actions
+	/* [NOT] ENFORCED is its OWN list item, as gram.y's ConstraintAttributeSpec
+	   is: written as a trailer on the CHECK rule, `CHECK (...) . NOT` cannot
+	   tell NOT ENFORCED from a following NOT NULL constraint with one token
+	   of lookahead, and the shift that wins breaks `CHECK (x > 0) NOT NULL`. */
+	| NOT ENFORCED        { $$ = &colConstraint{kind: "attr_not_enforced"} }
+	| ENFORCED            { $$ = &colConstraint{kind: "attr_enforced"} }
+	| NULL_P              { $$ = &colConstraint{kind: "null"} }   /* explicit nullability: a no-op, as legacy */
+	| STORAGE ColId       { $$ = &colConstraint{kind: "storage", text: $2} }
+	| REFERENCES qualified_name opt_ref_cols opt_fk_match opt_fk_actions
 			{
 				i := &colConstraint{kind: "fk"}
-				i.fk = &fkInfo{refTable: objectNameFromQn($2), refCols: $3, onDel: $4.(*fkActs).del, onUp: $4.(*fkActs).up}
+				acts := $5.(*fkActs)
+				i.fk = &fkInfo{refTable: objectNameFromQn($2), refCols: $3, onDel: acts.del, onUp: acts.up, delSetCols: acts.delSetCols, matchFull: $4}
 				$$ = i
 			}
 
@@ -3525,12 +3664,49 @@ fk_actions:
 
 fk_action:
 		ON DELETE_P fk_kw    { $$ = &namedFkAct{del: true, act: $3.(parser.FKAction)} }
+	| ON DELETE_P fk_set_act
+			{
+				sa := $3.(*namedFkAct)
+				sa.del = true
+				$$ = sa
+			}
 	| ON UPDATE SET fk_kw    { $$ = &namedFkAct{up: true, act: $4.(parser.FKAction)} }
 	| ON UPDATE fk_kw        { $$ = &namedFkAct{up: true, act: $3.(parser.FKAction)} }
+	| ON UPDATE fk_set_act
+			{
+				sa := $3.(*namedFkAct)
+				sa.up = true
+				$$ = sa
+			}
+
+/* SET NULL / SET DEFAULT live outside fk_kw so their optional column list
+   (`ON DELETE SET NULL (cols)`, PG 15) does not shift/reduce against the
+   keyword-only reduce. Legacy keeps the list for ON DELETE only. */
+fk_set_act:
+		SET NULL_P opt_fk_set_cols       { $$ = &namedFkAct{act: parser.FKActionSetNull, setCols: $3} }
+	| SET DEFAULT opt_fk_set_cols        { $$ = &namedFkAct{act: parser.FKActionSetDefault, setCols: $3} }
+
+opt_fk_set_cols:
+		/* empty */         { $$ = nil }
+	| '(' colid_list ')'    { $$ = $2 }
+
+opt_fk_match:
+		/* empty */      { $$ = false }
+	| MATCH FULL         { $$ = true }
+	| MATCH SIMPLE       { $$ = false }
+	| MATCH PARTIAL      { $$ = false }
+
+opt_enforced:
+		/* empty */      { $$ = false }
+	| ENFORCED           { $$ = false }
+	| NOT ENFORCED       { $$ = true }
+
+opt_gen_storage:
+		/* empty */   { $$ = true }
+	| STORED          { $$ = false }
+	| VIRTUAL         { $$ = true }
 
 fk_kw:
 		CASCADE              { $$ = parser.FKActionCascade }
 	| RESTRICT               { $$ = parser.FKActionRestrict }
 	| NO ACTION              { $$ = parser.FKActionNoAction }
-	| SET NULL_P             { $$ = parser.FKActionSetNull }
-	| SET DEFAULT            { $$ = parser.FKActionSetDefault }

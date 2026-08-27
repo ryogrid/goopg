@@ -257,3 +257,26 @@ func TestKnownDiffSelectAll(t *testing.T) {
 		t.Fatal("legacy unexpectedly accepts SELECT ALL; update the known-diffs table")
 	}
 }
+
+// TestKnownDiffCheckThenNotNull pins the CHECK-then-NOT-NULL row: legacy's
+// column-constraint loop LOSES a NOT NULL written after a CHECK
+// (`x int CHECK (x > 0) NOT NULL` -> NotNull=false), a defect with semantic
+// consequences that the yacc parser deliberately does not reproduce.
+func TestKnownDiffCheckThenNotNull(t *testing.T) {
+	const q = "CREATE TABLE t (x int CHECK (x > 0) NOT NULL)"
+	lstmts, err := parser.Parse(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lstmts[0].(*parser.CreateTableStmt).Columns[0].NotNull {
+		t.Fatal("legacy now keeps NOT NULL after CHECK; retire this known-diff row")
+	}
+	toks, _ := parser.Lex(q)
+	nstmts, err := ParseOneSrc(q, toks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nstmts[0].(*parser.CreateTableStmt).Columns[0].NotNull {
+		t.Fatal("yacc parser dropped NOT NULL after CHECK")
+	}
+}

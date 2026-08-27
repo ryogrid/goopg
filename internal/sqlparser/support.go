@@ -277,7 +277,206 @@ func splitFuncName(q qname) *funcTable {
 // groupClause carries the GROUP BY result into simple_select's action.
 type groupClause struct {
 	list []parser.Expr
+	sets *parser.GroupingSetsSpec
 }
+
+// groupItem is one comma-separated GROUP BY element after legacy's
+// parseGroupByElems: its contribution to the FLAT GroupBy list, and its
+// grouping-set alternatives (one entry for a plain expression).
+type groupItem struct {
+	flat      []parser.Expr
+	alts      [][]parser.Expr
+	construct bool
+}
+
+func plainGroupItem(e parser.Expr) *groupItem {
+	return &groupItem{flat: []parser.Expr{e}, alts: [][]parser.Expr{{e}}}
+}
+
+// groupingUnits reads a ROLLUP / CUBE / GROUPING SETS operand list the way
+// parseGroupingUnitList does: a parenthesised group `(a, b)` — which the
+// expression grammar hands back as a RowExpr — is ONE unit, everything else
+// is a unit of one.
+func groupingUnits(exprs []parser.Expr) [][]parser.Expr {
+	var units [][]parser.Expr
+	for _, e := range exprs {
+		if r, ok := e.(*parser.RowExpr); ok {
+			units = append(units, r.Elems)
+		} else {
+			units = append(units, []parser.Expr{e})
+		}
+	}
+	return units
+}
+
+func flattenUnits(units [][]parser.Expr) []parser.Expr {
+	var out []parser.Expr
+	for _, u := range units {
+		out = append(out, u...)
+	}
+	return out
+}
+
+// rollupAlternatives / cubeAlternatives / cartesianGroupingSets are legacy's
+// (select.go:856-907), including their orderings: ROLLUP lists the LONGEST
+// prefix first, CUBE walks bit masks upward, and comma-separated elements
+// combine by cartesian product with the earlier element outermost.
+func rollupAlternatives(units [][]parser.Expr) [][]parser.Expr {
+	alts := make([][]parser.Expr, 0, len(units)+1)
+	for i := len(units); i >= 0; i-- {
+		var set []parser.Expr
+		for _, u := range units[:i] {
+			set = append(set, u...)
+		}
+		alts = append(alts, set)
+	}
+	return alts
+}
+
+func cubeAlternatives(units [][]parser.Expr) [][]parser.Expr {
+	n := len(units)
+	alts := make([][]parser.Expr, 0, 1<<uint(n))
+	for mask := 0; mask < 1<<uint(n); mask++ {
+		var set []parser.Expr
+		for j := 0; j < n; j++ {
+			if mask&(1<<uint(j)) != 0 {
+				set = append(set, units[j]...)
+			}
+		}
+		alts = append(alts, set)
+	}
+	return alts
+}
+
+func cartesianGroupingSets(components [][][]parser.Expr) [][]parser.Expr {
+	sets := [][]parser.Expr{{}}
+	for _, alts := range components {
+		next := make([][]parser.Expr, 0, len(sets)*len(alts))
+		for _, prefix := range sets {
+			for _, alt := range alts {
+				combined := make([]parser.Expr, 0, len(prefix)+len(alt))
+				combined = append(combined, prefix...)
+				combined = append(combined, alt...)
+				next = append(next, combined)
+			}
+		}
+		sets = next
+	}
+	return sets
+}
+
+// buildGroupClause assembles GroupBy (the flat list, duplicates and all) and
+// the expanded GroupingSets exactly as parseGroupByElems returns them; no
+// construct means no GroupingSets at all.
+func buildGroupClause(pos int, items []*groupItem) *groupClause {
+	gc := &groupClause{}
+	var comps [][][]parser.Expr
+	construct := false
+	for _, it := range items {
+		gc.list = append(gc.list, it.flat...)
+		comps = append(comps, it.alts)
+		construct = construct || it.construct
+	}
+	if construct {
+		gc.sets = parser.NewGroupingSetsSpec(pos, cartesianGroupingSets(comps))
+	}
+	return gc
+}
+
+// joinLegacyTokens is joinGeneratedExprTokens (ddl.go:4530) over the token
+// stream between two absolute positions (exclusive of both): values joined
+// with single spaces, string literals re-quoted, and no space before ')' ','
+// '.', after '(' '.', or before a '(' that follows a name or ')'.
+func joinLegacyTokens(l yyLexer, from, to int) string {
+	ls, ok := l.(*lexerState)
+	if !ok {
+		return ""
+	}
+	render := func(tk parser.Token) string {
+		if tk.Kind == parser.TokenStringLit {
+			return "'" + strings.ReplaceAll(tk.Value, "'", "''") + "'"
+		}
+		return tk.Value
+	}
+	var b strings.Builder
+	var prev *parser.Token
+	for i := range ls.toks {
+		tk := ls.toks[i]
+		if tk.Pos <= from || tk.Pos >= to {
+			continue
+		}
+		if prev == nil {
+			b.WriteString(render(tk))
+			prev = &ls.toks[i]
+			continue
+		}
+		noSpace := false
+		if tk.Kind == parser.TokenSymbol {
+			switch tk.Value {
+			case ")", ",", ".":
+				noSpace = true
+			case "(":
+				if prev.Kind == parser.TokenIdent || prev.Kind == parser.TokenQuotedIdent || (prev.Kind == parser.TokenSymbol && prev.Value == ")") {
+					noSpace = true
+				}
+			}
+		}
+		if prev.Kind == parser.TokenSymbol && (prev.Value == "(" || prev.Value == ".") {
+			noSpace = true
+		}
+		if !noSpace {
+			b.WriteByte(' ')
+		}
+		b.WriteString(render(tk))
+		prev = &ls.toks[i]
+	}
+	return b.String()
+}
+
+// substringSimilar ports buildSubstringSimilar (select.go): SUBSTRING(str
+// SIMILAR pattern ESCAPE esc) with LITERAL pattern and escape is folded at
+// parse time into substring(str, <POSIX regex>::text) through the shared
+// similarto converter; a NULL pattern or escape folds to NULL; a non-literal
+// operand is the same error legacy raises.
+func substringSimilar(l yyLexer, pos int, str, pat, esc parser.Expr) parser.Expr {
+	patVal, patNull, patOK := literalValue(pat)
+	escVal, escNull, escOK := literalValue(esc)
+	ls, _ := l.(*lexerState)
+	if !patOK || !escOK {
+		if ls != nil && ls.err == nil {
+			ls.err = &parser.SyntaxError{Message: "SUBSTRING(... SIMILAR ... ESCAPE ...) with non-literal operands is not yet supported", Raw: true, Pos: pos}
+		}
+		return parser.NewNullConst(pos)
+	}
+	if patNull || escNull {
+		return parser.NewNullConst(pos)
+	}
+	if err := similarto.ValidateEscape(escVal); err != nil {
+		if ls != nil && ls.err == nil {
+			ls.err = &parser.SyntaxError{Message: "invalid escape string", Raw: true, Pos: pos}
+		}
+		return parser.NewNullConst(pos)
+	}
+	conv, err := similarto.ConvertSubstring(patVal, escVal)
+	if err != nil {
+		if ls != nil && ls.err == nil {
+			ls.err = &parser.SyntaxError{Message: err.Error(), Raw: true, Pos: pos}
+		}
+		return parser.NewNullConst(pos)
+	}
+	return specialFormCall(pos, "substring", []parser.Expr{str, parser.NewTypedStringLit(pos, "text", conv)})
+}
+
+func literalValue(e parser.Expr) (string, bool, bool) {
+	switch x := e.(type) {
+	case *parser.StringConst:
+		return x.Value, false, true
+	case *parser.NullConst:
+		return "", true, true
+	}
+	return "", false, false
+}
+
 
 // setop machinery types live here so grammar actions stay tiny.
 type opSpec struct {
@@ -630,6 +829,8 @@ type colSpec struct {
 	checkName, nnName, uqName string
 	collation, compression    string
 	nnNoInherit, checkNoInherit bool
+	checkNotEnforced bool
+	storage          string
 }
 
 // tableElem is one element of a CREATE TABLE parens list: a column spec or a
@@ -657,6 +858,7 @@ type tableElem struct {
 	partition  *parser.PartitionByClause
 	notNull    *tableNotNull
 	checkNoInh bool // table-level CHECK ... NO INHERIT
+	checkNotEnf bool // table-level CHECK ... NOT ENFORCED
 }
 
 // colConstraints accumulates a column's constraint suffix in CREATE TABLE.
@@ -687,6 +889,8 @@ type colConstraints struct {
 	compression string
 	nnNoInherit    bool
 	checkNoInherit bool
+	checkNotEnforced bool
+	storage        string
 	fk         *fkInfo
 }
 
@@ -721,6 +925,7 @@ type colConstraint struct {
 	expr parser.Expr
 	seq  *identityOpts   // identity_*: the `(START WITH n ...)` option list
 	name string          // `CONSTRAINT name` prefix; legacy keeps it only for NOT NULL / UNIQUE / CHECK
+	notEnforced bool     // check: trailing NOT ENFORCED
 }
 
 // identityOpts carries an identity column's sequence options — legacy's
@@ -779,31 +984,36 @@ func objectNameFromQn(q qname) parser.ObjectName {
 
 // fkActs accumulates ON DELETE / ON UPDATE referential actions.
 type fkActs struct {
-	del parser.FKAction
-	up  parser.FKAction
+	del        parser.FKAction
+	up         parser.FKAction
+	delSetCols []string // ON DELETE SET NULL|DEFAULT (cols); legacy drops the ON UPDATE form's list
 }
 
 // colConstraint kinds: "nn" | "pk" | "uq" | "def" | "check" | "fk".
 
 // fkInfo carries a column-level FK target parsed inline.
 type fkInfo struct {
-	refTable parser.ObjectName
-	refCols  []string
-	onDel    parser.FKAction
-	onUp     parser.FKAction
+	refTable   parser.ObjectName
+	refCols    []string
+	onDel      parser.FKAction
+	onUp       parser.FKAction
+	delSetCols []string
+	matchFull  bool
 }
 
 // namedFkAct is one ON DELETE/UPDATE referential action occurrence.
 type namedFkAct struct {
-	del bool
-	up  bool
-	act parser.FKAction
+	del     bool
+	up      bool
+	act     parser.FKAction
+	setCols []string
 }
 
 // applyFkAction folds an action occurrence into the accumulator.
 func applyFkAction(a *fkActs, n *namedFkAct) *fkActs {
 	if n.del {
 		a.del = n.act
+		a.delSetCols = n.setCols
 	}
 	if n.up {
 		a.up = n.act
@@ -815,6 +1025,7 @@ func applyFkAction(a *fkActs, n *namedFkAct) *fkActs {
 type ctTail struct {
 	partOf    parser.ObjectName
 	partOfElems []*partOfElem // PARTITION OF ... ( elements )
+	onCommit  string // ON COMMIT DELETE ROWS | DROP | PRESERVE ROWS
 	fromVals  []parser.Expr
 	toVals    []parser.Expr
 	inVals    []parser.Expr
@@ -1427,10 +1638,11 @@ func unwrapAnyArray(l yyLexer, list []parser.Expr, listPos int) []parser.Expr {
 // ColumnDef. It is the ONE place both CREATE TABLE and ALTER TABLE ADD COLUMN
 // go through for the fields added since 2026-08-27, so the two siblings cannot
 // drift again the way identity did.
-func copyColConstraints(cd *parser.ColumnDef, collation, compression, nnName, uqName, checkName string, nnNoInherit, checkNoInherit bool) {
+func copyColConstraints(cd *parser.ColumnDef, collation, compression, nnName, uqName, checkName string, nnNoInherit, checkNoInherit bool, checkNotEnforced bool, storage string) {
 	cd.Collation, cd.Compression = collation, compression
 	cd.NotNullConstraintName, cd.UniqueConstraintName, cd.CheckConstraintName = nnName, uqName, checkName
 	cd.NotNullNoInherit, cd.CheckNoInherit = nnNoInherit, checkNoInherit
+	cd.CheckNotEnforced, cd.Storage = checkNotEnforced, storage
 }
 
 // partOfElem is one entry of `CREATE TABLE c PARTITION OF p ( ... )`. Legacy
@@ -1451,7 +1663,16 @@ type partOfElem struct {
 }
 
 func applyPartOfElems(poc *parser.PartitionOfClause, elems []*partOfElem) {
+	seen := map[string]bool{}
 	for _, e := range elems {
+		// Legacy flags the FIRST column that is listed twice (DuplicateColumn)
+		// and lets the executor reject it.
+		if !e.hasCheck && e.col != "" {
+			if seen[e.col] && poc.DuplicateColumn == "" {
+				poc.DuplicateColumn = e.col
+			}
+			seen[e.col] = true
+		}
 		switch {
 		case e.hasCheck:
 			if e.checkName != "" {
@@ -1580,6 +1801,9 @@ func mergeCtTail(dst, src *ctTail) *ctTail {
 		dst.modulus, dst.remainder, dst.isHash = src.modulus, src.remainder, src.isHash
 		dst.partOfElems = src.partOfElems
 	}
+	if src.onCommit != "" {
+		dst.onCommit = src.onCommit
+	}
 	return dst
 }
 
@@ -1632,4 +1856,40 @@ func insertTarget(q qname, alias string, cols []string) (parser.RangeVar, []stri
 		return rv, nil
 	}
 	return rv, cols
+}
+
+// joinCheckTokens is legacy parseCheckExpr's capture: a PLAIN space join of the
+// tokens between the parens — no spacing rules at all (`( y ) . a > 0`,
+// `a in ( 1 , 2 )`) — with string literals re-quoted. Distinct from the
+// generated-column join (joinLegacyTokens) and from the partition-of check
+// join (tokenJoinLower, which drops the quotes).
+func joinCheckTokens(l yyLexer, from, to int) string {
+	ls, ok := l.(*lexerState)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, tk := range ls.toks {
+		if tk.Pos <= from || tk.Pos >= to {
+			continue
+		}
+		if tk.Kind == parser.TokenStringLit {
+			parts = append(parts, "'"+strings.ReplaceAll(tk.Value, "'", "''")+"'")
+		} else {
+			parts = append(parts, tk.Value)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// tblCheckTail carries a table-level CHECK's trailer words.
+type tblCheckTail struct {
+	noInherit, notEnforced bool
+}
+
+// checkOpt carries CREATE VIEW's WITH ... CHECK OPTION plus the byte position
+// of its WITH, so RawDef can stop there the way legacy's span does.
+type checkOpt struct {
+	opt string
+	pos int
 }

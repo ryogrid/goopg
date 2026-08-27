@@ -20,6 +20,10 @@ import (
    the grammar's INTERVAL SCONST rule. */
 %token <str> TYPEDLIT
 %token <str> VALUES_LA
+/* CHECKBODY: `CHECK ( ... )` folded by the adapter into ONE terminal whose
+   pos is the '(' and whose ival is the ')' — legacy never parses a check
+   body, it records a token join of whatever sits between the parens. */
+%token <ival> CHECKBODY
 
 %union {
 	str    string           // IDENT / SCONST / keyword text / Op value ...

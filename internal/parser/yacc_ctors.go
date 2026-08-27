@@ -498,3 +498,9 @@ func SplitEmbeddedInterval(body string) (value, unit string, ok bool) {
 func NewExecuteStmt(pos int, name string, params []Expr) *ExecuteStmt {
 	return &ExecuteStmt{pos: pos, Name: name, Params: params}
 }
+
+// NewGroupingSetsSpec builds the expanded grouping-set list the way
+// parseGroupByElems does (legacy computes the cartesian product at parse time).
+func NewGroupingSetsSpec(pos int, sets [][]Expr) *GroupingSetsSpec {
+	return &GroupingSetsSpec{pos: pos, Sets: sets}
+}
