@@ -820,6 +820,37 @@ func namedTableConstraint(name string, cols []string, isPrimary bool, incl []str
 	return d
 }
 
+// sessionAuthzStmt builds `SET [SESSION|LOCAL] AUTHORIZATION name|DEFAULT`.
+//
+// A separate `AUTHORIZATION DEFAULT` alternative would reduce/reduce against
+// set_value_atom's own DEFAULT (14 conflicts), and the atom TEXT is "default"
+// for both the bare keyword and the string literal 'default' — only the token
+// KIND separates them, so the check is made here rather than in the grammar.
+func sessionAuthzStmt(l *lexerState, local bool, atom string) parser.Stmt {
+	if l.authzIsDefaultKeyword() {
+		return parser.NewSetStmt(0, local, "session_authorization", "", true)
+	}
+	return parser.NewSetStmt(0, local, "session_authorization", atom, false)
+}
+
+// authzIsDefaultKeyword reports whether the token after AUTHORIZATION is the
+// bare DEFAULT keyword (not the string literal 'default').
+func (l *lexerState) authzIsDefaultKeyword() bool {
+	for i, t := range l.toks {
+		if (t.Kind != parser.TokenKeyword && t.Kind != parser.TokenIdent) ||
+			!strings.EqualFold(t.Value, "authorization") {
+			continue
+		}
+		if i+1 >= len(l.toks) {
+			return false
+		}
+		n := l.toks[i+1]
+		return (n.Kind == parser.TokenKeyword || n.Kind == parser.TokenIdent) &&
+			strings.EqualFold(n.Value, "default")
+	}
+	return false
+}
+
 // fillfactorFrom pulls the fillfactor out of a CREATE INDEX `WITH (...)` list.
 // Only fillfactor reaches the AST, as in legacy; other storage parameters are
 // accepted and discarded.

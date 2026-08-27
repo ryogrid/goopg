@@ -37,7 +37,6 @@ var notYetPortedKeywords = map[string]string{
 	"VARIADIC":    "VARIADIC call arguments; legacy fills FuncCall.Variadic",
 
 	// type_func_name_keyword
-	"AUTHORIZATION": "SET SESSION AUTHORIZATION / CREATE SCHEMA AUTHORIZATION",
 	"BINARY":        "COPY ... BINARY / BINARY cursors (P6.3, P6.5)",
 	"COLLATION":     "CREATE COLLATION and COLLATION FOR (plain COLLATE is reachable)",
 	"FREEZE":        "P6.5 VACUUM FREEZE",

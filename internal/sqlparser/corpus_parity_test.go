@@ -92,7 +92,8 @@ func harvestSQLLiterals(t *testing.T) []string {
 // 2026-08-27 (empty col list, DEFAULT in VALUES, partial index, expr arbiter, typed literals): 328.
 // 2026-08-27 (data-modifying CTEs, multi-word typed literals, misc): 336.
 // 2026-08-27 (index column surface): 349.
-const legacyCorpusParityFloor = 344
+// 2026-08-27 (ADD PRIMARY KEY USING INDEX, SET SESSION AUTHORIZATION): 350.
+const legacyCorpusParityFloor = 345
 
 func TestLegacyCorpusParity(t *testing.T) {
 	queries := harvestSQLLiterals(t)

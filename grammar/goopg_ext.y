@@ -673,6 +673,12 @@ set_stmt:
 				$$ = parser.NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
 			}
 
+	/* SET [SESSION|LOCAL] AUTHORIZATION name|DEFAULT. SESSION is consumed by
+	   set_scope, so only AUTHORIZATION remains here. Legacy records it as a
+	   plain SetStmt named "session_authorization". */
+	| SET set_scope AUTHORIZATION set_value_atom
+			{ $$ = sessionAuthzStmt(yylex.(*lexerState), $2, $4) }
+
 	/* SET [LOCAL] ROLE name — legacy records it as a plain SetStmt named
 	   "role" with no '='/TO, so setValueAtoms (which scans for the separator)
 	   cannot recover the value; it comes from the item directly. */
@@ -823,6 +829,13 @@ alter_table_action:
 				cd.DefaultExpr = cc.defExpr
 				a := parser.NewATAction(parser.AlterTableAddColumn)
 				a.Column = *cd
+				$$ = a
+			}
+	/* `ADD PRIMARY KEY USING INDEX i` promotes an existing unique index. */
+	| ADD_P PRIMARY KEY USING INDEX ColId
+			{
+				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
+				a.UsingIndexName = $6
 				$$ = a
 			}
 	| ADD_P PRIMARY KEY pk_cols

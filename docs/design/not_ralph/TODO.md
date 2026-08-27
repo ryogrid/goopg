@@ -470,11 +470,14 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
 **Must-pass regress: 2409 routed fragments, 222 still failing across 27 of the
 59 cases.** Ranked by fragments blocked:
 
-- [ ] **Index column surface (~42)** — expression columns
-  (`USING btree (f())`, `((a + b))`), per-column opclass (`(seqno float8_ops)`),
-  `ON ONLY t`, and `WITH (fillfactor = 10)`. `index_col` is `%type <str>` today,
-  so expression columns need `CreateIndexStmt.ColExprs` threading, not just a
-  grammar alternative.
+- [x] **DONE 2026-08-27 — index column surface.** Expression keys, per-column
+  opclass, COLLATE, ASC/DESC, NULLS order, `ON ONLY`, `WITH (fillfactor = ...)`.
+  Two grammar shapes were forced by measurement: the key must be
+  `name_or_call` / `'(' a_expr ')'` rather than a bare a_expr (a trailing
+  opclass ColId after an a_expr is ambiguous with VARYING / FILTER / WITHIN /
+  YEAR_P / SECOND_P — 14 S/R), and the opclass must be IDENT rather than ColId
+  (ColId admits FILTER and WITHIN, the very tokens that continue a
+  function-call key — 4 more S/R).
 - [ ] **`AS <reserved keyword>` aliases (~33)** — `SELECT true AS true`.
   gram.y's ColLabel admits reserved_keyword; ours stops at
   type_func_name_keyword. **Measured: adding the whole list costs 12
@@ -483,12 +486,31 @@ subpartition `PARTITION OF ... PARTITION BY`, and two multi-statement steps.
   collide with `c_expr: TRUE_P`. Same root cause and same fix as the
   parenthesized-set-op deferral below: the SelectStmt/AS restructure.
 - [ ] **`VARIADIC` call arguments (~19)** — `f(variadic array[1,2]::int[])`.
-  `FuncCall.Variadic` exists on the AST; VARIADIC is one of the reserved
-  tokens no production consumes.
+  `FuncCall.Variadic` exists on the AST; VARIADIC is one of the reserved tokens
+  no production consumes. **Sized 2026-08-27:** needs `opt_func_call_args`
+  retyped from `<exprs>` to a carrier holding the per-argument variadic flags,
+  which touches all 13 of its use sites; adding a competing
+  `qualified_name '(' variadic_args ')'` alternative instead conflicts on the
+  shared prefix. Note legacy also EXPANDS `VARIADIC array[a,b]` into individual
+  args each flagged variadic (select.go:4815-4875) — reproduce that, not just
+  the flag.
 - [ ] **Row-constructor comparison (~14)** — `WHERE (a, b) > ('x', 0)`.
-- [ ] **`ALTER TABLE ... ADD PRIMARY KEY USING INDEX name` (~14)**.
-- [ ] **Subpartitioning (~7)** — `PARTITION OF p FOR VALUES ... PARTITION BY LIST (c)`.
-- [ ] **`SET SESSION AUTHORIZATION name` (~6)**.
+  **Measured 2026-08-27:** `c_expr: '(' a_expr ',' expr_list ')'` (spelled to
+  need two items so it cannot collide with `'(' a_expr ')'` grouping) still
+  costs 12 reduce/reduce, all of them `a_expr: c_expr` vs `b_expr: c_expr` —
+  the row constructor merely EXPOSES the pre-existing a_expr/b_expr split.
+  Resolve that split first.
+- [x] **DONE 2026-08-27 — `ALTER TABLE ... ADD PRIMARY KEY USING INDEX name`.**
+- [ ] **Subpartitioning (~7)** — `PARTITION OF p FOR VALUES ... PARTITION BY
+  LIST (c)`. Blocked by the same flat `opt_ct_tail` that prevents composing
+  `WITH (...)` with `PARTITION BY` (P4.1 note above): the tail is a single
+  clause, so two of them cannot follow one another.
+- [x] **DONE 2026-08-27 — `SET [SESSION] AUTHORIZATION name|DEFAULT`.** A
+  separate `AUTHORIZATION DEFAULT` alternative reduce/reduces against
+  set_value_atom's own DEFAULT (14 conflicts), and the atom text is "default"
+  for the bare keyword and the literal `'default'` alike, so the distinction is
+  made on the token KIND in `sessionAuthzStmt`. Legacy itself rejects
+  `SET LOCAL AUTHORIZATION`.
 - [ ] Smaller: `COPY ... (subquery)` forms, `CREATE TABLE ... (LIKE t ...)`,
   `GENERATED ... AS`, JSON constructors, `~`/`&`/`=>` operator spellings.
 
