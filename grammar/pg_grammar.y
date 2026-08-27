@@ -88,6 +88,13 @@
 %type <strs>	opt_trig_args trig_arg_list drop_arg_types opt_policy_to policy_role_list
 %type <str>	ext_name opt_policy_as opt_policy_for
 %type <nodes>	ext_opts alter_seq_opts
+%type <stmt>	copy_inner
+%type <strs>	opt_copy_cols
+%type <ival>	copy_dir
+%type <node>	copy_endpoint
+%type <copts>	opt_copy_opts copy_opt_list copy_trail_list copy_trail_item
+%type <copt>	copy_opt
+%type <str>	copy_opt_name copy_opt_value copy_trail_flag copy_trail_str
 %type <node>	alter_seq_opt alter_type_action alter_domain_action opt_enum_pos attr_cmd
 %type <nodes>	attr_cmd_list
 %type <node>	ext_opt
@@ -190,7 +197,7 @@
 %type <stmt>	set_transaction_stmt
 %type <stmt>	refresh_matview_stmt drop_matview_stmt
 %type <b>	opt_concurrently
-%type <stmt>	explainable_stmt merge_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
+%type <stmt>	explainable_stmt merge_stmt copy_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
@@ -422,6 +429,10 @@ explainable_stmt:
 				$$ = $1
 			}
 	| call_stmt
+			{
+				$$ = $1
+			}
+	| copy_stmt
 			{
 				$$ = $1
 			}
@@ -907,12 +918,12 @@ simple_select:
 				// SELECT ... INTO is CREATE TABLE ... AS in disguise; the
 				// wrap happens at the SelectStmt rule, once ORDER BY / LIMIT
 				// have been attached, so only the target is recorded here.
-				if tgt, ok := $5.(*parser.ObjectName); ok && tgt != nil {
+				if tgt, ok := $5.(*intoTarget); ok && tgt != nil {
 					l := yylex.(*lexerState)
 					if l.intoFor == nil {
-						l.intoFor = map[*parser.SelectStmt]parser.ObjectName{}
+						l.intoFor = map[*parser.SelectStmt]*intoTarget{}
 					}
-					l.intoFor[s] = *tgt
+					l.intoFor[s] = tgt
 				}
 				$$ = s
 				// NOTE: ORDER BY / LIMIT / OFFSET live one level up, in
@@ -992,12 +1003,14 @@ func_name_keyword:
 /* into_clause — gram.y :12986. Legacy takes only `INTO [TABLE] name`; its
    TEMP / UNLOGGED / TABLESPACE variants are NOT accepted there
    (`SELECT a INTO TEMP x` is a syntax error), so they stay out. */
+/* The INTO token's own position rides along: an INTO in a context that
+   forbids it is reported AT the INTO (select.go:223), and the check happens
+   long after this rule has reduced. */
 into_clause:
-		/* empty */                      { $$ = (*parser.ObjectName)(nil) }
+		/* empty */                      { $$ = (*intoTarget)(nil) }
 	| INTO opt_into_table qualified_name
 			{
-				n := objectNameFromQn($3)
-				$$ = &n
+				$$ = &intoTarget{name: objectNameFromQn($3), pos: $<p>1}
 			}
 
 opt_into_table:

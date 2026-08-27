@@ -876,3 +876,30 @@ func MirrorFirstAttrCmd(s *AlterTypeStmt) {
 		s.AlterAttrName, s.AlterAttrType, s.AlterAttrCollation = c.Name, c.Type, c.Collation
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P5.11 COPY
+// ---------------------------------------------------------------------------
+
+func NewCopyStmt(pos int) *CopyStmt { return &CopyStmt{pos: pos} }
+
+// NewCopyOption — Bool is the "bare option name, no value" marker; every other
+// shape (value, star, column list) clears it.
+func NewCopyOption(pos int, name string) CopyOption {
+	return CopyOption{pos: pos, Name: name, Bool: true}
+}
+
+func CopyOptionValue(o CopyOption, v string) CopyOption {
+	o.Value, o.Bool = v, false
+	return o
+}
+
+func CopyOptionStar(o CopyOption) CopyOption {
+	o.Star, o.Bool = true, false
+	return o
+}
+
+func CopyOptionCols(o CopyOption, cols []string) CopyOption {
+	o.Cols, o.Bool = cols, false
+	return o
+}

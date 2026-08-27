@@ -44,3 +44,28 @@ func TestSelectShorthandsAndTempViews(t *testing.T) {
 	assertBothReject(t, "select (a).b from t")
 	assertBothReject(t, "TABLE sometable ORDER BY a")
 }
+
+// TestSelectIntoIsContextChecked pins the four contexts legacy REJECTS a
+// `SELECT ... INTO` in, each with its own message. Only a top-level SELECT may
+// carry one: intoWrap consumes the recorded target when it turns the query
+// into a CreateTableStmt, so anything left over after the parse reached a
+// cursor, a subquery or an INSERT source — and a view body is checked in its
+// own rule because its message and its missing caret differ.
+//
+// DECLARE's body is SelectStmt rather than `stmt` for exactly this reason:
+// routed through `stmt`, `DECLARE c CURSOR FOR SELECT 1 INTO t` became a
+// CREATE TABLE instead of an error.
+func TestSelectIntoIsContextChecked(t *testing.T) {
+	for _, q := range []string{
+		"DECLARE foo CURSOR FOR SELECT 1 INTO int4_tbl",
+		"SELECT * FROM (SELECT 1 INTO f) bar",
+		"CREATE VIEW foo AS SELECT 1 INTO int4_tbl",
+		"INSERT INTO int4_tbl SELECT 1 INTO f",
+	} {
+		assertBothReject(t, q)
+	}
+	// ... while the top-level form stays a CREATE TABLE ... AS in disguise.
+	assertParity(t, "SELECT 1 INTO t")
+	assertParity(t, "SELECT 1 INTO TABLE t")
+	assertParity(t, "SELECT a INTO t FROM u WHERE a > 1 ORDER BY a LIMIT 2")
+}

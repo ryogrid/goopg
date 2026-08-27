@@ -2315,9 +2315,17 @@ close_stmt:
 /* DECLARE name [NO] SCROLL CURSOR [WITH|WITHOUT HOLD] FOR <stmt>. gram.y also
    accepts BINARY / INSENSITIVE / ASENSITIVE here; legacy rejects all three
    ("expected CURSOR"), so they stay rejected. */
+/* The body is SelectStmt, not `stmt`: legacy's DECLARE calls parseSelect, and
+   routing it through `stmt` would run intoWrap over it — turning
+   `DECLARE c CURSOR FOR SELECT 1 INTO t` into a CREATE TABLE instead of the
+   error legacy raises. */
 declare_stmt:
-		DECLARE ColId opt_cursor_scroll CURSOR opt_cursor_hold FOR stmt
-			{ $$ = parser.NewDeclareCursorStmt($<p>1, $2, $7) }
+		DECLARE ColId opt_cursor_scroll CURSOR opt_cursor_hold FOR SelectStmt
+			{
+				sel, _ := $7.(*parser.SelectStmt)
+				checkStrayInto(yylex, sel, "SELECT ... INTO is not allowed here", false)
+				$$ = parser.NewDeclareCursorStmt($<p>1, $2, $7)
+			}
 
 opt_cursor_scroll:
 		/* empty */   { }
@@ -3357,3 +3365,128 @@ alter_domain_action:
 	| RENAME CONSTRAINT ColId TO ColId        { $$ = altDomRenameConstraint($3, $5) }
 	| RENAME TO ColId                         { $$ = altDomRenameTo($3) }
 	| OWNER TO alter_fn_owner                 { $$ = altDomOwner($3) }
+
+/* ============================================================================
+   P5.11 — COPY (gram.y CopyStmt).
+
+   Two shapes: a relation (with an optional column list) copied FROM or TO an
+   endpoint, and a parenthesised query copied TO one. The options come either
+   in the modern parenthesised list or in the pre-9.0 bare trail, which admits
+   a FIXED vocabulary — legacy's parseCopyLegacyTrail STOPS at any other word
+   rather than erroring, so the trail is a list of known items, not a generic
+   name/value list.
+   ========================================================================= */
+
+copy_stmt:
+		COPY qualified_name opt_copy_cols copy_dir copy_endpoint opt_copy_opts
+			{
+				st := parser.NewCopyStmt($<p>1)
+				st.Table, st.Columns = objectNameFromQn($2), $3
+				st.Direction = parser.CopyDirection($4)
+				ep := $5.(*copyEndpoint)
+				st.Endpoint, st.Filename = ep.kind, ep.name
+				st.Options = $6
+				$$ = st
+			}
+	/* A query source is TO-only; legacy answers a FROM with a bare syntax
+	   error rather than an explanatory one. */
+	| COPY '(' copy_inner ')' TO copy_endpoint opt_copy_opts
+			{
+				st := parser.NewCopyStmt($<p>1)
+				st.Direction = parser.CopyTo
+				if sel, ok := $3.(*parser.SelectStmt); ok {
+					st.Query = sel
+				} else {
+					st.QueryDML = $3
+				}
+				ep := $6.(*copyEndpoint)
+				st.Endpoint, st.Filename = ep.kind, ep.name
+				st.Options = $7
+				$$ = st
+			}
+
+copy_inner:
+		select_bare      { $$ = $1 }
+	| insert_stmt        { $$ = $1 }
+	| update_stmt        { $$ = $1 }
+	| delete_stmt        { $$ = $1 }
+
+opt_copy_cols:
+		/* empty */             { $$ = []string(nil) }
+	| '(' colid_list ')'        { $$ = $2 }
+
+copy_dir:
+		FROM      { $$ = int(parser.CopyFrom) }
+	| TO          { $$ = int(parser.CopyTo) }
+
+/* STDIN / STDOUT / PROGRAM arrive as ordinary identifiers (legacy compares
+   t.Value), so they are ColIds rather than terminals; which of them is legal
+   depends on the direction, and legacy raises its own message for a mismatch. */
+copy_endpoint:
+		ColId              { $$ = copyEndpointWord(yylex, $1, $<p>1) }
+	| ColId SCONST         { $$ = copyEndpointProgram(yylex, $1, $2, $<p>1) }
+	| SCONST               { $$ = &copyEndpoint{kind: parser.CopyEndpointFile, name: $1} }
+
+/* WITH is optional before BOTH option forms: legacy consumes it and then
+   checks for '(' , so `WITH DELIMITER ','` is the bare trail with a WITH in
+   front of it. */
+opt_copy_opts:
+		/* empty */                        { $$ = []parser.CopyOption(nil) }
+	| WITH '(' copy_opt_list ')'           { $$ = $3 }
+	| '(' copy_opt_list ')'                { $$ = $2 }
+	| WITH copy_trail_list                 { $$ = $2 }
+	| copy_trail_list                      { $$ = $1 }
+
+copy_opt_list:
+		copy_opt                           { $$ = []parser.CopyOption{$1} }
+	| copy_opt_list ',' copy_opt           { $$ = append($1, $3) }
+
+copy_opt:
+		copy_opt_name                          { $$ = parser.NewCopyOption($<p>1, $1) }
+	| copy_opt_name '*'                        { $$ = parser.CopyOptionStar(parser.NewCopyOption($<p>1, $1)) }
+	| copy_opt_name '(' colid_list ')'         { $$ = parser.CopyOptionCols(parser.NewCopyOption($<p>1, $1), $3) }
+	| copy_opt_name copy_opt_value             { $$ = parser.CopyOptionValue(parser.NewCopyOption($<p>1, $1), $2) }
+
+/* Both the NAME and the VALUE take ANY keyword: legacy's parseCopyOption
+   accepts a bare TokenIdent-or-TokenKeyword for each, which is how
+   `NULL ''` and `FREEZE true` parse. as_col_label is ColLabel plus the
+   reserved words. The name is stored RAW, exactly as written. */
+copy_opt_name:
+		as_col_label      { $$ = $1 }
+
+copy_opt_value:
+		as_col_label           { $$ = $1 }
+	| SCONST                   { $$ = $1 }
+	| ICONST                   { $$ = strconv.FormatInt(int64($1), 10) }
+
+/* The pre-9.0 bare trail. Its vocabulary is closed: parseCopyLegacyTrail
+   returns as soon as it sees a word outside this set. */
+copy_trail_list:
+		copy_trail_item                    { $$ = $1 }
+	| copy_trail_list copy_trail_item      { $$ = append($1, $2...) }
+
+copy_trail_item:
+		BINARY            { $$ = []parser.CopyOption{parser.NewCopyOption($<p>1, "binary")} }
+	| copy_trail_flag     { $$ = []parser.CopyOption{parser.NewCopyOption($<p>1, $1)} }
+	| copy_trail_str SCONST
+			{ $$ = []parser.CopyOption{parser.CopyOptionValue(parser.NewCopyOption($<p>1, $1), $2)} }
+	| FORCE QUOTE '*'
+			{ $$ = []parser.CopyOption{parser.CopyOptionStar(parser.NewCopyOption($<p>1, "force_quote"))} }
+	| FORCE QUOTE colid_list
+			{ $$ = []parser.CopyOption{parser.CopyOptionCols(parser.NewCopyOption($<p>1, "force_quote"), $3)} }
+	| FORCE NOT NULL_P colid_list
+			{ $$ = []parser.CopyOption{parser.CopyOptionCols(parser.NewCopyOption($<p>1, "force_not_null"), $4)} }
+	| FORCE NULL_P colid_list
+			{ $$ = []parser.CopyOption{parser.CopyOptionCols(parser.NewCopyOption($<p>1, "force_null"), $3)} }
+
+copy_trail_flag:
+		CSV        { $$ = "csv" }
+	| HEADER_P     { $$ = "header" }
+	| FREEZE       { $$ = "freeze" }
+
+copy_trail_str:
+		DELIMITER    { $$ = "delimiter" }
+	| NULL_P         { $$ = "null" }
+	| QUOTE          { $$ = "quote" }
+	| ESCAPE         { $$ = "escape" }
+	| ENCODING       { $$ = "encoding" }

@@ -69,6 +69,8 @@ import (
 	tflds  []parser.TypeField
 	tfld   parser.TypeField
 	nodes  []any
+	copts  []parser.CopyOption
+	copt   parser.CopyOption
 	fitems []parser.DropFunctionItem
 	ctt    *ctTail
 	wp     [2]string

@@ -63,7 +63,7 @@ type lexerState struct {
 	// target recorded for it. Keyed by POINTER rather than kept in a single
 	// slot because the INTO clause is parsed BEFORE the FROM list, so an outer
 	// select's target is already recorded when an inner subquery reduces.
-	intoFor map[*parser.SelectStmt]parser.ObjectName
+	intoFor map[*parser.SelectStmt]*intoTarget
 	prevPos  int    // absolute Pos of the token before that (mid-rule pos capture)
 
 	// base_yylex one-token pushback (base_yylex.go)
@@ -172,6 +172,15 @@ func ParseOne(toks []parser.Token, baseOffset int) ([]parser.Stmt, error) {
 }
 
 func (l *lexerState) errAsError() error {
+	// A SELECT ... INTO that never reached a top-level SELECT is an INTO in a
+	// context legacy forbids (a cursor, a subquery, an INSERT source): intoWrap
+	// removes the entry when it turns the query into a CreateTableStmt, so
+	// anything left over has to be rejected here rather than silently dropped.
+	if l.err == nil {
+		if e := strayIntoLeft(l); e != nil {
+			l.err = e
+		}
+	}
 	if l.err != nil {
 		return l.err
 	}

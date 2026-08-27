@@ -102,6 +102,8 @@ var routedStmts = map[string]bool{
 	"do": true,
 	// P5.6
 	"comment": true,
+	// P5.11
+	"copy": true,
 	// P5.8 — the two SELECT shorthands. Both already parsed identically; only
 	// the routing entry was missing.
 	"table": true,
@@ -149,6 +151,9 @@ func fragmentRouted(frag []parser.Token) bool {
 		}
 		if key == "comment" {
 			return commentRouted(frag)
+		}
+		if key == "copy" {
+			return copyRouted(frag)
 		}
 		if key == "create" || key == "drop" || key == "alter" {
 			// These lead many DDL classes; route only ported pairs by
@@ -395,6 +400,31 @@ func alterDomainRouted(frag []parser.Token) bool {
 		}
 	}
 	return false
+}
+
+// copyRouted vetoes `COPY (SELECT ... INTO t ...) TO ...`. Legacy stops the
+// inner SELECT at the INTO, records SelectInto and DISCARDS everything after
+// it (parseCopy + skipInnerQueryRemainder), so `SELECT 1 INTO frak UNION
+// SELECT 2` keeps no set-op arm at all. The grammar has no way to truncate a
+// query it has already built, so the form stays on the legacy path.
+func copyRouted(frag []parser.Token) bool {
+	depth := 0
+	for _, tok := range frag[1:] {
+		if tok.Kind == parser.TokenSymbol {
+			switch tok.Value {
+			case "(":
+				depth++
+			case ")":
+				depth--
+			}
+			continue
+		}
+		if depth > 0 && (tok.Kind == parser.TokenKeyword || tok.Kind == parser.TokenIdent) &&
+			strings.EqualFold(tok.Value, "into") {
+			return false
+		}
+	}
+	return true
 }
 
 // createRoutineRouted vetoes the two CREATE FUNCTION / PROCEDURE sub-forms the

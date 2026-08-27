@@ -36,6 +36,7 @@ func TestExplainStatement(t *testing.T) {
 		"explain (costs off) create table t as select 1",
 		"explain (costs off) with c as (select 1) select * from c",
 		"explain execute p",
+		"explain (costs off) copy t from stdin",
 		"explain (costs off) merge into t using u on true when matched then delete",
 		"EXPLAIN (COSTS OFF) SELECT * FROM t WHERE a = 1 ORDER BY b",
 	} {
@@ -61,6 +62,7 @@ func TestExplainRoutingFollowsInner(t *testing.T) {
 		"explain analyze verbose update t set a = 1",
 		"explain (costs off) with c as (select 1) select * from c",
 		"explain execute p",
+		"explain (costs off) copy t from stdin",
 		"explain (costs off) merge into t using u on true when matched then delete",
 	} {
 		if !routed(q) {
@@ -68,7 +70,6 @@ func TestExplainRoutingFollowsInner(t *testing.T) {
 		}
 	}
 	for _, q := range []string{
-		"explain (costs off) copy t from stdin",
 	} {
 		if routed(q) {
 			t.Errorf("unexpectedly routed: %q", q)

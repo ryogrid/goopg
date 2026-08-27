@@ -1613,9 +1613,55 @@ func intoWrap(l yyLexer, s parser.Stmt) parser.Stmt {
 		return s
 	}
 	delete(ls.intoFor, sel)
-	ct := parser.NewCreateTableStmt(0, tgt, nil, nil)
+	ct := parser.NewCreateTableStmt(0, tgt.name, nil, nil)
 	ct.SelectSource = sel
 	return ct
+}
+
+// intoTarget is `SELECT ... INTO name` — the target plus the INTO token's own
+// position, which an out-of-context INTO is reported at.
+type intoTarget struct {
+	name parser.ObjectName
+	pos  int
+}
+
+// checkStrayInto reports the SELECT ... INTO that legacy REJECTS by context.
+// Only a top-level SELECT may carry one: intoWrap consumes the entry when it
+// turns the query into a CreateTableStmt, so anything still in the map reached
+// a cursor, a subquery, an INSERT source or a view body, and legacy raises
+// there (select.go:223, one message per context).
+//
+// noPos is the selectIntoNoPos flag: a view body reports no caret at all.
+func checkStrayInto(l yyLexer, sel *parser.SelectStmt, msg string, noPos bool) bool {
+	ls, ok := l.(*lexerState)
+	if !ok || ls.intoFor == nil || sel == nil {
+		return false
+	}
+	tgt, ok := ls.intoFor[sel]
+	if !ok {
+		return false
+	}
+	delete(ls.intoFor, sel)
+	pos := tgt.pos
+	if noPos {
+		pos = -1
+	}
+	ls.raise(msg, true, pos)
+	return true
+}
+
+// strayIntoLeft is the catch-all for the contexts that have no rule of their
+// own to check in: after a successful parse, any entry still in the map is an
+// INTO that never reached a top-level SELECT.
+func strayIntoLeft(ls *lexerState) *parser.SyntaxError {
+	for _, tgt := range ls.intoFor {
+		return &parser.SyntaxError{
+			Message: "SELECT ... INTO is not allowed here",
+			Raw:     true,
+			Pos:     tgt.pos,
+		}
+	}
+	return nil
 }
 
 // parenTail is what follows a parenthesised left operand — a set operation,
@@ -3214,6 +3260,9 @@ func buildView(l yyLexer, orReplace bool, modifier any, q qname, cols []string, 
 		name.Schema = nm[len(nm)-2]
 	}
 	s, _ := sel.(*parser.SelectStmt)
+	// A view body may not contain SELECT INTO, and legacy reports it with its
+	// OWN message and no caret (ddl.go:2632, selectIntoNoPos).
+	checkStrayInto(l, s, "views must not contain SELECT INTO", true)
 	cv := parser.NewCreateViewStmt(name, cols, s)
 	cv.OrReplace = orReplace
 	// opt_create_modifier is shared with CREATE TABLE, which also accepts
@@ -3482,4 +3531,38 @@ func altTypeAttrCmds(v any) alterTypeOp {
 		}
 		parser.MirrorFirstAttrCmd(a)
 	}
+}
+
+// copyEndpoint carries COPY's sink or source until the statement rule folds it
+// into the two AST fields.
+type copyEndpoint struct {
+	kind parser.CopyEndpoint
+	name string
+}
+
+// copyEndpointWord resolves the bare STDIN / STDOUT spellings. Legacy raises
+// its own message when the word does not match the direction; the direction is
+// not known here, so the check is left to the executor and only an outright
+// unknown word is an error.
+func copyEndpointWord(l yyLexer, word string, pos int) *copyEndpoint {
+	switch strings.ToLower(word) {
+	case "stdin":
+		return &copyEndpoint{kind: parser.CopyEndpointStdin}
+	case "stdout":
+		return &copyEndpoint{kind: parser.CopyEndpointStdout}
+	}
+	if st, ok := l.(*lexerState); ok {
+		st.raise("expected STDIN, STDOUT, PROGRAM, or filename (got "+word+")", false, pos)
+	}
+	return &copyEndpoint{}
+}
+
+func copyEndpointProgram(l yyLexer, word, name string, pos int) *copyEndpoint {
+	if strings.EqualFold(word, "program") {
+		return &copyEndpoint{kind: parser.CopyEndpointProgram, name: name}
+	}
+	if st, ok := l.(*lexerState); ok {
+		st.raise("expected STDIN, STDOUT, PROGRAM, or filename (got "+word+")", false, pos)
+	}
+	return &copyEndpoint{}
 }
