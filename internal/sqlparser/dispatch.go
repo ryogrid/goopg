@@ -104,6 +104,10 @@ var routedStmts = map[string]bool{
 	"comment": true,
 	// P5.11
 	"copy": true,
+	// P5.14
+	"listen": true,
+	"notify": true,
+	"unlisten": true,
 	// P5.8 — the two SELECT shorthands. Both already parsed identically; only
 	// the routing entry was missing.
 	"table": true,
@@ -267,7 +271,8 @@ var routedCreatePairs = map[string]map[string]bool{
 		"schema": true, // P5.9
 		"sequence": true, "type": true, "domain": true, // P5.10
 		"index": true, // P5.12
-		"view": true}, // P5.13
+		"view": true, // P5.13
+		"materialized": true}, // P5.14 (SET SCHEMA only, see alterMatviewRouted)
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
 		"type": true, "domain": true, // P5.5
@@ -280,7 +285,7 @@ var routedCreatePairs = map[string]map[string]bool{
 		"access": true, "foreign": true, "text": true, "aggregate": true,
 		"operator": true, "cast": true, "transform": true, "rule": true,
 		"policy": true, "publication": true, "subscription": true,
-		"tablespace": true},
+		"tablespace": true, "language": true},
 }
 
 // secondKeywordRouted reports whether the fragment's first+second keyword
@@ -341,6 +346,9 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 	}
 	if key == "alter" && second == "view" {
 		return alterViewRouted(frag)
+	}
+	if key == "alter" && second == "materialized" {
+		return alterMatviewRouted(frag)
 	}
 	return true
 }
@@ -490,6 +498,31 @@ func alterViewRouted(frag []parser.Token) bool {
 		}
 	}
 	return false
+}
+
+// alterMatviewRouted — only `ALTER MATERIALIZED VIEW <name> SET SCHEMA <s>`
+// has a real AST; legacy answers every other form with a CompatNoopStmt built
+// by a skip-to-semicolon scan.
+func alterMatviewRouted(frag []parser.Token) bool {
+	words := make([]string, 0, 4)
+	seen := 0
+	for _, tok := range frag[3:] { // past ALTER MATERIALIZED VIEW
+		if tok.Kind == parser.TokenSymbol && tok.Value == "." {
+			seen = 0 // a dot means the name continues
+			continue
+		}
+		if tok.Kind != parser.TokenKeyword && tok.Kind != parser.TokenIdent {
+			continue
+		}
+		seen++
+		if seen >= 2 {
+			words = append(words, strings.ToLower(tok.Value))
+			if len(words) == 2 {
+				break
+			}
+		}
+	}
+	return len(words) == 2 && words[0] == "set" && words[1] == "schema"
 }
 
 // createRoutineRouted vetoes the two CREATE FUNCTION / PROCEDURE sub-forms the

@@ -910,3 +910,19 @@ func CopyOptionCols(o CopyOption, cols []string) CopyOption {
 func NewAlterIndexStmt(pos int, name ObjectName, tagOverride string) *AlterTableStmt {
 	return &AlterTableStmt{pos: pos, Name: name, TagOverride: tagOverride}
 }
+
+// ---------------------------------------------------------------------------
+// P5.14 LISTEN / NOTIFY / UNLISTEN
+// ---------------------------------------------------------------------------
+
+func NewListenStmt(pos int, channel string) *ListenStmt {
+	return &ListenStmt{pos: pos, Channel: channel}
+}
+
+func NewNotifyStmt(pos int, channel, payload string, hasPayload bool) *NotifyStmt {
+	return &NotifyStmt{pos: pos, Channel: channel, Payload: payload, HasPayload: hasPayload}
+}
+
+func NewUnlistenStmt(pos int, channel string, all bool) *UnlistenStmt {
+	return &UnlistenStmt{pos: pos, Channel: channel, All: all}
+}

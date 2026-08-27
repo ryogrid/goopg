@@ -3120,6 +3120,7 @@ drop_compat_kind:
 	| COLLATION                { $$ = "collation" }
 	| SERVER                   { $$ = "server" }
 	| CONVERSION_P             { $$ = "conversion" }
+	| LANGUAGE                 { $$ = "language" }
 	| EVENT TRIGGER            { $$ = "event trigger" }
 	| ACCESS METHOD            { $$ = "access method" }
 	| FOREIGN TABLE            { $$ = "foreign table" }
@@ -3584,3 +3585,29 @@ alter_view_action:
 	| RESET '(' str_pair_list ')'             { $$ = altViewReloptions($3, true) }
 	| ALTER opt_COLUMN ColId SET DEFAULT a_expr { $$ = altViewSetDefault($3, $6) }
 	| ALTER opt_COLUMN ColId DROP DEFAULT     { $$ = altViewDropDefault($3) }
+
+/* ============================================================================
+   P5.14 — LISTEN / NOTIFY / UNLISTEN, plus DROP LANGUAGE and the one
+   ALTER MATERIALIZED VIEW form that has a real AST.
+   ========================================================================= */
+
+listen_stmt:
+		LISTEN ColId              { $$ = parser.NewListenStmt($<p>1, $2) }
+
+notify_stmt:
+		NOTIFY ColId              { $$ = parser.NewNotifyStmt($<p>1, $2, "", false) }
+	| NOTIFY ColId ',' SCONST     { $$ = parser.NewNotifyStmt($<p>1, $2, $4, true) }
+
+unlisten_stmt:
+		UNLISTEN ColId            { $$ = parser.NewUnlistenStmt($<p>1, $2, false) }
+	| UNLISTEN '*'                { $$ = parser.NewUnlistenStmt($<p>1, "", true) }
+
+/* Only SET SCHEMA has a real AST; legacy answers every other ALTER
+   MATERIALIZED VIEW form with a CompatNoopStmt, so the dispatcher gates on it. */
+alter_matview_stmt:
+		ALTER MATERIALIZED VIEW qualified_name SET SCHEMA ColId
+			{
+				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($4), "ALTER MATERIALIZED VIEW")
+				st.SetSchema = $7
+				$$ = st
+			}
