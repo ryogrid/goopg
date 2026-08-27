@@ -3254,3 +3254,106 @@ opt_policy_using:
 opt_policy_check:
 		/* empty */                 { $$ = (parser.Expr)(nil) }
 	| WITH CHECK '(' a_expr ')'     { $$ = $4 }
+
+/* ============================================================================
+   P5.10 — ALTER SEQUENCE / TYPE / DOMAIN.
+
+   Each has its own AST node with an ACTION string or a set of option fields;
+   none of them is a skip-to-semicolon compat form. ALTER DOMAIN's VALIDATE
+   CONSTRAINT is the one exception — legacy answers it with a CompatNoopStmt —
+   so it is left out of the grammar and vetoed at the dispatcher.
+   ========================================================================= */
+
+alter_sequence_stmt:
+		ALTER SEQUENCE opt_if_exists_drop qualified_name alter_seq_opts
+			{
+				st := parser.NewAlterSequenceStmt($<p>1, objectNameFromQn($4), $3)
+				applyAlterSeqOpts(st, $5)
+				$$ = st
+			}
+
+alter_seq_opts:
+		/* empty */                        { $$ = []any(nil) }
+	| alter_seq_opts alter_seq_opt         { $$ = append($1, $2) }
+
+/* Unlike CREATE SEQUENCE, the NO forms are RECORDED here: a sequence already
+   has values, so `NO MINVALUE` means "reset to the type default", which is a
+   different statement from "leave unchanged". */
+alter_seq_opt:
+		AS ColId                              { $$ = altSeqDataType($2) }
+	| INCREMENT opt_BY_kw signed_iconst       { $$ = altSeqInt("increment", $3) }
+	| MINVALUE signed_iconst                  { $$ = altSeqInt("minvalue", $2) }
+	| MAXVALUE signed_iconst                  { $$ = altSeqInt("maxvalue", $2) }
+	| START opt_WITH_kw signed_iconst         { $$ = altSeqInt("start", $3) }
+	| RESTART                                 { $$ = altSeqRestart() }
+	| RESTART opt_WITH_kw signed_iconst       { $$ = altSeqInt("restart", $3) }
+	| CACHE signed_iconst                     { $$ = altSeqInt("cache", $2) }
+	| CYCLE                                   { $$ = altSeqFlag("cycle") }
+	| NO MINVALUE                             { $$ = altSeqFlag("nominvalue") }
+	| NO MAXVALUE                             { $$ = altSeqFlag("nomaxvalue") }
+	| NO CYCLE                                { $$ = altSeqFlag("nocycle") }
+	| SET LOGGED                              { $$ = altSeqLogged("logged") }
+	| SET UNLOGGED                            { $$ = altSeqLogged("unlogged") }
+	| OWNED BY seq_owner                      { $$ = altSeqOwnedBy($3) }
+
+alter_type_stmt:
+		ALTER TYPE_P qualified_name alter_type_action
+			{
+				st := parser.NewAlterTypeStmt($<p>1, objectNameFromQn($3))
+				$4.(alterTypeOp)(st)
+				$$ = st
+			}
+
+alter_type_action:
+	/* The enum labels are string literals, not identifiers. */
+		ADD_P VALUE_P opt_if_not_exists SCONST opt_enum_pos
+			{ $$ = altTypeAddValue($3, $4, $5.(*enumPos)) }
+	| RENAME VALUE_P SCONST TO SCONST      { $$ = altTypeRenameValue($3, $5) }
+	| RENAME TO ColId                      { $$ = altTypeRenameTo($3) }
+	| OWNER TO alter_fn_owner              { $$ = altTypeOwner($3) }
+	/* The attribute subcommands are a COMMA-SEPARATED list, and AttrCmds[0] is
+	   mirrored into the legacy scalar fields (the executor reads those when
+	   there is at most one). The attribute type is stored as the RAW token
+	   join, like a composite field's: `numeric(3,1)` comes back as
+	   "numeric ( 3 , 1 )". */
+	| attr_cmd_list                        { $$ = altTypeAttrCmds($1) }
+
+attr_cmd_list:
+		attr_cmd                       { $$ = []any{$1} }
+	| attr_cmd_list ',' attr_cmd       { $$ = append($1, $3) }
+
+attr_cmd:
+		ADD_P ATTRIBUTE ColId fn_type opt_field_collate opt_drop_behavior
+			{ $$ = parser.NewAlterTypeAttrCmd("add", lowerIdent($3), rawTypeSpan(yylex, $<p>4), $5, false) }
+	| DROP ATTRIBUTE opt_if_exists_drop ColId opt_drop_behavior
+			{ $$ = parser.NewAlterTypeAttrCmd("drop", lowerIdent($4), "", "", $3) }
+	| ALTER ATTRIBUTE ColId opt_set_data TYPE_P fn_type opt_field_collate opt_drop_behavior
+			{ $$ = parser.NewAlterTypeAttrCmd("alter", lowerIdent($3), rawTypeSpan(yylex, $<p>6), $7, false) }
+
+opt_set_data:
+		/* empty */   { }
+	| SET DATA_P      { }
+
+opt_enum_pos:
+		/* empty */        { $$ = &enumPos{} }
+	| BEFORE SCONST        { $$ = &enumPos{before: $2} }
+	| AFTER SCONST         { $$ = &enumPos{after: $2} }
+
+alter_domain_stmt:
+		ALTER DOMAIN_P qualified_name alter_domain_action
+			{
+				st := $4.(alterDomainOp)(qnLastPart($3))
+				$$ = alterDomainAt($<p>1, st)
+			}
+
+alter_domain_action:
+		SET NOT NULL_P                        { $$ = altDomAction("setnotnull") }
+	| DROP NOT NULL_P                         { $$ = altDomAction("dropnotnull") }
+	| SET DEFAULT a_expr                      { e := $3; $$ = altDomDefault(e) }
+	| DROP DEFAULT                            { $$ = altDomAction("dropdefault") }
+	| ADD_P check_body                        { $$ = altDomAddCheck(yylex, "", $<p>2) }
+	| ADD_P CONSTRAINT ColId check_body       { $$ = altDomAddCheck(yylex, $3, $<p>4) }
+	| DROP CONSTRAINT opt_if_exists_drop ColId { $$ = altDomDropConstraint($3, $4) }
+	| RENAME CONSTRAINT ColId TO ColId        { $$ = altDomRenameConstraint($3, $5) }
+	| RENAME TO ColId                         { $$ = altDomRenameTo($3) }
+	| OWNER TO alter_fn_owner                 { $$ = altDomOwner($3) }

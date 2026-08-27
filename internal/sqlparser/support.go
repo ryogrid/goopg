@@ -2742,8 +2742,14 @@ func rawTypeSpan(l yyLexer, from int) string {
 				}
 			}
 		}
-		if depth == 0 && t.Kind != parser.TokenSymbol && strings.EqualFold(t.Value, "collate") {
-			return strings.Join(parts, " ")
+		if depth == 0 && t.Kind != parser.TokenSymbol {
+			// COLLATE opens the next clause; CASCADE / RESTRICT end an ALTER
+			// TYPE attribute subcommand (parseAttrTypeTokens stops on all
+			// three), and none of them can be part of a type name.
+			switch strings.ToLower(t.Value) {
+			case "collate", "cascade", "restrict":
+				return strings.Join(parts, " ")
+			}
 		}
 		parts = append(parts, t.Value)
 	}
@@ -2770,14 +2776,21 @@ func domainNoop() domainOp { return func(*parser.CreateDomainStmt) {} }
 // The adapter has already folded `CHECK ( ... )` into one terminal whose pos is
 // the '(', so the body is read back out of the token stream here.
 func domainCheck(l yyLexer, name string, openParen int) domainOp {
+	expr, vals := domainCheckParts(l, openParen)
+	return func(d *parser.CreateDomainStmt) {
+		d.Checks = append(d.Checks, parser.NewDomainCheckClause(name, expr, vals))
+	}
+}
+
+// domainCheckParts is the shared reader behind CREATE DOMAIN's check list and
+// ALTER DOMAIN ADD CONSTRAINT: exactly one of (expr, inValues) is populated.
+func domainCheckParts(l yyLexer, openParen int) (string, []string) {
 	st, ok := l.(*lexerState)
 	if !ok {
-		return domainNoop()
+		return "", nil
 	}
 	if vals, ok := domainCheckInValues(st, openParen); ok {
-		return func(d *parser.CreateDomainStmt) {
-			d.Checks = append(d.Checks, parser.NewDomainCheckClause(name, "", vals))
-		}
+		return "", vals
 	}
 	var parts []string
 	depth := 0
@@ -2805,10 +2818,7 @@ func domainCheck(l yyLexer, name string, openParen int) domainOp {
 			parts = append(parts, t.Value)
 		}
 	}
-	expr := strings.Join(parts, " ")
-	return func(d *parser.CreateDomainStmt) {
-		d.Checks = append(d.Checks, parser.NewDomainCheckClause(name, expr, nil))
-	}
+	return strings.Join(parts, " "), nil
 }
 
 // domainCheckInValues recognises `( VALUE [::type] IN ( v, ... ) )` and returns
@@ -3269,5 +3279,207 @@ func applyExtOpts(st *parser.CreateExtensionStmt, v any) {
 		if f, ok := raw.(extOp); ok {
 			f(st)
 		}
+	}
+}
+
+// altSeqOp is one ALTER SEQUENCE option. Unlike CREATE SEQUENCE's, the NO
+// forms are RECORDED: a sequence already has values, so "reset to the type
+// default" is a different statement from "leave unchanged".
+type altSeqOp func(*parser.AlterSequenceStmt)
+
+func altSeqDataType(name string) altSeqOp {
+	n := lowerIdent(name)
+	return func(s *parser.AlterSequenceStmt) { s.DataType = n }
+}
+
+func altSeqInt(which string, n int64) altSeqOp {
+	v := n
+	return func(s *parser.AlterSequenceStmt) {
+		switch which {
+		case "increment":
+			s.Increment = &v
+		case "minvalue":
+			s.MinValue = &v
+		case "maxvalue":
+			s.MaxValue = &v
+		case "start":
+			s.StartWith = &v
+		case "restart":
+			s.RestartWith = &v
+		case "cache":
+			s.Cache = &v
+		}
+	}
+}
+
+func altSeqRestart() altSeqOp { return func(s *parser.AlterSequenceStmt) { s.Restart = true } }
+
+func altSeqFlag(which string) altSeqOp {
+	return func(s *parser.AlterSequenceStmt) {
+		switch which {
+		case "cycle":
+			s.Cycle = true
+		case "nominvalue":
+			s.NoMinValue = true
+		case "nomaxvalue":
+			s.NoMaxValue = true
+		case "nocycle":
+			s.NoCycle = true
+		}
+	}
+}
+
+func altSeqLogged(v string) altSeqOp {
+	s := v
+	return func(a *parser.AlterSequenceStmt) { a.SetLogged = s }
+}
+
+// altSeqOwnedBy — `OWNED BY NONE` clears the owner, which is distinct from an
+// absent clause, so it sets its own flag rather than storing an empty string.
+func altSeqOwnedBy(owner string) altSeqOp {
+	o := owner
+	return func(s *parser.AlterSequenceStmt) {
+		if o == "" {
+			s.ClearOwnedBy = true
+			return
+		}
+		s.OwnedBy = o
+	}
+}
+
+func applyAlterSeqOpts(st *parser.AlterSequenceStmt, v any) {
+	for _, raw := range asAnySlice(v) {
+		if f, ok := raw.(altSeqOp); ok {
+			f(st)
+		}
+	}
+}
+
+// enumPos carries ALTER TYPE ... ADD VALUE's optional BEFORE / AFTER anchor.
+type enumPos struct {
+	before string
+	after  string
+}
+
+type alterTypeOp func(*parser.AlterTypeStmt)
+
+func altTypeAddValue(ifNotExists bool, label string, pos *enumPos) alterTypeOp {
+	return func(a *parser.AlterTypeStmt) {
+		a.AddValue, a.IfNotExists = label, ifNotExists
+		a.Before, a.After = pos.before, pos.after
+	}
+}
+
+func altTypeRenameValue(old, new_ string) alterTypeOp {
+	o, n := old, new_
+	return func(a *parser.AlterTypeStmt) { a.RenameOldValue, a.RenameNewValue = o, n }
+}
+
+func altTypeRenameTo(name string) alterTypeOp {
+	n := name
+	return func(a *parser.AlterTypeStmt) { a.RenameTo = n }
+}
+
+func altTypeOwner(name string) alterTypeOp {
+	n := name
+	return func(a *parser.AlterTypeStmt) { a.NewOwner = n }
+}
+
+func altTypeAddAttr(name, typ, collation string) alterTypeOp {
+	n, ty, c := name, typ, collation
+	return func(a *parser.AlterTypeStmt) {
+		a.AddAttrName, a.AddAttrType, a.AddAttrCollation = n, ty, c
+	}
+}
+
+// alterDomainOp builds the statement from the domain name, which the action
+// rule does not have: the name is parsed before the action.
+type alterDomainOp func(name string) *parser.AlterDomainStmt
+
+func altDomAction(action string) alterDomainOp {
+	a := action
+	return func(name string) *parser.AlterDomainStmt {
+		return parser.NewAlterDomainStmt(0, name, a)
+	}
+}
+
+func altDomDefault(e parser.Expr) alterDomainOp {
+	return func(name string) *parser.AlterDomainStmt {
+		st := parser.NewAlterDomainStmt(0, name, "setdefault")
+		st.DefaultExpr = e
+		return st
+	}
+}
+
+// altDomAddCheck reuses the domain-CHECK reader: the same `VALUE IN (...)`
+// special case and the same raw token join with VALUE upper-cased.
+func altDomAddCheck(l yyLexer, cname string, openParen int) alterDomainOp {
+	expr, vals := domainCheckParts(l, openParen)
+	return func(name string) *parser.AlterDomainStmt {
+		st := parser.NewAlterDomainStmt(0, name, "addconstraint")
+		st.ConstraintName, st.CheckExpr, st.CheckInValues = cname, expr, vals
+		return st
+	}
+}
+
+func altDomDropConstraint(ifExists bool, cname string) alterDomainOp {
+	ie, c := ifExists, cname
+	return func(name string) *parser.AlterDomainStmt {
+		st := parser.NewAlterDomainStmt(0, name, "dropconstraint")
+		st.ConstraintName, st.IfExists = c, ie
+		return st
+	}
+}
+
+func altDomRenameConstraint(old, new_ string) alterDomainOp {
+	o, n := old, new_
+	return func(name string) *parser.AlterDomainStmt {
+		st := parser.NewAlterDomainStmt(0, name, "renameconstraint")
+		st.ConstraintName, st.NewConstraintName = o, n
+		return st
+	}
+}
+
+func altDomRenameTo(newName string) alterDomainOp {
+	n := newName
+	return func(name string) *parser.AlterDomainStmt {
+		st := parser.NewAlterDomainStmt(0, name, "rename")
+		st.NewName = n
+		return st
+	}
+}
+
+func altDomOwner(owner string) alterDomainOp {
+	o := owner
+	return func(name string) *parser.AlterDomainStmt {
+		st := parser.NewAlterDomainStmt(0, name, "owner")
+		st.NewOwner = o
+		return st
+	}
+}
+
+// alterDomainAt re-stamps the statement with its real position: the action
+// rule builds the node before the position is known and pos is unexported.
+func alterDomainAt(pos int, st *parser.AlterDomainStmt) parser.Stmt {
+	out := parser.NewAlterDomainStmt(pos, st.Name, st.Action)
+	out.NewName, out.NewOwner = st.NewName, st.NewOwner
+	out.ConstraintName, out.NewConstraintName = st.ConstraintName, st.NewConstraintName
+	out.CheckExpr, out.CheckInValues = st.CheckExpr, st.CheckInValues
+	out.IfExists, out.DefaultExpr = st.IfExists, st.DefaultExpr
+	return out
+}
+
+// altTypeAttrCmds records the comma-separated attribute subcommand list and
+// mirrors the first into the scalar fields, exactly as legacy's
+// mirrorFirstAttrCmd does.
+func altTypeAttrCmds(v any) alterTypeOp {
+	cmds := asAnySlice(v)
+	return func(a *parser.AlterTypeStmt) {
+		for _, raw := range cmds {
+			if c, ok := raw.(parser.AlterTypeAttrCmd); ok {
+				a.AttrCmds = append(a.AttrCmds, c)
+			}
+		}
+		parser.MirrorFirstAttrCmd(a)
 	}
 }

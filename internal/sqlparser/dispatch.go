@@ -259,7 +259,8 @@ var routedCreatePairs = map[string]map[string]bool{
 		"extension": true, "policy": true}, // P5.9
 	"alter": {"table": true,
 		"function": true, "procedure": true, "routine": true, // P5.6
-		"schema": true}, // P5.9
+		"schema": true, // P5.9
+		"sequence": true, "type": true, "domain": true}, // P5.10
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
 		"type": true, "domain": true, // P5.5
@@ -325,6 +326,9 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 	if key == "create" && (second == "function" || second == "procedure") {
 		return createRoutineRouted(frag)
 	}
+	if key == "alter" && second == "domain" {
+		return alterDomainRouted(frag)
+	}
 	return true
 }
 
@@ -362,6 +366,33 @@ func commentRouted(frag []parser.Token) bool {
 			continue
 		}
 		return commentKinds[w]
+	}
+	return false
+}
+
+// alterDomainActions names the ALTER DOMAIN actions the grammar covers. Every
+// other one — VALIDATE CONSTRAINT is the one that shows up — falls through in
+// legacy to a CompatNoopStmt built by a skip-to-semicolon scan, so it stays on
+// the legacy path. Widen this together with alter_domain_action.
+var alterDomainActions = map[string]bool{
+	"set": true, "drop": true, "add": true, "rename": true, "owner": true,
+}
+
+func alterDomainRouted(frag []parser.Token) bool {
+	// frag is ALTER DOMAIN <name> <action> ...; the name may be dotted.
+	seen := 0
+	for _, tok := range frag[2:] {
+		if tok.Kind == parser.TokenSymbol && tok.Value == "." {
+			seen = 0 // a dot means the name continues
+			continue
+		}
+		if tok.Kind != parser.TokenKeyword && tok.Kind != parser.TokenIdent {
+			continue
+		}
+		seen++
+		if seen == 2 {
+			return alterDomainActions[strings.ToLower(tok.Value)]
+		}
 	}
 	return false
 }

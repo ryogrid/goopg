@@ -141,3 +141,20 @@ func assertBothReject(t *testing.T, q string) {
 		t.Errorf("yacc ACCEPTS %q but legacy rejects it", q)
 	}
 }
+
+// assertNotRouted pins a statement the dispatcher must LEAVE on the legacy
+// path — typically because legacy answers it with a CompatNoopStmt built by a
+// skip-to-semicolon scan, which a grammar cannot reproduce without accepting
+// arbitrary token soup. Routing one of these would turn a working statement
+// into a 42601, since routeBatch never falls back.
+func assertNotRouted(t *testing.T, q string) {
+	t.Helper()
+	toks, err := parser.Lex(q)
+	if err != nil {
+		t.Fatalf("lex %q: %v", q, err)
+	}
+	frags := SplitStatements(toks)
+	if len(frags) == 1 && fragmentRouted(frags[0]) {
+		t.Errorf("%q is routed, but the grammar does not cover it", q)
+	}
+}

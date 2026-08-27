@@ -839,3 +839,40 @@ func NewCreatePolicyStmt(pos int, name string, table ObjectName) *CreatePolicySt
 	// Permissive and "all" are the defaults an omitted AS / FOR clause leaves.
 	return &CreatePolicyStmt{pos: pos, Name: name, Table: table, Permissive: true, Command: "all"}
 }
+
+// ---------------------------------------------------------------------------
+// P5.10 ALTER SEQUENCE / TYPE / DOMAIN
+// ---------------------------------------------------------------------------
+
+func NewAlterSequenceStmt(pos int, name ObjectName, ifExists bool) *AlterSequenceStmt {
+	return &AlterSequenceStmt{pos: pos, Name: name, IfExists: ifExists}
+}
+
+func NewAlterTypeStmt(pos int, name ObjectName) *AlterTypeStmt {
+	return &AlterTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
+}
+
+func NewAlterDomainStmt(pos int, name, action string) *AlterDomainStmt {
+	return &AlterDomainStmt{pos: pos, Name: name, Action: action}
+}
+
+func NewAlterTypeAttrCmd(kind, name, typ, collation string, ifExists bool) AlterTypeAttrCmd {
+	return AlterTypeAttrCmd{Kind: kind, Name: name, Type: typ, Collation: collation, IfExists: ifExists}
+}
+
+// MirrorFirstAttrCmd copies AttrCmds[0] into AlterTypeStmt's legacy scalar
+// fields, which the executor consults when there is at most one subcommand.
+func MirrorFirstAttrCmd(s *AlterTypeStmt) {
+	if len(s.AttrCmds) == 0 {
+		return
+	}
+	c := s.AttrCmds[0]
+	switch c.Kind {
+	case "add":
+		s.AddAttrName, s.AddAttrType, s.AddAttrCollation = c.Name, c.Type, c.Collation
+	case "drop":
+		s.DropAttrName, s.DropAttrIfExists = c.Name, c.IfExists
+	case "alter":
+		s.AlterAttrName, s.AlterAttrType, s.AlterAttrCollation = c.Name, c.Type, c.Collation
+	}
+}
