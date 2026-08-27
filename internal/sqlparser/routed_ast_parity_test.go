@@ -118,6 +118,7 @@ func TestRawSpanQuotedTailParity(t *testing.T) {
 // canonical dumps.
 func assertParity(t *testing.T, q string) {
 	t.Helper()
+	recordGolden(q, yaccDump(q))
 	l, n, err := diffParse(q)
 	if err != nil {
 		t.Errorf("%q -> %v", q, err)
@@ -134,6 +135,7 @@ func assertParity(t *testing.T, q string) {
 // explicit guard for that direction.
 func assertBothReject(t *testing.T, q string) {
 	t.Helper()
+	recordGolden(q, yaccDump(q))
 	if _, err := parser.Parse(q); err == nil {
 		t.Fatalf("legacy ACCEPTS %q — this guard assumes it does not", q)
 	}
