@@ -44,6 +44,7 @@ type lexerState struct {
 	lastPos  int    // absolute Pos of last returned token
 	fragEnd  int    // exclusive end offset of fragment's last real token; trailing ';' excluded
 	endMark  int    // optional explicit span end (>=0); set by with_data_kw
+	genSpanEnd int  // span end for a generated-column expression: the ')' position
 	prevPos  int    // absolute Pos of the token before that (mid-rule pos capture)
 
 	// base_yylex one-token pushback (base_yylex.go)
@@ -331,6 +332,12 @@ var knownTypeNames = map[string]string{
 	"pg_lsn": "pg_lsn", "timestamptz": "timestamptz", "timetz": "timetz",
 }
 
+// scanSelfChars is scan.l's {self} set verbatim
+// (postgres/src/backend/parser/scan.l:366). Any OTHER single-character
+// operator is part of {op_chars} and reaches the grammar as Op, exactly as
+// upstream does.
+const scanSelfChars = `,()[].;:+-*/%^<>=`
+
 // next returns the next terminal after base_yylex substitution.
 func (l *lexerState) next() lexResult {
 	if l.pushed {
@@ -422,10 +429,16 @@ func (l *lexerState) mapToken(i int) lexResult {
 		if name, ok := namedOperator[t.Value]; ok {
 			return lexResult{term: resolve(name), str: t.Value, pos: t.Pos, text: t.Value}
 		}
-		if len(t.Value) == 1 {
+		if len(t.Value) == 1 && strings.ContainsRune(scanSelfChars, rune(t.Value[0])) {
 			// scan.l's {self} set: single-char operators are char-literal
 			// terminals upstream — ASCII code per the yylex1 contract
 			// (tables.go). The legacy lexer emits them as TokenOperator.
+			//
+			// The membership test is load-bearing. Treating EVERY one-character
+			// operator as a char terminal made `~`, `&`, `#`, `|`, `@` and `?`
+			// unreachable, because the grammar declares only the {self}
+			// characters: `a ~ 'x'` was a syntax error while its multi-character
+			// siblings `!~` and `~*` parsed fine, since those reach Op.
 			return lexResult{term: int(t.Value[0]), str: t.Value, pos: t.Pos, text: t.Value}
 		}
 		return lexResult{term: resolve("Op"), str: t.Value, pos: t.Pos, text: t.Value}

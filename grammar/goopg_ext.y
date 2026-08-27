@@ -42,6 +42,11 @@ create_table_stmt:
 						cd.Primary = c.primary
 						cd.Unique = c.unique
 						cd.UniqueNullsNotDistinct = c.nullsNotDistinct
+						cd.GeneratedAlways = c.genAlways
+						cd.GeneratedExpr = c.genExpr
+						cd.GeneratedVirtual = c.genVirtual
+						cd.IdentityColumn = c.identity
+						cd.IdentityAlways = c.identityAlways
 						// The attrs attach to whichever constraint the column
 						// actually declared (legacy threads pointers to the
 						// specific flag pair).
@@ -274,6 +279,8 @@ table_element:
 				cs.checkText, cs.fkInfo = cc.checkText, cc.fk
 				cs.nullsNotDistinct = cc.nullsNotDistinct
 				cs.deferrable, cs.initiallyDeferred = cc.deferrable, cc.initiallyDeferred
+				cs.genExpr, cs.genAlways, cs.genVirtual = cc.genExpr, cc.genAlways, cc.genVirtual
+				cs.identity, cs.identityAlways = cc.identity, cc.identityAlways
 				$$ = &tableElem{col: cs}
 			}
 	| PRIMARY KEY pk_cols opt_include opt_constr_attrs
@@ -612,6 +619,13 @@ index_col:
    CollateExpr, and the key form below is name_or_call rather than a_expr
    precisely so a trailing opclass ColId cannot be mistaken for a continuation
    of an expression (VARYING / FILTER / YEAR ... all did). */
+/* gen_storage — STORED | VIRTUAL. Also pins the generated expression's span
+   end, because by the time the outer action runs the ')' is no longer the last
+   consumed token. */
+gen_storage:
+		STORED    { yylex.(*lexerState).genSpanEnd = yylex.(*lexerState).prevPos; $$ = false }
+	| VIRTUAL     { yylex.(*lexerState).genSpanEnd = yylex.(*lexerState).prevPos; $$ = true }
+
 opt_index_collate:
 		/* empty */   { $$ = "" }
 	| COLLATE ColId   { $$ = $2 }

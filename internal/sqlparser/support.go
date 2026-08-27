@@ -592,6 +592,11 @@ type colSpec struct {
 	nullsNotDistinct  bool
 	deferrable        bool
 	initiallyDeferred bool
+	genExpr           string
+	genAlways         bool
+	genVirtual        bool
+	identity          bool
+	identityAlways    bool
 	notNull  bool
 	primary  bool
 	unique   bool
@@ -631,6 +636,11 @@ type colConstraints struct {
 	deferrable        bool
 	initiallyDeferred bool
 	nullsNotDistinct  bool
+	genExpr           string
+	genAlways         bool
+	genVirtual        bool
+	identity          bool
+	identityAlways    bool
 	notNull    bool
 	primary    bool
 	unique     bool
