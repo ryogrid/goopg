@@ -394,6 +394,17 @@ func (l *lexerState) next() lexResult {
 		// `text '...'` or `json '...'`. The SCONST lookahead is what makes this
 		// unambiguous — no valid statement has a column reference or alias
 		// immediately followed by a string literal.
+		// `char(20) 'characters'` — the bpchar/varchar family may carry a
+		// typmod between the type name and the string, and legacy IGNORES it
+		// (char_typmod_literal_test.go). Folding here rather than in the
+		// grammar keeps CHAR_P/VARCHAR out of a second reduction: they are
+		// col_name_keywords, so a `char_lit_name` nonterminal was 3
+		// reduce/reduce conflicts against col_name_keyword.
+		if cur.term > 0 && charTypmodFamily[lower] {
+			if s2, ok := l.peekCharTypmodLit(); ok {
+				return lexResult{term: resolve("TYPEDLIT"), str: knownTypeNames[lower] + "\x1f" + s2, pos: cur.pos, text: cur.text}
+			}
+		}
 		if cur.term > 0 {
 			if nxt := l.peek(); nxt.term == resolve("SCONST") {
 				l.i++ // consume the SCONST too
@@ -453,6 +464,29 @@ func (l *lexerState) checkFollowsWith() bool {
 	p := l.toks[l.i-2]
 	return (p.Kind == parser.TokenKeyword || p.Kind == parser.TokenIdent) &&
 		strings.EqualFold(p.Value, "with")
+}
+
+// charTypmodFamily names the three types whose typed-literal spelling may
+// carry a typmod. Upstream restricts the form to bpchar/varchar the same way.
+var charTypmodFamily = map[string]bool{"char": true, "bpchar": true, "varchar": true}
+
+// peekCharTypmodLit matches `( ICONST ) SCONST` after a type name and consumes
+// it, returning the string. The typmod itself is discarded: legacy stores only
+// the raw literal.
+func (l *lexerState) peekCharTypmodLit() (string, bool) {
+	i := l.i
+	if i+3 >= len(l.toks) {
+		return "", false
+	}
+	open, num, close_, str := l.toks[i], l.toks[i+1], l.toks[i+2], l.toks[i+3]
+	if open.Kind != parser.TokenSymbol || open.Value != "(" ||
+		num.Kind != parser.TokenIntLit ||
+		close_.Kind != parser.TokenSymbol || close_.Value != ")" ||
+		str.Kind != parser.TokenStringLit {
+		return "", false
+	}
+	l.i = i + 4
+	return str.Value, true
 }
 
 // peek maps the next raw token WITHOUT consuming it (a pure function of the

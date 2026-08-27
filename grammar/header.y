@@ -70,6 +70,7 @@ import (
 	tfld   parser.TypeField
 	nodes  []any
 	copts  []parser.CopyOption
+	telems []*tableElem
 	copt   parser.CopyOption
 	fitems []parser.DropFunctionItem
 	ctt    *ctTail

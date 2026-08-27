@@ -80,6 +80,7 @@ create_table_stmt:
 							cd.OnUpdate = c.fkInfo.onUp
 							cd.OnDeleteSetCols = c.fkInfo.delSetCols
 							cd.FKMatchFull = c.fkInfo.matchFull
+							cd.FKNotValid, cd.FKNotEnforced = c.fkNotValid, c.fkNotEnforced
 						}
 						cols = append(cols, *cd)
 						bodyOrder = append(bodyOrder, c.name)
@@ -268,7 +269,7 @@ create_table_stmt:
 			}
 	/* Typed table — `CREATE TABLE t OF type [( col WITH OPTIONS ... )]`
 	   (gram.y :4020). The options are ColumnDefs with an EMPTY type. */
-	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name OF qualified_name opt_of_col_opts
+	| CREATE opt_create_modifier TABLE opt_if_not_exists qualified_name OF qualified_name opt_of_elements
 			{
 				ct := parser.NewCreateTableStmt(0, objectNameFromQn($5), nil, nil)
 				if pfx := $2.(*createPrefix); pfx != nil {
@@ -278,7 +279,7 @@ create_table_stmt:
 				ct.IfNotExists = $4
 				ot := objectNameFromQn($7)
 				ct.OfType = &ot
-				ct.OfTypeColumnOptions, _ = $8.([]parser.ColumnDef)
+				applyOfElements(ct, $8)
 				$$ = ct
 			}
 
@@ -354,6 +355,7 @@ table_element:
 				// nothing ever produced them: column-level CHECK and
 				// REFERENCES parsed cleanly and were then silently dropped.
 				cs.checkText, cs.fkInfo = cc.checkText, cc.fk
+				cs.fkNotValid, cs.fkNotEnforced = cc.fkNotValid, cc.fkNotEnforced
 				cs.nullsNotDistinct = cc.nullsNotDistinct
 				cs.deferrable, cs.initiallyDeferred = cc.deferrable, cc.initiallyDeferred
 				cs.genExpr, cs.genAlways, cs.genVirtual = cc.genExpr, cc.genAlways, cc.genVirtual
@@ -439,6 +441,7 @@ table_element:
 				}
 				if a, _ := $11.(*constrAttrs); a != nil {
 					fk.Deferrable, fk.InitiallyDeferred = a.deferrable, a.initiallyDeferred
+					fk.NotValid, fk.NotEnforced = a.notValid, a.notEnforced
 				}
 				$$ = &tableElem{fkDef: fk}
 			}
@@ -456,6 +459,7 @@ table_element:
 				}
 				if a, _ := $13.(*constrAttrs); a != nil {
 					fk.Deferrable, fk.InitiallyDeferred = a.deferrable, a.initiallyDeferred
+					fk.NotValid, fk.NotEnforced = a.notValid, a.notEnforced
 				}
 				$$ = &tableElem{fkDef: fk}
 			}
@@ -523,7 +527,7 @@ col_type_name:
 				if len(ct.ivCol) > 0 {
 					$$ = &typeWithArgs{ct: ct, args: ct.ivCol}
 				} else {
-					$$ = &typeWithArgs{ct: ct, args: implicitCharLen(yylex, $<p>1, ct)}
+					$$ = &typeWithArgs{ct: ct, args: implicitCharLen(yylex, $<p>1, ct), quoted: isQuotedIdentAt(yylex, $<p>1)}
 				}
 			}
 	/* `interval(3)` is not a plain typmod: legacy packs the precision together
@@ -643,13 +647,22 @@ partof_col_opts:
 	| partof_col_opts PRIMARY KEY                                         { $$ = $1 }
 	| partof_col_opts CHECKBODY                                           { $$ = $1 }
 
-opt_of_col_opts:
-		/* empty */                    { $$ = []parser.ColumnDef(nil) }
-	| '(' of_col_opt_list ')'          { $$ = $2 }
+/* A typed table's element list takes TABLE CONSTRAINTS as well as the
+   `col WITH OPTIONS ...` entries, and may be EMPTY — `CREATE TABLE e OF et ()`
+   is legal. Constraints reuse table_element so PRIMARY KEY / UNIQUE / CHECK
+   land in the same fields they would on an ordinary CREATE TABLE. */
+opt_of_elements:
+		/* empty */                    { $$ = []*tableElem(nil) }
+	| '(' ')'                          { $$ = []*tableElem{} }
+	| '(' of_element_list ')'          { $$ = $2 }
 
-of_col_opt_list:
-		of_col_opt                       { $$ = []parser.ColumnDef{$1.(parser.ColumnDef)} }
-	| of_col_opt_list ',' of_col_opt     { $$ = append($1.([]parser.ColumnDef), $3.(parser.ColumnDef)) }
+of_element_list:
+		of_element                       { $$ = []*tableElem{$1.(*tableElem)} }
+	| of_element_list ',' of_element     { $$ = append($1, $3.(*tableElem)) }
+
+of_element:
+		of_col_opt        { cd := $1.(parser.ColumnDef); $$ = &tableElem{ofCol: &cd} }
+	| table_element       { $$ = $1 }
 
 of_col_opt:
 		ColId WITH OPTIONS col_constraints
@@ -893,6 +906,9 @@ with_value:
 	| ON         { $$ = "on" }
 	| ColId      { $$ = $1 } /* covers off, heap, ... */
 	| '-' with_value { $$ = "-" + $2 } /* n_distinct = -0.5 */
+	/* An explicit plus sign is legal too (`autovacuum_vacuum_cost_delay = +5`)
+	   and legacy keeps it in the stored text. */
+	| '+' with_value { $$ = "+" + $2 }
 
 /* create_index_stmt / drop_index_stmt — P4.4 (gram.y IndexStmt / DropStmt
    subsets). v0: plain column keys (expressions, DESC/NULLS, opclasses and
@@ -989,7 +1005,7 @@ index_col:
    consumed token. */
 opt_index_collate:
 		/* empty */   { $$ = "" }
-	| COLLATE ColId   { $$ = $2 }
+	| COLLATE collation_name { $$ = $2 }
 
 /* IDENT, not ColId: an opclass name is always a real identifier
    (float8_ops, text_pattern_ops), and ColId also admits FILTER and WITHIN,
@@ -3318,6 +3334,8 @@ alter_type_action:
 		ADD_P VALUE_P opt_if_not_exists SCONST opt_enum_pos
 			{ $$ = altTypeAddValue($3, $4, $5.(*enumPos)) }
 	| RENAME VALUE_P SCONST TO SCONST      { $$ = altTypeRenameValue($3, $5) }
+	| RENAME ATTRIBUTE attr_name TO attr_name opt_drop_behavior
+			{ $$ = altTypeRenameAttr($3, $5) }
 	| RENAME TO ColId                      { $$ = altTypeRenameTo($3) }
 	| OWNER TO alter_fn_owner              { $$ = altTypeOwner($3) }
 	/* The attribute subcommands are a COMMA-SEPARATED list, and AttrCmds[0] is
@@ -3332,12 +3350,19 @@ attr_cmd_list:
 	| attr_cmd_list ',' attr_cmd       { $$ = append($1, $3) }
 
 attr_cmd:
-		ADD_P ATTRIBUTE ColId fn_type opt_field_collate opt_drop_behavior
+		ADD_P ATTRIBUTE attr_name fn_type opt_field_collate opt_drop_behavior
 			{ $$ = parser.NewAlterTypeAttrCmd("add", lowerIdent($3), rawTypeSpan(yylex, $<p>4), $5, false) }
-	| DROP ATTRIBUTE opt_if_exists_drop ColId opt_drop_behavior
+	| DROP ATTRIBUTE opt_if_exists_drop attr_name opt_drop_behavior
 			{ $$ = parser.NewAlterTypeAttrCmd("drop", lowerIdent($4), "", "", $3) }
-	| ALTER ATTRIBUTE ColId opt_set_data TYPE_P fn_type opt_field_collate opt_drop_behavior
+	| ALTER ATTRIBUTE attr_name opt_set_data TYPE_P fn_type opt_field_collate opt_drop_behavior
 			{ $$ = parser.NewAlterTypeAttrCmd("alter", lowerIdent($3), rawTypeSpan(yylex, $<p>6), $7, false) }
+
+/* Legacy reads an attribute name with parseIdent, which takes any TokenIdent —
+   and goopg's lexer emits ONLY as one, so `ADD ATTRIBUTE only int` is legal
+   there while a plain ColId would refuse it. */
+attr_name:
+		ColId      { $$ = $1 }
+	| ONLY         { $$ = "only" }
 
 opt_set_data:
 		/* empty */   { }

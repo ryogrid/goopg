@@ -25,7 +25,6 @@ import (
 // this map in the same commit.
 var notYetPortedKeywords = map[string]string{
 	// reserved_keyword
-	"ASYMMETRIC":  "BETWEEN ASYMMETRIC (only SYMMETRIC is ported)",
 	"GRANT":       "P6.6 GRANT/REVOKE",
 	"SYSTEM_USER": "DELIBERATE AND PERMANENT: parser.IsNoParenFuncName does not list it, so legacy treats it as a bare identifier. Adding it to sql_value_func_name would CREATE a parity diff, not fix one (see grammar/pg_grammar.y func_expr_common_subexpr).",
 

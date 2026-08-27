@@ -148,7 +148,7 @@
 %type <exprs>	array_expr array_expr_list substr_list overlay_list position_list
 %type <exprs>	trim_list
 %type <str>	sort_using_op constr_name func_name_keyword opt_part_opclass
-%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause paren_tail partof_elem partof_elem_list partof_col_opts opt_of_col_opts of_col_opt of_col_opt_list opt_identity_seq_opts identity_seq_opt_list identity_seq_opt
+%type <node>	part_elem part_elem_list opt_subpartition_by ctas_source into_clause paren_tail partof_elem partof_elem_list partof_col_opts of_col_opt opt_identity_seq_opts identity_seq_opt_list identity_seq_opt
 %type <i64>	signed_iconst
 %type <expr>	opt_paren_limit opt_paren_offset
 %type <exprs>	opt_execute_params
@@ -193,13 +193,17 @@
 %type <strs>	opt_locked_rels
 %type <exprs>	values_item_list
 %type <expr>	values_item
-%type <str>	set_guc_name set_value_list set_value_atom
+%type <ival>	like_op
+%type <str>	attr_name
+%type <str>	collation_name set_guc_name set_value_list set_value_atom
 %type <b>	opt_transaction opt_savepoint_kw
 %type <stmt>	set_transaction_stmt
 %type <stmt>	refresh_matview_stmt drop_matview_stmt
 %type <b>	opt_concurrently
 %type <stmt>	explainable_stmt merge_stmt copy_stmt alter_index_stmt alter_view_stmt listen_stmt notify_stmt unlisten_stmt alter_matview_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
+%type <telems>	opt_of_elements of_element_list
+%type <node>	of_element
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
 %type <str>	str_pair
@@ -314,6 +318,11 @@ explainable_stmt:
 				$$ = parser.NewExplainStmt($<p>1, o, $3)
 			}
 	| EXPLAIN ANALYZE VERBOSE explainable_stmt
+			{
+				o := parser.ExplainOptions{Analyze: true, Verbose: true}
+				o.Set.Analyze, o.Set.Verbose = true, true
+				$$ = parser.NewExplainStmt($<p>1, o, $4)
+			}	| EXPLAIN VERBOSE ANALYZE explainable_stmt
 			{
 				o := parser.ExplainOptions{Analyze: true, Verbose: true}
 				o.Set.Analyze, o.Set.Verbose = true, true
@@ -763,8 +772,14 @@ opt_constr_attrs:
 		/* empty */                    { $$ = (*constrAttrs)(nil) }
 	| opt_constr_attrs constr_attr     { a, _ := $1.(*constrAttrs); $$ = mergeConstrAttr(a, $2) }
 
+/* NOT VALID and [NOT] ENFORCED ride the same trailer as the deferrability
+   words — a table-level FOREIGN KEY takes them, and so does a column-level
+   REFERENCES. Legacy parses and DROPS all three, so they carry no marker. */
 constr_attr:
-		DEFERRABLE          { $$ = "deferrable" }
+		NOT VALID           { $$ = "not_valid" }
+	| NOT ENFORCED          { $$ = "not_enforced" }
+	| ENFORCED              { $$ = "enforced" }
+	| DEFERRABLE          { $$ = "deferrable" }
 	| NOT DEFERRABLE        { $$ = "not_deferrable" }
 	| INITIALLY DEFERRED    { $$ = "initially_deferred" }
 	| INITIALLY IMMEDIATE   { $$ = "initially_immediate" }
@@ -775,6 +790,9 @@ opt_include:
 
 opt_unique_nnd:
 		/* empty */                   { $$ = false }
+	/* NULLS DISTINCT is the affirmative spelling of the default, and legal
+	   wherever NULLS NOT DISTINCT is. */
+	| NULLS_P DISTINCT                { $$ = false }
 	| NULLS_P NOT DISTINCT            { $$ = true }
 
 /* for_locking_clause — gram.y :13300ff. `FOR UPDATE` and friends were absent
@@ -2404,7 +2422,7 @@ a_expr:
 	/* Generic operator terminal — gram.y `a_expr Op a_expr` (%left Op).
 	   Covers || << >> ~* !~ <@ @> && -> ->> #> #>> and any future
 	   multi-character spelling routed here by the adapter. */
-	| a_expr COLLATE ColId
+	| a_expr COLLATE collation_name
 			{
 				$$ = parser.NewCollateExpr($1.Pos(), $1, $3)
 			}
@@ -2449,18 +2467,14 @@ a_expr:
 	/* LIKE / ILIKE quantified over a list — legacy folds these into the IN
 	   shape with the pattern operator as AnyOp (OpLike / OpNotLike / OpILike),
 	   exactly like `op ANY`. */
-	| a_expr LIKE ANY '(' expr_list ')'
-			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpLike, nil, $5, $<p>5) }
-	| a_expr NOT_LA LIKE ANY '(' expr_list ')'
-			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpNotLike, nil, $6, $<p>6) }
-	| a_expr ILIKE ANY '(' expr_list ')'
-			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpILike, nil, $5, $<p>5) }
-	| a_expr LIKE ALL '(' expr_list ')'
-			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpLike, true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
-	| a_expr NOT_LA LIKE ALL '(' expr_list ')'
-			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpNotLike, true, nil, unwrapAnyArray(yylex, $6, $<p>6)) }
-	| a_expr ILIKE ALL '(' expr_list ')'
-			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpILike, true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
+	/* One rule per quantifier instead of one per (pattern-op x quantifier)
+	   pair: the four spellings and the SOME synonym are 12 combinations, and
+	   half of them (NOT ILIKE ANY / ALL / SOME, and every SOME) were simply
+	   missing. */
+	| a_expr like_op any_or_some '(' expr_list ')'
+			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, parser.OpCode($2), nil, $5, $<p>5) }
+	| a_expr like_op ALL '(' expr_list ')'
+			{ $$ = parser.NewInExpr($1.Pos(), $1, false, parser.OpCode($2), true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
 	| a_expr subq_op ANY '(' expr_list ')'
 			{
 				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), nil, $5, $<p>5)
@@ -2640,6 +2654,9 @@ a_expr:
 				$$ = buildBetween($1, $3, $5, false, false)
 			}
 	| a_expr BETWEEN SYMMETRIC b_expr AND b_expr %prec BETWEEN
+			{
+				$$ = buildBetween($1, $4, $6, false, true)
+			}	| a_expr BETWEEN ASYMMETRIC b_expr AND b_expr %prec BETWEEN
 			{
 				$$ = buildBetween($1, $4, $6, false, true)
 			}
@@ -3409,6 +3426,24 @@ ColLabel:
    ColLabel's other user is set_value_atom (goopg_ext.y:951), and admitting
    reserved words there makes `SET ROLE TO x` ambiguous — TO becomes a candidate
    VALUE for `SET ROLE`, and the shift that wins would swallow it. */
+/* A collation name may be schema-qualified; legacy's parseCollationName keeps
+   only the LAST component, so `pg_catalog."C"` and `"C"` are the same value. */
+/* The pattern operator of a quantified LIKE, as its AST Op. */
+like_op:
+		LIKE              { $$ = int(parser.OpLike) }
+	| ILIKE               { $$ = int(parser.OpILike) }
+	| NOT_LA LIKE         { $$ = int(parser.OpNotLike) }
+	| NOT_LA ILIKE        { $$ = int(parser.OpNotILike) }
+
+/* SOME is upstream's synonym for ANY (gram.y sub_type). */
+any_or_some:
+		ANY       { }
+	| SOME        { }
+
+collation_name:
+		ColId              { $$ = $1 }
+	| ColId '.' ColId      { $$ = $3 }
+
 as_col_label:
 		ColLabel          { $$ = $1 }
 	| reserved_keyword    { $$ = $1 }
@@ -3896,9 +3931,21 @@ col_constraints:
 				case "check_noinh":
 					cc.checkText, cc.checkName, cc.checkNoInherit = k.text, k.name, true
 				case "attr_not_enforced":
-					cc.checkNotEnforced = true
+					// The attribute binds to the constraint it FOLLOWS: after a
+					// REFERENCES it is the FK's, otherwise the CHECK's.
+					if cc.lastWasFK {
+						cc.fkNotEnforced = true
+					} else {
+						cc.checkNotEnforced = true
+					}
 				case "attr_enforced":
-					cc.checkNotEnforced = false
+					if cc.lastWasFK {
+						cc.fkNotEnforced = false
+					} else {
+						cc.checkNotEnforced = false
+					}
+				case "attr_not_valid":
+					cc.fkNotValid = true
 				case "null":
 					// nothing to record
 				case "storage":
@@ -3908,9 +3955,12 @@ col_constraints:
 				case "compression":
 					cc.compression = k.text
 				case "fk":
-					cc.fk = k.fk
+					cc.fk, cc.lastWasFK = k.fk, true
 				case "uq_nnd":
-					cc.unique, cc.nullsNotDistinct = true, true
+					// The CONSTRAINT name applies here exactly as it does to a
+					// plain UNIQUE; dropping it lost
+					// `CONSTRAINT u UNIQUE NULLS NOT DISTINCT`'s name.
+					cc.unique, cc.nullsNotDistinct, cc.uqName = true, true, k.name
 				case "attr_deferrable":
 					cc.deferrable = true
 				case "attr_not_deferrable":
@@ -3949,7 +3999,7 @@ col_constraint:
 	   (gram.y puts COLLATE in ColQualList; COMPRESSION sits just before it).
 	   ColId, not a_expr, so `DEFAULT x COLLATE "C"` keeps binding the COLLATE
 	   into the DEFAULT expression exactly as it did before. */
-	| COLLATE ColId       { $$ = &colConstraint{kind: "collate", text: $2} }
+	| COLLATE collation_name { $$ = &colConstraint{kind: "collate", text: $2} }
 	| COMPRESSION ColId   { $$ = &colConstraint{kind: "compression", text: $2} }
 	/* PRIMARY KEY / UNIQUE / DEFAULT used to sit at the END of fk_kw below:
 	   the FK rules (opt_ref_cols … fk_kw) were inserted between REFERENCES
@@ -3962,6 +4012,7 @@ col_constraint:
 	| PRIMARY KEY         { $$ = &colConstraint{kind: "pk"} }
 	| UNIQUE              { $$ = &colConstraint{kind: "uq"} }
 	| UNIQUE NULLS_P NOT DISTINCT { $$ = &colConstraint{kind: "uq_nnd"} }
+	| UNIQUE NULLS_P DISTINCT     { $$ = &colConstraint{kind: "uq"} }
 	/* ConstraintAttr — gram.y ColConstraint's own alternatives, NOT a trailer
 	   on each constraint element. Making them siblings in this loop is what
 	   keeps `NOT NULL` and `NOT DEFERRABLE` separable with one token of
@@ -4021,6 +4072,9 @@ col_constraint:
 	   of lookahead, and the shift that wins breaks `CHECK (x > 0) NOT NULL`. */
 	| NOT ENFORCED        { $$ = &colConstraint{kind: "attr_not_enforced"} }
 	| ENFORCED            { $$ = &colConstraint{kind: "attr_enforced"} }
+	/* NOT VALID is a list item for the same reason, and legacy parses and
+	   DROPS it on a column constraint. */
+	| NOT VALID           { $$ = &colConstraint{kind: "attr_not_valid"} }
 	| NULL_P              { $$ = &colConstraint{kind: "null"} }   /* explicit nullability: a no-op, as legacy */
 	| STORAGE ColId       { $$ = &colConstraint{kind: "storage", text: $2} }
 	| REFERENCES qualified_name opt_ref_cols opt_fk_match opt_fk_actions

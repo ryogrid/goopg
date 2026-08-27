@@ -812,6 +812,8 @@ type updWhere struct {
 type colSpec struct {
 	checkText string
 	fkInfo    *fkInfo
+	fkNotValid    bool
+	fkNotEnforced bool
 	refTable parser.ObjectName
 	refCols  []string
 	onDel    parser.FKAction
@@ -865,6 +867,9 @@ type tableElem struct {
 	asSelect   *parser.SelectStmt
 	partition  *parser.PartitionByClause
 	notNull    *tableNotNull
+	// ofCol is a typed table's `col WITH OPTIONS ...` entry: a ColumnDef with
+	// an EMPTY type, which is how legacy records it.
+	ofCol      *parser.ColumnDef
 	checkNoInh bool // table-level CHECK ... NO INHERIT
 	checkNotEnf bool // table-level CHECK ... NOT ENFORCED
 }
@@ -900,6 +905,12 @@ type colConstraints struct {
 	checkNotEnforced bool
 	storage        string
 	fk         *fkInfo
+	// fkNotValid / fkNotEnforced carry `REFERENCES ... NOT VALID` and
+	// `... NOT ENFORCED`. Legacy binds each attribute to the constraint it
+	// FOLLOWS, so lastWasFK says which of the check/fk pair the next one hits.
+	fkNotValid    bool
+	fkNotEnforced bool
+	lastWasFK     bool
 }
 
 // createTail accumulates trailing CREATE TABLE options (WITH/INHERITS/
@@ -961,6 +972,10 @@ func applyIdentityOpts(cd *parser.ColumnDef, o *identityOpts) {
 type typeWithArgs struct {
 	ct   castType
 	args []int64
+	// quoted marks a type name written as a QUOTED identifier: `"float"` names
+	// a user type and must not take the float4/float8 normalisation, exactly
+	// as ddl.go's `first.Kind != TokenQuotedIdent` guard has it.
+	quoted bool
 }
 
 // createPrefix carries CREATE [TEMP|TEMPORARY|UNLOGGED] modifiers.
@@ -1069,6 +1084,10 @@ type txModes struct {
 type constrAttrs struct {
 	deferrable        bool
 	initiallyDeferred bool
+	// NOT VALID and [NOT] ENFORCED are RECORDED, not dropped: legacy keeps
+	// them on TableForeignKeyDef and on a column's FK flags.
+	notValid    bool
+	notEnforced bool
 }
 
 func mergeConstrAttr(acc *constrAttrs, kind string) *constrAttrs {
@@ -1084,6 +1103,12 @@ func mergeConstrAttr(acc *constrAttrs, kind string) *constrAttrs {
 		acc.deferrable, acc.initiallyDeferred = true, true
 	case "initially_immediate":
 		acc.initiallyDeferred = false
+	case "not_valid":
+		acc.notValid = true
+	case "not_enforced":
+		acc.notEnforced = true
+	case "enforced":
+		acc.notEnforced = false
 	}
 	return acc
 }
@@ -2357,7 +2382,7 @@ type fnReturn struct {
 // ColumnType keeps them in a separate flag, so they are split back out here.
 func colTypeOf(tw *typeWithArgs) parser.ColumnType {
 	name, args := tw.ct.name, tw.args
-	if tw.ct.schema == "" {
+	if tw.ct.schema == "" && !tw.quoted {
 		// FLOAT [ (p) ] -> float4/float8 with the precision folded into the
 		// NAME (gram.y opt_float; ddl.go normalizeFloatTypeName). A schema
 		// qualifier means a user type that merely happens to be called float.
@@ -3641,4 +3666,66 @@ func altViewSetDefault(col string, e parser.Expr) alterViewOp {
 func altViewDropDefault(col string) alterViewOp {
 	c := col
 	return altViewAction(parser.AlterTableDropDefault, func(a *parser.AlterTableAction) { a.ColumnName = c })
+}
+
+func altTypeRenameAttr(old, new_ string) alterTypeOp {
+	o, n := old, new_
+	return func(a *parser.AlterTypeStmt) { a.RenameAttrOld, a.RenameAttrNew = o, n }
+}
+
+// applyOfElements folds a typed table's element list onto the statement. A
+// typed table takes `col WITH OPTIONS ...` entries and TABLE CONSTRAINTS, and
+// nothing else — its columns come from the type — so this handles the
+// constraint kinds and leaves the column-definition ones to the ordinary
+// CREATE TABLE path. The field choices mirror that path exactly: a NAMED
+// primary key or unique goes to NamedConstraints, a named CHECK to
+// TableNamedChecks, and an anonymous CHECK to the parallel slices.
+func applyOfElements(ct *parser.CreateTableStmt, v any) {
+	elems, _ := v.([]*tableElem)
+	for _, e := range elems {
+		if e == nil {
+			continue
+		}
+		switch {
+		case e.ofCol != nil:
+			ct.OfTypeColumnOptions = append(ct.OfTypeColumnOptions, *e.ofCol)
+		case e.pk != nil:
+			ct.PrimaryKey = e.pk
+		case e.namedPk != nil:
+			ct.NamedConstraints = append(ct.NamedConstraints, *e.namedPk)
+		case e.namedUq != nil:
+			ct.NamedConstraints = append(ct.NamedConstraints, *e.namedUq)
+		case e.uq != nil:
+			ct.TableUniques = append(ct.TableUniques, e.uq...)
+		case e.fkDef != nil:
+			ct.TableForeignKeys = append(ct.TableForeignKeys, *e.fkDef)
+		case e.check != "":
+			if e.checkName != "" {
+				ct.TableNamedChecks = append(ct.TableNamedChecks,
+					parser.PartitionCheckConstraint{Name: e.checkName, Expr: e.check, NoInherit: e.checkNoInh})
+				continue
+			}
+			ct.TableChecks = append(ct.TableChecks, e.check)
+			ct.TableCheckNoInherit = append(ct.TableCheckNoInherit, e.checkNoInh)
+			ct.TableCheckNotEnforced = append(ct.TableCheckNotEnforced, e.checkNotEnf)
+		}
+	}
+}
+
+
+// isQuotedIdentAt reports whether the token at byte position pos was written
+// as a quoted identifier. A quoted type name is a USER type: `"float"` must
+// not take the float4/float8 normalisation and `"char"` must not take the
+// implicit length of 1 (ddl.go guards both with `first.Kind != TokenQuotedIdent`).
+func isQuotedIdentAt(l yyLexer, pos int) bool {
+	st, ok := l.(*lexerState)
+	if !ok {
+		return false
+	}
+	for _, t := range st.toks {
+		if t.Pos == pos {
+			return t.Kind == parser.TokenQuotedIdent
+		}
+	}
+	return false
 }
