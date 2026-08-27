@@ -1333,6 +1333,10 @@ func arbiterFromExprs(items []parser.Expr) *parser.OnConflictTarget {
 	cols := make([]string, len(items))
 	exprs := make([]parser.Expr, len(items))
 	for i, e := range items {
+		// `key COLLATE "C"` in an arbiter: legacy keeps the bare column.
+		if ce, ok := e.(*parser.CollateExpr); ok {
+			e = ce.Operand
+		}
 		if cr, ok := e.(*parser.ColumnRef); ok && cr.Schema == "" && cr.Table == "" {
 			cols[i] = cr.Column
 			continue
@@ -1914,4 +1918,85 @@ func multiSetRHS(l yyLexer, e parser.Expr, pos int) parser.Expr {
 		}
 	}
 	return e
+}
+
+// explainOpt is one `name [value]` entry of an EXPLAIN option list.
+type explainOpt struct {
+	name  string
+	value string // "" = no value written
+	has   bool
+}
+
+// applyExplainOpts reproduces legacy parseExplainOneOption: each boolean
+// option sets its flag AND its Set marker (absent value = true, PG's boolean
+// spellings otherwise), FORMAT requires TEXT/XML/JSON/YAML, and an unknown
+// option or value is the same syntax error legacy raises.
+func applyExplainOpts(l yyLexer, pos int, opts []*explainOpt) parser.ExplainOptions {
+	var o parser.ExplainOptions
+	fail := func(msg string) {
+		if ls, ok := l.(*lexerState); ok && ls.err == nil {
+			ls.err = &parser.SyntaxError{Message: msg, Raw: true, Pos: pos}
+		}
+	}
+	for _, e := range opts {
+		name := strings.ToLower(e.name)
+		if name == "format" {
+			if !e.has {
+				fail("FORMAT requires a value (TEXT, XML, JSON, or YAML)")
+				continue
+			}
+			switch strings.ToLower(e.value) {
+			case "text":
+				o.Format = parser.ExplainFormatText
+			case "json":
+				o.Format = parser.ExplainFormatJSON
+			case "xml":
+				o.Format = parser.ExplainFormatXML
+			case "yaml":
+				o.Format = parser.ExplainFormatYAML
+			default:
+				fail(fmt.Sprintf("unsupported FORMAT %q (TEXT, XML, JSON, or YAML only)", e.value))
+				continue
+			}
+			o.Set.Format = true
+			continue
+		}
+		val := true
+		if e.has {
+			switch strings.ToLower(e.value) {
+			case "true", "on", "1", "yes", "t", "y":
+				val = true
+			case "false", "off", "0", "no", "f", "n":
+				val = false
+			default:
+				fail(fmt.Sprintf("invalid value for EXPLAIN option %q: %q", e.name, e.value))
+				continue
+			}
+		}
+		switch name {
+		case "analyze", "analyse":
+			o.Analyze, o.Set.Analyze = val, true
+		case "verbose":
+			o.Verbose, o.Set.Verbose = val, true
+		case "costs":
+			o.Costs, o.Set.Costs = val, true
+		case "buffers":
+			o.Buffers, o.Set.Buffers = val, true
+		case "settings":
+			o.Settings, o.Set.Settings = val, true
+		case "timing":
+			o.Timing, o.Set.Timing = val, true
+		case "summary":
+			o.Summary, o.Set.Summary = val, true
+		case "generic_plan":
+			o.GenericPlan, o.Set.GenericPlan = val, true
+		case "wal":
+			o.Wal, o.Set.Wal = val, true
+		case "memory":
+			o.Memory, o.Set.Memory = val, true
+		default:
+			fail(fmt.Sprintf("unknown EXPLAIN option %q", e.name))
+		}
+	}
+	return o
 }

@@ -79,6 +79,10 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
+%type <exprs>	arbiter_elem_list
+%type <expr>	arbiter_elem
+%type <node>	explain_opt_list explain_opt
+%type <str>	explain_opt_name explain_opt_value
 %type <node>	group_by_item group_by_list gs_list gs_elem fk_set_act opt_check_option tbl_check_tail
 %type <strs>	opt_fk_set_cols
 %type <b>	opt_fk_match opt_enforced opt_gen_storage opt_idx_nnd
@@ -211,7 +215,40 @@ stmt_list:
 			}
 
 stmt:
-		SelectStmt
+	/* EXPLAIN — gram.y ExplainStmt. The inner statement is any routed `stmt`;
+	   the dispatcher only routes an EXPLAIN whose inner statement it would
+	   route on its own (explainInnerRouted), so an unported inner class falls
+	   to legacy instead of surfacing a 42601. Bare ANALYZE / VERBOSE words and
+	   the parenthesised option list are both legacy-accepted; the list's
+	   names and values are validated by applyExplainOpts exactly as legacy's
+	   parseExplainOneOption does. */
+		EXPLAIN stmt
+			{
+				$$ = parser.NewExplainStmt($<p>1, parser.ExplainOptions{}, $2)
+			}
+	| EXPLAIN ANALYZE stmt
+			{
+				o := parser.ExplainOptions{Analyze: true}
+				o.Set.Analyze = true
+				$$ = parser.NewExplainStmt($<p>1, o, $3)
+			}
+	| EXPLAIN VERBOSE stmt
+			{
+				o := parser.ExplainOptions{Verbose: true}
+				o.Set.Verbose = true
+				$$ = parser.NewExplainStmt($<p>1, o, $3)
+			}
+	| EXPLAIN ANALYZE VERBOSE stmt
+			{
+				o := parser.ExplainOptions{Analyze: true, Verbose: true}
+				o.Set.Analyze, o.Set.Verbose = true, true
+				$$ = parser.NewExplainStmt($<p>1, o, $4)
+			}
+	| EXPLAIN '(' explain_opt_list ')' stmt
+			{
+				$$ = parser.NewExplainStmt($<p>1, applyExplainOpts(yylex, $<p>1, $3.([]*explainOpt)), $5)
+			}
+	| SelectStmt
 			{
 				// `SELECT ... INTO name` becomes a CreateTableStmt. The wrap
 				// happens HERE and not at the SelectStmt rule, because every
@@ -844,6 +881,46 @@ position_list:
 	/* b_expr first in both alternatives, so the reduce after the first
 	   argument is the same either way; an a_expr here would reduce/reduce. */
 	| b_expr ',' expr_list                 { $$ = append([]parser.Expr{$1}, $3...) }
+
+explain_opt_list:
+		explain_opt                        { $$ = []*explainOpt{$1.(*explainOpt)} }
+	| explain_opt_list ',' explain_opt     { $$ = append($1.([]*explainOpt), $3.(*explainOpt)) }
+
+/* An option is a NAME with an optional VALUE; ANALYZE / VERBOSE are keyword
+   tokens, the rest are identifiers. Values: identifiers (on, off, json, ...),
+   TRUE / FALSE, or a number. */
+explain_opt:
+		explain_opt_name                     { $$ = &explainOpt{name: $1} }
+	| explain_opt_name explain_opt_value   { $$ = &explainOpt{name: $1, value: $2, has: true} }
+
+explain_opt_name:
+		ColId         { $$ = $1 }
+	| ANALYZE         { $$ = "analyze" }
+	| ANALYSE         { $$ = "analyse" }
+	| VERBOSE         { $$ = "verbose" }
+	/* FORMAT itself is a ColId; only the adapter's FORMAT-before-JSON
+	   substitution (FORMAT_LA) needs its own alternative. json / text / xml
+	   values are ColIds too. */
+	| FORMAT_LA       { $$ = "format" }
+
+explain_opt_value:
+		ColId         { $$ = $1 }
+	| TRUE_P          { $$ = "true" }
+	| FALSE_P         { $$ = "false" }
+	| ON              { $$ = "on" }
+	| ICONST          { $$ = yylex.(*lexerState).lastText }
+	| SCONST          { $$ = $1 }
+
+/* Arbiter elements — gram.y index_elem again: an expression with an optional
+   COLLATE and operator class. Legacy DROPS both (the opclass here, the
+   COLLATE in arbiterFromExprs), so only the expression survives. */
+arbiter_elem_list:
+		arbiter_elem                        { $$ = []parser.Expr{$1} }
+	| arbiter_elem_list ',' arbiter_elem    { $$ = append($1, $3) }
+
+arbiter_elem:
+		a_expr            { $$ = $1 }
+	| a_expr IDENT        { $$ = $1 } /* opclass: parsed and dropped */
 
 sort_using_op:
 		exclude_op        { $$ = $1 }
@@ -3279,8 +3356,8 @@ opt_on_conflict:
 
 opt_arbiter:
 		/* empty */               { $$ = nil }
-	| '(' expr_list ')'           { $$ = arbiterFromExprs($2) } /* items may be expressions, not just names */
-	| '(' expr_list ')' WHERE a_expr
+	| '(' arbiter_elem_list ')'           { $$ = arbiterFromExprs($2) } /* items may be expressions, not just names */
+	| '(' arbiter_elem_list ')' WHERE a_expr
 			{
 				t := arbiterFromExprs($2)
 				t.Where = $5

@@ -25,8 +25,6 @@ import (
 // this map in the same commit.
 var notYetPortedKeywords = map[string]string{
 	// reserved_keyword
-	"ANALYSE":     "P6.5 VACUUM/ANALYZE",
-	"ANALYZE":     "P6.5 VACUUM/ANALYZE",
 	"ASYMMETRIC":  "BETWEEN ASYMMETRIC (only SYMMETRIC is ported)",
 	"GRANT":       "P6.6 GRANT/REVOKE",
 	"SYSTEM_USER": "DELIBERATE AND PERMANENT: parser.IsNoParenFuncName does not list it, so legacy treats it as a bare identifier. Adding it to sql_value_func_name would CREATE a parity diff, not fix one (see grammar/pg_grammar.y func_expr_common_subexpr).",
@@ -36,7 +34,6 @@ var notYetPortedKeywords = map[string]string{
 	"COLLATION":     "CREATE COLLATION and COLLATION FOR (plain COLLATE is reachable)",
 	"FREEZE":        "P6.5 VACUUM FREEZE",
 	"OVERLAPS":      "row OVERLAPS row (:15162) — uq_cols's WITHOUT OVERLAPS does not count, see blindRules",
-	"VERBOSE":       "P6.4 EXPLAIN VERBOSE / P6.5 VACUUM VERBOSE (func_name_keyword does not count — see blindRules)",
 	"TABLESAMPLE":   "P1.2 FROM ... TABLESAMPLE",
 }
 

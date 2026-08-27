@@ -504,3 +504,8 @@ func NewExecuteStmt(pos int, name string, params []Expr) *ExecuteStmt {
 func NewGroupingSetsSpec(pos int, sets [][]Expr) *GroupingSetsSpec {
 	return &GroupingSetsSpec{pos: pos, Sets: sets}
 }
+
+// NewExplainStmt wraps a routed statement with its EXPLAIN options.
+func NewExplainStmt(pos int, opts ExplainOptions, inner Stmt) *ExplainStmt {
+	return &ExplainStmt{pos: pos, Options: opts, Inner: inner}
+}

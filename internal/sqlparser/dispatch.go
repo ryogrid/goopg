@@ -56,6 +56,7 @@ func SplitStatements(toks []parser.Token) [][]parser.Token {
 // TestTPCHGrammarCoverage (19/22); typed-literal normalization handles
 // date/time/timestamp/interval SCONST forms.
 var routedStmts = map[string]bool{
+	"explain": true, // gated further by explainInnerRouted
 	"select": true,
 	"insert": true, // P3.1
 	"update": true, // P3.2
@@ -111,6 +112,9 @@ func fragmentRouted(frag []parser.Token) bool {
 		key := strings.ToLower(t.Value)
 		if key == "with" {
 			return withFollowerRouted(frag)
+		}
+		if key == "explain" {
+			return explainInnerRouted(frag)
 		}
 		if key == "create" || key == "drop" || key == "alter" {
 			// These lead many DDL classes; route only ported pairs by
@@ -170,6 +174,47 @@ func withFollowerRouted(toks []parser.Token) bool {
 }
 
 
+
+// explainInnerRouted routes an EXPLAIN only when the statement it wraps
+// would be routed on its own: skip the bare ANALYZE / VERBOSE words and a
+// parenthesised option list, then apply fragmentRouted to what follows. An
+// EXPLAIN over an unported class (MERGE, EXECUTE, ...) stays on legacy.
+func explainInnerRouted(frag []parser.Token) bool {
+	i := 1
+	for i < len(frag) {
+		tk := frag[i]
+		if tk.Kind == parser.TokenSymbol && tk.Value == "(" {
+			depth := 0
+			for ; i < len(frag); i++ {
+				if frag[i].Kind != parser.TokenSymbol {
+					continue
+				}
+				if frag[i].Value == "(" {
+					depth++
+				} else if frag[i].Value == ")" {
+					depth--
+					if depth == 0 {
+						i++
+						break
+					}
+				}
+			}
+			continue
+		}
+		if tk.Kind == parser.TokenKeyword || tk.Kind == parser.TokenIdent {
+			switch strings.ToLower(tk.Value) {
+			case "analyze", "analyse", "verbose":
+				i++
+				continue
+			}
+		}
+		break
+	}
+	if i >= len(frag) {
+		return false
+	}
+	return fragmentRouted(frag[i:])
+}
 
 // routedCreatePairs maps leading keyword -> set of ported second keywords.
 var routedCreatePairs = map[string]map[string]bool{
