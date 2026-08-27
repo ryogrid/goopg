@@ -280,3 +280,28 @@ func TestKnownDiffCheckThenNotNull(t *testing.T) {
 		t.Fatal("yacc parser dropped NOT NULL after CHECK")
 	}
 }
+
+// TestKnownDiffUniqueThenNotNull pins the same family one constraint over:
+// legacy's inline-UNIQUE branch ends in parseConstraintDeferrable, which
+// consumes a leading NOT while looking for `NOT DEFERRABLE` and then finds
+// DEFERRABLE missing — with the NOT already gone. `a int UNIQUE NOT NULL`
+// therefore loses its NOT NULL entirely (12 regress fragments).
+func TestKnownDiffUniqueThenNotNull(t *testing.T) {
+	const q = "CREATE TABLE t (a int UNIQUE NOT NULL)"
+	lstmts, err := parser.Parse(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lstmts[0].(*parser.CreateTableStmt).Columns[0].NotNull {
+		t.Fatal("legacy now keeps NOT NULL after UNIQUE; retire this known-diff row")
+	}
+	toks, _ := parser.Lex(q)
+	nstmts, err := ParseOneSrc(q, toks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	col := nstmts[0].(*parser.CreateTableStmt).Columns[0]
+	if !col.NotNull || !col.Unique {
+		t.Fatalf("yacc parser lost a constraint: NotNull=%v Unique=%v", col.NotNull, col.Unique)
+	}
+}

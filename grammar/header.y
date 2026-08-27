@@ -7,6 +7,7 @@
 package sqlparser
 
 import (
+	"strconv"
 
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -59,6 +60,9 @@ import (
 	ct     castType
 	isrc   *insSrc
 	onames []parser.ObjectName
+	fargs  []parser.FunctionArg
+	ivq    ivQual
+	fitems []parser.DropFunctionItem
 	ctt    *ctTail
 	wp     [2]string
 	oc     *parser.OnConflictClause

@@ -509,3 +509,82 @@ func NewGroupingSetsSpec(pos int, sets [][]Expr) *GroupingSetsSpec {
 func NewExplainStmt(pos int, opts ExplainOptions, inner Stmt) *ExplainStmt {
 	return &ExplainStmt{pos: pos, Options: opts, Inner: inner}
 }
+
+// --- CREATE FUNCTION family -------------------------------------------------
+
+func NewFunctionArg(name string, mode FuncArgMode, modeExplicit bool, typ ColumnType, def Expr) FunctionArg {
+	return FunctionArg{Name: name, Mode: mode, ModeExplicit: modeExplicit, Type: typ, Default: def}
+}
+
+func NewCreateFunctionStmt(pos int, orReplace bool, name ObjectName, args []FunctionArg) *CreateFunctionStmt {
+	return &CreateFunctionStmt{pos: pos, OrReplace: orReplace, Name: name, Args: args, Volatile: "v", Parallel: "u"}
+}
+
+func NewCreateProcedureStmt(pos int, orReplace bool, name ObjectName, args []FunctionArg) *CreateProcedureStmt {
+	return &CreateProcedureStmt{pos: pos, OrReplace: orReplace, Name: name, Args: args, Volatile: "v"}
+}
+
+func NewDropFunctionStmt(pos int, ifExists bool, name ObjectName, args []FunctionArg, behavior DropBehavior, extras []DropFunctionItem) *DropFunctionStmt {
+	return &DropFunctionStmt{pos: pos, IfExists: ifExists, Name: name, Args: args, Behavior: behavior, Extras: extras}
+}
+
+func NewDropProcedureStmt(pos int, ifExists bool, name ObjectName, names []ObjectName, args []FunctionArg, behavior DropBehavior, objKind string) *DropProcedureStmt {
+	return &DropProcedureStmt{pos: pos, IfExists: ifExists, Name: name, Names: names, Args: args, Behavior: behavior, ObjKind: objKind}
+}
+
+func NewCallStmt(pos int, name ObjectName, args []Expr, argNames []string) *CallStmt {
+	return &CallStmt{pos: pos, Name: name, Args: args, ArgNames: argNames}
+}
+
+func NewFunctionConfigOp(reset, resetAll bool, name, value string) FunctionConfigOp {
+	return FunctionConfigOp{Reset: reset, ResetAll: resetAll, Name: name, Value: value}
+}
+
+// TokenBodySQL exposes tokenBodySQL to the goyacc parser package, which
+// reconstructs `RETURN expr` function bodies with the identical rendering.
+func TokenBodySQL(t Token) string { return tokenBodySQL(t) }
+
+// IntervalQualTypmods packs an interval type qualifier (`INTERVAL <hi> [TO
+// <lo>] [(p)]`) into the two typmods legacy stores for it — which are NOT the
+// same number. The CAST path keeps only the LOW field's bit
+// (packIntervalCastTypmod) while the COLUMN path stores the full range mask
+// (packIntervalColumnTypmod), so both are computed here and the caller picks
+// the one its position needs. ok is false for a field pair PostgreSQL's
+// opt_interval grammar does not permit (e.g. MONTH TO DAY).
+//
+// prec < 0 means no `(p)` was written. hi == "" means precision-only
+// (`interval(3)`), which is the full range at that precision.
+func IntervalQualTypmods(hi, lo string, prec int) (castTypmod, colTypmod int64, ok bool) {
+	if hi == "" {
+		return packIntervalCastTypmod("", prec), packIntervalColumnTypmod(intervalFullRange, prec), true
+	}
+	if !intervalTypmodField[hi] {
+		return 0, 0, false
+	}
+	low := hi
+	if lo != "" && lo != hi {
+		l, valid := intervalRangeLowField(hi, lo)
+		if !valid {
+			return 0, 0, false
+		}
+		low = l
+	}
+	return packIntervalCastTypmod(low, prec), packIntervalColumnTypmod(intervalRangeMask(hi, low), prec), true
+}
+
+// ParseReloptionBool exposes parseReloptionBool to the goyacc parser package,
+// which must accept exactly the same spellings (on/off/true/false/yes/no/1/0)
+// for the boolean index storage parameters.
+func ParseReloptionBool(s string) (bool, bool) { return parseReloptionBool(s) }
+
+// NormalizeFloatTypeName exposes normalizeFloatTypeName to the goyacc parser
+// package. ok is false for the one input legacy rejects outright (`float(0)` —
+// "precision for type float must be at least 1 bit"); the caller keeps the raw
+// spelling in that case and lets the downstream type lookup report it.
+func NormalizeFloatTypeName(name string, args []int64) (string, []int64, bool) {
+	n, a, err := normalizeFloatTypeName(name, args, 0)
+	if err != nil {
+		return name, args, false
+	}
+	return n, a, true
+}

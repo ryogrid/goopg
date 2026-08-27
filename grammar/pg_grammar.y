@@ -79,7 +79,12 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
-%type <node>	at_constraint at_constr_tail
+%type <node>	at_constraint at_constr_tail fn_type fn_return fn_attrs fn_attr func_arg fn_drop_item opt_call_named_args call_named_arg_list call_named_arg
+%type <fargs>	opt_func_args func_arg_list_p
+%type <fitems>	fn_drop_extras
+%type <str>	fn_param_name fn_number fn_lang_name fn_set_values fn_body_list fn_config_name fn_config_value
+%type <ival>	fn_arg_mode
+%type <expr>	opt_arg_default
 %type <expr>	opt_at_using
 %type <b>	opt_detach_tail
 %type <ival>	rule_state
@@ -126,7 +131,7 @@
 %type <node>	opt_index_opclass
 %type <ival>	opclass_opt_list opclass_opt
 %type <b>	opt_index_dir
-%type <ival>	opt_index_with
+%type <node>	opt_index_with
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
 %type <str>	opt_index_name
@@ -147,7 +152,7 @@
 %type <stmt>	set_transaction_stmt
 %type <stmt>	refresh_matview_stmt drop_matview_stmt
 %type <b>	opt_concurrently
-%type <stmt>	tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
+%type <stmt>	create_function_stmt drop_function_stmt call_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
@@ -173,6 +178,8 @@
 %type <strs>	colid_list
 %type <node>	insert_rest
 %type <ct>	cast_target cast_typename
+%type <ivq>	interval_qual
+%type <str>	iv_field
 %type <ival>	opt_array_tail
 %type <exprs>	expr_list
 %type <expr>
@@ -328,6 +335,18 @@ stmt:
 				$$ = $1
 			}
 	| create_view_stmt
+			{
+				$$ = $1
+			}
+	| create_function_stmt
+			{
+				$$ = $1
+			}
+	| drop_function_stmt
+			{
+				$$ = $1
+			}
+	| call_stmt
 			{
 				$$ = $1
 			}
@@ -3187,6 +3206,23 @@ extract_field:
    from cast_ident so each input has exactly one derivation. Canonicalization
    mirrors legacy parseMultiWordTypeName (ddl.go:5278). Schema-qualified and
    array-typmod forms stay deferred (TODO P2.5). */
+/* interval_qual is deliberately NON-empty: an empty alternative here would
+   reduce right after INTERVAL and decide one token before the field keyword is
+   visible, the mid-rule trap documented in the playbook. A bare INTERVAL keeps
+   reaching cast_ident instead. */
+interval_qual:
+		iv_field                              { $$ = ivQual{hi: $1, prec: -1} }
+	| iv_field TO iv_field                    { $$ = ivQual{hi: $1, lo: $3, prec: -1} }
+	| iv_field TO iv_field '(' ICONST ')'     { $$ = ivQual{hi: $1, lo: $3, prec: $5} }
+
+iv_field:
+		YEAR_P     { $$ = "year" }
+	| MONTH_P      { $$ = "month" }
+	| DAY_P        { $$ = "day" }
+	| HOUR_P       { $$ = "hour" }
+	| MINUTE_P     { $$ = "minute" }
+	| SECOND_P     { $$ = "second" }
+
 cast_target:
 		cast_ident
 			{ $$ = castType{name: $1} }
@@ -3217,6 +3253,19 @@ cast_target:
 			{ $$ = castType{name: tzJoin("timestamp", $5), args: []int64{int64($3)}} }
 	| IDENT '.' ColId
 			{ $$ = castType{schema: $1, name: $3} }
+	/* INTERVAL <hi> [TO <lo>] [(p)] — gram.y ConstInterval opt_interval. The
+	   fields cannot ride col_type_name's trailing typmod suffix (they are bare
+	   keywords, not a parenthesised number), so `interval year to month` was a
+	   hard 42601 in EVERY routed position: column definitions and casts alike. */
+	| INTERVAL interval_qual
+			{
+				c, cl, ok := parser.IntervalQualTypmods($2.hi, $2.lo, $2.prec)
+				if !ok {
+					yylex.Error("invalid interval field combination")
+					return 1
+				}
+				$$ = castType{name: "interval", args: []int64{c}, ivCol: []int64{cl}}
+			}
 
 /* cast_typename — cast_target plus optional array suffixes ("int[]" folds
    into Name, legacy parity). */

@@ -694,6 +694,12 @@ func buildIntervalQualified(pos int, body, hi, lo string, prec int) parser.Expr 
 type castType struct {
 	schema, name string
 	args         []int64
+	// ivCol is the COLUMN-position typmod of an interval qualifier. The cast
+	// and column paths pack the same qualifier into different numbers (see
+	// parser.IntervalQualTypmods), and cast_target cannot know which position
+	// it is in, so it fills args with the cast packing — which every cast site
+	// already consumes — and parks the column packing here for col_type_name.
+	ivCol []int64
 }
 
 // withArrays appends n "[]" pairs the way legacy folds them into Name.
@@ -1124,26 +1130,88 @@ func (l *lexerState) authzIsDefaultKeyword() bool {
 	return false
 }
 
-// fillfactorFrom pulls the fillfactor out of a CREATE INDEX `WITH (...)` list.
-// Only fillfactor reaches the AST, as in legacy; other storage parameters are
-// accepted and discarded.
-func fillfactorFrom(kvs []string) int {
+// indexOpts carries the CREATE INDEX `WITH (...)` storage parameters that
+// reach the AST. Legacy records exactly these seven and silently discards
+// every other name (ddl.go:5590ff); the pointer-valued ones are three-state
+// (unset / true / false) because pg_dump re-emits only what was written.
+type indexOpts struct {
+	fillfactor       int
+	ginPendingLimit  int
+	pagesPerRange    int
+	buffering        string
+	deduplicateItems *bool
+	fastUpdate       *bool
+	autoSummarize    *bool
+}
+
+// indexOptsFrom parses the `name=value` pairs str_pair_list collected. An
+// unparsable value leaves the option unset, which is what legacy's guarded
+// `if ok { ... }` blocks do.
+func indexOptsFrom(kvs []string) *indexOpts {
+	o := &indexOpts{}
 	for _, kv := range kvs {
 		parts := splitKV(kv)
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "fillfactor") {
+		if len(parts) != 2 {
 			continue
 		}
-		n := 0
-		for _, c := range parts[1] {
-			if c < '0' || c > '9' {
-				return 0
+		name, val := strings.ToLower(parts[0]), parts[1]
+		switch name {
+		case "fillfactor":
+			o.fillfactor = reloptInt(val)
+		case "gin_pending_list_limit":
+			o.ginPendingLimit = reloptInt(val)
+		case "pages_per_range":
+			o.pagesPerRange = reloptInt(val)
+		case "buffering":
+			o.buffering = strings.ToLower(val)
+		case "deduplicate_items", "fastupdate", "autosummarize":
+			b, ok := parser.ParseReloptionBool(val)
+			if !ok {
+				continue
 			}
-			n = n*10 + int(c-'0')
+			switch name {
+			case "deduplicate_items":
+				o.deduplicateItems = &b
+			case "fastupdate":
+				o.fastUpdate = &b
+			case "autosummarize":
+				o.autoSummarize = &b
+			}
 		}
-		return n
 	}
-	return 0
+	return o
 }
+
+// reloptInt accepts only a bare run of digits, mirroring legacy's
+// `if p.cur().Kind == TokenIntLit` guard: anything else leaves the option at 0.
+func reloptInt(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
+func applyIndexOpts(ix *parser.CreateIndexStmt, v any) {
+	o, _ := v.(*indexOpts)
+	if o == nil {
+		return
+	}
+	ix.Fillfactor = o.fillfactor
+	ix.GinPendingListLimit = o.ginPendingLimit
+	ix.PagesPerRange = o.pagesPerRange
+	ix.Buffering = o.buffering
+	ix.DeduplicateItems = o.deduplicateItems
+	ix.FastUpdate = o.fastUpdate
+	ix.AutoSummarize = o.autoSummarize
+}
+
 
 // likeAllOpts is what `INCLUDING ALL` expands to in legacy's BodyOrder marker
 // encoding — the nine option names in this exact order (internal/parser).
@@ -1205,6 +1273,10 @@ type callArgs struct {
 type callArg struct {
 	expr     parser.Expr
 	variadic bool
+	// name/named are used only by CALL's argument list, whose named form
+	// keeps the name (CallStmt.ArgNames) instead of dropping it.
+	name  string
+	named bool
 }
 
 // appendCallArg adds one argument, reproducing legacy's VARIADIC array
@@ -2094,4 +2166,275 @@ func atStatValue(n int64) string { return strconv.FormatInt(n, 10) }
 func mustATTail(v any) *atConstrTail {
 	t, _ := v.(*atConstrTail)
 	return t
+}
+
+// fnAttrs accumulates CREATE FUNCTION / PROCEDURE's attribute list. Legacy
+// applies them in written order onto one statement, so the carrier mirrors the
+// statement's own fields rather than a list of clauses.
+type fnAttrs struct {
+	language        string
+	body            string
+	hasBody         bool
+	beginAtomic     bool
+	isReturnForm    bool
+	strict          bool
+	volatility      string
+	securityDefiner bool
+	leakproof       bool
+	window          bool
+	parallel        string
+	cost            string
+	rows            string
+	configOps       []parser.FunctionConfigOp
+}
+
+func newFnAttrs() *fnAttrs { return &fnAttrs{volatility: "v", parallel: "u"} }
+
+func mustFnAttrs(v any) *fnAttrs {
+	a, _ := v.(*fnAttrs)
+	if a == nil {
+		a = newFnAttrs()
+	}
+	return a
+}
+
+// applyFnAttrs copies the accumulated attributes onto a CREATE FUNCTION.
+func applyFnAttrs(st *parser.CreateFunctionStmt, a *fnAttrs) *parser.CreateFunctionStmt {
+	st.Language, st.Body = a.language, a.body
+	st.BeginAtomic, st.IsReturnForm = a.beginAtomic, a.isReturnForm
+	st.Strict, st.Volatile = a.strict, a.volatility
+	st.SecurityDefiner, st.Leakproof, st.Window = a.securityDefiner, a.leakproof, a.window
+	st.Parallel, st.Cost, st.Rows = a.parallel, a.cost, a.rows
+	st.ConfigOps = a.configOps
+	return st
+}
+
+// applyProcAttrs is the procedure's subset — CreateProcedureStmt has no
+// Leakproof / Parallel / Cost / Rows / ConfigOps fields.
+func applyProcAttrs(st *parser.CreateProcedureStmt, a *fnAttrs) *parser.CreateProcedureStmt {
+	// CREATE PROCEDURE's attribute loop (function.go parseCreateProcedureTail)
+	// handles LANGUAGE / AS / BEGIN ATOMIC / SET explicitly and sends every
+	// other attribute through consumeFunctionAttribute, which DROPS it — only
+	// WINDOW and STRICT are peeked at on the way past. So SECURITY DEFINER,
+	// the volatility words, COST and ROWS leave no trace on a procedure, and
+	// Volatile stays at its "v" default.
+	st.Language, st.Body = a.language, a.body
+	st.BeginAtomic = a.beginAtomic
+	st.Strict, st.Window = a.strict, a.window
+	return st
+}
+
+// tableArgs turns a RETURNS TABLE (...) column list into the trailing OUT
+// arguments legacy records it as.
+func tableArgs(base []parser.FunctionArg, cols []parser.FunctionArg) []parser.FunctionArg {
+	for _, c := range cols {
+		c.Mode, c.ModeExplicit = parser.FuncArgOut, true
+		base = append(base, c)
+	}
+	return base
+}
+
+// fnConfigUnset is the sentinel a SET clause returns for the two forms legacy
+// records NO config op for: `SET x FROM CURRENT` and `SET x TO DEFAULT`
+// (function.go parseFunctionConfigSetClause returns ok=false for both).
+const fnConfigUnset = "\x00\x00unset"
+
+// fnReturn carries the three shapes of a RETURNS clause: a plain type, SETOF
+// that type, or TABLE (cols) — which legacy folds into trailing OUT arguments.
+type fnReturn struct {
+	typ   parser.ColumnType
+	setof bool
+	table bool
+	cols  []parser.FunctionArg
+}
+
+// colTypeOf converts the grammar's type carrier to the AST's column type.
+// cast_typename folds array brackets into the name (castType.withArrays), but
+// ColumnType keeps them in a separate flag, so they are split back out here.
+func colTypeOf(tw *typeWithArgs) parser.ColumnType {
+	name, args := tw.ct.name, tw.args
+	if tw.ct.schema == "" {
+		// FLOAT [ (p) ] -> float4/float8 with the precision folded into the
+		// NAME (gram.y opt_float; ddl.go normalizeFloatTypeName). A schema
+		// qualifier means a user type that merely happens to be called float.
+		name, args, _ = parser.NormalizeFloatTypeName(name, args)
+	}
+	elem, isArray := trimArrayTail(name)
+	return parser.NewColumnType(tw.ct.schema, elem, args, isArray)
+}
+
+// parallelCode maps PARALLEL's word to pg_proc.proparallel's one-byte code.
+func parallelCode(s string) string {
+	switch strings.ToLower(s) {
+	case "safe":
+		return "s"
+	case "restricted":
+		return "r"
+	default:
+		return "u"
+	}
+}
+
+// fnDropBehavior mirrors parseDropFunctionTail's switch, which maps RESTRICT
+// to DropDefault (not DropRestrict) — RESTRICT is already the default and
+// legacy does not record it distinctly here.
+func fnDropBehavior(s string) parser.DropBehavior {
+	if s == "cascade" {
+		return parser.DropCascade
+	}
+	return parser.DropDefault
+}
+
+// dropProcNames reduces DROP PROCEDURE's extra targets to bare names:
+// DropProcedureStmt keeps additional names only, without their arg lists.
+func dropProcNames(extras []parser.DropFunctionItem) []parser.ObjectName {
+	if len(extras) == 0 {
+		return nil
+	}
+	out := make([]parser.ObjectName, 0, len(extras))
+	for _, e := range extras {
+		out = append(out, e.Name)
+	}
+	return out
+}
+
+// namedCallArgs accumulates CALL's argument list. Legacy fills ArgNames only
+// when at least one argument was written `name => value`; otherwise the field
+// stays nil even though every position has an (empty) name.
+type namedCallArgs struct {
+	exprs    []parser.Expr
+	argNames []string
+	hasNamed bool
+}
+
+func (c *namedCallArgs) names() []string {
+	if c == nil || !c.hasNamed {
+		return nil
+	}
+	return c.argNames
+}
+
+func appendNamedCallArg(c *namedCallArgs, a callArg) *namedCallArgs {
+	if c == nil {
+		c = &namedCallArgs{exprs: []parser.Expr{}, argNames: []string{}}
+	}
+	c.exprs = append(c.exprs, a.expr)
+	c.argNames = append(c.argNames, a.name)
+	c.hasNamed = c.hasNamed || a.named
+	return c
+}
+
+// joinBodyTokens renders every token from byte position `from` to the end of
+// the fragment (stopping at a top-level ';') the way legacy's RETURN-form body
+// does: tokenBodySQL per token, single spaces between.
+func joinBodyTokens(l yyLexer, from int) string {
+	st, ok := l.(*lexerState)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, t := range st.toks {
+		if t.Pos < from {
+			continue
+		}
+		if t.Kind == parser.TokenEOF {
+			break
+		}
+		if t.Kind == parser.TokenSymbol && t.Value == ";" {
+			break
+		}
+		parts = append(parts, parser.TokenBodySQL(t))
+	}
+	return strings.Join(parts, " ")
+}
+
+// isDefaultKeywordAt reports whether the token at byte position `pos` is the
+// DEFAULT keyword itself rather than an identifier or string that happens to
+// spell it. `SET x = DEFAULT` records no config op; `SET x = 'default'` does.
+func isDefaultKeywordAt(l yyLexer, pos int) bool {
+	st, ok := l.(*lexerState)
+	if !ok {
+		return false
+	}
+	for _, t := range st.toks {
+		if t.Pos == pos {
+			return t.Kind == parser.TokenKeyword && t.Keyword == parser.KwDefault
+		}
+	}
+	return false
+}
+
+// exprIdentName recovers the bare identifier a named CALL argument was written
+// with. The grammar has to accept a full a_expr on the left of `=>` (a ColId
+// there is reduce/reduce-ambiguous with the positional form), so the name is
+// extracted afterwards; anything that is not a bare column reference yields ""
+// and the argument is treated as positional, which is what legacy does when
+// the left side is not a TokenIdent.
+func exprIdentName(e parser.Expr) string {
+	cr, ok := e.(*parser.ColumnRef)
+	if !ok || cr.Schema != "" || cr.Table != "" {
+		return ""
+	}
+	return cr.Column
+}
+
+// implicitCharLen reproduces the implicit length-1 typmod a bare char /
+// character / nchar / national character carries (ddl.go:5196). Any explicit
+// typmod overwrites it; `bpchar` spelled directly is deliberately excluded and
+// stays unbounded, exactly as legacy has it.
+func implicitCharLen(l yyLexer, pos int, ct castType) []int64 {
+	if st, ok := l.(*lexerState); ok {
+		for _, t := range st.toks {
+			if t.Pos == pos && t.Kind == parser.TokenQuotedIdent {
+				// `"char"` names PG's one-byte internal type, not bpchar, and
+				// legacy leaves it unbounded (ddl.go:5195 excludes quoted).
+				return ct.args
+			}
+		}
+	}
+	if len(ct.args) == 0 && ct.schema == "" &&
+		(strings.EqualFold(ct.name, "char") || strings.EqualFold(ct.name, "character")) {
+		return []int64{1}
+	}
+	return ct.args
+}
+
+// ivQual carries an interval type qualifier between the grammar rule that
+// recognises it and the two packers. prec is -1 when no `(p)` was written.
+type ivQual struct {
+	hi, lo string
+	prec   int
+}
+
+// colTypmodArgs applies a trailing `( N )` typmod. Interval is the one type
+// where the number is not stored raw: legacy packs it with the full range mask
+// (packIntervalColumnTypmod), so `interval(3)` and `numeric(3)` differ.
+func colTypmodArgs(tw *typeWithArgs, n int64) []int64 {
+	if strings.EqualFold(tw.ct.name, "interval") && tw.ct.schema == "" {
+		if _, col, ok := parser.IntervalQualTypmods("", "", int(n)); ok {
+			return []int64{col}
+		}
+	}
+	return []int64{n}
+}
+
+// trimArrayTail splits the `[]` suffixes cast_typename folds into a type name
+// back into (element name, isArray) — the shape ColumnType stores.
+func trimArrayTail(name string) (string, bool) {
+	isArray := false
+	for strings.HasSuffix(name, "[]") {
+		name, isArray = strings.TrimSuffix(name, "[]"), true
+	}
+	return name, isArray
+}
+
+// tzSetStmt builds `SET [LOCAL] TIME ZONE v`, which legacy records as a plain
+// SetStmt named "timezone". DEFAULT is a Default=true statement with an empty
+// value, exactly as the generic `SET x = DEFAULT` path has it; LOCAL is an
+// ordinary value word here, not a scope.
+func tzSetStmt(local bool, v string) parser.Stmt {
+	if strings.EqualFold(v, "default") {
+		return parser.NewSetStmt(0, local, "timezone", "", true)
+	}
+	return parser.NewSetStmt(0, local, "timezone", v, false)
 }

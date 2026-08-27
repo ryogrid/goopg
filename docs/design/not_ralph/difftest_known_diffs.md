@@ -9,6 +9,7 @@ behavior via goopg_ext.y rule + note.
 |---|---|---|---|---|
 | `-5` / `-3.14` (unary minus on numeric literal) | `UnaryOp{OpUnaryNeg}` over positive const | folded negative const (`gram.y doNegate`, :10874) | folded const (ruleutils prints negated consts with explicit cast) | (b)-inverted: yacc is RIGHT; legacy divergence ledgered for a future legacy-side fix or made moot at cutover. Pinned by TestKnownDiffUnaryMinusFold. |
 | `x int CHECK (x > 0) NOT NULL` | column loop LOSES the NOT NULL after a CHECK (NotNull=false) | NotNull=true | NotNull=true | (b)-inverted: yacc is RIGHT; semantic loss in legacy, not reproduced. Pinned by TestKnownDiffCheckThenNotNull. |
+| `a int UNIQUE NOT NULL` | column loop LOSES the NOT NULL after an inline UNIQUE (parseConstraintDeferrable eats the leading NOT while looking for `NOT DEFERRABLE`) | NotNull=true, Unique=true | both true | (b)-inverted: yacc is RIGHT; 12 regress fragments. Pinned by TestKnownDiffUniqueThenNotNull. |
 | `SELECT ALL a` | syntax error ("expected expression (got all)") | accepted (`opt_all_clause`) | accepted | same shape as above; pinned by TestKnownDiffSelectAll. |
 
 | UNION/INTERSECT chain tree shape | upstream gram.y builds LEFT-nested trees (%left); goopg legacy+new parser build RIGHT-nested chains on the single SetOp slot | same as legacy (intentional parity) | semantically equivalent for set ops; revisit only if a planner consumer depends on nesting side |

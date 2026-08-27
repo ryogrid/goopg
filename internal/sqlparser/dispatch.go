@@ -75,6 +75,8 @@ var routedStmts = map[string]bool{
 	// P5.1 — REFRESH leads no other statement in PostgreSQL, so the single
 	// refresh_matview_stmt alternative covers the whole keyword.
 	"refresh": true,
+	// P5.2 — CALL leads no other statement.
+	"call": true,
 	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 
@@ -218,9 +220,11 @@ func explainInnerRouted(frag []parser.Token) bool {
 
 // routedCreatePairs maps leading keyword -> set of ported second keywords.
 var routedCreatePairs = map[string]map[string]bool{
-	"create": {"table": true, "index": true, "view": true, "materialized": true},
-	"alter":  {"table": true},
-	"drop":   {"table": true, "index": true, "view": true, "materialized": true}, // P5.1
+	"create": {"table": true, "index": true, "view": true, "materialized": true,
+		"function": true, "procedure": true}, // P5.2
+	"alter": {"table": true},
+	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
+		"function": true, "procedure": true, "routine": true}, // P5.2
 }
 
 // secondKeywordRouted reports whether the fragment's first+second keyword
@@ -269,6 +273,50 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 	}
 	if key == "alter" && second == "table" {
 		return alterTableActionsRouted(frag)
+	}
+	if key == "create" && (second == "function" || second == "procedure") {
+		return createRoutineRouted(frag)
+	}
+	return true
+}
+
+// createRoutineRouted vetoes the two CREATE FUNCTION / PROCEDURE sub-forms the
+// grammar deliberately does not cover, both of which would otherwise become a
+// hard 42601 (routeBatch never falls back once a fragment is routed):
+//
+//   - BEGIN ATOMIC ... END — legacy does not parse this body at all, it scans
+//     raw tokens to the matching END (function.go parseFunctionBody). There is
+//     no grammar to mirror, only a token walk, so it stays on the legacy path.
+//   - TRANSFORM FOR TYPE — legacy REJECTS it outright; keeping it unrouted
+//     preserves the legacy error message rather than substituting a yacc one.
+//
+// Both words are matched at paren depth 0 so an argument or column named
+// "transform", or a default expression containing BEGIN, cannot trip the veto.
+func createRoutineRouted(frag []parser.Token) bool {
+	depth := 0
+	for i, tok := range frag {
+		if tok.Kind == parser.TokenSymbol {
+			switch tok.Value {
+			case "(":
+				depth++
+			case ")":
+				depth--
+			}
+			continue
+		}
+		if depth != 0 || (tok.Kind != parser.TokenKeyword && tok.Kind != parser.TokenIdent) {
+			continue
+		}
+		switch strings.ToLower(tok.Value) {
+		case "transform":
+			return false
+		case "begin":
+			// `BEGIN ATOMIC`; a bare BEGIN at depth 0 is not a body opener in
+			// any legal spelling, but the ATOMIC check keeps the veto tight.
+			if i+1 < len(frag) && strings.EqualFold(frag[i+1].Value, "atomic") {
+				return false
+			}
+		}
 	}
 	return true
 }
