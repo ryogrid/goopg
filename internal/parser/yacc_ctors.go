@@ -196,6 +196,12 @@ func NewIntervalLitPre(pos int, months, days int32, micros int64) *IntervalLit {
 	return &IntervalLit{pos: pos, PreComputed: true, PreMonths: months, PreDays: days, PreMicros: micros}
 }
 
+// NewIntervalLitEmbedded builds the Form-2 `interval '<N> <unit>'` literal,
+// which keeps its value and singular unit rather than being pre-computed.
+func NewIntervalLitEmbedded(pos int, value, unit string) *IntervalLit {
+	return &IntervalLit{pos: pos, Value: value, Unit: unit}
+}
+
 // NewArrayConstructorExpr builds ARRAY[e1, ..., en] (legacy parity).
 func NewArrayConstructorExpr(pos int, elements []Expr) *ArrayConstructorExpr {
 	return &ArrayConstructorExpr{pos: pos, Elements: elements}
@@ -474,4 +480,14 @@ func SetPartitionOfHashBound(c *PartitionOfClause, modulus, remainder int64, isH
 // { DEFERRED | IMMEDIATE }`.
 func NewSetConstraintsStmt(pos int, all bool, names []string, deferred bool) *SetConstraintsStmt {
 	return &SetConstraintsStmt{pos: pos, All: all, Names: names, Deferred: deferred}
+}
+
+// SplitEmbeddedInterval exposes the Form-2 interval split (`interval
+// '<N> <unit>'` -> value + singular unit) to the goyacc parser, which has to
+// reproduce parseIntervalLiteral's ORDER of attempts: Form 2 first, and only
+// then the pre-computed whole-body decode. Skipping it makes
+// `interval '1 day'` a PreComputed literal where legacy keeps
+// Value="1"/Unit="day".
+func SplitEmbeddedInterval(body string) (value, unit string, ok bool) {
+	return splitEmbeddedInterval(body)
 }

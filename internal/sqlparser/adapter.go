@@ -45,6 +45,19 @@ type lexerState struct {
 	fragEnd  int    // exclusive end offset of fragment's last real token; trailing ';' excluded
 	endMark  int    // optional explicit span end (>=0); set by with_data_kw
 	genSpanEnd int  // span end for a generated-column expression: the ')' position
+
+	// lastIntervalNode / lastIntervalRaw remember the most recent
+	// `INTERVAL SCONST` reduction so `AT TIME ZONE INTERVAL '...'` can recover
+	// the literal's RAW body. Legacy deliberately degrades that zone to a plain
+	// StringConst (select.go:2442: "the standard interval parser only handles
+	// day/month/year units, so INTERVAL '00:00' / '-10:00' fall through here as
+	// strings"), and the body is not recoverable from the IntervalLit node.
+	// A single slot is enough, and is exact: the check is POINTER identity
+	// against the zone expression, so `AT TIME ZONE 'UTC' + interval '1 day'`
+	// — whose zone is a BinaryOp, not the interval node — correctly does not
+	// match.
+	lastIntervalNode parser.Expr
+	lastIntervalRaw  string
 	prevPos  int    // absolute Pos of the token before that (mid-rule pos capture)
 
 	// base_yylex one-token pushback (base_yylex.go)
@@ -330,6 +343,12 @@ var knownTypeNames = map[string]string{
 	"point": "point", "line": "line", "lseg": "lseg", "box": "box",
 	"path": "path", "polygon": "polygon", "circle": "circle",
 	"pg_lsn": "pg_lsn", "timestamptz": "timestamptz", "timetz": "timetz",
+	// Keyword-tokenised names legacy also accepts as typed-literal prefixes.
+	// Measured against legacy 2026-08-27 — it takes exactly these six and
+	// still REJECTS character, nchar, bit, int, float, double precision and
+	// national character, which therefore stay out.
+	"char": "char", "decimal": "decimal", "integer": "integer",
+	"smallint": "smallint", "bigint": "bigint", "real": "real",
 }
 
 // scanSelfChars is scan.l's {self} set verbatim

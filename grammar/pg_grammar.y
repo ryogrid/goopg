@@ -474,6 +474,33 @@ setop_op:
 // select_with_parens — gram.y :12828-12831. goopg addition: mark
 // Parenthesized=true (legacy parseParenthesisedSelectStmt stamps it;
 // planner stops flattening there, M0097-0042).
+//
+// NOT PORTED: a parenthesised SET-OP OPERAND, `(SELECT ...) UNION ALL
+// (SELECT ...)`. 14 must-pass regress fragments need it (select_distinct,
+// union). Measured 2026-08-27, and the diagnosis is now exact:
+//
+//   Adding `simple_select: paren_select` — with ONE shared `'(' SelectStmt ')'`
+//   rule feeding all three consumers, which is the least-conflict spelling —
+//   leaves exactly TWO reduce/reduce conflicts, both on ')' :
+//     state 1131  simple_select: paren_select.  vs  c_expr: paren_select.
+//     state 1916  simple_select: paren_select.  vs  base_table_ref: paren_select.opt_derived_alias
+//   Every OTHER lookahead resolves correctly on its own: UNION / INTERSECT /
+//   EXCEPT / ORDER / LIMIT / OFFSET / FETCH / FOR all reduce to simple_select,
+//   which is what the 14 fragments need.
+//
+//   ')' cannot be resolved by precedence — %prec steers shift/reduce, not
+//   reduce/reduce, and upstream's `c_expr: select_with_parens %prec UMINUS`
+//   (which was tried) changes nothing here. yacc resolves reduce/reduce by RULE
+//   ORDER, and simple_select is declared far earlier than c_expr, so
+//   simple_select wins ')' — which BREAKS `SELECT f((SELECT 1))` and every
+//   other doubly-parenthesised subquery. That is why this stays unported rather
+//   than shipping with the conflicts allowlisted.
+//
+//   The real fix is upstream's layering — select_no_parens / select_clause /
+//   select_with_parens, with the set-op alternatives taking select_clause — so
+//   the parenthesised operand never enters simple_select at all. That is a
+//   structural rewrite of the SELECT core, tracked in
+//   docs/design/not_ralph/TODO.md rather than attempted piecemeal.
 // select_clause — gram.y :12922-12926.
 // select_no_parens — gram.y :12837-12920 subset (locking clauses arrive
 // with P6; with_clause with P1.7). Set-op alternatives resolve via the
@@ -1743,6 +1770,30 @@ a_expr:
 			{
 				$$ = parser.NewCollateExpr($1.Pos(), $1, $3)
 			}
+	/* AT TIME ZONE / AT LOCAL — gram.y :15540ff. Both are rewritten into a
+	   timezone() call with the ZONE argument FIRST (gram.y builds
+	   makeFuncCall(timezone, list_make2($5, $1))); AT LOCAL passes the value
+	   alone. Only the productions were missing — the %left AT precedence
+	   declaration was already there from the verbatim block — so every
+	   spelling was a hard 42601. Like TRIM these are SYNTHESISED calls, so
+	   Variadic stays nil.
+
+	   %prec Op, NOT %prec AT: legacy parses the zone with
+	   parseExprPrec(precCompare+1) (select.go:2455), which binds LOOSER than
+	   '+' and '*', so `x AT TIME ZONE 'UTC' + interval '1 day'` means
+	   timezone('UTC' + interval, x) there and timezone('UTC', x) + interval
+	   under upstream's %left AT. Upstream is the saner reading, but this is a
+	   migration and the routed parser must not disagree with the parser it
+	   replaces; Op sits below '+' and above the comparisons, which reproduces
+	   legacy's binding exactly. */
+	| a_expr AT TIME ZONE a_expr %prec Op
+			{
+				$$ = specialFormCall($1.Pos(), "timezone", []parser.Expr{tzZone(yylex, $5), $1})
+			}
+	| a_expr AT LOCAL %prec Op
+			{
+				$$ = specialFormCall($1.Pos(), "timezone", []parser.Expr{$1})
+			}
 	| a_expr Op a_expr
 			{
 				$$ = parser.NewBinaryOp($1.Pos(), binOp(yylex, $2), $1, $3)
@@ -1992,7 +2043,11 @@ c_expr:
 			}
 	| INTERVAL SCONST
 			{
-				$$ = buildIntervalLit(yylex.(*lexerState).lastConsumedPos(), $2)
+				l := yylex.(*lexerState)
+				e := buildIntervalLit(l.lastConsumedPos(), $2)
+				// Remember the raw body for AT TIME ZONE — see lastIntervalNode.
+				l.lastIntervalNode, l.lastIntervalRaw = e, $2
+				$$ = e
 			}
 	| TYPEDLIT
 			{
@@ -2139,19 +2194,19 @@ func_expr_common_subexpr:
 	   FROM-less spelling upstream, and legacy simply requires the FROM. */
 		TRIM '(' BOTH trim_list ')'
 			{
-				$$ = trimCall($<p>1, "btrim", $4)
+				$$ = specialFormCall($<p>1, "btrim", $4)
 			}
 	| TRIM '(' LEADING trim_list ')'
 			{
-				$$ = trimCall($<p>1, "ltrim", $4)
+				$$ = specialFormCall($<p>1, "ltrim", $4)
 			}
 	| TRIM '(' TRAILING trim_list ')'
 			{
-				$$ = trimCall($<p>1, "rtrim", $4)
+				$$ = specialFormCall($<p>1, "rtrim", $4)
 			}
 	| TRIM '(' trim_list ')'
 			{
-				$$ = trimCall($<p>1, "btrim", $3)
+				$$ = specialFormCall($<p>1, "btrim", $3)
 			}
 	| sql_value_func_name
 			{
@@ -2844,9 +2899,16 @@ opt_upd_from:
 		/* empty */                       { $$ = nil }
 	| FROM upd_from_list               { $$ = $2 }
 
+/* base_table_ref, not qualified_name: legacy accepts EVERYTHING that
+   nonterminal covers in `UPDATE ... FROM` and `DELETE ... USING` — aliases,
+   AS aliases, ONLY, the inheritance star, derived tables, function tables and
+   LATERAL — and rejects only JOIN, which base_table_ref also excludes (joins
+   live in table_ref). The bare-name list dropped every alias, so
+   `UPDATE t SET ... FROM u b WHERE ...` was a hard 42601. Shared by both
+   statements, exactly as before. */
 upd_from_list:
-		qualified_name                     { $$ = []parser.RangeVar{rangeVarFromName($1, "")} }
-	| upd_from_list ',' qualified_name    { $$ = append($1, rangeVarFromName($3, "")) }
+		base_table_ref                     { $$ = []parser.RangeVar{$1} }
+	| upd_from_list ',' base_table_ref    { $$ = append($1, $3) }
 
 /* upd_where / del_where — the empty alternative was MISSING, so an
    unqualified `UPDATE t SET x = 1` or `DELETE FROM t` was a syntax error on

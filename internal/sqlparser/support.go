@@ -520,6 +520,16 @@ func tzJoin(base, mark string) string {
 // (`interval '<body>'`): parse the body into interval components at AST-build
 // time so the executor sees an IntervalLit datum, not text.
 func buildIntervalLit(pos int, body string) parser.Expr {
+	// ORDER MATTERS, and it was wrong: legacy's parseIntervalLiteral
+	// (select.go:3376) tries the Form-2 split FIRST — a plain `<N> <unit>` body
+	// keeps Value/Unit and PreComputed=false — and only falls back to the
+	// whole-body decode for multi-field or HH:MM:SS bodies. Going straight to
+	// ParseIntervalBody made `interval '1 day'` a PreComputed literal, so every
+	// routed statement using the single-unit spelling — which is exactly what
+	// the TPC-H query templates use — carried a different node than legacy.
+	if val, unit, ok := parser.SplitEmbeddedInterval(body); ok {
+		return parser.NewIntervalLitEmbedded(pos, val, unit)
+	}
 	if m, d, us, ok := parser.ParseIntervalBody(body); ok {
 		return parser.NewIntervalLitPre(pos, m, d, us)
 	}
@@ -1207,13 +1217,29 @@ func partitionByFrom(method string, methodPos int, keys []partKey) *parser.Parti
 	return pb
 }
 
-// trimCall builds TRIM's rewritten btrim/ltrim/rtrim call. It cannot go through
-// NewFuncCall: that ctor appends one Variadic flag per argument to match
-// legacy's general function-call path, but legacy builds TRIM directly as a
-// special form and never touches Variadic, so it stays nil. canonDump
-// distinguishes nil from []bool{false,false}.
-func trimCall(pos int, name string, args []parser.Expr) *parser.FuncCall {
+// specialFormCall builds a call that the grammar SYNTHESISES rather than
+// parses as a function call — TRIM's btrim/ltrim/rtrim, AT TIME ZONE's
+// timezone(). It cannot go through NewFuncCall: that ctor appends one Variadic
+// flag per argument to match legacy's general function-call path, but legacy
+// builds these special forms directly and never touches Variadic, so it stays
+// nil. canonDump distinguishes nil from []bool{false,false}, so using the
+// general ctor here diverges even when every form parses.
+func specialFormCall(pos int, name string, args []parser.Expr) *parser.FuncCall {
 	fc := parser.NewFuncCall(pos, parser.ObjectName{Name: name}, args, false)
 	fc.Variadic = nil
 	return fc
+}
+
+// tzZone reproduces legacy's AT TIME ZONE special case: a zone written as
+// `INTERVAL '<body>'` degrades to a plain StringConst of that body rather than
+// staying an interval literal (internal/parser/select.go:2442). The check is
+// pointer identity against the most recent INTERVAL SCONST reduction, so a
+// zone that merely CONTAINS an interval — `AT TIME ZONE 'UTC' + interval '1
+// day'`, whose zone is a BinaryOp — is left alone.
+func tzZone(l yyLexer, zone parser.Expr) parser.Expr {
+	ls, ok := l.(*lexerState)
+	if !ok || ls.lastIntervalNode == nil || ls.lastIntervalNode != zone {
+		return zone
+	}
+	return parser.NewStringConst(zone.Pos(), ls.lastIntervalRaw)
 }
