@@ -79,6 +79,10 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
+%type <str>	sort_using_op constr_name
+%type <strs>	constr_name_list
+%type <b>	constraints_set_mode opt_no_inherit
+%type <node>	trunc_name_list trunc_name
 %type <exprs>	opt_func_call_args
 %type <node>	opt_call_args call_arg_list call_arg
 %type <exprs>	opt_func_arg_list func_arg_list
@@ -104,6 +108,7 @@
 %type <str>	opt_drop_behavior
 %type <b>	opt_if_not_exists
 %type <str>	opt_index_name
+%type <str>	opt_like_options like_option
 %type <node>	exclude_elem_list exclude_elem opt_exclude_where
 %type <str>	exclude_op
 %type <node>	opt_table_element_list opt_index_where
@@ -563,6 +568,17 @@ sort_by_list:
 				$$ = append($1, $3)
 			}
 
+/* The operator after USING: gram.y spells this `any_operator |
+   OPERATOR '(' any_operator ')'`, but legacy's parseSortUsingOperator
+   (select.go:1771) never consumed the OPERATOR(...) form — it returns the bare
+   keyword and then chokes on '(' — so porting that alternative would ACCEPT
+   MORE than legacy. Pinned to what legacy takes: symbol operators (shared with
+   exclude_op) plus a plain or schema-qualified operator name. */
+sort_using_op:
+		exclude_op        { $$ = $1 }
+	| ColId               { $$ = $1 }
+	| ColId '.' ColId     { $$ = $1 + "." + $3 }
+
 SortBy:
 		a_expr
 			{
@@ -579,6 +595,23 @@ SortBy:
 	/* NULLS FIRST|LAST without an explicit ASC/DESC — gram.y's sortby is
 	   `a_expr opt_asc_desc opt_nulls_order`, so both parts are optional
 	   independently. */
+	/* ORDER BY x USING op — gram.y sortby's first alternative. */
+	| a_expr USING sort_using_op
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+			}
+	| a_expr USING sort_using_op NULLS_LA FIRST_P
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+				v := true
+				$$.NullsFirst = &v
+			}
+	| a_expr USING sort_using_op NULLS_LA LAST_P
+			{
+				$$ = parser.NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+				v := false
+				$$.NullsFirst = &v
+			}
 	| a_expr NULLS_LA FIRST_P
 			{
 				$$ = parser.NewSortBy($1.Pos(), $1, false, "")
@@ -668,6 +701,12 @@ limit_clause:
 			{
 				$$ = &selectLimit{count: $3, set: true}
 			}
+	| FETCH first_or_next row_or_rows WITH TIES
+			{
+				/* Countless form: the row count defaults to one
+				   (gram.y makeIntConst(1, -1)). */
+				$$ = &selectLimit{count: parser.NewIntegerConst(0, 1), withTies: true, set: true}
+			}
 	| FETCH first_or_next row_or_rows ONLY
 			{
 				// Omitted count defaults to 1 (gram.y :13346 alt).
@@ -756,6 +795,15 @@ opt_target_list:
 		target_list
 			{
 				$$ = $1
+			}
+	/* Genuinely empty: `SELECT FROM t` and `SELECT;` are both legal upstream
+	   (gram.y opt_target_list's empty alternative) and produce a
+	   zero-column result. Only target_list was ported, so a zero-column join
+	   — the shape TestPort_ZeroColumnJoinDoesNotCrashBackend exercises —
+	   raised 42601 instead of running. */
+	| /* empty */
+			{
+				$$ = nil
 			}
 
 target_list:
@@ -968,6 +1016,21 @@ relation_expr_opt_alias:
 	| qualified_name AS ColId
 			{
 				$$ = rangeVarFromName($1, $3)
+			}
+	/* Alias with a COLUMN-alias list — gram.y alias_clause's
+	   `AS ColId '(' name_list ')'` / `ColId '(' name_list ')'`. RangeVar.Columns
+	   already carries them; only the productions were missing. */
+	| qualified_name ColId '(' col_alias_list ')'
+			{
+				rv := rangeVarFromName($1, $2)
+				rv.Columns = $4
+				$$ = rv
+			}
+	| qualified_name AS ColId '(' col_alias_list ')'
+			{
+				rv := rangeVarFromName($1, $3)
+				rv.Columns = $5
+				$$ = rv
 			}
 
 /* base_table_ref — gram.y :13600 alternatives, P1.2 subset: plain relation
@@ -1865,6 +1928,13 @@ a_expr:
 
 /* c_expr — gram.y :15640ff, P1.1 subset: literals, parameters, column refs. */
 c_expr:
+	/* NOT PORTED: `tbl.*` as an EXPRESSION (whole-row expansion — VALUES(n.*),
+	   f(n.*)). gram.y reaches it through columnref's indirection; grafting
+	   `qualified_name '.' '*'` onto c_expr here costs 20 reduce/reduce
+	   conflicts (measured 2026-08-27), all of them the pre-existing
+	   a_expr/b_expr c_expr split rather than anything about the star itself.
+	   Target-list `tbl.*` is unaffected — it has its own target_el
+	   alternative (:839). Cost recorded in docs/design/not_ralph/TODO.md. */
 		ICONST
 			{
 				/* $1 is already the parsed integer (adapter fills ival). */
@@ -2575,7 +2645,10 @@ opt_update_where:
 /* opt_returning — gram.y :17340 returning_clause. */
 opt_returning:
 		/* empty */               { $$ = nil }
-	| RETURNING opt_target_list   { $$ = $2 }
+	/* target_list, NOT opt_target_list: gram.y's returning_clause (:12377)
+	   requires at least one item, and so does legacy — sharing the optional
+	   form here would make the yacc parser accept a bare RETURNING. */
+	| RETURNING target_list   { $$ = $2 }
 
 opt_ins_cols:
 		/* empty */  { $$ = nil }

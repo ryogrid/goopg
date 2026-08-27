@@ -615,6 +615,8 @@ type tableElem struct {
 	namedPk    *parser.TableConstraintDef
 	namedUq    *parser.TableConstraintDef
 	exclusion  *parser.TableConstraintDef
+	like       *parser.ObjectName
+	likeOpts   string
 	uqIncl     []string
 	uqNND      bool
 	uqAttrs    *constrAttrs
@@ -624,6 +626,7 @@ type tableElem struct {
 	inherits   []parser.ObjectName
 	asSelect   *parser.SelectStmt
 	partition  *parser.PartitionByClause
+	notNull    *tableNotNull
 }
 
 // colConstraints accumulates a column's constraint suffix in CREATE TABLE.
@@ -886,6 +889,10 @@ func fillfactorFrom(kvs []string) int {
 	return 0
 }
 
+// likeAllOpts is what `INCLUDING ALL` expands to in legacy's BodyOrder marker
+// encoding — the nine option names in this exact order (internal/parser).
+const likeAllOpts = ":+defaults:+identity:+generated:+constraints:+indexes:+comments:+statistics:+storage:+compression"
+
 // excludeElem is one `col WITH op` item of an EXCLUDE constraint.
 type excludeElem struct {
 	col string
@@ -1112,4 +1119,38 @@ type partBound struct {
 	// them as a third mutually exclusive shape alongside IN and FROM/TO.
 	modulus, remainder int64
 	isHash             bool
+}
+
+// truncTargets carries TRUNCATE's relation list, whose entries each have their
+// own ONLY flag — unlike drop_name_list, which is a bare name list.
+type truncTargets struct {
+	names []parser.ObjectName
+	only  []bool
+}
+
+// sortUsingIsDesc mirrors the legacy parser's sortUsingIsDesc
+// (internal/parser/select.go:1810). Real PostgreSQL never guesses a direction
+// here — it resolves the operator against the opclass at analysis time — but
+// legacy stamps SortBy.Desc from the operator's spelling, and the AST is the
+// migration's contract, so the heuristic is reproduced verbatim.
+func sortUsingIsDesc(op string) bool {
+	if op == ">" || op == ">=" || op == "~>~" || op == "~>=~" {
+		return true
+	}
+	lower := strings.ToLower(op)
+	if idx := strings.LastIndex(lower, "."); idx >= 0 {
+		lower = lower[idx+1:]
+	}
+	return strings.HasSuffix(lower, "gt") || strings.HasSuffix(lower, "greater") || strings.Contains(lower, "_gt_")
+}
+
+// tableNotNull carries a table-level NOT NULL constraint element. Its three
+// fields land in CreateTableStmt's parallel TableNotNullNames /
+// TableNotNullCols / TableNotNullNoInherit slices; an unnamed one contributes
+// an empty string to Names rather than being skipped, so the slices stay
+// index-aligned.
+type tableNotNull struct {
+	name      string
+	col       string
+	noInherit bool
 }

@@ -26,12 +26,16 @@ create_table_stmt:
 				var uqNullsNotDistinct, uqDeferrable, uqInitiallyDeferred []bool
 				var named []parser.TableConstraintDef
 				var exclusions []parser.TableConstraintDef
+				var likes []parser.ObjectName
+				var bodyOrder []string
 				var namedChecks []parser.PartitionCheckConstraint
 				var fks []parser.TableForeignKeyDef
 				var pkIncl []string
 				var pkDeferrable, pkInitiallyDeferred bool
 				var checks []string
 				var checkNoInherit, checkNotEnforced []bool
+				var nnNames, nnCols []string
+				var nnNoInherit []bool
 				for _, e := range elems {
 					switch {
 					case e.col != nil:
@@ -73,6 +77,7 @@ create_table_stmt:
 							cd.OnUpdate = c.fkInfo.onUp
 						}
 						cols = append(cols, *cd)
+						bodyOrder = append(bodyOrder, c.name)
 						if c.primary {
 							// Legacy records a column-level PRIMARY KEY in the
 							// statement's PrimaryKey list as well as on the
@@ -114,6 +119,23 @@ create_table_stmt:
 						if e.exclusion != nil {
 							exclusions = append(exclusions, *e.exclusion)
 						}
+						if e.notNull != nil {
+							nnNames = append(nnNames, e.notNull.name)
+							nnCols = append(nnCols, e.notNull.col)
+							nnNoInherit = append(nnNoInherit, e.notNull.noInherit)
+						}
+						if e.like != nil {
+							likes = append(likes, *e.like)
+							// Legacy interleaves a "@@LIKE:<dotted name>"
+							// marker into BodyOrder at the element's position,
+							// so BodyOrder has to be built in the loop rather
+							// than from the column list afterwards.
+							mk := e.like.Name
+							if e.like.Schema != "" {
+								mk = e.like.Schema + "." + mk
+							}
+							bodyOrder = append(bodyOrder, "@@LIKE:"+mk+e.likeOpts)
+						}
 						if e.check != "" {
 							if e.checkName != "" {
 								// CONSTRAINT c CHECK (...) -> TableNamedChecks,
@@ -134,9 +156,7 @@ create_table_stmt:
 		tbl.Schema = nm[len(nm)-2]
 	}
  	ct := parser.NewCreateTableStmt(0, tbl, cols, pk)
-				for _, c := range cols {
-					ct.BodyOrder = append(ct.BodyOrder, c.Name)
-				}
+				ct.BodyOrder = bodyOrder
 				if pfx := $2.(*createPrefix); pfx != nil {
 					ct.Temporary = pfx.temporary
 					ct.Unlogged = pfx.unlogged
@@ -149,11 +169,15 @@ create_table_stmt:
 				ct.TableUniqueInitiallyDeferred = uqInitiallyDeferred
 				ct.NamedConstraints = named
 				ct.TableExclusions = exclusions
+				ct.LikeTables = likes
 				ct.TableNamedChecks = namedChecks
 				ct.TableForeignKeys = fks
 				ct.PrimaryKeyInclude = pkIncl
 				ct.PrimaryKeyDeferrable = pkDeferrable
 				ct.PrimaryKeyInitiallyDeferred = pkInitiallyDeferred
+				ct.TableNotNullNames = nnNames
+				ct.TableNotNullCols = nnCols
+				ct.TableNotNullNoInherit = nnNoInherit
 				ct.TableChecks = checks
 				ct.TableCheckNoInherit = checkNoInherit
 				ct.TableCheckNotEnforced = checkNotEnforced
@@ -297,6 +321,16 @@ table_element:
 				a, _ := $7.(*constrAttrs)
 				$$ = &tableElem{namedUq: namedTableConstraint($2, $5, false, $6, $4, a)}
 			}
+	/* LIKE source_table [INCLUDING|EXCLUDING option ...] — gram.y TableLikeClause.
+	   Legacy keeps only the table NAME (CreateTableStmt.LikeTables) and
+	   discards the option list, so the options are parsed and dropped here too.
+	   LIKE is reserved, so this cannot collide with a column definition. */
+	| LIKE qualified_name opt_like_options
+			{
+				n := objectNameFromQn($2)
+				$$ = &tableElem{like: &n, likeOpts: $3}
+			}
+
 	/* EXCLUDE constraints — gram.y ExclusionConstraintElem. Anonymous ones go
 	   to TableExclusions, named ones to NamedConstraints, both as a
 	   TableConstraintDef with IsExclusion set. */
@@ -312,6 +346,17 @@ table_element:
 				w, _ := $9.(parser.Expr)
 				$$ = &tableElem{namedUq: newExclusionConstraint($2, $4, $6.([]excludeElem), $8, w, a)}
 			}
+	/* Table-level NOT NULL (PG 18's TableConstraint `NOT NULL columnname
+	   ConstraintAttributeSpec`, gram.y :4183). Distinct from the column
+	   constraint of the same spelling: it names a column that appears
+	   elsewhere in the element list, so it lands in the three parallel
+	   TableNotNull* slices and contributes NOTHING to BodyOrder. NOT is
+	   reserved and NULL_P cannot start a column definition, so the
+	   element-start decision stays unambiguous. */
+	| NOT NULL_P ColId opt_no_inherit
+			{ $$ = &tableElem{notNull: &tableNotNull{col: $3, noInherit: $4}} }
+	| CONSTRAINT ColId NOT NULL_P ColId opt_no_inherit
+			{ $$ = &tableElem{notNull: &tableNotNull{name: $2, col: $5, noInherit: $6}} }
 	| CONSTRAINT ColId CHECK '(' { yylex.(*lexerState).markSpanStart() } a_expr ')'
 			{ $$ = &tableElem{check: yylex.(*lexerState).spanTextCloseParen(), checkName: $2} }
 	/* Anonymous table-level CHECK and FOREIGN KEY (gram.y TableConstraint).
@@ -351,6 +396,22 @@ table_element:
 				}
 				$$ = &tableElem{fkDef: fk}
 			}
+
+/* The LIKE options are not a separate AST field: legacy ENCODES them into the
+   BodyOrder marker as `:+name` per INCLUDING, in source order, dropping every
+   EXCLUDING, with INCLUDING ALL expanding to a fixed nine.
+   ALL is reserved and therefore not a ColId; every other option name
+   (DEFAULTS, CONSTRAINTS, INDEXES, STORAGE, COMMENTS, STATISTICS,
+   COMPRESSION, IDENTITY, GENERATED) is unreserved. */
+opt_like_options:
+		/* empty */                    { $$ = "" }
+	| opt_like_options like_option     { $$ = $1 + $2 }
+
+like_option:
+		INCLUDING ALL                  { $$ = likeAllOpts }
+	| INCLUDING ColId                  { $$ = ":+" + lowerIdent($2) }
+	| EXCLUDING ALL                    { $$ = "" }
+	| EXCLUDING ColId                  { $$ = "" }
 
 exclude_elem_list:
 		exclude_elem                          { $$ = []excludeElem{$1.(excludeElem)} }
@@ -431,14 +492,53 @@ opt_drop_behavior:
 	| RESTRICT      { $$ = "restrict" }
 
 truncate_stmt:
-		TRUNCATE opt_TRUNCATE_kw drop_name_list opt_restart opt_drop_behavior
+		TRUNCATE opt_TRUNCATE_kw trunc_name_list opt_restart opt_drop_behavior
 			{
-				onl := make([]bool, len($3))
-				for i := range onl {
-					onl[i] = false
-				}
-				$$ = parser.NewTruncateStmt(0, $3, onl, dropBehavior($5), $4)
+				tt := $3.(*truncTargets)
+				$$ = parser.NewTruncateStmt(0, tt.names, tt.only, dropBehavior($5), $4)
 			}
+
+/* TRUNCATE's relation list is NOT drop_name_list: each entry carries its own
+   ONLY flag (gram.y relation_expr, reached through TruncateStmt's
+   relation_expr_list). TruncateStmt.Only is parallel to .Names. */
+trunc_name_list:
+		trunc_name
+			{
+				$$ = $1
+			}
+	| trunc_name_list ',' trunc_name
+			{
+				a, b := $1.(*truncTargets), $3.(*truncTargets)
+				a.names = append(a.names, b.names...)
+				a.only = append(a.only, b.only...)
+				$$ = a
+			}
+
+trunc_name:
+		qualified_name
+			{
+				$$ = &truncTargets{names: []parser.ObjectName{objectNameFromQn($1)}, only: []bool{false}}
+			}
+	| ONLY qualified_name
+			{
+				$$ = &truncTargets{names: []parser.ObjectName{objectNameFromQn($2)}, only: []bool{true}}
+			}
+
+opt_no_inherit:
+		/* empty */   { $$ = false }
+	| NO INHERIT      { $$ = true }
+
+constraints_set_mode:
+		DEFERRED   { $$ = true }
+	| IMMEDIATE    { $$ = false }
+
+constr_name_list:
+		constr_name                        { $$ = []string{$1} }
+	| constr_name_list ',' constr_name     { $$ = append($1, $3) }
+
+constr_name:
+		ColId              { $$ = $1 }
+	| ColId '.' ColId      { $$ = $3 }
 
 opt_TRUNCATE_kw:
 		/* empty */  { _ = 0 }
@@ -748,7 +848,17 @@ opt_savepoint_kw:
    setValueAtoms / internal/parser/parser.go:3056), so quotes are stripped. DEFAULT and RESET/SHOW ALL are
    separate shapes. SET TIME ZONE / FROM CURRENT arrive later. */
 set_stmt:
-		SET set_scope set_guc_name set_eq_to set_value_list
+	/* SET CONSTRAINTS — gram.y's ConstraintsSetStmt, a sibling of
+	   VariableSetStmt rather than one of its set_rest alternatives, so no
+	   set_scope: `SET LOCAL CONSTRAINTS` is not accepted upstream and legacy
+	   (parser.go:2496) does not take it either. A dotted name keeps only its
+	   LAST component, matching parseQualifiedConstraintName (parser.go:3028),
+	   which overwrites rather than appends. */
+		SET CONSTRAINTS ALL constraints_set_mode
+			{ $$ = parser.NewSetConstraintsStmt(0, true, nil, $4) }
+	| SET CONSTRAINTS constr_name_list constraints_set_mode
+			{ $$ = parser.NewSetConstraintsStmt(0, false, $3, $4) }
+	| SET set_scope set_guc_name set_eq_to set_value_list
 			{
 				// One alternative, not two: `SET x = DEFAULT` differs from
 				// `SET x = 'default'` only by token KIND, which the grammar

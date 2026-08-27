@@ -469,3 +469,9 @@ func SetPartitionOfHashBound(c *PartitionOfClause, modulus, remainder int64, isH
 	}
 	c.Modulus, c.Remainder, c.IsHash = modulus, remainder, true
 }
+
+// NewSetConstraintsStmt builds `SET CONSTRAINTS { ALL | name [, ...] }
+// { DEFERRED | IMMEDIATE }`.
+func NewSetConstraintsStmt(pos int, all bool, names []string, deferred bool) *SetConstraintsStmt {
+	return &SetConstraintsStmt{pos: pos, All: all, Names: names, Deferred: deferred}
+}

@@ -1,6 +1,10 @@
 package sqlparser
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // Parity pins for four AST-carrier defects that were live on ALREADY-ROUTED
 // statement classes. None of them was a parse failure — each produced a
@@ -121,5 +125,19 @@ func assertParity(t *testing.T, q string) {
 	}
 	if l != n {
 		t.Errorf("DIFF %q\n L=%s\n N=%s", q, truncForLog(l), truncForLog(n))
+	}
+}
+
+// assertBothReject pins a form that BOTH parsers must refuse. The differential
+// harness only reports legacy-accepts/yacc-rejects, so a widening — the yacc
+// parser accepting something legacy does not — is invisible to it; this is the
+// explicit guard for that direction.
+func assertBothReject(t *testing.T, q string) {
+	t.Helper()
+	if _, err := parser.Parse(q); err == nil {
+		t.Fatalf("legacy ACCEPTS %q — this guard assumes it does not", q)
+	}
+	if _, _, err := diffParse(q); err == nil {
+		t.Errorf("yacc ACCEPTS %q but legacy rejects it", q)
 	}
 }
