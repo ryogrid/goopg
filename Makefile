@@ -212,8 +212,8 @@ gen-parser:
 		|| { cat yacc_stderr.txt; exit 1; }
 	go run ./cmd/gen-tokennums-go
 	@conflicts=$$(grep -cE '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null || echo 999); \
-	if [ "$$conflicts" -ne 19 ]; then \
-		echo "ERROR: $$conflicts grammar conflicts (expected exactly 19 known: IF_P x9, SAVEPOINT = ROLLBACK TO [SAVEPOINT] name (SAVEPOINT is unreserved so it is also a valid ColId; shift wins, keyword form, matching PG) = one per opt_if_exists_drop/opt_if_not_exists user, '(' x2 = func_call/extract vs paren, '[' x2 = subscript, ON x2 = join ON, and DISTINCT.ON '(' vs reducing an empty opt_target_list (shift wins in both, so DISTINCT ON keeps binding), SESSION + LOCAL + CONSTRAINTS = keyword form vs empty set_scope after SET, all three shift, matching PG). Keep this message in sync with the number above."; exit 1; fi; \
+	if [ "$$conflicts" -ne 20 ]; then \
+		echo "ERROR: $$conflicts grammar conflicts (expected exactly 20 known: IF_P x9, SAVEPOINT = ROLLBACK TO [SAVEPOINT] name (SAVEPOINT is unreserved so it is also a valid ColId; shift wins, keyword form, matching PG) = one per opt_if_exists_drop/opt_if_not_exists user, '(' x3 = func_call/extract/TRIM vs paren, '[' x2 = subscript, ON x2 = join ON, and DISTINCT.ON '(' vs reducing an empty opt_target_list (shift wins in both, so DISTINCT ON keeps binding), SESSION + LOCAL + CONSTRAINTS = keyword form vs empty set_scope after SET, all three shift, matching PG). Keep this message in sync with the number above."; exit 1; fi; \
 	nonparen=$$(grep -E '^ *[0-9]+:.*(shift/reduce|reduce/reduce) conflict' internal/sqlparser/y.output 2>/dev/null | grep -vE "on '\\('" | grep -vE "on '\\.'" | grep -vE "on '\\['" | grep -vE "on ON" | grep -vE "on IF_P" | grep -vE "on NOT" | grep -vE "on SESSION" | grep -vE "on LOCAL" | grep -vE "on CONSTRAINTS" | grep -vE "on SAVEPOINT" | grep -c .); \
 	if [ "$$nonparen" -gt 0 ]; then \
 		echo "ERROR: $$nonparen conflict(s) NOT on the known set ('(' '.' '[' ON IF_P NOT SESSION LOCAL CONSTRAINTS) — inspect y.output"; exit 1; fi; \

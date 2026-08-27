@@ -79,8 +79,9 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
+%type <exprs>	trim_list
 %type <str>	sort_using_op constr_name opt_part_opclass
-%type <node>	part_elem part_elem_list
+%type <node>	part_elem part_elem_list opt_subpartition_by
 
 %type <strs>	constr_name_list
 %type <b>	constraints_set_mode opt_no_inherit opt_ctas_with_data
@@ -160,7 +161,7 @@
 %type <sortby>	SortBy
 %type <expr>	select_limit_value select_offset_value select_fetch_first_value
 %type <str>		first_or_next
-%type <str>	ColId ColLabel BareColLabel first_or_next opt_alias_ident
+%type <str>	ColId ColLabel BareColLabel as_col_label first_or_next opt_alias_ident
 %type <wd>	opt_window_spec
 %type <fr>	opt_frame_tail
 %type <node>	part_frame_extent part_frame_bound part_frame_excl
@@ -821,7 +822,7 @@ target_list:
 /* target_el — gram.y :17251-17287: AS alias, bare-label alias, bare expr, */
 /* and '*'. */
 target_el:
-		a_expr AS ColLabel
+		a_expr AS as_col_label
 			{
 				$$ = parser.NewResTarget($1.Pos(), $3, $1)
 			}
@@ -1018,6 +1019,21 @@ relation_expr_opt_alias:
 	| qualified_name AS ColId
 			{
 				$$ = rangeVarFromName($1, $3)
+			}
+	/* `person*` — gram.y relation_expr's inheritance-star form. It asks for
+	   descendants explicitly, which is already the default, so PG and legacy
+	   both parse it and record nothing; RangeVar.Only stays false. */
+	| qualified_name '*'
+			{
+				$$ = rangeVarFromName($1, "")
+			}
+	| qualified_name '*' ColId
+			{
+				$$ = rangeVarFromName($1, $3)
+			}
+	| qualified_name '*' AS ColId
+			{
+				$$ = rangeVarFromName($1, $4)
 			}
 	/* Alias with a COLUMN-alias list — gram.y alias_clause's
 	   `AS ColId '(' name_list ')'` / `ColId '(' name_list ')'`. RangeVar.Columns
@@ -2114,7 +2130,30 @@ c_expr:
    $3 straight through preserves the nil, which name_or_call deliberately
    does NOT do; matching legacy is what matters here. */
 func_expr_common_subexpr:
-		sql_value_func_name
+	/* TRIM — gram.y :15900ff. The direction keyword picks the target function
+	   (btrim / ltrim / rtrim) and trim_list REVERSES the operands: the string
+	   to trim ends up first and the trim characters after it, because gram.y
+	   builds it with lappend($3, $1). Legacy reproduces that ordering, so the
+	   port has to as well. Note `TRIM(x)` and `TRIM(x, y)` are NOT accepted by
+	   legacy — trim_list's bare expr_list alternative is what covers the
+	   FROM-less spelling upstream, and legacy simply requires the FROM. */
+		TRIM '(' BOTH trim_list ')'
+			{
+				$$ = trimCall($<p>1, "btrim", $4)
+			}
+	| TRIM '(' LEADING trim_list ')'
+			{
+				$$ = trimCall($<p>1, "ltrim", $4)
+			}
+	| TRIM '(' TRAILING trim_list ')'
+			{
+				$$ = trimCall($<p>1, "rtrim", $4)
+			}
+	| TRIM '(' trim_list ')'
+			{
+				$$ = trimCall($<p>1, "btrim", $3)
+			}
+	| sql_value_func_name
 			{
 				$$ = parser.NewFuncCall(yylex.(*lexerState).lastConsumedPos(), parser.ObjectName{Name: $1}, nil, false)
 			}
@@ -2127,6 +2166,16 @@ func_expr_common_subexpr:
    Keep this list and internal/parser/select.go:4753-4762 in sync: they are
    sibling paths (encode/decode-style) and a name present in only one of
    them is a silent parity diff. */
+/* gram.y's trim_list has a third, FROM-less alternative (`expr_list`) that
+   makes `TRIM(x)` and `TRIM(x, y)` legal upstream. It is deliberately NOT
+   ported: legacy rejects both, so admitting them would widen the routed parser
+   past the parser it replaces — and it costs a shift/reduce conflict, because
+   `TRIM(` then has to choose between starting an expr_list and starting the
+   `a_expr FROM ...` alternative. */
+trim_list:
+		a_expr FROM expr_list   { $$ = append($3, $1) }
+	| FROM expr_list            { $$ = $2 }
+
 sql_value_func_name:
 		CURRENT_TIMESTAMP	{ $$ = "current_timestamp" }
 	| CURRENT_DATE		{ $$ = "current_date" }
@@ -2477,6 +2526,18 @@ ColLabel:
 				$$ = $1
 			}
 
+/* as_col_label is upstream's ColLabel: everything this grammar's ColLabel takes
+   PLUS the reserved keywords. `SELECT true AS true` and `SELECT f1 AS five` are
+   both ordinary regress spellings.
+
+   It is a SEPARATE nonterminal rather than a widening of ColLabel because
+   ColLabel's other user is set_value_atom (goopg_ext.y:951), and admitting
+   reserved words there makes `SET ROLE TO x` ambiguous — TO becomes a candidate
+   VALUE for `SET ROLE`, and the shift that wins would swallow it. */
+as_col_label:
+		ColLabel          { $$ = $1 }
+	| reserved_keyword    { $$ = $1 }
+
 BareColLabel:
 		IDENT
 			{
@@ -2573,6 +2634,14 @@ cast_ident:
 	| DECIMAL_P     { $$ = "decimal" }
 	| BOOLEAN_P     { $$ = "boolean" }
 	| INTERVAL      { $$ = "interval" }
+	/* Keyword-tokenised type names. Measured against legacy, json / xml / path
+	   are the ONLY three names it accepts in cast position that do not already
+	   arrive as IDENT — every other candidate (jsonb, bytea, uuid, inet,
+	   money, the geometric types, ...) is a plain identifier and reaches
+	   cast_ident's IDENT alternative unchanged. */
+	| JSON          { $$ = "json" }
+	| XML_P         { $$ = "xml" }
+	| PATH          { $$ = "path" }
 
 
 /* values_rows — gram.y :13035 values_clause LIST subset: rows are '(' expr_list ')'

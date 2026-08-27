@@ -1206,3 +1206,14 @@ func partitionByFrom(method string, methodPos int, keys []partKey) *parser.Parti
 	}
 	return pb
 }
+
+// trimCall builds TRIM's rewritten btrim/ltrim/rtrim call. It cannot go through
+// NewFuncCall: that ctor appends one Variadic flag per argument to match
+// legacy's general function-call path, but legacy builds TRIM directly as a
+// special form and never touches Variadic, so it stays nil. canonDump
+// distinguishes nil from []bool{false,false}.
+func trimCall(pos int, name string, args []parser.Expr) *parser.FuncCall {
+	fc := parser.NewFuncCall(pos, parser.ObjectName{Name: name}, args, false)
+	fc.Variadic = nil
+	return fc
+}

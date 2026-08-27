@@ -556,6 +556,14 @@ trunc_name:
 				$$ = &truncTargets{names: []parser.ObjectName{objectNameFromQn($2)}, only: []bool{true}}
 			}
 
+/* A partition may itself be partitioned: `... PARTITION OF p FOR VALUES ...
+   PARTITION BY RANGE (c)`. gram.y hangs OptPartitionSpec off the same
+   CreateStmt as the bound, and ctTail already carries both fields. */
+opt_subpartition_by:
+		/* empty */   { $$ = (*parser.PartitionByClause)(nil) }
+	| PARTITION BY ColId '(' part_elem_list ')'
+			{ $$ = partitionByFrom($3, $<p>3, $5.([]partKey)) }
+
 /* Partition keys — gram.y part_elem. A key is a column name, a function call,
    or a parenthesised expression, each with an optional COLLATE and an optional
    operator class. The shape mirrors index_col (:739) deliberately, for the same
@@ -629,7 +637,7 @@ opt_ct_tail:
 			{
 				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
 			}
-	| PARTITION OF qualified_name part_bound_spec2
+	| PARTITION OF qualified_name part_bound_spec2 opt_subpartition_by
 			{
 				nm := $3.parts
 				par := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -641,6 +649,7 @@ opt_ct_tail:
 				b := $4.(*partBound)
 				i.fromVals, i.toVals, i.inVals, i.bDefault = b.from, b.to, b.inVals, b.isDefault
 				i.modulus, i.remainder, i.isHash = b.modulus, b.remainder, b.isHash
+				i.partition, _ = $5.(*parser.PartitionByClause)
 				$$ = i
 			}
 opt_ct_tail_noas:
@@ -653,7 +662,7 @@ opt_ct_tail_noas:
 			{
 				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
 			}
-	| PARTITION OF qualified_name part_bound_spec2
+	| PARTITION OF qualified_name part_bound_spec2 opt_subpartition_by
 			{
 				nm := $3.parts
 				par := parser.ObjectName{Name: nm[len(nm)-1]}
@@ -665,6 +674,7 @@ opt_ct_tail_noas:
 				b := $4.(*partBound)
 				i.fromVals, i.toVals, i.inVals, i.bDefault = b.from, b.to, b.inVals, b.isDefault
 				i.modulus, i.remainder, i.isHash = b.modulus, b.remainder, b.isHash
+				i.partition, _ = $5.(*parser.PartitionByClause)
 				$$ = i
 			}
 
@@ -1090,10 +1100,11 @@ alter_table_action:
 				a.UsingIndexName = $6
 				$$ = a
 			}
-	| ADD_P PRIMARY KEY pk_cols
+	| ADD_P PRIMARY KEY pk_cols opt_include
 			{
 				a := parser.NewATAction(parser.AlterTableAddPrimaryKey)
 				a.Columns = $4
+				a.IncludeColumns = $5
 				$$ = a
 			}
 	| DROP COLUMN ColId
