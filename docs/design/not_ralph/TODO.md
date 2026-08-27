@@ -968,6 +968,59 @@ is why every gate stayed green):
   LOCK (review finding)/GRANT/REVOKE(noop semantics preserved)/role &
   session statements. Flip utility routing.
 
+## P5.2–P5.5 landed (2026-08-27)
+
+Measured over the regress corpus (`postgres/src/test/regress/sql/*.sql`,
+13,582 fragments split on top-level semicolons):
+
+| slice | classes routed | routed fragments | yacc-side rejects | divergences |
+|---|---|---|---|---|
+| before | — | 11,920 | 22 | 250 |
+| P5.2 CREATE FUNCTION family | create/drop function, procedure, routine, call | 11,920 | 4 | 201 |
+| P5.3 utility statements | savepoint, release, checkpoint, discard, deallocate, prepare, execute, close, declare, fetch, move, analyze, vacuum, reindex, cluster, lock | 12,506 | 6 | 201 |
+| P5.4 MERGE | merge (+ CTE and PREPARE bodies) | 12,506 | 4 | 201 |
+| P5.5 type/domain/sequence | create/drop type, create/drop domain, create sequence, do | 12,757 | 2 | 204 |
+
+The 204 divergences are ALL documented known-diffs: 189 unary-minus folds, 13
+`UNIQUE NOT NULL` (new row, legacy loses the NOT NULL), 2 more of the same
+fold inside MERGE. The 2 remaining yacc-side rejects are `(f(x)).*`.
+
+Gaps in ALREADY-routed classes that these slices' corpus tests surfaced and
+closed — every one a hard 42601 or a silent AST divergence at HEAD:
+
+- `interval year to month` / `interval(3)` had no grammar at all, in column
+  definitions AND casts (the two positions pack DIFFERENT typmods).
+- CREATE INDEX `WITH` recorded fillfactor only, dropping the other five
+  storage parameters legacy keeps (59 fragments).
+- a column's array brackets were detected but never stripped, leaving a type
+  literally named `text[]` (36 fragments).
+- `float` / `float(p)` was not normalised to float4/float8 in the column path.
+- bare `char`/`character`/`nchar` was missing its implicit length of 1, while
+  quoted `"char"` must NOT get it.
+- SHOW/SET/RESET took a two-part GUC name only, and had no TIME ZONE form.
+- `char(10)[]` — array brackets after a typmod — was a syntax error.
+
+### Still unrouted after P5.5 (825 fragments, 93 classes)
+
+The biggest remaining blocks and what they need:
+
+- **role DDL** (create/alter/drop role, user, group — 210): NOT parser work.
+  `parser.Parse("CREATE ROLE r")` REJECTS; goopg handles role DDL in a
+  token-scan layer above the parser (splitLeadingRoleDDL). Leave unrouted.
+- **GRANT / REVOKE / ALTER DEFAULT PRIVILEGES**: same shape — the ACL work is
+  done by a token scanner, and parser.Parse returns a bare
+  `CompatNoopStmt{Tag:"GRANT"}`. A yacc rule would have to carry gram.y's full
+  GrantStmt surface to produce a payload-free node.
+- **the skip-to-semicolon compat family** (create/alter/drop operator 110,
+  create/drop event trigger 45, text search 52, create cast 17, rule, server,
+  user mapping, fdw, conversion, transform): legacy parses a short head and
+  then calls parseSkipToSemicolon — it accepts arbitrary token soup. A
+  faithful port needs an adapter-folded raw-tail terminal, not a real grammar;
+  a real grammar would be STRICTER than legacy.
+- **genuinely missing grammar**: create/drop trigger (42), create/drop schema
+  (44), alter function (18), alter index (10), drop sequence (10), drop rule
+  (9), comment on, copy, create policy.
+
 ## P7 — Cutover & deletion
 
 - [ ] **P7.1 Move generated sources into internal/parser; delete

@@ -62,6 +62,13 @@ import (
 	onames []parser.ObjectName
 	fargs  []parser.FunctionArg
 	ivq    ivQual
+	lrels  []parser.LockTableRelation
+	lrel   parser.LockTableRelation
+	mwc    *parser.MergeWhenClause
+	mwcs   []*parser.MergeWhenClause
+	tflds  []parser.TypeField
+	tfld   parser.TypeField
+	nodes  []any
 	fitems []parser.DropFunctionItem
 	ctt    *ctTail
 	wp     [2]string

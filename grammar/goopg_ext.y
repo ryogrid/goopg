@@ -528,9 +528,12 @@ col_type_name:
 			}
 	/* `interval(3)` is not a plain typmod: legacy packs the precision together
 	   with the full range mask (packIntervalColumnTypmod). */
-	| col_type_name '(' ICONST ')'               { $1.(*typeWithArgs).args = colTypmodArgs($1.(*typeWithArgs), int64($3)); $$ = $1 }
-	| col_type_name '(' ICONST ',' ICONST ')'    { $1.(*typeWithArgs).args = []int64{int64($3), int64($5)}; $$ = $1 }
-	| col_type_name '(' ICONST ',' ICONST ',' ICONST ')'    { $1.(*typeWithArgs).args = []int64{int64($3), int64($5), int64($7)}; $$ = $1 }
+	| col_type_name '(' ICONST ')' opt_array_tail               { tw := $1.(*typeWithArgs); tw.args = colTypmodArgs(tw, int64($3)); tw.ct = tw.ct.withArrays($5); $$ = tw }
+	| col_type_name '(' ICONST ',' ICONST ')' opt_array_tail    { tw := $1.(*typeWithArgs); tw.args = []int64{int64($3), int64($5)}; tw.ct = tw.ct.withArrays($7); $$ = tw }
+	/* The array brackets come AFTER the typmod (`char(10)[]`), which
+	   cast_typename's own opt_array_tail cannot reach — it has already been
+	   reduced by the time the typmod is seen. */
+	| col_type_name '(' ICONST ',' ICONST ',' ICONST ')' opt_array_tail    { tw := $1.(*typeWithArgs); tw.args = []int64{int64($3), int64($5), int64($7)}; tw.ct = tw.ct.withArrays($9); $$ = tw }
 
 
 /* drop_table_stmt / truncate_stmt — P4.4 (gram.y DropStmt / TruncateStmt
@@ -1988,21 +1991,31 @@ with_data_kw:
 create_function_stmt:
 		CREATE opt_or_replace FUNCTION qualified_name '(' opt_func_args ')' RETURNS fn_return fn_attrs
 			{
+				a := mustFnAttrs($10)
+				if msg, raw, at := fnAttrsCheck(yylex, a, "FUNCTION"); msg != "" {
+					yylex.(*lexerState).raise(msg, raw, at)
+					return 1
+				}
 				st := parser.NewCreateFunctionStmt($<p>1, $2, objectNameFromQn($4), $6)
 				r := $9.(*fnReturn)
 				st.ReturnType, st.ReturnsSet, st.ReturnsTable = r.typ, r.setof, r.table
 				if r.table {
 					st.Args = tableArgs(st.Args, r.cols)
 				}
-				$$ = applyFnAttrs(st, mustFnAttrs($10))
+				$$ = applyFnAttrs(st, a)
 			}
 	/* gram.y makes RETURNS optional (inferring the type from the OUT
 	   arguments); legacy requires it — "expected keyword returns" — so there is
 	   no RETURNS-less alternative here. CREATE PROCEDURE never takes one. */
 	| CREATE opt_or_replace PROCEDURE qualified_name '(' opt_func_args ')' fn_attrs
 			{
+				a := mustFnAttrs($8)
+				if msg, raw, at := fnAttrsCheck(yylex, a, "PROCEDURE"); msg != "" {
+					yylex.(*lexerState).raise(msg, raw, at)
+					return 1
+				}
 				st := parser.NewCreateProcedureStmt($<p>1, $2, objectNameFromQn($4), $6)
-				$$ = applyProcAttrs(st, mustFnAttrs($8))
+				$$ = applyProcAttrs(st, a)
 			}
 
 fn_return:
@@ -2075,14 +2088,47 @@ fn_attrs:
 	| fn_attrs fn_attr          { a := mustFnAttrs($1); $2.(func(*fnAttrs))(a); $$ = a }
 
 fn_attr:
-		LANGUAGE fn_lang_name       { s := $2; $$ = func(a *fnAttrs) { a.language = s } }
-	| AS fn_body_list             { s := $2; $$ = func(a *fnAttrs) { a.body, a.hasBody = s, true } }
+		LANGUAGE fn_lang_name
+			{
+				s, at := $2, $<p>1
+				$$ = func(a *fnAttrs) {
+					if a.sawLanguage {
+						a.fail("duplicate LANGUAGE clause (got language)", false, at)
+						return
+					}
+					a.language, a.sawLanguage = s, true
+				}
+			}
+	| AS fn_body_list
+			{
+				s, two, at := $2, twoItemAS(yylex, $<p>2), $<p>1
+				$$ = func(a *fnAttrs) {
+					if a.hasBody {
+						/* Legacy's errAtCur appends the token it stopped on;
+						   here that token is the AS keyword itself, so the
+						   text is fixed. */
+						a.fail("duplicate AS clause (got as)", false, at)
+						return
+					}
+					a.body, a.hasBody, a.twoItemAs = s, true, two
+				}
+			}
 	/* `RETURN expr` (PG14 SQL-standard body). Legacy swallows every remaining
 	   token to the end of the statement into the body, so the join runs from
 	   the expression's first token to the fragment end rather than to the end
 	   of a_expr — which is the same thing whenever RETURN is written last, and
 	   faithfully wrong in the same way when it is not. */
-	| RETURN a_expr               { p := $<p>2; $$ = func(a *fnAttrs) { a.body, a.hasBody, a.isReturnForm = "SELECT "+joinBodyTokens(yylex, p), true, true } }
+	| RETURN a_expr
+			{
+				p, at := $<p>2, $<p>1
+				$$ = func(a *fnAttrs) {
+					if a.hasBody {
+						a.fail("duplicate function body specified", true, at)
+						return
+					}
+					a.body, a.hasBody, a.isReturnForm = "SELECT "+joinBodyTokens(yylex, p), true, true
+				}
+			}
 	| IMMUTABLE                   { $$ = func(a *fnAttrs) { a.volatility = "i" } }
 	| STABLE                      { $$ = func(a *fnAttrs) { a.volatility = "s" } }
 	| VOLATILE                    { $$ = func(a *fnAttrs) { a.volatility = "v" } }
@@ -2207,3 +2253,566 @@ call_named_arg_list:
 call_named_arg:
 		a_expr                              { $$ = callArg{expr: $1} }
 	| a_expr EQUALS_GREATER a_expr          { $$ = callArg{expr: $3, name: exprIdentName($1), named: true} }
+
+/* ============================================================================
+   P5.3 — utility statements: transaction control (SAVEPOINT / RELEASE),
+   prepared statements (PREPARE / EXECUTE / DEALLOCATE), cursors (DECLARE /
+   FETCH / MOVE / CLOSE) and the maintenance commands (ANALYZE / VACUUM /
+   REINDEX / CLUSTER / LOCK / CHECKPOINT / DISCARD).
+
+   Together these are the largest remaining unrouted block in the regress
+   corpus (fetch 139, analyze 130, declare 80, execute 45, reindex 43, vacuum
+   33, savepoint 33, prepare 30, close 29 ... ).
+
+   Legacy is the parity target and is NARROWER than gram.y in several places,
+   so the grammar is deliberately narrowed to match rather than widened to
+   upstream: DISCARD ALL is REJECTED, a cursor may carry only [NO] SCROLL
+   before CURSOR (not BINARY / INSENSITIVE / ASENSITIVE), CLUSTER takes no
+   parenthesised option list, and MOVE is parsed-and-discarded as a
+   CompatNoopStmt with an empty body.
+   ========================================================================= */
+
+savepoint_stmt:
+		SAVEPOINT ColId          { $$ = parser.NewSavepointStmt($<p>1, $2) }
+	/* SAVEPOINT is unreserved and therefore also a ColId, which is exactly the
+	   pinned S/R conflict on RELEASE: shift keeps the keyword reading. */
+	| RELEASE SAVEPOINT ColId    { $$ = parser.NewReleaseSavepointStmt($<p>1, $3) }
+	| RELEASE ColId              { $$ = parser.NewReleaseSavepointStmt($<p>1, $2) }
+
+checkpoint_stmt:
+		CHECKPOINT               { $$ = parser.NewCheckpointStmt($<p>1) }
+
+/* DISCARD ALL is a legacy REJECT ("syntax error at or near \"all\""), so ALL
+   is not an alternative here; TEMPORARY normalises to TEMP. */
+discard_stmt:
+		DISCARD PLANS            { $$ = parser.NewDiscardStmt($<p>1, "PLANS") }
+	| DISCARD SEQUENCES          { $$ = parser.NewDiscardStmt($<p>1, "SEQUENCES") }
+	| DISCARD TEMP               { $$ = parser.NewDiscardStmt($<p>1, "TEMP") }
+	| DISCARD TEMPORARY          { $$ = parser.NewDiscardStmt($<p>1, "TEMP") }
+
+deallocate_stmt:
+		DEALLOCATE ColId             { $$ = parser.NewDeallocateStmt($<p>1, $2) }
+	| DEALLOCATE PREPARE ColId       { $$ = parser.NewDeallocateStmt($<p>1, $3) }
+	| DEALLOCATE ALL                 { $$ = parser.NewDeallocateStmt($<p>1, "") }
+	| DEALLOCATE PREPARE ALL         { $$ = parser.NewDeallocateStmt($<p>1, "") }
+
+prepare_stmt:
+		PREPARE ColId opt_prep_types AS stmt
+			{ $$ = parser.NewPrepareStmt($<p>1, $2, $3, $5) }
+	/* PREPARE TRANSACTION 'gid' is a different statement sharing the keyword
+	   (parser.go parsePrepare); TRANSACTION is reserved and never a ColId, so
+	   the two cannot be confused. */
+	| PREPARE TRANSACTION SCONST
+			{ $$ = parser.NewPrepareTransactionStmt($<p>1, $3) }
+
+/* The declared parameter types are recorded as their plain names; nil when no
+   list was written, which is why this is not an `opt_paren_list` of strings. */
+opt_prep_types:
+		/* empty */                  { $$ = []string(nil) }
+	| '(' prep_type_list ')'         { $$ = $2 }
+
+prep_type_list:
+		fn_type                          { $$ = []string{typeNameOf($1)} }
+	| prep_type_list ',' fn_type         { $$ = append($1, typeNameOf($3)) }
+
+execute_stmt:
+		EXECUTE ColId                        { $$ = parser.NewExecuteStmt($<p>1, $2, nil) }
+	| EXECUTE ColId '(' opt_func_call_args ')' { $$ = parser.NewExecuteStmt($<p>1, $2, $4) }
+
+close_stmt:
+		CLOSE ColId              { $$ = parser.NewCloseStmt($<p>1, $2) }
+	| CLOSE ALL                  { $$ = parser.NewCloseStmt($<p>1, "") }
+
+/* DECLARE name [NO] SCROLL CURSOR [WITH|WITHOUT HOLD] FOR <stmt>. gram.y also
+   accepts BINARY / INSENSITIVE / ASENSITIVE here; legacy rejects all three
+   ("expected CURSOR"), so they stay rejected. */
+declare_stmt:
+		DECLARE ColId opt_cursor_scroll CURSOR opt_cursor_hold FOR stmt
+			{ $$ = parser.NewDeclareCursorStmt($<p>1, $2, $7) }
+
+opt_cursor_scroll:
+		/* empty */   { }
+	| SCROLL          { }
+	| NO SCROLL       { }
+
+opt_cursor_hold:
+		/* empty */       { }
+	| WITH HOLD           { }
+	| WITHOUT HOLD        { }
+
+/* FETCH's direction and count collapse into (Count, Forward): ALL is -1, a
+   bare cursor is 1, and the backward directions only flip Forward — PRIOR and
+   LAST are Count=1 backward, exactly as parser.go records them. */
+fetch_stmt:
+		FETCH fetch_arg          { $$ = fetchStmt($<p>1, $2, false) }
+	| MOVE fetch_arg             { $$ = fetchStmt($<p>1, $2, true) }
+
+fetch_arg:
+	/* `FETCH c`, `FETCH FROM c` and `FETCH IN c` are spelled out rather than
+	   sharing the optional cursor_from used below: an EMPTY nonterminal here
+	   would reduce right after FETCH and decide before the direction word is
+	   visible — 16 extra shift/reduce conflicts. */
+		cursor_ref                                   { $$ = &fetchSpec{count: 1, forward: true, name: $1} }
+	| FROM cursor_ref                                { $$ = &fetchSpec{count: 1, forward: true, name: $2} }
+	| IN_P cursor_ref                                { $$ = &fetchSpec{count: 1, forward: true, name: $2} }
+	| ALL cursor_from cursor_ref                     { $$ = &fetchSpec{count: -1, forward: true, name: $3} }
+	| signed_iconst cursor_from cursor_ref           { $$ = &fetchSpec{count: $1, forward: true, name: $3} }
+	| NEXT cursor_from cursor_ref                    { $$ = &fetchSpec{count: 1, forward: true, name: $3} }
+	| PRIOR cursor_from cursor_ref                   { $$ = &fetchSpec{count: 1, forward: false, name: $3} }
+	| FIRST_P cursor_from cursor_ref                 { $$ = &fetchSpec{count: 1, forward: true, name: $3} }
+	| LAST_P cursor_from cursor_ref                  { $$ = &fetchSpec{count: 1, forward: false, name: $3} }
+	| ABSOLUTE_P signed_iconst cursor_from cursor_ref { $$ = &fetchSpec{count: $2, forward: true, name: $4} }
+	| RELATIVE_P signed_iconst cursor_from cursor_ref { $$ = &fetchSpec{count: $2, forward: true, name: $4} }
+	| FORWARD fetch_count cursor_from cursor_ref     { $$ = &fetchSpec{count: $2, forward: true, name: $4} }
+	| BACKWARD fetch_count cursor_from cursor_ref    { $$ = &fetchSpec{count: $2, forward: false, name: $4} }
+
+fetch_count:
+		/* empty */      { $$ = int64(1) }
+	| signed_iconst      { $$ = $1 }
+	| ALL                { $$ = int64(-1) }
+
+cursor_from:
+		/* empty */   { }
+	| FROM            { }
+	| IN_P            { }
+
+cursor_ref:
+		ColId   { $$ = $1 }
+
+analyze_stmt:
+		analyze_kw opt_vacuum_opts opt_vacuum_targets
+			{
+				v := $2.(*parser.VacuumStmt)
+				tg := $3.(*vacTargets)
+				$$ = parser.NewAnalyzeStmt($<p>1, v.Verbose, v.SkipLocked, tg.names, tg.cols)
+			}
+
+analyze_kw:
+		ANALYZE    { }
+	| ANALYSE      { }
+
+vacuum_stmt:
+		VACUUM opt_vacuum_opts opt_vacuum_targets
+			{
+				// The option list allocates the statement (it is the fold's
+				// accumulator), so the position is stamped by rebuilding the
+				// carrier here rather than mutating an unexported field.
+				v := vacuumAt($<p>1, $2)
+				tg := $3.(*vacTargets)
+				v.Targets, v.TargetCols = tg.names, tg.cols
+				$$ = v
+			}
+
+/* The bare-keyword prefix (`VACUUM FULL FREEZE VERBOSE ANALYZE t`) and the
+   parenthesised list are two different vocabularies in legacy: only the four
+   keyword options exist outside the parens. Sharing one nonterminal would
+   accept `VACUUM skip_locked t`, which legacy rejects. */
+opt_vacuum_opts:
+		vacuum_kw_opts                   { $$ = $1 }
+	| '(' vacuum_opt_list ')'            { $$ = $2 }
+
+vacuum_kw_opts:
+		/* empty */                      { $$ = parser.NewVacuumStmt(0) }
+	| vacuum_kw_opts vacuum_kw_opt       { v := $1.(*parser.VacuumStmt); $2.(func(*parser.VacuumStmt))(v); $$ = v }
+
+vacuum_kw_opt:
+		VERBOSE      { $$ = func(v *parser.VacuumStmt) { v.Verbose = true } }
+	| analyze_kw     { $$ = func(v *parser.VacuumStmt) { v.Analyze = true } }
+	| FULL           { $$ = func(v *parser.VacuumStmt) { v.Full = true } }
+	| FREEZE         { $$ = func(v *parser.VacuumStmt) { v.Freeze = true } }
+
+vacuum_opt_list:
+		vacuum_opt                          { v := parser.NewVacuumStmt(0); $1.(func(*parser.VacuumStmt))(v); $$ = v }
+	| vacuum_opt_list ',' vacuum_opt        { v := $1.(*parser.VacuumStmt); $3.(func(*parser.VacuumStmt))(v); $$ = v }
+
+/* ONE name+value rule, not one alternative per option: `VERBOSE`, `VERBOSE
+   true` and `skip_locked` would otherwise be three productions whose first
+   symbol reduces at the same point, which was 1584 reduce/reduce. The value is
+   optional and its meaning is per-option (ignored for the plain booleans,
+   three-valued for index_cleanup, negating for truncate/process_*). */
+vacuum_opt:
+		vacuum_opt_name opt_opt_value    { $$ = vacuumNamedOpt($1, $2) }
+
+/* ColId already covers the unreserved names (truncate, parallel, skip_locked,
+   index_cleanup ...); only the type_func_name keywords need spelling out. */
+vacuum_opt_name:
+		ColId       { $$ = $1 }
+	| VERBOSE       { $$ = "verbose" }
+	| analyze_kw    { $$ = "analyze" }
+	| FULL          { $$ = "full" }
+	| FREEZE        { $$ = "freeze" }
+
+opt_opt_value:
+		/* empty */   { $$ = "" }
+	| TRUE_P          { $$ = "true" }
+	| FALSE_P         { $$ = "false" }
+	| ColId           { $$ = $1 }
+	| SCONST          { $$ = $1 }
+	| signed_iconst   { $$ = strconv.FormatInt($1, 10) }
+
+opt_vacuum_targets:
+		/* empty */          { $$ = &vacTargets{} }
+	| vacuum_target_list     { $$ = $1 }
+
+vacuum_target_list:
+		vacuum_target                            { $$ = appendVacTarget(nil, $1.(*vacTarget)) }
+	| vacuum_target_list ',' vacuum_target       { $$ = appendVacTarget($1.(*vacTargets), $3.(*vacTarget)) }
+
+vacuum_target:
+		qualified_name                       { $$ = &vacTarget{name: objectNameFromQn($1)} }
+	| qualified_name '(' colid_list ')'      { $$ = &vacTarget{name: objectNameFromQn($1), cols: $3} }
+
+/* CONCURRENTLY may sit on EITHER side of the object kind: legacy checks for it
+   before the kind switch AND again after it (parser.go:2608 / :2627), so
+   `REINDEX CONCURRENTLY INDEX i` and `REINDEX INDEX CONCURRENTLY i` are both
+   accepted. IF EXISTS is parsed and discarded, as in legacy. */
+reindex_stmt:
+		REINDEX opt_reindex_opts opt_concurrently reindex_kind opt_concurrently opt_if_exists_drop qualified_name
+			{ $$ = parser.NewReindexStmt($<p>1, $2, $3 || $5, $4, qnText($7)) }
+
+opt_reindex_opts:
+		/* empty */                    { $$ = false }
+	| '(' reindex_opt_list ')'         { $$ = $2 }
+
+reindex_opt_list:
+		reindex_opt                        { $$ = $1 }
+	| reindex_opt_list ',' reindex_opt     { $$ = $1 || $3 }
+
+reindex_opt:
+		VERBOSE            { $$ = true }
+	| TABLESPACE ColId     { $$ = false }
+
+reindex_kind:
+		INDEX       { $$ = "INDEX" }
+	| TABLE         { $$ = "TABLE" }
+	| DATABASE      { $$ = "DATABASE" }
+	| SCHEMA        { $$ = "SCHEMA" }
+	| SYSTEM_P      { $$ = "SYSTEM" }
+
+/* CLUSTER takes NO parenthesised option list in legacy ("expected identifier
+   (got (")" ), only the bare VERBOSE keyword. */
+cluster_stmt:
+		CLUSTER opt_verbose_kw                                { $$ = parser.NewClusterStmt($<p>1, $2, nil, "") }
+	| CLUSTER opt_verbose_kw qualified_name opt_cluster_using
+			{ n := objectNameFromQn($3); $$ = parser.NewClusterStmt($<p>1, $2, &n, $4) }
+
+opt_verbose_kw:
+		/* empty */   { $$ = false }
+	| VERBOSE         { $$ = true }
+
+opt_cluster_using:
+		/* empty */     { $$ = "" }
+	| USING ColId       { $$ = $2 }
+
+/* LockTableRelation has no ONLY flag, so `LOCK TABLE ONLY t` records the same
+   relation an unqualified one does — legacy parses and drops the keyword. */
+lock_stmt:
+		LOCK_P opt_TABLE_kw lock_rel_list opt_lock_mode opt_nowait
+			{ $$ = parser.NewLockTableStmt($<p>1, $3, $4, $5) }
+
+opt_TABLE_kw:
+		/* empty */   { }
+	| TABLE           { }
+
+lock_rel_list:
+		lock_rel                        { $$ = []parser.LockTableRelation{$1} }
+	| lock_rel_list ',' lock_rel        { $$ = append($1, $3) }
+
+lock_rel:
+		opt_ONLY_kw qualified_name      { n := objectNameFromQn($2); $$ = parser.NewLockTableRelation(n.Schema, n.Name) }
+
+opt_lock_mode:
+		/* empty */                     { $$ = "AccessExclusiveLock" }
+	| IN_P lock_mode_words MODE
+			{
+				n, ok := parser.LockModeName($2)
+				if !ok {
+					yylex.Error("unrecognised lock mode")
+					return 1
+				}
+				$$ = n
+			}
+
+lock_mode_words:
+		lock_mode_word                        { $$ = []string{$1} }
+	| lock_mode_words lock_mode_word          { $$ = append($1, $2) }
+
+/* ACCESS / SHARE / ROW / UPDATE are all ColIds or unreserved words except
+   EXCLUSIVE, so the list is spelled from the exact vocabulary of
+   parser.go's lockModeNames table. */
+lock_mode_word:
+		ACCESS      { $$ = "access" }
+	| SHARE         { $$ = "share" }
+	| ROW           { $$ = "row" }
+	| UPDATE        { $$ = "update" }
+	| EXCLUSIVE     { $$ = "exclusive" }
+
+opt_nowait:
+		/* empty */   { $$ = false }
+	| NOWAIT          { $$ = true }
+
+/* ============================================================================
+   P5.4 — MERGE (gram.y MergeStmt). 106 unrouted regress fragments, plus the
+   four `WITH ... (MERGE ...)` / `PREPARE ... AS MERGE` fragments that were the
+   last yacc-side rejects in already-routed classes.
+
+   INTO is optional in legacy (parser.go parseMerge accepts a bare `MERGE t`),
+   and both the target and the source are base_table_refs — the same
+   nonterminal UPDATE/DELETE use — so a parenthesised sub-select source with an
+   alias comes for free.
+   ========================================================================= */
+
+merge_stmt:
+		MERGE opt_INTO_kw base_table_ref USING base_table_ref ON a_expr merge_when_list opt_returning
+			{ $$ = parser.NewMergeStmt($<p>1, $3, $5, $7, $8, $9) }
+
+opt_INTO_kw:
+		/* empty */   { }
+	| INTO            { }
+
+/* Legacy loops `for p.cur() == WHEN`, so an empty clause list is accepted. */
+merge_when_list:
+		/* empty */                        { $$ = []*parser.MergeWhenClause(nil) }
+	| merge_when_list merge_when_clause    { $$ = append($1, $2) }
+
+merge_when_clause:
+		WHEN merge_match opt_merge_and THEN merge_action
+			{
+				c := $2
+				c.Condition = $3
+				applyMergeAction(c, $5)
+				$$ = c
+			}
+
+merge_match:
+		MATCHED                      { $$ = parser.NewMergeWhenClause(0, true, false, false) }
+	| NOT MATCHED                    { $$ = parser.NewMergeWhenClause(0, false, false, false) }
+	| NOT MATCHED BY ColId           { $$ = mergeNotMatchedBy($4) }
+
+opt_merge_and:
+		/* empty */   { $$ = nil }
+	| AND a_expr      { $$ = $2 }
+
+merge_action:
+		UPDATE SET update_set_list        { $$ = &mergeAction{kind: parser.MergeActionUpdate, assigns: $3} }
+	| DELETE_P                            { $$ = &mergeAction{kind: parser.MergeActionDelete} }
+	| DO NOTHING                          { $$ = &mergeAction{kind: parser.MergeActionDoNothing} }
+	/* VALUES_LA, not VALUES: base_yylex substitutes the lookahead variant
+	   whenever VALUES is followed by '(' (base_yylex.go), so the plain token
+	   never reaches this position. `DEFAULT VALUES` below keeps plain VALUES
+	   because no paren follows it. */
+	| INSERT merge_ins_cols VALUES_LA '(' expr_list ')'
+			{ $$ = &mergeAction{kind: parser.MergeActionInsert, cols: $2, vals: $5} }
+	/* DEFAULT VALUES leaves InsertValues nil, which is how the executor tells
+	   the two apart. */
+	| INSERT merge_ins_cols DEFAULT VALUES
+			{ $$ = &mergeAction{kind: parser.MergeActionInsert, cols: $2} }
+
+merge_ins_cols:
+		/* empty */             { $$ = []string(nil) }
+	| '(' colid_list ')'        { $$ = $2 }
+
+/* ============================================================================
+   P5.5 — CREATE / DROP TYPE, CREATE / DROP DOMAIN, CREATE SEQUENCE, DO.
+
+   Legacy parses NONE of these bodies as expressions: it walks raw tokens and
+   stores their join (parseCreateType's composite/range scans,
+   parseDomainCheckExpr). The grammar therefore does the structural work — so a
+   malformed body is still a syntax error — and the ACTION rebuilds the stored
+   string from the token stream, the same division of labour CHECK bodies use.
+   ========================================================================= */
+
+create_type_stmt:
+	/* Shell type: `CREATE TYPE t` records the name and nothing else. */
+		CREATE TYPE_P qualified_name
+			{ $$ = parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3)) }
+	/* Base type: legacy sets ONLY HasOptions and skips the whole list. */
+	| CREATE TYPE_P qualified_name '(' type_opt_list ')'
+			{
+				st := parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3))
+				st.HasOptions = true
+				$$ = st
+			}
+	| CREATE TYPE_P qualified_name AS ENUM_P '(' enum_val_list ')'
+			{
+				st := parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3))
+				st.IsEnum, st.EnumValues = true, $7
+				$$ = st
+			}
+	| CREATE TYPE_P qualified_name AS '(' type_field_list ')'
+			{
+				st := parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3))
+				st.IsComposite, st.CompositeFields = true, $6
+				$$ = st
+			}
+	| CREATE TYPE_P qualified_name AS RANGE '(' range_opt_list ')'
+			{
+				st := parser.NewCreateTypeStmt($<p>1, objectNameFromQn($3))
+				st.IsRange = true
+				applyRangeOpts(st, $7)
+				$$ = st
+			}
+
+/* Legacy rejects an EMPTY enum list ("expected string literal in ENUM value
+   list"), so this is not an optional list. */
+enum_val_list:
+		SCONST                       { $$ = []string{$1} }
+	| enum_val_list ',' SCONST       { $$ = append($1, $3) }
+
+type_field_list:
+		type_field                        { $$ = []parser.TypeField{$1} }
+	| type_field_list ',' type_field      { $$ = append($1, $3) }
+
+/* ColType is the RAW token join legacy stores, not a rendered type name:
+   `character varying(20)` is kept as "character varying ( 20 )". The join runs
+   from the type's first token to the field's terminator, exactly as
+   parseCreateType's inner scan does. */
+type_field:
+		ColId col_type_name opt_field_collate
+			{ $$ = parser.NewTypeField(lowerIdent($1), rawTypeSpan(yylex, $<p>2), $3) }
+
+opt_field_collate:
+		/* empty */          { $$ = "" }
+	| COLLATE qualified_name { $$ = qnLastPart($2) }
+
+/* The base-type option list reaches the AST only as HasOptions, so the values
+   are accepted in the shapes gram.y allows and then dropped. */
+type_opt_list:
+		type_opt                        { }
+	| type_opt_list ',' type_opt        { }
+
+/* gram.y's def_elem takes a ColLabel, which upstream widens to EVERY keyword.
+   This grammar's ColLabel already reaches type_func_name_keyword (so LIKE and
+   ANALYZE are covered — `create type t (..., like = int8)` is 7 regress
+   fragments); only the RESERVED words need their own alternative, and DEFAULT
+   is the one that shows up as a base-type option name. */
+type_opt:
+		type_opt_name                       { }
+	| type_opt_name '=' type_opt_value      { }
+
+type_opt_name:
+		ColLabel     { }
+	| DEFAULT        { }
+
+type_opt_value:
+		ColId                           { }
+	| ColId '(' opt_func_args ')'       { }
+	| ColId '.' ColId                   { }
+	| SCONST                            { }
+	| signed_iconst                     { }
+	| FCONST                            { }
+	| TRUE_P                            { }
+	| FALSE_P                           { }
+
+range_opt_list:
+		range_opt                       { $$ = appendRangeOpt(nil, $1.(*kvPair)) }
+	| range_opt_list ',' range_opt      { $$ = appendRangeOpt($1, $3.(*kvPair)) }
+
+/* SUBTYPE's value is a raw token join (it may be a multi-word type name); the
+   other three are object names of which legacy keeps only the last part. */
+range_opt:
+		ColId '=' range_opt_value
+			{ $$ = &kvPair{key: lowerIdent($1), val: rawTypeSpan(yylex, $<p>3), last: $3} }
+	/* COLLATION is a type_func_name keyword, not a ColId, so it needs its own
+	   alternative; the other three option names are ordinary identifiers. */
+	| COLLATION '=' range_opt_value
+			{ $$ = &kvPair{key: "collation", val: rawTypeSpan(yylex, $<p>3), last: $3} }
+
+/* `SUBTYPE = int4[]` is a real spelling, so the value takes an array tail;
+   the three name-valued options never carry one and ignore it. */
+range_opt_value:
+		qualified_name opt_array_tail    { $$ = qnLastPart($1) }
+
+drop_type_stmt:
+		DROP TYPE_P opt_if_exists_drop drop_name_list opt_drop_behavior
+			{ $$ = parser.NewDropTypeStmt($<p>1, $4, $3, $5 == "cascade") }
+
+drop_domain_stmt:
+		DROP DOMAIN_P opt_if_exists_drop drop_name_list opt_drop_behavior
+			{ $$ = parser.NewDropDomainStmt($<p>1, $4, $3, $5 == "cascade") }
+
+/* AS is optional (`CREATE DOMAIN d int`), and the base type is stored as a
+   NAME plus separate typmod args, not as a ColumnType. */
+create_domain_stmt:
+		CREATE DOMAIN_P qualified_name opt_AS_kw col_type_name domain_constraints
+			{
+				tw := $5.(*typeWithArgs)
+				ct := colTypeOf(tw)
+				nm := ct.Name
+				if ct.Schema != "" {
+					nm = ct.Schema + "." + ct.Name
+				}
+				if ct.IsArray {
+					nm += "[]"
+				}
+				st := parser.NewCreateDomainStmt($<p>1, objectNameFromQn($3), nm, ct.Args)
+				applyDomainConstraints(st, $6)
+				$$ = st
+			}
+
+opt_AS_kw:
+		/* empty */   { }
+	| AS              { }
+
+domain_constraints:
+		/* empty */                           { $$ = []any(nil) }
+	| domain_constraints domain_constraint    { $$ = append($1, $2) }
+
+domain_constraint:
+		NOT NULL_P                { $$ = domainNotNull(true) }
+	| NULL_P                      { $$ = domainNotNull(false) }
+	| DEFAULT a_expr              { $$ = domainDefault($2) }
+	| check_body                  { $$ = domainCheck(yylex, "", $<p>1) }
+	| CONSTRAINT ColId check_body { $$ = domainCheck(yylex, $2, $<p>3) }
+	/* COLLATE on a domain is parsed and discarded by legacy. */
+	| COLLATE qualified_name      { $$ = domainNoop() }
+
+create_sequence_stmt:
+		CREATE opt_create_modifier SEQUENCE opt_if_not_exists qualified_name seq_opts
+			{
+				pfx, _ := $2.(*createPrefix)
+				temp, unlogged := false, false
+				if pfx != nil {
+					temp, unlogged = pfx.temporary, pfx.unlogged
+				}
+				st := parser.NewCreateSequenceStmt($<p>1, objectNameFromQn($5), temp, unlogged, $4)
+				applySeqOpts(st, $6)
+				$$ = st
+			}
+
+seq_opts:
+		/* empty */          { $$ = []any(nil) }
+	| seq_opts seq_opt       { $$ = append($1, $2) }
+
+/* NO MINVALUE / NO MAXVALUE / NO CYCLE all leave the field unset — legacy
+   consumes the word and records nothing, so CYCLE followed by NO CYCLE keeps
+   Cycle=true, which is what the option loop does. */
+seq_opt:
+		AS ColId                     { $$ = seqDataType($2) }
+	| INCREMENT opt_BY_kw signed_iconst { $$ = seqInt("increment", $3) }
+	| MINVALUE signed_iconst         { $$ = seqInt("minvalue", $2) }
+	| MAXVALUE signed_iconst         { $$ = seqInt("maxvalue", $2) }
+	| START opt_WITH_kw signed_iconst { $$ = seqInt("start", $3) }
+	| CACHE signed_iconst            { $$ = seqInt("cache", $2) }
+	| CYCLE                          { $$ = seqCycle() }
+	| NO MINVALUE                    { $$ = seqNoop() }
+	| NO MAXVALUE                    { $$ = seqNoop() }
+	| NO CYCLE                       { $$ = seqNoop() }
+	| OWNED BY seq_owner             { $$ = seqOwnedBy($3) }
+
+opt_BY_kw:
+		/* empty */   { }
+	| BY              { }
+
+opt_WITH_kw:
+		/* empty */   { }
+	| WITH            { }
+
+/* OWNED BY NONE records an EMPTY owner, not the word "none". */
+seq_owner:
+		qualified_name       { $$ = seqOwnerName($1) }
+
+do_stmt:
+	/* Legacy accepts ONLY `DO <dollar-quoted body>` — no LANGUAGE clause on
+	   either side ("expected dollar-quoted string for DO body"). */
+		DO SCONST            { $$ = parser.NewDoStmt($<p>1, "plpgsql", $2) }

@@ -35,6 +35,8 @@ func TestExplainStatement(t *testing.T) {
 		"explain (costs off) insert into t values (1)",
 		"explain (costs off) create table t as select 1",
 		"explain (costs off) with c as (select 1) select * from c",
+		"explain execute p",
+		"explain (costs off) merge into t using u on true when matched then delete",
 		"EXPLAIN (COSTS OFF) SELECT * FROM t WHERE a = 1 ORDER BY b",
 	} {
 		assertParity(t, q)
@@ -58,14 +60,14 @@ func TestExplainRoutingFollowsInner(t *testing.T) {
 		"explain (costs off) insert into t values (1)",
 		"explain analyze verbose update t set a = 1",
 		"explain (costs off) with c as (select 1) select * from c",
+		"explain execute p",
+		"explain (costs off) merge into t using u on true when matched then delete",
 	} {
 		if !routed(q) {
 			t.Errorf("not routed: %q", q)
 		}
 	}
 	for _, q := range []string{
-		"explain (costs off) merge into t using u on true when matched then delete",
-		"explain execute p",
 		"explain (costs off) copy t from stdin",
 	} {
 		if routed(q) {

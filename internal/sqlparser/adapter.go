@@ -534,6 +534,19 @@ func (l *lexerState) Error(msg string) {
 	}
 }
 
+// raise records a SEMANTIC error the grammar detects in an action — a message
+// legacy produces after parsing succeeds, not a parse failure. Error() above
+// always rewrites its argument into "syntax error at or near X", which is
+// exactly wrong for these, so they need their own entry point. raw mirrors
+// SyntaxError.Raw: raw errors print their message verbatim, non-raw ones are
+// wrapped the way parser.errAtCur's are.
+func (l *lexerState) raise(msg string, raw bool, pos int) {
+	if l.err != nil {
+		return
+	}
+	l.err = &parser.SyntaxError{Message: msg, Raw: raw, Pos: pos}
+}
+
 // pgQuote renders s the way psql echoes tokens in syntax errors: double
 // quotes, doubling any embedded quote.
 func pgQuote(s string) string {

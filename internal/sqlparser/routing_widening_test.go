@@ -41,12 +41,15 @@ func TestRoutingModifiersAndRecursive(t *testing.T) {
 	for _, q := range []string{
 		"CREATE TEMP VIEW v AS SELECT 1",
 		"CREATE TEMP SEQUENCE s",
-		"WITH c AS (SELECT 1) MERGE INTO t USING c ON true WHEN MATCHED THEN DELETE",
 	} {
 		if routed(q) {
 			t.Errorf("unexpectedly routed: %q", q)
 		}
 	}
+	// MergeStmt carries no WITH clause (neither in the AST nor in gram.y's
+	// MergeStmt), and legacy says so outright: "WITH clause must be followed
+	// by ...". Routing MERGE must not quietly make the combination legal.
+	assertBothReject(t, "WITH c AS (SELECT 1) MERGE INTO t USING c ON true WHEN MATCHED THEN DELETE")
 }
 
 // TestRoutingWideningGaps pins the four grammar gaps the wider routing

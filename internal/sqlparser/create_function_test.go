@@ -72,6 +72,19 @@ func TestCreateFunctionFamily(t *testing.T) {
 	// reject them too rather than silently widening the accepted language.
 	assertBothReject(t, "CREATE FUNCTION f(a int = 3) RETURNS int LANGUAGE sql AS 'x'")
 	assertBothReject(t, "CREATE FUNCTION f(OUT a int, OUT b int) LANGUAGE sql AS 'x'")
+	// Four errors legacy raises AFTER a successful parse, all of which the
+	// create_function_sql regress case checks byte-for-byte. The grammar has no
+	// way to fail mid-attribute-list (the reduce has already happened), so the
+	// attribute carrier records the first one and the statement rule raises it.
+	// A body is MANDATORY, and `AS 'a','b'` is LANGUAGE C only.
+	assertBothReject(t, "CREATE FUNCTION f(x int) RETURNS int LANGUAGE SQL AS $$ SELECT x * 2 $$ RETURN x * 3")
+	assertBothReject(t, "CREATE FUNCTION test1 (int) RETURNS int LANGUAGE SQL AS 'a', 'b'")
+	assertBothReject(t, "CREATE FUNCTION f() RETURNS int LANGUAGE sql")
+	assertBothReject(t, "CREATE PROCEDURE p() LANGUAGE sql")
+	assertBothReject(t, "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'x' AS 'y'")
+	assertBothReject(t, "CREATE FUNCTION f() RETURNS int LANGUAGE sql LANGUAGE c AS 'x'")
+	// ... but the C two-item form itself stays legal.
+	assertParity(t, "CREATE FUNCTION test1 (int) RETURNS int LANGUAGE C AS 'a', 'b'")
 }
 
 // TestCreateRoutineRoutingVetoes — the two sub-forms the grammar deliberately

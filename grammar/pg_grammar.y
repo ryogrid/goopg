@@ -79,6 +79,26 @@
 
 %type <strs>	pk_cols uq_cols col_alias_list cte_col_list opt_name_list_p
 %type <onames>	drop_name_list
+%type <strs>	enum_val_list
+%type <tflds>	type_field_list
+%type <tfld>	type_field
+%type <str>	opt_field_collate range_opt_value
+%type <node>	range_opt seq_opt domain_constraint
+%type <nodes>	range_opt_list domain_constraints seq_opts
+%type <str>	seq_owner
+%type <mwc>	merge_when_clause merge_match
+%type <mwcs>	merge_when_list
+%type <node>	merge_action
+%type <strs>	merge_ins_cols
+%type <expr>	opt_merge_and
+%type <node>	fetch_arg opt_vacuum_opts vacuum_kw_opts vacuum_kw_opt vacuum_opt_list vacuum_opt opt_vacuum_targets vacuum_target_list vacuum_target
+%type <str>	vacuum_opt_name opt_opt_value
+%type <strs>	opt_prep_types prep_type_list lock_mode_words
+%type <str>	cursor_ref reindex_kind opt_cluster_using lock_mode_word opt_lock_mode
+%type <i64>	fetch_count
+%type <b>	opt_reindex_opts reindex_opt_list reindex_opt opt_verbose_kw opt_nowait
+%type <lrels>	lock_rel_list
+%type <lrel>	lock_rel
 %type <node>	at_constraint at_constr_tail fn_type fn_return fn_attrs fn_attr func_arg fn_drop_item opt_call_named_args call_named_arg_list call_named_arg
 %type <fargs>	opt_func_args func_arg_list_p
 %type <fitems>	fn_drop_extras
@@ -152,7 +172,7 @@
 %type <stmt>	set_transaction_stmt
 %type <stmt>	refresh_matview_stmt drop_matview_stmt
 %type <b>	opt_concurrently
-%type <stmt>	create_function_stmt drop_function_stmt call_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
+%type <stmt>	explainable_stmt merge_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
 %type <node>	table_element_list table_element col_type_name col_constraints col_constraint
 %type <strs>	str_pair_list
@@ -211,6 +231,24 @@ root:
 			yylex.(*lexerState).out = $1
 		}
 
+/* stmt = explainable_stmt + ANALYZE. The split exists because EXPLAIN's
+   ANALYZE is CONSUMED AS THE OPTION whenever it follows EXPLAIN — legacy
+   rejects `EXPLAIN ANALYZE ANALYZE t` and reads `EXPLAIN ANALYZE t` as the
+   option plus an inner `t` — so an inner statement can never BE an ANALYZE.
+   Sharing one `stmt` between EXPLAIN's inner and the top level made that
+   ambiguity real: 30 shift/reduce conflicts, one per statement keyword.
+   Upstream draws the same line (gram.y ExplainableStmt). The parenthesised
+   option form has no such ambiguity and keeps the full `stmt`. */
+stmt:
+		explainable_stmt
+			{
+				$$ = $1
+			}
+	| analyze_stmt
+			{
+				$$ = $1
+			}
+
 stmt_list:
 		stmt
 			{
@@ -225,7 +263,7 @@ stmt_list:
 				$$ = $1 // trailing semicolon(s), gram.y stmtmulti ';' alt
 			}
 
-stmt:
+explainable_stmt:
 	/* EXPLAIN — gram.y ExplainStmt. The inner statement is any routed `stmt`;
 	   the dispatcher only routes an EXPLAIN whose inner statement it would
 	   route on its own (explainInnerRouted), so an unported inner class falls
@@ -233,23 +271,23 @@ stmt:
 	   the parenthesised option list are both legacy-accepted; the list's
 	   names and values are validated by applyExplainOpts exactly as legacy's
 	   parseExplainOneOption does. */
-		EXPLAIN stmt
+		EXPLAIN explainable_stmt
 			{
 				$$ = parser.NewExplainStmt($<p>1, parser.ExplainOptions{}, $2)
 			}
-	| EXPLAIN ANALYZE stmt
+	| EXPLAIN ANALYZE explainable_stmt
 			{
 				o := parser.ExplainOptions{Analyze: true}
 				o.Set.Analyze = true
 				$$ = parser.NewExplainStmt($<p>1, o, $3)
 			}
-	| EXPLAIN VERBOSE stmt
+	| EXPLAIN VERBOSE explainable_stmt
 			{
 				o := parser.ExplainOptions{Verbose: true}
 				o.Set.Verbose = true
 				$$ = parser.NewExplainStmt($<p>1, o, $3)
 			}
-	| EXPLAIN ANALYZE VERBOSE stmt
+	| EXPLAIN ANALYZE VERBOSE explainable_stmt
 			{
 				o := parser.ExplainOptions{Analyze: true, Verbose: true}
 				o.Set.Analyze, o.Set.Verbose = true, true
@@ -268,8 +306,7 @@ stmt:
 				// handing one of them a CreateTableStmt panics. INTO is only
 				// legal on a top-level statement anyway.
 				$$ = intoWrap(yylex, $1)
-			}
-	| insert_stmt
+			}	| insert_stmt
 			{
 				$$ = $1
 			}
@@ -281,11 +318,31 @@ stmt:
 			{
 				$$ = $1
 			}
-	| create_table_stmt
 	| create_table_stmt_as
 			{
 				$$ = $1
 			}
+	| create_matview_stmt
+			{
+				$$ = $1
+			}
+	| refresh_matview_stmt
+			{
+				$$ = $1
+			}
+	| declare_stmt
+			{
+				$$ = $1
+			}
+	| execute_stmt
+			{
+				$$ = $1
+			}
+	| merge_stmt
+			{
+				$$ = $1
+			}
+	| create_table_stmt
 	| drop_table_stmt
 			{
 				$$ = $1
@@ -350,15 +407,75 @@ stmt:
 			{
 				$$ = $1
 			}
+	| create_type_stmt
+			{
+				$$ = $1
+			}
+	| drop_type_stmt
+			{
+				$$ = $1
+			}
+	| create_domain_stmt
+			{
+				$$ = $1
+			}
+	| drop_domain_stmt
+			{
+				$$ = $1
+			}
+	| create_sequence_stmt
+			{
+				$$ = $1
+			}
+	| do_stmt
+			{
+				$$ = $1
+			}
+	| savepoint_stmt
+			{
+				$$ = $1
+			}
+	| checkpoint_stmt
+			{
+				$$ = $1
+			}
+	| discard_stmt
+			{
+				$$ = $1
+			}
+	| deallocate_stmt
+			{
+				$$ = $1
+			}
+	| prepare_stmt
+			{
+				$$ = $1
+			}
+	| close_stmt
+			{
+				$$ = $1
+			}
+	| fetch_stmt
+			{
+				$$ = $1
+			}
+	| vacuum_stmt
+			{
+				$$ = $1
+			}
+	| reindex_stmt
+			{
+				$$ = $1
+			}
+	| cluster_stmt
+			{
+				$$ = $1
+			}
+	| lock_stmt
+			{
+				$$ = $1
+			}
 	| drop_view_stmt
-			{
-				$$ = $1
-			}
-	| create_matview_stmt
-			{
-				$$ = $1
-			}
-	| refresh_matview_stmt
 			{
 				$$ = $1
 			}
@@ -1791,6 +1908,7 @@ cte_dml_body:
 		insert_stmt   { $$ = $1 }
 	| update_stmt     { $$ = $1 }
 	| delete_stmt     { $$ = $1 }
+	| merge_stmt      { $$ = $1 }
 
 cte_col_list:
 		/* empty */           { $$ = nil }

@@ -16,6 +16,8 @@ package parser
 //   - remaining arguments map to exported fields in declaration order,
 //   - nodes with only a pos (NullConst) take just the position.
 
+import "strings"
+
 func NewIntegerConst(pos int, value int64) *IntegerConst {
 	return &IntegerConst{pos: pos, Value: value}
 }
@@ -587,4 +589,166 @@ func NormalizeFloatTypeName(name string, args []int64) (string, []int64, bool) {
 		return name, args, false
 	}
 	return n, a, true
+}
+
+// ---------------------------------------------------------------------------
+// P5.3 utility statements: transaction control, prepared statements, cursors,
+// maintenance commands. All of these are plain carriers; the goyacc grammar
+// fills them the way the corresponding parser.go/ddl.go path does.
+// ---------------------------------------------------------------------------
+
+func NewSavepointStmt(pos int, name string) *SavepointStmt {
+	return &SavepointStmt{pos: pos, Name: name}
+}
+
+func NewReleaseSavepointStmt(pos int, name string) *ReleaseSavepointStmt {
+	return &ReleaseSavepointStmt{pos: pos, Name: name}
+}
+
+func NewCheckpointStmt(pos int) *CheckpointStmt { return &CheckpointStmt{pos: pos} }
+
+func NewDiscardStmt(pos int, mode string) *DiscardStmt {
+	return &DiscardStmt{pos: pos, Mode: mode}
+}
+
+// NewDeallocateStmt — an empty name means DEALLOCATE ALL.
+func NewDeallocateStmt(pos int, name string) *DeallocateStmt {
+	return &DeallocateStmt{pos: pos, Name: name}
+}
+
+func NewPrepareStmt(pos int, name string, paramTypes []string, query Stmt) *PrepareStmt {
+	return &PrepareStmt{pos: pos, Name: name, ParamTypes: paramTypes, Query: query}
+}
+
+// NewCloseStmt — an empty name means CLOSE ALL.
+func NewCloseStmt(pos int, name string) *CloseStmt {
+	return &CloseStmt{pos: pos, Name: name}
+}
+
+func NewDeclareCursorStmt(pos int, name string, query Stmt) *DeclareCursorStmt {
+	return &DeclareCursorStmt{pos: pos, Name: name, Query: query}
+}
+
+// NewFetchStmt — Count < 0 means ALL; Forward false means BACKWARD.
+func NewFetchStmt(pos int, name string, count int64, forward bool) *FetchStmt {
+	return &FetchStmt{pos: pos, CursorName: name, Count: count, Forward: forward}
+}
+
+func NewAnalyzeStmt(pos int, verbose, skipLocked bool, targets []ObjectName, cols [][]string) *AnalyzeStmt {
+	return &AnalyzeStmt{pos: pos, Verbose: verbose, SkipLocked: skipLocked, Targets: targets, TargetCols: cols}
+}
+
+// NewVacuumStmt starts from the defaults parseVacuum uses (ParallelWorkers -1
+// = unspecified); the option list mutates the returned statement in place.
+func NewVacuumStmt(pos int) *VacuumStmt {
+	return &VacuumStmt{pos: pos, ParallelWorkers: -1}
+}
+
+func NewReindexStmt(pos int, verbose, concurrently bool, objType, name string) *ReindexStmt {
+	return &ReindexStmt{pos: pos, Verbose: verbose, Concurrently: concurrently, ObjectType: objType, Name: name}
+}
+
+func NewClusterStmt(pos int, verbose bool, target *ObjectName, indexName string) *ClusterStmt {
+	c := &ClusterStmt{pos: pos, Verbose: verbose, IndexName: indexName}
+	if target != nil {
+		c.Target = target
+	}
+	return c
+}
+
+func NewLockTableRelation(schema, name string) LockTableRelation {
+	return LockTableRelation{Schema: schema, Name: name}
+}
+
+func NewLockTableStmt(pos int, rels []LockTableRelation, mode string, noWait bool) *LockTableStmt {
+	return &LockTableStmt{pos: pos, Relations: rels, Mode: mode, NoWait: noWait}
+}
+
+// NewCompatNoopStmt builds the parsed-and-ignored statement legacy records for
+// commands goopg accepts but does not act on (MOVE and friends).
+func NewCompatNoopStmt(pos int, tag string) *CompatNoopStmt {
+	return &CompatNoopStmt{pos: pos, Tag: tag}
+}
+
+// LockModeName maps the lock-mode words of `LOCK ... IN <mode> MODE` to
+// PostgreSQL's internal lock name, exactly as parser.go's lockModeNames table
+// does; ok is false when the words are not a recognised mode.
+func LockModeName(words []string) (string, bool) {
+	for _, m := range lockModeNames {
+		if len(m.words) != len(words) {
+			continue
+		}
+		match := true
+		for i, w := range m.words {
+			if !strings.EqualFold(w, words[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return m.name, true
+		}
+	}
+	return "", false
+}
+
+// NewVacuumStmtFrom copies an accumulated VACUUM option set onto a statement
+// stamped with the real position. The goyacc option list must allocate its own
+// accumulator before the position is known, and pos is unexported.
+func NewVacuumStmtFrom(pos int, src *VacuumStmt) *VacuumStmt {
+	out := *src
+	out.pos = pos
+	return &out
+}
+
+func NewPrepareTransactionStmt(pos int, gid string) *PrepareTransactionStmt {
+	return &PrepareTransactionStmt{pos: pos, Gid: gid}
+}
+
+// ---------------------------------------------------------------------------
+// P5.4 MERGE
+// ---------------------------------------------------------------------------
+
+func NewMergeStmt(pos int, target, source RangeVar, on Expr, clauses []*MergeWhenClause, returning []ResTarget) *MergeStmt {
+	return &MergeStmt{pos: pos, Target: target, Source: source, On: on, Clauses: clauses, Returning: returning}
+}
+
+func NewMergeWhenClause(pos int, matched, bySource, byTarget bool) *MergeWhenClause {
+	return &MergeWhenClause{pos: pos, Matched: matched, BySource: bySource, ByTarget: byTarget}
+}
+
+// ---------------------------------------------------------------------------
+// P5.5 type / domain / sequence DDL
+// ---------------------------------------------------------------------------
+
+func NewCreateTypeStmt(pos int, name ObjectName) *CreateTypeStmt {
+	return &CreateTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
+}
+
+func NewTypeField(name, colType, collation string) TypeField {
+	return TypeField{Name: name, ColType: colType, Collation: collation}
+}
+
+func NewDropTypeStmt(pos int, names []ObjectName, ifExists, cascade bool) *DropTypeStmt {
+	return &DropTypeStmt{pos: pos, Names: names, IfExists: ifExists, Cascade: cascade}
+}
+
+func NewCreateDomainStmt(pos int, name ObjectName, baseType string, args []int64) *CreateDomainStmt {
+	return &CreateDomainStmt{pos: pos, Name: name.Name, Schema: name.Schema, BaseType: baseType, BaseTypeArgs: args}
+}
+
+func NewDomainCheckClause(name, expr string, inValues []string) DomainCheckClause {
+	return DomainCheckClause{Name: name, Expr: expr, InValues: inValues}
+}
+
+func NewDropDomainStmt(pos int, names []ObjectName, ifExists, cascade bool) *DropDomainStmt {
+	return &DropDomainStmt{pos: pos, Names: names, IfExists: ifExists, Cascade: cascade}
+}
+
+func NewCreateSequenceStmt(pos int, name ObjectName, temp, unlogged, ifNotExists bool) *CreateSequenceStmt {
+	return &CreateSequenceStmt{pos: pos, Name: name, Temporary: temp, Unlogged: unlogged, IfNotExists: ifNotExists}
+}
+
+func NewDoStmt(pos int, language, body string) *DoStmt {
+	return &DoStmt{pos: pos, Language: language, Body: body}
 }

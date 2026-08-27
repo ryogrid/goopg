@@ -31,8 +31,6 @@ var notYetPortedKeywords = map[string]string{
 
 	// type_func_name_keyword
 	"BINARY":        "COPY ... BINARY / BINARY cursors (P6.3, P6.5)",
-	"COLLATION":     "CREATE COLLATION and COLLATION FOR (plain COLLATE is reachable)",
-	"FREEZE":        "P6.5 VACUUM FREEZE",
 	"OVERLAPS":      "row OVERLAPS row (:15162) — uq_cols's WITHOUT OVERLAPS does not count, see blindRules",
 	"TABLESAMPLE":   "P1.2 FROM ... TABLESAMPLE",
 }

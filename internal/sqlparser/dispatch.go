@@ -77,6 +77,29 @@ var routedStmts = map[string]bool{
 	"refresh": true,
 	// P5.2 — CALL leads no other statement.
 	"call": true,
+	// P5.3 utility statements. Each of these leads exactly one statement
+	// class, so no second-keyword gate is needed.
+	"savepoint": true,
+	"release": true,
+	"checkpoint": true,
+	"discard": true,
+	"deallocate": true,
+	"prepare": true,
+	"execute": true,
+	"close": true,
+	"declare": true,
+	"fetch": true,
+	"move": true,
+	"analyze": true,
+	"analyse": true,
+	"vacuum": true,
+	"reindex": true,
+	"cluster": true,
+	"lock": true,
+	// P5.4
+	"merge": true,
+	// P5.5 — DO leads no other statement.
+	"do": true,
 	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 
@@ -221,10 +244,12 @@ func explainInnerRouted(frag []parser.Token) bool {
 // routedCreatePairs maps leading keyword -> set of ported second keywords.
 var routedCreatePairs = map[string]map[string]bool{
 	"create": {"table": true, "index": true, "view": true, "materialized": true,
-		"function": true, "procedure": true}, // P5.2
+		"function": true, "procedure": true, // P5.2
+		"type": true, "domain": true, "sequence": true}, // P5.5
 	"alter": {"table": true},
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
-		"function": true, "procedure": true, "routine": true}, // P5.2
+		"function": true, "procedure": true, "routine": true, // P5.2
+		"type": true, "domain": true}, // P5.5
 }
 
 // secondKeywordRouted reports whether the fragment's first+second keyword

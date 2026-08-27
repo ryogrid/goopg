@@ -61,8 +61,10 @@ func TestRouteBatchWholeBatchOrLegacy(t *testing.T) {
 		t.Fatalf("all-routed batch produced %d statements, want 2", len(stmts))
 	}
 
-	// Mixed batch → declines wholesale.
-	toks, _ = parser.Lex("SELECT 1; DISCARD ALL;")
+	// Mixed batch → declines wholesale. The unrouted half has to be a class
+	// the grammar genuinely does not cover: DISCARD used to serve here and
+	// stopped working as a probe the moment P5.3 routed it.
+	toks, _ = parser.Lex("SELECT 1; CREATE ROLE r;")
 	_, handled, rerr := routeBatch("", toks)
 	if handled || rerr != nil {
 		t.Fatalf("mixed batch: handled=%v err=%v, want false/nil", handled, rerr)

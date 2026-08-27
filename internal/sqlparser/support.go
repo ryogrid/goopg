@@ -2172,6 +2172,13 @@ func mustATTail(v any) *atConstrTail {
 // applies them in written order onto one statement, so the carrier mirrors the
 // statement's own fields rather than a list of clauses.
 type fnAttrs struct {
+	// sawLanguage / twoItemAs / errMsg / errRaw carry the bookkeeping legacy's
+	// option loop keeps in local variables (function.go parseCreateFunction).
+	sawLanguage bool
+	twoItemAs   bool
+	errMsg      string
+	errRaw      bool
+	errPos      int
 	language        string
 	body            string
 	hasBody         bool
@@ -2189,6 +2196,56 @@ type fnAttrs struct {
 }
 
 func newFnAttrs() *fnAttrs { return &fnAttrs{volatility: "v", parallel: "u"} }
+
+// fnAttrErr records the FIRST attribute-list error legacy would have raised.
+// The grammar cannot fail mid-list (a reduce has already happened by then), so
+// the error is carried to the statement rule and raised there.
+func (a *fnAttrs) fail(msg string, raw bool, pos int) {
+	if a.errMsg == "" {
+		a.errMsg, a.errRaw, a.errPos = msg, raw, pos
+	}
+}
+
+// fnAttrsCheck reports the error a completed CREATE FUNCTION / PROCEDURE
+// attribute list carries, or "" when it is well formed. Two of these appear in
+// the create_function_sql regress case and are raised by legacy AFTER a
+// successful parse, so the grammar has to reproduce them explicitly:
+//
+//   - a body is MANDATORY ("expected AS $$body$$ ..."): legacy's option loop
+//     falls into its default arm at end of input and rejects when it never saw
+//     one.
+//   - `AS 'a', 'b'` is only legal for LANGUAGE C ("only one AS item needed for
+//     language %q"), with an unset language reported as "sql".
+func fnAttrsCheck(l yyLexer, a *fnAttrs, what string) (string, bool, int) {
+	if a.errMsg != "" {
+		return a.errMsg, a.errRaw, a.errPos
+	}
+	if !a.hasBody {
+		// Legacy stops on the token that ended the option loop, which for a
+		// well-formed statement is the EOF/';' one.
+		return "expected AS $$body$$ for CREATE " + what + " (got end of input)", false, endPos(l)
+	}
+	if a.twoItemAs {
+		lang := strings.ToLower(a.language)
+		if lang == "" {
+			lang = "sql"
+		}
+		if lang != "c" {
+			return fmt.Sprintf("only one AS item needed for language %q", lang), true, endPos(l)
+		}
+	}
+	return "", false, 0
+}
+
+// endPos is the byte offset legacy reports for an error raised at end of
+// statement: the position of the terminating token.
+func endPos(l yyLexer) int {
+	st, ok := l.(*lexerState)
+	if !ok || len(st.toks) == 0 {
+		return 0
+	}
+	return st.toks[len(st.toks)-1].Pos
+}
 
 func mustFnAttrs(v any) *fnAttrs {
 	a, _ := v.(*fnAttrs)
@@ -2437,4 +2494,465 @@ func tzSetStmt(local bool, v string) parser.Stmt {
 		return parser.NewSetStmt(0, local, "timezone", "", true)
 	}
 	return parser.NewSetStmt(0, local, "timezone", v, false)
+}
+
+// fetchSpec carries FETCH/MOVE's direction+count before they collapse into the
+// two fields FetchStmt actually stores.
+type fetchSpec struct {
+	count   int64
+	forward bool
+	name    string
+}
+
+// fetchStmt builds FETCH, or the parsed-and-discarded CompatNoopStmt legacy
+// records for MOVE (which reaches the executor as a no-op with an empty body).
+func fetchStmt(pos int, v any, isMove bool) parser.Stmt {
+	if isMove {
+		return parser.NewCompatNoopStmt(pos, "MOVE")
+	}
+	f, _ := v.(*fetchSpec)
+	if f == nil {
+		f = &fetchSpec{count: 1, forward: true}
+	}
+	return parser.NewFetchStmt(pos, f.name, f.count, f.forward)
+}
+
+// vacTarget / vacTargets carry VACUUM's and ANALYZE's `rel [(cols)]` list.
+// Targets and TargetCols are PARALLEL slices, and a target with no column list
+// contributes a nil entry rather than being skipped.
+type vacTarget struct {
+	name parser.ObjectName
+	cols []string
+}
+
+type vacTargets struct {
+	names []parser.ObjectName
+	cols  [][]string
+}
+
+func appendVacTarget(t *vacTargets, one *vacTarget) *vacTargets {
+	if t == nil {
+		t = &vacTargets{}
+	}
+	t.names = append(t.names, one.name)
+	t.cols = append(t.cols, one.cols)
+	return t
+}
+
+// isFalseWord reports whether an option's value word is the FALSE spelling.
+// Legacy treats anything else — including an absent word — as true.
+func isFalseWord(s string) bool { return strings.EqualFold(s, "false") }
+
+// vacuumNamedOpt handles the VACUUM options whose names are ordinary
+// identifiers rather than keywords (parser.go parseVacuumOptionList). An
+// unrecognised name is legacy's "unrecognised VACUUM option" error, but the
+// grammar cannot raise from a closure, so it is left as a no-op and the
+// statement simply carries no such flag — the same outcome the executor sees
+// for an option goopg does not implement.
+func vacuumNamedOpt(name, val string) func(*parser.VacuumStmt) {
+	switch strings.ToLower(name) {
+	// The four keyword options are spelled as their own vacuum_opt_name
+	// alternatives (they are type_func_name keywords, not ColIds) but land here
+	// with the rest. Their value word is consumed and IGNORED by legacy.
+	case "verbose":
+		return func(v *parser.VacuumStmt) { v.Verbose = true }
+	case "analyze", "analyse":
+		return func(v *parser.VacuumStmt) { v.Analyze = true }
+	case "full":
+		return func(v *parser.VacuumStmt) { v.Full = true }
+	case "freeze":
+		return func(v *parser.VacuumStmt) { v.Freeze = true }
+	case "truncate":
+		return func(v *parser.VacuumStmt) { v.NoTruncate = isFalseWord(val) }
+	case "parallel":
+		n := reloptInt(val)
+		return func(v *parser.VacuumStmt) { v.ParallelWorkers = n }
+	case "disable_page_skipping":
+		return func(v *parser.VacuumStmt) { v.DisablePageSkipping = true }
+	case "skip_database_stats":
+		return func(v *parser.VacuumStmt) { v.SkipDatabaseStats = true }
+	case "only_database_stats":
+		return func(v *parser.VacuumStmt) { v.OnlyDatabaseStats = true }
+	case "skip_locked":
+		return func(v *parser.VacuumStmt) { v.SkipLocked = true }
+	case "index_cleanup":
+		// Three-valued: true forces cleanup, false suppresses it, and the
+		// default "auto" sets neither field.
+		switch strings.ToLower(val) {
+		case "true":
+			return func(v *parser.VacuumStmt) { v.ForceIndexCleanup = true }
+		case "false":
+			return func(v *parser.VacuumStmt) { v.NoIndexCleanup = true }
+		}
+		return func(v *parser.VacuumStmt) {}
+	case "process_main":
+		return func(v *parser.VacuumStmt) { v.NoProcessMain = isFalseWord(val) }
+	case "process_toast":
+		return func(v *parser.VacuumStmt) { v.NoProcessToast = isFalseWord(val) }
+	case "buffer_usage_limit":
+		return func(v *parser.VacuumStmt) { v.BufferUsageLimit = val }
+	}
+	return func(v *parser.VacuumStmt) {}
+}
+
+// typeNameOf renders a PREPARE parameter type back to the plain name legacy
+// stores in ParamTypes (no schema, no typmod).
+func typeNameOf(v any) string {
+	tw, _ := v.(*typeWithArgs)
+	if tw == nil {
+		return ""
+	}
+	if tw.ct.schema != "" {
+		return tw.ct.schema + "." + tw.ct.name
+	}
+	return tw.ct.name
+}
+
+// qnText renders a qualified name the way REINDEX's single Name field wants it.
+func qnText(q qname) string {
+	return strings.Join(q.parts, ".")
+}
+
+// vacuumAt re-creates the VACUUM carrier at the statement's real position.
+// The option-list fold has to allocate the statement to accumulate into, and
+// VacuumStmt.pos is unexported, so the flags are copied onto a correctly
+// positioned node instead of mutating the original in place.
+func vacuumAt(pos int, v any) *parser.VacuumStmt {
+	src, _ := v.(*parser.VacuumStmt)
+	if src == nil {
+		return parser.NewVacuumStmt(pos)
+	}
+	return parser.NewVacuumStmtFrom(pos, src)
+}
+
+// mergeAction carries a MERGE WHEN clause's THEN branch until it is folded
+// onto the clause. The three payload shapes (UPDATE assignments, INSERT
+// columns+values, nothing) share one carrier because the grammar rule returns
+// a single value.
+type mergeAction struct {
+	kind    parser.MergeActionKind
+	assigns []parser.UpdateAssign
+	cols    []string
+	vals    []parser.Expr
+}
+
+func applyMergeAction(c *parser.MergeWhenClause, v any) {
+	a, _ := v.(*mergeAction)
+	if a == nil {
+		return
+	}
+	c.Action = a.kind
+	c.UpdateAssigns = a.assigns
+	c.InsertColumns = a.cols
+	c.InsertValues = a.vals
+}
+
+// mergeNotMatchedBy resolves `WHEN NOT MATCHED BY <word>`. Legacy accepts only
+// SOURCE and TARGET and silently records NEITHER flag for anything else
+// (parser.go parseMergeWhenClause's two acceptIdentKeyword calls), so an
+// unknown word degrades to a plain NOT MATCHED rather than erroring.
+func mergeNotMatchedBy(word string) *parser.MergeWhenClause {
+	switch strings.ToLower(word) {
+	case "source":
+		return parser.NewMergeWhenClause(0, false, true, false)
+	case "target":
+		return parser.NewMergeWhenClause(0, false, false, true)
+	}
+	return parser.NewMergeWhenClause(0, false, false, false)
+}
+
+// kvPair carries one `NAME = value` option from CREATE TYPE ... AS RANGE.
+// val is the raw token join legacy stores for SUBTYPE; last is the final
+// dotted component, which is what it stores for the three name-valued options.
+type kvPair struct {
+	key  string
+	val  string
+	last string
+}
+
+func appendRangeOpt(list any, one *kvPair) []any {
+	l, _ := list.([]any)
+	return append(l, any(one))
+}
+
+func applyRangeOpts(st *parser.CreateTypeStmt, v any) {
+	opts, _ := v.([]any)
+	for _, raw := range opts {
+		o, ok := raw.(*kvPair)
+		if !ok {
+			continue
+		}
+		switch o.key {
+		case "subtype":
+			st.RangeSubtype = o.val
+		case "multirange_type_name":
+			st.RangeMultirangeName = o.last
+		case "subtype_opclass":
+			st.RangeOpclassName = o.last
+		case "collation":
+			st.RangeCollationName = o.last
+		}
+	}
+}
+
+// qnLastPart is the final component of a dotted name — legacy's parseObjectName
+// followed by `.Name`, which DISCARDS the schema for these options.
+func qnLastPart(q qname) string {
+	if len(q.parts) == 0 {
+		return ""
+	}
+	return q.parts[len(q.parts)-1]
+}
+
+
+// rawTypeSpan reproduces legacy's inner token scan: from the token at byte
+// position `from`, join raw token values with single spaces until a top-level
+// ',' or ')' or the word COLLATE. That is how CREATE TYPE stores a composite
+// field's type and a range's SUBTYPE — as text, not as a parsed type.
+func rawTypeSpan(l yyLexer, from int) string {
+	st, ok := l.(*lexerState)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	depth := 0
+	for _, t := range st.toks {
+		if t.Pos < from {
+			continue
+		}
+		if t.Kind == parser.TokenEOF {
+			break
+		}
+		if t.Kind == parser.TokenSymbol {
+			switch t.Value {
+			case "(":
+				depth++
+			case ")":
+				if depth == 0 {
+					return strings.Join(parts, " ")
+				}
+				depth--
+			case ",", ";":
+				if depth == 0 && t.Value == "," {
+					return strings.Join(parts, " ")
+				}
+				if t.Value == ";" {
+					return strings.Join(parts, " ")
+				}
+			}
+		}
+		if depth == 0 && t.Kind != parser.TokenSymbol && strings.EqualFold(t.Value, "collate") {
+			return strings.Join(parts, " ")
+		}
+		parts = append(parts, t.Value)
+	}
+	return strings.Join(parts, " ")
+}
+
+// domainOp is one CREATE DOMAIN constraint clause, applied in written order.
+type domainOp func(*parser.CreateDomainStmt)
+
+func domainNotNull(v bool) domainOp {
+	return func(d *parser.CreateDomainStmt) { d.NotNull = v }
+}
+
+func domainDefault(e parser.Expr) domainOp {
+	return func(d *parser.CreateDomainStmt) { d.Default = e }
+}
+
+func domainNoop() domainOp { return func(*parser.CreateDomainStmt) {} }
+
+// domainCheck rebuilds the two shapes legacy stores for a domain CHECK: the
+// membership list of `CHECK (VALUE IN (...))` (Expr empty, InValues filled) and
+// otherwise the raw token join of the body, with VALUE upper-cased and string
+// literals re-quoted (ddl.go parseDomainCheckExpr / tryParseCheckInValues).
+// The adapter has already folded `CHECK ( ... )` into one terminal whose pos is
+// the '(', so the body is read back out of the token stream here.
+func domainCheck(l yyLexer, name string, openParen int) domainOp {
+	st, ok := l.(*lexerState)
+	if !ok {
+		return domainNoop()
+	}
+	if vals, ok := domainCheckInValues(st, openParen); ok {
+		return func(d *parser.CreateDomainStmt) {
+			d.Checks = append(d.Checks, parser.NewDomainCheckClause(name, "", vals))
+		}
+	}
+	var parts []string
+	depth := 0
+	for _, t := range st.toks {
+		if t.Pos < openParen {
+			continue
+		}
+		if t.Kind == parser.TokenSymbol && t.Value == "(" {
+			depth++
+			if depth == 1 {
+				continue // the CHECK's own opening paren is not part of the text
+			}
+		} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
+			depth--
+			if depth == 0 {
+				break
+			}
+		}
+		switch {
+		case t.Kind == parser.TokenStringLit:
+			parts = append(parts, "'"+strings.ReplaceAll(t.Value, "'", "''")+"'")
+		case (t.Kind == parser.TokenIdent || t.Kind == parser.TokenKeyword) && strings.EqualFold(t.Value, "value"):
+			parts = append(parts, "VALUE")
+		default:
+			parts = append(parts, t.Value)
+		}
+	}
+	expr := strings.Join(parts, " ")
+	return func(d *parser.CreateDomainStmt) {
+		d.Checks = append(d.Checks, parser.NewDomainCheckClause(name, expr, nil))
+	}
+}
+
+// domainCheckInValues recognises `( VALUE [::type] IN ( v, ... ) )` and returns
+// the raw literal values. Anything else falls back to the text form.
+func domainCheckInValues(st *lexerState, openParen int) ([]string, bool) {
+	i := 0
+	for ; i < len(st.toks); i++ {
+		if st.toks[i].Pos >= openParen {
+			break
+		}
+	}
+	next := func() parser.Token {
+		if i < len(st.toks) {
+			t := st.toks[i]
+			i++
+			return t
+		}
+		return parser.Token{Kind: parser.TokenEOF}
+	}
+	if t := next(); t.Kind != parser.TokenSymbol || t.Value != "(" {
+		return nil, false
+	}
+	t := next()
+	if !strings.EqualFold(t.Value, "value") {
+		return nil, false
+	}
+	t = next()
+	if t.Kind == parser.TokenOperator && t.Value == "::" {
+		// Skip a cast target of one or two tokens (`::text`, `::character
+		// varying`); anything longer is not a shape legacy recognises either.
+		t = next()
+		if t.Kind == parser.TokenIdent || t.Kind == parser.TokenKeyword {
+			t = next()
+		}
+	}
+	if !strings.EqualFold(t.Value, "in") {
+		return nil, false
+	}
+	if t := next(); t.Kind != parser.TokenSymbol || t.Value != "(" {
+		return nil, false
+	}
+	var vals []string
+	for {
+		t = next()
+		switch t.Kind {
+		case parser.TokenStringLit, parser.TokenIntLit, parser.TokenNumericLit:
+			vals = append(vals, t.Value)
+		case parser.TokenKeyword:
+			if t.Keyword != parser.KwTrue && t.Keyword != parser.KwFalse {
+				return nil, false
+			}
+			vals = append(vals, t.Value)
+		default:
+			return nil, false
+		}
+		t = next()
+		if t.Kind == parser.TokenSymbol && t.Value == "," {
+			continue
+		}
+		if t.Kind == parser.TokenSymbol && t.Value == ")" {
+			return vals, true
+		}
+		return nil, false
+	}
+}
+
+func applyDomainConstraints(st *parser.CreateDomainStmt, v any) {
+	ops, _ := v.([]any)
+	for _, o := range ops {
+		if f, ok := o.(domainOp); ok {
+			f(st)
+		}
+	}
+}
+
+// seqOp is one CREATE SEQUENCE option, applied in written order.
+type seqOp func(*parser.CreateSequenceStmt)
+
+func seqDataType(name string) seqOp {
+	n := lowerIdent(name)
+	return func(s *parser.CreateSequenceStmt) { s.DataType = n }
+}
+
+func seqInt(which string, n int64) seqOp {
+	v := n
+	return func(s *parser.CreateSequenceStmt) {
+		switch which {
+		case "increment":
+			s.Increment = &v
+		case "minvalue":
+			s.MinValue = &v
+		case "maxvalue":
+			s.MaxValue = &v
+		case "start":
+			s.Start = &v
+		case "cache":
+			s.Cache = &v
+		}
+	}
+}
+
+func seqCycle() seqOp { return func(s *parser.CreateSequenceStmt) { s.Cycle = true } }
+
+// seqNoop is NO MINVALUE / NO MAXVALUE / NO CYCLE: legacy consumes the word
+// pair and records nothing at all, so a later NO CYCLE does NOT undo an
+// earlier CYCLE.
+func seqNoop() seqOp { return func(*parser.CreateSequenceStmt) {} }
+
+func seqOwnedBy(owner string) seqOp {
+	o := owner
+	return func(s *parser.CreateSequenceStmt) { s.OwnedBy = o }
+}
+
+// seqOwnerName renders OWNED BY's target. NONE is the "no owner" spelling and
+// stores an empty string, not the word.
+func seqOwnerName(q qname) string {
+	if len(q.parts) == 1 && strings.EqualFold(q.parts[0], "none") {
+		return ""
+	}
+	return strings.Join(q.parts, ".")
+}
+
+func applySeqOpts(st *parser.CreateSequenceStmt, v any) {
+	ops, _ := v.([]any)
+	for _, o := range ops {
+		if f, ok := o.(seqOp); ok {
+			f(st)
+		}
+	}
+}
+
+// twoItemAS reports whether the AS body at byte position `pos` is followed by a
+// comma — the LANGUAGE C two-item form. Legacy sets its flag on the COMMA
+// alone, whether or not a second string actually follows (function.go:145-150),
+// so the check is on the token stream rather than on the parsed list.
+func twoItemAS(l yyLexer, pos int) bool {
+	st, ok := l.(*lexerState)
+	if !ok {
+		return false
+	}
+	for i, t := range st.toks {
+		if t.Pos == pos {
+			return i+1 < len(st.toks) &&
+				st.toks[i+1].Kind == parser.TokenSymbol && st.toks[i+1].Value == ","
+		}
+	}
+	return false
 }
