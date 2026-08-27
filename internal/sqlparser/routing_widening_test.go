@@ -26,6 +26,12 @@ func TestRoutingModifiersAndRecursive(t *testing.T) {
 		"CREATE TEMPORARY TABLE t (a int)",
 		"CREATE UNLOGGED TABLE t (a int)",
 		"CREATE TEMP TABLE t AS SELECT 1",
+		"CREATE TEMP VIEW v AS SELECT 1",
+		"CREATE OR REPLACE TEMP VIEW v AS SELECT 1",
+		"CREATE TEMPORARY VIEW v AS SELECT 1",
+		"CREATE TEMP SEQUENCE s",
+		"TABLE t",
+		"VALUES (1, 2), (3, 4)",
 		"CREATE UNIQUE INDEX i ON t (a)",
 		"WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t) SELECT n FROM t",
 		"WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c",
@@ -36,11 +42,10 @@ func TestRoutingModifiersAndRecursive(t *testing.T) {
 		}
 		assertParity(t, q)
 	}
-	// The grammar has no CREATE TEMP VIEW / SEQUENCE: a modifier on any other
-	// kind must still fall to legacy rather than surface a 42601.
+	// opt_create_modifier is taken by TABLE, VIEW and SEQUENCE only; a
+	// modifier on any other kind must still fall to legacy rather than
+	// surface a 42601.
 	for _, q := range []string{
-		"CREATE TEMP VIEW v AS SELECT 1",
-		"CREATE TEMP SEQUENCE s",
 	} {
 		if routed(q) {
 			t.Errorf("unexpectedly routed: %q", q)

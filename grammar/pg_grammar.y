@@ -645,6 +645,9 @@ base_select:
 			{
 				m := $1.(*parser.SelectStmt)
 				m.OrderBy = $2
+				if err := rewriteIndirectionStars(yylex, m); err != nil {
+					return 1
+				}
 				$$ = m
 			}
 	/* gram.y select_no_parens splits the limit/locking tail into two
@@ -2599,6 +2602,15 @@ c_expr:
 		'(' a_expr ')'
 			{
 				$$ = $2
+			}
+	/* `(expr).*` — whole-row expansion of a function call's result. It is a
+	   PARSE-TIME placeholder: RewriteIndirectionStarTargets (select.go) turns
+	   it into a synthetic `__irs_N`-aliased FROM entry plus a qualified star,
+	   and legacy runs that rewrite at the end of parseSelect. The position is
+	   the '(' — legacy stamps it from the same token. */
+	| '(' a_expr ')' '.' '*'
+			{
+				$$ = parser.NewIndirectionStar($<p>1, $2)
 			}
 	/* Implicit row constructor — gram.y implicit_row (:16632), spelled with a
 	   mandatory second element so it cannot collide with grouping parens.

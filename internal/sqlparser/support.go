@@ -1,6 +1,7 @@
 package sqlparser
 
 import (
+	"errors"
 	"strconv"
 	"fmt"
 	"strings"
@@ -3191,4 +3192,59 @@ func firstArg(args []string) []string {
 		return nil
 	}
 	return args[:1]
+}
+
+// buildView assembles CREATE [OR REPLACE] [TEMP] VIEW. The two grammar
+// alternatives exist only to keep the optional modifier in one position, so
+// the body lives here rather than being written twice.
+func buildView(l yyLexer, orReplace bool, modifier any, q qname, cols []string, with []string, sel parser.Stmt, check any) parser.Stmt {
+	nm := q.parts
+	name := parser.ObjectName{Name: nm[len(nm)-1]}
+	if len(nm) > 1 {
+		name.Schema = nm[len(nm)-2]
+	}
+	s, _ := sel.(*parser.SelectStmt)
+	cv := parser.NewCreateViewStmt(name, cols, s)
+	cv.OrReplace = orReplace
+	// opt_create_modifier is shared with CREATE TABLE, which also accepts
+	// UNLOGGED; a view records only the temp flag.
+	if pfx, _ := modifier.(*createPrefix); pfx != nil {
+		cv.Temporary = pfx.temporary
+	}
+	viewReloptions(cv, with)
+	st := l.(*lexerState)
+	co, _ := check.(*checkOpt)
+	if co != nil {
+		cv.CheckOption = co.opt
+		if co.pos >= 0 {
+			// RawDef stops at WITH: legacy's span excludes the option.
+			cv.RawDef = st.spanTextUpTo(co.pos)
+			return cv
+		}
+	}
+	cv.RawDef = st.spanTextUpTo(st.fragEnd)
+	return cv
+}
+
+// rewriteIndirectionStars runs legacy's end-of-parseSelect rewrite: every
+// `(f(x)).*` target becomes a synthetic `__irs_N`-aliased table-function FROM
+// entry plus a qualified star. Sharing parser.RewriteIndirectionStarTargets
+// rather than reimplementing it keeps the alias numbering (which is the TARGET
+// INDEX, not a running counter) and the aggregate rejection identical.
+func rewriteIndirectionStars(l yyLexer, s *parser.SelectStmt) error {
+	if s == nil {
+		return nil
+	}
+	if err := parser.RewriteIndirectionStarTargets(s, nil); err != nil {
+		if st, ok := l.(*lexerState); ok {
+			var se *parser.SyntaxError
+			if errors.As(err, &se) {
+				st.raise(se.Message, se.Raw, se.Pos)
+				return err
+			}
+			st.raise(err.Error(), true, 0)
+		}
+		return err
+	}
+	return nil
 }

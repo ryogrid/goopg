@@ -810,3 +810,11 @@ func SetDropCompatExtras(s *DropCompatStmt, argTypes []string, usingMethod strin
 	s.ArgTypes, s.UsingMethod, s.CastTypes = argTypes, usingMethod, castTypes
 	s.TransformType, s.TransformLang = transformType, transformLang
 }
+
+// NewIndirectionStar builds the `(expr).*` node. It is a PARSE-TIME
+// placeholder: RewriteIndirectionStarTargets turns it into a synthetic
+// `__irs_N`-aliased FROM entry plus a qualified star, and legacy runs that
+// rewrite at the end of parseSelect.
+func NewIndirectionStar(pos int, source Expr) *IndirectionStar {
+	return &IndirectionStar{pos: pos, Source: source}
+}

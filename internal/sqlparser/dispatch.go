@@ -102,6 +102,10 @@ var routedStmts = map[string]bool{
 	"do": true,
 	// P5.6
 	"comment": true,
+	// P5.8 — the two SELECT shorthands. Both already parsed identically; only
+	// the routing entry was missing.
+	"table": true,
+	"values": true,
 	// "create table": routed via createClassRouted two-keyword check (P4.1)
 }
 
@@ -286,9 +290,9 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 		w := strings.ToLower(tok.Value)
 		if !found {
 			if w == "temp" || w == "temporary" || w == "unlogged" {
-				// CREATE TEMP|TEMPORARY|UNLOGGED <kind>: the grammar's
-				// opt_create_modifier covers TABLE (every CREATE TABLE
-				// alternative takes it); no other kind takes a modifier yet.
+				// CREATE TEMP|TEMPORARY|UNLOGGED <kind>: opt_create_modifier
+				// is taken by TABLE, VIEW and SEQUENCE; no other kind takes
+				// one yet.
 				modifierSeen = true
 				continue
 			}
@@ -306,8 +310,8 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 	if !found {
 		return false
 	}
-	if modifierSeen && second != "table" {
-		return false // CREATE TEMP VIEW / SEQUENCE / ...: stays legacy
+	if modifierSeen && second != "table" && second != "view" && second != "sequence" {
+		return false // CREATE TEMP <other kind>: stays legacy
 	}
 	if !allowed[second] {
 		return false

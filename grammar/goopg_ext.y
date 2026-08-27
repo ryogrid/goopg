@@ -1855,28 +1855,17 @@ opt_COLUMN:
 	| COLUMN         { _ = 0 }
 
 /* create_view_stmt — P5 v0: CREATE [OR REPLACE] [TEMP] VIEW name [(cols)] AS select */
+/* Two alternatives, not `CREATE opt_or_replace opt_create_modifier VIEW`: with
+   both optional nonterminals in front, a TEMP after CREATE had to choose
+   between reducing an empty opt_or_replace (view path) and shifting into
+   opt_create_modifier (table path), and shift won — which killed
+   `CREATE TEMP VIEW` outright. Sharing the modifier position with
+   create_table_stmt removes the choice. */
 create_view_stmt:
-		CREATE opt_or_replace VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } select_bare opt_check_option
-			{
-				nm := $4.parts
-				v := parser.ObjectName{Name: nm[len(nm)-1]}
-				if len(nm) > 1 {
-					v.Schema = nm[len(nm)-2]
-				}
-				sel := $9.(*parser.SelectStmt)
-				cv := parser.NewCreateViewStmt(v, $5, sel)
-				cv.OrReplace = $2
-				viewReloptions(cv, $6)
-				co := $10.(*checkOpt)
-				cv.CheckOption = co.opt
-				if co.pos >= 0 {
-					// RawDef stops at WITH: legacy's span excludes the option.
-					cv.RawDef = yylex.(*lexerState).spanTextUpTo(co.pos)
-				} else {
-					cv.RawDef = yylex.(*lexerState).spanTextUpTo(yylex.(*lexerState).fragEnd)
-				}
-				$$ = cv
-			}
+		CREATE opt_create_modifier VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } select_bare opt_check_option
+			{ $$ = buildView(yylex, false, $2, $4, $5, $6, $9, $10) }
+	| CREATE OR REPLACE opt_create_modifier VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } select_bare opt_check_option
+			{ $$ = buildView(yylex, true, $4, $6, $7, $8, $11, $12) }
 
 /* WITH [CASCADED|LOCAL] CHECK OPTION — legacy records "cascaded" for the
    bare form. */
