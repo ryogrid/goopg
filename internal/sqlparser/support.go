@@ -3566,3 +3566,19 @@ func copyEndpointProgram(l yyLexer, word, name string, pos int) *copyEndpoint {
 	}
 	return &copyEndpoint{}
 }
+
+// strPairMap turns str_pair_list's "k=v" strings into the map an
+// AlterTableAction.With holds. A bare name (no '=') maps to an empty value,
+// which is how `WITH (security_barrier)` reaches the AST.
+func strPairMap(kvs []string) map[string]string {
+	out := map[string]string{}
+	for _, kv := range kvs {
+		parts := splitKV(kv)
+		if len(parts) == 2 {
+			out[strings.ToLower(parts[0])] = parts[1]
+			continue
+		}
+		out[strings.ToLower(kv)] = ""
+	}
+	return out
+}

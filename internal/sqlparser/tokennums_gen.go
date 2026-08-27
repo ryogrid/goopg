@@ -529,6 +529,6 @@ var genTokenNums = map[string]int{
 	"yyEofCode": 1,
 	"yyErrCode": 2,
 	"yyInitialStackSize": 16,
-	"yyLast": 64895,
+	"yyLast": 65790,
 	"yyPrivate": 57344,
 }

@@ -3490,3 +3490,71 @@ copy_trail_str:
 	| QUOTE          { $$ = "quote" }
 	| ESCAPE         { $$ = "escape" }
 	| ENCODING       { $$ = "encoding" }
+
+/* ============================================================================
+   P5.12 — ALTER INDEX. Legacy builds an AlterTableStmt for it (index and table
+   share the ALTER machinery) and overrides the CommandComplete tag for exactly
+   two of the six forms. Anything else falls through to a CompatNoopStmt built
+   by a skip-to-semicolon scan, so the dispatcher gates on the action word.
+   ========================================================================= */
+
+alter_index_stmt:
+	/* The column may be a NUMBER (an expression index's position). Legacy
+	   records the statistics target as TEXT, not as an integer. */
+		ALTER INDEX qualified_name ALTER opt_COLUMN alter_idx_col SET STATISTICS signed_iconst
+			{
+				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
+				a := parser.NewATAction(parser.AlterTableSetStatistics)
+				a.ColumnName, a.CheckExpr = $6, atStatValue($9)
+				st.Actions = append(st.Actions, *a)
+				$$ = st
+			}
+	/* The per-column option list is CONSUMED AND DISCARDED here, unlike ALTER
+	   TABLE's identical spelling which records it in SetOptions. */
+	| ALTER INDEX qualified_name ALTER opt_COLUMN alter_idx_col SET '(' str_pair_list ')'
+			{
+				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
+				a := parser.NewATAction(parser.AlterTableAlterColumnSet)
+				a.ColumnName = $6
+				st.Actions = append(st.Actions, *a)
+				$$ = st
+			}
+	| ALTER INDEX qualified_name SET TABLESPACE ColId
+			{
+				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "ALTER INDEX")
+				a := parser.NewATAction(parser.AlterTableSetTablespace)
+				a.TablespaceName = $6
+				st.Actions = append(st.Actions, *a)
+				$$ = st
+			}
+	| ALTER INDEX qualified_name SET '(' str_pair_list ')'
+			{
+				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "")
+				a := parser.NewATAction(parser.AlterIndexSetReloptions)
+				a.With = strPairMap($6)
+				st.Actions = append(st.Actions, *a)
+				$$ = st
+			}
+	/* ConstraintName carries the PARENT index name here — legacy reuses the
+	   field rather than adding one. */
+	| ALTER INDEX qualified_name ATTACH PARTITION qualified_name
+			{
+				parent := objectNameFromQn($3)
+				st := parser.NewAlterIndexStmt($<p>1, parent, "")
+				a := parser.NewATAction(parser.AlterIndexAttachPartition)
+				a.ConstraintName, a.ChildIndexName = parent.Name, objectNameFromQn($6).Name
+				st.Actions = append(st.Actions, *a)
+				$$ = st
+			}
+	| ALTER INDEX qualified_name RENAME TO ColId
+			{
+				st := parser.NewAlterIndexStmt($<p>1, objectNameFromQn($3), "ALTER INDEX")
+				a := parser.NewATAction(parser.AlterTableRenameTable)
+				a.NewName = $6
+				st.Actions = append(st.Actions, *a)
+				$$ = st
+			}
+
+alter_idx_col:
+		ColId       { $$ = $1 }
+	| ICONST        { $$ = strconv.FormatInt(int64($1), 10) }

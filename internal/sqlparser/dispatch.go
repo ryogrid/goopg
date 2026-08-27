@@ -265,7 +265,8 @@ var routedCreatePairs = map[string]map[string]bool{
 	"alter": {"table": true,
 		"function": true, "procedure": true, "routine": true, // P5.6
 		"schema": true, // P5.9
-		"sequence": true, "type": true, "domain": true}, // P5.10
+		"sequence": true, "type": true, "domain": true, // P5.10
+		"index": true}, // P5.12
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
 		"type": true, "domain": true, // P5.5
@@ -333,6 +334,9 @@ func secondKeywordRouted(frag []parser.Token, key string) bool {
 	}
 	if key == "alter" && second == "domain" {
 		return alterDomainRouted(frag)
+	}
+	if key == "alter" && second == "index" {
+		return alterIndexRouted(frag)
 	}
 	return true
 }
@@ -425,6 +429,33 @@ func copyRouted(frag []parser.Token) bool {
 		}
 	}
 	return true
+}
+
+// alterIndexActions names the ALTER INDEX actions the grammar covers. Legacy
+// falls through to a CompatNoopStmt built by a skip-to-semicolon scan for
+// everything else — including `ALTER INDEX IF EXISTS ...`, which is why the
+// word right after the index name has to be one of these.
+var alterIndexActions = map[string]bool{
+	"alter": true, "set": true, "attach": true, "rename": true,
+}
+
+func alterIndexRouted(frag []parser.Token) bool {
+	// frag is ALTER INDEX <name> <action> ...; the name may be dotted.
+	seen := 0
+	for _, tok := range frag[2:] {
+		if tok.Kind == parser.TokenSymbol && tok.Value == "." {
+			seen = 0 // a dot means the name continues
+			continue
+		}
+		if tok.Kind != parser.TokenKeyword && tok.Kind != parser.TokenIdent {
+			continue
+		}
+		seen++
+		if seen == 2 {
+			return alterIndexActions[strings.ToLower(tok.Value)]
+		}
+	}
+	return false
 }
 
 // createRoutineRouted vetoes the two CREATE FUNCTION / PROCEDURE sub-forms the

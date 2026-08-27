@@ -903,3 +903,10 @@ func CopyOptionCols(o CopyOption, cols []string) CopyOption {
 	o.Cols, o.Bool = cols, false
 	return o
 }
+
+// NewAlterIndexStmt builds the AlterTableStmt legacy uses for ALTER INDEX.
+// tagOverride is set only for the two forms whose CommandComplete tag legacy
+// overrides ("SET TABLESPACE" and "RENAME TO"); the rest answer "ALTER TABLE".
+func NewAlterIndexStmt(pos int, name ObjectName, tagOverride string) *AlterTableStmt {
+	return &AlterTableStmt{pos: pos, Name: name, TagOverride: tagOverride}
+}

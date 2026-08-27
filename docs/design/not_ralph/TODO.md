@@ -968,6 +968,68 @@ is why every gate stayed green):
   LOCK (review finding)/GRANT/REVOKE(noop semantics preserved)/role &
   session statements. Flip utility routing.
 
+## P5.2–P5.12 landed (2026-08-27/28)
+
+Measured over the regress corpus (13,582 fragments split on top-level
+semicolons). Routed fragments 11,920 -> 13,022; **yacc-side rejects 22 -> 0**;
+divergences 250 -> 204, ALL of them documented known-diffs (191 unary-minus
+folds, 13 `UNIQUE NOT NULL`).
+
+| slice | classes |
+|---|---|
+| P5.2 | create/drop function, procedure, routine, call |
+| P5.3 | savepoint, release, checkpoint, discard, deallocate, prepare, execute, close, declare, fetch, move, analyze, vacuum, reindex, cluster, lock |
+| P5.4 | merge (+ as a CTE body and a PREPARE body) |
+| P5.5 | create/drop type, create/drop domain, create sequence, do |
+| P5.6 | create/drop trigger, comment on, alter function/procedure/routine |
+| P5.7 | the whole DROP family (sequence, schema, extension, statistics, collation, server, conversion, event trigger, access method, foreign table/fdw, text search, aggregate, operator, operator class/family, cast, transform, rule, policy, publication, subscription, tablespace) |
+| P5.8 | `TABLE t`, top-level VALUES, CREATE [OR REPLACE] TEMP VIEW, `(expr).*` |
+| P5.9 | drop database, create extension, alter schema, create policy |
+| P5.10 | alter sequence / type / domain |
+| P5.11 | copy — plus the SELECT ... INTO context check it exposed |
+| P5.12 | alter index |
+
+### The remaining unrouted corpus is THREE things, only one of which is work
+
+1. **~250 fragments never reach parser.Parse.** Role DDL and GRANT/REVOKE are
+   handled by token scanners ABOVE the parser — `parser.Parse("CREATE ROLE r")`
+   returns an error — so they are not parser-migration work and survive the
+   cutover untouched.
+2. **~200 are the parse-and-ignore compat classes** (CREATE/ALTER OPERATOR,
+   EVENT TRIGGER, TEXT SEARCH, CAST, SCHEMA, RULE, CONVERSION, SERVER, FDW,
+   USER MAPPING, ACCESS METHOD, COLLATION, SECURITY LABEL ...). Their legacy
+   handler reads a short head and then calls parseSkipToSemicolon, so they
+   accept ARBITRARY token soup. A real grammar would be STRICTER than legacy
+   and would change behaviour. **Their correct end state is to keep the token
+   walk and carve it out of ddl.go into a narrow retained compat parser at
+   cutover, not to write grammar for them.**
+3. **The rest is genuinely missing grammar**: alter view, create aggregate,
+   create statistics, and the long tail of ALTER TABLE actions outside
+   routedAlterTableActions.
+
+### Bugs in ALREADY-routed classes that these slices' corpus tests found
+
+Every one was a hard 42601 or a silent AST divergence at HEAD:
+
+- `SELECT ... INTO` was not context-checked, so
+  `DECLARE c CURSOR FOR SELECT 1 INTO t` CREATED THE TABLE instead of erroring
+  (intoWrap turns any INTO-carrying SELECT into a CreateTableStmt). This is
+  what the select_into regress case had been failing on.
+- `interval year to month` / `interval(3)` had no grammar at all, in column
+  definitions AND casts (the two positions pack DIFFERENT typmods).
+- CREATE INDEX `WITH` recorded fillfactor only, dropping the other five
+  storage parameters legacy keeps (59 fragments).
+- a column's array brackets were detected but never stripped, leaving a type
+  literally named `text[]` (36 fragments).
+- `float` / `float(p)` was not normalised to float4/float8 in the column path.
+- bare `char`/`character`/`nchar` was missing its implicit length of 1, while
+  quoted `"char"` must NOT get it.
+- SHOW/SET/RESET took a two-part GUC name only, and had no TIME ZONE form.
+- `char(10)[]` — array brackets after a typmod — was a syntax error.
+- CREATE FUNCTION raised none of the four errors legacy raises AFTER a
+  successful parse (mandatory body, `AS 'a','b'` outside LANGUAGE C, duplicate
+  AS / LANGUAGE / RETURN), all of which create_function_sql checks byte-exactly.
+
 ## P5.2–P5.5 landed (2026-08-27)
 
 Measured over the regress corpus (`postgres/src/test/regress/sql/*.sql`,
