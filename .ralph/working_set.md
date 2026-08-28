@@ -1,45 +1,46 @@
-Task just completed: M0134-0155 (psql.sql) — sized live + scoped fixes
-landed, committed f2d54e226 on regress-renumbering (loop #46 had been
-killed mid-gate by the operator; this session finished and landed its WIP).
+Task just completed: M-NIGHTLY AI-20260822-001356-003 —
+`testport/TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary`, the only
+nightly regression that still reproduces at HEAD (failed 6 nights running:
+20260822/23/24/25/27 + the in-flight 20260828-235424).
 
-What landed: (1) SET ROLE TO/= generic_set spellings end-to-end — parser
-role arm (= is TokenOperator, NOT acceptSymbol; first cut was silently
-broken until new parser subtests caught it) + query.go/extended.go fast
-paths via stripSetToOrEquals. (2) SESSION AUTHORIZATION deliberately
-rejects TO/= (gram.y:1764/:1774 only; oracle-verified): setAuthzGenericSetForm
-routes those from both protocols' fast paths to the parser for the true 42601.
-(3) NEW shared-core rule surfaced by oracle-diff: PARSE-time errors inside an
-explicit txn now abort the block (connTx.Fail at dispatch.go parse-error
-return + dispatch_extended.go qerr return; mirrors M0132-S5); empty
-statements stay allowed in aborted blocks (#17983 parity,
-allowedInAbortedBlock). (4) CREATE TABLE (...) USING <am> accepted-and-
-discarded, both parseCreateTableTail arms. Harness: pg-oracle-diff.sh
---auto-start fixed (initdb -q removed — PG 18.3 has no -q; -U "$USER_"
-pinned). Tests: TestStripSetToOrEquals, TestFastPathGenericSetSpellings,
-TestParseErrorAbortsTransactionBlock, TestParseCreateTableUsingAccessMethod,
-parser SET subtests.
+Diagnosis: NOT an engine regression. `pg_advisory_lock()` returns **void**; PG
+18.3 sends it as a NON-NULL zero-length value (oracle-verified on a throwaway
+PG 18.3 at /tmp: `... IS NULL` -> f, `pg_typeof` -> `void`). goopg's
+`evalAdvisoryLock` (internal/executor/expr.go:17924) has returned the same
+empty non-NULL datum since M0096-0003. The test scanned it into `sql.NullBool`
+and only ever passed because goopg serialized an empty non-null string as NULL
+on the wire; `fd24fa33c` (postmaster wire fix, M0134-0070, 2026-08-21) made the
+empty value real and `ParseBool("")` then failed. So a PG-parity FIX exposed a
+test asserting the old bug. Fix: that one call site now uses `ExecContext`,
+matching the two sibling void call sites in the same file (:39 / :105 use
+`sql.NullString`, :363 uses `ExecContext`).
 
-Gates run: units PASS (43 pkgs), full postmaster pkg PASS under cap,
-parser PASS, regen-testport + check-testport-inventory PASS, commit-hook
-pgbench smoke PASS, 16-statement oracle-diff vs PG 18.3 matches except ONE
-character (error text echoes lowercased 'to' vs scan.c raw-source 'TO').
+Files: internal/testport/advisory_lock_test.go (the fix), .ralph/fix_plan.md
+(nightly 20260827 section filed + advisory rows closed), .ralph/deferral_ledger.md
+(new row: void RESULT COLUMN TYPE OID gap).
 
-Residual psql.sql gaps ledgered (.ralph/deferral_ledger.md M0134-0155):
-63 goopg-side ERRORs over >=6 subsystems — role-does-not-exist x14,
-syntax-error x11 (incl. "unsupported statement (got X)" template divergence),
-spurious NOT NULL x6, permission-denied-create-role x5, function-missing x5,
-table-permission denials x9 (M0134-0154 ACL core), pg_roles.rolinherit x2.
-Highest-leverage follow-up remains the ACL-check core (PUBLIC fallback +
-RoleIsMemberOf walk) per M0134-0154's recommendation.
+Ledgered discovery: goopg reports `pg_typeof(pg_advisory_lock(0))` = `unknown`
+where PG reports `void` (OID 2278) — value bytes match, RowDescription type OID
+does not. Applies to every void builtin. Needs a void Datum kind + result-type
+inference + wire RowDescription work (pg_proc already has RetType 2278).
 
-NEXT LOOP: per Current Priority banner + task-ID-ascending, work
-**M0134-0156 (psql_crosstab.sql)** next.
+M-NIGHTLY filing done this loop: run 20260827-052222 (133 items) filed. Its
+132-item testport block sampled a MID-MIGRATION parser sha (846d651d884d, inside
+the goyacc rewrite, before e56d4f4fd + the #97 merge) — the failures are that
+intermediate grammar's 42601s in test SETUP. 18 verified stale (PASS at HEAD),
+110 marked "presumed stale, pending" — **the in-flight nightly 20260828-235424
+runs the SAME HEAD sha and adjudicates them: read
+ci/logs/20260828-235424/testport/results.csv FIRST next loop and tick them off
+in bulk** (at filing time it had exactly ONE --- FAIL, the advisory one, now fixed).
 
-Peer-session WIP still present, leave uncommitted: .ralphrc, progress.json,
-analysis/postgres-oracle-compatibility-report.md, ci/logs/launch.log,
-docs/wiki/getting-started.md, docs/wiki/modules/catalog.md,
-internal/executor/operators_recursive_cte.go (nil-guard for o.ctx.Ctx),
-postgres symlink, third-party/tpcds-postgres submodule,
-analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt.
+Gates run: TestSyntax_Advisory* (5/5 PASS under cgroup cap), go vet
+./internal/testport, make ralph-state-guard, commit-hook pgbench smoke.
 
-In-flight: none.
+NEXT LOOP: adjudicate the 110 pending 20260827 rows from
+ci/logs/20260828-235424/testport/results.csv (bookkeeping, cheap), then per the
+Current Priority banner work **M0134-0156 (psql_crosstab.sql)**.
+
+In-flight: none of mine. NOTE: the nightly batch run 20260828-235424 was still
+executing during this loop (pid ~640236 run-nightly.sh) — do not run a second
+`internal/testport` binary concurrently with its testport stage (wedge, ledger
+row 2026-08-28 P7.2-testport-concurrency).

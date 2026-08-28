@@ -1277,14 +1277,32 @@ nightly and may be stale).
       — new tonight. Repro: `go test -v -run '^TestPort_RegressSuite$'
       ./internal/testport/`. Evidence:
       `ci/logs/20260822-001356/testport/go-test.log`.
-- [ ] **testport/TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary
-      (AI-20260822-001356-003)** — new tonight. Repro: `go test -v -run
+- [x] **testport/TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary
+      (AI-20260822-001356-003)** — first seen 20260822; re-failed every night
+      since (20260823-011911, 20260824-013441 as -002, 20260825-003932 as -002,
+      20260827-052222 as -124, and the in-flight 20260828-235424 at HEAD).
+      Repro: `go test -v -run
       '^TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary$'
       ./internal/testport/`. Evidence:
-      `ci/logs/20260822-001356/testport/go-test.log`. (Re-failed in
-      20260823-011911: `ci/logs/20260823-011911/testport/go-test.log`; re-failed
-      again in 20260824-013441 as AI-20260824-013441-002:
-      `ci/logs/20260824-013441/testport/go-test.log`.)
+      `ci/logs/20260822-001356/testport/go-test.log`.
+      **FIXED 2026-08-29 — the test was wrong, the engine is right.** Failure was
+      `scan SELECT pg_advisory_lock(0): sql/driver: couldn't convert "" into type
+      bool` in the test's SETUP line. `pg_advisory_lock()` returns **void**, not
+      boolean, and PG 18.3 sends that column as a NON-NULL zero-length value —
+      oracle-verified on a throwaway PG 18.3 (`SELECT pg_advisory_lock(0) IS
+      NULL` → `f`, `pg_typeof` → `void`); goopg's `evalAdvisoryLock`
+      (`internal/executor/expr.go`) has returned the same empty non-NULL datum
+      since M0096-0003. The test only ever passed because goopg **serialized an
+      empty non-null string as NULL on the wire**; `fd24fa33c`
+      (postmaster(wire), M0134-0070, 2026-08-21) fixed that bug, the real empty
+      value reached lib/pq, and `ParseBool("")` failed — i.e. the "regression"
+      was a PG-parity FIX exposing a test that asserted the bug. The one
+      offending call site now uses `ExecContext`, matching the two sibling void
+      call sites already in the same file (`sql.NullString` at :39/:105,
+      `ExecContext` at :363). Verified: all five
+      `TestSyntax_Advisory*` tests PASS. Ledgered: goopg reports `pg_typeof`
+      `unknown` where PG reports `void` for these builtins (row 2026-08-29
+      M-NIGHTLY-advisory-void).
 - [ ] **race/stage (AI-20260822-001356-004)** — stage race FAILED with no
       parseable cause; inspect stage logs before triaging further. Repro: `bash
       ci/batch/stages/stage-race.sh` (REPO_ROOT/RUN_DIR set; see
@@ -1345,14 +1363,172 @@ repro at HEAD first) before working.
       — new tonight. `go test -v -run '^TestPort_PgDumpConnectionSetup$'
       ./internal/testport/`. Evidence:
       `ci/logs/20260825-003932/testport/go-test.log`.
-- [ ] **units/testport —
+- [x] **units/testport —
       TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary FAILed
-      (AI-20260825-003932-002)** — duplicate of the still-open
-      AI-20260822-001356-003 row above (also failed the previous run; now 3+
-      nights running). `go test -v -run
-      '^TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary$'
+      (AI-20260825-003932-002)** — duplicate of AI-20260822-001356-003 above;
+      **FIXED 2026-08-29** with that row (void-vs-bool test defect). `go test -v
+      -run '^TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary$'
       ./internal/testport/`. Evidence:
       `ci/logs/20260825-003932/testport/go-test.log`.
+
+### Nightly run 20260827-052222 (sha `846d651d884d`, 133 items) — filed 2026-08-29
+
+**Root cause of the 132-item testport block: the run sampled a MID-MIGRATION
+parser sha.** `846d651d884d` ("parser-rewrite(gates): make the DDL probes assert")
+sits inside the goyacc parser rewrite, before `e56d4f4fd` ("fix the 5 regress
+cases the migration actually regressed") and the `#97` merge that closed it. The
+failures are overwhelmingly grammar gaps of that intermediate state — `CREATE
+TABLE t () INHERITS (…)` (empty column list), table-constraint `DEFERRABLE`,
+`UNIQUE NULLS NOT DISTINCT` — surfacing as `42601 syntax error` in each test's
+SETUP, not as engine regressions. Verified at HEAD (`5773b884c`) this loop:
+`TestPort_AddPrimaryKeyCascadesNotNullToExistingChild`,
+`TestPort_DeferrableUniqueStmtEndAutocommit`, `TestPort_SetConstraintsNNDDeferral`
+all PASS, and the in-flight nightly `20260828-235424` (same HEAD sha) shows 18 of
+these subjects PASS with exactly ONE `--- FAIL` in its testport log — the advisory
+item below. Items whose subject the 20260828 run had not yet reached at filing
+time stay unchecked; that run adjudicates them (do NOT re-investigate before
+reading `ci/logs/20260828-235424/testport/results.csv`).
+
+Repro for every `testport/*` row: `go test -v -run '^<name>$' ./internal/testport/`.
+Evidence for every row: `ci/logs/20260827-052222/testport/go-test.log`.
+
+- [x] **testport/TestPort_AddConstraintUniqueSkipsAbortedXminPhantom (AI-20260827-052222-001)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_AddPrimaryKeyCascadesNotNullToExistingChild (AI-20260827-052222-002)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_CreateTableInheritsChecksDedupedAcrossParents (AI-20260827-052222-003)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_CreateTableInheritsChildSyncsAttnotnullToHeap (AI-20260827-052222-004)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_CreateTableInheritsNoInheritCheckNotPropagated (AI-20260827-052222-005)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_CreateUniqueIndexSkipsAbortedXminPhantom (AI-20260827-052222-006)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_DeferrableUniqueStmtEndAutocommit (AI-20260827-052222-007)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_DeferrableUniqueStmtEndExplicitTxn (AI-20260827-052222-008)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_DeferrableUniqueStmtEndExtendedProtocol (AI-20260827-052222-009)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_DeferrableUniqueStmtEndGenuineDuplicate (AI-20260827-052222-010)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_DeferredNNDMultiColumn (AI-20260827-052222-011)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_InitiallyDeferredExclusionCommit (AI-20260827-052222-012)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [ ] **testport/TestPort_InitiallyDeferredFKCommit (AI-20260827-052222-013)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [x] **testport/TestPort_InitiallyDeferredNNDUniqueCommit (AI-20260827-052222-014)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_InitiallyDeferredUniqueCommit (AI-20260827-052222-015)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [ ] **testport/TestPort_IsolationAbortedKeyrevoke (AI-20260827-052222-016)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationAlterTable2 (AI-20260827-052222-017)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationAlterTable3 (AI-20260827-052222-018)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationAlterTable4 (AI-20260827-052222-019)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationClassroomScheduling (AI-20260827-052222-020)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationClusterConflictPartition (AI-20260827-052222-021)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationCreateTrigger (AI-20260827-052222-022)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationDeleteAbortSavept (AI-20260827-052222-023)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationDeleteAbortSavept2 (AI-20260827-052222-024)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationDetachPartitionConcurrently4 (AI-20260827-052222-025)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationDropIndexConcurrently1 (AI-20260827-052222-026)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationEvalPlanQual (AI-20260827-052222-027)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationFkContention (AI-20260827-052222-028)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationFkDeadlock (AI-20260827-052222-029)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationFkSnapshot (AI-20260827-052222-030)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationHorizons (AI-20260827-052222-031)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationInsertConflictDoNothing2 (AI-20260827-052222-032)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationInsertConflictDoUpdate2 (AI-20260827-052222-033)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationInsertConflictDoUpdate3 (AI-20260827-052222-034)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationInsertConflictDoUpdate4 (AI-20260827-052222-035)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationInsertConflictSpecconflict (AI-20260827-052222-036)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationIntraGrantInplace (AI-20260827-052222-037)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationLockCommittedKeyupdate (AI-20260827-052222-038)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationLockCommittedUpdate (AI-20260827-052222-039)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationLockNowait (AI-20260827-052222-040)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationLockUpdateDelete (AI-20260827-052222-041)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationLockUpdateTraversal (AI-20260827-052222-042)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationMatviewWriteSkew (AI-20260827-052222-043)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationMergeMatchRecheck (AI-20260827-052222-044)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationMergeUpdate (AI-20260827-052222-045)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationMultipleCic (AI-20260827-052222-046)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationNowait (AI-20260827-052222-047)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationNowait2 (AI-20260827-052222-048)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationNowait3 (AI-20260827-052222-049)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationNowait4 (AI-20260827-052222-050)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationNowait5 (AI-20260827-052222-051)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationPartialIndex (AI-20260827-052222-052)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationPartitionDropIndexLocking (AI-20260827-052222-053)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationPlpgsqlToast (AI-20260827-052222-054)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationPredicateGin (AI-20260827-052222-055)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationPredicateGist (AI-20260827-052222-056)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationPredicateHash (AI-20260827-052222-057)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationPreparedTransactionsCIC (AI-20260827-052222-058)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationPropagateLockDelete (AI-20260827-052222-059)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationReadOnlyAnomaly (AI-20260827-052222-060)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationReadOnlyAnomaly2 (AI-20260827-052222-061)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationReadOnlyAnomaly3 (AI-20260827-052222-062)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationReceiptReport (AI-20260827-052222-063)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationSerializableParallel (AI-20260827-052222-064)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationSerializableParallel2 (AI-20260827-052222-065)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationSerializableParallel3 (AI-20260827-052222-066)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationSkipLocked (AI-20260827-052222-067)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationSkipLocked2 (AI-20260827-052222-068)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationSkipLocked3 (AI-20260827-052222-069)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationSkipLocked4 (AI-20260827-052222-070)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationStats (AI-20260827-052222-071)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationTimeouts (AI-20260827-052222-072)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationTuplelockConflict (AI-20260827-052222-073)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationTuplelockPartition (AI-20260827-052222-074)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationTuplelockUpdate (AI-20260827-052222-075)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationTuplelockUpgradeNoDeadlock (AI-20260827-052222-076)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationTwoIds (AI-20260827-052222-077)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationUpdateConflictOut (AI-20260827-052222-078)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_IsolationVacuumNoCleanupLock (AI-20260827-052222-079)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_LockRowsSortOverJoinTakesRowLock (AI-20260827-052222-080)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [x] **testport/TestPort_NonDeferrableUniqueStillImmediate (AI-20260827-052222-081)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [ ] **testport/TestPort_NonPartitionedDeferredFKStillCatchesViolationAtCommit (AI-20260827-052222-082)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullAddConstraintCascadesUnderParentName (AI-20260827-052222-083)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullAddConstraintNotValidCascadesNotValid (AI-20260827-052222-084)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullAttachPartitionAbsorbs (AI-20260827-052222-085)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullAttachPartitionMissingChildConstraint (AI-20260827-052222-086)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullAttachPartitionNotValidConflict (AI-20260827-052222-087)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullAttachPartitionStillClearsLocal (AI-20260827-052222-088)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullCascadeSkipsUnrelatedSibling (AI-20260827-052222-089)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullCascadesMultiLevel (AI-20260827-052222-090)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullDetachPartitionUnabsorbs (AI-20260827-052222-091)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullDiamondConinhcount (AI-20260827-052222-092)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullInheritAbsorbsButKeepsLocal (AI-20260827-052222-093)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullInheritNoInheritCycleDoesNotDriftCoinhcount (AI-20260827-052222-094)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullInheritTransactionalFormAbsorbs (AI-20260827-052222-095)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullNoInheritUnabsorbs (AI-20260827-052222-096)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullSetNotNullCascadesToChildren (AI-20260827-052222-097)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_NotNullSetNotNullOnExistingDoesNotDoubleCascade (AI-20260827-052222-098)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PartitionedDeferrableUniqueDefersToCommitViaSetConstraintsAll (AI-20260827-052222-099)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PartitionedDeferrableUniqueDefersToCommitViaSetConstraintsNamed (AI-20260827-052222-100)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PartitionedDeferrableUniqueNamedChildOwnConstraintStillDefers (AI-20260827-052222-101)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PartitionedDeferredFKCatchesViolationAtCommit (AI-20260827-052222-102)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PartitionedDeferredFKMultiLevelCatchesViolationAtCommit (AI-20260827-052222-103)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PartitionedDeferredFKSatisfiedCommitsCleanly (AI-20260827-052222-104)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PartitionedUniqueConstraintFansOutToPgConstraint (AI-20260827-052222-105)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgAmcheck005OpclassDamage (AI-20260827-052222-106)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260827-052222-107)** — repeat of the already-open task for this subject above; see that row (re-failed tonight).
+- [ ] **testport/TestPort_PgDumpDatabaseConfigSet (AI-20260827-052222-108)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgDumpDatabaseGrantACL (AI-20260827-052222-109)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgDumpRoleConfigSet (AI-20260827-052222-110)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgDumpallGlobalsOnly (AI-20260827-052222-111)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgDumpallParameterACL (AI-20260827-052222-112)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgDumpallPredefinedRoleMembership (AI-20260827-052222-113)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgDumpallRoleMembership (AI-20260827-052222-114)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_PgoutputInteropGoopgToPG (AI-20260827-052222-115)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_RegressSuite (AI-20260827-052222-116)** — repeat of the already-open task for this subject above; see that row (re-failed tonight).
+- [ ] **testport/TestPort_SetConstraintsDeferral (AI-20260827-052222-117)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [x] **testport/TestPort_SetConstraintsExclusionDeferral (AI-20260827-052222-118)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_SetConstraintsNNDDeferral (AI-20260827-052222-119)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [x] **testport/TestPort_SetConstraintsUniqueDeferral (AI-20260827-052222-120)** — stale: mid-migration parser sha; PASS at HEAD (`ci/logs/20260828-235424/testport/go-test.log`).
+- [ ] **testport/TestPort_TimeoutsRowLevel (AI-20260827-052222-121)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_TwoPhaseCommitSameBackend (AI-20260827-052222-122)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestPort_ZeroColumnJoinDoesNotCrashBackend (AI-20260827-052222-123)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [x] **testport/TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary (AI-20260827-052222-124)** — repeat of the already-open AI-20260822-001356-003 row above; **FIXED this loop** (see that row for the diagnosis).
+- [ ] **testport/TestSyntax_DML_Delete (AI-20260827-052222-125)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestSyntax_DML_Update (AI-20260827-052222-126)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestSyntax_Locking_ForShare (AI-20260827-052222-127)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestSyntax_Locking_ForUpdate (AI-20260827-052222-128)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestSyntax_Locking_Nowait (AI-20260827-052222-129)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestSyntax_Select_Case (AI-20260827-052222-130)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+- [ ] **testport/TestSyntax_Select_CurrentSetting (AI-20260827-052222-131)** — presumed stale (same mid-migration parser sha); pending the 20260828-235424 verdict.
+
+Non-testport items from the same run:
+
+- [ ] **tpcds/stage (AI-20260827-052222-132)** — stage tpcds FAILED (fail(sweep)) with no parseable cause — inspect the stage logs. Evidence: `ci/logs/20260827-052222/`.
+- [ ] **tpch/Q5-timeout (AI-20260827-052222-133)** — Q5 hit its per-query budget (57014/cancel). Evidence: `ci/logs/20260827-052222/`.
+
 
 ## M0130 — Cluster-directory compat with PG 18.3 + PG physical replication (filed 2026-08-09)
 
