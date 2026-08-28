@@ -215,6 +215,7 @@ create_table_stmt:
 					SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
 					applyPartOfElems(ct.PartitionOf, tail.partOfElems)
 				}
+				scopePartitionByPos(ct)
 				ct.SelectSource = tail.asSelect
 				$$ = ct
 			}
@@ -238,6 +239,7 @@ create_table_stmt:
 					SetPartitionOfHashBound(ct.PartitionOf, tail.modulus, tail.remainder, tail.isHash)
 					applyPartOfElems(ct.PartitionOf, tail.partOfElems)
 				}
+				scopePartitionByPos(ct)
 				ct.SelectSource = tail.asSelect
 				/* This arm exists for the column-list-LESS spellings —
 				   PARTITION OF and the tails. A CREATE TABLE with NO column
@@ -749,7 +751,7 @@ trunc_name:
 opt_subpartition_by:
 		/* empty */   { $$ = (*PartitionByClause)(nil) }
 	| PARTITION BY ColId '(' part_elem_list ')'
-			{ $$ = partitionByFrom($3, $<p>3, $5.([]partKey)) }
+			{ $$ = partitionByFrom($<p>1, $3, $<p>3, $5.([]partKey)) }
 
 /* Partition keys — gram.y part_elem. A key is a column name, a function call,
    or a parenthesised expression, each with an optional COLLATE and an optional
@@ -851,7 +853,7 @@ ct_tail_item:
 			{ $$ = &ctTail{} }
 	| PARTITION BY ColId '(' part_elem_list ')'
 			{
-				i := &ctTail{}; i.partition = partitionByFrom($3, $<p>3, $5.([]partKey)); $$ = i
+				i := &ctTail{}; i.partition = partitionByFrom($<p>1, $3, $<p>3, $5.([]partKey)); $$ = i
 			}
 	| PARTITION OF qualified_name part_bound_spec2
 			{
@@ -1490,7 +1492,7 @@ alter_table_action:
 	   the constraint keyword, or CONSTRAINT for the named spelling — so the
 	   position is stamped here, where that token is on the stack. */
 	| ADD_P at_constraint
-			{ $$ = atActionAt($2, $<p>2) }
+			{ $$ = $2 }
 	| ADD_P CONSTRAINT ColId at_constraint
 			{
 				a := atActionAt($4, $<p>2)
@@ -1707,7 +1709,9 @@ alter_table_action:
 			}
 	| SET TABLESPACE ColId
 			{
-				a := NewATActionAt(AlterTableSetTablespace, $<p>3)
+				/* ddl.go:10012 records the SET keyword here; ALTER INDEX's own
+				   arm (:8049) records the TABLESPACE NAME instead. */
+				a := NewATActionAt(AlterTableSetTablespace, $<p>1)
 				a.TablespaceName = $3
 				$$ = a
 			}
@@ -1717,7 +1721,7 @@ alter_table_action:
 			{ $$ = NewATActionAt(AlterTableSetWithoutCluster, $<p>1) }
 	| CLUSTER ON ColId
 			{
-				a := NewATActionAt(AlterTableClusterOn, $<p>1)
+				a := NewATActionAt(AlterTableClusterOn, $<p>2)
 				a.ClusterIndexName = $3
 				$$ = a
 			}
@@ -1810,7 +1814,11 @@ at_constraint:
 			}
 	| check_body at_constr_tail
 			{
-				a := NewATActionAt(AlterTableAddCheck, $<p>1)
+				/* $<ival>1, not $<p>1: CHECKBODY's pos is the OPENING
+				   PAREN (joinCheckTokens spans from there) and its ival
+				   carries the CHECK keyword, which is where ddl.go anchors
+				   the action. */
+				a := NewATActionAt(AlterTableAddCheck, $<ival>1)
 				a.CheckExpr = $1
 				$$ = applyATCheckTail(a, mustATTail($2))
 			}
@@ -2625,7 +2633,9 @@ merge_when_list:
 merge_when_clause:
 		WHEN merge_match opt_merge_and THEN merge_action
 			{
-				c := $2
+				/* The WHEN keyword — merge_match reduces before it is on the
+				   stack, so the clause is re-anchored here. */
+				c := mergeWhenAt($2, $<p>1)
 				c.Condition = $3
 				applyMergeAction(c, $5)
 				$$ = c
@@ -3186,9 +3196,12 @@ drop_compat_kind:
    per-character), so legacy's parseOperatorRefName joins the run back up. The
    run rule is reachable only after DROP OPERATOR, where nothing else can
    follow, so it costs no conflict in expression context. */
+/* The qname carries its own offset, like qualified_name's: objectNameFromQn
+   forwards it to ObjectName.pos, which is the errposition a failed
+   DROP OPERATOR reports. */
 any_operator_name:
-		op_run                 { $$ = qname{parts: []string{$1}} }
-	| ColId '.' op_run         { $$ = qname{parts: []string{$1, $3}} }
+		op_run                 { $$ = qname{parts: []string{$1}, pos: $<p>1} }
+	| ColId '.' op_run         { $$ = qname{parts: []string{$1, $3}, pos: $<p>1} }
 
 op_run:
 		op_char                { $$ = $1 }
@@ -3679,7 +3692,7 @@ alter_index_stmt:
 	| ALTER INDEX qualified_name SET TABLESPACE ColId
 			{
 				st := NewAlterIndexStmt($<p>1, objectNameFromQn($3), "ALTER INDEX")
-				a := NewATActionAt(AlterTableSetTablespace, $<p>3)
+				a := NewATActionAt(AlterTableSetTablespace, $<p>6)
 				a.TablespaceName = $6
 				st.Actions = append(st.Actions, *a)
 				$$ = st
@@ -3706,7 +3719,7 @@ alter_index_stmt:
 	| ALTER INDEX qualified_name RENAME TO ColId
 			{
 				st := NewAlterIndexStmt($<p>1, objectNameFromQn($3), "ALTER INDEX")
-				a := NewATActionAt(AlterTableRenameTable, $<p>3)
+				a := NewATActionAt(AlterTableRenameTable, $<p>6)
 				a.NewName = $6
 				st.Actions = append(st.Actions, *a)
 				$$ = st
@@ -3733,14 +3746,14 @@ alter_view_stmt:
 			}
 
 alter_view_action:
-		RENAME TO ColId                       { $$ = altViewRenameTo($3) }
-	| RENAME opt_COLUMN ColId TO ColId        { $$ = altViewRenameCol($3, $5) }
+		RENAME TO ColId                       { $$ = altViewRenameTo($<p>3, $3) }
+	| RENAME opt_COLUMN ColId TO ColId        { $$ = altViewRenameCol($<p>3, $3, $5) }
 	| OWNER TO alter_fn_owner                 { $$ = altViewOwner($3) }
 	| SET SCHEMA ColId                        { $$ = altViewSetSchema($3) }
 	| SET '(' str_pair_list ')'               { $$ = altViewReloptions($3, false) }
 	| RESET '(' str_pair_list ')'             { $$ = altViewReloptions($3, true) }
-	| ALTER opt_COLUMN ColId SET DEFAULT a_expr { $$ = altViewSetDefault($3, $6) }
-	| ALTER opt_COLUMN ColId DROP DEFAULT     { $$ = altViewDropDefault($3) }
+	| ALTER opt_COLUMN ColId SET DEFAULT a_expr { $$ = altViewSetDefault($<p>3, $3, $6) }
+	| ALTER opt_COLUMN ColId DROP DEFAULT     { $$ = altViewDropDefault($<p>3, $3) }
 
 /* ============================================================================
    P5.14 — LISTEN / NOTIFY / UNLISTEN, plus DROP LANGUAGE and the one

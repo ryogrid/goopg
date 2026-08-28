@@ -1517,3 +1517,70 @@ a position convention is corrected, anything that was reading `X.Pos()` as a
 proxy for "where X starts" has to be re-checked.
 
 Left at 104.
+
+### 104 -> 46
+
+Anchors, again read off ddl.go/select.go:
+
+| node | anchor |
+|---|---|
+| SIMILAR TO | the SIMILAR keyword |
+| AT TIME ZONE / AT LOCAL | the AT keyword |
+| `FETCH … ROWS ONLY` implicit count | row_or_rows, not zero |
+| BETWEEN | the BETWEEN keyword (buildBetween used the left operand's) |
+| SortBy | its expression's FIRST token, not `expr.Pos()` — the same
+  correction ResTarget needed, and for the same reason: `ORDER BY a COLLATE x`
+  now has a CollateExpr anchored at COLLATE |
+| ALTER INDEX RENAME / SET TABLESPACE | the NEW name / the tablespace name |
+| CLUSTER ON | the ON keyword (ddl.go reads p.cur().Pos after CLUSTER) |
+| bare `ADD <constraint>` | the inner element's own anchor — for CHECK that is
+  CHECKBODY's `ival` (the CHECK keyword), because its `pos` is the OPENING
+  PAREN that joinCheckTokens spans from. The ADD wrapper was overwriting it;
+  the NAMED form still re-anchors, since there the token after ADD is
+  CONSTRAINT. |
+
+**A negative result worth recording**: stamping `PartitionByClause.pos`
+unconditionally made the count WORSE (83 -> 90). ddl.go leaves it zero for a
+top-level `CREATE TABLE … PARTITION BY` and sets it only for the clause after
+a PARTITION OF bound. Measuring each change in isolation is what caught it —
+two edits landed together and the total moved the wrong way.
+
+### 46 -> 9, and what the "past-the-end" family actually resolves to
+
+The five ALTER TABLE actions whose clause ends the statement do NOT need
+their legacy position reproduced, and nothing downstream needs adjusting to
+compensate. **Zero is the PG-faithful answer**, on two pieces of evidence:
+
+- `AlterTableCmd` has **no location field** (postgres/src/include/nodes/
+  parsenodes.h) — upstream does not track a position for these at all.
+- `alter_table.out:4402` shows
+  `ALTER TABLE list_parted2 DETACH PARTITION part_4;` producing
+  `ERROR: relation "part_4" does not exist` with **no `LINE 1:` / caret**,
+  while other errors in the same file do carry one.
+
+goopg's executor forwards `act.Pos()` into `ExecError.Pos` (95 sites), so a
+zero simply omits the wire Position field and psql prints no caret — exactly
+PG's output. Legacy's value was a caret pointing PAST THE END of the
+statement, which PG never emits. So this is not "legacy behaviour we chose
+not to reproduce"; it is a legacy DEFECT the new parser already fixes, and
+`TestPositionParity` now says so: `onlyPastTheEndPositions` excuses a
+statement only when EVERY differing position is legacy-past-the-end against a
+yacc zero — a provable condition, not a blanket exemption for those kinds.
+
+Two more ratchet corrections in the same spirit:
+
+- Statements in `knownDiffCorpus` are skipped, because their two ASTs differ
+  in SHAPE by design (the unary-minus fold inserts a UnaryOp), so walking
+  them node-by-node compares nodes that do not correspond.
+- `samePositionValues` skips a statement whose two walks visit the same
+  multiset of offsets — shape is canonDump's job, this test is about offsets.
+
+The rest of the round: ALTER VIEW's actions had no position at all (six
+forms), `any_operator_name` never carried a qname offset (DROP OPERATOR), a
+sub-partitioning `PARTITION BY` carries the PARTITION keyword while a
+top-level one carries zero (scopePartitionByPos, the same shape as
+topLevelSelect), MERGE's WHEN clause anchors at WHEN, `ROWS FROM(...)` at
+ROWS, a parenthesised join at its '(', and `ALTER TABLE … SET TABLESPACE`
+at SET where ALTER INDEX's anchors at the tablespace NAME.
+
+Left at 9.

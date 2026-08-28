@@ -538,8 +538,9 @@ type cteItem struct{ cte *CommonTableExpr }
 //	x >= low AND x <= high
 //	SYMMETRIC: (x>=low AND x<=high) OR (x>=high AND x<=low)
 //	NOT: NOT(<the above>)
-func buildBetween(left Expr, low, high Expr, negated, symmetric bool) Expr {
-	pos := left.Pos()
+// buildBetween takes the BETWEEN keyword's own offset: select.go desugars the
+// form into comparisons anchored there, not at the left operand.
+func buildBetween(pos int, left Expr, low, high Expr, negated, symmetric bool) Expr {
 	ge := func(a, b Expr) Expr {
 		return NewBinaryOp(pos, OpGe, a, b)
 	}
@@ -1601,8 +1602,14 @@ func newPartKey(e Expr, pos int, collation, opClass string) partKey {
 }
 
 // partitionByFrom assembles the five parallel slices PartitionByClause keeps.
-func partitionByFrom(method string, methodPos int, keys []partKey) *PartitionByClause {
+// partitionByFrom takes clausePos — the PARTITION keyword — separately from
+// methodPos (RANGE/LIST/HASH), but only the SUB-partition context uses it:
+// ddl.go leaves PartitionByClause.pos at zero for a top-level
+// `CREATE TABLE ... PARTITION BY`, and sets it only for the clause that
+// follows a PARTITION OF bound. Pass 0 for the top-level arm.
+func partitionByFrom(clausePos int, method string, methodPos int, keys []partKey) *PartitionByClause {
 	pb := NewPartitionByClause(upperIdent(method), nil)
+	pb.pos = clausePos
 	pb.MethodPos = methodPos
 	for _, k := range keys {
 		pb.KeyCols = append(pb.KeyCols, k.name)
@@ -3822,9 +3829,12 @@ func strPairMap(kvs []string) map[string]string {
 // builds for the statement.
 type alterViewOp func(*AlterTableStmt)
 
-func altViewAction(kind AlterTableActionKind, fill func(*AlterTableAction)) alterViewOp {
+// altViewAction takes the offset ddl.go records for the action — the column
+// or new name, per kind. SET/RESET (reloptions) pass 0, which is what ddl.go
+// leaves them at.
+func altViewAction(pos int, kind AlterTableActionKind, fill func(*AlterTableAction)) alterViewOp {
 	return func(st *AlterTableStmt) {
-		a := NewATAction(kind)
+		a := NewATActionAt(kind, pos)
 		if fill != nil {
 			fill(a)
 		}
@@ -3832,14 +3842,14 @@ func altViewAction(kind AlterTableActionKind, fill func(*AlterTableAction)) alte
 	}
 }
 
-func altViewRenameTo(name string) alterViewOp {
+func altViewRenameTo(pos int, name string) alterViewOp {
 	n := name
-	return altViewAction(AlterTableRenameTable, func(a *AlterTableAction) { a.NewName = n })
+	return altViewAction(pos, AlterTableRenameTable, func(a *AlterTableAction) { a.NewName = n })
 }
 
-func altViewRenameCol(old, new_ string) alterViewOp {
+func altViewRenameCol(pos int, old, new_ string) alterViewOp {
 	o, n := old, new_
-	return altViewAction(AlterTableRenameColumn, func(a *AlterTableAction) {
+	return altViewAction(pos, AlterTableRenameColumn, func(a *AlterTableAction) {
 		a.OldColumnName, a.NewName = o, n
 	})
 }
@@ -3858,24 +3868,25 @@ func altViewSetSchema(name string) alterViewOp {
 }
 
 func altViewReloptions(kvs []string, reset bool) alterViewOp {
+	const pos = 0 // ddl.go leaves SET/RESET (reloptions) at zero
 	opts := strPairMap(kvs)
 	kind := AlterTableSetReloptions
 	if reset {
 		kind = AlterTableResetReloptions
 	}
-	return altViewAction(kind, func(a *AlterTableAction) { a.With = opts })
+	return altViewAction(pos, kind, func(a *AlterTableAction) { a.With = opts })
 }
 
-func altViewSetDefault(col string, e Expr) alterViewOp {
+func altViewSetDefault(pos int, col string, e Expr) alterViewOp {
 	c := col
-	return altViewAction(AlterTableSetDefault, func(a *AlterTableAction) {
+	return altViewAction(pos, AlterTableSetDefault, func(a *AlterTableAction) {
 		a.ColumnName, a.DefaultExpr = c, e
 	})
 }
 
-func altViewDropDefault(col string) alterViewOp {
+func altViewDropDefault(pos int, col string) alterViewOp {
 	c := col
-	return altViewAction(AlterTableDropDefault, func(a *AlterTableAction) { a.ColumnName = c })
+	return altViewAction(pos, AlterTableDropDefault, func(a *AlterTableAction) { a.ColumnName = c })
 }
 
 func altTypeRenameAttr(old, new_ string) alterTypeOp {
@@ -4093,4 +4104,25 @@ func arbiterAt(t *OnConflictTarget, pos int) *OnConflictTarget {
 		t.pos = pos
 	}
 	return t
+}
+
+// scopePartitionByPos reproduces ddl.go's split: a PARTITION BY clause that
+// SUB-partitions a `PARTITION OF` child carries the PARTITION keyword's
+// offset, while a top-level `CREATE TABLE … PARTITION BY` carries zero. One
+// grammar rule serves both, so the distinction is applied here, where the
+// PartitionOf clause is visible — the same shape as topLevelSelect.
+func scopePartitionByPos(ct *CreateTableStmt) {
+	if ct.PartitionBy != nil && ct.PartitionOf == nil {
+		ct.PartitionBy.pos = 0
+	}
+}
+
+// mergeWhenAt re-anchors a MERGE WHEN clause at the WHEN keyword; merge_match
+// reduces before WHEN is on the stack.
+func mergeWhenAt(v any, pos int) *MergeWhenClause {
+	c, _ := v.(*MergeWhenClause)
+	if c != nil {
+		c.pos = pos
+	}
+	return c
 }

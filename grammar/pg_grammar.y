@@ -1212,15 +1212,15 @@ sort_using_op:
 SortBy:
 		a_expr
 			{
-				$$ = NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($<p>1, $1, false, "")
 			}
 	| a_expr ASC
 			{
-				$$ = NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($<p>1, $1, false, "")
 			}
 	| a_expr DESC
 			{
-				$$ = NewSortBy($1.Pos(), $1, true, "")
+				$$ = NewSortBy($<p>1, $1, true, "")
 			}
 	/* NULLS FIRST|LAST without an explicit ASC/DESC — gram.y's sortby is
 	   `a_expr opt_asc_desc opt_nulls_order`, so both parts are optional
@@ -1228,53 +1228,53 @@ SortBy:
 	/* ORDER BY x USING op — gram.y sortby's first alternative. */
 	| a_expr USING sort_using_op
 			{
-				$$ = NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+				$$ = NewSortBy($<p>1, $1, sortUsingIsDesc($3), $3)
 			}
 	| a_expr USING sort_using_op NULLS_LA FIRST_P
 			{
-				$$ = NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+				$$ = NewSortBy($<p>1, $1, sortUsingIsDesc($3), $3)
 				v := true
 				$$.NullsFirst = &v
 			}
 	| a_expr USING sort_using_op NULLS_LA LAST_P
 			{
-				$$ = NewSortBy($1.Pos(), $1, sortUsingIsDesc($3), $3)
+				$$ = NewSortBy($<p>1, $1, sortUsingIsDesc($3), $3)
 				v := false
 				$$.NullsFirst = &v
 			}
 	| a_expr NULLS_LA FIRST_P
 			{
-				$$ = NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($<p>1, $1, false, "")
 				v := true
 				$$.NullsFirst = &v
 			}
 	| a_expr NULLS_LA LAST_P
 			{
-				$$ = NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($<p>1, $1, false, "")
 				v := false
 				$$.NullsFirst = &v
 			}
 	| a_expr ASC NULLS_LA FIRST_P
 			{
-				$$ = NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($<p>1, $1, false, "")
 				v := true
 				$$.NullsFirst = &v
 			}
 	| a_expr ASC NULLS_LA LAST_P
 			{
-				$$ = NewSortBy($1.Pos(), $1, false, "")
+				$$ = NewSortBy($<p>1, $1, false, "")
 				v := false
 				$$.NullsFirst = &v
 			}
 	| a_expr DESC NULLS_LA FIRST_P
 			{
-				$$ = NewSortBy($1.Pos(), $1, true, "")
+				$$ = NewSortBy($<p>1, $1, true, "")
 				v := true
 				$$.NullsFirst = &v
 			}
 	| a_expr DESC NULLS_LA LAST_P
 			{
-				$$ = NewSortBy($1.Pos(), $1, true, "")
+				$$ = NewSortBy($<p>1, $1, true, "")
 				v := false
 				$$.NullsFirst = &v
 			}
@@ -1335,12 +1335,12 @@ limit_clause:
 			{
 				/* Countless form: the row count defaults to one
 				   (gram.y makeIntConst(1, -1)). */
-				$$ = &selectLimit{count: NewIntegerConst(0, 1), withTies: true, set: true}
+				$$ = &selectLimit{count: NewIntegerConst($<p>3, 1), withTies: true, set: true}
 			}
 	| FETCH first_or_next row_or_rows ONLY
 			{
 				// Omitted count defaults to 1 (gram.y :13346 alt).
-				$$ = &selectLimit{count: NewIntegerConst(0, 1), set: true}
+				$$ = &selectLimit{count: NewIntegerConst($<p>3, 1), set: true}
 			}
 	| FETCH first_or_next select_fetch_first_value row_or_rows WITH TIES
 			{
@@ -1698,10 +1698,10 @@ base_table_ref:
 					alias, cols = da.alias, da.cols
 					lateral = da.lateral
 				}
-				// Group-start position approximated by the base item's own
-				// position (legacy uses the '(' offset; a paren_pos mid-rule
+				// The '(' offset, which is what select.go records. It used
+				// to be approximated by the base item's own position (a
 				// here created an unresolvable S/R against nested groups).
-				pos := fe.Base.Pos()
+				pos := $<p>1
 				sub := syntheticParenSelect(pos, fe)
 				$$ = derivedRangeVar(yylex.(*lexerState), pos, sub, alias, cols, lateral)
 			}
@@ -1805,7 +1805,7 @@ func_table_expr:
 	| ROWS FROM '(' row_from_list ')' opt_with_ordinality
 			{
 				ord := $6 == ordYes
-				$$ = &funcTable{ref: newTableFuncRef(0, "", nil, ord, $4)}
+				$$ = &funcTable{ref: newTableFuncRef($<p>1, "", nil, ord, $4)}
 			}
 
 /* opt_ordinality — gram.y :14069: WITH_LA (base_yylex substitutes
@@ -2442,11 +2442,11 @@ a_expr:
 	   legacy's binding exactly. */
 	| a_expr AT TIME ZONE a_expr %prec Op
 			{
-				$$ = specialFormCall($1.Pos(), "timezone", []Expr{tzZone(yylex, $5), $1})
+				$$ = specialFormCall($<p>2, "timezone", []Expr{tzZone(yylex, $5), $1})
 			}
 	| a_expr AT LOCAL %prec Op
 			{
-				$$ = specialFormCall($1.Pos(), "timezone", []Expr{$1})
+				$$ = specialFormCall($<p>2, "timezone", []Expr{$1})
 			}
 	| a_expr Op a_expr
 			{
@@ -2559,19 +2559,19 @@ a_expr:
 	   via buildSimilarTo (legacy buildSimilarTo parity). */
 	| a_expr SIMILAR TO a_expr %prec SIMILAR
 			{
-				$$ = buildSimilarTo(yylex, $1, $4, nil, $1.Pos(), false)
+				$$ = buildSimilarTo(yylex, $1, $4, nil, $<p>2, false)
 			}
 	| a_expr SIMILAR TO a_expr ESCAPE a_expr %prec SIMILAR
 			{
-				$$ = buildSimilarTo(yylex, $1, $4, $6, $1.Pos(), false)
+				$$ = buildSimilarTo(yylex, $1, $4, $6, $<p>2, false)
 			}
 	| a_expr NOT_LA SIMILAR TO a_expr %prec NOT_LA
 			{
-				$$ = buildSimilarTo(yylex, $1, $5, nil, $1.Pos(), true)
+				$$ = buildSimilarTo(yylex, $1, $5, nil, $<p>2, true)
 			}
 	| a_expr NOT_LA SIMILAR TO a_expr ESCAPE a_expr %prec NOT_LA
 			{
-				$$ = buildSimilarTo(yylex, $1, $5, $7, $1.Pos(), true)
+				$$ = buildSimilarTo(yylex, $1, $5, $7, $<p>2, true)
 			}
 
 	/* [NOT] LIKE / ILIKE [+ ESCAPE] — gram.y :15080ff. ESCAPE wraps the
@@ -2639,29 +2639,29 @@ a_expr:
 	   desugars via buildBetween (legacy parseBetweenTail parity). */
 	| a_expr BETWEEN b_expr AND b_expr %prec BETWEEN
 			{
-				$$ = buildBetween($1, $3, $5, false, false)
+				$$ = buildBetween($<p>2, $1, $3, $5, false, false)
 			}
 	| a_expr BETWEEN SYMMETRIC b_expr AND b_expr %prec BETWEEN
 			{
-				$$ = buildBetween($1, $4, $6, false, true)
+				$$ = buildBetween($<p>2, $1, $4, $6, false, true)
 			}
 	/* ASYMMETRIC is the explicit spelling of the DEFAULT, so it desugars like
 	   the bare form, not like SYMMETRIC. */
 	| a_expr BETWEEN ASYMMETRIC b_expr AND b_expr %prec BETWEEN
 			{
-				$$ = buildBetween($1, $4, $6, false, false)
+				$$ = buildBetween($<p>2, $1, $4, $6, false, false)
 			}
 	| a_expr NOT_LA BETWEEN ASYMMETRIC b_expr AND b_expr %prec BETWEEN
 			{
-				$$ = buildBetween($1, $5, $7, true, false)
+				$$ = buildBetween($<p>2, $1, $5, $7, true, false)
 			}
 	| a_expr NOT_LA BETWEEN b_expr AND b_expr %prec BETWEEN
 			{
-				$$ = buildBetween($1, $4, $6, true, false)
+				$$ = buildBetween($<p>2, $1, $4, $6, true, false)
 			}
 	| a_expr NOT_LA BETWEEN SYMMETRIC b_expr AND b_expr %prec BETWEEN
 			{
-				$$ = buildBetween($1, $5, $7, true, true)
+				$$ = buildBetween($<p>2, $1, $5, $7, true, true)
 			}
 
 /* c_expr — gram.y :15640ff, P1.1 subset: literals, parameters, column refs. */
@@ -3288,7 +3288,7 @@ name_or_call:
 				_ = ft
 				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				fc.Filter = $5.(Expr)
-				fc.Over = NewBareWindowRef(0, $7)
+				fc.Over = NewBareWindowRef($<p>6, $7)
 				$$ = fc
 			}
 	| qualified_name '(' opt_call_args ')' filter_clause OVER '(' opt_window_spec ')'
