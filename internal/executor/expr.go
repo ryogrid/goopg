@@ -4795,23 +4795,16 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		return Datum{Kind: KindInt, Int: n}, nil
 
 	case "float", "float4", "real", "float8":
-		// Goopg v0 stores floats as KindNumeric strings. Validate via
-		// ParseFloat so the error message is PostgreSQL-compatible.
-		v := strings.TrimSpace(x.Value)
-		_, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			typname := "double precision"
-			if x.Type == "float4" || x.Type == "real" {
-				typname = "real"
-			}
-			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
-				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typname, x.Value)}
+		// `float8 '…'` shares float8in with `'…'::float8` (evalCast) — see
+		// float_in.go. M0134-0166: this arm used to validate with a bare
+		// strconv.ParseFloat (no 22003 for out-of-range, no float4 narrowing)
+		// and then fall back to the RAW spelling whenever parseNumeric
+		// refused it, so `float8 'NAN'` rendered as "NAN" instead of "NaN".
+		bits := 64
+		if x.Type == "float4" || x.Type == "real" {
+			bits = 32
 		}
-		m, s, perr := parseNumeric(v)
-		if perr != nil {
-			return NewStringDatum(v), nil
-		}
-		return newNumeric(m, int(s)), nil
+		return floatInDatumOrErr(x.Value, bits, x.Pos())
 
 	case "numeric", "decimal":
 		// Return as string — goopg v0 stores numerics as text.
@@ -6064,6 +6057,20 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return d, nil
 		}
 	case "float4", "real":
+		// Text → float4: float4in (postgres/src/backend/utils/adt/float.c:180).
+		// M0134-0166: this arm did not exist, so `'x'::float4` fell through to
+		// the `return d, nil` at the bottom and handed back the raw string
+		// unvalidated. See float_in.go.
+		if d.Kind == KindString {
+			s := d.StringValue()
+			// Array literals like '{1,2}'::float4[] pass through — the parser
+			// strips '[]' so the target type looks scalar. Same guard the
+			// int2 arm above carries. M0097-0063.
+			if len(s) > 0 && s[0] == '{' {
+				return d, nil
+			}
+			return floatInDatumOrErr(s, 32, pos)
+		}
 		// Integer → float4: round-trip through float32 to apply float32 precision.
 		// PostgreSQL float4 has ~7 significant decimal digits; full int64 precision
 		// must be lost before display. M0097-0147.
@@ -6100,6 +6107,17 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		}
 		return d, nil
 	case "float", "float8", "double precision":
+		// Text → float8: float8in (postgres/src/backend/utils/adt/float.c:364).
+		// M0134-0166: this arm did not exist, so `'10e400'::float8` and even
+		// `'N A N'::float8` fell through to the `return d, nil` below and
+		// "succeeded", storing the raw text in a float8. See float_in.go.
+		if d.Kind == KindString {
+			s := d.StringValue()
+			if len(s) > 0 && s[0] == '{' { // '{1,2}'::float8[], see the float4 arm
+				return d, nil
+			}
+			return floatInDatumOrErr(s, 64, pos)
+		}
 		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
 		// PostgreSQL float8out uses printf-style format that removes trailing zeros.
 		if d.Kind == KindNumeric {

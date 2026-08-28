@@ -2357,22 +2357,23 @@ func pgIntervalFieldsFromDatum(d Datum) (months, days int32, micros int64, err e
 // ParseFloat width (and hence the float4 rounding) and the type name PG uses in
 // its own 22P02 text (float.c float4in / float8in).
 func pgFloatFromDatum(d Datum, bits int) (float64, error) {
-	typeName := "double precision"
-	if bits == 32 {
-		typeName = "real"
-	}
 	switch d.Kind {
 	case KindInt:
 		return float64(d.Int), nil
 	case KindString, KindNumeric:
-		raw := strings.TrimSpace(d.StringValue())
+		raw := d.StringValue()
 		if d.Kind == KindNumeric {
 			raw = numericText(d)
 		}
-		v, err := strconv.ParseFloat(raw, bits)
+		// M0134-0166: this used to TrimSpace first and then report the
+		// trimmed text, so an `INSERT INTO t(f float8) VALUES ('  ')` said
+		// `… : ""` where PG says `… : "  "`, and it mapped strconv's ErrRange
+		// onto 22P02 instead of PG's dedicated 22003 "is out of range".
+		// floatIn (float_in.go) is float8in_internal and is now shared with
+		// evalCast / evalTypedStringLit — Hard-won Rule #2.
+		v, err := floatIn(raw, bits)
 		if err != nil {
-			return 0, &ExecError{Code: "22P02",
-				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, raw)}
+			return 0, err
 		}
 		if math.IsNaN(v) {
 			// strconv.ParseFloat("NaN", 64) yields Go's NaN, whose payload bit is
