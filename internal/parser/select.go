@@ -8,34 +8,6 @@ import (
 	"github.com/goopg/goopg/internal/utils/adt/similarto"
 )
 
-// parseValuesStmt parses a bare VALUES (row1), (row2), ... statement.
-// Used as a subquery source in FROM clauses: `FROM (VALUES ...) AS t(col)`.
-// M0097-0003.
-func (p *parser) parseValuesStmt() (Stmt, error) {
-	t, err := p.expectKeyword(KwValues)
-	if err != nil {
-		return nil, err
-	}
-	s := &SelectStmt{pos: t.Pos}
-	for {
-		if !p.acceptSymbol("(") {
-			return nil, p.errAtCur("expected '(' for VALUES row")
-		}
-		row, err := p.parseExprList()
-		if err != nil {
-			return nil, err
-		}
-		if !p.acceptSymbol(")") {
-			return nil, p.errAtCur("expected ')' after VALUES row")
-		}
-		s.ValuesRows = append(s.ValuesRows, row)
-		if !p.acceptSymbol(",") {
-			break
-		}
-	}
-	return s, nil
-}
-
 // parseValuesSelect parses a VALUES statement that may be followed by
 // UNION/INTERSECT/EXCEPT and/or ORDER BY/LIMIT/OFFSET. This is called
 // from parseSelect when the current token is VALUES. M0097-0049.
@@ -1723,13 +1695,6 @@ func (p *parser) parseCollationName() (string, error) {
 		}
 	}
 	return name, nil
-}
-
-// skipCollationName consumes a collation name and discards it.
-// Kept for callers in DDL/DML that don't need the value.
-func (p *parser) skipCollationName() error {
-	_, err := p.parseCollationName()
-	return err
 }
 
 func (p *parser) parseSortItem() (SortBy, error) {
@@ -4478,6 +4443,18 @@ func (p *parser) buildSubstringSimilar(str, pattern, escape Expr, pos int) (Expr
 	if strNull || patNull || escNull {
 		return &NullConst{pos: pos}, nil
 	}
+	return foldSubstringSimilar(str, patVal, escVal, pos)
+}
+
+// foldSubstringSimilar is the half of buildSubstringSimilar that runs once the
+// three operands are known to be non-NULL literals: validate the escape,
+// convert the SQL:1999 pattern, fold to a 2-arg substring(). It is a free
+// function because the goyacc grammar needs the same behaviour and cannot
+// reach a *parser — and its own copy had quietly dropped BOTH SQLSTATEs
+// (22025 with its HINT, and 2200C) plus the Pos: -1 convention, so the same
+// input produced a 42601 there. Pos is -1 because the fold has no token to
+// point at; that matches buildSimilarTo.
+func foldSubstringSimilar(str Expr, patVal, escVal string, pos int) (Expr, error) {
 	if err := similarto.ValidateEscape(escVal); err != nil {
 		return nil, &SyntaxError{
 			Pos: -1, Raw: true, Code: "22025",

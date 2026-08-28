@@ -4,7 +4,7 @@ Q5,5,structural,any,GROUP BY n_name over ASIA region = 5 nations
 Q9,175,structural,any,nation x year groups (25 x 7)
 Q12,2,structural,any,GROUP BY l_shipmode IN (MAIL;SHIP) = 2 rows (spotcheck invariant)
 Q22,7,structural,any,7 country-code groups
-Q13,35,pinned,20260727,bench/tpch/spotcheck_expected.env (re-pinned 2026-07-27 reload; lineitem=5997241; load-dependent — re-pin after every reload)
+Q13,34,pinned,20260826,bench/tpch/spotcheck_expected.env (re-pinned 2026-08-26 reload; load-dependent — re-pin after every reload)
 Q3,11521,load-dependent,20260727,tmp/tpch-runner anchor pass on the 2026-07-27 HammerDB reload (build_goopg_20260727-192854.log; tables live in PERSISTENT db tpch)
 Q10,20501,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27
 Q11,819,load-dependent,20260727,tmp/tpch-runner anchor pass 2026-07-27

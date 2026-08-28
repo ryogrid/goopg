@@ -161,6 +161,22 @@ the test suite is happy.
    allocation wins do not imply TPS wins (M0092: bottleneck was WAL fsync, not CPU).
 5. **After codec/format changes**: re-run the full regress-port suite; 6 silent
    regressions escaped this way once (M0106).
+6. **Parser/grammar changes**: read
+   `docs/design/not_ralph/06-goyacc-parser-playbook.md` — especially §12 —
+   before editing `grammar/*.y` or `internal/parser/`, and before changing
+   parser behaviour to fix a regress case or to match PostgreSQL. Skip the
+   re-read if you already read it this session; do not skip it because the
+   change looks small. That grammar is a PORT of `gram.y`, not a copy: it has
+   synthetic terminals with no upstream counterpart (`TYPEDLIT`, `CHECKBODY`,
+   the `*_LA` family), its own position primitive (`$<p>N` — `lastConsumedPos()`
+   silently returns the wrong token in specific reduce states), four
+   interacting position conventions that feed the wire `ErrorResponse.Position`
+   and are NOT covered by the golden corpus, and ~1.7% of statement classes
+   deliberately left on hand-written token scanners where a grammar rule would
+   make goopg STRICTER than it ships. §12 lists every intentional divergence
+   with its upstream citation. Build with `make gen-parser` (never `go build`
+   alone — it compiles a stale generated parser), and treat the
+   `parity_goldens.txt` diff as the review artifact for the change.
 
 ## ⚠️ Memory Guard (OOM protection — a heavy process may be SIGKILLed)
 A resident watchdog (`~/.ralph/mem_guard.py`, one instance per `ralph_loop.sh`

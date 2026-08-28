@@ -5033,7 +5033,7 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				}
 			}
 		default:
-			return p.resolveColumnNotNull(col, nnOccurrences)
+			return resolveColumnNotNull(col, nnOccurrences)
 		}
 	}
 }
@@ -5060,7 +5060,7 @@ type colNotNullOccurrence struct {
 // INHERIT raises the *plural* "conflicting NO INHERIT declarations for
 // not-null constraints on column %q" (E2, 42601); an unnamed first
 // constraint adopts a later explicit name. M0134-0005k.
-func (p *parser) resolveColumnNotNull(col *ColumnDef, occurrences []colNotNullOccurrence) error {
+func resolveColumnNotNull(col *ColumnDef, occurrences []colNotNullOccurrence) error {
 	if len(occurrences) == 0 {
 		return nil
 	}
@@ -11281,41 +11281,3 @@ func (p *parser) parseDropDomain(pos int) (Stmt, error) {
 	return &DropDomainStmt{pos: pos, Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
-// parseTruncate: TRUNCATE [TABLE] [ONLY] name [, [ONLY] …]
-// [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE|RESTRICT]. M0097-0069.
-func (p *parser) parseTruncate() (Stmt, error) {
-	t, err := p.expectKeyword(KwTruncate)
-	if err != nil {
-		return nil, err
-	}
-	_ = p.acceptKeyword(KwTable) // optional
-	// Parse table list with optional ONLY prefix per entry.
-	var names []ObjectName
-	var onlyFlags []bool
-	for {
-		only := p.acceptIdentKeyword("only") // ONLY is optional before each name
-		name, err := p.parseObjectName()
-		if err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-		onlyFlags = append(onlyFlags, only)
-		if !p.acceptSymbol(",") {
-			break
-		}
-	}
-	stmt := &TruncateStmt{pos: t.Pos, Names: names, Only: onlyFlags}
-	// Optional RESTART IDENTITY | CONTINUE IDENTITY clause.
-	if p.acceptIdentKeyword("restart") && p.acceptIdentKeyword("identity") {
-		stmt.RestartIdentity = true
-	} else {
-		_ = p.acceptIdentKeyword("continue") && p.acceptIdentKeyword("identity")
-	}
-	switch {
-	case p.acceptKeyword(KwCascade):
-		stmt.Behavior = DropCascade
-	case p.acceptKeyword(KwRestrict):
-		stmt.Behavior = DropDefault
-	}
-	return stmt, nil
-}

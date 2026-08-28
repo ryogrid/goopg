@@ -102,7 +102,11 @@ func TestIsColNameKeyword(t *testing.T) {
 // spec (0051-0001) plus a sample of goopg's own unreserved keywords.
 func TestColNameKeywordsAsColumnNamesDoD(t *testing.T) {
 	// Words that are plain TokenIdent (not keywords) — always parseable.
-	alwaysOK := []string{"name", "value", "type", "user", "data", "time",
+	// "user" is NOT one of them: postgres/src/include/parser/kwlist.h:480
+	// makes it a RESERVED_KEYWORD, so `CREATE TABLE t (user text)` is a
+	// syntax error upstream. goopg's hand-written lexer never classified it,
+	// which is why this list once contained it.
+	alwaysOK := []string{"name", "value", "type", "data", "time",
 		"month", "year", "hour", "minute", "second", "day", "zone", "version"}
 	for _, col := range alwaysOK {
 		sql := "CREATE TABLE t (" + col + " text)"
@@ -137,8 +141,10 @@ func TestColNameKeywordsAsColumnNamesDoD(t *testing.T) {
 		{"values", KwValues},
 		{"exists", KwExists},
 		{"between", KwBetween},
-		{"verbose", KwVerbose},
 	}
+	// NOT here: "verbose" is a TYPE_FUNC_NAME_KEYWORD upstream
+	// (kwlist.h:491), and ColId covers only unreserved + col_name keywords,
+	// so `CREATE TABLE t (verbose text)` is a syntax error in PG too.
 	for _, tc := range keywordCols {
 		sql := "CREATE TABLE t (" + tc.col + " text)"
 		_, err := Parse(sql)
