@@ -11,8 +11,9 @@ import (
 //
 // Each VM page is BlockSize bytes with a standard PageHeaderData. The
 // visibility bits live in the page body starting at SizeOfPageHeaderData.
-// PG uses 2 bits per heap page (ALL_VISIBLE + ALL_FROZEN); goopg only
-// tracks ALL_VISIBLE, so ALL_FROZEN is always 0.
+// PG uses 2 bits per heap page (ALL_VISIBLE + ALL_FROZEN); goopg tracks both
+// since the vacuum probe-audit (ALL_FROZEN set by VACUUM freeze passes,
+// cleared by DML alongside ALL_VISIBLE).
 //
 // Bits per byte: 4 pages per byte (2 bits each). Within a byte, the
 // least-significant bits correspond to the earliest heap pages.
@@ -35,70 +36,68 @@ const (
 	vmMaxHeapPagesPerPage = vmDataSize * VMPagesPerByte
 )
 
-// buildVMPage builds a single VM page from visibility bits. visible[i] is true
-// when heap page i is ALL_VISIBLE. Returns a BlockSize-byte slice with a valid
+// buildVMPage builds a single VM page from per-heap-page bit masks
+// (VMAllVisible | VMAllFrozen). Returns a BlockSize-byte slice with a valid
 // page header.
-func buildVMPage(visible []bool) []byte {
+func buildVMPage(masks []uint8) []byte {
 	p := make([]byte, BlockSize)
 	_ = InitPage(p)
 
-	// Write visibility bits into the data area.
-	// For each heap page: bit 0 = ALL_VISIBLE, bit 1 = ALL_FROZEN (always 0).
-	for i, vis := range visible {
-		if !vis {
+	for i, mask := range masks {
+		if mask == 0 {
 			continue
 		}
 		byteIdx := i / VMPagesPerByte
 		bitShift := (i % VMPagesPerByte) * VMBitsPerHeapPage
 		if vmDataOffset+byteIdx < BlockSize {
-			p[vmDataOffset+byteIdx] |= VMAllVisible << bitShift
+			p[vmDataOffset+byteIdx] |= mask << bitShift
 		}
 	}
 
 	return p
 }
 
-// parseVMPage reads visibility bits from a VM page. Returns a slice indexed
-// by heap page number (relative to baseBlk) where true = ALL_VISIBLE.
-func parseVMPage(p []byte) []bool {
+// parseVMPage reads visibility bits from a VM page. Returns per-heap-page
+// bit masks (VMAllVisible | VMAllFrozen) indexed by heap page number.
+func parseVMPage(p []byte) []uint8 {
 	if len(p) != BlockSize {
 		return nil
 	}
-	visible := make([]bool, vmMaxHeapPagesPerPage)
+	masks := make([]uint8, vmMaxHeapPagesPerPage)
 	for i := 0; i < vmMaxHeapPagesPerPage; i++ {
 		byteIdx := i / VMPagesPerByte
 		bitShift := (i % VMPagesPerByte) * VMBitsPerHeapPage
 		if vmDataOffset+byteIdx < BlockSize {
 			b := p[vmDataOffset+byteIdx]
-			visible[i] = (b & (VMAllVisible << bitShift)) != 0
+			masks[i] = (b >> bitShift) & (VMAllVisible | VMAllFrozen)
 		}
 	}
-	return visible
+	return masks
 }
 
 // WriteVMFork writes a PG-compatible VM fork file for one relation.
-// allVisible is a slice indexed by heap block number; true means the page
-// has its ALL_VISIBLE bit set.
+// masks is indexed by heap block number holding VMAllVisible/VMAllFrozen
+// bits.
 //
 // The file is written atomically (temp + rename) to path.
-func WriteVMFork(path string, allVisible []bool) error {
+func WriteVMFork(path string, masks []uint8) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("vm fork: mkdir: %w", err)
 	}
 
 	// Build VM pages.
-	numPages := (len(allVisible) + vmMaxHeapPagesPerPage - 1) / vmMaxHeapPagesPerPage
-	if numPages == 0 && len(allVisible) > 0 {
+	numPages := (len(masks) + vmMaxHeapPagesPerPage - 1) / vmMaxHeapPagesPerPage
+	if numPages == 0 && len(masks) > 0 {
 		numPages = 1
 	}
 
 	pages := make([][]byte, 0, numPages)
-	for i := 0; i < len(allVisible); i += vmMaxHeapPagesPerPage {
+	for i := 0; i < len(masks); i += vmMaxHeapPagesPerPage {
 		end := i + vmMaxHeapPagesPerPage
-		if end > len(allVisible) {
-			end = len(allVisible)
+		if end > len(masks) {
+			end = len(masks)
 		}
-		pages = append(pages, buildVMPage(allVisible[i:end]))
+		pages = append(pages, buildVMPage(masks[i:end]))
 	}
 
 	if len(pages) == 0 {
@@ -141,9 +140,9 @@ func WriteVMFork(path string, allVisible []bool) error {
 	return nil
 }
 
-// ReadVMFork reads a PG-compatible VM fork file and returns the visibility
-// bits indexed by heap block number. Returns nil if the file does not exist.
-func ReadVMFork(path string) ([]bool, error) {
+// ReadVMFork reads a PG-compatible VM fork file and returns per-block bit
+// masks indexed by heap block number. Returns nil if the file does not exist.
+func ReadVMFork(path string) ([]uint8, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -159,13 +158,13 @@ func ReadVMFork(path string) ([]bool, error) {
 	}
 
 	numPages := len(data) / BlockSize
-	var allVisible []bool
+	var masks []uint8
 	for i := 0; i < numPages; i++ {
 		pageOff := i * BlockSize
 		page := parseVMPage(data[pageOff : pageOff+BlockSize])
-		allVisible = append(allVisible, page...)
+		masks = append(masks, page...)
 	}
-	return allVisible, nil
+	return masks, nil
 }
 
 // DeleteVMFork removes the _vm fork file for a relation.
@@ -230,7 +229,7 @@ func (v *VisibilityMap) VMLoadForks(dataDir string) error {
 		return nil
 	}
 
-	loaded := make(map[vmKey][]bool)
+	loaded := make(map[vmKey][]uint8)
 
 	// Helper to scan a directory for _vm files.
 	scanDir := func(dir string, dbOid uint32) error {
@@ -251,13 +250,13 @@ func (v *VisibilityMap) VMLoadForks(dataDir string) error {
 				continue
 			}
 			path := filepath.Join(dir, file.Name())
-			allVisible, err := ReadVMFork(path)
+			masks, err := ReadVMFork(path)
 			if err != nil {
 				return fmt.Errorf("vm: load %q: %w", path, err)
 			}
-			if allVisible != nil {
+			if masks != nil {
 				key := vmKey{DBOid: dbOid, RelOid: relOid}
-				loaded[key] = allVisible
+				loaded[key] = masks
 			}
 		}
 		return nil

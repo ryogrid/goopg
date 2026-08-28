@@ -11,6 +11,7 @@ import (
 
 	"github.com/goopg/goopg/internal/storage/lmgr/lockwait"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 const (
@@ -870,6 +871,20 @@ func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) err
 
 	m.waitMu.Lock()
 	defer m.waitMu.Unlock()
+
+	// While parked on commitCond this backend is blocked on another
+	// transaction's outcome; upstream surfaces the same wait as
+	// Lock:transactionid from ProcSleep/XactLockTableWait (proc.c). Identity
+	// is resolved per call from goroutine-local state — the Manager object is
+	// shared by every connection, so no procNum may live on it. Unregistered
+	// goroutines (background workers, tests without a registry) skip the
+	// probe, mirroring track_activities=off.
+	if m.xidActiveWithSubxact(xid) {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeLock, activity.WaitTransactionID)
+			defer reg.WaitEventEnd(procNum)
+		}
+	}
 	for m.xidActiveWithSubxact(xid) {
 		if ctx.Err() != nil {
 			return ctx.Err()

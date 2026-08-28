@@ -557,6 +557,14 @@ func TestCheckpointerWritesCheckpointMarkers(t *testing.T) {
 		close(done)
 	}()
 
+	// First timeout checkpoint runs unconditionally (no anchor yet). Before
+	// the second tick, append WAL so the idle-skip (xlog.c:7005–7019) does
+	// not suppress it — the skip fires only when nothing was written since
+	// the last completed checkpoint.
+	waitSignals(t, flusher.flushSignalChan, 1, 2*time.Second)
+	if _, _, err := w.Append([]byte("idle-skip-test")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
 	waitSignals(t, flusher.flushSignalChan, 2, 2*time.Second)
 	cancel()
 	select {
@@ -572,10 +580,14 @@ func TestCheckpointerWritesCheckpointMarkers(t *testing.T) {
 	if len(recs) == 0 {
 		t.Fatal("expected at least one checkpoint record")
 	}
-	for i, r := range recs {
-		if len(r.Payload) == 0 || r.Payload[0] != RecordKindCheckpoint {
-			t.Fatalf("record %d kind = %v, want checkpoint", i, firstByte(r.Payload))
+	ckCount := 0
+	for _, r := range recs {
+		if len(r.Payload) > 0 && r.Payload[0] == RecordKindCheckpoint {
+			ckCount++
 		}
+	}
+	if ckCount < 2 {
+		t.Fatalf("checkpoint records = %d, want >= 2", ckCount)
 	}
 	if cp.LastCheckpointLSN() == 0 {
 		t.Fatal("last checkpoint lsn should be non-zero")

@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/storage/lmgr"
-	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/access/transam"
-	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 )
 
 // analyzeOp drives `ANALYZE [target [, …]]` against the
@@ -130,6 +130,7 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			// Non-fatal: stats are in memory; log and continue.
 			_ = werr
 		}
+		relStats.resetAnalyzeTriggers(tbl.OID)
 	}
 	// Inheritance-tree statistics for partitioned parents read every leaf
 	// partition under a blocking AccessShareLock (SKIP_LOCKED does not cover
@@ -138,7 +139,52 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 	for _, parent := range parents {
 		analyzeInheritanceWait(o.ctx, parent)
 	}
+
+	// Partitioned-parent aggregation (parity bundle F5-deferred→done-lite):
+	// roll up each partitioned parent's RowCount/Pages from its children so
+	// the planner's relsize path sees a non-stale total. Column-level stats
+	// for parents remain unset (planner falls back per column), which is
+	// strictly better than the previous no-op.
+	for _, parent := range parents {
+		if parent == nil || parent.PartitionMethod == "" {
+			continue
+		}
+		kids := o.partitionChildren(parent)
+		if len(kids) == 0 {
+			continue
+		}
+		var rows int64
+		pages := 0
+		for _, k := range kids {
+			if k.Stats == nil {
+				continue
+			}
+			rows += k.Stats.RowCount
+			pages += k.Stats.Pages
+		}
+		parent.Stats = &catalog.TableStats{RowCount: rows, Pages: pages, Analyzed: true}
+		o.ctx.Catalog.SetTableStats(parent, parent.Stats)
+		relStats.resetAnalyzeTriggers(parent.OID)
+	}
 	return nil, EOF
+}
+
+// partitionChildren resolves the direct leaf partitions of a partitioned
+// parent through the concrete catalog, peeling wrapper catalogs exactly like
+// expandVacuumTargets does. Returns nil when unsupported.
+func (o *analyzeOp) partitionChildren(parent *catalog.Table) []*catalog.Table {
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	base := o.ctx.Catalog
+	for {
+		if c, ok := base.(*catalog.InMemory); ok {
+			return c.PartitionChildren(parent.OID)
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+		} else {
+			return nil
+		}
+	}
 }
 
 // expandAnalyzeTargets resolves the ANALYZE target list into concrete heap
@@ -498,12 +544,12 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 			// before judging visibility — a stats-sampling scan must not
 			// undercount a live, only-row-locked tuple as invisible. M0118-0003.
 			var curcid storage.CommandId = storage.InvalidCommandId
-		var combo *transam.ComboCIDStore
-		if dsCtx != nil {
-			curcid = dsCtx.CmdID
-			combo = dsCtx.comboStore()
-		}
-		if !transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
+			var combo *transam.ComboCIDStore
+			if dsCtx != nil {
+				curcid = dsCtx.CmdID
+				combo = dsCtx.comboStore()
+			}
+			if !transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
 				continue
 			}
 			// Decode the PG-physical tuple body using the header (natts +
@@ -744,7 +790,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	// pairs here during the first pass so the correlation can be computed
 	// after sorting by value. Non-orderable kinds skip this.
 	type valuePosition struct {
-		d  Datum
+		d   Datum
 		pos int
 	}
 	var corrPairs []valuePosition
@@ -982,4 +1028,17 @@ func sortDatumsAscending(ds []Datum) error {
 		return cmp < 0
 	})
 	return firstErr
+}
+
+// AnalyzeRelationSampled runs the executor-grade sampled analyzer for one
+// relation without an executor Context: upstream-default stats target,
+// wall-clock-seeded reservoir, full column stats (NDistinct/NullFrac/MCV/
+// histogram/correlation). The autovacuum launcher calls this instead of the
+// simplified commands/vacuum.Analyze so autoanalyze produces planner-grade
+// statistics. pg_statistic heap persistence still requires a Context and is
+// therefore skipped here; the catalog TableStats sidecar (which the planner
+// consumes via internal/optimizer/relsize.go) IS updated by the caller.
+func AnalyzeRelationSampled(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
+	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget,
+		rand.New(rand.NewSource(time.Now().UnixNano())), nil, nil)
 }

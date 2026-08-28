@@ -3,15 +3,38 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/storage/lmgr"
-	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/commands/vacuum"
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 )
+
+// defaultAutovacuumFreezeMaxAge mirrors upstream's boot value (200M XIDs);
+// used when the GUC is absent from the session registry.
+const defaultAutovacuumFreezeMaxAge = int64(200_000_000)
+
+// lookupGUCInt reads an integer GUC's session-effective value via the
+// context's setting hook; ok=false when the hook is nil, the name is
+// unknown, or the value does not parse.
+func (o *vacuumOp) lookupGUCInt(name string) (int64, bool) {
+	if o.ctx == nil || o.ctx.GetSetting == nil {
+		return 0, false
+	}
+	raw, ok := o.ctx.GetSetting(name)
+	if !ok {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
 
 // vacuumOp executes a VACUUM statement, running heap page-prune on the
 // target relations and updating the FSM, VM, and relfrozenxid with the
@@ -59,20 +82,97 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		o.waitForDatabaseACLChange()
 	}
 
-	// Compute freeze horizon (M0046-0005): tuples with xmin < freezeBelow
-	// will have their xmin rewritten to FrozenTransactionID.
+	// Freeze cutoffs (M0046-0005 + parity bundle 03-design F2/F3):
+	// FreezeLimit = nextXID − min(freeze_min_age, autovacuum_freeze_max_age/2),
+	// clamped ≤ OldestXmin ALWAYS (an unclamped age-0 FREEZE limit would be
+	// nextXID itself and would freeze in-flight xmins — upstream clamps at
+	// vacuum.c:1213–1215). VACUUM (FREEZE) zeroes the effective min_age.
+	nextXID := o.ctx.TxnMgr.NextXID()
+	freezeMaxAge := int64(defaultAutovacuumFreezeMaxAge)
+	if v, ok := o.lookupGUCInt("autovacuum_freeze_max_age"); ok && v > 0 {
+		freezeMaxAge = v
+	}
+	freezeMinAge := o.ctx.FreezeMinAge // session vacuum_freeze_min_age (0 = off)
+	freezeForced := vs.Freeze
+	if freezeForced {
+		freezeMinAge = 1 // any positive value + Aggressive ⇒ everything eligible freezes
+	}
 	var freezeBelow storage.TransactionID
-	if o.ctx.FreezeMinAge > 0 {
-		currentXID := o.ctx.TxnMgr.NextXID()
-		if int64(currentXID) > o.ctx.FreezeMinAge {
-			freezeBelow = currentXID - storage.TransactionID(o.ctx.FreezeMinAge)
+	if freezeMinAge > 0 {
+		eff := freezeMinAge
+		if freezeMaxAge > 0 && freezeMaxAge/2 < eff {
+			eff = freezeMaxAge / 2
+		}
+		fb := nextXID - storage.TransactionID(eff)
+		if oldest := o.ctx.TxnMgr.OldestXmin(); fb > oldest {
+			fb = oldest
+		}
+		if fb > 0 {
+			freezeBelow = fb
 		}
 	}
+
+	// Aggressive determination is PER TABLE (depends on each relation's
+	// relfrozenxid age) and happens inside the target loop via the closure
+	// below. Base semantics (vacuum.c:1244–1273): full scan, no VM skips;
+	// relfrozenxid age treats InvalidTransactionID/0 as INFINITE — upstream
+	// creates heaps with relfrozenxid = InvalidTransactionId (heap.c:325) and
+	// the unsigned compare makes a never-vacuumed table's first VACUUM
+	// aggressive.
+	freezeTableAge := freezeMaxAge * 95 / 100 // vacuum.c:1246 cap
+	if v, ok := o.lookupGUCInt("vacuum_freeze_table_age"); ok && v > 0 {
+		fta := int64(v)
+		if fta > freezeTableAge {
+			fta = freezeTableAge
+		}
+		freezeTableAge = fta
+	}
+	aggressiveFor := func(tbl *catalog.Table) bool {
+		if freezeForced || vs.Full || vs.DisablePageSkipping || freezeTableAge <= 0 {
+			return true
+		}
+		var tableAge int64
+		switch {
+		case tbl.RelFrozenXID == storage.InvalidTransactionID || tbl.RelFrozenXID == 0:
+			tableAge = int64(nextXID) // maximal
+		default:
+			if nextXID > tbl.RelFrozenXID {
+				tableAge = int64(nextXID - tbl.RelFrozenXID)
+			}
+		}
+		return tableAge >= freezeTableAge
+	}
+	// vacuum_truncate is a BOOL GUC ("on"/"off"); default on like upstream.
+	truncate := true
+	if o.ctx != nil && o.ctx.GetSetting != nil {
+		if raw, ok := o.ctx.GetSetting("vacuum_truncate"); ok {
+			switch strings.ToLower(strings.TrimSpace(raw)) {
+			case "off", "false", "0", "no":
+				truncate = false
+			}
+		}
+	}
+	if vs.NoTruncate {
+		truncate = false
+	}
+	failsafeAge, _ := o.lookupGUCInt("vacuum_failsafe_age")
 
 	opts := vacuum.VacuumOptions{
 		FSM:         o.ctx.FSM,
 		VM:          o.ctx.VM,
 		FreezeBelow: freezeBelow,
+		Truncate:    truncate,
+		FailsafeAge: failsafeAge,
+	}
+	if d, ok := o.lookupGUCInt("vacuum_cost_delay"); ok && d > 0 {
+		opts.CostDelayMS = d
+		opts.CostLimit = 200
+		opts.CostPageHit, _ = o.lookupGUCInt("vacuum_cost_page_hit")
+		opts.CostPageMiss, _ = o.lookupGUCInt("vacuum_cost_page_miss")
+		opts.CostPageDirty, _ = o.lookupGUCInt("vacuum_cost_page_dirty")
+		if l, ok := o.lookupGUCInt("vacuum_cost_limit"); ok && l > 0 {
+			opts.CostLimit = l
+		}
 	}
 
 	// SKIP_LOCKED governs the per-relation lock taken to begin vacuuming.
@@ -150,6 +250,7 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		// observe. Permanent relations keep the global OldestXmin (opts.Horizon
 		// left 0 → vacuumCore derives it). horizons.spec (M0118-0009).
 		relOpts := opts
+		relOpts.Aggressive = aggressiveFor(tbl)
 		if tbl.Temp {
 			relOpts.Horizon = o.ctx.TxnMgr.OldestXminForProc(int32(o.ctx.Tx.Handle) - 1)
 		}
@@ -168,10 +269,19 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 				o.ctx.Catalog.UpdateRelStats(tbl, as.Pages, int64(as.Rows))
 			}
 		}
-		if err == nil && freezeBelow > 0 && stats.NewFrozenXID != 0 {
+		if err == nil {
+			// Successful VACUUM resets n_dead_tup / n_ins_since_vacuum
+			// (pgstat_relation_vacuum_rel). OID 0 (not yet nailed) skips.
+			relStats.resetVacuumTriggers(tbl.OID)
+		}
+		// relfrozenxid skip-guard (vacuumlazy.c skippedallvis): a
+		// non-aggressive pass that SKIPPED all-visible-but-not-all-frozen
+		// pages cannot know their oldest unfrozen xmin and must not advance.
+		guardedSkip := !relOpts.Aggressive && stats.SkippedAllVisible > 0
+		if err == nil && freezeBelow > 0 && !guardedSkip && stats.NewFrozenXID != 0 {
 			// Advance relfrozenxid to the lowest unfrozen xmin found.
 			tbl.RelFrozenXID = stats.NewFrozenXID
-		} else if err == nil && freezeBelow > 0 && stats.NewFrozenXID == 0 && stats.Frozen > 0 {
+		} else if err == nil && freezeBelow > 0 && !guardedSkip && stats.NewFrozenXID == 0 && stats.Frozen > 0 {
 			// All tuples frozen — relfrozenxid advances to freezeBelow.
 			tbl.RelFrozenXID = freezeBelow
 		}

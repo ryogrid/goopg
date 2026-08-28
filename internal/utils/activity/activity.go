@@ -77,6 +77,11 @@ const (
 	WaitObjectLock    = "object"
 	WaitUserLock      = "userlock"
 	WaitSpecToken     = "spectoken"
+	// LWLock-class tranche names (upstream wait_event_names.txt); emitted at
+	// their named choke points only (see not_ralph/pg-stat-activity-probes
+	// 03-design §4 amendment).
+	WaitWALWriteLock = "WALWriteLock"
+	WaitWALInsert    = "WALInsert"
 )
 
 // Client-type events  (PG_WAIT_CLIENT).

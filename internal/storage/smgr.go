@@ -1010,3 +1010,21 @@ func (r *relFile) close() error {
 	r.f = nil
 	return err
 }
+
+// ReleaseForgotten closes cached handles for relations whose backing files
+// have disappeared (dropped/deleted since the last checkpoint) and drops
+// them from the cache — the parity-bundle D-6 analog of upstream's
+// smgrdestroyall (checkpointer.c:488-490). Returns the number released.
+func (m *Manager) ReleaseForgotten() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	released := 0
+	for rel, f := range m.files {
+		if _, err := os.Stat(f.path); os.IsNotExist(err) {
+			_ = f.f.Close()
+			delete(m.files, rel)
+			released++
+		}
+	}
+	return released
+}

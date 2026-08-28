@@ -14,14 +14,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/goopg/goopg/internal/utils/activity"
-	"github.com/goopg/goopg/internal/storage/aio"
-	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/access/transam/control"
-	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/access/transam"
-	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/storage/aio"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // Runtime is the bundle of long-lived handles a running goopg
@@ -441,9 +441,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		PageHeaders: true,
 		SystemID:    systemID,
 		TimelineID:  tli,
-		// M0107-0005: closure-captures walProcNum (int32) for the atomic
-		// hot path; no goroutine map lookup and no mutex.
+		// M0107-0005: closure-captures walProcNum (int32) as the FALLBACK
+		// slot for unregistered callers. Probe-audit fix 2026-08-26: the
+		// primary attribution is the CALLING goroutine's own slot — the
+		// commit path parks/drains inside this hook on committer
+		// goroutines, and upstream reports WALWrite on the waiting backend.
 		OnWALWrite: func() {
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitWALWrite)
+				return
+			}
 			if act != nil {
 				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALWrite)
 			}
@@ -785,54 +792,59 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	mgr.OnBlockWritten = func(rel storage.RelFileNode, blk storage.BlockNumber) {
 		pool.InvalidateBlock(storage.BufferTag{Rel: rel, Block: blk})
 	}
-	// M0092-0005: BufferPin wait-event hook. Wired unconditionally (not
-	// gated on the boot-time TrackIOTiming value) so a runtime `SET
-	// track_io_timing` takes effect without a server restart; the hook
-	// body's LookupTrackedGoroutine call is itself gated on act's
-	// fast-path flag, keeping the default-off cost to a single atomic
-	// load rather than the goroutine-map lookup (M0122-0003 follow-up).
-	// M0107-0005: use LookupCurrentGoroutine (procNum) instead of
-	// LookupGoroutine (Registry+pid) so WaitEventStart is atomic.
+	// M0092-0005 / M0107-0005 / probe-audit 2026-08-26: BufferPin wait-event
+	// hook. Wired unconditionally so a runtime `SET track_io_timing` takes
+	// effect without a server restart. Wait-event WINDOWS are emitted for
+	// every registered backend (upstream reports waits regardless of
+	// track_io_timing); only the *_time accumulations stay gated via
+	// LookupTrackedGoroutine's fast-path flag, keeping the default-off
+	// timing cost to a single atomic load.
 	pool.OnPinWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeBufferPin, activity.WaitBufferPin)
 		}
 	}
 	pool.OnPinDone = func() {
-		// M0122-0003: WaitEventEnd's returned duration is real wall-clock
-		// time only when track_io_timing gated this pair on (the
-		// LookupTrackedGoroutine ok-branch), so accumulating it here
-		// unconditionally within this branch matches upstream's "zero
-		// unless track_io_timing is enabled" pg_stat_io.read_time semantics.
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		// The WAIT-EVENT window is emitted for every registered backend
+		// regardless of track_io_timing (upstream reports IO waits
+		// unconditionally); only the read_time ACCUMULATION stays gated on
+		// the backend's track_io_timing, matching pg_stat_io's "zero
+		// unless enabled" semantics (M0122-0003).
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			d := reg.WaitEventEnd(procNum)
-			pool.AddReadTimeNanos(int64(d))
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
+				pool.AddReadTimeNanos(int64(d))
+			}
 		}
 	}
 	// write_time's OnPinWait/OnPinDone analogue: brackets evictVictim's
 	// dirty-victim flushSlot call (M0122-0003 pg_stat_io follow-up).
 	pool.OnFlushWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
 	pool.OnFlushDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			d := reg.WaitEventEnd(procNum)
-			pool.AddWriteTimeNanos(int64(d))
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
+				pool.AddWriteTimeNanos(int64(d))
+			}
 		}
 	}
 	// extend_time's OnFlushWait/OnFlushDone analogue: brackets PinNew's
 	// mgr.Extend call (M0122-0003 pg_stat_io follow-up).
 	pool.OnExtendWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
 		}
 	}
 	pool.OnExtendDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			d := reg.WaitEventEnd(procNum)
-			pool.AddExtendTimeNanos(int64(d))
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
+				pool.AddExtendTimeNanos(int64(d))
+			}
 		}
 	}
 	// writeback's OnFlushWait/OnFlushDone analogues, one per context
@@ -849,14 +861,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// writeback wait visible in pg_stat_activity (writeback simplification
 	// 3, resolved: see deferral ledger).
 	pool.OnBackendWritebackWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
 	pool.OnBackendWritebackDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			d := reg.WaitEventEnd(procNum)
-			pool.AddBackendWritebackTimeNanos(int64(d))
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
+				pool.AddBackendWritebackTimeNanos(int64(d))
+			}
 		}
 	}
 	pool.OnBgwriterWritebackWait = func() {
@@ -1870,6 +1884,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// each checkpoint so PG standbys can always attach. Uses
 		// WithRelCacheInitLock to prevent TOCTOU races with concurrent
 		// backend startup reading the init files.
+		PostReleaseFn: func() int {
+			if mgr == nil {
+				return 0
+			}
+			return mgr.ReleaseForgotten()
+		},
 		PostCheckpointFn: func() error {
 			if abs == "" {
 				return nil
@@ -2255,14 +2275,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 
-	// M0130-S3: restore runtime CREATE EXTENSION entries from the pg_extension
-	// heap so installed extensions are visible after a restart.
-	if err := reloadUserExtensionsFromHeap(mgr, cat, clog); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: pg_extension reload: %w", err)
-	}
+		// M0130-S3: restore runtime CREATE EXTENSION entries from the pg_extension
+		// heap so installed extensions are visible after a restart.
+		if err := reloadUserExtensionsFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: pg_extension reload: %w", err)
+		}
 		return nil, fmt.Errorf("goopg: pg_collation reload: %w", err)
 	}
 	if err := reloadUserConversionsFromHeap(mgr, cat, clog); err != nil {
@@ -2334,67 +2354,66 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity can
-	// report blocking reasons. Wired unconditionally (not gated on the
-	// boot-time TrackIOTiming value) so a runtime `SET track_io_timing`
-	// takes effect without a server restart; each hook body's
-	// LookupTrackedGoroutine call is itself gated on act's fast-path
-	// flag, so the default-off cost stays a single atomic load rather
-	// than the goroutine-map lookup (M0092-0005 original rationale;
-	// M0122-0003 runtime-SET follow-up). M0107-0005: use
-	// LookupCurrentGoroutine (procNum) for atomic WaitEventStart instead
-	// of LookupGoroutine (mutex).
+	// report blocking reasons. Wired unconditionally so a runtime `SET
+	// track_io_timing` takes effect without a server restart. Probe-audit
+	// fix 2026-08-26: wait-event WINDOWS now resolve the calling backend on
+	// every firing (LookupCurrentGoroutine) and are emitted regardless of
+	// track_io_timing — upstream parity; previously they were silently
+	// suppressed whenever track_io_timing was off because the bodies were
+	// gated on LookupTrackedGoroutine's fast-path flag. Only *_time
+	// accumulations remain gated on that flag (single atomic load when off).
 	if opts.TrackIOTiming {
 		act.EnableTrackIOTimingFastPath()
 	}
 	if aioEngine != nil {
 		aioEngine.OnWaitStart = func() {
-			if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitAIO)
 			}
 		}
 		aioEngine.OnWaitEnd = func() {
-			if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 				reg.WaitEventEnd(procNum)
 			}
 		}
 	}
 	mgr.OnReadWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileRead)
 		}
 	}
 	mgr.OnReadDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventEnd(procNum)
 		}
 	}
 	mgr.OnWriteWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
 	mgr.OnWriteDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventEnd(procNum)
 		}
 	}
 	mgr.OnExtendWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
 		}
 	}
 	mgr.OnExtendDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventEnd(procNum)
 		}
 	}
 	mgr.OnSyncWait = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileSync)
 		}
 	}
 	mgr.OnSyncDone = func() {
-		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+		if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 			reg.WaitEventEnd(procNum)
 		}
 	}
@@ -2403,24 +2422,50 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// M0107-0005: capture walProcNum (int32) for atomic WaitEventStart.
 	if walWriter != nil {
 		walWriter.OnWALSync = func() {
+			// Attribute the wait to the CALLING goroutine's own slot:
+			// FlushUpTo runs synchronously on the committing backend's
+			// goroutine (backend-driven flush — there is no dedicated
+			// writer goroutine), and upstream surfaces exactly this wait as
+			// IO:WALSync on the COMMITTER via XLogFlush. Per-goroutine
+			// resolution makes every parked committer light up its own
+			// pg_stat_activity row instead of collapsing into one shared
+			// background entry. Fall back to the fixed walwriter slot for
+			// unregistered callers (the background-walwriter loop, tests).
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitWALSync)
+				return
+			}
 			if act != nil {
 				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALSync)
 			}
 		}
-		walWriter.OnWALSyncDone = func() {
-			if act == nil {
+		walWriter.OnWALWriteDone = func() {
+			// Balances OnWALWrite (drain/park phases). No fsync_time
+			// accumulation here — that clock is the fdatasync barrier only
+			// and stays on OnWALSyncDone.
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 				return
 			}
-			d := act.WaitEventEnd(walProcNum)
-			// fsync_time (pg_stat_io): FlushUpTo runs synchronously on the
-			// calling backend's own goroutine (SetCurrentGoroutine was
-			// called for it at connection setup — server.go), so
-			// LookupTrackedGoroutine correctly reports *that backend's*
-			// own track_io_timing setting, unlike walProcNum above (a
-			// fixed background slot shared by every committing backend,
-			// only suitable for the wait_event display, not per-session
-			// gating). Mirrors storage.Pool's OnPinDone gating exactly.
-			if _, _, ok := act.LookupTrackedGoroutine(); ok {
+			if act != nil {
+				act.WaitEventEnd(walProcNum)
+			}
+		}
+		walWriter.OnWALSyncDone = func() {
+			reg, procNum, ok := activity.LookupCurrentGoroutine()
+			if !ok && act != nil {
+				reg, procNum = act, walProcNum
+			}
+			if !ok {
+				return
+			}
+			d := reg.WaitEventEnd(procNum)
+			// fsync_time (pg_stat_io): gate on the calling backend's OWN
+			// track_io_timing setting (SetCurrentGoroutine was called for
+			// it at connection setup — server.go), unlike the old
+			// fixed-slot attribution. Mirrors storage.Pool's OnPinDone
+			// gating exactly.
+			if _, _, tracked := reg.LookupTrackedGoroutine(); tracked {
 				walWriter.AddFsyncTimeNanos(int64(d))
 			}
 		}
@@ -2474,6 +2519,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: vm load: %w", err)
+	}
+
+	// Parity bundle E3: publish relallvisible into pg_class view rows.
+	catalog.RelAllVisibleFunc = func(dbOid, relOid uint32) int32 {
+		return rt.VM.CountAllVisible(storage.RelFileNode{DBOid: dbOid, RelOid: relOid})
 	}
 
 	// M0130-S1: load persistent FSM state from per-relation. Same shape /
@@ -3115,10 +3165,10 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		}
 
 		tbl := &catalog.Table{
-			Schema:         schema,
-			Name:           tr.RelName,
-			Columns:        cols,
-			OID:            tr.OID,
+			Schema:  schema,
+			Name:    tr.RelName,
+			Columns: cols,
+			OID:     tr.OID,
 			// M0125-0043: the sibling of the CREATE-TABLE site in
 			// internal/executor/operators_ddl.go — this used to reload
 			// `SmallDimension` from the literal relation names "region" /

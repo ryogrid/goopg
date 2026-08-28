@@ -1054,6 +1054,158 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 
+	// ——— VACUUM / Autovacuum parity bundle (not_ralph/vacuum-autovacuum-parity,
+	// probe-audit follow-up): register the full upstream autovacuum/vacuum
+	// family so SET/show and postgresql.conf.sample match vanilla PG 18.3.
+	// Consumed today: autovacuum (launcher gate), autovacuum_naptime,
+	// the threshold/scale-factor pairs, autovacuum_vacuum_max_threshold,
+	// autovacuum_freeze_max_age / vacuum_freeze_(min|table)_age and the
+	// vacuum_cost_* family. The rest are registered for operator parity and
+	// currently inert (documented in the bundle).
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_cost_limit", Type: TypeInt, BootVal: "200",
+		MinVal: 1, MaxVal: 10000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_cost_page_hit", Type: TypeInt, BootVal: "1",
+		MinVal: 0, MaxVal: 10000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_cost_page_miss", Type: TypeInt, BootVal: "2",
+		MinVal: 0, MaxVal: 10000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_cost_page_dirty", Type: TypeInt, BootVal: "20",
+		MinVal: 0, MaxVal: 10000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_freeze_table_age", Type: TypeInt, BootVal: "150000000",
+		MinVal: 0, MaxVal: 2000000000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_failsafe_age", Type: TypeInt, BootVal: "1600000000",
+		MinVal: 0, MaxVal: 2100000000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_multixact_freeze_table_age", Type: TypeInt, BootVal: "150000000",
+		MinVal: 0, MaxVal: 2000000000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_multixact_freeze_max_age", Type: TypeInt, BootVal: "400000000",
+		MinVal: 1000000, MaxVal: 5000000000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_multixact_failsafe_age", Type: TypeInt, BootVal: "1500000000",
+		MinVal: 0, MaxVal: 2100000000,
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum", Type: TypeBool, BootVal: "on",
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_naptime", Type: TypeInt, BootVal: "60",
+		MinVal: 1, MaxVal: 2147483,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_vacuum_threshold", Type: TypeInt, BootVal: "50",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_vacuum_scale_factor", Type: TypeReal, BootVal: "0.2",
+		MinVal: 0, MaxVal: 100,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_vacuum_insert_threshold", Type: TypeInt, BootVal: "1000",
+		MinVal: -1, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_vacuum_insert_scale_factor", Type: TypeReal, BootVal: "0.2",
+		MinVal: 0, MaxVal: 100,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_analyze_threshold", Type: TypeInt, BootVal: "50",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_analyze_scale_factor", Type: TypeReal, BootVal: "0.1",
+		MinVal: 0, MaxVal: 100,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_vacuum_max_threshold", Type: TypeInt, BootVal: "200000000",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_multixact_freeze_max_age", Type: TypeInt, BootVal: "4000000000",
+		MinVal: 1000000, MaxVal: 5000000000,
+		Context: ContextPostmaster,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_max_workers", Type: TypeInt, BootVal: "3",
+		MinVal: 1, MaxVal: 262143,
+		Context: ContextPostmaster,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_work_mem", Type: TypeInt, Unit: UnitKB, BootVal: "-1",
+		MinVal: -1, MaxVal: 2147483647,
+		Context: ContextPostmaster,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_vacuum_cost_delay", Type: TypeReal, Unit: UnitMs, BootVal: "2",
+		MinVal: -1, MaxVal: 100,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_vacuum_cost_limit", Type: TypeInt, BootVal: "-1",
+		MinVal: -1, MaxVal: 10000,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_autovacuum_min_duration", Type: TypeInt, Unit: UnitMs, BootVal: "600000",
+		MinVal: -1, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeSession,
+	}))
+
 	// Planner toggle GUCs. Upstream uses them for testing (`SET
 	// enable_seqscan = off` to force an index plan). v0's planner
 	// ignores them — the rule-based decisions still apply — but

@@ -1862,6 +1862,8 @@ var pgProcNamesByOID = map[uint32]string{
 	2859: "pg_stat_get_buf_alloc",
 	2878: "pg_stat_get_live_tuples",
 	2879: "pg_stat_get_dead_tuples",
+	8101: "pg_stat_get_ins_since_vacuum",
+	8102: "pg_stat_get_mod_since_analyze",
 	2880: "pg_advisory_lock",
 	2881: "pg_advisory_lock_shared",
 	2882: "pg_try_advisory_lock",

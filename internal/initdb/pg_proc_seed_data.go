@@ -1859,6 +1859,8 @@ func pgProcAllEntries() []pgProcEntry {
 		{OID: 2859, Name: "pg_stat_get_buf_alloc", RetType: 20, ArgTypes: []uint32{}, Volatile: 's', Parallel: 'r', HandlerName: "pg_stat_get_buf_alloc"},
 		{OID: 2878, Name: "pg_stat_get_live_tuples", RetType: 20, ArgTypes: []uint32{26}, Volatile: 's', Parallel: 'r', HandlerName: "pg_stat_get_live_tuples"},
 		{OID: 2879, Name: "pg_stat_get_dead_tuples", RetType: 20, ArgTypes: []uint32{26}, Volatile: 's', Parallel: 'r', HandlerName: "pg_stat_get_dead_tuples"},
+		{OID: 8101, Name: "pg_stat_get_ins_since_vacuum", RetType: 20, ArgTypes: []uint32{26}, Volatile: 's', Parallel: 'r', HandlerName: "pg_stat_get_ins_since_vacuum"},
+		{OID: 8102, Name: "pg_stat_get_mod_since_analyze", RetType: 20, ArgTypes: []uint32{26}, Volatile: 's', Parallel: 'r', HandlerName: "pg_stat_get_mod_since_analyze"},
 		{OID: 2880, Name: "pg_advisory_lock", RetType: 2278, ArgTypes: []uint32{20}, Parallel: 'r', HandlerName: "pg_advisory_lock_int8"},
 		{OID: 2881, Name: "pg_advisory_lock_shared", RetType: 2278, ArgTypes: []uint32{20}, Parallel: 'r', HandlerName: "pg_advisory_lock_shared_int8"},
 		{OID: 2882, Name: "pg_try_advisory_lock", RetType: 16, ArgTypes: []uint32{20}, Parallel: 'r', HandlerName: "pg_try_advisory_lock_int8"},

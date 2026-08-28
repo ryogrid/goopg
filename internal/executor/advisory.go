@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // advisoryKey is the unified key for advisory locks.
@@ -221,15 +222,30 @@ func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uin
 	m.waiters[key] = append(m.waiters[key], w)
 	m.mu.Unlock()
 
+	// Parked on the ready channel = blocked on an advisory hold; upstream
+	// reports Lock:advisory (ProcSleep). Probe only this park — the retry
+	// recursion opens its own window. Identity comes from goroutine-local
+	// state; unregistered goroutines skip probing.
+	reg, procNum, hasActivity := activity.LookupCurrentGoroutine()
+	if hasActivity {
+		reg.WaitEventStart(procNum, activity.WaitTypeLock, activity.WaitAdvisoryLock)
+	}
+
 	select {
 	case <-w.ready:
 		// Lock was released; retry acquiring (there may be multiple waiters).
+		if hasActivity {
+			reg.WaitEventEnd(procNum)
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return m.acquire(ctx, key, sess, xactScoped, shared, twoArg)
 
 	case <-ctx.Done():
+		if hasActivity {
+			reg.WaitEventEnd(procNum)
+		}
 		// Cancelled before we got the lock — remove our waiter entry.
 		m.mu.Lock()
 		list := m.waiters[key]

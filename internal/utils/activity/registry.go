@@ -736,6 +736,10 @@ var waitEventStringCode = map[string]uint32{
 	WaitObjectLock:    27,
 	WaitUserLock:      28,
 	WaitSpecToken:     29,
+	// LWLock tranches surfaced at their named choke points (probe-audit
+	// follow-up: WAL commit path).
+	WaitWALWriteLock: 33,
+	WaitWALInsert:    34,
 	// Client events
 	WaitClientRead:  30,
 	WaitClientWrite: 31,

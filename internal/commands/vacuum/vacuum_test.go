@@ -304,3 +304,119 @@ func TestVacuumWithOptionsDefaultReclaims(t *testing.T) {
 		t.Fatalf("stats.Dead=%d want=1", stats.Dead)
 	}
 }
+
+// TestVacuumVMSkipAndAllFrozenBits pins the parity-bundle scan semantics
+// (docs/design/not_ralph/vacuum-autovacuum-parity 03-design F1): a
+// non-aggressive pass skips ALL_VISIBLE pages (counting them separately when
+// they are also ALL_FROZEN), never skips the final block, and an aggressive
+// pass scans everything.
+func TestVacuumVMSkipAndAllFrozenBits(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+
+	vm := storage.NewVisibilityMap()
+
+	mvccMgr := transam.NewManager()
+	tx1, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
+	mvccMgr.Commit(tx1)
+	tx2, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+	xid2, _ := mvccMgr.AssignXID(tx2)
+	tx2.XID = xid2
+	mvccMgr.Commit(tx2)
+
+	const nBlocks = 4
+	if _, err := pool.ExtendRelationBatch(rel, nBlocks); err != nil {
+		t.Fatalf("ExtendRelationBatch: %v", err)
+	}
+	for b := storage.BlockNumber(0); b < nBlocks; b++ {
+		live := storage.NewHeapTuple(xid1, storage.InvalidTransactionID, []byte("v"))
+		addTuple(t, pool, rel, b, live)
+		vm.SetAllVisible(rel, b) // pretend a prior pass marked these
+	}
+
+	// Non-aggressive: blocks 0..2 are skippable; the FINAL block is always
+	// scanned (vacuumlazy.c:1726–1729).
+	st, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{VM: vm})
+	if err != nil {
+		t.Fatalf("vacuum: %v", err)
+	}
+	if st.SkippedAllVisible != nBlocks-1 || st.Pages != 1 {
+		t.Fatalf("skip stats = %+v, want SkippedAllVisible=%d Pages=1", st, nBlocks-1)
+	}
+
+	// Aggressive: full scan regardless of VM bits.
+	st, err = VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{VM: vm, Aggressive: true})
+	if err != nil {
+		t.Fatalf("aggressive vacuum: %v", err)
+	}
+	if st.SkippedAllVisible != 0 || st.Pages != nBlocks {
+		t.Fatalf("aggressive skip stats = %+v, want 0 skipped / %d pages", st, nBlocks)
+	}
+
+	// Freeze pass sets ALL_FROZEN (implies visible); subsequent non-
+	// aggressive skips then count as frozen, not merely visible.
+	freezeBelow := xid2 // every live tuple's xmin == xid1 < freezeBelow
+	st, err = VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{
+		VM: vm, FreezeBelow: freezeBelow, Aggressive: true,
+	})
+	if err != nil {
+		t.Fatalf("freeze vacuum: %v", err)
+	}
+	if !vm.AllFrozen(rel, 0) || !vm.AllFrozen(rel, nBlocks-1) {
+		t.Fatalf("expected ALL_FROZEN on all blocks after freeze pass")
+	}
+	st, err = VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{VM: vm})
+	if err != nil {
+		t.Fatalf("post-freeze vacuum: %v", err)
+	}
+	if st.SkippedAllVisible != 0 || st.SkippedAllFrozen != nBlocks-1 || st.Pages != 1 {
+		t.Fatalf("post-freeze stats = %+v, want SkippedAllFrozen=%d Pages=1", st, nBlocks-1)
+	}
+}
+
+// TestVacuumTailTruncation pins parity E2: with Truncate enabled, trailing
+// all-empty blocks are dropped from the relation file (and the WAL hook, when
+// wired, fires before the physical shrink).
+func TestVacuumTailTruncation(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+
+	mvccMgr := transam.NewManager()
+	tx1, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
+	mvccMgr.Commit(tx1)
+
+	const nBlocks = 6
+	if _, err := pool.ExtendRelationBatch(rel, nBlocks); err != nil {
+		t.Fatalf("ExtendRelationBatch: %v", err)
+	}
+	// Populate only blocks 0 and 1; 2..5 stay empty.
+	for b := storage.BlockNumber(0); b < 2; b++ {
+		live := storage.NewHeapTuple(xid1, storage.InvalidTransactionID, []byte("v"))
+		addTuple(t, pool, rel, b, live)
+	}
+
+	var walCalls int
+	pool.SetLogSmgrTruncateTo(func(rel storage.RelFileNode, keep storage.BlockNumber) error {
+		walCalls++
+		return nil
+	})
+
+	if n, _ := pool.NBlocks(rel); int(n) != nBlocks {
+		t.Fatalf("pre-truncate nblocks=%d want %d", n, nBlocks)
+	}
+	st, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{Truncate: true})
+	if err != nil {
+		t.Fatalf("vacuum: %v", err)
+	}
+	n, _ := pool.NBlocks(rel)
+	if n != 2 {
+		t.Fatalf("post-truncate nblocks=%d want 2 (stats=%+v)", n, st)
+	}
+	if walCalls != 1 {
+		t.Fatalf("wal truncate calls=%d want 1", walCalls)
+	}
+}

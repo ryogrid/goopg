@@ -191,6 +191,13 @@ type CheckpointerConfig struct {
 	// M0106-0011 follow-up (b).
 	PostCheckpointFn func() error
 
+	// PostReleaseFn, when non-nil, runs right AFTER the data-file sync
+	// phase of every checkpoint (parity bundle D-6): closes cached smgr
+	// handles for relations whose backing files vanished since the last
+	// checkpoint (upstream smgrdestroyall, checkpointer.c:488-490).
+	// Non-fatal errors are logged like sibling hooks.
+	PostReleaseFn func() int
+
 	// TruncateCLOGFn, when non-nil, is called at the end of each successful
 	// checkpoint AFTER the checkpoint marker is durable, to truncate CLOG
 	// (pg_xact) up to the conservative oldest-safe XID (G1). Wiring truncation
@@ -294,6 +301,11 @@ type Checkpointer struct {
 	// caller opts in by passing SetRetainer).
 	retainer Retainer
 
+	// intervalOverrideNS carries SIGHUP/reload-driven interval changes to
+	// the Run loop (parity bundle D-2): the armed ticker is rebuilt from
+	// this value at every fire, so a live SET/postgresql.conf reload takes
+	// effect on the NEXT timeout checkpoint without restart.
+	intervalOverrideNS     atomic.Int64
 	lastCheckpointLSN      atomic.Uint64
 	lastCheckpointRedoLSN  atomic.Uint64
 	lastCheckpointStartLSN atomic.Uint64
@@ -437,6 +449,7 @@ func (c *Checkpointer) SetInterval(d time.Duration) {
 	if d <= 0 {
 		return
 	}
+	c.intervalOverrideNS.Store(int64(d))
 	c.cfg.Interval = d
 }
 
@@ -481,8 +494,16 @@ func (c *Checkpointer) SetCompletionTarget(t float64) {
 
 // Run starts the periodic checkpoint loop and returns when ctx is canceled.
 func (c *Checkpointer) Run(ctx context.Context) error {
-	ticker := time.NewTicker(c.cfg.Interval)
-	defer ticker.Stop()
+	// Parity D-2: timer (not ticker) so a reloaded checkpoint_timeout is
+	// picked up at the next fire via effectiveInterval().
+	effectiveInterval := func() time.Duration {
+		if ns := c.intervalOverrideNS.Load(); ns > 0 {
+			return time.Duration(ns)
+		}
+		return c.cfg.Interval
+	}
+	timer := time.NewTimer(effectiveInterval())
+	defer timer.Stop()
 
 	// volumeTicker is non-nil only when MaxWALBytes is set AND
 	// the writer can report its written LSN. Polling once a
@@ -519,10 +540,28 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-timer.C:
+			// Idle skip (xlog.c:7005–7019): a timeout checkpoint that would
+			// start at the same WAL position as the last completed one is a
+			// no-op upstream — nothing to flush, redo unchanged. Skip when
+			// nothing has been written since the last anchor. FORCE /
+			// shutdown / volume paths never take this shortcut.
+			if vr != nil {
+				start := c.lastCheckpointStartLSN.Load()
+				if start != 0 && vr.WrittenLSN() <= start {
+					continue
+				}
+			}
 			if err := c.runCheckpoint(ctx, true, false); err != nil {
 				c.cfg.Logger.Warn("checkpoint failed", "err", err)
 			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(effectiveInterval())
 		case <-volumeC:
 			if !c.volumeTriggerFires(vr) {
 				continue
@@ -1010,6 +1049,11 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	// M0106-0011 follow-up (b): call the post-checkpoint hook (when wired)
 	// to regenerate pg_internal.init after crash-recovery WAL replay may
 	// have unlinked it via RecordKindXactCommitInval. Non-fatal.
+	if c.cfg.PostReleaseFn != nil {
+		if n := c.cfg.PostReleaseFn(); n > 0 {
+			c.cfg.Logger.Info("checkpoint: released forgotten relation handles", "count", n)
+		}
+	}
 	if c.cfg.PostCheckpointFn != nil {
 		if err := c.cfg.PostCheckpointFn(); err != nil {
 			c.cfg.Logger.Warn("post-checkpoint init file refresh failed", "err", err)

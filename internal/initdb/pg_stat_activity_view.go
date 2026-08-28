@@ -84,16 +84,28 @@ func registerPgStatActivityView(cat *catalog.InMemory, reg *activity.Registry) e
 				b.XactStart,
 				b.QueryStart,
 				b.StateChange,
-				"", // wait_event_type: NULL in Stage A
-				"", // wait_event: NULL in Stage A
+				b.WaitEventType,
+				b.WaitEvent,
 				b.State,
 				b.BackendXID,
 				b.BackendXMin,
 				b.Query,
-				b.BackendType,
+				upstreamBackendType(b.BackendType),
 			})
 		}
 		return rows
 	}
 	return cat.RegisterVirtualTable(tbl)
+}
+
+// upstreamBackendType maps the registry's internal backend-type codes to the
+// literals vanilla PostgreSQL exposes in pg_stat_activity.backend_type
+// (upstream src/backend/utils/activity/backend_status.c GetBackendType /
+// pgstat_get_backend_desc): e.g. "client backend" with a space, not
+// "client_backend". Unknown codes pass through unchanged.
+func upstreamBackendType(t string) string {
+	if t == "client_backend" {
+		return "client backend"
+	}
+	return t
 }

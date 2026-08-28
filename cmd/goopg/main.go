@@ -34,6 +34,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/postmaster"
+	"github.com/goopg/goopg/internal/postmaster/autovacuum"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -586,6 +587,23 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// set rather than a wrong one — which is the same answer a
 		// truncated-away multixact gives upstream.
 		cfg.MultiXact = multixact.NewStoreAt(multixact.MultiXactId(rt.NextMultiXact))
+
+		// Autovacuum launcher (vacuum parity bundle): started when the
+		// `autovacuum` GUC is on (upstream default), sweeping every
+		// autovacuum_naptime seconds and reading its trigger thresholds from
+		// the same registry so SET/postgresql.conf take effect.
+		if boolGUC(registry, "autovacuum", true) {
+			napSec := intGUC(registry, "autovacuum_naptime", 60)
+			l := autovacuum.NewLauncher(rt.Pool, rt.TxnMgr, rt.Catalog)
+			l.FSM = rt.FSM
+			l.VM = rt.VM
+			l.MultiXact = cfg.MultiXact
+			l.GUCs = registry
+			l.NapInterval = time.Duration(napSec) * time.Second
+			cfg.AutovacuumLauncher = l
+			logger.Info("autovacuum launcher enabled",
+				"event", "autovacuum_launcher_enabled", "naptime_s", napSec)
+		}
 		// M0131-S18.4: publish the allocator's next-to-assign MultiXactId
 		// into every checkpoint (record + pg_control). Before this the
 		// encoder wrote a literal 1, so a cluster that had combined row
@@ -733,7 +751,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// development convenience. A future reload path will reapply
 	// this when the GUC changes — today the registry value is
 	// frozen at startup.
-	if rt != nil && rt.Checkpointer != nil {
+	applyCheckpointGUCs := func() {
+		if rt == nil || rt.Checkpointer == nil {
+			return
+		}
 		registry := cfg.Registry
 		if registry == nil {
 			registry = misc.BuildDefaultRegistry()
@@ -757,44 +778,66 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 		if v, ok := registry.Get("full_page_writes"); ok && rt.Pool != nil {
-			rt.Pool.SetFullPageWrites(v.Display() == "on")
-		}
-
-		// Slot-aware WAL retention. Wired here (rather than inside
-		// initdb.Open) because the GUC values that govern its
-		// behaviour — `max_slot_wal_keep_size` — only finish loading
-		// once the postgresql.conf entries have been applied to the
-		// registry. The retainer's own logger is the per-process
-		// slog so retention events show up next to the rest of the
-		// startup chatter.
-		if rt.WAL != nil {
-			retainer := &xlog.SlotAwareRetainer{
-				Writer: rt.WAL,
-				Slots:  rt.Slots,
-				Logger: logger,
-				// M0122-0009 follow-up: let RemoveOldSegmentsWithEstimate's
-				// XLOGfileslop-style sizing grow past the min_wal_size
-				// floor under sustained write volume (capped at
-				// max_wal_size, wired into rt.WAL's Config above via
-				// WALMaxSize).
-				CheckPointDistanceEstimateFn: rt.Checkpointer.CheckPointDistanceEstimate,
-			}
-			if v, ok := registry.Get("checkpoint_completion_target"); ok {
-				if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
-					retainer.CompletionTarget = f
-				}
-			}
-			if v, ok := registry.Get("max_slot_wal_keep_size"); ok {
-				// Stored in MB (matching upstream guc_tables.c). -1
-				// is the unlimited sentinel.
-				if mb, err := strconv.Atoi(v.Display()); err == nil {
-					if mb > 0 {
-						retainer.MaxSlotKeepBytes = int64(mb) * 1024 * 1024
+			want := v.Display() == "on"
+			if want != rt.Pool.FullPageWrites() {
+				// Parity bundle D-3: emit XLOG_FPW_CHANGE around the flip,
+				// upstream ordering (xlog.c:8233-8267) — ON flips the flag
+				// FIRST then logs; OFF logs FIRST then flips — so a crash
+				// never leaves a logged state that disagrees with the flag
+				// for records assembled after it.
+				payload, err := xlog.EncodeXLogFPWChangePG(want)
+				if err == nil {
+					appendFirst := !want // OFF: record first, then flip
+					if appendFirst {
+						_, _, _ = rt.WAL.Append(payload)
 					}
+					rt.Pool.SetFullPageWrites(want)
+					if !appendFirst {
+						_, _, _ = rt.WAL.Append(payload)
+					}
+				} else {
+					rt.Pool.SetFullPageWrites(want)
 				}
 			}
-			rt.Checkpointer.SetRetainer(retainer)
 		}
+	}
+	applyCheckpointGUCs()
+	cfg.ApplyCheckpointGUCs = applyCheckpointGUCs
+
+	// Slot-aware WAL retention. Wired here (rather than inside
+	// initdb.Open) because the GUC values that govern its
+	// behaviour — `max_slot_wal_keep_size` — only finish loading
+	// once the postgresql.conf entries have been applied to the
+	// registry. The retainer's own logger is the per-process
+	// slog so retention events show up next to the rest of the
+	// startup chatter.
+	if rt != nil && rt.WAL != nil {
+		retainer := &xlog.SlotAwareRetainer{
+			Writer: rt.WAL,
+			Slots:  rt.Slots,
+			Logger: logger,
+			// M0122-0009 follow-up: let RemoveOldSegmentsWithEstimate's
+			// XLOGfileslop-style sizing grow past the min_wal_size
+			// floor under sustained write volume (capped at
+			// max_wal_size, wired into rt.WAL's Config above via
+			// WALMaxSize).
+			CheckPointDistanceEstimateFn: rt.Checkpointer.CheckPointDistanceEstimate,
+		}
+		if v, ok := cfg.Registry.Get("checkpoint_completion_target"); ok {
+			if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
+				retainer.CompletionTarget = f
+			}
+		}
+		if v, ok := cfg.Registry.Get("max_slot_wal_keep_size"); ok {
+			// Stored in MB (matching upstream guc_tables.c). -1
+			// is the unlimited sentinel.
+			if mb, err := strconv.Atoi(v.Display()); err == nil {
+				if mb > 0 {
+					retainer.MaxSlotKeepBytes = int64(mb) * 1024 * 1024
+				}
+			}
+		}
+		rt.Checkpointer.SetRetainer(retainer)
 	}
 
 	// Run the periodic checkpointer alongside the server. SIGTERM /

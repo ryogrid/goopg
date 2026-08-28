@@ -29,6 +29,7 @@ import (
 
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
@@ -17372,6 +17373,8 @@ case "pg_char_to_encoding":
 		"pg_stat_get_tuples_deleted",
 		"pg_stat_get_live_tuples",
 		"pg_stat_get_dead_tuples",
+		"pg_stat_get_ins_since_vacuum",
+		"pg_stat_get_mod_since_analyze",
 		"pg_stat_get_vacuum_count":
 		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
@@ -17402,8 +17405,22 @@ case "pg_char_to_encoding":
 			if v < 0 {
 				v = 0 // PG clamps live-tuple estimate to non-negative
 			}
-		case "pg_stat_get_dead_tuples":
-			v = c.deltaDead
+		case "pg_stat_get_dead_tuples",
+			"pg_stat_get_ins_since_vacuum",
+			"pg_stat_get_mod_since_analyze":
+			// Read from the shared trigger store, NOT the tiered counters:
+			// these three feed autovacuum decisions and must reflect DML
+			// immediately (pending only reaches shared on an explicit
+			// flush), and VACUUM/ANALYZE reset them in place.
+			d, i, m := relStats.triggerSnapshot(oid)
+			switch name {
+			case "pg_stat_get_dead_tuples":
+				v = d
+			case "pg_stat_get_ins_since_vacuum":
+				v = i
+			default:
+				v = m
+			}
 			if v < 0 {
 				v = 0
 			}
@@ -18053,6 +18070,13 @@ func evalPgSleep(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, err
 	}
 	if d < 0 {
 		d = 0
+	}
+	// Deliberate sleep: upstream reports Timeout:PgSleep for the duration
+	// (misc.c pg_sleep → WaitLatch). Covers both the ctx-aware select and
+	// the bare time.Sleep fallback.
+	if ctx.Activity != nil {
+		ctx.Activity.WaitEventStart(ctx.ProcNum, activity.WaitTypeTimeout, activity.WaitPgSleep)
+		defer ctx.Activity.WaitEventEnd(ctx.ProcNum)
 	}
 	if ctx.Ctx != nil {
 		select {
