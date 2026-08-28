@@ -119,34 +119,62 @@ var routedStmts = map[string]bool{
 func routeBatch(src string, toks []Token) ([]Stmt, bool, error) {
 	frags := SplitStatements(toks)
 	if len(frags) == 0 {
-		return nil, false, nil // let legacy decide what an empty batch means
-	}
-	for _, f := range frags {
-		if firstMeaningful(f) == nil {
-			// An EMPTY fragment — the `;;` in `BEGIN; COMMIT;;` — produces no
-			// statement at all, so it is no reason to hand the whole batch
-			// back. It used to veto: fragmentRouted returns false for it, and
-			// one false sends every fragment to the legacy parser. That made
-			// a stray extra semicolon silently select the OLD parser for the
-			// entire batch.
-			continue
-		}
-		if !fragmentRouted(f) {
-			return nil, false, nil
-		}
+		return nil, false, nil // let the legacy body decide what an empty batch means
 	}
 	var all []Stmt
 	for _, f := range frags {
 		if firstMeaningful(f) == nil {
+			// An EMPTY fragment — the `;;` in `BEGIN; COMMIT;;`, or a bare
+			// separator — produces no statement at all.
 			continue
 		}
-		stmts, err := ParseOneSrc(src, f)
+		if fragmentRouted(f) {
+			stmts, err := ParseOneSrc(src, f)
+			if err != nil {
+				return nil, true, err
+			}
+			all = append(all, stmts...)
+			continue
+		}
+		// PER FRAGMENT, not per batch. This used to be all-or-nothing: one
+		// unrouted fragment sent EVERY fragment to the legacy parser. That was
+		// survivable while the legacy parser still handled every class, and
+		// became a hard 42601 the moment P7.2 deleted the routed classes'
+		// legacy arms — `CREATE COLLATION c (…); SET x = on;` failed on the
+		// SET, because the CREATE COLLATION dragged the batch onto a path that
+		// no longer knows what SET is. Each fragment now goes to the parser
+		// that owns it.
+		stmt, err := parseOneLegacyFragment(src, f)
 		if err != nil {
 			return nil, true, err
 		}
-		all = append(all, stmts...)
+		if stmt != nil {
+			all = append(all, stmt)
+		}
 	}
 	return all, true, nil
+}
+
+// parseOneLegacyFragment runs the retained hand-written parser over ONE
+// fragment — the compat token scanners for the classes the grammar
+// deliberately does not own (see the playbook §12.4).
+func parseOneLegacyFragment(src string, frag []Token) (Stmt, error) {
+	var p parser
+	p.tokens = frag
+	p.idx = 0
+	p.src = src
+	stmt, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	// A trailing `;` inside the fragment is the separator SplitStatements kept.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+		p.advance()
+	}
+	if p.cur().Kind != TokenEOF {
+		return nil, p.errSyntaxAtCur()
+	}
+	return stmt, nil
 }
 
 // fragmentRouted inspects the fragment's first meaningful token.

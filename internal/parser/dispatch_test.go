@@ -30,10 +30,17 @@ func TestSplitStatements(t *testing.T) {
 }
 
 
-// TestRouteBatchWholeBatchOrLegacy pins the whole-batch rule: one routed +
-// one unrouted statement must decline the ENTIRE batch (mixed batches stay
-// legacy until per-fragment mixing lands).
-func TestRouteBatchWholeBatchOrLegacy(t *testing.T) {
+// TestRouteBatchMixesPerFragment pins PER-FRAGMENT routing: each statement in
+// a batch goes to the parser that owns it.
+//
+// This used to pin the opposite — one unrouted fragment declined the ENTIRE
+// batch — with the note "until per-fragment mixing lands". It landed, and it
+// had to: while the legacy parser still handled every class, dragging a whole
+// batch onto it was survivable. Once P7.2 deleted the routed classes' legacy
+// arms it became a hard 42601, because the legacy path no longer knows what
+// `SET` is. `CREATE COLLATION c (…); SET x = on;` — real DDL from
+// wal_pg_waldump_test.go — failed on the SET.
+func TestRouteBatchMixesPerFragment(t *testing.T) {
 	// Restore, never delete: SELECT is routed by default now, and deleting
 	// the entry here un-routed it for every test that ran after this one.
 	prev, had := routedStmts["select"]
@@ -60,13 +67,28 @@ func TestRouteBatchWholeBatchOrLegacy(t *testing.T) {
 		t.Fatalf("all-routed batch produced %d statements, want 2", len(stmts))
 	}
 
-	// Mixed batch → declines wholesale. The unrouted half has to be a class
-	// the grammar genuinely does not cover: DISCARD used to serve here and
-	// stopped working as a probe the moment P5.3 routed it.
-	toks, _ = Lex("SELECT 1; CREATE ROLE r;")
-	_, handled, rerr := routeBatch("", toks)
-	if handled || rerr != nil {
-		t.Fatalf("mixed batch: handled=%v err=%v, want false/nil", handled, rerr)
+	// Mixed batch → BOTH halves parse, each on its own path. The unrouted
+	// half has to be a class the grammar genuinely does not cover AND the
+	// retained compat scanners still accept: CREATE COLLATION is one (DISCARD
+	// used to serve here and stopped working as a probe the moment P5.3
+	// routed it; CREATE ROLE is no good either — postmaster intercepts role
+	// DDL above Parse, so the parser rejects it outright).
+	toks, _ = Lex("SELECT 1; CREATE COLLATION c (locale = 'C'); SET x = on;")
+	stmts, handled, rerr := routeBatch("SELECT 1; CREATE COLLATION c (locale = 'C'); SET x = on;", toks)
+	if !handled {
+		t.Fatal("mixed batch declined; per-fragment routing should handle it")
+	}
+	if rerr != nil {
+		t.Fatalf("mixed batch: %v", rerr)
+	}
+	if len(stmts) != 3 {
+		t.Fatalf("mixed batch produced %d statements, want 3", len(stmts))
+	}
+	// The SET is the one that regressed: it is ROUTED, and before per-fragment
+	// mixing the unrouted CREATE COLLATION in front of it sent it to a legacy
+	// path that no longer has a SET arm.
+	if _, ok := stmts[2].(*SetStmt); !ok {
+		t.Fatalf("third statement is %T, want *SetStmt", stmts[2])
 	}
 }
 
