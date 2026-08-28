@@ -3136,8 +3136,8 @@ drop_misc_stmt:
 	   DropCompatStmt.ArgTypes says so, and parseDropAggregate reads one). */
 	| DROP AGGREGATE opt_if_exists_drop qualified_name '(' drop_arg_types ')' opt_drop_behavior
 			{ $$ = dropWithArgs($<p>1, "aggregate", $3, $4, firstArg($6), dropBehavior($8)) }
-	| DROP OPERATOR opt_if_exists_drop any_operator_name '(' drop_arg_types ')' opt_drop_behavior
-			{ $$ = dropWithArgs($<p>1, "operator", $3, $4, $6, dropBehavior($8)) }
+	| DROP OPERATOR opt_if_exists_drop any_operator_name oper_argtypes opt_drop_behavior
+			{ $$ = dropWithArgs($<p>1, "operator", $3, $4, $5, dropBehavior($6)) }
 	| DROP OPERATOR opclass_or_family opt_if_exists_drop qualified_name USING ColId opt_drop_behavior
 			{
 				st := NewDropCompatStmt($<p>1, $3, $4, []ObjectName{objectNameFromQn($5)}, dropBehavior($8))
@@ -3231,6 +3231,27 @@ op_char:
 drop_arg_types:
 		drop_arg_type                        { $$ = []string{$1} }
 	| drop_arg_types ',' drop_arg_type       { $$ = append($1, $3) }
+
+/* DROP OPERATOR's signature is NOT drop_arg_types: gram.y gives it its own
+   oper_argtypes (gram.y:9095) whose ONE-argument alternative is an ereport,
+   not a reduction — `drop operator === (int4)` is "missing argument", not a
+   lookup of a unary operator. Sharing drop_arg_types with DROP AGGREGATE (for
+   which a single type IS legal) swallowed that error and reported
+   `operator "===" does not exist` from the catalog instead. The errposition is
+   the TYPE's offset, matching parser_errposition(@3) upstream. */
+oper_argtypes:
+		'(' drop_arg_type ')'
+			{
+				raiseErr(yylex, &SyntaxError{
+					Pos:     $<p>2,
+					Message: "missing argument",
+					Hint:    "Use NONE to denote the missing argument of a unary operator.",
+					Raw:     true,
+				})
+				$$ = nil
+			}
+	| '(' drop_arg_type ',' drop_arg_types ')'
+			{ $$ = append([]string{$2}, $4...) }
 
 drop_arg_type:
 		fn_type      { $$ = typeNameOf($1) }

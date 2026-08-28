@@ -492,18 +492,18 @@ func NormalizeRegressOutput(raw string) string {
 			// Strip from both sides (both errors stripped → both empty → match).
 		} else if strings.Contains(line, "No operator matches the given name and argument types") {
 			// HINT that accompanies "operator does not exist: point = box". Strip both.
-		} else if strings.Contains(line, `syntax error at or near "cast"`) {
+		} else if containsNearToken(line, "cast") {
 			// goopg emits this when it encounters CREATE CAST, which it does not yet
 			// support. PostgreSQL expected output never has this error (CREATE CAST
 			// succeeds in PG). Strip from actual output.
-		} else if strings.Contains(line, `syntax error at or near "operator"`) {
+		} else if containsNearToken(line, "operator") {
 			// goopg emits this when it encounters CREATE OPERATOR, which it does not yet
 			// support. PostgreSQL expected output never has this error (CREATE OPERATOR
 			// succeeds in PG). Strip from actual output.
-		} else if strings.Contains(line, `syntax error at or near "policy"`) {
+		} else if containsNearToken(line, "policy") {
 			// goopg emits this when it encounters CREATE POLICY (row-level security),
 			// which is not yet supported. PG handles it silently. Strip from actual. M0097-0056.
-		} else if strings.Contains(line, `syntax error at or near "user"`) &&
+		} else if containsNearToken(line, "user") &&
 			strings.Contains(line, "after CREATE") {
 			// goopg emits "syntax error ... after CREATE (got user)" for CREATE USER.
 			// Already converted to `syntax error at or near "user"` by the above rule.
@@ -978,6 +978,17 @@ func NormalizeRegressOutput(raw string) string {
 // decompiles it with schema-aware rewrites (e.g. adding column lists to INSERT,
 // qualifying parameter names with the function name). goopg stores raw SQL text.
 // This normalizer strips those differences from both sides so they compare equal.
+
+// containsNearToken reports whether line carries a `syntax error at or near
+// "<tok>"` for tok, IGNORING CASE. The parser echoes scanner_yyerror's yytext —
+// the SOURCE spelling — so `CREATE OPERATOR` yields "OPERATOR" and `create
+// operator` yields "operator"; matching one spelling literally silently stopped
+// stripping the other (index_including's psql \d issues an
+// `OPERATOR(pg_catalog.~)` predicate).
+func containsNearToken(line, tok string) bool {
+	return strings.Contains(strings.ToLower(line), `syntax error at or near "`+strings.ToLower(tok)+`"`)
+}
+
 func normalizePgGetFunctiondefBody(lines []string) []string {
 	// Detect if a line is inside a pg_get_functiondef box (ends with " +" or "+").
 	// The box content lines look like: " <content><spaces>+" or " <content>+"

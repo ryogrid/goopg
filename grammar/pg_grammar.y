@@ -89,7 +89,7 @@
 %type <ival>	trig_timing
 %type <b>	opt_initially
 %type <expr>	opt_trig_when
-%type <strs>	opt_trig_args trig_arg_list drop_arg_types opt_policy_to policy_role_list
+%type <strs>	opt_trig_args trig_arg_list drop_arg_types oper_argtypes opt_policy_to policy_role_list
 %type <str>	ext_name opt_policy_as opt_policy_for
 %type <nodes>	ext_opts alter_seq_opts
 %type <stmt>	copy_inner

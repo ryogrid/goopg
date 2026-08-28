@@ -1055,7 +1055,7 @@ func (p *parser) errAtCur(msg string) error {
 // say nothing more.
 func (p *parser) errSyntaxAtCur() error {
 	t := p.cur()
-	return &SyntaxError{Pos: t.Pos, Message: nearTextOf(t)}
+	return &SyntaxError{Pos: t.Pos, Message: nearTextOf(p.src, t)}
 }
 
 // nearTextOf returns the text PG's scanner_yyerror echoes after "at or near"
@@ -1064,16 +1064,19 @@ func (p *parser) errSyntaxAtCur() error {
 // bare. This is SyntaxError.Message's contract — Error() adds the wrapper — so
 // both parsers must build it the same way or a caller that reads the field
 // (rather than the formatted string) sees two different shapes.
-func nearTextOf(t Token) string {
+func nearTextOf(src string, t Token) string {
 	switch t.Kind {
 	case TokenEOF:
 		return "end of input"
-	case TokenIdent:
-		// PG lexes some words as keywords (e.g. OIDS) and prints them uppercase
-		// in "syntax error at or near" messages. Mirror that for known soft keywords.
-		switch strings.ToLower(t.Value) {
-		case "oids":
-			return strings.ToUpper(t.Value)
+	case TokenIdent, TokenKeyword:
+		// scanner_yyerror echoes yytext — the SOURCE spelling. The lexer
+		// down-cases identifiers and canonicalises keywords, so echoing
+		// t.Value reported `NOT NUL` as near "nul" where PG says "NUL", and
+		// needed a hand-maintained uppercase list (OIDS) to paper over the
+		// same bug for soft keywords. Slice the original text instead:
+		// case-folding preserves byte length, so the slice is exact.
+		if raw, ok := rawSpelling(src, t); ok {
+			return raw
 		}
 		return t.Value
 	case TokenStringLit:
@@ -1085,6 +1088,21 @@ func nearTextOf(t Token) string {
 		return "\"" + strings.ReplaceAll(t.Value, "\"", "\"\"") + "\""
 	}
 	return t.Value
+}
+
+// rawSpelling returns the token's untouched source text. It is exact only when
+// the slice case-folds back to Value: a token the lexer REWROTE (an escaped
+// identifier, a keyword the scanner spells differently from the source) fails
+// the check and the caller falls back to Value.
+func rawSpelling(src string, t Token) (string, bool) {
+	if src == "" || t.Pos < 0 || t.Pos+len(t.Value) > len(src) {
+		return "", false
+	}
+	raw := src[t.Pos : t.Pos+len(t.Value)]
+	if !strings.EqualFold(raw, t.Value) {
+		return "", false
+	}
+	return raw, true
 }
 
 // expectKeyword consumes the current token if it's the named keyword;

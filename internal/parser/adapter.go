@@ -606,7 +606,7 @@ func (l *lexerState) Error(msg string) {
 	near := l.lastText
 	for _, tk := range l.toks {
 		if tk.Pos == l.lastPos {
-			near = nearTextOf(tk)
+			near = nearTextOf(l.src, tk)
 			break
 		}
 	}

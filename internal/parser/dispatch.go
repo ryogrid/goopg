@@ -26,9 +26,53 @@ import (
 func SplitStatements(toks []Token) [][]Token {
 	var out [][]Token
 	start := 0
+	depth := 0
+	// atomic tracks a CREATE FUNCTION ... BEGIN ATOMIC <stmts> END body, whose
+	// inner ';' separators belong to gram.y's routine_body_stmt_list, not to
+	// stmtmulti. caseDepth keeps a CASE ... END inside that body from being
+	// mistaken for the body's own END.
+	atomic, caseDepth := false, 0
 	for i, t := range toks {
-		if t.Kind == TokenSymbol && t.Value == ";" && i > start {
-			out = append(out, toks[start:i])
+		if isWordTok(t) {
+			switch {
+			case !atomic && eqFold(t.Value, "begin") && i+1 < len(toks) && eqFold(toks[i+1].Value, "atomic"):
+				atomic = true
+			case atomic && eqFold(t.Value, "case"):
+				caseDepth++
+			case atomic && eqFold(t.Value, "end"):
+				if caseDepth > 0 {
+					caseDepth--
+				} else {
+					atomic = false
+				}
+			}
+		}
+		// A ';' inside parentheses is NOT a statement separator: gram.y's
+		// RuleActionMulti consumes it, so `CREATE RULE r AS ON INSERT TO t
+		// DO INSTEAD (DELETE FROM t; DELETE FROM t)` is ONE statement.
+		// Splitting on it handed the legacy parser a fragment truncated at
+		// the inner ';' (copydml regress: 3 rules never created).
+		if t.Kind == TokenSymbol {
+			switch t.Value {
+			case "(":
+				depth++
+			case ")":
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+		if t.Kind == TokenSymbol && t.Value == ";" && depth == 0 && !atomic {
+			// KEEP the terminator in the fragment. Without it the yacc
+			// parser reaches EOF on a truncated statement and reports
+			// "syntax error at end of input"; PG's scanner hands ';' to
+			// the grammar, so the error anchors at or near ";" instead
+			// (12 such cases in the errors regress file). stmt_list
+			// already has the gram.y stmtmulti ';' alternative, and
+			// fragEndPos excludes a trailing ';' from every span.
+			if i > start {
+				out = append(out, toks[start:i+1])
+			}
 			start = i + 1
 		}
 	}
@@ -44,6 +88,12 @@ func SplitStatements(toks []Token) [][]Token {
 		}
 	}
 	return out
+}
+
+// isWordTok reports whether a token is a bare word — the lexer classes a
+// keyword as TokenKeyword or, when the word is not reserved, TokenIdent.
+func isWordTok(t Token) bool {
+	return t.Kind == TokenKeyword || t.Kind == TokenIdent
 }
 
 // routedStmts maps leading-terminal KEYS to their routing decision. Keys are
