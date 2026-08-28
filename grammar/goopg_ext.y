@@ -1579,25 +1579,25 @@ alter_table_action:
 			}
 	| REPLICA IDENTITY_P FULL
 			{
-				a := NewATActionAt(AlterTableReplicaIdentity, $<p>1)
+				a := NewATActionAt(AlterTableReplicaIdentity, $<p>2)
 				a.ReplicaIdentityMode = "f"
 				$$ = a
 			}
 	| REPLICA IDENTITY_P NOTHING
 			{
-				a := NewATActionAt(AlterTableReplicaIdentity, $<p>1)
+				a := NewATActionAt(AlterTableReplicaIdentity, $<p>2)
 				a.ReplicaIdentityMode = "n"
 				$$ = a
 			}
 	| REPLICA IDENTITY_P DEFAULT
 			{
-				a := NewATActionAt(AlterTableReplicaIdentity, $<p>1)
+				a := NewATActionAt(AlterTableReplicaIdentity, $<p>2)
 				a.ReplicaIdentityMode = "d"
 				$$ = a
 			}
 	| REPLICA IDENTITY_P USING INDEX ColId
 			{
-				a := NewATActionAt(AlterTableReplicaIdentity, $<p>1)
+				a := NewATActionAt(AlterTableReplicaIdentity, $<p>2)
 				a.ReplicaIdentityMode = "i"
 				a.ReplicaIdentityIndex = $5
 				$$ = a

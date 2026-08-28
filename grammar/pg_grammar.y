@@ -1521,87 +1521,87 @@ join_outer:
 		JOIN
 			{
 				$$ = newJoinSpec(false, "inner")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| INNER_P JOIN
 			{
 				$$ = newJoinSpec(false, "inner")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| NATURAL JOIN
 			{
 				$$ = newJoinSpec(true, "inner")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| NATURAL INNER_P JOIN
 			{
 				$$ = newJoinSpec(true, "inner")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| LEFT OUTER_P JOIN
 			{
 				$$ = newJoinSpec(false, "left")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| LEFT JOIN
 			{
 				$$ = newJoinSpec(false, "left")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| RIGHT OUTER_P JOIN
 			{
 				$$ = newJoinSpec(false, "right")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| RIGHT JOIN
 			{
 				$$ = newJoinSpec(false, "right")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| FULL OUTER_P JOIN
 			{
 				$$ = newJoinSpec(false, "full")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| FULL JOIN
 			{
 				$$ = newJoinSpec(false, "full")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| NATURAL LEFT OUTER_P JOIN
 			{
 				$$ = newJoinSpec(true, "left")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| NATURAL LEFT JOIN
 			{
 				$$ = newJoinSpec(true, "left")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| NATURAL RIGHT OUTER_P JOIN
 			{
 				$$ = newJoinSpec(true, "right")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| NATURAL RIGHT JOIN
 			{
 				$$ = newJoinSpec(true, "right")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| NATURAL FULL OUTER_P JOIN
 			{
 				$$ = newJoinSpec(true, "full")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| NATURAL FULL JOIN
 			{
 				$$ = newJoinSpec(true, "full")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 	| CROSS JOIN
 			{
 				$$ = newJoinSpec(false, "cross")
-				$$.pos = yylex.(*lexerState).lastConsumedPos()
+				$$.pos = $<p>1
 			}
 
 /* join_qual_opt — ON a_expr | USING '(' cols ')' | none (NATURAL/CROSS). */
@@ -1713,7 +1713,8 @@ base_table_ref:
 					sub = NewSelectStmt(0)
 				}
 				sub.Parenthesized = true
-				pos := sub.Pos()
+				/* The opening PAREN — select.go anchors a derived table there, not at the inner SELECT (whose own position is now the SELECT keyword). */
+				pos := $<p>1
 				lateral := false
 				alias := ""
 				var cols []string
@@ -1734,7 +1735,8 @@ base_table_ref:
 				// paren-wrapped select Parenthesized=true (:1396-1402);
 				// planner stops flattening at such branches.
 				sub.Parenthesized = true
-				pos := sub.Pos()
+				/* The opening PAREN — select.go anchors a derived table there, not at the inner SELECT (whose own position is now the SELECT keyword). */
+				pos := $<p>2
 				lateral := true
 				alias := ""
 				var cols []string
@@ -2099,7 +2101,7 @@ window_definition_list:
 window_definition:
 		ColId AS '(' opt_window_spec ')'
 			{
-				$$ = NamedWindowDef{Name: $1, Def: $4}
+				$$ = NamedWindowDef{Name: $1, Def: windowAt($4, $<p>1)}
 			}
 
 /* Upstream's window_specification shape, verbatim (gram.y :16417): ONE rule
@@ -2322,7 +2324,7 @@ a_expr:
 			}
 	| '-' a_expr %prec UMINUS
 			{
-				$$ = foldNegate($2)
+				$$ = foldNegate($<p>1, $2)
 			}
 	| '+' a_expr %prec UMINUS
 			{
@@ -2333,35 +2335,35 @@ a_expr:
 	   Positions ride on the LEFT operand (content dumps strip them). */
 	| a_expr IS NULL_P
 			{
-				$$ = NewIsNullExpr($1.Pos(), $1, false)
+				$$ = NewIsNullExpr($<p>2, $1, false)
 			}
 	| a_expr IS NOT NULL_P
 			{
-				$$ = NewIsNullExpr($1.Pos(), $1, true)
+				$$ = NewIsNullExpr($<p>2, $1, true)
 			}
 	| a_expr IS TRUE_P
 			{
-				$$ = NewIsBoolExpr($1.Pos(), $1, true, false, false)
+				$$ = NewIsBoolExpr($<p>2, $1, true, false, false)
 			}
 	| a_expr IS NOT TRUE_P
 			{
-				$$ = NewIsBoolExpr($1.Pos(), $1, true, false, true)
+				$$ = NewIsBoolExpr($<p>2, $1, true, false, true)
 			}
 	| a_expr IS FALSE_P
 			{
-				$$ = NewIsBoolExpr($1.Pos(), $1, false, true, false)
+				$$ = NewIsBoolExpr($<p>2, $1, false, true, false)
 			}
 	| a_expr IS NOT FALSE_P
 			{
-				$$ = NewIsBoolExpr($1.Pos(), $1, false, true, true)
+				$$ = NewIsBoolExpr($<p>2, $1, false, true, true)
 			}
 	| a_expr IS UNKNOWN
 			{
-				$$ = NewIsBoolExpr($1.Pos(), $1, false, false, false)
+				$$ = NewIsBoolExpr($<p>2, $1, false, false, false)
 			}
 	| a_expr IS NOT UNKNOWN
 			{
-				$$ = NewIsBoolExpr($1.Pos(), $1, false, false, true)
+				$$ = NewIsBoolExpr($<p>2, $1, false, false, true)
 			}
 	| a_expr IS DISTINCT FROM b_expr %prec IS
 			{
@@ -2374,11 +2376,11 @@ a_expr:
 	/* Postfix spellings — gram.y :15200 ISNULL / NOTNULL. */
 	| a_expr ISNULL
 			{
-				$$ = NewIsNullExpr($1.Pos(), $1, false)
+				$$ = NewIsNullExpr($<p>2, $1, false)
 			}
 	| a_expr NOTNULL
 			{
-				$$ = NewIsNullExpr($1.Pos(), $1, true)
+				$$ = NewIsNullExpr($<p>2, $1, true)
 			}
 	| EXISTS select_with_parens
 			{
@@ -2420,7 +2422,7 @@ a_expr:
 	   multi-character spelling routed here by the adapter. */
 	| a_expr COLLATE collation_name
 			{
-				$$ = NewCollateExpr($1.Pos(), $1, $3)
+				$$ = NewCollateExpr($<p>2, $1, $3)
 			}
 	/* AT TIME ZONE / AT LOCAL — gram.y :15540ff. Both are rewritten into a
 	   timezone() call with the ZONE argument FIRST (gram.y builds
@@ -2592,19 +2594,19 @@ a_expr:
 			}
 	| a_expr LIKE a_expr ESCAPE a_expr
 			{
-				$$ = NewBinaryOp($<p>2, OpLike, $1, NewLikeEscapePattern($3.Pos(), $3, $5))
+				$$ = NewBinaryOp($<p>2, OpLike, $1, NewLikeEscapePattern($<p>4, $3, $5))
 			}
 	| a_expr NOT_LA LIKE a_expr ESCAPE a_expr
 			{
-				$$ = NewBinaryOp($<p>2, OpNotLike, $1, NewLikeEscapePattern($4.Pos(), $4, $6))
+				$$ = NewBinaryOp($<p>2, OpNotLike, $1, NewLikeEscapePattern($<p>5, $4, $6))
 			}
 	| a_expr ILIKE a_expr ESCAPE a_expr
 			{
-				$$ = NewBinaryOp($<p>2, OpILike, $1, NewLikeEscapePattern($3.Pos(), $3, $5))
+				$$ = NewBinaryOp($<p>2, OpILike, $1, NewLikeEscapePattern($<p>4, $3, $5))
 			}
 	| a_expr NOT_LA ILIKE a_expr ESCAPE a_expr
 			{
-				$$ = NewBinaryOp($<p>2, OpNotILike, $1, NewLikeEscapePattern($4.Pos(), $4, $6))
+				$$ = NewBinaryOp($<p>2, OpNotILike, $1, NewLikeEscapePattern($<p>5, $4, $6))
 			}
 
 	/* [NOT] IN — gram.y :15130ff in_expr (list and subquery forms). */
@@ -3055,7 +3057,7 @@ b_expr:
 	   rejected every signed bound: `BETWEEN -1e6 AND 1e6`. */
 	| '-' b_expr %prec UMINUS
 			{
-				$$ = foldNegate($2)
+				$$ = foldNegate($<p>1, $2)
 			}
 	| '+' b_expr %prec UMINUS
 			{
@@ -3612,7 +3614,7 @@ insert_core:
 			{
 				src := $5.(*insRest)
 				rv, cols := insertTarget($3, $4, src.cols)
-				is := NewInsertStmt(0, rv, cols, src.src.rows)
+				is := NewInsertStmt($<p>1, rv, cols, src.src.rows)
 				if src.src.sel != nil {
 					SetInsertSelect(is, src.src.sel)
 				}
@@ -3625,7 +3627,9 @@ insert_core:
 			{
 				src := $6.(*insRest)
 				rv, cols := insertTarget($4, $5, src.cols)
-				is := NewInsertStmt(0, rv, cols, src.src.rows)
+				/* $<p>2 — the INSERT keyword. $<p>1 is with_clause, whose
+				   own offset is the WITH at the start of the statement. */
+				is := NewInsertStmt($<p>2, rv, cols, src.src.rows)
 				if src.src.sel != nil {
 					SetInsertSelect(is, src.src.sel)
 				}
@@ -3648,14 +3652,14 @@ opt_on_conflict:
 
 opt_arbiter:
 		/* empty */               { $$ = nil }
-	| '(' arbiter_elem_list ')'           { $$ = arbiterFromExprs($2) } /* items may be expressions, not just names */
+	| '(' arbiter_elem_list ')'           { $$ = arbiterAt(arbiterFromExprs($2), $<p>2) } /* items may be expressions, not just names */
 	| '(' arbiter_elem_list ')' WHERE a_expr
 			{
-				t := arbiterFromExprs($2)
+				t := arbiterAt(arbiterFromExprs($2), $<p>2)
 				t.Where = $5
 				$$ = t
 			}
-	| ON CONSTRAINT ColId { $$ = NewOnConflictTarget(nil, $3, nil) }
+	| ON CONSTRAINT ColId { $$ = arbiterAt(NewOnConflictTarget(nil, $3, nil), $<p>1) }
 
 update_set_list:
 		update_assign                   { $$ = []UpdateAssign{$1} }
@@ -3744,11 +3748,11 @@ update_core:
 				rv := rangeVarFromName($2, $3)
 				w := $7.(*updWhere)
 				if w.currentOf != "" {
-					u := NewUpdateStmt(0, rv, $5, $6, nil)
+					u := NewUpdateStmt($<p>1, rv, $5, $6, nil)
 					SetUpdateWhereCurrentOf(u, w.currentOf)
 					$$ = u
 				} else {
-					$$ = NewUpdateStmt(0, rv, $5, $6, w.expr)
+					$$ = NewUpdateStmt($<p>1, rv, $5, $6, w.expr)
 				}
 			}
 	/* The leading UPDATE keyword was MISSING from this alternative, so
@@ -3759,11 +3763,11 @@ update_core:
 				rv.Only = true
 				w := $8.(*updWhere)
 				if w.currentOf != "" {
-					u := NewUpdateStmt(0, rv, $6, $7, nil)
+					u := NewUpdateStmt($<p>1, rv, $6, $7, nil)
 					SetUpdateWhereCurrentOf(u, w.currentOf)
 					$$ = u
 				} else {
-					$$ = NewUpdateStmt(0, rv, $6, $7, w.expr)
+					$$ = NewUpdateStmt($<p>1, rv, $6, $7, w.expr)
 				}
 			}
 	| with_clause UPDATE qualified_name opt_upd_alias SET update_set_list opt_upd_from upd_where
@@ -3772,10 +3776,10 @@ update_core:
 				w := $8.(*updWhere)
 				var u *UpdateStmt
 				if w.currentOf != "" {
-					u = NewUpdateStmt(0, rv, $6, $7, nil)
+					u = NewUpdateStmt($<p>2, rv, $6, $7, nil)
 					SetUpdateWhereCurrentOf(u, w.currentOf)
 				} else {
-					u = NewUpdateStmt(0, rv, $6, $7, w.expr)
+					u = NewUpdateStmt($<p>2, rv, $6, $7, w.expr)
 				}
 				u.With = $1
 				$$ = u
@@ -3831,11 +3835,11 @@ delete_core:
 				rv := rangeVarFromName($3, $4)
 				w := $6.(*updWhere)
 				if w.currentOf != "" {
-					d := NewDeleteStmt(0, rv, $5, nil)
+					d := NewDeleteStmt($<p>1, rv, $5, nil)
 					SetDeleteWhereCurrentOf(d, w.currentOf)
 					$$ = d
 				} else {
-					$$ = NewDeleteStmt(0, rv, $5, w.expr)
+					$$ = NewDeleteStmt($<p>1, rv, $5, w.expr)
 				}
 			}
 	| DELETE_P FROM ONLY qualified_name opt_upd_alias opt_using_list del_where
@@ -3844,11 +3848,11 @@ delete_core:
 				rv.Only = true
 				w := $7.(*updWhere)
 				if w.currentOf != "" {
-					d := NewDeleteStmt(0, rv, $6, nil)
+					d := NewDeleteStmt($<p>1, rv, $6, nil)
 					SetDeleteWhereCurrentOf(d, w.currentOf)
 					$$ = d
 				} else {
-					$$ = NewDeleteStmt(0, rv, $6, w.expr)
+					$$ = NewDeleteStmt($<p>1, rv, $6, w.expr)
 				}
 			}
 	| with_clause DELETE_P FROM qualified_name opt_upd_alias opt_using_list del_where
@@ -3857,10 +3861,10 @@ delete_core:
 				w := $7.(*updWhere)
 				var d *DeleteStmt
 				if w.currentOf != "" {
-					d = NewDeleteStmt(0, rv, $6, nil)
+					d = NewDeleteStmt($<p>2, rv, $6, nil)
 					SetDeleteWhereCurrentOf(d, w.currentOf)
 				} else {
-					d = NewDeleteStmt(0, rv, $6, w.expr)
+					d = NewDeleteStmt($<p>2, rv, $6, w.expr)
 				}
 				d.With = $1
 				$$ = d

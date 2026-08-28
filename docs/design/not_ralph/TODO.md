@@ -1486,3 +1486,34 @@ offset PAST THE END of the statement (23 for `ALTER TABLE t INHERIT p`, which
 is 22 characters long). That is a legacy defect, and deliberately writing a
 caret past the end of the statement into the new parser would be a worse
 outcome than leaving those five at zero.
+
+### 204 -> 104
+
+The nested-vs-top-level rule turned out to cover **all four query kinds**, not
+just SELECT: `WITH c AS (SELECT 1) INSERT INTO t VALUES (1)` anchors the
+InsertStmt at INSERT (21), while a plain `INSERT INTO t VALUES (1)` is zero.
+topLevelSelect now un-stamps InsertStmt / UpdateStmt / DeleteStmt on the same
+`With == nil` test.
+
+The remaining anchors, each read off ddl.go/select.go rather than guessed:
+
+| node | anchor |
+|---|---|
+| IsNullExpr / IsBoolExpr | the IS keyword |
+| LikeEscapePattern | the ESCAPE keyword, not the pattern |
+| CollateExpr | the COLLATE keyword |
+| JoinExpr | the join keyword |
+| UnaryOp from `-x` | the MINUS SIGN — foldNegate was using the operand's |
+| derived table RangeVar | the opening PAREN, not the inner select |
+| ON CONFLICT arbiter | the first ELEMENT for `(a)`, the ON for `ON CONSTRAINT c` |
+| named window | its ColId |
+| REPLICA IDENTITY | the IDENTITY keyword, not REPLICA |
+| WITH + DML | the DML keyword ($2), not with_clause ($1, which is the WITH) |
+
+Two of these were only exposed by earlier fixes: the derived-table RangeVar
+had been correct while a nested select carried zero, and ResTarget had been
+correct while every expression node pointed at its own first token. Each time
+a position convention is corrected, anything that was reading `X.Pos()` as a
+proxy for "where X starts" has to be re-checked.
+
+Left at 104.

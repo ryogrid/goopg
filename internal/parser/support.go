@@ -69,7 +69,10 @@ func rangeVarFromName(q qname, alias string) RangeVar {
 // made moot at cutover", pinned on both sides by TestKnownDiffUnaryMinusFold.
 // b_expr's new unary-sign alternatives inherit it, which is why BETWEEN's
 // signed bounds fold too; that is consistent, not a new divergence.
-func foldNegate(e Expr) Expr {
+// foldNegate takes the MINUS sign's own offset: when the operand is not a
+// literal the result is a UnaryOp, and select.go anchors that at the sign,
+// not at the operand (`SELECT -f(1)` is 7, the '-', not 8).
+func foldNegate(pos int, e Expr) Expr {
 	switch v := e.(type) {
 	case *IntegerConst:
 		v.Value = -v.Value
@@ -78,7 +81,7 @@ func foldNegate(e Expr) Expr {
 		v.Value = "-" + v.Value
 		return v
 	default:
-		return NewUnaryOp(e.Pos(), OpUnaryNeg, e)
+		return NewUnaryOp(pos, OpUnaryNeg, e)
 	}
 }
 
@@ -4042,16 +4045,32 @@ func substringCall(l yyLexer, pos int, args []Expr) Expr {
 	return specialFormCall(pos, "substring", args)
 }
 
-// topLevelSelect reproduces the one asymmetry in select.go's SelectStmt
-// positions: a select parsed as a NESTED query keeps its leading keyword's
+// topLevelSelect reproduces the one asymmetry in select.go's / dml.go's
+// query positions: a query parsed as a NESTED one keeps its leading keyword's
 // offset, but the plain TOP-LEVEL statement carries zero. The WITH form is
 // not plain — `WITH c AS (...) SELECT 1` goes through parseSelectWithCTE,
-// which does stamp it — so only a top-level select with NO with-clause is
-// zeroed. The grammar has one rule for every position a select can appear in,
-// so the distinction has to be applied here, where "top level" is known.
+// which does stamp it (and the same holds for INSERT/UPDATE/DELETE) — so only
+// a top-level query with NO with-clause is zeroed. The grammar has one rule
+// for every position a query can appear in, so the distinction has to be
+// applied here, where "top level" is known.
 func topLevelSelect(st Stmt) Stmt {
-	if sel, ok := st.(*SelectStmt); ok && sel.With == nil {
-		sel.pos = 0
+	switch v := st.(type) {
+	case *SelectStmt:
+		if v.With == nil {
+			v.pos = 0
+		}
+	case *InsertStmt:
+		if v.With == nil {
+			v.pos = 0
+		}
+	case *UpdateStmt:
+		if v.With == nil {
+			v.pos = 0
+		}
+	case *DeleteStmt:
+		if v.With == nil {
+			v.pos = 0
+		}
 	}
 	return st
 }
@@ -4065,4 +4084,13 @@ func windowAt(v any, pos int) *WindowDef {
 		wd.pos = pos
 	}
 	return wd
+}
+
+// arbiterAt stamps an ON CONFLICT arbiter with the offset dml.go records —
+// the opening paren of the column list, or the ON of `ON CONSTRAINT`.
+func arbiterAt(t *OnConflictTarget, pos int) *OnConflictTarget {
+	if t != nil {
+		t.pos = pos
+	}
+	return t
 }
