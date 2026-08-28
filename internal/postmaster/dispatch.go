@@ -2226,7 +2226,24 @@ func createSchemaSubElementSchema(subCmd string) (schema string, hasTarget bool)
 }
 
 func normalizeCompatSQL(sql string) string {
-	s := strings.TrimSpace(sql)
+	// Comments are WHITESPACE to PG's lexer, not text: scan.l:213-215 defines
+	// `comment ("--"{non_newline}*)` and `whitespace ({space}+|{comment})`,
+	// and the `{whitespace}` rule (scan.l:443) emits no token at all — so
+	// `/* c */ CREATE ROLE x` reaches the grammar as `CREATE ROLE x`. goopg's
+	// compat tier classifies those statement classes the parser deliberately
+	// does not carry (role DDL, database DDL, the CREATE SCHEMA header — see
+	// the goyacc playbook §12's hand-written-scanner list) by prefix-matching
+	// this normalized text, and every one of those matches failed the moment a
+	// comment preceded the statement, because the comment survived
+	// normalization and no `create role `/`create database ` prefix was left.
+	// A leading comment is the normal shape of real SQL scripts, so CREATE /
+	// ALTER / DROP ROLE|USER|GROUP and CREATE / ALTER / DROP DATABASE were all
+	// unreachable from any commented script (M0134-0159; found via
+	// regproc.sql's `/* If objects exist, return oids */\nCREATE ROLE …`).
+	// Stripping first also lets the trailing-semicolon trim below see a `;`
+	// that a trailing comment would otherwise hide.
+	s := stripSQLComments(sql)
+	s = strings.TrimSpace(s)
 	for strings.HasSuffix(s, ";") {
 		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
 	}
@@ -2234,6 +2251,139 @@ func normalizeCompatSQL(sql string) string {
 	// Lowercasing string literals would cause 'A' and 'a' to map to the
 	// same plan-cache key, returning the wrong cached plan. M0097-0003.
 	return normalizeSQLPreservingLiterals(s)
+}
+
+// stripSQLComments replaces every SQL comment with a single space, the way
+// PG's lexer does (scan.l:213-215 folds `--…` and `/*…*/` into {whitespace},
+// whose rule body is `/* ignore */`). Everything else is copied byte for byte:
+// this is a lexical pre-pass for normalizeCompatSQL's prefix classification and
+// the plan-cache key, NOT a rewriter.
+//
+// Comment introducers inside a literal are not comments, so the scan skips the
+// same four literal forms firstTopLevelSemicolon (role_ddl.go) skips —
+// single-quoted strings, double-quoted identifiers, and dollar-quoted strings —
+// plus the E'' escape-string form, where a backslash escapes the next byte and
+// `E'a\'-- still in the literal'` must not be cut in half.
+//
+// Block comments NEST in PostgreSQL (scan.l's <xc> state carries an `xcdepth`
+// counter, scan.l:455-467), unlike the deliberately simplified non-nesting scan
+// in firstTopLevelSemicolon, so the depth is tracked here.
+//
+// An UNTERMINATED comment or literal is copied through verbatim rather than
+// swallowed: this function must never make a malformed statement look like a
+// well-formed one to the prefix matcher — the parser is what reports the
+// syntax error.
+func stripSQLComments(sql string) string {
+	if !strings.Contains(sql, "--") && !strings.Contains(sql, "/*") {
+		return sql // overwhelmingly the common case; no copy
+	}
+	var b strings.Builder
+	b.Grow(len(sql))
+	i, n := 0, len(sql)
+	for i < n {
+		c := sql[i]
+		switch {
+		case c == '\'':
+			// A leading E/e marks an escape string, in which a backslash
+			// escapes the following byte (including a quote). Plain and
+			// standard-conforming literals only escape a quote by doubling it.
+			esc := i > 0 && (sql[i-1] == 'e' || sql[i-1] == 'E') &&
+				(i == 1 || !isIdentByte(sql[i-2]))
+			j := i + 1
+			for j < n {
+				if esc && sql[j] == '\\' && j+1 < n {
+					j += 2
+					continue
+				}
+				if sql[j] == '\'' {
+					if j+1 < n && sql[j+1] == '\'' {
+						j += 2
+						continue
+					}
+					j++
+					break
+				}
+				j++
+			}
+			b.WriteString(sql[i:min(j, n)])
+			i = j
+		case c == '"':
+			j := i + 1
+			for j < n {
+				if sql[j] == '"' {
+					if j+1 < n && sql[j+1] == '"' {
+						j += 2
+						continue
+					}
+					j++
+					break
+				}
+				j++
+			}
+			b.WriteString(sql[i:min(j, n)])
+			i = j
+		case c == '$':
+			tag, after, isDollar := scanDollarTag(sql, i)
+			if !isDollar {
+				b.WriteByte(c)
+				i++
+				continue
+			}
+			end := after
+			if rel := strings.Index(sql[after:], tag); rel >= 0 {
+				end = after + rel + len(tag)
+			} else {
+				end = n // unterminated: copy the remainder verbatim
+			}
+			b.WriteString(sql[i:end])
+			i = end
+		case c == '-' && i+1 < n && sql[i+1] == '-':
+			// Line comment: runs to the end of the line. The terminating
+			// newline is itself whitespace, so emitting one space for the
+			// whole comment loses nothing (scan.l never distinguishes them).
+			for i < n && sql[i] != '\n' {
+				i++
+			}
+			b.WriteByte(' ')
+		case c == '/' && i+1 < n && sql[i+1] == '*':
+			depth := 1
+			j := i + 2
+			for j < n && depth > 0 {
+				if sql[j] == '/' && j+1 < n && sql[j+1] == '*' {
+					depth++
+					j += 2
+					continue
+				}
+				if sql[j] == '*' && j+1 < n && sql[j+1] == '/' {
+					depth--
+					j += 2
+					continue
+				}
+				j++
+			}
+			if depth > 0 {
+				// Unterminated /* — PG raises "unterminated /* comment"
+				// (scan.l:483). Copy it through so the parser sees it and
+				// reports that error itself.
+				b.WriteString(sql[i:])
+				return b.String()
+			}
+			b.WriteByte(' ')
+			i = j
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String()
+}
+
+// isIdentByte reports whether c can appear in an SQL identifier — used to tell
+// the escape-string prefix in `E'…'` from the tail of an identifier that merely
+// ends in "e" (`table'x'` is not an escape string).
+func isIdentByte(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9')
 }
 
 // planCacheKey builds the cross-session plan cache key: normalizeCompatSQL's

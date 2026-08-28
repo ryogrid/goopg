@@ -162,7 +162,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/rangefuncs.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/rangetypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/regex.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/regproc.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/regproc.sql,failed,no,-,"Sized live 2026-08-29 (M0134-0159) — PARKED at 766->758 diff lines / 63->61 ^+ERROR. The loop's fix was engine-wide, not regproc-specific: the case's first statement is a commented CREATE ROLE, and normalizeCompatSQL kept comments, so every compat-tier statement class (role DDL, database DDL) was unreachable behind any comment. Remaining buckets: the whole to_reg* soft-error family undispatched (~35 of 61 errors), function-style reg* casts are echo stubs (expr.go:14296), regoper/regoperator have no name-resolution seam, pg_input_error_info returns an empty row — see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/reindex_catalog.sql,pass,yes,-,"M0134-0062 (2026-08-21): registered pg_shdescription virtual table + 6 nailed system-index stubs (Table=nil, no-op REINDEX) in catalog.InMemory.registerSystemTables — 1/1 PASS 100% parity via pg-regress-runner"
 ,regress-sql,regress,postgres/src/test/regress/sql/reloptions.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/replica_identity.sql,not-tried,no,-,
