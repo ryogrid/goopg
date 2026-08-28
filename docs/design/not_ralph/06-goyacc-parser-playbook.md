@@ -348,13 +348,23 @@ git diff internal/parser/testdata/parity_goldens.txt # ← REVIEW THIS
   `internal/parser`.
 - Planner/executor-touching changes additionally: `scripts/tpch-spotcheck.sh`
   (fresh capped server; canonical Q12/Q13 row counts).
-- The FULL `go test ./internal/testport/` wedges in `TestPort_IsolationSuite`
-  — a harness problem, not a code one. Run the two halves separately:
-  `-run TestPort_IsolationSuite` (~30 s) and `-run TestPort_RegressSuite`
-  (~5 min). Judge a long run by EVIDENCE OF PROGRESS (diff-file count,
-  `cluster.log` mtime), never by elapsed time. Reap leftover scopes with
-  `systemctl --user stop goopg-verify-<name>.scope` — `kill` is the wrong
-  tool and the orphans are `ppid=1`.
+- **Run testport SPLIT and SEQUENTIALLY.** `TestPort_IsolationSuite` wedges
+  both in a FULL single run and when a second testport binary runs
+  concurrently — it passes standalone in ~28 s and then sits for 18+ minutes
+  at 0.1% CPU with its `cluster.log` untouched. Cause unknown; recorded in
+  `.ralph/deferral_ledger.md` (`P7.2-testport-concurrency`) with what was and
+  was not investigated. Do: `-run TestPort_IsolationSuite` first, then the
+  rest — never both at once.
+- **Judge a long run by EVIDENCE OF PROGRESS**, never by elapsed time: the
+  regress-diff artifact count (a healthy full run leaves ~162), the live
+  server's `cluster.log` mtime against `date`, and server churn (`ps -eo
+  etime,args | grep '[g]oopg start -D /tmp/Test'` — one server alive for 30+
+  minutes is the tell). A wedged gate looks exactly like a slow one on
+  `etime` alone.
+- Reap leftover scopes with `systemctl --user stop goopg-verify-<name>.scope`
+  — `kill` is the wrong tool and the orphans are `ppid=1`. They accumulate
+  across runs and at ~20 scopes every server in a fresh run fails to start,
+  which reads as a catastrophic regression and is not one.
 - **Never pass `-count=1` to a gate** — it defeats the test-result cache.
 - Live cluster hygiene: hold server age constant across A/B comparisons;
   `timeout N psql` kills only the client (the server keeps executing).
