@@ -1,10 +1,12 @@
 package executor
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // This file implements the three SQL-level index-AM property-reporting
@@ -305,4 +307,66 @@ func resolveOIDArg(d Datum) (uint32, bool) {
 		return uint32(n), true
 	}
 	return 0, false
+}
+
+// checkIndexAMCapabilities reproduces the "verify it can handle the requested
+// features" half of DefineIndex (postgres/src/backend/commands/indexcmds.c:
+// 868-892 plus ComputeIndexAttrs' per-column arm at :2222-2236), in upstream's
+// order: amcanunique, amcaninclude, amcanmulticol, then per-key-column
+// amcanorder.
+//
+// Before M0134-0167 execCreateIndex enforced exactly ONE of these — a
+// hardcoded `case "brin", "gin", "hash":` INCLUDE list — so goopg silently
+// ACCEPTED `CREATE UNIQUE INDEX ... USING spgist|gist|gin|brin|hash`,
+// multicolumn spgist/hash indexes, and ASC/DESC options on every orderless
+// AM, all of which real PG rejects with 0A000. Accepting a "unique" index on
+// an AM that cannot enforce uniqueness is not cosmetic: gist/spgist/gin/brin
+// are catalog-only in goopg (execCreateIndex's catalog-only branch), so the
+// declared uniqueness was never enforced by anything.
+//
+// The flags are read from catalog.IndexAMCapabilityByName — the hand-curated
+// mirror of each AM's IndexAmRoutine that M0134-0090 transcribed for
+// pg_indexam_has_property. That table was the codebase's only pg_am
+// capability source and had no second consumer until now; the AM name is the
+// DECLARED one, so `hash` answers as hash even though goopg builds a hash
+// index on the B-tree substrate.
+func checkIndexAMCapabilities(method string, s *parser.CreateIndexStmt) *ExecError {
+	amcap, ok := catalog.IndexAMCapabilityByName(method)
+	if !ok {
+		// Unknown AM: leave the diagnosis to the existing access-method
+		// validation rather than inventing a capability answer.
+		return nil
+	}
+	unsupported := func(what string) *ExecError {
+		return &ExecError{Code: "0A000", Pos: s.Pos(),
+			Message: fmt.Sprintf("access method \"%s\" does not support %s", method, what)}
+	}
+	if s.Unique && !amcap.CanUnique {
+		return unsupported("unique indexes")
+	}
+	if len(s.IncludeColumns) > 0 && !amcap.CanInclude {
+		return unsupported("included columns")
+	}
+	if len(s.Columns) > 1 && !amcap.CanMultiCol {
+		return unsupported("multicolumn indexes")
+	}
+	if amcap.CanOrder {
+		return nil
+	}
+	for _, co := range s.ColOrders {
+		if co.Descending {
+			return unsupported("ASC/DESC options")
+		}
+		// parser.IndexColOrder.NullsFirst is already defaulted from
+		// Descending (newIndexElem: "DESC implies NULLS FIRST unless the
+		// clause says otherwise"), so a value that disagrees with
+		// Descending is the only explicit NULLS order this AST can still
+		// distinguish from SORTBY_NULLS_DEFAULT. `NULLS LAST` on an
+		// ascending key collapses into the default and is therefore not
+		// reachable here — ledgered with the grammar resume point.
+		if co.NullsFirst != co.Descending {
+			return unsupported("NULLS FIRST/LAST options")
+		}
+	}
+	return nil
 }

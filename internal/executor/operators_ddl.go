@@ -7475,6 +7475,22 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.String())}
 	}
+	// Resolve the access method, then verify it can handle the requested
+	// features — DefineIndex's own "look up the access method, verify it can
+	// handle the requested features" block (postgres/src/backend/commands/
+	// indexcmds.c:838-892), which runs BEFORE index_reloptions() and long
+	// before index_create()'s name-conflict test. M0134-0167.
+	method := strings.ToLower(strings.TrimSpace(s.Method))
+	if method == "rtree" {
+		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
+		method = "gist"
+	}
+	if method == "" {
+		method = "btree"
+	}
+	if aerr := checkIndexAMCapabilities(method, s); aerr != nil {
+		return aerr
+	}
 	// Reject unrecognized `WITH (...)` names/namespaces before ANY other index
 	// check. DefineIndex runs index_reloptions() well before index_create()
 	// reaches the name-conflict test (postgres/src/backend/commands/
@@ -7532,23 +7548,6 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		return &ExecError{Code: "22023", Pos: s.Pos(),
 			Message: fmt.Sprintf("value %d out of bounds for option \"pages_per_range\"", s.PagesPerRange),
 			Detail:  "Valid values are between \"1\" and \"131072\"."}
-	}
-	method := strings.ToLower(strings.TrimSpace(s.Method))
-	if method == "rtree" {
-		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
-		method = "gist"
-	}
-	if method == "" {
-		method = "btree"
-	}
-	// brin, gin, hash do not support INCLUDE columns; hash is silently upgraded
-	// to btree only when there are no INCLUDE columns. M0097-0023.
-	if len(s.IncludeColumns) > 0 {
-		switch method {
-		case "brin", "gin", "hash":
-			return &ExecError{Code: "0A000", Pos: s.Pos(),
-				Message: fmt.Sprintf("access method \"%s\" does not support included columns", method)}
-		}
 	}
 	// goopg has no native hash access method: a hash index is built on the
 	// B-tree substrate. The catalog Method stays "btree" (pg_am / pg_dump
