@@ -1726,3 +1726,96 @@ copyRouted, alterDomainRouted, alterIndexRouted, alterViewRouted,
 alterMatviewRouted, explainInnerRouted) decline the ~1.7% of the regress corpus
 whose classes the grammar deliberately does not own — the parse-and-ignore
 compat scanners surveyed under "P7.2 scope, measured".
+
+## P7.3: the pre-migration baseline, MEASURED (2026-08-28)
+
+The migration was reported complete with "3 regress reds, same as baseline".
+Both halves of that sentence were wrong, in opposite directions, and it took a
+measurement to find out.
+
+The plan named `docs/test-port/postgres-oracle-target-inventory.csv` as the one
+trustworthy pre-migration record — its `status` column, since the older
+`regress-diff-baseline.csv` had `diff_lines` all-zero and had not been updated
+since July. The CSV was last touched at `f2d54e226`, about 20 hours before the
+first permanent routing flip, so its timing is right. It records **all five** of
+`errors`, `limit`, `numerology`, `copydml`, `create_function_sql` as
+`status=pass`.
+
+Running those five cases on a pre-migration tree gives a different answer:
+
+| case | pre-migration | HEAD before this work | verdict |
+|---|---|---|---|
+| `copydml` | PASS | FAIL | migration regression |
+| `create_function_sql` | PASS | FAIL | migration regression |
+| `errors` | PASS | FAIL | migration regression |
+| `limit` | **FAIL** | FAIL | red before the migration |
+| `numerology` | **FAIL** | FAIL | red before the migration |
+
+So the migration regressed **three** cases, not five, and the CSV over-reports
+two of the five rows sampled. Its `status` column is not a safe oracle either;
+the only reliable answer is to run the case on a pre-migration tree.
+
+Two traps in doing that. `f5613d73f` — the parent of the first permanent flip,
+and the obvious baseline commit — **does not compile**: its tracked generated
+`internal/sqlparser/yacc_parser.go` calls a `parser.NewExtractExpr` that no
+file defines. Use `f3c081546`, its parent. And in a fresh worktree the
+untracked `postgres` symlink is missing, so `clientToolBin(t, "psql")` returns
+"" and `TestPort_RegressSuite` **skips silently** — a green run that tested
+nothing.
+
+### The three regressions, and why per-fragment routing exposed them
+
+All three are boundary bugs in `SplitStatements`, and all three were INVISIBLE
+before P7.3. When a batch containing any unrouted statement went to the legacy
+parser WHOLE, legacy re-parsed the original source and got the right answer no
+matter where the fragment boundaries fell. Per-fragment routing made every
+boundary load-bearing.
+
+| fix | what was wrong |
+|---|---|
+| keep the terminating `;` in each fragment | yacc reached EOF on a truncated statement and said "syntax error at end of input"; PG hands `;` to the grammar and names it. 12 cases in `errors`. |
+| don't split on a `;` inside parentheses | `CREATE RULE … DO INSTEAD (DELETE …; DELETE …)` — gram.y's `RuleActionMulti` owns that `;`. The rule was never created, so `copydml` then reported the wrong error three times over. |
+| don't split inside `BEGIN ATOMIC … END` | gram.y's `routine_body_stmt_list` owns those `;`. `create_function_sql`'s three SQL-standard bodies never parsed. A `CASE … END` inside the body is tracked so it is not mistaken for the body's own `END`. |
+
+Two more PG-fidelity gaps surfaced while fixing `errors`:
+
+- `oper_argtypes` (gram.y:9095) gives DROP OPERATOR its own one-argument
+  alternative, and that alternative is an **ereport**, not a reduction:
+  `drop operator === (int4)` is `missing argument`, with the NONE hint. goopg
+  shared `drop_arg_types` with DROP AGGREGATE — for which a single type IS
+  legal — so the error was swallowed and the catalog reported
+  `operator "===" does not exist` instead.
+- `scanner_yyerror` echoes **yytext**, the source spelling. goopg echoed the
+  lexer's down-cased `Value`, so `NOT NUL` came back as near `"nul"` where PG
+  says `"NUL"`. That bug already had a hand-maintained uppercase workaround
+  list (`OIDS`); slicing the original source removes the need for the list.
+
+Pinned by `TestStatementSplitRespectsNesting`,
+`TestSyntaxErrorAnchorsAtSemicolon`, `TestSyntaxErrorEchoesSourceSpelling` and
+`TestDropOperatorMissingArgument` in `internal/parser/stmt_split_test.go`.
+
+`limit` and `numerology` stay red. They are not migration debt.
+
+### Two MORE regressions, found by running the whole suite
+
+`index_including` and `index_including_gist` also passed pre-migration and
+failed at HEAD, for a reason that is worth recording because it is invisible
+from the parser side. `psql`'s `\d` issues its own catalog query, and that
+query uses the schema-qualified operator form:
+
+```sql
+WHERE c.relname OPERATOR(pg_catalog.~) '^(tbl)$' COLLATE pg_catalog.default
+```
+
+The yacc grammar has no `OPERATOR(...)` rule, so goopg answers `syntax error at
+or near "OPERATOR"` — and it did so before the migration too. The case passed
+anyway because `internal/testport/framework/regress.go` STRIPS that error from
+both sides, matching the literal lowercase text
+`syntax error at or near "operator"`. Once the parser began echoing the source
+spelling, the strip rule stopped matching and two long-tolerated errors became
+visible as a regression.
+
+The strip rules for `cast`, `operator`, `policy` and `user` now compare case
+insensitively (`containsNearToken`). The underlying gap — no `OPERATOR(...)`
+qualified-operator rule — is unchanged and still deferred; it is a genuine
+feature gap, not migration debt, and it means `\d` on any relation errors.
