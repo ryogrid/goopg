@@ -666,10 +666,12 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 			// arbiter (PG oracle execIndexing.c:592-596,
 			// ExecCheckIndexConstraints: `!ii_Unique && !ii_ExclusionOps` is
 			// the only skip condition), but neither kind may be deferrable —
-			// keyed on indimmediate, which is false only for INITIALLY
-			// DEFERRED (a plain DEFERRABLE constraint stays immediate by
-			// default and remains a valid arbiter). execIndexing.c:604-610.
-			if idx.InitiallyDeferred {
+			// keyed on indimmediate (execIndexing.c:604-610), which is false
+			// for ANY DEFERRABLE constraint, not just INITIALLY DEFERRED ones
+			// (index.c:1049, 2080-2082). M0134-0161 corrected this: the old
+			// InitiallyDeferred key let a plain `DEFERRABLE` constraint
+			// through as an arbiter, which PG 18.3 rejects (oracle-verified).
+			if !idx.IsImmediate() {
 				// Pos: 0 — PG raises this at execution time
 				// (ExecCheckIndexConstraints, execIndexing.c) with no
 				// errposition, so the transcript has no "LINE N:" annotation.

@@ -1888,6 +1888,10 @@ type Index struct {
 	// when the constraint was declared `DEFERRABLE` / `DEFERRABLE INITIALLY
 	// DEFERRED`. pg_get_constraintdef re-emits the clause so pg_dump round-trips
 	// it. Only meaningful when IsConstraint is true. DU-002 slice 139.
+	//
+	// Do NOT read either field directly to decide "is this index immediate?" —
+	// use IsImmediate. pg_index.indimmediate is keyed on Deferrable ALONE, not
+	// on InitiallyDeferred; see IsImmediate's doc comment. M0134-0161.
 	Deferrable        bool
 	InitiallyDeferred bool
 	// PartitionParentOID is the OID of the parent index for partition index
@@ -2021,6 +2025,28 @@ func (i *Index) QualifiedName() string {
 	}
 	return i.Schema + "." + i.Name
 }
+
+// IsImmediate is pg_index.indimmediate: "the uniqueness check is enforced
+// immediately on insertion". It is the single predicate every indimmediate
+// consumer must use.
+//
+// The mapping is DEFERRABLE alone, NOT INITIALLY DEFERRED. index_create sets
+// the column from `(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0`
+// (postgres/src/backend/catalog/index.c:1049) and index_set_state_flags
+// re-clears it with `if (deferrable && indexForm->indimmediate)`
+// (index.c:2080-2082) — INITIALLY {IMMEDIATE|DEFERRED} never enters either
+// expression. A merely-`DEFERRABLE` constraint is therefore NON-immediate,
+// because its uniqueness can be deferred by a later SET CONSTRAINTS even
+// though it is not deferred by default.
+//
+// M0134-0161: four independent sites had drifted apart on this — two pg_index
+// row builders hardcoded `true`, while the REPLICA IDENTITY and ON CONFLICT
+// arbiter checks keyed on InitiallyDeferred and so silently ACCEPTED indexes
+// PG rejects. Oracle-verified on PG 18.3: a `UNIQUE (b) DEFERRABLE` constraint
+// reports indimmediate='f', is rejected by `REPLICA IDENTITY USING INDEX`
+// ("cannot use non-immediate index"), and is rejected as an ON CONFLICT
+// arbiter in both the ON CONSTRAINT and the inferred-by-column form.
+func (i *Index) IsImmediate() bool { return !i.Deferrable }
 
 // Catalog is the lookup interface the planner uses.
 type Catalog interface {
@@ -7200,7 +7226,7 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 			boolStr(idx.NullsNotDistinct),    // indnullsnotdistinct
 			boolStr(idx.Primary),             // indisprimary
 			boolStr(idx.IsExclusion),         // indisexclusion
-			"t",                              // indimmediate
+			boolStr(idx.IsImmediate()),       // indimmediate (M0134-0161)
 			boolStr(idx.IsClustered),         // indisclustered (DU-002 slice 320)
 			"t",                              // indisvalid
 			"f",                              // indcheckxmin

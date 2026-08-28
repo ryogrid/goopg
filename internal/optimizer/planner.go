@@ -10916,9 +10916,10 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 		// execIndexing.c:592-596), sibling of the analyzer's identical check
 		// (analyzer.go analyzeOnConflict) — this defensive re-check must stay
 		// in lockstep. Deferrable exclusion/unique constraints are rejected
-		// regardless of kind, keyed on InitiallyDeferred (indimmediate is
-		// false only for INITIALLY DEFERRED). execIndexing.c:604-610.
-		if idx.InitiallyDeferred {
+		// regardless of kind, keyed on indimmediate — false for ANY
+		// DEFERRABLE constraint, not just INITIALLY DEFERRED ones
+		// (index.c:1049, 2080-2082). execIndexing.c:604-610. M0134-0161.
+		if !idx.IsImmediate() {
 			// Pos: 0 — see analyzer.go's identical check; PG raises this at
 			// execution time with no errposition.
 			return nil, nil, &PlanError{Pos: 0, Code: "55000", Message: "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"}
@@ -11056,6 +11057,21 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 		}
 		if !match {
 			continue
+		}
+		// The index matched the inference specification. Only NOW may it be
+		// rejected for being non-immediate: PG's infer_arbiter_indexes
+		// deliberately does NOT filter on indimmediate ("Let executor
+		// complain about !indimmediate case directly, because the index
+		// may be used by an INSERT with a different ON CONFLICT clause",
+		// plancat.c:817), leaving ExecCheckIndexConstraints to raise
+		// (execIndexing.c:604-610). Ordering matters: skipping the index
+		// during matching instead would surface 42P10 "no unique or
+		// exclusion constraint matching the ON CONFLICT specification"
+		// where PG reports 55000. Sibling of the ON CONSTRAINT branch
+		// above — the two must stay in lockstep. M0134-0161.
+		if !idx.IsImmediate() {
+			// Pos: 0 — raised at execution time in PG, no errposition.
+			return nil, nil, &PlanError{Pos: 0, Code: "55000", Message: "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"}
 		}
 		ords := make([]int, 0, len(idx.Columns))
 		for _, ic := range idx.Columns {

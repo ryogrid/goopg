@@ -437,3 +437,49 @@ func TestResolveArbiterIndexRejectsDeferrableExclusionArbiter(t *testing.T) {
 		t.Errorf("code=%s, want 55000", pe.Code)
 	}
 }
+
+// TestResolveArbiterIndexRejectsMerelyDeferrableArbiter (M0134-0161) pins the
+// narrower half of the indimmediate rule that goopg previously got wrong: a
+// constraint declared just `DEFERRABLE` — i.e. INITIALLY IMMEDIATE, so
+// InitiallyDeferred is false — is STILL non-immediate and STILL rejected as an
+// ON CONFLICT arbiter. index_create derives indimmediate from the DEFERRABLE
+// flag alone (postgres/src/backend/catalog/index.c:1049, 2080-2082), so keying
+// the check on InitiallyDeferred silently accepted these. Oracle-verified on
+// PG 18.3: `INSERT … ON CONFLICT ON CONSTRAINT u_defer DO NOTHING` against a
+// `UNIQUE (b) DEFERRABLE` constraint raises 55000.
+func TestResolveArbiterIndexRejectsMerelyDeferrableArbiter(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_dkey"}, tbl, []string{"aid"}, true, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.Deferrable = true
+	idx.InitiallyDeferred = false // DEFERRABLE INITIALLY IMMEDIATE
+	if idx.IsImmediate() {
+		t.Fatal("IsImmediate() = true for a DEFERRABLE index, want false")
+	}
+	// Both arbiter-resolution branches must reject it: the explicit
+	// ON CONSTRAINT form and the inferred-by-column form. PG rejects both
+	// (execIndexing.c:604-610 runs after infer_arbiter_indexes has already
+	// selected the index — plancat.c:817).
+	for _, sql := range []string{
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) " +
+			"ON CONFLICT ON CONSTRAINT pgbench_accounts_dkey DO NOTHING",
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) " +
+			"ON CONFLICT (aid) DO NOTHING",
+	} {
+		stmt := parseOne(t, sql).(*parser.InsertStmt)
+		_, _, err := resolveArbiterIndex(stmt.OnConflict.Target, tbl, nil, cat)
+		if err == nil {
+			t.Fatalf("%s: expected 55000 error, got nil", sql)
+		}
+		pe, ok := err.(*PlanError)
+		if !ok {
+			t.Fatalf("%s: err type=%T, want *PlanError", sql, err)
+		}
+		if pe.Code != "55000" {
+			t.Errorf("%s: code=%s (%s), want 55000", sql, pe.Code, pe.Message)
+		}
+	}
+}

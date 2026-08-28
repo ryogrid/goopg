@@ -18576,7 +18576,12 @@ func resolveReplicaIdentityIndex(ctx *Context, tbl *catalog.Table, indexName str
 		return nil, &ExecError{Code: "42809", Pos: pos,
 			Message: fmt.Sprintf("cannot use non-unique index %q as replica identity", idx.Name)}
 	}
-	if idx.InitiallyDeferred {
+	// PG: `if (!indexRel->rd_index->indimmediate)` (tablecmds.c:18550). The
+	// predicate is DEFERRABLE alone — a `UNIQUE (…) DEFERRABLE` constraint is
+	// non-immediate even though it is INITIALLY IMMEDIATE. Keying this on
+	// InitiallyDeferred (as it did before M0134-0161) silently ACCEPTED such
+	// an index as replica identity, which PG rejects.
+	if !idx.IsImmediate() {
 		return nil, &ExecError{Code: "0A000", Pos: pos,
 			Message: fmt.Sprintf("cannot use non-immediate index %q as replica identity", idx.Name)}
 	}
