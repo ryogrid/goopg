@@ -1105,6 +1105,42 @@ func tableNeedsToastRelation(t *Table) bool {
 // virtual builder emits a relkind='t' TOAST row (and relkind='i' TOAST-index
 // row, slice 3) for exactly this set; toastBearingTables enumerates the same
 // set for the pg_index builder so the two catalogs never diverge.
+// RelkindHasStorage reports whether a relation of this pg_class.relkind owns a
+// physical relfilenode, mirroring upstream's RELKIND_HAS_STORAGE macro
+// (postgres/src/include/catalog/pg_class.h:200). heap_create
+// (postgres/src/backend/catalog/heap.c:335-345) only assigns a relfilenumber
+// when the macro holds, so every storage-less kind — plain view, composite
+// type, foreign table, partitioned table, partitioned index — carries
+// relfilenode = 0 in a real cluster.
+//
+// This is the single source of truth for the relfilenode column across all
+// four pg_class row builders (the two virtual ones here, and
+// executor.buildUserPGClassRow / buildUserPGClassRowForIndex): the virtual and
+// heap-persisted renderings of the same relation must never disagree, and
+// before M0134-0164 they did — the heap builder zeroed 'p'/'v' with an ad-hoc
+// check while the virtual builder handed out the relation OID for every kind,
+// so `SELECT relname FROM pg_class WHERE relkind IN ('v','c','f','p','I') AND
+// relfilenode <> 0` (regress sanity_check.sql) listed every view in the
+// database. M0134-0164.
+func RelkindHasStorage(relkind string) bool {
+	switch relkind {
+	case "r", "i", "S", "t", "m":
+		return true
+	default:
+		return false
+	}
+}
+
+// RelfilenodeForRelkind renders the pg_class.relfilenode cell for a relation of
+// the given kind: its own OID when the kind has storage, "0" otherwise. See
+// RelkindHasStorage. M0134-0164.
+func RelfilenodeForRelkind(relkind string, oid uint32) string {
+	if !RelkindHasStorage(relkind) {
+		return "0"
+	}
+	return strconv.Itoa(int(oid))
+}
+
 // ReplIdentOrDefault resolves a table's effective pg_class.relreplident code,
 // mapping an unset (empty) ReplicaIdentity to PG's implicit default 'd'
 // (REPLICA_IDENTITY_DEFAULT). DU-002 slice 305.
@@ -7484,6 +7520,11 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// name OF type`), "0" otherwise. Hoisted to a local so the row literal
 		// keeps its single-token column width (and comment alignment). DU-002 slice 374.
 		relOfType := strconv.Itoa(int(t.OfTypeOID))
+		// relfilenode: the relation OID for kinds with storage, "0" for the
+		// storage-less ones (view / foreign table / partitioned table).
+		// Hoisted to a local for the same reason as relOfType above — keeping
+		// the row literal's single-token column width. M0134-0164.
+		relFilenode := RelfilenodeForRelkind(relkind, t.OID)
 		relacl := c.relaclTextLocked(t.OID)
 		if t.IsSequence {
 			relacl = c.relaclTextLockedSeq(t.OID)
@@ -7496,7 +7537,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 			"10",                            // 5:  relowner (bootstrap superuser)
 			relam,                           // 6:  relam (heap=2; 0 for sequences)
-			strconv.Itoa(int(t.OID)),        // 7:  relfilenode
+			relFilenode,                     // 7:  relfilenode (0 for storage-less kinds — view/foreign/partitioned, M0134-0164)
 			strconv.Itoa(int(t.Tablespace)), // 8:  reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
 			relpages,                        // 9:  relpages
 			reltuples,                       // 10: reltuples
@@ -7684,6 +7725,10 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// below keeps its single-token column width (and comment
 		// alignment), same convention as relOfType above. M0122-0007.
 		idxTablespace := strconv.Itoa(int(idx.Tablespace))
+		// relfilenode: the index OID, or "0" for a partitioned index
+		// (relkind 'I'), which has no storage of its own. Hoisted for the
+		// same column-width reason as idxTablespace. M0134-0164.
+		idxFilenode := RelfilenodeForRelkind(idxRelkind, idx.OID)
 		out = append(out, []string{
 			strconv.Itoa(int(idx.OID)),  // 0:  oid
 			idx.Name,                    // 1:  relname
@@ -7692,7 +7737,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			"0",                         // 4:  reloftype
 			"10",                        // 5:  relowner
 			idxRelam,                    // 6:  relam
-			strconv.Itoa(int(idx.OID)),  // 7:  relfilenode
+			idxFilenode,                 // 7:  relfilenode (0 for a partitioned index, relkind 'I' — M0134-0164)
 			idxTablespace,               // 8:  reltablespace
 			"0",                         // 9:  relpages
 			"-1",                        // 10: reltuples (-1 = unknown for indexes)

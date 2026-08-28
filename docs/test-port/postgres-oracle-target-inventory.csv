@@ -171,7 +171,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/rowsecurity.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/rowtypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/rules.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/sanity_check.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/sanity_check.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/security_label.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/select.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/select_distinct.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
