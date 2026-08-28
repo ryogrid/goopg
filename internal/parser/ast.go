@@ -1726,6 +1726,15 @@ type CreateIndexStmt struct {
 	// (empty = database default). Mirrors CreateTableStmt.Tablespace.
 	// M0122-0007.
 	Tablespace string
+	// WithOptionNames holds every `WITH (...)` storage-parameter NAME exactly as
+	// written (including any `ns.` prefix), in source order — the names the
+	// typed fields above deliberately discard as well as the ones they keep.
+	// The typed fields alone cannot answer "was this name recognized?", so
+	// execCreateIndex validates against this list to reproduce PG's
+	// `unrecognized parameter "x"` / `unrecognized parameter namespace "x"`
+	// (index_reloptions -> parseRelOptions, reloptions.c:1488 / :1275).
+	// M0134-0160.
+	WithOptionNames []string
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key

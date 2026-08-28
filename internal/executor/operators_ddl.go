@@ -2598,14 +2598,15 @@ afterExistsCheck:
 	if s.WithOIDS {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tables declared WITH OIDS are not supported"}
 	}
-	// Validate storage parameter names: double-quoted names are case-sensitive,
-	// and all recognized option names are lowercase. A mixed-case key means the
-	// user wrote WITH ("Fillfactor" = 10) which PG rejects as unrecognized.
-	for k := range s.With {
-		if k != strings.ToLower(k) {
-			return &ExecError{Code: "42000", Pos: s.Pos(),
-				Message: fmt.Sprintf("unrecognized parameter %q", k)}
-		}
+	// Validate storage parameter names and namespaces against PG's reloption
+	// registry (reloptions_catalog.go). This subsumes the old mixed-case-only
+	// check — double-quoted names are case-sensitive and every recognized name
+	// is lowercase, so WITH ("Fillfactor" = 10) simply misses the registry —
+	// and additionally rejects names nothing below looks for, which used to be
+	// silently accepted and dropped. Heap relations declare the `toast`
+	// namespace (DefineRelation passes HEAP_RELOPT_NAMESPACES). M0134-0160.
+	if verr := validateRelOptionMap(s.With, relOptHeap, true, true, s.Pos()); verr != nil {
+		return verr
 	}
 	// Extract and bounds-check the fillfactor storage parameter so it can be
 	// persisted on the catalog table (and surfaced through pg_class.reloptions
@@ -4972,12 +4973,10 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		return &ExecError{Code: "42P16", Pos: s.Pos(),
 			Message: "ON COMMIT can only be used on temporary tables"}
 	}
-	// Validate storage parameter names (same rule as execCreateTable).
-	for k := range s.With {
-		if k != strings.ToLower(k) {
-			return &ExecError{Code: "42000", Pos: s.Pos(),
-				Message: fmt.Sprintf("unrecognized parameter %q", k)}
-		}
+	// Validate storage parameter names/namespaces (same rule as execCreateTable).
+	// M0134-0160.
+	if verr := validateRelOptionMap(s.With, relOptHeap, true, true, s.Pos()); verr != nil {
+		return verr
 	}
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
 		// No storage: create an empty table with no columns.
@@ -5133,11 +5132,8 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// the leaf's fillfactor persists on pg_class.reloptions and round-trips
 	// through pg_dump, mirroring the non-partition CREATE TABLE path above.
 	// M0110-0001 (DU-002 slice 191).
-	for k := range s.With {
-		if k != strings.ToLower(k) {
-			return &ExecError{Code: "42000", Pos: s.Pos(),
-				Message: fmt.Sprintf("unrecognized parameter %q", k)}
-		}
+	if verr := validateRelOptionMap(s.With, relOptHeap, true, true, s.Pos()); verr != nil {
+		return verr
 	}
 	if s.PartitionBy != nil && len(s.With) > 0 {
 		return &ExecError{Code: "0A000", Pos: s.Pos(),
@@ -7479,6 +7475,17 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.String())}
 	}
+	// Reject unrecognized `WITH (...)` names/namespaces before ANY other index
+	// check. DefineIndex runs index_reloptions() well before index_create()
+	// reaches the name-conflict test (postgres/src/backend/commands/
+	// indexcmds.c), which is observable: reloptions.sql re-uses one index name
+	// across its negative cases and expects `unrecognized parameter "x"`, not
+	// "relation already exists". The admissible set is the access method's
+	// (amoptions); indexes declare no namespace, so a qualified name is always
+	// an unrecognized namespace. M0134-0160.
+	if verr := validateRelOptionNames(s.WithOptionNames, indexRelOptKind(s.Method), false, false, s.Pos()); verr != nil {
+		return verr
+	}
 	name := s.Name
 	if name == "" {
 		name = o.autoIndexNameWithIncludes(tbl, s.Columns, s.IncludeColumns, "idx")
@@ -8726,8 +8733,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					// catalog fields so pg_class.reloptions / pg_dump round-trip the
 					// change; only GIN fastupdate has runtime effect (toggles the
 					// predicate-gin SSI lock granularity between per-key and
-					// whole-index, design 0118-0140). Unrecognized options are
-					// accepted and ignored, matching the CREATE INDEX WITH path.
+					// whole-index, design 0118-0140). Names outside the access
+					// method's admissible set are rejected the way
+					// ATExecSetRelOptions -> index_reloptions() does; the
+					// recognized-but-unapplied ones are still ignored (ledgered,
+					// M0134-0160).
+					if verr := validateRelOptionMap(act.With, indexRelOptKind(idx.Method), false, false, act.Pos()); verr != nil {
+						return verr
+					}
 					for name, val := range act.With {
 						if strings.EqualFold(name, "fastupdate") {
 							if b, ok := parseReloptionBool(val); ok {
@@ -11400,13 +11413,21 @@ func (o *ddlOp) execAlterTableSetReloptions(tbl *catalog.Table, act parser.Alter
 		autovacEnabled   *bool
 		toastTupleTarget *int
 	)
+	// Validate every name/namespace against PG's reloption registry before
+	// applying anything. ATExecSetRelOptions picks the admissible set by
+	// relkind — view_reloptions for RELKIND_VIEW, heap_reloptions otherwise
+	// (postgres/src/backend/commands/tablecmds.c) — and passes
+	// HEAP_RELOPT_NAMESPACES either way. This subsumes the old mixed-case-only
+	// check and additionally rejects names the switch below silently dropped.
+	// M0134-0160.
+	setKind := relOptHeap
+	if tbl.View != nil && !tbl.IsMatView {
+		setKind = relOptView
+	}
+	if verr := validateRelOptionMap(act.With, setKind, true, false, pos); verr != nil {
+		return verr
+	}
 	for k, v := range act.With {
-		// Double-quoted mixed-case names are unrecognized (PG/CREATE reject them);
-		// all modeled option names are lowercase.
-		if k != strings.ToLower(k) {
-			return &ExecError{Code: "42000", Pos: pos,
-				Message: fmt.Sprintf("unrecognized parameter %q", k)}
-		}
 		switch k {
 		case "parallel_workers":
 			pw, convErr := strconv.Atoi(strings.TrimSpace(v))

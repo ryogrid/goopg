@@ -3076,6 +3076,12 @@ func TestViewSecurityInvokerSurfacesInPgClassReloptions(t *testing.T) {
 // name in sequence) surfaced a spurious "already exists" instead of its own
 // real error — masking the fillfactor-bounds check below it in the same test
 // block. Valid values (on/off/auto) must still succeed.
+//
+// M0134-0160: the access method here was `USING btree`, which real PG rejects
+// outright — `buffering` is RELOPT_KIND_GIST only, so btoptions() raises
+// `unrecognized parameter "buffering"` before any enum check runs (verified
+// against the PG 18.3 oracle). The enum check this test is about is only
+// reachable on a GiST index, so the statements now say `USING gist`.
 func TestCreateIndexBufferingEnumValidation(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -3084,7 +3090,7 @@ func TestCreateIndexBufferingEnumValidation(t *testing.T) {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
 
-	err := runDDL(t, ctx, `CREATE INDEX gbufidx ON gbuf USING btree (id) WITH (buffering = invalid_value)`)
+	err := runDDL(t, ctx, `CREATE INDEX gbufidx ON gbuf USING gist (id) WITH (buffering = invalid_value)`)
 	if err == nil {
 		t.Fatal("buffering=invalid_value: expected an enum-validation error, got nil")
 	}
@@ -3106,7 +3112,7 @@ func TestCreateIndexBufferingEnumValidation(t *testing.T) {
 	// resolves).
 	for _, v := range []string{"on", "off", "auto"} {
 		name := "gbufidx_" + v
-		if err := runDDL(t, ctx, `CREATE INDEX `+name+` ON gbuf USING btree (id) WITH (buffering = `+v+`)`); err != nil {
+		if err := runDDL(t, ctx, `CREATE INDEX `+name+` ON gbuf USING gist (id) WITH (buffering = `+v+`)`); err != nil {
 			t.Errorf("buffering=%s: expected success, got %v", v, err)
 		}
 	}
