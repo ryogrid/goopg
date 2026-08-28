@@ -273,9 +273,35 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 	switch strings.ToLower(typeName) {
 	case "regclass":
 		connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
-		schema, rel, nameOK := splitRegQualifiedName(name)
+		segs, nameOK := splitRegIdentifiers(name)
 		if !nameOK {
 			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
+		}
+		// regclassin feeds the parsed name list through makeRangeVarFromNameList
+		// (namespace.c:3556-3580), which accepts at most three segments —
+		// catalog.schema.relation — and raises a 42601 SYNTAX_ERROR beyond that.
+		// Every other reg* type resolves a one- or two-segment name and never
+		// reaches this rule, so it lives in the regclass arm only. M0134-0168.
+		if len(segs) > 3 {
+			return NullDatum, &ExecError{Code: "42601", Pos: pos,
+				Message: "improper relation name (too many dotted names): " + strings.Join(segs, ".")}
+		}
+		// A three-segment name names a catalog explicitly; RangeVarGetRelidExtended
+		// (namespace.c:455-462) rejects it unless the catalog is the current
+		// database, since PG has no cross-database references. The message quotes
+		// the WHOLE dotted name, unlike the miss message below.
+		if len(segs) == 3 {
+			if !strings.EqualFold(segs[0], ctx.CurrentDatabase) {
+				return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+					Message: fmt.Sprintf("cross-database references are not implemented: %q", strings.Join(segs, "."))}
+			}
+			segs = segs[1:]
+		}
+		var schema, rel string
+		if len(segs) == 1 {
+			rel = segs[0]
+		} else {
+			schema, rel = segs[0], segs[1]
 		}
 		objName := parser.ObjectName{Schema: schema, Name: rel}
 		if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {

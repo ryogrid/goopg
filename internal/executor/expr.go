@@ -927,25 +927,20 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			case KindInt:
 				return NewStringDatum(regclassOIDToName(ctx, connDBOid, uint32(v.Int))), nil
 			case KindString:
-				// Shared SplitIdentifierString port: a quoted relation name
-				// (`'"My Table"'::regclass`) must be unquoted before the catalog
-				// lookup, and a syntax error raises regclassin's 42602.
-				// M0119-0006 (72nd slice, deferral row 1341) — the input half of
-				// RegOut's quote-emission; sibling of regIdentifierInput.
-				schema, rel, nameOK := splitRegQualifiedName(v.StringValue())
-				if !nameOK {
-					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
-				}
-				objName := parser.ObjectName{Schema: schema, Name: rel}
-				if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
-					return NewIntDatum(int64(tbl.OID)), nil
-				}
-				// Also resolve index names: 'idx_name'::regclass returns the index OID.
-				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if idx, found := im.LookupIndex(objName, connDBOid); found && idx != nil {
-						return NewIntDatum(int64(idx.OID)), nil
-					}
-				}
+				// Delegate the whole NAME path to regIdentifierInput — the
+				// shared regclassin port (reg_identifier.go). This arm used to
+				// re-implement the parse+lookup inline and then FALL THROUGH on
+				// a miss, so `'nosuch'::regclass` silently returned the raw name
+				// string instead of regclassin's 42P01 (regproc.c:989
+				// RangeVarGetRelid(..., missing_ok=false)); the bogus regclass
+				// value only surfaced later as a nonsense
+				// `invalid input syntax for type oid` when psql's \sv cast it on
+				// to oid. Delegating also picks up parseDashOrOid
+				// (regproc.c:1865): `'-'::regclass` is InvalidOid and a
+				// pure-digit string is a numeric OID, neither of which is a name
+				// to resolve. Sibling of the heap-write/array/EXECUTE-parameter
+				// callers of the same primitive (Hard-won Rule #2). M0134-0168.
+				return regIdentifierInput(v, "regclass", ctx, x.Pos())
 			}
 		}
 		if strings.EqualFold(x.TargetType, "regdictionary") && ctx != nil && ctx.Catalog != nil {
