@@ -1672,3 +1672,57 @@ is the second time in this migration that a test which looked like a guard was
 structurally unable to fail (the first was `TestLegacyCorpusParity` silently
 `continue`-ing whenever either parser rejected). Worth a standing habit:
 **make a guard fail on purpose once before trusting it.**
+
+### Out-of-scope red found while probing: TestPrepareExecuteRejectsResultTypeChange
+
+`internal/postmaster`'s `TestPrepareExecuteRejectsResultTypeChange` fails with
+`read frame: EOF`. It is NOT a migration regression — it fails identically on
+`master` and on `f5613d73f`, the commit before the first permanent routing
+flip. It has been invisible because `scripts/ralph-precommit-test.sh` EXCLUDES
+`internal/postmaster` from the units scope (along with testport and the
+cluster testutils), so the gate that has been reporting 43/43 green never runs
+it. Recorded here rather than fixed; it belongs to whoever owns the extended
+protocol's prepared-statement path.
+
+## P7.2 cutover, part 2: the legacy statement parsers are deleted
+
+1,224 lines gone — 1,128 of them from parser.go — and 23 dispatch arms with
+them. What stays is exactly what production still reaches: the compat token
+walks for CREATE/ALTER OPERATOR, TEXT SEARCH, CAST and friends, the shared
+helpers the grammar CALLS (normalizeFloatTypeName, decodeBitStringLit,
+foldSubstringSimilar, resolveColumnNotNull, similarto, …), the lexer, the AST,
+and the error machinery.
+
+### The deletion was MEASURED, not reasoned
+
+Reasoning about which arms the vetoes could still reach would have been
+guesswork. Instead each arm got a probe that recorded a stack trace, and the
+whole unit corpus — parser, executor, analyzer, optimizer, postmaster — ran
+against it. Only what the probe HIT was kept. Then a call-graph pass over
+`func (p *parser)` methods, iterated to a fixed point, removed the 31 that
+became unreachable.
+
+That loop found **three routing defects**, each of which silently sent a WHOLE
+BATCH to the legacy parser, and none of which any existing test could detect:
+
+| defect | effect |
+|---|---|
+| an EMPTY fragment vetoed the batch | one stray extra semicolon (`BEGIN; COMMIT;;`) selected the old parser for everything |
+| `firstMeaningful` treated a bare `;` as a statement | same root: a separator counted as a fragment worth routing |
+| a CTE NAME that is a keyword was read as the follower query | `WITH index AS (…)` — pg_amcheck declares exactly that — answered `routedStmts["index"]`, i.e. false |
+
+Fixing the third introduced a fourth, caught by the same loop: keying "is this
+a CTE name?" on a following `AS` or `(` also matched `SELECT (SELECT …)`, so
+the scan ran past the follower query. The `!routedStmts[kw]` guard fixes it.
+Without an empirical loop none of these would have surfaced — they are all
+silent FALLBACKS, and a fallback to a parser that still works looks like
+success.
+
+### Still on the legacy path, by design
+
+`parseCreate` / `parseAlter` / `parseDrop` / `parseCopy` / `parseExplain` /
+`parseStatementWithCTE` stay: their vetoes (createRoutineRouted, commentRouted,
+copyRouted, alterDomainRouted, alterIndexRouted, alterViewRouted,
+alterMatviewRouted, explainInnerRouted) decline the ~1.7% of the regress corpus
+whose classes the grammar deliberately does not own — the parse-and-ignore
+compat scanners surveyed under "P7.2 scope, measured".

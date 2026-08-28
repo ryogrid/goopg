@@ -122,12 +122,24 @@ func routeBatch(src string, toks []Token) ([]Stmt, bool, error) {
 		return nil, false, nil // let legacy decide what an empty batch means
 	}
 	for _, f := range frags {
+		if firstMeaningful(f) == nil {
+			// An EMPTY fragment — the `;;` in `BEGIN; COMMIT;;` — produces no
+			// statement at all, so it is no reason to hand the whole batch
+			// back. It used to veto: fragmentRouted returns false for it, and
+			// one false sends every fragment to the legacy parser. That made
+			// a stray extra semicolon silently select the OLD parser for the
+			// entire batch.
+			continue
+		}
 		if !fragmentRouted(f) {
 			return nil, false, nil
 		}
 	}
 	var all []Stmt
 	for _, f := range frags {
+		if firstMeaningful(f) == nil {
+			continue
+		}
 		stmts, err := ParseOneSrc(src, f)
 		if err != nil {
 			return nil, true, err
@@ -209,6 +221,19 @@ func withFollowerRouted(toks []Token) bool {
 			// EVERY recursive CTE — routedStmts["recursive"] — stayed legacy.
 			continue
 		default:
+			if !routedStmts[kw] && i+1 < len(toks) && isCTENameFollower(toks[i+1]) {
+				// A CTE NAME, not the follower query's keyword. goopg's lexer
+				// classifies unreserved words as keywords, so a CTE called
+				// `index` (pg_amcheck declares one) reached this arm and
+				// answered routedStmts["index"] — false — sending the whole
+				// batch to the legacy parser.
+				//
+				// The !routedStmts guard is load-bearing: `SELECT (SELECT …)`
+				// puts a '(' right after SELECT, so without it the follower
+				// query itself looked like a CTE name with a column list and
+				// the scan ran off the end.
+				continue
+			}
 			return routedStmts[kw]
 		}
 	}
@@ -216,6 +241,15 @@ func withFollowerRouted(toks []Token) bool {
 }
 
 
+
+// isCTENameFollower reports whether tok is what follows a CTE's NAME: the AS
+// keyword, or the '(' that opens its column alias list.
+func isCTENameFollower(tok Token) bool {
+	if tok.Kind == TokenSymbol && tok.Value == "(" {
+		return true
+	}
+	return (tok.Kind == TokenKeyword || tok.Kind == TokenIdent) && strings.EqualFold(tok.Value, "as")
+}
 
 // explainInnerRouted routes an EXPLAIN only when the statement it wraps
 // would be routed on its own: skip the bare ANALYZE / VERBOSE words and a
@@ -796,8 +830,15 @@ func alterActionRouted(a []string) bool {
 
 func firstMeaningful(frag []Token) *Token {
 	for i := range frag {
-		switch frag[i].Kind {
-		case TokenEOF:
+		switch {
+		case frag[i].Kind == TokenEOF:
+			continue
+		case frag[i].Kind == TokenSymbol && frag[i].Value == ";":
+			// A bare `;` is a STATEMENT SEPARATOR, not a statement. It shows
+			// up as its own fragment for the second semicolon of `BEGIN;
+			// COMMIT;;`, and treating it as meaningful made fragmentRouted
+			// say UNROUTED — which sent the WHOLE batch to the legacy parser,
+			// so a stray extra semicolon silently selected the old parser.
 			continue
 		default:
 			return &frag[i]

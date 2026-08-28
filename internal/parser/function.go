@@ -597,27 +597,6 @@ func (p *parser) parseProcedureArg() (FunctionArg, error) {
 	return p.parseArgNameAndType(pos, arg)
 }
 
-// rejectStageBModes returns an error if the current token is an
-// OUT / INOUT / VARIADIC keyword, which are not valid in CREATE FUNCTION.
-func (p *parser) rejectStageBModes(pos int) error {
-	if p.cur().Kind == TokenIdent {
-		if isReservedFutureMode(p.cur().Value) {
-			return p.errAtCur(fmt.Sprintf(
-				"function argument mode %q is not supported in v0 (Stage A: IN only)",
-				p.cur().Value))
-		}
-	}
-	if p.cur().Kind == TokenKeyword {
-		switch p.cur().Keyword {
-		case KwOut, KwInout, KwVariadic:
-			return p.errAtCur(fmt.Sprintf(
-				"function argument mode %q is not supported in v0 (Stage A: IN only)",
-				p.cur().Value))
-		}
-	}
-	return nil
-}
-
 // parseArgNameAndType handles the common `[name] type [DEFAULT expr]` portion
 // shared by parseFunctionArg and parseProcedureArg.
 func (p *parser) parseArgNameAndType(pos int, arg FunctionArg) (FunctionArg, error) {
