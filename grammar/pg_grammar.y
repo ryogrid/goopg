@@ -105,7 +105,7 @@
 %type <node>	ext_opt
 %type <expr>	opt_policy_using opt_policy_check
 %type <str>	drop_compat_kind opclass_or_family drop_arg_type op_run op_char
-%type <qn>	any_operator_name
+%type <qn>	any_operator_name qual_op
 %type <str>	trig_arg comment_text alter_routine_kind alter_fn_owner
 %type <fargs>	opt_comment_args
 %type <qn>	trig_func
@@ -2464,6 +2464,18 @@ a_expr:
 			{
 				$$ = NewUnaryOp($<p>1, prefixOp(yylex, $1), $2)
 			}
+	/* Schema-qualified spellings of the two rules above — gram.y :15009 and
+	   :15011 reach them through qual_Op. `%prec Op` is mandatory: the rule
+	   bodies end in a nonterminal, so without it yacc would take the rule's
+	   precedence from ')' . */
+	| a_expr qual_op a_expr %prec Op
+			{
+				$$ = NewBinaryOp($2.pos, binOp(yylex, qualOpName($2)), $1, $3)
+			}
+	| qual_op a_expr %prec Op
+			{
+				$$ = qualPrefixExpr(yylex, $1, $2)
+			}
 	/* op ANY/SOME/ALL — gram.y :15150ff quantified comparisons via
 	   subquery_Op subset. */
 	/* LIKE / ILIKE quantified over a list — legacy folds these into the IN
@@ -3085,6 +3097,17 @@ b_expr:
 			{
 				$$ = NewUnaryOp($<p>1, prefixOp(yylex, $1), $2)
 			}
+	/* b_expr's qual_Op pair — gram.y :15488 and :15490. BETWEEN's operands are
+	   b_expr, so without these `x BETWEEN OPERATOR(pg_catalog.-) 1 AND 1` and
+	   `a OPERATOR(pg_catalog.||) b BETWEEN ...` would not parse. */
+	| b_expr qual_op b_expr %prec Op
+			{
+				$$ = NewBinaryOp($2.pos, binOp(yylex, qualOpName($2)), $1, $3)
+			}
+	| qual_op b_expr %prec Op
+			{
+				$$ = qualPrefixExpr(yylex, $1, $2)
+			}
 
 opt_func_call_args:
 		/* empty */ { $$ = nil }
@@ -3357,6 +3380,30 @@ subq_op:
 	| GREATER_EQUALS { $$ = ">=" }
 	| NOT_EQUALS     { $$ = "<>" }
 
+/* qual_op — the OPERATOR(...) half of gram.y's `qual_Op` (gram.y:16658).
+   Upstream's qual_Op is `Op | OPERATOR '(' any_operator ')'`; the bare-Op half
+   already has its own alternatives on a_expr/b_expr (and '+' '-' '=' '<' '>'
+   arrive as char terminals with alternatives of their own), so only the
+   parenthesised spelling is new. Kept as a SEPARATE nonterminal rather than
+   folded into the existing `a_expr Op a_expr` rules so those proven rules and
+   their positions are untouched.
+
+   The operand is any_operator_name (goopg_ext.y), which is already gram.y's
+   `any_operator` minus the >1-qualifier recursion: `schema.op`, with op_run
+   rejoining the per-character Op tokens the lexer splits. It is bounded by the
+   ')' here, so op_run's greedy join stays unambiguous.
+
+   qname.pos carries the OPERATOR keyword's offset, which is where upstream
+   anchors the resulting A_Expr (`@2` of gram.y:15009 is the start of qual_Op).
+   psql reaches this rule on every `\d <pattern>` meta-command: processSQLNamePattern
+   (postgres/src/fe_utils/string_utils.c:1121-1152) emits
+   `<namevar> OPERATOR(pg_catalog.~) '^(pat)$' COLLATE pg_catalog.default`. */
+qual_op:
+		OPERATOR '(' any_operator_name ')'
+			{
+				$$ = qname{parts: $3.parts, pos: $<p>1}
+			}
+
 /* Identifier context aliases — gram.y :17632-17720. Generated lists come */
 /* from kwlists_gen.y. */
 ColId:
@@ -3413,9 +3460,17 @@ any_or_some:
 		ANY       { }
 	| SOME        { }
 
+/* gram.y spells the COLLATE operand `any_name` (:14867), and any_name's second
+   component is `attrs: '.' attr_name` with `attr_name: ColLabel` (:9161,
+   :17724) — ColLabel there is upstream's all-keywords label, which this
+   grammar calls as_col_label. Using ColId for it rejected `COLLATE
+   pg_catalog.default`, the spelling psql appends to every pattern-matching
+   \d query (processSQLNamePattern, fe_utils/string_utils.c:1121) and the one
+   `default` is RESERVED in, so it is unreachable through ColId. The qualifier
+   is still discarded: goopg resolves collations by bare name. */
 collation_name:
-		ColId              { $$ = $1 }
-	| ColId '.' ColId      { $$ = $3 }
+		ColId                    { $$ = $1 }
+	| ColId '.' as_col_label     { $$ = $3 }
 
 as_col_label:
 		ColLabel          { $$ = $1 }

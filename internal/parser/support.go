@@ -605,6 +605,37 @@ func binOp(l yyLexer, s string) OpCode {
 	return OpUnknown
 }
 
+// qualOpName returns the operator spelling of an OPERATOR(...) name. goopg's
+// AST has no schema-qualified operator node — every operator is an OpCode —
+// so the qualifier is dropped and only the spelling survives. Upstream
+// resolves the name in the named schema (oper() via LookupOperName,
+// postgres/src/backend/parser/parse_oper.c:99), which goopg cannot do because
+// it has no user-defined operators; see the deferral ledger row for
+// M0134-0158.
+func qualOpName(q qname) string {
+	if len(q.parts) == 0 {
+		return ""
+	}
+	return q.parts[len(q.parts)-1]
+}
+
+// qualPrefixExpr builds gram.y's `qual_Op a_expr %prec Op` (gram.y:15011) for
+// the OPERATOR(...) spelling. '-' and '+' have their own char-terminal
+// alternatives on the bare-Op path, so they can only reach a prefix position
+// through OPERATOR(...); route them to the same constructors those rules use
+// so `OPERATOR(pg_catalog.-) 1` folds to the same IntegerConst{-1} that `-1`
+// does (§12.5's doNegate note). Everything else goes through prefixOp, which
+// keeps the narrow {~} prefix set the bare-Op rule pins.
+func qualPrefixExpr(l yyLexer, q qname, operand Expr) Expr {
+	switch qualOpName(q) {
+	case "-":
+		return foldNegate(q.pos, operand)
+	case "+":
+		return NewUnaryOp(q.pos, OpUnaryPos, operand)
+	}
+	return NewUnaryOp(q.pos, prefixOp(l, qualOpName(q)), operand)
+}
+
 // whens is a CaseWhen list carrier (union field).
 type whenList struct {
 	items []CaseWhen
