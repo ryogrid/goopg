@@ -87,8 +87,10 @@ var errGrantorMustBeCurrentUser = errors.New("grantor must be current user")
 // as the aclitem's grantor, and the only role an explicit GRANTED BY clause
 // may legally name (see errGrantorMustBeCurrentUser). Only a non-nil error
 // return (a GRANTED BY mismatch) should abort the statement; every other early
-// return is an intentional silent no-op.
-func (s *Server) tryRecordTableGrant(stmt string, actingRole string) error {
+// return is an intentional silent no-op. searchPath is the session's effective
+// search_path (searchPathSchemas(sess)), used to resolve an unqualified object
+// name — see grantTableLookup.
+func (s *Server) tryRecordTableGrant(stmt string, actingRole string, searchPath []string) error {
 	if s.cfg.Catalog == nil {
 		return nil
 	}
@@ -200,9 +202,10 @@ func (s *Server) tryRecordTableGrant(stmt string, actingRole string) error {
 	}
 	tables := splitGrantList(objPart)
 	roles := splitRoleGrantList(rolePart)
+	lookup := s.grantTableLookup(searchPath)
 	for _, t := range tables {
 		on := objectNameFromIdent(t)
-		tbl, ok := s.cfg.Catalog.LookupTable(on)
+		tbl, ok := lookup.LookupTable(on)
 		if !ok {
 			continue
 		}
@@ -237,8 +240,10 @@ func (s *Server) tryRecordTableGrant(stmt string, actingRole string) error {
 // membership, REVOKE GRANT OPTION FOR) simply returns, leaving the statement as
 // a successful no-op. Recording the revoke keeps the materialized relacl in
 // sync so pg_dump re-emits only the privileges that actually remain. DU-002
-// slice 338.
-func (s *Server) tryRecordTableRevoke(stmt string) {
+// slice 338. searchPath mirrors tryRecordTableGrant's (see grantTableLookup):
+// a REVOKE must resolve the same relation the matching GRANT did, or the two
+// recorders disagree about which table the ACL belongs to.
+func (s *Server) tryRecordTableRevoke(stmt string, searchPath []string) {
 	if s.cfg.Catalog == nil {
 		return
 	}
@@ -332,9 +337,10 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 	}
 	tables := splitGrantList(objPart)
 	roles := splitRoleGrantList(rolePart)
+	lookup := s.grantTableLookup(searchPath)
 	for _, t := range tables {
 		on := objectNameFromIdent(t)
-		tbl, ok := s.cfg.Catalog.LookupTable(on)
+		tbl, ok := lookup.LookupTable(on)
 		if !ok {
 			continue
 		}
@@ -772,6 +778,28 @@ func splitFunctionList(list string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+// grantTableLookup resolves a GRANT/REVOKE object name to a relation the way
+// the rest of the engine resolves an unqualified name: through the session's
+// search_path.
+//
+// The recorders are hand-written token scanners that run BEFORE the executor
+// (query.go's autocommit fast path), so they never see an executor.Context and
+// used to call Catalog.LookupTable directly. That bare lookup only tries the
+// exact key, then "public.<name>", then "pg_catalog.<name>" — so a GRANT naming
+// an unqualified table in any OTHER schema resolved to nothing and the recorder
+// silently no-oped, reporting "GRANT" while recording no aclitem at all. Every
+// upstream regress case that does `SET search_path = <schema>` and then grants
+// unqualified (rowsecurity.sql:35-36 is the canonical one) therefore ran its
+// whole body with an empty relacl. Wrapping the catalog in the same
+// SearchPathCatalog the planner uses fixes the resolution without duplicating
+// the fallback order. M0134-0163.
+func (s *Server) grantTableLookup(searchPath []string) catalog.Catalog {
+	if len(searchPath) == 0 {
+		return s.cfg.Catalog
+	}
+	return catalog.WithSearchPath(s.cfg.Catalog, func() []string { return searchPath })
 }
 
 // objectNameFromIdent builds an ObjectName from a possibly schema-qualified

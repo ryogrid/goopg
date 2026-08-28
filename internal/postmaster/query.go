@@ -226,7 +226,7 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 		if connTx != nil {
 			actingRole = connTx.NonSuperuserRole
 		}
-		if err := s.tryRecordTableGrant(matchable, actingRole); err != nil {
+		if err := s.tryRecordTableGrant(matchable, actingRole, searchPathSchemas(sess)); err != nil {
 			return s.writeQueryError(w, errcodes.FeatureNotSupported, err.Error())
 		}
 		if err := w.WriteCommandComplete("GRANT"); err != nil {
@@ -240,7 +240,7 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// what remains (DU-002 slice 338). Like GRANT it is left to the executor's
 	// no-op path inside an explicit transaction.
 	if strings.HasPrefix(upper, "REVOKE ") && !isHeapACLObject && (connTx == nil || !connTx.InExplicit()) {
-		s.tryRecordTableRevoke(matchable)
+		s.tryRecordTableRevoke(matchable, searchPathSchemas(sess))
 		if err := w.WriteCommandComplete("REVOKE"); err != nil {
 			return err
 		}

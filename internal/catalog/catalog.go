@@ -16901,22 +16901,81 @@ func (c *InMemory) MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs [
 	byRole[owner] = privs
 }
 
-// HasTablePrivilege reports whether role was granted priv on relOID. M0118-0008.
+// HasTablePrivilege reports whether role holds priv on relOID. M0118-0008.
+//
+// This is goopg's aclmask() (postgres/src/backend/utils/adt/acl.c:1389), and
+// it matches grantees exactly the way that function's two loops do:
+//
+//  1. an aclitem whose grantee is `role` itself, OR whose grantee is PUBLIC
+//     (`aidata->ai_grantee == ACL_ID_PUBLIC || aidata->ai_grantee == roleid`),
+//     counts directly;
+//  2. any *other* aclitem counts too when `has_privs_of_role(roleid,
+//     aidata->ai_grantee)` — i.e. privileges reach a role indirectly through
+//     the INHERIT-marked role memberships it holds.
+//
+// Only step 1's direct-grantee half existed before M0134-0163, so
+// `GRANT ... TO PUBLIC` and `GRANT ... TO <group>` both parsed, both landed in
+// relacl, and neither granted anything: the recorded aclitem was keyed under
+// publicPseudoRole / the group's name and the lookup only ever probed the
+// querying role's own key.
+//
+// Locking note: HasPrivsOfRole and RoleOID take c.mu themselves, so the
+// indirect grantees are collected under the read lock and adjudicated after it
+// is dropped. That also mirrors aclmask's own ordering rationale ("we do this
+// in a separate pass to minimize expensive indirect membership tests") — the
+// `privs[priv]` pre-filter below is aclmask's `aidata->ai_privs & remaining`
+// guard, which skips the membership test for aclitems that could not help.
 func (c *InMemory) HasTablePrivilege(relOID uint32, role, priv string) bool {
 	role = strings.ToLower(strings.TrimSpace(role))
 	priv = strings.ToUpper(strings.TrimSpace(priv))
+
+	var indirect []string
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
+		c.mu.RUnlock()
 		return false
 	}
-	privs := byRole[role]
-	if privs == nil {
+	for _, grantee := range [2]string{role, publicPseudoRole} {
+		if privs := byRole[grantee]; privs != nil {
+			if _, ok := privs[priv]; ok {
+				c.mu.RUnlock()
+				return true
+			}
+		}
+	}
+	for grantee, privs := range byRole {
+		if grantee == role || grantee == publicPseudoRole {
+			continue // already checked it
+		}
+		if _, ok := privs[priv]; !ok {
+			continue
+		}
+		indirect = append(indirect, grantee)
+	}
+	c.mu.RUnlock()
+
+	if len(indirect) == 0 || role == "" {
 		return false
 	}
-	_, ok := privs[priv]
-	return ok
+	memberOid, ok := c.RoleOID(role)
+	if !ok {
+		return false
+	}
+	// Deterministic order: map iteration is randomised, and an unknown
+	// grantee name must never make the answer depend on which entry was
+	// visited first.
+	sort.Strings(indirect)
+	for _, grantee := range indirect {
+		granteeOid, ok := c.RoleOID(grantee)
+		if !ok {
+			continue
+		}
+		if c.HasPrivsOfRole(memberOid, granteeOid) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsOwnerACLRevoked reports whether relOID's owner has had its implicit

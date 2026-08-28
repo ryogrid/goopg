@@ -1501,3 +1501,57 @@ func TestParameterACLEntries(t *testing.T) {
 		t.Errorf("entry[1] = %+v, want {OID:%d Parname:work_mem}", got[1], oidWM)
 	}
 }
+
+// TestHasTablePrivilegeAclmaskGranteeMatching pins the two grantee-matching
+// rules HasTablePrivilege inherited from aclmask()
+// (postgres/src/backend/utils/adt/acl.c:1389) in M0134-0163: an aclitem whose
+// grantee is PUBLIC counts for every role, and an aclitem granted to some
+// other role counts for the roles that hold has_privs_of_role() over it.
+// Before M0134-0163 the lookup probed only the querying role's own key, so
+// `GRANT ... TO PUBLIC` and `GRANT ... TO <group>` were recorded in relacl and
+// then granted nobody anything — the dominant root cause of rowsecurity.sql's
+// 165 spurious "permission denied for table" errors.
+func TestHasTablePrivilegeAclmaskGranteeMatching(t *testing.T) {
+	c := NewInMemory()
+	const relPublic, relGroup = 16950, 16951
+
+	c.RegisterRoleWithOID("grp", 20000)
+	c.RegisterRoleWithOID("member", 20001)
+	c.RegisterRoleWithOID("noinherit_member", 20002)
+	c.RegisterRoleWithOID("outsider", 20003)
+	c.GrantRoleMembership(20000, 20001, 10, nil, boolPtr(true), nil)
+	c.GrantRoleMembership(20000, 20002, 10, nil, boolPtr(false), nil)
+
+	// (1) GRANT ... TO PUBLIC reaches every role, including one that has no
+	// aclitem of its own (aclmask's `ai_grantee == ACL_ID_PUBLIC` arm).
+	c.GrantTablePrivilege(relPublic, "public", "SELECT")
+	for _, role := range []string{"member", "outsider", "noinherit_member"} {
+		if !c.HasTablePrivilege(relPublic, role, "SELECT") {
+			t.Errorf("HasTablePrivilege(%s, SELECT) after GRANT TO PUBLIC = false; want true", role)
+		}
+	}
+	// PUBLIC confers only what was granted: INSERT was not.
+	if c.HasTablePrivilege(relPublic, "outsider", "INSERT") {
+		t.Errorf("HasTablePrivilege(outsider, INSERT) = true; the PUBLIC grant covered SELECT only")
+	}
+
+	// (2) A grant to a group reaches its INHERIT members (aclmask's second
+	// pass, `has_privs_of_role(roleid, aidata->ai_grantee)`), but not a
+	// NOINHERIT member (whose privileges need an explicit SET ROLE) and not a
+	// non-member.
+	c.GrantTablePrivilege(relGroup, "grp", "SELECT")
+	if !c.HasTablePrivilege(relGroup, "member", "SELECT") {
+		t.Errorf("HasTablePrivilege(member, SELECT) via INHERIT group membership = false; want true")
+	}
+	if c.HasTablePrivilege(relGroup, "noinherit_member", "SELECT") {
+		t.Errorf("HasTablePrivilege(noinherit_member, SELECT) = true; NOINHERIT blocks privilege inheritance")
+	}
+	if c.HasTablePrivilege(relGroup, "outsider", "SELECT") {
+		t.Errorf("HasTablePrivilege(outsider, SELECT) = true; want false — not a member of grp")
+	}
+	// The group's own grant still does not leak the owner's sentinel entry to
+	// a member: only SELECT was granted to grp.
+	if c.HasTablePrivilege(relGroup, "member", "DELETE") {
+		t.Errorf("HasTablePrivilege(member, DELETE) = true; only SELECT was granted to grp")
+	}
+}
