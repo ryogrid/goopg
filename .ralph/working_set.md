@@ -1,46 +1,56 @@
-Task just completed: M-NIGHTLY AI-20260822-001356-003 —
-`testport/TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary`, the only
-nightly regression that still reproduces at HEAD (failed 6 nights running:
-20260822/23/24/25/27 + the in-flight 20260828-235424).
+Task just completed: **M0134-0157 — psql_pipeline.sql**, PARKED with a contained
+fix (`not-tried` → `failed`). 357 → 291 diff lines, `^+ERROR` 22 → 15.
 
-Diagnosis: NOT an engine regression. `pg_advisory_lock()` returns **void**; PG
-18.3 sends it as a NON-NULL zero-length value (oracle-verified on a throwaway
-PG 18.3 at /tmp: `... IS NULL` -> f, `pg_typeof` -> `void`). goopg's
-`evalAdvisoryLock` (internal/executor/expr.go:17924) has returned the same
-empty non-NULL datum since M0096-0003. The test scanned it into `sql.NullBool`
-and only ever passed because goopg serialized an empty non-null string as NULL
-on the wire; `fd24fa33c` (postmaster wire fix, M0134-0070, 2026-08-21) made the
-empty value real and `ParseBool("")` then failed. So a PG-parity FIX exposed a
-test asserting the old bug. Fix: that one call site now uses `ExecContext`,
-matching the two sibling void call sites in the same file (:39 / :105 use
-`sql.NullString`, :363 uses `ExecContext`).
+Only TWO root causes — rare for M0134, because one cascades over ~85% of the file:
 
-Files: internal/testport/advisory_lock_test.go (the fix), .ralph/fix_plan.md
-(nightly 20260827 section filed + advisory rows closed), .ralph/deferral_ledger.md
-(new row: void RESULT COLUMN TYPE OID gap).
+1. **(PARKED, REFACTOR-tier) goopg's extended protocol has no implicit
+   transaction block.** Execute auto-commits (`dispatch_extended.go:171-201`)
+   and `MsgSync` (`server.go:1820`) never touches `connTx`. PG never commits at
+   Execute: `XACT_FLAGS_PIPELINING` (postgres.c:2317) → `BeginImplicitTransactionBlock`
+   on the NEXT `start_xact_command` (xact.c:4326) → commit at Sync after
+   `EndImplicitTransactionBlock` (postgres.c:4968). So PG's FIRST command in a
+   message group is NOT in a block and every later one IS, and a mid-group
+   `BEGIN` converts the block in place so `ROLLBACK` undoes earlier statements.
+   goopg commits the pre-BEGIN INSERT → next pipeline hits a duplicate key in an
+   explicit block whose COMMIT is (correctly) skipped-until-Sync → session
+   aborted for ~300 lines. goopg already has the SIMPLE-path analogue
+   (`dispatch.go:1071`); design doc carries a 5-step port.
+2. **(LANDED) Bind/Describe protocol-error text parity** — exact upstream
+   strings incl. PG's unnamed-prepared-statement special case
+   (postgres.c:1671/:2669); both sibling lookups now share
+   `missingPreparedStatement`.
 
-Ledgered discovery: goopg reports `pg_typeof(pg_advisory_lock(0))` = `unknown`
-where PG reports `void` (OID 2278) — value bytes match, RowDescription type OID
-does not. Applies to every void builtin. Needs a void Datum kind + result-type
-inference + wire RowDescription work (pg_proc already has RetType 2278).
+Also landed (crash found by the gate, contained not root-fixed): `stmtSQL`
+(`dispatch.go`) sliced `sql[28:0]` and **panicked the backend / closed the
+client socket** for `CREATE TABLE …; PREPARE …; ALTER TABLE … ADD COLUMN …;
+EXECUTE …` because `AlterTableStmt.Pos()` is 0. Clamped + pinned; this also
+un-breaks the pre-existing red `TestPrepareExecuteRejectsResultTypeChange`.
 
-M-NIGHTLY filing done this loop: run 20260827-052222 (133 items) filed. Its
-132-item testport block sampled a MID-MIGRATION parser sha (846d651d884d, inside
-the goyacc rewrite, before e56d4f4fd + the #97 merge) — the failures are that
-intermediate grammar's 42601s in test SETUP. 18 verified stale (PASS at HEAD),
-110 marked "presumed stale, pending" — **the in-flight nightly 20260828-235424
-runs the SAME HEAD sha and adjudicates them: read
-ci/logs/20260828-235424/testport/results.csv FIRST next loop and tick them off
-in bulk** (at filing time it had exactly ONE --- FAIL, the advisory one, now fixed).
+Files: internal/postmaster/extended.go, internal/postmaster/dispatch.go,
+extended_bind_message_parity_test.go (new), stmt_sql_position_guard_test.go
+(new), docs/design/m0134-0157-extended-implicit-transaction-block.md (new) +
+README index, CSV + regen-testport, fix_plan, deferral_ledger (4 rows).
 
-Gates run: TestSyntax_Advisory* (5/5 PASS under cgroup cap), go vet
-./internal/testport, make ralph-state-guard, commit-hook pgbench smoke.
+Gates run: `internal/postmaster` full package **PASS** (was 1 pre-existing FAIL
+at HEAD); `RALPH_PRECOMMIT_SCOPE=units` PASS (exit 0); 6-file regress A/B
+(prepare / psql_pipeline / plpgsql / transactions / select / prepared_xacts) —
+no regressions, only psql_pipeline moved; `make check-testport-inventory` +
+`make regen-testport` PASS; `make ralph-state-guard` OK; commit-hook pgbench smoke.
 
-NEXT LOOP: adjudicate the 110 pending 20260827 rows from
-ci/logs/20260828-235424/testport/results.csv (bookkeeping, cheap), then per the
-Current Priority banner work **M0134-0156 (psql_crosstab.sql)**.
+In-flight: none of mine (throwaway server /tmp/gp5533 stopped).
 
-In-flight: none of mine. NOTE: the nightly batch run 20260828-235424 was still
-executing during this loop (pid ~640236 run-nightly.sh) — do not run a second
-`internal/testport` binary concurrently with its testport stage (wedge, ledger
-row 2026-08-28 P7.2-testport-concurrency).
+**Carried obligations (same two as last loop — nightly 20260828-235424 was still
+running for this entire loop):**
+1. **TPC-DS SF0.5 gate still NOT run** (for M0134-0156 and now -0157). Once the
+   nightly is done: `FORCE=1 GOOPG_BIN=$PWD/tmp/goopg-sf05-bin scripts/tpcds-sf05-regression.sh sweep`.
+2. **The 110 "presumed stale, pending" 20260827 rows are still unadjudicated** —
+   read `ci/logs/20260828-235424/testport/results.csv` when it finishes.
+   NOTE: that run's **testport stage looks WEDGED** — started 23:54, go-test.log
+   last written 23:59, still no growth at 01:40 (matches the known isolation
+   wedge); its 120m timeout fires ~01:54.
+
+NEXT LOOP: file any new `## AI-` items (action-items.md is still the 20260827
+file), then per the Current Priority banner work **M0134-0158 (publication.sql)**.
+Two smaller filed follow-ups exist if a short loop is wanted: M0134-0157a (parser
+`Pos()==0`, needs the goyacc playbook §12 read) and M0134-0157b (non-deterministic
+function overload resolution — plpgsql regress alternates 4401/4402 lines).

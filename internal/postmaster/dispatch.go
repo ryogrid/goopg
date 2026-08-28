@@ -2574,6 +2574,21 @@ func stmtSQL(sql string, stmts []parser.Stmt, idx int) string {
 	if end > len(sql) {
 		end = len(sql)
 	}
+	// Defensive clamp. Not every statement node carries a real position: some
+	// node kinds still report Pos() == 0 (see the deferral-ledger row
+	// 2026-08-29 "parser Pos() regression"), and a following statement whose
+	// Pos is 0 or below this statement's start otherwise produced an inverted
+	// slice — `sql[28:0]` — which panicked the whole backend goroutine and
+	// dropped the client connection on any multi-statement batch containing
+	// such a node. PostgreSQL cannot crash here (`pg_prepared_statements`
+	// stores the raw text captured at PREPARE time), so degrade to "the rest
+	// of the batch" rather than take the process down. M0134-0157.
+	if start < 0 || start > len(sql) {
+		start = 0
+	}
+	if end < start {
+		end = len(sql)
+	}
 	raw := strings.TrimRight(sql[start:end], " \t\n\r")
 	// PostgreSQL's pg_prepared_statements always shows a trailing semicolon.
 	if !strings.HasSuffix(raw, ";") {
