@@ -3201,7 +3201,7 @@ drop_compat_kind:
    DROP OPERATOR reports. */
 any_operator_name:
 		op_run                 { $$ = qname{parts: []string{$1}, pos: $<p>1} }
-	| ColId '.' op_run         { $$ = qname{parts: []string{$1, $3}, pos: $<p>1} }
+	| ColId '.' op_run         { $$ = qname{parts: []string{$1, $3}, pos: $<p>3} }
 
 op_run:
 		op_char                { $$ = $1 }

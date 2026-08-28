@@ -56,6 +56,10 @@ type lexerState struct {
 	// match.
 	lastIntervalNode Expr
 	lastIntervalRaw  string
+	// lastIntervalLitPos is the SCONST's own offset: the degraded zone is a
+	// StringConst anchored at the LITERAL, while the IntervalLit it replaces
+	// is anchored at the INTERVAL keyword.
+	lastIntervalLitPos int
 
 	// intoFor maps a simple_select's SelectStmt to the `SELECT ... INTO name`
 	// target recorded for it. Keyed by POINTER rather than kept in a single

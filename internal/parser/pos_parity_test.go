@@ -95,8 +95,23 @@ func collectPositions(v any) []string {
 // and the transaction-control statements — and matching legacy there means
 // passing 0, not inventing an offset.
 //
-// The remaining tail is tracked in docs/design/not_ralph/TODO.md.
-const posParityCeiling = 9
+// FOUR remain, and each is a goopg-ism with no PG counterpart rather than a
+// gap:
+//
+//   ALTER TABLE … DETACH PARTITION p       legacy 48 on a 48-byte statement
+//   ALTER TABLE … ADD CHECK (…) NOT VALID  legacy anchors at CHECK
+//   SELECT f(variadic array[…]::int[]) x2  legacy anchors the cast at '::',
+//                                          the VARIADIC path anchors it at
+//                                          the array's first element
+//
+// AlterTableCmd has no location field upstream (parsenodes.h) and
+// alter_table.out:4402 shows PG emitting these errors with NO caret at all,
+// so there is no "correct" offset to converge on for the first two. The
+// DETACH one is the past-the-end defect described above, kept visible here
+// rather than excused because its statement has a SECOND differing position.
+//
+// The rest of the history is in docs/design/not_ralph/TODO.md.
+const posParityCeiling = 4
 
 func TestPositionParity(t *testing.T) {
 	var bad []string

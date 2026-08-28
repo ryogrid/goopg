@@ -1648,7 +1648,7 @@ func tzZone(l yyLexer, zone Expr) Expr {
 	if !ok || ls.lastIntervalNode == nil || ls.lastIntervalNode != zone {
 		return zone
 	}
-	return NewStringConst(zone.Pos(), ls.lastIntervalRaw)
+	return NewStringConst(ls.lastIntervalLitPos, ls.lastIntervalRaw)
 }
 
 // ctasSrc carries CREATE TABLE ... AS's source, which is either a query or a

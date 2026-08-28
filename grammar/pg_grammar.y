@@ -1002,11 +1002,15 @@ simple_select:
 	| TABLE qualified_name
 			{
 				// gram.y :12968 desugars TABLE <rel> to SELECT * FROM <rel>.
+				// The synthesised RangeVar takes the TABLE keyword's offset,
+				// which is what select.go records for the desugar.
 				s := NewSelectStmt($<p>1)
-				rv := rangeVarFromName($2, "")
-				s.Targets = []ResTarget{NewResTarget(0, "", NewStarExpr(0, "", ""))}
+				rv := rangeVarFromName(qname{parts: $2.parts, pos: $<p>1}, "")
+				/* select.go's TABLE desugar stamps the STAR with the TABLE
+				   keyword but leaves the ResTarget wrapper at zero. */
+				s.Targets = []ResTarget{NewResTarget(0, "", NewStarExpr($<p>1, "", ""))}
 				s.From = []RangeVar{rv}
-				s.FromExprs = []FromExpr{{Base: rv}}
+				s.FromExprs = []FromExpr{{pos: $<p>1, Base: rv}}
 				$$ = s
 			}
 // opt_sort_clause / sort_by_list / SortBy — gram.y :13196-13220.
@@ -1805,7 +1809,7 @@ func_table_expr:
 	| ROWS FROM '(' row_from_list ')' opt_with_ordinality
 			{
 				ord := $6 == ordYes
-				$$ = &funcTable{ref: newTableFuncRef($<p>1, "", nil, ord, $4)}
+				$$ = &funcTable{ref: newTableFuncRef($<p>2, "", nil, ord, $4)}
 			}
 
 /* opt_ordinality — gram.y :14069: WITH_LA (base_yylex substitutes
@@ -2536,23 +2540,23 @@ a_expr:
 	   base[l:u], base[:u], base[l:], base[:] (M0097 array slice parity). */
 	| a_expr '[' a_expr ']'
 			{
-				$$ = NewArraySubscriptExpr($1.Pos(), $1, false, $3, nil)
+				$$ = NewArraySubscriptExpr($<p>2, $1, false, $3, nil)
 			}
 	| a_expr '[' a_expr ':' a_expr ']'
 			{
-				$$ = NewArraySubscriptExpr($1.Pos(), $1, true, $3, $5)
+				$$ = NewArraySubscriptExpr($<p>2, $1, true, $3, $5)
 			}
 	| a_expr '[' ':' a_expr ']'
 			{
-				$$ = NewArraySubscriptExpr($1.Pos(), $1, true, nil, $4)
+				$$ = NewArraySubscriptExpr($<p>2, $1, true, nil, $4)
 			}
 	| a_expr '[' a_expr ':' ']'
 			{
-				$$ = NewArraySubscriptExpr($1.Pos(), $1, true, $3, nil)
+				$$ = NewArraySubscriptExpr($<p>2, $1, true, $3, nil)
 			}
 	| a_expr '[' ':' ']'
 			{
-				$$ = NewArraySubscriptExpr($1.Pos(), $1, true, nil, nil)
+				$$ = NewArraySubscriptExpr($<p>2, $1, true, nil, nil)
 			}
 
 	/* [NOT] SIMILAR TO [+ ESCAPE] — gram.y :15080-15115; constant folding
@@ -2775,7 +2779,7 @@ c_expr:
 					e = NewNullConst($<p>1)
 				}
 				// Remember the raw body for AT TIME ZONE — see lastIntervalNode.
-				l.lastIntervalNode, l.lastIntervalRaw = e, $2
+				l.lastIntervalNode, l.lastIntervalRaw, l.lastIntervalLitPos = e, $2, $<p>2
 				$$ = e
 			}
 	/* GROUPING(a, b) — the SQL-standard pseudo-function, which legacy gives

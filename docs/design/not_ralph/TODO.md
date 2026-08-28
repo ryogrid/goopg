@@ -1583,4 +1583,24 @@ topLevelSelect), MERGE's WHEN clause anchors at WHEN, `ROWS FROM(...)` at
 ROWS, a parenthesised join at its '(', and `ALTER TABLE … SET TABLESPACE`
 at SET where ALTER INDEX's anchors at the tablespace NAME.
 
-Left at 9.
+### 9 -> 4: done
+
+The last round: array subscripts anchor at `[`, `ROWS FROM(...)` at the inner
+FROM (not ROWS), a qualified operator name at the OPERATOR part (not the
+schema), the `AT TIME ZONE INTERVAL '…'` zone — which select.go DEGRADES to a
+StringConst — at the LITERAL while the IntervalLit it replaces stays at the
+INTERVAL keyword, and the `TABLE t` desugar stamps its RangeVar, FromExpr and
+StarExpr with the TABLE keyword while leaving the ResTarget wrapper at zero.
+
+**FOUR remain, and none is a gap** — each is a goopg-ism with no PG
+counterpart:
+
+| statement | legacy | why it stays |
+|---|---|---|
+| `ALTER TABLE … DETACH PARTITION p` | 48 on a 48-byte statement | past-the-end; PG emits no caret |
+| `ALTER TABLE … ADD CHECK (…) NOT VALID` | anchors at CHECK | AlterTableCmd has no location upstream; CHECKBODY carries the two PAREN offsets, not the keyword's |
+| `SELECT f(variadic array[…]::int[])` ×2 | anchors the cast at `::` | the VARIADIC arg path anchors it at the array's first element |
+
+`TestPositionParity` is a two-way ratchet at 4. It began at **2058** — a class
+that was completely invisible until the test existed, because canonDump
+prints no positions.
