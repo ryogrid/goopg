@@ -158,21 +158,55 @@ scripts/pg-regress-runner.sh -v int4 float8    # specific tests, show diff on fa
 # see postgres/src/test/recovery/t/ and postgres/src/test/subscription/t/
 ```
 
-## Parser code (goyacc migration)
+## Parser code — READ THE PLAYBOOK FIRST
 
-The SQL parser is mid-migration from the hand-written recursive-descent
-parser (`internal/parser`) to a goyacc-generated LALR parser
-(`internal/sqlparser`, grammar in `grammar/*.y`), via the strangler dispatch
-in `internal/sqlparser/dispatch.go`. Before touching ANYTHING in `grammar/`,
-`internal/sqlparser/`, or parser routing, read:
+SQL parsing is a goyacc-generated LALR parser whose grammar lives in
+`grammar/*.y`; everything (parser, lexer, AST, the retained compat scanners)
+is in the single package `internal/parser`. The migration from the
+hand-written recursive-descent parser is COMPLETE — there is no
+`internal/sqlparser` any more, and no routing hook to wire.
 
-1. `docs/design/not_ralph/06-goyacc-parser-playbook.md` — build loop, goyacc
-   error decoder, `$n` arithmetic rules, conflict-gate discipline, span
-   capture cookbook, routing, step-by-step recipe for new statement classes
-2. `docs/design/not_ralph/TODO.md` — current wave status, conflict pin,
-   known diffs, deferred slices
-3. `docs/design/not_ralph/02-grammar-porting-guide.md` and
+**Before touching `grammar/*.y`, `internal/parser/`, or parser routing —
+and BEFORE changing parser behaviour to fix a regress case or to match
+PostgreSQL — read
+`docs/design/not_ralph/06-goyacc-parser-playbook.md`, in particular §12.**
+If you have already read it in this session you do not need to re-read it,
+but do not skip it on the assumption that a change is "just" a grammar tweak.
+
+§12 is the reason this instruction is emphatic. This grammar is a port of
+`postgres/src/backend/parser/gram.y`, not a copy, and it carries deliberate
+goopg-specific accommodations that LOOK LIKE BUGS:
+
+- synthetic terminals the real scanner has no counterpart for (`TYPEDLIT`,
+  `CHECKBODY`, the `*_LA` family) — grep `gram.y` for them and you find
+  nothing, which is expected;
+- `$<p>N`, this grammar's stand-in for yacc's `@n`, and the specific
+  conditions under which `lastConsumedPos()` silently returns the WRONG
+  token;
+- four different position conventions that interact — node positions are the
+  wire `ErrorResponse.Position` and psql's caret, and are NOT covered by the
+  golden corpus, so a regression there is not caught automatically;
+- ~1.7% of statement classes that deliberately stay on hand-written token
+  scanners, where writing a grammar rule would make goopg STRICTER than it
+  ships and start rejecting working input;
+- an inventory of known, intentional divergences from `gram.y` in both
+  directions, each with its upstream citation.
+
+Then:
+
+1. `docs/design/not_ralph/TODO.md` — routed classes, conflict pin, known
+   diffs, deferred slices, and the full migration history including why each
+   divergence exists
+2. `docs/design/not_ralph/02-grammar-porting-guide.md` and
    `03-strangler-migration.md` — background and strategy
+
+Two rules that catch most first-time mistakes:
+
+- Build with **`make gen-parser`**, never `go build` alone — a bare build
+  happily compiles a stale generated parser.
+- The oracle is `internal/parser/testdata/parity_goldens.txt`. Regenerate with
+  `GOOPG_UPDATE_GOLDENS=1 go test ./internal/parser/` and **read the diff** —
+  it is the review artifact for your change, not a formality.
 
 ## Lint and format
 
