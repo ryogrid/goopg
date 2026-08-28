@@ -3656,10 +3656,7 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node
 	schema := make(Schema, nCols)
 	for i := 0; i < nCols; i++ {
 		name := fmt.Sprintf("column%d", i+1)
-		typ := exprType(planRows[0][i])
-		for r := 1; r < len(planRows); r++ {
-			typ = unifyValueTypes(typ, exprType(planRows[r][i]))
-		}
+		typ := resolveValuesColumnType(planRows, i)
 		schema[i] = SchemaColumn{Name: name, Type: typ}
 	}
 	var node Node = &Values{pos: s.Pos(), Rows: planRows, schema: schema}
@@ -3800,8 +3797,10 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 		} else {
 			name = fmt.Sprintf("column%d", i+1)
 		}
-		// Type: use the type of the first row's expression.
-		typ := exprType(planRows[0][i])
+		// Type: select_common_type over every row, not just the first —
+		// `(VALUES ('2015-01-02'), ('2015-04-01'::date))` must resolve to date
+		// whichever row carries the cast. M0134-0156.
+		typ := resolveValuesColumnType(planRows, i)
 		cols[i] = catalog.Column{Name: name, Type: typ}
 		schema[i] = SchemaColumn{Name: name, Type: typ}
 	}
@@ -7369,14 +7368,16 @@ func isUserDefinedPlannerType(name string) bool {
 }
 
 func groupExprName(e Expr) string {
-	if c, ok := e.(*ColumnRef); ok {
-		return c.Name
-	}
-	// FuncCall GROUP BY: use function name as column label (e.g. lower(c) → "lower"). M0097-0003.
-	if f, ok := e.(*FuncCall); ok && f.Name != "" {
-		return f.Name
-	}
-	return "?column?"
+	// PostgreSQL has exactly one implicit-column-label routine — FigureColname
+	// (parse_target.c) — and grouping does not change it: `SELECT EXTRACT(year
+	// FROM d), count(*) ... GROUP BY 1` labels the first column "extract", the
+	// same as without the GROUP BY. goopg's targetMeta is that routine; this
+	// used to be an independent mini-copy handling only ColumnRef and FuncCall,
+	// so every other labelled node kind (ExtractExpr, CASE, typed literals,
+	// scalar subqueries) silently degraded to "?column?" once a GROUP BY was
+	// present. Delegate instead of duplicating. M0134-0156.
+	name, _ := targetMeta(e, parser.ResTarget{})
+	return name
 }
 
 // buildHavingParentCtx creates a parent resolveContext for EXISTS/subquery
@@ -13033,6 +13034,43 @@ func isNumericTypeName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// valuesCandidateType reports the type an expression contributes to VALUES
+// column type resolution.
+//
+// PostgreSQL runs select_common_type (parse_coerce.c:1342) over the parse tree,
+// where an unadorned string literal still carries UNKNOWNOID and is therefore
+// *skipped* — any row supplying a real type wins, and the literals are coerced
+// to it afterwards. goopg's exprType has already resolved *StringConst to
+// "text", which would instead dominate the real type (text is the sink of
+// unifyValueTypes). Report bare string literals as "unknown" so they behave
+// like PG's unknown-type literals. M0134-0156.
+func valuesCandidateType(e Expr) catalog.Type {
+	if _, ok := e.(*StringConst); ok {
+		return catalog.Type{Name: "unknown"}
+	}
+	return exprType(e)
+}
+
+// resolveValuesColumnType applies PostgreSQL's select_common_type to one VALUES
+// column: unify across *every* row (not just the first), ignoring unknown-type
+// literals, and fall back to text when every row is unknown
+// (parse_coerce.c:1451 "If all the inputs were UNKNOWN ... resolve as type
+// TEXT"). Shared by the standalone-VALUES and VALUES-subquery planners so the
+// two sibling paths cannot drift. M0134-0156.
+func resolveValuesColumnType(planRows [][]Expr, col int) catalog.Type {
+	typ := catalog.Type{Name: "unknown"}
+	for r := range planRows {
+		if col >= len(planRows[r]) {
+			continue
+		}
+		typ = unifyValueTypes(typ, valuesCandidateType(planRows[r][col]))
+	}
+	if n := strings.ToLower(typ.Name); n == "" || n == "unknown" {
+		return catalog.Type{Name: "text"}
+	}
+	return typ
 }
 
 // unifyValueTypes returns the "wider" of two types for VALUES column type inference.
