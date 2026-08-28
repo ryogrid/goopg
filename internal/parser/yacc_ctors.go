@@ -540,6 +540,15 @@ func NewFunctionArg(name string, mode FuncArgMode, modeExplicit bool, typ Column
 	return FunctionArg{Name: name, Mode: mode, ModeExplicit: modeExplicit, Type: typ, Default: def}
 }
 
+// NewFunctionArgAt is NewFunctionArg with the argument's own byte offset —
+// its NAME when it has one, otherwise its type (function.go
+// parseFunctionArg). FunctionArg.pos is the errposition for a bad argument.
+func NewFunctionArgAt(pos int, name string, mode FuncArgMode, modeExplicit bool, typ ColumnType, def Expr) FunctionArg {
+	a := NewFunctionArg(name, mode, modeExplicit, typ, def)
+	a.pos = pos
+	return a
+}
+
 func NewCreateFunctionStmt(pos int, orReplace bool, name ObjectName, args []FunctionArg) *CreateFunctionStmt {
 	return &CreateFunctionStmt{pos: pos, OrReplace: orReplace, Name: name, Args: args, Volatile: "v", Parallel: "u"}
 }
@@ -961,4 +970,60 @@ func NewGroupingCall(pos int, args []Expr) *GroupingCall {
 // from a column actually named minvalue.
 func NewPartitionRangeBoundKeyword(pos int, isMax bool) *PartitionRangeBoundKeyword {
 	return &PartitionRangeBoundKeyword{pos: pos, IsMax: isMax}
+}
+
+// ---------------------------------------------------------------------------
+// P7.2: CREATE / ALTER EVENT TRIGGER. Ported because ddl.go builds REAL AST
+// nodes for both (unlike CREATE OPERATOR / TEXT SEARCH / CAST, whose legacy
+// handlers end in parseSkipToSemicolon and therefore accept arbitrary token
+// soup — a grammar for those would be stricter than what ships).
+// ---------------------------------------------------------------------------
+
+// evtrigFilterSep joins a WHEN clause's filter variable to its value list
+// inside one string, so evtrig_filter_list can carry both in a []string.
+const evtrigFilterSep = "\x1f"
+
+func evtrigFilter(name string, vals []string) string {
+	return name + evtrigFilterSep + strings.Join(vals, evtrigFilterSep)
+}
+
+// NewCreateEventTriggerStmt mirrors ddl.go's parseCreateEventTrigger: FilterVar
+// is LAST-WRITE-WINS across AND-joined clauses while FilterVars keeps every one
+// in source order (event_trigger.c's CreateEventTrigger needs the sequence to
+// detect a duplicate filter variable), and only a variable named "tag"
+// contributes to Tags.
+func NewCreateEventTriggerStmt(pos int, name, event string, filters []string, fn ObjectName) *CreateEventTriggerStmt {
+	st := &CreateEventTriggerStmt{pos: pos, Name: name, Event: event, FuncName: fn}
+	for _, f := range filters {
+		parts := strings.Split(f, evtrigFilterSep)
+		if len(parts) == 0 {
+			continue
+		}
+		st.FilterVar = parts[0]
+		st.FilterVars = append(st.FilterVars, parts[0])
+		if strings.EqualFold(parts[0], "tag") {
+			st.Tags = append(st.Tags, parts[1:]...)
+		}
+	}
+	return st
+}
+
+
+func NewAlterEventTriggerStmt(pos int, name, action, newName, newOwner string) *AlterEventTriggerStmt {
+	return &AlterEventTriggerStmt{pos: pos, Name: name, Action: action, NewName: newName, NewOwner: newOwner}
+}
+
+// NewCreateAccessMethodStmt builds CREATE ACCESS METHOD (gram.y CreateAmStmt).
+// amType is pg_am.amtype's one-byte code: "i" for INDEX, "t" for TABLE.
+func NewCreateAccessMethodStmt(pos int, name, amType string, handler ObjectName) *CreateAccessMethodStmt {
+	return &CreateAccessMethodStmt{pos: pos, Name: name, AMType: amType, HandlerName: handler}
+}
+
+// NewUpdateAssignAt is NewUpdateAssign with the assignment's own byte offset —
+// the COLUMN name (or the opening paren of the multi-column form), which is
+// where dml.go anchors it. UpdateAssign.pos is the errposition for a bad SET.
+func NewUpdateAssignAt(pos int, column, tableQualifier string, columns []string, expr Expr) *UpdateAssign {
+	a := NewUpdateAssign(column, tableQualifier, columns, expr)
+	a.pos = pos
+	return a
 }

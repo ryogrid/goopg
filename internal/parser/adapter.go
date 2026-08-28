@@ -622,12 +622,6 @@ func (l *lexerState) raise(msg string, raw bool, pos int) {
 	l.err = &SyntaxError{Message: msg, Raw: raw, Pos: pos}
 }
 
-// pgQuote renders s the way psql echoes tokens in syntax errors: double
-// quotes, doubling any embedded quote.
-func pgQuote(s string) string {
-	return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
-}
-
 // directArrayAt reports whether the token at absolute position pos is the
 // ARRAY keyword immediately followed by '[' — parseAnyTail's literal test for
 // the `ANY (ARRAY[...])` unwrap. Positions come from $<p>N, so a miss means the

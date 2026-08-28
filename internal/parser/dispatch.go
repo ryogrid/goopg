@@ -264,14 +264,17 @@ var routedCreatePairs = map[string]map[string]bool{
 		"function": true, "procedure": true, // P5.2
 		"type": true, "domain": true, "sequence": true, // P5.5
 		"trigger": true, "constraint": true, // P5.6 ("constraint" = CREATE CONSTRAINT TRIGGER)
-		"extension": true, "policy": true}, // P5.9
+		"extension": true, "policy": true, // P5.9
+		"event": true, // P7.2 — CREATE EVENT TRIGGER
+		"access": true}, // P7.2 — CREATE ACCESS METHOD
 	"alter": {"table": true,
 		"function": true, "procedure": true, "routine": true, // P5.6
 		"schema": true, // P5.9
 		"sequence": true, "type": true, "domain": true, // P5.10
 		"index": true, // P5.12
 		"view": true, // P5.13
-		"materialized": true}, // P5.14 (SET SCHEMA only, see alterMatviewRouted)
+		"materialized": true, // P5.14 (SET SCHEMA only, see alterMatviewRouted)
+		"event": true}, // P7.2 — ALTER EVENT TRIGGER
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
 		"type": true, "domain": true, // P5.5

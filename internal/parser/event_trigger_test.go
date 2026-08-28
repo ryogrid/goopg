@@ -2,146 +2,80 @@ package parser
 
 import "testing"
 
-// TestParseCreateEventTriggerSimple pins the no-WHEN-clause CREATE EVENT
-// TRIGGER form. DU-002 (M0119-0004).
-func TestParseCreateEventTriggerSimple(t *testing.T) {
-	stmts, err := Parse("CREATE EVENT TRIGGER et1 ON ddl_command_start EXECUTE FUNCTION et_func()")
-	if err != nil {
-		t.Fatal(err)
+// TestEventTriggerStmts pins P7.2's first class: CREATE / ALTER EVENT TRIGGER
+// (gram.y CreateEventTrigStmt / AlterEventTrigStmt).
+//
+// P5.14's note claimed every class legacy answers with a REAL AST node was
+// routed. It was not: this one, CREATE AGGREGATE, CREATE ACCESS METHOD,
+// CREATE RULE, ALTER DEFAULT PRIVILEGES and CREATE STATISTICS all build real
+// nodes and all still fell to legacy. Measured over the whole regress corpus,
+// 234 of 13,582 fragments (1.7%) genuinely reach the legacy parser; the other
+// 310 unrouted ones never get there at all, because postmaster's
+// compatNoopCommandTag (dispatch.go:1879) intercepts role DDL, GRANT/REVOKE
+// and database/schema DDL by string prefix ABOVE Parse.
+func TestEventTriggerStmts(t *testing.T) {
+	for _, q := range []string{
+		// EXECUTE takes FUNCTION, PROCEDURE, or neither — ddl.go's
+		// `_ = p.acceptKeyword(KwFunction) || p.acceptKeyword(KwProcedure)`.
+		"CREATE EVENT TRIGGER t ON ddl_command_start EXECUTE FUNCTION f()",
+		"CREATE EVENT TRIGGER t ON ddl_command_end EXECUTE PROCEDURE s.f()",
+		"CREATE EVENT TRIGGER t ON sql_drop EXECUTE f()",
+		"CREATE EVENT TRIGGER t ON table_rewrite EXECUTE FUNCTION public.f()",
+		// WHEN <var> IN (...) — only a variable named "tag" contributes to
+		// Tags, but every clause appends to FilterVars, and FilterVar is
+		// last-write-wins (event_trigger.c needs the sequence to spot a
+		// duplicate filter variable).
+		"CREATE EVENT TRIGGER t ON ddl_command_start WHEN tag IN ('DROP TABLE') EXECUTE FUNCTION f()",
+		"CREATE EVENT TRIGGER t ON ddl_command_start WHEN tag IN ('DROP TABLE','CREATE TABLE') EXECUTE FUNCTION f()",
+		"CREATE EVENT TRIGGER t ON ddl_command_start WHEN tag IN ('a') AND tag IN ('b') EXECUTE FUNCTION f()",
+		"CREATE EVENT TRIGGER t ON ddl_command_start WHEN other IN ('a') EXECUTE FUNCTION f()",
+		"CREATE EVENT TRIGGER t ON ddl_command_start WHEN other IN ('a') AND tag IN ('b') EXECUTE FUNCTION f()",
+
+		// enable_trigger, verbatim from gram.y:6319 — the four spellings and
+		// no others.
+		"ALTER EVENT TRIGGER t DISABLE",
+		"ALTER EVENT TRIGGER t ENABLE",
+		"ALTER EVENT TRIGGER t ENABLE REPLICA",
+		"ALTER EVENT TRIGGER t ENABLE ALWAYS",
+		// RENAME TO / OWNER TO live in upstream's RenameStmt / AlterOwnerStmt;
+		// goopg folds them into the same statement type.
+		"ALTER EVENT TRIGGER t RENAME TO u",
+		"ALTER EVENT TRIGGER t OWNER TO alice",
+		"ALTER EVENT TRIGGER t OWNER TO CURRENT_USER",
+		"ALTER EVENT TRIGGER t OWNER TO SESSION_USER",
+	} {
+		assertParity(t, q)
 	}
-	if len(stmts) != 1 {
-		t.Fatalf("len=%d want 1", len(stmts))
-	}
-	et, ok := stmts[0].(*CreateEventTriggerStmt)
-	if !ok {
-		t.Fatalf("type=%T want *CreateEventTriggerStmt", stmts[0])
-	}
-	if et.Name != "et1" {
-		t.Errorf("Name=%q", et.Name)
-	}
-	if et.Event != "ddl_command_start" {
-		t.Errorf("Event=%q", et.Event)
-	}
-	if et.FilterVar != "" || len(et.Tags) != 0 {
-		t.Errorf("FilterVar=%q Tags=%v want empty", et.FilterVar, et.Tags)
-	}
-	if et.FuncName.Name != "et_func" {
-		t.Errorf("FuncName=%+v", et.FuncName)
-	}
+
+	// The action words are TERMINALS, not ColIds. A ColId pair would have
+	// matched these and built an AlterEventTriggerStmt with an empty Action;
+	// ddl.go leaves the extra word unconsumed so it surfaces as a
+	// trailing-token error, which exact terminals reproduce for free.
+	assertBothReject(t, "ALTER EVENT TRIGGER t ENABLE BOGUS")
+	assertBothReject(t, "ALTER EVENT TRIGGER t DISABLE ALWAYS")
+	assertBothReject(t, "ALTER EVENT TRIGGER t BOGUS")
+	// An event trigger function takes no arguments (ddl.go: "event trigger
+	// functions take no arguments").
+	assertBothReject(t, "CREATE EVENT TRIGGER t ON ddl_command_start EXECUTE FUNCTION f(1)")
+	assertBothReject(t, "CREATE EVENT TRIGGER t ON ddl_command_start EXECUTE FUNCTION f")
 }
 
-// TestParseCreateEventTriggerWhenTag pins the WHEN TAG IN (...) form,
-// including EXECUTE PROCEDURE (the PG11+ synonym for FUNCTION).
-func TestParseCreateEventTriggerWhenTag(t *testing.T) {
-	stmts, err := Parse(`CREATE EVENT TRIGGER et2 ON ddl_command_end
-		WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE')
-		EXECUTE PROCEDURE public.et_func2()`)
-	if err != nil {
-		t.Fatal(err)
+// TestCreateAccessMethodStmt pins gram.y:5991 CreateAmStmt. It is the ONLY
+// other unrouted class whose legacy handler is a strict recursive-descent
+// parser rather than a token walk — see the survey in
+// docs/design/not_ralph/TODO.md under "P7.2 scope, measured".
+func TestCreateAccessMethodStmt(t *testing.T) {
+	for _, q := range []string{
+		"CREATE ACCESS METHOD m TYPE INDEX HANDLER h",
+		"CREATE ACCESS METHOD m TYPE TABLE HANDLER s.h",
+		"CREATE ACCESS METHOD gist2 TYPE INDEX HANDLER pg_catalog.gisthandler",
+	} {
+		assertParity(t, q)
 	}
-	et := stmts[0].(*CreateEventTriggerStmt)
-	if et.Event != "ddl_command_end" {
-		t.Errorf("Event=%q", et.Event)
-	}
-	if et.FilterVar != "tag" {
-		t.Errorf("FilterVar=%q want tag", et.FilterVar)
-	}
-	if len(et.Tags) != 2 || et.Tags[0] != "CREATE TABLE" || et.Tags[1] != "ALTER TABLE" {
-		t.Errorf("Tags=%v", et.Tags)
-	}
-	if et.FuncName.Schema != "public" || et.FuncName.Name != "et_func2" {
-		t.Errorf("FuncName=%+v", et.FuncName)
-	}
-}
-
-// TestParseDropEventTrigger pins `DROP EVENT TRIGGER [IF EXISTS] name`
-// routing through the shared DropCompatStmt (execDropCompat's "event
-// trigger" case). Before this loop "EVENT TRIGGER" mis-parsed entirely
-// (TRIGGER was swallowed as the object name, see the ddl.go comment).
-func TestParseDropEventTrigger(t *testing.T) {
-	stmts, err := Parse("DROP EVENT TRIGGER IF EXISTS et1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dc, ok := stmts[0].(*DropCompatStmt)
-	if !ok {
-		t.Fatalf("type=%T want *DropCompatStmt", stmts[0])
-	}
-	if dc.ObjType != "event trigger" {
-		t.Errorf("ObjType=%q want %q", dc.ObjType, "event trigger")
-	}
-	if !dc.IfExists {
-		t.Errorf("IfExists=false want true")
-	}
-	if len(dc.Names) != 1 || dc.Names[0].Name != "et1" {
-		t.Errorf("Names=%+v", dc.Names)
-	}
-}
-
-// TestParseCreateEventTriggerUnrecognizedFilterVar pins that a
-// non-"tag" filter variable still parses (semantic validation happens at
-// exec time, mirroring PostgreSQL's CreateEventTrigger).
-func TestParseCreateEventTriggerUnrecognizedFilterVar(t *testing.T) {
-	stmts, err := Parse("CREATE EVENT TRIGGER et3 ON sql_drop WHEN bogus IN ('x') EXECUTE FUNCTION et_func()")
-	if err != nil {
-		t.Fatal(err)
-	}
-	et := stmts[0].(*CreateEventTriggerStmt)
-	if et.FilterVar != "bogus" {
-		t.Errorf("FilterVar=%q want bogus", et.FilterVar)
-	}
-	if len(et.Tags) != 0 {
-		t.Errorf("Tags=%v want empty (only the \"tag\" filter var populates Tags)", et.Tags)
-	}
-}
-
-// TestParseAlterEventTrigger pins every ALTER EVENT TRIGGER form goopg
-// models: DISABLE, ENABLE [REPLICA|ALWAYS], RENAME TO, OWNER TO (including
-// the CURRENT_USER/SESSION_USER/CURRENT_ROLE sentinel). DU-002 (M0119-0004,
-// loop #69 ledger follow-up).
-func TestParseAlterEventTrigger(t *testing.T) {
-	cases := []struct {
-		sql        string
-		wantAction string
-		wantName   string
-		wantExtra  string // NewName for rename, NewOwner for owner
-	}{
-		{"ALTER EVENT TRIGGER et1 DISABLE", "disable", "et1", ""},
-		{"ALTER EVENT TRIGGER et1 ENABLE", "enable", "et1", ""},
-		{"ALTER EVENT TRIGGER et1 ENABLE REPLICA", "enable_replica", "et1", ""},
-		{"ALTER EVENT TRIGGER et1 ENABLE ALWAYS", "enable_always", "et1", ""},
-		{"ALTER EVENT TRIGGER et1 RENAME TO et2", "rename", "et1", "et2"},
-		{"ALTER EVENT TRIGGER et1 OWNER TO alice", "owner", "et1", "alice"},
-		{"ALTER EVENT TRIGGER et1 OWNER TO CURRENT_USER", "owner", "et1", "current_user"},
-		{"ALTER EVENT TRIGGER et1 OWNER TO session_user", "owner", "et1", "current_user"},
-	}
-	for _, c := range cases {
-		stmts, err := Parse(c.sql)
-		if err != nil {
-			t.Fatalf("%s: %v", c.sql, err)
-		}
-		if len(stmts) != 1 {
-			t.Fatalf("%s: len=%d want 1", c.sql, len(stmts))
-		}
-		aet, ok := stmts[0].(*AlterEventTriggerStmt)
-		if !ok {
-			t.Fatalf("%s: type=%T want *AlterEventTriggerStmt", c.sql, stmts[0])
-		}
-		if aet.Name != c.wantName {
-			t.Errorf("%s: Name=%q want %q", c.sql, aet.Name, c.wantName)
-		}
-		if aet.Action != c.wantAction {
-			t.Errorf("%s: Action=%q want %q", c.sql, aet.Action, c.wantAction)
-		}
-		switch c.wantAction {
-		case "rename":
-			if aet.NewName != c.wantExtra {
-				t.Errorf("%s: NewName=%q want %q", c.sql, aet.NewName, c.wantExtra)
-			}
-		case "owner":
-			if aet.NewOwner != c.wantExtra {
-				t.Errorf("%s: NewOwner=%q want %q", c.sql, aet.NewOwner, c.wantExtra)
-			}
-		}
-	}
+	// am_type is INDEX or TABLE and nothing else (gram.y:6002); TYPE and
+	// HANDLER are terminals, so all three malformations reject without an
+	// explicit check, at the same offset legacy reports.
+	assertBothReject(t, "CREATE ACCESS METHOD m TYPE BOGUS HANDLER h")
+	assertBothReject(t, "CREATE ACCESS METHOD m HANDLER h")
+	assertBothReject(t, "CREATE ACCESS METHOD m TYPE INDEX h")
 }

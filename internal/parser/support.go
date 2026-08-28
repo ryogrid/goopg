@@ -2340,11 +2340,6 @@ func mergeATTail(t *atConstrTail, w string) *atConstrTail {
 	return t
 }
 
-// atAction builds a bare ALTER TABLE action of the given kind.
-func atAction(k AlterTableActionKind) *AlterTableAction {
-	return NewATAction(k)
-}
-
 // applyATTail copies the trailing words onto the action.
 func applyATTail(a *AlterTableAction, t *atConstrTail) *AlterTableAction {
 	if t == nil {
@@ -2567,7 +2562,10 @@ func raiseErr(l yyLexer, se *SyntaxError) {
 
 // cast_typename folds array brackets into the name (castType.withArrays), but
 // ColumnType keeps them in a separate flag, so they are split back out here.
-func colTypeOf(l yyLexer, tw *typeWithArgs) ColumnType {
+// colTypeOf takes the TYPE NAME's byte offset because ColumnType.pos is an
+// errposition (ddl.go's parseColumnType records it) and canonDump prints no
+// positions, so a zero here was invisible to the whole differential suite.
+func colTypeOf(l yyLexer, tw *typeWithArgs, pos int) ColumnType {
 	name, args := tw.ct.name, tw.args
 	if tw.ct.schema == "" && !tw.quoted {
 		// FLOAT [ (p) ] -> float4/float8 with the precision folded into the
@@ -2586,7 +2584,9 @@ func colTypeOf(l yyLexer, tw *typeWithArgs) ColumnType {
 		// (1014). `bpchar` written directly is deliberately NOT stamped.
 		args = []int64{1}
 	}
-	return NewColumnType(tw.ct.schema, elem, args, isArray)
+	ct := NewColumnType(tw.ct.schema, elem, args, isArray)
+	ct.pos = pos
+	return ct
 }
 
 // parallelCode maps PARALLEL's word to pg_proc.proparallel's one-byte code.
@@ -3968,7 +3968,11 @@ func roleSetStmt(local bool, v string, isDefault bool) Stmt {
 // `float(p)` collapse into float4/float8 (array suffix preserved), a bare
 // char/character takes the implicit length of 1 — and a QUOTED name takes
 // NEITHER, because it denotes a user type.
-func castTo(l yyLexer, operand Expr, ct castType, extra []int64, pos int) Expr {
+// castTo takes castPos — the offset of the CAST-introducing token (`::` or
+// the CAST keyword), which is where select.go anchors the node — separately
+// from pos, the TYPE name's offset used for the quoted-identifier probe.
+// Using operand.Pos() put the caret under the value being cast instead.
+func castTo(l yyLexer, operand Expr, ct castType, extra []int64, pos, castPos int) Expr {
 	name, args := ct.name, ct.args
 	if len(extra) > 0 {
 		args = extra
@@ -3980,7 +3984,7 @@ func castTo(l yyLexer, operand Expr, ct castType, extra []int64, pos int) Expr {
 	if !quoted {
 		args = typmodsFor(name, args, len(args))
 	}
-	return NewCastExpr(operand.Pos(), operand, ObjectName{Schema: ct.schema, Name: name}, args)
+	return NewCastExpr(castPos, operand, ObjectName{Schema: ct.schema, Name: name}, args)
 }
 
 // partBoundValues turns the bare words MINVALUE and MAXVALUE in a range

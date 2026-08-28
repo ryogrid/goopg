@@ -75,16 +75,27 @@ func collectPositions(v any) []string {
 //
 // It started at 2058 the moment this test existed — the class had been
 // completely invisible until then, because canonDump prints no positions.
-// P7.1 took it to the number below by fixing the systemic causes:
-// qualified_name's default-reduction lastConsumedPos (which zeroed the
-// position of EVERY FuncCall in the language), ObjectName/ColumnDef/
-// ColumnType/AlterTableAction never being stamped at all, and SelectStmt
-// being stamped when legacy leaves it zero.
 //
-// What remains is a long tail inside the EXPRESSION grammar — StarExpr,
-// BinaryOp, CastExpr, IntervalLit and friends — tracked in
-// docs/design/not_ralph/TODO.md under P7.1 follow-up.
-const posParityCeiling = 1179
+// Two systemic causes account for most of the ground covered since:
+//
+//  1. lastConsumedPos() where the rule is a DEFAULT REDUCTION. It returns
+//     prevPos, which is only the current token's offset when a lookahead has
+//     actually been read; where none was, it names the token BEFORE. That
+//     alone zeroed every FuncCall in the language (via qualified_name) and
+//     put SelectStmt's position PAST THE END of the statement. $<p>N is the
+//     symbol's own captured offset and is right either way.
+//  2. Anchoring a node at its LEFT OPERAND instead of at its OPERATOR.
+//     select.go puts BinaryOp / InExpr / IsDistinctFrom / CastExpr on the
+//     operator token, not on what precedes it.
+//
+// The rest were constructors that simply never took a position:
+// ObjectName, ColumnDef, ColumnType, AlterTableAction, FunctionArg,
+// UpdateAssign. Note that a few nodes legitimately carry ZERO — SelectStmt
+// and the transaction-control statements — and matching legacy there means
+// passing 0, not inventing an offset.
+//
+// The remaining tail is tracked in docs/design/not_ralph/TODO.md.
+const posParityCeiling = 534
 
 func TestPositionParity(t *testing.T) {
 	var bad []string

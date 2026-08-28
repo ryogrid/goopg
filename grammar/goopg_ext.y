@@ -343,7 +343,7 @@ table_element:
 				// flag with the ELEMENT name, so they must be split back out.
 				// Detecting the suffix without stripping it left `text[]` as a
 				// type literally named "text[]" on 36 regress fragments.
-				ct := colTypeOf(yylex, tw)
+				ct := colTypeOf(yylex, tw, $<p>2)
 				cs.schema, cs.typ, cs.isArray = ct.Schema, ct.Name, ct.IsArray
 				cc := $3.(*colConstraints)
 				// The typmod lives on the TYPE carrier, not the constraint
@@ -1101,17 +1101,20 @@ iso_level:
 	| READ COMMITTED                    { $$ = "read committed" }
 	| READ UNCOMMITTED                  { $$ = "read uncommitted" }
 
+/* ZERO, like every other transaction-control statement ddl.go builds — and
+   lastConsumedPos() here did not even name the leading keyword: these rules
+   reduce after their trailing operand, so it pointed at the SCONST. */
 tx_commit:
-		COMMIT opt_transaction  { $$ = NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| END_P opt_transaction     { $$ = NewCommitStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| COMMIT PREPARED SCONST    { $$ = NewCommitPreparedStmt(yylex.(*lexerState).lastConsumedPos(), $3) }
+		COMMIT opt_transaction  { $$ = NewCommitStmt(0) }
+	| END_P opt_transaction     { $$ = NewCommitStmt(0) }
+	| COMMIT PREPARED SCONST    { $$ = NewCommitPreparedStmt(0, $3) }
 
 tx_rollback:
-		ROLLBACK opt_transaction { $$ = NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| ABORT_P opt_transaction    { $$ = NewRollbackStmt(yylex.(*lexerState).lastConsumedPos()) }
-	| ROLLBACK PREPARED SCONST   { $$ = NewRollbackPreparedStmt(yylex.(*lexerState).lastConsumedPos(), $3) }
+		ROLLBACK opt_transaction { $$ = NewRollbackStmt(0) }
+	| ABORT_P opt_transaction    { $$ = NewRollbackStmt(0) }
+	| ROLLBACK PREPARED SCONST   { $$ = NewRollbackPreparedStmt(0, $3) }
 	| ROLLBACK opt_transaction TO opt_savepoint_kw ColId
-			{ $$ = NewRollbackToSavepointStmt(yylex.(*lexerState).lastConsumedPos(), $5) }
+			{ $$ = NewRollbackToSavepointStmt(0, $5) }
 
 /* opt_transaction — gram.y's `opt_transaction: WORK | TRANSACTION | empty`.
    TRANSACTION used to be a tx_mode instead, which made `BEGIN TRANSACTION
@@ -1341,7 +1344,7 @@ alter_table_action:
 			{
 				cc := $4.(*colConstraints)
 				ct := $3.(*typeWithArgs)
-				cd := NewColumnDefAt($<p>2, $<p>3, $2, colTypeOf(yylex, ct))
+				cd := NewColumnDefAt($<p>2, $<p>3, $2, colTypeOf(yylex, ct, $<p>3))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
@@ -1377,7 +1380,7 @@ alter_table_action:
 			{
 				cc := $5.(*colConstraints)
 				ct := $4.(*typeWithArgs)
-				cd := NewColumnDefAt($<p>3, $<p>4, $3, colTypeOf(yylex, ct))
+				cd := NewColumnDefAt($<p>3, $<p>4, $3, colTypeOf(yylex, ct, $<p>4))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
@@ -1413,7 +1416,7 @@ alter_table_action:
 			{
 				cc := $7.(*colConstraints)
 				ct := $6.(*typeWithArgs)
-				cd := NewColumnDefAt($<p>5, $<p>6, $5, colTypeOf(yylex, ct))
+				cd := NewColumnDefAt($<p>5, $<p>6, $5, colTypeOf(yylex, ct, $<p>6))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
@@ -1450,7 +1453,7 @@ alter_table_action:
 			{
 				cc := $8.(*colConstraints)
 				ct := $7.(*typeWithArgs)
-				cd := NewColumnDefAt($<p>6, $<p>7, $6, colTypeOf(yylex, ct))
+				cd := NewColumnDefAt($<p>6, $<p>7, $6, colTypeOf(yylex, ct, $<p>7))
 				cd.NotNull = cc.notNull
 				cd.NotNullExplicit = cc.notNull // legacy parseColumnDef, ddl.go:5104
 				cd.DefaultExpr = cc.defExpr
@@ -1512,7 +1515,7 @@ alter_table_action:
 				ct := $5.(*typeWithArgs)
 				a := NewATActionAt(AlterTableAlterColumnType, $<p>3)
 				a.ColumnName = $3
-				a.NewType = colTypeOf(yylex, ct)
+				a.NewType = colTypeOf(yylex, ct, $<p>5)
 				a.UsingExpr, _ = $6.(Expr)
 				$$ = a
 			}
@@ -2056,9 +2059,9 @@ create_function_stmt:
 
 fn_return:
 		fn_type
-			{ $$ = &fnReturn{typ: colTypeOf(yylex, $1.(*typeWithArgs))} }
+			{ $$ = &fnReturn{typ: colTypeOf(yylex, $1.(*typeWithArgs), $<p>1)} }
 	| SETOF fn_type
-			{ $$ = &fnReturn{typ: colTypeOf(yylex, $2.(*typeWithArgs)), setof: true} }
+			{ $$ = &fnReturn{typ: colTypeOf(yylex, $2.(*typeWithArgs), $<p>2), setof: true} }
 	/* Legacy records RETURNS TABLE as `SETOF record` plus the columns folded
 	   into trailing OUT arguments (function.go), not as a distinct type. */
 	| TABLE '(' func_arg_list_p ')'
@@ -2080,17 +2083,17 @@ func_arg_list_p:
    `(` and decide one token too early. */
 func_arg:
 		fn_type opt_arg_default
-			{ $$ = NewFunctionArg("", FuncArgIn, false, colTypeOf(yylex, $1.(*typeWithArgs)), $2) }
+			{ $$ = NewFunctionArgAt($<p>1, "", FuncArgIn, false, colTypeOf(yylex, $1.(*typeWithArgs), $<p>1), $2) }
 	| fn_param_name fn_type opt_arg_default
-			{ $$ = NewFunctionArg($1, FuncArgIn, false, colTypeOf(yylex, $2.(*typeWithArgs)), $3) }
+			{ $$ = NewFunctionArgAt($<p>1, $1, FuncArgIn, false, colTypeOf(yylex, $2.(*typeWithArgs), $<p>2), $3) }
 	| fn_arg_mode fn_type opt_arg_default
-			{ $$ = NewFunctionArg("", FuncArgMode($1), true, colTypeOf(yylex, $2.(*typeWithArgs)), $3) }
+			{ $$ = NewFunctionArgAt($<p>1, "", FuncArgMode($1), true, colTypeOf(yylex, $2.(*typeWithArgs), $<p>2), $3) }
 	| fn_arg_mode fn_param_name fn_type opt_arg_default
-			{ $$ = NewFunctionArg($2, FuncArgMode($1), true, colTypeOf(yylex, $3.(*typeWithArgs)), $4) }
+			{ $$ = NewFunctionArgAt($<p>1, $2, FuncArgMode($1), true, colTypeOf(yylex, $3.(*typeWithArgs), $<p>3), $4) }
 	/* `name mode type` (`a OUT int`) as well as `mode name type`: legacy
 	   accepts both orderings (function.go parseFunctionArg). */
 	| fn_param_name fn_arg_mode fn_type opt_arg_default
-			{ $$ = NewFunctionArg($1, FuncArgMode($2), true, colTypeOf(yylex, $3.(*typeWithArgs)), $4) }
+			{ $$ = NewFunctionArgAt($<p>1, $1, FuncArgMode($2), true, colTypeOf(yylex, $3.(*typeWithArgs), $<p>3), $4) }
 
 /* gram.y's param_name is type_function_name, NOT ColId: OUT_P and INOUT are
    col_name_keywords, so a ColId here would be reduce/reduce-ambiguous with
@@ -2781,7 +2784,7 @@ create_domain_stmt:
 		CREATE DOMAIN_P qualified_name opt_AS_kw col_type_name domain_constraints
 			{
 				tw := $5.(*typeWithArgs)
-				ct := colTypeOf(yylex, tw)
+				ct := colTypeOf(yylex, tw, $<p>5)
 				nm := ct.Name
 				if ct.Schema != "" {
 					nm = ct.Schema + "." + ct.Name
@@ -3269,6 +3272,83 @@ alter_schema_stmt:
 			{ $$ = NewAlterSchemaStmt($<p>1, $3, "rename", $6, "") }
 	| ALTER SCHEMA ColId OWNER TO alter_fn_owner
 			{ $$ = NewAlterSchemaStmt($<p>1, $3, "owner", "", $6) }
+
+/* CREATE ACCESS METHOD — gram.y:5991 CreateAmStmt, verbatim:
+   `CREATE ACCESS METHOD name TYPE_P am_type HANDLER handler_name`.
+
+   goopg never invokes a user-defined access method; this only round-trips the
+   DDL for pg_dump (pg_am virtual view). ddl.go reads TYPE and HANDLER with
+   acceptIdentKeyword, but both are real kwlist keywords and therefore
+   terminals here — which is also what makes the two error cases (a missing
+   TYPE, an am_type that is neither INDEX nor TABLE) reject without an
+   explicit check. */
+create_access_method_stmt:
+		CREATE ACCESS METHOD ColId TYPE_P am_type HANDLER qualified_name
+			{ $$ = NewCreateAccessMethodStmt($<p>1, $4, $6, objectNameFromQn($8)) }
+
+am_type:
+		INDEX     { $$ = "i" }
+	| TABLE       { $$ = "t" }
+
+/* ============================================================================
+   CREATE / ALTER EVENT TRIGGER (gram.y CreateEventTrigStmt / AlterEventTrigStmt).
+
+   EVENT is a real keyword token but the event NAME (ddl_command_start) and
+   the ALTER action words (DISABLE/ENABLE/RENAME/OWNER) are ordinary
+   identifiers in ddl.go — acceptIdentKeyword, not acceptKeyword — so they are
+   ColIds here rather than terminals.
+   ========================================================================= */
+
+/* EXECUTE takes FUNCTION or PROCEDURE interchangeably, and ddl.go accepts
+   NEITHER as well (`_ = p.acceptKeyword(...) || ...`). Spelled as three arms:
+   an optional-keyword nonterminal has to reduce its empty alternative right
+   after EXECUTE, one token before FUNCTION/PROCEDURE can decide it. */
+create_event_trigger_stmt:
+		CREATE EVENT TRIGGER ColId ON ColId evtrig_when EXECUTE qualified_name '(' ')'
+			{ $$ = NewCreateEventTriggerStmt($<p>1, $4, $6, $7, objectNameFromQn($9)) }
+	| CREATE EVENT TRIGGER ColId ON ColId evtrig_when EXECUTE FUNCTION qualified_name '(' ')'
+			{ $$ = NewCreateEventTriggerStmt($<p>1, $4, $6, $7, objectNameFromQn($10)) }
+	| CREATE EVENT TRIGGER ColId ON ColId evtrig_when EXECUTE PROCEDURE qualified_name '(' ')'
+			{ $$ = NewCreateEventTriggerStmt($<p>1, $4, $6, $7, objectNameFromQn($10)) }
+
+/* WHEN <var> IN ('a','b') [AND <var> IN (...)]. The filter list is flattened
+   to "var\x1fv1\x1fv2" entries so one []string carries both halves;
+   NewCreateEventTriggerStmt splits them back out and applies ddl.go's rule
+   that only a filter variable named "tag" contributes to Tags. */
+evtrig_when:
+		/* empty */                { $$ = []string(nil) }
+	| WHEN evtrig_filter_list      { $$ = $2 }
+
+evtrig_filter_list:
+		ColId IN_P '(' evtrig_sconst_list ')'
+			{ $$ = []string{evtrigFilter($1, $4)} }
+	| evtrig_filter_list AND ColId IN_P '(' evtrig_sconst_list ')'
+			{ $$ = append($1, evtrigFilter($3, $6)) }
+
+evtrig_sconst_list:
+		SCONST                             { $$ = []string{$1} }
+	| evtrig_sconst_list ',' SCONST        { $$ = append($1, $3) }
+
+/* DISABLE / ENABLE [REPLICA|ALWAYS] — ddl.go reads these with
+   acceptIdentKeyword, but they are all real kwlist unreserved keywords, so
+   here they are TERMINALS. That matters for the error cases: a ColId pair
+   would have matched `DISABLE ALWAYS` and `ENABLE BOGUS` and produced an
+   AlterEventTriggerStmt with an empty Action, where ddl.go leaves the extra
+   word unconsumed and it surfaces as a trailing-token syntax error. Exact
+   terminals reproduce that for free. */
+alter_event_trigger_stmt:
+		ALTER EVENT TRIGGER ColId DISABLE_P
+			{ $$ = NewAlterEventTriggerStmt($<p>1, $4, "disable", "", "") }
+	| ALTER EVENT TRIGGER ColId ENABLE_P
+			{ $$ = NewAlterEventTriggerStmt($<p>1, $4, "enable", "", "") }
+	| ALTER EVENT TRIGGER ColId ENABLE_P REPLICA
+			{ $$ = NewAlterEventTriggerStmt($<p>1, $4, "enable_replica", "", "") }
+	| ALTER EVENT TRIGGER ColId ENABLE_P ALWAYS
+			{ $$ = NewAlterEventTriggerStmt($<p>1, $4, "enable_always", "", "") }
+	| ALTER EVENT TRIGGER ColId RENAME TO ColId
+			{ $$ = NewAlterEventTriggerStmt($<p>1, $4, "rename", $7, "") }
+	| ALTER EVENT TRIGGER ColId OWNER TO alter_fn_owner
+			{ $$ = NewAlterEventTriggerStmt($<p>1, $4, "owner", "", $7) }
 
 create_policy_stmt:
 		CREATE POLICY ColId ON qualified_name opt_policy_as opt_policy_for

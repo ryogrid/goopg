@@ -1366,3 +1366,100 @@ AexprConst folds the sign into the constant, so the fixed point is now
 round-trip render `'-1'::integer` instead of `-1`. Anything else that was
 written to be a fixed point of the legacy AST is worth re-checking the same
 way.
+
+## P7.2 scope, measured (2026-08-28)
+
+P7.2 was written as "delete the legacy recursive-descent files". Measuring
+what still reaches them changes the shape of that.
+
+Over the whole regress corpus, 13,582 fragments:
+
+| | count | |
+|---|---|---|
+| routed to the LALR parser | 13,038 | 96.0% |
+| intercepted ABOVE `parser.Parse` | 310 | 2.3% |
+| genuinely reach the legacy parser | **234** | **1.7%** |
+
+The 310 never touch the parser at all: `internal/postmaster/dispatch.go:1879`
+`compatNoopCommandTag` matches role DDL, GRANT/REVOKE and database/schema DDL
+by STRING PREFIX before dispatch, so a grammar rule for them would be dead
+code. That is why the corpus shows 81 `create role` and 73 `drop role`
+fragments that no grammar wave will ever need.
+
+### The 234 split by how STRICT their legacy handler is
+
+This is the axis that decides whether porting is an improvement:
+
+**Strict recursive descent — worth porting, and now ported:**
+
+- `CREATE EVENT TRIGGER` / `ALTER EVENT TRIGGER` (38 fragments) — routed.
+- `CREATE ACCESS METHOD` (6) — routed.
+
+**Token walks that accept arbitrary soup — deliberately NOT ported:**
+
+| class | fragments | why |
+|---|---|---|
+| CREATE / ALTER OPERATOR | 80 | ends in `parseSkipToSemicolon` |
+| CREATE / ALTER TEXT SEARCH | 37 | same |
+| CREATE CAST | 17 | same |
+| CREATE RULE | 4 | full token-soup scanner producing a CompatNoopStmt |
+| CREATE AGGREGATE | 6 | advances past unknown tokens, `break`s at EOF, never errors |
+| CREATE STATISTICS | 1 | real AST, but every failure path falls to `parseSkipToSemicolon` |
+| ALTER DEFAULT PRIVILEGES | 3 | collects every token to `;` and scans the flat list |
+| CREATE FOREIGN / SERVER / CONVERSION | ~11 | CompatNoopStmt |
+
+A grammar for any of these would be **STRICTER than what ships**. goopg does
+not execute them — they exist to round-trip DDL for pg_dump — so the only
+effect of porting would be to start rejecting inputs the server accepts
+today. P5.14's note that "every class legacy answers with a real AST node is
+routed" was wrong on six classes; this survey is the corrected version.
+
+### What that means for P7.2
+
+The deletable surface is the legacy statement parsers for the 96% that IS
+routed. What has to stay is not "the legacy parser" but a narrow retained
+compat scanner for the table above, plus the expression machinery the compat
+paths still call. Deleting the routed-class parsers also retires
+`parseLegacyOnly`, and with it `diffParse` — so the differential corpus tests
+(`corpus_parity`, `corpus_gap`, `pos_parity`, and ~60 assertParity pin files)
+have to be converted to the goldens captured in P7.0 first, or kept by
+retaining the legacy parser as a TEST-ONLY oracle. That trade is the open
+decision; it is not a mechanical deletion.
+
+### Position parity: 2058 -> 534
+
+`TestPositionParity` (added with P7.1) is down to 534. Two systemic causes
+account for nearly all of the ground:
+
+**1. `lastConsumedPos()` where the rule is a DEFAULT REDUCTION.** It returns
+`prevPos`, which names the current token only when a lookahead has actually
+been read. Where none was, it names the token BEFORE — and where the rule
+reduces after a trailing operand, it names something AFTER. Both directions
+were live: `qualified_name` zeroed every FuncCall in the language,
+`select_pos` put SelectStmt's position PAST THE END of the statement (8 for
+`SELECT 1`), and the transaction-control rules pointed at their SCONST.
+`$<p>N` — the symbol's own captured offset — is right either way, and is now
+the default; the grammar went from 94 `lastConsumedPos()` uses to a handful
+where a lookahead is genuinely guaranteed.
+
+**2. Anchoring at the LEFT OPERAND instead of at the OPERATOR.** select.go
+puts `BinaryOp`, `InExpr`, `IsDistinctFromExpr` and `CastExpr` on the operator
+token — `>`, `IN`, `::`, the `CAST` keyword — not on what precedes it. 36
+BinaryOp sites, 7 InExpr, 2 IsDistinctFrom and the whole cast family were
+using `$1.Pos()`.
+
+Fixing (2) then broke `ResTarget`, which HAD been correct while every
+expression node pointed at its own first token: a target's position is the
+first token of the target, so it needs `$<p>1` rather than `expr.Pos()`. That
+is worth remembering — these two conventions are independent, and a node's
+`Pos()` is not a substitute for "where this construct starts".
+
+The rest were constructors that never took a position at all: `ObjectName`,
+`ColumnDef`, `ColumnType`, `AlterTableAction`, `FunctionArg`, `UpdateAssign`.
+And a few nodes legitimately carry ZERO — `SelectStmt`, the transaction-control
+statements — where matching legacy means passing 0, not inventing an offset.
+
+Remaining buckets, largest first: `ObjectName` still zero on 38 statement
+names, `LockingClause` (30), `AlterTableAction` on the one-liner arms that do
+not end in `)` (29), `WindowDef` (24), `SelectStmt` inside subqueries (24),
+`OnConflictClause` (19), `RangeVar` (19).
