@@ -1459,7 +1459,30 @@ The rest were constructors that never took a position at all: `ObjectName`,
 And a few nodes legitimately carry ZERO — `SelectStmt`, the transaction-control
 statements — where matching legacy means passing 0, not inventing an offset.
 
-Remaining buckets, largest first: `ObjectName` still zero on 38 statement
-names, `LockingClause` (30), `AlterTableAction` on the one-liner arms that do
-not end in `)` (29), `WindowDef` (24), `SelectStmt` inside subqueries (24),
-`OnConflictClause` (19), `RangeVar` (19).
+### 534 -> 204
+
+A third convention turned up, and it is the subtlest: **a nested select
+carries a position, the top-level one does not.** select.go stamps a
+SelectStmt with its own leading keyword everywhere it parses one as an
+EMBEDDED query — a CTE body, a set-operation arm, a scalar subquery, a
+derived table, CTAS's source, INSERT's source, EXPLAIN's inner statement —
+and leaves only the plain top-level statement at zero. `WITH ... SELECT` is
+NOT plain, because it goes through parseSelectWithCTE, which stamps it. A
+grammar has one rule for all of those, so `simple_select` now stamps
+unconditionally and `stmt_list` un-stamps (topLevelSelect) — that alone was
+104 statements.
+
+The rest of that round: LockingClause at FOR, OnConflictClause at ON,
+ATTACH PARTITION at the child name, CaseExpr at CASE, quantifiedAny at its
+operator, and inline windows at OVER (opt_window_spec reduces before OVER is
+on the stack, so the caller applies it). `specialFormCall` and `buildView`
+were two more open-coded ObjectName copies that dropped the name's offset —
+`buildView` was the seventh.
+
+Left at 204. Four of the remaining ALTER TABLE actions — INHERIT, NO INHERIT,
+OF, NOT OF, DETACH PARTITION — are NOT worth reproducing: ddl.go evaluates
+`p.cur().Pos` AFTER consuming the clause, so at statement end it records the
+offset PAST THE END of the statement (23 for `ALTER TABLE t INHERIT p`, which
+is 22 characters long). That is a legacy defect, and deliberately writing a
+caret past the end of the statement into the new parser would be a worse
+outcome than leaving those five at zero.

@@ -289,11 +289,11 @@ stmt:
 stmt_list:
 		stmt
 			{
-				$$ = []Stmt{$1}
+				$$ = []Stmt{topLevelSelect($1)}
 			}
 	| stmt_list ';' stmt
 			{
-				$$ = append($1, $3)
+				$$ = append($1, topLevelSelect($3))
 			}
 	| stmt_list ';'
 			{
@@ -826,7 +826,9 @@ for_locking_clause:
 for_locking_item:
 		for_locking_strength opt_locked_rels opt_lock_wait_policy
 			{
-				$$ = NewLockingClause(yylex.(*lexerState).lastConsumedPos(),
+				/* $<p>1 — the FOR keyword, which propagates through
+				   for_locking_strength's first terminal. */
+				$$ = NewLockingClause($<p>1,
 					$1.(LockStrength), $2, $3.(LockWaitPolicy))
 			}
 
@@ -943,13 +945,14 @@ select_pos:
 simple_select:
 		SELECT select_pos opt_all_distinct opt_target_list into_clause opt_from_clause where_clause group_clause having_clause opt_window_clause
 			{
-				/* ZERO, deliberately. ddl.go/select.go never stamp a
-				   SelectStmt position — every legacy SELECT carries pos 0 —
-				   and select_pos's lastConsumedPos() did not even yield the
-				   SELECT keyword: this rule is a default reduction, so it
-				   returned the offset PAST THE END of the statement (8 for
-				   `SELECT 1`). A wrong caret is worse than none. */
-				s := NewSelectStmt(0)
+				/* The SELECT keyword's own offset. select.go stamps a
+				   SelectStmt everywhere it parses one as a NESTED query —
+				   a CTE body, a set-operation arm, a scalar subquery, a
+				   derived table, CTAS's source, EXPLAIN's inner statement —
+				   and leaves ONLY the plain top-level statement at zero.
+				   stmt_list does that zeroing (topLevelSelect), because a
+				   grammar has one rule for all of them. */
+				s := NewSelectStmt($<p>1)
 				if di, ok := $3.(*distinctInfo); ok && di != nil {
 					s.Distinct = di.distinct
 					s.DistinctOn = di.on
@@ -991,15 +994,15 @@ simple_select:
 			}
 	| VALUES_LA values_rows
 			{
-				// Zero, like every other SelectStmt legacy builds.
-				s := NewSelectStmt(0)
+				// The VALUES keyword, same convention as the SELECT arm.
+				s := NewSelectStmt($<p>1)
 				s.ValuesRows = $2
 				$$ = s
 			}
 	| TABLE qualified_name
 			{
 				// gram.y :12968 desugars TABLE <rel> to SELECT * FROM <rel>.
-				s := NewSelectStmt(0)
+				s := NewSelectStmt($<p>1)
 				rv := rangeVarFromName($2, "")
 				s.Targets = []ResTarget{NewResTarget(0, "", NewStarExpr(0, "", ""))}
 				s.From = []RangeVar{rv}
@@ -2388,12 +2391,12 @@ a_expr:
 	| CASE cse_wl END_P
 			{
 				wl := $2.(*whenList)
-				$$ = NewCaseExpr(0, nil, wl.items, nil)
+				$$ = NewCaseExpr($<p>1, nil, wl.items, nil)
 			}
 	| CASE cse_wl ELSE a_expr END_P
 			{
 				wl := $2.(*whenList)
-				$$ = NewCaseExpr(0, nil, wl.items, $4)
+				$$ = NewCaseExpr($<p>1, nil, wl.items, $4)
 			}
 	/* SIMPLE form: CASE operand WHEN value THEN ... (gram.y case_expr's
 	   case_arg). NewCaseExpr has always taken an operand — only the grammar
@@ -2404,12 +2407,12 @@ a_expr:
 	| CASE a_expr cse_wl END_P
 			{
 				wl := $3.(*whenList)
-				$$ = NewCaseExpr(0, $2, wl.items, nil)
+				$$ = NewCaseExpr($<p>1, $2, wl.items, nil)
 			}
 	| CASE a_expr cse_wl ELSE a_expr END_P
 			{
 				wl := $3.(*whenList)
-				$$ = NewCaseExpr(0, $2, wl.items, $5)
+				$$ = NewCaseExpr($<p>1, $2, wl.items, $5)
 			}
 
 	/* Generic operator terminal — gram.y `a_expr Op a_expr` (%left Op).
@@ -2465,16 +2468,16 @@ a_expr:
 	   half of them (NOT ILIKE ANY / ALL / SOME, and every SOME) were simply
 	   missing. */
 	| a_expr like_op any_or_some '(' expr_list ')'
-			{ $$ = quantifiedAny(yylex, $1.Pos(), $1, OpCode($2), nil, $5, $<p>5) }
+			{ $$ = quantifiedAny(yylex, $<p>2, $1, OpCode($2), nil, $5, $<p>5) }
 	| a_expr like_op ALL '(' expr_list ')'
 			{ $$ = NewInExpr($<p>2, $1, false, OpCode($2), true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
 	| a_expr subq_op ANY '(' expr_list ')'
 			{
-				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), nil, $5, $<p>5)
+				$$ = quantifiedAny(yylex, $<p>2, $1, binOp(yylex, $2), nil, $5, $<p>5)
 			}
 	| a_expr subq_op SOME '(' expr_list ')'
 			{
-				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), nil, $5, $<p>5)
+				$$ = quantifiedAny(yylex, $<p>2, $1, binOp(yylex, $2), nil, $5, $<p>5)
 			}
 	| a_expr subq_op ALL '(' expr_list ')'
 			{
@@ -2486,7 +2489,7 @@ a_expr:
 				if sub == nil {
 					sub = NewSelectStmt(0)
 				}
-				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), sub, nil, 0)
+				$$ = quantifiedAny(yylex, $<p>2, $1, binOp(yylex, $2), sub, nil, 0)
 			}
 	| a_expr subq_op SOME select_with_parens
 			{
@@ -2494,7 +2497,7 @@ a_expr:
 				if sub == nil {
 					sub = NewSelectStmt(0)
 				}
-				$$ = quantifiedAny(yylex, $1.Pos(), $1, binOp(yylex, $2), sub, nil, 0)
+				$$ = quantifiedAny(yylex, $<p>2, $1, binOp(yylex, $2), sub, nil, 0)
 			}
 	| a_expr subq_op ALL select_with_parens
 			{
@@ -3164,7 +3167,7 @@ name_or_call:
 				ft := splitFuncName($1)
 				fc := NewFuncCall($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, nil, true)
 				fc.Filter = $5.(Expr)
-				fc.Over = $8
+				fc.Over = windowAt($8, $<p>6)
 				$$ = fc
 			}
 	| qualified_name '(' '*' ')' OVER ColId
@@ -3178,7 +3181,7 @@ name_or_call:
 			{
 				ft := splitFuncName($1)
 				fc := NewFuncCall($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, nil, true)
-				fc.Over = $7
+				fc.Over = windowAt($7, $<p>5)
 				$$ = fc
 			}
 	| qualified_name '(' DISTINCT expr_list ')' OVER '(' opt_window_spec ')'
@@ -3186,7 +3189,7 @@ name_or_call:
 				ft := splitFuncName($1)
 				fc := NewFuncCall($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $4, false)
 				fc.Distinct = true
-				fc.Over = $8
+				fc.Over = windowAt($8, $<p>6)
 				$$ = fc
 			}
 	| qualified_name '(' DISTINCT expr_list ')'
@@ -3229,7 +3232,7 @@ name_or_call:
 			{
 				ft := splitFuncName($1)
 				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
-				fc.Over = $7
+				fc.Over = windowAt($7, $<p>5)
 				$$ = fc
 			}
 	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')'
@@ -3248,7 +3251,7 @@ name_or_call:
 				ft := splitFuncName($1)
 				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				fc.OrderBy = $6
-				fc.Over = $10
+				fc.Over = windowAt($10, $<p>8)
 				$$ = fc
 			}
 	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')' OVER ColId
@@ -3292,7 +3295,7 @@ name_or_call:
 				_ = ft
 				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
 				fc.Filter = $5.(Expr)
-				fc.Over = $8
+				fc.Over = windowAt($8, $<p>6)
 				$$ = fc
 			}
 	| qualified_name '(' opt_call_args ')' within_group_clause
@@ -3639,9 +3642,9 @@ opt_on_conflict:
 		/* empty */
 			{ $$ = nil }
 	| ON CONFLICT opt_arbiter DO NOTHING
-			{ $$ = NewOnConflictClause($3, OnConflictNothing, nil, nil) }
+			{ $$ = NewOnConflictClauseAt($<p>1, $3, OnConflictNothing, nil, nil) }
 	| ON CONFLICT opt_arbiter DO UPDATE SET update_set_list opt_update_where
-			{ $$ = NewOnConflictClause($3, OnConflictUpdate, $7, $8) }
+			{ $$ = NewOnConflictClauseAt($<p>1, $3, OnConflictUpdate, $7, $8) }
 
 opt_arbiter:
 		/* empty */               { $$ = nil }

@@ -95,7 +95,7 @@ func collectPositions(v any) []string {
 // passing 0, not inventing an offset.
 //
 // The remaining tail is tracked in docs/design/not_ralph/TODO.md.
-const posParityCeiling = 534
+const posParityCeiling = 204
 
 func TestPositionParity(t *testing.T) {
 	var bad []string

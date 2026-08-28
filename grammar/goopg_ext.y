@@ -1712,7 +1712,7 @@ alter_table_action:
 				$$ = a
 			}
 	| SET WITHOUT OIDS
-			{ $$ = NewATAction(AlterTableNoOp) }
+			{ $$ = NewATActionAt(AlterTableNoOp, $<p>1) }
 	| SET WITHOUT CLUSTER
 			{ $$ = NewATActionAt(AlterTableSetWithoutCluster, $<p>1) }
 	| CLUSTER ON ColId
@@ -1770,7 +1770,7 @@ alter_table_action:
 	| ATTACH PARTITION qualified_name part_bound_spec2
 			{
 				b := $4.(*partBound)
-				a := NewATAttachPartition(0, objectNameFromQn($3), b.from, b.to, b.inVals, b.isDefault)
+				a := NewATAttachPartition($<p>3, objectNameFromQn($3), b.from, b.to, b.inVals, b.isDefault)
 				SetPartitionOfHashBound(a.AttachPartitionOf, b.modulus, b.remainder, b.isHash)
 				$$ = a
 			}

@@ -1027,3 +1027,11 @@ func NewUpdateAssignAt(pos int, column, tableQualifier string, columns []string,
 	a.pos = pos
 	return a
 }
+
+// NewOnConflictClauseAt is NewOnConflictClause with the ON keyword's offset,
+// which is where dml.go anchors the clause.
+func NewOnConflictClauseAt(pos int, target *OnConflictTarget, action OnConflictAction, set []UpdateAssign, where Expr) *OnConflictClause {
+	c := NewOnConflictClause(target, action, set, where)
+	c.pos = pos
+	return c
+}

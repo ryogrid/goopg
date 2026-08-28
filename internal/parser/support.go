@@ -1619,7 +1619,10 @@ func partitionByFrom(method string, methodPos int, keys []partKey) *PartitionByC
 // nil. canonDump distinguishes nil from []bool{false,false}, so using the
 // general ctor here diverges even when every form parses.
 func specialFormCall(pos int, name string, args []Expr) *FuncCall {
-	fc := NewFuncCall(pos, ObjectName{Name: name}, args, false)
+	// The NAME carries the same offset as the call — select.go stamps both
+	// from the keyword. Leaving ObjectName.pos at zero was invisible to
+	// canonDump but is a real errposition for a failed argument coercion.
+	fc := NewFuncCall(pos, ObjectName{pos: pos, Name: name}, args, false)
 	fc.Variadic = nil
 	return fc
 }
@@ -3479,11 +3482,9 @@ func firstArg(args []string) []string {
 // alternatives exist only to keep the optional modifier in one position, so
 // the body lives here rather than being written twice.
 func buildView(l yyLexer, orReplace bool, modifier any, q qname, cols []string, with []string, sel Stmt, check any) Stmt {
-	nm := q.parts
-	name := ObjectName{Name: nm[len(nm)-1]}
-	if len(nm) > 1 {
-		name.Schema = nm[len(nm)-2]
-	}
+	// objectNameFromQn, not a seventh open-coded copy of it: the copies were
+	// what dropped qname.pos on every statement name.
+	name := objectNameFromQn(q)
 	s, _ := sel.(*SelectStmt)
 	// A view body may not contain SELECT INTO, and legacy reports it with its
 	// OWN message and no caret (ddl.go:2632, selectIntoNoPos).
@@ -4039,4 +4040,29 @@ func substringCall(l yyLexer, pos int, args []Expr) Expr {
 		}
 	}
 	return specialFormCall(pos, "substring", args)
+}
+
+// topLevelSelect reproduces the one asymmetry in select.go's SelectStmt
+// positions: a select parsed as a NESTED query keeps its leading keyword's
+// offset, but the plain TOP-LEVEL statement carries zero. The WITH form is
+// not plain — `WITH c AS (...) SELECT 1` goes through parseSelectWithCTE,
+// which does stamp it — so only a top-level select with NO with-clause is
+// zeroed. The grammar has one rule for every position a select can appear in,
+// so the distinction has to be applied here, where "top level" is known.
+func topLevelSelect(st Stmt) Stmt {
+	if sel, ok := st.(*SelectStmt); ok && sel.With == nil {
+		sel.pos = 0
+	}
+	return st
+}
+
+// windowAt stamps an inline window specification with the OVER keyword's
+// offset, which is where select.go anchors it. opt_window_spec reduces before
+// OVER is on the stack, so the position has to be applied by the caller.
+func windowAt(v any, pos int) *WindowDef {
+	wd, _ := v.(*WindowDef)
+	if wd != nil {
+		wd.pos = pos
+	}
+	return wd
 }
