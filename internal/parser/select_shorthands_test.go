@@ -42,7 +42,10 @@ func TestSelectShorthandsAndTempViews(t *testing.T) {
 	// no trailing clauses.
 	assertBothReject(t, "select (row(1, 2.0)).f1")
 	assertBothReject(t, "select (a).b from t")
-	assertBothReject(t, "TABLE sometable ORDER BY a")
+	// PG ACCEPTS this: select_no_parens wraps simple_select (gram.y:12970
+	// `TABLE relation_expr`) with opt_sort_clause. Legacy rejected it; the
+	// grammar is the PG-faithful side.
+	assertParity(t, "TABLE sometable ORDER BY a")
 }
 
 // TestSelectIntoIsContextChecked pins the four contexts legacy REJECTS a

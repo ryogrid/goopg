@@ -77,8 +77,9 @@ func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
 	return parseExprBatch(input, true, mc...)
 }
 
-// parseExprBatch is ParseExpr's parseBatch: useYacc=false forces the legacy
-// leg, for the differential tests only. See parseLegacyOnly.
+// parseExprBatch is ParseExpr's parseBatch. useYacc=false is unused today —
+// the routing decision for an expression is unconditional — but the parameter
+// keeps the two entry points the same shape.
 func parseExprBatch(input string, useYacc bool, mc ...*mmgr.Context) (Expr, error) {
 	var sctx *mmgr.Context
 	if len(mc) > 0 {
@@ -159,16 +160,11 @@ func parseExprBatch(input string, useYacc bool, mc ...*mmgr.Context) (Expr, erro
 // separate packages joined by a function-pointer hook wired from postmaster;
 // they are one package now, so the call is direct.
 //
-// parseLegacyOnly forces the fall-through. It exists ONLY for the
-// differential tests: with both parsers in one package, a diffParse whose
-// "legacy" leg called Parse would compare the yacc parser against itself and
-// pass while testing nothing.
+// The legacy body is still reached — routeBatch declines the ~1.7% of the
+// regress corpus whose classes it does not own (CREATE/ALTER OPERATOR, TEXT
+// SEARCH, CAST and the other compat scanners), and those fall through to it.
 func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 	return parseBatch(input, true, mc...)
-}
-
-func parseLegacyOnly(input string) ([]Stmt, error) {
-	return parseBatch(input, false)
 }
 
 func parseBatch(input string, useYacc bool, mc ...*mmgr.Context) ([]Stmt, error) {

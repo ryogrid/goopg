@@ -28,13 +28,6 @@ func TestColumnTypmodParity(t *testing.T) {
 		"ALTER TABLE t ADD COLUMN a varchar(10)",
 		"ALTER TABLE t ALTER COLUMN a TYPE numeric(10,2)",
 	} {
-		l, n, err := diffParse(q)
-		if err != nil {
-			t.Errorf("%q -> %v", q, err)
-			continue
-		}
-		if l != n {
-			t.Errorf("DIFF %q\n L=%s\n N=%s", q, l, n)
-		}
+		assertParity(t, q)
 	}
 }

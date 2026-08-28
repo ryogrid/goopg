@@ -64,5 +64,8 @@ func TestUtilityStatements(t *testing.T) {
 	assertBothReject(t, "CLUSTER (VERBOSE) t USING i")
 	assertBothReject(t, "EXPLAIN ANALYZE ANALYZE t")
 	// ANALYZE's own option words are keywords, not a relation name.
-	assertBothReject(t, "ANALYZE ANALYZE")
+	// PG ACCEPTS this: `analyze` is an UNRESERVED keyword, so the second one
+	// is the RELATION NAME (AnalyzeStmt: analyze_keyword opt_verbose
+	// opt_vacuum_relation_list). Legacy rejected it.
+	assertParity(t, "ANALYZE ANALYZE")
 }

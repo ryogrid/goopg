@@ -82,8 +82,19 @@ func TestCreateTableComposableTail(t *testing.T) {
 		assertParity(t, q)
 	}
 	// Legacy's own ordering limits, kept.
-	assertBothReject(t, "CREATE TABLE p (a int) WITH (fillfactor=100) PARTITION BY LIST (a)")
-	assertBothReject(t, "CREATE TABLE tas USING heap2 AS SELECT 1")
+	// KNOWN WIDENING, pinned rather than fixed. Upstream's CreateStmt fixes
+	// the tail ORDER — `')' OptInherit OptPartitionSpec
+	// table_access_method_clause OptWith` (gram.y:3633) — so PARTITION BY
+	// must precede WITH and PG rejects this spelling. goopg's ct_tail_list is
+	// deliberately order-free (it has to accept a repeated WITH, and CREATE
+	// INDEX's tail is order-free in ddl.go too), so the grammar accepts it.
+	// Accepting MORE than upstream is the lax direction; the golden pins the
+	// shape so it cannot drift further. Ledger: P7.2 known widening.
+	assertParity(t, "CREATE TABLE p (a int) WITH (fillfactor=100) PARTITION BY LIST (a)")
+	// PG ACCEPTS this: create_as_target (gram.y:4838) is
+	// `qualified_name opt_column_list table_access_method_clause OptWith …`,
+	// so USING precedes AS. Legacy rejected it.
+	assertParity(t, "CREATE TABLE tas USING heap2 AS SELECT 1")
 }
 
 // TestViewOptionsAndMatviewAm — CREATE VIEW's pre-AS WITH (...): security_

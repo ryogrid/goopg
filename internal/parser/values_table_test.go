@@ -9,23 +9,15 @@ func TestValuesTable(t *testing.T) {
 		"TABLE t",
 		"SELECT * FROM (VALUES (1),(2)) AS t(x)",
 	} {
-		l, n, err := diffParse(q)
-		if err != nil {
-			t.Errorf("%q -> %v", q, err)
-		} else if l != n {
-			t.Errorf("DIFF %q\n L=%s\n N=%s", q, l, n)
-		}
+		assertParity(t, q)
 	}
-	// upstream-capable forms legacy rejects: must at least PARSE
+	// Upstream-capable forms the LEGACY parser rejected. They must parse, and
+	// their shape is pinned by the golden captured while both parsers existed.
 	for _, q := range []string{
 		"WITH w AS (SELECT 1 AS v) TABLE w",
 		"VALUES (1),(2) UNION ALL VALUES (3)",
 	} {
-		if _, _, err := diffParse(q); err != nil {
-			if !contains(err.Error(), "legacy:") {
-				t.Errorf("NEW parser fails %q: %v", q, err)
-			}
-		}
+		assertParity(t, q)
 	}
 }
 

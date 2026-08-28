@@ -23,13 +23,6 @@ func TestMatViewParity(t *testing.T) {
 		"CREATE MATERIALIZED VIEW mv AS SELECT 1",
 		"CREATE MATERIALIZED VIEW IF NOT EXISTS s.mv (a, b) AS SELECT 1, 2 WITH NO DATA",
 	} {
-		l, n, err := diffParse(q)
-		if err != nil {
-			t.Errorf("%q -> %v", q, err)
-			continue
-		}
-		if l != n {
-			t.Errorf("DIFF %q\n L=%s\n N=%s", q, truncForLog(l), truncForLog(n))
-		}
+		assertParity(t, q)
 	}
 }

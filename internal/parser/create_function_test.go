@@ -143,14 +143,12 @@ func TestCreateFunctionRoutingCoversCorpus(t *testing.T) {
 			continue
 		}
 		routedN++
-		l, n, derr := diffParse(q)
-		switch {
-		case derr != nil && strings.HasPrefix(derr.Error(), "legacy:"):
-			// Neither parser accepts it; not this test's concern.
-		case derr != nil:
-			t.Errorf("routed but yacc rejects: %q: %v", q, derr)
-		case l != n:
-			t.Errorf("routed but diverges: %q\n  legacy=%s\n  yacc  =%s", q, l, n)
+		g, ok := goldenFor(t, q)
+		if !ok || strings.HasPrefix(g, "!") {
+			continue // harvester noise, or pinned as REJECTED
+		}
+		if _, derr := ParseOneSrc(q, frags[0]); derr != nil {
+			t.Errorf("routed but rejected: %q: %v", q, derr)
 		}
 	}
 	if routedN == 0 {

@@ -1,8 +1,9 @@
 package parser
 
 import (
+	"os"
+	"strings"
 	"testing"
-
 )
 
 // Parity pins for four AST-carrier defects that were live on ALREADY-ROUTED
@@ -113,33 +114,56 @@ func TestRawSpanQuotedTailParity(t *testing.T) {
 	}
 }
 
-// assertParity runs one statement through both parsers and requires identical
-// canonical dumps.
+// assertParity pins one statement's AST against the recorded golden.
+//
+// It used to compare the two PARSERS. That check was exactly right while both
+// existed, and became impossible the moment P7.2 deleted the legacy statement
+// parsers — the "legacy" leg would have had nothing to run. The goldens
+// replace it with no loss: every one was captured while the legacy oracle
+// still agreed (the ratchets stood at ZERO rejects and ZERO AST divergences
+// over both corpora), so a golden IS the legacy answer, recorded.
+//
+// A statement with no golden fails rather than passing vacuously — that is the
+// failure mode this whole file exists to prevent.
 func assertParity(t *testing.T, q string) {
 	t.Helper()
-	recordGolden(q, yaccDump(q))
-	l, n, err := diffParse(q)
-	if err != nil {
-		t.Errorf("%q -> %v", q, err)
+	got := yaccDump(q)
+	recordGolden(q, got)
+	if os.Getenv("GOOPG_UPDATE_GOLDENS") == "1" {
 		return
 	}
-	if l != n {
-		t.Errorf("DIFF %q\n L=%s\n N=%s", q, truncForLog(l), truncForLog(n))
+	want, ok := goldenFor(t, q)
+	if !ok {
+		t.Errorf("no golden for %q — regenerate with GOOPG_UPDATE_GOLDENS=1 and REVIEW the diff", q)
+		return
+	}
+	if got != want {
+		t.Errorf("AST drift %q\n want=%s\n got =%s", q, truncForLog(want), truncForLog(got))
+	}
+	if strings.HasPrefix(got, "!") {
+		t.Errorf("%q is REJECTED but pinned with assertParity: %s", q, truncForLog(got))
 	}
 }
 
-// assertBothReject pins a form that BOTH parsers must refuse. The differential
-// harness only reports legacy-accepts/yacc-rejects, so a widening — the yacc
-// parser accepting something legacy does not — is invisible to it; this is the
-// explicit guard for that direction.
+// assertBothReject pins a form the parser must REFUSE. The name is historical:
+// it used to require that legacy refused it too, which is what made it a guard
+// against WIDENING — the new parser accepting something legacy did not. That
+// direction is now pinned by the golden, which records the rejection message,
+// so an accidental widening shows up as a golden drift from "!syntax error …"
+// to an AST dump.
 func assertBothReject(t *testing.T, q string) {
 	t.Helper()
-	recordGolden(q, yaccDump(q))
-	if _, err := parseLegacyOnly(q); err == nil {
-		t.Fatalf("legacy ACCEPTS %q — this guard assumes it does not", q)
+	got := yaccDump(q)
+	recordGolden(q, got)
+	if !strings.HasPrefix(got, "!") {
+		t.Errorf("ACCEPTS %q, which this guard requires it to reject:\n %s", q, truncForLog(got))
+		return
 	}
-	if _, _, err := diffParse(q); err == nil {
-		t.Errorf("yacc ACCEPTS %q but legacy rejects it", q)
+	if os.Getenv("GOOPG_UPDATE_GOLDENS") == "1" {
+		return
+	}
+	if want, ok := goldenFor(t, q); ok && got != want {
+		t.Errorf("rejection drift %q\n want=%s\n got =%s", q, truncForLog(want), truncForLog(got))
 	}
 }
 

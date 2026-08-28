@@ -1604,3 +1604,71 @@ counterpart:
 `TestPositionParity` is a two-way ratchet at 4. It began at **2058** — a class
 that was completely invisible until the test existed, because canonDump
 prints no positions.
+
+## P7.2 cutover, part 1 (2026-08-28): the harness moves to the goldens
+
+The differential harness is gone. `assertParity` and `assertBothReject` now
+compare the yacc parser against the RECORDED GOLDEN instead of against the
+legacy parser, and `diffParse` / `parseLegacyOnly` are deleted. Nothing is
+lost: every golden was captured while the legacy oracle still existed and
+AGREED — the ratchets stood at ZERO rejects and ZERO AST divergences over both
+corpora — so a golden IS the legacy answer, recorded.
+
+Retired, having served their purpose, with their final numbers:
+
+| test | final |
+|---|---|
+| `TestLegacyCorpusRejects` | 0 |
+| `TestLegacyCorpusDivergence` | 0 |
+| `TestLegacyCorpusParity` | (pass) |
+| `TestPositionParity` | 4 |
+
+Each compared the two parsers over a harvested corpus; with one parser left
+the comparison has nothing to run against. `harvestSQLLiterals` survives in
+`corpus_scan_test.go`, because `alter_table_test.go` and
+`create_function_test.go` still use it to prove ROUTING COVERAGE — a routed
+form that does not parse is a hard 42601, since routeBatch never falls back.
+
+### Two defects the conversion exposed
+
+**1. `assertBothReject` could never detect a widening.** Its doc called it
+"the explicit guard for that direction". The body did:
+
+```go
+if _, err := parseLegacyOnly(q); err == nil { t.Fatalf("legacy ACCEPTS …") }
+if _, _, err := diffParse(q); err == nil { t.Errorf("yacc ACCEPTS …") }
+```
+
+`diffParse` returns an error when EITHER parser rejects. Legacy rejects by
+construction here, so `err` was never nil and the second check could not fire.
+Rewriting it against the golden surfaced five statements the new parser
+accepts. FOUR are PG-correct and legacy was wrong:
+
+| statement | why PG accepts it |
+|---|---|
+| `TABLE t ORDER BY a` | select_no_parens wraps `simple_select: TABLE relation_expr` with opt_sort_clause (gram.y:12970) |
+| `CREATE EXTENSION "e"` | CreateExtensionStmt takes `name` = ColId; a quoted identifier lexes as IDENT |
+| `CREATE TABLE t USING heap2 AS SELECT 1` | create_as_target puts table_access_method_clause before AS (gram.y:4838) |
+| `ANALYZE ANALYZE` | `analyze` is UNRESERVED, so the second one is the RELATION NAME |
+
+The fifth is a genuine WIDENING, now pinned rather than fixed:
+`CREATE TABLE p (a int) WITH (…) PARTITION BY LIST (a)`. Upstream fixes the
+tail order — `')' OptInherit OptPartitionSpec table_access_method_clause
+OptWith` (gram.y:3633) — so PARTITION BY must precede WITH. goopg's
+`ct_tail_list` is deliberately order-free (it must accept a repeated WITH, and
+CREATE INDEX's tail is order-free in ddl.go too), so the grammar takes both
+orders. Accepting MORE than upstream is the lax direction; the golden pins the
+shape so it cannot drift further.
+
+**2. The golden regenerator ran too early and recorded HALF the corpus.** It
+was a test named `TestZZZParityGoldensRegenerate`, on the assumption that the
+ZZZ prefix made it last. `go test` runs tests in SOURCE ORDER — file by file,
+alphabetically — so a regenerator living in `goldens_test.go` ran before every
+file after "g", and silently recorded nothing for them. The cutover oracle was
+missing exactly the statements it existed to pin.
+
+Moving it to `TestMain` took the corpus from **751 to 1642** statements. This
+is the second time in this migration that a test which looked like a guard was
+structurally unable to fail (the first was `TestLegacyCorpusParity` silently
+`continue`-ing whenever either parser rejected). Worth a standing habit:
+**make a guard fail on purpose once before trusting it.**

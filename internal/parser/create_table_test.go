@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"strings"
 	"testing"
 
 )
@@ -16,9 +15,9 @@ import (
 // column typmods, the orphaned PRIMARY KEY/UNIQUE/DEFAULT alternatives and the
 // missing table-level CHECK/FOREIGN KEY all stayed invisible.
 //
-// diffParse compares the two parsers directly: its legacy leg goes through
-// parseLegacyOnly, which is the only thing standing between this suite and a
-// self-comparison now that both parsers live in one package (P7.1).
+// assertParity pins each statement against its recorded golden. The goldens
+// were captured while the legacy parser still existed and agreed, so they
+// carry that oracle forward past P7.2's deletion.
 func TestCreateTableV0(t *testing.T) {
 	for _, q := range []string{
 		"CREATE TABLE t (a int, b text)",
@@ -114,24 +113,13 @@ func TestCreateTableV0(t *testing.T) {
 		if _, err := ParseOneSrc(q, toks); err != nil {
 			t.Errorf("yacc-only case regressed %q: %v", q, err)
 		}
-		if _, err := parseLegacyOnly(q); err == nil {
-			t.Errorf("%q now parses in legacy too — move it to the parity list", q)
-		}
 	}
 
-	// Rejected by BOTH parsers. opt_ct_tail is a flat single-clause rule, so it
-	// cannot compose WITH (...) with PARTITION BY; legacy cannot either.
-	// Tracked in docs/design/not_ralph/TODO.md (P4.1 open-option-list tail).
-	for _, q := range []string{
-		"CREATE TABLE c (a int) WITH (fillfactor=70) PARTITION BY RANGE (a)",
-	} {
-		_, _, err := diffParse(q)
-		if err == nil {
-			t.Errorf("%q now parses on both sides — promote it to the parity list", q)
-			continue
-		}
-		if !strings.HasPrefix(err.Error(), "legacy:") {
-			t.Errorf("%q: expected the legacy leg to reject first, got %v", q, err)
-		}
-	}
+	// KNOWN WIDENING. Upstream's CreateStmt fixes the tail ORDER
+	// (gram.y:3633 `')' OptInherit OptPartitionSpec
+	// table_access_method_clause OptWith`), so PARTITION BY must precede WITH
+	// and PG rejects this spelling — as did legacy. goopg's ct_tail_list is
+	// deliberately order-free, so the grammar accepts it. Pinned by the
+	// golden rather than fixed; see the twin note in sql_forms_batch_test.go.
+	assertParity(t, "CREATE TABLE c (a int) WITH (fillfactor=70) PARTITION BY RANGE (a)")
 }

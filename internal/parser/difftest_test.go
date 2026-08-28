@@ -85,32 +85,6 @@ func dumpStmts(stmts []Stmt) string {
 	return strings.Join(parts, "; ")
 }
 
-// diffParse runs both parsers over sql and returns their canonical dumps.
-// Legacy errors are expected for inputs outside its surface; new-parser
-// errors likewise — the corpus only feeds inputs both must accept.
-// P7.1: parseLegacyOnly, NOT Parse. Both parsers live in this package now, so
-// Parse routes and the "legacy" leg would be the yacc parser — the whole
-// differential suite would pass while comparing the new parser to itself.
-func diffParse(sql string) (legacy, yacc string, err error) {
-	lstmts, err := parseLegacyOnly(sql)
-	if err != nil {
-		return "", "", fmt.Errorf("legacy: %w", err)
-	}
-	toks, err := Lex(sql)
-	if err != nil {
-		return "", "", fmt.Errorf("lex: %w", err)
-	}
-	// ParseOneSrc, not ParseOne: routeBatch (dispatch.go:91) always calls the
-	// src-carrying entry point, and every raw-source span rule (view RawDef,
-	// CHECK text, SET values) returns "" when lexerState.src is empty. Using
-	// ParseOne here made the harness structurally blind to that whole class —
-	// a column-level CHECK compared equal while dropping its expression.
-	nstmts, err := ParseOneSrc(sql, toks)
-	if err != nil {
-		return "", "", fmt.Errorf("yacc: %w", err)
-	}
-	return dumpStmts(lstmts), dumpStmts(nstmts), nil
-}
 
 // TestDifferentialSelectCore is the P1.1 gate corpus (04-testing §3):
 // SELECT core — targets incl. arithmetic/precedence, column refs
@@ -209,19 +183,15 @@ func TestDifferentialSelectCore(t *testing.T) {
 		"SELECT a || b FROM t",
 	}
 	for _, sql := range cases {
-		legacy, yacc, err := diffParse(sql)
-		if err != nil {
-			t.Errorf("%q: %v", sql, err)
-			continue
-		}
-		if legacy != yacc {
-			t.Errorf("%q AST mismatch:\n  legacy: %s\n    yacc: %s", sql, legacy, yacc)
-		}
+		assertParity(t, sql)
 	}
 }
 
-// Known-difference pins — every row of difftest_known_diffs.md needs a test
-// asserting BOTH sides so the table can never silently rot.
+// Known-difference pins. These used to assert BOTH sides so
+// difftest_known_diffs.md could not silently rot. P7.2 deleted the legacy
+// statement parsers, so only the NEW side is checkable — the legacy shape each
+// row describes is now recorded prose, and the assertions below pin the shape
+// the migration deliberately chose instead.
 
 // TestKnownDiffUnaryMinusFold pins the unary-minus row: the yacc parser
 // folds `-literal` into a negative constant (upstream doNegate semantics,
@@ -238,14 +208,6 @@ func TestKnownDiffUnaryMinusFold(t *testing.T) {
 		t.Fatalf("yacc SELECT -5 target = %#v, want folded IntegerConst{-5}", sel.Targets[0].Expr)
 	}
 
-	lstmts, err := parseLegacyOnly("SELECT -5")
-	if err != nil {
-		t.Fatal(err)
-	}
-	lsel := lstmts[0].(*SelectStmt)
-	if _, ok := lsel.Targets[0].Expr.(*UnaryOp); !ok {
-		t.Fatalf("legacy SELECT -5 target = %#v, want UnaryOp (documents the divergence)", lsel.Targets[0].Expr)
-	}
 }
 
 // TestKnownDiffSelectAll pins the SELECT ALL row: accepted upstream and by
@@ -255,9 +217,6 @@ func TestKnownDiffSelectAll(t *testing.T) {
 	if _, err := ParseOne(toks, 0); err != nil {
 		t.Fatalf("yacc rejected SELECT ALL: %v", err)
 	}
-	if _, err := parseLegacyOnly("SELECT ALL a FROM t"); err == nil {
-		t.Fatal("legacy unexpectedly accepts SELECT ALL; update the known-diffs table")
-	}
 }
 
 // TestKnownDiffCheckThenNotNull pins the CHECK-then-NOT-NULL row: legacy's
@@ -266,13 +225,6 @@ func TestKnownDiffSelectAll(t *testing.T) {
 // consequences that the yacc parser deliberately does not reproduce.
 func TestKnownDiffCheckThenNotNull(t *testing.T) {
 	const q = "CREATE TABLE t (x int CHECK (x > 0) NOT NULL)"
-	lstmts, err := parseLegacyOnly(q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lstmts[0].(*CreateTableStmt).Columns[0].NotNull {
-		t.Fatal("legacy now keeps NOT NULL after CHECK; retire this known-diff row")
-	}
 	toks, _ := Lex(q)
 	nstmts, err := ParseOneSrc(q, toks)
 	if err != nil {
@@ -290,13 +242,6 @@ func TestKnownDiffCheckThenNotNull(t *testing.T) {
 // therefore loses its NOT NULL entirely (12 regress fragments).
 func TestKnownDiffUniqueThenNotNull(t *testing.T) {
 	const q = "CREATE TABLE t (a int UNIQUE NOT NULL)"
-	lstmts, err := parseLegacyOnly(q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lstmts[0].(*CreateTableStmt).Columns[0].NotNull {
-		t.Fatal("legacy now keeps NOT NULL after UNIQUE; retire this known-diff row")
-	}
 	toks, _ := Lex(q)
 	nstmts, err := ParseOneSrc(q, toks)
 	if err != nil {

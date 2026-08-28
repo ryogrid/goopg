@@ -16,11 +16,6 @@ func TestCastTargetTypes(t *testing.T) {
 		"SELECT n::national character varying(8) FROM t",
 		"SELECT x::numeric(10,2) FROM t",
 	} {
-		l, n, err := diffParse(q)
-		if err != nil {
-			t.Errorf("%q -> %v", q, err)
-		} else if l != n {
-			t.Errorf("DIFF %q\n L=%s\n N=%s", q, l, n)
-		}
+		assertParity(t, q)
 	}
 }

@@ -32,13 +32,6 @@ func TestNotLookaheadParity(t *testing.T) {
 		"SELECT * FROM t WHERE a NOT ILIKE 'x%'",
 		"SELECT * FROM t WHERE a NOT SIMILAR TO 'x%'",
 	} {
-		l, n, err := diffParse(q)
-		if err != nil {
-			t.Errorf("%q -> %v", q, err)
-			continue
-		}
-		if l != n {
-			t.Errorf("DIFF %q\n L=%s\n N=%s", q, truncForLog(l), truncForLog(n))
-		}
+		assertParity(t, q)
 	}
 }

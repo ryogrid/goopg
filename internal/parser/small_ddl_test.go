@@ -30,6 +30,8 @@ func TestSmallDDLClasses(t *testing.T) {
 	}
 	// An extension name is an IDENT or a string literal, never a quoted
 	// identifier or a number — legacy rejects both spellings.
-	assertBothReject(t, "CREATE EXTENSION \"e\"")
+	// PG ACCEPTS this: CreateExtensionStmt takes `name`, which is a ColId,
+	// and a quoted identifier lexes as IDENT. Legacy rejected it.
+	assertParity(t, "CREATE EXTENSION \"e\"")
 	assertBothReject(t, "CREATE EXTENSION e VERSION 1")
 }

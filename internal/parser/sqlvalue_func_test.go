@@ -40,14 +40,7 @@ func TestSQLValueFunctions(t *testing.T) {
 		"SELECT localtimestamp(0)",
 		"SELECT localtime(6)",
 	} {
-		l, n, err := diffParse(q)
-		if err != nil {
-			t.Errorf("%q -> %v", q, err)
-			continue
-		}
-		if l != n {
-			t.Errorf("DIFF %q\n L=%s\n N=%s", q, l, n)
-		}
+		assertParity(t, q)
 	}
 }
 
@@ -85,13 +78,6 @@ func TestPgbenchTPCBScriptParity(t *testing.T) {
 		"INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (10, 1, 21517, 2112, CURRENT_TIMESTAMP)",
 		"END",
 	} {
-		l, n, err := diffParse(q)
-		if err != nil {
-			t.Errorf("%q -> %v", q, err)
-			continue
-		}
-		if l != n {
-			t.Errorf("DIFF %q\n L=%s\n N=%s", q, l, n)
-		}
+		assertParity(t, q)
 	}
 }

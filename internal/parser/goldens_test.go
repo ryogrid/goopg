@@ -137,14 +137,27 @@ func TestParityGoldensAreCurrent(t *testing.T) {
 	}
 }
 
-// TestZZZParityGoldensRegenerate writes the file from what this run recorded.
-// The ZZZ prefix makes it run after every recorder in the package, which is the
-// only ordering guarantee Go gives (source order within a file, file order by
-// name).
-func TestZZZParityGoldensRegenerate(t *testing.T) {
-	if os.Getenv("GOOPG_UPDATE_GOLDENS") != "1" {
-		t.Skip("set GOOPG_UPDATE_GOLDENS=1 to regenerate")
+// TestMain writes the goldens AFTER every test in the package has run.
+//
+// The regenerator used to be a test named TestZZZParityGoldensRegenerate, on
+// the assumption that the ZZZ prefix made it last. It does not: `go test`
+// runs tests in SOURCE ORDER — file by file, alphabetically — so a regenerator
+// living in goldens_test.go ran before every file after "g" in the alphabet,
+// and silently recorded nothing for them. That is how a cutover oracle ends up
+// missing the statements it exists to pin. TestMain is the only hook that is
+// genuinely last.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if os.Getenv("GOOPG_UPDATE_GOLDENS") == "1" {
+		if err := writeGoldens(); err != nil {
+			fmt.Fprintln(os.Stderr, "golden regeneration failed:", err)
+			code = 1
+		}
 	}
+	os.Exit(code)
+}
+
+func writeGoldens() error {
 	goldenMu.Lock()
 	defer goldenMu.Unlock()
 	keys := make([]string, 0, len(goldenSeen))
@@ -154,18 +167,30 @@ func TestZZZParityGoldensRegenerate(t *testing.T) {
 	sort.Strings(keys)
 	var b strings.Builder
 	b.WriteString("# Parity goldens — the cutover's oracle; see goldens_test.go.\n")
-	b.WriteString("# Regenerate: GOOPG_UPDATE_GOLDENS=1 go test ./internal/sqlparser/\n")
+	b.WriteString("# Regenerate: GOOPG_UPDATE_GOLDENS=1 go test ./internal/parser/\n")
 	b.WriteString(fmt.Sprintf("# %d statements\n", len(keys)))
 	for _, q := range keys {
 		b.WriteString(escapeGolden(q) + "\t" + escapeGolden(goldenSeen[q]) + "\n")
 	}
 	if err := os.MkdirAll(filepath.Dir(goldenPath), 0o755); err != nil {
-		t.Fatal(err)
+		return err
 	}
-	if err := os.WriteFile(goldenPath, []byte(b.String()), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("wrote %d goldens to %s", len(keys), goldenPath)
+	return os.WriteFile(goldenPath, []byte(b.String()), 0o644)
 }
 
 var _ = goldenRecords
+
+// goldenFor returns the recorded dump for one statement. The file is loaded
+// once per run; a miss means the statement is new and must be reviewed into
+// the corpus rather than silently passing.
+var (
+	goldenLoadOnce sync.Once
+	goldenLoaded   map[string]string
+)
+
+func goldenFor(t *testing.T, q string) (string, bool) {
+	t.Helper()
+	goldenLoadOnce.Do(func() { goldenLoaded = loadGoldens(t) })
+	v, ok := goldenLoaded[q]
+	return v, ok
+}

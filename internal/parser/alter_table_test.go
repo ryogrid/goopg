@@ -49,14 +49,7 @@ func TestAlterTableRoutedParity(t *testing.T) {
 		"ALTER TABLE p ATTACH PARTITION c DEFAULT",
 		"ALTER TABLE p DETACH PARTITION c",
 	} {
-		l, n, err := diffParse(q)
-		if err != nil {
-			t.Errorf("%q -> %v", q, err)
-			continue
-		}
-		if l != n {
-			t.Errorf("DIFF %q\n L=%s\n N=%s", q, truncForLog(l), truncForLog(n))
-		}
+		assertParity(t, q)
 	}
 }
 
@@ -88,19 +81,22 @@ func TestAlterTableRoutingIsNarrow(t *testing.T) {
 			continue // stays legacy: safe by construction
 		}
 		routed++
-		l, n, derr := diffParse(q)
-		if derr != nil {
-			if strings.HasPrefix(derr.Error(), "legacy:") {
-				// Neither parser accepts it (the harvester also picks up
-				// truncated literals and commented-out fragments). Routing is
-				// not implicated.
-				continue
-			}
-			t.Errorf("ROUTED BUT UNPARSEABLE (hard 42601 for the user):\n  %s\n  %v", q, derr)
-			continue
+		// Routing is unconditional — routeBatch never falls back — so a
+		// routed form that does not parse is a hard 42601 for the user. The
+		// AST SHAPE is pinned by the goldens; this scan pins COVERAGE.
+		//
+		// Only statements that have a GOLDEN count. The harvester also picks
+		// up truncated literals and commented-out fragments ("ALTER TABLE t
+		// ADD", "... RENAME // CONSTRAINT old TO new"); the old shape excused
+		// those because legacy rejected them too, and the golden set — which
+		// records only what a real pin asserted — is the equivalent filter
+		// now that there is no legacy leg to ask.
+		g, ok := goldenFor(t, q)
+		if !ok || strings.HasPrefix(g, "!") {
+			continue // harvester noise, or a form pinned as REJECTED
 		}
-		if l != n {
-			t.Errorf("ROUTED BUT DIVERGENT:\n  %s\n  L=%s\n  N=%s", q, truncForLog(l), truncForLog(n))
+		if _, derr := ParseOneSrc(q, frags[0]); derr != nil {
+			t.Errorf("ROUTED BUT UNPARSEABLE (hard 42601 for the user):\n  %s\n  %v", q, derr)
 		}
 	}
 	if checked < 50 {

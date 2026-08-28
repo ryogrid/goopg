@@ -77,13 +77,7 @@ func TestBExprSignedBounds(t *testing.T) {
 		"SELECT f1 FROM t WHERE f1 NOT BETWEEN -1e6 AND 1e6",
 		"SELECT f1 FROM t WHERE f1 BETWEEN SYMMETRIC -1 AND 1",
 	} {
-		if _, err := Parse(q); err != nil {
-			t.Errorf("legacy rejects %q: %v", q, err)
-			continue
-		}
-		if _, _, err := diffParse(q); err != nil {
-			t.Errorf("yacc rejects %q: %v", q, err)
-		}
+		assertParity(t, q)
 	}
 }
 
