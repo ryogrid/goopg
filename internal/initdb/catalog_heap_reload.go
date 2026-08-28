@@ -822,6 +822,7 @@ func reloadRolesFromAuthidHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 			}
 			attrs := catalog.RoleAttrs{
 				Superuser:   d[2].BoolValue(),
+				Inherit:     d[3].BoolValue(), // rolinherit — M0134-0162
 				CreateRole:  d[4].BoolValue(),
 				CreateDB:    d[5].BoolValue(),
 				CanLogin:    d[6].BoolValue(),

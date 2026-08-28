@@ -47,7 +47,7 @@ func pgAuthidRel() storage.RelFileNode {
 // only mutates rolname while preserving oid) both route here. Exported for the
 // server-layer role-DDL intercept, which drives it from its own transaction
 // (Server.syncAuthidHeapRow).
-func SyncAuthidRow(ctx *Context, oid uint32, rolname string, super, canLogin, createDB, createRole, replication, bypassRLS bool, connLimit int32, rolpassword, validUntil string) error {
+func SyncAuthidRow(ctx *Context, oid uint32, rolname string, super, canLogin, inherit, createDB, createRole, replication, bypassRLS bool, connLimit int32, rolpassword, validUntil string) error {
 	if !catalogHeapSyncAvailable(ctx) {
 		return nil
 	}
@@ -55,7 +55,7 @@ func SyncAuthidRow(ctx *Context, oid uint32, rolname string, super, canLogin, cr
 		return err
 	}
 	stampAuthidRow(ctx, oid)
-	row := buildAuthidUserRow(int64(oid), rolname, super, canLogin, createDB, createRole,
+	row := buildAuthidUserRow(int64(oid), rolname, super, canLogin, inherit, createDB, createRole,
 		replication, bypassRLS, connLimit, rolpassword, validUntil)
 	tid, err := writeHeapRowCanonical(ctx, pgAuthidRel(), pgAuthidSyncCols(), row)
 	if err != nil {

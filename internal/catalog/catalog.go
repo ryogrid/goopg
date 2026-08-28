@@ -5780,9 +5780,18 @@ type RoleMembership struct {
 // user.c) — an existing row's value for that option is left untouched
 // (mirroring "a plain re-grant never downgrades an unmentioned option"), and
 // a fresh row falls back to InitGrantRoleOptions' defaults: admin=false,
-// set=true, inherit=the grantee's rolinherit (goopg has no per-role NOINHERIT
-// tracking — CREATE/ALTER ROLE never clears it — so every role's rolinherit
-// is always true, matching this default exactly). A non-nil pointer is the
+// set=true, inherit=the GRANTEE's (memberOid's) rolinherit, read live from the
+// RoleAttrs sidecar via roleInheritsByOIDLocked — mirroring AddRoleMems'
+// "otherwise, set the default value based on the role-level property" branch,
+// which does exactly this SearchSysCache1(AUTHOID, memberid) → mrform->
+// rolinherit lookup (postgres/src/backend/commands/user.c:1928-1938). Until
+// M0134-0162 this was hardcoded true, which was correct only because goopg had
+// no per-role NOINHERIT tracking at all; now that [NO]INHERIT is modelled, a
+// NOINHERIT member granted a role with a plain `GRANT r TO m` must NOT inherit
+// its privileges — HasPrivsOfRole/SelectBestAdmin below both traverse only
+// InheritOption-marked rows, so leaving the old default would have silently
+// handed a NOINHERIT role every privilege of every role it was granted. A
+// non-nil pointer is the
 // explicit requested value and always applies, including to an existing row
 // (may legitimately downgrade e.g. admin_option, unlike an unspecified
 // option on a bare re-grant). Returns the row's OID. M0119-0004-ACLHEAP.
@@ -5807,10 +5816,38 @@ func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, ad
 		OID: oid, RoleOID: roleOid, MemberOID: memberOid,
 		GrantorOID:    grantorOid,
 		AdminOption:   admin != nil && *admin,
-		InheritOption: inherit == nil || *inherit,
+		InheritOption: inheritOptionDefault(inherit, c.roleInheritsByOIDLocked(memberOid)),
 		SetOption:     set == nil || *set,
 	}
 	return oid
+}
+
+// inheritOptionDefault resolves a fresh membership row's inherit_option:
+// the explicitly requested value when the statement named one, else the
+// grantee's role-level rolinherit (user.c:1924-1939).
+func inheritOptionDefault(requested *bool, granteeRolInherit bool) bool {
+	if requested != nil {
+		return *requested
+	}
+	return granteeRolInherit
+}
+
+// roleInheritsByOIDLocked reports a role's pg_authid.rolinherit by OID.
+// Callers must already hold c.mu (GrantRoleMembership writes under Lock).
+// Mirrors IsSuperuser's OID→name→RoleAttrs walk. An OID with no sidecar entry
+// — the bootstrap superuser, the predefined pg_* roles, or a name registered
+// before attributes were recorded — reports PG's default true, matching every
+// rolinherit => 't' row in pg_authid.dat. M0134-0162.
+func (c *InMemory) roleInheritsByOIDLocked(oid uint32) bool {
+	for name, roid := range c.roles {
+		if roid == oid {
+			if a := c.roleAttrs[name]; a != nil {
+				return a.Inherit
+			}
+			return true
+		}
+	}
+	return true
 }
 
 // RevokeRoleMembership removes or downgrades the ONE `REVOKE <role> FROM
@@ -8714,9 +8751,10 @@ func (c *InMemory) registerSystemTables() {
 	// from the same live c.roles/c.roleAttrs state as pg_roles, not the
 	// on-disk global/1260 heap file: that file (pg_authid_sync.go) is a
 	// separate crash-recovery mirror for auth credentials, not a live SQL
-	// read path. rolinherit is never modelled (goopg's role DDL has no
-	// per-role NOINHERIT tracking) and always reports PG's CREATE ROLE
-	// default 't'. rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
+	// read path. rolinherit now reflects the RoleAttrs sidecar too
+	// (M0134-0162, which added per-role [NO]INHERIT tracking); a role with no
+	// sidecar entry still reports PG's CREATE ROLE default 't'.
+	// rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
 	// rolconnlimit/rolvaliduntil now reflect the RoleAttrs sidecar (DU-002
 	// slice 439 follow-up); a role with no sidecar entry (predefined pg_*
 	// roles, unregistered names) falls back to PG's own CREATE ROLE
@@ -8744,6 +8782,7 @@ func (c *InMemory) registerSystemTables() {
 	pgAuthid.VirtualRows = func() [][]string {
 		rowFor := func(oidStr, name string, a *RoleAttrs) []string {
 			rolsuper, rolcanlogin := "f", "t"
+			rolinherit := "t" // PG's CREATE ROLE default (user.c:291)
 			rolcreaterole, rolcreatedb, rolreplication, rolbypassrls := "f", "f", "f", "f"
 			rolconnlimit := "-1"
 			rolpassword := VirtualNull
@@ -8754,6 +8793,9 @@ func (c *InMemory) registerSystemTables() {
 				}
 				if !a.CanLogin {
 					rolcanlogin = "f"
+				}
+				if !a.Inherit {
+					rolinherit = "f"
 				}
 				if a.CreateRole {
 					rolcreaterole = "t"
@@ -8776,8 +8818,7 @@ func (c *InMemory) registerSystemTables() {
 				}
 			}
 			return []string{
-				oidStr, name, rolsuper,
-				"t", // rolinherit: PG default, never overridden by goopg's role DDL
+				oidStr, name, rolsuper, rolinherit,
 				rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls,
 				rolconnlimit, rolpassword, rolvaliduntil,
 			}
@@ -8795,17 +8836,19 @@ func (c *InMemory) registerSystemTables() {
 		}
 		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat), same
 		// gap/rationale as pg_roles above (0119-0004ch ledger discovery (a)):
-		// this RoleAttrs{ConnLimit: -1} drives rowFor's defaults to exactly
-		// PG's predefined-role shape (rolsuper/rolcanlogin='f', rolpassword
-		// NULL, rolconnlimit=-1), matching SyncPgAuthidFile's frozen rows and
-		// pg_authid.dat (every seeded role's rolconnlimit is -1, never 0).
+		// this RoleAttrs{ConnLimit: -1, Inherit: true} drives rowFor's
+		// defaults to exactly PG's predefined-role shape (rolsuper/
+		// rolcanlogin='f', rolinherit='t', rolpassword NULL, rolconnlimit=-1),
+		// matching SyncPgAuthidFile's frozen rows and pg_authid.dat (every
+		// seeded role's rolconnlimit is -1, never 0, and every one of them
+		// carries rolinherit => 't' — M0134-0162).
 		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
 		for _, s := range predefinedRoleSeeds {
 			predefinedNames = append(predefinedNames, s.name)
 		}
 		sort.Strings(predefinedNames)
 		for _, name := range predefinedNames {
-			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{ConnLimit: -1}))
+			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{ConnLimit: -1, Inherit: true}))
 		}
 		return out
 	}
@@ -16198,9 +16241,22 @@ func (c *InMemory) RegisterRole(name string) {
 // explicitly; see tryHandleRoleDDL's two construction sites. ValidUntil is
 // the raw `VALID UNTIL '<literal>'` text (empty = NULL/no expiration, PG's
 // default); goopg does not evaluate it (no password-expiry enforcement).
+//
+// Inherit mirrors `[NO]INHERIT` / pg_authid.rolinherit (M0134-0162). It is the
+// ONLY boolean here whose PG default is TRUE (user.c CreateRole's `bool
+// inherit = true` at :291, written unconditionally at :411; every seeded role
+// in pg_authid.dat carries rolinherit => 't'), so — exactly like ConnLimit's
+// -1 — the Go zero value is the WRONG starting point: every RoleAttrs built as
+// a "no attributes given yet" seed MUST set Inherit: true explicitly. The five
+// such sites are role_ddl.go's CREATE/ALTER/RENAME seeds and the predefined-
+// role row in this file's pg_authid VirtualRows. The two RoleAttrs{} literals
+// in checkCreateRolePrivileges/checkAlterRoleAttrPrivileges are deliberately
+// NOT seeds — they are "fail closed, no privileges" sentinels, and INHERIT is
+// not a privilege PG gates on there.
 type RoleAttrs struct {
 	CanLogin    bool
 	Superuser   bool
+	Inherit     bool
 	CreateDB    bool
 	CreateRole  bool
 	Replication bool
