@@ -1573,6 +1573,25 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	// it skip that ROLLBACK and abort on the next BEGIN with 25P02
 	// (AI-20260810-011258-006). See connTxState.wireStatus.
 	w.TxStatusFn = connTx.wireStatus
+	// Honor client_min_messages for every NOTICE/WARNING this connection
+	// emits. The GUC is read through the session registry on each message
+	// rather than snapshotted, so a mid-session `SET client_min_messages`
+	// (and its transactional SET LOCAL / RESET) takes effect immediately —
+	// upstream reads the same live GUC in should_output_to_client
+	// (postgres/src/backend/utils/error/elog.c). Installing the hook here,
+	// after the startup handshake, is what makes pre-auth messages
+	// unfiltered, matching upstream's ClientAuthInProgress carve-out.
+	// M0134-0165.
+	w.ClientMinMessagesFn = func() string {
+		if sess == nil {
+			return ""
+		}
+		_, eff, ok := sess.Get("client_min_messages")
+		if !ok {
+			return ""
+		}
+		return eff
+	}
 	// LISTEN/NOTIFY identity: the backend PID is the source of NOTIFY deliveries
 	// and the SessionRegistry is the hub key. On teardown drop every channel
 	// registration and undelivered notification for this session, mirroring

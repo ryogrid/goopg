@@ -172,7 +172,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/rowtypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/rules.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/sanity_check.sql,failed,no,-,
-,regress-sql,regress,postgres/src/test/regress/sql/security_label.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/security_label.sql,pass,yes,-,"M0134-0165: sized live for the first time (16-line diff, one root cause) and CLOSED GREEN — scripts/pg-regress-runner.sh --verbose security_label: 100% parity, byte-identical. goopg defined the client_min_messages GUC but nothing consumed it, so the case's opening SET client_min_messages TO 'warning' did not suppress the DROP ROLE IF EXISTS notices. Fixed engine-wide at the single wire choke point (libpq FrameWriter.WriteNoticeResponse), mirroring should_output_to_client (postgres/src/backend/utils/error/elog.c)."
 ,regress-sql,regress,postgres/src/test/regress/sql/select.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/select_distinct.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/select_distinct_on.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
