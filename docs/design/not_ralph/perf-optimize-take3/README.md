@@ -30,6 +30,14 @@ ground truth since, and none had been re-measured:**
    **empty wait columns on all 28,425 goopg samples**; this is the first study
    that can attribute goopg's commit wait the same way PG's is attributed.
 
+> **Update (2026-08-30, `ac0fd1267`): candidates A, B and C are implemented.**
+> `-S` select-only went **92,191 → 111,927 tps (+21.4 %)**, closing the read gap
+> against PostgreSQL from 1.23× to **1.02×**; `-N` is unchanged, as predicted for
+> a commit-flush-bound workload already at WAL parity. Allocation per query fell
+> 68.7 % and `Lock:relation` went from 19.9 % of all backend samples to zero.
+> Full results and the re-profile: [06-post-implementation-results.md](06-post-implementation-results.md).
+> Chapters 01–05 below describe the state *before* those changes.
+
 ## Verdict up front
 
 **The write path has reached PostgreSQL parity, and the WAL-persistence problem
@@ -88,6 +96,7 @@ Five findings carry the report:
 | [03-contention.md](03-contention.md) | Block and mutex profiles, ranked and mapped to source symbols |
 | [04-wal-persistence.md](04-wal-persistence.md) | goopg's flush path vs PG's `XLogFlush` group commit; why this is done |
 | [05-improvement-plan.md](05-improvement-plan.md) | Ranked candidates with measured ceilings, effort, risk, gates, sequencing, and the do-not-re-land list |
+| [06-post-implementation-results.md](06-post-implementation-results.md) | **Candidates A, B, C landed** — measured outcome, re-profile, and the next bottleneck |
 
 ## Review
 

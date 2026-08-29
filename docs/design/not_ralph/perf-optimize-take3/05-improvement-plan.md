@@ -14,6 +14,14 @@ allocation *count*, not *bytes*. `DeformPGIndexTuple` is 276 allocations per
 query and 11.48 % of read CPU; `yyNewParser` is 1 allocation per statement and
 1.94 %, despite being 54 % of allocated bytes ([02 §2.4](02-cpu-and-allocation.md)).
 
+> **Status (2026-08-30): candidates A, B and C are LANDED** in `ac0fd1267`.
+> Measured outcome, the re-profile on top of them, and a revised ranking are in
+> [06-post-implementation-results.md](06-post-implementation-results.md). The
+> ceilings below are the *predictions* this chapter made; 06 reports what was
+> actually realised — including where a prediction was wrong (candidate C's
+> ~2 % estimate understated it, because bytes-per-second is not the only cost of
+> an allocation).
+
 ## 1. Ranked candidates
 
 | # | candidate | evidence | est. ceiling | effort | risk |
