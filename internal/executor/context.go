@@ -1612,6 +1612,22 @@ func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode lmg
 		return nil
 	}
 	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	// perf-optimize-take3 candidate A. This whole function is
+	// acquire-then-immediately-release, so its only observable contract is
+	// "block if something conflicting is held right now". When no strong lock
+	// exists on the tag, a weak request provably cannot conflict, and upstream
+	// would not have touched the shared lock table at all
+	// (EligibleForRelationFastPath / FastPathGrantRelationLock,
+	// postgres/src/backend/storage/lmgr/lock.c:267,2750). Taking the global
+	// LockManager mutex twice — insert then delete — to record a lock that is
+	// dropped microseconds later was 90.8% of read-path mutex delay at c=50.
+	//
+	// Note this also removes the Lock:relation wait-event window, which was
+	// being reported around every acquire whether or not it blocked; upstream
+	// reports no wait for an uncontended fast-path grant either.
+	if tableLockMgr.NoConflictFastPath(tag, mode) {
+		return nil
+	}
 	if c.Activity != nil {
 		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
 	}

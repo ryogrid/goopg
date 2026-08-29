@@ -150,7 +150,7 @@ func ParseOneSrc(src string, toks []Token) ([]Stmt, error) {
 	l.lastPos = eofPos(toks)
 	l.fragEnd = fragEndPos(src, toks)
 	l.endMark = -1
-	if yyParse(l) != 0 {
+	if parsePooled(l) != 0 {
 		if l.err != nil {
 			return nil, l.err
 		}
@@ -164,7 +164,7 @@ func ParseOne(toks []Token, baseOffset int) ([]Stmt, error) {
 	l := &lexerState{toks: toks}
 	l.lastPos = eofPos(toks)
 	l.endMark = -1
-	if yyParse(l) != 0 {
+	if parsePooled(l) != 0 {
 		if l.err != nil {
 			return nil, l.err
 		}

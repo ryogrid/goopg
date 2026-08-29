@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/storage/lmgr/lockwait"
@@ -199,6 +200,9 @@ type lockState struct {
 	holders map[BackendID]Mask
 	waiters []*Waiter
 	granted Mask // OR of all holder masks; cached for fast conflict checks
+	// strongCounted records whether this tag currently contributes to
+	// lm.strongCounts, so syncStrongLocked can pair its increments exactly.
+	strongCounted bool
 }
 
 func (s *lockState) recomputeGranted() {
@@ -311,6 +315,10 @@ type LockManager struct {
 	mu              sync.Mutex
 	states          map[LockTag]*lockState
 	deadlockTimeout time.Duration
+
+	// strongCounts is the FastPathStrongRelationLocks->count[] analogue; see
+	// fastpath.go. Read without lm.mu, mutated only under it.
+	strongCounts [fastPathStrongBuckets]atomic.Int32
 }
 
 // New returns an empty lock manager with the default deadlock
@@ -377,6 +385,7 @@ func (lm *LockManager) TryAcquire(b BackendID, t LockTag, m Mode) error {
 	if st.canGrantImmediately(b, m) {
 		st.holders[b] |= bit(m)
 		st.granted |= bit(m)
+		lm.syncStrongLocked(t, st)
 		return nil
 	}
 	return ErrLockNotAvailable
@@ -430,6 +439,7 @@ func (lm *LockManager) acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 	if st.canGrantImmediately(b, m) {
 		st.holders[b] |= bit(m)
 		st.granted |= bit(m)
+		lm.syncStrongLocked(t, st)
 		lm.mu.Unlock()
 		return nil
 	}
@@ -531,6 +541,7 @@ func (lm *LockManager) unparkWaiter(t LockTag, w *Waiter, b BackendID, m Mode) {
 			delete(st.holders, b)
 		}
 		st.recomputeGranted()
+		lm.syncStrongLocked(t, st)
 		lm.wakePassLocked(t, st)
 	}
 	lm.gcLocked(t, st)
@@ -559,6 +570,7 @@ func (lm *LockManager) Release(b BackendID, t LockTag, m Mode) {
 		delete(st.holders, b)
 	}
 	st.recomputeGranted()
+	lm.syncStrongLocked(t, st)
 	lm.wakePassLocked(t, st)
 	lm.gcLocked(t, st)
 }
@@ -575,6 +587,7 @@ func (lm *LockManager) ReleaseAll(b BackendID) {
 		}
 		delete(st.holders, b)
 		st.recomputeGranted()
+		lm.syncStrongLocked(t, st)
 		lm.wakePassLocked(t, st)
 		lm.gcLocked(t, st)
 	}
@@ -596,6 +609,7 @@ func (lm *LockManager) wakePassLocked(_ LockTag, st *lockState) {
 		}
 		st.holders[w.Backend] |= bit(w.Mode)
 		st.granted |= bit(w.Mode)
+		lm.syncStrongLocked(w.tag, st)
 		st.waiters = st.waiters[1:]
 		// Buffered chan of size 1 so the send is non-blocking even
 		// if the waiter goroutine hasn't reached its select yet.

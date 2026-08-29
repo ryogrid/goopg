@@ -669,21 +669,58 @@ func DeformPGIndexTuple(raw []byte, attrs []PGIndexAttr, natts int) ([][]byte, [
 	if natts > len(attrs) {
 		return nil, nil, fmt.Errorf("btree: natts %d exceeds %d described attributes", natts, len(attrs))
 	}
+	values := make([][]byte, natts)
+	isnull := make([]bool, natts)
+	if err := deformPGIndexTupleInto(raw, attrs, natts, values, isnull); err != nil {
+		return nil, nil, err
+	}
+	return values, isnull, nil
+}
+
+// physAttr lets deformPGIndexTupleInto walk either the layout-only
+// []PGIndexAttr or the richer []PGKeyAttr without materialising the former
+// from the latter. It is a generic constraint, not an interface value: each
+// instantiation is a separate compiled loop with a direct field read, so there
+// is no dynamic dispatch and no boxing.
+//
+// The alternative — desc.Physical() — allocated and copied a []PGIndexAttr on
+// EVERY comparison, which at c=50 was a per-btree-descent allocation on top of
+// the two below (perf-optimize-take3/05 candidate B).
+type physAttr interface {
+	phys() PGIndexAttr
+}
+
+func (a PGIndexAttr) phys() PGIndexAttr { return a }
+
+// deformPGIndexTupleInto is the body of index_deform_tuple, writing into
+// caller-owned slices instead of allocating them.
+//
+// values[i] ALIASES raw (as DeformPGIndexTuple's contract has always said), so
+// a caller reusing scratch across tuples must finish with the previous tuple's
+// datums before deforming the next one. comparePGIndexTuples does: it deforms
+// both operands, then compares, then drops both.
+//
+// values and isnull must each have room for natts entries; the caller is
+// trusted on that, since the two in-tree callers pass a fixed-size array.
+func deformPGIndexTupleInto[T physAttr](raw []byte, attrs []T, natts int, values [][]byte, isnull []bool) error {
+	if natts > len(attrs) {
+		return fmt.Errorf("btree: natts %d exceeds %d described attributes", natts, len(attrs))
+	}
 	if len(raw) < SizeOfIndexTupleData {
-		return nil, nil, fmt.Errorf("btree: index tuple too short (%d bytes)", len(raw))
+		return fmt.Errorf("btree: index tuple too short (%d bytes)", len(raw))
 	}
 	tInfo := pgTInfo(raw)
 	size := int(tInfo & IndexSizeMask)
 	if size > len(raw) {
-		return nil, nil, fmt.Errorf("btree: t_info size %d exceeds the %d supplied bytes", size, len(raw))
+		return fmt.Errorf("btree: t_info size %d exceeds the %d supplied bytes", size, len(raw))
 	}
 	hasNulls := tInfo&IndexNullMask != 0
 	off := PGIndexInfoFindDataOffset(tInfo)
 
-	values := make([][]byte, natts)
-	isnull := make([]bool, natts)
 	for i := range natts {
-		att := attrs[i]
+		att := attrs[i].phys()
+		values[i] = nil
+		isnull[i] = false
 		if hasNulls {
 			// A CLEAR bit means null (fill_val sets the bit for present values).
 			if raw[SizeOfIndexTupleData+i/8]&(1<<uint(i%8)) == 0 {
@@ -695,17 +732,17 @@ func DeformPGIndexTuple(raw []byte, attrs []PGIndexAttr, natts int) ([][]byte, [
 			off = alignTo(off, att.AlignBy)
 		}
 		if off >= size {
-			return nil, nil, fmt.Errorf("btree: attribute %d starts at %d, past the %d-byte tuple", i, off, size)
+			return fmt.Errorf("btree: attribute %d starts at %d, past the %d-byte tuple", i, off, size)
 		}
 		n, err := pgAttLength(att, raw[off:size])
 		if err != nil {
-			return nil, nil, fmt.Errorf("btree: attribute %d: %w", i, err)
+			return fmt.Errorf("btree: attribute %d: %w", i, err)
 		}
 		if off+n > size {
-			return nil, nil, fmt.Errorf("btree: attribute %d of %d bytes overruns the %d-byte tuple", i, n, size)
+			return fmt.Errorf("btree: attribute %d of %d bytes overruns the %d-byte tuple", i, n, size)
 		}
 		values[i] = raw[off : off+n]
 		off += n
 	}
-	return values, isnull, nil
+	return nil
 }

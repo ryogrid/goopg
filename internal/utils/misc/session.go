@@ -86,11 +86,16 @@ func (s *SessionRegistry) SetReportableHook(fn func(name, value string)) {
 // Get returns the (variable, effective-value, ok) triple. The variable
 // pointer is the global registry entry — callers should not mutate it.
 func (s *SessionRegistry) Get(name string) (*Variable, string, bool) {
-	v, ok := s.lookupVariable(name)
+	// perf-optimize-take3/06 candidate F: lowercase ONCE. This used to call
+	// strings.ToLower twice for a global hit — once inside lookupVariable ->
+	// Registry.Get and once again for `key` — and then do up to three map
+	// lookups. It runs several times per statement, so the duplication showed
+	// up as 2.9% of read-path CPU.
+	key := lowerGUCName(name)
+	v, ok := s.lookupVariableLower(key)
 	if !ok {
 		return nil, "", false
 	}
-	key := strings.ToLower(name)
 	if val, ok := s.local[key]; ok {
 		return v, val, true
 	}
@@ -98,6 +103,30 @@ func (s *SessionRegistry) Get(name string) (*Variable, string, bool) {
 		return v, val, true
 	}
 	return v, v.Value, true
+}
+
+// lowerGUCName is strings.ToLower with an early exit. GUC names are ASCII and
+// almost always already lowercase; strings.ToLower scans the whole string
+// before deciding, whereas this stops at the first uppercase byte.
+func lowerGUCName(name string) string {
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c >= 'A' && c <= 'Z' {
+			return strings.ToLower(name)
+		}
+	}
+	return name
+}
+
+// lookupVariableLower is lookupVariable for an already-lowercased name.
+func (s *SessionRegistry) lookupVariableLower(lname string) (*Variable, bool) {
+	if s == nil {
+		return nil, false
+	}
+	if v, ok := s.global.getLower(lname); ok {
+		return v, true
+	}
+	v, ok := s.custom[lname]
+	return v, ok
 }
 
 // GetDisplay is like Get but returns the client-visible display form (e.g.

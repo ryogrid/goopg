@@ -202,6 +202,11 @@ func ComparePGIndexTupleKeyAttrs(desc *PGIndexKeyDesc, a, b []byte) (int, error)
 	return comparePGIndexTuples(desc, a, b, false)
 }
 
+// deformScratchAtts caps the on-stack deform scratch in comparePGIndexTuples.
+// PG's INDEX_MAX_KEYS is 32, but real indexes are narrow; 8 covers every index
+// in the TPC-H/TPC-DS/pgbench schemas with a 384-byte frame.
+const deformScratchAtts = 8
+
 func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (int, error) {
 	nkey := desc.NKeyAtts()
 	if nkey == 0 {
@@ -234,14 +239,36 @@ func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (
 	}
 	ncmp := min(nattsA, nattsB)
 
-	phys := desc.Physical()
 	if ncmp > 0 {
-		av, anull, err := DeformPGIndexTuple(a, phys, ncmp)
-		if err != nil {
+		// perf-optimize-take3/05 candidate B. This is the btree descent's
+		// inner loop: at c=50 it ran ~276 heap allocations per single-row
+		// index lookup (55.9% of ALL allocated objects in the server, 11.5%
+		// of read CPU) because each comparison allocated desc.Physical()
+		// plus a [][]byte and a []bool per operand — five allocations, none
+		// of which outlive the loop below.
+		//
+		// The scratch arrays are stack-allocated for the overwhelmingly
+		// common narrow-index case; deformPGIndexTupleInto only writes
+		// through them, so escape analysis keeps them off the heap. Indexes
+		// wider than deformScratchAtts fall back to the allocating path
+		// rather than growing the stack frame for every comparison.
+		var (
+			avArr, bvArr       [deformScratchAtts][]byte
+			anullArr, bnullArr [deformScratchAtts]bool
+			av, bv             [][]byte
+			anull, bnull       []bool
+		)
+		if ncmp <= deformScratchAtts {
+			av, bv = avArr[:ncmp], bvArr[:ncmp]
+			anull, bnull = anullArr[:ncmp], bnullArr[:ncmp]
+		} else {
+			av, bv = make([][]byte, ncmp), make([][]byte, ncmp)
+			anull, bnull = make([]bool, ncmp), make([]bool, ncmp)
+		}
+		if err := deformPGIndexTupleInto(a, desc.Attrs, ncmp, av, anull); err != nil {
 			return 0, fmt.Errorf("btree: left tuple: %w", err)
 		}
-		bv, bnull, err := DeformPGIndexTuple(b, phys, ncmp)
-		if err != nil {
+		if err := deformPGIndexTupleInto(b, desc.Attrs, ncmp, bv, bnull); err != nil {
 			return 0, fmt.Errorf("btree: right tuple: %w", err)
 		}
 		for i := range ncmp {
