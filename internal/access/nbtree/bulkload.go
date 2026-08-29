@@ -586,6 +586,25 @@ const maxRawItemSize = 7800
 // (pgposting_format_test.go) instead. Upstream draws the same line:
 // `_bt_load` closes a posting run with `_bt_keep_natts_fast` (nbtutils.c),
 // never with `_bt_compare`.
+// BTreeDefaultFillFactor mirrors upstream's BTREE_DEFAULT_FILLFACTOR
+// (postgres/src/include/access/nbtree.h:201): a freshly built LEAF is packed to
+// this percentage and the rest is left for later inserts, so an index that is
+// subsequently updated does not have to split every page it owns.
+const BTreeDefaultFillFactor = 90
+
+// leafFillFactorReserve is the byte headroom a bulk-built leaf keeps free,
+// upstream's BTGetTargetPageFreeSpace: (100 - fillfactor)% of the page's usable
+// space. Internal levels are unaffected — they are built from separators whose
+// count is fixed by the leaf level, so reserving there would only deepen the
+// tree.
+func leafFillFactorReserve(p storage.Page) int {
+	usable := int(storage.MustHeader(p).Special()) - storage.SizeOfPageHeaderData
+	if usable <= 0 {
+		return 0
+	}
+	return usable * (100 - BTreeDefaultFillFactor) / 100
+}
+
 func deduplicateToRawItems(f indexFormat, items []item) []rawItem {
 	raws, _ := deduplicateToRawItemsWithSpans(f, items)
 	return raws
@@ -756,7 +775,19 @@ func (bt *BTree) buildLevelRaw(raws []rawItem, flags uint16, level uint32) ([]bu
 		h := storage.MustHeader(curSlot.Page())
 		free := int(h.Upper()) - int(h.Lower())
 		const itemIDSize = 4
-		if free < itemIDSize+MaxAlign(len(ri.raw))+bt.format().separatorReserve(nextSep) {
+		need := itemIDSize + MaxAlign(len(ri.raw)) + bt.format().separatorReserve(nextSep)
+		// Fill factor (perf-optimize-take3 candidate G, root cause). Packing a
+		// leaf to 100% means the FIRST later insert into it must split it, which
+		// is why an index built by CREATE INDEX / pgbench -i doubled in size
+		// under -N and then stopped: ~0.019 splits/txn x 8 KB = 157 B/txn,
+		// against a measured 152 B/txn. Upstream leaves headroom instead —
+		// BTREE_DEFAULT_FILLFACTOR = 90 (postgres/src/include/access/nbtree.h:201),
+		// applied in _bt_buildadd via BTGetTargetPageFreeSpace — which is why
+		// PostgreSQL's pkey grows 0 B/txn on the same workload.
+		if level == 0 {
+			need += leafFillFactorReserve(curSlot.Page())
+		}
+		if free < need {
 			nextSlot, nextBlk, err := bt.pool.PinNew(bt.rel)
 			if err != nil {
 				curSlot.Unlock()

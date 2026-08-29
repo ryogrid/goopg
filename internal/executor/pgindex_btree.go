@@ -545,6 +545,12 @@ func indexBTreeOptions(ctx *Context, idx *catalog.Index) nbtree.Options {
 		// options constructor callable on its own — which is what lets the
 		// descriptor wiring be tested without a buffer pool.
 		opts.LogSplit = nbtree.PoolLogSplit(ctx.Pool)
+		// Heap-verified dead-entry reclamation on the split path
+		// (docs/design/not_ralph/btree-index-bloat-reclaim/DESIGN.md). nil for
+		// an index with no table behind it, which disables the purge.
+		if idx != nil {
+			opts.DeadTIDs = indexDeadTIDFilter(ctx, idx.Table)
+		}
 	}
 	return opts
 }
