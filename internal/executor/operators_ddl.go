@@ -197,6 +197,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateTablespace(s)
 	case *parser.DropTablespaceStmt:
 		return nil, o.execDropTablespace(s)
+	case *parser.AlterTablespaceStmt:
+		return nil, o.execAlterTablespace(s)
 	case *parser.CompatNoopStmt:
 		return nil, o.execCompatNoop(s)
 	case *parser.CommentOnStmt:
@@ -341,11 +343,23 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 			Detail:  `The prefix "pg_" is reserved for system tablespaces.`,
 		}
 	}
+	// Storage parameters. Before M0134-0176 the WITH clause was parsed and
+	// thrown away, so `WITH (some_nonexistent_parameter = true)` SUCCEEDED and
+	// `WITH (random_page_cost = 3.0)` recorded nothing. Validate the names
+	// against RELOPT_KIND_TABLESPACE first — upstream's CreateTableSpace calls
+	// tablespace_reloptions(..., validate=true) BEFORE inserting the
+	// pg_tablespace tuple (tablespace.c:359), so a rejected option must leave no
+	// tablespace behind. validnsps is NULL there, hence allowNamespaces=false.
+	spcoptions, verr := tablespaceOptionArray(nil, s.Options, false, s.Pos())
+	if verr != nil {
+		return verr
+	}
 	oid, err := o.ctx.Catalog.CreateTablespace(s.Name, s.Owner, location)
 	if err != nil {
 		// Only failure mode is a duplicate name.
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	o.ctx.Catalog.SetTablespaceOptions(s.Name, spcoptions)
 	// Create the in-place directory pg_tblspc/<oid> under the data dir. When no
 	// data dir is configured (embedded/test contexts), the registry entry stands
 	// alone — matching how other DDL operators skip cluster-filesystem effects.

@@ -2138,6 +2138,18 @@ type Catalog interface {
 	// CREATE TABLE ... TABLESPACE to validate and resolve the clause.
 	// M0122-0007.
 	LookupTablespaceOID(name string) (uint32, bool)
+	// TablespaceOptions returns a tablespace's pg_tablespace.spcoptions
+	// (`name=value` elements in source order) and whether it exists.
+	// M0134-0176.
+	TablespaceOptions(name string) ([]string, bool)
+	// SetTablespaceOptions replaces spcoptions wholesale; nil means SQL NULL.
+	// Reports whether the tablespace was present. M0134-0176.
+	SetTablespaceOptions(name string, opts []string) bool
+	// RenameTablespace re-keys a tablespace under newName, keeping its OID.
+	// False means the old name is unknown or newName is taken. M0134-0176.
+	RenameTablespace(oldName, newName string) bool
+	// SetTablespaceOwner records a new owner role name. M0134-0176.
+	SetTablespaceOwner(name, owner string) bool
 	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 	// objType is "conversion", "operator", "rule", "text search configuration", etc.
 	RegisterCompatObject(objType, name string)
@@ -3083,6 +3095,13 @@ type tablespaceRow struct {
 	name     string
 	owner    string
 	location string
+	// options is pg_tablespace.spcoptions: the storage parameters recorded by
+	// CREATE TABLESPACE ... WITH (...) and edited by ALTER TABLESPACE ...
+	// SET/RESET (...), held as PG's own `name=value` array elements in source
+	// order. nil renders as SQL NULL, which is what a tablespace with no
+	// parameters has (spcoptions is BKI_DEFAULT(_null_), not an empty array).
+	// M0134-0176.
+	options []string
 }
 
 // commentKey is the composite key for pg_description.
@@ -15182,9 +15201,15 @@ func (c *InMemory) PGCollationRowsForDBOid(dbOid uint32) [][]string {
 // It returns the two bootstrap tablespaces (pg_default OID 1663, pg_global OID
 // 1664, owned by the bootstrap superuser per pg_tablespace.dat) followed by any
 // in-place tablespaces in the runtime registry, ordered by OID for stable
-// output. Columns: oid, spcname, spcowner, spcacl (NULL = default), spcoptions
-// (NULL). Runtime in-place tablespaces report spcowner=10 (bootstrap superuser);
-// goopg does not resolve the recorded owner name to a role OID. M0110-0001.
+// output. Columns: oid, spcname, spcowner, spcacl (NULL = default), spcoptions.
+// Runtime in-place tablespaces report spcowner=10 (bootstrap superuser); goopg
+// does not resolve the recorded owner name to a role OID. M0110-0001.
+//
+// spcoptions carries the tablespace's storage parameters as a PG text[] literal
+// (M0134-0176). The two bootstrap tablespaces have none, and a tablespace whose
+// parameters were all RESET goes back to NULL rather than `{}` — spcoptions is
+// BKI_DEFAULT(_null_) and AlterTableSpaceOptions writes repl_null when the
+// merged array comes back empty (tablespace.c:1063-1066).
 func (c *InMemory) tablespaceVirtualRows() [][]string {
 	rows := [][]string{
 		{"1663", "pg_default", "10", "", ""},
@@ -15198,9 +15223,41 @@ func (c *InMemory) tablespaceVirtualRows() [][]string {
 	c.mu.RUnlock()
 	sort.Slice(extra, func(i, j int) bool { return extra[i].oid < extra[j].oid })
 	for _, ts := range extra {
-		rows = append(rows, []string{strconv.FormatUint(uint64(ts.oid), 10), ts.name, "10", "", ""})
+		rows = append(rows, []string{strconv.FormatUint(uint64(ts.oid), 10), ts.name, "10", "", pgTextArrayLiteral(ts.options)})
 	}
 	return rows
+}
+
+// pgTextArrayLiteral renders spcoptions' text[] the way PG's array_out does for
+// reloption arrays: `{a=1,b=2}`, with an element quoted only when it contains a
+// character that would otherwise be structural. An empty list is SQL NULL (the
+// empty string in this row representation), never `{}` — see
+// tablespaceVirtualRows' comment. M0134-0176.
+func pgTextArrayLiteral(elems []string) string {
+	if len(elems) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, e := range elems {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if strings.ContainsAny(e, ` ,{}"\`) || e == "" {
+			b.WriteByte('"')
+			for _, r := range e {
+				if r == '"' || r == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(r)
+			}
+			b.WriteByte('"')
+			continue
+		}
+		b.WriteString(e)
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 // PGDependRowsForDBOid builds pg_depend's row-set for dbOid's own relations
@@ -15998,6 +16055,75 @@ func (c *InMemory) DropTablespace(name string) (uint32, bool) {
 	}
 	delete(c.tablespaces, lc)
 	return ts.oid, true
+}
+
+// SetTablespaceOptions replaces a tablespace's spcoptions with opts (nil for
+// "no parameters", i.e. SQL NULL). The caller has already merged/validated the
+// list — this is only the store, mirroring how AlterTableSpaceOptions
+// (postgres/src/backend/commands/tablespace.c:1015) does all the merging in
+// transformRelOptions and then writes one replacement value. Reports whether
+// the tablespace was present. M0134-0176.
+func (c *InMemory) SetTablespaceOptions(name string, opts []string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ts, ok := c.tablespaces[strings.ToLower(name)]
+	if !ok {
+		return false
+	}
+	ts.options = append([]string(nil), opts...)
+	if len(ts.options) == 0 {
+		ts.options = nil
+	}
+	return true
+}
+
+// TablespaceOptions returns a tablespace's current spcoptions, and whether the
+// tablespace exists. The merge half of ALTER TABLESPACE SET/RESET needs the old
+// list before it can compute the new one. M0134-0176.
+func (c *InMemory) TablespaceOptions(name string) ([]string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ts, ok := c.tablespaces[strings.ToLower(name)]
+	if !ok {
+		return nil, false
+	}
+	return append([]string(nil), ts.options...), true
+}
+
+// RenameTablespace re-keys a tablespace under newName, keeping its OID (and so
+// its pg_tblspc/<oid> directory and every reltablespace pointing at it — PG's
+// RenameTableSpace only rewrites the pg_tablespace tuple's spcname). Reports
+// whether the rename happened; false means either the old name is unknown or
+// newName is already taken, which the caller distinguishes with its own lookup.
+// M0134-0176.
+func (c *InMemory) RenameTablespace(oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oldKey, newKey := strings.ToLower(oldName), strings.ToLower(newName)
+	ts, ok := c.tablespaces[oldKey]
+	if !ok {
+		return false
+	}
+	if _, taken := c.tablespaces[newKey]; taken && newKey != oldKey {
+		return false
+	}
+	delete(c.tablespaces, oldKey)
+	ts.name = newName
+	c.tablespaces[newKey] = ts
+	return true
+}
+
+// SetTablespaceOwner records a new owner role name for a tablespace. Reports
+// whether the tablespace was present. M0134-0176.
+func (c *InMemory) SetTablespaceOwner(name, owner string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ts, ok := c.tablespaces[strings.ToLower(name)]
+	if !ok {
+		return false
+	}
+	ts.owner = owner
+	return true
 }
 
 // RegisterTablespaceDuringRecovery re-registers a tablespace with its

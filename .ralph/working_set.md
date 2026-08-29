@@ -1,71 +1,66 @@
 (idle — nothing in flight)
 
-## Loop #7 result — M0134-0175a landed
+## Loop #8 result — M0134-0176 landed
 
 **Nightly triage:** `ci/logs/action-items.md` unchanged (run `20260828-235424`);
-both `## AI-` items already have M-NIGHTLY rows. Nothing new to file.
+both `## AI-` items already have M-NIGHTLY rows (001 ticked, 002 open). Nothing
+new to file.
 
-**Baton check:** previous baton said `(idle)`; tree had zero modified `.go` files.
+**Baton check:** previous baton said `(idle)`; selected by ID ascending per the
+banner. -0175b..e are filed sub-items, not the next ID.
 
-**Task:** M0134-0175a — `fillfactor` was never applied when choosing a heap
-insert page. `tablesample.sql` **304 → 214** diff lines; the first 63 lines of
-the case (every sampled `SELECT`) now match the oracle byte-for-byte. Design
-`docs/design/m0134-0175a-fillfactor-at-insert.md`.
+**Task:** M0134-0176 — tablespace storage parameters. `tablespace.sql`
+**854 → 811** diff lines, `^+ERROR` 32 → **25**. Design
+`docs/design/m0134-0176-tablespace-storage-parameters.md`.
 
 **Four things worth carrying:**
 
-1. **The *declared but unconsumed* pattern, third instance.** `fillfactor` was
-   parsed, bounds-checked, persisted to `pg_class.reloptions`, pg_dump'd,
-   ALTER-able and read by the **cost model** — with no consumer in the insert
-   path. Everything around a feature can exist while the feature does nothing.
-   Grep for a *consuming* reference, not any reference.
+1. **The *declared but unconsumed* pattern, FOURTH instance** (after
+   `client_min_messages`, `fillfactor`, and the relation reloptions of
+   M0134-0160). `CREATE TABLESPACE ... WITH (...)` was lexed, grammar-bounded,
+   stored on the AST — as a **raw token dump** — and read by nobody. Grep for a
+   *consuming* reference, not any reference. `pg_tablespace_location` (filed
+   -0176b) is a fifth instance found in the same file: a catalogued `pg_proc`
+   OID with no dispatch, returning an empty row instead of erroring.
 
-2. **The default has to be arithmetically inert, and that is the test.** PG's
-   `fillfactor=100` gives `saveFreeSpace=0` and `targetFreeSpace=MAXALIGN(len)`
-   — exactly the pre-existing "does it physically fit" check. The control test
-   `TestDefaultFillfactorPacksTightly` (ten rows, no reloption, still ONE block)
-   is what makes the "TPC-H/TPC-DS density is untouched" claim checkable rather
-   than asserted. Two other upstream properties are load-bearing: a freshly
-   extended page is exempt from the reserve (hio.c:859), and the
-   `nearlyEmptyFreeSpace` clamp stops a 4 KiB tuple in a `fillfactor=10` table
-   from demanding ~11 KiB on an 8 KiB page and extending forever
-   (revert-checked; both revert-checks bite).
+2. **A live PG 18.3 oracle is cheap and it paid off.** `initdb --auth=trust` +
+   `pg_ctl -o "-p 5541"` into /tmp takes ~30s and settled four semantics the
+   source alone left ambiguous — most importantly that **`RESET (bogus_never_set)`
+   SUCCEEDS** (validation runs on the MERGED array, so a name is only ever
+   checked on the way *in*) and that emptying the array gives **NULL, not `{}`**.
+   It also surfaced the one divergence that remains: `SET (seq_page_cost)` (bare
+   name) stores `=true` where PG rejects the VALUE TYPE — ledgered.
 
-3. **`catalog.InMemory` has NO OID index.** `LookupTableByOIDAllDBs` walks every
-   namespace's `map[string]*Table`, so any per-row catalog resolution on a write
-   path is an O(tables) scan under a shared RLock — the M0107 shape. The
-   workaround here is a per-session memo (`Context.heapFillfactorCache`,
-   following the `pgKeyDescCache` precedent) invalidated by ALTER. **If a future
-   task needs cheap rel→table on a hot path, add the OID index first**; the
-   ledger row names it as the real fix.
+3. **Port the shape, not just the answer.** `RESET (name = value)` → 42601 is
+   only *expressible* because the clause is an ordered list with a `HasValue`
+   bit. A `map[string]string` (what CREATE TABLE still uses — M0134-0160a) can
+   represent neither "no value" nor source order. Upstream's own comment says
+   "the grammar doesn't enforce it", which is the tell that the parser must
+   RECORD rather than reject.
 
-4. **The sibling was checked and deliberately NOT changed.**
-   `writeHeapRowReturningPG` has a near-identical block-selection loop but its
-   only caller is `writeHeapRowCanonical` (system catalogs ⇒ no reloptions ⇒
-   fillfactor always 100), so the gate there would be unreachable. The reason
-   and the port instruction are in a comment at the function. "Sibling paths
-   must change together **or say why they didn't**."
+4. **Check whether a grammar change is even needed.** Tablespace DDL is one of
+   the classes the goyacc port deliberately does not carry (playbook §12):
+   `CREATE` was already hand-written and `routedCreatePairs["alter"]` has no
+   `"tablespace"`, so `ALTER TABLESPACE` never reaches the grammar. The new arm
+   sits beside its `CREATE` sibling — no `grammar/*.y` edit, no goldens.
 
-**Discovered, filed, not fixed: M0134-0175e** — a second `FETCH FIRST` on an
-already-scrolled SCROLL CURSOR returns 0 rows (PG restarts and returns 3,4,5…).
-The first pass is byte-correct, so it is a portal rewind gap, not sampling; it
-was masked while all ten rows sat on one block. Compare `PortalRunFetch` /
-`DoPortalRewind` (`pquery.c:1400`).
+**Two traps hit:** an **orphaned server on 5533** silently answered my probe with
+old behavior (`bind: address already in use` was buried in the server log, and
+psql connected happily to the orphan) — always grep the server log for it before
+believing a "no change" result. And `3` lexes as `TokenIntLit`, not
+`TokenNumericLit`; `1.5` is the numeric one.
+
+**Discovered, filed, not fixed:** M0134-0176a (`ALTER ... ALL IN TABLESPACE`
+unparsed — the working RENAME unmasked its cascade into the case's final
+`DROP TABLESPACE`), M0134-0176b (`pg_tablespace_location` undispatched).
 
 **Gates run:** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS (no FAIL lines; `internal/initdb` 462s cold, rest cached);
-`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2 20.9s, Q13 rows=34 8.3s);
-`scripts/pg-regress-runner.sh tablesample` 214 lines;
-`make check-testport-inventory` PASS; `make ralph-state-guard` OK (auto-repaired
-the progress marker). `gofmt -l` flags operators_storage/context/operators_ddl
-**at HEAD too** — the known go1.25-baseline vs local-go1.26 mismatch, not this
-change; the two new files are clean.
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2 24.9s, Q13 rows=34 8.8s);
+`go test` on internal/{executor,parser,catalog,optimizer,postmaster} PASS;
+`scripts/pg-regress-runner.sh tablespace` before/after; live PG 18.3 A/B;
+`make regen-testport` + `make check-testport-inventory` PASS;
+`make ralph-state-guard` OK (auto-repaired the progress marker). gofmt drift on
+ddl.go/ast.go/operators_ddl.go/planner.go/dispatch.go is **pre-existing at HEAD**
+(verified by stash) — none of it touches the new lines.
 
-**In-flight: none.**
-
-**Carried obligations (21st loop):** TPC-DS SF0.5 gate still NOT run (for -0156,
--0157). -0158..-0175a are parser/DDL/catalog/ACL/wire/type-input/FK/plpgsql/
-pubsub/sampling/heap-page-density only; -0175a moves on-disk density **only for
-tables that set `fillfactor`**, and no TPC-DS table does, so it still cannot
-move a TPC-DS plan. The abandoned 4-case regress A/B from loop #6 remains
-unresumed (warm worktree `tmp/ab-head` no longer verified to exist).
+**In-flight:** none.

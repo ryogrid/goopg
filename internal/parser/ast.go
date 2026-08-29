@@ -1918,11 +1918,49 @@ type CreateTablespaceStmt struct {
 	Name     string
 	Owner    string // optional OWNER role; "" → current user
 	Location string // LOCATION string literal; "" → in-place tablespace
-	Options  []string
+	Options  []TablespaceOption
 }
 
 func (s *CreateTablespaceStmt) Pos() int  { return s.pos }
 func (s *CreateTablespaceStmt) stmtNode() {}
+
+// TablespaceOption is one `name [= value]` element of a tablespace storage-
+// parameter list, as it appears in `CREATE TABLESPACE ... WITH (...)` and
+// `ALTER TABLESPACE ... SET/RESET (...)`. Upstream carries these as a DefElem
+// list (gram.y's reloptions), and the LIST — not a map — is what makes two of
+// PG's checks expressible: RESET rejects an element that HAS a value
+// ("RESET must not include values for parameters", reloptions.c:1242, which is
+// exactly HasValue below), and an offending name is reported in source order.
+// M0134-0176. Contrast CreateTableStmt.With, still a map (M0134-0160a).
+type TablespaceOption struct {
+	Name     string
+	Value    string
+	HasValue bool
+}
+
+// AlterTablespaceStmt — `ALTER TABLESPACE name {SET|RESET} (...)`,
+// `... RENAME TO new` and `... OWNER TO role`. Mirrors gram.y's
+// AlterTableSpaceOptionsStmt (:9358) plus the tablespace arms of RenameStmt and
+// AlterOwnerStmt, which upstream keeps as three separate node types; goopg
+// folds them into one node discriminated by Action because all three land in
+// the same tiny executor path. M0134-0176.
+type AlterTablespaceStmt struct {
+	pos int
+	// Name is the tablespace being altered.
+	Name string
+	// Action is one of "set", "reset", "rename", "owner".
+	Action string
+	// Options carries the SET/RESET parameter list in source order.
+	Options []TablespaceOption
+	// NewName is the target of RENAME TO.
+	NewName string
+	// NewOwner is the target of OWNER TO; the literal "current_user" /
+	// "session_user" spellings reach here verbatim, as for ALTER TABLE.
+	NewOwner string
+}
+
+func (s *AlterTablespaceStmt) Pos() int  { return s.pos }
+func (s *AlterTablespaceStmt) stmtNode() {}
 
 // DropTablespaceStmt — `DROP TABLESPACE [IF EXISTS] name`. Removes the runtime
 // tablespace registry entry and its in-place pg_tblspc/<oid> directory.

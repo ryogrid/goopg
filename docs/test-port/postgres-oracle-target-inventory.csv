@@ -194,7 +194,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/subselect.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/sysviews.sql,pass,yes,-,Passes via TestPort_RegressSuite/sysviews (M0097-0032)
 ,regress-sql,regress,postgres/src/test/regress/sql/tablesample.sql,failed,no,-,
-,regress-sql,regress,postgres/src/test/regress/sql/tablespace.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/tablespace.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/temp.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/test_setup.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/text.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

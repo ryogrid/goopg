@@ -39,10 +39,18 @@ import (
 // (22023).
 //
 // The kinds below carry only what goopg can be asked about through SQL. The
-// ATTRIBUTE (ALTER TABLE ... ALTER COLUMN SET (n_distinct...)) and TABLESPACE
-// (ALTER TABLESPACE ... SET (...)) kinds are deliberately absent: those two
-// clauses have their own validation paths and are not routed through a
-// `WITH (...)` map.
+// ATTRIBUTE kind (ALTER TABLE ... ALTER COLUMN SET (n_distinct...)) is
+// deliberately absent: that clause has its own validation path and is not
+// routed through a `WITH (...)` option list.
+//
+// M0134-0176 added RELOPT_KIND_TABLESPACE. Its four options are reached from
+// two places — `CREATE TABLESPACE ... WITH (...)` and `ALTER TABLESPACE ...
+// SET/RESET (...)` — which upstream funnels into the same tablespace_reloptions
+// (reloptions.c:2091) as every other kind, so they belong in this one registry
+// rather than in a bespoke tablespace checker. Both goopg call sites carry an
+// ORDERED option list, so they use validateRelOptionNamesInOrder below and get
+// upstream's source-order error selection; the `WITH`-map callers still cannot
+// (M0134-0160a).
 
 // relOptKind mirrors PG's relopt_kind bitmask
 // (postgres/src/include/access/reloptions.h:39-56). One bit per relation kind
@@ -59,6 +67,7 @@ const (
 	relOptGIN
 	relOptBRIN
 	relOptView
+	relOptTablespace
 )
 
 // relOptionKinds is the union of PG 18.3's five reloption tables, flattened to
@@ -112,6 +121,14 @@ var relOptionKinds = map[string]relOptKind{
 	// enumRelOpts
 	"buffering":    relOptGiST,
 	"check_option": relOptView,
+
+	// tablespace_reloptions (reloptions.c:2091) — the whole admissible set for
+	// RELOPT_KIND_TABLESPACE, and no other kind admits any of them. The four
+	// names double as GUCs, but as storage parameters they are tablespace-only.
+	"random_page_cost":           relOptTablespace,
+	"seq_page_cost":              relOptTablespace,
+	"effective_io_concurrency":   relOptTablespace,
+	"maintenance_io_concurrency": relOptTablespace,
 }
 
 // relOptionNamespaces maps a `WITH (ns.name=...)` namespace to the kind whose
@@ -170,6 +187,17 @@ func indexRelOptKind(method string) relOptKind {
 func validateRelOptionNames(names []string, kind relOptKind, allowNamespaces, acceptOidsOff bool, pos int) *ExecError {
 	sorted := append([]string(nil), names...)
 	sort.Strings(sorted)
+	return validateRelOptionNamesInOrder(sorted, kind, allowNamespaces, acceptOidsOff, pos)
+}
+
+// validateRelOptionNamesInOrder is validateRelOptionNames without the sort, for
+// the callers that DO have the clause in source order (the tablespace paths,
+// M0134-0176). It is the same two passes; only the offender picked out of a
+// clause with several bad names differs, and reporting the source-order-first
+// one is what upstream does. Callers holding the clause as a map must keep
+// using validateRelOptionNames — see the M0134-0160a ledger row.
+func validateRelOptionNamesInOrder(names []string, kind relOptKind, allowNamespaces, acceptOidsOff bool, pos int) *ExecError {
+	sorted := names
 	// Pass 1 — namespaces (transformRelOptions, reloptions.c:1254-1276).
 	for _, full := range sorted {
 		ns, _, qualified := splitRelOptionName(full)

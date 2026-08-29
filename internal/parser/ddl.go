@@ -1090,24 +1090,141 @@ func (p *parser) parseCreateTablespaceTail(pos int) (Stmt, error) {
 	}
 	stmt.Location = lt.Value
 	p.advance()
-	// Optional WITH ( option = value, … ) — parsed but currently ignored.
+	// Optional WITH ( option = value, … ). Until M0134-0176 the body was a raw
+	// token dump nobody read, so every storage parameter — recognized or not —
+	// was silently accepted and discarded; it is now a structured list the
+	// executor validates and persists.
 	if p.acceptKeyword(KwWith) {
-		if c := p.cur(); c.Kind != TokenSymbol || c.Value != "(" {
-			return nil, p.errAtCur("expected '(' after WITH")
+		opts, err := p.parseTablespaceOptionList()
+		if err != nil {
+			return nil, err
 		}
-		p.advance() // consume '('
-		for {
-			c := p.cur()
-			if c.Kind == TokenEOF {
-				return nil, p.errAtCur("unterminated WITH option list")
+		stmt.Options = opts
+	}
+	return stmt, nil
+}
+
+// parseTablespaceOptionList parses `( name [= value] [, …] )` — the reloptions
+// production shared by CREATE TABLESPACE's WITH clause and ALTER TABLESPACE's
+// SET/RESET clause (gram.y: reloptions → reloption_list → reloption_elem). The
+// value is optional in the grammar for BOTH forms, which is deliberate: upstream
+// notes that "the grammar doesn't enforce it" and instead rejects a valued RESET
+// element downstream (reloptions.c:1228-1243), so the parser must record whether
+// a value was present rather than reject it here. p is positioned just after the
+// WITH/SET/RESET keyword. M0134-0176.
+func (p *parser) parseTablespaceOptionList() ([]TablespaceOption, error) {
+	if c := p.cur(); c.Kind != TokenSymbol || c.Value != "(" {
+		return nil, p.errAtCur("expected '(' after WITH")
+	}
+	p.advance() // consume '('
+	var opts []TablespaceOption
+	for {
+		c := p.cur()
+		if c.Kind == TokenEOF {
+			return nil, p.errAtCur("unterminated WITH option list")
+		}
+		if c.Kind == TokenSymbol && c.Value == ")" {
+			p.advance()
+			break
+		}
+		if c.Kind == TokenSymbol && c.Value == "," {
+			p.advance()
+			continue
+		}
+		if c.Kind != TokenIdent && c.Kind != TokenKeyword && c.Kind != TokenQuotedIdent {
+			return nil, p.errAtCur("expected storage parameter name")
+		}
+		opt := TablespaceOption{Name: strings.ToLower(c.Value)}
+		p.advance()
+		// A qualified `ns.name` reaches the executor as one dotted string, which
+		// is what validateRelOptionNames splits — matching how the index WITH
+		// clause carries its names (M0134-0160).
+		for p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+			p.advance()
+			nt := p.cur()
+			if nt.Kind != TokenIdent && nt.Kind != TokenKeyword && nt.Kind != TokenQuotedIdent {
+				return nil, p.errAtCur("expected storage parameter name after '.'")
 			}
-			if c.Kind == TokenSymbol && c.Value == ")" {
-				p.advance()
-				break
-			}
-			stmt.Options = append(stmt.Options, c.Value)
+			opt.Name += "." + strings.ToLower(nt.Value)
 			p.advance()
 		}
+		if c := p.cur(); (c.Kind == TokenOperator || c.Kind == TokenSymbol) && c.Value == "=" {
+			p.advance()
+			// def_arg is any of a number, string, identifier or reserved word;
+			// goopg keeps the literal text, which is what spcoptions stores.
+			vt := p.cur()
+			if vt.Kind == TokenEOF || (vt.Kind == TokenSymbol && (vt.Value == ")" || vt.Value == ",")) {
+				return nil, p.errAtCur("expected value after '='")
+			}
+			val := vt.Value
+			p.advance()
+			// A signed number arrives as the sign token plus the digits (the
+			// sign lexes as an operator or a symbol depending on context).
+			if nk := p.cur().Kind; (val == "-" || val == "+") && (nk == TokenIntLit || nk == TokenNumericLit) {
+				val += p.cur().Value
+				p.advance()
+			}
+			opt.Value = val
+			opt.HasValue = true
+		}
+		opts = append(opts, opt)
+	}
+	return opts, nil
+}
+
+// parseAlterTablespaceTail parses the tail of ALTER TABLESPACE after the
+// TABLESPACE keyword:
+//
+//	ALTER TABLESPACE name SET   ( param = value [, …] )
+//	ALTER TABLESPACE name RESET ( param [, …] )
+//	ALTER TABLESPACE name RENAME TO newname
+//	ALTER TABLESPACE name OWNER TO role
+//
+// Upstream splits these across three node types (AlterTableSpaceOptionsStmt at
+// gram.y:9358, plus the TABLESPACE arms of RenameStmt and AlterOwnerStmt);
+// goopg folds them into AlterTablespaceStmt.Action. M0134-0176.
+func (p *parser) parseAlterTablespaceTail(pos int) (Stmt, error) {
+	tok := p.cur()
+	if tok.Kind != TokenIdent && tok.Kind != TokenKeyword && tok.Kind != TokenQuotedIdent {
+		return nil, p.errAtCur("expected tablespace name")
+	}
+	stmt := &AlterTablespaceStmt{pos: pos, Name: tok.Value}
+	p.advance()
+	switch {
+	case p.acceptKeyword(KwSet):
+		opts, err := p.parseTablespaceOptionList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Action, stmt.Options = "set", opts
+	case p.acceptKeyword(KwReset):
+		opts, err := p.parseTablespaceOptionList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Action, stmt.Options = "reset", opts
+	case p.acceptIdentKeyword("rename"):
+		if _, err := p.expectKeyword(KwTo); err != nil {
+			return nil, err
+		}
+		nt := p.cur()
+		if nt.Kind != TokenIdent && nt.Kind != TokenKeyword && nt.Kind != TokenQuotedIdent {
+			return nil, p.errAtCur("expected new tablespace name after RENAME TO")
+		}
+		stmt.Action, stmt.NewName = "rename", nt.Value
+		p.advance()
+	case p.acceptIdentKeyword("owner"):
+		if _, err := p.expectKeyword(KwTo); err != nil {
+			return nil, err
+		}
+		ot := p.cur()
+		if ot.Kind != TokenIdent && ot.Kind != TokenKeyword && ot.Kind != TokenQuotedIdent {
+			return nil, p.errAtCur("expected role after OWNER TO")
+		}
+		stmt.Action, stmt.NewOwner = "owner", ot.Value
+		p.advance()
+	default:
+		return nil, p.errAtCur("expected SET, RESET, RENAME TO, or OWNER TO after ALTER TABLESPACE name")
 	}
 	return stmt, nil
 }
@@ -7274,6 +7391,17 @@ func (p *parser) parseAlter() (Stmt, error) {
 	t, err := p.expectKeyword(KwAlter)
 	if err != nil {
 		return nil, err
+	}
+	// ALTER TABLESPACE name {SET|RESET} (...) | RENAME TO new | OWNER TO role.
+	// Dispatched here for the same reason CREATE TABLESPACE lives in
+	// parseCreateTablespaceTail rather than the goyacc grammar: tablespace DDL
+	// is one of the statement classes the grammar port does not carry, so its
+	// ALTER forms fell through every arm of this function to the closing
+	// `expectKeyword(KwTable)` and reported `syntax error at or near "expected
+	// keyword table (got tablespace)"`. M0134-0176.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTablespace {
+		p.advance() // consume TABLESPACE
+		return p.parseAlterTablespaceTail(t.Pos)
 	}
 	// ALTER DEFAULT PRIVILEGES [FOR ROLE|USER ...] [IN SCHEMA ...]
 	// {GRANT|REVOKE} ... — a distinct top-level form (gram.y's

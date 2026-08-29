@@ -3656,6 +3656,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "CREATE TABLESPACE"
 	case *parser.DropTablespaceStmt:
 		return "DROP TABLESPACE"
+	case *parser.AlterTablespaceStmt:
+		return "ALTER TABLESPACE"
 	case *parser.CreateStatisticsStmt:
 		return "CREATE STATISTICS"
 	case *parser.AlterStatisticsStmt:
