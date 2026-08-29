@@ -170,9 +170,21 @@ func TestBulkSeparatorReserveIsExactAndSufficient(t *testing.T) {
 			tightest = free
 		}
 	}
-	if tightest >= legacyReserve {
-		t.Fatalf("tightest packed leaf still has %d free bytes; the constant %d-byte reserve was never given back",
-			tightest, legacyReserve)
+	// A bulk-built leaf now deliberately keeps BTreeDefaultFillFactor headroom
+	// so later inserts do not have to split every page (perf-optimize-take3
+	// candidate G; upstream's BTREE_DEFAULT_FILLFACTOR). That reserve is
+	// expected; what this guard still catches is the RETIRED constant reserve
+	// being charged on top of it.
+	fillReserve := 0
+	if slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: rootStart}); err == nil {
+		slot.RLock()
+		fillReserve = leafFillFactorReserve(slot.Page())
+		slot.RUnlock()
+		pool.Unpin(slot)
+	}
+	if tightest >= fillReserve+legacyReserve {
+		t.Fatalf("tightest packed leaf has %d free bytes, more than the %d-byte fill-factor reserve plus the retired %d-byte constant — the constant reserve was never given back",
+			tightest, fillReserve, legacyReserve)
 	}
 
 	// The regained space must not have cost correctness: the tree still answers.

@@ -897,6 +897,11 @@ type BTree struct {
 	rel      storage.RelFileNode
 	logSplit LogSplitFunc
 
+	// deadTIDs, when non-nil, lets the split path reclaim index entries whose
+	// heap tuple is dead to all (dead_purge.go). nil = disabled, no behaviour
+	// change.
+	deadTIDs DeadTIDFilter
+
 	// keyFmt is the index's key FORMAT (M0130-S11.4 slices 3b-2c-i and
 	// 3b-2c-ii-B1) — the one place every ordering AND item-layout decision in
 	// this package resolves. Its zero value is the blob format: the bytewise
@@ -1851,6 +1856,10 @@ type Options struct {
 	// Supplying one switches the tree to `_bt_compare` over PG binary
 	// datums and REQUIRES the tuple-shaped key operands 3b-2c-ii writes.
 	KeyDesc *PGIndexKeyDesc
+	// DeadTIDs, when non-nil, enables the split-path dead-entry purge
+	// (dead_purge.go). The executor supplies a heap-verified filter; leaving
+	// it nil keeps the pre-existing behaviour exactly.
+	DeadTIDs DeadTIDFilter
 }
 
 // Open returns a handle to an existing B-tree on rel. Validates the
@@ -1865,7 +1874,7 @@ func Open(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 
 // OpenWithOptions is the wired-up Open variant.
 func OpenWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs}
 	meta, err := bt.readMeta()
 	if err != nil {
 		return nil, err
@@ -1915,7 +1924,7 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 
 // CreateWithOptions is the wired-up Create variant.
 func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs}
 
 	// Ensure the relation file starts at block 0 (see
 	// BulkCreateWithOptions for rationale).
@@ -2828,6 +2837,13 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// page may fit comfortably in a single leaf after dedup,
 	// avoiding the split entirely. We bail back to the no-split
 	// path if dedup recovers enough space.
+	// dedupConsolidate rewrites in place (out := items[:0]), so keep the
+	// EXPANDED list for the dead-entry purge below — it must see one entry per
+	// heap TID, before any run has been merged into a posting.
+	var expandedItems []item
+	if bt.deadTIDs != nil {
+		expandedItems = append([]item(nil), allItems...)
+	}
 	allItems = dedupConsolidate(bt.format(), allItems)
 	var postDedupSnap []item
 	if bt.DebugTraceInserts {
@@ -2837,7 +2853,29 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// resetPageItems re-installs before any data item goes back on (S11.2b:
 	// the separator is a page item now, not opaque-area reserve, so it has to
 	// be paid for out of the same budget).
-	if bt.format().compactFootprint(allItems)+pageHighKeyFootprint(slot.Page()) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
+	fits := func(items []item) bool {
+		return bt.format().compactFootprint(items)+pageHighKeyFootprint(slot.Page()) <
+			pageFreeBudget(slot.Page())+pageOccupied(slot.Page())
+	}
+	if !fits(allItems) {
+		// Dedup alone did not recover the space, so we are about to split.
+		// Upstream would first delete dead entries and only then split
+		// (_bt_delete_or_dedup_one_page, nbtinsert.c:2683); this is that step,
+		// heap-verified like _bt_simpledel_pass so it needs no LP_DEAD hints.
+		//
+		// It runs HERE, after dedup has already failed, so the heap I/O is paid
+		// only when the alternative is a split — and it feeds its survivors
+		// back through dedupConsolidate, so purging can never cost a posting
+		// list. See docs/design/not_ralph/btree-index-bloat-reclaim/DESIGN.md.
+		if survivors, npurged := bt.purgeDeadHeapPointers(expandedItems); npurged > 0 {
+			survivors = dedupConsolidate(bt.format(), survivors)
+			allItems = survivors
+			if bt.DebugTraceInserts {
+				postDedupSnap = append([]item(nil), allItems...)
+			}
+		}
+	}
+	if fits(allItems) {
 		bt.traceRewrite(blk, "dedup-recovery", preLineCount, postPageItemsSnap, postDedupSnap)
 		// Re-attempt no-split insert with the dedup'd content.
 		// Reset the page and write the dedup'd items back, no
@@ -2846,12 +2884,19 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if err := bt.refillDeduplicated(blk, slot.Page(), allItems); err != nil {
 			rightSlot.Unlock()
 			bt.pool.Unpin(rightSlot)
+			bt.recycleBlock(rightBlk)
 			held.release()
 			return err
 		}
 		// Drop the freshly-allocated right slot — split avoided.
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
+		// The split was abandoned: this block was extended for a right sibling
+		// that is never linked in, so return it to the free list. Leaking it
+		// meant every dedup-recovery grew the relfile by a page even though the
+		// logical content shrank — which the dead-entry purge amplified,
+		// because it makes recovery succeed far more often.
+		bt.recycleBlock(rightBlk)
 		// C3-S3 (S2-review blocker fix A): this rewrite SHIFTS SLOT
 		// NUMBERS, so it must bump pd_lsn — the deferred kill pass
 		// re-verifies leaf identity by LSN equality (D7) and a plain

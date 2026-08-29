@@ -176,7 +176,18 @@ are competing space strategies and dedup wins for duplicate churn.
 A real fix must be **dedup-aware** (a no-space purge) or a **background btree
 vacuum**. Either is a design project in its own right, not a candidate to be
 knocked out alongside micro-optimisations, and shipping the reverted mechanism
-again would be a regression. G stays open with its blocking reason recorded.
+again would be a regression.
+
+> **RESOLVED (2026-08-30) — and the premise above was wrong.** Candidate G was
+> taken up in
+> [`../btree-index-bloat-reclaim/DESIGN.md`](../btree-index-bloat-reclaim/DESIGN.md).
+> Instrumentation showed the growth is **not** unreclaimed dead entries at all:
+> 1.95 M index entries examined at split time, **zero** dead, while
+> splits/txn × 8 KB = 157 B/txn against a measured 152 B/txn. The cause is
+> **split amplification** — goopg packed bulk-built leaves to 100%, so the first
+> insert into any leaf split it, whereas PostgreSQL leaves 10% free
+> (`BTREE_DEFAULT_FILLFACTOR`). Adding that fill factor takes pkey growth to
+> **0 B/txn, matching PostgreSQL**, with no throughput regression.
 
 ## 4. Where the read path stands now
 
