@@ -56,7 +56,7 @@ Tracking for [DESIGN.md](DESIGN.md). Tick only when actually done.
 - [x] race-gate PASS (0 races)
 - [x] tpch-spotcheck PASS (Q12=2, Q13=34)
 - [x] parser goldens unchanged (units gate)
-- [ ] pre-commit pgbench smoke
+- [x] pre-commit pgbench smoke PASS (hook ran on commit e0493dd8c)
 - [x] Diff reviewed: purge is split-path-only, fill factor build-time-only; per-index-open closure noted as a limitation in DESIGN.md §9.5
 
 ## Documentation
