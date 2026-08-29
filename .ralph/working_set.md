@@ -1,56 +1,61 @@
 (idle — nothing in flight)
 
-## Loop #17 result — M0134-0170 RESUMED from a predecessor's orphaned WIP, landed, case PARKED
+## Loop #3 result — M0134-0172 landed
 
-**The baton lied, and the tree told the truth.** `working_set.md` said `(idle)`, but
-`git status` showed engine edits with mtimes 10:00/10:26 — minutes old — and their
-comments cited **M0134-0170**, my own next task. A predecessor loop had been cut off
-mid-task without rewriting the baton (`.ralph/progress.json` flipped to `completed`
-at 09:47, edits continued to 10:26, and it left `tmp/wt-0170` + `tmp/ab-head`
-worktrees behind). `ps` confirmed only ONE ralph loop alive (mine), so this was
-orphaned WIP, not a live peer. **Always diff the tree against the baton's claim
-before treating "idle" as authority — check mtimes, and grep the diff for a task id.**
-I nearly burned the loop re-implementing it in a fresh worktree.
+**Nightly triage:** `ci/logs/action-items.md` still run `20260828-235424`; both `## AI-`
+items already filed (001 advisory-lock regression, 002 Q5 timeout). Nothing new to file.
 
-**Nightly triage:** `ci/logs/action-items.md` still run `20260828-235424`, both `## AI-`
-items already filed (001 checked/fixed, 002 open duplicate). Nothing new.
+**Baton check:** tree matched `(idle)` — zero modified `.go` files at start.
 
-**Task:** M0134-0170 `sqljson_queryfuncs.sql` sized live (`not-tried` → **`failed`**,
-**2021 diff lines / 259 `^+ERROR`**), 100% SQL/JSON query-function family → **PARKED**
-on ledger 0168a (third case in a row: -0168, -0169, -0170).
+**Task:** M0134-0172 `stats_ext.sql` sized (**3754 diff lines / 435 `^+ERROR`**) →
+**PARKED** at 3451 / 54. Residual is REFACTOR-tier: `CREATE STATISTICS` is parsed but
+~unvalidated (~40 missing PG errors), `ALTER STATISTICS` is a no-op, and the planner
+consumes **no** extended statistics at all (deps/ndistinct/MCV) — that's the bulk of
+the 3451 lines and the case's whole point. CSV `not-tried` → `failed`.
 
-**Shipped (engine-wide):** index expressions and partial-index predicates are now
-gated on IMMUTABILITY (42P17), and the partition-key sibling gained the built-in half
-it never had. goopg had ONE of upstream's three ports of that predicate. Design
-`docs/design/m0134-0170-index-expression-mutability.md`. Also two `pg-regress-runner.sh`
-guards (busy auto-start port; `psql` exit-2) — this case had first been "sized" at a
-**fabricated 1291 lines** because a foreign server on 15435 answered the readiness probe.
+**Shipped (engine-wide PL/pgSQL correctness fix):** `RETURN QUERY <query>` and the
+static form of `FOR rec IN <query> LOOP` never called
+`substitutePlpgsqlFrameVarsInSQL`, so **no** frame variable was visible to either —
+not a local, not even a function parameter. `return query select v + n` raised 42703
+on `v`. Two of the four SQL-string-capturing handlers substituted; these two didn't.
+Also: NULL/out-of-range array subscripts now render `NULL` (were leaking bare
+`tmp[1]` to the planner); routine OUT/`RETURNS TABLE` names excluded via new
+`plpgsqlFrame.outParamNames`. Design
+`docs/design/m0134-0172-plpgsql-query-stmt-frame-var-substitution.md`.
 
 **Three things worth carrying:**
 
-1. **A harness that cannot fail loudly reports a plausible number instead** — and that
-   number gets written into fix_plan/the ledger as fact. Both failure modes are now fatal.
-2. **Same line count ≠ same content, again.** 14-case A/B: identical counts everywhere,
-   but `create_index` differed — a Go pointer address leaking through `pg_get_indexdef`
-   (`&{105 0x… C}`), which differs between ANY two runs at HEAD too. Ledgered 0170c.
-3. **A by-name volatility approximation must be asymmetric.** The 31 mixed-volatility
-   `pg_proc.dat` names are EXCLUDED: rejecting legal DDL is worse than admitting DDL PG
-   rejects. Ledger 0170a.
+1. **A lazy convention is invisible at the site that forgets it.** `ReturnQueryStmt`
+   looks perfect in isolation — it parses a string and plans it. Nothing there says a
+   rewrite pass was owed; the obligation lives entirely in the *other* handlers. Exact
+   mirror of -0171 (shared helper wrong, all call sites right). Neither auditing the
+   helper nor the call sites suffices — enumerate the sibling set and prove it closed.
+2. **The same shape recurred inside my own fix.** `substitutePlpgsqlFrameVarsInSQL`
+   has THREE arms that consult the frame; I wired the new exclusion into two. Only
+   subtest (b) caught it.
+3. **A regress-runner diff delta can be pure cluster-state cascade.** `plpgsql` +10
+   looked like a regression with 2 new `f1 is not unique` errors. Re-running the whole
+   file against two **freshly-initdb'd** clusters showed *exactly one* changed
+   statement — the fix. The runner's shared 14-case cluster had manufactured the rest.
+   Diff-the-diffs lies; diff goopg's own output on clean dirs.
 
-Gates run: `go build ./...` OK; guard `index_mutability_test.go` PASS and
-**revert-checked** (10 index subtests + partition test fail when reverted);
-14-case DDL regress A/B vs `tmp/ab-head` (13 byte-identical, zero regressions);
-case A/B byte-identical at 2021 (fix is invisible to it, as expected);
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=34);
-`make regen-testport` + `make check-testport-inventory` PASS.
+Gates run: `go build ./...` OK; guard `TestPlpgSQLQueryStmtsSubstituteFrameVars` PASS,
+revert-checked (6 of 7 subtests fail on old body; 7th is the over-reach guard pinning
+that `FOR IN EXECUTE` is still NOT substituted); 14-case regress A/B (13 byte-identical,
+`plpgsql` traced to statement level = no regression); `plpgsql.sql` A/A'd first (noise
+±1/side); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=34); `make regen-testport` +
+`make check-testport-inventory` PASS; `make ralph-state-guard` OK after self-repair.
 
 In-flight: none.
 
-**Carried obligations (15th loop):** TPC-DS SF0.5 gate still NOT run (for -0156,
--0157). -0158..-0170 are parser/DDL/catalog/ACL/wire/type-input-only and cannot move
-a TPC-DS plan.
+**Carried obligations (17th loop):** TPC-DS SF0.5 gate still NOT run (for -0156,
+-0157). -0158..-0172 are parser/DDL/catalog/ACL/wire/type-input/FK/plpgsql-only and
+cannot move a TPC-DS plan.
 
-**NEXT LOOP:** banner rules — M-NIGHTLY filing, then M0134-0171 (`foreign_key.sql`,
-`failed`). Scratch worktrees `tmp/ab-head` (HEAD A/B baseline, has the postgres
-symlink) and `tmp/wt-0170` (unused) are reusable; remove `tmp/wt-0170` when convenient.
+**Env notes:** foreign orphan goopg holds **port 5533** (pid 1047197, not ours — do not
+kill); probe on 5540+. Probe dirs `/tmp/probe5541`, `/tmp/pl-fix`, `/tmp/pl-base` and
+binaries `/tmp/goopg-{probe,fix,base}` are throwaway; all servers stopped.
+
+**NEXT LOOP:** banner rules — M-NIGHTLY filing, then **M0134-0173 (`stats_import.sql`,
+status `not-tried`)**.

@@ -187,7 +187,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/sqljson_jsontable.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/sqljson_queryfuncs.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/stats.sql,failed,no,-,
-,regress-sql,regress,postgres/src/test/regress/sql/stats_ext.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/stats_ext.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/stats_import.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/strings.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/subscription.sql,not-tried,no,-,
