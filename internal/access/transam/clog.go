@@ -52,6 +52,10 @@ type CLog struct {
 	oldestMu      sync.RWMutex
 	oldestClogXid storage.TransactionID
 
+	// statusCache memoises TERMINAL statuses so the common visibility check
+	// never reaches clogBufferPool's global mutex. See clog_statuscache.go.
+	statusCache clogStatusCache
+
 	// truncateLogger, when non-nil, is invoked by TruncateCLOG to emit a
 	// CLOG_TRUNCATE WAL record (G9). Installed by initdb.Open after recovery
 	// completes; nil during recovery so replay does not re-append. nil-safe.
@@ -166,10 +170,14 @@ func (c *CLog) GetStatus(xid storage.TransactionID) TxnStatus {
 	// The buffer pool is the sole live store (M0117-0006 Part C); an unwritten
 	// lane faults in as all-zero (= in-progress = Unknown). Callers still
 	// short-circuit xid < OldestClogXid()/FirstNormalTransactionID upstream.
+	if st, ok := c.statusCache.lookup(xid); ok {
+		return st
+	}
 	st, err := c.pool.Load().getStatus(xid)
 	if err != nil {
 		return TxnStatusUnknown
 	}
+	c.statusCache.store(xid, st)
 	return st
 }
 
@@ -300,6 +308,9 @@ func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
 	if highXID == 0 {
 		return nil
 	}
+	// Recovery-time bulk rewrite: drop the whole read cache rather than track
+	// which lanes the sweep touched.
+	c.statusCache.invalidate()
 	// Sweep through the pool (the sole live store). Floor at the lowest XID
 	// still covered by an on-disk SLRU segment — after a prior TruncateCLOG,
 	// segment files entirely below the truncation horizon were unlinked, so
@@ -502,6 +513,10 @@ func (c *CLog) setStatusWithLSN(xid storage.TransactionID, status TxnStatus, lsn
 	if err != nil {
 		return err
 	}
+	// Reconcile the read cache with the write, including the recovery case
+	// where a terminal status is overridden. Unconditional (not gated on
+	// `changed`) so an idempotent re-stamp still repairs a stale entry.
+	c.statusCache.update(xid, status)
 	if !changed {
 		return nil
 	}
@@ -750,6 +765,11 @@ func (c *CLog) TruncateCLOG(oldestXid storage.TransactionID) error {
 	if oldestXid < FirstNormalTransactionID {
 		return nil // never truncate the bootstrap/frozen range
 	}
+	// Drop the terminal-status cache before anything else: once a range's
+	// status bytes are gone those XIDs become reusable after wraparound, and a
+	// stale "committed" for a recycled XID would make an in-progress
+	// transaction visible. See clog_statuscache.go.
+	c.statusCache.invalidate()
 
 	// (1) Cutoff page = the SLRU page holding oldestXid. Everything on a page
 	// strictly preceding this page is removable.

@@ -22,18 +22,29 @@ package postmaster
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
 const (
-	planCacheNumShards    = 16
-	planCacheMaxPerShard  = 32 // 16 * 32 = 512 total entries
+	planCacheNumShards   = 16
+	planCacheMaxPerShard = 32 // 16 * 32 = 512 total entries
+
+	// planCacheDoorkeeperSize is the admission filter's slot count (power of
+	// two). See planCache.admit. Sized well above the 512 cache entries so a
+	// genuinely repeated statement is unlikely to have its mark evicted by
+	// one-shot traffic between two executions.
+	planCacheDoorkeeperSize = 8192
+	planCacheDoorkeeperMask = planCacheDoorkeeperSize - 1
 )
 
 // planCache is the server-level cross-session plan cache. M0098-0005.
 type planCache struct {
 	shards [planCacheNumShards]planCacheShard
+	// doorkeeper is the admission filter (perf-optimize-take3/06 candidate H).
+	// Lock-free: one atomic Swap per Put.
+	doorkeeper [planCacheDoorkeeperSize]atomic.Uint64
 }
 
 type planCacheShard struct {
@@ -62,6 +73,51 @@ func shardIndex(key string) int {
 	return int(h & (planCacheNumShards - 1))
 }
 
+// hashKey64 is FNV-1a/64 over the key, used by the admission filter. The
+// 32-bit shardIndex hash is deliberately NOT reused: a 32-bit value collides
+// often enough at 8192 slots to admit unrelated one-shot keys.
+func hashKey64(key string) uint64 {
+	const (
+		off = 14695981039346656037
+		prm = 1099511628211
+	)
+	h := uint64(off)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= prm
+	}
+	return h
+}
+
+// admit is a doorkeeper: a key earns a cache slot only on its SECOND Put.
+//
+// perf-optimize-take3/06 candidate H. Under pgbench's default simple protocol
+// every statement arrives with its literals substituted client-side, so
+// planCacheKey is unique per execution, every Get misses and every Put then
+// took the shard WRITE lock and evicted a live entry. That made planCache.Put
+// 66% of all remaining -S mutex delay once the lock-manager fast path landed —
+// a write storm on behalf of keys that can never be read back.
+//
+// Admitting on the second sighting fixes both halves of that. One-shot SQL
+// never reaches the write lock at all, and the 512 entries stop being churned
+// by literal noise, so genuinely repeated statements survive instead of being
+// evicted by traffic that will never hit. A repeated statement is cached from
+// its third execution rather than its second — irrelevant for anything hot
+// enough to matter.
+//
+// Both error directions are benign. A hash collision that admits early caches a
+// one-shot plan, which is exactly today's behaviour. A mark lost to collision
+// costs one extra parse. Marks deliberately SURVIVE Invalidate(): "this SQL has
+// been seen before" stays true across DDL, so a hot statement is re-admitted on
+// its next execution rather than re-learning.
+func (pc *planCache) admit(key string) bool {
+	h := hashKey64(key)
+	if h == 0 {
+		h = 1 // 0 is the never-seen sentinel
+	}
+	return pc.doorkeeper[h&planCacheDoorkeeperMask].Swap(h) == h
+}
+
 // Get returns the cached plan for key, or (nil, false) if not present.
 func (pc *planCache) Get(key string) (optimizer.Node, bool) {
 	s := &pc.shards[shardIndex(key)]
@@ -73,6 +129,13 @@ func (pc *planCache) Get(key string) (optimizer.Node, bool) {
 
 // Put stores node under key. If the shard is full, the oldest entry is evicted.
 func (pc *planCache) Put(key string, node optimizer.Node) {
+	// Admission filter first: this is the whole point, so it must run BEFORE
+	// the shard write lock is taken. Skipping a Put is always safe — the key
+	// maps deterministically to the same plan, so a skipped store loses at
+	// most one cache hit, never correctness.
+	if !pc.admit(key) {
+		return
+	}
 	s := &pc.shards[shardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()

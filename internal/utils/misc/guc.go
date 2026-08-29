@@ -554,8 +554,29 @@ func (r *Registry) MustRegister(v *Variable) {
 }
 
 // Get returns the variable with the given name (case-insensitive).
+//
+// perf-optimize-take3/06 candidate F. GUC lookups run several times per
+// statement, and together with SessionRegistry.Get they were 4.5% of read-path
+// CPU — dominating both strings.ToLower (54% of its samples) and
+// mapaccess2_faststr (43%). Registration always stores strings.ToLower(v.Name)
+// as the key (see Register), and essentially every internal caller passes a
+// lowercase compile-time constant, so probing the map with the raw name first
+// turns a full-string scan plus a lookup into just the lookup. ToLower does not
+// allocate for an already-lowercase string, but it still scans every byte on
+// every call, and it does not stop early.
 func (r *Registry) Get(name string) (*Variable, bool) {
+	if v, ok := r.vars[name]; ok {
+		return v, true
+	}
 	v, ok := r.vars[strings.ToLower(name)]
+	return v, ok
+}
+
+// getLower is Get for a name the caller has ALREADY lowercased. It exists so a
+// caller needing the canonical key for its own maps (SessionRegistry.Get)
+// lowercases once instead of once per lookup layer.
+func (r *Registry) getLower(lname string) (*Variable, bool) {
+	v, ok := r.vars[lname]
 	return v, ok
 }
 
