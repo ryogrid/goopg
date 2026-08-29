@@ -11564,6 +11564,10 @@ func (o *ddlOp) execAlterTableSetReloptions(tbl *catalog.Table, act parser.Alter
 	}
 	if fillfactor != nil {
 		tbl.Fillfactor = *fillfactor
+		// Drop this session's memoised reserve so the next insert re-reads
+		// it (M0134-0175a); PG gets the same effect from relcache
+		// invalidation on the ALTER.
+		o.ctx.invalidateHeapFillfactor(tbl.OID)
 	}
 	if autovacEnabled != nil {
 		tbl.AutovacuumEnabled = *autovacEnabled
@@ -11586,6 +11590,7 @@ func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.Alt
 			tbl.ParallelWorkersSet = false
 		case "fillfactor":
 			tbl.Fillfactor = 0
+			o.ctx.invalidateHeapFillfactor(tbl.OID)
 		case "autovacuum_enabled":
 			tbl.AutovacuumEnabled = false
 			tbl.AutovacuumEnabledSet = false
