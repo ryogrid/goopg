@@ -545,34 +545,70 @@ func (l *lexer) next() (Token, error) {
 		l.pos++
 		return Token{Kind: TokenSymbol, Value: ":", Pos: start}, nil
 
-	case c == '<' || c == '>' || c == '=' || c == '!' || c == '+' || c == '-' || c == '/' || c == '%' || c == '|' || c == '&' || c == '#' || c == '~' || c == '@' || c == '^':
-		// Greedy multi-char operator match. M0097-0003: added <<, >>, &, #, ~.
-		two := ""
-		if l.pos+1 < len(l.src) {
-			two = l.src[l.pos : l.pos+2]
+	case isOpRunChar(c) && c != '*':
+		// Maximal-munch operator scan — a faithful port of scan.l's
+		// `{operator}` rule (postgres/src/backend/parser/scan.l:886-990),
+		// replacing a hand-maintained allowlist of two-character spellings.
+		//
+		// The allowlist was the bug: `@@`, `~~`, `<->`, `?|`, `|/` and EVERY
+		// user-defined `CREATE OPERATOR` name lexed as a sequence of
+		// single-character operators, so `a @@ any (...)` was a syntax error
+		// at "any" (the ANY quantifier rules take one `subq_op`, not two) and
+		// `a @@ 'x'` reported the operator as `@`. M0134-0179.
+		//
+		// Upstream matches `{op_chars}+` greedily and then trims, in order:
+		//   1. at an embedded `/*` or `--`, whichever comes first — those are
+		//      comment starts and the operator must stop there. A run that
+		//      BEGINS with either never reaches here: skipWhitespaceAndComments
+		//      consumed it, which is upstream's "will match a prior rule".
+		//   2. trailing `+`/`-`, unless some earlier character is one of
+		//      ~!@#^&|`?% — so `=-` is two operators but `?-` stays one.
+		// The one-char-{self} and `<= >= <> != =>` remappings upstream does
+		// here already live in adapter.go (scanSelfChars / namedOperator), so
+		// this returns TokenOperator for every width and lets the adapter
+		// choose the terminal — unchanged behaviour for single characters.
+		end := l.pos
+		for end < len(l.src) && isOpRunChar(l.src[end]) {
+			end++
 		}
-		switch two {
-		case "<=", ">=", "<>", "!=", "||", "<<", ">>", "~*", "!~", "=>", "<@", "@>", "&&", "->", "#>":
-			l.pos += 2
-			// Check for 3-char operators (e.g., !~*).
-			if l.pos < len(l.src) && l.src[l.pos] == '*' && (two == "!~") {
-				l.pos++
-				return Token{Kind: TokenOperator, Value: "!~*", Pos: start}, nil
-			}
-			// JSON text-extraction operator ->> (3-char). M0118-0009.
-			if l.pos < len(l.src) && l.src[l.pos] == '>' && two == "->" {
-				l.pos++
-				return Token{Kind: TokenOperator, Value: "->>", Pos: start}, nil
-			}
-			// JSON path text-extraction operator #>> (3-char). M0134-0039.
-			if l.pos < len(l.src) && l.src[l.pos] == '>' && two == "#>" {
-				l.pos++
-				return Token{Kind: TokenOperator, Value: "#>>", Pos: start}, nil
-			}
-			return Token{Kind: TokenOperator, Value: two, Pos: start}, nil
+		run := l.src[l.pos:end]
+		nchars := len(run)
+
+		cut := strings.Index(run, "/*")
+		if i := strings.Index(run, "--"); i >= 0 && (cut < 0 || i < cut) {
+			cut = i
 		}
-		l.pos++
-		return Token{Kind: TokenOperator, Value: string(c), Pos: start}, nil
+		if cut > 0 {
+			// cut == 0 is unreachable (see above); clamping keeps a future
+			// change to the comment skipper from stalling the scan loop.
+			nchars = cut
+		}
+
+		if nchars > 1 && (run[nchars-1] == '+' || run[nchars-1] == '-') {
+			qualified := false
+			for ic := nchars - 2; ic >= 0; ic-- {
+				switch run[ic] {
+				case '~', '!', '@', '#', '^', '&', '|', '`', '?', '%':
+					qualified = true
+				}
+				if qualified {
+					break
+				}
+			}
+			if !qualified {
+				for nchars > 1 && (run[nchars-1] == '+' || run[nchars-1] == '-') {
+					nchars--
+				}
+			}
+		}
+
+		// NAMEDATALEN, as an error rather than notice-and-truncate: upstream
+		// reasons that an over-long operator is a syntactic mistake anyway.
+		if nchars >= 64 {
+			return Token{}, l.errf(start, "operator too long")
+		}
+		l.pos += nchars
+		return Token{Kind: TokenOperator, Value: run[:nchars], Pos: start}, nil
 	}
 
 	return Token{}, l.errf(start, "unexpected character %q", c)
@@ -1179,4 +1215,22 @@ func isHexDigit(c byte) bool {
 // opening tag at the first subsequent `$`.
 func isDollarTagCont(c byte) bool {
 	return isIdentStart(c) || isDigit(c)
+}
+
+// isOpRunChar reports membership in scan.l's {op_chars} set
+// (postgres/src/backend/parser/scan.l:367) — the alphabet of a PostgreSQL
+// operator name, and therefore of the maximal-munch run scanned above.
+//
+// It is used for the run's CONTINUATION unconditionally, but the run's first
+// character additionally excludes '*': in this lexer '*' is claimed earlier by
+// the {self} case it shares with `, ; ( ) . [ ]`, so a run BEGINNING with '*'
+// (`**`, `*/`, `*<`) still splits. Every other position absorbs '*' normally,
+// which is what `~*`, `!~*` and `#>>` depend on. See the deferral ledger row
+// for M0134-0179.
+func isOpRunChar(c byte) bool {
+	switch c {
+	case '~', '!', '@', '#', '^', '&', '|', '`', '?', '+', '-', '*', '/', '%', '<', '>', '=':
+		return true
+	}
+	return false
 }
