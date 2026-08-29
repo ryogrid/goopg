@@ -174,7 +174,7 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 		refCols := ref.FK.RefColumns
 		if len(refCols) == 0 {
 			// Default: use parent PK column(s).
-			refCols = pkColumns(parentTbl)
+			refCols = pkColumns(ctx, parentTbl)
 		}
 		vals, allNull := fkColValues(parentTbl.Columns, refCols, parentRow)
 		if allNull {
@@ -340,7 +340,7 @@ func fkDeleteAncestorPass(ctx *Context, im *catalog.InMemory, leafTbl *catalog.T
 			fk := ref.FK
 			refCols := fk.RefColumns
 			if len(refCols) == 0 {
-				refCols = pkColumns(parent)
+				refCols = pkColumns(ctx, parent)
 			}
 			vals, allNull := fkColValues(leafTbl.Columns, refCols, leafRow)
 			if allNull {
@@ -641,7 +641,7 @@ func assertParentExists(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *cata
 	// Determine the referenced columns.
 	refCols := fk.RefColumns
 	if len(refCols) == 0 {
-		refCols = pkColumns(parentTbl)
+		refCols = pkColumns(ctx, parentTbl)
 	}
 	// FK INSERT check uses the wait-aware scan: when a matching parent row's
 	// xmax is in-flight, block until that updater commits or aborts, then
@@ -799,7 +799,7 @@ func assertNoChildRows(ctx *Context, childTbl *catalog.Table, fk catalog.Foreign
 		if len(refCols) == 0 {
 			if parentTbl, ok2 := ctx.Catalog.(*catalog.InMemory); ok2 {
 				if pt, ok3 := parentTbl.LookupTable(parser.ObjectName{Name: fk.RefTable}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)); ok3 {
-					refCols = pkColumns(pt)
+					refCols = pkColumns(ctx, pt)
 				}
 			}
 		}
@@ -1135,7 +1135,7 @@ func scanRefTableForDetachedPartitionMatch(ctx *Context, im *catalog.InMemory, f
 	// Referenced parent columns, in FK-column order.
 	refCols := fk.RefColumns
 	if len(refCols) == 0 {
-		refCols = pkColumns(parentTbl)
+		refCols = pkColumns(ctx, parentTbl)
 	}
 	if len(refCols) != len(fk.Columns) {
 		return nil, nil
@@ -1691,15 +1691,37 @@ func fkRowMatches(cols []catalog.Column, fkCols []string, row Row, vals []Datum)
 	return true
 }
 
-// pkColumns returns the primary-key column names for tbl by scanning its
-// indexes for the one with Primary = true. Falls back to the first column.
-func pkColumns(tbl *catalog.Table) []string {
-	// This function is called in FK contexts where we have an *InMemory
-	// catalog via the check's closure. Since pkColumns only needs the index
-	// list we look it up via the tbl pointer's catalog reference.
-	// We fall back to the first column when no PK index is found.
-	if len(tbl.Columns) > 0 {
-		return []string{tbl.Columns[0].Name}
+// pkColumns returns the primary-key column names for tbl, in index-key order,
+// by scanning its indexes for the one with Primary = true.
+//
+// This is goopg's port of the column half of transformFkeyGetPrimaryKey
+// (postgres/src/backend/commands/tablecmds.c:13382), which builds the
+// referenced-column list "from the indkey definition" of the index marked
+// indisprimary. It backs the `RefColumns == nil` convention on
+// catalog.ForeignKey ("empty = use parent PK"): an FK whose REFERENCES clause
+// omitted the column list resolves through here.
+//
+// It used to IGNORE the indexes entirely and return tbl.Columns[0] — the
+// table's first column — despite a doc comment that already described the
+// index scan (M0134-0171). That silently produced three wrong answers:
+// a multi-column PK yielded 1 of N columns, so the arity mismatch made every
+// valid row fail its FK check; a single-column PK that was not the first
+// column enforced the FK against the WRONG column; and only the
+// PK-is-column-1 case was accidentally right, which is why the single-column
+// regress coverage never caught it.
+//
+// Returns nil when tbl has no primary key. Callers that resolve at DDL time
+// raise 42704 ("there is no primary key for referenced table") for that case,
+// per tablecmds.c:13437; the runtime callers below treat nil as "cannot
+// resolve" and fall through to their existing not-found handling.
+func pkColumns(ctx *Context, tbl *catalog.Table) []string {
+	if ctx == nil || ctx.Catalog == nil || tbl == nil {
+		return nil
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+		if idx.Primary {
+			return append([]string(nil), idx.Columns...)
+		}
 	}
 	return nil
 }
