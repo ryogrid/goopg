@@ -1,67 +1,59 @@
 (idle — nothing in flight)
 
-## Loop #4 result — M0134-0173 landed
+## Loop #5 result — M0134-0174 landed
 
 **Nightly triage:** `ci/logs/action-items.md` still at run `20260828-235424`; both
 `## AI-` items already filed (001 advisory-lock FIXED, 002 Q5 timeout open). Nothing new.
 
 **Baton check:** tree matched `(idle)` — zero modified `.go` files at start.
 
-**Task:** M0134-0173 `stats_import.sql` sized live for the first time
-(`not-tried` → **`failed`**, 1461 diff lines / 74 `^+ERROR`) → **PARKED** at 1457 / 73.
-Residual is ~100% the PG 18 statistics-IMPORT function family
-(`pg_restore_relation_stats` / `pg_restore_attribute_stats` / `pg_clear_*_stats`,
-55 of 73 errors) plus no queryable `pg_statistic` (5 more). Ledger 0173c/0173d.
+**Task:** M0134-0174 `subscription.sql` sized live for the first time
+(`not-tried` → **`failed`**, 552 diff lines / 46 `^+ERROR` / 48 `^-ERROR`)
+→ **PARKED** at 526 / 29 / 31.
 
-**Shipped (engine-wide silent wrong-answer fix):** goopg treated every range-typed
-value as **opaque, unvalidated text**. `evalCast` had NO arm for any range type, so
-`'garbage'::int4range` succeeded, `'[5,1)'::int4range` succeeded where PG raises
-22000, and — the serious half — **no discrete range was ever canonicalized**, so
-`'[1,4]'::int4range` and `'[1,5)'::int4range` (the SAME value in PG) compared
-UNEQUAL through every equality, ORDER BY, btree probe and exclusion constraint.
-Second half: the six built-in range constructors were 42883 despite all twelve
-`range_constructor2/3` rows sitting in goopg's `pg_proc` seed. New
-`internal/executor/rangetypes.go`; design
-`docs/design/m0134-0173-range-type-input-and-constructors.md`.
+**Shipped (engine-wide silent-acceptance fix):** CREATE SUBSCRIPTION validated
+**nothing**. `execCreateSubscription` read two keys out of the `WITH` map
+(`enabled`, `slot_name`) and dropped every other name; `Conninfo` went into the
+catalog row unread. `CONNECTION 'foo'`, `CONNECTION 'i_dont_exist=param'`,
+`WITH (connect=false, enabled=true)`, `WITH (not_an_option=3)` and
+`PUBLICATION foo, testpub, foo` all SUCCEEDED. New
+`internal/executor/subscription_options.go` ports `parse_subscription_options`
+(`subscriptioncmds.c:124`), `check_duplicates_in_publist` (`:2362`) and
+`walrcv_check_conninfo`'s `PQconninfoParse` half (`fe-connect.c:6290`). Design
+`docs/design/m0134-0174-create-subscription-validation.md`.
 
 **Three things worth carrying:**
 
-1. **"Catalog advertises what the executor never implemented" is now a named
-   recurring shape** — M0134-0167 (IndexAMCapability) and this one within a week.
-   When a `pg_proc`/`pg_am` seed row exists, that is NOT evidence the feature runs.
-   Probe the SQL, not the catalog.
-2. **`evalCast(d, "text")` is NOT a general output function.** Its arm converts only
-   the kinds needing a session GUC (KindTime, KindBytes) and returns everything else
-   unchanged — a `KindNumeric` comes back as itself, so `StringValue()` is `""`.
-   `numrange(1.0,4.0)` first rendered `["","")`. Only the live oracle A/B caught it;
-   reading the arm did not.
-3. **A `git worktree add` of this repo does NOT get `postgres/`.** It creates an
-   EMPTY submodule dir (containing only the inner `postgres -> ../postgres` link),
-   so the regress runner silently finds no SQL. `rm` the inner link, `rmdir`, then
-   `ln -s /home/ryo/work/goopg/goopg/postgres <worktree>/postgres`.
+1. **The cascade is now a reliable sizing signal, not a nuisance.** 20 of the 46
+   divergences were a spurious `subscription already exists`; fixing validation
+   collapsed them to 3, and those 3 point *precisely* at the next missing piece
+   (the permission checks). When a case reuses one object name across negative
+   cases, count the "already exists" errors first — that number is the size of
+   the silently-accepted bucket, and the survivors name the next cause.
+2. **`specified_opts` is semantics, not bookkeeping.** Upstream distinguishes
+   "the user asked for this" from "this is the default" to pick between
+   `X and Y are mutually exclusive options` and `subscription with X must also
+   set Y`. Four of the eight incompatibility messages are wrong without it — a
+   final-value comparison cannot reproduce them.
+3. **`alter_generic` is nondeterministic (843 ↔ 841).** The flapping line is
+   `catalog update: freshly extended page did not accept tuple`. An A/A on the
+   unchanged patched tree reproduced the 843 baseline byte-identically. Same
+   class as `plpgsql.sql` — A/A before reading its line count as an A/B signal.
 
-Gates run: `go build ./...` OK; guard `TestRangeTypeInputAndConstructors` (8 subtests)
-PASS, **revert-checked at BOTH wiring points** (deleting the `evalCast` arm fails the
-cast subtest; deleting the `evalFuncCall` case fails the dispatch subtest); 43-statement
-oracle A/B vs a throwaway PG 18.3 — every value/message/DETAIL/HINT matches; 14-case
-regress A/B vs a HEAD worktree (`rangetypes` 2543→2166 / 234→182 `^+ERROR`,
-`multirangetypes` 4252→4235, 9 byte-identical, `create_index` delta = pre-existing
-nondeterministic pointer-address leak in `pg_get_indexdef`, `plpgsql` +5 traced line by
-line to the polymorphic `f1(anyrange,…)` block = no regression);
+Gates run: `go build ./...` OK; guards `TestParseSubscriptionOptions{Rejects,Accepts}`,
+`TestCheckConninfoSyntax`, `TestCheckDuplicatesInPublist`,
+`TestCreateSubscriptionRejectedEndToEnd` PASS, **revert-checked at BOTH wiring
+points** (removing the `checkConninfoSyntax` call or the `parseSubscriptionOptions`
+call fails the end-to-end guard); 8-case regress A/B vs a HEAD worktree
+(`subscription` 552→526, **seven byte-identical**, `alter_generic` delta proven
+nondeterministic by A/A); `go test ./internal/executor/ ./internal/catalog/
+./internal/parser/ ./internal/replication/` PASS;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2 24.0s, Q13 rows=34 8.5s);
-`make regen-testport` + `make check-testport-inventory` PASS;
-`make ralph-state-guard` OK after self-repair.
+`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2 20.6s, Q13 rows=34 8.2s);
+`make regen-testport` + `make check-testport-inventory` PASS.
 
 In-flight: none.
 
-**Carried obligations (18th loop):** TPC-DS SF0.5 gate still NOT run (for -0156, -0157).
--0158..-0173 are parser/DDL/catalog/ACL/wire/type-input/FK/plpgsql-only and cannot move
-a TPC-DS plan.
-
-**Env notes:** foreign orphan goopg still holds **port 5533** (pid 1047197, not ours —
-do not kill); probe on 5540+. Throwaway dirs `/tmp/probe0173`, `/tmp/pgoracle0173`,
-worktree `/tmp/gp0173head` — all servers stopped and the worktree removed.
-
-**NEXT LOOP:** banner rules — M-NIGHTLY filing, then
-**M0134-0174 (`subscription.sql`, status `not-tried`)**.
+**Carried obligations (19th loop):** TPC-DS SF0.5 gate still NOT run (for -0156, -0157).
+-0158..-0174 are parser/DDL/catalog/ACL/wire/type-input/FK/plpgsql/pubsub-only and
+cannot move a TPC-DS plan.

@@ -1162,13 +1162,39 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE SUBSCRIPTION requires PubSub registry in Context"}
 	}
-	enabled := true
-	if v, ok := s.With["enabled"]; ok {
-		enabled = v == "true" || v == "on" || v == "yes" || v == "1"
+	// M0134-0174: validate before creating anything, in upstream
+	// CreateSubscription's own order (subscriptioncmds.c:539) — a statement
+	// that is wrong in two ways must report the same one PG reports, and any
+	// check that runs after the registry insert would leave the silently
+	// created subscription behind to poison every later statement.
+	opts, err := parseSubscriptionOptions(s.With, s.Pos())
+	if err != nil {
+		return err
 	}
-	slotName := s.With["slot_name"]
 	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
-	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, enabled, o.currentDDLOwnerOID(), subDBOid)
+	// subscriptioncmds.c:623 — the duplicate-name check precedes the conninfo
+	// and publication checks, and names the subscription (goopg's registry
+	// error is the bare unquoted sentinel catalog.ErrSubscriptionExists).
+	if _, exists := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); exists {
+		return &ExecError{
+			Code:    "42710",
+			Pos:     s.Pos(),
+			Message: fmt.Sprintf("subscription %q already exists", s.Name),
+		}
+	}
+	// subscriptioncmds.c:632 — an unspecified slot_name defaults to the
+	// subscription name; `slot_name = NONE` leaves it empty.
+	slotName := opts.slotName
+	if !opts.specified["slot_name"] {
+		slotName = s.Name
+	}
+	if err := checkConninfoSyntax(s.Conninfo, s.Pos()); err != nil {
+		return err
+	}
+	if err := checkDuplicatesInPublist(s.Publications, s.Pos()); err != nil {
+		return err
+	}
+	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, opts.enabled, o.currentDDLOwnerOID(), subDBOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
