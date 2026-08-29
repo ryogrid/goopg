@@ -12621,6 +12621,14 @@ func exprType(e Expr) catalog.Type {
 		// follow-up.
 		case "pg_typeof":
 			return catalog.Type{Name: "regtype"}
+		// The six built-in range constructors (range_constructor2 /
+		// range_constructor3, rangetypes.c) each return their OWN range type —
+		// pg_proc.dat gives int4range prorettype int4range, and so on. Without
+		// this arm `pg_typeof(int4range(1,4))` answered `unknown`. M0134-0173.
+		case "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange":
+			if len(x.Args) == 2 || len(x.Args) == 3 {
+				return catalog.Type{Name: strings.ToLower(x.Name)}
+			}
 		// Type-cast functions: single-arg calls like float8(expr) act as explicit casts.
 		// Return the target type so downstream type inference (BinaryOp, wire) is correct.
 		case "float8", "double precision", "double", "float":

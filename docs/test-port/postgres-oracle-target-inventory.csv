@@ -188,7 +188,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/sqljson_queryfuncs.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/stats.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/stats_ext.sql,failed,no,-,
-,regress-sql,regress,postgres/src/test/regress/sql/stats_import.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/stats_import.sql,failed,no,-,RUN 2026-08-29 (M0134-0173): 1461 diff lines / 74 ^+ERROR at HEAD; PARKED — ~100% of the residual is the PG 18 statistics-import function family (pg_restore_relation_stats / pg_restore_attribute_stats / pg_clear_*_stats) plus the absence of a queryable pg_statistic relation. See deferral ledger rows 0173c/0173d.
 ,regress-sql,regress,postgres/src/test/regress/sql/strings.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/subscription.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/subselect.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

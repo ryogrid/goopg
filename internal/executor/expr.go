@@ -6603,6 +6603,25 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		}
 		return d, nil
 	}
+	// A range type (`::int4range`, `::daterange`, or a user
+	// `CREATE TYPE … AS RANGE` type) is NOT an unknown type — goopg carries
+	// range values as their canonical range_out text, so the cast is
+	// rangetypes.c's range_in: parse, run the SUBTYPE's input function over
+	// each bound, reject lower > upper, and canonicalize the discrete types
+	// to `[)`. Until M0134-0173 this fell through to the pass-through below,
+	// which made `'garbage'::int4range` succeed and left `'[1,4]'::int4range`
+	// and `'[1,5)'::int4range` — the same value in PG — comparing unequal.
+	// This is the fourth "missing evalCast arm = unvalidated text" instance
+	// (xid, circle, float8 were the first three).
+	if s, ok := datumAsString(d); ok {
+		if _, isRange := lookupRangeTypeForIO(targetType, ctx); isRange {
+			out, err := rangeIn(targetType, s, pos, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewStringDatum(out), nil
+		}
+	}
 	return d, nil // pass-through for unknown types
 }
 
@@ -11429,6 +11448,21 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 	}
 	switch name {
+	case "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange":
+		// range_constructor2 / range_constructor3 (rangetypes.c). goopg's
+		// pg_proc seed has carried these twelve rows since the range-type
+		// catalog work, so the catalog ADVERTISED a function the executor
+		// never implemented — `SELECT int4range(1,4)` was 42883. Both are
+		// proisstrict='f': a NULL bound is an INFINITE bound. M0134-0173.
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalRangeConstructor(name, args, x.Pos(), ctx)
 	case "bt_index_check":
 		// amcheck B-tree structural verification (slice S4 of 0110-0008).
 		return evalBtIndexCheck(x, slot, ctx, false)
