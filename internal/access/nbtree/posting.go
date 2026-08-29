@@ -57,6 +57,73 @@ func (f indexFormat) postingOffsetFor(key []byte) int {
 	return SizeOfIndexTupleData + len(key)
 }
 
+// postingChunkLens is the CHUNKING RULE for a run of `n` consecutive entries
+// that all share `key`: it returns one TID count per line pointer the run is
+// written as, where a count of 1 means a plain (non-posting) item. A run
+// longer than one posting can hold is cut into several, and a trailing
+// one-TID remainder goes back to a plain item, because upstream defines a
+// posting list as holding at least two TIDs (nbtree.h's BTreeTupleSetPosting
+// asserts it).
+//
+// It exists as its own function because the rule has two consumers that must
+// never disagree: `deduplicateToRawItems` WRITES the run, and `runFootprint`
+// BUDGETS it for the split path. They were separate expressions of the same
+// rule until M0134-0177, when a split whose byte budget disagreed with what
+// the refill actually wrote panicked the backend out of
+// `mustInsertItemSorted` ("not enough free space in page"). That is the same
+// class of bug `itemEncodedSize` was introduced to close for plain items
+// (root-0040), and it gets the same treatment: one function, two callers.
+func (f indexFormat) postingChunkLens(key []byte, n int) []int {
+	if n <= 1 {
+		return []int{n}
+	}
+	// Bytes left for the TID array after the key material, at 6 bytes each.
+	// The offset is format-dependent (see postingOffsetFor), so it is asked
+	// rather than recomputed here.
+	maxTIDsPerChunk := (maxRawItemSize - f.postingOffsetFor(key)) / SizeOfItemPointerData
+	if maxTIDsPerChunk < 1 {
+		// Pathological: the key alone exceeds the per-item page limit. Fall
+		// back to one plain item per TID so each entry still fits on its own.
+		out := make([]int, n)
+		for i := range out {
+			out[i] = 1
+		}
+		return out
+	}
+	if n <= maxTIDsPerChunk {
+		return []int{n}
+	}
+	out := make([]int, 0, (n+maxTIDsPerChunk-1)/maxTIDsPerChunk)
+	for off := 0; off < n; off += maxTIDsPerChunk {
+		end := off + maxTIDsPerChunk
+		if end > n {
+			end = n
+		}
+		out = append(out, end-off)
+	}
+	return out
+}
+
+// runFootprint is the on-page cost — line pointers plus MAXALIGNed bodies —
+// of writing a run of `n` same-key entries through the chunking rule above.
+// This is the split path's budget for a run, and it is exact by construction:
+// it prices precisely the items postingChunkLens says will be written.
+func (f indexFormat) runFootprint(key []byte, n int) int {
+	if n <= 0 {
+		return 0
+	}
+	const itemIDSize = 4 // matches storage.itemIDSize
+	total := 0
+	for _, c := range f.postingChunkLens(key, n) {
+		if c == 1 {
+			total += itemIDSize + MaxAlign(f.bodySize(key))
+			continue
+		}
+		total += itemIDSize + MaxAlign(f.postingSizeFor(key, c))
+	}
+	return total
+}
+
 // postingSizeFor is `_bt_form_posting`'s `newsize` (nbtdedup.c): the whole
 // on-page length of a posting item over `key` and `nhtids` TIDs.
 //

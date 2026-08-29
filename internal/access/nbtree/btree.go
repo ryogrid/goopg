@@ -2837,15 +2837,17 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// resetPageItems re-installs before any data item goes back on (S11.2b:
 	// the separator is a page item now, not opaque-area reserve, so it has to
 	// be paid for out of the same budget).
-	if bt.format().compactRawSize(allItems)+pageHighKeyFootprint(slot.Page()) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
+	if bt.format().compactFootprint(allItems)+pageHighKeyFootprint(slot.Page()) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
 		bt.traceRewrite(blk, "dedup-recovery", preLineCount, postPageItemsSnap, postDedupSnap)
 		// Re-attempt no-split insert with the dedup'd content.
 		// Reset the page and write the dedup'd items back, no
 		// split needed. The right-side allocation is rolled back.
 		resetPageItems(slot.Page())
-		for _, x := range allItems {
-			lineIdx := mustInsertItemSorted(bt.format(), slot.Page(), x)
-			bt.traceInsert(blk, lineIdx, x)
+		if err := bt.refillDeduplicated(blk, slot.Page(), allItems); err != nil {
+			rightSlot.Unlock()
+			bt.pool.Unpin(rightSlot)
+			held.release()
+			return err
 		}
 		// Drop the freshly-allocated right slot — split avoided.
 		rightSlot.Unlock()
@@ -2891,7 +2893,26 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// equivalent to count-midpoint; for variable-width keys it
 	// produces balanced halves in bytes (the on-disk metric the
 	// page fill threshold actually cares about).
-	mid := bt.format().byteAwareSplitLoc(allItems)
+	// M0134-0177: balance the halves on the COMPACT footprint — what
+	// refillDeduplicated will actually write — and refuse the split outright
+	// when no cut makes both halves fit, instead of discovering it mid-refill
+	// with the page already reset and the latch held (that path panicked out
+	// of mustInsertItemSorted). leftBudget is stated before the new separator;
+	// compactSplitLoc charges that per candidate, since its size depends on
+	// where the cut lands.
+	rightBudget := pageDataBudget()
+	if inheritedOK {
+		const itemIDSize = 4 // matches storage.itemIDSize
+		rightBudget -= itemIDSize + MaxAlign(len(inheritedHK))
+	}
+	mid, splitOK := bt.format().compactSplitLoc(allItems, pageDataBudget(), rightBudget)
+	if !splitOK {
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		held.release()
+		return fmt.Errorf("btree: no split point fits %d entries (%d bytes compacted) into two pages",
+			len(allItems), bt.format().compactFootprint(allItems))
+	}
 	leftItems := allItems[:mid]
 	rightItems := allItems[mid:]
 
@@ -2956,13 +2977,17 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		return err
 	}
 
-	for _, x := range leftItems {
-		lineIdx := mustInsertItemSorted(bt.format(), slot.Page(), x)
-		bt.traceInsert(blk, lineIdx, x)
+	if err := bt.refillDeduplicated(blk, slot.Page(), leftItems); err != nil {
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		held.release()
+		return err
 	}
-	for _, x := range rightItems {
-		lineIdx := mustInsertItemSorted(bt.format(), rightSlot.Page(), x)
-		bt.traceInsert(rightBlk, lineIdx, x)
+	if err := bt.refillDeduplicated(rightBlk, rightSlot.Page(), rightItems); err != nil {
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		held.release()
+		return err
 	}
 
 	// Non-rightmost split: the page that was left's right sibling
@@ -3437,6 +3462,41 @@ func insertItemSorted(f indexFormat, p storage.Page, it item) (int, error) {
 	return lo, nil
 }
 
+// refillDeduplicated writes `items` — sorted, and in the EXPANDED one-entry-
+// per-heap-TID form pageItems produces — onto a page that resetPageItems has
+// just cleared, re-forming posting lists over runs of same-key entries.
+//
+// This is M0055-0003 Phase B's "full landing", which dedupConsolidate's
+// comment deferred: before M0134-0177 the whole-page rewrites wrote one plain
+// line pointer per (key, TID) pair, so a page whose posting lists pageItems
+// had just expanded could not be written back at its original size. A leaf
+// holding 8 KiB of postings expands to several times that, and the split path
+// panicked trying to fit half of it onto one page. Upstream never has this
+// problem because _bt_split moves RAW on-page items and never expands a
+// posting (nbtsplitloc.c / nbtinsert.c); re-forming on the way out is how the
+// expanded representation gets back to parity.
+//
+// Items are written in order, so the caller's sort order IS the page order.
+func (bt *BTree) refillDeduplicated(blk storage.BlockNumber, p storage.Page, items []item) error {
+	raws, spans := deduplicateToRawItemsWithSpans(bt.format(), items)
+	consumed := 0
+	for i, r := range raws {
+		lineIdx, err := pgInsertItemRawAt(p, uint16(i+1), r.raw)
+		if err != nil {
+			return err
+		}
+		// One trace event per EXPANDED entry, all pointing at the line
+		// pointer that now carries it: the insert log is read to answer
+		// "which slot did this (key, TID) land in", and a posting answers
+		// that for every TID it holds.
+		for k := 0; k < spans[i]; k++ {
+			bt.traceInsert(blk, int(lineIdx)-1, items[consumed+k])
+		}
+		consumed += spans[i]
+	}
+	return nil
+}
+
 // mustInsertItemSorted is the panicking variant for callers that have
 // pre-verified space (dedup-recovery refill, split left/right refill,
 // createNewRoot, WAL replay). A panic here means the space estimate and
@@ -3537,17 +3597,16 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 // their TIDs through a side-channel `extraTIDs` slice on the
 // item.
 //
-// To keep things simple, we DON'T yet rebuild posting bytes here
-// — instead we de-duplicate the expanded list by collapsing
-// runs of identical (key, ptr) pairs that may exist after
-// pageItems' expansion. For real consolidation into postings,
-// we use `marshalPosting` directly when re-writing the page
-// (Phase B's full landing — out of scope for this commit).
-//
-// What this function does TODAY: drop exact (key, ptr) duplicates
-// from the expanded list. That alone bounds duplicate-heavy
-// workloads where the same heap tuple shows up multiple times
-// in the bulk-build's input.
+// Posting bytes are NOT rebuilt here — this function's whole job
+// is to drop exact (key, ptr) duplicates from the expanded list,
+// which bounds duplicate-heavy workloads where the same heap
+// tuple shows up more than once in the input. Re-forming runs
+// into postings is the WRITER's job and happens in
+// `refillDeduplicated` (via deduplicateToRawItems), which is
+// where Phase B actually landed in M0134-0177; until then the
+// rewrites wrote one plain line pointer per expanded (key, TID)
+// pair and a posting-heavy page could not be written back at its
+// original size, panicking the split path.
 func dedupConsolidate(f indexFormat, items []item) []item {
 	if len(items) <= 1 {
 		return items
@@ -3568,16 +3627,12 @@ func dedupConsolidate(f indexFormat, items []item) []item {
 	return out
 }
 
-// compactRawSize (M0055-0003 Phase B) sums the marshalled byte
-// size of every item in `items` plus the per-item line-pointer
-// overhead. Used to decide whether dedup recovered enough space
-// to skip the split.
-func (f indexFormat) compactRawSize(items []item) int {
-	total := 0
-	for _, it := range items {
-		total += f.itemEncodedSize(it)
-	}
-	return total
+// pageDataBudget is the payload bytes a page can hold once resetPageItems has
+// cleared it: everything between the page header and the B-tree opaque area.
+// Line pointers and MAXALIGNed item bodies are both charged against it, which
+// is the same accounting itemEncodedSize / runFootprint use.
+func pageDataBudget() int {
+	return int(btSpecialOffset) - int(storage.SizeOfPageHeaderData)
 }
 
 // pageFreeBudget returns the remaining free byte budget on a
@@ -3616,54 +3671,108 @@ func pageOccupied(p storage.Page) int {
 		(int(btSpecialOffset) - int(h.Upper()))
 }
 
-// byteAwareSplitLoc (M0055-0002-followup-byte-split) returns the
-// 0-based slot index where the split should land so the left
-// half holds approximately half the total encoded byte size.
-// For fixed-width keys this collapses to len(items)/2 (within a
-// rounding tick); for variable-width keys the split point lands
-// where the byte cursor crosses half-total, producing balanced
-// halves in bytes — the metric the page-fill threshold actually
-// cares about.
+// compactFootprint is the number of page bytes `items` occupies once written
+// back through deduplicateToRawItems — line pointers plus MAXALIGNed bodies,
+// with runs of same-key entries priced as the posting lists they are actually
+// stored as.
 //
-// The minimum split point is 1 (left always retains at least one
-// item) and the maximum is len(items)-1 so the right side is
-// non-empty. A degenerate single-item input returns 1 (caller
-// guarantees ≥ 2 items because we're splitting a full page).
-func (f indexFormat) byteAwareSplitLoc(items []item) int {
-	if len(items) <= 2 {
-		return 1
-	}
+// It is NOT compactRawSize. compactRawSize prices every expanded (key, TID)
+// pair as its own plain line pointer, which is what the whole-page rewrites
+// used to write; since M0134-0177 they re-form postings instead, so the budget
+// has to be asked the same question the writer answers.
+func (f indexFormat) compactFootprint(items []item) int {
 	total := 0
-	sizes := make([]int, len(items))
-	for i, it := range items {
-		// 8-byte IndexTupleData header + variable-length key (per
-		// `(item).marshal()` layout). We use the encoded size
-		// rather than just key length so the metric matches the
-		// on-page footprint.
-		sizes[i] = SizeOfIndexTupleData + len(it.key)
-		total += sizes[i]
+	for i := 0; i < len(items); {
+		j := i + 1
+		for j < len(items) && f.compareKeyAttrs(items[j].key, items[i].key) == 0 {
+			j++
+		}
+		total += f.runFootprint(items[i].key, j-i)
+		i = j
 	}
-	half := total / 2
-	cum := 0
-	for i := 0; i < len(items)-1; i++ {
-		cum += sizes[i]
-		if cum >= half {
-			// Place the split AFTER item i — left holds items[0..i],
-			// right holds items[i+1..]. Return i+1 because callers
-			// use `items[:mid]` / `items[mid:]`.
-			split := i + 1
-			if split < 1 {
-				split = 1
-			}
-			if split > len(items)-1 {
-				split = len(items) - 1
-			}
-			return split
+	return total
+}
+
+// compactSplitLoc picks the 0-based index where `items` — the EXPANDED,
+// sorted content of a page plus the item being inserted — is cut into the two
+// halves of a page split, and reports whether such a cut exists at all.
+//
+// It replaces byteAwareSplitLoc on the split path (M0134-0177). The older
+// function balanced the halves by a per-item byte estimate that assumed every
+// entry becomes its own line pointer. That assumption fails exactly where
+// pageItems has just EXPANDED posting lists: a leaf holding 8 KiB of postings
+// can expand to 21 KiB of (key, TID) pairs, and half of 21 KiB does not fit on
+// an 8 KiB page — the refill then panicked out of mustInsertItemSorted with
+// "storage: not enough free space in page", taking the backend down mid-COPY.
+// Balancing on the COMPACT footprint restores the invariant the split path
+// depends on: each half is priced as the page it will actually be written as.
+//
+// Budgets are the halves' data budgets: `leftBudget` BEFORE the new separator
+// (which depends on where the cut lands, so it is charged per candidate) and
+// `rightBudget` already net of the high key the right half inherits.
+//
+// The separator charge follows _bt_recsplitloc (nbtsplitloc.c): the first item
+// on the right becomes the left page's high key, so it counts against left as
+// well as right, and upstream declines to assume suffix truncation shrinks it
+// ("we cannot assume that suffix truncation will make it any smaller"). goopg
+// adds one MAXALIGNed heap TID on top, because truncateSeparator may APPEND
+// the tiebreaker TID when no key attribute distinguishes the two halves — a
+// pivot that is larger than the plain item it was derived from.
+func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) (int, bool) {
+	n := len(items)
+	if n < 2 {
+		return 0, false
+	}
+	const itemIDSize = 4 // matches storage.itemIDSize
+	// Run boundaries: starts[r] is the index of run r's first item, and
+	// starts[len(starts)-1] == n closes the last run.
+	starts := make([]int, 0, n+1)
+	for i := 0; i < n; {
+		starts = append(starts, i)
+		j := i + 1
+		for j < n && f.compareKeyAttrs(items[j].key, items[i].key) == 0 {
+			j++
+		}
+		i = j
+	}
+	starts = append(starts, n)
+	nr := len(starts) - 1
+	// prefix[r] / suffix[r]: compact footprint of the runs strictly before /
+	// from run r. A cut inside run r then costs prefix[r] + the head of r on
+	// the left, and the tail of r + suffix[r+1] on the right.
+	prefix := make([]int, nr+1)
+	for r := 0; r < nr; r++ {
+		prefix[r+1] = prefix[r] + f.runFootprint(items[starts[r]].key, starts[r+1]-starts[r])
+	}
+	suffix := make([]int, nr+1)
+	for r := nr - 1; r >= 0; r-- {
+		suffix[r] = suffix[r+1] + f.runFootprint(items[starts[r]].key, starts[r+1]-starts[r])
+	}
+	bestMid, bestSkew, found := 0, 0, false
+	r := 0
+	for m := 1; m < n; m++ {
+		for starts[r+1] <= m {
+			r++
+		}
+		// m lies in run r (or exactly on its first item, in which case the
+		// head is empty and the tail is the whole run).
+		head := m - starts[r]
+		tail := starts[r+1] - m
+		left := prefix[r] + f.runFootprint(items[starts[r]].key, head)
+		right := f.runFootprint(items[starts[r]].key, tail) + suffix[r+1]
+		sepCharge := itemIDSize + MaxAlign(f.bodySize(items[m].key)) + MaxAlign(SizeOfItemPointerData)
+		if left+sepCharge > leftBudget || right > rightBudget {
+			continue
+		}
+		skew := left - right
+		if skew < 0 {
+			skew = -skew
+		}
+		if !found || skew < bestSkew {
+			bestMid, bestSkew, found = m, skew, true
 		}
 	}
-	// Fall-through: total too small to cross half-mark before the
-	// last entry — return n-1 so right has exactly one item.
-	return len(items) - 1
+	return bestMid, found
 }
 
 // readPageItem (M0055-0002 Phase A) decodes a single item at the
@@ -3707,6 +3816,19 @@ func appendSorted(f indexFormat, items []item, it item) []item {
 	idx := sort.Search(len(items), func(i int) bool {
 		return f.compare(items[i].key, it.key) >= 0
 	})
+	// Within a run of entries that share the key, order by heap TID.
+	// sort.Search alone lands the new entry at the FRONT of its run, which is
+	// fine while every entry is its own plain line pointer but not once the
+	// refill re-forms the run into a posting list (M0134-0177): a posting's
+	// TID array is defined ascending — _bt_swap_posting calls a non-ascending
+	// one corruption, and amcheck checks it. Ordering by (key, heap TID) is
+	// also what a heapkeyspace leaf means by "sorted"
+	// (postgres/src/backend/access/nbtree/nbtinsert.c, _bt_findinsertloc).
+	for idx < len(items) &&
+		f.compareKeyAttrs(items[idx].key, it.key) == 0 &&
+		compareItemPointers(items[idx].ptr, it.ptr) < 0 {
+		idx++
+	}
 	out := make([]item, len(items)+1)
 	copy(out[:idx], items[:idx])
 	out[idx] = it

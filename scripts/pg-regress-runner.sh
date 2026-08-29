@@ -274,12 +274,31 @@ is_named_test() {
 }
 
 if [[ "$RUN_SETUP" -eq 1 ]]; then
-    echo "pg-regress-runner: running test_setup.sql (errors are expected for unimplemented features)..."
-    # Run the file un-stripped: \getenv/\set are standard psql meta-commands
-    # (the vars come from PG_ABS_SRCDIR/PG_LIBDIR/PG_DLSUFFIX exported above),
-    # and test_setup.sql has no \setenv. Best-effort: the C-language regresslib
-    # CREATE FUNCTIONs cannot load in goopg, so tolerate their failures.
-    "${PSQL[@]}" -f "${REGRESS_SQL}/test_setup.sql" >/dev/null 2>&1 || true
+    # test_setup.sql is excluded from --all discovery (it is the prerequisite,
+    # not a case), but it CAN be requested by name — and then it must run
+    # exactly once, as the test, like the four prerequisites below (M0134-0048).
+    # Running it twice is not merely redundant: the second pass COPYs the same
+    # rows into already-populated onek/tenk1, and before M0134-0177 that fed
+    # duplicate keys into the indexes create_index.sql had just built and
+    # panicked the backend out of the B-tree split
+    # (nbtree.mustInsertItemSorted, "not enough free space in page"), so the
+    # case reported "psql lost the connection" instead of a diff.
+    if is_named_test "test_setup"; then
+        echo "pg-regress-runner: skipping ALL setup (test_setup is the requested named test — it will run once, as the test itself, on a clean DB)"
+        RUN_SETUP=0
+    else
+        echo "pg-regress-runner: running test_setup.sql (errors are expected for unimplemented features)..."
+        # Run the file un-stripped: \getenv/\set are standard psql meta-commands
+        # (the vars come from PG_ABS_SRCDIR/PG_LIBDIR/PG_DLSUFFIX exported above),
+        # and test_setup.sql has no \setenv. Best-effort: the C-language regresslib
+        # CREATE FUNCTIONs cannot load in goopg, so tolerate their failures.
+        "${PSQL[@]}" -f "${REGRESS_SQL}/test_setup.sql" >/dev/null 2>&1 || true
+    fi
+fi
+# The four prerequisites below all read tables test_setup.sql creates, so they
+# are pointless (and DB-polluting) when test_setup itself is the case under
+# test — RUN_SETUP was cleared above for exactly that reason.
+if [[ "$RUN_SETUP" -eq 1 ]]; then
     # create_misc.sql creates the a_star/b_star/c_star/d_star/e_star/f_star
     # single/multiple-inheritance chain that select_parallel.sql:23 reads
     # (select round(avg(aa)), sum(aa) from a_star). Upstream runs it as a

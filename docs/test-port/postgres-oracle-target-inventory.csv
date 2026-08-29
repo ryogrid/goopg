@@ -196,7 +196,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/tablesample.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/tablespace.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/temp.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/test_setup.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/test_setup.sql,pass,yes,-,"M0134-0177: sized live via scripts/pg-regress-runner.sh -v test_setup — 100% parity (237 lines, 0 divergence). The case could not previously be RUN as a named case at all: the runner executed test_setup.sql as its own prerequisite and then again as the test, and the second COPY into already-populated onek/tenk1 crashed the backend in the B-tree split (nbtree.mustInsertItemSorted, ""not enough free space in page""). The runner now skips setup when test_setup is the named case, and the split-path crash is fixed (docs/design/m0134-0177-btree-split-posting-refill.md)."
 ,regress-sql,regress,postgres/src/test/regress/sql/text.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/tid.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/tidrangescan.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

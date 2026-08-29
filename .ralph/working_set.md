@@ -1,66 +1,69 @@
 (idle — nothing in flight)
 
-## Loop #8 result — M0134-0176 landed
+## Loop #9 result — M0134-0177 landed
 
 **Nightly triage:** `ci/logs/action-items.md` unchanged (run `20260828-235424`);
-both `## AI-` items already have M-NIGHTLY rows (001 ticked, 002 open). Nothing
-new to file.
+both `## AI-` items already have M-NIGHTLY rows (001 ticked, 002 open — Q5
+timeout). Nothing new to file. Banner: M-NIGHTLY filing is unconditional but
+SELECTION is subordinate to M0134 while any M0134 task is unchecked → worked
+M0134 by ID ascending. `-0176a/-0176b` are letter sub-items, not the next ID.
 
-**Baton check:** previous baton said `(idle)`; selected by ID ascending per the
-banner. -0175b..e are filed sub-items, not the next ID.
+**Task:** M0134-0177 — `test_setup.sql`. Case **PASSES** (237 lines, 100%
+parity), CSV `not-tried` → `pass`/`pass_required=yes`. Design
+`docs/design/m0134-0177-btree-split-posting-refill.md`.
 
-**Task:** M0134-0176 — tablespace storage parameters. `tablespace.sql`
-**854 → 811** diff lines, `^+ERROR` 32 → **25**. Design
-`docs/design/m0134-0176-tablespace-storage-parameters.md`.
+**Five things worth carrying:**
 
-**Four things worth carrying:**
+1. **A "not-tried" case can be un-RUNNABLE, not just untested.** `test_setup.sql`
+   already matched PG byte-for-byte; the runner just executed it twice (its own
+   prerequisite, then the test). Before assuming a case diverges, check that the
+   harness can run it *once*.
 
-1. **The *declared but unconsumed* pattern, FOURTH instance** (after
-   `client_min_messages`, `fillfactor`, and the relation reloptions of
-   M0134-0160). `CREATE TABLESPACE ... WITH (...)` was lexed, grammar-bounded,
-   stored on the AST — as a **raw token dump** — and read by nobody. Grep for a
-   *consuming* reference, not any reference. `pg_tablespace_location` (filed
-   -0176b) is a fifth instance found in the same file: a catalogued `pg_proc`
-   OID with no dispatch, returning an empty row instead of erroring.
+2. **The engine bug was found by the double-run, not by the case.** Second
+   `COPY` into a populated `onek` → `panic="storage: not enough free space in
+   page"` in `nbtree.mustInsertItemSorted`. Root cause: `pageItems` EXPANDS
+   posting lists (one item per heap TID) and the split refill wrote each back as
+   its own plain line pointer. Measured with a temporary `SPLITDBG` printf: an
+   8132-byte leaf expanded to **21960** bytes; both halves of a 50/50 cut
+   overflowed. Normal splits log ~8700 = "one page + the new item" — that ratio
+   is the invariant to check if this area regresses.
 
-2. **A live PG 18.3 oracle is cheap and it paid off.** `initdb --auth=trust` +
-   `pg_ctl -o "-p 5541"` into /tmp takes ~30s and settled four semantics the
-   source alone left ambiguous — most importantly that **`RESET (bogus_never_set)`
-   SUCCEEDS** (validation runs on the MERGED array, so a name is only ever
-   checked on the way *in*) and that emptying the array gives **NULL, not `{}`**.
-   It also surfaced the one divergence that remains: `SET (seq_page_cost)` (bare
-   name) stores `=true` where PG rejects the VALUE TYPE — ledgered.
+3. **Revert-check with a full READBACK, not just "no panic".** The guard at HEAD
+   fails `RangeScan returned 21396 entries, want 21600` — the old split path
+   *silently dropped 204 index entries* on shapes that didn't crash. A no-panic
+   assertion would have missed the worse half of the bug.
 
-3. **Port the shape, not just the answer.** `RESET (name = value)` → 42601 is
-   only *expressible* because the clause is an ordered list with a `HasValue`
-   bit. A `map[string]string` (what CREATE TABLE still uses — M0134-0160a) can
-   represent neither "no value" nor source order. Upstream's own comment says
-   "the grammar doesn't enforce it", which is the tell that the parser must
-   RECORD rather than reject.
+4. **Sibling-paths rule, size-model edition (3rd instance after
+   `itemEncodedSize`/root-0040).** `byteAwareSplitLoc` priced items with a
+   *different* expression than `itemEncodedSize` — no line pointer, no MAXALIGN,
+   no postings. Fix funnels writer and budget through one function
+   (`postingChunkLens`) and pins the equality in a test. Deleted the two
+   superseded helpers rather than leaving them as wrong-model siblings.
 
-4. **Check whether a grammar change is even needed.** Tablespace DDL is one of
-   the classes the goyacc port deliberately does not carry (playbook §12):
-   `CREATE` was already hand-written and `routedCreatePairs["alter"]` has no
-   `"tablespace"`, so `ALTER TABLESPACE` never reaches the grammar. The new arm
-   sits beside its `CREATE` sibling — no `grammar/*.y` edit, no goldens.
+5. **`pg-regress-runner.sh` quick-set A/B vs stashed HEAD is a cheap, sharp
+   gate** for high-blast-radius storage changes: ~10 min a side, and
+   "byte-identical, same 48 diff files, same line counts" is much stronger
+   evidence than a bare pass count (the quick set sits at 4/52 for unrelated
+   reasons, so the absolute number says nothing).
 
-**Two traps hit:** an **orphaned server on 5533** silently answered my probe with
-old behavior (`bind: address already in use` was buried in the server log, and
-psql connected happily to the orphan) — always grep the server log for it before
-believing a "no change" result. And `3` lexes as `TokenIntLit`, not
-`TokenNumericLit`; `1.5` is the numeric one.
+**Trap re-confirmed:** the throwaway-PG oracle is worth the 30s (`initdb -A
+trust` + `pg_ctl -o "-p 5542 -k /tmp"`) — it settled that psql's
+`psql:<file>:<line>:` NOTICE prefix is a `-f` artifact and that pg_regress uses
+a **stdin redirect** (`pg_regress_main.c:75`), which is why expected files carry
+bare `NOTICE:`. Separately: a `psql` against the TPC-H reference PG on **65432**
+hung for 15 min — do not probe the bench clusters for one-off oracle questions.
 
-**Discovered, filed, not fixed:** M0134-0176a (`ALTER ... ALL IN TABLESPACE`
-unparsed — the working RENAME unmasked its cascade into the case's final
-`DROP TABLESPACE`), M0134-0176b (`pg_tablespace_location` undispatched).
-
-**Gates run:** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2 24.9s, Q13 rows=34 8.8s);
-`go test` on internal/{executor,parser,catalog,optimizer,postmaster} PASS;
-`scripts/pg-regress-runner.sh tablespace` before/after; live PG 18.3 A/B;
-`make regen-testport` + `make check-testport-inventory` PASS;
+**Gates run:** `go test ./internal/access/nbtree/... ./internal/storage/...`
+PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2 22.2s, Q13 rows=34 9.3s);
+`scripts/pg-regress-runner.sh` quick set A/B **byte-identical**;
+`scripts/pg-regress-runner.sh -v test_setup` PASS; double-`test_setup` repro 0
+panics; `make regen-testport` + `make check-testport-inventory` PASS;
 `make ralph-state-guard` OK (auto-repaired the progress marker). gofmt drift on
-ddl.go/ast.go/operators_ddl.go/planner.go/dispatch.go is **pre-existing at HEAD**
-(verified by stash) — none of it touches the new lines.
+`btree.go` is **pre-existing at HEAD** (verified by stash); the new/changed
+`posting.go`, `bulkload.go` and the new test file are gofmt-clean.
+
+**NOT run:** TPC-DS SF0.5 gate (~1 h). This is an index-core change, so it is
+the one gate worth adding if anything looks off downstream.
 
 **In-flight:** none.
