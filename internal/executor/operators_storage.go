@@ -1062,6 +1062,24 @@ type seqScanOp struct {
 	curBlock storage.BlockNumber
 	curSlot  uint16
 
+	// sampleSpec / sampler implement TABLESAMPLE (M0134-0175). sampleSpec is
+	// the plan-time descriptor; sampler is built once in Open, after the
+	// arguments are evaluated, and is nil for an ordinary scan. Upstream
+	// carries the equivalent pair on SampleScanState (nodeSamplescan.c);
+	// goopg keeps them on the seq scan so TABLESAMPLE composes with
+	// everything the scan already does (visibility, SSI, ring buffers)
+	// instead of duplicating a scan node.
+	//
+	// The sampler is consulted at two points and only two: block acceptance
+	// in the block-advance path, and offset acceptance in the tuple loop.
+	// Both are BEFORE visibility checking, matching upstream — bernoulli
+	// hashes the line-pointer offset whether or not that line pointer holds
+	// a live tuple, so a dead tuple consumes its slot in the sample rather
+	// than shifting later tuples into it. The sampler is STATELESS (the
+	// block cursor is passed in), so rewind() needs no reset for a rescan.
+	sampleSpec *optimizer.TableSampleSpec
+	sampler    tableSampler
+
 	// pscan, when non-nil, makes this a PARALLEL scan: curBlock is then
 	// claimed from a shared atomic allocator instead of being incremented
 	// locally, so N workers' blocks partition the relation. Everything else
@@ -1296,6 +1314,7 @@ func newSeqScanOp(p *optimizer.SeqScan) *seqScanOp {
 		inheritParentOID:      p.InheritParentOID,
 		privilegeCheckRole:    p.PrivilegeCheckRole,
 		privilegeCheckRoleSet: p.PrivilegeCheckRoleSet,
+		sampleSpec:            p.TableSample,
 	}
 }
 
@@ -1604,6 +1623,18 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.curSlot = 0
 	o.slotMax = 0
 	o.prefetchedThru = 0
+	// TABLESAMPLE (M0134-0175). Built here rather than in newSeqScanOp because
+	// the arguments are expressions that need a live Context to evaluate, and
+	// upstream likewise defers them to BeginSampleScan (nodeSamplescan.c:225)
+	// rather than plan time. Without REPEATABLE upstream draws one random seed
+	// per scan and reuses it across rescans; randSeedForSample does the same.
+	if o.sampleSpec != nil {
+		sampler, err := buildSamplerFromSpec(o.sampleSpec, ctx, randSeedForSample())
+		if err != nil {
+			return err
+		}
+		o.sampler = sampler
+	}
 	// M0073-0004 / M0107-0001: per-operator mctx for varchar / char /
 	// text / bytea payload. Reset on block-advance; Release on Close.
 	o.sctx = mmgr.Acquire(ctx.Mctx, mmgr.KindExpr)
@@ -1767,6 +1798,15 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				o.curBlock = b
 			} else if o.curBlock >= o.nBlocks {
 				return nil, EOF
+			} else if o.sampler != nil {
+				// SYSTEM skips whole blocks here (system_nextsampleblock);
+				// BERNOULLI's block callback is a pass-through, exactly as
+				// upstream leaves NextSampleBlock NULL for it.
+				blk, ok := o.sampler.nextSampleBlock(uint32(o.curBlock), uint32(o.nBlocks))
+				if !ok {
+					return nil, EOF
+				}
+				o.curBlock = storage.BlockNumber(blk)
 			}
 			// Poll for query cancellation at each new block boundary.
 			if o.ctx.Ctx != nil {
@@ -1826,6 +1866,13 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			o.curSlot = 1
 		}
 		for int(o.curSlot) <= o.slotMax {
+			// TABLESAMPLE offset filter (bernoulli_nextsampletuple). Placed
+			// before the page RLock so a rejected offset costs a hash and
+			// nothing else.
+			if o.sampler != nil && !o.sampler.sampleTuple(uint32(o.curBlock), o.curSlot) {
+				o.curSlot++
+				continue
+			}
 			page := o.activePage
 			// Brief RLock around tuple decode + arena copy. After
 			// release, parent operators (filterOp / lockRowsOp /

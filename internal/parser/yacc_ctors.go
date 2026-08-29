@@ -1035,3 +1035,19 @@ func NewOnConflictClauseAt(pos int, target *OnConflictTarget, action OnConflictA
 	c.pos = pos
 	return c
 }
+
+// NewRangeTableSample builds a TABLESAMPLE clause — gram.y:14001. `pos` is the
+// METHOD NAME's offset, because that is what upstream stamps (`n->location =
+// @2`, i.e. func_name, not the TABLESAMPLE keyword). `method` is downcased
+// here so the grammar action does not have to: PG's scanner downcases the
+// unquoted identifier / unreserved keyword before `func_name` sees it, and
+// goopg's lexer preserves the source spelling, so `SYSTEM` and `system` must
+// converge on one name before the executor looks the method up (M0134-0175).
+func NewRangeTableSample(pos int, method string, args []Expr, repeatable Expr) *RangeTableSample {
+	return &RangeTableSample{
+		pos:        pos,
+		Method:     strings.ToLower(method),
+		Args:       args,
+		Repeatable: repeatable,
+	}
+}

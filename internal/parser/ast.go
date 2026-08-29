@@ -673,7 +673,32 @@ type RangeVar struct {
 	Lateral   bool          // the LATERAL keyword was written before this item; it may
 	// reference earlier FROM items, which is what makes a FROM
 	// permutation unsafe (planner/joinorder.go, M0125-0034)
+
+	// TableSample carries a TABLESAMPLE clause written on this FROM item
+	// (M0134-0175). Upstream models this as a separate RangeTableSample node
+	// that WRAPS the relation (gram.y:13616 `relation_expr opt_alias_clause
+	// tablesample_clause`); goopg's FROM item is a flat RangeVar value, so
+	// the sample descriptor hangs off the RangeVar instead. Nil when the
+	// item carries no TABLESAMPLE clause.
+	TableSample *RangeTableSample
 }
+
+// RangeTableSample is a TABLESAMPLE clause — gram.y:14001's RangeTableSample.
+// Method is the downcased sampling-method name as written ("system",
+// "bernoulli", or anything else the user typed — validation that the method
+// EXISTS is the executor's job, exactly as upstream defers it to
+// `parse_tablesample_method` so the error carries the right SQLSTATE).
+// Args holds the method's argument list (one float4 percentage for both
+// built-in methods) and Repeatable the optional REPEATABLE seed expression,
+// nil when the clause was omitted.
+type RangeTableSample struct {
+	pos        int // the METHOD NAME's offset — gram.y stamps `@2`, not the TABLESAMPLE keyword
+	Method     string
+	Args       []Expr
+	Repeatable Expr
+}
+
+func (r RangeTableSample) Pos() int { return r.pos }
 
 // TableFuncRef is a table-valued function used in the FROM clause.
 // Handles generate_series, unnest, user-defined SETOF functions, and ROWS FROM.

@@ -2975,6 +2975,17 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		b.table = &renamedTbl
 	}
 	ctx := newResolveContext([]rangeBinding{b}, baseSchema)
+	// TABLESAMPLE (M0134-0175). Resolved ONCE, above the inheritance and
+	// partition expansions below, because upstream applies the sample to
+	// every leaf of an expanded Append — `select count(*) from person
+	// tablesample bernoulli (100)` plans as four Sample Scans, not one
+	// Sample Scan over a Seq-Scan Append. Sharing one descriptor across the
+	// children also shares the seed, which is what makes the per-leaf
+	// samples jointly reproducible under REPEATABLE.
+	tsSpec, err := resolveTableSample(rv.TableSample, ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
 	// View: plan the stored inner SELECT and substitute its
 	// node. The outer ctx's schema (built from the view's
 	// catalog Table) takes precedence for downstream name
@@ -3084,7 +3095,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// buildInheritanceRemapProject wraps the scan in a Project
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
-					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID,
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID, TableSample: tsSpec,
 						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf), UniqueKeys: uniqueKeyColumnSets(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
@@ -3121,7 +3132,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		allDesc := collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 
 		if len(allDesc) > 0 {
-			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
+			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec,
 				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
@@ -3135,7 +3146,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// lock, skip the now-gone child instead of erroring. M0118-0008
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID,
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID, TableSample: tsSpec,
 					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child), UniqueKeys: uniqueKeyColumnSets(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
@@ -3156,8 +3167,42 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			return root, b, nil
 		}
 	}
-	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
+	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec,
 		EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}, b, nil
+}
+
+// resolveTableSample lifts the parser's RangeTableSample into a
+// TableSampleSpec, resolving the argument and REPEATABLE expressions against
+// the scan's own scope. Nil in, nil out — the overwhelmingly common case.
+//
+// Upstream resolves these with EXPR_KIND_FROM_FUNCTION (parse_clause.c:960),
+// which is what makes `TABLESAMPLE bernoulli(('1'::text < '0'::text)::int)`
+// legal: the argument is an ordinary scalar expression, merely one that cannot
+// see the relation being sampled (it is not in scope yet at that point in
+// upstream's transform). goopg resolves against a context that DOES include
+// the sampled relation, so a column reference here would resolve rather than
+// error — a laxity, recorded in the deferral ledger rather than papered over,
+// since rejecting it needs a scope distinction the resolver does not have.
+func resolveTableSample(ts *parser.RangeTableSample, ctx *resolveContext) (*TableSampleSpec, error) {
+	if ts == nil {
+		return nil, nil
+	}
+	spec := &TableSampleSpec{pos: ts.Pos(), Method: ts.Method}
+	for _, a := range ts.Args {
+		e, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, err
+		}
+		spec.Args = append(spec.Args, e)
+	}
+	if ts.Repeatable != nil {
+		e, err := resolveExpr(ts.Repeatable, ctx)
+		if err != nil {
+			return nil, err
+		}
+		spec.Repeatable = e
+	}
+	return spec, nil
 }
 
 // stage1RelSizeRows is the single stamping point for the relation-size

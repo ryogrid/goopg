@@ -75,6 +75,7 @@
 %type <fexprs>	from_list opt_from_clause
 %type <fexpr>	table_ref
 %type <rvar>	base_table_ref
+%type <node>	tablesample_clause opt_repeatable_clause
 %type <jspec>	join_outer
 %type <node>	join_qual_opt opt_derived_alias group_clause opt_with_ordinality
 %type <node>	func_table_expr
@@ -1638,6 +1639,44 @@ col_alias_list:
 				$$ = append($1, $3)
 			}
 
+/* tablesample_clause / opt_repeatable_clause — gram.y:14001-14020, verbatim
+   shape. Two deliberate narrowings, both recorded rather than silent:
+
+   - the method name uses ColId where upstream uses func_name. func_name is
+     `type_function_name | ColId indirection`; goopg has no type_function_name
+     nonterminal, and the indirection arm only exists upstream to let a
+     schema-qualified method name parse. ColId already covers every spelling
+     the two built-in methods and the regress corpus need (`bernoulli` is an
+     IDENT, `system` is the unreserved keyword SYSTEM_P), and it is STRICTER,
+     not laxer, than upstream — the direction §12 asks for when a narrowing
+     is unavoidable.
+   - REPEATABLE takes a_expr, as upstream does, so `REPEATABLE (1+2)` and
+     `REPEATABLE (0.4)` parse as expressions rather than literals.
+
+   Method-name VALIDATION is deliberately not done here. Upstream also defers
+   it (parse_tablesample_method, parse_clause.c) so that an unknown method
+   raises 42704 `tablesample method X does not exist` with a caret on the
+   name, rather than a syntax error. */
+tablesample_clause:
+		TABLESAMPLE ColId '(' expr_list ')' opt_repeatable_clause
+			{
+				var rep Expr
+				if r, ok := $6.(Expr); ok {
+					rep = r
+				}
+				$$ = NewRangeTableSample($<p>2, $2, $4, rep)
+			}
+
+opt_repeatable_clause:
+		REPEATABLE '(' a_expr ')'
+			{
+				$$ = $3
+			}
+	| /*EMPTY*/
+			{
+				$$ = nil
+			}
+
 relation_expr_opt_alias:
 		qualified_name %prec UMINUS
 			{
@@ -1690,6 +1729,24 @@ base_table_ref:
 		relation_expr_opt_alias
 			{
 				$$ = $1
+			}
+	/* gram.y:13616 `relation_expr opt_alias_clause tablesample_clause`.
+	   Upstream WRAPS the relation in a RangeTableSample node; goopg's FROM
+	   item is a flat RangeVar, so the descriptor hangs off it instead
+	   (M0134-0175). Placing the arm here rather than on each of
+	   relation_expr_opt_alias's eight alternatives keeps it to one rule and
+	   still covers every alias spelling, since they all reduce through
+	   relation_expr_opt_alias first. No conflict with `qualified_name ColId`:
+	   TABLESAMPLE is a type_func_name_keyword (kwlists_gen.y:425), so it can
+	   never reduce to ColId — which is precisely why upstream put it in that
+	   category. */
+	| relation_expr_opt_alias tablesample_clause
+			{
+				rv := $1
+				if ts, ok := $2.(*RangeTableSample); ok {
+					rv.TableSample = ts
+				}
+				$$ = rv
 			}
 	| ONLY qualified_name opt_alias_ident
 			{
