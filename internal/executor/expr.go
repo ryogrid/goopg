@@ -927,25 +927,20 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			case KindInt:
 				return NewStringDatum(regclassOIDToName(ctx, connDBOid, uint32(v.Int))), nil
 			case KindString:
-				// Shared SplitIdentifierString port: a quoted relation name
-				// (`'"My Table"'::regclass`) must be unquoted before the catalog
-				// lookup, and a syntax error raises regclassin's 42602.
-				// M0119-0006 (72nd slice, deferral row 1341) — the input half of
-				// RegOut's quote-emission; sibling of regIdentifierInput.
-				schema, rel, nameOK := splitRegQualifiedName(v.StringValue())
-				if !nameOK {
-					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
-				}
-				objName := parser.ObjectName{Schema: schema, Name: rel}
-				if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
-					return NewIntDatum(int64(tbl.OID)), nil
-				}
-				// Also resolve index names: 'idx_name'::regclass returns the index OID.
-				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if idx, found := im.LookupIndex(objName, connDBOid); found && idx != nil {
-						return NewIntDatum(int64(idx.OID)), nil
-					}
-				}
+				// Delegate the whole NAME path to regIdentifierInput — the
+				// shared regclassin port (reg_identifier.go). This arm used to
+				// re-implement the parse+lookup inline and then FALL THROUGH on
+				// a miss, so `'nosuch'::regclass` silently returned the raw name
+				// string instead of regclassin's 42P01 (regproc.c:989
+				// RangeVarGetRelid(..., missing_ok=false)); the bogus regclass
+				// value only surfaced later as a nonsense
+				// `invalid input syntax for type oid` when psql's \sv cast it on
+				// to oid. Delegating also picks up parseDashOrOid
+				// (regproc.c:1865): `'-'::regclass` is InvalidOid and a
+				// pure-digit string is a numeric OID, neither of which is a name
+				// to resolve. Sibling of the heap-write/array/EXECUTE-parameter
+				// callers of the same primitive (Hard-won Rule #2). M0134-0168.
+				return regIdentifierInput(v, "regclass", ctx, x.Pos())
 			}
 		}
 		if strings.EqualFold(x.TargetType, "regdictionary") && ctx != nil && ctx.Catalog != nil {
@@ -4795,23 +4790,16 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		return Datum{Kind: KindInt, Int: n}, nil
 
 	case "float", "float4", "real", "float8":
-		// Goopg v0 stores floats as KindNumeric strings. Validate via
-		// ParseFloat so the error message is PostgreSQL-compatible.
-		v := strings.TrimSpace(x.Value)
-		_, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			typname := "double precision"
-			if x.Type == "float4" || x.Type == "real" {
-				typname = "real"
-			}
-			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
-				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typname, x.Value)}
+		// `float8 '…'` shares float8in with `'…'::float8` (evalCast) — see
+		// float_in.go. M0134-0166: this arm used to validate with a bare
+		// strconv.ParseFloat (no 22003 for out-of-range, no float4 narrowing)
+		// and then fall back to the RAW spelling whenever parseNumeric
+		// refused it, so `float8 'NAN'` rendered as "NAN" instead of "NaN".
+		bits := 64
+		if x.Type == "float4" || x.Type == "real" {
+			bits = 32
 		}
-		m, s, perr := parseNumeric(v)
-		if perr != nil {
-			return NewStringDatum(v), nil
-		}
-		return newNumeric(m, int(s)), nil
+		return floatInDatumOrErr(x.Value, bits, x.Pos())
 
 	case "numeric", "decimal":
 		// Return as string — goopg v0 stores numerics as text.
@@ -6064,6 +6052,20 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return d, nil
 		}
 	case "float4", "real":
+		// Text → float4: float4in (postgres/src/backend/utils/adt/float.c:180).
+		// M0134-0166: this arm did not exist, so `'x'::float4` fell through to
+		// the `return d, nil` at the bottom and handed back the raw string
+		// unvalidated. See float_in.go.
+		if d.Kind == KindString {
+			s := d.StringValue()
+			// Array literals like '{1,2}'::float4[] pass through — the parser
+			// strips '[]' so the target type looks scalar. Same guard the
+			// int2 arm above carries. M0097-0063.
+			if len(s) > 0 && s[0] == '{' {
+				return d, nil
+			}
+			return floatInDatumOrErr(s, 32, pos)
+		}
 		// Integer → float4: round-trip through float32 to apply float32 precision.
 		// PostgreSQL float4 has ~7 significant decimal digits; full int64 precision
 		// must be lost before display. M0097-0147.
@@ -6100,6 +6102,17 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		}
 		return d, nil
 	case "float", "float8", "double precision":
+		// Text → float8: float8in (postgres/src/backend/utils/adt/float.c:364).
+		// M0134-0166: this arm did not exist, so `'10e400'::float8` and even
+		// `'N A N'::float8` fell through to the `return d, nil` below and
+		// "succeeded", storing the raw text in a float8. See float_in.go.
+		if d.Kind == KindString {
+			s := d.StringValue()
+			if len(s) > 0 && s[0] == '{' { // '{1,2}'::float8[], see the float4 arm
+				return d, nil
+			}
+			return floatInDatumOrErr(s, 64, pos)
+		}
 		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
 		// PostgreSQL float8out uses printf-style format that removes trailing zeros.
 		if d.Kind == KindNumeric {
@@ -6589,6 +6602,25 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return NewStringDatum(rewritten), nil
 		}
 		return d, nil
+	}
+	// A range type (`::int4range`, `::daterange`, or a user
+	// `CREATE TYPE … AS RANGE` type) is NOT an unknown type — goopg carries
+	// range values as their canonical range_out text, so the cast is
+	// rangetypes.c's range_in: parse, run the SUBTYPE's input function over
+	// each bound, reject lower > upper, and canonicalize the discrete types
+	// to `[)`. Until M0134-0173 this fell through to the pass-through below,
+	// which made `'garbage'::int4range` succeed and left `'[1,4]'::int4range`
+	// and `'[1,5)'::int4range` — the same value in PG — comparing unequal.
+	// This is the fourth "missing evalCast arm = unvalidated text" instance
+	// (xid, circle, float8 were the first three).
+	if s, ok := datumAsString(d); ok {
+		if _, isRange := lookupRangeTypeForIO(targetType, ctx); isRange {
+			out, err := rangeIn(targetType, s, pos, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewStringDatum(out), nil
+		}
 	}
 	return d, nil // pass-through for unknown types
 }
@@ -11416,6 +11448,21 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 	}
 	switch name {
+	case "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange":
+		// range_constructor2 / range_constructor3 (rangetypes.c). goopg's
+		// pg_proc seed has carried these twelve rows since the range-type
+		// catalog work, so the catalog ADVERTISED a function the executor
+		// never implemented — `SELECT int4range(1,4)` was 42883. Both are
+		// proisstrict='f': a NULL bound is an INFINITE bound. M0134-0173.
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalRangeConstructor(name, args, x.Pos(), ctx)
 	case "bt_index_check":
 		// amcheck B-tree structural verification (slice S4 of 0110-0008).
 		return evalBtIndexCheck(x, slot, ctx, false)

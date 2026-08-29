@@ -587,7 +587,21 @@ const maxRawItemSize = 7800
 // `_bt_load` closes a posting run with `_bt_keep_natts_fast` (nbtutils.c),
 // never with `_bt_compare`.
 func deduplicateToRawItems(f indexFormat, items []item) []rawItem {
+	raws, _ := deduplicateToRawItemsWithSpans(f, items)
+	return raws
+}
+
+// deduplicateToRawItemsWithSpans is deduplicateToRawItems plus, for each
+// emitted rawItem, the number of INPUT items it stands for (1 for a plain
+// item, the TID count for a posting). The spans exist so a caller that has to
+// account for every expanded entry — the split path's insert trace, which
+// logs one event per (key, TID) pair against the line pointer that ended up
+// carrying it — can do so without re-deriving the chunking rule a second time.
+//
+// The spans always sum to len(items).
+func deduplicateToRawItemsWithSpans(f indexFormat, items []item) ([]rawItem, []int) {
 	out := make([]rawItem, 0, len(items))
+	spans := make([]int, 0, len(items))
 	i := 0
 	for i < len(items) {
 		j := i + 1
@@ -595,53 +609,29 @@ func deduplicateToRawItems(f indexFormat, items []item) []rawItem {
 			j++
 		}
 		key := items[i].key
-		if j-i == 1 {
-			out = append(out, rawItem{raw: f.marshal(items[i]), key: key})
-		} else {
-			tids := make([]storage.ItemPointer, j-i)
-			for k := i; k < j; k++ {
-				tids[k-i] = items[k].ptr
+		off := i
+		// postingChunkLens IS the chunking rule (posting.go); the split
+		// path budgets a page from the very same function, so the bytes
+		// this loop writes and the bytes that path reserved cannot drift
+		// (M0134-0177).
+		for _, c := range f.postingChunkLens(key, j-i) {
+			if c == 1 {
+				out = append(out, rawItem{raw: f.marshal(items[off]), key: key})
+				spans = append(spans, 1)
+				off++
+				continue
 			}
-			// Compute the maximum number of TIDs that fit in one posting
-			// item: the bytes left after the key material at 6 bytes each
-			// (the TID array starts at the posting offset). The offset is
-			// format-dependent — 8+len(key) for a blob payload, but
-			// MAXALIGN(len(key)) for a tuple, which already includes its
-			// own header — so it is asked rather than recomputed here.
-			maxTIDsPerChunk := (maxRawItemSize - f.postingOffsetFor(key)) / 6
-			if maxTIDsPerChunk < 1 {
-				// Pathological: key alone exceeds the page limit. Fall
-				// back to single-item-per-TID encoding so each entry
-				// still fits (it.marshal() uses 8+keyLen bytes; if even
-				// that overflows, the underlying PageAddItemRaw will
-				// reject and the caller sees a clean error).
-				for k := i; k < j; k++ {
-					out = append(out, rawItem{raw: f.marshal(items[k]), key: key})
-				}
-			} else if len(tids) <= maxTIDsPerChunk {
-				out = append(out, rawItem{raw: f.marshalPosting(key, tids), key: key})
-			} else {
-				for off := 0; off < len(tids); off += maxTIDsPerChunk {
-					end := off + maxTIDsPerChunk
-					if end > len(tids) {
-						end = len(tids)
-					}
-					chunk := tids[off:end]
-					if len(chunk) == 1 {
-						// A posting list is defined to hold >= 2 TIDs
-						// (nbtree.h's BTreeTupleSetPosting asserts it), so a
-						// trailing one-TID remainder goes back to a plain
-						// item rather than a degenerate posting tuple.
-						out = append(out, rawItem{raw: f.marshal(item{ptr: chunk[0], key: key}), key: key})
-						continue
-					}
-					out = append(out, rawItem{raw: f.marshalPosting(key, chunk), key: key})
-				}
+			tids := make([]storage.ItemPointer, c)
+			for k := 0; k < c; k++ {
+				tids[k] = items[off+k].ptr
 			}
+			out = append(out, rawItem{raw: f.marshalPosting(key, tids), key: key})
+			spans = append(spans, c)
+			off += c
 		}
 		i = j
 	}
-	return out
+	return out, spans
 }
 
 // buildLevelRaw is like buildLevel but accepts pre-serialised rawItems.

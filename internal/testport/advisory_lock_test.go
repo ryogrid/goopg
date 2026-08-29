@@ -307,7 +307,18 @@ func TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary(t *testing.T) {
 
 	// Take the session-scoped lock in auto-commit, then enter an explicit
 	// transaction and unlock it from inside the transaction.
-	_ = scanBool(ctx, t, conn, "SELECT pg_advisory_lock(0)")
+	//
+	// pg_advisory_lock() returns void, not boolean — PG 18.3 sends the column
+	// as a NON-NULL zero-length value (verified on the oracle:
+	// `SELECT pg_advisory_lock(0) IS NULL` is false, pg_typeof is void), so it
+	// must be executed, never scanned into a bool. This used to call
+	// scanBool() and passed only because goopg serialized an empty non-null
+	// string as NULL on the wire; once that wire bug was fixed (fd24fa33c,
+	// M0134-0070) the empty value reached lib/pq and ParseBool("") failed.
+	// The sibling call sites in this file already use ExecContext/NullString.
+	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock(0)"); err != nil {
+		t.Fatalf("pg_advisory_lock(0): %v", err)
+	}
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		t.Fatalf("BEGIN: %v", err)
 	}

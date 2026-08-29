@@ -1062,6 +1062,24 @@ type seqScanOp struct {
 	curBlock storage.BlockNumber
 	curSlot  uint16
 
+	// sampleSpec / sampler implement TABLESAMPLE (M0134-0175). sampleSpec is
+	// the plan-time descriptor; sampler is built once in Open, after the
+	// arguments are evaluated, and is nil for an ordinary scan. Upstream
+	// carries the equivalent pair on SampleScanState (nodeSamplescan.c);
+	// goopg keeps them on the seq scan so TABLESAMPLE composes with
+	// everything the scan already does (visibility, SSI, ring buffers)
+	// instead of duplicating a scan node.
+	//
+	// The sampler is consulted at two points and only two: block acceptance
+	// in the block-advance path, and offset acceptance in the tuple loop.
+	// Both are BEFORE visibility checking, matching upstream — bernoulli
+	// hashes the line-pointer offset whether or not that line pointer holds
+	// a live tuple, so a dead tuple consumes its slot in the sample rather
+	// than shifting later tuples into it. The sampler is STATELESS (the
+	// block cursor is passed in), so rewind() needs no reset for a rescan.
+	sampleSpec *optimizer.TableSampleSpec
+	sampler    tableSampler
+
 	// pscan, when non-nil, makes this a PARALLEL scan: curBlock is then
 	// claimed from a shared atomic allocator instead of being incremented
 	// locally, so N workers' blocks partition the relation. Everything else
@@ -1296,6 +1314,7 @@ func newSeqScanOp(p *optimizer.SeqScan) *seqScanOp {
 		inheritParentOID:      p.InheritParentOID,
 		privilegeCheckRole:    p.PrivilegeCheckRole,
 		privilegeCheckRoleSet: p.PrivilegeCheckRoleSet,
+		sampleSpec:            p.TableSample,
 	}
 }
 
@@ -1604,6 +1623,18 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.curSlot = 0
 	o.slotMax = 0
 	o.prefetchedThru = 0
+	// TABLESAMPLE (M0134-0175). Built here rather than in newSeqScanOp because
+	// the arguments are expressions that need a live Context to evaluate, and
+	// upstream likewise defers them to BeginSampleScan (nodeSamplescan.c:225)
+	// rather than plan time. Without REPEATABLE upstream draws one random seed
+	// per scan and reuses it across rescans; randSeedForSample does the same.
+	if o.sampleSpec != nil {
+		sampler, err := buildSamplerFromSpec(o.sampleSpec, ctx, randSeedForSample())
+		if err != nil {
+			return err
+		}
+		o.sampler = sampler
+	}
 	// M0073-0004 / M0107-0001: per-operator mctx for varchar / char /
 	// text / bytea payload. Reset on block-advance; Release on Close.
 	o.sctx = mmgr.Acquire(ctx.Mctx, mmgr.KindExpr)
@@ -1767,6 +1798,15 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				o.curBlock = b
 			} else if o.curBlock >= o.nBlocks {
 				return nil, EOF
+			} else if o.sampler != nil {
+				// SYSTEM skips whole blocks here (system_nextsampleblock);
+				// BERNOULLI's block callback is a pass-through, exactly as
+				// upstream leaves NextSampleBlock NULL for it.
+				blk, ok := o.sampler.nextSampleBlock(uint32(o.curBlock), uint32(o.nBlocks))
+				if !ok {
+					return nil, EOF
+				}
+				o.curBlock = storage.BlockNumber(blk)
 			}
 			// Poll for query cancellation at each new block boundary.
 			if o.ctx.Ctx != nil {
@@ -1826,6 +1866,13 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			o.curSlot = 1
 		}
 		for int(o.curSlot) <= o.slotMax {
+			// TABLESAMPLE offset filter (bernoulli_nextsampletuple). Placed
+			// before the page RLock so a rejected offset costs a hash and
+			// nothing else.
+			if o.sampler != nil && !o.sampler.sampleTuple(uint32(o.curBlock), o.curSlot) {
+				o.curSlot++
+				continue
+			}
 			page := o.activePage
 			// Brief RLock around tuple decode + arena copy. After
 			// release, parent operators (filterOp / lockRowsOp /
@@ -9068,7 +9115,21 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// Emits the native RecordKindHeapInsert WAL record so the logical
 	// decoder sees the change.
 	logHeap := ctx.Pool.LogHeapInsert()
-	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
+	// targetFreeSpace is how much free space an EXISTING page must still have
+	// for this tuple to be allowed onto it — the maxaligned tuple length plus
+	// the relation's fillfactor reserve (M0134-0175a). It mirrors the
+	// identically-named local in PG's RelationGetBufferForTuple
+	// (postgres/src/backend/access/heap/hio.c:539-556). For the default
+	// fillfactor=100 the reserve is zero and this is exactly the old
+	// "does the tuple physically fit" test, so unset tables keep their
+	// byte-for-byte previous page layout.
+	targetFreeSpace := storage.HeapInsertTargetFreeSpace(len(tupleBytes), ctx.heapFillfactor(rel))
+	// tryAppendToBlock appends the tuple to blk. reserve is the free space the
+	// page must have BEFORE the append; pass 0 for a freshly extended page,
+	// which upstream also exempts from the fillfactor test (hio.c:859 checks
+	// only that the tuple physically fits) — otherwise a low-fillfactor table
+	// could reject its own brand-new page and extend forever.
+	tryAppendToBlock := func(blk storage.BlockNumber, reserve int) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
 			return false, err
@@ -9087,6 +9148,21 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 				ctx.Pool.Unpin(slot)
 				return false, err
 			}
+		}
+		// Fillfactor gate (hio.c:702 `if (targetFreeSpace <= pageFreeSpace)`).
+		// The page is not physically full, so — unlike the ErrNoSpaceInPage
+		// branch below — record its ACTUAL remaining free space rather than 0:
+		// a smaller tuple may still legitimately land here later, and the FSM
+		// search is already asking for targetFreeSpace, so an accurate entry
+		// cannot hand this page back for this tuple. Mirrors upstream's
+		// RecordAndGetPageWithFreeSpace(rel, blk, pageFreeSpace, targetFreeSpace).
+		if reserve > 0 && storage.PageGetHeapFreeSpace(slot.Page()) < reserve {
+			if ctx.FSM != nil {
+				ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
+			}
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
+			return false, nil
 		}
 		if lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
 			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
@@ -9125,9 +9201,11 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// (0, false) when every candidate is at or above hotPinThreshold,
 	// signalling the caller to fall through to extension instead of
 	// converging on a hot tail page.
-	minFreeBytes := uint16(len(tupleBytes) + 4) // 4 = itemIDSize (line pointer size)
+	// The FSM stores pd_upper-pd_lower, one line pointer more than
+	// PageGetHeapFreeSpace reports, so the search threshold adds it back.
+	minFreeBytes := uint16(targetFreeSpace + 4) // 4 = itemIDSize (line pointer size)
 	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
-		appended, err := tryAppendToBlock(fsmBlk)
+		appended, err := tryAppendToBlock(fsmBlk, targetFreeSpace)
 		if err != nil {
 			return ptr, err
 		}
@@ -9144,7 +9222,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, err
 	}
 	if nBlocks > 0 {
-		appended, err := tryAppendToBlock(nBlocks - 1)
+		appended, err := tryAppendToBlock(nBlocks-1, targetFreeSpace)
 		if err != nil {
 			return ptr, err
 		}
@@ -9169,7 +9247,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// extras here is the cross-stripe distribution mechanism: without
 	// it we would extend again and converge on a new tail page.
 	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
-		appended, err := tryAppendToBlock(fsmBlk)
+		appended, err := tryAppendToBlock(fsmBlk, targetFreeSpace)
 		if err != nil {
 			return ptr, err
 		}
@@ -9185,7 +9263,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, err
 	}
 	if nBlocks > 0 {
-		appended, err := tryAppendToBlock(nBlocks - 1)
+		appended, err := tryAppendToBlock(nBlocks-1, targetFreeSpace)
 		if err != nil {
 			return ptr, err
 		}
@@ -9205,7 +9283,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		if err != nil {
 			return ptr, err
 		}
-		appended, err := tryAppendToBlock(firstBlk)
+		appended, err := tryAppendToBlock(firstBlk, 0)
 		if err != nil {
 			return ptr, err
 		}
@@ -9270,6 +9348,15 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 	}
 
 	logHeap := ctx.Pool.LogHeapInsert()
+	// Deliberate divergence from writeHeapRowReturning's twin above, recorded
+	// so the two are not mistaken for having drifted apart: that path applies
+	// the relation's `fillfactor` reserve when choosing a page (M0134-0175a,
+	// mirroring hio.c's targetFreeSpace). This path writes system-catalog
+	// relations only (its single caller is writeHeapRowCanonical), and a
+	// catalog relation carries no reloptions, so its fillfactor is always the
+	// default 100 and the reserve always zero. Adding the gate here would be
+	// unreachable code. If this function ever gains a user-table caller, port
+	// the targetFreeSpace computation and the reserve argument across.
 	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {

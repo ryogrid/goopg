@@ -2,6 +2,7 @@ package libpq
 
 import (
 	"encoding/binary"
+	"strings"
 )
 
 // WriteStartupMessage emits the v3 protocol startup packet. Unlike
@@ -273,8 +274,149 @@ func (fw *FrameWriter) WriteErrorResponse(fields []ErrorField) error {
 	return fw.writeFieldedMessage(MsgErrorResponse, fields)
 }
 
-// WriteNoticeResponse emits 'N' with the same body shape as ErrorResponse.
+// Message elevels, mirroring postgres/src/include/utils/elog.h. The numeric
+// values are upstream's so the `>=` comparison in ShouldOutputToClient is
+// literally the one PG makes; only the levels goopg can either put on the wire
+// or accept as a client_min_messages value are enumerated.
+const (
+	elevelDebug5  = 10
+	elevelDebug4  = 11
+	elevelDebug3  = 12
+	elevelDebug2  = 13
+	elevelDebug1  = 14
+	elevelLog     = 15
+	elevelInfo    = 17
+	elevelNotice  = 18
+	elevelWarning = 19
+	elevelError   = 21
+	elevelFatal   = 22
+	elevelPanic   = 23
+)
+
+// severityElevel maps the non-localized severity string goopg puts in the 'V'
+// field of a NoticeResponse/ErrorResponse back to its elog.h elevel. The
+// second result is false for a severity this table does not know, in which
+// case callers must not suppress the message.
+func severityElevel(sev string) (int, bool) {
+	switch sev {
+	case "DEBUG", "DEBUG1":
+		return elevelDebug1, true
+	case "DEBUG2":
+		return elevelDebug2, true
+	case "DEBUG3":
+		return elevelDebug3, true
+	case "DEBUG4":
+		return elevelDebug4, true
+	case "DEBUG5":
+		return elevelDebug5, true
+	case "LOG":
+		return elevelLog, true
+	case "INFO":
+		return elevelInfo, true
+	case "NOTICE":
+		return elevelNotice, true
+	case "WARNING":
+		return elevelWarning, true
+	case "ERROR":
+		return elevelError, true
+	case "FATAL":
+		return elevelFatal, true
+	case "PANIC":
+		return elevelPanic, true
+	}
+	return 0, false
+}
+
+// clientMinMessagesElevel maps a client_min_messages GUC value to its elevel,
+// mirroring client_message_level_options in
+// postgres/src/backend/utils/misc/guc_tables.c. "debug" and "info" are
+// upstream's hidden aliases: accepted as input, not advertised in
+// pg_settings.enumvals.
+func clientMinMessagesElevel(val string) (int, bool) {
+	switch strings.ToLower(val) {
+	case "debug5":
+		return elevelDebug5, true
+	case "debug4":
+		return elevelDebug4, true
+	case "debug3":
+		return elevelDebug3, true
+	case "debug2", "debug":
+		return elevelDebug2, true
+	case "debug1":
+		return elevelDebug1, true
+	case "log":
+		return elevelLog, true
+	case "info":
+		return elevelInfo, true
+	case "notice":
+		return elevelNotice, true
+	case "warning":
+		return elevelWarning, true
+	case "error":
+		return elevelError, true
+	}
+	return 0, false
+}
+
+// ShouldOutputToClient reports whether a message of the given non-localized
+// severity is visible to a client whose client_min_messages GUC holds
+// clientMin, mirroring should_output_to_client in
+// postgres/src/backend/utils/error/elog.c:
+//
+//	return (elevel >= client_min_messages || elevel == INFO);
+//
+// INFO is deliberately unconditional upstream ("always sent to client
+// regardless of client_min_messages", elog.h). An unrecognized severity or
+// GUC value falls open — goopg never silently drops a message it cannot
+// classify.
+func ShouldOutputToClient(severity, clientMin string) bool {
+	elevel, ok := severityElevel(severity)
+	if !ok {
+		return true
+	}
+	if elevel == elevelInfo {
+		return true
+	}
+	min, ok := clientMinMessagesElevel(clientMin)
+	if !ok {
+		return true
+	}
+	return elevel >= min
+}
+
+// noticeSeverity extracts the severity a NoticeResponse field set carries.
+// The non-localized 'V' field is authoritative (it is the one whose spelling
+// is fixed by the protocol); 'S' is the fallback for field sets that predate
+// it.
+func noticeSeverity(fields []ErrorField) string {
+	sev := ""
+	for _, f := range fields {
+		if f.Code == FieldSeverityNonLocal {
+			return f.Value
+		}
+		if f.Code == FieldSeverity && sev == "" {
+			sev = f.Value
+		}
+	}
+	return sev
+}
+
+// WriteNoticeResponse emits 'N' with the same body shape as ErrorResponse,
+// unless the connection's client_min_messages GUC suppresses this severity.
+//
+// The filter lives here, at the single wire choke point, for the same reason
+// PostgreSQL puts should_output_to_client inside elog.c rather than at each
+// ereport call site: every one of goopg's NOTICE/WARNING producers reaches the
+// client through this function, so no producer can forget to consult the GUC.
+// WriteErrorResponse needs no such gate — ERROR/FATAL/PANIC are elevel >= 21
+// and client_min_messages caps out at "error" (21), so upstream's comparison
+// admits them unconditionally.
 func (fw *FrameWriter) WriteNoticeResponse(fields []ErrorField) error {
+	if fw.ClientMinMessagesFn != nil {
+		if !ShouldOutputToClient(noticeSeverity(fields), fw.ClientMinMessagesFn()) {
+			return nil
+		}
+	}
 	return fw.writeFieldedMessage(MsgNoticeResponse, fields)
 }
 

@@ -673,7 +673,32 @@ type RangeVar struct {
 	Lateral   bool          // the LATERAL keyword was written before this item; it may
 	// reference earlier FROM items, which is what makes a FROM
 	// permutation unsafe (planner/joinorder.go, M0125-0034)
+
+	// TableSample carries a TABLESAMPLE clause written on this FROM item
+	// (M0134-0175). Upstream models this as a separate RangeTableSample node
+	// that WRAPS the relation (gram.y:13616 `relation_expr opt_alias_clause
+	// tablesample_clause`); goopg's FROM item is a flat RangeVar value, so
+	// the sample descriptor hangs off the RangeVar instead. Nil when the
+	// item carries no TABLESAMPLE clause.
+	TableSample *RangeTableSample
 }
+
+// RangeTableSample is a TABLESAMPLE clause — gram.y:14001's RangeTableSample.
+// Method is the downcased sampling-method name as written ("system",
+// "bernoulli", or anything else the user typed — validation that the method
+// EXISTS is the executor's job, exactly as upstream defers it to
+// `parse_tablesample_method` so the error carries the right SQLSTATE).
+// Args holds the method's argument list (one float4 percentage for both
+// built-in methods) and Repeatable the optional REPEATABLE seed expression,
+// nil when the clause was omitted.
+type RangeTableSample struct {
+	pos        int // the METHOD NAME's offset — gram.y stamps `@2`, not the TABLESAMPLE keyword
+	Method     string
+	Args       []Expr
+	Repeatable Expr
+}
+
+func (r RangeTableSample) Pos() int { return r.pos }
 
 // TableFuncRef is a table-valued function used in the FROM clause.
 // Handles generate_series, unnest, user-defined SETOF functions, and ROWS FROM.
@@ -1726,6 +1751,15 @@ type CreateIndexStmt struct {
 	// (empty = database default). Mirrors CreateTableStmt.Tablespace.
 	// M0122-0007.
 	Tablespace string
+	// WithOptionNames holds every `WITH (...)` storage-parameter NAME exactly as
+	// written (including any `ns.` prefix), in source order — the names the
+	// typed fields above deliberately discard as well as the ones they keep.
+	// The typed fields alone cannot answer "was this name recognized?", so
+	// execCreateIndex validates against this list to reproduce PG's
+	// `unrecognized parameter "x"` / `unrecognized parameter namespace "x"`
+	// (index_reloptions -> parseRelOptions, reloptions.c:1488 / :1275).
+	// M0134-0160.
+	WithOptionNames []string
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key
@@ -1884,11 +1918,49 @@ type CreateTablespaceStmt struct {
 	Name     string
 	Owner    string // optional OWNER role; "" → current user
 	Location string // LOCATION string literal; "" → in-place tablespace
-	Options  []string
+	Options  []TablespaceOption
 }
 
 func (s *CreateTablespaceStmt) Pos() int  { return s.pos }
 func (s *CreateTablespaceStmt) stmtNode() {}
+
+// TablespaceOption is one `name [= value]` element of a tablespace storage-
+// parameter list, as it appears in `CREATE TABLESPACE ... WITH (...)` and
+// `ALTER TABLESPACE ... SET/RESET (...)`. Upstream carries these as a DefElem
+// list (gram.y's reloptions), and the LIST — not a map — is what makes two of
+// PG's checks expressible: RESET rejects an element that HAS a value
+// ("RESET must not include values for parameters", reloptions.c:1242, which is
+// exactly HasValue below), and an offending name is reported in source order.
+// M0134-0176. Contrast CreateTableStmt.With, still a map (M0134-0160a).
+type TablespaceOption struct {
+	Name     string
+	Value    string
+	HasValue bool
+}
+
+// AlterTablespaceStmt — `ALTER TABLESPACE name {SET|RESET} (...)`,
+// `... RENAME TO new` and `... OWNER TO role`. Mirrors gram.y's
+// AlterTableSpaceOptionsStmt (:9358) plus the tablespace arms of RenameStmt and
+// AlterOwnerStmt, which upstream keeps as three separate node types; goopg
+// folds them into one node discriminated by Action because all three land in
+// the same tiny executor path. M0134-0176.
+type AlterTablespaceStmt struct {
+	pos int
+	// Name is the tablespace being altered.
+	Name string
+	// Action is one of "set", "reset", "rename", "owner".
+	Action string
+	// Options carries the SET/RESET parameter list in source order.
+	Options []TablespaceOption
+	// NewName is the target of RENAME TO.
+	NewName string
+	// NewOwner is the target of OWNER TO; the literal "current_user" /
+	// "session_user" spellings reach here verbatim, as for ALTER TABLE.
+	NewOwner string
+}
+
+func (s *AlterTablespaceStmt) Pos() int  { return s.pos }
+func (s *AlterTablespaceStmt) stmtNode() {}
 
 // DropTablespaceStmt — `DROP TABLESPACE [IF EXISTS] name`. Removes the runtime
 // tablespace registry entry and its in-place pg_tblspc/<oid> directory.

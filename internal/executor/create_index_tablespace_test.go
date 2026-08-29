@@ -138,11 +138,32 @@ func TestAlterIndexSetTablespaceUpdatesIndex(t *testing.T) {
 		t.Errorf("idx1.Tablespace = %d, want %d", idx.Tablespace, wantOID)
 	}
 
-	if err := runDDL(t, ctx, "ALTER INDEX idx1 SET (fastupdate = off)"); err != nil {
+	// The non-TABLESPACE ALTER INDEX SET arm must still work. It is asserted on
+	// a GIN index, not on idx1: `fastupdate` is RELOPT_KIND_GIN, and since
+	// M0134-0160 goopg validates ALTER INDEX SET against the access method's
+	// admissible set the way ATExecSetRelOptions -> index_reloptions() does, so
+	// `ALTER INDEX <btree> SET (fastupdate = off)` now raises the same
+	// `unrecognized parameter "fastupdate"` real PG 18.3 raises (verified
+	// against the oracle).
+	if err := runDDL(t, ctx, "CREATE INDEX gidx1 ON t1 USING gin (a)"); err != nil {
+		t.Fatalf("CREATE INDEX gidx1: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER INDEX gidx1 SET (fastupdate = off)"); err != nil {
 		t.Fatalf("ALTER INDEX ... SET (fastupdate=off) regressed: %v", err)
 	}
-	if idx.FastUpdate == nil || *idx.FastUpdate {
-		t.Errorf("idx1.FastUpdate = %v, want *false", idx.FastUpdate)
+	gidx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Schema: "public", Name: "gidx1"})
+	if !ok {
+		t.Fatalf("gidx1 not found")
+	}
+	if gidx.FastUpdate == nil || *gidx.FastUpdate {
+		t.Errorf("gidx1.FastUpdate = %v, want *false", gidx.FastUpdate)
+	}
+	// ... and the btree index rejects it, matching PG.
+	if err := runDDL(t, ctx, "ALTER INDEX idx1 SET (fastupdate = off)"); err == nil {
+		t.Error("ALTER INDEX <btree> SET (fastupdate=off): expected 22023, got nil")
+	} else if ee, isExec := err.(*ExecError); !isExec || ee.Code != "22023" ||
+		ee.Message != `unrecognized parameter "fastupdate"` {
+		t.Errorf("ALTER INDEX <btree> SET (fastupdate=off): error = %v, want 22023 unrecognized parameter", err)
 	}
 }
 

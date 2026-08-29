@@ -1105,6 +1105,42 @@ func tableNeedsToastRelation(t *Table) bool {
 // virtual builder emits a relkind='t' TOAST row (and relkind='i' TOAST-index
 // row, slice 3) for exactly this set; toastBearingTables enumerates the same
 // set for the pg_index builder so the two catalogs never diverge.
+// RelkindHasStorage reports whether a relation of this pg_class.relkind owns a
+// physical relfilenode, mirroring upstream's RELKIND_HAS_STORAGE macro
+// (postgres/src/include/catalog/pg_class.h:200). heap_create
+// (postgres/src/backend/catalog/heap.c:335-345) only assigns a relfilenumber
+// when the macro holds, so every storage-less kind — plain view, composite
+// type, foreign table, partitioned table, partitioned index — carries
+// relfilenode = 0 in a real cluster.
+//
+// This is the single source of truth for the relfilenode column across all
+// four pg_class row builders (the two virtual ones here, and
+// executor.buildUserPGClassRow / buildUserPGClassRowForIndex): the virtual and
+// heap-persisted renderings of the same relation must never disagree, and
+// before M0134-0164 they did — the heap builder zeroed 'p'/'v' with an ad-hoc
+// check while the virtual builder handed out the relation OID for every kind,
+// so `SELECT relname FROM pg_class WHERE relkind IN ('v','c','f','p','I') AND
+// relfilenode <> 0` (regress sanity_check.sql) listed every view in the
+// database. M0134-0164.
+func RelkindHasStorage(relkind string) bool {
+	switch relkind {
+	case "r", "i", "S", "t", "m":
+		return true
+	default:
+		return false
+	}
+}
+
+// RelfilenodeForRelkind renders the pg_class.relfilenode cell for a relation of
+// the given kind: its own OID when the kind has storage, "0" otherwise. See
+// RelkindHasStorage. M0134-0164.
+func RelfilenodeForRelkind(relkind string, oid uint32) string {
+	if !RelkindHasStorage(relkind) {
+		return "0"
+	}
+	return strconv.Itoa(int(oid))
+}
+
 // ReplIdentOrDefault resolves a table's effective pg_class.relreplident code,
 // mapping an unset (empty) ReplicaIdentity to PG's implicit default 'd'
 // (REPLICA_IDENTITY_DEFAULT). DU-002 slice 305.
@@ -1888,6 +1924,10 @@ type Index struct {
 	// when the constraint was declared `DEFERRABLE` / `DEFERRABLE INITIALLY
 	// DEFERRED`. pg_get_constraintdef re-emits the clause so pg_dump round-trips
 	// it. Only meaningful when IsConstraint is true. DU-002 slice 139.
+	//
+	// Do NOT read either field directly to decide "is this index immediate?" —
+	// use IsImmediate. pg_index.indimmediate is keyed on Deferrable ALONE, not
+	// on InitiallyDeferred; see IsImmediate's doc comment. M0134-0161.
 	Deferrable        bool
 	InitiallyDeferred bool
 	// PartitionParentOID is the OID of the parent index for partition index
@@ -2022,6 +2062,28 @@ func (i *Index) QualifiedName() string {
 	return i.Schema + "." + i.Name
 }
 
+// IsImmediate is pg_index.indimmediate: "the uniqueness check is enforced
+// immediately on insertion". It is the single predicate every indimmediate
+// consumer must use.
+//
+// The mapping is DEFERRABLE alone, NOT INITIALLY DEFERRED. index_create sets
+// the column from `(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0`
+// (postgres/src/backend/catalog/index.c:1049) and index_set_state_flags
+// re-clears it with `if (deferrable && indexForm->indimmediate)`
+// (index.c:2080-2082) — INITIALLY {IMMEDIATE|DEFERRED} never enters either
+// expression. A merely-`DEFERRABLE` constraint is therefore NON-immediate,
+// because its uniqueness can be deferred by a later SET CONSTRAINTS even
+// though it is not deferred by default.
+//
+// M0134-0161: four independent sites had drifted apart on this — two pg_index
+// row builders hardcoded `true`, while the REPLICA IDENTITY and ON CONFLICT
+// arbiter checks keyed on InitiallyDeferred and so silently ACCEPTED indexes
+// PG rejects. Oracle-verified on PG 18.3: a `UNIQUE (b) DEFERRABLE` constraint
+// reports indimmediate='f', is rejected by `REPLICA IDENTITY USING INDEX`
+// ("cannot use non-immediate index"), and is rejected as an ON CONFLICT
+// arbiter in both the ON CONSTRAINT and the inferred-by-column form.
+func (i *Index) IsImmediate() bool { return !i.Deferrable }
+
 // Catalog is the lookup interface the planner uses.
 type Catalog interface {
 	LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool)
@@ -2076,6 +2138,18 @@ type Catalog interface {
 	// CREATE TABLE ... TABLESPACE to validate and resolve the clause.
 	// M0122-0007.
 	LookupTablespaceOID(name string) (uint32, bool)
+	// TablespaceOptions returns a tablespace's pg_tablespace.spcoptions
+	// (`name=value` elements in source order) and whether it exists.
+	// M0134-0176.
+	TablespaceOptions(name string) ([]string, bool)
+	// SetTablespaceOptions replaces spcoptions wholesale; nil means SQL NULL.
+	// Reports whether the tablespace was present. M0134-0176.
+	SetTablespaceOptions(name string, opts []string) bool
+	// RenameTablespace re-keys a tablespace under newName, keeping its OID.
+	// False means the old name is unknown or newName is taken. M0134-0176.
+	RenameTablespace(oldName, newName string) bool
+	// SetTablespaceOwner records a new owner role name. M0134-0176.
+	SetTablespaceOwner(name, owner string) bool
 	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 	// objType is "conversion", "operator", "rule", "text search configuration", etc.
 	RegisterCompatObject(objType, name string)
@@ -3021,6 +3095,13 @@ type tablespaceRow struct {
 	name     string
 	owner    string
 	location string
+	// options is pg_tablespace.spcoptions: the storage parameters recorded by
+	// CREATE TABLESPACE ... WITH (...) and edited by ALTER TABLESPACE ...
+	// SET/RESET (...), held as PG's own `name=value` array elements in source
+	// order. nil renders as SQL NULL, which is what a tablespace with no
+	// parameters has (spcoptions is BKI_DEFAULT(_null_), not an empty array).
+	// M0134-0176.
+	options []string
 }
 
 // commentKey is the composite key for pg_description.
@@ -5754,9 +5835,18 @@ type RoleMembership struct {
 // user.c) — an existing row's value for that option is left untouched
 // (mirroring "a plain re-grant never downgrades an unmentioned option"), and
 // a fresh row falls back to InitGrantRoleOptions' defaults: admin=false,
-// set=true, inherit=the grantee's rolinherit (goopg has no per-role NOINHERIT
-// tracking — CREATE/ALTER ROLE never clears it — so every role's rolinherit
-// is always true, matching this default exactly). A non-nil pointer is the
+// set=true, inherit=the GRANTEE's (memberOid's) rolinherit, read live from the
+// RoleAttrs sidecar via roleInheritsByOIDLocked — mirroring AddRoleMems'
+// "otherwise, set the default value based on the role-level property" branch,
+// which does exactly this SearchSysCache1(AUTHOID, memberid) → mrform->
+// rolinherit lookup (postgres/src/backend/commands/user.c:1928-1938). Until
+// M0134-0162 this was hardcoded true, which was correct only because goopg had
+// no per-role NOINHERIT tracking at all; now that [NO]INHERIT is modelled, a
+// NOINHERIT member granted a role with a plain `GRANT r TO m` must NOT inherit
+// its privileges — HasPrivsOfRole/SelectBestAdmin below both traverse only
+// InheritOption-marked rows, so leaving the old default would have silently
+// handed a NOINHERIT role every privilege of every role it was granted. A
+// non-nil pointer is the
 // explicit requested value and always applies, including to an existing row
 // (may legitimately downgrade e.g. admin_option, unlike an unspecified
 // option on a bare re-grant). Returns the row's OID. M0119-0004-ACLHEAP.
@@ -5781,10 +5871,38 @@ func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, ad
 		OID: oid, RoleOID: roleOid, MemberOID: memberOid,
 		GrantorOID:    grantorOid,
 		AdminOption:   admin != nil && *admin,
-		InheritOption: inherit == nil || *inherit,
+		InheritOption: inheritOptionDefault(inherit, c.roleInheritsByOIDLocked(memberOid)),
 		SetOption:     set == nil || *set,
 	}
 	return oid
+}
+
+// inheritOptionDefault resolves a fresh membership row's inherit_option:
+// the explicitly requested value when the statement named one, else the
+// grantee's role-level rolinherit (user.c:1924-1939).
+func inheritOptionDefault(requested *bool, granteeRolInherit bool) bool {
+	if requested != nil {
+		return *requested
+	}
+	return granteeRolInherit
+}
+
+// roleInheritsByOIDLocked reports a role's pg_authid.rolinherit by OID.
+// Callers must already hold c.mu (GrantRoleMembership writes under Lock).
+// Mirrors IsSuperuser's OID→name→RoleAttrs walk. An OID with no sidecar entry
+// — the bootstrap superuser, the predefined pg_* roles, or a name registered
+// before attributes were recorded — reports PG's default true, matching every
+// rolinherit => 't' row in pg_authid.dat. M0134-0162.
+func (c *InMemory) roleInheritsByOIDLocked(oid uint32) bool {
+	for name, roid := range c.roles {
+		if roid == oid {
+			if a := c.roleAttrs[name]; a != nil {
+				return a.Inherit
+			}
+			return true
+		}
+	}
+	return true
 }
 
 // RevokeRoleMembership removes or downgrades the ONE `REVOKE <role> FROM
@@ -7200,7 +7318,7 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 			boolStr(idx.NullsNotDistinct),    // indnullsnotdistinct
 			boolStr(idx.Primary),             // indisprimary
 			boolStr(idx.IsExclusion),         // indisexclusion
-			"t",                              // indimmediate
+			boolStr(idx.IsImmediate()),       // indimmediate (M0134-0161)
 			boolStr(idx.IsClustered),         // indisclustered (DU-002 slice 320)
 			"t",                              // indisvalid
 			"f",                              // indcheckxmin
@@ -7421,6 +7539,11 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// name OF type`), "0" otherwise. Hoisted to a local so the row literal
 		// keeps its single-token column width (and comment alignment). DU-002 slice 374.
 		relOfType := strconv.Itoa(int(t.OfTypeOID))
+		// relfilenode: the relation OID for kinds with storage, "0" for the
+		// storage-less ones (view / foreign table / partitioned table).
+		// Hoisted to a local for the same reason as relOfType above — keeping
+		// the row literal's single-token column width. M0134-0164.
+		relFilenode := RelfilenodeForRelkind(relkind, t.OID)
 		relacl := c.relaclTextLocked(t.OID)
 		if t.IsSequence {
 			relacl = c.relaclTextLockedSeq(t.OID)
@@ -7433,7 +7556,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 			"10",                            // 5:  relowner (bootstrap superuser)
 			relam,                           // 6:  relam (heap=2; 0 for sequences)
-			strconv.Itoa(int(t.OID)),        // 7:  relfilenode
+			relFilenode,                     // 7:  relfilenode (0 for storage-less kinds — view/foreign/partitioned, M0134-0164)
 			strconv.Itoa(int(t.Tablespace)), // 8:  reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
 			relpages,                        // 9:  relpages
 			reltuples,                       // 10: reltuples
@@ -7621,6 +7744,10 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// below keeps its single-token column width (and comment
 		// alignment), same convention as relOfType above. M0122-0007.
 		idxTablespace := strconv.Itoa(int(idx.Tablespace))
+		// relfilenode: the index OID, or "0" for a partitioned index
+		// (relkind 'I'), which has no storage of its own. Hoisted for the
+		// same column-width reason as idxTablespace. M0134-0164.
+		idxFilenode := RelfilenodeForRelkind(idxRelkind, idx.OID)
 		out = append(out, []string{
 			strconv.Itoa(int(idx.OID)),  // 0:  oid
 			idx.Name,                    // 1:  relname
@@ -7629,7 +7756,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			"0",                         // 4:  reloftype
 			"10",                        // 5:  relowner
 			idxRelam,                    // 6:  relam
-			strconv.Itoa(int(idx.OID)),  // 7:  relfilenode
+			idxFilenode,                 // 7:  relfilenode (0 for a partitioned index, relkind 'I' — M0134-0164)
 			idxTablespace,               // 8:  reltablespace
 			"0",                         // 9:  relpages
 			"-1",                        // 10: reltuples (-1 = unknown for indexes)
@@ -8688,9 +8815,10 @@ func (c *InMemory) registerSystemTables() {
 	// from the same live c.roles/c.roleAttrs state as pg_roles, not the
 	// on-disk global/1260 heap file: that file (pg_authid_sync.go) is a
 	// separate crash-recovery mirror for auth credentials, not a live SQL
-	// read path. rolinherit is never modelled (goopg's role DDL has no
-	// per-role NOINHERIT tracking) and always reports PG's CREATE ROLE
-	// default 't'. rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
+	// read path. rolinherit now reflects the RoleAttrs sidecar too
+	// (M0134-0162, which added per-role [NO]INHERIT tracking); a role with no
+	// sidecar entry still reports PG's CREATE ROLE default 't'.
+	// rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
 	// rolconnlimit/rolvaliduntil now reflect the RoleAttrs sidecar (DU-002
 	// slice 439 follow-up); a role with no sidecar entry (predefined pg_*
 	// roles, unregistered names) falls back to PG's own CREATE ROLE
@@ -8718,6 +8846,7 @@ func (c *InMemory) registerSystemTables() {
 	pgAuthid.VirtualRows = func() [][]string {
 		rowFor := func(oidStr, name string, a *RoleAttrs) []string {
 			rolsuper, rolcanlogin := "f", "t"
+			rolinherit := "t" // PG's CREATE ROLE default (user.c:291)
 			rolcreaterole, rolcreatedb, rolreplication, rolbypassrls := "f", "f", "f", "f"
 			rolconnlimit := "-1"
 			rolpassword := VirtualNull
@@ -8728,6 +8857,9 @@ func (c *InMemory) registerSystemTables() {
 				}
 				if !a.CanLogin {
 					rolcanlogin = "f"
+				}
+				if !a.Inherit {
+					rolinherit = "f"
 				}
 				if a.CreateRole {
 					rolcreaterole = "t"
@@ -8750,8 +8882,7 @@ func (c *InMemory) registerSystemTables() {
 				}
 			}
 			return []string{
-				oidStr, name, rolsuper,
-				"t", // rolinherit: PG default, never overridden by goopg's role DDL
+				oidStr, name, rolsuper, rolinherit,
 				rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls,
 				rolconnlimit, rolpassword, rolvaliduntil,
 			}
@@ -8769,17 +8900,19 @@ func (c *InMemory) registerSystemTables() {
 		}
 		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat), same
 		// gap/rationale as pg_roles above (0119-0004ch ledger discovery (a)):
-		// this RoleAttrs{ConnLimit: -1} drives rowFor's defaults to exactly
-		// PG's predefined-role shape (rolsuper/rolcanlogin='f', rolpassword
-		// NULL, rolconnlimit=-1), matching SyncPgAuthidFile's frozen rows and
-		// pg_authid.dat (every seeded role's rolconnlimit is -1, never 0).
+		// this RoleAttrs{ConnLimit: -1, Inherit: true} drives rowFor's
+		// defaults to exactly PG's predefined-role shape (rolsuper/
+		// rolcanlogin='f', rolinherit='t', rolpassword NULL, rolconnlimit=-1),
+		// matching SyncPgAuthidFile's frozen rows and pg_authid.dat (every
+		// seeded role's rolconnlimit is -1, never 0, and every one of them
+		// carries rolinherit => 't' — M0134-0162).
 		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
 		for _, s := range predefinedRoleSeeds {
 			predefinedNames = append(predefinedNames, s.name)
 		}
 		sort.Strings(predefinedNames)
 		for _, name := range predefinedNames {
-			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{ConnLimit: -1}))
+			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{ConnLimit: -1, Inherit: true}))
 		}
 		return out
 	}
@@ -15068,9 +15201,15 @@ func (c *InMemory) PGCollationRowsForDBOid(dbOid uint32) [][]string {
 // It returns the two bootstrap tablespaces (pg_default OID 1663, pg_global OID
 // 1664, owned by the bootstrap superuser per pg_tablespace.dat) followed by any
 // in-place tablespaces in the runtime registry, ordered by OID for stable
-// output. Columns: oid, spcname, spcowner, spcacl (NULL = default), spcoptions
-// (NULL). Runtime in-place tablespaces report spcowner=10 (bootstrap superuser);
-// goopg does not resolve the recorded owner name to a role OID. M0110-0001.
+// output. Columns: oid, spcname, spcowner, spcacl (NULL = default), spcoptions.
+// Runtime in-place tablespaces report spcowner=10 (bootstrap superuser); goopg
+// does not resolve the recorded owner name to a role OID. M0110-0001.
+//
+// spcoptions carries the tablespace's storage parameters as a PG text[] literal
+// (M0134-0176). The two bootstrap tablespaces have none, and a tablespace whose
+// parameters were all RESET goes back to NULL rather than `{}` — spcoptions is
+// BKI_DEFAULT(_null_) and AlterTableSpaceOptions writes repl_null when the
+// merged array comes back empty (tablespace.c:1063-1066).
 func (c *InMemory) tablespaceVirtualRows() [][]string {
 	rows := [][]string{
 		{"1663", "pg_default", "10", "", ""},
@@ -15084,9 +15223,41 @@ func (c *InMemory) tablespaceVirtualRows() [][]string {
 	c.mu.RUnlock()
 	sort.Slice(extra, func(i, j int) bool { return extra[i].oid < extra[j].oid })
 	for _, ts := range extra {
-		rows = append(rows, []string{strconv.FormatUint(uint64(ts.oid), 10), ts.name, "10", "", ""})
+		rows = append(rows, []string{strconv.FormatUint(uint64(ts.oid), 10), ts.name, "10", "", pgTextArrayLiteral(ts.options)})
 	}
 	return rows
+}
+
+// pgTextArrayLiteral renders spcoptions' text[] the way PG's array_out does for
+// reloption arrays: `{a=1,b=2}`, with an element quoted only when it contains a
+// character that would otherwise be structural. An empty list is SQL NULL (the
+// empty string in this row representation), never `{}` — see
+// tablespaceVirtualRows' comment. M0134-0176.
+func pgTextArrayLiteral(elems []string) string {
+	if len(elems) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, e := range elems {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if strings.ContainsAny(e, ` ,{}"\`) || e == "" {
+			b.WriteByte('"')
+			for _, r := range e {
+				if r == '"' || r == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(r)
+			}
+			b.WriteByte('"')
+			continue
+		}
+		b.WriteString(e)
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 // PGDependRowsForDBOid builds pg_depend's row-set for dbOid's own relations
@@ -15886,6 +16057,75 @@ func (c *InMemory) DropTablespace(name string) (uint32, bool) {
 	return ts.oid, true
 }
 
+// SetTablespaceOptions replaces a tablespace's spcoptions with opts (nil for
+// "no parameters", i.e. SQL NULL). The caller has already merged/validated the
+// list — this is only the store, mirroring how AlterTableSpaceOptions
+// (postgres/src/backend/commands/tablespace.c:1015) does all the merging in
+// transformRelOptions and then writes one replacement value. Reports whether
+// the tablespace was present. M0134-0176.
+func (c *InMemory) SetTablespaceOptions(name string, opts []string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ts, ok := c.tablespaces[strings.ToLower(name)]
+	if !ok {
+		return false
+	}
+	ts.options = append([]string(nil), opts...)
+	if len(ts.options) == 0 {
+		ts.options = nil
+	}
+	return true
+}
+
+// TablespaceOptions returns a tablespace's current spcoptions, and whether the
+// tablespace exists. The merge half of ALTER TABLESPACE SET/RESET needs the old
+// list before it can compute the new one. M0134-0176.
+func (c *InMemory) TablespaceOptions(name string) ([]string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ts, ok := c.tablespaces[strings.ToLower(name)]
+	if !ok {
+		return nil, false
+	}
+	return append([]string(nil), ts.options...), true
+}
+
+// RenameTablespace re-keys a tablespace under newName, keeping its OID (and so
+// its pg_tblspc/<oid> directory and every reltablespace pointing at it — PG's
+// RenameTableSpace only rewrites the pg_tablespace tuple's spcname). Reports
+// whether the rename happened; false means either the old name is unknown or
+// newName is already taken, which the caller distinguishes with its own lookup.
+// M0134-0176.
+func (c *InMemory) RenameTablespace(oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oldKey, newKey := strings.ToLower(oldName), strings.ToLower(newName)
+	ts, ok := c.tablespaces[oldKey]
+	if !ok {
+		return false
+	}
+	if _, taken := c.tablespaces[newKey]; taken && newKey != oldKey {
+		return false
+	}
+	delete(c.tablespaces, oldKey)
+	ts.name = newName
+	c.tablespaces[newKey] = ts
+	return true
+}
+
+// SetTablespaceOwner records a new owner role name for a tablespace. Reports
+// whether the tablespace was present. M0134-0176.
+func (c *InMemory) SetTablespaceOwner(name, owner string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ts, ok := c.tablespaces[strings.ToLower(name)]
+	if !ok {
+		return false
+	}
+	ts.owner = owner
+	return true
+}
+
 // RegisterTablespaceDuringRecovery re-registers a tablespace with its
 // original OID (owner/location are unused strings — the pg_tablespace virtual
 // view hardcodes spcowner=10). Called by B4.1e's reloadUserTablespacesFromHeap
@@ -16172,9 +16412,22 @@ func (c *InMemory) RegisterRole(name string) {
 // explicitly; see tryHandleRoleDDL's two construction sites. ValidUntil is
 // the raw `VALID UNTIL '<literal>'` text (empty = NULL/no expiration, PG's
 // default); goopg does not evaluate it (no password-expiry enforcement).
+//
+// Inherit mirrors `[NO]INHERIT` / pg_authid.rolinherit (M0134-0162). It is the
+// ONLY boolean here whose PG default is TRUE (user.c CreateRole's `bool
+// inherit = true` at :291, written unconditionally at :411; every seeded role
+// in pg_authid.dat carries rolinherit => 't'), so — exactly like ConnLimit's
+// -1 — the Go zero value is the WRONG starting point: every RoleAttrs built as
+// a "no attributes given yet" seed MUST set Inherit: true explicitly. The five
+// such sites are role_ddl.go's CREATE/ALTER/RENAME seeds and the predefined-
+// role row in this file's pg_authid VirtualRows. The two RoleAttrs{} literals
+// in checkCreateRolePrivileges/checkAlterRoleAttrPrivileges are deliberately
+// NOT seeds — they are "fail closed, no privileges" sentinels, and INHERIT is
+// not a privilege PG gates on there.
 type RoleAttrs struct {
 	CanLogin    bool
 	Superuser   bool
+	Inherit     bool
 	CreateDB    bool
 	CreateRole  bool
 	Replication bool
@@ -16819,22 +17072,81 @@ func (c *InMemory) MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs [
 	byRole[owner] = privs
 }
 
-// HasTablePrivilege reports whether role was granted priv on relOID. M0118-0008.
+// HasTablePrivilege reports whether role holds priv on relOID. M0118-0008.
+//
+// This is goopg's aclmask() (postgres/src/backend/utils/adt/acl.c:1389), and
+// it matches grantees exactly the way that function's two loops do:
+//
+//  1. an aclitem whose grantee is `role` itself, OR whose grantee is PUBLIC
+//     (`aidata->ai_grantee == ACL_ID_PUBLIC || aidata->ai_grantee == roleid`),
+//     counts directly;
+//  2. any *other* aclitem counts too when `has_privs_of_role(roleid,
+//     aidata->ai_grantee)` — i.e. privileges reach a role indirectly through
+//     the INHERIT-marked role memberships it holds.
+//
+// Only step 1's direct-grantee half existed before M0134-0163, so
+// `GRANT ... TO PUBLIC` and `GRANT ... TO <group>` both parsed, both landed in
+// relacl, and neither granted anything: the recorded aclitem was keyed under
+// publicPseudoRole / the group's name and the lookup only ever probed the
+// querying role's own key.
+//
+// Locking note: HasPrivsOfRole and RoleOID take c.mu themselves, so the
+// indirect grantees are collected under the read lock and adjudicated after it
+// is dropped. That also mirrors aclmask's own ordering rationale ("we do this
+// in a separate pass to minimize expensive indirect membership tests") — the
+// `privs[priv]` pre-filter below is aclmask's `aidata->ai_privs & remaining`
+// guard, which skips the membership test for aclitems that could not help.
 func (c *InMemory) HasTablePrivilege(relOID uint32, role, priv string) bool {
 	role = strings.ToLower(strings.TrimSpace(role))
 	priv = strings.ToUpper(strings.TrimSpace(priv))
+
+	var indirect []string
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
+		c.mu.RUnlock()
 		return false
 	}
-	privs := byRole[role]
-	if privs == nil {
+	for _, grantee := range [2]string{role, publicPseudoRole} {
+		if privs := byRole[grantee]; privs != nil {
+			if _, ok := privs[priv]; ok {
+				c.mu.RUnlock()
+				return true
+			}
+		}
+	}
+	for grantee, privs := range byRole {
+		if grantee == role || grantee == publicPseudoRole {
+			continue // already checked it
+		}
+		if _, ok := privs[priv]; !ok {
+			continue
+		}
+		indirect = append(indirect, grantee)
+	}
+	c.mu.RUnlock()
+
+	if len(indirect) == 0 || role == "" {
 		return false
 	}
-	_, ok := privs[priv]
-	return ok
+	memberOid, ok := c.RoleOID(role)
+	if !ok {
+		return false
+	}
+	// Deterministic order: map iteration is randomised, and an unknown
+	// grantee name must never make the answer depend on which entry was
+	// visited first.
+	sort.Strings(indirect)
+	for _, grantee := range indirect {
+		granteeOid, ok := c.RoleOID(grantee)
+		if !ok {
+			continue
+		}
+		if c.HasPrivsOfRole(memberOid, granteeOid) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsOwnerACLRevoked reports whether relOID's owner has had its implicit

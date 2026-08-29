@@ -14,8 +14,11 @@ func TestParseCreateTablespace(t *testing.T) {
 		{"CREATE TABLESPACE ts2 LOCATION '/data/ts2'", "ts2", "", "/data/ts2", 0},
 		{"CREATE TABLESPACE ts3 OWNER alice LOCATION ''", "ts3", "alice", "", 0},
 		{"CREATE TABLESPACE ts4 OWNER = bob LOCATION '/x'", "ts4", "bob", "/x", 0},
-		// Options are captured as a raw token list (random_page_cost, =, 1.0).
-		{"CREATE TABLESPACE ts5 LOCATION '' WITH (random_page_cost = 1.0)", "ts5", "", "", 3},
+		// Before M0134-0176 the WITH body was a raw token list (three entries
+		// for this clause: random_page_cost, =, 1.0) that no consumer read. It
+		// is now one structured TablespaceOption per parameter.
+		{"CREATE TABLESPACE ts5 LOCATION '' WITH (random_page_cost = 1.0)", "ts5", "", "", 1},
+		{"CREATE TABLESPACE ts6 LOCATION '' WITH (random_page_cost = 1.0, seq_page_cost = 2)", "ts6", "", "", 2},
 	}
 	for _, tc := range cases {
 		stmts, err := Parse(tc.sql)
@@ -202,5 +205,82 @@ func TestParseAlterIndexSetTablespace(t *testing.T) {
 	s2 := stmts2[0].(*AlterTableStmt)
 	if len(s2.Actions) != 1 || s2.Actions[0].Kind != AlterIndexSetReloptions {
 		t.Fatalf("reloptions SET regressed: %+v", s2.Actions)
+	}
+}
+
+// TestParseCreateTablespaceOptionValues pins the structure M0134-0176 gave the
+// WITH clause. The raw token list it replaced could not express any of these:
+// which token is a name and which a value, that a bare name has NO value (the
+// distinction PG's RESET check is built on), or that `ns.name` is one qualified
+// name rather than three tokens.
+func TestParseCreateTablespaceOptionValues(t *testing.T) {
+	stmts, err := Parse("CREATE TABLESPACE ts LOCATION '' WITH (random_page_cost = 1.5, Seq_Page_Cost, toast.x = -3)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := stmts[0].(*CreateTablespaceStmt)
+	want := []TablespaceOption{
+		{Name: "random_page_cost", Value: "1.5", HasValue: true},
+		{Name: "seq_page_cost", HasValue: false},
+		{Name: "toast.x", Value: "-3", HasValue: true},
+	}
+	if len(s.Options) != len(want) {
+		t.Fatalf("got %d options (%v), want %d", len(s.Options), s.Options, len(want))
+	}
+	for i, w := range want {
+		if s.Options[i] != w {
+			t.Errorf("option %d = %+v, want %+v", i, s.Options[i], w)
+		}
+	}
+}
+
+// TestParseAlterTablespace pins all four ALTER TABLESPACE forms. Before
+// M0134-0176 every one of them fell through parseAlter to its closing
+// expectKeyword(KwTable) and came back as `syntax error at or near "expected
+// keyword table (got tablespace)"`, so this test would have failed at Parse.
+func TestParseAlterTablespace(t *testing.T) {
+	cases := []struct {
+		sql      string
+		action   string
+		nopts    int
+		newName  string
+		newOwner string
+	}{
+		{"ALTER TABLESPACE ts SET (random_page_cost = 1.0, seq_page_cost = 1.1)", "set", 2, "", ""},
+		{"ALTER TABLESPACE ts RESET (random_page_cost, effective_io_concurrency)", "reset", 2, "", ""},
+		// RESET (name = value) must PARSE: upstream's grammar accepts it and
+		// rejects it downstream (reloptions.c:1228-1243), which is the only
+		// place the "RESET must not include values" message can come from.
+		{"ALTER TABLESPACE ts RESET (random_page_cost = 2.0)", "reset", 1, "", ""},
+		{"ALTER TABLESPACE ts RENAME TO ts2", "rename", 0, "ts2", ""},
+		{"ALTER TABLESPACE ts OWNER TO alice", "owner", 0, "", "alice"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		s, ok := stmts[0].(*AlterTablespaceStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): want *AlterTablespaceStmt, got %T", tc.sql, stmts[0])
+		}
+		if s.Name != "ts" {
+			t.Errorf("%q: name=%q want %q", tc.sql, s.Name, "ts")
+		}
+		if s.Action != tc.action {
+			t.Errorf("%q: action=%q want %q", tc.sql, s.Action, tc.action)
+		}
+		if len(s.Options) != tc.nopts {
+			t.Errorf("%q: %d options want %d", tc.sql, len(s.Options), tc.nopts)
+		}
+		if s.NewName != tc.newName {
+			t.Errorf("%q: newName=%q want %q", tc.sql, s.NewName, tc.newName)
+		}
+		if s.NewOwner != tc.newOwner {
+			t.Errorf("%q: newOwner=%q want %q", tc.sql, s.NewOwner, tc.newOwner)
+		}
+	}
+	if _, err := Parse("ALTER TABLESPACE ts FROBNICATE"); err == nil {
+		t.Error("ALTER TABLESPACE ts FROBNICATE: want error, got nil")
 	}
 }

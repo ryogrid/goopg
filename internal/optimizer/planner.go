@@ -212,7 +212,7 @@ func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.AlterAggregateRenameStmt, *parser.AlterAggregateOwnerStmt,
 		*parser.CreateExtensionStmt,
 		*parser.CreateCollationStmt, *parser.AlterCollationStmt, *parser.AlterConversionStmt,
-		*parser.CreateTablespaceStmt, *parser.DropTablespaceStmt,
+		*parser.CreateTablespaceStmt, *parser.DropTablespaceStmt, *parser.AlterTablespaceStmt,
 		*parser.CreateOpClassStmt, *parser.AlterOperatorSetStmt, *parser.AlterOpFamilyAddStmt,
 		*parser.AlterOpFamilyDropStmt,
 		*parser.CreateEventTriggerStmt, *parser.AlterEventTriggerStmt,
@@ -2975,6 +2975,17 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		b.table = &renamedTbl
 	}
 	ctx := newResolveContext([]rangeBinding{b}, baseSchema)
+	// TABLESAMPLE (M0134-0175). Resolved ONCE, above the inheritance and
+	// partition expansions below, because upstream applies the sample to
+	// every leaf of an expanded Append — `select count(*) from person
+	// tablesample bernoulli (100)` plans as four Sample Scans, not one
+	// Sample Scan over a Seq-Scan Append. Sharing one descriptor across the
+	// children also shares the seed, which is what makes the per-leaf
+	// samples jointly reproducible under REPEATABLE.
+	tsSpec, err := resolveTableSample(rv.TableSample, ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
 	// View: plan the stored inner SELECT and substitute its
 	// node. The outer ctx's schema (built from the view's
 	// catalog Table) takes precedence for downstream name
@@ -3084,7 +3095,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// buildInheritanceRemapProject wraps the scan in a Project
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
-					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID,
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID, TableSample: tsSpec,
 						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf), UniqueKeys: uniqueKeyColumnSets(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
@@ -3121,7 +3132,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		allDesc := collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 
 		if len(allDesc) > 0 {
-			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
+			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec,
 				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
@@ -3135,7 +3146,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// lock, skip the now-gone child instead of erroring. M0118-0008
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID,
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID, TableSample: tsSpec,
 					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child), UniqueKeys: uniqueKeyColumnSets(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
@@ -3156,8 +3167,42 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			return root, b, nil
 		}
 	}
-	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema,
+	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec,
 		EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}, b, nil
+}
+
+// resolveTableSample lifts the parser's RangeTableSample into a
+// TableSampleSpec, resolving the argument and REPEATABLE expressions against
+// the scan's own scope. Nil in, nil out — the overwhelmingly common case.
+//
+// Upstream resolves these with EXPR_KIND_FROM_FUNCTION (parse_clause.c:960),
+// which is what makes `TABLESAMPLE bernoulli(('1'::text < '0'::text)::int)`
+// legal: the argument is an ordinary scalar expression, merely one that cannot
+// see the relation being sampled (it is not in scope yet at that point in
+// upstream's transform). goopg resolves against a context that DOES include
+// the sampled relation, so a column reference here would resolve rather than
+// error — a laxity, recorded in the deferral ledger rather than papered over,
+// since rejecting it needs a scope distinction the resolver does not have.
+func resolveTableSample(ts *parser.RangeTableSample, ctx *resolveContext) (*TableSampleSpec, error) {
+	if ts == nil {
+		return nil, nil
+	}
+	spec := &TableSampleSpec{pos: ts.Pos(), Method: ts.Method}
+	for _, a := range ts.Args {
+		e, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, err
+		}
+		spec.Args = append(spec.Args, e)
+	}
+	if ts.Repeatable != nil {
+		e, err := resolveExpr(ts.Repeatable, ctx)
+		if err != nil {
+			return nil, err
+		}
+		spec.Repeatable = e
+	}
+	return spec, nil
 }
 
 // stage1RelSizeRows is the single stamping point for the relation-size
@@ -3656,10 +3701,7 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node
 	schema := make(Schema, nCols)
 	for i := 0; i < nCols; i++ {
 		name := fmt.Sprintf("column%d", i+1)
-		typ := exprType(planRows[0][i])
-		for r := 1; r < len(planRows); r++ {
-			typ = unifyValueTypes(typ, exprType(planRows[r][i]))
-		}
+		typ := resolveValuesColumnType(planRows, i)
 		schema[i] = SchemaColumn{Name: name, Type: typ}
 	}
 	var node Node = &Values{pos: s.Pos(), Rows: planRows, schema: schema}
@@ -3800,8 +3842,10 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 		} else {
 			name = fmt.Sprintf("column%d", i+1)
 		}
-		// Type: use the type of the first row's expression.
-		typ := exprType(planRows[0][i])
+		// Type: select_common_type over every row, not just the first —
+		// `(VALUES ('2015-01-02'), ('2015-04-01'::date))` must resolve to date
+		// whichever row carries the cast. M0134-0156.
+		typ := resolveValuesColumnType(planRows, i)
 		cols[i] = catalog.Column{Name: name, Type: typ}
 		schema[i] = SchemaColumn{Name: name, Type: typ}
 	}
@@ -7369,14 +7413,16 @@ func isUserDefinedPlannerType(name string) bool {
 }
 
 func groupExprName(e Expr) string {
-	if c, ok := e.(*ColumnRef); ok {
-		return c.Name
-	}
-	// FuncCall GROUP BY: use function name as column label (e.g. lower(c) → "lower"). M0097-0003.
-	if f, ok := e.(*FuncCall); ok && f.Name != "" {
-		return f.Name
-	}
-	return "?column?"
+	// PostgreSQL has exactly one implicit-column-label routine — FigureColname
+	// (parse_target.c) — and grouping does not change it: `SELECT EXTRACT(year
+	// FROM d), count(*) ... GROUP BY 1` labels the first column "extract", the
+	// same as without the GROUP BY. goopg's targetMeta is that routine; this
+	// used to be an independent mini-copy handling only ColumnRef and FuncCall,
+	// so every other labelled node kind (ExtractExpr, CASE, typed literals,
+	// scalar subqueries) silently degraded to "?column?" once a GROUP BY was
+	// present. Delegate instead of duplicating. M0134-0156.
+	name, _ := targetMeta(e, parser.ResTarget{})
+	return name
 }
 
 // buildHavingParentCtx creates a parent resolveContext for EXISTS/subquery
@@ -10915,9 +10961,10 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 		// execIndexing.c:592-596), sibling of the analyzer's identical check
 		// (analyzer.go analyzeOnConflict) — this defensive re-check must stay
 		// in lockstep. Deferrable exclusion/unique constraints are rejected
-		// regardless of kind, keyed on InitiallyDeferred (indimmediate is
-		// false only for INITIALLY DEFERRED). execIndexing.c:604-610.
-		if idx.InitiallyDeferred {
+		// regardless of kind, keyed on indimmediate — false for ANY
+		// DEFERRABLE constraint, not just INITIALLY DEFERRED ones
+		// (index.c:1049, 2080-2082). execIndexing.c:604-610. M0134-0161.
+		if !idx.IsImmediate() {
 			// Pos: 0 — see analyzer.go's identical check; PG raises this at
 			// execution time with no errposition.
 			return nil, nil, &PlanError{Pos: 0, Code: "55000", Message: "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"}
@@ -11055,6 +11102,21 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 		}
 		if !match {
 			continue
+		}
+		// The index matched the inference specification. Only NOW may it be
+		// rejected for being non-immediate: PG's infer_arbiter_indexes
+		// deliberately does NOT filter on indimmediate ("Let executor
+		// complain about !indimmediate case directly, because the index
+		// may be used by an INSERT with a different ON CONFLICT clause",
+		// plancat.c:817), leaving ExecCheckIndexConstraints to raise
+		// (execIndexing.c:604-610). Ordering matters: skipping the index
+		// during matching instead would surface 42P10 "no unique or
+		// exclusion constraint matching the ON CONFLICT specification"
+		// where PG reports 55000. Sibling of the ON CONSTRAINT branch
+		// above — the two must stay in lockstep. M0134-0161.
+		if !idx.IsImmediate() {
+			// Pos: 0 — raised at execution time in PG, no errposition.
+			return nil, nil, &PlanError{Pos: 0, Code: "55000", Message: "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"}
 		}
 		ords := make([]int, 0, len(idx.Columns))
 		for _, ic := range idx.Columns {
@@ -12604,6 +12666,14 @@ func exprType(e Expr) catalog.Type {
 		// follow-up.
 		case "pg_typeof":
 			return catalog.Type{Name: "regtype"}
+		// The six built-in range constructors (range_constructor2 /
+		// range_constructor3, rangetypes.c) each return their OWN range type —
+		// pg_proc.dat gives int4range prorettype int4range, and so on. Without
+		// this arm `pg_typeof(int4range(1,4))` answered `unknown`. M0134-0173.
+		case "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange":
+			if len(x.Args) == 2 || len(x.Args) == 3 {
+				return catalog.Type{Name: strings.ToLower(x.Name)}
+			}
 		// Type-cast functions: single-arg calls like float8(expr) act as explicit casts.
 		// Return the target type so downstream type inference (BinaryOp, wire) is correct.
 		case "float8", "double precision", "double", "float":
@@ -13033,6 +13103,43 @@ func isNumericTypeName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// valuesCandidateType reports the type an expression contributes to VALUES
+// column type resolution.
+//
+// PostgreSQL runs select_common_type (parse_coerce.c:1342) over the parse tree,
+// where an unadorned string literal still carries UNKNOWNOID and is therefore
+// *skipped* — any row supplying a real type wins, and the literals are coerced
+// to it afterwards. goopg's exprType has already resolved *StringConst to
+// "text", which would instead dominate the real type (text is the sink of
+// unifyValueTypes). Report bare string literals as "unknown" so they behave
+// like PG's unknown-type literals. M0134-0156.
+func valuesCandidateType(e Expr) catalog.Type {
+	if _, ok := e.(*StringConst); ok {
+		return catalog.Type{Name: "unknown"}
+	}
+	return exprType(e)
+}
+
+// resolveValuesColumnType applies PostgreSQL's select_common_type to one VALUES
+// column: unify across *every* row (not just the first), ignoring unknown-type
+// literals, and fall back to text when every row is unknown
+// (parse_coerce.c:1451 "If all the inputs were UNKNOWN ... resolve as type
+// TEXT"). Shared by the standalone-VALUES and VALUES-subquery planners so the
+// two sibling paths cannot drift. M0134-0156.
+func resolveValuesColumnType(planRows [][]Expr, col int) catalog.Type {
+	typ := catalog.Type{Name: "unknown"}
+	for r := range planRows {
+		if col >= len(planRows[r]) {
+			continue
+		}
+		typ = unifyValueTypes(typ, valuesCandidateType(planRows[r][col]))
+	}
+	if n := strings.ToLower(typ.Name); n == "" || n == "unknown" {
+		return catalog.Type{Name: "text"}
+	}
+	return typ
 }
 
 // unifyValueTypes returns the "wider" of two types for VALUES column type inference.

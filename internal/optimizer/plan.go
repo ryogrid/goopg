@@ -591,6 +591,27 @@ func (e *FuncCall) Pos() int { return e.pos }
 func (*FuncCall) exprNode()  {}
 
 // SeqScan — full heap scan of a single relation.
+// TableSampleSpec is the planner-side form of a TABLESAMPLE clause: the
+// parser's RangeTableSample with its argument expressions RESOLVED against the
+// scan's scope, so the executor can evaluate them with the ordinary evalExpr
+// rather than reaching back into the parser AST. M0134-0175.
+//
+// Method is NOT validated here. Upstream validates it in the parser
+// (parse_tablesample_method, parse_clause.c:929) and goopg validates it in the
+// executor; either way the message is 42704 "tablesample method X does not
+// exist" rather than a syntax error, which is what the oracle's caret under
+// the method name requires.
+type TableSampleSpec struct {
+	pos        int // the method name's offset, for the error caret
+	Method     string
+	Args       []Expr
+	Repeatable Expr
+}
+
+// Pos returns the method name's byte offset — the position upstream stamps
+// (gram.y:14001 `n->location = @2`) and the one the oracle's caret points at.
+func (t *TableSampleSpec) Pos() int { return t.pos }
+
 type SeqScan struct {
 	// searchedTree: a one-relation search root is a bare scan (searchedtree.go).
 	searchedTree
@@ -598,6 +619,14 @@ type SeqScan struct {
 	Table  *catalog.Table
 	Alias  string // FROM-clause alias; empty when not specified
 	schema Schema
+	// TableSample carries the FROM item's TABLESAMPLE clause (M0134-0175),
+	// nil for an ordinary scan. Upstream builds a distinct SampleScan plan
+	// node (nodeSamplescan.c) whose only structural difference from SeqScan
+	// is the sampler callback pair; goopg keeps one scan node and switches on
+	// this field, so every existing SeqScan consumer (cost, EXPLAIN naming,
+	// parallel-scan claiming) keeps working unchanged. EXPLAIN renders
+	// "Sample Scan on t" instead of "Seq Scan on t" when it is set.
+	TableSample *TableSampleSpec
 	// EstRelRows is the relation-size fallback's row estimate for Table,
 	// stamped once at plan-build time and 0 when it did not apply (the
 	// GOOPG_RELSIZE_FALLBACK flag is off, the relation is ANALYZEd, or no

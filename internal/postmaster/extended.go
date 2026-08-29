@@ -145,11 +145,7 @@ func (s *Server) handleBindFrame(state *extendedState, payload []byte) *extended
 	}
 	stmt, ok := state.statements[statementName]
 	if !ok {
-		return &extendedMessageError{
-			Code:    errcodes.InvalidSQLStatementName,
-			Message: fmt.Sprintf("prepared statement %q does not exist", statementName),
-			Routine: "postmaster.handleBindFrame",
-		}
+		return missingPreparedStatement(statementName, "postmaster.handleBindFrame")
 	}
 
 	nParamFormats, err := pr.readUint16()
@@ -169,12 +165,20 @@ func (s *Server) handleBindFrame(state *extendedState, payload []byte) *extended
 	if err != nil {
 		return protoViolation("invalid Bind message: "+err.Error(), "postmaster.handleBindFrame")
 	}
+	// Upstream's guard is `numPFormats > 1 && numPFormats != numParams`
+	// (postgres.c:1720-1724) — 0 means "all text", 1 means "this code for
+	// every parameter". The extra `!= 1` term below is the same predicate
+	// spelled out; only the message text is upstream's. M0134-0157.
 	if len(paramFormats) != 0 && len(paramFormats) != 1 && len(paramFormats) != int(nParams) {
-		return protoViolation("invalid Bind message: parameter format code count mismatch", "postmaster.handleBindFrame")
+		return protoViolation(
+			fmt.Sprintf("bind message has %d parameter formats but %d parameters", len(paramFormats), nParams),
+			"postmaster.handleBindFrame",
+		)
 	}
 	if int(nParams) != stmt.ParamCount {
 		return protoViolation(
-			fmt.Sprintf("bind supplies %d parameters, prepared statement requires %d", nParams, stmt.ParamCount),
+			fmt.Sprintf("bind message supplies %d parameters, but prepared statement %q requires %d",
+				nParams, statementName, stmt.ParamCount),
 			"postmaster.handleBindFrame",
 		)
 	}
@@ -260,11 +264,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *li
 	case 'S':
 		stmt, ok := state.statements[name]
 		if !ok {
-			return &extendedMessageError{
-				Code:    errcodes.InvalidSQLStatementName,
-				Message: fmt.Sprintf("prepared statement %q does not exist", name),
-				Routine: "postmaster.handleDescribeFrame",
-			}, nil
+			return missingPreparedStatement(name, "postmaster.handleDescribeFrame"), nil
 		}
 		oids := make([]uint32, stmt.ParamCount)
 		if err := w.WriteParameterDescription(oids); err != nil {
@@ -837,6 +837,26 @@ func bindFormatCode(codes []uint16, idx int) uint16 {
 		return codes[0]
 	}
 	return codes[idx]
+}
+
+// missingPreparedStatement renders the "prepared statement not found" error the
+// Bind and Describe-statement handlers both raise. PostgreSQL special-cases the
+// UNNAMED statement: `FetchPreparedStatement` is only consulted for a non-empty
+// name, and the empty name falls through to `unnamed_stmt_psrc == NULL`, which
+// reports a message carrying no name at all (postgres.c:1665-1671 for Bind,
+// postgres.c:2661-2669 for Describe). Both sites share ERRCODE_UNDEFINED_PSTATEMENT.
+// Keeping the two callers on one helper is deliberate: they are sibling paths
+// over the same lookup and diverged silently before. M0134-0157.
+func missingPreparedStatement(name, routine string) *extendedMessageError {
+	msg := fmt.Sprintf("prepared statement %q does not exist", name)
+	if name == "" {
+		msg = "unnamed prepared statement does not exist"
+	}
+	return &extendedMessageError{
+		Code:    errcodes.InvalidSQLStatementName,
+		Message: msg,
+		Routine: routine,
+	}
 }
 
 func protoViolation(msg, routine string) *extendedMessageError {

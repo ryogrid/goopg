@@ -35,7 +35,7 @@ func TestTryRecordTableGrantStampsActingRoleAsGrantor(t *testing.T) {
 
 	// The bootstrap superuser's own GRANT is still attributed to the owner
 	// ("postgres") — the pre-existing, unchanged common case.
-	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO bob`, ""); err != nil {
+	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO bob`, "", nil); err != nil {
 		t.Fatalf("owner GRANT: %v", err)
 	}
 	want := `{postgres=arwdDxtm/postgres,bob=r/postgres}`
@@ -45,7 +45,7 @@ func TestTryRecordTableGrantStampsActingRoleAsGrantor(t *testing.T) {
 
 	// bob (SET ROLE'd, i.e. actingRole = "bob") grants onward to charlie: the
 	// new aclitem's grantor must be "bob", not "postgres".
-	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO charlie`, "bob"); err != nil {
+	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO charlie`, "bob", nil); err != nil {
 		t.Fatalf("delegated GRANT: %v", err)
 	}
 	want = `{postgres=arwdDxtm/postgres,bob=r/postgres,charlie=r/bob}`
@@ -56,7 +56,7 @@ func TestTryRecordTableGrantStampsActingRoleAsGrantor(t *testing.T) {
 	// A later re-GRANT of the same privilege by the owner restamps the
 	// grantor back to the owner (PostgreSQL's aclupdate updates an existing
 	// aclitem's grantor to whoever issued the latest GRANT).
-	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO charlie`, ""); err != nil {
+	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO charlie`, "", nil); err != nil {
 		t.Fatalf("owner re-GRANT: %v", err)
 	}
 	want = `{postgres=arwdDxtm/postgres,bob=r/postgres,charlie=r/postgres}`
@@ -73,7 +73,7 @@ func TestTryRecordTableGrantStampsActingRoleAsGrantor(t *testing.T) {
 func TestTryRecordTableGrantGrantedByCurrentUserIsNoop(t *testing.T) {
 	s, im, oid := newGrantTestServer(t)
 
-	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO bob GRANTED BY postgres`, ""); err != nil {
+	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO bob GRANTED BY postgres`, "", nil); err != nil {
 		t.Fatalf("GRANTED BY postgres (as postgres): %v", err)
 	}
 	want := `{postgres=arwdDxtm/postgres,bob=r/postgres}`
@@ -81,7 +81,7 @@ func TestTryRecordTableGrantGrantedByCurrentUserIsNoop(t *testing.T) {
 		t.Fatalf("relacl = %q; want %q", got, want)
 	}
 
-	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO charlie GRANTED BY bob`, "bob"); err != nil {
+	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO charlie GRANTED BY bob`, "bob", nil); err != nil {
 		t.Fatalf("GRANTED BY bob (as bob): %v", err)
 	}
 	want = `{postgres=arwdDxtm/postgres,bob=r/postgres,charlie=r/bob}`
@@ -98,7 +98,7 @@ func TestTryRecordTableGrantGrantedByCurrentUserIsNoop(t *testing.T) {
 func TestTryRecordTableGrantGrantedByOtherRoleErrors(t *testing.T) {
 	s, im, oid := newGrantTestServer(t)
 
-	err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO charlie GRANTED BY bob`, "")
+	err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO charlie GRANTED BY bob`, "", nil)
 	if err != errGrantorMustBeCurrentUser {
 		t.Fatalf("err = %v; want errGrantorMustBeCurrentUser", err)
 	}
@@ -141,7 +141,7 @@ func TestTryRecordTableRevokeMaterializesActualOwner(t *testing.T) {
 		t.Fatalf("relacl before revoke = %q; want \"\" (NULL)", got)
 	}
 
-	s.tryRecordTableRevoke(`REVOKE ALL ON TABLE t FROM regress_seq_user`)
+	s.tryRecordTableRevoke(`REVOKE ALL ON TABLE t FROM regress_seq_user`, nil)
 
 	// The owner's implicit default ACL must now be materialized (under the
 	// "postgres" sentinel) with every privilege stripped — a non-NULL empty
@@ -167,8 +167,52 @@ func TestTryRecordTableRevokeMaterializesActualOwner(t *testing.T) {
 
 	// A subsequent REVOKE (of a privilege the owner no longer holds) is a
 	// harmless no-op, not a panic or a resurrection of the owner default.
-	s.tryRecordTableRevoke(`REVOKE SELECT ON TABLE t FROM regress_seq_user`)
+	s.tryRecordTableRevoke(`REVOKE SELECT ON TABLE t FROM regress_seq_user`, nil)
 	if got := im.RelaclText(oid); got != "{}" {
 		t.Fatalf("relacl after second REVOKE FROM actual owner = %q; want %q (unchanged empty array)", got, "{}")
+	}
+}
+
+// TestTryRecordTableGrantResolvesSearchPath pins the M0134-0163 fix: the
+// GRANT/REVOKE recorders run before the executor and so have no
+// executor.Context, but they must still resolve an unqualified relation name
+// through the session's search_path. Catalog.LookupTable alone only tries the
+// bare key, "public.<name>", and "pg_catalog.<name>", so a GRANT naming a table
+// in any other schema used to resolve to nothing and record no aclitem while
+// still reporting "GRANT" — leaving every `SET search_path = <schema>` regress
+// case (rowsecurity.sql:35-36) running against an empty relacl.
+func TestTryRecordTableGrantResolvesSearchPath(t *testing.T) {
+	im := catalog.NewInMemory()
+	tbl, err := im.CreateTable(parser.ObjectName{Schema: "sch", Name: "doc"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	})
+	if err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	s := &Server{cfg: Config{Catalog: im}}
+
+	// Without "sch" on the search_path the name is unresolvable, so the
+	// recorder stays a silent no-op (the pre-fix behaviour, still correct here).
+	if err := s.tryRecordTableGrant(`GRANT SELECT ON doc TO bob`, "", []string{"public"}); err != nil {
+		t.Fatalf("off-path GRANT: %v", err)
+	}
+	if got := im.RelaclText(tbl.OID); got != "" {
+		t.Fatalf("relacl after off-path GRANT = %q; want empty (name not resolvable)", got)
+	}
+
+	// With "sch" on the search_path the unqualified name resolves and the
+	// aclitem lands, exactly as the schema-qualified form would.
+	if err := s.tryRecordTableGrant(`GRANT SELECT ON doc TO bob`, "", []string{"sch", "public"}); err != nil {
+		t.Fatalf("on-path GRANT: %v", err)
+	}
+	want := `{postgres=arwdDxtm/postgres,bob=r/postgres}`
+	if got := im.RelaclText(tbl.OID); got != want {
+		t.Fatalf("relacl after on-path GRANT = %q; want %q", got, want)
+	}
+
+	// REVOKE must resolve the same relation, or the pair desynchronises.
+	s.tryRecordTableRevoke(`REVOKE SELECT ON doc FROM bob`, []string{"sch", "public"})
+	if got := im.RelaclText(tbl.OID); got != "" {
+		t.Fatalf("relacl after on-path REVOKE = %q; want empty", got)
 	}
 }

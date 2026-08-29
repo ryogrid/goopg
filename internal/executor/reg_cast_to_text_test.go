@@ -17,15 +17,18 @@ import (
 // resolved name; evalCastTyped is the third sibling of the SELECT/COPY
 // renderers and must agree (pattern_sibling_paths_must_agree).
 //
-// A note on shapes: the parser lowers `'pg_type'::regclass` (string input) to
-// a KindString in a bare NewInMemory test catalog (system tables are not
-// resolvable by name there, so the input arm passes the string through), so
-// the STRING-input regclass/regtype shapes do not exercise this guard — the
-// KindInt shapes do: a stored reg* COLUMN, `<oid>::regrole/regcollation`
-// (no OID-resolving input arm, so the datum stays KindInt), the regproc/
-// regprocedure string inputs (which resolve to the OID), and a direct KindInt
-// datum. The battery covers every shape; the design doc's five literals are
-// pinned as regression checks in the SQL test.
+// A note on shapes: the STRING-input regtype shape still lowers to a
+// KindString in a bare NewInMemory test catalog, so it pins the END state
+// rather than the guard. Every other shape is guard-driven: a stored reg*
+// COLUMN, `<oid>::regrole/regcollation` (no OID-resolving input arm, so the
+// datum stays KindInt), the regproc/regprocedure string inputs (which resolve
+// to the OID), a direct KindInt datum — and, since M0134-0168 routed the
+// string-input `::regclass` cast through regIdentifierInput, the regclass
+// string shape too. That change is why the battery names the fixture's own
+// `qmt` rather than `pg_type`: this harness never registered the system
+// catalogs, so `'pg_type'::regclass` used to survive only because the cast
+// silently passed an unresolvable name through, and it now correctly raises
+// regclassin's 42P01.
 
 // regCastTextCat is a fixture holding every object the battery resolves: a
 // user table qmt in public (qualify-observable), a user routine
@@ -62,14 +65,13 @@ func TestRegCastToStringRendersName(t *testing.T) {
 		query string
 		want  string
 	}{
-		// The design doc's five literals. regclass's string input stays a
-		// KindString in this harness, so these pin the END state rather than
-		// the guard (see the file comment); on a server whose catalog resolves
-		// pg_type by name they are guard-driven too.
-		{`SELECT 'pg_type'::regclass::text`, "pg_type"},
-		{`SELECT 'pg_type'::regclass::name`, "pg_type"},
-		{`SELECT 'pg_type'::regclass::varchar`, "pg_type"},
-		{`SELECT 'pg_type'::regclass::bpchar`, "pg_type"},
+		// The design doc's five literals, on the fixture's own relation:
+		// `'qmt'::regclass` resolves to the table's OID (M0134-0168), so these
+		// drive the KindInt guard rather than merely pinning the end state.
+		{`SELECT 'qmt'::regclass::text`, "qmt"},
+		{`SELECT 'qmt'::regclass::name`, "qmt"},
+		{`SELECT 'qmt'::regclass::varchar`, "qmt"},
+		{`SELECT 'qmt'::regclass::bpchar`, "qmt"},
 		// regproc/regprocedure string inputs DO resolve to a KindInt OID, so
 		// these exercise the guard; varbit renders via format_type_be's
 		// bit-varying alias (reg_qualify_test.go's 74th-slice alias).

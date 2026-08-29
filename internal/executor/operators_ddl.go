@@ -197,6 +197,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateTablespace(s)
 	case *parser.DropTablespaceStmt:
 		return nil, o.execDropTablespace(s)
+	case *parser.AlterTablespaceStmt:
+		return nil, o.execAlterTablespace(s)
 	case *parser.CompatNoopStmt:
 		return nil, o.execCompatNoop(s)
 	case *parser.CommentOnStmt:
@@ -341,11 +343,23 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 			Detail:  `The prefix "pg_" is reserved for system tablespaces.`,
 		}
 	}
+	// Storage parameters. Before M0134-0176 the WITH clause was parsed and
+	// thrown away, so `WITH (some_nonexistent_parameter = true)` SUCCEEDED and
+	// `WITH (random_page_cost = 3.0)` recorded nothing. Validate the names
+	// against RELOPT_KIND_TABLESPACE first — upstream's CreateTableSpace calls
+	// tablespace_reloptions(..., validate=true) BEFORE inserting the
+	// pg_tablespace tuple (tablespace.c:359), so a rejected option must leave no
+	// tablespace behind. validnsps is NULL there, hence allowNamespaces=false.
+	spcoptions, verr := tablespaceOptionArray(nil, s.Options, false, s.Pos())
+	if verr != nil {
+		return verr
+	}
 	oid, err := o.ctx.Catalog.CreateTablespace(s.Name, s.Owner, location)
 	if err != nil {
 		// Only failure mode is a duplicate name.
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	o.ctx.Catalog.SetTablespaceOptions(s.Name, spcoptions)
 	// Create the in-place directory pg_tblspc/<oid> under the data dir. When no
 	// data dir is configured (embedded/test contexts), the registry entry stands
 	// alone — matching how other DDL operators skip cluster-filesystem effects.
@@ -1162,13 +1176,39 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE SUBSCRIPTION requires PubSub registry in Context"}
 	}
-	enabled := true
-	if v, ok := s.With["enabled"]; ok {
-		enabled = v == "true" || v == "on" || v == "yes" || v == "1"
+	// M0134-0174: validate before creating anything, in upstream
+	// CreateSubscription's own order (subscriptioncmds.c:539) — a statement
+	// that is wrong in two ways must report the same one PG reports, and any
+	// check that runs after the registry insert would leave the silently
+	// created subscription behind to poison every later statement.
+	opts, err := parseSubscriptionOptions(s.With, s.Pos())
+	if err != nil {
+		return err
 	}
-	slotName := s.With["slot_name"]
 	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
-	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, enabled, o.currentDDLOwnerOID(), subDBOid)
+	// subscriptioncmds.c:623 — the duplicate-name check precedes the conninfo
+	// and publication checks, and names the subscription (goopg's registry
+	// error is the bare unquoted sentinel catalog.ErrSubscriptionExists).
+	if _, exists := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); exists {
+		return &ExecError{
+			Code:    "42710",
+			Pos:     s.Pos(),
+			Message: fmt.Sprintf("subscription %q already exists", s.Name),
+		}
+	}
+	// subscriptioncmds.c:632 — an unspecified slot_name defaults to the
+	// subscription name; `slot_name = NONE` leaves it empty.
+	slotName := opts.slotName
+	if !opts.specified["slot_name"] {
+		slotName = s.Name
+	}
+	if err := checkConninfoSyntax(s.Conninfo, s.Pos()); err != nil {
+		return err
+	}
+	if err := checkDuplicatesInPublist(s.Publications, s.Pos()); err != nil {
+		return err
+	}
+	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, opts.enabled, o.currentDDLOwnerOID(), subDBOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -2598,14 +2638,15 @@ afterExistsCheck:
 	if s.WithOIDS {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tables declared WITH OIDS are not supported"}
 	}
-	// Validate storage parameter names: double-quoted names are case-sensitive,
-	// and all recognized option names are lowercase. A mixed-case key means the
-	// user wrote WITH ("Fillfactor" = 10) which PG rejects as unrecognized.
-	for k := range s.With {
-		if k != strings.ToLower(k) {
-			return &ExecError{Code: "42000", Pos: s.Pos(),
-				Message: fmt.Sprintf("unrecognized parameter %q", k)}
-		}
+	// Validate storage parameter names and namespaces against PG's reloption
+	// registry (reloptions_catalog.go). This subsumes the old mixed-case-only
+	// check — double-quoted names are case-sensitive and every recognized name
+	// is lowercase, so WITH ("Fillfactor" = 10) simply misses the registry —
+	// and additionally rejects names nothing below looks for, which used to be
+	// silently accepted and dropped. Heap relations declare the `toast`
+	// namespace (DefineRelation passes HEAP_RELOPT_NAMESPACES). M0134-0160.
+	if verr := validateRelOptionMap(s.With, relOptHeap, true, true, s.Pos()); verr != nil {
+		return verr
 	}
 	// Extract and bounds-check the fillfactor storage parameter so it can be
 	// persisted on the catalog table (and surfaced through pg_class.reloptions
@@ -4972,12 +5013,10 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		return &ExecError{Code: "42P16", Pos: s.Pos(),
 			Message: "ON COMMIT can only be used on temporary tables"}
 	}
-	// Validate storage parameter names (same rule as execCreateTable).
-	for k := range s.With {
-		if k != strings.ToLower(k) {
-			return &ExecError{Code: "42000", Pos: s.Pos(),
-				Message: fmt.Sprintf("unrecognized parameter %q", k)}
-		}
+	// Validate storage parameter names/namespaces (same rule as execCreateTable).
+	// M0134-0160.
+	if verr := validateRelOptionMap(s.With, relOptHeap, true, true, s.Pos()); verr != nil {
+		return verr
 	}
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
 		// No storage: create an empty table with no columns.
@@ -5133,11 +5172,8 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// the leaf's fillfactor persists on pg_class.reloptions and round-trips
 	// through pg_dump, mirroring the non-partition CREATE TABLE path above.
 	// M0110-0001 (DU-002 slice 191).
-	for k := range s.With {
-		if k != strings.ToLower(k) {
-			return &ExecError{Code: "42000", Pos: s.Pos(),
-				Message: fmt.Sprintf("unrecognized parameter %q", k)}
-		}
+	if verr := validateRelOptionMap(s.With, relOptHeap, true, true, s.Pos()); verr != nil {
+		return verr
 	}
 	if s.PartitionBy != nil && len(s.With) > 0 {
 		return &ExecError{Code: "0A000", Pos: s.Pos(),
@@ -7479,6 +7515,51 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.String())}
 	}
+	// Resolve the access method, then verify it can handle the requested
+	// features — DefineIndex's own "look up the access method, verify it can
+	// handle the requested features" block (postgres/src/backend/commands/
+	// indexcmds.c:838-892), which runs BEFORE index_reloptions() and long
+	// before index_create()'s name-conflict test. M0134-0167.
+	method := strings.ToLower(strings.TrimSpace(s.Method))
+	if method == "rtree" {
+		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
+		method = "gist"
+	}
+	if method == "" {
+		method = "btree"
+	}
+	if aerr := checkIndexAMCapabilities(method, s); aerr != nil {
+		return aerr
+	}
+	// Validate the partial-index predicate's volatility — DefineIndex's
+	// `if (stmt->whereClause) CheckPredicate(...)` (indexcmds.c:905-906), which
+	// sits exactly here: after the access-method capability block and before
+	// transformRelOptions/index_reloptions. M0134-0170.
+	if s.HasPredicate {
+		if merr := checkIndexPredicateMutability(s.Predicate, o.ctx.Catalog, s.Pos()); merr != nil {
+			return merr
+		}
+	}
+	// Reject unrecognized `WITH (...)` names/namespaces before ANY other index
+	// check. DefineIndex runs index_reloptions() well before index_create()
+	// reaches the name-conflict test (postgres/src/backend/commands/
+	// indexcmds.c), which is observable: reloptions.sql re-uses one index name
+	// across its negative cases and expects `unrecognized parameter "x"`, not
+	// "relation already exists". The admissible set is the access method's
+	// (amoptions); indexes declare no namespace, so a qualified name is always
+	// an unrecognized namespace. M0134-0160.
+	if verr := validateRelOptionNames(s.WithOptionNames, indexRelOptKind(s.Method), false, false, s.Pos()); verr != nil {
+		return verr
+	}
+	// Then each expression key, ComputeIndexAttrs' own volatility test
+	// (indexcmds.c:2010-2019). It runs after index_reloptions and still ahead of
+	// index_create's name-conflict check, so an index name reused across
+	// negative cases keeps reporting the mutability error rather than
+	// "relation already exists" — the same ordering constraint M0134-0160
+	// established for the reloption check above. M0134-0170.
+	if merr := checkIndexExprMutability(s.ColExprs, o.ctx.Catalog, s.Pos()); merr != nil {
+		return merr
+	}
 	name := s.Name
 	if name == "" {
 		name = o.autoIndexNameWithIncludes(tbl, s.Columns, s.IncludeColumns, "idx")
@@ -7525,23 +7606,6 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		return &ExecError{Code: "22023", Pos: s.Pos(),
 			Message: fmt.Sprintf("value %d out of bounds for option \"pages_per_range\"", s.PagesPerRange),
 			Detail:  "Valid values are between \"1\" and \"131072\"."}
-	}
-	method := strings.ToLower(strings.TrimSpace(s.Method))
-	if method == "rtree" {
-		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
-		method = "gist"
-	}
-	if method == "" {
-		method = "btree"
-	}
-	// brin, gin, hash do not support INCLUDE columns; hash is silently upgraded
-	// to btree only when there are no INCLUDE columns. M0097-0023.
-	if len(s.IncludeColumns) > 0 {
-		switch method {
-		case "brin", "gin", "hash":
-			return &ExecError{Code: "0A000", Pos: s.Pos(),
-				Message: fmt.Sprintf("access method \"%s\" does not support included columns", method)}
-		}
 	}
 	// goopg has no native hash access method: a hash index is built on the
 	// B-tree substrate. The catalog Method stays "btree" (pg_am / pg_dump
@@ -8726,8 +8790,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					// catalog fields so pg_class.reloptions / pg_dump round-trip the
 					// change; only GIN fastupdate has runtime effect (toggles the
 					// predicate-gin SSI lock granularity between per-key and
-					// whole-index, design 0118-0140). Unrecognized options are
-					// accepted and ignored, matching the CREATE INDEX WITH path.
+					// whole-index, design 0118-0140). Names outside the access
+					// method's admissible set are rejected the way
+					// ATExecSetRelOptions -> index_reloptions() does; the
+					// recognized-but-unapplied ones are still ignored (ledgered,
+					// M0134-0160).
+					if verr := validateRelOptionMap(act.With, indexRelOptKind(idx.Method), false, false, act.Pos()); verr != nil {
+						return verr
+					}
 					for name, val := range act.With {
 						if strings.EqualFold(name, "fastupdate") {
 							if b, ok := parseReloptionBool(val); ok {
@@ -11400,13 +11470,21 @@ func (o *ddlOp) execAlterTableSetReloptions(tbl *catalog.Table, act parser.Alter
 		autovacEnabled   *bool
 		toastTupleTarget *int
 	)
+	// Validate every name/namespace against PG's reloption registry before
+	// applying anything. ATExecSetRelOptions picks the admissible set by
+	// relkind — view_reloptions for RELKIND_VIEW, heap_reloptions otherwise
+	// (postgres/src/backend/commands/tablecmds.c) — and passes
+	// HEAP_RELOPT_NAMESPACES either way. This subsumes the old mixed-case-only
+	// check and additionally rejects names the switch below silently dropped.
+	// M0134-0160.
+	setKind := relOptHeap
+	if tbl.View != nil && !tbl.IsMatView {
+		setKind = relOptView
+	}
+	if verr := validateRelOptionMap(act.With, setKind, true, false, pos); verr != nil {
+		return verr
+	}
 	for k, v := range act.With {
-		// Double-quoted mixed-case names are unrecognized (PG/CREATE reject them);
-		// all modeled option names are lowercase.
-		if k != strings.ToLower(k) {
-			return &ExecError{Code: "42000", Pos: pos,
-				Message: fmt.Sprintf("unrecognized parameter %q", k)}
-		}
 		switch k {
 		case "parallel_workers":
 			pw, convErr := strconv.Atoi(strings.TrimSpace(v))
@@ -11500,6 +11578,10 @@ func (o *ddlOp) execAlterTableSetReloptions(tbl *catalog.Table, act parser.Alter
 	}
 	if fillfactor != nil {
 		tbl.Fillfactor = *fillfactor
+		// Drop this session's memoised reserve so the next insert re-reads
+		// it (M0134-0175a); PG gets the same effect from relcache
+		// invalidation on the ALTER.
+		o.ctx.invalidateHeapFillfactor(tbl.OID)
 	}
 	if autovacEnabled != nil {
 		tbl.AutovacuumEnabled = *autovacEnabled
@@ -11522,6 +11604,7 @@ func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.Alt
 			tbl.ParallelWorkersSet = false
 		case "fillfactor":
 			tbl.Fillfactor = 0
+			o.ctx.invalidateHeapFillfactor(tbl.OID)
 		case "autovacuum_enabled":
 			tbl.AutovacuumEnabled = false
 			tbl.AutovacuumEnabledSet = false
@@ -18555,7 +18638,12 @@ func resolveReplicaIdentityIndex(ctx *Context, tbl *catalog.Table, indexName str
 		return nil, &ExecError{Code: "42809", Pos: pos,
 			Message: fmt.Sprintf("cannot use non-unique index %q as replica identity", idx.Name)}
 	}
-	if idx.InitiallyDeferred {
+	// PG: `if (!indexRel->rd_index->indimmediate)` (tablecmds.c:18550). The
+	// predicate is DEFERRABLE alone — a `UNIQUE (…) DEFERRABLE` constraint is
+	// non-immediate even though it is INITIALLY IMMEDIATE. Keying this on
+	// InitiallyDeferred (as it did before M0134-0161) silently ACCEPTED such
+	// an index as replica identity, which PG rejects.
+	if !idx.IsImmediate() {
 		return nil, &ExecError{Code: "0A000", Pos: pos,
 			Message: fmt.Sprintf("cannot use non-immediate index %q as replica identity", idx.Name)}
 	}
@@ -22506,6 +22594,61 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 	return nil
 }
 
+// resolveTSTokenTypes mirrors getTokenTypes (tsearchcmds.c:1229) — the
+// translation every ALTER TEXT SEARCH CONFIGURATION mapping form runs on its
+// `FOR tok [, ...]` list before it touches pg_ts_config_map. Upstream calls it
+// from both MakeConfigurationMapping (ADD / ALTER / ALTER ... REPLACE) and
+// DropConfigurationMapping, and it does two things goopg's mapping paths were
+// missing:
+//
+//   - DEDUPLICATION ("Duplicated entries list are removed from tokennames").
+//     A repeated token is silently skipped, so `DROP MAPPING FOR word, word`
+//     deletes once and SUCCEEDS, `ADD MAPPING FOR word, word WITH d` inserts
+//     one row instead of colliding on pg_ts_config_map_index, and
+//     `DROP MAPPING IF EXISTS FOR word, word` emits ONE skip NOTICE.
+//   - PARSER VALIDATION. Every name is looked up in the configuration's
+//     parser's lextype table — for the only parser goopg has, the built-in
+//     "default" (catalog.DefaultParserTokenTypes, which
+//     catalog.TSTokenTypeID indexes). An unknown name raises
+//     ERRCODE_INVALID_PARAMETER_VALUE (22023) "token type %q does not
+//     exist". This runs BEFORE any mapping lookup and before the dictionary
+//     names are resolved, and — unlike the "mapping for token type ... does
+//     not exist" miss below it — is NOT downgraded to a NOTICE by
+//     DROP MAPPING's IF EXISTS: missing_ok covers a missing MAPPING, never a
+//     token type the parser cannot emit.
+//
+// An empty input list stays empty (upstream returns NIL): that is the bare
+// `ALTER MAPPING REPLACE old WITH new` form, where "no tokens named" means
+// "every mapped token", not "no tokens".
+//
+// The token names arrive already lower-cased from the parser
+// (parseTSTokenTypeCommaList), so the case-insensitive lookup here and
+// upstream's strcmp against the lextype alias agree for every unquoted
+// spelling. M0134-0178 (tsdicts.sql).
+func resolveTSTokenTypes(tokenTypes []string) ([]string, error) {
+	if len(tokenTypes) == 0 {
+		return tokenTypes, nil
+	}
+	result := make([]string, 0, len(tokenTypes))
+	seen := make(map[string]struct{}, len(tokenTypes))
+	for _, tt := range tokenTypes {
+		// Skip if this token is already in the result (upstream's
+		// tstoken_list_member check, which precedes the lextype scan).
+		if _, dup := seen[tt]; dup {
+			continue
+		}
+		seen[tt] = struct{}{}
+		if _, ok := catalog.TSTokenTypeID(tt); !ok {
+			return nil, &ExecError{
+				Code:    "22023",
+				Message: fmt.Sprintf("token type %q does not exist", tt),
+			}
+		}
+		result = append(result, tt)
+	}
+	return result, nil
+}
+
 // execAlterTSConfigAddMapping implements ALTER TEXT SEARCH CONFIGURATION name
 // ADD MAPPING FOR tokentype [, ...] WITH dictionary [, ...] — appends one
 // pg_ts_config_map entry per named token type so pg_dump's dumpTSConfig
@@ -22515,6 +22658,10 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 // then user-created dictionaries (CREATE TEXT SEARCH DICTIONARY) in the same
 // schema as the configuration. DU-002 slice 446 (M0119-0004).
 func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	tokenTypes, err := resolveTSTokenTypes(s.TokenTypes)
+	if err != nil {
+		return err
+	}
 	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
 	for _, dn := range s.Dictionaries {
 		oid, err := resolveTSDictOID(im, dn)
@@ -22523,7 +22670,7 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 		}
 		dictOIDs = append(dictOIDs, oid)
 	}
-	for _, tt := range s.TokenTypes {
+	for _, tt := range tokenTypes {
 		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
@@ -22586,6 +22733,10 @@ func resolveTSDictOID(im *catalog.InMemory, dn parser.ObjectName) (uint32, error
 // unresolvable dictionary name or configuration. DU-002 replacedict
 // follow-up (M0119-0004).
 func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	tokenTypes, err := resolveTSTokenTypes(s.TokenTypes)
+	if err != nil {
+		return err
+	}
 	oldOID, err := resolveTSDictOID(im, s.OldDict)
 	if err != nil {
 		return err
@@ -22594,7 +22745,7 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 	if err != nil {
 		return err
 	}
-	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, tokenTypes, oldOID, newOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if uc == nil {
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 	}
@@ -22614,6 +22765,10 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 // inserts the new list, so re-pointing an existing mapping is exactly what
 // this statement is for. DU-002 slice 446 follow-up (M0119-0004).
 func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	tokenTypes, err := resolveTSTokenTypes(s.TokenTypes)
+	if err != nil {
+		return err
+	}
 	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
 	for _, dn := range s.Dictionaries {
 		oid, err := resolveTSDictOID(im, dn)
@@ -22622,7 +22777,7 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 		}
 		dictOIDs = append(dictOIDs, oid)
 	}
-	for _, tt := range s.TokenTypes {
+	for _, tt := range tokenTypes {
 		uc := im.AlterTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
@@ -22644,7 +22799,11 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 // "mapping for token type \"%s\" does not exist" unless IF EXISTS is given,
 // in which case it is a NOTICE). DU-002 slice 446 follow-up (M0119-0004).
 func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
-	for _, tt := range s.TokenTypes {
+	tokenTypes, err := resolveTSTokenTypes(s.TokenTypes)
+	if err != nil {
+		return err
+	}
+	for _, tt := range tokenTypes {
 		uc, found := im.DropTSConfigMapping(s.ConfigName.Name, schema, tt, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}

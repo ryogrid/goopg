@@ -173,6 +173,17 @@ type FrameWriter struct {
 	// ROLLBACK and then hit 25P02 on the next BEGIN (AI-20260810-011258-006).
 	TxStatusFn func(afterError bool) TransactionStatus
 
+	// ClientMinMessagesFn, when non-nil, supplies the connection's current
+	// client_min_messages GUC value. WriteNoticeResponse consults it to
+	// decide whether a NOTICE/WARNING is visible to this client, mirroring
+	// should_output_to_client in postgres/src/backend/utils/error/elog.c.
+	// The server installs it from runPostStartupLoop, which is also why a
+	// nil hook means "send everything": messages emitted before the startup
+	// handshake completes are unfiltered, matching upstream's
+	// ClientAuthInProgress carve-out (client_min_messages is honored only
+	// after authentication).
+	ClientMinMessagesFn func() string
+
 	// M0092-0004: per-connection scratch buffers for WriteDataRowReuse.
 	// Reused across rows AND across statements on the same connection
 	// (pgbench-style workloads issue many single-row SELECTs in a row).

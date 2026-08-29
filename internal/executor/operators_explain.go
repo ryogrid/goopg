@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -769,6 +770,12 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Key: " + strings.Join(parts, ", "))})
 		}
 	case *optimizer.SeqScan:
+		// TABLESAMPLE's `Sampling:` line (explain.c show_tablesample,
+		// M0134-0175). Upstream prints it BEFORE any Filter, and prints
+		// REPEATABLE only when the clause carried one.
+		if p.TableSample != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Sampling: " + formatTableSample(p.TableSample, reg, qualify))})
+		}
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
@@ -1812,13 +1819,13 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		// relation scanned twice without an alias prints two
 		// distinguishable labels (e.g. "nation" / "nation_1").
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return parallelPrefix + "Seq Scan on " + dname
+			return parallelPrefix + seqScanLabel(p) + " on " + dname
 		}
 		tname := schemaQualify(p.Table.QualifiedName())
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("%sSeq Scan on %s %s", parallelPrefix, tname, p.Alias)
+			return fmt.Sprintf("%s%s on %s %s", parallelPrefix, seqScanLabel(p), tname, p.Alias)
 		}
-		return parallelPrefix + "Seq Scan on " + tname
+		return parallelPrefix + seqScanLabel(p) + " on " + tname
 	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
@@ -1967,12 +1974,12 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return parallelPrefix + "Seq Scan on " + dname
+			return parallelPrefix + seqScanLabel(p) + " on " + dname
 		}
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("%sSeq Scan on %s %s", parallelPrefix, p.Table.QualifiedName(), p.Alias)
+			return fmt.Sprintf("%s%s on %s %s", parallelPrefix, seqScanLabel(p), p.Table.QualifiedName(), p.Alias)
 		}
-		return fmt.Sprintf("%sSeq Scan on %s", parallelPrefix, p.Table.QualifiedName())
+		return fmt.Sprintf("%s%s on %s", parallelPrefix, seqScanLabel(p), p.Table.QualifiedName())
 	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
@@ -2273,4 +2280,112 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 		return []optimizer.Node{p.Child}
 	}
 	return nil
+}
+
+// seqScanLabel returns the node label for a SeqScan: "Sample Scan" when the
+// scan carries a TABLESAMPLE clause, "Seq Scan" otherwise. Upstream reaches the
+// same two strings from two different plan node tags (T_SampleScan /
+// T_SeqScan, explain.c:1189-1195); goopg has one scan node, so the label is a
+// property of the node rather than of its type. M0134-0175.
+//
+// Note the "Parallel " prefix composes with either — upstream prints
+// "Parallel Seq Scan" and would print "Parallel Sample Scan" identically,
+// since the prefix is applied to whichever label the tag selected.
+func seqScanLabel(p *optimizer.SeqScan) string {
+	if p.TableSample != nil {
+		return "Sample Scan"
+	}
+	return "Seq Scan"
+}
+
+// formatTableSample renders the `Sampling:` line's payload —
+// `<method> (<args>) [REPEATABLE (<seed>)]`, mirroring show_tablesample
+// (explain.c:3021-3054). M0134-0175.
+//
+// The argument deparse is where this can drift from the oracle, and the reason
+// is worth stating: upstream COERCES each argument to the method's declared
+// parameter type (float4) during parse analysis, so a literal `50` reaches
+// EXPLAIN as a float4 Const and deparses as `'50'::real`, and `10*2` reaches it
+// already constant-folded as `'20'::real`. goopg does not coerce the argument,
+// so the same deparse has to be synthesised here: a numeric constant is
+// re-rendered in upstream's coerced form, and anything else falls through to
+// the ordinary expression printer.
+func formatTableSample(ts *optimizer.TableSampleSpec, reg *subPlanReg, qualify bool) string {
+	args := make([]string, 0, len(ts.Args))
+	for _, a := range ts.Args {
+		args = append(args, formatSampleArg(a, reg, qualify, "real"))
+	}
+	out := ts.Method + " (" + strings.Join(args, ", ") + ")"
+	if ts.Repeatable != nil {
+		out += " REPEATABLE (" + formatSampleArg(ts.Repeatable, reg, qualify, "double precision") + ")"
+	}
+	return out
+}
+
+// formatSampleArg deparses one TABLESAMPLE argument in upstream's coerced
+// form. A constant that evaluates to a number prints as `'<v>'::<typ>`, which
+// is what a Const of that type deparses to in ruleutils.c; everything else
+// (a Var from a LATERAL outer reference, say) prints through the ordinary
+// expression printer, matching upstream's `Sampling: bernoulli
+// ("*VALUES*".column1)`.
+func formatSampleArg(e optimizer.Expr, reg *subPlanReg, qualify bool, typ string) string {
+	if v, ok := constSampleValue(e); ok {
+		return "'" + v + "'::" + typ
+	}
+	return formatExprQual(e, reg, qualify)
+}
+
+// constSampleValue folds a TABLESAMPLE argument to its numeric value when the
+// expression is a constant one, returning it in PG's float4 output form.
+//
+// This exists because upstream folds these constants during parse analysis
+// (eval_const_expressions, run before EXPLAIN ever sees the plan), so
+// `TABLESAMPLE SYSTEM (10*2)` reaches show_tablesample as a single Const and
+// prints `'20'::real`. goopg keeps the BinaryOp tree, so the fold has to happen
+// at print time. Only the four arithmetic operators appear in the regress
+// corpus and only they are folded here; anything else returns ok=false and
+// falls back to the ordinary expression deparse, which is the safe direction —
+// a wrong EXPLAIN string is worse than a differently-shaped one. M0134-0175.
+func constSampleValue(e optimizer.Expr) (string, bool) {
+	f, ok := constSampleFloat(e)
+	if !ok {
+		return "", false
+	}
+	return PGFloatOut(f, 32), true
+}
+
+func constSampleFloat(e optimizer.Expr) (float64, bool) {
+	switch v := e.(type) {
+	case *optimizer.IntegerConst:
+		return float64(v.Value), true
+	case *optimizer.NumericConst:
+		f, err := strconv.ParseFloat(v.Value, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case *optimizer.BinaryOp:
+		l, ok := constSampleFloat(v.Left)
+		if !ok {
+			return 0, false
+		}
+		r, ok := constSampleFloat(v.Right)
+		if !ok {
+			return 0, false
+		}
+		switch v.Op {
+		case parser.OpAdd:
+			return l + r, true
+		case parser.OpSub:
+			return l - r, true
+		case parser.OpMul:
+			return l * r, true
+		case parser.OpDiv:
+			if r == 0 {
+				return 0, false
+			}
+			return l / r, true
+		}
+	}
+	return 0, false
 }

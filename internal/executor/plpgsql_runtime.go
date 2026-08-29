@@ -84,6 +84,17 @@ type plpgsqlFrame struct {
 	// whether the underlying query produced at least one row, and read via a
 	// bare `FOUND` reference. M0118-0009 (design 0118-0097).
 	found bool
+	// outParamNames lists the OUT / INOUT / RETURNS TABLE parameter names of
+	// this routine. They are registered as ordinary NULL frame variables (see
+	// the ArgModes loop in the frame builder), which makes them indistinguishable
+	// from a local — but they are *result column names* by construction, so a
+	// `RETURN QUERY select a from t` in a `RETURNS TABLE (a int)` function must
+	// resolve `a` to the table column, not to the always-NULL variable.
+	// PostgreSQL settles the same collision with plpgsql.variable_conflict
+	// (default `error`); goopg's text substitution cannot detect ambiguity, so
+	// it keeps the column — the pre-existing behaviour and the only one that
+	// does not silently NULL out the query. M0134-0172.
+	outParamNames []string
 }
 
 // plpgsqlTrigCtx holds the trigger execution context injected into
@@ -972,6 +983,7 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 				typ = normalizeCatalogType(r.ArgTypes[i])
 			}
 			_ = frame.add(r.ArgNames[i], typ, NullDatum) // ignore dup (INOUT already added)
+			frame.outParamNames = append(frame.outParamNames, r.ArgNames[i])
 		}
 	}
 	for _, d := range block.Declarations {
@@ -1722,6 +1734,19 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 	case *plpgsql.ReturnQueryStmt:
 		// RETURN QUERY SELECT — run query and append all result rows to SETOF accumulator.
 		sql := s.QuerySrc
+		// The query text is planned as plain SQL, so every PL/pgSQL variable it
+		// references must be substituted first — exactly as the SelectIntoStmt
+		// and execPLpgSQLEmbeddedSQL siblings do. Without this NO frame variable
+		// worked here (not even a function parameter): `return query select v+n`
+		// planned `v`/`n` as missing columns and raised 42703. M0134-0172.
+		if frame.trig != nil {
+			sql = substituteTriggerRefs(sql, frame.trig)
+		}
+		// The routine's own OUT / RETURNS TABLE column names are excluded: they
+		// are always-NULL frame variables that shadow the result column names,
+		// so substituting them would rewrite `select a from t` to
+		// `select NULL from t`. See plpgsqlFrame.outParamNames.
+		sql = substitutePlpgsqlFrameVarsInSQL(sql, frame, frame.outParamNames...)
 		stmts, perr := parser.Parse(sql)
 		if perr != nil || len(stmts) == 0 {
 			return Datum{}, flowNone, &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("RETURN QUERY: %v", perr)}
@@ -1984,6 +2009,17 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// FOR rec IN EXECUTE expr LOOP — dynamic SQL cursor. M0097-0073.
 		// The captured SQL text starts with EXECUTE; evaluate the rest as an
 		// expression to get the actual SQL string.
+		if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "EXECUTE ") {
+			// Static query form: substitute frame variables before planning, as
+			// the SelectIntoStmt / execPLpgSQLEmbeddedSQL siblings do. Without
+			// this `for r in select a from t where a >= v loop` planned `v` as a
+			// missing column and raised 42703. The EXECUTE form is deliberately
+			// excluded — there the variables are passed via USING and the string
+			// is PG-opaque. The loop's own record variable is excluded so a
+			// stale binding from a previous iteration cannot be substituted into
+			// the query that produces the next one. M0134-0172.
+			sql = substitutePlpgsqlFrameVarsInSQL(sql, frame, append([]string{s.Var}, frame.outParamNames...)...)
+		}
 		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "EXECUTE ") {
 			exprText := strings.TrimSpace(sql[strings.IndexByte(sql, ' '):])
 			sqlExpr, parseErr := parser.ParseExpr(exprText)
@@ -3381,7 +3417,17 @@ func splitTopLevelCommas(s string) []string {
 // Two passes: first varname[N] subscripts, then bare identifier references.
 // A preceding or following "." is treated as a table/column qualifier and suppresses substitution.
 // String literals and double-quoted identifiers are skipped.
-func substitutePlpgsqlFrameVarsInSQL(sql string, frame *plpgsqlFrame) string {
+// Names listed in `except` are never substituted — used by the FOR-IN-query
+// loop to shield its own record variable from a stale previous binding.
+func substitutePlpgsqlFrameVarsInSQL(sql string, frame *plpgsqlFrame, except ...string) string {
+	excluded := func(name string) bool {
+		for _, e := range except {
+			if strings.EqualFold(e, name) {
+				return true
+			}
+		}
+		return false
+	}
 	// Pass 1: substitute varname[N] patterns (array subscripts).
 	var p1 strings.Builder
 	i := 0
@@ -3398,28 +3444,42 @@ func substitutePlpgsqlFrameVarsInSQL(sql string, frame *plpgsqlFrame) string {
 				for k < len(sql) && sql[k] >= '0' && sql[k] <= '9' {
 					k++
 				}
-				if k < len(sql) && sql[k] == ']' && k > numStart {
+				// A leading "." makes this a qualified name (r.tmp[1]), not a
+				// bare frame variable — leave it for pass 2's record-field arm.
+				precededByDot := i > 0 && sql[i-1] == '.'
+				if k < len(sql) && sql[k] == ']' && k > numStart && !precededByDot && !excluded(varName) {
 					idxStr := sql[numStart:k]
 					if idx64, err2 := strconv.ParseInt(idxStr, 10, 64); err2 == nil {
 						if fi, ok := frame.lookup(varName); ok {
 							val := frame.values[fi]
-							if !val.IsNull() {
-								elems := parseTextArray(val.StringValue())
-								var elemIdx int
-								if strings.EqualFold(varName, "tg_argv") {
-									elemIdx = int(idx64) // tg_argv is 0-based
-								} else {
-									elemIdx = int(idx64) - 1 // regular PL/pgSQL arrays are 1-based
-								}
-								if elemIdx >= 0 && elemIdx < len(elems) {
-									escaped := strings.ReplaceAll(elems[elemIdx], "'", "''")
-									p1.WriteByte('\'')
-									p1.WriteString(escaped)
-									p1.WriteByte('\'')
-									i = k + 1
-									continue
-								}
+							// A subscript of a NULL array, or one outside the
+							// array's bounds, yields NULL in PostgreSQL
+							// (array_subscript / ExecEvalSubscriptingRef in
+							// execExprInterp.c). Emitting the bare `tmp[1]` text
+							// instead made the planner resolve `tmp` as a column
+							// and raise 42703. M0134-0172.
+							if val.IsNull() {
+								p1.WriteString("NULL")
+								i = k + 1
+								continue
 							}
+							elems := parseTextArray(val.StringValue())
+							var elemIdx int
+							if strings.EqualFold(varName, "tg_argv") {
+								elemIdx = int(idx64) // tg_argv is 0-based
+							} else {
+								elemIdx = int(idx64) - 1 // regular PL/pgSQL arrays are 1-based
+							}
+							if elemIdx >= 0 && elemIdx < len(elems) {
+								escaped := strings.ReplaceAll(elems[elemIdx], "'", "''")
+								p1.WriteByte('\'')
+								p1.WriteString(escaped)
+								p1.WriteByte('\'')
+							} else {
+								p1.WriteString("NULL")
+							}
+							i = k + 1
+							continue
 						}
 					}
 				}
@@ -3482,7 +3542,7 @@ func substitutePlpgsqlFrameVarsInSQL(sql string, frame *plpgsqlFrame) string {
 			// plain table.column reference (varName is not a record var) falls
 			// through untouched, so a real column qualifier is unaffected.
 			// M0118-0008 (plpgsql-toast fetch-after-commit).
-			if !preceded && j < len(s1) && s1[j] == '.' && frame.isRecordVar(varName) {
+			if !preceded && !excluded(varName) && j < len(s1) && s1[j] == '.' && frame.isRecordVar(varName) {
 				k := j + 1
 				if k < len(s1) && isIdentStartByte(s1[k]) {
 					f := k
@@ -3499,7 +3559,7 @@ func substitutePlpgsqlFrameVarsInSQL(sql string, frame *plpgsqlFrame) string {
 					}
 				}
 			}
-			if !preceded && !followed {
+			if !preceded && !followed && !excluded(varName) {
 				if fi, ok := frame.lookup(varName); ok {
 					out.WriteString(datumToSQLLiteral(frame.values[fi]))
 					i = j

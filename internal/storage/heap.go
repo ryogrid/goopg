@@ -31,6 +31,28 @@ const (
 	// const initialisers cannot call a helper: (23+7)/8*8 = 24.
 	MaxHeapTuplesPerPage = (BlockSize - SizeOfPageHeaderData) /
 		((SizeOfHeapTupleHeaderData+7)/8*8 + itemIDSize)
+
+	// MaxHeapTupleSize is the largest maxaligned tuple body that can be
+	// stored on an otherwise empty heap page, mirroring PG's macro
+	// (postgres/src/include/access/htup_details.h:561):
+	// BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(ItemIdData)).
+	// 8160 for an 8 KiB page.
+	MaxHeapTupleSize = BlockSize - (SizeOfPageHeaderData+7)/8*8 - (itemIDSize+7)/8*8
+
+	// HeapDefaultFillfactor mirrors PG's HEAP_DEFAULT_FILLFACTOR
+	// (postgres/src/include/utils/rel.h:360): a table with no explicit
+	// `fillfactor` reloption reserves no free space, so inserts pack pages
+	// as tightly as the tuples allow.
+	HeapDefaultFillfactor = 100
+
+	// nearlyEmptyFreeSpace mirrors the identically-named local in PG's
+	// RelationGetBufferForTuple (postgres/src/backend/access/heap/hio.c:546).
+	// Pages without tuples can still carry line pointers, so upstream treats
+	// a page as "empty enough" once the unavailable space is slight; the
+	// threshold caps the fillfactor reserve so a low-fillfactor table with a
+	// large tuple cannot demand more free space than a brand-new page has,
+	// which would extend the relation forever. 8016 for an 8 KiB page.
+	nearlyEmptyFreeSpace = MaxHeapTupleSize - (MaxHeapTuplesPerPage/8)*itemIDSize
 )
 
 var (
@@ -580,6 +602,70 @@ func PageLinePointerCount(p Page) (int, error) {
 		return 0, fmt.Errorf("invalid line pointer area size: lower=%d", lower)
 	}
 	return (lower - SizeOfPageHeaderData) / itemIDSize, nil
+}
+
+// PageGetHeapFreeSpace reports how many bytes of tuple payload the page can
+// still accept, mirroring PG's PageGetHeapFreeSpace
+// (postgres/src/backend/storage/page/bufpage.c:988) layered over
+// PageGetFreeSpace (bufpage.c:907): the gap between the line-pointer array
+// and the tuple region, minus the one line pointer the new tuple needs.
+//
+// The result is directly comparable to a MAXALIGNed tuple length, so
+// `maxAlign8(len(raw)) <= PageGetHeapFreeSpace(p)` is exactly the condition
+// PageAddHeapTuple checks internally.
+//
+// Divergence from upstream, deliberate: PG's version answers 0 once the page
+// holds MaxHeapTuplesPerPage line pointers *unless* PD_HAS_FREE_LINES says a
+// dead pointer can be recycled. goopg's PageAddHeapTuple always appends a
+// fresh line pointer and never recycles, so the unconditional 0 is the
+// accurate answer for this allocator.
+func PageGetHeapFreeSpace(p Page) int {
+	h, err := Header(p)
+	if err != nil {
+		return 0
+	}
+	space := h.FreeSpace()
+	if space < itemIDSize {
+		return 0
+	}
+	space -= itemIDSize
+	if space > 0 {
+		if n, err := PageLinePointerCount(p); err != nil || n >= MaxHeapTuplesPerPage {
+			return 0
+		}
+	}
+	return space
+}
+
+// HeapInsertTargetFreeSpace returns the amount of free space an *existing*
+// heap page must have before an insert of a tupleLen-byte tuple may land on
+// it, mirroring the targetFreeSpace computation at the head of PG's
+// RelationGetBufferForTuple (postgres/src/backend/access/heap/hio.c:520-556).
+//
+// This is where the `fillfactor` reloption acquires its meaning: the reserve
+// `BLCKSZ * (100 - fillfactor) / 100` is added to the tuple length, so a page
+// stops accepting inserts while it still holds that much free space — the
+// room later HOT updates need to keep a new row version on the same page.
+// fillfactor <= 0 means "unset", i.e. HeapDefaultFillfactor, which makes the
+// reserve zero and the result plain maxAlign8(tupleLen).
+//
+// The nearlyEmptyFreeSpace clamp is upstream's and load-bearing: without it a
+// fillfactor=10 table holding 4 KiB tuples would demand ~11 KiB of free space
+// on an 8 KiB page, so no page — not even a freshly extended one — could ever
+// satisfy the target and the relation would extend without bound.
+func HeapInsertTargetFreeSpace(tupleLen, fillfactor int) int {
+	length := maxAlign8(tupleLen)
+	if fillfactor <= 0 {
+		fillfactor = HeapDefaultFillfactor
+	}
+	saveFreeSpace := BlockSize * (100 - fillfactor) / 100
+	if length+saveFreeSpace > nearlyEmptyFreeSpace {
+		if length > nearlyEmptyFreeSpace {
+			return length
+		}
+		return nearlyEmptyFreeSpace
+	}
+	return length + saveFreeSpace
 }
 
 // PageAddHeapTuple appends a tuple to the page and returns the 1-based

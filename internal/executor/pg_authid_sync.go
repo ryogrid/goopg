@@ -56,7 +56,7 @@ func pgAuthidSyncCols() []catalog.Column {
 // NULL, since goopg's timestamptz type has no infinity representation yet
 // (see the deferral ledger) — narrower than the original gap, which lost
 // every VALID UNTIL value, not just the sentinel ones.
-func buildAuthidUserRow(oid int64, rolname string, super, canLogin, createDB, createRole, replication, bypassRLS bool, connLimit int32, rolpassword, validUntil string) Row {
+func buildAuthidUserRow(oid int64, rolname string, super, canLogin, inherit, createDB, createRole, replication, bypassRLS bool, connLimit int32, rolpassword, validUntil string) Row {
 	validUntilDatum := NullDatum
 	if validUntil != "" {
 		if t, err := parseCopyTimestamp(validUntil); err == nil {
@@ -70,7 +70,7 @@ func buildAuthidUserRow(oid int64, rolname string, super, canLogin, createDB, cr
 		NewIntDatum(oid),
 		NewStringDatum(rolname),
 		NewBoolDatum(super),
-		NewBoolDatum(true), // rolinherit — PG default
+		NewBoolDatum(inherit), // rolinherit (M0134-0162; was hardcoded to PG's 't' default)
 		NewBoolDatum(createRole),
 		NewBoolDatum(createDB),
 		NewBoolDatum(canLogin),

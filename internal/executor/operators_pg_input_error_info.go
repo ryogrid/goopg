@@ -113,15 +113,18 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 				sqlCode = ee.Code
 			}
 		}
-	case "float4", "real":
-		if _, ferr := strconv.ParseFloat(v, 32); ferr != nil {
-			message = "invalid input syntax for type real: \"" + v + "\""
-			sqlCode = "22P02"
+	case "float4", "real", "float8", "double precision":
+		// M0134-0166: a bare strconv.ParseFloat reported every failure as
+		// 22P02, so pg_input_error_info('1e4000','float8') claimed a syntax
+		// error where PG reports 22003 "is out of range for type double
+		// precision". floatIn is float8in_internal — float_in.go.
+		bits := 64
+		if t == "float4" || t == "real" {
+			bits = 32
 		}
-	case "float8", "double precision":
-		if _, ferr := strconv.ParseFloat(v, 64); ferr != nil {
-			message = "invalid input syntax for type double precision: \"" + v + "\""
-			sqlCode = "22P02"
+		if _, ferr := floatIn(v, bits); ferr != nil {
+			message = ferr.Message
+			sqlCode = ferr.Code
 		}
 	case "oid":
 		// For a single oid, PostgreSQL reports the full input string on error.

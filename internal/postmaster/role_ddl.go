@@ -81,7 +81,7 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		// PG defaults: CREATE USER implies LOGIN; CREATE ROLE/GROUP imply
 		// NOLOGIN (postgres/src/backend/commands/user.c CreateRole).
 		// Explicit LOGIN/NOLOGIN below overrides.
-		attrs := catalog.RoleAttrs{CanLogin: strings.HasPrefix(norm, "create user "), ConnLimit: -1}
+		attrs := catalog.RoleAttrs{CanLogin: strings.HasPrefix(norm, "create user "), Inherit: true, ConnLimit: -1}
 		if err := applyRoleAttrOptions(sql, norm, name, &attrs, resolveCurrent); err != nil {
 			return true, err
 		}
@@ -133,7 +133,7 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		// Start from the recorded attributes so an ALTER only changes what it
 		// names (PG semantics: unspecified attributes keep their value). The
 		// bootstrap superuser defaults to superuser+login.
-		attrs := catalog.RoleAttrs{CanLogin: isBootstrap, Superuser: isBootstrap, ConnLimit: -1}
+		attrs := catalog.RoleAttrs{CanLogin: isBootstrap, Superuser: isBootstrap, Inherit: true, ConnLimit: -1}
 		im, isInMem := s.cfg.Catalog.(*catalog.InMemory)
 		if isInMem {
 			if cur, found := im.LookupRoleAttrs(name); found {
@@ -221,8 +221,8 @@ func (s *Server) syncAuthidHeapRow(rolname string, oid uint32, attrs catalog.Rol
 	}
 	return s.runAuthidHeapTxn(func(ectx *executor.Context) error {
 		return executor.SyncAuthidRow(ectx, oid, rolname, attrs.Superuser, attrs.CanLogin,
-			attrs.CreateDB, attrs.CreateRole, attrs.Replication, attrs.BypassRLS,
-			attrs.ConnLimit, secret, attrs.ValidUntil)
+			attrs.Inherit, attrs.CreateDB, attrs.CreateRole, attrs.Replication,
+			attrs.BypassRLS, attrs.ConnLimit, secret, attrs.ValidUntil)
 	})
 }
 
@@ -352,7 +352,7 @@ func (s *Server) renameRole(name, newName string) error {
 	// just an attribute change that happens to touch rolname, so it rides the
 	// same per-row path as CREATE/ALTER.
 	var oid uint32
-	attrs := catalog.RoleAttrs{ConnLimit: -1}
+	attrs := catalog.RoleAttrs{Inherit: true, ConnLimit: -1}
 	if isInMem {
 		oid, _ = im.RoleOID(newName)
 		if a, ok := im.LookupRoleAttrs(newName); ok {
@@ -375,7 +375,8 @@ func isReservedRoleName(name string) bool {
 // the password literal (and the VALID UNTIL timestamp literal) must be taken
 // from it because normalizeCompatSQL lower-cases the whole line and would
 // corrupt a case-sensitive value. CREATEDB/CREATEROLE/REPLICATION/BYPASSRLS/
-// CONNECTION LIMIT/VALID UNTIL are recognised (DU-002 slice 439 follow-up);
+// CONNECTION LIMIT/VALID UNTIL are recognised (DU-002 slice 439 follow-up),
+// as is INHERIT/NOINHERIT (M0134-0162);
 // IN ROLE/ADMIN/ROLE/USER/SYSID (membership + the legacy numeric-OID clause)
 // remain unrecognised and ignored, matching the handler's historical
 // accept-and-ignore behaviour for options outside RoleAttrs' scope.
@@ -389,6 +390,15 @@ func applyRoleAttrOptions(sql, norm, role string, attrs *catalog.RoleAttrs, reso
 		attrs.CanLogin = false
 	} else if strings.Contains(norm, " login") {
 		attrs.CanLogin = true
+	}
+	// INHERIT/NOINHERIT (M0134-0162). The leading space that every option
+	// probe here relies on is what keeps this from self-matching the role
+	// NAME in roleattributes.sql's `CREATE ROLE regress_test_inherit WITH
+	// NOINHERIT` — "regress_test_inherit" is preceded by '_', not ' '.
+	if strings.Contains(norm, " noinherit") {
+		attrs.Inherit = false
+	} else if strings.Contains(norm, " inherit") {
+		attrs.Inherit = true
 	}
 	if strings.Contains(norm, " nocreatedb") {
 		attrs.CreateDB = false

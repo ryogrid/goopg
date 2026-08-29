@@ -579,7 +579,7 @@ create_table_stmt_as:
    goopg's AST carries both on CreateTableStmt, so one nonterminal serves both
    the plain and the column-alias spellings instead of doubling them. */
 ctas_source:
-		select_bare
+		SelectStmt
 			{
 				sel, _ := $1.(*SelectStmt)
 				$$ = &ctasSrc{sel: sel}
@@ -1924,9 +1924,9 @@ opt_COLUMN:
    `CREATE TEMP VIEW` outright. Sharing the modifier position with
    create_table_stmt removes the choice. */
 create_view_stmt:
-		CREATE opt_create_modifier VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } select_bare opt_check_option
+		CREATE opt_create_modifier VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } SelectStmt opt_check_option
 			{ $$ = buildView(yylex, false, $2, $4, $5, $6, $9, $10) }
-	| CREATE OR REPLACE opt_create_modifier VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } select_bare opt_check_option
+	| CREATE OR REPLACE opt_create_modifier VIEW qualified_name opt_name_list_p opt_view_with AS { yylex.(*lexerState).markSpanStart() } SelectStmt opt_check_option
 			{ $$ = buildView(yylex, true, $4, $6, $7, $8, $11, $12) }
 
 /* WITH [CASCADED|LOCAL] CHECK OPTION — legacy records "cascaded" for the
@@ -1960,7 +1960,7 @@ drop_view_stmt:
    [(aliases)] AS select [WITH [NO] DATA]. USING/WITH (opts)/TABLESPACE
    deferred (legacy fallback covers them via the modifier-fallback rule). */
 create_matview_stmt:
-		CREATE MATERIALIZED VIEW opt_if_not_exists qualified_name opt_name_list_p opt_table_am AS { yylex.(*lexerState).markSpanStart() } select_bare opt_with_data
+		CREATE MATERIALIZED VIEW opt_if_not_exists qualified_name opt_name_list_p opt_table_am AS { yylex.(*lexerState).markSpanStart() } SelectStmt opt_with_data
 			{
 				v := objectNameFromQn($5)
 				sel := $10.(*SelectStmt)

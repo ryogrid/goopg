@@ -231,7 +231,7 @@ func mustDatum(t *testing.T, f func() (Datum, error)) Datum {
 // FROM pg_authid` under a non-UTC session prints a different instant than the
 // plain SELECT of the same column.
 func TestPgAuthidValidUntilIsTimestampTZ(t *testing.T) {
-	row := buildAuthidUserRow(16385, "alice", false, true, false, false, false, false,
+	row := buildAuthidUserRow(16385, "alice", false, true, true /* inherit */, false, false, false, false,
 		-1, "", "2020-01-01 10:00:00+05:30")
 
 	var idx = -1

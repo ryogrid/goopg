@@ -114,13 +114,23 @@ func TestAlterTableSetReloptionsBounds(t *testing.T) {
 	if ee, ok := err.(*ExecError); !ok || ee.Code != "22023" {
 		t.Errorf("parallel_workers=2000: error = %v, want *ExecError 22023", err)
 	}
-	// An unrecognized lowercase option is accepted and ignored (CREATE parity);
-	// it must not error and must not appear in reloptions.
-	if err := runDDL(t, ctx, `ALTER TABLE b SET (no_such_option=1)`); err != nil {
-		t.Errorf("ALTER TABLE b SET (no_such_option=1): unexpected error %v", err)
+	// An unrecognized option is REJECTED (CREATE parity). Until M0134-0160 this
+	// case pinned the opposite — "accepted and ignored" — which was goopg
+	// behavior, not PG's: ATExecSetRelOptions runs heap_reloptions() over the
+	// merged array and parseRelOptions raises `unrecognized parameter "x"`
+	// (22023) for a name outside RELOPT_KIND_HEAP
+	// (postgres/src/backend/access/common/reloptions.c:1488).
+	err = runDDL(t, ctx, `ALTER TABLE b SET (no_such_option=1)`)
+	if err == nil {
+		t.Fatal("expected unrecognized-parameter error for no_such_option, got nil")
 	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "22023" ||
+		ee.Message != `unrecognized parameter "no_such_option"` {
+		t.Errorf("no_such_option=1: error = %v, want *ExecError 22023 unrecognized parameter", err)
+	}
+	// The rejected statement must leave no trace in reloptions.
 	if got := reloptCell(t, cat, "b"); got != "" {
-		t.Errorf("reloptions after ignored option = %q, want \"\" (NULL)", got)
+		t.Errorf("reloptions after rejected option = %q, want \"\" (NULL)", got)
 	}
 }
 

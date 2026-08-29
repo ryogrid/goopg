@@ -75,6 +75,7 @@
 %type <fexprs>	from_list opt_from_clause
 %type <fexpr>	table_ref
 %type <rvar>	base_table_ref
+%type <node>	tablesample_clause opt_repeatable_clause
 %type <jspec>	join_outer
 %type <node>	join_qual_opt opt_derived_alias group_clause opt_with_ordinality
 %type <node>	func_table_expr
@@ -105,7 +106,7 @@
 %type <node>	ext_opt
 %type <expr>	opt_policy_using opt_policy_check
 %type <str>	drop_compat_kind opclass_or_family drop_arg_type op_run op_char
-%type <qn>	any_operator_name
+%type <qn>	any_operator_name qual_op
 %type <str>	trig_arg comment_text alter_routine_kind alter_fn_owner
 %type <fargs>	opt_comment_args
 %type <qn>	trig_func
@@ -631,8 +632,13 @@ explainable_stmt:
                             carries the set-op and the trailing clauses, with
                             ORDER BY / LIMIT / OFFSET lifted off a BARE right
                             branch exactly as foldSetOps lifts them.
-   select_bare is legacy's parseSelect: NO leading '(' — CREATE VIEW's body and
-   CTAS's source reject `AS (SELECT 1)` there, so they take select_bare. */
+   select_bare is legacy's parseSelect: NO leading '('. It is the right choice
+   only where upstream ALSO refuses a parenthesised query. CREATE VIEW's body
+   and CTAS's source are NOT such places — gram.y:11287 and gram.y:4807 both
+   take `SelectStmt`, so `CREATE TABLE t AS (SELECT 1)` and
+   `CREATE VIEW v AS (SELECT 1)` are legal PostgreSQL. They used select_bare
+   here purely because the legacy hand parser could not take a leading '(',
+   and that was corrected in M0134-0169. */
 SelectStmt:
 		select_no_parens %prec UMINUS
 			{
@@ -1633,6 +1639,44 @@ col_alias_list:
 				$$ = append($1, $3)
 			}
 
+/* tablesample_clause / opt_repeatable_clause — gram.y:14001-14020, verbatim
+   shape. Two deliberate narrowings, both recorded rather than silent:
+
+   - the method name uses ColId where upstream uses func_name. func_name is
+     `type_function_name | ColId indirection`; goopg has no type_function_name
+     nonterminal, and the indirection arm only exists upstream to let a
+     schema-qualified method name parse. ColId already covers every spelling
+     the two built-in methods and the regress corpus need (`bernoulli` is an
+     IDENT, `system` is the unreserved keyword SYSTEM_P), and it is STRICTER,
+     not laxer, than upstream — the direction §12 asks for when a narrowing
+     is unavoidable.
+   - REPEATABLE takes a_expr, as upstream does, so `REPEATABLE (1+2)` and
+     `REPEATABLE (0.4)` parse as expressions rather than literals.
+
+   Method-name VALIDATION is deliberately not done here. Upstream also defers
+   it (parse_tablesample_method, parse_clause.c) so that an unknown method
+   raises 42704 `tablesample method X does not exist` with a caret on the
+   name, rather than a syntax error. */
+tablesample_clause:
+		TABLESAMPLE ColId '(' expr_list ')' opt_repeatable_clause
+			{
+				var rep Expr
+				if r, ok := $6.(Expr); ok {
+					rep = r
+				}
+				$$ = NewRangeTableSample($<p>2, $2, $4, rep)
+			}
+
+opt_repeatable_clause:
+		REPEATABLE '(' a_expr ')'
+			{
+				$$ = $3
+			}
+	| /*EMPTY*/
+			{
+				$$ = nil
+			}
+
 relation_expr_opt_alias:
 		qualified_name %prec UMINUS
 			{
@@ -1685,6 +1729,24 @@ base_table_ref:
 		relation_expr_opt_alias
 			{
 				$$ = $1
+			}
+	/* gram.y:13616 `relation_expr opt_alias_clause tablesample_clause`.
+	   Upstream WRAPS the relation in a RangeTableSample node; goopg's FROM
+	   item is a flat RangeVar, so the descriptor hangs off it instead
+	   (M0134-0175). Placing the arm here rather than on each of
+	   relation_expr_opt_alias's eight alternatives keeps it to one rule and
+	   still covers every alias spelling, since they all reduce through
+	   relation_expr_opt_alias first. No conflict with `qualified_name ColId`:
+	   TABLESAMPLE is a type_func_name_keyword (kwlists_gen.y:425), so it can
+	   never reduce to ColId — which is precisely why upstream put it in that
+	   category. */
+	| relation_expr_opt_alias tablesample_clause
+			{
+				rv := $1
+				if ts, ok := $2.(*RangeTableSample); ok {
+					rv.TableSample = ts
+				}
+				$$ = rv
 			}
 	| ONLY qualified_name opt_alias_ident
 			{
@@ -2464,6 +2526,18 @@ a_expr:
 			{
 				$$ = NewUnaryOp($<p>1, prefixOp(yylex, $1), $2)
 			}
+	/* Schema-qualified spellings of the two rules above — gram.y :15009 and
+	   :15011 reach them through qual_Op. `%prec Op` is mandatory: the rule
+	   bodies end in a nonterminal, so without it yacc would take the rule's
+	   precedence from ')' . */
+	| a_expr qual_op a_expr %prec Op
+			{
+				$$ = NewBinaryOp($2.pos, binOp(yylex, qualOpName($2)), $1, $3)
+			}
+	| qual_op a_expr %prec Op
+			{
+				$$ = qualPrefixExpr(yylex, $1, $2)
+			}
 	/* op ANY/SOME/ALL — gram.y :15150ff quantified comparisons via
 	   subquery_Op subset. */
 	/* LIKE / ILIKE quantified over a list — legacy folds these into the IN
@@ -3085,6 +3159,17 @@ b_expr:
 			{
 				$$ = NewUnaryOp($<p>1, prefixOp(yylex, $1), $2)
 			}
+	/* b_expr's qual_Op pair — gram.y :15488 and :15490. BETWEEN's operands are
+	   b_expr, so without these `x BETWEEN OPERATOR(pg_catalog.-) 1 AND 1` and
+	   `a OPERATOR(pg_catalog.||) b BETWEEN ...` would not parse. */
+	| b_expr qual_op b_expr %prec Op
+			{
+				$$ = NewBinaryOp($2.pos, binOp(yylex, qualOpName($2)), $1, $3)
+			}
+	| qual_op b_expr %prec Op
+			{
+				$$ = qualPrefixExpr(yylex, $1, $2)
+			}
 
 opt_func_call_args:
 		/* empty */ { $$ = nil }
@@ -3357,6 +3442,30 @@ subq_op:
 	| GREATER_EQUALS { $$ = ">=" }
 	| NOT_EQUALS     { $$ = "<>" }
 
+/* qual_op — the OPERATOR(...) half of gram.y's `qual_Op` (gram.y:16658).
+   Upstream's qual_Op is `Op | OPERATOR '(' any_operator ')'`; the bare-Op half
+   already has its own alternatives on a_expr/b_expr (and '+' '-' '=' '<' '>'
+   arrive as char terminals with alternatives of their own), so only the
+   parenthesised spelling is new. Kept as a SEPARATE nonterminal rather than
+   folded into the existing `a_expr Op a_expr` rules so those proven rules and
+   their positions are untouched.
+
+   The operand is any_operator_name (goopg_ext.y), which is already gram.y's
+   `any_operator` minus the >1-qualifier recursion: `schema.op`, with op_run
+   rejoining the per-character Op tokens the lexer splits. It is bounded by the
+   ')' here, so op_run's greedy join stays unambiguous.
+
+   qname.pos carries the OPERATOR keyword's offset, which is where upstream
+   anchors the resulting A_Expr (`@2` of gram.y:15009 is the start of qual_Op).
+   psql reaches this rule on every `\d <pattern>` meta-command: processSQLNamePattern
+   (postgres/src/fe_utils/string_utils.c:1121-1152) emits
+   `<namevar> OPERATOR(pg_catalog.~) '^(pat)$' COLLATE pg_catalog.default`. */
+qual_op:
+		OPERATOR '(' any_operator_name ')'
+			{
+				$$ = qname{parts: $3.parts, pos: $<p>1}
+			}
+
 /* Identifier context aliases — gram.y :17632-17720. Generated lists come */
 /* from kwlists_gen.y. */
 ColId:
@@ -3413,9 +3522,17 @@ any_or_some:
 		ANY       { }
 	| SOME        { }
 
+/* gram.y spells the COLLATE operand `any_name` (:14867), and any_name's second
+   component is `attrs: '.' attr_name` with `attr_name: ColLabel` (:9161,
+   :17724) — ColLabel there is upstream's all-keywords label, which this
+   grammar calls as_col_label. Using ColId for it rejected `COLLATE
+   pg_catalog.default`, the spelling psql appends to every pattern-matching
+   \d query (processSQLNamePattern, fe_utils/string_utils.c:1121) and the one
+   `default` is RESERVED in, so it is unreachable through ColId. The qualifier
+   is still discarded: goopg resolves collations by bare name. */
 collation_name:
-		ColId              { $$ = $1 }
-	| ColId '.' ColId      { $$ = $3 }
+		ColId                    { $$ = $1 }
+	| ColId '.' as_col_label     { $$ = $3 }
 
 as_col_label:
 		ColLabel          { $$ = $1 }

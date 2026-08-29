@@ -302,6 +302,13 @@ type Context struct {
 	// (*Context).pgIndexKeyDesc; nil until the first index btree is opened.
 	pgKeyDescCache map[uint32]*nbtree.PGIndexKeyDesc
 
+	// heapFillfactorCache memoises the `fillfactor` reloption per relation
+	// OID for this session — goopg's stand-in for the rd_options PG reads off
+	// an already-open Relation. Populated lazily by (*Context).heapFillfactor
+	// and dropped per-OID by invalidateHeapFillfactor; nil until the first
+	// heap insert. M0134-0175a.
+	heapFillfactorCache map[uint32]int
+
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it
 	// zero so the sampler reseeds from the wall clock.

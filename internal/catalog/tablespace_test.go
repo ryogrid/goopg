@@ -143,3 +143,68 @@ func TestCreateTablespaceRegistry(t *testing.T) {
 		t.Fatalf("re-created ts1 reused OID %d", oid1)
 	}
 }
+
+// TestPgTablespaceRendersSpcoptions pins the wire-visible half of M0134-0176:
+// the pg_tablespace virtual view hardcoded spcoptions to NULL for every row, so
+// even a stored storage parameter was invisible to
+// `SELECT spcoptions FROM pg_tablespace`.
+func TestPgTablespaceRendersSpcoptions(t *testing.T) {
+	c := NewInMemory()
+	if _, err := c.CreateTablespace("ts", "postgres", ""); err != nil {
+		t.Fatalf("CreateTablespace: %v", err)
+	}
+	if !c.SetTablespaceOptions("ts", []string{"random_page_cost=3.0", "seq_page_cost=1.1"}) {
+		t.Fatal("SetTablespaceOptions: tablespace not found")
+	}
+	var found bool
+	for _, row := range c.tablespaceVirtualRows() {
+		switch row[1] {
+		case "ts":
+			found = true
+			if want := "{random_page_cost=3.0,seq_page_cost=1.1}"; row[4] != want {
+				t.Errorf("spcoptions = %q, want %q", row[4], want)
+			}
+		case "pg_default", "pg_global":
+			// The bootstrap tablespaces have no options and must render as SQL
+			// NULL (the empty string here), never as `{}` — spcoptions is
+			// BKI_DEFAULT(_null_).
+			if row[4] != "" {
+				t.Errorf("%s: spcoptions = %q, want NULL", row[1], row[4])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("pg_tablespace has no row for the created tablespace")
+	}
+	// Emptying the list goes back to NULL, matching what AlterTableSpaceOptions
+	// writes when the merged array comes back empty (tablespace.c:1063-1066).
+	c.SetTablespaceOptions("ts", nil)
+	for _, row := range c.tablespaceVirtualRows() {
+		if row[1] == "ts" && row[4] != "" {
+			t.Errorf("spcoptions after clearing = %q, want NULL", row[4])
+		}
+	}
+}
+
+// TestPgTextArrayLiteralQuoting pins array_out's quoting rule for the elements
+// spcoptions can hold: an element is bare unless it contains a character that
+// would otherwise be structural.
+func TestPgTextArrayLiteralQuoting(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want string
+	}{
+		{nil, ""},
+		{[]string{}, ""},
+		{[]string{"a=1"}, "{a=1}"},
+		{[]string{"a=1", "b=2"}, "{a=1,b=2}"},
+		{[]string{"a=x y"}, `{"a=x y"}`},
+		{[]string{"a=x,y"}, `{"a=x,y"}`},
+		{[]string{`a="q"`}, `{"a=\"q\""}`},
+	}
+	for _, c := range cases {
+		if got := pgTextArrayLiteral(c.in); got != c.want {
+			t.Errorf("pgTextArrayLiteral(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

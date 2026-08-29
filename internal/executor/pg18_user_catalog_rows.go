@@ -504,9 +504,15 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	} else if tbl.View != nil {
 		relkind = "v" // plain view (no physical storage — the SELECT substitutes at reference time)
 	}
-	relfilenode := int64(tbl.OID)
-	if relkind == "p" || relkind == "v" {
-		relfilenode = 0 // partitioned tables and plain views have no physical storage
+	// relfilenode: the relation OID for kinds with storage, 0 otherwise. The
+	// rule is catalog.RelkindHasStorage (upstream RELKIND_HAS_STORAGE), shared
+	// with the two virtual pg_class builders in internal/catalog/catalog.go so
+	// the heap-persisted and live renderings of the same relation cannot
+	// disagree — they did before M0134-0164, when this ad-hoc 'p'/'v' check had
+	// no virtual twin.
+	relfilenode := int64(0)
+	if catalog.RelkindHasStorage(relkind) {
+		relfilenode = int64(tbl.OID)
 	}
 	isPartition := tbl.PartitionParentOID != 0
 	// relpersistence: 'u' for UNLOGGED tables, 'p' for permanent. pg_dump keys
@@ -1422,7 +1428,7 @@ func buildUserPGIndexRow(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewBoolDatum(idx.NullsNotDistinct),                // indnullsnotdistinct (DU-002 slice 134)
 		NewBoolDatum(idx.Primary),                         // indisprimary
 		NewBoolDatum(false),                               // indisexclusion
-		NewBoolDatum(true),                                // indimmediate
+		NewBoolDatum(idx.IsImmediate()),                   // indimmediate (M0134-0161)
 		NewBoolDatum(idx.IsClustered),                     // indisclustered (DU-002 slice 320)
 		NewBoolDatum(true),                                // indisvalid
 		NewBoolDatum(false),                               // indcheckxmin
