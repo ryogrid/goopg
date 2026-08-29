@@ -223,3 +223,7 @@
 2026-08-28T23:54:42+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 nightly batch already running (lock: /home/ryo/.ralph/locks/goopg-nightly-run.lock) — exiting
 2026-08-29T02:12:41+09:00 [RUN]	S1 barrier reached
+2026-08-30T01:16:37+09:00 [RUN]	start run_id=20260830-011637 sha=82b6debb dirty=17 src_fp=731f88685204587e stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-30T01:16:52+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-30T01:54:59+09:00 [RUN]	S1 barrier reached
+2026-08-30T02:56:32+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
