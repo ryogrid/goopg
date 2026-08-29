@@ -36,7 +36,14 @@ ground truth since, and none had been re-measured:**
 > a commit-flush-bound workload already at WAL parity. Allocation per query fell
 > 68.7 % and `Lock:relation` went from 19.9 % of all backend samples to zero.
 > Full results and the re-profile: [06-post-implementation-results.md](06-post-implementation-results.md).
-> Chapters 01–05 below describe the state *before* those changes.
+>
+> **Update (2026-08-30, `1a395f2bf`): candidates H, F and E are implemented too**
+> (`-S` a further **+2.0 %**, ranges disjoint), taking the series total to
+> **93,083 → 117,182 tps (+25.9 %)** — now **1.02× of PostgreSQL 18.3**, i.e.
+> marginally ahead, subject to the `bpchar` heap caveat in
+> [00 §5](00-methodology.md). Candidates **D and G are deliberately declined**
+> with evidence: [07-remaining-candidates.md](07-remaining-candidates.md).
+> Chapters 01–05 below describe the state *before* any of these changes.
 
 ## Verdict up front
 
@@ -97,6 +104,7 @@ Five findings carry the report:
 | [04-wal-persistence.md](04-wal-persistence.md) | goopg's flush path vs PG's `XLogFlush` group commit; why this is done |
 | [05-improvement-plan.md](05-improvement-plan.md) | Ranked candidates with measured ceilings, effort, risk, gates, sequencing, and the do-not-re-land list |
 | [06-post-implementation-results.md](06-post-implementation-results.md) | **Candidates A, B, C landed** — measured outcome, re-profile, and the next bottleneck |
+| [07-remaining-candidates.md](07-remaining-candidates.md) | **H, F, E landed; D and G declined** — final results and the evidence for declining |
 
 ## Review
 
