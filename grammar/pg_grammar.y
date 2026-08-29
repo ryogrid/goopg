@@ -631,8 +631,13 @@ explainable_stmt:
                             carries the set-op and the trailing clauses, with
                             ORDER BY / LIMIT / OFFSET lifted off a BARE right
                             branch exactly as foldSetOps lifts them.
-   select_bare is legacy's parseSelect: NO leading '(' — CREATE VIEW's body and
-   CTAS's source reject `AS (SELECT 1)` there, so they take select_bare. */
+   select_bare is legacy's parseSelect: NO leading '('. It is the right choice
+   only where upstream ALSO refuses a parenthesised query. CREATE VIEW's body
+   and CTAS's source are NOT such places — gram.y:11287 and gram.y:4807 both
+   take `SelectStmt`, so `CREATE TABLE t AS (SELECT 1)` and
+   `CREATE VIEW v AS (SELECT 1)` are legal PostgreSQL. They used select_bare
+   here purely because the legacy hand parser could not take a leading '(',
+   and that was corrected in M0134-0169. */
 SelectStmt:
 		select_no_parens %prec UMINUS
 			{

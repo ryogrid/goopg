@@ -56,11 +56,40 @@ func TestParenthesisedSetOpOperands(t *testing.T) {
 		"(SELECT 1) OFFSET 1 LIMIT 2",
 		"(SELECT 1) LIMIT ALL",
 		"WITH c AS (SELECT 1) (SELECT 2)",
-		// select_bare: a view body or CTAS source may not START with '('.
-		"CREATE VIEW v AS (SELECT 1)",
-		"CREATE TABLE t AS (SELECT 1)",
 	} {
 		assertBothReject(t, q)
+	}
+}
+
+// TestCtasAndViewSourceAcceptsParenthesisedQuery pins the M0134-0169 widening:
+// CTAS's source and a view body take gram.y's `SelectStmt`, which admits
+// `select_with_parens`, NOT goopg's `select_bare`.
+//
+// These two spellings used to sit in the assertBothReject list above, on the
+// stated ground that "a view body or CTAS source may not START with '('".
+// That was the LEGACY hand parser's limit recorded as if it were PostgreSQL's:
+// upstream's CreateAsStmt (gram.y:4807), its IF NOT EXISTS twin (:4821) and
+// ViewStmt (:11287) all take `SelectStmt`, so every form below is legal
+// PostgreSQL 18.3. It is a widening past the legacy oracle ON PURPOSE, decided
+// against ./postgres/ per playbook §12.5, so the goldens for these entries were
+// re-recorded rather than treated as drift.
+//
+// Reached from the regress corpus by sqljson_jsontable.sql:37 (`CREATE TEMP
+// TABLE json_table_test (js) AS (VALUES …)`) and privileges.sql:963,998.
+func TestCtasAndViewSourceAcceptsParenthesisedQuery(t *testing.T) {
+	for _, q := range []string{
+		"CREATE TABLE t AS (SELECT 1)",
+		"CREATE TABLE t AS SELECT 1",
+		"CREATE TABLE IF NOT EXISTS t AS (SELECT 1)",
+		"CREATE TEMP TABLE t (js) AS (VALUES ('1'), ('2'))",
+		"CREATE TABLE t AS (SELECT 1 UNION SELECT 2)",
+		"CREATE TABLE t AS ((SELECT 1))",
+		"CREATE TABLE t AS (SELECT 1) WITH NO DATA",
+		"CREATE VIEW v AS (SELECT 1)",
+		"CREATE OR REPLACE VIEW v AS (SELECT 1)",
+		"CREATE MATERIALIZED VIEW mv AS (SELECT 1)",
+	} {
+		assertParity(t, q)
 	}
 }
 

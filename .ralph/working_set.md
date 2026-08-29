@@ -1,59 +1,70 @@
 (idle — nothing in flight)
 
-## Loop #10 result — M0134-0164 PARKED, engine-wide relfilenode fix landed
+## Loop #16 result — M0134-0169 sized, engine-wide grammar fix landed, case PARKED
 
-**Nightly triage:** `ci/logs/action-items.md` still holds only run
-`20260828-235424`'s two items; both already filed (fix_plan L1538, L1542).
-Nothing new.
+**Nightly triage:** `ci/logs/action-items.md` still run `20260828-235424` (unchanged
+for a 2nd loop), both `## AI-` items already filed. Nothing new to file.
 
-**Task: M0134-0164 (`sanity_check.sql`) — `not-tried` → `failed`, PARKED.**
-77 → **21** diff lines standalone (129 → 21 inside the 13-case A/B, whose
-baseline is higher only because that run loads all 13 cases' objects first —
-both sides saw the identical load).
+**Tree check first (loop #15's lesson):** `git status` mtimes vs the baton's — no
+uncommitted engine WIP this time, baton `(idle)` was accurate. Selected per banner.
+
+**Task:** M0134-0169 `sqljson_jsontable.sql`, sized live `not-tried` → `failed`
+(1347 → **1335** diff lines, `^+ERROR` 116 → **115**), then PARKED.
+
+The case is 100% blocked by the SQL/JSON `JSON_TABLE` subsystem (ledger 0168a,
+which also gates -0170) — its 90 syntax errors reduce to four tokens: `COLUMNS`
+x68, `PASSING` x12, `AS` x9 (all JSON_TABLE) and **`(` x1**, which was something
+else entirely and is what the loop shipped.
+
+**Shipped (engine-wide):** CTAS's source, `create_view_stmt` (both arms) and
+`create_matview_stmt` took `select_bare`, so `CREATE TABLE t AS (SELECT 1)`,
+`CREATE VIEW v AS (SELECT 1)` and `CREATE MATERIALIZED VIEW mv AS (SELECT 1)`
+were rejected — all legal PG (`gram.y:4807`/`:4821`/`:11287` take `SelectStmt`).
+Four productions `select_bare` → `SelectStmt`. Design
+`docs/design/m0134-0169-ctas-view-source-parenthesised-query.md`.
 
 **Three things worth carrying:**
 
-1. **`sanity_check.sql` is a pure INVARIANT PROBE, not a feature test.** Three
-   statements, no schema of its own; in upstream's serial schedule it audits
-   whatever ran before it. Its two queries are `pg_class` invariants a real
-   cluster answers with zero rows, so every diff line is an engine-wide catalog
-   defect by construction. Cheap to run, high signal — the same shape is worth
-   looking for in other `_check`-style cases.
-2. **Four pg_class row builders, four different answers.** `relfilenode` must be
-   0 for storage-less relkinds (`RELKIND_HAS_STORAGE`, `pg_class.h:200`;
-   `heap_create`, `heap.c:335-345`). The HEAP builder (`buildUserPGClassRow`)
-   had an ad-hoc `p`/`v` check, initdb had the convention in comments
-   (`relcache_init.go:770`, `initdb.go:6072`), the composite builder hardcoded 0
-   — and BOTH VIRTUAL builders in `catalog.go` `PGClassRowsForDBOid` (table row
-   AND index row) had none of it. Fixed with one shared
-   `catalog.RelkindHasStorage` / `RelfilenodeForRelkind`. When touching a
-   pg_class column, enumerate all four builders first.
-3. **Row-literal formatting convention in `PGClassRowsForDBOid`:** hoist any
-   multi-token cell to a local (as `relOfType` / `idxTablespace` already do).
-   Inlining an expression re-aligns ~50 unrelated comment columns and churns the
-   go1.25 gofmt baseline.
+1. **A guard is only as good as the premise that went in.** This bug survived
+   the whole parser migration because it was recorded as *intentional* in THREE
+   places — a `pg_grammar.y:634` comment asserting PG rejects `AS (SELECT 1)`,
+   an `assertBothReject` entry, and two `!syntax error` goldens. All three were
+   faithful records of the **legacy hand parser's** limit, promoted to a claim
+   about PostgreSQL that nothing ever checked against `gram.y`. When a comment
+   states a PG rule, verify it before trusting it — especially a comment that
+   explains why goopg is *narrower*.
+2. **`SelectStmt` is usable wherever gram.y uses it — conflicts stayed at 59.**
+   The three-tier `SelectStmt`/`select_with_parens`/`select_no_parens` layering
+   was built for exactly this; those call sites were leftovers, not a constraint.
+   Cheap to check: edit, `make gen-parser`, read the pinned conflict count.
+3. **Same-length regress diffs can still differ.** `join`/`subselect` moved
+   `Values (431 rows)` → `(435 rows)` — goopg plans virtual `pg_class` as a
+   Values node sized by the live relation count, and 4 relations that used to
+   fail to parse now exist in the shared regress DB. Forward effect, not a plan
+   regression. Also: **normalise the `---`/`+++` header paths before `cmp`**, or
+   a worktree A/B reports every file as CHANGED.
 
-Gates run: 13-case regress A/B vs a HEAD worktree (`create_view`, `create_table`,
-`alter_table`, `rules`, `dependency`, `inherit`, `matview`, `foreign_data`,
-`sequence`, `indexing`, `create_index`, `psql`, `sanity_check`) — **10
-byte-identical, ZERO regressions**; `alter_table` 3800 → 3798 as independent
-confirmation. `create_index` is nondeterministic at byte level (Go pointer
-address leaking into `pg_get_indexdef`, ledgered). New unit guard
-`internal/executor/pg_class_relfilenode_storage_test.go`, revert-checked.
-`RALPH_PRECOMMIT_SCOPE=units` PASS (exit 0). `scripts/tpch-spotcheck.sh` PASS
-(Q12 rows=2, Q13 rows=34). pre-commit pgbench smoke PASS. Baseline worktree
-removed.
+Gates run: `make gen-parser` (59 conflicts, unchanged) ×4; `go build ./...` OK;
+`go test ./internal/parser/` PASS; guard `TestCtasAndViewSourceAcceptsParenthesisedQuery`
+**revert-checked** (fails on all ten with the grammar reverted); 15-case regress
+A/B vs a HEAD worktree (11 byte-identical, `sqljson_jsontable` −12, `privileges`
+−7, zero regressions); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12 rows=2, Q13 rows=34);
+`make check-testport-inventory` PASS; `make regen-testport` clean;
+`make ralph-state-guard` OK (auto-repaired the stale completed marker).
 
 In-flight: none.
 
-**Carried obligations (9th loop):**
-1. **TPC-DS SF0.5 gate still NOT run** (for -0156, -0157). -0158..-0164 are
-   parser/DDL/catalog/ACL-only and cannot move a TPC-DS plan. Nightly idle:
+**Carried obligations (14th loop):**
+1. **TPC-DS SF0.5 gate still NOT run** (for -0156, -0157). -0158..-0169 are
+   parser/DDL/catalog/ACL/wire/type-input-only and cannot move a TPC-DS plan.
+   Nightly idle:
    `FORCE=1 GOOPG_BIN=$PWD/tmp/goopg-sf05-bin scripts/tpcds-sf05-regression.sh sweep`.
 2. **The 110 "presumed stale, pending" 20260827 rows are STILL unadjudicated** —
    nightly testport keeps hitting the 120m timeout with no results.csv
    (`TestPort_IsolationSuite` full-run wedge, playbook §9).
 
 NEXT LOOP (banner is the authority): M-NIGHTLY filing first, then
-**M0134-0165 — `security_label.sql`** (status `not-tried`). 0164a (pg_index has
-no bootstrap catalog index rows) is a backlog follow-up, not the main sequence.
+**M0134-0170 — `sqljson_queryfuncs.sql`** (status `not-tried`). 0168a gates it
+too, so expect the same sizing-and-park unless the loop opens the SQL/JSON
+grammar work.
