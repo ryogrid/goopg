@@ -208,7 +208,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/transactions.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/triggers.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/truncate.sql,pass,yes,-,M0097-0023-loop44: transactional TRUNCATE rollback + sequence OWNED BY cascade + partition FK scan + SETOF record OUT param expansion
-,regress-sql,regress,postgres/src/test/regress/sql/tsdicts.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/tsdicts.sql,failed,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/tsearch.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/tsrf.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/tstypes.sql,not-tried,no,-,

@@ -22594,6 +22594,61 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 	return nil
 }
 
+// resolveTSTokenTypes mirrors getTokenTypes (tsearchcmds.c:1229) — the
+// translation every ALTER TEXT SEARCH CONFIGURATION mapping form runs on its
+// `FOR tok [, ...]` list before it touches pg_ts_config_map. Upstream calls it
+// from both MakeConfigurationMapping (ADD / ALTER / ALTER ... REPLACE) and
+// DropConfigurationMapping, and it does two things goopg's mapping paths were
+// missing:
+//
+//   - DEDUPLICATION ("Duplicated entries list are removed from tokennames").
+//     A repeated token is silently skipped, so `DROP MAPPING FOR word, word`
+//     deletes once and SUCCEEDS, `ADD MAPPING FOR word, word WITH d` inserts
+//     one row instead of colliding on pg_ts_config_map_index, and
+//     `DROP MAPPING IF EXISTS FOR word, word` emits ONE skip NOTICE.
+//   - PARSER VALIDATION. Every name is looked up in the configuration's
+//     parser's lextype table — for the only parser goopg has, the built-in
+//     "default" (catalog.DefaultParserTokenTypes, which
+//     catalog.TSTokenTypeID indexes). An unknown name raises
+//     ERRCODE_INVALID_PARAMETER_VALUE (22023) "token type %q does not
+//     exist". This runs BEFORE any mapping lookup and before the dictionary
+//     names are resolved, and — unlike the "mapping for token type ... does
+//     not exist" miss below it — is NOT downgraded to a NOTICE by
+//     DROP MAPPING's IF EXISTS: missing_ok covers a missing MAPPING, never a
+//     token type the parser cannot emit.
+//
+// An empty input list stays empty (upstream returns NIL): that is the bare
+// `ALTER MAPPING REPLACE old WITH new` form, where "no tokens named" means
+// "every mapped token", not "no tokens".
+//
+// The token names arrive already lower-cased from the parser
+// (parseTSTokenTypeCommaList), so the case-insensitive lookup here and
+// upstream's strcmp against the lextype alias agree for every unquoted
+// spelling. M0134-0178 (tsdicts.sql).
+func resolveTSTokenTypes(tokenTypes []string) ([]string, error) {
+	if len(tokenTypes) == 0 {
+		return tokenTypes, nil
+	}
+	result := make([]string, 0, len(tokenTypes))
+	seen := make(map[string]struct{}, len(tokenTypes))
+	for _, tt := range tokenTypes {
+		// Skip if this token is already in the result (upstream's
+		// tstoken_list_member check, which precedes the lextype scan).
+		if _, dup := seen[tt]; dup {
+			continue
+		}
+		seen[tt] = struct{}{}
+		if _, ok := catalog.TSTokenTypeID(tt); !ok {
+			return nil, &ExecError{
+				Code:    "22023",
+				Message: fmt.Sprintf("token type %q does not exist", tt),
+			}
+		}
+		result = append(result, tt)
+	}
+	return result, nil
+}
+
 // execAlterTSConfigAddMapping implements ALTER TEXT SEARCH CONFIGURATION name
 // ADD MAPPING FOR tokentype [, ...] WITH dictionary [, ...] — appends one
 // pg_ts_config_map entry per named token type so pg_dump's dumpTSConfig
@@ -22603,6 +22658,10 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 // then user-created dictionaries (CREATE TEXT SEARCH DICTIONARY) in the same
 // schema as the configuration. DU-002 slice 446 (M0119-0004).
 func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	tokenTypes, err := resolveTSTokenTypes(s.TokenTypes)
+	if err != nil {
+		return err
+	}
 	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
 	for _, dn := range s.Dictionaries {
 		oid, err := resolveTSDictOID(im, dn)
@@ -22611,7 +22670,7 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 		}
 		dictOIDs = append(dictOIDs, oid)
 	}
-	for _, tt := range s.TokenTypes {
+	for _, tt := range tokenTypes {
 		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
@@ -22674,6 +22733,10 @@ func resolveTSDictOID(im *catalog.InMemory, dn parser.ObjectName) (uint32, error
 // unresolvable dictionary name or configuration. DU-002 replacedict
 // follow-up (M0119-0004).
 func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	tokenTypes, err := resolveTSTokenTypes(s.TokenTypes)
+	if err != nil {
+		return err
+	}
 	oldOID, err := resolveTSDictOID(im, s.OldDict)
 	if err != nil {
 		return err
@@ -22682,7 +22745,7 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 	if err != nil {
 		return err
 	}
-	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, tokenTypes, oldOID, newOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if uc == nil {
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 	}
@@ -22702,6 +22765,10 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 // inserts the new list, so re-pointing an existing mapping is exactly what
 // this statement is for. DU-002 slice 446 follow-up (M0119-0004).
 func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	tokenTypes, err := resolveTSTokenTypes(s.TokenTypes)
+	if err != nil {
+		return err
+	}
 	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
 	for _, dn := range s.Dictionaries {
 		oid, err := resolveTSDictOID(im, dn)
@@ -22710,7 +22777,7 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 		}
 		dictOIDs = append(dictOIDs, oid)
 	}
-	for _, tt := range s.TokenTypes {
+	for _, tt := range tokenTypes {
 		uc := im.AlterTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
@@ -22732,7 +22799,11 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 // "mapping for token type \"%s\" does not exist" unless IF EXISTS is given,
 // in which case it is a NOTICE). DU-002 slice 446 follow-up (M0119-0004).
 func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
-	for _, tt := range s.TokenTypes {
+	tokenTypes, err := resolveTSTokenTypes(s.TokenTypes)
+	if err != nil {
+		return err
+	}
+	for _, tt := range tokenTypes {
 		uc, found := im.DropTSConfigMapping(s.ConfigName.Name, schema, tt, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
