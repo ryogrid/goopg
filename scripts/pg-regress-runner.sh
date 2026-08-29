@@ -198,6 +198,23 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ "$AUTO_START" -eq 1 ]]; then
+    # Guard: refuse to run if ${PORT} is already answering. Without this the
+    # readiness probe below is satisfied by SOMEBODY ELSE'S server (a stale
+    # orphan from a killed run, or a concurrent Ralph loop's A/B worktree
+    # server), our own goopg never binds, and every psql silently measures the
+    # foreign server. The run still prints a plausible "FAIL <case> (N lines)"
+    # — a fabricated case size that then gets recorded in fix_plan.md and the
+    # deferral ledger as fact. Observed 2026-08-29: sqljson_queryfuncs sized as
+    # "1291 diff lines" that were 1290 expected-only lines plus one
+    # "connection refused". Fail loudly instead.
+    if pg_isready -h 127.0.0.1 -p "${PORT}" -U postgres -q 2>/dev/null; then
+        echo "pg-regress-runner: port ${PORT} is ALREADY in use by another server." >&2
+        echo "  Refusing to auto-start: results would silently measure that server." >&2
+        echo "  Reap the orphan (systemctl --user stop <scope>, or goopg stop -D <dir>)" >&2
+        echo "  or point at it deliberately with --port ${PORT}." >&2
+        exit 2
+    fi
+
     echo "pg-regress-runner: building goopg..."
     (cd "${REPO_ROOT}" && go build -o bin/goopg ./cmd/goopg 2>&1)
 
@@ -217,6 +234,16 @@ if [[ "$AUTO_START" -eq 1 ]]; then
         "until pg_isready -h 127.0.0.1 -p ${PORT} -U postgres -q; do sleep 1; done"
 
     SERVER_PID="$(head -1 "${GOOPG_DATADIR}/postmaster.pid" 2>/dev/null || true)"
+    # An empty SERVER_PID means our own postmaster.pid was never written, i.e.
+    # whatever answered pg_isready above is NOT the server we started. cleanup()
+    # keys its kill on SERVER_PID, so this also used to leave the run both
+    # measuring and never reaping a foreign process. (The banner printed a bare
+    # "server ready (pid=)" and the run continued.)
+    if [[ -z "$SERVER_PID" ]] || ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "pg-regress-runner: goopg did not start (no live pid in ${GOOPG_DATADIR}/postmaster.pid)." >&2
+        echo "  Server log: ${GOOPG_LOG}" >&2
+        exit 2
+    fi
     echo "pg-regress-runner: server ready (pid=${SERVER_PID})"
 fi
 
@@ -353,7 +380,8 @@ normalise_output() {
 
 # -------------------------------------------------------------------------- #
 # Run one test
-# Returns: 0=PASS, 1=FAIL, 2=SKIP
+# Returns: 0=PASS, 1=FAIL, 2=SKIP, 3=OPERATIONAL ERROR (connection lost —
+# the capture is not a usable diff and must not be counted as a result)
 # -------------------------------------------------------------------------- #
 mkdir -p "${OUT_DIR}"
 
@@ -386,7 +414,22 @@ run_test() {
     # errors come out bare, matching the expected .out files byte-for-byte.
     # The -a echo-all flag is preserved (it lives in the PSQL array above), so
     # the echoed SQL still matches the expected output.
-    "${PSQL[@]}" < "${sql_file}" >"${actual_raw}" 2>&1 || true
+    local prc=0
+    "${PSQL[@]}" < "${sql_file}" >"${actual_raw}" 2>&1 || prc=$?
+
+    # psql exits 2 when "connection to server went bad and the session was not
+    # interactive" (postgres/doc/src/sgml/ref/psql-ref.sgml, "Exit Status"):
+    # either it never connected, or the backend died mid-case. Neither produces
+    # a meaningful diff — the capture is a truncated prefix plus one libpq
+    # error line, which diffs against the whole expected file and reports a
+    # believable-looking case size. Ordinary in-case SQL errors do NOT set this
+    # (no ON_ERROR_STOP), so this only fires on real connectivity loss.
+    if [[ "$prc" -eq 2 ]]; then
+        echo "ERROR ${name}  (psql lost the connection — NOT a valid diff)"
+        sed -n '$p' "${actual_raw}" | sed 's/^/      /'
+        rm -f "${actual_raw}" "${actual_norm}" "${expected_norm}"
+        return 3
+    fi
 
     normalise_output < "${actual_raw}" > "${actual_norm}"
     normalise_output < "${exp_file}"   > "${expected_norm}"
@@ -416,6 +459,7 @@ run_test() {
 pass=0
 fail=0
 skip=0
+oper=0
 total=${#TESTS[@]}
 
 echo "pg-regress-runner: running ${total} tests against goopg:${PORT}"
@@ -428,6 +472,10 @@ for t in "${TESTS[@]}"; do
         0) pass=$((pass + 1)) ;;
         1) fail=$((fail + 1)); [[ "$STOP_ON_FIRST" -eq 1 ]] && break ;;
         2) skip=$((skip + 1)) ;;
+        # Connection loss: the server is gone or was never ours. Every later
+        # case would be fabricated the same way, so stop rather than emit a
+        # sweep of meaningless diffs.
+        3) oper=$((oper + 1)); break ;;
     esac
 done
 
@@ -439,6 +487,12 @@ fi
 echo "pg-regress-runner: ${pass}/$((pass+fail)) PASS (${pct}% parity, ${skip} skipped)"
 echo "  diffs in: ${OUT_DIR}/"
 
+if [[ $oper -gt 0 ]]; then
+    echo "pg-regress-runner: ABORTED — lost the server connection mid-run." >&2
+    echo "  The counts above are INCOMPLETE and no case size from this run is usable." >&2
+    [[ "$AUTO_START" -eq 1 ]] && echo "  Server log: ${GOOPG_LOG}" >&2
+    exit 2
+fi
 if [[ $fail -gt 0 ]]; then
     exit 1
 fi

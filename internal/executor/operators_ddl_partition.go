@@ -290,38 +290,32 @@ func validatePartKeyExprInner(e parser.Expr, pos int, keyColNum int, ctx *Contex
 				Message: "aggregate functions are not allowed in partition key expressions"}
 		}
 		// Check catalog for SRF or non-immutable.
+		var routines []*catalog.Routine
 		if rs := ctx.Catalog.Routines(); rs != nil {
-			routines := rs.LookupByName(v.Name)
+			routines = rs.LookupByName(v.Name)
 			for _, r := range routines {
 				if r.ReturnsSet {
 					return &ExecError{Code: "0A000", Pos: pos,
 						Message: "set-returning functions are not allowed in partition key expressions"}
 				}
-				// SQL language functions are inlined by PG; check body for volatile ops.
-				if r.Language == "sql" {
-					rs2 := ctx.Catalog.Routines()
-					if stmts, err := parser.Parse(r.Body); err == nil {
-						for _, stmt := range stmts {
-							if sel, ok := stmt.(*parser.SelectStmt); ok {
-								for _, col := range sel.Targets {
-									if sqlBodyExprIsVolatile(col.Expr, rs2) {
-										return &ExecError{Code: "42P16", Pos: pos,
-											Message: "functions in partition key expression must be marked IMMUTABLE"}
-									}
-								}
-							}
-						}
-					}
-				} else if r.Volatile != "i" {
-					return &ExecError{Code: "42P16", Pos: pos,
-						Message: "functions in partition key expression must be marked IMMUTABLE"}
-				}
-				// No-arg IMMUTABLE function is a constant expression.
-				if len(v.Args) == 0 {
-					return &ExecError{Code: "42P16", Pos: pos,
-						Message: "cannot use constant expression as partition key"}
-				}
 			}
+		}
+		// The volatility test itself is ComputePartitionAttrs' half of the same
+		// upstream predicate CheckPredicate/ComputeIndexAttrs use for indexes
+		// (contain_mutable_functions), so both goopg ports now share one
+		// classifier — see index_mutability.go. This site used to consult ONLY
+		// ctx.Catalog.Routines(), i.e. user-defined functions, so a bare volatile
+		// BUILT-IN (`PARTITION BY RANGE ((a + (random()*10)::int))`) was accepted;
+		// funcCallIsNonImmutable falls through to the pg_proc.dat-derived
+		// built-in set when the name is not a user routine. M0134-0170.
+		if funcCallIsNonImmutable(v, ctx.Catalog) {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: "functions in partition key expression must be marked IMMUTABLE"}
+		}
+		// No-arg IMMUTABLE user function is a constant expression.
+		if len(routines) > 0 && len(v.Args) == 0 {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: "cannot use constant expression as partition key"}
 		}
 		// Recursively validate args — constants are valid as function arguments.
 		for _, arg := range v.Args {
@@ -926,70 +920,6 @@ func isUserDefinedAggregate(name string, ctx *Context) bool {
 }
 
 // isBuiltinSRF returns true for well-known built-in set-returning functions.
-// knownVolatileBuiltins are functions that make SQL functions effectively VOLATILE.
-// SQL functions using only immutable ops (arithmetic, string, etc.) are inlineable
-// and treated as IMMUTABLE by PG's partition-key check even if marked VOLATILE.
-var knownVolatileBuiltins = map[string]bool{
-	"random": true, "setseed": true,
-	"clock_timestamp": true, "statement_timestamp": true, "transaction_timestamp": true,
-	"timeofday": true, "pg_sleep": true,
-	"nextval": true, "currval": true, "lastval": true,
-	"gen_random_uuid": true, "gen_random_bytes": true,
-	"now": true, "current_timestamp": true,
-}
-
-// sqlBodyExprIsVolatile returns true if the expression tree contains a known
-// volatile built-in call or a user-defined function that is not IMMUTABLE and
-// not itself a SQL-language function (which would be recursively inlined).
-func sqlBodyExprIsVolatile(e parser.Expr, rs *catalog.Routines) bool {
-	if e == nil {
-		return false
-	}
-	switch v := e.(type) {
-	case *parser.FuncCall:
-		name := strings.ToLower(v.Name.Name)
-		if knownVolatileBuiltins[name] {
-			return true
-		}
-		// Check user-defined function volatility in catalog.
-		if rs != nil {
-			for _, r := range rs.LookupByName(v.Name) {
-				if r.Language == "sql" {
-					// Inline: check the body recursively.
-					stmts, err := parser.Parse(r.Body)
-					if err == nil {
-						for _, stmt := range stmts {
-							if sel, ok := stmt.(*parser.SelectStmt); ok {
-								for _, col := range sel.Targets {
-									if sqlBodyExprIsVolatile(col.Expr, rs) {
-										return true
-									}
-								}
-							}
-						}
-					}
-				} else if r.Volatile != "i" {
-					return true
-				}
-			}
-		}
-		for _, arg := range v.Args {
-			if sqlBodyExprIsVolatile(arg, rs) {
-				return true
-			}
-		}
-	case *parser.BinaryOp:
-		return sqlBodyExprIsVolatile(v.Left, rs) || sqlBodyExprIsVolatile(v.Right, rs)
-	case *parser.UnaryOp:
-		return sqlBodyExprIsVolatile(v.Operand, rs)
-	case *parser.CastExpr:
-		return sqlBodyExprIsVolatile(v.Operand, rs)
-	case *parser.CollateExpr:
-		return sqlBodyExprIsVolatile(v.Operand, rs)
-	}
-	return false
-}
-
 func isBuiltinSRF(name string) bool {
 	switch name {
 	case "generate_series", "generate_subscripts", "unnest",

@@ -7491,6 +7491,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if aerr := checkIndexAMCapabilities(method, s); aerr != nil {
 		return aerr
 	}
+	// Validate the partial-index predicate's volatility — DefineIndex's
+	// `if (stmt->whereClause) CheckPredicate(...)` (indexcmds.c:905-906), which
+	// sits exactly here: after the access-method capability block and before
+	// transformRelOptions/index_reloptions. M0134-0170.
+	if s.HasPredicate {
+		if merr := checkIndexPredicateMutability(s.Predicate, o.ctx.Catalog, s.Pos()); merr != nil {
+			return merr
+		}
+	}
 	// Reject unrecognized `WITH (...)` names/namespaces before ANY other index
 	// check. DefineIndex runs index_reloptions() well before index_create()
 	// reaches the name-conflict test (postgres/src/backend/commands/
@@ -7501,6 +7510,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// an unrecognized namespace. M0134-0160.
 	if verr := validateRelOptionNames(s.WithOptionNames, indexRelOptKind(s.Method), false, false, s.Pos()); verr != nil {
 		return verr
+	}
+	// Then each expression key, ComputeIndexAttrs' own volatility test
+	// (indexcmds.c:2010-2019). It runs after index_reloptions and still ahead of
+	// index_create's name-conflict check, so an index name reused across
+	// negative cases keeps reporting the mutability error rather than
+	// "relation already exists" — the same ordering constraint M0134-0160
+	// established for the reloption check above. M0134-0170.
+	if merr := checkIndexExprMutability(s.ColExprs, o.ctx.Catalog, s.Pos()); merr != nil {
+		return merr
 	}
 	name := s.Name
 	if name == "" {
