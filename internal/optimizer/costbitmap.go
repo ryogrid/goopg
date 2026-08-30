@@ -14,15 +14,32 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 )
 
-// costBitmapIndexScan costs a single B-tree index scan that feeds a TIDBitmap.
-// It is `cost_index` plus PG's per-tuple bitmap-manipulation charge
-// (costsize.c:1172: cpu_operator_cost * 0.1 per tuple for tbm_add_tuples).
+// costBitmapIndexScan costs a single B-tree index scan that feeds a TIDBitmap:
+// the INDEX SIDE ONLY, plus PG's per-tuple bitmap-manipulation charge.
+//
+// PG oracle, `cost_bitmap_tree_node` (costsize.c:1150):
+//
+//	*cost = ((IndexPath *) path)->indextotalcost;
+//	*cost += 0.1 * cpu_operator_cost * path->rows;
+//
+// `indextotalcost` is what `amcostestimate` returned — the index descent and
+// leaf scan. It does NOT include heap fetches, because a bitmap index scan
+// never touches the heap: it emits TIDs, and the `BitmapHeapScan` above is what
+// reads pages and is separately costed for exactly that.
+//
+// This used to call `costIndexScan`, which is the WHOLE scan — index side plus
+// the max/min heap-IO interpolation plus `cpu_tuple_cost` per heap tuple. So
+// every bitmap path paid for its heap twice: once here, invisibly, and once in
+// `costBitmapHeapScan` where it belongs. On TPC-H Q2's `supplier` probe the
+// index side is PG's 7.77 and goopg was charging ~874, which is the bulk of the
+// 1786 vs 43 gap that kept the bitmap losing.
 func costBitmapIndexScan(cp costParams, in indexScanInputs) Cost {
-	c := costIndexScan(cp, in)
+	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
 	tuplesFetched := clampRowEst(in.selectivity * in.relTuples)
-	// bitmap-manipulation overhead: 0.1 * cpu_operator_cost per tuple.
-	c.Total += 0.1 * cp.cpuOperatorCost * tuplesFetched
-	return c
+	return Cost{
+		Startup: idxStartup,
+		Total:   idxTotal + 0.1*cp.cpuOperatorCost*tuplesFetched,
+	}
 }
 
 // costBitmapHeapScan costs a complete BitmapHeapScan: index access (startup) plus

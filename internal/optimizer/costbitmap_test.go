@@ -17,16 +17,31 @@ func TestCostBitmapIndexScan_AddsBitmapOverhead(t *testing.T) {
 		correlation: 0,
 		totalTablePages: 200,
 	}
-	base := costIndexScan(cp, in)
+	// The baseline is the INDEX SIDE, not the whole index scan. PG's
+	// cost_bitmap_tree_node (costsize.c:1150) takes `indextotalcost` — what
+	// amcostestimate returned — and adds only the bitmap-manipulation charge. A
+	// bitmap index scan emits TIDs and never touches the heap; the
+	// BitmapHeapScan above it is separately costed for exactly that.
+	//
+	// This assertion previously compared against costIndexScan, i.e. the WHOLE
+	// scan including heap IO — so it agreed with an implementation that charged
+	// the heap twice, once here invisibly and once where it belongs. It pinned
+	// the defect rather than guarding against it.
+	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
 	bitmap := costBitmapIndexScan(cp, in)
 	tuplesFetched := clampRowEst(in.selectivity * in.relTuples) // 1000
-	overhead := 0.1 * cp.cpuOperatorCost * tuplesFetched       // 0.1 * 0.0025 * 1000 = 0.25
-	if diff := bitmap.Total - base.Total; math.Abs(diff-overhead) > 1e-9 {
-		t.Errorf("costBitmapIndexScan overhead = %v, want %v", diff, overhead)
+	overhead := 0.1 * cp.cpuOperatorCost * tuplesFetched        // 0.1 * 0.0025 * 1000 = 0.25
+	if diff := bitmap.Total - idxTotal; math.Abs(diff-overhead) > 1e-9 {
+		t.Errorf("costBitmapIndexScan overhead over the index side = %v, want %v", diff, overhead)
 	}
-	// Startup should be the same (both pay the B-tree descent).
-	if math.Abs(bitmap.Startup-base.Startup) > 1e-9 {
-		t.Errorf("costBitmapIndexScan startup differs: %v vs %v", bitmap.Startup, base.Startup)
+	if math.Abs(bitmap.Startup-idxStartup) > 1e-9 {
+		t.Errorf("costBitmapIndexScan startup = %v, want the index-side startup %v", bitmap.Startup, idxStartup)
+	}
+	// And it must be strictly CHEAPER than a full index scan, which pays for
+	// heap fetches this node does not perform.
+	if base := costIndexScan(cp, in); bitmap.Total >= base.Total {
+		t.Errorf("bitmap index side (%v) is not cheaper than a full index scan (%v); the heap is being charged twice again",
+			bitmap.Total, base.Total)
 	}
 }
 
