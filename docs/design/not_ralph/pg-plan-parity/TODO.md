@@ -238,6 +238,15 @@ refuse — the exact failure that file warns about.
       is a nested-loop ANTI-join inner (its columns are never read, so narrowing
       is invisible there) and all six of gap B's bitmap scans are NL inners.
       **This is the highest-leverage next step in the whole document**
+- [x] SIZED stage 1, and it is not a quick win: `indexOnlyScanOp.Open` is **262
+      lines** covering relation + index locks, SERIALIZABLE predicate locking
+      (`ssiRecordRelationRead`), hash-index bucket-grain locking, key
+      resolution and row materialisation. Splitting it into a one-time
+      `openPrep` plus a per-scan part — the shape `indexScanOp` already has —
+      means deciding, for each of those, whether it is per-OPEN or per-RESCAN.
+      Get the SSI half wrong and the result is an isolation bug, not a slow
+      query, so this needs the isolation suite in its gate and not just the
+      TPC-H one
 - [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
       one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
       (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over
