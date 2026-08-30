@@ -237,10 +237,30 @@ experiment (DESIGN §4-A):
 - [x] And the census had been measuring the LABELLER: `EXPLAIN` had no
       `BitmapHeapScan` arm, so it printed the Go type and the count read zero
       even after bitmap paths were winning
-- [ ] **Next unlock, most likely**: the producer declines a FILTERED leaf,
-      because `BitmapHeapScan` has no residual `Cond` the way `IndexScan` got
-      one in `80a5e334d`. Give it one and the same restriction lifts. Q2, Q11,
-      Q20 and Q21 all have filtered leaves
+- [x] The filtered-leaf restriction was lifted (`01b9a9686`, `BitmapHeapScan`
+      now has a residual `Cond`). **It unlocked nothing** — zero plans changed.
+      The hypothesis was wrong
+- [x] **Measured why instead.** Those relations already GET bitmap paths,
+      including the exact one PG uses for Q2:
+
+      ```
+      BM supplier.supplier_nation_fkidx req=0x0002 built=true cost=2588.7
+      ```
+
+      PG prices that same scan at **43.46**. Bitmap is not blocked for
+      Q2/Q11/Q20/Q21 — it is MISPRICED by roughly 60x and loses to the plain
+      index probe
+- [ ] **The real next step is `costBitmapHeapScan`**, and two terms are missing:
+  - [ ] PG blends random toward SEQUENTIAL page cost as the touched fraction
+        grows: `cost_per_page = spc_random_page_cost -
+        (spc_random_page_cost - spc_seq_page_cost) * sqrt(pages_fetched / T)`
+        (`cost_bitmap_heap_scan`, costsize.c:1023). goopg charges full random
+        cost per page, which is most of the 60x — a bitmap scan touching most
+        of a relation is priced as if every page were a random seek, which is
+        exactly the case bitmap exists to make cheap
+  - [ ] PG's is a nested-loop inner, so its pages are amortised by `loop_count`
+        (the same arm `07f4f7814` added to `cost_index`). `costBitmapHeapScan`
+        has no `loop_count` notion at all
 
 ### B (original notes) — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans) — BLOCKED on a consumer
 

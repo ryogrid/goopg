@@ -854,9 +854,35 @@ first). The lesson is the same and is now stated twice on purpose: when a
 mechanism resists explanation, print the state at the failure and stop
 theorising.
 
-### 11.4 What is left
+### 11.4 What is left, measured rather than guessed
 
 Four of PG's six bitmap scans (Q2, Q11, Q20, Q21) and Q13/Q16's index-only
-scans. The bitmap producer declines a FILTERED leaf, because `BitmapHeapScan`
-has no residual `Cond` the way `IndexScan` now does — that is the most likely
-next unlock, and it is the same fix `80a5e334d` made for the index arm.
+scans.
+
+The filtered-leaf restriction was named here as "the most likely next unlock".
+It was lifted in `01b9a9686` and **unlocked nothing** — zero plans changed.
+Instrumenting the producer instead of guessing again shows why: those relations
+already GET bitmap paths, including the exact one PG uses for Q2.
+
+```
+BM supplier.supplier_nation_fkidx req=0x0002 built=true cost=2588.7
+```
+
+PG prices that same scan at **43.46**. So bitmap is not BLOCKED for those four
+queries — it is **mispriced by roughly 60x** and loses to the plain index probe.
+Two terms are missing from `costBitmapHeapScan`, and the first is most of the
+gap:
+
+1. PG blends random toward SEQUENTIAL page cost as the touched fraction grows —
+   `cost_per_page = spc_random_page_cost - (spc_random_page_cost -
+   spc_seq_page_cost) * sqrt(pages_fetched / T)` (`cost_bitmap_heap_scan`,
+   costsize.c:1023). goopg charges full random cost per page, so a bitmap scan
+   touching most of a relation is priced as if every page were a random seek —
+   precisely the case bitmap exists to make cheap.
+2. PG's is a nested-loop inner, so its pages are amortised by `loop_count`, the
+   same arm `07f4f7814` added to `cost_index`. `costBitmapHeapScan` has no
+   `loop_count` notion at all.
+
+That is a cost-formula gap with a named PG oracle on both terms, which is a very
+different remaining task from the "missing infrastructure" this document opened
+with.
