@@ -1366,6 +1366,48 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			jn.RightKey = cloneExprReplacingOuter(n.RightKey, replace)
 		}
 		return &jn, nil
+	case *NestedLoopIndexJoin:
+		// D3.0 clone, NLI arm. Without it every scalar/EXISTS subquery whose
+		// inner plan the search shaped as an NLI failed to decorrelate — and
+		// failed SILENTLY, because `unnestSubqueriesInPlan`'s driver loop
+		// swallows the error (`if err != nil || newOuter == nil { break }`) and
+		// simply leaves the sublink as a correlated SubPlan. That is how TPC-H
+		// Q2 regressed 1.6 s -> 84.4 s when `cost_index`'s `loop_count` arm
+		// (07f4f7814) started producing NLI shapes inside subquery plans: the
+		// cloner's node-kind list had never needed one, so the failure looked
+		// like a costing decision rather than a missing switch case.
+		outerNode, err := clonePlanReplacingOuter(n.Outer, replace)
+		if err != nil {
+			return nil, err
+		}
+		innerNode, err := clonePlanReplacingOuter(n.Inner, replace)
+		if err != nil {
+			return nil, err
+		}
+		is, isIdx := innerNode.(*IndexScan)
+		if !isIdx {
+			// The `*IndexScan` arm below demotes a probe to a `*SeqScan` when
+			// its key is a HARVESTED correlation, because after replacement the
+			// scan would probe its own column. `Inner` is typed `*IndexScan`
+			// and cannot carry that demotion, and the equality it stands for is
+			// the one the enclosing join is about to enforce — so decline here
+			// rather than build a node the plan builder must refuse. Declining
+			// is what this whole arm did before it existed, so this case is no
+			// worse than the status quo.
+			return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: NLI inner demoted to a non-index scan"}
+		}
+		nli := *n
+		nli.Outer = outerNode
+		nli.Inner = is
+		if n.Predicate != nil {
+			nli.Predicate = cloneExprReplacingOuter(n.Predicate, replace)
+		}
+		// `InnerMemo.Child` ALIASES `Inner` (plan.go), and the clone has a new
+		// `Inner`, so carrying the old wrapper would point the cache at the
+		// original scan. Drop it: the cache is an optimisation, and no cache is
+		// always correct.
+		nli.InnerMemo = nil
+		return &nli, nil
 	case *Filter:
 		child, err := clonePlanReplacingOuter(n.Child, replace)
 		if err != nil {
