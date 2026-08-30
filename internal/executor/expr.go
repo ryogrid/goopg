@@ -548,6 +548,22 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		}
 		return NullDatum, nil
 	case *optimizer.NumericConst:
+		// Take the same int64 fast paths the heap decoder takes
+		// (decodePhysicalPGValueMctxStyled's "numeric" arm). This arm is
+		// evaluated once per ROW, not once per query — a literal like `24` or
+		// `0.04` in a WHERE clause was re-parsed through math/big.Int.SetString
+		// for every tuple scanned, which measured 5.6 % of CPU and 22.8 % of
+		// all allocations on a TPC-H Q6 scan. The fast paths are a strict
+		// subset of parseNumeric: they reject exponents, underscores and
+		// anything past 18 digits, so those still fall through unchanged.
+		// (docs/design/not_ralph/tpch-q6-numeric-decode/)
+		if v, s, ok := parseNumericFastInt(x.Value); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: s}, nil
+		}
+		// expectedScale = -1 accepts whatever scale the literal spells.
+		if v, s, ok := parseNumericFastScale(x.Value, -1); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: s}, nil
+		}
 		m, s, err := parseNumeric(x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(), Message: err.Error()}

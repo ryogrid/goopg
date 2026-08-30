@@ -132,6 +132,15 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 			if so := unwrapSeqScanOp(child); so != nil {
 				so.ssiGistPred = p.Predicate
 				so.ssiGinPred = p.Predicate
+				// Same predicate, second use: let the scan reject tuples
+				// before deforming and deep-copying them. Pure
+				// pre-rejection — filterOp still evaluates it on the
+				// survivors — and armed only for expressions
+				// planScanPrefilter proves safe to evaluate twice.
+				// See scan_prefilter.go.
+				if pf, pok := planScanPrefilter(p.Predicate, len(so.cols)); pok {
+					so.prefilter, so.prefilterSet = pf, true
+				}
 			}
 		}
 		// M0054-0005a-followup: filterOp is a pure pass-through
@@ -479,6 +488,15 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 			if so, ok2 := tree.ops[childIdx].state.(*seqScanOp); ok2 {
 				so.ssiGistPred = p.Predicate
 				so.ssiGinPred = p.Predicate
+				// Same predicate, second use: let the scan reject tuples
+				// before deforming and deep-copying them. Pure
+				// pre-rejection — filterOp still evaluates it on the
+				// survivors — and armed only for expressions
+				// planScanPrefilter proves safe to evaluate twice.
+				// See scan_prefilter.go.
+				if pf, pok := planScanPrefilter(p.Predicate, len(so.cols)); pok {
+					so.prefilter, so.prefilterSet = pf, true
+				}
 			}
 		}
 		// Phase C.3: predicate compiled into exprTreeSlab; filterState holds
