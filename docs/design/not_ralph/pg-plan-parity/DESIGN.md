@@ -409,16 +409,51 @@ evaluated over (PG does, in `cost_qual_eval`). Until it does, making
 parameterised inners cheaper will keep pulling plans toward correlated
 subplans that goopg then executes badly.
 
+### 9.3b The unexplained fact that decided it
+
+Re-applied and re-measured to find the Q2 fix, the decorrelation path was
+instrumented — and it reports SUCCESS on the very subquery that ends up as a
+SubPlan:
+
+```
+UNNEST scalar ACCEPTED: *optimizer.Project
+UNNEST apply: params=1 residuals=0
+(no BAIL from any of: planHasOuterRefRemaining, no-Filter-contains-subquery,
+ not-AND-reachable, buildUnnestedSubquery-returned-nil)
+```
+
+`canUnnestSubquery` accepts, `unnestSubquery` runs to completion and returns a
+rewritten tree — and `EXPLAIN` still shows `Filter: (partsupp.ps_supplycost =
+(SubPlan 1))`. So the SubPlan in the final plan is not the one the unnester
+declined to remove; something downstream re-creates or re-plans it. That is a
+bug in its own right and it is NOT understood.
+
+`innerPlanIsIndexProbeCheap` (unnest.go) was the expected culprit — it is the
+S6/D6.2 policy that keeps a SubPlan when the inner is probe-shaped, and it names
+Q2 in its own comment. It is not: it returned false (accept) in this build.
+
 ### 9.4 Decision
 
-Reverted. Shipping a 43x regression on a benchmark query to gain plan-shape
-parity on the others is the wrong trade to make silently, and the fix is not a
-tweak to the arm — it is subplan cost placement, a separate piece of work.
+Reverted — twice, the second time after re-applying it specifically to hunt the
+Q2 fix. Re-measured on a fresh server per arm: **Q2 1.6 s -> 84.4 s**, Q11
+1.0 s -> 0.2 s, Q5 and Q8 unchanged.
 
-The resurrection order is: (1) charge SubPlan evaluation over its row count in
-`subplan_cost.go`, re-check that Q2 keeps its de-correlated plan or gets PG's
-placement; (2) re-apply the `loop_count` arm; (3) re-run the 21-query byte gate
-AND a timing pass — the byte gate alone would have passed this change.
+The deciding reason is §9.3b, not the regression by itself. A 53x regression
+whose mechanism is understood is a trade to put in front of a human; one that
+rests on an unexplained observation is not shippable at all, because the
+unexplained part may be the actual defect and the plan change merely what
+exposed it.
+
+The work is preserved as
+[`wip/loop-count-arm.patch`](wip/loop-count-arm.patch) — it applies cleanly to
+`80a5e334d` and carries its own tests — so resurrecting it is `git apply`, not
+a rewrite.
+
+Resurrection order: (1) explain §9.3b — find what re-creates SubPlan 1 after a
+successful unnest; (2) charge SubPlan evaluation over the row count it is
+evaluated over (PG `cost_qual_eval`), `subplan_cost.go`; (3) `git apply` the
+patch; (4) re-run the 21-query byte gate AND a timing pass on every query whose
+plan changed.
 
 **That last point is the transferable lesson.** All 21 result sets were
 byte-identical and every unit test passed. A row-count gate cannot see a 43x

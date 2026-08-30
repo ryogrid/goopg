@@ -96,10 +96,15 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] **Q2 2.0 s -> 87.3 s** — goopg evaluates SubPlan 1 as a Filter above a
       160,000-row join where PG evaluates it inside the Hash Cond over 670
       `part` rows
-- [ ] Prerequisite before re-applying: charge a SubPlan's evaluation cost over
-      the row count it will be evaluated over (PG `cost_qual_eval`),
-      `subplan_cost.go`
-- [ ] Then re-apply the arm and re-run BOTH the byte gate and a timing pass
+- [x] Preserved as `wip/loop-count-arm.patch`; applies cleanly to `80a5e334d`
+      and carries its own tests
+- [ ] **First**: explain DESIGN §9.3b — the unnester reports SUCCESS on Q2's
+      subquery (`UNNEST scalar ACCEPTED`, `params=1 residuals=0`, no bail) and
+      `SubPlan 1` still reaches the final plan. Something downstream re-creates
+      or re-plans it. Not understood, and it is why the arm was not shipped
+- [ ] Then: charge a SubPlan's evaluation cost over the row count it will be
+      evaluated over (PG `cost_qual_eval`), `subplan_cost.go`
+- [ ] Then `git apply` the patch and re-run BOTH the byte gate and a timing pass
 
 ### A — Index Only Scan (Q13, Q16, Q22) — BLOCKED on attribute-usage analysis
 
