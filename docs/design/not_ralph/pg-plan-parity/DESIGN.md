@@ -1046,6 +1046,32 @@ same durable-sidecar path is the place to look.
 
 **Why this matters beyond bitmap.** Every cost comparison in this document was
 made on a restarted server, i.e. against index scans priced at `max_IO_cost`.
-That includes the 27-vs-6 bitmap over-selection and the q21/q08 slowdowns in
-§11.4. Fix the persistence first and re-run them before calibrating anything
-else — the trade those numbers describe may not exist.
+
+### 13.2 Fixed (`b48008455`), and it retired the trade
+
+The persisted `pg_statistic` row already had `stakind3`/`stanumbers3` columns,
+written as 0/NULL. Correlation now rides there as PG's
+`STATISTIC_KIND_CORRELATION` (3) — a one-element `stanumbers` array with no
+`stavalues`, which is PG's layout for that slot — with the decoder in
+`catalog/codec.go` and the startup reload in `initdb/open.go`.
+
+Verified end to end rather than by inspection: ANALYZE, restart, then print what
+`indexCorrelationFor` reads — `nation_pk` 1, `nation_regionkey_fkidx` 0.355,
+`supplier_nation_fkidx` -0.017, identical to the in-session values and
+previously all zero.
+
+**Result: Bitmap Heap Scan 1 -> 6, matching PG's count**, with four of PG's five
+bitmap queries covered (Q11, Q17, Q20, Q21), 21/21 result sets byte-identical,
+and **every TPC-H query the same speed or faster** — Q3 7.2 s -> 3.6 s.
+
+And it retired §11.4's trade outright. That section recorded the double-count
+cost fix as buying PG's bitmap targets at the price of q21 +37% and q08 2x.
+Those measurements were taken against index scans priced at `max_IO_cost`. With
+correlation restored, bitmap reaches PG's count **with no cost fix and no
+slowdown at all** — so the trade was an artefact of the missing statistic, not a
+real choice. The prediction in the first draft of this section, that "the trade
+those numbers describe may not exist", held.
+
+That is the strongest form of this document's recurring lesson: a calibration
+conclusion is only as good as the statistics underneath it, and four rounds of
+bitmap cost analysis were conducted on top of a missing one.

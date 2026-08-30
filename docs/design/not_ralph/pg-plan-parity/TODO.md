@@ -414,15 +414,26 @@ experiment (DESIGN §4-A):
       `nation_regionkey_fkidx` 0.355, `supplier_nation_fkidx` -0.017. So
       correlation is computed and does reach `indexCorrelationFor` — it is
       **not persisted or not restored**
-- [ ] **Fix that first, before any further calibration.** Same shape as §9's
-      NDistinct/NDistinctFrac split: look at the durable stats sidecar written
-      by ANALYZE (`operators_analyze.go`) and re-read at startup
-      (`initdb/open.go`). `catalog.ColumnStats.Correlation` is a plain float in
-      the same struct that already round-trips
-- [ ] **Then re-run everything.** Every cost comparison in this document was
-      made on a restarted server, i.e. against index scans priced at
-      `max_IO_cost`. That includes the 27-vs-6 bitmap over-selection and the
-      q21/q08 slowdowns — the trade those numbers describe may not survive
+- [x] **FIXED** (`b48008455`). The persisted `pg_statistic` row already had
+      `stakind3`/`stanumbers3` columns written as 0/NULL; correlation now rides
+      there as PG's `STATISTIC_KIND_CORRELATION`, with the decoder in
+      `catalog/codec.go` and the reload in `initdb/open.go`. Verified by
+      ANALYZE -> restart -> print
+- [x] **Bitmap Heap Scan 1 -> 6, PG's count**, covering four of PG's five
+      (Q11, Q17, Q20, Q21). 21/21 byte-identical, every query same or FASTER,
+      Q3 7.2 s -> 3.6 s
+- [x] **The §11.4 trade is retired.** The double-count cost fix appeared to buy
+      the bitmap targets at q21 +37% / q08 2x; those numbers were measured
+      against index scans priced at `max_IO_cost`. With correlation restored
+      bitmap reaches PG's count with NO cost fix and no slowdown, so the trade
+      was an artefact of the missing statistic
+- [ ] Remaining on bitmap: **Q2** is the one of PG's five still not covered, and
+      goopg picks bitmap on **Q8** where PG does not. Re-measure that pair now
+      that the statistic is real — every earlier comparison in this file is
+      stale
+- [ ] The double-count fix (§11.4) is still unlanded and still oracle-correct.
+      Re-evaluate it on top of the restored correlation rather than on the old
+      numbers
 - [ ] Worth a regression test in its own right, independent of plan parity: a
       bitmap scan forced over a relation big enough to go lossy, compared
       against the seq-scan result. That test would have caught this years
