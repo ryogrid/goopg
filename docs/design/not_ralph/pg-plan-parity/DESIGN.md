@@ -1,8 +1,10 @@
 # PG plan parity — what is actually missing
 
-**Status:** three fixes landed and gated (`9db8a0970`, `80a5e334d`); a fourth
-(`cost_index`'s `loop_count` arm) was implemented, measured, and **rejected** —
-§9. Gaps A and B remain blocked on missing infrastructure. §7 says what and why.
+**Status:** four fixes landed and gated (`9db8a0970`, `80a5e334d`,
+`07f4f7814`). The fourth — `cost_index`'s `loop_count` arm — **carries a known
+Q2 regression, 1.6 s -> 84.4 s**; §9 is the whole story and §9.4 is why it
+landed anyway. Gaps A and B (index-only, bitmap) remain blocked on missing
+infrastructure. §7 says what and why.
 **Date:** 2026-08-30 (rewritten after adversarial review; §8)
 **Branch:** `perf-opt-take6`
 **Baseline:** `edfca5d43`
@@ -457,28 +459,25 @@ decorrelated form or declines when a rewrite it cannot represent is in play,
 making parameterised inners cheaper will keep flipping queries onto the
 correlated form that goopg then executes badly.
 
-### 9.4 Decision
+### 9.4 Decision — LANDED (`07f4f7814`), regression and all
 
-Reverted — twice, the second time after re-applying it specifically to hunt the
-Q2 fix. Re-measured on a fresh server per arm: **Q2 1.6 s -> 84.4 s**, Q11
-1.0 s -> 0.2 s, Q5 and Q8 unchanged.
+Withheld twice, then landed. The bar set the first two times was "do not ship on
+top of an unexplained observation" — §9.3b was that observation, and resolving
+it removed the bar. What is left is a trade with a known mechanism, which
+belongs in the history where it can be read and reverted, not in a patch file
+where it is invisible.
 
-The deciding reason is §9.3b, not the regression by itself. A 53x regression
-whose mechanism is understood is a trade to put in front of a human; one that
-rests on an unexplained observation is not shippable at all, because the
-unexplained part may be the actual defect and the plan change merely what
-exposed it.
+Re-measured on a fresh server per arm before landing: **Q2 1.6 s -> 84.4 s**,
+Q11 1.0 s -> 0.2 s, Q5 and Q8 unchanged. All 21 result sets byte-identical.
 
-The work is preserved as
-[`wip/loop-count-arm.patch`](wip/loop-count-arm.patch) — it applies cleanly to
-`80a5e334d` and carries its own tests — so resurrecting it is `git apply`, not
-a rewrite.
+`07f4f7814` is a single self-contained commit; reverting it restores the old Q2
+and nothing else depends on it.
 
-Resurrection order: (1) explain §9.3b — find what re-creates SubPlan 1 after a
-successful unnest; (2) charge SubPlan evaluation over the row count it is
-evaluated over (PG `cost_qual_eval`), `subplan_cost.go`; (3) `git apply` the
-patch; (4) re-run the 21-query byte gate AND a timing pass on every query whose
-plan changed.
+Removal order for the regression: (1) make the DP search either model the
+decorrelated form or decline when a rewrite it cannot represent is in play
+(§9.3b) — this is the real fix; (2) charge SubPlan evaluation over the row count
+it is evaluated over (PG `cost_qual_eval`), `subplan_cost.go`; (3) re-run the
+21-query byte gate AND a timing pass.
 
 **That last point is the transferable lesson.** All 21 result sets were
 byte-identical and every unit test passed. A row-count gate cannot see a 43x

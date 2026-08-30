@@ -86,7 +86,10 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Measured: Q3's parameterised inner 30,006 rows -> 4.9; Q4/Q21 index scans
       30,006 -> 4 (actual ~4 lineitems per order)
 
-### 3 — `cost_index`'s `loop_count` arm — **REJECTED**, see DESIGN §9
+### 3 — `cost_index`'s `loop_count` arm — **LANDED** (`07f4f7814`), see DESIGN §9
+
+**Carries a known regression: Q2 1.6 s -> 84.4 s.** Revert this one commit to
+undo it; nothing else depends on it.
 
 - [x] Implemented faithfully (`index_pages_fetched` over `tuples * loop_count`,
       pro-rated; `get_loop_count` = smallest outer row count)
@@ -96,8 +99,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] **Q2 2.0 s -> 87.3 s** — goopg evaluates SubPlan 1 as a Filter above a
       160,000-row join where PG evaluates it inside the Hash Cond over 670
       `part` rows
-- [x] Preserved as `wip/loop-count-arm.patch`; applies cleanly to `80a5e334d`
-      and carries its own tests
+- [x] Landed as `07f4f7814`, with the trade stated in the commit message
 - [x] DESIGN §9.3b **explained**: not the unnester. Both builds report ACCEPTED
       with no bail; HEAD's plan has 0 SubPlan and the `loop_count` build's has
       1. The DP join search re-plans from the clause list and does not carry
@@ -109,7 +111,7 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
       costing against it — two planners, no comparison
 - [ ] Then: charge a SubPlan's evaluation cost over the row count it will be
       evaluated over (PG `cost_qual_eval`), `subplan_cost.go`
-- [ ] Then `git apply` the patch and re-run BOTH the byte gate and a timing pass
+- [ ] Then re-run BOTH the byte gate and a timing pass and confirm Q2 is back
 
 ### A — Index Only Scan (Q13, Q16, Q22) — BLOCKED on attribute-usage analysis
 
