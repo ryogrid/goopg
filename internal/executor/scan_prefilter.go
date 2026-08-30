@@ -140,7 +140,15 @@ func prefilterSafeExpr(e optimizer.Expr, maxIdx *int) bool {
 // surface from there keeps error position, message and ordering byte-identical
 // to a build with the prefilter disabled.
 func (o *seqScanOp) evalPrefilter() (bool, error) {
-	v, err := evalExpr(o.prefilter.pred, o.scanRow, o.ctx)
+	// evalExprSlot with a cached SlotView, not evalExpr: evalExpr boxes the
+	// Row into a SlotView interface on every call, and boxing a slice
+	// heap-allocates (runtime.convTslice). That was one allocation per scanned
+	// row — 32 % of the query's total — to recompute a value that never
+	// changes, since o.scanRow's backing array is stable for the scan.
+	if o.scanSlot == nil {
+		o.scanSlot = rowSlotView(o.scanRow)
+	}
+	v, err := evalExprSlot(o.prefilter.pred, o.scanSlot, o.ctx)
 	if err != nil {
 		return true, err
 	}

@@ -715,32 +715,70 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 }
 
 // PageGetHeapTuple reads the tuple stored in a 1-based line-pointer slot.
+// The returned tuple owns its memory and is independent of p.
 func PageGetHeapTuple(p Page, slot uint16) (HeapTuple, error) {
+	t, _, err := PageGetHeapTupleInto(p, slot, nil)
+	return t, err
+}
+
+// PageGetHeapTupleInto is PageGetHeapTuple with a caller-supplied scratch
+// buffer, returning the (possibly regrown) buffer alongside the tuple.
+//
+// The returned tuple's Data and Bitmap ALIAS buf — they are valid only until
+// the next call that reuses it. Pass nil for the allocating behaviour of
+// PageGetHeapTuple. HeapTuple has exactly two slice fields (Data, Bitmap);
+// Header is all scalars, so those two are the whole aliasing surface.
+//
+// Why a scratch buffer at all: reading one tuple used to cost THREE
+// allocations and three copies — one here for the raw bytes, then two more
+// inside ParseHeapTuple re-copying Data and Bitmap out of a buffer that was
+// already private. On a TPC-H Q6 scan that was 65 % of every allocation the
+// query made. See docs/design/not_ralph/tpch-q6-numeric-decode/design-take6.md.
+//
+// Caller contract: nothing derived from the returned tuple may outlive the
+// next reuse of buf. seqScanOp satisfies this because it consumes the tuple
+// entirely within one Next iteration, and because no heap-decode arm produces
+// a Datum aliasing the tuple bytes — every varlena arm copies into the
+// per-page arena or into owned memory. TestDecodedRowDoesNotAliasSourceBuffer
+// pins that invariant so a future arm that starts aliasing trips over it.
+func PageGetHeapTupleInto(p Page, slot uint16, buf []byte) (HeapTuple, []byte, error) {
 	if slot == 0 {
-		return HeapTuple{}, ErrInvalidSlot
+		return HeapTuple{}, buf, ErrInvalidSlot
 	}
 	count, err := PageLinePointerCount(p)
 	if err != nil {
-		return HeapTuple{}, err
+		return HeapTuple{}, buf, err
 	}
 	idx := int(slot) - 1
 	if idx < 0 || idx >= count {
-		return HeapTuple{}, ErrInvalidSlot
+		return HeapTuple{}, buf, ErrInvalidSlot
 	}
 	item, err := readItemID(p, idx)
 	if err != nil {
-		return HeapTuple{}, err
+		return HeapTuple{}, buf, err
 	}
 	if item.Flags != ItemIDNormal {
-		return HeapTuple{}, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+		return HeapTuple{}, buf, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
 	}
 	off := int(item.Offset)
 	ln := int(item.Length)
 	if off < 0 || ln < 0 || off+ln > len(p) {
-		return HeapTuple{}, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+		return HeapTuple{}, buf, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
 	}
-	raw := append([]byte(nil), p[off:off+ln]...)
-	return ParseHeapTuple(raw)
+	if cap(buf) < ln {
+		buf = make([]byte, ln)
+	}
+	raw := buf[:ln]
+	copy(raw, p[off:off+ln])
+	// parseHeapTupleAlias, NOT ParseHeapTuple: raw is already private to this
+	// caller, so ParseHeapTuple's defensive re-copy of Data and Bitmap would
+	// copy a private buffer into another private buffer. ParseHeapTuple keeps
+	// that copy for its own callers, whose input may be a live page alias.
+	t, err := parseHeapTupleAlias(raw)
+	if err != nil {
+		return HeapTuple{}, buf, err
+	}
+	return t, buf, nil
 }
 
 // PageGetHeapTupleNoCopy reads the tuple at the 1-based slot, with

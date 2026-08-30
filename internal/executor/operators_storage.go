@@ -1038,6 +1038,14 @@ type seqScanOp struct {
 	// and docs/design/not_ralph/tpch-q6-numeric-decode/.
 	prefilter    scanPrefilter
 	prefilterSet bool
+	// scanSlot is the boxed SlotView over scanRow, cached because
+	// converting a slice to an interface heap-allocates
+	// (runtime.convTslice) and scanRow's identity does not change
+	// between rows. Rebuilt only when scanRow is reallocated.
+	scanSlot SlotView
+	// tupleBuf is the per-scan scratch buffer PageGetHeapTupleInto copies
+	// each tuple into, so a scan costs no allocation per tuple.
+	tupleBuf []byte
 	// gistSSIIdxOID / gistSSIColIdx are resolved in Open from ssiGistPred + the
 	// table's GiST index: the index OID used as the predicate-lock relation and
 	// the position of the indexed point column in cols. gistSSIIdxOID==0 disables
@@ -1569,8 +1577,16 @@ func (o *seqScanOp) Open(ctx *Context) error {
 				break
 			}
 		}
-		if o.gistSSIIdxOID != 0 || o.ginSSIIdxOID != 0 ||
-			hasEnum || o.typeACLColIdx >= 0 || o.attrACLColIdx >= 0 {
+		// All THREE aclitem columns must be listed. pg_database.datacl gets the
+		// identical post-clone KindBytes -> aclitemout rewrite that typacl and
+		// attacl do, and omitting it would let a predicate on datacl be
+		// prefiltered against the raw _aclitem blob while filterOp sees the
+		// rendered text — breaking the "can only remove rows the Filter would
+		// remove anyway" guarantee this block exists to protect. Found by
+		// adversarial review of design-take6.md; exactly the sibling-path
+		// failure mode.
+		if o.gistSSIIdxOID != 0 || o.ginSSIIdxOID != 0 || hasEnum ||
+			o.typeACLColIdx >= 0 || o.attrACLColIdx >= 0 || o.dbACLColIdx >= 0 {
 			o.prefilterSet = false
 		}
 	}
@@ -1931,7 +1947,14 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if o.pinned != nil {
 				o.pinned.RLock()
 			}
-			tuple, err := storage.PageGetHeapTuple(page, o.curSlot)
+			// Scratch-buffer read: the tuple's Data/Bitmap alias o.tupleBuf and
+			// are valid only until the next iteration reuses it. Safe here
+			// because the tuple is consumed entirely within this iteration
+			// (decode -> detoast -> cloneRowOwned) and no decode arm produces a
+			// Datum aliasing the tuple bytes — see PageGetHeapTupleInto's
+			// contract and TestDecodedRowDoesNotAliasSourceBuffer.
+			tuple, tbuf, err := storage.PageGetHeapTupleInto(page, o.curSlot, o.tupleBuf)
+			o.tupleBuf = tbuf
 			o.curSlot++
 			if err != nil {
 				if o.pinned != nil {
@@ -2026,6 +2049,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// which deep-copies arena bytes via cloneRowOwned.
 			if o.scanRow == nil || len(o.scanRow) != len(o.cols) {
 				o.scanRow = acquireRow(len(o.cols))
+				o.scanSlot = nil // rebox against the new backing array
 			}
 			// Use bitmap + natts to correctly decode rows that have NULL
 			// columns or were stored before ALTER TABLE ADD COLUMN expanded
