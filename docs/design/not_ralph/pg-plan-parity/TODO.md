@@ -346,16 +346,47 @@ experiment (DESIGN §4-A):
       beneath a Gather, and that call is NOT gated on `BitmapHeapScan.Parallel`.
       So there are two independent places that put a bitmap scan into parallel
       mode, and the flag is only one of them
-- [ ] **Remaining work, in order.** (1) Decide whether to fix the leader/worker
-      handoff in `prebuildBitmapScans` + `attachParallelBitmapScan`
-      (operators_gather.go:135-160, :295, :334) or to gate BOTH entry points off
-      until it is; the leader builds the TID bitmap, sets its own
-      `tbm`/`iter`/`ownBitmap`, then publishes — and the leader's own operator
-      may then take `nextParallel` and ignore what it just built, which is the
-      first thing to check. (2) Land the double-count fix, which is written and
-      oracle-verified and blocked only by this. (3) Re-run the 21-query gate;
-      expect bitmap to jump well past PG's 6, so re-check the census against PG
-      per query rather than by count
+- [x] **ROOT CAUSE FOUND, and it is not the parallel handoff.**
+      `bitmapHeapScanOp` **drops every row on a LOSSY page**, in BOTH paths:
+
+      ```go
+      // nextParallel
+      if entry.isLossy {
+              o.lossyPages++
+              // … a lossy page emits nothing through this operator.
+              // Full lossy-page iteration is deferred (S5.x follow-up).
+              continue
+      }
+
+      // nextSerial
+      if lossy {
+              // We'll return one row at a time and save position.
+              continue // fall through to lossy handling below
+      }
+      ```
+
+      There is no lossy handling below. Both comments misdescribe what the code
+      does — the parallel one claims to match the serial path, and the serial
+      one describes an implementation that was never written.
+
+      A TID bitmap goes lossy when it exceeds `work_mem`, which a scan of 6 M
+      `lineitem` rows does immediately. That is the 94% row loss on q03: 702 of
+      11415. It was invisible because bitmap paths never won on cost
+
+### B — the actual blocker: lossy-page iteration
+
+- [ ] **This, not costing, is what gap B needs.** Implement lossy-page
+      iteration: when a bitmap entry is lossy the scan must walk EVERY line
+      pointer on the page and re-check each tuple against `BitmapQual`
+      (PG: `bitgetpage` + the recheck path, nodeBitmapHeapscan.c). Until then a
+      bitmap scan over any relation large enough to overflow `work_mem`
+      silently returns a subset, so bitmap paths cannot be enabled broadly at
+      any cost setting
+- [ ] Only then: land the verified double-count fix and re-run the gate
+- [ ] Worth a regression test in its own right, independent of plan parity: a
+      bitmap scan forced over a relation big enough to go lossy, compared
+      against the seq-scan result. That test would have caught this years
+      earlier than a plan-shape census did
 - [ ] **The remaining calibration question, after that.** Startup 14.35 vs PG's
       7.87 is roughly `indexProbeCostMultiplier`, which `btreeIndexAMCost`
       applies at costindex.go:189. That knob exists because goopg's index access

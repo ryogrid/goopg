@@ -916,3 +916,62 @@ This is the third time in this document that a census number moving in the
 found pinning the defect it was meant to guard. Neither is a coincidence: a test
 written from the implementation rather than from the oracle will always agree
 with the implementation.
+
+
+## 12 Why bitmap parity is unreachable today: lossy pages are dropped
+
+The remaining four bitmap scans are not blocked by costing, by path generation,
+or by the parallel handoff. They are blocked by this, in
+`internal/executor/operators_bitmap.go`:
+
+```go
+// nextParallel
+if entry.isLossy {
+        o.lossyPages++
+        // … a lossy page emits nothing through this operator.
+        // Full lossy-page iteration is deferred (S5.x follow-up).
+        continue
+}
+
+// nextSerial
+if lossy {
+        // We'll return one row at a time and save position.
+        continue // fall through to lossy handling below
+}
+```
+
+**A lossy page emits nothing, on both paths.** There is no lossy handling below
+the serial branch; its comment describes code that was never written, and the
+parallel branch's comment claims to match a serial behaviour that is itself
+unimplemented.
+
+A TID bitmap goes lossy once it exceeds `work_mem`, which a scan over 6 M
+`lineitem` rows does at once. That is exactly the 94% row loss measured on Q3
+(702 rows of 11415) the moment bitmap paths began to win.
+
+### 12.1 Why this took so long to surface
+
+It is the fourth latent bug this work found in the bitmap feature, after the
+`EOF` contract violation (`b4bd87a1a`), the `Outer`-shape rewrap
+(`d24d9e6be`), and the double-charged heap cost. All four share one cause:
+**the planner never selected a bitmap path, so the executor's bitmap code had
+never run end to end.** Cost bugs kept the path unreachable, and unreachable
+code accumulated correctness bugs that only the cost fixes could expose. Each
+fix revealed the next.
+
+That is worth stating as a general risk rather than a bitmap anecdote: in a
+cost-based planner, an access method that never wins is not "implemented but
+unused" — it is untested, and its cost model is the only thing hiding that.
+
+### 12.2 What gap B actually needs
+
+Implement lossy-page iteration: on a lossy entry, walk every line pointer on the
+page and re-check each tuple against `BitmapQual` (PG's `bitgetpage` and the
+recheck path in `nodeBitmapHeapscan.c`). Until then, a bitmap scan over any
+relation large enough to overflow `work_mem` silently returns a subset, so
+bitmap paths cannot be enabled broadly at any cost setting — and the verified
+double-count fix (§11.4) must stay unlanded.
+
+This also deserves a regression test independent of plan parity: force a bitmap
+scan over a relation big enough to go lossy and compare against the seq-scan
+result. Such a test would have caught this long before a plan-shape census did.
