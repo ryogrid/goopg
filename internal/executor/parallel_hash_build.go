@@ -282,19 +282,47 @@ func (s *channelSource) Next() (TupleSlot, error) {
 	return &MaterializedSlot{schema: s.schema, row: row}, nil
 }
 
-// extractSeqScanFromPlan returns the *planner.SeqScan at the root of a plan
-// subtree, unwrapping a single Filter if present. Returns nil when the subtree
-// is not a parallel-scannable shape (e.g. IndexScan, join, subquery).
+// extractSeqScanFromPlan finds the scan that DRIVES a build subtree — the leaf
+// a parallel block allocator can be attached to — descending the pass-through
+// nodes Filter and Project to any depth. It returns nil for every other shape.
+//
+// It is deliberately NARROWER than attachParallelScan (parallel_scan.go), and
+// the asymmetry is a SAFETY PROPERTY, not an oversight. Do not "fix" it by
+// making the two match.
+//
+// attachParallelScan also descends aggregateOp, sortOp and a joinOp's probe
+// side. Those are safe THERE because the node it serves is a Gather, and the
+// planner has split the partial subtree accordingly: a Partial aggregate under
+// the Gather with a Finalize above it (optimizer/parallel.go, splitAgg), and
+// Gather Merge for the sorted case. The cooperative hash build has neither.
+// Its producers each call BuildWorker(buildPlan) and get the WHOLE aggregate,
+// then attachParallelScan partitions the scan beneath it — so N producers would
+// each aggregate their own partition and the consumer would union the partial
+// results into the hash table with no Finalize. For a HAVING sum(...) predicate
+// — TPC-H Q18's semi-join build side is exactly that — the result is silently
+// WRONG ROWS.
+//
+// Refusing to descend Aggregate (and Sort, and Join, which can reach an
+// Aggregate) is what prevents that today. Widening this walker is only safe for
+// a node kind that is 1:1 and order-independent, which Filter and Project are.
+//
+// Q18 also measures the cost side of descending joins: every producer redoes
+// each nested build, 35.7s -> 42.9-44.1s over two alternating rounds. But cost
+// is the SECOND reason to decline; correctness is the first. See
+// docs/design/not_ralph/parallel-hash-build-coverage/DESIGN.md §4.
 func extractSeqScanFromPlan(node optimizer.Node) *optimizer.SeqScan {
-	switch n := node.(type) {
-	case *optimizer.SeqScan:
-		return n
-	case *optimizer.Filter:
-		if s, ok := n.Child.(*optimizer.SeqScan); ok {
-			return s
+	for {
+		switch n := node.(type) {
+		case *optimizer.SeqScan:
+			return n
+		case *optimizer.Filter:
+			node = n.Child
+		case *optimizer.Project:
+			node = n.Child
+		default:
+			return nil
 		}
 	}
-	return nil
 }
 
 // parallelBuildEligible reports whether this hash join's build side can be
