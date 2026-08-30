@@ -1075,3 +1075,25 @@ those numbers describe may not exist", held.
 That is the strongest form of this document's recurring lesson: a calibration
 conclusion is only as good as the statistics underneath it, and four rounds of
 bitmap cost analysis were conducted on top of a missing one.
+
+### 13.3 Two errors that cancel
+
+Re-running the double-count fix on top of the restored correlation gives a
+result worth stating carefully. It now covers all FIVE of PG's bitmap queries,
+Q2 included — but it selects **24** bitmap scans against PG's 6, where leaving
+it out selects exactly **6** and covers four of the five.
+
+So the oracle-correct change makes goopg's aggregate behaviour diverge FURTHER
+from PG. That is only possible if **another term is under-charging bitmap and
+the double charge was compensating for it**. The two errors currently cancel,
+which is why today's count matches PG's for the wrong reason.
+
+Removing either alone makes things worse; both have to move together. The places
+to look, against `cost_bitmap_heap_scan` (costsize.c): goopg charges
+`cpu_tuple_cost` per tuple where PG additionally charges `qpqual_cost` per tuple
+and a `cpu_operator_cost` per bitmap entry, and `computeBitmapPages` may differ
+from `compute_bitmap_pages` on the `maxentries` / lossy-degradation path.
+
+The general form is worth keeping: **when fixing a verified bug moves a system
+further from its reference, look for the second bug it was cancelling** rather
+than reverting the fix and calling the reference wrong.

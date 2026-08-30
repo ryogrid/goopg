@@ -431,9 +431,22 @@ experiment (DESIGN §4-A):
       goopg picks bitmap on **Q8** where PG does not. Re-measure that pair now
       that the statistic is real — every earlier comparison in this file is
       stale
-- [ ] The double-count fix (§11.4) is still unlanded and still oracle-correct.
-      Re-evaluate it on top of the restored correlation rather than on the old
-      numbers
+- [x] **Re-evaluated the double-count fix on top of the restored correlation,
+      and it should stay unlanded — for a NEW reason.** It now covers all five
+      of PG's bitmap queries including Q2, but selects **24** bitmap scans
+      against PG's 6. Without it goopg selects **6**, matching PG's count, and
+      covers four of the five. Six-matching-six is closer to parity than
+      twenty-four-covering-five
+- [ ] **And that is a finding, not just a preference.** Removing a genuine
+      double-charge makes goopg's aggregate behaviour diverge FURTHER from PG.
+      That means another term is UNDER-charging bitmap, and the double charge
+      was accidentally compensating for it. Find that term before removing the
+      double charge — the two errors currently cancel, which is why the census
+      count looks right today for the wrong reason. Candidates: the CPU terms
+      (`cost_bitmap_heap_scan` charges `cpu_tuple_cost` per tuple; PG also
+      charges `qpqual_cost` per tuple and a `cpu_operator_cost` per bitmap
+      entry), and `computeBitmapPages` vs PG's `compute_bitmap_pages` on the
+      `maxentries` / lossy-degradation path
 - [ ] Worth a regression test in its own right, independent of plan parity: a
       bitmap scan forced over a relation big enough to go lossy, compared
       against the seq-scan result. That test would have caught this years
