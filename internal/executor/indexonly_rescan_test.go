@@ -44,3 +44,33 @@ func TestIndexOnlyScanRescanResetsScanState(t *testing.T) {
 		t.Errorf("the pre-Open guard mutated scan state: rows=%d idx=%d", len(o.rows), o.idx)
 	}
 }
+
+// TestBitmapHeapScanOpSatisfiesNLIInner is the bitmap half of the same claim
+// TestIndexOnlyScanOpSatisfiesNLIInner makes: a bitmap heap scan can be driven
+// as a nested-loop inner, which is what all six of PG's TPC-H bitmap scans are.
+//
+// Compile-time, for the same reason: the planner half (a parameterised bitmap
+// path) is worthless if the operator cannot be re-probed, so a drifted
+// signature should break the build rather than a benchmark.
+func TestBitmapHeapScanOpSatisfiesNLIInner(t *testing.T) {
+	var _ nliInner = (*bitmapHeapScanOp)(nil)
+}
+
+// TestBitmapOuterBindersForwardDownTheTree pins that every node which can sit
+// between the heap scan and the probe forwards the bound slot. A BitmapAnd that
+// silently dropped it would leave its children probing with a stale or nil
+// outer row — wrong rows, not a slow scan.
+func TestBitmapOuterBindersForwardDownTheTree(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   any
+	}{
+		{"bitmapIndexScanOp", (*bitmapIndexScanOp)(nil)},
+		{"bitmapAndOp", (*bitmapAndOp)(nil)},
+		{"bitmapOrOp", (*bitmapOrOp)(nil)},
+	} {
+		if _, ok := tc.op.(bitmapOuterBinder); !ok {
+			t.Errorf("%s does not implement bitmapOuterBinder; a parameterised probe under it would never see the outer row", tc.name)
+		}
+	}
+}

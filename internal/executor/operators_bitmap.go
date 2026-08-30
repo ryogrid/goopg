@@ -19,6 +19,16 @@ type bitmapProducer interface {
 	buildBitmap(ctx *Context) (*TIDBitmap, error)
 }
 
+// bitmapOuterBinder is the half of `nliInner` a bitmap PRODUCER needs when the
+// heap scan above it is a nested-loop inner: the probe key references outer
+// columns, so the slot has to reach the node that encodes the key. BitmapAnd /
+// BitmapOr forward it to their children; a producer that cannot be
+// parameterised simply does not implement it, and the heap scan then binds
+// nothing — which is the unparameterised case and needs no binding.
+type bitmapOuterBinder interface {
+	BindOuter(slot SlotView, outerWidth int)
+}
+
 // ---------------------------------------------------------------------------
 // bitmapIndexScanOp — PG's BitmapIndexScan (nodeBitmapIndexscan.c).
 // MultiExec-style: no Next(), only buildBitmap().
@@ -33,6 +43,13 @@ type bitmapIndexScanOp struct {
 
 	// scanRow is lazily allocated for evalExpr (needs a Row context).
 	scanRow Row
+
+	// outerSlot / outerWidth are bound by a nested-loop parent (BindOuter) when
+	// the bitmap heap scan above this node is a parameterised inner. The probe
+	// encoders resolve Key/Keys against the slot; nil is the unparameterised
+	// case, where the planner guarantees those reduce to constants.
+	outerSlot  SlotView
+	outerWidth int
 }
 
 func newBitmapIndexScanOp(p *optimizer.BitmapIndexScan) *bitmapIndexScanOp {
@@ -76,6 +93,13 @@ func (o *bitmapIndexScanOp) Open(ctx *Context) error {
 	}
 	o.tree = tree
 	return nil
+}
+
+// BindOuter records the slot a nested-loop parent binds before each rescan; the
+// probe encoders resolve Key/Keys against it. See bitmapOuterBinder.
+func (o *bitmapIndexScanOp) BindOuter(slot SlotView, outerWidth int) {
+	o.outerSlot = slot
+	o.outerWidth = outerWidth
 }
 
 func (o *bitmapIndexScanOp) Close() error {
@@ -173,7 +197,7 @@ func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, err error) 
 
 // lookupKey encodes a single-column equality key.
 func (o *bitmapIndexScanOp) lookupKey(col *catalog.Column) (lo, hi []byte, err error) {
-	val, evalErr := evalExpr(o.plan.Key, o.scanRow, o.ctx)
+	val, evalErr := evalExprSlot(o.plan.Key, o.outerSlot, o.ctx)
 	if evalErr != nil {
 		return nil, nil, evalErr
 	}
@@ -201,7 +225,7 @@ func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte,
 		if !found {
 			return nil, nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
 		}
-		val, evalErr := evalExpr(keyExpr, o.scanRow, o.ctx)
+		val, evalErr := evalExprSlot(keyExpr, o.outerSlot, o.ctx)
 		if evalErr != nil {
 			return nil, nil, evalErr
 		}
@@ -282,7 +306,40 @@ func newBitmapHeapScanOp(p *optimizer.BitmapHeapScan) *bitmapHeapScanOp {
 
 func (o *bitmapHeapScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
+// Open is the single-scan entry point: one-time setup, then let Next build the
+// bitmap lazily. A nested-loop parent instead calls openPrep once and Rescan per
+// outer row — see Rescan for what each probe must discard.
 func (o *bitmapHeapScanOp) Open(ctx *Context) error {
+	return o.openPrep(ctx)
+}
+
+// BindOuter forwards the parent's slot to the bitmap PRODUCER, which is where
+// the probe key is encoded. A producer that cannot be parameterised does not
+// implement bitmapOuterBinder and simply receives nothing.
+func (o *bitmapHeapScanOp) BindOuter(slot SlotView, outerWidth int) {
+	if b, ok := o.outerBitmap.(bitmapOuterBinder); ok {
+		b.BindOuter(slot, outerWidth)
+	}
+}
+
+// Rescan discards the previous probe's bitmap and page state so the next Next()
+// rebuilds from the newly bound outer row.
+//
+// `tbm` is the one that matters: Next builds it lazily on `o.tbm == nil`, so
+// leaving it set would silently reuse the PREVIOUS outer row's TID set — every
+// probe after the first returning the first probe's rows, which is a wrong
+// answer and not a slow one. The pinned page must be released rather than
+// dropped, or the buffer leaks one pin per outer row.
+func (o *bitmapHeapScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
+	o.BindOuter(outerSlot, outerWidth)
+	o.releasePinned()
+	o.tbm = nil
+	o.iter = nil
+	o.ownBitmap = false
+	return nil
+}
+
+func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "BitmapHeapScan requires storage handles in Context"}
 	}
@@ -667,6 +724,17 @@ func (o *bitmapAndOp) Next() (TupleSlot, error) {
 	panic("BitmapAnd does not support ExecProcNode call")
 }
 
+// BindOuter forwards to every input, so a parameterised probe nested under a
+// BitmapAnd still sees the outer row. An input that cannot be parameterised
+// does not implement bitmapOuterBinder and is skipped.
+func (o *bitmapAndOp) BindOuter(slot SlotView, outerWidth int) {
+	for _, in := range o.inputBitmaps {
+		if b, ok := in.(bitmapOuterBinder); ok {
+			b.BindOuter(slot, outerWidth)
+		}
+	}
+}
+
 func (o *bitmapAndOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	if len(o.inputBitmaps) == 0 {
 		return &TIDBitmap{}, nil
@@ -735,6 +803,15 @@ func (o *bitmapOrOp) Close() error {
 // Next panics — BitmapOr is MultiExec-style.
 func (o *bitmapOrOp) Next() (TupleSlot, error) {
 	panic("BitmapOr does not support ExecProcNode call")
+}
+
+// BindOuter forwards to every input — see bitmapAndOp.BindOuter.
+func (o *bitmapOrOp) BindOuter(slot SlotView, outerWidth int) {
+	for _, in := range o.inputBitmaps {
+		if b, ok := in.(bitmapOuterBinder); ok {
+			b.BindOuter(slot, outerWidth)
+		}
+	}
 }
 
 func (o *bitmapOrOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
