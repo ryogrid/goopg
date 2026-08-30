@@ -47,9 +47,19 @@ one had. Measured:
 | `pg_stats` rows for `lineitem` | **0** | populated |
 | `relallvisible` (`customer`/`orders`/`part`) | **0 / 0 / 0** | 3,662 / 27,814 / 4,198 |
 
-A cost-based planner with `reltuples = 0` and no `pg_stats` cannot prefer an
-index path — it has no selectivity and no relation size. It was not choosing
-sequential scans; it was choosing in the dark.
+**Precisely what that costs the planner** — and it is not "no size estimate",
+which an earlier draft of this paragraph claimed. goopg has a relation-size
+fallback: `seqScanRows` returns `EstRelRows` when `tableRows` is 0, derived from
+block counts by `GOOPG_RELSIZE_FALLBACK`, whose default stage is **2, i.e. on**.
+So with `reltuples = 0` the planner still has a *cardinality* for the relation.
+
+What it does not have is **selectivity**. `pg_stats` is empty, so there are no
+MCV lists, no histograms and no ndistinct — and selectivity is what decides
+whether a qual is narrow enough for an index path to beat a sequential scan.
+A planner that knows a table has 6 M rows but cannot estimate what fraction a
+predicate keeps will price an index scan over the whole relation, which never
+wins. That is the mechanism, and it is why the missing piece is `ANALYZE`
+specifically rather than relation sizes.
 
 This is documented behaviour of the bench harness, not a goopg defect:
 `CLAUDE.md` records that HammerDB's final ANALYZE step fails and that the gate

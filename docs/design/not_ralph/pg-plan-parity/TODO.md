@@ -17,6 +17,8 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Establish which paths the planner generates (index, index-only, bitmap — all)
 - [x] Confirm `addBaseRelBitmapPaths` is reachable from `addBaseRelIndexPaths`
 - [x] Measure goopg vs PG statistics state (`reltuples`, `relpages`, `pg_stats`, `relallvisible`)
+- [x] Confirm what `reltuples=0` actually costs the planner: NOT relation size
+      (`GOOPG_RELSIZE_FALLBACK` supplies it, default on) but SELECTIVITY
 - [x] Confirm `ANALYZE` works, and that it persists across sessions **and** restarts
 - [x] Confirm `VACUUM` populates `relallvisible`
 - [x] Re-run the plan comparison with both engines VACUUMed + ANALYZEd (the fair one)
