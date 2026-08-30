@@ -407,12 +407,22 @@ experiment (DESIGN §4-A):
       correlation **every index scan in goopg is priced at `max_IO_cost`** — the
       fully-uncorrelated worst case. Index probes are systematically overpriced,
       so bitmap (and seq) rivals win too often. See DESIGN §13
-- [ ] **Do this before any further cost calibration.** `operators_analyze.go`
-      computes correlation, so it is either not persisted/restored (the same
-      shape as the NDistinct/NDistinctFrac split in §9) or not projected by
-      `pg_stats`. One print in `indexCorrelationFor` distinguishes them. Every
-      index-vs-bitmap comparison in this document was made against an overpriced
-      index scan, so re-run them afterwards
+- [x] **Settled by measurement.** The `pg_stats` reading was a red herring —
+      that view NULLs correlation by design (`pgstats_e2e_test.go`). Printing
+      what the planner reads gives `corr=0` on the restarted server, but an
+      IN-SESSION `ANALYZE` restores it: `nation_pk` 1,
+      `nation_regionkey_fkidx` 0.355, `supplier_nation_fkidx` -0.017. So
+      correlation is computed and does reach `indexCorrelationFor` — it is
+      **not persisted or not restored**
+- [ ] **Fix that first, before any further calibration.** Same shape as §9's
+      NDistinct/NDistinctFrac split: look at the durable stats sidecar written
+      by ANALYZE (`operators_analyze.go`) and re-read at startup
+      (`initdb/open.go`). `catalog.ColumnStats.Correlation` is a plain float in
+      the same struct that already round-trips
+- [ ] **Then re-run everything.** Every cost comparison in this document was
+      made on a restarted server, i.e. against index scans priced at
+      `max_IO_cost`. That includes the 27-vs-6 bitmap over-selection and the
+      q21/q08 slowdowns — the trade those numbers describe may not survive
 - [ ] Worth a regression test in its own right, independent of plan parity: a
       bitmap scan forced over a relation big enough to go lossy, compared
       against the seq-scan result. That test would have caught this years

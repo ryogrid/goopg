@@ -992,9 +992,11 @@ goopg  pg_stats.correlation          PG
   supplier.s_nationkey  (empty)      0.030710574
 ```
 
-**goopg stores no correlation statistic at all.** `indexCorrelationFor`
-(costindex.go) reads `stats.Correlation` correctly; the value it reads is
-always zero. And `csquared = correlation²` is what `cost_index` interpolates
+**Correlation is computed, reaches the planner, and is LOST ACROSS A RESTART.**
+That is the corrected form; the first draft of this section said "goopg stores
+no correlation statistic at all", which the measurements below disprove.
+`indexCorrelationFor` (costindex.go) reads `stats.Correlation` correctly, and on
+a restarted server the value it reads is always zero: And `csquared = correlation²` is what `cost_index` interpolates
 between its two I/O bounds:
 
 ```go
@@ -1013,21 +1015,37 @@ index cost decision in the planner**, not just the bitmap comparison. §1 record
 "`indexCorrelationFor` returns 0 for every index goopg has today" as a fact
 about goopg's indexes; it is actually a missing statistic.
 
-### 13.1 What to check first
+### 13.1 Settled by measurement, in two steps
 
-`operators_analyze.go` has a `--- correlation (STATISTIC_KIND_CORRELATION) ---`
-section, so the value is COMPUTED. It does not reach the planner. The two
-candidates, in order:
+Both candidates were checked rather than argued.
 
-1. it is computed but not persisted, or not restored at startup — the same shape
-   as the `NDistinct`-vs-`NDistinctFrac` split in §9, where the absolute form
-   was lost across a restart and only the scale-free one survived;
-2. it is persisted but `pg_stats` does not project it, in which case the
-   planner may actually see it and the table above is measuring the view rather
-   than the statistic — check `catalog.ColumnStats.Correlation` directly before
-   concluding.
+**The `pg_stats` reading was a red herring.** `pgstats_e2e_test.go` asserts
+`correlation` is NULL in that view by design — "a slot goopg does not collect"
+— so the table above was measuring the VIEW, not the statistic. That comment is
+now stale, per what follows.
 
-Distinguishing those is one print in `indexCorrelationFor`, and it should come
-before any further cost calibration: with correlation missing, every
-index-vs-anything comparison in this document was made against an overpriced
-index scan.
+**Printing what the planner actually reads** gives `corr=0` for every index on
+the running (restarted) server — so the statistic really is zero there, and §13's
+conclusion about `max_IO_cost` stands.
+
+**But an in-session `ANALYZE` restores it:**
+
+```
+ANALYZE nation; ANALYZE supplier;  -- then EXPLAIN in the SAME session
+CORR idx=nation_pk               corr=1
+CORR idx=nation_regionkey_fkidx  corr=0.3553846153846154
+CORR idx=supplier_nation_fkidx   corr=-0.017069080910690808
+CORR idx=supplier_pk             corr=1
+```
+
+So ANALYZE computes correlation correctly and it does reach
+`indexCorrelationFor` — it is **not persisted or not restored**. That is
+precisely the shape of the `NDistinct`-vs-`NDistinctFrac` split in §9, where the
+absolute form was lost across a restart and only the scale-free one survived; the
+same durable-sidecar path is the place to look.
+
+**Why this matters beyond bitmap.** Every cost comparison in this document was
+made on a restarted server, i.e. against index scans priced at `max_IO_cost`.
+That includes the 27-vs-6 bitmap over-selection and the q21/q08 slowdowns in
+§11.4. Fix the persistence first and re-run them before calibrating anything
+else — the trade those numbers describe may not exist.
