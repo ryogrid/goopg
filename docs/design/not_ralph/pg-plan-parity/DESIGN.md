@@ -1,8 +1,9 @@
 # PG plan parity — what is actually missing
 
-**Status:** eight fixes landed and gated. **Index Only Scan is no longer zero:
-TPC-H Q22 now emits PG's plan** (§10). The Q2 regression is fixed (§9.5). Q13,
-Q16 and the six bitmap scans remain — §7 and §10.2 say what is left and why.
+**Status:** ten fixes landed and gated. **Index Only Scan and Bitmap Heap Scan
+are both off zero** — Q22 emits PG's index-only scan (§10), and Q8/Q17 emit
+parameterised bitmap scans roughly 9x faster than before (§11). The Q2
+regression is fixed (§9.5). Q13, Q16 and four of PG's six bitmap scans remain.
 **Date:** 2026-08-30 (rewritten after adversarial review; §8)
 **Branch:** `perf-opt-take6`
 **Baseline:** `edfca5d43`
@@ -802,3 +803,60 @@ enumerate dependents, was **four production files** — `joinlayout.go`,
 counted the name; the compiler counted the coupling, and they differed by an
 order of magnitude in the direction that discourages starting. When a type
 change is the question, ask the type checker, not `grep`.
+
+
+## 11 Bitmap scans: Q8 and Q17 landed (`94fd0c9b3`, `b4bd87a1a`)
+
+**Bitmap Heap Scan 0 -> 2, and both queries got ~9x faster: Q8 10.0 s -> 1.1 s,
+Q17 3.4 s -> 0.4 s.** goopg now picks a bitmap scan as a nested-loop inner,
+which is the shape all six of PG's TPC-H bitmap scans have.
+
+Three things had to be true. Only one of them was the planner.
+
+### 11.1 A pre-existing EOF-contract bug that only this consumer could expose
+
+`bitmapHeapScanOp` signalled exhaustion with `(nil, nil)` instead of
+`(nil, EOF)`. Every operator in the package returns `EOF` and every consumer
+tests `err == EOF`, so a nil slot with a nil error passes that test and arrives
+as a REAL row that happens to be nil. A top-level pull tolerated it because it
+stops on a nil slot anyway — which is exactly why it survived — but a
+`NestedLoopIndexJoin` inner following the contract does `slotRow(nil)`, gets a
+zero-length row, and panics with `index out of range [7] with length 0` from
+inside the join's predicate evaluation, on a stack naming neither the bitmap
+scan nor that return.
+
+### 11.2 The census had been measuring the labeller, not the planner
+
+`EXPLAIN` had **no arm for `BitmapHeapScan` at all**; it printed the Go type
+`*optimizer.BitmapHeapScan`. So the first two census runs after bitmap paths
+started winning still read **zero**, and would have kept reading zero
+indefinitely. A census that greps for a label is only as good as the labeller.
+
+### 11.3 Five wrong hypotheses, then one measurement
+
+The crash in 11.1 was chased through five hypotheses formed by reasoning —
+merged-schema width mismatch (disproved by adding the assertion, which never
+fired), the parallel hash-build path, the bitmap emit path, `slotRow`, and a
+missing walk arm. All five were wrong.
+
+It was settled in ONE run by printing `len(outerMS.row)`, `len(innerMS.row)`,
+`outerWidth` and `innerWidth` at the crash site:
+
+```
+outerRow=9 innerRow=16 outerW=9 innerW=16 schema=25   <- fine
+outerRow=9 innerRow=0  outerW=9 innerW=16 schema=25   <- crash
+```
+
+Widths consistent, inner row EMPTY — which points at the callee's return, not at
+any of the five theories. This is the second time in this document that a
+multi-round reasoning chain was ended by one instrumented run (§9.6 is the
+first). The lesson is the same and is now stated twice on purpose: when a
+mechanism resists explanation, print the state at the failure and stop
+theorising.
+
+### 11.4 What is left
+
+Four of PG's six bitmap scans (Q2, Q11, Q20, Q21) and Q13/Q16's index-only
+scans. The bitmap producer declines a FILTERED leaf, because `BitmapHeapScan`
+has no residual `Cond` the way `IndexScan` now does — that is the most likely
+next unlock, and it is the same fix `80a5e334d` made for the index arm.

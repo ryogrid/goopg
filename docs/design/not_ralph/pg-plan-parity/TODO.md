@@ -226,7 +226,23 @@ experiment (DESIGN §4-A):
 - [ ] Verify Q22, Q16, Q13 flip **on cost**, no query-specific test
 - [ ] Full row-count gate
 
-### B — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans) — BLOCKED on a consumer
+### B — Bitmap — **Q8 and Q17 DONE** (`b4bd87a1a`); Q2/Q11/Q20/Q21 remain
+
+- [x] Bitmap Heap Scan 0 -> 2, and ~9x faster: Q8 10.0 s -> 1.1 s, Q17
+      3.4 s -> 0.4 s. Gated: 21/21 byte-identical, units, isolation suite,
+      spotcheck, timing per arm
+- [x] Root cause of the two reverted attempts: `bitmapHeapScanOp` returned
+      `(nil, nil)` on exhaustion instead of `(nil, EOF)` — a pre-existing
+      contract bug only an EOF-respecting consumer could expose
+- [x] And the census had been measuring the LABELLER: `EXPLAIN` had no
+      `BitmapHeapScan` arm, so it printed the Go type and the count read zero
+      even after bitmap paths were winning
+- [ ] **Next unlock, most likely**: the producer declines a FILTERED leaf,
+      because `BitmapHeapScan` has no residual `Cond` the way `IndexScan` got
+      one in `80a5e334d`. Give it one and the same restriction lifts. Q2, Q11,
+      Q20 and Q21 all have filtered leaves
+
+### B (original notes) — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans) — BLOCKED on a consumer
 
 **Blocker found.** All six of PG's bitmap scans here are nested-loop inners with
 an outer-var `Index Cond`, so goopg needs *parameterised* bitmap paths. But
