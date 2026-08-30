@@ -797,12 +797,47 @@ Each was A/B'd against this branch's HEAD before the prefix arm
 (`1c4b7a5e0`) and reproduces identically there, so none is attributable to
 section D. Recorded because the gate run is where they became visible.
 
-- [ ] **Q72 regressed since 2026-08-24.** `sweep-20260824-003146` has
+- [x] **Q72 regressed since 2026-08-24.** `sweep-20260824-003146` has
       `Q72 PASS 73s`; today it TIMEOUTs at >400s on BOTH `1c4b7a5e0` and the
-      prefix arm. The cause is therefore somewhere in this session's earlier
-      commits (the cost-model / bitmap / correlation work), not in D. Bisect
-      across those commits — the row-count gate cannot have caught it, since a
-      timeout produces no rows to compare.
+      prefix arm, so it is not section D. **Bisected** (9 steps, 425-commit
+      range, verdict = Q72 under a 200s timeout):
+
+          first bad commit = ab8fbc334
+          "optimizer(costbitmap): a bitmap INDEX scan was charged for
+           heap fetches it never performs"
+
+      That commit is CORRECT — `cost_bitmap_tree_node` (costsize.c:1150) costs a
+      BitmapIndexScan from `indextotalcost` alone, and goopg was calling the
+      whole `costIndexScan` including heap IO. Its own message records "HONEST
+      RESULT: no plan changed", which was true **of TPC-H**; TPC-DS was not run
+      at that commit. Making bitmap index scans ~100x cheaper let parameterised
+      bitmap paths start winning, and Q72 is where one wins badly.
+
+- [ ] **Q72's actual defect: the two fact tables swap roles.** Plans captured
+      either side of `ab8fbc334`:
+
+      | | drives from | probes |
+      |---|---|---|
+      | **PG 18.3** | `Parallel Seq Scan on catalog_sales` (232k rows/worker) | `Index Scan using inventory_pkey`, `Index Cond: ((inv_date_sk = d2.d_date_sk) AND (inv_item_sk = catalog_sales.cs_item_sk))` |
+      | **goopg (good, pre-ab8fbc334)** | hash-join tree, `Seq Scan on catalog_sales rows=720657` | — |
+      | **goopg (bad, current)** | `Seq Scan on inventory rows=4710000` | `Bitmap Heap Scan on catalog_sales` via `catalog_sales_pkey`, **rows=1** |
+
+      goopg probes `catalog_sales` and scans `inventory`; PG does the exact
+      inverse. The `rows=1` estimate on the parameterised bitmap is the engine
+      of it: it is arithmetically defensible for a fully-bound UNIQUE pkey
+      probe, but it propagates upward so every join above estimates 1 row, which
+      makes a chain of nested loops look free — and each of those rescans a
+      hash join whose probe side is the 4.7M-row `inventory` seq scan.
+
+- [ ] **Next**: goopg needs the path PG uses — a parameterised probe on
+      `inventory_pkey (inv_date_sk, inv_item_sk)` bound from TWO different rels
+      (`d2` and `catalog_sales`). Section D's prefix arm is a prerequisite but
+      is NOT sufficient on its own (Q72 still times out with it). Check first
+      whether the DP ever *generates* that path — per
+      DESIGN §14.4, verify generation before theorising about cost.
+- [ ] Do NOT fix this by reverting `ab8fbc334`: it would restore Q72 by
+      reinstating a cost the oracle names as wrong, and the bitmap wins that
+      followed it (Q11/Q20/Q21) depend on it.
 - [ ] **Q47 and Q69 time out** (>400s) on both binaries.
 - [ ] **Q31, Q64, Q71 report ERROR inside a full sweep but PASS standalone**
       (19 / 2 / 580 rows). Same shape as the known "isolation wedges in FULL
