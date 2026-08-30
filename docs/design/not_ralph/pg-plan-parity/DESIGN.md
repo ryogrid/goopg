@@ -1422,3 +1422,78 @@ different files and only the first one mentions leaf width.
   catch this class: a planner panic closes the connection, so the file says
   `server closed the connection unexpectedly` and matches neither pattern. Any
   sweep used as a gate must grep for that string too.
+
+## 16. Q2 measured: the bitmap/index crossover is ONE mis-priced term, quantified
+
+§13.4 left an open question — "look for a term of the same order as
+`indexTotalCost`" — and §14.3 narrowed Q17 to a near-tie without measuring
+goopg's side of it. Q2 answers both, because Q2's mismatch is the SAME
+comparison and its margin is wider.
+
+goopg's Q2 already matches PG almost everywhere (nation⋈region hash join,
+`partsupp_supplier_fkidx` probe, the `part` scan). The single divergence is one
+node: PG takes `Bitmap Heap Scan on supplier` via `supplier_nation_fkidx`;
+goopg takes `Index Scan` on the SAME index at the SAME 400 rows.
+
+Both candidates, both engines, same index, same parameterisation:
+
+| | goopg | PG 18.3 | goopg error |
+|---|---|---|---|
+| Bitmap Heap Scan | 14.35..**66.42** | 7.87..**43.46** | **+53%** |
+| Index Scan | 0.25..**54.73** | 0.29..**47.75** | **+15%** |
+| **chosen** | index (54.73 < 66.42) | **bitmap** (43.46 < 47.75) | |
+
+### 16.1 What this corrects
+
+- **PG's margin here is 9.9%, not the 37x a first estimate suggested.** The
+  guess was that 400 scattered rows cost 400 random fetches (~1600); the oracle
+  says 47.75, because `supplier` is small enough that Mackert-Lohman caps
+  `index_pages_fetched` near the table's own page count. Measure the oracle
+  before predicting its margin — this is the second time in this document an
+  estimate of PG's own arithmetic was wrong by an order of magnitude.
+- **§14.3's Q17 reading was directionally incomplete.** Against PG, goopg's Q17
+  numbers are LOW (bitmap −8.7%, index −12.7%) while Q2's are HIGH (+53%, +15%).
+  Absolute error is not the invariant. The invariant is the RATIO:
+
+  | | goopg bitmap/index | PG bitmap/index |
+  |---|---|---|
+  | Q2 | **1.214** | 0.910 |
+  | Q17 | **1.034** | 0.990 |
+
+  In both, goopg prices the bitmap too high RELATIVE to the index, so the index
+  wins where PG's bitmap does. That is one defect with one sign, visible in two
+  queries, rather than two separate calibration puzzles.
+
+### 16.2 Where the excess sits, in two named pieces
+
+Decomposing Q2's bitmap against PG's:
+
+- **Startup: 14.35 vs 7.87 — almost exactly double.** PG's own
+  `Bitmap Index Scan` line reads `cost=0.00..7.77`, so PG's bitmap startup IS
+  the index-side cost. goopg's being ~2x it is the double charge §13.4 records
+  as deliberately RETAINED (`startup + runCost + indexCost.Total` in
+  `costBitmapHeapScan`). This is the term §13.4 was hunting, and it is exactly
+  "of the same order as `indexTotalCost`" as predicted.
+- **Heap side: ~52.1 vs PG's ~35.6 — a further +46%**, which is NOT the double
+  charge and is the larger of the two. It lives in `computeBitmapPages` /
+  `costBitmapHeapScan`'s page estimate for 400 rows of a ~400-page table.
+
+Both errors have the SAME sign, so they add rather than cancel. That is the
+piece §13.3's "look for the second bug it was cancelling" framing had backwards,
+and it explains why removing the double charge alone did not settle the census:
+it removes ~7 of a ~23 unit excess and leaves the bitmap still over-priced
+against a correctly-ish priced index.
+
+### 16.3 Why this is the highest-value remaining item
+
+`supplier_nation_fkidx` at 400 rows is the node in Q2, and the same comparison
+decides Q17. Correcting the bitmap's heap-side estimate would move BOTH to PG's
+choice, taking goopg's bitmap set to `{q02, q11, q17, q20, q21}` — PG's set
+exactly — without touching join order, column pruning or the search seam, all of
+which are architectural. Neither Q13/Q16 (§15.4) nor Q72 (TODO §E) has that
+property.
+
+**Next**: instrument `computeBitmapPages` for Q2's supplier probe (400 tuples,
+`supplier` pages, `supplier_nation_fkidx` pages) and compare the page count
+against PG's `compute_bitmap_pages` for the same inputs. One number, one node —
+and per §14.4, confirm the inputs before theorising about the formula.

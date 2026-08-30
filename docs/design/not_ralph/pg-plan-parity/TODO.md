@@ -909,6 +909,27 @@ section D. Recorded because the gate run is where they became visible.
       closes the connection and matches neither, which is why the first sweep of
       this attempt looked clean.
 
+## G — the bitmap/index crossover: quantified, and the best remaining target
+
+- [x] Q2 measured on both engines, same index, same parameterisation
+      (`supplier_nation_fkidx`, 400 rows): goopg bitmap **66.42** vs PG
+      **43.46** (+53%); goopg index **54.73** vs PG **47.75** (+15%). goopg
+      picks index, PG picks bitmap. DESIGN §16.
+- [x] The invariant is the RATIO, not the absolute error: goopg's
+      bitmap/index is 1.214 (Q2) and 1.034 (Q17) where PG's is 0.910 and 0.990.
+      One defect, one sign, two queries — not two puzzles.
+- [x] Excess decomposed: startup 14.35 vs PG 7.87 (≈2x — the double charge
+      §13.4 records as RETAINED, and the term it was hunting), plus a heap-side
+      ~52.1 vs ~35.6 (+46%) that is larger and separate. Same sign, so they ADD;
+      §13.3's "the second bug it was cancelling" had the sign backwards.
+- [ ] **Next**: instrument `computeBitmapPages` for Q2's supplier probe and
+      compare its page count against PG's `compute_bitmap_pages` on the same
+      inputs. Confirm the INPUTS before theorising about the formula (§14.4).
+- [ ] Highest value of everything still open: fixing it moves BOTH Q2 and Q17 to
+      PG's choice, giving the bitmap set `{q02, q11, q17, q20, q21}` = PG's set
+      exactly, with no architectural change. Q13/Q16 need a partial search-root
+      boundary (§15.4) and Q72 needs joinlist flattening (§E) — both structural.
+
 ## Cross-cutting
 
 - [ ] No change may test a relation name, query shape, or benchmark identity
