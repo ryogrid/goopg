@@ -1061,11 +1061,13 @@ func reresolveNLIKeysByName(nli *NestedLoopIndexJoin) {
 			cr.Index = idx
 		}
 	}
-	if nli.Inner.Key != nil {
-		rebind(nli.Inner.Key)
-	}
-	for _, k := range nli.Inner.Keys {
-		rebind(k)
+	if _, innerKey, innerKeys, ok := nliInnerProbe(nli.Inner); ok {
+		if innerKey != nil {
+			rebind(innerKey)
+		}
+		for _, k := range innerKeys {
+			rebind(k)
+		}
 	}
 	if nli.Type != JoinTypeSemi && nli.Type != JoinTypeAnti {
 		innerSchema := nli.Inner.Output()

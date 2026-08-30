@@ -142,11 +142,11 @@ func TestNLIRulePromotesCompositeKeyJoinWithFullLeadingPrefix(t *testing.T) {
 	if nli == nil {
 		t.Fatalf("expected NLI in plan; tree: %s", describePlanTree(node))
 	}
-	if got := len(nli.Inner.Keys); got != 2 {
-		t.Fatalf("expected Inner.Keys length 2 for composite-key full-prefix probe; got %d (Inner.Key=%v)", got, nli.Inner.Key)
+	if got := len(nliIn(nli.Inner).Keys); got != 2 {
+		t.Fatalf("expected Inner.Keys length 2 for composite-key full-prefix probe; got %d (Inner.Key=%v)", got, nliIn(nli.Inner).Key)
 	}
-	if nli.Inner.Index == nil || nli.Inner.Index.Name != "partsupp_pk" {
-		t.Fatalf("expected partsupp_pk index; got %v", nli.Inner.Index)
+	if nliIn(nli.Inner).Index == nil || nliIn(nli.Inner).Index.Name != "partsupp_pk" {
+		t.Fatalf("expected partsupp_pk index; got %v", nliIn(nli.Inner).Index)
 	}
 }
 
@@ -332,8 +332,8 @@ func TestNLIRulePromotesAcrossOROfANDsCommonEqui(t *testing.T) {
 	if nli == nil {
 		t.Fatalf("expected NLI from OR-factor; tree: %s", describePlanTree(node))
 	}
-	if nli.Inner.Index == nil || nli.Inner.Index.Name != "part_pk" {
-		t.Fatalf("expected part_pk on inner; got %v", nli.Inner.Index)
+	if nliIn(nli.Inner).Index == nil || nliIn(nli.Inner).Index.Name != "part_pk" {
+		t.Fatalf("expected part_pk on inner; got %v", nliIn(nli.Inner).Index)
 	}
 }
 

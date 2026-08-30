@@ -134,11 +134,11 @@ func TestCreateNestLoopPlanNLIProbeKeyIsInOUTERCoordinates(t *testing.T) {
 	if !ok {
 		t.Fatalf("createPlan(parameterised PathNestLoop) = %T, want *NestedLoopIndexJoin", n)
 	}
-	if len(nli.Inner.Keys) != 2 || nli.Inner.Key != nil {
-		t.Fatalf("a two-column probe must use Keys, not Key: Key=%v Keys=%v", nli.Inner.Key, nli.Inner.Keys)
+	if len(nliIn(nli.Inner).Keys) != 2 || nliIn(nli.Inner).Key != nil {
+		t.Fatalf("a two-column probe must use Keys, not Key: Key=%v Keys=%v", nliIn(nli.Inner).Key, nliIn(nli.Inner).Keys)
 	}
 	outerWidth := len(nli.Outer.Output())
-	for i, k := range nli.Inner.Keys {
+	for i, k := range nliIn(nli.Inner).Keys {
 		cr, isCol := k.(*ColumnRef)
 		if !isCol {
 			t.Fatalf("probe key %d = %T, want *ColumnRef", i, k)
@@ -148,10 +148,10 @@ func TestCreateNestLoopPlanNLIProbeKeyIsInOUTERCoordinates(t *testing.T) {
 				i, cr.Index, outerWidth)
 		}
 	}
-	if got := nli.Inner.Keys[0].(*ColumnRef).Index; got != 1 {
+	if got := nliIn(nli.Inner).Keys[0].(*ColumnRef).Index; got != 1 {
 		t.Errorf("probe key 0 = col(%d), want col(1) (binding 3 = b1, outer position 1)", got)
 	}
-	if got := nli.Inner.Keys[1].(*ColumnRef).Index; got != 2 {
+	if got := nliIn(nli.Inner).Keys[1].(*ColumnRef).Index; got != 2 {
 		t.Errorf("probe key 1 = col(%d), want col(2) (binding 4 = b2, outer position 2)", got)
 	}
 	// The path's own clause expressions belong to the search and must survive.
@@ -197,10 +197,10 @@ func TestCreateNestLoopPlanNLIResidualIsInMERGEDCoordinates(t *testing.T) {
 		t.Errorf("residual right = col(%d), want col(0) (binding 2 = b0, merged position 0)", got)
 	}
 	// A single-column probe uses `Key`, the shape every pre-existing caller emits.
-	if nli.Inner.Key == nil || len(nli.Inner.Keys) != 0 {
-		t.Fatalf("a one-column probe must use Key, not Keys: Key=%v Keys=%v", nli.Inner.Key, nli.Inner.Keys)
+	if nliIn(nli.Inner).Key == nil || len(nliIn(nli.Inner).Keys) != 0 {
+		t.Fatalf("a one-column probe must use Key, not Keys: Key=%v Keys=%v", nliIn(nli.Inner).Key, nliIn(nli.Inner).Keys)
 	}
-	if got := nli.Inner.Key.(*ColumnRef).Index; got != 1 {
+	if got := nliIn(nli.Inner).Key.(*ColumnRef).Index; got != 1 {
 		t.Errorf("probe key = col(%d), want col(1) (binding 3 = b1, outer position 1)", got)
 	}
 }
@@ -259,12 +259,23 @@ func TestLeafCondGatesTheNLIInner(t *testing.T) {
 	if !isNLI {
 		t.Fatalf("plan = %T, want *NestedLoopIndexJoin", node)
 	}
-	if nli.Inner == nil || nli.Inner.Cond == nil {
+	if nli.Inner == nil || nliIn(nli.Inner).Cond == nil {
 		t.Fatal("the leaf's local qual must be absorbed into IndexScan.Cond, not dropped")
 	}
 	if nli.Predicate != nil {
 		t.Errorf("the absorbed qual must NOT appear as a join residual; Predicate = %v", nli.Predicate)
 	}
+}
+
+// nliIn narrows a NestedLoopIndexJoin's inner to the plain index probe these
+// tests construct. `Inner` is typed `Node` since it may also hold an
+// `*IndexOnlyScan`; every test in this package builds the *IndexScan form, so
+// they assert the probe fields through here rather than each type-asserting.
+// A nil return means the inner was some other kind, which fails the caller's
+// next assertion with its own message.
+func nliIn(n Node) *IndexScan {
+	is, _ := n.(*IndexScan)
+	return is
 }
 
 func TestCreateNestLoopPlanPanics(t *testing.T) {

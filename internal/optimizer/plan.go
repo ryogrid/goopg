@@ -819,7 +819,19 @@ type NestedLoopIndexJoin struct {
 	pos       int
 	Type      JoinType
 	Outer     Node
-	Inner     *IndexScan
+	// Inner is the parameterised probe this join re-executes per outer row.
+	//
+	// Typed `Node` rather than `*IndexScan` so an `*IndexOnlyScan` can sit here
+	// too — PG's Q13/Q16/Q22 all put one on the inner side, and for a SEMI or
+	// ANTI join it is provably safe to narrow because the join's schema is the
+	// OUTER's alone (see the schema construction in nl_index_join.go: "the inner
+	// side is consumed only for matching, never projected").
+	//
+	// The set of concrete types is CLOSED and is enumerated by
+	// `nliInnerProbe` — everything that needs the probe's index or keys goes
+	// through it rather than type-asserting locally, so adding a third inner
+	// kind is one edit and not a hunt.
+	Inner     Node
 	Predicate Expr // residual filter applied per joined row
 	schema    Schema
 
@@ -832,6 +844,23 @@ type NestedLoopIndexJoin struct {
 	// insertion gate requires ANALYZE stats, which are in-memory and
 	// restart-lost).
 	InnerMemo *Memoize
+}
+
+// nliInnerProbe reads the probe fields shared by every legal
+// `NestedLoopIndexJoin.Inner`. ok=false means the node is not a probe shape at
+// all, which every caller treats as "decline", never as an error.
+//
+// This exists so the Inner field can be widened without scattering type
+// assertions: the switch below is the ONE place that enumerates which node
+// kinds may be an inner.
+func nliInnerProbe(n Node) (idx *catalog.Index, key Expr, keys []Expr, ok bool) {
+	switch x := n.(type) {
+	case *IndexScan:
+		return x.Index, x.Key, x.Keys, true
+	case *IndexOnlyScan:
+		return x.Index, x.Key, x.Keys, true
+	}
+	return nil, nil, nil, false
 }
 
 func (n *NestedLoopIndexJoin) Pos() int       { return n.pos }

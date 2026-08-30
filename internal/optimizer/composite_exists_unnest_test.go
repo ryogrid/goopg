@@ -227,7 +227,7 @@ func TestCompositeExistsCompositeIndexConsumesBothPairs(t *testing.T) {
 	if nli == nil {
 		t.Skipf("composite EXISTS did not convert to NLI here; tree: %s", describePlanTree(node))
 	}
-	idx := nli.Inner
+	idx := nliIn(nli.Inner)
 	if idx == nil {
 		t.Fatalf("NLI has no inner IndexScan")
 	}

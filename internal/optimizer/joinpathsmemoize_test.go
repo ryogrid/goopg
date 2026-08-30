@@ -309,9 +309,9 @@ func TestCreatePlanMemoizeKeysAreTheProbeKeys(t *testing.T) {
 	if nli.InnerMemo.Child != nli.Inner {
 		t.Fatal("the cache must wrap the very probe the join drives")
 	}
-	if len(nli.InnerMemo.KeyExprs) != 1 || nli.InnerMemo.KeyExprs[0] != nli.Inner.Key {
+	if len(nli.InnerMemo.KeyExprs) != 1 || nli.InnerMemo.KeyExprs[0] != nliIn(nli.Inner).Key {
 		t.Fatalf("cache key %v is not the probe key %v — the two were derived separately",
-			nli.InnerMemo.KeyExprs, nli.Inner.Key)
+			nli.InnerMemo.KeyExprs, nliIn(nli.Inner).Key)
 	}
 	if nli.InnerMemo.EstEntries != 128 {
 		t.Fatalf("EstEntries %d, want 128: the executor must size the table from the estimate the search costed",
@@ -319,8 +319,8 @@ func TestCreatePlanMemoizeKeysAreTheProbeKeys(t *testing.T) {
 	}
 	// OUTER coordinates, not merged: `b.b1` is outer position 1. The cache and
 	// the probe are the same object, so this also pins the cache's space.
-	if cr, ok := nli.Inner.Key.(*ColumnRef); !ok || cr.Index != 1 {
-		t.Fatalf("probe key = %v, want col(1) in OUTER coordinates", nli.Inner.Key)
+	if cr, ok := nliIn(nli.Inner).Key.(*ColumnRef); !ok || cr.Index != 1 {
+		t.Fatalf("probe key = %v, want col(1) in OUTER coordinates", nliIn(nli.Inner).Key)
 	}
 }
 

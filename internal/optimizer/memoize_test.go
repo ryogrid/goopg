@@ -115,7 +115,7 @@ func TestMemoizeAttachKillSwitch(t *testing.T) {
 // decline: the ndistinct lookup would be undefined.
 func TestMemoizeAttachNonColumnKey(t *testing.T) {
 	nli := memoNLI(t, JoinTypeInner, 4000, 10, true)
-	nli.Inner.Key = &ColumnRef{Index: 7, Name: "bogus"}
+	nliIn(nli.Inner).Key = &ColumnRef{Index: 7, Name: "bogus"}
 	maybeAttachMemoize(nli)
 	if nli.InnerMemo != nil {
 		t.Fatal("InnerMemo attached for an out-of-schema key")
