@@ -386,12 +386,25 @@ refuse — the exact failure that file warns about.
       Bitmap paths never actually WON on cost either (Bitmap Heap Scan stayed 0);
       they only perturbed the DP enough to change two plans.
 
-      So the next attempt should start at the JOIN driver, not the planner:
-      `nestedLoopIndexJoinOp` composes outer+inner through a persistent
-      VirtualSlot (`outerMS`), and whatever it assumes about the inner's slot
-      lifetime holds for `indexScanOp` and not for `bitmapHeapScanOp`. Fix that
-      first, with a unit test driving a bitmap inner directly, and only then
-      re-add the producer.
+      So the next attempt should start at the JOIN driver, not the planner.
+      Narrowed further before reverting:
+
+      - **The bitmap emit path is NOT the fault.** `fetchExact` ends
+        `o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}` with a
+        cloned, correctly-sized row, so the inner does hand back a populated
+        slot.
+      - Which leaves the ROUTING. `nestedLoopIndexJoinOp` composes outer+inner
+        into a persistent `VirtualSlot` that dispatches `Get(i)` to `outerMS` or
+        `innerMS` by width. A merged column that routes to the WRONG half
+        explains "index 7, length 0" exactly — it reached a slot whose row was
+        never filled for that side. The suspect is the `in.merged` / `in.lay`
+        that `createNestLoopBitmapJoinPlan` got from `joinInputsFor`
+        disagreeing with `BitmapHeapScan.Output()`, which is the leaf's FULL
+        table schema.
+      - So: assert `len(in.merged) == len(outer.Output()) + len(inner.Output())`
+        in the consumer before doing anything else, and write the unit test to
+        drive a bitmap inner through `nestedLoopIndexJoinOp` directly so the
+        failure surfaces without a 6M-row query.
 - [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`).
       `matchBitmapIndexQuals` (pathbitmap.go:234) matches only `col = const` via
       `normalizeColumnConst`; a parameterised sibling would mirror
