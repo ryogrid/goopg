@@ -2588,7 +2588,25 @@ type BitmapHeapScan struct {
 	// the bitmap entry is lossy or the index AM requires recheck.
 	BitmapQual []Expr
 	// Outer is the bitmap-producing subtree (BitmapIndexScan / BitmapAnd / BitmapOr).
-	Outer  Node
+	Outer Node
+	// Cond is a residual filter evaluated per heap tuple — PostgreSQL's
+	// `Filter:` line on a Bitmap Heap Scan, which sits alongside
+	// `Recheck Cond:` rather than in a separate node. ColumnRefs are in the
+	// scan's OWN output coordinates (leaf-local), the same space
+	// `IndexScan.Cond` uses. Nil means no residual filtering.
+	//
+	// It exists for the same reason `IndexScan.Cond` does: a relation's local
+	// quals need somewhere to live INSIDE the node when the scan is a
+	// `NestedLoopIndexJoin` inner, because the join re-probes it per outer row
+	// and cannot carry the `*Filter` wrappers the quals otherwise sit in. Until
+	// this field existed, `addParameterizedBitmapPaths` declined every FILTERED
+	// relation — which is four of PG's six TPC-H bitmap scans (Q2, Q11, Q20,
+	// Q21), all of which have filtered leaves.
+	//
+	// Distinct from `BitmapQual`: that is the RECHECK list, re-evaluated only
+	// when a bitmap entry is lossy or the AM demands it. `Cond` is evaluated on
+	// every tuple, lossy or not.
+	Cond   Expr
 	schema Schema
 	// Parallel mirrors PostgreSQL's Plan.parallel_aware: true when this scan
 	// was chosen as the worker-read driving scan under a Gather/GatherMerge

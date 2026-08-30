@@ -716,6 +716,29 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if filt != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
 		}
+	case *optimizer.BitmapHeapScan:
+		// PG prints `Recheck Cond:` then `Filter:` on a Bitmap Heap Scan. The
+		// two are different things and both belong here: BitmapQual is the
+		// recheck list (lossy pages only), Cond is the per-tuple residual the
+		// scan carries when it is an NLI inner (plan.go, BitmapHeapScan.Cond).
+		if len(p.BitmapQual) > 0 {
+			var rc optimizer.Expr = p.BitmapQual[0]
+			for _, q := range p.BitmapQual[1:] {
+				rc = &optimizer.BinaryOp{Op: parser.OpAnd, Left: rc, Right: q}
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + wrapParen(formatExprQual(rc, reg, qualify)))})
+		}
+		filt := attachedFilter
+		if p.Cond != nil {
+			if filt == nil {
+				filt = p.Cond
+			} else {
+				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: filt, Right: p.Cond}
+			}
+		}
+		if filt != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
+		}
 	case *optimizer.IndexOnlyScan:
 		// S6 min/max rewrite: the IOS's residual `col IS NOT NULL` qual is
 		// stored in Cond (it cannot be pushed into the btree probe) and

@@ -616,6 +616,20 @@ func (o *bitmapHeapScanOp) fetchOneTuple(_ storage.BlockNumber, offset uint16, r
 		}
 	}
 
+	// PG's `Filter:` on a Bitmap Heap Scan: the relation's local quals,
+	// evaluated on EVERY tuple — unlike BitmapQual above, which is the recheck
+	// list and fires only on a lossy entry. Set only on an NLI inner, where the
+	// quals cannot live in a *Filter above (plan.go, BitmapHeapScan.Cond).
+	if o.plan.Cond != nil {
+		d, cerr := evalExpr(o.plan.Cond, o.scanRow, o.ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+			return nil, nil // filtered out; the caller skips a nil slot
+		}
+	}
+
 	// Clone arena-backed data.
 	row := cloneRowOwned(o.scanRow)
 	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
@@ -658,6 +672,20 @@ func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, 
 		}
 		if !passed {
 			return o.Next() // recheck failed, skip
+		}
+	}
+
+	// PG's `Filter:` on a Bitmap Heap Scan: the relation's local quals,
+	// evaluated on EVERY tuple — unlike BitmapQual above, which is the recheck
+	// list and fires only on a lossy entry. Set only on an NLI inner, where the
+	// quals cannot live in a *Filter above (plan.go, BitmapHeapScan.Cond).
+	if o.plan.Cond != nil {
+		d, cerr := evalExpr(o.plan.Cond, o.scanRow, o.ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+			return o.Next() // filtered out; fetchExact skips by recursing, not by nil
 		}
 	}
 

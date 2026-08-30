@@ -342,7 +342,18 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 	idxPath := innerPath.Children[0]
 	outerPath := p.Children[0]
 	in := joinInputsFor(p, "PathNestLoop(NLI-bitmap)", outerPath, innerPath)
-	bhs := in.inner.(*BitmapHeapScan)
+	// The leaf's local quals arrive as *Filter wrappers the rewrapper rebuilt
+	// over the scan; absorb them into the node's own Cond, since
+	// NestedLoopIndexJoin.Inner re-probes per outer row and cannot carry
+	// wrappers. Same move, same reason, as the index arm above.
+	innerBase, leafCond, absorbable := absorbableLeafCond(in.inner)
+	if !absorbable {
+		panic(fmt.Sprintf("createPlan: NLI bitmap inner %T carries wrappers that are not leaf-local", in.inner))
+	}
+	bhs := innerBase.(*BitmapHeapScan)
+	if leafCond != nil {
+		bhs.Cond = leafCond
+	}
 	bis := bhs.Outer.(*BitmapIndexScan)
 	outerLay := in.lay[:len(in.outer.Output())]
 	outerIndex := outerLay.bindingIndex()

@@ -438,7 +438,13 @@ func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
 		if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
 			continue
 		}
-		if !scanLeafIsBare(rel.baseLeaf) {
+		// The leaf's local quals ride inside the node on `BitmapHeapScan.Cond`
+		// (plan.go), exactly as they do on `IndexScan.Cond` since 80a5e334d.
+		// This used to be `scanLeafIsBare`, which declined every FILTERED
+		// relation — four of PG's six TPC-H bitmap scans (Q2, Q11, Q20, Q21).
+		// A leaf whose wrappers are not leaf-local is still declined; see
+		// `absorbableLeafCond` for why that is a coordinates question.
+		if _, _, ok := absorbableLeafCond(rel.baseLeaf); !ok {
 			continue
 		}
 		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)
@@ -461,9 +467,9 @@ func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
 		added := false
 		for _, req := range consideredParameterizations(cands) {
 			for _, idx := range cat.IndexesOnTable(tbl) {
-				if p := s.buildOneParameterizedBitmapPath(rel, tbl, idx, cands, req,
-					relPages, relTuples, T, totalPages, maxEntries); p != nil {
-					addPath(rel, p)
+				if pth := s.buildOneParameterizedBitmapPath(rel, tbl, idx, cands, req,
+					relPages, relTuples, T, totalPages, maxEntries); pth != nil {
+					addPath(rel, pth)
 					added = true
 				}
 			}
