@@ -758,11 +758,29 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	}
 
 	committed = true
+	// A SEMI or ANTI join never projects its inner — the joinedSchema branch
+	// above builds the OUTER's schema alone, "consumed only for matching, never
+	// projected". So when the residual reads no inner column either, the probe's
+	// heap tuple is wanted for nothing but VISIBILITY, and that is precisely what
+	// an index-only scan reads from the visibility map instead. PG's TPC-H Q22
+	// uses an Index Only Scan for exactly this anti-join probe.
+	//
+	// Safe by construction rather than by analysis: because the join does not
+	// publish the inner's columns, narrowing them cannot renumber any ColumnRef
+	// above — which is the problem that makes index-only scans expensive
+	// everywhere else in goopg (positional ColumnRefs over a concatenated
+	// outer||inner schema, where PG has relation-qualified Vars).
+	var innerNode Node = inner
+	if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+		if ios := indexOnlyNLIInner(inner, residualPred, len(outerNode.Output())); ios != nil {
+			innerNode = ios
+		}
+	}
 	nli := &NestedLoopIndexJoin{
 		pos:   j.pos,
 		Type:  j.Type,
 		Outer: outerNode,
-		Inner: inner,
+		Inner: innerNode,
 		// M0054-0006-followup-Q19: when the equi-conjunct came
 		// from the OR-factoring path, the original OR predicate
 		// stays as a residual so each emitted joined row is
@@ -1415,4 +1433,78 @@ func innerUnwrapCostAccepts(outer Node, innerScan *SeqScan, idx *catalog.Index, 
 			outer, outerRows, innerRows, matchSet, residualMult, statsKnown, accept)
 	}
 	return accept
+}
+
+
+// indexOnlyNLIInner promotes a semi/anti NestedLoopIndexJoin's probe to an
+// `*IndexOnlyScan`, or returns nil to leave the plain probe alone.
+//
+// PG oracle: `check_index_only` (indxpath.c:2229) asks whether a scan's output
+// is covered by the index. Here the question is simpler and the answer is
+// stronger — for SEMI/ANTI the scan's output is not read AT ALL, so coverage is
+// vacuous and the only real conditions are the ones below.
+//
+// Each decline names the wrong answer it prevents:
+//
+//   - `Cond != nil` — a residual on the scan itself is evaluated against the
+//     scanned row, and an index-only scan supplies only the indexed columns.
+//   - an EXCLUSIVE range bound — `indexOnlyScanOp` drives the INCLUSIVE
+//     RangeScan and copies no LowOp/HighOp, so the boundary row would leak
+//     (the same M0134-0001 S4 class-8 rule `tryPromoteIndexOnlyScan` applies).
+//   - a residual that reads an inner column — it is evaluated on the MERGED
+//     row, so any ColumnRef at or past `outerWidth` addresses the inner.
+//   - an outer/subquery reference inside the residual, which `walkColumnRefs`
+//     reports separately and whose coordinate space this cannot reason about.
+func indexOnlyNLIInner(inner *IndexScan, residual Expr, outerWidth int) *IndexOnlyScan {
+	if inner == nil || inner.Index == nil || inner.Table == nil {
+		return nil
+	}
+	if inner.Cond != nil {
+		return nil
+	}
+	if inner.LowOp == parser.OpGt || inner.HighOp == parser.OpLt {
+		return nil
+	}
+	if residual != nil {
+		safe := true
+		walkColumnRefs(residual, func(i int) {
+			if i >= outerWidth {
+				safe = false
+			}
+		}, func() { safe = false })
+		if !safe {
+			return nil
+		}
+	}
+	// `Covered` is the index's own key columns. Nothing reads them — that is the
+	// premise — but the executor decodes a row of this shape from the index key,
+	// so the list must describe real columns of the table.
+	covered := make([]catalog.Column, 0, len(inner.Index.Columns))
+	schema := make(Schema, 0, len(inner.Index.Columns))
+	for _, name := range inner.Index.Columns {
+		col, found := tableColumnByName(inner.Table, name)
+		if !found {
+			return nil
+		}
+		covered = append(covered, col)
+		schema = append(schema, SchemaColumn{Name: col.Name, Type: col.Type})
+	}
+	if len(covered) == 0 {
+		return nil
+	}
+	return &IndexOnlyScan{
+		pos:     inner.pos,
+		Table:   inner.Table,
+		Index:   inner.Index,
+		Key:     inner.Key,
+		Keys:    inner.Keys,
+		LowKey:  inner.LowKey,
+		HighKey: inner.HighKey,
+		Covered: covered,
+		schema:  schema,
+		// Carried for the same reason createIndexScanPlan carries them: a scan
+		// that loses its check role is authorised against the wrong role.
+		PrivilegeCheckRole:    inner.PrivilegeCheckRole,
+		PrivilegeCheckRoleSet: inner.PrivilegeCheckRoleSet,
+	}
 }

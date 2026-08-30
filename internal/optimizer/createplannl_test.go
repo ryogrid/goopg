@@ -278,6 +278,24 @@ func nliIn(n Node) *IndexScan {
 	return is
 }
 
+// nliProbeKeys returns an NLI inner's equality probe keys whichever probe node
+// kind it is. A semi/anti inner is promoted to an *IndexOnlyScan when nothing
+// reads its columns (indexOnlyNLIInner), so a test that asserts on the PROBE
+// must not also pin the node TYPE — the probe is the invariant, the node kind
+// is an optimisation.
+func nliProbeKeys(n Node) []Expr {
+	_, key, keys, ok := nliInnerProbe(n)
+	switch {
+	case !ok:
+		return nil
+	case len(keys) > 0:
+		return keys
+	case key != nil:
+		return []Expr{key}
+	}
+	return nil
+}
+
 func TestCreateNestLoopPlanPanics(t *testing.T) {
 	a, b := cpjTwoRel()
 	idx := cpiIndex("a0")
