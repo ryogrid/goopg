@@ -442,11 +442,24 @@ experiment (DESIGN §4-A):
       That means another term is UNDER-charging bitmap, and the double charge
       was accidentally compensating for it. Find that term before removing the
       double charge — the two errors currently cancel, which is why the census
-      count looks right today for the wrong reason. Candidates: the CPU terms
-      (`cost_bitmap_heap_scan` charges `cpu_tuple_cost` per tuple; PG also
-      charges `qpqual_cost` per tuple and a `cpu_operator_cost` per bitmap
-      entry), and `computeBitmapPages` vs PG's `compute_bitmap_pages` on the
-      `maxentries` / lossy-degradation path
+      count looks right today for the wrong reason.
+- [ ] **The under-charge is IDENTIFIED.** PG:
+
+      ```c
+      cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
+      cpu_run_cost  = cpu_per_tuple * tuples_fetched;
+      ```
+
+      goopg's `costBitmapHeapScan` charges `cpuTupleCost * tuplesFetched` and
+      omits `qpqual_cost.per_tuple` entirely — the per-tuple cost of the
+      recheck quals and the scan's own `Cond`. That undercharges bitmap, which
+      is exactly the direction needed to explain the cancellation.
+      `qualEvalCost(cp, nQuals, rows)` already exists; the work is threading a
+      qual count into `costBitmapHeapScan`, which does not receive one today
+- [ ] **Land the two together, never separately** — each alone makes the census
+      worse — and gate on the census SHAPE rather than its count: goopg should
+      end at PG's 6 scans AND on PG's five queries, where today it has 6 scans
+      but on q08 instead of q02
 - [ ] Worth a regression test in its own right, independent of plan parity: a
       bitmap scan forced over a relation big enough to go lossy, compared
       against the seq-scan result. That test would have caught this years
