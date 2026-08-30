@@ -320,11 +320,28 @@ experiment (DESIGN §4-A):
       bug in the parameterised bitmap inner beyond the Outer shape. Find it
       before landing the cost fix; the fix is written and verified against the
       oracle, and is held back only by this
-- [ ] Suggested probe, given the pattern this file has established four times:
-      do not reason about which qual is being lost. Take q03, force its bitmap
-      plan, and print per outer row the probe key, the TID count in the bitmap,
-      and the rows surviving `Cond` — the row loss is ~94%, which is large
-      enough to localise in one run
+- [x] **Probe run, and it relocated the bug.** Instrumenting `Rescan` produced
+      NO output for q03 — so the failing bitmap is not a nested-loop inner at
+      all. Its plan is:
+
+      ```
+      Gather  (Workers Planned: 4)
+        -> Hash Join
+             -> Bitmap Heap Scan on public.lineitem
+                  Filter: (l_shipdate > '1995-03-15'::date)
+                  -> Bitmap Index Scan on public.idx_lineitem_orderkey_fkidx
+      ```
+
+      An UNPARAMETERISED bitmap heap scan under a parallel `Gather`. So the
+      ~94% row loss is in the PARALLEL bitmap path (`nextParallel`, the shared
+      `o.pbm` page allocator), which — like the two bugs already found — had
+      never been exercised end to end because bitmap paths never won on cost
+- [ ] **So the remaining blocker is parallel bitmap execution, not the
+      parameterised inner.** The leader builds and publishes the bitmap and
+      workers claim pages from a shared allocator; verify that wiring is
+      complete before landing the double-count fix. A single-worker check
+      (`SET max_parallel_workers_per_gather = 0`) on q03 would confirm the
+      diagnosis in one run: if the rows come back, it is the parallel path
 - [ ] **The remaining calibration question, after that.** Startup 14.35 vs PG's
       7.87 is roughly `indexProbeCostMultiplier`, which `btreeIndexAMCost`
       applies at costindex.go:189. That knob exists because goopg's index access
