@@ -268,6 +268,21 @@ type bitmapHeapScanOp struct {
 	pageBuf   storage.Page
 	pageBlock storage.BlockNumber
 	pageLossy bool
+	// lossyOff is the cursor within a LOSSY page: a lossy bitmap entry names a
+	// page but no offsets, so the scan must walk every line pointer and
+	// re-check each tuple. It has to survive across Next() calls, and
+	// `inLossyPage` is what stops the loop re-advancing the TBM iterator while
+	// a page is still being walked — the iterator yields a lossy page exactly
+	// once.
+	// parOffsets / parOff are the cursor within an EXACT page on the parallel
+	// path, and parRecheck the entry's recheck flag. They exist because a
+	// page's matches span multiple Next() calls; without them the scan emitted
+	// one row per page.
+	parOffsets  []uint16
+	parOff      int
+	parRecheck  bool
+	lossyOff    uint16
+	inLossyPage bool
 
 	// scanRow is reused per Next() — zero allocation per tuple.
 	scanRow Row
@@ -448,6 +463,16 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 			o.ownBitmap = true
 		}
 
+		// Still walking a lossy page: do NOT advance the iterator, which yields
+		// a lossy entry only once.
+		if o.inLossyPage {
+			if slot, err := o.nextLossyTuple(o.pageBlock); err != nil || slot != nil {
+				return slot, err
+			}
+			o.inLossyPage = false
+			continue
+		}
+
 		// Advance the TBM iterator.
 		block, offset, lossy, recheck, ok := o.iter.next()
 		if !ok {
@@ -491,11 +516,23 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 		}
 
 		// For lossy pages, iterate ALL offsets. The iterator yields
-		// (block, 0, lossy=true) once; we walk every line pointer.
+		// (block, 0, lossy=true) once; we walk every line pointer and re-check
+		// each tuple, which is PG's `bitgetpage` lossy branch
+		// (nodeBitmapHeapscan.c).
+		//
+		// This used to `continue`, under a comment promising "lossy handling
+		// below" that was never written — so every row on a lossy page was
+		// silently DROPPED. A TID bitmap goes lossy above work_mem, so a bitmap
+		// over TPC-H `lineitem` lost ~94% of its rows. It stayed invisible
+		// because bitmap paths never won on cost and so never ran.
 		if lossy {
-			// Use a sub-state to track position within the lossy page.
-			// We'll return one row at a time and save position.
-			continue // fall through to lossy handling below
+			o.inLossyPage = true
+			o.lossyOff = 0
+			if slot, err := o.nextLossyTuple(block); err != nil || slot != nil {
+				return slot, err
+			}
+			o.inLossyPage = false
+			continue
 		}
 
 		// Exact page: fetch the specific tuple at the given offset.
@@ -517,6 +554,13 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 // accidentally claiming a new page from the shared allocator.
 func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 	for {
+		// Resume the current page before claiming another: a page's offsets
+		// span multiple Next() calls.
+		if o.parOff < len(o.parOffsets) {
+			if slot, err := o.nextParallelTuple(o.pageBlock); err != nil || slot != nil {
+				return slot, err
+			}
+		}
 		block, entry, ok := o.pbm.nextPage()
 		if !ok {
 			// Exhausted.
@@ -548,32 +592,48 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 
 		if entry.isLossy {
 			o.lossyPages++
-			// Lossy pages: the serial path does not iterate all offsets
-			// (the original Next() issued `continue` for lossy). Match that
-			// here — a lossy page emits nothing through this operator.
-			// Full lossy-page iteration is deferred (S5.x follow-up).
+			// Walk every line pointer on the page, exactly as the serial path
+			// does. The previous code `continue`d here and claimed to be
+			// matching the serial path — which was itself dropping lossy pages,
+			// so the two agreed only in being wrong together.
+			o.lossyOff = 0
+			for {
+				slot, err := o.nextLossyTuple(block)
+				if err != nil {
+					return nil, err
+				}
+				if slot == nil {
+					break
+				}
+				return slot, nil
+			}
 			continue
 		}
 
-		// Exact page: extract and iterate offsets.
+		// Exact page: extract the offsets and walk them ACROSS Next() calls.
+		//
+		// The cursor is the whole point. This loop used to `return row, nil` on
+		// the first surviving tuple and then fall out of the function — so the
+		// next Next() claimed a NEW page from the shared allocator and every
+		// remaining match on this one was LOST. It emitted exactly one row per
+		// page, which is what the instrumentation showed:
+		// `exactPages=27379 emitted=27379` on TPC-H `lineitem`, i.e. ~1 row
+		// where the page held ~46, and Q3 returning 702 rows of 11415.
+		//
+		// It survived because bitmap paths never won on cost, so this arm had
+		// never run. `o.parOffsets`/`o.parOff` now hold the position, and the
+		// page is only released once its offsets are exhausted.
 		o.exactPages++
 		n := tbmExtractPageTuple(entry, nil)
 		if n == 0 {
 			continue
 		}
-		offsets := make([]uint16, n)
-		tbmExtractPageTuple(entry, offsets)
-		for _, off := range offsets {
-			// Inline the per-tuple fetch, avoiding fetchExact's recursive
-			// o.Next() call which would claim a fresh page from the shared
-			// allocator and lose the remaining TIDs on this page.
-			row, err := o.fetchOneTuple(block, off, entry.recheck)
-			if err != nil {
-				return nil, err
-			}
-			if row != nil {
-				return row, nil
-			}
+		o.parOffsets = make([]uint16, n)
+		tbmExtractPageTuple(entry, o.parOffsets)
+		o.parOff = 0
+		o.parRecheck = entry.recheck
+		if slot, err := o.nextParallelTuple(block); err != nil || slot != nil {
+			return slot, err
 		}
 	}
 }
@@ -694,6 +754,65 @@ func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, 
 	row := cloneRowOwned(o.scanRow)
 	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
 	return &o.slot, nil
+}
+
+// nextParallelTuple returns the next surviving tuple from the current exact
+// page, or (nil, nil) once its offsets are exhausted. `fetchOneTuple` is used
+// rather than `fetchExact` because the latter recurses through o.Next(), which
+// would claim a fresh page from the shared allocator and abandon this one.
+func (o *bitmapHeapScanOp) nextParallelTuple(block storage.BlockNumber) (TupleSlot, error) {
+	for o.parOff < len(o.parOffsets) {
+		off := o.parOffsets[o.parOff]
+		o.parOff++
+		slot, err := o.fetchOneTuple(block, off, o.parRecheck)
+		if err != nil {
+			return nil, err
+		}
+		if slot != nil {
+			return slot, nil
+		}
+	}
+	o.parOffsets = nil
+	o.parOff = 0
+	return nil, nil
+}
+
+// nextLossyTuple advances `lossyOff` over the pinned page and returns the next
+// tuple that survives visibility, the bitmap recheck and `Cond`, or (nil, nil)
+// when the page is exhausted.
+//
+// A LOSSY bitmap entry records only that a page contains matches, not which
+// offsets — so every line pointer has to be visited and every tuple re-checked.
+// That is why PG re-evaluates `bitmapqualorig` on a lossy page
+// (nodeBitmapHeapscan.c) and why `recheck` is passed unconditionally true here.
+//
+// `fetchOneTuple` is used rather than `fetchExact` deliberately: the latter
+// recurses through `o.Next()` when it skips a tuple, which would advance the
+// TBM iterator off this page mid-walk. `fetchOneTuple` reports a skip as
+// (nil, nil) and leaves the cursor to this loop.
+//
+// The page's end is found by `PageGetItemID` returning an error rather than by
+// a max-offset helper, because this package has none.
+func (o *bitmapHeapScanOp) nextLossyTuple(block storage.BlockNumber) (TupleSlot, error) {
+	if o.pinned == nil {
+		return nil, nil
+	}
+	for {
+		o.lossyOff++
+		if o.lossyOff == 0 || o.lossyOff > uint16(MaxOffsetNumber) {
+			return nil, nil
+		}
+		if _, err := storage.PageGetItemID(o.pageBuf, o.lossyOff); err != nil {
+			return nil, nil // past the last line pointer: page exhausted
+		}
+		slot, err := o.fetchOneTuple(block, o.lossyOff, true)
+		if err != nil {
+			return nil, err
+		}
+		if slot != nil {
+			return slot, nil
+		}
+	}
 }
 
 // evalBitmapQual evaluates the BitmapHeapScan's BitmapQual against the
