@@ -1801,6 +1801,19 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mmgr.Con
 		if err != nil {
 			return Datum{}, 0, err
 		}
+		// Decode the NumericData body straight into the mantissa+scale the
+		// Datum carries. Both ends are exact integers with an explicit decimal
+		// scale, so the old route through numeric_out text and math/big was
+		// pure loss: it measured 46 % of all CPU and 6.07 allocations per
+		// value on a TPC-H Q6 scan, whose lineitem has EIGHT numeric columns
+		// (docs/design/not_ralph/tpch-q6-numeric-decode/DESIGN.md).
+		//
+		// ok=false hands the value to the unchanged text path below — legacy
+		// text payloads, NaN/±Infinity, and mantissas past int64 all still go
+		// exactly where they went before.
+		if v, scale, ok := nodes.NumericInt64FromStoredPayload(payload); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
+		}
 		text, err := nodes.NumericTextFromStoredPayload(payload)
 		if err != nil {
 			return Datum{}, 0, err
