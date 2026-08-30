@@ -975,3 +975,59 @@ double-count fix (§11.4) must stay unlanded.
 This also deserves a regression test independent of plan parity: force a bitmap
 scan over a relation big enough to go lossy and compare against the seq-scan
 result. Such a test would have caught this long before a plan-shape census did.
+
+
+## 13 The over-selection has a systematic cause: correlation is 0 everywhere
+
+With the bitmap executor holes fixed (`5341d652a`) and the double-count cost fix
+applied, all five of PG's bitmap queries get bitmap scans — but goopg selects
+**27** bitmap scans against PG's 6. That over-selection is not a bitmap problem.
+It is this:
+
+```
+goopg  pg_stats.correlation          PG
+  lineitem.l_orderkey   (empty)      0.20565678
+  lineitem.l_partkey    (empty)      0.0027776298
+  orders.o_custkey      (empty)     -0.008831654
+  supplier.s_nationkey  (empty)      0.030710574
+```
+
+**goopg stores no correlation statistic at all.** `indexCorrelationFor`
+(costindex.go) reads `stats.Correlation` correctly; the value it reads is
+always zero. And `csquared = correlation²` is what `cost_index` interpolates
+between its two I/O bounds:
+
+```go
+csquared := in.correlation * in.correlation
+runCost += maxIOCost + csquared*(minIOCost-maxIOCost)
+```
+
+With `csquared = 0` every index scan in goopg is priced at **`max_IO_cost`** —
+the perfectly-uncorrelated case, every heap page a random seek. PG prices the
+same scans partway toward `min_IO_cost`. So goopg's index probes are
+systematically overpriced, and any rival that does not pay per-row random
+fetches — a bitmap scan, a seq scan — wins more often than it should.
+
+This is a bigger finding than the bitmap work that led to it: it affects **every
+index cost decision in the planner**, not just the bitmap comparison. §1 recorded
+"`indexCorrelationFor` returns 0 for every index goopg has today" as a fact
+about goopg's indexes; it is actually a missing statistic.
+
+### 13.1 What to check first
+
+`operators_analyze.go` has a `--- correlation (STATISTIC_KIND_CORRELATION) ---`
+section, so the value is COMPUTED. It does not reach the planner. The two
+candidates, in order:
+
+1. it is computed but not persisted, or not restored at startup — the same shape
+   as the `NDistinct`-vs-`NDistinctFrac` split in §9, where the absolute form
+   was lost across a restart and only the scale-free one survived;
+2. it is persisted but `pg_stats` does not project it, in which case the
+   planner may actually see it and the table above is measuring the view rather
+   than the statistic — check `catalog.ColumnStats.Correlation` directly before
+   concluding.
+
+Distinguishing those is one print in `indexCorrelationFor`, and it should come
+before any further cost calibration: with correlation missing, every
+index-vs-anything comparison in this document was made against an overpriced
+index scan.

@@ -400,11 +400,19 @@ experiment (DESIGN §4-A):
       So the double-count fix is oracle-correct and buys all five PG bitmap
       targets, at the price of three slower queries. It is NOT landed; that is
       a judgement for a human, not an automated gate
-- [ ] If it is landed, the follow-up is the over-selection: applying
-      `indexProbeCostMultiplier` to bitmap heap pages as well was tried and
-      changes nothing (it scales both sides of the comparison), so the cause is
-      elsewhere — compare goopg's index-probe cost against PG's for one of the
-      10 queries where goopg picks bitmap and PG does not
+- [x] **Over-selection root cause found — and it is not about bitmap.**
+      goopg's `pg_stats.correlation` is EMPTY for every column where PG has real
+      values (`l_orderkey` 0.206, `s_nationkey` 0.031, …). `cost_index`
+      interpolates between its two I/O bounds by `correlation²`, so with zero
+      correlation **every index scan in goopg is priced at `max_IO_cost`** — the
+      fully-uncorrelated worst case. Index probes are systematically overpriced,
+      so bitmap (and seq) rivals win too often. See DESIGN §13
+- [ ] **Do this before any further cost calibration.** `operators_analyze.go`
+      computes correlation, so it is either not persisted/restored (the same
+      shape as the NDistinct/NDistinctFrac split in §9) or not projected by
+      `pg_stats`. One print in `indexCorrelationFor` distinguishes them. Every
+      index-vs-bitmap comparison in this document was made against an overpriced
+      index scan, so re-run them afterwards
 - [ ] Worth a regression test in its own right, independent of plan parity: a
       bitmap scan forced over a relation big enough to go lossy, compared
       against the seq-scan result. That test would have caught this years
