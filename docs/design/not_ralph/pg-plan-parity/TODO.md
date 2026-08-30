@@ -276,6 +276,29 @@ refuse — the exact failure that file warns about.
       same `Nested Loop Anti Join`, same `Index Cond: (o_custkey = c_custkey)`.
       The single difference is the node type: `Index Scan` vs PG's
       `Index Only Scan`. Q22 is therefore the cheapest census win available
+- [x] **A cheaper shortcut for Q22 exists and is REJECTED — record so it is not
+      rediscovered and taken.** For semi/anti the NLI never emits the inner row
+      (`operators_nljoin.go:239-250`: Semi returns `o.outerOnly`, Anti marks and
+      skips), so the inner is used only to test existence. A flag —
+      `IndexScan.IndexOnly` — plus an executor branch skipping the heap fetch
+      when `ctx.VM.AllVisible(block)` would produce the same execution and the
+      same `Index Only Scan` EXPLAIN line for Q22, at perhaps a fifth of the
+      cost of the three-stage plan. It is even correct: ALL_VISIBLE is exactly
+      the guarantee that lets an index entry stand in for a visible tuple, and
+      `indexOnlyScanOp` already relies on it.
+
+      It is rejected because it is a SECOND representation of index-only
+      scanning alongside the existing `IndexOnlyScan` node — the
+      two-ways-to-say-one-thing shape this repo is repeatedly bitten by
+      (see the `variableNumDistinct` divergence, `1081e5b84`, found in this same
+      session) — and because PG's Q22 uses a real Index Only Scan node, so the
+      faithful structural change is widening `Inner`, not adding a flag beside
+      it. `CLAUDE.md`: "Vanilla-PG compatibility is absolute."
+
+      If a future maintainer decides the trade is worth it, the guards are:
+      set the flag only when the NLI's `Predicate` references no inner column
+      (walk `ColumnRefs` for `Index >= outerWidth`) and the inner's `Cond` is
+      nil, or the skipped heap fetch drops a predicate
 - [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
       one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
       (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over
