@@ -299,6 +299,24 @@ refuse — the exact failure that file warns about.
       set the flag only when the NLI's `Predicate` references no inner column
       (walk `ColumnRefs` for `Index >= outerWidth`) and the inner's `Cond` is
       nil, or the skipped heap fetch drops a predicate
+- [x] Stage 1 fully mapped against the source, so it can be written without
+      re-deriving it. `indexOnlyScanOp.Open` splits as:
+
+      | half | contents |
+      |---|---|
+      | `openPrep` | handles check, privilege check, `o.ctx`, `arrayStyle`, `heapRel`, the three lock acquisitions, `isHashIdx`, the non-hash `ssiRecordRelationRead`, `openIndexBTree` |
+      | `Rescan` | reset `rows`/`idx`/`hashProbeFingerprint`/`touchedBlocks`, bind the outer slot, key resolution, the hash-bucket SIREAD, `keyDecodable`, `scanFn`, `RangeScan`, the `Backward` start index, `pruneTouchedTempPages` |
+      | `Open` | `openPrep` + `Rescan(nil, 0)` |
+
+      New fields needed: `tree`, `heapRel`, `isHashIdx`, `outerSlot`,
+      `outerWidth`.
+- [x] **One non-obvious prerequisite inside stage 1**: the three probe helpers
+      are constant-only today. `lookupKey` calls `evalExpr(o.plan.Key, nil,
+      o.ctx)` — a **nil row** (operators_indexonly.go:814), and `lookupKeys` /
+      `lookupRangeBounds` match. An NLI inner's probe key references OUTER
+      columns, so all three must move to `evalExprSlot(expr, o.outerSlot,
+      o.ctx)`, mirroring `indexScanOp`. Miss this and the scan silently probes
+      with a nil row rather than failing
 - [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
       one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
       (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over
