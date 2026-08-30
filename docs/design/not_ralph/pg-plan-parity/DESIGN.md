@@ -1264,3 +1264,95 @@ every point downstream. This is the same shape as the census bug in §9 (the
 labeller, not the planner) and the memory note "in a cost-based planner, a path
 the optimiser never selects has never been executed" — three instances now of a
 missing thing being mistaken for a wrong thing.
+
+## 15. The index-only PATH: a concrete plan, anchored on `baseRelLayout`
+
+Q13 and Q16 are the two remaining index-only scans, and both sit where the
+existing peephole cannot reach them — as **hash-join inputs**:
+
+```
+PG Q13:  ->  Hash  (cost=3906.42..3906.42 rows=150000 width=6)
+               ->  Index Only Scan using customer_pk on customer
+PG Q16:  ->  Parallel Hash Join
+               ->  Parallel Index Only Scan using partsupp_pk on partsupp
+                     Filter: (NOT (ANY (ps_suppkey = (hashed SubPlan 1).col1)))
+```
+
+`tryPromoteIndexOnlyScan` fires at one site, over a `*Project`, and inside a
+join tree there is no `*Project` above the scan — the join reads the scan
+directly. So the promotion has nothing to attach to and fires zero times across
+all 22 queries. This has been mis-diagnosed twice (first as `attr_needed`, then
+as the promotion not being schema-preserving); neither is the blocker.
+
+The real blocker is that an index-only scan is NARROWER than the scan it
+replaces, and goopg addresses columns POSITIONALLY. Narrowing a leaf shifts
+every `ColumnRef.Index` above it.
+
+### 15.1 Why this is tractable: the DP already re-bases every clause
+
+`createPlan` does not use parse-time coordinates. It computes an `outputLayout`
+per node and rewrites each clause into it (`createplanjoin.go`):
+
+```go
+func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
+        width := len(n.Output())
+        if leafWidth := len(rel.baseLeaf.Output()); leafWidth != width {
+                panic("... the schema was synthesised, not carried")
+        }
+        lay := make(outputLayout, width)
+        for i := range lay {
+                lay[i] = rel.baseOffset + i        // <- the only assumption
+        }
+        return lay
+}
+```
+
+`translateToLayout` is `set_join_references` (setrefs.c:2557) at goopg's
+fidelity, and it already refuses — loudly — any clause referencing a column
+absent from the node's output:
+
+> `createPlan: %s references binding column %d (%s), which is not among the %d
+> output columns it is being re-based onto`
+
+That is exactly the safety property a pruning pass needs. **The narrowing is a
+`baseRelLayout` change, not a tree-walking remap.** The `lay[i] = baseOffset + i`
+identity is the only place that assumes a leaf emits its table's full column
+list, and the width panic beside it is the seam.
+
+### 15.2 The five steps
+
+1. **Needed-column set per base rel.** `searchCtx` has `relInfos`, `clauses`,
+   `tupleFraction` — but no target list, so this must be threaded from
+   `planSelect`: the final projection plus ORDER BY / GROUP BY / HAVING, unioned
+   with every `restrictInfo` mentioning the rel. This is PG's `reltarget` +
+   `attr_needed` (`build_base_rel_tlists`), and it is the only genuinely new
+   state.
+2. **`check_index_only`** (PG `indxpath.c:1010`): a btree index qualifies when
+   its columns cover that set. `customer_pk (c_custkey)` covers Q13's
+   `{c_custkey}`; `partsupp_pk (ps_partkey, ps_suppkey)` covers Q16's.
+3. **Generate `PathIndexOnlyScan`** beside the seq-scan path at base-rel level,
+   costed by `cost_index(..., indexonly=true)` — PG subtracts the heap fetches
+   in proportion to the visibility-map fraction. Then `addPath` decides, which
+   is what makes this a cost choice and not a forced one.
+4. **`baseRelLayout` narrowing.** For an index-only leaf, position `i` holds
+   the covered column at index-column order, so
+   `lay[i] = rel.baseOffset + originalTablePos(covered[i])` and the identity
+   `baseOffset + i` becomes the special case where the two coincide. Replace the
+   width panic with this computation; keep a panic for any OTHER width
+   disagreement, since that still means a synthesised schema.
+5. **Nothing else.** Every ancestor is re-based from `lay` by the existing
+   `translateToLayout`, and a clause referencing a pruned column hits its
+   existing refusal panic instead of silently reading the wrong column — so a
+   coverage bug is loud at plan time, not wrong at runtime.
+
+### 15.3 What to verify first, and why
+
+Per §14.4, verify GENERATION before costing: instrument the producer and
+confirm a `PathIndexOnlyScan` is emitted for `customer` in Q13 at all, before
+comparing any cost against PG's `0.42..3906.42`. The Q8 round cost five wrong
+hypotheses to that exact mistake.
+
+The risk to watch is step 4 interacting with the parallel path: Q16's is a
+`Parallel Index Only Scan`, so the narrowed layout must hold across
+`PartialPathlist` and the Gather above it. Q13's is serial and is therefore the
+one to land first.
