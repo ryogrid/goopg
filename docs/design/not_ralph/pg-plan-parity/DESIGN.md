@@ -886,3 +886,33 @@ gap:
 That is a cost-formula gap with a named PG oracle on both terms, which is a very
 different remaining task from the "missing infrastructure" this document opened
 with.
+
+### 11.5 Both terms fixed (`94ef875ab`) — and the first was inverted, not missing
+
+`costBitmapHeapScan` did have an interpolation; it ran **backwards**. goopg
+computed `sqrt*random + (1-sqrt)*seq`, which moves toward RANDOM as more of the
+relation is touched. PG's is
+
+```c
+cost_per_page = spc_random_page_cost
+              - (spc_random_page_cost - spc_seq_page_cost) * sqrt(pages_fetched / T);
+```
+
+which moves toward SEQUENTIAL — the entire reason a bitmap scan exists. The
+file's own comment described PG's behaviour ("a near-whole-table scan approaches
+seq_page_cost") while the expression below it did the opposite, so comment and
+code never contradicted each other in review, and the unit test encoded the
+inverted form. `compute_bitmap_pages` also gained PG's `loop_count` pro-rating.
+
+**The result reads backwards and is the opposite: Bitmap Heap Scan went 2 -> 1.**
+PG's Q8 has ZERO bitmap nodes and PG's Q17 has two. goopg had one on BOTH, so
+its Q8 bitmap was a divergence the inverted formula produced; after the fix
+goopg's bitmap set on those queries matches PG's exactly. Timed against the TRUE
+pre-work baseline rather than the intermediate state: q08 11.7 s -> 11.5 s (its
+1.1 s under the buggy formula was never real), q17 2.2 s -> 0.4 s.
+
+This is the third time in this document that a census number moving in the
+"wrong" direction was the correct outcome, and the second time a unit test was
+found pinning the defect it was meant to guard. Neither is a coincidence: a test
+written from the implementation rather than from the oracle will always agree
+with the implementation.

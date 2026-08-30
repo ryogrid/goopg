@@ -250,17 +250,24 @@ experiment (DESIGN §4-A):
       PG prices that same scan at **43.46**. Bitmap is not blocked for
       Q2/Q11/Q20/Q21 — it is MISPRICED by roughly 60x and loses to the plain
       index probe
-- [ ] **The real next step is `costBitmapHeapScan`**, and two terms are missing:
-  - [ ] PG blends random toward SEQUENTIAL page cost as the touched fraction
-        grows: `cost_per_page = spc_random_page_cost -
-        (spc_random_page_cost - spc_seq_page_cost) * sqrt(pages_fetched / T)`
-        (`cost_bitmap_heap_scan`, costsize.c:1023). goopg charges full random
-        cost per page, which is most of the 60x — a bitmap scan touching most
-        of a relation is priced as if every page were a random seek, which is
-        exactly the case bitmap exists to make cheap
-  - [ ] PG's is a nested-loop inner, so its pages are amortised by `loop_count`
-        (the same arm `07f4f7814` added to `cost_index`). `costBitmapHeapScan`
-        has no `loop_count` notion at all
+- [x] **Both terms FIXED** (`94ef875ab`), and the first was worse than
+      "missing" — it was INVERTED. goopg computed
+      `sqrt*random + (1-sqrt)*seq`, which moves toward RANDOM as the touched
+      fraction grows; PG's `random - (random-seq)*sqrt(ratio)`
+      (costsize.c:1071) moves toward SEQUENTIAL, which is the whole reason the
+      access method exists. The file's own comment described PG's behaviour
+      while the expression did the opposite, so the two never contradicted each
+      other in review. `compute_bitmap_pages` also gained PG's `loop_count`
+      pro-rating (costsize.c:6514)
+- [x] Result is PLAN PARITY, not a speed win, and it reads backwards at first:
+      Bitmap Heap Scan went 2 -> 1. **PG's Q8 has ZERO bitmap nodes**; goopg had
+      one there only because the inverted formula made small-fraction bitmaps
+      too cheap. goopg's bitmap set on Q8/Q17 now matches PG's exactly. Timed
+      against the TRUE pre-work baseline: q08 11.7 -> 11.5 (its 1.1s under the
+      buggy formula was never real), q17 2.2 -> 0.4
+- [ ] Q2/Q11/Q20/Q21 STILL get no bitmap. With the formula now PG-faithful, the
+      remaining gap is elsewhere — re-measure `supplier.supplier_nation_fkidx`
+      (was 2588.7 vs PG's 43.46) before forming a new hypothesis
 
 ### B (original notes) — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans) — BLOCKED on a consumer
 
