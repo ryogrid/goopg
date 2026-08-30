@@ -21,11 +21,12 @@ package optimizer
 // `random_page_cost` predicts. Sequential fetches and CPU terms are PG-native,
 // since neither is what the multiplier was measured against.
 //
-// Only the `loop_count == 1` arm is reproduced. `loop_count > 1` is the
-// repeated-inner-scan arm, which prices a parameterised path inside a nested
-// loop — the case `paramIndexScanCost` already owns under its own convention
-// ("cost one execution; the join above multiplies"). Mixing the two here would
-// re-introduce exactly the double model this slice avoids. Ledgered.
+// BOTH `loop_count` arms are reproduced. The `loop_count > 1` arm prices a
+// parameterised path inside a nested loop and returns the cost of ONE
+// execution — PG pro-rates by `loop_count` itself — so it keeps the convention
+// the single-scan arm and the join arm already share ("cost one execution; the
+// join above multiplies"). There is no second model: the flat-probe function
+// that used to price parameterised paths separately is gone.
 
 import (
 	"math"
@@ -71,6 +72,16 @@ type indexScanInputs struct {
 	// relation in the query, which is what the cache budget is pro-rated
 	// between.
 	totalTablePages float64
+	// loopCount is `cost_index`'s parameter of the same name: how many times
+	// this scan is expected to be RE-executed, which for a parameterised path
+	// is the row count of the outer relations supplying its parameter
+	// (`get_loop_count`, indxpath.c:3266). 0 or 1 means a single execution.
+	//
+	// It exists so the returned cost stays "one execution": PG pro-rates the
+	// amortised total back down by `loopCount` for exactly that reason, which
+	// is what lets the join arm keep multiplying by the outer row count without
+	// double-counting.
+	loopCount float64
 }
 
 // costIndexScan is `cost_index` (costsize.c:520) for a single, non-parallel,
@@ -98,17 +109,40 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
 
 	tuplesFetched := clampRowEst(in.selectivity * in.relTuples)
 
-	// max_IO_cost: the perfectly uncorrelated case (csquared = 0).
-	pagesFetched := indexPagesFetched(tuplesFetched, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
-	maxIOCost := pagesFetched * cp.randomPageCost * indexProbeCostMultiplier
+	var maxIOCost, minIOCost float64
+	if in.loopCount > 1 {
+		// The repeated-scan arm (costsize.c:598-640). Its whole content is one
+		// idea: a scan run `loopCount` times does NOT cost `loopCount` times a
+		// single scan, because the pages the second scan wants are largely the
+		// ones the first already brought in. PG expresses that by running
+		// Mackert-Lohman over the TOTAL tuples all the scans fetch and then
+		// pro-rating back to one scan, so the total grows sublinearly in
+		// `loopCount` and the quotient shrinks.
+		//
+		// "In this case we assume all the fetches are random accesses" — so
+		// unlike the single-scan arm below there is no seq_page_cost term in
+		// either bound.
+		pagesFetched := indexPagesFetched(tuplesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
+		maxIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
 
-	// min_IO_cost: the perfectly correlated case (csquared = 1). One random
-	// fetch, then sequential ones.
-	minIOCost := 0.0
-	if correlatedPages := math.Ceil(in.selectivity * float64(in.relPages)); correlatedPages > 0 {
-		minIOCost = cp.randomPageCost * indexProbeCostMultiplier
-		if correlatedPages > 1 {
-			minIOCost += (correlatedPages - 1) * cp.seqPageCost
+		// The correlated bound applies the same formula one level up, at PAGE
+		// rather than tuple grain: each scan touches `selectivity * relPages`
+		// pages, and caching across scans is what Mackert-Lohman then estimates.
+		pagesFetched = math.Ceil(in.selectivity * float64(in.relPages))
+		pagesFetched = indexPagesFetched(pagesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
+		minIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+	} else {
+		// max_IO_cost: the perfectly uncorrelated case (csquared = 0).
+		pagesFetched := indexPagesFetched(tuplesFetched, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
+		maxIOCost = pagesFetched * cp.randomPageCost * indexProbeCostMultiplier
+
+		// min_IO_cost: the perfectly correlated case (csquared = 1). One random
+		// fetch, then sequential ones.
+		if correlatedPages := math.Ceil(in.selectivity * float64(in.relPages)); correlatedPages > 0 {
+			minIOCost = cp.randomPageCost * indexProbeCostMultiplier
+			if correlatedPages > 1 {
+				minIOCost += (correlatedPages - 1) * cp.seqPageCost
+			}
 		}
 	}
 

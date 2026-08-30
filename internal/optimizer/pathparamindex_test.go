@@ -161,13 +161,47 @@ func TestAddParameterizedIndexPathsUniqueIndexGivesOneRow(t *testing.T) {
 	if param.Rows != 1 {
 		t.Errorf("ppi_rows = %v; want 1 for a fully-bound unique index", param.Rows)
 	}
-	// One execution of a bound probe, not a scan of the relation: the whole
-	// reason 03 §9 rule 3 insists cost primitives read the PATH's Rows.
-	if want := indexProbeCost(s.cp); param.Cost.Total != want {
-		t.Errorf("cost = %v; want one probe (%v)", param.Cost.Total, want)
+	// One execution of a bound probe, not a scan of the relation.
+	//
+	// This used to assert `Cost.Total == indexProbeCost(s.cp)` exactly, which
+	// was an artefact of the flat per-probe function that priced parameterised
+	// paths separately. They are priced by `cost_index` (costsize.c:520) now,
+	// like every other index path, so the number is a model output rather than
+	// a constant to pin. The PROPERTY the constant stood for is asserted
+	// instead — one-probe shaped, and independent of the relation's size.
+	if probe := indexProbeCost(s.cp); param.Cost.Total > 2*probe {
+		t.Errorf("cost = %v; a fully-bound unique probe must stay one-probe shaped (~%v)", param.Cost.Total, probe)
 	}
 	if seq := rel.Pathlist[0]; param.Cost.Total >= seq.Cost.Total {
 		t.Errorf("a bound PK probe (%v) is not cheaper than the seq scan (%v)", param.Cost.Total, seq.Cost.Total)
+	}
+
+	// The sharp form of "one execution": ten times the relation must not cost
+	// ten times the probe. A cost that tracked the relation's size would mean
+	// the path had been priced as a scan, which is what the old equality was
+	// really guarding against.
+	catBig, ordersBig, _ := ppiCatalog(t)
+	ppiSetStats(ordersBig, 15_000_000,
+		catalog.ColumnStats{NDistinct: 15_000_000},
+		catalog.ColumnStats{NDistinct: 1_500_000},
+		catalog.ColumnStats{NDistinct: 5})
+	sBig := ppiCtx(t, ordersBig, 15_000_000, ppiEquiClause(outer, "l_orderkey", inner, "o_orderkey"))
+	sBig.addParameterizedIndexPaths(catBig)
+	var big *Path
+	for _, p := range sBig.findRel(inner).Pathlist {
+		if p.RequiredOuter != 0 {
+			big = p
+		}
+	}
+	if big == nil {
+		t.Fatal("no parameterised path on the 10x relation")
+	}
+	if big.Rows != 1 {
+		t.Errorf("ppi_rows on the 10x relation = %v; want 1", big.Rows)
+	}
+	if big.Cost.Total > 1.5*param.Cost.Total {
+		t.Errorf("probe cost went %v -> %v for a 10x relation; a bound unique probe must not scale with it",
+			param.Cost.Total, big.Cost.Total)
 	}
 }
 
