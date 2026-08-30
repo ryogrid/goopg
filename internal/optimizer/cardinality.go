@@ -47,12 +47,12 @@ func EstimateRows(n Node) int64 {
 	case *IndexScan:
 		// Equality probe → 1 row per call site; a bound-less scan reads the
 		// whole relation (M0127-P5.9-h, see indexScanRows).
-		return indexScanRows(x.Table, x.Key, x.Keys, x.LowKey, x.HighKey)
+		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey)
 	case *IndexOnlyScan:
 		// Same two shapes as *IndexScan, and the full-range one is REACHABLE
 		// without the join search: planner.go's sort-avoidance rewrite builds
 		// an ordered full-range IOS with nil Key/Keys/LowKey/HighKey.
-		return indexScanRows(x.Table, x.Key, x.Keys, x.LowKey, x.HighKey)
+		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey)
 	case *Values:
 		return int64(len(x.Rows))
 	case *Filter:
@@ -284,22 +284,91 @@ func seqScanRows(x *SeqScan) int64 {
 // answers neither: the 1 is minted here, after the search, when the finished
 // plan tree is re-estimated.
 //
-// A node with ANY key or bound keeps the old answer verbatim, which is what
-// keeps this narrow: every index scan the flag-off TPC-H planner emits binds
-// an Index Cond, so none of them reach the full-scan arm.
-//
 // The no-statistics case returns 1 rather than 0 deliberately: 0 means "no
 // estimate available" to every caller and would zero every node above, which
 // is a worse answer than the one this function is replacing.
-func indexScanRows(tbl *catalog.Table, key Expr, keys []Expr, lowKey, highKey Expr) int64 {
-	if key != nil || len(keys) > 0 || lowKey != nil || highKey != nil {
+//
+// KEYED SCANS ARE NO LONGER A FLAT 1 (pg-plan-parity item 0). The historical
+// convention above — "any key or bound ⇒ 1 row" — is right for a UNIQUE index
+// whose every column is bound by equality, and wrong for every other keyed
+// scan. On a non-unique index it was wrong by orders of magnitude:
+//
+//	SELECT * FROM supplier WHERE s_nationkey = 5
+//	   goopg  rows=1        PG  rows=378      (10 000 rows / 25 nations)
+//
+// and because EstimateRows also sizes hash tables, picks join algorithms and
+// decides Memoize, a probe priced at one row makes an index-driven nested loop
+// look free while simultaneously making the index scan itself look too cheap to
+// beat with a bitmap. It is the constant underneath both the "bitmap never
+// wins" and "nested loop 1 vs 25" gaps.
+//
+// The estimate now follows PG: selectivity × reltuples, with the per-column
+// equality selectivity from `var_eq_non_const` (selfuncs.c) — the same helper
+// the parameterised-path sizing uses, so the two cannot drift — and
+// DEFAULT_INEQ_SEL per range bound. A unique index fully bound by equality
+// still returns 1, which is both correct and what keeps the common PK probe
+// unchanged.
+func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr, lowKey, highKey Expr) int64 {
+	relRows := tableRows(tbl)
+	keyed := key != nil || len(keys) > 0
+	bounded := lowKey != nil || highKey != nil
+
+	if !keyed && !bounded {
+		// Full index scan: reads the whole relation.
+		if relRows > 0 {
+			return relRows
+		}
 		return 1
 	}
-	if rows := tableRows(tbl); rows > 0 {
-		return rows
+	// Without reltuples there is nothing to scale, so keep the historical
+	// answer rather than inventing one.
+	if relRows <= 0 {
+		return 1
 	}
-	return 1
+
+	nEq := len(keys)
+	if key != nil && nEq == 0 {
+		nEq = 1
+	}
+	// A unique index with every column pinned by equality yields at most one
+	// row — PG's `btcostestimate` special-case, and the shape the old constant
+	// was really written for.
+	if idx != nil && idx.Unique && nEq > 0 && nEq >= len(idx.Columns) {
+		return 1
+	}
+
+	sel := 1.0
+	for i := 0; i < nEq; i++ {
+		var cs *catalog.ColumnStats
+		if idx != nil && i < len(idx.Columns) {
+			cs = columnStatsByName(tbl, idx.Columns[i])
+		}
+		sel *= varEqNonConstSelectivity(cs)
+	}
+	// PG charges DEFAULT_INEQ_SEL per unmatched inequality bound
+	// (selfuncs.h); a two-sided range therefore lands near its
+	// DEFAULT_RANGE_INEQ_SEL neighbourhood without needing histograms here.
+	if lowKey != nil {
+		sel *= defaultIneqSel
+	}
+	if highKey != nil {
+		sel *= defaultIneqSel
+	}
+	sel = clampSelectivity(sel)
+
+	rows := int64(sel * float64(relRows))
+	if rows < 1 {
+		return 1
+	}
+	if rows > relRows {
+		return relRows
+	}
+	return rows
 }
+
+// defaultIneqSel is PG's DEFAULT_INEQ_SEL (selfuncs.h): the selectivity charged
+// for a scalar inequality whose statistics do not settle it.
+const defaultIneqSel = 0.3333333333333333
 
 // tableRows returns the catalog's reltuples-equivalent for a
 // table, or 0 when ANALYZE hasn't run yet.

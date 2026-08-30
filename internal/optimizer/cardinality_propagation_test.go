@@ -48,10 +48,13 @@ func TestEstimateRowsPassThroughWrappers(t *testing.T) {
 		{"Gather", &Gather{Child: scan}, 1234},
 		{"GatherMerge", &GatherMerge{Child: scan}, 1234},
 		{"LockRows", &LockRows{Child: scan}, 1234},
-		// Memoize wraps *IndexScan which always estimates 1 (equality
-		// probe convention). Confirm the pass-through, not a specific
-		// row count.
-		{"Memoize", &Memoize{Child: idxScan}, 1},
+		// Memoize wraps an *IndexScan. What matters here is the
+		// PASS-THROUGH, not the child's own number, so the expectation is
+		// taken FROM the child rather than written as a constant — this
+		// used to hardcode 1 and broke when the keyed-scan estimate stopped
+		// being a flat 1 (pg-plan-parity item 0), which is exactly the kind
+		// of coupling a pass-through test should not have.
+		{"Memoize", &Memoize{Child: idxScan}, EstimateRows(idxScan)},
 		{"CTEScan", &CTEScan{Name: "c", Child: scan}, 1234},
 	}
 	for _, tc := range cases {
