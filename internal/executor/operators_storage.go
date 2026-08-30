@@ -1043,6 +1043,14 @@ type seqScanOp struct {
 	// (runtime.convTslice) and scanRow's identity does not change
 	// between rows. Rebuilt only when scanRow is reallocated.
 	scanSlot SlotView
+	// pfSlab / pfIdx are the COMPILED form of the prefilter predicate, built
+	// once in Open (where a *Context exists, which constant folding needs) and
+	// immutable after. Per-operator rather than shared: each parallel worker
+	// builds its own operator tree, so the slab is goroutine-private by
+	// construction. pfIdx == noExpr means "use the interpreter", which is what
+	// the non-fast Build path and any compile failure fall back to.
+	pfSlab exprTreeSlab
+	pfIdx  int32
 	// tupleBuf is the per-scan scratch buffer PageGetHeapTupleInto copies
 	// each tuple into, so a scan costs no allocation per tuple.
 	tupleBuf []byte
@@ -1588,6 +1596,19 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		if o.gistSSIIdxOID != 0 || o.ginSSIIdxOID != 0 || hasEnum ||
 			o.typeACLColIdx >= 0 || o.attrACLColIdx >= 0 || o.dbACLColIdx >= 0 {
 			o.prefilterSet = false
+		}
+	}
+	// Compile the prefilter predicate into the existing ExprNode slab, with
+	// constant folding enabled by passing ctx. Rebuilt on every Open so a
+	// re-Open under a different Context re-folds against that Context's GUCs.
+	// evalFastExpr dispatches on an integer kind rather than an interface type
+	// switch, and the fold removes the literals and the constant
+	// `date + interval` subtree that Q6 was re-evaluating per row.
+	o.pfSlab, o.pfIdx = nil, noExpr
+	if o.prefilterSet {
+		var slab exprTreeSlab
+		if idx := slab.buildExprCtx(o.prefilter.pred, ctx); idx != noExpr {
+			o.pfSlab, o.pfIdx = slab, idx
 		}
 	}
 	// M0118-0001: a SERIALIZABLE seq scan takes a relation-level SIREAD
