@@ -373,16 +373,38 @@ experiment (DESIGN §4-A):
       `lineitem` rows does immediately. That is the 94% row loss on q03: 702 of
       11415. It was invisible because bitmap paths never won on cost
 
-### B — the actual blocker: lossy-page iteration
+### B — executor holes FIXED (`5341d652a`); one costing decision left
 
-- [ ] **This, not costing, is what gap B needs.** Implement lossy-page
-      iteration: when a bitmap entry is lossy the scan must walk EVERY line
-      pointer on the page and re-check each tuple against `BitmapQual`
-      (PG: `bitgetpage` + the recheck path, nodeBitmapHeapscan.c). Until then a
-      bitmap scan over any relation large enough to overflow `work_mem`
-      silently returns a subset, so bitmap paths cannot be enabled broadly at
-      any cost setting
-- [ ] Only then: land the verified double-count fix and re-run the gate
+- [x] **The 94% row loss was NOT lossy pages.** Measured: `lossyPages=0`,
+      `exactPages=27379 emitted=27379` — exactly ONE row per page.
+      `nextParallel`'s exact-page loop returned the first surviving tuple and
+      fell out of the function, so the next `Next()` claimed a new page and the
+      rest of the current one was lost. Fixed with a per-page offset cursor
+- [x] Lossy-page iteration implemented too (both paths emitted nothing on a
+      lossy page; `nextSerial`'s comment promised handling that was never
+      written). Not the cause here, but a real hole
+- [x] **With those fixed AND the double-count fix applied, all five of PG's
+      bitmap queries get bitmap scans: Q2, Q11, Q17, Q20, Q21 — and 21/21
+      result sets stay byte-identical**
+- [ ] **The remaining decision is a trade, not a bug.** That configuration
+      selects **27** bitmap scans against PG's 6, and the over-selection costs
+      time:
+
+      | query | HEAD | with the cost fix |
+      |---|---:|---:|
+      | q21 | 10.7 s | **14.7 s** |
+      | q08 | 0.5 s | **1.0 s** |
+      | q03 | 7.2 s | 8.2 s |
+      | q02/q05/q09/q11/q17/q19/q20 | — | unchanged |
+
+      So the double-count fix is oracle-correct and buys all five PG bitmap
+      targets, at the price of three slower queries. It is NOT landed; that is
+      a judgement for a human, not an automated gate
+- [ ] If it is landed, the follow-up is the over-selection: applying
+      `indexProbeCostMultiplier` to bitmap heap pages as well was tried and
+      changes nothing (it scales both sides of the comparison), so the cause is
+      elsewhere — compare goopg's index-probe cost against PG's for one of the
+      10 queries where goopg picks bitmap and PG does not
 - [ ] Worth a regression test in its own right, independent of plan parity: a
       bitmap scan forced over a relation big enough to go lossy, compared
       against the seq-scan result. That test would have caught this years
