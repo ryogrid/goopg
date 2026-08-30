@@ -160,7 +160,21 @@ error. Q2 84.4 s -> 1.9 s, all plan-shape gains retained.
       under an NLI is silently unreachable. Fix it on its own merits, with its
       own gate
 
-### A — Index Only Scan (Q13, Q16, Q22) — BLOCKED on attribute-usage analysis
+### A — Index Only Scan — **Q22 DONE**; Q13/Q16 still blocked
+
+- [x] **Q22 landed** (`20495f11e` stage 1, `4bb67d06b` stage 2, `38f37863a`
+      stage 3). Index Only Scan 0 -> 1, matching PG, and Q22 got faster
+      (1.4 s -> 0.9 s). Gated: 21/21 byte-identical, only q22's plan changed,
+      units, TestPort_IsolationSuite, tpch-spotcheck
+- [x] Stage 2's scope estimate was wrong by an order of magnitude in the
+      discouraging direction: grep said 52 references across 26 files, the
+      compiler said 4 production files + 8 test files. Ask the type checker,
+      not grep
+- [ ] Q13 and Q16 are NOT reachable this way — their index-only scans are
+      HASH-JOIN inputs, which do publish their columns, so they still need the
+      column-pruning pass below
+
+### A (rest) — Index Only Scan (Q13, Q16) — BLOCKED on attribute-usage analysis
 
 **Blocker found.** The existing promotion derives coverage from the TOP-LEVEL
 `Project`'s target list (`planner.go:1691-1704`, matching

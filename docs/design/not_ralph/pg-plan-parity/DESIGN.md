@@ -1,9 +1,8 @@
 # PG plan parity — what is actually missing
 
-**Status:** five fixes landed and gated (`9db8a0970`, `80a5e334d`, `07f4f7814`,
-`1081e5b84`, `f95d85ae2`). **The Q2 regression is FIXED** — §9.5. Gaps A and B
-(index-only, bitmap) remain blocked on missing infrastructure. §7 says what and
-why.
+**Status:** eight fixes landed and gated. **Index Only Scan is no longer zero:
+TPC-H Q22 now emits PG's plan** (§10). The Q2 regression is fixed (§9.5). Q13,
+Q16 and the six bitmap scans remain — §7 and §10.2 say what is left and why.
 **Date:** 2026-08-30 (rewritten after adversarial review; §8)
 **Branch:** `perf-opt-take6`
 **Baseline:** `edfca5d43`
@@ -755,3 +754,51 @@ loop as a place where evidence goes to die.
 The five-hypothesis table is left in §9.3b deliberately. A future reader
 comparing it with this section learns more from the sequence than from the
 answer.
+
+## 10 Index-only scans: Q22 landed (`20495f11e`, `4bb67d06b`, `38f37863a`)
+
+**Index Only Scan 0 -> 1.** goopg's Q22 emits
+`Index Only Scan using order_customer_fkidx on orders`, which is what PG emits
+for that anti-join probe, and the query is FASTER for it: 1.4 s -> 0.9 s.
+
+### 10.1 What made it reachable when §4-A said it was not
+
+§4-A is still right about Q13 and Q16. Q22 is different, and the difference is
+one line of `nl_index_join.go`:
+
+```go
+if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+        joinedSchema = append(Schema(nil), outerNode.Output()...)
+} else { /* outer ++ inner */ }
+```
+
+A semi/anti join **does not publish its inner's columns**. So narrowing the
+inner cannot renumber any `ColumnRef` above it, and the positional-addressing
+problem that makes index-only scans a cross-cutting refactor here simply does
+not arise. Coverage is not tested because there is nothing to cover: the heap
+tuple was wanted for VISIBILITY alone, which is exactly what the visibility map
+supplies.
+
+Three stages, each gated on its own:
+
+| stage | commit | what |
+|---|---|---|
+| 1 | `20495f11e` | `indexOnlyScanOp.Open` split into `openPrep` + `Rescan` + `BindOuter`, mirroring `indexScanOp`. The four probe helpers moved off a NIL ROW to `evalExprSlot(expr, o.outerSlot, …)` — they were constant-only, and would have probed silently wrong as an inner |
+| 2 | `4bb67d06b` | `NestedLoopIndexJoin.Inner` widened to `Node`; `nliInnerProbe` is the one place enumerating legal inner kinds |
+| 3 | `38f37863a` | the promotion, with four declines (scan-level `Cond`, exclusive bound, residual reading an inner column, outer/subquery reference) |
+
+### 10.2 What is left, and an estimate to distrust
+
+Q13 and Q16 are NOT reachable this way — their index-only scans are hash-join
+inputs, which DO publish their columns — so they still need the column-pruning
+pass §4-A describes. The six bitmap scans need the rescan chain
+(`bitmapHeapScanOp` -> `bitmapIndexScanOp` -> And/Or) plus the planner half.
+
+**A methodological note that cost this document real time.** Stage 2 was
+estimated at "52 references across 26 files" by grepping for `.Inner`. The
+actual coupling, obtained by changing the field type and letting the compiler
+enumerate dependents, was **four production files** — `joinlayout.go`,
+`memoize.go`, `subplan_cost.go`, `executor.go` — plus eight test files. Grep
+counted the name; the compiler counted the coupling, and they differed by an
+order of magnitude in the direction that discourages starting. When a type
+change is the question, ask the type checker, not `grep`.
