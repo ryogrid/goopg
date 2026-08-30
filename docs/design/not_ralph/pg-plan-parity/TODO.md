@@ -829,12 +829,43 @@ section D. Recorded because the gate run is where they became visible.
       makes a chain of nested loops look free — and each of those rescans a
       hash join whose probe side is the 4.7M-row `inventory` seq scan.
 
-- [ ] **Next**: goopg needs the path PG uses — a parameterised probe on
-      `inventory_pkey (inv_date_sk, inv_item_sk)` bound from TWO different rels
-      (`d2` and `catalog_sales`). Section D's prefix arm is a prerequisite but
-      is NOT sufficient on its own (Q72 still times out with it). Check first
-      whether the DP ever *generates* that path — per
-      DESIGN §14.4, verify generation before theorising about cost.
+- [x] **CORRECTED — that next step was wrong, and §14.4's rule caught it.**
+      Instrumenting generation (rather than reasoning about cost, again) shows
+      the `inventory_pkey` path is not merely unbuilt, it is UNREACHABLE:
+
+          GEN inventory req=0x0001 bound=[inv_item_sk] -> idx=<none>
+
+      `inventory_pkey` is `(inv_date_sk, inv_item_sk, inv_warehouse_sk)`. goopg
+      binds only `inv_item_sk` — the SECOND column — so the leading column is
+      unbound and section D's rule correctly declines. `inv_date_sk` is never
+      bound because `d2` is not in `inventory`'s search problem at all.
+
+- [ ] **Root cause: the join-order search collapses to PAIRWISE on Q72.**
+      Printing each `searchOneProblem`'s composition:
+
+      | query | problems | shape |
+      |---|---|---|
+      | TPC-H Q8 | `nitems=8 rels=[region nation customer orders lineitem supplier nation part]` | one true 8-way search |
+      | TPC-DS Q72 | six problems, **every one `nitems=2`** | a chain of 2-way searches |
+
+      Q72's FROM is a 7-table comma list plus two `LEFT OUTER JOIN`s
+      (`promotion`, `catalog_returns`). PG's `deconstruct_jointree` flattens the
+      inner-join subtree so all of them are candidates at one level; goopg
+      recurses the joinlist pairwise, so the join ORDER is effectively fixed in
+      FROM order and only the access method is chosen. A rel can then only be
+      parameterised by its single problem-mate — `inventory` by `catalog_sales`,
+      giving `inv_item_sk` and nothing else.
+
+      So PG's Q72 plan is unreachable at ANY cost setting, and `ab8fbc334` only
+      changed which of the reachable-but-poor options won. This is PRE-EXISTING
+      and independent of both the bitmap cost fix and section D.
+
+- [ ] **Next**: find why the joinlist is not flattened when outer joins are
+      present. TPC-H proves the N-way path works (Q8 gets `nitems=8`), so this is
+      a flattening gap specific to a FROM that mixes comma-joins with
+      `LEFT OUTER JOIN`, not a missing capability. Fixing it is likely also
+      worth a large part of the standing Nested Loop 19-vs-25 gap, since every
+      TPC-DS query of this shape is planned with a fixed join order.
 - [ ] Do NOT fix this by reverting `ab8fbc334`: it would restore Q72 by
       reinstating a cost the oracle names as wrong, and the bitmap wins that
       followed it (Q11/Q20/Q21) depend on it.
