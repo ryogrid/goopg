@@ -195,8 +195,14 @@ parameterised path. A parameterised bitmap path would therefore have no
 consumer, and generating one would let the DP price a plan the builder must
 refuse — the exact failure that file warns about.
 
+- [x] Confirmed gap B does NOT inherit gap A's schema problem: a BitmapHeapScan
+      fetches whole heap rows, so it has the same schema as the IndexScan it
+      replaces and nothing above needs renumbering. B is the better-shaped gap
+- [x] Confirmed the executor blocker: `bitmapHeapScanOp` has NO `Rescan` and NO
+      `BindOuter` (cf. `indexScanOp` at operators_index.go:353/:362). A bitmap
+      inner must rebuild its TID bitmap per outer row; that path does not exist
+- [ ] Add bitmap rescan-per-outer-row to the executor
 - [ ] Generalise `NestedLoopIndexJoin.Inner` (or add a bitmap-inner join node)
-- [ ] Confirm the bitmap executor supports rescan-per-outer-row
 - [x] Item 0 (the 1-row estimate feeding bitmap comparisons) — done
 - [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`)
 - [ ] Let join clauses contribute index quals (`matchBitmapIndexQuals`)

@@ -323,7 +323,20 @@ So B is **not** a cost-calibration item. Comparing `costBitmapHeapScan` against
 Reason 3 is now fixed — see **item 0** below. Reasons 1 and 2 remain, and behind
 them sits a harder blocker:
 
-**Blocker (verified 2026-08-30).** A parameterised bitmap path would have **no
+**Blocker, both halves verified (2026-08-30).** Gap B does NOT inherit gap A's
+schema problem — a `BitmapHeapScan` fetches whole heap rows, so it produces the
+same schema as the `IndexScan` it would replace and nothing above it needs
+renumbering. That makes B the better-shaped of the two. But it has two blockers
+of its own, one planner-side and one executor-side.
+
+*Executor side:* `bitmapHeapScanOp` (operators_bitmap.go) has **no `Rescan` and
+no `BindOuter`** — compare `indexScanOp`, which has both
+(operators_index.go:353, :362). A nested-loop inner is re-probed once per outer
+row with a new bound key; a bitmap inner would have to rebuild its TID bitmap
+from the index each time. That path does not exist, so even a correctly costed
+parameterised bitmap path could not be executed.
+
+*Planner side:* a parameterised bitmap path would have **no
 consumer**. `NestedLoopIndexJoin.Inner` is typed `*IndexScan`
 (`plan.go:822`), and `pathparamindex.go` already documents the NLI constructor
 as the *only* consumer of a parameterised path. Emitting a parameterised bitmap
