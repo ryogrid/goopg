@@ -3958,6 +3958,13 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 				NDistinctFrac: distinctFrac,
 				NullFrac:      float64(sr.StaNullFrac),
 				AvgWidth:      float64(sr.StaWidth),
+				// Restored from stakind3/stanumbers3. Without it every index
+				// scan on a restarted server was priced at `max_IO_cost` —
+				// `cost_index` interpolates its two I/O bounds by correlation
+				// squared, so zero means "assume every heap page is a random
+				// seek". ANALYZE has always computed this; it simply had no
+				// persisted slot.
+				Correlation: float64(sr.Correlation),
 			}
 			// MCV
 			if len(sr.MCVFreqs) > 0 && len(sr.MCVValues) > 0 {

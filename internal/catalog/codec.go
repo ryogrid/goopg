@@ -1451,11 +1451,16 @@ type PGStatisticRow struct {
 	StaNullFrac float32   // stanullfrac
 	StaWidth    int32     // stawidth (avg column width in bytes)
 	StaDistinct float32   // stadistinct (<0 → fraction; >0 → count)
-	StaKind1    int16     // stakind1 (1=MCV, 2=histogram, 0=empty)
+	StaKind1    int16     // stakind1 (1=MCV, 2=histogram, 3=correlation, 0=empty)
 	StaKind2    int16     // stakind2
+	StaKind3    int16     // stakind3
 	MCVFreqs    []float32 // stanumbers1 when stakind1==STATISTIC_KIND_MCV
 	MCVValues   []string  // stavalues1 decoded as text
 	HistBounds  []string  // stavalues2 decoded as text when stakind2==STATISTIC_KIND_HISTOGRAM
+	// Correlation is stanumbers3's single element when
+	// stakind3==STATISTIC_KIND_CORRELATION. It carries no stavalues, which is
+	// why it rides a stanumbers slot alone.
+	Correlation float32
 }
 
 // pgStatisticPhysicalFixed is the byte length of the fixed-size prefix of a
@@ -1474,6 +1479,7 @@ const (
 	pgStatOffStaDistinct = 16
 	pgStatOffStaKind1    = 20
 	pgStatOffStaKind2    = 22
+	pgStatOffStaKind3    = 24
 )
 
 // DecodePGStatisticPhysicalRow decodes the PG18 physical on-disk format of a
@@ -1495,6 +1501,7 @@ func DecodePGStatisticPhysicalRow(data []byte, bitmap []byte) (PGStatisticRow, e
 	r.StaDistinct = math.Float32frombits(binary.LittleEndian.Uint32(data[pgStatOffStaDistinct : pgStatOffStaDistinct+4]))
 	r.StaKind1 = int16(binary.LittleEndian.Uint16(data[pgStatOffStaKind1 : pgStatOffStaKind1+2]))
 	r.StaKind2 = int16(binary.LittleEndian.Uint16(data[pgStatOffStaKind2 : pgStatOffStaKind2+2]))
+	r.StaKind3 = int16(binary.LittleEndian.Uint16(data[pgStatOffStaKind3 : pgStatOffStaKind3+2]))
 
 	// Varlena columns follow the fixed part. Columns 22-31 (stanumbers1-5,
 	// stavalues1-5) are nullable. Each may be NULL (bit clear in bitmap)
@@ -1538,8 +1545,18 @@ func DecodePGStatisticPhysicalRow(data []byte, bitmap []byte) (PGStatisticRow, e
 		if err != nil {
 			return r, err
 		}
-		if col == 22 && blob != nil {
+		if blob == nil {
+			continue
+		}
+		switch col {
+		case 22:
 			r.MCVFreqs = decodeFloat4Array(blob)
+		case 24: // stanumbers3
+			if r.StaKind3 == 3 { // STATISTIC_KIND_CORRELATION
+				if v := decodeFloat4Array(blob); len(v) > 0 {
+					r.Correlation = v[0]
+				}
+			}
 		}
 	}
 	// stavalues1-5 (cols 27-31)
