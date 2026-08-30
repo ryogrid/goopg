@@ -258,6 +258,24 @@ refuse — the exact failure that file warns about.
       isolation-risky, though the isolation suite still belongs in its gate
       because `indexOnlyScanOp` has one thing `indexScanOp` does not: it
       materialises `o.rows` in `Open`, so `Rescan` must re-materialise
+- [x] **PROVED the safety of the Q22 case**, which was the open question that
+      made gap A look risky everywhere. For a semi/anti NLI the join's schema is
+      the OUTER's alone — `nl_index_join.go:677-684`:
+
+      ```go
+      if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+              joinedSchema = append(Schema(nil), outerNode.Output()...)
+      } else { /* outer ++ inner */ }
+      ```
+
+      with the comment "the inner side is consumed only for matching, never
+      projected". So narrowing a semi/anti NLI's inner is INVISIBLE above it —
+      the positional-ColumnRef problem that blocks Q13 and Q16 provably does not
+      arise for Q22. No column-pruning pass is needed for this one query
+- [x] Confirmed goopg's Q22 plan is ALREADY structurally identical to PG's —
+      same `Nested Loop Anti Join`, same `Index Cond: (o_custkey = c_custkey)`.
+      The single difference is the node type: `Index Scan` vs PG's
+      `Index Only Scan`. Q22 is therefore the cheapest census win available
 - [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
       one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
       (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over

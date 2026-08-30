@@ -270,7 +270,15 @@ single representational difference is why `check_index_only` is a local
 predicate in PG and a cross-cutting refactor here.
 
 The honest scope for gap A is therefore: a column-pruning/remap pass, with the
-index-only path costed on top of it. Neither half alone is sufficient.
+index-only path costed on top of it. Neither half alone is sufficient —
+**except for Q22, which is provably exempt.** For a semi/anti
+`NestedLoopIndexJoin` the join's schema is the OUTER's alone
+(`nl_index_join.go:677-684`, "the inner side is consumed only for matching,
+never projected"), so narrowing its inner is invisible to everything above and
+the positional-`ColumnRef` problem does not arise. goopg's Q22 plan is already
+structurally identical to PG's — same `Nested Loop Anti Join`, same
+`Index Cond: (o_custkey = c_custkey)` — and differs only in `Index Scan` vs
+`Index Only Scan`. It is the cheapest census win in this document.
 Supporting evidence for how absent the path form is:
 
 ```
