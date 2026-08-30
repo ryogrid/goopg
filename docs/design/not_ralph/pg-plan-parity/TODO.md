@@ -100,18 +100,34 @@ undo it; nothing else depends on it.
       160,000-row join where PG evaluates it inside the Hash Cond over 670
       `part` rows
 - [x] Landed as `07f4f7814`, with the trade stated in the commit message
-- [x] DESIGN §9.3b **explained**: not the unnester. Both builds report ACCEPTED
-      with no bail; HEAD's plan has 0 SubPlan and the `loop_count` build's has
-      1. The DP join search re-plans from the clause list and does not carry
-      the unnesting rewrite, so when the search's plan wins the correlated
-      SubPlan returns with it
-- [ ] **The real prerequisite**: the DP search must either model the
-      decorrelated form as a relation, or decline when a rewrite it cannot
-      represent is in play. Today it silently discards the rewrite instead of
-      costing against it — two planners, no comparison
+- [x] DESIGN §9.3b's "the DP discards the unnester's rewrite" was WRONG — the
+      search runs FIRST (planner.go:1206) and the unnester decorates its output
+      (planner.go:1237). Caught by adversarial review
+- [x] Two more hypotheses tested and refuted: a missing `*NestedLoopIndexJoin`
+      walk arm (adding it leaves Q2 at 83.6 s), and the sublink sitting in
+      `Join.Predicate` (instrumenting both arms produced no hits)
+- [x] Established: Q2's post-search walk NEVER RUNS (`preDPUnnested=true`), and
+      that is IDENTICAL with and without the `loop_count` arm while the plan is
+      not (0 SubPlans vs 2). So the earlier "UNNEST ACCEPTED" instrumentation
+      was reporting the PRE-DP path, not the walk
+- [ ] **Locus, not yet mechanism**: inside `predp.go`, whose own `tryJoinSearch`
+      (predp.go:127) is the search the `loop_count` arm changes. Do not assert a
+      mechanism again until it is demonstrated
 - [ ] Then: charge a SubPlan's evaluation cost over the row count it will be
       evaluated over (PG `cost_qual_eval`), `subplan_cost.go`
 - [ ] Then re-run BOTH the byte gate and a timing pass and confirm Q2 is back
+
+### 4 — close the gate gap the review found
+
+- [ ] Items 1-3 were gated on 21 result sets; §7 declares the bar as all 22
+      queries, and item 0 compared 24 files (21 + Q15's three fragments). Re-run
+      Q15's `q15_create`/`q15_viewbody`/`q15_main` against the landed build so
+      every landed item meets the same bar
+- [ ] The `*NestedLoopIndexJoin` arm missing from `unnestSubqueriesInPlan`'s
+      walk (unnest.go:513-528) is a real traversal hole even though it does NOT
+      explain Q2 (tested: adding it leaves Q2 at 83.6 s). A sublink's `*Filter`
+      under an NLI is silently unreachable. Fix it on its own merits, with its
+      own gate
 
 ### A — Index Only Scan (Q13, Q16, Q22) — BLOCKED on attribute-usage analysis
 

@@ -146,9 +146,16 @@ document with confusingly similar counts, so, explicitly:
 | | queries | what it is |
 |---|---|---|
 | census (§3, above) | ~20-21 per side, and the two sides differ | the plan-shape comparison against PG, captured before this work |
-| **gate (§9 and every landed commit)** | **21: Q1-Q22 minus Q15** | the byte-for-byte result comparison every change had to pass |
+| **gate, items 1-3** | **21: Q1-Q22 minus Q15** | the byte-for-byte result comparison |
+| **gate, item 0** | **24** | 21 + Q15's three fragments, which item 0 DID compare |
 
-The gate excludes Q15 alone, and for a mechanical reason rather than a
+**Item 0's gate was therefore stricter than items 1-3's, and §7 declares "all 22
+queries" as the bar — so items 1, 2 and 3 were gated three files short of the
+document's own stated requirement.** That is stated rather than smoothed over;
+re-running those three fragments against the landed build is an open item in
+TODO.md.
+
+The 21-query gate excludes Q15 alone, and for a mechanical reason rather than a
 convenient one: Q15 is not a single runnable statement in this query set — it
 ships as `q15_create` / `q15_viewbody` / `q15_main` fragments that create and
 drop a view around the query, so a one-file-per-query sweep has nothing to run.
@@ -180,8 +187,11 @@ An earlier draft said goopg lacks `check_index_only` and that
 `groupagg_indexorder.go:269`, and the min/max sites — and §1 shows it firing.
 
 The real defect is **where** it runs: it is a **top-of-plan peephole** over
-`Project(Filter?(IndexScan))`, applied once to the finished plan
-(`planner.go:1691-1704`). It therefore cannot reach a scan buried inside a join
+`Project(Filter?(IndexScan))` at `planner.go:1691-1704` — once per SELECT LEVEL
+(every FROM-subquery and sublink inner gets its own call via
+`planSelectWithParent`), gated on `len(s.Locking) == 0`, and before several
+later rewrites. An earlier draft said "applied once to the finished plan", which
+is wrong on both counts. It therefore cannot reach a scan buried inside a join
 tree — and all three of PG's TPC-H index-only scans are exactly that (Q13 hash
 build side, Q16 parallel-hash-join input, Q22 nested-loop inner).
 
@@ -204,7 +214,11 @@ the tree is invisible to every ancestor. No renumbering, no `attr_needed`: the
 Project already *is* the statement of which columns the rest of the plan wants
 from below it.
 
-**(b) But inside a join tree there is no `*Project` above the scan at all.** A
+**(b) But in a flat FROM-list join tree there is no `*Project` above the scan.**
+(The unqualified form of this claim is false: a FROM-subquery is planned by
+`planSubqueryRangeVar` → `planSelectWithParent` and returns its own plan root —
+a `*Project` — into the join tree, `planner.go:3990`. TPC-H's queries are mostly
+flat FROM-lists, which is why the pass fired zero times.) A
 tree-wide pass that offers the promotion at every `Project` was written and
 run against all 22 queries. It is correct and it fires **zero times** — the
 census does not move by a single node. Reduced to the smallest case:
@@ -220,9 +234,17 @@ EXPLAIN SELECT o.o_orderkey FROM orders o
    ->  Index Scan using order_customer_fkidx on orders
 ```
 
-The scan is index-only-eligible on every count and the join reads it directly.
-There is no Project to consume, so the pass has no hook point. It was removed
-rather than left in as dead code.
+The join reads the scan directly, so the pass has no hook point, and it was
+removed rather than left in as dead code.
+
+**Caveat on this repro, and it is a real one:** `c_custkey < 100` is a STRICT
+bound, and `tryPromoteIndexOnlyScan` refuses promotion outright for one
+(`planner.go:14377`, `LowOp == OpGt || HighOp == OpLt` — the executor's IOS path
+has no exclusive-bound support, M0134-0001 S4 class 8). So this query would not
+promote even WITH a Project above it, and it cannot by itself distinguish "no
+Project" from "exclusive bound". Use `c_custkey <= 100` before drawing
+conclusions from it. The zero-fire result over all 22 TPC-H queries is the
+evidence that stands; this reduction is illustrative only.
 
 So gap A is not "port a predicate" (draft 1) and not "add `attr_needed`"
 (draft 2). It is: **give the promotion something to attach to inside a join
@@ -303,7 +325,7 @@ them sits a harder blocker:
 
 **Blocker (verified 2026-08-30).** A parameterised bitmap path would have **no
 consumer**. `NestedLoopIndexJoin.Inner` is typed `*IndexScan`
-(`plan.go:801`), and `pathparamindex.go` already documents the NLI constructor
+(`plan.go:822`), and `pathparamindex.go` already documents the NLI constructor
 as the *only* consumer of a parameterised path. Emitting a parameterised bitmap
 path before that type is generalised would let the DP price a plan the plan
 builder must refuse — the precise failure that file warns against. B therefore
@@ -314,8 +336,13 @@ outer row) *before* `RequiredOuter` and `matchBitmapIndexQuals` are touched.
 
 Parameterised inner index paths **are** generated —
 `addParameterizedIndexPaths` (`pathparamindex.go:220`), live since M0127-P5.9,
-reached from `pathindexordered.go:50`; goopg's Q22 emits one under a Nested Loop
-Anti Join. So existence is settled. The open question is why that arm loses to
+reached from `pathindexordered.go:50`. An earlier draft cited "goopg's Q22 emits
+one under a Nested Loop Anti Join" as the proof; **that citation is wrong**. The
+search's NLI arm hard-codes `Type: JoinTypeInner` (createplannl.go:274-276), so
+a Semi/Anti `NestedLoopIndexJoin` comes from the legacy rule-based rewrite
+`rewriteJoinsToNLI` (nl_index_join.go), which runs after the search and is not a
+costed path at all. Q22's artefact settles the existence of the legacy rewrite,
+not of the path. The open question is why that arm loses to
 hash 23 times out of 25, and §4-B's hardcoded 1-row estimate is a prime
 suspect: an inner priced at 1 row makes the *loop* look cheap but also makes the
 index scan's own cost degenerate, and the same constant feeds join costing.
@@ -356,14 +383,19 @@ be gated on a concrete piece of infrastructure that does not exist yet:
 
 - **Item 0** (the cardinality constant) — **DONE**, `9db8a0970`, fully gated.
   It was a prerequisite for B and C and a real defect in its own right.
-- **A** needs per-relation attribute-usage analysis (PG `attr_needed` /
-  `reltarget`) and an index-only *path* type. Neither exists; grep returns
-  nothing for either. Not a relocation.
+- **A** needs a column-pruning/remap pass AND an index-only *path* type (§4-A).
+  It also overlaps B: PG's Q22 index-only scan is a NESTED-LOOP INNER, and
+  `NestedLoopIndexJoin.Inner` is `*IndexScan` with `createNestLoopIndexJoinPlan`
+  panicking on anything else (createplannl.go:224-226) — so one of A's three
+  target queries needs B's blocker cleared as well. An earlier draft's clean
+  per-gap split understated A.
 - **B** needs `NestedLoopIndexJoin.Inner` generalised beyond `*IndexScan`, or a
   parameterised bitmap path has no consumer and the DP prices unbuildable plans.
-- **C** overlaps B rather than being independent: PG's six nested loops here are
-  largely the *same* plans as its six bitmap scans (bitmap-heap inners in Q2,
-  Q11, Q17, Q20, Q21), so C cannot be reproduced without B.
+- **C** overlaps B rather than being independent: **six of** PG's 25 nested
+  loops here are the *same* plans as its six bitmap scans (bitmap-heap inners in
+  Q2, Q11, Q17, Q20, Q21), so that part of C cannot be reproduced without B. An
+  earlier draft wrote "PG's six nested loops", which contradicts §3's census row
+  of 25 and made C look four times smaller than it is.
 
 Item 0 also settled an open question the other way: fixing the cardinality
 constant did **not** move IOS/bitmap/nested-loop counts, so the remaining gaps
@@ -453,7 +485,10 @@ Q11 got 4.5x faster (0.9 s -> 0.2 s) and picked up PG's exact inner probe,
 
 ### 9.3 Why it was rejected anyway
 
-**Q2 went 2.0 s -> 87.3 s.** Not a costing artefact — the plan it switched to is
+**Q2 went 2.0 s -> 87.3 s** in the first measurement and 1.6 s -> 84.4 s in the
+re-measurement below; the multiplier is ~43x and ~53x respectively. Both pairs
+are reported because they are separate A/B runs on separate builds, not two
+readings of one run. Not a costing artefact — the plan it switched to is
 close to PG's own. PG's Q2 is `Nested Loop -> Nested Loop -> Hash Join(nation,
 region)` with `Index Scan using partsupp_supplier_fkidx` on
 `ps_suppkey = supplier.s_suppkey`, and goopg now produces that shape. The
@@ -504,30 +539,43 @@ bug in its own right and it is NOT understood.
 S6/D6.2 policy that keeps a SubPlan when the inner is probe-shaped, and it names
 Q2 in its own comment. It is not: it returned false (accept) in this build.
 
-**Resolved — and it is not the unnester.** Instrumenting every `return nil, nil`
-in `unnestSubquery` and running BOTH builds against the same query settles it:
+**Draft 3 said "the DP search discards the unnester's rewrite". That is WRONG,
+and the call order alone disproves it:** `tryJoinSearch` runs at
+`planner.go:1206` and `unnestSubqueriesInPlan` at `planner.go:1237` — the search
+runs FIRST and the unnester decorates its output. `unnestSubquery` finishes with
+`filter.Child = join; return outer` (unnest.go:2208), mutating in place the
+`*Filter` the search left behind; it never builds a competing plan for anything
+to discard. (Found by adversarial review, 2026-08-30.)
 
-| build | unnest decision | bails | `SubPlan` in final plan |
-|---|---|---|---|
-| `80a5e334d` (no `loop_count`) | ACCEPTED | none | **0** |
-| + `loop_count` arm | ACCEPTED | none | **1** |
+Two further hypotheses were tested and are also wrong:
 
-The rewrite succeeds identically in both. What differs is downstream: the DP
-join search re-plans the relation set from the clause list, and the plan it
-produces does not carry the unnesting rewrite — the aggregate the unnester
-joined in is not a relation the search models, so when the search's plan wins,
-the correlated `SubPlan` comes back with it.
+- **A missing `*NestedLoopIndexJoin` arm in the walk.** The walk
+  (unnest.go:513-528) has arms for only `*Filter`, `*Join`, `*Project`,
+  `*Aggregate`, `*Sort`, `*Limit` — no NLI arm, and the `loop_count` arm's whole
+  effect is to make the search emit NLI nodes. Plausible, and false: adding the
+  arm leaves Q2 at 2 SubPlans and 83.6 s.
+- **The sublink sitting in `Join.Predicate`,** which the walk never inspects.
+  Also false — instrumenting both the `*Filter` and `*Join` arms produced NO
+  hits at all.
 
-So the defect is a **planner disagreement**, not a costing or unnesting bug:
-goopg has two planners for this query — the rewrite-based one that decorrelates
-and the PG-shaped DP — and the DP silently discards the other's rewrite rather
-than costing against it. The `loop_count` arm only changes which one wins.
+**What the evidence actually shows.** The post-search walk never runs for Q2:
 
-That is a third piece of architecture, distinct from the two in §4, and it is
-the real prerequisite for the arm: until the search either models the
-decorrelated form or declines when a rewrite it cannot represent is in play,
-making parameterised inners cheaper will keep flipping queries onto the
-correlated form that goopg then executes badly.
+```
+POSTDP: preDPUnnested=true (walk SKIPPED)     <- Q2's top level
+POSTDP: preDPUnnested=false (walk runs)       <- the subquery's own level
+```
+
+and — this is the decisive part — **that is identical with and without the
+`loop_count` arm**, while the plan is not: 0 SubPlans without it, 2 with it. So
+the earlier "UNNEST ACCEPTED / no bail" instrumentation was reporting the
+**pre-DP** unnest path (`predp.go`), not the post-search walk, which is why it
+looked like a successful rewrite being thrown away.
+
+The locus is therefore inside the pre-DP path, whose own `tryJoinSearch`
+(`predp.go:127`) is the search whose behaviour the `loop_count` arm changes.
+Beyond that the mechanism is **not established**, and this section should not
+claim one again until it is. The three refuted hypotheses are recorded so the
+next attempt does not re-run them.
 
 ### 9.4 Decision — LANDED (`07f4f7814`), regression and all
 
@@ -550,6 +598,6 @@ it is evaluated over (PG `cost_qual_eval`), `subplan_cost.go`; (3) re-run the
 21-query byte gate AND a timing pass.
 
 **That last point is the transferable lesson.** All 21 result sets were
-byte-identical and every unit test passed. A row-count gate cannot see a 43x
+byte-identical and every unit test passed. A row-count gate cannot see a 43-53x
 regression; only timing the changed queries caught it. Any future plan-shape
 change needs both.
