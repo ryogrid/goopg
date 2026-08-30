@@ -242,6 +242,65 @@ func (s Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
 	return true
 }
 
+// SeesCommittedXIDHinted is SeesCommittedXID for a tuple whose
+// HEAP_XMIN_COMMITTED hint bit is already set. It is identical except that it
+// does NOT consult the CLOG.
+//
+// Why that is safe, and why it is not just an optimisation of convenience:
+//
+// The hint bit is written at exactly one place (seqScanOp.Next, M0115-0004),
+// and only AFTER the tuple was confirmed visible through SeesCommittedXID —
+// which means clogSaysNotAborted(xmin) already returned true — and only when
+// xmin is not the current transaction or one of its ancestors (a self-visible
+// tuple can still be rolled back to a savepoint, so it is deliberately not
+// hinted). Commit is terminal: an XID the CLOG did not report as aborted then
+// cannot report as aborted later. So for a hinted tuple the CLOG consult is
+// guaranteed to return true, and skipping it cannot change an answer.
+//
+// What still MUST be checked is the snapshot window. The hint bit records
+// "xmin committed", not "xmin committed before MY snapshot" — a snapshot taken
+// while xmin was still in progress must not see it. That is precisely PG's
+// HEAP_XMIN_COMMITTED branch, which does only the snapshot test:
+//
+//	else {	/* xmin is committed, but maybe not according to our snapshot */
+//	    if (!HeapTupleHeaderXminFrozen(tuple) &&
+//	        XidInMVCCSnapshot(HeapTupleHeaderGetRawXmin(tuple), snapshot))
+//	        return false;
+//	}
+//	                    -- postgres/src/backend/access/heap/heapam_visibility.c
+//
+// This closes a gap the comment on SeesCommittedXID already described as the
+// intended design ("the hint bits ... are what keep this off the repeat-scan
+// hot path, exactly as upstream") but which no caller realised: both
+// TupleVisible and TupleVisibleSubxact called plain SeesCommittedXID in the
+// hint-bit-SET branch, so the hint bit saved nothing and every tuple of every
+// scan paid OldestClogXid() + GetStatus(). Measured at 7.97 % of TPC-H Q14's
+// CPU (docs/design/not_ralph/perf-optimize-take6/).
+//
+// The HasAborted check is retained even though PG's branch has no equivalent:
+// it is an in-memory lookup, and it is a cheap backstop for the crash-recovery
+// case SeesCommittedXID's comment describes.
+func (s Snapshot) SeesCommittedXIDHinted(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	if s.HasAborted(xid) {
+		return false
+	}
+	// NO clogSaysNotAborted here — see above. Everything below is the snapshot
+	// window test, byte-identical to SeesCommittedXID's tail.
+	if xid < s.Xmin {
+		return true
+	}
+	if xid >= s.Xmax {
+		return false
+	}
+	if s.HasInProgress(xid) {
+		return false
+	}
+	return true
+}
+
 // clogSaysNotAborted reports whether the durable commit log permits treating
 // xid as committed: true unless the CLOG positively says TxnStatusAborted.
 //
