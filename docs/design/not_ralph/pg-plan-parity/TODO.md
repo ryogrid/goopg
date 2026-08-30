@@ -228,6 +228,16 @@ refuse — the exact failure that file warns about.
 - [x] Confirmed the executor blocker: `bitmapHeapScanOp` has NO `Rescan` and NO
       `BindOuter` (cf. `indexScanOp` at operators_index.go:353/:362). A bitmap
       inner must rebuild its TID bitmap per outer row; that path does not exist
+- [x] Scoped the executor side: the join driver is ALREADY generic — it builds
+      the inner through the `nliInner` interface (operators_nljoin.go:101),
+      satisfied today by `indexScanOp` and `memoizeOp`. The typing blocker is
+      the PLAN node's `Inner *IndexScan` field alone
+- [x] What is missing is the interface's rescan half on the candidate operators:
+      `indexOnlyScanOp` and `bitmapHeapScanOp` implement neither `BindOuter` nor
+      `Rescan`. ONE shape of work serves BOTH gaps — gap A's Q22 index-only scan
+      is a nested-loop ANTI-join inner (its columns are never read, so narrowing
+      is invisible there) and all six of gap B's bitmap scans are NL inners.
+      **This is the highest-leverage next step in the whole document**
 - [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
       one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
       (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over

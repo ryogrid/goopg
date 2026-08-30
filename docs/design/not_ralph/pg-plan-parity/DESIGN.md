@@ -335,6 +335,20 @@ row with a new bound key; a bitmap inner would have to rebuild its TID bitmap
 from the index each time. That path does not exist, so even a correctly costed
 parameterised bitmap path could not be executed.
 
+*Executor interface, the good news:* the executor is ALREADY generic here. It
+builds the inner through an `nliInner` interface (operators_nljoin.go:101 —
+`Schema/openPrep/Next/BindOuter/Rescan/Close`) which both `indexScanOp` and
+`memoizeOp` satisfy. So nothing in the executor's join driver hard-codes an
+index scan; the typing blocker is the PLAN node's field alone.
+
+What each candidate inner still lacks is the interface's rescan half:
+`indexOnlyScanOp` and `bitmapHeapScanOp` implement neither `BindOuter` nor
+`Rescan`. That is the same missing piece for gap A's Q22 (PG's index-only scan
+there is a nested-loop ANTI-join inner, where the inner's columns are never
+read at all, so narrowing it would be invisible) and for all six of gap B's
+bitmap scans. It is one shape of work serving both gaps, which makes it the
+highest-leverage next step in this document.
+
 *Planner side:* a parameterised bitmap path would have **no
 consumer**. `NestedLoopIndexJoin.Inner` is typed `*IndexScan`
 (`plan.go:822`), and `pathparamindex.go` already documents the NLI constructor
