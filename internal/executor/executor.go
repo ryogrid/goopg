@@ -191,6 +191,8 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 			innerScan = newIndexScanOp(in)
 		case *optimizer.IndexOnlyScan:
 			innerScan = newIndexOnlyScanOp(in)
+		case *optimizer.BitmapHeapScan:
+			innerScan = newBitmapHeapScanOp(in)
 		default:
 			return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
 				Message: fmt.Sprintf("NestedLoopIndexJoin inner is a %T, which is not a re-probeable scan", p.Inner)}

@@ -421,3 +421,108 @@ func (s *searchCtx) chooseBitmapAnd(
 		Children: []*Path{bitmapAndPath},
 	}
 }
+
+func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
+	if s == nil || cat == nil || s.clauses == nil || len(s.clauses.all) == 0 {
+		return
+	}
+	totalPages := s.totalTablePages()
+	for i, rel := range s.levelRels(1) {
+		if i >= len(s.relInfos) {
+			break
+		}
+		tbl := s.relInfos[i].table
+		if tbl == nil {
+			continue
+		}
+		if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
+			continue
+		}
+		if !scanLeafIsBare(rel.baseLeaf) {
+			continue
+		}
+		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)
+		if len(cands) == 0 {
+			continue
+		}
+		relTuples := float64(s.relInfos[i].baseRows)
+		if relTuples < 1 {
+			relTuples = rel.Rows
+		}
+		if relTuples < 1 {
+			relTuples = 1
+		}
+		relPages := baseRelPages(tbl, relTuples)
+		T := float64(relPages)
+		if T < 1 {
+			T = 1
+		}
+		maxEntries := bitmapMaxEntries(s.cp.workMem)
+		added := false
+		for _, req := range consideredParameterizations(cands) {
+			for _, idx := range cat.IndexesOnTable(tbl) {
+				if p := s.buildOneParameterizedBitmapPath(rel, tbl, idx, cands, req,
+					relPages, relTuples, T, totalPages, maxEntries); p != nil {
+					addPath(rel, p)
+					added = true
+				}
+			}
+		}
+		if added {
+			setCheapest(rel)
+		}
+	}
+}
+
+func (s *searchCtx) buildOneParameterizedBitmapPath(
+	rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
+	cands []paramIndexClause, req RelSet,
+	relPages int64, relTuples, T, totalPages float64, maxEntries int,
+) *Path {
+	if idx == nil || idx.HasPredicate {
+		return nil
+	}
+	bound := make(map[string]paramIndexClause, len(cands))
+	for _, c := range cands {
+		if !relsSubset(c.outerRels, req) {
+			continue
+		}
+		if _, dup := bound[c.innerCol]; dup {
+			continue
+		}
+		bound[c.innerCol] = c
+	}
+	var clauses []indexPathClause
+	sel := 1.0
+	for pos, colName := range idx.Columns {
+		c, ok := bound[colName]
+		if !ok {
+			break
+		}
+		clauses = append(clauses, indexPathClause{indexCol: pos, key: c.outerKey})
+		sel *= varEqNonConstSelectivity(columnStatsByName(tbl, colName), relTuples)
+	}
+	if len(clauses) == 0 {
+		return nil
+	}
+	sel = clampSelectivity(sel)
+	tuplesFetched := clampRowEst(sel * relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	idxCost := costBitmapIndexScan(s.cp, indexScanInputs{
+		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
+		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
+		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)), totalTablePages: totalPages,
+	})
+	pagesFetched := computeBitmapPages(tuplesFetched, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
+	return &Path{
+		Kind: PathBitmapHeapScan, Rel: rel,
+		Rows:          parameterizedBaserelRows(rel, nil, sel),
+		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T),
+		RequiredOuter: req,
+		Children: []*Path{{
+			Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
+			BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
+			IndexClauses: clauses, RequiredOuter: req,
+		}},
+	}
+}

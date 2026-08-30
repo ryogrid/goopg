@@ -451,8 +451,18 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 		block, offset, lossy, recheck, ok := o.iter.next()
 		if !ok {
 			// Exhausted.
+			//
+			// EOF, not (nil, nil). Every operator in this package signals
+			// exhaustion with EOF, and every consumer tests `err == EOF`; a nil
+			// slot with a nil error passes that test and reaches the caller as a
+			// REAL row that happens to be nil. A top-level pull tolerated it
+			// because it stops on a nil slot anyway, which is why this survived
+			// — but a `NestedLoopIndexJoin` inner following the contract does
+			// `slotRow(nil)` -> a zero-length row -> "index out of range with
+			// length 0" from inside the join's predicate evaluation, on a stack
+			// that names neither this line nor the bitmap scan.
 			o.releasePinned()
-			return nil, nil
+			return nil, EOF
 		}
 
 		// If the page changed or we haven't pinned one yet, pin the new page.
@@ -509,8 +519,18 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 		block, entry, ok := o.pbm.nextPage()
 		if !ok {
 			// Exhausted.
+			//
+			// EOF, not (nil, nil). Every operator in this package signals
+			// exhaustion with EOF, and every consumer tests `err == EOF`; a nil
+			// slot with a nil error passes that test and reaches the caller as a
+			// REAL row that happens to be nil. A top-level pull tolerated it
+			// because it stops on a nil slot anyway, which is why this survived
+			// — but a `NestedLoopIndexJoin` inner following the contract does
+			// `slotRow(nil)` -> a zero-length row -> "index out of range with
+			// length 0" from inside the join's predicate evaluation, on a stack
+			// that names neither this line nor the bitmap scan.
 			o.releasePinned()
-			return nil, nil
+			return nil, EOF
 		}
 
 		// Pin the page.

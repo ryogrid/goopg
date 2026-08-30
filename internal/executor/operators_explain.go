@@ -2054,6 +2054,29 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 		// ordinal (preserving duplicate-row multiplicity through
 		// the aggregate-above-join shape).
 		return "Ordinality"
+	case *optimizer.BitmapHeapScan:
+		// PG's "Bitmap Heap Scan on <table>" (explain.c). goopg had NO arm for
+		// this node at all, so a bitmap scan printed its Go type
+		// (`*optimizer.BitmapHeapScan`) — which is also why a plan census
+		// grepping for the PG label read zero even once bitmap scans were being
+		// chosen.
+		if p.Table == nil {
+			return fmt.Sprintf("%T", n)
+		}
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return "Bitmap Heap Scan on " + dname
+		}
+		return "Bitmap Heap Scan on " + schemaQualify(p.Table.QualifiedName())
+	case *optimizer.BitmapIndexScan:
+		// PG names the INDEX here, not the table.
+		if p.Index == nil {
+			return fmt.Sprintf("%T", n)
+		}
+		return "Bitmap Index Scan on " + p.Index.QualifiedName()
+	case *optimizer.BitmapAnd:
+		return "BitmapAnd"
+	case *optimizer.BitmapOr:
+		return "BitmapOr"
 	case *optimizer.NestedLoopIndexJoin:
 		// M0054-0006: this node is always a nested loop; S3
 		// (0134-0001 P2) applies the same PG label rule as the
@@ -2268,6 +2291,16 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 			return []optimizer.Node{p.Outer, p.InnerMemo}
 		}
 		return []optimizer.Node{p.Outer, p.Inner}
+	case *optimizer.BitmapHeapScan:
+		// The bitmap qual tree renders BENEATH the heap scan, as in PG.
+		if p.Outer == nil {
+			return nil
+		}
+		return []optimizer.Node{p.Outer}
+	case *optimizer.BitmapAnd:
+		return p.Inputs
+	case *optimizer.BitmapOr:
+		return p.Inputs
 	case *optimizer.Memoize:
 		return []optimizer.Node{p.Child}
 	case *optimizer.Merge:

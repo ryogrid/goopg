@@ -177,6 +177,9 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		}
 		memoPath, innerPath = innerPath, innerPath.Children[0]
 	}
+	if innerPath.Kind == PathBitmapHeapScan {
+		return createNestLoopBitmapJoinPlan(p, innerPath)
+	}
 	if innerPath.Kind != PathIndexScan {
 		// The only parameterised path kind goopg builds is the base index scan
 		// (`addParameterizedIndexPaths`). Any other kind reaching here is a
@@ -333,4 +336,29 @@ func relsOf(p *Path) RelSet {
 		return 0
 	}
 	return p.Rel.Relids
+}
+
+func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) {
+	idxPath := innerPath.Children[0]
+	outerPath := p.Children[0]
+	in := joinInputsFor(p, "PathNestLoop(NLI-bitmap)", outerPath, innerPath)
+	bhs := in.inner.(*BitmapHeapScan)
+	bis := bhs.Outer.(*BitmapIndexScan)
+	outerLay := in.lay[:len(in.outer.Output())]
+	outerIndex := outerLay.bindingIndex()
+	keys := make([]Expr, 0, len(idxPath.IndexClauses))
+	for _, c := range idxPath.IndexClauses {
+		keys = append(keys, translateToLayout("bitmap probe key", c.key, outerLay, outerIndex))
+	}
+	if len(keys) == 1 {
+		bis.Key, bis.Keys = keys[0], nil
+	} else {
+		bis.Key, bis.Keys = nil, keys
+	}
+	bhs.BitmapQual = nil
+	return &NestedLoopIndexJoin{
+		pos: in.outer.Pos(), Type: JoinTypeInner, Outer: in.outer, Inner: bhs,
+		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)", nil, p.Residual),
+		schema:    in.merged,
+	}, in.lay
 }
