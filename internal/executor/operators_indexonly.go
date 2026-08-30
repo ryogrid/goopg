@@ -41,6 +41,19 @@ type indexOnlyScanOp struct {
 	// after the scan so a subsequent index-only scan reflects PG's prune-on-read
 	// (horizons.spec, M0118-0009). nil keys are never inserted.
 	touchedBlocks map[storage.BlockNumber]struct{}
+	// State captured by openPrep and reused across every Rescan: the locks it
+	// took are held for the operator's lifetime and the btree handle stays
+	// valid, so an NLI parent probing once per outer row re-enters only Rescan.
+	// `tree != nil` is also what Open reads to detect a re-Open.
+	heapRel   storage.RelFileNode
+	tree      *nbtree.BTree
+	isHashIdx bool
+	// outerSlot / outerWidth are bound by a NestedLoopIndexJoin parent before
+	// each Rescan (BindOuter); the probe helpers resolve Key/Keys/LowKey/HighKey
+	// against the slot. nil on the single-table path, where those expressions
+	// must reduce to constants.
+	outerSlot  SlotView
+	outerWidth int
 	// hashProbeFingerprint is the blob-format encoding of this scan's probe key
 	// (ssiHashProbeFingerprint) — the bytes the hash-bucket SIREAD tag must be
 	// derived from, as opposed to the tuple-image search key the same probe
@@ -58,7 +71,34 @@ func newIndexOnlyScanOp(p *optimizer.IndexOnlyScan) *indexOnlyScanOp {
 
 func (o *indexOnlyScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
+// Open is the single-table entry point: one-time setup, then one scan.
+//
+// The split into `openPrep` + `Rescan` mirrors `indexScanOp`
+// (operators_index.go:274/292/353/362) exactly, and for the same reason: a
+// `NestedLoopIndexJoin` parent calls `openPrep` ONCE and then `Rescan` per outer
+// row, so the relation locks, the relation-grain SIREAD and `btree.Open` must
+// not be repeated per probe — while the probe key, the bitmap of matched rows
+// and the temp-page prune must be redone on every one.
+//
+// Which half each piece belongs to is mirrored from that sibling rather than
+// re-derived, because the SSI allocation is the part that would be a
+// correctness bug rather than a slow query if it were guessed wrong.
 func (o *indexOnlyScanOp) Open(ctx *Context) error {
+	if o.tree != nil {
+		// Reopen (e.g. a re-executed subplan): locks are still held and the
+		// btree handle is still valid, so only the scan is redone.
+		o.ctx = ctx
+		return o.Rescan(nil, 0)
+	}
+	if err := o.openPrep(ctx); err != nil {
+		return err
+	}
+	return o.Rescan(nil, 0)
+}
+
+// openPrep is the one-time half: everything independent of any outer-row
+// binding. See Open for why the boundary sits where it does.
+func (o *indexOnlyScanOp) openPrep(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: "IndexOnlyScan requires storage handles"}
@@ -67,8 +107,6 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
 	}
 	o.ctx = ctx
-	o.rows = nil
-	o.idx = 0
 	// The array element output style, resolved once per scan (M0119-0006). An
 	// index-only scan renders array elements from the KEY rather than the heap;
 	// it is the seq/bitmap scans' sibling and must agree with them, so it reads
@@ -76,6 +114,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	o.arrayStyle = arrayOutputStyle(ctx)
 
 	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
+	o.heapRel = heapRel
 	if err := ctx.acquireRelLock(heapRel, lmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
@@ -109,6 +148,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	// positive. DeclaredHash marks an index created `USING hash` (Method stays
 	// "btree" since goopg builds it on the B-tree substrate).
 	isHashIdx := o.plan.Index != nil && o.plan.Index.DeclaredHash
+	o.isHashIdx = isHashIdx
 	// M0118-0001: a SERIALIZABLE index-only scan takes a relation-level SIREAD
 	// predicate lock on the heap relation, exactly like the seq-scan and
 	// (heap-fetching) index-scan paths. Acquired BEFORE the probe-bound lookups
@@ -126,7 +166,36 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	o.tree = tree
+	return nil
 
+}
+
+// BindOuter records the slot a NestedLoopIndexJoin parent binds before each
+// Rescan; the probe helpers resolve Key/Keys/LowKey/HighKey against it. Mirrors
+// indexScanOp.BindOuter.
+func (o *indexOnlyScanOp) BindOuter(slot SlotView, outerWidth int) {
+	o.outerSlot = slot
+	o.outerWidth = outerWidth
+}
+
+// Rescan re-drains the index after binding an outer slot. The single-table path
+// reaches it through Open with a nil slot; an NLI parent calls it once per outer
+// row.
+func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
+	if o.tree == nil {
+		// Defensive: openPrep must have run.
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "indexOnlyScanOp.Rescan called before Open"}
+	}
+	o.rows = o.rows[:0]
+	o.idx = 0
+	o.touchedBlocks = nil
+	o.outerSlot = outerSlot
+	o.outerWidth = outerWidth
+	ctx := o.ctx
+	heapRel := o.heapRel
+	tree := o.tree
+	isHashIdx := o.isHashIdx
 	o.hashProbeFingerprint = nil
 	var loBytes, hiBytes []byte
 	switch {
@@ -772,6 +841,13 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st array.Output
 // the M0054-0006 composite probe through IOS promotion (M0116-0003).
 // Any NULL component short-circuits to ok=false — equality on NULL is
 // unknown, so the probe correctly produces zero rows.
+// The three probe helpers resolve their expressions against `o.outerSlot`, not
+// against a nil row. They took `nil` before this operator could be an NLI inner,
+// which was correct then and would be a SILENT wrong answer now: an inner's
+// probe key references OUTER columns, and evaluating it against no row yields
+// whatever the nil path produces rather than an error. Mirrors indexScanOp's
+// helpers, which have always been slot-aware. A nil slot is the single-table
+// case, where the planner guarantees these reduce to constants.
 func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 	if len(o.plan.Keys) != len(o.plan.Index.Columns) {
 		return nil, false, &ExecError{
@@ -782,7 +858,7 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 	}
 	parts := make([]indexProbeKeyPart, 0, len(o.plan.Keys))
 	for i, ke := range o.plan.Keys {
-		v, err := evalExpr(ke, nil, o.ctx)
+		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
 		if err != nil {
 			return nil, false, err
 		}
@@ -811,7 +887,7 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 // Note: encodeBTreeKeyForColumn returns *ExecError (not error), so we
 // must guard against the nil-pointer-in-interface issue explicitly.
 func (o *indexOnlyScanOp) lookupKey() ([]byte, bool, error) {
-	v, err := evalExpr(o.plan.Key, nil, o.ctx)
+	v, err := evalExprSlot(o.plan.Key, o.outerSlot, o.ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -841,7 +917,7 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 			Message: fmt.Sprintf("indexed column %q not found", o.plan.Index.Columns[0])}
 	}
 	if o.plan.LowKey != nil {
-		v, evalE := evalExpr(o.plan.LowKey, nil, o.ctx)
+		v, evalE := evalExprSlot(o.plan.LowKey, o.outerSlot, o.ctx)
 		if evalE != nil {
 			return nil, nil, false, evalE
 		}
@@ -855,7 +931,7 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 		lo = k
 	}
 	if o.plan.HighKey != nil {
-		v, evalE := evalExpr(o.plan.HighKey, nil, o.ctx)
+		v, evalE := evalExprSlot(o.plan.HighKey, o.outerSlot, o.ctx)
 		if evalE != nil {
 			return nil, nil, false, evalE
 		}
