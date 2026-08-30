@@ -127,14 +127,19 @@ undo it; nothing else depends on it.
       `case *Filter:` sites in unnest.go, and the original probe's count=1
       replacement hit line 270 instead of the walk's line 432). Refuted: the
       walk DOES see a `*Filter` whose predicate contains the sublink
-- [ ] **Question is now minimal**: `unnestSubquery` is called on the right
-      Filter, reports success (ACCEPTED, params=1 residuals=0, none of its four
-      bails), and the sublink is STILL a SubPlan in the finished plan. Test in
-      this order: (1) the caller loop at unnest.go:~448 discarding `newOuter`;
-      (2) a duplicated conjunct — `Filter.PushedBelow` exists because pushdown
-      passes COPY a restriction down and leave the original (plan.go:1280-1300),
-      so one copy could be rewritten and another survive; (3) a later pass
-      rebuilding from a stale node
+- [x] Measured `UNNESTWALK sublinks 1 -> 1` across `unnestSubqueriesInPlan` at
+      Q2's outer level — the walk does NOT remove it, so no later pass
+      re-introduces it. Candidate (3) eliminated
+- [ ] **Leading hypothesis (#5 — test before acting; the first four were
+      wrong)**: `unnestSubquery`'s substitution is by POINTER IDENTITY —
+      `if c == conjunct` over `splitAnd(filter.Predicate)` — and if
+      `findFilterContainingSubquery` returns a conjunct that is not one of
+      `splitAnd`'s top-level elements (nested conjunct, under an OR, or the two
+      functions flattening differently), every conjunct is copied UNCHANGED
+      while `filter.Child = join` still installs the join. No bail, returns
+      success, sublink survives. Reproduces all five observations
+- [ ] Test: one print comparing `conjunct` against the elements of
+      `splitAnd(filter.Predicate)` by pointer, at that line
 - [ ] Then: charge a SubPlan's evaluation cost over the row count it will be
       evaluated over (PG `cost_qual_eval`), `subplan_cost.go`
 - [ ] Then re-run BOTH the byte gate and a timing pass and confirm Q2 is back

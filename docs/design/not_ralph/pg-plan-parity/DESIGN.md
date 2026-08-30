@@ -623,14 +623,46 @@ question is now as narrow as it can get without a fix:
 > **`unnestSubquery` is called on the right `*Filter`, reports success, and the
 > sublink is still a `SubPlan` in the finished plan.**
 
-Every intermediate step has been measured; the remaining gap is between
-"`unnestSubquery` returned a rewritten tree" and "that tree is what `EXPLAIN`
-prints". The candidates, in order of cheapness to test: the caller loop in
-`unnestSubqueriesInPlan` (unnest.go:~448) discarding `newOuter`; a duplicated
-conjunct (`Filter.PushedBelow` exists precisely because qual-pushdown passes
-COPY a restriction down and leave the original in place, plan.go:1280-1300) so
-that one copy is rewritten and another survives; or a later pass rebuilding from
-a stale node.
+Two more measurements close it further.
+
+**The walk does not remove the sublink**, so no later pass re-introduces it:
+
+```
+UNNESTWALK sublinks 1 -> 1
+```
+
+counted over the whole plan tree immediately before and after
+`unnestSubqueriesInPlan` at Q2's outer level. That eliminates "a later pass
+rebuilds from a stale node".
+
+**And the rewrite's substitution is by POINTER IDENTITY.** `unnestSubquery`
+ends:
+
+```go
+newConjunct := replaceExprInConjunct(conjunct, sub, replacement)
+conjuncts := splitAnd(filter.Predicate)
+for _, c := range conjuncts {
+        if c == conjunct { … newConjunct … } else { … c … }   // pointer compare
+}
+filter.Predicate = combineAnd(newConjuncts)
+…
+filter.Child = join
+return outer, nil
+```
+
+If `findFilterContainingSubquery` hands back a `conjunct` pointer that is not
+one of `splitAnd(filter.Predicate)`'s top-level elements — because the sublink
+sits inside a nested conjunct, or under an `OR`, or because the two functions
+flatten the predicate differently — then **every conjunct is copied unchanged**,
+`filter.Predicate` keeps the sublink, and `filter.Child = join` installs the
+join anyway. No bail is taken and the function returns success.
+
+That reproduces every observation exactly: accepted, `params=1 residuals=0`, no
+bail, sublink survives, count 1 -> 1. It is a HYPOTHESIS, not a demonstrated
+mechanism — the fifth on this list, and the first four were wrong — so the next
+session should test it before acting on it. The test is one print:
+`conjunct` versus the elements of `splitAnd(filter.Predicate)` at that line,
+compared by pointer.
 
 ### 9.4 Decision — LANDED (`07f4f7814`), regression and all
 
