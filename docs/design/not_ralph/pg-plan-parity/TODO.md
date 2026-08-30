@@ -742,6 +742,78 @@ refuse — the exact failure that file warns about.
 - [ ] Largest blast radius — can move every join plan. Last.
 - [ ] Full row-count gate + `scripts/tpch-spotcheck.sh` + TPC-DS SF0.5
 
+## D — Prefix probes (PG `amoptionalkey`) — LANDED
+
+- [x] Root-cause Q8's bitmap: the index producer required TOTAL index coverage
+      while the bitmap producer accepted a prefix, so at `req={part}` the bitmap
+      was the ONLY candidate. Never a cost difference — see DESIGN §14
+- [x] Executor: `lookupKeys` accepts a short key list; pad `hiBytes` via
+      `compositeUpperBound` (the single-`Key` branch has done this since
+      M0053-0001, so the "executor cannot express it" comment was false)
+- [x] `indexPathClauses` truncates at the first unbound column; still declines
+      when the LEADING column is unbound
+- [x] Rename `pickIndexCoveringAllLeadingColumns` → `...LeadingPrefix`; rank on
+      bound-column count, not index width
+- [x] Split probe selectivity (prefix) from `ppi_rows` (all movable clauses);
+      gate the `idx.Unique` one-row short-circuit on FULL binding
+- [x] Gates: 21/21 byte-identical, units PASS, `tpch-spotcheck` PASS, Q8/Q17
+      timings unchanged, exactly 2 of 21 plans changed
+
+### D-followup — Q17's SubPlan scan (NOT the node this change touched)
+
+- [x] Established by node-by-node comparison (DESIGN §14.3): the bitmap this
+      change removed sat at Q17's JOIN INPUT, where PG has no bitmap — PG
+      hash-joins there. The census drop 6 → 4 is therefore not a parity loss;
+      the old count matched PG's 6 by coincidence, not by position.
+- [x] Two strict improvements at that node: `p_partkey = l_partkey` moved from a
+      post-join `Filter:` to an `Index Cond:`, and the estimate moved from
+      rows=1 to rows=30 (PG independently says 31).
+- [ ] The REAL Q17 mismatch is `SubPlan 1`: PG uses a Bitmap Heap Scan
+      (`Recheck Cond: (l_partkey = part.p_partkey)`), goopg an Index Scan. This
+      predates the prefix arm and is unchanged by it.
+- [ ] PG separates the two by **1.0%** there (bitmap 4.67..127.62, index
+      0.43..128.97 with `enable_bitmapscan=off`). goopg's costs for that node
+      have NOT been measured.
+- [ ] **Next**: instrument the SubPlan node specifically. Do NOT reuse §14's
+      `PAIR` numbers — those are the DP's parameterised candidates at the join
+      input, and a correlated SubPlan's scan is parameterised from an outer
+      query level, a different seam. Confirm which seam costs it before
+      comparing anything.
+- [ ] This supersedes DESIGN §13.4's open question. Do NOT resume hunting "a
+      term of the same order as `indexTotalCost`": that framing came from
+      assuming both candidates existed when one did not.
+
+### D-followup-2 — stop reporting parity as a node-type census
+
+- [ ] The census (Bitmap 6 vs 6, Index Scan 32 vs 24, …) cannot distinguish
+      "same node type, same position" from "same node type, wrong position".
+      Q17 had both engines at 1 bitmap while the bitmaps were on DIFFERENT
+      scans. Replace the count with a per-query, per-position diff before
+      quoting parity numbers again.
+
+## E — pre-existing TPC-DS findings surfaced by this gate run (NOT caused by D)
+
+Each was A/B'd against this branch's HEAD before the prefix arm
+(`1c4b7a5e0`) and reproduces identically there, so none is attributable to
+section D. Recorded because the gate run is where they became visible.
+
+- [ ] **Q72 regressed since 2026-08-24.** `sweep-20260824-003146` has
+      `Q72 PASS 73s`; today it TIMEOUTs at >400s on BOTH `1c4b7a5e0` and the
+      prefix arm. The cause is therefore somewhere in this session's earlier
+      commits (the cost-model / bitmap / correlation work), not in D. Bisect
+      across those commits — the row-count gate cannot have caught it, since a
+      timeout produces no rows to compare.
+- [ ] **Q47 and Q69 time out** (>400s) on both binaries.
+- [ ] **Q31, Q64, Q71 report ERROR inside a full sweep but PASS standalone**
+      (19 / 2 / 580 rows). Same shape as the known "isolation wedges in FULL
+      testport but passes standalone" trap: judge these by a standalone re-run
+      before treating them as engine bugs.
+- [ ] The 2026-08-31 05:19 sweep aborted at Q71 with
+      `goopg (sf05) did not become ready in 180s` after a clean stop, with no
+      leaked scopes and no orphan processes afterwards — a transient restart
+      failure under load, not a wedge. `Q72..Q99` was then run as a subset
+      probe: PASS=26 MISMATCH=0 ERROR=0, `verdict-changes=none`.
+
 ## Cross-cutting
 
 - [ ] No change may test a relation name, query shape, or benchmark identity

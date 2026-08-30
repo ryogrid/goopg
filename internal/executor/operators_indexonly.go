@@ -200,11 +200,17 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	var loBytes, hiBytes []byte
 	switch {
 	case len(o.plan.Keys) > 0:
-		// Full multi-column equality probe (M0054-0006 composite),
-		// preserved through IOS promotion by M0116-0003. The planner
-		// guarantees len(Keys) == len(Index.Columns), so the encoded
-		// probe addresses one B-tree leaf entry exactly — no suffix
-		// padding required.
+		// Multi-column equality probe (M0054-0006 composite), preserved
+		// through IOS promotion by M0116-0003.
+		//
+		// `Keys` may bind a strict LEADING PREFIX of the index, since a
+		// prefix `*IndexScan` is promotable like any other (PG's
+		// `amoptionalkey`, indxpath.c:1029-1076). A full key addresses
+		// one B-tree leaf entry exactly and must NOT be padded; a
+		// prefix must be, or the scan stops at the first entry instead
+		// of covering every entry sharing the prefix. Kept identical to
+		// `indexScanOp`'s branch — the two probe the same index for the
+		// same plan node, so they cannot be allowed to disagree.
 		key, ok, err := o.lookupKeys()
 		if err != nil {
 			return err
@@ -214,6 +220,9 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = key
 		hiBytes = key
+		if len(o.plan.Keys) < len(o.plan.Index.Columns) {
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
+		}
 	case o.plan.Key != nil:
 		key, ok, err := o.lookupKey()
 		if err != nil {
@@ -849,7 +858,7 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st array.Output
 // helpers, which have always been slot-aware. A nil slot is the single-table
 // case, where the planner guarantees these reduce to constants.
 func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
-	if len(o.plan.Keys) != len(o.plan.Index.Columns) {
+	if len(o.plan.Keys) == 0 || len(o.plan.Keys) > len(o.plan.Index.Columns) {
 		return nil, false, &ExecError{
 			Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexOnlyScanOp.lookupKeys: planner supplied %d keys for index %q with %d columns",

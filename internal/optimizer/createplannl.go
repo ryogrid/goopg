@@ -69,7 +69,7 @@ package optimizer
 // carry every movable clause: `get_baserel_parampathinfo` puts them in
 // `ppi_clauses`, and `create_indexscan_plan` places whatever the index did not
 // consume into the scan's `qpqual`. goopg's parameterised index path carries
-// only the equalities `pickIndexCoveringAllLeadingColumns` accepted
+// only the equalities `pickIndexCoveringLeadingPrefix` accepted
 // (`Path.IndexClauses`), and goopg's `*IndexScan` has no qual field at all — so
 // a movable NON-index clause such as `b.y > a.x` would be dropped from the join
 // residual and enforced by nothing. That is a wrong answer, and it is this arm

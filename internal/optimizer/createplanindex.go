@@ -339,8 +339,8 @@ func createIndexScanPlan(p *Path) Node {
 		if p.RequiredOuter != 0 {
 			panic(fmt.Sprintf("createPlan: parameterised PathIndexScan on %s carries no index clauses", p.IndexInfo.Name))
 		}
-	case len(p.IndexClauses) != ncols:
-		panic(fmt.Sprintf("createPlan: PathIndexScan on %s binds %d of %d index columns; a prefix probe is not a shape the executor emits",
+	case len(p.IndexClauses) > ncols:
+		panic(fmt.Sprintf("createPlan: PathIndexScan on %s binds %d clauses to a %d-column index",
 			p.IndexInfo.Name, len(p.IndexClauses), ncols))
 	}
 
@@ -381,10 +381,17 @@ func createIndexScanPlan(p *Path) Node {
 	// `Key` vs `Keys` is the executor's distinction, not a new one: a
 	// single-column probe uses `Key` (every pre-existing single-column caller
 	// does, nl_index_join.go:656-660) and a composite one uses `Keys`, which
-	// encodes every column in declared order with no suffix padding. An empty
-	// list sets neither, which is the executor's range-scan branch with both
-	// bounds nil — a scan of the whole index in key order
-	// (operators_index.go:415-430), exactly what "full index scan" means.
+	// encodes each bound column in declared order. An empty list sets neither,
+	// which is the executor's range-scan branch with both bounds nil — a scan
+	// of the whole index in key order (operators_index.go:415-430), exactly
+	// what "full index scan" means.
+	//
+	// A list SHORTER than the index is a prefix probe and needs no special
+	// case on this side: both executor branches pad a short key to cover every
+	// key sharing the bound prefix, so the choice between them stays purely
+	// about how many expressions there are. Note `Key` has always meant that
+	// for a composite index (M0053-0001) — the prefix arm did not introduce
+	// the padding, it made the planner willing to ASK for it.
 	switch len(keys) {
 	case 0:
 	case 1:

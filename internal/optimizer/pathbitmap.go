@@ -527,7 +527,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(req))
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
-		Rows:          parameterizedBaserelRows(rel, nil, sel),
+		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
 		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T),
 		RequiredOuter: req,
 		Children: []*Path{{

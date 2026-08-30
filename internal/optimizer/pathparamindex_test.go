@@ -237,11 +237,11 @@ func TestAddParameterizedIndexPathsNonUniqueUsesNdistinct(t *testing.T) {
 
 // TestAddParameterizedIndexPathsNeedsEveryIndexColumnBound is the shared
 // eligibility rule, and the first half of 03 §5.2's binding contract: path
-// generation calls `pickIndexCoveringAllLeadingColumns`, the SAME function the
+// generation calls `pickIndexCoveringLeadingPrefix`, the SAME function the
 // NLI constructor uses, so it cannot cost an index the constructor declines.
 // A composite index with only its leading column bound is such an index —
 // goopg's executor emits no partial-prefix probe.
-func TestAddParameterizedIndexPathsNeedsEveryIndexColumnBound(t *testing.T) {
+func TestAddParameterizedIndexPathsAcceptsALeadingPrefix(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "partsupp"}, []catalog.Column{
 		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}},
@@ -256,11 +256,35 @@ func TestAddParameterizedIndexPathsNeedsEveryIndexColumnBound(t *testing.T) {
 	}
 	outer, inner := relsetOf(0), relsetOf(1)
 
-	// Leading column only: no path.
+	// Leading column only: a prefix probe, which PG's `amoptionalkey` arm
+	// builds and goopg's executor pads into a range over every entry sharing
+	// the prefix. Requiring TOTAL coverage here is what left the bitmap
+	// producer as the only candidate on TPC-H Q8.
 	s := ppiCtx(t, tbl, 800_000, ppiEquiClause(outer, "p_partkey", inner, "ps_partkey"))
 	s.addParameterizedIndexPaths(c)
-	if got := len(s.findRel(inner).Pathlist); got != 1 {
-		t.Fatalf("a half-bound composite index produced %d paths; want only the seq scan", got)
+	prefixPaths := s.findRel(inner).Pathlist
+	if got := len(prefixPaths); got != 2 {
+		t.Fatalf("a prefix-bound composite index produced %d paths; want the seq scan plus one", got)
+	}
+	var prefix *Path
+	for _, p := range prefixPaths {
+		if p.Kind == PathIndexScan {
+			prefix = p
+		}
+	}
+	if prefix == nil {
+		t.Fatal("no index path among the prefix-bound paths")
+	}
+	if got := len(prefix.IndexClauses); got != 1 {
+		t.Fatalf("the prefix path binds %d index columns; want 1", got)
+	}
+	// The uniqueness short-circuit must NOT fire: `partsupp_pkey` is unique on
+	// (ps_partkey, ps_suppkey), but one ps_partkey covers many suppliers. A
+	// path claiming one row here would make every nested loop above it look
+	// free — the row estimate is the whole reason this case is asserted.
+	if prefix.Rows <= 1 {
+		t.Fatalf("the prefix path claims %.2f rows; a unique index bound on its "+
+			"LEADING column only does not return one row", prefix.Rows)
 	}
 
 	// Both columns bound by the same outer rel: one path.
@@ -268,8 +292,15 @@ func TestAddParameterizedIndexPathsNeedsEveryIndexColumnBound(t *testing.T) {
 		ppiEquiClause(outer, "p_partkey", inner, "ps_partkey"),
 		ppiEquiClause(outer, "s_suppkey", inner, "ps_suppkey"))
 	s.addParameterizedIndexPaths(c)
-	if got := len(s.findRel(inner).Pathlist); got != 2 {
+	full := s.findRel(inner).Pathlist
+	if got := len(full); got != 2 {
 		t.Fatalf("a fully-bound composite index produced %d paths; want the seq scan plus one", got)
+	}
+	// And with the WHOLE unique key bound the short-circuit does fire.
+	for _, p := range full {
+		if p.Kind == PathIndexScan && p.Rows != 1 {
+			t.Fatalf("a fully-bound unique index claims %.2f rows; want exactly 1", p.Rows)
+		}
 	}
 }
 

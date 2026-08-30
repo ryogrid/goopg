@@ -162,6 +162,32 @@ func TestCreateIndexScanPlanComposite(t *testing.T) {
 	}
 }
 
+// TestCreateIndexScanPlanPrefixProbe: a clause list SHORTER than the index is a
+// prefix probe (PG's `amoptionalkey`, indxpath.c:1029-1076). It builds, and it
+// builds through the SAME `Key`/`Keys` convention as any other probe — the
+// executor pads the short key to a range over every entry sharing the prefix,
+// so the node needs nothing to mark it as partial. This is the shape PG picks
+// for TPC-H Q8's `lineitem_part_supp_fkidx`, where only `l_partkey` is bound.
+func TestCreateIndexScanPlanPrefixProbe(t *testing.T) {
+	idx := cpiIndex("l_partkey", "l_suppkey")
+	k0 := &ColumnRef{Name: "p_partkey"}
+	p := cpiPath(&SeqScan{Table: &catalog.Table{Name: "lineitem"}}, idx,
+		[]indexPathClause{{ri: &restrictInfo{}, indexCol: 0, key: k0}}, relsetOf(1))
+
+	is, ok := createPlan(p).(*IndexScan)
+	if !ok {
+		t.Fatalf("createPlan(prefix PathIndexScan) = %T, want *IndexScan", createPlan(p))
+	}
+	if is.Index != idx {
+		t.Fatalf("node carries index %v, path chose %v", is.Index, idx)
+	}
+	// One expression, so the single-column convention applies even though the
+	// index is composite.
+	if is.Key != Expr(k0) || is.Keys != nil {
+		t.Fatalf("prefix probe: Key=%v Keys=%v, want Key=k0 Keys=nil", is.Key, is.Keys)
+	}
+}
+
 // TestCreateIndexScanPlanSingleColumnUsesKey: the executor's convention — a
 // single-column probe sets `Key`, never a one-element `Keys`.
 func TestCreateIndexScanPlanSingleColumnUsesKey(t *testing.T) {
@@ -252,9 +278,12 @@ func TestCreateIndexScanPlanPanics(t *testing.T) {
 			path: cpiPath(&SeqScan{Table: tbl}, idx2, nil, relsetOf(1)),
 			want: "carries no index clauses",
 		},
-		"prefix probe": {
-			path: cpiPath(&SeqScan{Table: tbl}, idx2, two[:1], relsetOf(1)),
-			want: "binds 1 of 2",
+		"more clauses than index columns": {
+			path: cpiPath(&SeqScan{Table: tbl}, idx2,
+				append(append([]indexPathClause{}, two...),
+					indexPathClause{ri: &restrictInfo{}, indexCol: 2, key: ka}),
+				relsetOf(1)),
+			want: "binds 3 clauses to a 2-column index",
 		},
 		"order lost": {
 			path: cpiPath(&SeqScan{Table: tbl}, idx2, []indexPathClause{

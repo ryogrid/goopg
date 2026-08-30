@@ -16,6 +16,7 @@ package optimizer
 // all.
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -333,7 +334,7 @@ func TestConsideredParameterizationsGeneratesPairwiseUnions(t *testing.T) {
 // rule end to end, on the shape that motivates it: the composite-FK probe.
 // `lineitem(l_partkey, l_suppkey)` is equated to `part` and to `supplier`
 // separately, so no SINGLE outer rel binds the whole index key —
-// `pickIndexCoveringAllLeadingColumns` correctly declines both singletons — and
+// `pickIndexCoveringLeadingPrefix` correctly declines both singletons — and
 // only the union {part, supplier} yields a path.
 func TestParameterizedIndexPathsBindCompositeIndexFromTwoOuterRels(t *testing.T) {
 	c := catalog.NewInMemory()
@@ -378,7 +379,14 @@ func TestParameterizedIndexPathsBindCompositeIndexFromTwoOuterRels(t *testing.T)
 			params = append(params, p.RequiredOuter)
 		}
 	}
-	if len(params) != 1 || params[0] != part|supplier {
-		t.Fatalf("got parameterisations %v, want exactly [{part,supplier}]: neither singleton binds both index columns", params)
+	// `part` alone binds the index's LEADING column (`l_partkey`), so it gets a
+	// prefix path; `part|supplier` binds both and gets the full probe. What
+	// must NOT appear is `supplier` alone: `l_suppkey` is the index's TRAILING
+	// column, and a btree cannot begin a scan below its leading column.
+	sort.Slice(params, func(i, j int) bool { return params[i] < params[j] })
+	want := []RelSet{part, part | supplier}
+	if len(params) != len(want) || params[0] != want[0] || params[1] != want[1] {
+		t.Fatalf("got parameterisations %v, want %v: {part} is the prefix probe, "+
+			"{part,supplier} the full one, and {supplier} alone is unusable", params, want)
 	}
 }

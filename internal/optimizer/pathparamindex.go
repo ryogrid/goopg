@@ -110,7 +110,7 @@ func indexableJoinClausesFor(relids RelSet, clauses []*restrictInfo) []paramInde
 // composite-FK shape, `lineitem(l_partkey, l_suppkey)` probed from `part` and
 // `supplier` — has no single clause that binds it, so a singleton-only list
 // offers the index two half-bound key sets and
-// `pickIndexCoveringAllLeadingColumns` correctly declines both. Only the union
+// `pickIndexCoveringLeadingPrefix` correctly declines both. Only the union
 // {part, supplier} binds the whole key. This half was ledgered against
 // P5.4b-ii-b, deliberately: until the NLI arm existed to consume a
 // parameterised path, the extra sets would have been generated, priced, and
@@ -327,19 +327,39 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		return false
 	}
 	// The SAME index-eligibility rule the NLI constructor applies
-	// (`pickIndexCoveringAllLeadingColumns`, nl_index_join.go:970): a
-	// multi-column index qualifies only when EVERY one of its columns is
-	// bound, because a partial-prefix probe is not a shape goopg's executor
-	// emits. Sharing the function is what keeps path generation from costing
-	// an index the constructor would decline — the first half of 03 §5.2's
-	// binding contract; the second half (sharing `tryBuildNLI`'s whole
-	// gauntlet) belongs to the arm that builds the join, P5.4b-ii-b.
-	idx, _ := pickIndexCoveringAllLeadingColumns(cat, tbl, innerToOuter)
+	// (`pickIndexCoveringLeadingPrefix`, nl_index_join.go): an index
+	// qualifies when its LEADING column is bound, and the probe binds the
+	// gapless prefix that is bound from there — PG's `amoptionalkey` rule
+	// (indxpath.c:1029-1076). Sharing the function is what keeps path
+	// generation from costing an index the constructor would decline — the
+	// first half of 03 §5.2's binding contract; the second half (sharing
+	// `tryBuildNLI`'s whole gauntlet) belongs to the arm that builds the
+	// join, P5.4b-ii-b.
+	//
+	// Requiring TOTAL coverage here is what made goopg choose a Bitmap Heap
+	// Scan for TPC-H Q8 where PG chooses `Index Scan using
+	// lineitem_part_supp_fkidx`: with only `l_partkey` bound, this producer
+	// declined and the bitmap producer — which never had the restriction —
+	// was the only candidate left. It was never a costing difference. At
+	// every parameterisation where both produced a path, the index path was
+	// already cheaper and `addPath` already discarded the bitmap.
+	idx, _ := pickIndexCoveringLeadingPrefix(cat, tbl, innerToOuter)
 	if idx == nil {
 		return false
 	}
-	sel := parameterizedIndexSelectivity(tbl, idx, bound, relTuples)
-	rows := parameterizedBaserelRows(rel, idx, sel)
+	// The probe binds a gapless leading prefix, which may be SHORTER than
+	// `bound`: a clause on a column past the first unbound one is not an index
+	// qual at all. Splitting the two selectivities is PG's own split — the
+	// index quals drive `cost_index`'s page estimate (`indexSelectivity`),
+	// while `ppi_rows` counts every movable clause because the ones that are
+	// not index quals still filter (`get_parameterized_baserel_size`,
+	// costsize.c:5379). Sharing one number would either over-charge the probe
+	// or under-count the filter.
+	clauses := indexPathClauses(idx, bound)
+	probed := boundPrefixClauses(bound, clauses)
+	fullyBound := len(clauses) == len(idx.Columns)
+	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, fullyBound)
+	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound)
 	// The index's own ordering (`build_index_pathkeys`, pathkeys.c:740) AND the
 	// direction it was computed for, taken together so they cannot disagree
 	// (M0127-P5.5-a, pathindexcarrier.go). PG passes the same `useful_pathkeys`
@@ -382,9 +402,9 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// the search's candidate order and `IndexScan.Keys[i]` binds
 		// `Index.Columns[i]` positionally, so the reordering is the difference
 		// between the right answer and a probe that compares the wrong pair of
-		// columns. Never nil here: `pickIndexCoveringAllLeadingColumns` accepted
+		// columns. Never nil here: `pickIndexCoveringLeadingPrefix` accepted
 		// `idx` only because every one of its columns is bound.
-		IndexClauses:  indexPathClauses(idx, bound),
+		IndexClauses:  clauses,
 		RequiredOuter: req,
 	})
 	return true
@@ -396,14 +416,19 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 // `indexQuals`). Index quals only — the relation's local quals are not in it,
 // because `cost_index` charges over `baserel->tuples` and including them would
 // count them twice.
-func parameterizedIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, bound []paramIndexClause, relTuples float64) float64 {
+func parameterizedIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, bound []paramIndexClause, relTuples float64, fullyBound bool) float64 {
 	// PG's `vardata->isunique` short circuit (`var_eq_non_const`, selfuncs.c):
 	// when the equated column matched a unique index, assume exactly one match
-	// regardless of what the statistics say. Here the whole key of a unique
-	// index is bound — `pickIndexCoveringAllLeadingColumns` guarantees it — so
-	// the scan returns at most one row by definition of the constraint. As a
-	// SELECTIVITY that is one tuple out of the relation.
-	if idx.Unique {
+	// regardless of what the statistics say.
+	//
+	// `fullyBound` is the precondition, and it is a PARAMETER because it
+	// stopped being a guarantee when the producer began emitting prefix
+	// probes. Uniqueness of an index on (a, b) says nothing about how many
+	// rows share one value of `a` — asserting one row for a prefix probe would
+	// under-count `lineitem_part_supp_fkidx` bound on `l_partkey` alone by the
+	// ~30 lineitems per part, and it is the ROW estimate that decides whether
+	// the nested loop above is affordable.
+	if idx.Unique && fullyBound {
 		if relTuples <= 1 {
 			return 1
 		}
@@ -434,14 +459,15 @@ func parameterizedIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, bound
 //
 // PG's floor is `clamp_row_est`: a scan that returns "0.3 rows" still costs a
 // probe, and a zero would make every join above it free.
-func parameterizedBaserelRows(rel *RelOptInfo, idx *catalog.Index, sel float64) float64 {
+func parameterizedBaserelRows(rel *RelOptInfo, idx *catalog.Index, sel float64, fullyBound bool) float64 {
 	// The uniqueness short-circuit is on the ROWS side and not merely inherited
 	// from the selectivity: `parameterizedIndexSelectivity` expresses "one
 	// tuple" as `1/relTuples`, which reproduces one row only when `rel.Rows`
 	// and `relTuples` agree. They need not — `rel.Rows` is post-restriction —
-	// and a unique index fully bound by equality returns at most one row by
-	// definition of the constraint, whatever the restriction did.
-	if idx != nil && idx.Unique {
+	// and a unique index FULLY bound by equality returns at most one row by
+	// definition of the constraint, whatever the restriction did. A prefix
+	// probe has no such guarantee — see `parameterizedIndexSelectivity`.
+	if idx != nil && idx.Unique && fullyBound {
 		return 1
 	}
 	rows := rel.Rows * sel
@@ -556,3 +582,22 @@ func columnStatsByName(tbl *catalog.Table, name string) *catalog.ColumnStats {
 	return nil
 }
 
+// boundPrefixClauses narrows `bound` to just the clauses the probe actually
+// binds, named by the index-column list `indexPathClauses` produced. The
+// remainder are movable clauses that could not become index quals; they still
+// filter, so they belong to the row estimate but not to the probe's page cost.
+func boundPrefixClauses(bound []paramIndexClause, clauses []indexPathClause) []paramIndexClause {
+	if len(clauses) >= len(bound) {
+		return bound
+	}
+	keep := make([]paramIndexClause, 0, len(clauses))
+	for _, ipc := range clauses {
+		for _, c := range bound {
+			if c.ri == ipc.ri {
+				keep = append(keep, c)
+				break
+			}
+		}
+	}
+	return keep
+}

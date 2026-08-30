@@ -1119,3 +1119,148 @@ gives Bitmap Heap Scan 6, PG's count, on four of PG's five queries — with both
 the double-count removal and the qpqual term written up but unlanded. Anyone
 resuming should look for a term of the same order as `indexTotalCost` itself,
 not for more per-tuple CPU.
+
+## 14. Q8 was never a costing bug — it was candidate generation
+
+§13's whole line of enquiry assumed the Q8 bitmap-vs-index mismatch was a cost
+calibration problem, and looked for "a term of the same order as
+`indexTotalCost`". That assumption was wrong, and it was wrong for four rounds
+because every round reasoned about the cost functions instead of printing what
+the two producers actually emitted.
+
+Printing both candidates' `Cost{Startup, Total}` for `lineitem` under every Q8
+parameterisation settles it in one run:
+
+| parameterisation | bitmap | parameterised index | `addPath` |
+|---|---|---|---|
+| `{part}` | 4.66..116.49, 30.7 rows | **none generated** | bitmap kept |
+| `{part,supplier}` | 4.50..13.01, 1 row | 0.50..8.49, 1 row | index kept, **bitmap rejected** |
+| `{part,supplier,orders}` | 4.50..13.01, 1 row | 0.50..8.49, 1 row | index kept, **bitmap rejected** |
+
+At every parameterisation where both producers emitted a path, the index path
+was already strictly cheaper on both axes and `addPath`'s dominance pruning
+already discarded the bitmap. The bitmap survived in exactly one place: the
+parameterisation where the index producer emitted **nothing at all**.
+
+### 14.1 The asymmetry
+
+`addOneParameterizedIndexPath` required that EVERY column of the index be bound,
+via `pickIndexCoveringAllLeadingColumns`. `lineitem_part_supp_fkidx` is
+`(l_partkey, l_suppkey)`; at `req={part}` only `l_partkey` is bound, so the
+index producer declined and the bitmap producer — which never had the
+restriction — was the only candidate left.
+
+The restriction was documented, in three places, as an executor limitation:
+
+> a multi-column index qualifies only when EVERY one of its columns is bound,
+> because a partial-prefix probe is not a shape goopg's executor emits
+
+That is false, and had been false since M0053-0001. `operators_index.go`'s
+single-`Key` branch has always padded a one-column probe on a composite index
+with `compositeUpperBound`, turning it into a range over every entry sharing the
+prefix — which is precisely a prefix probe. Only the planner refused to ask for
+one. `pathindexclauses.go` even anticipated the arm by name ("if a later
+producer (PG's `amoptionalkey`/prefix-probe arm) forgets the precondition").
+
+### 14.2 What landed
+
+PG requires only that the LEADING index column have a qual
+(`build_index_paths`, indxpath.c:1029-1076; `amoptionalkey`). Five coordinated
+changes, since the rule was stated redundantly in five places:
+
+1. **`operators_index.go`** — `lookupKeys` accepts a short key list, and the
+   multi-key branch pads `hiBytes` with `compositeUpperBound` when the list is
+   shorter than the index. A FULL key must *not* be padded: it is a point
+   lookup, and padding it would widen the scan to every duplicate of the whole
+   key.
+2. **`indexPathClauses`** — TRUNCATES at the first unbound column instead of
+   declining the index. A list that binds nothing at column 0 is still declined:
+   a btree cannot begin a scan below its leading column, and `Keys[i]` binds
+   `Index.Columns[i]` positionally, so a gapped list would probe the wrong
+   column.
+3. **`pickIndexCoveringAllLeadingColumns` → `pickIndexCoveringLeadingPrefix`** —
+   renamed because the old name became a false statement. Its ranking moved from
+   *index width* to *bound-column count*; those were the same number under total
+   coverage, and ranking on width would now prefer a wide index bound only on
+   its leading column over a narrow one bound completely.
+4. **`createplanindex.go`** — the `binds N of M ... not a shape the executor
+   emits` panic became a `> ncols` guard.
+5. **Selectivity split** — the probe's selectivity now comes from the bound
+   PREFIX, while `ppi_rows` still comes from every movable clause, which is
+   PG's own split (`cost_index`'s `indexSelectivity` vs
+   `get_parameterized_baserel_size`). And the `idx.Unique` short-circuit is now
+   gated on full binding: a unique index on `(a, b)` says nothing about how many
+   rows share one value of `a`, and claiming one row there would have made every
+   nested loop above it look free.
+
+Result: Q8's `lineitem` scan is now `Index Scan using lineitem_part_supp_fkidx`
+with `Index Cond: (l_partkey = p_partkey)`, rows=30 — PG's plan — and it won on
+cost (112.65 vs the bitmap's 116.49), with both candidates generated and
+compared. Exactly two plans changed across the 21 queries; 21/21 result sets
+stayed byte-identical and both changed queries timed the same.
+
+### 14.3 Q17: the node that changed is not the node PG puts a bitmap on
+
+Q17's raw census reads as a regression — goopg's Bitmap Heap Scan count went
+6 → 4 while PG has 6. Comparing the plans NODE BY NODE says otherwise, and the
+first framing of this section (a "1% cost near-tie that goopg falls on the wrong
+side of") compared two different nodes. Corrected:
+
+Q17 has two `lineitem` scans in each engine.
+
+| position | PG 18.3 | goopg before | goopg after |
+|---|---|---|---|
+| join input | Seq Scan under a **Hash Join** | **Bitmap Heap Scan** as nested-loop inner, rows=1 | **Index Scan**, `Index Cond: (l_partkey = p_partkey)`, rows=30 |
+| `SubPlan 1` | **Bitmap Heap Scan**, `Recheck Cond: (l_partkey = part.p_partkey)` | Index Scan, `l_partkey = $0` | Index Scan (**unchanged**) |
+
+The bitmap this change removed sat at the JOIN INPUT, where PG has no bitmap —
+PG hash-joins there. And PG's bitmap, in `SubPlan 1`, faces a goopg Index Scan
+both before and after; that mismatch is real, separate, and untouched here.
+
+So the removed bitmap was never a match. It was a *coincidence* of the aggregate
+count, which is exactly the failure mode of counting node types instead of
+comparing positions — the same lesson as "a row-count gate cannot catch a
+plan-shape regression", one level up.
+
+Two things at the join input got strictly better, both visible in the plan text:
+
+- The join predicate `p_partkey = l_partkey` was a **post-join `Filter:`** and is
+  now an `Index Cond:`. The nested loop no longer re-checks the join key on
+  every probed row; the probe enforces it.
+- The inner's estimate moved from **rows=1 to rows=30**. Thirty is right —
+  PG independently estimates 31 for the same access. The old `rows=1` came from
+  the `idx.Unique` short-circuit firing on a partially-bound index, which §14.2
+  item 5 gates.
+
+The genuine open question is therefore the SUBPLAN node, and PG's own numbers
+show how fine it is. Asking the oracle to price the alternative there
+(`SET enable_bitmapscan=off`):
+
+| PG 18.3, `SubPlan 1` | startup | total |
+|---|---|---|
+| Bitmap Heap Scan (**chosen**) | 4.67 | **127.62** |
+| Index Scan | 0.43 | **128.97** |
+
+PG separates them by 1.0%. goopg picks the index scan there. Whether goopg's
+costs for THAT node bracket the same way has not been measured — the `PAIR`
+trace in §14 covered the DP's parameterised candidates, and a correlated
+SubPlan's scan is parameterised from an outer query level, which is a different
+seam. Measuring it is the follow-up, and it must instrument the SubPlan node
+specifically rather than reuse §14's numbers, which belong to the join input.
+
+### 14.4 The methodological point
+
+This is the fifth wrong hypothesis in a row about Q8, and the first round that
+measured instead of reasoning. Every earlier round asked "which cost term is
+wrong?" — a question that presupposes both candidates existed. The one-line
+instrumentation that would have refuted the premise (print every path each
+producer emits, with its parameterisation) was cheap and available from the
+start.
+
+Generalised: **before comparing two candidates' costs, verify both candidates
+were generated.** A cost model can only choose among the paths it is offered,
+and an absent path is indistinguishable from an infinitely expensive one at
+every point downstream. This is the same shape as the census bug in §9 (the
+labeller, not the planner) and the memory note "in a cost-based planner, a path
+the optimiser never selects has never been executed" — three instances now of a
+missing thing being mistaken for a wrong thing.

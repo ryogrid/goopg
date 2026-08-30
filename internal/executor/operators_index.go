@@ -395,10 +395,17 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if len(o.plan.Keys) > 0 {
 		// Multi-column equality probe (M0054-0006-followup-Q9-
 		// composite). Encode each leading column from
-		// `Index.Columns[0..len(Keys)-1]` in order. The planner
-		// guarantees `len(Keys) == len(Index.Columns)` whenever
-		// `Keys` is non-empty, so no suffix padding is required —
-		// we synthesise a full equality probe.
+		// `Index.Columns[0..len(Keys)-1]` in order.
+		//
+		// `Keys` may bind a strict LEADING PREFIX of the index rather
+		// than all of it (PG's `amoptionalkey` prefix probe: only the
+		// first index column is required to have a qual,
+		// indxpath.c:1029-1076). The suffix padding below is what makes
+		// that a range rather than a point lookup, and it is the SAME
+		// rule the single-`Key` branch has applied to composite indexes
+		// since M0053-0001 — stated once per branch because the two
+		// encode their lo bound differently, not because they differ
+		// here.
 		key, ok, err := o.lookupKeys()
 		if err != nil {
 			return err
@@ -409,6 +416,15 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = key
 		hiBytes = key
+		// A prefix probe's inclusive upper bound must cover every key
+		// whose bound leading columns equal `key`, exactly as the
+		// single-`Key` branch does below. A FULL-key probe must not be
+		// padded: it is a point lookup and padding it would widen the
+		// scan to every duplicate of the whole key, which is the same
+		// set only for a unique index.
+		if len(o.plan.Keys) < len(o.plan.Index.Columns) {
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
+		}
 	} else if o.plan.Key != nil {
 		// Single-column equality scan: probe key is both lo and hi.
 		key, ok, err := o.lookupKey()
@@ -740,11 +756,16 @@ func (o *indexScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bo
 // the probe correctly produces zero rows. (M0054-0006-followup-
 // Q9-composite.)
 func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
-	if len(o.plan.Keys) != len(o.plan.Index.Columns) {
-		// Defensive: the planner is contractually required to
-		// supply one Key per index column. A mismatch here is a
-		// planner bug, surfaced as runtime XX000 with the index
-		// name so the bug is named at the failure site.
+	if len(o.plan.Keys) == 0 || len(o.plan.Keys) > len(o.plan.Index.Columns) {
+		// Defensive: the planner is contractually required to supply a
+		// non-empty LEADING PREFIX of the index columns — at most one
+		// Key per index column, with no gaps, since `Keys[i]` binds
+		// `Index.Columns[i]` positionally. A count outside that range is
+		// a planner bug, surfaced as runtime XX000 with the index name
+		// so the bug is named at the failure site. A SHORT list is legal
+		// (prefix probe) and is padded by the caller; there is no
+		// representation for a gap, which is why `indexPathClauses`
+		// declines rather than shortening one.
 		return nil, false, &ExecError{
 			Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexScanOp.lookupKeys: planner supplied %d keys for index %q with %d columns", len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),

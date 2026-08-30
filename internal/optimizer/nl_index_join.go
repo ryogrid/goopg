@@ -451,7 +451,7 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// Choose an index that lives on `innerScan.Table` and whose
 	// EVERY leading column appears in `innerToOuter`. Prefer the
 	// longest such index (most columns bound = most selective).
-	idx, keys := pickIndexCoveringAllLeadingColumns(cat, innerScan.Table, innerToOuter)
+	idx, keys := pickIndexCoveringLeadingPrefix(cat, innerScan.Table, innerToOuter)
 	if idx == nil {
 		return nil, false
 	}
@@ -990,13 +990,18 @@ func walkAndConjunctsNLI(e Expr) []Expr {
 	return out
 }
 
-// pickIndexCoveringAllLeadingColumns returns the longest B-tree
-// index on `tbl` whose EVERY column is bound by an entry in
-// `innerToOuter`. Single-column indexes also satisfy this when
-// the bound key is in the map. Returns (nil, nil) if no such index
-// exists. The returned `keys` slice is in `Index.Columns` order
-// — keys[i] is the outer Expr for Index.Columns[i].
-func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) (*catalog.Index, []Expr) {
+// pickIndexCoveringLeadingPrefix returns the B-tree index on `tbl`
+// that binds the most LEADING columns from `innerToOuter`, together
+// with the probe expressions for those columns. Coverage need not be
+// total: PG requires only that the leading column be bound
+// (`amoptionalkey`, indxpath.c:1029-1076), and the executor turns a
+// short key list into a range over every key sharing that prefix
+// (operators_index.go, `compositeUpperBound`). Returns (nil, nil)
+// when no index has its LEADING column bound — the one case a btree
+// cannot start a scan for. The returned `keys` slice is in
+// `Index.Columns` order and may be SHORTER than `Index.Columns`;
+// keys[i] is the outer Expr for Index.Columns[i], with no gaps.
+func pickIndexCoveringLeadingPrefix(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) (*catalog.Index, []Expr) {
 	var best *catalog.Index
 	var bestKeys []Expr
 	for _, idx := range cat.IndexesOnTable(tbl) {
@@ -1013,20 +1018,32 @@ func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table,
 			continue
 		}
 		keys := make([]Expr, 0, len(idx.Columns))
-		covered := true
 		for _, col := range idx.Columns {
 			outer, ok := innerToOuter[col]
 			if !ok {
-				covered = false
+				// The first unbound column ends the probe. Columns after
+				// it are unreachable: a btree scan is ordered by the whole
+				// key, so an unbound column makes every later one a filter
+				// rather than a bound. This is PG's `amoptionalkey` rule —
+				// only the LEADING column must be bound (indxpath.c:1029).
 				break
 			}
 			keys = append(keys, outer)
 		}
-		if !covered {
+		if len(keys) == 0 {
+			// Leading column unbound: this index cannot start a scan for
+			// this parameterisation at all.
 			continue
 		}
-		// Prefer the longest covered index (most-selective).
-		if best == nil || len(idx.Columns) > len(best.Columns) {
+		// Prefer the probe that BINDS the most columns — more bound
+		// columns is a strictly narrower scan on the same table. Ties go
+		// to the first index seen, so the choice is stable.
+		//
+		// This ranks on bound columns, NOT on index width as it did while
+		// full coverage was mandatory (the two were the same number then).
+		// Ranking on width would now prefer a wide index that binds only
+		// its leading column over a narrow one bound completely.
+		if best == nil || len(keys) > len(bestKeys) {
 			best = idx
 			bestKeys = keys
 		}
