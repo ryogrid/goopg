@@ -272,15 +272,29 @@ experiment (DESIGN §4-A):
       — because a bitmap index scan emits TIDs and never touches the heap.
       Fixed (`ab8fbc334`); the supplier probe's index side was ~874 against
       PG's 7.77
-- [ ] **Q2/Q11/Q20/Q21 STILL get no bitmap**, after all three cost fixes and
-      with zero plans changed by the last one. So the remaining gap is NOT in
-      `costBitmapHeapScan`/`costBitmapIndexScan` — those now match the oracle
-      term for term. Next: measure the RIVAL. Print the cheapest parameterised
-      path per relation and its kind, and compare the bitmap's total against the
-      plain index probe's for `supplier` under `s_nationkey = n_nationkey`. PG
-      prefers bitmap there; whichever term makes goopg's index probe cheaper
-      than PG's is the thing to look at, and it is a different function from the
-      three already corrected
+- [x] **Rival measured.** For `supplier` under `s_nationkey = n_nationkey`
+      (req `0x0002`), after all three cost fixes:
+
+      | path | rows | startup | total |
+      |---|---:|---:|---:|
+      | goopg bitmap | 400 | 14.35 | **66.42** |
+      | goopg index probe | 400 | — | **54.73** |
+      | **PG bitmap** (the one it picks) | 400 | **7.87** | **43.46** |
+
+      The bitmap does not appear in `rel.CheapestParameterized` at all — it is
+      DOMINATED by the index probe, by 21%. It was 1786 before the three fixes,
+      so those closed 96% of the gap; what is left is a 1.53x overcost on the
+      bitmap, and if goopg's bitmap were at PG's 43.46 it would beat the 54.73
+      probe and win
+- [ ] **The remaining gap is calibration, not structure.** Startup 14.35 vs PG's
+      7.87 is roughly `indexProbeCostMultiplier`, which `btreeIndexAMCost`
+      applies at costindex.go:189. That knob exists because goopg's index access
+      materialises TIDs eagerly — which a bitmap index scan also does, so
+      applying it is arguable. But BOTH rivals are inflated by it, so the
+      multiplier alone does not explain the ORDERING flip: PG prefers bitmap
+      over its own index probe and goopg does not. The next question is what
+      makes goopg's index probe relatively cheaper than PG's, and it is a
+      question about `costIndexScan`, not about the bitmap functions
 
 ### B (original notes) — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans) — BLOCKED on a consumer
 
