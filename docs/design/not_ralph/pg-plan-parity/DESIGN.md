@@ -432,6 +432,31 @@ bug in its own right and it is NOT understood.
 S6/D6.2 policy that keeps a SubPlan when the inner is probe-shaped, and it names
 Q2 in its own comment. It is not: it returned false (accept) in this build.
 
+**Resolved — and it is not the unnester.** Instrumenting every `return nil, nil`
+in `unnestSubquery` and running BOTH builds against the same query settles it:
+
+| build | unnest decision | bails | `SubPlan` in final plan |
+|---|---|---|---|
+| `80a5e334d` (no `loop_count`) | ACCEPTED | none | **0** |
+| + `loop_count` arm | ACCEPTED | none | **1** |
+
+The rewrite succeeds identically in both. What differs is downstream: the DP
+join search re-plans the relation set from the clause list, and the plan it
+produces does not carry the unnesting rewrite — the aggregate the unnester
+joined in is not a relation the search models, so when the search's plan wins,
+the correlated `SubPlan` comes back with it.
+
+So the defect is a **planner disagreement**, not a costing or unnesting bug:
+goopg has two planners for this query — the rewrite-based one that decorrelates
+and the PG-shaped DP — and the DP silently discards the other's rewrite rather
+than costing against it. The `loop_count` arm only changes which one wins.
+
+That is a third piece of architecture, distinct from the two in §4, and it is
+the real prerequisite for the arm: until the search either models the
+decorrelated form or declines when a rewrite it cannot represent is in play,
+making parameterised inners cheaper will keep flipping queries onto the
+correlated form that goopg then executes badly.
+
 ### 9.4 Decision
 
 Reverted — twice, the second time after re-applying it specifically to hunt the

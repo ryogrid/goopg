@@ -98,10 +98,15 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
       `part` rows
 - [x] Preserved as `wip/loop-count-arm.patch`; applies cleanly to `80a5e334d`
       and carries its own tests
-- [ ] **First**: explain DESIGN §9.3b — the unnester reports SUCCESS on Q2's
-      subquery (`UNNEST scalar ACCEPTED`, `params=1 residuals=0`, no bail) and
-      `SubPlan 1` still reaches the final plan. Something downstream re-creates
-      or re-plans it. Not understood, and it is why the arm was not shipped
+- [x] DESIGN §9.3b **explained**: not the unnester. Both builds report ACCEPTED
+      with no bail; HEAD's plan has 0 SubPlan and the `loop_count` build's has
+      1. The DP join search re-plans from the clause list and does not carry
+      the unnesting rewrite, so when the search's plan wins the correlated
+      SubPlan returns with it
+- [ ] **The real prerequisite**: the DP search must either model the
+      decorrelated form as a relation, or decline when a rewrite it cannot
+      represent is in play. Today it silently discards the rewrite instead of
+      costing against it — two planners, no comparison
 - [ ] Then: charge a SubPlan's evaluation cost over the row count it will be
       evaluated over (PG `cost_qual_eval`), `subplan_cost.go`
 - [ ] Then `git apply` the patch and re-run BOTH the byte gate and a timing pass
