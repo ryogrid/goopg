@@ -265,9 +265,22 @@ experiment (DESIGN §4-A):
       too cheap. goopg's bitmap set on Q8/Q17 now matches PG's exactly. Timed
       against the TRUE pre-work baseline: q08 11.7 -> 11.5 (its 1.1s under the
       buggy formula was never real), q17 2.2 -> 0.4
-- [ ] Q2/Q11/Q20/Q21 STILL get no bitmap. With the formula now PG-faithful, the
-      remaining gap is elsewhere — re-measure `supplier.supplier_nation_fkidx`
-      (was 2588.7 vs PG's 43.46) before forming a new hypothesis
+- [x] Re-measured as instructed rather than guessing, and it found a THIRD
+      costing bug: `costBitmapIndexScan` called `costIndexScan`, i.e. the whole
+      scan including heap IO, so every bitmap path paid for its heap TWICE.
+      PG's `cost_bitmap_tree_node` uses `indextotalcost` — the index side alone
+      — because a bitmap index scan emits TIDs and never touches the heap.
+      Fixed (`ab8fbc334`); the supplier probe's index side was ~874 against
+      PG's 7.77
+- [ ] **Q2/Q11/Q20/Q21 STILL get no bitmap**, after all three cost fixes and
+      with zero plans changed by the last one. So the remaining gap is NOT in
+      `costBitmapHeapScan`/`costBitmapIndexScan` — those now match the oracle
+      term for term. Next: measure the RIVAL. Print the cheapest parameterised
+      path per relation and its kind, and compare the bitmap's total against the
+      plain index probe's for `supplier` under `s_nationkey = n_nationkey`. PG
+      prefers bitmap there; whichever term makes goopg's index probe cheaper
+      than PG's is the thing to look at, and it is a different function from the
+      three already corrected
 
 ### B (original notes) — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans) — BLOCKED on a consumer
 
