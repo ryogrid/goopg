@@ -201,7 +201,13 @@ refuse — the exact failure that file warns about.
 - [x] Confirmed the executor blocker: `bitmapHeapScanOp` has NO `Rescan` and NO
       `BindOuter` (cf. `indexScanOp` at operators_index.go:353/:362). A bitmap
       inner must rebuild its TID bitmap per outer row; that path does not exist
-- [ ] Add bitmap rescan-per-outer-row to the executor
+- [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
+      one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
+      (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over
+      several), so `BindOuter`/`Rescan` are needed on `bitmapIndexScanOp` too —
+      that is where an outer-var probe key would actually be bound — and the
+      And/Or nodes must propagate them. Sizing this before starting is the
+      difference between a bounded task and an open-ended one
 - [ ] Generalise `NestedLoopIndexJoin.Inner` (or add a bitmap-inner join node)
 - [x] Item 0 (the 1-row estimate feeding bitmap comparisons) — done
 - [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`)
