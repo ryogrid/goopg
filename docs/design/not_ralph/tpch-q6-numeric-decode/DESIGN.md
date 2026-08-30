@@ -651,6 +651,13 @@ Existing gates:
 
 ---
 
+> **Superseded (2026-08-30):** the top two items below were implemented in
+> [benchmark-results-take5.md](benchmark-results-take5.md) — `cloneRowOwned`
+> fell from 26.6 % to 1.16 % and the deform now stops at the predicate's highest
+> attnum (6 of 16 on Q6). A further 1.85× serial / 2.18× parallel; the gap to
+> PostgreSQL is now **6.0×**, not 13×. §9's remaining rows are still open and
+> are re-measured there.
+
 ## 9. What this does *not* fix
 
 The gap will remain roughly an order of magnitude after this change, and it is
