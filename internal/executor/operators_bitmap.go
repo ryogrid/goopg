@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage/lmgr"
@@ -388,7 +389,7 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 	o.outerBitmap, ok = outerOp.(bitmapProducer)
 	if !ok {
 		outerOp.Close()
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "BitmapHeapScan outer is not a bitmap producer"}
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("BitmapHeapScan outer is a %T, which is not a bitmap producer", o.plan.Outer)}
 	}
 	return nil
 }

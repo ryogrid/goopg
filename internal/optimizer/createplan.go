@@ -100,7 +100,10 @@ func createPlanNode(p *Path) (Node, outputLayout) {
 		// M0128-P2.4: bitmap heap scan — the page-at-a-time heap visitor.
 		n, err := createBitmapHeapScanPlan(p)
 		if err != nil {
-			return nil, nil
+			// Was `return nil, nil`, which turned a construction failure into a
+			// nil plan node and a confusing error much later. A failure here is a
+			// producer bug, the same class every other createPlan arm panics on.
+			panic("createPlan: PathBitmapHeapScan: " + err.Error())
 		}
 		return n, baseRelLayout(p.Rel, n)
 	case PathBitmapIndexScan:
