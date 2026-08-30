@@ -317,6 +317,16 @@ refuse — the exact failure that file warns about.
       columns, so all three must move to `evalExprSlot(expr, o.outerSlot,
       o.ctx)`, mirroring `indexScanOp`. Miss this and the scan silently probes
       with a nil row rather than failing
+- [x] **Stage 2 measured, and it is the expensive one.** Widening
+      `NestedLoopIndexJoin.Inner` off `*IndexScan` touches **52 references
+      across 26 non-test files**, plus **11 test files**
+      (`grep -rn "\.Inner\b"` in internal/optimizer + internal/executor,
+      excluding the `inner*` false positives). Every one either needs a type
+      switch or an assertion that the inner is still an index scan — the
+      remap passes, the EXPLAIN arms, the FOR UPDATE TID-provider walks
+      (`nliInnerIndexScan`), the subplan walkers, and the createplan
+      assertions. That is the number behind "multi-day", and it is why stage 1
+      alone — which is genuinely mechanical — buys nothing on its own
 - [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
       one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
       (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over
