@@ -363,6 +363,35 @@ refuse — the exact failure that file warns about.
       difference between a bounded task and an open-ended one
 - [ ] Generalise `NestedLoopIndexJoin.Inner` (or add a bitmap-inner join node)
 - [x] Item 0 (the 1-row estimate feeding bitmap comparisons) — done
+- [x] **ATTEMPTED and reverted — the planner half works, the EXECUTOR half of
+      the join does not.** A parameterised bitmap producer
+      (`addParameterizedBitmapPaths`, mirroring `addParameterizedIndexPaths`)
+      plus a `createNestLoopBitmapJoinPlan` consumer plus the executor build arm
+      were written and did generate competing paths: Q8 and Q17's plans changed,
+      Nested Loop 13 -> 15, Hash Join 36 -> 34. But the queries CRASHED the
+      backend:
+
+      ```
+      panic: runtime error: index out of range [7] with length 0
+        executor.(*MaterializedSlot).Get            slot.go:87
+        executor.(*VirtualSlot).Get                 slot.go:154
+        executor.evalExprSlot                       expr.go:451
+        executor.(*nestedLoopIndexJoinOp).evalPredicateSlot  operators_nljoin.go:316
+        executor.(*nestedLoopIndexJoinOp).Next      operators_nljoin.go:212
+      ```
+
+      The NLI's residual predicate reads merged column 7 while the INNER half of
+      the merged slot has length 0 — the bitmap heap scan's row is not composing
+      into `NestedLoopIndexJoin`'s `VirtualSlot` the way an index scan's does.
+      Bitmap paths never actually WON on cost either (Bitmap Heap Scan stayed 0);
+      they only perturbed the DP enough to change two plans.
+
+      So the next attempt should start at the JOIN driver, not the planner:
+      `nestedLoopIndexJoinOp` composes outer+inner through a persistent
+      VirtualSlot (`outerMS`), and whatever it assumes about the inner's slot
+      lifetime holds for `indexScanOp` and not for `bitmapHeapScanOp`. Fix that
+      first, with a unit test driving a bitmap inner directly, and only then
+      re-add the producer.
 - [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`).
       `matchBitmapIndexQuals` (pathbitmap.go:234) matches only `col = const` via
       `normalizeColumnConst`; a parameterised sibling would mirror
