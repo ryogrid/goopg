@@ -106,13 +106,17 @@ undo it; nothing else depends on it.
 - [x] Two more hypotheses tested and refuted: a missing `*NestedLoopIndexJoin`
       walk arm (adding it leaves Q2 at 83.6 s), and the sublink sitting in
       `Join.Predicate` (instrumenting both arms produced no hits)
-- [x] Established: Q2's post-search walk NEVER RUNS (`preDPUnnested=true`), and
-      that is IDENTICAL with and without the `loop_count` arm while the plan is
-      not (0 SubPlans vs 2). So the earlier "UNNEST ACCEPTED" instrumentation
-      was reporting the PRE-DP path, not the walk
-- [ ] **Locus, not yet mechanism**: inside `predp.go`, whose own `tryJoinSearch`
-      (predp.go:127) is the search the `loop_count` arm changes. Do not assert a
-      mechanism again until it is demonstrated
+- [x] Established: the `preDPUnnested` gate prints identically with and without
+      the arm while the plan differs (0 SubPlans vs 2) — so the differing factor
+      is not which unnest path ran
+- [x] Withdrew a second wrong claim: attributing the `preDPUnnested=true` line
+      to Q2's outer level was inferred from print order, and
+      `whereEligibleForPreDPUnnest` says the opposite (it returns false when a
+      SubqueryExpr is in the WHERE, which Q2's is). Unreconciled with the
+      separate finding that the walk's Filter/Join arms see no sublink
+- [ ] **Next probe**: print the SELECT level identity alongside `preDPUnnested`
+      instead of inferring it from print order — the mistake this line of
+      investigation made twice. Do not assert a mechanism until demonstrated
 - [ ] Then: charge a SubPlan's evaluation cost over the row count it will be
       evaluated over (PG `cost_qual_eval`), `subplan_cost.go`
 - [ ] Then re-run BOTH the byte gate and a timing pass and confirm Q2 is back

@@ -558,24 +558,41 @@ Two further hypotheses were tested and are also wrong:
   Also false — instrumenting both the `*Filter` and `*Join` arms produced NO
   hits at all.
 
-**What the evidence actually shows.** The post-search walk never runs for Q2:
+**What the evidence actually shows — and what it does not.** Instrumenting the
+`preDPUnnested` gate (planner.go:1236) during an `EXPLAIN` of Q2 prints two
+lines, one per SELECT level:
 
 ```
-POSTDP: preDPUnnested=true (walk SKIPPED)     <- Q2's top level
-POSTDP: preDPUnnested=false (walk runs)       <- the subquery's own level
+POSTDP: preDPUnnested=true (walk SKIPPED)
+POSTDP: preDPUnnested=false (walk runs)
 ```
 
-and — this is the decisive part — **that is identical with and without the
-`loop_count` arm**, while the plan is not: 0 SubPlans without it, 2 with it. So
-the earlier "UNNEST ACCEPTED / no bail" instrumentation was reporting the
-**pre-DP** unnest path (`predp.go`), not the post-search walk, which is why it
-looked like a successful rewrite being thrown away.
+and — this part IS decisive — **those two lines are identical with and without
+the `loop_count` arm**, while the plan is not: 0 SubPlans without it, 2 with it.
+So whatever differs, it is not which unnest path ran.
 
-The locus is therefore inside the pre-DP path, whose own `tryJoinSearch`
-(`predp.go:127`) is the search whose behaviour the `loop_count` arm changes.
-Beyond that the mechanism is **not established**, and this section should not
-claim one again until it is. The three refuted hypotheses are recorded so the
-next attempt does not re-run them.
+**A first draft of this paragraph attributed the `true` line to Q2's outer
+level. That attribution is unsupported and probably wrong**, because
+`whereEligibleForPreDPUnnest` (predp.go) returns false the moment a
+`SubqueryExpr` appears anywhere in the WHERE, and Q2's scalar sublink is exactly
+that — so Q2's outer level should be the `false` line, i.e. the walk SHOULD run.
+Which contradicts the separate observation that instrumenting the walk's
+`*Filter` and `*Join` arms produced no hits at all. Those two facts are not yet
+reconciled.
+
+The mechanism is therefore **not established**, and no replacement is asserted
+here. What is established, and is worth the next attempt's time:
+
+1. the search runs before the post-search unnester (planner.go:1206 vs :1237),
+   so no "discarded rewrite" story applies;
+2. adding the missing `*NestedLoopIndexJoin` walk arm does not fix Q2 (83.6 s);
+3. the sublink is not reachable in either the `*Filter` or the `*Join` arm of
+   the walk, per instrumentation;
+4. the `preDPUnnested` decision is unchanged by the `loop_count` arm.
+
+The obvious next probe is to print the level identity alongside `preDPUnnested`
+rather than inferring it from print order, which is the mistake this section
+made twice.
 
 ### 9.4 Decision — LANDED (`07f4f7814`), regression and all
 
