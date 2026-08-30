@@ -140,6 +140,20 @@ overlap. That row was the same gap as "Nested Loop 1 vs 25" counted twice.
 > total. Only PG was *not* re-swept after ANALYZE (it was already analysed), so
 > "the fair comparison" is half re-captured.
 
+**The census set is NOT the gate set.** Two different sets appear in this
+document with confusingly similar counts, so, explicitly:
+
+| | queries | what it is |
+|---|---|---|
+| census (§3, above) | ~20-21 per side, and the two sides differ | the plan-shape comparison against PG, captured before this work |
+| **gate (§9 and every landed commit)** | **21: Q1-Q22 minus Q15** | the byte-for-byte result comparison every change had to pass |
+
+The gate excludes Q15 alone, and for a mechanical reason rather than a
+convenient one: Q15 is not a single runnable statement in this query set — it
+ships as `q15_create` / `q15_viewbody` / `q15_main` fragments that create and
+drop a view around the query, so a one-file-per-query sweep has nothing to run.
+Q6 IS in the gate set (it is missing only from the older census capture).
+
 Per query:
 
 | query | goopg | PostgreSQL | gap |
