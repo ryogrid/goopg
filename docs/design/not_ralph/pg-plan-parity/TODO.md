@@ -286,7 +286,34 @@ experiment (DESIGN §4-A):
       so those closed 96% of the gap; what is left is a 1.53x overcost on the
       bitmap, and if goopg's bitmap were at PG's 43.46 it would beat the 54.73
       probe and win
-- [ ] **The remaining gap is calibration, not structure.** Startup 14.35 vs PG's
+- [x] **A FOURTH cost bug found, verified, and NOT landed** — because landing it
+      breaks 9 queries. `costBitmapHeapScan` returned
+      `startup + runCost + indexCost.Total` where `startup` IS
+      `indexCost.Total`, so the index cost was counted TWICE. PG counts it once
+      (`startup_cost += indexTotalCost`, then
+      `total_cost = startup_cost + run_cost`). goopg's comment asserted PG "adds
+      indexTotalCost again into total", a misreading that made the double count
+      look oracle-backed — which is why it survived.
+
+      Removing it does exactly what the arithmetic predicted: the `supplier`
+      bitmap drops 66.42 -> 52.07, beats the 54.73 index probe, and **Bitmap
+      Heap Scan jumps 1 -> 27 across 15 queries**. That is far past PG's 6, and
+      9 of those queries then FAIL:
+
+      ```
+      ERROR: BitmapHeapScan outer is not a bitmap producer
+      ```
+
+      So the parameterised-bitmap construction is broken for shapes that only
+      became reachable once bitmaps started winning; Q17 worked by luck. The
+      cost fix is correct and is held back only by that
+- [ ] **Do this first, then land the double-count fix**: `createPlanNode` for a
+      parameterised `PathBitmapIndexScan` child is not producing an operator
+      that satisfies `bitmapProducer`. Note `createBitmapHeapScanPlan` does
+      `outer, _ := createPlanNode(p.Children[0])` — it DISCARDS the error, so a
+      failure there becomes a nil/!bitmapProducer `Outer` at execution instead
+      of a plan-time diagnostic. Start by not discarding it
+- [ ] **The remaining calibration question, after that.** Startup 14.35 vs PG's
       7.87 is roughly `indexProbeCostMultiplier`, which `btreeIndexAMCost`
       applies at costindex.go:189. That knob exists because goopg's index access
       materialises TIDs eagerly — which a bitmap index scan also does, so
