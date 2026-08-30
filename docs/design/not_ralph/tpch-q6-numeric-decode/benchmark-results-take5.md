@@ -312,6 +312,12 @@ left alone per `CLAUDE.md`.
 
 ---
 
+> **Superseded in part (2026-08-30):** the `PageGetHeapTuple`/`ParseHeapTuple`
+> allocations below were removed in
+> [benchmark-results-take6.md](benchmark-results-take6.md) — allocations/query
+> 18.8 M → 0.80 M, Q6 parallel 1.21 s → 1.03 s. `evalExprSlot` is unchanged and
+> is re-characterised there (31.88 % is cum; flat is 14.19 %).
+
 ## 6. What is left
 
 | item | measured | note |
