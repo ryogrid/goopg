@@ -3,10 +3,15 @@
 Companion to [DESIGN.md](DESIGN.md). Status is the truth of the tree, not an
 aspiration.
 
-**Item 0 is LANDED and gated** (`9db8a0970`). A, B and C are not started, and
-each is now blocked on a specific, identified piece of missing infrastructure —
-recorded below so the next pass starts from the blocker rather than re-deriving
-it.
+**Landed and gated:** item 0 (`9db8a0970`), items 1 and 2 (`80a5e334d`).
+**Implemented, measured, rejected:** item 3, the `loop_count` arm — DESIGN §9.
+A and B remain blocked on missing infrastructure, recorded below so the next
+pass starts from the blocker rather than re-deriving it.
+
+**Gate requirement, learned the hard way (DESIGN §9.4): a row-count gate is not
+sufficient for a plan-shape change.** Item 3 kept all 21 result sets
+byte-identical and passed every unit test while making Q2 43x slower. Time the
+queries whose plans changed, every time.
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
@@ -54,6 +59,47 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [x] Two tests updated: the one that pinned the old constant as "the blast
       radius" (that guard was the defect), and a pass-through test that
       hardcoded 1 while its comment said not to
+
+### 1 — parameterised paths over FILTERED relations — **DONE** (`80a5e334d`)
+
+- [x] `addParameterizedIndexPaths` declined every relation with local quals
+      (`scanLeafIsBare`), because `NestedLoopIndexJoin.Inner` is `*IndexScan`
+      and cannot carry the `*Filter` wrappers
+- [x] Gave `IndexScan` a residual `Cond` — PG's `Filter:` beside `Index Cond:`
+      on one node — and absorbed the quals into the probe
+- [x] Absorbed, not hoisted: evaluated once per index match (the costed
+      semantics), not once per probed pair (the D6.3b Q9 blowup)
+- [x] Non-`LeafLocal` wrappers still declined: `Cond` runs in the scan's own
+      coordinates, and a merged-row predicate would read the wrong columns
+- [x] `Cond` walked by `subplan_lower_walk` alongside the probe keys
+- [x] Gate: 21/21 result sets byte-identical, spotcheck PASS, units, `-race`
+
+### 2 — `get_variable_numdistinct`'s relative form — **DONE** (`80a5e334d`)
+
+- [x] `varEqNonConstSelectivity` read only `ColumnStats.NDistinct` (absolute),
+      so a column carrying only `NDistinctFrac` was treated as UNANALYSED
+- [x] That is the normal state of a restarted server (the absolute count needs
+      a row count that is not restored, ledger pq-P6)
+- [x] TPC-H `lineitem.l_orderkey`: 1.2 M distinct values read as 200
+- [x] Implemented PG's full `get_variable_numdistinct`, including the
+      asymmetric no-data branches
+- [x] Measured: Q3's parameterised inner 30,006 rows -> 4.9; Q4/Q21 index scans
+      30,006 -> 4 (actual ~4 lineitems per order)
+
+### 3 — `cost_index`'s `loop_count` arm — **REJECTED**, see DESIGN §9
+
+- [x] Implemented faithfully (`index_pages_fetched` over `tuples * loop_count`,
+      pro-rated; `get_loop_count` = smallest outer row count)
+- [x] Measured: Q3's inner probe cost 23.9 -> 4.9 (PG: 4.01); census moved
+      Nested Loop 5 -> 13, Index Scan 16 -> 24 (PG: 24), Hash Join 44 -> 35;
+      all 21 result sets byte-identical
+- [x] **Q2 2.0 s -> 87.3 s** — goopg evaluates SubPlan 1 as a Filter above a
+      160,000-row join where PG evaluates it inside the Hash Cond over 670
+      `part` rows
+- [ ] Prerequisite before re-applying: charge a SubPlan's evaluation cost over
+      the row count it will be evaluated over (PG `cost_qual_eval`),
+      `subplan_cost.go`
+- [ ] Then re-apply the arm and re-run BOTH the byte gate and a timing pass
 
 ### A — Index Only Scan (Q13, Q16, Q22) — BLOCKED on attribute-usage analysis
 

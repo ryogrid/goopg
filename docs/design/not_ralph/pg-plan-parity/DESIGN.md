@@ -1,8 +1,8 @@
 # PG plan parity — what is actually missing
 
-**Status:** **item 0 landed and gated (`9db8a0970`); gaps A/B/C not started**,
-each blocked on a specific missing piece of infrastructure identified at source
-level. §7 says what and why.
+**Status:** three fixes landed and gated (`9db8a0970`, `80a5e334d`); a fourth
+(`cost_index`'s `loop_count` arm) was implemented, measured, and **rejected** —
+§9. Gaps A and B remain blocked on missing infrastructure. §7 says what and why.
 **Date:** 2026-08-30 (rewritten after adversarial review; §8)
 **Branch:** `perf-opt-take6`
 **Baseline:** `edfca5d43`
@@ -333,3 +333,94 @@ ten PG oracle references; §2's PG column; both censuses arithmetically; §2.1's
 Q12 before/after; the Q22/Q13 spot-checks; that the "statistics are
 per-connection" memory note is genuinely stale; and that §5's constraint is
 sound — both real gaps land in path generation, its first permitted category.
+
+
+## 9. The `loop_count` arm: implemented, measured, rejected
+
+This is recorded in full because the result is counter-intuitive and the code is
+worth resurrecting once §9.3 is fixed — not because it was a dead end.
+
+### 9.1 What it was
+
+`cost_index` (costindex.go) reproduced only PG's `loop_count == 1` arm.
+Parameterised paths were priced by a separate flat-probe function that charged a
+full `random_page_cost` per fetched row **on every rescan** — a repeated inner
+scan costed as if nothing were ever cached. PG spends its entire `loop_count > 1`
+arm (costsize.c:598-640) amortising exactly that: it runs Mackert-Lohman over
+the tuples ALL the scans fetch and pro-rates back to one scan, so the total
+grows sublinearly in the loop count. The loop count itself is `get_loop_count`
+(indxpath.c:3266) — the SMALLEST row count among the relations supplying the
+parameter, not the product.
+
+Implementing it removed the second cost model 04 §1 forbids, which was a
+structural improvement independent of the numbers.
+
+### 9.2 What it did — the numbers are not the problem
+
+TPC-H Q3's inner probe of `lineitem`, across the three fixes in order:
+
+| | inner rows | inner cost | NLI path cost |
+|---|---:|---:|---:|
+| before anything | 30,006 | 120,479 | 36,233,884,802 |
+| after the numdistinct fix (`80a5e334d`) | 4.9 | 23.9 | 7,284,735 |
+| after the `loop_count` arm | 4.9 | **4.9** | 1,603,379 |
+
+PG's own figure for that probe is `cost=0.43..4.01`. The amortised arm lands on
+it. Across the 22 queries the census moved decisively toward PG's shapes, and
+**all 21 result sets stayed byte-identical**:
+
+| node | before | after | PG |
+|---|---:|---:|---:|
+| Nested Loop | 5 | **13** | 25 |
+| Index Scan | 16 | **24** | 24 |
+| Hash Join | 44 | **35** | 26 |
+| Seq Scan | 68 | 60 | |
+
+Q11 got 4.5x faster (0.9 s -> 0.2 s) and picked up PG's exact inner probe,
+`Index Cond: (ps_suppkey = s_suppkey)`.
+
+### 9.3 Why it was rejected anyway
+
+**Q2 went 2.0 s -> 87.3 s.** Not a costing artefact — the plan it switched to is
+close to PG's own. PG's Q2 is `Nested Loop -> Nested Loop -> Hash Join(nation,
+region)` with `Index Scan using partsupp_supplier_fkidx` on
+`ps_suppkey = supplier.s_suppkey`, and goopg now produces that shape. The
+difference that costs 43x is **where SubPlan 1 is evaluated**:
+
+```
+PG:     Hash Cond: ((part.p_partkey = partsupp.ps_partkey)
+                    AND ((SubPlan 1) = partsupp.ps_supplycost))
+        ... over Gather -> Parallel Seq Scan on part (rows=670)
+
+goopg:  Hash Join
+          Filter: (partsupp.ps_supplycost = (SubPlan 1))
+        ... over a 160,000-row join output
+```
+
+PG evaluates the correlated subplan ~670 times, as part of the hash condition on
+the small side. goopg evaluates it as a filter above the large join — on the
+order of 160,000 times. Before this change goopg avoided the question entirely by
+de-correlating the subquery into a `HashAggregate`; making the parameterised
+inner cheap is what made the correlated form win the comparison.
+
+So the defect the change EXPOSED is real and is not in `cost_index`: goopg does
+not charge a SubPlan's evaluation cost against the number of rows it will be
+evaluated over (PG does, in `cost_qual_eval`). Until it does, making
+parameterised inners cheaper will keep pulling plans toward correlated
+subplans that goopg then executes badly.
+
+### 9.4 Decision
+
+Reverted. Shipping a 43x regression on a benchmark query to gain plan-shape
+parity on the others is the wrong trade to make silently, and the fix is not a
+tweak to the arm — it is subplan cost placement, a separate piece of work.
+
+The resurrection order is: (1) charge SubPlan evaluation over its row count in
+`subplan_cost.go`, re-check that Q2 keeps its de-correlated plan or gets PG's
+placement; (2) re-apply the `loop_count` arm; (3) re-run the 21-query byte gate
+AND a timing pass — the byte gate alone would have passed this change.
+
+**That last point is the transferable lesson.** All 21 result sets were
+byte-identical and every unit test passed. A row-count gate cannot see a 43x
+regression; only timing the changed queries caught it. Any future plan-shape
+change needs both.
