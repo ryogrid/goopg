@@ -1280,6 +1280,28 @@ func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byt
 // decode sites — catalog reload, VACUUM, ANALYZE, DDL rescans — which have no
 // GUCs to read and must not acquire a dependency on any. M0119-0006.
 func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mmgr.Context, st array.OutputStyle) error {
+	_, err := DecodeRowRangeIntoMctxPGTupleStyled(dst, cols, data, bitmap, storedNatts, sctx, st, 0, len(cols), 0)
+	return err
+}
+
+// DecodeRowRangeIntoMctxPGTupleStyled decodes columns [from, to) of a tuple,
+// resuming at byte offset `off`, and returns the offset reached. Decoding the
+// whole row is the `from=0, to=len(cols), off=0` case, which is what
+// DecodeRowIntoMctxPGTupleStyled asks for.
+//
+// The range form exists so a scan can deform only the columns its own
+// predicate reads, test that predicate, and pay for the remaining columns only
+// on the rows that survive — PostgreSQL's slot_getsomeattrs discipline
+// (postgres/src/backend/executor/execTuples.c). A physical tuple has no column
+// offset array, so a suffix can be skipped but a prefix cannot; the returned
+// offset is what makes resumption exact, and it must be threaded back
+// unchanged or the second half decodes garbage.
+//
+// Callers that stop early MUST NOT let the partially-filled row escape:
+// entries at or past `to` still hold whatever the previous tuple left there.
+// See seqScanOp.Next, which keeps the partial row strictly inside its own
+// prefilter (docs/design/not_ralph/tpch-q6-numeric-decode/).
+func DecodeRowRangeIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mmgr.Context, st array.OutputStyle, from, to, off int) (int, error) {
 	// PG-physical decode with null-bitmap and natts awareness. M0111-0002 S3:
 	// the goopg legacy format has been removed, so there is a single on-disk
 	// format. A PG-physical tuple always records natts; storedNatts==0 means a
@@ -1289,8 +1311,11 @@ func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap
 	if storedNatts == 0 {
 		storedNatts = n
 	}
-	off := 0
-	for i, c := range cols {
+	if to > n {
+		to = n
+	}
+	for i := from; i < to; i++ {
+		c := cols[i]
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
 		// M0097-0077: when the column has a precomputed MissingValue Datum
 		// (set by ALTER TABLE ADD COLUMN … DEFAULT <const>), surface it
@@ -1317,12 +1342,12 @@ func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap
 		}
 		v, consumed, err := decodePhysicalPGValueMctxStyled(c.Type, data[off:], sctx, st)
 		if err != nil {
-			return fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
+			return off, fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
 		}
 		dst[i] = v
 		off += consumed
 	}
-	return nil
+	return off, nil
 }
 
 // DecodeHeapTupleRowInto fills dst from a heap tuple, selecting the row format

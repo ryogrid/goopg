@@ -268,7 +268,22 @@ func parseNumericFastScale(text string, expectedScale int16) (int64, int16, bool
 		intPart = s
 	}
 	digits := intPart + fracPart
-	if len(digits) == 0 || len(digits) > 18 {
+	if len(digits) == 0 {
+		return 0, 0, false
+	}
+	// Leading zeros carry no magnitude, so they must not count against the
+	// 18-digit int64 budget. Without this, `0.060000000000000005` — which
+	// PostgreSQL produces by constant-folding `0.05 + 0.01`, and which TPC-H
+	// Q6 therefore evaluates once per scanned row — spells 19 digit
+	// characters, fails the cap, and falls into math/big for a mantissa
+	// (60000000000000005) that fits int64 with three orders of magnitude to
+	// spare.
+	lead := 0
+	for lead < len(digits)-1 && digits[lead] == '0' {
+		lead++
+	}
+	digits = digits[lead:]
+	if len(digits) > 18 {
 		return 0, 0, false
 	}
 	// Parse digits as int64.

@@ -190,6 +190,21 @@ func needsDetoast(row Row) bool {
 	return false
 }
 
+// needsDetoastPrefix is needsDetoast over row[0:n], for callers holding a
+// partially-deformed row whose tail is stale (seqScanOp's prefilter path).
+// Scanning the whole row there would test the previous tuple's columns.
+func needsDetoastPrefix(row Row, n int) bool {
+	if n > len(row) {
+		n = len(row)
+	}
+	for i := 0; i < n; i++ {
+		if row[i].Kind == KindToastPointer {
+			return true
+		}
+	}
+	return false
+}
+
 // ToastLargeColumnsIfNeeded scans row for columns whose encoded length
 // exceeds ToastThreshold and stores them in the TOAST relation, replacing
 // the oversized datum with a KindToastPointer datum.

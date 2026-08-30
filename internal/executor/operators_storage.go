@@ -1029,6 +1029,15 @@ type seqScanOp struct {
 	// page-level GiST predicate locking (predicate-gist spec). nil for every
 	// non-gist scan (the common case) — pure no-op.
 	ssiGistPred optimizer.Expr
+
+	// prefilter is the same Filter predicate, reused to reject tuples before
+	// they are fully deformed and deep-copied. Set only when planScanPrefilter
+	// proves the expression safe to evaluate twice, and disarmed in Open when
+	// any of the post-decode row rewrites are live (they would make the
+	// prefilter see different values than filterOp does). See scan_prefilter.go
+	// and docs/design/not_ralph/tpch-q6-numeric-decode/.
+	prefilter    scanPrefilter
+	prefilterSet bool
 	// gistSSIIdxOID / gistSSIColIdx are resolved in Open from ssiGistPred + the
 	// table's GiST index: the index OID used as the predicate-lock relation and
 	// the position of the indexed point column in cols. gistSSIIdxOID==0 disables
@@ -1350,6 +1359,19 @@ func (o *seqScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
 	return DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx)
 }
 
+// decodeScanRowRange is decodeScanRow over a column window, returning the byte
+// offset reached so the caller can resume. Used by the prefilter path in Next
+// to deform only the predicate's columns first; see scan_prefilter.go.
+func (o *seqScanOp) decodeScanRowRange(data, bitmap []byte, storedNatts, from, to, off int) (int, error) {
+	// Mirror decodeScanRow's two arms exactly: the unstyled entry point is
+	// DefaultOutputStyle(), not a zero OutputStyle.
+	st := o.arrayStyle
+	if !o.arrayStyleLive {
+		st = array.DefaultOutputStyle()
+	}
+	return DecodeRowRangeIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx, st, from, to, off)
+}
+
 func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
 	if o.gistScratch == nil || len(o.gistScratch) != len(o.cols) {
 		o.gistScratch = make(Row, len(o.cols))
@@ -1525,6 +1547,31 @@ func (o *seqScanOp) Open(ctx *Context) error {
 				o.ginSearchKeys = keys
 				ssiRecordGinKeyRead(ctx, o.rel.DBOid, oid, keys, fu)
 			}
+		}
+	}
+	// Disarm the prefilter whenever a post-decode rewrite is live. Each of
+	// these mutates the row AFTER cloneRowOwned, so the prefilter would judge
+	// a tuple on values that differ from the ones filterOp above eventually
+	// sees — and the GiST/GIN hooks additionally do per-tuple SSI bookkeeping
+	// that a skipped row must not miss. All are rare; the common scan keeps
+	// the fast path. (The relation-level SIREAD below and the per-tuple heap
+	// SIREAD in Next both run BEFORE the prefilter, so predicate locks are
+	// taken on every tuple scanned regardless of whether it survives — which
+	// is also what PostgreSQL does.)
+	if o.prefilterSet {
+		// NB: o.enumTypes is allocated for EVERY scan (one slot per column,
+		// nil where the column is not an enum), so testing the slice for nil
+		// disarms unconditionally. Only an actual enum column matters.
+		hasEnum := false
+		for _, et := range o.enumTypes {
+			if et != nil {
+				hasEnum = true
+				break
+			}
+		}
+		if o.gistSSIIdxOID != 0 || o.ginSSIIdxOID != 0 ||
+			hasEnum || o.typeACLColIdx >= 0 || o.attrACLColIdx >= 0 {
+			o.prefilterSet = false
 		}
 	}
 	// M0118-0001: a SERIALIZABLE seq scan takes a relation-level SIREAD
@@ -1985,7 +2032,45 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// the schema. HeapNattsMask = 0x07FF; storedNatts==0 means natts
 			// was not explicitly set (legacy goopg rows without PG format).
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-			if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
+			if o.prefilterSet {
+				// Two-phase deform, PG's slot_getsomeattrs discipline: decode
+				// only the columns the predicate reads, test it, and pay for
+				// the remaining columns (and the deep copy below) only on the
+				// tuples that survive. On TPC-H Q6 that is 6 of 16 columns and
+				// ~2 % of rows.
+				//
+				// The partial row is handed to NOTHING but the predicate —
+				// entries at/past MaxCols still hold the previous tuple's
+				// values — so it must not escape this block.
+				off, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, 0, o.prefilter.MaxCols, 0)
+				if derr != nil {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
+				// A toasted value in the prefix would be judged un-detoasted,
+				// which could differ from what filterOp sees. Rare (the
+				// predicate columns are usually fixed-width); when it happens,
+				// finish the row and let filterOp decide alone.
+				if !needsDetoastPrefix(o.scanRow, o.prefilter.MaxCols) {
+					keep, perr := o.evalPrefilter()
+					if perr == nil && !keep {
+						if o.pinned != nil {
+							o.pinned.RUnlock()
+						}
+						continue
+					}
+					// perr != nil: fall through and let filterOp raise it, so
+					// the error surfaces from exactly where it did before.
+				}
+				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, o.prefilter.MaxCols, len(o.cols), off); derr != nil {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
+			} else if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
