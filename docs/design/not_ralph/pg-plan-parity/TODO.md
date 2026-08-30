@@ -464,6 +464,21 @@ experiment (DESIGN §4-A):
       changes were reverted; the branch keeps the double charge and its
       matching-6 census. Look for a term of the same ORDER as `indexTotalCost`,
       not for more per-tuple CPU
+- [x] Two more candidates ELIMINATED by reading, not guessing:
+  - [x] "goopg does not charge the bitmap inner's STARTUP per rescan, and a
+        bitmap's cost is startup-dominated" — refuted: `nestloopCost`
+        (cost_funcs.go:384) charges `outerRows * innerRescanTotal`, and that
+        total includes startup
+  - [x] `qpqual_cost.per_tuple` (§13.4) — real but numerically negligible
+- [x] Measured PG directly on the one mismatched query. PG's Q8 uses a
+      PARAMETERISED `Index Scan using lineitem_part_supp_fkidx on lineitem`
+      (`cost=0.43..N`) exactly where goopg picks a bitmap. So the divergence is
+      a bitmap-vs-parameterised-index-probe comparison inside a nested loop, on
+      one specific index — which is the narrowest form the question has taken
+- [ ] **Next**: print both candidate paths' Cost{Startup,Total} for `lineitem`
+      under Q8's parameterisation and compare against PG's `0.43..N`. Both
+      numbers, not one — every previous round guessed at a single term and was
+      wrong four times
 - [ ] ~~Land the two together, never separately~~ — each alone makes the census
       worse — and gate on the census SHAPE rather than its count: goopg should
       end at PG's 6 scans AND on PG's five queries, where today it has 6 scans
