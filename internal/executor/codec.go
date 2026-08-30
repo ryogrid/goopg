@@ -1302,6 +1302,15 @@ func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap
 // See seqScanOp.Next, which keeps the partial row strictly inside its own
 // prefilter (docs/design/not_ralph/tpch-q6-numeric-decode/).
 func DecodeRowRangeIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mmgr.Context, st array.OutputStyle, from, to, off int) (int, error) {
+	return decodeRowRangeInfo(dst, cols, nil, data, bitmap, storedNatts, sctx, st, from, to, off)
+}
+
+// decodeRowRangeInfo is DecodeRowRangeIntoMctxPGTupleStyled with an optional
+// pre-resolved per-column type descriptor (resolveColTypeInfo). Pass nil and it
+// resolves each column's type name per value exactly as before; pass a slice
+// resolved once in the operator's Open and the per-value string work
+// disappears. See colTypeInfo.
+func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data, bitmap []byte, storedNatts int, sctx *mmgr.Context, st array.OutputStyle, from, to, off int) (int, error) {
 	// PG-physical decode with null-bitmap and natts awareness. M0111-0002 S3:
 	// the goopg legacy format has been removed, so there is a single on-disk
 	// format. A PG-physical tuple always records natts; storedNatts==0 means a
@@ -1334,13 +1343,23 @@ func DecodeRowRangeIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, b
 			dst[i] = NullDatum
 			continue
 		}
-		off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
+		var (
+			align int
+			tname string
+		)
+		if info != nil {
+			align, tname = info[i].align, info[i].lower
+		} else {
+			tname = strings.ToLower(c.Type.Name)
+			align = physicalPGTypeAlignLowered(c.Type, tname)
+		}
+		off = alignPhysicalPGOffset(off, align)
 		if off >= len(data) {
 			// Data exhausted — treat remaining columns as NULL.
 			dst[i] = NullDatum
 			continue
 		}
-		v, consumed, err := decodePhysicalPGValueMctxStyled(c.Type, data[off:], sctx, st)
+		v, consumed, err := decodePhysicalPGValueLowered(c.Type, tname, data[off:], sctx, st)
 		if err != nil {
 			return off, fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
 		}
@@ -1409,12 +1428,18 @@ func alignPhysicalPGOffset(off, align int) int {
 }
 
 func physicalPGTypeAlign(t catalog.Type) int {
+	return physicalPGTypeAlignLowered(t, strings.ToLower(t.Name))
+}
+
+// physicalPGTypeAlignLowered is physicalPGTypeAlign with the lowercased type
+// name supplied. See decodePhysicalPGValueLowered for why.
+func physicalPGTypeAlignLowered(t catalog.Type, tname string) int {
 	// All array columns store a varlena ArrayType blob → PG 'i' (4-byte) align.
 	// M0118-0002.
 	if t.IsArray {
 		return 4
 	}
-	switch strings.ToLower(t.Name) {
+	switch tname {
 	case "bool", "boolean":
 		return 1
 	case "char":
@@ -1549,10 +1574,29 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mmgr.Con
 	// M0118-0002. The session DateStyle/TimeZone rides along because goopg
 	// renders the element text here, where upstream's array_out would render it
 	// at output time (M0119-0006).
+	return decodePhysicalPGValueLowered(t, strings.ToLower(t.Name), data, sctx, st)
+}
+
+// decodePhysicalPGValueLowered is decodePhysicalPGValueMctxStyled with the
+// lowercased type name supplied by the caller.
+//
+// The type of a column does not change between the rows of one scan, but this
+// switch used to recompute strings.ToLower(t.Name) for EVERY VALUE of every
+// row — as did physicalPGTypeAlign and isTimestampTZTypeName, giving three
+// scans of the same string per value. Together they measured 4.64 % of TPC-H
+// Q14's CPU and 6.13 % of Q3's.
+//
+// PostgreSQL has no string on this path at all: heap_deform_tuple reads
+// attlen / attbyval / attalignby out of the TupleDesc, resolved once when the
+// relation is opened (postgres/src/backend/access/common/heaptuple.c).
+// resolveColTypeInfo is goopg's equivalent, and callers that hold a column list
+// should resolve once and pass it down.
+// (docs/design/not_ralph/perf-optimize-take6/README.md candidate A.)
+func decodePhysicalPGValueLowered(t catalog.Type, tname string, data []byte, sctx *mmgr.Context, st array.OutputStyle) (Datum, int, error) {
 	if t.IsArray {
 		return decodeArrayValuePGStyled(t, data, st)
 	}
-	switch strings.ToLower(t.Name) {
+	switch tname {
 	case "bool", "boolean":
 		if len(data) < 1 {
 			return Datum{}, 0, fmt.Errorf("truncated bool")
@@ -1644,7 +1688,13 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mmgr.Con
 		// string concat). The wire path re-derives the type from the column and
 		// is unaffected either way.
 		ts := time.UnixMicro(micros + pgEpochUnixMicros).UTC()
-		if isTimestampTZTypeName(t.Name) {
+		// tname, not isTimestampTZTypeName(t.Name): this arm is only reached
+		// via `case "timestamp", "timestamptz"`, so tname is already exactly
+		// one of those two literals and the general predicate — which
+		// TrimSpaces and ToLowers the raw name on every value — can only
+		// return the same answer. Removing it is the last of the three
+		// per-value string scans colTypeInfo exists to eliminate.
+		if tname == "timestamptz" {
 			return NewTimestampTZDatum(ts), 8, nil
 		}
 		return NewTimeDatum(ts), 8, nil
