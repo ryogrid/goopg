@@ -1,84 +1,98 @@
 # PG plan parity — TODO
 
-Companion to [DESIGN.md](DESIGN.md). One line per item; status is the truth of
-the tree, not an aspiration.
+Companion to [DESIGN.md](DESIGN.md). Status is the truth of the tree, not an
+aspiration.
 
-**Nothing in the three implementation sections below has been done.** The survey
-is complete and gap A is root-caused; no planner code has changed. See
-DESIGN.md §8.
+**No planner code has been changed.** The survey is complete and the three gaps
+are diagnosed (three of them re-diagnosed after review — see DESIGN §8).
+Everything under "Implementation" is unstarted.
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
 ---
 
-## Survey
+## Survey — done
 
-- [x] Establish which access methods exist in the executor (all of them do)
-- [x] Establish which paths the planner generates (index, index-only, bitmap — all)
-- [x] Confirm `addBaseRelBitmapPaths` is reachable from `addBaseRelIndexPaths`
-- [x] Measure goopg vs PG statistics state (`reltuples`, `relpages`, `pg_stats`, `relallvisible`)
-- [x] Confirm what `reltuples=0` actually costs the planner: NOT relation size
-      (`GOOPG_RELSIZE_FALLBACK` supplies it, default on) but SELECTIVITY
-- [x] Confirm `ANALYZE` works, and that it persists across sessions **and** restarts
-- [x] Confirm `VACUUM` populates `relallvisible`
-- [x] Re-run the plan comparison with both engines VACUUMed + ANALYZEd (the fair one)
-- [x] Produce the per-query gap table (DESIGN §3)
+- [x] Confirm every access method exists in the executor
+- [x] Confirm the planner generates index, index-only and bitmap paths (5 IOS sites)
+- [x] Confirm `addBaseRelBitmapPaths` is reachable and `GOOPG_PGSHAPED_DP` is on
+- [x] Confirm goopg **does** emit `Index Only Scan` (`SELECT o_orderkey FROM orders WHERE o_orderkey = 5`)
+- [x] Measure both clusters' statistics state
+- [x] Establish what `reltuples = 0` actually costs — **not** relation size
+      (`GOOPG_RELSIZE_FALLBACK` reads the live smgr block count) and **not**
+      the ability to pick an index (PG uses default selectivities); it changes
+      which plans win
+- [x] Confirm `ANALYZE` persists across sessions and restart (durable sidecar)
+- [x] Confirm **VACUUM's relstats do NOT persist** — in-memory only
+- [x] Re-sweep goopg plans after VACUUM + ANALYZE
+- [x] Census by node type, split by parameterisation (this is what killed the
+      "Index Scan parity" reading)
+- [x] Per-query gap table
+- [x] Root-cause A: a top-of-plan peephole (`planner.go:1691-1704`) that cannot
+      reach scans inside join trees
+- [x] Root-cause B: `RequiredOuter` hardcoded 0; `matchBitmapIndexQuals` matches
+      only `col = const`; `indexScanRows` returns a hardcoded 1 for any keyed
+      index scan
+- [x] Confirm parameterised inner index paths are generated (`pathparamindex.go:220`)
+- [ ] Re-sweep **PG** after the goopg re-sweep so both halves of the "fair"
+      comparison come from one capture, on one query set (see DESIGN §3 caveat)
 
-## A — Index Only Scan (Q13, Q16, Q22)
+## Implementation — none started
 
-- [x] Find where an index-only path is (or is not) proposed for a covering index
-      → it is NOT: `pathindexordered.go` hardcodes `index_only_scan == false`
-        with the comment "goopg's search has no visibility-map model, so
-        check_index_only's answer is always no". A generation gap, not costing.
-- [ ] Give the search rel an `allvisfrac` (= `relallvisible / relpages`), as `plancat.c` `estimate_rel_size` does
-- [ ] Port `check_index_only`'s question: are all relation columns the query needs available from the index?
-- [ ] Feed `allvisfrac` (from `relallvisible / relpages`) into the index cost, as `cost_index` does
-- [ ] Verify Q22 flips Index Scan → Index Only Scan **on cost**, with no query-specific test
-- [ ] Verify Q16 and Q13 follow
-- [ ] Row counts unchanged on all 22 queries
-- [ ] `Heap Fetches` reported in EXPLAIN matches the VM state (there is an existing `explain_heap_fetches_test.go`)
+### 0 — `indexScanRows`' hardcoded 1  ← do this first
 
-## B — Bitmap scans never win (Q2, Q11, Q20, Q21)
+- [ ] `cardinality.go:294-297` returns 1 for any keyed index scan. goopg
+      estimates 1 row where PG estimates 378 on the same predicate.
+- [ ] Replace with a selectivity-derived estimate (PG: `btcostestimate` →
+      `genericcostestimate`, and `clauselist_selectivity`)
+- [ ] This is a prerequisite for B and probably for C — it is listed first
+      because every other item is priced against it
+- [ ] **Full row-count gate**: all 22 TPC-H queries + TPC-DS SF0.5
 
-- [x] Determine whether `buildOneBitmapPath` returns nil or the path is generated and loses
-      → it IS generated and fully costed; it loses. So B is a costing/input
-        problem, not a generation gap.
-- [ ] Settle the leading hypothesis: `buildOneBitmapPath` matches only LOCAL
-      filter conjuncts, but PG's bitmap scans here are driven by JOIN quals
-      (parameterised paths). If so, B and C share one root cause.
-- [ ] If generated: compare `costBitmapHeapScan` / `computeBitmapPages` against `cost_bitmap_heap_scan` / `compute_bitmap_pages`
-- [ ] Check the inputs, not just the formula (`indexPages`, `totalTablePages`, `effectiveCacheSize`, `maxEntries`)
-- [ ] Verify at least one of Q2/Q11/Q20/Q21 flips on cost
-- [ ] Row counts unchanged on all 22 queries
+### A — Index Only Scan (Q13, Q16, Q22)
 
-## C — Nested Loop under-preferred vs Hash Join (Q3, Q19; Q12's method)
+- [ ] Move the coverage decision from the top-of-plan peephole into
+      per-relation path generation, so it can reach scans inside join trees
+- [ ] Give the search rel an `allvisfrac`; note `relsize.go:424` documents its
+      absence deliberately, so this is a new planner input, not a plumbing fix
+- [ ] `cost_index` to charge heap fetches against it
+- [ ] **Caveat**: on this cluster `relallvisible == relpages` for all eight
+      relations, so an `allvisfrac` test here cannot distinguish a correct
+      value from a hardcoded 1.0. Use a relation with partial VM coverage or
+      the acceptance test is unfalsifiable.
+- [ ] Verify Q22, Q16, Q13 flip **on cost**, no query-specific test
+- [ ] Full row-count gate
 
-- [ ] Compare `initial_cost_nestloop` / `final_cost_nestloop` against goopg's equivalent
-- [x] Check whether parameterised inner index paths are generated at all
-      → yes: `addParameterizedIndexPaths` (`pathparamindex.go`) exists and runs
-        from `addBaseRelIndexPaths`.
-- [ ] Distinguish the two remaining candidates: its eligibility guards
-      (`scanLeafFor` must yield a rebuildable leaf; the stricter NLI arm) vs the
-      join cost model preferring hash
-- [ ] Verify Q19 and Q3 flip on cost
-- [ ] **Full row-count gate on all 22 queries** — this item can move every join plan
-- [ ] Re-run `scripts/tpch-spotcheck.sh` and the TPC-DS SF0.5 regression gate
+### B — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans)
+
+- [ ] Depends on item 0
+- [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`)
+- [ ] Let join clauses contribute index quals (`matchBitmapIndexQuals`)
+- [ ] Verify at least one query flips on cost
+- [ ] Full row-count gate
+
+### C — Nested Loop vs Hash (1 vs 25)
+
+- [ ] Depends on item 0
+- [ ] Determine why the NLI arm loses 23 of 25 times: eligibility guards in
+      `addParameterizedIndexPaths` vs join costing
+- [ ] Largest blast radius — can move every join plan. Last.
+- [ ] Full row-count gate + `scripts/tpch-spotcheck.sh` + TPC-DS SF0.5
 
 ## Cross-cutting
 
-- [ ] No change may test a relation name, query shape, or benchmark identity (DESIGN §4)
+- [ ] No change may test a relation name, query shape, or benchmark identity
 - [ ] Each landed item cites the PG function it mirrors
-- [ ] `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` green
-- [ ] `scripts/tpch-spotcheck.sh` PASS (Q12 = 2, Q13 = 34)
-- [ ] `go test -race` green
-- [ ] Design doc agent-reviewed, findings recorded
+- [ ] units / `tpch-spotcheck` / `-race` green
+- [x] Design doc agent-reviewed; findings recorded (DESIGN §8)
 
-## Bench-harness follow-up (not a goopg defect, but it caused the whole confusion)
+## Bench-harness follow-up
 
+- [ ] `CLAUDE.md:34` is stale: it says `ANALYZE <table>` in db `tpch` errors
+      with a per-DB scoping gap, but `pg_stats` is populated on :65433 today.
+      Correct it, and the deferral-ledger row `bench-reorg ANALYZE-scope`.
 - [ ] Decide whether the TPC-H gate should keep running S-cold. It measures a
-      planner with no statistics, which is not what a user experiences and is
-      not what the PG side is measured under. `CLAUDE.md` records the S-cold
-      state as a consequence of HammerDB's ANALYZE step failing, not as a
-      deliberate comparison choice.
-- [ ] If it should stay S-cold, say so explicitly in the bench README so the
-      next person does not re-derive "goopg does not use indexes" from it.
+      planner with default selectivities against a PG that has real ones. If
+      that is deliberate, say so in the bench README so the next person does
+      not re-derive "goopg does not use indexes" from it — as this survey
+      initially did.
