@@ -601,13 +601,36 @@ Standing at the end of this session:
 |---|---|---|
 | 1 | the DP search discards the unnester's rewrite | **refuted** — search runs first (planner.go:1206 vs :1237) |
 | 2 | missing `*NestedLoopIndexJoin` walk arm | **refuted by measurement** — adding it leaves Q2 at 83.6 s |
-| 3 | sublink unreachable in the walk's visited arms | **open** — its refutation used an untrustworthy probe |
+| 3 | sublink unreachable in the walk's visited arms | **refuted, correctly this time** — see below |
 | 4 | Q2's post-search walk never runs | **refuted by measurement** — it runs |
 
-The next step is to re-do hypothesis 3's probe correctly: assert the insertion
-point (there are two `case *Filter:` sites in unnest.go) and print what the walk
-sees at Q2's outer level, where it is now known to run on a tree carrying
-exactly one sublink.
+Hypothesis 3's probe was then re-done with its insertion point ASSERTED — there
+are **15** `case *Filter:` sites in unnest.go, not two, and the original probe's
+`count=1` replacement had landed on the first (line 270) instead of the walk's
+(line 432). At the right site:
+
+```
+WALK Filter: sublinkInPred=false pred=*BinaryOp
+WALK Filter: sublinkInPred=true  pred=*BinaryOp     <- the walk DOES see it
+WALK Filter: sublinkInPred=false pred=*BinaryOp
+```
+
+So the walk reaches a `*Filter` whose predicate contains the sublink. Combined
+with the earlier instrumentation — `canUnnestSubquery` ACCEPTS, `unnestSubquery`
+runs with `params=1 residuals=0` and takes **none** of its four bail paths — the
+question is now as narrow as it can get without a fix:
+
+> **`unnestSubquery` is called on the right `*Filter`, reports success, and the
+> sublink is still a `SubPlan` in the finished plan.**
+
+Every intermediate step has been measured; the remaining gap is between
+"`unnestSubquery` returned a rewritten tree" and "that tree is what `EXPLAIN`
+prints". The candidates, in order of cheapness to test: the caller loop in
+`unnestSubqueriesInPlan` (unnest.go:~448) discarding `newOuter`; a duplicated
+conjunct (`Filter.PushedBelow` exists precisely because qual-pushdown passes
+COPY a restriction down and leave the original in place, plan.go:1280-1300) so
+that one copy is rewritten and another survives; or a later pass rebuilding from
+a stale node.
 
 ### 9.4 Decision — LANDED (`07f4f7814`), regression and all
 

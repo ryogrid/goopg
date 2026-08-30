@@ -123,8 +123,18 @@ undo it; nothing else depends on it.
       demonstrably runs on a `*Filter`-rooted tree containing a sublink. There
       are two `case *Filter:` sites in unnest.go and the probe likely went to
       the wrong one
-- [ ] **Next**: re-do hypothesis 3's probe with an asserted insertion point, and
-      print what the walk actually sees at Q2's outer level
+- [x] Hypothesis 3 re-probed with an ASSERTED insertion point (there are 15
+      `case *Filter:` sites in unnest.go, and the original probe's count=1
+      replacement hit line 270 instead of the walk's line 432). Refuted: the
+      walk DOES see a `*Filter` whose predicate contains the sublink
+- [ ] **Question is now minimal**: `unnestSubquery` is called on the right
+      Filter, reports success (ACCEPTED, params=1 residuals=0, none of its four
+      bails), and the sublink is STILL a SubPlan in the finished plan. Test in
+      this order: (1) the caller loop at unnest.go:~448 discarding `newOuter`;
+      (2) a duplicated conjunct — `Filter.PushedBelow` exists because pushdown
+      passes COPY a restriction down and leave the original (plan.go:1280-1300),
+      so one copy could be rewritten and another survive; (3) a later pass
+      rebuilding from a stale node
 - [ ] Then: charge a SubPlan's evaluation cost over the row count it will be
       evaluated over (PG `cost_qual_eval`), `subplan_cost.go`
 - [ ] Then re-run BOTH the byte gate and a timing pass and confirm Q2 is back
