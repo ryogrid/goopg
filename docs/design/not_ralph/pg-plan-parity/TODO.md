@@ -336,12 +336,26 @@ experiment (DESIGN §4-A):
       ~94% row loss is in the PARALLEL bitmap path (`nextParallel`, the shared
       `o.pbm` page allocator), which — like the two bugs already found — had
       never been exercised end to end because bitmap paths never won on cost
-- [ ] **So the remaining blocker is parallel bitmap execution, not the
-      parameterised inner.** The leader builds and publishes the bitmap and
-      workers claim pages from a shared allocator; verify that wiring is
-      complete before landing the double-count fix. A single-worker check
-      (`SET max_parallel_workers_per_gather = 0`) on q03 would confirm the
-      diagnosis in one run: if the rows come back, it is the parallel path
+- [x] **CONFIRMED in one run.** q03 with bitmap paths winning:
+      `max_parallel_workers_per_gather` default -> **702 rows**; set to 0 ->
+      **11415 rows, correct**. The parallel bitmap heap scan is broken
+- [x] Tried the obvious conservative fix — stop stamping `BitmapHeapScan` as
+      parallel-aware in `stampParallelScan` (parallel.go). **It does not work**:
+      q03 stays at 702. `operators_gather.go` calls
+      `attachParallelBitmapScan(child, o.pbm)` whenever it finds a bitmap op
+      beneath a Gather, and that call is NOT gated on `BitmapHeapScan.Parallel`.
+      So there are two independent places that put a bitmap scan into parallel
+      mode, and the flag is only one of them
+- [ ] **Remaining work, in order.** (1) Decide whether to fix the leader/worker
+      handoff in `prebuildBitmapScans` + `attachParallelBitmapScan`
+      (operators_gather.go:135-160, :295, :334) or to gate BOTH entry points off
+      until it is; the leader builds the TID bitmap, sets its own
+      `tbm`/`iter`/`ownBitmap`, then publishes — and the leader's own operator
+      may then take `nextParallel` and ignore what it just built, which is the
+      first thing to check. (2) Land the double-count fix, which is written and
+      oracle-verified and blocked only by this. (3) Re-run the 21-query gate;
+      expect bitmap to jump well past PG's 6, so re-check the census against PG
+      per query rather than by count
 - [ ] **The remaining calibration question, after that.** Startup 14.35 vs PG's
       7.87 is roughly `indexProbeCostMultiplier`, which `btreeIndexAMCost`
       applies at costindex.go:189. That knob exists because goopg's index access
