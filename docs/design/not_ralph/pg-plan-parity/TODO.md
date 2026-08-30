@@ -114,9 +114,17 @@ undo it; nothing else depends on it.
       `whereEligibleForPreDPUnnest` says the opposite (it returns false when a
       SubqueryExpr is in the WHERE, which Q2's is). Unreconciled with the
       separate finding that the walk's Filter/Join arms see no sublink
-- [ ] **Next probe**: print the SELECT level identity alongside `preDPUnnested`
-      instead of inferring it from print order — the mistake this line of
-      investigation made twice. Do not assert a mechanism until demonstrated
+- [x] Level probe DONE and it inverted the guess: the `preDPUnnested=true` line
+      is Q2's INNER subquery (tables [nation region supplier partsupp], 0
+      sublinks). Q2's OUTER level has `preDPUnnested=false`, carries the 1
+      sublink, and the post-search walk DOES run on it
+- [x] Consequence: hypothesis 3 (sublink unreachable in the walk's arms) is OPEN
+      again — its refutation used a probe that cannot be trusted, since the walk
+      demonstrably runs on a `*Filter`-rooted tree containing a sublink. There
+      are two `case *Filter:` sites in unnest.go and the probe likely went to
+      the wrong one
+- [ ] **Next**: re-do hypothesis 3's probe with an asserted insertion point, and
+      print what the walk actually sees at Q2's outer level
 - [ ] Then: charge a SubPlan's evaluation cost over the row count it will be
       evaluated over (PG `cost_qual_eval`), `subplan_cost.go`
 - [ ] Then re-run BOTH the byte gate and a timing pass and confirm Q2 is back

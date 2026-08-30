@@ -571,41 +571,43 @@ Two further hypotheses were tested and are also wrong:
   Also false — instrumenting both the `*Filter` and `*Join` arms produced NO
   hits at all.
 
-**What the evidence actually shows — and what it does not.** Instrumenting the
-`preDPUnnested` gate (planner.go:1236) during an `EXPLAIN` of Q2 prints two
-lines, one per SELECT level:
+**What the evidence shows, now MEASURED rather than inferred.** The earlier
+version of this paragraph read two debug lines and guessed which SELECT level
+each belonged to. Re-instrumented to print the level's own identity — its base
+tables and its sublink count — the answer is the opposite of the guess:
 
 ```
-POSTDP: preDPUnnested=true (walk SKIPPED)
-POSTDP: preDPUnnested=false (walk runs)
+POSTDP preDPUnnested=true  root=*Filter tables=[nation region supplier partsupp]      sublinks=0
+POSTDP preDPUnnested=false root=*Filter tables=[nation region supplier partsupp part] sublinks=1
 ```
 
-and — this part IS decisive — **those two lines are identical with and without
-the `loop_count` arm**, while the plan is not: 0 SubPlans without it, 2 with it.
-So whatever differs, it is not which unnest path ran.
+The `true` line is Q2's INNER subquery (`select min(ps_supplycost) from partsupp,
+supplier, nation, region …`), which has no sublinks and for which skipping the
+walk is correct. Q2's OUTER level is the second line — it includes `part`, it
+carries the one sublink, and **`preDPUnnested=false`, so the post-search walk
+DOES run on it.**
 
-**A first draft of this paragraph attributed the `true` line to Q2's outer
-level. That attribution is unsupported and probably wrong**, because
-`whereEligibleForPreDPUnnest` (predp.go) returns false the moment a
-`SubqueryExpr` appears anywhere in the WHERE, and Q2's scalar sublink is exactly
-that — so Q2's outer level should be the `false` line, i.e. the walk SHOULD run.
-Which contradicts the separate observation that instrumenting the walk's
-`*Filter` and `*Join` arms produced no hits at all. Those two facts are not yet
-reconciled.
+That retires the "the walk never runs" story as well. It also undermines the
+refutation of hypothesis 3 above: that refutation rested on instrumenting the
+walk's `*Filter` and `*Join` arms and seeing no hits, but the walk demonstrably
+runs on a tree whose root IS a `*Filter` and which contains a sublink, so the
+probe that reported "no hits" cannot be trusted (most likely it was inserted at
+the wrong one of two `case *Filter:` sites). **Hypothesis 3 is therefore OPEN
+again, not refuted.**
 
-The mechanism is therefore **not established**, and no replacement is asserted
-here. What is established, and is worth the next attempt's time:
+Standing at the end of this session:
 
-1. the search runs before the post-search unnester (planner.go:1206 vs :1237),
-   so no "discarded rewrite" story applies;
-2. adding the missing `*NestedLoopIndexJoin` walk arm does not fix Q2 (83.6 s);
-3. the sublink is not reachable in either the `*Filter` or the `*Join` arm of
-   the walk, per instrumentation;
-4. the `preDPUnnested` decision is unchanged by the `loop_count` arm.
+| # | hypothesis | status |
+|---|---|---|
+| 1 | the DP search discards the unnester's rewrite | **refuted** — search runs first (planner.go:1206 vs :1237) |
+| 2 | missing `*NestedLoopIndexJoin` walk arm | **refuted by measurement** — adding it leaves Q2 at 83.6 s |
+| 3 | sublink unreachable in the walk's visited arms | **open** — its refutation used an untrustworthy probe |
+| 4 | Q2's post-search walk never runs | **refuted by measurement** — it runs |
 
-The obvious next probe is to print the level identity alongside `preDPUnnested`
-rather than inferring it from print order, which is the mistake this section
-made twice.
+The next step is to re-do hypothesis 3's probe correctly: assert the insertion
+point (there are two `case *Filter:` sites in unnest.go) and print what the walk
+sees at Q2's outer level, where it is now known to run on a tree carrying
+exactly one sublink.
 
 ### 9.4 Decision — LANDED (`07f4f7814`), regression and all
 
