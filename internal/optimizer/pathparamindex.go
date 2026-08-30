@@ -242,12 +242,25 @@ func (s *searchCtx) addParameterizedIndexPaths(cat catalog.Catalog) {
 		// `NestedLoopIndexJoin.Inner` is typed `*IndexScan` and so cannot carry
 		// the `*Filter` wrappers a leaf's local quals live in. Costing a path
 		// here whose only consumer must refuse it would let the DP choose a plan
-		// the builder cannot honour — and the two alternatives are both worse
-		// than declining: dropping the wrappers loses the quals outright (a wrong
-		// answer), and hoisting them onto the join residual is the D6.3b Q9
-		// blowup. Ledgered: this costs goopg every NLI over a filtered leaf,
-		// which the legacy `tryBuildNLI` still serves.
-		if !scanLeafIsBare(rel.baseLeaf) {
+		// the builder cannot honour — so the producer applies the consumer's own
+		// rule (rule #2).
+		//
+		// That rule used to be `scanLeafIsBare`: no wrappers at all. It is now
+		// `absorbableLeafCond`, because the quals have somewhere to go —
+		// `IndexScan.Cond`, PG's `Filter:` alongside `Index Cond:` on one node.
+		// The bare rule declined every filtered relation, which is precisely the
+		// shape PG parameterises in TPC-H (Q19's `lineitem` behind
+		// `l_shipmode`/`l_shipinstruct`, Q3's behind `l_shipdate`), so goopg
+		// could not reach those plans at any cost setting. A leaf whose wrappers
+		// are NOT leaf-local is still declined — see `absorbableLeafCond` for
+		// why that one is a coordinates question and not a shape question.
+		//
+		// Note the row estimate needs no adjustment for the absorbed quals:
+		// `parameterizedBaserelRows` multiplies `rel.Rows`, which already
+		// carries the leaf's baserestrict selectivity (see its comment), so the
+		// local quals are priced exactly once whether they sit in a wrapper or
+		// in `Cond`.
+		if _, _, ok := absorbableLeafCond(rel.baseLeaf); !ok {
 			continue
 		}
 		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)
@@ -372,7 +385,7 @@ func parameterizedBaserelRows(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.
 	}
 	sel := 1.0
 	for _, c := range bound {
-		sel *= varEqNonConstSelectivity(columnStatsByName(tbl, c.innerCol))
+		sel *= varEqNonConstSelectivity(columnStatsByName(tbl, c.innerCol), rel.Rows)
 	}
 	rows := rel.Rows * sel
 	if rows > rel.Rows {
@@ -398,12 +411,12 @@ func parameterizedBaserelRows(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.
 // (DEFAULT_NUM_DISTINCT = 200, selfuncs.h), which is what the zero-stats branch
 // returns here — through the package-level `defaultNumDistinct`
 // (joinselectivity.go), so this arm and the join estimator's cannot drift apart.
-func varEqNonConstSelectivity(stats *catalog.ColumnStats) float64 {
-	if stats == nil || stats.NDistinct <= 0 {
+func varEqNonConstSelectivity(stats *catalog.ColumnStats, relRows float64) float64 {
+	if stats == nil {
 		return 1.0 / defaultNumDistinct
 	}
 	sel := 1.0 - stats.NullFrac
-	if nd := float64(stats.NDistinct); nd > 1 {
+	if nd := variableNumDistinct(stats, relRows); nd > 1 {
 		sel /= nd
 	}
 	if len(stats.MCV) > 0 && stats.MCV[0].Frequency > 0 && sel > stats.MCV[0].Frequency {
@@ -416,6 +429,54 @@ func varEqNonConstSelectivity(stats *catalog.ColumnStats) float64 {
 		return 1
 	}
 	return sel
+}
+
+// variableNumDistinct is `get_variable_numdistinct` (selfuncs.c:5843): how many
+// distinct values a column holds, from whichever of ANALYZE's two renderings is
+// available.
+//
+// PG keeps ONE field, `stadistinct`, and overloads its sign: positive is an
+// absolute count, negative is a count expressed as a FRACTION of the relation's
+// rows (`-stadistinct * ntuples`), and zero means unknown. goopg splits the two
+// senses across `NDistinct` and `NDistinctFrac` (catalog.go) — but the estimator
+// only ever read the absolute one, so a column carrying only the fraction was
+// read as "unknown" and fell to DEFAULT_NUM_DISTINCT.
+//
+// That was not a corner case on this workload; it is the normal state of a
+// restarted server, because the absolute count is derived from a row count that
+// is not restored (`TableStats.RowCount`, ledger row pq-P6) while the
+// scale-free fraction survives. TPC-H `lineitem.l_orderkey` reads
+// `NDistinct=0, NDistinctFrac=0.202` on a restarted cluster: 1.2 M distinct
+// values estimated as 200, so `l_orderkey = <outer>` matched 0.005 of the
+// relation instead of 8.25e-7 — 6000x too many rows. That is what made the
+// parameterised inner of TPC-H Q3 cost 36 billion against the hash join's
+// 1.9 million and kept goopg off PG's plan.
+//
+// The final two branches are PG's too, and they are not symmetric with each
+// other: with no data at all, a relation SMALLER than DEFAULT_NUM_DISTINCT is
+// assumed to have one distinct value per row, and only a larger one falls back
+// to the constant — "so that the behavior isn't discontinuous" (selfuncs.c).
+func variableNumDistinct(stats *catalog.ColumnStats, relRows float64) float64 {
+	if stats == nil {
+		return defaultNumDistinct
+	}
+	// "If we had an absolute estimate, use that." — clamped to >= 1 by
+	// clamp_row_est, which is why a stored 0 cannot masquerade as a count here.
+	if stats.NDistinct > 0 {
+		return clampRowEst(float64(stats.NDistinct))
+	}
+	// "Otherwise we need to get the relation size; punt if not available."
+	if relRows <= 0 || math.IsNaN(relRows) {
+		return defaultNumDistinct
+	}
+	// "If we had a relative estimate, use that." PG's `-stadistinct * ntuples`.
+	if stats.NDistinctFrac > 0 {
+		return clampRowEst(stats.NDistinctFrac * relRows)
+	}
+	if relRows < defaultNumDistinct {
+		return clampRowEst(relRows)
+	}
+	return defaultNumDistinct
 }
 
 // columnStatsByName resolves a column name to its ANALYZE statistics, or nil

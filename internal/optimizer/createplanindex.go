@@ -69,6 +69,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // scanLeafRewrap rebuilds the wrappers that sat above a base relation's
@@ -194,6 +195,58 @@ func scanLeafIsBare(leaf Node) bool {
 	}
 	probe := &SeqScan{}
 	return rewrap(probe) == Node(probe)
+}
+
+// absorbableLeafCond peels `n`'s `*Filter` wrappers and returns their
+// predicates conjoined, for a caller that will put them on `IndexScan.Cond`
+// instead of leaving them in nodes above the scan.
+//
+// This is what replaced `scanLeafIsBare` as the NLI arm's eligibility rule.
+// The bare-leaf rule declined every filtered relation outright, which cost
+// goopg the parameterised inner on exactly the TPC-H shapes PG uses one for
+// (Q19's `lineitem` behind `l_shipmode`/`l_shipinstruct`, Q3's behind
+// `l_shipdate`). `IndexScan.Cond` gives those quals a home inside the node, so
+// the question stops being "are there wrappers" and becomes "can this node
+// evaluate them".
+//
+// It can, on ONE condition, and the condition is coordinates rather than
+// shape: `Cond` is evaluated against the scan's own row, so every wrapper must
+// be `LeafLocal` — the flag that says the predicate's `ColumnRef.Index` values
+// are leaf-local and were therefore never renumbered into FROM-cumulative
+// space by the posMap passes (plan.go:1272-1279). A non-LeafLocal wrapper's
+// indexes address the merged row of some join above; evaluating it against the
+// scan's row would read the WRONG COLUMNS and silently return wrong rows, not
+// fail. Such a leaf is declined, exactly as before.
+//
+// ok=false means "decline" for every caller, never "error" — same contract as
+// `scanLeafFor`.
+func absorbableLeafCond(n Node) (Node, Expr, bool) {
+	if n == nil {
+		return nil, nil, false
+	}
+	var conds []Expr
+	cur := n
+	for {
+		f, isF := cur.(*Filter)
+		if !isF {
+			break
+		}
+		if f.Child == nil || f.Predicate == nil || !f.LeafLocal {
+			return nil, nil, false
+		}
+		conds = append(conds, f.Predicate)
+		cur = f.Child
+	}
+	if len(conds) == 0 {
+		return cur, nil, true
+	}
+	// Innermost-first, so the conjunction reads in the order the wrappers would
+	// have been evaluated bottom-up.
+	cond := conds[len(conds)-1]
+	for i := len(conds) - 2; i >= 0; i-- {
+		cond = &BinaryOp{pos: conds[i].Pos(), Op: parser.OpAnd, Left: cond, Right: conds[i]}
+	}
+	return cur, cond, true
 }
 
 // scanIdentityOf reads the copied-forward state off a base scan node, or nil

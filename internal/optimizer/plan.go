@@ -760,6 +760,27 @@ type IndexScan struct {
 	// bound (M0134-0001 S4 class 8) so the redundant Filter can be dropped.
 	LowOp  parser.OpCode
 	HighOp parser.OpCode
+	// Cond is a residual filter evaluated per HEAP TUPLE the probe returns —
+	// PostgreSQL's `Filter:` line on an Index Scan node, which sits alongside
+	// `Index Cond:` rather than in a separate node. Its ColumnRefs are in the
+	// scan's OWN output coordinates (leaf-local), the same space
+	// `IndexOnlyScan.Cond` uses. Nil means no residual filtering.
+	//
+	// It exists so a relation's local quals have somewhere to live INSIDE the
+	// node when the scan is a `NestedLoopIndexJoin.Inner` — that field is typed
+	// `*IndexScan` and cannot carry the `*Filter` wrappers the quals otherwise
+	// sit in, which is what used to make `addParameterizedIndexPaths` decline
+	// every filtered leaf (`scanLeafIsBare`). The alternative it replaces is the
+	// D6.3b Q9 blowup: hoisting the quals onto the join residual re-evaluates,
+	// once per probed PAIR, a clause the path was costed as applying once per
+	// inner row. Here it is applied once per index match, which is the costed
+	// semantics.
+	//
+	// Only the NLI arm sets it. On a plain (unparameterised) index path the
+	// leaf's `*Filter` wrappers are rebuilt above the scan by `scanLeafFor`'s
+	// rewrapper as before, and Cond stays nil — one predicate evaluated in one
+	// place either way, never both.
+	Cond   Expr
 	schema Schema
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
 	// same name. M0122-0008 (view-owner privilege gap).

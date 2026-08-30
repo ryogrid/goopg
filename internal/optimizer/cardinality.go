@@ -343,7 +343,9 @@ func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr
 		if idx != nil && i < len(idx.Columns) {
 			cs = columnStatsByName(tbl, idx.Columns[i])
 		}
-		sel *= varEqNonConstSelectivity(cs)
+		// `relRows` is what lets a column carrying only the FRACTION form of
+		// its distinct count be read at all — see `variableNumDistinct`.
+		sel *= varEqNonConstSelectivity(cs, float64(relRows))
 	}
 	// PG charges DEFAULT_INEQ_SEL per unmatched inequality bound
 	// (selfuncs.h); a two-sided range therefore lands near its

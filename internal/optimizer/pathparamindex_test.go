@@ -345,16 +345,64 @@ func TestVarEqNonConstSelectivityMCVCrossCheck(t *testing.T) {
 		NDistinct: 10,
 		MCV:       []catalog.MCVEntry{{Value: "a", Frequency: 0.04}},
 	}
-	if got := varEqNonConstSelectivity(stats); got != 0.04 {
+	if got := varEqNonConstSelectivity(stats, 1000); got != 0.04 {
 		t.Errorf("selectivity = %v; want it clamped to the MCV[0] frequency 0.04", got)
 	}
 	// Null fraction comes off the top before the division (selfuncs.c).
-	got := varEqNonConstSelectivity(&catalog.ColumnStats{NDistinct: 4, NullFrac: 0.5})
+	got := varEqNonConstSelectivity(&catalog.ColumnStats{NDistinct: 4, NullFrac: 0.5}, 1000)
 	if want := 0.5 / 4; got != want {
 		t.Errorf("selectivity with 50%% nulls = %v; want %v", got, want)
 	}
 	// No statistics: PG's DEFAULT_NUM_DISTINCT.
-	if got := varEqNonConstSelectivity(nil); got != 1.0/200.0 {
+	if got := varEqNonConstSelectivity(nil, 1000); got != 1.0/200.0 {
 		t.Errorf("unanalysed column selectivity = %v; want 1/200", got)
+	}
+}
+
+// A column whose distinct count is stored ONLY in the fraction form — the
+// normal state on a restarted server, where the absolute count's row-count
+// input is not restored (ledger pq-P6) — must be read as a real estimate and
+// not as "unknown". This is PG's negative `stadistinct`
+// (`get_variable_numdistinct`, selfuncs.c: `-stadistinct * ntuples`).
+//
+// The regression it pins is not subtle: TPC-H `lineitem.l_orderkey` reads
+// NDistinctFrac=0.202 over 6,001,255 rows. Read correctly that is 1.2 M
+// distinct values; read as "unknown" it is 200, a 6000x error in the row
+// estimate of every `l_orderkey = <outer>` probe.
+func TestVarEqNonConstSelectivityFractionForm(t *testing.T) {
+	stats := &catalog.ColumnStats{NDistinct: 0, NDistinctFrac: 0.202}
+	const relRows = 6001255.0
+	got := varEqNonConstSelectivity(stats, relRows)
+	want := 1.0 / clampRowEst(0.202*relRows)
+	if got != want {
+		t.Errorf("selectivity from the fraction form = %v; want %v", got, want)
+	}
+	if got >= 1.0/200.0 {
+		t.Errorf("selectivity %v is no sharper than DEFAULT_NUM_DISTINCT; the fraction form was ignored", got)
+	}
+	// The absolute form still wins when both are present: PG returns on
+	// `stadistinct > 0` before it ever looks at the relation size.
+	both := &catalog.ColumnStats{NDistinct: 50, NDistinctFrac: 0.9}
+	if got := varEqNonConstSelectivity(both, relRows); got != 1.0/50.0 {
+		t.Errorf("selectivity with both forms = %v; want the absolute 1/50", got)
+	}
+	// No relation size to scale by: PG "punts" to the default rather than
+	// treating the fraction as an absolute count.
+	if got := varEqNonConstSelectivity(stats, 0); got != 1.0/200.0 {
+		t.Errorf("selectivity with no relation size = %v; want 1/200", got)
+	}
+}
+
+// PG's two no-data branches are deliberately asymmetric: a relation smaller
+// than DEFAULT_NUM_DISTINCT is assumed to hold one distinct value per row, and
+// only a larger one falls back to the constant — "so that the behavior isn't
+// discontinuous" (get_variable_numdistinct, selfuncs.c).
+func TestVariableNumDistinctNoDataBranches(t *testing.T) {
+	empty := &catalog.ColumnStats{}
+	if got := variableNumDistinct(empty, 50); got != 50 {
+		t.Errorf("numdistinct for a 50-row relation with no stats = %v; want 50", got)
+	}
+	if got := variableNumDistinct(empty, 5000); got != 200 {
+		t.Errorf("numdistinct for a 5000-row relation with no stats = %v; want DEFAULT_NUM_DISTINCT", got)
 	}
 }

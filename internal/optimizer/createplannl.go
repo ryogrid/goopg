@@ -201,11 +201,33 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 	}
 
 	in := joinInputsFor(p, "PathNestLoop(NLI)", outerPath, innerPath)
-	is, bare := in.inner.(*IndexScan)
+	// The leaf's local quals arrive as `*Filter` wrappers that `scanLeafFor`'s
+	// rewrapper rebuilt over the probe. `NestedLoopIndexJoin.Inner` is typed
+	// `*IndexScan` and cannot hold them, so they are absorbed into the scan's
+	// own `Cond` — PG's `Filter:` sitting beside `Index Cond:` on one Index Scan
+	// node, which is the shape being reproduced here.
+	//
+	// Absorbing is not hoisting: `Cond` is evaluated once per row the probe
+	// returns, which is what the path was costed for. Moving the same quals to
+	// the join residual instead would evaluate them once per probed PAIR — the
+	// D6.3b Q9 blowup (`innerUnwrapCostAccepts`, nl_index_join.go).
+	innerBase, leafCond, absorbable := absorbableLeafCond(in.inner)
+	if !absorbable {
+		// Made unreachable at the producer, which applies the same predicate
+		// (`addParameterizedIndexPaths`). Reaching it means a path was costed
+		// over a leaf whose wrappers are not leaf-local, and evaluating those
+		// against the scan's own row would read the wrong columns.
+		panic(fmt.Sprintf("createPlan: NLI inner %T carries wrappers that are not leaf-local; IndexScan.Cond cannot evaluate them in the scan's coordinates", in.inner))
+	}
+	is, bare := innerBase.(*IndexScan)
 	if !bare {
-		// Made unreachable at the producer (`addParameterizedIndexPaths`); see
-		// the file header for why hoisting the wrappers is not the fix.
-		panic(fmt.Sprintf("createPlan: NLI inner emitted a %T, but NestedLoopIndexJoin.Inner is an *IndexScan; the leaf's wrappers have nowhere to go", in.inner))
+		panic(fmt.Sprintf("createPlan: NLI inner emitted a %T, but NestedLoopIndexJoin.Inner is an *IndexScan", innerBase))
+	}
+	if leafCond != nil {
+		// The probe rebuilt by `createIndexScanPlan` is a fresh node this arm
+		// owns (`scanLeafFor` never mutates the leaf), so setting Cond here
+		// cannot disturb the leaf the search still references by pointer.
+		is.Cond = leafCond
 	}
 
 	// The probe keys are re-based onto the OUTER alone — see the file header.

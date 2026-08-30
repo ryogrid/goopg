@@ -697,8 +697,24 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if cond := formatIndexCond(p, reg); cond != "" {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 		}
-		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		// `Filter:` comes from either of two places, and upstream renders both
+		// the same way because to PG they ARE the same thing — a scan-level
+		// qual that is not an index qual (`show_scan_qual` on `scan.plan.qual`,
+		// explain.c). goopg reaches it as a `*Filter` node above the scan in the
+		// ordinary case, and as `IndexScan.Cond` when the scan is an NLI inner
+		// and the quals had to move inside the node (plan.go, IndexScan.Cond).
+		// Only one is ever set, but they are joined rather than sequenced so a
+		// future third producer cannot make one silently shadow the other.
+		filt := attachedFilter
+		if p.Cond != nil {
+			if filt == nil {
+				filt = p.Cond
+			} else {
+				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: filt, Right: p.Cond}
+			}
+		}
+		if filt != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
 		}
 	case *optimizer.IndexOnlyScan:
 		// S6 min/max rewrite: the IOS's residual `col IS NOT NULL` qual is

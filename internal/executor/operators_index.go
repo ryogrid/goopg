@@ -630,10 +630,36 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// the seqScanOp inline hook is not enough — render here too (no-op off the
 		// catalogs / for a NULL ACL).
 		renderHeapACLColumnInto(o.ctx.Catalog, o.plan.Table, o.plan.Table.Columns, row)
-		// Record the actual (HOT-resolved) live slot for
-		// currentTID() — lockRowsOp stamps the live version.
-		o.lastTID = storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
-		o.hasLast = true
+		// PG's `Filter:` on an Index Scan: the relation's local quals, evaluated
+		// per heap tuple the probe returned. Set only on an NLI inner, where the
+		// quals cannot live in a *Filter above (plan.go, IndexScan.Cond).
+		//
+		// Evaluated HERE — after the tuple is fetched and detoasted, before the
+		// row is emitted — but deliberately NOT short-circuiting the two things
+		// below it:
+		//
+		//   - the SSI hooks still run for a filtered-out tuple, because PG takes
+		//     the predicate lock in the heap fetch (`PredicateLockTID`, before
+		//     `ExecQual`). A tuple that was READ and then rejected still forms
+		//     the rw-edge; skipping it would be a SERIALIZABLE false negative.
+		//   - `lastTID`/`hasLast` are advanced only when the row is kept, since
+		//     `currentTID` is documented as the most recently EMITTED row and
+		//     lockRowsOp stamps that TID. Advancing on a rejected tuple would
+		//     point it at a row the plan never returned.
+		keepRow := true
+		if o.plan.Cond != nil {
+			d, cerr := evalExpr(o.plan.Cond, row, o.ctx)
+			if cerr != nil {
+				return nil, cerr
+			}
+			keepRow = !d.IsNull() && d.Kind == KindBool && d.BoolValue()
+		}
+		if keepRow {
+			// Record the actual (HOT-resolved) live slot for
+			// currentTID() — lockRowsOp stamps the live version.
+			o.lastTID = storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
+			o.hasLast = true
+		}
 		// M0104-0007: SSI read-path hook on the HOT-resolved live slot.
 		// Helper short-circuits for RC/RR; for SERIALIZABLE this installs a
 		// tuple-grain predicate lock and an rw-conflict edge to the writer
@@ -653,6 +679,9 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			}
 		} else if err := ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
 			return nil, err
+		}
+		if !keepRow {
+			continue
 		}
 		// M0092-0007: stack-aliased slot — reuse o.slot across
 		// every Next() call. Caller must consume / Materialize

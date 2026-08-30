@@ -49,12 +49,22 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 	case *SeqScan:
 		return true
 	case *IndexScan:
-		if !one(&x.Key) || !one(&x.LowKey) || !one(&x.HighKey) {
+		// Cond is walked with the probe keys, not skipped: it holds the
+		// relation's local quals when the scan is an NLI inner (plan.go,
+		// IndexScan.Cond). Those quals reach a *Filter node on every other path
+		// through the planner, and the *Filter arm below walks its Predicate —
+		// so omitting Cond here would make the same predicate visible or
+		// invisible to this pass depending on which join shape won, which is
+		// exactly the sibling-divergence class of bug.
+		if !one(&x.Key) || !one(&x.LowKey) || !one(&x.HighKey) || !one(&x.Cond) {
 			return false
 		}
 		return rewriteAll(x.Keys)
 	case *IndexOnlyScan:
-		if !one(&x.Key) || !one(&x.LowKey) || !one(&x.HighKey) {
+		// Same for the IOS's residual qual. Today it is only ever a
+		// `col IS NOT NULL` the min/max rewrite attached, so this is a no-op —
+		// it is here so the two scan arms state the same rule.
+		if !one(&x.Key) || !one(&x.LowKey) || !one(&x.HighKey) || !one(&x.Cond) {
 			return false
 		}
 		return rewriteAll(x.Keys)
