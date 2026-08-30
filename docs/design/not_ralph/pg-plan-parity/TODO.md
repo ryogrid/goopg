@@ -307,12 +307,24 @@ experiment (DESIGN §4-A):
       So the parameterised-bitmap construction is broken for shapes that only
       became reachable once bitmaps started winning; Q17 worked by luck. The
       cost fix is correct and is held back only by that
-- [ ] **Do this first, then land the double-count fix**: `createPlanNode` for a
-      parameterised `PathBitmapIndexScan` child is not producing an operator
-      that satisfies `bitmapProducer`. Note `createBitmapHeapScanPlan` does
-      `outer, _ := createPlanNode(p.Children[0])` — it DISCARDS the error, so a
-      failure there becomes a nil/!bitmapProducer `Outer` at execution instead
-      of a plan-time diagnostic. Start by not discarding it
+- [x] Diagnosed and PARTLY fixed. The `outer, _ :=` note above was wrong — that
+      discards a LAYOUT, not an error. Measuring instead of reading found the
+      real cause: `createBitmapIndexScanPlan` ended `return rewrap(bis)`,
+      wrapping the bitmap PRODUCER in the leaf's `*Filter`, and
+      `BitmapHeapScan.Outer` must be a producer. Fixed in `d24d9e6be`, which
+      also makes createPlan panic on a construction error instead of returning
+      a nil node, and makes the executor's assertion name the type it got
+- [ ] **STILL BLOCKING the double-count fix**: with `d24d9e6be` in place the
+      nine failures become three WRONG ANSWERS — q03 returns 702 rows of 11415,
+      q08 and q14 return wrong values. So there is a second, deeper correctness
+      bug in the parameterised bitmap inner beyond the Outer shape. Find it
+      before landing the cost fix; the fix is written and verified against the
+      oracle, and is held back only by this
+- [ ] Suggested probe, given the pattern this file has established four times:
+      do not reason about which qual is being lost. Take q03, force its bitmap
+      plan, and print per outer row the probe key, the TID count in the bitmap,
+      and the rows surviving `Cond` — the row loss is ~94%, which is large
+      enough to localise in one run
 - [ ] **The remaining calibration question, after that.** Startup 14.35 vs PG's
       7.87 is roughly `indexProbeCostMultiplier`, which `btreeIndexAMCost`
       applies at costindex.go:189. That knob exists because goopg's index access
