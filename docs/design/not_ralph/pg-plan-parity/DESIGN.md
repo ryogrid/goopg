@@ -1340,10 +1340,9 @@ list, and the width panic beside it is the seam.
    `baseOffset + i` becomes the special case where the two coincide. Replace the
    width panic with this computation; keep a panic for any OTHER width
    disagreement, since that still means a synthesised schema.
-5. **Nothing else.** Every ancestor is re-based from `lay` by the existing
-   `translateToLayout`, and a clause referencing a pruned column hits its
-   existing refusal panic instead of silently reading the wrong column — so a
-   coverage bug is loud at plan time, not wrong at runtime.
+5. ~~**Nothing else.**~~ **WRONG — see §15.4.** Every ancestor *inside the
+   search* is re-based from `lay` by the existing `translateToLayout`. There is
+   a SECOND boundary above it that this step missed.
 
 ### 15.3 What to verify first, and why
 
@@ -1356,3 +1355,70 @@ The risk to watch is step 4 interacting with the parallel path: Q16's is a
 `Parallel Index Only Scan`, so the narrowed layout must hold across
 `PartialPathlist` and the Gather above it. Q13's is serial and is therefore the
 one to land first.
+
+
+### 15.4 The attempt, and the boundary §15.2 missed — NEGATIVE RESULT
+
+Steps 1-5 were implemented (2026-08-31) and reverted. The build was clean, the
+optimizer suite green, and the mechanism worked exactly as designed on Q16:
+
+```
+IOS partsupp: needed=[ps_partkey ps_suppkey] indexes=[partsupp_part_fkidx partsupp_pk partsupp_supplier_fkidx]
+IOS   try partsupp.partsupp_pk covered=true
+IOS   ADD partsupp.partsupp_pk allvis=1.00 cost=0.38..45336.38 rows=800000 (cheapest now 61282.00)
+```
+
+The needed-column set was computed correctly, `check_index_only` accepted
+`partsupp_pk`, `allvisfrac` came back as a real 1.00 from goopg's visibility map
+(`relallvisible == relpages` on every TPC-H table, matching PG), and the path
+was costed at **45336** against an incumbent **61282** — cheaper on merit, which
+is what `addPath` then acted on.
+
+Then `createPlan` panicked:
+
+```
+createPlan: search root does not publish binding coordinate(s) [2 3 4];
+the enclosing tree references columns the searched subtree cannot supply
+```
+
+**`boundaryMap` (createplanroot.go:194) is a second boundary, and it is a
+TOTALITY invariant, not a usage check.** `createPlanAtSearchRootRange` requires
+the searched subtree to reproduce the WHOLE binding concatenation
+`[base, base+width)` — every coordinate, whether the enclosing tree reads it or
+not — because the enclosing tree's `ColumnRef.Index` values are numbered against
+that full concatenation and are fixed before the search runs. Narrowing any base
+rel therefore breaks it by construction: dropping `partsupp`'s
+`ps_availqty`/`ps_supplycost`/`ps_comment` leaves holes at coordinates 2, 3, 4.
+
+So §15.2's step 5 was wrong. `translateToLayout` re-bases clauses INSIDE the
+search; it has nothing to do with the search-root boundary, and the two are
+separate seams. Reaching an index-only path needs BOTH:
+
+- the layout narrowing of step 4 (which worked), and
+- a partial search-root boundary plus a renumbering of the ENCLOSING tree — the
+  same needed-set question one level up, at a point where `planSelect` has not
+  built the parent yet.
+
+The second half is the real cost of this feature and it was invisible from the
+code reading in §15.1, because `baseRelLayout` and `boundaryMap` are in
+different files and only the first one mentions leaf width.
+
+**What survived the revert as knowledge, not code:**
+
+- goopg's visibility map IS readable by the planner
+  (`catalog.RelAllVisibleFunc`, wired in `initdb/open.go:2525`), so
+  `baserel->allvisfrac` can be PG-faithful rather than assumed. `relsize.go:424`
+  says the opposite ("goopg has no visibility map for the planner to read") and
+  is stale.
+- On the TPC-H cluster `relallvisible == relpages` for customer, orders and
+  partsupp, so an index-only scan really is cheaper there and the feature is
+  worth finishing — it does not depend on a VACUUM that has not happened.
+- Q13 never reaches the search AT ALL: its inner subquery has no `WHERE`, so
+  there is no `*Filter` for the seam at `planner.go:1206` to match, and
+  `addBaseRelIndexPaths` is never called. Q13 therefore needs the seam widened
+  BEFORE it needs an index-only path — a separate blocker from Q16's, and one
+  no amount of path work would have revealed.
+- The one-line error check `grep -l "ERROR\|panic"` over EXPLAIN output does not
+  catch this class: a planner panic closes the connection, so the file says
+  `server closed the connection unexpectedly` and matches neither pattern. Any
+  sweep used as a gate must grep for that string too.

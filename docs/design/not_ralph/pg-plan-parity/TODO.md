@@ -880,6 +880,35 @@ section D. Recorded because the gate run is where they became visible.
       failure under load, not a wedge. `Q72..Q99` was then run as a subset
       probe: PASS=26 MISMATCH=0 ERROR=0, `verdict-changes=none`.
 
+## F — index-only PATH: attempted, reverted, two blockers now named
+
+- [x] Steps 1-5 of DESIGN §15 implemented and reverted 2026-08-31. Mechanism
+      verified working on Q16: needed set `[ps_partkey ps_suppkey]`,
+      `partsupp_pk` covered, `allvisfrac=1.00` read from the real VM, path
+      costed **45336 vs the incumbent 61282** — cheaper on merit.
+- [x] Blocked by a SECOND boundary §15.2 missed: `boundaryMap`
+      (createplanroot.go:194) requires the search root to publish EVERY binding
+      coordinate in `[base, base+width)`, whether the enclosing tree reads it or
+      not. Narrowing a base rel leaves holes and it panics at plan time.
+- [ ] **Next for Q16**: a partial search-root boundary plus renumbering of the
+      ENCLOSING tree's ColumnRefs — the needed-set question one level up, at a
+      point where `planSelect` has not built the parent yet. This is the real
+      cost of the feature; §15.1's code reading missed it because
+      `baseRelLayout` and `boundaryMap` live in different files.
+- [ ] **Next for Q13, and it is a DIFFERENT blocker**: Q13 never reaches the
+      join search at all. Its inner subquery has no `WHERE`, so there is no
+      `*Filter` for the seam at `planner.go:1206` to match and
+      `addBaseRelIndexPaths` is never called. Widen the seam first; no amount of
+      path work reaches Q13 until then.
+- [x] Correct `relsize.go:424` — "goopg has no visibility map for the planner to
+      read" is stale. `catalog.RelAllVisibleFunc` is wired in
+      `initdb/open.go:2525`, and `relallvisible == relpages` on every TPC-H
+      table, so `allvisfrac` can be PG-faithful.
+- [ ] Any EXPLAIN sweep used as a gate must grep for
+      `server closed the connection` as well as `ERROR|panic`: a planner panic
+      closes the connection and matches neither, which is why the first sweep of
+      this attempt looked clean.
+
 ## Cross-cutting
 
 - [ ] No change may test a relation name, query shape, or benchmark identity
