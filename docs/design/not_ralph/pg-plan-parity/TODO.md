@@ -401,10 +401,29 @@ refuse — the exact failure that file warns about.
         that `createNestLoopBitmapJoinPlan` got from `joinInputsFor`
         disagreeing with `BitmapHeapScan.Output()`, which is the leaf's FULL
         table schema.
+      - **`slotRow` is not the fault either.** It is `slot.Row()`, and the
+        bitmap returns a `*MaterializedSlot` exactly as `indexScanOp` does.
+      - The assertion below is aimed correctly, and reading
+        `nestedLoopIndexJoinOp.Open` says why:
+
+        ```go
+        o.outerWidth = len(o.outer.Schema())
+        o.innerWidth = len(o.inner.Schema())
+        cols := make([]virtualCol, 0, o.outerWidth+o.innerWidth)  // one per side
+        o.virtualOut = NewVirtualSlot(o.Schema(), []TupleSlot{o.outerMS, o.innerMS}, cols)
+        ```
+
+        `cols` is sized from the two OPERATOR schemas while `o.Schema()` is the
+        PLANNER's merged schema. Those are independent, and nothing checks they
+        agree — so a consumer that builds `in.merged` inconsistently with
+        `BitmapHeapScan.Output()` produces exactly this class of crash and no
+        earlier complaint.
       - So: assert `len(in.merged) == len(outer.Output()) + len(inner.Output())`
         in the consumer before doing anything else, and write the unit test to
         drive a bitmap inner through `nestedLoopIndexJoinOp` directly so the
-        failure surfaces without a 6M-row query.
+        failure surfaces without a 6M-row query. Consider making that assertion
+        permanent in `Open` for ALL inner kinds — the index arm has simply never
+        violated it.
 - [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`).
       `matchBitmapIndexQuals` (pathbitmap.go:234) matches only `col = const` via
       `normalizeColumnConst`; a parameterised sibling would mirror
