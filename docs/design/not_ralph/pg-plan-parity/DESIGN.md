@@ -1,10 +1,9 @@
 # PG plan parity — what is actually missing
 
-**Status:** four fixes landed and gated (`9db8a0970`, `80a5e334d`,
-`07f4f7814`). The fourth — `cost_index`'s `loop_count` arm — **carries a known
-Q2 regression, 1.6 s -> 84.4 s**; §9 is the whole story and §9.4 is why it
-landed anyway. Gaps A and B (index-only, bitmap) remain blocked on missing
-infrastructure. §7 says what and why.
+**Status:** five fixes landed and gated (`9db8a0970`, `80a5e334d`, `07f4f7814`,
+`1081e5b84`, `f95d85ae2`). **The Q2 regression is FIXED** — §9.5. Gaps A and B
+(index-only, bitmap) remain blocked on missing infrastructure. §7 says what and
+why.
 **Date:** 2026-08-30 (rewritten after adversarial review; §8)
 **Branch:** `perf-opt-take6`
 **Baseline:** `edfca5d43`
@@ -688,3 +687,49 @@ it is evaluated over (PG `cost_qual_eval`), `subplan_cost.go`; (3) re-run the
 byte-identical and every unit test passed. A row-count gate cannot see a 43-53x
 regression; only timing the changed queries caught it. Any future plan-shape
 change needs both.
+
+
+## 9.5 The Q2 regression: RESOLVED (`f95d85ae2`)
+
+**84.4 s -> 1.9 s, result set byte-identical, and none of §9.2's plan-shape
+gains given back.**
+
+The cause was not costing, not the DP, not the unnester's logic, and not any of
+the five mechanisms proposed above. `clonePlanReplacingOuter` (unnest.go)
+enumerates the plan node kinds a correlated subquery's body may contain — Join,
+Filter, Project, Aggregate, Sort, Limit, SeqScan, IndexScan, Values, CTEScan,
+MaterializedCTEScan — and had **no `*NestedLoopIndexJoin` arm**, because until
+`cost_index` learned its `loop_count` amortisation the search never produced one
+inside a subquery body. Once it did, Q2's inner plan became
+`Aggregate -> NestedLoopIndexJoin -> …` and the cloner returned
+`unsupported plan node`.
+
+**And the failure is silent by construction.** `unnestSubqueriesInPlan`'s driver
+loop ends `if err != nil || newOuter == nil { break }` — an error and a decline
+are the same thing to it — so the sublink simply stayed a correlated SubPlan,
+evaluated per row of a 160,000-row join instead of being decorrelated into a
+hash aggregate. Nothing anywhere reports it.
+
+### 9.6 Why five hypotheses in a row were wrong
+
+Worth recording, because the pattern is more transferable than the bug:
+
+| # | hypothesis | how it died |
+|---|---|---|
+| 1 | the DP discards the unnester's rewrite | call order — search runs first |
+| 2 | missing `*NestedLoopIndexJoin` walk arm | measured: Q2 stays at 83.6 s |
+| 3 | sublink unreachable in the walk | measured (after fixing a probe that had hit the wrong 1 of 15 `case *Filter:` sites) |
+| 4 | the post-search walk never runs | measured: it runs |
+| 5 | pointer-identity conjunct substitution | measured: the code never reaches that line |
+
+Every one of the five reasoned from plan shape, call structure or cost. The
+answer was a missing switch case behind a swallowed error, and it was found the
+moment the probe stopped asking "which of my theories is right" and started
+asking "where does this function actually return". The general lesson: when a
+rewrite reports success and does nothing, instrument its EXIT PATHS before
+theorising about its inputs — and treat `if err != nil { break }` in a driver
+loop as a place where evidence goes to die.
+
+The five-hypothesis table is left in §9.3b deliberately. A future reader
+comparing it with this section learns more from the sequence than from the
+answer.

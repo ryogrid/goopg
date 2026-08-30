@@ -88,8 +88,9 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
 ### 3 — `cost_index`'s `loop_count` arm — **LANDED** (`07f4f7814`), see DESIGN §9
 
-**Carries a known regression: Q2 1.6 s -> 84.4 s.** Revert this one commit to
-undo it; nothing else depends on it.
+**Its Q2 regression is FIXED** by `f95d85ae2` (DESIGN §9.5): the decorrelation
+cloner had no `*NestedLoopIndexJoin` arm and failed silently behind a swallowed
+error. Q2 84.4 s -> 1.9 s, all plan-shape gains retained.
 
 - [x] Implemented faithfully (`index_pages_fetched` over `tuples * loop_count`,
       pro-rated; `get_loop_count` = smallest outer row count)
@@ -130,8 +131,11 @@ undo it; nothing else depends on it.
 - [x] Measured `UNNESTWALK sublinks 1 -> 1` across `unnestSubqueriesInPlan` at
       Q2's outer level — the walk does NOT remove it, so no later pass
       re-introduces it. Candidate (3) eliminated
-- [ ] **Leading hypothesis (#5 — test before acting; the first four were
-      wrong)**: `unnestSubquery`'s substitution is by POINTER IDENTITY —
+- [x] **RESOLVED** (`f95d85ae2`) — and it was none of the five hypotheses. The
+      cloner `clonePlanReplacingOuter` had no `*NestedLoopIndexJoin` arm; the
+      error is swallowed by the driver loop's `if err != nil { break }`, so the
+      sublink silently stayed a SubPlan. See DESIGN §9.5-9.6
+- [ ] ~~Leading hypothesis (#5)~~ — superseded: `unnestSubquery`'s substitution is by POINTER IDENTITY —
       `if c == conjunct` over `splitAnd(filter.Predicate)` — and if
       `findFilterContainingSubquery` returns a conjunct that is not one of
       `splitAnd`'s top-level elements (nested conjunct, under an OR, or the two
