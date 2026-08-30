@@ -1,6 +1,8 @@
 # PG plan parity — what is actually missing
 
-**Status:** **survey only — no planner code has been changed.** §7 says why.
+**Status:** **item 0 landed and gated (`9db8a0970`); gaps A/B/C not started**,
+each blocked on a specific missing piece of infrastructure identified at source
+level. §7 says what and why.
 **Date:** 2026-08-30 (rewritten after adversarial review; §8)
 **Branch:** `perf-opt-take6`
 **Baseline:** `edfca5d43`
@@ -171,6 +173,26 @@ Note goopg's promotion consults **no visibility map**, which is the opposite of
 what an earlier draft assumed. Making this a per-relation path-generation
 decision is the work; porting a predicate is not.
 
+**Blocker (verified 2026-08-30).** Even that framing understates it. The
+peephole derives coverage from the **top-level `Project`'s target list** — that
+is the only place it can learn which columns are still wanted. Inside a join
+tree no such Project exists, so the question has nothing to read. PG answers it
+from `rel->reltarget`, populated by `build_base_rel_tlists` /
+`add_vars_to_targetlist` out of `baserel->attr_needed`. In goopg:
+
+```
+$ grep -rn "attr_needed\|reltarget\|neededCols\|attrs_used" internal/optimizer/
+(no matches)
+```
+
+and no `path*.go` file mentions `IndexOnlyScan` at all — the path model has no
+index-only path type; IOS exists solely as a post-hoc rewrite. So A is
+**building per-relation attribute-usage analysis and an index-only path type**,
+not relocating a predicate. Confirmed shapes: Q13's IOS is a hash **build side**
+(`Index Only Scan using customer_pk` feeding `Hash`), Q16's is a
+`Parallel Index Only Scan` inside a `Parallel Hash Join` — neither is under a
+Project.
+
 ### B — Bitmap: never parameterised, and fed a 1-row estimate
 
 Answering the question an earlier draft left open: `buildOneBitmapPath` returns
@@ -204,6 +226,18 @@ So B is **not** a cost-calibration item. Comparing `costBitmapHeapScan` against
 `cost_bitmap_heap_scan` would find nothing, because the formulas are being fed
 1 and 1.0.
 
+Reason 3 is now fixed — see **item 0** below. Reasons 1 and 2 remain, and behind
+them sits a harder blocker:
+
+**Blocker (verified 2026-08-30).** A parameterised bitmap path would have **no
+consumer**. `NestedLoopIndexJoin.Inner` is typed `*IndexScan`
+(`plan.go:801`), and `pathparamindex.go` already documents the NLI constructor
+as the *only* consumer of a parameterised path. Emitting a parameterised bitmap
+path before that type is generalised would let the DP price a plan the plan
+builder must refuse — the precise failure that file warns against. B therefore
+needs a join-node change (plus confirmation that the bitmap executor rescans per
+outer row) *before* `RequiredOuter` and `matchBitmapIndexQuals` are touched.
+
 ### C — Nested Loop under-preferred (1 vs 25)
 
 Parameterised inner index paths **are** generated —
@@ -213,6 +247,15 @@ Anti Join. So existence is settled. The open question is why that arm loses to
 hash 23 times out of 25, and §4-B's hardcoded 1-row estimate is a prime
 suspect: an inner priced at 1 row makes the *loop* look cheap but also makes the
 index scan's own cost degenerate, and the same constant feeds join costing.
+
+**Update (item 0 landed).** The hardcoded 1 is gone; `indexScanRows` now returns
+selectivity x reltuples (`var_eq_non_const` per equality column, `DEFAULT_INEQ_SEL`
+per range bound), with a unique index fully bound by equality still returning 1.
+`s_nationkey = 5` moved rows=1 -> rows=400 (PG: 378). The census response was
+Index Scan 25 -> 16 — index scans stopped being artificially cheap — but **0
+bitmap, 0 IOS, 1 nested loop is unchanged**, which retires the "prime suspect"
+hypothesis above: the constant was a real defect, and it was not what was
+suppressing the three shapes. All 24 TPC-H result sets stayed byte-identical.
 
 **B and C likely share one root cause with A's sibling problem** — the reachable
 path space lacks parameterised shapes, and cardinality for keyed scans is a
@@ -235,23 +278,32 @@ expressible as "PG's `costsize.c`/`indxpath.c` does X, and goopg now does X".
 
 ## 7. Why this stops at the design
 
-**No planner code has been changed**, and the corrected diagnoses in §4 are why
-that is the right call rather than a shortfall to apologise for: the work is
-larger than the earlier draft implied, and in three of four cases it is *not*
-the work that draft named.
+**Item 0 shipped; A, B and C did not.** The corrected diagnoses in §4 are why,
+and the reason is not "this is large" in the abstract — each gap turned out to
+be gated on a concrete piece of infrastructure that does not exist yet:
 
-- A is relocating an existing coverage check from a top-of-plan peephole into
-  per-relation path generation.
-- B is adding parameterised bitmap paths **and** fixing a cardinality constant
-  that affects every keyed index scan in the system.
-- C shares B's cardinality dependency.
+- **Item 0** (the cardinality constant) — **DONE**, `9db8a0970`, fully gated.
+  It was a prerequisite for B and C and a real defect in its own right.
+- **A** needs per-relation attribute-usage analysis (PG `attr_needed` /
+  `reltarget`) and an index-only *path* type. Neither exists; grep returns
+  nothing for either. Not a relocation.
+- **B** needs `NestedLoopIndexJoin.Inner` generalised beyond `*IndexScan`, or a
+  parameterised bitmap path has no consumer and the DP prices unbuildable plans.
+- **C** overlaps B rather than being independent: PG's six nested loops here are
+  largely the *same* plans as its six bitmap scans (bitmap-heap inners in Q2,
+  Q11, Q17, Q20, Q21), so C cannot be reproduced without B.
+
+Item 0 also settled an open question the other way: fixing the cardinality
+constant did **not** move IOS/bitmap/nested-loop counts, so the remaining gaps
+are structural (missing path shapes), not mis-costing.
 
 In this repository a planner change carries the project's most expensive failure
 mode — silent row-count regressions, 608 anchors, documented multi-loop
 bisects — so the gate is all 22 TPC-H queries plus the TPC-DS SF0.5 sweep, not
 the query being targeted. Landing any of the above half-gated would be worse
-than landing nothing. [TODO.md](TODO.md)'s implementation boxes are all
-unticked.
+than landing nothing. Item 0 cleared that bar: 24/24 result sets compared with
+`cmp`, `tpch-spotcheck` PASS, units 43/43, `-race` clean. See
+[TODO.md](TODO.md).
 
 ## 8. Review record
 
