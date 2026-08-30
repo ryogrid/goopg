@@ -418,8 +418,16 @@ refuse — the exact failure that file warns about.
         agree — so a consumer that builds `in.merged` inconsistently with
         `BitmapHeapScan.Output()` produces exactly this class of crash and no
         earlier complaint.
-      - So: assert `len(in.merged) == len(outer.Output()) + len(inner.Output())`
-        in the consumer before doing anything else, and write the unit test to
+      - **DONE, and it is now permanent** (`6d6249c60`): the check lives in
+        `nestedLoopIndexJoinOp.Open` for ALL inner kinds, so retrying the bitmap
+        work will produce a NAMED error identifying the width mismatch instead
+        of the deep `index out of range` panic. Writing it also surfaced that
+        the invariant is CONDITIONAL — a semi/anti join publishes the outer's
+        schema alone, so `cols` is deliberately longer there. The first draft
+        asserted `outer+inner` unconditionally and broke four existing
+        semi/anti tests, which is the fastest possible confirmation that the
+        rule needed both cases.
+      - Remaining: with that check in place, and write the unit test to
         drive a bitmap inner through `nestedLoopIndexJoinOp` directly so the
         failure surfaces without a 6M-row query. Consider making that assertion
         permanent in `Open` for ALL inner kinds — the index arm has simply never
