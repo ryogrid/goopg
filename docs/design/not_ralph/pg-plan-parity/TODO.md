@@ -3,9 +3,10 @@
 Companion to [DESIGN.md](DESIGN.md). Status is the truth of the tree, not an
 aspiration.
 
-**No planner code has been changed.** The survey is complete and the three gaps
-are diagnosed (three of them re-diagnosed after review — see DESIGN §8).
-Everything under "Implementation" is unstarted.
+**Item 0 is LANDED and gated** (`9db8a0970`). A, B and C are not started, and
+each is now blocked on a specific, identified piece of missing infrastructure —
+recorded below so the next pass starts from the blocker rather than re-deriving
+it.
 
 Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
@@ -39,20 +40,34 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 
 ## Implementation — none started
 
-### 0 — `indexScanRows`' hardcoded 1  ← do this first
+### 0 — `indexScanRows`' hardcoded 1 — **DONE** (`9db8a0970`)
 
-- [ ] `cardinality.go:294-297` returns 1 for any keyed index scan. goopg
-      estimates 1 row where PG estimates 378 on the same predicate.
-- [ ] Replace with a selectivity-derived estimate (PG: `btcostestimate` →
-      `genericcostestimate`, and `clauselist_selectivity`)
-- [ ] This is a prerequisite for B and probably for C — it is listed first
-      because every other item is priced against it
-- [ ] **Full row-count gate**: all 22 TPC-H queries + TPC-DS SF0.5
+- [x] Replaced the flat 1 with selectivity x reltuples, using
+      `varEqNonConstSelectivity` (PG `var_eq_non_const`) per equality column and
+      `DEFAULT_INEQ_SEL` per range bound
+- [x] A unique index fully bound by equality still returns 1; no-stats still
+      returns 1
+- [x] Measured: `s_nationkey = 5` goes rows=1 -> rows=400 (PG 378)
+- [x] **Full row-count gate**: all 24 TPC-H result sets byte-identical (`cmp`)
+      to the pre-change binary on the same cluster
+- [x] tpch-spotcheck PASS, units 43/43, `-race` clean
+- [x] Two tests updated: the one that pinned the old constant as "the blast
+      radius" (that guard was the defect), and a pass-through test that
+      hardcoded 1 while its comment said not to
 
-### A — Index Only Scan (Q13, Q16, Q22)
+### A — Index Only Scan (Q13, Q16, Q22) — BLOCKED on attribute-usage analysis
 
-- [ ] Move the coverage decision from the top-of-plan peephole into
-      per-relation path generation, so it can reach scans inside join trees
+**Blocker found.** The existing promotion derives coverage from the TOP-LEVEL
+`Project`'s target list (`planner.go:1691-1704`, matching
+`Project(Filter?(IndexScan))`). Inside a join tree there is no such Project, so
+the question "which columns does the rest of the plan still need from this
+relation" has no answer to read. PG answers it with `baserel->attr_needed`,
+built during `build_base_rel_tlists`/`deconstruct_jointree`. **That analysis
+does not exist in goopg**, and it is the real prerequisite — not a relocation
+of the existing check.
+
+- [ ] Build a per-relation attribute-usage set (PG `attr_needed`)
+- [ ] Move the coverage decision into per-relation path generation on top of it
 - [ ] Give the search rel an `allvisfrac`; note `relsize.go:424` documents its
       absence deliberately, so this is a new planner input, not a plumbing fix
 - [ ] `cost_index` to charge heap fetches against it
@@ -63,9 +78,19 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started
 - [ ] Verify Q22, Q16, Q13 flip **on cost**, no query-specific test
 - [ ] Full row-count gate
 
-### B — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans)
+### B — Bitmap (Q2, Q11, Q17, Q20, Q21 — 6 scans) — BLOCKED on a consumer
 
-- [ ] Depends on item 0
+**Blocker found.** All six of PG's bitmap scans here are nested-loop inners with
+an outer-var `Index Cond`, so goopg needs *parameterised* bitmap paths. But
+`NestedLoopIndexJoin.Inner` is typed **`*IndexScan`**, and `pathparamindex.go`
+already documents that the NLI constructor is the only consumer of a
+parameterised path. A parameterised bitmap path would therefore have no
+consumer, and generating one would let the DP price a plan the builder must
+refuse — the exact failure that file warns about.
+
+- [ ] Generalise `NestedLoopIndexJoin.Inner` (or add a bitmap-inner join node)
+- [ ] Confirm the bitmap executor supports rescan-per-outer-row
+- [x] Item 0 (the 1-row estimate feeding bitmap comparisons) — done
 - [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`)
 - [ ] Let join clauses contribute index quals (`matchBitmapIndexQuals`)
 - [ ] Verify at least one query flips on cost
