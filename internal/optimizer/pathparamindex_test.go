@@ -414,11 +414,24 @@ func TestVarEqNonConstSelectivityFractionForm(t *testing.T) {
 	if got >= 1.0/200.0 {
 		t.Errorf("selectivity %v is no sharper than DEFAULT_NUM_DISTINCT; the fraction form was ignored", got)
 	}
-	// The absolute form still wins when both are present: PG returns on
-	// `stadistinct > 0` before it ever looks at the relation size.
-	both := &catalog.ColumnStats{NDistinct: 50, NDistinctFrac: 0.9}
-	if got := varEqNonConstSelectivity(both, relRows); got != 1.0/50.0 {
-		t.Errorf("selectivity with both forms = %v; want the absolute 1/50", got)
+	// When BOTH forms are present the winner is decided by PG's analyze.c
+	// rule, which `ColumnStats.StaDistinct` implements: a fraction above 0.1
+	// means "distinctness scales with the relation", so it wins over the
+	// absolute count rather than losing to it.
+	//
+	// An earlier version of this test asserted the opposite (absolute always
+	// wins) because the function under test open-coded its own reduction. That
+	// assertion was pinning a divergence from `getVariableNumDistinct`
+	// (joinselectivity.go), which the join estimator uses on the same columns —
+	// two different distinct counts for one column in one plan.
+	bigFrac := &catalog.ColumnStats{NDistinct: 50, NDistinctFrac: 0.9}
+	if got, want := varEqNonConstSelectivity(bigFrac, relRows), 1.0/clampRowEst(0.9*relRows); got != want {
+		t.Errorf("selectivity with frac>0.1 and an absolute count = %v; want the fraction to win (%v)", got, want)
+	}
+	// Below the 0.1 threshold the absolute count is used.
+	smallFrac := &catalog.ColumnStats{NDistinct: 50, NDistinctFrac: 0.05}
+	if got := varEqNonConstSelectivity(smallFrac, relRows); got != 1.0/50.0 {
+		t.Errorf("selectivity with frac<=0.1 = %v; want the absolute 1/50", got)
 	}
 	// No relation size to scale by: PG "punts" to the default rather than
 	// treating the fraction as an absolute count.

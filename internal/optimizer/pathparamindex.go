@@ -514,52 +514,26 @@ func varEqNonConstSelectivity(stats *catalog.ColumnStats, relRows float64) float
 	return sel
 }
 
-// variableNumDistinct is `get_variable_numdistinct` (selfuncs.c:5843): how many
-// distinct values a column holds, from whichever of ANALYZE's two renderings is
-// available.
+// variableNumDistinct is `get_variable_numdistinct` (selfuncs.c:6341) for the
+// case this file needs, and it is a THIN WRAPPER on purpose.
 //
-// PG keeps ONE field, `stadistinct`, and overloads its sign: positive is an
-// absolute count, negative is a count expressed as a FRACTION of the relation's
-// rows (`-stadistinct * ntuples`), and zero means unknown. goopg splits the two
-// senses across `NDistinct` and `NDistinctFrac` (catalog.go) — but the estimator
-// only ever read the absolute one, so a column carrying only the fraction was
-// read as "unknown" and fell to DEFAULT_NUM_DISTINCT.
+// The reduction it performs — absolute count, else fraction times relation
+// size, else the small-relation/default split — had already been written and
+// centralised in `getVariableNumDistinct` (joinselectivity.go). An earlier
+// version of this function open-coded it again, which made it the FOURTH copy
+// (`catalog.go`'s `StaDistinct` comment names the three) and, worse, a copy
+// that disagreed: it returned the absolute `NDistinct` whenever that was
+// positive, while `StaDistinct()` applies PG's analyze.c rule that the FRACTION
+// wins once it exceeds 0.1, absolute count or not. ANALYZE sets both fields, so
+// for any column with `NDistinctFrac > 0.1` the join estimator and this one
+// would have returned different distinct counts for the same column in the
+// same plan — the exact sibling-path divergence this repo has been bitten by
+// repeatedly, and silent because both answers are plausible.
 //
-// That was not a corner case on this workload; it is the normal state of a
-// restarted server, because the absolute count is derived from a row count that
-// is not restored (`TableStats.RowCount`, ledger row pq-P6) while the
-// scale-free fraction survives. TPC-H `lineitem.l_orderkey` reads
-// `NDistinct=0, NDistinctFrac=0.202` on a restarted cluster: 1.2 M distinct
-// values estimated as 200, so `l_orderkey = <outer>` matched 0.005 of the
-// relation instead of 8.25e-7 — 6000x too many rows. That is what made the
-// parameterised inner of TPC-H Q3 cost 36 billion against the hash join's
-// 1.9 million and kept goopg off PG's plan.
-//
-// The final two branches are PG's too, and they are not symmetric with each
-// other: with no data at all, a relation SMALLER than DEFAULT_NUM_DISTINCT is
-// assumed to have one distinct value per row, and only a larger one falls back
-// to the constant — "so that the behavior isn't discontinuous" (selfuncs.c).
+// So the only thing left here is the shape conversion.
 func variableNumDistinct(stats *catalog.ColumnStats, relRows float64) float64 {
-	if stats == nil {
-		return defaultNumDistinct
-	}
-	// "If we had an absolute estimate, use that." — clamped to >= 1 by
-	// clamp_row_est, which is why a stored 0 cannot masquerade as a count here.
-	if stats.NDistinct > 0 {
-		return clampRowEst(float64(stats.NDistinct))
-	}
-	// "Otherwise we need to get the relation size; punt if not available."
-	if relRows <= 0 || math.IsNaN(relRows) {
-		return defaultNumDistinct
-	}
-	// "If we had a relative estimate, use that." PG's `-stadistinct * ntuples`.
-	if stats.NDistinctFrac > 0 {
-		return clampRowEst(stats.NDistinctFrac * relRows)
-	}
-	if relRows < defaultNumDistinct {
-		return clampRowEst(relRows)
-	}
-	return defaultNumDistinct
+	nd, _ := getVariableNumDistinct(joinVarStats{stats: stats, tuples: relRows})
+	return nd
 }
 
 // columnStatsByName resolves a column name to its ANALYZE statistics, or nil
