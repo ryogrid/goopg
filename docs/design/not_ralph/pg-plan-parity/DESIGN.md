@@ -226,10 +226,31 @@ rather than left in as dead code.
 
 So gap A is not "port a predicate" (draft 1) and not "add `attr_needed`"
 (draft 2). It is: **give the promotion something to attach to inside a join
-tree**, which means either an index-only PATH costed as index-only during
-generation, or schema narrowing with ancestor remapping — i.e. a column-pruning
-pass. Both are real work; neither is a coverage predicate. Supporting evidence
-for how absent the path form is:
+tree**.
+
+**(c) And the path form does not escape the schema problem either.** Tracing the
+plumbing: `searchCtx` (joinsearch.go) carries no output-column information at
+all, and neither does `joinlistProblem` (relfromjoinlist.go:82) — bindings,
+scans, relInfos, conjuncts, cumOffsets, cp, cat, joinInfoList, and nothing about
+what the statement selects. So an index-only path needs a needed-columns channel
+threaded from `planner.go` down through the joinlist construction. That is
+mechanical. But the *consumer* is not: `createIndexScanPlan`
+(createplanindex.go) rebuilds the leaf with `schema: id.schema`, the full table
+width, and an index-only variant by definition cannot produce the columns the
+index does not carry. Narrowing it breaks every positional `ColumnRef` above it
+in the join tree — the same wall as (b).
+
+**Why PG does not hit this wall.** PG's plan tree addresses columns with `Var`
+nodes carrying `varno`/`varattno` — relation-qualified, so narrowing a scan's
+output changes nothing above it. goopg's `ColumnRef.Index` is POSITIONAL into
+the node's input schema, and a join's schema is the concatenation
+`outer || inner`, so narrowing any input shifts every position above it. That
+single representational difference is why `check_index_only` is a local
+predicate in PG and a cross-cutting refactor here.
+
+The honest scope for gap A is therefore: a column-pruning/remap pass, with the
+index-only path costed on top of it. Neither half alone is sufficient.
+Supporting evidence for how absent the path form is:
 
 ```
 $ grep -rn "attr_needed\|reltarget\|neededCols\|attrs_used" internal/optimizer/

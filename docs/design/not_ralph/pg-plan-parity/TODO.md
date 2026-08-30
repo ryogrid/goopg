@@ -133,7 +133,18 @@ experiment (DESIGN §4-A):
       queries. It fires **zero times** and moves the census by nothing: inside a
       join tree there is no `*Project` above the scan for it to consume. Removed
       rather than left as dead code
-- [ ] So the work is one of these two, and neither is a coverage predicate:
+- [x] Checked whether the PATH form escapes the schema problem. It does not:
+      `searchCtx` and `joinlistProblem` carry no output-column information (so a
+      needed-columns channel must be threaded from planner.go — mechanical), but
+      `createIndexScanPlan` rebuilds the leaf at full table width and an
+      index-only variant cannot produce the columns the index lacks. Narrowing
+      it breaks every positional ColumnRef above it
+- [x] Root cause named: PG addresses columns with relation-qualified
+      `Var(varno, varattno)`, so narrowing a scan is invisible above it. goopg's
+      `ColumnRef.Index` is POSITIONAL into a concatenated `outer || inner` join
+      schema, so narrowing any input shifts everything above. That is why this
+      is local in PG and cross-cutting here
+- [ ] So the work is BOTH of these, not either:
   - [ ] an index-only PATH generated and costed as index-only
         (`check_index_only` + `cost_index(indexonly=true)`), so the choice
         between a seq scan and a covering index is made on cost — this is what
