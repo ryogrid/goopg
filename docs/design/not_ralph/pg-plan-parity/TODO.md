@@ -427,6 +427,26 @@ refuse — the exact failure that file warns about.
         asserted `outer+inner` unconditionally and broke four existing
         semi/anti tests, which is the fastest possible confirmation that the
         rule needed both cases.
+      - **HYPOTHESIS TESTED AND DISPROVED (2026-08-31).** The bitmap producer
+        and consumer were rewritten with `6d6249c60`'s width check live, and the
+        check **did not fire** — the planner's merged schema and the children's
+        operator widths DO agree. The same
+        `index out of range [7] with length 0` panic occurs, in
+        `evalPredicateSlot` on the SERIAL path (Q17's stack is
+        `aggregateOp.Open -> filterOp -> projectOp -> nliOp.Next`, no Gather),
+        so it is not the parallel hash-build path either.
+
+        What is now eliminated: the bitmap emit path (`fetchExact` sets a
+        cloned, correctly-sized row), `slotRow` (it is `slot.Row()`, and the
+        bitmap returns a `*MaterializedSlot` exactly as `indexScanOp` does),
+        the merged-schema width mismatch, and the parallel path.
+
+        What is left: `VirtualSlot.Get` dispatched to a `MaterializedSlot` whose
+        `row` was nil at that moment, with widths consistent. So the next probe
+        should print, at the `evalPredicateSlot` call site,
+        `len(o.outerMS.row)`, `len(o.innerMS.row)`, `o.outerWidth` and the
+        predicate's ColumnRef indexes — i.e. find WHICH side was empty and WHEN,
+        rather than reasoning about which side ought to be.
       - Remaining: with that check in place, and write the unit test to
         drive a bitmap inner through `nestedLoopIndexJoinOp` directly so the
         failure surfaces without a 6M-row query. Consider making that assertion
