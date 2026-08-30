@@ -310,7 +310,7 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			o.touchedBlocks[ptr.Block] = struct{}{}
 		}
 		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID, ctx.MultiXact,
-		ctx.CmdID, ctx.comboStore())
+			ctx.CmdID, ctx.comboStore())
 		// M0118-0001: SSI phantom conflict-out for an index-only-scanned tuple
 		// present at this TID but invisible because a concurrent transaction
 		// inserted it — the IOS analog of the seq-scan invisible-tuple path. The
