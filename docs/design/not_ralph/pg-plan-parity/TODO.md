@@ -341,6 +341,19 @@ refuse — the exact failure that file warns about.
       (`nliInnerIndexScan`), the subplan walkers, and the createplan
       assertions. That is the number behind "multi-day", and it is why stage 1
       alone — which is genuinely mechanical — buys nothing on its own
+- [x] **MEASURED, not estimated** (after grep oversized stage 2 by 10x). The
+      bitmap executor half is SMALL: `bitmapIndexScanOp.Open` is 36 lines and is
+      already effectively an `openPrep` — it does locks + `openIndexBTree` and
+      nothing else, because the actual scan lives in `buildBitmap`, which
+      `bitmapHeapScanOp` calls through the `bitmapProducer` interface.
+      `bitmapHeapScanOp.Open` is 53 lines. So the rescan split is roughly
+      "`buildBitmap` again + reset the iteration", not a 262-line dissection
+      like `indexOnlyScanOp` was
+- [x] And stage 2 already removed the OTHER blocker: `NestedLoopIndexJoin.Inner`
+      is now `Node`, so a `*BitmapHeapScan` may legally sit there. What is still
+      needed on top: an arm in `nliInnerProbe` (or a decision that a bitmap
+      inner is not a "probe" in that sense), an arm at the executor build site,
+      and the planner half below
 - [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
       one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
       (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over
@@ -350,7 +363,13 @@ refuse — the exact failure that file warns about.
       difference between a bounded task and an open-ended one
 - [ ] Generalise `NestedLoopIndexJoin.Inner` (or add a bitmap-inner join node)
 - [x] Item 0 (the 1-row estimate feeding bitmap comparisons) — done
-- [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`)
+- [ ] Allow parameterised bitmap paths (`pathbitmap.go:177` `RequiredOuter: 0`).
+      `matchBitmapIndexQuals` (pathbitmap.go:234) matches only `col = const` via
+      `normalizeColumnConst`; a parameterised sibling would mirror
+      `addParameterizedIndexPaths`. THIS is the remaining bulk — the three
+      bitmap planner files total 871 lines, and this adds a parameterised path
+      producer plus its createplan consumer. Size it by building it, not by
+      grepping it
 - [ ] Let join clauses contribute index quals (`matchBitmapIndexQuals`)
 - [ ] Verify at least one query flips on cost
 - [ ] Full row-count gate
