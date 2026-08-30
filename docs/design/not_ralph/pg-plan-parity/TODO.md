@@ -456,7 +456,15 @@ experiment (DESIGN §4-A):
       is exactly the direction needed to explain the cancellation.
       `qualEvalCost(cp, nQuals, rows)` already exists; the work is threading a
       qual count into `costBitmapHeapScan`, which does not receive one today
-- [ ] **Land the two together, never separately** — each alone makes the census
+- [x] **TRIED, and it is NOT the counterweight — negative result.** The qpqual
+      term was implemented and landed together with the double-count removal:
+      the census stayed at **24** bitmap scans, unchanged. `qualEvalCost` is
+      `cpu_operator_cost x numQuals x tuples` and the recheck lists hold one or
+      two clauses, so against page costs in the hundreds it is noise. Both
+      changes were reverted; the branch keeps the double charge and its
+      matching-6 census. Look for a term of the same ORDER as `indexTotalCost`,
+      not for more per-tuple CPU
+- [ ] ~~Land the two together, never separately~~ — each alone makes the census
       worse — and gate on the census SHAPE rather than its count: goopg should
       end at PG's 6 scans AND on PG's five queries, where today it has 6 scans
       but on q08 instead of q02

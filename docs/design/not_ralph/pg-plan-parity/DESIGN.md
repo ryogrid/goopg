@@ -1097,3 +1097,25 @@ from `compute_bitmap_pages` on the `maxentries` / lossy-degradation path.
 The general form is worth keeping: **when fixing a verified bug moves a system
 further from its reference, look for the second bug it was cancelling** rather
 than reverting the fix and calling the reference wrong.
+
+### 13.4 The qpqual term is real but far too small — NEGATIVE RESULT
+
+§13.3 named `qpqual_cost.per_tuple` as the missing counterweight. It is genuinely
+missing — PG computes `cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple`
+and goopg charged `cpu_tuple_cost` alone — but implementing it and landing it
+together with the double-count removal leaves the census at **24** bitmap scans,
+unchanged from removing the double count on its own.
+
+The arithmetic says why: `qualEvalCost` is
+`cpu_operator_cost x numQuals x tuples`, and the recheck lists here hold one or
+two clauses. Against page costs in the hundreds, one or two `cpu_operator_cost`
+units per tuple is noise. So the qpqual gap is worth fixing for fidelity, but it
+is **not** what the double charge was compensating for, and §13.3's hypothesis
+is only half right: the two errors do cancel, but the second one is still
+unidentified and is much larger than this.
+
+The state left on the branch is therefore the double charge RETAINED — which
+gives Bitmap Heap Scan 6, PG's count, on four of PG's five queries — with both
+the double-count removal and the qpqual term written up but unlanded. Anyone
+resuming should look for a term of the same order as `indexTotalCost` itself,
+not for more per-tuple CPU.
