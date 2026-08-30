@@ -519,7 +519,12 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)), totalTablePages: totalPages,
 	})
-	pagesFetched := computeBitmapPages(tuplesFetched, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
+	// `get_loop_count` (indxpath.c:2328): the smallest row count among the
+	// relations supplying the parameter. The path cost stays per-execution — PG
+	// pro-rates inside `compute_bitmap_pages` — so the join above still
+	// multiplies by the outer row count without double-counting.
+	pagesFetched := computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalPages,
+		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(req))
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
 		Rows:          parameterizedBaserelRows(rel, nil, sel),

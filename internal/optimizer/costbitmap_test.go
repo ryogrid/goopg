@@ -126,12 +126,20 @@ func TestCostBitmapHeapScan_Components(t *testing.T) {
 
 	// Total = startup + runCost + indexCost.Total
 	// runCost = pageCost * pagesFetched + cpuTupleCost * tuplesFetched
-	// pageCost = sqrt(100/1000)*4 + (1-sqrt(0.1))*1 = sqrt(0.1)*4 + (1-sqrt(0.1))*1
-	// sqrt(0.1) ≈ 0.3162
-	// pageCost ≈ 0.3162*4 + 0.6838*1 = 1.2648 + 0.6838 = 1.9486
-	// runCost ≈ 1.9486*100 + 0.01*500 = 194.86 + 5 = 199.86
-	// Total ≈ 50 + 199.86 + 50 = 299.86
-	wantTotal := 50.0 + (math.Sqrt(0.1)*4+(1-math.Sqrt(0.1))*1)*100 + 0.01*500 + 50.0
+	//
+	// pageCost is PG's, verbatim (cost_bitmap_heap_scan, costsize.c:1071):
+	//   random - (random - seq) * sqrt(pages_fetched / T)
+	//         = 4 - 3*sqrt(0.1) ≈ 4 - 0.9487 = 3.0513
+	// runCost ≈ 3.0513*100 + 0.01*500 = 305.13 + 5 = 310.13
+	// Total   ≈ 50 + 310.13 + 50 = 410.13
+	//
+	// This expectation previously encoded `sqrt*random + (1-sqrt)*seq`, which is
+	// PG's interpolation RUN BACKWARDS — it approaches sequential cost as the
+	// touched fraction SHRINKS. The test therefore pinned the defect, and it is
+	// worth noting which direction the error ran: a small fraction (here 10%)
+	// came out too CHEAP, and a large one too EXPENSIVE. The large-fraction end
+	// is what kept TPC-H Q2's `supplier` bitmap at 2588.7 against PG's 43.46.
+	wantTotal := 50.0 + (4-3*math.Sqrt(0.1))*100 + 0.01*500 + 50.0
 	if math.Abs(cost.Total-wantTotal) > 1e-9 {
 		t.Errorf("Total = %v, want ~%v", cost.Total, wantTotal)
 	}

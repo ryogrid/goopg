@@ -36,18 +36,35 @@ func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetch
 	// and the heap side is the run cost.
 	startup := indexCost.Total
 
-	// Per-page cost: interpolate between random_page_cost (few pages) and
-	// seq_page_cost (nearly the whole table). PG uses the square root of the
-	// ratio (costsize.c:1080-1087) — `sqrt(pages_fetched / T) * random +
-	// (1 - sqrt(...)) * seq`. The interpolation is clamped so a tiny fraction
-	// stays close to random_page_cost and a near-whole-table scan approaches
-	// seq_page_cost.
-	frac := 0.0
-	if T > 0 && pagesFetched > 0 {
-		frac = math.Sqrt(pagesFetched / T)
+	// Per-page cost, interpolating between random_page_cost (a few scattered
+	// pages) and seq_page_cost (nearly the whole table). PG, verbatim
+	// (`cost_bitmap_heap_scan`, costsize.c:1069-1075):
+	//
+	//	if (pages_fetched >= 2.0)
+	//		cost_per_page = spc_random_page_cost -
+	//			(spc_random_page_cost - spc_seq_page_cost) * sqrt(pages_fetched / T);
+	//	else
+	//		cost_per_page = spc_random_page_cost;
+	//
+	// The direction matters and this code had it BACKWARDS: it computed
+	// `sqrt*random + (1-sqrt)*seq`, which moves TOWARD random as more of the
+	// relation is touched. PG moves toward SEQUENTIAL, because a bitmap scan
+	// that visits most pages reads them in physical order — which is the entire
+	// reason the access method exists. goopg's own comment described PG's
+	// behaviour ("a near-whole-table scan approaches seq_page_cost") while the
+	// expression below it did the opposite, so the two never contradicted each
+	// other in review.
+	//
+	// Measured: TPC-H Q2's `supplier` bitmap (the scan PG picks) was priced at
+	// 2588.7 against PG's 43.46. Charging ~3x per page is most of that gap.
+	//
+	// The `pages_fetched >= 2` guard is PG's too: a single-page fetch has no
+	// sequentiality to exploit, so it stays at full random cost rather than
+	// being discounted by a ratio that is meaningless at one page.
+	pageCost := cp.randomPageCost
+	if pagesFetched >= 2.0 && T > 0 {
+		pageCost = cp.randomPageCost - (cp.randomPageCost-cp.seqPageCost)*math.Sqrt(pagesFetched/T)
 	}
-	// Clamp: the fraction is already bounded [0, 1] by sqrt of a [0, 1] ratio.
-	pageCost := frac*cp.randomPageCost + (1-frac)*cp.seqPageCost
 
 	runCost := pageCost * pagesFetched
 
@@ -77,8 +94,34 @@ func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetch
 // and every tuple on those pages is fetched — matching PG's lossiness correction
 // (costsize.c:889-908).
 func computeBitmapPages(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize float64, maxEntries int) float64 {
+	return computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize, maxEntries, 1)
+}
+
+// computeBitmapPagesLooped is `compute_bitmap_pages` with PG's `loop_count`
+// (costsize.c:6514). A bitmap scan re-executed once per outer row does NOT
+// fetch `loop_count` times the pages of one execution, because the pages the
+// second scan wants are largely the ones the first already brought in — so PG
+// runs Mackert-Lohman over the tuples ALL the scans fetch and pro-rates back to
+// one:
+//
+//	pages_fetched = index_pages_fetched(tuples_fetched * loop_count, …);
+//	pages_fetched /= loop_count;
+//
+// Without this a parameterised bitmap is priced as though every one of its
+// executions re-read the relation cold, which is what kept TPC-H Q8's bitmap —
+// the shape PG chooses — losing to a plain index probe. It is the exact
+// counterpart of the `loop_count > 1` arm `cost_index` gained in 07f4f7814.
+func computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize float64, maxEntries int, loopCount float64) float64 {
 	if T <= 0 || tuplesFetched <= 0 {
 		return 0
+	}
+	if loopCount > 1 {
+		scaled := indexPagesFetched(tuplesFetched*loopCount, int64(T), indexPages, totalTablePages, effectiveCacheSize)
+		scaled /= loopCount
+		if scaled >= T {
+			scaled = T
+		}
+		return math.Ceil(scaled)
 	}
 
 	// Mackert-Lohman page-count estimate, with cache effects when the caller
