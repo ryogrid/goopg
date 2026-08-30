@@ -238,15 +238,26 @@ refuse — the exact failure that file warns about.
       is a nested-loop ANTI-join inner (its columns are never read, so narrowing
       is invisible there) and all six of gap B's bitmap scans are NL inners.
       **This is the highest-leverage next step in the whole document**
-- [x] SIZED stage 1, and it is not a quick win: `indexOnlyScanOp.Open` is **262
-      lines** covering relation + index locks, SERIALIZABLE predicate locking
-      (`ssiRecordRelationRead`), hash-index bucket-grain locking, key
-      resolution and row materialisation. Splitting it into a one-time
-      `openPrep` plus a per-scan part — the shape `indexScanOp` already has —
-      means deciding, for each of those, whether it is per-OPEN or per-RESCAN.
-      Get the SSI half wrong and the result is an isolation bug, not a slow
-      query, so this needs the isolation suite in its gate and not just the
-      TPC-H one
+- [x] SIZED stage 1. `indexOnlyScanOp.Open` is **262 lines** covering relation +
+      index locks, SERIALIZABLE predicate locking, hash-index bucket-grain
+      locking, key resolution and row materialisation
+- [x] **Correction to a first, over-cautious reading of that size.** There is a
+      DIRECT PRECEDENT for the split, in the sibling operator, and it settles
+      the question the size raises. `indexScanOp` already has exactly this
+      shape (operators_index.go:274/292/353/362):
+
+      | half | contents |
+      |---|---|
+      | `openPrep` (one-time) | `acquireRelLock`, `acquireScanReadLockTxn`, `acquireScanIndexReadLocksTxn`, `openIndexBTree` |
+      | `Rescan` (per outer row) | reset tids/idx, bind the outer slot, resolve Key/Keys/LowKey/HighKey, decide the gap-lock grain, run the scan |
+      | `Open` | reopen -> `Rescan`; else `openPrep` + `Rescan` |
+
+      So the locks and the relation-grain SIREAD belong to the ONE-TIME half and
+      the per-rescan half is the probe. The allocation is not a judgement call to
+      be re-derived — it is mirrored. That makes stage 1 mechanical rather than
+      isolation-risky, though the isolation suite still belongs in its gate
+      because `indexOnlyScanOp` has one thing `indexScanOp` does not: it
+      materialises `o.rows` in `Open`, so `Rescan` must re-materialise
 - [ ] Add bitmap rescan-per-outer-row to the executor. Note it is a CHAIN, not
       one method: `bitmapHeapScanOp.Open` builds the outer bitmap producer tree
       (`buildNode(o.plan.Outer)`, a BitmapIndexScan or a BitmapAnd/BitmapOr over
