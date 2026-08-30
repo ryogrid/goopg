@@ -124,8 +124,26 @@ built during `build_base_rel_tlists`/`deconstruct_jointree`. **That analysis
 does not exist in goopg**, and it is the real prerequisite — not a relocation
 of the existing check.
 
-- [ ] Build a per-relation attribute-usage set (PG `attr_needed`)
-- [ ] Move the coverage decision into per-relation path generation on top of it
+Diagnosis corrected twice; the current one is backed by a built-and-measured
+experiment (DESIGN §4-A):
+
+- [x] `tryPromoteIndexOnlyScan` is schema-preserving, so applying it at ANY
+      `*Project` needs no ancestor renumbering and no `attr_needed`
+- [x] A tree-wide pass doing exactly that was written and run over all 22
+      queries. It fires **zero times** and moves the census by nothing: inside a
+      join tree there is no `*Project` above the scan for it to consume. Removed
+      rather than left as dead code
+- [ ] So the work is one of these two, and neither is a coverage predicate:
+  - [ ] an index-only PATH generated and costed as index-only
+        (`check_index_only` + `cost_index(indexonly=true)`), so the choice
+        between a seq scan and a covering index is made on cost — this is what
+        PG does and what makes Q13 pick `Index Only Scan using customer_pk`
+  - [ ] or schema narrowing with ancestor remapping (a column-pruning pass),
+        which is the larger and riskier of the two
+- [ ] Smallest reproduction to work against:
+      `SELECT o.o_orderkey FROM orders o JOIN (SELECT c_custkey FROM customer
+      WHERE c_custkey < 100) c ON o.o_custkey = c.c_custkey` — the customer scan
+      is index-only-eligible on every count and is read directly by the join
 - [ ] Give the search rel an `allvisfrac`; note `relsize.go:424` documents its
       absence deliberately, so this is a new planner input, not a plumbing fix
 - [ ] `cost_index` to charge heap fetches against it

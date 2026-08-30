@@ -175,12 +175,47 @@ Note goopg's promotion consults **no visibility map**, which is the opposite of
 what an earlier draft assumed. Making this a per-relation path-generation
 decision is the work; porting a predicate is not.
 
-**Blocker (verified 2026-08-30).** Even that framing understates it. The
-peephole derives coverage from the **top-level `Project`'s target list** — that
-is the only place it can learn which columns are still wanted. Inside a join
-tree no such Project exists, so the question has nothing to read. PG answers it
-from `rel->reltarget`, populated by `build_base_rel_tlists` /
-`add_vars_to_targetlist` out of `baserel->attr_needed`. In goopg:
+**Blocker, sharpened by experiment (2026-08-30).** An earlier draft of this
+section said the blocker was the absence of `attr_needed`. That is true of PG's
+architecture but it is not what stops goopg, and the difference decides how much
+work this is. Two facts, the second found by building the thing and measuring
+it:
+
+**(a) `tryPromoteIndexOnlyScan` is SCHEMA-PRESERVING.** The node it returns
+always has exactly the `*Project`'s own schema — directly
+(`iosSchema = proj.schema`) or by reinstating a narrowing
+`Project{schema: proj.schema}` when a surviving Filter pulled in a column
+outside the target list. So substituting its result for a `*Project` ANYWHERE in
+the tree is invisible to every ancestor. No renumbering, no `attr_needed`: the
+Project already *is* the statement of which columns the rest of the plan wants
+from below it.
+
+**(b) But inside a join tree there is no `*Project` above the scan at all.** A
+tree-wide pass that offers the promotion at every `Project` was written and
+run against all 22 queries. It is correct and it fires **zero times** — the
+census does not move by a single node. Reduced to the smallest case:
+
+```
+EXPLAIN SELECT o.o_orderkey FROM orders o
+        JOIN (SELECT c_custkey FROM customer WHERE c_custkey < 100) c
+          ON o.o_custkey = c.c_custkey;
+
+ Nested Loop
+   ->  Index Scan using customer_pk on customer     <- covered, needs only c_custkey
+         Index Cond: (c_custkey < 100)
+   ->  Index Scan using order_customer_fkidx on orders
+```
+
+The scan is index-only-eligible on every count and the join reads it directly.
+There is no Project to consume, so the pass has no hook point. It was removed
+rather than left in as dead code.
+
+So gap A is not "port a predicate" (draft 1) and not "add `attr_needed`"
+(draft 2). It is: **give the promotion something to attach to inside a join
+tree**, which means either an index-only PATH costed as index-only during
+generation, or schema narrowing with ancestor remapping — i.e. a column-pruning
+pass. Both are real work; neither is a coverage predicate. Supporting evidence
+for how absent the path form is:
 
 ```
 $ grep -rn "attr_needed\|reltarget\|neededCols\|attrs_used" internal/optimizer/
