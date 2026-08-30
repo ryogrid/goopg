@@ -1043,6 +1043,13 @@ type seqScanOp struct {
 	// (runtime.convTslice) and scanRow's identity does not change
 	// between rows. Rebuilt only when scanRow is reallocated.
 	scanSlot SlotView
+	// colInfo is the per-column type resolution (resolveColTypeInfo),
+	// computed once in Open. Without it the decode path re-lowercases each
+	// column's type NAME for every VALUE of every row — three scans of the
+	// same string per value, 4.6-6.1 %% of CPU on TPC-H Q14/Q3. PG's
+	// TupleDesc equivalent. Re-resolved on every Open so an ALTER TABLE that
+	// re-resolves o.cols re-resolves this with it.
+	colInfo []colTypeInfo
 	// pfSlab / pfIdx are the COMPILED form of the prefilter predicate, built
 	// once in Open (where a *Context exists, which constant folding needs) and
 	// immutable after. Per-operator rather than shared: each parallel worker
@@ -1369,10 +1376,12 @@ func (o *seqScanOp) gistRowMatches(row Row) bool {
 // under the boot-default GUCs, so the branch is a cost guard, not a behaviour
 // switch.
 func (o *seqScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
-	if o.arrayStyleLive {
-		return DecodeRowIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx, o.arrayStyle)
+	st := o.arrayStyle
+	if !o.arrayStyleLive {
+		st = array.DefaultOutputStyle()
 	}
-	return DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx)
+	_, err := decodeRowRangeInfo(o.scanRow, o.cols, o.colInfo, data, bitmap, storedNatts, o.sctx, st, 0, len(o.cols), 0)
+	return err
 }
 
 // decodeScanRowRange is decodeScanRow over a column window, returning the byte
@@ -1385,7 +1394,7 @@ func (o *seqScanOp) decodeScanRowRange(data, bitmap []byte, storedNatts, from, t
 	if !o.arrayStyleLive {
 		st = array.DefaultOutputStyle()
 	}
-	return DecodeRowRangeIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx, st, from, to, off)
+	return decodeRowRangeInfo(o.scanRow, o.cols, o.colInfo, data, bitmap, storedNatts, o.sctx, st, from, to, off)
 }
 
 func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
@@ -1458,6 +1467,7 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// after the reopen/rewind branch above so a re-Open under a different
 	// Context — the only way the GUCs can differ mid-operator — re-reads them.
 	o.arrayStyleLive = colsHaveArray(o.cols)
+	o.colInfo = resolveColTypeInfo(o.cols)
 	if o.arrayStyleLive {
 		o.arrayStyle = arrayOutputStyle(ctx)
 	}

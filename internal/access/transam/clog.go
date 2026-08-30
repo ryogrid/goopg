@@ -47,10 +47,24 @@ type CLog struct {
 	// oldestClogXid is the lowest XID whose status is still retained. Below it,
 	// status has been truncated away and callers MUST treat the XID as
 	// committed/frozen (it is older than every relfrozenxid). Mirrors PG's
-	// TransamVariables->oldestClogXid. Guarded by oldestMu so it can be read
-	// without taking slruDirMu. Zero means "no truncation has occurred".
-	oldestMu      sync.RWMutex
-	oldestClogXid storage.TransactionID
+	// TransamVariables->oldestClogXid. Zero means "no truncation has occurred".
+	//
+	// ATOMIC, not mutex-guarded, because it is read ONCE PER TUPLE on the
+	// visibility path (Snapshot.clogSaysNotAborted). Under a 4-worker parallel
+	// scan that RLock/RUnlock pair was 46 % of all atomic RMW traffic and ~5 %
+	// of total CPU on TPC-H Q14 — pure lock bookkeeping on a single uint32.
+	//
+	// It must stay LIVE rather than being hoisted into the snapshot: TruncateCLOG
+	// publishes the new horizon BEFORE deleting the SLRU bytes (see the ordering
+	// note there), so a reader holding a stale, older horizon would fail the
+	// XIDPrecedes short-circuit and fault in a truncated page as all-zero
+	// (= Unknown), which statusCache would then memoise. An atomic load keeps the
+	// value live and costs nothing.
+	// (docs/design/not_ralph/perf-optimize-take6/README.md candidate B.)
+	oldestClogXid atomic.Uint32
+
+	// oldestMu now guards truncateLogger only.
+	oldestMu sync.RWMutex
 
 	// statusCache memoises TERMINAL statuses so the common visibility check
 	// never reaches clogBufferPool's global mutex. See clog_statuscache.go.
@@ -102,18 +116,20 @@ func (c *CLog) SetTruncateLogger(fn func(oldestXid storage.TransactionID) error)
 // XID below this value MUST treat it as committed/frozen (its status bytes are
 // gone). Mirrors TransamVariables->oldestClogXid.
 func (c *CLog) OldestClogXid() storage.TransactionID {
-	c.oldestMu.RLock()
-	defer c.oldestMu.RUnlock()
-	return c.oldestClogXid
+	return storage.TransactionID(c.oldestClogXid.Load())
 }
 
 // AdvanceOldestClogXid monotonically advances oldestClogXid toward xid. It
 // never moves backward (wraparound-safe via txnPrecedes). Mirrors PG
 // varsup.c:AdvanceOldestClogXid.
 func (c *CLog) AdvanceOldestClogXid(xid storage.TransactionID) {
+	// Serialised by oldestMu so the read-compare-store is atomic as a whole;
+	// readers never take the lock, they Load(). Advancing is rare (VACUUM /
+	// truncation), reading is per tuple.
 	c.oldestMu.Lock()
-	if c.oldestClogXid == 0 || txnPrecedes(c.oldestClogXid, xid) {
-		c.oldestClogXid = xid
+	cur := storage.TransactionID(c.oldestClogXid.Load())
+	if cur == 0 || txnPrecedes(cur, xid) {
+		c.oldestClogXid.Store(uint32(xid))
 	}
 	c.oldestMu.Unlock()
 }
@@ -778,9 +794,7 @@ func (c *CLog) TruncateCLOG(oldestXid storage.TransactionID) error {
 	// (2) "Nothing to remove" guard. If oldestClogXid is already at or beyond
 	// oldestXid, this is a no-op replay. Also skip when no on-disk segment or
 	// in-memory bank lies entirely below the cutoff page.
-	c.oldestMu.RLock()
-	cur := c.oldestClogXid
-	c.oldestMu.RUnlock()
+	cur := storage.TransactionID(c.oldestClogXid.Load())
 	if cur != 0 && !txnPrecedes(cur, oldestXid) {
 		return nil // already truncated at or past oldestXid
 	}

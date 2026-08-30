@@ -28,6 +28,19 @@ type SubxactMap struct {
 	parents map[storage.TransactionID]storage.TransactionID // subxid → parent xid
 	aborted map[storage.TransactionID]bool                  // aborted subxids
 
+	// nParents mirrors len(parents) so IsSubxact can answer the overwhelmingly
+	// common "no subtransactions at all" case without taking mu.
+	//
+	// IsSubxact is called ONCE PER TUPLE on the visibility path
+	// (TupleVisibleSubxact -> isCurrentTxXID). Under a 4-worker parallel scan
+	// that RLock/RUnlock pair was 50 % of all atomic RMW traffic and ~5 % of
+	// total CPU on TPC-H Q14, to probe a map that an OLAP query never populates.
+	// (docs/design/not_ralph/perf-optimize-take6/README.md candidate B.)
+	//
+	// Kept in step with parents under mu; read without it. A zero count means
+	// the map is empty, so the guarded lookup could only have returned false.
+	nParents atomic.Int64
+
 	// slru, when non-nil, is the persistent pg_subtrans mirror that parent
 	// links are written through to. nil = persistence disabled (default).
 	slru *SubtransSLRU
@@ -105,6 +118,7 @@ func (m *SubxactMap) RestoreFromSLRU() (int, error) {
 	m.mu.Lock()
 	for subxid, parent := range links {
 		m.parents[subxid] = parent
+		m.nParents.Store(int64(len(m.parents)))
 	}
 	m.mu.Unlock()
 	return len(links), nil
@@ -134,6 +148,7 @@ func (m *SubxactMap) Truncate(oldestXact storage.TransactionID) error {
 	for subxid := range m.parents {
 		if storage.XIDPrecedes(subxid, oldestXact) {
 			delete(m.parents, subxid)
+			m.nParents.Store(int64(len(m.parents)))
 		}
 	}
 	for subxid := range m.aborted {
@@ -156,6 +171,7 @@ func (m *SubxactMap) Truncate(oldestXact storage.TransactionID) error {
 func (m *SubxactMap) Register(subxid, parentXid storage.TransactionID) {
 	m.mu.Lock()
 	m.parents[subxid] = parentXid
+	m.nParents.Store(int64(len(m.parents)))
 	slru := m.slru
 	m.mu.Unlock()
 	// Best-effort durable mirror: a failed SLRU write must not break the
@@ -223,6 +239,11 @@ func (m *SubxactMap) TopLevelXid(xid storage.TransactionID) storage.TransactionI
 
 // IsSubxact reports whether xid is a registered subxact XID.
 func (m *SubxactMap) IsSubxact(xid storage.TransactionID) bool {
+	// Empty map: the locked lookup below could only return false, so skip it.
+	// This is the whole point of nParents — see its comment.
+	if m.nParents.Load() == 0 {
+		return false
+	}
 	m.mu.RLock()
 	_, ok := m.parents[xid]
 	m.mu.RUnlock()
