@@ -72,6 +72,7 @@ const (
 	ExprBinaryOp           // payload[0] = op, [1] = overflow code, [4:8] = int32 pos; childA/childB = operands
 	ExprUnaryOp            // payload[0] = uint8(parser.OpCode), [4:8] = int32 pos; childA = operand index
 	ExprAdapter            // orig = original planner.Expr; delegates to evalExprSlot
+	ExprConstVal           // constVal = a subtree folded to a value at build time
 )
 
 // noExpr is the sentinel "no expression child" index, analogous to noChild.
@@ -96,6 +97,10 @@ type ExprNode struct {
 	childB  int32        // right child index; noExpr if none
 	payload [40]byte     // per-Kind inline data (see constants above)
 	orig    optimizer.Expr // non-nil only for ExprAdapter
+	// constVal is the folded value for ExprConstVal, and nil for every other
+	// kind. A Datum is 48 bytes against payload's 40, so it cannot ride inline;
+	// a pointer costs 8 bytes on every node instead of growing payload by 48.
+	constVal *Datum
 }
 
 // exprTreeSlab is the flat slice of ExprNode for a single statement.
@@ -107,8 +112,41 @@ type exprTreeSlab []ExprNode
 // to ExprAdapter (delegates to evalExprSlot at evaluation time, so
 // correctness is always preserved).
 func (s *exprTreeSlab) buildExpr(e optimizer.Expr) int32 {
+	return s.buildExprCtx(e, nil)
+}
+
+// buildExprCtx is buildExpr with optional CONSTANT FOLDING.
+//
+// With ctx == nil the result is byte-identical to buildExpr's, so the existing
+// call sites cannot change behaviour. A caller that passes a real Context opts
+// in: any subtree that reads no column and is deterministic is evaluated ONCE
+// here, through evalExprSlot — the very evaluator that would otherwise run it
+// per row — and replaced by its value.
+//
+// Why this matters: TPC-H Q6's predicate contains
+// `'1994-01-01'::date + '1 year'::interval`, which goopg re-evaluated six
+// million times per query (4.48 % of the whole query's CPU in addTimeInterval
+// alone). PostgreSQL folds the same expression in eval_const_expressions at
+// plan time. See docs/design/not_ralph/tpch-q6-numeric-decode/design-take7.md.
+//
+// Folding declines rather than reasons whenever it is unsure:
+//   - exprFoldable is a WHITELIST, so an expression kind it does not name is
+//     never folded;
+//   - a subtree whose evaluation ERRORS is left uncompiled, so the error is
+//     still raised per row with the same message, position and row ordering.
+//     Folding a failing constant would move a runtime error to build time and
+//     change whether earlier rows are returned first.
+func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 	if e == nil {
 		return noExpr
+	}
+	if ctx != nil && exprFoldable(e) {
+		if d, ok := foldConstant(e, ctx); ok {
+			idx := int32(len(*s))
+			v := d
+			*s = append(*s, ExprNode{Kind: ExprConstVal, constVal: &v})
+			return idx
+		}
 	}
 	switch t := e.(type) {
 	case *optimizer.ColumnRef:
@@ -185,8 +223,8 @@ func (s *exprTreeSlab) buildExpr(e optimizer.Expr) int32 {
 		// index is stable even if subsequent appends reallocate the slab.
 		idx := int32(len(*s))
 		*s = append(*s, ExprNode{Kind: ExprBinaryOp})
-		childA := s.buildExpr(t.Left)
-		childB := s.buildExpr(t.Right)
+		childA := s.buildExprCtx(t.Left, ctx)
+		childB := s.buildExprCtx(t.Right, ctx)
 		(*s)[idx].childA = childA
 		(*s)[idx].childB = childB
 		(*s)[idx].payload[0] = uint8(t.Op)
@@ -205,7 +243,7 @@ func (s *exprTreeSlab) buildExpr(e optimizer.Expr) int32 {
 	case *optimizer.UnaryOp:
 		idx := int32(len(*s))
 		*s = append(*s, ExprNode{Kind: ExprUnaryOp})
-		childA := s.buildExpr(t.Operand)
+		childA := s.buildExprCtx(t.Operand, ctx)
 		(*s)[idx].childA = childA
 		(*s)[idx].payload[0] = uint8(t.Op)
 		binary.LittleEndian.PutUint32((*s)[idx].payload[4:], uint32(int32(t.Pos())))
@@ -253,6 +291,12 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 	}
 	n := &exprs[idx]
 	switch n.Kind {
+	case ExprConstVal:
+		// Folded at build time by buildExprCtx. The value is whatever
+		// evalExprSlot produced for this subtree, so no evaluation semantics
+		// live here — there is nothing to keep in sync with the interpreter.
+		return *n.constVal, nil
+
 	case ExprColumnRef:
 		colIdx := int(int32(binary.LittleEndian.Uint32(n.payload[:])))
 		// Sibling-path guard (M0127-PS6.1, 09 §1). The interpreted twin
@@ -411,4 +455,138 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 	default:
 		return Datum{}, fmt.Errorf("executor: evalFastExpr: unknown ExprKind %d at idx %d", n.Kind, idx)
 	}
+}
+
+// exprFoldable reports whether e can be evaluated once at build time and
+// replaced by its value — i.e. it reads no column and is deterministic.
+//
+// This is a WHITELIST, and the direction is deliberate. An expression kind it
+// does not name is simply not folded, costing performance; a kind wrongly
+// admitted would be evaluated against the wrong row or at the wrong time,
+// costing correctness. goopg has a documented history of expression walkers
+// that silently miss an arm (internal/optimizer/exprwalk_inventory_test.go),
+// so this one is built to miss safely.
+//
+// Excluded on purpose:
+//
+//   - ColumnRef / OuterColumnRef — read a row, which is the whole point.
+//   - ParamRef / ExecParamRef — bound per execution, not per plan.
+//   - FuncCall — volatility is not resolved here, so now(), random() and any
+//     user function are all excluded wholesale rather than judged individually.
+//   - SubqueryExpr / ExistsExpr / InExpr / ArraySubqueryExpr — open a plan.
+//   - CTIDExpr / TableOidExpr / MergeActionExpr / MergeWholeRowRef / RowExpr —
+//     read the tuple or row as a whole.
+//   - CollateExpr / ExtractExpr / CaseExpr / LikeEscapePattern — plausible but
+//     left out rather than reasoned about loosely; they are not on any hot
+//     path this targets.
+//
+// Note the *values* of the literal kinds below can depend on session GUCs
+// (a timestamptz TypedStringLit reads TimeZone). That is safe because folding
+// happens in the operator's Open against the same Context that will evaluate
+// the rows, and a re-Open rebuilds the slab.
+func exprFoldable(e optimizer.Expr) bool {
+	switch x := e.(type) {
+	case nil:
+		return false
+
+	case *optimizer.IntegerConst, *optimizer.StringConst, *optimizer.NumericConst,
+		*optimizer.TypedStringLit, *optimizer.IntervalLit, *optimizer.NullConst,
+		*optimizer.BooleanConst:
+		return true
+
+	case *optimizer.BinaryOp:
+		return exprFoldable(x.Left) && exprFoldable(x.Right)
+	case *optimizer.UnaryOp:
+		return exprFoldable(x.Operand)
+	case *optimizer.CastExpr:
+		return exprFoldable(x.Operand)
+	case *optimizer.IsNullExpr:
+		return exprFoldable(x.Operand)
+	case *optimizer.IsBoolExpr:
+		return exprFoldable(x.Operand)
+	case *optimizer.IsDistinctFromExpr:
+		return exprFoldable(x.Left) && exprFoldable(x.Right)
+
+	default:
+		return false
+	}
+}
+
+// foldConstant evaluates a column-free subtree once and reports whether the
+// result is safe to freeze into the plan.
+//
+// It declines in two cases, and the second is the one that matters:
+//
+//  1. The evaluation ERRORS. Folding a failing constant would move the error
+//     from row time to build time, changing when the statement fails and
+//     whether earlier rows were already returned. Left uncompiled, it raises
+//     per row exactly as before.
+//
+//  2. The value DEPENDS ON SESSION SETTINGS. This is a parallel-only
+//     wrong-answer hazard and it is not hypothetical: gatherOp Opens the
+//     leader's child with the session Context but each worker with a
+//     NewWorkerContext whose GetSetting is deliberately nil
+//     (parallel_worker_ctx.go). timeZoneFromCtx returns "" for such a
+//     Context, so a zone-less TIMESTAMPTZ literal reads as the session
+//     TimeZone in the leader and as the default zone in every worker — and
+//     folding would freeze those two DIFFERENT constants into two plans
+//     evaluating the same query.
+//
+// Rather than enumerate which types consult the session — a list that would
+// drift — the check is self-verifying: evaluate once with the caller's
+// Context and once with a settings-blind copy of it, which is precisely what
+// a worker sees. Fold only if both agree. Anything session-sensitive
+// disagrees (or errors) and is declined.
+//
+// This mirrors the rule evalTypedStringLit already applies to its own cache:
+// "when usedSession fired … it must not be written to x.CachedTime /
+// x.CacheValid, or a different session with a different TimeZone reusing this
+// plan node would get the wrong instant" (expr.go, M0134-0026).
+func foldConstant(e optimizer.Expr, ctx *Context) (Datum, bool) {
+	// nil slot: exprFoldable has already established there is no ColumnRef to
+	// read, so no row is needed.
+	withSession, err := evalExprSlot(e, nil, ctx)
+	if err != nil {
+		return Datum{}, false
+	}
+	blind := *ctx
+	blind.GetSetting = nil
+	blindVal, berr := evalExprSlot(e, nil, &blind)
+	if berr != nil {
+		return Datum{}, false
+	}
+	if !foldedValuesIdentical(withSession, blindVal) {
+		return Datum{}, false
+	}
+	return withSession, true
+}
+
+// foldedValuesIdentical compares two trial evaluations of the same constant.
+//
+// It compares the RAW representation, not Format(). Format() is display
+// oriented and renders a KindTime as wall-clock text, which hides exactly the
+// difference this function exists to find: a zone-less TIMESTAMPTZ read in
+// Asia/Tokyo and the same literal read with no session both print
+// "2026-08-30 12:00:00" while denoting instants nine hours apart. Comparing
+// rendered text would have silently declared them identical and folded the
+// wrong constant into every parallel worker.
+func foldedValuesIdentical(a, b Datum) bool {
+	if a.Kind != b.Kind || a.IsNull() != b.IsNull() {
+		return false
+	}
+	if a.IsNull() {
+		return true
+	}
+	// Int carries the instant for KindTime, the mantissa for KindNumeric, and
+	// the arena coordinate for arena-backed strings; TimeSub distinguishes
+	// date / timestamp / timestamptz; Scale and Flags complete the scalar form.
+	if a.Int != b.Int || a.Scale != b.Scale || a.TimeSub != b.TimeSub || a.Flags != b.Flags {
+		return false
+	}
+	// Payload-bearing kinds: compare the bytes a consumer would read.
+	switch a.Kind {
+	case KindString, KindBytes:
+		return a.StringValue() == b.StringValue()
+	}
+	return true
 }

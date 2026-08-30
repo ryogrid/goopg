@@ -148,7 +148,20 @@ func (o *seqScanOp) evalPrefilter() (bool, error) {
 	if o.scanSlot == nil {
 		o.scanSlot = rowSlotView(o.scanRow)
 	}
-	v, err := evalExprSlot(o.prefilter.pred, o.scanSlot, o.ctx)
+	// Compiled form when Open produced one (integer kind-switch dispatch plus
+	// build-time constant folding), otherwise the interpreter. evalFastExpr
+	// delegates every kind it does not compile back to evalExprSlot via
+	// ExprAdapter, so the two agree by construction rather than by parallel
+	// maintenance.
+	var (
+		v   Datum
+		err error
+	)
+	if o.pfIdx != noExpr {
+		v, err = evalFastExpr(o.pfSlab, o.pfIdx, o.scanSlot, o.ctx)
+	} else {
+		v, err = evalExprSlot(o.prefilter.pred, o.scanSlot, o.ctx)
+	}
 	if err != nil {
 		return true, err
 	}
