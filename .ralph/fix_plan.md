@@ -7462,7 +7462,7 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [ ] **M0134-0178 — tsdicts.sql** — regress-sql `failed` (was `not-tried`; RUN 2026-08-29: **899 diff lines / 100 `^+ERROR`**). **PARKED** — 94% of the diff is one REFACTOR-tier subsystem goopg does not have at all: the text-search DICTIONARY engine (`ts_lexize` 71 errors, `to_tsvector`/`to_tsquery`/`phraseto_tsquery` 21, snowball `english_stem`, ispell affix-file validation). goopg models text search as a **pg_dump round trip only** — catalog rows, no tokenizer or lexizer — so closing it means porting `postgres/src/backend/tsearch/` (`spell.c` ~1700 lines, `dict_ispell/synonym/thesaurus.c`, `regis.c`, the generated stemmers, `share/tsearch_data/`); ledgered **0178a**, and it parks -0179 (`tsearch.sql`) and -0180 (`tsrf.sql`) too — **re-arm all three together**. The loop shipped the one contained cause, which is fully independent of every dictionary: `ALTER TEXT SEARCH CONFIGURATION`'s mapping forms never implemented `getTokenTypes` (`tsearchcmds.c:1229`) — no deduplication of the `FOR tok [, ...]` list and **no validation of a token name against the configuration's parser**, so `ADD MAPPING FOR not_a_token` silently wrote a `pg_ts_config_map` row with `maptokentype = -1` (a mapping no parser can match, which pg_dump would re-emit un-restorably) while duplicated tokens made statements collide with themselves. Design `docs/design/m0134-0178-tsconfig-token-type-validation.md`, guard `internal/executor/tsconfig_token_type_validation_test.go` (revert-checked). Quoted mixed-case token names filed as ledger 0178b. **899 → 863 lines, `^+ERROR` 100 → 97, `^-ERROR` 8 → 5.**
 - [ ] **M0134-0179 — tsearch.sql** — regress-sql `not-tried` → **`failed`**, **PARKED 2026-08-29** (sized live for the first time: **3750 diff lines / 379 `^+ERROR`**, unchanged by this loop's fix — see "the trap" below). **319 of the 379 errors (84%) are the absent text-search engine** — `to_tsquery` 70, `websearch_to_tsquery` 67, the `@@` match operator 163, plus `ts_rewrite`/`to_tsvector`/`ts_headline`/`ts_lexize`/`ts_debug`/`ts_parse` — i.e. **the same blocker as M0134-0178**, exactly as the previous loop's baton predicted. Re-arm with ledger row **0178a** (port `postgres/src/backend/tsearch/`). Note `-0180` (`tsrf.sql`) is **set-returning functions and is NOT blocked by this** — size it normally. **Shipped instead (engine-wide scanner fix, design `docs/design/m0134-0179-operator-maximal-munch-lexing.md`):** goopg recognised multi-character operators from a **hand-maintained allowlist** of 15 two-char spellings and emitted everything else **one character at a time**. PG matches `{op_chars}+` greedily (`scan.l:886`) over an **open** alphabet — which is what makes `CREATE OPERATOR` possible at all — then trims at an embedded `/*`/`--`, strips a trailing `+`/`-` unless an earlier char is one of ``~!@#^&|`?%`` (so `a=-1` is two tokens but `a@>-1` is one), and errors at NAMEDATALEN. The failure was **structural, not cosmetic**: `a @@ 'x'` split into two `@` tokens and reduced as a **prefix** `@` over the literal (hence `operator does not exist: @` out of `prefixOp` — goopg was building a *different tree*, not mis-naming an infix), and `a @@ any (...)` was a **syntax error at "any"** because the quantifier rules take exactly one `subq_op`. `?` and `` ` ``, both legal op_chars, never reached the operator case and died as `unexpected character`, asserting the character is illegal in SQL. The `{self}` and `<= >= <> != =>` remappings `scan.l` does inline were **already correct** in `adapter.go`, so single-char behaviour is bit-for-bit unchanged. Result: **79 bogus lex errors → 0** (jsonb+geometry), 163 mis-named `@` → correctly-named `@@` (tsearch), **zero golden-corpus diff** (1.5 MB `parity_goldens.txt` — the playbook's required review artifact), 18 of 20 regress cases byte-identical. **The trap worth carrying:** raw diff lines grew (jsonb 6387→6517, geometry 5646→5674) while fidelity *improved* — the delta is exactly 65×2 and 14×2, one-line lex errors becoming PG's three-line `ERROR`/`LINE`/caret shape. **`^-` lines (output goopg failed to produce) is the regression metric and it did not move** (2529/4748 both sides). Guard `internal/parser/operator_maximal_munch_test.go`, revert-checked **40 failures** at HEAD. Two follow-ups ledgered: the closed 36-entry `OpCode` enum has no `pg_operator` lookup (so `@@` now fails as `unsupported operator "@@"` rather than PG's 42883 — same blocker as M0134-0158), and `*`-initial runs still split.
 - [ ] **M0134-0180 — tsrf.sql** — regress-sql `not-tried` → **`failed`**, **PARKED 2026-09-01** (sized live: 793 → 785 diff lines, `^-` 235 → 232, `^+ERROR` unchanged at 10; unlike most M0134 cases this is ~10 largely independent PG SRF-placement rules, not one gap with a long error tail, and several already matched byte-for-byte with zero code change: sibling-SRF lockstep zipping, SRFs computed after aggregation when not GROUP-BY-referenced, DISTINCT ON placement, GROUP BY CUBE + SRF). **Shipped:** PG's `transformLimitClause` runs SRF-placement checking (`parse_func.c:2500-2680`) before the numeric-type coercion, so `SELECT 1 LIMIT generate_series(1,3)` must raise `set-returning functions are not allowed in LIMIT` even though `generate_series` is int8-typed; goopg had no such check and silently evaluated the SRF via the executor's `generate_series`-as-scalar fallback (reduces to the first arg), returning a wrong single-row result instead of erroring. New `exprHasSRF` walker in `internal/parser/analyzer/analyzer.go` (same node coverage as the existing `exprHasWindowFunc`; builtin-SRF name set + catalog `ReturnsSet` lookup — cannot import executor's sibling `isBuiltinSRF`, layering runs the other way) wired into the LIMIT/OFFSET analyzer block. Guard `TestAnalyzeSRFInLimitOffsetRejected` + `TestAnalyzeLimitOffsetNonSRFStillAccepted` (`internal/parser/analyzer/analyzer_test.go`). Design `docs/design/0100-0149/m0134-0180-tsrf-sizing.md`. **PARKED** — three REFACTOR-tier gaps remain, ledgered: **0180a** six more "not allowed in X" contexts (CASE/COALESCE/aggregate-arg/window-arg/UPDATE-SET/RETURNING/VALUES — aggregate/window-arg has zero existing precedent); **0180b** nested-SRF-as-another-SRF's-argument (`generate_series(1, generate_series(1,3))` returns 1 row not 6) and GROUP-BY-referencing-a-target-list-SRF (changes pre-aggregation cardinality) both need a recursive/stacked `ProjectSet` model, not a patch to the flat "zip to maxLen" one; **0180c** `|@|` as a user-defined prefix operator over `unnest` fails at the parser's closed `{-,+,NOT,~}` prefix set, unrelated to SRFs (same class as the M0134-0179 closed-`OpCode`-enum follow-up). A fourth item (correlated `LIMIT ... OFFSET <outer column>` inside a scalar subquery) is out of scope, own resume point, not ledgered as a numbered follow-up.
-- [ ] **M0134-0181 — tstypes.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+- [ ] **M0134-0181 — tstypes.sql** — regress-sql `not-tried` → **`failed`**, **PARKED 2026-09-01** (sized live: 1839 diff lines, 159 `^+ERROR`, 4 `^-ERROR`). **No contained fix landed** — unlike `tsrf.sql` (M0134-0180, ~10 independent placement rules) this file is dominated by ONE absent subsystem with no narrow slice inside it: the `tsvector`/`tsquery` core **type kernel** (parse + canonical output + compare), narrower than the already-parked M0134-0178/0179 dictionary/stemmer gap — most assertions build `tsvector`/`tsquery` directly from literals (`'a:1 b:2'::tsvector`), never calling `to_tsvector`, so no tokenizer/stemmer/`pg_ts_config` lookup is needed, only the type itself. Code search confirmed there is no `tsvectorin`-equivalent anywhere in goopg (only catalog OID/name-formatting plumbing in `internal/executor/expr.go`/`internal/catalog/codec.go`) — the apparently-working `::tsvector` cast is an opaque-type text-passthrough fallback, not real parsing; calling `tsvectorout(...)` explicitly errors `function tsvectorout does not exist`, proving no real function backs the type. Buckets: `@@` match operator `unsupported operator "@@"` (~89 occurrences, the largest), `ts_rank`/`ts_rank_cd` uncalled (29), `ts_delete` uncalled (12), `setweight` uncalled (6), `<->` phrase-distance operator `unsupported` (4), `array_to_tsvector`/`tsvector_to_array`/`strip`/`ts_filter`/`numnode`/`tsquery_phrase` uncalled (16 combined), plus 2 unrelated pre-existing `box`-type geometry errors caught in the same diff window (out of scope here). No narrow slice was found — even the most contained-looking item (`tsvectorout` quoting) can't be fixed in isolation, since the "cast" that looks like it works has no real parser behind it to format the output of. Filed **M0136** (own new milestone, below) rather than folding into ledger row 0178a — this gap is strictly narrower and more foundational than the dictionary/stemmer engine (needs none of its machinery) though 0178a's `to_tsvector` result value will eventually need M0136's canonical-output/compare machinery too. Design `docs/design/0100-0149/m0134-0181-tstypes-sizing.md`. Re-arm trigger: M0136-S1 landing (re-measure `tstypes` live).
 - [ ] **M0134-0182 — type_sanity.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0183 — typed_table.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0184 — unicode.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
@@ -7517,3 +7517,83 @@ properly instead of parking a fourth time.
 - [ ] **M0135-S4 — `pg_input_is_valid`/`pg_input_error_info('jsonpath')` soft-error
       surfacing** — small slice once S1 exists; check whether goopg already has
       this machinery for another type before building new plumbing. Design §S4.
+
+## M0136 — `tsvector`/`tsquery` core type engine (filed 2026-09-01, from M0134-0181 sizing)
+
+Design: `docs/design/0100-0149/m0134-0181-tstypes-sizing.md`. goopg has NO
+`tsvector`/`tsquery` type kernel anywhere — only `pg_type`/`pg_proc` catalog
+scaffolding. `SELECT '1'::tsvector` "succeeds" only because goopg falls back
+to an opaque-type text passthrough for a type with no registered I/O
+function, not because a real parser exists; calling `tsvectorout(...)`
+explicitly errors `function tsvectorout does not exist`. This milestone is
+narrower and more foundational than the already-parked M0134-0178/0179
+dictionary/stemmer gap (ledger row 0178a, `postgres/src/backend/tsearch/`):
+it needs no tokenizer, stemmer, or `pg_ts_config`/`pg_ts_dict` lookup — only
+the type itself, its operators, and its non-dictionary utility functions.
+Landing S1 alone unblocks a real re-measurement of M0134-0181 (`tstypes.sql`)
+and is a genuine prerequisite for the *result* type of `to_tsvector` once
+0178a eventually lands. Selection order **within M0134's normal ordering**
+— not auto-prioritized ahead of M0134's remaining single-file tasks; select
+per the `## Current Priority` banner when it names M0136, or opportunistically
+if a loop lands on `tstypes.sql`/`tsdicts.sql`/`tsearch.sql`/`tsrf.sql` and
+wants to unblock the shared type-kernel gap properly.
+
+- [ ] **M0136-S1 — `tsvector`/`tsquery` type kernel (parse + canonical
+      output only)** — new `internal/executor/tsearch/` package (or
+      `internal/executor/tsvector.go`/`tsquery.go` if small enough to stay
+      flat — decide during implementation) parsing the `'lexeme:weight,pos
+      ...'` tsvector grammar and the `!`/`&`/`|`/`<->`/`()`/weight-label
+      tsquery grammar, plus canonical pretty-printers (quoting/escaping
+      rules — PG quotes every lexeme and backslash-escapes embedded quotes/
+      backslashes). Oracle: `postgres/src/backend/utils/adt/tsvector.c`
+      (`tsvectorin`/`tsvectorout`, lines 174/313/407/446),
+      `tsvector_parser.c` (shared lexeme-position-list scanner), `tsquery.c`
+      (`tsqueryin`/`tsqueryout`, operator-precedence parser: `!` highest,
+      then `<->` [with optional `<N>` distance], then `&`, then `|`
+      lowest). Wire `tsvectorin`/`tsvectorout`/`tsqueryin`/`tsqueryout`
+      (`internal/initdb/pg_proc_seed_data.go` has the catalog rows, zero
+      executor dispatch today) plus the `::tsvector`/`::tsquery` CAST path
+      (currently a passthrough in `evalCast`/`coerceTextLikeDatum`).
+      Acceptance: `scripts/pg-regress-runner.sh tstypes` diff shrinks
+      substantially on the pure-literal assertions (lines 6-79 of the file);
+      targeted unit tests for parser/pretty-printer edge cases (empty-lexeme
+      rejection, escaped quotes/backslashes, weight-label combinations,
+      `<N>` phrase-distance parsing, operator precedence/parenthesization).
+- [ ] **M0136-S2 — `tsvector` comparison + editing/utility functions** —
+      `tsvector_cmp` (lexicographic-then-position-array compare, needed for
+      `<`/`>` and btree opclass), `strip`, `setweight` (2-arg + 3-arg lexeme-
+      filter form), `ts_delete` (text + text[] forms), `ts_filter` (by
+      weight array), `numnode`, `tsquery_phrase` (3-arg with explicit
+      distance), `tsvector_to_array`, `array_to_tsvector` (must sort+dedup,
+      reject NULL/empty lexemes), `unnest(tsvector)` (table function returning
+      lexeme/positions/weights). Oracle:
+      `postgres/src/backend/utils/adt/tsvector_op.c:168(strip),
+      211(setweight),273(setweight_by_filter),554/578(delete_str/arr),
+      632(unnest),720(to_array),747(array_to_tsvector),819(filter)`,
+      `tsquery_util.c` (numnode/tsquery_phrase). Depends on S1's parsed
+      representation. Acceptance: `tstypes.sql`'s "tsvector editing
+      operations" block (lines 235-281) matches the oracle.
+- [ ] **M0136-S3 — `@@` match operator + `<->` phrase-distance operator** —
+      `ts_match_tq`/`ts_match_vq`/`ts_match_qv`/`ts_match_tt` (`@@` over all
+      four tsvector/tsquery operand-type combinations) and the phrase-
+      distance execution mode PG's `TS_execute`/`ts_phrase_execute` use for
+      `<->` inside a tsquery. Oracle: `postgres/src/backend/utils/adt/
+      tsvector_op.c:2206-2310` (`ts_match_*`) plus the phrase-execute path
+      referenced from there. Needs new operator lexing/dispatch (mirror the
+      M0135-S3 `@?`/`@@` precedent for jsonpath — `@@` is likely already a
+      lexable token per M0134-0179's maximal-munch scanner fix, just
+      unwired at the operator-dispatch layer, `unsupported operator "@@"`).
+      Acceptance: `tstypes.sql`'s "tsvector-tsquery operations" and "phrase
+      search" blocks (lines 104-189) match the oracle; re-run
+      `tsearch.sql`/`tsdicts.sql` to confirm their `@@` buckets (163/many
+      occurrences, ledger 0178a) shrink even though `to_tsvector` itself
+      stays blocked.
+- [ ] **M0136-S4 — `ts_rank`/`ts_rank_cd` scoring** — all 4 arities each
+      (`ts_rank(vector, query)`, `+weights`, `+normalization`, both).
+      Oracle: `postgres/src/backend/utils/adt/tsrank.c:439-1010`
+      (`ts_rank_wttf`/`_wtt`/`_ttf`/`_tt`, `ts_rankcd_*`) — cover-density
+      ranking is a materially different algorithm from plain ranking, not a
+      normalization-flag variant. Acceptance: `tstypes.sql`'s "ranking"
+      block (lines 191-222) matches the oracle bit-for-bit (floating-point
+      formatting sensitivity — the file's own `SET extra_float_digits = 0`
+      preamble exists for this).
