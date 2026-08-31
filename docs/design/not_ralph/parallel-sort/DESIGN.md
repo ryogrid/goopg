@@ -270,3 +270,55 @@ Every one of these is currently satisfied and must remain so:
 - **Abbreviated keys.** PG's leading-key abbreviation is a large constant
   factor goopg has no analogue for; any goopg/PG per-comparison comparison
   should say so.
+
+
+## 9. Outcome
+
+Implemented and measured. Results in [`PERF.md`](./PERF.md).
+
+| stage | disposition |
+|---|---|
+| §4.2 NULL ordering (+ `evalSortKeyValue`) | **SHIPPED** as `6fa1f400d`, standalone — it was a live wrong-results bug, not a prerequisite |
+| §4.1 precomputed sort keys | **SHIPPED** — q16 1.4s → 0.9s (−36 %), q01 −10 %, q18 −5 %; 21/21 results byte-identical, no plan moved |
+| §4.3 re-enable P7 for index-only driving scans | **REFUTED by measurement, not shipped** |
+
+### 9.1 Stage 3 was refuted, and by its own success
+
+The review flagged that stage 3 had no mitigation (§7). It was implemented
+anyway and measured, because the prediction was that a cheap comparator would
+make per-worker sorts pay. It does the opposite:
+
+| query | leader-side sort (shipped) | per-worker sorts (P7) |
+|---|---:|---:|
+| q16 | **0.9s** | 1.6s (+78 %) |
+| q10 | **3.0s** | 3.4s (+13 %) |
+| q13 | **4.8s** | 5.1s (+6 %) |
+
+Stage 1 is *why* stage 3 fails. The argument for moving the sort into the
+workers was that the sort dominated — 34 % of q16's run. Precomputing the keys
+removed that dominance, and against a sort that is no longer the bottleneck,
+N worker sorts plus a k-way merge cost more than one leader-side sort over a
+parallel scan. `sortPartialRootPays` stays.
+
+This is worth stating plainly because the design predicted the opposite: the
+two stages were expected to compose, and instead the first one obsoleted the
+third.
+
+### 9.2 What this says about the original objective
+
+goopg's parallel sorting is PG's design — `Gather Merge` over per-worker
+`Sort`s — and it remains available and correct (it is what q01, q03 and others
+use today). What changed is that goopg no longer *needs* it on the shape that
+motivated this work. q16's remaining 3.0x against PG is not the sort and not
+the scan; both now match PG's plan and its parallelism. Finding what it is, is
+the next question, and this document does not answer it.
+
+### 9.3 Still open
+
+- **Bounded / top-N sort** (§8) — untouched, and still the largest single win
+  available on `ORDER BY … LIMIT` shapes.
+- **Incremental Sort** (§8) — goopg has no such node.
+- **Stability on the spill and merge paths** (§5.1) — no source tiebreak in
+  `sortHeap`/`gmHeap`; documented, not fixed, matching PG's own non-guarantee.
+- **Per-worker sort memory** (§7) — 256 MiB × W remains unbudgeted; it did not
+  bite because stage 3 is not shipped.

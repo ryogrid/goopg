@@ -751,6 +751,20 @@ type sortOp struct {
 	// In-memory chunk / tail.
 	rows []Row
 	idx  int
+	// keyvals[i] holds the ORDER BY key values of rows[i], evaluated once when
+	// the row is pulled instead of re-derived inside every comparison
+	// (M0134-0191). goopg's per-key cost is an interpreted evalExpr dispatch,
+	// so paying it O(N log N) times dominated the sort; PG stores only its
+	// first key (SortTuple.datum1) because heap_getattr is cheap enough that
+	// its complexity tradeoff lands elsewhere — see
+	// docs/design/not_ralph/parallel-sort/DESIGN.md §4.1 for why goopg
+	// deliberately diverges and stores all k.
+	//
+	// Kept in lockstep with rows through every permutation, exactly as ctids
+	// is, and TRUNCATED with rows at the spill point below — a keyvals that
+	// outlived a flush would be offset by every spilled row and silently
+	// compare the wrong keys.
+	keyvals [][]Datum
 
 	// ctids carries the per-row TID side-channel (hasCTID / ctidBlock /
 	// ctidOff) in lockstep with rows so a parent LockRows can stamp row locks
@@ -829,7 +843,12 @@ func (o *sortOp) Open(ctx *Context) error {
 		// independent row. (M0071-0010 Stage B.)
 		ms := slot.Materialize()
 		row := ms.Row()
+		kv, kerr := o.sortKeyVals(row)
+		if kerr != nil {
+			return kerr
+		}
 		o.rows = append(o.rows, row)
+		o.keyvals = append(o.keyvals, kv)
 		if !o.ctidsDisabled {
 			o.ctids = append(o.ctids, sortCTID{block: ms.ctidBlock, off: ms.ctidOff, has: ms.hasCTID})
 		}
@@ -840,6 +859,7 @@ func (o *sortOp) Open(ctx *Context) error {
 				return err
 			}
 			o.rows = o.rows[:0]
+			o.keyvals = o.keyvals[:0]
 			// Spilling drops the TID side-channel: the N-way merge over spill
 			// files reconstructs rows without ctids. Disable it permanently so
 			// the in-memory Next() path doesn't emit stale/misaligned TIDs.
@@ -856,12 +876,107 @@ func (o *sortOp) Open(ctx *Context) error {
 	return nil
 }
 
-// sortChunk in-place sorts a slice using the configured key list.
-// Sets o.sortErr if an evaluator error surfaces during comparison.
+// sortKeyVals evaluates every ORDER BY key for one row, once. This is the ONLY
+// place sort keys are computed: the in-memory tail fills it as rows are pulled,
+// and each spill-merge source fills it as it advances, so both paths compare
+// through the same lessKeyVals and cannot drift apart (DESIGN §5.6 — a tail
+// sorted by one comparator and merged against spill files by another emits
+// out-of-order rows with no error).
+//
+// evalSortKeyValue, not evalExpr: the reg*-OID family sorts by the underlying
+// OID (see isRegSortFamilyTypeName).
+func (o *sortOp) sortKeyVals(row Row) ([]Datum, error) {
+	if len(o.keys) == 0 {
+		return nil, nil
+	}
+	kv := make([]Datum, len(o.keys))
+	for i, k := range o.keys {
+		v, err := evalSortKeyValue(k.Expr, row, o.ctx)
+		if err != nil {
+			return nil, err
+		}
+		kv[i] = v
+	}
+	return kv, nil
+}
+
+// lessKeyVals is the comparator, over PRECOMPUTED key values. It is the same
+// rule lessRows applied — NULL placement by NullsFirst, then compareDatum,
+// then Desc — with the evaluation lifted out.
+func (o *sortOp) lessKeyVals(a, b []Datum) bool {
+	for i, k := range o.keys {
+		av, bv := a[i], b[i]
+		if av.IsNull() && !bv.IsNull() {
+			return k.NullsFirst
+		}
+		if !av.IsNull() && bv.IsNull() {
+			return !k.NullsFirst
+		}
+		if av.IsNull() && bv.IsNull() {
+			continue
+		}
+		cmp, err := compareDatum(av, bv, k.Expr.Pos())
+		if err != nil {
+			if o.sortErr == nil {
+				o.sortErr = err
+			}
+			return false
+		}
+		if cmp == 0 {
+			continue
+		}
+		if k.Desc {
+			return cmp > 0
+		}
+		return cmp < 0
+	}
+	return false
+}
+
+// sortChunk sorts o.rows and o.keyvals together. It is permutation-based
+// rather than a bare in-place sort because keyvals has to move with rows;
+// before M0134-0191 there was nothing to keep in step and it sorted rows
+// directly.
 func (o *sortOp) sortChunk(rows []Row) {
-	sort.SliceStable(rows, func(i, j int) bool {
-		return o.lessRows(rows[i], rows[j])
+	if len(o.keyvals) != len(rows) {
+		// Defensive: nothing should reach here with the two out of step, and
+		// comparing on stale keys would be a silent wrong answer.
+		sort.SliceStable(rows, func(i, j int) bool { return o.lessRows(rows[i], rows[j]) })
+		return
+	}
+	perm := make([]int, len(rows))
+	for i := range perm {
+		perm[i] = i
+	}
+	sort.SliceStable(perm, func(i, j int) bool {
+		return o.lessKeyVals(o.keyvals[perm[i]], o.keyvals[perm[j]])
 	})
+	applySortPerm(perm, rows, o.keyvals, nil)
+}
+
+// applySortPerm rewrites rows / keyvals / ctids in place under perm. Every
+// slice moves under the SAME permutation, which is what keeps a row with its
+// own keys and its own TID.
+func applySortPerm(perm []int, rows []Row, keyvals [][]Datum, ctids []sortCTID) {
+	newRows := make([]Row, len(perm))
+	for i, p := range perm {
+		newRows[i] = rows[p]
+	}
+	copy(rows, newRows)
+	if keyvals != nil {
+		newKV := make([][]Datum, len(perm))
+		for i, p := range perm {
+			newKV[i] = keyvals[p]
+		}
+		copy(keyvals, newKV)
+	}
+	if ctids != nil {
+		newC := make([]sortCTID, len(perm))
+		for i, p := range perm {
+			newC[i] = ctids[p]
+		}
+		copy(ctids, newC)
+	}
 }
 
 // sortTailWithCTIDs sorts the final in-memory tail (o.rows). When the TID
@@ -873,24 +988,21 @@ func (o *sortOp) sortTailWithCTIDs() {
 		o.sortChunk(o.rows)
 		return
 	}
+	if len(o.keyvals) != len(o.rows) {
+		o.sortChunk(o.rows)
+		return
+	}
 	perm := make([]int, len(o.rows))
 	for i := range perm {
 		perm[i] = i
 	}
 	sort.SliceStable(perm, func(i, j int) bool {
-		return o.lessRows(o.rows[perm[i]], o.rows[perm[j]])
+		return o.lessKeyVals(o.keyvals[perm[i]], o.keyvals[perm[j]])
 	})
 	if o.sortErr != nil {
 		return
 	}
-	newRows := make([]Row, len(o.rows))
-	newCtids := make([]sortCTID, len(o.ctids))
-	for i, p := range perm {
-		newRows[i] = o.rows[p]
-		newCtids[i] = o.ctids[p]
-	}
-	o.rows = newRows
-	o.ctids = newCtids
+	applySortPerm(perm, o.rows, o.keyvals, o.ctids)
 }
 
 // isRegSortFamilyTypeName reports whether name is one of the reg* OID-alias
@@ -1072,13 +1184,15 @@ func (o *sortOp) Next() (TupleSlot, error) {
 // initMerge opens spill readers, primes each source with one row,
 // and builds the min-heap.
 func (o *sortOp) initMerge() error {
-	o.heap = &sortHeap{less: o.lessRows}
+	// Same comparator as the in-memory tail (DESIGN §5.6): each source
+	// computes its current row's keys on advance, and the heap orders those.
+	o.heap = &sortHeap{less: o.lessKeyVals, keysOf: o.sortKeyVals}
 	for _, p := range o.spillFiles {
 		r, err := newSpillReader(p)
 		if err != nil {
 			return err
 		}
-		s := &sortSource{reader: r}
+		s := &sortSource{reader: r, keysOf: o.sortKeyVals}
 		if err := s.advance(); err != nil {
 			return err
 		}
@@ -1087,8 +1201,11 @@ func (o *sortOp) initMerge() error {
 		}
 	}
 	if len(o.rows) > 0 {
-		s := &sortSource{rows: o.rows}
-		s.advance()
+		// The tail already has its keys; hand them over rather than recompute.
+		s := &sortSource{rows: o.rows, keyvals: o.keyvals, keysOf: o.sortKeyVals}
+		if err := s.advance(); err != nil {
+			return err
+		}
 		if !s.eof {
 			heap.Push(o.heap, s)
 		}
@@ -1127,6 +1244,16 @@ type sortSource struct {
 
 	cur Row
 	eof bool
+
+	// curKeys are cur's ORDER BY key values, so the merge heap compares
+	// precomputed keys exactly as the in-memory sort does (M0134-0191).
+	// keyvals, when set, is the caller's already-computed table for `rows`
+	// (the in-memory tail hands its own over rather than recomputing);
+	// keysOf computes them for rows read back from a spill file, which carry
+	// no keys of their own.
+	curKeys []Datum
+	keyvals [][]Datum
+	keysOf  func(Row) ([]Datum, error)
 }
 
 func (s *sortSource) advance() error {
@@ -1143,15 +1270,36 @@ func (s *sortSource) advance() error {
 			return err
 		}
 		s.cur = cloneRow(row) // ReadRow's buffer is reused; clone for retain
-		return nil
+		return s.loadKeys(-1)
 	}
 	if s.idx >= len(s.rows) {
 		s.eof = true
 		s.cur = nil
+		s.curKeys = nil
 		return nil
 	}
 	s.cur = s.rows[s.idx]
+	i := s.idx
 	s.idx++
+	return s.loadKeys(i)
+}
+
+// loadKeys fills curKeys for the row just taken. `at` is that row's index in
+// s.rows when it came from the in-memory tail (so its keys are already known),
+// or -1 when it was read from a spill file and must be computed.
+func (s *sortSource) loadKeys(at int) error {
+	if s.keysOf == nil {
+		return nil
+	}
+	if at >= 0 && at < len(s.keyvals) {
+		s.curKeys = s.keyvals[at]
+		return nil
+	}
+	kv, err := s.keysOf(s.cur)
+	if err != nil {
+		return err
+	}
+	s.curKeys = kv
 	return nil
 }
 
@@ -1159,11 +1307,17 @@ func (s *sortSource) advance() error {
 // under a row-comparator function.
 type sortHeap struct {
 	sources []*sortSource
-	less    func(a, b Row) bool
+	// less compares PRECOMPUTED key values — the same comparator the
+	// in-memory sort uses, so the tail and the spill files are merged under
+	// one rule (M0134-0191, DESIGN §5.6).
+	less   func(a, b []Datum) bool
+	keysOf func(Row) ([]Datum, error)
 }
 
-func (h *sortHeap) Len() int           { return len(h.sources) }
-func (h *sortHeap) Less(i, j int) bool { return h.less(h.sources[i].cur, h.sources[j].cur) }
+func (h *sortHeap) Len() int { return len(h.sources) }
+func (h *sortHeap) Less(i, j int) bool {
+	return h.less(h.sources[i].curKeys, h.sources[j].curKeys)
+}
 func (h *sortHeap) Swap(i, j int)      { h.sources[i], h.sources[j] = h.sources[j], h.sources[i] }
 func (h *sortHeap) Push(x any)         { h.sources = append(h.sources, x.(*sortSource)) }
 func (h *sortHeap) Pop() any {
