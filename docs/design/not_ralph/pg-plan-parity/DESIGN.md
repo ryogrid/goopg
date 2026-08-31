@@ -1868,3 +1868,89 @@ probe — each generated as a real path or plan candidate, priced by
 oracle-verified cost functions, and chosen by `add_path` or an explicit
 cost comparison with both candidates present. No plan anywhere is selected by
 fiat.
+
+## 23. Parallel Index Only Scan: implemented, measured, NOT shipped — and §21's premise was wrong
+
+§21 recorded q16's 0.9s → 1.6s as "the delta is parallelism, not the access
+method", and TODO carried a Parallel-IOS item on that basis. Implementing it
+refuted the premise.
+
+### 23.1 What was built
+
+A complete, working parallel index-only scan, in the shape goopg's parallelism
+already uses (a post-planning `MaybeAddGather` rewrite, not a partial path):
+
+- `IndexOnlyScan.Parallel`, with `drivingScan` / `stampParallelScan` /
+  `scanTable` arms so an IOS is an eligible driving scan, and the `"Parallel "`
+  EXPLAIN prefix in both `describePlan` and `describePlanVerbose`.
+- `parallelIndexScanState`: a shared claim set over index LEAF BLOCKS.
+  `LoadOrStore` reports false to exactly one worker per block, so every leaf is
+  processed exactly once — no block dropped, none duplicated.
+- `nbtree.RangeScanWithPosLeafFilter`: a per-LEAF admission test, consulted
+  once per page before any entry on it is parsed.
+
+It is correct: q16's result set came back byte-identical at every stage.
+
+### 23.2 Two measured iterations, and why the second was needed
+
+| variant | q16 |
+|---|---:|
+| serial (shipped) | **1.6s** |
+| claim consulted per ENTRY | 5.7s |
+| + memoised per block | 4.5s |
+| + `nbtree` per-LEAF filter | 2.7s |
+
+The first version asked the shared `sync.Map` once per index ENTRY — 800k
+entries × 4 participants — and the coordination cost alone made it 3.5x slower
+than serial. Skipped work has to be skipped *before* it is done: the per-leaf
+filter (one test per ~300 entries) recovered most of it. None of the three
+variants beat serial.
+
+### 23.3 Why it cannot win here — the profile
+
+A CPU profile of the parallel run names the cost, and it is not the scan:
+
+```
+34.59%  executor.(*sortOp).sortTailWithCTIDs.func1
+32.90%  executor.(*sortOp).lessRows
+27.94%  executor.evalExpr
+```
+
+**q16 is SORT-bound, not scan-bound.** goopg places the Gather as
+`GatherMerge → Sort → …`, so every worker sorts its own share and the leader
+then k-way merges them: total comparison work is unchanged, a merge stage is
+added, and channel overhead on top. Parallelising the index scan underneath
+cannot touch the dominant term.
+
+Full-suite confirmation — enabling eligibility regressed both index-only
+queries and helped none:
+
+| query | serial | parallel IOS |
+|---|---:|---:|
+| q13 | 4.2s | **6.8s** |
+| q16 | 1.5s | **2.3s** |
+| q22 | 0.7s | 0.7s |
+
+### 23.4 Disposition
+
+Reverted in full rather than shipped, and rather than left in the tree
+unreachable behind a disabled gate — an unwinnable path is an untested path.
+The change is recorded here with its measurements so it can be redone when its
+precondition holds.
+
+**The precondition is not the scan.** For a parallel IOS to pay on these
+shapes, one of two things must land first:
+
+1. **Gather placement.** `Sort(Gather(…))` — one sort in the leader over
+   gathered rows — parallelises the scan and joins while leaving the sort cost
+   exactly where serial has it. goopg currently produces `GatherMerge(Sort(…))`
+   for this shape because `findPartialSubtree` takes a Sort over a
+   partial-capable subtree as the partial root. PG's own q16 plan is
+   `Gather Merge → Sort → Parallel Hash Join → Parallel Index Only Scan`, which
+   works for PG because its per-worker sort is much cheaper than goopg's.
+2. **`sortOp` cost.** At 34% of a parallel run and dominating the serial one
+   too, the sort is the actual gap to PG on q16 (PG 0.3s vs goopg 1.6s).
+
+Corrected claim: **§21's "the delta is parallelism, not the access method" was
+wrong.** The delta is the sort. The access method matches PG; the sort does
+not.
