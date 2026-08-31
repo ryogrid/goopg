@@ -5,8 +5,8 @@ goopg is a single Go process (no fork-per-backend like PostgreSQL). The
 `internal/postmaster`, which accepts TCP connections and runs **one goroutine
 per client connection** — each goroutine is the analogue of one PostgreSQL
 backend process, owning its own MVCC transaction, snapshot, pinned buffers, and
-WAL inserts. SQL flows through four stages in turn: parse (`internal/parser`,
-out of scope here), plan (`internal/optimizer`), execute (`internal/executor`),
+WAL inserts. SQL flows through four stages in turn: parse (`internal/parser`),
+plan (`internal/optimizer`), execute (`internal/executor`),
 and access storage through the buffer pool (`internal/storage`).
 
 The data directory is the durable substrate. `internal/initdb` writes it from
@@ -64,7 +64,7 @@ flowchart TD
 ```
 
 > `parser`, `xlog`, and the checkpointer are documented at this architectural
-> level but are **out of scope** for this wiki's per-module pages.
+> level but are documented in the [Module Map](README.md#module-map) of this wiki.
 
 ## Data Flow
 
