@@ -9958,6 +9958,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			oldColName := act.OldColumnName
 			newColName := act.NewName
 
+			// M0134-0183: a typed table may not have a column renamed. First
+			// check in renameatt_check (postgres/src/backend/commands/
+			// tablecmds.c:3798-3802), which runs before the ONLY+children
+			// check just below. 42809, no errposition.
+			if tbl.OfTypeOID != 0 {
+				return &ExecError{Code: "42809", Pos: 0, Message: "cannot rename column of typed table"}
+			}
+
 			// M0134-0002 C9: `ONLY` on a parent that has children is refused
 			// BEFORE the column-existence lookup, mirroring renameatt_internal's
 			// not-recursing branch (postgres/src/backend/commands/tablecmds.c:3912-3917).
@@ -10278,6 +10286,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			return nil
 		case parser.AlterTableInherit:
+			// M0134-0183: a typed table's inheritance may not be changed.
+			// ATPrepAddInherit (postgres/src/backend/commands/tablecmds.c:
+			// 17237-17241) checks this before ATExecAddInherit even looks up
+			// the named parent, so it must precede the parent lookup below.
+			// 42809, no errposition.
+			if tbl.OfTypeOID != 0 {
+				return &ExecError{Code: "42809", Pos: 0, Message: "cannot change inheritance of typed table"}
+			}
 			// INHERIT parent_table — register the named table as a parent of tbl
 			// so that scanning the parent includes tbl's rows (M0097-0048).
 			parentTbl, ok := o.lookupTableWithSearch(act.InheritParent)
@@ -11624,6 +11640,15 @@ func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.Alt
 
 func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalog.Table, act parser.AlterTableAction) error {
 	col := act.Column
+	// M0134-0183: a typed table (`CREATE TABLE ... OF type`) may not gain a
+	// column outside its defining composite type. This is the FIRST check in
+	// ATPrepAddColumn (postgres/src/backend/commands/tablecmds.c:7200-7203),
+	// which runs in PG's separate prep pass before ATExecAddColumn's checks
+	// below — so it must precede the partition-child and system-column
+	// checks here too. 42809 ERRCODE_WRONG_OBJECT_TYPE, no errposition.
+	if tbl.OfTypeOID != 0 {
+		return &ExecError{Code: "42809", Pos: 0, Message: "cannot add column to typed table"}
+	}
 	// M0134-0002 C9 residual (S1): PG refuses ADD COLUMN on a partition child
 	// with 42809 ERRCODE_WRONG_OBJECT_TYPE, no errdetail, no errhint, Pos 0.
 	// This is the FIRST check in ATExecAddColumn — before the system-column
@@ -26054,6 +26079,14 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 // Indexes referencing only the dropped column become empty orphans (harmless
 // for now; a future pass can DROP them explicitly).
 func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
+	// M0134-0183: a typed table may not lose a column outside its defining
+	// composite type. First check in ATPrepDropColumn
+	// (postgres/src/backend/commands/tablecmds.c:9260-9263), which runs in
+	// PG's prep pass before ATExecDropColumn's checks below — precedes even
+	// the IF EXISTS / column-existence check. 42809, no errposition.
+	if tbl.OfTypeOID != 0 {
+		return &ExecError{Code: "42809", Pos: 0, Message: "cannot drop column from typed table"}
+	}
 	// Find the column to drop.
 	dropIdx := -1
 	for i, col := range tbl.Columns {
@@ -26302,6 +26335,14 @@ func noUsingCoercionError(colName, targetType string) *ExecError {
 }
 
 func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
+	// M0134-0183: a typed table may not have a column's type altered. First
+	// check in ATPrepAlterColumnType (postgres/src/backend/commands/
+	// tablecmds.c:14395-14400), which runs before the column-existence
+	// lookup just below — unlike its DROP/RENAME siblings this one DOES
+	// carry parser_errposition(pstate, def->location), so Pos is act.Pos().
+	if tbl.OfTypeOID != 0 {
+		return &ExecError{Code: "42809", Pos: act.Pos(), Message: "cannot alter column type of typed table"}
+	}
 	colIdx := -1
 	for i, col := range tbl.Columns {
 		if strings.EqualFold(col.Name, act.ColumnName) {
