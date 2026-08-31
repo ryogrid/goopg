@@ -28,16 +28,16 @@ parallel Gather, PARAM_EXEC lowering).
   scans, `Gather`).
 - `unnest.go` (4,311) — subquery pull-up and correlated-subquery decorrelation
   to semi/anti joins.
-- `joinsearch.go` (636) / `joinsearchlevel.go` (602) / `joinsearchseam.go` (636)
+- `joinsearch.go` (457) / `joinsearchlevel.go` (602) / `joinsearchseam.go` (654)
   — the PG-shaped join-search substrate (`searchCtx`, level lists,
   `joinSearchOneLevel`).
-- `nl_index_join.go` (1,418) — `rewriteJoinsToNLI` rule pass.
-- `cardinality.go` (1,330) — `EstimateRows` bottom-up row estimation.
-- `path.go` (709) — cost-model substrate: `Path`, `RelOptInfo`, `Cost`,
+- `nl_index_join.go` (1,527) — `rewriteJoinsToNLI` rule pass.
+- `cardinality.go` (1,401) — `EstimateRows` bottom-up row estimation.
+- `path.go` (719) — cost-model substrate: `Path`, `RelOptInfo`, `Cost`,
   `RelSet`, `PathKind`, add_path/set_cheapest dominance.
 - `cost_funcs.go` / `joincost.go` / `costindex.go` / `costbitmap.go` — PG cost
   function ports (`costParams`, `costSeqscan`, `hashJoinCost`, …).
-- `joinlayout.go` (1,350) — column-coordinate translation (pos-map family,
+- `joinlayout.go` (1,353) — column-coordinate translation (pos-map family,
   by-name re-resolvers).
 - `createplan*.go` — `createPlan`/`createPlanNode`: Path → executor-Node.
 

@@ -78,6 +78,11 @@ See [architecture.md](architecture.md) for the system diagram and data flow.
 | [`internal/utils`](modules/utils.md) | Utility packages: GUC registry, datetime/interval formatting, encoding, activity tracking. |
 | [`internal/port`](modules/port.md) | Platform runtime: nanotime, semaphore, process pinning — Linux `linkname` shims + fallbacks. |
 
+Test-support packages (`internal/testport`, `internal/testutil/*`) and the
+`cmd/` code/report generators are **out of this wiki's scope** — they are test
+infrastructure and one-shot tools, not engine packages. See
+`docs/test-port/README.md` and `cmd/` for those.
+
 ## Getting Started
 
 See [getting-started.md](getting-started.md).

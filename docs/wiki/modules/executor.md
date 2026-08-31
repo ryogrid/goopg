@@ -11,7 +11,7 @@ executes stored routines (PL/pgSQL, SQL-language, C-stub, `internal`), `CALL` /
 There are **two sibling engines**: a legacy `Build`/`Run` producing an
 `Operator` tree, and a GC-pointer-free fast path `BuildFast`/`BuildFastIterator`
 over flat int32-indexed slabs. The fast path is the live server entry point
-(`postmaster/dispatch.go:2964`).
+(`postmaster/dispatch.go:3398`).
 
 ## Key Files
 

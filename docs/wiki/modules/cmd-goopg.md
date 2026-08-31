@@ -19,9 +19,9 @@ control plane over a Unix socket, and run a streaming standby.
 
 ## Key Files
 
-- `cmd/goopg/main.go` (1,345 LOC) — CLI dispatch + subcommand implementations;
+- `cmd/goopg/main.go` (1,388 LOC) — CLI dispatch + subcommand implementations;
   `runStart` (`main.go:251`) is the server startup path.
-- `cmd/goopg/standby.go` (489 LOC) — streaming-standby lifecycle and promotion.
+- `cmd/goopg/standby.go` (497 LOC) — streaming-standby lifecycle and promotion.
 - `cmd/goopg/main_test.go`, `cmd/goopg/standby_test.go` — tests (`runRestart`
   is factored as `runRestartWithStarter` at `main.go:1154` so tests can inject a
   fake starter).
