@@ -1,70 +1,89 @@
 (idle — nothing in flight)
 
-## Loop #12 (2026-09-01) result — M0134 declared EXHAUSTED, priority falls to M0119 (commit `4f14b6fba`)
+## Loop #13 (2026-09-01) result — M0119-0006 97th slice landed (commit `56e4f98f6`)
 
-**Nightly triage:** `ci/logs/action-items.md` still shows run `20260901-010436`
-(7 items, mtime 02:11) — same run loops #10/#11 already confirmed filed (all 7
-subjects have M-NIGHTLY tasks in fix_plan.md, re-verified this loop). No new
-items.
+**Nightly triage:** `ci/logs/action-items.md` still the same run
+`20260901-010436` (7 items, mtime 02:11) loops #10-#12 already confirmed
+filed. Re-verified this loop: all 7 subjects (`IsolationIntraGrantInplace`,
+`IsolationStats`, `LockRowsSortOverJoinTakesRowLock`, `PgDumpConnectionSetup`,
+`PgStatActivity`, `RegressSuite`, `TestSyntax_Catalog_PgStatActivity`) already
+have an unchecked M-NIGHTLY task in `fix_plan.md` from earlier runs. No new
+filing needed.
 
-**Task:** resolved the standing question loops #9-#11 had each partly
-investigated but never closed: is there any regress-sql case with a
-`failed`/`not-tried` CSV status that lacks an M0134 task ID (i.e. genuinely new
-work)? Answer, verified mechanically: **no.**
+**Task:** per the Current Priority banner (M0134 exhausted, active selection
+M0119, sole open task M0119-0006 "pg_amcheck server tier"). Rather than
+trusting the CSV's stale "unsupported index AM" premise, empirically drove
+the REAL `pg_amcheck` binary against `003_check.pl`'s exact upstream fixture
+(box/int4range/int4[] columns + `USING {BTREE,HASH,BRIN,GIST,GIN,SPGIST}`
+indexes) on a fresh capped goopg server. Finding: the **entire fixture setup
+already succeeds** — refutes half the AC-003 premise (mirrors the earlier
+`[[ac003_blocker3_refuted_pg_amcheck_whole_db_clean]]` pattern). What
+`pg_amcheck` itself surfaced instead: `pg_class.relam` reported btree (403)
+for EVERY gist/gin/spgist/brin index, so pg_amcheck's own btree-only
+enumeration query wrongly selected them and errored "is not a B-Tree index"
+(exit 2, six spurious errors).
 
-Method: extracted the canonical 189-row `task ↔ case` table from
-`docs/milestones/0134-regress-sql-failed-not-tried-digestion.md`'s own "Task
-list" section, diffed it (`comm -23`) against every regress-sql row in
-`docs/test-port/postgres-oracle-target-inventory.csv` currently `failed`/
-`not-tried` (167 rows) — empty result, every one already has an ID. Also
-confirmed zero active `fix_plan.md` task bodies still carry the original
-unattempted-boilerplate filing text. (Tasks 0091-0140 appearing absent from
-the active `fix_plan.md` turned out to be a red herring — legitimate archival
-commit `1d74052c5` moved them to `completed_milestones/completed_fix_plan_012.md`
-months ago; each ID's real landing commit was confirmed via `git log`, e.g.
-`eac970d26` M0134-0092, `608a2bb81` M0134-0140.)
+**Root cause:** two sibling pg_class row builders — `internal/catalog/
+catalog.go`'s virtual `VirtualRows` pg_class path and `internal/executor/
+pg18_user_catalog_rows.go`'s `buildUserPGClassRowForIndex` (heap-persisted,
+PG-standby-facing sibling) — only special-cased `idx.Method=="hash"` (itself
+DEAD: a `USING hash` index stores `idx.Method=="btree"` by design,
+`idx.DeclaredHash` is the separate marker) and silently defaulted every other
+non-btree method to btree's oid. gist/gin/spgist/brin indexes ARE registered
+catalog-only under their real `Method` string (`execCreateIndex`'s
+`method=="gist"||...` branch) — the builders just never consulted it, even
+though the canonical `AccessMethodOIDByName(name)` map already existed one
+file away.
 
-**Conclusion:** all 189 filed M0134 regress-sql cases have been sized at least
-once and are each CLOSED (green or stale-pass) or PARKED on a named
-REFACTOR-tier prerequisite with its own re-arm trigger (parallel-query
-execution, SQL/JSON constructors, outer-join nullability, physical GiST/GIN/
-SP-GiST/BRIN index-scan integration, geometry operator lexing, the `money`
-type, `pg_shdepend`/object-address enumeration, etc.). **M0134 has no
-selectable task.** Documented in
-`docs/milestones/0134-regress-sql-failed-not-tried-digestion.md` ("Exhaustion
-note (2026-09-01)", status header) and in `fix_plan.md`'s Current Priority
-banner + M0119 section (M0119-0005 was already fully landed — only M0119-0006
-pg_amcheck server tier remains open).
+**Fix landed:** both builders now resolve `AccessMethodOIDByName(idx.Method)`,
+carved out for `idx.DeclaredHash` (hash unchanged — still reports btree's
+oid, matching the documented "everywhere else in goopg" contract). New
+`indexRelamOID` helper in `pg18_user_catalog_rows.go`. Verified end-to-end:
+`pg_amcheck --schema=s1 postgres` went from exit 2 to exit 0/clean, identical
+to real PG.
 
-**Concurrency note (important for next loop):** mid-session a concurrent Ralph
-process committed `57eb66cdd` ("condense remaining tasks/subtasks to
-final-status-only"), shrinking `fix_plan.md` from ~3972 to ~679 lines
-(compressing nightly-item and M0134-task-list bodies to terse bullets). It
-landed between my Reads and Edits of `fix_plan.md`; my banner/M0119-section
-edits (old_string matches were all in sections the condenser didn't touch)
-applied cleanly on top and are already part of that commit — verified via
-`git diff` (empty) before this loop's own commit. No corruption, but a
-reminder that a second Ralph loop is/was active on this tree concurrently
-(matches `[[concurrent_ralph_loops_corrupt_tree]]` /
-`[[ralph_fixplan_driver_churn_defeats_edit]]`) — re-read `fix_plan.md` fresh
-before editing it, don't trust a cached view.
+**Files:** `internal/catalog/catalog.go` (relam builder fix), `internal/
+executor/pg18_user_catalog_rows.go` (`indexRelamOID` helper + call site),
+`docs/design/0100-0149/0119-0006-pg-class-relam-nonbtree-index-am.md` (new
+design doc, accepted), `docs/design/README.md` (indexed as `0119-0006bm`),
+`.ralph/deferral_ledger.md` (new row).
 
-**NEXT LOOP:** Re-check the `## Current Priority` banner first. It now says
-M0134 is exhausted and active selection is **M0119** (sole task: M0119-0006 —
-pg_amcheck server tier). Per the M0119 per-task rule, write a design doc under
-`docs/design/M0119-0006-NNNN-*.md` (draft → accepted, agent-reviewed) before
-implementing. Re-verify M0119-0006 hasn't already landed (check git log /
-`.ralph/deferral_ledger.md` first — M0119 tasks require "verify it already
-landed" per the milestone's own rule). After M0119 clears, M0122's remaining
-items are next. If any M0134 PARKED case's named prerequisite has since
-landed as its own milestone, that re-arms M0134 selection for that one case
-only (re-run `scripts/pg-regress-runner.sh --verbose <case>` and re-size).
+**Key symbols:** `catalog.AccessMethodOIDByName`, `catalog.Index.Method` /
+`.DeclaredHash`, `executor.indexRelamOID`, `executor.execCreateIndex`
+(operators_ddl.go:7502, the gist/gin/spgist/brin catalog-only branch at
+:7632).
 
-**Gates run:** `go build ./...` clean; `make check-testport-inventory` PASS;
-`make ralph-state-guard` PASS (one auto-repair, same benign pattern as loops
-#4-#12); pre-commit pgbench smoke PASS (507/650/11726 TPS, 0 failed) — fired
-automatically via the git hook on the milestone-doc commit. Did not run the
-full `ralph-precommit-test.sh` units suite or `tpch-spotcheck.sh` this loop
-(no engine/planner/executor code touched — pure docs/fix_plan bookkeeping).
+**New deferral (recorded, NOT fixed — separate bug, one-task-per-loop):**
+while re-verifying, an EMPTY partition child (`CREATE TABLE p1_1 PARTITION OF
+p1 FOR VALUES IN (...)`, zero rows ever inserted) makes `pg_amcheck` error
+`could not open file ... No such file or directory` on `verify_heapam()` —
+goopg apparently never creates a heap relation's main-fork file until first
+write (lazy `smgr` creation), so a genuinely-empty table looks ENOENT the
+same way a REMOVED file does (see `[[goopg_smgr_ocreate_recreates_removed_files]]`).
+Root-causing this (partition-specific vs. general) is the next M0119-0006
+slice — resume point and the "must not regress
+`TestVerifyHeapam_DetectsMissingRelationFile`" constraint are in the ledger
+row appended this loop.
 
-**In-flight:** none.
+**NEXT LOOP:** Re-check the `## Current Priority` banner first (still M0119
+unless something changed it). Continue M0119-0006 with the empty-heap-file
+ENOENT deferral above as the concrete next slice: (1) confirm whether it's
+partition-specific or general (repro with a bare non-partition empty table);
+(2) if general, decide fix site — eager file touch at CREATE TABLE time vs.
+teaching `verify_heapam`'s Open/NBlocks path (`internal/executor/
+operators_verify_heapam.go`) to disambiguate "empty, never written" from
+"removed after having data" without breaking
+`TestVerifyHeapam_DetectsMissingRelationFile`. Continue driving the REAL
+`pg_amcheck` binary against fixture slices — it is a much faster oracle for
+this milestone than reasoning from the CSV's (partially stale) blocker
+descriptions.
+
+**Gates run:** `go build ./...` clean; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` full suite PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=34); pre-commit pgbench smoke PASS (509/655/11768 TPS, 0
+failed) fired automatically via the git hook. `make ralph-state-guard`:
+found the same benign running/completed mismatch loops #4-#13 have all seen,
+auto-repaired.
+
+**In-flight:** none. Throwaway probe server/data dir (`/tmp/m0119data`,
+`/tmp/goopg-m0119`) cleaned up before commit.
