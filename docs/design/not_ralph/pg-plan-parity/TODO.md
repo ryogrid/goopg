@@ -904,7 +904,8 @@ section D. Recorded because the gate run is where they became visible.
       generation while the seam reported success. Q13 = PG's
       `Index Only Scan using customer_pk`, byte-identical, 3738 vs seq 12960
       (PG: 3906). Deferred, each named: filterless INNER trees stay legacy
-      (five stable plans move at once — own gated round); Parallel IOS. One regression caught by the TPC-DS gate pre-landing:
+      (five stable plans move at once — own gated round); Parallel IOS — ATTEMPTED AND REVERTED, see section G-3. One regression caught
+      by the TPC-DS gate pre-landing:
       Q77's `*CTEScan` prefix leaf panicked in `markSearchedTree`; the entry
       search now gates on `scanLeafFor` rebuildability.
 - [x] Correct `relsize.go:424` — "goopg has no visibility map for the planner to
@@ -982,6 +983,34 @@ section D. Recorded because the gate run is where they became visible.
 - [x] Seam re-applied UNCHANGED; Q17 = PG's node, `SubPlan 1` correctly
       correlated, result byte-identical, 1.9s (bitmap rebuild per row — the
       task #48 executor cost, stated).
+
+### G-3 — Parallel Index Only Scan: built, measured, reverted (DESIGN §23)
+
+- [x] Implemented end to end and CORRECT (byte-identical results): an
+      `IndexOnlyScan.Parallel` flag with `drivingScan`/`stampParallelScan`
+      arms, a shared leaf-block claim set, and a new
+      `nbtree.RangeScanWithPosLeafFilter` so an unowned leaf is skipped before
+      its entries are parsed.
+- [x] Three measured variants, none beating serial (q16 1.6s): per-entry claim
+      5.7s, memoised 4.5s, per-leaf filter 2.7s. Full suite: q13 4.2→6.8s,
+      q16 1.5→2.3s, q22 unchanged. Reverted rather than ship a regression.
+- [x] **§21's premise was WRONG and is corrected**: q16's residual is not the
+      missing parallel scan. A CPU profile puts 34% in `sortOp.lessRows` /
+      `sortTailWithCTIDs` — q16 is SORT-bound. Each worker sorts its own share
+      under `GatherMerge(Sort(…))`, so total comparison work is unchanged and
+      a merge stage is added.
+- [x] **SHIPPED (DESIGN §23.4)** after two PG-faithful corrections: decline the
+      P7 Sort-as-partial-root for an IOS driving scan (`sortPartialRootPays`)
+      so the Gather lands BELOW the sort, and size the parallelism by
+      `index->pages` rather than the heap (PG's `compute_parallel_worker`
+      input). Medians: q16 1.7→1.3s (−24%), q13 4.5→4.4s, q22 0.8→0.7s; both
+      of the latter now decline on index size and keep their plans. All gates
+      green, 21/21 byte-identical, one plan changed.
+- [ ] Remaining q16 gap is the SORT, not the scan: 1.3s vs PG's 0.3s, with
+      `sortOp.lessRows`/`sortTailWithCTIDs` dominating. Superseded precondition
+      (`Sort(Gather(…))` keeps one leader-side sort while parallelising scan +
+      joins) or `sortOp` cost itself — the latter is also the real gap to PG on
+      q16 (PG 0.3s vs goopg 1.6s).
 
 ## Cross-cutting
 
