@@ -1,69 +1,83 @@
 (idle — nothing in flight)
 
-## Loop #9 result — M0134-0177 landed
+## Loop #1 (2026-09-01) result — M0134-0180 (tsrf.sql) sized & PARKED; LIMIT/OFFSET SRF check landed as `8519d98b7`
 
-**Nightly triage:** `ci/logs/action-items.md` unchanged (run `20260828-235424`);
-both `## AI-` items already have M-NIGHTLY rows (001 ticked, 002 open — Q5
-timeout). Nothing new to file. Banner: M-NIGHTLY filing is unconditional but
-SELECTION is subordinate to M0134 while any M0134 task is unchecked → worked
-M0134 by ID ascending. `-0176a/-0176b` are letter sub-items, not the next ID.
+**Nightly triage:** `ci/logs/action-items.md` run `20260831-013952` (2 new
+items) filed as unconditional obligation, NOT selected (banner still names
+M0134): `AI-...-001` testport isolation-suite timeout (17 specs stuck
+`[running]` 1h56m, one blocked on a `lib/pq` conn stuck in IO wait — needs a
+clean-tree confirmation run before trusting it as a real hang, since the
+run's `meta.json` shows 18 dirty files incl. a concurrently-modified
+`postgres` submodule) and `AI-...-002` build-broke-mid-stage (confirmed
+stale — `go build ./...` clean at HEAD). Both rows in fix_plan.md's
+M-NIGHTLY section.
 
-**Task:** M0134-0177 — `test_setup.sql`. Case **PASSES** (237 lines, 100%
-parity), CSV `not-tried` → `pass`/`pass_required=yes`. Design
-`docs/design/m0134-0177-btree-split-posting-refill.md`.
+**Task:** M0134-0180 — `tsrf.sql`. **PARKED** (CSV `not-tried` → `failed`),
+793→785 diff lines. Design `docs/design/0100-0149/m0134-0180-tsrf-sizing.md`
+(landed by a CONCURRENT session's doc-reorg commit `17e695d08` — see note 4
+below — not by my own commit `8519d98b7`, which is why it isn't in that
+commit's file list).
 
-**Five things worth carrying:**
+**Landed:** `exprHasSRF` walker (`internal/parser/analyzer/analyzer.go`,
+mirrors `exprHasWindowFunc`) rejects a set-returning function in LIMIT/OFFSET
+(SQLSTATE 0A000) instead of silently evaluating it via the executor's
+`generate_series`-as-scalar fallback (wrong single-row result). Guards:
+`TestAnalyzeSRFInLimitOffsetRejected`, `TestAnalyzeLimitOffsetNonSRFStillAccepted`.
 
-1. **A "not-tried" case can be un-RUNNABLE, not just untested.** `test_setup.sql`
-   already matched PG byte-for-byte; the runner just executed it twice (its own
-   prerequisite, then the test). Before assuming a case diverges, check that the
-   harness can run it *once*.
+**Four things worth carrying:**
 
-2. **The engine bug was found by the double-run, not by the case.** Second
-   `COPY` into a populated `onek` → `panic="storage: not enough free space in
-   page"` in `nbtree.mustInsertItemSorted`. Root cause: `pageItems` EXPANDS
-   posting lists (one item per heap TID) and the split refill wrote each back as
-   its own plain line pointer. Measured with a temporary `SPLITDBG` printf: an
-   8132-byte leaf expanded to **21960** bytes; both halves of a 50/50 cut
-   overflowed. Normal splits log ~8700 = "one page + the new item" — that ratio
-   is the invariant to check if this area regresses.
+1. **`tsrf.sql` is ~10 independent placement rules, not one gap.** Several
+   already matched the oracle byte-for-byte with ZERO code change: sibling-SRF
+   lockstep zipping (`operators_project_set.go: openSelectSrfMode` already
+   NULL-pads to maxLen correctly), post-aggregation SRF timing when not
+   GROUP-BY-referenced, DISTINCT ON placement, GROUP BY CUBE+SRF. Don't assume
+   a `failed` case needs its dominant gap fixed — verify each assertion
+   independently first (an `Explore` subagent sweep is the efficient way).
+2. **Three REFACTOR-tier gaps ledgered, NOT attempted**: `0180a` six more
+   "SRF not allowed in X" contexts (CASE/COALESCE/aggregate-arg/window-arg/
+   UPDATE-SET/RETURNING/VALUES — aggregate/window-arg has ZERO existing
+   precedent in goopg, needs a `parse_agg.c`-style sublevels-up walker);
+   `0180b` nested-SRF-as-another-SRF's-own-argument (`generate_series(1,
+   generate_series(1,3))` → 1 row not 6) AND GROUP-BY-referencing-a-
+   target-list-SRF (changes pre-aggregation cardinality) — BOTH need the SAME
+   primitive, a recursive/stacked ProjectSet, not independent patches;
+   `0180c` `|@|` as a user-defined prefix operator fails at the parser's
+   closed `{-,+,NOT,~}` prefix set (`select.go:parseUnary`,
+   `support.go:prefixOp`) — unrelated to SRFs, same class as the M0134-0179
+   closed-`OpCode`-enum follow-up.
+3. **`isBuiltinSRF` now has TWO copies** (`internal/executor/
+   operators_ddl_partition.go` and the new `builtinSRFNames` in
+   `internal/parser/analyzer/analyzer.go`) — unavoidable, executor imports
+   analyzer not the reverse. Cross-referenced by comment; keep them in sync
+   by hand if either SRF list changes (Hard-won Rule #2).
+4. **A concurrent session (PID from `ps`, session-id `3ac4bff9...`) was
+   running a 1273-file design-doc reorg (buckets `0000-0049/`, `0050-0099/`,
+   `0100-0149/`) IN THE SAME WORKING TREE throughout this loop** and committed
+   it (`17e695d08`) mid-loop, between my `git add` of the new design doc +
+   README.md edit and my own commit. Because git's index/working tree is
+   shared, that commit swept up my ALREADY-STAGED `docs/design/
+   0100-0149/m0134-0180-tsrf-sizing.md` and my `docs/design/README.md`
+   one-line index-entry edit (both landed correctly, verified post-hoc via
+   `git show HEAD:<path>` — the reorg's own link-path rewrite happened to
+   match the bucket I'd already chosen). My own commit `8519d98b7` therefore
+   does NOT list the design doc or README.md, even though both exist and are
+   committed. **If touching `docs/design/README.md` again while another
+   session may be live, `git add` it immediately before committing (don't
+   leave it staged-but-uncommitted across tool calls) to shrink this race
+   window.**
 
-3. **Revert-check with a full READBACK, not just "no panic".** The guard at HEAD
-   fails `RangeScan returned 21396 entries, want 21600` — the old split path
-   *silently dropped 204 index entries* on shapes that didn't crash. A no-panic
-   assertion would have missed the worse half of the bug.
+**Gates run:** `go build ./...` clean; `go test ./internal/parser/...`
+(incl. `TestParityGoldensAreCurrent`, zero golden diff) / `./internal/
+optimizer/...` / `./internal/executor/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12
+rows=2 22.7s, Q13 rows=34 6.9s); `make check-testport-inventory` PASS;
+`make regen-testport` clean regen; `make ralph-state-guard` PASS. Pre-commit
+hook pgbench smoke PASS (10942 TPS select-only).
 
-4. **Sibling-paths rule, size-model edition (3rd instance after
-   `itemEncodedSize`/root-0040).** `byteAwareSplitLoc` priced items with a
-   *different* expression than `itemEncodedSize` — no line pointer, no MAXALIGN,
-   no postings. Fix funnels writer and budget through one function
-   (`postingChunkLens`) and pins the equality in a test. Deleted the two
-   superseded helpers rather than leaving them as wrong-model siblings.
-
-5. **`pg-regress-runner.sh` quick-set A/B vs stashed HEAD is a cheap, sharp
-   gate** for high-blast-radius storage changes: ~10 min a side, and
-   "byte-identical, same 48 diff files, same line counts" is much stronger
-   evidence than a bare pass count (the quick set sits at 4/52 for unrelated
-   reasons, so the absolute number says nothing).
-
-**Trap re-confirmed:** the throwaway-PG oracle is worth the 30s (`initdb -A
-trust` + `pg_ctl -o "-p 5542 -k /tmp"`) — it settled that psql's
-`psql:<file>:<line>:` NOTICE prefix is a `-f` artifact and that pg_regress uses
-a **stdin redirect** (`pg_regress_main.c:75`), which is why expected files carry
-bare `NOTICE:`. Separately: a `psql` against the TPC-H reference PG on **65432**
-hung for 15 min — do not probe the bench clusters for one-off oracle questions.
-
-**Gates run:** `go test ./internal/access/nbtree/... ./internal/storage/...`
-PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2 22.2s, Q13 rows=34 9.3s);
-`scripts/pg-regress-runner.sh` quick set A/B **byte-identical**;
-`scripts/pg-regress-runner.sh -v test_setup` PASS; double-`test_setup` repro 0
-panics; `make regen-testport` + `make check-testport-inventory` PASS;
-`make ralph-state-guard` OK (auto-repaired the progress marker). gofmt drift on
-`btree.go` is **pre-existing at HEAD** (verified by stash); the new/changed
-`posting.go`, `bulkload.go` and the new test file are gofmt-clean.
-
-**NOT run:** TPC-DS SF0.5 gate (~1 h). This is an index-core change, so it is
-the one gate worth adding if anything looks off downstream.
+**NEXT LOOP:** Re-check banner (M0134 still priority as of this writing).
+Next unclaimed M0134 case per fix_plan.md ordering, OR pick up ledger row
+0180a/0180b/0180c if the banner ever names "M0134 follow-ups" specifically.
+Also worth a quick check: did the AI-...-001 testport-hang nightly item get
+a clean-tree re-run yet (see M-NIGHTLY section)?
 
 **In-flight:** none.
