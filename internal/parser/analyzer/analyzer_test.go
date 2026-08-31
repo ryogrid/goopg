@@ -182,6 +182,52 @@ func TestAnalyzeWindowFunctionUnsupportedRejected(t *testing.T) {
 		"0A000")
 }
 
+// TestAnalyzeSRFInLimitOffsetRejected pins M0134-0180 (tsrf.sql): PG rejects
+// a set-returning function in LIMIT/OFFSET (postgres/src/backend/parser/
+// parse_func.c, EXPR_KIND_LIMIT/EXPR_KIND_OFFSET) even though the SRF's
+// result type (int8) would otherwise satisfy the plain integer-expression
+// check. Before this fix goopg silently evaluated the SRF as a scalar
+// (taking its first argument, per evalFuncCall's "generate_series used as a
+// scalar expression" fallback) and returned a wrong row count instead of
+// erroring.
+func TestAnalyzeSRFInLimitOffsetRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT aid FROM pgbench_accounts LIMIT generate_series(1,3)",
+		"0A000")
+	expectAnalyzeCode(t, cat,
+		"SELECT aid FROM pgbench_accounts OFFSET generate_series(1,3)",
+		"0A000")
+	// A user-defined SETOF routine must be caught too, not just the
+	// builtin-name allowlist.
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Name: "srf_ints", ReturnsSet: true,
+		ReturnType: catalog.Type{Name: "int4"}, Language: "sql",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	expectAnalyzeCode(t, cat,
+		"SELECT aid FROM pgbench_accounts LIMIT srf_ints()",
+		"0A000")
+}
+
+// TestAnalyzeLimitOffsetNonSRFStillAccepted guards against exprHasSRF
+// over-triggering: a plain scalar function or literal in LIMIT/OFFSET must
+// still analyze cleanly (sibling-path regression check for the new
+// exprHasSRF gate added alongside the window-function 0A000 check above).
+func TestAnalyzeLimitOffsetNonSRFStillAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT aid FROM pgbench_accounts LIMIT abs(-3)",
+		"SELECT aid FROM pgbench_accounts LIMIT 5 OFFSET 1",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
 // TestAnalyzeWindowAggregateFunctionAccepted pins the M0134-0022b
 // widening: array_agg() OVER () — previously rejected here as the
 // canonical "not supported in v0 analyzer" case (see the comment above)
