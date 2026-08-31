@@ -1,0 +1,740 @@
+# 0020-0001 — Window Function Parser Surface and AST
+
+**Status:** accepted (step 1 — parser + AST only; analyzer /
+planner / executor deferred)
+**Milestone:** [0020 — Window Function Support](../../milestones/0020-window-functions-over-row-number-rank-lag-lead.md)
+**Spans seam:** SQL parser, FuncCall AST, analyzer reject.
+**Cross-links:**
+[root-0010](../../root/root-0010-parser.md) (parser scaffolding),
+[0016-0001](0016-0001-with-parser-ast-and-name-resolution.md),
+[0017-0001](0017-0001-on-conflict-parser-ast-and-analysis.md),
+[0018-0001](0018-0001-explain-parser-options-and-ast.md),
+[0021-0001](0021-0001-for-update-parser-analysis-and-ast.md)
+(parser-only step-1 precedents).
+
+## Context
+
+goopg's parser handles aggregates, scalar functions, joins, and
+subqueries but doesn't yet recognise the `OVER (…)` tail that
+promotes a function call to a window function. Reporting
+queries that need ROW_NUMBER / RANK / LAG / LEAD over partition
++ order tuples — common in BI tools, ORMs, and migration
+workloads — fail at the lex/parse layer with a generic syntax
+error.
+
+This slice introduces the **parser surface and AST nodes**
+without yet wiring the analyzer / planner / executor — mirrors
+the M0016/M0017/M0018/M0021 step-1 precedents. Establishing
+the AST shape in one well-tested commit lets later stages
+(analyzer name resolution, planner WindowAgg node, executor
+streaming-sort + per-partition state) land incrementally.
+
+## Grammar
+
+```
+func_call    ::= func_name '(' [args] ')' [over_clause]
+over_clause  ::= OVER '(' [partition_clause] [order_clause] ')'
+partition_clause ::= PARTITION BY expr_list
+order_clause     ::= ORDER BY sort_list
+```
+
+Stage A scope:
+
+- Bare `OVER ()`, `OVER (PARTITION BY …)`, `OVER (ORDER BY …)`,
+  `OVER (PARTITION BY … ORDER BY …)` — the four shapes
+  ROW_NUMBER and RANK need.
+- Frame clauses (`ROWS BETWEEN …`, `RANGE …`, `GROUPS …`,
+  frame-exclusion) parse but are explicitly rejected.
+  Stage B promotes them.
+- Named-window references (`OVER win_name`) and named-window
+  definitions (`WINDOW win AS (...)`) are out of step-1 scope.
+
+## AST shape
+
+```go
+type FuncCall struct {
+    pos      int
+    Name     ObjectName
+    Args     []Expr
+    Star     bool
+    Distinct bool
+    Over     *WindowDef       // ← new in M0020-0001
+}
+
+type WindowDef struct {
+    pos         int
+    PartitionBy []Expr
+    OrderBy     []SortBy
+}
+```
+
+`FuncCall.Over` is nil for every pre-M0020 call. PartitionBy
+and OrderBy reuse the existing `[]Expr` / `[]SortBy` shapes so
+the executor's ordering logic doesn't have to learn new
+sort-key plumbing for window functions.
+
+## New keywords
+
+```go
+KwOver      Keyword = "over"
+KwPartition Keyword = "partition"
+```
+
+`KwOrder` and `KwBy` already exist; `KwRows` / `KwRange` /
+`KwGroups` stay deferred.
+
+## Parser wiring
+
+`parseFuncCallTail` ends with `)` then calls a new
+`maybeWindowTail(fc)` helper:
+
+```go
+func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
+    if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOver) {
+        return fc, nil
+    }
+    wd, err := p.parseWindowDef()
+    if err != nil { return nil, err }
+    fc.Over = wd
+    return fc, nil
+}
+```
+
+Returning `fc` unchanged when no `OVER` follows preserves the
+byte-for-byte invariant for every existing caller.
+
+`parseWindowDef` consumes `OVER ( [PARTITION BY exprs]
+[ORDER BY sortlist] )` and errors on any token that isn't `)`
+after the optional ORDER BY — that's how frame clauses surface
+their explicit "not supported in v0" message instead of a
+generic syntax error.
+
+## Analyzer gate
+
+`analyzeExpr`'s `*parser.FuncCall` arm rejects when `x.Over !=
+nil` with SQLSTATE `0A000` "window functions are not supported
+in v0 analyzer". Mirrors the two-step gate from M0017-0002 →
+M0017-0003 / M0018-0002 → M0018-0003: parser accepts the
+surface so diagnostics surface specific feature names; the
+analyzer refuses to silently degrade to non-windowed evaluation.
+
+## Tests
+
+`internal/parser/window_test.go`:
+
+- `TestParseWindowFuncBareOver` — `f() OVER ()` produces
+  non-nil Over with empty PartitionBy / OrderBy.
+- `TestParseWindowFuncPartitionBy` — `OVER (PARTITION BY x)`.
+- `TestParseWindowFuncOrderBy` — `OVER (ORDER BY x DESC)`;
+  pins the SortBy.Desc round-trip.
+- `TestParseWindowFuncPartitionAndOrder` — both clauses
+  combined.
+- `TestParseWindowFuncCountStarOver` — `count(*) OVER ()`
+  flows through the Star=true branch into the window tail.
+- `TestParseWindowFuncRejectsFrameClause` — `ROWS BETWEEN …`
+  and `RANGE UNBOUNDED PRECEDING` both surface parse errors.
+- `TestParseWindowFuncWithoutOverUnchanged` — rollout
+  guardrail for non-windowed calls.
+
+`internal/analyzer/analyzer_test.go`:
+
+- `TestAnalyzeWindowFunctionRejected` — `SELECT row_number()
+  OVER ()` surfaces SQLSTATE `0A000`.
+
+Full `go test ./...` green.
+
+## Out of scope
+
+- Analyzer: name resolution + type checking for ROW_NUMBER /
+  RANK / LAG / LEAD — M0020-0002.
+- Planner: WindowAgg plan node + partition / order key
+  propagation — M0020-0003.
+- Executor: per-partition streaming + sort + window-function
+  evaluation — M0020-0004.
+- Frame clauses (ROWS / RANGE / GROUPS / frame exclusion).
+- Named-window references (`OVER win_name`) and named-window
+  definitions (`WINDOW win AS (...)`).
+- LAG/LEAD-specific argument shapes (offset, default).
+
+## Follow-up: named windows (2026-07-05, M0122-0004)
+
+Implemented the two items this doc originally scoped out — `WINDOW
+name AS (...)` clauses and the bare `OVER name` reference form —
+without touching the planner or executor at all, by resolving the
+reference entirely inside the analyzer before either sees the AST.
+
+**AST:** `parser.SelectStmt` gained `WindowClause
+[]NamedWindowDef` (`internal/parser/ast.go`); `NamedWindowDef{Name
+string; Def *WindowDef}`. `WindowDef` (`internal/parser/expr.go`)
+gained `RefName string` — set instead of `PartitionBy`/`OrderBy` for
+the bare-name form, empty for the pre-existing anonymous
+`OVER (...)` form (byte-for-byte unchanged for every non-named
+query).
+
+**Parser:** `parseWindowDef` (`internal/parser/select.go`) now
+branches after consuming `OVER`: `(` → the existing anonymous body
+(factored into a new shared `parseWindowSpecBody`, used by both the
+anonymous and named forms so they can never drift apart — see
+`pattern_sibling_paths_must_agree`); a bare identifier → `RefName`.
+A new `WINDOW` clause is parsed via `acceptIdentKeyword("window")`
+(mirrors the existing `WITHIN`/`FILTER` unreserved-keyword
+precedent rather than adding a new reserved keyword token) between
+`HAVING` and `ORDER BY`, matching upstream's grammar position.
+`isAliasStart` gained a `"window"` exclusion alongside the
+pre-existing `"fetch"` one — without it, `sum(x) OVER w WINDOW w AS
+(...)` would swallow `window` as `sum(x)`'s implicit column alias
+before the parser ever reached the WINDOW-clause branch.
+
+**Analyzer:** a new `resolveNamedWindowRefs` (`internal/analyzer/
+analyzer.go`) runs once per `SELECT`, immediately before
+`analyzeTargets`. It builds a `name → *WindowDef` map from
+`s.WindowClause` and walks every expression tree a window function
+can legally appear in (Targets, GROUP BY, HAVING, ORDER BY — the
+same set `exprHasWindowFunc` already checks), and for any
+`FuncCall.Over.RefName != ""` copies the matching definition's
+`PartitionBy`/`OrderBy` in place, raising `42P20` ("window %q does
+not exist") for an unresolvable name. The traversal
+(`resolveWindowRefsInExpr`) deliberately mirrors
+`exprHasWindowFunc`'s node-type coverage — same sibling-consistency
+rationale as the parser change.
+
+Because the mutation happens on the *same* AST nodes the planner
+and executor already consume, `internal/planner/planner.go`'s
+`windowSpecKey`/window-grouping logic and
+`internal/executor/operators_window.go`'s evaluator needed **zero**
+changes — a named-window reference is indistinguishable from an
+equivalent inline anonymous one by the time either stage sees it,
+and functions sharing one named window correctly group into a
+single `WindowAgg` node (same as writing the spec out twice inline).
+
+**Tests:** `internal/parser/window_test.go`
+(`TestParseWindowClauseNamedWindow`,
+`TestParseWindowClauseMultipleNamedWindows`);
+`internal/analyzer/analyzer_test.go`
+(`TestAnalyzeNamedWindowClauseAccepted`,
+`TestAnalyzeNamedWindowUndefinedRejected` — both the wrong-name and
+right-name-not-defined-here cases); `internal/executor/
+window_compat_test.go`'s `TestCompatWindowNamedWindowClause` proves
+end-to-end that a named `OVER w` used by two different functions
+produces byte-identical output to writing the same spec inline
+twice.
+
+**Still deferred (unchanged from the original scope):** frame
+clauses, LAG/LEAD-specific default-shapes are already implemented
+elsewhere — only ROWS/RANGE/GROUPS frame execution remains open,
+tracked as its own `unimplemented_feat.json`/fix_plan M0122-0004
+item. Combining forms (`OVER (win_name ORDER BY ...)` extending a
+named window with additional clauses at the reference site, and a
+named window definition itself referencing another named window as
+its base) are **not** supported — only a bare `OVER name` and a
+self-contained `WINDOW name AS (...)` body. Both are real upstream
+syntax (see `postgres/src/test/regress/sql/window.sql`) not
+exercised by this loop's tests; deferred to a follow-up if a real
+query shape needs them.
+
+## Follow-up: combining window forms (2026-07-07, M0122-0004)
+
+Implemented the two combining forms the previous follow-up scoped
+out: `OVER (existing_window_name ...)` extending a named window at
+the reference site, and a `WINDOW w2 AS (w1 ...)` entry basing itself
+on an earlier named window. Both are governed by SQL:2008 7.11
+`<window clause>` syntax rule 10 / general rule 1 (upstream:
+`transformWindowDefinitions`, `postgres/src/backend/parser/parse_clause.c`),
+confirmed field-for-field against a live PostgreSQL 18.3 instance
+before implementing (see `.ralph/deferral_ledger.md`'s 2026-07-07 row
+for the exact probe transcript): the referencing side inherits the
+referenced window's `PARTITION BY` outright (declaring its own is an
+error), may add its own `ORDER BY` only if the referenced window has
+none, and always keeps its own frame clause (never inherited) — but
+the referenced window having *any* frame clause at all is itself an
+error, regardless of what the referencing side declares.
+
+**Crucial distinction this loop's own first implementation attempt
+got wrong** (caught by the pre-existing `TestCompatWindowExplicitRowsFrameSliding`
+compat test, not by a new test written for this slice): a
+parenthesis-free `OVER name` reference is a *different* upstream AST
+shape from `OVER (name)` — gram.y's `over_clause: OVER ColId` sets
+`WindowDef.name` (not `.refname`) and is resolved by
+`transformWindowFuncCall` (`parse_agg.c`) via a direct name-indexed
+alias into `pstate->p_windowdefs`, entirely bypassing
+`transformWindowDefinitions`'s override validation — so `OVER w`
+referencing a `w` that itself has a frame clause is always legal,
+while the *parenthesized* `OVER (w)` (and any `OVER (w ...)` variant)
+goes through the override checks and would raise "cannot copy window
+\"w\" because it has a frame clause" for the same `w`. Confirmed
+against real PostgreSQL 18.3 both ways. `parser.WindowDef` gained
+`IsBareRef bool`, set only by the parenthesis-free identifier branch
+of `parseWindowDef`; the analyzer skips override validation entirely
+for that case (wholesale field copy, matching the original
+pre-combining-forms behavior byte-for-byte) and only runs it for the
+parenthesized shape.
+
+**Parser (`internal/parser/select.go`):** `parseWindowSpecBody` now
+recognises an optional leading `existing_window_name` — a bare or
+quoted identifier immediately after `(`, excluding the bare (unquoted)
+words `rows`/`range`/`groups` so `OVER (ROWS BETWEEN ...)` still
+parses as an anonymous frame clause rather than misreading `ROWS` as
+a window name (mirrors gram.y's documented precedence trick giving
+`PARTITION`/`RANGE`/`ROWS`/`GROUPS` the same precedence as `IDENT` so
+the empty-`opt_existing_window_name` production wins the shift/reduce
+conflict). `KwPartition`/`KwOrder` are already distinct keyword tokens
+in this lexer, so no analogous exclusion is needed for those.
+
+**Analyzer (`internal/analyzer/analyzer.go`):** `resolveNamedWindowRefs`
+now processes `s.WindowClause` in list order (matching
+`pstate->p_windowdefs`'s append order upstream), building the
+`name → *WindowDef` map incrementally so a later entry may reference
+an earlier one — a forward or undefined reference reports the same
+"does not exist" a genuinely unknown name would (a self-reference is
+necessarily "forward" too, since a name isn't registered until after
+its own entry is processed) — and rejects a duplicate name with
+`42P20` ("window %q is already defined", previously entirely
+unchecked). Each entry is mutated in place to hold its final merged
+`PartitionBy`/`OrderBy`/`Frame` via the new `mergeWindowDef` helper
+before being registered, so a third-level reference
+(`w3 AS (w2 ...)` where `w2 AS (w1 ...)`) sees already-resolved
+values. The same helper is reused for a `FuncCall`'s own inline
+`OVER (name ...)` in `resolveWindowRefsInExpr`, guarded by
+`!x.Over.IsBareRef`.
+
+**Bug fixed in passing:** the undefined-window-name diagnostic
+(`window %q does not exist`) was raising `42P20`
+(`ERRCODE_WINDOWING_ERROR`) — upstream's `parse_agg.c`/`parse_clause.c`
+both use `42704` (`ERRCODE_UNDEFINED_OBJECT`) for this specific
+message, confirmed against PostgreSQL 18.3
+(`TestAnalyzeNamedWindowUndefinedRejected` updated accordingly). `42P20`
+is upstream's code for the override/duplicate-name errors this
+follow-up newly added, not for a missing name.
+
+**Tests:** `internal/parser/window_test.go`
+(`TestParseWindowClauseOverCombiningForm`,
+`TestParseWindowClauseNamedWindowBasedOnNamedWindow`,
+`TestParseWindowClauseRefNameExcludesFrameModeWords`);
+`internal/analyzer/analyzer_test.go`
+(`TestAnalyzeNamedWindowCombiningFormAccepted`,
+`TestAnalyzeNamedWindowCombiningFormErrors`,
+`TestAnalyzeNamedWindowBareRefToFramedWindowAccepted` — pins the
+bare-vs-parenthesized distinction above); `internal/executor/
+window_compat_test.go`'s `TestCompatWindowCombiningForms`. All error
+shapes and the accepted-merge shapes were independently confirmed
+against a live PostgreSQL 18.3 instance before being encoded as Go
+test expectations. Gates: `go build ./...`/`go vet` clean; `go test
+./internal/parser/... ./internal/analyzer/... ./internal/executor/...
+./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+workloads).
+
+**Still out of scope:** `RANGE`/`GROUPS` frame modes remain an
+unrelated, larger deferred item (tracked above); combining forms
+involving those modes are moot until that lands.
+
+## Follow-up: frame-consuming aggregate window functions (2026-07-05, M0122-0004)
+
+Implemented `sum`/`count`/`avg`/`min`/`max` as window functions
+(`sum(x) OVER (...)`, `count(*) OVER (...)`, etc.) — the natural
+prerequisite this doc's own Follow-up section named for ROWS/RANGE/
+GROUPS frame execution: before this change the only window functions
+with executor support (row_number/rank/lag/lead) never consult a
+frame at all, so there was no consumer to validate frame execution
+against. This slice deliberately does **not** add frame-clause
+parsing/execution — it implements PostgreSQL's *default* frame
+instead (which needs no explicit ROWS/RANGE/GROUPS clause):
+`RANGE UNBOUNDED PRECEDING` (cumulative, peer-group-inclusive) when
+ORDER BY is present, otherwise the whole partition. Verified against
+upstream PostgreSQL 18.3 directly (`postgres/local_install`) rather
+than assumed.
+
+**AST/planner:** `planner.WindowFunc` (`internal/planner/plan.go`)
+gained `Star bool`, `Filter Expr`, and `InputType catalog.Type`
+alongside the existing `Args []Expr`, so an aggregate window call can
+carry the same shape `AggregateCall` needs. `buildWindowFunc`
+(`internal/planner/planner.go`) gained a `"sum", "count", "avg",
+"min", "max"` case that resolves the single argument (or `Star` for
+`count(*)`) and the optional `FILTER (WHERE ...)` predicate, deriving
+the output type with the same rules `buildAggregateCall` already uses
+for the non-window path (`sum`→arg type, `avg`→float8 for float
+input else numeric, `min`/`max`→arg type, `count`→int8). DISTINCT and
+aggregate-internal ORDER BY are rejected with `0A000` — this mirrors
+a genuine PostgreSQL restriction on aggregate window functions
+(`parse_func.c`'s `transformAggregateCall`: "DISTINCT/aggregate ORDER
+BY is not implemented for window functions"), not a v0 gap.
+`windowCallKey` gained a `filter:` component — without it, two
+`sum(x) FILTER (WHERE a) OVER (w)` / `sum(x) FILTER (WHERE b) OVER
+(w)` calls with otherwise-identical signatures would collide onto
+the same output column (latent bug in the pre-existing key, never
+exercised because none of row_number/rank/lag/lead take FILTER).
+
+**Analyzer:** `analyzeWindowFuncCall` (`internal/analyzer/
+analyzer.go`) gained the mirror-image validation (same DISTINCT/
+ORDER BY rejection, same output-type rules) — kept in sync with the
+planner per `pattern_sibling_paths_must_agree` since both type-check
+the same call independently.
+
+**Executor:** `internal/executor/operators_window.go` reuses the
+*existing* GROUP BY aggregate accumulator (`aggregateOp.applyAgg`/
+`finishAgg` in `operators_join_agg.go`) instead of a second
+implementation, via `windowFuncToAggregateCall` (adapts a
+`WindowFunc` into an `AggregateCall`) and a bare `&aggregateOp{ctx:
+o.ctx}` helper instance (its methods only touch `ctx`, verified by
+reading both method bodies in full). This gets numeric-exact sums,
+float4/float8 precision formatting, and NULL-skipping for free,
+identical to non-window aggregates. Frame evaluation
+(`evalFrameAggFuncs`) precomputes peer-group boundaries per partition
+with a new `peerGroupBounds` helper — reusing the same `samePeer`
+check `rank()` already used inline — then walks groups in order,
+accumulating into one running `aggRuntime` per function so the
+default cumulative frame falls out naturally: with no ORDER BY,
+`samePeer` always returns `true`, so `peerGroupBounds` collapses to
+a single group spanning the whole partition, giving the "whole
+partition" default with no special-casing.
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowAggregateFunctionsAccepted`,
+`TestAnalyzeWindowAggregateFunctionsRejected`;
+`TestAnalyzeWindowFunctionUnsupportedRejected` repointed at
+`first_value()`, a real still-unimplemented window function, since
+`count(*) OVER ()` is no longer a valid rejection case);
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowAggregatesDefaultFrame`,
+`TestCompatWindowAggregateNoOrderByWholePartition`,
+`TestCompatWindowAggregateFilterClause`) — all three pin exact
+row values cross-checked against a scratch upstream PostgreSQL 18.3
+instance, not just "no error".
+
+**Still open:** ROWS/RANGE/GROUPS frame-clause parsing/execution
+itself (now has a real consumer — a future loop can wire an explicit
+frame clause into `evalFrameAggFuncs` by generalizing
+`peerGroupBounds` into an arbitrary frame-bounds function).
+`first_value`/`last_value`/`nth_value`/`ntile`/`cume_dist`/
+`percent_rank` as window functions remain unimplemented. Combining
+an explicit frame clause with row_number/rank/lag/lead (which
+PostgreSQL rejects — those functions cannot have a non-default
+frame) is not yet enforced since frame clauses aren't parsed at all.
+
+## Follow-up: first_value/last_value/nth_value (2026-07-05, M0122-0004)
+
+Implemented `first_value`/`last_value`/`nth_value` as window functions,
+reusing the same default-frame infrastructure the previous Follow-up
+section built for `sum`/`count`/`avg`/`min`/`max`. Per spec (and
+`window_first_value`/`window_last_value`/`window_nth_value` in
+`postgres/src/backend/utils/adt/windowfuncs.c`), these evaluate their
+value expression at a specific row of the frame rather than
+accumulating over it: `first_value` at the frame head, `last_value`
+at the frame tail, `nth_value(expr, n)` at the n-th row from the frame
+head (1-based, `NULL` if `n` is beyond the frame).
+
+**AST/planner:** `buildWindowFunc` (`internal/planner/planner.go`)
+gained `"first_value"`/`"last_value"` (exactly one argument, no
+DISTINCT/star, return type = argument type via `inferExprType` — same
+pattern as `lag`/`lead`) and `"nth_value"` (exactly two arguments:
+value expression and `n`) cases. `analyzeWindowFuncCall`
+(`internal/analyzer/analyzer.go`) mirrors the same arg-shape checks.
+
+**Executor:** `internal/executor/operators_window.go`'s default frame
+end (for a row's own peer group) is exactly the boundary
+`evalFrameAggFuncs`'s `peerGroupBounds` already computes, so no new
+frame-bounds logic was needed — only a new `frameEnd[]` per-partition
+array (`hasFrameValueWindowFunc` gates its computation) mapping each
+row's local index to its peer group's exclusive end, built once per
+partition from the existing `peerGroupBounds` output. Given that:
+`first_value` reads `o.rows[pStart]` (frame head is always the
+partition start, since the default frame has no upper-bound-only
+variant these functions would need); `last_value` reads
+`o.rows[frameEnd[localIdx]-1]`; `nth_value` evaluates its `n`
+argument per current row (same as `lag`/`lead`'s offset), rejects
+`n <= 0` with `22016` (`argument of nth_value must be greater than
+zero`, matching `window_nth_value`'s `ERRCODE_INVALID_ARGUMENT_FOR_
+NTH_VALUE` exactly), and returns `NULL` when `pStart + n - 1` falls
+at or past the frame end.
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowValueFunctionsAccepted`,
+`TestAnalyzeWindowValueFunctionsRejected`;
+`TestAnalyzeWindowFunctionUnsupportedRejected` repointed at `ntile()`
+since `first_value()` is no longer a valid rejection case),
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowValueFunctionsDefaultFrame`,
+`TestCompatWindowNthValueOutOfFrameAndInvalidN`) — cross-checked
+row-for-row (including the `nth_value(val, 0)` error text) against a
+scratch upstream PostgreSQL 18.3 instance.
+
+**Still open:** `ntile`/`cume_dist`/`percent_rank` as window functions
+remain unimplemented (they exist today only as `WITHIN GROUP`
+ordered-set aggregates, a different code path). ROWS/RANGE/GROUPS
+frame-clause parsing/execution itself is still the largest remaining
+piece of this bucket — see the previous Follow-up section.
+
+## Follow-up: ntile/cume_dist/percent_rank (2026-07-05, M0122-0004)
+
+Implemented the three remaining ranking window functions named as open
+in the previous two Follow-up sections. Unlike `first_value`/
+`last_value`/`nth_value`, none of these are frame-relative — they
+needed their own per-partition computation rather than a drop-in onto
+`peerGroupBounds`'s existing consumers, matching the prediction in the
+`2026-07-05` `M0122-0003`-adjacent ledger row that this would not be
+mechanical.
+
+**AST/planner:** `buildWindowFunc` (`internal/planner/planner.go`)
+gained `"cume_dist"`/`"percent_rank"` (zero arguments, no DISTINCT/star,
+return type `float8` — matches `pg_proc.dat`) and `"ntile"` (exactly
+one argument, return type `int4`) cases. `analyzeWindowFuncCall`
+(`internal/analyzer/analyzer.go`) mirrors the same arg-shape checks.
+
+**Executor (`internal/executor/operators_window.go`):**
+
+- `ntile(nbuckets)` reproduces `window_ntile`
+  (`postgres/src/backend/utils/adt/windowfuncs.c`) exactly: `nbuckets`
+  is evaluated once per partition (from the partition's first row,
+  matching upstream's first-call-only argument evaluation), rejects
+  `nbuckets <= 0` with `22014`
+  (`argument of ntile must be greater than zero`), and the first
+  `total % nbuckets` buckets get one extra row rather than
+  concentrating the remainder in the last bucket. New
+  `evalNtileFuncs`/`evalNtileFunc`, called from `evalWindowFuncs`
+  alongside the existing `evalFrameAggFuncs` pre-computation pass.
+- `percent_rank()` = `(rank - 1) / (total_rows - 1)`, `0` when the
+  partition has a single row (matches `window_percent_rank`'s
+  divide-by-zero guard).
+- `cume_dist()` = `NP / total_rows`, where `NP` is the 1-based count of
+  rows at or before the current row's peer group — i.e. exactly the
+  existing `frameEnd[]` boundary (`peerGroupBounds`) also used by
+  `first_value`/`last_value`. `hasFrameValueWindowFunc` was extended to
+  also gate `frameEnd[]` computation for `cume_dist`.
+- Both `percent_rank`/`cume_dist` reuse the existing `rank` local
+  (already computed for `rank()`/`dense_rank()`) rather than
+  recomputing tie position.
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowRankingFunctionsAccepted`,
+`TestAnalyzeWindowRankingFunctionsRejected`;
+`TestAnalyzeWindowFunctionUnsupportedRejected` repointed at
+`dense_rank()` since `ntile()` is no longer a valid rejection case),
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowNtileBuckets`,
+`TestCompatWindowNtileMoreBucketsThanRows`,
+`TestCompatWindowNtileInvalidArgument`,
+`TestCompatWindowPercentRankAndCumeDist`) — the bucket-sizing and
+percent_rank/cume_dist cases pin exact values reasoned from upstream's
+algorithm, including the non-obvious "remainder buckets get the extra
+row, not the last bucket" rule.
+
+**Still open (at the time of this section):** `dense_rank()` as a
+window function (only its `WITHIN GROUP` ordered-set-aggregate form
+exists) was the only rejection case left for
+`TestAnalyzeWindowFunctionUnsupportedRejected`.
+ROWS/RANGE/GROUPS frame-clause parsing/execution itself remains the
+largest item in this M0020 bucket — every ranking/value/aggregate
+window function implemented so far still assumes PostgreSQL's default
+frame; an explicit frame clause is not yet parseable at all.
+
+## Follow-up: dense_rank() as a window function (2026-07-05, M0122-0004)
+
+Implemented `dense_rank()` as a window function — the last remaining
+gap named by the previous Follow-up section, and the last of the 11
+standard PostgreSQL window functions
+(`row_number`/`rank`/`dense_rank`/`percent_rank`/`cume_dist`/`ntile`/
+`lag`/`lead`/`first_value`/`last_value`/`nth_value`) to land. Its
+`WITHIN GROUP` ordered-set-aggregate form (`pg_proc` OIDs 3992/3993)
+was already implemented separately and is unaffected.
+
+**AST/planner/analyzer:** `dense_rank` joins the `row_number`/`rank`
+case in both `buildWindowFunc` (`internal/planner/planner.go`) and
+`analyzeWindowFuncCall` (`internal/analyzer/analyzer.go`) — same
+zero-argument, no-DISTINCT/star shape check, same `int8` return type.
+No catalog change needed: `pg_proc` OID 3102 (`dense_rank`,
+`HandlerName: "window_dense_rank"`) was already seeded
+(`internal/initdb/pg_proc_seed_data.go`), just never dispatched by the
+executor's window-function switch.
+
+**Executor (`internal/executor/operators_window.go`):** `evalWindowFuncs`
+gains a `denseRank` counter alongside the existing `rank`/`rowNum`
+locals. `rank` jumps to the current row's 1-based position
+(`rowNum`) whenever the peer group changes — `dense_rank` instead
+just increments by 1 at the same peer-group-change point, so it never
+skips a value after a tie (matches `window_dense_rank` in
+`postgres/src/backend/utils/adt/windowfuncs.c`: `wfstate->rank++`
+vs. `rank()`'s jump to the current row number).
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowRankingFunctionsAccepted` gains a `dense_rank()`
+case; `TestAnalyzeWindowRankingFunctionsRejected` gains a
+`dense_rank(1)` arg-shape case; `TestAnalyzeWindowFunctionUnsupportedRejected`
+repointed at `array_agg() OVER ()` since `dense_rank()` is no longer a
+valid rejection case — general aggregates other than
+sum/count/avg/min/max are the next rejection case),
+`internal/executor/window_compat_test.go`'s
+`TestCompatWindowDenseRankPeerGroups` (same tie-then-gap fixture as
+`TestCompatWindowRankPeerGroups`, cross-checked against upstream
+PostgreSQL 18.3: `rank` 1,1,3 vs. `dense_rank` 1,1,2 on the same rows).
+
+**Now fully closed:** every standard PostgreSQL window function is
+implemented under the default frame. The only remaining item in this
+M0020/M0122-0004 bucket is ROWS/RANGE/GROUPS frame-clause
+parsing/execution itself (three real consumers now exist —
+`evalFrameAggFuncs`/`frameEnd`/`evalNtileFuncs` — that a future loop
+could generalize into arbitrary frame-bounds computation), plus
+combining named-window forms (`OVER (win ORDER BY ...)`, a named
+window based on another named window), which are real deferred
+upstream syntax, not implemented shortcuts.
+
+## Follow-up: ROWS window frame clause (2026-07-05, M0122-0004)
+
+Implemented the `{ROWS|RANGE|GROUPS} frame_extent [frame_exclusion]`
+window frame clause — the last item named by the previous Follow-up
+section. Only `ROWS` mode reaches the executor; `RANGE`/`GROUPS`
+parse structurally but are rejected by the analyzer (`0A000`), a
+deliberate v0 scope limit rather than a bug (`RANGE`'s peer-group
+value comparison needs a `<` operator lookup per ORDER BY column that
+this slice doesn't build; `GROUPS` needs group-counting bounds).
+
+**Parser (`internal/parser/expr.go`/`select.go`):** new
+`WindowFrame`/`FrameMode`/`FrameBoundKind`/`FrameExclusion` AST types
+(`WindowDef.Frame *WindowFrame`, nil when no frame clause was
+written). `parseFrameClause`/`parseFrameBound`/`parseFrameExclusion`
+mirror gram.y's `opt_frame_clause`/`frame_extent`/`frame_bound`
+productions; `ROWS`/`RANGE`/`GROUPS`/`UNBOUNDED`/`PRECEDING`/
+`FOLLOWING`/`CURRENT`/`EXCLUDE`/`TIES`/`OTHERS` are all soft
+(unreserved) keywords like `WITHIN`/`FILTER`/`WINDOW`, so no lexer
+change was needed. Bound-ordering validation and the `RANGE`/`GROUPS`
+rejection are deliberately left to the analyzer, which is the only
+layer in this codebase that raises non-syntax SQLSTATEs — the parser
+now accepts any syntactically valid frame clause.
+
+**Analyzer (`internal/analyzer/analyzer.go`):** new
+`validateWindowFrame`, called from `analyzeWindowFuncCall`, reproduces
+`gram.y`'s frame-bound reduce-time checks (all `42P20`): a start of
+`UNBOUNDED FOLLOWING`, an end of `UNBOUNDED PRECEDING`, a `CURRENT
+ROW` start with a `PRECEDING` end, and a `FOLLOWING` start with a
+`PRECEDING`/`CURRENT ROW` end are all rejected. `RANGE`/`GROUPS` are
+rejected with `0A000` before bound validation. Offset expressions are
+type-checked here (via `analyzeExpr`) but not range/null-checked —
+that mirrors `LIMIT`/`OFFSET`'s pattern of deferring range/null checks
+to a once-per-query runtime evaluation, since an offset can't be
+range-checked until it's evaluated.
+
+**Planner (`internal/planner/plan.go`/`planner.go`):** `WindowAgg`
+gains a `Frame *planner.WindowFrame` field — a resolved form of
+`parser.WindowFrame` where `StartOffset`/`EndOffset` are planner
+`Expr`s (resolved against the window's input schema by
+`resolveWindowFrame`, the same way `PARTITION BY`/`ORDER BY` are
+resolved) instead of raw `parser.Expr`. `windowSpecKey` (used to group
+window function calls sharing one `WindowAgg` node) now also hashes
+the frame clause via a new `windowFrameKey`, so two calls differing
+only in their frame clause are correctly split into separate nodes
+rather than silently sharing one `Frame`.
+
+**Executor (`internal/executor/operators_window.go`):** frame offset
+expressions are evaluated once per query (`resolveFrameOffset`,
+mirroring `limitOp.Open`'s once-per-query `LIMIT`/`OFFSET`
+evaluation — PostgreSQL disallows column/aggregate/window references
+in a frame offset for exactly this reason) into `frameStartOff`/
+`frameEndOff`, raising `22004` (null offset), `42804` (non-integer),
+or `22013` (negative) to match `nodeWindowAgg.c`'s exact error
+wording. New `frameBounds(pStart, pEnd, i)` reproduces
+`update_frameheadpos`/`update_frametailpos`'s ROWS-mode arithmetic
+exactly (postgres/src/backend/executor/nodeWindowAgg.c): both bounds
+clamp to the partition, and an out-of-order result collapses to an
+empty frame rather than erroring, matching upstream. `evalFrameAggFuncs`
+branches to a new `evalExplicitFrameAggFuncs` when `o.plan.Frame != nil`
+— per-row frame bounds via `frameBounds` instead of the shared
+per-partition peer-group accumulation the default-frame path uses —
+with `frameRowExcluded` applying `EXCLUDE CURRENT ROW`/`GROUP`/`TIES`
+against the row's peer-group bounds (`peerBoundsOf`) when an exclusion
+was specified. `first_value`/`last_value`/`nth_value` also switch to
+`o.frameBounds` (plus `firstInFrame`/`lastInFrame`/`nthInFrame` for
+exclusion-aware searching) when `o.plan.Frame != nil`, so they respect
+an explicit `ROWS` frame too. `cume_dist` is the one exception by
+design — per PG spec it is frame-independent and always uses the
+default-frame `frameEnd[]`/peer-group bounds even under an explicit
+frame clause (matches `window_cume_dist` in
+`postgres/src/backend/utils/adt/windowfuncs.c`, which never consults
+the frame).
+
+**Tests:** `internal/parser/window_test.go`
+(`TestParseWindowFuncAcceptsFrameClause`, replacing the old
+`TestParseWindowFuncRejectsFrameClause`, plus frame-shape parse-tree
+pins), `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowFrameRowsAccepted`,
+`TestAnalyzeWindowFrameRangeGroupsRejected`,
+`TestAnalyzeWindowFrameBoundOrderingRejected`),
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowExplicitRowsFrameSliding`,
+`TestCompatWindowExplicitFrameExcludeCurrentRow`,
+`TestCompatWindowExplicitFrameExcludeGroupAndTies`,
+`TestCompatWindowFrameNegativeOffsetRejected` — all cross-checked
+against upstream PostgreSQL 18.3 row-for-row).
+
+**Deferred (ledger row, M0122-0004):** `RANGE`/`GROUPS` frame modes —
+the substantially larger remaining item, needing per-ORDER-BY-column
+`<`/`=` peer comparison (`RANGE`) or group-counting bounds (`GROUPS`)
+instead of `ROWS`' plain row-index arithmetic.
+
+## Follow-up: GROUPS window frame mode (2026-07-09, M0122-0004)
+
+Implemented `GROUPS` frame mode — closes half of the deferred item
+above. `RANGE` remains rejected (`0A000`): unlike `GROUPS`, its offset
+bounds need a per-ORDER-BY-column `+`/`-`/`<` operator lookup keyed on
+the ordering column's data type (numeric `+`/`-`, `interval` for
+datetime columns), a materially larger, type-system-reaching capability
+this slice doesn't build. `GROUPS`, per spec (`syntax.sgml`,
+`postgres/src/backend/parser/parse_clause.c`), only needs its offset
+treated as a non-negative integer count of ORDER BY *peer groups*
+rather than rows — the same offset-resolution/validation machinery
+`ROWS` already has (`resolveFrameOffset`), just applied to peer-group
+indices instead of row indices — so it did not need the `RANGE`-only
+operator-lookup machinery.
+
+**Analyzer (`internal/analyzer/analyzer.go`):** `validateWindowFrame`
+now takes the window's `ORDER BY` column count and switches on
+`fr.Mode`: `FrameModeRows` is unrestricted (as before), `FrameModeGroups`
+requires at least one `ORDER BY` column (`42P20` "GROUPS mode requires
+an ORDER BY clause", matching `parse_clause.c`'s post-parse check
+byte-for-byte — verified against a real PostgreSQL 18.3 instance), and
+anything else (`FrameModeRange`) is still rejected with `0A000`. Bound-
+ordering validation (`42P20`) is unchanged — it was already mode-
+agnostic.
+
+**Planner (`internal/planner/plan.go`/`planner.go`):** `planner.WindowFrame`
+gains a `Mode parser.FrameMode` field (previously dropped during
+lowering, since a `Frame` reaching the planner was always `ROWS`);
+`resolveWindowFrame` now carries it through unchanged from the parsed
+`parser.WindowFrame`.
+
+**Executor (`internal/executor/operators_window.go`):** `frameBounds`
+gained a `groupBounds []int` parameter (the partition's peer-group
+boundary array, as returned by the existing `peerGroupBounds` — nil
+for `ROWS`-mode callers) and now dispatches to a new
+`frameBoundsGroups` when `Frame.Mode == FrameModeGroups`. `frameBoundsGroups`
+mirrors `frameBounds`' own `ROWS`-mode arithmetic exactly, but performs
+it on peer-*group* indices (via a new `groupIndexOf` helper — the same
+binary search `peerBoundsOf` already used, now factored out and shared)
+instead of row indices, then translates the resulting `[startGroup,
+endGroup)` back to an absolute `[startRow, endRow)` row range through
+`groupBounds`. `evalExplicitFrameAggFuncs` now computes `groupBounds`
+whenever `Frame.Mode == FrameModeGroups` (previously only for an
+`EXCLUDE` clause) and threads it into every `frameBounds` call; the
+`first_value`/`last_value`/`nth_value` cases in the main per-row loop
+do the same via the existing `valueGroupBounds` (its populate-condition
+widened to also cover `GROUPS` mode, not just `EXCLUDE`). No change was
+needed for `row_number`/`rank`/`dense_rank`/`lag`/`lead`/`ntile`/
+`percent_rank`/`cume_dist` — per spec they are frame-independent
+regardless of mode, already established by the `ROWS` slice above.
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowFrameRangeRejected` — renamed/narrowed from
+`TestAnalyzeWindowFrameRangeGroupsRejected`;
+`TestAnalyzeWindowFrameGroupsAccepted`;
+`TestAnalyzeWindowFrameGroupsRequiresOrderByRejected`),
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowExplicitGroupsFrameSliding` — duplicate-key data so
+`GROUPS` genuinely diverges from an equivalent `ROWS` frame;
+`TestCompatWindowGroupsUnboundedPrecedingCumulative`), both cross-
+checked row-for-row against a real PostgreSQL 18.3 instance. Confirmed
+non-vacuous via `git stash` on the four impl files (fails pre-fix with
+the old `0A000` "only ROWS is implemented" error).
+
+**Still deferred (ledger row, M0122-0004):** `RANGE` frame
+mode — needs the per-ORDER-BY-column operator-lookup machinery
+described above; `GROUPS`' peer-group index arithmetic doesn't
+generalize to it.

@@ -288,6 +288,6 @@ gate and always pays the lookup cost.
 
 ## 7. Related improvements
 
-- [01-spill-writer-stack-elimination.md](./01-spill-writer-stack-elimination.md) — the immediate per-caller fix; Fix 02 is the systemic generalization.
+- [01-spill-writer-stack-elimination.md](01-spill-writer-stack-elimination.md) — the immediate per-caller fix; Fix 02 is the systemic generalization.
 - `internal/gls/gls.go` — the infrastructure Fix 02 builds on (pprof goroutine labels for cheap backend-ID lookup).
 - After Fix 02 lands, any new code that needs goroutine identity should use `gls.BackendID()` + `activity.LookupByBackendID()` or simply call `activity.LookupCurrentGoroutine()` which now prefers the gls fast path.

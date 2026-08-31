@@ -274,7 +274,7 @@ Every one of these is currently satisfied and must remain so:
 
 ## 9. Outcome
 
-Implemented and measured. Results in [`PERF.md`](./PERF.md).
+Implemented and measured. Results in [`PERF.md`](PERF.md).
 
 | stage | disposition |
 |---|---|

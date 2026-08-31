@@ -4,7 +4,7 @@
 | --- | --- |
 | status | draft (DESIGN ONLY) |
 | date | 2026-08-02 |
-| supersedes | [0034-0001-bushy-join-planning.md](../0034-0001-bushy-join-planning.md) (bushy enumeration); [analysis/cost-driven-second-try-200731/07-cost-model-interaction.md](../../../analysis/cost-driven-second-try-200731/07-cost-model-interaction.md) §6 prohibition line "no shape preference for left-deep-with-fact-outermost" (see §6) |
+| supersedes | [0034-0001-bushy-join-planning.md](../0000-0049/0034-0001-bushy-join-planning.md) (bushy enumeration); [analysis/cost-driven-second-try-200731/07-cost-model-interaction.md](../../../analysis/cost-driven-second-try-200731/07-cost-model-interaction.md) §6 prohibition line "no shape preference for left-deep-with-fact-outermost" (see §6) |
 
 ## 1. The invariant
 
@@ -132,7 +132,7 @@ final relset alone ([03](03-join-search-pg-dp.md) §10). Consequences:
 
 ## 4. Cross products: why the PG-shaped search does not resurrect the Q2 problem
 
-[0034-0001](../0034-0001-bushy-join-planning.md) motivated bushy DP with Q2:
+[0034-0001](../0000-0049/0034-0001-bushy-join-planning.md) motivated bushy DP with Q2:
 `part` and `supplier` share no join edge, and the then-current **greedy
 left-deep ordering** placed them adjacently, forcing a 2×10⁹-row cross join.
 The correct conclusion is narrower than "left-deep needs cross products":

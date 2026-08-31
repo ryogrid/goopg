@@ -263,7 +263,7 @@ signatures are unchanged. All caching is internal to the struct.
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | `reg == nil` in unit tests (no server context) | Wait events silently skipped — IO timing not recorded | `hasReg == false` guard — the `if w.hasReg` check ensures WaitEventStart/End are never called with nil reg. This is the correct behaviour for test contexts. |
-| Goroutine migration (if spill writer is passed across goroutines in the future) | Cached `procNum` points to wrong backend's slot | Not possible in current architecture. The single-goroutine constraint is documented in the struct comment. If multi-goroutine use is ever added, switch to `gls.BackendID()` + registry lookup by backend ID (see [02-systemic-backend-id-lookup.md](./02-systemic-backend-id-lookup.md)). |
+| Goroutine migration (if spill writer is passed across goroutines in the future) | Cached `procNum` points to wrong backend's slot | Not possible in current architecture. The single-goroutine constraint is documented in the struct comment. If multi-goroutine use is ever added, switch to `gls.BackendID()` + registry lookup by backend ID (see [02-systemic-backend-id-lookup.md](02-systemic-backend-id-lookup.md)). |
 | `LookupCurrentGoroutine` fails at construction time (goroutine not yet registered when `drainRowsBounded` runs) | `hasReg == false`, wait events skipped | `SetCurrentGoroutine` is called at connection startup (`server.go:968`) before any query executes. The spill writer is created during query execution, well after registration. This cannot fail in practice. |
 
 ## 6. Verification
@@ -295,5 +295,5 @@ signatures are unchanged. All caching is internal to the struct.
 
 ## 7. Related improvements
 
-- [02-systemic-backend-id-lookup.md](./02-systemic-backend-id-lookup.md) — the systemic fix that adds `LookupByBackendID()` using `gls.BackendID()`, eliminating all remaining `runtime.Stack` callers and providing a safe pattern for future hot-path goroutine-identity lookups.
+- [02-systemic-backend-id-lookup.md](02-systemic-backend-id-lookup.md) — the systemic fix that adds `LookupByBackendID()` using `gls.BackendID()`, eliminating all remaining `runtime.Stack` callers and providing a safe pattern for future hot-path goroutine-identity lookups.
 - The WAL perf-optimize2 fix (`internal/gls/gls.go`) is the direct precedent — same anti-pattern, same fix shape, validated in production-like benchmarks.

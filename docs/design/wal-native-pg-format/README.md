@@ -66,9 +66,9 @@ doc 01 but explicitly out of scope for doc 03's schema mapping.
 
 ## Related existing design docs
 
-- [`0101-0001-wal-page-header-compat-default.md`](../0101-0001-wal-page-header-compat-default.md) — page-frame (PageHeaders) parity, magic `0xD118`.
-- [`0101-0003-wal-xlprev-restart-seeding-fix.md`](../0101-0003-wal-xlprev-restart-seeding-fix.md) — the `xl_prev` 0-based prev-link fix.
-- [`0100-0005-loop14-pg-physical-format-fixes.md`](../0100-0005-loop14-pg-physical-format-fixes.md) — physical tuple/format fixes.
-- [`0030-0002-ddl-wal-records.md`](../0030-0002-ddl-wal-records.md) — the goopg-private catalog-DDL record family.
-- [`0079-0002-btree-record-wal-parity.md`](../0079-0002-btree-record-wal-parity.md), [`0080-0001-heap-freeze-and-multi-insert-wal.md`](../0080-0001-heap-freeze-and-multi-insert-wal.md) — prior per-RMGR parity work.
+- [`0101-0001-wal-page-header-compat-default.md`](../0100-0149/0101-0001-wal-page-header-compat-default.md) — page-frame (PageHeaders) parity, magic `0xD118`.
+- [`0101-0003-wal-xlprev-restart-seeding-fix.md`](../0100-0149/0101-0003-wal-xlprev-restart-seeding-fix.md) — the `xl_prev` 0-based prev-link fix.
+- [`0100-0005-loop14-pg-physical-format-fixes.md`](../0100-0149/0100-0005-loop14-pg-physical-format-fixes.md) — physical tuple/format fixes.
+- [`0030-0002-ddl-wal-records.md`](../0000-0049/0030-0002-ddl-wal-records.md) — the goopg-private catalog-DDL record family.
+- [`0079-0002-btree-record-wal-parity.md`](../0050-0099/0079-0002-btree-record-wal-parity.md), [`0080-0001-heap-freeze-and-multi-insert-wal.md`](../0050-0099/0080-0001-heap-freeze-and-multi-insert-wal.md) — prior per-RMGR parity work.
 - `analysis/perf-optimize3-dash/01-single-stream-wal-design.md`, `02-canonical-only-coverage-audit.md` — native-vs-canonical rationale and the canonical coverage gaps.

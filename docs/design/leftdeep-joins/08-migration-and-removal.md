@@ -143,8 +143,8 @@ join_order_restriction inference — the last two carry the
 
 - `docs/design/README.md`: bundle bullet under `## Design Bundles` (added
   with this bundle); status flips (`draft` → `accepted`) as stages land.
-- Supersession stamps at S7: [0034-0001](../0034-0001-bushy-join-planning.md),
-  [0038-0001](../0038-0001-multi-way-hash-join.md), and the MHJ chapters of
+- Supersession stamps at S7: [0034-0001](../0000-0049/0034-0001-bushy-join-planning.md),
+  [0038-0001](../0000-0049/0038-0001-multi-way-hash-join.md), and the MHJ chapters of
   the 0043/0063/0125/0126 lines get `superseded by: leftdeep-joins/` headers
   (never deleted);
   [cost-model/09](../cost-model/09-verification-and-acceptance.md) §3's

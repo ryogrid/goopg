@@ -235,6 +235,6 @@ If pursued after re-profiling:
 
 ## 8. Related improvements
 
-- [01-spill-writer-stack-elimination.md](./01-spill-writer-stack-elimination.md) — the primary fix that makes Fix 05 potentially unnecessary for the initial optimization pass.
-- [04-double-clone-elimination.md](./04-double-clone-elimination.md) — eliminates the hash-build clone redundancy, which is a larger allocation source than the probe-phase clone.
+- [01-spill-writer-stack-elimination.md](01-spill-writer-stack-elimination.md) — the primary fix that makes Fix 05 potentially unnecessary for the initial optimization pass.
+- [04-double-clone-elimination.md](04-double-clone-elimination.md) — eliminates the hash-build clone redundancy, which is a larger allocation source than the probe-phase clone.
 - M0071-0014 VirtualSlot composition — the precedent that already eliminated per-match copies in the MHJ probe loop; Fix 05 extends this to downstream operators.
