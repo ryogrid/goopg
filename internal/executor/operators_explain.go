@@ -697,8 +697,47 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if cond := formatIndexCond(p, reg); cond != "" {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 		}
-		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		// `Filter:` comes from either of two places, and upstream renders both
+		// the same way because to PG they ARE the same thing — a scan-level
+		// qual that is not an index qual (`show_scan_qual` on `scan.plan.qual`,
+		// explain.c). goopg reaches it as a `*Filter` node above the scan in the
+		// ordinary case, and as `IndexScan.Cond` when the scan is an NLI inner
+		// and the quals had to move inside the node (plan.go, IndexScan.Cond).
+		// Only one is ever set, but they are joined rather than sequenced so a
+		// future third producer cannot make one silently shadow the other.
+		filt := attachedFilter
+		if p.Cond != nil {
+			if filt == nil {
+				filt = p.Cond
+			} else {
+				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: filt, Right: p.Cond}
+			}
+		}
+		if filt != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
+		}
+	case *optimizer.BitmapHeapScan:
+		// PG prints `Recheck Cond:` then `Filter:` on a Bitmap Heap Scan. The
+		// two are different things and both belong here: BitmapQual is the
+		// recheck list (lossy pages only), Cond is the per-tuple residual the
+		// scan carries when it is an NLI inner (plan.go, BitmapHeapScan.Cond).
+		if len(p.BitmapQual) > 0 {
+			var rc optimizer.Expr = p.BitmapQual[0]
+			for _, q := range p.BitmapQual[1:] {
+				rc = &optimizer.BinaryOp{Op: parser.OpAnd, Left: rc, Right: q}
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + wrapParen(formatExprQual(rc, reg, qualify)))})
+		}
+		filt := attachedFilter
+		if p.Cond != nil {
+			if filt == nil {
+				filt = p.Cond
+			} else {
+				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: filt, Right: p.Cond}
+			}
+		}
+		if filt != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
 		}
 	case *optimizer.IndexOnlyScan:
 		// S6 min/max rewrite: the IOS's residual `col IS NOT NULL` qual is
@@ -2038,6 +2077,29 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 		// ordinal (preserving duplicate-row multiplicity through
 		// the aggregate-above-join shape).
 		return "Ordinality"
+	case *optimizer.BitmapHeapScan:
+		// PG's "Bitmap Heap Scan on <table>" (explain.c). goopg had NO arm for
+		// this node at all, so a bitmap scan printed its Go type
+		// (`*optimizer.BitmapHeapScan`) — which is also why a plan census
+		// grepping for the PG label read zero even once bitmap scans were being
+		// chosen.
+		if p.Table == nil {
+			return fmt.Sprintf("%T", n)
+		}
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return "Bitmap Heap Scan on " + dname
+		}
+		return "Bitmap Heap Scan on " + schemaQualify(p.Table.QualifiedName())
+	case *optimizer.BitmapIndexScan:
+		// PG names the INDEX here, not the table.
+		if p.Index == nil {
+			return fmt.Sprintf("%T", n)
+		}
+		return "Bitmap Index Scan on " + p.Index.QualifiedName()
+	case *optimizer.BitmapAnd:
+		return "BitmapAnd"
+	case *optimizer.BitmapOr:
+		return "BitmapOr"
 	case *optimizer.NestedLoopIndexJoin:
 		// M0054-0006: this node is always a nested loop; S3
 		// (0134-0001 P2) applies the same PG label rule as the
@@ -2252,6 +2314,16 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 			return []optimizer.Node{p.Outer, p.InnerMemo}
 		}
 		return []optimizer.Node{p.Outer, p.Inner}
+	case *optimizer.BitmapHeapScan:
+		// The bitmap qual tree renders BENEATH the heap scan, as in PG.
+		if p.Outer == nil {
+			return nil
+		}
+		return []optimizer.Node{p.Outer}
+	case *optimizer.BitmapAnd:
+		return p.Inputs
+	case *optimizer.BitmapOr:
+		return p.Inputs
 	case *optimizer.Memoize:
 		return []optimizer.Node{p.Child}
 	case *optimizer.Merge:

@@ -451,7 +451,7 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// Choose an index that lives on `innerScan.Table` and whose
 	// EVERY leading column appears in `innerToOuter`. Prefer the
 	// longest such index (most columns bound = most selective).
-	idx, keys := pickIndexCoveringAllLeadingColumns(cat, innerScan.Table, innerToOuter)
+	idx, keys := pickIndexCoveringLeadingPrefix(cat, innerScan.Table, innerToOuter)
 	if idx == nil {
 		return nil, false
 	}
@@ -758,11 +758,29 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	}
 
 	committed = true
+	// A SEMI or ANTI join never projects its inner — the joinedSchema branch
+	// above builds the OUTER's schema alone, "consumed only for matching, never
+	// projected". So when the residual reads no inner column either, the probe's
+	// heap tuple is wanted for nothing but VISIBILITY, and that is precisely what
+	// an index-only scan reads from the visibility map instead. PG's TPC-H Q22
+	// uses an Index Only Scan for exactly this anti-join probe.
+	//
+	// Safe by construction rather than by analysis: because the join does not
+	// publish the inner's columns, narrowing them cannot renumber any ColumnRef
+	// above — which is the problem that makes index-only scans expensive
+	// everywhere else in goopg (positional ColumnRefs over a concatenated
+	// outer||inner schema, where PG has relation-qualified Vars).
+	var innerNode Node = inner
+	if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+		if ios := indexOnlyNLIInner(inner, residualPred, len(outerNode.Output())); ios != nil {
+			innerNode = ios
+		}
+	}
 	nli := &NestedLoopIndexJoin{
 		pos:   j.pos,
 		Type:  j.Type,
 		Outer: outerNode,
-		Inner: inner,
+		Inner: innerNode,
 		// M0054-0006-followup-Q19: when the equi-conjunct came
 		// from the OR-factoring path, the original OR predicate
 		// stays as a residual so each emitted joined row is
@@ -972,13 +990,18 @@ func walkAndConjunctsNLI(e Expr) []Expr {
 	return out
 }
 
-// pickIndexCoveringAllLeadingColumns returns the longest B-tree
-// index on `tbl` whose EVERY column is bound by an entry in
-// `innerToOuter`. Single-column indexes also satisfy this when
-// the bound key is in the map. Returns (nil, nil) if no such index
-// exists. The returned `keys` slice is in `Index.Columns` order
-// — keys[i] is the outer Expr for Index.Columns[i].
-func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) (*catalog.Index, []Expr) {
+// pickIndexCoveringLeadingPrefix returns the B-tree index on `tbl`
+// that binds the most LEADING columns from `innerToOuter`, together
+// with the probe expressions for those columns. Coverage need not be
+// total: PG requires only that the leading column be bound
+// (`amoptionalkey`, indxpath.c:1029-1076), and the executor turns a
+// short key list into a range over every key sharing that prefix
+// (operators_index.go, `compositeUpperBound`). Returns (nil, nil)
+// when no index has its LEADING column bound — the one case a btree
+// cannot start a scan for. The returned `keys` slice is in
+// `Index.Columns` order and may be SHORTER than `Index.Columns`;
+// keys[i] is the outer Expr for Index.Columns[i], with no gaps.
+func pickIndexCoveringLeadingPrefix(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) (*catalog.Index, []Expr) {
 	var best *catalog.Index
 	var bestKeys []Expr
 	for _, idx := range cat.IndexesOnTable(tbl) {
@@ -995,20 +1018,32 @@ func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table,
 			continue
 		}
 		keys := make([]Expr, 0, len(idx.Columns))
-		covered := true
 		for _, col := range idx.Columns {
 			outer, ok := innerToOuter[col]
 			if !ok {
-				covered = false
+				// The first unbound column ends the probe. Columns after
+				// it are unreachable: a btree scan is ordered by the whole
+				// key, so an unbound column makes every later one a filter
+				// rather than a bound. This is PG's `amoptionalkey` rule —
+				// only the LEADING column must be bound (indxpath.c:1029).
 				break
 			}
 			keys = append(keys, outer)
 		}
-		if !covered {
+		if len(keys) == 0 {
+			// Leading column unbound: this index cannot start a scan for
+			// this parameterisation at all.
 			continue
 		}
-		// Prefer the longest covered index (most-selective).
-		if best == nil || len(idx.Columns) > len(best.Columns) {
+		// Prefer the probe that BINDS the most columns — more bound
+		// columns is a strictly narrower scan on the same table. Ties go
+		// to the first index seen, so the choice is stable.
+		//
+		// This ranks on bound columns, NOT on index width as it did while
+		// full coverage was mandatory (the two were the same number then).
+		// Ranking on width would now prefer a wide index that binds only
+		// its leading column over a narrow one bound completely.
+		if best == nil || len(keys) > len(bestKeys) {
 			best = idx
 			bestKeys = keys
 		}
@@ -1415,4 +1450,78 @@ func innerUnwrapCostAccepts(outer Node, innerScan *SeqScan, idx *catalog.Index, 
 			outer, outerRows, innerRows, matchSet, residualMult, statsKnown, accept)
 	}
 	return accept
+}
+
+
+// indexOnlyNLIInner promotes a semi/anti NestedLoopIndexJoin's probe to an
+// `*IndexOnlyScan`, or returns nil to leave the plain probe alone.
+//
+// PG oracle: `check_index_only` (indxpath.c:2229) asks whether a scan's output
+// is covered by the index. Here the question is simpler and the answer is
+// stronger — for SEMI/ANTI the scan's output is not read AT ALL, so coverage is
+// vacuous and the only real conditions are the ones below.
+//
+// Each decline names the wrong answer it prevents:
+//
+//   - `Cond != nil` — a residual on the scan itself is evaluated against the
+//     scanned row, and an index-only scan supplies only the indexed columns.
+//   - an EXCLUSIVE range bound — `indexOnlyScanOp` drives the INCLUSIVE
+//     RangeScan and copies no LowOp/HighOp, so the boundary row would leak
+//     (the same M0134-0001 S4 class-8 rule `tryPromoteIndexOnlyScan` applies).
+//   - a residual that reads an inner column — it is evaluated on the MERGED
+//     row, so any ColumnRef at or past `outerWidth` addresses the inner.
+//   - an outer/subquery reference inside the residual, which `walkColumnRefs`
+//     reports separately and whose coordinate space this cannot reason about.
+func indexOnlyNLIInner(inner *IndexScan, residual Expr, outerWidth int) *IndexOnlyScan {
+	if inner == nil || inner.Index == nil || inner.Table == nil {
+		return nil
+	}
+	if inner.Cond != nil {
+		return nil
+	}
+	if inner.LowOp == parser.OpGt || inner.HighOp == parser.OpLt {
+		return nil
+	}
+	if residual != nil {
+		safe := true
+		walkColumnRefs(residual, func(i int) {
+			if i >= outerWidth {
+				safe = false
+			}
+		}, func() { safe = false })
+		if !safe {
+			return nil
+		}
+	}
+	// `Covered` is the index's own key columns. Nothing reads them — that is the
+	// premise — but the executor decodes a row of this shape from the index key,
+	// so the list must describe real columns of the table.
+	covered := make([]catalog.Column, 0, len(inner.Index.Columns))
+	schema := make(Schema, 0, len(inner.Index.Columns))
+	for _, name := range inner.Index.Columns {
+		col, found := tableColumnByName(inner.Table, name)
+		if !found {
+			return nil
+		}
+		covered = append(covered, col)
+		schema = append(schema, SchemaColumn{Name: col.Name, Type: col.Type})
+	}
+	if len(covered) == 0 {
+		return nil
+	}
+	return &IndexOnlyScan{
+		pos:     inner.pos,
+		Table:   inner.Table,
+		Index:   inner.Index,
+		Key:     inner.Key,
+		Keys:    inner.Keys,
+		LowKey:  inner.LowKey,
+		HighKey: inner.HighKey,
+		Covered: covered,
+		schema:  schema,
+		// Carried for the same reason createIndexScanPlan carries them: a scan
+		// that loses its check role is authorised against the wrong role.
+		PrivilegeCheckRole:    inner.PrivilegeCheckRole,
+		PrivilegeCheckRoleSet: inner.PrivilegeCheckRoleSet,
+	}
 }

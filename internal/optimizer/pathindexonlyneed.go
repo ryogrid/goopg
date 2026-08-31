@@ -1,0 +1,211 @@
+package optimizer
+
+// M0134-0187 — the per-base-rel NEEDED-COLUMN set, PG's `reltarget` +
+// `attr_needed` (`build_base_rel_tlists`, initsplan.c:114) at the fidelity this
+// seam can reach. See docs/design/not_ralph/pg-plan-parity/DESIGN.md §15/§21.
+//
+// `check_index_only` (indxpath.c:1010) asks one question: does this index
+// supply every column of this relation that the rest of the query reads? PG
+// answers it from `rel->reltarget->exprs` plus the attributes each clause
+// needs, both attributed to a specific RTE. goopg's search boundary has
+// neither — the statement's projection is not built until after the search
+// returns. So the set is collected from the statement AST, by COLUMN NAME,
+// and the approximation runs deliberately in ONE direction:
+//
+//   - Names are not attributed to a relation. A name used for `orders` also
+//     counts as needed for `customer` if `customer` has a column of that name.
+//     That OVER-states the requirement — an index has MORE to cover, so fewer
+//     index-only paths are offered. It never omits a column.
+//   - Anything the walker does not enumerate — a node type, a `SELECT *`, a
+//     set operation — abandons the whole set (`ok=false`) and the producer
+//     offers nothing. An index-only scan that drops a column the query reads
+//     returns wrong rows, so silence is the only safe answer.
+//
+// The `default:` arms below are therefore load-bearing.
+// `collectColumnRefTableNamesWalk` (reduce_outer_joins.go) has the same shape
+// with the opposite default — correct for its own conservative question and a
+// wrong-answer bug if reused here (rule #2).
+
+import "github.com/goopg/goopg/internal/parser"
+
+// neededColumnNames returns every column name the statement reads, and whether
+// the answer is TRUSTWORTHY. A false second return means "assume every column
+// of every relation is needed" — the caller must then offer no index-only path.
+func neededColumnNames(s *parser.SelectStmt) (map[string]bool, bool) {
+	if s == nil {
+		return nil, false
+	}
+	dst := make(map[string]bool, 16)
+	if !collectStmtColumnNames(s, dst) {
+		return nil, false
+	}
+	return dst, true
+}
+
+// collectStmtColumnNames walks one SELECT's non-FROM clauses. Derived tables
+// are skipped: each is planned by its own `planSelect` call and therefore gets
+// its own set.
+func collectStmtColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
+	if s == nil {
+		return false
+	}
+	// Shapes whose column usage this walker does not model; an unaccounted
+	// reference is a dropped column, so they decline as a group.
+	if s.SetOp != nil || s.SetOpOperand != nil || s.With != nil ||
+		len(s.ValuesRows) != 0 || s.GroupingSets != nil ||
+		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	for _, t := range s.Targets {
+		if !collectExprColumnNames(t.Expr, dst) {
+			return false
+		}
+	}
+	for _, e := range []parser.Expr{s.Where, s.Having, s.Limit, s.Offset} {
+		if !collectExprColumnNames(e, dst) {
+			return false
+		}
+	}
+	for _, group := range [][]parser.Expr{s.GroupBy, s.DistinctOn} {
+		for _, e := range group {
+			if !collectExprColumnNames(e, dst) {
+				return false
+			}
+		}
+	}
+	for _, sb := range s.OrderBy {
+		if !collectExprColumnNames(sb.Expr, dst) {
+			return false
+		}
+	}
+	// ON clauses: a column that appears ONLY in an ON clause is still read by
+	// the scan beneath it.
+	for i := range s.FromExprs {
+		if !collectRangeVarColumnNames(&s.FromExprs[i].Base) {
+			return false
+		}
+		for j := range s.FromExprs[i].Joins {
+			jn := &s.FromExprs[i].Joins[j]
+			if !collectRangeVarColumnNames(&jn.Right) {
+				return false
+			}
+			// USING(c) and NATURAL both name columns on both sides; NATURAL
+			// does not even spell them out, so it declines.
+			if jn.Natural {
+				return false
+			}
+			for _, u := range jn.Using {
+				dst[u] = true
+			}
+			if !collectExprColumnNames(jn.On, dst) {
+				return false
+			}
+		}
+	}
+	for i := range s.From {
+		if !collectRangeVarColumnNames(&s.From[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// collectRangeVarColumnNames accounts for one FROM item. A plain table or a
+// derived table (planned by its own planSelect) contributes nothing; anything
+// that can hide an expression declines.
+func collectRangeVarColumnNames(rv *parser.RangeVar) bool {
+	if rv == nil {
+		return true
+	}
+	return rv.TableFunc == nil && rv.TableSample == nil && !rv.Lateral
+}
+
+// collectExprColumnNames adds every `ColumnRef.Column` in e to dst. Returns
+// false the moment it meets something it cannot account for.
+func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
+	if e == nil {
+		return true
+	}
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		dst[x.Column] = true
+		return true
+
+	// Leaves that provably carry no column reference.
+	case *parser.IntegerConst, *parser.StringConst, *parser.NumericConst,
+		*parser.NullConst, *parser.BooleanConst, *parser.TypedStringLit,
+		*parser.IntervalLit, *parser.ParamRef, *parser.DefaultMarker:
+		return true
+
+	case *parser.BinaryOp:
+		return collectExprColumnNames(x.Left, dst) && collectExprColumnNames(x.Right, dst)
+	case *parser.UnaryOp:
+		return collectExprColumnNames(x.Operand, dst)
+	case *parser.IsNullExpr:
+		return collectExprColumnNames(x.Operand, dst)
+	case *parser.IsBoolExpr:
+		return collectExprColumnNames(x.Operand, dst)
+	case *parser.CastExpr:
+		return collectExprColumnNames(x.Operand, dst)
+	case *parser.CollateExpr:
+		return collectExprColumnNames(x.Operand, dst)
+	case *parser.IsDistinctFromExpr:
+		return collectExprColumnNames(x.Left, dst) && collectExprColumnNames(x.Right, dst)
+	case *parser.CaseExpr:
+		if !collectExprColumnNames(x.Operand, dst) || !collectExprColumnNames(x.Else, dst) {
+			return false
+		}
+		for _, w := range x.Whens {
+			if !collectExprColumnNames(w.When, dst) || !collectExprColumnNames(w.Then, dst) {
+				return false
+			}
+		}
+		return true
+	case *parser.FuncCall:
+		// A window function's frame can name columns; decline rather than
+		// model the WindowDef shape here. `count(*)` reads no column.
+		if x.Over != nil {
+			return false
+		}
+		for _, a := range x.Args {
+			if !collectExprColumnNames(a, dst) {
+				return false
+			}
+		}
+		if !collectExprColumnNames(x.Filter, dst) {
+			return false
+		}
+		for _, group := range [][]parser.SortBy{x.OrderBy, x.WithinGroup} {
+			for _, sb := range group {
+				if !collectExprColumnNames(sb.Expr, dst) {
+					return false
+				}
+			}
+		}
+		return true
+	case *parser.InExpr:
+		if !collectExprColumnNames(x.Operand, dst) {
+			return false
+		}
+		for _, v := range x.List {
+			if !collectExprColumnNames(v, dst) {
+				return false
+			}
+		}
+		if x.Subquery != nil {
+			// A correlated subquery reads OUTER columns by name, so its own
+			// walk keeps those in this set too.
+			return collectStmtColumnNames(x.Subquery, dst)
+		}
+		return true
+	case *parser.ExistsExpr:
+		return collectStmtColumnNames(x.Subquery, dst)
+	case *parser.SubqueryExpr:
+		return collectStmtColumnNames(x.Inner, dst)
+	default:
+		// `StarExpr`, `IndirectionStar`, `RowExpr`, the array and extract
+		// forms, and any node added after this file was written. Declining is
+		// the only answer that cannot silently drop a column.
+		return false
+	}
+}

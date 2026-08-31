@@ -110,7 +110,7 @@ func indexableJoinClausesFor(relids RelSet, clauses []*restrictInfo) []paramInde
 // composite-FK shape, `lineitem(l_partkey, l_suppkey)` probed from `part` and
 // `supplier` — has no single clause that binds it, so a singleton-only list
 // offers the index two half-bound key sets and
-// `pickIndexCoveringAllLeadingColumns` correctly declines both. Only the union
+// `pickIndexCoveringLeadingPrefix` correctly declines both. Only the union
 // {part, supplier} binds the whole key. This half was ledgered against
 // P5.4b-ii-b, deliberately: until the NLI arm existed to consume a
 // parameterised path, the extra sets would have been generated, priced, and
@@ -221,6 +221,7 @@ func (s *searchCtx) addParameterizedIndexPaths(cat catalog.Catalog) {
 	if s == nil || cat == nil || s.clauses == nil || len(s.clauses.all) == 0 {
 		return
 	}
+	totalPages := s.totalTablePages()
 	for i, rel := range s.levelRels(1) {
 		if i >= len(s.relInfos) {
 			break
@@ -242,21 +243,50 @@ func (s *searchCtx) addParameterizedIndexPaths(cat catalog.Catalog) {
 		// `NestedLoopIndexJoin.Inner` is typed `*IndexScan` and so cannot carry
 		// the `*Filter` wrappers a leaf's local quals live in. Costing a path
 		// here whose only consumer must refuse it would let the DP choose a plan
-		// the builder cannot honour — and the two alternatives are both worse
-		// than declining: dropping the wrappers loses the quals outright (a wrong
-		// answer), and hoisting them onto the join residual is the D6.3b Q9
-		// blowup. Ledgered: this costs goopg every NLI over a filtered leaf,
-		// which the legacy `tryBuildNLI` still serves.
-		if !scanLeafIsBare(rel.baseLeaf) {
+		// the builder cannot honour — so the producer applies the consumer's own
+		// rule (rule #2).
+		//
+		// That rule used to be `scanLeafIsBare`: no wrappers at all. It is now
+		// `absorbableLeafCond`, because the quals have somewhere to go —
+		// `IndexScan.Cond`, PG's `Filter:` alongside `Index Cond:` on one node.
+		// The bare rule declined every filtered relation, which is precisely the
+		// shape PG parameterises in TPC-H (Q19's `lineitem` behind
+		// `l_shipmode`/`l_shipinstruct`, Q3's behind `l_shipdate`), so goopg
+		// could not reach those plans at any cost setting. A leaf whose wrappers
+		// are NOT leaf-local is still declined — see `absorbableLeafCond` for
+		// why that one is a coordinates question and not a shape question.
+		//
+		// Note the row estimate needs no adjustment for the absorbed quals:
+		// `parameterizedBaserelRows` multiplies `rel.Rows`, which already
+		// carries the leaf's baserestrict selectivity (see its comment), so the
+		// local quals are priced exactly once whether they sit in a wrapper or
+		// in `Cond`.
+		if _, _, ok := absorbableLeafCond(rel.baseLeaf); !ok {
 			continue
 		}
 		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)
 		if len(cands) == 0 {
 			continue
 		}
+		// `baserel->tuples` — the PRE-restriction count `cost_index` charges
+		// over, and the count `get_variable_numdistinct` scales a fractional
+		// distinct estimate by. Not `rel.Rows`, which is post-restriction.
+		relTuples := float64(s.relInfos[i].baseRows)
+		if relTuples < 1 {
+			// Not always populated (no catalog estimate; every enumerator unit
+			// test). Falling back to the rel's own row count keeps this a real
+			// relation size instead of 1, which would make
+			// `get_variable_numdistinct` scale a fractional distinct estimate
+			// by nothing and hand `cost_index` a one-row table.
+			relTuples = rel.Rows
+		}
+		if relTuples < 1 {
+			relTuples = 1
+		}
+		relPages := baseRelPages(tbl, relTuples)
 		added := false
 		for _, req := range consideredParameterizations(cands) {
-			if s.addOneParameterizedIndexPath(rel, tbl, cat, cands, req) {
+			if s.addOneParameterizedIndexPath(rel, tbl, cat, cands, req, relPages, relTuples, totalPages) {
 				added = true
 			}
 		}
@@ -273,7 +303,7 @@ func (s *searchCtx) addParameterizedIndexPaths(cat catalog.Catalog) {
 // together and offered to the index as one key set.
 //
 // Returns whether a path was added.
-func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, cands []paramIndexClause, req RelSet) bool {
+func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, cands []paramIndexClause, req RelSet, relPages int64, relTuples, totalPages float64) bool {
 	innerToOuter := make(map[string]Expr, len(cands))
 	// The inner-side operand of the same clauses, keyed the same way — the
 	// column expressions `buildIndexPathkeys` names the index's key columns
@@ -297,18 +327,39 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		return false
 	}
 	// The SAME index-eligibility rule the NLI constructor applies
-	// (`pickIndexCoveringAllLeadingColumns`, nl_index_join.go:970): a
-	// multi-column index qualifies only when EVERY one of its columns is
-	// bound, because a partial-prefix probe is not a shape goopg's executor
-	// emits. Sharing the function is what keeps path generation from costing
-	// an index the constructor would decline — the first half of 03 §5.2's
-	// binding contract; the second half (sharing `tryBuildNLI`'s whole
-	// gauntlet) belongs to the arm that builds the join, P5.4b-ii-b.
-	idx, _ := pickIndexCoveringAllLeadingColumns(cat, tbl, innerToOuter)
+	// (`pickIndexCoveringLeadingPrefix`, nl_index_join.go): an index
+	// qualifies when its LEADING column is bound, and the probe binds the
+	// gapless prefix that is bound from there — PG's `amoptionalkey` rule
+	// (indxpath.c:1029-1076). Sharing the function is what keeps path
+	// generation from costing an index the constructor would decline — the
+	// first half of 03 §5.2's binding contract; the second half (sharing
+	// `tryBuildNLI`'s whole gauntlet) belongs to the arm that builds the
+	// join, P5.4b-ii-b.
+	//
+	// Requiring TOTAL coverage here is what made goopg choose a Bitmap Heap
+	// Scan for TPC-H Q8 where PG chooses `Index Scan using
+	// lineitem_part_supp_fkidx`: with only `l_partkey` bound, this producer
+	// declined and the bitmap producer — which never had the restriction —
+	// was the only candidate left. It was never a costing difference. At
+	// every parameterisation where both produced a path, the index path was
+	// already cheaper and `addPath` already discarded the bitmap.
+	idx, _ := pickIndexCoveringLeadingPrefix(cat, tbl, innerToOuter)
 	if idx == nil {
 		return false
 	}
-	rows := parameterizedBaserelRows(rel, tbl, idx, bound)
+	// The probe binds a gapless leading prefix, which may be SHORTER than
+	// `bound`: a clause on a column past the first unbound one is not an index
+	// qual at all. Splitting the two selectivities is PG's own split — the
+	// index quals drive `cost_index`'s page estimate (`indexSelectivity`),
+	// while `ppi_rows` counts every movable clause because the ones that are
+	// not index quals still filter (`get_parameterized_baserel_size`,
+	// costsize.c:5379). Sharing one number would either over-charge the probe
+	// or under-count the filter.
+	clauses := indexPathClauses(idx, bound)
+	probed := boundPrefixClauses(bound, clauses)
+	fullyBound := len(clauses) == len(idx.Columns)
+	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, fullyBound)
+	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound)
 	// The index's own ordering (`build_index_pathkeys`, pathkeys.c:740) AND the
 	// direction it was computed for, taken together so they cannot disagree
 	// (M0127-P5.5-a, pathindexcarrier.go). PG passes the same `useful_pathkeys`
@@ -319,11 +370,27 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	// select, and PG's own `pathkeys_possibly_useful` gate needs
 	// `query_pathkeys`, which this seam does not have (03 §10). Both ledgered.
 	keys, dir := indexPathOrdering(idx, innerExprs, false)
+	// `cost_index(path, root, loop_count, false)` (costsize.c:520) with the
+	// loop count `create_index_path` takes from `get_loop_count` — the SAME
+	// scan model the unparameterised ordered path uses (pathindexordered.go),
+	// not a second one.
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	cost := costIndexScan(s.cp, indexScanInputs{
+		relPages:        relPages,
+		relTuples:       relTuples,
+		indexPages:      indexPages,
+		indexTuples:     indexTuples,
+		treeHeight:      treeHeight,
+		selectivity:     sel,
+		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		totalTablePages: totalPages,
+		loopCount:       s.loopCountFor(req),
+	})
 	addPath(rel, &Path{
 		Kind:     PathIndexScan,
 		Rel:      rel,
 		Rows:     rows,
-		Cost:     paramIndexScanCost(s.cp, rows),
+		Cost:     cost,
 		Pathkeys: keys,
 		// `IndexPath.indexinfo` / `indexscandir` (pathnodes.h:1845/1849): the
 		// index this path's cost and rows were computed FOR, named so P5.5's
@@ -335,44 +402,73 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// the search's candidate order and `IndexScan.Keys[i]` binds
 		// `Index.Columns[i]` positionally, so the reordering is the difference
 		// between the right answer and a probe that compares the wrong pair of
-		// columns. Never nil here: `pickIndexCoveringAllLeadingColumns` accepted
+		// columns. Never nil here: `pickIndexCoveringLeadingPrefix` accepted
 		// `idx` only because every one of its columns is bound.
-		IndexClauses:  indexPathClauses(idx, bound),
+		IndexClauses:  clauses,
 		RequiredOuter: req,
 	})
 	return true
 }
 
-// parameterizedBaserelRows is `get_parameterized_baserel_size`
-// (costsize.c:5379): the rows ONE execution of the parameterised scan returns.
-//
-// PG computes `rel->tuples * clauselist_selectivity(param_clauses ∪
-// baserestrictinfo)` and caps the result at `rel->rows`. goopg's `rel.Rows`
-// already carries the baserestrict selectivity (the local quals live inside the
-// leaf node and their effect is inside `initialRelRows`, joinsearch.go:236), so
-// the same product is `rel.Rows * selectivity(param_clauses)` — the two forms
-// are equal, and this one cannot double-count the local quals.
-//
-// The cap is then automatic rather than defensive, since every factor is ≤ 1;
-// it is still applied, because the unique-index rule below is not a product.
-//
-// PG's floor is `clamp_row_est` (costsize.c), which rounds a fractional
-// estimate up to 1: a scan that returns "0.3 rows" still costs a probe, and a
-// zero would make every join above it free.
-func parameterizedBaserelRows(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index, bound []paramIndexClause) float64 {
+// parameterizedIndexSelectivity is `indexSelectivity` for the clauses bound
+// into this probe: the fraction of the relation the INDEX QUALS alone admit
+// (PG computes it in `btcostestimate` via `clauselist_selectivity` over
+// `indexQuals`). Index quals only — the relation's local quals are not in it,
+// because `cost_index` charges over `baserel->tuples` and including them would
+// count them twice.
+func parameterizedIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, bound []paramIndexClause, relTuples float64, fullyBound bool) float64 {
 	// PG's `vardata->isunique` short circuit (`var_eq_non_const`, selfuncs.c):
 	// when the equated column matched a unique index, assume exactly one match
-	// regardless of what the statistics say. Here the whole key of a unique
-	// index is bound — `pickIndexCoveringAllLeadingColumns` guarantees it — so
-	// the scan returns at most one row by definition of the constraint, which
-	// is both the sharpest estimate available and the dominant case in
-	// practice (every primary-key probe).
-	if idx.Unique {
-		return 1
+	// regardless of what the statistics say.
+	//
+	// `fullyBound` is the precondition, and it is a PARAMETER because it
+	// stopped being a guarantee when the producer began emitting prefix
+	// probes. Uniqueness of an index on (a, b) says nothing about how many
+	// rows share one value of `a` — asserting one row for a prefix probe would
+	// under-count `lineitem_part_supp_fkidx` bound on `l_partkey` alone by the
+	// ~30 lineitems per part, and it is the ROW estimate that decides whether
+	// the nested loop above is affordable.
+	if idx.Unique && fullyBound {
+		if relTuples <= 1 {
+			return 1
+		}
+		return 1 / relTuples
 	}
 	sel := 1.0
 	for _, c := range bound {
-		sel *= varEqNonConstSelectivity(columnStatsByName(tbl, c.innerCol))
+		sel *= varEqNonConstSelectivity(columnStatsByName(tbl, c.innerCol), relTuples)
+	}
+	if sel > 1 {
+		return 1
+	}
+	if sel < 0 {
+		return 0
+	}
+	return sel
+}
+
+// parameterizedBaserelRows is `get_parameterized_baserel_size`
+// (costsize.c:5379): the rows ONE execution of the parameterised scan returns.
+//
+// PG computes `rel->tuples * clauselist_selectivity(param_clauses u
+// baserestrictinfo)` and caps at `rel->rows`. goopg's `rel.Rows` already
+// carries the baserestrict selectivity (the local quals live inside the leaf
+// node and their effect is inside `initialRelRows`, joinsearch.go:236), so the
+// same product is `rel.Rows * selectivity(param_clauses)` — the two forms are
+// equal, and this one cannot double-count the local quals.
+//
+// PG's floor is `clamp_row_est`: a scan that returns "0.3 rows" still costs a
+// probe, and a zero would make every join above it free.
+func parameterizedBaserelRows(rel *RelOptInfo, idx *catalog.Index, sel float64, fullyBound bool) float64 {
+	// The uniqueness short-circuit is on the ROWS side and not merely inherited
+	// from the selectivity: `parameterizedIndexSelectivity` expresses "one
+	// tuple" as `1/relTuples`, which reproduces one row only when `rel.Rows`
+	// and `relTuples` agree. They need not — `rel.Rows` is post-restriction —
+	// and a unique index FULLY bound by equality returns at most one row by
+	// definition of the constraint, whatever the restriction did. A prefix
+	// probe has no such guarantee — see `parameterizedIndexSelectivity`.
+	if idx != nil && idx.Unique && fullyBound {
+		return 1
 	}
 	rows := rel.Rows * sel
 	if rows > rel.Rows {
@@ -382,6 +478,32 @@ func parameterizedBaserelRows(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.
 		return 1
 	}
 	return rows
+}
+
+// loopCountFor is `get_loop_count` (indxpath.c:3266): how many times a scan
+// parameterised by `req` is expected to be re-executed.
+//
+// PG's rule is the SMALLEST row count among the relations supplying the
+// parameter — not the product and not the sum. Worth keeping exactly, because
+// `cost_index`'s repeated-scan arm DIVIDES by this number, so an inflated one
+// would make a parameterised inner look free.
+func (s *searchCtx) loopCountFor(req RelSet) float64 {
+	if req == 0 {
+		return 1
+	}
+	result := 0.0
+	for _, rel := range s.levelRels(1) {
+		if rel == nil || rel.Relids&req == 0 || rel.Rows <= 0 {
+			continue
+		}
+		if result == 0 || rel.Rows < result {
+			result = rel.Rows
+		}
+	}
+	if result > 0 {
+		return result
+	}
+	return 1
 }
 
 // varEqNonConstSelectivity is `var_eq_non_const` (selfuncs.c) for the case this
@@ -398,12 +520,12 @@ func parameterizedBaserelRows(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.
 // (DEFAULT_NUM_DISTINCT = 200, selfuncs.h), which is what the zero-stats branch
 // returns here — through the package-level `defaultNumDistinct`
 // (joinselectivity.go), so this arm and the join estimator's cannot drift apart.
-func varEqNonConstSelectivity(stats *catalog.ColumnStats) float64 {
-	if stats == nil || stats.NDistinct <= 0 {
+func varEqNonConstSelectivity(stats *catalog.ColumnStats, relRows float64) float64 {
+	if stats == nil {
 		return 1.0 / defaultNumDistinct
 	}
 	sel := 1.0 - stats.NullFrac
-	if nd := float64(stats.NDistinct); nd > 1 {
+	if nd := variableNumDistinct(stats, relRows); nd > 1 {
 		sel /= nd
 	}
 	if len(stats.MCV) > 0 && stats.MCV[0].Frequency > 0 && sel > stats.MCV[0].Frequency {
@@ -416,6 +538,28 @@ func varEqNonConstSelectivity(stats *catalog.ColumnStats) float64 {
 		return 1
 	}
 	return sel
+}
+
+// variableNumDistinct is `get_variable_numdistinct` (selfuncs.c:6341) for the
+// case this file needs, and it is a THIN WRAPPER on purpose.
+//
+// The reduction it performs — absolute count, else fraction times relation
+// size, else the small-relation/default split — had already been written and
+// centralised in `getVariableNumDistinct` (joinselectivity.go). An earlier
+// version of this function open-coded it again, which made it the FOURTH copy
+// (`catalog.go`'s `StaDistinct` comment names the three) and, worse, a copy
+// that disagreed: it returned the absolute `NDistinct` whenever that was
+// positive, while `StaDistinct()` applies PG's analyze.c rule that the FRACTION
+// wins once it exceeds 0.1, absolute count or not. ANALYZE sets both fields, so
+// for any column with `NDistinctFrac > 0.1` the join estimator and this one
+// would have returned different distinct counts for the same column in the
+// same plan — the exact sibling-path divergence this repo has been bitten by
+// repeatedly, and silent because both answers are plausible.
+//
+// So the only thing left here is the shape conversion.
+func variableNumDistinct(stats *catalog.ColumnStats, relRows float64) float64 {
+	nd, _ := getVariableNumDistinct(joinVarStats{stats: stats, tuples: relRows})
+	return nd
 }
 
 // columnStatsByName resolves a column name to its ANALYZE statistics, or nil
@@ -438,28 +582,22 @@ func columnStatsByName(tbl *catalog.Table, name string) *catalog.ColumnStats {
 	return nil
 }
 
-// paramIndexScanCost prices ONE execution of a parameterised index scan — the
-// convention PG uses for a parameterised path throughout (`cost_index` costs a
-// single scan with the parameter bound, and `cost_rescan` is what multiplies it
-// by the outer's row count at the nested loop above).
-//
-// It is built from `indexProbeCost` rather than beside it, and that is the
-// point: `indexProbeCostMultiplier` (cost_funcs.go:202) exists because goopg's
-// probe materialises the whole TID list eagerly and so runs far slower than
-// PG's random_page_cost model predicts. A second, independently-derived index
-// cost model here would be a second calibration to keep in step — exactly the
-// "two cost models inside one comparison" failure 04 §1 forbids. So the first
-// row costs a full probe, and each further row costs the incremental part of
-// one: another heap page at random cost, plus the per-tuple CPU.
-//
-// Startup is zero. PG charges the B-tree descent as `index_startup_cost`
-// (`btcostestimate`), which is small next to the multiplied probe cost and
-// which goopg has no descent model to derive; the omission is ledgered.
-func paramIndexScanCost(cp costParams, rows float64) Cost {
-	total := indexProbeCost(cp)
-	if rows > 1 {
-		perExtraRow := indexProbeCostMultiplier * (cp.randomPageCost + cp.cpuIndexTupleCost + cp.cpuTupleCost)
-		total += (rows - 1) * perExtraRow
+// boundPrefixClauses narrows `bound` to just the clauses the probe actually
+// binds, named by the index-column list `indexPathClauses` produced. The
+// remainder are movable clauses that could not become index quals; they still
+// filter, so they belong to the row estimate but not to the probe's page cost.
+func boundPrefixClauses(bound []paramIndexClause, clauses []indexPathClause) []paramIndexClause {
+	if len(clauses) >= len(bound) {
+		return bound
 	}
-	return Cost{Startup: 0, Total: total}
+	keep := make([]paramIndexClause, 0, len(clauses))
+	for _, ipc := range clauses {
+		for _, c := range bound {
+			if c.ri == ipc.ri {
+				keep = append(keep, c)
+				break
+			}
+		}
+	}
+	return keep
 }

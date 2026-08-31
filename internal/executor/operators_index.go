@@ -395,10 +395,17 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if len(o.plan.Keys) > 0 {
 		// Multi-column equality probe (M0054-0006-followup-Q9-
 		// composite). Encode each leading column from
-		// `Index.Columns[0..len(Keys)-1]` in order. The planner
-		// guarantees `len(Keys) == len(Index.Columns)` whenever
-		// `Keys` is non-empty, so no suffix padding is required —
-		// we synthesise a full equality probe.
+		// `Index.Columns[0..len(Keys)-1]` in order.
+		//
+		// `Keys` may bind a strict LEADING PREFIX of the index rather
+		// than all of it (PG's `amoptionalkey` prefix probe: only the
+		// first index column is required to have a qual,
+		// indxpath.c:1029-1076). The suffix padding below is what makes
+		// that a range rather than a point lookup, and it is the SAME
+		// rule the single-`Key` branch has applied to composite indexes
+		// since M0053-0001 — stated once per branch because the two
+		// encode their lo bound differently, not because they differ
+		// here.
 		key, ok, err := o.lookupKeys()
 		if err != nil {
 			return err
@@ -409,6 +416,15 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = key
 		hiBytes = key
+		// A prefix probe's inclusive upper bound must cover every key
+		// whose bound leading columns equal `key`, exactly as the
+		// single-`Key` branch does below. A FULL-key probe must not be
+		// padded: it is a point lookup and padding it would widen the
+		// scan to every duplicate of the whole key, which is the same
+		// set only for a unique index.
+		if len(o.plan.Keys) < len(o.plan.Index.Columns) {
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
+		}
 	} else if o.plan.Key != nil {
 		// Single-column equality scan: probe key is both lo and hi.
 		key, ok, err := o.lookupKey()
@@ -630,10 +646,36 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// the seqScanOp inline hook is not enough — render here too (no-op off the
 		// catalogs / for a NULL ACL).
 		renderHeapACLColumnInto(o.ctx.Catalog, o.plan.Table, o.plan.Table.Columns, row)
-		// Record the actual (HOT-resolved) live slot for
-		// currentTID() — lockRowsOp stamps the live version.
-		o.lastTID = storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
-		o.hasLast = true
+		// PG's `Filter:` on an Index Scan: the relation's local quals, evaluated
+		// per heap tuple the probe returned. Set only on an NLI inner, where the
+		// quals cannot live in a *Filter above (plan.go, IndexScan.Cond).
+		//
+		// Evaluated HERE — after the tuple is fetched and detoasted, before the
+		// row is emitted — but deliberately NOT short-circuiting the two things
+		// below it:
+		//
+		//   - the SSI hooks still run for a filtered-out tuple, because PG takes
+		//     the predicate lock in the heap fetch (`PredicateLockTID`, before
+		//     `ExecQual`). A tuple that was READ and then rejected still forms
+		//     the rw-edge; skipping it would be a SERIALIZABLE false negative.
+		//   - `lastTID`/`hasLast` are advanced only when the row is kept, since
+		//     `currentTID` is documented as the most recently EMITTED row and
+		//     lockRowsOp stamps that TID. Advancing on a rejected tuple would
+		//     point it at a row the plan never returned.
+		keepRow := true
+		if o.plan.Cond != nil {
+			d, cerr := evalExpr(o.plan.Cond, row, o.ctx)
+			if cerr != nil {
+				return nil, cerr
+			}
+			keepRow = !d.IsNull() && d.Kind == KindBool && d.BoolValue()
+		}
+		if keepRow {
+			// Record the actual (HOT-resolved) live slot for
+			// currentTID() — lockRowsOp stamps the live version.
+			o.lastTID = storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
+			o.hasLast = true
+		}
 		// M0104-0007: SSI read-path hook on the HOT-resolved live slot.
 		// Helper short-circuits for RC/RR; for SERIALIZABLE this installs a
 		// tuple-grain predicate lock and an rw-conflict edge to the writer
@@ -653,6 +695,9 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			}
 		} else if err := ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
 			return nil, err
+		}
+		if !keepRow {
+			continue
 		}
 		// M0092-0007: stack-aliased slot — reuse o.slot across
 		// every Next() call. Caller must consume / Materialize
@@ -711,11 +756,16 @@ func (o *indexScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bo
 // the probe correctly produces zero rows. (M0054-0006-followup-
 // Q9-composite.)
 func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
-	if len(o.plan.Keys) != len(o.plan.Index.Columns) {
-		// Defensive: the planner is contractually required to
-		// supply one Key per index column. A mismatch here is a
-		// planner bug, surfaced as runtime XX000 with the index
-		// name so the bug is named at the failure site.
+	if len(o.plan.Keys) == 0 || len(o.plan.Keys) > len(o.plan.Index.Columns) {
+		// Defensive: the planner is contractually required to supply a
+		// non-empty LEADING PREFIX of the index columns — at most one
+		// Key per index column, with no gaps, since `Keys[i]` binds
+		// `Index.Columns[i]` positionally. A count outside that range is
+		// a planner bug, surfaced as runtime XX000 with the index name
+		// so the bug is named at the failure site. A SHORT list is legal
+		// (prefix probe) and is padded by the caller; there is no
+		// representation for a gap, which is why `indexPathClauses`
+		// declines rather than shortening one.
 		return nil, false, &ExecError{
 			Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexScanOp.lookupKeys: planner supplied %d keys for index %q with %d columns", len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),

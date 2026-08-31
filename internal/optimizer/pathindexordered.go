@@ -54,6 +54,11 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 	// create_index_paths generates both indexscan and bitmap paths for every
 	// index, and add_path keeps the cheaper one in each cost regime.
 	s.addBaseRelBitmapPaths(cat)
+	s.addParameterizedBitmapPaths(cat)
+	// M0134-0187: `create_index_path(..., indexonly=true)` for every index
+	// covering what the statement reads from the relation — generated here
+	// because it competes in the same rel's pathlist as the rest.
+	s.addIndexOnlyPaths(cat)
 }
 
 // addOrderedIndexPaths generates, for every base relation, the unparameterised

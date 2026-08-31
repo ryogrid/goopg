@@ -101,7 +101,7 @@ func TestIndexPathClausesReordersCandidateOrderToIndexOrder(t *testing.T) {
 }
 
 // TestIndexPathClausesAgreesWithTheIndexPick is hard-won rule #2 applied to the
-// one twin this carrier has. `pickIndexCoveringAllLeadingColumns` (the function
+// one twin this carrier has. `pickIndexCoveringLeadingPrefix` (the function
 // the NLI constructor shares) independently produces the ordered probe-value
 // list, and it is the reason the index was accepted at all. If the carrier's
 // keys ever disagreed with it, the path would be COSTED for one probe and BUILT
@@ -114,7 +114,7 @@ func TestIndexPathClausesAgreesWithTheIndexPick(t *testing.T) {
 	for _, c := range bound {
 		innerToOuter[c.innerCol] = c.outerKey
 	}
-	idx, pickKeys := pickIndexCoveringAllLeadingColumns(cat, ps, innerToOuter)
+	idx, pickKeys := pickIndexCoveringLeadingPrefix(cat, ps, innerToOuter)
 	if idx == nil {
 		t.Fatal("the fully-bound composite index was declined; the twin cannot be compared")
 	}
@@ -136,18 +136,32 @@ func TestIndexPathClausesAgreesWithTheIndexPick(t *testing.T) {
 // `IndexScan.Keys` is positional and requires one expression per index column,
 // so a SHORTENED list would silently re-index every position after the gap.
 // nil — decline — is the only safe answer.
-func TestIndexPathClausesDeclinesOnAnUnboundColumn(t *testing.T) {
+func TestIndexPathClausesTruncatesAtTheFirstUnboundColumn(t *testing.T) {
 	_, _, idx := picComposite(t)
-	// Only the LEADING column bound: the shape PG's `amoptionalkey` arm accepts
-	// and goopg's executor cannot express.
-	leadingOnly := picReversedBound()[1:]
+	bound := picReversedBound()
+	// Only the LEADING column bound: PG's `amoptionalkey` prefix probe
+	// (indxpath.c:1029-1076). The executor pads the short key to a range over
+	// every entry sharing the prefix, so this is representable — it is the
+	// shape PG picks for TPC-H Q8's `lineitem_part_supp_fkidx`.
+	leadingOnly := bound[1:]
 
-	if got := indexPathClauses(idx, leadingOnly); got != nil {
-		t.Fatalf("a half-bound composite index carried %d clauses; want nil (decline)", len(got))
+	got := indexPathClauses(idx, leadingOnly)
+	if len(got) != 1 {
+		t.Fatalf("a leading-column-only bound carried %d clauses; want 1 (prefix probe)", len(got))
 	}
+	if got[0].indexCol != 0 {
+		t.Fatalf("the prefix clause claims index column %d; want 0", got[0].indexCol)
+	}
+	if got[0].ri != leadingOnly[0].ri {
+		t.Fatal("the carried restrictInfo is not the one that was bound")
+	}
+
 	// The trailing-column-only case is the one that would mis-bind most
-	// visibly: a one-entry list whose key belongs to column 1.
-	if got := indexPathClauses(idx, picReversedBound()[:1]); got != nil {
+	// visibly: a one-entry list whose key belongs to column 1 would be bound
+	// POSITIONALLY to column 0 and probe the wrong column. A btree cannot start
+	// a scan below its leading column, so this still declines outright — the
+	// prefix arm widened what is representable, not what is safe.
+	if got := indexPathClauses(idx, bound[:1]); got != nil {
 		t.Fatalf("a trailing-only bound carried %d clauses; want nil (decline)", len(got))
 	}
 }

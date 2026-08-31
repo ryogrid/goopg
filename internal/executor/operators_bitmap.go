@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage/lmgr"
@@ -19,6 +20,16 @@ type bitmapProducer interface {
 	buildBitmap(ctx *Context) (*TIDBitmap, error)
 }
 
+// bitmapOuterBinder is the half of `nliInner` a bitmap PRODUCER needs when the
+// heap scan above it is a nested-loop inner: the probe key references outer
+// columns, so the slot has to reach the node that encodes the key. BitmapAnd /
+// BitmapOr forward it to their children; a producer that cannot be
+// parameterised simply does not implement it, and the heap scan then binds
+// nothing — which is the unparameterised case and needs no binding.
+type bitmapOuterBinder interface {
+	BindOuter(slot SlotView, outerWidth int)
+}
+
 // ---------------------------------------------------------------------------
 // bitmapIndexScanOp — PG's BitmapIndexScan (nodeBitmapIndexscan.c).
 // MultiExec-style: no Next(), only buildBitmap().
@@ -33,6 +44,13 @@ type bitmapIndexScanOp struct {
 
 	// scanRow is lazily allocated for evalExpr (needs a Row context).
 	scanRow Row
+
+	// outerSlot / outerWidth are bound by a nested-loop parent (BindOuter) when
+	// the bitmap heap scan above this node is a parameterised inner. The probe
+	// encoders resolve Key/Keys against the slot; nil is the unparameterised
+	// case, where the planner guarantees those reduce to constants.
+	outerSlot  SlotView
+	outerWidth int
 }
 
 func newBitmapIndexScanOp(p *optimizer.BitmapIndexScan) *bitmapIndexScanOp {
@@ -76,6 +94,13 @@ func (o *bitmapIndexScanOp) Open(ctx *Context) error {
 	}
 	o.tree = tree
 	return nil
+}
+
+// BindOuter records the slot a nested-loop parent binds before each rescan; the
+// probe encoders resolve Key/Keys against it. See bitmapOuterBinder.
+func (o *bitmapIndexScanOp) BindOuter(slot SlotView, outerWidth int) {
+	o.outerSlot = slot
+	o.outerWidth = outerWidth
 }
 
 func (o *bitmapIndexScanOp) Close() error {
@@ -173,7 +198,7 @@ func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, err error) 
 
 // lookupKey encodes a single-column equality key.
 func (o *bitmapIndexScanOp) lookupKey(col *catalog.Column) (lo, hi []byte, err error) {
-	val, evalErr := evalExpr(o.plan.Key, o.scanRow, o.ctx)
+	val, evalErr := evalExprSlot(o.plan.Key, o.outerSlot, o.ctx)
 	if evalErr != nil {
 		return nil, nil, evalErr
 	}
@@ -201,7 +226,7 @@ func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte,
 		if !found {
 			return nil, nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
 		}
-		val, evalErr := evalExpr(keyExpr, o.scanRow, o.ctx)
+		val, evalErr := evalExprSlot(keyExpr, o.outerSlot, o.ctx)
 		if evalErr != nil {
 			return nil, nil, evalErr
 		}
@@ -243,6 +268,21 @@ type bitmapHeapScanOp struct {
 	pageBuf   storage.Page
 	pageBlock storage.BlockNumber
 	pageLossy bool
+	// lossyOff is the cursor within a LOSSY page: a lossy bitmap entry names a
+	// page but no offsets, so the scan must walk every line pointer and
+	// re-check each tuple. It has to survive across Next() calls, and
+	// `inLossyPage` is what stops the loop re-advancing the TBM iterator while
+	// a page is still being walked — the iterator yields a lossy page exactly
+	// once.
+	// parOffsets / parOff are the cursor within an EXACT page on the parallel
+	// path, and parRecheck the entry's recheck flag. They exist because a
+	// page's matches span multiple Next() calls; without them the scan emitted
+	// one row per page.
+	parOffsets  []uint16
+	parOff      int
+	parRecheck  bool
+	lossyOff    uint16
+	inLossyPage bool
 
 	// scanRow is reused per Next() — zero allocation per tuple.
 	scanRow Row
@@ -282,7 +322,40 @@ func newBitmapHeapScanOp(p *optimizer.BitmapHeapScan) *bitmapHeapScanOp {
 
 func (o *bitmapHeapScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
+// Open is the single-scan entry point: one-time setup, then let Next build the
+// bitmap lazily. A nested-loop parent instead calls openPrep once and Rescan per
+// outer row — see Rescan for what each probe must discard.
 func (o *bitmapHeapScanOp) Open(ctx *Context) error {
+	return o.openPrep(ctx)
+}
+
+// BindOuter forwards the parent's slot to the bitmap PRODUCER, which is where
+// the probe key is encoded. A producer that cannot be parameterised does not
+// implement bitmapOuterBinder and simply receives nothing.
+func (o *bitmapHeapScanOp) BindOuter(slot SlotView, outerWidth int) {
+	if b, ok := o.outerBitmap.(bitmapOuterBinder); ok {
+		b.BindOuter(slot, outerWidth)
+	}
+}
+
+// Rescan discards the previous probe's bitmap and page state so the next Next()
+// rebuilds from the newly bound outer row.
+//
+// `tbm` is the one that matters: Next builds it lazily on `o.tbm == nil`, so
+// leaving it set would silently reuse the PREVIOUS outer row's TID set — every
+// probe after the first returning the first probe's rows, which is a wrong
+// answer and not a slow one. The pinned page must be released rather than
+// dropped, or the buffer leaks one pin per outer row.
+func (o *bitmapHeapScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
+	o.BindOuter(outerSlot, outerWidth)
+	o.releasePinned()
+	o.tbm = nil
+	o.iter = nil
+	o.ownBitmap = false
+	return nil
+}
+
+func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "BitmapHeapScan requires storage handles in Context"}
 	}
@@ -331,7 +404,7 @@ func (o *bitmapHeapScanOp) Open(ctx *Context) error {
 	o.outerBitmap, ok = outerOp.(bitmapProducer)
 	if !ok {
 		outerOp.Close()
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "BitmapHeapScan outer is not a bitmap producer"}
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("BitmapHeapScan outer is a %T, which is not a bitmap producer", o.plan.Outer)}
 	}
 	return nil
 }
@@ -390,12 +463,32 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 			o.ownBitmap = true
 		}
 
+		// Still walking a lossy page: do NOT advance the iterator, which yields
+		// a lossy entry only once.
+		if o.inLossyPage {
+			if slot, err := o.nextLossyTuple(o.pageBlock); err != nil || slot != nil {
+				return slot, err
+			}
+			o.inLossyPage = false
+			continue
+		}
+
 		// Advance the TBM iterator.
 		block, offset, lossy, recheck, ok := o.iter.next()
 		if !ok {
 			// Exhausted.
+			//
+			// EOF, not (nil, nil). Every operator in this package signals
+			// exhaustion with EOF, and every consumer tests `err == EOF`; a nil
+			// slot with a nil error passes that test and reaches the caller as a
+			// REAL row that happens to be nil. A top-level pull tolerated it
+			// because it stops on a nil slot anyway, which is why this survived
+			// — but a `NestedLoopIndexJoin` inner following the contract does
+			// `slotRow(nil)` -> a zero-length row -> "index out of range with
+			// length 0" from inside the join's predicate evaluation, on a stack
+			// that names neither this line nor the bitmap scan.
 			o.releasePinned()
-			return nil, nil
+			return nil, EOF
 		}
 
 		// If the page changed or we haven't pinned one yet, pin the new page.
@@ -423,11 +516,23 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 		}
 
 		// For lossy pages, iterate ALL offsets. The iterator yields
-		// (block, 0, lossy=true) once; we walk every line pointer.
+		// (block, 0, lossy=true) once; we walk every line pointer and re-check
+		// each tuple, which is PG's `bitgetpage` lossy branch
+		// (nodeBitmapHeapscan.c).
+		//
+		// This used to `continue`, under a comment promising "lossy handling
+		// below" that was never written — so every row on a lossy page was
+		// silently DROPPED. A TID bitmap goes lossy above work_mem, so a bitmap
+		// over TPC-H `lineitem` lost ~94% of its rows. It stayed invisible
+		// because bitmap paths never won on cost and so never ran.
 		if lossy {
-			// Use a sub-state to track position within the lossy page.
-			// We'll return one row at a time and save position.
-			continue // fall through to lossy handling below
+			o.inLossyPage = true
+			o.lossyOff = 0
+			if slot, err := o.nextLossyTuple(block); err != nil || slot != nil {
+				return slot, err
+			}
+			o.inLossyPage = false
+			continue
 		}
 
 		// Exact page: fetch the specific tuple at the given offset.
@@ -449,11 +554,28 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 // accidentally claiming a new page from the shared allocator.
 func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 	for {
+		// Resume the current page before claiming another: a page's offsets
+		// span multiple Next() calls.
+		if o.parOff < len(o.parOffsets) {
+			if slot, err := o.nextParallelTuple(o.pageBlock); err != nil || slot != nil {
+				return slot, err
+			}
+		}
 		block, entry, ok := o.pbm.nextPage()
 		if !ok {
 			// Exhausted.
+			//
+			// EOF, not (nil, nil). Every operator in this package signals
+			// exhaustion with EOF, and every consumer tests `err == EOF`; a nil
+			// slot with a nil error passes that test and reaches the caller as a
+			// REAL row that happens to be nil. A top-level pull tolerated it
+			// because it stops on a nil slot anyway, which is why this survived
+			// — but a `NestedLoopIndexJoin` inner following the contract does
+			// `slotRow(nil)` -> a zero-length row -> "index out of range with
+			// length 0" from inside the join's predicate evaluation, on a stack
+			// that names neither this line nor the bitmap scan.
 			o.releasePinned()
-			return nil, nil
+			return nil, EOF
 		}
 
 		// Pin the page.
@@ -470,32 +592,48 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 
 		if entry.isLossy {
 			o.lossyPages++
-			// Lossy pages: the serial path does not iterate all offsets
-			// (the original Next() issued `continue` for lossy). Match that
-			// here — a lossy page emits nothing through this operator.
-			// Full lossy-page iteration is deferred (S5.x follow-up).
+			// Walk every line pointer on the page, exactly as the serial path
+			// does. The previous code `continue`d here and claimed to be
+			// matching the serial path — which was itself dropping lossy pages,
+			// so the two agreed only in being wrong together.
+			o.lossyOff = 0
+			for {
+				slot, err := o.nextLossyTuple(block)
+				if err != nil {
+					return nil, err
+				}
+				if slot == nil {
+					break
+				}
+				return slot, nil
+			}
 			continue
 		}
 
-		// Exact page: extract and iterate offsets.
+		// Exact page: extract the offsets and walk them ACROSS Next() calls.
+		//
+		// The cursor is the whole point. This loop used to `return row, nil` on
+		// the first surviving tuple and then fall out of the function — so the
+		// next Next() claimed a NEW page from the shared allocator and every
+		// remaining match on this one was LOST. It emitted exactly one row per
+		// page, which is what the instrumentation showed:
+		// `exactPages=27379 emitted=27379` on TPC-H `lineitem`, i.e. ~1 row
+		// where the page held ~46, and Q3 returning 702 rows of 11415.
+		//
+		// It survived because bitmap paths never won on cost, so this arm had
+		// never run. `o.parOffsets`/`o.parOff` now hold the position, and the
+		// page is only released once its offsets are exhausted.
 		o.exactPages++
 		n := tbmExtractPageTuple(entry, nil)
 		if n == 0 {
 			continue
 		}
-		offsets := make([]uint16, n)
-		tbmExtractPageTuple(entry, offsets)
-		for _, off := range offsets {
-			// Inline the per-tuple fetch, avoiding fetchExact's recursive
-			// o.Next() call which would claim a fresh page from the shared
-			// allocator and lose the remaining TIDs on this page.
-			row, err := o.fetchOneTuple(block, off, entry.recheck)
-			if err != nil {
-				return nil, err
-			}
-			if row != nil {
-				return row, nil
-			}
+		o.parOffsets = make([]uint16, n)
+		tbmExtractPageTuple(entry, o.parOffsets)
+		o.parOff = 0
+		o.parRecheck = entry.recheck
+		if slot, err := o.nextParallelTuple(block); err != nil || slot != nil {
+			return slot, err
 		}
 	}
 }
@@ -536,6 +674,20 @@ func (o *bitmapHeapScanOp) fetchOneTuple(_ storage.BlockNumber, offset uint16, r
 		}
 		if !passed {
 			return nil, nil // recheck failed, skip
+		}
+	}
+
+	// PG's `Filter:` on a Bitmap Heap Scan: the relation's local quals,
+	// evaluated on EVERY tuple — unlike BitmapQual above, which is the recheck
+	// list and fires only on a lossy entry. Set only on an NLI inner, where the
+	// quals cannot live in a *Filter above (plan.go, BitmapHeapScan.Cond).
+	if o.plan.Cond != nil {
+		d, cerr := evalExpr(o.plan.Cond, o.scanRow, o.ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+			return nil, nil // filtered out; the caller skips a nil slot
 		}
 	}
 
@@ -584,10 +736,83 @@ func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, 
 		}
 	}
 
+	// PG's `Filter:` on a Bitmap Heap Scan: the relation's local quals,
+	// evaluated on EVERY tuple — unlike BitmapQual above, which is the recheck
+	// list and fires only on a lossy entry. Set only on an NLI inner, where the
+	// quals cannot live in a *Filter above (plan.go, BitmapHeapScan.Cond).
+	if o.plan.Cond != nil {
+		d, cerr := evalExpr(o.plan.Cond, o.scanRow, o.ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+			return o.Next() // filtered out; fetchExact skips by recursing, not by nil
+		}
+	}
+
 	// Clone arena-backed data.
 	row := cloneRowOwned(o.scanRow)
 	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
 	return &o.slot, nil
+}
+
+// nextParallelTuple returns the next surviving tuple from the current exact
+// page, or (nil, nil) once its offsets are exhausted. `fetchOneTuple` is used
+// rather than `fetchExact` because the latter recurses through o.Next(), which
+// would claim a fresh page from the shared allocator and abandon this one.
+func (o *bitmapHeapScanOp) nextParallelTuple(block storage.BlockNumber) (TupleSlot, error) {
+	for o.parOff < len(o.parOffsets) {
+		off := o.parOffsets[o.parOff]
+		o.parOff++
+		slot, err := o.fetchOneTuple(block, off, o.parRecheck)
+		if err != nil {
+			return nil, err
+		}
+		if slot != nil {
+			return slot, nil
+		}
+	}
+	o.parOffsets = nil
+	o.parOff = 0
+	return nil, nil
+}
+
+// nextLossyTuple advances `lossyOff` over the pinned page and returns the next
+// tuple that survives visibility, the bitmap recheck and `Cond`, or (nil, nil)
+// when the page is exhausted.
+//
+// A LOSSY bitmap entry records only that a page contains matches, not which
+// offsets — so every line pointer has to be visited and every tuple re-checked.
+// That is why PG re-evaluates `bitmapqualorig` on a lossy page
+// (nodeBitmapHeapscan.c) and why `recheck` is passed unconditionally true here.
+//
+// `fetchOneTuple` is used rather than `fetchExact` deliberately: the latter
+// recurses through `o.Next()` when it skips a tuple, which would advance the
+// TBM iterator off this page mid-walk. `fetchOneTuple` reports a skip as
+// (nil, nil) and leaves the cursor to this loop.
+//
+// The page's end is found by `PageGetItemID` returning an error rather than by
+// a max-offset helper, because this package has none.
+func (o *bitmapHeapScanOp) nextLossyTuple(block storage.BlockNumber) (TupleSlot, error) {
+	if o.pinned == nil {
+		return nil, nil
+	}
+	for {
+		o.lossyOff++
+		if o.lossyOff == 0 || o.lossyOff > uint16(MaxOffsetNumber) {
+			return nil, nil
+		}
+		if _, err := storage.PageGetItemID(o.pageBuf, o.lossyOff); err != nil {
+			return nil, nil // past the last line pointer: page exhausted
+		}
+		slot, err := o.fetchOneTuple(block, o.lossyOff, true)
+		if err != nil {
+			return nil, err
+		}
+		if slot != nil {
+			return slot, nil
+		}
+	}
 }
 
 // evalBitmapQual evaluates the BitmapHeapScan's BitmapQual against the
@@ -667,6 +892,17 @@ func (o *bitmapAndOp) Next() (TupleSlot, error) {
 	panic("BitmapAnd does not support ExecProcNode call")
 }
 
+// BindOuter forwards to every input, so a parameterised probe nested under a
+// BitmapAnd still sees the outer row. An input that cannot be parameterised
+// does not implement bitmapOuterBinder and is skipped.
+func (o *bitmapAndOp) BindOuter(slot SlotView, outerWidth int) {
+	for _, in := range o.inputBitmaps {
+		if b, ok := in.(bitmapOuterBinder); ok {
+			b.BindOuter(slot, outerWidth)
+		}
+	}
+}
+
 func (o *bitmapAndOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	if len(o.inputBitmaps) == 0 {
 		return &TIDBitmap{}, nil
@@ -735,6 +971,15 @@ func (o *bitmapOrOp) Close() error {
 // Next panics — BitmapOr is MultiExec-style.
 func (o *bitmapOrOp) Next() (TupleSlot, error) {
 	panic("BitmapOr does not support ExecProcNode call")
+}
+
+// BindOuter forwards to every input — see bitmapAndOp.BindOuter.
+func (o *bitmapOrOp) BindOuter(slot SlotView, outerWidth int) {
+	for _, in := range o.inputBitmaps {
+		if b, ok := in.(bitmapOuterBinder); ok {
+			b.BindOuter(slot, outerWidth)
+		}
+	}
 }
 
 func (o *bitmapOrOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {

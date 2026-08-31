@@ -127,14 +127,45 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 		// coordinates. See outputLayout's doc for why this is not an error.
 		return nil
 	}
-	width := len(n.Output())
-	if leafWidth := len(rel.baseLeaf.Output()); leafWidth != width {
-		panic(fmt.Sprintf("createPlan: rebuilt leaf for relset %#04x is %d columns wide but the recorded leaf is %d; the schema was synthesised, not carried",
-			uint16(rel.Relids), width, leafWidth))
+	out := n.Output()
+	leaf := rel.baseLeaf.Output()
+	width := len(out)
+	if width == len(leaf) {
+		// The common case: the rebuilt leaf emits its table's whole column
+		// list, so output position i IS binding position i.
+		lay := make(outputLayout, width)
+		for i := range lay {
+			lay[i] = rel.baseOffset + i
+		}
+		return lay
+	}
+	// An index-only scan emits only the columns its index covers, so it is
+	// NARROWER than the recorded leaf and the identity above does not hold.
+	// Positions are recovered by NAME against the leaf's schema — the leaf is
+	// the coordinate space every clause over this rel was written in, so this
+	// is the whole of the translation. Everything above is re-based by
+	// `translateToLayout` exactly as for a full-width leaf, and a clause
+	// naming a column this scan does not emit lands on that function's
+	// existing refusal panic at PLAN time rather than reading the wrong
+	// column at run time. (M0134-0187, DESIGN §15/§21.)
+	if width > len(leaf) {
+		panic(fmt.Sprintf("createPlan: rebuilt leaf for relset %#04x is %d columns wide but the recorded leaf is only %d; the schema was synthesised, not carried",
+			uint16(rel.Relids), width, len(leaf)))
 	}
 	lay := make(outputLayout, width)
-	for i := range lay {
-		lay[i] = rel.baseOffset + i
+	for i, col := range out {
+		at := -1
+		for j := range leaf {
+			if leaf[j].Name == col.Name {
+				at = j
+				break
+			}
+		}
+		if at < 0 {
+			panic(fmt.Sprintf("createPlan: narrowed leaf for relset %#04x emits column %q, which the recorded leaf does not have; the schema was synthesised, not narrowed",
+				uint16(rel.Relids), col.Name))
+		}
+		lay[i] = rel.baseOffset + at
 	}
 	return lay
 }

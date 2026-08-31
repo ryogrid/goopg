@@ -32,6 +32,8 @@ package executor
 // borrowed slice safely.
 
 import (
+	"fmt"
+
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -149,6 +151,34 @@ func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 	}
 	for i := 0; i < o.innerWidth; i++ {
 		cols = append(cols, virtualCol{sourceIdx: 1, sourceCol: int16(i)})
+	}
+	// The planner's merged schema and the two operator schemas are computed
+	// independently — `o.Schema()` is `NestedLoopIndexJoin.schema`, built by
+	// createPlan, while `cols` is sized from what the child OPERATORS report —
+	// and nothing has ever checked they agree. The index arm simply never
+	// violated it, so the invariant was never written down.
+	//
+	// When they disagree, `Get(i)` reads `cols[i]` and lands on a source slot
+	// whose row was never filled for that side, surfacing as
+	// "index out of range [N] with length 0" from deep inside expression
+	// evaluation — a stack that names neither the join nor the mismatch. This
+	// turns that into a named error at the point the contract breaks. Found
+	// while wiring a bitmap heap scan in as an inner (docs/design/not_ralph/
+	// pg-plan-parity, TODO gap B).
+	//
+	// The invariant is CONDITIONAL, and writing it down was worth the exercise:
+	// a SEMI or ANTI join publishes the OUTER's schema alone — its inner "is
+	// consumed only for matching, never projected" (nl_index_join.go) — so
+	// `cols` is deliberately longer than the schema there and the surplus
+	// entries are never addressed.
+	want := o.outerWidth + o.innerWidth
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
+		want = o.outerWidth
+	}
+	if got := len(o.Schema()); got != want {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(),
+			Message: fmt.Sprintf("NestedLoopIndexJoin(%v) schema has %d columns but its children report %d (outer %d + inner %d); the planner's schema and the operators' disagree",
+				o.plan.Type, got, want, o.outerWidth, o.innerWidth)}
 	}
 	o.virtualOut = NewVirtualSlot(o.Schema(), []TupleSlot{o.outerMS, o.innerMS}, cols)
 	o.outerOnly = SlotFromRow(o.Schema(), nil)

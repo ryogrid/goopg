@@ -61,8 +61,8 @@ func TestPartialIndexNotChosenForUnprovenQual(t *testing.T) {
 	// loop, so it needs the guard independently — a unit test on one path
 	// proves nothing about the other.
 	innerToOuter := map[string]Expr{"unique1": &ColumnRef{Name: "x"}}
-	if got, _ := pickIndexCoveringAllLeadingColumns(cat, tbl, innerToOuter); got != nil {
-		t.Fatalf("pickIndexCoveringAllLeadingColumns returned partial index %q; "+
+	if got, _ := pickIndexCoveringLeadingPrefix(cat, tbl, innerToOuter); got != nil {
+		t.Fatalf("pickIndexCoveringLeadingPrefix returned partial index %q; "+
 			"same rule applies on the parameterized path", got.Name)
 	}
 }
@@ -91,8 +91,8 @@ func TestNonPartialIndexStillChosen(t *testing.T) {
 	}
 
 	innerToOuter := map[string]Expr{"unique1": &ColumnRef{Name: "x"}}
-	if idx, _ := pickIndexCoveringAllLeadingColumns(cat, tbl, innerToOuter); idx == nil {
-		t.Fatal("pickIndexCoveringAllLeadingColumns declined a plain (non-partial) index")
+	if idx, _ := pickIndexCoveringLeadingPrefix(cat, tbl, innerToOuter); idx == nil {
+		t.Fatal("pickIndexCoveringLeadingPrefix declined a plain (non-partial) index")
 	}
 }
 

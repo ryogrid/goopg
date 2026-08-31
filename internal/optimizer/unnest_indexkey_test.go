@@ -604,9 +604,9 @@ func TestIndexKeyCompositeCorrelationDecorrelatesKeepingBothPairs(t *testing.T) 
 	if nli == nil {
 		t.Fatalf("neither a semi/anti Join nor NLI found despite hasAnySemiOrAnti")
 	}
-	if len(nli.Inner.Keys) < 2 && nli.Predicate == nil {
+	if len(nliProbeKeys(nli.Inner)) < 2 && nli.Predicate == nil {
 		t.Fatalf("second equijoin pair vanished: NLI probe has %d key(s) and no residual predicate",
-			len(nli.Inner.Keys))
+			len(nliProbeKeys(nli.Inner)))
 	}
 }
 

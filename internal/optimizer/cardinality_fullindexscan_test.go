@@ -19,9 +19,18 @@ package optimizer
 // (`analysis/leftdeep-joins/2026-08-05-p59run3-audit-on.plans.txt`).
 //
 // Both halves are asserted, because only together do they say anything: the
-// full-scan arm returns the relation (the fix) AND the probe arm still returns
-// 1 (the blast radius — every index scan the flag-off planner emits binds an
-// Index Cond, so none of them may move).
+// full-scan arm returns the relation (the original fix) AND the bound arms
+// return what their selectivity says.
+//
+// UPDATED by pg-plan-parity item 0. This test used to assert that EVERY bound
+// shape returns 1 — described here as "the blast radius … none of them may
+// move". That guard was itself the defect: a flat 1 is right only for a UNIQUE
+// index fully bound by equality, and on a non-unique index it was wrong by
+// orders of magnitude (goopg 1 vs PG 378 rows for `s_nationkey = 5` over
+// 10 000 rows). Because EstimateRows also sizes hash tables and picks join
+// algorithms, that constant is the one underneath both the "bitmap never wins"
+// and "nested loop 1 vs 25" plan gaps. The unique-equality case below still
+// asserts 1; the others now assert selectivity × reltuples.
 
 import (
 	"testing"
@@ -32,6 +41,7 @@ import (
 func TestEstimateRowsFullIndexScan(t *testing.T) {
 	tbl := statsTable("orders", 1500000, 1500000)
 	col := &ColumnRef{Name: "c"}
+	uniqueIdx := &catalog.Index{Name: "orders_pk", Columns: []string{"c"}, Unique: true}
 
 	cases := []struct {
 		name string
@@ -45,12 +55,22 @@ func TestEstimateRowsFullIndexScan(t *testing.T) {
 		// the flag OFF, so the arm is not search-only.
 		{"IndexOnlyScan/full", &IndexOnlyScan{Table: tbl}, 1500000},
 
-		// Every shape that binds the index keeps the probe convention.
-		{"IndexScan/key", &IndexScan{Table: tbl, Key: col}, 1},
-		{"IndexScan/keys", &IndexScan{Table: tbl, Keys: []Expr{col}}, 1},
-		{"IndexScan/lowKey", &IndexScan{Table: tbl, LowKey: col}, 1},
-		{"IndexScan/highKey", &IndexScan{Table: tbl, HighKey: col}, 1},
-		{"IndexOnlyScan/key", &IndexOnlyScan{Table: tbl, Key: col}, 1},
+		// A UNIQUE index with every column bound by equality is the one
+		// shape the old flat-1 convention was really right about, and it
+		// keeps that answer. This is the PK probe, i.e. most of them.
+		{"IndexScan/unique/key", &IndexScan{Table: tbl, Index: uniqueIdx, Key: col}, 1},
+
+		// Every OTHER bound shape is now selectivity × reltuples, not 1
+		// (pg-plan-parity item 0). These nodes carry no Index, so there are
+		// no column statistics to consult and the per-column equality
+		// selectivity falls back to PG's DEFAULT_NUM_DISTINCT = 200:
+		// 1 500 000 / 200 = 7 500.
+		{"IndexScan/key", &IndexScan{Table: tbl, Key: col}, 7500},
+		{"IndexScan/keys", &IndexScan{Table: tbl, Keys: []Expr{col}}, 7500},
+		{"IndexOnlyScan/key", &IndexOnlyScan{Table: tbl, Key: col}, 7500},
+		// One inequality bound is PG's DEFAULT_INEQ_SEL = 1/3.
+		{"IndexScan/lowKey", &IndexScan{Table: tbl, LowKey: col}, 500000},
+		{"IndexScan/highKey", &IndexScan{Table: tbl, HighKey: col}, 500000},
 
 		// No ANALYZE: 1, not 0. Zero means "no estimate available" to
 		// every caller and would zero every node above this one — the

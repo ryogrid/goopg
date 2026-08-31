@@ -134,11 +134,11 @@ func TestCreateNestLoopPlanNLIProbeKeyIsInOUTERCoordinates(t *testing.T) {
 	if !ok {
 		t.Fatalf("createPlan(parameterised PathNestLoop) = %T, want *NestedLoopIndexJoin", n)
 	}
-	if len(nli.Inner.Keys) != 2 || nli.Inner.Key != nil {
-		t.Fatalf("a two-column probe must use Keys, not Key: Key=%v Keys=%v", nli.Inner.Key, nli.Inner.Keys)
+	if len(nliIn(nli.Inner).Keys) != 2 || nliIn(nli.Inner).Key != nil {
+		t.Fatalf("a two-column probe must use Keys, not Key: Key=%v Keys=%v", nliIn(nli.Inner).Key, nliIn(nli.Inner).Keys)
 	}
 	outerWidth := len(nli.Outer.Output())
-	for i, k := range nli.Inner.Keys {
+	for i, k := range nliIn(nli.Inner).Keys {
 		cr, isCol := k.(*ColumnRef)
 		if !isCol {
 			t.Fatalf("probe key %d = %T, want *ColumnRef", i, k)
@@ -148,10 +148,10 @@ func TestCreateNestLoopPlanNLIProbeKeyIsInOUTERCoordinates(t *testing.T) {
 				i, cr.Index, outerWidth)
 		}
 	}
-	if got := nli.Inner.Keys[0].(*ColumnRef).Index; got != 1 {
+	if got := nliIn(nli.Inner).Keys[0].(*ColumnRef).Index; got != 1 {
 		t.Errorf("probe key 0 = col(%d), want col(1) (binding 3 = b1, outer position 1)", got)
 	}
-	if got := nli.Inner.Keys[1].(*ColumnRef).Index; got != 2 {
+	if got := nliIn(nli.Inner).Keys[1].(*ColumnRef).Index; got != 2 {
 		t.Errorf("probe key 1 = col(%d), want col(2) (binding 4 = b2, outer position 2)", got)
 	}
 	// The path's own clause expressions belong to the search and must survive.
@@ -197,44 +197,103 @@ func TestCreateNestLoopPlanNLIResidualIsInMERGEDCoordinates(t *testing.T) {
 		t.Errorf("residual right = col(%d), want col(0) (binding 2 = b0, merged position 0)", got)
 	}
 	// A single-column probe uses `Key`, the shape every pre-existing caller emits.
-	if nli.Inner.Key == nil || len(nli.Inner.Keys) != 0 {
-		t.Fatalf("a one-column probe must use Key, not Keys: Key=%v Keys=%v", nli.Inner.Key, nli.Inner.Keys)
+	if nliIn(nli.Inner).Key == nil || len(nliIn(nli.Inner).Keys) != 0 {
+		t.Fatalf("a one-column probe must use Key, not Keys: Key=%v Keys=%v", nliIn(nli.Inner).Key, nliIn(nli.Inner).Keys)
 	}
-	if got := nli.Inner.Key.(*ColumnRef).Index; got != 1 {
+	if got := nliIn(nli.Inner).Key.(*ColumnRef).Index; got != 1 {
 		t.Errorf("probe key = col(%d), want col(1) (binding 3 = b1, outer position 1)", got)
 	}
 }
 
-// TestScanLeafIsBareGatesTheNLIInner pins the producer/consumer agreement
-// (rule #2): the leaf shapes `addParameterizedIndexPaths` will cost a path over
-// are exactly the ones whose emitted node can BE a `NestedLoopIndexJoin.Inner`.
-func TestScanLeafIsBareGatesTheNLIInner(t *testing.T) {
+// TestLeafCondGatesTheNLIInner pins the producer/consumer agreement (rule #2):
+// the leaf shapes `addParameterizedIndexPaths` will cost a path over are exactly
+// the ones whose emitted node can BE a `NestedLoopIndexJoin.Inner`.
+//
+// The rule USED to be `scanLeafIsBare` — no wrappers at all — and an earlier
+// version of this test asserted that a wrapped leaf must panic. That assertion
+// was pinning the limitation, not the invariant: `NestedLoopIndexJoin.Inner` is
+// typed `*IndexScan`, and once `IndexScan.Cond` existed the quals had somewhere
+// to go. What has to stay true is narrower and is about COORDINATES: `Cond` is
+// evaluated against the scan's own row, so a leaf-local wrapper can be absorbed
+// and a non-leaf-local one — whose ColumnRefs address some join's merged row —
+// must still be refused, because evaluating it here would read the wrong
+// columns and return wrong rows rather than fail.
+func TestLeafCondGatesTheNLIInner(t *testing.T) {
 	bare := &SeqScan{Table: &catalog.Table{Name: "t"}, schema: cpjSchema("t", 2)}
-	if !scanLeafIsBare(bare) {
-		t.Fatal("a bare scan is a rebuildable NLI inner")
+	if _, cond, ok := absorbableLeafCond(bare); !ok || cond != nil {
+		t.Fatalf("a bare scan is absorbable with no cond; got ok=%v cond=%v", ok, cond)
 	}
 	wrapped := &Filter{Child: bare, Predicate: col(0), LeafLocal: true}
-	if scanLeafIsBare(wrapped) {
-		t.Fatal("a leaf behind a *Filter has quals NestedLoopIndexJoin.Inner cannot carry")
+	base, cond, ok := absorbableLeafCond(wrapped)
+	if !ok || cond == nil {
+		t.Fatalf("a leaf-local wrapper is absorbable; got ok=%v cond=%v", ok, cond)
 	}
-	if scanLeafIsBare(&Limit{}) {
-		t.Fatal("a non-scan leaf is not bare, it is not a leaf at all")
+	if base != Node(bare) {
+		t.Errorf("absorbing must peel to the base scan; got %T", base)
 	}
-	// And the consumer refuses the shape the producer now declines, rather than
-	// dropping the quals.
+	if _, _, ok := absorbableLeafCond(&Filter{Child: bare, Predicate: col(0)}); ok {
+		t.Fatal("a NON-leaf-local wrapper must be refused: its ColumnRefs are in merged coordinates")
+	}
+	if _, _, ok := absorbableLeafCond(&Filter{Child: bare, LeafLocal: true}); ok {
+		t.Fatal("a wrapper with a nil predicate is not a shape to absorb")
+	}
+
+	// Two wrappers conjoin rather than the outer one winning — a dropped
+	// conjunct is a wrong answer, not a slow plan.
+	two := &Filter{Child: wrapped, Predicate: col(1), LeafLocal: true}
+	if _, cond, ok := absorbableLeafCond(two); !ok || cond == nil {
+		t.Fatalf("stacked leaf-local wrappers are absorbable; got ok=%v", ok)
+	} else if _, isAnd := cond.(*BinaryOp); !isAnd {
+		t.Errorf("two wrappers must conjoin into a BinaryOp; got %T", cond)
+	}
+
+	// And the consumer now ABSORBS the shape it used to refuse: the quals land
+	// on the probe's own Cond, where they are evaluated once per row the probe
+	// returns — not hoisted to the join residual, which would re-evaluate them
+	// once per probed pair (the D6.3b blowup).
 	a, b := cpjTwoRel()
 	a.baseLeaf = &Filter{Child: a.baseLeaf, Predicate: col(0), LeafLocal: true}
 	inner := cpnParamIndexPath(a, cpiIndex("a0"), b.Relids, 3)
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("no panic; a wrapped inner leaf must be refused")
-		}
-		if msg, _ := r.(string); !strings.Contains(msg, "wrappers have nowhere to go") {
-			t.Fatalf("panic = %v, want the wrapped-leaf refusal", r)
-		}
-	}()
-	createPlanNode(cpnNestLoopPath(cpjLeafPath(b), inner, nil))
+	node, _ := createPlanNode(cpnNestLoopPath(cpjLeafPath(b), inner, nil))
+	nli, isNLI := node.(*NestedLoopIndexJoin)
+	if !isNLI {
+		t.Fatalf("plan = %T, want *NestedLoopIndexJoin", node)
+	}
+	if nli.Inner == nil || nliIn(nli.Inner).Cond == nil {
+		t.Fatal("the leaf's local qual must be absorbed into IndexScan.Cond, not dropped")
+	}
+	if nli.Predicate != nil {
+		t.Errorf("the absorbed qual must NOT appear as a join residual; Predicate = %v", nli.Predicate)
+	}
+}
+
+// nliIn narrows a NestedLoopIndexJoin's inner to the plain index probe these
+// tests construct. `Inner` is typed `Node` since it may also hold an
+// `*IndexOnlyScan`; every test in this package builds the *IndexScan form, so
+// they assert the probe fields through here rather than each type-asserting.
+// A nil return means the inner was some other kind, which fails the caller's
+// next assertion with its own message.
+func nliIn(n Node) *IndexScan {
+	is, _ := n.(*IndexScan)
+	return is
+}
+
+// nliProbeKeys returns an NLI inner's equality probe keys whichever probe node
+// kind it is. A semi/anti inner is promoted to an *IndexOnlyScan when nothing
+// reads its columns (indexOnlyNLIInner), so a test that asserts on the PROBE
+// must not also pin the node TYPE — the probe is the invariant, the node kind
+// is an optimisation.
+func nliProbeKeys(n Node) []Expr {
+	_, key, keys, ok := nliInnerProbe(n)
+	switch {
+	case !ok:
+		return nil
+	case len(keys) > 0:
+		return keys
+	case key != nil:
+		return []Expr{key}
+	}
+	return nil
 }
 
 func TestCreateNestLoopPlanPanics(t *testing.T) {

@@ -162,6 +162,14 @@ type searchCtx struct {
 	// "no special joins" — a simple inner-join-only FROM clause — which is
 	// the fast path equivalent of an empty list. M0128-P1.2.
 	joinInfoList []*SpecialJoinInfo
+
+	// neededCols / neededColsKnown are PG's `reltarget` + `attr_needed` for
+	// this statement, by COLUMN NAME — see pathindexonlyneed.go for the
+	// direction of the approximation. `neededColsKnown == false` means
+	// "assume every column is needed", which is what the pre-index-only
+	// planner assumed unconditionally. Consumed by `addIndexOnlyPaths`.
+	neededCols      map[string]bool
+	neededColsKnown bool
 }
 
 // newSearchCtx allocates the level lists for an nrels-relation join problem.

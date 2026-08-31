@@ -55,6 +55,17 @@ func TestAddOneBitmapPath_ReturnsTrueForValidIndex(t *testing.T) {
 	_, tbl, idx := testCatWithIdx(t)
 	s := testSearchForBitmap(t, tbl)
 	rel := s.levelRels(1)[0]
+	// PG builds a bitmap path only FROM index clauses (`get_index_paths`
+	// collects what `build_index_paths` made from the clause set), so the
+	// leaf must carry an equality on the indexed column — a clause-less
+	// full-table bitmap is a shape PG never generates and goopg now
+	// declines. TestBuildOneBitmapPath_DeclinesWithoutQuals pins the
+	// refusal side.
+	rel.baseLeaf = &Filter{
+		Child:     rel.baseLeaf,
+		Predicate: &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: 0}, Right: &IntegerConst{Value: 5}},
+		LeafLocal: true,
+	}
 	relTuples := float64(s.relInfos[0].baseRows)
 	relPages := baseRelPages(tbl, relTuples)
 	T := float64(relPages)
@@ -256,6 +267,18 @@ func TestChooseBitmapAnd_TwoIndexes(t *testing.T) {
 	}
 	maxEntries := bitmapMaxEntries(s.cp.workMem)
 
+	// Each index must have a matching equality conjunct on the leaf, or the
+	// producer declines it (PG's build-from-clauses rule): a BitmapAnd is an
+	// intersection of two QUAL-driven bitmaps, never of two full scans.
+	rel.baseLeaf = &Filter{
+		Child: rel.baseLeaf,
+		Predicate: &BinaryOp{Op: parser.OpAnd,
+			Left:  &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: 0}, Right: &IntegerConst{Value: 5}},
+			Right: &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: 1}, Right: &IntegerConst{Value: 7}},
+		},
+		LeafLocal: true,
+	}
+
 	// Verify buildOneBitmapPath returns valid paths for both indexes.
 	p1 := s.buildOneBitmapPath(rel, tbl, idx1, relPages, relTuples, T, s.totalTablePages(), maxEntries, rel.baseLeaf)
 	if p1 == nil {
@@ -275,6 +298,28 @@ func TestChooseBitmapAnd_TwoIndexes(t *testing.T) {
 
 	// Verify the full pipeline doesn't panic.
 	s.addBaseRelBitmapPaths(cat)
+}
+
+// TestBuildOneBitmapPath_DeclinesWithoutQuals pins the generation gate: a
+// bare leaf matches no index clause, and PG never builds a bitmap path
+// except FROM clauses (indxpath.c, get_index_paths -> bitindexpaths). The
+// cost model is not the guard here — a clause-less full-table bitmap
+// under-prices the seq scan (no qual-eval CPU on the bitmap side) and 13
+// of 21 TPC-H plans flipped to it the day the index-side double charge
+// was removed.
+func TestBuildOneBitmapPath_DeclinesWithoutQuals(t *testing.T) {
+	_, tbl, idx := testCatWithIdx(t)
+	s := testSearchForBitmap(t, tbl)
+	rel := s.levelRels(1)[0]
+	relTuples := float64(s.relInfos[0].baseRows)
+	relPages := baseRelPages(tbl, relTuples)
+	T := float64(relPages)
+	if T < 1 {
+		T = 1
+	}
+	if p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, s.totalTablePages(), bitmapMaxEntries(s.cp.workMem), rel.baseLeaf); p != nil {
+		t.Fatalf("a leaf with no index quals produced a bitmap path (rows=%.0f); PG only builds bitmaps from clauses", p.Rows)
+	}
 }
 
 func TestBuildOneBitmapPath_QualPushdown(t *testing.T) {

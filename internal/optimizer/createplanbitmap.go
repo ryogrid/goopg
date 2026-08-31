@@ -99,7 +99,26 @@ func createBitmapIndexScanPlan(p *Path) Node {
 		Pred:   pred,
 		schema: id.schema,
 	}
-	return rewrap(bis)
+	// Returned BARE: the leaf's `*Filter` wrappers must NOT be rebuilt here.
+	//
+	// `BitmapHeapScan.Outer` is required to be a bitmap PRODUCER — the executor
+	// asserts `outerOp.(bitmapProducer)` — and a `*Filter` is not one. Rewrapping
+	// therefore produced `Filter{BitmapIndexScan}` as the Outer and failed at
+	// execution with "BitmapHeapScan outer is not a bitmap producer", for every
+	// bitmap path over a FILTERED leaf. It was latent only because bitmap paths
+	// never won on cost; the moment they did, nine TPC-H queries failed.
+	//
+	// It is also what PG does. A `Bitmap Index Scan` node carries `Index Cond:`
+	// and nothing else; the relation's other quals appear as `Filter:` on the
+	// `Bitmap Heap Scan` above it. `createBitmapHeapScanPlan` rewraps there,
+	// which is where the leaf's wrappers belong and where they already go.
+	//
+	// `rewrap` is deliberately still taken from `scanLeafFor` above rather than
+	// dropped from the call: the identity it returns alongside is what supplies
+	// pos/table/alias/schema, and a future edit that needs the wrappers should
+	// find them here rather than re-derive them.
+	_ = rewrap
+	return bis
 }
 
 // bitmapQualExprs extracts the bitmap qual expression list from a bitmap

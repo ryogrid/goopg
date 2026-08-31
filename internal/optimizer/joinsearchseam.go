@@ -180,7 +180,13 @@ func tryJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalo
 // `node`/`pred` come back untouched — which is 03 §4.2's rule that a failed
 // search falls back to the syntactic shape rather than failing the statement.
 func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) (out Node, residual Expr, used bool) {
-	if !pgShapedDPEnabled() || node == nil || pred == nil || ctx == nil {
+	// `pred == nil` is NOT a decline (M0134-0188): a FROM tree with no WHERE
+	// still deserves the search — its access methods are chosen there, and
+	// TPC-H Q13's `customer LEFT JOIN orders` subquery is precisely a
+	// filterless statement whose customer scan must become PG's
+	// `Index Only Scan using customer_pk`. `splitAnd(nil)` is an empty
+	// conjunct list and every consumer below already handles it.
+	if !pgShapedDPEnabled() || node == nil || ctx == nil {
 		return node, pred, false
 	}
 	nrels := len(ctx.bindings)
@@ -206,8 +212,15 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// touching one is declined by the clause producer and survives in the
 	// residual `Filter` above the spine.
 	nprefix := jl.nrels()
-	if nprefix < 2 {
-		// `a LEFT JOIN b` has a one-relation prefix; there is no order to search.
+	if nprefix < 2 && len(spine) == 0 {
+		// One relation and no spine is not a search — the single-table paths
+		// own that statement. UNDER a spine a one-relation prefix is still
+		// worth planning (M0134-0188): there is no order to choose, but there
+		// IS an access method — base-rel path generation runs, `add_path`
+		// picks among seq / index / index-only, and the boundary republishes
+		// binding order exactly as for a wider prefix. `a LEFT JOIN b`'s left
+		// side is the one place PG chooses a covering scan that no other
+		// goopg seam could reach (TPC-H Q13).
 		traceSeamDecline("prefix-size", nrels, nprefix)
 		return node, pred, false
 	}
@@ -327,6 +340,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// node does not exist yet at this point in `planSelect` (see
 		// `searchTupleFraction`).
 		tupleFraction: ctx.tupleFraction,
+		// The statement's needed-column set (pathindexonlyneed.go), computed
+		// once in `planSelect` — the only frame holding the
+		// *parser.SelectStmt; the search boundary sees resolved nodes only.
+		neededCols:      ctx.neededCols,
+		neededColsKnown: ctx.neededColsKnown,
 		// joinInfoList is root->join_info_list from jointree deconstruction,
 		// consumed by join_is_legal/joinOrderRestricted/hasJoinRestriction
 		// inside the search (M0128-P1.2).

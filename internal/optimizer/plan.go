@@ -760,6 +760,27 @@ type IndexScan struct {
 	// bound (M0134-0001 S4 class 8) so the redundant Filter can be dropped.
 	LowOp  parser.OpCode
 	HighOp parser.OpCode
+	// Cond is a residual filter evaluated per HEAP TUPLE the probe returns —
+	// PostgreSQL's `Filter:` line on an Index Scan node, which sits alongside
+	// `Index Cond:` rather than in a separate node. Its ColumnRefs are in the
+	// scan's OWN output coordinates (leaf-local), the same space
+	// `IndexOnlyScan.Cond` uses. Nil means no residual filtering.
+	//
+	// It exists so a relation's local quals have somewhere to live INSIDE the
+	// node when the scan is a `NestedLoopIndexJoin.Inner` — that field is typed
+	// `*IndexScan` and cannot carry the `*Filter` wrappers the quals otherwise
+	// sit in, which is what used to make `addParameterizedIndexPaths` decline
+	// every filtered leaf (`scanLeafIsBare`). The alternative it replaces is the
+	// D6.3b Q9 blowup: hoisting the quals onto the join residual re-evaluates,
+	// once per probed PAIR, a clause the path was costed as applying once per
+	// inner row. Here it is applied once per index match, which is the costed
+	// semantics.
+	//
+	// Only the NLI arm sets it. On a plain (unparameterised) index path the
+	// leaf's `*Filter` wrappers are rebuilt above the scan by `scanLeafFor`'s
+	// rewrapper as before, and Cond stays nil — one predicate evaluated in one
+	// place either way, never both.
+	Cond   Expr
 	schema Schema
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
 	// same name. M0122-0008 (view-owner privilege gap).
@@ -798,7 +819,19 @@ type NestedLoopIndexJoin struct {
 	pos       int
 	Type      JoinType
 	Outer     Node
-	Inner     *IndexScan
+	// Inner is the parameterised probe this join re-executes per outer row.
+	//
+	// Typed `Node` rather than `*IndexScan` so an `*IndexOnlyScan` can sit here
+	// too — PG's Q13/Q16/Q22 all put one on the inner side, and for a SEMI or
+	// ANTI join it is provably safe to narrow because the join's schema is the
+	// OUTER's alone (see the schema construction in nl_index_join.go: "the inner
+	// side is consumed only for matching, never projected").
+	//
+	// The set of concrete types is CLOSED and is enumerated by
+	// `nliInnerProbe` — everything that needs the probe's index or keys goes
+	// through it rather than type-asserting locally, so adding a third inner
+	// kind is one edit and not a hunt.
+	Inner     Node
 	Predicate Expr // residual filter applied per joined row
 	schema    Schema
 
@@ -811,6 +844,36 @@ type NestedLoopIndexJoin struct {
 	// insertion gate requires ANALYZE stats, which are in-memory and
 	// restart-lost).
 	InnerMemo *Memoize
+}
+
+// nliInnerProbe reads the probe fields shared by every legal
+// `NestedLoopIndexJoin.Inner`. ok=false means the node is not a probe shape at
+// all, which every caller treats as "decline", never as an error.
+//
+// This exists so the Inner field can be widened without scattering type
+// assertions: the switch below is the ONE place that enumerates which node
+// kinds may be an inner.
+func nliInnerProbe(n Node) (idx *catalog.Index, key Expr, keys []Expr, ok bool) {
+	switch x := n.(type) {
+	case *IndexScan:
+		return x.Index, x.Key, x.Keys, true
+	case *IndexOnlyScan:
+		return x.Index, x.Key, x.Keys, true
+	case *BitmapHeapScan:
+		// A keyed bitmap probe is a legal NLI inner: `bitmapHeapScanOp`
+		// implements the full `nliInner` interface (BindOuter forwards to the
+		// producer, Rescan drops the stale TID set). The probe keys live one
+		// node down, on the single `*BitmapIndexScan` producer — an And/Or
+		// tree carries several probes and is not a single-key inner, so it
+		// stays illegal. Without this arm, `clonePlanReplacingOuter`'s NLI
+		// guard declined any subplan whose probe planned as a bitmap and the
+		// scalar silently stayed a per-row SubPlan (M0134-0186; TPC-H q02's
+		// decorrelation, 588 calls at ~150k rows each).
+		if bis, ok := x.Outer.(*BitmapIndexScan); ok {
+			return bis.Index, bis.Key, bis.Keys, true
+		}
+	}
+	return nil, nil, nil, false
 }
 
 func (n *NestedLoopIndexJoin) Pos() int       { return n.pos }
@@ -2538,7 +2601,25 @@ type BitmapHeapScan struct {
 	// the bitmap entry is lossy or the index AM requires recheck.
 	BitmapQual []Expr
 	// Outer is the bitmap-producing subtree (BitmapIndexScan / BitmapAnd / BitmapOr).
-	Outer  Node
+	Outer Node
+	// Cond is a residual filter evaluated per heap tuple — PostgreSQL's
+	// `Filter:` line on a Bitmap Heap Scan, which sits alongside
+	// `Recheck Cond:` rather than in a separate node. ColumnRefs are in the
+	// scan's OWN output coordinates (leaf-local), the same space
+	// `IndexScan.Cond` uses. Nil means no residual filtering.
+	//
+	// It exists for the same reason `IndexScan.Cond` does: a relation's local
+	// quals need somewhere to live INSIDE the node when the scan is a
+	// `NestedLoopIndexJoin` inner, because the join re-probes it per outer row
+	// and cannot carry the `*Filter` wrappers the quals otherwise sit in. Until
+	// this field existed, `addParameterizedBitmapPaths` declined every FILTERED
+	// relation — which is four of PG's six TPC-H bitmap scans (Q2, Q11, Q20,
+	// Q21), all of which have filtered leaves.
+	//
+	// Distinct from `BitmapQual`: that is the RECHECK list, re-evaluated only
+	// when a bitmap entry is lossy or the AM demands it. `Cond` is evaluated on
+	// every tuple, lossy or not.
+	Cond   Expr
 	schema Schema
 	// Parallel mirrors PostgreSQL's Plan.parallel_aware: true when this scan
 	// was chosen as the worker-read driving scan under a Gather/GatherMerge

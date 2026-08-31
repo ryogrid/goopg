@@ -138,6 +138,21 @@ func (s *searchCtx) buildOneBitmapPath(
 	conjuncts := extractFilterConjuncts(leaf)
 	indexClauses, qualSelectivity := matchBitmapIndexQuals(idx, tbl, conjuncts, id)
 
+	// PG builds a bitmap path only FROM index clauses: `get_index_paths`
+	// (indxpath.c) collects into `bitindexpaths` the paths `build_index_paths`
+	// made from the clause set (or a proven partial-index predicate), and a
+	// clause-less full-table bitmap is never generated at all. goopg used to
+	// build one for every index and rely on the cost model to reject it —
+	// "they lose to seq scan in add_path" — which held only while
+	// `costBitmapHeapScan` double-charged the index side. The moment that
+	// oracle-verified duplicate was removed, full-table bitmaps beat the seq
+	// scan on every table with a non-trivial filter (the bitmap side pays no
+	// qual-eval CPU) and 13 of 21 TPC-H plans flipped to a shape PG cannot
+	// produce. Generation, not costing, is PG's guard — so it is goopg's too.
+	if len(indexClauses) == 0 && partialPredicate == nil {
+		return nil
+	}
+
 	// Index geometry — same as the regular index scan cost model.
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
 
@@ -419,5 +434,140 @@ func (s *searchCtx) chooseBitmapAnd(
 		Rows:     rel.Rows,
 		Cost:     totalCost,
 		Children: []*Path{bitmapAndPath},
+	}
+}
+
+func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
+	if s == nil || cat == nil || s.clauses == nil || len(s.clauses.all) == 0 {
+		return
+	}
+	totalPages := s.totalTablePages()
+	for i, rel := range s.levelRels(1) {
+		if i >= len(s.relInfos) {
+			break
+		}
+		tbl := s.relInfos[i].table
+		if tbl == nil {
+			continue
+		}
+		if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
+			continue
+		}
+		// The leaf's local quals ride inside the node on `BitmapHeapScan.Cond`
+		// (plan.go), exactly as they do on `IndexScan.Cond` since 80a5e334d.
+		// This used to be `scanLeafIsBare`, which declined every FILTERED
+		// relation — four of PG's six TPC-H bitmap scans (Q2, Q11, Q20, Q21).
+		// A leaf whose wrappers are not leaf-local is still declined; see
+		// `absorbableLeafCond` for why that is a coordinates question.
+		if _, _, ok := absorbableLeafCond(rel.baseLeaf); !ok {
+			continue
+		}
+		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)
+		if len(cands) == 0 {
+			continue
+		}
+		relTuples := float64(s.relInfos[i].baseRows)
+		if relTuples < 1 {
+			relTuples = rel.Rows
+		}
+		if relTuples < 1 {
+			relTuples = 1
+		}
+		relPages := baseRelPages(tbl, relTuples)
+		T := float64(relPages)
+		if T < 1 {
+			T = 1
+		}
+		maxEntries := bitmapMaxEntries(s.cp.workMem)
+		added := false
+		for _, req := range consideredParameterizations(cands) {
+			for _, idx := range cat.IndexesOnTable(tbl) {
+				if pth := s.buildOneParameterizedBitmapPath(rel, tbl, idx, cands, req,
+					relPages, relTuples, T, totalPages, maxEntries); pth != nil {
+					addPath(rel, pth)
+					added = true
+				}
+			}
+		}
+		if added {
+			setCheapest(rel)
+		}
+	}
+}
+
+func (s *searchCtx) buildOneParameterizedBitmapPath(
+	rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
+	cands []paramIndexClause, req RelSet,
+	relPages int64, relTuples, T, totalPages float64, maxEntries int,
+) *Path {
+	if idx == nil || idx.HasPredicate {
+		return nil
+	}
+	bound := make(map[string]paramIndexClause, len(cands))
+	for _, c := range cands {
+		if !relsSubset(c.outerRels, req) {
+			continue
+		}
+		if _, dup := bound[c.innerCol]; dup {
+			continue
+		}
+		bound[c.innerCol] = c
+	}
+	var clauses []indexPathClause
+	sel := 1.0
+	for pos, colName := range idx.Columns {
+		c, ok := bound[colName]
+		if !ok {
+			break
+		}
+		// `ri` carried for the SAME reason `indexPathClauses` carries it
+		// (pathindexclauses.go): `probeEnforcedClauses` identifies a clause the
+		// probe already applies BY its restrictInfo, and `create_nestloop_path`
+		// drops such clauses from the join residual (pathnode.c:2478). Without
+		// it the bitmap inner's own join clause was re-charged by
+		// `qualEvalCost` as a residual — ~5.0 on TPC-H Q2's supplier probe,
+		// enough to flip a 5-loop near-tie to the index inner. The index
+		// producer's list has carried `ri` since P5.5-b; this one silently did
+		// not (rule #2: sibling paths must agree).
+		clauses = append(clauses, indexPathClause{ri: c.ri, indexCol: pos, key: c.outerKey})
+		sel *= varEqNonConstSelectivity(columnStatsByName(tbl, colName), relTuples)
+	}
+	if len(clauses) == 0 {
+		return nil
+	}
+	sel = clampSelectivity(sel)
+	tuplesFetched := clampRowEst(sel * relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	idxCost := costBitmapIndexScan(s.cp, indexScanInputs{
+		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
+		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
+		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)), totalTablePages: totalPages,
+	})
+	// `get_loop_count` (indxpath.c:2328): the smallest row count among the
+	// relations supplying the parameter. The path cost stays per-execution — PG
+	// pro-rates inside `compute_bitmap_pages` — so the join above still
+	// multiplies by the outer row count without double-counting.
+	pagesFetched := computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalPages,
+		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(req))
+	return &Path{
+		Kind: PathBitmapHeapScan, Rel: rel,
+		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
+		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T),
+		RequiredOuter: req,
+		// On the HEAP path, not only the child: `probeEnforcedClauses` and
+		// `memoizeCacheKeys` both read the INNER CANDIDATE's own list, and the
+		// candidate `addNLIPaths` iterates is this node. PG's equivalent
+		// (`is_redundant_with_indexclauses` via `bitmapqual`) reaches the same
+		// clauses by walking the child tree; goopg carries them here so "what
+		// the probe enforces" stays one list read twice. Without this the
+		// bitmap inner's own join clause was re-charged as a nestloop residual
+		// (~5.0 on Q2's supplier probe) that the sibling index path did not
+		// pay.
+		IndexClauses: clauses,
+		Children: []*Path{{
+			Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
+			BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
+			IndexClauses: clauses, RequiredOuter: req,
+		}},
 	}
 }

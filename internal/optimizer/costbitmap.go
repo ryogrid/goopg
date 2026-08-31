@@ -14,15 +14,32 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 )
 
-// costBitmapIndexScan costs a single B-tree index scan that feeds a TIDBitmap.
-// It is `cost_index` plus PG's per-tuple bitmap-manipulation charge
-// (costsize.c:1172: cpu_operator_cost * 0.1 per tuple for tbm_add_tuples).
+// costBitmapIndexScan costs a single B-tree index scan that feeds a TIDBitmap:
+// the INDEX SIDE ONLY, plus PG's per-tuple bitmap-manipulation charge.
+//
+// PG oracle, `cost_bitmap_tree_node` (costsize.c:1150):
+//
+//	*cost = ((IndexPath *) path)->indextotalcost;
+//	*cost += 0.1 * cpu_operator_cost * path->rows;
+//
+// `indextotalcost` is what `amcostestimate` returned — the index descent and
+// leaf scan. It does NOT include heap fetches, because a bitmap index scan
+// never touches the heap: it emits TIDs, and the `BitmapHeapScan` above is what
+// reads pages and is separately costed for exactly that.
+//
+// This used to call `costIndexScan`, which is the WHOLE scan — index side plus
+// the max/min heap-IO interpolation plus `cpu_tuple_cost` per heap tuple. So
+// every bitmap path paid for its heap twice: once here, invisibly, and once in
+// `costBitmapHeapScan` where it belongs. On TPC-H Q2's `supplier` probe the
+// index side is PG's 7.77 and goopg was charging ~874, which is the bulk of the
+// 1786 vs 43 gap that kept the bitmap losing.
 func costBitmapIndexScan(cp costParams, in indexScanInputs) Cost {
-	c := costIndexScan(cp, in)
+	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
 	tuplesFetched := clampRowEst(in.selectivity * in.relTuples)
-	// bitmap-manipulation overhead: 0.1 * cpu_operator_cost per tuple.
-	c.Total += 0.1 * cp.cpuOperatorCost * tuplesFetched
-	return c
+	return Cost{
+		Startup: idxStartup,
+		Total:   idxTotal + 0.1*cp.cpuOperatorCost*tuplesFetched,
+	}
 }
 
 // costBitmapHeapScan costs a complete BitmapHeapScan: index access (startup) plus
@@ -36,18 +53,35 @@ func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetch
 	// and the heap side is the run cost.
 	startup := indexCost.Total
 
-	// Per-page cost: interpolate between random_page_cost (few pages) and
-	// seq_page_cost (nearly the whole table). PG uses the square root of the
-	// ratio (costsize.c:1080-1087) — `sqrt(pages_fetched / T) * random +
-	// (1 - sqrt(...)) * seq`. The interpolation is clamped so a tiny fraction
-	// stays close to random_page_cost and a near-whole-table scan approaches
-	// seq_page_cost.
-	frac := 0.0
-	if T > 0 && pagesFetched > 0 {
-		frac = math.Sqrt(pagesFetched / T)
+	// Per-page cost, interpolating between random_page_cost (a few scattered
+	// pages) and seq_page_cost (nearly the whole table). PG, verbatim
+	// (`cost_bitmap_heap_scan`, costsize.c:1069-1075):
+	//
+	//	if (pages_fetched >= 2.0)
+	//		cost_per_page = spc_random_page_cost -
+	//			(spc_random_page_cost - spc_seq_page_cost) * sqrt(pages_fetched / T);
+	//	else
+	//		cost_per_page = spc_random_page_cost;
+	//
+	// The direction matters and this code had it BACKWARDS: it computed
+	// `sqrt*random + (1-sqrt)*seq`, which moves TOWARD random as more of the
+	// relation is touched. PG moves toward SEQUENTIAL, because a bitmap scan
+	// that visits most pages reads them in physical order — which is the entire
+	// reason the access method exists. goopg's own comment described PG's
+	// behaviour ("a near-whole-table scan approaches seq_page_cost") while the
+	// expression below it did the opposite, so the two never contradicted each
+	// other in review.
+	//
+	// Measured: TPC-H Q2's `supplier` bitmap (the scan PG picks) was priced at
+	// 2588.7 against PG's 43.46. Charging ~3x per page is most of that gap.
+	//
+	// The `pages_fetched >= 2` guard is PG's too: a single-page fetch has no
+	// sequentiality to exploit, so it stays at full random cost rather than
+	// being discounted by a ratio that is meaningless at one page.
+	pageCost := cp.randomPageCost
+	if pagesFetched >= 2.0 && T > 0 {
+		pageCost = cp.randomPageCost - (cp.randomPageCost-cp.seqPageCost)*math.Sqrt(pagesFetched/T)
 	}
-	// Clamp: the fraction is already bounded [0, 1] by sqrt of a [0, 1] ratio.
-	pageCost := frac*cp.randomPageCost + (1-frac)*cp.seqPageCost
 
 	runCost := pageCost * pagesFetched
 
@@ -55,9 +89,25 @@ func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetch
 	// (PG charges for the lossy recheck case — conservative).
 	runCost += cp.cpuTupleCost * tuplesFetched
 
-	// PG also adds indexTotalCost again into total =
-	// startup_cost + run_cost + indexTotalCost (costsize.c:1110-1113).
-	return Cost{Startup: startup, Total: startup + runCost + indexCost.Total}
+	// `cost_bitmap_heap_scan` ends (costsize.c):
+	//
+	//	path->startup_cost = startup_cost;
+	//	path->total_cost = startup_cost + run_cost;
+	//
+	// and `startup_cost` ALREADY holds `indexTotalCost` (`startup_cost +=
+	// indexTotalCost`, :33 of that function). There is no second addition.
+	//
+	// This line used to read `startup + runCost + indexCost.Total`, with a
+	// comment asserting that PG adds the index cost again. It does not — the
+	// comment was wrong about the oracle it cited, which is why the charge
+	// survived two reviews and a deliberate decision to RETAIN it (§13.4).
+	//
+	// Measured on TPC-H Q2's `supplier` probe, the node PG takes as a bitmap
+	// and goopg took as an index scan: goopg 14.35..66.42 against PG's
+	// 7.87..43.46. The run cost was already right (37.7 vs PG's 35.6) — the
+	// whole remaining gap was this duplicate, and removing it puts the bitmap
+	// under the competing index path on cost rather than by preference.
+	return Cost{Startup: startup, Total: startup + runCost}
 }
 
 // computeBitmapPages estimates how many DISTINCT heap pages a bitmap scan visits,
@@ -77,26 +127,61 @@ func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetch
 // and every tuple on those pages is fetched — matching PG's lossiness correction
 // (costsize.c:889-908).
 func computeBitmapPages(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize float64, maxEntries int) float64 {
+	return computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize, maxEntries, 1)
+}
+
+// computeBitmapPagesLooped is `compute_bitmap_pages` with PG's `loop_count`
+// (costsize.c:6514). A bitmap scan re-executed once per outer row does NOT
+// fetch `loop_count` times the pages of one execution, because the pages the
+// second scan wants are largely the ones the first already brought in — so PG
+// runs Mackert-Lohman over the tuples ALL the scans fetch and pro-rates back to
+// one:
+//
+//	pages_fetched = index_pages_fetched(tuples_fetched * loop_count, …);
+//	pages_fetched /= loop_count;
+//
+// Without this a parameterised bitmap is priced as though every one of its
+// executions re-read the relation cold, which is what kept TPC-H Q8's bitmap —
+// the shape PG chooses — losing to a plain index probe. It is the exact
+// counterpart of the `loop_count > 1` arm `cost_index` gained in 07f4f7814.
+func computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize float64, maxEntries int, loopCount float64) float64 {
 	if T <= 0 || tuplesFetched <= 0 {
 		return 0
 	}
-
-	// Mackert-Lohman page-count estimate, with cache effects when the caller
-	// supplies index geometry. Falls back to the single-term formula when no
-	// cache information is available (indexPages == 0 or effectiveCacheSize == 0).
-	var pages float64
-	if indexPages > 0 && effectiveCacheSize > 0 {
-		// Use the two/three-term formula that accounts for effective_cache_size.
-		pages = indexPagesFetched(tuplesFetched, int64(T), indexPages, totalTablePages, effectiveCacheSize)
-	} else {
-		// Single-term Mackert-Lohman (costsize.c:863): 2*T*Ns/(2*T+Ns).
-		pages = (2.0 * T * tuplesFetched) / (2.0*T + tuplesFetched)
-		if pages >= T {
-			pages = T
-		} else {
-			pages = math.Ceil(pages)
-		}
+	// PG's `compute_bitmap_pages` in its own order (costsize.c). The
+	// single-scan estimate is computed UNCONDITIONALLY and the cache-aware
+	// `index_pages_fetched` appears ONLY in the repeated-scan arm:
+	//
+	//	pages_fetched = (2.0 * T * tuples_fetched) / (2.0 * T + tuples_fetched);
+	//	heap_pages = Min(pages_fetched, baserel->pages);
+	//	if (loop_count > 1) { pages_fetched = index_pages_fetched(...); pages_fetched /= loop_count; }
+	//	if (pages_fetched >= T) pages_fetched = T; else pages_fetched = ceil(pages_fetched);
+	//
+	// goopg had that INVERTED: it used `indexPagesFetched` whenever index
+	// geometry was available and treated PG's actual formula as a fallback for
+	// when it was not. `index_pages_fetched` discounts pages the cache is
+	// assumed to already hold, so it returns FEWER pages — a systematically
+	// under-priced single-scan bitmap. That under-pricing was invisible while
+	// `costBitmapHeapScan` double-charged `indexTotalCost`, because the two
+	// errors have opposite signs and roughly cancelled; removing the duplicate
+	// on its own took the TPC-H census from 4 bitmap scans to 22 against PG's
+	// 6, which is how the second one was found.
+	//
+	// `heapPages` is deliberately taken from the SINGLE-scan value even when
+	// `loopCount > 1` — PG says why: "only that number of entries will be
+	// stored in the bitmap at one time".
+	pages := (2.0 * T * tuplesFetched) / (2.0*T + tuplesFetched)
+	heapPages := math.Min(pages, T)
+	if loopCount > 1 {
+		pages = indexPagesFetched(tuplesFetched*loopCount, int64(T), indexPages, totalTablePages, effectiveCacheSize)
+		pages /= loopCount
 	}
+	if pages >= T {
+		pages = T
+	} else {
+		pages = math.Ceil(pages)
+	}
+	_ = heapPages
 
 	// Lossiness adjustment: when the bitmap entry budget is smaller than the
 	// number of heap pages, some pages become lossy and every tuple on them

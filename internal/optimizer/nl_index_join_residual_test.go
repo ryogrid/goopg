@@ -96,9 +96,9 @@ func planNLI(t *testing.T, cat catalog.Catalog, sql string) *NestedLoopIndexJoin
 // filters every row out rather than raising an error.
 func assertResidualIndicesResolve(t *testing.T, nli *NestedLoopIndexJoin) {
 	t.Helper()
-	joined := make(Schema, 0, len(nli.Outer.Output())+len(nli.Inner.Output()))
+	joined := make(Schema, 0, len(nli.Outer.Output())+len(nliIn(nli.Inner).Output()))
 	joined = append(joined, nli.Outer.Output()...)
-	joined = append(joined, nli.Inner.Output()...)
+	joined = append(joined, nliIn(nli.Inner).Output()...)
 	visitColumnRefs(nli.Predicate, func(e Expr) {
 		cr, ok := e.(*ColumnRef)
 		if !ok || cr.Name == "" {
@@ -127,8 +127,8 @@ func TestNLIPropagatesInnerAlias(t *testing.T) {
 	useLegacyEnumerator(t)
 	cat := nliResidualFixture(t)
 	nli := planNLI(t, cat, `SELECT * FROM lineitem l, part p WHERE l.l_partkey = p.p_partkey`)
-	if nli.Inner.Alias != "p" {
-		t.Fatalf("inner IndexScan lost its alias: got %q, want %q", nli.Inner.Alias, "p")
+	if nliIn(nli.Inner).Alias != "p" {
+		t.Fatalf("inner IndexScan lost its alias: got %q, want %q", nliIn(nli.Inner).Alias, "p")
 	}
 }
 
@@ -141,12 +141,12 @@ func TestNLISelfJoinKeepsAliasesDistinct(t *testing.T) {
 	cat := nliSelfJoinFixture(t)
 	nli := planNLI(t, cat,
 		`SELECT n1.n_name, n2.n_name FROM nation n1, nation n2 WHERE n1.n_regionkey = n2.n_nationkey`)
-	if nli.Inner.Alias != "n2" {
-		t.Fatalf("self-join inner lost its alias: got %q, want %q", nli.Inner.Alias, "n2")
+	if nliIn(nli.Inner).Alias != "n2" {
+		t.Fatalf("self-join inner lost its alias: got %q, want %q", nliIn(nli.Inner).Alias, "n2")
 	}
 	// The two sides must also stay distinguishable by source identity,
 	// which is what the residual rebind relies on when the names collide.
-	outer, inner := nli.Outer.Output(), nli.Inner.Output()
+	outer, inner := nli.Outer.Output(), nliIn(nli.Inner).Output()
 	if len(outer) == 0 || len(inner) == 0 {
 		t.Fatalf("unexpected empty schema: outer=%d inner=%d", len(outer), len(inner))
 	}

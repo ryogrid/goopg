@@ -78,7 +78,7 @@ import (
 // still references. The caller holds the only copy of that number (the schema of
 // the join subtree the search replaced), so it is the caller that must state it.
 func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
-	return createPlanAtSearchRootRange(p, 0, bindingWidth)
+	return createPlanAtSearchRootRange(p, 0, bindingWidth, nil)
 }
 
 // createPlanAtSearchRootRange is `createPlanAtSearchRoot` for a search problem
@@ -98,7 +98,14 @@ func createPlanAtSearchRoot(p *Path, bindingWidth int) Node {
 // columns are exactly the pre-search concatenation restricted to its own range —
 // which is what makes it usable as a leaf of the enclosing problem with
 // `baseOffset = base` and nothing else to translate.
-func createPlanAtSearchRootRange(p *Path, base, width int) Node {
+// `fill` (M0134-0187) licenses a PADDED slot for a binding coordinate a
+// narrowed index-only leaf legitimately dropped: it answers with the pruned
+// column's SchemaColumn when — and only when — that column is provably outside
+// the statement's needed set. The boundary Project then publishes a typed NULL
+// at that position, which nothing above can read (the needed set over-states
+// by construction). A hole the filler does NOT license still panics: the
+// totality assertion stays loud for real producer bugs. nil = no padding.
+func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (SchemaColumn, bool)) Node {
 	if p == nil {
 		panic("createPlan: search root has no path")
 	}
@@ -128,8 +135,8 @@ func createPlanAtSearchRootRange(p *Path, base, width int) Node {
 	// — on the Project itself the claim is false by design (searchedtree.go
 	// explains why that is the sharpest argument for the tag).
 	assertSearchedTreeNeedsNoReconcile(n)
-	m := boundaryMap(lay, base, width)
-	if boundaryMapIsIdentity(m) {
+	m, fills := boundaryMap(lay, base, width, fill)
+	if len(fills) == 0 && boundaryMapIsIdentity(m) {
 		// The search's order already IS binding order — the common left-deep
 		// case. Emitting a Project here would be a pure copy of every row.
 		//
@@ -141,7 +148,7 @@ func createPlanAtSearchRootRange(p *Path, base, width int) Node {
 		// regardless of layout.
 		return markSearchedTree(n)
 	}
-	return markSearchedTree(projectToBindingOrder(n, m))
+	return markSearchedTree(projectToBindingOrder(n, m, fills))
 }
 
 // boundaryMap composes 03 §10's map from the search root's layout: entry `b` is
@@ -171,7 +178,7 @@ func createPlanAtSearchRootRange(p *Path, base, width int) Node {
 // statement's own search, and the sub-problem's first FROM item's offset for a
 // sub-joinlist (M0127-P5.9-a). Entry `i` of the returned map is therefore the
 // root output column holding binding coordinate `base+i`.
-func boundaryMap(lay outputLayout, base, width int) []int {
+func boundaryMap(lay outputLayout, base, width int, fill func(int) (SchemaColumn, bool)) ([]int, map[int]SchemaColumn) {
 	if len(lay) == 0 {
 		panic("createPlan: search root publishes no columns")
 	}
@@ -190,11 +197,33 @@ func boundaryMap(lay outputLayout, base, width int) []int {
 		}
 		m[bind-base] = out
 	}
+	var fills map[int]SchemaColumn
 	if missing := missingBindingCoords(m, base); len(missing) > 0 {
-		panic(fmt.Sprintf("createPlan: search root does not publish binding coordinate(s) %v; the enclosing tree references columns the searched subtree cannot supply",
-			missing))
+		// A hole is legal ONLY when the filler licenses it — a pruned
+		// index-only column that the statement provably never reads. Any
+		// other hole is still the producer bug this panic has always named.
+		var unfillable []int
+		for _, coord := range missing {
+			var col SchemaColumn
+			ok := false
+			if fill != nil {
+				col, ok = fill(coord)
+			}
+			if !ok {
+				unfillable = append(unfillable, coord)
+				continue
+			}
+			if fills == nil {
+				fills = make(map[int]SchemaColumn, len(missing))
+			}
+			fills[coord-base] = col
+		}
+		if len(unfillable) > 0 {
+			panic(fmt.Sprintf("createPlan: search root does not publish binding coordinate(s) %v; the enclosing tree references columns the searched subtree cannot supply",
+				unfillable))
+		}
 	}
-	return m
+	return m, fills
 }
 
 // missingBindingCoords lists the holes in a boundary map, for the diagnostic
@@ -237,11 +266,25 @@ func boundaryMapIsIdentity(m []int) bool {
 // disambiguation rides on (`findColumnIndexByNameAndSource`, `predRebind`):
 // dropping it here would make Q21's three `lineitem` aliases indistinguishable
 // to every pass above the search root.
-func projectToBindingOrder(child Node, m []int) Node {
+func projectToBindingOrder(child Node, m []int, fills map[int]SchemaColumn) Node {
 	in := child.Output()
 	targets := make([]Expr, len(m))
 	out := make(Schema, len(m))
 	for bind, col := range m {
+		if col < 0 {
+			// A licensed hole (M0134-0187): the coordinate belongs to a
+			// column a narrowed index-only leaf pruned, and the filler has
+			// proven the statement never reads it. The slot keeps the pruned
+			// column's name and type — every positional consumer above stays
+			// aligned — and its VALUE is a typed NULL nothing dereferences.
+			c, ok := fills[bind]
+			if !ok {
+				panic(fmt.Sprintf("createPlan: boundary hole at output %d has no licensed fill", bind))
+			}
+			targets[bind] = &NullConst{pos: child.Pos()}
+			out[bind] = c
+			continue
+		}
 		c := in[col]
 		targets[bind] = &ColumnRef{
 			pos:            child.Pos(),
@@ -387,6 +430,14 @@ func assertBoundaryProjectionIntact(p *Project) {
 	in := p.Child.Output()
 	out := p.Output()
 	for i, tg := range p.Targets {
+		// A `*NullConst` target is a LICENSED boundary hole (M0134-0187): a
+		// pruned index-only column the statement provably never reads,
+		// published as a typed NULL to keep positions aligned. It is the ONE
+		// non-ColumnRef shape `projectToBindingOrder` emits; anything else
+		// still means a pass rebuilt the map as an expression.
+		if _, isPad := tg.(*NullConst); isPad {
+			continue
+		}
 		cr, isCol := tg.(*ColumnRef)
 		if !isCol {
 			panic(fmt.Sprintf("createPlan: search-boundary projection target %d is a %T; every target of the boundary map is a pass-through ColumnRef, so a pass rebuilt the map as an expression",

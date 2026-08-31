@@ -115,7 +115,7 @@ func joinClauseIsMovableInto(ri *restrictInfo, currentRelids, currentAndOuter Re
 // somewhere below.
 //
 // goopg's parameterised index path applies only the equalities
-// `pickIndexCoveringAllLeadingColumns` accepted — `Path.IndexClauses`
+// `pickIndexCoveringLeadingPrefix` accepted — `Path.IndexClauses`
 // (pathindexclauses.go) — and goopg's `*IndexScan` has NO qual field for a
 // remainder to live in. `b.y > a.x` at inner `{b}` under parameterisation `{a}`
 // is movable by the test above and enforced by nothing at all: dropping it here

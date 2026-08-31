@@ -10984,6 +10984,15 @@ func planIsIndexScanBased(n optimizer.Node) bool {
 	switch x := n.(type) {
 	case *optimizer.IndexScan:
 		return true
+	case *optimizer.BitmapHeapScan:
+		// The planner twin (innerPlanIsIndexProbeCheap) admits the keyed
+		// single-producer bitmap for the same reason it admits IndexScan:
+		// bitmapHeapScanOp.Open rebuilds the probe from its Key against the
+		// CURRENT outer binding, so the re-Open-per-key lifecycle is exactly
+		// as safe as the index scan's. Kept in lockstep per that function's
+		// contract. M0134-0185.
+		_, ok := x.Outer.(*optimizer.BitmapIndexScan)
+		return ok
 	case *optimizer.Project:
 		return planIsIndexScanBased(x.Child)
 	case *optimizer.Aggregate:

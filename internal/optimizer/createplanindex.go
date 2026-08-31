@@ -69,6 +69,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // scanLeafRewrap rebuilds the wrappers that sat above a base relation's
@@ -196,6 +197,58 @@ func scanLeafIsBare(leaf Node) bool {
 	return rewrap(probe) == Node(probe)
 }
 
+// absorbableLeafCond peels `n`'s `*Filter` wrappers and returns their
+// predicates conjoined, for a caller that will put them on `IndexScan.Cond`
+// instead of leaving them in nodes above the scan.
+//
+// This is what replaced `scanLeafIsBare` as the NLI arm's eligibility rule.
+// The bare-leaf rule declined every filtered relation outright, which cost
+// goopg the parameterised inner on exactly the TPC-H shapes PG uses one for
+// (Q19's `lineitem` behind `l_shipmode`/`l_shipinstruct`, Q3's behind
+// `l_shipdate`). `IndexScan.Cond` gives those quals a home inside the node, so
+// the question stops being "are there wrappers" and becomes "can this node
+// evaluate them".
+//
+// It can, on ONE condition, and the condition is coordinates rather than
+// shape: `Cond` is evaluated against the scan's own row, so every wrapper must
+// be `LeafLocal` — the flag that says the predicate's `ColumnRef.Index` values
+// are leaf-local and were therefore never renumbered into FROM-cumulative
+// space by the posMap passes (plan.go:1272-1279). A non-LeafLocal wrapper's
+// indexes address the merged row of some join above; evaluating it against the
+// scan's row would read the WRONG COLUMNS and silently return wrong rows, not
+// fail. Such a leaf is declined, exactly as before.
+//
+// ok=false means "decline" for every caller, never "error" — same contract as
+// `scanLeafFor`.
+func absorbableLeafCond(n Node) (Node, Expr, bool) {
+	if n == nil {
+		return nil, nil, false
+	}
+	var conds []Expr
+	cur := n
+	for {
+		f, isF := cur.(*Filter)
+		if !isF {
+			break
+		}
+		if f.Child == nil || f.Predicate == nil || !f.LeafLocal {
+			return nil, nil, false
+		}
+		conds = append(conds, f.Predicate)
+		cur = f.Child
+	}
+	if len(conds) == 0 {
+		return cur, nil, true
+	}
+	// Innermost-first, so the conjunction reads in the order the wrappers would
+	// have been evaluated bottom-up.
+	cond := conds[len(conds)-1]
+	for i := len(conds) - 2; i >= 0; i-- {
+		cond = &BinaryOp{pos: conds[i].Pos(), Op: parser.OpAnd, Left: cond, Right: conds[i]}
+	}
+	return cur, cond, true
+}
+
 // scanIdentityOf reads the copied-forward state off a base scan node, or nil
 // when the node is not one.
 func scanIdentityOf(n Node) *scanIdentity {
@@ -277,6 +330,53 @@ func createIndexScanPlan(p *Path) Node {
 	if p.IndexScanDir != ForwardScanDirection {
 		panic(fmt.Sprintf("createPlan: PathIndexScan with %s; goopg's *IndexScan has no direction to set", p.IndexScanDir))
 	}
+	// M0134-0187: an index-only path emits only the columns its index covers,
+	// so it builds a different node with a NARROWER schema. It carries no
+	// index clauses (a full index scan); `baseRelLayout` re-bases the
+	// narrowed output by name and the search boundary pads what was pruned —
+	// see DESIGN §15/§21.
+	if p.IndexOnly {
+		if len(p.IndexOnlyCovered) == 0 {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s covers no columns", p.IndexInfo.Name))
+		}
+		if len(p.IndexClauses) != 0 {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries %d index clauses; the producer builds a full index scan",
+				p.IndexInfo.Name, len(p.IndexClauses)))
+		}
+		// Schema entries are COPIED from the leaf's own schema rather than
+		// synthesised: `SchemaColumn` carries a `SourceTableIdx` the leaf has
+		// already resolved, and `baseRelLayout` re-bases these positions by
+		// name against that same leaf schema, so the two agree by
+		// construction.
+		schema := make(Schema, 0, len(p.IndexOnlyCovered))
+		for _, c := range p.IndexOnlyCovered {
+			at := -1
+			for j := range id.schema {
+				if id.schema[j].Name == c.Name {
+					at = j
+					break
+				}
+			}
+			if at < 0 {
+				panic(fmt.Sprintf("createPlan: index-only scan on %s covers column %q, which the leaf schema does not have",
+					p.IndexInfo.Name, c.Name))
+			}
+			schema = append(schema, id.schema[at])
+		}
+		// `rewrap` would reinstate a leaf-local `*Filter` whose ColumnRefs are
+		// written against the FULL leaf schema; the producer refuses a
+		// non-bare leaf precisely so there is nothing to reinstate.
+		return &IndexOnlyScan{
+			pos:                   id.pos,
+			Table:                 id.table,
+			Index:                 p.IndexInfo,
+			Covered:               append([]catalog.Column(nil), p.IndexOnlyCovered...),
+			schema:                schema,
+			PrivilegeCheckRole:    id.privilegeCheckRole,
+			PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
+		}
+	}
+
 	ncols := len(p.IndexInfo.Columns)
 	switch {
 	case len(p.IndexClauses) == 0:
@@ -286,8 +386,8 @@ func createIndexScanPlan(p *Path) Node {
 		if p.RequiredOuter != 0 {
 			panic(fmt.Sprintf("createPlan: parameterised PathIndexScan on %s carries no index clauses", p.IndexInfo.Name))
 		}
-	case len(p.IndexClauses) != ncols:
-		panic(fmt.Sprintf("createPlan: PathIndexScan on %s binds %d of %d index columns; a prefix probe is not a shape the executor emits",
+	case len(p.IndexClauses) > ncols:
+		panic(fmt.Sprintf("createPlan: PathIndexScan on %s binds %d clauses to a %d-column index",
 			p.IndexInfo.Name, len(p.IndexClauses), ncols))
 	}
 
@@ -328,10 +428,17 @@ func createIndexScanPlan(p *Path) Node {
 	// `Key` vs `Keys` is the executor's distinction, not a new one: a
 	// single-column probe uses `Key` (every pre-existing single-column caller
 	// does, nl_index_join.go:656-660) and a composite one uses `Keys`, which
-	// encodes every column in declared order with no suffix padding. An empty
-	// list sets neither, which is the executor's range-scan branch with both
-	// bounds nil — a scan of the whole index in key order
-	// (operators_index.go:415-430), exactly what "full index scan" means.
+	// encodes each bound column in declared order. An empty list sets neither,
+	// which is the executor's range-scan branch with both bounds nil — a scan
+	// of the whole index in key order (operators_index.go:415-430), exactly
+	// what "full index scan" means.
+	//
+	// A list SHORTER than the index is a prefix probe and needs no special
+	// case on this side: both executor branches pad a short key to cover every
+	// key sharing the bound prefix, so the choice between them stays purely
+	// about how many expressions there are. Note `Key` has always meant that
+	// for a composite index (M0053-0001) — the prefix arm did not introduce
+	// the padding, it made the planner willing to ASK for it.
 	switch len(keys) {
 	case 0:
 	case 1:

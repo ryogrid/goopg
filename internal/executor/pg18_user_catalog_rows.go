@@ -1530,6 +1530,11 @@ func pgStatisticColumnsPG18() []catalog.Column {
 const (
 	statisticKindMCV       int16 = 1
 	statisticKindHistogram int16 = 2
+	// STATISTIC_KIND_CORRELATION (pg_statistic.h). goopg's ANALYZE computes
+	// this and the planner consumes it (`indexCorrelationFor`, costindex.go),
+	// but until this slot existed it was never PERSISTED — so it survived only
+	// within the analysing session and every restarted server saw zero.
+	statisticKindCorrelation int16 = 3
 	// eqOp is the OID for text equality operator (used for staop1 MCV slot).
 	eqOp uint32 = 98 // text =
 )
@@ -1555,12 +1560,13 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 	// which field wins.
 	distinctStr := strconv.FormatFloat(stats.StaDistinct(), 'g', -1, 32)
 
-	var stakind1, stakind2 int16
+	var stakind1, stakind2, stakind3 int16
 	var staop1 uint32
 	var stanumbers1 Datum = NullDatum
 	var stavalues1 Datum = NullDatum
 	var stanumbers2 Datum = NullDatum
 	var stavalues2 Datum = NullDatum
+	var stanumbers3 Datum = NullDatum
 
 	if len(stats.MCV) > 0 {
 		stakind1 = statisticKindMCV
@@ -1578,6 +1584,17 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 		stakind2 = statisticKindHistogram
 		stavalues2 = NewBytesDatum(pgTextArrayBytes(stats.Histogram))
 	}
+	// Correlation rides in slot 3, as a one-element stanumbers array — PG's
+	// layout for STATISTIC_KIND_CORRELATION, which carries no stavalues.
+	//
+	// Zero is skipped rather than written, matching every other slot here and
+	// PG's own behaviour of not emitting a slot it has nothing for. That also
+	// means a genuinely-zero correlation reads back as zero either way, which is
+	// the same answer.
+	if stats.Correlation != 0 {
+		stakind3 = statisticKindCorrelation
+		stanumbers3 = NewBytesDatum(pgFloat4ArrayBytes([]float32{float32(stats.Correlation)}))
+	}
 
 	return Row{
 		NewIntDatum(int64(tableOID)), // starelid
@@ -1588,7 +1605,7 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 		NewStringDatum(distinctStr),  // stadistinct (float4 as varlena text)
 		NewIntDatum(int64(stakind1)), // stakind1
 		NewIntDatum(int64(stakind2)), // stakind2
-		NewIntDatum(0),               // stakind3
+		NewIntDatum(int64(stakind3)), // stakind3
 		NewIntDatum(0),               // stakind4
 		NewIntDatum(0),               // stakind5
 		NewIntDatum(int64(staop1)),   // staop1
@@ -1603,7 +1620,7 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 		NewIntDatum(0),               // stacoll5
 		stanumbers1,                  // stanumbers1
 		stanumbers2,                  // stanumbers2
-		NullDatum,                    // stanumbers3
+		stanumbers3,                  // stanumbers3
 		NullDatum,                    // stanumbers4
 		NullDatum,                    // stanumbers5
 		stavalues1,                   // stavalues1

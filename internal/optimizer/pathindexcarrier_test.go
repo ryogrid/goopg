@@ -86,7 +86,7 @@ func TestIndexPathOrderingUnorderableIndexIsStillForward(t *testing.T) {
 }
 
 // TestParameterizedIndexPathNamesItsIndex: the parameterised constructor
-// (`addOneParameterizedIndexPath`) records the index `pickIndexCoveringAllLeadingColumns`
+// (`addOneParameterizedIndexPath`) records the index `pickIndexCoveringLeadingPrefix`
 // chose — the same index `parameterizedBaserelRows` and the cost were computed
 // over. Without it a chosen NLI inner could not be re-emitted as the probe that
 // was costed.

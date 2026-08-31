@@ -181,11 +181,25 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Inner is always an *IndexScan by plan-node contract; an
-		// optional InnerMemo (S7) interposes the memoize cache — its
-		// Child aliases the same *IndexScan, so the probe machinery
-		// is identical either way.
-		var innerScan nliInner = newIndexScanOp(p.Inner)
+		// Inner is a probe node the join re-executes per outer row. The
+		// legal kinds are enumerated here and by `nliInnerProbe` in the
+		// optimizer; both operators satisfy `nliInner`, which is what lets
+		// the join driver stay ignorant of which one it got.
+		var innerScan nliInner
+		switch in := p.Inner.(type) {
+		case *optimizer.IndexScan:
+			innerScan = newIndexScanOp(in)
+		case *optimizer.IndexOnlyScan:
+			innerScan = newIndexOnlyScanOp(in)
+		case *optimizer.BitmapHeapScan:
+			innerScan = newBitmapHeapScanOp(in)
+		default:
+			return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
+				Message: fmt.Sprintf("NestedLoopIndexJoin inner is a %T, which is not a re-probeable scan", p.Inner)}
+		}
+		// The memoize cache (S7) wraps only a plain index probe: `Memoize.Child`
+		// is typed `*IndexScan`, and the optimizer declines to build the cache
+		// for any other inner kind, so this assertion cannot fire.
 		if p.InnerMemo != nil {
 			innerScan = newMemoizeOp(p.InnerMemo, innerScan.(*indexScanOp))
 		}

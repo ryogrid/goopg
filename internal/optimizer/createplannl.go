@@ -69,7 +69,7 @@ package optimizer
 // carry every movable clause: `get_baserel_parampathinfo` puts them in
 // `ppi_clauses`, and `create_indexscan_plan` places whatever the index did not
 // consume into the scan's `qpqual`. goopg's parameterised index path carries
-// only the equalities `pickIndexCoveringAllLeadingColumns` accepted
+// only the equalities `pickIndexCoveringLeadingPrefix` accepted
 // (`Path.IndexClauses`), and goopg's `*IndexScan` has no qual field at all — so
 // a movable NON-index clause such as `b.y > a.x` would be dropped from the join
 // residual and enforced by nothing. That is a wrong answer, and it is this arm
@@ -177,6 +177,9 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		}
 		memoPath, innerPath = innerPath, innerPath.Children[0]
 	}
+	if innerPath.Kind == PathBitmapHeapScan {
+		return createNestLoopBitmapJoinPlan(p, innerPath)
+	}
 	if innerPath.Kind != PathIndexScan {
 		// The only parameterised path kind goopg builds is the base index scan
 		// (`addParameterizedIndexPaths`). Any other kind reaching here is a
@@ -201,11 +204,33 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 	}
 
 	in := joinInputsFor(p, "PathNestLoop(NLI)", outerPath, innerPath)
-	is, bare := in.inner.(*IndexScan)
+	// The leaf's local quals arrive as `*Filter` wrappers that `scanLeafFor`'s
+	// rewrapper rebuilt over the probe. `NestedLoopIndexJoin.Inner` is typed
+	// `*IndexScan` and cannot hold them, so they are absorbed into the scan's
+	// own `Cond` — PG's `Filter:` sitting beside `Index Cond:` on one Index Scan
+	// node, which is the shape being reproduced here.
+	//
+	// Absorbing is not hoisting: `Cond` is evaluated once per row the probe
+	// returns, which is what the path was costed for. Moving the same quals to
+	// the join residual instead would evaluate them once per probed PAIR — the
+	// D6.3b Q9 blowup (`innerUnwrapCostAccepts`, nl_index_join.go).
+	innerBase, leafCond, absorbable := absorbableLeafCond(in.inner)
+	if !absorbable {
+		// Made unreachable at the producer, which applies the same predicate
+		// (`addParameterizedIndexPaths`). Reaching it means a path was costed
+		// over a leaf whose wrappers are not leaf-local, and evaluating those
+		// against the scan's own row would read the wrong columns.
+		panic(fmt.Sprintf("createPlan: NLI inner %T carries wrappers that are not leaf-local; IndexScan.Cond cannot evaluate them in the scan's coordinates", in.inner))
+	}
+	is, bare := innerBase.(*IndexScan)
 	if !bare {
-		// Made unreachable at the producer (`addParameterizedIndexPaths`); see
-		// the file header for why hoisting the wrappers is not the fix.
-		panic(fmt.Sprintf("createPlan: NLI inner emitted a %T, but NestedLoopIndexJoin.Inner is an *IndexScan; the leaf's wrappers have nowhere to go", in.inner))
+		panic(fmt.Sprintf("createPlan: NLI inner emitted a %T, but NestedLoopIndexJoin.Inner is an *IndexScan", innerBase))
+	}
+	if leafCond != nil {
+		// The probe rebuilt by `createIndexScanPlan` is a fresh node this arm
+		// owns (`scanLeafFor` never mutates the leaf), so setting Cond here
+		// cannot disturb the leaf the search still references by pointer.
+		is.Cond = leafCond
 	}
 
 	// The probe keys are re-based onto the OUTER alone — see the file header.
@@ -311,4 +336,40 @@ func relsOf(p *Path) RelSet {
 		return 0
 	}
 	return p.Rel.Relids
+}
+
+func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) {
+	idxPath := innerPath.Children[0]
+	outerPath := p.Children[0]
+	in := joinInputsFor(p, "PathNestLoop(NLI-bitmap)", outerPath, innerPath)
+	// The leaf's local quals arrive as *Filter wrappers the rewrapper rebuilt
+	// over the scan; absorb them into the node's own Cond, since
+	// NestedLoopIndexJoin.Inner re-probes per outer row and cannot carry
+	// wrappers. Same move, same reason, as the index arm above.
+	innerBase, leafCond, absorbable := absorbableLeafCond(in.inner)
+	if !absorbable {
+		panic(fmt.Sprintf("createPlan: NLI bitmap inner %T carries wrappers that are not leaf-local", in.inner))
+	}
+	bhs := innerBase.(*BitmapHeapScan)
+	if leafCond != nil {
+		bhs.Cond = leafCond
+	}
+	bis := bhs.Outer.(*BitmapIndexScan)
+	outerLay := in.lay[:len(in.outer.Output())]
+	outerIndex := outerLay.bindingIndex()
+	keys := make([]Expr, 0, len(idxPath.IndexClauses))
+	for _, c := range idxPath.IndexClauses {
+		keys = append(keys, translateToLayout("bitmap probe key", c.key, outerLay, outerIndex))
+	}
+	if len(keys) == 1 {
+		bis.Key, bis.Keys = keys[0], nil
+	} else {
+		bis.Key, bis.Keys = nil, keys
+	}
+	bhs.BitmapQual = nil
+	return &NestedLoopIndexJoin{
+		pos: in.outer.Pos(), Type: JoinTypeInner, Outer: in.outer, Inner: bhs,
+		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)", nil, p.Residual),
+		schema:    in.merged,
+	}, in.lay
 }

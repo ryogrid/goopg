@@ -161,13 +161,47 @@ func TestAddParameterizedIndexPathsUniqueIndexGivesOneRow(t *testing.T) {
 	if param.Rows != 1 {
 		t.Errorf("ppi_rows = %v; want 1 for a fully-bound unique index", param.Rows)
 	}
-	// One execution of a bound probe, not a scan of the relation: the whole
-	// reason 03 §9 rule 3 insists cost primitives read the PATH's Rows.
-	if want := indexProbeCost(s.cp); param.Cost.Total != want {
-		t.Errorf("cost = %v; want one probe (%v)", param.Cost.Total, want)
+	// One execution of a bound probe, not a scan of the relation.
+	//
+	// This used to assert `Cost.Total == indexProbeCost(s.cp)` exactly, which
+	// was an artefact of the flat per-probe function that priced parameterised
+	// paths separately. They are priced by `cost_index` (costsize.c:520) now,
+	// like every other index path, so the number is a model output rather than
+	// a constant to pin. The PROPERTY the constant stood for is asserted
+	// instead — one-probe shaped, and independent of the relation's size.
+	if probe := indexProbeCost(s.cp); param.Cost.Total > 2*probe {
+		t.Errorf("cost = %v; a fully-bound unique probe must stay one-probe shaped (~%v)", param.Cost.Total, probe)
 	}
 	if seq := rel.Pathlist[0]; param.Cost.Total >= seq.Cost.Total {
 		t.Errorf("a bound PK probe (%v) is not cheaper than the seq scan (%v)", param.Cost.Total, seq.Cost.Total)
+	}
+
+	// The sharp form of "one execution": ten times the relation must not cost
+	// ten times the probe. A cost that tracked the relation's size would mean
+	// the path had been priced as a scan, which is what the old equality was
+	// really guarding against.
+	catBig, ordersBig, _ := ppiCatalog(t)
+	ppiSetStats(ordersBig, 15_000_000,
+		catalog.ColumnStats{NDistinct: 15_000_000},
+		catalog.ColumnStats{NDistinct: 1_500_000},
+		catalog.ColumnStats{NDistinct: 5})
+	sBig := ppiCtx(t, ordersBig, 15_000_000, ppiEquiClause(outer, "l_orderkey", inner, "o_orderkey"))
+	sBig.addParameterizedIndexPaths(catBig)
+	var big *Path
+	for _, p := range sBig.findRel(inner).Pathlist {
+		if p.RequiredOuter != 0 {
+			big = p
+		}
+	}
+	if big == nil {
+		t.Fatal("no parameterised path on the 10x relation")
+	}
+	if big.Rows != 1 {
+		t.Errorf("ppi_rows on the 10x relation = %v; want 1", big.Rows)
+	}
+	if big.Cost.Total > 1.5*param.Cost.Total {
+		t.Errorf("probe cost went %v -> %v for a 10x relation; a bound unique probe must not scale with it",
+			param.Cost.Total, big.Cost.Total)
 	}
 }
 
@@ -203,11 +237,11 @@ func TestAddParameterizedIndexPathsNonUniqueUsesNdistinct(t *testing.T) {
 
 // TestAddParameterizedIndexPathsNeedsEveryIndexColumnBound is the shared
 // eligibility rule, and the first half of 03 §5.2's binding contract: path
-// generation calls `pickIndexCoveringAllLeadingColumns`, the SAME function the
+// generation calls `pickIndexCoveringLeadingPrefix`, the SAME function the
 // NLI constructor uses, so it cannot cost an index the constructor declines.
 // A composite index with only its leading column bound is such an index —
 // goopg's executor emits no partial-prefix probe.
-func TestAddParameterizedIndexPathsNeedsEveryIndexColumnBound(t *testing.T) {
+func TestAddParameterizedIndexPathsAcceptsALeadingPrefix(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "partsupp"}, []catalog.Column{
 		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}},
@@ -222,11 +256,35 @@ func TestAddParameterizedIndexPathsNeedsEveryIndexColumnBound(t *testing.T) {
 	}
 	outer, inner := relsetOf(0), relsetOf(1)
 
-	// Leading column only: no path.
+	// Leading column only: a prefix probe, which PG's `amoptionalkey` arm
+	// builds and goopg's executor pads into a range over every entry sharing
+	// the prefix. Requiring TOTAL coverage here is what left the bitmap
+	// producer as the only candidate on TPC-H Q8.
 	s := ppiCtx(t, tbl, 800_000, ppiEquiClause(outer, "p_partkey", inner, "ps_partkey"))
 	s.addParameterizedIndexPaths(c)
-	if got := len(s.findRel(inner).Pathlist); got != 1 {
-		t.Fatalf("a half-bound composite index produced %d paths; want only the seq scan", got)
+	prefixPaths := s.findRel(inner).Pathlist
+	if got := len(prefixPaths); got != 2 {
+		t.Fatalf("a prefix-bound composite index produced %d paths; want the seq scan plus one", got)
+	}
+	var prefix *Path
+	for _, p := range prefixPaths {
+		if p.Kind == PathIndexScan {
+			prefix = p
+		}
+	}
+	if prefix == nil {
+		t.Fatal("no index path among the prefix-bound paths")
+	}
+	if got := len(prefix.IndexClauses); got != 1 {
+		t.Fatalf("the prefix path binds %d index columns; want 1", got)
+	}
+	// The uniqueness short-circuit must NOT fire: `partsupp_pkey` is unique on
+	// (ps_partkey, ps_suppkey), but one ps_partkey covers many suppliers. A
+	// path claiming one row here would make every nested loop above it look
+	// free — the row estimate is the whole reason this case is asserted.
+	if prefix.Rows <= 1 {
+		t.Fatalf("the prefix path claims %.2f rows; a unique index bound on its "+
+			"LEADING column only does not return one row", prefix.Rows)
 	}
 
 	// Both columns bound by the same outer rel: one path.
@@ -234,8 +292,15 @@ func TestAddParameterizedIndexPathsNeedsEveryIndexColumnBound(t *testing.T) {
 		ppiEquiClause(outer, "p_partkey", inner, "ps_partkey"),
 		ppiEquiClause(outer, "s_suppkey", inner, "ps_suppkey"))
 	s.addParameterizedIndexPaths(c)
-	if got := len(s.findRel(inner).Pathlist); got != 2 {
+	full := s.findRel(inner).Pathlist
+	if got := len(full); got != 2 {
 		t.Fatalf("a fully-bound composite index produced %d paths; want the seq scan plus one", got)
+	}
+	// And with the WHOLE unique key bound the short-circuit does fire.
+	for _, p := range full {
+		if p.Kind == PathIndexScan && p.Rows != 1 {
+			t.Fatalf("a fully-bound unique index claims %.2f rows; want exactly 1", p.Rows)
+		}
 	}
 }
 
@@ -345,16 +410,77 @@ func TestVarEqNonConstSelectivityMCVCrossCheck(t *testing.T) {
 		NDistinct: 10,
 		MCV:       []catalog.MCVEntry{{Value: "a", Frequency: 0.04}},
 	}
-	if got := varEqNonConstSelectivity(stats); got != 0.04 {
+	if got := varEqNonConstSelectivity(stats, 1000); got != 0.04 {
 		t.Errorf("selectivity = %v; want it clamped to the MCV[0] frequency 0.04", got)
 	}
 	// Null fraction comes off the top before the division (selfuncs.c).
-	got := varEqNonConstSelectivity(&catalog.ColumnStats{NDistinct: 4, NullFrac: 0.5})
+	got := varEqNonConstSelectivity(&catalog.ColumnStats{NDistinct: 4, NullFrac: 0.5}, 1000)
 	if want := 0.5 / 4; got != want {
 		t.Errorf("selectivity with 50%% nulls = %v; want %v", got, want)
 	}
 	// No statistics: PG's DEFAULT_NUM_DISTINCT.
-	if got := varEqNonConstSelectivity(nil); got != 1.0/200.0 {
+	if got := varEqNonConstSelectivity(nil, 1000); got != 1.0/200.0 {
 		t.Errorf("unanalysed column selectivity = %v; want 1/200", got)
+	}
+}
+
+// A column whose distinct count is stored ONLY in the fraction form — the
+// normal state on a restarted server, where the absolute count's row-count
+// input is not restored (ledger pq-P6) — must be read as a real estimate and
+// not as "unknown". This is PG's negative `stadistinct`
+// (`get_variable_numdistinct`, selfuncs.c: `-stadistinct * ntuples`).
+//
+// The regression it pins is not subtle: TPC-H `lineitem.l_orderkey` reads
+// NDistinctFrac=0.202 over 6,001,255 rows. Read correctly that is 1.2 M
+// distinct values; read as "unknown" it is 200, a 6000x error in the row
+// estimate of every `l_orderkey = <outer>` probe.
+func TestVarEqNonConstSelectivityFractionForm(t *testing.T) {
+	stats := &catalog.ColumnStats{NDistinct: 0, NDistinctFrac: 0.202}
+	const relRows = 6001255.0
+	got := varEqNonConstSelectivity(stats, relRows)
+	want := 1.0 / clampRowEst(0.202*relRows)
+	if got != want {
+		t.Errorf("selectivity from the fraction form = %v; want %v", got, want)
+	}
+	if got >= 1.0/200.0 {
+		t.Errorf("selectivity %v is no sharper than DEFAULT_NUM_DISTINCT; the fraction form was ignored", got)
+	}
+	// When BOTH forms are present the winner is decided by PG's analyze.c
+	// rule, which `ColumnStats.StaDistinct` implements: a fraction above 0.1
+	// means "distinctness scales with the relation", so it wins over the
+	// absolute count rather than losing to it.
+	//
+	// An earlier version of this test asserted the opposite (absolute always
+	// wins) because the function under test open-coded its own reduction. That
+	// assertion was pinning a divergence from `getVariableNumDistinct`
+	// (joinselectivity.go), which the join estimator uses on the same columns —
+	// two different distinct counts for one column in one plan.
+	bigFrac := &catalog.ColumnStats{NDistinct: 50, NDistinctFrac: 0.9}
+	if got, want := varEqNonConstSelectivity(bigFrac, relRows), 1.0/clampRowEst(0.9*relRows); got != want {
+		t.Errorf("selectivity with frac>0.1 and an absolute count = %v; want the fraction to win (%v)", got, want)
+	}
+	// Below the 0.1 threshold the absolute count is used.
+	smallFrac := &catalog.ColumnStats{NDistinct: 50, NDistinctFrac: 0.05}
+	if got := varEqNonConstSelectivity(smallFrac, relRows); got != 1.0/50.0 {
+		t.Errorf("selectivity with frac<=0.1 = %v; want the absolute 1/50", got)
+	}
+	// No relation size to scale by: PG "punts" to the default rather than
+	// treating the fraction as an absolute count.
+	if got := varEqNonConstSelectivity(stats, 0); got != 1.0/200.0 {
+		t.Errorf("selectivity with no relation size = %v; want 1/200", got)
+	}
+}
+
+// PG's two no-data branches are deliberately asymmetric: a relation smaller
+// than DEFAULT_NUM_DISTINCT is assumed to hold one distinct value per row, and
+// only a larger one falls back to the constant — "so that the behavior isn't
+// discontinuous" (get_variable_numdistinct, selfuncs.c).
+func TestVariableNumDistinctNoDataBranches(t *testing.T) {
+	empty := &catalog.ColumnStats{}
+	if got := variableNumDistinct(empty, 50); got != 50 {
+		t.Errorf("numdistinct for a 50-row relation with no stats = %v; want 50", got)
+	}
+	if got := variableNumDistinct(empty, 5000); got != 200 {
+		t.Errorf("numdistinct for a 5000-row relation with no stats = %v; want DEFAULT_NUM_DISTINCT", got)
 	}
 }

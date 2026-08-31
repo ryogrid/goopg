@@ -85,15 +85,24 @@ func maybeAttachMemoize(nli *NestedLoopIndexJoin) *NestedLoopIndexJoin {
 		return nli
 	}
 	inner := nli.Inner
-	if inner == nil || inner.Index == nil {
+	innerIdx, innerKey, innerKeys, isProbe := nliInnerProbe(inner)
+	if !isProbe || innerIdx == nil {
+		return nli
+	}
+	// The cache node still holds a `*IndexScan` (Memoize.Child), so an
+	// index-only inner is declined here rather than mis-typed. It costs the
+	// cache, not correctness — and the cache is an optimisation the search
+	// offers, never one a plan depends on.
+	innerScan, isPlainScan := inner.(*IndexScan)
+	if !isPlainScan {
 		return nli
 	}
 	var keyExprs []Expr
 	switch {
-	case len(inner.Keys) > 0:
-		keyExprs = inner.Keys
-	case inner.Key != nil:
-		keyExprs = []Expr{inner.Key}
+	case len(innerKeys) > 0:
+		keyExprs = innerKeys
+	case innerKey != nil:
+		keyExprs = []Expr{innerKey}
 	default:
 		return nli // range probe (LowKey/HighKey) — parameter set unclear, skip
 	}
@@ -131,12 +140,12 @@ func maybeAttachMemoize(nli *NestedLoopIndexJoin) *NestedLoopIndexJoin {
 	// SingleRow: a full-key probe over a unique index yields at most
 	// one row per parameter set (PG's `singlerow`,
 	// nodeMemoize.c:832/:1058).
-	singleRow := inner.Index.Unique &&
-		(len(inner.Keys) == len(inner.Index.Columns) ||
-			(inner.Key != nil && len(inner.Index.Columns) == 1))
+	singleRow := innerIdx.Unique &&
+		(len(innerKeys) == len(innerIdx.Columns) ||
+			(innerKey != nil && len(innerIdx.Columns) == 1))
 	nli.InnerMemo = &Memoize{
 		pos:        inner.Pos(),
-		Child:      inner,
+		Child:      innerScan,
 		KeyExprs:   keyExprs,
 		SingleRow:  singleRow,
 		EstEntries: est,

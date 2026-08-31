@@ -128,7 +128,7 @@ func TestPreDPPinnedSemiKeysResolveAfterDP(t *testing.T) {
 		published = semi.Output()
 	case nli != nil:
 		outerSchema = nli.Outer.Output()
-		leftKey = nli.Inner.Key
+		leftKey = nliIn(nli.Inner).Key
 		pred = nli.Predicate
 		published = nli.Output()
 	default:

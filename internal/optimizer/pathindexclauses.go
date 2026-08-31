@@ -14,7 +14,7 @@ package optimizer
 // facts a chosen index path must name — WHICH index and in WHICH direction —
 // and ledgered the third as the larger question: a parameterised index path is
 // built from `bound []paramIndexClause` (the clauses
-// `pickIndexCoveringAllLeadingColumns` accepted) and then DISCARDS them once
+// `pickIndexCoveringLeadingPrefix` accepted) and then DISCARDS them once
 // the cost and rows are computed. PG keeps them, and `createPlan` needs them
 // for two separate jobs:
 //
@@ -55,18 +55,20 @@ package optimizer
 //     nowhere to go and stays a residual qual.
 //   - **No gaps.** PG happily builds a probe binding columns 0 and 2 of a
 //     three-column index and leaving column 1 unbound; goopg's
-//     `IndexScan.Keys` requires `len(Keys) == len(Index.Columns)` (a shorter
-//     prefix is rejected to keep the executor probe purely equality-shaped),
-//     so a gapped list is unrepresentable. `indexPathClauses` DECLINES — it
-//     returns nil rather than a shortened list — because a shortened list
-//     silently re-indexes every position after the gap, which is exactly the
-//     mis-binding the whole file exists to prevent.
+//     `IndexScan.Keys` binds `Keys[i]` to `Index.Columns[i]` POSITIONALLY, so
+//     a gapped list is unrepresentable — a shortened list silently re-indexes
+//     every position after the gap, which is exactly the mis-binding this file
+//     exists to prevent.
 //
-// The second narrowing is defensive as things stand: the only producer runs
-// after `pickIndexCoveringAllLeadingColumns` has already established that every
-// column of `idx` is bound. It is written anyway because the decline is the
-// safe answer and the alternative is silent corruption if a later producer
-// (PG's `amoptionalkey`/prefix-probe arm) forgets the precondition.
+// A gap is therefore TRUNCATED, not tolerated and not declined outright: the
+// list stops at the first unbound column and the result is the leading prefix,
+// which is representable and is what PG's `amoptionalkey` arm builds. Columns
+// 0 and 2 of a three-column index yield a one-column probe on column 0, with
+// the column-2 clause left to be enforced as an ordinary qual above the scan.
+// Declining the whole index instead would be safe but would cost the prefix
+// probe PG chooses for TPC-H Q8's `lineitem_part_supp_fkidx` (only `l_partkey`
+// is bound there; `l_suppkey` is not). A list that binds NOTHING at column 0
+// is still declined — a btree scan can only begin at its leading column.
 //
 // The UNPARAMETERISED ordered path (pathindexordered.go) carries an EMPTY list,
 // and that is not an omission: "An empty list implies a full index scan"
@@ -125,7 +127,7 @@ type indexPathClause struct {
 // `addOneParameterizedIndexPath` builds `bound` and its `innerToOuter` map in
 // one pass under one first-wins test: the clause this scan finds for column X is
 // necessarily the clause whose `outerKey` is `innerToOuter[X]`, which is the
-// value `pickIndexCoveringAllLeadingColumns` accepted the index on. The two
+// value `pickIndexCoveringLeadingPrefix` accepted the index on. The two
 // derivations of "the probe value at column X" therefore agree by construction
 // rather than by coincidence (rule #2: sibling paths change together).
 func indexPathClauses(idx *catalog.Index, bound []paramIndexClause) []indexPathClause {
@@ -136,11 +138,22 @@ func indexPathClauses(idx *catalog.Index, bound []paramIndexClause) []indexPathC
 	for pos, col := range idx.Columns {
 		c, ok := boundClauseForColumn(bound, col)
 		if !ok {
-			// An unbound column. Declining is the safe answer — see the
-			// header's "No gaps".
-			return nil
+			// The first unbound column ENDS the list rather than voiding
+			// it: everything accumulated so far is a gapless leading
+			// prefix, which is exactly what PG's `amoptionalkey` probe
+			// binds (indxpath.c:1029-1076, "only the first index column
+			// is required to have a qual"). Stopping here is also what
+			// keeps the header's "No gaps" true — a column AFTER this one
+			// can never be admitted, so no later clause can silently
+			// re-index into the gap.
+			break
 		}
 		out = append(out, indexPathClause{ri: c.ri, indexCol: pos, key: c.outerKey})
+	}
+	if len(out) == 0 {
+		// Nothing bound the LEADING column. A btree can only start a scan
+		// from column 0, so a list beginning at column 1 names no probe.
+		return nil
 	}
 	return out
 }

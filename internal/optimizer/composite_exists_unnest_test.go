@@ -227,12 +227,15 @@ func TestCompositeExistsCompositeIndexConsumesBothPairs(t *testing.T) {
 	if nli == nil {
 		t.Skipf("composite EXISTS did not convert to NLI here; tree: %s", describePlanTree(node))
 	}
-	idx := nli.Inner
-	if idx == nil {
-		t.Fatalf("NLI has no inner IndexScan")
+	// Asserted on the PROBE, not the node type: a semi NLI's inner is promoted
+	// to an *IndexOnlyScan when nothing reads its columns, which is orthogonal
+	// to whether both pairs were consumed.
+	probeKeys := nliProbeKeys(nli.Inner)
+	if probeKeys == nil {
+		t.Fatalf("NLI inner is not a probe node: %T", nli.Inner)
 	}
-	if len(idx.Keys) < 2 {
-		t.Fatalf("expected the composite probe to consume BOTH pairs (Keys>=2), got Keys=%d Key=%v — the S1c bail's 'competing probe key' fear would be real if this regressed",
-			len(idx.Keys), idx.Key)
+	if len(probeKeys) < 2 {
+		t.Fatalf("expected the composite probe to consume BOTH pairs (keys>=2), got %d — the S1c bail's 'competing probe key' fear would be real if this regressed",
+			len(probeKeys))
 	}
 }

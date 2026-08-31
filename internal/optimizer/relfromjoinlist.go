@@ -109,6 +109,13 @@ type joinlistProblem struct {
 	// tupleFraction is the query's `root->tuple_fraction`, applied to the
 	// TOP-level problem only (see makeRelFromJoinlist).
 	tupleFraction float64
+
+	// neededCols / neededColsKnown carry the statement's needed-column set to
+	// `searchCtx` (pathindexonlyneed.go) and to the boundary hole-filler.
+	// Every sub-problem of one statement shares it: the set is a property of
+	// the STATEMENT, not of a FROM subset.
+	neededCols      map[string]bool
+	neededColsKnown bool
 }
 
 // joinlistRel is what a joinlist item resolves to: goopg's stand-in for the
@@ -147,6 +154,32 @@ func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, error) {
 	r, err := makeRelFromJoinlist(jl, prob, prob.tupleFraction)
 	if err != nil {
 		return nil, err
+	}
+	// M0134-0188: a ONE-leaf problem short-circuits inside makeRelFromJoinlist
+	// ("single joinlist node, so we're done") and comes back as the RAW leaf —
+	// correct for a nested sub-list unwrap, where the ENCLOSING problem owns
+	// the leaf's paths (including its parameterised ones), but wrong at the
+	// problem's own entry: this is the whole search for the statement, no
+	// enclosing problem exists, and returning the raw leaf silently skips
+	// base-rel path generation — the seam then reports a searched prefix whose
+	// access method nobody ever examined. TPC-H Q13's `customer LEFT JOIN
+	// orders` peels to exactly this: a one-leaf prefix whose covering
+	// `customer_pk` scan can only be chosen by `addBaseRelIndexPaths` +
+	// `add_path`. Run the one-relation search protocol here, at the entry
+	// only: `joinSearch` with nrels=1 enumerates nothing and `finalPath`
+	// returns the base rel's cheapest — seq, index, or index-only, on cost.
+	// Gated on `scanLeafFor` — the same consumer-side rebuildability test
+	// every path producer applies — because the boundary must tag whatever
+	// `createPlan` returns and `markSearchedTree` accepts only the kinds that
+	// embed the tag. TPC-DS Q77's prefix leaf is a `*CTEScan`: rebuildable by
+	// nobody, taggable by nothing, and running the one-relation protocol on it
+	// panicked at plan time. Declining leaves it exactly as the short-circuit
+	// always left it.
+	if _, _, rebuildable := scanLeafFor(r.node); rebuildable && r.info.table != nil && jl.nrels() == 1 {
+		r, err = prob.searchOneProblem([]joinlistRel{r}, prob.tupleFraction)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return r.node, nil
 }
@@ -328,6 +361,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
+	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
 	s.addBaseRelIndexPaths(prob.cat)
 	if _, err := s.joinSearch(s.clauses, newJoinRelBuilder(s, prob.cat)); err != nil {
 		return joinlistRel{}, err
@@ -337,7 +371,31 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		return joinlistRel{}, err
 	}
 	return joinlistRel{
-		node: createPlanAtSearchRootRange(p, base, width),
+		// The hole-filler licenses a PADDED boundary slot for exactly the
+		// coordinates a narrowed index-only leaf legitimately dropped: the
+		// column must be provably outside the statement's needed set. Any
+		// other hole still panics — the totality assertion stays loud for
+		// real producer bugs (M0134-0187, DESIGN §21).
+		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
+			if !prob.neededColsKnown {
+				return SchemaColumn{}, false
+			}
+			for i := range items {
+				if coord >= cum[i] && coord < cum[i+1] {
+					leafSchema := scans[i].Output()
+					pos := coord - cum[i]
+					if pos < 0 || pos >= len(leafSchema) {
+						return SchemaColumn{}, false
+					}
+					col := leafSchema[pos]
+					if col.Name == "" || prob.neededCols[col.Name] {
+						return SchemaColumn{}, false
+					}
+					return col, true
+				}
+			}
+			return SchemaColumn{}, false
+		}),
 		// The searched tree enters the enclosing problem as a leaf at the first
 		// coordinate it publishes. Nothing else of the sub-problem crosses:
 		// `info` is deliberately table-less so that every producer that assumes

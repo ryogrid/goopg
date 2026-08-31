@@ -17,16 +17,31 @@ func TestCostBitmapIndexScan_AddsBitmapOverhead(t *testing.T) {
 		correlation: 0,
 		totalTablePages: 200,
 	}
-	base := costIndexScan(cp, in)
+	// The baseline is the INDEX SIDE, not the whole index scan. PG's
+	// cost_bitmap_tree_node (costsize.c:1150) takes `indextotalcost` — what
+	// amcostestimate returned — and adds only the bitmap-manipulation charge. A
+	// bitmap index scan emits TIDs and never touches the heap; the
+	// BitmapHeapScan above it is separately costed for exactly that.
+	//
+	// This assertion previously compared against costIndexScan, i.e. the WHOLE
+	// scan including heap IO — so it agreed with an implementation that charged
+	// the heap twice, once here invisibly and once where it belongs. It pinned
+	// the defect rather than guarding against it.
+	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
 	bitmap := costBitmapIndexScan(cp, in)
 	tuplesFetched := clampRowEst(in.selectivity * in.relTuples) // 1000
-	overhead := 0.1 * cp.cpuOperatorCost * tuplesFetched       // 0.1 * 0.0025 * 1000 = 0.25
-	if diff := bitmap.Total - base.Total; math.Abs(diff-overhead) > 1e-9 {
-		t.Errorf("costBitmapIndexScan overhead = %v, want %v", diff, overhead)
+	overhead := 0.1 * cp.cpuOperatorCost * tuplesFetched        // 0.1 * 0.0025 * 1000 = 0.25
+	if diff := bitmap.Total - idxTotal; math.Abs(diff-overhead) > 1e-9 {
+		t.Errorf("costBitmapIndexScan overhead over the index side = %v, want %v", diff, overhead)
 	}
-	// Startup should be the same (both pay the B-tree descent).
-	if math.Abs(bitmap.Startup-base.Startup) > 1e-9 {
-		t.Errorf("costBitmapIndexScan startup differs: %v vs %v", bitmap.Startup, base.Startup)
+	if math.Abs(bitmap.Startup-idxStartup) > 1e-9 {
+		t.Errorf("costBitmapIndexScan startup = %v, want the index-side startup %v", bitmap.Startup, idxStartup)
+	}
+	// And it must be strictly CHEAPER than a full index scan, which pays for
+	// heap fetches this node does not perform.
+	if base := costIndexScan(cp, in); bitmap.Total >= base.Total {
+		t.Errorf("bitmap index side (%v) is not cheaper than a full index scan (%v); the heap is being charged twice again",
+			bitmap.Total, base.Total)
 	}
 }
 
@@ -124,14 +139,31 @@ func TestCostBitmapHeapScan_Components(t *testing.T) {
 		t.Errorf("startup = %v, want 50", cost.Startup)
 	}
 
-	// Total = startup + runCost + indexCost.Total
+	// Total = startup + runCost, and startup ALREADY holds indexCost.Total.
 	// runCost = pageCost * pagesFetched + cpuTupleCost * tuplesFetched
-	// pageCost = sqrt(100/1000)*4 + (1-sqrt(0.1))*1 = sqrt(0.1)*4 + (1-sqrt(0.1))*1
-	// sqrt(0.1) ≈ 0.3162
-	// pageCost ≈ 0.3162*4 + 0.6838*1 = 1.2648 + 0.6838 = 1.9486
-	// runCost ≈ 1.9486*100 + 0.01*500 = 194.86 + 5 = 199.86
-	// Total ≈ 50 + 199.86 + 50 = 299.86
-	wantTotal := 50.0 + (math.Sqrt(0.1)*4+(1-math.Sqrt(0.1))*1)*100 + 0.01*500 + 50.0
+	//
+	// pageCost is PG's, verbatim (cost_bitmap_heap_scan, costsize.c:1071):
+	//   random - (random - seq) * sqrt(pages_fetched / T)
+	//         = 4 - 3*sqrt(0.1) ≈ 4 - 0.9487 = 3.0513
+	// runCost ≈ 3.0513*100 + 0.01*500 = 305.13 + 5 = 310.13
+	// Total   ≈ 50 + 310.13 = 360.13
+	//
+	// This expectation has now pinned TWO defects in turn, which is worth
+	// recording as a property of the test rather than of either bug:
+	//
+	//  1. It first encoded `sqrt*random + (1-sqrt)*seq` — PG's interpolation
+	//     RUN BACKWARDS, approaching sequential cost as the touched fraction
+	//     SHRINKS. That kept Q2's `supplier` bitmap at 2588.7 vs PG's 43.46.
+	//  2. It then encoded `+ indexCost.Total` a SECOND time, from a comment
+	//     asserting PG does the same. PG does not: `cost_bitmap_heap_scan` ends
+	//     `path->total_cost = startup_cost + run_cost` with `indexTotalCost`
+	//     already inside `startup_cost`. That duplicate is what kept the same
+	//     `supplier` bitmap at 66.42 vs PG's 43.46 after (1) was fixed.
+	//
+	// Both times the expectation was derived from the implementation, so it
+	// agreed with it perfectly and could not have caught either. The figure
+	// below is derived from the ORACLE's assembly instead.
+	wantTotal := 50.0 + (4-3*math.Sqrt(0.1))*100 + 0.01*500
 	if math.Abs(cost.Total-wantTotal) > 1e-9 {
 		t.Errorf("Total = %v, want ~%v", cost.Total, wantTotal)
 	}
