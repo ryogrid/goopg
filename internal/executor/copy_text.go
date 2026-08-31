@@ -910,9 +910,21 @@ var pgTimestampLayouts = []string{
 	"2006-01-02T15:04:05Z07:00",
 	"2006-01-02T15:04:05Z0700",
 	"2006-01-02T15:04:05Z07",
+	// PG's DecodeDateTime tokenizes on whitespace, so a zone offset is legal
+	// input whether or not it is separated from the time field by a space
+	// (`'2009-06-08 21:07:30 -07'` and `'...30-07'` both parse; M0134-0189).
+	// Go's time.Parse matches layouts literally, so the space needs its own
+	// layout entries rather than being implied by the no-space ones above.
+	"2006-01-02 15:04:05 Z07:00",
+	"2006-01-02 15:04:05 Z0700",
+	"2006-01-02 15:04:05 Z07",
+	"2006-01-02T15:04:05 Z07:00",
+	"2006-01-02T15:04:05 Z0700",
+	"2006-01-02T15:04:05 Z07",
 	"2006-01-02 15:04:05",
 	"2006-01-02T15:04:05",
 	"2006-01-02 15:04Z07",
+	"2006-01-02 15:04 Z07",
 	"2006-01-02 15:04",
 	"2006-01-02",
 }
