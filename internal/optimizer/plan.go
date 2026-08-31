@@ -935,6 +935,12 @@ type IndexOnlyScan struct {
 	// Backward emits the materialised rows in reverse (S6 max rewrite: PG's
 	// `Index Only Scan Backward` over an ASC index delivers DESC NULLS FIRST).
 	Backward bool
+	// Parallel mirrors PostgreSQL's Plan.parallel_aware — see SeqScan's field
+	// of the same name. Stamped once by parallel.go's stampParallelScan, never
+	// inferred at render time. When set, each worker's scan processes only the
+	// index LEAF BLOCKS it claims from the shared parallelIndexScanState
+	// (M0134-0189), so the union over workers is the whole scan exactly once.
+	Parallel bool
 	schema   Schema
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
 	// same name. M0122-0008 (view-owner privilege gap).

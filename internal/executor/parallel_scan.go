@@ -187,3 +187,86 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 	}
 	return false
 }
+
+// parallelIndexScanState is the work queue for one parallel index-only scan.
+//
+// It partitions by index LEAF BLOCK rather than heap block, because that is the
+// unit an index scan walks: `nbtree.ScanPos.Blk` names the leaf every entry
+// came from, so a worker decides "mine or not" per page with no extra I/O.
+//
+// Divergence from PostgreSQL, stated because it is real: PG's parallel btree
+// scan (`_bt_parallel_seize`) hands each worker the NEXT leaf page, so a worker
+// walks only its own. goopg's workers each walk the whole leaf chain and skip
+// blocks another worker claimed — the descent is duplicated N times, while the
+// per-entry work (visibility, decode, materialisation) is partitioned once.
+//
+// The claim is first-come, and that is what makes it CORRECT rather than merely
+// fast: `LoadOrStore` reports loaded=false to exactly one caller per block, so
+// every leaf is processed by exactly one worker. None can be dropped (some
+// worker always reaches it) and none duplicated (only the first claimer
+// proceeds). The seq-scan allocator gets that from an atomic counter; this gets
+// it from the map.
+type parallelIndexScanState struct {
+	claimed sync.Map // storage.BlockNumber -> struct{}
+	blocks  atomic.Uint64
+}
+
+func newParallelIndexScanState() *parallelIndexScanState { return &parallelIndexScanState{} }
+
+// claimLeaf reports whether the calling worker owns leaf block blk. Exactly one
+// worker is told yes for any given block.
+//
+// A nil receiver answers YES for every block — the serial case, which is what
+// leaves every non-parallel caller of the scan loop unchanged.
+func (s *parallelIndexScanState) claimLeaf(blk storage.BlockNumber) bool {
+	if s == nil {
+		return true
+	}
+	if _, loaded := s.claimed.LoadOrStore(blk, struct{}{}); loaded {
+		return false
+	}
+	s.blocks.Add(1)
+	return true
+}
+
+// claimedBlocks reports how many leaf blocks have been handed out, for tests
+// and instrumentation.
+func (s *parallelIndexScanState) claimedBlocks() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.blocks.Load()
+}
+
+// attachParallelIndexScan wires op's driving index-only scan to the shared
+// leaf-block claim set. The walk mirrors attachParallelScan's — row-wise
+// wrappers only, stopping at the first index-only scan — and an unmodelled node
+// is left alone, leaving the tree serial. Declining to parallelise is a missed
+// optimisation; attaching in the wrong place is duplicated or dropped rows.
+func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
+	if st == nil {
+		return false
+	}
+	switch x := op.(type) {
+	case *indexOnlyScanOp:
+		x.pidx = st
+		return true
+	case *filterOp:
+		return attachParallelIndexScan(x.child, st)
+	case *projectOp:
+		return attachParallelIndexScan(x.child, st)
+	case *instrumentedOp:
+		return attachParallelIndexScan(x.inner, st)
+	case *joinOp:
+		// Probe side only, for the reason attachParallelScan's joinOp arm states.
+		if probeSideIsLeft(x.plan) {
+			return attachParallelIndexScan(x.left, st)
+		}
+		return attachParallelIndexScan(x.right, st)
+	case *aggregateOp:
+		return attachParallelIndexScan(x.child, st)
+	case *sortOp:
+		return attachParallelIndexScan(x.child, st)
+	}
+	return false
+}

@@ -1931,7 +1931,56 @@ queries and helped none:
 | q16 | 1.5s | **2.3s** |
 | q22 | 0.7s | 0.7s |
 
-### 23.4 Disposition
+### 23.4 Disposition — SHIPPED after two corrections
+
+The first write-up of this section concluded "reverted, do not ship". That was
+premature: the profile had correctly identified the sort as the cost, and the
+two fixes that follow from it were not tried before reverting. Both are PG's
+own rules, and with them the scan ships and wins.
+
+**Fix 1 — do not move the sort into the workers for this shape.**
+`findPartialSubtree`'s P7 arm takes a `Sort` over a partial-capable subtree as
+the partial root, giving `GatherMerge -> Sort -> <partial>` — every worker
+sorts, the leader k-way merges, total comparison work unchanged. That pays for
+a parallel seq scan and not for an index-only scan, which is already the cheap
+half. `sortPartialRootPays` declines it, the walk falls through, and the Gather
+lands BELOW the sort instead:
+
+```
+Sort -> Gather -> Hash Anti Join -> Hash Join -> Parallel Index Only Scan
+```
+
+one sort, in the leader, exactly where the serial plan had it.
+
+**Fix 2 — size the parallelism by the INDEX, not the heap.** An index-only
+scan never reads the heap, so the heap's block count does not bound it. PG
+passes `index->pages` to `compute_parallel_worker` (allpaths.c); goopg was
+passing the table's. That single change is what separates the two queries:
+q16's `partsupp_pk` is 2770 real blocks and clears the threshold, while q13's
+`customer_pk` is a few hundred over a 3822-block table — sized by the heap it
+was granted workers it could not use (4.2s -> 7.1s), sized by the index it
+stays serial, which is both faster and PG's own answer.
+
+Measured, three runs per arm on fresh equal-age servers, medians:
+
+| query | serial | parallel IOS | |
+|---|---:|---:|---|
+| q16 | 1.7s | **1.3s** | **−24%**, `Parallel Index Only Scan using partsupp_pk` |
+| q13 | 4.5s | 4.4s | −2%, declines on index size — unchanged plan |
+| q22 | 0.8s | 0.7s | −13%, declines — unchanged plan |
+
+Gates: TPC-H 21/21 byte-identical, exactly ONE plan changed (q16); units,
+tpch-spotcheck PASS; TPC-DS SF0.5 PASS=95 MISMATCH=0 ERROR=0 TIMEOUT=0.
+
+### 23.5 What §21 got wrong, and what is still true
+
+§21's "the delta is parallelism, not the access method" was half right. The
+parallelism was genuinely missing — it is now implemented and q16 gains 24%
+from it. But the *residual* §21 was explaining is the sort: q16 is still 1.3s
+against PG's 0.3s, and `sortOp` is where that gap lives. Parallelising the scan
+was worth doing and was never going to close it on its own.
+
+### 23.6 Superseded disposition (kept for the record)
 
 Reverted in full rather than shipped, and rather than left in the tree
 unreachable behind a disabled gate — an unwinnable path is an untested path.

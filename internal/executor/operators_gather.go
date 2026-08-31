@@ -98,6 +98,12 @@ type gatherOp struct {
 	// The leader builds the bitmap once before fan-out and publishes it here;
 	// workers claim pages via attachParallelBitmapScan.
 	pbm *parallelBitmapState
+
+	// pidx is the shared leaf-block claim set for a parallel index-only scan
+	// (M0134-0189). Unlike pbm there is nothing to pre-build: the index is
+	// already there, so every tree — leader and workers alike — walks it and
+	// keeps only the leaf blocks it claims first.
+	pidx *parallelIndexScanState
 }
 
 func newGatherOp(p *optimizer.Gather, buildChild func() (Operator, error)) *gatherOp {
@@ -225,6 +231,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 	o.ch = make(chan rowBatch, gatherChanDepth*(n+1))
 	// One allocator shared by every child tree, including the leader's.
 	o.pscan = newParallelScanState(0)
+	o.pidx = newParallelIndexScanState()
 
 	// P8: hash-join build sides run ONCE, here, before anything fans out.
 	// This must precede both NewWorkerContext (which copies the reference)
@@ -293,6 +300,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 		// it is a peer, not an extra full scan.
 		attachParallelScan(child, o.pscan)
 		attachParallelBitmapScan(child, o.pbm) // S5.6
+		attachParallelIndexScan(child, o.pidx) // M0134-0189
 		if err := child.Open(ctx); err != nil {
 			_ = child.Close()
 			return err
@@ -332,6 +340,7 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 	}
 	attachParallelScan(child, o.pscan)
 	attachParallelBitmapScan(child, o.pbm) // S5.6
+	attachParallelIndexScan(child, o.pidx) // M0134-0189
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {
 		return err

@@ -1877,10 +1877,19 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		if p.Backward {
 			dir = " Backward"
 		}
-		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), dname)
+		// M0134-0189: "Parallel " prefix, same rule and same source as the
+		// SeqScan / BitmapHeapScan arms — plan->parallel_aware stamped once by
+		// stampParallelScan, never inferred from sitting under a Gather. This
+		// arm exists in BOTH describePlanVerbose and describePlan and the two
+		// must agree: PG's prefix is verbose-independent (explain.c:1630).
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
 		}
-		return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), dname)
+		}
+		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.Insert:
 		return "Insert on " + schemaQualify(p.Table.QualifiedName())
 	case *optimizer.Update:
@@ -2035,10 +2044,19 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 		if p.Backward {
 			dir = " Backward"
 		}
-		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), dname)
+		// M0134-0189: "Parallel " prefix, same rule and same source as the
+		// SeqScan / BitmapHeapScan arms — plan->parallel_aware stamped once by
+		// stampParallelScan, never inferred from sitting under a Gather. This
+		// arm exists in BOTH describePlanVerbose and describePlan and the two
+		// must agree: PG's prefix is verbose-independent (explain.c:1630).
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
 		}
-		return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), p.Table.QualifiedName())
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), dname)
+		}
+		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), p.Table.QualifiedName())
 	case *optimizer.Insert:
 		return fmt.Sprintf("Insert on %s", p.Table.QualifiedName())
 	case *optimizer.Update:

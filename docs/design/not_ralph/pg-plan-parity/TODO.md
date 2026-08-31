@@ -999,7 +999,15 @@ section D. Recorded because the gate run is where they became visible.
       `sortTailWithCTIDs` — q16 is SORT-bound. Each worker sorts its own share
       under `GatherMerge(Sort(…))`, so total comparison work is unchanged and
       a merge stage is added.
-- [ ] **Precondition before retrying**: either Gather placement
+- [x] **SHIPPED (DESIGN §23.4)** after two PG-faithful corrections: decline the
+      P7 Sort-as-partial-root for an IOS driving scan (`sortPartialRootPays`)
+      so the Gather lands BELOW the sort, and size the parallelism by
+      `index->pages` rather than the heap (PG's `compute_parallel_worker`
+      input). Medians: q16 1.7→1.3s (−24%), q13 4.5→4.4s, q22 0.8→0.7s; both
+      of the latter now decline on index size and keep their plans. All gates
+      green, 21/21 byte-identical, one plan changed.
+- [ ] Remaining q16 gap is the SORT, not the scan: 1.3s vs PG's 0.3s, with
+      `sortOp.lessRows`/`sortTailWithCTIDs` dominating. Superseded precondition
       (`Sort(Gather(…))` keeps one leader-side sort while parallelising scan +
       joins) or `sortOp` cost itself — the latter is also the real gap to PG on
       q16 (PG 0.3s vs goopg 1.6s).

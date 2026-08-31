@@ -282,7 +282,7 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		// goopg's Sort carries no top-N limit, so there is no per-worker
 		// truncation to reason about: every worker emits its whole partition.
 		if srt, isSort := cur.(*Sort); isSort && len(srt.Keys) > 0 &&
-			drivingScan(srt.Child) != nil {
+			drivingScan(srt.Child) != nil && sortPartialRootPays(srt) {
 			return partialTarget{node: srt, mergeKeys: srt.Keys}, true
 		}
 		if terminatesPartial(cur) {
@@ -303,6 +303,37 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		}
 		cur = kids[0]
 	}
+}
+
+// sortPartialRootPays reports whether moving the sort into the workers — P7's
+// `Gather Merge -> Sort -> <partial>` — is worth it for this subtree.
+//
+// It answers NO when the driving scan is an index-only scan, and that is a
+// MEASURED restriction, not a preference (M0134-0189). Taking the Sort as the
+// partial root gives every worker its own Sort and the leader a k-way merge on
+// top: the total comparison work is unchanged, a merge stage is added, and the
+// scan saving has to pay for both. For a parallel SEQ scan it does — that is
+// why the arm exists. For a parallel index-only scan it does not, because the
+// IOS is already the cheap half of these plans: a CPU profile of TPC-H q16
+// under this shape puts 34% in `sortOp.lessRows` / `sortTailWithCTIDs` and the
+// scan nowhere in the top nodes, and enabling it measured q16 1.5s -> 2.3s and
+// q13 4.2s -> 6.8s.
+//
+// Declining here does not make the subtree serial. The walk falls through to
+// `terminatesPartial(*Sort)` and descends, so the Gather lands BELOW the sort
+// instead: `Sort -> Gather -> <joins> -> Parallel Index Only Scan`, which
+// parallelises the scan and the joins while leaving exactly one sort, in the
+// leader, where the serial plan already had it.
+//
+// The honest shape of this rule is "per-worker sort must be cheaper than the
+// merge it forces", which needs a cost model goopg's parallel post-pass does
+// not have — it is a size rule (`computeParallelWorkers`), not a cost
+// comparison. Until that exists this states the one case measurement has
+// actually settled, and states it where the decision is made rather than by
+// disabling the scan type outright.
+func sortPartialRootPays(srt *Sort) bool {
+	_, isIOS := drivingScan(srt.Child).(*IndexOnlyScan)
+	return !isIOS
 }
 
 // terminatesPartial reports whether a Gather must sit at or below this node.
@@ -353,6 +384,10 @@ func stampParallelScan(n Node) Node {
 		c.Parallel = true
 		return &c
 	case *BitmapHeapScan:
+		c := *x
+		c.Parallel = true
+		return &c
+	case *IndexOnlyScan:
 		c := *x
 		c.Parallel = true
 		return &c
@@ -408,6 +443,14 @@ func drivingScan(n Node) Node {
 	case *SeqScan:
 		return x
 	case *BitmapHeapScan:
+		return x
+	case *IndexOnlyScan:
+		// M0134-0189. An index-only scan is partial the same way a seq scan
+		// is: workers split the relation, here by index LEAF BLOCK rather
+		// than heap block. Admitted where a plain *IndexScan is not, because
+		// the IOS materialises its whole range in Open — so the split is a
+		// partition of that materialisation — while an index scan is also the
+		// NLI probe shape, under which a Gather never sits.
 		return x
 	case *Filter:
 		return drivingScan(x.Child)
@@ -532,6 +575,8 @@ func scanTable(n Node) *catalog.Table {
 		return x.Table
 	case *BitmapHeapScan:
 		return x.Table
+	case *IndexOnlyScan:
+		return x.Table
 	}
 	return nil
 }
@@ -555,6 +600,24 @@ func computeParallelWorkers(subtree Node, s ParallelSettings) int {
 	}
 
 	blocks, known := parallelRelationBlocks(tbl, s)
+	// An index-only scan never reads the heap, so the heap's size is not what
+	// bounds its parallelism — the INDEX's is. PG sizes exactly this way:
+	// `create_index_paths` passes `index->pages` to `compute_parallel_worker`
+	// (allpaths.c) rather than the relation's, so a covering scan of a small
+	// index does not get the worker count its big table would earn.
+	//
+	// Measured, and it is what separates the two TPC-H index-only queries
+	// (M0134-0189): q16 scans `partsupp_pk`, 2770 real blocks, which clears
+	// the threshold and gains from the split (1.5s -> 1.2s). q13 scans
+	// `customer_pk`, a few hundred blocks over a 3822-block table — sized by
+	// the heap it was granted workers and the Gather cost more than the scan
+	// saved (4.2s -> 7.1s); sized by the index it is below the threshold and
+	// stays serial, which is the right answer and PG's own rule.
+	if ios, isIOS := scan.(*IndexOnlyScan); isIOS && ios.Index != nil {
+		if pages, ok := catalog.IndexRealPages(ios.Index); ok && pages > 0 {
+			blocks, known = pages, true
+		}
+	}
 	if !known {
 		// Size unknown — refuse. Note this is NOT "no ANALYZE statistics":
 		// the size input is a live block count, which needs no ANALYZE (see

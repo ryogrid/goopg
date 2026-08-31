@@ -25,6 +25,23 @@ type indexOnlyScanOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
+	// pidx is the shared leaf-block claim set when this scan is a Gather
+	// worker's driving scan; nil for a serial scan, and a nil receiver
+	// claims every block (parallel_scan.go). M0134-0189.
+	pidx *parallelIndexScanState
+	// leafOwned caches this worker's verdict per leaf, lastLeaf* the most
+	// recent one. The shared claim is a sync.Map operation and a range scan
+	// visits ~300 entries per leaf, so consulting it per ENTRY made the
+	// parallel scan 3.5x SLOWER than serial (q16 1.6s -> 5.7s). A btree scan
+	// walks leaves in key order, so the common case is "same block as the
+	// last entry" and costs one comparison. The map is kept so revisiting a
+	// block reuses this worker's OWN verdict rather than re-asking the
+	// shared set, which would answer "already claimed" about our own claim
+	// and silently drop rows.
+	leafOwned     map[storage.BlockNumber]bool
+	lastLeaf      storage.BlockNumber
+	lastLeafOwned bool
+	lastLeafValid bool
 	// arrayStyle is the session DateStyle/TimeZone an array element's output
 	// function reads, resolved once in Open. M0119-0006.
 	arrayStyle array.OutputStyle
@@ -372,7 +389,19 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		return true, nil
 	}
 
-	if err := tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
+	scanPosFn := func(key []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+		return scanFn(key, ptr)
+	}
+	// nil for a serial scan, so the scan behaves exactly as it always has.
+	var leafFilter func(storage.BlockNumber) bool
+	if o.pidx != nil {
+		leafFilter = o.ownsLeaf
+	}
+
+	// RangeScanWithPosLeafFilter rather than RangeScan: the leaf filter is
+	// what partitions the scan across workers, and the bounds semantics are
+	// identical — RangeScan is rangeScanPos with both ends inclusive.
+	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, false, false, leafFilter, scanPosFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
@@ -405,6 +434,25 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 // (storage.PageVacuumPrune + the LogHeapPruneOpt WAL hook / MarkDirty fallback)
 // but takes no relation lock and never touches the Visibility Map. Best-effort:
 // any error leaves the page untouched rather than failing the read.
+// ownsLeaf reports whether this worker processes entries from leaf block blk,
+// memoising the shared claim. See the leafOwned field for why the shared set is
+// consulted at most once per block per worker rather than once per entry.
+func (o *indexOnlyScanOp) ownsLeaf(blk storage.BlockNumber) bool {
+	if o.lastLeafValid && o.lastLeaf == blk {
+		return o.lastLeafOwned
+	}
+	owned, seen := o.leafOwned[blk]
+	if !seen {
+		owned = o.pidx.claimLeaf(blk)
+		if o.leafOwned == nil {
+			o.leafOwned = make(map[storage.BlockNumber]bool, 64)
+		}
+		o.leafOwned[blk] = owned
+	}
+	o.lastLeaf, o.lastLeafOwned, o.lastLeafValid = blk, owned, true
+	return owned
+}
+
 func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.RelFileNode) {
 	if len(o.touchedBlocks) == 0 || ctx.Pool == nil || ctx.TxnMgr == nil {
 		return

@@ -4040,6 +4040,28 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 // reached via descendToLeaf (which already handles right-link
 // recovery); subsequent leaves are walked rightward via op.Next.
 func (bt *BTree) rangeScanPos(lo, hi []byte, loExclusive, hiExclusive bool, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
+	return bt.rangeScanPosLeaf(lo, hi, loExclusive, hiExclusive, nil, fn)
+}
+
+// RangeScanWithPosLeafFilter is RangeScanWithPos with a per-LEAF admission
+// test. When leafFilter is non-nil it is consulted once per leaf page, before
+// any entry on that page is parsed, and a false answer skips the page whole.
+//
+// It exists for the parallel index-only scan (M0134-0189), where every worker
+// walks the same leaf chain and must process a disjoint share of it. Filtering
+// per ENTRY instead — the obvious shape, and the one measured first — leaves
+// each worker parsing all 800k entries of TPC-H's partsupp_pk and made the
+// parallel scan SLOWER than the serial one (1.6s -> 4.5s): skipped work has to
+// be skipped before it is done, not after. With the page-level test a worker
+// still pins every leaf (cheap, buffer-cached) but parses only its own.
+//
+// leafFilter must be a pure function of the block number: it is called once per
+// leaf per scan, and the scan does not revisit a page it declined.
+func (bt *BTree) RangeScanWithPosLeafFilter(lo, hi []byte, loExclusive, hiExclusive bool, leafFilter func(storage.BlockNumber) bool, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
+	return bt.rangeScanPosLeaf(lo, hi, loExclusive, hiExclusive, leafFilter, fn)
+}
+
+func (bt *BTree) rangeScanPosLeaf(lo, hi []byte, loExclusive, hiExclusive bool, leafFilter func(storage.BlockNumber) bool, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
 	cur, _, err := bt.descendToLeaf(lo)
 	if err != nil {
 		return err
@@ -4057,6 +4079,15 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, loExclusive, hiExclusive bool, fn f
 		// When lo is nil, keyExceedsHighKey(page, nil) is always false
 		// (nil compares less than any real key), so we never skip — correct.
 		if lo != nil && keyExceedsHighKey(bt.format(), slot.Page(), lo) {
+			next := op.Next
+			bt.unpinR(slot)
+			cur = next
+			continue
+		}
+		// Per-leaf admission (M0134-0189). AFTER the high-key recovery skip so
+		// a declined page is one this scan would really have read, and BEFORE
+		// PGDataItemCount so declining costs the pin and nothing else.
+		if leafFilter != nil && !leafFilter(cur) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
