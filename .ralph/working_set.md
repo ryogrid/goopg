@@ -1,83 +1,71 @@
 (idle — nothing in flight)
 
-## Loop #1 (2026-09-01) result — M0134-0180 (tsrf.sql) sized & PARKED; LIMIT/OFFSET SRF check landed as `8519d98b7`
+## Loop #3 (2026-09-01) result — M0134-0182 (type_sanity.sql) sized & PARKED,
+## RESERV date/time literal fix shipped
 
-**Nightly triage:** `ci/logs/action-items.md` run `20260831-013952` (2 new
-items) filed as unconditional obligation, NOT selected (banner still names
-M0134): `AI-...-001` testport isolation-suite timeout (17 specs stuck
-`[running]` 1h56m, one blocked on a `lib/pq` conn stuck in IO wait — needs a
-clean-tree confirmation run before trusting it as a real hang, since the
-run's `meta.json` shows 18 dirty files incl. a concurrently-modified
-`postgres` submodule) and `AI-...-002` build-broke-mid-stage (confirmed
-stale — `go build ./...` clean at HEAD). Both rows in fix_plan.md's
-M-NIGHTLY section.
+**Nightly triage:** `ci/logs/action-items.md` still shows the same run
+`20260831-013952` — already filed prior loop. A newer nightly
+(`20260901-010436`) was mid-run (pgbench stage) when checked, and a
+concurrent process was seen committing its logs — nothing new to file this
+loop.
 
-**Task:** M0134-0180 — `tsrf.sql`. **PARKED** (CSV `not-tried` → `failed`),
-793→785 diff lines. Design `docs/design/0100-0149/m0134-0180-tsrf-sizing.md`
-(landed by a CONCURRENT session's doc-reorg commit `17e695d08` — see note 4
-below — not by my own commit `8519d98b7`, which is why it isn't in that
-commit's file list).
+**Task:** M0134-0182 — `type_sanity.sql`. **PARKED** (CSV `not-tried` →
+`failed`, 1151 diff lines / 9 `^+ERROR`, unchanged in COUNT before/after —
+see why below). Design `docs/design/0100-0149/m0134-0182-type-sanity-sizing.md`.
 
-**Landed:** `exprHasSRF` walker (`internal/parser/analyzer/analyzer.go`,
-mirrors `exprHasWindowFunc`) rejects a set-returning function in LIMIT/OFFSET
-(SQLSTATE 0A000) instead of silently evaluating it via the executor's
-`generate_series`-as-scalar fallback (wrong single-row result). Guards:
-`TestAnalyzeSRFInLimitOffsetRejected`, `TestAnalyzeLimitOffsetNonSRFStillAccepted`.
+**Shipped:** PG's RESERV date/time input keywords ('now'/'today'/
+'tomorrow'/'yesterday'/'epoch' — DecodeDateTime/DecodeTimeOnly, datetime.c)
+were entirely unimplemented for date/time/timetz/timestamp/timestamptz
+literal input (only infinity/-infinity worked). New shared functions
+`parseDateSpecialLiteral`/`parseTimestampSpecialLiteral`/
+`parseTimeSpecialLiteral`/`parseTimeTZSpecialLiteral`
+(internal/executor/copy_text.go) + `nowFromCtx(ctx)` helper (expr.go, next
+to timeZoneFromCtx), threaded through all 10 literal/cast/
+pg_input_is_valid/row-encode call sites in expr.go + codec.go. New test
+`internal/executor/date_time_reserv_literal_test.go`
+(TestDateTimeReservedLiteral, 20 self-consistent cases).
 
-**Four things worth carrying:**
+**Finding — fixing it unmasked a NEW bug:** `'1 2'::int2vector` works
+standalone but `CREATE TABLE t AS SELECT '1 2'::int2vector` errors
+`expected bytes for int2vector, got kind 3` — the CTAS row-encode path
+wasn't reachable before (died earlier on 'today'::date). Net `^+ERROR`
+count unchanged (9→9, one error swapped for another) — textbook
+serially-masked-cause shape, same as M0134-0014/-0025/-0026.
 
-1. **`tsrf.sql` is ~10 independent placement rules, not one gap.** Several
-   already matched the oracle byte-for-byte with ZERO code change: sibling-SRF
-   lockstep zipping (`operators_project_set.go: openSelectSrfMode` already
-   NULL-pads to maxLen correctly), post-aggregation SRF timing when not
-   GROUP-BY-referenced, DISTINCT ON placement, GROUP BY CUBE+SRF. Don't assume
-   a `failed` case needs its dominant gap fixed — verify each assertion
-   independently first (an `Explore` subagent sweep is the efficient way).
-2. **Three REFACTOR-tier gaps ledgered, NOT attempted**: `0180a` six more
-   "SRF not allowed in X" contexts (CASE/COALESCE/aggregate-arg/window-arg/
-   UPDATE-SET/RETURNING/VALUES — aggregate/window-arg has ZERO existing
-   precedent in goopg, needs a `parse_agg.c`-style sublevels-up walker);
-   `0180b` nested-SRF-as-another-SRF's-own-argument (`generate_series(1,
-   generate_series(1,3))` → 1 row not 6) AND GROUP-BY-referencing-a-
-   target-list-SRF (changes pre-aggregation cardinality) — BOTH need the SAME
-   primitive, a recursive/stacked ProjectSet, not independent patches;
-   `0180c` `|@|` as a user-defined prefix operator fails at the parser's
-   closed `{-,+,NOT,~}` prefix set (`select.go:parseUnary`,
-   `support.go:prefixOp`) — unrelated to SRFs, same class as the M0134-0179
-   closed-`OpCode`-enum follow-up.
-3. **`isBuiltinSRF` now has TWO copies** (`internal/executor/
-   operators_ddl_partition.go` and the new `builtinSRFNames` in
-   `internal/parser/analyzer/analyzer.go`) — unavoidable, executor imports
-   analyzer not the reverse. Cross-referenced by comment; keep them in sync
-   by hand if either SRF list changes (Hard-won Rule #2).
-4. **A concurrent session (PID from `ps`, session-id `3ac4bff9...`) was
-   running a 1273-file design-doc reorg (buckets `0000-0049/`, `0050-0099/`,
-   `0100-0149/`) IN THE SAME WORKING TREE throughout this loop** and committed
-   it (`17e695d08`) mid-loop, between my `git add` of the new design doc +
-   README.md edit and my own commit. Because git's index/working tree is
-   shared, that commit swept up my ALREADY-STAGED `docs/design/
-   0100-0149/m0134-0180-tsrf-sizing.md` and my `docs/design/README.md`
-   one-line index-entry edit (both landed correctly, verified post-hoc via
-   `git show HEAD:<path>` — the reorg's own link-path rewrite happened to
-   match the bucket I'd already chosen). My own commit `8519d98b7` therefore
-   does NOT list the design doc or README.md, even though both exist and are
-   committed. **If touching `docs/design/README.md` again while another
-   session may be live, `git add` it immediately before committing (don't
-   leave it staged-but-uncommitted across tool calls) to shrink this race
-   window.**
+**Biggest discovery (ledgered, NOT fixed — REFACTOR-tier):** goopg's live
+`pg_proc`/`regproc` only expose ~32 hand-curated builtins
+(`catalog.builtinProcsByName`) despite a full 3397-row pg_proc.dat mirror
+(`internal/initdb.pgProcInitialEntries()`) correctly written to the on-disk
+heap at initdb time (verified: `base/*/1255` is 778KB but
+`SELECT count(*) FROM pg_proc` returns 32 on a fresh cluster; `int4pl`/
+`array_in`/every PG builtin misses `'x'::regproc` despite being used
+constantly by the evaluator). This is write-only heap data the live query
+engine and `reg_identifier.go`'s regproc-cast fallback never read. Blocks 7
+of this case's 9 `^+ERROR`s and very likely much wider "function does not
+exist" false-negative noise across OTHER regress cases too. Filed as its
+own ledger row, no milestone number assigned yet — worth prioritizing highly
+next time M0134 selection reaches an unclaimed slot, or as a standalone
+M-numbered milestone given its likely blast radius across the whole M0134
+backlog.
 
-**Gates run:** `go build ./...` clean; `go test ./internal/parser/...`
-(incl. `TestParityGoldensAreCurrent`, zero golden diff) / `./internal/
-optimizer/...` / `./internal/executor/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12
-rows=2 22.7s, Q13 rows=34 6.9s); `make check-testport-inventory` PASS;
-`make regen-testport` clean regen; `make ralph-state-guard` PASS. Pre-commit
-hook pgbench smoke PASS (10942 TPS select-only).
+**Gates run:** `go build ./...` clean; `go test ./internal/executor/...`
+full package PASS (incl. new test + pre-existing infinity-literal tests,
+confirming no regression on the folded-in infinity behavior);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` full units
+suite PASS; `make check-testport-inventory` PASS; `make regen-testport`
+clean 6-file regen (CSV flip + derived docs, regress-sql 160→161 failed /
+9→8 not-tried); `make ralph-state-guard` PASS.
 
-**NEXT LOOP:** Re-check banner (M0134 still priority as of this writing).
-Next unclaimed M0134 case per fix_plan.md ordering, OR pick up ledger row
-0180a/0180b/0180c if the banner ever names "M0134 follow-ups" specifically.
-Also worth a quick check: did the AI-...-001 testport-hang nightly item get
-a clean-tree re-run yet (see M-NIGHTLY section)?
+**NEXT LOOP:** Re-check banner (M0134 priority as of writing). Next
+unclaimed M0134 case per ordering is **M0134-0183** (`typed_table.sql`,
+`not-tried`, never sized) — pick that up unless the banner changes.
+Separately worth flagging to the user/next-loop-selector: the pg_proc/
+regproc exposure gap discovered this loop is a HIGH-VALUE, REFACTOR-tier
+target (internal/executor/reg_identifier.go's regproc arm +
+internal/initdb.pgProcInitialEntries() wiring into the live pg_proc
+heap-scan/lookup path) that could unlock many other stuck M0134 cases
+whose `^+ERROR`s are "function X does not exist" for common PG builtins —
+consider filing it as a numbered milestone rather than leaving it as a bare
+ledger row if it recurs in future sizing loops.
 
 **In-flight:** none.

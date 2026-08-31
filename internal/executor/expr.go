@@ -4880,7 +4880,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// PG's 'infinity' / '-infinity' spellings have no finite time.Time and
 		// map to the DATEVAL_NOEND / DATEVAL_NOBEGIN sentinel; intercept before
 		// the layout parse (not time-cached). (unimplemented_feat #5(d-iv))
-		if inf, ok := parseDateInfinityLiteral(x.Value); ok {
+		if inf, ok := parseDateSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
 			return inf, nil
 		}
 		// M0125-0007 / M0119-0006: PG's DecodeDate reads each numeric field on
@@ -4895,12 +4895,19 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		x.CacheValid = true
 		return NewTimeDatum(x.CachedTime), nil
 	case "time":
+		// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
+		if inf, ok := parseTimeSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
+			return inf, nil
+		}
 		ts, err := parseTimeString(x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
 		}
 		return NewTimeDatum(ts), nil
 	case "timetz":
+		if inf, ok := parseTimeTZSpecialLiteral(x.Value, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
+			return inf, nil
+		}
 		ts, offsetSecs, err := parseTimeTZString(x.Value, timeZoneFromCtx(ctx))
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", x.Value)}
@@ -4925,7 +4932,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// time.Time and so are intercepted before the layout loop; the
 		// ±infinity sentinel is not time-cached (detection is a trivial
 		// string compare). (unimplemented_feat #5(d-iv))
-		if inf, ok := parseTimestampInfinityLiteral(x.Value); ok {
+		if inf, ok := parseTimestampSpecialLiteral(x.Value, nowFromCtx(ctx), isTimestampTZTypeName(x.Type)); ok {
 			return inf, nil
 		}
 		// M0125-0007: same field-at-a-time acceptance as the date case above —
@@ -5661,6 +5668,21 @@ func timeZoneFromCtx(ctx *Context) string {
 	return ""
 }
 
+// nowFromCtx returns the statement timestamp the 'now'/'today'/'tomorrow'/
+// 'yesterday' RESERV date/time literals resolve against (ctx.Now — captured
+// once at statement start, same source as the "now"/"current_timestamp"
+// function arm above). ctx.Now is zero only when ctx itself is nil: several
+// encodeValuePGCtx callers (catalog-row/bootstrap encoders, see the
+// "timestamp"/"timestamptz" codec.go arm) pass a nil ctx and are never on a
+// live literal-parsing path, but a real wall-clock fallback is still safer
+// than the zero time.Time — mirrors timeZoneFromCtx's nil-ctx default.
+func nowFromCtx(ctx *Context) time.Time {
+	if ctx != nil && !ctx.Now.IsZero() {
+		return ctx.Now
+	}
+	return time.Now()
+}
+
 // formatTimeDatumDateStyle renders a non-time-only KindTime datum as text,
 // honoring the session DateStyle and TimeZone GUCs. Mirrors Datum.Format()'s
 // ±infinity and TimeSub branching, but dispatches DATE / TIMESTAMP /
@@ -6268,7 +6290,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		if d.Kind == KindString {
 			s := d.StringValue()
 			// 'infinity' / '-infinity' → DATEVAL_NOEND / NOBEGIN (#5(d-iv)).
-			if inf, ok := parseDateInfinityLiteral(s); ok {
+			if inf, ok := parseDateSpecialLiteral(s, nowFromCtx(ctx)); ok {
 				return inf, nil
 			}
 			// date_in decodes a zone field and then ignores it, so the day comes
@@ -6300,6 +6322,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "time":
 		// Cast to time: extract time-of-day from KindTime, parse strings. M0097-0004.
 		if d.Kind == KindString {
+			// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
+			if inf, ok := parseTimeSpecialLiteral(d.StringValue(), nowFromCtx(ctx)); ok {
+				return inf, nil
+			}
 			ts, err := parseTimeString(d.StringValue())
 			if err != nil {
 				return Datum{}, err
@@ -6315,6 +6341,9 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "timetz":
 		// Cast to timetz: parse strings with timezone offset. M0097-0004.
 		if d.Kind == KindString {
+			if inf, ok := parseTimeTZSpecialLiteral(d.StringValue(), nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
+				return inf, nil
+			}
 			ts, offsetSecs, err := parseTimeTZString(d.StringValue(), timeZoneFromCtx(ctx))
 			if err != nil {
 				return Datum{}, err
@@ -6332,7 +6361,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		tz := isTimestampTZTypeName(targetType)
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
-			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
+			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), tz); ok {
 				return inf, nil
 			}
 			// `::timestamp` discards a zone the text carries, `::timestamptz`
@@ -12617,11 +12646,15 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				_, err := parsePgLSN(v)
 				return NewBoolDatum(err == nil), nil
 			case "time", "timetz":
+				// 'now' is valid time/timetz input (#5(d-iv), M0134-0182).
+				if strings.EqualFold(strings.TrimSpace(v), "now") {
+					return NewBoolDatum(true), nil
+				}
 				_, err := parseTimeString(v)
 				return NewBoolDatum(err == nil), nil
 			case "date":
-				// 'infinity' / '-infinity' are valid date input (#5(d-iv)).
-				if _, ok := parseDateInfinityLiteral(v); ok {
+				// 'infinity' / '-infinity' / 'today' / ... are valid date input (#5(d-iv), M0134-0182).
+				if _, ok := parseDateSpecialLiteral(v, nowFromCtx(ctx)); ok {
 					return NewBoolDatum(true), nil
 				}
 				// M0125-0007 / M0119-0006: pg_input_is_valid must agree with the
@@ -12630,8 +12663,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				_, err := parsePGDateText(v)
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":
-				// 'infinity' / '-infinity' are valid timestamp input (#5(d-iv)).
-				if _, ok := parseTimestampInfinityLiteral(v); ok {
+				// 'infinity' / '-infinity' / 'today' / ... are valid timestamp input (#5(d-iv), M0134-0182).
+				if _, ok := parseTimestampSpecialLiteral(v, nowFromCtx(ctx), t == "timestamptz"); ok {
 					return NewBoolDatum(true), nil
 				}
 				_, err := parseCopyTimestampZone(v, tsZoneModeForType(t))

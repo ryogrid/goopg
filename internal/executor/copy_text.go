@@ -1483,38 +1483,117 @@ func parseCopyTimestampZoneParts(s string, zone tsZoneMode, sessionZone string) 
 	return time.Time{}, 0, fmt.Errorf("invalid timestamp %q", s)
 }
 
-// parseTimestampInfinityLiteral recognises PostgreSQL's special timestamp input
-// spellings that have no finite time.Time representation: 'infinity' / '+infinity'
-// (DTK_LATE) and '-infinity' (DTK_EARLY). Matching is case-insensitive on the
-// trimmed text, mirroring the RESERV token lookup in datetime.c (the
-// {"+infinity",…,DTK_LATE}, {LATE,…,DTK_LATE} and {EARLY,…,DTK_EARLY} entries in
-// datetbl, consumed by DecodeDateTime). Returns the matching KindTime ±infinity
-// sentinel Datum and true, or (zero, false) when s is not an infinity literal.
-// (unimplemented_feat #5(d-iv))
-func parseTimestampInfinityLiteral(s string) (Datum, bool) {
+// parseTimestampSpecialLiteral recognises PostgreSQL's RESERV keyword
+// spellings for timestamp/timestamptz input (DecodeDateTime, datetime.c's
+// datetbl): 'infinity' / '+infinity' (DTK_LATE) and '-infinity' (DTK_EARLY)
+// have no finite time.Time representation; 'now' (DTK_NOW), 'today'
+// (DTK_TODAY), 'tomorrow' (DTK_TOMORROW), 'yesterday' (DTK_YESTERDAY) and
+// 'epoch' (DTK_EPOCH) resolve against now, the caller's captured statement
+// time (ctx.Now — see nowFromCtx) — matching real PG's GetCurrentTimeUsec/
+// GetCurrentDateTime, which read the transaction's `now()` rather than the
+// live wall clock. 'today'/'tomorrow'/'yesterday' truncate to midnight in
+// UTC, the same simplification current_date's own RESERV-less arm already
+// makes (expr.go's "current_date" case) — session-TimeZone-aware midnight
+// is a pre-existing, separately-tracked gap, not one this literal path
+// introduces. Matching is case-insensitive on the trimmed text. tz tags the
+// result TimeSubTimestampTZ (NewTimestampTZDatum) vs plain (NewTimeDatum),
+// mirroring every other timestamp-producing site's convention
+// (isTimestampTZTypeName). Returns the resolved Datum and true, or (zero,
+// false) when s matches none of the RESERV spellings. (unimplemented_feat
+// #5(d-iv), M0134-0182)
+func parseTimestampSpecialLiteral(s string, now time.Time, tz bool) (Datum, bool) {
+	mk := NewTimeDatum
+	if tz {
+		mk = NewTimestampTZDatum
+	}
+	midnight := func(t time.Time) Datum {
+		t = t.UTC()
+		return mk(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC))
+	}
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "infinity", "+infinity":
 		return NewTimestampInfinity(true), true
 	case "-infinity":
 		return NewTimestampInfinity(false), true
+	case "now":
+		return mk(now), true
+	case "epoch":
+		return mk(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)), true
+	case "today":
+		return midnight(now), true
+	case "tomorrow":
+		return midnight(now.AddDate(0, 0, 1)), true
+	case "yesterday":
+		return midnight(now.AddDate(0, 0, -1)), true
 	}
 	return Datum{}, false
 }
 
-// parseDateInfinityLiteral is the date-domain sibling of
-// parseTimestampInfinityLiteral: PG's date_in (DecodeDateTime with the same
-// DTK_LATE / DTK_EARLY RESERV tokens) maps 'infinity'/'+infinity' →
-// DATEVAL_NOEND and '-infinity' → DATEVAL_NOBEGIN. Returns the matching
-// ±infinity DATE sentinel Datum (TimeSubDate set) and true, or (zero, false).
-// (unimplemented_feat #5(d-iv))
-func parseDateInfinityLiteral(s string) (Datum, bool) {
+// parseDateSpecialLiteral is the date-domain sibling of
+// parseTimestampSpecialLiteral: PG's date_in shares DecodeDateTime with the
+// same RESERV tokens, then discards the time-of-day. 'now' and 'today' are
+// therefore the same DATE for date_in (both fold to midnight of the current
+// day; the distinction only matters for the timestamp domain, where 'now'
+// keeps the time-of-day). See parseTimestampSpecialLiteral for the shared
+// now/UTC-midnight semantics and the current_date TimeZone caveat.
+// (unimplemented_feat #5(d-iv), M0134-0182)
+func parseDateSpecialLiteral(s string, now time.Time) (Datum, bool) {
+	midnight := func(t time.Time) Datum {
+		t = t.UTC()
+		return NewDateDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC))
+	}
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "infinity", "+infinity":
 		return NewDateInfinity(true), true
 	case "-infinity":
 		return NewDateInfinity(false), true
+	case "now", "today":
+		return midnight(now), true
+	case "tomorrow":
+		return midnight(now.AddDate(0, 0, 1)), true
+	case "yesterday":
+		return midnight(now.AddDate(0, 0, -1)), true
+	case "epoch":
+		return NewDateDatum(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)), true
 	}
 	return Datum{}, false
+}
+
+// parseTimeSpecialLiteral recognises 'now', the only RESERV token
+// DecodeTimeOnly accepts (datetime.c) for `time` input: the caller's
+// captured statement time-of-day, date discarded. Mirrors current_time's
+// existing convention (expr.go's "current_time" FuncCall arm) of reading
+// ctx.Now.UTC() directly rather than converting through the session
+// TimeZone — `time`/`time with time zone`'s own zone handling is a
+// pre-existing, separately-tracked simplification this literal path does
+// not change. now is nowFromCtx(ctx). (M0134-0182)
+func parseTimeSpecialLiteral(s string, now time.Time) (Datum, bool) {
+	if !strings.EqualFold(strings.TrimSpace(s), "now") {
+		return Datum{}, false
+	}
+	t := now.UTC()
+	return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), true
+}
+
+// parseTimeTZSpecialLiteral is the timetz-domain sibling of
+// parseTimeSpecialLiteral. Unlike plain `time`, `time with time zone` has an
+// established "no zone in the input" fallback already (parseTimeTZString's
+// own tail: misc.TimeTZSessionOffset(zone, ...) supplies the session zone's
+// current offset) — 'now' reuses that exact mechanism rather than adding a
+// second, divergent one. zone is the session TimeZone GUC (timeZoneFromCtx);
+// an empty zone (no GetSetting wired) leaves the offset at 0, same as every
+// other timetz path's nil-ctx fallback.
+func parseTimeTZSpecialLiteral(s string, now time.Time, zone string) (Datum, bool) {
+	if !strings.EqualFold(strings.TrimSpace(s), "now") {
+		return Datum{}, false
+	}
+	t := now.UTC()
+	tt := time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+	offsetSecs := 0
+	if zone != "" {
+		offsetSecs = misc.TimeTZSessionOffset(zone, t.Hour(), t.Minute(), t.Second())
+	}
+	return NewTimeTZDatum(tt, offsetSecs), true
 }
 
 // parseFullTimestamp parses PostgreSQL verbose timestamp strings such as
