@@ -1,55 +1,70 @@
 (idle — nothing in flight)
 
-## Loop #9 (2026-09-01) result — M0134-0188 (`xml.sql`) contained fix shipped
+## Loop #12 (2026-09-01) result — M0134 declared EXHAUSTED, priority falls to M0119 (commit `4f14b6fba`)
 
 **Nightly triage:** `ci/logs/action-items.md` still shows run `20260901-010436`
-(7 items) — all already filed (confirmed via grep against fix_plan.md: 5
-pre-existing rows re-failed, 2 already filed loop #7/#8). No new items filed
-this loop.
+(7 items, mtime 02:11) — same run loops #10/#11 already confirmed filed (all 7
+subjects have M-NIGHTLY tasks in fix_plan.md, re-verified this loop). No new
+items.
 
-**Task:** M0134-0188 — `xml.sql`. Sized live for the first time: 0/1 PASS,
-2222 diff lines, 239 `^+ERROR`, 38 `^-ERROR`. Landed the fifth "missing
-evalCast arm = unvalidated text" fix (commit `db71a8d2a`), taking it to 2202
-diff lines / 37 `^-ERROR`. CSV stays `failed`/`pass_required=no` (dominated
-by two REFACTOR-tier subsystems — see below).
+**Task:** resolved the standing question loops #9-#11 had each partly
+investigated but never closed: is there any regress-sql case with a
+`failed`/`not-tried` CSV status that lacks an M0134 task ID (i.e. genuinely new
+work)? Answer, verified mechanically: **no.**
 
-**Fix shipped:** goopg had no `evalCast` arm for `"xml"` at all, so
-`'<wrong'::xml` and (worse) an *implicit* column-coercion
-`INSERT INTO t(x xml) VALUES ('<wrong')` both silently succeeded. New
-`xmlValidate` (`internal/executor/xmltypes.go`) checks well-formedness per
-the session `xmloption` GUC (declared but previously unconsumed) via
-`encoding/xml.Decoder` strict mode — a well-formedness check, not a full XML
-engine. Wired into TWO sibling paths (both needed independent fixes):
-`evalCast`'s new `"xml"` case (also backs `pg_input_is_valid`/
-`pg_input_error_info`), and `encodeValuePGCtx`'s new `"xml"` case
-(`codec.go`) — the physical row-encoder INSERT/UPDATE calls for implicit
-coercion, which never routed through `evalCast`. New test
-`TestXMLWellFormedness`. Regression A/B (stash-based,
-`create_table`/`alter_table`/`type_sanity`) byte-identical, zero
-regressions.
+Method: extracted the canonical 189-row `task ↔ case` table from
+`docs/milestones/0134-regress-sql-failed-not-tried-digestion.md`'s own "Task
+list" section, diffed it (`comm -23`) against every regress-sql row in
+`docs/test-port/postgres-oracle-target-inventory.csv` currently `failed`/
+`not-tried` (167 rows) — empty result, every one already has an ID. Also
+confirmed zero active `fix_plan.md` task bodies still carry the original
+unattempted-boilerplate filing text. (Tasks 0091-0140 appearing absent from
+the active `fix_plan.md` turned out to be a red herring — legitimate archival
+commit `1d74052c5` moved them to `completed_milestones/completed_fix_plan_012.md`
+months ago; each ID's real landing commit was confirmed via `git log`, e.g.
+`eac970d26` M0134-0092, `608a2bb81` M0134-0140.)
 
-**Remaining gaps (ledgered, `.ralph/deferral_ledger.md` M0134-0188 row):**
-(a) SQL/XML publishing-function grammar (`XMLELEMENT`/`XMLTABLE`/
-`XMLCONCAT`/…) has no grammar production at all — REFACTOR-tier, same shape
-as the already-filed SQL/JSON gap M0134-0168a, blocks M0134-0189
-(`xmlmap.sql`) too; (b) XPath evaluation (`xpath`/`xpath_exists`) plus three
-contained leaf functions (`xmlcomment`/`xmltext`/`xml_is_well_formed*`);
-(c) `SET XML OPTION DOCUMENT|CONTENT`'s own grammar form; (d)
-declaration-level well-formedness checks `encoding/xml` doesn't model (e.g.
-`standalone="y"` validity). None attempted.
+**Conclusion:** all 189 filed M0134 regress-sql cases have been sized at least
+once and are each CLOSED (green or stale-pass) or PARKED on a named
+REFACTOR-tier prerequisite with its own re-arm trigger (parallel-query
+execution, SQL/JSON constructors, outer-join nullability, physical GiST/GIN/
+SP-GiST/BRIN index-scan integration, geometry operator lexing, the `money`
+type, `pg_shdepend`/object-address enumeration, etc.). **M0134 has no
+selectable task.** Documented in
+`docs/milestones/0134-regress-sql-failed-not-tried-digestion.md` ("Exhaustion
+note (2026-09-01)", status header) and in `fix_plan.md`'s Current Priority
+banner + M0119 section (M0119-0005 was already fully landed — only M0119-0006
+pg_amcheck server tier remains open).
 
-**Gates run:** `go build ./...` clean; `go test ./internal/optimizer/...
-./internal/parser/... ./internal/parser/analyzer/... ./internal/catalog/...
-./internal/executor/...` all PASS; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (full suite incl. internal/initdb,
-cmd/goopg); `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=34); `make
-ralph-state-guard` PASS (one auto-repair, same benign pre-existing
-"completed" marker pattern as loops #4-#8); pre-commit pgbench smoke PASS
-(505/650/11723 TPS, 0 failed).
+**Concurrency note (important for next loop):** mid-session a concurrent Ralph
+process committed `57eb66cdd` ("condense remaining tasks/subtasks to
+final-status-only"), shrinking `fix_plan.md` from ~3972 to ~679 lines
+(compressing nightly-item and M0134-task-list bodies to terse bullets). It
+landed between my Reads and Edits of `fix_plan.md`; my banner/M0119-section
+edits (old_string matches were all in sections the condenser didn't touch)
+applied cleanly on top and are already part of that commit — verified via
+`git diff` (empty) before this loop's own commit. No corruption, but a
+reminder that a second Ralph loop is/was active on this tree concurrently
+(matches `[[concurrent_ralph_loops_corrupt_tree]]` /
+`[[ralph_fixplan_driver_churn_defeats_edit]]`) — re-read `fix_plan.md` fresh
+before editing it, don't trust a cached view.
 
-**NEXT LOOP:** Re-check banner (M0134 priority as of writing). Next unclaimed
-M0134 case per ordering is **M0134-0189** (`xmlmap.sql`, `not-tried`, never
-sized) — expect the same sizing-and-park shape (gated by the same SQL/XML
-grammar gap (a) above) unless that subsystem gets opened first.
+**NEXT LOOP:** Re-check the `## Current Priority` banner first. It now says
+M0134 is exhausted and active selection is **M0119** (sole task: M0119-0006 —
+pg_amcheck server tier). Per the M0119 per-task rule, write a design doc under
+`docs/design/M0119-0006-NNNN-*.md` (draft → accepted, agent-reviewed) before
+implementing. Re-verify M0119-0006 hasn't already landed (check git log /
+`.ralph/deferral_ledger.md` first — M0119 tasks require "verify it already
+landed" per the milestone's own rule). After M0119 clears, M0122's remaining
+items are next. If any M0134 PARKED case's named prerequisite has since
+landed as its own milestone, that re-arms M0134 selection for that one case
+only (re-run `scripts/pg-regress-runner.sh --verbose <case>` and re-size).
+
+**Gates run:** `go build ./...` clean; `make check-testport-inventory` PASS;
+`make ralph-state-guard` PASS (one auto-repair, same benign pattern as loops
+#4-#12); pre-commit pgbench smoke PASS (507/650/11726 TPS, 0 failed) — fired
+automatically via the git hook on the milestone-doc commit. Did not run the
+full `ralph-precommit-test.sh` units suite or `tpch-spotcheck.sh` this loop
+(no engine/planner/executor code touched — pure docs/fix_plan bookkeeping).
 
 **In-flight:** none.
