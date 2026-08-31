@@ -19,7 +19,7 @@
 - **Lateral** (`openLateral`, `:251`): per-outer-row re-execution into
   `o.rows`.
 - **RIGHT/FULL** are forced onto merge join by planning rule
-  ([0003-0001](../0003-0001-planner-overview.md)), inheriting merge's full
+  ([0003-0001](../0000-0049/0003-0001-planner-overview.md)), inheriting merge's full
   materialisation.
 - **NLI** (`operators_nljoin.go`) and **Memoize** are already streaming and
   zero-copy — the executor's good citizens.

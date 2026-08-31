@@ -310,5 +310,5 @@ per row stays at 1 — it just moves from seqScanOp to drainRowsCtx.
 
 ## 7. Related improvements
 
-- [03-row-decode-fast-path.md](./03-row-decode-fast-path.md) — the decode strategy that produces arena-backed Datums; Fix 04 eliminates the redundant copy of those Datums.
-- [01-spill-writer-stack-elimination.md](./01-spill-writer-stack-elimination.md) — the spill writer that `drainRowsBounded` delegates to; the spill writer's `WriteRow` already handles arena-backed input correctly.
+- [03-row-decode-fast-path.md](03-row-decode-fast-path.md) — the decode strategy that produces arena-backed Datums; Fix 04 eliminates the redundant copy of those Datums.
+- [01-spill-writer-stack-elimination.md](01-spill-writer-stack-elimination.md) — the spill writer that `drainRowsBounded` delegates to; the spill writer's `WriteRow` already handles arena-backed input correctly.

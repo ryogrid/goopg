@@ -5,7 +5,7 @@
 | priority | LOW-MEDIUM — 4–9% cum alloc across all queries |
 | risk | Low |
 | files | `internal/executor/numeric.go`, `internal/executor/codec.go` |
-| composes with | [03-row-decode-fast-path.md](./03-row-decode-fast-path.md) |
+| composes with | [03-row-decode-fast-path.md](03-row-decode-fast-path.md) |
 
 ## 1. Motivation
 
@@ -371,5 +371,5 @@ use case (scan decode). Populating it is a blocking prerequisite:
 
 ## 8. Related improvements
 
-- [03-row-decode-fast-path.md](./03-row-decode-fast-path.md) — the decode strategy that includes `makeNumericColDecode(scale)`, which directly calls `parseNumericFastScale` without the if/else chain. Implement Fix 06 before Fix 03 so the strategy can include the known-scale numeric decode function.
+- [03-row-decode-fast-path.md](03-row-decode-fast-path.md) — the decode strategy that includes `makeNumericColDecode(scale)`, which directly calls `parseNumericFastScale` without the if/else chain. Implement Fix 06 before Fix 03 so the strategy can include the known-scale numeric decode function.
 - The int64 fast-path arithmetic (`numericAdd`, `numericMul`, `numericDiv`, `numericCmp` in `numeric.go`) already exists — Fix 06 ensures values land on the int64 lane from the start, avoiding big.Int promotion during decode.

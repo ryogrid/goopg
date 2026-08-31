@@ -21,12 +21,12 @@ probe (12–26% cum where joins exist).
 
 | Impl. order | Document | Depends on | Payoff | Importance |
 | --- | --- | --- | --- | --- |
-| **1** | [01-spill-writer-stack-elimination.md](./01-spill-writer-stack-elimination.md) | None | **3–7× faster** for Q4/Q7/Q13 | CRITICAL |
-| 2 | [02-systemic-backend-id-lookup.md](./02-systemic-backend-id-lookup.md) | None (complements 01) | Eliminates remaining `runtime.Stack` callers | MEDIUM |
-| 3 | [03-row-decode-fast-path.md](./03-row-decode-fast-path.md) | None | 24–38% cum CPU reduction across all queries | HIGH |
-| 4 | [04-double-clone-elimination.md](./04-double-clone-elimination.md) | None | Eliminates redundant O(width) copy per build row | HIGH |
-| 5 | [05-hash-probe-clone-elimination.md](./05-hash-probe-clone-elimination.md) | None (optional after 01–04) | 12–26% cum CPU where joins exist | MEDIUM |
-| 6 | [06-numeric-fast-path.md](./06-numeric-fast-path.md) | Composes with 03 | 4–9% cum alloc reduction | LOW-MEDIUM |
+| **1** | [01-spill-writer-stack-elimination.md](01-spill-writer-stack-elimination.md) | None | **3–7× faster** for Q4/Q7/Q13 | CRITICAL |
+| 2 | [02-systemic-backend-id-lookup.md](02-systemic-backend-id-lookup.md) | None (complements 01) | Eliminates remaining `runtime.Stack` callers | MEDIUM |
+| 3 | [03-row-decode-fast-path.md](03-row-decode-fast-path.md) | None | 24–38% cum CPU reduction across all queries | HIGH |
+| 4 | [04-double-clone-elimination.md](04-double-clone-elimination.md) | None | Eliminates redundant O(width) copy per build row | HIGH |
+| 5 | [05-hash-probe-clone-elimination.md](05-hash-probe-clone-elimination.md) | None (optional after 01–04) | 12–26% cum CPU where joins exist | MEDIUM |
+| 6 | [06-numeric-fast-path.md](06-numeric-fast-path.md) | Composes with 03 | 4–9% cum alloc reduction | LOW-MEDIUM |
 
 **Recommended implementation order:** 01 → 02 → 06 → 03 → 04 → 05.
 
@@ -84,5 +84,5 @@ probe (12–26% cum where joins exist).
 
 - [cost-model/](../cost-model/README.md) — PG-faithful Path/cost model (the planner that selects which plans these fixes benefit)
 - [perf-optimize/](../perf-optimize/) — Round 1–4 performance optimizations, including the WAL `runtime.Stack` fix (M0068) that is the direct precedent for Fix 01
-- [M0068-0004 row-slot pool](../0068-0004-row-slot-pool.md) — the `rowPool` design that Fix 03 builds upon
-- [M0073-0002 decode arena binding](../0073-0002-decode-arena-binding.md) — arena-backed string/bytes decode that Fix 03 extends
+- [M0068-0004 row-slot pool](../0050-0099/0068-0004-row-slot-pool.md) — the `rowPool` design that Fix 03 builds upon
+- [M0073-0002 decode arena binding](../0050-0099/0073-0002-decode-arena-binding.md) — arena-backed string/bytes decode that Fix 03 extends

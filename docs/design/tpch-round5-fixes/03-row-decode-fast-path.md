@@ -5,7 +5,7 @@
 | priority | HIGH — 24–38% cum CPU across all 5 queries |
 | risk | Medium |
 | files | `internal/executor/codec.go`, `internal/executor/codec_strategy.go` (new), `internal/executor/operators_storage.go` |
-| composes with | [06-numeric-fast-path.md](./06-numeric-fast-path.md) |
+| composes with | [06-numeric-fast-path.md](06-numeric-fast-path.md) |
 
 ## 1. Motivation
 
@@ -444,5 +444,5 @@ no performance impact.
 
 ## 7. Related improvements
 
-- [06-numeric-fast-path.md](./06-numeric-fast-path.md) — the known-scale numeric decode function that the strategy's numeric closure calls. Implement 06 before 03 so the strategy can directly include `parseNumericFastScale`.
-- [04-double-clone-elimination.md](./04-double-clone-elimination.md) — the decode strategy's arena-backed path feeds into the double-clone problem; fixing both together gives the largest cumulative allocation reduction.
+- [06-numeric-fast-path.md](06-numeric-fast-path.md) — the known-scale numeric decode function that the strategy's numeric closure calls. Implement 06 before 03 so the strategy can directly include `parseNumericFastScale`.
+- [04-double-clone-elimination.md](04-double-clone-elimination.md) — the decode strategy's arena-backed path feeds into the double-clone problem; fixing both together gives the largest cumulative allocation reduction.

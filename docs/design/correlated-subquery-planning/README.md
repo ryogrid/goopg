@@ -7,7 +7,7 @@
 | branch | `wal-pg-nodetree` (HEAD `e4a43ba6` at time of writing) |
 | scope | planner + executor design bundle (design only — no code changes in this bundle) |
 | goal | PG-faithful, efficient planning and execution of queries containing correlated (and non-correlated) subqueries |
-| supersedes | on overlap: the unimplemented remainder of [0058-0001](../0058-0001-subplan-and-join-optimisation.md) and follow-ups implied by [0061-0001](../0061-0001-exists-anti-semi-join-unnesting.md); absorbs [0063-0004](../0063-0004-q21-anti-join-index-driven.md) into the NLI semi/anti design |
+| supersedes | on overlap: the unimplemented remainder of [0058-0001](../0050-0099/0058-0001-subplan-and-join-optimisation.md) and follow-ups implied by [0061-0001](../0050-0099/0061-0001-exists-anti-semi-join-unnesting.md); absorbs [0063-0004](../0050-0099/0063-0004-q21-anti-join-index-driven.md) into the NLI semi/anti design |
 
 ## Why this bundle exists
 
@@ -97,10 +97,10 @@ measured facts as drivers.
 
 | Prior doc | Relationship |
 | --- | --- |
-| [0058-0001](../0058-0001-subplan-and-join-optimisation.md) | Gaps 1/3/4/5 landed (M0058, `d5091071`); the unimplemented remainder and its SubPlan-cache sections are superseded by docs 03/04 |
-| [0061-0001](../0061-0001-exists-anti-semi-join-unnesting.md) | Implemented core absorbed as current state in doc 01; its non-firing at HEAD is this bundle's D3.0 |
-| [0063-0004](../0063-0004-q21-anti-join-index-driven.md) | Absorbed as a special case of D6.2 (NLI anti-join) |
-| [0040-0001](../0040-0001-subquery-caching-and-unnest.md), [0033-0001](../0033-0001-subquery-unnesting.md), [0003-0008](../0003-0008-subqueries.md) | Historical background; built on, not superseded |
+| [0058-0001](../0050-0099/0058-0001-subplan-and-join-optimisation.md) | Gaps 1/3/4/5 landed (M0058, `d5091071`); the unimplemented remainder and its SubPlan-cache sections are superseded by docs 03/04 |
+| [0061-0001](../0050-0099/0061-0001-exists-anti-semi-join-unnesting.md) | Implemented core absorbed as current state in doc 01; its non-firing at HEAD is this bundle's D3.0 |
+| [0063-0004](../0050-0099/0063-0004-q21-anti-join-index-driven.md) | Absorbed as a special case of D6.2 (NLI anti-join) |
+| [0040-0001](../0000-0049/0040-0001-subquery-caching-and-unnest.md), [0033-0001](../0000-0049/0033-0001-subquery-unnesting.md), [0003-0008](../0000-0049/0003-0008-subqueries.md) | Historical background; built on, not superseded |
 | [fix-for-q5/](../fix-for-q5/README.md), 0077 cost-model line | Cost-model ownership stays there; doc 06 adds only the minimal touchpoints this bundle needs |
 | M0122-0011 NullAware NOT-IN | Retained beyond-PG divergence (doc 02 fidelity matrix) |
 

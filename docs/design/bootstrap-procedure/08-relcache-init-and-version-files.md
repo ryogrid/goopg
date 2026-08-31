@@ -3,7 +3,7 @@
 **Status:** draft
 **Date:** 2026-05-19
 **Milestone:** M0106 (PG Relcache Init File Compatibility); supersedes
-[`docs/design/0106-0001-relcache-init-file-format.md`](../0106-0001-relcache-init-file-format.md).
+[`docs/design/0106-0001-relcache-init-file-format.md`](../0100-0149/0106-0001-relcache-init-file-format.md).
 
 ---
 

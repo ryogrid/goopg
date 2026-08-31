@@ -2,7 +2,7 @@
 
 Covers `6fa1f400d` (gather-merge NULL-ordering fix) and `M0134-0191`
 (precomputed sort keys). Design and rationale:
-[`DESIGN.md`](./DESIGN.md).
+[`DESIGN.md`](DESIGN.md).
 
 ## Method
 

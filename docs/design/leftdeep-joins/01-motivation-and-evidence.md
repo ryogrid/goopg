@@ -12,7 +12,7 @@ Three independent efforts all hit the same wall in 2026-07/08:
 
 **(1) MultiHashJoin (the n-ary plan node, M0038 → M0126-0011).** Introduced
 because a binary hash cascade "copied ~800K rows × 17 cols" at one Q2 seam
-([0038-0001](../0038-0001-multi-way-hash-join.md)). It worked — and it grew a
+([0038-0001](../0000-0049/0038-0001-multi-way-hash-join.md)). It worked — and it grew a
 planner-side coordinate round-trip (flatten to OID-sorted table list, remap
 every `ColumnRef`: `rewriteMultiWayChain` `internal/planner/bushy.go:1795`,
 `buildMHJPosMap` `:2385`, plus `mhj_input_rewrite.go`, 903 lines) that became
