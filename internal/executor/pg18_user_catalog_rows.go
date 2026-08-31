@@ -655,6 +655,26 @@ func indexPersistence(idx *catalog.Index) string {
 	return "p"
 }
 
+// indexRelamOID resolves pg_class.relam for a user index. A `USING hash`
+// index is architecturally built on the B-tree substrate (idx.Method stays
+// "btree", idx.DeclaredHash records the original clause — see
+// catalog.IndexAMCapabilityByName's doc comment) so it deliberately keeps
+// reporting btree's oid here too. gist/gin/spgist/brin indexes are
+// catalog-only under their real Method string (no B-tree substrate
+// involved), so relam must resolve from it — mirrors the fix to catalog.go's
+// virtual pg_class builder (M0119-0006: pg_class.relam was defaulting every
+// non-hash non-btree method to btree's oid, which made pg_amcheck's own
+// `c.relam = BTREE_AM_OID` index-enumeration query wrongly match them).
+func indexRelamOID(idx *catalog.Index) int64 {
+	if idx == nil || idx.DeclaredHash {
+		return pgBTreeAccessMethodOID
+	}
+	if amOID := catalog.AccessMethodOIDByName(idx.Method); amOID != 0 {
+		return int64(amOID)
+	}
+	return pgBTreeAccessMethodOID
+}
+
 // buildUserPGClassRowForIndex constructs the 34-column PG18-canonical
 // pg_class row for a user-defined index.
 func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
@@ -676,7 +696,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewIntDatum(0),                        // reltype
 		NewIntDatum(0),                        // reloftype
 		NewIntDatum(bootstrapSuperuserOID),    // relowner
-		NewIntDatum(pgBTreeAccessMethodOID),   // relam
+		NewIntDatum(indexRelamOID(idx)),       // relam
 		NewIntDatum(int64(idx.OID)),           // relfilenode
 		NewIntDatum(int64(idx.Tablespace)),    // reltablespace (0 = default; explicit CREATE/ALTER INDEX ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                        // relpages

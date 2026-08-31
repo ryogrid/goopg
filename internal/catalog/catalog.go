@@ -7757,10 +7757,26 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				idxNsOID = oid
 			}
 		}
-		// Determine relam for index: btree=403, hash=405, gist=783, gin=2742, spgist=4000, brin=3580.
+		// Determine relam for index: btree=403, hash=405, gist=783, gin=2742,
+		// spgist=4000, brin=3580. A `USING hash` index is architecturally built
+		// on the B-tree substrate (idx.Method stays "btree", idx.DeclaredHash
+		// records the original clause — see IndexAMCapabilityByName's doc
+		// comment) so it deliberately keeps reporting relam=403 here too,
+		// matching how it reports "everywhere else in goopg" except the one
+		// pg_indexam_has_property compat surface. gist/gin/spgist/brin indexes
+		// ARE registered catalog-only under their real Method string (no B-tree
+		// substrate involved), so relam must resolve from it — this branch used
+		// to only special-case "hash" (itself dead: idx.Method is never
+		// literally "hash"), silently defaulting every non-hash non-btree
+		// method to btree's oid and making pg_class.relam wrong for every
+		// gist/gin/spgist/brin index (surfaced by pg_amcheck's own
+		// `c.relam = BTREE_AM_OID` index-enumeration query wrongly matching
+		// them, M0119-0006).
 		idxRelam := "403" // default btree
-		if idx.Method == "hash" {
-			idxRelam = "405"
+		if !idx.DeclaredHash {
+			if amOID := AccessMethodOIDByName(idx.Method); amOID != 0 {
+				idxRelam = strconv.Itoa(int(amOID))
+			}
 		}
 		idxPers := "p"
 		if idx.Table != nil {
