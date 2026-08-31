@@ -155,6 +155,32 @@ func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// M0134-0188: a ONE-leaf problem short-circuits inside makeRelFromJoinlist
+	// ("single joinlist node, so we're done") and comes back as the RAW leaf —
+	// correct for a nested sub-list unwrap, where the ENCLOSING problem owns
+	// the leaf's paths (including its parameterised ones), but wrong at the
+	// problem's own entry: this is the whole search for the statement, no
+	// enclosing problem exists, and returning the raw leaf silently skips
+	// base-rel path generation — the seam then reports a searched prefix whose
+	// access method nobody ever examined. TPC-H Q13's `customer LEFT JOIN
+	// orders` peels to exactly this: a one-leaf prefix whose covering
+	// `customer_pk` scan can only be chosen by `addBaseRelIndexPaths` +
+	// `add_path`. Run the one-relation search protocol here, at the entry
+	// only: `joinSearch` with nrels=1 enumerates nothing and `finalPath`
+	// returns the base rel's cheapest — seq, index, or index-only, on cost.
+	// Gated on `scanLeafFor` — the same consumer-side rebuildability test
+	// every path producer applies — because the boundary must tag whatever
+	// `createPlan` returns and `markSearchedTree` accepts only the kinds that
+	// embed the tag. TPC-DS Q77's prefix leaf is a `*CTEScan`: rebuildable by
+	// nobody, taggable by nothing, and running the one-relation protocol on it
+	// panicked at plan time. Declining leaves it exactly as the short-circuit
+	// always left it.
+	if _, _, rebuildable := scanLeafFor(r.node); rebuildable && r.info.table != nil && jl.nrels() == 1 {
+		r, err = prob.searchOneProblem([]joinlistRel{r}, prob.tupleFraction)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return r.node, nil
 }
 

@@ -1233,6 +1233,33 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// See pushOuterQualsIntoLaterals in pushdown.go.
 			node = pushOuterQualsIntoLaterals(node)
 		}
+	} else if joinTreeHasOuterLink(node) {
+		// M0134-0188: a FROM tree with no WHERE at all. No *Filter wrapper
+		// exists, so the seam chain above — which lives entirely inside the
+		// `s.Where != nil` branch — never ran for such a statement, and its
+		// scans kept their syntactic access methods unexamined. TPC-H Q13's
+		// `customer LEFT JOIN orders` subquery is exactly this shape, and its
+		// customer scan can only become PG's covering `Index Only Scan
+		// using customer_pk` through the search's base-rel path generation.
+		//
+		// Gated on an OUTER link being present: a filterless INNER/CROSS
+		// tree is left on the legacy path for now — the outer-spine shape is
+		// the one whose LEFT side has NO other route to cost-based access
+		// selection, while widening to every filterless join tree moves many
+		// long-stable plans at once and deserves its own gated round.
+		// The search is invoked with a nil predicate (an empty conjunct
+		// list); a declined search returns the tree untouched, and a residual
+		// can only arise from unconsumed ON quals, which the Filter below
+		// preserves exactly as the *Filter arm's does. `tupleFraction` and
+		// the needed-column set are populated here for the same reason the
+		// WHERE arm populates them: the search reads both.
+		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
+		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
+		if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
+			node = newChild
+		} else if newChild != node {
+			node = &Filter{pos: node.Pos(), Child: newChild, Predicate: newPred}
+		}
 	}
 
 	// Unnest correlated subqueries. With the S5a pre-DP position
@@ -15183,4 +15210,26 @@ func findExprInTargets(re Expr, targets []Expr) int {
 		}
 	}
 	return -1
+}
+
+
+// joinTreeHasOuterLink reports whether node is a join tree carrying at least
+// one non-INNER, non-CROSS link — the gate for M0134-0188's WHERE-less seam
+// arm. Cheap and shape-only: it answers "is there an outer spine here for
+// `splitOuterSpine` to peel", not whether the peel will succeed.
+func joinTreeHasOuterLink(node Node) bool {
+	j, ok := node.(*Join)
+	if !ok {
+		return false
+	}
+	for {
+		if j.Type != JoinTypeInner && j.Type != JoinTypeCross {
+			return true
+		}
+		next, ok := j.Left.(*Join)
+		if !ok {
+			return false
+		}
+		j = next
+	}
 }

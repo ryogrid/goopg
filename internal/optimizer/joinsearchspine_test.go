@@ -437,19 +437,33 @@ func TestPGShapedSeamDeclinesAnOuterLinkBelowAnInnerOne(t *testing.T) {
 // (`make_rel_from_joinlist` returns the item). Declining keeps the seam's
 // contract honest — a "searched" tree of one leaf would tag a scan and make the
 // legacy layout passes skip it for nothing.
-func TestPGShapedSeamDeclinesAOneRelationPrefix(t *testing.T) {
+func TestPGShapedSeamSearchesAOneRelationPrefixUnderASpine(t *testing.T) {
 	withPGShapedDP(t)
 	names := []string{"a", "b"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 10},
 		"a LEFT JOIN b ON a.x = b.x")
 	pred := seamLocal(names, 0)
 
+	// M0134-0188: `a LEFT JOIN b` peels to a ONE-relation prefix, and the
+	// seam used to decline it — "there is no order to search". There is no
+	// order, but there IS an access method: base-rel path generation runs,
+	// `add_path` chooses among seq / index / index-only, and the boundary
+	// republishes binding order. This is the only seam through which the
+	// LEFT side of an outer join reaches cost-based access selection at all
+	// (TPC-H Q13's covering scan). A one-relation statement with NO spine
+	// stays out — the earlier `nrels < 2` gate — so the single-table paths
+	// keep owning those.
 	out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
-	if used {
-		t.Fatal("the seam ran a search on a one-relation prefix")
+	if !used {
+		t.Fatal("the seam declined a one-relation prefix under a LEFT spine")
 	}
-	if out != node || residual != pred {
-		t.Fatal("the seam altered its inputs while declining")
+	if out != node {
+		t.Fatal("the splice must keep the spine root: only its Left is replaced")
+	}
+	// The local qual on `a` is attached to the leaf inside the search
+	// (prefixNullable(LEFT)=false), so nothing survives as residual.
+	if residual != nil {
+		t.Fatalf("the prefix-local qual was not consumed: residual=%v", residual)
 	}
 }
 

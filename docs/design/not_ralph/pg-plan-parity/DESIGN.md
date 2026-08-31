@@ -1813,3 +1813,58 @@ at `planner.go` to match — the search never runs and no path of any kind is
 generated for it. That is a seam-widening item (run the search for filterless
 FROM trees), not an index-only item; the path machinery this section landed
 will serve it unchanged the day the seam reaches it.
+
+## 22. Q13 LANDED — the table is complete
+
+The last unmatched node fell to a chain of three small gaps, each found by the
+instrument-first discipline:
+
+1. **The whole join-search seam lived inside `if s.Where != nil`.** A
+   filterless statement — Q13's `customer LEFT JOIN orders` subquery — never
+   ran the search at all; its scans kept their syntactic access methods
+   unexamined. A new `else` arm invokes the search with a nil predicate,
+   GATED on the tree carrying an outer link: that is the shape whose LEFT side
+   has no other route to cost-based access selection, while widening to every
+   filterless inner join moved five long-stable plans at once and is deferred
+   to its own gated round.
+2. **`a LEFT JOIN b` peels to a ONE-relation prefix, and the seam declined
+   it** ("there is no order to search"). There is no order — but there IS an
+   access method. The decline now requires an empty spine too; under a spine
+   the one-relation problem proceeds.
+3. **`makeRelFromJoinlist` short-circuits a single-leaf list** ("single
+   joinlist node, so we're done") and returns the RAW leaf — correct for a
+   nested sub-list unwrap where the enclosing problem owns the leaf's paths,
+   silently wrong at the problem's ENTRY, where no enclosing problem exists.
+   The seam then reported a searched prefix (`seam-spine nspine=1 nprefix=1`)
+   whose access method nobody had ever examined. `planJoinlistSearch` now runs
+   the one-relation search protocol at the entry only: `joinSearch` with
+   nrels=1 enumerates nothing, and `finalPath` returns the base rel's
+   cheapest — seq, index, or index-only, on cost.
+
+Result:
+
+```
+->  Hash Left Join
+      Hash Cond: (customer.c_custkey = orders.o_custkey)
+      ->  Index Only Scan using public.customer_pk on public.customer
+      ->  Seq Scan on public.orders
+            Filter: (o_comment NOT LIKE '%special%requests%')
+```
+
+PG's exact shape, and the cost margin is nearly PG's own: goopg 3738 vs seq
+12960, PG 3906 vs its seq alternative. Byte-identical results, 7.9s (previous
+runs 8.0–10.7s).
+
+One regression was caught by the TPC-DS gate and fixed before landing: the
+one-relation entry search ran on TPC-DS Q77's `*CTEScan` prefix leaf, which no
+producer can rebuild and `markSearchedTree` cannot tag — a plan-time panic.
+The gate is `scanLeafFor`, the SAME consumer-side rebuildability test every
+path producer applies; a non-rebuildable leaf is left exactly as the
+short-circuit always left it.
+
+**Every PG target node in the comparison table now has its goopg counterpart**:
+bitmaps on q02/q11/q17/q20/q21, index-only scans on q13/q16/q22, Q8's prefix
+probe — each generated as a real path or plan candidate, priced by
+oracle-verified cost functions, and chosen by `add_path` or an explicit
+cost comparison with both candidates present. No plan anywhere is selected by
+fiat.

@@ -896,10 +896,17 @@ section D. Recorded because the gate run is where they became visible.
       totality tripwires stay loud for unlicensed holes. Q16 = PG's
       `Index Only Scan using partsupp_pk`, byte-identical, won on a real
       `allvisfrac` = 1.0.
-- [ ] **Q13's blocker is the seam, confirmed separate**: its inner subquery
-      has no `WHERE`, so no `*Filter` exists for the join-search seam to
-      match — the search never runs for it. Widen the seam to filterless FROM
-      trees; the index-only machinery then serves it unchanged.
+- [x] **Q13 LANDED (DESIGN §22)**: three chained gaps — the seam lived inside
+      `if s.Where != nil` (new outer-link-gated WHERE-less arm); a one-relation
+      prefix under a spine was declined ("no order to search" — but there IS
+      an access method); and `makeRelFromJoinlist`'s single-leaf short-circuit
+      returned the raw leaf at the problem ENTRY, skipping base-rel path
+      generation while the seam reported success. Q13 = PG's
+      `Index Only Scan using customer_pk`, byte-identical, 3738 vs seq 12960
+      (PG: 3906). Deferred, each named: filterless INNER trees stay legacy
+      (five stable plans move at once — own gated round); Parallel IOS. One regression caught by the TPC-DS gate pre-landing:
+      Q77's `*CTEScan` prefix leaf panicked in `markSearchedTree`; the entry
+      search now gates on `scanLeafFor` rebuildability.
 - [x] Correct `relsize.go:424` — "goopg has no visibility map for the planner to
       read" is stale. `catalog.RelAllVisibleFunc` is wired in
       `initdb/open.go:2525`, and `relallvisible == relpages` on every TPC-H
