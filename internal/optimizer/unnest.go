@@ -690,6 +690,14 @@ func innerPlanIsIndexProbeCheap(n Node) bool {
 	switch x := n.(type) {
 	case *IndexScan:
 		return true
+	case *BitmapHeapScan:
+		// A keyed bitmap probe is the same shape one node deeper: the key
+		// lives on the single `*BitmapIndexScan` producer and re-Opening
+		// rebuilds the probe for the new outer binding. And/Or producers
+		// carry several probes and are not admitted — same narrowness as
+		// the executor twin. M0134-0185.
+		_, ok := x.Outer.(*BitmapIndexScan)
+		return ok
 	case *Project:
 		return innerPlanIsIndexProbeCheap(x.Child)
 	case *Aggregate:
@@ -791,6 +799,17 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 	walk = func(n Node) {
 		if n == nil {
 			return
+		}
+		// A bitmap probe harvests exactly like an index probe: the key
+		// expressions live on the `BitmapIndexScan` leaf and the emitted
+		// schema is the heap node's. Without this arm a correlated EXISTS
+		// whose inner planned as a bitmap silently loses decorrelation —
+		// four unnest_indexkey tests pin that (DESIGN §19 prerequisite 2).
+		if bhs, ok := n.(*BitmapHeapScan); ok {
+			if bis, ok := bhs.Outer.(*BitmapIndexScan); ok {
+				n = &IndexScan{pos: bis.Pos(), Table: bis.Table, Alias: bis.Alias,
+					Index: bis.Index, Key: bis.Key, Keys: bis.Keys, schema: bhs.Output()}
+			}
 		}
 		if is, ok := n.(*IndexScan); ok {
 			schema := is.Output()
@@ -1077,6 +1096,40 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 		if n.HighKey != nil {
 			walkExprTree(n.HighKey, visit)
+		}
+	// The bitmap family (M0134-0185). These arms are CORRECTNESS, not
+	// coverage hygiene: `planHasOuterRef` rides this walker to compute
+	// `IsNonCorrelated`, and a correlated probe key inside a
+	// `BitmapIndexScan` that this switch cannot see classifies the whole
+	// sublink as evaluable-once — the executor then caches the first outer
+	// binding's result for every subsequent row. Measured on TPC-H Q17 when
+	// its SubPlan was given PG's bitmap shape: 413893.02 where the answer is
+	// 340260.12 (DESIGN §19).
+	case *BitmapHeapScan:
+		if n.Cond != nil {
+			walkExprTree(n.Cond, visit)
+		}
+		for _, q := range n.BitmapQual {
+			walkExprTree(q, visit)
+		}
+		walkPlanExprs(n.Outer, visit)
+	case *BitmapIndexScan:
+		if n.Key != nil {
+			walkExprTree(n.Key, visit)
+		}
+		for _, k := range n.Keys {
+			walkExprTree(k, visit)
+		}
+		for _, q := range n.Pred {
+			walkExprTree(q, visit)
+		}
+	case *BitmapAnd:
+		for _, in := range n.Inputs {
+			walkPlanExprs(in, visit)
+		}
+	case *BitmapOr:
+		for _, in := range n.Inputs {
+			walkPlanExprs(in, visit)
 		}
 	case *WindowAgg:
 		walkPlanExprs(n.Child, visit)
@@ -1625,6 +1678,132 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			if col := indexColRef(0); col != nil {
 				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpLe, Left: col, Right: cloneExprReplacingOuter(n.HighKey, replace)})
 			}
+		}
+		if len(conds) > 0 {
+			return &Filter{pos: n.pos, Child: seq, Predicate: combineAnd(conds)}, nil
+		}
+		return seq, nil
+	case *BitmapHeapScan:
+		// D3.0 clone, bitmap arm — the *IndexScan crux one node level
+		// deeper. The probe keys live on the `*BitmapIndexScan` under
+		// `Outer`; a harvested correlation there becomes, after
+		// replacement, a probe of the scan's OWN column, and the enclosing
+		// join now enforces that equality — so the whole bitmap collapses
+		// to a SeqScan, exactly as the index probe does. Without this arm
+		// the default declined, the driver swallowed the error, and every
+		// correlated EXISTS whose inner planned as a bitmap silently kept
+		// its SubPlan (M0134-0185; the NLI arm above records the identical
+		// failure mode from f95d85ae2).
+		bis, isBis := n.Outer.(*BitmapIndexScan)
+		if !isBis {
+			// BitmapAnd/BitmapOr producers carry several probes with
+			// distinct harvest answers; declining is what this whole arm
+			// did before it existed.
+			return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: bitmap producer is not a single BitmapIndexScan"}
+		}
+		isHarvested := func(e Expr) bool {
+			oc, ok := e.(*OuterColumnRef)
+			if !ok {
+				return false
+			}
+			_, inMap := replace[oc]
+			return inMap
+		}
+		correlated := isHarvested(bis.Key)
+		for _, k := range bis.Keys {
+			if isHarvested(k) {
+				correlated = true
+			}
+		}
+		if !correlated {
+			cb := *bis
+			if bis.Key != nil {
+				cb.Key = cloneExprReplacingOuter(bis.Key, replace)
+			}
+			if len(bis.Keys) > 0 {
+				cb.Keys = make([]Expr, len(bis.Keys))
+				for i, k := range bis.Keys {
+					cb.Keys[i] = cloneExprReplacingOuter(k, replace)
+				}
+			}
+			if len(bis.Pred) > 0 {
+				cb.Pred = make([]Expr, len(bis.Pred))
+				for i, q := range bis.Pred {
+					cb.Pred[i] = cloneExprReplacingOuter(q, replace)
+				}
+			}
+			ch := *n
+			ch.Outer = &cb
+			if len(n.BitmapQual) > 0 {
+				ch.BitmapQual = make([]Expr, len(n.BitmapQual))
+				for i, q := range n.BitmapQual {
+					ch.BitmapQual[i] = cloneExprReplacingOuter(q, replace)
+				}
+			}
+			if n.Cond != nil {
+				ch.Cond = cloneExprReplacingOuter(n.Cond, replace)
+			}
+			return &ch, nil
+		}
+		seq := &SeqScan{
+			pos:    n.pos,
+			Table:  n.Table,
+			Alias:  n.Alias,
+			schema: n.schema,
+		}
+		indexColRef := func(col int) *ColumnRef {
+			if bis.Index == nil || col >= len(bis.Index.Columns) {
+				return nil
+			}
+			name := bis.Index.Columns[col]
+			for i, sc := range n.schema {
+				if sc.Name == name {
+					return &ColumnRef{pos: n.pos, Index: i, Name: name, Type: sc.Type, SourceTableIdx: sc.SourceTableIdx}
+				}
+			}
+			return nil
+		}
+		var conds []Expr
+		if bis.Key != nil && !isHarvested(bis.Key) {
+			if col := indexColRef(0); col != nil {
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpEq, Left: col, Right: cloneExprReplacingOuter(bis.Key, replace)})
+			}
+		}
+		for i, k := range bis.Keys {
+			if isHarvested(k) {
+				continue
+			}
+			if col := indexColRef(i); col != nil {
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpEq, Left: col, Right: cloneExprReplacingOuter(k, replace)})
+			}
+		}
+		// Recheck quals: an entry whose outer refs are all HARVESTED is the
+		// probe equality itself — the enclosing join enforces it, so it is
+		// dropped, the exact statement the Filter arm's replacement-
+		// tautology rule makes. An entry with a NON-harvested outer ref
+		// cannot be enforced by anything after the demotion — decline. An
+		// entry with no outer refs at all (a partial-index predicate) still
+		// filters, so it survives as a Filter conjunct.
+		for _, q := range n.BitmapQual {
+			hasOuter, allHarvested := false, true
+			walkExprTree(q, func(e Expr) {
+				if oc, ok := e.(*OuterColumnRef); ok {
+					hasOuter = true
+					if _, inMap := replace[oc]; !inMap {
+						allHarvested = false
+					}
+				}
+			})
+			if hasOuter && allHarvested {
+				continue
+			}
+			if hasOuter {
+				return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: bitmap recheck qual carries an unharvested outer reference"}
+			}
+			conds = append(conds, cloneExprReplacingOuter(q, replace))
+		}
+		if n.Cond != nil {
+			conds = append(conds, cloneExprReplacingOuter(n.Cond, replace))
 		}
 		if len(conds) > 0 {
 			return &Filter{pos: n.pos, Child: seq, Predicate: combineAnd(conds)}, nil

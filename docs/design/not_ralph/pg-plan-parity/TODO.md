@@ -961,14 +961,18 @@ section D. Recorded because the gate run is where they became visible.
 - [x] Reverted because it returned wrong results (413893.02 vs 340260.12):
       the subplan executor evaluates the bitmap ONCE (`InitPlan` labelling)
       and reuses the first outer binding's TIDBitmap for every row.
-- [ ] Prerequisite 1: teach the subplan path to re-drive `bitmapHeapScanOp`
-      per outer evaluation (same executor seam as the rescan-cost gap; fix
-      together with task #48).
-- [ ] Prerequisite 2: teach `unnest_indexkey`'s EXISTS-decorrelation harvest
-      the bitmap shape — four tests show it declines to decorrelate when the
-      correlated probe is not `*IndexScan`, which loses semi-join unnesting.
-- [ ] Then re-apply the seam costing (the helper is in §19 / git history at
-      this commit; it needs no changes — only its consumers do).
+- [x] Prerequisite 1 RESOLVED (§19.1): the mis-drive was CLASSIFICATION, not
+      execution — `walkPlanExprs` (→ `planHasOuterRef` → `IsNonCorrelated`)
+      was blind to `BitmapIndexScan.Key`. Bitmap arms added to
+      `walkPlanExprs`, `lowerTraverseNode`, the harvest walk, and
+      `clonePlanReplacingOuter` (the f95d85ae2 failure mode at the same
+      switch, one node family later).
+- [x] Prerequisite 2 RESOLVED: harvest + cloner arms; S6 policy twins
+      (`innerPlanIsIndexProbeCheap` / `planIsIndexScanBased`) both admit the
+      keyed single-producer bitmap, so probe-cheap scalars stay SubPlans.
+- [x] Seam re-applied UNCHANGED; Q17 = PG's node, `SubPlan 1` correctly
+      correlated, result byte-identical, 1.9s (bitmap rebuild per row — the
+      task #48 executor cost, stated).
 
 ## Cross-cutting
 

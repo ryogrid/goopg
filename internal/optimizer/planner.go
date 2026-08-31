@@ -9094,6 +9094,72 @@ func parserExprKey(e parser.Expr) string {
 // already builds (root-0026 SELECT-side twin, M0119-0004). The caller passes
 // false to preserve pre-existing behavior where a different layer already
 // handles (or is unaffected by) the child fan-out — see call sites.
+// bitmapOverCorrelatedProbe prices the two access methods for a correlated
+// single-equality probe — `WHERE inner.col = outer.col` — and returns the
+// bitmap plan when it is the cheaper one, nil to keep the plain index scan.
+//
+// The inputs are exactly the join search's: `varEqNonConstSelectivity` for the
+// unknown probe value (`var_eq_non_const`, selfuncs.c), real index geometry
+// (M0134-0183), `costIndexScan` vs `costBitmapIndexScan` +
+// `computeBitmapPages` + `costBitmapHeapScan` at loop_count 1 — PG plans a
+// subquery once, independent of how many times the outer will drive it, and
+// prices it exactly this way. No preference is expressed anywhere: an
+// un-analysed table returns nil (no row count means no honest comparison, and
+// nil is the pre-existing behaviour), and a tie keeps the index.
+//
+// The composite-prefix case needs no special handling on either side: the
+// bitmap's `lookupKey` pads the probe with `compositeUpperBound` exactly as
+// the index scan's does, and `needsRecheck` marks the prefix probe's tuples
+// for recheck against BitmapQual — which carries the very equality this probe
+// binds.
+func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int) Node {
+	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
+		return nil
+	}
+	cp := defaultCostParams()
+	relTuples := float64(tbl.Stats.RowCount)
+	relPages := baseRelPages(tbl, relTuples)
+	T := float64(relPages)
+	if T < 1 {
+		T = 1
+	}
+	sel := varEqNonConstSelectivity(columnStatsByName(tbl, col.Name), relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	in := indexScanInputs{
+		relPages:        relPages,
+		relTuples:       relTuples,
+		indexPages:      indexPages,
+		indexTuples:     indexTuples,
+		treeHeight:      treeHeight,
+		selectivity:     sel,
+		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		totalTablePages: T,
+		loopCount:       1,
+	}
+	idxCost := costIndexScan(cp, in)
+	bmIdxCost := costBitmapIndexScan(cp, in)
+	tuples := clampRowEst(sel * relTuples)
+	pages := computeBitmapPages(tuples, T, indexPages, T, cp.effectiveCacheSize, bitmapMaxEntries(cp.workMem))
+	bm := costBitmapHeapScan(cp, bmIdxCost, pages, tuples, T)
+	if bm.Total >= idxCost.Total {
+		return nil
+	}
+	return &BitmapHeapScan{
+		pos:        pos,
+		Table:      tbl,
+		BitmapQual: []Expr{queryClause},
+		Outer: &BitmapIndexScan{
+			pos:    pos,
+			Table:  tbl,
+			Index:  idx,
+			Key:    key,
+			Pred:   []Expr{queryClause},
+			schema: schema,
+		},
+		schema: schema,
+	}
+}
+
 func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.Catalog, enforceInheritanceFanout bool) (Node, bool, error) {
 	if len(ctx.bindings) != 1 {
 		return nil, false, nil
@@ -9154,6 +9220,19 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
 			if idx == nil {
 				return nil, false, nil
+			}
+			// M0134-0185: this arm used to return the index scan
+			// UNCONDITIONALLY — the one access-method decision in the planner
+			// that consulted no cost at all. PG plans a correlated subquery
+			// through the full path machinery and on TPC-H Q17's SubPlan
+			// picks a Bitmap Heap Scan over this very probe by 1% (127.62 vs
+			// 128.97). Offer the same candidate, priced by the SAME cost
+			// functions the join search uses, and let the numbers decide.
+			// Reachable only with an outer binding in scope, so the
+			// UPDATE/DELETE callers — whose executors pattern-match
+			// `*IndexScan` — never see the bitmap shape.
+			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos()); bhs != nil {
+				return bhs, true, nil
 			}
 			return &IndexScan{
 				pos:        where.Pos(),

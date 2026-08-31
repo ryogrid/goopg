@@ -68,6 +68,34 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 			return false
 		}
 		return rewriteAll(x.Keys)
+	case *BitmapHeapScan:
+		// Same statement as the IndexScan arm's, one node family over:
+		// `Cond` holds relation-local quals when the scan is an NLI inner,
+		// `BitmapQual` is the recheck list, and the probe keys live on the
+		// producer subtree under `Outer`. M0134-0185.
+		if !one(&x.Cond) || !rewriteAll(x.BitmapQual) {
+			return false
+		}
+		return lowerTraverseNode(x.Outer, fx)
+	case *BitmapIndexScan:
+		if !one(&x.Key) || !rewriteAll(x.Keys) {
+			return false
+		}
+		return rewriteAll(x.Pred)
+	case *BitmapAnd:
+		for _, in := range x.Inputs {
+			if !lowerTraverseNode(in, fx) {
+				return false
+			}
+		}
+		return true
+	case *BitmapOr:
+		for _, in := range x.Inputs {
+			if !lowerTraverseNode(in, fx) {
+				return false
+			}
+		}
+		return true
 	case *Filter:
 		return one(&x.Predicate) && lowerTraverseNode(x.Child, fx)
 	case *Project:

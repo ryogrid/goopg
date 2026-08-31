@@ -1678,3 +1678,45 @@ worked and chose PG's node), but an executor-rebind gap plus a consumer that
 must learn the shape. Both are prerequisites, and both live outside the
 planner. The 21/21 result gate caught this in one query — worth noting that
 the PLAN sweep looked perfect; only the result bytes told the truth.
+
+### 19.1 RESOLVED — Q17 selects PG's plan, and the walkers were the whole story
+
+The two prerequisites of §19 came down to FOUR walkers that had never learned
+the bitmap node family, each failing in its own way (M0134-0185):
+
+1. **`walkPlanExprs`** — carries `planHasOuterRef`, which computes
+   `IsNonCorrelated`. Blind to `BitmapIndexScan.Key`, it classified the bitmap
+   subplan as evaluable-once; the executor cached the first outer binding's
+   result. THE wrong-answer bug, and latent for any bitmap inside any sublink.
+2. **`lowerTraverseNode`** (subplan_lower_walk.go) — bailed on the unmodelled
+   node, which was sound but left the sublink on the stack path with the
+   mislabelled flag.
+3. **The indexkey harvest walk** — saw no probe key in a bitmap inner, so a
+   correlated EXISTS that planned as a bitmap silently lost decorrelation.
+4. **`clonePlanReplacingOuter`** — no bitmap arm, so the D3.0 clone declined
+   and the driver swallowed the error: the same failure mode, at the same
+   switch, as f95d85ae2's missing NLI arm. The new arm mirrors the
+   `*IndexScan` crux one node deeper, including the demote-to-SeqScan rule for
+   a harvested probe key.
+
+Plus the S6 policy twins — `innerPlanIsIndexProbeCheap` and the executor's
+`planIsIndexScanBased` — which both learned that a keyed single-producer
+bitmap is a probe (kept in lockstep per their own contract), so a probe-cheap
+scalar stays a SubPlan exactly as before.
+
+With those five in place the §19 seam costing was re-applied UNCHANGED, and:
+
+```
+SubPlan 1
+  ->  Aggregate
+        ->  Bitmap Heap Scan on public.lineitem
+              Recheck Cond: (lineitem.l_partkey = $0)
+              ->  Bitmap Index Scan on public.lineitem_part_supp_fkidx
+```
+
+`SubPlan` (not `InitPlan`) — correctly classified as correlated, re-driven per
+outer row through the CorrSubqOps re-Open path, **result byte-identical**,
+1.9s (from 0.4s: the per-row bitmap rebuild is the same executor cost task #48
+tracks; honest, stated, not hidden). goopg's bitmap query set now COVERS PG's
+entirely: every query where PG uses a bitmap, goopg uses one on the same
+index at the same node.
