@@ -53,7 +53,6 @@ var excludedCases = map[string]string{
 	"copyencoding":            "COPY encoding options; out of scope for goopg v0.",
 	"encoding":                "Multi-byte encoding; out of scope for goopg v0.",
 	"euc_kr":                  "EUC-KR encoding; out of scope for goopg v0.",
-	"unicode":                 "Unicode normalization; out of scope for goopg v0.",
 
 	// ── External / infra features ─────────────────────────────────────────
 	"async":          "LISTEN/NOTIFY async messaging; out of scope for goopg v0.",

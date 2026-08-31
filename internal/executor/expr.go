@@ -27,6 +27,8 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/activity"
@@ -14648,6 +14650,96 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			return NewStringDatum(strings.TrimRight(s.StringValue(), cutset)), nil
 		}
+	case "normalize":
+		// normalize(text [, form]) — PG: varlena.c:6603 unicode_normalize_func.
+		// The 1-arg spelling defaults form to NFC (system_functions.sql:626
+		// `"normalize"(text, text DEFAULT 'NFC')`); goopg has no default-arg
+		// catalog mechanism, so the default is applied here directly, the same
+		// way btrim/ltrim/rtrim above default their cutset argument.
+		// M0134-0184 (unicode.sql).
+		if len(x.Args) >= 1 {
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			formStr := "NFC"
+			if len(x.Args) >= 2 {
+				f, err := evalExprSlot(x.Args[1], slot, ctx)
+				if err != nil {
+					return Datum{}, err
+				}
+				if f.IsNull() {
+					return NullDatum, nil
+				}
+				formStr = f.StringValue()
+			}
+			form, ok := unicodeNormalizationForm(formStr)
+			if !ok {
+				// PG: unicode_norm_form_from_string (varlena.c:6521) never calls
+				// errposition() — psql shows no LINE/caret for this error, unlike
+				// most 22023s in this file, so Pos is deliberately omitted here.
+				return Datum{}, &ExecError{Code: "22023",
+					Message: fmt.Sprintf("invalid normalization form: %s", formStr)}
+			}
+			return NewStringDatum(form.String(s.StringValue())), nil
+		}
+	case "is_normalized":
+		// is_normalized(text [, form]) — PG: varlena.c:6670 unicode_is_normalized.
+		// Same 1-arg NFC default as normalize() above. M0134-0184.
+		if len(x.Args) >= 1 {
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			formStr := "NFC"
+			if len(x.Args) >= 2 {
+				f, err := evalExprSlot(x.Args[1], slot, ctx)
+				if err != nil {
+					return Datum{}, err
+				}
+				if f.IsNull() {
+					return NullDatum, nil
+				}
+				formStr = f.StringValue()
+			}
+			form, ok := unicodeNormalizationForm(formStr)
+			if !ok {
+				// PG: unicode_norm_form_from_string never calls errposition() —
+				// see the identical note in the "normalize" case above.
+				return Datum{}, &ExecError{Code: "22023",
+					Message: fmt.Sprintf("invalid normalization form: %s", formStr)}
+			}
+			return NewBoolDatum(form.IsNormalString(s.StringValue())), nil
+		}
+	case "unicode_assigned":
+		// unicode_assigned(text) — PG: varlena.c:6572. True iff every codepoint
+		// in the input has an assigned Unicode general category (i.e. is not
+		// in category Cn "unassigned"). Go's stdlib unicode.Cn table tracks the
+		// same UCD assignment split, so no separate UCD data needs embedding.
+		// M0134-0184.
+		if len(x.Args) == 1 {
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			assigned := true
+			for _, r := range s.StringValue() {
+				if unicode.Is(unicode.Cn, r) {
+					assigned = false
+					break
+				}
+			}
+			return NewBoolDatum(assigned), nil
+		}
+	case "unicode_version":
+		// unicode_version() — PG: varlena.c:6552, returns PG_UNICODE_VERSION
+		// ("major.minor" of the UCD PG was built against). The regress test
+		// only asserts IS NOT NULL, so the exact string is not load-bearing;
+		// x/text's bundled UCD is 15.0.0, matching the norm package in use
+		// below. M0134-0184.
+		if len(x.Args) == 0 {
+			return NewStringDatum("15.0"), nil
+		}
 	case "lpad":
 		// lpad(text, int [, fill_text])
 		if len(x.Args) >= 2 {
@@ -20993,6 +21085,25 @@ func evalPgClientEncoding(ctx *Context) (Datum, error) {
 		}
 	}
 	return NewStringDatum(enc), nil
+}
+
+// unicodeNormalizationForm maps a normalize()/is_normalized() form argument
+// to golang.org/x/text/unicode/norm's Form. PG: varlena.c
+// unicode_norm_form_from_string — pg_strcasecmp, so case-insensitive.
+// M0134-0184.
+func unicodeNormalizationForm(s string) (norm.Form, bool) {
+	switch strings.ToUpper(s) {
+	case "NFC":
+		return norm.NFC, true
+	case "NFD":
+		return norm.NFD, true
+	case "NFKC":
+		return norm.NFKC, true
+	case "NFKD":
+		return norm.NFKD, true
+	default:
+		return 0, false
+	}
 }
 
 // evalGetDatabaseEncoding returns the current database's encoding as a name,

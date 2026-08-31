@@ -168,7 +168,7 @@
 %type <qn>	qualified_name
 %type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call
 %type <expr>	func_expr_common_subexpr
-%type <str>	sql_value_func_name
+%type <str>	sql_value_func_name unicode_normal_form
 %type <node>	cse_wl when_then filter_clause within_group_clause
 %type <exprs>	opt_func_call_args
 %type <str>	subq_op extract_field
@@ -2439,6 +2439,24 @@ a_expr:
 			{
 				$$ = NewIsDistinctFromExpr($<p>2, $1, $6, true)
 			}
+	/* IS [NOT] [form] NORMALIZED — gram.y :15364ff, COERCE_SQL_SYNTAX rewrite
+	   to is_normalized(text[, text]), NOT-wrapped for the negated forms. */
+	| a_expr IS NORMALIZED %prec IS
+			{
+				$$ = specialFormCall($<p>2, "is_normalized", []Expr{$1})
+			}
+	| a_expr IS unicode_normal_form NORMALIZED %prec IS
+			{
+				$$ = specialFormCall($<p>2, "is_normalized", []Expr{$1, NewStringConst($<p>3, $3)})
+			}
+	| a_expr IS NOT NORMALIZED %prec IS
+			{
+				$$ = NewUnaryOp($<p>2, OpNot, specialFormCall($<p>2, "is_normalized", []Expr{$1}))
+			}
+	| a_expr IS NOT unicode_normal_form NORMALIZED %prec IS
+			{
+				$$ = NewUnaryOp($<p>2, OpNot, specialFormCall($<p>2, "is_normalized", []Expr{$1, NewStringConst($<p>4, $4)}))
+			}
 	/* Postfix spellings — gram.y :15200 ISNULL / NOTNULL. */
 	| a_expr ISNULL
 			{
@@ -3041,6 +3059,17 @@ func_expr_common_subexpr:
 			{
 				$$ = specialFormCall($<p>1, "btrim", $3)
 			}
+	/* NORMALIZE(str [, form]) — gram.y :15896ff, COERCE_SQL_SYNTAX rewrite to
+	   normalize(text[, text]). unicode_normal_form supplies the uppercase form
+	   name as a plain StringConst arg, matching makeStringConst($5, @5). */
+	| NORMALIZE '(' a_expr ')'
+			{
+				$$ = specialFormCall($<p>1, "normalize", []Expr{$3})
+			}
+	| NORMALIZE '(' a_expr ',' unicode_normal_form ')'
+			{
+				$$ = specialFormCall($<p>1, "normalize", []Expr{$3, NewStringConst($<p>5, $5)})
+			}
 	| sql_value_func_name
 			{
 				$$ = NewFuncCall($<p>1, ObjectName{pos: $<p>1, Name: $1}, nil, false)
@@ -3063,6 +3092,15 @@ func_expr_common_subexpr:
 trim_list:
 		a_expr FROM expr_list   { $$ = append($3, $1) }
 	| FROM expr_list            { $$ = $2 }
+
+/* unicode_normal_form — gram.y :16789ff. Bare unquoted identifiers (NFC is an
+   unreserved keyword, not a string literal), fed as a StringConst arg to
+   normalize()/is_normalized(). */
+unicode_normal_form:
+		NFC			{ $$ = "NFC" }
+	| NFD			{ $$ = "NFD" }
+	| NFKC			{ $$ = "NFKC" }
+	| NFKD			{ $$ = "NFKD" }
 
 sql_value_func_name:
 		CURRENT_TIMESTAMP	{ $$ = "current_timestamp" }
