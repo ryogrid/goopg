@@ -520,7 +520,16 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		if !ok {
 			break
 		}
-		clauses = append(clauses, indexPathClause{indexCol: pos, key: c.outerKey})
+		// `ri` carried for the SAME reason `indexPathClauses` carries it
+		// (pathindexclauses.go): `probeEnforcedClauses` identifies a clause the
+		// probe already applies BY its restrictInfo, and `create_nestloop_path`
+		// drops such clauses from the join residual (pathnode.c:2478). Without
+		// it the bitmap inner's own join clause was re-charged by
+		// `qualEvalCost` as a residual — ~5.0 on TPC-H Q2's supplier probe,
+		// enough to flip a 5-loop near-tie to the index inner. The index
+		// producer's list has carried `ri` since P5.5-b; this one silently did
+		// not (rule #2: sibling paths must agree).
+		clauses = append(clauses, indexPathClause{ri: c.ri, indexCol: pos, key: c.outerKey})
 		sel *= varEqNonConstSelectivity(columnStatsByName(tbl, colName), relTuples)
 	}
 	if len(clauses) == 0 {
@@ -545,6 +554,16 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
 		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T),
 		RequiredOuter: req,
+		// On the HEAP path, not only the child: `probeEnforcedClauses` and
+		// `memoizeCacheKeys` both read the INNER CANDIDATE's own list, and the
+		// candidate `addNLIPaths` iterates is this node. PG's equivalent
+		// (`is_redundant_with_indexclauses` via `bitmapqual`) reaches the same
+		// clauses by walking the child tree; goopg carries them here so "what
+		// the probe enforces" stays one list read twice. Without this the
+		// bitmap inner's own join clause was re-charged as a nestloop residual
+		// (~5.0 on Q2's supplier probe) that the sibling index path did not
+		// pay.
+		IndexClauses: clauses,
 		Children: []*Path{{
 			Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
 			BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,

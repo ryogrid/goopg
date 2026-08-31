@@ -2526,6 +2526,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return rt.VM.CountAllVisible(storage.RelFileNode{DBOid: dbOid, RelOid: relOid})
 	}
 
+	// M0134-0183: real relation sizes for the planner. Existence is checked
+	// with the stat-only Exists first — NBlocks reaches the file through
+	// relFile, which opens with O_CREATE and would recreate a removed fork
+	// as empty (the pg_amcheck missing-fork scenario).
+	catalog.RelNBlocksFunc = func(rel storage.RelFileNode) (int64, bool) {
+		if !pool.Exists(rel) {
+			return 0, false
+		}
+		n, err := pool.NBlocks(rel)
+		if err != nil {
+			return 0, false
+		}
+		return int64(n), true
+	}
+
 	// M0130-S1: load persistent FSM state from per-relation. Same shape /
 	// nil-safety as the VM load above. A missing file is the
 	// fresh-cluster case; a corrupt one is a hard startup

@@ -323,6 +323,23 @@ func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples flo
 	if indexPages < 1 {
 		indexPages = 1
 	}
+	// The REAL file size when storage can answer — `get_relation_info`
+	// (plancat.c:466) reads `RelationGetNumberOfBlocks(indexRelation)`, the
+	// actual block count, and estimates nothing. The width-derived guess above
+	// stays as the fallback (planning against a catalog with no storage
+	// attached, e.g. unit tests), and it is a GUESS with a known failure:
+	// HammerDB declares TPC-H's integer keys NUMERIC, `typeWidth` prices an
+	// unconstrained-precision key at 32 bytes, and every such index came out
+	// 2x its real size — supplier_nation_fkidx derived 60 pages against 30
+	// real, which alone held the bitmap-vs-index probe choice on the wrong
+	// side of PG's (M0134-0183). `perPage` is re-derived from the real count
+	// so the tree-height estimate below reads the real fanout.
+	if real, ok := catalog.IndexRealPages(idx); ok && real > 0 {
+		indexPages = float64(real)
+		if perPage < indexTuples/indexPages {
+			perPage = math.Ceil(indexTuples / indexPages)
+		}
+	}
 
 	// Tree height: how many INTERNAL levels sit above the leaves. PG's
 	// `_bt_getrootheight` reports 0 for a single-page index, which is what

@@ -933,14 +933,24 @@ section D. Recorded because the gate run is where they became visible.
 - [x] Gates: 21/21 byte-identical, optimizer+executor green, census
       {q08,q11,q20,q21} vs PG {q02,q11,q17,q20,q21}. One plan changed (q08
       customer → bitmap): cost-honest but 1.7s vs 0.9s — recorded, not hidden.
-- [ ] **Q2 open question MOVED one level up**: bitmap 52.07 now beats index
-      54.73 and both survive addPath, yet the plan keeps the index — the
-      decision happens in `addNLIPaths`' join costing (memoize wrapping /
-      rescan totals / outer rows=5 startup-vs-total tradeoff). Instrument the
-      JOIN candidates for that joinrel next, per §14.4 one level up.
-- [ ] q08's customer bitmap: cost-honest per the model but slower (1.7s vs
-      0.9s) and not PG's node (PG's join order probes customer_pk). Likely the
-      same loop-count/rescan residual as the Q2 question; revisit together.
+- [x] **Q2 RESOLVED — PG's plan, chosen on cost (DESIGN §18)**: three more
+      defects found via the join-level trace. (1) bitmap indexPathClauses
+      carried no `ri` → its own join clause re-charged as residual (~5.0);
+      (2) the clause list lived only on the child path → probeEnforcedClauses
+      and memoizeCacheKeys saw nothing; (3) index geometry derived from a
+      width guess that prices HammerDB's NUMERIC keys at 32 bytes → every
+      index ~2x real size (supplier_nation_fkidx: derived 60, real 11). Fixed
+      by reading REAL block counts (`catalog.RelNBlocksFunc`, plancat.c:466
+      semantics; `Exists` guard against the smgr O_CREATE trap).
+- [ ] **NEW TOP ITEM — bitmap rescan is ~60x an index probe in the executor.**
+      q02 on PG's own plan shape: 2.1s → 129.3s. The model prices the rescan
+      at 0.94x an index probe (PG's own ratio: 0.91x) and PG executes it fine;
+      goopg's TIDBitmap rebuild per rescan is the gap. Executor work, not
+      planner. Do NOT fix by biasing the cost model — that is the arbitrary
+      selection this work is mandated to avoid.
+- [ ] q05's supplier probe flipped to bitmap (timing unchanged, 37s); PG
+      seq-scans supplier under a different join shape. Census divergence to
+      revisit only after the join-shape items (Q72 flattening).
 
 ## Cross-cutting
 

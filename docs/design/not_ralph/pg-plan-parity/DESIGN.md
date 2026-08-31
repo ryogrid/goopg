@@ -1558,3 +1558,76 @@ startup-vs-total tradeoff. The next measurement is the join-cost comparison
 INSIDE `addNLIPaths` for that joinrel — the candidates' own costs are now known
 to be correctly ordered, so §14.4's lesson applies one level up: verify which
 JOIN candidates were built and at what cost before touching any formula.
+
+## 18. Q2 LANDED on PG's plan — real index geometry plus two clause-identity fixes
+
+§17.1's instrumentation of `addNLIPaths` (the join-level comparison) found the
+last three defects in one chain, and Q2's supplier probe is now PG's node —
+`Bitmap Heap Scan via supplier_nation_fkidx` — chosen on cost, 250.07 vs the
+index inner's 257.27, with both candidates generated and compared.
+
+1. **The bitmap inner's own join clause was re-charged as a nestloop
+   residual.** `probeEnforcedClauses` identifies an already-applied clause BY
+   its `restrictInfo`, and the parameterised bitmap producer built its
+   `indexPathClause`es without `ri` — the index producer has carried it since
+   P5.5-b (rule #2, sibling paths must agree). Worth ~5.0 on Q2's probe.
+2. **The clause list lived only on the CHILD BitmapIndexScan path.**
+   `probeEnforcedClauses` and `memoizeCacheKeys` read the inner CANDIDATE's
+   list, and the candidate `addNLIPaths` iterates is the heap-level path. PG
+   reaches the same clauses by walking `bitmapqual`; goopg now carries them on
+   the heap path so "what the probe enforces" stays one list read twice.
+3. **Index geometry was derived from a width GUESS, and the guess prices
+   HammerDB's NUMERIC keys at 32 bytes.** All TPC-H "integer" keys are
+   declared NUMERIC by the HammerDB load, so every index came out ~2x its real
+   size — `supplier_nation_fkidx` derived 60 pages against goopg's real 11
+   (and PG's real 30). PG does not estimate this at all: `get_relation_info`
+   (plancat.c:466) reads `RelationGetNumberOfBlocks(indexRelation)`. goopg now
+   does the same through `catalog.RelNBlocksFunc` — wired in `initdb/open.go`
+   beside `RelAllVisibleFunc`, guarded by the stat-only `Exists` because the
+   smgr's `NBlocks` opens with O_CREATE and would recreate a removed fork.
+   The width derivation stays as the no-storage fallback (unit tests).
+
+After fix 3 the index side of the bitmap fell from 14.35 to 6.35 (PG: 7.87),
+and the join comparison went 250.07 (bitmap) vs 257.27 (index).
+
+### 18.1 Results, and the two honest costs
+
+Census: bitmap set **{q02, q05, q08, q11, q20, q21}** vs PG's
+{q02, q11, q17, q20, q21}; Index Scan count 24 = PG's 24. Gates: TPC-H 21/21
+byte-identical, units, spotcheck, TPC-DS SF0.5 all green. Six plans changed;
+all six timed on fresh equal-age servers:
+
+| | HEAD | real-geometry |
+|---|---|---|
+| q02 | 2.1s | **129.3s** |
+| q05 | 38.9s | 37.0s |
+| q08 | 0.5s | 0.5s |
+| q11 | 0.1s | 0.1s |
+| q20 | 1.3s | 1.2s |
+| q21 | 12.6s | **10.0s** |
+
+**q02 is 60x slower on PG's own plan shape.** The cost model prices the bitmap
+rescan at 44.07 against the index probe's 46.73 — near-parity, matching PG's
+own near-parity (43.46 vs 47.75) — but goopg's EXECUTOR rebuilds a bitmap per
+rescan at far more than 0.94x an index probe's real cost. PG chooses this plan
+and executes it fine; goopg chooses it and pays ~60x. That is an
+executor-efficiency gap in the TIDBitmap rescan path (newly exercised — an
+unwinnable path was an untested path, and now it is a WINNING path), not a
+planning error, and it is the top follow-up. The alternative — biasing the
+cost model away from PG's constants so the slow executor is avoided — is
+exactly the arbitrary-selection code this work is mandated not to write.
+
+**q05 is a new census divergence**: its supplier probe also flipped to a
+bitmap where PG seq-scans supplier under a hash join. Timing is unchanged
+(37s). Cost-honest under goopg's join shape, which differs from PG's before
+any access-method choice is made.
+
+### 18.2 The lesson under all three
+
+Every planning-side number in this chain is now measured against a REAL
+quantity — real index pages, real clause identity, real per-loop costs — and
+the one remaining Q2-family gap (§18.1) is a real EXECUTION cost the model's
+faithful constants do not describe. The cost model has stopped being the
+suspect; the divergences that remain are structural (join shape: q05, q08,
+Q72's pairwise search; boundary totality: Q13/Q16) or executor-side (bitmap
+rescan). None is a term to tune.

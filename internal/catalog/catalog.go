@@ -60,6 +60,32 @@ var UserTableTriggerStatsFunc func(oid uint32) (dead, mod, ins string)
 // relation's VM-derived all-visible block count (pg_class.relallvisible).
 var RelAllVisibleFunc func(dbOid, relOid uint32) int32
 
+// RelNBlocksFunc is optionally set by initdb/bootstrap to report a relation
+// fork's REAL on-disk size in blocks, without creating a missing fork (the
+// smgr's plain NBlocks opens with O_CREATE and would silently recreate a
+// removed file — see Manager.Exists). It exists for the planner:
+// `get_relation_info` (plancat.c) reads an index's size with
+// `RelationGetNumberOfBlocks`, the real file size, NOT an estimate — and
+// goopg's width-derived guess was 2x off on every HammerDB TPC-H index
+// because those columns are declared NUMERIC (M0134-0183).
+var RelNBlocksFunc func(rel storage.RelFileNode) (int64, bool)
+
+// IndexRealPages reports idx's real main-fork size in blocks, when the
+// storage hook is wired and the fork exists. The dbOid/tablespace resolution
+// mirrors (*InMemory).IndexRelFileNode less the receiver's default-db state:
+// an Index with DBOid 0 belongs to the default database, the same fallback
+// RelAllVisible applies for tables.
+func IndexRealPages(idx *Index) (int64, bool) {
+	if idx == nil || RelNBlocksFunc == nil {
+		return 0, false
+	}
+	dbOid := DefaultDBOid
+	if idx.DBOid != 0 {
+		dbOid = idx.DBOid
+	}
+	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
+}
+
 // relAllVisibleFor renders the relallvisible column for one table via the
 // bootstrap-provided hook; "0" when unavailable.
 func (c *InMemory) relAllVisibleCell(t *Table) string {
