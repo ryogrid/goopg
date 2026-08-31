@@ -272,29 +272,47 @@ func (o *gatherMergeOp) advance(src *gmSource) (bool, error) {
 // ordering, matching sortOp's own discipline.
 func (o *gatherMergeOp) lessRows(a, b Row) bool {
 	for _, k := range o.keys {
-		av, err := evalExpr(k.Expr, a, o.ctx)
+		av, err := evalSortKeyValue(k.Expr, a, o.ctx)
 		if err != nil {
 			if o.sortErr == nil {
 				o.sortErr = err
 			}
 			return false
 		}
-		bv, err := evalExpr(k.Expr, b, o.ctx)
+		bv, err := evalSortKeyValue(k.Expr, b, o.ctx)
 		if err != nil {
 			if o.sortErr == nil {
 				o.sortErr = err
 			}
 			return false
+		}
+		// NULL placement is `k.NullsFirst`, NOT `k.Desc`. The two coincide
+		// only for PG's DEFAULTS (NULLS LAST for ASC, NULLS FIRST for DESC,
+		// which is how `sortByNullsFirst` resolves an omitted clause), so the
+		// old `k.Desc` form agreed with `sortOp` by accident and disagreed the
+		// moment a query wrote NULLS FIRST/LAST explicitly.
+		//
+		// That is a WRONG-RESULTS bug, not a cosmetic one, and it was live:
+		// each worker's Sort ordered NULLs one way and this merge re-ordered
+		// them the other, so the leader interleaved them as soon as one worker
+		// exhausted its NULLs. Measured on HEAD before the fix, over a
+		// Gather Merge -> Sort -> Seq Scan plan:
+		//
+		//   select nullif(l_linenumber,1) from lineitem
+		//     order by 1 asc nulls first
+		//   -> a NULL surfaced at row 1183498, AFTER non-NULLs (PG: correct)
+		//
+		// This comparator and `sortOp.lessRows` are one rule read twice: the
+		// merge orders the streams the worker sorts produced, so any
+		// disagreement between them is unordered output by construction.
+		if av.IsNull() && !bv.IsNull() {
+			return k.NullsFirst
+		}
+		if !av.IsNull() && bv.IsNull() {
+			return !k.NullsFirst
 		}
 		if av.IsNull() && bv.IsNull() {
 			continue
-		}
-		// NULLs sort last for ASC, first for DESC — matching sortOp.
-		if av.IsNull() {
-			return k.Desc
-		}
-		if bv.IsNull() {
-			return !k.Desc
 		}
 		cmp, err := compareDatum(av, bv, 0)
 		if err != nil {

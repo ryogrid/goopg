@@ -173,6 +173,58 @@ func TestGatherMergePreservesOrder(t *testing.T) {
 	}
 }
 
+// TestGatherMergeExplicitNullOrdering pins the rule that `sortOp` and
+// `gatherMergeOp` place NULLs by the SAME field.
+//
+// The merge used to decide NULL placement from `k.Desc`, which coincides with
+// `k.NullsFirst` only for PG's defaults (NULLS LAST for ASC, NULLS FIRST for
+// DESC — how `sortByNullsFirst` resolves an omitted clause). Every case in
+// TestGatherMergePreservesOrder uses those defaults, so the whole suite passed
+// while an explicit NULLS FIRST/LAST returned rows in the wrong order: each
+// worker's Sort ordered NULLs one way, the leader's merge the other, and they
+// interleaved as soon as one worker ran out of NULLs.
+//
+// Measured on HEAD before the fix, over Gather Merge -> Sort -> Seq Scan:
+// `select nullif(l_linenumber,1) from lineitem order by 1 asc nulls first`
+// put a NULL at row 1183498, after non-NULLs. PG ordered it correctly.
+//
+// The four combinations below are the whole truth table: for two of them
+// NullsFirst == Desc (the defaults, which passed before) and for two it does
+// not (which did not).
+func TestGatherMergeExplicitNullOrdering(t *testing.T) {
+	ctx, cleanup := gmFixture(t)
+	defer cleanup()
+
+	for _, sql := range []string{
+		"SELECT k, id FROM pq_merge ORDER BY k ASC NULLS FIRST, id",
+		"SELECT k, id FROM pq_merge ORDER BY k ASC NULLS LAST, id",
+		"SELECT k, id FROM pq_merge ORDER BY k DESC NULLS FIRST, id",
+		"SELECT k, id FROM pq_merge ORDER BY k DESC NULLS LAST, id",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			serialRows, err := runQueryWithErr(ctx, sql)
+			if err != nil {
+				t.Fatalf("serial: %v", err)
+			}
+			want := renderRows(serialRows)
+			for _, workers := range []int{1, 2, 4} {
+				got := runGatherMerge(t, ctx, sql, workers)
+				if len(got) != len(want) {
+					t.Fatalf("workers=%d: got %d rows, want %d", workers, len(got), len(want))
+				}
+				for i := range want {
+					if got[i] != want[i] {
+						t.Fatalf("workers=%d: row %d differs: got %q, want %q\n"+
+							"the merge placed NULLs differently from the worker "+
+							"sorts — the rows are all present and in the wrong order",
+							workers, i, got[i], want[i])
+					}
+				}
+			}
+		})
+	}
+}
+
 // TestGatherMergeNoDuplicates: the same duplicate-rows bug the P6 identity
 // test caught applies here, and the merge path has its OWN way of hitting it —
 // attachParallelScan has to descend through the sortOp, which plain Gather
