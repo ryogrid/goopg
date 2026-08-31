@@ -1720,3 +1720,52 @@ outer row through the CorrSubqOps re-Open path, **result byte-identical**,
 tracks; honest, stated, not hidden). goopg's bitmap query set now COVERS PG's
 entirely: every query where PG uses a bitmap, goopg uses one on the same
 index at the same node.
+
+## 20. q02's "60x executor gap" was two more missing bitmap arms — 93s → 0.9s
+
+Task #48 framed q02's regression (2.1s → 93s on PG's plan shape) as bitmap
+rescan cost in the executor. Three measurements in sequence refuted that and
+found the truth:
+
+1. **A CPU profile mid-query showed NO bitmap machinery in the top 25** — the
+   time was generic nested-loop probe work under `evalExprSlot` at 97.8%
+   cumulative: the whole query nested under a Filter evaluating a SubPlan.
+2. **`EXPLAIN ANALYZE` on both binaries side by side** showed the real
+   difference: the fast plan has NO SubPlan at all. The correlated `min()`
+   subquery decorrelates into a HashAggregate joined back (its inner chain
+   runs ONCE: 154,080 rows, 0.6s). The slow plan kept
+   `SubPlan 1 (calls=588 rebuilds=418)` — each call re-running that same
+   ~150k-row chain. Not a rescan-cost problem: an execution-COUNT problem,
+   588x.
+3. **Instrumenting the unnest driver's swallowed exits** (the
+   goopg_swallowed_error_in_rewrite_driver lesson, applied for the second
+   time this session) named the decline in one run:
+
+       UNNEST decline site0 err=XX000: clonePlanReplacingOuter:
+       NLI inner demoted to a non-index scan
+
+Two arms were missing, each behind the other:
+
+- **`clonePlanReplacingOuter`'s NLI arm** hard-asserted `innerNode.(*IndexScan)`
+  — written when `NestedLoopIndexJoin.Inner` WAS typed `*IndexScan`, and never
+  updated when M0134-0180 widened it to `Node`. The fix delegates to
+  `nliInnerProbe`, the single enumerator of legal inner kinds.
+- **`nliInnerProbe` itself had no bitmap arm** — so the delegation alone
+  changed nothing. A keyed single-producer `BitmapHeapScan` is a legal NLI
+  inner (`bitmapHeapScanOp` implements the full `nliInner` interface), and its
+  probe keys live one node down on the `*BitmapIndexScan`. Both consumers
+  tolerate it: `joinlayout` rebinds the same key pointers by name, and
+  `maybeAttachMemoize` separately guards `*IndexScan` and simply declines the
+  cache.
+
+With both arms: q02 decorrelates again, **0.9s** — faster than the 2.1s it ran
+before the whole bitmap effort began, with the supplier bitmaps in place and
+the result byte-identical. Exactly one plan changed; census unchanged at PG's
+full bitmap coverage.
+
+That closes the M0134-0185/0186 sweep at SEVEN bitmap-blind switches:
+`walkPlanExprs`, `lowerTraverseNode`, the indexkey harvest, `clonePlanReplacingOuter`
+(twice — its own arm and its NLI guard), the S6 policy twins, and
+`nliInnerProbe`. Every one was written when "scan" meant `*IndexScan`, and
+each failed differently: wrong results, lost lowering, lost decorrelation, a
+588x execution blowup. The census could see none of them.

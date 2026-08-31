@@ -942,12 +942,14 @@ section D. Recorded because the gate run is where they became visible.
       index ~2x real size (supplier_nation_fkidx: derived 60, real 11). Fixed
       by reading REAL block counts (`catalog.RelNBlocksFunc`, plancat.c:466
       semantics; `Exists` guard against the smgr O_CREATE trap).
-- [ ] **NEW TOP ITEM — bitmap rescan is ~60x an index probe in the executor.**
-      q02 on PG's own plan shape: 2.1s → 129.3s. The model prices the rescan
-      at 0.94x an index probe (PG's own ratio: 0.91x) and PG executes it fine;
-      goopg's TIDBitmap rebuild per rescan is the gap. Executor work, not
-      planner. Do NOT fix by biasing the cost model — that is the arbitrary
-      selection this work is mandated to avoid.
+- [x] **RESOLVED — the "60x executor gap" was two more bitmap-blind switches
+      (DESIGN §20).** The profile showed no bitmap machinery at all; EXPLAIN
+      ANALYZE showed the fast plan DECORRELATES (inner chain runs once) while
+      the slow one kept a 588-call SubPlan; the instrumented unnest driver
+      named the decline: `clonePlanReplacingOuter`'s NLI guard still asserted
+      `*IndexScan` (pre-M0134-0180 typing), and `nliInnerProbe` had no bitmap
+      arm behind it. Both fixed: q02 = 0.9s, byte-identical, faster than the
+      2.1s it ran before the bitmap effort began.
 - [ ] q05's supplier probe flipped to bitmap (timing unchanged, 37s); PG
       seq-scans supplier under a different join shape. Census divergence to
       revisit only after the join-shape items (Q72 flattening).

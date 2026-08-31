@@ -859,6 +859,19 @@ func nliInnerProbe(n Node) (idx *catalog.Index, key Expr, keys []Expr, ok bool) 
 		return x.Index, x.Key, x.Keys, true
 	case *IndexOnlyScan:
 		return x.Index, x.Key, x.Keys, true
+	case *BitmapHeapScan:
+		// A keyed bitmap probe is a legal NLI inner: `bitmapHeapScanOp`
+		// implements the full `nliInner` interface (BindOuter forwards to the
+		// producer, Rescan drops the stale TID set). The probe keys live one
+		// node down, on the single `*BitmapIndexScan` producer — an And/Or
+		// tree carries several probes and is not a single-key inner, so it
+		// stays illegal. Without this arm, `clonePlanReplacingOuter`'s NLI
+		// guard declined any subplan whose probe planned as a bitmap and the
+		// scalar silently stayed a per-row SubPlan (M0134-0186; TPC-H q02's
+		// decorrelation, 588 calls at ~150k rows each).
+		if bis, ok := x.Outer.(*BitmapIndexScan); ok {
+			return bis.Index, bis.Key, bis.Keys, true
+		}
 	}
 	return nil, nil, nil, false
 }

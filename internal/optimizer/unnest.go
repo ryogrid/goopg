@@ -1437,21 +1437,24 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		if err != nil {
 			return nil, err
 		}
-		is, isIdx := innerNode.(*IndexScan)
-		if !isIdx {
-			// The `*IndexScan` arm below demotes a probe to a `*SeqScan` when
-			// its key is a HARVESTED correlation, because after replacement the
-			// scan would probe its own column. `Inner` is typed `*IndexScan`
-			// and cannot carry that demotion, and the equality it stands for is
-			// the one the enclosing join is about to enforce — so decline here
-			// rather than build a node the plan builder must refuse. Declining
-			// is what this whole arm did before it existed, so this case is no
-			// worse than the status quo.
-			return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: NLI inner demoted to a non-index scan"}
+		// `Inner` is `Node` since M0134-0180 widened it, and the ONE list of
+		// legal inner kinds is `nliInnerProbe` — an `*IndexScan` or a keyed
+		// bitmap probe. A clone that is neither means the scan arm DEMOTED the
+		// probe to a `*SeqScan` (its key was a HARVESTED correlation, so after
+		// replacement it would probe its own column); an NLI cannot drive
+		// that, and the equality it stands for is the one the enclosing join
+		// is about to enforce — so decline, exactly as before. What changed
+		// (M0134-0185): a bitmap inner whose key is NOT harvested clones as
+		// itself and passes — before this, q02's subplan hit the old
+		// `*IndexScan`-only assertion the moment its supplier probe planned as
+		// a bitmap, the driver swallowed the error, and the scalar silently
+		// stayed a 588-call SubPlan instead of decorrelating (2.1s → 93s).
+		if _, _, _, legal := nliInnerProbe(innerNode); !legal {
+			return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: NLI inner demoted to a non-probe scan"}
 		}
 		nli := *n
 		nli.Outer = outerNode
-		nli.Inner = is
+		nli.Inner = innerNode
 		if n.Predicate != nil {
 			nli.Predicate = cloneExprReplacingOuter(n.Predicate, replace)
 		}
