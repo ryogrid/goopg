@@ -70,10 +70,10 @@ flowchart TD
 
 1. **Connect** — `postmaster.Run` → `acceptLoop` → `serveConn` per connection
    (`internal/postmaster/server.go`).
-2. **Parse** — `parser.Parse` (`internal/postmaster/dispatch.go:127`).
-3. **Plan** — `optimizer.Plan(stmt, catalog)` (`internal/postmaster/dispatch.go:1095`).
+2. **Parse** — `parser.Parse` (`internal/postmaster/dispatch.go:166`).
+3. **Plan** — `optimizer.Plan(stmt, catalog)` (`internal/postmaster/dispatch.go:1161`).
 4. **Execute** — `executor.BuildFastIterator(node)` → `Open`/`Next`/`Close`
-   (`internal/postmaster/dispatch.go:2964`).
+   (`internal/postmaster/dispatch.go:3398`).
 5. **Access storage** — operators pin pages through `storage.Pool.Pin` and read
    through `storage.Manager.ReadBlock`; heap writes go through
    `storage.PageAddHeapTuple`/`PageSetHeapTupleXmax`.

@@ -26,9 +26,8 @@ restore the resulting tar.
 
 ```go
 type Handler struct{ ... }
-func NewHandler(cfg Config) *Handler
-func (h *Handler) ReplyBaseBackup(conn *FrameWriter, req Request) error
-func (h *Handler) Write(p []byte) (int, error)     // stream a block of bytes
+func NewHandler(cfg Config, werr WriteQueryErrorFunc) *Handler
+func (h *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, args string) error
 
 type Config struct{ ... }    // server, storage, WAL access, checksum kind
 ```

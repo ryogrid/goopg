@@ -30,17 +30,18 @@ run on demand (e.g., `pg_amcheck` TAP, `verify_heapam()` SRF, DBA diagnostics).
 
 ```go
 // B-tree verification
-func VerifyBtreePage(bt *nbtree.BTree, blk, ...) error
-func VerifyBtreeItemOrder(bt, blk, ...) error
-func VerifyBtreeLevelSiblingLinks(bt, ...) error
-func VerifyBtreeParentDownlinks(bt, ...) error
+func VerifyBtreePage(p storage.Page, blk storage.BlockNumber, indexName string) []BtreeReport
+func VerifyBtreeItemOrder(p, blk, indexName) []BtreeReport
+func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost, indexName) []BtreeReport
+func VerifyBtreeParentDownlinks(src PageSource, parentBlk, indexName, ...) []BtreeReport
 
 // Heap verification
-func VerifyHeapPage(p storage.Page, blk, ...) Report
-func VerifyHeapPageWithRel(rel, p, blk, ...) Report
+func VerifyHeapPage(p storage.Page, blk storage.BlockNumber) ([]Report, error)
+func VerifyHeapPageWithRel(p, blk, rel) ([]Report, error)
 
 // All-indexed check
-func HeapAllIndexedCheck(rel, indexes, ...) error
+func VerifyBtreeHeapAllIndexed(indexLeafEntries, heapEntries []nbtree.LeafEntry, ...) []BtreeReport
+func VerifyBtreeHeapAllIndexedRelation(idxSrc, keyFmt, heapEntries, ...) ([]BtreeReport, error)
 ```
 
 ## Internal structure

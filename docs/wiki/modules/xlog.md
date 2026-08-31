@@ -63,17 +63,17 @@ replication.
 ```go
 // Writer (writer.go)
 func NewWriter(cfg Config) (*Writer, error)
-func (w *Writer) Append(rec Record) (lsn uint64, err error)
-func (w *Writer) AppendRaw(lsn uint64, data []byte) (uint64, error)
+func (w *Writer) Append(payload []byte) (lsn uint64, used uint64, err error)
+func (w *Writer) AppendRaw(stream []byte) (lsn uint64, used uint64, err error)
 func (w *Writer) FlushUpTo(lsn uint64) error
 func (w *Writer) WrittenLSN() uint64 / DrainedLSN() uint64
 func (w *Writer) Close() error
 
 // Recovery (recovery.go)
-func ReplayRecords(records []Record, mgr *storage.Manager, ...) error
-func ReplayRecordsFrom(...) error
-func ReplayFromDirWithMgr(dir string, mgr *storage.Manager, ...) (ReplayStats, error)
-func ApplyRecord(rec Record, ...) error          // redo one record
+func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error)
+func ReplayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64) (ReplayStats, error)
+func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64) (ReplayStats, error)
+func ApplyRecord(mgr *storage.Manager, r Record) (bool, error)   // redo one record
 func DiscoverLastCheckpointLSN(...) (uint64, error)
 
 // Reader (reader.go)
@@ -81,7 +81,7 @@ func readStream(segDir string, startLSN uint64, ...) ([]Record, error)
 func readStreamFrom(segDir string, startLSN uint64, w *Writer, ...) (*RecordIterator, error)
 
 // Logical decoding (pgoutput.go)
-func NewPgOutput(w io.Writer, filter RelationFilter) *PgOutput
+func NewPgOutput(snap *CatalogSnapshot, w io.Writer) *PgOutput
 func (p *PgOutput) Begin(xid) / Commit(lsn) / Insert(rel, row) / ...
 ```
 

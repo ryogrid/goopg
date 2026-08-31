@@ -12,19 +12,19 @@ background vacuum/analyze launcher.
 
 - `server.go` (1,881) — `Server` listener; accept loop, per-conn goroutine,
   startup/auth handshake, frame loop, control plane.
-- `dispatch.go` (3,906) — simple-query dispatcher: parse→plan→execute loop,
+- `dispatch.go` (4,453) — simple-query dispatcher: parse→plan→execute loop,
   plan cache, auto-commit, CommandComplete/RFQ, GC-throttle.
-- `query.go` (619) — legacy string-match fast paths (`SELECT 1`, `SHOW`,
+- `query.go` (698) — legacy string-match fast paths (`SELECT 1`, `SHOW`,
   `SET/RESET`), `writeQueryError`.
-- `copy.go` (908) — COPY routing: CopyTo stream / CopyFrom frame drain.
-- `extended.go` (901) — extended-protocol frames: Parse/Bind/Describe/Execute/
+- `copy.go` (942) — COPY routing: CopyTo stream / CopyFrom frame drain.
+- `extended.go` (934) — extended-protocol frames: Parse/Bind/Describe/Execute/
   Close, portal drain with `maxRows` suspension.
-- `dispatch_extended.go` (709) — extended-query executor path.
-- `database_ddl.go` (1,944) / `role_ddl.go` (1,070) — string-prefix DDL bypasses
+- `dispatch_extended.go` (733) — extended-query executor path.
+- `database_ddl.go` (2,018) / `role_ddl.go` (1,374) — string-prefix DDL bypasses
   for CREATE/ALTER/DROP DATABASE and ROLE.
-- `conn_tx.go` (836) — `connTxState`: explicit-txn holder, session identity,
+- `conn_tx.go` (857) — `connTxState`: explicit-txn holder, session identity,
   cursors, prepared statements, notify buffer.
-- `txn_verb.go` (321) — shared BEGIN/COMMIT/ROLLBACK/SAVEPOINT state machine.
+- `txn_verb.go` (525) — shared BEGIN/COMMIT/ROLLBACK/SAVEPOINT state machine.
 - `notify.go` / `cancel.go` / `eof_watch.go` / `twophase.go` / `plancache.go` —
   LISTEN/NOTIFY hub; cancel registry; client-EOF watcher; 2PC store; plan cache.
 - `autovacuum/launcher.go` — background autovacuum/autoanalyze launcher.

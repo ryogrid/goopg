@@ -32,7 +32,7 @@ optimizer (layer rule), so the serializable/analyzable expression layer lives in
 - `rebuild.go` (884) — plan-node cloning/rebuilding (`Clone`, deep-copy helpers).
 - `readfuncs.go` (586) — `Read`: text-mode deserializer (the `readNode`/`read*`
   family), the inverse of `outfuncs`.
-- `resolver_query.go` (485) — query-level resolution (`ResolveQuery` / query
+- `resolver_query.go` (485) — query-level resolution (`ResolveViewQuery` / query
   statement transform).
 - `readfuncs_query.go` (485) — query-node deserialization.
 - `outfuncs.go` (358) — `Out`: text-mode serializer producing PG-compatible
@@ -50,12 +50,13 @@ optimizer (layer rule), so the serializable/analyzable expression layer lives in
 func Out(n Node) string                     // -> "(SELECT ...)" S-expression
 func Read(s string) (Node, error)           // <- parse it back
 func OutList(nodes []Node) string
-func ReadQuery(s string) (Node, error)      // query-flavored variant
+func ReadRuleAction(s string) ([]Node, error) // query-flavored variant
 
 // Resolution (PG transformExpr analogue)
-func ResolveExpr(e Expr, s scope) (Node, error)
-func ResolveForColumn(...)                  // typed column resolution
-func ResolveQuery(...)                      // full-statement resolution
+func ResolveExpr(e parser.Expr, targetType uint32) (Node, error)
+func ResolveForColumn(e parser.Expr, targetType uint32) (Node, bool)     // typed column
+func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32) (Node, bool)
+func ResolveViewQuery(sel *parser.SelectStmt, r RelationResolver) (*Query, error)
 ```
 
 ## Internal structure

@@ -48,15 +48,13 @@ scans, and VACUUM purges dead entries from. All operator-facing code paths
 ## Public API
 
 ```go
-func Open(rel storage.RelFileNode, ...) (*BTree, error)
-func OpenWithOptions(...) (*BTree, error)
-func Create(rel, ...) (*BTree, error)                     // CREATE INDEX
-func (bt *BTree) Search(key []byte) (ItemPointer, bool, error)   // point lookup
-func (bt *BTree) Insert(key []byte, ptr ItemPointer) error
+func Open(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error)
+func OpenWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error)
+func Create(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error)   // CREATE INDEX
+func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error)   // point lookup
+func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error
 func (bt *BTree) RangeScan(lo, hi []byte, fn func(key, ptr) bool) error
-func (bt *BTree) RangeScanWithPos(lo, hi []byte, loStrict, hiStrict bool, ...) error
-func (bt *BTree) PageItems(blk) []item
-func (bt *BTree) Close()
+func (bt *BTree) RangeScanWithPos(lo, hi []byte, loExclusive, hiExclusive bool, ...) error
 ```
 
 ## Internal structure

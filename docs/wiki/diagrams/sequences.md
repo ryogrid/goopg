@@ -34,10 +34,10 @@ sequenceDiagram
 1. **Accept + handshake** — `postmaster.Run` → `acceptLoop` → `serveConn`
    (`internal/postmaster/server.go:855/886`), `handleStartup`, `checkAuth`.
 2. **Dispatch** — `MsgQuery` → `handleQueryOrCopy` (`copy.go:51`) →
-   `dispatchSimpleQueryViaExecutor` (`dispatch.go:100`).
-3. **Parse** — `parser.Parse` (`dispatch.go:127`).
-4. **Plan** — plan-cache miss → `optimizer.Plan` (`dispatch.go:1095`).
-5. **Execute** — `executor.BuildFastIterator` (`dispatch.go:2964`) → `Open` /
+   `dispatchSimpleQueryViaExecutor` (`dispatch.go:139`).
+3. **Parse** — `parser.Parse` (`dispatch.go:166`).
+4. **Plan** — plan-cache miss → `optimizer.Plan` (`dispatch.go:1161`).
+5. **Execute** — `executor.BuildFastIterator` (`dispatch.go:3398`) → `Open` /
    `Next` / `Close`.
 6. **Respond** — `commandTagFor` → `WriteCommandComplete` → `ReadyForQuery`.
 

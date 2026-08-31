@@ -16,20 +16,20 @@ over flat int32-indexed slabs. The fast path is the live server entry point
 ## Key Files
 
 - `executor.go` (647) — `Build`/`BuildFast` dispatch (`optimizer.Node` → operator/slab).
-- `expr.go` (18,168) — interpreted evaluator `evalExprSlot` + every SQL builtin
+- `expr.go` (21,152) — interpreted evaluator `evalExprSlot` + every SQL builtin
   body (to_char, regexp, extract, casts, interval/time arithmetic, subqueries).
-- `exprnode.go` (904) — compiled expression tree `ExprNode`/`exprTreeSlab` + `evalFastExpr`.
+- `exprnode.go` (592) — compiled expression tree `ExprNode`/`exprTreeSlab` + `evalFastExpr`.
 - `opnode.go` (904) — fast-path operator tree `OpNode`/`opTreeSlab`, `Slot`,
   `OpIterator`, `opOpen`/`opNext` dispatch, `BuildFastIterator`.
-- `operators_storage.go` (9,663) — `seqScanOp`/`insertOp`/`updateOp`/`deleteOp`:
+- `operators_storage.go` (9,999) — `seqScanOp`/`insertOp`/`updateOp`/`deleteOp`:
   heap writes, HOT updates, xmax stamping, EPQ retry chains, unique/exclusion checks.
 - `operators_join_agg.go` (4,987) — `joinOp` (lazy hash / merge / nested-loop /
   lateral), `aggregateOp` (hash + sorted grouping, user sfunc dispatch).
-- `operators_ddl.go` (26,160) — `ddlOp`, one ~50-arm `Next` switch over every
+- `operators_ddl.go` (27,132) — `ddlOp`, one ~50-arm `Next` switch over every
   parser DDL statement.
-- `plpgsql_runtime.go` (3,627) — stored-routine dispatch by language +
+- `plpgsql_runtime.go` (3,752) — stored-routine dispatch by language +
   PL/pgSQL statement interpreter (`executePLpgSQLStmt`).
-- `context.go` (1,876) — the per-statement `Context` struct, `NewContext`,
+- `context.go` (1,930) — the per-statement `Context` struct, `NewContext`,
   `CommitTransaction`, lock helpers.
 - `datum.go` (890) — 48-byte `Datum` value carrier, `DatumKind`/`TimeSubtype`.
 - `session.go` (1,039) — `Session` interface (`BasicSession`,

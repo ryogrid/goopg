@@ -23,7 +23,7 @@ control plane over a Unix socket, and run a streaming standby.
   `runStart` (`main.go:251`) is the server startup path.
 - `cmd/goopg/standby.go` (489 LOC) — streaming-standby lifecycle and promotion.
 - `cmd/goopg/main_test.go`, `cmd/goopg/standby_test.go` — tests (`runRestart`
-  is factored as `runRestartWithStarter` at `main.go:1100` so tests can inject a
+  is factored as `runRestartWithStarter` at `main.go:1154` so tests can inject a
   fake starter).
 
 ## Public API / CLI surface

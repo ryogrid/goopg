@@ -46,26 +46,28 @@ replays `XACT_COMMIT`/`XACT_ABORT` records through the same manager.
 ## Public API
 
 ```go
-func NewManager(cfg Config) *Manager
+func NewManager() *Manager
 func (m *Manager) Begin(...) *Transaction
 func (t *Transaction) AssignXID()                  // materialize an XID lazily
 func (t *Transaction) FreshSnapshot() *Snapshot    // per-statement snapshot
 func (t *Transaction) SnapshotFor(...) *Snapshot   // statement-level snapshot
-func (t *Transaction) Commit(...) / CommitAsync(...) / Rollback(...)
-func (t *Transaction) AllocateSubXid()             // sub-transaction XID
+func (m *Manager) Commit(...) / CommitAsync(...) / Rollback(...)
+func (m *Manager) AllocateSubXid()                 // sub-transaction XID
 func (m *Manager) WaitForXID(xid, ...)             // wait for another txn
 func (m *Manager) OldestXmin() TransactionID       // vacuum horizon
 func (m *Manager) NextXID() TransactionID / SetNextXID(xid)
 func (m *Manager) ReplayXactCommit(...) / ReplayXactAbort(...) // WAL recovery
 
 // CLog
-func (c *CLog) TransactionIdDidCommit(xid) bool
-func (c *CLog) TransactionIdDidAbort(xid) bool
-func (c *CLog) SetTransactionIdStatus(xid, status)
+func (c *CLog) DidCommit(xid, parentOf) bool
+func (c *CLog) GetStatus(xid) TxnStatus
+func (c *CLog) SetCommitted(xid) / SetAborted(xid)
 
 // Multixact
-func (s *Store) LookupMulti(mxid) ([]TransactionID, error)
-func (s *Store) AddMulti(members []TransactionID) (MultiXactId, error)
+func (s *Store) Members(mxid) ([]Member, bool)
+func (s *Store) Create(m1, m2 Member) (MultiXactId, error)
+func (s *Store) CreateFromMembers(members []Member) (MultiXactId, error)
+func (s *Store) Expand(mxid, add, live) (MultiXactId, error)
 ```
 
 ## Internal structure

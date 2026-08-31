@@ -71,6 +71,7 @@ See [architecture.md](architecture.md) for the system diagram and data flow.
 | [`internal/initdb`](modules/initdb.md) | Cluster bootstrap + startup recovery: data-dir creation, WAL replay, catalog heap reload. |
 | [`internal/replication`](modules/replication.md) | Streaming + logical replication: walsender/walreceiver, apply launcher, table sync. |
 | [`internal/access/amcheck`](modules/amcheck.md) | Index/table verification: heap all-indexed checks, nbtree verification, bloom filter. |
+| [`internal/access/common/pglz`](modules/pglz.md) | PGLZ LZ compression: inline-compressed varlena codec (PG `pg_lzcompress.c` port). |
 | [`internal/backup`](modules/backup.md) | Physical backup: `pg_basebackup`-compatible streaming tar output, manifest. |
 | [`internal/commands/vacuum`](modules/vacuum.md) | VACUUM: dead-tuple reclamation, tuple freeze, VM update, tail truncation. |
 | [`internal/pl/plpgsql`](modules/plpgsql.md) | PL/pgSQL language parser/AST: function body parser, statement AST types. |

@@ -15,10 +15,10 @@ replication 5.
 
 | File | LOC | Role |
 |---|---|---|
-| `catalog.go` | 24,021 | Everything core: structs, `InMemory`, all registries, all virtual row builders |
-| `pg_proc_names_generated.go` | 13,621 | Generated OID→(proname,argtypes) reverse map |
-| `codec.go` | 2,022 | `PGClassRow`/`PGAttributeRow`/`PGTypeRow` heap encode/decode |
-| `routines.go` | 1,057 | User-defined routine (function/procedure) registry |
+| `catalog.go` | 24,969 | Everything core: structs, `InMemory`, all registries, all virtual row builders |
+| `pg_proc_names_generated.go` | 13,623 | Generated OID→(proname,argtypes) reverse map |
+| `codec.go` | 2,049 | `PGClassRow`/`PGAttributeRow`/`PGTypeRow` heap encode/decode |
+| `routines.go` | 1,081 | User-defined routine (function/procedure) registry |
 | `pg_operator_seed_data.go` | 807 | Full PG18 pg_operator seed, 799 rows |
 | `pubsub.go` | 746 | Publication/subscription rows |
 | `default_acl.go` | 294 | ALTER DEFAULT PRIVILEGES (DEFACLOBJ_* letters) |
@@ -26,28 +26,28 @@ replication 5.
 
 ## Core data structures
 
-- **`Table`** (`catalog.go:334`) — the central relation record. Notable fields:
-  `Schema/Name/Columns/OID`; `RelFileNodeOID` (:342) and `DBOid` (:355) for
+- **`Table`** (`catalog.go:418`) — the central relation record. Notable fields:
+  `Schema/Name/Columns/OID`; `RelFileNodeOID` and `DBOid` for
   physical per-database routing; **`Virtual bool` + `VirtualRows func()[][]string`**
   (:363–364) marking catalogs served by builders instead of heaps;
   `View *parser.SelectStmt` / `ViewDef` (:376–384); constraints
   (`NamedChecks`, `NotNullConstraints`:476–481); partition fields (:529–567);
-  `Unlogged`/`Temp` (:570–571); **`TempOwner string`** (:630) — per-session temp
+  `Unlogged`/`Temp` (:570–571); **`TempOwner string`** — per-session temp
   ownership token; `Owner` (:642, role name driving VACUUM privilege);
-  `Stats *TableStats` (:421); reloptions mirrors (`Fillfactor`:648,
+  `Stats *TableStats`; reloptions mirrors (`Fillfactor`:648,
   `ReplicaIdentity`:592, `RowSecurity`:600…).
-- **`Column`** (`catalog.go:110`) — `Type Type` (:97; note `Type{Name, Args, IsArray}`
+- **`Column`** (`catalog.go:194`) — `Type Type` (:97; note `Type{Name, Args, IsArray}`
   where `Name` is the *element* type name for arrays), `Ordinal`, identity/
   generated fields (:117–160), `Dropped` (:165, slot retained),
   `MissingValue any` (:141, attmissingval analogue typed `any` to dodge a
   catalog→executor import cycle), and ~15 dump-only fidelity fields
   `Storage/Compression/StatTarget/Options/Collation/FDWOptions` (:177–223).
-- **`Index`** (`catalog.go:1778`) — `Unique/Method/Primary/ColExprs/Predicate/
+- **`Index`** (`catalog.go:1898`) — `Unique/Method/Primary/ColExprs/Predicate/
   IncludeColumns/ColDescending…`, plus its own `DBOid`.
 - **Constraint & rule types** — `NamedCheckConstraint` (:228; NotValid/NoInherit/
   NotEnforced), `NamedNotNullConstraint` (:251, PG18 contype='n'), `ForeignKey`
-  (:1498), `Trigger` (:1342), `PolicyInfo` (:1413), `RuleInfo` (:1444),
-  `PartitionBound` (:1556), `TableStats`/`ColumnStats` (:1649/:1693).
+ , `Trigger`, `PolicyInfo`, `RuleInfo`,
+  `PartitionBound`, `TableStats`/`ColumnStats` (:1649/:1693).
 - **Type-side registries** — `EnumType`:3069, `Domain`:3105, `CompositeType`:3234,
   `RangeType`:3274, `UserCollation`:3355, `UserOperator`:18712,
   `UserOperatorClass/Family`:19215/18991, `AmOpMember/AmProcMember`:19447/19463,
@@ -55,13 +55,13 @@ replication 5.
   `ForeignDataWrapper`:17315, `ForeignServer`:18205, `UserMapping`:20333,
   `StatisticsObject`:2993, `RoleMembership`:5643, `RoleAttrs`:15972,
   `BuiltinProc`:19784, `BuiltinOperator`:19931.
-- **Manager vs on-disk duality** — `InMemory` (`catalog.go:2296`) is the live
+- **Manager vs on-disk duality** — `InMemory` (`catalog.go:2459`) is the live
   truth: an `RWMutex` guarding `namespaces map[uint32]*tableNamespace` (:2316,
   where `tableNamespace{tables,indexes,byTable}`:2282) plus ~40 flat maps
   (enums/domains/composites/ranges/roles/ACLs/toast renames/partition edges).
   The on-disk heap catalogs are a **persistence projection**: written by the
   executor at DDL time, reloaded at startup into the same `InMemory`. Code
-  programs against the `Catalog` interface (:1990); `SearchPathCatalog` (:23876)
+  programs against the `Catalog` interface; `SearchPathCatalog`
   wraps it adding search_path/temp-owner/dboid resolution.
 
 ## Virtual vs heap-backed catalogs
@@ -69,13 +69,13 @@ replication 5.
 The split is deliberate and asymmetric:
 
 - **pg_class (1259) is virtual** — registered in `(*InMemory).registerSystemTables()`
-  (`catalog.go:8133`) with `Virtual: true` and a PG18-canonical 34-column
-  tupdesc (:8140–8175); rows come from `PGClassRowsForDBOid` (:7168). The
+  (`catalog.go:8418`) with `Virtual: true` and a PG18-canonical 34-column
+  tupdesc (:8140–8175); rows come from `PGClassRowsForDBOid`. The
   executor's values operator special-cases it (`internal/executor/operators.go:165`
   swaps in `ctx.PgClassRows()`; hook declared `executor/context.go:689–694`).
 - **pg_type (1247) and pg_attribute (1249) are heap-backed** — when
   `base/<dbOid>/1247|1249` exist, startup registers them via
-  `RegisterRealTable` (`catalog.go:12147`, rejects Virtual tables, requires a
+  `RegisterRealTable` (`catalog.go:12467`, rejects Virtual tables, requires a
   preset OID < FirstUserOID) so a SeqScan reads the relfile directly
   (`internal/initdb/open.go:2795 loadSystemCatalogsIfPresent`).
 - **…but pg_class also gets a real heap image** for PG-standby/dump parity:
@@ -88,12 +88,12 @@ The split is deliberate and asymmetric:
   (`loadUserTablesFromHeap`, open.go:2899+, per-database pass open.go:1540).
 - The 34-column alignment exists precisely so `scanMatching` can decode physical
   pg_class heap tuples for statements like `UPDATE pg_class SET reltuples…`
-  (`catalog.go:8138–8142`).
+  (`catalog.go:8423–8142`).
 - Everything else — pg_database, pg_namespace, pg_constraint, pg_depend,
   pg_stat_*, information_schema.* — is a virtual builder either here
-  (`registerSystemTables` catalog.go:8133–11812,
+  (`registerSystemTables` catalog.go:8418–11812,
   `registerInformationSchemaTables`:11812, the `PG*RowsForDBOid` family
-  :6567–15654) or in `internal/executor/sys_pg_*.go`.
+ –15654) or in `internal/executor/sys_pg_*.go`.
 
 ## Lifecycle
 
@@ -113,7 +113,7 @@ The split is deliberate and asymmetric:
   `newPredefinedRoleMap`:15932.
 - **Dependency recording** — there is deliberately **no general pg_depend
   store**: `PGDependRowsForDBOid`:14990 synthesizes only sequence-ownership ('a')
-  rows through the executor-injected `SequenceParamsFunc` hook (catalog.go:80,
+  rows through the executor-injected `SequenceParamsFunc` hook (catalog.go:164,
   import-cycle breaker). The one first-class edge type is
   `constraintViewDeps`:2489 (`RegisterViewConstraintDep`:20952 /
   `ViewsDependingOnConstraint`:20996) enforcing DROP CONSTRAINT RESTRICT for
@@ -121,9 +121,9 @@ The split is deliberate and asymmetric:
 - **Transactional semantics** — most catalog mutations are immediate, not
   MVCC-versioned; PG-like behaviour is emulated with explicit sidecar markers:
   deferred DROP TABLE visibility (`SetTablePendingDropXID`/`TablePendingDropXID`,
-  :21339–21365), `PgClassRowMark`s (:2949/:21379, row-lock marks on pg_class
+ –21365), `PgClassRowMark`s (:2949/:21379, row-lock marks on pg_class
   tuples), `pendingAttachXID` (:2417, in-flight ATTACH PARTITION blocks FK
-  deletes), `DetachPendingEpoch` on children (:550) with
+  deletes), `DetachPendingEpoch` on children with
   `VisiblePartitionChildren`:4834 (detach-concurrent snapshot epoch), and
   `pendingInheritanceChangeCount` (:2457, forces plan-cache bypass). Treat
   catalog DDL as autocommit-ish except where a marker above exists.
@@ -141,7 +141,7 @@ The split is deliberate and asymmetric:
   trailing `dbOid ...uint32`, defaulted via `resolveDBOid`:3811 to
   `DefaultDBOid = 1`. Type-family maps key dbOid into the name
   (`domainKey`:3821, `enumKey`:3829, …).
-- **The postgres-is-default quirk** — `NamespaceDBOid(connDBOid)` (:23962) maps
+- **The postgres-is-default quirk** — `NamespaceDBOid(connDBOid)` maps
   0 **and `PostgresDBOid = 5`** back to DefaultDBOid(1), because write paths
   still persist under 1; only genuinely new CREATE DATABASE OIDs get their own
   namespace. Per-db heaps `base/<dbOid>/1259|1249` exist since M0122-0007;
@@ -154,7 +154,7 @@ The split is deliberate and asymmetric:
   `SnapshotPartitionDetachEpoch`, `DisableSeqScan`, `DBOid`.
 - **Temp tables** — `Table.TempOwner` records the owning session token;
   per-owner temp namespaces (`EnsureTempNamespace`/`tempNamespaceName`,
-  :15823–15884); `DropSessionTempObjects`:20534 cleans up at disconnect;
+ –15884); `DropSessionTempObjects`:20534 cleans up at disconnect;
   `AccessibleInheritanceChildren`:4578 hides other-session temp children
   (RELATION_IS_OTHER_TEMP).
 
@@ -172,7 +172,7 @@ The split is deliberate and asymmetric:
   reltype is goopg's RECORDOID (2249), diverging from upstream per-view
   composite types (documented in the generator header).
 - **pg_stat_\*** — Go builders, not SQL views: `PGStatTablesRowsForDBOid`:7704,
-  xact/indexes/statio variants :7797–8076, scoped by `StatTableScope{All,User,Sys}`:7671;
+  xact/indexes/statio variants–8076, scoped by `StatTableScope{All,User,Sys}`:7671;
   counters are faithful zeros/NULLs (no PgStat_StatTabEntry store),
   n_live_tup comes from ANALYZE reltuples.
 - **information_schema** — virtual tables registered in-package
@@ -185,41 +185,41 @@ Grouped highlights (all in `catalog.go` unless noted):
 
 ```go
 // Lookup
-LookupTable / LookupColumn / LookupIndex          // interface :1990; impls :12224/:12299/:12311
-LookupTableByOID / LookupTableByOIDAllDBs         // :6346/:6360
-LookupIndexByOID :4886 · TablesInSchema :20472 · AllTables :21195
-UserTableHandles :21220 · AllUserViews/MatViews :21457/:21475
+LookupTable / LookupColumn / LookupIndex          // interface; impls/:12299/:12311
+LookupTableByOID / LookupTableByOIDAllDBs         ///:6360
+LookupIndexByOID · TablesInSchema · AllTables
+UserTableHandles · AllUserViews/MatViews/:21475
 
 // DDL
-CreateTable/CreateIndex/CreateView/AddColumn      // :12355–12592
-DropTable/DropView/DropIndex/RenameTable/RenameIndex/RenameSchema // :20506–13139
-TryRegisterUserTable :12112 · AllocOID :6468
+CreateTable/CreateIndex/CreateView/AddColumn      //–12592
+DropTable/DropView/DropIndex/RenameTable/RenameIndex/RenameSchema //–13139
+TryRegisterUserTable · AllocOID
 
 // Row builders (virtual catalogs)
-PGClassRowsForDBOid :7168   PGAttrdefRowsForDBOid :6966
-PGConstraintRowsForDBOid :6645    PGDependRowsForDBOid :14990
-PGInheritsRowsForDBOid :15293     PGIndexesRows… :6567
-PGStatTables/Xact/Indexes… :7704–8129
+PGClassRowsForDBOid   PGAttrdefRowsForDBOid
+PGConstraintRowsForDBOid    PGDependRowsForDBOid
+PGInheritsRowsForDBOid     PGIndexesRows…
+PGStatTables/Xact/Indexes…–8129
 
 // Types
-RegisterEnum/AddEnumValueResult/DropEnum :21613–22060
-RegisterDomain/DropDomain :22929/:23662
-RegisterCompositeTypeWithFields :22070  RegisterRangeType :22654
-ResolveColumnType :23829
+RegisterEnum/AddEnumValueResult/DropEnum–22060
+RegisterDomain/DropDomain/:23662
+RegisterCompositeTypeWithFields  RegisterRangeType
+ResolveColumnType
 
 // Privileges / roles
-GrantTablePrivilege[WithGrantOption][As] :16236–16258
-RevokeTablePrivilege :16350  HasTablePrivilege :16558
-RelaclText :16956  IsSuperuser :5914  RoleIsMemberOf :5883
-RoleOID :16114  RoleNameForOID :16181
+GrantTablePrivilege[WithGrantOption][As]–16258
+RevokeTablePrivilege  HasTablePrivilege
+RelaclText  IsSuperuser  RoleIsMemberOf
+RoleOID  RoleNameForOID
 
 // Codec (codec.go + small files)
 PGClassRow/PGAttributeRow/PGTypeRow encode+decode · PadBpchar
-EncodingIDToName (encoding.go) · SerializeTSDictOptions :14055
+EncodingIDToName (encoding.go) · SerializeTSDictOptions
 
 // Cross-package hooks (import-cycle breakers)
-SequenceParamsFunc / FindSequenceOwnedByFunc :80/:91
-SetRelationSizer :21133  RegprocName/RegprocedureNameParts :20023/:20190
+SequenceParamsFunc / FindSequenceOwnedByFunc/:91
+SetRelationSizer  RegprocName/RegprocedureNameParts/:20190
 ```
 
 ## Dependencies
@@ -237,7 +237,7 @@ SetRelationSizer :21133  RegprocName/RegprocedureNameParts :20023/:20190
   pg_class row are two renderers of the same object; changes must land in both
   or pg_dump/PG-standby and `\d` disagree.
 - **Do not "fix" the db 5→1 mapping** — making postgres connections use their
-  own namespace makes every existing table vanish (`catalog.go:23951–23961`).
+  own namespace makes every existing table vanish (`catalog.go:24910–23961`).
 - The live "postgres" database's displayed OID must stay the 16384 placeholder —
   CREATE SUBSCRIPTION subdbid and datacl heap resync depend on it (:2361–2368).
 - `RoleAttrs.ConnLimit == 0` is a *valid PG setting* ("no new connections");
@@ -250,4 +250,4 @@ SetRelationSizer :21133  RegprocName/RegprocedureNameParts :20023/:20190
 - `SmallDimension` is retired (M0125-0043): nothing sets it; the planner derives
   smallness itself (:440–451).
 - Empty `TempOwner` on a temp relation means visible-to-all-sessions
-  (single-session legacy compat, :626–629).
+  (single-session legacy compat,–629).

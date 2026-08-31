@@ -49,7 +49,7 @@ func (fr *FrameReader) ReadStartupPacket() (version uint32, payload []byte, err 
 func (fr *FrameReader) ReadFrame() (Frame, error)          // type byte + payload
 func NewFrameWriter(w io.Writer) *FrameWriter
 func (fw *FrameWriter) WriteFrame(typ byte, payload []byte) error
-func (fw *FrameWriter) DataRowScratch(ncols int) (cells [][]byte, valueBuf []byte) error
+func (fw *FrameWriter) DataRowScratch(ncols int) (cells [][]byte, valueBuf []byte)
 func ParseStartupParameters(buf []byte) (map[string]string, error)
 
 // Message writers (messages.go)
@@ -62,10 +62,11 @@ func (fw *FrameWriter) WriteReadyForQuery(status byte)
 func (fw *FrameWriter) WriteErrorResponse(fields []ErrorField)
 
 // Auth policy (auth/auth.go)
-type Policy interface { Decide(r *Request) (*Decision, error) }
-func DefaultPolicy() *Policy
-type Request struct{ ConnType; User; Database; Address string }
-type Decision struct{ Method Method; Ok bool; Err error }
+type Policy interface{ ... }
+func DefaultPolicy() *RuleSet
+type Request struct{ ConnType; User; Database string; Remote net.IP }
+type Decision struct{ Method Method; Options ...; Rule Rule }
+func (rs *RuleSet) Match(req Request) Decision
 ```
 
 ## Internal structure
@@ -92,7 +93,7 @@ type Decision struct{ Method Method; Ok bool; Err error }
 
 - **Used by** — `internal/postmaster` (connection accept + protocol loop),
   `internal/replication` (walsender framing), `internal/executor`
-  (`client_min_messages` filtering hook), `internal/server`.
+  (`client_min_messages` filtering hook).
 - **Uses** — `internal/utils/misc` (GUC values), `internal/utils/errcodes`
   (SQLSTATE constants). `auth/` uses `internal/crypto`-style primitives only if
   needed for SCRAM/MD5; it avoids importing higher layers.

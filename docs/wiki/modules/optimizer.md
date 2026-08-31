@@ -20,13 +20,13 @@ parallel Gather, PARAM_EXEC lowering).
 
 ## Key Files
 
-- `planner.go` (14,821) — `Plan()` entry, statement dispatch, `planSelect`
+- `planner.go` (15,262) — `Plan()` entry, statement dispatch, `planSelect`
   pipeline, view-recursion guard, min/max rewrite.
-- `plan.go` (2,532) — the plan IR: `Node`/`Expr` interfaces, `Schema`, and every
+- `plan.go` (2,672) — the plan IR: `Node`/`Expr` interfaces, `Schema`, and every
   plan-node struct (`SeqScan`, `IndexScan`, `Join`, `NestedLoopIndexJoin`,
   `Aggregate`, `WindowAgg`, `Sort`, `Limit`, insert/update/delete/merge, bitmap
   scans, `Gather`).
-- `unnest.go` (4,087) — subquery pull-up and correlated-subquery decorrelation
+- `unnest.go` (4,311) — subquery pull-up and correlated-subquery decorrelation
   to semi/anti joins.
 - `joinsearch.go` (636) / `joinsearchlevel.go` (602) / `joinsearchseam.go` (636)
   — the PG-shaped join-search substrate (`searchCtx`, level lists,
@@ -53,7 +53,7 @@ func ResolveIndexPredicate(predicate parser.Expr, tbl *catalog.Table) (Expr, err
 func ResolveAlterColumnTypeUsing(table *catalog.Table, e parser.Expr) (Expr, error)
 type PlanError struct{ Pos, Code, Message, Hint, Detail }               // planner.go:28
 func EstimateRows(n Node) int64                                         // cardinality.go:43
-func IsSmallDimensionSide(n Node) bool                                  // cardinality.go:411
+func IsSmallDimensionSide(n Node) bool                                  // cardinality.go:482
 ```
 
 Feature gates (all wrap package atomics): `SetUnnestPreDPEnabled`,
@@ -65,7 +65,7 @@ Feature gates (all wrap package atomics): `SetUnnestPreDPEnabled`,
 
 - **Statement dispatch** — `planStmt` (`planner.go:142`) switches on `parser.Stmt`;
   DDL becomes a passthrough `*DDL`; transactions map to `*Transaction`/`*Utility`.
-- **`planSelect` pipeline** (`planner.go:734`) — roughly mirrors PG's
+- **`planSelect` pipeline** (`planner.go:741`) — roughly mirrors PG's
   `subquery_planner`/`grouping_planner`: grouping-set normalization → CTE
   pre-planning → set-op flattening → FROM planning → WHERE (aggregate-rejection
   42803, `canonicalizeQual`, single-table fast paths) → join search → rule passes

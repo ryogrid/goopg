@@ -54,8 +54,14 @@ Each `Stmt` is an AST node type (e.g., `*Select`, `*Insert`, `*CreateTable`,
 
 ```go
 // Analyzer (internal/parser/analyzer/)
-func Analyze(ctx *Context, stmts []Stmt) ([]optimizer.Node, error)
-func runCoerce(expr Expr, targetType string) (Expr, error)
+func Analyze(stmt parser.Stmt, cat catalog.Catalog) error
+func NumericCoercePrecedence(typeName string) int
+
+// The analyzer is called from the planner after Parse:
+//   stmts, _ := parser.Parse(sql)
+//   for _, stmt := range stmts {
+//       analyzer.Analyze(stmt, catalog)  // resolves names, types, coerces
+//   }
 ```
 
 ## Internal structure
