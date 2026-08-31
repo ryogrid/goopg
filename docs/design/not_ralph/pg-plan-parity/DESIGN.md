@@ -1631,3 +1631,50 @@ faithful constants do not describe. The cost model has stopped being the
 suspect; the divergences that remain are structural (join shape: q05, q08,
 Q72's pairwise search; boundary totality: Q13/Q16) or executor-side (bitmap
 rescan). None is a term to tune.
+
+## 19. Q17's SubPlan: PG's node reached, wrong answer returned — NEGATIVE RESULT
+
+The last unmatched bitmap is Q17's SubPlan, and its scan does not come from the
+join search at all: `planIndexScanFromWhere`'s correlated-`OuterColumnRef` arm
+(planner.go) builds the `Index Scan (l_partkey = $0)` UNCONDITIONALLY — the one
+access-method decision left in the planner that consulted no cost. PG plans a
+correlated subquery through the full path machinery and picks the bitmap there
+by 1% (127.62 vs 128.97).
+
+The attempt (2026-08-31, reverted): price both candidates at that seam with the
+SAME cost functions the join search uses (`varEqNonConstSelectivity`, real
+geometry, `costIndexScan` vs `costBitmapHeapScan` at loop_count 1) and return
+the bitmap when cheaper. It chose PG's exact node —
+
+```
+InitPlan 1
+  ->  Aggregate
+        ->  Bitmap Heap Scan on public.lineitem
+              Recheck Cond: (lineitem.l_partkey = part.p_partkey)
+              ->  Bitmap Index Scan on public.lineitem_part_supp_fkidx
+```
+
+— and returned **413893.02 where the answer is 340260.12**. Two blockers, both
+named by the failure:
+
+1. **The subplan executor does not re-drive a bitmap per outer row.** The
+   EXPLAIN label flipped from `SubPlan 1` to `InitPlan 1`: the subplan
+   machinery treats the node as evaluable-once, and the TIDBitmap built for the
+   first outer binding is reused for every subsequent one — a stale-probe wrong
+   answer, the exact class `indexScanOp`'s slot-aware helpers were built to
+   prevent (M0134-0180's `evalExprSlot` work). The index scan re-binds through
+   that path; `bitmapHeapScanOp` in the SUBPLAN context does not. This is the
+   same executor seam as task #48's rescan-cost gap, seen from the correctness
+   side rather than the speed side.
+2. **The EXISTS-decorrelation harvest pattern-matches `*IndexScan` from this
+   seam.** Four unnest/indexkey tests fail with "indexed inner did not
+   decorrelate": returning a bitmap loses semi-join unnesting for every
+   correlated EXISTS whose inner is indexed — a much worse trade than Q17's
+   node. Any future change here must teach `unnest_indexkey`'s harvest the
+   bitmap shape FIRST.
+
+So Q17 joins the structural list: not a costing question (the costing half
+worked and chose PG's node), but an executor-rebind gap plus a consumer that
+must learn the shape. Both are prerequisites, and both live outside the
+planner. The 21/21 result gate caught this in one query — worth noting that
+the PLAN sweep looked perfect; only the result bytes told the truth.

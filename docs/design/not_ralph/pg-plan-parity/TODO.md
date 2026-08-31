@@ -952,6 +952,24 @@ section D. Recorded because the gate run is where they became visible.
       seq-scans supplier under a different join shape. Census divergence to
       revisit only after the join-shape items (Q72 flattening).
 
+### G-2 — Q17's SubPlan: attempted, reverted, two prerequisites named (§19)
+
+- [x] Root cause found: the SubPlan's scan comes from
+      `planIndexScanFromWhere`'s correlated arm, which picks the index with NO
+      cost comparison — the last cost-free access-method decision. The costing
+      half of the fix worked and chose PG's exact node.
+- [x] Reverted because it returned wrong results (413893.02 vs 340260.12):
+      the subplan executor evaluates the bitmap ONCE (`InitPlan` labelling)
+      and reuses the first outer binding's TIDBitmap for every row.
+- [ ] Prerequisite 1: teach the subplan path to re-drive `bitmapHeapScanOp`
+      per outer evaluation (same executor seam as the rescan-cost gap; fix
+      together with task #48).
+- [ ] Prerequisite 2: teach `unnest_indexkey`'s EXISTS-decorrelation harvest
+      the bitmap shape — four tests show it declines to decorrelate when the
+      correlated probe is not `*IndexScan`, which loses semi-join unnesting.
+- [ ] Then re-apply the seam costing (the helper is in §19 / git history at
+      this commit; it needs no changes — only its consumers do).
+
 ## Cross-cutting
 
 - [ ] No change may test a relation name, query shape, or benchmark identity
