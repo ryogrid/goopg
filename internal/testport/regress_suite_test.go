@@ -320,8 +320,8 @@ var regressExcluded = map[string]string{
 	"roleattributes": "Role attributes; out of scope for goopg v0.", "rowsecurity": "Row-level security; out of scope for goopg v0.",
 	"security_label": "Security labels; out of scope for goopg v0.",
 	// Parallel
-	"select_parallel": "Parallel query; out of scope for goopg v0.", "vacuum_parallel": "Parallel VACUUM; out of scope for goopg v0.",
-	"write_parallel": "Parallel write; out of scope for goopg v0.",
+	"select_parallel": "Parallel query; out of scope for goopg v0.",
+	"write_parallel":  "Parallel write; out of scope for goopg v0.",
 	// Event triggers
 	"event_trigger": "Event triggers; out of scope for goopg v0.", "event_trigger_login": "Login event triggers; out of scope for goopg v0.",
 	// psql client

@@ -86,7 +86,6 @@ var excludedCases = map[string]string{
 
 	// ── Parallel ─────────────────────────────────────────────────────────
 	"select_parallel": "Parallel query execution; out of scope for goopg v0.",
-	"vacuum_parallel": "Parallel VACUUM; out of scope for goopg v0.",
 	"write_parallel":  "Parallel write; out of scope for goopg v0.",
 
 	// ── Event triggers ───────────────────────────────────────────────────

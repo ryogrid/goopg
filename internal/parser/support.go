@@ -2862,9 +2862,10 @@ func appendVacTarget(t *vacTargets, one *vacTarget) *vacTargets {
 	return t
 }
 
-// isFalseWord reports whether an option's value word is the FALSE spelling.
-// Legacy treats anything else — including an absent word — as true.
-func isFalseWord(s string) bool { return strings.EqualFold(s, "false") }
+// isFalseWord reports whether an option's value word is a FALSE spelling
+// (legacy's defGetBoolean/parse_bool "false"/"off"). Legacy treats anything
+// else — including an absent word — as true.
+func isFalseWord(s string) bool { return strings.EqualFold(s, "false") || strings.EqualFold(s, "off") }
 
 // vacuumNamedOpt handles the VACUUM options whose names are ordinary
 // identifiers rather than keywords (parser.go parseVacuumOptionList). An
@@ -2902,9 +2903,9 @@ func vacuumNamedOpt(name, val string) func(*VacuumStmt) {
 		// Three-valued: true forces cleanup, false suppresses it, and the
 		// default "auto" sets neither field.
 		switch strings.ToLower(val) {
-		case "true":
+		case "true", "on":
 			return func(v *VacuumStmt) { v.ForceIndexCleanup = true }
-		case "false":
+		case "false", "off":
 			return func(v *VacuumStmt) { v.NoIndexCleanup = true }
 		}
 		return func(v *VacuumStmt) {}

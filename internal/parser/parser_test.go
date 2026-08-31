@@ -115,6 +115,45 @@ func TestParseVacuumTruncateOption(t *testing.T) {
 	}
 }
 
+// TestParseVacuumIndexCleanupOnOff covers the reserved-keyword ON/OFF
+// spellings of the three-valued INDEX_CLEANUP option (gram.y's
+// opt_boolean_or_string accepts the bare ON keyword — not just TRUE_P/
+// FALSE_P/a NonReservedWord — since ON is fully reserved and can't lex as a
+// ColId). M0134-0185 (vacuum_parallel.sql): `VACUUM (PARALLEL 4,
+// INDEX_CLEANUP ON) t` was a syntax error before this rule gained the ON
+// alternative. OFF already parsed (it lexes as a plain identifier, no
+// reserved OFF token exists), but its value word was never actually wired
+// to the false branch — fixed alongside so ON and OFF are handled
+// symmetrically.
+func TestParseVacuumIndexCleanupOnOff(t *testing.T) {
+	tests := []struct {
+		in    string
+		force bool
+		suppr bool
+	}{
+		{"VACUUM (INDEX_CLEANUP ON) t", true, false},
+		{"VACUUM (INDEX_CLEANUP OFF) t", false, true},
+		{"VACUUM (INDEX_CLEANUP true) t", true, false},
+		{"VACUUM (INDEX_CLEANUP false) t", false, true},
+		{"VACUUM (INDEX_CLEANUP auto) t", false, false},
+		{"VACUUM (PARALLEL 4, INDEX_CLEANUP ON) t", true, false},
+	}
+	for _, c := range tests {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		v, ok := stmts[0].(*VacuumStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T want *VacuumStmt", c.in, stmts[0])
+		}
+		if v.ForceIndexCleanup != c.force || v.NoIndexCleanup != c.suppr {
+			t.Errorf("Parse(%q): ForceIndexCleanup=%v NoIndexCleanup=%v want %v/%v",
+				c.in, v.ForceIndexCleanup, v.NoIndexCleanup, c.force, c.suppr)
+		}
+	}
+}
+
 // TestParseAnalyze is the analyze-only variant (subset of VACUUM
 // options).
 func TestParseAnalyze(t *testing.T) {
