@@ -13,12 +13,13 @@ import (
 // behavior: the boundary value (`c2 = 100`) and the NULL row (`c2 IS NULL`) are
 // both excluded, and every row 1..99 is present.
 //
-// The covering query `SELECT c2 FROM t WHERE c2 < 100` must NOT be promoted to an
-// IndexOnlyScan — goopg's indexOnlyScanOp is inclusive-only and cannot express
-// the strict bound, so promotion would leak c2=100. Option B (coordinator
-// decision, 2026-08-15) makes tryPromoteIndexOnlyScan refuse promotion when the
-// source IndexScan carries an exclusive bound; the exclusive IndexScan stays and
-// renders `Index Cond: (c2 < 100)`.
+// The covering query `SELECT c2 FROM t WHERE c2 < 100` IS promoted to an
+// IndexOnlyScan. It briefly was not: indexOnlyScanOp scanned inclusively and
+// could not express the strict bound, so promotion would have leaked c2=100,
+// and Option B (2026-08-15) had tryPromoteIndexOnlyScan refuse the promotion.
+// The operator now threads LowOp/HighOp into its btree range scan (Option A),
+// so promotion is back on and the IOS renders `Index Cond: (c2 < 100)` while
+// still excluding the boundary row.
 func TestRangeScanExclusiveBoundaryAndNull(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -40,15 +41,12 @@ func TestRangeScanExclusiveBoundaryAndNull(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Covering single-conjunct strict range: Option B keeps it a regular
-	// IndexScan (no IOS promotion), rendering the exclusive Index Cond.
+	// Covering single-conjunct strict range: promoted to an IndexOnlyScan that
+	// carries the exclusive bound itself (Option A).
 	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT c2 FROM t WHERE c2 < 100")
 	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "Index Scan") {
-		t.Errorf("expected Index Scan (Option B: no IOS promotion for exclusive bound); got:\n%s", joined)
-	}
-	if strings.Contains(joined, "Index Only Scan") {
-		t.Errorf("exclusive-bound scan must not be promoted to IndexOnlyScan; got:\n%s", joined)
+	if !strings.Contains(joined, "Index Only Scan") {
+		t.Errorf("expected Index Only Scan (exclusive bound is IOS-expressible); got:\n%s", joined)
 	}
 	if !strings.Contains(joined, "Index Cond: (c2 < 100)") {
 		t.Errorf("expected exclusive `Index Cond: (c2 < 100)`; got:\n%s", joined)
@@ -109,11 +107,8 @@ func TestRangeScanExclusiveUpperBoundTwin(t *testing.T) {
 
 	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT c2 FROM t WHERE c2 > 100")
 	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "Index Scan") {
-		t.Errorf("expected Index Scan; got:\n%s", joined)
-	}
-	if strings.Contains(joined, "Index Only Scan") {
-		t.Errorf("exclusive-bound scan must not be promoted to IndexOnlyScan; got:\n%s", joined)
+	if !strings.Contains(joined, "Index Only Scan") {
+		t.Errorf("expected Index Only Scan; got:\n%s", joined)
 	}
 	if !strings.Contains(joined, "Index Cond: (c2 > 100)") {
 		t.Errorf("expected exclusive `Index Cond: (c2 > 100)`; got:\n%s", joined)

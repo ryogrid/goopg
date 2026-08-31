@@ -7,8 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // explainOp renders the inner plan tree as a single-column
@@ -744,8 +745,29 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// stored in Cond (it cannot be pushed into the btree probe) and
 		// rendered as an Index Cond, matching upstream's build_minmax_path
 		// which carries it as an index qual (planagg.c build_minmax_path).
+		//
+		// The btree bound itself (M0134-0001 S4 class 8: it may now be
+		// EXCLUSIVE) renders on the same line, since PG prints one
+		// `Index Cond:` holding every index qual.
+		var condParts []string
+		if bound := formatIndexOnlyCond(p, reg); bound != "" {
+			condParts = append(condParts, bound)
+		}
 		if p.Cond != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + wrapParen(formatExprQual(p.Cond, reg, qualify)))})
+			condParts = append(condParts, wrapParen(formatExprQual(p.Cond, reg, qualify)))
+		}
+		if len(condParts) > 0 {
+			cond := strings.Join(condParts, " AND ")
+			if len(condParts) > 1 {
+				cond = "(" + cond + ")"
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
+		}
+		// A residual qual above the IOS (the composite-index trailing-column
+		// guard keeps one) is upstream's `show_scan_qual` line and was simply
+		// missing here, so a Filter that DOES run went unrendered.
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	case *optimizer.Join:
 		// M0127-P2.1: render the join's equi-key list, upstream's
@@ -970,7 +992,30 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
-	cols := p.Index.Columns
+	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
+}
+
+// formatIndexOnlyCond is formatIndexCond for an IndexOnlyScan. The two nodes
+// carry the same probe fields (an IOS is a promoted IndexScan), and the
+// promotion now copies LowOp/HighOp too (M0134-0001 S4 class 8), so the bound
+// must render with the same strictness the executor scans with — a `>` bound
+// printed as `>=` would misdescribe the plan.
+func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
+	if p == nil || p.Index == nil {
+		return ""
+	}
+	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
+}
+
+// formatIndexCondParts is the shared body of formatIndexCond /
+// formatIndexOnlyCond: sibling paths that must not disagree.
+func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg) string {
+	p := struct {
+		Keys                 []optimizer.Expr
+		Key, LowKey, HighKey optimizer.Expr
+		LowOp, HighOp        parser.OpCode
+	}{keys, key, lowKey, highKey, lowOp, highOp}
+	cols := index.Columns
 	// Multi-column equality probe.
 	if len(p.Keys) > 0 && len(cols) >= len(p.Keys) {
 		if len(p.Keys) == 1 {

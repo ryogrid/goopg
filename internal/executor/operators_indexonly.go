@@ -12,6 +12,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/adt/array"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -263,8 +264,20 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = lo
 		hiBytes = hi
-		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
-			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
+		// M0134-0001 S4 (class 8): kept identical to `indexScanOp`'s range
+		// branch — the two probe the same index for the same plan node, so
+		// they cannot be allowed to disagree. Composite padding follows the
+		// bound's strictness: an inclusive hi needs trailing +infinity to
+		// cover every key sharing the leading columns; an EXCLUSIVE hi stays
+		// a bare prefix. The lo side is symmetric: pad only when EXCLUSIVE so
+		// the whole equal-key group is skipped.
+		if len(o.plan.Index.Columns) > 1 {
+			if loBytes != nil && o.plan.LowOp == parser.OpGt {
+				loBytes = o.ctx.compositeUpperBound(o.plan.Index, loBytes)
+			}
+			if hiBytes != nil && o.plan.HighOp != parser.OpLt {
+				hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
+			}
 		}
 	}
 
@@ -400,8 +413,10 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 
 	// RangeScanWithPosLeafFilter rather than RangeScan: the leaf filter is
 	// what partitions the scan across workers, and the bounds semantics are
-	// identical — RangeScan is rangeScanPos with both ends inclusive.
-	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, false, false, leafFilter, scanPosFn); err != nil {
+	// identical — RangeScan is rangeScanPos with both ends inclusive. The two
+	// bool flags carry the bound strictness (M0134-0001 S4 class 8); they are
+	// false for every producer that leaves LowOp/HighOp at OpUnknown.
+	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, leafFilter, scanPosFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 

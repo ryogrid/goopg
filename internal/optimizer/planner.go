@@ -14510,16 +14510,12 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	if !ok {
 		return proj
 	}
-	// M0134-0001 S4 (class 8): a range scan with an EXCLUSIVE bound cannot be
-	// promoted to an IndexOnlyScan. indexOnlyScanOp calls the inclusive
-	// RangeScan and copies no LowOp/HighOp, so with the part-5 Filter drop the
-	// boundary value would leak (c2 < 100 returns the c2=100 row). Refuse
-	// promotion; the exclusive IndexScan stays. Inclusive bounds (<= / >=)
-	// still promote as before. Decision: S4 Option B (coordinator, 2026-08-15);
-	// executor-side IOS exclusivity is deferral-ledger work, out of scope.
-	if idxScan.LowOp == parser.OpGt || idxScan.HighOp == parser.OpLt {
-		return proj
-	}
+	// M0134-0001 S4 (class 8): an EXCLUSIVE bound used to block promotion,
+	// because indexOnlyScanOp called the inclusive RangeScan and copied no
+	// LowOp/HighOp, so with the part-5 Filter drop the boundary value leaked
+	// (c2 < 100 returned the c2=100 row). The operator now carries the
+	// strictness through (Option A), so the bound ops are simply copied onto
+	// the IndexOnlyScan below and strict ranges promote like inclusive ones.
 	// Check that every projected column is in the index key.
 	idxColSet := make(map[string]bool, len(idxScan.Index.Columns))
 	for _, c := range idxScan.Index.Columns {
@@ -14625,6 +14621,8 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		Keys:    idxScan.Keys,
 		LowKey:  idxScan.LowKey,
 		HighKey: idxScan.HighKey,
+		LowOp:   idxScan.LowOp,
+		HighOp:  idxScan.HighOp,
 		Covered: covered,
 		schema:  iosSchema,
 	}

@@ -923,6 +923,15 @@ type IndexOnlyScan struct {
 	Keys    []Expr
 	LowKey  Expr
 	HighKey Expr
+	// LowOp / HighOp mirror IndexScan's fields of the same name: the bound's
+	// strictness. `OpGt` (low) / `OpLt` (high) make that end of the range
+	// EXCLUSIVE; the zero value `OpUnknown` — what every producer other than
+	// the IndexScan promotion leaves — means inclusive, which is the only
+	// shape those producers build. Before M0134-0001's class-8 gap was closed
+	// the executor could not express exclusivity at all, so the promotion
+	// refused strict-bound scans outright.
+	LowOp   parser.OpCode
+	HighOp  parser.OpCode
 	// Covered is the slice of catalog.Column entries that the output schema
 	// contains (a subset of Index.Columns, in projection order).
 	Covered []catalog.Column

@@ -28,7 +28,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 
 | id | sev | finding | verdict | status | commit |
 |---|---|---|---|---|---|
-| EO2-1 | high | `executor/operators_indexonly.go:Rescan` — LowOp/HighOp strictness ignored, bounds always inclusive | ? | [ ] | |
+| EO2-1 | high | `executor/operators_indexonly.go:Rescan` — LowOp/HighOp strictness ignored, bounds always inclusive | BUG | [x] | see progress log |
 | ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | ? | [ ] | |
 | NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | ? | [ ] | |
 | ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | ? | [ ] | |
@@ -140,3 +140,25 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 ## Progress log
 
 (append one line per verified/fixed item)
+
+- 2026-09-01 **EO2-1 = BUG (fixed).** `indexOnlyScanOp.Rescan` passed `false, false`
+  to `RangeScanWithPosLeafFilter` and padded only the composite HI bound, so a
+  strict bound scanned INCLUSIVELY — the exact asymmetry `indexScanOp` avoids.
+  Not reachable at HEAD only because `tryPromoteIndexOnlyScan` refused to promote
+  strict-bound scans (M0134-0001 S4 Option B, deferral-ledger row 2026-08-15),
+  which cost the PG-matching `Index Only Scan` plan shape. Fixed with Option A:
+  `IndexOnlyScan` carries `LowOp`/`HighOp` (optimizer/plan.go), the promotion
+  copies them and the refusal is gone (optimizer/planner.go), the operator
+  mirrors `indexScanOp`'s strictness-aware composite padding and passes the real
+  exclusive flags, and the EXPLAIN IOS branch gained the missing `Index Cond:`
+  (shared `formatIndexCondParts`) and `Filter:` lines. Verified on a live capped
+  server: `a > 5 AND a < 10` under an Index Only Scan returns 6..9, and a
+  composite `(a,b)` index agrees with the inclusive rewrite. The two
+  `range_exclusive_index_scan_test.go` cases that pinned Option B were updated to
+  the Option-A shape; the composite-keeps-Filter case now passes only because the
+  render gap is closed. Deferral-ledger row flipped to `resolved`.
+  Gates: UNITS PASS, tpch-spotcheck PASS (Q12=2/Q13=34), TPC-DS SF0.5 PASS.
+
+Note on the `commit` column: a commit cannot contain its own hash, so a row's
+hash is filled in by the NEXT commit; rows reading `see progress log` are already
+landed.
