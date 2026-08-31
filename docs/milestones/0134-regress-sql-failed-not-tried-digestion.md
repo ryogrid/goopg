@@ -1,11 +1,14 @@
 # Milestone 0134 — regress-sql `failed` / `not-tried` test-case digestion
 
-**Status:** planned
+**Status:** EXHAUSTED (2026-09-01) — all 189 filed cases sized; none currently
+selectable. See "Exhaustion note (2026-09-01)" below.
 **Filed:** 2026-08-15 (user directive)
 **Priority placement:** **next after M-NIGHTLY.** The `## Current Priority`
 banner in `.ralph/fix_plan.md` ranks M-NIGHTLY (nightly regression fixes) first
 and M0134 immediately after it (user directive 2026-08-15), ahead of M0119 and
-M0122's remaining items.
+M0122's remaining items. **As of 2026-09-01, M0134 has no remaining selectable
+work (see exhaustion note below), so the banner's active milestone falls
+through to M0119.**
 **Reference plan:** `.ralph/fix_plan.md` (M0134 section, at the foot of the file)
 **Prerequisite infrastructure:** the D-001 pg_regress runner
 (`scripts/pg-regress-runner.sh`, see `docs/test-port/README.md`) — the SQL-level
@@ -381,3 +384,54 @@ closed with a forward reference, and never forced green by weakening the case.
 - `make check-testport-inventory` passes.
 - `scripts/pg-regress-runner.sh <case>` is the per-case gate; no case is checked
   off on a skipped or erroring run.
+
+## Exhaustion note (2026-09-01)
+
+Loop #12 resolved the open question three prior loops (#9-#11) had each partly
+investigated but not closed: **is there any regress-sql case with a `failed`/
+`not-tried` CSV status that was never assigned an M0134 task ID?** Verified
+mechanically, not by inference:
+
+1. Extracted the 189-row canonical `task ↔ case` table from this doc's own
+   "Task list" section (all `M0134-0001`..`M0134-0189` IDs, 189 unique).
+2. Extracted every regress-sql row from
+   `docs/test-port/postgres-oracle-target-inventory.csv` currently at status
+   `failed` or `not-tried` (167 rows as of this date — the difference from 189
+   is cases that flipped to `pass`, e.g. `select_having`/`select_implicit`
+   confirmed-stale, `roleattributes`/`security_label`/`async`/`maintain_every`
+   closed green).
+3. `comm -23` between the two filename sets: **empty**. Every currently
+   failed/not-tried regress-sql case already has an M0134 task ID.
+4. Cross-checked for boilerplate (never-attempted) task bodies in
+   `.ralph/fix_plan.md` — the original filing template ("regress-sql
+   `failed`/`not-tried`: make the case match PG 18.3 … Run the case, fix the
+   divergence …") — **zero matches** in the active file. (Tasks 0091-0140's
+   bullets are not in the active file at all, but that is the *expected*
+   result of the legitimate archival commit `1d74052c5`, which moved 46
+   completed M0134 sub-task items to
+   `completed_milestones/completed_fix_plan_012.md`; every one of those IDs
+   carries a real "CLOSED"/"PARKED" narrative there, confirmed via `git log`
+   against their individual landing commits, e.g. `eac970d26` M0134-0092,
+   `608a2bb81` M0134-0140.)
+
+**Conclusion: M0134 has no remaining selectable regress-sql work.** All 189
+filed cases have been sized at least once and are each in a terminal state:
+CLOSED green (passing), CLOSED stale (flipped to `pass` with no code change),
+or PARKED (blocked on a REFACTOR-tier prerequisite, each with its own re-arm
+trigger and deferral-ledger rows — parallel-query execution, SQL/JSON
+constructors, outer-join nullability tracking, a physical GiST/GIN/SP-GiST/BRIN
+index-scan plan integration, the geometry operator-lexer family, the `money`
+type, `pg_shdepend`/object-address enumeration, and others named throughout the
+task list above). The milestone is not "complete" in the Definition-of-Done
+sense (most PARKED cases still fail the case gate), but it is **exhausted**:
+no loop can make further M0134 progress without first landing one of those
+named prerequisite milestones. **Re-arm rule:** re-open M0134 selection only
+when one of the named prerequisites lands as its own milestone — re-run
+`scripts/pg-regress-runner.sh --verbose <case>` for every PARKED case blocked
+on it and re-size.
+
+Per the `## Current Priority` banner's own documented fallback ("Below M0134
+the next milestones are M0119 …, then M0122"), active selection now falls
+through to **M0119** (sole remaining task: M0119-0006, pg_amcheck server
+tier) — see the banner update in `.ralph/fix_plan.md` made in the same commit
+as this note.
