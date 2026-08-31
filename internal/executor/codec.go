@@ -1019,6 +1019,23 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		// (e.g. relpartbound when relispartition=true). Empty varlena.
 		s := d.StringValue()
 		return varlenaTextBytes(s), nil
+	case "xml":
+		// M0134-0188: the physical-encode path is a SIBLING of evalCast's
+		// `::xml` arm (xmltypes.go) and must apply the same well-formedness
+		// gate — otherwise `INSERT INTO t(x xml) VALUES ('<wrong')` (an
+		// IMPLICIT column coercion, which never routes through evalCast)
+		// stored the malformed fragment while an explicit `::xml` cast on
+		// the same string correctly raised 2200N/2200M
+		// (pattern_sibling_paths_must_agree).
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		if ee := xmlValidate(s, xmlOptionFromCtx(ctx)); ee != nil {
+			ee.Pos = pos
+			return nil, ee
+		}
+		return varlenaTextBytes(s), nil
 	default:
 		// text, varchar, char, bpchar, unknown, numeric, etc.
 		// Use PG varlena format (LE): 1-byte header for short values,

@@ -6649,6 +6649,20 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return NewStringDatum(rewritten), nil
 		}
 		return d, nil
+	case "xml":
+		// `::xml` (and the implicit coercion on an `xml`-typed column
+		// INSERT/UPDATE) must be well-formed per the session xmloption GUC —
+		// see xmltypes.go. Previously this fell through to the pass-through
+		// below, so `'<wrong'::xml` succeeded and stored the fragment
+		// verbatim. M0134-0188.
+		if s, ok := datumAsString(d); ok {
+			if ee := xmlValidate(s, xmlOptionFromCtx(ctx)); ee != nil {
+				ee.Pos = pos
+				return Datum{}, ee
+			}
+			return NewStringDatum(s), nil
+		}
+		return d, nil
 	}
 	// A range type (`::int4range`, `::daterange`, or a user
 	// `CREATE TYPE … AS RANGE` type) is NOT an unknown type — goopg carries
@@ -12722,6 +12736,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// parseMacaddr8Literal.
 				_, _, _, _, _, _, _, _, merr := parseMacaddr8Literal(v)
 				return NewBoolDatum(merr == nil), nil
+			case "xml":
+				// M0134-0188: agrees with the ::xml cast path, same
+				// xmlValidate (xmltypes.go).
+				return NewBoolDatum(xmlValidate(v, xmlOptionFromCtx(ctx)) == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
