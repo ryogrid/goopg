@@ -2,29 +2,26 @@
 
 Roadmap derived from `.ralph/specs/GOAL_AND_REQUIREMENTS.md` (§10 "Definition of
 Done (Initial Milestone)"). Pick the topmost unchecked item **unless the Current
-Priority banner below or a dependency forces another order**. **As of 2026-08-15:
+Priority banner below or a dependency forces another order**.
 M-NIGHTLY is the standing filing obligation (highest priority); M0134
 (regress-sql `failed`/`not-tried` digestion) was the next-priority milestone
-after M-NIGHTLY (user directive 2026-08-15), and as of 2026-09-01 M0134 is
+after M-NIGHTLY, and as of 2026-09-01 M0134 is
 EXHAUSTED (see below) so active selection falls through to M0119.**
 The banner is the sole ordering
 authority — `.ralph/working_set.md`'s "NEXT LOOP" note carries state, not
 priority, and does not outrank it.
-**M0134 (regress-sql `failed`/`not-tried` test-case digestion) was filed
-2026-08-15 at the foot of this file and was the next-priority milestone after
-M-NIGHTLY** (user directive 2026-08-15) — it was selected immediately after
-M-NIGHTLY's regression fixes, ahead of M0119 and M0122's remaining items.
-**EXHAUSTED 2026-09-01: all 189 filed M0134 cases have been sized at least
-once (verified by a full ID↔case cross-reference against the CSV's current
-`failed`/`not-tried` regress-sql rows — zero rows lack an ID, and zero active
-task bodies still carry the original unattempted-boilerplate text); every one
-is now CLOSED (green or stale-pass) or PARKED on a named REFACTOR-tier
-prerequisite with its own re-arm trigger** — see "Exhaustion note (2026-09-01)"
-in `docs/milestones/0134-regress-sql-failed-not-tried-digestion.md` for the
-full verification method and the re-arm rule. No M0134 task is currently
-selectable. M0132 and M0133 are COMPLETE; M0131 is closed except S24 (deferred,
-not selectable); M0130 is closed. **Active priority after M-NIGHTLY is now
-M0119** (sole remaining task: M0119-0006, pg_amcheck server tier), then M0122.
+
+**M-NIGHTLY is the standing filing obligation (unconditional, highest priority):
+every loop reads `ci/logs/action-items.md` and files each new `## AI-` subject
+under the M-NIGHTLY milestone below.**
+
+**M-NIGHTLY selection rule (inherits prior M-NIGHTLY procedure §2, per
+ci/design/07-ralph-feedback.md §B):**
+1. Before investigating, re-run the item's repro at HEAD — the log reflects the
+   last nightly run and may be stale.
+2. Fix with the normal gates (practice cards apply), cite the AI-id in the
+   commit message, check the task off.
+3. The next nightly run confirms and drops the item from the log.
 
 ## Notes / rules
 
@@ -43,116 +40,38 @@ M0119** (sole remaining task: M0119-0006, pg_amcheck server tier), then M0122.
   `completed_fix_plan_011.md`); they are reference-only, NOT actionable, and must
   not be copied back here.
 
-## Current Priority (per 2026-08-15 — M0134; UPDATED 2026-09-01 — M0134 EXHAUSTED, falls through to M0119)
-
-**M-NIGHTLY is the standing filing obligation (unconditional, highest priority):
-every loop reads `ci/logs/action-items.md` and files each new `## AI-` subject
-under the M-NIGHTLY milestone below.**
-
-**M0134 EXHAUSTED as of 2026-09-01 — no task currently selectable.** All 189
-filed regress-sql cases have been sized at least once and are each CLOSED
-(green or stale-pass) or PARKED on a named REFACTOR-tier prerequisite with its
-own re-arm trigger; verification method and re-arm rule are in
-`docs/milestones/0134-regress-sql-failed-not-tried-digestion.md` ("Exhaustion
-note (2026-09-01)"). **Active selection (after M-NIGHTLY) is now M0119**
-(sole remaining task: M0119-0006, pg_amcheck server tier), then M0122. Do not
-re-attempt an M0134 task unless its re-arm trigger has fired — check the
-milestone doc's exhaustion note first. The long narrative paragraph below is
-kept as the historical record of how each of the 189 cases was sized; it is
-no longer an active work queue.
-
-**M0134 (regress-sql `failed`/`not-tried` test-case digestion) is the
-next-priority milestone after M-NIGHTLY** (user directive 2026-08-15) — work it
-immediately after M-NIGHTLY's regression fixes. **Within M0134, selection is by task
-ID ascending, and the IDs were RENUMBERED 2026-08-19 by user directive** so the
-eighteen highest-value cases occupy M0134-0006..0023 (details in the M0134 section
-preamble at the foot of this file). **M0134-0002, -0003, -0004 and -0005 are all
-PARKED** — 0005 was parked 2026-08-19 by the same directive — and **0006
-(`select_having.sql`) and 0007 (`select_implicit.sql`) were both CLOSED
-2026-08-19 as stale `failed` statuses with no goopg change, and **0008
-(`select_parallel.sql`) was PARKED 2026-08-19** — it asserts
-`pg_stat_database.parallel_workers_launched` and goopg has no parallel-worker
-execution path at all, so it is unreachable until a parallel-query milestone
-lands (re-arm trigger recorded on the task), and **0009 (`select_views.sql`) was
-PARKED 2026-08-19** — it needs three independent parser/DDL gaps (`?#` operator
-lexing, unary prefix `#`, `CREATE SCHEMA ... CREATE TABLE` sub-commands) before
-it can pass, though the loop that sized it landed a real engine fix out of it
-(session identity for `current_user`/`session_user`, design
-`docs/design/m0134-0009-session-user-identity.md`) — and **0010
-(`predicate.sql`) was PARKED 2026-08-19** on the same pattern: sized at 18/22
-diverging EXPLAINs with zero hard blockers but five independent root causes, of
-which the loop shipped the smallest (single-baserel NOT NULL qual reduction,
-design `docs/design/m0134-0010-notnull-qual-reduction.md`), taking it to 14/22;
-the rest need outer-join nullability tracking first (re-arm trigger on the task)
-— and **0011 (`subselect.sql`) was PARKED 2026-08-19** on the same pattern: sized at ~90-120 of ~335 statements diverging across seven independent root causes (no missing prerequisite — verified against `parallel_schedule`), of which the loop shipped the only contained one (`IN (subquery)` in a `JOIN ... ON` clause, design `docs/design/m0134-0011-join-on-sublink-catalog.md`), clearing all 5 of the case's SQLSTATE 0A000 errors; the highest-value remainder needs a parser-AST + join-tree refactor first (re-arm trigger on the task) — and **0012 (`update.sql`) was PARKED 2026-08-20** on the very same pattern — sized at 841 diff lines across eight root causes whose dominant bucket (multi-level partition row routing, ~300 lines) is REFACTOR-tier, while the loop shipped the one contained cause (LIST partition routing dropped every non-int/string/bool key kind, design `docs/design/m0134-0012-list-partition-numeric-routing.md`, 841 → 823 lines and 13 → 11 `^+ERROR`) — and **0013 (`insert.sql`) was PARKED 2026-08-20** on the identical pattern — sized at 1062 diff lines across eight root causes whose dominant bucket (INSERT target-list indirection, ~330 lines, unparsed grammar) is REFACTOR-tier, while the loop shipped the one contained correctness bug (a dropped DEFAULT partition left a stale parent-side bounds entry that blocked every future DEFAULT partition, design `docs/design/m0134-0013-default-partition-stale-bounds-cache.md`, 1062 → 1051 lines and 58 → 50 `^+ERROR`) — and **0014 (`mvcc.sql`) was PARKED 2026-08-20**: the standing "possible regression, verify" rule was applied first and the case still FAILS at HEAD (17 diff lines / 2 `^+ERROR`), so it is not a stale status and the CSV row stays `failed`; it has two serially-masked causes, of which the loop shipped the contained one (sublink-bearing PL/pgSQL expressions now fall back to the SQL engine, design `docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md`), while the newly-unmasked one — `substitutePlpgsqlFrameVarsInSQL` binding plpgsql variables by TEXTUAL substitution before parsing, corrupting the alias list `g(i)` into `g(1)` — is REFACTOR-tier (parse-then-bind, PG'"'"'s parser-hook + `PARAM_EXTERN` model) with a re-arm trigger on the task — and 0020 (`stats.sql`) was PARKED 2026-08-20 after being RUN for the first time (its `not-tried` status resolved to genuinely failing, 1391 → 1351 diff lines / 101 → 80 `^+ERROR` after shipping the engine-wide transaction-scoped pgstat getters, design `docs/design/m0134-0020-xact-pgstat-getters.md`), and 0021 (`vacuum.sql`) was PARKED 2026-08-20 on the same pattern (496 diff lines / 18 `^+ERROR` at HEAD, six root-cause buckets, shipped the per-relation VACUUM/ANALYZE maintenance-permission check — two tiers, not one — design `docs/design/m0134-0021-vacuum-partition-child-permission.md`, taking it to 393 / 14 with all six ownership permutations of `expected/vacuum.out:593-684` now byte-identical), and 0022 (`window.sql`) was PARKED 2026-08-20 on the same pattern (4575 diff lines / 90 `^+ERROR` at HEAD, nine buckets, shipped the four-gate unification that lets ordinary aggregates be used as window functions, design `docs/design/m0134-0022-window-aggregate-gates.md`, taking it to 4604 / 64 — errors down 26 while lines rose 29, because rejections became value comparisons), and 0023 (`write_parallel.sql`) was PARKED 2026-08-20 after being RUN for the first time (its `not-tried` status resolved to genuinely failing, 86 -> 80 diff lines / **12 -> 0 `^+ERROR`** after shipping the same-transaction drop/recreate name-reuse fix, design `docs/design/m0134-0023-txn-drop-recreate-name-reuse.md`; the case is structurally unreachable because 55% of its expected output is parallel-plan-shaped and goopg has no parallel-worker execution path), and 0024 (`generated_virtual.sql`) was PARKED 2026-08-20 on the same pattern — re-run at HEAD confirmed it is not stale (4438 diff lines / 114 `^+ERROR`), and the loop shipped a fix that was NOT a generated-column bug at all but an engine-wide one the case merely exposed: unqualified `INHERITS`/`ALTER TABLE ... INHERIT` parent lookup ignored `search_path` (design `docs/design/m0134-0024-inherits-searchpath-lookup.md`, 4438 -> 4397 lines and 114 -> 96 `^+ERROR`), and 0025 (`groupingsets.sql`) was PARKED 2026-08-20 on the same pattern — re-run at HEAD confirmed it is not stale (2373 diff lines / 25 `^+ERROR`), and sizing found that **63% of the diff was a single cascading hunk caused by a real backend PANIC**, not by distinct mismatches: `resolveExprAfterAggregate` (`internal/optimizer/planner.go:7386`) hard-cast `resolveColumnRef`'s output to `*ColumnRef`, so ANY correlated outer-level reference in the target list of a subquery containing an aggregate killed the connection — reproduced live with NO grouping sets and even with NO GROUP BY, i.e. engine-wide, the case merely being the first regress file to combine LATERAL + aggregate + correlated target-list ref (design `docs/design/m0134-0025-lateral-outer-colref-aggregate-crash.md`, 2373 -> 2689 lines / 25 -> 41 `^+ERROR` with the connection-loss cascade GONE — the counts rising is the expected shape of progress and was PROVEN by a stash A/B: the pre-crash region that ran in both builds is byte-identical, every new error belongs to a statement that previously never executed, verdict NO REGRESSION); its two largest remaining buckets (grouping-sets aggregation STRATEGY selection and tied-row emission order) are REFACTOR-tier with a re-arm trigger on the task, and **0026 (`guc.sql`) was PARKED 2026-08-20** on the same pattern — re-run at HEAD confirmed it is not stale (767 diff lines / 27 `^+ERROR` / 11 `^-ERROR`) — and the loop shipped an **engine-wide silent wrong-value bug** the case merely exposed: a `timestamptz` input string carrying no zone was parsed with a zone-less Go layout that defaults the location to UTC, while PG reads those digits as local time in the session `TimeZone` GUC (`DecodeDateTime`, `postgres/src/backend/utils/adt/datetime.c:1573-1583`), so every zone-less `timestamptz` input in a non-UTC session stored the WRONG INSTANT with no error raised (design `docs/design/m0134-0026-timestamptz-literal-session-timezone.md`, **760 -> 536 diff lines, -224**). **That improvement is invisible under the default harness** (which reports 767 -> 767) because `scripts/pg-regress-runner.sh` never exports what real `pg_regress.c:764-804` sets, so the case never enters a non-UTC session — a FALSE NEGATIVE now ledgered as its own re-baselining task. Its remaining buckets (top-level `SET LOCAL` persisting with no `WarnNoTransactionBlock` warning, CONTAINED and the natural next slice; `ROLLBACK TO SAVEPOINT` not restoring GUCs, REFACTOR-tier; assorted missing builtins) are ledgered, and 0027 (`copy.sql`), 0028 (`horology.sql`) and 0029 (`identity.sql`) were each PARKED 2026-08-20 on the same pattern (see their own entries below for shipped-fix detail), and **0030 (`incremental_sort.sql`) was PARKED 2026-08-20** on the same pattern — sized at HEAD (953 diff lines / 14 `^+ERROR`), dominated (~700+ lines) by goopg having **no Incremental Sort plan node or executor at all** (REFACTOR-tier, own milestone), while the loop shipped the one contained, generically-useful fix among the 14 `^+ERROR`s: `targetMeta` (`internal/optimizer/planner.go:11566-11579`) had no arm for `*OuterColumnRef`, so a LATERAL derived table whose sole projected column is a bare correlated outer-column reference got its synthetic schema column mislabeled `?column?`, breaking qualified lookup from the outer query — a general LATERAL-subquery bug, not incremental_sort-specific (14 -> 8 `^+ERROR`), so the next M0134 task to select is **M0134-0031 (`copy2.sql`, status `failed`)** — 0015 (`join.sql`), 0016 (`create_table.sql`) 0018 (`create_index.sql`) and 0019 (`indexing.sql`) were each PARKED on the same pattern after shipping one contained fix, and 0017 (`hash_index.sql`) CLOSED green. **0031 (`copy2.sql`) was PARKED 2026-08-20** on the same pattern — sized at HEAD (955 diff lines / 60 `^+ERROR`), dominated by three REFACTOR-tier missing-feature buckets (legacy `WITH DELIMITER AS`/`NULL AS` option grammar ~90 lines; `COPY ... FROM stdin WHERE <expr>` unparsed ~120+ lines; `COPY ... WITH (DEFAULT '…')` option unimplemented ~150 lines), while the loop shipped the smallest CONTAINED bucket: PG's CSV writer force-quotes a field colliding with the NULL marker or (single-column) the `\.` EOF marker (`CopyAttributeOutCSV`, `postgres/src/backend/commands/copyto.c:1300-1350`), a rule `EncodeCopyCsvRow` (`internal/executor/copy_csv.go:126-144`) lacked entirely — design `docs/design/m0134-0031-copy-csv-force-quote-null-eof.md`, 955 → 888 diff lines (`^+ERROR` unchanged at 60, all remaining belong to the excluded buckets). **0032 (`inherit.sql`) was PARKED 2026-08-20** on the same pattern — sized at HEAD (3310 diff lines / 38 `^+ERROR` / 40 `^-ERROR`), dominated by a REFACTOR-tier missing subsystem (the ALTER TABLE inheritance validation matrix, ~1000+ lines) plus several independent smaller gaps (EXPLAIN plan-shape divergence, `pg_get_expr`/CHECK-constraint raw-text deparse, a `circle` GiST opclass gap, an unconfirmed ORDER BY/Sort correctness bug, DROP CASCADE ordering), while the loop shipped the smallest CONTAINED bucket: `buildForeignKeyDefString` (`internal/executor/expr.go:6345`) unconditionally schema-qualified `pg_get_constraintdef`'s FK `REFERENCES` clause regardless of session search_path visibility — design `docs/design/m0134-0032-fk-constraintdef-schema-visibility.md`, 3310 → 3300 diff lines, the `test_foreign_constraints_id1_fkey` mismatch fully resolved, and **0033 (`create_procedure.sql`) was PARKED 2026-08-20** on the same pattern — sized at HEAD (131 diff lines / 2 `^+ERROR` / 1 `^-ERROR`), a small case with five independent root causes, two REFACTOR-tier (missing `LINE N`/`^` error-position pointer — `Pos == 0` sentinel collision across the wire-encoding guards in `internal/postmaster/copy.go`/`txn_verb.go`; `pg_get_functiondef` BEGIN-ATOMIC body deparse is raw-text substitution not AST re-deparse) and one a standalone engine-wide gap (no `ACL_EXECUTE` enforcement anywhere in `internal/executor`, so `CALL` on an EXECUTE-revoked procedure never raises "permission denied"), while the loop shipped the smallest CONTAINED bucket: `internal/executor/operators_ddl.go:16743-16753`'s DROP PROCEDURE/FUNCTION not-found branch unconditionally attached the CALL-only "No procedure matches…" HINT, which real PG's DROP name-resolution path (`LookupFuncName`, `namespace.c`) never emits — design `docs/design/m0134-0033-drop-procedure-notfound-hint.md`, 131 → 124 diff lines, and **0034 (`insert_conflict.sql`) was PARKED 2026-08-20** on the same pattern — sized at HEAD (539 diff lines / 2 `^+ERROR` / 9 `^-ERROR`), six independent root causes, of which the loop shipped the CONTAINED one: `resolveArbiterIndex` (`internal/optimizer/planner.go:10691-10806`) used subset/liberal `ON CONFLICT` arbiter-index matching instead of PG's exact-set match (`bms_equal` for plain columns, real expression-AST equality for expression columns via new `parserExprStructEqual`), silently accepting and *executing* ON CONFLICT clauses PG rejects — a genuine data-correctness bug, not cosmetic — design `docs/design/m0134-0034-arbiter-index-exact-set-match.md`, 539 → 422 diff lines, 9 → 6 `^-ERROR` (one new `^+ERROR` also surfaced — a pre-existing, out-of-scope check-ordering gap between arbiter resolution and UPDATE-SET-target validation in `planOnConflict`, ledgered separately — net improvement accepted). Remaining buckets (EXPLAIN plan shape for ON CONFLICT, GiST exclusion-constraint physical enforcement, `excluded` whole-row WHERE-clause reference, attached-partition local-index arbiter lookup) are REFACTOR-tier or unsized, ledgered, so the next M0134 task to select is **M0134-0035 (`interval.sql`, status `failed`)**. **M0134-0159 (`regproc.sql`) was PARKED 2026-08-29** on the same pattern — sized live for the first time (`not-tried` → `failed`, 766 → 758 diff lines / `^+ERROR` 63 → 61) — and the loop shipped an **engine-wide** fix the case merely exposed rather than anything regproc-specific: goopg's compat tier classifies the statement classes the grammar deliberately does not carry (role DDL, database DDL) by prefix-matching `normalizeCompatSQL`, which kept comments verbatim where PG's lexer folds them into `{whitespace}` (`scan.l:213-215`), so **CREATE/ALTER/DROP ROLE|USER|GROUP and CREATE/ALTER/DROP DATABASE were unreachable from any commented SQL script** (design `docs/design/m0134-0159-sql-comment-stripping-compat-intercepts.md`); its remaining buckets are filed as 0159a/0159b/0159c. **M0134-0160 (`reloptions.sql`) was PARKED 2026-08-29** on the same pattern — sized live for the first time (`not-tried` → `failed`, 232 → **201** diff lines / `^+ERROR` 17 → **6**) — and the loop again shipped an **engine-wide** fix the case merely exposed: goopg validated storage parameters only by *recognising* them, so a `WITH (...)` name nobody looked for was silently accepted and dropped (`CREATE TABLE t(i int) WITH (not_existing_option=2)` SUCCEEDED, as did the CREATE INDEX / ALTER TABLE SET / bad-namespace forms), where PG raises 22023 from `parseRelOptions`/`transformRelOptions` (`reloptions.c:1488`/`:1275`) — a silent-acceptance correctness gap that also cascades into spurious "relation already exists" on every later negative case (design `docs/design/m0134-0160-reloption-name-registry.md`; **twelve of a 14-case regress A/B byte-identical**, `alter_table` 3792 → 3784). Its remaining buckets are filed as 0160a/0160b. **M0134-0161 (`replica_identity.sql`) was PARKED 2026-08-29** on the same pattern — sized live for the first time (`not-tried` → `failed`, 194 → **189** diff lines / `^-ERROR` 3 → **2**) — and the loop again shipped an **engine-wide** fix the case merely exposed: `pg_index.indimmediate` is keyed on the `DEFERRABLE` flag ALONE (`index.c:1049`, `index.c:2080-2082`), never on INITIALLY DEFERRED, and seven goopg consumers had drifted into three different answers — both pg_index row builders hardcoded `true`, the `REPLICA IDENTITY USING INDEX` check and both ON CONFLICT arbiter checks keyed on `InitiallyDeferred`, and the inferred-by-column arbiter branch had no check at all — so a `UNIQUE (b) DEFERRABLE` constraint was silently ACCEPTED as both a replica identity and an ON CONFLICT arbiter where PG rejects it (design `docs/design/m0134-0161-indimmediate-deferrable-key.md`; 13-case regress A/B, **twelve byte-identical**, zero regressions). Its remaining buckets are filed as 0161a-0161h. **M0134-0162 (`roleattributes.sql`) was CLOSED GREEN 2026-08-29** — the first full close in this run of the sequence, not a park: sized live for the first time at 28 diff lines, whose entirety was ONE root cause, and the case now passes byte-identically (`not-tried` → **`pass`**, 28 → **0**). `[NO]INHERIT` was accept-and-ignore engine-wide (`catalog.RoleAttrs` had no `Inherit` field, `applyRoleAttrOptions` never probed for it, and both `pg_authid` row builders hardcoded `rolinherit = 't'`), and the fix had to carry a second, non-cosmetic half: `rolinherit` is PG's default for `pg_auth_members.inherit_option` (`user.c:1924-1939`) and goopg's `HasPrivsOfRole`/`SelectBestAdmin` traverse only inherit-marked rows, so shipping the catalog column alone would have left a NOINHERIT role inheriting every privilege of every role granted to it (design `docs/design/m0134-0162-rolinherit-attribute.md`; 8-case regress A/B vs a HEAD worktree, zero regressions). Its remaining buckets are filed as 0162a-0162c. **M0134-0163 (`rowsecurity.sql`) was PARKED 2026-08-29** on the same pattern — sized live for the first time (`not-tried` → `failed`, `^+ERROR` 301 → **137**, of which spurious `permission denied for table` 165 → **11**) — and the loop shipped an **engine-wide ACL** fix the case merely exposed (GRANT on an unqualified table outside `public` recorded nothing; `HasTablePrivilege` was not `aclmask()`, so `GRANT … TO PUBLIC` and group grants conferred nobody anything); its remaining buckets are filed as 0163a-0163c. **M0134-0164 (`sanity_check.sql`) was PARKED 2026-08-29** on the same pattern — sized live for the first time (`not-tried` → `failed`, 77 → **21** diff lines) — and the loop again shipped an **engine-wide** fix the case merely exposed: `pg_class.relfilenode` was the relation OID for EVERY relkind in both virtual builders, where PG leaves the storage-less kinds (`v`/`c`/`f`/`p`/`I`) at 0 (`RELKIND_HAS_STORAGE`, `pg_class.h:200`; `heap_create`, `heap.c:335-345`) — a four-way sibling divergence in which the heap builder, initdb and the composite builder each already had (some of) the right answer and the runtime virtual builder had none of it (design `docs/design/m0134-0164-relfilenode-storage-less-relkinds.md`; 13-case regress A/B, **10 byte-identical**, zero regressions, and `alter_table` 3800 → 3798 as independent confirmation). Its remainder is filed as 0164a. **M0134-0165 (`security_label.sql`) CLOSED GREEN 2026-08-29** — the second full close in the run sequence, not a park: sized live for the first time at 16 diff lines, the entirety of which was ONE root cause, and the case now passes byte-identically (`not-tried` → **`pass`**, 16 → **0**). The `SECURITY LABEL` statements themselves already matched; the diff was the case's `SET client_min_messages TO 'warning'` scaffold failing to suppress two `DROP ROLE IF EXISTS` NOTICEs. **Engine-wide**: `client_min_messages` was a GUC declaration that NOTHING consumed, so every NOTICE/WARNING goopg ever produced reached the client unconditionally; fixed at the single wire choke point (`WriteNoticeResponse` + a per-connection `FrameWriter.ClientMinMessagesFn` hook) mirroring `should_output_to_client` (`elog.c`), design `docs/design/m0134-0165-client-min-messages-notice-filter.md`; 16-case regress A/B net **−127 diff lines, zero regressions**. Remaining buckets filed as 0165a/0165b. **The next M0134 task to select is M0134-0166 (`float8.sql`, status `failed`).** **M0134-0166 (`float8.sql`) PARKED 2026-08-29** on the same pattern — sized live for the first time (1311 diff lines / 56 `^+ERROR`) — and the loop again shipped an **engine-wide** fix the case merely exposed: `evalCast` had **no `KindString` arm at all** for `float4`/`float8`, so `'10e400'::float8` and even `'N A N'::float8` returned the raw text unvalidated; float input existed four times in four different states and now shares one `float8in_internal`-faithful `floatIn` (design `docs/design/m0134-0166-float8in-shared-input.md`; 20-case regress A/B, `float4` −192, `float8` −107, **18 byte-identical**, zero regressions). Remaining buckets filed 0166a–0166d. **M0134-0167 (`spgist.sql`) was PARKED 2026-08-29** on the same pattern — sized live for the first time (`not-tried` → `failed`, **23 diff lines, ONE hunk**), and the case's entire divergence is that goopg has **no SP-GiST access method at all** (`USING spgist` registers catalog metadata only), which is REFACTOR-tier; everything else in the file already matched byte-for-byte. The loop again shipped an **engine-wide** fix the case merely exposed: `catalog.IndexAMCapability` (M0134-0090) is a 1:1 mirror of the six in-tree AMs' `IndexAmRoutine` flags that had **one consumer**, `pg_indexam_has_property` — so the compat surface could REPORT that spgist cannot do unique indexes while `execCreateIndex` happily created one. Of upstream's five `DefineIndex` capability checks (`indexcmds.c:869/874/879`, `:2228/2233`) goopg enforced one, as a hardcoded AM-name list, so `CREATE UNIQUE INDEX … USING spgist|gist|gin|brin|hash`, multicolumn spgist/hash and `DESC`/`NULLS FIRST` on every orderless AM were silently ACCEPTED — not cosmetic, since those four AMs are catalog-only in goopg and the index advertised `indisunique` while enforcing nothing (design `docs/design/m0134-0167-index-am-capability-gate.md`; 15-statement oracle A/B byte-identical, 15-case regress A/B zero regressions, guarded by a revert-checked unit test because **no upstream regress case exercises any of the five errors**). Its remaining buckets are filed as 0167a–0167d, so the next M0134 task to select is **M0134-0168 (`sqljson.sql`, status `not-tried`)**. **M0134-0168 (`sqljson.sql`) was PARKED 2026-08-29** on the SQL/JSON constructor subsystem (ledger 0168a), shipping the engine-wide `'name'::regclass` → `regclassin` delegation instead. **M0134-0169 (`sqljson_jsontable.sql`) was PARKED 2026-08-29** on the SAME blocker — sized live for the first time (`not-tried` → `failed`, 1347 → **1335** diff lines / `^+ERROR` 116 → **115**), its 90 syntax errors resolving to just four tokens (`COLUMNS` x68, `PASSING` x12, `AS` x9 — all `JSON_TABLE` — and `(` x1). The lone `(` was a separate, **engine-wide grammar bug**: CTAS's source and both view bodies took `select_bare`, so `CREATE TABLE t AS (SELECT 1)`, `CREATE VIEW v AS (SELECT 1)` and `CREATE MATERIALIZED VIEW mv AS (SELECT 1)` were rejected where upstream's `CreateAsStmt` (`gram.y:4807`) and `ViewStmt` (`:11287`) take `SelectStmt`. It had been recorded as intentional in three places (grammar comment, `assertBothReject` guard, golden corpus), each a faithful record of the LEGACY parser's limit mistaken for a PostgreSQL rule (design `docs/design/m0134-0169-ctas-view-source-parenthesised-query.md`; four productions changed, **no new grammar conflicts**; 15-case regress A/B, 11 byte-identical, `privileges` 3885 → 3878, zero regressions). Its remainder is filed as 0169a/0169b, so **the next M0134 task to select is M0134-0170 (`sqljson_queryfuncs.sql`, status `not-tried`)** — note 0168a gates it too, so expect the same sizing-and-park unless the SQL/JSON subsystem is opened. **M0134-0170 (`sqljson_queryfuncs.sql`) was PARKED 2026-08-29** on that same blocker, as predicted — sized live for the first time (`not-tried` → `failed`, **2021 diff lines / 259 `^+ERROR` / 113 `^-ERROR`**), 100% of which is the SQL/JSON **query-function** family (218 syntax errors over `RETURNING` x121 / `PASSING` x38 / `DEFAULT` x11 / …, 33 `function json_exists|json_value|json_query does not exist`, 8 relation-cascade). The loop again shipped an **engine-wide** fix the case merely POINTS AT but cannot itself exercise: its `:360-389` block is 39 `CREATE INDEX ON t (JSON_QUERY(js, '…'))` statements asserting `functions in index expression must be marked IMMUTABLE` 28 times, and **goopg implemented that check nowhere** — `CREATE INDEX ON t ((clock_timestamp()::text))`, `((a + (random()*10)::int))`, a user VOLATILE/STABLE function key and `WHERE a > (random()*10)::int` were all accepted, which is a correctness bug, not a cosmetic one (an index entry computed from a non-IMMUTABLE expression cannot be reproduced at probe time, so the index silently disagrees with the heap). It is the *sibling paths must agree* pattern again: goopg had ONE of upstream's three ports of the same predicate (`validatePartKeyExprInner` = `ComputePartitionAttrs`, `tablecmds.c:19966`) and neither index half (`CheckPredicate` `indexcmds.c:1843-1857` called at `:906`; `ComputeIndexAttrs` `:2016-2019`) — and the survivor had its own gap, consulting only user-defined routines so a bare volatile BUILT-IN in a partition key slipped through. All three now share one `pg_proc.dat`-derived classifier (design `docs/design/m0134-0170-index-expression-mutability.md`; 14-case DDL-heavy regress A/B, **13 byte-identical, zero regressions**; guard revert-checked, and necessary because the two messages appear in exactly ONE upstream expected file — the case that cannot run). The loop also made `scripts/pg-regress-runner.sh` fail loudly on a busy auto-start port and on a `psql` exit-2 connection loss: both used to yield a plausible-looking case size, and this very case was first "sized" at a fabricated 1291 lines. Its remainder is filed as 0170a-0170c, so **the next M0134 task to select is M0134-0171 (`foreign_key.sql`, status `failed`)**. **M0134-0171 (`foreign_key.sql`) was PARKED 2026-08-29** on the same pattern — re-sized at HEAD (stays `failed`, **3490 → 3343 diff lines / `^+ERROR` 279 → 253**), its residual being REFACTOR-tier (113 cascaded `relation does not exist` plus the partitioned-FK `fkpart*` matrix) — and the loop again shipped an **engine-wide** fix the case merely exposed, this time a silent **data-integrity** bug rather than a message gap: an FK written `REFERENCES <table>` with no referenced-column list takes the referenced table's PRIMARY KEY (`transformFkeyGetPrimaryKey`, `tablecmds.c:13382`, called from `ATAddForeignKeyConstraint` `:10190`), but goopg's `pkColumns` returned the referenced table's **first column** — under a doc comment that already described the index scan its body never performed, the *dead-documentation* twin of *dead code is not a reference implementation*. It produced three wrong answers and the shape of the existing coverage is why only the harmless one was ever exercised: a **multi-column PK** yielded 1 of N columns, so the arity mismatch made the check compare N values against 1 column and **every valid row was rejected** with a bogus 23503; a **single-column PK that is not column 1** silently enforced the FK against the **WRONG column** (PG refuses to create that constraint at all, and the `"id"` in its DETAIL is proof upstream resolved the PK); PK-is-column-1 was right by luck, and every pre-existing FK test used exactly that shape. Fixed via the `IndexesOnTable` accessor already on the catalog interface, with `ctx` threaded to all five consumers, and deliberately kept at the runtime resolver: `execCreateTable` registers FKs (`:3758`/`:3795`) BEFORE it creates the PK index (`:4024`), so upstream's store-it-concretely model would break self-referencing FKs — pinned by a `SelfReferencingFK` subtest and ledgered as 0171a along with the `pg_constraint.confkey = {}` divergence it leaves behind (design `docs/design/m0134-0171-fk-omitted-refcolumns-primary-key.md`; 14-case regress A/B, **13 byte-identical, zero regressions**). The one bucket that ROSE is the expected shape of progress: upstream's block headed *"Test a primary key with attributes located in later attnum positions compared to the fk attributes"* previously ran against the wrong column and produced garbage, and now executes correctly, diverging only on the auto-generated constraint NAME (0171c). Its remainder is filed as 0171a-0171d, so **the next M0134 task to select is M0134-0172 (`stats_ext.sql`, status `not-tried`)**. **M0134-0172 (`stats_ext.sql`) was PARKED 2026-08-29** on the extended-statistics subsystem (ledger rows 0172a-0172c), shipping the engine-wide `RETURN QUERY` / `FOR ... IN <query>` frame-variable substitution fix instead. **M0134-0173 (`stats_import.sql`) was PARKED 2026-08-29** on the same pattern — sized live for the first time (`not-tried` -> `failed`, 1461 -> **1457** diff lines / `^+ERROR` 74 -> **73**), ~100% of its residual being the PG 18 statistics-IMPORT function family plus the absence of a queryable `pg_statistic` relation (ledger rows 0173c/0173d) — and the loop again shipped an **engine-wide** fix the case merely POINTS AT with one statement: goopg treated every range-typed value as **opaque, unvalidated text**, so `'garbage'::int4range` succeeded and, far worse, **no discrete range was ever canonicalized**, making `'[1,4]'::int4range` and `'[1,5)'::int4range` — the same value in PG — compare UNEQUAL through every equality, `ORDER BY`, btree probe and exclusion constraint (design `docs/design/m0134-0173-range-type-input-and-constructors.md`; `rangetypes` 2543 -> **2166** lines / 234 -> **182** `^+ERROR` in a 14-case A/B with zero regressions). So **the next M0134 task to select is M0134-0174 (`subscription.sql`, status `not-tried`)**. 0019's shipped fix was the widest-reaching yet — the `^` operator was missing from the parser entirely, so it was an engine-wide parse failure rather than a case-local gap. Standing rule for the ONE remaining
-"possible regression, verify" case (`reindex_catalog`; `mvcc` was checked and is
-genuinely failing): re-run `scripts/pg-regress-runner.sh --verbose <case>` at HEAD FIRST
-and, if it already passes, flip the CSV row to `pass` / `pass_required=yes`
-with a "stale — already fixed" note instead of implementing anything. M0132 and M0133 are COMPLETE,
-M0131 is closed except S24 (durable MultiXact SLRU — explicitly DEFERRED with an
-executable re-arm trigger; not selectable), and M0130 is closed. Below M0134 the
-next milestones are **M0119 (deferral-ledger backlog consumption)**, then M0122 —
-**M0119 is now the active milestone** (M0134 exhausted, see above); its sole
-remaining task is M0119-0006 (pg_amcheck server tier) — M0119-0005 (pg_waldump
-server tier) is already fully landed (see the M0119 section's "Already landed"
-note).
-Document order does NOT reflect priority here; this banner does.
-**M0119 selection rule: pick a M0119 task ONLY when no milestone above M0119 in
-the priority order has a remaining task that should be done** — "should be done"
-= unchecked and not parked or deferred, with prerequisites met. M0119 is a
-backlog-consumption milestone and the terminal drain: it never runs ahead of
-feature/build work. M-NIGHTLY's standing filing obligation is not itself a bar;
-its tasks block M0119 only while selectable per the M-NIGHTLY selection rule
-(after M0134 clears). M0122 (below M0119) does not block M0119.
-The banner is the sole ordering authority — `.ralph/working_set.md`'s notes carry
-state, not priority, and do not outrank it.
-
-**M-NIGHTLY selection rule (inherits prior M-NIGHTLY procedure §2, per
-ci/design/07-ralph-feedback.md §B):**
-1. Before investigating, re-run the item's repro at HEAD — the log reflects the
-   last nightly run and may be stale.
-2. Fix with the normal gates (practice cards apply), cite the AI-id in the
-   commit message, check the task off.
-3. The next nightly run confirms and drops the item from the log.
 
 ## M-NIGHTLY — Nightly regression triage (STANDING — ACTIVE since 2026-08-08)
 
-<!-- Standing milestone: never complete it, never archive it, keep it directly
-     under the Current Priority banner. Source of work: ci/logs/action-items.md
-     (regenerated by every nightly batch run; design ci/design/07-ralph-feedback.md).
-     As of 2026-08-09 ALL priority milestones (M0124/M0125/M0127/M0128/M0123/M0129) are
-     CLOSED. **As of 2026-08-15 M0134 is the next-priority milestone after
-     M-NIGHTLY** (user directive 2026-08-15 — see the Current Priority banner and
-     the M0134 section at the END of this file), ahead of M0119 and M0122's
-     remaining items;
-     M-NIGHTLY filing stays unconditional, and selection is subordinate to M0134
-     while any M0134 task is unchecked, then to M0119, then to M0122.
-     Loop rule:
-       1. Read ci/logs/action-items.md (absent file = nothing to do). For each
-          `## AI-` item whose `subject:` has no OPEN (unchecked) task below,
-          add one task:
-            - [ ] <subject> — <one-line what> (AI-<id>; repro: <cmd>)
-          If an unchecked task for the same subject already exists, do NOT add
-          another — append the new AI-id to that task's line instead. If only a
-          CHECKED task exists for the subject, the failure REOPENED: add a new
-          task and note the earlier fix didn't hold.
-       2. Before investigating, re-run the item's repro at HEAD — the log
-          reflects the last nightly run and may be stale; if it passes, check
-          the task off with a "stale — already fixed" note.
-       3. Fix with the normal gates (practice cards apply), cite the AI-id in
-          the commit message, check the task off. The next nightly run confirms
-          and drops the item from the log.
-     (Tasks are added here by the in-loop agent, one per subject. This
-     placeholder is a comment, not a checkbox, so the plan-complete exit
-     heuristic stays live.) -->
+Standing milestone: never complete it, never archive it, keep it directly
+under the Current Priority banner. Source of work: ci/logs/action-items.md
+(regenerated by every nightly batch run; design ci/design/07-ralph-feedback.md).
 
-
+Loop rule:
+   1. Read ci/logs/action-items.md (absent file = nothing to do). For each
+      `## AI-` item whose `subject:` has no OPEN (unchecked) task below,
+      add one task:
+      - [ ] <subject> — <one-line what> (AI-<id>; repro: <cmd>)
+      If an unchecked task for the same subject already exists, do NOT add
+      another — append the new AI-id to that task's line instead. If only a
+      CHECKED task exists for the subject, the failure REOPENED: add a new
+      task and note the earlier fix didn't hold.
+   2. Before investigating, re-run the item's repro at HEAD — the log
+      reflects the last nightly run and may be stale; if it passes, check
+      the task off with a "stale — already fixed" note.
+   3. Fix with the normal gates (practice cards apply), cite the AI-id in
+      the commit message, check the task off. The next nightly run confirms
+      and drops the item from the log.
+(Tasks are added here by the in-loop agent, one per subject. This
+placeholder is a comment, not a checkbox, so the plan-complete exit
+heuristic stays live.)
 
 ### Nightly run 20260805-014309 (2 items, sha `ce027cee` — status fail)
 - [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260822-001356-001)**.
 - [ ] **testport/TestPort_RegressSuite — limit, numerology (AI-20260822-001356-002)**.
 - [ ] **race/stage (AI-20260822-001356-004)**.
 - [ ] **race/build-broke-mid-stage (AI-20260822-001356-005)**.
+
 ### Nightly run 20260824-013441 (sha `e7495e712dda`, 2 items) — filed 2026-08-24
 - [ ] **units/testport — TestPort_PgDumpConnectionSetup FAILed (AI-20260825-003932-001)**.
 - [ ] **testport/TestPort_InitiallyDeferredFKCommit (AI-20260827-052222-013)**.
@@ -271,14 +190,19 @@ Non-testport items from the same run:
 
 - [ ] **tpcds/stage (AI-20260827-052222-132)**.
 - [ ] **tpch/Q5-timeout (AI-20260827-052222-133)**.
+
 ### Nightly run 20260828-235424 (sha `5773b884c5bf`, 2 items) — filed 2026-08-29
 - [ ] **tpch/Q5-timeout (AI-20260828-235424-002)**.
+
 ### Nightly run 20260831-013952 (sha `c051b81fa596`, 2 items) — filed 2026-09-01
 - [ ] **testport/stage (AI-20260831-013952-001)**.
+
 - [ ] **testport/build-broke-mid-stage (AI-20260831-013952-002)**.
+
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
 - [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005)**.
 - [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007)**.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
 M0130 (Cluster-directory compat with PG 18.3 + PG physical replication).
@@ -388,6 +312,7 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+
 ## M0131 — Bidirectional cluster-directory cold-start + real-PG system-view hosting (filed 2026-08-11)
 
 > **Demoted from top priority by the 2026-08-13 user directive** — M0132 is now
@@ -422,6 +347,7 @@ Theme F — Crash-state cluster-directory interchange (added 2026-08-11, user di
 **Theme design:** `docs/design/0131-0012-crash-state-cluster-dir-interchange.md`. Theme F is independent of Themes C/D and may proceed in parallel.
 
 - [ ] **M0131-S24 — MultiXact: durable `pg_multixact` SLRU + `multixact_redo`** — DEFERRED.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
 M0132 (Explicit transactions across the extended query protocol), M0133 (information_schema on disk).
@@ -633,6 +559,7 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [x] **M0134-0187 — generated_stored.sql** — regress-sql `failed`.
 - [x] **M0134-0188 — xml.sql** — regress-sql `not-tried` (PARKED).
 - [x] **M0134-0189 — xmlmap.sql** — regress-sql `not-tried` (PARKED).
+
 ## M0135 — SQL/JSON `jsonpath` subsystem (filed 2026-08-20, from M0134-0039/0040/0041 sizing)
 
 Design: `docs/design/m0135-0001-jsonpath-subsystem.md`. goopg has no jsonpath
