@@ -1474,15 +1474,16 @@ Decomposing Q2's bitmap against PG's:
   as deliberately RETAINED (`startup + runCost + indexCost.Total` in
   `costBitmapHeapScan`). This is the term §13.4 was hunting, and it is exactly
   "of the same order as `indexTotalCost`" as predicted.
-- **Heap side: ~52.1 vs PG's ~35.6 — a further +46%**, which is NOT the double
-  charge and is the larger of the two. It lives in `computeBitmapPages` /
-  `costBitmapHeapScan`'s page estimate for 400 rows of a ~400-page table.
+- **Heap side: ~52.1 vs PG's ~35.6 — a further +46%.** WRONG DECOMPOSITION,
+  corrected in §17: the 52.1 figure was `total − startup`, which still contained
+  the duplicate a SECOND time (`Total = startup + run + indexCost.Total` counts
+  the index side twice, so `total − startup` = run + one duplicate). The true
+  run cost was 37.7 vs PG's 35.6 — within 6% — and the heap-side estimate was
+  never materially wrong. The entire Q2 excess was the duplicate, once in
+  startup's frame of reference and once in the total's.
 
-Both errors have the SAME sign, so they add rather than cancel. That is the
-piece §13.3's "look for the second bug it was cancelling" framing had backwards,
-and it explains why removing the double charge alone did not settle the census:
-it removes ~7 of a ~23 unit excess and leaves the bitmap still over-priced
-against a correctly-ish priced index.
+§13.3's instinct ("look for the second bug it was cancelling") was right after
+all, but the second bug was not a cost term — see §17.
 
 ### 16.3 Why this is the highest-value remaining item
 
@@ -1497,3 +1498,63 @@ property.
 `supplier` pages, `supplier_nation_fkidx` pages) and compare the page count
 against PG's `compute_bitmap_pages` for the same inputs. One number, one node —
 and per §14.4, confirm the inputs before theorising about the formula.
+
+## 17. The second bug was generation, not a cost term — LANDED
+
+§16's next step (instrument `computeBitmapPages`, compare against
+`compute_bitmap_pages`) found three defects, all settled against the oracle and
+landed together because each was masking the next:
+
+1. **The double charge is simply wrong, and the comment citing PG was false.**
+   `cost_bitmap_heap_scan` ends `path->total_cost = startup_cost + run_cost`
+   with `indexTotalCost` already inside `startup_cost` — there is no second
+   addition. goopg's `Total: startup + runCost + indexCost.Total` cited
+   "costsize.c:1110-1113" for a line PG does not contain. Removed. §16.2's
+   "+46% heap side" decomposition was an artifact of this same duplicate
+   (`total − startup` still contained it once); the true run cost was 37.7 vs
+   PG's 35.6.
+2. **`compute_bitmap_pages`'s arms were inverted.** PG computes the plain
+   Mackert-Lohman single-scan estimate UNCONDITIONALLY and uses the cache-aware
+   `index_pages_fetched` only inside `if (loop_count > 1)`. goopg used the
+   cache-aware form whenever index geometry was available — systematically
+   fewer pages, an under-priced single-scan bitmap. Restructured to PG's exact
+   order.
+3. **goopg generated clause-less full-table bitmap paths; PG never does.**
+   `get_index_paths` collects into `bitindexpaths` only what
+   `build_index_paths` made FROM the clause set. goopg built a bitmap for
+   every index and relied on the cost model to reject it ("they lose to seq
+   scan in add_path") — which held ONLY while defect 1 over-priced them.
+   Removing the double charge alone flipped 13 of 21 plans to full-table
+   bitmaps (census 4 → 22), whose execution was also broken (7/21 rc=0):
+   an unwinnable path is an untested path, again. The fix is PG's guard in
+   PG's place: `buildOneBitmapPath` declines when no index qual matched and
+   no partial-index predicate applies. Two tests that handed the producer a
+   bare leaf and asserted a path exists were rewritten to carry quals; a new
+   test pins the refusal.
+
+**Result** (all gates green, 21/21 byte-identical, rc=0 across the board):
+
+| bitmap set | before | after | PG |
+|---|---|---|---|
+| queries | q11 q20 q21 | **q08** q11 q20 q21 | q02 q11 q17 q20 q21 |
+
+Exactly ONE plan changed vs the prefix-arm baseline: q08's `customer` input
+went from `Index Scan using customer_nation_fkidx` (rows=6000) to a
+parameterised Bitmap Heap Scan on the same index — cost-honest (756.04 vs
+845.89, both candidates generated) but **slower in practice: q08 1.7s vs 0.9s**.
+Not PG's node either (PG's different join order probes `customer_pk`). Recorded
+as a real cost-model residual, not hidden behind the census.
+
+### 17.1 Q2 remains, and the open question moved
+
+Post-fix, Q2's supplier candidates are bitmap 14.35..**52.07** vs index
+0.25..**54.73** — the bitmap IS cheaper on total now, both survive `addPath`
+(neither dominates: index wins startup, bitmap wins total), and the plan still
+picks the index. So the decision is made DOWNSTREAM, in `addNLIPaths`' join
+costing over `CheapestParameterized` — where `getMemoizePath` may wrap either
+inner and `pathRescanTotal` answers differently for a memoized one, and where
+the outer's row count (5, from nation⋈region) sits right at the
+startup-vs-total tradeoff. The next measurement is the join-cost comparison
+INSIDE `addNLIPaths` for that joinrel — the candidates' own costs are now known
+to be correctly ordered, so §14.4's lesson applies one level up: verify which
+JOIN candidates were built and at what cost before touching any formula.

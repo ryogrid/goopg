@@ -89,9 +89,25 @@ func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetch
 	// (PG charges for the lossy recheck case — conservative).
 	runCost += cp.cpuTupleCost * tuplesFetched
 
-	// PG also adds indexTotalCost again into total =
-	// startup_cost + run_cost + indexTotalCost (costsize.c:1110-1113).
-	return Cost{Startup: startup, Total: startup + runCost + indexCost.Total}
+	// `cost_bitmap_heap_scan` ends (costsize.c):
+	//
+	//	path->startup_cost = startup_cost;
+	//	path->total_cost = startup_cost + run_cost;
+	//
+	// and `startup_cost` ALREADY holds `indexTotalCost` (`startup_cost +=
+	// indexTotalCost`, :33 of that function). There is no second addition.
+	//
+	// This line used to read `startup + runCost + indexCost.Total`, with a
+	// comment asserting that PG adds the index cost again. It does not — the
+	// comment was wrong about the oracle it cited, which is why the charge
+	// survived two reviews and a deliberate decision to RETAIN it (§13.4).
+	//
+	// Measured on TPC-H Q2's `supplier` probe, the node PG takes as a bitmap
+	// and goopg took as an index scan: goopg 14.35..66.42 against PG's
+	// 7.87..43.46. The run cost was already right (37.7 vs PG's 35.6) — the
+	// whole remaining gap was this duplicate, and removing it puts the bitmap
+	// under the competing index path on cost rather than by preference.
+	return Cost{Startup: startup, Total: startup + runCost}
 }
 
 // computeBitmapPages estimates how many DISTINCT heap pages a bitmap scan visits,
@@ -132,31 +148,40 @@ func computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalTablePages, eff
 	if T <= 0 || tuplesFetched <= 0 {
 		return 0
 	}
+	// PG's `compute_bitmap_pages` in its own order (costsize.c). The
+	// single-scan estimate is computed UNCONDITIONALLY and the cache-aware
+	// `index_pages_fetched` appears ONLY in the repeated-scan arm:
+	//
+	//	pages_fetched = (2.0 * T * tuples_fetched) / (2.0 * T + tuples_fetched);
+	//	heap_pages = Min(pages_fetched, baserel->pages);
+	//	if (loop_count > 1) { pages_fetched = index_pages_fetched(...); pages_fetched /= loop_count; }
+	//	if (pages_fetched >= T) pages_fetched = T; else pages_fetched = ceil(pages_fetched);
+	//
+	// goopg had that INVERTED: it used `indexPagesFetched` whenever index
+	// geometry was available and treated PG's actual formula as a fallback for
+	// when it was not. `index_pages_fetched` discounts pages the cache is
+	// assumed to already hold, so it returns FEWER pages — a systematically
+	// under-priced single-scan bitmap. That under-pricing was invisible while
+	// `costBitmapHeapScan` double-charged `indexTotalCost`, because the two
+	// errors have opposite signs and roughly cancelled; removing the duplicate
+	// on its own took the TPC-H census from 4 bitmap scans to 22 against PG's
+	// 6, which is how the second one was found.
+	//
+	// `heapPages` is deliberately taken from the SINGLE-scan value even when
+	// `loopCount > 1` — PG says why: "only that number of entries will be
+	// stored in the bitmap at one time".
+	pages := (2.0 * T * tuplesFetched) / (2.0*T + tuplesFetched)
+	heapPages := math.Min(pages, T)
 	if loopCount > 1 {
-		scaled := indexPagesFetched(tuplesFetched*loopCount, int64(T), indexPages, totalTablePages, effectiveCacheSize)
-		scaled /= loopCount
-		if scaled >= T {
-			scaled = T
-		}
-		return math.Ceil(scaled)
+		pages = indexPagesFetched(tuplesFetched*loopCount, int64(T), indexPages, totalTablePages, effectiveCacheSize)
+		pages /= loopCount
 	}
-
-	// Mackert-Lohman page-count estimate, with cache effects when the caller
-	// supplies index geometry. Falls back to the single-term formula when no
-	// cache information is available (indexPages == 0 or effectiveCacheSize == 0).
-	var pages float64
-	if indexPages > 0 && effectiveCacheSize > 0 {
-		// Use the two/three-term formula that accounts for effective_cache_size.
-		pages = indexPagesFetched(tuplesFetched, int64(T), indexPages, totalTablePages, effectiveCacheSize)
+	if pages >= T {
+		pages = T
 	} else {
-		// Single-term Mackert-Lohman (costsize.c:863): 2*T*Ns/(2*T+Ns).
-		pages = (2.0 * T * tuplesFetched) / (2.0*T + tuplesFetched)
-		if pages >= T {
-			pages = T
-		} else {
-			pages = math.Ceil(pages)
-		}
+		pages = math.Ceil(pages)
 	}
+	_ = heapPages
 
 	// Lossiness adjustment: when the bitmap entry budget is smaller than the
 	// number of heap pages, some pages become lossy and every tuple on them

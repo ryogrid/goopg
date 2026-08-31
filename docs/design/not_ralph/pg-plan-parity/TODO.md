@@ -922,13 +922,25 @@ section D. Recorded because the gate run is where they became visible.
       §13.4 records as RETAINED, and the term it was hunting), plus a heap-side
       ~52.1 vs ~35.6 (+46%) that is larger and separate. Same sign, so they ADD;
       §13.3's "the second bug it was cancelling" had the sign backwards.
-- [ ] **Next**: instrument `computeBitmapPages` for Q2's supplier probe and
-      compare its page count against PG's `compute_bitmap_pages` on the same
-      inputs. Confirm the INPUTS before theorising about the formula (§14.4).
-- [ ] Highest value of everything still open: fixing it moves BOTH Q2 and Q17 to
-      PG's choice, giving the bitmap set `{q02, q11, q17, q20, q21}` = PG's set
-      exactly, with no architectural change. Q13/Q16 need a partial search-root
-      boundary (§15.4) and Q72 needs joinlist flattening (§E) — both structural.
+- [x] **Done — three defects, all oracle-settled, landed together (§17):**
+      the double charge removed (PG has no second `indexTotalCost` addition;
+      the comment citing costsize.c:1110-1113 was false), `compute_bitmap_pages`
+      restructured to PG's arm order (plain M-L single-scan unconditionally;
+      cache-aware form only under `loop_count > 1`), and PG's generation guard
+      added (`buildOneBitmapPath` declines with no index quals — goopg's
+      clause-less full-table bitmaps flipped 13/21 plans the moment the double
+      charge stopped over-pricing them, with broken execution to match).
+- [x] Gates: 21/21 byte-identical, optimizer+executor green, census
+      {q08,q11,q20,q21} vs PG {q02,q11,q17,q20,q21}. One plan changed (q08
+      customer → bitmap): cost-honest but 1.7s vs 0.9s — recorded, not hidden.
+- [ ] **Q2 open question MOVED one level up**: bitmap 52.07 now beats index
+      54.73 and both survive addPath, yet the plan keeps the index — the
+      decision happens in `addNLIPaths`' join costing (memoize wrapping /
+      rescan totals / outer rows=5 startup-vs-total tradeoff). Instrument the
+      JOIN candidates for that joinrel next, per §14.4 one level up.
+- [ ] q08's customer bitmap: cost-honest per the model but slower (1.7s vs
+      0.9s) and not PG's node (PG's join order probes customer_pk). Likely the
+      same loop-count/rescan residual as the Q2 question; revisit together.
 
 ## Cross-cutting
 

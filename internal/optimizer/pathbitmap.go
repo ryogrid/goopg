@@ -138,6 +138,21 @@ func (s *searchCtx) buildOneBitmapPath(
 	conjuncts := extractFilterConjuncts(leaf)
 	indexClauses, qualSelectivity := matchBitmapIndexQuals(idx, tbl, conjuncts, id)
 
+	// PG builds a bitmap path only FROM index clauses: `get_index_paths`
+	// (indxpath.c) collects into `bitindexpaths` the paths `build_index_paths`
+	// made from the clause set (or a proven partial-index predicate), and a
+	// clause-less full-table bitmap is never generated at all. goopg used to
+	// build one for every index and rely on the cost model to reject it —
+	// "they lose to seq scan in add_path" — which held only while
+	// `costBitmapHeapScan` double-charged the index side. The moment that
+	// oracle-verified duplicate was removed, full-table bitmaps beat the seq
+	// scan on every table with a non-trivial filter (the bitmap side pays no
+	// qual-eval CPU) and 13 of 21 TPC-H plans flipped to a shape PG cannot
+	// produce. Generation, not costing, is PG's guard — so it is goopg's too.
+	if len(indexClauses) == 0 && partialPredicate == nil {
+		return nil
+	}
+
 	// Index geometry — same as the regular index scan cost model.
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
 

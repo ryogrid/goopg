@@ -139,22 +139,31 @@ func TestCostBitmapHeapScan_Components(t *testing.T) {
 		t.Errorf("startup = %v, want 50", cost.Startup)
 	}
 
-	// Total = startup + runCost + indexCost.Total
+	// Total = startup + runCost, and startup ALREADY holds indexCost.Total.
 	// runCost = pageCost * pagesFetched + cpuTupleCost * tuplesFetched
 	//
 	// pageCost is PG's, verbatim (cost_bitmap_heap_scan, costsize.c:1071):
 	//   random - (random - seq) * sqrt(pages_fetched / T)
 	//         = 4 - 3*sqrt(0.1) ≈ 4 - 0.9487 = 3.0513
 	// runCost ≈ 3.0513*100 + 0.01*500 = 305.13 + 5 = 310.13
-	// Total   ≈ 50 + 310.13 + 50 = 410.13
+	// Total   ≈ 50 + 310.13 = 360.13
 	//
-	// This expectation previously encoded `sqrt*random + (1-sqrt)*seq`, which is
-	// PG's interpolation RUN BACKWARDS — it approaches sequential cost as the
-	// touched fraction SHRINKS. The test therefore pinned the defect, and it is
-	// worth noting which direction the error ran: a small fraction (here 10%)
-	// came out too CHEAP, and a large one too EXPENSIVE. The large-fraction end
-	// is what kept TPC-H Q2's `supplier` bitmap at 2588.7 against PG's 43.46.
-	wantTotal := 50.0 + (4-3*math.Sqrt(0.1))*100 + 0.01*500 + 50.0
+	// This expectation has now pinned TWO defects in turn, which is worth
+	// recording as a property of the test rather than of either bug:
+	//
+	//  1. It first encoded `sqrt*random + (1-sqrt)*seq` — PG's interpolation
+	//     RUN BACKWARDS, approaching sequential cost as the touched fraction
+	//     SHRINKS. That kept Q2's `supplier` bitmap at 2588.7 vs PG's 43.46.
+	//  2. It then encoded `+ indexCost.Total` a SECOND time, from a comment
+	//     asserting PG does the same. PG does not: `cost_bitmap_heap_scan` ends
+	//     `path->total_cost = startup_cost + run_cost` with `indexTotalCost`
+	//     already inside `startup_cost`. That duplicate is what kept the same
+	//     `supplier` bitmap at 66.42 vs PG's 43.46 after (1) was fixed.
+	//
+	// Both times the expectation was derived from the implementation, so it
+	// agreed with it perfectly and could not have caught either. The figure
+	// below is derived from the ORACLE's assembly instead.
+	wantTotal := 50.0 + (4-3*math.Sqrt(0.1))*100 + 0.01*500
 	if math.Abs(cost.Total-wantTotal) > 1e-9 {
 		t.Errorf("Total = %v, want ~%v", cost.Total, wantTotal)
 	}
