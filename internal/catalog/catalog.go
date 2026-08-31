@@ -103,6 +103,28 @@ func (c *InMemory) relAllVisibleCell(t *Table) string {
 	return relAllVisibleFor(dbOid, relOID)
 }
 
+// RelAllVisible reports the relation's VM-derived all-visible BLOCK COUNT
+// (pg_class.relallvisible) as a number, for callers that compute with it: the
+// planner's `baserel->allvisfrac`, the term that makes an index-only scan
+// cheaper than an index scan (`relAllVisibleFraction`,
+// internal/optimizer/pathindexonly.go). Returns 0 when no VM hook is wired,
+// which prices an index-only scan at exactly what the equivalent index scan
+// costs — the safe direction.
+func RelAllVisible(t *Table) int32 {
+	if t == nil || RelAllVisibleFunc == nil {
+		return 0
+	}
+	dbOid := DefaultDBOid
+	if t.DBOid != 0 {
+		dbOid = t.DBOid
+	}
+	relOID := t.OID
+	if t.RelFileNodeOID != 0 {
+		relOID = t.RelFileNodeOID
+	}
+	return RelAllVisibleFunc(dbOid, relOID)
+}
+
 func relAllVisibleFor(dbOid, relOid uint32) string {
 	if RelAllVisibleFunc == nil {
 		return "0"

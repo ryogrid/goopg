@@ -82,6 +82,13 @@ type indexScanInputs struct {
 	// is what lets the join arm keep multiplying by the outer row count without
 	// double-counting.
 	loopCount float64
+
+	// indexOnly / allVisFrac are `cost_index`'s `indexonly` argument and
+	// `baserel->allvisfrac`. See `heapPagesAfterVM`. Zero values give exactly
+	// the pre-existing behaviour, so every caller that does not set them is
+	// costing a plain index scan as before.
+	indexOnly  bool
+	allVisFrac float64
 }
 
 // costIndexScan is `cost_index` (costsize.c:520) for a single, non-parallel,
@@ -123,6 +130,7 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
 		// unlike the single-scan arm below there is no seq_page_cost term in
 		// either bound.
 		pagesFetched := indexPagesFetched(tuplesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
+		pagesFetched = in.heapPagesAfterVM(pagesFetched)
 		maxIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
 
 		// The correlated bound applies the same formula one level up, at PAGE
@@ -130,15 +138,17 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
 		// pages, and caching across scans is what Mackert-Lohman then estimates.
 		pagesFetched = math.Ceil(in.selectivity * float64(in.relPages))
 		pagesFetched = indexPagesFetched(pagesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
+		pagesFetched = in.heapPagesAfterVM(pagesFetched)
 		minIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
 	} else {
 		// max_IO_cost: the perfectly uncorrelated case (csquared = 0).
 		pagesFetched := indexPagesFetched(tuplesFetched, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
+		pagesFetched = in.heapPagesAfterVM(pagesFetched)
 		maxIOCost = pagesFetched * cp.randomPageCost * indexProbeCostMultiplier
 
 		// min_IO_cost: the perfectly correlated case (csquared = 1). One random
 		// fetch, then sequential ones.
-		if correlatedPages := math.Ceil(in.selectivity * float64(in.relPages)); correlatedPages > 0 {
+		if correlatedPages := in.heapPagesAfterVM(math.Ceil(in.selectivity * float64(in.relPages))); correlatedPages > 0 {
 			minIOCost = cp.randomPageCost * indexProbeCostMultiplier
 			if correlatedPages > 1 {
 				minIOCost += (correlatedPages - 1) * cp.seqPageCost
@@ -379,4 +389,31 @@ func indexTupleWidth(idx *catalog.Index, tbl *catalog.Table) int {
 		w = 8
 	}
 	return indexTupleHeaderBytes + w + linePointerBytes
+}
+
+// heapPagesAfterVM is `cost_index`'s index-only reduction (costsize.c:589-596):
+//
+//	if (indexonly)
+//	    pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+//
+// An index-only scan still visits the heap for any page the visibility map
+// does not mark all-visible, so the saving is the all-visible FRACTION and
+// nothing more: on a never-vacuumed table `allVisFrac` is 0 and an index-only
+// scan costs exactly what the equivalent index scan costs — the preference is
+// earned from the visibility map, not granted. Applied at every one of
+// `cost_index`'s four `pages_fetched` sites because PG applies it to the PAGE
+// COUNT and the two IO bounds derive from that count with different per-page
+// prices (M0134-0187, DESIGN §15).
+func (in indexScanInputs) heapPagesAfterVM(pages float64) float64 {
+	if !in.indexOnly {
+		return pages
+	}
+	frac := in.allVisFrac
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	return math.Ceil(pages * (1 - frac))
 }

@@ -890,16 +890,16 @@ section D. Recorded because the gate run is where they became visible.
       (createplanroot.go:194) requires the search root to publish EVERY binding
       coordinate in `[base, base+width)`, whether the enclosing tree reads it or
       not. Narrowing a base rel leaves holes and it panics at plan time.
-- [ ] **Next for Q16**: a partial search-root boundary plus renumbering of the
-      ENCLOSING tree's ColumnRefs — the needed-set question one level up, at a
-      point where `planSelect` has not built the parent yet. This is the real
-      cost of the feature; §15.1's code reading missed it because
-      `baseRelLayout` and `boundaryMap` live in different files.
-- [ ] **Next for Q13, and it is a DIFFERENT blocker**: Q13 never reaches the
-      join search at all. Its inner subquery has no `WHERE`, so there is no
-      `*Filter` for the seam at `planner.go:1206` to match and
-      `addBaseRelIndexPaths` is never called. Widen the seam first; no amount of
-      path work reaches Q13 until then.
+- [x] **Q16 LANDED (DESIGN §21)**: the "renumber the enclosing tree" framing
+      was wrong — a licensed boundary hole is PADDED with a typed NULL (the
+      needed set proves nothing reads it), positions stay aligned, and both
+      totality tripwires stay loud for unlicensed holes. Q16 = PG's
+      `Index Only Scan using partsupp_pk`, byte-identical, won on a real
+      `allvisfrac` = 1.0.
+- [ ] **Q13's blocker is the seam, confirmed separate**: its inner subquery
+      has no `WHERE`, so no `*Filter` exists for the join-search seam to
+      match — the search never runs for it. Widen the seam to filterless FROM
+      trees; the index-only machinery then serves it unchanged.
 - [x] Correct `relsize.go:424` — "goopg has no visibility map for the planner to
       read" is stale. `catalog.RelAllVisibleFunc` is wired in
       `initdb/open.go:2525`, and `relallvisible == relpages` on every TPC-H

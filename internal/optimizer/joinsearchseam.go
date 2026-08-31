@@ -327,6 +327,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// node does not exist yet at this point in `planSelect` (see
 		// `searchTupleFraction`).
 		tupleFraction: ctx.tupleFraction,
+		// The statement's needed-column set (pathindexonlyneed.go), computed
+		// once in `planSelect` — the only frame holding the
+		// *parser.SelectStmt; the search boundary sees resolved nodes only.
+		neededCols:      ctx.neededCols,
+		neededColsKnown: ctx.neededColsKnown,
 		// joinInfoList is root->join_info_list from jointree deconstruction,
 		// consumed by join_is_legal/joinOrderRestricted/hasJoinRestriction
 		// inside the search (M0128-P1.2).

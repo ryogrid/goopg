@@ -381,6 +381,13 @@ type resolveContext struct {
 	// the first rel exists. 0 (fetch everything) in every context that is not
 	// a top-level FROM clause. M0127-P5.9-b; see `searchTupleFraction`.
 	tupleFraction float64
+
+	// neededCols / neededColsKnown: the statement's needed-column set,
+	// computed once per `planSelect` (pathindexonlyneed.go) and handed to the
+	// join-order search so `addIndexOnlyPaths` can answer `check_index_only`
+	// and the search boundary can license padded holes (M0134-0187).
+	neededCols      map[string]bool
+	neededColsKnown bool
 }
 
 type rangeBinding struct {
@@ -1183,6 +1190,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// fraction is derived from the unresolved clauses; see
 			// `searchTupleFraction` for why they are not resolved early.
 			ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
+			ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 			if unnestPreDPEnabled() && whereEligibleForPreDPUnnest(pred) {
 				// S5a (D3.1): pull up sublinks BEFORE join-order
 				// search — matching upstream's pull_up_sublinks-

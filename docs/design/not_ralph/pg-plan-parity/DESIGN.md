@@ -1769,3 +1769,47 @@ That closes the M0134-0185/0186 sweep at SEVEN bitmap-blind switches:
 `nliInnerProbe`. Every one was written when "scan" meant `*IndexScan`, and
 each failed differently: wrong results, lost lowering, lost decorrelation, a
 588x execution blowup. The census could see none of them.
+
+## 21. Q16 LANDED — the boundary hole is PADDED, not renumbered
+
+§15.4 scoped the index-only blocker as "a partial search-root boundary plus
+renumbering the ENCLOSING tree", and that framing was wrong about the second
+half. `boundaryMap`'s totality is an ASSERTION, not a semantic need: the
+enclosing tree provably never reads a pruned column, because the needed set
+over-approximates STATEMENT-WIDE by construction (`pathindexonlyneed.go` —
+every name any clause anywhere reads, else `known=false` and no path is
+offered). So a hole does not need the tree renumbered around it; it needs a
+placeholder that keeps every position aligned.
+
+The whole §15 implementation was re-applied unchanged, plus one new piece:
+
+- `createPlanAtSearchRootRange` takes a hole-filler. For a missing binding
+  coordinate the filler answers with the pruned column's `SchemaColumn` WHEN —
+  and only when — that column is provably outside the statement's needed set
+  (`searchOneProblem` builds it from the problem's own leaf schemas). The
+  boundary Project then publishes a typed NULL at that position: same width,
+  same positions, nothing renumbered, and the value is never dereferenced.
+- An UNLICENSED hole still panics with the original message, and
+  `assertBoundaryProjectionIntact` admits exactly one non-ColumnRef target
+  shape (`*NullConst`) — the totality tripwire stays loud for real producer
+  bugs on both the producer and consumer side.
+
+Result: Q16 selects **`Index Only Scan using partsupp_pk`** — PG's node — with
+byte-identical output. Chosen on cost: `allvisfrac` is the real 1.0 from the
+visibility map, so `heapPagesAfterVM` removes the heap side entirely and the
+covering scan beats the seq scan on merit (the §15.4 trace already showed the
+margin: 45336 vs 61282).
+
+Timed on fresh equal-age servers: q16 0.9s → 1.6s. The delta is
+parallelism, not the access method: PG runs this node as a *Parallel* Index
+Only Scan across 4 workers, while goopg's index-only path is serial-only (the
+`PartialPathlist` half §15.3 flagged as the risk to defer). The node is PG's,
+the choice is cost-honest, and the residual is a known, named gap rather than
+a mystery — recorded here instead of hidden.
+
+**Q13 remains, and its blocker is the one §15.4 named as separate**: its inner
+subquery has no WHERE clause, so no `*Filter` exists for the join-search seam
+at `planner.go` to match — the search never runs and no path of any kind is
+generated for it. That is a seam-widening item (run the search for filterless
+FROM trees), not an index-only item; the path machinery this section landed
+will serve it unchanged the day the seam reaches it.

@@ -164,6 +164,16 @@ type Path struct {
 	IndexScanDir ScanDirection
 	IndexClauses []indexPathClause
 
+	// IndexOnly marks this path as PG's T_IndexOnlyScan rather than
+	// T_IndexScan (`create_index_path`'s `indexonly` argument). PG carries the
+	// distinction on the pathtype of the SAME IndexPath struct rather than in
+	// a separate node, and so does this. IndexOnlyCovered is the column list
+	// the scan emits, in INDEX-COLUMN order — a subset of the table's columns,
+	// which is what makes the node narrower than the leaf it replaces;
+	// `baseRelLayout` re-bases it by name (M0134-0187).
+	IndexOnly        bool
+	IndexOnlyCovered []catalog.Column
+
 	// MemoizeInfo is the `MemoizePath`-only payload (M0127-P5.4b-ii-b-2): the
 	// entry-count estimate `cost_memoize_rescan` computed on the way to the
 	// rescan cost, and that rescan cost itself. It is nil for every other kind,

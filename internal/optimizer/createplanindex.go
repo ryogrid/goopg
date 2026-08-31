@@ -330,6 +330,53 @@ func createIndexScanPlan(p *Path) Node {
 	if p.IndexScanDir != ForwardScanDirection {
 		panic(fmt.Sprintf("createPlan: PathIndexScan with %s; goopg's *IndexScan has no direction to set", p.IndexScanDir))
 	}
+	// M0134-0187: an index-only path emits only the columns its index covers,
+	// so it builds a different node with a NARROWER schema. It carries no
+	// index clauses (a full index scan); `baseRelLayout` re-bases the
+	// narrowed output by name and the search boundary pads what was pruned —
+	// see DESIGN §15/§21.
+	if p.IndexOnly {
+		if len(p.IndexOnlyCovered) == 0 {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s covers no columns", p.IndexInfo.Name))
+		}
+		if len(p.IndexClauses) != 0 {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries %d index clauses; the producer builds a full index scan",
+				p.IndexInfo.Name, len(p.IndexClauses)))
+		}
+		// Schema entries are COPIED from the leaf's own schema rather than
+		// synthesised: `SchemaColumn` carries a `SourceTableIdx` the leaf has
+		// already resolved, and `baseRelLayout` re-bases these positions by
+		// name against that same leaf schema, so the two agree by
+		// construction.
+		schema := make(Schema, 0, len(p.IndexOnlyCovered))
+		for _, c := range p.IndexOnlyCovered {
+			at := -1
+			for j := range id.schema {
+				if id.schema[j].Name == c.Name {
+					at = j
+					break
+				}
+			}
+			if at < 0 {
+				panic(fmt.Sprintf("createPlan: index-only scan on %s covers column %q, which the leaf schema does not have",
+					p.IndexInfo.Name, c.Name))
+			}
+			schema = append(schema, id.schema[at])
+		}
+		// `rewrap` would reinstate a leaf-local `*Filter` whose ColumnRefs are
+		// written against the FULL leaf schema; the producer refuses a
+		// non-bare leaf precisely so there is nothing to reinstate.
+		return &IndexOnlyScan{
+			pos:                   id.pos,
+			Table:                 id.table,
+			Index:                 p.IndexInfo,
+			Covered:               append([]catalog.Column(nil), p.IndexOnlyCovered...),
+			schema:                schema,
+			PrivilegeCheckRole:    id.privilegeCheckRole,
+			PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
+		}
+	}
+
 	ncols := len(p.IndexInfo.Columns)
 	switch {
 	case len(p.IndexClauses) == 0:

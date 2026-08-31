@@ -109,6 +109,13 @@ type joinlistProblem struct {
 	// tupleFraction is the query's `root->tuple_fraction`, applied to the
 	// TOP-level problem only (see makeRelFromJoinlist).
 	tupleFraction float64
+
+	// neededCols / neededColsKnown carry the statement's needed-column set to
+	// `searchCtx` (pathindexonlyneed.go) and to the boundary hole-filler.
+	// Every sub-problem of one statement shares it: the set is a property of
+	// the STATEMENT, not of a FROM subset.
+	neededCols      map[string]bool
+	neededColsKnown bool
 }
 
 // joinlistRel is what a joinlist item resolves to: goopg's stand-in for the
@@ -328,6 +335,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
+	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
 	s.addBaseRelIndexPaths(prob.cat)
 	if _, err := s.joinSearch(s.clauses, newJoinRelBuilder(s, prob.cat)); err != nil {
 		return joinlistRel{}, err
@@ -337,7 +345,31 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		return joinlistRel{}, err
 	}
 	return joinlistRel{
-		node: createPlanAtSearchRootRange(p, base, width),
+		// The hole-filler licenses a PADDED boundary slot for exactly the
+		// coordinates a narrowed index-only leaf legitimately dropped: the
+		// column must be provably outside the statement's needed set. Any
+		// other hole still panics — the totality assertion stays loud for
+		// real producer bugs (M0134-0187, DESIGN §21).
+		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
+			if !prob.neededColsKnown {
+				return SchemaColumn{}, false
+			}
+			for i := range items {
+				if coord >= cum[i] && coord < cum[i+1] {
+					leafSchema := scans[i].Output()
+					pos := coord - cum[i]
+					if pos < 0 || pos >= len(leafSchema) {
+						return SchemaColumn{}, false
+					}
+					col := leafSchema[pos]
+					if col.Name == "" || prob.neededCols[col.Name] {
+						return SchemaColumn{}, false
+					}
+					return col, true
+				}
+			}
+			return SchemaColumn{}, false
+		}),
 		// The searched tree enters the enclosing problem as a leaf at the first
 		// coordinate it publishes. Nothing else of the sub-problem crosses:
 		// `info` is deliberately table-less so that every producer that assumes
