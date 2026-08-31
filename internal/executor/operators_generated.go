@@ -211,6 +211,34 @@ func evalGenFuncCall(x *parser.FuncCall, cols []catalog.Column, row Row, dbOid .
 		}
 		return NullDatum, nil
 	}
+	// M0134-0187: nullif/coalesce joined the whitelist because generated_stored.sql's
+	// NOT-NULL-generated-column cases use `GENERATED ALWAYS AS (nullif(a, 0)) STORED
+	// NOT NULL` — this evaluator previously fell through to the trailing
+	// `return NullDatum, nil` for any unrecognised function, which is
+	// indistinguishable here from a legitimately NULL result and left the
+	// generated column NULL even when the expression could evaluate cleanly
+	// (evalExprSlot's "nullif"/"coalesce" cases in expr.go are the reference
+	// implementation this mirrors).
+	if fn == "nullif" && len(x.Args) == 2 {
+		a, err1 := evalGenExpr(x.Args[0], cols, row, dbOid...)
+		b, err2 := evalGenExpr(x.Args[1], cols, row, dbOid...)
+		if err1 != nil || err2 != nil {
+			return NullDatum, nil
+		}
+		if !a.IsNull() && !b.IsNull() && a.Format() == b.Format() {
+			return NullDatum, nil
+		}
+		return a, nil
+	}
+	if fn == "coalesce" {
+		for _, arg := range x.Args {
+			v, err := evalGenExpr(arg, cols, row, dbOid...)
+			if err == nil && !v.IsNull() {
+				return v, nil
+			}
+		}
+		return NullDatum, nil
+	}
 	if fn == "nextval" && len(x.Args) == 1 {
 		argVal, err := evalGenExpr(x.Args[0], cols, row, dbOid...)
 		if err != nil || argVal.Kind != KindString {

@@ -10460,11 +10460,17 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 	// planInsert's 42601 diagnostic rather than be silently DEFAULT-padded.
 	explicitColCount := 0
 	if len(s.Columns) == 0 {
+		// M0134-0187: the implicit column list includes GENERATED ALWAYS AS
+		// … STORED columns too, matching PostgreSQL's checkInsertTargets
+		// (postgres/src/backend/parser/parse_target.c), which does not
+		// filter attgenerated columns out of the default target list at
+		// all. A generated column's cell may still only be DEFAULT (or
+		// simply omitted, when the row is shorter than the column count) —
+		// enforced by the "cannot insert a non-DEFAULT value" check in the
+		// row loop below; the value itself is always recomputed by
+		// computeGeneratedColumns regardless of what lands in the slot.
 		colIndex = make([]int, 0, len(tbl.Columns))
-		for i, col := range tbl.Columns {
-			if col.GeneratedAlways {
-				continue
-			}
+		for i := range tbl.Columns {
 			colIndex = append(colIndex, i)
 		}
 	} else {
@@ -10553,10 +10559,25 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 			return nil
 		}
 		for i, e := range r {
+			tgt := colIndex[i]
 			if _, ok := e.(*parser.DefaultMarker); !ok {
+				// M0134-0187: a GENERATED ALWAYS AS … STORED column may only
+				// ever be assigned DEFAULT — PostgreSQL's rewriteHandler.c
+				// (ExecComputeStoredGenerated / the values_rte "cannot insert
+				// a non-DEFAULT value" check) rejects any other value,
+				// including a literal that happens to match the computed
+				// result. colIndex now carries generated ordinals (see
+				// above), so a real expression can land here.
+				if tbl.Columns[tgt].GeneratedAlways {
+					return &PlanError{
+						Pos:     e.Pos(),
+						Code:    "428C9",
+						Message: fmt.Sprintf("cannot insert a non-DEFAULT value into column %q", tbl.Columns[tgt].Name),
+						Detail:  fmt.Sprintf("Column %q is a generated column.", tbl.Columns[tgt].Name),
+					}
+				}
 				continue
 			}
-			tgt := colIndex[i]
 			r[i] = defaultMarkerReplacement(tbl, tgt)
 		}
 	}
@@ -10662,8 +10683,16 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		tbl = base
 	}
 	// Map source-row column index -> target table column ordinal.
-	// Generated columns are excluded from the mapping when no explicit
-	// column list is provided — they are computed by the executor. M0096-0008.
+	// For an INSERT … SELECT with no explicit column list, generated
+	// columns are excluded from the mapping — they are computed by the
+	// executor, and (unlike the VALUES form) a SELECT-sourced cell has no
+	// DEFAULT spelling to legitimately target one with. M0096-0008. For a
+	// VALUES-sourced INSERT, generated columns ARE included (M0134-0187):
+	// rewriteInsertDefaultMarkers built its own colIndex the same way and
+	// already rejected any row supplying a real value there, so by the time
+	// planInsert runs every generated-column cell is a harmless DEFAULT
+	// stand-in that computeGeneratedColumns overwrites — the two colIndex
+	// derivations must stay in lockstep (see that function's doc comment).
 	// For a view target, the source-row order is the VIEW's own column
 	// order (outerColMap), not base's physical order — root-0025 deferred
 	// item 1 (a view may subset/reorder/rename base's columns).
@@ -10672,7 +10701,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		if resolveTbl != nil {
 			colIndex = make([]int, 0, len(outerColMap))
 			for _, baseOrd := range outerColMap {
-				if tbl.Columns[baseOrd].GeneratedAlways {
+				if s.Select != nil && tbl.Columns[baseOrd].GeneratedAlways {
 					continue
 				}
 				colIndex = append(colIndex, baseOrd)
@@ -10680,8 +10709,8 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		} else {
 			colIndex = make([]int, 0, len(tbl.Columns))
 			for i, col := range tbl.Columns {
-				if col.GeneratedAlways {
-					continue // skip generated columns; executor fills them in
+				if s.Select != nil && col.GeneratedAlways {
+					continue // SELECT form only: skip generated columns; executor fills them in
 				}
 				colIndex = append(colIndex, i)
 			}

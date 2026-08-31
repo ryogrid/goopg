@@ -2692,6 +2692,17 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			row = newRow
 		}
 
+		// Compute generated columns (GENERATED ALWAYS AS … STORED). Must run
+		// AFTER before-insert triggers (which see the pre-generation row, same
+		// as upstream ExecBRInsertTriggers before ExecComputeStoredGenerated)
+		// and BEFORE any constraint enforcement below — NOT NULL/CHECK on a
+		// generated column must see its computed value, not the placeholder
+		// NULL left by the DEFAULT-marker substitution. Moved up from just
+		// before partition routing (M0134-0187); still runs before routing,
+		// since PARTITION BY may key on a generated column's value.
+		// M0096-0008.
+		_ = computeGeneratedColumns(cols, row)
+
 		// NOT NULL constraint enforcement.
 		// For partitioned tables, defer until after routing so the error names
 		// the leaf partition (matches PG behavior).
@@ -2736,9 +2747,6 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// so that violation MESSAGEs name the leaf partition (matches upstream
 		// PG; M0100-0005m).  Parent's FK definitions apply to routed inserts.
 		targetRel := rel
-		// Compute generated columns (GENERATED ALWAYS AS … STORED) before writing.
-		// M0096-0008.
-		_ = computeGeneratedColumns(cols, row)
 
 		var routedPart *catalog.Table
 		if isPartitioned {

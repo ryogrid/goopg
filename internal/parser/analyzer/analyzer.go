@@ -3180,20 +3180,16 @@ func lookupColumn(tbl *catalog.Table, name string) (*catalog.Column, bool) {
 
 func resolveInsertTargetColumns(tbl *catalog.Table, cat catalog.Catalog, s *parser.InsertStmt) ([]catalog.Column, error) {
 	if len(s.Columns) == 0 {
-		// Skip GENERATED ALWAYS AS … STORED columns — they are computed by
-		// the executor, not supplied by the INSERT statement. M0096-0008.
-		out := make([]catalog.Column, 0, len(tbl.Columns))
-		for _, col := range tbl.Columns {
-			if col.GeneratedAlways {
-				continue
-			}
-			out = append(out, col)
-		}
-		if len(out) == len(tbl.Columns) {
-			// No generated columns — return all columns for backward compat.
-			return append([]catalog.Column(nil), tbl.Columns...), nil
-		}
-		return out, nil
+		// M0134-0187: the implicit target-column list includes GENERATED
+		// ALWAYS AS … STORED columns, matching planInsert/
+		// rewriteInsertDefaultMarkers's colIndex for this same (VALUES-row)
+		// form — this function is only reached for that form, since
+		// analyzeInsert returns early for s.Select != nil before calling it.
+		// A generated column's cell is guaranteed by that point to be a
+		// harmless DEFAULT-derived value (NULL or resolved DefaultExpr);
+		// rewriteInsertDefaultMarkers already rejected any row supplying a
+		// real value for one before the analyzer ever ran. M0096-0008.
+		return append([]catalog.Column(nil), tbl.Columns...), nil
 	}
 	out := make([]catalog.Column, 0, len(s.Columns))
 	for _, name := range s.Columns {
