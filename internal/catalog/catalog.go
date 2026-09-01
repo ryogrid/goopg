@@ -4791,6 +4791,39 @@ func AccessibleInheritanceChildren(children []*Table, sessionTempOwner string) [
 	return out
 }
 
+// tablesByChildOIDs resolves a child-OID list to *Table values in ONE pass over
+// the namespace, preserving the order of oids and dropping the ones that have
+// no table.
+//
+// review/260831 CA-1/CA-2: InheritanceChildren and PartitionChildren used to
+// scan the whole namespace once PER CHILD — O(children x tables) — and both sit
+// on per-statement paths (FK enforcement walks the children of every child
+// table, partition routing walks them per row). Callers must hold c.mu.
+func (c *InMemory) tablesByChildOIDs(oids []uint32, dbOid uint32) []*Table {
+	pos := make(map[uint32]int, len(oids))
+	for i, oid := range oids {
+		pos[oid] = i
+	}
+	slots := make([]*Table, len(oids))
+	found := 0
+	for _, t := range c.ns(dbOid).tables {
+		if i, ok := pos[t.OID]; ok && slots[i] == nil {
+			slots[i] = t
+			found++
+			if found == len(oids) {
+				break
+			}
+		}
+	}
+	out := make([]*Table, 0, found)
+	for _, t := range slots {
+		if t != nil {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // InheritanceChildren returns the direct inheritance children of parentOID.
 // Returns nil if the table has no inheritance children. M0096-0009.
 func (c *InMemory) InheritanceChildren(parentOID uint32, dbOid ...uint32) []*Table {
@@ -4800,16 +4833,7 @@ func (c *InMemory) InheritanceChildren(parentOID uint32, dbOid ...uint32) []*Tab
 	if len(children) == 0 {
 		return nil
 	}
-	out := make([]*Table, 0, len(children))
-	for _, oid := range children {
-		for _, t := range c.ns(resolveDBOid(dbOid)).tables {
-			if t.OID == oid {
-				out = append(out, t)
-				break
-			}
-		}
-	}
-	return out
+	return c.tablesByChildOIDs(children, resolveDBOid(dbOid))
 }
 
 // PartitionChildren returns the OIDs of partition children for a partitioned table.
@@ -4821,16 +4845,7 @@ func (c *InMemory) PartitionChildren(parentOID uint32, dbOid ...uint32) []*Table
 	if len(children) == 0 {
 		return nil
 	}
-	out := make([]*Table, 0, len(children))
-	for _, oid := range children {
-		for _, t := range c.ns(resolveDBOid(dbOid)).tables {
-			if t.OID == oid {
-				out = append(out, t)
-				break
-			}
-		}
-	}
-	return out
+	return c.tablesByChildOIDs(children, resolveDBOid(dbOid))
 }
 
 // RegisterPartitionChild registers tbl (OID childOID) as a partition of parentOID.
