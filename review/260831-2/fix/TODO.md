@@ -30,8 +30,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 |---|---|---|---|---|---|
 | EO2-1 | high | `executor/operators_indexonly.go:Rescan` — LowOp/HighOp strictness ignored, bounds always inclusive | BUG | [x] | `5360b7e79` |
 | ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | ? | [ ] | |
-| NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | BUG | [x] | see progress log |
-| ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | ? | [ ] | |
+| NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | BUG | [x] | `dafe96692` |
+| ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | BUG | [x] | see progress log |
 | ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | ? | [ ] | |
 | TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | ? | [ ] | |
 | CP-1 | high | `postmaster/txn_verb.go:applyTransactionVerb` — DDL in a failed block survives COMMIT-as-ROLLBACK | ? | [ ] | |
@@ -173,3 +173,15 @@ landed.
   before the `continue`. Guard: `TestVacuumTailTruncationKeepsVMSkippedBlocks`
   (3 all-visible live blocks + 1 genuinely empty tail block; nblocks must be 3,
   was 0 before the fix).
+
+- 2026-09-01 **ST-1 = BUG (fixed).** `ReadFSMFork` reconstructed the FSM tree by
+  walking BACKWARDS from the root with `need = ceil(levelCount/fsmSlotsPerPage)`,
+  which evaluates to 1 at every step — so it always concluded the file had
+  exactly one leaf page. `buildFSMTree` writes level 0 first and the root last,
+  so for any relation over `fsmSlotsPerPage` (4069) heap blocks every free-space
+  entry from block 4069 onward was silently dropped on load, and the leaf offset
+  it computed was wrong as well. Fix: leaves start at offset 0, and the leaf
+  COUNT is recovered forward (total pages is strictly increasing in the leaf
+  count, so scan for the count whose tree is exactly this file); a file matching
+  no leaf count is now a hard error rather than a silent partial read. Guard:
+  `TestFSMForkRoundTripBeyondOneLeafPage` (fsmSlotsPerPage+100 blocks).
