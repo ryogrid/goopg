@@ -298,14 +298,24 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
-	case "timestamp":
+	case "timestamp", "timestamptz":
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
-		return encodeTimestampBinary(d.TimeValue().UTC()), nil
-	case "timestamptz":
-		if d.Kind != KindTime {
-			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		// The ±infinity sentinels ship PG's DT_NOEND / DT_NOBEGIN wire value
+		// (PG_INT64_MAX / PG_INT64_MIN micros, timestamp_send) — the heap
+		// encode arm in codec.go already does this and the two must agree
+		// (Hard-won Rule #2). Without the intercept the KindTime carrier's
+		// INT64-extreme nanoseconds fall through TimeValue() and ship a
+		// finite ~year-2262 instant. (review/260831-2 EC-7)
+		if d.IsTimestampNotFinite() {
+			b := make([]byte, 8)
+			sentinel := int64(math.MinInt64)
+			if d.IsTimestampPosInf() {
+				sentinel = math.MaxInt64
+			}
+			binary.BigEndian.PutUint64(b, uint64(sentinel))
+			return b, nil
 		}
 		return encodeTimestampBinary(d.TimeValue().UTC()), nil
 	case "time", "time without time zone":
@@ -338,6 +348,18 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 	case "date":
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		// Sibling of the timestamp intercept above: DATEVAL_NOEND /
+		// DATEVAL_NOBEGIN = PG_INT32_MAX / PG_INT32_MIN days (date_send).
+		// (review/260831-2 EC-7)
+		if d.IsTimestampNotFinite() {
+			b := make([]byte, 4)
+			sentinel := int32(math.MinInt32)
+			if d.IsTimestampPosInf() {
+				sentinel = math.MaxInt32
+			}
+			binary.BigEndian.PutUint32(b, uint32(sentinel))
+			return b, nil
 		}
 		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 		days := int32(d.TimeValue().UTC().Truncate(24*time.Hour).Sub(epoch).Hours() / 24)
@@ -538,6 +560,15 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("timestamp: expected 8 bytes, got %d", len(payload))
 		}
 		usec := int64(binary.BigEndian.Uint64(payload))
+		// Decode twin of the encode intercept: timestamp_recv accepts
+		// DT_NOEND / DT_NOBEGIN unchanged, and the epoch arithmetic below
+		// would overflow on them. (review/260831-2 EC-7)
+		switch usec {
+		case math.MaxInt64:
+			return NewTimestampInfinity(true), nil
+		case math.MinInt64:
+			return NewTimestampInfinity(false), nil
+		}
 		ts := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
 		// M0119-0006 (41st slice): the column type is in reach here, so this
 		// decoder owes the same subtype tag the heap decode already applies
@@ -588,6 +619,14 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
 		}
 		days := int32(binary.BigEndian.Uint32(payload))
+		// Decode twin of the encode intercept: date_recv accepts
+		// DATEVAL_NOEND / DATEVAL_NOBEGIN unchanged. (review/260831-2 EC-7)
+		switch days {
+		case math.MaxInt32:
+			return NewDateInfinity(true), nil
+		case math.MinInt32:
+			return NewDateInfinity(false), nil
+		}
 		d := pgEpoch.AddDate(0, 0, int(days))
 		return NewDateDatum(d), nil
 	case "interval":
