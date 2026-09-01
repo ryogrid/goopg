@@ -835,6 +835,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 	for _, scanTbl := range tables {
 		rel := ctx.Catalog.RelFileNode(scanTbl)
 		cols := scanTbl.Columns
+		fkIdx := fkColumnIndexes(cols, fk.Columns)
 		nBlocks, err := ctx.Pool.NBlocks(rel)
 		if err != nil {
 			continue
@@ -869,7 +870,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 				if err != nil {
 					continue
 				}
-				if fkRowMatches(cols, fk.Columns, row, vals) {
+				if fkRowMatchesAt(fkIdx, row, vals) {
 					victims = append(victims, victim{tbl: scanTbl, blk: blk, slot: slotIdx, row: row})
 				}
 			}
@@ -905,6 +906,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, vals []Datum) error {
 	rel := ctx.Catalog.RelFileNode(childTbl)
 	cols := childTbl.Columns
+	fkIdx := fkColumnIndexes(cols, fk.Columns)
 
 	type pendingUpdate struct {
 		blk    storage.BlockNumber
@@ -947,16 +949,14 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 			if err != nil {
 				continue
 			}
-			if !fkRowMatches(cols, fk.Columns, row, vals) {
+			if !fkRowMatchesAt(fkIdx, row, vals) {
 				continue
 			}
 			newRow := make(Row, len(cols))
 			copy(newRow, row)
-			for _, fkCol := range fk.Columns {
-				for i, c := range cols {
-					if strings.EqualFold(c.Name, fkCol) {
-						newRow[i] = NullDatum
-					}
+			for _, i := range fkIdx {
+				if i >= 0 {
+					newRow[i] = NullDatum
 				}
 			}
 			pending = append(pending, pendingUpdate{blk: blk, slot: slotIdx, newRow: newRow})
@@ -1240,6 +1240,7 @@ func scanRefTableForDetachedPartitionMatch(ctx *Context, im *catalog.InMemory, f
 func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, error) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	cols := tbl.Columns
+	colIdx := fkColumnIndexes(cols, colNames)
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return false, nil // relation may not have blocks yet
@@ -1274,7 +1275,7 @@ func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals [
 			if err != nil {
 				continue
 			}
-			if fkRowMatches(cols, colNames, row, vals) {
+			if fkRowMatchesAt(colIdx, row, vals) {
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return true, nil
@@ -1317,6 +1318,7 @@ type fkPendingRef struct {
 func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, *fkPendingRef, error) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	cols := tbl.Columns
+	colIdx := fkColumnIndexes(cols, colNames)
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return false, nil, nil
@@ -1352,7 +1354,7 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			if err != nil {
 				continue
 			}
-			if !fkRowMatches(cols, colNames, row, vals) {
+			if !fkRowMatchesAt(colIdx, row, vals) {
 				continue
 			}
 			// Matched.  Decide whether to wait on the updater.  For an
@@ -1537,6 +1539,7 @@ func detectInFlightChildInsert(ctx *Context, childTbl *catalog.Table, fkCols []s
 	for _, t := range tables {
 		rel := ctx.Catalog.RelFileNode(t)
 		cols := t.Columns
+		fkIdx := fkColumnIndexes(cols, fkCols)
 		nBlocks, err := ctx.Pool.NBlocks(rel)
 		if err != nil {
 			continue
@@ -1578,7 +1581,7 @@ func detectInFlightChildInsert(ctx *Context, childTbl *catalog.Table, fkCols []s
 				if derr != nil {
 					continue
 				}
-				if fkRowMatches(cols, fkCols, row, vals) {
+				if fkRowMatchesAt(fkIdx, row, vals) {
 					s.RUnlock()
 					ctx.Pool.Unpin(s)
 					return xmin, true
@@ -1666,25 +1669,41 @@ func fkColValues(cols []catalog.Column, fkCols []string, row Row) ([]Datum, bool
 }
 
 // fkRowMatches reports whether a row's named columns equal the given values.
-func fkRowMatches(cols []catalog.Column, fkCols []string, row Row, vals []Datum) bool {
-	if len(fkCols) != len(vals) {
-		return false
-	}
+// fkColumnIndexes resolves FK column NAMES to their positions in cols.
+//
+// review/260831 EO1-11: fkRowMatches did this name match per FK column PER ROW,
+// and its callers run it over every row of a full table scan, so a cascade over
+// an n-row child table did n × len(fkCols) × len(cols) EqualFold comparisons to
+// answer a question that does not change between rows. The resolution is
+// hoisted out of the scan loop; -1 marks a name the table does not have, which
+// is what the old "not found" arm returned false for.
+func fkColumnIndexes(cols []catalog.Column, fkCols []string) []int {
+	idx := make([]int, len(fkCols))
 	for i, name := range fkCols {
-		found := false
+		idx[i] = -1
 		for j, c := range cols {
 			if strings.EqualFold(c.Name, name) {
-				if j >= len(row) {
-					return false
-				}
-				if !datumEquals(row[j], vals[i]) {
-					return false
-				}
-				found = true
+				idx[i] = j
 				break
 			}
 		}
-		if !found {
+	}
+	return idx
+}
+
+// fkRowMatchesAt reports whether row's FK columns (given as PRE-RESOLVED
+// positions, see fkColumnIndexes) all equal vals. A position of -1 — a column
+// name the table does not have — is a non-match, as it was when the name
+// lookup happened inline.
+func fkRowMatchesAt(idx []int, row Row, vals []Datum) bool {
+	if len(idx) != len(vals) {
+		return false
+	}
+	for i, j := range idx {
+		if j < 0 || j >= len(row) {
+			return false
+		}
+		if !datumEquals(row[j], vals[i]) {
 			return false
 		}
 	}
