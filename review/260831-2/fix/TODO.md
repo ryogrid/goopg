@@ -66,8 +66,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | CP-2 | med | `postmaster/dispatch.go:normalizeSQLPreservingLiterals` — plan-cache key collision on quoted identifiers | ? | [ ] | |
 | UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | BUG | [x] | 306709703 |
 | UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | BUG | [x] | 00e35fbab |
-| UT-4 | med | `utils/mmgr/mctx.go:Context.Release` — mutates `c.children` while ranging over it | BUG | [x] | this commit |
-| CM-3 | med | `cmd/plan-snapshot/main.go:planEqual` — `rowsRegexp` never matches the real EXPLAIN format | ? | [ ] | |
+| UT-4 | med | `utils/mmgr/mctx.go:Context.Release` — mutates `c.children` while ranging over it | BUG | [x] | 370100352 |
+| CM-3 | med | `cmd/plan-snapshot/main.go:planEqual` — `rowsRegexp` never matches the real EXPLAIN format | BUG | [x] | this commit |
 
 ## C. Low severity (claimed)
 
@@ -379,3 +379,17 @@ landed.
   parent before releasing it, so the child's removal scan is a no-op.
   Guard: `TestReleaseCascadesToEveryChild`. Gates: units green; pgbench
   smoke green.
+
+- 2026-09-01 **CM-3 = BUG (fixed).** `plan-snapshot`'s `rowsRegexp` was
+  `\s*\(rows=(\d+)\)`, a shape no EXPLAIN ever prints: PG 18.3 emits
+  `Seq Scan on lineitem  (cost=0.00..35.50 rows=2550 width=4)` and goopg
+  emits the same annotation with zeroed costs
+  (operators_explain.go). Nothing was ever stripped or extracted, so the
+  `structural` mode silently behaved exactly like `strict-text` — a cost
+  drift reported a plan DIFFER — and `semantic-cost` compared two empty
+  cost lists, i.e. its ±10% tolerance never ran. The unit tests missed it
+  because they were written against the same invented format; they now use
+  real annotations. Fix: match the whole `(cost=A..B rows=N width=W)`
+  annotation and capture N. Guard:
+  `TestRowsRegexpMatchesRealExplainOutput` (one PG line, one goopg line).
+  Gates: units green; pgbench smoke green.
