@@ -1378,12 +1378,11 @@ func (m *Manager) captureSnapshot() Snapshot {
 
 	// M0100-0002: include ALL aborted XIDs in the snapshot so rolled-back
 	// rows remain invisible even when their xmin falls below Xmin.
+	// review/260831 TA-1: shared, not copied. insertSortedXID is
+	// copy-on-write, so the slice this snapshot observes never changes under
+	// it; snapshots outnumber aborts by orders of magnitude.
 	m.abortedMu.RLock()
-	var aborted []storage.TransactionID
-	if len(m.abortedXIDs) > 0 {
-		aborted = make([]storage.TransactionID, len(m.abortedXIDs))
-		copy(aborted, m.abortedXIDs)
-	}
+	aborted := m.abortedXIDs
 	// M0117-0002: attach the durable commit log (nil unless SetCLog was called)
 	// so the snapshot can fall back to the CLOG for in-window XIDs the in-memory
 	// arrays cannot classify.
@@ -1400,14 +1399,24 @@ func (m *Manager) captureSnapshot() Snapshot {
 	}
 }
 
-// insertSortedXID inserts xid into a sorted slice of XIDs (ascending).
+// insertSortedXID returns a NEW sorted slice with xid inserted (ascending),
+// never mutating s.
+//
+// review/260831 TA-1: it used to shift in place, which forced captureSnapshot
+// to deep-copy abortedXIDs on every snapshot — once per statement, O(aborts)
+// each — just so a later abort could not rewrite an array a live snapshot was
+// reading. Copy-on-write moves that cost to the abort path, which is orders of
+// magnitude rarer, and lets every snapshot share one immutable slice. The
+// arrays are already documented as immutable after capture (see
+// Snapshot.WithCLog / Snapshot.Clone).
 func insertSortedXID(s []storage.TransactionID, xid storage.TransactionID) []storage.TransactionID {
 	idx := sort.Search(len(s), func(i int) bool { return s[i] >= xid })
 	if idx < len(s) && s[idx] == xid {
 		return s // already present
 	}
-	s = append(s, 0)
-	copy(s[idx+1:], s[idx:])
-	s[idx] = xid
-	return s
+	out := make([]storage.TransactionID, len(s)+1)
+	copy(out, s[:idx])
+	out[idx] = xid
+	copy(out[idx+1:], s[idx:])
+	return out
 }
