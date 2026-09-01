@@ -4,7 +4,7 @@ B-tree search descent, page split, dedup consolidation, and WAL redo.
 
 ## Search Descent
 
-````mermaid
+```mermaid
 flowchart TD
     S["BTree.Search(key)"] --> M["pinR: read metapage (block 0)"]
     M --> Root["BtMetaPageData.root<br/>→ root block number"]
@@ -17,11 +17,11 @@ flowchart TD
     LeafScan --> Found{"exact match?"}
     Found -->|yes| Return["ItemPointer + true"]
     Found -->|no| ReturnNull["nil + false"]
-````
+```
 
 ## Page Split
 
-````mermaid
+```mermaid
 flowchart TD
     Ins["BTree.Insert(key, ptr)"] --> Desc["descendToLeaf (pinW)"]
     Desc --> TryFast["tryInsertOnCachedRightmost<br/>monotonic insert fast path"]
@@ -41,11 +41,11 @@ flowchart TD
     NewRoot --> Done
 
     note right of Done: WAL-logged at each mutation step
-````
+```
 
 ## Dedup Consolidation + WAL Redo
 
-````mermaid
+```mermaid
 flowchart TD
     subgraph Dedup Consolidation
         D1["dedupConsolidate(items)"] --> D2["group same-key adjacent items"]
@@ -65,4 +65,4 @@ flowchart TD
     end
 
     note right of D5: Opportunistic; runs before split<br/>so same-key items share a page
-````
+```

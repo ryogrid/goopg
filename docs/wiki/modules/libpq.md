@@ -10,7 +10,7 @@ It is deliberately a **leaf protocol layer**: it knows nothing about SQL,
 catalogs, or execution. Higher layers (`internal/postmaster`) drive the
 connection lifecycle; the executor writes result rows through
 `FrameWriter.DataRow*`; the replication streams use `replication.go`.
-Package total: **4,093 LOC** across 10 production files (4 parent + 6 `auth/`).
+Package total: **4,093 LOC** across 11 production files (4 parent + 7 `auth/`).
 
 ## Key Files
 

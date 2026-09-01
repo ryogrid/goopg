@@ -6,7 +6,7 @@ extended + COPY), and the operator control plane. One goroutine per client
 connection (`serveConn`) is the analogue of one PG backend process, owning the
 active MVCC transaction/snapshot, pinned buffers, WAL inserts, and the
 synchronous-commit flush. The `autovacuum/` subpackage is the ticker-driven
-background vacuum/analyze launcher. **17,296 LOC** in the parent package.
+background vacuum/analyze launcher. **16,770 LOC** in the parent package.
 
 ## Key Files (by LOC)
 

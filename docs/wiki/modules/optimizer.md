@@ -5,7 +5,7 @@ executor plan tree of `Node`s: name/type resolution of expressions, FROM-clause
 and subquery planning, sublink pull-up/unnesting to semi/anti joins, a
 PG-shaped join-order search with cost-based cardinality estimation, plan-node
 construction, and late rewrite passes (NLI conversion, min/max-to-index-scan,
-parallel Gather, PARAM_EXEC lowering). **52,650 LOC** across 100+ `.go` files.
+parallel Gather, PARAM_EXEC lowering). **56,019 LOC** across 90+ `.go` files.
 
 ## Responsibilities
 

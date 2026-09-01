@@ -65,10 +65,10 @@ flowchart TD
 | `vm_fork.go` | 293 | VM fork persistence (`buildVMPage`, `ReadVMFork`, `VMSaveForks`) |
 | `prune.go` | 284 | Page prune: `PagePruneOpt`, `PageVacuumPrune`, HOT redirects, LP_DEAD, dead-tuple sweep |
 | `page.go` | 237 | `PageHeader` accessors (LSN, flags, free space), `RelFileNode`/`BufferTag`, `InitPage` |
-| `vm.go` | 236 | Runtime visibility map: `AllVisible`, `AllFrozen`, `SetAllVisible`, `PageAllVisible`, `CountAllVisible` |
+| `vm.go` | 241 | Runtime visibility map: `AllVisible`, `AllFrozen`, `SetAllVisible`, `PageAllVisible`, `CountAllVisible` |
 | `pageident_probe.go` | 213 | Page-identity probing (identify a page's contents after read) |
 | `fsm.go` | 154 | In-memory FSM: `GetPageWithFreeSpace`, `GetCandidates`, `RecordFreeSpace` |
-| `freeze.go` | 147 | Tuple freeze: `PageFreezeOldTuples`, `PageFreezeBySlots` |
+| `freeze.go` | 152 | Tuple freeze: `PageFreezeOldTuples`, `PageFreezeBySlots` |
 | `checksum.go` | 136 | FNV-1a page checksum (`checksum_impl.h` port), `PageChecksum`, `VerifyPage` |
 | `io_trace.go` | 119 | I/O tracing for benchmarks |
 | `pdlsn_assert.go` | 118 | `GOOPG_PDLSN_ASSERT` runtime guard |

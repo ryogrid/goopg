@@ -5,7 +5,7 @@ evaluation dispatch.
 
 ## Operator Tree Structure
 
-````mermaid
+```mermaid
 classDiagram
     class Operator {
         <<interface>>
@@ -56,11 +56,11 @@ classDiagram
     OpIterator --> OpNode : opOpen / opNext dispatch
     opTreeSlab --> exprTreeSlab : exprs
     OpNode --> exprTreeSlab : exprIdx
-````
+```
 
 ## Fast-Slab vs Legacy Engine
 
-````mermaid
+```mermaid
 flowchart TD
     Node["optimizer.Node"] --> Legacy{"entry point?"}
     Legacy -->|"Build"| L1["buildNode recursive<br/>Operator tree"]
@@ -73,11 +73,11 @@ flowchart TD
     F2 -->|no| F4["OpAdapter wraps legacy<br/>Operator interface"]
     F4 --> F5["forward to legacy op"]
     F3 --> F6["Slots are GC-pointer-free;<br/>int32 indices instead of pointers"]
-````
+```
 
 ## Expression Evaluation Dispatch
 
-````mermaid
+```mermaid
 flowchart TD
     Expr["parser.Expr / nodes.Expr"] --> A{"engine?"}
     A -->|"interpreter (legacy)"| I1["evalExprSlot"]
@@ -91,4 +91,4 @@ flowchart TD
     C3 --> C5["boolean short-circuit on KindBool"]
     C5 --> R["Datum result"]
     I3 --> R
-````
+```

@@ -79,7 +79,7 @@ flowchart TD
 | `applyworker.go` | 963 | Logical replication apply worker |
 | `opnode.go` | 927 | Fast-path operator tree `OpNode`/`opTreeSlab`, `Slot`, `OpIterator`, `opOpen`/`opNext` dispatch |
 | `datum.go` | 890 | 48-byte `Datum` value carrier, `DatumKind`/`TimeSubtype` |
-| `executor.go` | 647 | `Build`/`BuildFast` dispatch (`optimizer.Node` → operator/slab) |
+| `executor.go` | 680 | `Build`/`BuildFast` dispatch (`optimizer.Node` → operator/slab) |
 | `exprnode.go` | 592 | Compiled expression tree `ExprNode`/`exprTreeSlab` + `evalFastExpr` |
 | `hashsize/` | — | Leaf package: hash-join geometry (`nbuckets`/`nbatch`), shared by planner and executor |
 | `kvcache/` | — | Leaf package: byte-budgeted LRU backing correlated-subquery caches |
@@ -119,7 +119,7 @@ type RowCounter interface { RowsAffected() int64 }         // feeds "INSERT 0 N"
 var EOF, ErrSelfTerminate
 type Context struct{ /* per-statement state */ }           // NewContext() *Context
 type Datum struct{ /* 48-byte value carrier */ }
-type Row = []Datum
+type Row []Datum
 type ExecError struct { Code, Message, Detail, Hint, Context string; Pos int;
                         ConditionName string }              // SQLSTATE carrier
 type Session interface{ /* isolation, savepoints, DDL undo, deferred checks */ }

@@ -5,7 +5,7 @@ and synchronous replication.
 
 ## Physical Streaming
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant S as standby (walreceiver)
     participant H as primary replication.Handler
@@ -25,11 +25,11 @@ sequenceDiagram
     S->>W: AppendRaw (verbatim) / Append (re-encode)
     S->>H: StandbyStatusUpdate (write=flush=apply LSN)
     H->>H: SyncRep.UpdateStandbyProgress(appname, lsn)
-````
+```
 
 ## Logical Decoding (pgoutput)
 
-````mermaid
+```mermaid
 flowchart TD
     Sub["START_REPLICATION … pgoutput<br/>(logical mode)"] --> Handler["runLogicalWalsender"]
     Handler --> Slot["xlog.SlotDecoder<br/>slot-backed decoding (logical slot)"]
@@ -45,11 +45,11 @@ flowchart TD
     Apply --> Sync["SyncRep releases at remote_apply"]
 
     note right of Apply: table sync: RunTableSyncManager drives<br/>COPY per rel through pg_subscription_rel i→d→s→r
-````
+```
 
 ## Synchronous Replication
 
-````mermaid
+```mermaid
 stateDiagram-v2
     [*] --> PrimaryCommit: COMMIT on primary
     PrimaryCommit --> AppendWAL: xlog append + FlushUpTo
@@ -65,4 +65,4 @@ stateDiagram-v2
     WaitQuorum --> Timeout: standby lag / disconnect
     Timeout --> Forget: SyncRep.ForgetStandby<br/>loses quorum credit
     Forget --> [*]: commit may be delayed/failed
-````
+```

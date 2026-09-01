@@ -60,7 +60,7 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 | `nailed_view_seed_data.go` | 2,456 | Seed tables for 80 pg_catalog views (captured from PG18.3) |
 | `information_schema_view_seed_data.go` | 2,000 | Seed tables for 65 information_schema views |
 | `pg_aggregate_bootstrap.go` | 1,946 | pg_aggregate/pg_proc heap row generation for built-in aggregates |
-| `pg_amproc_entries.go` | 792 | pg_amproc/pg_amop seed entries |
+| `pg_amproc_entries.go` | 1018 | pg_amproc/pg_amop seed entries |
 | `pg_type_bootstrap.go` | 792 | pg_type heap row bootstrap for all built-in types |
 | `replication_views.go` | 747 | Replication-related pg_catalog view seed rows |
 | `pg_proc_view.go` | 629 | `pg_proc` virtual row helpers |
@@ -68,14 +68,12 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 | `xact_recovery.go` | 290 | Transaction recovery: `TransactionIdIsInProgress`, `TransactionIdDidCommit`, abort sweep |
 | `pg_type_seed_data.go` | 403 | Seed data constants for pg_type (type OID map) |
 | `system_view_oid_pins.go` | 437 | Fixed OID assignments for system views (12000–16383 band) |
-| `pg_cast_bootstrap.go` | 293 | pg_cast bootstrap rows |
+| `pg_cast_bootstrap.go` | 307 | pg_cast bootstrap rows |
 | `pg_conversion_bootstrap.go` | 268 | pg_conversion bootstrap rows |
 | `pg_constraint_bootstrap.go` | 234 | pg_constraint bootstrap rows |
 | `pg_rewrite_toast_bootstrap.go` | 293 | TOAST for oversized pg_rewrite ev_action blobs |
 | `pg_rewrite_toast_writer.go` | 262 | writer for TOAST pairs |
-| `pg_collation_bootstrap.go` | 231 | pg_collation bootstrap rows |
-| `pg_extension_bootstrap.go` | 213 | pg_extension bootstrap rows |
-| `pologistat_bootstrap.go` | 202 | pg_statistic bootstrap rows |
+| `pg_collation_bootstrap.go` | 120 | pg_collation bootstrap rows |
 | `locale.go` | 245 | Locale resolution (`DetectLocale`, `localeSetings`) |
 | `catalog_cache.go` | — | M0114 fast-start JSON snapshot |
 | `timeline.go` | — | Timeline ID management (`LoadOrCreateTimelineID`) |

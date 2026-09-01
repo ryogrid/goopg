@@ -5,7 +5,7 @@ catalog split, and the DDL sync path to on-disk catalog heaps.
 
 ## InMemory Structure
 
-````mermaid
+```mermaid
 classDiagram
     class InMemory {
         +mu RWMutex
@@ -45,11 +45,11 @@ classDiagram
     InMemory --> tableNamespace : namespaces[dbOid]
     tableNamespace --> Table : byTable[oid]
     Table --> Column : Columns
-````
+```
 
 ## Virtual vs Heap-Backed Catalogs
 
-````mermaid
+```mermaid
 flowchart TD
     CAT["catalog.InMemory"]
 
@@ -67,11 +67,11 @@ flowchart TD
     Sync --> Reload["startup: loadUserTablesFromHeap<br/>→ reload*FromHeap passes<br/>→ rebuild InMemory from disk"]
 
     note right of Dual: pg_class virtual rows serve live queries;<br/>heap image serves PG-standby / pg_dump parity
-````
+```
 
 ## DDL Sync to Catalog Heaps
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant E as executor.ddlOp
     participant CAT as catalog.InMemory
@@ -94,4 +94,4 @@ sequenceDiagram
     ST-->>E: DONE
 
     Note over E: DDL ABORT: NewAutocommitUndoSession<br/>reverts InMemory changes;<br/>heap writes are not rolled back
-````
+```

@@ -5,7 +5,7 @@ flow through the goopg server.
 
 ## Connection Lifecycle
 
-````mermaid
+```mermaid
 stateDiagram-v2
     [*] --> Listener: Run
     Listener --> acceptLoop: bind TCP
@@ -19,11 +19,11 @@ stateDiagram-v2
     runPostStartupLoop --> MsgTerminate: client disconnect
     MsgTerminate --> [*]: cleanup + slot release
     note right of runPostStartupLoop: one goroutine per conn; owns WAL, txn, buffers
-````
+```
 
 ## Simple-Query Protocol
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant C as Client
     participant S as postmaster.Server
@@ -54,11 +54,11 @@ sequenceDiagram
         S->>S: applyTransactionVerb (COMMIT/ROLLBACK)
         S-->>C: CommandComplete + ReadyForQuery
     end
-````
+```
 
 ## Extended-Query Protocol
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant C as Client
     participant S as postmaster.Server
@@ -94,4 +94,4 @@ sequenceDiagram
     S-->>C: ReadyForQuery
 
     Note over C,S: MsgDescribe / MsgClose also available
-````
+```

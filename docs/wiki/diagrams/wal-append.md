@@ -4,7 +4,7 @@ WAL record encoding, ring buffer append, segment write, and checkpointing.
 
 ## WAL Record Encoding
 
-````mermaid
+```mermaid
 classDiagram
     class Record {
         +RecordKind kind
@@ -45,11 +45,11 @@ classDiagram
     Record --> XLogPageHeader : page framing (8 KiB pages)
     Record "many" --> MemRing : appended
     note right of Record: xl_prev backpointer chain; validated by reader / pg_waldump
-````
+```
 
 ## Ring Buffer Append
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant C as Caller (executor/storage)
     participant W as xlog.Writer
@@ -73,11 +73,11 @@ sequenceDiagram
     S->>S: doSync (fdatasync / sync_file_range)
     S-->>W: flush complete
     W-->>C: ok
-````
+```
 
 ## Segment Write + Checkpoint
 
-````mermaid
+```mermaid
 flowchart TD
     W["Writer"] --> Pre["preallocateSegment / recycleSegmentFile"]
     Pre --> Seg["append into pg_wal segment<br/>XLogSegSize"]
@@ -91,4 +91,4 @@ flowchart TD
     Fields --> LSN["LastCheckpointLSN advances recovery horizon"]
 
     note right of Fields: records must be PG-canonical so a vanilla PG 18.3 standby<br/>can replay them (pg_assembled_emit.go)
-````
+```

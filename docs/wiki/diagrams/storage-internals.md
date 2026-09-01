@@ -5,7 +5,7 @@ flush barrier.
 
 ## Buffer Pool Pin/Unpin Cycle
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant E as executor op (scan / insert)
     participant P as storage.Pool
@@ -29,11 +29,11 @@ sequenceDiagram
     E->>E: read/write page (MarkDirty*)
     E->>P: Unpin(s)
     P->>P: atomic CAS pinCount-1
-````
+```
 
 ## Clock-Sweep Eviction
 
-````mermaid
+```mermaid
 flowchart TD
     Start["Pin miss: need a buffer"] --> Hand["advance clockHand (atomic)"]
     Hand --> Check["inspect slot state word"]
@@ -50,11 +50,11 @@ flowchart TD
     Read --> Done["return *Slot"]
 
     note right of Hand: state word: pinCount 22b | usageCount 8b<br/>dirty | valid | ioInflight | gen 15b
-````
+```
 
 ## Page Write + WAL Flush
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant E as executor
     participant P as storage.Pool
@@ -70,4 +70,4 @@ sequenceDiagram
     P->>M: WriteBlock(rel, blk, buf)
     M-->>P: bytes durable
     Note over P,M: WAL-before-data: page hits disk<br/>only after WAL is flushed past its LSN
-````
+```

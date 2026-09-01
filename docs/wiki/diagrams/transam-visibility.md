@@ -5,7 +5,7 @@ rules.
 
 ## XID Lifecycle
 
-````mermaid
+```mermaid
 stateDiagram-v2
     [*] --> NoXID: Manager.Begin
     NoXID --> NoXID: read-only stmts (never AssignXID)
@@ -18,11 +18,11 @@ stateDiagram-v2
     Committed --> [*]: visible to later snapshots
     Aborted --> [*]: invisible forever
     NoXID --> [*]: read-only commit fast path
-````
+```
 
 ## Snapshot Capture + Commit/Abort in CLog
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant T as Transaction
     participant M as transam.Manager
@@ -43,11 +43,11 @@ sequenceDiagram
     M->>M: CommitAsync: defer durable clog write<br/>behind LSN watermark
 
     Note over T,C: ReplayXactCommit reconstructs from WAL at recovery
-````
+```
 
 ## MVCC Visibility Rules
 
-````mermaid
+```mermaid
 flowchart TD
     T["heap tuple header:<br/>xmin, xmax, cmin, cmax"] --> V["transam.TupleVisible(h, snap, currentXID, curcid)"]
     V --> XMIN{"xmin < snap.Xmin<br/>or xmin == currentXID?"}
@@ -69,4 +69,4 @@ flowchart TD
     XMAX -->|"xmax in-progress"| CONCURRENT["visible: lock/deleter uncommitted<br/>may trigger EPQ retry on write"]
 
     note right of V: hint-bit fast paths skip clog reads;<br/>sub-xids and multixacts walked when present;<br/>OldestXmin feeds vacuum horizon
-````
+```

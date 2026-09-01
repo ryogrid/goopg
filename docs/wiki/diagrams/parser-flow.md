@@ -5,7 +5,7 @@ parsing.
 
 ## Lexer → Yacc / Hand-Written Dispatch
 
-````mermaid
+```mermaid
 flowchart TD
     SQL["SQL text"] --> Lex["lexer.Lex(input)<br/>hand-written tokenizer"]
     Lex --> Toks["[]Token<br/>keyword/ident/number/string/operator"]
@@ -22,11 +22,11 @@ flowchart TD
     H3 --> AST
 
     note right of Route: ~1.7% of statement classes stay on<br/>hand-written scanners (parser gap)
-````
+```
 
 ## AST → Analyzer Pipeline
 
-````mermaid
+```mermaid
 sequenceDiagram
     participant P as parser.Parse
     participant A as analyzer.Analyze
@@ -43,11 +43,11 @@ sequenceDiagram
         A-->>O: optimizer.Node IR
         O->>O: query_planner, join_search
     end
-````
+```
 
 ## PL/pgSQL Parsing
 
-````mermaid
+```mermaid
 flowchart TD
     Body["CREATE FUNCTION … LANGUAGE plpgsql<br/>body text"] --> Parse["pl/plpgsql.Parse(src)<br/>hand-written bodyParser"]
     Parse --> Block["*Block AST (ast.go)"]
@@ -57,4 +57,4 @@ flowchart TD
     Exec --> SQL["embedded SQL:<br/>recursive parser.Parse + executor"]
 
     note right of Exec: plpgsql is interpreted over internal/pl/plpgsql ASTs;<br/>language dispatch: dispatchStoredRoutineByLanguage
-````
+```
