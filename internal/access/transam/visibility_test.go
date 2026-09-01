@@ -277,3 +277,42 @@ func TestTupleVisibleMultiXact(t *testing.T) {
 		})
 	}
 }
+
+// TestTupleVisibleXmaxCommittedHintRespectsSnapshot is the review/260831-2
+// TA-1 guard: the HEAP_XMAX_COMMITTED branch returned `false` outright, i.e. it
+// read the hint bit as "deleted, full stop". The bit only records that xmax
+// committed at SOME point — a snapshot taken while the deleter was still in
+// progress must keep seeing the row. PG re-checks the snapshot in this very
+// branch (HeapTupleSatisfiesMVCC: `if (XidInMVCCSnapshot(xmax, snapshot))
+// return true;`), and the subxact twin TupleVisibleSubxact already did.
+func TestTupleVisibleXmaxCommittedHintRespectsSnapshot(t *testing.T) {
+	// The deleter (15) was in progress when this snapshot was taken.
+	snap := Snapshot{
+		Xmin:       storage.TransactionID(10),
+		Xmax:       storage.TransactionID(20),
+		InProgress: []storage.TransactionID{15},
+	}
+	current := storage.TransactionID(18)
+
+	h := storage.HeapTupleHeader{
+		Xmin:     8,
+		Xmax:     15,
+		Infomask: storage.HeapXmaxCommitted,
+	}
+	if !TupleVisible(h, snap, current, storage.InvalidCommandId, nil, nil) {
+		t.Error("row deleted by an xid in-progress at snapshot time must stay visible despite the HEAP_XMAX_COMMITTED hint")
+	}
+	if !TupleVisibleSubxact(h, snap, current, nil, storage.InvalidCommandId, nil, nil) {
+		t.Error("sibling path disagrees: TupleVisibleSubxact hid the row")
+	}
+
+	// A deleter the snapshot DOES see as committed still hides the row.
+	hSeen := storage.HeapTupleHeader{
+		Xmin:     8,
+		Xmax:     9,
+		Infomask: storage.HeapXmaxCommitted,
+	}
+	if TupleVisible(hSeen, snap, current, storage.InvalidCommandId, nil, nil) {
+		t.Error("row deleted by an xid below the snapshot xmin must be invisible")
+	}
+}

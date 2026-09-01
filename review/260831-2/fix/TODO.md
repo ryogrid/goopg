@@ -32,8 +32,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | ? | [ ] | |
 | NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | BUG | [x] | `dafe96692` |
 | ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | BUG | [x] | `e4b3b7ff3` |
-| ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | BUG | [x] | see progress log |
-| TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | ? | [ ] | |
+| ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | BUG | [x] | `8ca6a5a8d` |
+| TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | BUG | [x] | see progress log |
 | CP-1 | high | `postmaster/txn_verb.go:applyTransactionVerb` — DDL in a failed block survives COMMIT-as-ROLLBACK | ? | [ ] | |
 | CM-1 | high | `cmd/goopg/standby.go:Promote` — `promoting` atomic never reset; failed promote wedges permanently | ? | [ ] | |
 
@@ -194,3 +194,16 @@ landed.
   `TransactionIdPrecedes` here (`HeapTupleSatisfiesVacuum`). Fix:
   `!XIDPrecedes(effXmax, oldestXmin)`. Guard: `TestTupleDeadToAllWraparound`
   (horizon 0xFFFFFF00, deleter 50 — i.e. just after a wrap).
+
+- 2026-09-01 **TA-1 = BUG (fixed).** `TupleVisible`'s `HeapXmaxCommitted` arm
+  returned `false` unconditionally. The hint bit only records that xmax
+  committed at SOME point — it says nothing about whether the reading snapshot
+  predates that commit — so a REPEATABLE READ / serializable snapshot lost rows
+  the moment any other backend's scan happened to set the bit, and the same
+  snapshot disagreed with the `TupleVisibleSubxact` twin two arms down, which
+  does consult the snapshot. PG re-checks in this exact branch
+  (`HeapTupleSatisfiesMVCC`: `if (XidInMVCCSnapshot(xmax, snapshot)) return
+  true;`). Fix: `return !snap.SeesCommittedXID(effXmax)`. Guard:
+  `TestTupleVisibleXmaxCommittedHintRespectsSnapshot` — a snapshot with the
+  deleter still in progress keeps seeing the row, the subxact twin agrees, and a
+  deleter below Xmin stays invisible.
