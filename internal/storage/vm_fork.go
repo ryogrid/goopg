@@ -63,16 +63,26 @@ func parseVMPage(p []byte) []uint8 {
 	if len(p) != BlockSize {
 		return nil
 	}
-	masks := make([]uint8, vmMaxHeapPagesPerPage)
+	return appendVMPage(make([]uint8, 0, vmMaxHeapPagesPerPage), p)
+}
+
+// appendVMPage decodes one VM page's bits onto dst.
+//
+// review/260831 ST-8: ReadVMFork used to take a freshly allocated
+// vmMaxHeapPagesPerPage slice per page and then append (copy) it into the
+// result, so reading a fork allocated and copied twice per page. Appending
+// straight into the caller's buffer removes both.
+func appendVMPage(dst []uint8, p []byte) []uint8 {
 	for i := 0; i < vmMaxHeapPagesPerPage; i++ {
 		byteIdx := i / VMPagesPerByte
 		bitShift := (i % VMPagesPerByte) * VMBitsPerHeapPage
+		var m uint8
 		if vmDataOffset+byteIdx < BlockSize {
-			b := p[vmDataOffset+byteIdx]
-			masks[i] = (b >> bitShift) & (VMAllVisible | VMAllFrozen)
+			m = (p[vmDataOffset+byteIdx] >> bitShift) & (VMAllVisible | VMAllFrozen)
 		}
+		dst = append(dst, m)
 	}
-	return masks
+	return dst
 }
 
 // WriteVMFork writes a PG-compatible VM fork file for one relation.
@@ -158,11 +168,10 @@ func ReadVMFork(path string) ([]uint8, error) {
 	}
 
 	numPages := len(data) / BlockSize
-	var masks []uint8
+	masks := make([]uint8, 0, numPages*vmMaxHeapPagesPerPage)
 	for i := 0; i < numPages; i++ {
 		pageOff := i * BlockSize
-		page := parseVMPage(data[pageOff : pageOff+BlockSize])
-		masks = append(masks, page...)
+		masks = appendVMPage(masks, data[pageOff:pageOff+BlockSize])
 	}
 	return masks, nil
 }
