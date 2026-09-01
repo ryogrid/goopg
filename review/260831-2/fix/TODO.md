@@ -29,7 +29,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | id | sev | finding | verdict | status | commit |
 |---|---|---|---|---|---|
 | EO2-1 | high | `executor/operators_indexonly.go:Rescan` — LowOp/HighOp strictness ignored, bounds always inclusive | BUG | [x] | `5360b7e79` |
-| ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | BUG | [x] | this commit |
+| ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | BUG | [x] | 3767bb7f4 |
 | NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | BUG | [x] | `dafe96692` |
 | ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | BUG | [x] | `e4b3b7ff3` |
 | ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | BUG | [x] | `8ca6a5a8d` |
@@ -41,7 +41,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 
 | id | sev | finding | verdict | status | commit |
 |---|---|---|---|---|---|
-| EC-1 | med | `executor/codec.go:parseIntegerInput` — base-0 ParseInt treats leading `0` as octal | ? | [ ] | |
+| EC-1 | med | `executor/codec.go:parseIntegerInput` — base-0 ParseInt treats leading `0` as octal | BUG | [x] | this commit |
 | EC-2 | med | `executor/btree_array_key.go:encodeArrayBTreeKey` — quoted `"NULL"` element encoded as SQL NULL | ? | [ ] | |
 | EC-4 | med | `executor/copy.go:PushBinaryData` — binary COPY FROM skips defaults / NOT NULL / CHECK | ? | [ ] | |
 | EO1-1 | med | `executor/operators_call.go:callOp.Next` — IN/INOUT arg after an OUT param reads the wrong slot | ? | [ ] | |
@@ -250,3 +250,14 @@ landed.
   observed only the odd-numbered lossy pages). Gates: units green;
   TPC-DS SF0.5 sweep on this build PASS=95 MISMATCH=0 CKMISMATCH=0
   ERROR=0 TIMEOUT=0, plan shapes 99/99 identical.
+
+- 2026-09-01 **EC-1 = BUG (fixed).** `parseIntegerInput` handed the whole
+  string to `strconv.ParseInt(…, 0, bitSize)`, whose base-0 mode reads a
+  leading `0` as an OCTAL prefix: `'010'::int` returned 8 and `'09'::int`
+  failed with a parse error, where PG returns 10 and 9. PG's `pg_strtoint32`
+  only honours the explicit `0x`/`0o`/`0b` radix prefixes it added in v16 —
+  a bare leading zero is decimal. Fix: detect the explicit prefix
+  (after an optional sign) and pass base 0 only then, base 10 otherwise.
+  Guard: `TestParseIntegerInputLeadingZeroIsDecimal`. Gates: units green;
+  TPC-DS SF0.5 sweep on this build PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0
+  TIMEOUT=0, plan shapes 99/99 identical; TPC-H spotcheck Q12/Q13 PASS.

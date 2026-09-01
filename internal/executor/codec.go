@@ -2105,36 +2105,27 @@ func parseIntegerInput(raw, typeName string, bitSize int) (int64, error) {
 			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
 	}
 
-	// Detect base prefix.
+	// Detect base prefix. PG's scanner accepts a sign in front of it
+	// ("-0x10" is -16), so the prefix is looked for past the sign.
+	body := s
+	if body[0] == '-' || body[0] == '+' {
+		body = body[1:]
+	}
 	isNonDecimal := false
-	prefix := ""
-	rest := s
-	if len(s) >= 2 && (s[0] == '0') {
-		switch {
-		case s[1] == 'b' || s[1] == 'B':
+	rest := body
+	if len(body) >= 2 && body[0] == '0' {
+		switch body[1] {
+		case 'b', 'B', 'o', 'O', 'x', 'X':
 			isNonDecimal = true
-			prefix = s[:2]
-			rest = s[2:]
-		case s[1] == 'o' || s[1] == 'O':
-			isNonDecimal = true
-			prefix = s[:2]
-			rest = s[2:]
-		case s[1] == 'x' || s[1] == 'X':
-			isNonDecimal = true
-			prefix = s[:2]
-			rest = s[2:]
+			rest = body[2:]
 		}
 	}
-	_ = prefix
 
 	// Validate underscore rules.
 	if !isNonDecimal {
 		// Decimal: no leading underscore (after optional sign), no trailing, no consecutive.
-		check := rest
-		if len(check) > 0 && (check[0] == '-' || check[0] == '+') {
-			check = check[1:]
-		}
-		if len(check) > 0 && check[0] == '_' {
+		// `rest` is already sign-stripped here.
+		if len(rest) > 0 && rest[0] == '_' {
 			return 0, &ExecError{Code: "22P02",
 				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
 		}
@@ -2159,7 +2150,16 @@ func parseIntegerInput(raw, typeName string, bitSize int) (int64, error) {
 
 	// Strip underscores for parsing.
 	cleaned := strings.ReplaceAll(s, "_", "")
-	v, err := strconv.ParseInt(cleaned, 0, bitSize)
+	// Base 10 unless an explicit 0b/0o/0x prefix said otherwise: a bare
+	// leading zero is NOT octal to PG's integer input function ('0123' is
+	// 123, '09' is 9), while Go's base-0 ParseInt reads both as octal
+	// (review/260831-2 EC-1). Base 0 is still right for the prefixed forms,
+	// sign included.
+	base := 10
+	if isNonDecimal {
+		base = 0
+	}
+	v, err := strconv.ParseInt(cleaned, base, bitSize)
 	if err != nil {
 		numErr, ok := err.(*strconv.NumError)
 		if ok && numErr.Err == strconv.ErrRange {
