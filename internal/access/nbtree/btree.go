@@ -536,6 +536,11 @@ func DecodeInt8(b []byte) (int64, error) {
 	return int64(binary.BigEndian.Uint64(b) ^ 0x8000000000000000), nil
 }
 
+// bigTen is the divisor EncodeNumericKey strips trailing zeros with. It is a
+// package-level constant value so the per-call allocation disappears; big.Int
+// values are never mutated by Quo/QuoRem operands, so sharing it is safe.
+var bigTen = big.NewInt(10)
+
 // EncodeNumericKey encodes a NUMERIC value (mantissa * 10^(-scale)) into
 // a sortable byte string such that bytewise comparison matches numeric
 // order. The encoding is scale-invariant: numerically equal inputs
@@ -573,16 +578,21 @@ func EncodeNumericKey(mantissa *big.Int, scale int16) []byte {
 	abs := new(big.Int).Abs(mantissa)
 	// Strip trailing zeros so numerically-equal values normalise to
 	// the same digit string.
+	//
+	// review/260831 NB-11: the loop used to allocate a fresh big.Int per digit
+	// stripped — one for the quotient QuoRem writes and throws away, plus the
+	// 10 and the 0 it compared against — and then divide a SECOND time to keep
+	// the quotient it had just computed. It now reuses two scratch values and
+	// swaps the quotient in.
 	s := int32(scale)
-	ten := big.NewInt(10)
-	zero := big.NewInt(0)
 	rem := new(big.Int)
+	quo := new(big.Int)
 	for {
-		new(big.Int).QuoRem(abs, ten, rem)
-		if rem.Cmp(zero) != 0 {
+		quo.QuoRem(abs, bigTen, rem)
+		if rem.Sign() != 0 {
 			break
 		}
-		abs.Quo(abs, ten)
+		abs, quo = quo, abs
 		s--
 		if abs.Sign() == 0 {
 			break
