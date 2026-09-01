@@ -58,19 +58,19 @@ not, with the reason) / empty (not judged yet).
 | ES-8 | executor-sys | medium | `plpgsql_runtime.go:executeSQLRoutine` (+procedures/setof) — body re-parsed and re-planned on every call | REJECT (needs the plan-cache machinery) | real — a SQL-language routine re-parses (and re-plans) its body on every call | the body text IS stable per routine (arguments are rewritten to $n, values go through ctx.Params), so a cache is possible; but the planner mutates the tree it is given, so caching a bare AST is not safe. The sound design is the postmaster planCache (keyed plan + its invalidation), reused from the executor | out of scope for a per-finding fix | [ ] deferred |
 | ES-9 | executor-sys | medium | `plpgsql_runtime.go:executePLpgSQLTriggerBody` — trigger body re-parsed on every firing | ADOPT | 100 rows through a BEFORE INSERT row trigger: 1.90ms -> 0.97ms (2.0x), 1.21MB / 10,642 allocs -> 761KB / 6245 | the interpreter lowers each statement into fresh values as it goes and never writes back into the parsed block; the cache key is the body text, so CREATE OR REPLACE lands on a different key | one sync.Map, applied to all four plpgsql.Parse call sites in the executor | [x] fixed |
 | ES-17 | executor-sys | medium | `toast.go:DetoastValue` — full TOAST relation scan per detoasted column | ADOPT (partial) | reading a value whose chunks sit early in the TOAST relation: ~50us -> ~40us and 226 -> 109 allocs; a value at the end is unchanged (nothing to skip) | the scan stops once every chunk_seq of the value has been seen — chunk_seq is unique per chunk_id, so a later sighting could only be an older version, which the visibility test already filters | one counter; the real remedy (a TOAST chunk index, as upstream has) is a feature, recorded below | [x] fixed |
-| OP1-1 | optimizer-1 | medium | `cardinality.go:estimateNumGroups` — per-relation full-tree walk plus subtree re-estimation | | | | | [ ] |
-| OP1-2 | optimizer-1 | medium | `cardinality.go:semiPairMatchFraction` — O(n·m) MCV matching nested loop | | | | | [ ] |
-| OP1-3 | optimizer-1 | medium | `cardinality.go:EstimateRows` — no memoization on recursive estimates | | | | | [ ] |
+| OP1-1 | optimizer-1 | medium | `cardinality.go:estimateNumGroups` — per-relation full-tree walk plus subtree re-estimation | REJECT (planning-time, restructuring risk) | the walk is over the plan tree during planning, not per row | the fix is caching estimates on a tree the planner rewrites in place — the same staleness problem as OP2-3 | — | [x] no change |
+| OP1-2 | optimizer-1 | medium | `cardinality.go:semiPairMatchFraction` — O(n·m) MCV matching nested loop | ADOPT | MCV pairing at the default statistics target (100 x 100): 17.7us -> 4.1us (4.4x); allocations rise 1 -> 4 (the index map) | a differential test pins the pairing against the old nested scan over partial overlaps, duplicates on either side, and a clamped second list | one map plus the same used-flag array | [x] fixed |
+| OP1-3 | optimizer-1 | medium | `cardinality.go:EstimateRows` — no memoization on recursive estimates | REJECT (unsafe to memoize) | within one call the recursion visits each node once; the repetition comes from the join search calling it on many candidate subtrees | a memo keyed by node pointer goes stale the moment a rewrite mutates a node, and the search builds fresh nodes per candidate anyway | — | [x] no change |
 | OP2-3 | optimizer-2 | medium | foldconst.go:FoldConstants — Always allocates fresh nodes/slices even when nothing folds | REJECT (contract risk) | planning-time only, once per query | FoldConstants returning fresh nodes is what makes the later in-place rewrites safe; returning the input when nothing folded would alias the caller tree, and every mutating pass would have to be surveyed first | — | [x] no change |
-| OP2-11 | optimizer-2 | medium | joinsearchseam.go:tryPGShapedJoinSearch — searchConsumes rebuilds restrict infos per conjunct | | | | | [ ] |
+| OP2-11 | optimizer-2 | medium | joinsearchseam.go:tryPGShapedJoinSearch — searchConsumes rebuilds restrict infos per conjunct | REJECT (planning-time) | rebuilding restrict infos per conjunct inside the join search is O(conjuncts x clauses) with both counts small | threading a prebuilt set through the search seam risks feeding a candidate the wrong clause set — a plan-shape bug | — | [x] no change |
 | OP2-12 | optimizer-2 | medium | joinselectivity.go:examineJoinVar / columnStatsByName — Linear column lookup per operand | | | | | [ ] |
 | OP2-14 | optimizer-2 | medium | pathbitmap.go:chooseBitmapAnd — costBitmapTree recomputed inside sort comparator | ADOPT (small, no benchmark) | the comparator recomputed each candidate cost O(log n) times and costBitmapTree walks the whole bitmap tree; n is small in practice, so no measurable planning win is claimed | same ordering — the same costs, computed once | strictly less work, same shape | [x] fixed |
-| OP2-18 | optimizer-2 | medium | scan_input_rewrite.go:absorbConjunctsIntoSubtree — Re-walks the whole subtree per matching conjunct | | | | | [ ] |
-| OP2-20 | optimizer-2 | medium | pushdown.go:pushOneConjunct — Per-conjunct whole-tree walks at every recursion level | | | | | [ ] |
+| OP2-18 | optimizer-2 | medium | scan_input_rewrite.go:absorbConjunctsIntoSubtree — Re-walks the whole subtree per matching conjunct | REJECT (planning-time) | the re-walk is O(conjuncts x subtree nodes), both small in practice | the pass decides WHERE a predicate lands, which is plan correctness; restructuring it for microseconds is a bad trade | — | [x] no change |
+| OP2-20 | optimizer-2 | medium | pushdown.go:pushOneConjunct — Per-conjunct whole-tree walks at every recursion level | REJECT (planning-time) | same shape as OP2-18: 20 conjuncts over a 20-node tree is 400 visits, microseconds | same risk: pushdown placement is correctness | — | [x] no change |
 | OP2-29 | optimizer-2 | medium | selectivity.go:clauseSelectivity / clauseSelectivityWithSource — Near-identical duplicated implementations | REJECT (not a performance finding) | `clauseSelectivity` and `clauseSelectivityWithSource` being near-duplicates is a maintainability observation; neither is slower for it | merging them changes which selectivity a clause gets in the paths that call one and not the other — a plan-shape risk with no measured win | — | [x] no change |
 | OP2-31 | optimizer-2 | medium | planner.go:tryRangeIndexScan — Whole WHERE predicate resolved twice | REJECT (planning-time, threading risk) | one extra resolveExpr of the WHERE clause per planning of this shape | threading the already-resolved predicate out of tryRangeIndexScan means resolving in the right scope at the right time; a mistake there is a wrong plan, not a slow one | — | [x] no change |
-| XL-8 | xlog | medium | iterator.go:readOneAt — record header bytes read twice | | | | | [ ] |
-| XL-9 | xlog | medium | iterator.go:readBytesAt / readRecordBytesAt / readSegmentSlice — per-record allocation + per-chunk file open | | | | | [ ] |
+| XL-8 | xlog | medium | iterator.go:readOneAt — record header bytes read twice | REJECT (mitigated, and splitting the read is delicate) | the header bytes are still read twice, but after XL-9 that is a second pread on a cached handle rather than a second open | reading the remainder separately means re-deriving the page-header walk for a partial read — the arithmetic that decides where a record continues after a page boundary | — | [x] no change |
+| XL-9 | xlog | medium | iterator.go:readBytesAt / readRecordBytesAt / readSegmentSlice — per-record allocation + per-chunk file open | ADOPT (no micro-benchmark) | the segment file was opened and closed on EVERY read, and readOneAt reads twice per record — two open/close pairs per replayed record. The handle is cached on the iterator and closed with it | reads are the same pread calls on the same bytes; a failed read drops the handle so the next read re-opens | one cached handle + Close; the uncached helper is gone rather than left beside it | [x] fixed |
 | XL-14 | xlog | medium | format.go:encodeRecordXLog / wrapXLogMainData — two allocations per WAL record | ADOPT | 64-byte payload 84.5 ns -> 51.8 ns (1.6x), 4096-byte payload 1.75us -> 0.92us (1.9x), 2 allocs -> 1 | the emitted bytes are identical; the chunk header is written in place instead of in a temporary | `wrapXLogMainData` is gone rather than left as a second, unused copy of the rule | [x] fixed |
 | XL-21 | xlog | medium | pg_assembled_emit.go — envelope + body + mainData allocation chain per PG record | | | | | [ ] |
 | XL-24 | xlog | medium | pg_xlog_decode.go:parseXLogRecordData — cloneXLogBytes per block/main-data chunk | REJECT (the copy is the boundary) | one copy per block/main-data chunk during decode | those copies are what make a decoded record independent of the reader buffer; removing them means proving every caller passes a freshly allocated buffer AND accepting that a retained record pins the whole record buffer | — | [x] no change |
@@ -78,7 +78,7 @@ not, with the reason) / empty (not judged yet).
 | XL-31 | xlog | medium | reader.go:readStreamFrom — stream slice grows without a capacity hint | ADOPT (no micro-benchmark) | a WAL segment is 16MB and there is usually more than one, so growing from zero capacity re-copied the whole stream at every doubling; the first segment size is known up front | pure capacity hint, the bytes are identical | one argument to make() | [x] fixed |
 | XL-38 | xlog | medium | reorder.go:foldChanges — allocates a copy even when nothing folds | ADOPT | the common no-fold case: 6244 ns -> 117 ns (53x), 24,576 B -> 0 allocs | two tests pin both paths: no fold returns the input, and a fold in the middle still produces the UPDATE with its neighbours intact | one scan before the allocation | [x] fixed |
 | XL-39 | xlog | medium | recovery.go:Decode* helpers — defensive tuple copies per record | | | | | [ ] |
-| XL-50 | xlog | medium | slots.go:writeSlotLocked — full rewrite + double fsync per slot update | | | | | [ ] |
+| XL-50 | xlog | medium | slots.go:writeSlotLocked — full rewrite + double fsync per slot update | REJECT (PG-faithful durability) | not waste: `postgres/src/common/file_utils.c durable_rename` fsyncs the file under its NEW name after the rename AND the parent directory, which is exactly what writeSlotLocked does | removing either fsync weakens slot durability below upstream | — | [x] no change |
 | XL-68 | xlog | medium | xlog_assemble.go:assembleXLogRecord — header/payload built via repeated append with no capacity hint | ADOPT | one block ref: 207 ns -> 107 ns (data only), 293 ns -> 132 ns (image with a hole), 6.5us -> 3.1us (whole-page image); 6-8 allocs -> 2 | byte-identical output; the WAL/pg_waldump parity tests in the package cover it | sizes computed up front by one shared hole helper, so the estimate cannot drift from what is written | [x] fixed |
 | IN-4 | initdb | medium | `pg_aggregate_view.go:registerPgAggregateView` — pgAggregateInitialEntries() rebuilt on every query | ADOPT | one query against pg_aggregate: 96.2us -> 6.3us (15.3x), 87.6KB / 1515 allocs -> 9.5KB / 28 | the BKI half is constant; consumers only read the rows (they build their own Row per output), so sharing the cached slices is safe | one sync.OnceValue and a shorter closure | [x] fixed |
 | IN-8 | initdb | medium | `initdb.go:writeMultiPageHeap` / `writeMultiPageHeapRowsExternal` — hasVarWidthCol recomputed per row (loop invariant) | ADOPT (small) | the varlena scan moves out of the per-row loop in both bootstrap heap writers; initdb-only, so no steady-state effect | the value is identical for every row of a call — the column set does not change | two hoisted locals | [x] fixed |
@@ -1338,3 +1338,48 @@ cheaper; here neither half holds.)
 observation, not a performance one: neither is slower for the duplication.
 Merging them changes which selectivity a clause receives on the paths that call
 one and not the other, which is a plan-shape risk with no measured win.
+
+### OP1-2 / XL-9 — ADOPT; XL-8 / XL-50 / OP1-1 / OP1-3 / OP2-11 / OP2-18 / OP2-20 — REJECT
+
+**OP1-2** — `semiPairMatchFraction` paired the two MCV lists with a nested loop:
+up to statistics_target^2 (10,000 by default) string comparisons per selectivity
+estimate. The second list is indexed by value now, and the "lowest still-unused
+index wins" rule the nested scan implemented is preserved — including the
+forward scan that only runs if a list ever holds duplicate values.
+
+| MCV pairing, 100 x 100 with a 50-value overlap | before | after |
+|---|---|---|
+| | 17,745 ns, 112 B, 1 alloc | 4,056 ns, 3608 B, 4 allocs |
+
+`TestMCVPairingMatchesNested` compares the two forms over full overlap, partial
+overlap, no overlap, duplicates on either side, and a clamped second list.
+
+**XL-9** — `readSegmentSlice` opened AND closed the WAL segment file on every
+read, and `readOneAt` reads twice per record (the header, then the record), so
+replaying a segment did two open/close pairs per record. The iterator now caches
+the handle for the segment it is reading and closes it with the iterator; a
+failed read drops the handle so the next read re-opens rather than inheriting
+whatever made it fail. No micro-benchmark is recorded — the change is a syscall
+count, and building a WAL-segment fixture to measure it was not worth the
+detour — but the reads themselves are unchanged preads over the same bytes.
+
+**XL-8 — REJECT (mitigated).** The header bytes are still read twice, but after
+XL-9 the second read is a pread on a cached handle rather than a second open.
+Reading only the remainder would mean re-deriving the page-header walk for a
+partial read — the arithmetic that decides where a record continues after a page
+boundary — for one memory copy.
+
+**XL-50 — REJECT: the "double fsync" is upstream's.**
+`postgres/src/common/file_utils.c durable_rename` fsyncs the file under its NEW
+name after the rename and then the parent directory, which is exactly what
+`writeSlotLocked` does. Removing either fsync would put slot durability below
+PG's.
+
+**OP1-1 / OP1-3 / OP2-11 / OP2-18 / OP2-20 — REJECT: planning-time walks.**
+All five are repeated traversals during planning, not per row, over trees and
+clause lists that are small in practice (a 20-conjunct query over a 20-node tree
+is 400 node visits — microseconds). Every proposed fix is either a cache on a
+tree the planner rewrites in place (the OP2-3 staleness problem) or threading
+prebuilt state through a seam that decides WHERE a predicate lands. Those are
+plan-correctness mechanisms; trading a microsecond for a chance of the wrong
+plan is the wrong direction.
