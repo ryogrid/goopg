@@ -533,3 +533,46 @@ func TestWalsenderCatalogDBOidVar(t *testing.T) {
 		t.Fatalf("empty dbName → %v, want %v", got, want)
 	}
 }
+
+// TestWalsenderPgoutputAdapterEmptyWriteIsDropped pins review/260831-2 CP-4:
+// `endLSN := nextLSN + len(p) - 1` underflows to ~2^64 on a zero-length write,
+// so an empty payload used to put a frame on the wire whose EndLSN was garbage
+// and whose successor's startLSN was reset to 0 — a walEnd the subscriber can
+// never ack past. An empty write must emit nothing and leave nextLSN alone.
+func TestWalsenderPgoutputAdapterEmptyWriteIsDropped(t *testing.T) {
+	var buf bytes.Buffer
+	fw := libpq.NewFrameWriter(&buf)
+
+	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 100}
+	n, err := a.Write(nil)
+	if err != nil {
+		t.Fatalf("Write(nil): %v", err)
+	}
+	if n != 0 {
+		t.Errorf("Write(nil) = %d, want 0", n)
+	}
+	if a.nextLSN != 100 {
+		t.Errorf("nextLSN moved to %d on an empty write, want 100", a.nextLSN)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("empty write put %d bytes on the wire, want none", buf.Len())
+	}
+
+	// The next real write still starts where it should.
+	if _, err := a.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	fr := libpq.NewFrameReader(&buf)
+	f, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _, err := libpq.DecodeReplicationMessage(f.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := parsed.(*libpq.WALDataMessage)
+	if m.StartLSN != 100 || m.EndLSN != 102 {
+		t.Errorf("after the empty write: StartLSN=%d EndLSN=%d, want 100/102", m.StartLSN, m.EndLSN)
+	}
+}

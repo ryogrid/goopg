@@ -219,6 +219,13 @@ type walsenderPgoutputAdapter struct {
 func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if len(p) == 0 {
+		// endLSN below is `nextLSN + len(p) - 1`, which UNDERFLOWS to ~2^64 on
+		// an empty write and would advertise a garbage walEnd the subscriber
+		// can never ack past. An empty payload carries nothing, so drop it.
+		// (review/260831-2 CP-4)
+		return 0, nil
+	}
 	startLSN := a.nextLSN
 	endLSN := a.nextLSN + uint64(len(p)) - 1
 	a.nextLSN = endLSN + 1
