@@ -36,12 +36,12 @@ not, with the reason) / empty (not judged yet).
 | EC-7 | executor-core | medium | `hash_partition.go:computeHashPartitionRowHash` — per-row invariant work on the INSERT partition-routing hot path | | | | | [ ] |
 | EC-14 | executor-core | medium | `copy.go:insertSourceRow` — per-row `make(Row, …)` instead of the row pool | REJECT (regression risk vs benefit) | one small allocation per row, against a per-row cost dominated by defaults, constraints, tuple encode, the page write and index maintenance | pooling requires PROVING no path retains the row (defaults, CHECK/domain constraints, TOAST, heap write, unique-index maintenance); a wrong release corrupts data silently rather than failing a test | — | [x] no change |
 | EC-16 | executor-core | medium | `copy_binary.go:decodeNumericBinary` — dead `fullMantissa` computation before unconditional fallback | | | | | [ ] |
-| EC-20 | executor-core | medium | `expr.go:evalCast` — `strings.ToLower(targetType)` on every cast evaluation | | | | | [ ] |
+| EC-20 | executor-core | medium | `expr.go:evalCast` — `strings.ToLower(targetType)` on every cast evaluation | REJECT (no benefit, sibling risk) | `strings.ToLower` does not allocate for an already-lower-case type name, and plan type names are catalog-normalised — the cost is a scan of a few bytes per cast | avoiding it means switching on the raw string first and keeping a second, lower-cased switch in sync — the sibling-paths failure mode this codebase has been bitten by repeatedly | — | [x] no change |
 | EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | REJECT (already done) | — | — | — | [x] no change |
 | EO1-13 | executor-operators-1 | medium | `operators_gather_merge.go:lessRows` — Sort key expressions re-evaluated on every heap comparison (promoted from Appendix A) | ADOPT | 4 sources x 2000 rows: 2.63ms -> 1.94ms (1.36x), allocs 42,652 -> 23,988 | comparison rule unchanged verbatim; keys evaluated once, when the row is pulled | same shape as EO2-2 / sortOp | [x] fixed |
 | EO1-4 | executor-operators-1 | medium | `operators_analyze.go:analyzeRelationWith` — Decodes every visible tuple but only keeps a fraction | | | | | [ ] |
 | EO1-7 | executor-operators-1 | medium | `operators_bitmap.go:bitmapIndexScanOp.buildBitmap` — Allocates a slice per index entry in hot loop | ADOPT (finding partly wrong) | 17.0 ns -> 12.8 ns per index entry (1.33x). The claimed allocation does NOT happen — escape analysis keeps the one-element slice on the stack, 0 allocs either way | same insertion path (addOne); recheckAny is still only set when a tuple is added | three lines, and the call now says what it does | [x] fixed |
-| EO1-10 | executor-operators-1 | medium | `operators_generate_series.go:generateSeriesOp.Next` — Allocates a Row per emitted value | | | | | [ ] |
+| EO1-10 | executor-operators-1 | medium | `operators_generate_series.go:generateSeriesOp.Next` — Allocates a Row per emitted value | ADOPT | 20,000 values: 1.96ms -> 0.69ms (2.8x), 2.27MB / 40,098 allocs -> 13.8KB / 93 | the same slot-reuse contract the rest of the executor uses (indexScanOp, M0092-0007); values are unchanged | one Row and one slot field per operator, applied to generate_series and generate_subscripts alike | [x] fixed |
 | EO1-11 | executor-operators-1 | medium | `operators_fk.go:fkRowMatches` — Per-row linear column-name lookup on every row of a table scan | ADOPT | 16-column table, FK columns last: 262 ns -> 24 ns per row (10.7x) | a differential test compares the new form against the old name-resolving one, unknown-column and case-insensitive cases included | the resolution is hoisted to the top of each scan; the old function is gone, not duplicated | [x] fixed |
 | EO2-1 | executor-operators-2 | high | `operators_join_agg.go:applyAgg` — string_agg O(n²) string concatenation | ADOPT | 4000 rows in one group: 34.99ms -> 1.89ms (18.5x), 229MB -> 1.5MB allocated | concatenation order, delimiter placement and the bytea path are identical; the ORDER BY path already used a Builder | one field swapped: `strResult` string -> `strAccum []byte` | [x] fixed |
 | EO2-2 | executor-operators-2 | medium | `operators_window.go:Open` — sort comparator re-evaluates expressions per comparison | ADOPT | 4000 rows / 8 partitions: 18.44ms -> 7.66ms (2.4x), allocs 256,905 -> 56,166 | comparison rule unchanged verbatim; only the evaluation moved to once per row | same "precompute keys, sort a permutation" shape as sortOp.sortChunk | [x] fixed |
@@ -50,8 +50,8 @@ not, with the reason) / empty (not judged yet).
 | EO2-8 | executor-operators-2 | medium | `operators_generated.go:evalGeneratedExpr` — re-parses expression string per row | | | | | [ ] |
 | EO2-9 | executor-operators-2 | medium | `operators_storage.go:checkUniqueIndexesForInsert` / `maintainUniqueIndexesForInsert` — per-row per-index btree open | | | | | [ ] |
 | EO2-11 | executor-operators-2 | medium | `operators_join_agg.go:aggregateOp.Open` — per-row allocations for group key values | | | | | [ ] |
-| EO2-12 | executor-operators-2 | medium | `operators_merge.go:mergedRow` — per-candidate-pair allocation | | | | | [ ] |
-| EO2-14 | executor-operators-2 | medium | `operators_project_set.go:openSelectSrfMode` — per-step output row allocation | | | | | [ ] |
+| EO2-12 | executor-operators-2 | medium | `operators_merge.go:mergedRow` — per-candidate-pair allocation | ADOPT | 400 target x 100 source rows: 6.47ms -> 4.34ms (1.5x), 9.10MB / 83,476 allocs -> 1.40MB / 43,476 (exactly the 40,000 pairs) | nothing retains the concatenated row — the pending mod stores its own copies of the source and target rows — so one scan buffer serves the whole page | one helper next to mergedRow, which stays for the callers that do need an owned row | [x] fixed |
+| EO2-14 | executor-operators-2 | medium | `operators_project_set.go:openSelectSrfMode` — per-step output row allocation | REJECT (not waste) | the per-step rows ARE the operator output: openSelectSrfMode materialises them into o.rows and Next hands them out, so each allocation is a retained row, not a temporary | — | — | [x] no change |
 | EO2-24 | executor-operators-2 | medium | `slot.go:asSlot` (callers: nextMerge, recursiveUnionOp, workTableScanOp) — MaterializedSlot allocated per emitted row | ADOPT | GROUP BY over 1000 groups: 2.54ms -> 2.39ms, 29,197 -> 28,197 allocs (exactly one per emitted row), 2.23MB -> 2.17MB | the established slot-reuse idiom and its documented "valid until the next Next()" contract (indexScanOp, M0092-0007) | one field per operator, four call sites | [x] fixed |
 | EO2-25 | executor-operators-2 | medium | `operators_upsert.go:maintainNonArbiterIndexesCapture` — btree re-opened per index per row | | | | | [ ] |
 | ES-7 | executor-sys | medium | `plpgsql_runtime.go:rewriteSQLNamedParams` — regexp compiled per argument per invocation | ADOPT | 3-argument rewrite: 29.6us -> 9.5us (3.1x), 16.0KB -> 1.0KB, 152 -> 25 allocs | the compiled pattern is identical; the cache key is the argument name | one `sync.Map`; the key set is bounded by the schema, not by traffic | [x] fixed |
@@ -1045,3 +1045,52 @@ there is none.
 - **No regression**: yes. New tests pin the FSM max equivalence and both
   foldChanges paths; the VM and FSM fork suites pass unchanged.
 - **Maintainability**: yes. Every one of them is shorter than what it replaced.
+
+### EO1-10 — ADOPT (reuse the series row and slot)
+
+`generate_series` and `generate_subscripts` allocated a one-column `Row` AND a
+`MaterializedSlot` for every value they emitted. Both are now operator fields,
+under the executor's existing "valid until the next Next()" contract.
+
+| `SELECT count(*) FROM generate_series(1, 20000)` | before | after |
+|---|---|---|
+| | 1,961,482 ns, 2,273,926 B, 40,098 allocs | 691,704 ns, 13,776 B, 93 allocs |
+
+- **Benefit**: yes. 2.8x, and the allocation count stops scaling with the series
+  length.
+- **No regression**: yes. Same values, same order; the SRF tests pass.
+- **Maintainability**: yes. Two fields, matching the idiom used elsewhere.
+
+### EO2-12 — ADOPT (build the MERGE ON row once per page, not per pair)
+
+`mergeOp` evaluates the ON condition for every (target row, source row) pair,
+and each evaluation allocated the concatenated row. Nothing retains it — the
+pending modification stores its own copies of the source and target rows — so
+one scratch buffer serves the whole page scan. `mergedRow` stays for the three
+callers that do need an owned row.
+
+| MERGE, 400 target x 100 source rows | before | after |
+|---|---|---|
+| | 6,471,980 ns, 9,099,281 B, 83,476 allocs | 4,340,512 ns, 1,399,520 B, 43,476 allocs |
+
+The allocation delta is exactly 40,000 — one per pair — which is the finding.
+
+- **Benefit**: yes. 1.5x on this shape, and the quadratic allocation term is gone.
+- **No regression**: yes. The MERGE suite passes, and the buffer never escapes
+  the pair loop.
+- **Maintainability**: yes. One helper beside the function it mirrors.
+
+### EO2-14 — REJECT (the allocation is the output)
+
+`openSelectSrfMode` allocates a row per emitted step, but those rows are the
+operator's output: they are appended to `o.rows` and handed out by `Next`.
+There is no temporary to remove — only a pooling scheme, which would have to
+prove no consumer retains a row past its next call, for no measured gain.
+
+### EC-20 — REJECT (no benefit, and it invites a sibling-path bug)
+
+`strings.ToLower` returns its input without allocating when it is already
+lower-case, and plan type names are catalog-normalised, so the per-cast cost is
+a scan of a few bytes. Removing it means switching on the raw string first and
+keeping a second, lower-cased switch in sync — the exact "sibling paths must
+agree" failure mode this codebase has been bitten by repeatedly.
