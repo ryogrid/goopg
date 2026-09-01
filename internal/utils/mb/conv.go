@@ -69,19 +69,18 @@ func DoEncodingConversion(src []byte, srcEnc, destEnc int32, lookup ConvProcLook
 		return nil, err
 	}
 
-	// Allocate destination buffer with worst-case expansion.
-	destBuf := make([]byte, len(src)*MAX_CONVERSION_GROWTH+1)
-	// We pass a sub-slice that the proc can write into.
-	// The proc is responsible for returning how many source bytes were consumed
-	// and the dest bytes produced.
+	// The proc allocates and returns its own destination buffer, and reports
+	// how many source bytes it consumed.
+	//
+	// review/260831 UT-14: a worst-case-expansion destination buffer used to be
+	// allocated here and immediately discarded (`_ = destBuf`) — for a 1 MB
+	// value under MAX_CONVERSION_GROWTH that is megabytes of garbage per
+	// conversion, for a buffer nothing ever wrote to.
 	consumed, converted, procErr := proc(src, false)
 	if procErr != nil {
 		return nil, procErr
 	}
-
-	// Use the proc's output directly (it allocated its own dest).
 	_ = consumed
-	_ = destBuf
 	return converted, nil
 }
 
