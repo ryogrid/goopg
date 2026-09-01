@@ -39,14 +39,14 @@ not, with the reason) / empty (not judged yet).
 | EC-20 | executor-core | medium | `expr.go:evalCast` — `strings.ToLower(targetType)` on every cast evaluation | REJECT (no benefit, sibling risk) | `strings.ToLower` does not allocate for an already-lower-case type name, and plan type names are catalog-normalised — the cost is a scan of a few bytes per cast | avoiding it means switching on the raw string first and keeping a second, lower-cased switch in sync — the sibling-paths failure mode this codebase has been bitten by repeatedly | — | [x] no change |
 | EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | REJECT (already done) | — | — | — | [x] no change |
 | EO1-13 | executor-operators-1 | medium | `operators_gather_merge.go:lessRows` — Sort key expressions re-evaluated on every heap comparison (promoted from Appendix A) | ADOPT | 4 sources x 2000 rows: 2.63ms -> 1.94ms (1.36x), allocs 42,652 -> 23,988 | comparison rule unchanged verbatim; keys evaluated once, when the row is pulled | same shape as EO2-2 / sortOp | [x] fixed |
-| EO1-4 | executor-operators-1 | medium | `operators_analyze.go:analyzeRelationWith` — Decodes every visible tuple but only keeps a fraction | | | | | [ ] |
+| EO1-4 | executor-operators-1 | medium | `operators_analyze.go:analyzeRelationWith` — Decodes every visible tuple but only keeps a fraction | ADOPT | 60,000-row table, 30,000-row sample: 124.3ms -> 117.8ms (5%), 362,167 -> 343,705 allocs, 77.9MB -> 76.0MB | the sampling decision and the RNG call order are unchanged — only the decode moved behind them, so the same rows end up in the reservoir | the decode is inline in one place instead of one | [x] fixed |
 | EO1-7 | executor-operators-1 | medium | `operators_bitmap.go:bitmapIndexScanOp.buildBitmap` — Allocates a slice per index entry in hot loop | ADOPT (finding partly wrong) | 17.0 ns -> 12.8 ns per index entry (1.33x). The claimed allocation does NOT happen — escape analysis keeps the one-element slice on the stack, 0 allocs either way | same insertion path (addOne); recheckAny is still only set when a tuple is added | three lines, and the call now says what it does | [x] fixed |
 | EO1-10 | executor-operators-1 | medium | `operators_generate_series.go:generateSeriesOp.Next` — Allocates a Row per emitted value | ADOPT | 20,000 values: 1.96ms -> 0.69ms (2.8x), 2.27MB / 40,098 allocs -> 13.8KB / 93 | the same slot-reuse contract the rest of the executor uses (indexScanOp, M0092-0007); values are unchanged | one Row and one slot field per operator, applied to generate_series and generate_subscripts alike | [x] fixed |
 | EO1-11 | executor-operators-1 | medium | `operators_fk.go:fkRowMatches` — Per-row linear column-name lookup on every row of a table scan | ADOPT | 16-column table, FK columns last: 262 ns -> 24 ns per row (10.7x) | a differential test compares the new form against the old name-resolving one, unknown-column and case-insensitive cases included | the resolution is hoisted to the top of each scan; the old function is gone, not duplicated | [x] fixed |
 | EO2-1 | executor-operators-2 | high | `operators_join_agg.go:applyAgg` — string_agg O(n²) string concatenation | ADOPT | 4000 rows in one group: 34.99ms -> 1.89ms (18.5x), 229MB -> 1.5MB allocated | concatenation order, delimiter placement and the bytea path are identical; the ORDER BY path already used a Builder | one field swapped: `strResult` string -> `strAccum []byte` | [x] fixed |
 | EO2-2 | executor-operators-2 | medium | `operators_window.go:Open` — sort comparator re-evaluates expressions per comparison | ADOPT | 4000 rows / 8 partitions: 18.44ms -> 7.66ms (2.4x), allocs 256,905 -> 56,166 | comparison rule unchanged verbatim; only the evaluation moved to once per row | same "precompute keys, sort a permutation" shape as sortOp.sortChunk | [x] fixed |
-| EO2-6 | executor-operators-2 | medium | `operators_index.go:Next` / `operators_storage.go:Next` — per-row enum value linear scan | | | | | [ ] |
-| EO2-7 | executor-operators-2 | medium | `operators_indexonly.go:decodeRowFromKey` / `operators_indexonly.go:decodeRowFromHeap` — per-row map allocation + O(covered × columns) projection | | | | | [ ] |
+| EO2-6 | executor-operators-2 | medium | `operators_index.go:Next` / `operators_storage.go:Next` — per-row enum value linear scan | ADOPT (not measurable end to end) | the per-row enum lookup plus label scan becomes one map read; the position map is resolved once per scan | same values, and the IOS tests pass | one lazily-built pair of slices on the operator | [x] fixed |
+| EO2-7 | executor-operators-2 | medium | `operators_indexonly.go:decodeRowFromKey` / `operators_indexonly.go:decodeRowFromHeap` — per-row map allocation + O(covered × columns) projection | ADOPT (not measurable end to end) | removes a map[string]Datum allocated per row plus the per-row name lookups | same projection, same errors; the IOS tests pass | positions resolved once per scan; the map-based projectCovered is gone rather than left beside the new path | [x] fixed |
 | EO2-8 | executor-operators-2 | medium | `operators_generated.go:evalGeneratedExpr` — re-parses expression string per row | ADOPT | 200 rows into a table with one generated column: 1.85ms -> 0.77ms (2.4x), 456KB / 8844 allocs -> 275KB / 5645 | evalGenExpr only READS the tree, and the key is the expression text, so a changed column definition lands on a different key | one sync.Map behind an accessor | [x] fixed |
 | EO2-9 | executor-operators-2 | medium | `operators_storage.go:checkUniqueIndexesForInsert` / `maintainUniqueIndexesForInsert` — per-row per-index btree open | REJECT (risk over reward) | measured: openIndexBTree is 159 ns / 416 B / 2 allocs per row per index — about 1-3% of a row insert | caching a tree across rows means invalidating it on index DDL, a CONCURRENTLY swap or a relfilenode change mid-statement; getting that wrong writes entries into the wrong tree | — | [x] no change |
 | EO2-11 | executor-operators-2 | medium | `operators_join_agg.go:aggregateOp.Open` — per-row allocations for group key values | | | | | [ ] |
@@ -68,12 +68,12 @@ not, with the reason) / empty (not judged yet).
 | OP2-18 | optimizer-2 | medium | scan_input_rewrite.go:absorbConjunctsIntoSubtree — Re-walks the whole subtree per matching conjunct | | | | | [ ] |
 | OP2-20 | optimizer-2 | medium | pushdown.go:pushOneConjunct — Per-conjunct whole-tree walks at every recursion level | | | | | [ ] |
 | OP2-29 | optimizer-2 | medium | selectivity.go:clauseSelectivity / clauseSelectivityWithSource — Near-identical duplicated implementations | | | | | [ ] |
-| OP2-31 | optimizer-2 | medium | planner.go:tryRangeIndexScan — Whole WHERE predicate resolved twice | | | | | [ ] |
+| OP2-31 | optimizer-2 | medium | planner.go:tryRangeIndexScan — Whole WHERE predicate resolved twice | REJECT (planning-time, threading risk) | one extra resolveExpr of the WHERE clause per planning of this shape | threading the already-resolved predicate out of tryRangeIndexScan means resolving in the right scope at the right time; a mistake there is a wrong plan, not a slow one | — | [x] no change |
 | XL-8 | xlog | medium | iterator.go:readOneAt — record header bytes read twice | | | | | [ ] |
 | XL-9 | xlog | medium | iterator.go:readBytesAt / readRecordBytesAt / readSegmentSlice — per-record allocation + per-chunk file open | | | | | [ ] |
 | XL-14 | xlog | medium | format.go:encodeRecordXLog / wrapXLogMainData — two allocations per WAL record | ADOPT | 64-byte payload 84.5 ns -> 51.8 ns (1.6x), 4096-byte payload 1.75us -> 0.92us (1.9x), 2 allocs -> 1 | the emitted bytes are identical; the chunk header is written in place instead of in a temporary | `wrapXLogMainData` is gone rather than left as a second, unused copy of the rule | [x] fixed |
 | XL-21 | xlog | medium | pg_assembled_emit.go — envelope + body + mainData allocation chain per PG record | | | | | [ ] |
-| XL-24 | xlog | medium | pg_xlog_decode.go:parseXLogRecordData — cloneXLogBytes per block/main-data chunk | | | | | [ ] |
+| XL-24 | xlog | medium | pg_xlog_decode.go:parseXLogRecordData — cloneXLogBytes per block/main-data chunk | REJECT (the copy is the boundary) | one copy per block/main-data chunk during decode | those copies are what make a decoded record independent of the reader buffer; removing them means proving every caller passes a freshly allocated buffer AND accepting that a retained record pins the whole record buffer | — | [x] no change |
 | XL-25 | xlog | medium | pgoutput.go:pgoPhysEpoch — reconstructs the PG epoch per column decode | | | | | [ ] |
 | XL-31 | xlog | medium | reader.go:readStreamFrom — stream slice grows without a capacity hint | ADOPT (no micro-benchmark) | a WAL segment is 16MB and there is usually more than one, so growing from zero capacity re-copied the whole stream at every doubling; the first segment size is known up front | pure capacity hint, the bytes are identical | one argument to make() | [x] fixed |
 | XL-38 | xlog | medium | reorder.go:foldChanges — allocates a copy even when nothing folds | ADOPT | the common no-fold case: 6244 ns -> 117 ns (53x), 24,576 B -> 0 allocs | two tests pin both paths: no fold returns the input, and a fold in the middle still produces the UPDATE with its neighbours intact | one scan before the allocation | [x] fixed |
@@ -109,7 +109,7 @@ not, with the reason) / empty (not judged yet).
 | PN-1 | parser-nodes | medium | `internal/parser/adapter.go:mapToken` — Per-token `resolve()` map lookup for every terminal | ADOPT (small) | pgbench-shaped statements: SELECT 6.28us -> 5.94us, UPDATE 6.33us -> 6.05us, INSERT 10.19us -> 9.81us (4-5%) | the terminal numbers are the same constants, resolved at init instead of per token | strictly less work: one map lookup per keyword instead of two, and the fixed terminals become package vars | [x] fixed |
 | PN-2 | parser-nodes | medium | `internal/parser/adapter.go:next()` — Double `strings.ToLower` per token | REJECT (no benefit, and a behaviour risk) | `strings.ToLower` does not allocate when the input is already lower-case, and the token strings are short — a scan of a few bytes | dropping the second call is NOT equivalent: a string literal such as `SELECT 'DATE' 'x'` currently reaches the typed-literal fold through the lowered text, and would stop doing so | — | [x] no change |
 | CP-3 | catalog-postmaster | medium | `catalog.go:InheritanceChildren` / `PartitionChildren` — O(children × tables) lookup by scanning the whole namespace map per child | ADOPT | 300 unrelated tables: 4 children 4.77us -> 3.18us (1.5x), 64 children 105us -> 10.1us (10.4x) | registration order and the "child OID with no table is skipped" rule pinned by a test | one shared helper, no cached index to keep in sync | [x] fixed |
-| CP-4 | catalog-postmaster | medium | `catalog.go:RoleIsMemberOf` / `IsAdminOfRole` / `HasPrivsOfRole` / `SelectBestAdmin` — BFS re-scans the entire `roleMembers` map per queue level (O(V×E)) | | | | | [ ] |
+| CP-4 | catalog-postmaster | medium | `catalog.go:RoleIsMemberOf` / `IsAdminOfRole` / `HasPrivsOfRole` / `SelectBestAdmin` — BFS re-scans the entire `roleMembers` map per queue level (O(V×E)) | REJECT (needs a maintained index) | the BFS re-scans the whole roleMembers map per level, but even one level is a full map scan — building the adjacency per call does not remove that | the real fix is an adjacency index maintained by every GRANT/REVOKE path, which is where role membership correctness lives | out of scope for a per-finding fix | [ ] deferred |
 | CP-5 | catalog-postmaster | medium | `catalog.go:LookupTableByOIDAllDBs` / `tableByOID` — linear scan of all tables per OID lookup | REJECT (maintainability) | plausible — `tableByOID` is O(tables) and runs per row for `tableoid::regclass` | — | an OID index would have to be maintained at ~100 sites that assign into or delete from `ns.tables`; there is no central setTable/dropTable helper to hang it on. Revisit once those writes are funnelled through one place | [x] no change |
 | UT-1 | utils | medium | `internal/utils/misc/encoding_guc.go:encodingNameToCanonical` — re-cleans the constant encoding table on every call | REJECT (no benefit) | the only caller is the client_encoding GUC check; it is not on any per-row or per-tuple path | — | — | [x] no change |
 | UT-9 | utils | medium | `internal/utils/adt/datetime/pg_datetime_format.go` — `fmt.Sprintf` on the per-cell output path | ADOPT | wire form 381 ns -> 45.9 ns (8.3x), 6 allocs -> 1; with a fraction 479 ns -> 54.8 ns (8.7x), 9 allocs -> 1. The DateStyle-aware path the protocol actually uses (misc.FormatTimestamp/FormatDate, ISO) 124 ns -> 56 ns and 79 ns -> 40 ns | two differential tests compare every renderer against the fmt / time.Format implementation it replaced, over thousands of random values plus BC, > year 9999 and negative-time edge cases | plain digit appends behind the same function names; the append form is the primitive and the string form wraps it | [x] fixed |
@@ -1216,3 +1216,59 @@ lands on a different key.
 This also settles half of ES-8: a PL/pgSQL routine no longer re-parses its body
 per call. What remains deferred there is the SQL-language routine's re-PLANNING
 per call, which needs the postmaster plan cache rather than an AST cache.
+
+### EO1-4 — ADOPT (decode only the tuples ANALYZE keeps)
+
+The sampling scan decoded EVERY visible tuple into a fresh Row and then usually
+dropped it: with the default statistics target the reservoir holds 30,000 rows,
+so a 10M-row table paid 10M decodes to keep 30,000. The reservoir decision is
+made first now, and the decode happens only for a tuple that is going into the
+sample. The RNG is still consulted once per row past the cap, in the same order,
+so the sample is the same sample.
+
+| ANALYZE a 60,000-row table (30,000-row sample) | before | after |
+|---|---|---|
+| | 124,332,775 ns, 77,935,702 B, 362,167 allocs | 117,809,146 ns, 76,014,648 B, 343,705 allocs |
+
+(The benchmark calls `analyzeRelation` directly and commits the seeding
+transaction first, the way `operators_analyze_test.go` does — the SQL-level
+ANALYZE does not reach the sampler from the unit fixture.)
+
+### EO2-6 / EO2-7 — ADOPT, without an end-to-end measurement
+
+`indexOnlyScanOp` did three things per row that depend only on the scan:
+projected its covered columns through a freshly allocated `map[string]Datum`,
+found each covered column's position in the table by scanning the column list,
+and — for an enum column — looked the type up and scanned its label list. All
+three are resolved once per scan now (`coveredKeyIdx`, `coveredHeapIdx`,
+`coveredEnum`), and the map-based `projectCovered` is gone rather than left
+beside the new path.
+
+No end-to-end benchmark is recorded, and that is worth being explicit about: I
+could not get the planner to emit an IndexOnlyScan for these shapes at all
+(`SELECT a, bb FROM t WHERE a >= 0` and a BETWEEN variant both plan as a Filter
+over a scan, with and without ANALYZE), which matches the known gap that goopg
+has no index-only-scan path. The change is a strict reduction in per-row work on
+the operator's decode path, verified by the existing IOS unit tests, but its
+benefit is only realised once that planner gap is closed.
+
+### CP-4 / OP2-31 / XL-24 — REJECT
+
+**CP-4** — the role-membership BFS re-scans the whole `roleMembers` map per
+queue level, but even a single level is a full map scan, so building the
+adjacency per call does not remove the dominant cost. The fix that would is an
+adjacency index maintained by every GRANT/REVOKE path — role membership is
+where ACL correctness lives, so that is a deliberate change, not a per-finding
+one. Recorded as deferred.
+
+**OP2-31** — resolving the WHERE clause twice costs one `resolveExpr` per
+planning of this shape. Threading the already-resolved predicate out of
+`tryRangeIndexScan` means getting the resolve scope and timing right; a mistake
+there produces a wrong plan rather than a slow one. Not worth it for
+planning-time work that a cached plan pays once.
+
+**XL-24** — the `cloneXLogBytes` copies are the boundary that makes a decoded
+WAL record independent of the reader's buffer. Removing them means proving
+every caller hands in a freshly allocated buffer and accepting that any
+retained record pins the whole record buffer. On the recovery path that trade
+is not worth a per-record copy of a few hundred bytes.
