@@ -183,8 +183,12 @@ func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 	// still fits metapage + one leaf (121 × 16 B ≪ one btree page), so 2839
 	// stays at 2. M0133-S4 tranche 4 adds element_types (6 more chunks),
 	// taking 2838 to 32 pages (127 chunks at ~2032 B, four to a page →
-	// ceil(127/4) = 32).
-	wantPages := map[string]int{"2838": 32, "2839": 2}
+	// ceil(127/4) = 32). review/260831 NB-17 then made pglz.Compress emit the
+	// byte-identical stream real pglz_compress() emits (hash chain +
+	// good_match early exit) instead of the slightly denser one the old
+	// brute-force search found; the same values now take 131 chunks, so 2838
+	// is ceil(131/4) = 33 pages. 2839 still fits metapage + one leaf.
+	wantPages := map[string]int{"2838": 33, "2839": 2}
 	for _, db := range []string{"1", "5"} {
 		for _, oid := range []string{"2838", "2839"} {
 			path := filepath.Join(dir, "base", db, oid)
