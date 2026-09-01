@@ -260,6 +260,17 @@ const xidMaxSafe = ^storage.TransactionID(0) - xidStopAge
 // counter — suitable for tests and callers that have not yet threaded
 // an explicit procNum. Production server code should always supply one.
 func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, error) {
+	// Validated up front so BOTH branches below reject an unsupported level:
+	// the auto-assign branch used to return before the switch, so a garbage
+	// level was stored into the slot (and registered SSI bookkeeping when it
+	// happened to equal IsolationSerializable). Checking here also means the
+	// auto-assign CAS cannot claim a slot that is then abandoned by the error
+	// return. (review/260831-2 TA-3.)
+	switch iso {
+	case IsolationReadCommitted, IsolationRepeatableRead, IsolationSerializable:
+	default:
+		return Transaction{}, fmt.Errorf("mvcc: unsupported isolation level %v", iso)
+	}
 	var procNum int32
 	if len(procNums) > 0 {
 		procNum = procNums[0]
@@ -300,11 +311,6 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 			m.ssiMu.Unlock()
 		}
 		return Transaction{Handle: handle, XID: storage.InvalidTransactionID, Isolation: iso}, nil
-	}
-	switch iso {
-	case IsolationReadCommitted, IsolationRepeatableRead, IsolationSerializable:
-	default:
-		return Transaction{}, fmt.Errorf("mvcc: unsupported isolation level %v", iso)
 	}
 	if procNum < 0 || int(procNum) >= len(m.procArray.slots) {
 		return Transaction{}, fmt.Errorf("mvcc: procNum %d out of range [0, %d)", procNum, len(m.procArray.slots))
