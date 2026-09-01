@@ -71,7 +71,7 @@ not, with the reason) / empty (not judged yet).
 | OP2-31 | optimizer-2 | medium | planner.go:tryRangeIndexScan — Whole WHERE predicate resolved twice | | | | | [ ] |
 | XL-8 | xlog | medium | iterator.go:readOneAt — record header bytes read twice | | | | | [ ] |
 | XL-9 | xlog | medium | iterator.go:readBytesAt / readRecordBytesAt / readSegmentSlice — per-record allocation + per-chunk file open | | | | | [ ] |
-| XL-14 | xlog | medium | format.go:encodeRecordXLog / wrapXLogMainData — two allocations per WAL record | | | | | [ ] |
+| XL-14 | xlog | medium | format.go:encodeRecordXLog / wrapXLogMainData — two allocations per WAL record | ADOPT | 64-byte payload 84.5 ns -> 51.8 ns (1.6x), 4096-byte payload 1.75us -> 0.92us (1.9x), 2 allocs -> 1 | the emitted bytes are identical; the chunk header is written in place instead of in a temporary | `wrapXLogMainData` is gone rather than left as a second, unused copy of the rule | [x] fixed |
 | XL-21 | xlog | medium | pg_assembled_emit.go — envelope + body + mainData allocation chain per PG record | | | | | [ ] |
 | XL-24 | xlog | medium | pg_xlog_decode.go:parseXLogRecordData — cloneXLogBytes per block/main-data chunk | | | | | [ ] |
 | XL-25 | xlog | medium | pgoutput.go:pgoPhysEpoch — reconstructs the PG epoch per column decode | | | | | [ ] |
@@ -79,7 +79,7 @@ not, with the reason) / empty (not judged yet).
 | XL-38 | xlog | medium | reorder.go:foldChanges — allocates a copy even when nothing folds | | | | | [ ] |
 | XL-39 | xlog | medium | recovery.go:Decode* helpers — defensive tuple copies per record | | | | | [ ] |
 | XL-50 | xlog | medium | slots.go:writeSlotLocked — full rewrite + double fsync per slot update | | | | | [ ] |
-| XL-68 | xlog | medium | xlog_assemble.go:assembleXLogRecord — header/payload built via repeated append with no capacity hint | | | | | [ ] |
+| XL-68 | xlog | medium | xlog_assemble.go:assembleXLogRecord — header/payload built via repeated append with no capacity hint | ADOPT | one block ref: 207 ns -> 107 ns (data only), 293 ns -> 132 ns (image with a hole), 6.5us -> 3.1us (whole-page image); 6-8 allocs -> 2 | byte-identical output; the WAL/pg_waldump parity tests in the package cover it | sizes computed up front by one shared hole helper, so the estimate cannot drift from what is written | [x] fixed |
 | IN-4 | initdb | medium | `pg_aggregate_view.go:registerPgAggregateView` — pgAggregateInitialEntries() rebuilt on every query | | | | | [ ] |
 | IN-8 | initdb | medium | `initdb.go:writeMultiPageHeap` / `writeMultiPageHeapRowsExternal` — hasVarWidthCol recomputed per row (loop invariant) | | | | | [ ] |
 | ST-1 | storage | high | `heap.go:CollectDeadHeapSlots` — copies every tuple to inspect only its header | ADOPT | 8282 -> 2622 ns/page (3.2x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
@@ -723,3 +723,53 @@ tables in the namespace):
   and the "a child OID with no table is skipped" rule.
 - **Maintainability**: yes. One helper shared by both callers; no cached index
   that could go stale.
+
+### XL-68 — ADOPT (size the WAL record buffers up front)
+
+`assembleXLogRecord` grew its header and payload regions from nil and then
+concatenated them into a third buffer, and `encodeFullPageImage` built each
+full-page image in its own page-sized buffer before that was copied into the
+payload — so one WAL record cost six to eight allocations. All three sizes are
+known before the loop, so they are computed once: block headers are at most 25
+bytes each, and the payload is the images plus the block data plus the main
+data. `fpiHole` is now the single place that decides what a page's free-space
+hole is, so the size estimate and the bytes actually written cannot disagree,
+and the image is appended straight into the payload.
+
+Measured (`internal/access/transam/xlog/assemble_bench_test.go`, one block ref
+with 96 bytes of block data and 24 bytes of main data):
+
+| case | before | after |
+|---|---|---|
+| no image | 207.5 ns, 488 B, 6 allocs | 107.1 ns, 272 B, 2 allocs |
+| image with a hole | 293.1 ns, 664 B, 8 allocs | 131.9 ns, 320 B, 2 allocs |
+| whole-page image | 6458 ns, 36,792 B, 7 allocs | 3136 ns, 18,944 B, 2 allocs |
+
+- **Benefit**: yes. About 2x on every WAL record, and half the bytes allocated —
+  goopg emits a full-page image per record today, so the third row is the one
+  the write path actually walks.
+- **No regression**: yes. The output bytes are unchanged, and the package's
+  pg_waldump / PG-parity tests exercise every record type.
+- **Maintainability**: yes. One helper replaces the duplicated hole rule.
+
+### XL-14 — ADOPT (write the main-data chunk in place)
+
+`encodeRecordXLog` called `wrapXLogMainData`, which allocated a buffer holding
+the chunk header plus a copy of the payload, and then copied that buffer again
+into the output record: two allocations and two copies of the payload per WAL
+record. The chunk header is now written directly into the output record and the
+payload copied once. `wrapXLogMainData` had no other caller and was removed
+rather than left as an unused second copy of the format rule (its counterpart
+`unwrapXLogMainData` stays, since the decode path uses it).
+
+Measured (`internal/access/transam/xlog/assemble_bench_test.go`):
+
+| payload | before | after |
+|---|---|---|
+| 64 B | 84.5 ns, 176 B, 2 allocs | 51.8 ns, 96 B, 1 alloc |
+| 4096 B | 1750 ns, 9728 B, 2 allocs | 919 ns, 4864 B, 1 alloc |
+
+- **Benefit**: yes. 1.6x to 1.9x per record, on the write path.
+- **No regression**: yes. The emitted bytes are identical; the package's format
+  tests pin the header, the padding and the chunk encoding.
+- **Maintainability**: yes. One function fewer.
