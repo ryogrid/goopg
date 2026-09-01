@@ -27,6 +27,13 @@ var (
 	ErrDatabaseNotFound = errors.New("database does not exist")
 )
 
+// ErrRenameNameConflict is wrapped by the RenameCollation / RenameConversion
+// rename helpers when the *target* name is already taken, as opposed to the
+// source object being absent. Callers must tell the two apart: PG reports a
+// rename collision as 42710 duplicate_object ("... already exists in schema
+// ..."), not 42704 undefined_object (review/260831-2 EO1-7).
+var ErrRenameNameConflict = errors.New("name already exists")
+
 // RelationLockRowsFunc is optionally set by the executor to provide
 // currently-held relation lock rows (from LOCK TABLE) for pg_locks.
 // Same column order as AdvisoryLockRowsFunc. M0097.
@@ -13704,7 +13711,7 @@ func (c *InMemory) RenameCollation(name, schema, newName string, dbOid ...uint32
 			continue
 		}
 		if strings.EqualFold(uc.Name, newName) {
-			return fmt.Errorf("collation %q already exists", newName)
+			return fmt.Errorf("collation %q already exists: %w", newName, ErrRenameNameConflict)
 		}
 	}
 	if target == nil {
@@ -13991,7 +13998,7 @@ func (c *InMemory) RenameConversion(name, schema, newName string, dbOid ...uint3
 			continue
 		}
 		if strings.EqualFold(uc.Name, newName) {
-			return fmt.Errorf("conversion %q already exists", newName)
+			return fmt.Errorf("conversion %q already exists: %w", newName, ErrRenameNameConflict)
 		}
 	}
 	if target == nil {

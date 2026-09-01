@@ -840,6 +840,16 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 	switch s.Action {
 	case "rename":
 		if err := im.RenameCollation(s.Name.Name, schema, s.NewName, dbOid); err != nil {
+			// A taken target name is PG's 42710 duplicate_object, not
+			// "does not exist" — and under IF EXISTS the old mapping
+			// downgraded the collision to a NOTICE and reported success
+			// while nothing was renamed (review/260831-2 EO1-7). Wording
+			// per PG's RenameCollation (pg_collation.c); goopg is always
+			// UTF8, as the COMMENT ON COLLATION path already assumes.
+			if errors.Is(err, catalog.ErrRenameNameConflict) {
+				return &ExecError{Code: "42710", Pos: s.Pos(),
+					Message: fmt.Sprintf("collation %q for encoding %q already exists in schema %q", s.NewName, "UTF8", schema)}
+			}
 			return notFound()
 		}
 		// B2.2 slice 4: the rename is a canonical pg_collation heap UPDATE
@@ -920,6 +930,13 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 	switch s.Action {
 	case "rename":
 		if err := im.RenameConversion(s.Name.Name, schema, s.NewName, dbOid); err != nil {
+			// Same split as execAlterCollation's rename arm: a taken target
+			// name is 42710 duplicate_object with PG's report_namespace_conflict
+			// wording (alter.c), not 42704 (review/260831-2 EO1-7).
+			if errors.Is(err, catalog.ErrRenameNameConflict) {
+				return &ExecError{Code: "42710", Pos: s.Pos(),
+					Message: fmt.Sprintf("conversion %q already exists in schema %q", s.NewName, schema)}
+			}
 			return notFound()
 		}
 		// Move the compat-registry entry with the rename: DROP CONVERSION's
