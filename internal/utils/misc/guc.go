@@ -830,14 +830,29 @@ func convertUnit(n int64, from, to Unit) (int64, error) {
 		if !ok {
 			return 0, fmt.Errorf("cannot convert byte unit to time unit")
 		}
-		return n * fb / tb, nil
+		return scaleUnit(n, fb, tb)
 	}
 	if ft, ok := timeFamily(from); ok {
 		tt, ok := timeFamily(to)
 		if !ok {
 			return 0, fmt.Errorf("cannot convert time unit to byte unit")
 		}
-		return n * ft / tt, nil
+		return scaleUnit(n, ft, tt)
 	}
 	return 0, fmt.Errorf("unconvertible unit pair (%v -> %v)", from, to)
+}
+
+// scaleUnit computes n*mul/div with an overflow check. The bare `n * mul / div`
+// it replaces wrapped silently, so `SET work_mem = '9000000TB'` stored a
+// wrapped (often negative, sometimes in-range and therefore ACCEPTED) value
+// instead of being rejected. PG's convert_to_base_unit uses
+// pg_mul_s64_overflow for exactly this and reports `invalid value for
+// parameter … HINT: Value exceeds integer range.` (review/260831-2 UT-3).
+func scaleUnit(n, mul, div int64) (int64, error) {
+	if mul != 0 {
+		if p := n * mul; p/mul != n {
+			return 0, errors.New("value exceeds integer range")
+		}
+	}
+	return n * mul / div, nil
 }
