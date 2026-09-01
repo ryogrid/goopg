@@ -624,6 +624,14 @@ func (o *limitOp) Open(ctx *Context) error {
 	o.skipped = 0
 	o.inTiesPhase = false
 	o.tieKeyVals = nil
+	// The bounds themselves are per-execution too: a correlated LIMIT/OFFSET
+	// (`SELECT (SELECT ... LIMIT o.n) FROM o`) is re-evaluated on every Open,
+	// and a NULL result means "no limit" / "no offset". Without this reset the
+	// NULL arms below simply left the PREVIOUS outer row's bound in place, so
+	// the unlimited execution kept the earlier row count
+	// (review/260831-2 EO1-2).
+	o.limitCount = -1
+	o.offsetCount = 0
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}

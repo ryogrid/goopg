@@ -80,7 +80,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EC-6 | low | `executor/copy_binary.go:datumToCopyBinary` — int4 arm missing range check | ? | [ ] | |
 | EC-7 | low | `executor/copy_binary.go:copyBinaryToDatum` — infinity sentinels not handled | ? | [ ] | |
 | EC-8 | low | `executor/codec_aclitem.go:aclModeFromPrivLetters` — shift-after-guard pattern (report says not a live bug) | ? | [ ] | |
-| EO1-2 | low | `executor/operators.go:limitOp.Open` — stale limitCount survives a NULL-limit re-Open | BUG | [ ] | pending gate |
+| EO1-2 | low | `executor/operators.go:limitOp.Open` — stale limitCount survives a NULL-limit re-Open | BUG | [x] fixed + guarded | this commit |
 | EO1-4 | low | `executor/operators_bitmap.go:lookupBounds` — index out of range with a zero-key-column index | NOT A BUG | [x] | — |
 | EO1-5 | low | `executor/operators_generate_series.go:generateSeriesOp.Next` — int64 overflow near MaxInt64 | BUG (dup EO2-3) | [x] | 5c60e8551 |
 | EO1-6 | low | `executor/operators_ddl.go:execDropTablespace` — not-empty check only inspects InMemory catalog | NOT A BUG | [x] | — |
