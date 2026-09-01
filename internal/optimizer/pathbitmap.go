@@ -325,12 +325,20 @@ func (s *searchCtx) chooseBitmapAnd(
 
 	// Copy and sort by tree cost (cheapest first), matching PG's
 	// path_usage_comparator sort order.
+	//
+	// review/260831 OP2-14: the comparator used to call costBitmapTree on both
+	// sides of every comparison, so each candidate's cost was recomputed
+	// O(log n) times — and costBitmapTree walks the path's whole bitmap tree.
+	// The costs are computed once and the sort reads them.
 	paths := make([]*Path, len(singlePaths))
 	copy(paths, singlePaths)
+	treeCost := make(map[*Path]float64, len(paths))
+	for _, p := range paths {
+		c, _ := costBitmapTree(s.cp, p.Children[0])
+		treeCost[p] = c
+	}
 	sort.Slice(paths, func(i, j int) bool {
-		ci, _ := costBitmapTree(s.cp, paths[i].Children[0])
-		cj, _ := costBitmapTree(s.cp, paths[j].Children[0])
-		return ci < cj
+		return treeCost[paths[i]] < treeCost[paths[j]]
 	})
 
 	// Pre-extract index column sets for redundancy checks.
