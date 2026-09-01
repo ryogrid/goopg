@@ -142,3 +142,53 @@ func BenchmarkFoldChangesNoFold(b *testing.B) {
 func benchRel(oid uint32) storage.RelFileNode {
 	return storage.RelFileNode{DBOid: 1, RelOid: oid}
 }
+
+// BenchmarkFramedAssemble measures assembling and framing one pre-assembled PG
+// record (review/260831 XL-21): the record used to be assembled and then copied
+// again into a buffer carrying the 7-byte goopg envelope.
+func BenchmarkFramedAssemble(b *testing.B) {
+	mainData, blocks := benchAssembleInputs("")
+
+	b.Run("assemble+frame", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			body, err := assembleXLogRecord(mainData, blocks)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if out := framePGAssembled(RmgrHeap, 0, 7, body); len(out) == 0 {
+				b.Fatal("empty record")
+			}
+		}
+	})
+	b.Run("framed", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			out, err := framedAssemble(RmgrHeap, 0, 7, mainData, blocks)
+			if err != nil || len(out) == 0 {
+				b.Fatalf("framedAssemble: %v", err)
+			}
+		}
+	})
+}
+
+// TestFramedAssembleMatchesFrameOfAssemble pins that framing through the
+// prefix produces the same bytes as assembling then framing (review/260831
+// XL-21).
+func TestFramedAssembleMatchesFrameOfAssemble(t *testing.T) {
+	for _, image := range []string{"", "hole", "full"} {
+		mainData, blocks := benchAssembleInputs(image)
+		body, err := assembleXLogRecord(mainData, blocks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := framePGAssembled(RmgrHeap, 3, 42, body)
+		got, err := framedAssemble(RmgrHeap, 3, 42, mainData, blocks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("image=%q: framedAssemble produced %d bytes, assemble+frame %d", image, len(got), len(want))
+		}
+	}
+}

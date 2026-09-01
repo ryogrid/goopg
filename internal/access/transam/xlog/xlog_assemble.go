@@ -73,6 +73,17 @@ type FullPageImage struct {
 // owning transaction id is a header field (XLogRecord.XID) and is stamped by
 // the caller, not carried in the body.
 func assembleXLogRecord(mainData []byte, blocks []BlockRef) ([]byte, error) {
+	return assembleXLogRecordInto(nil, mainData, blocks)
+}
+
+// assembleXLogRecordInto is assembleXLogRecord with `prefix` copied in front of
+// the assembled record, in the SAME allocation.
+//
+// review/260831 XL-21: the pre-assembled-PG path used to assemble the record
+// and then copy the whole thing again into a buffer carrying the 7-byte goopg
+// envelope — a second allocation and a second full copy of every WAL record it
+// emits. Passing the envelope in as a prefix removes both.
+func assembleXLogRecordInto(prefix []byte, mainData []byte, blocks []BlockRef) ([]byte, error) {
 	// review/260831 XL-68: both regions used to grow from nil, so every WAL
 	// record paid a handful of reallocations and then one more copy for the
 	// concatenation at the end. The sizes are known up front — a block header
@@ -168,7 +179,8 @@ func assembleXLogRecord(mainData []byte, blocks []BlockRef) ([]byte, error) {
 		payload = append(payload, mainData...)
 	}
 
-	out := make([]byte, 0, len(header)+len(payload))
+	out := make([]byte, 0, len(prefix)+len(header)+len(payload))
+	out = append(out, prefix...)
 	out = append(out, header...)
 	out = append(out, payload...)
 	return out, nil
