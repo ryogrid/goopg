@@ -35,7 +35,7 @@ not, with the reason) / empty (not judged yet).
 | EC-3 | executor-core | medium | `applyworker.go:decodePgoutputTupleAsRow` — column-name map rebuilt on every row | | | | | [ ] |
 | EC-7 | executor-core | medium | `hash_partition.go:computeHashPartitionRowHash` — per-row invariant work on the INSERT partition-routing hot path | | | | | [ ] |
 | EC-14 | executor-core | medium | `copy.go:insertSourceRow` — per-row `make(Row, …)` instead of the row pool | REJECT (regression risk vs benefit) | one small allocation per row, against a per-row cost dominated by defaults, constraints, tuple encode, the page write and index maintenance | pooling requires PROVING no path retains the row (defaults, CHECK/domain constraints, TOAST, heap write, unique-index maintenance); a wrong release corrupts data silently rather than failing a test | — | [x] no change |
-| EC-16 | executor-core | medium | `copy_binary.go:decodeNumericBinary` — dead `fullMantissa` computation before unconditional fallback | | | | | [ ] |
+| EC-16 | executor-core | medium | `copy_binary.go:decodeNumericBinary` — dead `fullMantissa` computation before unconditional fallback | ADOPT (mostly dead code) | binary NUMERIC decode 652 ns -> 608 ns for a small value; the loop was pure waste but cheap | BOTH arms of the branch it fed called decodeNumericBinaryViaBig — the "fast path" was never finished — so removing it cannot change a result | deletes a 25-line loop that read as a live fast path | [x] fixed |
 | EC-20 | executor-core | medium | `expr.go:evalCast` — `strings.ToLower(targetType)` on every cast evaluation | REJECT (no benefit, sibling risk) | `strings.ToLower` does not allocate for an already-lower-case type name, and plan type names are catalog-normalised — the cost is a scan of a few bytes per cast | avoiding it means switching on the raw string first and keeping a second, lower-cased switch in sync — the sibling-paths failure mode this codebase has been bitten by repeatedly | — | [x] no change |
 | EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | REJECT (already done) | — | — | — | [x] no change |
 | EO1-13 | executor-operators-1 | medium | `operators_gather_merge.go:lessRows` — Sort key expressions re-evaluated on every heap comparison (promoted from Appendix A) | ADOPT | 4 sources x 2000 rows: 2.63ms -> 1.94ms (1.36x), allocs 42,652 -> 23,988 | comparison rule unchanged verbatim; keys evaluated once, when the row is pulled | same shape as EO2-2 / sortOp | [x] fixed |
@@ -80,7 +80,7 @@ not, with the reason) / empty (not judged yet).
 | XL-39 | xlog | medium | recovery.go:Decode* helpers — defensive tuple copies per record | | | | | [ ] |
 | XL-50 | xlog | medium | slots.go:writeSlotLocked — full rewrite + double fsync per slot update | | | | | [ ] |
 | XL-68 | xlog | medium | xlog_assemble.go:assembleXLogRecord — header/payload built via repeated append with no capacity hint | ADOPT | one block ref: 207 ns -> 107 ns (data only), 293 ns -> 132 ns (image with a hole), 6.5us -> 3.1us (whole-page image); 6-8 allocs -> 2 | byte-identical output; the WAL/pg_waldump parity tests in the package cover it | sizes computed up front by one shared hole helper, so the estimate cannot drift from what is written | [x] fixed |
-| IN-4 | initdb | medium | `pg_aggregate_view.go:registerPgAggregateView` — pgAggregateInitialEntries() rebuilt on every query | | | | | [ ] |
+| IN-4 | initdb | medium | `pg_aggregate_view.go:registerPgAggregateView` — pgAggregateInitialEntries() rebuilt on every query | ADOPT | one query against pg_aggregate: 96.2us -> 6.3us (15.3x), 87.6KB / 1515 allocs -> 9.5KB / 28 | the BKI half is constant; consumers only read the rows (they build their own Row per output), so sharing the cached slices is safe | one sync.OnceValue and a shorter closure | [x] fixed |
 | IN-8 | initdb | medium | `initdb.go:writeMultiPageHeap` / `writeMultiPageHeapRowsExternal` — hasVarWidthCol recomputed per row (loop invariant) | ADOPT (small) | the varlena scan moves out of the per-row loop in both bootstrap heap writers; initdb-only, so no steady-state effect | the value is identical for every row of a call — the column set does not change | two hoisted locals | [x] fixed |
 | ST-1 | storage | high | `heap.go:CollectDeadHeapSlots` — copies every tuple to inspect only its header | ADOPT | 8282 -> 2622 ns/page (3.2x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
 | ST-2 | storage | high | `vm.go:PageAllVisible` / `PageAllFrozen` — same full-tuple copy, only the header is read | ADOPT | 8007 -> 2188 ns/page (3.7x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
@@ -91,10 +91,10 @@ not, with the reason) / empty (not judged yet).
 | ST-8 | storage | medium | `fsm_fork.go:buildFSMTree` — re-parses every built page just to recover the max category | ADOPT | building a 100k-page relation FSM: 346us -> 244us (1.42x), 322KB / 66 allocs -> 216KB / 40 | fp_nodes[0] IS the max-tree root buildFSMPage computes; a test compares it against parseFSMPage over several fill levels | one accessor replaces a full page re-parse (and ST-9 in Appendix A, the same parseFSMPage waste, disappears with it) | [x] fixed |
 | ST-10 | storage | medium | `vm_fork.go:parseVMPage` — allocates a full `vmMaxHeapPagesPerPage` slice per page during `ReadVMFork` | ADOPT | decoding a 16-page VM fork: 1.02ms -> 0.43ms (2.4x), 2.51MB / 10 allocs -> 524KB / 1 | the decode rule is unchanged, it just appends into the caller buffer; parseVMPage keeps its signature for the redo test | one helper, one pre-sized result | [x] fixed |
 | ST-14 | storage | medium | `lmgr/lockmgr.go:grantedExcept` — O(number of holders) recomputation when the cached mask already has the answer | | | | | [ ] |
-| ST-16 | storage | medium | `aio/read_stream.go:refill` — allocates a fresh BlockSize buffer per prefetched block | | | | | [ ] |
-| ST-17 | storage | medium | `bufpool.go:Prefetch` — allocates a fresh 8KB buffer per prefetch | | | | | [ ] |
+| ST-16 | storage | medium | `aio/read_stream.go:refill` — allocates a fresh BlockSize buffer per prefetched block | REJECT (needs an API contract, not a fix) | real allocation per prefetched block | the buffer BECOMES the caller data: ReadStream.Next hands those bytes out, so recycling needs a release call and a "do not retain" contract on every consumer | out of scope for a per-finding fix | [ ] deferred |
+| ST-17 | storage | medium | `bufpool.go:Prefetch` — allocates a fresh 8KB buffer per prefetch | REJECT (unsafe to pool) | real 8KB allocation per prefetch | the buffer must stay alive until the async read completes, and the handle is dropped — reusing one buffer across in-flight prefetches means concurrent kernel writes into it. A pool would have to be tied to IO completion, which the AIO layer does not expose | out of scope for a per-finding fix | [ ] deferred |
 | NB-4 | nbtree-amcheck | low/medium | `pgpage.go:pgFirstDataSlot` — opaque re-decoded on every accessor call inside loops | | | | | [ ] |
-| NB-8 | nbtree-amcheck | medium | `btree.go:resetPageItems` — byte-by-byte zeroing of the whole data area on every page rewrite | | | | | [ ] |
+| NB-8 | nbtree-amcheck | medium | `btree.go:resetPageItems` — byte-by-byte zeroing of the whole data area on every page rewrite | ADOPT | 1811 ns -> 118 ns per page rewrite (15.3x) | `clear` over the same byte range; the high key is still re-stamped afterwards, which the existing TestResetPageItemsKeepsTheHighKey pins | one line | [x] fixed |
 | NB-9 | nbtree-amcheck | medium | `btree.go:findChildBlockDirect` / `btree.go:insertItemSorted` — per-probe key copies inside descent/insert binary search | | | | | [ ] |
 | NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | REJECT (maintainability) | plausible | — | pageItems returns an EXPANDED item list (one entry per heap TID), so items do not map 1:1 to line pointers; a lazy binary search would have to rework that invariant and its VACUUM-side readers | [x] no change |
 | NB-11 | nbtree-amcheck | low/medium | `btree.go:EncodeNumericKey` — fresh big.Int allocation per trailing-zero strip iteration | ADOPT | numeric index key with trailing zeros: 506 ns -> 251 ns (2.0x), 128 B / 15 allocs -> 48 B / 5 | a differential test compares the key bytes against the old two-division strip loop | two scratch values and a swap, plus a package-level ten | [x] fixed |
@@ -113,7 +113,7 @@ not, with the reason) / empty (not judged yet).
 | CP-5 | catalog-postmaster | medium | `catalog.go:LookupTableByOIDAllDBs` / `tableByOID` — linear scan of all tables per OID lookup | REJECT (maintainability) | plausible — `tableByOID` is O(tables) and runs per row for `tableoid::regclass` | — | an OID index would have to be maintained at ~100 sites that assign into or delete from `ns.tables`; there is no central setTable/dropTable helper to hang it on. Revisit once those writes are funnelled through one place | [x] no change |
 | UT-1 | utils | medium | `internal/utils/misc/encoding_guc.go:encodingNameToCanonical` — re-cleans the constant encoding table on every call | REJECT (no benefit) | the only caller is the client_encoding GUC check; it is not on any per-row or per-tuple path | — | — | [x] no change |
 | UT-9 | utils | medium | `internal/utils/adt/datetime/pg_datetime_format.go` — `fmt.Sprintf` on the per-cell output path | ADOPT | wire form 381 ns -> 45.9 ns (8.3x), 6 allocs -> 1; with a fraction 479 ns -> 54.8 ns (8.7x), 9 allocs -> 1. The DateStyle-aware path the protocol actually uses (misc.FormatTimestamp/FormatDate, ISO) 124 ns -> 56 ns and 79 ns -> 40 ns | two differential tests compare every renderer against the fmt / time.Format implementation it replaced, over thousands of random values plus BC, > year 9999 and negative-time edge cases | plain digit appends behind the same function names; the append form is the primitive and the string form wraps it | [x] fixed |
-| UT-14 | utils | medium | `internal/utils/mb/conv.go:DoEncodingConversion` — dead `destBuf` allocation | | | | | [ ] |
+| UT-14 | utils | medium | `internal/utils/mb/conv.go:DoEncodingConversion` — dead `destBuf` allocation | ADOPT | removes a worst-case-expansion buffer allocated and discarded per conversion (`_ = destBuf`) — MAX_CONVERSION_GROWTH x the input size, per call | dead: the proc allocates and returns its own destination | deletes four lines | [x] fixed |
 | UT-20 | utils | medium | `internal/utils/mmgr/mctx.go:Lookup` — global mutex on the per-datum read path | ADOPT | serial 3.70 ns -> 0.67 ns (5.5x); 16-way parallel 35.05 ns -> 0.09 ns (396x — the mutex was serialising every backend on a pure read) | the registry slots are atomic pointers; ctxMu still orders id allocation, and a released slot is cleared BEFORE its id can be reused | one declaration and three accessors; `go test -race` on the package passes | [x] fixed |
 | UT-23 | utils | medium | `internal/utils/adt/array/pgarray.go:DecodeElemStyled` — `strings.ToLower(elemName)` recomputed per element | REJECT (no benefit) | `strings.ToLower` only scans (no allocation) when the input is already lower-case, and element names are catalog-normalised | — | — | [x] no change |
 
@@ -1094,3 +1094,40 @@ lower-case, and plan type names are catalog-normalised, so the per-cast cost is
 a scan of a few bytes. Removing it means switching on the raw string first and
 keeping a second, lower-cased switch in sync — the exact "sibling paths must
 agree" failure mode this codebase has been bitten by repeatedly.
+
+### NB-8 / IN-4 / UT-14 / EC-16 — ADOPT; ST-16 / ST-17 — REJECT (deferred)
+
+**NB-8** — `resetPageItems` zeroed the whole ~8 KB data area one byte at a
+time, on every whole-page rewrite (split, dedup recovery, VACUUM compaction and
+their WAL replays). `clear` over the same range: 1811 ns -> 118 ns (15.3x).
+The high key is still re-stamped afterwards, which
+`TestResetPageItemsKeepsTheHighKey` already pins.
+
+**IN-4** — `pg_aggregate`'s virtual-row builder rebuilt the 161 constant BKI
+rows — 22 columns of Sprintf plus an OID->name lookup each — on EVERY query
+against the view. The constant half is built once (`sync.OnceValue`) and the
+live CREATE AGGREGATE rows appended per call. Consumers only read the rows
+(they construct their own Row per output), so sharing the cached slices is safe.
+
+| one pg_aggregate query | before | after |
+|---|---|---|
+| | 96,224 ns, 87,560 B, 1515 allocs | 6,296 ns, 9,491 B, 28 allocs |
+
+**UT-14** — `DoEncodingConversion` allocated a worst-case-expansion destination
+buffer (`len(src) * MAX_CONVERSION_GROWTH + 1`) and then discarded it
+(`_ = destBuf`); the conversion proc allocates and returns its own. Deleted.
+
+**EC-16** — `decodeNumericBinary` accumulated an int64 mantissa digit by digit
+to choose between a "small numeric" fast path and the big.Int path — and both
+arms called `decodeNumericBinaryViaBig`, because the fast path was never
+finished (its own comment: "we need to add fractional"). The loop is gone;
+652 ns -> 608 ns for a two-digit value. The real value here is that the code no
+longer reads as though a fast path exists.
+
+**ST-16 / ST-17 — REJECT, recorded as deferred.** Both allocate a block-sized
+buffer per prefetch, and both are real. Neither can be pooled without a
+contract change: in `ReadStream.refill` the buffer becomes the caller's data
+(`Next` hands those bytes out), and in `Pool.Prefetch` the buffer must outlive
+an async read whose handle is dropped, so a shared buffer would mean concurrent
+kernel writes into it. The sound fix is a buffer pool tied to IO completion,
+which the AIO layer does not expose today — a feature, not a per-finding fix.
