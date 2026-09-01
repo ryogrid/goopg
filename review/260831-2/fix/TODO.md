@@ -64,7 +64,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | NP-5 | med | `plpgsql/parser.go:parseFor` — `isQueryFor` peeks only the first token; parenthesized bound misroutes | BUG | [x] | this commit |
 | OP1-2 | med | `optimizer/exprwalk.go:exprChildSlots` — FuncCall child slots omit Filter/Over/OrderBy/WithinGroup/Variadic | NOT A BUG | [x] | — |
 | OP1-3 | med | `optimizer/createplannl.go:createNestLoopBitmapJoinPlan` — `bhs.BitmapQual = nil` drops recheck quals | BUG | [ ] | pending gate |
-| XL-4 | med | `wal/slot_decoder.go:Run` — ConfirmedFlushLSN never advances for PG-format commit records | BUG | [ ] | pending gate |
+| XL-4 | med | `wal/slot_decoder.go:Run` — ConfirmedFlushLSN never advances for PG-format commit records | BUG | [x] fixed + guarded | this commit |
 | CP-2 | med | `postmaster/dispatch.go:normalizeSQLPreservingLiterals` — plan-cache key collision on quoted identifiers | BUG | [x] | this commit |
 | UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | BUG | [x] | 306709703 |
 | UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | BUG | [x] | 00e35fbab |
@@ -82,15 +82,15 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EC-8 | low | `executor/codec_aclitem.go:aclModeFromPrivLetters` — shift-after-guard pattern (report says not a live bug) | ? | [ ] | |
 | EO1-2 | low | `executor/operators.go:limitOp.Open` — stale limitCount survives a NULL-limit re-Open | BUG | [ ] | pending gate |
 | EO1-4 | low | `executor/operators_bitmap.go:lookupBounds` — index out of range with a zero-key-column index | NOT A BUG | [x] | — |
-| EO1-5 | low | `executor/operators_generate_series.go:generateSeriesOp.Next` — int64 overflow near MaxInt64 | ? | [ ] | |
-| EO1-6 | low | `executor/operators_ddl.go:execDropTablespace` — not-empty check only inspects InMemory catalog | ? | [ ] | |
-| EO1-7 | low | `executor/operators_ddl.go:execAlterCollation/Conversion` — rename collision reported as 42704 | ? | [ ] | |
-| EO1-8 | low | `executor/operators_ddl.go:execCreateTable` — fallback column path drops serial's implicit NOT NULL | ? | [ ] | |
-| EO1-9 | low | `executor/operators_fk.go:checkConstraints` — CHECK VALUES built from `Format()` text | ? | [ ] | |
-| EO1-10 | low | `executor/operators_from_unnest.go` and sibling SRFs — `SlotFromRow(nil, …)` nil schema | ? | [ ] | |
+| EO1-5 | low | `executor/operators_generate_series.go:generateSeriesOp.Next` — int64 overflow near MaxInt64 | BUG (dup EO2-3) | [x] | 5c60e8551 |
+| EO1-6 | low | `executor/operators_ddl.go:execDropTablespace` — not-empty check only inspects InMemory catalog | NOT A BUG | [x] | — |
+| EO1-7 | low | `executor/operators_ddl.go:execAlterCollation/Conversion` — rename collision reported as 42704 | BUG | [x] fixed + guarded | this commit |
+| EO1-8 | low | `executor/operators_ddl.go:execCreateTable` — fallback column path drops serial's implicit NOT NULL | NOT A BUG | [x] | — |
+| EO1-9 | low | `executor/operators_fk.go:checkConstraints` — CHECK VALUES built from `Format()` text | BUG | [x] fixed + guarded | this commit |
+| EO1-10 | low | `executor/operators_from_unnest.go` and sibling SRFs — `SlotFromRow(nil, …)` nil schema | NOT A BUG | [x] refuted | - |
 | EO2-6 | low | `executor/operators_pg_options_to_table.go:Open` — lateral binding via ctx.OuterRows, no BindLateralOuter | ? | [ ] | |
 | EO2-7 | low | `executor/operators_generated.go:evalGenExpr` — ColumnRef bounds check after EqualFold | ? | [ ] | |
-| EO2-8 | low | `executor/operators_utility_settings.go:nextShow` — `SHOW ALL` emits 2 columns vs PG's 3 | ? | [ ] | |
+| EO2-8 | low | `executor/operators_utility_settings.go:nextShow` — `SHOW ALL` emits 2 columns vs PG's 3 | BUG | [x] fixed + guarded | this commit |
 | ES-1 | low | `executor/parallel_agg_combine.go:combineNumericSum` — Int-lane contribution dropped when lanes disagree | ? | [ ] | |
 | ES-2 | low | `executor/parallel_agg_split.go:aggPartialAccum.merge` — silent break on state-count mismatch | ? | [ ] | |
 | ES-3 | low | `executor/pgstat_relations.go:dropTable` — trigger counters not cleaned up | ? | [ ] | |
@@ -748,3 +748,126 @@ checked in a new `scaleUnit` helper. Guard:
 (`internal/utils/misc/guc_unit_overflow_test.go`), which also pins the
 still-valid `8MB`/`1500ms` conversions; proven red — all three overflow cases
 returned wrapped negatives.
+
+### EO1-5 — BUG, duplicate of EO2-3 (fixed in 5c60e8551)
+
+Same defect, same line: `generateSeriesOp.Next` advanced with a bare
+`o.current += o.step`, which wraps at the int64 ceiling back inside the bounds
+so the series never terminates. Fixed together with the zero-step check under
+EO2-3; the guard is `internal/executor/generate_series_overflow_test.go`.
+
+### EO1-6 — NOT A BUG
+
+`execDropTablespace`'s "not empty" guard is indeed inside an
+`o.ctx.Catalog.(*catalog.InMemory)` type assertion, but that assertion is the
+repo-wide idiom — around 300 sites in `internal/executor` alone do the same —
+because `*catalog.InMemory` is the only Catalog implementation the server ever
+installs (`postmaster/server.go` passes `cfg.Catalog` straight through). The
+guard therefore always runs in production. If a second implementation ever
+lands, this is one of ~300 places to revisit, not a defect of this function.
+
+### EO1-8 — NOT A BUG (dead path)
+
+The second column-building loop in `execCreateTable` — the one labelled
+"Fallback: no BodyOrder (e.g. empty column list or old path)" — does build
+`NotNull: c.NotNull` without the `|| c.IdentityColumn || isSerialCol` term the
+live `addCol` path uses (and drops `IsArray` and the identity fields too). It
+is unreachable: both parser front ends append to `BodyOrder` for every column
+they append to `Columns` (`parser/ddl.go:3815,3896`,
+`parser/yacc_parser.go:16415`), and no other code in the tree constructs a
+`parser.CreateTableStmt`, so a statement with columns always has a non-empty
+`BodyOrder`. Verified behaviourally as well: `CREATE TABLE s (a serial)` /
+`bigserial` / `smallserial` all land `NotNull=true` through the live path.
+
+### EO2-8 — BUG (fixed)
+
+Confirmed against the live PG 18.3 oracle: `SHOW ALL` there is
+`name | setting | description` (guc.c `ShowAllGUCConfig`), while goopg emitted
+two columns — the third was deliberately deferred ("leave description for
+milestone 5 (catalog) work" in `postmaster/query.go`). A client reading the
+third field by index got a short row. Fixed in all four places that shape the
+result: the plan schema (`optimizer/plan.go` `Utility.Output`), the executor
+operator (`executor/operators_utility_settings.go` `nextShow`), and the simple
+and extended protocol paths (`postmaster/query.go` `handleShowAll` +
+`showAllFields`, `postmaster/extended.go` — 3 sites). The description text is
+read from the `pg_catalog.pg_settings` virtual view's `short_desc` column, so
+it stays byte-identical to PG for every GUC that view already carries; GUCs it
+does not carry yet get an empty description rather than invented text.
+
+Guard: `postmaster/show_all_description_test.go` —
+`TestShowAllEmitsDescriptionColumn` (RowDescription is exactly
+name/setting/description and every DataRow carries 3 columns; red before the
+fix with "has 2 columns ([name setting])") and
+`TestShowAllDescriptionIsPopulated` (a server wired with a catalog returns
+PG's exact `short_desc` for `enable_seqscan`).
+
+### EO1-7 — BUG (fixed)
+
+Real. Both `execAlterCollation` and `execAlterConversion` mapped *every*
+error out of `im.RenameCollation` / `im.RenameConversion` to `notFound()`, and
+those helpers return two distinct failures: source missing, and target name
+already taken. A collision therefore reported 42704 "does not exist" naming
+the SOURCE object — and with `IF EXISTS` it was downgraded to a NOTICE and the
+statement reported success while nothing had been renamed. PG 18.3 oracle:
+
+    ALTER COLLATION zzc1 RENAME TO zzc2;
+    ERROR:  collation "zzc2" for encoding "UTF8" already exists in schema "public"
+    ALTER CONVERSION zzcv1 RENAME TO zzcv2;
+    ERROR:  conversion "zzcv2" already exists in schema "public"
+
+both 42710 duplicate_object (`report_namespace_conflict`, alter.c). Fix:
+`catalog.ErrRenameNameConflict`, wrapped by the two rename helpers on the
+target-taken path, and an `errors.Is` arm in each executor rename case that
+raises 42710 with PG's wording (the encoding is spelled "UTF8" exactly as the
+COMMENT ON COLLATION path already assumes).
+
+Guard: `executor/alter_rename_conflict_test.go` — collation and conversion
+cases assert code 42710 and PG's exact message, that `IF EXISTS` does not
+swallow the collision, and that the source object survives the failed rename.
+Red before the fix: `42704: collation "cc1" does not exist`.
+
+### EO1-9 — BUG (fixed) — worse than reported
+
+Real, and it bites two functions, one of them silently. `checkConstraints`
+rebuilds every column value with `Datum.Format()` and interpolates it back
+into a synthetic `SELECT (expr) FROM (VALUES ('…'::type)) AS _chk(…)`.
+`Format()` is a *display* rendering: for a `date` column it produces
+"05-06-2020", which does not re-parse as a date. Observed on goopg before the
+fix, for an INSERT PG 18.3 accepts:
+
+    CREATE TABLE ck_date (d date CHECK (d > '2000-01-01'));
+    INSERT INTO ck_date VALUES ('2020-05-06');
+    ERROR: XX000 internal error: could not evaluate check constraint
+           "ck_date_d_check" ... 22007 invalid input syntax for type date: "05-06-2020"
+
+`evalDomainCheckExpr` has the identical construction *and* treats every
+evaluation failure as a PASS, so the same type mismatch made a domain CHECK
+silently unenforced — a wrong-results bug, not just a spurious error:
+
+    CREATE DOMAIN dd AS date CHECK (VALUE > '2000-01-01');
+    INSERT INTO dt VALUES ('1999-01-01');   -- goopg: accepted
+    -- PG 18.3: ERROR value for domain zzdd violates check constraint "zzdd_check"
+
+Fix: both sites bind the row values as parameters (`$1::type`, with
+`synthCtx.Params` carrying the Datums) instead of rendering and re-parsing
+them, so no round trip through text happens. The cast keeps the column's
+declared type, with `[]` re-appended for array columns (`Type.Name` holds the
+element name).
+
+Guard: `executor/check_constraint_param_binding_test.go` —
+`TestCheckConstraintValuesBindAsParams` (date/bytea/timestamp/interval/float8/
+array/quoted-text all insert cleanly, and a violating row still raises 23514)
+and `TestDomainCheckDateIsEnforced` (violating domain value now raises 23514).
+Both red before the fix.
+
+### EO1-10 — NOT A BUG (latent, and not a nil deref)
+
+`SlotFromRow(nil, row)` in the SRF operators passes a nil `optimizer.Schema`,
+which is a nil *slice*, not a nil pointer — reading it yields length 0, never
+a panic. Both places in the tree that read a producer slot's own schema guard
+for it: `plpgsql_runtime.go:1985` takes it only `if len(s) > 0` (otherwise
+keeping `op.Schema()`), and `:2094` only `if slot.Schema() != nil`. Verified
+behaviourally: `FOR r IN SELECT * FROM unnest(ARRAY[10,20]) AS t(x) LOOP acc
+:= acc || r.x` returns "10 20 ", i.e. field-by-name binding through an SRF
+works today. Worth tidying if the SRFs are touched again, but nothing is
+broken.
