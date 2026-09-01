@@ -801,58 +801,11 @@ func decodeNumericBinary(payload []byte) (Datum, error) {
 		digits[i] = int64(binary.BigEndian.Uint16(payload[8+i*2:]))
 	}
 
-	// Reconstruct the numeric value as mantissa × 10^-dscale.
-	// weight is the power of 10000 of the first digit.
-	// Total integer value = sum(digits[i] * 10000^(weight-i)).
-	// Mantissa (at scale dscale) = value * 10^dscale.
-	var mantissa int64
-	overflow := false
-	for i, d := range digits {
-		exp := weight - i
-		if exp >= 0 {
-			// Integer part
-			for j := 0; j < exp; j++ {
-				if mantissa > math.MaxInt64/10000 {
-					overflow = true
-					break
-				}
-				mantissa *= 10000
-			}
-			if overflow {
-				break
-			}
-			mantissa += d
-		} else {
-			// Fractional part: digit d contributes at position -exp*4 digits after decimal
-			// This is already handled by the dscale reconstruction below.
-		}
-	}
-
-	if overflow || ndigits > 4 {
-		// Fall back to big.Int path for large numerics.
-		// Reconstruct via string.
-		return decodeNumericBinaryViaBig(digits, weight, sign, dscale)
-	}
-
-	// Multiply mantissa by 10^dscale to get the integer representation.
-	// Then store as KindNumeric with NumericMantissa and NumericScale.
-	fullMantissa := int64(0)
-	// Compute the value as: digits[0]*10000^weight + ... + digits[n-1]*10000^(weight-n+1)
-	// then multiply by 10^dscale to get an integer mantissa.
-	for i, d := range digits {
-		exp := weight - i
-		p := int64(1)
-		for j := 0; j < exp; j++ {
-			p *= 10000
-		}
-		for j := 0; j < (-exp); j++ {
-			// Fractional part — we need dscale post-decimal digits
-			_ = j
-		}
-		fullMantissa += d * p
-	}
-	// Now fullMantissa is the integer part; we need to add fractional.
-	// Simpler: rebuild from string representation.
+	// review/260831 EC-16: an int64 mantissa used to be accumulated here digit
+	// by digit, purely to decide between a "small numeric" fast path and the
+	// big.Int path — and BOTH arms called decodeNumericBinaryViaBig, because
+	// the fast path was never finished (its own comment said "we need to add
+	// fractional"). Every binary NUMERIC in a COPY paid that loop for nothing.
 	return decodeNumericBinaryViaBig(digits, weight, sign, dscale)
 }
 
