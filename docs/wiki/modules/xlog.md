@@ -952,48 +952,344 @@ concurrent access model:
 The lock-free CAS path is the hot path; the mutex path is only hit when the
 ring is full and the writer is temporarily blocked on I/O.
 
-## pgoutput logical decoding (`pgoutput.go`)
+## Logical replication
 
-`PgOutput` implements the pgoutput plugin protocol for logical replication.
-The output is a stream of messages consumed by the subscriber:
+Logical replication ships per-row changes from a publisher to subscribers by
+decoding WAL records through a pipeline of in-process components. The
+publisher side runs in the walsender goroutine; the subscriber side runs in a
+separate apply-worker goroutine.
 
-- `Begin(xid, commitLSN)` — signals the start of a transaction.
-- `Change(c Change)` — a relation/insert/update/delete change. The `Change`
-  struct carries the relation OID, the operation type, and the old/new tuple
-  values.
-- `Commit(xid, commitLSN)` — signals the end of a transaction.
+### Publisher-side pipeline
 
-`RelationFilter` controls which relations produce changes — called once per
-relation per transaction. The filter is set via `SetFilter`.
+```
+WAL segment → RecordIterator → Classify → Decoder → ReorderBuffer → PgOutput → walsenderPgoutputAdapter → 'w' CopyData → subscriber
+```
 
-`slot_decoder.go` bridges a logical slot to `PgOutput`: it reads from the
-slot's WAL position, decodes each record, and feeds it to `PgOutput`.
+The entry point is `runLogicalWalsender` (`internal/replication/logicalwalsender.go:33`),
+invoked by `replyStartReplication` after the CopyBoth handshake when the
+client sends `START_REPLICATION ... LOGICAL`. Each stage below is a distinct
+file in `internal/access/transam/xlog/`.
 
-## Key flow: logical replication from slot
+### pgoutput wire protocol (`pgoutput.go`)
+
+`PgOutput` implements the `OutputPlugin` interface and emits messages in
+upstream's pgoutput v1 byte format. One `PgOutput` is constructed per active
+logical slot:
+
+```go
+plugin := xlog.NewPgOutput(snap, adapter)
+```
+
+Message kinds (mirror `LOGICAL_REP_MSG_*` in upstream `logicalproto.h`):
+
+| kind | constant | payload shape | when |
+|---|---|---|---|
+| `'B'` | `pgoBegin` | `commitLSN(8) + pgoTimestamp(8) + xid(4)` | per-xact prologue |
+| `'C'` | `pgoCommit` | `flags(1)=0 + commitLSN(8) + endLSN(8)=commitLSN + pgoTimestamp(8)` | per-xact epilogue |
+| `'R'` | `pgoRelation` | `relOID(4) + schema(NUL) + name(NUL) + replident(1) + ncols(2) + [colFlag(1) + colName(NUL) + typeOID(4) + typmod(4)]*n` | lazily, first Change per session |
+| `'I'` | `pgoInsert` | `relOID(4) + 'N' + tupleBody` | row INSERT |
+| `'D'` | `pgoDelete` | `relOID(4) + 'O' + oldTupleBody` or `'K' + natts(2)=0` | row DELETE |
+| `'U'` | `pgoUpdate` | `relOID(4) + ['O'+oldTupleBody]? + 'N' + newTupleBody` | row UPDATE |
+
+`Begin` (`pgoutput.go:133`) captures commit time via `time.Now()` — v0
+doesn't yet stamp xact-end records with the original commit timestamp, so the
+plugin uses the current wall clock. Apply workers don't depend on exact
+original timestamps.
+
+`Commit` (`pgoutput.go:147`) fixes flags at 0 (documented as "unused").
+`commitLSN` = `endLSN` in the encoder; they diverge only once separate
+flushed-vs-applied tracking is added.
+
+`Change` (`pgoutput.go:162`) emits `'R'` once per relation per session
+(tracked in `emittedRel map[uint32]struct{}`), then the per-row message.
+Relations not found in `CatalogSnapshot.Lookup` are skipped (created after
+slot start). The filter gates both `'R'` and the row message.
+
+Tuple encoding (`encodePgoTuple`, `pgoutput.go:298`) parses the PG-physical
+heap-tuple body using `storage.ParseHeapTuple` and walks each column by type:
+
+- **NULL columns** emit `'n'` (no bytes).
+- **Not-null columns** emit `'t' + len(4 BE) + text_value`.
+- **Columns beyond stored natts** (ALTER TABLE ADD COLUMN) emit `'n'`
+  (NULL) — no byte body (the encoder has no `'u'` status constant; `'u'` is
+  only accepted on the decoder side).
+- **`bpchar`** values are blank-padded via `catalog.PadBpchar` so the wire matches
+  PG's fixed-width semantics.
+- **Array columns** (type `IsArray=true`) first detour to `array.RenderTextStyled`
+  for the `{el1,el2}` text rendering, then the `'R'` message advertises the
+  base-element → array type OID via `catalog.ArrayOIDForBase`.
+- **External TOAST pointers** cause a hard error (toasted replication not supported).
+- **reg\* columns** (regclass, regproc, etc.) are name-output through `RegOut`
+  (a func threaded from `p.snap.RegOut`, bound by the walsender via
+  `executor.RegOutRendererVisible`), giving the NAME not the numeric OID.
+
+The timestamp `pgoTimestamp` (`pgoutput.go:645`) uses PostgreSQL's epoch
+(2000-01-01 UTC) and counts microseconds: `uint64(t.Sub(pgEpoch).Microseconds())`.
+
+### RelationFilter and publication set
+
+`RelationFilter` (`pgoutput.go:78`) is the `Allows(rel *RelationDef, kind ChangeKind) bool`
+interface. `SetFilter` attaches it; nil = pass all.
+
+The publication filter (`publicationFilter` in `logicalwalsender.go:278`) is a
+bitset union across the slot's subscribed publications:
+
+- `allowFlags{insert, update, delete}` tracks which publish-* flags are set.
+- `allTablesAllowed` is set when ANY publication covers ALL TABLES.
+- `byTable` maps `"schema.name"` to the per-table bits.
+
+`buildPublicationFilter` looks up each named publication via
+`catalog.PubSub.LookupPublication`, silently skipping unknown names (the lenient
+path — upstream rejects them at CREATE SUBSCRIPTION time); ambiguous membership
+folds to the most permissive by `unionFlags` — a table passes if any of its
+publications grant the action.
+
+### Catalog snapshot (`snapshot.go`)
+
+`CatalogSnapshot` freezes the catalog's relation metadata at slot creation:
+
+- Keyed by `RelOid` (the stable identifier across schema renames) → `*RelationDef`.
+- `BuildCatalogSnapshot` calls `catalog.AllTables`, captures `Schema, Name, OID, Columns`.
+- The `RegOut` renderer is threaded from the walsender's `executor.RegOutRendererVisible`
+  for reg* column output.
+- `SlotSnapshot` bundles `Catalog` + MVCC `transam.Snapshot`; the slot decoder's
+  `Snapshot` field holds it, but the plugin resolves relations through the
+  snapshot it was constructed with (`NewPgOutput`).
+
+A miss from `Lookup` (relation unknown or created after slot creation) causes the
+plugin to skip the change silently.
+
+### Classifier (`classifier.go`)
+
+`Classify(dec, rec)` dispatches one WAL record into the `Decoder`:
+
+| record kind | xid source | decoder action |
+|---|---|---|
+| `RecordKindHeapInsert` | tuple.xmin (bytes 0-3 of heap tuple body) | `ApplyChange(ChangeInsert, newTuple)` |
+| `RecordKindHeapHotUpdate` | new-tuple.xmin | `ApplyChange(ChangeUpdate, newTuple, oldTuple=nil)` |
+| `RecordKindHeapUpdate` | new-tuple.xmin | `ApplyChange(ChangeUpdate, newTuple)` |
+| `RecordKindHeapDelete` | payload xmax | `ApplyChange(ChangeDelete, oldTuple)` |
+| `RecordKindXactCommit` | payload xid | `ApplyCommit(xid, rec.EndLSN)` |
+| `RecordKindXactAbort` | payload xid | `ApplyAbort(xid)` |
+| others (vacuum, btree, pageimage, checkpoint) | — | skip silently |
+
+PG-format records (produced by `initdb`/`open.go`'s xact markers, heap
+flipped to PG form) ride through `classifyDecodedXLog` which checks
+`r.XLog.Header.Rmid`:
+
+- `RmgrXact + xlogXactCommit/Abort`: reorder buffer commit/abort.
+- `RmgrHeap` dispatches via `xlogHeapOpMask` (insert/delete/hot-update) and
+  reconstructs the tuple from the block ref's `Data` (heap header + tuple
+  bytes), not a page image.
+
+### Decoder and OutputPlugin interface (`decoder.go`)
+
+The `Decoder` sits between the classifier (or the `Classify` function calling
+it) and the output plugin:
+
+```go
+type OutputPlugin interface {
+    Begin(xid storage.TransactionID, commitLSN uint64) error
+    Change(c Change) error
+    Commit(xid storage.TransactionID, commitLSN uint64) error
+}
+```
+
+- `ApplyChange(xid, c)` queues `c` in the reorder buffer — no plugin call
+  (uncommitted state never reaches the wire).
+- `ApplyCommit(xid, commitLSN)` commits the reorder buffer for `xid`, then
+  drives the plugin as `Begin → Change* → Commit` in append order. Empty
+  xacts (all changes filtered out) return nil.
+- `ApplyAbort(xid)` drops the queue, no plugin invoked.
+- `Active()` returns the in-flight xact count for observability.
+- `OldestBeginLSN()` returns the smallest begin LSN across in-flight xacts,
+  used by the publisher to know which WAL must remain readable.
+
+### Reorder buffer (`reorder.go`)
+
+The reorder buffer accumulates per-xact change events:
+
+```go
+rb := NewReorderBuffer()
+rb.Append(xid, change)        // queue
+changes, beginLSN, ok := rb.Commit(xid)  // drain
+rb.Abort(xid)                 // drop
+n := rb.Active()              // in-flight count
+oldest := rb.OldestBeginLSN() // oldest begin
+```
+
+- Append records the begin LSN (`c.LSN`) on first append for an xid.
+- Invalid transaction IDs are rejected.
+- The buffer does not store the commit LSN — the caller (Decoder.ApplyCommit)
+  propagates it to the plugin.
+- `foldChanges` is called in `Commit`: consecutive `(ChangeDelete, ChangeInsert)`
+  pairs on the same rel are folded into a single `ChangeUpdate` so the plugin
+  emits `'U'` instead of `'D' + 'I'`.
+
+### SlotDecoder loop (`slot_decoder.go`)
+
+`SlotDecoder` is the long-lived consumer for one logical slot:
+
+```go
+dec, err := xlog.NewSlotDecoder(slots, slotName, w, walDir, segSize, plugin)
+// or:
+dec, err := xlog.NewSlotDecoderWithSnapshot(slots, slotName, w, walDir, segSize, plugin, snap)
+```
+
+`Run(ctx)` drives the loop:
+
+1. `iter.Next(ctx)` fetches the next WAL record from `RestartLSN`.
+2. `Classify(dec, rec)` dispatches it into the decoder (reorder buffer +
+   plugin for commits).
+3. On commit, `slots.AdvanceConfirmedFlushLSN(slotName, rec.EndLSN)` updates the
+   slot state on disk. This is the "subscriber has applied through here"
+   anchor — restart from this LSN never replays a committed-and-acked
+   transaction.
+
+`recordIsXactCommit` checks both forms (native `RecordKindXactCommit` at
+`rec.Payload[0]` and PG-format via `r.XLog.Header.Rmid`/`Info`) so the slot
+advances on every commit regardless of which code path wrote the record.
+
+The `Snapshot` field (from `NewSlotDecoderWithSnapshot`) is the HISTORIC view
+frozen at construction. The plugin resolves relations through the snapshot it
+was handed at `NewPgOutput` time; the SlotDecoder does not propagate its
+`Snapshot` to the plugin.
+
+Error handling:
+- `context.Canceled`, `context.DeadlineExceeded`, `io.EOF`, `ErrClosed`:
+  graceful shutdown, return directly.
+- Classifier errors: abort the run, caller decides whether to re-create the
+  `SlotDecoder`.
+- Plugin errors: same behavior.
+
+### Publisher-side walsender (`logicalwalsender.go`)
+
+`runLogicalWalsender` (`logicalwalsender.go:33`) is the full pipeline:
+
+1. **Catalog snapshot** via `BuildCatalogSnapshot(im, regOut, dbOid)` — calls
+   `catalog.AllTables` + `RegOutRendererVisible`.
+2. **PgOutput** via `NewPgOutput(snap, adapter)` — the `walsenderPgoutputAdapter`
+   wraps each `Write` in a `'w'` CopyData frame (`libpq.EncodeWALData`).
+3. **Publication filter** from the slot's `publication_names` option (parsed by
+   `parseStartReplicationArgs`). Empty list / no `PubSub` = pass-all.
+4. **SlotDecoder** via `NewSlotDecoderWithSnapshot` — the iterator anchored at the
+   slot's current `RestartLSN`.
+5. **Receive goroutine** parses standby-status `CopyData` frames and dispatches
+   into `handleStandbyCopyData` (slot LSN + `SyncRep`), `CopyDone` / `Terminate`
+   cancel the stream.
+6. **Decoder goroutine** calls `dec.Run(ctx)` which blocks until shutdown or error.
+7. **Keepalive** every 10 s via `adapter.WriteKeepalive(time.Now().UTC)`. Without this,
+   the subscriber's `wal_receiver_timeout` (default 60 s) kills the connection
+   when no pgoutput message has crossed the wire (common case during quiet
+   workloads). The `'k'` frame's `walEnd` is the adapter's last-emitted
+   synthetic LSN.
+8. **SyncRep register**: `defer s.cfg.SyncRep.ForgetStandby(appName)` on all
+   paths — the subscriber's progress report in the "standby status" frame drives
+   the `SyncRep` quorum check.
+
+#### `walsenderPgoutputAdapter`
+
+Each `Write(p []byte)` produces one CopyData frame with synthetic LSNs:
+
+```go
+startLSN := a.nextLSN
+endLSN := a.nextLSN + uint64(len(p)) - 1
+a.nextLSN = endLSN + 1
+frame := libpq.EncodeWALData(startLSN, endLSN, time.Now().UTC(), p)
+```
+
+Empty payloads are dropped (endLSN underflow). `WriteKeepalive` adds a primary-
+keepalive `'k'` frame (no reply required) under the same mutex to prevent
+interleaving.
+
+### Subscriber-side pipeline
+
+The subscriber (`logicalreceiver.go`, `applylauncher.go`) consumes the `'w'`/
+`'k'` CopyData stream, parses each pgoutput message via `DecodeMessage`
+(`pgoutput_decoder.go:83`), and dispatches into the `ApplyWorker`.
+
+`DecodedMessage` discriminates kinds: `'B'` (Begin), `'C'` (Commit), `'R'` (Relation),
+`'I'` (Insert), `'D'` (Delete), `'T'` (Truncate), `'U'` (Update). Each is dispatched
+by `ApplyWorker` to mirror upstream's `apply_handle_*` family in
+`postgres/src/backend/replication/logical/applyworker.c`.
+
+### Full pipeline sequence
 
 ```mermaid
 sequenceDiagram
-    participant C as Consumer (apply worker)
-    participant S as Slots
-    participant IT as RecordIterator
-    participant P as PgOutput
-    participant F as RelationFilter
-C->>S: CreateLogical('sub1', 'pgoutput', 'mydb', startLSN)
-    S->>S: write slot file to pg_replslot/sub1/state
-    C->>IT: NewRecordIterator(writer, walDir, segSize, startLSN)
-    loop Next()
-        IT->>IT: Next(ctx) → Record
-        IT->>P: Change(record)
-        P->>F: RelationRel(relOID)
-        alt filtered out
-            P-->>IT: skip
-        else included
-            P->>P: encode insert/update/delete as pgoutput message
-            P-->>C: pgoutput message bytes
+    participant Sub as Subscriber (apply worker)
+    participant Pub as Publisher walsender
+    participant SD as SlotDecoder
+    participant CI as Classifier
+    participant DR as Decoder+ReorderBuffer
+    participant PO as PgOutput
+    participant AF as RelationFilter
+    participant W as walsenderPgoutputAdapter
+
+    Sub->>Pub: START_REPLICATION .. LOGICAL
+    Pub->>Pub: BuildCatalogSnapshot (immutable)
+    Pub->>Pub: NewPgOutput(snap, adapter)
+    Pub->>Pub: Plugin.SetFilter(publicationFilter)
+    Pub->>SD: NewSlotDecoderWithSnapshot
+
+    Note over SD: Iterator anchored at RestartLSN
+
+    loop WAL records
+        SD->>CI: Classify(dec, rec)
+        CI->>DR: ApplyChange(xid, change)
+        DR->>DR: Append to reorder buffer
+
+        alt XactCommit
+            CI->>DR: ApplyCommit(xid, commitLSN)
+            DR->>DR: ReorderBuffer.Commit(xid) -> [changes]
+            DR->>PO: Begin(xid, commitLSN)
+            loop each change in append order
+                PO->>AF: Allows(rel, kind)
+                alt filtered out
+                    PO-->>PO: skip
+                else pass
+                    PO->>PO: emit R if not yet sent
+                    PO->>PO: encode I/D/U payload
+                end
+                PO->>W: Write(pgoutput bytes)
+                W->>W: wrap in 'w' CopyData
+                W->>Sub: wal-data frame
+            end
+            DR->>PO: Commit(xid, commitLSN)
+            PO->>W: Write('C' + ...)
+            W->>Sub: wal-data frame
+            SD->>SD: AdvanceConfirmedFlushLSN
+        else XactAbort
+            CI->>DR: ApplyAbort(xid)
+            DR->>DR: ReorderBuffer.Abort(xid)
         end
     end
-C->>S: AdvanceConfirmedFlushLSN('sub1', commitLSN)
+
+    Note over Pub: 10s keepalive ticker
+    Pub->>Sub: 'k' keepalive frame
+    Sub->>Pub: standby status (flush_lsn, apply_lsn)
+    Pub->>Pub: handleStandbyCopyData
+    Pub->>Pub: SyncRep quorum check
 ```
+
+### Key components summary
+
+| Component | File | Role |
+|---|---|---|
+| `PgOutput` | `pgoutput.go` | pgoutput v1 wire encoder; implements `OutputPlugin` |
+| `RelationFilter` | `pgoutput.go:78` | publication-membership gate |
+| `SlotDecoder` | `slot_decoder.go` | per-slot WAL->decoder loop |
+| `Classify` | `classifier.go` | WAL record -> xid dispatch into decoder |
+| `Decoder` | `decoder.go` | reorder buffer + OutputPlugin orchestration |
+| `ReorderBuffer` | `reorder.go` | per-xact change accumulation + commit/abort |
+| `CatalogSnapshot` | `snapshot.go` | frozen relation metadata (BuildCatalogSnapshot) |
+| `SlotSnapshot` | `snapshot.go:136` | catalog + MVCC bundle for plugin |
+| `runLogicalWalsender` | `logicalwalsender.go:33` | publisher (walsender)-side pipeline entry |
+| `walsenderPgoutputAdapter` | `logicalwalsender.go:213` | io.Writer that wraps in 'w' CopyData frames |
+| `DecodeMessage` | `pgoutput_decoder.go:83` | subscriber-side pgoutput v1 parser |
+| `buildPublicationFilter` | `logicalwalsender.go:361` | materializes membership from `PubSub` |
+| `publicationFilter` | `logicalwalsender.go:278` | per-table allowFlags business logic |
+
 
 ## Key flow: timeline switching
 
