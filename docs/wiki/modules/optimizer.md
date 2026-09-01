@@ -43,7 +43,7 @@ parallel Gather, PARAM_EXEC lowering). **56,019 LOC** across 90+ `.go` files.
 | `joinkeyproof.go`      | 689    | Proof rules for join-key functional-dependency reasoning: whether a column is functionally determined by the join key (used for ORDER BY elimination). |
 | `foldconst.go`         | 660    | Constant folding: `FoldConstants` entry, `foldPlanConstants`, `tryFoldBinaryOp`/`tryFoldUnaryOp`, `foldCaseExpr`. Pure bottom-up evaluator with panic-propagated runtime errors (division by zero → PlanError). |
 | `joinsearchseam.go`    | 654    | The `planSelect` seam where the PG-shaped join search is asked to plan a real statement. `tryJoinSearch`, `tryPGShapedJoinSearch`, `splitOuterSpine` (pinned outer-join peeling), `extractSearchLeaves`, `searchConsumes`. |
-| `relsize.go`           | 641    | PG's `set_joinrel_size_estimates`: `calcJoinrelSize`, joinrel row-count and width computation. |
+| `relsize.go`           | 641    | Block-count relation-size fallback: `GOOPG_RELSIZE_FALLBACK` staging, `estimateRelSize` (port of `table_block_relation_estimate_size`), `typeWidth`/`tupleWidth`, page-geometry constants. |
 | `joinsearchlevel.go`   | 602    | `joinSearchOneLevel` phases 1/2/3: 1=unparameterised (lev-1,1), 2=bushy (k,lev-k), 3=clauseless last-ditch. `makeJoinRel`, `joinRelBuilder` interface. |
 | `joinorder.go`         | 600    | Join-restriction inference: `joinIsLegal`, `hasJoinRestriction`, `buildJoinOrderRestrictions` — SpecialJoinInfo processing for LEFT/ANTI/SEMI join legality during search. |
 | `joinrelsize.go`       | 560    | Join relation sizing: `calcJoinrelSize` (PG's `set_joinrel_size_estimates`), outer-join row floor, SEMI-join match-fraction calculation. |
@@ -56,7 +56,7 @@ parallel Gather, PARAM_EXEC lowering). **56,019 LOC** across 90+ `.go` files.
 | `copy.go`              | 501    | Plan-tree deep-copy: `copyNode`, `copyExpr` — used for CTE inlining and subquery cloning. |
 | `collapse.go`          | 489    | Explicit-JOIN collapsing: `tryCollapseJoinTree` — flattens INNER JOIN chains into the search's FROM list when `GOOPG_PGSHAPED_COLLAPSE=1`. |
 | `scan_input_rewrite.go`| 475    | Scan input rewriting: handles `FOR UPDATE`/`FOR SHARE` locking rows for scan nodes. |
-| `costindex.go`         | 419    | Index scan costing: `costIndexScan`, `costIndexOnlyScan`, Mackert-Lohman formula for index page fetch estimation. |
+| `costindex.go`         | 419    | Index scan costing: `costIndexScan` (incl. index-only via `indexOnly` flag), Mackert-Lohman formula for index page fetch estimation. |
 | `joinpathsmerge.go`    | 426    | Merge-join path generation: `addMergeJoinPath`, merge-clause order derivation, explicit-sort merge paths. |
 | `equiv_class.go`       | 442    | Transitive equality inference: `equivClasses` (union-find), `inferTransitiveEqualities`, `inferAnchoredEqualities`. Discovers `a=c` from `a=b AND b=c`. |
 | `cost_funcs.go`       | 458    | PG cost function ports: `costParams`, `costSeqscan`, `hashJoinCost`, `nestloopCost`, `mergeJoinCost`, `gatherCost`, `indexProbeCost`. |
@@ -193,7 +193,7 @@ sequenceDiagram
 - `joinSearchOneLevel` (joinsearchlevel.go) runs three phases per level:
   - **Phase 1** (`makeRelsByClauseJoins`): pairs each rel at (lev-1) with every rel at level 1,
     gated by `hasJoinClause` or `joinOrderRestricted`. Both left-sided and right-sided.
-  - **Phase 2** (`makeRelsByClauselessJoins`): pairs every (k, lev-k) split for k in 2..lev-2.
+  - **Phase 2** (`makeRelsByClauseJoins`): pairs every (k, lev-k) split for k in 2..lev-2.
     Bushy joins only when clause-connected.
   - **Phase 3** (`makeRelsByClauselessJoins`): pairs when no clause exists (cartesian).
 - `makeJoinRel` is find-or-create: same relset → same RelOptInfo (for `addPath` pruning power).
@@ -241,7 +241,7 @@ SeqScan       → tableRows (catalog.reltuples)
 IndexScan     → 1 for eq probe, tableRows for unbounded scan
 IndexOnlyScan → same as IndexScan
 Filter        → child * selectivity
-Join          → outer * inner * joinSelectivity * (1 for SEMI, 0.25 for ANTI default)
+Join          → outer * inner * joinSelectivity; SEMI → outer * matchFraction (no-stats default 0.5); ANTI → outer * (1 - matchFraction)
 Aggregate     → estimateNumGroups (NDistinct of GROUP BY columns)
 Values        → len(rows) exactly
 Sort/Limit    → child rows (unchanged)
@@ -546,7 +546,7 @@ groups them by table and builds `PathBitmapAnd`/`PathBitmapOr` combinators:
 - **BitmapOr** — multiple index scans whose results are ORed (unioned). Used
   for OR clauses and for IN lists.
 - **BitmapHeapScan** — consumes the final bitmap and fetches matching heap
-  tuples. Costed via `costIndexOnlyScan` with the bitmap selectivity.
+  tuples. Costed via `costBitmapHeapScan` with the bitmap selectivity.
 
 ## Join-key proof (`joinkeyproof.go`)
 
@@ -576,26 +576,455 @@ Every plan-shaping feature is gated by a process-start env var. The full list:
 | `GOOPG_REDUCE_OUTER_JOINS` | on | reduce_outer_joins pass |
 | `GOOPG_BITMAP` | on | Bitmap scan path generation |
 
-## Cost model details (`cost_funcs.go`)
+## Cost model (`cost_funcs.go`, `costindex.go`, `costbitmap.go`)
 
-The cost functions are ports of PG's `costsize.c`:
+The cost model is a faithful reproduction of PostgreSQL 18.3's `costsize.c` in
+PG's one-currency unit (`seq_page_cost = 1.0`). Every cost — scan, sort, join,
+Gather — is absolute and directly comparable (design invariant #1). Live since
+`GOOPG_PGSHAPED_DP` defaulted ON (2026-08-06): every production plan is priced
+through these functions. The model is calibrated by PG's GUCs and will diverge
+from PG where those GUCs differ.
 
-- `costSeqScan`: `cpu_tuple_cost * ntuples + seq_page_cost * npages`
-- `costIndexScan`: `random_page_cost * nIndexPages + cpu_tuple_cost * ntuples +
-  seq_page_cost * nHeapPages` (with Mackert-Lohman formula for index fetch)
-- `costIndexOnlyScan`: same as IndexScan but nHeapPages = 0
-- `hashJoinCost`: `cpu_operator_cost * ntuples * nkeys + hashTableBuild +
-  hashTableProbe` (with work_mem budget for spill estimation)
-- `nestloopCost`: `cpu_tuple_cost * outer * inner + random_page_cost * inner
-  * outer` (for non-index NL)
-- `mergeJoinCost`: `cpu_operator_cost * (outer + inner) + sortCost(outer) +
-  sortCost(inner)` (when sorts are needed)
-- `gatherCost`: `parallel_setup_cost + parallel_tuple_cost * ntuples / nworkers`
+### Cost parameters (`costParams`)
 
-The `costParams` struct carries the GUC values (`seq_page_cost`,
-`random_page_cost`, `cpu_tuple_cost`, `cpu_operator_cost`,
-`parallel_setup_cost`, `parallel_tuple_cost`, `effective_cache_size`,
-`work_mem`) plus the relation-level `tuple_fraction` and `nrows`/`nIndexPages`.
+The `costParams` struct (`cost_funcs.go:47`) carries the PG cost GUCs at their
+PG 18 boot values:
+
+| Constant | Value | PG GUC |
+|---|---|---|
+| `seqPageCost` | 1.0 | `seq_page_cost` |
+| `randomPageCost` | 4.0 | `random_page_cost` |
+| `cpuTupleCost` | 0.01 | `cpu_tuple_cost` |
+| `cpuIndexTupleCost` | 0.005 | `cpu_index_tuple_cost` |
+| `cpuOperatorCost` | 0.0025 | `cpu_operator_cost` |
+| `parallelSetupCost` | 1000.0 | `parallel_setup_cost` |
+| `parallelTupleCost` | 0.1 | `parallel_tuple_cost` |
+| `effectiveCacheSize` | 4 GB / 8 KB = 524,288 pages | `effective_cache_size` |
+| `workMem` | `hashsize.DefaultMemLimitBytes` | `work_mem` |
+
+The `costParams` defaults are threaded from the session at path-generation time;
+until then (outside the search) the boot defaults are used. A drift-guard test
+asserts the two agree.
+
+### Calibration constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `stdFuzzFactor` | 1.01 | PG's `STD_FUZZ_FACTOR` for path dominance |
+| `blockSizeBytes` | 8192 | PG's `BLCKSZ` |
+| `pageHeaderSizeBytes` | 24 | Per-page overhead |
+| `usableBytesPerBlock` | 8168 | Block size minus page header |
+| `perTupleOverhead` | 28 | Heap tuple header overhead |
+| `heapDefaultFillfactor` | 100 | Default heap fill factor |
+| `btreeDefaultFillfactor` | 90 | Default B-tree leaf fill factor (`BTREE_DEFAULT_FILLFACTOR`) |
+| `pageCPUMultiplier` | 50 | CPU charge per index page descended (`cpu_operator_cost` units) |
+| `indexProbeCostMultiplier` | 1.0 (env override: `GOOPG_INDEX_PROBE_MULT`) | Scales index probe cost for goopg's eager TID-materialising probe |
+| `defaultEqSelectivity` | 0.005 (1/200) | Default equality selectivity |
+| `defaultIneqSelectivity` | 1/3 | Default inequality selectivity |
+| `defaultGenericSelectivity` | 1/3 | Default generic selectivity |
+| `defaultNumDistinct` | 200 | Default NDistinct when stats absent |
+| `defaultUnhandledClauseSel` | 0.5 | Default selectivity for unhandled clause types |
+| `defaultIneqJoinSel` | 1/3 | Default inequality join selectivity |
+| `neverAnalyzedMinPages` | 10 | Page threshold for never-analyzed heuristic |
+| `maximumRowCount` | 1e100 | Row count clamp |
+
+### Scan costs
+
+**`costSeqscan`** (`cost_funcs.go:122`): PG `cost_seqscan` (costsize.c:295).
+
+```
+run_cost = seq_page_cost * npages + (cpu_tuple_cost + cpu_operator_cost * numQualOps) * ntuples
+startup_cost = 0
+```
+
+The parallel case divides the run cost by the parallel divisor (the caller passes
+a per-worker tuple/page count).
+
+**`costIndexScan`** (`costindex.go:112`): PG `cost_index` (costsize.c:520). The
+most complex scan cost, with two I/O bounds interpolated by correlation:
+
+```
+index_am_cost = btreeIndexAMCost(cp, in)   # descent + leaf scan
+tups_fetched = clampRowEst(selectivity * relTuples)
+
+# Two I/O bounds computed via Mackert-Lohman (indexPagesFetched)
+max_IO_cost = pagesFetched * random_page_cost * indexProbeCostMultiplier
+min_IO_cost = random_page_cost * indexProbeCostMultiplier + (correlated_pages - 1) * seq_page_cost
+
+# Interpolate by correlation^2
+run_cost = max_IO_cost + correlation² * (min_IO_cost - max_IO_cost)
+run_cost += cpu_tuple_cost * tups_fetched
+```
+
+The `btreeIndexAMCost` helper (`costindex.go:186`) charges the index side:
+- `numIndexPages * random_page_cost * indexProbeCostMultiplier` — random page
+  fetches for index pages, scaled by the probe multiplier
+- `numIndexTuples * cpu_index_tuple_cost` — per-tuple CPU
+- `(treeHeight + 1) * pageCPUMultiplier * cpu_operator_cost` — B-tree descent,
+  charged at startup (paid before the first tuple emerges, making an ordered
+  index path's startup non-zero and comparable against a sort's)
+
+The `loop_count > 1` arm (parameterised paths inside NLI) pro-rates via
+Mackert-Lohman over the total tuples across all loops, then divides back to
+one execution.
+
+**`costBitmapIndexScan`** (`costbitmap.go:36`): PG `cost_bitmap_tree_node`
+(costsize.c:1150). Costs only the index side — the heap fetch is costed
+separately by `costBitmapHeapScan`:
+
+```
+index_cost = btreeIndexAMCost(cp, in)   # descent + leaf scan
+total = index_total + 0.1 * cpu_operator_cost * tups_fetched   # bitmap manipulation
+```
+
+**`costBitmapHeapScan`** (`costbitmap.go:51`): PG `cost_bitmap_heap_scan`
+(costsize.c:1009). Startup = index cost, run cost = heap fetch with per-page
+interpolation:
+
+```
+startup = indexCost.Total
+if pages_fetched >= 2:
+    cost_per_page = random_page_cost - (random_page_cost - seq_page_cost) * sqrt(pages_fetched / T)
+else:
+    cost_per_page = random_page_cost
+run_cost = cost_per_page * pages_fetched + cpu_tuple_cost * tups_fetched
+```
+
+The per-page interpolation is directional: as more of the relation is touched,
+the cost moves TOWARD `seq_page_cost` (sequential), because a bitmap scan that
+visits most pages reads them in physical order — the reason the access method
+exists. Previously this was inverted (moving toward random), causing massive
+overestimates (TPC-H Q2's `supplier` bitmap was priced at 2588.7 vs PG's 43.46).
+
+### The Mackert-Lohman formula (`indexPagesFetched`, `costindex.go:228`)
+
+PG's `index_pages_fetched` (costsize.c:906): fetching `tuplesFetched` tuples
+from a `pages`-page table touches how many DISTINCT pages, given caching?
+
+Two regimes:
+- **`T <= b`** (table fits in cache pro-rata share): `(2TN)/(2T+N)` birthday-
+  problem estimate, clamped to `T`.
+- **`T > b`** (does not fit): a limit `lim = (2Tb)/(2T-b)` beyond which every
+  further tuple costs a fresh page at rate `(T-b)/T`.
+
+Where `b = ceil(effectiveCacheSize * T / totalPages)` is the pro-rated cache
+budget, `T` is the relation's page count, and `totalPages` is the sum of every
+base relation's pages plus index pages in the query.
+
+### Join costs
+
+**`hashJoinCost`** (`cost_funcs.go:309`): PG `initial_cost_hashjoin` +
+`final_cost_hashjoin` (costsize.c:4160/4275):
+
+```
+build = (cpu_operator_cost * numHashClauses + cpu_tuple_cost) * innerRows + inner.Total
+startup = outer.Startup + build
+run = (outer.Total - outer.Startup) + cpu_operator_cost * numHashClauses * outerRows
+    + cpu_tuple_cost * outputRows
+```
+
+The spill term is added when `hashsize.Choose` returns `NBatch > 1` — the SAME
+function `joinOp.buildGeometry` calls, so the planner and executor agree on
+whether a build spills:
+
+```
+innerPages = spillPages(innerRows, innerCols, innerAvgVarBytes)
+outerPages = spillPages(outerRows, outerCols, outerAvgVarBytes)
+startup += seq_page_cost * innerPages       # write inner (startup)
+run += seq_page_cost * (innerPages + 2*outerPages)  # read inner + write+read outer
+```
+
+`spillPages` (`cost_funcs.go:346`) uses `hashsize.EntryBytes` for the per-row
+footprint, the same model the executor's hash table uses, so the pages charged
+match the bytes the geometry solved for.
+
+**`nestloopCost`** (`cost_funcs.go:384`): PG `final_cost_nestloop`
+(costsize.c:3349):
+
+```
+ntuples = max(outerRows, 1) * max(innerRows, 1)   # PAIRS PROCESSED, not emitted
+startup = outer.Startup + inner.Startup
+run = (outer.Total - outer.Startup) + outerRows * innerRescanTotal + cpu_tuple_cost * ntuples
+```
+
+The per-tuple CPU charge rides `ntuples` — the number of pairs the loop
+PROCESSES, not the number it emits. PG is explicit about the distinction
+("Compute number of tuples processed (not number emitted!)", costsize.c).
+Charging on the output instead would make a cartesian loop over a collapsed
+estimate look free (the Q47 fix, P5.9-j).
+
+`innerRescanTotal` is the cost of one inner scan — for an NLI, one parameterised
+index probe (`indexProbeCost`).
+
+**`mergeJoinCost`** (`cost_funcs.go:400`): PG `final_cost_mergejoin`
+(costsize.c:3837):
+
+```
+startup = outer.Startup + inner.Startup
+run = (outer.Total - outer.Startup) + (inner.Total - inner.Startup)
+    + cpu_operator_cost * (outerRows + innerRows) + cpu_tuple_cost * outputRows
+```
+
+Sort costs are added by the caller (via `costSortRun`) when the input's pathkeys
+do not satisfy the merge clause.
+
+### Sort cost (`costSortRun`, `cost_funcs.go:186`)
+
+PG `cost_tuplesort` (costsize.c:2144):
+
+```
+tuples = max(inputRows, 2)   # clamp to avoid log(0)
+comparisonCost = 2.0 * cpu_operator_cost
+startup = comparisonCost * tuples * log2(tuples)
+total = startup + cpu_operator_cost * tuples   # per-row emit
+```
+
+When `ncols > 0` and `workMem > 0` and the input exceeds memory, the external
+merge arm charges I/O:
+
+```
+npages = ceil(inputBytes / blockSizeBytes)
+nruns = inputBytes / sortMemBytes
+logRuns = ceil(log(nruns) / log(mergeOrder))   # merge passes
+npageaccesses = 2 * npages * logRuns
+startup += npageaccesses * (seq_page_cost * 0.75 + random_page_cost * 0.25)
+```
+
+The `tuplesortMergeOrder` helper (`cost_funcs.go:229`) computes the fan-in
+cap from `workMem` using PG's constants (TAPE_BUFFER_OVERHEAD=8192,
+MERGE_BUFFER_SIZE=262144, MINORDER=6, MAXORDER=500).
+
+### Other costs
+
+**`gatherCost`** (`cost_funcs.go:414`): PG `cost_gather` (costsize.c:446):
+
+```
+startup = sub.Startup + parallel_setup_cost
+total = sub.Total + parallel_setup_cost + parallel_tuple_cost * outputRows
+```
+
+**`aggCost`** (`cost_funcs.go:452`): PG `cost_agg` AGG_HASHED arm
+(costsize.c:2751):
+
+```
+perInput = cpu_operator_cost * (numAggs + numGroupCols)
+startup = child.Total + perInput * inputRows
+perGroup = cpu_operator_cost * numAggs + cpu_tuple_cost
+total = startup + perGroup * numGroups
+```
+
+**`indexProbeCost`** (`cost_funcs.go:425`): cost of one equality probe of a
+selective/unique index returning ~1 row:
+
+```
+indexProbeCostMultiplier * (2 * random_page_cost + cpu_index_tuple_cost + cpu_tuple_cost + cpu_operator_cost)
+```
+
+This is the per-outer-row rescan cost an NLI pays. The multiplier
+recalibrates toward goopg's eager TID-materialising probe (goopg materialises
+the whole TID list per probe, so a large NLI probe runs slower than PG's
+random_page_cost model predicts). Without it, the cost-driven DP picks ruinous
+NLI plans (measured: Q5/Q9 20-200x).
+
+**`qualEvalCost`** (`cost_funcs.go:145`): per-tuple operator cost of a qual
+list:
+
+```
+cpu_operator_cost * numQuals * tuples
+```
+
+The tuple count is the caller's choice: a nested loop evaluates quals on the
+full cross product; a hash join only on tuples that survived the key match.
+Charging both on the join's output rows would make a cartesian nested loop
+look free.
+
+### Parallel divisor (`getParallelDivisor`, `cost_funcs.go:104`)
+
+PG's `get_parallel_divisor` (costsize.c:6474): the worker count plus the
+leader's fractional contribution when `parallel_leader_participation` is on:
+
+```
+d(1) = 1.7, d(2) = 2.4, d(3) = 3.1, d(w >= 4) = w
+```
+
+### Path dominance (`addPath` / `setCheapest`, `path.go`)
+
+`addPath` implements PG's `add_path` dominance logic with `stdFuzzFactor = 1.01`:
+a new path dominates existing paths if it is cheaper in both startup and total
+cost, or if it dominates on one axis and is within the fuzz factor on the other.
+`disabled_nodes` domination trumps all else. On exact ties, the incumbent wins
+(order-stable).
+
+`setCheapest` selects `CheapestStartupPath` and `CheapestTotalPath` from
+**unparameterised paths only**. `CheapestParameterized` = cheapest unparameterised
+prepended + every surviving parameterised path. Selection uses exact (unfuzzed)
+`comparePathCosts` with pathkey tie-break.
+
+### Path offer order (`addPathsToJoinrel`, `joinpaths.go:187`)
+
+For each (outer, inner) pair, paths are offered in PG's order:
+
+1. `sortInnerAndOuter` — explicit-sort merge
+2. `matchUnsortedOuterMerge` — merge exploiting existing order
+3. `addHashJoinPath` — hash build on inner, probe from outer
+4. `addNestLoopPath` — plain nested loop (always offered, usually dominated)
+5. `addNLIPaths` — parameterised index probes on the inner
+
+Order matters because `addPath` keeps the incumbent on exact ties.
+
+### Index geometry estimation (`estimateIndexGeometry`, `costindex.go:318`)
+
+Since `catalog.Index` carries no `relpages`/`reltuples` and ANALYZE does not
+visit indexes, the index's page count and tree height are estimated from the
+heap's row count and the declared key column widths:
+
+```
+perPage = floor(usableBytesPerBlock * fillfactor / 100 / width)
+indexPages = ceil(indexTuples / perPage)
+treeHeight = 0 if single-page, else ceil(log(indexTuples) / log(perPage)) - 1
+```
+
+When `catalog.IndexRealPages` can answer (the real file size from storage),
+the width-derived guess is replaced by the actual page count.
+
+### Correlation estimation (`indexCorrelationFor`, `costindex.go:286`)
+
+PG's `btcost_correlation` (selfuncs.c:7305): the Pearson correlation between
+the index's physical row order and the leading column's logical order. Reads
+`ColumnStats.Correlation` (collected by ANALYZE), negates for DESC key, and
+dilutes by 0.75 for multi-column indexes. When no correlation statistic exists,
+returns 0 (PG's default for the uncorrelated case — `max_IO_cost`).
+
+### RelSize fallback (`relsize.go`)
+
+The `GOOPG_RELSIZE_FALLBACK` staging gate (0-3, default stage 2) controls
+whether the planner reads a block-count-derived relation size fallback when
+ANALYZE stats are absent (cold-started server):
+
+- **Stage 0**: off — no catalog read, no estimate, byte-identical pre-M0125 plans.
+- **Stage 1**: `EstimateRows` reads the fallback (shape-neutral).
+- **Stage 2** (default): + the join search seed (`rowCounts[i]`). Moves the
+  JOIN ORDER rather than a single node's choice. Measured: TPC-H 1.40x, TPC-DS
+  SF0.5 18.8% faster, zero regressions, one timeout (Q72).
+- **Stage 3**: + `estimateBaseRelInfo.baseRows` (NOT YET WIRED).
+
+`estimateRelSize` (`relsize.go`) is a faithful port of PG's
+`table_block_relation_estimate_size` with 5 load-bearing rules: 10-page
+never-analyzed floor, curpages==0 exit, density from stats, density from tuple
+width in integer arithmetic, and `rint(density * curpages)`.
+
+### Cardinality defaults (`cardinality.go`, `selectivity.go`)
+
+When ANALYZE column stats are absent, the planner uses PG's default
+selectivities:
+
+| Clause type | Default selectivity |
+|---|---|
+| Equality (`col = val`) | 0.005 (1/200) |
+| Inequality (`col > val`) | 1/3 |
+| Generic | 1/3 |
+| Unhandled | 0.5 |
+| Join equality (no stats) | 1 / max(NDistinct_left, NDistinct_right) |
+| Default NDistinct | 200 |
+
+`clauseSelectivity` (`selectivity.go:28`) dispatches on clause type: AND/OR
+(probability product/sum), equality (MCV + non-MCV fallback), range (histogram
+interpolation), and the `*WithSource` reliability-tracking twins.
+
+`EstimateRows` (`cardinality.go:43`) is a bottom-up per-node row estimator:
+- `SeqScan`: `tableRows` from catalog stats or fallback.
+- `IndexScan`: 1 for eq probe, `tableRows` for unbounded.
+- `Filter`: `child * selectivity`.
+- `Join`: `outer * inner * joinSelectivity`; SEMI: `outer * matchFraction` (default 0.5); ANTI: `outer * (1 - matchFraction)`.
+- `Aggregate`: `estimateNumGroups` (NDistinct of GROUP BY columns).
+- `Values`: `len(rows)` exactly.
+- `Sort/Limit`: child rows unchanged.
+- `WindowAgg`: child rows unchanged.
+- `Union/SetOp`: `estimateSetOp`.
+
+`EstimateRows` returns 0 when no estimate is possible (no stats), distinguishing
+"no info" from "zero rows". Callers must check.
+
+### The `planSelect` pipeline (`planner.go:741`)
+
+The main planning pipeline in detail:
+
+1. **GROUPING SETS normalisation**: `prepareGroupingSets` decomposes `CUBE(a,b)`
+   into a `GroupingSets` node with all 8 subsets, each with the appropriate
+   `GroupingFunc` expression.
+
+2. **CTE pre-planning**: `preplanWithClause` plans every WITH body once.
+   Single-reference CTEs are inlined; multi-reference CTEs are materialised
+   into `CTEScan` nodes. Recursive CTEs produce `RecursiveUnion` +
+   `WorkTableScan`.
+
+3. **Set-op flattening**: right-associative parse tree (A UNION (B UNION ALL C))
+   → flat left-associative `(A UNION B) UNION ALL C`.
+
+4. **FROM clause planning**: `planFromClause` dispatches per item:
+   - Base table: `planScanRangeVar` → `SeqScan`/`IndexScan` with inheritance
+     children walk.
+   - Subquery: `planSubqueryRangeVar` → recursive `planSelect`.
+   - CTE: `planCTERangeVar` → reference to materialised body.
+   - VALUES: `planStandaloneValuesSelect` → `ValuesScan`.
+   - JOIN: `planJoinPredicate` → collect natural/USING/ON qualifiers, outer-join
+     special treatment.
+   - SRF: `planTableFuncRangeVar`, `planFromUnnest`, `planFromRegexpMatches`.
+
+5. **WHERE clause resolution**: `resolveExpr` walk with aggregate rejection
+   (42803), `canonicalizeQual` (AND/OR flatten, duplicate conjunct merge,
+   constant folding, De Morgan's laws).
+
+6. **Sublink unnesting**: `unestSubqueriesInPlan` → EXISTS→semi-join,
+   IN→semi-join, NOT-IN→anti-join, scalar subquery→join. The
+   `indexKeyHarvest` mechanism detects cheap SubPlans that should remain
+   un-unnested.
+
+7. **Join-order search**: the central optimisation (see below).
+
+8. **Late rewrite passes**: `rewriteJoinsToNLI` (NLI conversion),
+   `reduce_outer_joins` (outer→inner via NULL rejection), qual push-down,
+   inner-join qual push-down, `inferAnchoredEqualities`.
+
+9. **Aggregate/window stages**: `buildAggregateStage` selects between
+   `HashAgg` and `SortAgg`; `buildWindowStage` plans window functions.
+
+10. **Sort/Distinct/Limit wrapping**: `planOrderBy`, `planDistinctClause`,
+    `planLimit`.
+
+11. **Plan() tail**: EXISTS-to-ANY rewrite, `lowerSubplanParams` (PARAM_EXEC
+    lowering), `fillJoinHashKeys`, `fixColumnRefIndices` (coordinate remapping),
+    `assertSearchedBoundariesIntact`.
+
+### Join-order search (the PG-shaped DP)
+
+The join search (`joinsearch.go`, `joinsearchlevel.go`) is a faithful
+reproduction of PG's `standard_join_search` using level lists, capped at 16
+base relations (`RelSet uint16` bitmask).
+
+`buildInitialRels` populates level 1 from every FROM item — including subquery,
+CTE, and VALUES leaves (closing the leaf-whitelist gap the old bushy DP had).
+
+`joinSearchOneLevel` runs three phases per level:
+- **Phase 1**: clause-connected pairs `(lev-1, 1)` — both left-sided and
+  right-sided, gated by `hasJoinClause` or `joinOrderRestricted`.
+- **Phase 2**: bushy pairs `(k, lev-k)` for k in 2..lev-2, clause-connected.
+- **Phase 3**: clauseless pairs (cartesian), last resort.
+
+The **outer-spine peel** (`splitOuterSpine`) peels LEFT JOIN links off the top
+of the join tree, searches the INNER prefix below them, then splices the links
+back. Without it, every TPC-DS query with an outer join would be declined from
+the search.
+
+### Coordinate spaces (the #1 silent-bug source)
+
+Column refs are resolved in binding-offset space (pre-search). The search
+reorders rels and assigns new relset bits. `outputLayout` and the `joinlayout.go`
+pos-maps are the translators. `fixColumnRefIndices` walks every expression in
+the plan tree after the search, remapping all `ColumnRef` indices from
+pre-search binding-offset space to post-search output-layout space. A
+mis-translation reads the wrong column silently — no crash, wrong answer. The
+`assertSearchedBoundariesIntact` call in `Plan()` is the last line of defence.
 
 ## RelOptInfo / Path structure (`path.go`)
 
