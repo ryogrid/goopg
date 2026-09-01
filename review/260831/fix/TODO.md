@@ -48,12 +48,12 @@ not, with the reason) / empty (not judged yet).
 | EO2-6 | executor-operators-2 | medium | `operators_index.go:Next` / `operators_storage.go:Next` — per-row enum value linear scan | | | | | [ ] |
 | EO2-7 | executor-operators-2 | medium | `operators_indexonly.go:decodeRowFromKey` / `operators_indexonly.go:decodeRowFromHeap` — per-row map allocation + O(covered × columns) projection | | | | | [ ] |
 | EO2-8 | executor-operators-2 | medium | `operators_generated.go:evalGeneratedExpr` — re-parses expression string per row | | | | | [ ] |
-| EO2-9 | executor-operators-2 | medium | `operators_storage.go:checkUniqueIndexesForInsert` / `maintainUniqueIndexesForInsert` — per-row per-index btree open | | | | | [ ] |
+| EO2-9 | executor-operators-2 | medium | `operators_storage.go:checkUniqueIndexesForInsert` / `maintainUniqueIndexesForInsert` — per-row per-index btree open | REJECT (risk over reward) | measured: openIndexBTree is 159 ns / 416 B / 2 allocs per row per index — about 1-3% of a row insert | caching a tree across rows means invalidating it on index DDL, a CONCURRENTLY swap or a relfilenode change mid-statement; getting that wrong writes entries into the wrong tree | — | [x] no change |
 | EO2-11 | executor-operators-2 | medium | `operators_join_agg.go:aggregateOp.Open` — per-row allocations for group key values | | | | | [ ] |
 | EO2-12 | executor-operators-2 | medium | `operators_merge.go:mergedRow` — per-candidate-pair allocation | ADOPT | 400 target x 100 source rows: 6.47ms -> 4.34ms (1.5x), 9.10MB / 83,476 allocs -> 1.40MB / 43,476 (exactly the 40,000 pairs) | nothing retains the concatenated row — the pending mod stores its own copies of the source and target rows — so one scan buffer serves the whole page | one helper next to mergedRow, which stays for the callers that do need an owned row | [x] fixed |
 | EO2-14 | executor-operators-2 | medium | `operators_project_set.go:openSelectSrfMode` — per-step output row allocation | REJECT (not waste) | the per-step rows ARE the operator output: openSelectSrfMode materialises them into o.rows and Next hands them out, so each allocation is a retained row, not a temporary | — | — | [x] no change |
 | EO2-24 | executor-operators-2 | medium | `slot.go:asSlot` (callers: nextMerge, recursiveUnionOp, workTableScanOp) — MaterializedSlot allocated per emitted row | ADOPT | GROUP BY over 1000 groups: 2.54ms -> 2.39ms, 29,197 -> 28,197 allocs (exactly one per emitted row), 2.23MB -> 2.17MB | the established slot-reuse idiom and its documented "valid until the next Next()" contract (indexScanOp, M0092-0007) | one field per operator, four call sites | [x] fixed |
-| EO2-25 | executor-operators-2 | medium | `operators_upsert.go:maintainNonArbiterIndexesCapture` — btree re-opened per index per row | | | | | [ ] |
+| EO2-25 | executor-operators-2 | medium | `operators_upsert.go:maintainNonArbiterIndexesCapture` — btree re-opened per index per row | REJECT (same as EO2-9) | same per-row btree open on the upsert path, same 159 ns | same invalidation problem | — | [x] no change |
 | ES-7 | executor-sys | medium | `plpgsql_runtime.go:rewriteSQLNamedParams` — regexp compiled per argument per invocation | ADOPT | 3-argument rewrite: 29.6us -> 9.5us (3.1x), 16.0KB -> 1.0KB, 152 -> 25 allocs | the compiled pattern is identical; the cache key is the argument name | one `sync.Map`; the key set is bounded by the schema, not by traffic | [x] fixed |
 | ES-8 | executor-sys | medium | `plpgsql_runtime.go:executeSQLRoutine` (+procedures/setof) — body re-parsed and re-planned on every call | REJECT (needs the plan-cache machinery) | real — a SQL-language routine re-parses (and re-plans) its body on every call | the body text IS stable per routine (arguments are rewritten to $n, values go through ctx.Params), so a cache is possible; but the planner mutates the tree it is given, so caching a bare AST is not safe. The sound design is the postmaster planCache (keyed plan + its invalidation), reused from the executor | out of scope for a per-finding fix | [ ] deferred |
 | ES-9 | executor-sys | medium | `plpgsql_runtime.go:executePLpgSQLTriggerBody` — trigger body re-parsed on every firing | | | | | [ ] |
@@ -61,10 +61,10 @@ not, with the reason) / empty (not judged yet).
 | OP1-1 | optimizer-1 | medium | `cardinality.go:estimateNumGroups` — per-relation full-tree walk plus subtree re-estimation | | | | | [ ] |
 | OP1-2 | optimizer-1 | medium | `cardinality.go:semiPairMatchFraction` — O(n·m) MCV matching nested loop | | | | | [ ] |
 | OP1-3 | optimizer-1 | medium | `cardinality.go:EstimateRows` — no memoization on recursive estimates | | | | | [ ] |
-| OP2-3 | optimizer-2 | medium | foldconst.go:FoldConstants — Always allocates fresh nodes/slices even when nothing folds | | | | | [ ] |
+| OP2-3 | optimizer-2 | medium | foldconst.go:FoldConstants — Always allocates fresh nodes/slices even when nothing folds | REJECT (contract risk) | planning-time only, once per query | FoldConstants returning fresh nodes is what makes the later in-place rewrites safe; returning the input when nothing folded would alias the caller tree, and every mutating pass would have to be surveyed first | — | [x] no change |
 | OP2-11 | optimizer-2 | medium | joinsearchseam.go:tryPGShapedJoinSearch — searchConsumes rebuilds restrict infos per conjunct | | | | | [ ] |
 | OP2-12 | optimizer-2 | medium | joinselectivity.go:examineJoinVar / columnStatsByName — Linear column lookup per operand | | | | | [ ] |
-| OP2-14 | optimizer-2 | medium | pathbitmap.go:chooseBitmapAnd — costBitmapTree recomputed inside sort comparator | | | | | [ ] |
+| OP2-14 | optimizer-2 | medium | pathbitmap.go:chooseBitmapAnd — costBitmapTree recomputed inside sort comparator | ADOPT (small, no benchmark) | the comparator recomputed each candidate cost O(log n) times and costBitmapTree walks the whole bitmap tree; n is small in practice, so no measurable planning win is claimed | same ordering — the same costs, computed once | strictly less work, same shape | [x] fixed |
 | OP2-18 | optimizer-2 | medium | scan_input_rewrite.go:absorbConjunctsIntoSubtree — Re-walks the whole subtree per matching conjunct | | | | | [ ] |
 | OP2-20 | optimizer-2 | medium | pushdown.go:pushOneConjunct — Per-conjunct whole-tree walks at every recursion level | | | | | [ ] |
 | OP2-29 | optimizer-2 | medium | selectivity.go:clauseSelectivity / clauseSelectivityWithSource — Near-identical duplicated implementations | | | | | [ ] |
@@ -93,7 +93,7 @@ not, with the reason) / empty (not judged yet).
 | ST-14 | storage | medium | `lmgr/lockmgr.go:grantedExcept` — O(number of holders) recomputation when the cached mask already has the answer | | | | | [ ] |
 | ST-16 | storage | medium | `aio/read_stream.go:refill` — allocates a fresh BlockSize buffer per prefetched block | REJECT (needs an API contract, not a fix) | real allocation per prefetched block | the buffer BECOMES the caller data: ReadStream.Next hands those bytes out, so recycling needs a release call and a "do not retain" contract on every consumer | out of scope for a per-finding fix | [ ] deferred |
 | ST-17 | storage | medium | `bufpool.go:Prefetch` — allocates a fresh 8KB buffer per prefetch | REJECT (unsafe to pool) | real 8KB allocation per prefetch | the buffer must stay alive until the async read completes, and the handle is dropped — reusing one buffer across in-flight prefetches means concurrent kernel writes into it. A pool would have to be tied to IO completion, which the AIO layer does not expose | out of scope for a per-finding fix | [ ] deferred |
-| NB-4 | nbtree-amcheck | low/medium | `pgpage.go:pgFirstDataSlot` — opaque re-decoded on every accessor call inside loops | | | | | [ ] |
+| NB-4 | nbtree-amcheck | low/medium | `pgpage.go:pgFirstDataSlot` — opaque re-decoded on every accessor call inside loops | ADOPT | 1.563 ns -> 0.382 ns per call (4.1x), and it is called per item inside page loops | a test compares the narrow read against PGFirstDataKey(ReadPGOpaque) over rightmost and non-rightmost pages | reads one field instead of five, with the P_RIGHTMOST rule spelled out | [x] fixed |
 | NB-8 | nbtree-amcheck | medium | `btree.go:resetPageItems` — byte-by-byte zeroing of the whole data area on every page rewrite | ADOPT | 1811 ns -> 118 ns per page rewrite (15.3x) | `clear` over the same byte range; the high key is still re-stamped afterwards, which the existing TestResetPageItemsKeepsTheHighKey pins | one line | [x] fixed |
 | NB-9 | nbtree-amcheck | medium | `btree.go:findChildBlockDirect` / `btree.go:insertItemSorted` — per-probe key copies inside descent/insert binary search | | | | | [ ] |
 | NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | REJECT (maintainability) | plausible | — | pageItems returns an EXPANDED item list (one entry per heap TID), so items do not map 1:1 to line pointers; a lazy binary search would have to rework that invariant and its VACUUM-side readers | [x] no change |
@@ -105,7 +105,7 @@ not, with the reason) / empty (not judged yet).
 | NB-20 | nbtree-amcheck | low/medium | `backup/basebackup.go:emitBaseBackupTar` / `emitTablespaceTar` — whole-file buffering | | | | | [ ] |
 | TA-1 | transam | medium | `manager.go:captureSnapshot` — Full copy of `abortedXIDs` on every snapshot capture | ADOPT | with 10,000 aborts: 15.0us -> 1.13us (13x), 41KB -> 89B per snapshot | honours the existing contract that Aborted is immutable after capture; the insert side became copy-on-write | contained in one insert helper | [x] fixed |
 | TA-2 | transam | medium | `manager.go:SnapshotFor` — Deep-`Clone()` of the pinned snapshot on every RR/SSI statement | ADOPT | per statement in RR/SSI: 9.7 ns -> 1.4 ns with no aborts, 116 ns -> 1.4 ns with 100 aborts, 6.9us -> 1.4 ns (41KB -> 0) with 10,000 | rests on the invariant WithCLog already documents: the XID arrays are immutable after capture. captureSnapshot builds fresh slices and insertSortedXID is copy-on-write (TA-1); nothing else writes them | Clone keeps its name and contract, with the invariant spelled out | [x] fixed |
-| TA-8 | transam | medium | `multixact/store.go:Members` — Allocates + copies the member slice on every call, and takes the global mutex | | | | | [ ] |
+| TA-8 | transam | medium | `multixact/store.go:Members` — Allocates + copies the member slice on every call, and takes the global mutex | ADOPT (small) | serial unchanged (18.7 -> 18.5 ns), 16-way parallel 32.5 ns -> 25.3 ns (1.29x); the map lookup and the member copy dominate, so the lock was not the whole cost | reads only; `go test -race` on the package passes | Mutex -> RWMutex, three call sites | [x] fixed |
 | PN-1 | parser-nodes | medium | `internal/parser/adapter.go:mapToken` — Per-token `resolve()` map lookup for every terminal | ADOPT (small) | pgbench-shaped statements: SELECT 6.28us -> 5.94us, UPDATE 6.33us -> 6.05us, INSERT 10.19us -> 9.81us (4-5%) | the terminal numbers are the same constants, resolved at init instead of per token | strictly less work: one map lookup per keyword instead of two, and the fixed terminals become package vars | [x] fixed |
 | PN-2 | parser-nodes | medium | `internal/parser/adapter.go:next()` — Double `strings.ToLower` per token | REJECT (no benefit, and a behaviour risk) | `strings.ToLower` does not allocate when the input is already lower-case, and the token strings are short — a scan of a few bytes | dropping the second call is NOT equivalent: a string literal such as `SELECT 'DATE' 'x'` currently reaches the typed-literal fold through the lowered text, and would stop doing so | — | [x] no change |
 | CP-3 | catalog-postmaster | medium | `catalog.go:InheritanceChildren` / `PartitionChildren` — O(children × tables) lookup by scanning the whole namespace map per child | ADOPT | 300 unrelated tables: 4 children 4.77us -> 3.18us (1.5x), 64 children 105us -> 10.1us (10.4x) | registration order and the "child OID with no table is skipped" rule pinned by a test | one shared helper, no cached index to keep in sync | [x] fixed |
@@ -1131,3 +1131,42 @@ contract change: in `ReadStream.refill` the buffer becomes the caller's data
 an async read whose handle is dropped, so a shared buffer would mean concurrent
 kernel writes into it. The sound fix is a buffer pool tied to IO completion,
 which the AIO layer does not expose today — a feature, not a per-finding fix.
+
+### NB-4 / TA-8 / OP2-14 — ADOPT; EO2-9 / EO2-25 / OP2-3 — REJECT
+
+**NB-4** — `pgFirstDataSlot` decoded the whole 16-byte page opaque (five
+little-endian loads into a struct) to answer one comparison, and the accessors
+above it call it per item inside page loops. It reads `btpo_next` directly now;
+P_RIGHTMOST is exactly `btpo_next == P_NONE`.
+`TestPGFirstDataSlotMatchesOpaqueDecode` pins the equivalence.
+
+| | before | after |
+|---|---|---|
+| `pgFirstDataSlot` | 1.563 ns | 0.382 ns |
+
+**TA-8** — `multixact.Store.Members` and `Next` are pure reads on a per-row
+path (every tuple whose xmax is a MultiXactId resolves its members) and took
+the store's exclusive mutex. Now an RWMutex. Serial time is unchanged — the map
+lookup and the member copy dominate — but 16-way parallel goes 32.5 ns ->
+25.3 ns. The copy stays: the returned slice is documented as the caller's.
+
+**OP2-14** — `chooseBitmapAnd` sorted its candidates with a comparator that
+called `costBitmapTree` on both sides of every comparison, walking each
+candidate's whole bitmap tree O(log n) times. The costs are computed once now.
+No benchmark: the candidate count is small in practice, so this is adopted as a
+strictly-less-work simplification rather than a measured win.
+
+**EO2-9 / EO2-25 — REJECT.** Measured first: `openIndexBTree` costs 159 ns,
+416 B and 2 allocations per row per index — roughly 1-3% of a row insert. The
+fix would be caching the opened tree across rows, which means invalidating it
+on index DDL, on a CREATE INDEX CONCURRENTLY swap and on any relfilenode
+change mid-statement. Getting that wrong writes index entries into the wrong
+tree — a silent corruption — for a low single-digit percentage. Not a good
+trade; a statement-scoped cache in the COPY path alone would be the safer place
+to revisit it.
+
+**OP2-3 — REJECT.** `FoldConstants` allocating fresh nodes even when nothing
+folds is what makes the planner's later in-place rewrites safe: returning the
+input unchanged would alias the caller's tree. Establishing that no mutating
+pass depends on the copy is a survey of the whole rewrite layer, for a saving
+that is planning-time only and paid once per query.
