@@ -29,13 +29,14 @@
 | EC-14 | executor-core | medium | `copy.go:insertSourceRow` — per-row `make(Row, …)` instead of the row pool | | | | | [ ] |
 | EC-16 | executor-core | medium | `copy_binary.go:decodeNumericBinary` — dead `fullMantissa` computation before unconditional fallback | | | | | [ ] |
 | EC-20 | executor-core | medium | `expr.go:evalCast` — `strings.ToLower(targetType)` on every cast evaluation | | | | | [ ] |
-| EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | | | | | [ ] |
+| EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | REJECT（対応済み） | — | — | — | [x] no change |
+| EO1-13 | executor-operators-1 | medium | `operators_gather_merge.go:lessRows` — Sort key expressions re-evaluated on every heap comparison（Appendix A から昇格） | ADOPT | 4 ソース × 2000 行で 2.63ms→1.94ms (1.36x)、alloc 42,652→23,988 | 比較規則は逐語で不変。キーは行を pull した時点で 1 回だけ評価 | EO2-2 / sortOp と同じ方針に揃う | [x] fixed |
 | EO1-4 | executor-operators-1 | medium | `operators_analyze.go:analyzeRelationWith` — Decodes every visible tuple but only keeps a fraction | | | | | [ ] |
 | EO1-7 | executor-operators-1 | medium | `operators_bitmap.go:bitmapIndexScanOp.buildBitmap` — Allocates a slice per index entry in hot loop | | | | | [ ] |
 | EO1-10 | executor-operators-1 | medium | `operators_generate_series.go:generateSeriesOp.Next` — Allocates a Row per emitted value | | | | | [ ] |
 | EO1-11 | executor-operators-1 | medium | `operators_fk.go:fkRowMatches` — Per-row linear column-name lookup on every row of a table scan | | | | | [ ] |
 | EO2-1 | executor-operators-2 | high | `operators_join_agg.go:applyAgg` — string_agg O(n²) string concatenation | ADOPT | 4000 行 1 グループで 34.99ms→1.89ms (18.5x)、229MB→1.5MB | 連結順・区切り・bytea 経路は同一。ORDER BY 経路は元から Builder | `strResult` 文字列 → `strAccum []byte` の 1 フィールド置換 | [x] fixed |
-| EO2-2 | executor-operators-2 | medium | `operators_window.go:Open` — sort comparator re-evaluates expressions per comparison | | | | | [ ] |
+| EO2-2 | executor-operators-2 | medium | `operators_window.go:Open` — sort comparator re-evaluates expressions per comparison | ADOPT | 4000 行 8 パーティションで 18.44ms→7.66ms (2.4x)、alloc 256,905→56,166 | 比較規則は逐語で不変。キーを行ごとに 1 回評価する形に変えただけ | sortOp.sortChunk と同じ「キー先計算 + 置換ソート」に揃う | [x] fixed |
 | EO2-6 | executor-operators-2 | medium | `operators_index.go:Next` / `operators_storage.go:Next` — per-row enum value linear scan | | | | | [ ] |
 | EO2-7 | executor-operators-2 | medium | `operators_indexonly.go:decodeRowFromKey` / `operators_indexonly.go:decodeRowFromHeap` — per-row map allocation + O(covered × columns) projection | | | | | [ ] |
 | EO2-8 | executor-operators-2 | medium | `operators_generated.go:evalGeneratedExpr` — re-parses expression string per row | | | | | [ ] |
@@ -87,14 +88,14 @@
 | NB-4 | nbtree-amcheck | low/medium | `pgpage.go:pgFirstDataSlot` — opaque re-decoded on every accessor call inside loops | | | | | [ ] |
 | NB-8 | nbtree-amcheck | medium | `btree.go:resetPageItems` — byte-by-byte zeroing of the whole data area on every page rewrite | | | | | [ ] |
 | NB-9 | nbtree-amcheck | medium | `btree.go:findChildBlockDirect` / `btree.go:insertItemSorted` — per-probe key copies inside descent/insert binary search | | | | | [ ] |
-| NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | | | | | [ ] |
+| NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | REJECT（保守性） | ○ 見込みあり | — | × pageItems は heap TID ごとに展開した項目列を返す（行と行ポインタが 1:1 でない）ため遅延二分探索は不変条件に踏み込む | [x] no change |
 | NB-11 | nbtree-amcheck | low/medium | `btree.go:EncodeNumericKey` — fresh big.Int allocation per trailing-zero strip iteration | | | | | [ ] |
 | NB-15 | nbtree-amcheck | low/medium | `amcheck/heapallindexed.go:fingerprintLeafEntry` — a fresh buffer allocation per element, twice per element | | | | | [ ] |
 | NB-17 | nbtree-amcheck | high | `pglz.go:Compress` — brute-force O(n·window·matchlen) match search | ADOPT | 64KiB 入力で random 377ms→1.0ms (379x)、nodetree 8.1ms→0.26ms (32x)、text 30.0ms→1.5ms (20x) | 出力は正当な PGLZ ストリームのまま。round-trip テストで固定。圧縮率はわずかに悪化（下記） | 上流 pg_lzcompress.c と同じ hash chain + good_match/good_drop。定数は PG の既定値 | [x] fixed |
 | NB-18 | nbtree-amcheck | low/medium | `pglz.go:Decompress` — byte-by-byte run-length copy even for non-overlapping matches | ADOPT | text 78.9µs→43.6µs (1.8x)、nodetree 44.6µs→26.1µs (1.7x) | 重なりあり (off < length) は従来のバイトループのまま。round-trip テストで固定 | if 1 本の分岐追加のみ | [x] fixed |
 | NB-19 | nbtree-amcheck | low/medium | `backup/basebackup.go:baseBackupStreamer.Write` / `streamBackupManifest` — fresh frame buffer allocated per chunk | | | | | [ ] |
 | NB-20 | nbtree-amcheck | low/medium | `backup/basebackup.go:emitBaseBackupTar` / `emitTablespaceTar` — whole-file buffering | | | | | [ ] |
-| TA-1 | transam | medium | `manager.go:captureSnapshot` — Full copy of `abortedXIDs` on every snapshot capture | | | | | [ ] |
+| TA-1 | transam | medium | `manager.go:captureSnapshot` — Full copy of `abortedXIDs` on every snapshot capture | ADOPT | abort 10,000 件で 15.0µs→1.13µs (13x)、41KB→89B/スナップショット | Aborted 配列は capture 後 immutable という既存契約どおり。insert 側を copy-on-write 化 | 実装は挿入関数 1 つの中に閉じる | [x] fixed |
 | TA-2 | transam | medium | `manager.go:SnapshotFor` — Deep-`Clone()` of the pinned snapshot on every RR/SSI statement | | | | | [ ] |
 | TA-8 | transam | medium | `multixact/store.go:Members` — Allocates + copies the member slice on every call, and takes the global mutex | | | | | [ ] |
 | PN-1 | parser-nodes | medium | `internal/parser/adapter.go:mapToken` — Per-token `resolve()` map lookup for every terminal | | | | | [ ] |
@@ -144,7 +145,6 @@
 - `EO1-8` `operators_call.go:callArgTypeCompatible` — Allocates two maps on every CALL
 - `EO1-9` `operators_distinct.go:distinctOnOp.Next` — String concatenation in a loop per row
 - `EO1-12` `operators_fk.go:fkSetNull` — Nested linear column lookup per matching row
-- `EO1-13` `operators_gather_merge.go:gatherMergeOp.lessRows` — Sort key expressions re-evaluated on every heap comparison
 - `EO1-14` `operators_ddl.go:execTruncate` — FK-cascade check rebuilds per-iteration data and re-lowers names
 
 **executor-operators-2.md**
@@ -513,3 +513,60 @@ text ≤ 0.75 と round-trip を恒久的に固定する。非圧縮データは
 - **効用**: ○ TOAST 読み出しで 1.7〜1.8 倍。
 - **無回帰**: ○ 重なり経路は従来コードのまま。round-trip テストで固定。
 - **保守性**: ○ 分岐 1 本。
+
+### EO1-1 — REJECT（既に対応済み）
+
+`sortOp` は M0134-0191 で既にキー値を `o.keyvals` に先計算しており、実ソートは
+`lessKeyVals`（先計算済み Datum 同士の比較）で回っている。`lessRows` は
+`len(o.keyvals) != len(rows)` になった場合の防御的フォールバックとしてのみ残って
+おり、通常経路では呼ばれない。指摘の症状は現行コードには存在しない。
+
+### EO2-2 — ADOPT（ウィンドウ入力ソートのキー先計算）
+
+`windowOp.Open` の比較関数は PARTITION BY / ORDER BY の式を比較のたびに両辺で
+`evalExpr` していた（n 行なら式ごとに O(n log n) 回）。`sortOp.sortChunk` と同じ
+形——行ごとに 1 回だけ評価して置換をソート——に置き換えた。比較規則
+（`compareSortDatums` の呼び順、`decided`、`Desc` 反転）は逐語で不変。
+
+計測（`internal/executor/window_sortkey_bench_test.go`、4000 行 / 8 パーティション、
+`row_number() OVER (PARTITION BY g ORDER BY t)`）:
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| before | 18,435,533 | 8,989,178 | 256,905 |
+| after | 7,660,551 | 4,784,936 | 56,166 |
+
+- **効用**: ○ 2.4 倍、alloc 4.6 分の 1。行数が増えるほど差が開く。
+- **無回帰**: ○ 評価位置が変わるだけ。ウィンドウ関数の既存テストは緑。
+- **保守性**: ○ 既存の sortOp と同じ定石に揃った。
+
+### EO1-13 — ADOPT（Gather Merge のヒープ比較キー先計算）
+
+`gatherMergeOp.lessRows` はヒープ比較のたびに両辺でソートキーを評価していたため、
+出力 1 行あたり O(キー数 × log ソース数) 回の式評価が発生していた。`advance` で行を
+pull した時点で 1 回だけ評価して `gmSource.curKeys` に持たせ、ヒープは Datum 同士を
+比べるだけにした。NULL 配置・`Desc`・`compareDatum` の順序規則は逐語で不変
+（この比較器と `sortOp` の規則が一致していることが Gather Merge の正当性そのもの
+なので、規則には触れていない）。
+
+計測（`internal/executor/gather_merge_keys_bench_test.go`、4 ソース × 2000 行、
+キーは列参照 2 本 = 最も安い式）:
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| before | 2,632,359 | 1,023,654 | 42,652 |
+| after | 1,935,229 | 1,151,443 | 23,988 |
+
+- **効用**: ○ 1.36 倍。キーが列参照より重い式（キャスト・関数）なら差はさらに開く。
+- **無回帰**: ○ 比較規則は不変。B/op がわずかに増えるのは行ごとのキー配列を保持する
+  ぶんで、評価回数と alloc 回数は減っている。
+- **保守性**: ○ EO2-2 / sortOp と同じ方針。
+
+### NB-10 — REJECT（保守性）
+
+`BTree.Search` が `pageItems` でリーフ全体をデコードしてから二分探索しているのは
+事実だが、`pageItems` は heap TID ごとに項目を展開した列を返す（項目インデックスと
+行ポインタが 1:1 ではない）。遅延デコードの二分探索にするには展開規則と
+`pageItemsWithDead` / VACUUM 側の「同じ列を見ている」前提まで作り替える必要があり、
+nbtree の不変条件に踏み込む変更量になる。効用は見込めるが、判断基準 3（保守性を
+著しく下げない）を満たさないため今回は見送る。
