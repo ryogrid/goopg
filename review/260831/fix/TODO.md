@@ -42,7 +42,7 @@ not, with the reason) / empty (not judged yet).
 | EO1-4 | executor-operators-1 | medium | `operators_analyze.go:analyzeRelationWith` — Decodes every visible tuple but only keeps a fraction | | | | | [ ] |
 | EO1-7 | executor-operators-1 | medium | `operators_bitmap.go:bitmapIndexScanOp.buildBitmap` — Allocates a slice per index entry in hot loop | | | | | [ ] |
 | EO1-10 | executor-operators-1 | medium | `operators_generate_series.go:generateSeriesOp.Next` — Allocates a Row per emitted value | | | | | [ ] |
-| EO1-11 | executor-operators-1 | medium | `operators_fk.go:fkRowMatches` — Per-row linear column-name lookup on every row of a table scan | | | | | [ ] |
+| EO1-11 | executor-operators-1 | medium | `operators_fk.go:fkRowMatches` — Per-row linear column-name lookup on every row of a table scan | ADOPT | 16-column table, FK columns last: 262 ns -> 24 ns per row (10.7x) | a differential test compares the new form against the old name-resolving one, unknown-column and case-insensitive cases included | the resolution is hoisted to the top of each scan; the old function is gone, not duplicated | [x] fixed |
 | EO2-1 | executor-operators-2 | high | `operators_join_agg.go:applyAgg` — string_agg O(n²) string concatenation | ADOPT | 4000 rows in one group: 34.99ms -> 1.89ms (18.5x), 229MB -> 1.5MB allocated | concatenation order, delimiter placement and the bytea path are identical; the ORDER BY path already used a Builder | one field swapped: `strResult` string -> `strAccum []byte` | [x] fixed |
 | EO2-2 | executor-operators-2 | medium | `operators_window.go:Open` — sort comparator re-evaluates expressions per comparison | ADOPT | 4000 rows / 8 partitions: 18.44ms -> 7.66ms (2.4x), allocs 256,905 -> 56,166 | comparison rule unchanged verbatim; only the evaluation moved to once per row | same "precompute keys, sort a permutation" shape as sortOp.sortChunk | [x] fixed |
 | EO2-6 | executor-operators-2 | medium | `operators_index.go:Next` / `operators_storage.go:Next` — per-row enum value linear scan | | | | | [ ] |
@@ -108,9 +108,9 @@ not, with the reason) / empty (not judged yet).
 | TA-8 | transam | medium | `multixact/store.go:Members` — Allocates + copies the member slice on every call, and takes the global mutex | | | | | [ ] |
 | PN-1 | parser-nodes | medium | `internal/parser/adapter.go:mapToken` — Per-token `resolve()` map lookup for every terminal | | | | | [ ] |
 | PN-2 | parser-nodes | medium | `internal/parser/adapter.go:next()` — Double `strings.ToLower` per token | | | | | [ ] |
-| CP-3 | catalog-postmaster | medium | `catalog.go:InheritanceChildren` / `PartitionChildren` — O(children × tables) lookup by scanning the whole namespace map per child | | | | | [ ] |
+| CP-3 | catalog-postmaster | medium | `catalog.go:InheritanceChildren` / `PartitionChildren` — O(children × tables) lookup by scanning the whole namespace map per child | ADOPT | 300 unrelated tables: 4 children 4.77us -> 3.18us (1.5x), 64 children 105us -> 10.1us (10.4x) | registration order and the "child OID with no table is skipped" rule pinned by a test | one shared helper, no cached index to keep in sync | [x] fixed |
 | CP-4 | catalog-postmaster | medium | `catalog.go:RoleIsMemberOf` / `IsAdminOfRole` / `HasPrivsOfRole` / `SelectBestAdmin` — BFS re-scans the entire `roleMembers` map per queue level (O(V×E)) | | | | | [ ] |
-| CP-5 | catalog-postmaster | medium | `catalog.go:LookupTableByOIDAllDBs` / `tableByOID` — linear scan of all tables per OID lookup | | | | | [ ] |
+| CP-5 | catalog-postmaster | medium | `catalog.go:LookupTableByOIDAllDBs` / `tableByOID` — linear scan of all tables per OID lookup | REJECT (maintainability) | plausible — `tableByOID` is O(tables) and runs per row for `tableoid::regclass` | — | an OID index would have to be maintained at ~100 sites that assign into or delete from `ns.tables`; there is no central setTable/dropTable helper to hang it on. Revisit once those writes are funnelled through one place | [x] no change |
 | UT-1 | utils | medium | `internal/utils/misc/encoding_guc.go:encodingNameToCanonical` — re-cleans the constant encoding table on every call | REJECT (no benefit) | the only caller is the client_encoding GUC check; it is not on any per-row or per-tuple path | — | — | [x] no change |
 | UT-9 | utils | medium | `internal/utils/adt/datetime/pg_datetime_format.go` — `fmt.Sprintf` on the per-cell output path | | | | | [ ] |
 | UT-14 | utils | medium | `internal/utils/mb/conv.go:DoEncodingConversion` — dead `destBuf` allocation | | | | | [ ] |
@@ -672,3 +672,54 @@ have room):
 - **Maintainability**: yes. The summary has exactly one owner (the writer), and
   a reader with no summary falls back to the old full scan — so a bug there
   costs speed, never correctness.
+
+### EO1-11 — ADOPT (resolve FK columns once per scan, not once per row)
+
+`fkRowMatches` matched FK column NAMES against the table's columns with
+`strings.EqualFold` for every row, and its five callers run it over every row of
+a full table scan (cascade delete, SET NULL, parent-match probes, the in-flight
+child-insert detector). The resolution is now hoisted to the top of each scan
+(`fkColumnIndexes`), and the comparison works on positions
+(`fkRowMatchesAt`). The old function had no other callers and was deleted rather
+than left behind as a second implementation of the same rule.
+
+Measured (`internal/executor/fk_colmatch_bench_test.go`, 16-column table, the
+two FK columns last — which is what makes the linear name scan expensive; one
+iteration is one row of the scan):
+
+| | ns/op | allocs/op |
+|---|---|---|
+| resolve per row (old) | 262.1 | 0 |
+| precomputed (new) | 24.4 | 0 |
+
+- **Benefit**: yes. 10.7x per row, on a path that is already a full table scan.
+- **No regression**: yes. `TestFKRowMatchAtMatchesByName` keeps a copy of the
+  old name-resolving implementation and asserts both agree on match, value
+  mismatch, unknown column, case-insensitive name and arity mismatch.
+- **Maintainability**: yes. One resolution helper, and one comparison function
+  instead of one.
+
+### CP-3 — ADOPT (resolve inheritance/partition children in one pass)
+
+`InheritanceChildren` / `PartitionChildren` looked up each child OID by scanning
+the whole namespace's table map — O(children x tables). Both sit on
+per-statement paths (FK enforcement walks the children of every child table;
+partition routing calls them while routing rows), and goopg's own bootstrap
+already registers several hundred catalog and information_schema tables before
+any user table exists. They now share `tablesByChildOIDs`, which walks the
+namespace once and drops the results into their registration-order slots.
+
+Measured (`internal/catalog/children_lookup_bench_test.go`, 300 unrelated
+tables in the namespace):
+
+| | before | after |
+|---|---|---|
+| 4 children | 4767 ns, 32 B | 3175 ns, 32 B |
+| 64 children | 104,724 ns, 512 B | 10,116 ns, 3368 B |
+
+- **Benefit**: yes. 1.5x for a handful of children, 10.4x for 64. The extra
+  bytes at 64 children are the OID->slot map that replaces the repeated scans.
+- **No regression**: yes. `TestPartitionChildrenOrder` pins registration order
+  and the "a child OID with no table is skipped" rule.
+- **Maintainability**: yes. One helper shared by both callers; no cached index
+  that could go stale.
