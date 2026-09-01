@@ -58,6 +58,35 @@ was 57% of server CPU under pgbench simple-update. `BackendID` is a pointer
 load plus a one-entry label scan, allocation-free. goopg reserves goroutine
 pprof labels for this purpose (no other code sets goroutine labels).
 
+## Public API
+
+```go
+// runtimeshim — the linkname'd primitives (with pure-Go fallbacks)
+func Nanotime() int64                       // monotonic clock (runtime.nanotime)
+func SemaAcquire(s *uint32)                 // block until *s > 0, then decrement
+func SemaRelease(s *uint32)                 // increment *s, wake one acquirer
+func PinP()                                 // pin goroutine to current P
+func UnpinP()                               // unpin from P
+
+// gls — goroutine-local backend id
+func SetBackendID(id int32)                 // stamp pprof label (cold path)
+func BackendID() (int32, bool)              // read back (WAL hot path)
+```
+
+## Internal structure
+
+- **`runtimeshim`** — each primitive has three files: the `//go:linkname`
+  site (`*_linkname.go`, build-tagged `go1.X && !go1.Y && !noLinkname`), the
+  pure-Go fallback (`*_fallback.go`, inverse tag), and the exported wrapper.
+  The semaphore is a single `uint32` cell owned by the caller; `SemaAcquire`
+  parks via the runtime's goroutine-park machinery (no internal mutex, unlike
+  `sync.Cond`). `PinP`/`UnpinP` bracket two-word lock-free updates.
+- **`gls`** — `SetBackendID` calls `runtime/pprof.SetGoroutineLabels` (labels
+  are inherited by spawned goroutines); `BackendID` reads the current label via
+  a linkname mirror of `runtime/pprof.runtime_getProfLabel` (the stdlib exposes
+  no "read my labels" function). A runtime self-check detects layout drift and
+  returns `(0, false)`, so callers fall back to stripe 0.
+
 ## Dependencies
 
 - **Used by** — `internal/storage` (buffer pool slot waits, pin/unpin),
