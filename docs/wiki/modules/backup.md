@@ -159,17 +159,17 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    TW[archive/tar Writer] -->|Write(p)| BSS[baseBackupStreamer.Write]
-    BSS --> CHK{ctx.Err()?}
-    CHK -- cancelled --> ERR[return ctx.Err()]
-    CHK -- ok --> LOOP[for len(p) > 0]
-    LOOP --> CHUNK{len(p) > baseBackupChunkBytes?}
-    CHUNK -- yes --> C1[chunk = 64 KiB]
-    CHUNK -- no --> C2[chunk = len(p)]
+    TW["archive/tar Writer"] -->|"Write(p)"| BSS["baseBackupStreamer.Write"]
+    BSS --> CHK{"ctx.Err()?"}
+    CHK -- cancelled --> ERR["return ctx.Err()"]
+    CHK -- ok --> LOOP["for len(p) > 0"]
+    LOOP --> CHUNK{"len(p) > baseBackupChunkBytes?"}
+    CHUNK -- yes --> C1["chunk = 64 KiB"]
+    CHUNK -- no --> C2["chunk = len(p)"]
     C1 --> FRAME['d' type byte + chunk → WriteCopyData]
     C2 --> FRAME
-    FRAME --> DONE2[bytesDone += n]
-    DONE2 --> PROG{bytesDone >= nextProgressMark?}
+    FRAME --> DONE2["bytesDone += n"]
+    DONE2 --> PROG{"bytesDone >= nextProgressMark?"}
     PROG -- yes --> PF[writeProgressFrame + advance mark]
     PROG -- no --> LOOP2
     PF --> LOOP2
@@ -179,17 +179,17 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    REC["record() closure"] --> CHK2{path is pg_wal/?}
-    CHK2 -- yes --> SKIP[skip: WAL tracked via WAL-Ranges, never Files]
-    CHK2 -- no --> ALGO{mck.checksumFile(data)}
-    ALGO --> CRC[CRC32C via castagnoliTable<br/>little-endian byte image]
+    REC["record() closure"] --> CHK2{"path is pg_wal/?"}
+    CHK2 -- yes --> SKIP["skip: WAL tracked via WAL-Ranges, never Files"]
+    CHK2 -- no --> ALGO{"mck.checksumFile(data)"}
+    ALGO --> CRC["CRC32C via castagnoliTable<br/>little-endian byte image"]
     ALGO --> SHA[SHA224/256/384/512 via crypto/sha*]
     ALGO --> NONE[mckNone → no checksum fields]
     CRC --> E[manifestEntry appended]
     SHA --> E
     NONE --> E
-    E --> BUILD[buildBackupManifest:<br/>Version-2 JSON, Files[], WAL-Ranges,<br/>SHA-256 Manifest-Checksum]
-    BUILD --> STREAM[streamBackupManifest:<br/>'m' marker + 'd' frames]
+    E --> BUILD["buildBackupManifest:<br/>Version-2 JSON, Files array, WAL-Ranges,<br/>SHA-256 Manifest-Checksum"]
+    BUILD --> STREAM["streamBackupManifest:<br/>m marker + d frames"]
 ```
 
 ### Checksums

@@ -51,15 +51,15 @@ envelope without losing the location.
 flowchart TD
     SRC[PL/pgSQL body source]
     LEX[parser.Lex — main SQL lexer]
-    BP[bodyParser<br/>src + tokens + idx]
-    TOP[parseTopBlock<br/>[DECLARE decls] BEGIN stmts [EXCEPTION] END [;]]
-    DS[parseDeclSection<br/>decl+ until BEGIN]
-    DECL[parseDeclaration<br/>name type [DEFAULT|:= expr] ;]
-    SL[parseStmtListWithException<br/>terminators: END / EXCEPTION]
-    ST[parseStmt<br/>dispatch on first token]
-    EB[parseExceptionBlock<br/>WHEN conds THEN stmts]
-    SQL[parseSQLStmt<br/>embedded SQL → parser.Parse]
-    EX[scanExprToKeyword / scanExprToSemicolon<br/>slice source → parser.ParseExpr]
+    BP["bodyParser<br/>src + tokens + idx"]
+    TOP["parseTopBlock<br/>DECLARE section, then BEGIN, EXCEPTION, END"]
+    DS["parseDeclSection<br/>decl+ until BEGIN"]
+    DECL["parseDeclaration<br/>name type (DEFAULT or := expr);"]
+    SL["parseStmtListWithException<br/>terminators: END / EXCEPTION"]
+    ST["parseStmt<br/>dispatch on first token"]
+    EB["parseExceptionBlock<br/>WHEN conds THEN stmts"]
+    SQL["parseSQLStmt<br/>embedded SQL → parser.Parse"]
+    EX["scanExprToKeyword / scanExprToSemicolon<br/>slice source → parser.ParseExpr"]
     TOP --> DS
     TOP --> SL
     DS --> DECL
@@ -76,15 +76,15 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    ST[parseStmt<br/>inspect first token] --> R{Token kind}
-    R -- KwReturn --> PR[parseReturn<br/>RETURN; / RETURN expr; / RETURN NEXT / RETURN QUERY]
-    R -- KwIf --> PI[parseIf<br/>IF/ELSIF/ELSEIF/ELSE]
-    R -- KwLoop --> PL[parseLoop<br/>LOOP ... END LOOP;]
-    R -- KwWhile --> PW[parseWhile<br/>WHILE cond LOOP ... END LOOP;]
-    R -- KwFor --> PF[parseFor<br/>query FOR vs integer-range FOR]
-    R -- KwBegin --> PN[parseNestedBlock<br/>BEGIN ... [EXCEPTION] END]
+    ST["parseStmt<br/>inspect first token"] --> R{Token kind}
+    R -- KwReturn --> PR["parseReturn<br/>RETURN; / RETURN expr; / RETURN NEXT / RETURN QUERY"]
+    R -- KwIf --> PI["parseIf<br/>IF/ELSIF/ELSEIF/ELSE"]
+    R -- KwLoop --> PL["parseLoop<br/>LOOP ... END LOOP;"]
+    R -- KwWhile --> PW["parseWhile<br/>WHILE cond LOOP ... END LOOP;"]
+    R -- KwFor --> PF["parseFor<br/>query FOR vs integer-range FOR"]
+    R -- KwBegin --> PN["parseNestedBlock<br/>BEGIN ... (EXCEPTION) END"]
     R -- KwPerform --> PP[parsePerform]
-    R -- KwNull --> PN2[NullStmt — NULL;]
+    R -- KwNull --> PN2["NullStmt — NULL;"]
     R -- KwCommit/KwRollback --> PT[TxControlStmt]
     R -- KwExit --> PE[parseExit]
     R -- KwContinue --> PC[parseContinue]
@@ -93,7 +93,7 @@ flowchart TD
     R -- KwSet --> PSQL
     R -- ident raise --> PR2[parseRaise]
     R -- ident grant/revoke --> PSQL
-    R -- ident --> PA[parseAssign<br/>x := v / x[i] := v / NEW.f := v / x.f := v]
+    R -- ident --> PA["parseAssign<br/>x := v / x(i) := v / NEW.f := v / x.f := v"]
 ```
 
 ### Token handling primitives
@@ -251,20 +251,20 @@ TOP->>TOP: expectKeyword(KwEnd), acceptSymbol(',')
 
 ```mermaid
 flowchart TD
-    PF[parseFor: expect KwFor, read loop var, expect KwIn]
-    PF --> REV{accept KwReverse?}
+    PF["parseFor: expect KwFor, read loop var, expect KwIn"]
+    PF --> REV{"accept KwReverse?"}
     REV -- yes --> RANGE2[integer-range FOR — reverse]
     REV -- no --> PEEK{first real token}
     PEEK -- KwSelect/KwInsert/KwUpdate/KwDelete/KwWith/KwExecute --> QFOR[query FOR]
     PEEK -- "(" --> QFOR
     PEEK -- other --> RANGE1[integer-range FOR]
-    QFOR --> QSCAN[depth-aware scan to depth-0 KwLoop<br/>capture sqlText]
-    QSCAN --> QSTMT[ForSelectStmt{Var, SQL, Body}]
+    QFOR --> QSCAN["depth-aware scan to depth-0 KwLoop<br/>capture sqlText"]
+    QSCAN --> QSTMT["ForSelectStmt(Var, SQL, Body)"]
     RANGE1 --> LOWER[scanExprTo '..']
-    RANGE1 --> REV2{accept KwBy?}
+    RANGE1 --> REV2{"accept KwBy?"}
     LOWER --> UPPER[scanExprTo KwLoop/KwBy]
     REV2 -- yes --> STEP[scanExprToKeyword KwLoop]
-    UPPER --> RSTMT[ForStmt{Var, Reverse, Lower, Upper, Step, Body}]
+    UPPER --> RSTMT["ForStmt(Var, Reverse, Lower, Upper, Step, Body)"]
     STEP --> RSTMT
 ```
 

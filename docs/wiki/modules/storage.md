@@ -32,8 +32,8 @@ flowchart TD
     end
     subgraph IO
         AIO[aio io_uring]
-        FILE[(relation forks)]
-        WAL[(pg_wal)]
+        FILE["(relation forks)"]
+        WAL["(pg_wal)"]
     end
     EXEC --> POOL --> BUFMAP --> SLOT
     POOL --> SMGR --> FILE
@@ -316,11 +316,11 @@ every slot reuse.
 ```mermaid
 flowchart LR
     subgraph bufmap
-        BUCKET[bufmapBucket: key0, key1, val]
-        HASH[hash(tag) → bucket index]
+        BUCKET["bufmapBucket: key0, key1, val"]
+        HASH["hash(tag) → bucket index"]
         PROBE[linear probe chain]
         TOMB[tombstone on delete]
-        COMPACT[compact() pass]
+        COMPACT["compact() pass"]
     end
     BUCKET --> HASH
     HASH --> PROBE
@@ -673,10 +673,10 @@ The clock-sweep eviction algorithm:
 flowchart TD
     A[Pool.Pin miss] --> B{find victim via clock hand}
     B --> C[read usageCount]
-    C --> D{usageCount > 0?}
-    D -- yes --> E[usageCount--, advance hand, retry]
+    C --> D{"usageCount > 0?"}
+    D -- yes --> E["usageCount--, advance hand, retry"]
     D -- no --> F[claim victim]
-    F --> G{is dirty?}
+    F --> G{"is dirty?"}
     G -- yes --> H[flushSlot: WAL-flush + write]
     G -- no --> I[skip flush]
     H --> J[insert new tag into bufmap]

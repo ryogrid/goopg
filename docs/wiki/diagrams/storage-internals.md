@@ -35,7 +35,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-Start["Pin miss: need a buffer"] --> Hand['advance clockHand (atomic)']
+Start["Pin miss: need a buffer"] --> Hand["advance clockHand (atomic)"]
     Hand --> Check["inspect slot state word"]
     Check --> PinBusy{"pinCount > 0?"}
     PinBusy -->|yes| Hand
@@ -43,13 +43,13 @@ Start["Pin miss: need a buffer"] --> Hand['advance clockHand (atomic)']
     Usage -->|yes| Clear["usageCount = 0 (second chance)<br/>atomic CAS"]
     Clear --> Hand
     Usage -->|no| Dirty{"dirty?"}
-Dirty -->|yes| Flush["flushSlot:<br/>WAL to max(pd_lsn, hintFlushBarrier)<br/>then WriteBlock']
+Dirty -->|yes| Flush["flushSlot:<br/>WAL to max(pd_lsn, hintFlushBarrier)<br/>then WriteBlock"]
     Flush --> Evict
-Dirty -->|no| Evict["evictVictim: bmDelete,<br/>gen+1 (ABA defense)']
+Dirty -->|no| Evict["evictVictim: bmDelete,<br/>gen+1 (ABA defense)"]
     Evict --> Read["ReadBlock new page into slot"]
     Read --> Done["return *Slot"]
 
-    note right of Hand: state word: pinCount 22b | usageCount 8b<br/>dirty | valid | ioInflight | gen 15b
+    %% note right of Hand: state word: pinCount 22b | usageCount 8b<br/>dirty | valid | ioInflight | gen 15b
 ```
 
 ## Page Write + WAL Flush

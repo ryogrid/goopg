@@ -30,10 +30,10 @@ flowchart LR
     end
     subgraph storage
         XLOG[xlog WAL]
-        PGX[(pg_xact SLRU)]
-        PGS[(pg_subtrans SLRU)]
-        PGM[(pg_multixact SLRU)]
-        CTR[(pg_control)]
+        PGX["(pg_xact SLRU)"]
+        PGS["(pg_subtrans SLRU)"]
+        PGM["(pg_multixact SLRU)"]
+        CTR["(pg_control)"]
     end
     M --> TXN --> CLOG --> PGX
     M --> SNAP --> VIS

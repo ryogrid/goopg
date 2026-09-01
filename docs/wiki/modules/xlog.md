@@ -22,18 +22,18 @@ flowchart LR
         TXN[transam commit]
     end
     subgraph xlog
-        ENC[record encoders<br/>recovery.go]
+        ENC["record encoders<br/>recovery.go"]
         W[Writer]
         RING[MemRing]
         STRIPE[stripe append]
-        SEG[(pg_wal segments)]
+        SEG["(pg_wal segments)"]
         CKO[Checkpointer]
     end
     subgraph Consumers
         REC[Recovery/Replay]
-        PG[pg_assembled_emit<br/>PG-canonical]
+        PG["pg_assembled_emit<br/>PG-canonical"]
         PGO[pgoutput logical]
-        PGD[pg_xlog_decode<br/>PG-authored WAL]
+        PGD["pg_xlog_decode<br/>PG-authored WAL"]
         SLOTS[replication slots]
     end
     EXEC --> ENC --> W --> RING --> STRIPE --> SEG
@@ -286,15 +286,15 @@ goes through `pg_xlog_decode`'s rmgr dispatch with block-ref/FPI handling.
 ```mermaid
 flowchart TD
     S[segment stream] --> R[ReplayRecords]
-    R --> A{IsGoopgNativeRecord?}
+    R --> A{"IsGoopgNativeRecord?"}
     A -- yes --> K[ApplyRecord native kind dispatch]
-    A -- no --> P[replayDecodedXLogRecord<br/>PG rmgr dispatch]
+    A -- no --> P["replayDecodedXLogRecord<br/>PG rmgr dispatch"]
     K --> H[replayHeapInsert/Delete/Update/MultiInsert]
     K --> B[replayBtreeInsert/Split/Dedup/Delete/NewRoot]
     K --> X[replayXactCommit/Abort]
     K --> M[replaySmgrCreate/Truncate]
     P --> PR[redoHeapPageForBlock + block-ref images]
-    P --> PU{unsupported?}
+    P --> PU{"unsupported?"}
     PU -- yes --> E[ErrUnsupportedRecord]
     PU -- no --> OK[redo complete]
 ```

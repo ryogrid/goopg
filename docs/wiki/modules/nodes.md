@@ -143,7 +143,7 @@ flowchart TD
         IR[IR node] --> OUT[Out: outNode type-switch]
         OUT --> OC[outConst / outFuncExpr / outOpExpr / ...]
         OC --> OD[outDatum: by-value 8-byte LE word / by-ref full varlena]
-OD --> TEXT["(CONST :consttype 23 :consttypmod -1 ...)']
+OD --> TEXT["(CONST :consttype 23 :consttypmod -1 ...)"]
     end
     subgraph Deserialize
         TEXT2[pg_attrdef.adbin text] --> TOK[tokenizer: pg_strtok port]
@@ -185,14 +185,14 @@ styles must not be swapped — `Out` emits them differently on purpose.
 ```mermaid
 flowchart TD
     E[parser.Expr AST] --> R{ResolveExpr / ResolveForColumn}
-    R -->|integer literal| I[fitsInt4? -> NewInt4Const : NewInt8Const]
-    R -->|unary minus on literal| N[foldNegate -> negative Const]
-    R -->|string literal| S[coerce unknown -> targetType]
-    R -->|binary op| B[resolveBinaryOp -> buildOpExpr / OpExpr]
-    R -->|function call| F[resolveFuncCall -> FuncExpr via LookupProcForNode]
-    R -->|IS DISTINCT FROM| D[DistinctExpr via '=' op]
+    R -->|integer literal| I["fitsInt4? -> NewInt4Const : NewInt8Const"]
+    R -->|unary minus on literal| N["foldNegate -> negative Const"]
+    R -->|string literal| S["coerce unknown -> targetType"]
+    R -->|binary op| B["resolveBinaryOp -> buildOpExpr / OpExpr"]
+    R -->|function call| F["resolveFuncCall -> FuncExpr via LookupProcForNode"]
+    R -->|IS DISTINCT FROM| D["DistinctExpr via '=' op"]
     R -->|CASE| C[CaseExpr: searched or simple w/ CaseTestExpr]
-    R -->|outside subset| U[ErrUnsupported -> store SQL text instead]
+    R -->|outside subset| U["ErrUnsupported -> store SQL text instead"]
 ```
 
 `ResolveExpr` (resolver_expr.go:50) converts a column-DEFAULT (or

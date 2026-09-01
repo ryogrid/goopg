@@ -173,17 +173,17 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
     HC[HandleCommand] -->|query payload| CMD{leading token}
-    CMD -->|IDENTIFY_SYSTEM| IS[replyIdentifySystem:<br/>systemID, timeline, xlogpos, dbname]
-    CMD -->|CREATE_REPLICATION_SLOT| CRS[replyCreateReplicationSlot:<br/>parse slot name + options<br/>slot_type, output_plugin]
-    CRS --> PHYS{slot_type?}
-    PHYS --> PHYSICAL[create xlog.Slot, physical kind]
-    PHYS --> LOGICAL[create xlog.Slot, logical kind<br/>+ output_plugin validation]
+    CMD -->|IDENTIFY_SYSTEM| IS["replyIdentifySystem:<br/>systemID, timeline, xlogpos, dbname"]
+    CMD -->|CREATE_REPLICATION_SLOT| CRS["replyCreateReplicationSlot:<br/>parse slot name + options<br/>slot_type, output_plugin"]
+    CRS --> PHYS{"slot_type?"}
+    PHYS --> PHYSICAL["create xlog.Slot, physical kind"]
+    PHYS --> LOGICAL["create xlog.Slot, logical kind<br/>+ output_plugin validation"]
     CMD -->|DROP_REPLICATION_SLOT| DRS[replyDropReplicationSlot]
-    CMD -->|READ_REPLICATION_SLOT| RRS[replyReadReplicationSlot:<br/>slot_name, lsn, tli, active]
-    CMD -->|TIMELINE_HISTORY| TH[replyTimelineHistory:<br/>read file, ship as CopyData]
+    CMD -->|READ_REPLICATION_SLOT| RRS["replyReadReplicationSlot:<br/>slot_name, lsn, tli, active"]
+    CMD -->|TIMELINE_HISTORY| TH["replyTimelineHistory:<br/>read file, ship as CopyData"]
     CMD -->|BASE_BACKUP| BB[forward to backup.Handler]
-    CMD -->|START_REPLICATION| SR[replyStartReplication:<br/>parse args, branch on mode]
-    CMD -->|other| FALL[return false, nil → regular SQL handler]
+    CMD -->|START_REPLICATION| SR["replyStartReplication:<br/>parse args, branch on mode"]
+    CMD -->|other| FALL["return false, nil → regular SQL handler"]
 ```
 
 ### Physical streaming loop

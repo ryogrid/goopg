@@ -87,12 +87,12 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 
 ```mermaid
 flowchart TD
-    subgraph Init["Init (bootstrap)"]
+    subgraph "Init (bootstrap)"
         DIR[create subdirs]
         CFG[write config files]
-        SYS[bootstrapSystemCatalogs<br/>pg_type/pg_class/pg_attribute]
-        CATS[bootstrapPgClassTuples<br/>bootstrapPgAttributeTuples<br/>bootstrapPgNamespaceTuples<br/>bootstrapPgProcTuples<br/>bootstrapPgAmTuples<br/>... 30+ catalog passes]
-        BTREE[bootstrap btree indexes<br/>btree_index_bootstrap.go]
+        SYS["bootstrapSystemCatalogs<br/>pg_type/pg_class/pg_attribute"]
+        CATS["bootstrapPgClassTuples<br/>bootstrapPgAttributeTuples<br/>bootstrapPgNamespaceTuples<br/>bootstrapPgProcTuples<br/>bootstrapPgAmTuples<br/>... 30+ catalog passes"]
+        BTREE["bootstrap btree indexes<br/>btree_index_bootstrap.go"]
         REWRITE[bootstrap pg_rewrite + TOAST]
         CLOG[bootstrap SLRU placeholders]
         RELCACHE[bootstrapRelcacheInitFiles]
@@ -101,13 +101,13 @@ flowchart TD
         CTL[writePgControl]
         FSYNC[syncDataDir]
     end
-    subgraph Open["Open (startup)"]
+    subgraph "Open (startup)"
         VERIFY[verify directory]
         OPEN_SMGR[NewManager]
-        RECOVERY[beginRecovery<br/>find redo LSN]
+        RECOVERY["beginRecovery<br/>find redo LSN"]
         WAL_REPLAY[ReplayFromDirWithMgr]
         CLOG_REPLAY[CLOG replay + abort sweep]
-        RELOAD[catalog heap reloads<br/>~40 reload*FromHeap passes]
+        RELOAD["catalog heap reloads<br/>~40 reload*FromHeap passes"]
         RELCACHE_R[regen pg_internal.init]
         VIEWS[register runtime views]
         PROD[stampInProduction]

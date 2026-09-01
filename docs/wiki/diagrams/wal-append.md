@@ -44,7 +44,7 @@ classDiagram
     Record --> RecordKind : kind byte
     Record --> XLogPageHeader : page framing (8 KiB pages)
     Record "many" --> MemRing : appended
-    note right of Record: "xl_prev backpointer chain; validated by reader / pg_waldump"
+note for Record "xl_prev backpointer chain; validated by reader / pg_waldump"
 ```
 
 ## Ring Buffer Append
@@ -87,8 +87,8 @@ flowchart TD
     CP["Checkpointer goroutine"] --> Int["tick interval"]
     Int --> Flush["WriteDirtyPages / flush dirty buffers"]
     Flush --> Emit["append CHECKPOINT record<br/>embedding CheckPointFields"]
-Emit --> Fields["CheckPointFields:<br/>redo LSN, nextXID, nextOid, timeline']
+Emit --> Fields["CheckPointFields:<br/>redo LSN, nextXID, nextOid, timeline"]
     Fields --> LSN["LastCheckpointLSN advances recovery horizon"]
 
-    note right of Fields: records must be PG-canonical so a vanilla PG 18.3 standby<br/>can replay them (pg_assembled_emit.go)
+    %% note right of Fields: records must be PG-canonical so a vanilla PG 18.3 standby<br/>can replay them (pg_assembled_emit.go)
 ```

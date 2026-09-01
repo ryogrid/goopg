@@ -136,7 +136,7 @@ graph TD
     L --> M[Rewrite passes: NLI, reduce_outer_joins, qual push-down]
     M --> N[buildAggregateStage / buildWindowStage]
     N --> O[Sort / Distinct / Limit wrap]
-    O --> P[Plan() tail: EXISTS->ANY, lowerSubPlanParams, fillJoinHashKeys]
+    O --> P["Plan() tail: EXISTS to ANY, lowerSubPlanParams, fillJoinHashKeys"]
 ```
 
 1. GROUPING SETS/ROLLUP/CUBE: normalise GROUP BY to deduplicated union (`groupingsets.go`).

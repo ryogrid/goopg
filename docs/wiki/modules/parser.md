@@ -166,7 +166,7 @@ flowchart TD
     A[SQL text] --> B[lexer.go Lex]
     B --> C[Token stream via tokenSlicePool]
     C --> D{dispatch.go first-token routing}
-    D -->|yacc grammar| E[yacc_parser.go LALR(1) state machine]
+    D -->|yacc grammar| E["yacc_parser.go LALR(1) state machine"]
     D -->|hand-written DDL| F[ddl.go recursive descent]
     D -->|SELECT/DML| G[select.go / dml.go]
     D -->|PL/pgSQL body| H[pl/pgSQL parser]

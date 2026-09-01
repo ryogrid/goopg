@@ -42,17 +42,17 @@ func DecodeInlineCompressed(data []byte) ([]byte, int, error)      // parse + de
 flowchart TD
     subgraph Compress
         IN[raw bytes]
-        LOOP[for i < len(data)]
+        LOOP["for i < len(data)"]
         CTRL[emit control-byte placeholder]
         BIT[for 8 bits per control byte]
-        SEARCH[scan history window [i-maxOff, i-1]<br/>for longest match ≥ 3 bytes]
-        MATCH{bestLen ≥ minMatchLen?}
-        MATCH -- yes --> TAG[emit match tag: 2 bytes<br/>(len nibble + off high nibble + off low byte)<br/>+ optional extension byte]
+        SEARCH["scan history window i-maxOff..i-1<br/>for longest match ≥ 3 bytes"]
+        MATCH{"bestLen ≥ minMatchLen?"}
+        MATCH -- yes --> TAG["emit match tag: 2 bytes<br/>(len nibble + off high nibble + off low byte)<br/>+ optional extension byte"]
         MATCH -- no --> LIT[emit literal byte]
-        TAG --> ADV[i += bestLen]
+        TAG --> ADV["i += bestLen"]
         LIT --> ADV[i++]
         ADV --> BIT
-        BIT --> CTRL2[fill control byte<br/>(LSB-first match/literal bits)]
+        BIT --> CTRL2["fill control byte<br/>(LSB-first match/literal bits)"]
         CTRL2 --> LOOP
         LOOP --> OUT[token stream]
     end
@@ -62,14 +62,14 @@ flowchart TD
         RAW[rawSize known upfront]
         CTRL_READ[read control byte]
         BIT_READ[for 8 bits]
-        TST{ctrl bit == 1?}
-        TST -- match --> DECODE_TAG[read 2 bytes + optional ext byte<br/>length = nibble+3, off = hi<<4|lo]
+        TST{"ctrl bit == 1?"}
+        TST -- match --> DECODE_TAG["read 2 bytes + optional ext byte<br/>length = nibble+3, off = hi<<4|lo"]
         TST -- literal --> DECODE_LIT[copy one byte verbatim]
-        DECODE_TAG --> COPY[byte-by-byte copy<br/>start = len(dst)-off<br/>for k in 0..length:<br/>dst = append(dst, dst[start+k])]
+        DECODE_TAG --> COPY["byte-by-byte copy<br/>start = len(dst)-off<br/>for k in 0..length:<br/>dst = append(dst, dst[start+k])"]
         DECODE_LIT --> COPY
         COPY --> BIT_READ
         BIT_READ --> CTRL_READ
-        CTRL_READ --> DST_CHECK{len(dst) == rawSize?}
+        CTRL_READ --> DST_CHECK{"len(dst) == rawSize?"}
         DST_CHECK -- yes --> DST[dst bytes]
     end
 ```

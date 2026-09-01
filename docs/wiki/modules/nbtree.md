@@ -207,7 +207,7 @@ flowchart LR
     HDR --> LPO
     LPO --> ITEMS
     ITEMS --> SPEC
-    subgraph Flags (legacy BTPageOpaque)
+    subgraph "Flags (legacy BTPageOpaque)"
         F1[BTP_LEAF 0x01]
         F2[BTP_ROOT 0x02]
         F3[BTP_META 0x04]
@@ -262,11 +262,11 @@ snapshot might still see.
 
 ```mermaid
 flowchart TD
-    I[Insert key, TID] --> D[descendToLeaf]
-    D --> C{page has room?}
+    I["Insert key, TID"] --> D[descendToLeaf]
+    D --> C{"page has room?"}
     C -- yes --> NS[tryInsertNoSplit]
     C -- no --> DEDUP[dedupConsolidate]
-    DEDUP --> C2{room now?}
+    DEDUP --> C2{"room now?"}
     C2 -- yes --> NS
     C2 -- no --> SPLIT[finishSplit]
     SPLIT --> L[write left page]
@@ -276,7 +276,7 @@ flowchart TD
     PR --> RN[createNewRoot if at root]
     NS --> W[WAL log]
     RN --> W
-    D --> FAST{fast-path rightmost?}
+    D --> FAST{"fast-path rightmost?"}
     FAST -- yes --> NS
     FAST -- no --> C
 ```

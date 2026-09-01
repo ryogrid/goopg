@@ -53,7 +53,7 @@ classDiagram
 flowchart TD
     CAT["catalog.InMemory"]
 
-CAT --> Virtual["Virtual: true<br/>registerSystemTables']
+CAT --> Virtual["Virtual: true<br/>registerSystemTables"]
     Virtual --> PGC["pg_class (1259)<br/>PGClassRowsForDBOid<br/>34-col PG18-canonical tupdesc"]
     Virtual --> PGD["pg_database, pg_namespace,<br/>pg_constraint, pg_depend,<br/>pg_stat_*, information_schema.*"]
     Virtual --> PGN["…all Go builders,<br/>no backing relfile"]
@@ -64,9 +64,9 @@ CAT --> Virtual["Virtual: true<br/>registerSystemTables']
 
     CAT --> Dual["pg_class also gets real heap image"]
     Dual --> Sync["syncTableToCatalogHeap<br/>writes 34-col pg_class + 25-col pg_attribute<br/>+ btree indexes + pg_attrdef + pg_inherits"]
-Sync --> Reload["startup: loadUserTablesFromHeap<br/>→ reload*FromHeap passes<br/>→ rebuild InMemory from disk']
+Sync --> Reload["startup: loadUserTablesFromHeap<br/>→ reload*FromHeap passes<br/>→ rebuild InMemory from disk"]
 
-    note right of Dual: pg_class virtual rows serve live queries;<br/>heap image serves PG-standby / pg_dump parity
+    %% note right of Dual: pg_class virtual rows serve live queries;<br/>heap image serves PG-standby / pg_dump parity
 ```
 
 ## DDL Sync to Catalog Heaps

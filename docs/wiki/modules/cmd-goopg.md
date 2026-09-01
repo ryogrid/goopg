@@ -133,22 +133,22 @@ flowchart TD
     A[runStart] --> B[Env tuning]
     B --> B1[GOOPG_MUTEX_PROFILE_RATE / GOOPG_BLOCK_PROFILE_RATE]
     B --> B2[GOOPG_DISABLE_NLI → optimizer.SetNLIEnabled false]
-    B --> B3[GOGC=200 default; GOMEMLIMIT passthrough]
+    B --> B3["GOGC=200 default; GOMEMLIMIT passthrough"]
     B --> C[pprof on 127.0.0.1:6060 / GOOPG_PPROF_ADDR]
     C --> D[signal.NotifyContext SIGINT/SIGTERM]
     D --> E[BuildDefaultRegistry]
     E --> F[OnChange bridges: enable_nestloop_index / enable_memoize / enable_presorted_aggregate / enable_hashagg]
-    F --> G{confPath != ""}
+    F --> G{"confPath != """}
     G -- yes --> H[ParseConfigFile + ApplyConfigEntries]
     G -- no --> I
-    H --> I{dataDir != ""}
+    H --> I{"dataDir != """}
     I -- yes --> J[initdb.Open with OpenOptions from ~20 GUCs]
     I -- no --> K[protocol-only mode]
     J --> L[deferred SaveCatalog/SaveVM/SaveFSM/Close]
     L --> M[MultiXact store seeded from rt.NextMultiXact]
     M --> N[Auth store from catalog + pg_auth overlay]
     N --> O[Checkpointer goroutine on child ctx]
-    O --> P{recovery/standby?}
+    O --> P{"recovery/standby?"}
     P -- yes --> Q[archive recovery or startStandby]
     P -- no --> R
     Q --> R[postmaster.New + srv.Run]

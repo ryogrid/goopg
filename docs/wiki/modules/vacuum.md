@@ -86,26 +86,26 @@ All four funnel into `vacuumCore(pool, mgr, rel, opts)`.
 ```mermaid
 flowchart TD
     subgraph vacuumCore
-        H[Resolve horizon<br/>opts.Horizon ?? mgr.OldestXmin]
-        FA{Failsafe?<br/>nextXID-horizon >= FailsafeAge}
-        FA -- yes --> AG[Aggressive=true,<br/>CostDelay=0]
+        H["Resolve horizon<br/>opts.Horizon ?? mgr.OldestXmin"]
+        FA{"Failsafe?<br/>nextXID-horizon >= FailsafeAge"}
+        FA -- yes --> AG["Aggressive=true,<br/>CostDelay=0"]
         LOOP[for blk 0..nBlocks]
-        VM{VM skip?<br/>!aggressive && AllVisible<br/>&& !isLastBlock}
-        VM -- skip --> LNE[lastNonEmpty = blk<br/>+ SkippedAll{Frozen,Visible}++]
+        VM{"VM skip?<br/>!aggressive && AllVisible<br/>&& !isLastBlock"}
+        VM -- skip --> LNE["lastNonEmpty = blk<br/>+ SkippedAll(Frozen,Visible)++"]
         VM -- scan --> PIN[Pin + Lock slot]
-        PIN --> PRUNE[PageVacuumPrune<br/>HOT/multixact-aware]
-        PRUNE --> DIRTY{reclaimed > 0?}
-        DIRTY -- yes --> LOG[logPrune hook or MarkDirty]<br/>+ DeadTIDs collect<br/>+ lastNonEmpty = blk
-        PRUNE --> FREEZE{FreezeBelow > 0?}
-        FREEZE -- yes --> FRZ[PageFreezeOldTuples<br/>+ logFreeze hook<br/>+ NewFrozenXID tracking]
+        PIN --> PRUNE["PageVacuumPrune<br/>HOT/multixact-aware"]
+        PRUNE --> DIRTY{"reclaimed > 0?"}
+        DIRTY -- yes --> LOG["logPrune hook or MarkDirty<br/>+ DeadTIDs collect<br/>+ lastNonEmpty = blk"]
+        PRUNE --> FREEZE{"FreezeBelow > 0?"}
+        FREEZE -- yes --> FRZ["PageFreezeOldTuples<br/>+ logFreeze hook<br/>+ NewFrozenXID tracking"]
         FREEZE --> FSM[FSM.RecordFreeSpaceForPage]
-        FSM --> VMU[VM: SetAllFrozen /<br/>SetAllVisible / ClearBlock]
+        FSM --> VMU["VM: SetAllFrozen /<br/>SetAllVisible / ClearBlock"]
         VMU --> COST[Cost-based throttle]
-        COST --> UNPIN[Unlock + Unpin<br/>Pages++]
+        COST --> UNPIN["Unlock + Unpin<br/>Pages++"]
         LNE --> LOOP
         UNPIN --> LOOP
-        LOOP --> TRUNC{Truncate?}
-        TRUNC -- yes --> TT[pool.TruncateRelationTail<br/>keep = lastNonEmpty+1]
+        LOOP --> TRUNC{"Truncate?"}
+        TRUNC -- yes --> TT["pool.TruncateRelationTail<br/>keep = lastNonEmpty+1"]
     end
 ```
 
@@ -128,32 +128,32 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    VMIN{opts.VM != nil?}
+    VMIN{"opts.VM != nil?"}
     VMIN -- no --> VMSKIP[skip VM update]
-    VMIN -- yes --> FRZCHK{FreezeBelow > 0<br/>&& PageAllFrozen(page, cutoff)?}
-    FRZCHK -- yes --> SETFRZ[VM.SetAllFrozen(rel, blk)]
-    FRZCHK -- no --> VISCHK{PageAllVisible(page, horizon)?}
-    VISCHK -- yes --> SETVIS[VM.SetAllVisible(rel, blk)]
-    VISCHK -- no --> CLR[VM.ClearBlock(rel, blk)]
+    VMIN -- yes --> FRZCHK{"FreezeBelow > 0<br/>&& PageAllFrozen(page, cutoff)?"}
+    FRZCHK -- yes --> SETFRZ["VM.SetAllFrozen(rel, blk)"]
+    FRZCHK -- no --> VISCHK{"PageAllVisible(page, horizon)?"}
+    VISCHK -- yes --> SETVIS["VM.SetAllVisible(rel, blk)"]
+    VISCHK -- no --> CLR["VM.ClearBlock(rel, blk)"]
 ```
 
 ### Cost pacing flow
 
 ```mermaid
 flowchart TD
-    CP{opts.CostDelayMS > 0?}
+    CP{"opts.CostDelayMS > 0?"}
     CP -- no --> SKIPC[no pacing — PG manual VACUUM default]
-    CP -- yes --> SEEN{blk in costSeen?}
-    SEEN -- first touch --> C1[c = CostPageMiss]
-    SEEN -- later touch --> C2[c = CostPageHit]
-    C1 --> DIRTY2{pageDirty?}
+    CP -- yes --> SEEN{"blk in costSeen?"}
+    SEEN -- first touch --> C1["c = CostPageMiss"]
+    SEEN -- later touch --> C2["c = CostPageHit"]
+    C1 --> DIRTY2{"pageDirty?"}
     C2 --> DIRTY2
-    DIRTY2 -- yes --> C3[c += CostPageDirty]
-    C3 --> BAL[costBalance += c]
+    DIRTY2 -- yes --> C3["c += CostPageDirty"]
+    C3 --> BAL["costBalance += c"]
     DIRTY2 -- no --> BAL
-    BAL --> OVER{costBalance >= CostLimit?}
-    OVER -- yes --> SLEEP[sleep = CostDelayMS * costBalance / CostLimit<br/>capped at 4 × CostDelayMS]
-    SLEEP --> RESET[costBalance = 0]
+    BAL --> OVER{"costBalance >= CostLimit?"}
+    OVER -- yes --> SLEEP["sleep = CostDelayMS * costBalance / CostLimit<br/>capped at 4 × CostDelayMS"]
+    SLEEP --> RESET["costBalance = 0"]
     OVER -- no --> SKIP2[no sleep]
 ```
 
@@ -345,9 +345,9 @@ costBalance = 0
 flowchart TD
     subgraph VM bit transitions
         INIT[page state after prune/freeze]
-        INIT --> FROZEN{PageAllFrozen?}
+        INIT --> FROZEN{"PageAllFrozen?"}
         FROZEN -- yes --> SETF[VM.SetAllFrozen]
-        FROZEN -- no --> VIS{PageAllVisible?}
+        FROZEN -- no --> VIS{"PageAllVisible?"}
         VIS -- yes --> SETV[VM.SetAllVisible]
         VIS -- no --> CLR[VM.ClearBlock]
         SETF --> NEXT[advance to next block]

@@ -143,27 +143,27 @@ func fingerprintLeafEntry(e nbtree.LeafEntry) []byte  // big-endian TID + key by
 ```mermaid
 flowchart TD
     subgraph B-tree Tiers
-        VBP[VerifyBtreePage<br/>Meta/leaf/internal page structure]
-        VIO[VerifyBtreeItemOrder<br/>High-key & item-order invariants]
-        VLS[VerifyBtreeLevelSiblingLinks<br/>Prev/next agreement, level uniformity]
-        VPD[VerifyBtreeParentDownlinks<br/>Downlink level, lower-bound invariant]
-        VUQ[VerifyBtreeUnique<br/>Cross-leaf duplicate key detection]
+        VBP["VerifyBtreePage<br/>Meta/leaf/internal page structure"]
+        VIO["VerifyBtreeItemOrder<br/>High-key & item-order invariants"]
+        VLS["VerifyBtreeLevelSiblingLinks<br/>Prev/next agreement, level uniformity"]
+        VPD["VerifyBtreeParentDownlinks<br/>Downlink level, lower-bound invariant"]
+        VUQ["VerifyBtreeUnique<br/>Cross-leaf duplicate key detection"]
         VBP --> VIO --> VLS --> VPD --> VUQ
     end
 
     subgraph Heap Tiers
-        VHP[VerifyHeapPage<br/>LP bounds, redirect, tuple header]
-        VHR[VerifyHeapPageWithRel<br/>+ natts-vs-table]
-        VHX[VerifyHeapPageWithXminStatus<br/>+ clog-dependent chain audit]
-        VHRN[VerifyHeapRelation<br/>Relation-level block loop]
+        VHP["VerifyHeapPage<br/>LP bounds, redirect, tuple header"]
+        VHR["VerifyHeapPageWithRel<br/>+ natts-vs-table"]
+        VHX["VerifyHeapPageWithXminStatus<br/>+ clog-dependent chain audit"]
+        VHRN["VerifyHeapRelation<br/>Relation-level block loop"]
         VHP --> VHR --> VHX --> VHRN
     end
 
     subgraph All-Indexed
-        BLF[Bloom filter<br/>bloomCreate/bloomAddElement]
-        CLF[CollectBtreeLeafEntries<br/>Index leaf walk]
-        CHS[CollectHeapIndexEntries<br/>Heap LP_NORMAL walk]
-        HAC[VerifyBtreeHeapAllIndexed<br/>Fingerprint + probe]
+        BLF["Bloom filter<br/>bloomCreate/bloomAddElement"]
+        CLF["CollectBtreeLeafEntries<br/>Index leaf walk"]
+        CHS["CollectHeapIndexEntries<br/>Heap LP_NORMAL walk"]
+        HAC["VerifyBtreeHeapAllIndexed<br/>Fingerprint + probe"]
         BLF --> HAC
         CLF --> HAC
         CHS --> HAC
@@ -218,17 +218,17 @@ C->>V: VerifyBtreeUnique(src, 'idx', keyFmt, cmpKeys, visible)
 ```mermaid
 flowchart TD
     VHP[VerifyHeapPage / WithRel / WithXminStatus] --> LP[for offnum 1..maxoff]
-    LP --> RED{is redirect?}
-    RED -- yes --> REDV[validate redirect target<br/>not unused/dead/redirect]
-    RED -- no --> UNUSED{is unused?}
+    LP --> RED{"is redirect?"}
+    RED -- yes --> REDV["validate redirect target<br/>not unused/dead/redirect"]
+    RED -- no --> UNUSED{"is unused?"}
     UNUSED -- yes --> SKIP[skip]
-    UNUSED -- no --> ALIGN{8-byte aligned<br/>len >= 24?}
+    UNUSED -- no --> ALIGN{"8-byte aligned<br/>len >= 24?"}
     ALIGN -- no --> REP1[Report: misaligned / short tuple]
-    ALIGN -- yes --> HDR[checkTupleHeader:<br/>t_hoff, multixact-committed,<br/>HOT-updated-xmax0]
-    HDR --> XMIN[resolveXminStatus +<br/>checkXminBounds]
+    ALIGN -- yes --> HDR["checkTupleHeader:<br/>t_hoff, multixact-committed,<br/>HOT-updated-xmax0"]
+    HDR --> XMIN["resolveXminStatus +<br/>checkXminBounds"]
     XMIN --> XMAX[checkXmaxBounds]
-    XMAX --> NATTS[if WithRel: natts <= RelDesc.Natts]
-    NATTS --> CHAIN[checkUpdateChains:<br/>redirect→heap-only,<br/>3 clog-dependent transitions]
+    XMAX --> NATTS["if WithRel: natts <= RelDesc.Natts"]
+    NATTS --> CHAIN["checkUpdateChains:<br/>redirect→heap-only,<br/>3 clog-dependent transitions"]
 ```
 
 ### All-indexed
@@ -241,12 +241,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    IDX[Index leaf entries] --> FP[fingerprintLeafEntry<br/>big-endian TID + key]
+    IDX[Index leaf entries] --> FP["fingerprintLeafEntry<br/>big-endian TID + key"]
     FP --> ADD[bloomAddElement ×N]
-    ADD --> BLF[bloomFilter<br/>m bits, k hash funcs]
+    ADD --> BLF["bloomFilter<br/>m bits, k hash funcs"]
     HEAP[Heap-formed entries] --> FP2[fingerprintLeafEntry]
-    FP2 --> PROBE{bloomLacksElement?}
-    PROBE -- absent --> MISS[Report: heap tuple lacks<br/>matching index tuple]
+    FP2 --> PROBE{"bloomLacksElement?"}
+    PROBE -- absent --> MISS["Report: heap tuple lacks<br/>matching index tuple"]
     PROBE -- present --> OK[live tuple has index entry — pass]
 ```
 
@@ -400,22 +400,22 @@ flowchart TD
     KIND -- LP_UNUSED --> SKIP[skip]
     KIND -- LP_DEAD --> SKIP
     KIND -- LP_REDIRECT --> REDIR[check: target not unused/dead/redirect]
-    KIND -- LP_NORMAL --> ALIGN{8-byte aligned?}
+    KIND -- LP_NORMAL --> ALIGN{"8-byte aligned?"}
     ALIGN -- no --> REP1[report: misaligned line pointer]
-    ALIGN -- yes --> TUPLE{len >= 24?}
+    ALIGN -- yes --> TUPLE{"len >= 24?"}
     TUPLE -- no --> REP2[report: short tuple]
     TUPLE -- yes --> HDR[checkTupleHeader]
-    HDR --> XMIN[resolveXminStatus<br/>headerXmin → xid]
+    HDR --> XMIN["resolveXminStatus<br/>headerXmin → xid"]
     XMIN --> XB{checkXminBounds}
     XB --> XMAX{checkXmaxBounds}
-    XMAX --> NATTS{natts <= RelDesc.Natts?}
+    XMAX --> NATTS{"natts <= RelDesc.Natts?"}
     NATTS -- no --> REP3[report: too many attributes]
     NATTS -- yes --> CTID[record CTID for chain pass]
     CTID --> ENDLP[advance]
     REDIR --> ENDLP
     SKIP --> ENDLP
     ENDLP --> WHILE
-    WHILE --> CHAIN[checkUpdateChains<br/>redirect→heap-only,<br/>flag agreement,<br/>3 clog-dependent transitions]
+    WHILE --> CHAIN["checkUpdateChains<br/>redirect→heap-only,<br/>flag agreement,<br/>3 clog-dependent transitions"]
 ```
 
 ## Report types by tier

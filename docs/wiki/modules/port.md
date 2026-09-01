@@ -104,19 +104,19 @@ flowchart TD
             PU[UnpinP → runtime.procUnpin]
         end
         subgraph "fallback build (inverse tag / noLinkname)"
-            NFL[Nanotime → time.Now().UnixNano]
+            NFL["Nanotime → time.Now().UnixNano"]
             SFL[Sema via global mutex + sync.Cond map]
-            PFL[PinP/UnpinP via global mutex, P index 0]
+            PFL["PinP/UnpinP via global mutex, P index 0"]
         end
     end
 
     subgraph gls
         SET[SetBackendID → pprof.SetGoroutineLabels]
-        PROBE[glsUsable = probeLayout<br/>recovered round-trip on throwaway goroutine]
-        READ[BackendID → linkname runtime_getProfLabel<br/>+ labelMapMirror scan]
+        PROBE["glsUsable = probeLayout<br/>recovered round-trip on throwaway goroutine"]
+        READ["BackendID → linkname runtime_getProfLabel<br/>+ labelMapMirror scan"]
         SET --> PROBE
         PROBE -->|usable| READ
-        PROBE -->|mismatch| FB2[(0,false) → stripe 0]
+        PROBE -->|mismatch| FB2["(0,false) → stripe 0"]
     end
 ```
 

@@ -29,7 +29,7 @@ flowchart LR
         ROUT[Routines]
     end
     subgraph Storage
-        HEAP[(heap files)]
+        HEAP["(heap files)"]
     end
     EXEC --> IM --> VIRT
     EXEC --> CODEC --> HEAP
@@ -257,7 +257,7 @@ The split is deliberate and asymmetric:
 
 ```mermaid
 flowchart TD
-    subgraph Virtual["Virtual (Go builders)"]
+    subgraph "Virtual (Go builders)"
         pg_class[pg_class 1259]
         pg_constraint[pg_constraint]
         pg_depend[pg_depend]

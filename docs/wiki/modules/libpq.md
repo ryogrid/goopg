@@ -144,9 +144,9 @@ flowchart TD
     subgraph Server
         FR[FrameReader]
         FR --> RSP[ReadStartupPacket → version + payload]
-        FR --> RF[ReadFrame → Frame{Type, Payload}]
+        FR --> RF["ReadFrame → Frame(Type, Payload)"]
         FW[FrameWriter]
-        FW --> WF[WriteFrame(type, payload)]
+        FW --> WF["WriteFrame(type, payload)"]
         FW --> DRS[DataRowScratch → pre-sized cells + valueBuf]
         FW --> F[Flush]
     end

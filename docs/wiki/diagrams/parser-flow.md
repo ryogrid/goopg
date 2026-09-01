@@ -8,11 +8,11 @@ parsing.
 ```mermaid
 flowchart TD
     SQL["SQL text"] --> Lex["lexer.Lex(input)<br/>hand-written tokenizer"]
-    Lex --> Toks["[]Token<br/>keyword/ident/number/string/operator"]
+    Lex --> Toks["lexer token stream<br/>keyword/ident/number/string/operator"]
     Toks --> Route["dispatch.routeBatch / parseStatement"]
     Route --> YACC{"statement class?"}
     YACC -->|"bulk SQL"| Y1["yacc_parser.go (LALR(1) grammar)<br/>compiled from grammar/*.y"]
-Y1 --> Y2["yacc_ctors.go: AST constructors<br/>$<p>N position tracking']
+Y1 --> Y2["yacc_ctors.go: AST constructors<br/>$<p>N position tracking"]
     YACC -->|"DDL (CREATE/ALTER/DROP/GRANT…)"| H1["hand-written ddl.go<br/>recursive descent"]
     YACC -->|"SELECT/INSERT/UPDATE/DELETE"| H2["select.go / dml.go<br/>statement tree builder"]
     YACC -->|"expressions"| H3["expr.go / function.go<br/>operators, casts, subqueries"]
@@ -21,7 +21,7 @@ Y1 --> Y2["yacc_ctors.go: AST constructors<br/>$<p>N position tracking']
     H2 --> AST
     H3 --> AST
 
-    note right of Route: ~1.7% of statement classes stay on<br/>hand-written scanners (parser gap)
+    %% note right of Route: ~1.7% of statement classes stay on<br/>hand-written scanners (parser gap)
 ```
 
 ## AST → Analyzer Pipeline
@@ -51,10 +51,10 @@ sequenceDiagram
 flowchart TD
     Body["CREATE FUNCTION … LANGUAGE plpgsql<br/>body text"] --> Parse["pl/plpgsql.Parse(src)<br/>hand-written bodyParser"]
     Parse --> Block["*Block AST (ast.go)"]
-    Block --> Stmts["parseStmtList → []Stmt<br/>parseLoop / parseWhile / parseFor"]
+    Block --> Stmts["parseStmtList (sequence of Stmt)<br/>parseLoop / parseWhile / parseFor"]
     Stmts --> Exceptions["parseExceptionBlock<br/>EXCEPTION WHEN …"]
-Block --> Exec["executor: executePLpgSQLStmt<br/>interpreted execution']
-Exec --> SQL["embedded SQL:<br/>recursive parser.Parse + executor']
+Block --> Exec["executor: executePLpgSQLStmt<br/>interpreted execution"]
+Exec --> SQL["embedded SQL:<br/>recursive parser.Parse + executor"]
 
-    note right of Exec: plpgsql is interpreted over internal/pl/plpgsql ASTs;<br/>language dispatch: dispatchStoredRoutineByLanguage
+    %% note right of Exec: plpgsql is interpreted over internal/pl/plpgsql ASTs;<br/>language dispatch: dispatchStoredRoutineByLanguage
 ```

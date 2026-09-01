@@ -46,7 +46,7 @@ Client([Client: psql / pgbench / standby]) -->|'v3 wire protocol'| SRV[postmaste
     PLAN --> EXEC[executor: BuildFastIterator]
     EXEC --> POOL[storage: Pool]
     POOL --> SMGR[storage: Manager]
-    SMGR --> DISK[(data directory)]
+    SMGR --> DISK["(data directory)"]
 
     EXEC -->|WAL emit| WAL[xlog: Writer]
     WAL --> CKPT[checkpointer]

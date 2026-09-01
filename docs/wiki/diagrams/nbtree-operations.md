@@ -6,7 +6,7 @@ B-tree search descent, page split, dedup consolidation, and WAL redo.
 
 ```mermaid
 flowchart TD
-S["BTree.Search(key)"] --> M["pinR: read metapage (block 0)']
+S["BTree.Search(key)"] --> M["pinR: read metapage (block 0)"]
     M --> Root["BtMetaPageData.root<br/>→ root block number"]
     Root --> Desc["descendToLeaf(key)"]
     Desc --> Loop["read page, locate BTPageOpaque"]
@@ -40,7 +40,7 @@ flowchart TD
     Rec --> NewRoot["createNewRoot if root split"]
     NewRoot --> Done
 
-    note right of Done: WAL-logged at each mutation step
+    %% note right of Done: WAL-logged at each mutation step
 ```
 
 ## Dedup Consolidation + WAL Redo
@@ -50,11 +50,11 @@ flowchart TD
     subgraph Dedup Consolidation
         D1["dedupConsolidate(items)"] --> D2["group same-key adjacent items"]
         D2 --> D3["collapse into posting-list entries<br/>PGBTPostingRaw"]
-D3 --> D4["refillDeduplicated: rebuild page']
+D3 --> D4["refillDeduplicated: rebuild page"]
         D4 --> D5["return compacted items"]
     end
 
-    subgraph WAL Redo (replay.go)
+    subgraph "WAL Redo (replay.go)"
         R1["ApplyRecord → btree kind"] --> R2{"opcode?"}
         R2 -->|BTREE_INSERT| R3["ApplyInsertRecordAt<br/>page + raw key + offnum"]
         R2 -->|BTREE_SPLIT| R4["ReplaySplitUpper / ReplaySplitLeft<br/>create new halves + pivot"]
@@ -64,5 +64,5 @@ D3 --> D4["refillDeduplicated: rebuild page']
         R2 -->|BTREE_VACUUM| R8["ReplayVacuumPage"]
     end
 
-    note right of D5: Opportunistic; runs before split<br/>so same-key items share a page
+    %% note right of D5: Opportunistic; runs before split<br/>so same-key items share a page
 ```

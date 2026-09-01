@@ -18,7 +18,7 @@ stateDiagram-v2
     runPostStartupLoop --> MsgParse: extended protocol
     runPostStartupLoop --> MsgTerminate: client disconnect
     MsgTerminate --> [*]: cleanup + slot release
-    note right of runPostStartupLoop: one goroutine per conn; owns WAL, txn, buffers
+    %% note right of runPostStartupLoop: one goroutine per conn; owns WAL, txn, buffers
 ```
 
 ## Simple-Query Protocol
