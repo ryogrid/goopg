@@ -237,24 +237,42 @@ func (o *callOp) Open(ctx *Context) error {
 			providedSet[i] = true
 		}
 	} else {
-		// Positional args: map caller args to IN/INOUT positions in order.
-		inIdx := 0
-		for i := 0; i < len(r.ArgTypes) && inIdx < len(args); i++ {
-			mode := "i"
-			if i < len(r.ArgModes) && r.ArgModes[i] != "" {
-				mode = r.ArgModes[i]
-			}
+		// Positional args with the OUT placeholders left out. PG does not
+		// accept this form for a CALL (every parameter position, OUT included,
+		// has to be written out), but goopg has always taken it, so the args
+		// are SCATTERED onto the non-OUT positions here instead of being left
+		// packed at 0..n-1. Everything downstream — the default filling, the
+		// variadic bundling and the parameter binding in Next() — then reads
+		// `args` as position-aligned, which is the one representation that is
+		// right for all four call forms (review/260831-2 EO1-1).
+		hasOut := false
+		for _, mode := range r.ArgModes {
 			if mode == "o" {
-				continue // skip OUT params in positional mapping
+				hasOut = true
+				break
 			}
-			providedSet[i] = true
-			// Reorder needed: build mapping
-			inIdx++
 		}
-		// If not callerProvidedAll and no named args, positional mapping is 0..len(args)-1
-		// unless we have OUT params mixed in.
-		if !callerProvidedAll {
-			providedSet = make(map[int]bool, len(args))
+		providedSet = make(map[int]bool, len(args))
+		if hasOut && len(args) <= len(r.ArgTypes) {
+			scattered := make([]Datum, len(r.ArgTypes))
+			for i := range scattered {
+				scattered[i] = NullDatum
+			}
+			ai := 0
+			for i := 0; i < len(r.ArgTypes) && ai < len(args); i++ {
+				mode := "i"
+				if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+					mode = r.ArgModes[i]
+				}
+				if mode == "o" {
+					continue
+				}
+				scattered[i] = args[ai]
+				providedSet[i] = true
+				ai++
+			}
+			args = scattered
+		} else {
 			for i := 0; i < len(args); i++ {
 				providedSet[i] = true
 			}
@@ -433,7 +451,12 @@ func (o *callOp) Next() (TupleSlot, error) {
 	child.Params = make([]Datum, len(r.ArgTypes))
 	frame := newPLpgSQLFrame()
 
-	argIdx := 0
+	// o.args is POSITION-aligned (resolve() scatters, reorders and pads it to
+	// one datum per declared parameter), so a parameter reads its own slot.
+	// Walking it with a separate cursor that skipped OUT positions shifted
+	// every IN/INOUT parameter that follows an OUT one: `CALL p(1, NULL, 2)`
+	// on `p(a int, OUT b int, c int)` bound c to the OUT placeholder NULL
+	// instead of 2 (review/260831-2 EO1-1).
 	for i := 0; i < len(r.ArgTypes); i++ {
 		declared := normalizeCatalogType(r.ArgTypes[i])
 		mode := "i"
@@ -450,11 +473,11 @@ func (o *callOp) Next() (TupleSlot, error) {
 			}
 		case "b":
 			// INOUT param: caller provides a value.
-			if argIdx >= len(o.args) {
+			if i >= len(o.args) {
 				return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(),
 					Message: "not enough arguments for procedure"}
 			}
-			coerced, err := coerceDatumToType(o.args[argIdx], declared, o.plan.Stmt.Pos(), fmt.Sprintf("argument %d", argIdx+1))
+			coerced, err := coerceDatumToType(o.args[i], declared, o.plan.Stmt.Pos(), fmt.Sprintf("argument %d", i+1))
 			if err != nil {
 				return nil, err
 			}
@@ -464,14 +487,13 @@ func (o *callOp) Next() (TupleSlot, error) {
 					return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(), Message: err.Error()}
 				}
 			}
-			argIdx++
 		default:
 			// IN param: caller provides a value.
-			if argIdx >= len(o.args) {
+			if i >= len(o.args) {
 				return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(),
 					Message: "not enough arguments for procedure"}
 			}
-			coerced, err := coerceDatumToType(o.args[argIdx], declared, o.plan.Stmt.Pos(), fmt.Sprintf("argument %d", argIdx+1))
+			coerced, err := coerceDatumToType(o.args[i], declared, o.plan.Stmt.Pos(), fmt.Sprintf("argument %d", i+1))
 			if err != nil {
 				return nil, err
 			}
@@ -481,7 +503,6 @@ func (o *callOp) Next() (TupleSlot, error) {
 					return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(), Message: err.Error()}
 				}
 			}
-			argIdx++
 		}
 	}
 

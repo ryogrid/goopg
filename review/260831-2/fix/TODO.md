@@ -43,8 +43,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 |---|---|---|---|---|---|
 | EC-1 | med | `executor/codec.go:parseIntegerInput` — base-0 ParseInt treats leading `0` as octal | BUG | [x] | ed634f2c9 |
 | EC-2 | med | `executor/btree_array_key.go:encodeArrayBTreeKey` — quoted `"NULL"` element encoded as SQL NULL | BUG | [x] | 9000565e7 |
-| EC-4 | med | `executor/copy.go:PushBinaryData` — binary COPY FROM skips defaults / NOT NULL / CHECK | BUG | [x] | this commit |
-| EO1-1 | med | `executor/operators_call.go:callOp.Next` — IN/INOUT arg after an OUT param reads the wrong slot | ? | [ ] | |
+| EC-4 | med | `executor/copy.go:PushBinaryData` — binary COPY FROM skips defaults / NOT NULL / CHECK | BUG | [x] | 7f9f16784 |
+| EO1-1 | med | `executor/operators_call.go:callOp.Next` — IN/INOUT arg after an OUT param reads the wrong slot | BUG | [x] | this commit |
 | EO1-3 | med | `executor/operators.go:limitOp.Next` — `LIMIT 0 ... WITH TIES` panics on nil tieKeyVals | ? | [ ] | |
 | EO2-2 | med | `executor/operators_sequence.go:seqState.nextVal` — int64 overflow wraps instead of raising 2200H | ? | [ ] | |
 | EO2-3 | med | `executor/operators_project_set.go:openSelectSrfMode` — generate_series int64 overflow spins forever | ? | [ ] | |
@@ -290,3 +290,15 @@ landed.
   again. Guard: `internal/executor/copy_binary_constraints_test.go`
   (NOT NULL, CHECK and DEFAULT cases). Gates: units green; TPC-DS SF0.5
   sweep PASS=95 MISMATCH=0; TPC-H spotcheck Q12/Q13 PASS.
+
+- 2026-09-01 **EO1-1 = BUG (fixed).** `callOp` bound the CALL argument list
+  with a moving `argIdx` cursor that advanced once per NON-OUT parameter,
+  while the values themselves had already been scattered onto the routine's
+  full parameter list. For a procedure whose OUT parameter is not last —
+  `p(IN a, OUT b, IN c)` — the cursor read slot 1 for the third parameter,
+  so `c` silently received `b`'s (unset) value and every error message
+  named the wrong argument position. Fix: bind positionally from the
+  scattered list (`o.args[i]`, `argument %d, i+1`) and scatter a short
+  positional list onto the non-OUT positions before that. Guard:
+  `internal/executor/call_out_param_slot_test.go`. Gates: units green;
+  TPC-DS SF0.5 sweep PASS=95 MISMATCH=0; TPC-H spotcheck Q12/Q13 PASS.
