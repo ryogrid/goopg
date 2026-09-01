@@ -549,6 +549,24 @@ type CastExpr struct {
 func (e *CastExpr) Pos() int { return e.pos }
 func (*CastExpr) exprNode()  {}
 
+// NewCastExprFromParser builds the resolved CastExpr for a parser-level cast
+// whose operand has already been lowered by a caller OUTSIDE this package —
+// today PL/pgSQL expression lowering in executor/plpgsql_runtime.go, which
+// cannot reach exprType/encodeTypmod. review/260831-2 ES-7: that lowerer used
+// to return the bare operand for `*parser.CastExpr`, silently DROPPING every
+// cast written inside a PL/pgSQL expression (`i::text`, `n::numeric`), so the
+// expression evaluated at the operand's own type.
+func NewCastExprFromParser(x *parser.CastExpr, operand Expr) *CastExpr {
+	typeName := strings.ToLower(x.Type.Name)
+	return &CastExpr{
+		pos:        x.Pos(),
+		Operand:    operand,
+		TargetType: typeName,
+		SourceType: exprType(operand).Name,
+		Typmod:     encodeTypmod(typeName, x.Typmods),
+	}
+}
+
 // RowExpr is a resolved row constructor `(a, b, c)`. At evaluation time it
 // produces a text composite representation `(v1,v2,...,vN)`. Used for
 // whole-row variable refs and row-constructor IN comparisons. M0097-0020.

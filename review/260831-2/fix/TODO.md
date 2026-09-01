@@ -51,7 +51,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EO2-4 | med | `executor/operators_recursive_cte.go:recursiveUnionOp.Open` — phase state not reset on re-open | NOT A BUG | [x] | — |
 | EO2-5 | med | `executor/opnode.go:limitOpNext` — `FETCH FIRST 0 ROWS WITH TIES` panics on nil tieKeyVals | BUG | [x] | 0e50eb19a |
 | ES-6 | med | `executor/plpgsql_runtime.go:executePLpgSQLStmt (ForStmt)` — BY step not validated; zero/negative step infinite-loops | BUG | [x] | pending |
-| ES-7 | med | `executor/plpgsql_runtime.go:lowerPLpgSQLExpr (CastExpr)` — cast dropped in PL/pgSQL expressions | ? | [ ] | |
+| ES-7 | med | `executor/plpgsql_runtime.go:lowerPLpgSQLExpr (CastExpr)` — cast dropped in PL/pgSQL expressions | BUG | [x] | pending |
 | IN-2 | med | `initdb/catalog_cache.go:readCatalogCache` — silent partial catalog on TryRegisterUserTable failure | ? | [ ] | |
 | ST-3 | med | `storage/bufpool.go:pinLoad/evictVictim` — dirty victim content discarded when the flush fails | ? | [ ] | |
 | ST-7 | med | `storage/vm.go:PageAllVisible/PageAllFrozen` — plain XID comparison breaks under wraparound | BUG | [x] | 3f13f584e |
@@ -486,3 +486,19 @@ landed.
   the loop. Guard `internal/executor/plpgsql_for_step_test.go` runs the
   function on a side goroutine with a 10 s deadline, so the pre-fix build
   fails by TIMING OUT rather than by hanging the suite.
+
+- 2026-09-01 **ES-7 = BUG, FIXED (wrong results).** `lowerPLpgSQLExpr`'s
+  `*parser.CastExpr` arm returned the operand unchanged, so every cast written
+  inside a PL/pgSQL expression was silently DISCARDED and the expression
+  evaluated at the operand's own type: `7 / 2::numeric` did integer division
+  and produced 3. Fix: lower the operand and rebuild the cast through the new
+  `optimizer.NewCastExprFromParser`, which is the planner's own construction
+  (target type lower-cased, source type from `exprType`, typmod encoded) so
+  the two lowering paths cannot disagree. Guard
+  `internal/executor/plpgsql_cast_test.go` pins the PG 18.3 output
+  `3.5000000000000000|2|2.5000000000000000`, the middle term being the control
+  that uncast integer division must STAY integer division.
+  Two gaps found while scoping this and NOT introduced by it (both verified to
+  fail on the pre-fix build too, so they are separate findings, added to the
+  table as ES-8/ES-9): float8 arithmetic inside PL/pgSQL is evaluated as
+  numeric, and `RETURN <expr>::text` fails 42804.

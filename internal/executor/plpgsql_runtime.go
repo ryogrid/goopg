@@ -2636,7 +2636,15 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		}
 		return &optimizer.BinaryOp{Op: x.Op, Left: left, Right: right}, nil
 	case *parser.CastExpr:
-		return lowerPLpgSQLExpr(x.Operand, frame)
+		// review/260831-2 ES-7: this used to return the operand unchanged, so
+		// every cast inside a PL/pgSQL expression was a no-op and the
+		// expression evaluated at the operand's type ("5::float8 / 2" gave 2,
+		// not 2.5). Lower it the way the planner does.
+		operand, err := lowerPLpgSQLExpr(x.Operand, frame)
+		if err != nil {
+			return nil, err
+		}
+		return optimizer.NewCastExprFromParser(x, operand), nil
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "window function calls are not supported in PL/pgSQL expressions in v0"}
