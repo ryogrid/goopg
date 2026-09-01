@@ -119,6 +119,20 @@ func buildFSMPage(categories []uint8, numSlots int) []byte {
 	return p
 }
 
+// fsmPageMaxCat is the maximum category an FSM page holds. fp_nodes[0] is the
+// root of the max-tree buildFSMPage computes bottom-up, so it IS that maximum
+// and no scan is needed.
+//
+// review/260831 ST-7: buildFSMTree used to call parseFSMPage on every page it
+// had just built, purely to learn this one byte — and parseFSMPage allocates a
+// full fsmSlotsPerPage slice and walks the whole node array to produce it.
+func fsmPageMaxCat(p []byte) uint8 {
+	if len(p) != BlockSize {
+		return 0
+	}
+	return p[fsmPageHeaderSize+fsmNextSlotSize]
+}
+
 // parseFSMPage reads leaf categories from an FSM page. Returns the slice of
 // leaf-node category values (up to fsmSlotsPerPage entries). Also returns the
 // maximum category stored anywhere in the page (internal or leaf nodes).
@@ -240,8 +254,7 @@ func buildFSMTree(cats []uint8) [][]byte {
 		}
 		pg := buildFSMPage(cats[i:end], end-i)
 		l0.pages = append(l0.pages, pg)
-		_, maxCat := parseFSMPage(pg)
-		l0.maxCats = append(l0.maxCats, maxCat)
+		l0.maxCats = append(l0.maxCats, fsmPageMaxCat(pg))
 	}
 	levels = append(levels, l0)
 
@@ -256,8 +269,7 @@ func buildFSMTree(cats []uint8) [][]byte {
 			}
 			pg := buildFSMPage(prev.maxCats[i:end], end-i)
 			cur.pages = append(cur.pages, pg)
-			_, maxCat := parseFSMPage(pg)
-			cur.maxCats = append(cur.maxCats, maxCat)
+			cur.maxCats = append(cur.maxCats, fsmPageMaxCat(pg))
 		}
 		levels = append(levels, cur)
 	}
