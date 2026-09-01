@@ -86,7 +86,7 @@ func (o *verifyHeapamOp) Open(ctx *Context) error {
 		// NULL relation → no rows (upstream PG_RETURN_NULL on a NULL regclass).
 		return nil
 	}
-	tbl, ok := verifyHeapamResolveTable(argVal, im)
+	tbl, ok := verifyHeapamResolveTable(argVal, im, ctx.CurrentDatabaseOid)
 	if !ok {
 		if argVal.Kind == KindInt {
 			if _, isToast := im.ToastParentTable(uint32(argVal.Int)); isToast {
@@ -253,12 +253,25 @@ func verifyHeapamXidStatus(ctx *Context) amcheck.XidStatusFunc {
 // verifyHeapamResolveTable converts a KindInt OID or KindString name Datum to
 // the heap relation it names. Mirrors partitionResolveRegclass but returns the
 // *catalog.Table the SRF needs (natts, relfrozenxid) rather than just a name.
-func verifyHeapamResolveTable(d Datum, im *catalog.InMemory) (*catalog.Table, bool) {
+// dbOid pins the lookup to the calling connection's database namespace
+// (ctx.CurrentDatabaseOid) — table OIDs are cluster-wide unique but tables
+// live in per-database namespaces (catalog.InMemory.ns), so an unscoped
+// lookup silently defaults to DefaultDBOid and reports "relation does not
+// exist" for every table in any other database. Found empirically while
+// re-verifying M0119-0006 against a non-default pg_amcheck target database.
+// ctx.CurrentDatabaseOid is documented as zero in embedded/test contexts
+// (context.go), which must still resolve like "no dbOid given" (i.e.
+// DefaultDBOid) rather than literally searching namespace 0 — zero is never
+// a real dbOid (catalog.DefaultDBOid == 1).
+func verifyHeapamResolveTable(d Datum, im *catalog.InMemory, dbOid uint32) (*catalog.Table, bool) {
+	if dbOid == 0 {
+		dbOid = catalog.DefaultDBOid
+	}
 	switch d.Kind {
 	case KindInt:
-		return im.LookupTableByOID(uint32(d.Int))
+		return im.LookupTableByOID(uint32(d.Int), dbOid)
 	case KindString:
-		return im.LookupTable(parser.ObjectName{Name: d.StringValue()})
+		return im.LookupTable(parser.ObjectName{Name: d.StringValue()}, dbOid)
 	default:
 		return nil, false
 	}
