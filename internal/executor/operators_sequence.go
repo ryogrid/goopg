@@ -63,12 +63,19 @@ func (s *seqState) nextVal() (int64, error) {
 	defer s.mu.Unlock()
 	cur := s.current.Load()
 	next := cur + s.increment
+	// review/260831-2 EO2-2: int64 addition wraps silently, so a large
+	// increment near the ceiling produced a NEGATIVE "next" that passed the
+	// `next > s.max` test and was handed out as a sequence value. PG detects
+	// the overflow before comparing (sequence.c nextval_internal:
+	// `(maxv >= 0 && next > maxv - incby) || (maxv < 0 && next + incby > maxv)`)
+	// and reports the same "reached maximum value" error, verified on PG 18.3.
+	overflowed := (s.increment > 0 && next < cur) || (s.increment < 0 && next > cur)
 	seqName := s.schema + "." + s.seqName
 	if s.schema == "" || s.schema == "public" {
 		seqName = s.seqName
 	}
 	if s.increment > 0 {
-		if next > s.max {
+		if overflowed || next > s.max {
 			if s.cycle {
 				next = s.min
 			} else {
@@ -76,7 +83,7 @@ func (s *seqState) nextVal() (int64, error) {
 			}
 		}
 	} else {
-		if next < s.min {
+		if overflowed || next < s.min {
 			if s.cycle {
 				next = s.max
 			} else {
