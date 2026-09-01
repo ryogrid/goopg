@@ -576,30 +576,162 @@ bytes to the current segment, advances the write LSN, and notifies
 subscribers. `drainBufferUpTo` drains everything up to a target LSN (used
 by `FlushUpTo`).
 
-## Checkpointer pacing (`checkpointer.go`)
+## Checkpointer (`checkpointer.go`)
 
-The checkpointer uses a completion-target pacer:
+The checkpointer is a dedicated goroutine that periodically advances the
+recovery horizon by (1) computing and publishing a redo pointer, (2) flushing
+every dirty buffer so the data files are consistent as of that pointer, and
+(3) writing a durable `CHECKPOINT` record + `pg_control` update. It is the
+goopg analogue of PostgreSQL's `checkpointer` process.
+
+### Struct and configuration
 
 ```go
 type Checkpointer struct {
     interval        time.Duration  // checkpoint_timeout
     maxWALBytes     int64          // max_wal_size
     minWALBytes     int64          // min_wal_size
-    completionTarget float64       // checkpoint_completion_target
+    completionTarget float64       // checkpoint_completion_target (default 0.9)
+    intervalOverrideNS atomic.Int64 // reloaded checkpoint_timeout
+    volumeAnchor    atomic.Uint64  // pre-first-checkpoint WrittenLSN anchor
+    lastCheckpointStartLSN, lastCheckpointRedoLSN, lastCheckpointLSN atomic.Uint64
     // ...
 }
 ```
 
-`Run` ticks every 100 ms. On each tick:
-1. Check if `volumeTriggerFires` (WAL bytes > maxWALBytes).
-2. If a checkpoint is due, emit a `CHECKPOINT` record.
-3. Pace the dirty-page flush across the checkpoint duration:
-   `flushBudget = maxPagesToFlush * (currentTime - checkpointStart) /
-   (checkpointDuration * completionTarget)`.
-4. Call `FlushDirtyPages` with the budget.
+Key configuration (`CheckpointerConfig` / `GUCParameters`): `Interval`
+(`checkpoint_timeout`, default 5 min), `MaxWALBytes`/`MinWALBytes`
+(`max_wal_size`/`min_wal_size`), `CompletionTarget`
+(`checkpoint_completion_target`), `SegmentSize`, `VolumeCheckInterval`
+(how often the volume trigger polls), `WalLevel`, and `PGCompatCheckpoints`
+(whether to emit PG-canonical online checkpoint records). The flusher is any
+`DirtyPageFlusher` — in the live server the buffer pool (`Pool`), which also
+implements `pacedFlusher` (`FlushAllPaced`) and `dataFileSyncer`
+(`SyncAllDataFiles`).
 
-`CheckpointNow` is the synchronous path (for `CHECKPOINT` SQL command and
-shutdown). It bypasses the pacer and flushes all dirty pages immediately.
+### The `Run` loop
+
+`Run(ctx)` uses a **timer** (not a ticker) so a reloaded `checkpoint_timeout`
+is picked up at the next fire via `effectiveInterval()`. Each loop iteration
+selects on three channels:
+
+1. **`timer.C`** — a timeout checkpoint is due. Before running, the idle-skip
+   check (PG `xlog.c:7005-7019`) compares the writer's `WrittenLSN()` against
+   `lastCheckpointStartLSN`; if nothing was written since the last checkpoint
+   (and the writer implements `volumeReporter` — true in production — and
+   `lastCheckpointStartLSN != 0`), it is a no-op and the timer just resets. Otherwise it calls
+   `runCheckpoint(ctx, spread=true, shutdown=false)` — the *scheduled* (spread)
+   path.
+2. **`volumeC`** — a ticker that only exists when `MaxWALBytes > 0` and the
+   writer implements `volumeReporter` (`WrittenLSN()`). On each tick,
+   `volumeTriggerFires(vr)` checks whether the distance since the last
+   checkpoint's redo exceeds `max_wal_size` in segment terms
+   (`elapsedSegmentsNeeded()` = `checkpointSegments - 1`). If it fires, the checkpoint runs at
+   **immediate** speed (`spread=false`): `max_wal_size` is a backpressure
+   signal, not a cadence knob.
+3. **`ctx.Done()`** — return cleanly (shutdown path calls `CheckpointShutdown`
+   separately).
+
+Before entering the loop, the volume anchor is seeded from the writer's
+`WrittenLSN()` so the first `max_wal_size` window is measured from a real
+position; the `OnLoopStart`/`OnLoopEnd` hooks fire only after the anchor is
+stored (AI-20260813-005117-008).
+
+### `runCheckpoint` — the core sequence
+
+`runCheckpoint(ctx, spread, shutdown)` performs, in order:
+
+1. **Build the pacer** — `buildPacer(ctx, spread, start)` returns a
+   per-buffer delay closure aiming to finish the writeback at
+   `start + Interval * CompletionTarget`. It returns `nil` when spreading is
+   disabled or the inputs are degenerate, in which case the flush runs at
+   immediate speed.
+2. **Sample and publish the redo pointer BEFORE the flush** (the
+   perf-optimize3-dash/03 ordering that mirrors PG's `CreateCheckPoint`). The
+   `computeRedo` closure derives the 0-based redo from the writer's
+   `WrittenLSN()` plus the page-header prefix for the next record. When
+   `PGCompatCheckpoints && !shutdown`, the redo is instead established by
+   **appending an `XLOG_CHECKPOINT_REDO` record** — its start LSN minus one
+   becomes the redo pointer, exactly like upstream `CreateCheckPoint`
+   (`xlog.c:7087-7099`); PG17+ recovery validates this record at
+   `CheckPoint.redo`. The append happens inside the FPI barrier's critical
+   section so no torn-page-relevant record can land between the sampled redo
+   and the published one.
+   `PublishRedoBarrier(sampleRedo)` waits out every in-flight
+   FPI-decision→append section before sampling, then publishes the frontier.
+3. **Flush dirty pages** — `flushDirty(pacer)` calls `FlushAllPaced(pacer)`
+   when the flusher supports it, else `FlushAll()`. The pacer is consulted
+   between buffer batches so the writeback is spread across the
+   `Interval*CompletionTarget` window.
+4. **Flush the CLOG buffer pool** — `FlushCLOGFn` (if wired) drains the
+   clog's dirty pages in the same phase; an error here fails the checkpoint
+   rather than being swallowed (M0117-0007 Part B).
+5. **Sync all data files** — `SyncAllDataFiles()` fdatasyncs every relfile so
+   the flushed bytes are durable before the checkpoint LSN advances
+   (M0089-0001; without this, a crash between the pwrite and the next OS flush
+   could rewind the data files while WAL replay believed them applied).
+6. **Record this cycle's redo distance** — `updateCheckPointDistanceEstimate`
+   feeds a moving average that `SlotAwareRetainer` consults for
+   `XLOGfileslop`-style WAL recycling.
+7. **Sample the live counters ONCE** — `nextXid` (from the MVCC manager),
+   `nextOid` (from the catalog), timeline, `full_page_writes`, `wal_level`,
+   and the multixact counters (`nextMulti`/`nextMultiOffset`/`oldestMulti`),
+   all before the record is encoded so the checkpoint record and the
+   `pg_control` copy cannot disagree (M0131-S18.3/.4).
+8. **Append the checkpoint record** — in PG-compat mode an online checkpoint
+   first appends an `XLOG_RUNNING_XACTS` record (`LogStandbySnapshot`
+   analogue) so a hot-standby PG recovering from this redo reaches
+   `STANDBY_SNAPSHOT_READY`; shutdown checkpoints skip it and stamp
+   `oldestActiveXid = InvalidTransactionId`. Then the `CHECKPOINT` record
+   itself is appended (`EncodeCheckpointPGFields` with the explicit
+   ONLINE/SHUTDOWN opcode) and flushed to its end LSN. The native path uses
+   `EncodeCheckpoint`.
+9. **Publish the checkpoint LSNs** — `lastCheckpointRedoLSN` (the **redo**
+   pointer computed at step 2, stored 1-based) and `lastCheckpointLSN` (the
+   checkpoint record's own end LSN) are stored. Recovery and `BASE_BACKUP`
+   begin at the redo, not the record, so records in the `(redo, record]`
+   window — state the flush may not have captured, e.g. a commit acked
+   mid-flush — are still covered.
+10. **Update `pg_control`** — `control.UpdateControlFile` writes
+    `CheckPoint`, `CheckPointCopyRedo`, the sampled TLI/nextXid/nextOid/
+    multixact fields, and sets `State = DB_SHUTDOWNED` (shutdown) or
+    `DB_IN_PRODUCTION` (live). External tools (`pg_resetwal`/`pg_rewind`/
+    `pg_controldata`) gate on this byte to decide whether recovery is
+    required.
+
+### The pacer
+
+`buildPacer` returns `nil` when spreading is disabled (a scheduled checkpoint
+with `CompletionTarget <= 0` or `Interval <= 0`). Otherwise it returns a
+closure that, given the flush progress `0..1`, sleeps until
+`start + CompletionTarget*Interval*progress` — front-loading nothing and
+backing off the tail of the writeback so the last buffer lands just before the
+completion target. `volumeTriggerFires` (step 2 of `Run`) compares the WAL
+distance since the last redo against `checkpointSegments` (= `max_wal_size /
+(1 + checkpoint_completion_target) / SegmentSize`); `elapsedSegmentsNeeded`
+is its helper (returns `checkpointSegments - 1`, floored at 1) for the
+segment math.
+
+### Synchronous paths
+
+- **`CheckpointNow`** — the synchronous path for the `CHECKPOINT` SQL command
+  and explicit operator requests. It runs a full checkpoint immediately
+  (spread=false) and returns only after the record + pg_control are durable.
+- **`CheckpointShutdown`** — the shutdown checkpoint: spread=false,
+  shutdown=true, so `State = DB_SHUTDOWNED` and a subsequent startup knows the
+  cluster was cleanly stopped. Shutdown checkpoints keep the sampled-frontier
+  redo (no `XLOG_CHECKPOINT_REDO` marker), because no WAL may be written
+  between a shutdown checkpoint's redo and its record — the record itself
+  marks the redo point, mirroring upstream's comment in `xlog.c`.
+
+### Idle-skip and volume semantics
+
+A timeout checkpoint is skipped when the writer's `WrittenLSN()` has not
+advanced past `lastCheckpointStartLSN` (nothing new to flush). FORCE,
+shutdown, and volume-triggered checkpoints never take this shortcut. The
+volume trigger only exists when both `MaxWALBytes > 0` and the writer can
+report its written LSN; polling once per second between timeout ticks is
+deliberate, since checkpoints take far longer than that.
 
 ## Replication slot persistence (`slots_pg.go`)
 
@@ -633,12 +765,141 @@ essential for consistency: without reordering, a subtransaction's updates
 might be replayed before its parent's updates, producing a visible but
 inconsistent state.
 
-## Streaming replayer (`stream_replayer.go`)
+## Streaming replication
 
-`StreamReplayer` replays WAL records as they arrive from the master (via
-`pg_basebackup` or PITR restore). It reads from the WAL stream, classifies
-each record, and calls `ApplyRecord`. The replayer suspends during
-transaction boundaries that need reordering.
+Streaming replication is the standby path where WAL is forwarded from the
+primary to a live standby as it is written, and applied continuously. It
+spans three cooperating pieces: the **walsender** (`internal/replication/
+walsender.go`), the **walreceiver** (`internal/replication/walreceiver.go`),
+and the **stream replayer** (`stream_replayer.go`). The wire protocol is the
+PostgreSQL v3 replication protocol (COPY BOTH mode).
+
+### The walsender side (primary)
+
+`Handler.replyStartReplication` serves the `START_REPLICATION` command:
+
+1. **Parse** — `parseStartReplicationArgs` parses `START_REPLICATION
+   PHYSICAL|LOGICAL <startLSN> [SLOT s] [(options)]`. `PHYSICAL` is the
+   default when the mode keyword is omitted.
+2. **Timeline validation** — a requested TLI must not exceed the current
+   timeline (`s.cfg.Timeline`); an older TLI serves WAL up to the switch
+   point recorded in the history file, then EOF. TLI > 1 historical reads
+   need the segment-naming migration (M0130-S8.3x).
+3. **Slot activation** — when a slot name is given, `Slots.SetActive`
+   marks it active for the stream and it is cleared on exit.
+4. **Enter COPY BOTH** — `WriteCopyBothResponse(0, nil)` hands the
+   connection over to streaming mode. LOGICAL mode diverts to
+   `runLogicalWalsender` (the `SlotDecoder` + `PgOutput` pipeline); the
+   physical path continues here.
+5. **Build the iterator** — `xlog.NewRecordIterator(s.cfg.WAL, walDir,
+   segSize, args.StartLSN)` walks the WAL from the requested LSN.
+6. **Observability** — the walsender registers into the process-wide
+   `WalSenders` registry (`pg_stat_replication`); `SyncRep.ForgetStandby`
+   removes the standby from the FIRST/ANY quorum on disconnect.
+7. **Three cooperating goroutines**:
+   - *receive goroutine*: consumes `CopyData`/`CopyDone`/`Terminate`
+     frames. `CopyData` payloads are standby status updates decoded by
+     `handleStandbyCopyData` (below). `CopyDone` or `Terminate` cancels the
+     stream context.
+   - *chunk-producer goroutine*: calls `it.NextRaw(streamCtx, XLOGBlockSize)` and sends the chunk on a channel (size 1, one chunk in flight).
+   - *main send loop*: receives chunks from the producer goroutine, wraps each in a `'w'` WAL-data frame, writes to the wire, and flushes. A 10 s keepalive
+   timer emits a keepalive frame when WAL is idle so the standby can
+   advance its progress reporting.
+
+### The `'w'` WAL-data frame and keepalive
+
+Each shipped WAL chunk is wrapped as:
+
+```
+'w' int64be startLSN  int64be endLSN  int64be sendTime  <record bytes>
+```
+
+(`libpq.EncodeWALData`). When `endLSN - startLSN == len(bytes)` the chunk is
+verbatim raw WAL and the standby uses `AppendRaw`; otherwise it is re-encoded
+through `Append`. This dual path supports both goopg-native walsenders and
+real PG walsenders — both forward raw stream bytes (`it.NextRaw` preserves
+page headers and zero padding); the `Append` fallback is triggered only by
+the logical walsender path. The keepalive frame (`EncodeKeepalive`) carries
+the primary's `WrittenLSN()` and a `reply` flag.
+
+### Standby status updates
+
+`handleStandbyCopyData` decodes each inbound `StandbyStatusUpdate`
+(`write/flush/apply` LSNs). On receipt it:
+
+1. **Advances the slot** — `Slots.AdvanceConfirmedFlushLSN(slot, flushLSN)`
+   persists the consumer's confirmed-flush position (logical slots).
+2. **Updates the sender state** — `senderHandle.ApplyStandbyStatus(...)`
+   feeds the `pg_stat_replication` row.
+3. **Feeds SyncRep** — `syncRep.UpdateStandbyProgress(appName, write, flush,
+   apply)` releases any commit blocked in `WaitForLSN` once the
+   acknowledged LSN reaches the commit target. `ForgetStandby` on disconnect
+   ensures a dropped standby no longer counts toward a quorum.
+
+### The walreceiver side (standby)
+
+`StartWalReceiver` (internal/replication/walreceiver.go) connects to the
+primary, sends a v3 startup message with `replication=true`, drains handshake
+frames until `ReadyForQuery`, then sends `START_REPLICATION`, then loops:
+
+1. Receives `'w'` WAL-data frames and `Append`s them into the **local** WAL
+   writer, so the received bytes land in the standby's own `pg_wal`.
+2. Sends periodic `StandbyStatusUpdate` frames with its write/flush/apply
+   LSNs so the primary can advance slot/`pg_stat_replication` state and
+   release synchronous commits.
+3. Uses exponential-backoff reconnection on failure.
+4. Trims overlapping data on reconnect (see replication.md's "WalReceiver
+   trimming overlapping data").
+
+### The stream replayer (standby apply)
+
+`StreamReplayer` (stream_replayer.go) drives the same per-record `ApplyRecord`
+kernel as crash recovery, but from a live `RecordIterator`:
+
+```go
+func NewStreamReplayer(mgr *storage.Manager, baselineLSN uint64) *StreamReplayer
+func (sr *StreamReplayer) SetXactReplayHook(fn func(xid storage.TransactionID, committed bool))
+func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error
+func (sr *StreamReplayer) ApplyLSN() uint64
+func (sr *StreamReplayer) AtEndOfWAL() bool
+```
+
+- The standby's main loop wires the walreceiver (which `Append`s into the
+  local writer) and the replayer (which iterates). The iterator wakes on the
+  writer's flush subscription, so records are applied as soon as they are
+  flushed — unlike crash recovery's read-all-then-apply model.
+- `Run(ctx, iter)` pulls records with `iter.Next(ctx)` and applies each via
+  `ApplyRecord`. It returns `nil` on clean ctx-cancel or `io.EOF` (writer
+  closed); a per-record apply error is returned and the caller decides
+  whether to crash or retry (v0 `cmd/goopg start` logs and exits a standby on
+  a primary/standby WAL divergence, because that is unrecoverable without a
+  fresh base backup).
+- **Apply is idempotent via `pd_lsn`**, so restart-resume never needs a
+  separate apply cursor — the iterator always starts at the writer's
+  `WrittenLSN()` at boot and the previously-applied tail is silently skipped.
+- `SetXactReplayHook` wires commit/abort records to the local MVCC manager
+  (`ReplayXactCommit`/`ReplayXactAbort`) so replayed tuples become visible to
+  standby queries (xmin < snapshot xmax) rather than reading as "future"
+  XIDs.
+- `ApplyLSN()` reports the last successfully applied LSN; `AtEndOfWAL()`
+  reports whether replay has applied every complete record the local writer
+  holds and is parked awaiting bytes (the promotion drain uses this as its
+  stop condition — `ApplyLSN` can never reach `WrittenLSN` when the received
+  stream was cut mid-record).
+- The replayer applies records in **arrival order** via `ApplyRecord` — it does
+  NOT use `reorder.go` (the reorder buffer belongs to the logical-decoding
+  pipeline, `SlotDecoder` + `PgOutput`). Subtransaction-abort handling is done
+  by the redo path's `ApplyRecord` itself.
+
+### Streaming vs crash recovery
+
+| Aspect | Crash recovery | Streaming |
+|---|---|---|
+| Input | read all of `pg_wal`, find last checkpoint, apply tail in one pass | live `RecordIterator` over local writer |
+| Trigger | boot (`open` the data dir) | records arrive continuously |
+| Apply cursor | none (replay then serve) | `pd_lsn` idempotence; restart starts at `WrittenLSN()` |
+| XID visibility | full boot reload | `SetXactReplayHook` → MVCC `ReplayXact*` |
+| Errors | fail the start | caller decides crash/retry; divergence ⇒ fresh base backup |
 
 ## Segment preallocation (`segment_pad.go`)
 
@@ -733,167 +994,6 @@ C->>S: CreateLogical('sub1', 'pgoutput', 'mydb', startLSN)
     end
 C->>S: AdvanceConfirmedFlushLSN('sub1', commitLSN)
 ```
-
-## Record kind constants (`recovery.go`)
-
-The goopg-native record kinds are defined as `RecordKind` constants:
-
-| Kind | Value | Payload |
-|---|---|---:|
-| `RecordKindHeapInsert` | 0x01 | rel, blk, lineSlot, tuple |
-| `RecordKindHeapDelete` | 0x02 | rel, blk, lineSlot, xmax, oldTuple |
-| `RecordKindHeapUpdate` | 0x03 | rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tuple |
-| `RecordKindHeapHotUpdate` | 0x04 | rel, blk, oldSlot, xmax, tuple |
-| `RecordKindHeapMultiInsert` | 0x05 | rel, blk, slots, tuples |
-| `RecordKindHeapLock` | 0x06 | rel, blk, lineSlot, xmax, lockStrength |
-| `RecordKindHeapPruneOpt` | 0x07 | rel, blk, redirects, unused |
-| `RecordKindHeapFreeze` | 0x08 | rel, blk, frozenSlots |
-| `RecordKindHeapVisible` | 0x09 | rel, blk, heapBlk |
-| `RecordKindHeapVacuum` | 0x0A | rel, blk, deadSlots |
-| `RecordKindSmgrCreate` | 0x0B | rel |
-| `RecordKindSmgrTruncate` | 0x0C | rel |
-| `RecordKindSmgrTruncateTo` | 0x0D | rel, nBlocks |
-| `RecordKindBtreeInsert` | 0x0E | rel, blk, offnum, item |
-| `RecordKindBtreeSplit` | 0x0F | rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage |
-| `RecordKindBtreeVacuum` | 0x10 | rel, blk, keptItems, opaqueFlags |
-| `RecordKindBtreeUnlinkPage` | 0x11 | rel, blk, leftBlk, rightBlk, btvac |
-| `RecordKindBtreeNewRoot` | 0x12 | rel, rootBlk, rootPage, leftChildBlk, metaBlk, metaPage |
-| `RecordKindBtreeMarkPageHalfDead` | 0x13 | rel, blk, leftBlk, rightBlk, leftChild, rightChild |
-| `RecordKindBtreeReusePage` | 0x14 | rel, blk, lastRecycledXid |
-| `RecordKindBtreeMetaCleanup` | 0x15 | rel, blk |
-| `RecordKindXactCommit` | 0x16 | xid |
-| `RecordKindXactAbort` | 0x17 | xid |
-| `RecordKindXactAssignment` | 0x18 | parentXid, subXids |
-| `RecordKindXactRollbackTo` | 0x19 | parentXid, abortedSubXids |
-| `RecordKindXactSubAbort` | 0x1A | subXid |
-| `RecordKindXactMarker` | 0x1B | xid, marker |
-| `RecordKindClogTruncate` | 0x1C | xid |
-| `RecordKindPageImage` | 0x1D | rel, blk, page |
-| `RecordKindCheckpoint` | 0x1E | CheckPointFields |
-| `RecordKindCheckpointCompat` | 0x1F | redoLSN, tli, nextXid, nextOid |
-| `RecordKindRelmap` | 0x20 | relmap data |
-| `RecordKindSeqLog` | 0x21 | seq data |
-
-## PG-canonical emission (`pg_assembled_emit.go`)
-
-When `pageHeaders=true` (the default for PG-compatible WAL), records are
-emitted in PG's `XLogRecord` format. The assembly path:
-
-1. `xlog_assemble.go` wraps the raw payload in a PG `XLogRecord` header
-   (xl_tot_len, xl_xid, xl_prev, xl_info, xl_rmid).
-2. `xlog_emit.go` orchestrates the assembly and passes the result to the
-   state's `appendPGCompat` method.
-3. The PG header adds 24 bytes per record (for the `XLogRecord` struct) plus
-   block-ref arrays when needed.
-
-`pg_assembled_emit.go` provides the per-record-kind encoders that produce
-PG-canonical output: `EncodeHeapInsertPG`, `EncodeHeapUpdatePG`,
-`EncodeHeapDeletePG`, `EncodeXactCommitPG`, `EncodeXactAbortPG`, etc.
-
-## Writer state machine (`writer.go`)
-
-The `Writer` has a `state` struct for the append path:
-
-```go
-type state struct {
-    mu         sync.Mutex
-    writeLock  paddedMutex  // serializes segment writes
-    walFile    *os.File
-    segNo      uint64
-    segOffset  int64
-    tail       uint64   // next LSN to write
-    head       uint64   // oldest LSN still in ring
-    // ...
-}
-```
-
-`tryAppend` is the lock-free fast path: it CAS-increments the ring head,
-copies the payload, and returns the LSN. If the ring is full, it falls back
-to `append`, which acquires the write lock and drains the ring
-before retrying.
-
-`append` is the general path: it reserves bytes in the ring, copies the
-payload, and publishes the new tail. `appendPGCompat` does the same but
-with PG-format headers.
-
-`drainBufferBytes` is called when the ring is full: it writes the reserved
-bytes to the current segment, advances the write LSN, and notifies
-subscribers. `drainBufferUpTo` drains everything up to a target LSN (used
-by `FlushUpTo`).
-
-## Checkpointer pacing (`checkpointer.go`)
-
-The checkpointer uses a completion-target pacer:
-
-```go
-type Checkpointer struct {
-    interval        time.Duration  // checkpoint_timeout
-    maxWALBytes     int64          // max_wal_size
-    minWALBytes     int64          // min_wal_size
-    completionTarget float64       // checkpoint_completion_target
-    // ...
-}
-```
-
-`Run` ticks every 100 ms. On each tick:
-1. Check if `volumeTriggerFires` (WAL bytes > maxWALBytes).
-2. If a checkpoint is due, emit a `CHECKPOINT` record.
-3. Pace the dirty-page flush across the checkpoint duration:
-   `flushBudget = maxPagesToFlush * (currentTime - checkpointStart) /
-   (checkpointDuration * completionTarget)`.
-4. Call `FlushDirtyPages` with the budget.
-
-`CheckpointNow` is the synchronous path (for `CHECKPOINT` SQL command and
-shutdown). It bypasses the pacer and flushes all dirty pages immediately.
-
-## Replication slot persistence (`slots_pg.go`)
-
-Slots are persisted to `pg_replslot/<name>/state` using the PG slot-file
-format. The file contains:
-
-```
-slot_name|plugin|database|two_phase|failover|wal_level|reserve_lsn|restart_lsn|confirmed_flush|catalog_xmin|...
-```
-
-`OpenSlots` reads all slot files from the directory. `Create`/`CreateLogical`
-write a new slot file. `Drop` removes the file. `AdvanceConfirmedFlushLSN`
-updates the confirmed flush LSN in the slot file atomically.
-
-## SyncRep (`syncrep.go`)
-
-Synchronous replication mode: `SyncRepMode` is `SyncRepOff`, `SyncRepRemoteWrite`,
-`SyncRepRemoteFlush`, or `SyncRepRemoteApply`. `syncrep_parse.go` parses the `synchronous_standby_names`
-GUC into a list of standby names with quorum/priority syntax.
-
-`WaitForLSN` blocks the committing backend until the standby acknowledges
-receipt past the commit LSN. The wait is on a condition variable that the
-standby's feedback wakes up.
-
-## Reorder buffer (`reorder.go`)
-
-`reorder.go` reorders WAL records for subtransaction-safe replay. When a
-subtransaction commits, its records are released to the replayer in commit
-order. When a subtransaction aborts, its records are discarded. This is
-essential for consistency: without reordering, a subtransaction's updates
-might be replayed before its parent's updates, producing a visible but
-inconsistent state.
-
-## Streaming replayer (`stream_replayer.go`)
-
-`StreamReplayer` replays WAL records as they arrive from the master (via
-`pg_basebackup` or PITR restore). It reads from the WAL stream, classifies
-each record, and calls `ApplyRecord`. The replayer suspends during
-transaction boundaries that need reordering.
-
-## Segment preallocation (`segment_pad.go`)
-
-`eagerPreallocSegment` zeroes a future segment (`pg_wal/<tli>/<seg>`) in a
-background goroutine. The segment is preallocated before the write path needs
-it, so the write path never blocks on `fallocate` or `write(0)`.
-
-`recycleSegmentFile` renames a removed segment to a future segment number
-and rezeroes it. `segment_pad.go` handles the zero-padding of recycled
-segments.
 
 ## Key flow: timeline switching
 
