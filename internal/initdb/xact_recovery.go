@@ -40,6 +40,19 @@ import (
 // (RmgrXact / xlogXactCommit / xlogXactAbort emitted in PageHeaders mode)
 // are processed. The native records carry the XID at payload bytes 1..4;
 // canonical records carry it in the XLogRecord header's XID field.
+// nativeKindByte reports whether r.Payload[0] may be read as a goopg
+// RecordKind tag, given that the caller needs at least minLen payload bytes.
+// The kind byte is only trustworthy when the record's (xl_rmid, xl_info) is
+// the pair recordKindToRmgrInfo assigns to it: a structurally real PG record
+// carries raw struct bytes there, and its first byte can collide with a
+// RecordKind constant — IsGoopgNativeRecord's own documentation names the
+// WAL-scanning startup paths as the callers that must ask first. Both scanners
+// in this file used to switch on the byte unguarded, latent only because a
+// PG-format record reaches them with a nil Payload (review/260831-2 IN-3).
+func nativeKindByte(r xlog.Record, minLen int) bool {
+	return len(r.Payload) >= minLen && xlog.IsGoopgNativeRecord(r)
+}
+
 func replayCLogFromWAL(walDir string, clog *transam.CLog, txnMgr *transam.Manager) error {
 	if _, err := os.Stat(walDir); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -85,7 +98,7 @@ func replayCLogFromWAL(walDir string, clog *transam.CLog, txnMgr *transam.Manage
 			txnMgr.SetNextXID(storage.TransactionID(r.XLog.Header.XID) + 1)
 		}
 		// --- Native goopg commit/abort records ---
-		if len(r.Payload) >= xlog.XactRecordSize {
+		if nativeKindByte(r, xlog.XactRecordSize) {
 			switch r.Payload[0] {
 			case xlog.RecordKindXactCommit:
 				xid := storage.TransactionID(binary.LittleEndian.Uint32(r.Payload[1:5]))
@@ -276,7 +289,7 @@ func walHasXactRecords(walDir string) (bool, error) {
 		return false, err
 	}
 	for _, r := range records {
-		if len(r.Payload) >= 5 {
+		if nativeKindByte(r, 5) {
 			switch r.Payload[0] {
 			case xlog.RecordKindXactCommit, xlog.RecordKindXactAbort:
 				return true, nil
