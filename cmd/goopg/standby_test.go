@@ -323,3 +323,64 @@ func TestStandbyControllerPromoteWritesTimelineHistory(t *testing.T) {
 		t.Errorf("persisted TLI = %d, want 2", got)
 	}
 }
+
+// TestStandbyControllerPromoteRetryableAfterFailure is the review/260831-2
+// CM-1 guard. A Promote that fails (here: a cancelled context caught while
+// waiting for the walreceiver to exit) leaves the node a standby, so the
+// operator must be able to try again — that is exactly what
+// promoteSignalWatcher's "removed first so a partial Promote can be retried
+// by re-creating the file" comment promises. The `promoting` flag used to be
+// set and never cleared, so every later PROMOTE — control socket and
+// promote.signal alike — came back "promotion already in progress" and the
+// standby could never be promoted for the life of the process.
+//
+// The controller is assembled by hand rather than via startStandby so the
+// first attempt fails deterministically: receiverDone stays open, so the
+// step-2 select can only take the ctx.Done() arm.
+func TestStandbyControllerPromoteRetryableAfterFailure(t *testing.T) {
+	dataDir := initStandbyDir(t)
+
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rplCtx, rplCancel := context.WithCancel(context.Background())
+	defer rplCancel()
+	rplDone := make(chan struct{})
+	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger)
+
+	rcvDone := make(chan struct{})
+	sc := &standbyController{
+		rt:             rt,
+		logger:         logger,
+		receiverCancel: func() {},
+		receiverDone:   rcvDone,
+		replayerCancel: rplCancel,
+		replayerDone:   rplDone,
+		replayer:       replayer,
+	}
+
+	failCtx, failCancel := context.WithCancel(context.Background())
+	failCancel()
+	if err := sc.Promote(failCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Promote error = %v, want context.Canceled", err)
+	}
+	if !rt.Standby {
+		t.Fatal("failed Promote left Runtime.Standby = false")
+	}
+
+	// The condition that made the first attempt fail is gone.
+	close(rcvDone)
+	if err := sc.Promote(context.Background()); err != nil {
+		t.Fatalf("retry Promote: %v", err)
+	}
+	if rt.Standby {
+		t.Error("Runtime.Standby = true after successful retry, want false")
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, initdb.StandbySignalFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("standby.signal still present after retry (err=%v)", err)
+	}
+}

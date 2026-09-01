@@ -34,8 +34,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | BUG | [x] | `e4b3b7ff3` |
 | ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | BUG | [x] | `8ca6a5a8d` |
 | TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | BUG | [x] | `98a9a11a6` |
-| CP-1 | high | `postmaster/txn_verb.go:applyTransactionVerb` — DDL in a failed block survives COMMIT-as-ROLLBACK | BUG | [x] | see progress log |
-| CM-1 | high | `cmd/goopg/standby.go:Promote` — `promoting` atomic never reset; failed promote wedges permanently | ? | [ ] | |
+| CP-1 | high | `postmaster/txn_verb.go:applyTransactionVerb` — DDL in a failed block survives COMMIT-as-ROLLBACK | BUG | [x] | `574dd707b` |
+| CM-1 | high | `cmd/goopg/standby.go:Promote` — `promoting` atomic never reset; failed promote wedges permanently | BUG | [x] | see progress log |
 
 ## B. Medium severity (claimed)
 
@@ -221,3 +221,19 @@ landed.
   messages; after the failed-block COMMIT `pg_class` must have no `failblk` row
   and the INSERT must fail with "does not exist" (red before the fix on both
   assertions).
+
+- 2026-09-01 **CM-1 = BUG (fixed).** `standbyController.Promote` set the
+  `promoting` atomic and never cleared it, and wrapped the work in a
+  `sync.Once`. A promote that FAILED (drain timeout, cancelled context) left the
+  node a standby, yet every later PROMOTE — control socket and `promote.signal`
+  alike — returned "promotion already in progress" for the life of the process.
+  That directly contradicts `promoteSignalWatcher`'s own contract ("removed
+  first so a partial Promote can be retried by re-creating the file"). Fix:
+  `defer sc.promoting.Store(false)` so the in-flight guard is released on every
+  exit, drop the now-redundant `sync.Once` (the `promoted` flag already provides
+  success idempotency, and steps 1-2 of runPromote are idempotent), and re-check
+  `promoted` after winning the CAS. Guard:
+  `TestStandbyControllerPromoteRetryableAfterFailure` — hand-built controller
+  whose receiverDone stays open so the first attempt fails deterministically on
+  a cancelled context; the retry after closing it must succeed (it returned
+  "promotion already in progress" before the fix).
