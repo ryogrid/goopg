@@ -54,8 +54,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | ES-7 | med | `executor/plpgsql_runtime.go:lowerPLpgSQLExpr (CastExpr)` — cast dropped in PL/pgSQL expressions | ? | [ ] | |
 | IN-2 | med | `initdb/catalog_cache.go:readCatalogCache` — silent partial catalog on TryRegisterUserTable failure | ? | [ ] | |
 | ST-3 | med | `storage/bufpool.go:pinLoad/evictVictim` — dirty victim content discarded when the flush fails | ? | [ ] | |
-| ST-7 | med | `storage/vm.go:PageAllVisible/PageAllFrozen` — plain XID comparison breaks under wraparound | BUG | [x] | this commit |
-| ST-8 | med | `storage/freeze.go:PageFreezeOldTuples` — plain XID comparison breaks under wraparound | ? | [ ] | |
+| ST-7 | med | `storage/vm.go:PageAllVisible/PageAllFrozen` — plain XID comparison breaks under wraparound | BUG | [x] | 3f13f584e |
+| ST-8 | med | `storage/freeze.go:PageFreezeOldTuples` — plain XID comparison breaks under wraparound | BUG | [x] | this commit |
 | NB-2 | med | `pglz/pglz.go:Decompress` — match length clamped instead of erroring on corrupt streams | ? | [ ] | |
 | TA-2 | med | `transam/manager.go:AssignXID` — non-atomic read-check-allocate-store allows XID leak/double-assign | ? | [ ] | |
 | NP-1 | med | `plpgsql/parser.go:parseFor` — FOR-query scan truncates on a `loop` identifier inside the SQL text | ? | [ ] | |
@@ -329,3 +329,14 @@ landed.
   repo's existing circular primitive `XIDPrecedes` (same primitive as the
   ST-2 fix). Guard: `TestPageAllVisibleAcrossWraparound`. Gates: units
   green; pgbench smoke green (commit hook).
+
+- 2026-09-01 **ST-8 = BUG (fixed).** Same class as ST-7, on the freeze path:
+  `PageFreezeOldTuples` decided eligibility with `xmin >= freezeBelow` and
+  tracked `MinUnfrozenXID` with `<`. After the XID counter wraps, every
+  ancient (numerically huge) xmin looks newer than the freeze cutoff, so
+  VACUUM freezes NOTHING at the moment freezing is what prevents
+  wraparound, and relfrozenxid advances off the wrong minimum. PG uses
+  `TransactionIdPrecedes` (heap_prepare_freeze_tuple). Fix: `XIDPrecedes`
+  for both comparisons. Guard: `TestPageFreezeAcrossWraparound` (a
+  pre-wrap tuple must be frozen and the post-wrap one reported as
+  MinUnfrozenXID). Gates: units green; pgbench smoke green.

@@ -59,9 +59,14 @@ func PageFreezeOldTuples(p Page, freezeBelow TransactionID) (PageFreezeStats, er
 			continue
 		}
 
-		if xmin >= freezeBelow {
+		// review/260831-2 ST-8: circular XID comparison (PG's
+		// TransactionIdPrecedes, used by heap_prepare_freeze_tuple). A plain
+		// `>=` reads every pre-wraparound xmin as NEWER than a post-wraparound
+		// freeze horizon, so vacuum froze nothing exactly when freezing is what
+		// prevents wraparound — and relfrozenxid tracked the wrong minimum.
+		if !XIDPrecedes(xmin, freezeBelow) {
 			// Not old enough — track for relfrozenxid computation.
-			if stats.MinUnfrozenXID == 0 || xmin < stats.MinUnfrozenXID {
+			if stats.MinUnfrozenXID == 0 || XIDPrecedes(xmin, stats.MinUnfrozenXID) {
 				stats.MinUnfrozenXID = xmin
 			}
 			continue
