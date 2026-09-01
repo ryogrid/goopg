@@ -73,11 +73,18 @@ func FormatTimestamp(micros int64) string {
 	y, m, d := j2date(dateDays + postgresEpochJDate)
 	// The BC marker trails the whole value ("0001-01-01 00:00:00 BC"), so the
 	// date part is rendered without it and the suffix appended last.
-	s := fmt.Sprintf("%s %s", formatISODateNoEra(y, m, d), formatTimeOfDay(timeOfDay))
+	// review/260831 UT-9: rendered through a stack buffer rather than
+	// fmt.Sprintf over two already-allocated strings. This is a per-cell output
+	// path (COPY TO text, array element output), so the three intermediate
+	// strings it used to build were paid per value.
+	var b [48]byte
+	buf := appendISODateNoEra(b[:0], y, m, d)
+	buf = append(buf, ' ')
+	buf = appendTimeOfDay(buf, timeOfDay)
 	if y <= 0 {
-		s += " BC"
+		buf = append(buf, " BC"...)
 	}
-	return s
+	return string(buf)
 }
 
 // FormatTimestampTZUTC renders a TIMESTAMPTZ as timestamptz_out does with the
@@ -134,11 +141,49 @@ func formatISODate(y, m, d int) string {
 // the YEAR digits (year 0 is 1 BC) but WITHOUT the trailing " BC" marker, which
 // upstream appends after the time part of a timestamp.
 func formatISODateNoEra(y, m, d int) string {
+	var b [24]byte
+	return string(appendISODateNoEra(b[:0], y, m, d))
+}
+
+// appendISODateNoEra is formatISODateNoEra writing into dst.
+func appendISODateNoEra(dst []byte, y, m, d int) []byte {
 	year := y
 	if year <= 0 {
 		year = -(year - 1)
 	}
-	return fmt.Sprintf("%04d-%02d-%02d", year, m, d)
+	dst = appendPad4(dst, year)
+	dst = append(dst, '-')
+	dst = appendPad2(dst, m)
+	dst = append(dst, '-')
+	return appendPad2(dst, d)
+}
+
+// appendPad2 appends v as at least two digits, the way %02d prints it.
+func appendPad2(dst []byte, v int) []byte {
+	if v < 0 {
+		dst = append(dst, '-')
+		v = -v
+	}
+	if v < 10 {
+		return append(dst, '0', byte('0'+v))
+	}
+	if v < 100 {
+		return append(dst, byte('0'+v/10), byte('0'+v%10))
+	}
+	return strconv.AppendInt(dst, int64(v), 10)
+}
+
+// appendPad4 appends v as at least four digits, the way %04d prints it.
+func appendPad4(dst []byte, v int) []byte {
+	if v < 0 {
+		dst = append(dst, '-')
+		v = -v
+	}
+	if v < 10000 {
+		return append(dst, byte('0'+v/1000%10), byte('0'+v/100%10),
+			byte('0'+v/10%10), byte('0'+v%10))
+	}
+	return strconv.AppendInt(dst, int64(v), 10)
 }
 
 // formatTimeOfDay renders microseconds-since-midnight as HH:MM:SS[.ffffff],
@@ -146,9 +191,16 @@ func formatISODateNoEra(y, m, d int) string {
 // fraction is printed only when non-zero and carries no trailing zeros
 // (12:34:56.100000 → "12:34:56.1", 01:02:03.000001 → "01:02:03.000001").
 func formatTimeOfDay(micros int64) string {
-	neg := ""
+	var b [32]byte
+	return string(appendTimeOfDay(b[:0], micros))
+}
+
+// appendTimeOfDay is formatTimeOfDay writing into dst, so a caller that is
+// already building a buffer (FormatTimestamp) does not pay for an intermediate
+// string. review/260831 UT-9.
+func appendTimeOfDay(dst []byte, micros int64) []byte {
 	if micros < 0 {
-		neg = "-"
+		dst = append(dst, '-')
 		micros = -micros
 	}
 	h := micros / usecsPerHour
@@ -157,12 +209,26 @@ func formatTimeOfDay(micros int64) string {
 	rem %= usecsPerMinute
 	s := rem / usecsPerSec
 	frac := rem % usecsPerSec
-	out := neg + fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	dst = appendPad2(dst, int(h))
+	dst = append(dst, ':')
+	dst = appendPad2(dst, int(m))
+	dst = append(dst, ':')
+	dst = appendPad2(dst, int(s))
 	if frac != 0 {
-		f := strings.TrimRight(fmt.Sprintf("%06d", frac), "0")
-		out += "." + f
+		dst = append(dst, '.')
+		var digits [6]byte
+		v := frac
+		for i := 5; i >= 0; i-- {
+			digits[i] = byte('0' + v%10)
+			v /= 10
+		}
+		end := 6
+		for end > 0 && digits[end-1] == '0' {
+			end--
+		}
+		dst = append(dst, digits[:end]...)
 	}
-	return out
+	return dst
 }
 
 // j2date is the port of upstream j2date (postgres/src/backend/utils/adt/
