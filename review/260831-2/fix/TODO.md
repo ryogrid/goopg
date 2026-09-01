@@ -110,7 +110,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | NB-4 | low | `access/nbtree/btree.go:descendToLeaf` — wrong sentinel disables the rightmost-leaf cache | ? | [ ] | |
 | NB-5 | low | `access/nbtree/btree.go:tryInsertOnCachedRightmost` — no deleted/half-dead page check | ? | [ ] | |
 | TA-3 | low | `transam/manager.go:Begin` — auto-assign path skips isolation-level validation | ? | [ ] | |
-| TA-4 | low | `transam/manager.go:AcquireConnSlot` — int32 cursor overflow → negative modulo | BUG | [ ] | pending gate |
+| TA-4 | low | `transam/manager.go:AcquireConnSlot` — int32 cursor overflow → negative modulo | BUG | [x] fixed + guarded | this commit |
 | TA-5 | low | `transam/clog.go:GetStatus` — nil `pool` dereference vs the nil-safe contract elsewhere | NOT A BUG | [x] | — |
 | TA-6 | low | `multixact/multixact.go:StatusesConflict` — invalid Status indexes out of bounds | NOT A BUG | [x] | — |
 | NP-2 | low | `plpgsql/parser.go:parseSQLStmt` — `SELECT INTO x FROM t` yields a malformed query | ? | [ ] | |

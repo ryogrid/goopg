@@ -502,7 +502,13 @@ func (m *Manager) AcquireConnSlot() (int32, error) {
 	// that spacing while still never handing out a HELD slot.
 	start := m.connSlotCursor.Add(1)
 	for off := int32(0); off < int32(sz-1); off++ {
-		i := 1 + (start+off)%int32(sz-1)
+		// The cursor is a free-running int32: once it has handed out 2^31
+		// slots it wraps negative, and a negative modulo made `i` zero or
+		// negative — either silently handing out the reserved slot 0 or
+		// panicking on a negative index. Reducing through uint32 keeps the
+		// rotation in [0, sz-1) for every cursor value
+		// (review/260831-2 TA-4).
+		i := 1 + int32(uint32(start+off)%uint32(sz-1))
 		if m.procArray.slots[i].connHeld.CompareAndSwap(0, 1) {
 			return i, nil
 		}
