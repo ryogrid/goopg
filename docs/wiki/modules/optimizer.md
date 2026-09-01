@@ -82,20 +82,20 @@ func EstimateRows(n Node) int64                                                 
 func IsSmallDimensionSide(n Node) bool                                                          // cardinality.go:482
 func FoldConstants(e Expr) Expr                                                                 // foldconst.go:21
 func IsConstantPlanExpr(n Node) bool                                                             // plner.go:5500+, expr side
-func DeriveSubqueryTargetName(s *parser.SelectStmt) string                          // plner.go:5400+
-func ExprEqual(a, b Expr) bool                                                               // plner.go:14000+
-func ResolveExprWithoutAggregate(e parser.Expr, ctx resolveContext) (Expr, error)               // plner.go:13000+
-func RewriteInsertDefaultMarkers(n Node) Node                                                    // plner.go:10500+
-func ExprHasAggregate(e Expr) bool                                                             // plner.go:8300+
-func ExprHasWindowFunc(e Expr) bool                                                           // plner.go:8400+
+func deriveSubqueryTargetName(e parser.Expr) string                                   // plner.go:5755, unexported
+func exprEqual(a, b Expr) bool                                                               // plner.go, unexported
+func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error)                             // plner.go:13742, unexported
+func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) error                 // plner.go:10449, unexported
+func exprHasAggregate(e parser.Expr) bool                                                      // plner.go:8281, unexported
+func parserExprHasWindowFunc(e parser.Expr) bool                                              // plner.go:8449, unexported
 ```
 
 Feature gates (all wrap package atomics + env var kill-switches):
 
 | Gate function | Env var | Default | Effect |
 |---|---|---|---:|---:|---:|
-| `SetUnestPreDPEnabled` | `GOOPG_UNEST_PREDP` | on | Run pull-up before join search |
-| `SetSubqueryUnestEnabled` | `GOOPG_SUBQUERY_UNEST` | on | Sublink decorrelation |
+| `SetUnnestPreDPEnabled` | `GOOPG_UNEST_PREDP` | on | Run pull-up before join search |
+| `SetSubqueryUnnestEnabled` | `GOOPG_SUBQUERY_UNEST` | on | Sublink decorrelation |
 | `SetIndexKeyHarvestEnabled` | `GOOPG_INDEXKEY_HARVEST` | on | Harvest inner-index params for NLI |
 | `SetNLIEnabled` | `GOOPG_NLI` | on | Rewrite joins to NLI |
 | `SetNLICostGateLegacy` | `GOOPG_NLI_COST_GATE` | off | Use old cost gate for NLI |
@@ -499,15 +499,15 @@ indirection-star expansion.
 
 ## Subquery target name derivation
 
-`DeriveSubqueryTargetName` generates a stable column name for a subquery
+`deriveSubqueryTargetName` (unexported) generates a stable column name for a subquery
 output (e.g. `"t"."col"` from `SELECT col FROM t`). Used by the executor's
 `TargetEntry` rendering and by `pg_stat_activity` query display.
 
 ## Expression equality and hashing
 
-`ExprEqual` (planner.go:14000+) is a deep structural comparison of two
+`exprEqual` (unexported) is a deep structural comparison of two
 `optimizer.Expr` trees. It is used by the equivalence-class inference and
-by the `ExprHasAggregate`/`ExprHasWindowFunc` predicates. The comparison
+by the `exprHasAggregate`/`parserExprHasWindowFunc` predicates. The comparison
 is structural, not semantic — `a+b` and `b+a` are NOT equal.
 
 ## Plan node deep copy (`copy.go`)
@@ -729,7 +729,7 @@ gated by `GOOPG_MINMAX_REWRITE` (default on).
 
 ## Boolean test simplification
 
-`ExprHasAggregate`/`ExprHasWindowFunc` are used by the WHERE clause checker
+`exprHasAggregate`/`parserExprHasWindowFunc` (both unexported) are used by the WHERE clause checker
 to reject aggregates/window functions in WHERE (42803 error). The check is:
 if the expression contains an aggregate or window function call, it's an
 error — matching PG's `check_ungrouped_columns` semantics.

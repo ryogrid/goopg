@@ -79,7 +79,7 @@ The central relation record with ~60 fields:
 
 - `Type` (`Type{Name, Args, IsArray}` where `Name` is the *element* type name for arrays)
 - `Ordinal`, `Dropped` (slot retained), `MissingValue any` (attmissingval, typed `any` to dodge import cycle)
-- Identity: `IdentityGen` ("a"/"d"/""), `IdentityStart`, `IdentityIncrement`, `IdentityMin`, `IdentityMax`, `IdentityCache`, `IdentityCycle`
+- Identity: `IdentityColumn`/`IdentityAlways` (bool, distinguishes ALWAYS vs DEFAULT), `IdentityStart`, `IdentityIncrement`, `IdentityMin`, `IdentityMax`, `IdentityCache`, `IdentityCycle`
 - `GeneratedExpr string` (STORED generated columns), `GeneratedVirtual` (note: still materialized STORED)
 - ~15 dump-only fidelity fields: `Storage`, `Compression`, `StatTarget`, `Options`, `Collation`, `FDWOptions`, `Local`, `InhCount`, `IsLocal`
 
@@ -249,8 +249,8 @@ The split is deliberate and asymmetric:
   `global/1262` (not per-database). `SharedCatalogRelFileNode` routes it.
   Startup reload in `loadSystemCatalogsIfPresent` reads it.
 - **pg_proc heap** — user-defined routines write physical pg_proc/pg_aggregate
-  heap rows via `writeRoutineHeapRowWithIndexes` (initdb recovery path) and
-  `applyRoutineHeapRow` (runtime CREATE/ALTER). The `Routines` registry carries
+  heap rows via `bootstrapPgProcTuples` (initdb recovery path) and
+  `syncRoutineToCatalogHeap` (runtime CREATE/ALTER). The `Routines` registry carries
   `heapTIDs map[uint32]SchemaHeapTID` for O(1) heap UPDATE.
 - Everything else — pg_namespace, pg_constraint, pg_depend, pg_stat_*,
   information_schema.* — is a virtual builder.
@@ -278,7 +278,7 @@ flowchart TD
         pg_inherits[pg_inherits]
     end
     pg_class -.->|"syncTableToCatalogHeap"| pg_class_heap
-    pg_proc_virtual -.->|"writeRoutineHeapRow"| pg_proc_heap
+    pg_proc_virtual -.->|"syncRoutineToCatalogHeap"| pg_proc_heap
 ```
 
 ## Lifecycle
@@ -590,9 +590,9 @@ This 13,623-line generated file provides three maps:
 
 These are consumed by:
 - `pg_node_oid_lookup.go` — builds forward indexes `LookupProcForNode`/`LookupOperatorForNode`
-- `regproc.go` — `RegprocName`, `RegprocedureName`, `RegprocNameAndSchema`
+- `regproc.go` — `RegprocName`, `RegprocedureName`, `RegprocedureNameAndSchema`
 - `initdb` — pg_proc heap row bootstrap
-- pg_proc virtual row builder — `PGProcRows` family
+- pg_proc virtual row builder — `registerPgProcView` / `BuiltinProcs`
 
 ## `Routines` registry details (`routines.go`)
 
@@ -728,7 +728,7 @@ sequenceDiagram
 - **Sibling renderers** — the virtual pg_class builder and the heap-written
   pg_class row are two renderers of the same object; changes must land in both
   or pg_dump/PG-standby and `\d` disagree. Same for pg_proc (virtual rows from
-  `Routines` registry + heap rows from `writeRoutineHeapRowWithIndexes`).
+  `Routines` registry + heap rows from `syncRoutineToCatalogHeap`).
 - **Do not "fix" the db 5→1 mapping** — making postgres connections use their
   own namespace makes every existing table vanish (`catalog.go:24910–23961`).
 - **The live "postgres" database's displayed OID must stay the 16384 placeholder** —
@@ -1040,7 +1040,7 @@ The `Routine` struct (35 fields) tracks:
 - Signature: `ArgTypes []string`, `ArgTypeOIDs []uint32`,
   `ArgTypeSchemas []string`, `ArgDefaults []string`, `ArgModes []string`,
   `ArgNames []string`, `ReturnType string`, `ReturnTypeSet bool`.
-- Behavior: `Volatility`, `Strict`, `SecurityDefiner`, `LeakProof`,
+- Behavior: `Volatility`, `Strict`, `SecurityDefiner`, `Leakproof`,
   `ParallelSafe`, `Cost`, `Rows`.
 - Body: `Body string` (SQL/PL/pgSQL source), `Bin string` (C library path),
   `Prosrc string` (the SQL body text), `Config []string` (proconfig SET).

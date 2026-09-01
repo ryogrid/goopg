@@ -250,7 +250,7 @@ sequenceDiagram
 - `Append` (single record) vs `AppendRaw` (pre-assembled stream) — `AppendRaw`
   bypasses the per-record header wrap, used by the standby/streaming path.
 - `mem_ring_concurrent.go` publishes a drained tail with CAS; `tryAppend`/
-  `tryAppendRwMutex` are the two insertion paths (`wal_buffer.go` tracks
+  `append` are the two insertion paths (`wal_buffer.go` tracks
   reserved bytes against the write frontier).
 
 ### Record layout
@@ -258,7 +258,7 @@ sequenceDiagram
 Each record has a header (`RecordKind` byte + flags + payload length +
 `xl_prev` backpointer) and an optional body; `format.go` keeps the wire layout
 PG-compatible. For PG-authored WAL the `XLogRecord` header is decoded with
-`SizeOfXLogRecord`, `SizeOfXLogRecordHeader`, `SizeOfXLogRecordHeaderMax` and
+`SizeOfXLogRecord` (24 bytes, the only header-size constant in `format.go`) and
 the block-ref trailer. Record kinds cover:
 
 - **heap**: insert, delete, update, multi-insert, hot-update, lock, prune-opt,
@@ -390,7 +390,7 @@ handle the `000000010000000000000001` naming scheme.
 
 The Writer's `Config` struct specifies segment size (default 16 MB), WAL
 buffers capacity, `pageHeaders` flag (whether to emit PG-format page headers),
-and the `WalSegmentSize` GUC. `IsValidWalSegSize` checks that the size is a
+and the `SegmentSize` config field. `IsValidWalSegSize` checks that the size is a
 power of 2 between 1 MB and 1 GB.
 
 ## Key flow: WAL record append and flush
@@ -463,7 +463,7 @@ sequenceDiagram
   hold their LSN ordering.
 - **Segment preallocation is eager, not lazy** — `eagerPreallocSegment` zeroes
   a future segment in a background worker so the write path never blocks on
-  allocation mid-commit; `predict_xlog_record_len`/`predict_emitted_size`
+  allocation mid-commit; `predictXLogRecordLen`/`predictEmittedSize`
   reserve the exact bytes a record will occupy before the ring append.
 - **The redo path is the second writer** — every `replay*` mutation mutates
   pages the same way the primary path does, including pd_lsn stamping
@@ -482,11 +482,11 @@ sequenceDiagram
 - **`AIOEngine` interface** — the Writer can optionally use an io_uring engine
   for async segment writes. The `Config.AIOEngine` field wires it at startup;
   without it, segment writes are synchronous `pwrite` + `fdatasync`.
-- **`removeOldSegmentsWithEstimate`** — the checkpointer can call
+- **`RemoveOldSegmentsWithEstimate`** — the checkpointer can call
   `RemoveOldSegmentsWithEstimate` with a distance-estimate and completion target
   to pace segment recycling, avoiding a burst of I/O when many segments are freed
   at once.
-- **`bufferDrainReason` enum** — the drain path records why a buffer drain was
+- **`drainReason` enum** — the drain path records why a buffer drain was
   triggered (overflow, flush, shutdown) via `drainReason` counters for telemetry.
 
 ## Record kind constants (`recovery.go`)
@@ -542,8 +542,8 @@ emitted in PG's `XLogRecord` format. The assembly path:
    block-ref arrays when needed.
 
 `pg_assembled_emit.go` provides the per-record-kind encoders that produce
-PG-canonical output: `EncodePGHeapInsert`, `EncodePGHeapUpdate`,
-`EncodePGHeapDelete`, `EncodePGXactCommit`, `EncodePGXactAbort`, etc.
+PG-canonical output: `EncodeHeapInsertPG`, `EncodeHeapUpdatePG`,
+`EncodeHeapDeletePG`, `EncodeXactCommitPG`, `EncodeXactAbortPG`, etc.
 
 ## Writer state machine (`writer.go`)
 
@@ -564,7 +564,7 @@ type state struct {
 
 `tryAppend` is the lock-free fast path: it CAS-increments the ring head,
 copies the payload, and returns the LSN. If the ring is full, it falls back
-to `tryAppendRwMutex`, which acquires the write lock and drains the ring
+to `append`, which acquires the write lock and drains the ring
 before retrying.
 
 `append` is the general path: it reserves bytes in the ring, copies the
@@ -616,8 +616,8 @@ updates the confirmed flush LSN in the slot file atomically.
 
 ## SyncRep (`syncrep.go`)
 
-Synchronous replication mode: `SyncRepMode` is `SYNC_REP_OFF`, `SYNC_REP_QUORUM`,
-or `SYNC_REP_PRIORITY`. `syncrep_parse.go` parses the `synchronous_standby_names`
+Synchronous replication mode: `SyncRepMode` is `SyncRepOff`, `SyncRepRemoteWrite`,
+`SyncRepRemoteFlush`, or `SyncRepRemoteApply`. `syncrep_parse.go` parses the `synchronous_standby_names`
 GUC into a list of standby names with quorum/priority syntax.
 
 `WaitForLSN` blocks the committing backend until the standby acknowledges
@@ -678,12 +678,12 @@ MemRing's reserved space. `PageHeaders=true` produces PG-compatible WAL;
 The `MemRing` is a circular buffer of `blockSize`-aligned pages. The
 concurrent access model:
 
-- `tryAppend` CAS-increments `ringHead` (the reservation pointer). If the
+- `tryAppend` CAS-increments `head` (the reservation pointer). If the
   CAS succeeds, the caller owns the slot and can write the payload.
-- `tryAppendRwMutex` is the fallback: it acquires the write lock, drains
+- `append` is the fallback: it acquires the write lock, drains
   the ring, and retries.
 - `drainBufferBytes` is called by the writer goroutine: it advances
-  `ringDrain` (the committed pointer) and writes the drained pages to the
+  `tail` (the committed pointer) and writes the drained pages to the
   segment file.
 - `Subscribe`/`Unsubscribe` allow listeners (e.g., the walwriter goroutine
   and the walsender) to be notified when new data is available.
@@ -787,8 +787,8 @@ emitted in PG's `XLogRecord` format. The assembly path:
    block-ref arrays when needed.
 
 `pg_assembled_emit.go` provides the per-record-kind encoders that produce
-PG-canonical output: `EncodePGHeapInsert`, `EncodePGHeapUpdate`,
-`EncodePGHeapDelete`, `EncodePGXactCommit`, `EncodePGXactAbort`, etc.
+PG-canonical output: `EncodeHeapInsertPG`, `EncodeHeapUpdatePG`,
+`EncodeHeapDeletePG`, `EncodeXactCommitPG`, `EncodeXactAbortPG`, etc.
 
 ## Writer state machine (`writer.go`)
 
@@ -809,7 +809,7 @@ type state struct {
 
 `tryAppend` is the lock-free fast path: it CAS-increments the ring head,
 copies the payload, and returns the LSN. If the ring is full, it falls back
-to `tryAppendRwMutex`, which acquires the write lock and drains the ring
+to `append`, which acquires the write lock and drains the ring
 before retrying.
 
 `append` is the general path: it reserves bytes in the ring, copies the
@@ -861,8 +861,8 @@ updates the confirmed flush LSN in the slot file atomically.
 
 ## SyncRep (`syncrep.go`)
 
-Synchronous replication mode: `SyncRepMode` is `SYNC_REP_OFF`, `SYNC_REP_QUORUM`,
-or `SYNC_REP_PRIORITY`. `syncrep_parse.go` parses the `synchronous_standby_names`
+Synchronous replication mode: `SyncRepMode` is `SyncRepOff`, `SyncRepRemoteWrite`,
+`SyncRepRemoteFlush`, or `SyncRepRemoteApply`. `syncrep_parse.go` parses the `synchronous_standby_names`
 GUC into a list of standby names with quorum/priority syntax.
 
 `WaitForLSN` blocks the committing backend until the standby acknowledges
