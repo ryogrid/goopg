@@ -1240,6 +1240,16 @@ func pgAttTypmod(typOID uint32, args []int64) int64 {
 		if len(args) >= 1 {
 			return args[0]
 		}
+	case 1083, 1266, 1114, 1184: // time / timetz / timestamp / timestamptz:
+		// the fractional-seconds precision, stored raw
+		// (anytime_typmodin / anytimestamp_typmodin return `p` itself, with no
+		// VARHDRSZ offset). Without these arms `time(3)` and `timestamp(2)`
+		// reported atttypmod -1 where PG 18.3 reports 3 and 2, which loses the
+		// precision on any client that reconstructs the type from the catalog
+		// — pg_dump included (review/260831-2, found while checking ES-4).
+		if len(args) >= 1 {
+			return args[0]
+		}
 	case 1186: // interval: the packed INTERVAL_TYPMOD, stored raw (no VARHDRSZ
 		// offset, unlike numeric/char — intervaltypmodin returns the packed value
 		// directly). Args[0] IS the packed typmod the parser produced.
