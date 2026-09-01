@@ -259,6 +259,9 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			tgtRow  Row
 		}
 		var visible []scannedTuple
+		// onScratch backs the ON-condition row for every (target, source) pair
+		// on this page (review/260831 EO2-12).
+		var onScratch Row
 		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
 			tuple, err := storage.PageGetHeapTuple(page, slotIdx)
 			if err != nil {
@@ -289,7 +292,13 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				vtTgtRow = remapRowForPartition(scanTbl.Columns, tbl.Columns, vt.tgtRow)
 			}
 			for si := range srcRows {
-				combined := mergedRow(vtTgtRow, srcRows[si].row)
+				// review/260831 EO2-12: the ON condition is evaluated for every
+				// (target, source) pair, and each evaluation used to allocate the
+				// concatenated row. The buffer is reused across the whole scan:
+				// nothing retains `combined` — the pending mod stores its own
+				// copies of the source and target rows.
+				onScratch = appendMergedRow(onScratch, vtTgtRow, srcRows[si].row)
+				combined := onScratch
 				v, err := evalExpr(o.plan.On, combined, o.ctx)
 				if err != nil {
 					continue
@@ -803,6 +812,15 @@ func mergedRow(tgt, src Row) Row {
 	copy(out, tgt)
 	copy(out[len(tgt):], src)
 	return out
+}
+
+// appendMergedRow is mergedRow into a caller-owned buffer: it rewrites dst
+// (from index 0) with tgt||src and returns it, so a loop that only needs the
+// concatenation to evaluate an expression does not allocate per iteration.
+// review/260831 EO2-12.
+func appendMergedRow(dst, tgt, src Row) Row {
+	dst = append(dst[:0], tgt...)
+	return append(dst, src...)
 }
 
 // mergeClauseCondMatches reports whether clause.Condition is nil (always matches)
