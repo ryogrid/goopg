@@ -1016,6 +1016,49 @@ of the join tree, searches the INNER prefix below them, then splices the links
 back. Without it, every TPC-DS query with an outer join would be declined from
 the search.
 
+### GEQO (genetic query optimizer, `geqo.go`)
+
+When a query has `>= geqo_threshold` base relations (default 12) and the `geqo`
+GUC is ON (default), the DP's enumeration over subsets (3^16 ≈ 43 M for a
+16-relation query) becomes prohibitively expensive. goopg reproduces PG's
+answer: switch to a **genetic query optimizer** — a randomised search that
+treats join order as a constrained TSP and evolves a near-optimal plan without
+enumerating every subset. Design: `docs/design/0100-0149/m0134-0190-geqo-genetic-query-optimizer.md`.
+
+The dispatch lives in `searchOneProblem` (`relfromjoinlist.go`): when
+`GeqoEnabled() && len(items) >= GeqoThreshold()`, `geqoSearch` runs instead of
+the DP `joinSearch`. `geqo` / `geqo_threshold` are bridged from the GUC registry
+to process-global atomics in `cmd/goopg/main.go` (the same `OnChange` pattern as
+`enable_memoize`), so `SET geqo = off` and `SET geqo_threshold = N` take effect.
+The other `geqo_*` tuning GUCs stay accepted but use PG's defaults (effort 5,
+pool = `2^(nrels+1)` clamped to `[10·effort, 50·effort]`, generations = pool
+size, bias 2.0), since the planner has no session in scope to read them.
+
+The GA loop (PG `geqo` / geqo_main.c):
+
+1. **Pool init**: `pool_size` random permutations of `1..nrels` (inside-out
+   Fisher-Yates `initTour`), each fitness-scored by `geqoEval`; invalid tours
+   (`math.MaxFloat64`) are discarded; the pool is sorted ascending by cost.
+2. **Selection**: `geqoSelection` picks two parents with linear bias
+   (`linearRand`, f(x) = bias − 2(bias−1)x).
+3. **ERX crossover**: `gimmeEdgeTable` + `gimmeTour` build a child tour with
+   edge-recombination crossover, preserving parent adjacency; shared edges are
+   preferred, then fewest-unused-edges with a random tie-break (`gimmeGene`),
+   with `edgeFailure` fallbacks (total_edges==4 → remaining → last unused).
+4. **Evaluation**: `geqoEval` → `gimmeTree` (clump merging) → cheapest path cost.
+5. **Replacement**: `spreadChromosome` inserts the child into the sorted pool,
+   displacing the worst.
+6. **Result**: after `generations` iterations, the best tour becomes the plan.
+
+`geqoEval` runs in a **fresh context per evaluation** (`freshEvalCtx`) — PG's
+temporary memory context + `join_rel_list` truncation — so one tour's
+`makeJoinRel` find-or-create never prices another tour's stale joinrels.
+`gimmeTree`'s `mergeClump` calls `setCheapest` after each `makeJoinRel`
+(mirroring `merge_clump`, geqo_eval.c:280) so a grown clump's `CheapestTotal`
+is ready for the next merge. GEQO reuses the same `joinRelBuilder`
+(`sizeJoinRel` + `addPathsToJoinrel`) as the DP, so both strategies produce
+comparable costs.
+
 ### Coordinate spaces (the #1 silent-bug source)
 
 Column refs are resolved in binding-offset space (pre-search). The search
