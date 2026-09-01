@@ -69,6 +69,10 @@ type recursiveUnionOp struct {
 	done     bool
 	depth    int // iteration counter for maxRecursiveDepth guard
 	ctx      *Context
+	// slot is reused across emissions (review/260831 EO2-24); the returned
+	// pointer is stable and its row field is overwritten each Next, as in
+	// indexScanOp (M0092-0007).
+	slot MaterializedSlot
 }
 
 func newRecursiveUnionOp(p *optimizer.RecursiveUnion, anchor, recursive Operator) *recursiveUnionOp {
@@ -208,7 +212,9 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 
 	row := o.output[o.outIdx]
 	o.outIdx++
-	return asSlot(o.Schema(), row), nil
+	o.slot.schema = o.Schema()
+	o.slot.row = row
+	return &o.slot, nil
 }
 
 // rowKey builds a string key for row deduplication. M0097-0006.
@@ -269,6 +275,8 @@ type workTableScanOp struct {
 	plan *optimizer.WorkTableScan
 	ctx  *Context
 	idx  int
+	// slot is reused across emissions (review/260831 EO2-24).
+	slot MaterializedSlot
 }
 
 func newWorkTableScanOp(p *optimizer.WorkTableScan) *workTableScanOp {
@@ -291,5 +299,7 @@ func (o *workTableScanOp) Next() (TupleSlot, error) {
 	}
 	row := o.ctx.WorkTableRows[o.idx]
 	o.idx++
-	return asSlot(o.Schema(), row), nil
+	o.slot.schema = o.Schema()
+	o.slot.row = row
+	return &o.slot, nil
 }

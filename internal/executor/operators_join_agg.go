@@ -42,6 +42,11 @@ type joinOp struct {
 	right  Operator
 	schema optimizer.Schema
 
+	// slot is reused across emissions (review/260831 EO2-24); the returned
+	// pointer is stable and its row field is overwritten each Next, exactly
+	// as indexScanOp's is.
+	slot MaterializedSlot
+
 	ctx *Context
 
 	// M0036 lazy-output state (hash join only)
@@ -427,7 +432,15 @@ func (o *joinOp) nextMerge() (TupleSlot, error) {
 	if err != nil {
 		return nil, err
 	}
-	return asSlot(o.Schema(), row), nil
+	if row == nil {
+		return nil, nil
+	}
+	// review/260831 EO2-24: emit through the operator's own slot instead of
+	// allocating a MaterializedSlot per row. Same idiom, and same
+	// "valid until the next Next()" contract, as indexScanOp (M0092-0007).
+	o.slot.schema = o.schema
+	o.slot.row = row
+	return &o.slot, nil
 }
 
 // lateralBindable is implemented by FROM-clause SRFs that can have
@@ -1807,6 +1820,8 @@ type aggregateOp struct {
 	plan   *optimizer.Aggregate
 	child  Operator
 	schema optimizer.Schema
+	// slot is reused across emissions (review/260831 EO2-24).
+	slot MaterializedSlot
 
 	ctx  *Context
 	rows []Row
@@ -4066,7 +4081,10 @@ func (o *aggregateOp) Next() (TupleSlot, error) {
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return asSlot(o.schema, row), nil
+	// review/260831 EO2-24: reuse the operator's slot (see joinOp.nextMerge).
+	o.slot.schema = o.schema
+	o.slot.row = row
+	return &o.slot, nil
 }
 
 func (o *aggregateOp) Close() error {
