@@ -249,6 +249,18 @@ func regoperatorNameAndArgs(s string) (name, leftType, rightType string, ok bool
 	return strings.TrimSpace(s[:open]), leftType, rightType, true
 }
 
+// schemaExistsForReg reports whether a schema name is registered, so the reg*
+// input functions can raise PG's 3F000 for a qualifier that names nothing. A
+// catalog that is not the in-memory one cannot be asked, and answers "yes" so
+// the resolution below is reached rather than a spurious error raised.
+func schemaExistsForReg(ctx *Context, schema string) bool {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return true
+	}
+	return im.SchemaExists(schema)
+}
+
 func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum, error) {
 	if v.Kind != KindString {
 		// numeric literal / already-OID datum — the heap arm range-checks.
@@ -331,11 +343,33 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		// double-quoted name must be unquoted first; splitting also hands
 		// userTypeOIDForName a bare name, letting a schema-qualified user type
 		// resolve instead of dying as `schema.type` in a bare-name lookup.
-		if oid := catalog.TypeNameToOID(typeName); oid != catalog.OIDText || strings.EqualFold(typeName, "text") {
+		// A schema qualifier is not decoration: regtypein runs the parsed name
+		// through parseTypeString -> LookupTypeName, which resolves the schema
+		// first and raises 3F000 when it does not exist, then looks for the type
+		// in THAT schema only. goopg used to drop the qualifier on the floor, so
+		// `public.int4`, `nosuchschema.int4` and `nosuchschema.ct` all resolved
+		// as if written bare (review/260831-2 ES-8).
+		//
+		// Built-in types live in pg_catalog, and that is the only schema they
+		// answer to. User types are the one case goopg cannot check: its
+		// catalog stores them without a namespace (a second `CREATE TYPE
+		// s2.ct` is refused as a duplicate), so a qualified user type is
+		// resolved by bare name once its schema is known to exist — no worse
+		// than before, and PG-correct for every schema-less spelling. The
+		// residual is the missing per-schema type namespace, not this arm.
+		if schema != "" && !schemaExistsForReg(ctx, schema) {
+			return NullDatum, &ExecError{Code: "3F000", Pos: pos,
+				Message: fmt.Sprintf("schema %q does not exist", schema)}
+		}
+		builtinVisible := schema == "" || strings.EqualFold(schema, "pg_catalog")
+		if oid := catalog.TypeNameToOID(typeName); builtinVisible &&
+			(oid != catalog.OIDText || strings.EqualFold(typeName, "text")) {
 			return NewIntDatum(int64(oid)), nil
 		}
-		if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok {
-			return NewIntDatum(int64(oid)), nil
+		if !strings.EqualFold(schema, "pg_catalog") {
+			if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok {
+				return NewIntDatum(int64(oid)), nil
+			}
 		}
 		return NullDatum, &ExecError{Code: "42704", Pos: pos,
 			Message: fmt.Sprintf("type %q does not exist", regDisplayName(schema, typeName))}
