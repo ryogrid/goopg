@@ -44,7 +44,7 @@ classDiagram
     Record --> RecordKind : kind byte
     Record --> XLogPageHeader : page framing (8 KiB pages)
     Record "many" --> MemRing : appended
-    note right of Record: xl_prev backpointer chain; validated by reader / pg_waldump
+    note right of Record: "xl_prev backpointer chain; validated by reader / pg_waldump"
 ```
 
 ## Ring Buffer Append
