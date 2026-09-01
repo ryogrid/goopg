@@ -1117,6 +1117,16 @@ func varlenaTextBytes(s string) []byte {
 // the PG timestamp encoding).
 var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
 
+// maxDateDaysForMicros / minDateDaysForMicros bound the days-since-2000 range
+// whose conversion to Unix microseconds still fits in int64. PG's date type
+// reaches far past this (5874897 AD); the sentinels aside, a date beyond the
+// bound cannot be represented as micros at all (review/260831-2 EC-5).
+const (
+	microsPerDay         = int64(24 * 3600 * 1000000)
+	maxDateDaysForMicros = int32((math.MaxInt64 - 946684800000000) / microsPerDay)
+	minDateDaysForMicros = int32((math.MinInt64 + 946684800000000) / microsPerDay)
+)
+
 // pgTimeMicros extracts the microseconds-since-midnight that PG's TimeADT holds
 // from the time.Time carrier of a `time`/`timetz` Datum.
 //
@@ -1684,6 +1694,16 @@ func decodePhysicalPGValueLowered(t catalog.Type, tname string, data []byte, sct
 			return NewDateInfinity(true), 4, nil
 		case math.MinInt32:
 			return NewDateInfinity(false), 4, nil
+		}
+		// Outside the sentinels PG still spans 4714 BC .. 5874897 AD, and the
+		// micros arithmetic below overflows int64 well before that upper end
+		// (~year 294247), wrapping a far-future date into a garbage near-past
+		// one. goopg's own date input already refuses anything outside Go's
+		// time range, so this only guards a heap written by real PG — but
+		// silently decoding it wrong is worse than saying so
+		// (review/260831-2 EC-5).
+		if days > maxDateDaysForMicros || days < minDateDaysForMicros {
+			return Datum{}, 0, fmt.Errorf("date out of range: %d days from 2000-01-01", days)
 		}
 		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
 		// Tag as DATE (TimeSubDate) so a storage-decoded date renders identically
