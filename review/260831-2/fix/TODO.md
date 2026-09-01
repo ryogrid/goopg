@@ -41,8 +41,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 
 | id | sev | finding | verdict | status | commit |
 |---|---|---|---|---|---|
-| EC-1 | med | `executor/codec.go:parseIntegerInput` — base-0 ParseInt treats leading `0` as octal | BUG | [x] | this commit |
-| EC-2 | med | `executor/btree_array_key.go:encodeArrayBTreeKey` — quoted `"NULL"` element encoded as SQL NULL | ? | [ ] | |
+| EC-1 | med | `executor/codec.go:parseIntegerInput` — base-0 ParseInt treats leading `0` as octal | BUG | [x] | ed634f2c9 |
+| EC-2 | med | `executor/btree_array_key.go:encodeArrayBTreeKey` — quoted `"NULL"` element encoded as SQL NULL | BUG | [x] | this commit |
 | EC-4 | med | `executor/copy.go:PushBinaryData` — binary COPY FROM skips defaults / NOT NULL / CHECK | ? | [ ] | |
 | EO1-1 | med | `executor/operators_call.go:callOp.Next` — IN/INOUT arg after an OUT param reads the wrong slot | ? | [ ] | |
 | EO1-3 | med | `executor/operators.go:limitOp.Next` — `LIMIT 0 ... WITH TIES` panics on nil tieKeyVals | ? | [ ] | |
@@ -261,3 +261,17 @@ landed.
   Guard: `TestParseIntegerInputLeadingZeroIsDecimal`. Gates: units green;
   TPC-DS SF0.5 sweep on this build PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0
   TIMEOUT=0, plan shapes 99/99 identical; TPC-H spotcheck Q12/Q13 PASS.
+
+- 2026-09-01 **EC-2 = BUG (fixed).** `encodeArrayBTreeKey` split the array
+  literal with `parseTextArray`, which returns only the unquoted element
+  TEXT, then tagged any element equal to `NULL` as a SQL NULL. That erases
+  the one distinction the array syntax exists to carry: `{NULL}` is a null
+  element but `{"NULL"}` is the four-character string. Two rows differing
+  only in that quoting hashed to the same b-tree key, so an index lookup
+  for `'{"NULL"}'` could return the `{NULL}` row (PG's `ReadArrayStr`
+  treats the quoted form as a plain value). Fix: `parseTextArrayElems`
+  returns each element with a `Quoted` flag and the NULL tag is applied
+  only to unquoted `NULL`; `parseTextArray` stays a thin wrapper so the
+  other callers are unchanged. Guard:
+  `TestEncodeArrayBTreeKeyQuotedNullIsNotNull`. Gates: units green;
+  TPC-DS SF0.5 sweep PASS=95 MISMATCH=0, plan shapes 99/99 identical.

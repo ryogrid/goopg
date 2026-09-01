@@ -19401,14 +19401,39 @@ func arrayElemsSubset(sub, super []string) bool {
 func ParseTextArrayLiteral(s string) []string { return parseTextArray(s) }
 
 func parseTextArray(s string) []string {
+	elems := parseTextArrayElems(s)
+	if elems == nil {
+		return nil
+	}
+	out := make([]string, len(elems))
+	for i, e := range elems {
+		out[i] = e.Text
+	}
+	return out
+}
+
+// textArrayElem is one element of an array literal together with the one bit
+// the unquoted text cannot carry: whether the element WAS quoted. `{NULL}` is
+// an array holding a NULL, `{"NULL"}` an array holding the four-character
+// string — PG's ReadArrayStr only accepts the unquoted, unescaped spelling as
+// the NULL token, and callers that special-case NULL have to make the same
+// distinction (review/260831-2 EC-2).
+type textArrayElem struct {
+	Text   string
+	Quoted bool
+}
+
+// parseTextArrayElems is parseTextArray's quoted-ness-preserving twin; the two
+// must stay in sync because they are the same scan.
+func parseTextArrayElems(s string) []textArrayElem {
 	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
-		return []string{s}
+		return []textArrayElem{{Text: s}}
 	}
 	inner := s[1 : len(s)-1]
 	if inner == "" {
 		return nil
 	}
-	var elems []string
+	var elems []textArrayElem
 	i := 0
 	for i < len(inner) {
 		// PG's ReadArrayStr (postgres/src/backend/utils/adt/arrayfuncs.c)
@@ -19441,14 +19466,14 @@ func parseTextArray(s string) []string {
 					i++
 				}
 			}
-			elems = append(elems, sb.String())
+			elems = append(elems, textArrayElem{Text: sb.String(), Quoted: true})
 		} else {
 			// Unquoted element: read until comma or end.
 			start := i
 			for i < len(inner) && inner[i] != ',' {
 				i++
 			}
-			elems = append(elems, inner[start:i])
+			elems = append(elems, textArrayElem{Text: inner[start:i]})
 		}
 		if i < len(inner) && inner[i] == ',' {
 			i++

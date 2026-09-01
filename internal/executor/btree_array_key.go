@@ -114,17 +114,24 @@ func encodeArrayBTreeKey(ctx *Context, v Datum, col *catalog.Column, pos int) ([
 	elemCol := catalog.Column{Name: col.Name, Type: catalog.Type{Name: col.Type.Name}}
 
 	out := make([]byte, 0, 8)
-	for _, e := range parseTextArray(s) {
+	for _, e := range parseTextArrayElems(s) {
 		// An unquoted NULL token is PG's array NULL (case-insensitive,
 		// array_in). goopg's heap codec rejects NULL elements outright
 		// (encodeArrayValuePG), so this arm is reachable only from a probe key
 		// built out of a query literal; encoding it correctly is still required
 		// so the probe lands where array_cmp says it belongs.
-		if strings.EqualFold(strings.TrimSpace(e), "NULL") {
+		//
+		// QUOTED is the whole distinction: `{NULL}` is a NULL element,
+		// `{"NULL"}` is the four-character string, and array_cmp sorts them at
+		// opposite ends. Keying off the unquoted text alone gave both the same
+		// bytes, so a text[] index could not tell them apart — an equality
+		// probe crossed over and a unique index saw a false duplicate
+		// (review/260831-2 EC-2).
+		if !e.Quoted && strings.EqualFold(strings.TrimSpace(e.Text), "NULL") {
 			out = append(out, arrayKeyElemNull)
 			continue
 		}
-		eb, encErr := encodeBTreeKeyForColumn(ctx, NewStringDatum(e), &elemCol, pos)
+		eb, encErr := encodeBTreeKeyForColumn(ctx, NewStringDatum(e.Text), &elemCol, pos)
 		if encErr != nil {
 			return nil, encErr
 		}
