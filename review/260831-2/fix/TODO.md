@@ -44,12 +44,12 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EC-1 | med | `executor/codec.go:parseIntegerInput` — base-0 ParseInt treats leading `0` as octal | BUG | [x] | ed634f2c9 |
 | EC-2 | med | `executor/btree_array_key.go:encodeArrayBTreeKey` — quoted `"NULL"` element encoded as SQL NULL | BUG | [x] | 9000565e7 |
 | EC-4 | med | `executor/copy.go:PushBinaryData` — binary COPY FROM skips defaults / NOT NULL / CHECK | BUG | [x] | 7f9f16784 |
-| EO1-1 | med | `executor/operators_call.go:callOp.Next` — IN/INOUT arg after an OUT param reads the wrong slot | BUG | [x] | this commit |
-| EO1-3 | med | `executor/operators.go:limitOp.Next` — `LIMIT 0 ... WITH TIES` panics on nil tieKeyVals | ? | [ ] | |
+| EO1-1 | med | `executor/operators_call.go:callOp.Next` — IN/INOUT arg after an OUT param reads the wrong slot | BUG | [x] | cf2eae0e2 |
+| EO1-3 | med | `executor/operators.go:limitOp.Next` — `LIMIT 0 ... WITH TIES` panics on nil tieKeyVals | BUG | [x] | this commit |
 | EO2-2 | med | `executor/operators_sequence.go:seqState.nextVal` — int64 overflow wraps instead of raising 2200H | ? | [ ] | |
 | EO2-3 | med | `executor/operators_project_set.go:openSelectSrfMode` — generate_series int64 overflow spins forever | ? | [ ] | |
 | EO2-4 | med | `executor/operators_recursive_cte.go:recursiveUnionOp.Open` — phase state not reset on re-open | ? | [ ] | |
-| EO2-5 | med | `executor/opnode.go:limitOpNext` — `FETCH FIRST 0 ROWS WITH TIES` panics on nil tieKeyVals | ? | [ ] | |
+| EO2-5 | med | `executor/opnode.go:limitOpNext` — `FETCH FIRST 0 ROWS WITH TIES` panics on nil tieKeyVals | BUG | [x] | this commit |
 | ES-6 | med | `executor/plpgsql_runtime.go:executePLpgSQLStmt (ForStmt)` — BY step not validated; zero/negative step infinite-loops | ? | [ ] | |
 | ES-7 | med | `executor/plpgsql_runtime.go:lowerPLpgSQLExpr (CastExpr)` — cast dropped in PL/pgSQL expressions | ? | [ ] | |
 | IN-2 | med | `initdb/catalog_cache.go:readCatalogCache` — silent partial catalog on TryRegisterUserTable failure | ? | [ ] | |
@@ -302,3 +302,18 @@ landed.
   positional list onto the non-OUT positions before that. Guard:
   `internal/executor/call_out_param_slot_test.go`. Gates: units green;
   TPC-DS SF0.5 sweep PASS=95 MISMATCH=0; TPC-H spotcheck Q12/Q13 PASS.
+
+- 2026-09-01 **EO1-3 / EO2-5 = BUG (fixed, one change).** Both LIMIT
+  implementations — `limitOp.Next` (operators.go, the Build+Run path) and
+  `limitOpNext` (opnode.go, the BuildFast path the live server uses) —
+  entered their WITH TIES comparison as soon as `emitted >= limitCount`.
+  For a count of ZERO that is true before any row has been emitted, so
+  `tieKeyVals` was still empty and the comparison indexed an empty Row:
+  `FETCH FIRST 0 ROWS WITH TIES` panicked the backend with "index out of
+  range [0] with length 0". PG returns no rows (nodeLimit.c never enters
+  the tie window with an empty boundary row). Fix: in both siblings, bail
+  out with EOF when the tie-key snapshot is empty. Guards:
+  `TestLimitZeroWithTiesReturnsNoRows` (Build+Run) and
+  `TestLimitZeroWithTiesReturnsNoRowsFast` (BuildFast) — each was verified
+  red by stashing only its own sibling's file. Gates: units green; TPC-DS
+  SF0.5 sweep PASS=95 MISMATCH=0; TPC-H spotcheck Q12/Q13 PASS.
