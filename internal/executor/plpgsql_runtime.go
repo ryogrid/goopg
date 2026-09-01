@@ -1512,10 +1512,21 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if err != nil {
 				return Datum{}, flowNone, err
 			}
-			if sv.IsNull() || sv.Kind != KindInt {
+			if sv.IsNull() {
+				// PG: pl_exec.c, ERRCODE_NULL_VALUE_NOT_ALLOWED.
+				return Datum{}, flowNone, &ExecError{Code: "22004", Pos: s.Pos(), Message: "BY value of FOR loop cannot be null"}
+			}
+			if sv.Kind != KindInt {
 				return Datum{}, flowNone, &ExecError{Code: "42804", Pos: s.Pos(), Message: "FOR loop step must be an integer"}
 			}
 			stepVal = sv.Int
+			// review/260831-2 ES-6: a zero or negative BY step used to reach
+			// the loops below, where `i += stepVal` never advances past the
+			// bound — the backend spun forever inside the function. PG
+			// rejects it up front (pl_exec.c, ERRCODE_INVALID_PARAMETER_VALUE).
+			if stepVal <= 0 {
+				return Datum{}, flowNone, &ExecError{Code: "22023", Pos: s.Pos(), Message: "BY value of FOR loop must be greater than zero"}
+			}
 		}
 		if lower.IsNull() || lower.Kind != KindInt || upper.IsNull() || upper.Kind != KindInt {
 			return Datum{}, flowNone, &ExecError{Code: "42804", Pos: s.Pos(), Message: "FOR loop bounds must be integers"}

@@ -48,9 +48,9 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EO1-3 | med | `executor/operators.go:limitOp.Next` — `LIMIT 0 ... WITH TIES` panics on nil tieKeyVals | BUG | [x] | 0e50eb19a |
 | EO2-2 | med | `executor/operators_sequence.go:seqState.nextVal` — int64 overflow wraps instead of raising 2200H | ? | [ ] | |
 | EO2-3 | med | `executor/operators_project_set.go:openSelectSrfMode` — generate_series int64 overflow spins forever | ? | [ ] | |
-| EO2-4 | med | `executor/operators_recursive_cte.go:recursiveUnionOp.Open` — phase state not reset on re-open | ? | [ ] | |
+| EO2-4 | med | `executor/operators_recursive_cte.go:recursiveUnionOp.Open` — phase state not reset on re-open | NOT A BUG | [x] | — |
 | EO2-5 | med | `executor/opnode.go:limitOpNext` — `FETCH FIRST 0 ROWS WITH TIES` panics on nil tieKeyVals | BUG | [x] | 0e50eb19a |
-| ES-6 | med | `executor/plpgsql_runtime.go:executePLpgSQLStmt (ForStmt)` — BY step not validated; zero/negative step infinite-loops | ? | [ ] | |
+| ES-6 | med | `executor/plpgsql_runtime.go:executePLpgSQLStmt (ForStmt)` — BY step not validated; zero/negative step infinite-loops | BUG | [x] | pending |
 | ES-7 | med | `executor/plpgsql_runtime.go:lowerPLpgSQLExpr (CastExpr)` — cast dropped in PL/pgSQL expressions | ? | [ ] | |
 | IN-2 | med | `initdb/catalog_cache.go:readCatalogCache` — silent partial catalog on TryRegisterUserTable failure | ? | [ ] | |
 | ST-3 | med | `storage/bufpool.go:pinLoad/evictVictim` — dirty victim content discarded when the flush fails | ? | [ ] | |
@@ -58,12 +58,12 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | ST-8 | med | `storage/freeze.go:PageFreezeOldTuples` — plain XID comparison breaks under wraparound | BUG | [x] | 8d5028fb3 |
 | NB-2 | med | `pglz/pglz.go:Decompress` — match length clamped instead of erroring on corrupt streams | NOT A BUG | [x] | — |
 | TA-2 | med | `transam/manager.go:AssignXID` — non-atomic read-check-allocate-store allows XID leak/double-assign | NOT A BUG | [x] | — |
-| NP-1 | med | `plpgsql/parser.go:parseFor` — FOR-query scan truncates on a `loop` identifier inside the SQL text | ? | [ ] | |
-| NP-5 | med | `plpgsql/parser.go:parseFor` — `isQueryFor` peeks only the first token; parenthesized bound misroutes | ? | [ ] | |
+| NP-1 | med | `plpgsql/parser.go:parseFor` — FOR-query scan truncates on a `loop` identifier inside the SQL text | NOT A BUG | [x] | — |
+| NP-5 | med | `plpgsql/parser.go:parseFor` — `isQueryFor` peeks only the first token; parenthesized bound misroutes | BUG | [ ] | pending gate |
 | OP1-2 | med | `optimizer/exprwalk.go:exprChildSlots` — FuncCall child slots omit Filter/Over/OrderBy/WithinGroup/Variadic | ? | [ ] | |
 | OP1-3 | med | `optimizer/createplannl.go:createNestLoopBitmapJoinPlan` — `bhs.BitmapQual = nil` drops recheck quals | ? | [ ] | |
 | XL-4 | med | `wal/slot_decoder.go:Run` — ConfirmedFlushLSN never advances for PG-format commit records | ? | [ ] | |
-| CP-2 | med | `postmaster/dispatch.go:normalizeSQLPreservingLiterals` — plan-cache key collision on quoted identifiers | ? | [ ] | |
+| CP-2 | med | `postmaster/dispatch.go:normalizeSQLPreservingLiterals` — plan-cache key collision on quoted identifiers | BUG | [ ] | pending gate |
 | UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | BUG | [x] | 306709703 |
 | UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | BUG | [x] | 00e35fbab |
 | UT-4 | med | `utils/mmgr/mctx.go:Context.Release` — mutates `c.children` while ranging over it | BUG | [x] | 370100352 |
@@ -416,3 +416,73 @@ landed.
   own XID under XidGenLock, never another backend's). Left as-is rather
   than adding a CAS that would still leak the losing XID; re-open this row
   if a parallel or background writer ever shares a procNum.
+
+- 2026-09-01 **EO2-4 = NOT A BUG (re-open unreachable).** `recursiveUnionOp.Open`
+  really does leave `initDone`/`done`/`outIdx`/`depth`/`output` intact, so a
+  second `Open` on the same operator would replay a finished fixpoint. But no
+  caller can do that. The only re-open path in the executor is the SubPlan
+  rescan machinery (`executor/subplan.go`), and `classifySubPlan` has no arm
+  for `*optimizer.RecursiveUnion`: it falls into `default: kind =
+  rescanRebuild`, i.e. any plan containing a recursive CTE is rebuilt from the
+  plan tree for every rescan, never re-Opened. The other per-outer-row replay
+  path is the `Rescan(outerSlot, outerWidth)` interface (nested-loop-index
+  join / memoize), which `recursiveUnionOp` does not implement, so it can
+  never be selected as a rescannable inner. Left as-is; if a
+  `*RecursiveUnion` arm is ever added to `classifySubPlan`, the reset must be
+  added at the same time.
+
+- 2026-09-01 **NP-1 = NOT A BUG (PG truncates identically).** The FOR-query
+  scan really does stop at the first depth-0 `loop` token even when it is
+  meant as an identifier — but that is exactly PG's own lexical rule, since
+  plpgsql scans the SQL text for the closing LOOP keyword rather than parsing
+  it. Measured on PG 18.3 at 127.0.0.1:65438:
+  `for r in select loop from np1_t loop …` → `ERROR: syntax error at or near
+  "from"` (PG cut the statement at `loop` too), while the quoted form
+  `for r in select "loop" from np1_t loop …` returns 3. goopg matches on both
+  counts: its lexer only produces the `loop` KEYWORD token for the unquoted
+  spelling, so a quoted `"loop"` column runs through the FOR-query path fine
+  (verified with a throwaway probe: `np1_f()` = 3). No divergence to fix.
+
+- 2026-09-01 **NP-5 = BUG, FIXED.** `parseFor` chose between an integer-range
+  FOR and a query FOR by peeking at a single token, and treated ANY leading
+  `(` as a query FOR. So a parenthesised lower bound went to the SQL parser:
+  `FOR i IN (1+1)..4 LOOP` failed with `42601: FOR query parse error: syntax
+  error at or near "1"`. PG resolves the same ambiguity by which terminator
+  the bound expression stops at (`pl_gram.y` for_control reads it with
+  `read_sql_expression2(K_DOTDOT, K_LOOP)`), i.e. a top-level `..` ahead of
+  LOOP means integer FOR; measured on PG 18.3, that loop sums to 9. Fix: new
+  `dotDotBeforeLoop()` pure lookahead (paren-depth aware, stops at the depth-0
+  LOOP) decides the `(` case. Guard
+  `internal/executor/plpgsql_for_paren_bound_test.go` covers both the range
+  form and the control `FOR r IN (SELECT …) LOOP`, which must stay a query
+  FOR; proven red by stashing only `internal/pl/plpgsql/parser.go`.
+
+- 2026-09-01 **CP-2 = BUG, FIXED (live wrong results).**
+  `normalizeSQLPreservingLiterals` lowercased everything outside SINGLE quotes,
+  so a quoted identifier was folded too and `SELECT * FROM "Foo"` /
+  `SELECT * FROM "foo"` produced the same `planCacheKey`. PG downcases only
+  UNquoted identifiers (`scan.l` {identifier} → `downcase_truncate_identifier`;
+  the `<xd>` delimited form is taken as-is), so those are two different tables.
+  Reproduced on a throwaway goopg server (port 5539, `tmp/cp2data`): with 111
+  in `"Foo"` and 222 in `"foo"`, three `select * from "Foo"` followed by
+  `select * from "foo"` returned **111** — the cached "Foo" plan. Fix: a
+  `inDoubleQuote` span in the same shape as the single-quote one (doubled `""`
+  is an escaped quote, not the end). Re-verified on the same server after the
+  fix: `Foo=111`, `foo=222`. Guard
+  `internal/postmaster/plancache_quoted_ident_test.go`, proven red by stashing
+  only `internal/postmaster/dispatch.go`; it also pins the unquoted folding,
+  the whitespace collapse and the single-quote preservation.
+  (Noted, NOT fixed: a dollar-quoted body is still case-folded in the key, so
+  two `CREATE FUNCTION`s whose bodies differ only in case share a key. DDL
+  invalidates the cache on every statement, so no reproducer today.)
+
+- 2026-09-01 **ES-6 = BUG, FIXED (hang).** The `FOR … BY <step>` arm read the
+  step and went straight into the loop, so `BY 0` (and any negative step in a
+  forward loop) never advanced past the bound and the backend spun inside the
+  function forever — no error, no cancellation point. PG validates the step up
+  front: null → `22004 "BY value of FOR loop cannot be null"`, non-positive →
+  `22023 "BY value of FOR loop must be greater than zero"` (pl_exec.c), both
+  reproduced on PG 18.3 at 127.0.0.1:65438. Fix: the same two checks before
+  the loop. Guard `internal/executor/plpgsql_for_step_test.go` runs the
+  function on a side goroutine with a 10 s deadline, so the pre-fix build
+  fails by TIMING OUT rather than by hanging the suite.
