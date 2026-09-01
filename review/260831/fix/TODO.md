@@ -75,21 +75,21 @@ not, with the reason) / empty (not judged yet).
 | XL-21 | xlog | medium | pg_assembled_emit.go — envelope + body + mainData allocation chain per PG record | | | | | [ ] |
 | XL-24 | xlog | medium | pg_xlog_decode.go:parseXLogRecordData — cloneXLogBytes per block/main-data chunk | | | | | [ ] |
 | XL-25 | xlog | medium | pgoutput.go:pgoPhysEpoch — reconstructs the PG epoch per column decode | | | | | [ ] |
-| XL-31 | xlog | medium | reader.go:readStreamFrom — stream slice grows without a capacity hint | | | | | [ ] |
-| XL-38 | xlog | medium | reorder.go:foldChanges — allocates a copy even when nothing folds | | | | | [ ] |
+| XL-31 | xlog | medium | reader.go:readStreamFrom — stream slice grows without a capacity hint | ADOPT (no micro-benchmark) | a WAL segment is 16MB and there is usually more than one, so growing from zero capacity re-copied the whole stream at every doubling; the first segment size is known up front | pure capacity hint, the bytes are identical | one argument to make() | [x] fixed |
+| XL-38 | xlog | medium | reorder.go:foldChanges — allocates a copy even when nothing folds | ADOPT | the common no-fold case: 6244 ns -> 117 ns (53x), 24,576 B -> 0 allocs | two tests pin both paths: no fold returns the input, and a fold in the middle still produces the UPDATE with its neighbours intact | one scan before the allocation | [x] fixed |
 | XL-39 | xlog | medium | recovery.go:Decode* helpers — defensive tuple copies per record | | | | | [ ] |
 | XL-50 | xlog | medium | slots.go:writeSlotLocked — full rewrite + double fsync per slot update | | | | | [ ] |
 | XL-68 | xlog | medium | xlog_assemble.go:assembleXLogRecord — header/payload built via repeated append with no capacity hint | ADOPT | one block ref: 207 ns -> 107 ns (data only), 293 ns -> 132 ns (image with a hole), 6.5us -> 3.1us (whole-page image); 6-8 allocs -> 2 | byte-identical output; the WAL/pg_waldump parity tests in the package cover it | sizes computed up front by one shared hole helper, so the estimate cannot drift from what is written | [x] fixed |
 | IN-4 | initdb | medium | `pg_aggregate_view.go:registerPgAggregateView` — pgAggregateInitialEntries() rebuilt on every query | | | | | [ ] |
-| IN-8 | initdb | medium | `initdb.go:writeMultiPageHeap` / `writeMultiPageHeapRowsExternal` — hasVarWidthCol recomputed per row (loop invariant) | | | | | [ ] |
+| IN-8 | initdb | medium | `initdb.go:writeMultiPageHeap` / `writeMultiPageHeapRowsExternal` — hasVarWidthCol recomputed per row (loop invariant) | ADOPT (small) | the varlena scan moves out of the per-row loop in both bootstrap heap writers; initdb-only, so no steady-state effect | the value is identical for every row of a call — the column set does not change | two hoisted locals | [x] fixed |
 | ST-1 | storage | high | `heap.go:CollectDeadHeapSlots` — copies every tuple to inspect only its header | ADOPT | 8282 -> 2622 ns/page (3.2x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
 | ST-2 | storage | high | `vm.go:PageAllVisible` / `PageAllFrozen` — same full-tuple copy, only the header is read | ADOPT | 8007 -> 2188 ns/page (3.7x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
 | ST-3 | storage | high | `prune.go:pagePruneCore` — `ParseHeapTuple` copy per tuple on the prune/VACUUM path | ADOPT | 8220 -> 3233 ns/page (2.5x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
 | ST-4 | storage | medium | `prune.go:pruneChainTip` — per-chain-member `ParseHeapTuple` copy | ADOPT | same as ST-3 (same page loop) | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
 | ST-5 | storage | medium | `fsm.go:RecordFreeSpace` — grow-one-element-at-a-time to reach a high block number | ADOPT | recording a high block number now costs one allocation (was: one append per block) | what is recorded is identical; skipped blocks stay 0 (= full) | three lines | [x] fixed |
 | ST-6 | storage | medium | `fsm.go:GetPageWithFreeSpace` — full linear scan of the block array per lookup | ADOPT | 100k-page relation: GetCandidates 23.6us -> 192ns (123x), GetPageWithFreeSpace 24.4us -> 163ns (150x), one insert round trip 23.7us -> 304ns (78x) | a differential test pins equivalence with the full-scan version, tie-breaking included | one-level summary per 512 blocks; relations of one chunk or less keep the plain scan | [x] fixed |
-| ST-8 | storage | medium | `fsm_fork.go:buildFSMTree` — re-parses every built page just to recover the max category | | | | | [ ] |
-| ST-10 | storage | medium | `vm_fork.go:parseVMPage` — allocates a full `vmMaxHeapPagesPerPage` slice per page during `ReadVMFork` | | | | | [ ] |
+| ST-8 | storage | medium | `fsm_fork.go:buildFSMTree` — re-parses every built page just to recover the max category | ADOPT | building a 100k-page relation FSM: 346us -> 244us (1.42x), 322KB / 66 allocs -> 216KB / 40 | fp_nodes[0] IS the max-tree root buildFSMPage computes; a test compares it against parseFSMPage over several fill levels | one accessor replaces a full page re-parse (and ST-9 in Appendix A, the same parseFSMPage waste, disappears with it) | [x] fixed |
+| ST-10 | storage | medium | `vm_fork.go:parseVMPage` — allocates a full `vmMaxHeapPagesPerPage` slice per page during `ReadVMFork` | ADOPT | decoding a 16-page VM fork: 1.02ms -> 0.43ms (2.4x), 2.51MB / 10 allocs -> 524KB / 1 | the decode rule is unchanged, it just appends into the caller buffer; parseVMPage keeps its signature for the redo test | one helper, one pre-sized result | [x] fixed |
 | ST-14 | storage | medium | `lmgr/lockmgr.go:grantedExcept` — O(number of holders) recomputation when the cached mask already has the answer | | | | | [ ] |
 | ST-16 | storage | medium | `aio/read_stream.go:refill` — allocates a fresh BlockSize buffer per prefetched block | | | | | [ ] |
 | ST-17 | storage | medium | `bufpool.go:Prefetch` — allocates a fresh 8KB buffer per prefetch | | | | | [ ] |
@@ -994,3 +994,54 @@ finding, confirmed.
   executor suite, the TPC-H spot check and the TPC-DS SF0.5 sweep all pass.
 - **Maintainability**: yes. It makes four operators match the idiom the rest of
   the executor already uses.
+
+### IN-8 / ST-8 / ST-10 / XL-31 / XL-38 — ADOPT (loop invariants and needless copies)
+
+Five independent, contained findings, each measured on its own:
+
+**IN-8** — `writeMultiPageHeap` and `writeMultiPageHeapRowsExternal` called
+`hasVarWidthCol(cols)` per row, though the column set is fixed for the whole
+call. Hoisted. This is initdb-only code, so there is no steady-state effect; it
+is adopted because it is two lines and removes a per-row scan.
+
+**ST-8** — `buildFSMTree` called `parseFSMPage` on every page it had just
+built, purely to learn that page's maximum category — and `parseFSMPage`
+allocates a full leaf-category slice and walks the whole node array.
+`fp_nodes[0]` is the root of the max-tree `buildFSMPage` computes bottom-up, so
+it IS that maximum. `TestFSMPageMaxCatMatchesParse` pins the equivalence. (This
+also retires the Appendix A finding ST-9, which is the same waste seen from
+`parseFSMPage`'s side.)
+
+| build the FSM for 100k pages | before | after |
+|---|---|---|
+| | 346,290 ns, 322,031 B, 66 allocs | 243,617 ns, 215,534 B, 40 allocs |
+
+**ST-10** — `ReadVMFork` allocated a `vmMaxHeapPagesPerPage` slice per page and
+then appended (copied) it into a result that itself grew from nil. The decode
+now appends straight into a pre-sized result. `parseVMPage` keeps its signature
+because `vm_redo_test.go` uses it.
+
+| decode a 16-page VM fork | before | after |
+|---|---|---|
+| | 1,023,763 ns, 2,514,989 B, 10 allocs | 428,355 ns, 524,290 B, 1 alloc |
+
+**XL-31** — `readStreamFrom` grew the WAL stream from a zero-capacity slice,
+re-copying everything read so far at each doubling; a segment is 16 MB. It
+starts at one segment now. No micro-benchmark: this is a capacity hint whose
+output bytes are identical.
+
+**XL-38** — `foldChanges` allocated and copied even when nothing folded, which
+is the common shape (a transaction of plain inserts or updates). It now scans
+for the first foldable delete+insert pair and returns the input untouched when
+there is none.
+
+| 256 changes, nothing folds | before | after |
+|---|---|---|
+| | 6244 ns, 24,576 B, 1 alloc | 116.9 ns, 0 B, 0 allocs |
+
+- **Benefit**: yes for ST-8, ST-10 and XL-38 (1.4x, 2.4x, 53x); XL-31 and IN-8
+  are cheap, obviously-correct removals of avoidable work rather than measured
+  wins.
+- **No regression**: yes. New tests pin the FSM max equivalence and both
+  foldChanges paths; the VM and FSM fork suites pass unchanged.
+- **Maintainability**: yes. Every one of them is shorter than what it replaced.
