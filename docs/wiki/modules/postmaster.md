@@ -19,6 +19,7 @@ background vacuum/analyze launcher. **17,296 LOC** in the parent package.
 | `copy.go`            | 942   | COPY routing: CopyTo stream via `runCopyToStream`; CopyFrom arms `copyInState` and routes `CopyData`/`CopyDone`/`CopyFail` frames; text and CSV EOD detection. |
 | `extended.go`        | 934   | Extended-protocol frames: Parse/Bind/Describe/Execute/Close handlers, `extendedState` (statements+portals), `extendedQueryResult` with row materialization, `payloadReader`. |
 | `conn_tx.go`         | 857   | `connTxState`: explicit-txn holder, session identity trio, cursors, prepared statements, notify buffer, `OnCommitActions`, prepared-transaction GID. |
+| `grant_ddl.go`       | 834   | GRANT/REVOKE DDL handling, privilege checks, role-based access control. |
 | `dispatch_extended.go`| 733  | Extended-query executor path: `executeExtendedQueryViaExecutor`, `tryHandleDatabaseOrRoleDDLExtended`, `tryCompatNoopExtended`, `paramsToDatums`. |
 | `query.go`           | 698   | Legacy string-match fast paths (`SELECT 1`, `SHOW`, `SET/RESET`, `SET ROLE`/`SESSION AUTHORIZATION`), `writeQueryError`, `setIsSuperuserGUC`. |
 | `txn_verb.go`        | 525   | Shared BEGIN/COMMIT/ROLLBACK/SAVEPOINT state machine: `applyTransactionVerb`, `txnVerbOutcome`, 25P01 warning, deferred FK/SSI/DDL-applier sequence. |
@@ -28,7 +29,6 @@ background vacuum/analyze launcher. **17,296 LOC** in the parent package.
 | `plancache.go`       | 175   | Cross-session plan cache: 16 shards × 32 entries = 512 total, FNV-1a shard hash, doorkeeper admission filter, DDL invalidation. |
 | `cancel.go`          | 154   | Cancel registry: `CancelBackend`/`pg_cancel_backend`/`pg_terminate_backend` by PID or procNum. |
 | `eof_watch.go`       | 133   | Client-EOF watcher: per-query goroutine `recvfrom(MSG_PEEK)` every 500 ms cancels compute-bound queries when the client vanishes. |
-| `grant_ddl.go`       | 834   | GRANT/REVOKE DDL handling, privilege checks, role-based access control. |
 | `autovacuum/launcher.go` | 526 | Background autovacuum/autoanalyze launcher with its own Pool/TxnMgr/Catalog handles. |
 
 ## Public API
@@ -45,8 +45,15 @@ func (s *Server) Addr() *net.TCPAddr / Ready() <-chan struct{}
 func (s *Server) CancelBackend(pid int32) error / TerminateBackend(pid int32) error
 func (s *Server) QueueNotify(sess *misc.SessionRegistry, channel, payload string)
 func (s *Server) SetForcedGCEnabled(v bool)
+func (s *Server) ApplyLauncher() *replication.ApplyLauncher
 type Notification struct{ PID uint32; Channel, Payload string }
 func NewLauncher(pool, txnMgr, cat) *Launcher   // autovacuum subpackage
+
+// Plan cache
+type planCacheKey string
+func normalizeCompatSQL(sql string) string
+func planCacheKey(sql string, connDBOid uint32) string
+func planCacheIsCacheable(node optimizer.Node) bool
 ```
 
 ## Internal structure
@@ -245,6 +252,34 @@ query and full GC every ~8 queries (43% CPU at c=10 SO).
 Standalone `Launcher` with its own Pool/TxnMgr/Catalog handles, ticks every
 60 s, scans `AllTables()`, calls `vacuum.VacuumWithOptions`/`vacuum.Analyze`.
 
+## Key flow: shutdown sequence
+
+```mermaid
+sequenceDiagram
+    participant O as Operator (SIGTERM)
+    participant S as Server
+    participant AL as acceptLoop
+    participant CS as connState
+    participant CP as controlPlane
+    participant CK as Checkpointer
+    O->>S: Run() ctx cancelled
+    S->>S: stopControlPlane
+    S->>S: stopApplyLauncher
+    S->>S: stopAutovacuum
+    S->>AL: context cancel
+    AL->>AL: listener.Close()
+    S->>CS: drain in-flight connections (up to ShutdownDeadline)
+    alt SIGQUIT / STOPIMMEDIATE
+        S-->>CS: 0 s wait, immediate close
+    else normal
+        CS-->>S: all connections drained
+    end
+    S->>CK: CheckpointNow()
+    S->>S: Pool.Close()
+    S->>S: remove PID file
+    S->>S: os.Exit
+```
+
 ## Dependencies
 
 - **Uses** `catalog`, `executor`, `parser`, `optimizer`, `libpq` (+`auth`),
@@ -319,3 +354,297 @@ Standalone `Launcher` with its own Pool/TxnMgr/Catalog handles, ticks every
 - **NOTIFY commit-visibility** — notifications queue on `pending` but are only
   delivered once the notifying transaction commits; ROLLBACK discards them.
   Savepoint operations (RELEASE/ROLLBACK TO) re-scope buffered notifies.
+
+- **Statement/lock timeouts** — `statement_timeout` and `lock_timeout` are read
+  from the `SessionRegistry` at statement start via `sessionStatementTimeout`/
+  `sessionLockTimeout` in dispatch.go (1665/1686). A statement that outlives its
+  timeout is cancelled via context cancel; the cancel is detected at the next
+  `Pin()` call, which returns a context-cancelled error.
+
+- **`executeOneSimpleStmt` is the per-statement bottleneck** — it wraps
+  `BuildFastIterator → Open/Next/Close → commandTagFor` and handles plan-cache
+  read/write, auto-commit, and result serialization. Every optimization to the
+  simple-query path touches this function.
+
+## Extended protocol state machine (`extended.go`)
+
+`extendedState` holds the per-connection prepared-statement and portal maps:
+
+```go
+type extendedState struct {
+    mu        sync.Mutex
+    statements map[string]*preparedStatement  // stmt name → statement
+    portals    map[string]*portalState        // portal name → portal
+}
+```
+
+`preparedStatement` carries `query`, `paramCount`, `node optimizer.Node`,
+`nodeFields`, `schema`, `tableOID`, `commandTag`, `commandTagFn`, `ddlSuffix`,
+`isDDL`, `isRO`, `isTX`, `isCopy`, `inferredParamTypes`.
+
+`portalState` carries `stmt *preparedStatement`, `params []executor.Datum`,
+`result *extendedQueryResult`, `rowPos int`, `maxRows int`, `formatCodes`.
+
+**Parse**: `handleParse` calls `parser.Parse` + `optimizer.Plan` (unless
+cached), stores the result as a `preparedStatement`. A PARSE-time error inside
+an explicit transaction sets `syncRequired` and aborts the block (25P02).
+
+**Bind**: `handleBind` resolves the statement, coerces parameters, and creates
+a `portalState` with `extendedQueryResult`. The portal is stored in `portals`.
+
+**Describe**: `handleDescribe` returns `RowDescription` from the portal's
+schema, or `ParameterDescription` from the statement's param count.
+
+**Execute**: `handleExecute` runs `executeExtendedQueryViaExecutor` (which
+materializes ALL rows into `extendedQueryResult`), then drains the portal by
+`maxRows` batches. `RowPos` tracks the current position for suspension.
+
+## Two-phase commit (`twophase.go`)
+
+`twophase.go` implements `PREPARE TRANSACTION` / `COMMIT PREPARED` /
+`ROLLBACK PREPARED`:
+
+- `preparedState` map: `globalGID` → `*preparedTransaction` (with tx, snap,
+  xid, preparedTime, tempTables, etc.).
+- `PreparedTransactionCount` returns the count for `pg_prepared_xacts`.
+- `PrepareTransaction` persists the transaction state to a sidecar file under
+  `pg_twophase/` using the `pg_twophase` format.
+- `CommitPrepared` / `RollbackPrepared` replay the state from the file.
+
+## Cursor support
+
+`executeFetch` (dispatch.go:4154) materializes a cursor's result into
+`cursorCursorEntry` (stored in `connTxState.cursors`), then drains it by
+`count` rows. `materializeCursor` calls `executeOneSimpleStmt` with a FETCH
+ALL plan, storing the full result. `resolveCurrentOf` resolves `WHERE CURRENT OF`
+for UPDATE/DELETE.
+
+## COPY protocol (`copy.go`)
+
+`runCopyToStream` (CopyTo) sends the row data as `CopyData` frames.
+`handleCopyInFrame` (CopyFrom) arms `copyInState` and routes:
+- `CopyData` → `consumeExecCopyData` (executor-backed path) or
+  `consumeTextCopyData` (text-mode, line-oriented).
+- `CopyDone` → `commitCopyTx` (validate rows, commit).
+- `CopyFail` → `rollbackCopyTx` (discard rows).
+
+`isCopyTextEOD` detects `\.` (backslash-period) at the start of a line as
+the text-mode end-of-data delimiter. `isCopyTextEOD` handles both `\.` and
+`\.\n` (with optional carriage return).
+
+## Notify buffering (`notify.go`)
+
+`notifyHub` is the singleton hub per `Server`:
+
+```go
+type notifyHub struct {
+    mu        sync.Mutex
+    listeners map[string][]*misc.SessionRegistry  // channel → sessions
+    pending   map[*misc.SessionRegistry][]*Notification
+}
+```
+
+`QueueNotify` enqueues a notification into `pending` for the session.
+`bufferNotify`/`notifySavepoint`/`notifyReleaseSavepoint`/`notifyRollbackToSavepoint`
+handle savepoint scoping of buffered notifications. `deliverNotifies` scans
+`pending` and routes matching listeners. `ConnTxState` carries `pendingNotifications`
+for the savepoint scope.
+
+## DDL bypass chain reference
+
+The combined bypass chain used by both simple and extended protocols:
+
+| Statement type | Handler | Covers |
+|---|---|---:|
+| DROP DATABASE | `handleDatabaseDDLBypass` | Full DROP DATABASE (has parser grammar) |
+| CREATE DATABASE | `handleDatabaseDDLBypass` | String-prefix match |
+| ALTER DATABASE | `handleDatabaseDDLBypass` | String-prefix match (partial) |
+| CREATE ROLE | `tryHandleRoleDDL` | String-prefix match |
+| ALTER ROLE | `tryHandleRoleDDL` | String-prefix match |
+| DROP ROLE | `tryHandleRoleDDL` | String-prefix match |
+| GRANT | `compatNoopCommandTag` | Recognized as no-op |
+| SCHEMA | `compatNoopCommandTag` | Recognized as no-op |
+| COMMENT | `compatNoopCommandTag` | Recognized as no-op |
+| EXTENSION | `compatNoopCommandTag` | Recognized as no-op |
+| SECURITY LABEL | `compatNoopCommandTag` | Recognized as no-op |
+| TEXT SEARCH | `compatNoopCommandTag` | Recognized as no-op |
+| DEFAULT PRIVILEGES | `compatNoopCommandTag` | Recognized as no-op |
+
+## Statement logging (`statement_log.go`)
+
+`logStatement`/`logDuration` implement per-statement query logging:
+
+- `GOOPG_LOG_STATEMENT` env (or `log_statement` GUC) gates whether statements
+  are logged at all.
+- `log_min_duration_statement` GUC gates duration logging — a statement
+  faster than the threshold is not logged.
+- The log line format matches PG's: `LOG:  duration: 12.345 ms  statement:
+  SELECT ...` plus the client address and database.
+
+`sessionStatsTarget`/`sessionFreezeMinAge`/`sessionSyncCommitMode`/
+`sessionAsyncCommit`/`sessionOpportunisticPrune` are the GUC-read helpers in
+dispatch.go that bridge `SessionRegistry` values to executor/storage
+behavior (stats_target, vacuum_freeze_min_age, synchronous_commit, etc.).
+
+## Server config defaults (`server.go`)
+
+`Config.defaults()` fills in sensible defaults for unset fields:
+
+```go
+func (c *Config) defaults() {
+    if c.Address == "" { c.Address = "127.0.0.1" }
+    if c.ServerVersion == "" { c.ServerVersion = "18.3" }
+    if c.ShutdownDeadline == 0 { c.ShutdownDeadline = 120 * time.Second }
+    if c.HandshakeTimeout == 0 { c.HandshakeTimeout = 30 * time.Second }
+    // ...
+}
+```
+
+`New(cfg)` wires the `Server` struct: the listener is bound lazily in
+`Run`, the apply launcher is created, and the control plane is initialized.
+
+## Cursor support detail
+
+`materializeCursor` runs the cursor's query via `executeOneSimpleStmt` with
+a FETCH-ALL plan, collecting all rows into the `cursorEntry.result`. The
+result is stored in `connTxState.cursors` keyed by cursor name. `executeFetch`
+reads `count` rows from the materialized result, respecting `forward` and
+the `RowPos` cursor.
+
+`FETCH ALL` / `FETCH 10` / `FETCH NEXT` / `FETCH FORWARD` / `FETCH BACKWARD`
+/ `FETCH ABSOLUTE` / `FETCH RELATIVE` are all routed through `executeFetch`.
+
+## Signal/control-plane handling
+
+The `Server` runs a `controlPlane` goroutine that listens on a Unix-domain
+socket (via `transam/control.Listener`). Operator commands:
+
+- `stop` / `stop immediate` — graceful/immediate shutdown.
+- `reload` — `reloadConfig` re-reads `postgresql.conf` and applies SIGHUP
+  GUCs.
+- `status` — returns the server state (started, ready, shutting down).
+- `promote` — promote a standby (archive-recovery mode).
+
+`Send(path, cmd, timeout)` in `control/control.go` is how `pg_ctl`-style
+clients issue these commands.
+
+## The per-connection goroutine lifecycle
+
+`serveConn(ctx, conn, cfg)` is the connection handler:
+
+1. `handleStartup` — read the StartupMessage, extract params, set up the
+   session registry.
+2. `checkAuth` — run the auth exchange (trust/md5/scram/reject).
+3. `sendStartupReply` — ParameterStatus for each reportable GUC, then
+   BackendKeyData, then ReadyForQuery.
+4. `runPostStartupLoop` — the frame loop dispatching each message type.
+5. On exit: `rollbackOpenTxnOnTeardown`, `cleanupSessionTempObjects`,
+   `ReleaseConnSlot`, and unregister the activity slot.
+
+The connection goroutine owns the `executor.Context` (per-statement),
+the `connTxState` (per-connection transaction state), the `SessionRegistry`,
+and the plan-cache shard access.
+
+## Key flow: extended protocol bind-execute cycle
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as runPostStartupLoop
+    participant X as extendedState
+    participant E as executor
+    C->>P: Parse "stmt1" "SELECT * FROM t WHERE id=$1" [int4]
+    P->>X: store preparedStatement
+    C->>P: Bind "portal1" "stmt1" ["42"] []
+    P->>X: paramsToDatums → portalState{params}
+    C->>P: Describe 'P' "portal1"
+    P->>P: describeExtendedQuery → RowDescription (id)
+    C->>P: Execute "portal1" 0
+    P->>E: executeExtendedQueryViaExecutor
+    E->>E: BuildFastIterator + Open/Next/Close
+    E-->>P: extendedQueryResult (all rows)
+    P->>P: WriteDataRow per row
+    P-->>C: CommandComplete
+    C->>P: Close 'P' "portal1"
+    C->>P: Sync
+    P-->>C: ReadyForQuery
+```
+
+## Compat no-op absorption
+
+`compatNoopCommandTag(sql)` recognizes a set of SQL statements goopg does not
+act on but must not error on, and returns their command tag. The recognized
+forms (string-prefix matched in `splitLeadingCompatNoopDDL`):
+
+- `GRANT ...` / `REVOKE ...` (no-op privilege statements absorbed here; real
+  GRANT/REVOKE on tables goes through `grant_ddl.go`).
+- `COMMENT ON ...` — absorbed as a no-op unless it targets a tracked object.
+- `SECURITY LABEL ...` — always a no-op.
+- `TEXT SEARCH DICTIONARY/CONFIGURATION ...` — absorbed unless it matches a
+  tracked TS object.
+- `EXTENSION ...` — absorbed unless it matches a tracked extension.
+- `CREATE SCHEMA ...` — handled by `tryHandleDatabaseDDL`'s schema arm.
+- `ALTER SYSTEM ...` — absorbed.
+- `DISCARD ALL` — absorbed (with a session reset side effect).
+
+`registerCompatNoopSchema` records a no-op `CREATE SCHEMA` in the catalog so
+later references to the schema resolve; the schema-qualified mismatch check
+(`schemaQualMismatchError`) distinguishes a genuinely-misspelled schema from
+a compat no-op that just happens to start with the same name.
+
+The bypass chain must be replicated in BOTH the simple path (dispatch.go) and
+the extended path (dispatch_extended.go's `tryCompatNoopExtended`) — a missed
+arm is a silent protocol divergence.
+
+## Statement tag rendering
+
+`commandTagFor(node, op, rowCount)` builds the `CommandComplete` tag:
+
+| Plan node | Tag |
+|---|---|
+| `Insert` | `INSERT 0 <n>` |
+| `Update` | `UPDATE <n>` |
+| `Delete` | `DELETE <n>` |
+| `Select` | `SELECT <n>` |
+| `Copy` | `COPY <n>` |
+| `DDL` | per-`ddlTag(stmt)` (e.g. `CREATE TABLE`, `ALTER TABLE`) |
+| `Transaction` | per-`transactionTag(verb)` (`BEGIN`, `COMMIT`, `ROLLBACK`) |
+| `Utility` | per-`utilityTag(stmt)` |
+| `Merge` | `MERGE <n>` |
+
+`rowsAffected(op)` extracts the count from a `RowCounter` operator; a
+non-counter operator returns 0, so forgetting the `RowCounter` interface
+silently emits `INSERT 0 0` instead of `INSERT 0 N`.
+
+## Datum-to-text rendering (`dispatch.go`)
+
+`appendTypedCellText` renders a `Datum` to its wire text form, dispatching on
+the catalog `Type`:
+
+- `int2`/`int4`/`int8`/`oid`/`xid`/`cid` → decimal text from `Datum.Int`.
+- `float4`/`float8` → `appendFloatText(dst, d, 32)` / `appendFloat8Text`
+  (matching PG's `%g`-style float output, including exponent formatting).
+- `text`/`varchar`/`bpchar`/`char` → raw bytes.
+- `date`/`time`/`timestamp`/`timestamptz` → `appendTimeText` with the
+  session DateStyle.
+- `numeric` → `FormatNumeric`.
+- `bool` → `t`/`f`.
+- `bytea` → `\x...` hex (or escape format per `bytea_output`).
+
+`maybeConvertCellsForClientEncoding` applies the client encoding conversion
+when `client_encoding != server_encoding`.
+
+## GC counter tuning (`dispatch.go`)
+
+`parseForcedGCEnv` reads `GOOPG_FORCED_GC` from the environment: unset/`0`/
+`false`/`off` disables, anything else enables. `maybeForceGCAfterCommit` is
+called after every commit:
+
+1. Bump `queriesWithoutFreeCounter` atomically.
+2. If `GOOPG_FORCED_GC` is off, return immediately (no STW).
+3. Every `queriesPerForcedFree` (10,000) queries, or when
+   `runtime.MemStats.HeapInuse > heapReleaseThresholdBytes` (4 GiB), run
+   `runtime.GC()` + `debug.FreeOSMemory()`.
+
+The 10,000-counter (raised from 8) avoids the STW `ReadMemStats` + full GC on
+every query that caused a 43% CPU regression at pgbench c=10 SO.

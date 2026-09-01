@@ -121,7 +121,13 @@ func (w *Writer) Close() error
 func (w *Writer) MemRing() *MemRing
 func (w *Writer) TimelineID() uint32 / Format() WALFormatVersion
 func (w *Writer) SetCommitDelayUs(us int64) / SetCommitSiblings(n int)
+func (w *Writer) SetWalWriterFlushAfter(bytes int64)
 func (w *Writer) BackgroundWrite() error
+func (w *Writer) PageHeadersEnabled() bool
+func (w *Writer) WALBuffersCapacity() int64 / WALBuffersBytesResident() int64
+func (w *Writer) WALBuffersOverflowDrainBytes() uint64 / WALBuffersFlushDrainBytes() uint64
+func (w *Writer) FsyncCount() int64 / AddFsyncTimeNanos(n int64) / FsyncTimeNanos() int64
+func (w *Writer) SegmentsPreallocated() int64 / PreallocatedBytes() int64
 func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint64, error)
 func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, cfgSegSize int64, pageHeaders bool) (int64, uint64, error)
 
@@ -258,7 +264,7 @@ the block-ref trailer. Record kinds cover:
 - **heap**: insert, delete, update, multi-insert, hot-update, lock, prune-opt,
   freeze, visible, vacuum (dead-slot list)
 - **smgr**: create, truncate, truncate-to
-- **btree**: insert, split, vacum, unlink-page, new-root, mark-page-halfdead,
+- **btree**: insert, split, vacuum, unlink-page, new-root, mark-page-halfdead,
   reuse-page, meta-cleanup
 - **xact**: commit, abort, assignment, rollback-to, sub-abort, marker
 - **clog**: truncate
@@ -382,6 +388,35 @@ rezero, `segment_pad.go`); `RemoveOldSegments` applies the retention horizon
 (`retention.go`). `FormatSegmentName`/`FormatSegmentNameTLI` and `parseSegmentName`
 handle the `000000010000000000000001` naming scheme.
 
+The Writer's `Config` struct specifies segment size (default 16 MB), WAL
+buffers capacity, `pageHeaders` flag (whether to emit PG-format page headers),
+and the `WalSegmentSize` GUC. `IsValidWalSegSize` checks that the size is a
+power of 2 between 1 MB and 1 GB.
+
+## Key flow: WAL record append and flush
+
+```mermaid
+sequenceDiagram
+    participant E as executor
+    participant W as Writer
+    participant R as MemRing
+    participant S as stripe_append
+    participant F as os.File (pg_wal)
+    E->>E: encode heap mutation (EncodeHeapInsert)
+    E->>W: Append(payload)
+    W->>R: tryAppend (CAS on tail)
+    R->>R: copy payload, stamp LSN
+    R-->>W: (lsn, used, nil)
+    W-->>E: lsn
+    Note over E: storage flushes WAL before data write
+    E->>W: FlushUpTo(lsn)
+    W->>R: drainBufferUpTo(lsn)
+    W->>S: walWriteStage (write stripe)
+    S->>F: pwrite(segment, data, offset)
+    W->>W: doSync(fdatasync)
+    W-->>E: flush complete
+```
+
 ## Dependencies
 
 - **Used by** — `internal/storage` (WAL flush barrier, `WALFlusher`),
@@ -444,3 +479,438 @@ handle the `000000010000000000000001` naming scheme.
 - **Logical decoding needs a catalog snapshot** — `PgOutput`'s `RelationFilter`
   decides which relations emit; `snapshot.go` freezes a catalog snapshot so
   the decode doesn't race DDL.
+- **`AIOEngine` interface** — the Writer can optionally use an io_uring engine
+  for async segment writes. The `Config.AIOEngine` field wires it at startup;
+  without it, segment writes are synchronous `pwrite` + `fdatasync`.
+- **`removeOldSegmentsWithEstimate`** — the checkpointer can call
+  `RemoveOldSegmentsWithEstimate` with a distance-estimate and completion target
+  to pace segment recycling, avoiding a burst of I/O when many segments are freed
+  at once.
+- **`bufferDrainReason` enum** — the drain path records why a buffer drain was
+  triggered (overflow, flush, shutdown) via `drainReason` counters for telemetry.
+
+## Record kind constants (`recovery.go`)
+
+The goopg-native record kinds are defined as `RecordKind` constants:
+
+| Kind | Value | Payload |
+|---|---:|---|
+| `RecordKindHeapInsert` | 0x01 | rel, blk, lineSlot, tuple |
+| `RecordKindHeapDelete` | 0x02 | rel, blk, lineSlot, xmax, oldTuple |
+| `RecordKindHeapUpdate` | 0x03 | rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tuple |
+| `RecordKindHeapHotUpdate` | 0x04 | rel, blk, oldSlot, xmax, tuple |
+| `RecordKindHeapMultiInsert` | 0x05 | rel, blk, slots, tuples |
+| `RecordKindHeapLock` | 0x06 | rel, blk, lineSlot, xmax, lockStrength |
+| `RecordKindHeapPruneOpt` | 0x07 | rel, blk, redirects, unused |
+| `RecordKindHeapFreeze` | 0x08 | rel, blk, frozenSlots |
+| `RecordKindHeapVisible` | 0x09 | rel, blk, heapBlk |
+| `RecordKindHeapVacuum` | 0x0A | rel, blk, deadSlots |
+| `RecordKindSmgrCreate` | 0x0B | rel |
+| `RecordKindSmgrTruncate` | 0x0C | rel |
+| `RecordKindSmgrTruncateTo` | 0x0D | rel, nBlocks |
+| `RecordKindBtreeInsert` | 0x0E | rel, blk, offnum, item |
+| `RecordKindBtreeSplit` | 0x0F | rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage |
+| `RecordKindBtreeVacuum` | 0x10 | rel, blk, keptItems, opaqueFlags |
+| `RecordKindBtreeUnlinkPage` | 0x11 | rel, blk, leftBlk, rightBlk, btvac |
+| `RecordKindBtreeNewRoot` | 0x12 | rel, rootBlk, rootPage, leftChildBlk, metaBlk, metaPage |
+| `RecordKindBtreeMarkPageHalfDead` | 0x13 | rel, blk, leftBlk, rightBlk, leftChild, rightChild |
+| `RecordKindBtreeReusePage` | 0x14 | rel, blk, lastRecycledXid |
+| `RecordKindBtreeMetaCleanup` | 0x15 | rel, blk |
+| `RecordKindXactCommit` | 0x16 | xid |
+| `RecordKindXactAbort` | 0x17 | xid |
+| `RecordKindXactAssignment` | 0x18 | parentXid, subXids |
+| `RecordKindXactRollbackTo` | 0x19 | parentXid, abortedSubXids |
+| `RecordKindXactSubAbort` | 0x1A | subXid |
+| `RecordKindXactMarker` | 0x1B | xid, marker |
+| `RecordKindClogTruncate` | 0x1C | xid |
+| `RecordKindPageImage` | 0x1D | rel, blk, page |
+| `RecordKindCheckpoint` | 0x1E | CheckPointFields |
+| `RecordKindCheckpointCompat` | 0x1F | redoLSN, tli, nextXid, nextOid |
+| `RecordKindRelmap` | 0x20 | relmap data |
+| `RecordKindSeqLog` | 0x21 | seq data |
+
+## PG-canonical emission (`pg_assembled_emit.go`)
+
+When `pageHeaders=true` (the default for PG-compatible WAL), records are
+emitted in PG's `XLogRecord` format. The assembly path:
+
+1. `xlog_assemble.go` wraps the raw payload in a PG `XLogRecord` header
+   (xl_tot_len, xl_xid, xl_prev, xl_info, xl_rmid).
+2. `xlog_emit.go` orchestrates the assembly and passes the result to the
+   state's `appendPGCompat` method.
+3. The PG header adds 24 bytes per record (for the `XLogRecord` struct) plus
+   block-ref arrays when needed.
+
+`pg_assembled_emit.go` provides the per-record-kind encoders that produce
+PG-canonical output: `EncodePGHeapInsert`, `EncodePGHeapUpdate`,
+`EncodePGHeapDelete`, `EncodePGXactCommit`, `EncodePGXactAbort`, etc.
+
+## Writer state machine (`writer.go`)
+
+The `Writer` has a `state` struct for the append path:
+
+```go
+type state struct {
+    mu         sync.Mutex
+    writeLock  paddedMutex  // serializes segment writes
+    walFile    *os.File
+    segNo      uint64
+    segOffset  int64
+    tail       uint64   // next LSN to write
+    head       uint64   // oldest LSN still in ring
+    // ...
+}
+```
+
+`tryAppend` is the lock-free fast path: it CAS-increments the ring head,
+copies the payload, and returns the LSN. If the ring is full, it falls back
+to `tryAppendRwMutex`, which acquires the write lock and drains the ring
+before retrying.
+
+`append` is the general path: it reserves bytes in the ring, copies the
+payload, and publishes the new tail. `appendPGCompat` does the same but
+with PG-format headers.
+
+`drainBufferBytes` is called when the ring is full: it writes the reserved
+bytes to the current segment, advances the write LSN, and notifies
+subscribers. `drainBufferUpTo` drains everything up to a target LSN (used
+by `FlushUpTo`).
+
+## Checkpointer pacing (`checkpointer.go`)
+
+The checkpointer uses a completion-target pacer:
+
+```go
+type Checkpointer struct {
+    interval        time.Duration  // checkpoint_timeout
+    maxWALBytes     int64          // max_wal_size
+    minWALBytes     int64          // min_wal_size
+    completionTarget float64       // checkpoint_completion_target
+    // ...
+}
+```
+
+`Run` ticks every 100 ms. On each tick:
+1. Check if `volumeTriggerFires` (WAL bytes > maxWALBytes).
+2. If a checkpoint is due, emit a `CHECKPOINT` record.
+3. Pace the dirty-page flush across the checkpoint duration:
+   `flushBudget = maxPagesToFlush * (currentTime - checkpointStart) /
+   (checkpointDuration * completionTarget)`.
+4. Call `FlushDirtyPages` with the budget.
+
+`CheckpointNow` is the synchronous path (for `CHECKPOINT` SQL command and
+shutdown). It bypasses the pacer and flushes all dirty pages immediately.
+
+## Replication slot persistence (`slots_pg.go`)
+
+Slots are persisted to `pg_replslot/<name>/state` using the PG slot-file
+format. The file contains:
+
+```
+slot_name|plugin|database|two_phase|failover|wal_level|reserve_lsn|restart_lsn|confirmed_flush|catalog_xmin|...
+```
+
+`OpenSlots` reads all slot files from the directory. `Create`/`CreateLogical`
+write a new slot file. `Drop` removes the file. `AdvanceConfirmedFlushLSN`
+updates the confirmed flush LSN in the slot file atomically.
+
+## SyncRep (`syncrep.go`)
+
+Synchronous replication mode: `SyncRepMode` is `SYNC_REP_OFF`, `SYNC_REP_QUORUM`,
+or `SYNC_REP_PRIORITY`. `syncrep_parse.go` parses the `synchronous_standby_names`
+GUC into a list of standby names with quorum/priority syntax.
+
+`WaitForLSN` blocks the committing backend until the standby acknowledges
+receipt past the commit LSN. The wait is on a condition variable that the
+standby's feedback wakes up.
+
+## Reorder buffer (`reorder.go`)
+
+`reorder.go` reorders WAL records for subtransaction-safe replay. When a
+subtransaction commits, its records are released to the replayer in commit
+order. When a subtransaction aborts, its records are discarded. This is
+essential for consistency: without reordering, a subtransaction's updates
+might be replayed before its parent's updates, producing a visible but
+inconsistent state.
+
+## Streaming replayer (`stream_replayer.go`)
+
+`StreamReplayer` replays WAL records as they arrive from the master (via
+`pg_basebackup` or PITR restore). It reads from the WAL stream, classifies
+each record, and calls `ApplyRecord`. The replayer suspends during
+transaction boundaries that need reordering.
+
+## Segment preallocation (`segment_pad.go`)
+
+`eagerPreallocSegment` zeroes a future segment (`pg_wal/<tli>/<seg>`) in a
+background goroutine. The segment is preallocated before the write path needs
+it, so the write path never blocks on `fallocate` or `write(0)`.
+
+`recycleSegmentFile` renames a removed segment to a future segment number
+and rezeroes it. `segment_pad.go` handles the zero-padding of recycled
+segments.
+
+## Writer Config fields (`writer.go`)
+
+The `Config` struct that `NewWriter` consumes:
+
+```go
+type Config struct {
+    WalDir        string           // pg_wal directory
+    SegmentSize   int64            // default 16MB
+    WALBuffers    int64            // in bytes (default 64KB)
+    PageHeaders   bool             // emit PG-format page headers
+    TimelineID    uint32
+    AIOEngine     AIOEngine        // nil = synchronous I/O
+    Logger        *slog.Logger
+    FlushWALHook  func()           // called after each WAL flush
+    // ...
+}
+```
+
+`SegmentSize` must be a power of 2 between 1 MB and 1 GB (validated by
+`IsValidWalSegSize`). `WALBuffers` defaults to 64 KB and is the cap on the
+MemRing's reserved space. `PageHeaders=true` produces PG-compatible WAL;
+`PageHeaders=false` produces the compact goopg-native format.
+
+## MemRing concurrent access (`mem_ring_concurrent.go`)
+
+The `MemRing` is a circular buffer of `blockSize`-aligned pages. The
+concurrent access model:
+
+- `tryAppend` CAS-increments `ringHead` (the reservation pointer). If the
+  CAS succeeds, the caller owns the slot and can write the payload.
+- `tryAppendRwMutex` is the fallback: it acquires the write lock, drains
+  the ring, and retries.
+- `drainBufferBytes` is called by the writer goroutine: it advances
+  `ringDrain` (the committed pointer) and writes the drained pages to the
+  segment file.
+- `Subscribe`/`Unsubscribe` allow listeners (e.g., the walwriter goroutine
+  and the walsender) to be notified when new data is available.
+
+The lock-free CAS path is the hot path; the mutex path is only hit when the
+ring is full and the writer is temporarily blocked on I/O.
+
+## pgoutput logical decoding (`pgoutput.go`)
+
+`PgOutput` implements the pgoutput plugin protocol for logical replication.
+The output is a stream of messages consumed by the subscriber:
+
+- `Begin(xid, commitLSN)` — signals the start of a transaction.
+- `Change(c Change)` — a relation/insert/update/delete change. The `Change`
+  struct carries the relation OID, the operation type, and the old/new tuple
+  values.
+- `Commit(xid, commitLSN)` — signals the end of a transaction.
+
+`RelationFilter` controls which relations produce changes — called once per
+relation per transaction. The filter is set via `SetFilter`.
+
+`slot_decoder.go` bridges a logical slot to `PgOutput`: it reads from the
+slot's WAL position, decodes each record, and feeds it to `PgOutput`.
+
+## Key flow: logical replication from slot
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer (apply worker)
+    participant S as Slots
+    participant IT as RecordIterator
+    participant P as PgOutput
+    participant F as RelationFilter
+    C->>S: CreateLogical("sub1", "pgoutput", "mydb", startLSN)
+    S->>S: write slot file to pg_replslot/sub1/state
+    C->>IT: NewRecordIterator(writer, walDir, segSize, startLSN)
+    loop Next()
+        IT->>IT: Next(ctx) → Record
+        IT->>P: Change(record)
+        P->>F: RelationRel(relOID)
+        alt filtered out
+            P-->>IT: skip
+        else included
+            P->>P: encode insert/update/delete as pgoutput message
+            P-->>C: pgoutput message bytes
+        end
+    end
+    C->>S: AdvanceConfirmedFlushLSN("sub1", commitLSN)
+```
+
+## Record kind constants (`recovery.go`)
+
+The goopg-native record kinds are defined as `RecordKind` constants:
+
+| Kind | Value | Payload |
+|---|---|---:|
+| `RecordKindHeapInsert` | 0x01 | rel, blk, lineSlot, tuple |
+| `RecordKindHeapDelete` | 0x02 | rel, blk, lineSlot, xmax, oldTuple |
+| `RecordKindHeapUpdate` | 0x03 | rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tuple |
+| `RecordKindHeapHotUpdate` | 0x04 | rel, blk, oldSlot, xmax, tuple |
+| `RecordKindHeapMultiInsert` | 0x05 | rel, blk, slots, tuples |
+| `RecordKindHeapLock` | 0x06 | rel, blk, lineSlot, xmax, lockStrength |
+| `RecordKindHeapPruneOpt` | 0x07 | rel, blk, redirects, unused |
+| `RecordKindHeapFreeze` | 0x08 | rel, blk, frozenSlots |
+| `RecordKindHeapVisible` | 0x09 | rel, blk, heapBlk |
+| `RecordKindHeapVacuum` | 0x0A | rel, blk, deadSlots |
+| `RecordKindSmgrCreate` | 0x0B | rel |
+| `RecordKindSmgrTruncate` | 0x0C | rel |
+| `RecordKindSmgrTruncateTo` | 0x0D | rel, nBlocks |
+| `RecordKindBtreeInsert` | 0x0E | rel, blk, offnum, item |
+| `RecordKindBtreeSplit` | 0x0F | rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage |
+| `RecordKindBtreeVacuum` | 0x10 | rel, blk, keptItems, opaqueFlags |
+| `RecordKindBtreeUnlinkPage` | 0x11 | rel, blk, leftBlk, rightBlk, btvac |
+| `RecordKindBtreeNewRoot` | 0x12 | rel, rootBlk, rootPage, leftChildBlk, metaBlk, metaPage |
+| `RecordKindBtreeMarkPageHalfDead` | 0x13 | rel, blk, leftBlk, rightBlk, leftChild, rightChild |
+| `RecordKindBtreeReusePage` | 0x14 | rel, blk, lastRecycledXid |
+| `RecordKindBtreeMetaCleanup` | 0x15 | rel, blk |
+| `RecordKindXactCommit` | 0x16 | xid |
+| `RecordKindXactAbort` | 0x17 | xid |
+| `RecordKindXactAssignment` | 0x18 | parentXid, subXids |
+| `RecordKindXactRollbackTo` | 0x19 | parentXid, abortedSubXids |
+| `RecordKindXactSubAbort` | 0x1A | subXid |
+| `RecordKindXactMarker` | 0x1B | xid, marker |
+| `RecordKindClogTruncate` | 0x1C | xid |
+| `RecordKindPageImage` | 0x1D | rel, blk, page |
+| `RecordKindCheckpoint` | 0x1E | CheckPointFields |
+| `RecordKindCheckpointCompat` | 0x1F | redoLSN, tli, nextXid, nextOid |
+| `RecordKindRelmap` | 0x20 | relmap data |
+| `RecordKindSeqLog` | 0x21 | seq data |
+
+## PG-canonical emission (`pg_assembled_emit.go`)
+
+When `pageHeaders=true` (the default for PG-compatible WAL), records are
+emitted in PG's `XLogRecord` format. The assembly path:
+
+1. `xlog_assemble.go` wraps the raw payload in a PG `XLogRecord` header
+   (xl_tot_len, xl_xid, xl_prev, xl_info, xl_rmid).
+2. `xlog_emit.go` orchestrates the assembly and passes the result to the
+   state's `appendPGCompat` method.
+3. The PG header adds 24 bytes per record (for the `XLogRecord` struct) plus
+   block-ref arrays when needed.
+
+`pg_assembled_emit.go` provides the per-record-kind encoders that produce
+PG-canonical output: `EncodePGHeapInsert`, `EncodePGHeapUpdate`,
+`EncodePGHeapDelete`, `EncodePGXactCommit`, `EncodePGXactAbort`, etc.
+
+## Writer state machine (`writer.go`)
+
+The `Writer` has a `state` struct for the append path:
+
+```go
+type state struct {
+    mu         sync.Mutex
+    writeLock  paddedMutex  // serializes segment writes
+    walFile    *os.File
+    segNo      uint64
+    segOffset  int64
+    tail       uint64   // next LSN to write
+    head       uint64   // oldest LSN still in ring
+    // ...
+}
+```
+
+`tryAppend` is the lock-free fast path: it CAS-increments the ring head,
+copies the payload, and returns the LSN. If the ring is full, it falls back
+to `tryAppendRwMutex`, which acquires the write lock and drains the ring
+before retrying.
+
+`append` is the general path: it reserves bytes in the ring, copies the
+payload, and publishes the new tail. `appendPGCompat` does the same but
+with PG-format headers.
+
+`drainBufferBytes` is called when the ring is full: it writes the reserved
+bytes to the current segment, advances the write LSN, and notifies
+subscribers. `drainBufferUpTo` drains everything up to a target LSN (used
+by `FlushUpTo`).
+
+## Checkpointer pacing (`checkpointer.go`)
+
+The checkpointer uses a completion-target pacer:
+
+```go
+type Checkpointer struct {
+    interval        time.Duration  // checkpoint_timeout
+    maxWALBytes     int64          // max_wal_size
+    minWALBytes     int64          // min_wal_size
+    completionTarget float64       // checkpoint_completion_target
+    // ...
+}
+```
+
+`Run` ticks every 100 ms. On each tick:
+1. Check if `volumeTriggerFires` (WAL bytes > maxWALBytes).
+2. If a checkpoint is due, emit a `CHECKPOINT` record.
+3. Pace the dirty-page flush across the checkpoint duration:
+   `flushBudget = maxPagesToFlush * (currentTime - checkpointStart) /
+   (checkpointDuration * completionTarget)`.
+4. Call `FlushDirtyPages` with the budget.
+
+`CheckpointNow` is the synchronous path (for `CHECKPOINT` SQL command and
+shutdown). It bypasses the pacer and flushes all dirty pages immediately.
+
+## Replication slot persistence (`slots_pg.go`)
+
+Slots are persisted to `pg_replslot/<name>/state` using the PG slot-file
+format. The file contains:
+
+```
+slot_name|plugin|database|two_phase|failover|wal_level|reserve_lsn|restart_lsn|confirmed_flush|catalog_xmin|...
+```
+
+`OpenSlots` reads all slot files from the directory. `Create`/`CreateLogical`
+write a new slot file. `Drop` removes the file. `AdvanceConfirmedFlushLSN`
+updates the confirmed flush LSN in the slot file atomically.
+
+## SyncRep (`syncrep.go`)
+
+Synchronous replication mode: `SyncRepMode` is `SYNC_REP_OFF`, `SYNC_REP_QUORUM`,
+or `SYNC_REP_PRIORITY`. `syncrep_parse.go` parses the `synchronous_standby_names`
+GUC into a list of standby names with quorum/priority syntax.
+
+`WaitForLSN` blocks the committing backend until the standby acknowledges
+receipt past the commit LSN. The wait is on a condition variable that the
+standby's feedback wakes up.
+
+## Reorder buffer (`reorder.go`)
+
+`reorder.go` reorders WAL records for subtransaction-safe replay. When a
+subtransaction commits, its records are released to the replayer in commit
+order. When a subtransaction aborts, its records are discarded. This is
+essential for consistency: without reordering, a subtransaction's updates
+might be replayed before its parent's updates, producing a visible but
+inconsistent state.
+
+## Streaming replayer (`stream_replayer.go`)
+
+`StreamReplayer` replays WAL records as they arrive from the master (via
+`pg_basebackup` or PITR restore). It reads from the WAL stream, classifies
+each record, and calls `ApplyRecord`. The replayer suspends during
+transaction boundaries that need reordering.
+
+## Segment preallocation (`segment_pad.go`)
+
+`eagerPreallocSegment` zeroes a future segment (`pg_wal/<tli>/<seg>`) in a
+background goroutine. The segment is preallocated before the write path needs
+it, so the write path never blocks on `fallocate` or `write(0)`.
+
+`recycleSegmentFile` renames a removed segment to a future segment number
+and rezeroes it. `segment_pad.go` handles the zero-padding of recycled
+segments.
+
+## Key flow: timeline switching
+
+```mermaid
+sequenceDiagram
+    participant R as Replica
+    participant M as Master
+    participant W as Writer
+    participant C as Checkpointer
+    M->>C: CheckpointNow (emit CHECKPOINT record)
+    C->>W: EncodeCheckpoint (nextTLI, redoLSN, ...)
+    W->>W: Append(CHECKPOINT)
+    W->>W: FlushUpTo(lsn)
+    M->>M: timeline switch (increment TLI)
+    M->>W: Writer.TimelineID() → new TLI
+    W->>W: new segment, long page header with new TLI
+    R->>R: detect timeline change in WAL stream
+    R->>R: update timeline history file
+    R->>R: resume replay with new TLI
+```

@@ -75,14 +75,6 @@ The central relation record with ~60 fields:
 - **Stats**: `Stats *TableStats` (nil before ANALYZE)
 - **Dump-only**: `ForeignServerName`, `ForeignOptions`, `Policies`, `Rules`, `Compression`, `StatTarget`, `Collation`, `ParallelWorkers` — goopg does not act on these
 
-The `Owner` field drives VACUUM privilege checks (a table can only be vacuumed
-by its owner or a superuser); `RelFrozenXID` mirrors pg_class.relfrozenxid for
-anti-wraparound autovacuum decisions; `RelFileNodeOID` overrides the on-disk
-relfile identity when it differs from the catalog OID (physical backup
-compatibility). `DBOid` is read by `RelFileNode` to stamp
-`storage.RelFileNode.DBOid` per-table instead of using the single process-wide
-`InMemory.dbOid`, so physical storage separates per database (M0122-0007).
-
 ### `Column` (`catalog.go:194`)
 
 - `Type` (`Type{Name, Args, IsArray}` where `Name` is the *element* type name for arrays)
@@ -659,6 +651,37 @@ type SubscriptionRel struct {
 `AdvanceSubscriptionRel` updates the LSN and state of a subscription relation,
 used by the apply worker to track which WAL position it has consumed.
 
+## Key flow: CREATE TABLE
+
+```mermaid
+sequenceDiagram
+    participant E as executor ddlOp
+    participant C as catalog InMemory
+    participant H as heap files
+    participant W as xlog
+    E->>E: execCreateTable(parser.CreateStmt)
+    E->>C: CreateTable(schema, name, cols, ...)
+    C->>C: AllocOID → table OID
+    C->>C: getOrCreateNS(dbOid) → namespace
+    C->>C: store table in tables["schema.name"]
+    C->>C: RegisterPartitionChild if partition
+    C-->>E: *Table
+    E->>C: CreateIndex(table, primary key, ...)
+    C->>C: AllocOID → index OID
+    C->>C: store index in indexes["schema.name"]
+    C-->>E: *Index
+    E->>E: syncTableToCatalogHeap(table)
+    E->>H: write pg_class heap row (144 bytes)
+    E->>H: write pg_attribute heap rows (100 bytes each)
+    E->>H: write pg_class btree index rows
+    E->>H: write pg_attribute btree index rows
+    E->>H: write pg_attrdef rows for column defaults
+    E->>H: write pg_inherits rows if partition
+    E->>W: EncodeSmgrCreate(rel) + EncodeHeapInsert (catalog WAL)
+    E->>E: RelcacheInitFileUnlink(dbOid)
+    E->>C: Invalidate() plan cache
+```
+
 ## Dependencies
 
 - **Used by** — executor (101 files), optimizer (39), initdb (29), postmaster (7),
@@ -778,3 +801,724 @@ sequenceDiagram
   Write paths still persist under 1. The `databaseOid` map tracks the REAL
   distinct OID for genuinely new databases, while the bootstrap databases
   keep the legacy 16384 placeholder.
+- **`lookupTable` vs `LookupTable`** — the unexported `lookupTable` (lowercase)
+  is a direct map access without search-path resolution; the exported
+  `LookupTable` on `SearchPathCatalog` tries schemas in order. Using the wrong
+  one bypasses temp-table visibility and partition-detach epoch gating.
+- **`resolveDBOid` defaulting to 1** — every accessor takes `dbOid ...uint32`
+  that defaults to `DefaultDBOid = 1`. A caller that forgets to pass the
+  connection's real database OID silently reads/writes database 1's objects.
+- **Toast table naming** — `ToastRelName` generates `pg_toast_<relOID>` names;
+  `ToastParentTable` resolves the parent relation from a toast OID.
+  `ToastRelFileNode` constructs the `RelFileNode` for the toast fork.
+  `RenameToastRel` is called during `ALTER TABLE RENAME TO` to keep the toast
+  name in sync.
+- **`registerSystemTables` seeds all built-in OIDs** — called once at startup,
+  it installs pg_type, pg_attribute, pg_class, pg_database, pg_proc, and all
+  other bootstrap catalogs with their canonical PG18 OIDs. A new built-in
+  catalog must be added here or the OID is available for user allocation.
+- **`FirstRoutineOID = 1<<17`** — built-in pg_proc entries occupy OIDs 1 through
+  131071 (PG18 has ~4,000 built-in procs). User-defined routines start at 131072.
+  The gap is a safety margin so generated pg_proc entries never collide with
+  user routines.
+
+## Built-in type OID reference (`codec.go`)
+
+The `codec.go` file defines the built-in type OID constants. The most
+frequently referenced:
+
+| OID | Type | Kind |
+|---|---:|---|
+| 16 | `bool` | boolean |
+| 17 | `bytea` | varlena |
+| 18 | `char` | char |
+| 19 | `name` | name |
+| 20 | `int8` | int64 |
+| 21 | `int2` | int16 |
+| 23 | `int4` | int32 |
+| 25 | `text` | varlena |
+| 26 | `oid` | uint32 |
+| 28 | `xid` | uint32 |
+| 29 | `cid` | uint32 |
+| 30 | `oidvector` | varlena |
+| 114 | `json` | varlena |
+| 142 | `xml` | varlena |
+| 600 | `point` | by-ref |
+| 601 | `lseg` | by-ref |
+| 602 | `path` | by-ref |
+| 603 | `box` | by-ref |
+| 604 | `polygon` | by-ref |
+| 628 | `line` | by-ref |
+| 650 | `cidr` | varlena |
+| 700 | `float4` | float32 |
+| 701 | `float8` | float64 |
+| 705 | `unknown` | — |
+| 718 | `circle` | by-ref |
+| 790 | `money` | int64 |
+| 829 | `macaddr` | by-ref |
+| 869 | `inet` | varlena |
+| 1033 | `aclitem` | varlena |
+| 1042 | `bpchar` | varlena |
+| 1043 | `varchar` | varlena |
+| 1082 | `date` | int32 |
+| 1083 | `time` | int64 |
+| 1114 | `timestamp` | int64 |
+| 1184 | `timestamptz` | int64 |
+| 1186 | `interval` | by-ref |
+| 1266 | `timetz` | int64 |
+| 1560 | `bit` | varlena |
+| 1562 | `varbit` | varlena |
+| 1700 | `numeric` | by-ref |
+| 2249 | `record` | — |
+| 2278 | `void` | — |
+| 2279 | `trigger` | — |
+| 2950 | `uuid` | by-ref |
+| 3802 | `jsonb` | varlena |
+| 3904 | `int4range` | by-ref |
+| 4072 | `jsonpath` | varlena |
+
+`REGCLASS` (2205), `REGPROC` (24), `REGOPER` (2203), `REGNAMESPACE` (4089),
+`REGROLE` (4096), and `REGTYPE` (2206) are also defined for the reg* family.
+
+## Codec row layouts
+
+**pg_class row** (144-byte fixed part). The column layout with offsets:
+
+| Offset | Column | Size |
+|---|---:|---:|
+| 0 | `relname` (name) | 64 |
+| 64 | `relnamespace` (oid) | 4 |
+| 68 | `reltype` (oid) | 4 |
+| 72 | `reloftype` (oid) | 4 |
+| 76 | `relowner` (oid) | 4 |
+| 80 | `relam` (oid) | 4 |
+| 84 | `relfilenode` (oid) | 4 |
+| 88 | `reltablespace` (oid) | 4 |
+| 92 | `relpages` (int4) | 4 |
+| 96 | `reltuples` (float4) | 4 |
+| 100 | `relallvisible` (int4) | 4 |
+| 104 | `reltoastrelid` (oid) | 4 |
+| 108 | `relhasindex` (bool) | 1 |
+| 109 | `relisshared` (bool) | 1 |
+| 110 | `relpersistence` (char) | 1 |
+| 111 | `relkind` (char) | 1 |
+| 112 | `relnatts` (int2) | 2 |
+| 114 | `relchecks` (int2) | 2 |
+| 116 | `relhasrules` (bool) | 1 |
+| 117 | `relhastriggers` (bool) | 1 |
+| 118 | `relhassubclass` (bool) | 1 |
+| 119 | `relrowsecurity` (bool) | 1 |
+| 120 | `relforcerowsecurity` (bool) | 1 |
+| 121 | `relispopulated` (bool) | 1 |
+| 122 | `relreplident` (char) | 1 |
+| 123 | `relispartition` (bool) | 1 |
+| 124 | `relrewrite` (oid) | 4 |
+| 128 | `relfrozenxid` (xid) | 4 |
+| 132 | `relminmxid` (xid) | 4 |
+| 136 | `relacl` (aclitem[]) | 4+ |
+| 140 | `reloptions` (text[]) | 4+ |
+| 144 | `relpartbound` (pg_node_tree) | 4+ |
+
+The fixed 144-byte prefix means the codec can decode `relname`/`relnamespace`/
+`relfilenode`/`relkind`/`relnatts` without walking the null bitmap.
+
+**pg_attribute row** (100-byte fixed part):
+
+| Offset | Column | Size |
+|---|---:|---:|
+| 0 | `attrelid` (oid) | 4 |
+| 4 | `attname` (name) | 64 |
+| 68 | `atttypid` (oid) | 4 |
+| 72 | `attstattarget` (int4) | 4 |
+| 76 | `attlen` (int2) | 2 |
+| 78 | `attnum` (int2) | 2 |
+| 80 | `attndims` (int4) | 4 |
+| 84 | `attcacheoff` (int4) | 4 |
+| 88 | `atttypmod` (int4) | 4 |
+| 92 | `attbyval` (bool) | 1 |
+| 93 | `attstorage` (char) | 1 |
+| 94 | `attalign` (char) | 1 |
+| 95 | `attnotnull` (bool) | 1 |
+| 96 | `atthasdef` (bool) | 1 |
+| 97 | `atthasmissing` (bool) | 1 |
+| 98 | `attidentity` (char) | 1 |
+| 99 | `attgenerated` (char) | 1 |
+| 100 | `attisdropped` (bool) | 1 |
+| 101 | `attislocal` (bool) | 1 |
+| 102 | `attinhcount` (int2) | 2 |
+| 104 | `attcollation` (oid) | 4 |
+| 108 | `attacl` (aclitem[]) | 4+ |
+| 112 | `attoptions` (text[]) | 4+ |
+| 116 | `attfdwoptions` (text[]) | 4+ |
+
+## `Catalog` interface method groups
+
+The `Catalog` interface (~85 methods) breaks down into groups:
+
+**Table/index**: `CreateTable`, `CreateIndex`, `DropTable`, `DropIndex`,
+`AddColumn`, `RenameTable`, `RenameIndex`, `RegisterRealTable`,
+`RegisterVirtualTable`, `AllTables`, `AllIndexes`, `TablesInSchema`,
+`UserTableHandles`, `LookupTable`, `LookupIndex`, `LookupTableByOID`,
+`LookupIndexByOID`, `IndexesOnTable`, `HasPrimaryKey`, `ToastRelName`,
+`ToastRelFileNode`, `ToastRelFileNodeByOID`, `DropSessionTempObjects`,
+`SessionTempTableNames`.
+
+**Schema**: `SchemaExists`, `SchemaOID`, `SchemaNameForOID`, `RegisterSchema`,
+`UnregisterSchema`, `RenameSchema`.
+
+**Types**: `RegisterEnum`, `DropEnum`, `AddEnumValue`, `RemoveEnumValue`,
+`RenameEnum`, `LookupEnum`, `LookupEnumByOID`, `LookupEnumByArrayOID`;
+`RegisterDomain`, `DropDomain`, `RenameDomain`, `LookupDomain`,
+`LookupDomainByOID`; `RegisterCompositeType`, `RegisterCompositeTypeWithFields`,
+`DropCompositeType`, `LookupCompositeType`, `LookupCompositeTypeByOID`;
+`RegisterRangeType`, `DropRangeType`, `RenameRangeType`, `LookupRangeType`,
+`LookupRangeTypeByOID`.
+
+**Routines**: `Routines().Create`, `Routines().Drop`, `Routines().Lookup`,
+`Routines().LookupByName`, `Routines().LookupByOID`, `Routines().ResolveByName`,
+`Routines().ResolveBySig`, `Routines().RenameRoutine`, `Routines().SetSchema`.
+
+**Roles/privileges**: `RegisterRole`, `UnregisterRole`, `RenameRole`,
+`RoleOID`, `RoleNameForOID`, `IsSuperuser`, `RoleIsMemberOf`,
+`IsAdminOfRole`, `HasPrivsOfRole`, `GrantRoleMembership`,
+`RevokeRoleMembership`, `GrantTablePrivilege`, `RevokeTablePrivilege`,
+`HasTablePrivilege`, `GrantColumnPrivilege`, `RevokeColumnPrivilege`,
+`RelaclText`, `ProcACLText`, `TypeACLText`, `NamespaceACLText`.
+
+**Statistics**: `RegisterStatistics`, `DropStatistics`, `LookupStatistics`,
+`StatisticsByOID`.
+
+**Extensions/tablespaces/collations**: `CreateExtension`, `DropExtension`,
+`CreateTablespace`, `DropTablespace`, `RenameTablespace`, `LookupTablespaceOID`,
+`CreateCollation`, `DropCollation`, `RenameCollation`, `CreateConversion`,
+`DropConversion`, `CreateTSDict`, `DropTSDict`, `CreateTSConfig`,
+`DropTSConfig`.
+
+**Publications/subscriptions**: `CreatePublication`, `DropPublication`,
+`LookupPublication`, `Publications`, `PublicationsForDBOid`,
+`CreateSubscription`, `DropSubscription`, `LookupSubscription`,
+`Subscriptions`, `SubscriptionsForDBOid`.
+
+**Partition routing**: `FindPartitionForValue`, `FindRangePartitionForValue`,
+`FindRangePartitionForDatums`, `FindHashPartitionForValue`,
+`FindHashPartitionByHash`, `PartitionChildren`, `IndexPartitionChildren`,
+`VisiblePartitionChildren`, `InheritanceChildren`,
+`AccessibleInheritanceChildren`, `RegisterPartitionChild`,
+`UnregisterPartitionChild`, `MarkPartitionDetachPending`,
+`ClearPartitionDetachPending`.
+
+**OID/misc**: `AllocOID`, `AdvanceNextOIDPast`, `NextOID`, `DBOID`,
+`SetDBOID`, `SetComment`, `GetComment`, `AllComments`, `RegisterCompatObject`,
+`DropCompatObject`, `ListCompatObjects`, `SetRelationSizer`, `RelationBlocks`,
+`RegprocName`, `RegprocedureName`, `RegoperatorName`, `IndexRealPages`,
+`ResolveIndexColumnOpclassOID`, `ResolveIndexColumnCollationOID`.
+
+## `SearchPathCatalog` vs `InMemory` — the wrapper pattern
+
+Every `Catalog` method has two implementations: the concrete `*InMemory`
+receiver and the `SearchPathCatalog` wrapper. The wrapper:
+
+1. Delegates the actual work to the wrapped `Catalog`.
+2. Applies search-path resolution for unqualified names (`LookupTable`,
+   `LookupIndex`).
+3. Filters temp tables by `TempOwnerToken`.
+4. Routes per-database operations to the right namespace (the wrapper's
+   `DBOid`).
+5. Applies the partition-detach epoch gate to `VisiblePartitionChildren`.
+
+The executor and optimizer take a `catalog.Catalog` (the interface); the
+postmaster constructs a `SearchPathCatalog` per connection with the session's
+search path. The `SearchPathCatalog` is stateless — it holds a reference to
+the underlying `InMemory` and the session-specific settings.
+
+## `Routine` struct fields (`routines.go`)
+
+The `Routine` struct (35 fields) tracks:
+
+- Identity: `Name`, `Schema`, `DBOid`, `OID`, `Kind` (function/procedure),
+  `Language`, `Owner`.
+- Signature: `ArgTypes []string`, `ArgTypeOIDs []uint32`,
+  `ArgTypeSchemas []string`, `ArgDefaults []string`, `ArgModes []string`,
+  `ArgNames []string`, `ReturnType string`, `ReturnTypeSet bool`.
+- Behavior: `Volatility`, `Strict`, `SecurityDefiner`, `LeakProof`,
+  `ParallelSafe`, `Cost`, `Rows`.
+- Body: `Body string` (SQL/PL/pgSQL source), `Bin string` (C library path),
+  `Prosrc string` (the SQL body text), `Config []string` (proconfig SET).
+- Dependencies: `SequenceDeps`, `RoutineCallOIDs`, `TableDeps`, `ColumnDeps`.
+- Aggregate: `Aggregate *UserAggregate` (prokind='a').
+
+`ResolveByName` returns all overloads of a name; `ResolveBySig` resolves by
+name + arg types. Ambiguity (multiple overloads with the same name and
+arg-types after type coercion) is an error, matching `func_match_argtypes`.
+
+## Virtual catalog registration order
+
+`registerInformationSchemaTables` (catalog.go:11812) registers the
+information_schema views. The order matters because some views reference
+others in their query definitions. The registration order:
+
+1. `information_schema.tables` (the base view)
+2. `information_schema.columns`
+3. `information_schema.schemata`
+4. `information_schema.views`
+5. `information_schema.routines`
+6. `information_schema.parameters`
+7. `information_schema.referential_constraints`
+8. `information_schema.key_column_usage`
+9. `information_schema.table_constraints`
+10. `information_schema.table_privileges`
+11. `information_schema.column_privileges`
+12. `information_schema.role_table_grants`
+13. `information_schema.element_types`
+14. `information_schema.sequences`
+15. `information_schema.domain_constraints`
+16. `information_schema.domains`
+17. `information_schema.domain_udt_usage`
+18. `information_schema.role_column_grants`
+19. `information_schema.role_routine_grants`
+20. `information_schema.check_constraints`
+
+## Type name resolution helpers
+
+`ResolveColumnType` resolves a column type by name, handling `serial`/`bigserial`/
+`smallserial` (via `IsSerialTypeName`) and array type names. `TablesWithColumnOfType`
+finds all tables with a column of a given type (used by `DROP TYPE` RESTRICT).
+`FindColumnUsingDomainTransitively` walks domain base types to find whether a
+domain's base uses a given type.
+
+## Operator lookup for node resolution (`pg_node_oid_lookup.go`)
+
+`LookupOperatorForNode(opname, leftOID, rightOID)` returns an `OperatorEntry`
+for an operator named `opname` with the given operand type OIDs. The
+`pg_operator_seed_data.go` file provides the full 799-row PG18 pg_operator
+seed as `PGOperatorAllEntries()`. The forward index maps
+`(name, leftOID, rightOID)` → operator OID and metadata.
+
+`LookupProcForNode(funcname, argOIDs)` returns the funcid for a built-in
+function. `ProcResultType(funcid)` returns its `prorettype` OID from
+`pgProcRetTypeByOID`.
+
+These three are the resolver's sole entry points into the catalog — the
+`nodes` package must not import the full catalog (layer rule), so it uses
+these narrow forward indexes instead.
+
+## `InMemory` method implementation details
+
+### `ns` / `getOrCreateNS` — namespace resolution
+
+`ns(dbOid)` returns the `tableNamespace` for the given database OID, or
+`emptyTableNamespace` if the database is unknown. `getOrCreateNS` creates
+one if it doesn't exist (called by `CreateTable`, `CreateIndex`, etc.).
+
+`resolveDBOid` defaults `dbOid=0` to `DefaultDBOid=1` — the `PostgresDBOid=5`
+is also mapped to 1 for display purposes only. Write paths always persist
+under the real OID.
+
+### `registerSystemTables` — bootstrap catalog registration
+
+Called once at startup, this method (catalog.go:8418) registers every
+built-in catalog table with its canonical PG18 OID. The registration order:
+
+1. `pg_type` (1247) — heap-backed, non-virtual.
+2. `pg_attribute` (1249) — heap-backed, non-virtual.
+3. `pg_class` (1259) — virtual, Go builder.
+4. `pg_database` (1262) — shared catalog, heap-backed.
+5. `pg_proc` (1255) — virtual, from `pgProcNamesByOID`.
+6. `pg_namespace` (2615) — virtual.
+7. `pg_constraint` (2662) — virtual.
+8. `pg_depend` (2608) — virtual.
+9. `pg_index` (2610) — virtual.
+10. `pg_trigger` (2620) — virtual.
+11. `pg_rewrite` (2618) — virtual.
+12. `pg_operator` (2617) — virtual.
+13. `pg_opclass` (2616) — virtual.
+14. `pg_am` (2601) — virtual.
+15. `pg_amop` (2602) — virtual.
+16. `pg_amproc` (2603) — virtual.
+17. `pg_enum` (3501) — virtual.
+18. `pg_range` (3541) — virtual.
+19. `pg_attrdef` (2604) — virtual.
+20. `pg_inherits` (2611) — virtual.
+21. `pg_stat_user_tables` — virtual (Go builder).
+22. `pg_stat_all_tables` — virtual.
+23. `pg_stat_sys_tables` — virtual.
+24. ... + 20+ more pg_stat_* and information_schema views.
+
+### `syncTableToCatalogHeap` — physical catalog persistence
+
+Called by ~12 DDL statements, this function (operators_ddl.go:18036) writes
+the pg_class, pg_attribute, pg_attrdef, and pg_inherits heap rows:
+
+1. Compute the pg_class heap row as a 144-byte fixed part using the
+   `PGClassRow` codec.
+2. Write the row via `PageAddHeapTuple` + `smgr.Extend`/`WriteBlock`.
+3. Build the pg_class btree index entry and WAL-log it.
+4. For each column, write the pg_attribute heap row (100 bytes).
+5. Build the pg_attribute btree index entry.
+6. For each column default, write the pg_attrdef heap row (with the
+   `adbin` serialized by `nodes.Out`).
+7. For partition children, write the pg_inherits row.
+8. WAL-log every heap mutation.
+
+The function is the "sibling renderer" to the virtual pg_class builder.
+Both must produce the same column values or `\d` and pg_dump disagree.
+
+### `registerSystemTables` bootstrapping flow
+
+The full startup flow for catalog initialization:
+
+1. `initdb/open.go` calls `loadSystemCatalogsIfPresent` which reads the
+   heap files for `pg_type` (1247), `pg_attribute` (1249), and `pg_database`
+   (1262) from disk.
+2. `RegisterRealTable` registers each as a real (non-virtual) table.
+3. `loadUserTablesFromHeap` scans `base/1/1259` (pg_class heap) and
+   registers every user table as a `Table`.
+4. `loadRoutinesFromHeap` scans `pg_proc` for user-defined routines.
+5. `loadUserIndexesFromHeap` scans `pg_index` for user-defined indexes.
+6. `registerSystemTables` installs the virtual system catalogs on top of
+   the heap-backed ones.
+7. WAL replay runs `Register*DuringRecovery` for any DDL records.
+
+The `registerSystemTables` call is idempotent — it skips tables whose OID
+is already registered by `RegisterRealTable`.
+
+## OID allocation details
+
+`AllocOID` returns the next available OID and advances the counter:
+
+```go
+func (c *InMemory) AllocOID() uint32 {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    return c.allocOIDLocked()
+}
+
+func (c *InMemory) allocOIDLocked() uint32 {
+    oid := c.nextOID
+    c.nextOID++
+    return oid
+}
+```
+
+`AdvanceNextOIDPast(maxOID)` bumps the counter past a given OID (used at
+startup to establish the floor). `NextOID` returns the current value without
+allocating.
+
+`FirstUserOID = 16384` means user tables start at OID 16384. Built-in
+catalogs occupy OIDs 1-16383. `BootstrapSuperuserOID = 10` is the
+bootstrapped superuser role. `FirstRoutineOID = 131072` leaves room for
+built-in pg_proc entries.
+
+## `RoleMembership` graph
+
+`roleMembers` maps `roleMembershipKey{member, role}` → `*RoleMembership`:
+
+```go
+type RoleMembership struct {
+    Grantor   uint32
+    Inherit   bool
+    AdminOption bool
+}
+```
+
+`GrantRoleMembership` adds an entry; `RevokeRoleMembership` removes it.
+`RoleIsMemberOf` walks the graph: it follows `member→role` edges
+transitively (respecting `Inherit`). `IsAdminOfRole` checks for a direct
+edge with `AdminOption=true`.
+
+`AllRoleMemberships` returns all edges for `pg_auth_members`. `AllRoleStates`
+returns all roles with their `RoleAttrs` for `pg_roles`.
+
+## Constraint recording
+
+Constraints are stored on the `Table` struct:
+
+- `NamedChecks`: `CHECK (expr)` with a name.
+- `NotNullConstraints`: `NOT NULL` with a name.
+- `CheckConstraints`: unnamed `CHECK (expr)`.
+- `ForeignKeys`: `FOREIGN KEY (col) REFERENCES other(col)`.
+- `PrimaryKey`: derived from `HasPrimaryKey`.
+- `Unique`: `UNIQUE (col)` — stored as `Index.Unique` on the index.
+
+`PGConstraintRowsForDBOid` renders these as `pg_constraint` rows. The
+`contype` is `'p'` (primary key), `'u'` (unique), `'f'` (foreign key),
+`'c'` (check), or `'n'` (not null).
+
+`constraintViewDeps` enforces `DROP CONSTRAINT RESTRICT` for functional
+dependency views: a view is marked as dependent on a constraint via
+`constraintViewDeps[string] = []string{viewName}`. Dropping the constraint
+without `CASCADE` fails if any view depends on it.
+
+## `EnumType` lifecycle
+
+`RegisterEnum(dbOid, name, values)` creates an `EnumType` with the given
+ordered values. `AddEnumValue` appends a new value (at the end for PG
+compatibility — new enum values are always added at the end, not sorted).
+`RemoveEnumValue` removes a value (only if unused). `RenameEnum` renames
+the type.
+
+`LookupEnum` resolves by name; `LookupEnumByOID` resolves by OID;
+`LookupEnumByArrayOID` resolves the array type of an enum (e.g., `_mood`
+for `mood`).
+
+The enum values are stored as `[]EnumValue`:
+
+```go
+type EnumValue struct {
+    OID   uint32
+    Label string
+}
+```
+
+Each value has its own OID (allocated from the global counter). The sort
+order is the position in the `Values` slice (0-indexed).
+
+## `Domain` lifecycle
+
+`RegisterDomain` creates a `Domain` with a base type, not-null constraint,
+default expression, and check constraints. `AddDomainCheck` appends a new
+check. `DropDomain` removes the domain (RESTRICT only — fails if any column
+uses the domain). `DropDomainConstraint` removes a specific check constraint.
+
+`FindColumnUsingDomainTransitively` walks the domain's base type chain to
+find whether any column ultimately uses a given type through a domain.
+
+## `CompositeType` lifecycle
+
+`RegisterCompositeTypeWithFields` creates a composite type (used for `CREATE
+TYPE AS (col1 type1, col2 type2)`). `CompositeField` specifies the field
+name, type, and OID. `LookupCompositeType` resolves by name; `DropCompositeType`
+removes it.
+
+## `RangeType` lifecycle
+
+`RegisterRangeType` creates a range type with a subtype, opclass, collation,
+canonical function, and subtype_diff function. `MultirangeName` is the
+associated multirange type name. `LookupRangeTypeByMultirangeOID` resolves
+the range type from its multirange's OID.
+
+## `Cast` registry
+
+`Cast` entries map `(source OID, target OID)` → `Cast` with the coercion
+method (function, binary-compatible, I/O, etc.). `LookupCast` resolves
+the cast. The cast registry is seeded at startup from the built-in cast
+list (PG18's `cast.c`).
+
+## `Transform` registry
+
+`Transform` entries map `(type OID, language OID)` → `Transform` with
+`FromFuncOID` and `ToFuncOID` for the type's transformation functions
+between the SQL type and the language's internal representation.
+
+## `AccessMethod` registry
+
+`AccessMethod` entries map `(name, dbOid)` → `AccessMethod`:
+
+```go
+type AccessMethod struct {
+    OID        uint32
+    Name       string
+    Type       string // "Table" or "Index"
+    HandlerOID uint32
+}
+```
+
+`AccessMethodOIDByName` resolves the OID for a known access method.
+`IndexAMCapabilityByName` returns a bitmap of capabilities for a named
+index AM (used by the planner to decide which index strategies are
+available). The known access methods are "btree" (goopg's sole index AM),
+"hash" (stored as btree with DeclaredHash flag), and "heap" (the table AM).
+
+## Partition routing internals
+
+The catalog implements partition routing for LIST, RANGE, and HASH methods:
+
+- **LIST partitions**: `FindPartitionForValue` iterates `PartitionBounds` looking
+  for a `PartitionBound` whose `BoundValues` contains the input value. The
+  comparison uses the partition key's opclass comparator.
+- **RANGE partitions**: `FindRangePartitionForValue` binary-searches the bounds
+  sorted by `PartitionBound.Index` (which is the CREATE TABLE order). Each bound
+  is a `[lower, upper)` interval; `FindRangePartitionForDatums` handles the
+  multi-column case by comparing column-by-column with the opclass.
+- **HASH partitions**: `FindHashPartitionForValue` hashes the input value via
+  `FindHashPartitionByHash`, which computes `hash(key) % nPartitions` and maps
+  the remainder to the bound whose `PartitionBound.Index` matches.
+  `FindHashPartitionByHash` is the public API for hash-partition routing.
+
+`PartitionChildren` and `IndexPartitionChildren` return the live partition list
+for a parent, excluding those with `DetachPendingEpoch <= snapshotEpoch`.
+`VisiblePartitionChildren` applies the epoch gate; `InheritanceChildren` bypasses
+it (used for DDL that must see all children).
+
+## ACL model details
+
+ACLs are stored in three parallel maps per table (and per attribute):
+
+```
+tableACLs[relOID][grantee] → map[privilege]bool
+tableACLGrantor[relOID][grantee] → grantorName
+tableACLOrder[relOID] → [grantee1, grantee2, ...]  (preserves grant order)
+```
+
+`RelaclText` renders the PG `aclitem[]` text format (e.g. `{user=arwd/user}`)
+from the three maps. `GrantTablePrivilege` adds a new grantee/privilege pair;
+`RevokeTablePrivilege` removes it. `HasTablePrivilege` checks if a role
+(including inherited roles) has the privilege.
+
+Column-level ACLs follow the same pattern with `attrACLKey{relOID, attNum}`.
+
+`MaterializeOwnerACL` ensures the table owner has their implicit privileges in
+the ACL map; `IsOwnerACLRevoked` detects the case where `REVOKE ALL FROM owner`
+leaves an empty-but-not-null array.
+
+## Role membership resolution
+
+`RoleIsMemberOf` checks if `role` is a member of `parentRole` by walking the
+role membership graph stored in `roleMembers[roleMembershipKey{member, role}]`.
+`IsAdminOfRole` additionally requires `ADMIN OPTION` (the `grantor` field).
+`HasPrivsOfRole` returns true if `role` is a member of `parentRole` with
+`inherit=true` (the `Inherit` flag on the membership).
+
+`AllRoleStates` returns the full set of known roles with their `RoleAttrs` for
+pg_roles. `AllRoleMemberships` returns the grant edges for pg_auth_members.
+
+## Toast table resolution
+
+`ToastRelName` generates `pg_toast_<relOID>` from a relation OID.
+`ToastParentTable` resolves the parent relation from a toast OID, searching
+all namespaces. `ToastRelFileNode` constructs the `RelFileNode` for the
+toast's `_main` fork. `ToastRelFileNodeByOID` resolves by OID alone (used
+by the executor when the toast OID is known but not the parent).
+
+`LookupToastRel` resolves a toast relation by schema+name, returning both
+the OID and whether it is an index. `toastBearingTables` returns all tables
+that have a toast relation (used by VACUUM).
+
+## Search path resolution (`SearchPathCatalog`)
+
+`SearchPathCatalog` wraps a `Catalog` with additional state:
+
+- `schemas []string` — the effective search_path (pulled from the session
+  registry at construction time)
+- `tempOwnerToken string` — the current session's temp-table owner token
+- `snapshotPartitionDetachEpoch uint64` — the snapshot's epoch for partition
+  visibility gating
+- `disableSeqScan bool` — `SET enable_seqscan = off`
+- `dbOid uint32` — the connection's database OID
+
+`LookupTable` tries each schema in order: first the temp namespace (if the
+temp owner token matches), then `pg_catalog`, then `pg_temp` (the session's
+own temp schema), then each search_path schema. `LookupIndex` follows the same
+order. `IndexesOnTable` returns all indexes for a table (including partition
+indexes).
+
+`SearchPathCatalog` also carries `SnapshotPartitionDetachEpoch` to implement
+the detach-concurrently gate: `VisiblePartitionChildren` omits children whose
+`DetachPendingEpoch` is ≤ the snapshot's epoch.
+
+## Virtual row builder reference
+
+Every virtual catalog has a `PG*RowsForDBOid` function. The row builder
+receives the database OID and returns `[][]string` ready for the executor's
+VALUES operator. Key builders:
+
+- **PGClassRowsForDBOid**: 34-column pg_class row. Renders relkind, relnatts,
+  reltuples (from `Stats.Reltuples` or `Table.Stats`), relfrozenxid, relhasindex,
+  relisshared, relpersistence, reloptions, etc.
+- **PGAttributeRowsForDBOid**: 25-column pg_attribute row. Renders attname,
+  atttypid, attlen, attnum, atttypmod, attnotnull, atthasdef, attidentity,
+  attgenerated, attisdropped, etc.
+- **PGIndexesRowsForDBOid**: pg_indexes view (schemaname, tablename, indexname,
+  tablespace, indexdef). The `indexdef` is reconstructed from `Index` fields.
+- **PGConstraintRowsForDBOid**: pg_constraint system view. Only renders
+  constraints that goopg tracks (NOT NULL, CHECK, PRIMARY KEY, UNIQUE, FOREIGN
+  KEY). Renders conname, connamespace, contype, conrelid, confrelid, etc.
+- **PGDependRowsForDBOid**: pg_depend with only sequence-ownership ('a') edges.
+- **PGTriggerRowsForDBOid**: pg_trigger — always returns zero rows (goopg has
+  no trigger support).
+- **PGPolicyRowsForDBOid**: pg_policy — returns zero rows (goopg has no RLS).
+- **PGRewriteRowsForDBOid**: pg_rewrite — returns the `_RETURN` rule for
+  views stored in `Table.Rules`.
+- **PGStatTablesRowsForDBOid**: pg_stat_all_tables / pg_stat_user_tables /
+  pg_stat_sys_tables. Renders seq_scan, seq_tup_read, n_live_tup (from
+  ANALYZE), n_dead_tup, etc. All counters start at zero.
+- **PGStatDatabaseRows**: pg_stat_database (xact_commit, xact_rollback, blks_read,
+  blks_hit, etc.) — all counters start at zero.
+- **PGCollationRowsForDBOid**: pg_collation rows for default and C/POSIX
+  collations plus user-defined collations.
+- **PGConversionRowsForDBOid**: pg_conversion rows for built-in and
+  user-defined encoding conversions.
+- **PGSequenceRowsForDBOid**: pg_sequence rows for owned sequences.
+- **PGTSDictRowsForDBOid / PGTSConfigRowsForDBOid**: text search dictionary
+  and configuration rows.
+- **PGForeignTableRowsForDBOid, PGForeignServerRowsForDBOid,
+  PGUserMappingsRowsForDBOid**: FDW-related rows.
+- **PGDatabasesRows**: pg_database rows (datname, datdba, encoding, datcollate,
+  datconnlimit, etc.).
+- **PGInitPrivsRowsForDBOid**: pg_init_privs rows for system catalog initial
+  privileges.
+
+## `InMemory` method categories
+
+The `InMemory` struct has methods organized by domain:
+
+**Table/index methods**: `CreateTable`, `CreateIndex`, `DropTable`, `DropIndex`,
+`RenameTable`, `RenameIndex`, `AddColumn`, `RegisterRealTable`,
+`RegisterVirtualTable`, `TryRegisterUserTable`, `AllTables`, `AllIndexes`,
+`TablesInSchema`, `UserTableHandles`, `LookupTable`, `LookupIndex`,
+`LookupTableByOID`, `LookupIndexByOID`, `IndexesOnTable`, `HasPrimaryKey`,
+`ToastRelName`, `ToastParentTable`, `ToastRelFileNode`, `ToastRelFileNodeByOID`.
+
+**Schema methods**: `SchemaExists`, `SchemaOID`, `SchemaNameForOID`,
+`RegisterSchema`, `UnregisterSchema`, `RenameSchema`.
+
+**Type methods**: `RegisterEnum`, `DropEnum`, `AddEnumValue`, `RemoveEnumValue`,
+`RenameEnum`, `LookupEnum`, `LookupEnumByOID`, `LookupEnumByArrayOID`;
+`RegisterDomain`, `DropDomain`, `RenameDomain`, `LookupDomain`,
+`LookupDomainByOID`, `LookupDomainByArrayOID`; `RegisterCompositeTypeWithFields`,
+`RegisterCompositeType`, `DropCompositeType`, `LookupCompositeType`,
+`LookupCompositeTypeByOID`; `RegisterRangeType`, `DropRangeType`,
+`RenameRangeType`, `LookupRangeType`, `LookupRangeTypeByOID`,
+`LookupRangeTypeByMultirangeOID`.
+
+**Role/privilege methods**: `RegisterRole`, `UnregisterRole`, `RenameRole`,
+`RoleOID`, `RoleNameForOID`, `IsSuperuser`, `RoleIsMemberOf`, `IsAdminOfRole`,
+`HasPrivsOfRole`, `GrantRoleMembership`, `RevokeRoleMembership`,
+`GrantTablePrivilege`, `RevokeTablePrivilege`, `HasTablePrivilege`,
+`GrantColumnPrivilege`, `RevokeColumnPrivilege`, `RelaclText`,
+`ProcACLText`, `TypeACLText`, `NamespaceACLText`, `ParameterACLText`,
+`DatabaseACLText`, `ForeignServerACLText`, `ForeignDataWrapperACLText`.
+
+**Statistics methods**: `RegisterStatistics`, `DropStatistics`,
+`LookupStatistics`, `StatisticsByOID`, `SetStatisticsTarget`,
+`RenameStatisticsObject`, `SetStatisticsOwner`, `SetStatisticsSchema`.
+
+**Comment methods**: `SetComment`, `GetComment`, `AllComments`.
+
+**OID methods**: `AllocOID`, `AdvanceNextOIDPast`, `NextOID`, `DBOID`,
+`SetDBOID`.
+
+**User operator/aggregate/FDW methods**: `RegisterUserOperator`,
+`DropUserOperator`, `LookupUserOperator`, `LookupUserOperatorByOID`;
+`RegisterUserOperatorFamily`, `DropUserOperatorFamily`,
+`LookupUserOperatorFamily`; `RegisterUserOperatorClass`,
+`DropUserOperatorClass`, `LookupUserOperatorClass`; `RegisterAmOpMember`,
+`RegisterAmProcMember`; `RegisterForeignDataWrapper`, `DropForeignDataWrapper`,
+`LookupForeignDataWrapper`; `RegisterForeignServer`, `DropForeignServer`,
+`LookupForeignServer`; `RegisterUserMapping`, `DropUserMapping`,
+`LookupUserMapping`; `RegisterAccessMethod`, `DropAccessMethod`,
+`LookupAccessMethod`; `RegisterEventTrigger`, `DropEventTrigger`,
+`LookupEventTrigger`; `RegisterUserAggregate`, `DropUserAggregate`,
+`LookupUserAggregateByName`, `LookupUserAggregateByOID`.
+
+**Inheritance/partition methods**: `RegisterInheritanceChild`,
+`UnregisterInheritanceChild`, `InheritanceChildren`,
+`AccessibleInheritanceChildren`, `IsInheritanceDescendant`,
+`HasTempInheritanceChildren`; `RegisterPartitionChild`,
+`UnregisterPartitionChild`, `PartitionChildren`, `IndexPartitionChildren`,
+`VisiblePartitionChildren`, `MarkPartitionDetachPending`,
+`ClearPartitionDetachPending`, `PendingPartitionDetachCount`.
+
+**Extension/misc methods**: `CreateExtension`, `DropExtension`,
+`CreateTablespace`, `DropTablespace`, `RenameTablespace`, `LookupTablespaceOID`;
+`CreateCollation`, `DropCollation`, `RenameCollation`, `LookupCollation`; etc.

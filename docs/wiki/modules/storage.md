@@ -27,6 +27,8 @@ flowchart TD
         PRUNE[prune/freeze]
         CHK[checksum]
         LM[lmgr lock manager]
+        BG[bgwriter]
+        SCAN[scan_ring]
     end
     subgraph IO
         AIO[aio io_uring]
@@ -47,6 +49,8 @@ flowchart TD
     TA --> POOL
     VAC --> POOL
     CAT --> SMGR
+    BG --> POOL
+    POOL --> SCAN
 ```
 
 ## Key Files
@@ -98,6 +102,7 @@ func (p *Pool) RedoRecPtr() uint64 / PublishRedoRecPtr(redo uint64)
 func (p *Pool) PublishRedoBarrier(sample func() uint64) uint64
 func (p *Pool) SetBtreeRecycleHorizon(fn) / BtreeRecycleHorizon() / Close()
 func (p *Pool) EvictionCount() / ExtendCount() / AddReadTimeNanos(n) / AddWriteTimeNanos(n)
+func (p *Pool) HasWALFrontier() bool
 type WALFlusher interface { FlushUpTo(lsn uint64) error; WalRecords() int64; WalBytes() int64 }
 ```
 
@@ -300,14 +305,6 @@ sequenceDiagram
 - `slotEventRing` (64 entries) traces pin/unpin/dirty/evict events for
   `dumpSlotEvents` diagnostics.
 
-### FPI / WAL-before-data
-
-`needsImage(s)` decides whether a logged mutation needs a full-page image:
-when the page's LSN is before `RedoRecPtr()` (the oldest LSN a checkpoint
-could need), the image is emitted so replay has a self-contained page.
-`SetFullPageWrites` toggles `full_page_writes`. `PublishRedoRecPtr`/
-`PublishRedoBarrier` feed the FPI decision from the checkpointer.
-
 ### bufmap
 
 `bufmap` is a lock-free open-addressing hash over `(key0, key1)` packed from the
@@ -315,6 +312,29 @@ tag, with linear probing, tombstone deletion, and a `compact()` pass to keep
 probe chains short. `packVal`/`unpackVal` pack slot index + generation into one
 64-bit value; ABA is defeated by the generation counter, which increments on
 every slot reuse.
+
+```mermaid
+flowchart LR
+    subgraph bufmap
+        BUCKET[bufmapBucket: key0, key1, val]
+        HASH[hash(tag) → bucket index]
+        PROBE[linear probe chain]
+        TOMB[tombstone on delete]
+        COMPACT[compact() pass]
+    end
+    BUCKET --> HASH
+    HASH --> PROBE
+    PROBE --> TOMB
+    TOMB --> COMPACT
+```
+
+### FPI / WAL-before-data
+
+`needsImage(s)` decides whether a logged mutation needs a full-page image:
+when the page's LSN is before `RedoRecPtr()` (the oldest LSN a checkpoint
+could need), the image is emitted so replay has a self-contained page.
+`SetFullPageWrites` toggles `full_page_writes`. `PublishRedoRecPtr`/
+`PublishRedoBarrier` feed the FPI decision from the checkpointer.
 
 ### Heap page / tuple layout
 
@@ -354,6 +374,54 @@ per-backend deadlock timer. 8 modes (`Mode`), each a bit in a `Mask`
 re-acquisition. `deadlock.go` does wait-for-graph detection; `lockwait/`
 implements the wait/cancel primitive. `AllLocks` exposes the full table for
 pg_locks.
+
+```mermaid
+sequenceDiagram
+    participant B1 as Backend 1
+    participant LM as LockManager
+    participant B2 as Backend 2
+    B1->>LM: Acquire(lockTag, ExclusiveLock)
+    LM->>LM: canGrantImmediately? yes
+    LM-->>B1: granted
+    B2->>LM: Acquire(lockTag, ExclusiveLock)
+    LM->>LM: canGrantImmediately? no (conflict)
+    LM->>LM: enqueue waiter, start deadlock timer
+    B1->>LM: Release(lockTag, ExclusiveLock)
+    LM->>LM: wakePassLocked → unparkWaiter
+    LM-->>B2: granted
+```
+
+## Key flow: page read (buffer pool miss)
+
+```mermaid
+sequenceDiagram
+    participant E as executor
+    participant P as Pool
+    participant BM as bufmap
+    participant S as Slot
+    participant M as Manager
+    participant AIO as AIOEngine (io_uring)
+    E->>P: Pin(tag)
+    P->>BM: Lookup(tag)
+    BM-->>P: miss (no slot found)
+    P->>P: clock-sweep victim (usage CAS loop)
+    P->>S: flush dirty victim (WalFlusher.FlushUpTo)
+    P->>P: claimSlotLocked(slot, tag)
+    alt AIO enabled
+        P->>M: PrefetchBlock(rel, blk, alignedBuf)
+        M->>AIO: Submit(ReadOp)
+        AIO-->>M: AIOHandle
+        M->>M: wait for completion
+        M-->>P: data in buf
+    else sync I/O
+        P->>M: ReadBlock(rel, blk, page)
+        M-->>P: data in page
+    end
+    P->>P: VerifyPage (checksum check)
+    P->>BM: Insert(tag, slotIdx, gen)
+    P->>S: state.Store(valid|pinCount=1|gen)
+    P-->>E: *Slot (page ready)
+```
 
 ## Dependencies
 
@@ -400,3 +468,369 @@ pg_locks.
   the checkpointer's dirty-page budget.
 - **Arena alignment** — slot pages come from a 4 KiB-aligned arena so `O_DIRECT`
   reads (which need aligned buffers) work without a bounce copy.
+- **Slot state packing is load-bearing** — `pinCount(22b)`, `usageCount(8b)`,
+  `gen(15b)`, plus `valid`/`dirty`/`ioInflight` bits pack into one 64-bit word.
+  A shift or mask change corrupts the entire atomic state: `statePin`,
+  `stateUsage`, `stateGen` accessors must match their `slot*Mask`/`slot*Shift`
+  constants exactly.
+- **bufmap compact() is O(nSlots)** — called when deletions exceed 25% of
+  capacity. A concurrent Insert during compaction reads stale metadata; the
+  compaction holds `bufmap.mu` but not the pool lock, so Insert must check
+  whether the slot is still valid after the compaction cursors pass it.
+- **LockManager 8 modes** — `AccessShareLock`, `RowShareLock`, `RowExclusiveLock`,
+  `ShareUpdateExclusiveLock`, `ShareLock`, `ShareRowExclusiveLock`,
+  `ExclusiveLock`, `AccessExclusiveLock`. `ConflictsWith(m, held)` checks
+  whether `held` (a `Mask` of held modes) conflicts with requested mode `m`.
+  The conflict matrix is PG's standard lock table; a wrong bit here produces
+  spurious deadlocks or silent data races.
+
+## Slot state packing details
+
+The `Slot` struct uses a single `atomic.Uint64` for the state word. The bit
+layout is:
+
+```
+bits 0-21:   pinCount (22 bits, max ~4M concurrent pins)
+bits 22-29:  usageCount (8 bits, clock-sweep second-chance)
+bits 30-31:  flags (valid, dirty, ioInflight — 3 bits)
+bits 32-46:  generation (15 bits, ABA defense)
+bits 47-63:  reserved
+```
+
+The `statePin`, `stateUsage`, `stateGen`, `stateValid`, `stateDirty`, and
+`stateIO` accessors extract the relevant bits. `Pin()` CAS-increments
+`pinCount`; `Unpin()` CAS-decrements and triggers the clock-sweep at zero.
+`contentMu` is an `RWMutex` protecting the page content; readers share the
+page via `RLock`/`RUnlock`, writers use `Lock`/`Unlock`.
+
+## Pool configuration (`PoolConfig`)
+
+```go
+type PoolConfig struct {
+    NBuffers     int   // total buffer slots (default 1024)
+    WALFlusher   WALFlusher
+    FullPageWrites *bool
+    Tracer       *iotrace.Tracer
+    Mgr          *Manager
+    ArenaSize    int   // 4 KiB-aligned arena size (default 4 MiB)
+    ClockSweepInterval int // eviction interval (default 100)
+}
+```
+
+`NewPool` allocates the arena, initializes `bufmap`, and creates the
+`Slot` array. The `WALFlusher` is the durable interface for flushing WAL
+before data writes.
+
+## Lock manager internals (`lmgr/lockmgr.go`)
+
+`LockManager` owns a `map[LockTag]*lockState`. Each `lockState` has:
+
+- `held map[BackendID]Mask` — the lock modes each backend currently holds.
+- `waiters []Waiter` — FIFO queue of waiters, each with a `context.Context`
+  and a `ch chan struct{}` for wakeup.
+- `granted Mask` — the union of held modes (fast path for conflict check).
+
+`canGrantImmediately` checks whether the requested mode conflicts with the
+`granted` mask. If not, the backend is added to `held` and the mask is
+updated. If yes, the backend is enqueued in `waiters` and its context's
+`Done()` channel is selected on.
+
+`Release` removes a held mode from `held` and calls `wakePassLocked` to
+grant the next compatible waiter(s). `ReleaseAll` removes all held modes for
+a backend.
+
+`hasSimpleDeadlock` checks if the current backend already holds a lock that
+would prevent the requested mode from being granted (simple deadlock
+detection, matching PG's `CheckDeadlock`).
+
+## Deadlock detection (`lmgr/deadlock.go`)
+
+The deadlock detector builds a wait-for-graph from the lock manager's state
+and runs cycle detection. `RunDeadlockDetection` is called periodically from
+the checkpointer goroutine. When a cycle is found, the youngest transaction
+in the cycle is aborted (40P01).
+
+`lockwait/` implements `LockWaitSet` — a per-backend wait primitive that
+combines the lock wait with a timeout and a cancel function.
+
+## `fastpath.go`
+
+The fastpath gives a backend a small cache of lock tags it has already
+acquired (`AccessShareLock`/`RowShareLock`). An `Acquire` for a fastpath
+hit skips the lock manager entirely. `fastpathEntry` is a 16-entry ring
+buffer per backend.
+
+## Buffer pool read/write timing
+
+`AddReadTimeNanos`/`AddWriteTimeNanos` accumulate I/O timing for pg_stat_io
+and EXPLAIN (BUFFERS). The counters are exposed via `BufferCounters()`.
+
+## Background writer (`bgwriter.go`)
+
+`backgroundWriter` is a goroutine that periodically runs `WriteDirtyPages`
+to flush a batch of dirty pages. The batch size is `PoolConfig.DirtyPageBatch`
+(default 32). The bgwriter cooperates with the checkpointer: the checkpointer
+flushes all dirty pages at checkpoint time; the bgwriter flushes continuously
+to reduce the checkpoint burst.
+
+## Page identity probe (`pageident_probe.go`)
+
+`PageIdentityProbe` reads a page and identifies its contents by examining
+the page header, the opaque area, and the first line pointer. This is used
+by the `amcheck` verification functions and by the `pageident` tool for
+diagnosing corrupt pages.
+
+## Checksum algorithm (`checksum.go`)
+
+`PageChecksum` implements the FNV-1a 16-bit hash over the page content,
+with the checksum field itself zeroed during computation. The algorithm
+matches PG's `checksum_impl.h` exactly:
+
+```go
+func PageChecksum(page []byte, blkno BlockNumber) uint16 {
+    // port of PG's pg_checksum_page
+    // uses FNV-1a with seed = blkno + 1 (so zero never appears)
+}
+```
+
+`VerifyPage` recomputes the checksum and compares it to `pd_checksum`.
+Checksums are only verified when `DataChecksumVersion == 1` in pg_control.
+
+## FSM binary tree geometry (`fsm_fork.go`)
+
+The FSM fork is a fixed binary tree:
+
+- Each leaf node covers 1 heap page, with a 0-255 free-space category.
+- Each internal node holds `max(left, right)`.
+- The tree is stored in blocks of 32 B per node (256 categories).
+- `buildFSMTree` constructs the tree from a `[]uint16` of free-space values.
+- `GetPageWithFreeSpace` navigates the tree to find a leaf with enough space.
+
+The `fsmSpaceAvailToCat` table maps byte counts to 0-255 categories:
+
+```
+0-31 bytes:     category 0
+32-63 bytes:    category 1
+64-127 bytes:   category 2
+128-255 bytes:  category 3
+256-511 bytes:  category 4
+... geometrically up to ...
+BlockSize:      category 255
+```
+
+## Key flow: VACUUM page prune
+
+```mermaid
+sequenceDiagram
+    participant V as vacuumOp
+    participant P as Pool
+    participant H as heap.go
+    participant F as FSM
+    participant VM as VisibilityMap
+    V->>P: Pin(tag) → read page
+    V->>H: PagePruneOpt(page, oldestXmin)
+    H->>H: TupleDeadToAll? yes → LP_DEAD
+    H->>H: redirect HOT chain tails
+    H-->>V: PruneResult{deadSlots}
+    V->>H: CollectDeadHeapSlots(page, isDead)
+    V->>H: VacuumHeapPageBySlots(page, deadSlots)
+    H->>H: defragment page
+    H->>H: ClearHeapTupleXmax for frozen tuples
+    V->>F: RecordFreeSpace(rel, blk, freeBytes)
+    V->>VM: SetAllVisible(rel, blk) if all visible
+    V->>P: MarkDirtyLogicalChange(slot, lsn)
+    V->>P: Unpin(slot)
+```
+
+## Commit order and LSN stamping
+
+The `flushSlot` path in the buffer pool ensures WAL-before-data:
+
+1. `MarkDirtyWithLSN(slot, lsn)` records `max(lsn, slot.hintFlushBarrier)`
+   as the flush threshold.
+2. At write time (`evictVictim` or `FlushAll`), `flushSlot` calls
+   `WALFlusher.FlushUpTo(threshold)`.
+3. Once the WAL is flushed past the threshold, the data page is written
+   to disk via `Manager.WriteBlock` or `WriteBlockAIO`.
+
+The `pd_lsn` on the page is set to the mutation's WAL LSN. On recovery,
+replay checks `pd_lsn` against the record's LSN to skip already-applied
+records (`GOOPG_PDLSN_ASSERT` validates this invariant).
+
+## Buffer pool eviction details
+
+The clock-sweep eviction algorithm:
+
+```mermaid
+flowchart TD
+    A[Pool.Pin miss] --> B{find victim via clock hand}
+    B --> C[read usageCount]
+    C --> D{usageCount > 0?}
+    D -- yes --> E[usageCount--, advance hand, retry]
+    D -- no --> F[claim victim]
+    F --> G{is dirty?}
+    G -- yes --> H[flushSlot: WAL-flush + write]
+    G -- no --> I[skip flush]
+    H --> J[insert new tag into bufmap]
+    I --> J
+    J --> K[load page from disk under contentMu]
+```
+
+The clock hand is a `uint32` index into the slot array. `EvictionCount`
+tracks how many times a victim was claimed. The `usageCount` gives every
+recently-pinned page a second chance before eviction, preventing thrashing
+under scan workloads.
+
+The eviction path takes `pinMu` (a mutex) to serialize victim selection,
+then `contentMu` on the victim slot for the disk read. The `bufmap`
+insert/delete happens under the same lock, so a concurrent `Pin` for the
+same tag either sees the old mapping (and re-pins) or the new one.
+
+## Fork I/O and O_DIRECT
+
+`ManagerConfig` controls whether the storage manager uses `O_DIRECT`:
+
+```go
+type ManagerConfig struct {
+    DataDir        string
+    Checksums      bool   // verify checksums on read
+    ODirect        bool   // use O_DIRECT (requires aligned buffers)
+    AIO            bool   // enable the io_uring AIO seam
+    // ...
+}
+```
+
+When `ODirect=true`, every read/write uses the 4 KiB-aligned arena pages
+directly — no bounce copy. When `AIO=true`, reads/writes are submitted to
+the io_uring engine and awaited via `AIOHandle`.
+
+`PrefetchBlock` returns an `AIOHandle` that the caller polls; `WriteBlockAIO`
+does the same for writes. `ReleaseForgotten` reclaims handles whose
+completion was never awaited.
+
+## `smgr` fork path resolution
+
+`RelForkPath(dataDir, rfn)` resolves a relation fork to its on-disk path:
+
+| Fork | Suffix |
+|---|---:|
+| `MainForkNumber` | `.rel` (the file itself) |
+| `FSMForkNumber` | `_fsm` |
+| `VisibilityMapForkNumber` | `_vm` |
+| `InitForkNumber` | `_init` |
+
+The directory is `base/<dbOid>/` for per-database relations or `global/`
+for shared catalogs (DBOid == 0). The filename is the relfilenode OID with
+the fork suffix.
+
+`TruncateRelationTo(rel, nBlocks)` truncates the main fork to `nBlocks`
+and the FSM/VM forks to the corresponding block counts.
+
+## Heap page layout constants
+
+The heap page header (`PageHeader`) field offsets:
+
+| Offset | Field | Size |
+|---|---:|---:|
+| 0 | `pd_lsn` (high 32 bits) | 4 |
+| 4 | `pd_lsn` (low 32 bits) | 4 |
+| 8 | `pd_checksum` | 2 |
+| 10 | `pd_flags` | 2 |
+| 12 | `pd_lower` | 2 |
+| 14 | `pd_upper` | 2 |
+| 16 | `pd_special` | 2 |
+| 18 | `pd_pagesize_version` | 2 |
+| 20 | `pd_prune_xid` | 4 |
+
+`pd_flags` bits: `PD_HAS_FREE_LINES` (0x0001), `PD_PAGE_FULL` (0x0002),
+`PD_ALL_VISIBLE` (0x0004), `PD_VALID_FLAG_BITS` (0x0007).
+
+The tuple header (`HeapTupleHeader`, 23 bytes):
+
+| Offset | Field | Size |
+|---|---:|---:|
+| 0 | `t_xmin` | 4 |
+| 4 | `t_xmax` | 4 |
+| 8 | `t_cid` | 4 |
+| 12 | `t_ctid` | 6 |
+| 18 | `t_infomask2` | 2 |
+| 20 | `t_infomask` | 2 |
+| 22 | `t_hoff` | 1 |
+
+`t_infomask` bits include `HeapXminCommitted` (0x0100), `HeapXminInvalid`
+(0x0200), `HeapXmaxInvalid` (0x0800), `HeapXmaxCommitted` (0x0400),
+`HeapHasNull` (0x0001), `HeapHasVarWidth` (0x0002), `HeapHasExternal` (0x0004),
+`HeapXmaxIsMulti` (0x1000), `HeapXmaxLockOnly` (0x0080),
+`HeapXmaxKeyShrLock` (0x0010), `HeapXmaxExclLock` (0x0040), `HeapComboCID`
+(0x0020). **Note: goopg's `HeapXmaxCommitted` (0x0400) and `HeapXmaxInvalid`
+(0x0800) are SWAPPED relative to PG's `HEAP_XMAX_COMMITTED` (0x0800) /
+`HEAP_XMAX_INVALID` (0x0400)** — this is a deliberate choice (the comments
+say "Mirrors PostgreSQL's" but the hex values are reversed). The swap is
+consistent throughout the codebase, so goopg-authored pages are self-consistent,
+but a PG reader reading a goopg page directly would misinterpret the xmax
+status bits. The WAL redo path uses goopg's own constants, not PG's.
+
+`t_infomask2` bits include `HeapHotUpdated` (0x4000), `HeapOnlyTuple` (0x8000),
+`HeapKeysUpdated` (0x2000). `HeapNattsMask` (0x07FF) masks the number of
+attributes from the low 11 bits.
+
+## Page checksum interplay with hint bits
+
+A page checksum covers the whole 8 KiB. Setting a hint bit (e.g.
+`HEAP_XMIN_COMMITTED`) without bumping `pd_lsn` would make the checksum
+stale, so hint-bit writes use `MarkDirtyLogicalChange` which records a
+logical (non-physical) change and does NOT require a WAL record — the
+checksum is recomputed by the writeback path. `pd_lsn` is not bumped for
+hint-bit-only changes (matching PG's `MarkBufferDirtyHint`).
+
+## VM fork bit semantics
+
+`vm.go` provides the runtime visibility map:
+
+```go
+const (
+    VISIBLE_MASK  uint8 = 1 << 0 // ALL_VISIBLE
+    FROZEN_MASK   uint8 = 1 << 1 // ALL_FROZEN
+)
+```
+
+`SetAllVisible(rel, blk)` sets the ALL_VISIBLE bit (and, if the page is also
+all-frozen, the ALL_FROZEN bit). `PageAllVisible(p, horizon)` is the page-level
+check used by VACUUM to decide whether to set the bit. `CountAllVisible(rel)`
+returns the number of all-visible pages (for pg_class.relallvisible).
+
+`vm_redo.go`'s `VMPageSetBits`/`VMPageClearBits` operate on the on-disk VM
+fork page directly (recovery has no in-memory VM).
+
+## pg_locks and AllLocks
+
+`AllLocks()` returns `[]LockHolding` for pg_locks:
+
+```go
+type LockHolding struct {
+    Database OID
+    Relation OID
+    Page     uint32
+    Tuple    uint16
+    VirtualXID uint32
+    Mode     Mode
+    Granted  bool
+    PID      int32
+    // ...
+}
+```
+
+The lock manager's `Holders(t)`/`Waiters(t)` are the per-tag views. The
+executor builds the pg_locks virtual rows from `AllLocks()`.
+
+## Storage used-by and layering
+
+Storage is a lower-layer dependency used by nearly everything, but it must
+NOT import executor/optimizer/catalog. The reverse direction (those packages
+import storage) is the rule. The `lmgr` subpackage is further isolated:
+it uses only `lockwait` internally and never imports the buffer pool.
+
+The injected function hooks (`SetRelationSizer`, `RelAllVisibleFunc`, etc.)
+are declared in catalog but implemented via `SetRelationSizer`-style setters
+so catalog can hand the buffer pool a function pointer without an import
+cycle.

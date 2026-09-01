@@ -45,6 +45,8 @@ func (v *Variable) Set(value string, source Source) error
 func (v *Variable) Reset()
 func (v *Variable) Display() string
 func (v *Variable) FormatDisplayValue(raw string) string
+func (v *Variable) canonicalize(value string) (string, error)
+func (v *Variable) canonicalizeFrom(current, value string) (string, error)
 func NewSessionRegistry(global *Registry) *SessionRegistry
 func (s *SessionRegistry) Get(name) (*Variable, string, bool)
 func (s *SessionRegistry) GetDisplay(name) (*Variable, string, bool)
@@ -252,6 +254,7 @@ func (c *Context) AllocBytes(b []byte) (offset, length uint32)
 func (c *Context) AllocString(s string) (offset, length uint32)
 func (c *Context) Bytes(offset, length uint32) []byte
 func (c *Context) Usage() (allocated, peak int64)
+func (c *Context) growChunk(n int)
 func Lookup(id ContextID) *Context
 func Perm() *Context                             // process-global permanent context (slot 1)
 func AllocFor[T any](c *Context) *T
@@ -266,16 +269,6 @@ context keeps the unsynchronized fast path. `gen` is bumped on `Reset()` for
 debug use-after-Reset detection. `lifetimeCounters` (`totalAllocated`,
 `currentBytes`, `peakBytes`) back `EXPLAIN (MEMORY)` and survive `Reset()`.
 
-**Gotchas** — `AllocSlice[T]` requires a pointer-free `T` (the backing slab is
-allocated as `[]byte`, a GC noscan span; a Go pointer stored in a `T` is
-invisible to the mark phase). `putChunk` rejects buffers whose `cap != cs` —
-an oversized chunk (from a single allocation exceeding the chunk size) would
-otherwise land in the wrong pool and break the offset encoding (an in-chunk
-offset ≥ cs aliases to chunkIdx+1, and `Bytes()` resolves into the wrong chunk,
-silently returning nil). The `Context` struct is size-constrained to ≤ 96 B
-(`TestContextSizeof`), which is why `lifetimeCounters` and the permanent-context
-mutex live off-struct.
-
 ### `internal/utils/adt/similarto` — SIMILAR TO regex
 
 The `similarto.go` file (179 LOC) translates PG's `SIMILAR TO` pattern syntax
@@ -287,6 +280,26 @@ into a Go `regexp` for `LIKE`-style pattern matching (rewriting `%`→`.*`,
 The `pgarray.go` file (529 LOC) provides array element type name resolution /
 lookup helpers used by the catalog and executor, plus array-output formatting
 helpers (`array_elem_output_style`, `bytea_output_escape`).
+
+## Key flow: memory context reset cascade
+
+```mermaid
+sequenceDiagram
+    participant E as executor End()
+    participant C as Session Context
+    participant T as Txn Context
+    participant S as Stmt Context
+    participant X as Expr Context
+    E->>C: Release() (end of connection)
+    C->>C: pool chunk slabs, drop child registry
+    E->>T: Reset() (end of transaction)
+    T->>S: cascade Reset()
+    S->>X: cascade Reset()
+    X->>X: rewind chunks to len 0 (backing arrays retained)
+    X->>X: gen++ (use-after-Reset detection)
+    T->>T: lifetimeCounters survive
+    T->>T: bump gen, reset alloc pointer
+```
 
 ## Public API
 
@@ -340,3 +353,338 @@ the per-package API blocks above).
   separate `Hint` (`Available values: …`) rather than baking the list into the
   message, matching PG's `set_config_option` PGC_ENUM branch; callers that can
   surface a HINT should `errors.As` for the type.
+- **`AllocSlice[T]` pointer-free requirement** — the backing slab is allocated
+  as `[]byte` (a GC noscan span); a Go pointer stored in a `T` is invisible to
+  the mark phase. Use `AllocFor[T]` for pointer-bearing types.
+- **`putChunk` rejects `cap != cs`** — an oversized chunk from a single
+  allocation exceeding the chunk size would land in the wrong `sync.Pool` and
+  break the offset encoding (an in-chunk offset ≥ cs aliases to chunkIdx+1,
+  and `Bytes()` resolves into the wrong chunk, silently returning nil).
+- **Context struct is ≤ 96 B** — `TestContextSizeof` pins it; `lifetimeCounters`
+  and the permanent-context mutex live off-struct because they would blow the
+  size budget.
+- **`goroutineID` via `runtime.Stack`** — the old loop searched the whole stack
+  string for the first space, landing on `s[9]==' '`; the fixed version walks
+  to the "goroutine" prefix. Keep the fix — a bare search silently picks the
+  wrong number on unrelated stack layouts.
+
+## GUC variable internals
+
+`Variable` struct (guc.go:136):
+
+```go
+type Variable struct {
+    Name    string
+    Value   string
+    BootValue string
+    RstVal  string  // reset_val — the session-start value
+    Min, Max int64
+    Type    Type    // Bool, Int, Real, String, Enum
+    Context Context // Internal, Postmaster, SIGHUP, Backend, Suset, Userset
+    Source  Source  // Default, EnvVar, ConfigFile, CmdLine, Override, Session, Local
+    Scope   Scope   // Server, Database, Role, Session, Transaction
+    Unit    Unit    // None, Bytes, KB, MB, GB, TB, Ms, S, Min, H, D, Blocks
+    Flags   VarFlag // Report, DisallowInFile, NotInSample, Custom, Explain
+    Enum    []string
+    OnChange func()
+    shortDesc, longDesc string
+    // ... internal state
+}
+```
+
+`canonicalize` converts a user-supplied value to canonical form:
+- Ints: `parseIntWithUnit` → unit conversion to native unit.
+- Enums: case-insensitive match against `Enum[]`, fallback to bool parser if
+  the enum has both "on" and "off" entries.
+- Bools: `parseBoolish` (1/yes/on/true/t, 0/no/off/false/f).
+- Reals: `strconv.ParseFloat` with locale-independent decimal point.
+
+`canonicalizeFrom` is the same but with an explicit baseline — used only by
+`DateStyle`, where a partial spec (e.g. `SET DateStyle = 'SQL'`) must keep the
+existing order component.
+
+## `BuildDefaultRegistry` structure (`defaults.go`)
+
+`BuildDefaultRegistry` (1,603 LOC) registers every PG18 GUC. The function
+follows the shape of PG's `guc_tables.c`:
+
+```go
+func BuildDefaultRegistry() *Registry {
+    r := NewRegistry()
+    r.MustRegister(vars...) // ~500 Variables
+    return r
+}
+```
+
+Each `Variable` is constructed with `NewVariable`:
+
+```go
+r.MustRegister(NewVariable(Variable{
+    Name: "work_mem", Type: TypeInt, Context: ContextUserset,
+    Value: "4194304", BootValue: "4194304",
+    Min: 65536, Max: math.MaxInt64, Unit: UnitKB,
+    shortDesc: "Sets the maximum memory used for query workspaces.",
+    longDesc:  "...",
+}))
+```
+
+The `TestSampleConfigCoversRegistry` test ensures every GUC with
+`FlagNotInSample` cleared appears in the `postgresql.conf.sample` template.
+
+## SessionRegistry transaction journal (`session.go`)
+
+`BeginTransaction` snapshots the current session values into `txPrior`:
+any `SET` (not `SET LOCAL`) during the transaction records the value it
+replaces. `EndTransaction(false)` — ABORT — restores every `txPrior` entry:
+if the prior value was nil (key absent), the key is deleted; otherwise the
+prior value is written back. `EndTransaction(true)` — COMMIT — drops the
+journal; `SET` values are now permanent.
+
+`SET LOCAL` values are stored in a separate `localLayer` map (not journalled).
+On both COMMIT and ROLLBACK, the local layer is dropped. On ABORT, the
+`txPrior` restore runs AFTER the local layer is dropped, so the session
+returns to the pre-transaction state.
+
+## `mb` encoding conversion dispatch (`conv.go`)
+
+`conv.go` provides `Convert` (encoding conversion) and `BOMHandling` (UTF-16
+byte-order mark detection). The conversion dispatch maps (src encoding,
+dst encoding) to a converter function. Known converters are in `euc_jp.go`,
+`euc_kr.go`, `latin1.go`, `latin2.go`. Each converter implements:
+- `Convert(src []byte) ([]byte, error)` — transcode bytes.
+- `Width(r rune) int` — display width for the encoding.
+
+## ActivityRegistry slot layout (`registry.go`)
+
+`activitySlot` is 64-byte cache-line-aligned:
+
+```
+offset 0:  waitInfo uint32 (typeCode<<16|eventCode)
+offset 4:  _pad0 [4]byte
+offset 8:  stateChange int64 (unix nanos)
+offset 16: cold atomic.Pointer[coldActivity]  // 8 bytes
+offset 24: _pad1 [40]byte  // pad to 64
+```
+
+`coldActivity` is a separately allocated struct (not inline) so the atomic
+pointer swap is the only write: `cold = new(coldActivity)`, then `Store`.
+The old `cold` is garbage-collected.
+
+`Snapshot()` iterates all slots, reads the `cold` pointer atomically, and
+copies the fields. It never blocks a backend — if a backend is mid-Reset
+(disconnecting), the `cold` pointer may be nil, and the snapshot skips that
+slot.
+
+## Annual activity slot count
+
+`capacity` defaults to 1024 (matching PG's `max_connections` default). 16
+background-worker slots are reserved for WAL writer, checkpointer, autovacuum,
+bgwriter, and walsenders. The `Register()` method returns an error when all
+slots are full.
+
+## GUC bridges (`OnChange`)
+
+`OnChange` hooks bridge SQL-level SET to package-level atomic flags:
+
+```go
+r.OnChange("enable_nestloop", func(value string) {
+    planner.SetNLIEnabled(value == "on")
+})
+r.OnChange("work_mem", func(value string) {
+    executor.SetWorkMem(value)
+})
+r.OnChange("enable_seqscan", func(value string) {
+    planner.SetSeqScanEnabled(value == "on")
+})
+r.OnChange("enable_hashjoin", func(value string) {
+    planner.SetHashJoinEnabled(value == "on")
+})
+r.OnChange("enable_mergejoin", func(value string) {
+    planner.SetMergeJoinEnabled(value == "on")
+})
+```
+
+These are declared in the `init()` functions of the respective packages and
+registered in `BuildDefaultRegistry`'s init chain.
+
+## `internal/utils/errcodes` — SQLSTATE codes
+
+The `codes.go` file defines every SQLSTATE code as an `errcodes.Code` type.
+Key groups:
+
+| Range | Category |
+|---|---|---:|
+| `00000` | Successful completion |
+| `01000` | Warning |
+| `02000` | No data |
+| `03XXX` | SQL statement not yet complete |
+| `08XXX` | Connection exception |
+| `09XXX` | Triggered action exception |
+| `0AXXX` | Feature not supported |
+| `0DXXX` | Invalid target type specification |
+| `0FXXX` | Locator exception |
+| `0LXXX` | Invalid grantor |
+| `0PXXX` | Invalid role specification |
+| `20XXX` | Case not found for CASE statement |
+| `21XXX` | Cardinality violation |
+| `22XXX` | Data exception (division by zero, numeric overflow, etc.) |
+| `23XXX` | Integrity constraint violation |
+| `24XXX` | Invalid cursor state |
+| `25XXX` | Invalid transaction state |
+| `26XXX` | Invalid SQL statement name |
+| `27XXX` | Triggered data change violation |
+| `28XXX` | Invalid authorization specification |
+| `2BXXX` | Dependent privilege descriptors still exist |
+| `2DXXX` | Invalid transaction termination |
+| `2FXXX` | SQL routine exception |
+| `34XXX` | Invalid cursor name |
+| `38XXX` | External routine exception |
+| `39XXX` | External routine invocation exception |
+| `3BXXX` | Savepoint exception |
+| `3DXXX` | Invalid catalog name |
+| `3FXXX` | Invalid schema name |
+| `40XXX` | Transaction rollback (serialization failure, deadlock, etc.) |
+| `42XXX` | Syntax error or access rule violation |
+| `44XXX` | WITH CHECK OPTION violation |
+| `53XXX` | Insufficient resources |
+| `54XXX` | Program limit exceeded |
+| `55XXX` | Object not in prerequisite state |
+| `57XXX` | Operator intervention |
+| `58XXX` | System error (IO error, etc.) |
+| `F0000` | Config file error |
+| `HVXXX` | FDW error |
+| `P0000` | PL/pgSQL error |
+| `XX000` | Internal error |
+
+`SerializationFailure` (40001) is used by SSI pre-commit.
+`DeadlockDetected` (40P01) is used by the WFG deadlock checker.
+`UniqueViolation` (23505) is used by unique constraint checks.
+`ForeignKeyViolation` (23503) is used by FK enforcement.
+
+## `internal/utils/adt` overview
+
+Beyond `datetime`, `similarto`, and `array`, the `adt/` tree currently
+contains exactly three leaf packages (verified against the source): `array`,
+`datetime`, and `similarto`. Everything else that PG puts under
+`src/backend/utils/adt/` (numeric, bit, network, tsquery/tsvector, geometric,
+etc.) lives in `internal/executor/expr.go` as hand-ported builtins rather
+than as `utils/adt` subpackages — the numeric, bit, network, and text-search
+type helpers are implemented there. When looking for a type helper, check
+`expr.go` first; only datetime/similarto/array live in `utils/adt`.
+
+### `adt/numeric` (in `expr.go`)
+
+Numeric parsing and formatting live in `internal/executor/expr.go`. The
+numeric value is represented as `mantissa * 10^-scale` where mantissa can be
+an int64 (fast path, `Datum.Int`) or a `big.Int` (big-mantissa path). Key
+functions:
+
+```go
+func parseNumericOrZero(s string) *big.Int
+func newNumericFromFloat(f float64) Datum
+func roundNumericToInt(d Datum, pos int) (int64, error)
+func roundNumericToScale(d Datum, scale int16) Datum
+func int64DivFastToNumeric(val int64, log10 int) Datum
+func toCharNumericFormat(val Datum, fmtStr string) string
+```
+
+The `big.Int` mantissa path allocates from `mmgr.Perm()` (the permanent
+context) so it survives without per-statement Reset.
+
+### `adt/array` (`pgarray.go`)
+
+The `array` package provides:
+- `arrayElemOutputStyle` / `byteaOutputEscape` — array output formatting.
+- Array element type name resolution / lookup helpers used by the catalog
+  and executor.
+
+### `adt/bit`, `adt/network`, `adt/tsquery`/`adt/tsvector`
+
+No such `utils/adt` subpackages exist. Bit/varbit operators, inet/macaddr
+parsing, and text-search functions are implemented as builtins in
+`internal/executor/expr.go` (`evalPgLSNBinary`, `parseMacaddrLiteral`,
+`parseInetLiteral`, etc.). Text search configs/dictionaries are resolved via
+the catalog's `UserTSConfig`/`UserTSDict` registries.
+
+## `internal/utils/activity` wait-event constants
+
+The wait-event type and name constants are upstream-compatible so
+`pg_stat_activity.wait_event_type`/`wait_event` match a real PG:
+
+```
+WaitEventTypeIO      → DataFileRead, DataFileExtend, WALWrite, WALSync, ...
+WaitEventTypeLock    → relation, extend, tuple, ...
+WaitEventTypeClient  → ClientRead, ClientWrite
+WaitEventTypeTimeout → PostmasterMain, BgWorkerStartup, ...
+WaitEventTypeActivity → BgWriterMain, CheckpointerMain, AutoVacuumMain, ...
+WaitEventTypeIPC     → ...
+WaitEventTypeLWLock  → ...
+WaitEventTypeBufferPin → ...
+```
+
+`WaitEventStart(slot, "IO", "DataFileRead")` sets the `waitInfo` word
+`(IO<<16)|DataFileRead`; `WaitEventEnd` clears it. The lock manager and the
+buffer pool call these around blocking operations so `pg_stat_activity`
+shows what a backend is blocked on.
+
+## `mmgr` chunk geometry
+
+The chunk sizes:
+
+```
+defaultChunkSize = 64 KiB   (Session/Txn/Stmt contexts)
+smallChunkSize   = 4 KiB    (ExprContext)
+largeChunkSize   = 256 KiB  (sort/hash-join build sides)
+```
+
+`Acquire(parent, KindExpr)` selects `smallChunkSize`; `Acquire(parent,
+KindSort)`/`KindHashJoin` select `largeChunkSize`; everything else defaults
+to `defaultChunkSize`.
+
+`growChunk(n)` allocates a new chunk when the current one is full: it inserts
+the new chunk AFTER the current head in the chunk list, preserving the
+small-chunk tail so the bump pointer keeps pointing into the large chunk for
+the sort/hash build side. `AllocAligned(n, align)` bumps to the next aligned
+offset within the current chunk, growing if needed.
+
+`Usage()` walks the chunk list summing `cap(chunk)` for allocated and
+`len(chunk)` for peak. It excludes chunks returned to the pool.
+
+## `internal/utils/misc` config parser (`parser.go`)
+
+`ParseConfigEntries` reads a `postgresql.conf`-format file into
+`[]ConfigEntry`:
+
+```go
+type ConfigEntry struct {
+    Name  string
+    Value string
+    Line  int
+    File  string
+    Comment string
+}
+```
+
+The parser handles:
+- `#` comments (full-line and trailing).
+- `key = value` assignments.
+- `key = 'quoted value'` (single or double quotes, with backslash escapes).
+- Multi-line values via `key = E'...'` (escape strings).
+- `include` / `include_dir` / `include_if_exists` directives.
+- Blank lines and trailing whitespace.
+
+`ApplyConfigEntries` validates each entry against the registry (unknown
+parameter → error; invalid value → `ValidationError`). `ApplyReloadEntries`
+is the SIGHUP path: it warns (never fails) on invalid entries and skips
+Postmaster/Internal context GUCs that cannot be changed at runtime.
+
+## `datestyle` / `timestamptz_out`
+
+`mergeDateStyle` merges a partial DateStyle spec (e.g. `SET DateStyle = 'SQL'`)
+keeping the existing order component. The date styles: `ISO`, `SQL`,
+`Postgres`, `German`; orders: `DMY`, `MDY`, `YMD`. The GUC value is stored
+as `"ISO, DMY"` (style + order).
+
+`timestamptz_out.go` renders `timestamptz`/`timestamp` values in PG's format
+using the current DateStyle. The `TZ` field prints the timezone abbreviation
+from the session's `TimeZone` GUC.
