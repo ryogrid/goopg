@@ -178,7 +178,11 @@ func pagePruneCore(p Page, oldestXmin TransactionID) (PruneResult, int, error) {
 		if off < 0 || ln < 0 || off+ln > len(p) {
 			continue // skip corrupt items silently
 		}
-		t, err := ParseHeapTuple(p[off : off+ln])
+		// review/260831 ST-3: header-only (isDead / IsHeapOnly / IsHotUpdated /
+		// CTID); the page is exclusively content-locked for the whole call by
+		// contract and t dies with the iteration, so the copying decode's
+		// Data+Bitmap allocations were discarded immediately.
+		t, err := parseHeapTupleAlias(p[off : off+ln])
 		if err != nil {
 			continue
 		}
@@ -259,7 +263,9 @@ func pruneChainTip(p Page, startSlot uint16, isDead func(HeapTupleHeader) bool) 
 		if off < 0 || ln < 0 || off+ln > len(p) {
 			return 0
 		}
-		t, err := ParseHeapTuple(p[off : off+ln])
+		// review/260831 ST-4: header-only chain walk under the same page lock;
+		// a long HOT chain paid one tuple copy per hop.
+		t, err := parseHeapTupleAlias(p[off : off+ln])
 		if err != nil {
 			return 0
 		}
