@@ -39,7 +39,7 @@ flowchart TD
     Enc --> Frames["'w' CopyData frames"]
 
     PGO --> Subscriber["LogicalReceiver (apply side)"]
-    Subscriber --> Dec["pgoutput_decoder: decode messages"]
+Subscriber --> Dec["pgoutput_decoder: decode messages']
     Dec --> Apply["executor.ApplyWorker<br/>applies rows to subscriber tables"]
     Apply --> Ack["LSN ack (apply for all three LSNs)"]
     Apply --> Sync["SyncRep releases at remote_apply"]

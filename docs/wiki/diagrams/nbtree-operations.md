@@ -6,7 +6,7 @@ B-tree search descent, page split, dedup consolidation, and WAL redo.
 
 ```mermaid
 flowchart TD
-    S["BTree.Search(key)"] --> M["pinR: read metapage (block 0)"]
+S["BTree.Search(key)"] --> M["pinR: read metapage (block 0)']
     M --> Root["BtMetaPageData.root<br/>→ root block number"]
     Root --> Desc["descendToLeaf(key)"]
     Desc --> Loop["read page, locate BTPageOpaque"]
@@ -50,7 +50,7 @@ flowchart TD
     subgraph Dedup Consolidation
         D1["dedupConsolidate(items)"] --> D2["group same-key adjacent items"]
         D2 --> D3["collapse into posting-list entries<br/>PGBTPostingRaw"]
-        D3 --> D4["refillDeduplicated: rebuild page"]
+D3 --> D4["refillDeduplicated: rebuild page']
         D4 --> D5["return compacted items"]
     end
 

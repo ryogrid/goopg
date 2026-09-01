@@ -96,15 +96,15 @@ sequenceDiagram
     participant G as global Registry (Variable)
     participant W as wire (ParameterStatus)
 
-    C->>SR: Set("work_mem", "8MB", local)
+C->>SR: Set('work_mem', '8MB', local)
     SR->>SR: lowerGUCName + lookupVariable
-    SR->>G: canonicalizeFrom(effective, "8MB")
-    G-->>SR: "8388608" (canonical, MB→bytes)
+    SR->>G: canonicalizeFrom(effective, 8MB)
+G-->>SR: '8388608' (canonical, MB→bytes)
     SR->>SR: snapshotPrior(key) + store in session/local layer
     SR->>W: onReportableChange (FlagReport vars only)
     SR->>G: invokeOnChange (process-global bridge)
     C->>SR: EndTransaction(false) — ABORT
-    SR->>SR: drop local layer; restore txPrior session values
+SR->>SR: drop local layer, restore txPrior session values
     SR->>W: onReportableChange for moved FlagReport vars
 ```
 

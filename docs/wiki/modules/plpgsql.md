@@ -228,21 +228,21 @@ sequenceDiagram
     participant ST as parseStmt
     participant EXPR as scanExprTo / ParseExpr
 
-    CALL->>PARSE: Parse("DECLARE x int := 1; BEGIN x := x + 1; RETURN x; END")
+CALL->>PARSE: Parse('DECLARE x int := 1, BEGIN x := x + 1, RETURN x, END')
     PARSE->>LEX: parser.Lex(src)
     LEX-->>PARSE: []parser.Token (or *LexError → wrapped)
     PARSE->>BP: &bodyParser{src, tokens}
     PARSE->>TOP: parseTopBlock()
     TOP->>DECL: first token is KwDeclare
     DECL->>DECL: parseDeclaration → x int := 1 (ColumnType, Default Expr)
-    TOP->>ST: BEGIN consumed; parseStmtListWithException(KwEnd)
-    ST->>ST: token is ident "x" → parseAssign
-    ST->>EXPR: scanExprToSemicolon("x := ") → ParseExpr("x + 1")
-    ST-->>TOP: AssignStmt{Target: "x", Value: BinOp}
+TOP->>ST: BEGIN consumed, parseStmtListWithException(KwEnd)
+ST->>ST: token is ident 'x' → parseAssign
+ST->>EXPR: scanExprToSemicolon('x := ') → ParseExpr('x + 1')
+ST-->>TOP: AssignStmt{Target: 'x', Value: BinOp}
     ST->>ST: token is KwReturn → parseReturn
-    ST->>EXPR: scanExprToSemicolon → ParseExpr("x")
+ST->>EXPR: scanExprToSemicolon → ParseExpr('x')
     ST-->>TOP: ReturnStmt{Expr: ColumnRef{x}}
-    TOP->>TOP: expectKeyword(KwEnd); acceptSymbol(";")
+TOP->>TOP: expectKeyword(KwEnd), acceptSymbol(',')
     TOP-->>PARSE: *Block{Declarations, Statements}
     PARSE-->>CALL: *Block, nil
 ```
@@ -284,10 +284,10 @@ sequenceDiagram
     participant EB as parseExceptionBlock
 
     TOP->>SL: parseStmtListWithException(KwEnd)
-    SL->>SL: parse stmts until END or ident "exception"
+SL->>SL: parse stmts until END or ident 'exception'
     SL-->>TOP: stmts, nil (END found)
-    SL->>EB: ident "exception" found → parseExceptionBlock()
-    EB->>EB: consume "exception"
+SL->>EB: ident 'exception' found → parseExceptionBlock()
+EB->>EB: consume 'exception'
     loop for each WHEN
         EB->>EB: parse WHEN cond [OR cond]... THEN
         EB->>EB: parseStmtListWithException(KwEnd) → handler body
@@ -429,7 +429,7 @@ sequenceDiagram
     participant RET as parseReturn
 
     P->>IF: token is KwIf
-    IF->>SCAN: scanExprToKeyword("IF condition", KwThen)
+IF->>SCAN: scanExprToKeyword('IF condition', KwThen)
     SCAN-->>IF: Expr{x > 0}
     IF->>SL: parseStmtList(KwEnd, KwElsif, KwElseif)
     SL->>RET: token is KwReturn → parseReturn
@@ -441,7 +441,7 @@ sequenceDiagram
     SL->>RET: token is KwReturn → parseReturn
     RET-->>SL: ReturnStmt{IntegerConst{0}}
     SL-->>IF: [ReturnStmt{0}]
-    IF->>IF: expectKeyword(KwEnd), expectKeyword(KwIf), acceptSymbol(";")
+    IF->>IF: expectKeyword(KwEnd), expectKeyword(KwIf), acceptSymbol(semicolon)
     IF-->>P: IfStmt{Cond, Then: [ReturnStmt{x}], Else: [ReturnStmt{0}]}
 ```
 
@@ -454,20 +454,20 @@ sequenceDiagram
     participant SCAN as scanExprTo
 
     P->>F: token is KwFor
-    F->>F: expect KwFor, read ident "i", expect KwIn
-    F->>F: peek: not SELECT/EXECUTE/( → integer-range FOR
-    F->>SCAN: scanExprTo("lower bound", "..")
+    F->>F: expect KwFor, read ident i, expect KwIn
+    F->>F: peek: not SELECT/EXECUTE/openparen → integer-range FOR
+F->>SCAN: scanExprTo('lower bound', '..')
     SCAN-->>F: Expr{IntegerConst{1}}
     F->>F: advance() (consume ..)
-    F->>SCAN: scanExprTo("upper bound", KwLoop|KwBy)
+F->>SCAN: scanExprTo('upper bound', KwLoop|KwBy)
     SCAN-->>F: Expr{IntegerConst{10}}
     F->>F: acceptKeyword(KwBy) → yes
-    F->>SCAN: scanExprToKeyword("BY step", KwLoop)
+F->>SCAN: scanExprToKeyword('BY step', KwLoop)
     SCAN-->>F: Expr{IntegerConst{2}}
     F->>F: advance() (consume LOOP)
     F->>F: parseStmtList(KwEnd) → body
-    F->>F: expect KwEnd, expect KwLoop, accept ";"
-    F-->>P: ForStmt{Var: "i", Lower: 1, Upper: 10, Step: 2, Body: [...]}
+F->>F: expect KwEnd, expect KwLoop, accept ','
+F-->>P: ForStmt{Var: 'i', Lower: 1, Upper: 10, Step: 2, Body: [...]}
 ```
 
 ## Array subscript assignment walkthrough

@@ -12,7 +12,7 @@ flowchart TD
     Toks --> Route["dispatch.routeBatch / parseStatement"]
     Route --> YACC{"statement class?"}
     YACC -->|"bulk SQL"| Y1["yacc_parser.go (LALR(1) grammar)<br/>compiled from grammar/*.y"]
-    Y1 --> Y2["yacc_ctors.go: AST constructors<br/>$<p>N position tracking"]
+Y1 --> Y2["yacc_ctors.go: AST constructors<br/>$<p>N position tracking']
     YACC -->|"DDL (CREATE/ALTER/DROP/GRANT…)"| H1["hand-written ddl.go<br/>recursive descent"]
     YACC -->|"SELECT/INSERT/UPDATE/DELETE"| H2["select.go / dml.go<br/>statement tree builder"]
     YACC -->|"expressions"| H3["expr.go / function.go<br/>operators, casts, subqueries"]
@@ -53,8 +53,8 @@ flowchart TD
     Parse --> Block["*Block AST (ast.go)"]
     Block --> Stmts["parseStmtList → []Stmt<br/>parseLoop / parseWhile / parseFor"]
     Stmts --> Exceptions["parseExceptionBlock<br/>EXCEPTION WHEN …"]
-    Block --> Exec["executor: executePLpgSQLStmt<br/>interpreted execution"]
-    Exec --> SQL["embedded SQL:<br/>recursive parser.Parse + executor"]
+Block --> Exec["executor: executePLpgSQLStmt<br/>interpreted execution']
+Exec --> SQL["embedded SQL:<br/>recursive parser.Parse + executor']
 
     note right of Exec: plpgsql is interpreted over internal/pl/plpgsql ASTs;<br/>language dispatch: dispatchStoredRoutineByLanguage
 ```

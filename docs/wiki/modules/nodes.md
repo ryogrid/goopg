@@ -143,7 +143,7 @@ flowchart TD
         IR[IR node] --> OUT[Out: outNode type-switch]
         OUT --> OC[outConst / outFuncExpr / outOpExpr / ...]
         OC --> OD[outDatum: by-value 8-byte LE word / by-ref full varlena]
-        OD --> TEXT["(CONST :consttype 23 :consttypmod -1 ...)"]
+OD --> TEXT["(CONST :consttype 23 :consttypmod -1 ...)']
     end
     subgraph Deserialize
         TEXT2[pg_attrdef.adbin text] --> TOK[tokenizer: pg_strtok port]
@@ -468,7 +468,7 @@ sequenceDiagram
     N->>N: resolve casts → CoerceViaIO / RelabelType
     N-->>E: Node (typed IR)
     E->>O: Out(node)
-    O-->>E: "(CONST ...)" S-expression string
+O-->>E: '(CONST ...)' S-expression string
     E->>H: write pg_attrdef row with adbin = S-expression
     Note over H: a real PG 18.3 can stringToNode this later
 ```

@@ -179,7 +179,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    REC[record() closure] --> CHK2{path is pg_wal/?}
+    REC["record() closure"] --> CHK2{path is pg_wal/?}
     CHK2 -- yes --> SKIP[skip: WAL tracked via WAL-Ranges, never Files]
     CHK2 -- no --> ALGO{mck.checksumFile(data)}
     ALGO --> CRC[CRC32C via castagnoliTable<br/>little-endian byte image]
@@ -210,7 +210,7 @@ sequenceDiagram
 
     PB->>WS: START_REPLICATION ... (streaming)
     PB->>WS: BASE_BACKUP (CHECKPOINT 'fast', LABEL 'test', MANIFEST 'yes', WAL)
-    WS->>BH: ReplyBaseBackup(ctx, w, "CHECKPOINT 'fast', ...")
+WS->>BH: ReplyBaseBackup(ctx, w, 'CHECKPOINT 'fast', ...')
     BH->>BH: parseBaseBackupOptions → includeWAL=true
     BH->>CK: CheckpointNow() (force IMMEDIATE)
     CK-->>BH: redoLSN, ckptRecLSN
@@ -219,13 +219,13 @@ sequenceDiagram
     BH-->>PB: recptr + tli result set (startLSN, startTLI)
     BH->>BH: collectInPlaceTablespaces() → [oid, relPath]
     BH-->>PB: spcoid/spclocation/size result set (NULL row + one per tablespace)
-    BH-->>PB: CopyOutResponse + 'n' "base.tar"
+BH-->>PB: CopyOutResponse + 'n' 'base.tar'
     BH->>BH: emitBaseBackupTar (backup_label → files → pg_control → WAL segs)
     BH-->>PB: 'd' frames
     BH-->>PB: 'p' progress frames every 1 MiB
     BH->>BH: buildBackupManifest(sysID, tli, baseLSN0, stopLSN0)
     BH-->>PB: 'm' manifest frames
-    BH-->>PB: CopyDone + stop recptr result + CommandComplete("BASE_BACKUP")
+BH-->>PB: CopyDone + stop recptr result + CommandComplete('BASE_BACKUP')
     BH-->>PB: ReadyForQuery
     PB->>PB: restore: base.tar into fresh data dir
     PG->>PB: real PG 18.3 standby reads backup_label, pg_control<br/>(minRecoveryPoint patched), replays from baseLSN0
@@ -309,7 +309,7 @@ sequenceDiagram
     H->>BASE: emitBaseBackupTar (base.tar)
     BASE-->>W: 'd' frames (backup_label, files, pg_control, WAL segs)
     H->>H: per in-place tablespace: loop
-    H->>W: newArchiveFrame("<oid>.tar", relPath)
+H->>W: newArchiveFrame('<oid>.tar', relPath)
     H->>TS: emitTablespaceTar(tablespace, mck)
     TS->>W: 'd' frames (files under version dir)
     TS-->>H: manifest entries

@@ -663,12 +663,12 @@ sequenceDiagram
     E->>C: CreateTable(schema, name, cols, ...)
     C->>C: AllocOID → table OID
     C->>C: getOrCreateNS(dbOid) → namespace
-    C->>C: store table in tables["schema.name"]
+C->>C: store table in tables['schema.name']
     C->>C: RegisterPartitionChild if partition
     C-->>E: *Table
     E->>C: CreateIndex(table, primary key, ...)
     C->>C: AllocOID → index OID
-    C->>C: store index in indexes["schema.name"]
+C->>C: store index in indexes['schema.name']
     C-->>E: *Index
     E->>E: syncTableToCatalogHeap(table)
     E->>H: write pg_class heap row (144 bytes)

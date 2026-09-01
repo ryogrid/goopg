@@ -259,19 +259,19 @@ sequenceDiagram
     participant YACC as yacc_parser.go LALR(1)
     participant HAND as hand-written parser
 
-    CALL->>PARSE: Parse("SELECT 1; INSERT INTO t VALUES (2);")
+    CALL->>PARSE: Parse(SELECT 1, INSERT INTO t VALUES (2))
     PARSE->>LEX: Lex(input)
     LEX-->>PARSE: []Token with TokenEOF sentinel
     PARSE->>SPLIT: SplitStatements(toks)
-    SPLIT->>SPLIT: split on ';' at depth 0
-    SPLIT-->>PARSE: 2 fragments: [SELECT, 1] and [INSERT, INTO, t, VALUES, (, 2, ), ;]
+SPLIT->>SPLIT: split on ',' at depth 0
+SPLIT-->>PARSE: 2 fragments: [SELECT, 1] and [INSERT, INTO, t, VALUES, (, 2, ), ,]
     loop for each fragment
         PARSE->>DISP: dispatch.go route
         DISP->>DISP: fragmentRouted → isWordTok → routedStmts lookup
         DISP-->>YACC: yacc grammar (SELECT)
         YACC-->>PARSE: *Select{TargetList: ...}
         DISP-->>HAND: hand-written (INSERT via dml.go)
-        HAND-->>PARSE: *Insert{Relation: "t", ...}
+HAND-->>PARSE: *Insert{Relation: 't', ...}
     end
     PARSE-->>CALL: []Stmt{*Select, *Insert}
 ```
@@ -288,14 +288,14 @@ sequenceDiagram
     P->>PRIM: parsePrimary → column ref / literal / function / subquery
     PRIM-->>P: Expr (e.g. ColumnRef)
     P->>BIN: peekBinaryOp → check operator token
-    BIN-->>P: "+", precAddSub
+BIN-->>P: '+', precAddSub
     P->>P: if opPrec >= currPrec: parse right-hand side
     P->>PRIM: parsePrimary → another Expr
-    P->>P: build BinOp{Left, "+", Right}
-    P->>BIN: peekBinaryOp → "*", precMulDiv
+P->>P: build BinOp{Left, '+', Right}
+P->>BIN: peekBinaryOp → '*', precMulDiv
     P->>P: if precMulDiv > precAddSub: parse right first
     P->>PRIM: parsePrimary → literal
-    P->>P: build BinOp{Left, "*", Right}
+P->>P: build BinOp{Left, '*', Right}
     P->>P: return combined BinOp
 ```
 

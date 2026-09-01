@@ -96,14 +96,14 @@ The fallback uses a single global `sync.Mutex` + a `map[*uint32]*sync.Cond` pool
 ```mermaid
 flowchart TD
     subgraph runtimeshim
-        subgraph linkname build (go1.24 && !go1.27 && !noLinkname)
+        subgraph "linkname build (go1.24 && !go1.27 && !noLinkname)"
             NL[Nanotime → runtime.nanotime]
             SA[SemaAcquire → sync.runtime_Semacquire]
             SR[SemaRelease → sync.runtime_Semrelease]
             PP[PinP → runtime.procPin]
             PU[UnpinP → runtime.procUnpin]
         end
-        subgraph fallback build (inverse tag / noLinkname)
+        subgraph "fallback build (inverse tag / noLinkname)"
             NFL[Nanotime → time.Now().UnixNano]
             SFL[Sema via global mutex + sync.Cond map]
             PFL[PinP/UnpinP via global mutex, P index 0]
@@ -167,15 +167,15 @@ sequenceDiagram
     participant PKG as package init
     participant PROBE as probeLayout()
     participant G as throwaway goroutine
-    participant LINK as linkname read
+    participant LNK as linkname read
 
     PKG->>PROBE: glsUsable = probeLayout()
-    PROBE->>G: go func() { SetBackendID(1234567); v, ok = readLabelID(); done <- ok }()
-    G->>G: SetBackendID(1234567)
-    G->>LINK: runtime_getProfLabel()
-    LINK-->>G: unsafe.Pointer to label map
-    G->>G: cast to *labelMapMirror, scan for "goopg_backend_id"
-    G->>G: compare value == 1234567
+    PROBE->>G: go func() SetBackendID(1234567) readLabelID() check()
+    G->>G: SetBackendID 1234567
+    G->>LNK: runtime_getProfLabel()
+    LNK-->>G: unsafe.Pointer to label map
+G->>G: cast to *labelMapMirror, scan for goopg_backend_id
+    G->>G: compare value = 1234567
     G-->>PROBE: true if round-trip succeeded
     PROBE-->>PKG: glsUsable = true/false
     Note over PKG: panic-recover guards wild pointer deref<br/>from layout mismatch
@@ -267,7 +267,7 @@ sequenceDiagram
     POOL-->>SEM: SemaAcquire(&slot.sema) — park if 0
     SEM-->>B: woken (slot freed by eviction)
     B->>POOL: pin slot, do page I/O
-    POOL->>SEM: SemaRelease(&slot.sema) — "I/O finished, proceed"
+POOL->>SEM: SemaRelease(&slot.sema) — 'I/O finished, proceed'
 ```
 
 The semaphore is one `uint32` per slot, identified by address. `SemaRelease`

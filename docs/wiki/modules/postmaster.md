@@ -553,19 +553,19 @@ sequenceDiagram
     participant P as runPostStartupLoop
     participant X as extendedState
     participant E as executor
-    C->>P: Parse "stmt1" "SELECT * FROM t WHERE id=$1" [int4]
+C->>P: Parse 'stmt1' 'SELECT * FROM t WHERE id=$1' [int4]
     P->>X: store preparedStatement
-    C->>P: Bind "portal1" "stmt1" ["42"] []
+C->>P: Bind 'portal1' 'stmt1' ['42'] []
     P->>X: paramsToDatums → portalState{params}
-    C->>P: Describe 'P' "portal1"
+C->>P: Describe 'P' 'portal1'
     P->>P: describeExtendedQuery → RowDescription (id)
-    C->>P: Execute "portal1" 0
+C->>P: Execute 'portal1' 0
     P->>E: executeExtendedQueryViaExecutor
     E->>E: BuildFastIterator + Open/Next/Close
     E-->>P: extendedQueryResult (all rows)
     P->>P: WriteDataRow per row
     P-->>C: CommandComplete
-    C->>P: Close 'P' "portal1"
+C->>P: Close 'P' 'portal1'
     C->>P: Sync
     P-->>C: ReadyForQuery
 ```

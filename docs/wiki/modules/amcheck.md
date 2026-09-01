@@ -187,7 +187,7 @@ sequenceDiagram
     participant SRC as PageSource
     participant VIS as HeapVisibilityFunc
 
-    C->>V: VerifyBtreeUnique(src, "idx", keyFmt, cmpKeys, visible)
+C->>V: VerifyBtreeUnique(src, 'idx', keyFmt, cmpKeys, visible)
     V->>SRC: src(MetaBlock) → metapage
     V->>SRC: src(root) → descend to leftmost leaf
     loop per leaf page via btpo_next

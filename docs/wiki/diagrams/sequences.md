@@ -16,7 +16,7 @@ sequenceDiagram
     participant E as executor
     participant ST as storage.Pool
 
-    C->>S: MsgQuery("SELECT …")
+C->>S: MsgQuery('SELECT …')
     S->>P: Parse(sql)
     P-->>S: parser.Stmt
     S->>O: Plan(stmt, catalog)

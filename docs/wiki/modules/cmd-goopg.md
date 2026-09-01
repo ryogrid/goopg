@@ -264,7 +264,7 @@ sequenceDiagram
     participant SRV as postmaster control-plane handler
 
     CLI->>PID: parse `<datadir>/goopg.pid` → pid, socket path
-    CLI->>SOCK: dial Unix socket, send "STOP"/"RELOAD"/"CHECKPOINT"/"PROMOTE"/"PING"
+CLI->>SOCK: dial Unix socket, send 'STOP'/'RELOAD'/'CHECKPOINT'/'PROMOTE'/'PING'
     SOCK-->>CLI: response (OK or error)
     CLI->>CLI: exit 0 on success, 3 stale pidfile, 4 unresponsive socket, 1 other error
 ```

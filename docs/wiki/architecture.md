@@ -40,7 +40,7 @@ referenced for context.
 
 ```mermaid
 flowchart TD
-    Client([Client: psql / pgbench / standby]) -->|"v3 wire protocol"| SRV[postmaster: Server + serveConn]
+Client([Client: psql / pgbench / standby]) -->|'v3 wire protocol'| SRV[postmaster: Server + serveConn]
     SRV --> PARSE[parser: Parse]
     PARSE --> PLAN[optimizer: Plan]
     PLAN --> EXEC[executor: BuildFastIterator]
@@ -55,7 +55,7 @@ flowchart TD
     SRV --> WALSND[replication: walsender]
     WALSND -->|"physical + logical stream"| WALRCV[replication: walreceiver / logicalreceiver]
 
-    IDB[initdb: Init / Open] -->|"Runtime: Pool + TxnMgr + Catalog + WAL"| SRV
+IDB[initdb: Init / Open] -->|'Runtime: Pool + TxnMgr + Catalog + WAL'| SRV
     CMD[cmd/goopg] --> IDB
     CMD --> SRV
 

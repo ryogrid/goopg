@@ -475,7 +475,7 @@ sequenceDiagram
     PM->>PM: checkAuth policy match
     PM->>AU: Exchange(Decision{scram}, store, user)
     AU->>SS: NewSCRAMServer(user, secret)
-    AU->>FW: WriteAuthenticationSASL(["SCRAM-SHA-256"])
+AU->>FW: WriteAuthenticationSASL(['SCRAM-SHA-256'])
     C->>FR: SASLInitialResponse (client-first)
     AU->>SS: Step(client-first) → server-first
     AU->>FW: WriteAuthenticationSASLContinue(server-first)

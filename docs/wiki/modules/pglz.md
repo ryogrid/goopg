@@ -107,7 +107,7 @@ After loop: if len(dst) != rawSize → error
 A compressed varlena is:
 
 ```
-[4 B va_header  = (totalSize << 2) | 0x02]    VARATT_IS_4B_C
+[4 B va_header  = (totalSize * 4) | 0x02]    VARATT_IS_4B_C
 [4 B va_tcinfo  = rawSize | (method << 30)]
 [compressed PGLZ token stream]
 ```
@@ -246,7 +246,7 @@ sequenceDiagram
     PG->>PG: INSERT ... stores a large pg_node_tree<br/>→ pglz_compress → VARATT_IS_4B_C varlena
     PG->>GO: heap/catalog read (logical decode or catalog scan)
     GO->>DEC: DecodeInlineCompressed(8+ bytes)
-    DEC->>DEC: totalSize = header >> 2; method = tcinfo >> 30
+    DEC->>DEC: totalSize = header / 4, method = tcinfo shift 30
     DEC->>DEC: totalSize <= len(data)? method == 0?
     DEC->>DE: Decompress(data[8:totalSize], rawSize)
     DE-->>DEC: original bytes (or error on corrupt stream)

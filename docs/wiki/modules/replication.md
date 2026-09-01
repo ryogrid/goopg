@@ -211,7 +211,7 @@ sequenceDiagram
     participant P as PgOutput
     participant A as walsenderPgoutputAdapter
 
-    C->>R: START_REPLICATION SLOT s LOGICAL ("proto_version" '1', ...)
+C->>R: START_REPLICATION SLOT s LOGICAL ('proto_version' '1', ...)
     R->>L: args.Mode == LOGICAL
     L->>L: require WAL + *catalog.InMemory + WALDirPath
     L->>L: dbOidVar = walsenderCatalogDBOidVar (per-db catalog resolution)

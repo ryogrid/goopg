@@ -717,7 +717,7 @@ sequenceDiagram
     participant IT as RecordIterator
     participant P as PgOutput
     participant F as RelationFilter
-    C->>S: CreateLogical("sub1", "pgoutput", "mydb", startLSN)
+C->>S: CreateLogical('sub1', 'pgoutput', 'mydb', startLSN)
     S->>S: write slot file to pg_replslot/sub1/state
     C->>IT: NewRecordIterator(writer, walDir, segSize, startLSN)
     loop Next()
@@ -731,7 +731,7 @@ sequenceDiagram
             P-->>C: pgoutput message bytes
         end
     end
-    C->>S: AdvanceConfirmedFlushLSN("sub1", commitLSN)
+C->>S: AdvanceConfirmedFlushLSN('sub1', commitLSN)
 ```
 
 ## Record kind constants (`recovery.go`)

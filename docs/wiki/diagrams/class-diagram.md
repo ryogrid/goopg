@@ -91,7 +91,7 @@ classDiagram
         +Run()
     }
 
-    RelOptInfo --> Path : "add_path / set_cheapest"
+RelOptInfo --> Path : 'add_path / set_cheapest'
     Path --> Node : createPlanNode
     Operator <|.. joinOp
     Operator <|.. seqScanOp
