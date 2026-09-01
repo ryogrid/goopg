@@ -52,7 +52,7 @@ not, with the reason) / empty (not judged yet).
 | EO2-11 | executor-operators-2 | medium | `operators_join_agg.go:aggregateOp.Open` — per-row allocations for group key values | | | | | [ ] |
 | EO2-12 | executor-operators-2 | medium | `operators_merge.go:mergedRow` — per-candidate-pair allocation | | | | | [ ] |
 | EO2-14 | executor-operators-2 | medium | `operators_project_set.go:openSelectSrfMode` — per-step output row allocation | | | | | [ ] |
-| EO2-24 | executor-operators-2 | medium | `slot.go:asSlot` (callers: nextMerge, recursiveUnionOp, workTableScanOp) — MaterializedSlot allocated per emitted row | | | | | [ ] |
+| EO2-24 | executor-operators-2 | medium | `slot.go:asSlot` (callers: nextMerge, recursiveUnionOp, workTableScanOp) — MaterializedSlot allocated per emitted row | ADOPT | GROUP BY over 1000 groups: 2.54ms -> 2.39ms, 29,197 -> 28,197 allocs (exactly one per emitted row), 2.23MB -> 2.17MB | the established slot-reuse idiom and its documented "valid until the next Next()" contract (indexScanOp, M0092-0007) | one field per operator, four call sites | [x] fixed |
 | EO2-25 | executor-operators-2 | medium | `operators_upsert.go:maintainNonArbiterIndexesCapture` — btree re-opened per index per row | | | | | [ ] |
 | ES-7 | executor-sys | medium | `plpgsql_runtime.go:rewriteSQLNamedParams` — regexp compiled per argument per invocation | ADOPT | 3-argument rewrite: 29.6us -> 9.5us (3.1x), 16.0KB -> 1.0KB, 152 -> 25 allocs | the compiled pattern is identical; the cache key is the argument name | one `sync.Map`; the key set is bounded by the schema, not by traffic | [x] fixed |
 | ES-8 | executor-sys | medium | `plpgsql_runtime.go:executeSQLRoutine` (+procedures/setof) — body re-parsed and re-planned on every call | REJECT (needs the plan-cache machinery) | real — a SQL-language routine re-parses (and re-plans) its body on every call | the body text IS stable per routine (arguments are rewritten to $n, values go through ctx.Params), so a cache is possible; but the planner mutates the tree it is given, so caching a bare AST is not safe. The sound design is the postmaster planCache (keyed plan + its invalidation), reused from the executor | out of scope for a per-finding fix | [ ] deferred |
@@ -967,3 +967,30 @@ nine trailing zeros):
   the produced key bytes against the old two-division strip loop over
   positive, negative, zero, huge and negatively-scaled values.
 - **Maintainability**: yes. The loop got shorter.
+
+### EO2-24 — ADOPT (emit through the operator's own slot)
+
+Four emission paths — the merge join, the aggregate, the recursive union and
+the worktable scan — wrapped every emitted row in a freshly allocated
+`MaterializedSlot`. `indexScanOp` has carried its own reusable slot since
+M0092-0007, under the executor's documented contract that a slot is valid only
+until the next `Next()` unless the consumer materialises it; these four now do
+the same.
+
+Measured (`internal/executor/slot_reuse_bench_test.go`,
+`SELECT g, count(*) FROM aggemit GROUP BY g` over 4000 rows in 1000 groups):
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| before | 2,541,682 | 2,232,102 | 29,197 |
+| after | 2,393,938 | 2,168,036 | 28,197 |
+
+The allocation delta is exactly 1000 — one per emitted row — which is the
+finding, confirmed.
+
+- **Benefit**: yes, though modest per row: ~6% on this query, and one fewer
+  allocation per emitted row on four operators.
+- **No regression**: yes. The slot contract is the existing one, and the
+  executor suite, the TPC-H spot check and the TPC-DS SF0.5 sweep all pass.
+- **Maintainability**: yes. It makes four operators match the idiom the rest of
+  the executor already uses.
