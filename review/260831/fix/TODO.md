@@ -1,42 +1,50 @@
-# 性能レビュー修正タスク — review/260831
+# Performance-review fix tasks — review/260831
 
-`review/260831/<subsystem>.md`（15 サブシステム / 346 findings）を 1 件ずつタスク化し、
-以下の **3 判定基準** を満たすものだけ修正する。
+The documents under `review/260831/<subsystem>.md` (15 subsystems, 346 findings)
+are turned into tasks here. A finding is fixed only when it passes all **three
+criteria**:
 
-1. **効用** — 実際に測れる改善があるか（ホットパスか、ベンチ/計測で差が出るか）。
-   「理論上は無駄だが実行回数が O(1) / 一度きり」のものは効用なしと判定する。
-2. **無回帰** — 出力・プラン・ディスク形式・エラーコードを変えないか。planner/executor は
-   `RALPH_PRECOMMIT_SCOPE=units` + `scripts/tpch-spotcheck.sh` + TPC-DS SF0.5 sweep で確認。
-3. **保守性** — 可読性を著しく下げないか（unsafe / 手書きアンロール / 不変条件を増やす変更は不採用寄り）。
+1. **Benefit** — is there a real, measurable improvement (a hot path, a
+   before/after benchmark that moves)? "Wasteful in theory but executed O(1)
+   times / once at startup" counts as no benefit.
+2. **No regression** — output, plans, on-disk format and error codes stay the
+   same. Planner/executor changes are checked with
+   `RALPH_PRECOMMIT_SCOPE=units` + `scripts/tpch-spotcheck.sh` + the TPC-DS
+   SF0.5 sweep.
+3. **Maintainability** — readability is not badly degraded (unsafe code, hand
+   unrolling, or a change that adds invariants leans towards reject).
 
-判定は `verdict` 列に記録する: **ADOPT**（修正する）/ **REJECT**（しない、理由付き）/ 空欄（未判定）。
+The `verdict` column records the decision: **ADOPT** (fix it) / **REJECT** (do
+not, with the reason) / empty (not judged yet).
 
-## 進め方
+## How this proceeds
 
-- 優先セット = severity high / medium / low-medium（下表 83 件）。上から効用の大きい順に着手する。
-- severity low（236 件）は既定 REJECT（基準 1「効用」で落ちる micro-opt）。
-  ただしホットパスで trivial かつ無害なものは個別に ADOPT に昇格し、この表へ移す。
-  一覧と既定判定は「## 付録 A — severity low 一覧」に記録する。
-- 「no issues found」節（27 件）は指摘ではないため対象外。
-- 修正 1 件ごとに gate → commit → push。
+- Priority set = severity high / medium / low-medium (the 83 rows below),
+  worked in descending order of expected benefit.
+- The 236 severity-low findings are REJECT by default (they fail criterion 1,
+  benefit); one that turns out to sit on a hot path and is trivially fixable is
+  promoted into the table below. The list and its default verdict live in
+  "Appendix A".
+- The 27 "no issues found" sections are not findings and are out of scope.
+- Every fix gets its own gate run, commit and push.
 
-## 優先セット
+## Priority set
 
-| ID | subsystem | sev | finding | verdict | 効用 | 無回帰 | 保守性 | status |
+| ID | subsystem | sev | finding | verdict | benefit | no regression | maintainability | status |
 |---|---|---|---|---|---|---|---|---|
 | EC-3 | executor-core | medium | `applyworker.go:decodePgoutputTupleAsRow` — column-name map rebuilt on every row | | | | | [ ] |
 | EC-7 | executor-core | medium | `hash_partition.go:computeHashPartitionRowHash` — per-row invariant work on the INSERT partition-routing hot path | | | | | [ ] |
 | EC-14 | executor-core | medium | `copy.go:insertSourceRow` — per-row `make(Row, …)` instead of the row pool | | | | | [ ] |
 | EC-16 | executor-core | medium | `copy_binary.go:decodeNumericBinary` — dead `fullMantissa` computation before unconditional fallback | | | | | [ ] |
 | EC-20 | executor-core | medium | `expr.go:evalCast` — `strings.ToLower(targetType)` on every cast evaluation | | | | | [ ] |
-| EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | REJECT（対応済み） | — | — | — | [x] no change |
-| EO1-13 | executor-operators-1 | medium | `operators_gather_merge.go:lessRows` — Sort key expressions re-evaluated on every heap comparison（Appendix A から昇格） | ADOPT | 4 ソース × 2000 行で 2.63ms→1.94ms (1.36x)、alloc 42,652→23,988 | 比較規則は逐語で不変。キーは行を pull した時点で 1 回だけ評価 | EO2-2 / sortOp と同じ方針に揃う | [x] fixed |
+| EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | REJECT (already done) | — | — | — | [x] no change |
+| EO1-13 | executor-operators-1 | medium | `operators_gather_merge.go:lessRows` — Sort key expressions re-evaluated on every heap comparison (promoted from Appendix A) | ADOPT | 4 sources x 2000 rows: 2.63ms -> 1.94ms (1.36x), allocs 42,652 -> 23,988 | comparison rule unchanged verbatim; keys evaluated once, when the row is pulled | same shape as EO2-2 / sortOp | [x] fixed |
 | EO1-4 | executor-operators-1 | medium | `operators_analyze.go:analyzeRelationWith` — Decodes every visible tuple but only keeps a fraction | | | | | [ ] |
 | EO1-7 | executor-operators-1 | medium | `operators_bitmap.go:bitmapIndexScanOp.buildBitmap` — Allocates a slice per index entry in hot loop | | | | | [ ] |
 | EO1-10 | executor-operators-1 | medium | `operators_generate_series.go:generateSeriesOp.Next` — Allocates a Row per emitted value | | | | | [ ] |
 | EO1-11 | executor-operators-1 | medium | `operators_fk.go:fkRowMatches` — Per-row linear column-name lookup on every row of a table scan | | | | | [ ] |
-| EO2-1 | executor-operators-2 | high | `operators_join_agg.go:applyAgg` — string_agg O(n²) string concatenation | ADOPT | 4000 行 1 グループで 34.99ms→1.89ms (18.5x)、229MB→1.5MB | 連結順・区切り・bytea 経路は同一。ORDER BY 経路は元から Builder | `strResult` 文字列 → `strAccum []byte` の 1 フィールド置換 | [x] fixed |
-| EO2-2 | executor-operators-2 | medium | `operators_window.go:Open` — sort comparator re-evaluates expressions per comparison | ADOPT | 4000 行 8 パーティションで 18.44ms→7.66ms (2.4x)、alloc 256,905→56,166 | 比較規則は逐語で不変。キーを行ごとに 1 回評価する形に変えただけ | sortOp.sortChunk と同じ「キー先計算 + 置換ソート」に揃う | [x] fixed |
+| EO2-1 | executor-operators-2 | high | `operators_join_agg.go:applyAgg` — string_agg O(n²) string concatenation | ADOPT | 4000 rows in one group: 34.99ms -> 1.89ms (18.5x), 229MB -> 1.5MB allocated | concatenation order, delimiter placement and the bytea path are identical; the ORDER BY path already used a Builder | one field swapped: `strResult` string -> `strAccum []byte` | [x] fixed |
+| EO2-2 | executor-operators-2 | medium | `operators_window.go:Open` — sort comparator re-evaluates expressions per comparison | ADOPT | 4000 rows / 8 partitions: 18.44ms -> 7.66ms (2.4x), allocs 256,905 -> 56,166 | comparison rule unchanged verbatim; only the evaluation moved to once per row | same "precompute keys, sort a permutation" shape as sortOp.sortChunk | [x] fixed |
 | EO2-6 | executor-operators-2 | medium | `operators_index.go:Next` / `operators_storage.go:Next` — per-row enum value linear scan | | | | | [ ] |
 | EO2-7 | executor-operators-2 | medium | `operators_indexonly.go:decodeRowFromKey` / `operators_indexonly.go:decodeRowFromHeap` — per-row map allocation + O(covered × columns) projection | | | | | [ ] |
 | EO2-8 | executor-operators-2 | medium | `operators_generated.go:evalGeneratedExpr` — re-parses expression string per row | | | | | [ ] |
@@ -46,7 +54,7 @@
 | EO2-14 | executor-operators-2 | medium | `operators_project_set.go:openSelectSrfMode` — per-step output row allocation | | | | | [ ] |
 | EO2-24 | executor-operators-2 | medium | `slot.go:asSlot` (callers: nextMerge, recursiveUnionOp, workTableScanOp) — MaterializedSlot allocated per emitted row | | | | | [ ] |
 | EO2-25 | executor-operators-2 | medium | `operators_upsert.go:maintainNonArbiterIndexesCapture` — btree re-opened per index per row | | | | | [ ] |
-| ES-7 | executor-sys | medium | `plpgsql_runtime.go:rewriteSQLNamedParams` — regexp compiled per argument per invocation | | | | | [ ] |
+| ES-7 | executor-sys | medium | `plpgsql_runtime.go:rewriteSQLNamedParams` — regexp compiled per argument per invocation | ADOPT | 3-argument rewrite: 29.6us -> 9.5us (3.1x), 16.0KB -> 1.0KB, 152 -> 25 allocs | the compiled pattern is identical; the cache key is the argument name | one `sync.Map`; the key set is bounded by the schema, not by traffic | [x] fixed |
 | ES-8 | executor-sys | medium | `plpgsql_runtime.go:executeSQLRoutine` (+procedures/setof) — body re-parsed and re-planned on every call | | | | | [ ] |
 | ES-9 | executor-sys | medium | `plpgsql_runtime.go:executePLpgSQLTriggerBody` — trigger body re-parsed on every firing | | | | | [ ] |
 | ES-17 | executor-sys | medium | `toast.go:DetoastValue` — full TOAST relation scan per detoasted column | | | | | [ ] |
@@ -74,12 +82,12 @@
 | XL-68 | xlog | medium | xlog_assemble.go:assembleXLogRecord — header/payload built via repeated append with no capacity hint | | | | | [ ] |
 | IN-4 | initdb | medium | `pg_aggregate_view.go:registerPgAggregateView` — pgAggregateInitialEntries() rebuilt on every query | | | | | [ ] |
 | IN-8 | initdb | medium | `initdb.go:writeMultiPageHeap` / `writeMultiPageHeapRowsExternal` — hasVarWidthCol recomputed per row (loop invariant) | | | | | [ ] |
-| ST-1 | storage | high | `heap.go:CollectDeadHeapSlots` — copies every tuple to inspect only its header | ADOPT | 8282→2622 ns/page (3.2x), 157→0 allocs | ヘッダのみ参照・ページ排他ロック下・tuple は反復を越えない | 既存 API `parseHeapTupleAlias` の再利用のみ | [x] fixed |
-| ST-2 | storage | high | `vm.go:PageAllVisible` / `PageAllFrozen` — same full-tuple copy, only the header is read | ADOPT | 8007→2188 ns/page (3.7x), 157→0 allocs | ヘッダのみ参照・ページ排他ロック下・tuple は反復を越えない | 既存 API `parseHeapTupleAlias` の再利用のみ | [x] fixed |
-| ST-3 | storage | high | `prune.go:pagePruneCore` — `ParseHeapTuple` copy per tuple on the prune/VACUUM path | ADOPT | 8220→3233 ns/page (2.5x), 157→0 allocs | ヘッダのみ参照・ページ排他ロック下・tuple は反復を越えない | 既存 API `parseHeapTupleAlias` の再利用のみ | [x] fixed |
-| ST-4 | storage | medium | `prune.go:pruneChainTip` — per-chain-member `ParseHeapTuple` copy | ADOPT | 同左 (同一ページループ) | ヘッダのみ参照・ページ排他ロック下・tuple は反復を越えない | 既存 API `parseHeapTupleAlias` の再利用のみ | [x] fixed |
-| ST-5 | storage | medium | `fsm.go:RecordFreeSpace` — grow-one-element-at-a-time to reach a high block number | | | | | [ ] |
-| ST-6 | storage | medium | `fsm.go:GetPageWithFreeSpace` — full linear scan of the block array per lookup | | | | | [ ] |
+| ST-1 | storage | high | `heap.go:CollectDeadHeapSlots` — copies every tuple to inspect only its header | ADOPT | 8282 -> 2622 ns/page (3.2x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
+| ST-2 | storage | high | `vm.go:PageAllVisible` / `PageAllFrozen` — same full-tuple copy, only the header is read | ADOPT | 8007 -> 2188 ns/page (3.7x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
+| ST-3 | storage | high | `prune.go:pagePruneCore` — `ParseHeapTuple` copy per tuple on the prune/VACUUM path | ADOPT | 8220 -> 3233 ns/page (2.5x), 157 -> 0 allocs | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
+| ST-4 | storage | medium | `prune.go:pruneChainTip` — per-chain-member `ParseHeapTuple` copy | ADOPT | same as ST-3 (same page loop) | header-only read, under the page content lock, tuple never outlives the iteration | reuses the existing `parseHeapTupleAlias` | [x] fixed |
+| ST-5 | storage | medium | `fsm.go:RecordFreeSpace` — grow-one-element-at-a-time to reach a high block number | ADOPT | recording a high block number now costs one allocation (was: one append per block) | what is recorded is identical; skipped blocks stay 0 (= full) | three lines | [x] fixed |
+| ST-6 | storage | medium | `fsm.go:GetPageWithFreeSpace` — full linear scan of the block array per lookup | ADOPT | 100k-page relation: GetCandidates 23.6us -> 192ns (123x), GetPageWithFreeSpace 24.4us -> 163ns (150x), one insert round trip 23.7us -> 304ns (78x) | a differential test pins equivalence with the full-scan version, tie-breaking included | one-level summary per 512 blocks; relations of one chunk or less keep the plain scan | [x] fixed |
 | ST-8 | storage | medium | `fsm_fork.go:buildFSMTree` — re-parses every built page just to recover the max category | | | | | [ ] |
 | ST-10 | storage | medium | `vm_fork.go:parseVMPage` — allocates a full `vmMaxHeapPagesPerPage` slice per page during `ReadVMFork` | | | | | [ ] |
 | ST-14 | storage | medium | `lmgr/lockmgr.go:grantedExcept` — O(number of holders) recomputation when the cached mask already has the answer | | | | | [ ] |
@@ -88,14 +96,14 @@
 | NB-4 | nbtree-amcheck | low/medium | `pgpage.go:pgFirstDataSlot` — opaque re-decoded on every accessor call inside loops | | | | | [ ] |
 | NB-8 | nbtree-amcheck | medium | `btree.go:resetPageItems` — byte-by-byte zeroing of the whole data area on every page rewrite | | | | | [ ] |
 | NB-9 | nbtree-amcheck | medium | `btree.go:findChildBlockDirect` / `btree.go:insertItemSorted` — per-probe key copies inside descent/insert binary search | | | | | [ ] |
-| NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | REJECT（保守性） | ○ 見込みあり | — | × pageItems は heap TID ごとに展開した項目列を返す（行と行ポインタが 1:1 でない）ため遅延二分探索は不変条件に踏み込む | [x] no change |
+| NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | REJECT (maintainability) | plausible | — | pageItems returns an EXPANDED item list (one entry per heap TID), so items do not map 1:1 to line pointers; a lazy binary search would have to rework that invariant and its VACUUM-side readers | [x] no change |
 | NB-11 | nbtree-amcheck | low/medium | `btree.go:EncodeNumericKey` — fresh big.Int allocation per trailing-zero strip iteration | | | | | [ ] |
 | NB-15 | nbtree-amcheck | low/medium | `amcheck/heapallindexed.go:fingerprintLeafEntry` — a fresh buffer allocation per element, twice per element | | | | | [ ] |
-| NB-17 | nbtree-amcheck | high | `pglz.go:Compress` — brute-force O(n·window·matchlen) match search | ADOPT | 64KiB 入力で random 377ms→1.0ms (379x)、nodetree 8.1ms→0.26ms (32x)、text 30.0ms→1.5ms (20x) | 出力は正当な PGLZ ストリームのまま。round-trip テストで固定。圧縮率はわずかに悪化（下記） | 上流 pg_lzcompress.c と同じ hash chain + good_match/good_drop。定数は PG の既定値 | [x] fixed |
-| NB-18 | nbtree-amcheck | low/medium | `pglz.go:Decompress` — byte-by-byte run-length copy even for non-overlapping matches | ADOPT | text 78.9µs→43.6µs (1.8x)、nodetree 44.6µs→26.1µs (1.7x) | 重なりあり (off < length) は従来のバイトループのまま。round-trip テストで固定 | if 1 本の分岐追加のみ | [x] fixed |
+| NB-17 | nbtree-amcheck | high | `pglz.go:Compress` — brute-force O(n·window·matchlen) match search | ADOPT | 64KiB inputs: random 377ms -> 1.0ms (379x), nodetree 8.1ms -> 0.26ms (32x), text 30.0ms -> 1.5ms (20x) | the output is now byte-identical to upstream pglz_compress (golden test); the ratio worsens slightly (below) | same hash chain + good_match/good_drop as upstream pg_lzcompress.c, with PG defaults | [x] fixed |
+| NB-18 | nbtree-amcheck | low/medium | `pglz.go:Decompress` — byte-by-byte run-length copy even for non-overlapping matches | ADOPT | text 78.9us -> 43.6us (1.8x), nodetree 44.6us -> 26.1us (1.7x) | overlapping matches (off < length) keep the byte loop; the round-trip test pins it | one added branch | [x] fixed |
 | NB-19 | nbtree-amcheck | low/medium | `backup/basebackup.go:baseBackupStreamer.Write` / `streamBackupManifest` — fresh frame buffer allocated per chunk | | | | | [ ] |
 | NB-20 | nbtree-amcheck | low/medium | `backup/basebackup.go:emitBaseBackupTar` / `emitTablespaceTar` — whole-file buffering | | | | | [ ] |
-| TA-1 | transam | medium | `manager.go:captureSnapshot` — Full copy of `abortedXIDs` on every snapshot capture | ADOPT | abort 10,000 件で 15.0µs→1.13µs (13x)、41KB→89B/スナップショット | Aborted 配列は capture 後 immutable という既存契約どおり。insert 側を copy-on-write 化 | 実装は挿入関数 1 つの中に閉じる | [x] fixed |
+| TA-1 | transam | medium | `manager.go:captureSnapshot` — Full copy of `abortedXIDs` on every snapshot capture | ADOPT | with 10,000 aborts: 15.0us -> 1.13us (13x), 41KB -> 89B per snapshot | honours the existing contract that Aborted is immutable after capture; the insert side became copy-on-write | contained in one insert helper | [x] fixed |
 | TA-2 | transam | medium | `manager.go:SnapshotFor` — Deep-`Clone()` of the pinned snapshot on every RR/SSI statement | | | | | [ ] |
 | TA-8 | transam | medium | `multixact/store.go:Members` — Allocates + copies the member slice on every call, and takes the global mutex | | | | | [ ] |
 | PN-1 | parser-nodes | medium | `internal/parser/adapter.go:mapToken` — Per-token `resolve()` map lookup for every terminal | | | | | [ ] |
@@ -103,16 +111,17 @@
 | CP-3 | catalog-postmaster | medium | `catalog.go:InheritanceChildren` / `PartitionChildren` — O(children × tables) lookup by scanning the whole namespace map per child | | | | | [ ] |
 | CP-4 | catalog-postmaster | medium | `catalog.go:RoleIsMemberOf` / `IsAdminOfRole` / `HasPrivsOfRole` / `SelectBestAdmin` — BFS re-scans the entire `roleMembers` map per queue level (O(V×E)) | | | | | [ ] |
 | CP-5 | catalog-postmaster | medium | `catalog.go:LookupTableByOIDAllDBs` / `tableByOID` — linear scan of all tables per OID lookup | | | | | [ ] |
-| UT-1 | utils | medium | `internal/utils/misc/encoding_guc.go:encodingNameToCanonical` — re-cleans the constant encoding table on every call | | | | | [ ] |
+| UT-1 | utils | medium | `internal/utils/misc/encoding_guc.go:encodingNameToCanonical` — re-cleans the constant encoding table on every call | REJECT (no benefit) | the only caller is the client_encoding GUC check; it is not on any per-row or per-tuple path | — | — | [x] no change |
 | UT-9 | utils | medium | `internal/utils/adt/datetime/pg_datetime_format.go` — `fmt.Sprintf` on the per-cell output path | | | | | [ ] |
 | UT-14 | utils | medium | `internal/utils/mb/conv.go:DoEncodingConversion` — dead `destBuf` allocation | | | | | [ ] |
 | UT-20 | utils | medium | `internal/utils/mmgr/mctx.go:Lookup` — global mutex on the per-datum read path | | | | | [ ] |
-| UT-23 | utils | medium | `internal/utils/adt/array/pgarray.go:DecodeElemStyled` — `strings.ToLower(elemName)` recomputed per element | | | | | [ ] |
+| UT-23 | utils | medium | `internal/utils/adt/array/pgarray.go:DecodeElemStyled` — `strings.ToLower(elemName)` recomputed per element | REJECT (no benefit) | `strings.ToLower` only scans (no allocation) when the input is already lower-case, and element names are catalog-normalised | — | — | [x] no change |
 
-## 付録 A — severity low 一覧（既定 REJECT: 基準 1「効用」）
+## Appendix A — severity-low findings (REJECT by default: criterion 1, benefit)
 
-実行回数が少ない / 1 回あたりの節約がナノ秒規模 / 生成コード・ブートストラップ経路のため、
-個別の計測可能な効用が見込めないもの。ホットパスと判明したものだけ優先セットへ昇格する。
+Executed rarely, saving nanoseconds per call, or on generated/bootstrap paths —
+no individually measurable benefit. Only findings that turn out to be on a hot
+path are promoted into the priority set.
 
 
 **executor-core.md**
@@ -395,7 +404,7 @@
 - `CM-6` `cmd/tpch-runner/main.go:selectQueries` — dead sorted-copy computation
 - `CM-7` `cmd/gen-pg-operator-data/main.go` — pg_operator.dat parsed twice (two full passes)
 
-## 付録 B — 指摘なし節（対象外）
+## Appendix B — "no issues found" sections (out of scope)
 
 - `EO1-15` (executor-operators-1) `operators_explain_format.go` / `operators_explain.go`
 - `EO2-26` (executor-operators-2) Files with no significant findings
@@ -425,148 +434,241 @@
 - `UT-22` (utils) `internal/utils/adt/similarto/similarto.go` — no issues found
 - `UT-24` (utils) `internal/utils/adt/array/pgarray.go` — otherwise no issues found
 
-## 進捗ログ
+## Progress log
 
+### ST-1 / ST-2 / ST-3 / ST-4 — ADOPT (`ParseHeapTuple` -> `parseHeapTupleAlias`)
 
-### ST-1 / ST-2 / ST-3 / ST-4 — ADOPT（`ParseHeapTuple` → `parseHeapTupleAlias`）
+Four page loops on the VACUUM / prune / visibility-map paths read nothing but
+`HeapTuple.Header`, yet called the copying `ParseHeapTuple`, throwing away two
+allocations (Data and Bitmap) per tuple. Every caller holds the page pinned
+under an exclusive content lock and the returned tuple never outlives the
+iteration (the contract on `VacuumHeapPageBySlots`, and the `slot.Lock()` /
+`slot.Unlock()` span in `vacuum.go`), so the existing no-copy decode
+`parseHeapTupleAlias` — introduced for the read hot path in M0092-0006 — is a
+drop-in replacement.
 
-VACUUM / prune / VM 更新の 4 つのページループは `HeapTuple.Header` しか読まないのに、
-コピーする `ParseHeapTuple` を呼び、タプルごとに `Data` と `Bitmap` の 2 アロケーションを
-捨てていた。呼び出し側はいずれもページを pin + 排他 content lock した状態で、返った
-tuple はその反復を越えない（`VacuumHeapPageBySlots` の契約、`vacuum.go` の
-`slot.Lock()`〜`slot.Unlock()` 区間）。既存の no-copy デコード `parseHeapTupleAlias`
-（M0092-0006 で読み取りホットパス向けに導入済み）に差し替えるだけで済む。
+Measured (200 tuples on an 8KB page,
+`internal/storage/headeronly_decode_bench_test.go`):
 
-計測（200 タプル / 8KB ページ、`internal/storage/headeronly_decode_bench_test.go`）:
-
-| ベンチ | before | after |
+| bench | before | after |
 |---|---|---|
 | `CollectDeadHeapSlots` | 8282 ns/op, 3768 B, 157 allocs | 2622 ns/op, 0 B, 0 allocs |
 | `PageAllVisible` | 8007 ns/op, 3769 B, 157 allocs | 2188 ns/op, 0 B, 0 allocs |
 | `pagePruneCore` | 8220 ns/op, 3768 B, 157 allocs | 3233 ns/op, 0 B, 0 allocs |
 
-- **効用**: ○ VACUUM がページごとに全タプル分のコピーを捨てていた。2.5〜3.7 倍。
-- **無回帰**: ○ 読む値は同一。ベンチはゼロアロケーションを恒久的に固定する。
-- **保守性**: ○ 既存関数の差し替え + 理由コメント。新しい不変条件は増えない。
+- **Benefit**: yes. VACUUM was discarding a full copy of every tuple on every
+  page it scanned. 2.5x to 3.7x.
+- **No regression**: yes. The values read are identical, and the benchmarks pin
+  zero allocations permanently.
+- **Maintainability**: yes. One function swapped plus a comment saying why; no
+  new invariant.
 
-### EO2-1 — ADOPT（string_agg の O(n²) 連結を解消）
+### EO2-1 — ADOPT (string_agg's O(n^2) concatenation)
 
-ORDER BY なしの `string_agg` は `st.strResult += delim + piece` で累積しており、
-1 行ごとにアキュムレータ全体を再確保・再コピーしていた（1 グループ n 行で O(n²) バイト）。
-ORDER BY 付き経路は既に `strElems` + `strings.Builder` で遅延連結していたため、
-非 ORDER BY 経路だけが取り残されていた形。`strAccum []byte` への append に置換し、
-`finishAgg` で 1 回だけ文字列化する。bytea モードは生バイトを貯めるだけなので同一に扱える
-（`byteaOutMode` による最終レンダリングは変更なし）。`strResult` は bit_and/bit_or/bit_xor の
-BIT(n) 幅タグ専用フィールドとして残す。
+Without ORDER BY, `string_agg` accumulated with `st.strResult += delim + piece`,
+reallocating and recopying the whole accumulator per input row — O(n^2) bytes
+for one group. The ORDER BY path already deferred concatenation through
+`strElems` + `strings.Builder`, so only the unordered path had been left behind.
+It now appends into a byte slice and is stringified once in `finishAgg`. bytea
+mode simply accumulates raw bytes, so it needs no separate treatment
+(`byteaOutMode` still renders at the end). `strResult` stays as the BIT(n)
+width tag for bit_and/bit_or/bit_xor.
 
-計測（`internal/executor/string_agg_accum_bench_test.go`、4000 行 × 26 バイトを 1 グループ）:
+Measured (`internal/executor/string_agg_accum_bench_test.go`, 4000 rows of 26
+bytes in one group):
 
 | | ns/op | B/op | allocs/op |
 |---|---|---|---|
 | before | 34,986,204 | 229,731,898 | 16,349 |
 | after | 1,890,655 | 1,535,984 | 12,272 |
 
-- **効用**: ○ 18.5 倍、確保バイト 150 分の 1。行数に対して二次だった項が消える。
-- **無回帰**: ○ 連結順・区切りの挿入位置・bytea の GUC 経路は不変。既存の string_agg テスト緑。
-- **保守性**: ○ フィールド 1 つの置換。ORDER BY 経路と同じ「最後にまとめる」方針に揃う。
+- **Benefit**: yes. 18.5x, and 150x fewer bytes allocated; the term that was
+  quadratic in the row count is gone.
+- **No regression**: yes. Concatenation order, delimiter placement and the
+  bytea GUC path are unchanged; the existing string_agg tests stay green.
+- **Maintainability**: yes. One field replaced, and the unordered path now
+  follows the same "assemble once at the end" rule as the ordered one.
 
-### NB-17 ADOPT（PGLZ Compress: hash chain）
+### NB-17 — ADOPT (PGLZ Compress: hash chain)
 
-`Compress` は各位置から履歴窓を総当たりで走査していた（位置ごとに最大 4096 個の
-候補 × 一致長）。非圧縮データ（random）では窓が毎回フルスキャンされ、64KiB で
-377ms もかかっていた。上流 `postgres/src/common/pg_lzcompress.c` は 4 バイト
-ハッシュ（`pglz_hist_idx`）+ 履歴チェーン（`PGLZ_HISTORY_SIZE` 4096）と
-`good_match`/`good_drop`（既定 128 / 10%）による早期打ち切りを持つので、それを
-そのまま移植した。定数・ハッシュ関数・打ち切り規則は上流と同一で、goopg 独自の
-チューニングは入れていない。
+`Compress` scanned the whole history window from every position (up to 4096
+candidates times the match length, per position). On incompressible input
+(random) the window was rescanned in full every time: 377 ms for 64 KiB.
+Upstream `postgres/src/common/pg_lzcompress.c` uses a 4-byte hash
+(`pglz_hist_idx`) with history chains (`PGLZ_HISTORY_SIZE` 4096) and the
+`good_match` / `good_drop` early exit (defaults 128 / 10%), which is what was
+ported here. The hash function, the constants and the cut-off rule are
+upstream's; no goopg-specific tuning was added.
 
-計測（`internal/access/common/pglz/compress_bench_test.go`、64KiB 入力）:
+Measured (`internal/access/common/pglz/compress_bench_test.go`, 64 KiB inputs):
 
-| blob | before ns/op | after ns/op | 倍率 |
+| blob | before ns/op | after ns/op | speedup |
 |---|---|---|---|
 | random | 377,273,400 | 995,478 | 379x |
 | nodetree | 8,146,757 | 257,828 | 32x |
 | text | 29,989,230 | 1,528,340 | 20x |
 
-トレードオフ（記録）: 早期打ち切りにより圧縮率がわずかに悪化する。
-nodetree 0.0381→0.0439、text 0.1588→0.1688。これは上流 PG 自身が既定で受け入れて
-いる同じトレードオフで、`TestCompressRatioAndRoundTrip` が nodetree ≤ 0.25 /
-text ≤ 0.75 と round-trip を恒久的に固定する。非圧縮データは両実装とも
-呼び出し側が弾く（圧縮不能として raw 格納）ので挙動差はない。
+The compression ratio worsens slightly because of the early exit: nodetree
+0.0381 -> 0.0439, text 0.1588 -> 0.1688. That is the same trade upstream PG
+makes by default — and the output is now BYTE-IDENTICAL to what real
+`pglz_compress()` produces, which the old brute-force search was not.
+`TestCompressMatchesUpstreamPGLZ` pins that against golden files generated by
+linking PG 18.3's `pg_lzcompress.c` into a frontend harness, and
+`TestCompressRatioAndRoundTrip` pins the ratio bounds and the round trip.
+Incompressible input is rejected by the callers in both variants, so nothing
+changes there.
 
-- **効用**: ○ 20〜380 倍。TOAST 書き込みパスの CPU がそのまま減る。
-- **無回帰**: ○ 出力は PGLZ 仕様どおりで `Decompress` と PG 双方が読める。
-- **保守性**: ○ 上流と 1:1 対応するコードなので、むしろ参照しやすくなった。
+One consequence, recorded because it looks like a regression and is not: the
+seeded pg_rewrite TOAST heap in a fresh data directory grows from 127 to 131
+chunks (32 -> 33 pages), because the same values compress slightly less well.
+`TestPgRewriteToastPairIndexRowAndFiles` was re-pinned accordingly.
 
-### NB-18 ADOPT（PGLZ Decompress: 非重なりマッチは 1 回コピー）
+- **Benefit**: yes. 20x to 380x; the TOAST write path pays that CPU directly.
+- **No regression**: yes, and stronger than before — the stream is now what PG
+  itself emits.
+- **Maintainability**: yes. The code now corresponds 1:1 with upstream, so it
+  is easier to check against it, not harder.
 
-`Decompress` はすべてのマッチを 1 バイトずつ展開していた。run-length 展開が
-必要なのは重なりのあるマッチ（`off < length`）だけで、それ以外は `append` 1 回で
-済む。`dst` は `rawSize` で事前確保済みなのでどちらの経路も再確保しない。
+### NB-18 — ADOPT (PGLZ Decompress: one copy for non-overlapping matches)
 
-| blob | before ns/op | after ns/op | 倍率 |
+`Decompress` expanded every match one byte at a time. Only an overlapping match
+(`off < length`) needs the run-length expansion; anything else is a single
+`append`. `dst` is pre-sized to `rawSize`, so neither branch reallocates.
+
+| blob | before ns/op | after ns/op | speedup |
 |---|---|---|---|
 | text | 78,934 | 43,559 | 1.8x |
 | nodetree | 44,567 | 26,109 | 1.7x |
-| random | 100,496 | 98,790 | 1.0x（マッチがほぼ無い） |
+| random | 100,496 | 98,790 | 1.0x (almost no matches) |
 
-- **効用**: ○ TOAST 読み出しで 1.7〜1.8 倍。
-- **無回帰**: ○ 重なり経路は従来コードのまま。round-trip テストで固定。
-- **保守性**: ○ 分岐 1 本。
+- **Benefit**: yes. 1.7x to 1.8x on TOAST reads.
+- **No regression**: yes. The overlapping path is the old code, and the
+  round-trip test pins the result.
+- **Maintainability**: yes. One branch.
 
-### EO1-1 — REJECT（既に対応済み）
+### EO1-1 — REJECT (already done)
 
-`sortOp` は M0134-0191 で既にキー値を `o.keyvals` に先計算しており、実ソートは
-`lessKeyVals`（先計算済み Datum 同士の比較）で回っている。`lessRows` は
-`len(o.keyvals) != len(rows)` になった場合の防御的フォールバックとしてのみ残って
-おり、通常経路では呼ばれない。指摘の症状は現行コードには存在しない。
+`sortOp` has precomputed its key values into `o.keyvals` since M0134-0191, and
+the actual sort runs through `lessKeyVals` (comparing precomputed Datums).
+`lessRows` survives only as a defensive fallback for the case where
+`len(o.keyvals) != len(rows)`, which the normal path never hits. The symptom
+the finding describes does not exist in the current code.
 
-### EO2-2 — ADOPT（ウィンドウ入力ソートのキー先計算）
+### EO2-2 — ADOPT (precompute the window input sort keys)
 
-`windowOp.Open` の比較関数は PARTITION BY / ORDER BY の式を比較のたびに両辺で
-`evalExpr` していた（n 行なら式ごとに O(n log n) 回）。`sortOp.sortChunk` と同じ
-形——行ごとに 1 回だけ評価して置換をソート——に置き換えた。比較規則
-（`compareSortDatums` の呼び順、`decided`、`Desc` 反転）は逐語で不変。
+`windowOp.Open`'s comparator called `evalExpr` on both sides for every PARTITION
+BY / ORDER BY expression on every comparison — O(n log n) evaluations per
+expression instead of one per row. It now follows `sortOp.sortChunk`: evaluate
+once per row, sort a permutation over the precomputed keys. The comparison rule
+(the `compareSortDatums` call order, `decided`, the `Desc` flip) is unchanged
+verbatim.
 
-計測（`internal/executor/window_sortkey_bench_test.go`、4000 行 / 8 パーティション、
-`row_number() OVER (PARTITION BY g ORDER BY t)`）:
+Measured (`internal/executor/window_sortkey_bench_test.go`, 4000 rows over 8
+partitions, `row_number() OVER (PARTITION BY g ORDER BY t)`):
 
 | | ns/op | B/op | allocs/op |
 |---|---|---|---|
 | before | 18,435,533 | 8,989,178 | 256,905 |
 | after | 7,660,551 | 4,784,936 | 56,166 |
 
-- **効用**: ○ 2.4 倍、alloc 4.6 分の 1。行数が増えるほど差が開く。
-- **無回帰**: ○ 評価位置が変わるだけ。ウィンドウ関数の既存テストは緑。
-- **保守性**: ○ 既存の sortOp と同じ定石に揃った。
+- **Benefit**: yes. 2.4x and 4.6x fewer allocations, widening with row count.
+- **No regression**: yes. Only the evaluation site moved; the window tests stay
+  green.
+- **Maintainability**: yes. It now matches the shape sortOp already uses.
 
-### EO1-13 — ADOPT（Gather Merge のヒープ比較キー先計算）
+### EO1-13 — ADOPT (precompute the Gather Merge heap keys)
 
-`gatherMergeOp.lessRows` はヒープ比較のたびに両辺でソートキーを評価していたため、
-出力 1 行あたり O(キー数 × log ソース数) 回の式評価が発生していた。`advance` で行を
-pull した時点で 1 回だけ評価して `gmSource.curKeys` に持たせ、ヒープは Datum 同士を
-比べるだけにした。NULL 配置・`Desc`・`compareDatum` の順序規則は逐語で不変
-（この比較器と `sortOp` の規則が一致していることが Gather Merge の正当性そのもの
-なので、規則には触れていない）。
+`gatherMergeOp.lessRows` evaluated the sort keys on both sides of every heap
+comparison, so each output row cost O(keys x log sources) evaluations. `advance`
+now evaluates them once when it pulls the row, into `gmSource.curKeys`, and the
+heap compares Datums. NULL placement, `Desc` and the `compareDatum` ordering
+rule are unchanged verbatim — this comparator agreeing with `sortOp`'s is
+exactly what makes Gather Merge correct, so the rule itself was not touched.
 
-計測（`internal/executor/gather_merge_keys_bench_test.go`、4 ソース × 2000 行、
-キーは列参照 2 本 = 最も安い式）:
+Measured (`internal/executor/gather_merge_keys_bench_test.go`, 4 sources x 2000
+rows, keys being two column references — the cheapest possible expressions):
 
 | | ns/op | B/op | allocs/op |
 |---|---|---|---|
 | before | 2,632,359 | 1,023,654 | 42,652 |
 | after | 1,935,229 | 1,151,443 | 23,988 |
 
-- **効用**: ○ 1.36 倍。キーが列参照より重い式（キャスト・関数）なら差はさらに開く。
-- **無回帰**: ○ 比較規則は不変。B/op がわずかに増えるのは行ごとのキー配列を保持する
-  ぶんで、評価回数と alloc 回数は減っている。
-- **保守性**: ○ EO2-2 / sortOp と同じ方針。
+- **Benefit**: yes, 1.36x here, and more for keys heavier than a column
+  reference (casts, function calls).
+- **No regression**: yes. B/op rises slightly because each front row now holds
+  its key array; the number of evaluations and of allocations both fall.
+- **Maintainability**: yes. Same approach as EO2-2 / sortOp.
 
-### NB-10 — REJECT（保守性）
+### NB-10 — REJECT (maintainability)
 
-`BTree.Search` が `pageItems` でリーフ全体をデコードしてから二分探索しているのは
-事実だが、`pageItems` は heap TID ごとに項目を展開した列を返す（項目インデックスと
-行ポインタが 1:1 ではない）。遅延デコードの二分探索にするには展開規則と
-`pageItemsWithDead` / VACUUM 側の「同じ列を見ている」前提まで作り替える必要があり、
-nbtree の不変条件に踏み込む変更量になる。効用は見込めるが、判断基準 3（保守性を
-著しく下げない）を満たさないため今回は見送る。
+`BTree.Search` does decode the whole leaf through `pageItems` before binary
+searching it. But `pageItems` returns an EXPANDED item list (one entry per heap
+TID), so item indexes do not map 1:1 onto line pointers. Making the binary
+search decode lazily would mean reworking that expansion rule and the
+`pageItemsWithDead` / VACUUM readers that assume they are looking at the same
+list — a change deep into nbtree's invariants. The benefit is plausible, but
+criterion 3 (do not badly degrade maintainability) is not met, so this is left
+alone for now.
+
+### ES-7 — ADOPT (cache the PL/pgSQL named-parameter regexps)
+
+`rewriteSQLNamedParams` called `regexp.MustCompile` once per argument, so
+calling a PL/pgSQL function compiled as many regexps as it has arguments on
+every invocation — a fixed cost unrelated to what the body does. The pattern is
+now cached in a `sync.Map` keyed by argument name; the pattern itself is
+unchanged verbatim. The key set is the set of argument identifiers in the
+database's routines, so it is bounded by the schema, not by traffic.
+
+Measured (`internal/executor/plpgsql_namedparam_bench_test.go`, 3 arguments):
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| before | 29,582 | 15,960 | 152 |
+| after | 9,498 | 1,028 | 25 |
+
+- **Benefit**: yes. 3.1x; a fixed cost proportional to the call count is gone.
+- **No regression**: yes. The compiled pattern is identical and the plpgsql
+  tests stay green.
+- **Maintainability**: yes. One helper function.
+
+### ST-5 / ST-6 — ADOPT (FSM lookups scaled with the relation)
+
+`GetCandidates` / `GetPageWithFreeSpace` scanned every registered page of the
+relation. The INSERT path calls this to choose a target page, so **the cost of
+one insert grew with the size of the table** — 23.6 us per lookup on a
+100k-page (800 MB) relation. On an append-heavy relation every page but the
+tail is full, so almost the whole scan was reading zeroes.
+
+The FSM now keeps a one-level summary of the maximum free space per 512 blocks
+(`chunkMax`) and skips a chunk wholesale when its maximum is below what the
+caller asked for. It is the same idea as PG's FSM tree, flattened to one level
+because the reader only ever asks "could there be anything here at all". The
+summary is maintained exactly by the writer (`RecordFreeSpace`) under the write
+lock; readers only consult it, still under the shared lock, and fall back to the
+plain scan when there is no summary. Relations of one chunk or less keep no
+summary and behave exactly as before, because for them the scan is already
+cheaper than the bookkeeping. ST-5 is a second issue in the same function:
+recording a high block number appended one block at a time, and now grows in one
+allocation.
+
+Measured (`internal/storage/fsm_lookup_bench_test.go`, only the last 4 pages
+have room):
+
+| bench | before | after |
+|---|---|---|
+| `GetCandidates`, 64 pages | 49.9 ns | 63.5 ns |
+| `GetCandidates`, 100k pages | 23,590 ns | 192 ns |
+| `GetPageWithFreeSpace`, 64 pages | 22.4 ns | 27.3 ns |
+| `GetPageWithFreeSpace`, 100k pages | 24,400 ns | 163 ns |
+| insert round trip (get + record), 64 pages | 77-87 ns | 77 ns |
+| insert round trip, 100k pages | 23,650 ns | 304 ns |
+
+- **Benefit**: yes. 78x to 150x on large relations. Small relations pay 5-14 ns
+  more per read (one extra map lookup for `chunkMax`); the full insert round
+  trip is unchanged.
+- **No regression**: yes. `TestFSMChunkMaxMatchesFullScan` pins equivalence with
+  a reference implementation copied from the old code over 2000 rounds of
+  random updates, including the "ties go to the lower block number" rule.
+- **Maintainability**: yes. The summary has exactly one owner (the writer), and
+  a reader with no summary falls back to the old full scan — so a bug there
+  costs speed, never correctness.
