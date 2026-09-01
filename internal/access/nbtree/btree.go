@@ -2515,7 +2515,12 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 			// M0055-0002-followup-rightmost-cache: if this leaf
 			// has no Next pointer it IS the rightmost; refresh
 			// the cache. Cheap atomic write, no allocation.
-			if op.Next == 0 {
+			// The rightmost page's sibling link is P_NONE on disk,
+			// which readOpaque translates to InvalidBlockNumber —
+			// comparing against 0 was never true, so this cache was
+			// never populated and the fast path below was dead code
+			// (review/260831-2 NB-4).
+			if op.Next == storage.InvalidBlockNumber {
 				bt.rightmostLeafBlk.Store(uint64(cur))
 			}
 			// (M0055-0004-followup-stage2-splitmu-removal:
@@ -3564,14 +3569,15 @@ func mustInsertItemSorted(f indexFormat, p storage.Page, it item) int {
 //
 // Staleness conditions:
 //   - The leaf has a Next pointer set (a later split moved the
-//     rightmost forward). The cache is stale; clear and miss.
+//     rightmost forward), or it is deleted / half-dead / mid-split.
+//     The cache is stale; clear and miss.
 //   - The leaf is full (no space for `it`). Caller takes the
 //     normal split path.
 //   - `it.key < leaf.HighKey` (the key belongs to a left sibling,
 //     not this leaf — the cache is wrong for this insert).
 //
 // The cache is updated by the slow-path descent every time it
-// reaches a leaf that's truly the rightmost (Next == 0).
+// reaches a leaf that's truly the rightmost (Next == InvalidBlockNumber).
 func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (bool, error) {
 	slot, err := bt.pinW(blk)
 	if err != nil {
@@ -3580,8 +3586,23 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 		return false, nil
 	}
 	op := readOpaque(slot.Page())
-	if op.Level != 0 || op.Next != 0 {
+	if op.Level != 0 || op.Next != storage.InvalidBlockNumber {
 		// Not a leaf, or no longer rightmost — cache is stale.
+		// (The sentinel is InvalidBlockNumber, not 0 — see NB-4 at
+		// the descent-side store.)
+		bt.unpinW(slot)
+		bt.rightmostLeafBlk.Store(0)
+		return false, nil
+	}
+	// A page that is being deleted, or that carries an unfinished split,
+	// is not a legal insert target: upstream's _bt_findinsertloc reaches
+	// neither (a deleted/half-dead page is unlinked from the descent, and
+	// an incomplete split is completed by _bt_finish_split before the
+	// insert). Only the descent path knows how to handle either, so miss
+	// to it. Without this the cache could hand an insert to a page that
+	// unlinkEmptyLeaf is about to recycle under a different key range
+	// (review/260831-2 NB-5).
+	if op.IsDeleted() || op.IsHalfDead() || op.HasIncompleteSplit() {
 		bt.unpinW(slot)
 		bt.rightmostLeafBlk.Store(0)
 		return false, nil
