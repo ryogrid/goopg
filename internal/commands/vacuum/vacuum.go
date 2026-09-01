@@ -160,6 +160,13 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 			} else {
 				stats.SkippedAllVisible++
 			}
+			// A skipped block was NOT examined, so it must be assumed
+			// non-empty: it is all-visible, which for a heap page means it
+			// holds live tuples. Upstream advances `vacrel->nonempty_pages`
+			// on this very path (heap_vac_scan_next_block, vacuumlazy.c) —
+			// without it, a trailing run of skipped all-visible blocks looks
+			// empty to the truncation step below and live data is dropped.
+			lastNonEmpty = blk
 			continue
 		}
 		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})

@@ -28,9 +28,9 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 
 | id | sev | finding | verdict | status | commit |
 |---|---|---|---|---|---|
-| EO2-1 | high | `executor/operators_indexonly.go:Rescan` — LowOp/HighOp strictness ignored, bounds always inclusive | BUG | [x] | see progress log |
+| EO2-1 | high | `executor/operators_indexonly.go:Rescan` — LowOp/HighOp strictness ignored, bounds always inclusive | BUG | [x] | `5360b7e79` |
 | ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | ? | [ ] | |
-| NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | ? | [ ] | |
+| NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | BUG | [x] | see progress log |
 | ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | ? | [ ] | |
 | ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | ? | [ ] | |
 | TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | ? | [ ] | |
@@ -162,3 +162,14 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 Note on the `commit` column: a commit cannot contain its own hash, so a row's
 hash is filled in by the NEXT commit; rows reading `see progress log` are already
 landed.
+
+- 2026-09-01 **NB-1 = BUG (fixed).** `vacuumCore`'s visibility-map skip branch
+  `continue`d without touching `lastNonEmpty`, and the tail-truncation step at
+  the end of the pass truncates the relation to `lastNonEmpty+1`. A trailing run
+  of all-visible (hence live, hence skippable) blocks therefore looked EMPTY and
+  was truncated away — silent data loss on exactly the pages VACUUM is proudest
+  of skipping. Upstream advances `vacrel->nonempty_pages` on this very path
+  (`heap_vac_scan_next_block`, vacuumlazy.c). Fix: set `lastNonEmpty = blk`
+  before the `continue`. Guard: `TestVacuumTailTruncationKeepsVMSkippedBlocks`
+  (3 all-visible live blocks + 1 genuinely empty tail block; nblocks must be 3,
+  was 0 before the fix).
