@@ -47,7 +47,7 @@ not, with the reason) / empty (not judged yet).
 | EO2-2 | executor-operators-2 | medium | `operators_window.go:Open` — sort comparator re-evaluates expressions per comparison | ADOPT | 4000 rows / 8 partitions: 18.44ms -> 7.66ms (2.4x), allocs 256,905 -> 56,166 | comparison rule unchanged verbatim; only the evaluation moved to once per row | same "precompute keys, sort a permutation" shape as sortOp.sortChunk | [x] fixed |
 | EO2-6 | executor-operators-2 | medium | `operators_index.go:Next` / `operators_storage.go:Next` — per-row enum value linear scan | | | | | [ ] |
 | EO2-7 | executor-operators-2 | medium | `operators_indexonly.go:decodeRowFromKey` / `operators_indexonly.go:decodeRowFromHeap` — per-row map allocation + O(covered × columns) projection | | | | | [ ] |
-| EO2-8 | executor-operators-2 | medium | `operators_generated.go:evalGeneratedExpr` — re-parses expression string per row | | | | | [ ] |
+| EO2-8 | executor-operators-2 | medium | `operators_generated.go:evalGeneratedExpr` — re-parses expression string per row | ADOPT | 200 rows into a table with one generated column: 1.85ms -> 0.77ms (2.4x), 456KB / 8844 allocs -> 275KB / 5645 | evalGenExpr only READS the tree, and the key is the expression text, so a changed column definition lands on a different key | one sync.Map behind an accessor | [x] fixed |
 | EO2-9 | executor-operators-2 | medium | `operators_storage.go:checkUniqueIndexesForInsert` / `maintainUniqueIndexesForInsert` — per-row per-index btree open | REJECT (risk over reward) | measured: openIndexBTree is 159 ns / 416 B / 2 allocs per row per index — about 1-3% of a row insert | caching a tree across rows means invalidating it on index DDL, a CONCURRENTLY swap or a relfilenode change mid-statement; getting that wrong writes entries into the wrong tree | — | [x] no change |
 | EO2-11 | executor-operators-2 | medium | `operators_join_agg.go:aggregateOp.Open` — per-row allocations for group key values | | | | | [ ] |
 | EO2-12 | executor-operators-2 | medium | `operators_merge.go:mergedRow` — per-candidate-pair allocation | ADOPT | 400 target x 100 source rows: 6.47ms -> 4.34ms (1.5x), 9.10MB / 83,476 allocs -> 1.40MB / 43,476 (exactly the 40,000 pairs) | nothing retains the concatenated row — the pending mod stores its own copies of the source and target rows — so one scan buffer serves the whole page | one helper next to mergedRow, which stays for the callers that do need an owned row | [x] fixed |
@@ -56,8 +56,8 @@ not, with the reason) / empty (not judged yet).
 | EO2-25 | executor-operators-2 | medium | `operators_upsert.go:maintainNonArbiterIndexesCapture` — btree re-opened per index per row | REJECT (same as EO2-9) | same per-row btree open on the upsert path, same 159 ns | same invalidation problem | — | [x] no change |
 | ES-7 | executor-sys | medium | `plpgsql_runtime.go:rewriteSQLNamedParams` — regexp compiled per argument per invocation | ADOPT | 3-argument rewrite: 29.6us -> 9.5us (3.1x), 16.0KB -> 1.0KB, 152 -> 25 allocs | the compiled pattern is identical; the cache key is the argument name | one `sync.Map`; the key set is bounded by the schema, not by traffic | [x] fixed |
 | ES-8 | executor-sys | medium | `plpgsql_runtime.go:executeSQLRoutine` (+procedures/setof) — body re-parsed and re-planned on every call | REJECT (needs the plan-cache machinery) | real — a SQL-language routine re-parses (and re-plans) its body on every call | the body text IS stable per routine (arguments are rewritten to $n, values go through ctx.Params), so a cache is possible; but the planner mutates the tree it is given, so caching a bare AST is not safe. The sound design is the postmaster planCache (keyed plan + its invalidation), reused from the executor | out of scope for a per-finding fix | [ ] deferred |
-| ES-9 | executor-sys | medium | `plpgsql_runtime.go:executePLpgSQLTriggerBody` — trigger body re-parsed on every firing | | | | | [ ] |
-| ES-17 | executor-sys | medium | `toast.go:DetoastValue` — full TOAST relation scan per detoasted column | | | | | [ ] |
+| ES-9 | executor-sys | medium | `plpgsql_runtime.go:executePLpgSQLTriggerBody` — trigger body re-parsed on every firing | ADOPT | 100 rows through a BEFORE INSERT row trigger: 1.90ms -> 0.97ms (2.0x), 1.21MB / 10,642 allocs -> 761KB / 6245 | the interpreter lowers each statement into fresh values as it goes and never writes back into the parsed block; the cache key is the body text, so CREATE OR REPLACE lands on a different key | one sync.Map, applied to all four plpgsql.Parse call sites in the executor | [x] fixed |
+| ES-17 | executor-sys | medium | `toast.go:DetoastValue` — full TOAST relation scan per detoasted column | ADOPT (partial) | reading a value whose chunks sit early in the TOAST relation: ~50us -> ~40us and 226 -> 109 allocs; a value at the end is unchanged (nothing to skip) | the scan stops once every chunk_seq of the value has been seen — chunk_seq is unique per chunk_id, so a later sighting could only be an older version, which the visibility test already filters | one counter; the real remedy (a TOAST chunk index, as upstream has) is a feature, recorded below | [x] fixed |
 | OP1-1 | optimizer-1 | medium | `cardinality.go:estimateNumGroups` — per-relation full-tree walk plus subtree re-estimation | | | | | [ ] |
 | OP1-2 | optimizer-1 | medium | `cardinality.go:semiPairMatchFraction` — O(n·m) MCV matching nested loop | | | | | [ ] |
 | OP1-3 | optimizer-1 | medium | `cardinality.go:EstimateRows` — no memoization on recursive estimates | | | | | [ ] |
@@ -1170,3 +1170,49 @@ folds is what makes the planner's later in-place rewrites safe: returning the
 input unchanged would alias the caller's tree. Establishing that no mutating
 pass depends on the copy is a survey of the whole rewrite layer, for a saving
 that is planning-time only and paid once per query.
+
+### ES-17 — ADOPT (partial: stop the TOAST scan when the value is complete)
+
+`DetoastValue` scanned the ENTIRE TOAST relation — every block, every tuple,
+decoding each row — to collect one value's chunks, and kept scanning after it
+had them all. It now stops as soon as every chunk_seq of the value has been
+seen. chunk_seq is unique per chunk_id, so a later sighting could only be an
+older version, which the visibility test already filters out.
+
+| detoast one value, 40-row TOAST relation | before | after |
+|---|---|---|
+| chunks early in the relation | ~50,000 ns, 226 allocs | ~40,000 ns, 109 allocs |
+| chunks at the end | ~49,000 ns, 227 allocs | ~49,000 ns, 227 allocs (nothing to skip) |
+
+This is a partial fix and is recorded as such: the cost is still O(TOAST
+relation) in the worst case. The real remedy is what upstream does — read the
+chunks through `pg_toast_<rel>_index` on (chunk_id, chunk_seq) — which means
+creating, maintaining, WAL-logging and recovering that index. That is a
+feature-sized change, not a per-finding fix.
+
+### EO2-8 — ADOPT (parse a generated column's expression once)
+
+`evalGeneratedExpr` ran the SQL parser on the stored expression text for EVERY
+row written. The text is fixed by the column definition and `evalGenExpr` only
+reads the tree, so the parse is cached by expression text.
+
+| 200 rows into a table with one generated column | before | after |
+|---|---|---|
+| | 1,850,965 ns, 456,002 B, 8844 allocs | 765,546 ns, 274,928 B, 5645 allocs |
+
+### ES-9 — ADOPT (parse a PL/pgSQL body once)
+
+The routine body was re-parsed on every call and every trigger firing — a full
+PL/pgSQL parse per row for a row-level trigger. All four `plpgsql.Parse` call
+sites in the executor now go through a body-text-keyed cache. The interpreter
+lowers each statement into fresh optimizer values as it runs and never writes
+back into the parsed block, and CREATE OR REPLACE changes the body text, so it
+lands on a different key.
+
+| 100 rows through a BEFORE INSERT row trigger | before | after |
+|---|---|---|
+| | 1,900,638 ns, 1,207,604 B, 10,642 allocs | 968,417 ns, 761,481 B, 6245 allocs |
+
+This also settles half of ES-8: a PL/pgSQL routine no longer re-parses its body
+per call. What remains deferred there is the SQL-language routine's re-PLANNING
+per call, which needs the postmaster plan cache rather than an AST cache.
