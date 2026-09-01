@@ -125,7 +125,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | XL-1 | low | `wal/append_xlog_payload.go:appendXLogPayload` — error from emitWithPageHeaders swallowed | ? | [ ] | |
 | XL-2 | low | `wal/insert_pos.go:reserveLocked` — `onCrossSegment` padded return discarded | ? | [ ] | |
 | XL-3 | low | `wal/pgoutput.go:encodePgoTuplePhysical` — column-offset walk mis-advances on null columns | NOT A BUG | [x] | — |
-| XL-5 | med | `wal/pgoutput.go:pgoPhysicalAlign` — alignment table drifted from the executor decoder's (found while checking XL-3) | BUG | [ ] | pending gate |
+| XL-5 | med | `wal/pgoutput.go:pgoPhysicalAlign` — alignment table drifted from the executor decoder's (found while checking XL-3) | BUG | [x] fixed + guarded | this commit |
 | CP-3 | low | `postmaster/autovacuum/launcher.go:freezeCutoff` — dead signedness check / unsigned wrap reliance | ? | [ ] | |
 | CP-4 | low | `replication/logicalwalsender.go:walsenderPgoutputAdapter.Write` — LSN underflow on empty write | ? | [ ] | |
 | CP-5 | low | `postmaster/server.go:isReplicationStartupParam` — overly broad match | ? | [ ] | |

@@ -341,37 +341,12 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 }
 
 // pgoPhysicalAlign rounds off up to the PG storage alignment for t's physical
-// type. Mirrors executor.alignPhysicalPGOffset + physicalPGTypeAlign. Type
-// names here are the lowercase canonical catalog names (same as pgoDecodeValue).
+// type. The alignment table is catalog.PhysicalTypeAlignName, shared with the
+// executor's decoder (executor.physicalPGTypeAlignLowered): this used to be a
+// hand-copied subset that had drifted from it, mis-aligning pg_lsn / xid8 /
+// smallserial / serial8 / anyarray columns on the replication wire.
 func pgoPhysicalAlign(off int, t catalog.Type) int {
-	align := 4
-	// A user array column is catalog.Type{Name:<ELEMENT type>, IsArray:true} —
-	// Name is the ELEMENT's name, so every arm below would claim the array and
-	// impose the ELEMENT's alignment (e.g. 8 for `interval[]`). On disk an array
-	// is always a varlena ArrayType blob, i.e. PG 'i' / 4-byte alignment, so the
-	// IsArray test has to come first. M0119-0006.
-	if t.IsArray {
-		return (off + 3) &^ 3
-	}
-	switch t.Name {
-	case "bool", "boolean", "name",
-		// uuid: pg_type OID 2950 is typalign 'c', typlen 16 (M0119-0006).
-		"uuid":
-		align = 1
-	case "char":
-		if len(t.Args) == 0 {
-			align = 1
-		} else {
-			align = 4
-		}
-	case "int2", "smallint":
-		align = 2
-	case "int8", "bigint", "bigserial", "float8", "double precision", "double",
-		"timestamp", "timestamptz", "time", "timetz",
-		// interval: pg_type OID 1186 is typalign 'd', typlen 16.
-		"interval":
-		align = 8
-	}
+	align := catalog.PhysicalTypeAlignName(t)
 	if align <= 1 {
 		return off
 	}
