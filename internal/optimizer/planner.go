@@ -2596,6 +2596,14 @@ func nodeReferencesOuter(n Node) bool {
 		return exprContainsColumnRef(x.StringExpr) ||
 			exprContainsColumnRef(x.PatternExpr) ||
 			exprContainsColumnRef(x.FlagsExpr)
+	case *PgOptionsToTable:
+		// `FROM t, LATERAL pg_options_to_table(t.opts)`: the argument is a
+		// plain *ColumnRef against the left sibling, so the wrapping Join has
+		// to run through the per-outer-row lateral driver. Without this case
+		// the join stayed a plain nested loop, nothing ever bound an outer
+		// row, and the query died with "column ref opts/1 on nil slot"
+		// (review/260831-2 EO2-6).
+		return exprContainsColumnRef(x.Arg)
 	case *OrdinalityWrap:
 		// WITH ORDINALITY wraps the underlying SRF node; unwrap so a
 		// correlated argument is still detected under the wrapper.
