@@ -112,7 +112,7 @@ not, with the reason) / empty (not judged yet).
 | CP-4 | catalog-postmaster | medium | `catalog.go:RoleIsMemberOf` / `IsAdminOfRole` / `HasPrivsOfRole` / `SelectBestAdmin` — BFS re-scans the entire `roleMembers` map per queue level (O(V×E)) | | | | | [ ] |
 | CP-5 | catalog-postmaster | medium | `catalog.go:LookupTableByOIDAllDBs` / `tableByOID` — linear scan of all tables per OID lookup | REJECT (maintainability) | plausible — `tableByOID` is O(tables) and runs per row for `tableoid::regclass` | — | an OID index would have to be maintained at ~100 sites that assign into or delete from `ns.tables`; there is no central setTable/dropTable helper to hang it on. Revisit once those writes are funnelled through one place | [x] no change |
 | UT-1 | utils | medium | `internal/utils/misc/encoding_guc.go:encodingNameToCanonical` — re-cleans the constant encoding table on every call | REJECT (no benefit) | the only caller is the client_encoding GUC check; it is not on any per-row or per-tuple path | — | — | [x] no change |
-| UT-9 | utils | medium | `internal/utils/adt/datetime/pg_datetime_format.go` — `fmt.Sprintf` on the per-cell output path | | | | | [ ] |
+| UT-9 | utils | medium | `internal/utils/adt/datetime/pg_datetime_format.go` — `fmt.Sprintf` on the per-cell output path | ADOPT | wire form 381 ns -> 45.9 ns (8.3x), 6 allocs -> 1; with a fraction 479 ns -> 54.8 ns (8.7x), 9 allocs -> 1. The DateStyle-aware path the protocol actually uses (misc.FormatTimestamp/FormatDate, ISO) 124 ns -> 56 ns and 79 ns -> 40 ns | two differential tests compare every renderer against the fmt / time.Format implementation it replaced, over thousands of random values plus BC, > year 9999 and negative-time edge cases | plain digit appends behind the same function names; the append form is the primitive and the string form wraps it | [x] fixed |
 | UT-14 | utils | medium | `internal/utils/mb/conv.go:DoEncodingConversion` — dead `destBuf` allocation | | | | | [ ] |
 | UT-20 | utils | medium | `internal/utils/mmgr/mctx.go:Lookup` — global mutex on the per-datum read path | ADOPT | serial 3.70 ns -> 0.67 ns (5.5x); 16-way parallel 35.05 ns -> 0.09 ns (396x — the mutex was serialising every backend on a pure read) | the registry slots are atomic pointers; ctxMu still orders id allocation, and a released slot is cleared BEFORE its id can be reused | one declaration and three accessors; `go test -race` on the package passes | [x] fixed |
 | UT-23 | utils | medium | `internal/utils/adt/array/pgarray.go:DecodeElemStyled` — `strings.ToLower(elemName)` recomputed per element | REJECT (no benefit) | `strings.ToLower` only scans (no allocation) when the input is already lower-case, and element names are catalog-normalised | — | — | [x] no change |
@@ -874,3 +874,40 @@ the postmaster's `planCache` — which already caches planned trees keyed by SQL
 text, together with the invalidation that makes that safe — from the executor's
 routine path. That is a feature-sized change, not a per-finding fix, so it is
 recorded here as deferred rather than done badly.
+
+### UT-9 — ADOPT (render dates and timestamps without fmt)
+
+Two per-cell output paths built their text out of `fmt.Sprintf` and string
+concatenation:
+
+- `datetime.FormatTimestamp` (COPY TO text, array element output) did a Sprintf
+  for the date, another for the time, a third to join them, and more for the
+  fractional seconds — six allocations for one value.
+- `misc.FormatTimestamp` / `misc.FormatDate` (the protocol's row output, via
+  dispatch) used `time.Format` plus concatenation for the ISO DateStyle, which
+  is the default and therefore what nearly every result row is rendered in.
+
+Both now write their digits into a stack buffer and allocate exactly the string
+they return. The append form is the primitive and the string form wraps it, so
+`FormatTimestamp` no longer materialises the time-of-day separately.
+
+Measured:
+
+| bench | before | after |
+|---|---|---|
+| `datetime.FormatTimestamp` | 381.0 ns, 88 B, 6 allocs | 45.9 ns, 24 B, 1 alloc |
+| `datetime.FormatTimestamp`, fractional | 479.0 ns, 120 B, 9 allocs | 54.8 ns, 24 B, 1 alloc |
+| `misc.FormatTimestamp` (ISO) | 123.9 ns, 24 B, 1 alloc | 56.1 ns, 24 B, 1 alloc |
+| `misc.FormatTimestamp` (ISO, fractional) | 171.6 ns, 52 B, 3 allocs | 88.7 ns, 28 B, 2 allocs |
+| `misc.FormatDate` (ISO) | 79.1 ns, 16 B, 1 alloc | 39.6 ns, 16 B, 1 alloc |
+
+- **Benefit**: yes. 2x on the protocol path and 8x on the COPY/array path, per
+  value rendered.
+- **No regression**: yes. `TestFormatMatchesSprintfReference` and
+  `TestISOFastPathsMatchTimeFormat` keep the old implementations as references
+  and compare them against the new ones over thousands of random values plus
+  the edge cases that hand-rolled digit code gets wrong: BC years, years past
+  9999, negative times, and every fractional-second shape.
+- **Maintainability**: acceptable. Digit appends are more code than a Sprintf,
+  but they are the boring kind, they sit behind the same function names, and
+  the differential tests document exactly what they must produce.
