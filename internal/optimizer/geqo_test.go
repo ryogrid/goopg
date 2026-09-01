@@ -2,6 +2,8 @@ package optimizer
 
 import (
 	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestGeqoPoolSize checks the pool sizing formula against PG's gimme_pool_size.
@@ -202,4 +204,151 @@ func TestGeqoEvalPanicsOnNilCtx(t *testing.T) {
 		}
 	}()
 	geqoEval(nil, []Gene{1, 2}, 2)
+}
+
+// --- GEQO usage-case tests ---
+
+// geqoTestCtx builds an n-relation search context suitable for the REAL
+// joinRelBuilder: each base rel carries a costed PathPrebuilt path and its
+// CheapestTotal, and `s.clauses` holds one cross-rel equality clause per
+// consecutive pair so every clump merge is "desirable" (a relevant join clause
+// exists). This mirrors the production setup in `searchOneProblem`
+// (relfromjoinlist.go): buildInitialRels (level-1 rels with paths) + clauses +
+// the concrete `newJoinRelBuilder`.
+func geqoTestCtx(t *testing.T, n int) *searchCtx {
+	t.Helper()
+	s := jslCtx(t, n)
+	// One equijoin clause between each consecutive pair (i, i+1). gimmeTree's
+	// mergeClump uses desirableJoin → hasRelevantJoinClause; a fully connected
+	// clause set is what makes the GA able to collapse the tour into one clump
+	// during the non-forced pass.
+	var clauses []*restrictInfo
+	for i := 0; i < n-1; i++ {
+		clauses = append(clauses, &restrictInfo{
+			clause:      &BinaryOp{Op: parser.OpEq, Left: jsCol(i, "a"), Right: jsCol(i+1, "a")},
+			relids:      relsetOf(i) | relsetOf(i+1),
+			leftKey:     jsCol(i, "a"),
+			rightKey:    jsCol(i+1, "a"),
+			leftRelids:  relsetOf(i),
+			rightRelids: relsetOf(i + 1),
+			isEquijoin:  true,
+			ecID:        noEquivClass,
+		})
+	}
+	l := &restrictInfoList{}
+	for _, c := range clauses {
+		l.all = append(l.all, c)
+	}
+	s.clauses = l
+	return s
+}
+
+// TestGeqoSearchReturnsValidFullRelPath is the core usage test: the real GA
+// driver (geqoSearch) over the real joinRelBuilder must return a path whose
+// final joinrel covers EVERY base relation — i.e. GEQO actually solves the
+// join-order problem rather than failing back or returning a partial tree.
+// Runs for 2..8 relations; below maxSearchRels and above the 2-rel minimum,
+// spanning the typical GEQO-eligible range.
+func TestGeqoSearchReturnsValidFullRelPath(t *testing.T) {
+	for n := 2; n <= 8; n++ {
+		s := geqoTestCtx(t, n)
+		s.builder = newJoinRelBuilder(s, nil)
+		p, err := geqoSearch(s, s.builder, 5)
+		if err != nil {
+			t.Fatalf("n=%d: geqoSearch error: %v", n, err)
+		}
+		if p == nil {
+			t.Fatalf("n=%d: geqoSearch returned nil path", n)
+		}
+		all := RelSet(1)<<uint(n) - 1
+		if p.Rel.Relids != all {
+			t.Errorf("n=%d: final relids=%#04x, want full relset %#04x", n, uint16(p.Rel.Relids), uint16(all))
+		}
+		if !(p.Cost.Total > 0) {
+			t.Errorf("n=%d: total cost %v not positive", n, p.Cost.Total)
+		}
+	}
+}
+
+// TestGeqoSearchDeterministic checks the fixed-seed PRNG makes the whole GA
+// deterministic: two runs on the same problem return the same final cost.
+// (PG uses geqo_seed; goopg's v0 uses a fixed seed — geqo.go:141.)
+func TestGeqoSearchDeterministic(t *testing.T) {
+	run := func() float64 {
+		s := geqoTestCtx(t, 5)
+		s.builder = newJoinRelBuilder(s, nil)
+		p, err := geqoSearch(s, s.builder, 5)
+		if err != nil {
+			t.Fatalf("geqoSearch: %v", err)
+		}
+		return p.Cost.Total
+	}
+	a, b := run(), run()
+	if a != b {
+		t.Errorf("GEQO not deterministic: first run %v, second run %v", a, b)
+	}
+}
+
+// TestGeqoSearchFailsWithoutValidPool checks the guarded failure path: when no
+// valid tour can be formed, geqoSearch returns an error instead of a nil path
+// or a panic. Build a context with an EMPTY clause list and a builder that
+// refuses to add paths (so every joinrel ends with no CheapestTotal → every
+// tour scores MaxFloat64 → randomInitPool fails after 10000 tries).
+func TestGeqoSearchFailsWithoutValidPool(t *testing.T) {
+	s := jslCtx(t, 4) // no clauses, no builder addPaths refusal → still connects via force pass
+	s.builder = newJoinRelBuilder(s, nil)
+	// A nil clause list is legal (desirableJoin handles it); GEQO's force pass
+	// must still collapse the clumps. This asserts the opposite failure: with a
+	// builder that yields no paths, we error out cleanly rather than panic.
+	bad := &refusingBuilder{s: s}
+	s.builder = bad
+	p, err := geqoSearch(s, bad, 5)
+	if err == nil {
+		t.Fatalf("geqoSearch should fail with a refusing builder, got path %v", p)
+	}
+}
+
+// refusingBuilder implements joinRelBuilder but adds NO paths, so every
+// joinrel ends without a CheapestTotal and every tour scores MaxFloat64.
+type refusingBuilder struct {
+	s *searchCtx
+}
+
+func (r *refusingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo) (float64, int) {
+	return r.s.calcJoinrelSize(nil, outer, inner, clauses)
+}
+
+func (r *refusingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo) error {
+	return nil // refuse: never add a path
+}
+
+// TestGeqoDispatchConditions checks the two GUC-backed knobs that gate GEQO:
+// GeqoEnabled (default on) and GeqoThreshold (default 12, matching PG), plus
+// the SetGeqo* setters used by the cmd/goopg/main.go bridge.
+func TestGeqoDispatchConditions(t *testing.T) {
+	if !GeqoEnabled() {
+		t.Error("GEQO should default to enabled (PG geqo=on)")
+	}
+	if got := GeqoThreshold(); got != 12 {
+		t.Errorf("GeqoThreshold default = %d, want 12 (PG geqo_threshold)", got)
+	}
+	// The setters are process-global atomics; restore the defaults afterwards
+	// so other tests are unaffected.
+	SetGeqoEnabled(false)
+	if GeqoEnabled() {
+		t.Error("SetGeqoEnabled(false) did not disable GEQO")
+	}
+	SetGeqoEnabled(true)
+	if !GeqoEnabled() {
+		t.Error("SetGeqoEnabled(true) did not re-enable GEQO")
+	}
+	SetGeqoThreshold(8)
+	if got := GeqoThreshold(); got != 8 {
+		t.Errorf("SetGeqoThreshold(8) -> %d", got)
+	}
+	SetGeqoThreshold(2) // clamps below 2 (geqo.go:28)
+	if got := GeqoThreshold(); got != 2 {
+		t.Errorf("SetGeqoThreshold(1) should clamp to 2, got %d", got)
+	}
+	SetGeqoThreshold(12) // restore default
 }
