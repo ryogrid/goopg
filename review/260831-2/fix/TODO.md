@@ -56,8 +56,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | ST-3 | med | `storage/bufpool.go:pinLoad/evictVictim` — dirty victim content discarded when the flush fails | ? | [ ] | |
 | ST-7 | med | `storage/vm.go:PageAllVisible/PageAllFrozen` — plain XID comparison breaks under wraparound | BUG | [x] | 3f13f584e |
 | ST-8 | med | `storage/freeze.go:PageFreezeOldTuples` — plain XID comparison breaks under wraparound | BUG | [x] | 8d5028fb3 |
-| NB-2 | med | `pglz/pglz.go:Decompress` — match length clamped instead of erroring on corrupt streams | ? | [ ] | |
-| TA-2 | med | `transam/manager.go:AssignXID` — non-atomic read-check-allocate-store allows XID leak/double-assign | ? | [ ] | |
+| NB-2 | med | `pglz/pglz.go:Decompress` — match length clamped instead of erroring on corrupt streams | NOT A BUG | [x] | — |
+| TA-2 | med | `transam/manager.go:AssignXID` — non-atomic read-check-allocate-store allows XID leak/double-assign | NOT A BUG | [x] | — |
 | NP-1 | med | `plpgsql/parser.go:parseFor` — FOR-query scan truncates on a `loop` identifier inside the SQL text | ? | [ ] | |
 | NP-5 | med | `plpgsql/parser.go:parseFor` — `isQueryFor` peeks only the first token; parenthesized bound misroutes | ? | [ ] | |
 | OP1-2 | med | `optimizer/exprwalk.go:exprChildSlots` — FuncCall child slots omit Filter/Over/OrderBy/WithinGroup/Variadic | ? | [ ] | |
@@ -67,7 +67,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | BUG | [x] | 306709703 |
 | UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | BUG | [x] | 00e35fbab |
 | UT-4 | med | `utils/mmgr/mctx.go:Context.Release` — mutates `c.children` while ranging over it | BUG | [x] | 370100352 |
-| CM-3 | med | `cmd/plan-snapshot/main.go:planEqual` — `rowsRegexp` never matches the real EXPLAIN format | BUG | [x] | this commit |
+| CM-3 | med | `cmd/plan-snapshot/main.go:planEqual` — `rowsRegexp` never matches the real EXPLAIN format | BUG | [x] | edd6195b9 |
 
 ## C. Low severity (claimed)
 
@@ -393,3 +393,26 @@ landed.
   annotation and capture N. Guard:
   `TestRowsRegexpMatchesRealExplainOutput` (one PG line, one goopg line).
   Gates: units green; pgbench smoke green.
+
+- 2026-09-01 **NB-2 = NOT A BUG.** `pglz.Decompress` clamping a match length
+  to the remaining output (`if remaining := rawSize - len(dst); length >
+  remaining { length = remaining }`) is exactly what PG does:
+  `postgres/src/common/pg_lzcompress.c`, pglz_decompress → `/* Don't emit
+  more data than requested. */ len = Min(len, destend - dp);`. Corruption
+  is caught the same way in both: goopg's trailing
+  `len(dst) != rawSize` check is PG's `check_complete` test. (One real
+  difference, noted and NOT a live bug: PG's check_complete also requires
+  the SOURCE to be fully consumed (`sp != srcend`), so goopg accepts a
+  stream with trailing garbage after a complete output. No caller can
+  produce that; recorded here rather than fixed.)
+
+- 2026-09-01 **TA-2 = NOT A BUG (no concurrent caller).** `AssignXID`'s
+  read-check-allocate-store on `s.xid` is indeed not atomic, but a slot is
+  a per-connection procNum and the only caller is
+  `Context.MaterializeWriterXID`, reached from the owning backend's own
+  goroutine on the write path; goopg's parallel workers are read-only and
+  never materialise an XID. So no two goroutines can race on one slot
+  today — the same structural argument PG relies on (a backend assigns its
+  own XID under XidGenLock, never another backend's). Left as-is rather
+  than adding a CAS that would still leak the losing XID; re-open this row
+  if a parallel or background writer ever shares a procNum.
