@@ -3932,9 +3932,10 @@ func resetPageItems(p storage.Page) {
 	h.SetLower(uint16(storage.SizeOfPageHeaderData))
 	h.SetUpper(uint16(btSpecialOffset))
 	// Zero the in-between bytes for cleanliness; not strictly required.
-	for i := storage.SizeOfPageHeaderData; i < btSpecialOffset; i++ {
-		p[i] = 0
-	}
+	// review/260831 NB-8: `clear` on the slice, not a byte-at-a-time loop —
+	// this is ~8 KB per page rewrite and page rewrites happen on every split
+	// and every vacuum-compaction of a leaf.
+	clear(p[storage.SizeOfPageHeaderData:btSpecialOffset])
 	if hasHK {
 		if err := pgSetHighKeyRaw(p, hk); err != nil {
 			panic(err)
