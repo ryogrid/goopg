@@ -7,6 +7,8 @@ package executor
 // and similar patterns. M0096-0006.
 
 import (
+	"math"
+
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -78,11 +80,22 @@ func (o *generateSeriesOp) Next() (TupleSlot, error) {
 	}
 	if o.step == 0 {
 		o.done = true
-		return nil, &ExecError{Code: "2201F", Message: "step size cannot equal zero"}
+		// PG: int8.c generate_series_int8, ERRCODE_INVALID_PARAMETER_VALUE
+		// (22023). review/260831-2 EO2-3: this used to report 2201F.
+		return nil, &ExecError{Code: "22023", Message: "step size cannot equal zero"}
 	}
 
 	val := NewIntDatum(o.current)
-	o.current += o.step
+	// review/260831-2 EO2-3: `o.current += o.step` wraps at the int64 ceiling,
+	// and a wrapped current is back inside the bounds — the series then ran
+	// forever. PG stops the iteration when the addition overflows
+	// (pg_add_s64_overflow in generate_series_int8).
+	if (o.step > 0 && o.current > math.MaxInt64-o.step) ||
+		(o.step < 0 && o.current < math.MinInt64-o.step) {
+		o.done = true
+	} else {
+		o.current += o.step
+	}
 	return SlotFromRow(nil, Row{val}), nil
 }
 
