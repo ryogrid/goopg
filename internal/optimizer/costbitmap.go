@@ -126,8 +126,8 @@ func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetch
 // When maxEntries (derived from work_mem) is less than T, some pages become lossy
 // and every tuple on those pages is fetched — matching PG's lossiness correction
 // (costsize.c:889-908).
-func computeBitmapPages(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize float64, maxEntries int) float64 {
-	return computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize, maxEntries, 1)
+func computeBitmapPages(tuplesFetched, relTuples, T, indexPages, totalTablePages, effectiveCacheSize float64, maxEntries int) (float64, float64) {
+	return computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalTablePages, effectiveCacheSize, maxEntries, 1)
 }
 
 // computeBitmapPagesLooped is `compute_bitmap_pages` with PG's `loop_count`
@@ -144,9 +144,9 @@ func computeBitmapPages(tuplesFetched, T, indexPages, totalTablePages, effective
 // executions re-read the relation cold, which is what kept TPC-H Q8's bitmap —
 // the shape PG chooses — losing to a plain index probe. It is the exact
 // counterpart of the `loop_count > 1` arm `cost_index` gained in 07f4f7814.
-func computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalTablePages, effectiveCacheSize float64, maxEntries int, loopCount float64) float64 {
+func computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalTablePages, effectiveCacheSize float64, maxEntries int, loopCount float64) (float64, float64) {
 	if T <= 0 || tuplesFetched <= 0 {
-		return 0
+		return 0, tuplesFetched
 	}
 	// PG's `compute_bitmap_pages` in its own order (costsize.c). The
 	// single-scan estimate is computed UNCONDITIONALLY and the cache-aware
@@ -181,31 +181,46 @@ func computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalTablePages, eff
 	} else {
 		pages = math.Ceil(pages)
 	}
-	_ = heapPages
-
-	// Lossiness adjustment: when the bitmap entry budget is smaller than the
-	// number of heap pages, some pages become lossy and every tuple on them
-	// must be fetched. PG's formula (costsize.c:889-908):
-	//   exact_pages = min(maxEntries, pages), lossy_pages = pages - exact_pages
-	// Then re-estimate: tuples on exact pages found via index,
-	// tuples on lossy pages = all tuples on those pages.
-	if maxEntries > 0 && pages > float64(maxEntries) {
-		// PG's maxentries is in bytes; ours is in entry count.
-		lossyPages := pages - float64(maxEntries)
-		exactPages := float64(maxEntries)
-		if exactPages < 1 {
-			exactPages = 1
+	// Lossiness adjustment. When the bitmap entry budget cannot hold one entry
+	// per heap page, `tbm_lossify` degrades pages to page-granular entries and
+	// the heap node must then recheck EVERY tuple on a lossy page, not just the
+	// ones the index pointed at. The page count is unchanged — the same pages
+	// are visited — so what the correction moves is `tuples_fetched`, which is
+	// what the caller charges cpu_tuple_cost (and the qual) against.
+	//
+	// PG, verbatim (costsize.c:6564-6588):
+	//
+	//	if (maxentries < heap_pages) {
+	//		lossy_pages = Max(0, heap_pages - maxentries / 2);
+	//		exact_pages = heap_pages - lossy_pages;
+	//		if (lossy_pages > 0)
+	//			tuples_fetched = clamp_row_est(indexSelectivity *
+	//				(exact_pages / heap_pages) * baserel->tuples +
+	//				(lossy_pages / heap_pages) * baserel->tuples);
+	//	}
+	//
+	// `indexSelectivity * baserel->tuples` is our (pre-clamp) `tuplesFetched`,
+	// and `heap_pages` is the SINGLE-scan page estimate — deliberately not the
+	// loop-count-prorated one, because only one scan's worth of entries is in
+	// the bitmap at a time (PG says so at costsize.c:6544).
+	//
+	// This block used to compute `lossyTuples`/`exactTuples` and then discard
+	// them with `_ =`, so a lossy bitmap was priced as if every fetched page
+	// yielded only its index-matched tuples — the under-charge grows with the
+	// lossy fraction, which is exactly the regime where a bitmap should start
+	// losing to a seq scan. The formula was also not PG's: it used the prorated
+	// `pages` rather than `heap_pages`, `maxEntries` rather than
+	// `maxEntries / 2`, and `T/pages` as tuples-per-lossy-page.
+	if maxEntries > 0 && float64(maxEntries) < heapPages && heapPages > 0 {
+		lossyPages := math.Max(0, heapPages-float64(maxEntries)/2)
+		exactPages := heapPages - lossyPages
+		if lossyPages > 0 {
+			tuplesFetched = clampRowEst(tuplesFetched*(exactPages/heapPages) +
+				(lossyPages/heapPages)*relTuples)
 		}
-		// Exact pages: bitmap still works — tuples on them found via index.
-		// Lossy pages: every tuple on the page is fetched.
-		lossyTuples := lossyPages * math.Max(T/pages, 1.0) // tuples per lossy page (rough)
-		exactTuples := exactPages * (tuplesFetched / pages) // tuples per exact page
-		_ = lossyTuples + exactTuples // total tuples fetched
-		// Pages fetched doesn't change — we still visit the same pages.
-		// PG adjusts `tuples_fetched` and returns the same `pages_fetched`.
 	}
 
-	return pages
+	return pages, tuplesFetched
 }
 
 // tbmEntryBytes is the estimated per-entry byte cost used to convert work_mem
@@ -314,7 +329,7 @@ func costBitmapOrCost(cp costParams, paths []*Path) (Cost, float64) {
 func bitmapScanCostEst(cp costParams, bitmapPath *Path, relRows, T, indexPages, totalTablePages float64, maxEntries int) Cost {
 	treeCost, selec := costBitmapTree(cp, bitmapPath)
 	tuplesFetched := clampRowEst(selec * relRows)
-	pagesFetched := computeBitmapPages(tuplesFetched, T, indexPages, totalTablePages, cp.effectiveCacheSize, maxEntries)
+	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relRows, T, indexPages, totalTablePages, cp.effectiveCacheSize, maxEntries)
 	return costBitmapHeapScan(cp, Cost{Total: treeCost}, pagesFetched, tuplesFetched, T)
 }
 
@@ -324,7 +339,7 @@ func bitmapScanCostEst(cp costParams, bitmapPath *Path, relRows, T, indexPages, 
 func bitmapAndScanCostEst(cp costParams, paths []*Path, relRows, T, indexPages, totalTablePages float64, maxEntries int) Cost {
 	treeCost, selec := costBitmapAndCost(cp, paths)
 	tuplesFetched := clampRowEst(selec * relRows)
-	pagesFetched := computeBitmapPages(tuplesFetched, T, indexPages, totalTablePages, cp.effectiveCacheSize, maxEntries)
+	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relRows, T, indexPages, totalTablePages, cp.effectiveCacheSize, maxEntries)
 	return costBitmapHeapScan(cp, treeCost, pagesFetched, tuplesFetched, T)
 }
 

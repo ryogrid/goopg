@@ -19,9 +19,10 @@ import (
 )
 
 type pgOptionsToTableOp struct {
-	plan *optimizer.PgOptionsToTable
-	rows []Row
-	idx  int
+	plan      *optimizer.PgOptionsToTable
+	outerSlot SlotView
+	rows      []Row
+	idx       int
 }
 
 func newPgOptionsToTableOp(p *optimizer.PgOptionsToTable) *pgOptionsToTableOp {
@@ -30,6 +31,15 @@ func newPgOptionsToTableOp(p *optimizer.PgOptionsToTable) *pgOptionsToTableOp {
 
 func (o *pgOptionsToTableOp) Schema() optimizer.Schema { return o.plan.Output() }
 
+// BindLateralOuter binds the outer row's slot for lateral arg evaluation,
+// mirroring the sibling lateral SRFs (pg_get_sequence_data,
+// pg_get_publication_tables, verify_heapam). Without it this op was not
+// lateralBindable, so under an explicit `LATERAL pg_options_to_table(z.opts)`
+// the argument's same-level ColumnRef had no slot to resolve against and the
+// query died with "column ref opts/1 on nil slot" (review/260831-2 EO2-6).
+// Passing nil clears the binding.
+func (o *pgOptionsToTableOp) BindLateralOuter(slot SlotView) { o.outerSlot = slot }
+
 func (o *pgOptionsToTableOp) Open(ctx *Context) error {
 	o.rows = nil
 	o.idx = 0
@@ -37,13 +47,14 @@ func (o *pgOptionsToTableOp) Open(ctx *Context) error {
 		return nil
 	}
 
-	// Resolve the argument against the current outer row when this SRF is
-	// driven laterally (the pg_dump usage correlates on fdwoptions).
-	var outerRow Row
-	if len(ctx.OuterRows) > 0 {
-		outerRow = ctx.OuterRows[len(ctx.OuterRows)-1]
+	// Resolve the argument against the bound lateral outer slot when there is
+	// one (explicit LATERAL / implicit-LATERAL comma join), else against the
+	// correlation stack — the pg_dump usage correlates on fdwoptions from a
+	// subquery, where only ctx.OuterRows is set.
+	if o.outerSlot == nil && len(ctx.OuterRows) > 0 {
+		o.outerSlot = SlotFromRow(nil, ctx.OuterRows[len(ctx.OuterRows)-1])
 	}
-	argVal, err := evalExpr(o.plan.Arg, outerRow, ctx)
+	argVal, err := evalExprSlot(o.plan.Arg, o.outerSlot, ctx)
 	if err != nil {
 		return err
 	}

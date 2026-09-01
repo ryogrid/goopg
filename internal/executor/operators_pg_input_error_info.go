@@ -222,6 +222,13 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)
+	case "xml":
+		// xml: agrees with the ::xml cast path, same xmlValidate
+		// (xmltypes.go). M0134-0188.
+		if ee := xmlValidate(v, xmlOptionFromCtx(o.ctx)); ee != nil {
+			message = ee.Message
+			sqlCode = ee.Code
+		}
 	case "bytea":
 		// bytea: reuse byteaIn (bytea.go, mirrors byteain() in varlena.c) so the
 		// hex/escape error text and SQLSTATE (22023/22P02) stay identical to the

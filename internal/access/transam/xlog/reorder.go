@@ -142,8 +142,23 @@ func foldChanges(in []Change) []Change {
 	if len(in) < 2 {
 		return in
 	}
+	// review/260831 XL-38: the common case is that nothing folds — a
+	// transaction of plain INSERTs or UPDATEs — and the copy was paid anyway.
+	// Find the first foldable pair before allocating; when there is none, the
+	// input is already the answer.
+	first := -1
+	for i := 0; i+1 < len(in); i++ {
+		if in[i].Kind == ChangeDelete && in[i+1].Kind == ChangeInsert && in[i].Rel == in[i+1].Rel {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return in
+	}
 	out := make([]Change, 0, len(in))
-	for i := 0; i < len(in); i++ {
+	out = append(out, in[:first]...)
+	for i := first; i < len(in); i++ {
 		if i+1 < len(in) &&
 			in[i].Kind == ChangeDelete &&
 			in[i+1].Kind == ChangeInsert &&

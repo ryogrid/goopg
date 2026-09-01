@@ -961,12 +961,18 @@ func TestPlanInsertDefaultValuesExpandsToColumnDefaults(t *testing.T) {
 	}
 }
 
-// TestPlanInsertDefaultValuesSkipsGeneratedColumns: rung 17 — generated
-// columns are excluded from the expansion, matching planInsert's
-// implicit-column-list rule. The Insert's source then has arity one
-// less than len(tbl.Columns); the executor populates the generated
-// column via computeGeneratedColumns.
-func TestPlanInsertDefaultValuesSkipsGeneratedColumns(t *testing.T) {
+// TestPlanInsertDefaultValuesIncludesGeneratedColumns: rung 17, revised by
+// M0134-0187 — a GENERATED ALWAYS AS … STORED column IS part of the
+// implicit column list, matching PostgreSQL's checkInsertTargets (it does
+// not filter attgenerated out of the default target list). `DEFAULT VALUES`
+// expands to one DefaultMarker per column including the generated one; the
+// executor still recomputes it via computeGeneratedColumns regardless of
+// the placeholder that lands in its slot. Previously (through M0134-0186)
+// this excluded the generated column, which broke `INSERT INTO t VALUES
+// (v, DEFAULT)` — an explicit DEFAULT targeting the generated column's own
+// position — with a false "target expects N-1" arity error instead of
+// accepting it the way PostgreSQL's generated_stored.sql expects.
+func TestPlanInsertDefaultValuesIncludesGeneratedColumns(t *testing.T) {
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
 		{Name: "id", Type: catalog.Type{Name: "int4"}, DefaultExpr: &parser.IntegerConst{Value: 1}},
@@ -980,11 +986,60 @@ func TestPlanInsertDefaultValuesSkipsGeneratedColumns(t *testing.T) {
 	}
 	ins := node.(*Insert)
 	values := ins.Source.(*Values)
-	if len(values.Rows[0]) != 1 {
-		t.Fatalf("expansion size=%d want 1 (generated col excluded)", len(values.Rows[0]))
+	if len(values.Rows[0]) != 2 {
+		t.Fatalf("expansion size=%d want 2 (generated col included)", len(values.Rows[0]))
 	}
-	if len(ins.ColumnIndex) != 1 || ins.ColumnIndex[0] != 0 {
-		t.Errorf("ColumnIndex=%v want [0]", ins.ColumnIndex)
+	if len(ins.ColumnIndex) != 2 || ins.ColumnIndex[0] != 0 || ins.ColumnIndex[1] != 1 {
+		t.Errorf("ColumnIndex=%v want [0 1]", ins.ColumnIndex)
+	}
+}
+
+// TestPlanInsertValuesRejectsNonDefaultIntoGeneratedColumn: M0134-0187 —
+// PostgreSQL only ever accepts DEFAULT for a GENERATED ALWAYS AS … STORED
+// column's cell (rewriteHandler.c's "cannot insert a non-DEFAULT value"
+// check); an actual value there — even one matching what the expression
+// would compute — is a 428C9 error, not silently accepted and overwritten.
+func TestPlanInsertValuesRejectsNonDefaultIntoGeneratedColumn(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}, GeneratedAlways: true, GeneratedExpr: "a * 2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Plan(parseOne(t, "INSERT INTO t VALUES (1, 2)"), c)
+	if err == nil {
+		t.Fatal("Plan: want error, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("err type=%T want *PlanError", err)
+	}
+	if pe.Code != "428C9" {
+		t.Errorf("Code=%q want 428C9", pe.Code)
+	}
+	if pe.Message != `cannot insert a non-DEFAULT value into column "b"` {
+		t.Errorf("Message=%q", pe.Message)
+	}
+	if pe.Detail != `Column "b" is a generated column.` {
+		t.Errorf("Detail=%q", pe.Detail)
+	}
+
+	// The explicit-DEFAULT spelling in the same position must still work.
+	node, err := Plan(parseOne(t, "INSERT INTO t VALUES (1, DEFAULT)"), c)
+	if err != nil {
+		t.Fatalf("Plan (DEFAULT): %v", err)
+	}
+	ins := node.(*Insert)
+	if len(ins.ColumnIndex) != 2 {
+		t.Errorf("ColumnIndex=%v want length 2", ins.ColumnIndex)
+	}
+
+	// Fewer values than columns, no explicit column list: the generated
+	// column is simply omitted (implicitly defaulted), same as any other
+	// trailing column PostgreSQL allows to fall back to DEFAULT.
+	if _, err := Plan(parseOne(t, "INSERT INTO t VALUES (1)"), c); err != nil {
+		t.Errorf("Plan (short row): %v", err)
 	}
 }
 

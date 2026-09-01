@@ -100,7 +100,7 @@ func encodeArrayBTreeKey(ctx *Context, v Datum, col *catalog.Column, pos int) ([
 		return nil, &ExecError{Code: "22P02", Pos: pos,
 			Message: fmt.Sprintf("malformed array literal: %q", v.StringValue())}
 	}
-	if strings.ContainsRune(s[1:len(s)-1], '{') {
+	if arrayLiteralHasNestedBrace(s[1 : len(s)-1]) {
 		return nil, &ExecError{Code: "0A000", Pos: pos,
 			Message: fmt.Sprintf("btree v0 cannot index multidimensional array column %q", col.Name)}
 	}
@@ -114,17 +114,24 @@ func encodeArrayBTreeKey(ctx *Context, v Datum, col *catalog.Column, pos int) ([
 	elemCol := catalog.Column{Name: col.Name, Type: catalog.Type{Name: col.Type.Name}}
 
 	out := make([]byte, 0, 8)
-	for _, e := range parseTextArray(s) {
+	for _, e := range parseTextArrayElems(s) {
 		// An unquoted NULL token is PG's array NULL (case-insensitive,
 		// array_in). goopg's heap codec rejects NULL elements outright
 		// (encodeArrayValuePG), so this arm is reachable only from a probe key
 		// built out of a query literal; encoding it correctly is still required
 		// so the probe lands where array_cmp says it belongs.
-		if strings.EqualFold(strings.TrimSpace(e), "NULL") {
+		//
+		// QUOTED is the whole distinction: `{NULL}` is a NULL element,
+		// `{"NULL"}` is the four-character string, and array_cmp sorts them at
+		// opposite ends. Keying off the unquoted text alone gave both the same
+		// bytes, so a text[] index could not tell them apart — an equality
+		// probe crossed over and a unique index saw a false duplicate
+		// (review/260831-2 EC-2).
+		if !e.Quoted && strings.EqualFold(strings.TrimSpace(e.Text), "NULL") {
 			out = append(out, arrayKeyElemNull)
 			continue
 		}
-		eb, encErr := encodeBTreeKeyForColumn(ctx, NewStringDatum(e), &elemCol, pos)
+		eb, encErr := encodeBTreeKeyForColumn(ctx, NewStringDatum(e.Text), &elemCol, pos)
 		if encErr != nil {
 			return nil, encErr
 		}
@@ -362,4 +369,28 @@ func arrayKeyElemRendererPGImage(name string, st array.OutputStyle) func(Datum) 
 // `pgEpoch.Add(micros)` the key decoder applies.
 func pgTimestampMicrosOfDatum(d Datum) int64 {
 	return d.TimeValue().UTC().UnixMicro() - pgEpochUnixMicros
+}
+
+// arrayLiteralHasNestedBrace reports whether the INNER text of an array
+// literal opens a nested array, i.e. contains a `{` outside quotes. The scan
+// has to respect quoting and backslash escapes exactly as
+// parseTextArrayElems does: a plain byte search rejected a perfectly ordinary
+// 1-D value whose quoted TEXT element merely contains a brace — `{"a{b"}`
+// probed as `0A000 cannot index multidimensional array column`, while PG
+// indexes and matches it (review/260831-2 EC-3).
+func arrayLiteralHasNestedBrace(inner string) bool {
+	inQuotes := false
+	for i := 0; i < len(inner); i++ {
+		switch inner[i] {
+		case '\\':
+			i++ // escaped byte is data, whatever it is
+		case '"':
+			inQuotes = !inQuotes
+		case '{':
+			if !inQuotes {
+				return true
+			}
+		}
+	}
+	return false
 }

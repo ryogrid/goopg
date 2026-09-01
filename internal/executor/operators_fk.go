@@ -835,6 +835,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 	for _, scanTbl := range tables {
 		rel := ctx.Catalog.RelFileNode(scanTbl)
 		cols := scanTbl.Columns
+		fkIdx := fkColumnIndexes(cols, fk.Columns)
 		nBlocks, err := ctx.Pool.NBlocks(rel)
 		if err != nil {
 			continue
@@ -869,7 +870,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 				if err != nil {
 					continue
 				}
-				if fkRowMatches(cols, fk.Columns, row, vals) {
+				if fkRowMatchesAt(fkIdx, row, vals) {
 					victims = append(victims, victim{tbl: scanTbl, blk: blk, slot: slotIdx, row: row})
 				}
 			}
@@ -905,6 +906,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, vals []Datum) error {
 	rel := ctx.Catalog.RelFileNode(childTbl)
 	cols := childTbl.Columns
+	fkIdx := fkColumnIndexes(cols, fk.Columns)
 
 	type pendingUpdate struct {
 		blk    storage.BlockNumber
@@ -947,16 +949,14 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 			if err != nil {
 				continue
 			}
-			if !fkRowMatches(cols, fk.Columns, row, vals) {
+			if !fkRowMatchesAt(fkIdx, row, vals) {
 				continue
 			}
 			newRow := make(Row, len(cols))
 			copy(newRow, row)
-			for _, fkCol := range fk.Columns {
-				for i, c := range cols {
-					if strings.EqualFold(c.Name, fkCol) {
-						newRow[i] = NullDatum
-					}
+			for _, i := range fkIdx {
+				if i >= 0 {
+					newRow[i] = NullDatum
 				}
 			}
 			pending = append(pending, pendingUpdate{blk: blk, slot: slotIdx, newRow: newRow})
@@ -1240,6 +1240,7 @@ func scanRefTableForDetachedPartitionMatch(ctx *Context, im *catalog.InMemory, f
 func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, error) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	cols := tbl.Columns
+	colIdx := fkColumnIndexes(cols, colNames)
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return false, nil // relation may not have blocks yet
@@ -1274,7 +1275,7 @@ func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals [
 			if err != nil {
 				continue
 			}
-			if fkRowMatches(cols, colNames, row, vals) {
+			if fkRowMatchesAt(colIdx, row, vals) {
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return true, nil
@@ -1317,6 +1318,7 @@ type fkPendingRef struct {
 func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, *fkPendingRef, error) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	cols := tbl.Columns
+	colIdx := fkColumnIndexes(cols, colNames)
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return false, nil, nil
@@ -1352,7 +1354,7 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			if err != nil {
 				continue
 			}
-			if !fkRowMatches(cols, colNames, row, vals) {
+			if !fkRowMatchesAt(colIdx, row, vals) {
 				continue
 			}
 			// Matched.  Decide whether to wait on the updater.  For an
@@ -1537,6 +1539,7 @@ func detectInFlightChildInsert(ctx *Context, childTbl *catalog.Table, fkCols []s
 	for _, t := range tables {
 		rel := ctx.Catalog.RelFileNode(t)
 		cols := t.Columns
+		fkIdx := fkColumnIndexes(cols, fkCols)
 		nBlocks, err := ctx.Pool.NBlocks(rel)
 		if err != nil {
 			continue
@@ -1578,7 +1581,7 @@ func detectInFlightChildInsert(ctx *Context, childTbl *catalog.Table, fkCols []s
 				if derr != nil {
 					continue
 				}
-				if fkRowMatches(cols, fkCols, row, vals) {
+				if fkRowMatchesAt(fkIdx, row, vals) {
 					s.RUnlock()
 					ctx.Pool.Unpin(s)
 					return xmin, true
@@ -1666,25 +1669,41 @@ func fkColValues(cols []catalog.Column, fkCols []string, row Row) ([]Datum, bool
 }
 
 // fkRowMatches reports whether a row's named columns equal the given values.
-func fkRowMatches(cols []catalog.Column, fkCols []string, row Row, vals []Datum) bool {
-	if len(fkCols) != len(vals) {
-		return false
-	}
+// fkColumnIndexes resolves FK column NAMES to their positions in cols.
+//
+// review/260831 EO1-11: fkRowMatches did this name match per FK column PER ROW,
+// and its callers run it over every row of a full table scan, so a cascade over
+// an n-row child table did n × len(fkCols) × len(cols) EqualFold comparisons to
+// answer a question that does not change between rows. The resolution is
+// hoisted out of the scan loop; -1 marks a name the table does not have, which
+// is what the old "not found" arm returned false for.
+func fkColumnIndexes(cols []catalog.Column, fkCols []string) []int {
+	idx := make([]int, len(fkCols))
 	for i, name := range fkCols {
-		found := false
+		idx[i] = -1
 		for j, c := range cols {
 			if strings.EqualFold(c.Name, name) {
-				if j >= len(row) {
-					return false
-				}
-				if !datumEquals(row[j], vals[i]) {
-					return false
-				}
-				found = true
+				idx[i] = j
 				break
 			}
 		}
-		if !found {
+	}
+	return idx
+}
+
+// fkRowMatchesAt reports whether row's FK columns (given as PRE-RESOLVED
+// positions, see fkColumnIndexes) all equal vals. A position of -1 — a column
+// name the table does not have — is a non-match, as it was when the name
+// lookup happened inline.
+func fkRowMatchesAt(idx []int, row Row, vals []Datum) bool {
+	if len(idx) != len(vals) {
+		return false
+	}
+	for i, j := range idx {
+		if j < 0 || j >= len(row) {
+			return false
+		}
+		if !datumEquals(row[j], vals[i]) {
 			return false
 		}
 	}
@@ -1769,14 +1788,29 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 		if ci < len(tbl.NamedChecks) && tbl.NamedChecks[ci].NotEnforced {
 			continue
 		}
-		// Build actual-value from clause for this row.
+		// Build actual-value from clause for this row. The values ride as
+		// bound parameters ($1, $2, …), not as interpolated text: a Datum's
+		// Format() output is a DISPLAY rendering, not necessarily a literal
+		// that re-parses to the same value in its own type. A `date` column
+		// under a CHECK constraint made that concrete — Format() renders
+		// "05-06-2020", which the re-parse rejects, so a valid INSERT died
+		// with XX000 "could not evaluate check constraint"
+		// (review/260831-2 EO1-9). Parameters skip the render/re-parse round
+		// trip entirely.
 		colVals := make([]string, len(tbl.Columns))
+		params := make([]Datum, 0, len(tbl.Columns))
 		for i, col := range tbl.Columns {
+			// An array column carries its ELEMENT name in Type.Name plus
+			// IsArray, so the cast has to re-add the "[]".
+			typeName := col.Type.Name
+			if col.Type.IsArray {
+				typeName += "[]"
+			}
 			if i < len(row) && !row[i].IsNull() {
-				v := row[i].Format()
-				colVals[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::" + col.Type.Name
+				params = append(params, row[i])
+				colVals[i] = fmt.Sprintf("$%d::%s", len(params), typeName)
 			} else {
-				colVals[i] = "NULL::" + col.Type.Name
+				colVals[i] = "NULL::" + typeName
 			}
 		}
 		colVals = append(colVals, fmt.Sprintf("%d::oid", tbl.OID))
@@ -1814,6 +1848,7 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 			return unevaluable("build", err)
 		}
 		synthCtx := *ctx
+		synthCtx.Params = params
 		if err := op.Open(&synthCtx); err != nil {
 			op.Close()
 			return unevaluable("open", err)
@@ -1980,9 +2015,17 @@ func checkRowConstraintsForWrite(ctx *Context, tbl *catalog.Table, cols []catalo
 // plan/build failures are treated as a pass (matches checkConstraints' leniency)
 // rather than blocking the DML statement on an internal evaluation gap.
 func evalDomainCheckExpr(ctx *Context, exprSQL string, v Datum, baseType string) (bool, error) {
+	// Bound parameter, not interpolated Format() text — same reason as
+	// checkConstraints (review/260831-2 EO1-9): a `date` value renders as
+	// "05-06-2020", which does not re-parse as a date, and every failure in
+	// this function is treated as a PASS, so a domain CHECK over such a type
+	// was silently NOT ENFORCED (PG 18.3: `value for domain zzdd violates
+	// check constraint "zzdd_check"`).
 	valSQL := "NULL::" + baseType
+	var params []Datum
 	if !v.IsNull() {
-		valSQL = "'" + strings.ReplaceAll(v.Format(), "'", "''") + "'::" + baseType
+		params = []Datum{v}
+		valSQL = "$1::" + baseType
 	}
 	fullSQL := "SELECT (" + exprSQL + ") FROM (VALUES (" + valSQL + ")) AS _chk(value)"
 	stmts, err := parser.Parse(fullSQL)
@@ -1998,6 +2041,7 @@ func evalDomainCheckExpr(ctx *Context, exprSQL string, v Datum, baseType string)
 		return true, nil
 	}
 	synthCtx := *ctx
+	synthCtx.Params = params
 	if err := op.Open(&synthCtx); err != nil {
 		op.Close()
 		return true, nil

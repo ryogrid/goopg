@@ -218,6 +218,17 @@ func (s *lockState) recomputeGranted() {
 // likes on a tag it already holds. The "except self" mask is what
 // gets fed into ConflictsWith for the requesting backend.
 func (s *lockState) grantedExcept(b BackendID) Mask {
+	// review/260831 ST-14: when b holds nothing on this tag there is nothing
+	// to exclude, and `granted` — the cached OR every acquire and release
+	// keeps current — is already the answer. That is the common case: a
+	// backend asking about a tag it does not yet hold. Only a self-holder pays
+	// the walk over the holder map.
+	if _, isHolder := s.holders[b]; !isHolder {
+		return s.granted
+	}
+	if len(s.holders) == 1 {
+		return 0 // b is the only holder
+	}
 	var g Mask
 	for h, m := range s.holders {
 		if h == b {

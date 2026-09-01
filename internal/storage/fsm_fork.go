@@ -119,6 +119,20 @@ func buildFSMPage(categories []uint8, numSlots int) []byte {
 	return p
 }
 
+// fsmPageMaxCat is the maximum category an FSM page holds. fp_nodes[0] is the
+// root of the max-tree buildFSMPage computes bottom-up, so it IS that maximum
+// and no scan is needed.
+//
+// review/260831 ST-7: buildFSMTree used to call parseFSMPage on every page it
+// had just built, purely to learn this one byte — and parseFSMPage allocates a
+// full fsmSlotsPerPage slice and walks the whole node array to produce it.
+func fsmPageMaxCat(p []byte) uint8 {
+	if len(p) != BlockSize {
+		return 0
+	}
+	return p[fsmPageHeaderSize+fsmNextSlotSize]
+}
+
 // parseFSMPage reads leaf categories from an FSM page. Returns the slice of
 // leaf-node category values (up to fsmSlotsPerPage entries). Also returns the
 // maximum category stored anywhere in the page (internal or leaf nodes).
@@ -240,8 +254,7 @@ func buildFSMTree(cats []uint8) [][]byte {
 		}
 		pg := buildFSMPage(cats[i:end], end-i)
 		l0.pages = append(l0.pages, pg)
-		_, maxCat := parseFSMPage(pg)
-		l0.maxCats = append(l0.maxCats, maxCat)
+		l0.maxCats = append(l0.maxCats, fsmPageMaxCat(pg))
 	}
 	levels = append(levels, l0)
 
@@ -256,8 +269,7 @@ func buildFSMTree(cats []uint8) [][]byte {
 			}
 			pg := buildFSMPage(prev.maxCats[i:end], end-i)
 			cur.pages = append(cur.pages, pg)
-			_, maxCat := parseFSMPage(pg)
-			cur.maxCats = append(cur.maxCats, maxCat)
+			cur.maxCats = append(cur.maxCats, fsmPageMaxCat(pg))
 		}
 		levels = append(levels, cur)
 	}
@@ -293,56 +305,40 @@ func ReadFSMFork(path string) ([]uint16, error) {
 		return nil, nil
 	}
 
-	// Determine the tree structure. The first page is a level-0 leaf page.
-	// We need to figure out how many level-0 pages there are.
-	// Walk from root backwards: the last page is the root, preceding pages
-	// are at decreasing levels.
-
-	// Strategy: reconstruct the level structure.
-	// Level 0 pages have fsmSlotsPerPage leaf slots each.
-	// If we have N pages total, and the root is at the end, we can work
-	// backwards: root = 1 page. Its parent level has fsmSlotsPerPage times
-	// as many pages as the root has... but that's not right either.
-
-	// Simpler approach: we know the root is the last page. We can reconstruct
-	// from the root downward.
-
-	// Find the level structure by working backwards from the root.
-	type levelPages struct {
-		count  int
-		offset int // byte offset of first page at this level
-	}
-	var levels []levelPages
-
-	// Root is the last page.
-	remainingPages := numPages - 1 // pages before root
-	levelCount := 1               // root = 1 page
-	rootOffset := (numPages - 1) * BlockSize
-	levels = append(levels, levelPages{count: levelCount, offset: rootOffset})
-
-	// Work backwards: each level L has enough pages to cover level L+1's pages.
-	for remainingPages > 0 {
-		// Level l needs ceil(levelCount / fsmSlotsPerPage) pages.
-		need := (levelCount + fsmSlotsPerPage - 1) / fsmSlotsPerPage
-		if need > remainingPages {
-			// Shouldn't happen with well-formed files.
-			need = remainingPages
+	// Determine the tree structure. buildFSMTree writes level 0 (the LEAF
+	// pages) first, then each successive level, root last — so the leaves
+	// start at offset 0 and only their COUNT has to be recovered.
+	//
+	// It used to be derived by walking backwards from the root
+	// (`need = ceil(levelCount / fsmSlotsPerPage)`), which is 1 at every step
+	// and therefore claimed exactly one leaf page for any file. Every relation
+	// past fsmSlotsPerPage (4069) heap blocks needs more, so all free-space
+	// entries from block 4069 on were silently dropped on load
+	// (review/260831-2 ST-1). Recover the count FORWARD instead: the total
+	// page count is a strictly increasing function of the leaf count, so scan
+	// for the leaf count whose tree is exactly this file.
+	leafPages := 0
+	for l := 1; l <= numPages; l++ {
+		total := l
+		for c := l; c > 1; {
+			c = (c + fsmSlotsPerPage - 1) / fsmSlotsPerPage
+			total += c
 		}
-		remainingPages -= need
-		offset := remainingPages * BlockSize
-		levels = append(levels, levelPages{count: need, offset: offset})
-		levelCount = need
+		if total == numPages {
+			leafPages = l
+			break
+		}
+		if total > numPages {
+			break
+		}
+	}
+	if leafPages == 0 {
+		return nil, fmt.Errorf("fsm fork: %q: %d pages is not a well-formed FSM tree", path, numPages)
 	}
 
-	// levels[0] is root, levels[1] is root's parent, ..., levels[len-1] is leaf.
-	// The last level is level 0 (leaf).
-	leafLevel := levels[len(levels)-1]
-	totalSlots := leafLevel.count * fsmSlotsPerPage
-	freeSpace := make([]uint16, 0, totalSlots)
-
-	// Read all leaf pages.
-	for i := 0; i < leafLevel.count; i++ {
-		pageOff := leafLevel.offset + i*BlockSize
+	freeSpace := make([]uint16, 0, leafPages*fsmSlotsPerPage)
+	for i := 0; i < leafPages; i++ {
+		pageOff := i * BlockSize
 		cats, _ := parseFSMPage(data[pageOff : pageOff+BlockSize])
 		for _, c := range cats {
 			freeSpace = append(freeSpace, fsmSpaceCatToAvail(c))
@@ -489,6 +485,15 @@ func (f *FSM) FSMLoadForks(dataDir string) error {
 
 	f.mu.Lock()
 	f.pages = loaded
+	// The chunk summaries describe the page arrays that were just replaced.
+	// Rebuild them here rather than leaving it to the first writer: readers
+	// only consult a summary, they never build one (review/260831 ST-6).
+	f.chunkMax = make(map[fsmKey][]uint16, len(loaded))
+	for key, pages := range loaded {
+		if len(pages) > fsmChunkBlocks {
+			f.chunkMax[key] = buildChunkMax(pages)
+		}
+	}
 	f.mu.Unlock()
 	return nil
 }

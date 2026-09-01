@@ -158,12 +158,20 @@ func PageAllVisible(p Page, horizon TransactionID) bool {
 		if off < 0 || ln < 0 || off+ln > len(p) {
 			return false
 		}
-		t, err := ParseHeapTuple(p[off : off+ln])
+		// review/260831 ST-2: only the header is read below, and t does not
+		// escape the iteration — the caller (VACUUM's per-page pass) holds the
+		// page pinned and content-locked across the call, so the aliasing
+		// decode is safe and skips two copies per tuple.
+		t, err := parseHeapTupleAlias(p[off : off+ln])
 		if err != nil {
 			return false
 		}
 		// Tuple must have a committed xmin before the global horizon.
-		if t.Header.Xmin == InvalidTransactionID || t.Header.Xmin >= horizon {
+		// review/260831-2 ST-7: the comparison is circular (PG's
+		// TransactionIdPrecedes in heap_page_is_all_visible); a plain `>=`
+		// reads every pre-wraparound xmin as newer than a post-wraparound
+		// horizon and permanently refuses the ALL_VISIBLE bit.
+		if t.Header.Xmin == InvalidTransactionID || !XIDPrecedes(t.Header.Xmin, horizon) {
 			return false
 		}
 		// Tuple must not be deleted. An updater-bearing multixact xmax
@@ -203,11 +211,16 @@ func PageAllFrozen(p Page, freezeBelow TransactionID) bool {
 		if off < 0 || ln < 0 || off+ln > len(p) {
 			return false
 		}
-		t, err := ParseHeapTuple(p[off : off+ln])
+		// review/260831 ST-2: only the header is read below, and t does not
+		// escape the iteration — the caller (VACUUM's per-page pass) holds the
+		// page pinned and content-locked across the call, so the aliasing
+		// decode is safe and skips two copies per tuple.
+		t, err := parseHeapTupleAlias(p[off : off+ln])
 		if err != nil {
 			return false
 		}
-		if t.Header.Xmin == InvalidTransactionID || t.Header.Xmin >= freezeBelow {
+		// review/260831-2 ST-7: circular comparison, as in PageAllVisible.
+		if t.Header.Xmin == InvalidTransactionID || !XIDPrecedes(t.Header.Xmin, freezeBelow) {
 			return false
 		}
 		if t.Header.Xmax != InvalidTransactionID && !IsHeapTupleLockOnly(t.Header.Infomask) {

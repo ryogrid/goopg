@@ -27,8 +27,13 @@ import (
 // leader's own child.
 type gmSource struct {
 	// cur is the row at this source's front, valid while live.
-	cur  Row
-	live bool
+	cur Row
+	// curKeys holds cur's sort-key values, evaluated once when the row was
+	// pulled. review/260831 EO1-13: the heap comparator used to evaluate every
+	// key expression on both rows of every comparison, so each output row paid
+	// O(keys · log sources) evaluations instead of O(keys).
+	curKeys []Datum
+	live    bool
 	// ch is non-nil for a worker source.
 	ch <-chan rowBatch
 	// pending holds rows already received from ch but not yet consumed.
@@ -154,7 +159,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	}
 	o.sources = live
 
-	o.h = &gmHeap{less: o.lessRows}
+	o.h = &gmHeap{less: o.lessKeys}
 	o.h.srcs = append(o.h.srcs, o.sources...)
 	heap.Init(o.h)
 	return nil
@@ -171,11 +176,11 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 // trade.
 type gmHeap struct {
 	srcs []*gmSource
-	less func(a, b Row) bool
+	less func(a, b []Datum) bool
 }
 
 func (h *gmHeap) Len() int           { return len(h.srcs) }
-func (h *gmHeap) Less(i, j int) bool { return h.less(h.srcs[i].cur, h.srcs[j].cur) }
+func (h *gmHeap) Less(i, j int) bool { return h.less(h.srcs[i].curKeys, h.srcs[j].curKeys) }
 func (h *gmHeap) Swap(i, j int)      { h.srcs[i], h.srcs[j] = h.srcs[j], h.srcs[i] }
 func (h *gmHeap) Push(x any)         { h.srcs = append(h.srcs, x.(*gmSource)) }
 func (h *gmHeap) Pop() any {
@@ -237,7 +242,28 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 }
 
 // advance pulls the next row for src, returning false when it is exhausted.
+// It also evaluates that row's sort keys once, up front (review/260831
+// EO1-13), so the heap comparator only compares Datums.
 func (o *gatherMergeOp) advance(src *gmSource) (bool, error) {
+	ok, err := o.advanceRow(src)
+	if err != nil || !ok {
+		return ok, err
+	}
+	kv := make([]Datum, len(o.keys))
+	for i, k := range o.keys {
+		v, err := evalSortKeyValue(k.Expr, src.cur, o.ctx)
+		if err != nil {
+			return false, err
+		}
+		kv[i] = v
+	}
+	src.curKeys = kv
+	return true, nil
+}
+
+// advanceRow is advance without the key evaluation: it moves src to its next
+// row and reports whether one was available.
+func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 	if src.local != nil {
 		slot, err := src.local.Next()
 		if errors.Is(err, EOF) {
@@ -267,25 +293,12 @@ func (o *gatherMergeOp) advance(src *gmSource) (bool, error) {
 	return true, nil
 }
 
-// lessRows orders two rows by the node's sort keys. Evaluation errors are
-// captured rather than returned so the comparator stays a strict weak
-// ordering, matching sortOp's own discipline.
-func (o *gatherMergeOp) lessRows(a, b Row) bool {
-	for _, k := range o.keys {
-		av, err := evalSortKeyValue(k.Expr, a, o.ctx)
-		if err != nil {
-			if o.sortErr == nil {
-				o.sortErr = err
-			}
-			return false
-		}
-		bv, err := evalSortKeyValue(k.Expr, b, o.ctx)
-		if err != nil {
-			if o.sortErr == nil {
-				o.sortErr = err
-			}
-			return false
-		}
+// lessKeys orders two sources by their PRECOMPUTED sort-key values (see
+// advance). Comparison errors are captured rather than returned so the
+// comparator stays a strict weak ordering, matching sortOp's own discipline.
+func (o *gatherMergeOp) lessKeys(a, b []Datum) bool {
+	for i, k := range o.keys {
+		av, bv := a[i], b[i]
 		// NULL placement is `k.NullsFirst`, NOT `k.Desc`. The two coincide
 		// only for PG's DEFAULTS (NULLS LAST for ASC, NULLS FIRST for DESC,
 		// which is how `sortByNullsFirst` resolves an omitted clause), so the

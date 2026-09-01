@@ -12,6 +12,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/adt/array"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -45,6 +46,17 @@ type indexOnlyScanOp struct {
 	// arrayStyle is the session DateStyle/TimeZone an array element's output
 	// function reads, resolved once in Open. M0119-0006.
 	arrayStyle array.OutputStyle
+	// coveredHeapIdx[i] is the position of Covered[i] in the table's column
+	// list, and coveredEnum[i] maps that column's enum labels to sort orders
+	// (nil when the column is not an enum). review/260831 EO2-6/EO2-7: both
+	// used to be recomputed PER ROW — a linear name scan over every table
+	// column, and an enum lookup plus a linear label scan.
+	coveredHeapIdx []int
+	coveredEnum    []map[string]float64
+	// coveredKeyIdx[i] is the position of Covered[i] among the index's key
+	// columns, resolved once per scan (review/260831 EO2-7: the projection
+	// used to go through a freshly allocated map[string]Datum per row).
+	coveredKeyIdx []int
 	// M0092-0007: embedded slot reused across every Next() call
 	// so we don't allocate a fresh MaterializedSlot per emission.
 	slot MaterializedSlot
@@ -263,8 +275,20 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = lo
 		hiBytes = hi
-		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
-			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
+		// M0134-0001 S4 (class 8): kept identical to `indexScanOp`'s range
+		// branch — the two probe the same index for the same plan node, so
+		// they cannot be allowed to disagree. Composite padding follows the
+		// bound's strictness: an inclusive hi needs trailing +infinity to
+		// cover every key sharing the leading columns; an EXCLUSIVE hi stays
+		// a bare prefix. The lo side is symmetric: pad only when EXCLUSIVE so
+		// the whole equal-key group is skipped.
+		if len(o.plan.Index.Columns) > 1 {
+			if loBytes != nil && o.plan.LowOp == parser.OpGt {
+				loBytes = o.ctx.compositeUpperBound(o.plan.Index, loBytes)
+			}
+			if hiBytes != nil && o.plan.HighOp != parser.OpLt {
+				hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
+			}
 		}
 	}
 
@@ -400,8 +424,10 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 
 	// RangeScanWithPosLeafFilter rather than RangeScan: the leaf filter is
 	// what partitions the scan across workers, and the bounds semantics are
-	// identical — RangeScan is rangeScanPos with both ends inclusive.
-	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, false, false, leafFilter, scanPosFn); err != nil {
+	// identical — RangeScan is rangeScanPos with both ends inclusive. The two
+	// bool flags carry the bound strictness (M0134-0001 S4 class 8); they are
+	// false for every producer that leaves LowOp/HighOp at OpUnknown.
+	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, leafFilter, scanPosFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
@@ -586,11 +612,11 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		decoded := make(map[string]Datum, len(keyCols))
-		for i, col := range keyCols {
-			decoded[col.Name] = vals[i]
+		names := make([]string, len(keyCols))
+		for i, kc := range keyCols {
+			names[i] = kc.Name
 		}
-		return o.projectCovered(decoded)
+		return o.projectKeyVals(names, vals)
 	}
 	if len(o.plan.Index.Columns) == 1 && len(o.plan.Covered) == 1 {
 		d, err := decodeBTreeKeyToDatumStyled(key, o.plan.Covered[0], o.arrayStyle)
@@ -600,7 +626,7 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		return Row{d}, nil
 	}
 	// Multi-column: decode all key columns in declaration order, then project.
-	decoded := make(map[string]Datum, len(o.plan.Index.Columns))
+	vals := make([]Datum, 0, len(o.plan.Index.Columns))
 	off := 0
 	for _, colName := range o.plan.Index.Columns {
 		col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
@@ -611,22 +637,41 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		if err != nil {
 			return nil, fmt.Errorf("IOS key col %q: %w", colName, err)
 		}
-		decoded[colName] = d
+		vals = append(vals, d)
 		off += n
 	}
-	return o.projectCovered(decoded)
+	return o.projectKeyVals(o.plan.Index.Columns, vals)
 }
 
-// projectCovered picks the scan's output columns out of the decoded key
-// attributes. Shared by both key formats — see decodeRowFromKey.
-func (o *indexOnlyScanOp) projectCovered(decoded map[string]Datum) (Row, error) {
-	row := make(Row, len(o.plan.Covered))
-	for i, col := range o.plan.Covered {
-		d, ok := decoded[col.Name]
-		if !ok {
-			return nil, fmt.Errorf("IOS: covered column %q not decoded", col.Name)
+// projectKeyVals picks the scan's output columns out of the decoded key
+// attributes, using a position map resolved once per scan.
+//
+// review/260831 EO2-7: this was a map[string]Datum built per row and then read
+// back per covered column. keyCols is fixed for the life of the scan — it comes
+// from the index definition — so the positions are resolved on the first row.
+func (o *indexOnlyScanOp) projectKeyVals(keyNames []string, vals []Datum) (Row, error) {
+	if o.coveredKeyIdx == nil {
+		idx := make([]int, len(o.plan.Covered))
+		for i, col := range o.plan.Covered {
+			idx[i] = -1
+			for j, kn := range keyNames {
+				if kn == col.Name {
+					idx[i] = j
+					break
+				}
+			}
+			if idx[i] < 0 {
+				return nil, fmt.Errorf("IOS: covered column %q not decoded", col.Name)
+			}
 		}
-		row[i] = d
+		o.coveredKeyIdx = idx
+	}
+	row := make(Row, len(o.plan.Covered))
+	for i, j := range o.coveredKeyIdx {
+		if j >= len(vals) {
+			return nil, fmt.Errorf("IOS: covered column %q not decoded", o.plan.Covered[i].Name)
+		}
+		row[i] = vals[j]
 	}
 	return row, nil
 }
@@ -746,33 +791,55 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 	if err != nil {
 		return nil, err
 	}
+	o.ensureCoveredMaps()
 	row := make(Row, len(o.plan.Covered))
-	for i, col := range o.plan.Covered {
-		for j, tc := range o.plan.Table.Columns {
-			if tc.Name == col.Name && j < len(fullRow) {
-				row[i] = fullRow[j]
-				break
-			}
+	for i, j := range o.coveredHeapIdx {
+		if j >= 0 && j < len(fullRow) {
+			row[i] = fullRow[j]
 		}
 	}
 	// Convert KindString enum values to KindEnum (sort order) for correct
 	// comparison in Filter predicates. M0097-0022.
-	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		for i, col := range o.plan.Covered {
-			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
-				if row[i].Kind == KindString {
-					label := row[i].StringValue()
-					for _, ev := range et.Values {
-						if ev.Label == label {
-							row[i] = NewEnumDatum(ev.SortOrder, label)
-							break
-						}
-					}
-				}
-			}
+	for i, labels := range o.coveredEnum {
+		if labels == nil || row[i].Kind != KindString {
+			continue
+		}
+		if order, ok := labels[row[i].StringValue()]; ok {
+			row[i] = NewEnumDatum(order, row[i].StringValue())
 		}
 	}
 	return row, nil
+}
+
+// ensureCoveredMaps resolves, once per scan, where each Covered column lives in
+// the table's column list and which of them are enums (with their label ->
+// sort-order table). review/260831 EO2-6/EO2-7.
+func (o *indexOnlyScanOp) ensureCoveredMaps() {
+	if o.coveredHeapIdx != nil {
+		return
+	}
+	o.coveredHeapIdx = make([]int, len(o.plan.Covered))
+	o.coveredEnum = make([]map[string]float64, len(o.plan.Covered))
+	im, hasIM := o.ctx.Catalog.(*catalog.InMemory)
+	for i, col := range o.plan.Covered {
+		o.coveredHeapIdx[i] = -1
+		for j, tc := range o.plan.Table.Columns {
+			if tc.Name == col.Name {
+				o.coveredHeapIdx[i] = j
+				break
+			}
+		}
+		if !hasIM {
+			continue
+		}
+		if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+			labels := make(map[string]float64, len(et.Values))
+			for _, ev := range et.Values {
+				labels[ev.Label] = ev.SortOrder
+			}
+			o.coveredEnum[i] = labels
+		}
+	}
 }
 
 // decodeBTreeKeyToDatum inverts the B-tree key encoding for a single column

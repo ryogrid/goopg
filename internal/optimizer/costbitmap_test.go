@@ -48,7 +48,7 @@ func TestCostBitmapIndexScan_AddsBitmapOverhead(t *testing.T) {
 func TestComputeBitmapPages_SmallSelectivity(t *testing.T) {
 	// T=1000 pages, 10 tuples fetched — should be ~10 pages (few distinct pages).
 	// No cache info → falls back to single-term ML.
-	pages := computeBitmapPages(10, 1000, 0, 1000, 0, 0)
+	pages, _ := computeBitmapPages(10, 10000, 1000, 0, 1000, 0, 0)
 	// 2*1000*10/(2000+10) = 20000/2010 ≈ 9.95 → ceil → 10
 	if pages != 10 {
 		t.Errorf("computeBitmapPages(10, 1000, 0, ...) = %v, want 10", pages)
@@ -58,7 +58,7 @@ func TestComputeBitmapPages_SmallSelectivity(t *testing.T) {
 func TestComputeBitmapPages_LargeSelectivity(t *testing.T) {
 	// T=1000 pages, 5000 tuples fetched — many distinct pages, approaching T.
 	// No cache info → falls back to single-term ML.
-	pages := computeBitmapPages(5000, 1000, 0, 1000, 0, 0)
+	pages, _ := computeBitmapPages(5000, 10000, 1000, 0, 1000, 0, 0)
 	// 2*1000*5000/(2000+5000) = 10000000/7000 ≈ 1428.6 → ceil → 1429
 	// But capped at T=1000.
 	if pages != 1000 {
@@ -69,7 +69,7 @@ func TestComputeBitmapPages_LargeSelectivity(t *testing.T) {
 func TestComputeBitmapPages_AllTuples(t *testing.T) {
 	// T=100 pages, all tuples fetched (10000 tuples on 100 pages).
 	// No cache info → falls back to single-term ML.
-	pages := computeBitmapPages(10000, 100, 0, 100, 0, 0)
+	pages, _ := computeBitmapPages(10000, 10000, 100, 0, 100, 0, 0)
 	// Should be capped at T.
 	if pages != 100 {
 		t.Errorf("computeBitmapPages(10000, 100, 0, ...) = %v, want 100", pages)
@@ -77,25 +77,44 @@ func TestComputeBitmapPages_AllTuples(t *testing.T) {
 }
 
 func TestComputeBitmapPages_ZeroInputs(t *testing.T) {
-	if p := computeBitmapPages(0, 100, 0, 100, 0, 0); p != 0 {
+	if p, _ := computeBitmapPages(0, 1000, 100, 0, 100, 0, 0); p != 0 {
 		t.Errorf("computeBitmapPages(0, _, _, ...) = %v, want 0", p)
 	}
-	if p := computeBitmapPages(10, 0, 0, 100, 0, 0); p != 0 {
+	if p, _ := computeBitmapPages(10, 1000, 0, 0, 100, 0, 0); p != 0 {
 		t.Errorf("computeBitmapPages(_, 0, _, ...) = %v, want 0", p)
 	}
 }
 
 func TestComputeBitmapPages_LossyAdjustment(t *testing.T) {
-	// T=1000 pages, 500 tuples fetched, maxEntries=200 → pages exceeds budget.
-	pages := computeBitmapPages(500, 1000, 0, 1000, 0, 200)
-	// Without lossiness: 2*1000*500/(2000+500) = 400 → ceil → 400
-	// With lossiness: pages ≈ 400 > 200, so exact=200, lossy=200
-	// Pages fetched stays at 400 (still visiting same pages).
-	// The formula returns the same pages count — lossiness affects tuples_fetched,
-	// not pages_fetched (PG's compute_bitmap_pages adjusts tuples, not pages).
-	// But our current implementation returns pages unchanged — lossiness correction
-	// is a tuning concern, not a structure change.
-	_ = pages // at minimum, it should not panic
+	// review/260831-2 OP1-5. When the bitmap cannot hold one entry per heap
+	// page, the heap node rechecks every tuple on the lossy pages, so PG raises
+	// tuples_fetched and leaves pages_fetched alone (costsize.c:6564-6588).
+	// This used to compute the correction and throw it away with `_ =`, which
+	// under-charged every lossy bitmap scan's CPU cost.
+	//
+	// T=1000 pages, 20000 live tuples, 500 tuples matched, maxEntries=200:
+	//   pages     = 2*1000*500/(2000+500)      = 400   (also heap_pages)
+	//   lossy     = max(0, 400 - 200/2)        = 300
+	//   exact     = 400 - 300                  = 100
+	//   tuples    = 500*(100/400) + (300/400)*20000 = 125 + 15000 = 15125
+	pages, tuples := computeBitmapPages(500, 20000, 1000, 0, 1000, 0, 200)
+	if pages != 400 {
+		t.Errorf("pages = %v, want 400 (lossiness must not move the page count)", pages)
+	}
+	if tuples != 15125 {
+		t.Errorf("tuples = %v, want 15125 (lossy-page tuples must be charged for)", tuples)
+	}
+
+	// A budget that covers the pages leaves tuples_fetched untouched — PG's
+	// guard is `maxentries < heap_pages`, so an exactly-sufficient budget is
+	// NOT lossy.
+	if _, tuples := computeBitmapPages(500, 20000, 1000, 0, 1000, 0, 400); tuples != 500 {
+		t.Errorf("non-lossy tuples = %v, want 500 (unadjusted)", tuples)
+	}
+	// maxEntries == 0 means "unlimited" (work_mem unset), never lossy.
+	if _, tuples := computeBitmapPages(500, 20000, 1000, 0, 1000, 0, 0); tuples != 500 {
+		t.Errorf("unlimited-budget tuples = %v, want 500 (unadjusted)", tuples)
+	}
 }
 
 func TestBitmapMaxEntries_WorkMem(t *testing.T) {

@@ -2754,11 +2754,12 @@ func (p *Pool) WriteDirtyPages(maxPages int) int {
 
 	p.bgwriterMu.Lock()
 	start := p.bgwriterHand
-	p.bgwriterHand = (start + n) % n
 	p.bgwriterMu.Unlock()
 
 	victims := make([]victim, 0, maxPages)
+	scanned := 0
 	for i := 0; i < n && len(victims) < maxPages; i++ {
+		scanned = i + 1
 		idx := (start + i) % n
 		s := &p.slots[idx]
 		st := s.state.Load()
@@ -2766,6 +2767,16 @@ func (p *Pool) WriteDirtyPages(maxPages int) int {
 			victims = append(victims, victim{idx: idx, tag: s.tag})
 		}
 	}
+
+	// Advance the scan cursor past the buffers this tick examined, mirroring
+	// upstream BgBufferSync's next_to_clean += num_to_scan. This used to be
+	// `(start + n) % n`, which is `start` — the cursor never moved, so every
+	// tick rescanned the same prefix from the same origin and the bgwriter
+	// could never reach the buffers beyond its first maxPages victims
+	// (review/260831-2 ST-4).
+	p.bgwriterMu.Lock()
+	p.bgwriterHand = (start + scanned) % n
+	p.bgwriterMu.Unlock()
 
 	written := 0
 	for _, v := range victims {

@@ -18,7 +18,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -73,14 +72,16 @@ type standbyController struct {
 	signalCancel context.CancelFunc
 	signalDone   chan struct{}
 
-	// promoteOnce protects against concurrent or repeated PROMOTE
+	// promoting guards against concurrent or repeated PROMOTE
 	// commands. A second invocation after a successful promote is
 	// a no-op that returns nil; one already in flight returns an
-	// "already promoting" error so the operator notices.
-	promoteOnce sync.Once
-	promoting   atomic.Bool
-	promoteErr  atomic.Pointer[error]
-	promoted    atomic.Bool
+	// "already promoting" error so the operator notices. A promote
+	// that FAILED clears the flag again — promotion is retryable,
+	// which is what promoteSignalWatcher's "re-create the file to
+	// retry" contract assumes (review/260831-2 CM-1).
+	promoting  atomic.Bool
+	promoteErr atomic.Pointer[error]
+	promoted   atomic.Bool
 }
 
 // startStandby launches the receiver + replayer goroutines and
@@ -160,8 +161,10 @@ func standbyApplyLSNFunc(replayer *xlog.StreamReplayer) func() uint64 {
 // counted but not waited for.
 //
 // Returns nil if the standby was already promoted by a prior call.
-// Concurrent callers see an "already promoting" error; once the
-// in-flight call returns, subsequent callers see its result.
+// Concurrent callers see an "already promoting" error. A promote that
+// failed is NOT sticky: the node is still a standby, so a later call
+// runs the sequence again (steps 1-2 are idempotent — the receiver
+// context stays cancelled and its done channel stays closed).
 func (sc *standbyController) Promote(ctx context.Context) error {
 	if sc.promoted.Load() {
 		return nil
@@ -169,18 +172,23 @@ func (sc *standbyController) Promote(ctx context.Context) error {
 	if !sc.promoting.CompareAndSwap(false, true) {
 		return errors.New("promotion already in progress")
 	}
-	var firstErr error
-	sc.promoteOnce.Do(func() {
-		firstErr = sc.runPromote(ctx)
-		if firstErr == nil {
-			sc.promoted.Store(true)
-		}
-		sc.promoteErr.Store(&firstErr)
-	})
-	if cached := sc.promoteErr.Load(); cached != nil {
-		return *cached
+	// Release the in-flight guard on EVERY exit, success or failure:
+	// a promote that returned an error (drain timeout, cancelled
+	// context) leaves the node a standby, and the operator must be
+	// able to try again. Leaving the flag set wedged every later
+	// PROMOTE — control socket and promote.signal alike — behind a
+	// misleading "already in progress" (review/260831-2 CM-1).
+	defer sc.promoting.Store(false)
+	// A promote may have completed between the two loads above.
+	if sc.promoted.Load() {
+		return nil
 	}
-	return firstErr
+	err := sc.runPromote(ctx)
+	sc.promoteErr.Store(&err)
+	if err == nil {
+		sc.promoted.Store(true)
+	}
+	return err
 }
 
 func (sc *standbyController) runPromote(ctx context.Context) error {
@@ -357,9 +365,9 @@ func (sc *standbyController) Close() {
 // the same filename on each WAL replay cycle.
 //
 // On detect: remove the file first (so a partial Promote can be
-// retried by re-creating the file), then call Promote. promoteOnce
-// inside Promote provides idempotency against the control-socket
-// PROMOTE path. The watcher exits after a successful trigger; on
+// retried by re-creating the file), then call Promote. The
+// promoted/promoting flags inside Promote provide idempotency
+// against the control-socket PROMOTE path. The watcher exits after a successful trigger; on
 // context cancellation (Close, shutdown) it also exits cleanly.
 func (sc *standbyController) promoteSignalWatcher(ctx context.Context) {
 	defer close(sc.signalDone)

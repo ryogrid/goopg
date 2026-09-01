@@ -303,7 +303,6 @@ var regressExcluded = map[string]string{
 	"collate.linux.utf8": "Linux UTF-8 collation; out of scope for goopg v0.", "collate.utf8": "UTF-8 collation; out of scope for goopg v0.",
 	"collate.windows.win1252": "Windows collation; out of scope for goopg v0.", "copyencoding": "COPY encoding; out of scope for goopg v0.",
 	"encoding": "Multi-byte encoding; out of scope for goopg v0.", "euc_kr": "EUC-KR encoding; out of scope for goopg v0.",
-	"unicode": "Unicode normalization; out of scope for goopg v0.",
 	// External / infra features
 	"async": "LISTEN/NOTIFY; out of scope for goopg v0.", "compression": "TOAST compression; out of scope for goopg v0.",
 	"foreign_data": "FDW; out of scope for goopg v0.", "indirect_toast": "Indirect TOAST; out of scope for goopg v0.",
@@ -321,8 +320,8 @@ var regressExcluded = map[string]string{
 	"roleattributes": "Role attributes; out of scope for goopg v0.", "rowsecurity": "Row-level security; out of scope for goopg v0.",
 	"security_label": "Security labels; out of scope for goopg v0.",
 	// Parallel
-	"select_parallel": "Parallel query; out of scope for goopg v0.", "vacuum_parallel": "Parallel VACUUM; out of scope for goopg v0.",
-	"write_parallel": "Parallel write; out of scope for goopg v0.",
+	"select_parallel": "Parallel query; out of scope for goopg v0.",
+	"write_parallel":  "Parallel write; out of scope for goopg v0.",
 	// Event triggers
 	"event_trigger": "Event triggers; out of scope for goopg v0.", "event_trigger_login": "Login event triggers; out of scope for goopg v0.",
 	// psql client

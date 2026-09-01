@@ -48,6 +48,29 @@ var (
 	yyUnkCode = 3 // "$unk" printing index; asserted at init below
 )
 
+// Terminal numbers the lexer adapter needs for EVERY token of every statement.
+//
+// review/260831 PN-1: mapToken used to call resolve() — a map lookup keyed by
+// the terminal's NAME — per token, and for a keyword it did two lookups (text
+// -> keywordDef, then name -> number). These are constants of the generated
+// grammar, so they are resolved once at init instead, and keywordTerm carries
+// a keyword's terminal number directly.
+var (
+	termIDENT     int
+	termSCONST    int
+	termBCONST    int
+	termICONST    int
+	termFCONST    int
+	termPARAM     int
+	termTYPEDLIT  int
+	termCHECK     int
+	termCHECKBODY int
+
+	// keywordTerm maps a lowercase keyword's TEXT straight to its terminal
+	// number, collapsing mapToken's two lookups into one.
+	keywordTerm = make(map[string]int, len(keywordDefs))
+)
+
 func init() {
 	for name, num := range genTokenNums {
 		nameToNum[name] = num
@@ -69,6 +92,19 @@ func init() {
 			unresolved = append(unresolved, name)
 		}
 	}
+	termIDENT = resolve("IDENT")
+	termSCONST = resolve("SCONST")
+	termBCONST = resolve("BCONST")
+	termICONST = resolve("ICONST")
+	termFCONST = resolve("FCONST")
+	termPARAM = resolve("PARAM")
+	termTYPEDLIT = resolve("TYPEDLIT")
+	termCHECK = resolve("CHECK")
+	termCHECKBODY = resolve("CHECKBODY")
+	for text, d := range keywordByText {
+		keywordTerm[text] = resolve(d.Token)
+	}
+
 	initSubstRules()
 }
 

@@ -579,8 +579,8 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		return buf[:], nil
 	case "timestamp", "timestamptz":
 		if d.Kind == KindString {
-			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
-			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
+			// 'infinity' / '-infinity' / 'today' / ... (#5(d-iv), M0134-0182).
+			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), isTimestampTZTypeName(t.Name)); ok {
 				d = inf
 			} else {
 				// A zone in the text belongs to the value only for timestamptz;
@@ -636,8 +636,8 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		return buf[:], nil
 	case "date":
 		if d.Kind == KindString {
-			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
-			if inf, ok := parseDateInfinityLiteral(d.StringValue()); ok {
+			// 'infinity' / '-infinity' / 'today' / ... (#5(d-iv), M0134-0182).
+			if inf, ok := parseDateSpecialLiteral(d.StringValue(), nowFromCtx(ctx)); ok {
 				d = inf
 			} else {
 				// date_in never looks at the decoded zone, nor at an hour-24 /
@@ -1019,6 +1019,23 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		// (e.g. relpartbound when relispartition=true). Empty varlena.
 		s := d.StringValue()
 		return varlenaTextBytes(s), nil
+	case "xml":
+		// M0134-0188: the physical-encode path is a SIBLING of evalCast's
+		// `::xml` arm (xmltypes.go) and must apply the same well-formedness
+		// gate — otherwise `INSERT INTO t(x xml) VALUES ('<wrong')` (an
+		// IMPLICIT column coercion, which never routes through evalCast)
+		// stored the malformed fragment while an explicit `::xml` cast on
+		// the same string correctly raised 2200N/2200M
+		// (pattern_sibling_paths_must_agree).
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		if ee := xmlValidate(s, xmlOptionFromCtx(ctx)); ee != nil {
+			ee.Pos = pos
+			return nil, ee
+		}
+		return varlenaTextBytes(s), nil
 	default:
 		// text, varchar, char, bpchar, unknown, numeric, etc.
 		// Use PG varlena format (LE): 1-byte header for short values,
@@ -1099,6 +1116,16 @@ func varlenaTextBytes(s string) []byte {
 // pgEpochUnixMicros is 2000-01-01 UTC in Unix microseconds (used by
 // the PG timestamp encoding).
 var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
+
+// maxDateDaysForMicros / minDateDaysForMicros bound the days-since-2000 range
+// whose conversion to Unix microseconds still fits in int64. PG's date type
+// reaches far past this (5874897 AD); the sentinels aside, a date beyond the
+// bound cannot be represented as micros at all (review/260831-2 EC-5).
+const (
+	microsPerDay         = int64(24 * 3600 * 1000000)
+	maxDateDaysForMicros = int32((math.MaxInt64 - 946684800000000) / microsPerDay)
+	minDateDaysForMicros = int32((math.MinInt64 + 946684800000000) / microsPerDay)
+)
 
 // pgTimeMicros extracts the microseconds-since-midnight that PG's TimeADT holds
 // from the time.Time carrier of a `time`/`timetz` Datum.
@@ -1432,55 +1459,10 @@ func physicalPGTypeAlign(t catalog.Type) int {
 }
 
 // physicalPGTypeAlignLowered is physicalPGTypeAlign with the lowercased type
-// name supplied. See decodePhysicalPGValueLowered for why.
+// name supplied. See decodePhysicalPGValueLowered for why. The table itself
+// lives in catalog.PhysicalTypeAlign so that xlog/pgoutput.go shares it.
 func physicalPGTypeAlignLowered(t catalog.Type, tname string) int {
-	// All array columns store a varlena ArrayType blob → PG 'i' (4-byte) align.
-	// M0118-0002.
-	if t.IsArray {
-		return 4
-	}
-	switch tname {
-	case "bool", "boolean":
-		return 1
-	case "char":
-		// Single-byte internal "char" type: alignment 1.
-		// char(N) with length modifier is bpchar (varlena): alignment 4.
-		if len(t.Args) == 0 {
-			return 1
-		}
-		return 4
-	case "int2", "smallint", "smallserial", "serial2":
-		return 2
-	case "int4", "integer", "int", "serial", "serial4", "oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid", "float4", "real", "date", "xid":
-		return 4
-	case "int8", "bigint", "bigserial", "serial8", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
-		// interval is typalign 'd' (pg_type OID 1186) even though its 16 bytes
-		// exceed a Datum — the struct's leading field is an int64.
-		"interval",
-		// xid8 is typalign 'd' (pg_type OID 5069, typlen 8) — it had been
-		// falling through to the default 4 while its 4-byte encode hid the
-		// consequence. M0119-0006 (54th slice); `xid` (OID 28) stays 'i' above.
-		"xid8":
-		return 8
-	case "name",
-		// uuid is pg_type OID 2950: typlen 16, typalign 'c'. Its 16 bytes
-		// exceed a Datum but carry no field wider than a byte. M0119-0006.
-		"uuid":
-		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
-	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "pg_node_tree", "oidvector", "int2vector":
-		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
-	case "anyarray":
-		// anyarray (OID 2277) is typalign='d' — 8 bytes, NOT the 'i' every
-		// other varlena array uses (postgres/src/include/catalog/pg_type.dat:573).
-		// Its two catalog users are pg_attribute.attmissingval and
-		// pg_statistic.stavalues1..5; a hosted PG deforms both with its own
-		// compiled descriptor, so 4-byte padding here put every following
-		// byte one word early. Sibling of initdb.pgTypeAlignChar(2277), which
-		// declares the same 'd' in the nailed self-description. M0131-S14.2.
-		return 8
-	default:
-		return 4
-	}
+	return catalog.PhysicalTypeAlign(t, tname)
 }
 
 // pgPhysicalTypeIsVarlena reports whether the PG18 on-disk representation
@@ -1712,6 +1694,16 @@ func decodePhysicalPGValueLowered(t catalog.Type, tname string, data []byte, sct
 			return NewDateInfinity(true), 4, nil
 		case math.MinInt32:
 			return NewDateInfinity(false), 4, nil
+		}
+		// Outside the sentinels PG still spans 4714 BC .. 5874897 AD, and the
+		// micros arithmetic below overflows int64 well before that upper end
+		// (~year 294247), wrapping a far-future date into a garbage near-past
+		// one. goopg's own date input already refuses anything outside Go's
+		// time range, so this only guards a heap written by real PG — but
+		// silently decoding it wrong is worse than saying so
+		// (review/260831-2 EC-5).
+		if days > maxDateDaysForMicros || days < minDateDaysForMicros {
+			return Datum{}, 0, fmt.Errorf("date out of range: %d days from 2000-01-01", days)
 		}
 		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
 		// Tag as DATE (TimeSubDate) so a storage-decoded date renders identically
@@ -2088,36 +2080,27 @@ func parseIntegerInput(raw, typeName string, bitSize int) (int64, error) {
 			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
 	}
 
-	// Detect base prefix.
+	// Detect base prefix. PG's scanner accepts a sign in front of it
+	// ("-0x10" is -16), so the prefix is looked for past the sign.
+	body := s
+	if body[0] == '-' || body[0] == '+' {
+		body = body[1:]
+	}
 	isNonDecimal := false
-	prefix := ""
-	rest := s
-	if len(s) >= 2 && (s[0] == '0') {
-		switch {
-		case s[1] == 'b' || s[1] == 'B':
+	rest := body
+	if len(body) >= 2 && body[0] == '0' {
+		switch body[1] {
+		case 'b', 'B', 'o', 'O', 'x', 'X':
 			isNonDecimal = true
-			prefix = s[:2]
-			rest = s[2:]
-		case s[1] == 'o' || s[1] == 'O':
-			isNonDecimal = true
-			prefix = s[:2]
-			rest = s[2:]
-		case s[1] == 'x' || s[1] == 'X':
-			isNonDecimal = true
-			prefix = s[:2]
-			rest = s[2:]
+			rest = body[2:]
 		}
 	}
-	_ = prefix
 
 	// Validate underscore rules.
 	if !isNonDecimal {
 		// Decimal: no leading underscore (after optional sign), no trailing, no consecutive.
-		check := rest
-		if len(check) > 0 && (check[0] == '-' || check[0] == '+') {
-			check = check[1:]
-		}
-		if len(check) > 0 && check[0] == '_' {
+		// `rest` is already sign-stripped here.
+		if len(rest) > 0 && rest[0] == '_' {
 			return 0, &ExecError{Code: "22P02",
 				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
 		}
@@ -2142,7 +2125,16 @@ func parseIntegerInput(raw, typeName string, bitSize int) (int64, error) {
 
 	// Strip underscores for parsing.
 	cleaned := strings.ReplaceAll(s, "_", "")
-	v, err := strconv.ParseInt(cleaned, 0, bitSize)
+	// Base 10 unless an explicit 0b/0o/0x prefix said otherwise: a bare
+	// leading zero is NOT octal to PG's integer input function ('0123' is
+	// 123, '09' is 9), while Go's base-0 ParseInt reads both as octal
+	// (review/260831-2 EC-1). Base 0 is still right for the prefixed forms,
+	// sign included.
+	base := 10
+	if isNonDecimal {
+		base = 0
+	}
+	v, err := strconv.ParseInt(cleaned, base, bitSize)
 	if err != nil {
 		numErr, ok := err.(*strconv.NumError)
 		if ok && numErr.Err == strconv.ErrRange {

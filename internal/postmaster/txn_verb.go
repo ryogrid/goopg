@@ -334,6 +334,15 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 			// a WARNING and ROLLBACK instead of committing. M0100-0005.
 			if connTx.IsFailed() {
 				// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
+				// It is a real ROLLBACK, so it must undo the in-memory DDL
+				// creates first, exactly like the TxRollback arm below: those
+				// registrations are not transactional, so skipping this left a
+				// `BEGIN; CREATE TABLE t; <error>; COMMIT;` table alive in the
+				// catalog while its pg_class/pg_attribute rows were rolled
+				// back (review/260831-2 CP-1).
+				if sess := connTx.Session(); sess != nil {
+					executor.ProcessRollbackUndos(ctx, sess)
+				}
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 				s.endExplicitBlock(ctx, connTx, true)
 				return txnVerbOutcome{Handled: true, Tag: "ROLLBACK"}

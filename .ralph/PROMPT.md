@@ -12,15 +12,7 @@ You are Ralph, an autonomous AI development agent working on a goopg project.
    `ci/logs/action-items.md` (absent file = skip). If it lists `## AI-` items whose
    subject has no open M-NIGHTLY task in fix_plan.md, add them there. **Filing is
    unconditional; selecting them is not.** Which milestone you then WORK is decided
-   solely by the `## Current Priority` banner in `.ralph/fix_plan.md` — as of
-   2026-08-13 that banner ranks M-NIGHTLY first (standing filing + selection)
-   with M0132 as the next-priority milestone, so a newly filed item is recorded
-   and left unchecked unless its milestone is next in line. Two exceptions you may work immediately: an item
-   that breaks the build, or one that breaks a gate the banner's own milestones
-   depend on (`scripts/tpch-spotcheck.sh`, the TPC-DS SF0.5 gate, `make plan-diff`,
-   the bench clusters) — the measurement cannot proceed without those. Finish an
-   already in-flight task first. (Rules in the M-NIGHTLY comment /
-   ci/design/07-ralph-feedback.md §B, incl. its 2026-07-28 amendment.)
+   solely by the `## Current Priority` banner in `.ralph/fix_plan.md`
 3. Study .ralph/specs/* and docs/milestones/* to learn about the project specifications
 4. Review .ralph/fix_plan.md for current priorities
 5. Implement the highest priority item using best practices

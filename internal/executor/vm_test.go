@@ -8,7 +8,7 @@ import (
 )
 
 // newVMFixture creates a context with both FSM and VM wired in.
-func newVMFixture(t *testing.T) (*Context, func()) {
+func newVMFixture(t testing.TB) (*Context, func()) {
 	t.Helper()
 	ctx, cleanup := newFSMFixture(t)
 	ctx.VM = storage.NewVisibilityMap()

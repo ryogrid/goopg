@@ -27,6 +27,13 @@ var (
 	ErrDatabaseNotFound = errors.New("database does not exist")
 )
 
+// ErrRenameNameConflict is wrapped by the RenameCollation / RenameConversion
+// rename helpers when the *target* name is already taken, as opposed to the
+// source object being absent. Callers must tell the two apart: PG reports a
+// rename collision as 42710 duplicate_object ("... already exists in schema
+// ..."), not 42704 undefined_object (review/260831-2 EO1-7).
+var ErrRenameNameConflict = errors.New("name already exists")
+
 // RelationLockRowsFunc is optionally set by the executor to provide
 // currently-held relation lock rows (from LOCK TABLE) for pg_locks.
 // Same column order as AdvisoryLockRowsFunc. M0097.
@@ -4784,6 +4791,39 @@ func AccessibleInheritanceChildren(children []*Table, sessionTempOwner string) [
 	return out
 }
 
+// tablesByChildOIDs resolves a child-OID list to *Table values in ONE pass over
+// the namespace, preserving the order of oids and dropping the ones that have
+// no table.
+//
+// review/260831 CA-1/CA-2: InheritanceChildren and PartitionChildren used to
+// scan the whole namespace once PER CHILD — O(children x tables) — and both sit
+// on per-statement paths (FK enforcement walks the children of every child
+// table, partition routing walks them per row). Callers must hold c.mu.
+func (c *InMemory) tablesByChildOIDs(oids []uint32, dbOid uint32) []*Table {
+	pos := make(map[uint32]int, len(oids))
+	for i, oid := range oids {
+		pos[oid] = i
+	}
+	slots := make([]*Table, len(oids))
+	found := 0
+	for _, t := range c.ns(dbOid).tables {
+		if i, ok := pos[t.OID]; ok && slots[i] == nil {
+			slots[i] = t
+			found++
+			if found == len(oids) {
+				break
+			}
+		}
+	}
+	out := make([]*Table, 0, found)
+	for _, t := range slots {
+		if t != nil {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // InheritanceChildren returns the direct inheritance children of parentOID.
 // Returns nil if the table has no inheritance children. M0096-0009.
 func (c *InMemory) InheritanceChildren(parentOID uint32, dbOid ...uint32) []*Table {
@@ -4793,16 +4833,7 @@ func (c *InMemory) InheritanceChildren(parentOID uint32, dbOid ...uint32) []*Tab
 	if len(children) == 0 {
 		return nil
 	}
-	out := make([]*Table, 0, len(children))
-	for _, oid := range children {
-		for _, t := range c.ns(resolveDBOid(dbOid)).tables {
-			if t.OID == oid {
-				out = append(out, t)
-				break
-			}
-		}
-	}
-	return out
+	return c.tablesByChildOIDs(children, resolveDBOid(dbOid))
 }
 
 // PartitionChildren returns the OIDs of partition children for a partitioned table.
@@ -4814,16 +4845,7 @@ func (c *InMemory) PartitionChildren(parentOID uint32, dbOid ...uint32) []*Table
 	if len(children) == 0 {
 		return nil
 	}
-	out := make([]*Table, 0, len(children))
-	for _, oid := range children {
-		for _, t := range c.ns(resolveDBOid(dbOid)).tables {
-			if t.OID == oid {
-				out = append(out, t)
-				break
-			}
-		}
-	}
-	return out
+	return c.tablesByChildOIDs(children, resolveDBOid(dbOid))
 }
 
 // RegisterPartitionChild registers tbl (OID childOID) as a partition of parentOID.
@@ -7757,10 +7779,26 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				idxNsOID = oid
 			}
 		}
-		// Determine relam for index: btree=403, hash=405, gist=783, gin=2742, spgist=4000, brin=3580.
+		// Determine relam for index: btree=403, hash=405, gist=783, gin=2742,
+		// spgist=4000, brin=3580. A `USING hash` index is architecturally built
+		// on the B-tree substrate (idx.Method stays "btree", idx.DeclaredHash
+		// records the original clause — see IndexAMCapabilityByName's doc
+		// comment) so it deliberately keeps reporting relam=403 here too,
+		// matching how it reports "everywhere else in goopg" except the one
+		// pg_indexam_has_property compat surface. gist/gin/spgist/brin indexes
+		// ARE registered catalog-only under their real Method string (no B-tree
+		// substrate involved), so relam must resolve from it — this branch used
+		// to only special-case "hash" (itself dead: idx.Method is never
+		// literally "hash"), silently defaulting every non-hash non-btree
+		// method to btree's oid and making pg_class.relam wrong for every
+		// gist/gin/spgist/brin index (surfaced by pg_amcheck's own
+		// `c.relam = BTREE_AM_OID` index-enumeration query wrongly matching
+		// them, M0119-0006).
 		idxRelam := "403" // default btree
-		if idx.Method == "hash" {
-			idxRelam = "405"
+		if !idx.DeclaredHash {
+			if amOID := AccessMethodOIDByName(idx.Method); amOID != 0 {
+				idxRelam = strconv.Itoa(int(amOID))
+			}
 		}
 		idxPers := "p"
 		if idx.Table != nil {
@@ -13688,7 +13726,7 @@ func (c *InMemory) RenameCollation(name, schema, newName string, dbOid ...uint32
 			continue
 		}
 		if strings.EqualFold(uc.Name, newName) {
-			return fmt.Errorf("collation %q already exists", newName)
+			return fmt.Errorf("collation %q already exists: %w", newName, ErrRenameNameConflict)
 		}
 	}
 	if target == nil {
@@ -13975,7 +14013,7 @@ func (c *InMemory) RenameConversion(name, schema, newName string, dbOid ...uint3
 			continue
 		}
 		if strings.EqualFold(uc.Name, newName) {
-			return fmt.Errorf("conversion %q already exists", newName)
+			return fmt.Errorf("conversion %q already exists: %w", newName, ErrRenameNameConflict)
 		}
 	}
 	if target == nil {
@@ -24829,6 +24867,19 @@ type SearchPathCatalog struct {
 	// false in the default (toggle-untouched) case so legacy plans are unchanged.
 	// Design 0118-0103 (M0118-0009 horizons enabler).
 	DisableSeqScan bool
+	// DisableIndexScan / DisableBitmapScan / DisableIndexOnlyScan mirror the
+	// querying session's `enable_indexscan` / `enable_bitmapscan` /
+	// `enable_indexonlyscan` GUCs, exactly as DisableSeqScan mirrors
+	// enable_seqscan. They were accepted-and-ignored declarations until
+	// review/260831-2 X-8: `SET enable_indexscan = off` left every index plan
+	// in place, where PG (costsize.c's disabled-node accounting) falls back to
+	// a bitmap and then to a seq scan. The planner reads them through the same
+	// carrier walk (IndexScanDisabled/BitmapScanDisabled/IndexOnlyScanDisabled)
+	// and DECLINES the corresponding scan shape; false (toggle untouched) is
+	// the default, so legacy plans are unchanged.
+	DisableIndexScan     bool
+	DisableBitmapScan    bool
+	DisableIndexOnlyScan bool
 	// DBOid is the querying connection's real, physical database oid
 	// (executor.Context.CurrentDatabaseOid, resolved via ResolveDatabaseOid).
 	// Zero for connection-less contexts (embedded/test callers, or a
@@ -24859,6 +24910,19 @@ func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken 
 // (dropping the Sort). The planner discovers it via a seqScanToggleCarrier
 // interface walk over the catalog wrapper chain. Design 0118-0103 (horizons).
 func (c *SearchPathCatalog) SeqScanDisabled() bool { return c.DisableSeqScan }
+
+// IndexScanDisabled / BitmapScanDisabled / IndexOnlyScanDisabled report the
+// querying session's enable_indexscan / enable_bitmapscan / enable_indexonlyscan
+// GUCs so the planner can decline that scan shape. Siblings of
+// SeqScanDisabled, discovered by the same carrier-interface walk over the
+// catalog wrapper chain. review/260831-2 X-8.
+func (c *SearchPathCatalog) IndexScanDisabled() bool { return c.DisableIndexScan }
+
+// BitmapScanDisabled — see IndexScanDisabled.
+func (c *SearchPathCatalog) BitmapScanDisabled() bool { return c.DisableBitmapScan }
+
+// IndexOnlyScanDisabled — see IndexScanDisabled.
+func (c *SearchPathCatalog) IndexOnlyScanDisabled() bool { return c.DisableIndexOnlyScan }
 
 // CurrentPartitionDetachEpoch returns the querying statement's snapshot
 // partition-detach epoch so the planner's partition-expansion site can apply

@@ -1,7 +1,6 @@
 package nbtree
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -1504,5 +1503,11 @@ func readInternalFirstChildBlock(p storage.Page) storage.BlockNumber {
 	if err != nil || len(raw) < SizeOfIndexTupleData {
 		return storage.InvalidBlockNumber
 	}
-	return storage.BlockNumber(binary.LittleEndian.Uint32(raw[2:6]))
+	// The downlink is a t_tid: bi_hi at [0:2], bi_lo at [2:4] (bytes [4:6] are
+	// the offset/status half, not part of the block number). Reading a bare
+	// little-endian uint32 at [2:6] therefore dropped the high 16 bits and
+	// mixed in status bits — wrong for any block, and wrong even at block 0
+	// once the status half is non-zero. Share the one decoder
+	// (review/260831-2 NB-3).
+	return BTreeTupleGetDownLink(raw)
 }

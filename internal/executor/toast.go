@@ -425,12 +425,18 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 		return nil, fmt.Errorf("invalid TOAST pointer: total length %d exceeds %d chunks", totalLen, numChunks)
 	}
 	chunks := make([][]byte, numChunks)
+	// review/260831 ES-17: the scan stops as soon as this value's chunks have
+	// all been seen. goopg's TOAST relation has no chunk index yet (upstream
+	// reads chunks through pg_toast_<rel>_index on (chunk_id, chunk_seq)), so
+	// this is still a sequential scan — but it no longer keeps reading the
+	// whole relation after the value has been reassembled.
+	found := 0
 
 	nBlocks, err := ctx.Pool.NBlocks(toastRel)
 	if err != nil {
 		return nil, fmt.Errorf("TOAST detoast NBlocks: %w", err)
 	}
-	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+	for blk := storage.BlockNumber(0); blk < nBlocks && found < numChunks; blk++ {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: toastRel, Block: blk})
 		if err != nil {
 			return nil, err
@@ -465,11 +471,24 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 			// decodeValue's default case returns KindString for varlen
 			// types (even bytea). Accept both kinds so chunk data
 			// stored as either bytes or string is correctly captured.
+			var chunk []byte
 			switch row[2].Kind {
 			case KindBytes:
-				chunks[seq] = row[2].BytesValue()
+				chunk = row[2].BytesValue()
 			case KindString:
-				chunks[seq] = []byte(row[2].StringValue())
+				chunk = []byte(row[2].StringValue())
+			default:
+				continue
+			}
+			// A chunk_seq is unique per chunk_id, so a second sighting would be
+			// a duplicate (or an older, invisible version already filtered
+			// above); count each sequence once.
+			if chunks[seq] == nil {
+				found++
+			}
+			chunks[seq] = chunk
+			if found == numChunks {
+				break
 			}
 		}
 		slot.RUnlock()

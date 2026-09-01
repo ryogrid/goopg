@@ -562,6 +562,11 @@ type baseBackupStreamer struct {
 	bytesDone        uint64
 	nextProgressMark uint64
 	ctx              context.Context
+	// chunkBuf backs the CopyData payload. review/260831 NB-19: a fresh
+	// baseBackupChunkBytes buffer was allocated per chunk — one per 64 KiB of
+	// backup — even though WriteCopyData writes the bytes out synchronously
+	// and keeps nothing.
+	chunkBuf []byte
 }
 
 func (s *baseBackupStreamer) Write(p []byte) (int, error) {
@@ -575,7 +580,10 @@ func (s *baseBackupStreamer) Write(p []byte) (int, error) {
 			n = baseBackupChunkBytes
 		}
 		// Build the CopyData payload: 'd' type byte + chunk.
-		buf := make([]byte, 1+n)
+		if cap(s.chunkBuf) < 1+n {
+			s.chunkBuf = make([]byte, 1+n)
+		}
+		buf := s.chunkBuf[:1+n]
 		buf[0] = 'd'
 		copy(buf[1:], p[:n])
 		if err := s.w.WriteCopyData(buf); err != nil {
@@ -1206,12 +1214,18 @@ func streamBackupManifest(w *libpq.FrameWriter, manifest []byte) error {
 	if err := w.WriteCopyData([]byte{'m'}); err != nil {
 		return err
 	}
+	// review/260831 NB-19: one buffer for every chunk, not one per chunk —
+	// WriteCopyData writes synchronously and keeps nothing.
+	var chunkBuf []byte
 	for len(manifest) > 0 {
 		n := len(manifest)
 		if n > baseBackupChunkBytes {
 			n = baseBackupChunkBytes
 		}
-		buf := make([]byte, 1+n)
+		if cap(chunkBuf) < 1+n {
+			chunkBuf = make([]byte, 1+n)
+		}
+		buf := chunkBuf[:1+n]
 		buf[0] = 'd'
 		copy(buf[1:], manifest[:n])
 		if err := w.WriteCopyData(buf); err != nil {

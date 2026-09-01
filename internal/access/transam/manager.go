@@ -260,6 +260,17 @@ const xidMaxSafe = ^storage.TransactionID(0) - xidStopAge
 // counter — suitable for tests and callers that have not yet threaded
 // an explicit procNum. Production server code should always supply one.
 func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, error) {
+	// Validated up front so BOTH branches below reject an unsupported level:
+	// the auto-assign branch used to return before the switch, so a garbage
+	// level was stored into the slot (and registered SSI bookkeeping when it
+	// happened to equal IsolationSerializable). Checking here also means the
+	// auto-assign CAS cannot claim a slot that is then abandoned by the error
+	// return. (review/260831-2 TA-3.)
+	switch iso {
+	case IsolationReadCommitted, IsolationRepeatableRead, IsolationSerializable:
+	default:
+		return Transaction{}, fmt.Errorf("mvcc: unsupported isolation level %v", iso)
+	}
 	var procNum int32
 	if len(procNums) > 0 {
 		procNum = procNums[0]
@@ -300,11 +311,6 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 			m.ssiMu.Unlock()
 		}
 		return Transaction{Handle: handle, XID: storage.InvalidTransactionID, Isolation: iso}, nil
-	}
-	switch iso {
-	case IsolationReadCommitted, IsolationRepeatableRead, IsolationSerializable:
-	default:
-		return Transaction{}, fmt.Errorf("mvcc: unsupported isolation level %v", iso)
 	}
 	if procNum < 0 || int(procNum) >= len(m.procArray.slots) {
 		return Transaction{}, fmt.Errorf("mvcc: procNum %d out of range [0, %d)", procNum, len(m.procArray.slots))
@@ -502,7 +508,13 @@ func (m *Manager) AcquireConnSlot() (int32, error) {
 	// that spacing while still never handing out a HELD slot.
 	start := m.connSlotCursor.Add(1)
 	for off := int32(0); off < int32(sz-1); off++ {
-		i := 1 + (start+off)%int32(sz-1)
+		// The cursor is a free-running int32: once it has handed out 2^31
+		// slots it wraps negative, and a negative modulo made `i` zero or
+		// negative — either silently handing out the reserved slot 0 or
+		// panicking on a negative index. Reducing through uint32 keeps the
+		// rotation in [0, sz-1) for every cursor value
+		// (review/260831-2 TA-4).
+		i := 1 + int32(uint32(start+off)%uint32(sz-1))
 		if m.procArray.slots[i].connHeld.CompareAndSwap(0, 1) {
 			return i, nil
 		}
@@ -1366,12 +1378,11 @@ func (m *Manager) captureSnapshot() Snapshot {
 
 	// M0100-0002: include ALL aborted XIDs in the snapshot so rolled-back
 	// rows remain invisible even when their xmin falls below Xmin.
+	// review/260831 TA-1: shared, not copied. insertSortedXID is
+	// copy-on-write, so the slice this snapshot observes never changes under
+	// it; snapshots outnumber aborts by orders of magnitude.
 	m.abortedMu.RLock()
-	var aborted []storage.TransactionID
-	if len(m.abortedXIDs) > 0 {
-		aborted = make([]storage.TransactionID, len(m.abortedXIDs))
-		copy(aborted, m.abortedXIDs)
-	}
+	aborted := m.abortedXIDs
 	// M0117-0002: attach the durable commit log (nil unless SetCLog was called)
 	// so the snapshot can fall back to the CLOG for in-window XIDs the in-memory
 	// arrays cannot classify.
@@ -1388,14 +1399,24 @@ func (m *Manager) captureSnapshot() Snapshot {
 	}
 }
 
-// insertSortedXID inserts xid into a sorted slice of XIDs (ascending).
+// insertSortedXID returns a NEW sorted slice with xid inserted (ascending),
+// never mutating s.
+//
+// review/260831 TA-1: it used to shift in place, which forced captureSnapshot
+// to deep-copy abortedXIDs on every snapshot — once per statement, O(aborts)
+// each — just so a later abort could not rewrite an array a live snapshot was
+// reading. Copy-on-write moves that cost to the abort path, which is orders of
+// magnitude rarer, and lets every snapshot share one immutable slice. The
+// arrays are already documented as immutable after capture (see
+// Snapshot.WithCLog / Snapshot.Clone).
 func insertSortedXID(s []storage.TransactionID, xid storage.TransactionID) []storage.TransactionID {
 	idx := sort.Search(len(s), func(i int) bool { return s[i] >= xid })
 	if idx < len(s) && s[idx] == xid {
 		return s // already present
 	}
-	s = append(s, 0)
-	copy(s[idx+1:], s[idx:])
-	s[idx] = xid
-	return s
+	out := make([]storage.TransactionID, len(s)+1)
+	copy(out, s[:idx])
+	out[idx] = xid
+	copy(out[idx+1:], s[idx:])
+	return out
 }

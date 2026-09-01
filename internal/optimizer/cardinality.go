@@ -781,20 +781,36 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 		if float64(clamped2) > nd2 {
 			clamped2 = int(nd2)
 		}
+		// review/260831 OP1-2: the pairing used to be a nested loop over both
+		// MCV lists — up to statistics_target^2 (10,000 by default) string
+		// comparisons per selectivity estimate. Indexing the second list by
+		// value and consuming each entry once is the same pairing: "each MCV
+		// matches at most one member of the other list", and taking the LOWEST
+		// unused index for a value is exactly what the inner scan did.
+		firstByValue := make(map[string]int, clamped2)
+		for k := clamped2 - 1; k >= 0; k-- {
+			firstByValue[st2.MCV[k].Value] = k // lowest index wins
+		}
 		matched2 := make([]bool, clamped2)
 		matchFreq1, nmatches := 0.0, 0
 		for i := range st1.MCV {
-			// "we assume that each MCV will match at most one member of the
-			// other MCV list" — hence the used-up flags and the break.
-			for k := 0; k < clamped2; k++ {
-				if matched2[k] || st1.MCV[i].Value != st2.MCV[k].Value {
-					continue
-				}
-				matched2[k] = true
-				nmatches++
-				matchFreq1 += st1.MCV[i].Frequency
-				break
+			k, ok := firstByValue[st1.MCV[i].Value]
+			if !ok {
+				continue
 			}
+			// An MCV list holds distinct values, so the map answers directly;
+			// the forward scan only runs if one ever holds duplicates, and it
+			// then picks the same "lowest still-unused index" the old nested
+			// loop did.
+			for k < clamped2 && matched2[k] && st2.MCV[k].Value == st1.MCV[i].Value {
+				k++
+			}
+			if k >= clamped2 || matched2[k] || st2.MCV[k].Value != st1.MCV[i].Value {
+				continue
+			}
+			matched2[k] = true
+			nmatches++
+			matchFreq1 += st1.MCV[i].Frequency
 		}
 		matchFreq1 = clampProbability(matchFreq1)
 

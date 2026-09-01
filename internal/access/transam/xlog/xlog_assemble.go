@@ -73,8 +73,32 @@ type FullPageImage struct {
 // owning transaction id is a header field (XLogRecord.XID) and is stamped by
 // the caller, not carried in the body.
 func assembleXLogRecord(mainData []byte, blocks []BlockRef) ([]byte, error) {
-	var header []byte // block + main-data chunk headers
-	var payload []byte // block images/data, then main data
+	return assembleXLogRecordInto(nil, mainData, blocks)
+}
+
+// assembleXLogRecordInto is assembleXLogRecord with `prefix` copied in front of
+// the assembled record, in the SAME allocation.
+//
+// review/260831 XL-21: the pre-assembled-PG path used to assemble the record
+// and then copy the whole thing again into a buffer carrying the 7-byte goopg
+// envelope — a second allocation and a second full copy of every WAL record it
+// emits. Passing the envelope in as a prefix removes both.
+func assembleXLogRecordInto(prefix []byte, mainData []byte, blocks []BlockRef) ([]byte, error) {
+	// review/260831 XL-68: both regions used to grow from nil, so every WAL
+	// record paid a handful of reallocations and then one more copy for the
+	// concatenation at the end. The sizes are known up front — a block header
+	// is at most 25 bytes (2 id/flags + 2 data length + 5 image header + 12
+	// RelFileLocator + 4 block number) and the payload is the images, the block
+	// data and the main data — so both are allocated once, and so is the result.
+	const maxBlockHeaderBytes = 25
+	headerCap := len(blocks)*maxBlockHeaderBytes + 5 // + main-data chunk header
+	payloadCap := len(mainData)
+	for i := range blocks {
+		payloadCap += len(blocks[i].Data)
+		payloadCap += fpiEncodedLen(blocks[i].Image)
+	}
+	header := make([]byte, 0, headerCap)   // block + main-data chunk headers
+	payload := make([]byte, 0, payloadCap) // block images/data, then main data
 
 	for i := range blocks {
 		b := &blocks[i]
@@ -108,14 +132,16 @@ func assembleXLogRecord(mainData []byte, blocks []BlockRef) ([]byte, error) {
 
 		// XLogRecordBlockImageHeader + the image bytes (into payload).
 		if b.Image != nil {
-			imgBytes, imgLen, holeOffset, bimgInfo, err := encodeFullPageImage(b.Image)
+			var imgLen, holeOffset uint16
+			var bimgInfo byte
+			var err error
+			payload, imgLen, holeOffset, bimgInfo, err = appendFullPageImage(payload, b.Image)
 			if err != nil {
 				return nil, err
 			}
 			header = binary.LittleEndian.AppendUint16(header, imgLen)
 			header = binary.LittleEndian.AppendUint16(header, holeOffset)
 			header = append(header, bimgInfo)
-			payload = append(payload, imgBytes...)
 		}
 
 		// RelFileLocator (unless SAME_REL) + BlockNumber.
@@ -153,37 +179,71 @@ func assembleXLogRecord(mainData []byte, blocks []BlockRef) ([]byte, error) {
 		payload = append(payload, mainData...)
 	}
 
-	return append(header, payload...), nil
+	out := make([]byte, 0, len(prefix)+len(header)+len(payload))
+	out = append(out, prefix...)
+	out = append(out, header...)
+	out = append(out, payload...)
+	return out, nil
 }
 
-// encodeFullPageImage returns the on-wire image bytes plus the
+// appendFullPageImage appends the on-wire image bytes to dst and returns the
 // XLogRecordBlockImageHeader fields (image length, hole offset, bimg_info).
 // The hole is removed when the page carries a valid standard header, matching
 // PostgreSQL's XLogRecordAssemble; otherwise the full page is emitted.
-func encodeFullPageImage(img *FullPageImage) (imgBytes []byte, imgLen, holeOffset uint16, bimgInfo byte, err error) {
+//
+// review/260831 XL-68: it used to build the image in a freshly allocated buffer
+// that the caller then copied into the payload — a page-sized allocation and
+// copy per full-page image, on a path that emits one per record.
+// fpiHole reports the free-space hole [lower:upper) that a full-page image
+// omits, and whether the page has a usable standard header at all. It is the
+// one place that decides what a "hole" is, so fpiEncodedLen and
+// appendFullPageImage cannot disagree about the size of what gets written.
+func fpiHole(page storage.Page) (lower, upper int, hasHole bool) {
+	if len(page) != storage.BlockSize {
+		return 0, 0, false
+	}
+	hdr := storage.MustHeader(page)
+	lower, upper = int(hdr.Lower()), int(hdr.Upper())
+	if lower >= storage.SizeOfPageHeaderData && upper > lower && upper <= storage.BlockSize {
+		return lower, upper, true
+	}
+	return 0, 0, false
+}
+
+// fpiEncodedLen is how many payload bytes img will occupy (0 when there is no
+// image), used to size the payload buffer up front.
+func fpiEncodedLen(img *FullPageImage) int {
+	if img == nil {
+		return 0
+	}
+	if len(img.Page) != storage.BlockSize {
+		return 0 // rejected by appendFullPageImage
+	}
+	if lower, upper, ok := fpiHole(img.Page); ok {
+		return storage.BlockSize - (upper - lower)
+	}
+	return storage.BlockSize
+}
+
+func appendFullPageImage(dst []byte, img *FullPageImage) (out []byte, imgLen, holeOffset uint16, bimgInfo byte, err error) {
 	page := img.Page
 	if len(page) != storage.BlockSize {
-		return nil, 0, 0, 0, fmt.Errorf("wal: full-page image is %d bytes, want %d", len(page), storage.BlockSize)
+		return dst, 0, 0, 0, fmt.Errorf("wal: full-page image is %d bytes, want %d", len(page), storage.BlockSize)
 	}
 	if img.Apply {
 		bimgInfo |= bkpImageApply
 	}
 
-	hdr := storage.MustHeader(page)
-	lower := int(hdr.Lower())
-	upper := int(hdr.Upper())
 	// Valid standard header → remove the free-space hole [pd_lower:pd_upper].
-	if lower >= storage.SizeOfPageHeaderData && upper > lower && upper <= storage.BlockSize {
+	if lower, upper, ok := fpiHole(page); ok {
 		holeLen := upper - lower
 		bimgInfo |= bkpImageHasHole
-		out := make([]byte, 0, storage.BlockSize-holeLen)
-		out = append(out, page[:lower]...)
-		out = append(out, page[upper:]...)
-		return out, uint16(storage.BlockSize - holeLen), uint16(lower), bimgInfo, nil
+		dst = append(dst, page[:lower]...)
+		dst = append(dst, page[upper:]...)
+		return dst, uint16(storage.BlockSize - holeLen), uint16(lower), bimgInfo, nil
 	}
 
 	// No detectable hole → full page, hole_offset = 0, no BKPIMAGE_HAS_HOLE.
-	out := make([]byte, storage.BlockSize)
-	copy(out, page)
-	return out, uint16(storage.BlockSize), 0, bimgInfo, nil
+	dst = append(dst, page...)
+	return dst, uint16(storage.BlockSize), 0, bimgInfo, nil
 }

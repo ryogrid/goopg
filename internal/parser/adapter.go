@@ -404,16 +404,16 @@ func (l *lexerState) next() lexResult {
 		// reduce/reduce conflicts against col_name_keyword.
 		if cur.term > 0 && charTypmodFamily[lower] {
 			if s2, ok := l.peekCharTypmodLit(); ok {
-				return lexResult{term: resolve("TYPEDLIT"), str: knownTypeNames[lower] + "\x1f" + s2, pos: cur.pos, text: cur.text}
+				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + s2, pos: cur.pos, text: cur.text}
 			}
 		}
 		if cur.term > 0 {
-			if nxt := l.peek(); nxt.term == resolve("SCONST") {
+			if nxt := l.peek(); nxt.term == termSCONST {
 				l.i++ // consume the SCONST too
 				// Fold to one synthetic terminal so c_expr can build a
 				// TypedStringLit (legacy parity) instead of a bare string —
 				// `date 'X' + interval 'Y'` needs the type for + resolution.
-				return lexResult{term: resolve("TYPEDLIT"), str: knownTypeNames[lower] + "\x1f" + nxt.str, pos: cur.pos, text: cur.text + " " + nxt.text}
+				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + nxt.str, pos: cur.pos, text: cur.text + " " + nxt.text}
 			}
 		}
 	}
@@ -424,7 +424,7 @@ func (l *lexerState) next() lexResult {
 	// it. The fold makes the grammar do the same: the body is opaque, the
 	// terminal carries both paren positions, and the rule joins the tokens
 	// between them. `WITH CHECK OPTION` is untouched (no '(' follows).
-	if cur.term == resolve("CHECK") && cur.term > 0 && !l.checkFollowsWith() {
+	if cur.term == termCHECK && cur.term > 0 && !l.checkFollowsWith() {
 		if nxt := l.peek(); nxt.term == int('(') {
 			depth := 0
 			for j := l.i; j < len(l.toks); j++ {
@@ -438,7 +438,7 @@ func (l *lexerState) next() lexResult {
 					depth--
 					if depth == 0 {
 						l.i = j + 1
-						return lexResult{term: resolve("CHECKBODY"), pos: nxt.pos, ival: tk.Pos, text: "check"}
+						return lexResult{term: termCHECKBODY, pos: nxt.pos, ival: tk.Pos, text: "check"}
 					}
 				}
 			}
@@ -516,16 +516,16 @@ func (l *lexerState) mapToken(i int) lexResult {
 		return lexResult{term: 0}
 	case TokenIdent, TokenKeyword:
 		lower := strings.ToLower(t.Value)
-		if def, ok := keywordByText[lower]; ok {
-			return lexResult{term: resolve(def.Token), str: lower, pos: t.Pos, text: t.Value}
+		if term, ok := keywordTerm[lower]; ok {
+			return lexResult{term: term, str: lower, pos: t.Pos, text: t.Value}
 		}
 		// Unquoted identifiers fold to lowercase upstream (scan.l).
-		return lexResult{term: resolve("IDENT"), str: lower, pos: t.Pos, text: t.Value}
+		return lexResult{term: termIDENT, str: lower, pos: t.Pos, text: t.Value}
 	case TokenQuotedIdent:
 		// Quoted identifiers are never keywords; Value is decoded/unquoted.
-		return lexResult{term: resolve("IDENT"), str: t.Value, pos: t.Pos, text: t.Value}
+		return lexResult{term: termIDENT, str: t.Value, pos: t.Pos, text: t.Value}
 	case TokenStringLit:
-		return lexResult{term: resolve("SCONST"), str: t.Value, pos: t.Pos, text: t.Value}
+		return lexResult{term: termSCONST, str: t.Value, pos: t.Pos, text: t.Value}
 	case TokenIntLit:
 		// scan.l process_integer_literal: a literal that does not FIT is
 		// re-delivered as FCONST and kept as text, never truncated. Atoi's
@@ -537,19 +537,19 @@ func (l *lexerState) mapToken(i int) lexResult {
 		// there too, so int64 is the boundary that keeps the two ASTs equal.
 		n, err := strconv.ParseInt(strings.ReplaceAll(t.Value, "_", ""), 10, 64)
 		if err != nil {
-			return lexResult{term: resolve("FCONST"), str: t.Value, pos: t.Pos, text: t.Value}
+			return lexResult{term: termFCONST, str: t.Value, pos: t.Pos, text: t.Value}
 		}
-		return lexResult{term: resolve("ICONST"), ival: int(n), str: t.Value, pos: t.Pos, text: t.Value}
+		return lexResult{term: termICONST, ival: int(n), str: t.Value, pos: t.Pos, text: t.Value}
 	case TokenNumericLit:
-		return lexResult{term: resolve("FCONST"), str: t.Value, pos: t.Pos, text: t.Value}
+		return lexResult{term: termFCONST, str: t.Value, pos: t.Pos, text: t.Value}
 	case TokenBitStringLit:
 		// BCONST vs XCONST split is lossy in the legacy lexer (05-risks #4):
 		// both arrive as TokenBitStringLit with a marker byte inside Value.
 		// Conformance fixture due at P2; BCONST is the safe default today.
-		return lexResult{term: resolve("BCONST"), str: t.Value, pos: t.Pos, text: t.Value}
+		return lexResult{term: termBCONST, str: t.Value, pos: t.Pos, text: t.Value}
 	case TokenParam:
 		n, _ := strconv.Atoi(strings.TrimPrefix(t.Value, "$"))
-		return lexResult{term: resolve("PARAM"), ival: n, str: t.Value, pos: t.Pos, text: t.Value}
+		return lexResult{term: termPARAM, ival: n, str: t.Value, pos: t.Pos, text: t.Value}
 	case TokenOperator:
 		if name, ok := namedOperator[t.Value]; ok {
 			return lexResult{term: resolve(name), str: t.Value, pos: t.Pos, text: t.Value}

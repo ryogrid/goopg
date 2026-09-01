@@ -107,3 +107,38 @@ func TestFSMSaveDeterministicOrdering(t *testing.T) {
 		}
 	}
 }
+
+// TestFSMForkRoundTripBeyondOneLeafPage is the review/260831-2 ST-1 guard: a
+// relation larger than fsmSlotsPerPage (4069) heap blocks needs more than one
+// FSM LEAF page, but ReadFSMFork derived the leaf-page count by walking
+// BACKWARDS from the root (`need = ceil(levelCount / fsmSlotsPerPage)`), which
+// is 1 at every step — so it read only the first leaf page and silently
+// dropped the free space of every block at or beyond 4069.
+func TestFSMForkRoundTripBeyondOneLeafPage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "16400_fsm")
+
+	const nBlocks = fsmSlotsPerPage + 100
+	want := make([]uint16, nBlocks)
+	for i := range want {
+		// Distinct-per-block value that survives the category quantisation
+		// round trip (write converts to a category, read converts back).
+		want[i] = fsmSpaceCatToAvail(fsmSpaceAvailToCat(uint16((i % 200) * 40)))
+	}
+	if err := WriteFSMFork(path, want); err != nil {
+		t.Fatalf("WriteFSMFork: %v", err)
+	}
+
+	got, err := ReadFSMFork(path)
+	if err != nil {
+		t.Fatalf("ReadFSMFork: %v", err)
+	}
+	if len(got) < nBlocks {
+		t.Fatalf("ReadFSMFork returned %d slots, want at least %d (leaf pages dropped)", len(got), nBlocks)
+	}
+	for i := 0; i < nBlocks; i++ {
+		if got[i] != want[i] {
+			t.Fatalf("block %d: free space %d, want %d", i, got[i], want[i])
+		}
+	}
+}

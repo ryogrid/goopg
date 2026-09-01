@@ -95,21 +95,6 @@ func maxAlignXLog(n int) int {
 	return (n + xlogRecordAlign - 1) &^ (xlogRecordAlign - 1)
 }
 
-func wrapXLogMainData(payload []byte) []byte {
-	if len(payload) <= 0xFF {
-		out := make([]byte, 2+len(payload))
-		out[0] = xlrBlockIDDataShort
-		out[1] = byte(len(payload))
-		copy(out[2:], payload)
-		return out
-	}
-	out := make([]byte, 5+len(payload))
-	out[0] = xlrBlockIDDataLong
-	binary.LittleEndian.PutUint32(out[1:5], uint32(len(payload)))
-	copy(out[5:], payload)
-	return out
-}
-
 func unwrapXLogMainData(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("%w: missing xlog data header", ErrCorruptRecord)
@@ -185,9 +170,16 @@ func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
 	if rmid, info, xid, body, ok := unframePGAssembled(payload); ok {
 		return encodeAssembledXLog(body, rmid, info, xid, prev)
 	}
-	wrapped := wrapXLogMainData(payload)
 	rmgr, info, xid := classifyXLogRecord(payload)
-	realLen := xlogRecordHeaderSize + len(wrapped)
+	// review/260831 XL-14: the wrapped main-data chunk used to be built in its
+	// own buffer (a full copy of payload) and then copied again into `out`.
+	// It is written straight into `out` now — one allocation and one copy of
+	// the payload per WAL record instead of two of each.
+	chunkHdrLen := 2
+	if len(payload) > 0xFF {
+		chunkHdrLen = 5
+	}
+	realLen := xlogRecordHeaderSize + chunkHdrLen + len(payload)
 	// prev is the caller's 0-based PG LSN (writer.go stores prevRecPtr as
 	// start-1 which is already the 0-based RecPtr). InvalidXLogRecPtr (0)
 	// means "no previous record" and is used verbatim.
@@ -204,10 +196,18 @@ func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
 	// nextRecord = MAXALIGN(xl_tot_len) advance lands on the next
 	// header.
 	out := make([]byte, maxAlignXLog(realLen))
-	if err := EncodeXLogRecordHeader(out[:xlogRecordHeaderSize], header, wrapped); err != nil {
+	body := out[xlogRecordHeaderSize:realLen]
+	if chunkHdrLen == 2 {
+		body[0] = xlrBlockIDDataShort
+		body[1] = byte(len(payload))
+	} else {
+		body[0] = xlrBlockIDDataLong
+		binary.LittleEndian.PutUint32(body[1:5], uint32(len(payload)))
+	}
+	copy(body[chunkHdrLen:], payload)
+	if err := EncodeXLogRecordHeader(out[:xlogRecordHeaderSize], header, body); err != nil {
 		return nil, 0, err
 	}
-	copy(out[xlogRecordHeaderSize:realLen], wrapped)
 	return out, realLen, nil
 }
 

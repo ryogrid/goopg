@@ -51,6 +51,18 @@ func framePGAssembled(rmid Rmgr, info uint8, xid uint32, body []byte) []byte {
 	return out
 }
 
+// framedAssemble assembles a PG record and frames it in ONE allocation: the
+// envelope header is handed to the assembler as a prefix instead of being
+// prepended by a second copy afterwards. review/260831 XL-21.
+func framedAssemble(rmid Rmgr, info uint8, xid uint32, mainData []byte, blocks []BlockRef) ([]byte, error) {
+	var env [pgAssembledEnvelopeHeader]byte
+	env[0] = pgAssembledMarker
+	env[1] = byte(rmid)
+	env[2] = info
+	binary.LittleEndian.PutUint32(env[3:7], xid)
+	return assembleXLogRecordInto(env[:], mainData, blocks)
+}
+
 // unframePGAssembled reports whether payload is a pre-assembled PG envelope and,
 // if so, returns its header fields and the assembled body (aliasing payload).
 func unframePGAssembled(payload []byte) (rmid Rmgr, info uint8, xid uint32, body []byte, ok bool) {
@@ -192,11 +204,7 @@ func EncodeHeapDeletePG(rel storage.RelFileNode, blk storage.BlockNumber, lineSl
 	}
 	mainData[7] = flags
 
-	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk}})
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrHeap, xlogHeapDelete, uint32(xmax), body), nil
+	return framedAssemble(RmgrHeap, xlogHeapDelete, uint32(xmax), mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk}})
 }
 
 // heapHeaderPlusData splits a marshaled HeapTuple into the block-0 payload PG
@@ -254,13 +262,9 @@ func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, old
 	// new_xmax [8:12] stays 0 (the new tuple is not deleted).
 	binary.LittleEndian.PutUint16(mainData[12:14], newSlot) // new_offnum
 
-	body, err := assembleXLogRecord(mainData, []BlockRef{{
+	return framedAssemble(RmgrHeap, xlogHeapHotUpdate, uint32(xmax), mainData, []BlockRef{{
 		ID: 0, Rel: rel, Block: blk, Data: heapHeaderPlusData(newTuple),
 	}})
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrHeap, xlogHeapHotUpdate, uint32(xmax), body), nil
 }
 
 // EncodeHeapUpdatePG builds a PostgreSQL xl_heap_update record for one NON-HOT
@@ -292,11 +296,7 @@ func EncodeHeapUpdatePG(rel storage.RelFileNode, oldBlk storage.BlockNumber, old
 	if oldBlk != newBlk {
 		blocks = append(blocks, BlockRef{ID: 1, Rel: rel, Block: oldBlk})
 	}
-	body, err := assembleXLogRecord(mainData, blocks)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrHeap, xlogHeapUpdate, uint32(xmax), body), nil
+	return framedAssemble(RmgrHeap, xlogHeapUpdate, uint32(xmax), mainData, blocks)
 }
 
 // sizeOfXLogBtreeInsertData is PG's SizeOfBtreeInsert: offnum(2).
@@ -319,11 +319,7 @@ func EncodeBtreeInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, offnu
 	}
 	mainData := make([]byte, sizeOfXLogBtreeInsertData)
 	binary.LittleEndian.PutUint16(mainData[0:2], offnum)
-	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: item}})
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrBtree, xlogBtreeInsertLeaf, 0, body), nil
+	return framedAssemble(RmgrBtree, xlogBtreeInsertLeaf, 0, mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: item}})
 }
 
 const (
@@ -383,11 +379,7 @@ func EncodeXactCommitPGWithSubxacts(xid storage.TransactionID, subxacts []storag
 		// of the chunks goopg writes, matching upstream's order.
 		mainData = binary.LittleEndian.AppendUint32(mainData, 0)
 	}
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrXact, info, uint32(xid), body), nil
+	return framedAssemble(RmgrXact, info, uint32(xid), mainData, nil)
 }
 
 // EncodeXactAbortPG builds a PostgreSQL xl_xact_abort record (xact_time s8 = 0,
@@ -412,11 +404,7 @@ func EncodeXactAbortPGWithSubxacts(xid storage.TransactionID, subxacts []storage
 			mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
 		}
 	}
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrXact, info, uint32(xid), body), nil
+	return framedAssemble(RmgrXact, info, uint32(xid), mainData, nil)
 }
 
 // EncodeXactAssignmentPG builds a PostgreSQL xl_xact_assignment record
@@ -522,11 +510,7 @@ func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redi
 		}
 	}
 	mainData := []byte{0, flags} // reason = 0, flags
-	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrHeap2, xlogHeap2PruneOnAccess, 0, body), nil
+	return framedAssemble(RmgrHeap2, xlogHeap2PruneOnAccess, 0, mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
 }
 
 // EncodeHeapFreezePG builds a PostgreSQL xl_heap_prune record for one page's
@@ -560,11 +544,7 @@ func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, frozen
 	// upstream's redo derives its buffer-lock mode and its lp_truncate_only
 	// decision from this bit alone (heapam_xlog.c:77,106).
 	mainData := []byte{0, xlhpHasFreezePlans | xlhpCleanupLock} // reason = 0, flags
-	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrHeap2, xlogHeap2PruneVacuumClean, 0, body), nil
+	return framedAssemble(RmgrHeap2, xlogHeap2PruneVacuumClean, 0, mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
 }
 
 // sizeOfXLogBtreeSplitData is PG's SizeOfBtreeSplit: level(4) + firstrightoff(2)
@@ -723,11 +703,7 @@ func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.Block
 	} else if childBlk != storage.InvalidBlockNumber {
 		return nil, fmt.Errorf("wal: btree-split at level 0 must not carry child block %d", childBlk)
 	}
-	body, err := assembleXLogRecord(mainData, blocks)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrBtree, info, 0, body), nil
+	return framedAssemble(RmgrBtree, info, 0, mainData, blocks)
 }
 
 // sizeOfXLogBtreeVacuumData is PG's SizeOfBtreeVacuum: ndeleted(2) +
@@ -792,11 +768,7 @@ func EncodeBtreeVacuumPG(rel storage.RelFileNode, blk storage.BlockNumber, prePa
 	} else {
 		block = BlockRef{ID: 0, Rel: rel, Block: blk, Image: &FullPageImage{Page: page, Apply: true}}
 	}
-	body, err := assembleXLogRecord(mainData, []BlockRef{block})
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrBtree, xlogBtreeVacuum, 0, body), nil
+	return framedAssemble(RmgrBtree, xlogBtreeVacuum, 0, mainData, []BlockRef{block})
 }
 
 // sizeOfXLogBtreeNewRootData is PG's SizeOfBtreeNewroot: rootblk(4) + level(4).
@@ -892,11 +864,7 @@ func EncodeBtreeNewRootPG(rel storage.RelFileNode, rootBlk storage.BlockNumber, 
 		ID: 2, Rel: rel, Block: metaBlk, SameRel: true, WillInit: true,
 		Data: encodeXLogBtreeMetadata(nbtree.ReadPGMetaPage(metaPage)),
 	})
-	body, err := assembleXLogRecord(mainData, blocks)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrBtree, xlogBtreeNewRoot, 0, body), nil
+	return framedAssemble(RmgrBtree, xlogBtreeNewRoot, 0, mainData, blocks)
 }
 
 // sizeOfXLogBtreeMarkPageHalfDeadData is PG's SizeOfBtreeMarkPageHalfDead:
@@ -959,14 +927,10 @@ func EncodeBtreeMarkPageHalfDeadPG(rel storage.RelFileNode, leafBlk storage.Bloc
 	binary.LittleEndian.PutUint32(mainData[12:16], uint32(op.Next))
 	binary.LittleEndian.PutUint32(mainData[16:20], uint32(topparent))
 
-	body, err := assembleXLogRecord(mainData, []BlockRef{
+	return framedAssemble(RmgrBtree, xlogBtreeMarkPageHalfDead, 0, mainData, []BlockRef{
 		{ID: 0, Rel: rel, Block: leafBlk, WillInit: true},
 		{ID: 1, Rel: rel, Block: parentBlk, SameRel: true},
 	})
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrBtree, xlogBtreeMarkPageHalfDead, 0, body), nil
 }
 
 // sizeOfXLogBtreeUnlinkPageData is PG's SizeOfBtreeUnlinkPage:
@@ -1117,11 +1081,7 @@ func EncodeBtreeUnlinkPagePG(req BtreeUnlinkPagePGRequest) ([]byte, error) {
 	le.PutUint32(mainData[28:32], uint32(leafrightsib))
 	le.PutUint32(mainData[32:36], uint32(leaftopparent))
 
-	body, err := assembleXLogRecord(mainData, blocks)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrBtree, info, 0, body), nil
+	return framedAssemble(RmgrBtree, info, 0, mainData, blocks)
 }
 
 // EncodePageImagePG builds a PostgreSQL RM_XLOG standalone full-page-image record
@@ -1138,11 +1098,7 @@ func EncodePageImagePG(rel storage.RelFileNode, blk storage.BlockNumber, page st
 		return nil, fmt.Errorf("wal: page image must be %d bytes", storage.BlockSize)
 	}
 	blocks := []BlockRef{{ID: 0, Rel: rel, Block: blk, Image: &FullPageImage{Page: page, Apply: true}}}
-	body, err := assembleXLogRecord(nil, blocks)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrXLog, xlogXLogFPI, 0, body), nil
+	return framedAssemble(RmgrXLog, xlogXLogFPI, 0, nil, blocks)
 }
 
 // EncodeSmgrCreatePG builds a PostgreSQL RM_SMGR relation-file-creation record
@@ -1176,11 +1132,7 @@ func EncodeSmgrCreatePG(rel storage.RelFileNode, xid storage.TransactionID) ([]b
 	mainData = binary.LittleEndian.AppendUint32(mainData, rel.DBOid)
 	mainData = binary.LittleEndian.AppendUint32(mainData, rel.RelOid)
 	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(rel.Fork))
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrStorage, xlogSmgrCreate, uint32(xid), body), nil
+	return framedAssemble(RmgrStorage, xlogSmgrCreate, uint32(xid), mainData, nil)
 }
 
 // EncodeTblspcCreatePG builds a PostgreSQL RM_TBLSPC tablespace-create record
@@ -1196,11 +1148,7 @@ func EncodeTblspcCreatePG(tsOID uint32, location string, xid storage.Transaction
 	mainData = binary.LittleEndian.AppendUint32(mainData, tsOID)
 	mainData = append(mainData, []byte(location)...)
 	mainData = append(mainData, 0) // ts_path null terminator
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrTblspc, xlogTblspcCreate, uint32(xid), body), nil
+	return framedAssemble(RmgrTblspc, xlogTblspcCreate, uint32(xid), mainData, nil)
 }
 
 // EncodeTblspcDropPG builds a PostgreSQL RM_TBLSPC tablespace-drop record
@@ -1208,11 +1156,7 @@ func EncodeTblspcCreatePG(tsOID uint32, location string, xid storage.Transaction
 // and no block ref, mirroring PG's DropTableSpace XLogInsert. B4.1d.
 func EncodeTblspcDropPG(tsOID uint32, xid storage.TransactionID) ([]byte, error) {
 	mainData := binary.LittleEndian.AppendUint32(make([]byte, 0, 4), tsOID)
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrTblspc, xlogTblspcDrop, uint32(xid), body), nil
+	return framedAssemble(RmgrTblspc, xlogTblspcDrop, uint32(xid), mainData, nil)
 }
 
 // EncodeDbaseCreateWalLogPG builds a PostgreSQL RM_DBASE create record using the
@@ -1226,11 +1170,7 @@ func EncodeDbaseCreateWalLogPG(dbOID, tsOID uint32, xid storage.TransactionID) (
 	mainData := make([]byte, 0, 8)
 	mainData = binary.LittleEndian.AppendUint32(mainData, dbOID)
 	mainData = binary.LittleEndian.AppendUint32(mainData, tsOID)
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrDbase, xlogDbaseCreateWalLog, uint32(xid), body), nil
+	return framedAssemble(RmgrDbase, xlogDbaseCreateWalLog, uint32(xid), mainData, nil)
 }
 
 // EncodeDbaseDropPG builds a PostgreSQL RM_DBASE drop record (XLOG_DBASE_DROP)
@@ -1245,11 +1185,7 @@ func EncodeDbaseDropPG(dbOID uint32, tsOIDs []uint32, xid storage.TransactionID)
 	for _, ts := range tsOIDs {
 		mainData = binary.LittleEndian.AppendUint32(mainData, ts)
 	}
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrDbase, xlogDbaseDrop, uint32(xid), body), nil
+	return framedAssemble(RmgrDbase, xlogDbaseDrop, uint32(xid), mainData, nil)
 }
 
 // clogXactsPerPage is PostgreSQL's CLOG_XACTS_PER_PAGE: 2 status bits per xact →
@@ -1272,11 +1208,7 @@ func EncodeClogTruncatePG(oldestXid storage.TransactionID, oldestXactDb uint32) 
 	mainData = binary.LittleEndian.AppendUint64(mainData, uint64(pageno))
 	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(oldestXid))
 	mainData = binary.LittleEndian.AppendUint32(mainData, oldestXactDb)
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrCLOG, xlogClogTruncate, 0, body), nil
+	return framedAssemble(RmgrCLOG, xlogClogTruncate, 0, mainData, nil)
 }
 
 // EncodeCheckpointPG builds a PostgreSQL RM_XLOG checkpoint record carrying the
@@ -1334,11 +1266,7 @@ func EncodeCheckpointPGFields(shutdown bool, f CheckPointFields) ([]byte, error)
 // Shutdown checkpoints don't emit it — the checkpoint record itself marks redo.
 func EncodeCheckpointRedoPG() ([]byte, error) {
 	mainData := binary.LittleEndian.AppendUint32(make([]byte, 0, 4), 1) // wal_level=replica
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrXLog, xlogCheckpointRedo, 0, body), nil
+	return framedAssemble(RmgrXLog, xlogCheckpointRedo, 0, mainData, nil)
 }
 
 // minSizeOfXlRunningXacts is offsetof(xl_running_xacts, xids) in PG18
@@ -1372,11 +1300,7 @@ func EncodeRunningXactsPG(nextXid, oldestRunning, latestCompleted uint32, xids [
 	for i, xid := range xids {
 		le.PutUint32(mainData[minSizeOfXlRunningXacts+4*i:], xid)
 	}
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrStandby, xlogStandbyRunningXacts, 0, body), nil
+	return framedAssemble(RmgrStandby, xlogStandbyRunningXacts, 0, mainData, nil)
 }
 
 // EncodeXLogNextOidPG builds the pre-assembled envelope for an XLOG_NEXTOID
@@ -1391,11 +1315,7 @@ func EncodeRunningXactsPG(nextXid, oldestRunning, latestCompleted uint32, xids [
 func EncodeXLogNextOidPG(nextOID uint32) ([]byte, error) {
 	mainData := make([]byte, 4)
 	binary.LittleEndian.PutUint32(mainData, nextOID)
-	body, err := assembleXLogRecord(mainData, nil)
-	if err != nil {
-		return nil, err
-	}
-	return framePGAssembled(RmgrXLog, xlogXLogNextOid, 0, body), nil
+	return framedAssemble(RmgrXLog, xlogXLogNextOid, 0, mainData, nil)
 }
 
 // DecodeXLogNextOid parses an XLOG_NEXTOID main-data body — a bare Oid

@@ -20,6 +20,41 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 )
 
+// pgAggregateBKIRows renders the constant BKI half of pg_aggregate once and
+// caches it. review/260831 IN-4: this used to run per query — 161 rows x 22
+// columns of Sprintf plus an OID->name lookup each.
+var pgAggregateBKIRows = sync.OnceValue(func() [][]string {
+	bki := pgAggregateInitialEntries()
+	rows := make([][]string, 0, len(bki))
+	for _, e := range bki {
+		rows = append(rows, []string{
+			fmt.Sprintf("%d", e.AggFnOID),
+			string(e.AggKind),
+			fmt.Sprintf("%d", e.AggNumDirectArgs),
+			aggBuiltinFuncName(e.AggTransFn),
+			aggBuiltinFuncName(e.AggFinalFn),
+			aggBuiltinFuncName(e.AggCombineFn),
+			aggBuiltinFuncName(e.AggSerialFn),
+			aggBuiltinFuncName(e.AggDeserialFn),
+			aggBuiltinFuncName(e.AggMTransFn),
+			aggBuiltinFuncName(e.AggMInvTransFn),
+			aggBuiltinFuncName(e.AggMFinalFn),
+			boolToTF(e.AggFinalExtra),
+			boolToTF(e.AggMFinalExtra),
+			string(e.AggFinalModify),
+			string(e.AggMFinalModify),
+			fmt.Sprintf("%d", e.AggSortOp),
+			fmt.Sprintf("%d", e.AggTransType),
+			fmt.Sprintf("%d", e.AggTransSpace),
+			fmt.Sprintf("%d", e.AggMTransType),
+			fmt.Sprintf("%d", e.AggMTransSpace),
+			nullableAggText(e.AggInitVal),
+			nullableAggText(e.AggMInitVal),
+		})
+	}
+	return rows
+})
+
 // registerPgAggregateView installs `pg_catalog.pg_aggregate` as a Virtual
 // table combining the 161 built-in (BKI) aggregate rows with every
 // CREATE AGGREGATE registered in the live catalog.
@@ -32,37 +67,13 @@ func registerPgAggregateView(cat *catalog.InMemory) error {
 		Virtual: true,
 	}
 	tbl.VirtualRows = func() [][]string {
-		bki := pgAggregateInitialEntries()
-		rows := make([][]string, 0, len(bki)+16)
-		for _, e := range bki {
-			rows = append(rows, []string{
-				fmt.Sprintf("%d", e.AggFnOID),
-				string(e.AggKind),
-				fmt.Sprintf("%d", e.AggNumDirectArgs),
-				aggBuiltinFuncName(e.AggTransFn),
-				aggBuiltinFuncName(e.AggFinalFn),
-				aggBuiltinFuncName(e.AggCombineFn),
-				aggBuiltinFuncName(e.AggSerialFn),
-				aggBuiltinFuncName(e.AggDeserialFn),
-				aggBuiltinFuncName(e.AggMTransFn),
-				aggBuiltinFuncName(e.AggMInvTransFn),
-				aggBuiltinFuncName(e.AggMFinalFn),
-				boolToTF(e.AggFinalExtra),
-				boolToTF(e.AggMFinalExtra),
-				string(e.AggFinalModify),
-				string(e.AggMFinalModify),
-				fmt.Sprintf("%d", e.AggSortOp),
-				fmt.Sprintf("%d", e.AggTransType),
-				fmt.Sprintf("%d", e.AggTransSpace),
-				fmt.Sprintf("%d", e.AggMTransType),
-				fmt.Sprintf("%d", e.AggMTransSpace),
-				nullableAggText(e.AggInitVal),
-				nullableAggText(e.AggMInitVal),
-			})
-		}
-		// Append user-defined aggregates (CREATE AGGREGATE). aggkind is always
-		// 'n' (normal) and the moving-aggregate columns are always zero/default
-		// -- goopg parses but discards MSFUNC/MINVFUNC/... (parseAggregateOptions).
+		// review/260831 IN-4: the 161 BKI rows are constant — they used to be
+		// rebuilt (and re-formatted into strings, with an OID->name lookup per
+		// column) on EVERY query against pg_aggregate. They are built once here
+		// and the live CREATE AGGREGATE rows appended per call.
+		bkiRows := pgAggregateBKIRows()
+		rows := make([][]string, 0, len(bkiRows)+16)
+		rows = append(rows, bkiRows...)
 		for _, agg := range cat.ListUserAggregates() {
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", agg.OID),

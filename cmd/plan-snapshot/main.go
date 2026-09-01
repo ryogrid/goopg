@@ -336,11 +336,17 @@ func readSnapshot(path string) (map[string]string, error) {
 	return out, nil
 }
 
-// rowsRegexp captures the `(rows=N)` cost-estimate suffix.
-// Used by structural mode to strip cost annotations before
-// comparison and by semantic-cost mode to extract them for
+// rowsRegexp matches the whole `(cost=A..B rows=N width=W)` estimate
+// annotation EXPLAIN appends to every plan line, capturing the row
+// estimate. Used by structural mode to strip cost annotations before
+// comparison and by semantic-cost mode to extract them for the
 // tolerance check.
-var rowsRegexp = regexp.MustCompile(`\s*\(rows=(\d+)\)`)
+//
+// review/260831-2 CM-3: this used to be `\s*\(rows=(\d+)\)`, a shape
+// EXPLAIN never emits — nothing was ever stripped or extracted, so
+// `structural` silently behaved exactly like `strict-text` and
+// `semantic-cost` compared two empty cost lists.
+var rowsRegexp = regexp.MustCompile(`\s*\(cost=[0-9.]+\.\.[0-9.]+ rows=(\d+) width=\d+\)`)
 
 // planEqual compares two EXPLAIN texts under the chosen mode.
 // (M0076-0006.)

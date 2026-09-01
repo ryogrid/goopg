@@ -336,6 +336,26 @@ func tryFoldUnaryOp(pos int, op parser.OpCode, operand Expr) Expr {
 	return nil
 }
 
+// isNullConstExpr reports whether an already-folded expression is the NULL
+// constant, seeing through the casts a typed NULL literal (`NULL::int`) leaves
+// behind. (review/260831-2 OP2-1)
+// Written with type assertions rather than a type switch on purpose: this is
+// not a traversal over Expr, so it is not a member of the RC-1a walker class
+// exprwalk_inventory_test.go pins (same resolution the *ColumnRef filters in
+// bushy.go took).
+func isNullConstExpr(e Expr) bool {
+	for {
+		if _, ok := e.(*NullConst); ok {
+			return true
+		}
+		cast, ok := e.(*CastExpr)
+		if !ok {
+			return false
+		}
+		e = cast.Operand
+	}
+}
+
 // foldCaseExpr folds a CASE expression.
 // Constant WHEN conditions are evaluated at plan time:
 //   - WHEN FALSE → branch and its THEN are dropped (THEN is NOT folded)
@@ -373,6 +393,20 @@ func foldCaseExpr(x *CaseExpr) Expr {
 		// If both the operand and the WHEN value are literals, compare them now
 		// to skip dead branches without folding their THEN body.
 		if operand != nil {
+			// A NULL operand makes EVERY branch dead: `CASE NULL WHEN x` tests
+			// `NULL = x`, which is NULL, never true, for any x (including
+			// `WHEN NULL`). toLiteralValue does not cover *NullConst, so
+			// without this arm the shortcut below was skipped and every THEN
+			// was folded as "potentially reachable" — turning
+			// `CASE NULL::int WHEN 1 THEN 1/0 ELSE 42 END` into a plan-time
+			// 22012 where PG returns 42. PG reaches the same outcome from the
+			// other side: eval_const_expressions_mutator only takes the
+			// constant-CASE path for a non-null Const arg
+			// (postgres/src/backend/optimizer/util/clauses.c) and otherwise
+			// leaves the dead THEN unevaluated. (review/260831-2 OP2-1)
+			if isNullConstExpr(operand) {
+				continue
+			}
 			if opLit, opOk := toLiteralValue(operand); opOk {
 				if whenLit, wOk := toLiteralValue(cond); wOk {
 					cmp, cerr := litCompare(opLit, whenLit)

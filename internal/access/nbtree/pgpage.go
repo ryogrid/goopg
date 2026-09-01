@@ -1,6 +1,7 @@
 package nbtree
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -68,7 +69,15 @@ func PGFirstDataKey(op PGBTPageOpaque) uint16 {
 // an opaque through every accessor eventually threads a STALE one, and a stale
 // rightmost bit silently shifts every subsequent read by one slot.
 func pgFirstDataSlot(p storage.Page) uint16 {
-	return PGFirstDataKey(ReadPGOpaque(p))
+	// review/260831 NB-4: read just btpo_next rather than decoding the whole
+	// 16-byte opaque (five little-endian loads) to answer one comparison. The
+	// accessors below call this per item, inside page loops. P_RIGHTMOST is
+	// exactly `btpo_next == P_NONE` (PGBTPageOpaque.IsRightmost).
+	next := storage.BlockNumber(binary.LittleEndian.Uint32(p[pgSpecialOffset+4 : pgSpecialOffset+8]))
+	if next == PNone {
+		return PHiKey
+	}
+	return PFirstKey
 }
 
 // pgDataSlot maps a 1-based data-item slot to its physical line-pointer slot.

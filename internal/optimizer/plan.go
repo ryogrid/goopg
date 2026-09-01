@@ -549,6 +549,24 @@ type CastExpr struct {
 func (e *CastExpr) Pos() int { return e.pos }
 func (*CastExpr) exprNode()  {}
 
+// NewCastExprFromParser builds the resolved CastExpr for a parser-level cast
+// whose operand has already been lowered by a caller OUTSIDE this package —
+// today PL/pgSQL expression lowering in executor/plpgsql_runtime.go, which
+// cannot reach exprType/encodeTypmod. review/260831-2 ES-7: that lowerer used
+// to return the bare operand for `*parser.CastExpr`, silently DROPPING every
+// cast written inside a PL/pgSQL expression (`i::text`, `n::numeric`), so the
+// expression evaluated at the operand's own type.
+func NewCastExprFromParser(x *parser.CastExpr, operand Expr) *CastExpr {
+	typeName := strings.ToLower(x.Type.Name)
+	return &CastExpr{
+		pos:        x.Pos(),
+		Operand:    operand,
+		TargetType: typeName,
+		SourceType: exprType(operand).Name,
+		Typmod:     encodeTypmod(typeName, x.Typmods),
+	}
+}
+
 // RowExpr is a resolved row constructor `(a, b, c)`. At evaluation time it
 // produces a text composite representation `(v1,v2,...,vN)`. Used for
 // whole-row variable refs and row-constructor IN comparisons. M0097-0020.
@@ -923,6 +941,15 @@ type IndexOnlyScan struct {
 	Keys    []Expr
 	LowKey  Expr
 	HighKey Expr
+	// LowOp / HighOp mirror IndexScan's fields of the same name: the bound's
+	// strictness. `OpGt` (low) / `OpLt` (high) make that end of the range
+	// EXCLUSIVE; the zero value `OpUnknown` — what every producer other than
+	// the IndexScan promotion leaves — means inclusive, which is the only
+	// shape those producers build. Before M0134-0001's class-8 gap was closed
+	// the executor could not express exclusivity at all, so the promotion
+	// refused strict-bound scans outright.
+	LowOp   parser.OpCode
+	HighOp  parser.OpCode
 	// Covered is the slice of catalog.Column entries that the output schema
 	// contains (a subset of Index.Columns, in projection order).
 	Covered []catalog.Column
@@ -2350,9 +2377,13 @@ func (n *Utility) Output() Schema {
 	switch stmt := n.Stmt.(type) {
 	case *parser.ShowStmt:
 		if stmt.All {
+			// PG: `SHOW ALL` is name/setting/description (guc.c
+			// ShowAllGUCConfig) — the third column was missing
+			// (review/260831-2 EO2-8).
 			return Schema{
 				{Name: "name", Type: catalog.Type{Name: "text"}},
 				{Name: "setting", Type: catalog.Type{Name: "text"}},
+				{Name: "description", Type: catalog.Type{Name: "text"}},
 			}
 		}
 		return Schema{{Name: stmt.Name, Type: catalog.Type{Name: "text"}}}

@@ -159,6 +159,21 @@ func (v *Variable) canonicalize(value string) (string, error) {
 	return v.canonicalizeFrom(v.Value, value)
 }
 
+// realNumericPrefixLen returns the length of the longest prefix of s that
+// parses as a float, i.e. what strtod() would consume — the rest is the unit
+// suffix. review/260831-2 UT-2: the previous scan accepted only sign/digit/dot,
+// so scientific notation split in the wrong place ("1e-2" → number "1", suffix
+// "e-2") and the bogus suffix was then silently DROPPED for unitless GUCs,
+// storing 1 where PG (parse_real -> strtod) stores 0.01.
+func realNumericPrefixLen(s string) int {
+	for i := len(s); i > 0; i-- {
+		if _, err := strconv.ParseFloat(strings.TrimSpace(s[:i]), 64); err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
 // canonicalizeFrom is canonicalize with an explicit current-value
 // baseline. DateStyle is the only GUC whose canonical form depends on it
 // (a partial spec like "SET datestyle = 'SQL'" must keep the existing
@@ -192,15 +207,7 @@ func (v *Variable) canonicalizeFrom(current, value string) (string, error) {
 		// Strip leading/trailing whitespace and attempt to separate numeric
 		// part from unit suffix (e.g. "900us" → 900, "us").
 		trimmed := strings.TrimSpace(value)
-		numEnd := 0
-		for numEnd < len(trimmed) {
-			c := trimmed[numEnd]
-			if c == '+' || c == '-' || c == '.' || (c >= '0' && c <= '9') {
-				numEnd++
-			} else {
-				break
-			}
-		}
+		numEnd := realNumericPrefixLen(trimmed)
 		suffix := strings.TrimSpace(strings.ToLower(trimmed[numEnd:]))
 		numStr := strings.TrimSpace(trimmed[:numEnd])
 		if numStr == "" {
@@ -823,14 +830,29 @@ func convertUnit(n int64, from, to Unit) (int64, error) {
 		if !ok {
 			return 0, fmt.Errorf("cannot convert byte unit to time unit")
 		}
-		return n * fb / tb, nil
+		return scaleUnit(n, fb, tb)
 	}
 	if ft, ok := timeFamily(from); ok {
 		tt, ok := timeFamily(to)
 		if !ok {
 			return 0, fmt.Errorf("cannot convert time unit to byte unit")
 		}
-		return n * ft / tt, nil
+		return scaleUnit(n, ft, tt)
 	}
 	return 0, fmt.Errorf("unconvertible unit pair (%v -> %v)", from, to)
+}
+
+// scaleUnit computes n*mul/div with an overflow check. The bare `n * mul / div`
+// it replaces wrapped silently, so `SET work_mem = '9000000TB'` stored a
+// wrapped (often negative, sometimes in-range and therefore ACCEPTED) value
+// instead of being rejected. PG's convert_to_base_unit uses
+// pg_mul_s64_overflow for exactly this and reports `invalid value for
+// parameter … HINT: Value exceeds integer range.` (review/260831-2 UT-3).
+func scaleUnit(n, mul, div int64) (int64, error) {
+	if mul != 0 {
+		if p := n * mul; p/mul != n {
+			return 0, errors.New("value exceeds integer range")
+		}
+	}
+	return n * mul / div, nil
 }

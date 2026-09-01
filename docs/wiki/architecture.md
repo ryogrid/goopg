@@ -5,8 +5,8 @@ goopg is a single Go process (no fork-per-backend like PostgreSQL). The
 `internal/postmaster`, which accepts TCP connections and runs **one goroutine
 per client connection** — each goroutine is the analogue of one PostgreSQL
 backend process, owning its own MVCC transaction, snapshot, pinned buffers, and
-WAL inserts. SQL flows through four stages in turn: parse (`internal/parser`,
-out of scope here), plan (`internal/optimizer`), execute (`internal/executor`),
+WAL inserts. SQL flows through four stages in turn: parse (`internal/parser`),
+plan (`internal/optimizer`), execute (`internal/executor`),
 and access storage through the buffer pool (`internal/storage`).
 
 The data directory is the durable substrate. `internal/initdb` writes it from
@@ -40,13 +40,13 @@ referenced for context.
 
 ```mermaid
 flowchart TD
-    Client([Client: psql / pgbench / standby]) -->|"v3 wire protocol"| SRV[postmaster: Server + serveConn]
+Client([Client: psql / pgbench / standby]) -->|'v3 wire protocol'| SRV[postmaster: Server + serveConn]
     SRV --> PARSE[parser: Parse]
     PARSE --> PLAN[optimizer: Plan]
     PLAN --> EXEC[executor: BuildFastIterator]
     EXEC --> POOL[storage: Pool]
     POOL --> SMGR[storage: Manager]
-    SMGR --> DISK[(data directory)]
+    SMGR --> DISK["(data directory)"]
 
     EXEC -->|WAL emit| WAL[xlog: Writer]
     WAL --> CKPT[checkpointer]
@@ -55,7 +55,7 @@ flowchart TD
     SRV --> WALSND[replication: walsender]
     WALSND -->|"physical + logical stream"| WALRCV[replication: walreceiver / logicalreceiver]
 
-    IDB[initdb: Init / Open] -->|"Runtime: Pool + TxnMgr + Catalog + WAL"| SRV
+IDB[initdb: Init / Open] -->|'Runtime: Pool + TxnMgr + Catalog + WAL'| SRV
     CMD[cmd/goopg] --> IDB
     CMD --> SRV
 
@@ -64,16 +64,16 @@ flowchart TD
 ```
 
 > `parser`, `xlog`, and the checkpointer are documented at this architectural
-> level but are **out of scope** for this wiki's per-module pages.
+> level but are documented in the [Module Map](README.md#module-map) of this wiki.
 
 ## Data Flow
 
 1. **Connect** — `postmaster.Run` → `acceptLoop` → `serveConn` per connection
    (`internal/postmaster/server.go`).
-2. **Parse** — `parser.Parse` (`internal/postmaster/dispatch.go:127`).
-3. **Plan** — `optimizer.Plan(stmt, catalog)` (`internal/postmaster/dispatch.go:1095`).
+2. **Parse** — `parser.Parse` (`internal/postmaster/dispatch.go:166`).
+3. **Plan** — `optimizer.Plan(stmt, catalog)` (`internal/postmaster/dispatch.go:1161`).
 4. **Execute** — `executor.BuildFastIterator(node)` → `Open`/`Next`/`Close`
-   (`internal/postmaster/dispatch.go:2964`).
+   (`internal/postmaster/dispatch.go:3398`).
 5. **Access storage** — operators pin pages through `storage.Pool.Pin` and read
    through `storage.Manager.ReadBlock`; heap writes go through
    `storage.PageAddHeapTuple`/`PageSetHeapTupleXmax`.

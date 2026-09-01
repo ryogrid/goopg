@@ -71,7 +71,12 @@ var ErrMultipleUpdaters = errors.New("multixact: new multixact has more than one
 // Store is safe for concurrent use: the hot path that will eventually wire it in
 // (stampLockInner) is concurrent.
 type Store struct {
-	mu    sync.Mutex
+	// mu is an RWMutex because Members and Next are pure reads on a per-row
+	// path (every tuple whose xmax is a MultiXactId resolves its members),
+	// while creation is rare. review/260831 TA-8: they used to take the
+	// exclusive lock and serialise every backend's row-lock checks against
+	// each other.
+	mu    sync.RWMutex
 	next  MultiXactId
 	byID  map[MultiXactId][]Member
 	bySet map[string]MultiXactId
@@ -99,8 +104,8 @@ func NewStoreAt(next MultiXactId) *Store {
 // Next reports the MultiXactId that will be assigned to the next freshly-created
 // set (analogous to pg_control's nextMXact). A re-used set does not advance it.
 func (s *Store) Next() MultiXactId {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.next
 }
 
@@ -110,8 +115,8 @@ func (s *Store) Next() MultiXactId {
 // slice is a copy: mutating it does not affect the store, and the stored set
 // stays immutable.
 func (s *Store) Members(multi MultiXactId) (members []Member, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	ms, found := s.byID[multi]
 	if !found {
 		return nil, false

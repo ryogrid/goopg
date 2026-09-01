@@ -461,3 +461,30 @@ func parseSingleExpr(t *testing.T, expr string) (Expr, error) {
 	}
 	return resolved, nil
 }
+
+// TestFoldSimpleCaseNullOperandSuppressesDivisionByZero pins the NULL-operand
+// case: `CASE NULL::int WHEN 1 THEN 1/0 WHEN 2 THEN 2/0 ELSE 42 END` tests
+// `NULL = 1` / `NULL = 2`, which are NULL, so every THEN is dead and PG 18.3
+// returns 42 (verified against the oracle). Before review/260831-2 OP2-1 the
+// simple-CASE shortcut was skipped for a NULL operand — toLiteralValue does not
+// cover *NullConst — and both dead THEN bodies were folded, raising a plan-time
+// division by zero.
+func TestFoldSimpleCaseNullOperandSuppressesDivisionByZero(t *testing.T) {
+	for _, sql := range []string{
+		"CASE NULL::int WHEN 1 THEN 1/0 WHEN 2 THEN 2/0 ELSE 42 END",
+		"CASE NULL WHEN 1 THEN 1/0 ELSE 42 END",
+	} {
+		e, err := parseSingleExpr(t, sql)
+		if err != nil {
+			t.Fatalf("parseSingleExpr(%q): %v", sql, err)
+		}
+		folded := FoldConstants(e) // must NOT panic
+		ic, ok := folded.(*IntegerConst)
+		if !ok {
+			t.Fatalf("%s: want *IntegerConst(42), got %T", sql, folded)
+		}
+		if ic.Value != 42 {
+			t.Errorf("%s: got %d, want 42", sql, ic.Value)
+		}
+	}
+}

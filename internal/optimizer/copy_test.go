@@ -235,6 +235,11 @@ func TestPlanCopyIncorrectOptions(t *testing.T) {
 		{"COPY pgbench_accounts FROM STDIN (log_verbosity unsupported)", "COPY LOG_VERBOSITY \"unsupported\" not recognized"},
 		{"COPY pgbench_accounts FROM STDIN with (reject_limit 1)", "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE"},
 		{"COPY pgbench_accounts FROM STDIN with (on_error ignore, reject_limit 0)", "REJECT_LIMIT (0) must be greater than zero"},
+		// An EXPLICIT `ON_ERROR stop` is rejected exactly like an omitted
+		// ON_ERROR: PG's test is `!opts_out->on_error` and COPY_ON_ERROR_STOP
+		// is the zero value, so only IGNORE licenses REJECT_LIMIT. Verified
+		// against PG 18.3. (review/260831-2 OP1-1)
+		{"COPY pgbench_accounts FROM STDIN with (on_error stop, reject_limit 5)", "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE"},
 	}
 	for _, tc := range cases {
 		_, err := Plan(parseOne(t, tc.sql), cat)

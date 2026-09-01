@@ -236,7 +236,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// selectivity.go:isConstExpr.
 	"planner.go:isPlainConstantBound":            nonRecursiveClassifier,
 	"planner.go:planHasEscapingOuterRef":         walkerPending, // 6 of 32 arms
-	"planner.go:planIndexScanFromWhere":          nonRecursiveClassifier,
+	// Renamed by review/260831-2 X-8: the hand-written switch moved into
+	// planIndexScanFromWhereShape; planIndexScanFromWhere is now the thin
+	// wrapper that applies the enable_indexscan/indexonlyscan toggles.
+	"planner.go:planIndexScanFromWhereShape":     nonRecursiveClassifier,
 	"planner.go:remapColumnRefsToSchema":         walkerPending, // 13 of 32 arms
 	"planner.go:replaceExprNode":                 walkerPending, // 6 of 32 arms
 	"planner.go:shiftColumnRefsBy":               walkerPending, // 13 of 32 arms

@@ -655,6 +655,26 @@ func indexPersistence(idx *catalog.Index) string {
 	return "p"
 }
 
+// indexRelamOID resolves pg_class.relam for a user index. A `USING hash`
+// index is architecturally built on the B-tree substrate (idx.Method stays
+// "btree", idx.DeclaredHash records the original clause — see
+// catalog.IndexAMCapabilityByName's doc comment) so it deliberately keeps
+// reporting btree's oid here too. gist/gin/spgist/brin indexes are
+// catalog-only under their real Method string (no B-tree substrate
+// involved), so relam must resolve from it — mirrors the fix to catalog.go's
+// virtual pg_class builder (M0119-0006: pg_class.relam was defaulting every
+// non-hash non-btree method to btree's oid, which made pg_amcheck's own
+// `c.relam = BTREE_AM_OID` index-enumeration query wrongly match them).
+func indexRelamOID(idx *catalog.Index) int64 {
+	if idx == nil || idx.DeclaredHash {
+		return pgBTreeAccessMethodOID
+	}
+	if amOID := catalog.AccessMethodOIDByName(idx.Method); amOID != 0 {
+		return int64(amOID)
+	}
+	return pgBTreeAccessMethodOID
+}
+
 // buildUserPGClassRowForIndex constructs the 34-column PG18-canonical
 // pg_class row for a user-defined index.
 func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
@@ -676,7 +696,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewIntDatum(0),                        // reltype
 		NewIntDatum(0),                        // reloftype
 		NewIntDatum(bootstrapSuperuserOID),    // relowner
-		NewIntDatum(pgBTreeAccessMethodOID),   // relam
+		NewIntDatum(indexRelamOID(idx)),       // relam
 		NewIntDatum(int64(idx.OID)),           // relfilenode
 		NewIntDatum(int64(idx.Tablespace)),    // reltablespace (0 = default; explicit CREATE/ALTER INDEX ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                        // relpages
@@ -1217,6 +1237,16 @@ func pgAttTypmod(typOID uint32, args []int64) int64 {
 		}
 	case 1560, 1562: // bit(n) / bit varying(n): the raw bit length, no VARHDRSZ
 		// (anybit_typmodin stores the length directly).
+		if len(args) >= 1 {
+			return args[0]
+		}
+	case 1083, 1266, 1114, 1184: // time / timetz / timestamp / timestamptz:
+		// the fractional-seconds precision, stored raw
+		// (anytime_typmodin / anytimestamp_typmodin return `p` itself, with no
+		// VARHDRSZ offset). Without these arms `time(3)` and `timestamp(2)`
+		// reported atttypmod -1 where PG 18.3 reports 3 and 2, which loses the
+		// precision on any client that reconstructs the type from the catalog
+		// — pg_dump included (review/260831-2, found while checking ES-4).
 		if len(args) >= 1 {
 			return args[0]
 		}

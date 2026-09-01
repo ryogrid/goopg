@@ -40,6 +40,19 @@ const (
 	// maxOffset is the largest back-reference distance the 12-bit offset
 	// field can encode.
 	maxOffset = 4095
+	// histSize is PGLZ_HISTORY_SIZE (pg_lzcompress.c): the number of hash
+	// buckets and, equivalently, the size of the position ring the match
+	// search walks. It is one more than maxOffset, so a ring slot can only be
+	// overwritten by a position that is already out of encodable range.
+	histSize = 4096
+	histMask = histSize - 1
+	// goodMatch / goodDrop are upstream's default strategy knobs
+	// (strategy_default_data): stop the history walk once a match this long is
+	// found, and lower that bar by this percentage per visited candidate. They
+	// bound the chain walk without which a highly repetitive input degenerates
+	// to the old brute-force cost.
+	goodMatch = 128
+	goodDrop  = 10
 )
 
 // extSizeMask is VARLENA_EXTSIZE_MASK: the low 30 bits of va_tcinfo hold the
@@ -52,17 +65,42 @@ const extSizeMask = (uint32(1) << 30) - 1
 // PostgreSQL's pglz_decompress as well as by Decompress. Returns nil for empty
 // input.
 //
-// This is a greedy longest-match compressor over a 4095-byte window.
-// PostgreSQL uses a hash-chain matcher with additional good_match heuristics,
-// so its byte output for the same input may differ; that is fine, because any
-// valid PGLZ token stream round-trips through either implementation's
-// decompressor regardless of the encoder's match choices.
+// This is a greedy longest-match compressor over a 4095-byte window, using the
+// same hash-chain matcher as PostgreSQL (pg_lzcompress.c pglz_find_match plus
+// the default strategy's good_match/good_drop bounds). Its byte output for the
+// same input may still differ from upstream's; that is fine, because any valid
+// PGLZ token stream round-trips through either implementation's decompressor
+// regardless of the encoder's match choices.
+//
+// review/260831 NB-17: the match search used to scan all 4095 history offsets
+// per input byte, comparing up to 273 bytes each — ~1.1M comparisons per byte
+// in the worst case, i.e. quadratic in the value size on the TOAST write path.
+// The hash chain visits only positions whose next four bytes hash equal.
 func Compress(data []byte) []byte {
 	n := len(data)
 	if n == 0 {
 		return nil
 	}
 	out := make([]byte, 0, n/2+64)
+	// head[h] is the most recent position whose four bytes hash to h, and
+	// ring[pos&histMask] is the position before that one with the same hash —
+	// upstream's hist_start[] / doubly-linked hist_entries[], flattened. A slot
+	// is only reused after histSize further positions, by which point the old
+	// occupant is out of the 12-bit offset range anyway, so no explicit
+	// recycling is needed. -1 marks "no entry".
+	var head [histSize]int32
+	for h := range head {
+		head[h] = -1
+	}
+	ring := make([]int32, histSize)
+	for k := range ring {
+		ring[k] = -1
+	}
+	addPos := func(pos int) {
+		h := histIdx(data, pos, n)
+		ring[pos&histMask] = head[h]
+		head[h] = int32(pos)
+	}
 	i := 0
 	for i < n {
 		ctrlIdx := len(out)
@@ -71,27 +109,38 @@ func Compress(data []byte) []byte {
 		for bit := uint(0); bit < 8 && i < n; bit++ {
 			bestLen, bestOff := 0, 0
 
-			maxOff := i
-			if maxOff > maxOffset {
-				maxOff = maxOffset
-			}
 			maxLen := n - i
 			if maxLen > maxMatchLen {
 				maxLen = maxMatchLen
 			}
-			// Search the history window [i-maxOff, i-1] for the longest match.
-			for off := 1; off <= maxOff; off++ {
-				src := i - off
+			// Walk this position's hash chain newest-first, exactly as
+			// pglz_find_match does, stopping at the first candidate that has
+			// fallen out of offset range (the chain is ordered by position, so
+			// everything past it is out of range too).
+			bar := goodMatch
+			for cand := head[histIdx(data, i, n)]; cand >= 0; cand = ring[int(cand)&histMask] {
+				off := i - int(cand)
+				if off > maxOffset {
+					break
+				}
 				l := 0
-				for l < maxLen && data[src+l] == data[i+l] {
+				for l < maxLen && data[int(cand)+l] == data[i+l] {
 					l++
 				}
-				if l >= minMatchLen && l > bestLen {
+				if l > bestLen {
 					bestLen, bestOff = l, off
 					if bestLen == maxLen {
 						break
 					}
 				}
+				// Be happy with lesser matches the deeper we walk.
+				if bestLen >= bar {
+					break
+				}
+				bar -= bar * goodDrop / 100
+			}
+			if bestLen < minMatchLen {
+				bestLen, bestOff = 0, 0
 			}
 
 			if bestLen >= minMatchLen {
@@ -109,16 +158,29 @@ func Compress(data []byte) []byte {
 					// extension byte carrying (len-18).
 					out = append(out, 0x0f|offHi, byte(bestOff&0xFF), byte(bestLen-18))
 				}
+				for k := 0; k < bestLen; k++ {
+					addPos(i + k)
+				}
 				i += bestLen
 			} else {
 				// Literal: control bit CLEAR (0); copy one byte verbatim.
 				out = append(out, data[i])
+				addPos(i)
 				i++
 			}
 		}
 		out[ctrlIdx] = ctrl
 	}
 	return out
+}
+
+// histIdx is pglz_hist_idx: the hash of the four bytes starting at pos, or of
+// the single byte at pos when fewer than four remain.
+func histIdx(data []byte, pos, end int) int {
+	if end-pos < 4 {
+		return int(data[pos]) & histMask
+	}
+	return (int(data[pos])<<6 ^ int(data[pos+1])<<4 ^ int(data[pos+2])<<2 ^ int(data[pos+3])) & histMask
 }
 
 // Decompress decodes a raw PGLZ token stream into exactly rawSize bytes. It
@@ -161,12 +223,17 @@ func Decompress(src []byte, rawSize int) ([]byte, error) {
 				if remaining := rawSize - len(dst); length > remaining {
 					length = remaining
 				}
-				// Byte-by-byte copy so an off<length match performs the
-				// intended run-length expansion (dst is pre-sized to rawSize,
-				// so append never reallocates here).
+				// review/260831 NB-18: only an overlapping match (off <
+				// length) needs the byte-at-a-time run-length expansion; the
+				// common non-overlapping case is one copy. dst is pre-sized to
+				// rawSize, so neither branch reallocates.
 				start := len(dst) - off
-				for k := 0; k < length; k++ {
-					dst = append(dst, dst[start+k])
+				if off >= length {
+					dst = append(dst, dst[start:start+length]...)
+				} else {
+					for k := 0; k < length; k++ {
+						dst = append(dst, dst[start+k])
+					}
 				}
 			} else {
 				dst = append(dst, src[sp])

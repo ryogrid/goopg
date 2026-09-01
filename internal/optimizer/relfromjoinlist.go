@@ -363,10 +363,19 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
 	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
 	s.addBaseRelIndexPaths(prob.cat)
-	if _, err := s.joinSearch(s.clauses, newJoinRelBuilder(s, prob.cat)); err != nil {
-		return joinlistRel{}, err
-	}
-	p, err := s.finalPath()
+	// GEQO: when the query has >= geqo_threshold base relations and geqo is
+	// enabled, use the genetic query optimizer instead of the DP search.
+	builder := newJoinRelBuilder(s, prob.cat)
+	p, err := func() (*Path, error) {
+		if GeqoEnabled() && len(items) >= GeqoThreshold() {
+			s.builder = builder
+			return geqoSearch(s, builder, 5)
+		}
+		if _, err := s.joinSearch(s.clauses, builder); err != nil {
+			return nil, err
+		}
+		return s.finalPath()
+	}()
 	if err != nil {
 		return joinlistRel{}, err
 	}

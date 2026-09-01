@@ -2,6 +2,7 @@ package misc
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -135,8 +136,77 @@ func FormatDate(t time.Time, style, order string) string {
 	case "German":
 		return t.Format("02.01.2006") + era
 	default:
-		return t.Format("2006-01-02") + era
+		// review/260831 UT-9: ISO is the default DateStyle and therefore the
+		// shape almost every result row is rendered in, so it does not go
+		// through time.Format (which builds its own buffer and then a string)
+		// plus a concatenation. isoDate writes the digits into a stack buffer
+		// and allocates exactly the returned string.
+		return isoDate(t, era)
 	}
+}
+
+// appendPad2 appends v as at least two digits ("07", "42", "123"), the way
+// %02d prints it.
+func appendPad2(dst []byte, v int) []byte {
+	if v < 0 {
+		dst = append(dst, '-')
+		v = -v
+	}
+	if v < 10 {
+		return append(dst, '0', byte('0'+v))
+	}
+	if v < 100 {
+		return append(dst, byte('0'+v/10), byte('0'+v%10))
+	}
+	return strconv.AppendInt(dst, int64(v), 10)
+}
+
+// appendYear4 appends the year as at least four digits ("0001", "2020",
+// "294276"), the way %04d prints it. The value is the DISPLAY year, so it is
+// already positive (eraDisplay has mapped year 0 to "1 BC").
+func appendYear4(dst []byte, y int) []byte {
+	if y < 0 {
+		dst = append(dst, '-')
+		y = -y
+	}
+	if y < 10000 {
+		return append(dst, byte('0'+y/1000%10), byte('0'+y/100%10),
+			byte('0'+y/10%10), byte('0'+y%10))
+	}
+	return strconv.AppendInt(dst, int64(y), 10)
+}
+
+// isoDate renders "YYYY-MM-DD" + era.
+func isoDate(t time.Time, era string) string {
+	y, mo, d := t.Date()
+	var b [32]byte
+	buf := appendYear4(b[:0], y)
+	buf = append(buf, '-')
+	buf = appendPad2(buf, int(mo))
+	buf = append(buf, '-')
+	buf = appendPad2(buf, d)
+	buf = append(buf, era...)
+	return string(buf)
+}
+
+// isoTimestamp renders "YYYY-MM-DD HH:MM:SS" + frac.
+func isoTimestamp(t time.Time, frac string) string {
+	y, mo, d := t.Date()
+	hh, mi, ss := t.Clock()
+	var b [48]byte
+	buf := appendYear4(b[:0], y)
+	buf = append(buf, '-')
+	buf = appendPad2(buf, int(mo))
+	buf = append(buf, '-')
+	buf = appendPad2(buf, d)
+	buf = append(buf, ' ')
+	buf = appendPad2(buf, hh)
+	buf = append(buf, ':')
+	buf = appendPad2(buf, mi)
+	buf = append(buf, ':')
+	buf = appendPad2(buf, ss)
+	buf = append(buf, frac...)
+	return string(buf)
 }
 
 // eraDisplay converts a stored (astronomical) instant into the pair every
@@ -230,6 +300,7 @@ func formatTimestampBody(t time.Time, style, order string) (body, era string) {
 	case "German":
 		return disp.Format("02.01.2006 15:04:05") + frac, era
 	default:
-		return disp.Format("2006-01-02 15:04:05") + frac, era
+		// review/260831 UT-9: the ISO default, see isoDate.
+		return isoTimestamp(disp, frac), era
 	}
 }

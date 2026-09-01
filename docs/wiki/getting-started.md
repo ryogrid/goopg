@@ -132,5 +132,5 @@ scope with `systemctl --user stop <unit>.scope`.
 
 - [architecture.md](architecture.md) — system shape and data flow.
 - [README.md](README.md#module-map) — module map with one-line purposes.
-- `modules/*.md` — per-module deep-dives for the six core engine packages and
-  the `cmd/goopg` entry point.
+- `modules/*.md` — per-module deep-dives for every engine package, from
+  `internal/parser` through `internal/storage` and `internal/replication`.

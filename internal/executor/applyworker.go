@@ -92,6 +92,14 @@ type ApplyWorker struct {
 type applyRel struct {
 	remote *xlog.DecodedRelation
 	local  *catalog.Table
+	// localIdx maps each REMOTE attribute to its position in the local
+	// table's column list, and claimed marks the local columns some remote
+	// attribute names. review/260831 EC-3: both used to be rebuilt from the
+	// column NAMES for every replicated row; they depend only on the pair of
+	// column lists, which is fixed until the next Relation message replaces
+	// this entry.
+	localIdx []int
+	claimed  []bool
 }
 
 // NewApplyWorker wires an apply worker to local storage handles.
@@ -262,7 +270,7 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 			return nil
 		}
 	}
-	row, unchanged, missing, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	row, unchanged, missing, err := r.decodeTuple(m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode insert tuple for %q: %w", r.local.Name, err)
 	}
@@ -325,7 +333,7 @@ func (w *ApplyWorker) applyDelete(m *xlog.DecodedMessage) error {
 	if len(m.OldTuple) == 0 {
 		return nil
 	}
-	keyRow, _, _, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+	keyRow, _, _, err := r.decodeTuple(m.OldTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode delete old-tuple for %q: %w", r.local.Name, err)
 	}
@@ -346,7 +354,7 @@ func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 		return fmt.Errorf("applyworker: UPDATE for relation %s.%s has no local table",
 			r.remote.Schema, r.remote.Name)
 	}
-	newRow, newUnchanged, newMissing, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	newRow, newUnchanged, newMissing, err := r.decodeTuple(m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode update new-tuple for %q: %w", r.local.Name, err)
 	}
@@ -368,7 +376,7 @@ func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 		// become NullDatum wildcards in the key — those columns
 		// never exist on the publisher side so they can't
 		// participate in row-locator matching.
-		oldKeyRow, _, _, err = decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+		oldKeyRow, _, _, err = r.decodeTuple(m.OldTuple)
 		if err != nil {
 			return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
 		}
@@ -850,19 +858,17 @@ func (w *ApplyWorker) promoteSyncedRels(commitLSN uint64) {
 // ignore the mask — the NullDatum + rowMatchesKey's
 // "skip NULL key cells" semantics yield correct behaviour
 // for OldTuple/key-row use cases.
-func decodePgoutputTupleAsRow(remoteCols []xlog.DecodedAttr, localCols []catalog.Column, tup []xlog.DecodedColumn) (Row, []bool, []bool, error) {
-	if len(tup) != len(remoteCols) {
-		return nil, nil, nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
-	}
-	// Build remote-ordinal → local-ordinal map by column name. PG's
-	// apply worker resolves attributes by name (not by position) so
-	// that subscriber DDL can carry the columns in a different order
-	// or add extra columns the publisher doesn't have. Both sides
-	// emit catalog-normalised lowercase names — for unquoted DDL the
-	// names match directly; quoted-identifier mismatches surface as
-	// the explicit error below. claimed[j] tracks which local columns
-	// were referenced by some remote attribute; the unclaimed positions
-	// are subscriber-extra (M0103-0007 rung 11).
+// pgoutputColumnMap resolves each remote attribute to its local column
+// position by NAME — PG's apply worker resolves attributes by name, not by
+// position, so subscriber DDL may order the columns differently or add columns
+// the publisher does not have. Both sides emit catalog-normalised lowercase
+// names; a quoted-identifier mismatch surfaces as the error below. claimed[j]
+// marks the local columns some remote attribute names; the unclaimed positions
+// are subscriber-extra (M0103-0007 rung 11).
+// review/260831 EC-3: this is the part of the tuple decode that depends only on
+// the two column lists, lifted out so an apply relation can resolve it once
+// (see applyRel.columnMap) instead of once per replicated row.
+func pgoutputColumnMap(remoteCols []xlog.DecodedAttr, localCols []catalog.Column) ([]int, []bool, error) {
 	localIdx := make([]int, len(remoteCols))
 	claimed := make([]bool, len(localCols))
 	for i, rc := range remoteCols {
@@ -874,10 +880,50 @@ func decodePgoutputTupleAsRow(remoteCols []xlog.DecodedAttr, localCols []catalog
 			}
 		}
 		if found < 0 {
-			return nil, nil, nil, fmt.Errorf("remote col %q has no matching local column", rc.Name)
+			return nil, nil, fmt.Errorf("remote col %q has no matching local column", rc.Name)
 		}
 		localIdx[i] = found
 		claimed[found] = true
+	}
+	return localIdx, claimed, nil
+}
+
+// decodeTuple decodes one replicated tuple against this relation, using the
+// cached column map. review/260831 EC-3.
+func (r *applyRel) decodeTuple(tup []xlog.DecodedColumn) (Row, []bool, []bool, error) {
+	localIdx, claimed, err := r.columnMap()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return decodePgoutputTupleAsRowWith(localIdx, claimed, r.remote.Columns, r.local.Columns, tup)
+}
+
+// columnMap returns this relation's cached remote->local column map, resolving
+// it on first use. review/260831 EC-3.
+func (r *applyRel) columnMap() ([]int, []bool, error) {
+	if r.localIdx == nil {
+		idx, claimed, err := pgoutputColumnMap(r.remote.Columns, r.local.Columns)
+		if err != nil {
+			return nil, nil, err
+		}
+		r.localIdx, r.claimed = idx, claimed
+	}
+	return r.localIdx, r.claimed, nil
+}
+
+func decodePgoutputTupleAsRow(remoteCols []xlog.DecodedAttr, localCols []catalog.Column, tup []xlog.DecodedColumn) (Row, []bool, []bool, error) {
+	localIdx, claimed, err := pgoutputColumnMap(remoteCols, localCols)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return decodePgoutputTupleAsRowWith(localIdx, claimed, remoteCols, localCols, tup)
+}
+
+// decodePgoutputTupleAsRowWith is decodePgoutputTupleAsRow over a PRE-RESOLVED
+// column map (review/260831 EC-3).
+func decodePgoutputTupleAsRowWith(localIdx []int, claimed []bool, remoteCols []xlog.DecodedAttr, localCols []catalog.Column, tup []xlog.DecodedColumn) (Row, []bool, []bool, error) {
+	if len(tup) != len(remoteCols) {
+		return nil, nil, nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
 	}
 	row := make(Row, len(localCols))
 	unchanged := make([]bool, len(localCols))

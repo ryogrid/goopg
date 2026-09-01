@@ -401,6 +401,15 @@ func analyzeSelectStmt(s *parser.SelectStmt, cat catalog.Catalog, parent *scope,
 		}
 	}
 	if s.Limit != nil {
+		// SRFs are rejected before the integer-type check: PG's LIMIT/OFFSET
+		// transform (transformLimitClause, parse_clause.c) runs
+		// check_srf_call_placement ahead of coerce_to_specific_type, so a
+		// set-returning LIMIT expression gets the SRF-placement error even
+		// when its result type would otherwise be a valid integer (e.g.
+		// generate_series(1,3), which is int8-typed). M0134-0180.
+		if exprHasSRF(s.Limit, ctx.cat) {
+			return analyzeError(s.Limit.Pos(), "0A000", "set-returning functions are not allowed in LIMIT")
+		}
 		typ, err := analyzeExpr(s.Limit, ctx)
 		if err != nil {
 			return err
@@ -410,6 +419,9 @@ func analyzeSelectStmt(s *parser.SelectStmt, cat catalog.Catalog, parent *scope,
 		}
 	}
 	if s.Offset != nil {
+		if exprHasSRF(s.Offset, ctx.cat) {
+			return analyzeError(s.Offset.Pos(), "0A000", "set-returning functions are not allowed in OFFSET")
+		}
 		typ, err := analyzeExpr(s.Offset, ctx)
 		if err != nil {
 			return err
@@ -1125,6 +1137,93 @@ func exprHasWindowFunc(e parser.Expr) bool {
 		}
 		for _, a := range x.Args {
 			if exprHasWindowFunc(a) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// builtinSRFNames lists the set-returning functions goopg recognizes without
+// a catalog lookup. Mirrors internal/executor/operators_ddl_partition.go's
+// isBuiltinSRF (a sibling list, not importable here — executor imports
+// analyzer, not the reverse — Hard-won Rule #2: keep the two in sync by hand).
+var builtinSRFNames = map[string]bool{
+	"generate_series": true, "generate_subscripts": true, "unnest": true,
+	"json_each": true, "json_each_text": true, "json_array_elements": true,
+	"jsonb_each": true, "jsonb_each_text": true, "jsonb_array_elements": true,
+	"string_to_table": true, "regexp_split_to_table": true,
+	"regexp_matches": true,
+}
+
+// exprHasSRF reports whether e contains a set-returning function call
+// anywhere in its tree — either one of the builtin SRFs goopg special-cases
+// in the SELECT-list ProjectSet path, or a catalog-registered routine with
+// ReturnsSet=true. Mirrors exprHasWindowFunc's shape/node coverage. Used to
+// port PG's "set-returning functions are not allowed in %s" family
+// (postgres/src/backend/parser/parse_expr.c:1770/2263,
+// parse_func.c:2500-2680) at the specific call sites goopg rejects them for
+// (currently LIMIT/OFFSET only — M0134-0180; the other seven contexts named
+// there are deferred, see the deferral ledger).
+func exprHasSRF(e parser.Expr, cat catalog.Catalog) bool {
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		return exprHasSRF(x.Left, cat) || exprHasSRF(x.Right, cat)
+	case *parser.UnaryOp:
+		return exprHasSRF(x.Operand, cat)
+	case *parser.CastExpr:
+		return exprHasSRF(x.Operand, cat)
+	case *parser.ExtractExpr:
+		return exprHasSRF(x.Source, cat)
+	case *parser.CaseExpr:
+		if x.Operand != nil && exprHasSRF(x.Operand, cat) {
+			return true
+		}
+		for _, w := range x.Whens {
+			if exprHasSRF(w.When, cat) || exprHasSRF(w.Then, cat) {
+				return true
+			}
+		}
+		if x.Else != nil && exprHasSRF(x.Else, cat) {
+			return true
+		}
+		return false
+	case *parser.IsNullExpr:
+		return exprHasSRF(x.Operand, cat)
+	case *parser.IsBoolExpr:
+		return exprHasSRF(x.Operand, cat)
+	case *parser.CollateExpr:
+		return exprHasSRF(x.Operand, cat)
+	case *parser.IsDistinctFromExpr:
+		return exprHasSRF(x.Left, cat) || exprHasSRF(x.Right, cat)
+	case *parser.InExpr:
+		if exprHasSRF(x.Operand, cat) {
+			return true
+		}
+		for _, v := range x.List {
+			if exprHasSRF(v, cat) {
+				return true
+			}
+		}
+		return false
+	case *parser.FuncCall:
+		name := strings.ToLower(x.Name.Name)
+		if builtinSRFNames[name] {
+			return true
+		}
+		if cat != nil {
+			if rs := cat.Routines(); rs != nil {
+				for _, r := range rs.LookupByName(x.Name) {
+					if r.ReturnsSet {
+						return true
+					}
+				}
+			}
+		}
+		for _, a := range x.Args {
+			if exprHasSRF(a, cat) {
 				return true
 			}
 		}
@@ -3081,20 +3180,16 @@ func lookupColumn(tbl *catalog.Table, name string) (*catalog.Column, bool) {
 
 func resolveInsertTargetColumns(tbl *catalog.Table, cat catalog.Catalog, s *parser.InsertStmt) ([]catalog.Column, error) {
 	if len(s.Columns) == 0 {
-		// Skip GENERATED ALWAYS AS … STORED columns — they are computed by
-		// the executor, not supplied by the INSERT statement. M0096-0008.
-		out := make([]catalog.Column, 0, len(tbl.Columns))
-		for _, col := range tbl.Columns {
-			if col.GeneratedAlways {
-				continue
-			}
-			out = append(out, col)
-		}
-		if len(out) == len(tbl.Columns) {
-			// No generated columns — return all columns for backward compat.
-			return append([]catalog.Column(nil), tbl.Columns...), nil
-		}
-		return out, nil
+		// M0134-0187: the implicit target-column list includes GENERATED
+		// ALWAYS AS … STORED columns, matching planInsert/
+		// rewriteInsertDefaultMarkers's colIndex for this same (VALUES-row)
+		// form — this function is only reached for that form, since
+		// analyzeInsert returns early for s.Select != nil before calling it.
+		// A generated column's cell is guaranteed by that point to be a
+		// harmless DEFAULT-derived value (NULL or resolved DefaultExpr);
+		// rewriteInsertDefaultMarkers already rejected any row supplying a
+		// real value for one before the analyzer ever ran. M0096-0008.
+		return append([]catalog.Column(nil), tbl.Columns...), nil
 	}
 	out := make([]catalog.Column, 0, len(s.Columns))
 	for _, name := range s.Columns {

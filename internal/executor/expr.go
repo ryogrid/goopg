@@ -27,6 +27,8 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/activity"
@@ -854,14 +856,22 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 					}
 					return NewStringDatum(typName), nil
 				}
-				// Try as a type name → return OID, across all four
-				// user-type kinds (enum/domain/composite/range/multirange),
-				// mirroring userTypeNameForOID's reverse direction.
-				if oid, ok := userTypeOIDForName(ctx.Catalog, typName); ok {
-					return NewIntDatum(int64(oid)), nil
-				}
-				// Built-in type name → return itself
-				return v, nil
+				// Delegate the whole NAME path to regIdentifierInput — the
+				// shared regtypein port (reg_identifier.go), exactly as the
+				// regclass arm above delegates to the regclassin port. This arm
+				// used to resolve USER types to an OID here and then FALL
+				// THROUGH for a built-in name, returning the raw string: so
+				// `'int4'::regtype` printed `int4` where PG's regtypeout prints
+				// `integer` (format_type_be), and chaining `::oid` failed with a
+				// nonsense `invalid input syntax for type oid: "int4"` because
+				// the datum was never the OID that a reg* datum is defined to be
+				// (the model documented at the reg*→string cast guard below).
+				// An unknown name fell through the same way instead of raising
+				// regtypein's 42704 (regproc.c:1176 parseTypeString). Delegating
+				// also picks up the schema qualifier (3F000 for a schema that
+				// does not exist) the shared port already honors.
+				// review/260831-2 X-7.
+				return regIdentifierInput(v, "regtype", ctx, x.Pos())
 			case KindInt:
 				// OID integer → type name; InvalidOid (0) renders as "-" (see above).
 				if v.Int == 0 {
@@ -4880,7 +4890,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// PG's 'infinity' / '-infinity' spellings have no finite time.Time and
 		// map to the DATEVAL_NOEND / DATEVAL_NOBEGIN sentinel; intercept before
 		// the layout parse (not time-cached). (unimplemented_feat #5(d-iv))
-		if inf, ok := parseDateInfinityLiteral(x.Value); ok {
+		if inf, ok := parseDateSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
 			return inf, nil
 		}
 		// M0125-0007 / M0119-0006: PG's DecodeDate reads each numeric field on
@@ -4895,12 +4905,19 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		x.CacheValid = true
 		return NewTimeDatum(x.CachedTime), nil
 	case "time":
+		// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
+		if inf, ok := parseTimeSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
+			return inf, nil
+		}
 		ts, err := parseTimeString(x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
 		}
 		return NewTimeDatum(ts), nil
 	case "timetz":
+		if inf, ok := parseTimeTZSpecialLiteral(x.Value, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
+			return inf, nil
+		}
 		ts, offsetSecs, err := parseTimeTZString(x.Value, timeZoneFromCtx(ctx))
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", x.Value)}
@@ -4925,7 +4942,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// time.Time and so are intercepted before the layout loop; the
 		// ±infinity sentinel is not time-cached (detection is a trivial
 		// string compare). (unimplemented_feat #5(d-iv))
-		if inf, ok := parseTimestampInfinityLiteral(x.Value); ok {
+		if inf, ok := parseTimestampSpecialLiteral(x.Value, nowFromCtx(ctx), isTimestampTZTypeName(x.Type)); ok {
 			return inf, nil
 		}
 		// M0125-0007: same field-at-a-time acceptance as the date case above —
@@ -5661,6 +5678,21 @@ func timeZoneFromCtx(ctx *Context) string {
 	return ""
 }
 
+// nowFromCtx returns the statement timestamp the 'now'/'today'/'tomorrow'/
+// 'yesterday' RESERV date/time literals resolve against (ctx.Now — captured
+// once at statement start, same source as the "now"/"current_timestamp"
+// function arm above). ctx.Now is zero only when ctx itself is nil: several
+// encodeValuePGCtx callers (catalog-row/bootstrap encoders, see the
+// "timestamp"/"timestamptz" codec.go arm) pass a nil ctx and are never on a
+// live literal-parsing path, but a real wall-clock fallback is still safer
+// than the zero time.Time — mirrors timeZoneFromCtx's nil-ctx default.
+func nowFromCtx(ctx *Context) time.Time {
+	if ctx != nil && !ctx.Now.IsZero() {
+		return ctx.Now
+	}
+	return time.Now()
+}
+
 // formatTimeDatumDateStyle renders a non-time-only KindTime datum as text,
 // honoring the session DateStyle and TimeZone GUCs. Mirrors Datum.Format()'s
 // ±infinity and TimeSub branching, but dispatches DATE / TIMESTAMP /
@@ -6268,7 +6300,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		if d.Kind == KindString {
 			s := d.StringValue()
 			// 'infinity' / '-infinity' → DATEVAL_NOEND / NOBEGIN (#5(d-iv)).
-			if inf, ok := parseDateInfinityLiteral(s); ok {
+			if inf, ok := parseDateSpecialLiteral(s, nowFromCtx(ctx)); ok {
 				return inf, nil
 			}
 			// date_in decodes a zone field and then ignores it, so the day comes
@@ -6300,6 +6332,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "time":
 		// Cast to time: extract time-of-day from KindTime, parse strings. M0097-0004.
 		if d.Kind == KindString {
+			// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
+			if inf, ok := parseTimeSpecialLiteral(d.StringValue(), nowFromCtx(ctx)); ok {
+				return inf, nil
+			}
 			ts, err := parseTimeString(d.StringValue())
 			if err != nil {
 				return Datum{}, err
@@ -6315,6 +6351,9 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "timetz":
 		// Cast to timetz: parse strings with timezone offset. M0097-0004.
 		if d.Kind == KindString {
+			if inf, ok := parseTimeTZSpecialLiteral(d.StringValue(), nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
+				return inf, nil
+			}
 			ts, offsetSecs, err := parseTimeTZString(d.StringValue(), timeZoneFromCtx(ctx))
 			if err != nil {
 				return Datum{}, err
@@ -6332,7 +6371,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		tz := isTimestampTZTypeName(targetType)
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
-			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
+			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), tz); ok {
 				return inf, nil
 			}
 			// `::timestamp` discards a zone the text carries, `::timestamptz`
@@ -6616,6 +6655,20 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, err
 			}
 			return NewStringDatum(rewritten), nil
+		}
+		return d, nil
+	case "xml":
+		// `::xml` (and the implicit coercion on an `xml`-typed column
+		// INSERT/UPDATE) must be well-formed per the session xmloption GUC —
+		// see xmltypes.go. Previously this fell through to the pass-through
+		// below, so `'<wrong'::xml` succeeded and stored the fragment
+		// verbatim. M0134-0188.
+		if s, ok := datumAsString(d); ok {
+			if ee := xmlValidate(s, xmlOptionFromCtx(ctx)); ee != nil {
+				ee.Pos = pos
+				return Datum{}, ee
+			}
+			return NewStringDatum(s), nil
 		}
 		return d, nil
 	}
@@ -12617,11 +12670,15 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				_, err := parsePgLSN(v)
 				return NewBoolDatum(err == nil), nil
 			case "time", "timetz":
+				// 'now' is valid time/timetz input (#5(d-iv), M0134-0182).
+				if strings.EqualFold(strings.TrimSpace(v), "now") {
+					return NewBoolDatum(true), nil
+				}
 				_, err := parseTimeString(v)
 				return NewBoolDatum(err == nil), nil
 			case "date":
-				// 'infinity' / '-infinity' are valid date input (#5(d-iv)).
-				if _, ok := parseDateInfinityLiteral(v); ok {
+				// 'infinity' / '-infinity' / 'today' / ... are valid date input (#5(d-iv), M0134-0182).
+				if _, ok := parseDateSpecialLiteral(v, nowFromCtx(ctx)); ok {
 					return NewBoolDatum(true), nil
 				}
 				// M0125-0007 / M0119-0006: pg_input_is_valid must agree with the
@@ -12630,8 +12687,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				_, err := parsePGDateText(v)
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":
-				// 'infinity' / '-infinity' are valid timestamp input (#5(d-iv)).
-				if _, ok := parseTimestampInfinityLiteral(v); ok {
+				// 'infinity' / '-infinity' / 'today' / ... are valid timestamp input (#5(d-iv), M0134-0182).
+				if _, ok := parseTimestampSpecialLiteral(v, nowFromCtx(ctx), t == "timestamptz"); ok {
 					return NewBoolDatum(true), nil
 				}
 				_, err := parseCopyTimestampZone(v, tsZoneModeForType(t))
@@ -12687,6 +12744,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// parseMacaddr8Literal.
 				_, _, _, _, _, _, _, _, merr := parseMacaddr8Literal(v)
 				return NewBoolDatum(merr == nil), nil
+			case "xml":
+				// M0134-0188: agrees with the ::xml cast path, same
+				// xmlValidate (xmltypes.go).
+				return NewBoolDatum(xmlValidate(v, xmlOptionFromCtx(ctx)) == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
@@ -14614,6 +14675,96 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				}
 			}
 			return NewStringDatum(strings.TrimRight(s.StringValue(), cutset)), nil
+		}
+	case "normalize":
+		// normalize(text [, form]) — PG: varlena.c:6603 unicode_normalize_func.
+		// The 1-arg spelling defaults form to NFC (system_functions.sql:626
+		// `"normalize"(text, text DEFAULT 'NFC')`); goopg has no default-arg
+		// catalog mechanism, so the default is applied here directly, the same
+		// way btrim/ltrim/rtrim above default their cutset argument.
+		// M0134-0184 (unicode.sql).
+		if len(x.Args) >= 1 {
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			formStr := "NFC"
+			if len(x.Args) >= 2 {
+				f, err := evalExprSlot(x.Args[1], slot, ctx)
+				if err != nil {
+					return Datum{}, err
+				}
+				if f.IsNull() {
+					return NullDatum, nil
+				}
+				formStr = f.StringValue()
+			}
+			form, ok := unicodeNormalizationForm(formStr)
+			if !ok {
+				// PG: unicode_norm_form_from_string (varlena.c:6521) never calls
+				// errposition() — psql shows no LINE/caret for this error, unlike
+				// most 22023s in this file, so Pos is deliberately omitted here.
+				return Datum{}, &ExecError{Code: "22023",
+					Message: fmt.Sprintf("invalid normalization form: %s", formStr)}
+			}
+			return NewStringDatum(form.String(s.StringValue())), nil
+		}
+	case "is_normalized":
+		// is_normalized(text [, form]) — PG: varlena.c:6670 unicode_is_normalized.
+		// Same 1-arg NFC default as normalize() above. M0134-0184.
+		if len(x.Args) >= 1 {
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			formStr := "NFC"
+			if len(x.Args) >= 2 {
+				f, err := evalExprSlot(x.Args[1], slot, ctx)
+				if err != nil {
+					return Datum{}, err
+				}
+				if f.IsNull() {
+					return NullDatum, nil
+				}
+				formStr = f.StringValue()
+			}
+			form, ok := unicodeNormalizationForm(formStr)
+			if !ok {
+				// PG: unicode_norm_form_from_string never calls errposition() —
+				// see the identical note in the "normalize" case above.
+				return Datum{}, &ExecError{Code: "22023",
+					Message: fmt.Sprintf("invalid normalization form: %s", formStr)}
+			}
+			return NewBoolDatum(form.IsNormalString(s.StringValue())), nil
+		}
+	case "unicode_assigned":
+		// unicode_assigned(text) — PG: varlena.c:6572. True iff every codepoint
+		// in the input has an assigned Unicode general category (i.e. is not
+		// in category Cn "unassigned"). Go's stdlib unicode.Cn table tracks the
+		// same UCD assignment split, so no separate UCD data needs embedding.
+		// M0134-0184.
+		if len(x.Args) == 1 {
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			assigned := true
+			for _, r := range s.StringValue() {
+				if unicode.Is(unicode.Cn, r) {
+					assigned = false
+					break
+				}
+			}
+			return NewBoolDatum(assigned), nil
+		}
+	case "unicode_version":
+		// unicode_version() — PG: varlena.c:6552, returns PG_UNICODE_VERSION
+		// ("major.minor" of the UCD PG was built against). The regress test
+		// only asserts IS NOT NULL, so the exact string is not load-bearing;
+		// x/text's bundled UCD is 15.0.0, matching the norm package in use
+		// below. M0134-0184.
+		if len(x.Args) == 0 {
+			return NewStringDatum("15.0"), nil
 		}
 	case "lpad":
 		// lpad(text, int [, fill_text])
@@ -19258,14 +19409,39 @@ func arrayElemsSubset(sub, super []string) bool {
 func ParseTextArrayLiteral(s string) []string { return parseTextArray(s) }
 
 func parseTextArray(s string) []string {
+	elems := parseTextArrayElems(s)
+	if elems == nil {
+		return nil
+	}
+	out := make([]string, len(elems))
+	for i, e := range elems {
+		out[i] = e.Text
+	}
+	return out
+}
+
+// textArrayElem is one element of an array literal together with the one bit
+// the unquoted text cannot carry: whether the element WAS quoted. `{NULL}` is
+// an array holding a NULL, `{"NULL"}` an array holding the four-character
+// string — PG's ReadArrayStr only accepts the unquoted, unescaped spelling as
+// the NULL token, and callers that special-case NULL have to make the same
+// distinction (review/260831-2 EC-2).
+type textArrayElem struct {
+	Text   string
+	Quoted bool
+}
+
+// parseTextArrayElems is parseTextArray's quoted-ness-preserving twin; the two
+// must stay in sync because they are the same scan.
+func parseTextArrayElems(s string) []textArrayElem {
 	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
-		return []string{s}
+		return []textArrayElem{{Text: s}}
 	}
 	inner := s[1 : len(s)-1]
 	if inner == "" {
 		return nil
 	}
-	var elems []string
+	var elems []textArrayElem
 	i := 0
 	for i < len(inner) {
 		// PG's ReadArrayStr (postgres/src/backend/utils/adt/arrayfuncs.c)
@@ -19298,14 +19474,14 @@ func parseTextArray(s string) []string {
 					i++
 				}
 			}
-			elems = append(elems, sb.String())
+			elems = append(elems, textArrayElem{Text: sb.String(), Quoted: true})
 		} else {
 			// Unquoted element: read until comma or end.
 			start := i
 			for i < len(inner) && inner[i] != ',' {
 				i++
 			}
-			elems = append(elems, inner[start:i])
+			elems = append(elems, textArrayElem{Text: inner[start:i]})
 		}
 		if i < len(inner) && inner[i] == ',' {
 			i++
@@ -20960,6 +21136,25 @@ func evalPgClientEncoding(ctx *Context) (Datum, error) {
 		}
 	}
 	return NewStringDatum(enc), nil
+}
+
+// unicodeNormalizationForm maps a normalize()/is_normalized() form argument
+// to golang.org/x/text/unicode/norm's Form. PG: varlena.c
+// unicode_norm_form_from_string — pg_strcasecmp, so case-insensitive.
+// M0134-0184.
+func unicodeNormalizationForm(s string) (norm.Form, bool) {
+	switch strings.ToUpper(s) {
+	case "NFC":
+		return norm.NFC, true
+	case "NFD":
+		return norm.NFD, true
+	case "NFKC":
+		return norm.NFKC, true
+	case "NFKD":
+		return norm.NFKD, true
+	default:
+		return 0, false
+	}
 }
 
 // evalGetDatabaseEncoding returns the current database's encoding as a name,

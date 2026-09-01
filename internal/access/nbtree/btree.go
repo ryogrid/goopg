@@ -536,6 +536,11 @@ func DecodeInt8(b []byte) (int64, error) {
 	return int64(binary.BigEndian.Uint64(b) ^ 0x8000000000000000), nil
 }
 
+// bigTen is the divisor EncodeNumericKey strips trailing zeros with. It is a
+// package-level constant value so the per-call allocation disappears; big.Int
+// values are never mutated by Quo/QuoRem operands, so sharing it is safe.
+var bigTen = big.NewInt(10)
+
 // EncodeNumericKey encodes a NUMERIC value (mantissa * 10^(-scale)) into
 // a sortable byte string such that bytewise comparison matches numeric
 // order. The encoding is scale-invariant: numerically equal inputs
@@ -573,16 +578,21 @@ func EncodeNumericKey(mantissa *big.Int, scale int16) []byte {
 	abs := new(big.Int).Abs(mantissa)
 	// Strip trailing zeros so numerically-equal values normalise to
 	// the same digit string.
+	//
+	// review/260831 NB-11: the loop used to allocate a fresh big.Int per digit
+	// stripped — one for the quotient QuoRem writes and throws away, plus the
+	// 10 and the 0 it compared against — and then divide a SECOND time to keep
+	// the quotient it had just computed. It now reuses two scratch values and
+	// swaps the quotient in.
 	s := int32(scale)
-	ten := big.NewInt(10)
-	zero := big.NewInt(0)
 	rem := new(big.Int)
+	quo := new(big.Int)
 	for {
-		new(big.Int).QuoRem(abs, ten, rem)
-		if rem.Cmp(zero) != 0 {
+		quo.QuoRem(abs, bigTen, rem)
+		if rem.Sign() != 0 {
 			break
 		}
-		abs.Quo(abs, ten)
+		abs, quo = quo, abs
 		s--
 		if abs.Sign() == 0 {
 			break
@@ -2451,7 +2461,7 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.Bl
 		if err != nil {
 			return true // will surface at the final error check
 		}
-		it, err := f.parse(raw)
+		it, err := f.parseNoCopy(raw)
 		if err != nil {
 			return true
 		}
@@ -2470,7 +2480,12 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.Bl
 	if err != nil {
 		return 0, err
 	}
-	it, err := f.parse(raw)
+	// review/260831 NB-9: parseNoCopy, not parse. Every probe of this binary
+	// search used to COPY the probed key out of the page — O(log n) key copies
+	// per internal page, on every descent of every index lookup — and the copy
+	// was thrown away after one comparison. The page is pinned under a shared
+	// content latch for the whole call and only the child block number escapes.
+	it, err := f.parseNoCopy(raw)
 	if err != nil {
 		maybeDumpPageOnParseErr(p, "findChildBlockDirect: parseItem")
 		return 0, err
@@ -2515,7 +2530,12 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 			// M0055-0002-followup-rightmost-cache: if this leaf
 			// has no Next pointer it IS the rightmost; refresh
 			// the cache. Cheap atomic write, no allocation.
-			if op.Next == 0 {
+			// The rightmost page's sibling link is P_NONE on disk,
+			// which readOpaque translates to InvalidBlockNumber —
+			// comparing against 0 was never true, so this cache was
+			// never populated and the fast path below was dead code
+			// (review/260831-2 NB-4).
+			if op.Next == storage.InvalidBlockNumber {
 				bt.rightmostLeafBlk.Store(uint64(cur))
 			}
 			// (M0055-0004-followup-stage2-splitmu-removal:
@@ -3564,14 +3584,15 @@ func mustInsertItemSorted(f indexFormat, p storage.Page, it item) int {
 //
 // Staleness conditions:
 //   - The leaf has a Next pointer set (a later split moved the
-//     rightmost forward). The cache is stale; clear and miss.
+//     rightmost forward), or it is deleted / half-dead / mid-split.
+//     The cache is stale; clear and miss.
 //   - The leaf is full (no space for `it`). Caller takes the
 //     normal split path.
 //   - `it.key < leaf.HighKey` (the key belongs to a left sibling,
 //     not this leaf — the cache is wrong for this insert).
 //
 // The cache is updated by the slow-path descent every time it
-// reaches a leaf that's truly the rightmost (Next == 0).
+// reaches a leaf that's truly the rightmost (Next == InvalidBlockNumber).
 func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (bool, error) {
 	slot, err := bt.pinW(blk)
 	if err != nil {
@@ -3580,8 +3601,23 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 		return false, nil
 	}
 	op := readOpaque(slot.Page())
-	if op.Level != 0 || op.Next != 0 {
+	if op.Level != 0 || op.Next != storage.InvalidBlockNumber {
 		// Not a leaf, or no longer rightmost — cache is stale.
+		// (The sentinel is InvalidBlockNumber, not 0 — see NB-4 at
+		// the descent-side store.)
+		bt.unpinW(slot)
+		bt.rightmostLeafBlk.Store(0)
+		return false, nil
+	}
+	// A page that is being deleted, or that carries an unfinished split,
+	// is not a legal insert target: upstream's _bt_findinsertloc reaches
+	// neither (a deleted/half-dead page is unlinked from the descent, and
+	// an incomplete split is completed by _bt_finish_split before the
+	// insert). Only the descent path knows how to handle either, so miss
+	// to it. Without this the cache could hand an insert to a page that
+	// unlinkEmptyLeaf is about to recycle under a different key range
+	// (review/260831-2 NB-5).
+	if op.IsDeleted() || op.IsHalfDead() || op.HasIncompleteSplit() {
 		bt.unpinW(slot)
 		bt.rightmostLeafBlk.Store(0)
 		return false, nil
@@ -3827,6 +3863,10 @@ func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) 
 // (M0047-0003) it returns the FIRST tid bundled in the posting
 // — that's enough for the binary search since all posting tids
 // share the same key.
+// The returned item's key ALIASES the page bytes (review/260831 NB-9): both
+// callers are ordering probes that compare and discard while holding the page
+// pinned, and copying the key per probe made a binary search allocate O(log n)
+// times per insert.
 func (f indexFormat) readPageItem(p storage.Page, idx int) (item, error) {
 	// C3-S1: AllowDead — this is a binary-search ordering probe; Dead
 	// items retain valid key bytes until purged, and result filtering
@@ -3850,7 +3890,7 @@ func (f indexFormat) readPageItem(p storage.Page, idx int) (item, error) {
 		// what an ordering probe against the run wants.
 		return item{ptr: ptr, key: key}, nil
 	}
-	it, perr := f.parse(raw)
+	it, perr := f.parseNoCopy(raw)
 	if perr != nil {
 		maybeDumpPageOnParseErr(p, "readPageItem: parseItem")
 	}
@@ -3901,9 +3941,10 @@ func resetPageItems(p storage.Page) {
 	h.SetLower(uint16(storage.SizeOfPageHeaderData))
 	h.SetUpper(uint16(btSpecialOffset))
 	// Zero the in-between bytes for cleanliness; not strictly required.
-	for i := storage.SizeOfPageHeaderData; i < btSpecialOffset; i++ {
-		p[i] = 0
-	}
+	// review/260831 NB-8: `clear` on the slice, not a byte-at-a-time loop —
+	// this is ~8 KB per page rewrite and page rewrites happen on every split
+	// and every vacuum-compaction of a leaf.
+	clear(p[storage.SizeOfPageHeaderData:btSpecialOffset])
 	if hasHK {
 		if err := pgSetHighKeyRaw(p, hk); err != nil {
 			panic(err)

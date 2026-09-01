@@ -24,6 +24,7 @@ package mmgr
 
 import (
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -95,8 +96,15 @@ func (c *Context) ensureLC() {
 
 // --- registry ---
 
+// ctxRegistry maps a ContextID to its Context. The slots are atomic pointers
+// rather than plain ones because Lookup is on the per-datum read path — every
+// arena-backed Datum resolves its payload through it — and it used to take
+// ctxMu, a PROCESS-GLOBAL mutex, to read one pointer (review/260831 UT-9). That
+// serialised every backend's datum reads against each other and against context
+// creation. ctxMu still guards id allocation and the free list, which is where
+// the ordering actually matters.
 var (
-	ctxRegistry     [65536]*Context
+	ctxRegistry     [65536]atomic.Pointer[Context]
 	ctxRegistryNext = ContextID(2) // 0=invalid, 1=perm
 	ctxFreeList     []ContextID
 	ctxMu           sync.Mutex
@@ -138,7 +146,7 @@ func (c *Context) isShared() bool { return c.id == PermContextID }
 // are single-owner by contract.
 var permanentContext = func() *Context {
 	c := &Context{cs: defaultChunkSize, id: PermContextID, kind: KindSession}
-	ctxRegistry[PermContextID] = c
+	ctxRegistry[PermContextID].Store(c)
 	return c
 }()
 
@@ -157,8 +165,10 @@ func acquireID() ContextID {
 }
 
 func releaseID(id ContextID) {
+	// Clear the slot BEFORE the id can be handed out again: a reader that still
+	// holds the id must see nil, never the next owner's Context.
+	ctxRegistry[id].Store(nil)
 	ctxMu.Lock()
-	ctxRegistry[id] = nil
 	ctxFreeList = append(ctxFreeList, id)
 	ctxMu.Unlock()
 }
@@ -169,10 +179,7 @@ func Lookup(id ContextID) *Context {
 	if id == InvalidContextID {
 		return nil
 	}
-	ctxMu.Lock()
-	c := ctxRegistry[id]
-	ctxMu.Unlock()
-	return c
+	return ctxRegistry[id].Load()
 }
 
 // --- chunk pools ---
@@ -240,9 +247,7 @@ func Acquire(parent *Context, kind Kind) *Context {
 	}
 	id := acquireID()
 	c := &Context{parent: parent, cs: cs, id: id, kind: kind}
-	ctxMu.Lock()
-	ctxRegistry[id] = c
-	ctxMu.Unlock()
+	ctxRegistry[id].Store(c)
 	if parent != nil {
 		parent.children = append(parent.children, c)
 	}
@@ -286,10 +291,17 @@ func (c *Context) Usage() (allocated int64, peak int64) {
 // Release returns chunks to the pool, cascades Release to children, and
 // removes c from the registry. After Release, c must not be used.
 func (c *Context) Release() {
-	for _, child := range c.children {
+	// review/260831-2 UT-4: detach the children BEFORE releasing them. Each
+	// child's Release() removes itself from its parent's children slice, so
+	// ranging over the live slice let the shift skip every second child (its
+	// chunks never returned to the pool) and release another one twice.
+	// Clearing c.parent first makes the child's removal scan a no-op.
+	children := c.children
+	c.children = nil
+	for _, child := range children {
+		child.parent = nil
 		child.Release()
 	}
-	c.children = c.children[:0]
 	for i := range c.chunks {
 		putChunk(c.cs, c.chunks[i].buf)
 		c.chunks[i].buf = nil

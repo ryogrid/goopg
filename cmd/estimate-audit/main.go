@@ -445,16 +445,32 @@ func selectQueries(spec string) []int {
 			continue
 		}
 		if i := strings.Index(part, "-"); i > 0 {
-			lo, _ := strconv.Atoi(strings.TrimSpace(part[:i]))
-			hi, _ := strconv.Atoi(strings.TrimSpace(part[i+1:]))
+			// Both bounds must parse: with the errors dropped, `--queries 5-`
+			// gave hi=0 and the 5..0 loop selected NOTHING, auditing zero
+			// queries without a word of complaint. (review/260831-2 CM-5)
+			lo, loErr := strconv.Atoi(strings.TrimSpace(part[:i]))
+			hi, hiErr := strconv.Atoi(strings.TrimSpace(part[i+1:]))
+			if loErr != nil || hiErr != nil {
+				fatal("--queries: cannot parse range %q (want e.g. 3-9)", part)
+			}
+			if lo < 1 || hi < lo {
+				fatal("--queries: invalid range %q (want 1 <= lo <= hi)", part)
+			}
 			for q := lo; q <= hi; q++ {
 				seen[q] = true
 			}
 			continue
 		}
-		if v, err := strconv.Atoi(part); err == nil {
-			seen[v] = true
+		// A bare number likewise: `--queries -5` parsed to -5 and asked for a
+		// nonexistent "Q-5", and a typo parsed to nothing at all.
+		v, err := strconv.Atoi(part)
+		if err != nil {
+			fatal("--queries: cannot parse query number %q", part)
 		}
+		if v < 1 {
+			fatal("--queries: query number %d is out of range (queries start at 1)", v)
+		}
+		seen[v] = true
 	}
 	out := make([]int, 0, len(seen))
 	for q := range seen {

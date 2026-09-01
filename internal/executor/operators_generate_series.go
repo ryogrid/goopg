@@ -7,6 +7,8 @@ package executor
 // and similar patterns. M0096-0006.
 
 import (
+	"math"
+
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -18,6 +20,13 @@ type generateSeriesOp struct {
 	step    int64
 	started bool
 	done    bool
+
+	// row and slot are reused across emissions (review/260831 EO1-10): the
+	// series used to allocate a one-column Row AND a MaterializedSlot per
+	// value. Same "valid until the next Next()" contract as indexScanOp
+	// (M0092-0007).
+	row  Row
+	slot MaterializedSlot
 }
 
 func newGenerateSeriesOp(p *optimizer.GenerateSeries) *generateSeriesOp {
@@ -78,12 +87,28 @@ func (o *generateSeriesOp) Next() (TupleSlot, error) {
 	}
 	if o.step == 0 {
 		o.done = true
-		return nil, &ExecError{Code: "2201F", Message: "step size cannot equal zero"}
+		// PG: int8.c generate_series_int8, ERRCODE_INVALID_PARAMETER_VALUE
+		// (22023). review/260831-2 EO2-3: this used to report 2201F.
+		return nil, &ExecError{Code: "22023", Message: "step size cannot equal zero"}
 	}
 
 	val := NewIntDatum(o.current)
-	o.current += o.step
-	return SlotFromRow(nil, Row{val}), nil
+	// review/260831-2 EO2-3: `o.current += o.step` wraps at the int64 ceiling,
+	// and a wrapped current is back inside the bounds — the series then ran
+	// forever. PG stops the iteration when the addition overflows
+	// (pg_add_s64_overflow in generate_series_int8).
+	if (o.step > 0 && o.current > math.MaxInt64-o.step) ||
+		(o.step < 0 && o.current < math.MinInt64-o.step) {
+		o.done = true
+	} else {
+		o.current += o.step
+	}
+	if o.row == nil {
+		o.row = make(Row, 1)
+	}
+	o.row[0] = val
+	o.slot.row = o.row
+	return &o.slot, nil
 }
 
 // generateSubscriptsOp implements generate_subscripts(arr, dim[, rev]) SRF.
@@ -96,6 +121,10 @@ type generateSubscriptsOp struct {
 	step    int64
 	started bool
 	done    bool
+
+	// row and slot are reused across emissions (review/260831 EO1-10).
+	row  Row
+	slot MaterializedSlot
 }
 
 func newGenerateSubscriptsOp(p *optimizer.GenerateSubscripts) *generateSubscriptsOp {
@@ -162,5 +191,10 @@ func (o *generateSubscriptsOp) Next() (TupleSlot, error) {
 
 	val := NewIntDatum(o.current)
 	o.current += o.step
-	return SlotFromRow(nil, Row{val}), nil
+	if o.row == nil {
+		o.row = make(Row, 1)
+	}
+	o.row[0] = val
+	o.slot.row = o.row
+	return &o.slot, nil
 }

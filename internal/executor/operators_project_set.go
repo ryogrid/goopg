@@ -13,6 +13,7 @@ package executor
 // row and zips multiple SRFs together (parallel expansion with NULL padding).
 
 import (
+	"math"
 	"strings"
 
 	"github.com/goopg/goopg/internal/optimizer"
@@ -141,14 +142,30 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 					step = s
 				}
 			}
+			// review/260831-2 EO2-3: a zero step used to yield an empty
+			// series instead of PG's error, and `v += step` wraps at the
+			// int64 ceiling — the wrapped value is back inside the bounds, so
+			// the loop appended forever and the backend grew without limit.
+			// PG raises for step 0 (int8.c generate_series_int8,
+			// ERRCODE_INVALID_PARAMETER_VALUE) and ends the series when the
+			// addition overflows (pg_add_s64_overflow).
+			if step == 0 {
+				return &ExecError{Code: "22023", Message: "step size cannot equal zero"}
+			}
 			var vals []int64
 			if step > 0 {
 				for v := start; v <= stop; v += step {
 					vals = append(vals, v)
+					if v > math.MaxInt64-step {
+						break
+					}
 				}
-			} else if step < 0 {
+			} else {
 				for v := start; v >= stop; v += step {
 					vals = append(vals, v)
+					if v < math.MinInt64-step {
+						break
+					}
 				}
 			}
 			genResults[k] = seriesResult{colIdx: sc.ColIdx, vals: vals, wrapped: sc.Wrapped}

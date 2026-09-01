@@ -2522,3 +2522,41 @@ func TestBuildUserPGIndexRowExprPredNullBitmapRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// TestPgAttTypmodEveryTypmodCarryingType pins atttypmod for every built-in type
+// whose typmod is more than a plain length, against values read from the PG
+// 18.3 oracle:
+//
+//	create table es4(c <type>);
+//	select atttypmod from pg_attribute where attrelid = 'es4'::regclass and attname = 'c';
+//
+// The time/timestamp family was missing entirely — `time(3)` reported -1 where
+// PG reports 3 — so a client rebuilding the column type from the catalog
+// (pg_dump above all) silently dropped the precision. review/260831-2, found
+// while confirming ES-4's numeric arithmetic (which is correct).
+func TestPgAttTypmodEveryTypmodCarryingType(t *testing.T) {
+	for _, tc := range []struct {
+		sql  string
+		oid  uint32
+		args []int64
+		want int64
+	}{
+		{"numeric(10,2)", 1700, []int64{10, 2}, 655366},
+		{"numeric(10)", 1700, []int64{10}, 655364},
+		{"numeric", 1700, nil, -1},
+		{"varchar(5)", 1043, []int64{5}, 9},
+		{"char(5)", 1042, []int64{5}, 9},
+		{"bit(3)", 1560, []int64{3}, 3},
+		{"interval hour to minute", 1186, []int64{201392127}, 201392127},
+		{"time(3)", 1083, []int64{3}, 3},
+		{"timetz(4)", 1266, []int64{4}, 4},
+		{"timestamp(2)", 1114, []int64{2}, 2},
+		{"timestamptz(5)", 1184, []int64{5}, 5},
+		{"time with time zone", 1266, nil, -1},
+	} {
+		if got := pgAttTypmod(tc.oid, tc.args); got != tc.want {
+			t.Errorf("%s: pgAttTypmod(%d, %v) = %d, want %d (PG 18.3)",
+				tc.sql, tc.oid, tc.args, got, tc.want)
+		}
+	}
+}

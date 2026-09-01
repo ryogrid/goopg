@@ -51,6 +51,14 @@ type RecordIterator struct {
 	// can span page boundaries (the next page's header sits between
 	// fragments). See M0014-0001 step 2.
 	pageHeaders bool
+	// segFile caches the segment file the last read opened, so a scan that
+	// walks a segment does not open and close it once per read.
+	// review/260831 XL-9: readSegmentSlice opened the file per call, and
+	// readOneAt reads twice per record (header, then body), so replaying one
+	// segment did two opens per record.
+	segFile     *os.File
+	segFileNo   uint64
+	segFileTLI  uint32
 	lastWaitPos int64
 	lastWaitEnd uint64
 	// parkedAtEnd is set while Next is blocked at the *end of the WAL
@@ -135,6 +143,7 @@ func (it *RecordIterator) Close() error {
 		return nil // already closed
 	}
 	it.writer.Unsubscribe(it.wake)
+	it.closeSegFile()
 	return nil
 }
 
@@ -551,7 +560,7 @@ func (it *RecordIterator) readBytesAt(pos int64, n int) ([]byte, error) {
 		if max := int(drained - cur); want > max {
 			want = max
 		}
-		buf, err := readSegmentSlice(it.walDir, segNo, segOff, want, it.writer.TimelineID())
+		buf, err := it.readSegmentSliceCached(segNo, segOff, want, it.writer.TimelineID())
 		if err != nil {
 			return nil, err
 		}
@@ -568,20 +577,36 @@ func (it *RecordIterator) readBytesAt(pos int64, n int) ([]byte, error) {
 	return out, nil
 }
 
-// readSegmentSlice opens segment `segNo` for the given timeline, reads up to
-// `n` bytes at `off`, and returns whatever was actually read (may be short if
-// the file ends inside the requested window).
-func readSegmentSlice(walDir string, segNo uint64, off int64, n int, tli uint32) ([]byte, error) {
-	path := filepath.Join(walDir, FormatSegmentNameTLI(segNo, tli))
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("wal: iterator open %s: %w", path, err)
+// readSegmentSliceCached reads up to `n` bytes at `off` from segment `segNo`
+// on timeline `tli`, returning whatever was actually read (short if the file
+// ends inside the window), over a cached file handle: the
+// same segment is usually read many times in a row (a record header, then the
+// record, then the next record), so the open/close pair is hoisted out of the
+// read. review/260831 XL-9.
+func (it *RecordIterator) readSegmentSliceCached(segNo uint64, off int64, n int, tli uint32) ([]byte, error) {
+	if it.segFile == nil || it.segFileNo != segNo || it.segFileTLI != tli {
+		it.closeSegFile()
+		path := filepath.Join(it.walDir, FormatSegmentNameTLI(segNo, tli))
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("wal: iterator open %s: %w", path, err)
+		}
+		it.segFile, it.segFileNo, it.segFileTLI = f, segNo, tli
 	}
-	defer f.Close()
 	buf := make([]byte, n)
-	got, err := f.ReadAt(buf, off)
+	got, err := it.segFile.ReadAt(buf, off)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("wal: iterator read %s @ %d: %w", path, off, err)
+		// Drop the handle: the next read re-opens rather than inheriting
+		// whatever state made this one fail.
+		it.closeSegFile()
+		return nil, fmt.Errorf("wal: iterator read segment %d @ %d: %w", segNo, off, err)
 	}
 	return buf[:got], nil
+}
+
+func (it *RecordIterator) closeSegFile() {
+	if it.segFile != nil {
+		_ = it.segFile.Close()
+		it.segFile = nil
+	}
 }

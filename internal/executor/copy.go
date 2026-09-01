@@ -480,13 +480,7 @@ func (c *CopyFromExecutor) listedColumns() []catalog.Column {
 // column slice (unlisted columns stay NULL) and writes it through the
 // heap-write path.
 func (c *CopyFromExecutor) insertSourceRow(src Row) error {
-	row := make(Row, len(c.cols))
-	for i := range c.cols {
-		row[i] = NullDatum
-	}
-	for srcIdx, tgtOrd := range c.plan.ColumnIndex {
-		row[tgtOrd] = src[srcIdx]
-	}
+	row := c.scatterSourceRow(src)
 	// M0119-0006 (68th slice): route reg* columns through the SAME
 	// coerceRowForConstraintChecks the INSERT path uses, so a name field
 	// resolves like regclassin/regrolein ("-" → OID 0, pure-digit → numeric OID,
@@ -502,6 +496,30 @@ func (c *CopyFromExecutor) insertSourceRow(src Row) error {
 		return err
 	}
 
+	return c.storeCopyRow(row)
+}
+
+// scatterSourceRow places a decoded input row into the table's full column
+// slice; columns the COPY statement did not list stay NULL (the default
+// filling below decides what they end up as).
+func (c *CopyFromExecutor) scatterSourceRow(src Row) Row {
+	row := make(Row, len(c.cols))
+	for i := range c.cols {
+		row[i] = NullDatum
+	}
+	for srcIdx, tgtOrd := range c.plan.ColumnIndex {
+		row[tgtOrd] = src[srcIdx]
+	}
+	return row
+}
+
+// storeCopyRow runs the per-row work that is the SAME for every COPY input
+// format — defaults, constraints, the heap write, index maintenance — so the
+// text/CSV and BINARY paths cannot drift apart. Upstream has one CopyFrom()
+// loop for all three formats (copyfrom.c), and the binary path here used to
+// inline its own write instead, skipping defaults, NOT NULL, CHECK and domain
+// constraints entirely (review/260831-2 EC-4).
+func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 	// M0134-0005l: apply the same default-filling and constraint sequence
 	// insertOp.Next runs, so COPY FROM stops silently accepting rows PG
 	// rejects and stops storing NULL where PG stores a default
@@ -587,20 +605,12 @@ func (c *CopyFromExecutor) PushBinaryData(chunk []byte) (done bool, err error) {
 	c.binaryBuf = c.binaryBuf[consumed:]
 
 	for _, src := range rows {
-		row := make(Row, len(c.cols))
-		for i := range c.cols {
-			row[i] = NullDatum
+		// Same per-row work as the text/CSV path: PG's CopyFrom() applies
+		// defaults and ExecConstraints for every format, so a binary stream
+		// must not be a way around NOT NULL / CHECK / DEFAULT (EC-4).
+		if storeErr := c.storeCopyRow(c.scatterSourceRow(src)); storeErr != nil {
+			return false, storeErr
 		}
-		for srcIdx, tgtOrd := range c.plan.ColumnIndex {
-			row[tgtOrd] = src[srcIdx]
-		}
-		rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
-		ptr, writeErr := writeHeapRowReturning(c.ctx, rel, c.cols, row)
-		if writeErr != nil {
-			return false, writeErr
-		}
-		maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptr)
-		c.rowsIn++
 	}
 	return trailerFound, nil
 }

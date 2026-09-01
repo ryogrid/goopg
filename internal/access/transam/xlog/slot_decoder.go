@@ -145,10 +145,28 @@ func (s *SlotDecoder) Run(ctx context.Context) error {
 		// correct restart anchor. Slots.AdvanceConfirmedFlushLSN
 		// rounds up so the on-disk state file always reflects
 		// the most recent acked commit.
-		if len(rec.Payload) > 0 && rec.Payload[0] == RecordKindXactCommit {
+		if recordIsXactCommit(rec) {
 			if err := s.slots.AdvanceConfirmedFlushLSN(s.slotName, rec.EndLSN); err != nil {
 				return fmt.Errorf("wal: slot %q advance confirmed_flush_lsn: %w", s.slotName, err)
 			}
 		}
 	}
+}
+
+// recordIsXactCommit reports whether rec is a commit record in EITHER of the
+// two forms Classify dispatches, and it exists because the two must agree
+// (review/260831-2 XL-4): the check used to test the native payload kind only,
+// while every commit the server actually writes is PG-format
+// (initdb/open.go's xact-marker hook calls EncodeXactCommitPG) and reaches
+// ApplyCommit through classifyDecodedXLog. The slot's restart anchor therefore
+// never moved and a restart re-delivered every commit since slot creation.
+func recordIsXactCommit(rec Record) bool {
+	if len(rec.Payload) > 0 {
+		return rec.Payload[0] == RecordKindXactCommit
+	}
+	if rec.XLog == nil {
+		return false
+	}
+	h := rec.XLog.Header
+	return h.Rmid == RmgrXact && h.Info&xlogXactOpMask == xlogXactCommit
 }

@@ -816,6 +816,15 @@ func limitOpNext(tree *opTreeSlab, n *OpNode, dst *Slot) error {
 		}
 		// WITH TIES: continue while ORDER BY key values equal those of
 		// the last emitted row (saved in tieKeyVals). M0097-0042.
+		//
+		// No boundary row means no ties to keep: `FETCH FIRST 0 ROWS WITH
+		// TIES` never emitted one, so tieKeyVals is still nil and the
+		// comparison below would index an empty Row. PG returns zero rows for
+		// a zero count (nodeLimit.c never enters the tie window)
+		// (review/260831-2 EO2-5).
+		if len(s.tieKeyVals) != len(s.tieKeyExprIdxs) {
+			return EOF
+		}
 		if err := opNext(tree, n.childA, dst); err != nil {
 			return err
 		}

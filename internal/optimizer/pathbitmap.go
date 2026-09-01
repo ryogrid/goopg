@@ -173,7 +173,7 @@ func (s *searchCtx) buildOneBitmapPath(
 	idxCost := costBitmapIndexScan(s.cp, in)
 
 	// Compute how many distinct heap pages the bitmap visits.
-	pagesFetched := computeBitmapPages(tuplesFetched, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
+	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
 
 	// Total cost: index access (startup) + heap fetch (run).
 	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T)
@@ -325,12 +325,20 @@ func (s *searchCtx) chooseBitmapAnd(
 
 	// Copy and sort by tree cost (cheapest first), matching PG's
 	// path_usage_comparator sort order.
+	//
+	// review/260831 OP2-14: the comparator used to call costBitmapTree on both
+	// sides of every comparison, so each candidate's cost was recomputed
+	// O(log n) times — and costBitmapTree walks the path's whole bitmap tree.
+	// The costs are computed once and the sort reads them.
 	paths := make([]*Path, len(singlePaths))
 	copy(paths, singlePaths)
+	treeCost := make(map[*Path]float64, len(paths))
+	for _, p := range paths {
+		c, _ := costBitmapTree(s.cp, p.Children[0])
+		treeCost[p] = c
+	}
 	sort.Slice(paths, func(i, j int) bool {
-		ci, _ := costBitmapTree(s.cp, paths[i].Children[0])
-		cj, _ := costBitmapTree(s.cp, paths[j].Children[0])
-		return ci < cj
+		return treeCost[paths[i]] < treeCost[paths[j]]
 	})
 
 	// Pre-extract index column sets for redundancy checks.
@@ -425,7 +433,7 @@ func (s *searchCtx) chooseBitmapAnd(
 	// Recompute heap-access cost atop the AND tree.
 	tuplesFetched := clampRowEst(andSelec * relTuples)
 	andIP := indexPagesForPath(bitmapAndPath, tbl, relTuples)
-	pagesFetched := computeBitmapPages(tuplesFetched, T, andIP, totalPages, s.cp.effectiveCacheSize, maxEntries)
+	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, andIP, totalPages, s.cp.effectiveCacheSize, maxEntries)
 	totalCost := costBitmapHeapScan(s.cp, andCost, pagesFetched, tuplesFetched, T)
 
 	return &Path{
@@ -547,7 +555,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	// relations supplying the parameter. The path cost stays per-execution — PG
 	// pro-rates inside `compute_bitmap_pages` — so the join above still
 	// multiplies by the outer row count without double-counting.
-	pagesFetched := computeBitmapPagesLooped(tuplesFetched, T, indexPages, totalPages,
+	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
 		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(req))
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,

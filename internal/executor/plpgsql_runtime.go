@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -42,15 +43,53 @@ func wrapSQLFunctionContext(err error, funcName string, stmtNum int) error {
 // rewriteSQLNamedParams replaces named parameter references in a SQL function
 // body with positional $n references. This supports SQL functions that reference
 // their arguments by name (e.g. "select value + seed" → "select $1 + $2").
+// namedParamREs caches the per-argument-name regexp rewriteSQLNamedParams
+// needs. review/260831 ES-7: it used to call regexp.MustCompile once per
+// argument on EVERY routine invocation, so a three-argument PL/pgSQL function
+// paid three compilations per call. The key set is the set of argument
+// identifiers appearing in the database's routines, so it is bounded by the
+// schema, not by traffic.
+// plpgsqlBlockCache maps a routine BODY to its parsed PL/pgSQL block.
+//
+// review/260831 ES-9: the body was re-parsed on every call and every trigger
+// firing — a full PL/pgSQL parse per row for a row-level trigger. The
+// interpreter only READS the block (it lowers each statement into fresh
+// optimizer/expression values as it goes), and the key is the body text itself,
+// so a CREATE OR REPLACE simply lands on a different key.
+var plpgsqlBlockCache sync.Map // string -> *plpgsql.Block
+
+func parsePLpgSQLBody(body string) (*plpgsql.Block, error) {
+	if v, ok := plpgsqlBlockCache.Load(body); ok {
+		return v.(*plpgsql.Block), nil
+	}
+	blk, err := plpgsql.Parse(body)
+	if err != nil {
+		return nil, err
+	}
+	plpgsqlBlockCache.Store(body, blk)
+	return blk, nil
+}
+
+var namedParamREs sync.Map // string -> *regexp.Regexp
+
+func namedParamRE(name string) *regexp.Regexp {
+	if v, ok := namedParamREs.Load(name); ok {
+		return v.(*regexp.Regexp)
+	}
+	// Match either a string literal (to skip) OR the parameter name as a
+	// whole word. String literals come first in the alternation so they're
+	// consumed without replacement.
+	re := regexp.MustCompile(`'(?:[^'\\]|\\.)*'|(?i)\b` + regexp.QuoteMeta(name) + `\b`)
+	namedParamREs.Store(name, re)
+	return re
+}
+
 func rewriteSQLNamedParams(body string, argNames []string) string {
 	for i, name := range argNames {
 		if name == "" {
 			continue
 		}
-		// Match either a string literal (to skip) OR the parameter name as a
-		// whole word. String literals come first in the alternation so they're
-		// consumed without replacement.
-		re := regexp.MustCompile(`'(?:[^'\\]|\\.)*'|(?i)\b` + regexp.QuoteMeta(name) + `\b`)
+		re := namedParamRE(name)
 		pos := i + 1 // 1-based
 		body = re.ReplaceAllStringFunc(body, func(m string) string {
 			if m[0] == '\'' {
@@ -946,7 +985,7 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 			}
 		}
 	}
-	block, err := plpgsql.Parse(r.Body)
+	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return nil, &ExecError{Code: "P0000", Pos: pos, Message: fmt.Sprintf("invalid PL/pgSQL body for function %s: %v", r.QualifiedName(), err)}
 	}
@@ -1208,7 +1247,7 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 			}
 		}
 	}
-	block, err := plpgsql.Parse(r.Body)
+	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return Datum{}, &ExecError{Code: "P0000", Pos: pos, Message: fmt.Sprintf("invalid PL/pgSQL body for function %s: %v", r.QualifiedName(), err)}
 	}
@@ -1512,10 +1551,21 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if err != nil {
 				return Datum{}, flowNone, err
 			}
-			if sv.IsNull() || sv.Kind != KindInt {
+			if sv.IsNull() {
+				// PG: pl_exec.c, ERRCODE_NULL_VALUE_NOT_ALLOWED.
+				return Datum{}, flowNone, &ExecError{Code: "22004", Pos: s.Pos(), Message: "BY value of FOR loop cannot be null"}
+			}
+			if sv.Kind != KindInt {
 				return Datum{}, flowNone, &ExecError{Code: "42804", Pos: s.Pos(), Message: "FOR loop step must be an integer"}
 			}
 			stepVal = sv.Int
+			// review/260831-2 ES-6: a zero or negative BY step used to reach
+			// the loops below, where `i += stepVal` never advances past the
+			// bound — the backend spun forever inside the function. PG
+			// rejects it up front (pl_exec.c, ERRCODE_INVALID_PARAMETER_VALUE).
+			if stepVal <= 0 {
+				return Datum{}, flowNone, &ExecError{Code: "22023", Pos: s.Pos(), Message: "BY value of FOR loop must be greater than zero"}
+			}
 		}
 		if lower.IsNull() || lower.Kind != KindInt || upper.IsNull() || upper.Kind != KindInt {
 			return Datum{}, flowNone, &ExecError{Code: "42804", Pos: s.Pos(), Message: "FOR loop bounds must be integers"}
@@ -2625,7 +2675,15 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		}
 		return &optimizer.BinaryOp{Op: x.Op, Left: left, Right: right}, nil
 	case *parser.CastExpr:
-		return lowerPLpgSQLExpr(x.Operand, frame)
+		// review/260831-2 ES-7: this used to return the operand unchanged, so
+		// every cast inside a PL/pgSQL expression was a no-op and the
+		// expression evaluated at the operand's type ("5::float8 / 2" gave 2,
+		// not 2.5). Lower it the way the planner does.
+		operand, err := lowerPLpgSQLExpr(x.Operand, frame)
+		if err != nil {
+			return nil, err
+		}
+		return optimizer.NewCastExprFromParser(x, operand), nil
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "window function calls are not supported in PL/pgSQL expressions in v0"}
@@ -3015,7 +3073,7 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 		// postgres/src/backend/commands/trigger.c ExecCallTriggerFunc.
 		return nil, false, nil
 	}
-	block, err := plpgsql.Parse(r.Body)
+	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return nil, false, &ExecError{Code: "P0000", Message: fmt.Sprintf("invalid trigger body for %s: %v", r.QualifiedName(), err)}
 	}

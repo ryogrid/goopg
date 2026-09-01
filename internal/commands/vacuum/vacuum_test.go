@@ -420,3 +420,49 @@ func TestVacuumTailTruncation(t *testing.T) {
 		t.Fatalf("wal truncate calls=%d want 1", walCalls)
 	}
 }
+
+// TestVacuumTailTruncationKeepsVMSkippedBlocks is the review/260831-2 NB-1
+// guard: the VM-skip branch used to `continue` without touching lastNonEmpty,
+// so a trailing run of ALL_VISIBLE blocks holding LIVE tuples looked empty to
+// the truncation step and was dropped from the relation. Upstream advances
+// `vacrel->nonempty_pages` on the same skip path (vacuumlazy.c
+// heap_vac_scan_next_block) for exactly this reason.
+func TestVacuumTailTruncationKeepsVMSkippedBlocks(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+
+	vm := storage.NewVisibilityMap()
+
+	mvccMgr := transam.NewManager()
+	tx1, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
+	mvccMgr.Commit(tx1)
+
+	const nBlocks = 4
+	if _, err := pool.ExtendRelationBatch(rel, nBlocks); err != nil {
+		t.Fatalf("ExtendRelationBatch: %v", err)
+	}
+	// Blocks 0..2 hold live tuples and are ALL_VISIBLE (so a non-aggressive
+	// pass skips them); the final block is left untouched — a freshly
+	// extended, never-written page, which the scan skips as `IsNew`.
+	for b := storage.BlockNumber(0); b < nBlocks-1; b++ {
+		live := storage.NewHeapTuple(xid1, storage.InvalidTransactionID, []byte("v"))
+		addTuple(t, pool, rel, b, live)
+		vm.SetAllVisible(rel, b)
+	}
+
+	pool.SetLogSmgrTruncateTo(func(rel storage.RelFileNode, keep storage.BlockNumber) error { return nil })
+
+	st, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{VM: vm, Truncate: true})
+	if err != nil {
+		t.Fatalf("vacuum: %v", err)
+	}
+	if st.SkippedAllVisible != nBlocks-1 {
+		t.Fatalf("skip stats = %+v, want SkippedAllVisible=%d", st, nBlocks-1)
+	}
+	// Only the trailing empty block may go.
+	if n, _ := pool.NBlocks(rel); n != nBlocks-1 {
+		t.Fatalf("post-truncate nblocks=%d want %d — live all-visible blocks were truncated away", n, nBlocks-1)
+	}
+}

@@ -42,6 +42,11 @@ type joinOp struct {
 	right  Operator
 	schema optimizer.Schema
 
+	// slot is reused across emissions (review/260831 EO2-24); the returned
+	// pointer is stable and its row field is overwritten each Next, exactly
+	// as indexScanOp's is.
+	slot MaterializedSlot
+
 	ctx *Context
 
 	// M0036 lazy-output state (hash join only)
@@ -427,7 +432,15 @@ func (o *joinOp) nextMerge() (TupleSlot, error) {
 	if err != nil {
 		return nil, err
 	}
-	return asSlot(o.Schema(), row), nil
+	if row == nil {
+		return nil, nil
+	}
+	// review/260831 EO2-24: emit through the operator's own slot instead of
+	// allocating a MaterializedSlot per row. Same idiom, and same
+	// "valid until the next Next()" contract, as indexScanOp (M0092-0007).
+	o.slot.schema = o.schema
+	o.slot.row = row
+	return &o.slot, nil
 }
 
 // lateralBindable is implemented by FROM-clause SRFs that can have
@@ -1807,6 +1820,8 @@ type aggregateOp struct {
 	plan   *optimizer.Aggregate
 	child  Operator
 	schema optimizer.Schema
+	// slot is reused across emissions (review/260831 EO2-24).
+	slot MaterializedSlot
 
 	ctx  *Context
 	rows []Row
@@ -1864,7 +1879,14 @@ type aggRuntime struct {
 	// Extended aggregate accumulators (M0097-0007).
 	boolResult bool   // for bool_and / bool_or / every
 	intResult  int64  // for bit_and / bit_or / bit_xor
-	strResult  string // for string_agg
+	strResult  string // for bit_and/bit_or/bit_xor's BIT(n) width tag
+	// strAccum is string_agg's unordered accumulator. review/260831 EO2-1:
+	// this used to be `strResult += delim + piece`, which reallocates and
+	// recopies the whole accumulator per input row — O(n^2) bytes copied for
+	// one group. Appending to a byte slice amortises the growth, and it holds
+	// bytea mode's RAW bytes just as well as text mode's UTF-8 (finishAgg
+	// renders bytea through byteaOutMode at the end either way).
+	strAccum []byte
 	// arrayElems holds the accumulated element format-strings for
 	// array_agg(expr); arrayElemNull[i] marks element i as NULL
 	// (reserved — current applyAgg skips NULL inputs, so this is
@@ -1882,7 +1904,7 @@ type aggRuntime struct {
 	// PostgreSQL sorts the transition inputs before running the transition
 	// function (nodeAgg.c process_ordered_aggregate_single), so the delimiter
 	// that separates two adjacent pieces is the *right-hand* row's own second
-	// argument — which is only knowable after the sort. strResult stays the
+	// argument — which is only knowable after the sort. strAccum stays the
 	// accumulator for the far more common unordered case.
 	strElems    []string
 	strDelims   []string
@@ -2854,7 +2876,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			}
 		}
 	case "string_agg":
-		// string_agg(expr, delimiter) — accumulate in strResult with delimiter.
+		// string_agg(expr, delimiter) — accumulate in strAccum with delimiter.
 		// For bytea values, st.boolResult=true signals bytea mode: the RAW
 		// bytes are accumulated (a Go string is just a byte sequence — no hex
 		// encoding here), and finishAgg's "string_agg" case renders the
@@ -2896,12 +2918,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 				st.hasValue = true
 				break
 			}
-			if !st.hasValue {
-				st.strResult = raw
-				st.hasValue = true
-			} else {
-				st.strResult += delimRaw + raw
+			if st.hasValue {
+				st.strAccum = append(st.strAccum, delimRaw...)
 			}
+			st.strAccum = append(st.strAccum, raw...)
+			st.hasValue = true
 			break
 		}
 		// Text string_agg: evaluate the delimiter from Arg2.
@@ -2925,12 +2946,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			st.hasValue = true
 			break
 		}
-		if !st.hasValue {
-			st.strResult = sv
-			st.hasValue = true
-		} else {
-			st.strResult += delim + sv
+		if st.hasValue {
+			st.strAccum = append(st.strAccum, delim...)
 		}
+		st.strAccum = append(st.strAccum, sv...)
+		st.hasValue = true
 	case "array_agg":
 		// array_agg(expr [ORDER BY sort_list]) — accumulate per-row elements.
 		// NULLs are included as array elements (PostgreSQL semantics).
@@ -3685,6 +3705,33 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Da
 	return o.finishBuiltinAgg(st, call), nil
 }
 
+// foldIntLaneIntoNumeric merges the int-lane running sum into the numeric lane
+// so a group that used BOTH lanes reports their total.
+//
+// aggRuntime carries two accumulators for sum/avg — `sum` for KindInt inputs
+// and `numericSum` for KindNumeric ones — and the finalizers below return the
+// numeric lane whenever it is live, which silently discarded whatever the int
+// lane held. A group mixes the lanes whenever its argument's Kind varies per
+// row (`sum(CASE WHEN a = 1 THEN 1 ELSE 1.5 END)` returned 4.5 where PG 18.3
+// returns 5.5), and the parallel combine can mix them across workers too
+// (parallel_agg_combine.go:combineNumericSum, review/260831-2 ES-1).
+//
+// An overflow in the fold leaves the state untouched: finishBuiltinAgg has no
+// error channel, and reporting the numeric lane alone is the pre-existing
+// behaviour for that (unreachable in practice) case.
+func foldIntLaneIntoNumeric(st aggRuntime) aggRuntime {
+	if st.numericSum.Kind != KindNumeric || st.sum == 0 {
+		return st
+	}
+	total, err := numericAdd(st.numericSum, numericFromInt(st.sum))
+	if err != nil {
+		return st
+	}
+	st.numericSum = total
+	st.sum = 0
+	return st
+}
+
 // finishBuiltinAgg finalizes a built-in aggregate. Split out of finishAgg by
 // M0125-0025 so that adding the error channel the user-defined path needs did
 // not have to touch this body's ~100 returns, none of which can fail.
@@ -3706,6 +3753,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
 		}
+		st = foldIntLaneIntoNumeric(st)
 		if st.numericSum.Kind == KindNumeric {
 			// For float4 input, PostgreSQL uses float4 as the transition type
 			// (float4pl accumulation with intermediate float32 rounding). Simulate
@@ -3738,6 +3786,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
 		}
+		st = foldIntLaneIntoNumeric(st)
 		// avg(float4/float8) returns float8 — use float64 division and format
 		// with %.15g to match PostgreSQL's float8out. M0097-0020.
 		if strings.EqualFold(call.Type.Name, "float8") || strings.EqualFold(call.Type.Name, "float4") {
@@ -3789,7 +3838,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		if !st.hasValue {
 			return NullDatum
 		}
-		out := st.strResult
+		out := string(st.strAccum)
 		// The aggregate's own ORDER BY deferred concatenation to here
 		// (M0125-0019). Each piece carries the delimiter it was collected
 		// with, and PG emits the delimiter of the RIGHT-hand piece between
@@ -4032,7 +4081,10 @@ func (o *aggregateOp) Next() (TupleSlot, error) {
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return asSlot(o.schema, row), nil
+	// review/260831 EO2-24: reuse the operator's slot (see joinOp.nextMerge).
+	o.slot.schema = o.schema
+	o.slot.row = row
+	return &o.slot, nil
 }
 
 func (o *aggregateOp) Close() error {

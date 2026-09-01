@@ -419,6 +419,27 @@ func (p *bodyParser) parseWhile() (*WhileStmt, error) {
 	return &WhileStmt{pos: whileTok.Pos, Cond: cond, Body: body}, nil
 }
 
+// dotDotBeforeLoop reports whether a `..` range separator appears at paren
+// depth 0 before the LOOP keyword that closes a FOR control clause. It is a
+// pure lookahead — p.idx is not moved.
+func (p *bodyParser) dotDotBeforeLoop() bool {
+	depth := 0
+	for i := p.idx; i < len(p.tokens); i++ {
+		t := p.tokens[i]
+		switch {
+		case t.Kind == parser.TokenSymbol && t.Value == "(":
+			depth++
+		case t.Kind == parser.TokenSymbol && t.Value == ")":
+			depth--
+		case depth == 0 && t.Kind == parser.TokenOperator && t.Value == "..":
+			return true
+		case depth == 0 && t.Kind == parser.TokenKeyword && t.Keyword == parser.KwLoop:
+			return false
+		}
+	}
+	return false
+}
+
 // parseFor parses FOR loops: integer-range (`FOR var IN low..high`)
 // or query-based (`FOR rec IN SELECT ...`). M0097-0012 extended.
 func (p *bodyParser) parseFor() (Stmt, error) {
@@ -447,7 +468,14 @@ func (p *bodyParser) parseFor() (Stmt, error) {
 			t.Keyword == parser.KwExecute) {
 			isQueryFor = true
 		} else if t.Kind == parser.TokenSymbol && t.Value == "(" {
-			isQueryFor = true
+			// A leading '(' is ambiguous: `FOR r IN (SELECT …) LOOP` is a
+			// query FOR, but `FOR i IN (1+1)..4 LOOP` is an integer range
+			// whose lower bound merely happens to be parenthesised. PG
+			// resolves it by which terminator the bound expression stops at
+			// (pl_gram.y for_control: read_sql_expression2(K_DOTDOT, K_LOOP)),
+			// i.e. a top-level `..` ahead of LOOP means integer FOR. Measured
+			// on PG 18.3: `FOR i IN (1+1)..4 LOOP s := s + i;` sums to 9.
+			isQueryFor = !p.dotDotBeforeLoop()
 		}
 	}
 

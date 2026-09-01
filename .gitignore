@@ -140,3 +140,5 @@ internal/sqlparser/y.output
 internal/sqlparser/yacc_stderr.txt
 
 !opencode.json
+# Mermaid validator
+tools/mermaid-validator/node_modules/

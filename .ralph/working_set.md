@@ -1,69 +1,89 @@
 (idle — nothing in flight)
 
-## Loop #9 result — M0134-0177 landed
+## Loop #13 (2026-09-01) result — M0119-0006 97th slice landed (commit `56e4f98f6`)
 
-**Nightly triage:** `ci/logs/action-items.md` unchanged (run `20260828-235424`);
-both `## AI-` items already have M-NIGHTLY rows (001 ticked, 002 open — Q5
-timeout). Nothing new to file. Banner: M-NIGHTLY filing is unconditional but
-SELECTION is subordinate to M0134 while any M0134 task is unchecked → worked
-M0134 by ID ascending. `-0176a/-0176b` are letter sub-items, not the next ID.
+**Nightly triage:** `ci/logs/action-items.md` still the same run
+`20260901-010436` (7 items, mtime 02:11) loops #10-#12 already confirmed
+filed. Re-verified this loop: all 7 subjects (`IsolationIntraGrantInplace`,
+`IsolationStats`, `LockRowsSortOverJoinTakesRowLock`, `PgDumpConnectionSetup`,
+`PgStatActivity`, `RegressSuite`, `TestSyntax_Catalog_PgStatActivity`) already
+have an unchecked M-NIGHTLY task in `fix_plan.md` from earlier runs. No new
+filing needed.
 
-**Task:** M0134-0177 — `test_setup.sql`. Case **PASSES** (237 lines, 100%
-parity), CSV `not-tried` → `pass`/`pass_required=yes`. Design
-`docs/design/m0134-0177-btree-split-posting-refill.md`.
+**Task:** per the Current Priority banner (M0134 exhausted, active selection
+M0119, sole open task M0119-0006 "pg_amcheck server tier"). Rather than
+trusting the CSV's stale "unsupported index AM" premise, empirically drove
+the REAL `pg_amcheck` binary against `003_check.pl`'s exact upstream fixture
+(box/int4range/int4[] columns + `USING {BTREE,HASH,BRIN,GIST,GIN,SPGIST}`
+indexes) on a fresh capped goopg server. Finding: the **entire fixture setup
+already succeeds** — refutes half the AC-003 premise (mirrors the earlier
+`[[ac003_blocker3_refuted_pg_amcheck_whole_db_clean]]` pattern). What
+`pg_amcheck` itself surfaced instead: `pg_class.relam` reported btree (403)
+for EVERY gist/gin/spgist/brin index, so pg_amcheck's own btree-only
+enumeration query wrongly selected them and errored "is not a B-Tree index"
+(exit 2, six spurious errors).
 
-**Five things worth carrying:**
+**Root cause:** two sibling pg_class row builders — `internal/catalog/
+catalog.go`'s virtual `VirtualRows` pg_class path and `internal/executor/
+pg18_user_catalog_rows.go`'s `buildUserPGClassRowForIndex` (heap-persisted,
+PG-standby-facing sibling) — only special-cased `idx.Method=="hash"` (itself
+DEAD: a `USING hash` index stores `idx.Method=="btree"` by design,
+`idx.DeclaredHash` is the separate marker) and silently defaulted every other
+non-btree method to btree's oid. gist/gin/spgist/brin indexes ARE registered
+catalog-only under their real `Method` string (`execCreateIndex`'s
+`method=="gist"||...` branch) — the builders just never consulted it, even
+though the canonical `AccessMethodOIDByName(name)` map already existed one
+file away.
 
-1. **A "not-tried" case can be un-RUNNABLE, not just untested.** `test_setup.sql`
-   already matched PG byte-for-byte; the runner just executed it twice (its own
-   prerequisite, then the test). Before assuming a case diverges, check that the
-   harness can run it *once*.
+**Fix landed:** both builders now resolve `AccessMethodOIDByName(idx.Method)`,
+carved out for `idx.DeclaredHash` (hash unchanged — still reports btree's
+oid, matching the documented "everywhere else in goopg" contract). New
+`indexRelamOID` helper in `pg18_user_catalog_rows.go`. Verified end-to-end:
+`pg_amcheck --schema=s1 postgres` went from exit 2 to exit 0/clean, identical
+to real PG.
 
-2. **The engine bug was found by the double-run, not by the case.** Second
-   `COPY` into a populated `onek` → `panic="storage: not enough free space in
-   page"` in `nbtree.mustInsertItemSorted`. Root cause: `pageItems` EXPANDS
-   posting lists (one item per heap TID) and the split refill wrote each back as
-   its own plain line pointer. Measured with a temporary `SPLITDBG` printf: an
-   8132-byte leaf expanded to **21960** bytes; both halves of a 50/50 cut
-   overflowed. Normal splits log ~8700 = "one page + the new item" — that ratio
-   is the invariant to check if this area regresses.
+**Files:** `internal/catalog/catalog.go` (relam builder fix), `internal/
+executor/pg18_user_catalog_rows.go` (`indexRelamOID` helper + call site),
+`docs/design/0100-0149/0119-0006-pg-class-relam-nonbtree-index-am.md` (new
+design doc, accepted), `docs/design/README.md` (indexed as `0119-0006bm`),
+`.ralph/deferral_ledger.md` (new row).
 
-3. **Revert-check with a full READBACK, not just "no panic".** The guard at HEAD
-   fails `RangeScan returned 21396 entries, want 21600` — the old split path
-   *silently dropped 204 index entries* on shapes that didn't crash. A no-panic
-   assertion would have missed the worse half of the bug.
+**Key symbols:** `catalog.AccessMethodOIDByName`, `catalog.Index.Method` /
+`.DeclaredHash`, `executor.indexRelamOID`, `executor.execCreateIndex`
+(operators_ddl.go:7502, the gist/gin/spgist/brin catalog-only branch at
+:7632).
 
-4. **Sibling-paths rule, size-model edition (3rd instance after
-   `itemEncodedSize`/root-0040).** `byteAwareSplitLoc` priced items with a
-   *different* expression than `itemEncodedSize` — no line pointer, no MAXALIGN,
-   no postings. Fix funnels writer and budget through one function
-   (`postingChunkLens`) and pins the equality in a test. Deleted the two
-   superseded helpers rather than leaving them as wrong-model siblings.
+**New deferral (recorded, NOT fixed — separate bug, one-task-per-loop):**
+while re-verifying, an EMPTY partition child (`CREATE TABLE p1_1 PARTITION OF
+p1 FOR VALUES IN (...)`, zero rows ever inserted) makes `pg_amcheck` error
+`could not open file ... No such file or directory` on `verify_heapam()` —
+goopg apparently never creates a heap relation's main-fork file until first
+write (lazy `smgr` creation), so a genuinely-empty table looks ENOENT the
+same way a REMOVED file does (see `[[goopg_smgr_ocreate_recreates_removed_files]]`).
+Root-causing this (partition-specific vs. general) is the next M0119-0006
+slice — resume point and the "must not regress
+`TestVerifyHeapam_DetectsMissingRelationFile`" constraint are in the ledger
+row appended this loop.
 
-5. **`pg-regress-runner.sh` quick-set A/B vs stashed HEAD is a cheap, sharp
-   gate** for high-blast-radius storage changes: ~10 min a side, and
-   "byte-identical, same 48 diff files, same line counts" is much stronger
-   evidence than a bare pass count (the quick set sits at 4/52 for unrelated
-   reasons, so the absolute number says nothing).
+**NEXT LOOP:** Re-check the `## Current Priority` banner first (still M0119
+unless something changed it). Continue M0119-0006 with the empty-heap-file
+ENOENT deferral above as the concrete next slice: (1) confirm whether it's
+partition-specific or general (repro with a bare non-partition empty table);
+(2) if general, decide fix site — eager file touch at CREATE TABLE time vs.
+teaching `verify_heapam`'s Open/NBlocks path (`internal/executor/
+operators_verify_heapam.go`) to disambiguate "empty, never written" from
+"removed after having data" without breaking
+`TestVerifyHeapam_DetectsMissingRelationFile`. Continue driving the REAL
+`pg_amcheck` binary against fixture slices — it is a much faster oracle for
+this milestone than reasoning from the CSV's (partially stale) blocker
+descriptions.
 
-**Trap re-confirmed:** the throwaway-PG oracle is worth the 30s (`initdb -A
-trust` + `pg_ctl -o "-p 5542 -k /tmp"`) — it settled that psql's
-`psql:<file>:<line>:` NOTICE prefix is a `-f` artifact and that pg_regress uses
-a **stdin redirect** (`pg_regress_main.c:75`), which is why expected files carry
-bare `NOTICE:`. Separately: a `psql` against the TPC-H reference PG on **65432**
-hung for 15 min — do not probe the bench clusters for one-off oracle questions.
+**Gates run:** `go build ./...` clean; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` full suite PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=34); pre-commit pgbench smoke PASS (509/655/11768 TPS, 0
+failed) fired automatically via the git hook. `make ralph-state-guard`:
+found the same benign running/completed mismatch loops #4-#13 have all seen,
+auto-repaired.
 
-**Gates run:** `go test ./internal/access/nbtree/... ./internal/storage/...`
-PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12 rows=2 22.2s, Q13 rows=34 9.3s);
-`scripts/pg-regress-runner.sh` quick set A/B **byte-identical**;
-`scripts/pg-regress-runner.sh -v test_setup` PASS; double-`test_setup` repro 0
-panics; `make regen-testport` + `make check-testport-inventory` PASS;
-`make ralph-state-guard` OK (auto-repaired the progress marker). gofmt drift on
-`btree.go` is **pre-existing at HEAD** (verified by stash); the new/changed
-`posting.go`, `bulkload.go` and the new test file are gofmt-clean.
-
-**NOT run:** TPC-DS SF0.5 gate (~1 h). This is an index-core change, so it is
-the one gate worth adding if anything looks off downstream.
-
-**In-flight:** none.
+**In-flight:** none. Throwaway probe server/data dir (`/tmp/m0119data`,
+`/tmp/goopg-m0119`) cleaned up before commit.

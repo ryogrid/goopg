@@ -73,6 +73,53 @@ func TestParseCopyTimestampISO8601SeparatorAndZulu(t *testing.T) {
 	}
 }
 
+// TestParseCopyTimestampSpaceBeforeOffset is M0134-0189 (xmlmap.sql): PG's
+// DecodeDateTime tokenizes on whitespace, so a numeric zone offset is legal
+// input whether or not a space separates it from the time field —
+// `'2009-06-08 21:07:30 -07'::timestamptz` and `'...30-07'::timestamptz` are
+// the same instant (verified against a local PG 18.3 cluster). goopg's
+// pgTimestampLayouts only had the no-space spelling for every zone-bearing
+// entry, so xmlmap.sql's own INSERT (`'2009-06-08 21:07:30 -07'` into a
+// timestamptz column) raised 22007 on otherwise-valid PG input.
+func TestParseCopyTimestampSpaceBeforeOffset(t *testing.T) {
+	base := time.Date(2009, 6, 8, 21, 7, 30, 0, time.UTC)
+	for _, c := range []struct {
+		in   string
+		want time.Time
+	}{
+		{"2009-06-08 21:07:30 -07", base.Add(7 * time.Hour)},
+		{"2009-06-08 21:07:30 -07:00", base.Add(7 * time.Hour)},
+		{"2009-06-08 21:07:30 +0700", base.Add(-7 * time.Hour)},
+		{"2009-06-08T21:07:30 -07", base.Add(7 * time.Hour)},
+		{"2009-06-08 21:07 -07", time.Date(2009, 6, 8, 21, 7, 0, 0, time.UTC).Add(7 * time.Hour)},
+		// The no-space spelling must keep working (a regression on the
+		// duplicated layout entries would only show up on the space form).
+		{"2009-06-08 21:07:30-07", base.Add(7 * time.Hour)},
+	} {
+		got, err := parseCopyTimestamp(c.in)
+		if err != nil {
+			t.Errorf("parseCopyTimestamp(%q): %v — PG reads this as %v", c.in, err, c.want)
+			continue
+		}
+		if !got.UTC().Equal(c.want) {
+			t.Errorf("parseCopyTimestamp(%q) = %v, want %v", c.in, got.UTC(), c.want)
+		}
+	}
+	// `timestamp` (no time zone) discards the offset either way, matching
+	// timestamp_in's tsDiscardZone rule — the space must not change that.
+	discardWant := base
+	for _, in := range []string{"2009-06-08 21:07:30 -07", "2009-06-08 21:07:30-07"} {
+		got, err := parseCopyTimestampZone(in, tsDiscardZone)
+		if err != nil {
+			t.Errorf("parseCopyTimestampZone(%q, tsDiscardZone): %v", in, err)
+			continue
+		}
+		if !got.UTC().Equal(discardWant) {
+			t.Errorf("parseCopyTimestampZone(%q, tsDiscardZone) = %v, want %v", in, got.UTC(), discardWant)
+		}
+	}
+}
+
 // TestTimestampLiteralAndCopyPathsAgree is the sibling-path guard that the
 // shared layout table exists to make cheap (Hard-won Rule #2). A typed literal
 // and the same text arriving through COPY / the value encoder must decode to

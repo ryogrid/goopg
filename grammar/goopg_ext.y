@@ -2501,6 +2501,7 @@ opt_opt_value:
 		/* empty */   { $$ = "" }
 	| TRUE_P          { $$ = "true" }
 	| FALSE_P         { $$ = "false" }
+	| ON              { $$ = "on" }
 	| ColId           { $$ = $1 }
 	| SCONST          { $$ = $1 }
 	| signed_iconst   { $$ = strconv.FormatInt($1, 10) }

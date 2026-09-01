@@ -194,3 +194,48 @@ func assertArrayKeysEqualLiterals(t *testing.T, path string, got [][]byte, wantL
 		}
 	}
 }
+
+// TestEncodeArrayBTreeKeyQuotedNullIsNotNull is the review/260831-2 EC-2 guard.
+// The element scan used to hand encodeArrayBTreeKey the UNQUOTED text of every
+// element, so `{"NULL"}` — a one-element array holding the four-character
+// string — was encoded with the NULL element tag, byte-identical to `{NULL}`.
+// PG keeps them apart and sorts them at opposite ends (captured from the PG
+// 18.3 oracle):
+//
+//	select v.x::text from (values ('{}'::text[]),('{"NULL"}'),('{NULL}'),
+//	                              ('{a}'),('{ZZ}')) v(x) order by v.x;
+//	 {} | {"NULL"} | {ZZ} | {a} | {NULL}
+//
+// i.e. the string 'NULL' sorts with the other strings while a real NULL element
+// sorts after all of them, and `'{NULL}' = '{"NULL"}'` is false.
+func TestEncodeArrayBTreeKeyQuotedNullIsNotNull(t *testing.T) {
+	col := &catalog.Column{Name: "a", Type: catalog.Type{Name: "text", IsArray: true}}
+	order := []string{"{}", `{"NULL"}`, "{ZZ}", "{a}", "{NULL}"}
+	keys := make([][]byte, len(order))
+	for i, lit := range order {
+		k, err := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), col, 0)
+		if err != nil {
+			t.Fatalf("encode %s: %v", lit, err)
+		}
+		keys[i] = k
+	}
+	for i := 1; i < len(keys); i++ {
+		if bytes.Compare(keys[i-1], keys[i]) >= 0 {
+			t.Errorf("key(%s)=%x is not below key(%s)=%x, but PG orders them that way",
+				order[i-1], keys[i-1], order[i], keys[i])
+		}
+	}
+	// The distinct-keys property spelled out: a probe for the string must not
+	// land on the NULL element (a unique index would call that a duplicate).
+	if bytes.Equal(keys[1], keys[4]) {
+		t.Errorf(`key({"NULL"}) and key({NULL}) are identical (%x); PG reports '{NULL}' = '{"NULL"}' as false`, keys[1])
+	}
+	// The unquoted NULL token stays case-insensitive, as array_in has it.
+	lower, err := encodeBTreeKeyForColumn(nil, NewStringDatum("{nUlL}"), col, 0)
+	if err != nil {
+		t.Fatalf("encode {nUlL}: %v", err)
+	}
+	if !bytes.Equal(lower, keys[4]) {
+		t.Errorf("key({nUlL})=%x differs from key({NULL})=%x; array_in reads both as a NULL element", lower, keys[4])
+	}
+}

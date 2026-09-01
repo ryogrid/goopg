@@ -174,7 +174,15 @@ func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.T
 		return true
 	}
 	if h.Infomask&storage.HeapXmaxCommitted != 0 {
-		return false
+		// The hint bit only records that xmax committed at SOME point; it
+		// says nothing about whether THIS snapshot predates that commit. A
+		// snapshot taken while the deleter was still in progress must keep
+		// seeing the row — PG re-checks the snapshot in this very branch
+		// (HeapTupleSatisfiesMVCC: `if (XidInMVCCSnapshot(xmax, snapshot))
+		// return true;`). Returning false outright hid rows from RR/SSI
+		// snapshots once any scan set the bit, and disagreed with the
+		// TupleVisibleSubxact twin below (review/260831-2 TA-1).
+		return !snap.SeesCommittedXID(effXmax)
 	}
 	// Deleted by a transaction visible as committed to the snapshot:
 	// invisible. Otherwise (future or still in-progress): visible.

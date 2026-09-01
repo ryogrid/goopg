@@ -298,14 +298,24 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
-	case "timestamp":
+	case "timestamp", "timestamptz":
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
-		return encodeTimestampBinary(d.TimeValue().UTC()), nil
-	case "timestamptz":
-		if d.Kind != KindTime {
-			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		// The ±infinity sentinels ship PG's DT_NOEND / DT_NOBEGIN wire value
+		// (PG_INT64_MAX / PG_INT64_MIN micros, timestamp_send) — the heap
+		// encode arm in codec.go already does this and the two must agree
+		// (Hard-won Rule #2). Without the intercept the KindTime carrier's
+		// INT64-extreme nanoseconds fall through TimeValue() and ship a
+		// finite ~year-2262 instant. (review/260831-2 EC-7)
+		if d.IsTimestampNotFinite() {
+			b := make([]byte, 8)
+			sentinel := int64(math.MinInt64)
+			if d.IsTimestampPosInf() {
+				sentinel = math.MaxInt64
+			}
+			binary.BigEndian.PutUint64(b, uint64(sentinel))
+			return b, nil
 		}
 		return encodeTimestampBinary(d.TimeValue().UTC()), nil
 	case "time", "time without time zone":
@@ -338,6 +348,18 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 	case "date":
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		// Sibling of the timestamp intercept above: DATEVAL_NOEND /
+		// DATEVAL_NOBEGIN = PG_INT32_MAX / PG_INT32_MIN days (date_send).
+		// (review/260831-2 EC-7)
+		if d.IsTimestampNotFinite() {
+			b := make([]byte, 4)
+			sentinel := int32(math.MinInt32)
+			if d.IsTimestampPosInf() {
+				sentinel = math.MaxInt32
+			}
+			binary.BigEndian.PutUint32(b, uint32(sentinel))
+			return b, nil
 		}
 		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 		days := int32(d.TimeValue().UTC().Truncate(24*time.Hour).Sub(epoch).Hours() / 24)
@@ -538,6 +560,15 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("timestamp: expected 8 bytes, got %d", len(payload))
 		}
 		usec := int64(binary.BigEndian.Uint64(payload))
+		// Decode twin of the encode intercept: timestamp_recv accepts
+		// DT_NOEND / DT_NOBEGIN unchanged, and the epoch arithmetic below
+		// would overflow on them. (review/260831-2 EC-7)
+		switch usec {
+		case math.MaxInt64:
+			return NewTimestampInfinity(true), nil
+		case math.MinInt64:
+			return NewTimestampInfinity(false), nil
+		}
 		ts := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
 		// M0119-0006 (41st slice): the column type is in reach here, so this
 		// decoder owes the same subtype tag the heap decode already applies
@@ -588,6 +619,14 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
 		}
 		days := int32(binary.BigEndian.Uint32(payload))
+		// Decode twin of the encode intercept: date_recv accepts
+		// DATEVAL_NOEND / DATEVAL_NOBEGIN unchanged. (review/260831-2 EC-7)
+		switch days {
+		case math.MaxInt32:
+			return NewDateInfinity(true), nil
+		case math.MinInt32:
+			return NewDateInfinity(false), nil
+		}
 		d := pgEpoch.AddDate(0, 0, int(days))
 		return NewDateDatum(d), nil
 	case "interval":
@@ -762,58 +801,11 @@ func decodeNumericBinary(payload []byte) (Datum, error) {
 		digits[i] = int64(binary.BigEndian.Uint16(payload[8+i*2:]))
 	}
 
-	// Reconstruct the numeric value as mantissa × 10^-dscale.
-	// weight is the power of 10000 of the first digit.
-	// Total integer value = sum(digits[i] * 10000^(weight-i)).
-	// Mantissa (at scale dscale) = value * 10^dscale.
-	var mantissa int64
-	overflow := false
-	for i, d := range digits {
-		exp := weight - i
-		if exp >= 0 {
-			// Integer part
-			for j := 0; j < exp; j++ {
-				if mantissa > math.MaxInt64/10000 {
-					overflow = true
-					break
-				}
-				mantissa *= 10000
-			}
-			if overflow {
-				break
-			}
-			mantissa += d
-		} else {
-			// Fractional part: digit d contributes at position -exp*4 digits after decimal
-			// This is already handled by the dscale reconstruction below.
-		}
-	}
-
-	if overflow || ndigits > 4 {
-		// Fall back to big.Int path for large numerics.
-		// Reconstruct via string.
-		return decodeNumericBinaryViaBig(digits, weight, sign, dscale)
-	}
-
-	// Multiply mantissa by 10^dscale to get the integer representation.
-	// Then store as KindNumeric with NumericMantissa and NumericScale.
-	fullMantissa := int64(0)
-	// Compute the value as: digits[0]*10000^weight + ... + digits[n-1]*10000^(weight-n+1)
-	// then multiply by 10^dscale to get an integer mantissa.
-	for i, d := range digits {
-		exp := weight - i
-		p := int64(1)
-		for j := 0; j < exp; j++ {
-			p *= 10000
-		}
-		for j := 0; j < (-exp); j++ {
-			// Fractional part — we need dscale post-decimal digits
-			_ = j
-		}
-		fullMantissa += d * p
-	}
-	// Now fullMantissa is the integer part; we need to add fractional.
-	// Simpler: rebuild from string representation.
+	// review/260831 EC-16: an int64 mantissa used to be accumulated here digit
+	// by digit, purely to decide between a "small numeric" fast path and the
+	// big.Int path — and BOTH arms called decodeNumericBinaryViaBig, because
+	// the fast path was never finished (its own comment said "we need to add
+	// fractional"). Every binary NUMERIC in a COPY paid that loop for nothing.
 	return decodeNumericBinaryViaBig(digits, weight, sign, dscale)
 }
 

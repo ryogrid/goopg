@@ -170,6 +170,13 @@ func applyIndexOrderedGroupingRule(aggNode *Aggregate, cat catalog.Catalog) {
 		if !ok {
 			continue
 		}
+		// The rule replaces the SeqScan with an IndexScan or an IndexOnlyScan;
+		// a session that turned that shape off keeps its SeqScan (the toggles
+		// are read through the same carrier walk currentSeqScanDisabled uses).
+		// review/260831-2 X-8.
+		if scanShapeDisabled(newChild, cat) {
+			continue
+		}
 
 		// GroupKeyOrder: indices into GroupExprs, in index-column order.
 		order := make([]int, len(prefix))

@@ -557,10 +557,32 @@ func coldFromBackend(b *Backend) *coldActivity {
 		ClientPort:  b.ClientPort,
 		BackendType: b.BackendType,
 	}
+	// review/260831-2 UT-1: BackendStart arrives as an RFC3339Nano string
+	// (server.go stamps it at connection setup) but the slot holds unix
+	// nanos — it used not to be copied at all, so every row of
+	// pg_stat_activity reported an EMPTY backend_start. PG always has one,
+	// so fall back to registration time when the caller left it unset.
+	c.BackendStart = parseWallString(b.BackendStart)
+	if c.BackendStart == 0 {
+		c.BackendStart = time.Now().UnixNano()
+	}
 	n := b.ApplicationName
 	c.ApplicationName.Store(&n)
 	c.State.Store(uint32(parseBackendState(b.State)))
 	return c
+}
+
+// parseWallString converts an RFC3339Nano wall-clock string into unix nanos,
+// returning 0 for an empty or unparseable value.
+func parseWallString(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return 0
+	}
+	return t.UnixNano()
 }
 
 // UpdateApplicationName atomically updates the ApplicationName for procNum.

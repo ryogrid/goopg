@@ -599,7 +599,10 @@ func liveSegmentRunStart(segNos []uint64) uint64 {
 // or when the last segment is shorter than segSize (lazy-grow sentinel).
 // TLI-tolerant: tries TLI=1 first, then falls back to any timeline.
 func readStreamFrom(walDir string, segSize int64, firstSegNo uint64) ([]byte, error) {
-	stream := make([]byte, 0)
+	// review/260831 XL-31: one segment is segSize bytes and there is usually
+	// more than one, so growing from a zero-capacity slice re-copied the whole
+	// stream every time it doubled. Start at one segment.
+	stream := make([]byte, 0, segSize)
 	for segNo := firstSegNo; ; segNo++ {
 		f, err := openSegmentFile(walDir, segNo)
 		if err != nil {
