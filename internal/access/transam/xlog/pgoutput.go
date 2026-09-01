@@ -610,9 +610,12 @@ func pgoDecodePhysicalVarlena(data []byte) ([]byte, int, error) {
 
 // pgoPhysEpoch is the PostgreSQL epoch (2000-01-01 UTC) used to reconstruct
 // absolute instants from PG-physical micros/days offsets.
-func pgoPhysEpoch() time.Time {
-	return time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-}
+// pgoEpoch is PostgreSQL's timestamp epoch (2000-01-01 UTC). review/260831
+// XL-25: pgoPhysEpoch built this time.Time on every call, and it is called per
+// decoded timestamp column.
+var pgoEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func pgoPhysEpoch() time.Time { return pgoEpoch }
 
 // pgoTypeOIDFor maps a v0 catalog type name to the upstream PostgreSQL type
 // OID used in pgoutput Relation messages. Delegates to catalog.TypeNameToOID
