@@ -473,6 +473,15 @@ func (f *FSM) FSMLoadForks(dataDir string) error {
 
 	f.mu.Lock()
 	f.pages = loaded
+	// The chunk summaries describe the page arrays that were just replaced.
+	// Rebuild them here rather than leaving it to the first writer: readers
+	// only consult a summary, they never build one (review/260831 ST-6).
+	f.chunkMax = make(map[fsmKey][]uint16, len(loaded))
+	for key, pages := range loaded {
+		if len(pages) > fsmChunkBlocks {
+			f.chunkMax[key] = buildChunkMax(pages)
+		}
+	}
 	f.mu.Unlock()
 	return nil
 }
