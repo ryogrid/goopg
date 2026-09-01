@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -42,15 +43,32 @@ func wrapSQLFunctionContext(err error, funcName string, stmtNum int) error {
 // rewriteSQLNamedParams replaces named parameter references in a SQL function
 // body with positional $n references. This supports SQL functions that reference
 // their arguments by name (e.g. "select value + seed" → "select $1 + $2").
+// namedParamREs caches the per-argument-name regexp rewriteSQLNamedParams
+// needs. review/260831 ES-7: it used to call regexp.MustCompile once per
+// argument on EVERY routine invocation, so a three-argument PL/pgSQL function
+// paid three compilations per call. The key set is the set of argument
+// identifiers appearing in the database's routines, so it is bounded by the
+// schema, not by traffic.
+var namedParamREs sync.Map // string -> *regexp.Regexp
+
+func namedParamRE(name string) *regexp.Regexp {
+	if v, ok := namedParamREs.Load(name); ok {
+		return v.(*regexp.Regexp)
+	}
+	// Match either a string literal (to skip) OR the parameter name as a
+	// whole word. String literals come first in the alternation so they're
+	// consumed without replacement.
+	re := regexp.MustCompile(`'(?:[^'\\]|\\.)*'|(?i)\b` + regexp.QuoteMeta(name) + `\b`)
+	namedParamREs.Store(name, re)
+	return re
+}
+
 func rewriteSQLNamedParams(body string, argNames []string) string {
 	for i, name := range argNames {
 		if name == "" {
 			continue
 		}
-		// Match either a string literal (to skip) OR the parameter name as a
-		// whole word. String literals come first in the alternation so they're
-		// consumed without replacement.
-		re := regexp.MustCompile(`'(?:[^'\\]|\\.)*'|(?i)\b` + regexp.QuoteMeta(name) + `\b`)
+		re := namedParamRE(name)
 		pos := i + 1 // 1-based
 		body = re.ReplaceAllStringFunc(body, func(m string) string {
 			if m[0] == '\'' {
