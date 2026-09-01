@@ -34,7 +34,7 @@ not, with the reason) / empty (not judged yet).
 |---|---|---|---|---|---|---|---|---|
 | EC-3 | executor-core | medium | `applyworker.go:decodePgoutputTupleAsRow` — column-name map rebuilt on every row | | | | | [ ] |
 | EC-7 | executor-core | medium | `hash_partition.go:computeHashPartitionRowHash` — per-row invariant work on the INSERT partition-routing hot path | | | | | [ ] |
-| EC-14 | executor-core | medium | `copy.go:insertSourceRow` — per-row `make(Row, …)` instead of the row pool | | | | | [ ] |
+| EC-14 | executor-core | medium | `copy.go:insertSourceRow` — per-row `make(Row, …)` instead of the row pool | REJECT (regression risk vs benefit) | one small allocation per row, against a per-row cost dominated by defaults, constraints, tuple encode, the page write and index maintenance | pooling requires PROVING no path retains the row (defaults, CHECK/domain constraints, TOAST, heap write, unique-index maintenance); a wrong release corrupts data silently rather than failing a test | — | [x] no change |
 | EC-16 | executor-core | medium | `copy_binary.go:decodeNumericBinary` — dead `fullMantissa` computation before unconditional fallback | | | | | [ ] |
 | EC-20 | executor-core | medium | `expr.go:evalCast` — `strings.ToLower(targetType)` on every cast evaluation | | | | | [ ] |
 | EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | REJECT (already done) | — | — | — | [x] no change |
@@ -55,7 +55,7 @@ not, with the reason) / empty (not judged yet).
 | EO2-24 | executor-operators-2 | medium | `slot.go:asSlot` (callers: nextMerge, recursiveUnionOp, workTableScanOp) — MaterializedSlot allocated per emitted row | | | | | [ ] |
 | EO2-25 | executor-operators-2 | medium | `operators_upsert.go:maintainNonArbiterIndexesCapture` — btree re-opened per index per row | | | | | [ ] |
 | ES-7 | executor-sys | medium | `plpgsql_runtime.go:rewriteSQLNamedParams` — regexp compiled per argument per invocation | ADOPT | 3-argument rewrite: 29.6us -> 9.5us (3.1x), 16.0KB -> 1.0KB, 152 -> 25 allocs | the compiled pattern is identical; the cache key is the argument name | one `sync.Map`; the key set is bounded by the schema, not by traffic | [x] fixed |
-| ES-8 | executor-sys | medium | `plpgsql_runtime.go:executeSQLRoutine` (+procedures/setof) — body re-parsed and re-planned on every call | | | | | [ ] |
+| ES-8 | executor-sys | medium | `plpgsql_runtime.go:executeSQLRoutine` (+procedures/setof) — body re-parsed and re-planned on every call | REJECT (needs the plan-cache machinery) | real — a SQL-language routine re-parses (and re-plans) its body on every call | the body text IS stable per routine (arguments are rewritten to $n, values go through ctx.Params), so a cache is possible; but the planner mutates the tree it is given, so caching a bare AST is not safe. The sound design is the postmaster planCache (keyed plan + its invalidation), reused from the executor | out of scope for a per-finding fix | [ ] deferred |
 | ES-9 | executor-sys | medium | `plpgsql_runtime.go:executePLpgSQLTriggerBody` — trigger body re-parsed on every firing | | | | | [ ] |
 | ES-17 | executor-sys | medium | `toast.go:DetoastValue` — full TOAST relation scan per detoasted column | | | | | [ ] |
 | OP1-1 | optimizer-1 | medium | `cardinality.go:estimateNumGroups` — per-relation full-tree walk plus subtree re-estimation | | | | | [ ] |
@@ -114,7 +114,7 @@ not, with the reason) / empty (not judged yet).
 | UT-1 | utils | medium | `internal/utils/misc/encoding_guc.go:encodingNameToCanonical` — re-cleans the constant encoding table on every call | REJECT (no benefit) | the only caller is the client_encoding GUC check; it is not on any per-row or per-tuple path | — | — | [x] no change |
 | UT-9 | utils | medium | `internal/utils/adt/datetime/pg_datetime_format.go` — `fmt.Sprintf` on the per-cell output path | | | | | [ ] |
 | UT-14 | utils | medium | `internal/utils/mb/conv.go:DoEncodingConversion` — dead `destBuf` allocation | | | | | [ ] |
-| UT-20 | utils | medium | `internal/utils/mmgr/mctx.go:Lookup` — global mutex on the per-datum read path | | | | | [ ] |
+| UT-20 | utils | medium | `internal/utils/mmgr/mctx.go:Lookup` — global mutex on the per-datum read path | ADOPT | serial 3.70 ns -> 0.67 ns (5.5x); 16-way parallel 35.05 ns -> 0.09 ns (396x — the mutex was serialising every backend on a pure read) | the registry slots are atomic pointers; ctxMu still orders id allocation, and a released slot is cleared BEFORE its id can be reused | one declaration and three accessors; `go test -race` on the package passes | [x] fixed |
 | UT-23 | utils | medium | `internal/utils/adt/array/pgarray.go:DecodeElemStyled` — `strings.ToLower(elemName)` recomputed per element | REJECT (no benefit) | `strings.ToLower` only scans (no allocation) when the input is already lower-case, and element names are catalog-normalised | — | — | [x] no change |
 
 ## Appendix A — severity-low findings (REJECT by default: criterion 1, benefit)
@@ -823,3 +823,54 @@ Measured (`internal/access/transam/capture_snapshot_bench_test.go`):
   tree: `captureSnapshot` and the old `Clone` were the only ones.
 - **Maintainability**: yes. One function shrank, and the rule it depends on is
   now stated in the place that depends on it.
+
+### UT-20 — ADOPT (lock-free memory-context registry)
+
+`mmgr.Lookup` resolves a `ContextID` to its `Context`, and every arena-backed
+Datum goes through it to reach its payload bytes. It took `ctxMu`, a
+PROCESS-GLOBAL mutex, to read one pointer out of a fixed array — so every
+backend's datum reads serialised against each other and against context
+creation. The registry slots are `atomic.Pointer[Context]` now. `ctxMu` still
+guards id allocation and the free list, which is where ordering matters, and
+`releaseID` clears the slot BEFORE the id can be handed out again, so a reader
+holding a stale id sees nil rather than the next owner's context.
+
+Measured (`internal/utils/mmgr/lookup_bench_test.go`):
+
+| | before | after |
+|---|---|---|
+| serial | 3.70 ns | 0.67 ns |
+| 16-way parallel | 35.05 ns | 0.088 ns |
+
+- **Benefit**: yes. 5.5x serial, and the parallel number is the real one: under
+  concurrency the old form got *slower* per call as cores were added, which is
+  the signature of a contended global lock on a read path.
+- **No regression**: yes. `go test -race ./internal/utils/mmgr` passes, and the
+  release ordering is stricter than before (slot cleared outside the lock,
+  before the id becomes reusable).
+- **Maintainability**: yes. One declaration and three accessors changed; the
+  reason is written at the declaration.
+
+### EC-14 — REJECT (risk outweighs the benefit)
+
+`insertSourceRow` allocates one `Row` per COPY input row. Using the row pool
+means proving that nothing downstream retains it — default filling, NOT NULL,
+CHECK and domain constraints, TOASTing, the heap write and unique-index
+maintenance all take the row — and a release that turns out to be wrong does not
+fail a test, it corrupts the next row's data. Against that: one small allocation
+per row, on a path whose per-row cost is dominated by tuple encoding, the page
+write and index maintenance. Not a good trade at this evidence level; a COPY
+profile showing the allocation actually registering would change the answer.
+
+### ES-8 — REJECT for now (needs the plan cache, not an AST cache)
+
+A SQL-language routine re-parses and re-plans its body on every call. The body
+text is stable per routine — `rewriteSQLNamedParams` maps argument names to
+`$n` and the values travel in `ctx.Params` — so a cache keyed by the routine is
+possible in principle. What blocks a quick fix is that the planner mutates the
+tree it is handed (constant folding, scan-input rewrites, unnest rewriting), so
+handing it a cached AST a second time is not safe. The sound design is to reuse
+the postmaster's `planCache` — which already caches planned trees keyed by SQL
+text, together with the invalidation that makes that safe — from the executor's
+routine path. That is a feature-sized change, not a per-finding fix, so it is
+recorded here as deferred rather than done badly.
