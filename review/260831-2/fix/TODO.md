@@ -141,8 +141,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | X-2 | low | *(not in the review — found while verifying NP-2)* `'x' \|\| true` yields `xt`; PG yields `xtrue` (bool→text in concat takes the 1-char form) | BUG | [ ] not fixed | |
 | X-3 | low | *(not in the review — found while verifying NP-2)* plpgsql `FOUND` stays false after a successful `SELECT … INTO`; PG sets it true | BUG | [ ] not fixed | |
 | X-4 | med | *(not in the review — found while verifying ES-4)* `executor/pg18_user_catalog_rows.go:pgAttTypmod` — no arm for time/timetz/timestamp/timestamptz, so `time(3)` reports atttypmod -1 (PG: 3) | BUG | [x] fixed + guarded | this commit |
-| X-7 | med | *(not in the review — found while verifying ES-8)* a literal `'int4'::regtype` in a SELECT list is never resolved: goopg prints `int4` (PG: `integer`, via format_type) and `'int4'::regtype::oid` errors `invalid input syntax for type oid`. The regtype COLUMN path is correct, so the literal-cast path bypasses `regIdentifierInput` entirely. `'pg_class'::regclass::oid` works, so this is regtype-only | BUG | [ ] not fixed | |
-| X-8 | med | *(not in the review — found while probing)* `enable_indexscan` / `enable_bitmapscan` / `enable_indexonlyscan` are accepted but ignored: with all three `off` in a fresh session, `SELECT * FROM t WHERE a = 42` still plans `Index Only Scan` at cost 0.00..0.00 (PG switches to `Seq Scan`). The zero cost suggests a planner fast path that never consults the GUCs | BUG | [ ] not fixed | |
+| X-7 | med | *(not in the review — found while verifying ES-8)* a literal `'int4'::regtype` in a SELECT list is never resolved: goopg prints `int4` (PG: `integer`, via format_type) and `'int4'::regtype::oid` errors `invalid input syntax for type oid`. The regtype COLUMN path is correct, so the literal-cast path bypasses `regIdentifierInput` entirely. `'pg_class'::regclass::oid` works, so this is regtype-only | BUG | [x] fixed + guarded | this commit |
+| X-8 | med | *(not in the review — found while probing)* `enable_indexscan` / `enable_bitmapscan` / `enable_indexonlyscan` are accepted but ignored: with all three `off` in a fresh session, `SELECT * FROM t WHERE a = 42` still plans `Index Only Scan` at cost 0.00..0.00 (PG switches to `Seq Scan`). The zero cost suggests a planner fast path that never consults the GUCs | BUG | [x] fixed + guarded | this commit |
 
 ---
 
@@ -1505,3 +1505,95 @@ sentinel and its sign. Red before the fix on all six.
 The report says so itself ("the `if idx < 0` guard catches this before the
 shift, so this is not a live panic … no change needed"). Recorded as reviewed;
 nothing to fix.
+### X-7 — BUG (fixed, one-line delegation)
+
+`'int4'::regtype` never became an OID. The `regtype` arm of `evalCastTyped`'s
+CastExpr switch (`executor/expr.go`) resolved a USER type through
+`userTypeOIDForName` but fell through for a built-in name and returned the raw
+string, so against PG 18.3 on 65438:
+
+| expression | PG 18.3 | goopg (before) |
+|---|---|---|
+| `'int4'::regtype` | `integer` | `int4` |
+| `'int4'::regtype::oid` | `23` | ERROR `invalid input syntax for type oid: "int4"` |
+| `'int4'::regtype::text` | `integer` | `int4` |
+| `'nosuchtype'::regtype` | 42704 | `nosuchtype` |
+
+A reg* datum is a plain KindInt holding an object OID (the model documented at
+the reg*→string cast guard, expr.go ~5556), which is why the datum could not
+chain: the SELECT/COPY/cast renderers all call `RegOut` on an OID. The regclass
+arm of the very same switch was fixed this way in M0134-0168; regtype was the
+sibling nobody came back to. Fixed by delegating the name path to
+`regIdentifierInput(v, "regtype", …)` — the shared regtypein port — which also
+picks up the schema qualifier ES-8 taught it (3F000 for a missing schema) and
+regtypein's 42704 for an unknown name.
+
+Guard: `executor/regtype_cast_literal_test.go` — the built-in name must produce
+the OID datum and render `integer` through `::text`, an unknown name must raise
+42704, a bad schema 3F000, and a user type must keep resolving. Red before the
+fix (`22P02: invalid input syntax for type oid: "int4"`).
+
+### X-8 — BUG (fixed; one residual, recorded)
+
+`enable_indexscan` / `enable_bitmapscan` / `enable_indexonlyscan` were
+registered as deliberate no-ops (`utils/misc/defaults.go:1210`, "v0's planner
+ignores them … so test scripts don't trip", M0097-0069), so every index plan
+survived `SET … = off`. Only `enable_seqscan` had ever been made real (design
+0118-0103, via `SearchPathCatalog.DisableSeqScan` + `currentSeqScanDisabled`).
+
+Fixed along exactly that seam: three new `SearchPathCatalog` fields + carrier
+methods, populated from the session GUCs in BOTH plan-catalog wrappers
+(`sessionPlanCatalog`, `ctxPlanCatalog`), read in the planner by
+`currentIndexScanDisabled` / `currentBitmapScanDisabled` /
+`indexOnlyScanRejected`. PG prices a disabled node instead of removing it, so
+`enable_indexscan = off` disables the index-ONLY shape too (both are costed by
+`cost_index`) — verified on the oracle, and why `indexOnlyScanRejected` is the
+OR of two toggles.
+
+Producers gated (each one had to be found by probing, since the rule-based
+planner has several independent paths to an index scan):
+
+- `planIndexScanFromWhere` — result-filtered through the new `scanShapeDisabled`
+  so its IndexScan and its bitmap arm are gated independently;
+- `rewriteScanInputsWithSingleTablePredicates` (`scan_input_rewrite.go`) — the
+  pass that rewrites a SeqScan back into an IndexScan *after* the producer
+  above declined; without this gate the toggles looked completely dead;
+- `tryPromoteIndexOnlyScan` (gated at its single call site, it takes no
+  catalog) and `tryPromoteOrderedIndexOnlyScan`;
+- the min/max InitPlan IOS rules in `rewriteMinMaxAggregates` (both the
+  single-column and the composite-prefix arm);
+- `applyIndexOrderedGroupingRule` (`groupagg_indexorder.go`);
+- the cost-based path producers `addParameterizedIndexPaths` /
+  `addOrderedIndexPaths` / `addBaseRelBitmapPaths` /
+  `addParameterizedBitmapPaths` / `addIndexOnlyPaths`.
+
+Plan cache: `planCacheKey` is `(dbOid, normalized SQL)` only, so a session that
+turned a toggle off would have published its plan to every other connection
+(and read theirs). `plannerScanTogglesActive` now keeps such a session off the
+shared cache entirely, on all three Get/Put sites — the same treatment a
+session with temp inheritance children gets. This also closes the same latent
+hole for `enable_seqscan`, which had been real since 0118-0103.
+
+Verified against PG 18.3 on 65438 with `x8(a, b)`, btree on `a`:
+
+| session | PG 18.3 | goopg (after) |
+|---|---|---|
+| all on, `SELECT a … WHERE a = 42` | Index Only Scan | Index Only Scan |
+| all on, `SELECT b … WHERE a = 42` | Index Scan | Index Scan |
+| `enable_indexonlyscan=off` | Index Scan | Index Scan |
+| `enable_indexscan=off` | **Bitmap Heap Scan** | **Seq Scan** (residual) |
+| `enable_indexscan+bitmapscan=off` | Seq Scan | Seq Scan |
+| all three off | Seq Scan | Seq Scan |
+
+Residual (recorded, not fixed): with only `enable_indexscan = off` PG falls back
+to a bitmap plan and goopg goes straight to the Seq Scan — the bitmap producers
+live in the cost-based search, which this single-table rule-based query never
+reaches, so there is no bitmap candidate to fall back to. Same class for the
+min/max rule: goopg's fallback keeps its `Limit → Sort → SeqScan` InitPlan
+shape where PG plans a plain `Aggregate → Seq Scan`. Both are plan-shape-only:
+the result sets are identical, and neither is reachable with the default GUCs.
+
+Guards: `optimizer/scan_toggles_test.go` pins the six-row matrix above
+(including "the toggles change nothing when untouched") and
+`postmaster/plan_cache_scan_toggles_test.go` pins the cache bypass for all four
+toggles plus the RESET direction.
