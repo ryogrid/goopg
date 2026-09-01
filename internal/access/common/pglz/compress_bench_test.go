@@ -64,3 +64,18 @@ func TestCompressRatioAndRoundTrip(t *testing.T) {
 	}
 }
 
+// BenchmarkDecompress guards review/260831 NB-18: a non-overlapping match is
+// one copy, not a byte-at-a-time loop.
+func BenchmarkDecompress(b *testing.B) {
+	for name, blob := range benchBlobs() {
+		comp := Compress(blob)
+		b.Run(name, func(b *testing.B) {
+			b.SetBytes(int64(len(blob)))
+			for b.Loop() {
+				if _, err := Decompress(comp, len(blob)); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

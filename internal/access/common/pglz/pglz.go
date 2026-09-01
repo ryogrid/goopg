@@ -223,12 +223,17 @@ func Decompress(src []byte, rawSize int) ([]byte, error) {
 				if remaining := rawSize - len(dst); length > remaining {
 					length = remaining
 				}
-				// Byte-by-byte copy so an off<length match performs the
-				// intended run-length expansion (dst is pre-sized to rawSize,
-				// so append never reallocates here).
+				// review/260831 NB-18: only an overlapping match (off <
+				// length) needs the byte-at-a-time run-length expansion; the
+				// common non-overlapping case is one copy. dst is pre-sized to
+				// rawSize, so neither branch reallocates.
 				start := len(dst) - off
-				for k := 0; k < length; k++ {
-					dst = append(dst, dst[start+k])
+				if off >= length {
+					dst = append(dst, dst[start:start+length]...)
+				} else {
+					for k := 0; k < length; k++ {
+						dst = append(dst, dst[start+k])
+					}
 				}
 			} else {
 				dst = append(dst, src[sp])
