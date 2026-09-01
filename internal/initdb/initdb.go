@@ -6373,6 +6373,9 @@ func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []n
 		return nil, err
 	}
 	tids := make([]heapTID, len(rels))
+	// review/260831 IN-8: the column set does not change between rows, so the
+	// varlena scan is a loop invariant.
+	varWidth := hasVarWidthCol(cols)
 	for i, rel := range rels {
 		row := rowFn(rel)
 		payload, err := executor.EncodeRowPG(cols, row)
@@ -6381,7 +6384,7 @@ func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []n
 		}
 		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
 		tuple.Header.SetNatts(len(cols))
-		if hasVarWidthCol(cols) {
+		if varWidth {
 			tuple.Header.Infomask |= storage.HeapHasVarWidth
 		}
 		off, err := storage.PageAddHeapTuple(page, tuple)
@@ -6442,6 +6445,8 @@ func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Colu
 		return nil, err
 	}
 	tids := make([]heapTID, 0, len(rows))
+	// review/260831 IN-8: loop invariant, see writeMultiPageHeap.
+	varWidth := hasVarWidthCol(cols)
 	for i, row := range rows {
 		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
@@ -6455,7 +6460,7 @@ func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Colu
 			tuple = storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
 		}
 		tuple.Header.SetNatts(len(cols))
-		if hasVarWidthCol(cols) {
+		if varWidth {
 			tuple.Header.Infomask |= storage.HeapHasVarWidth
 		}
 		if i < len(external) && external[i] {
