@@ -90,20 +90,21 @@ type Snapshot struct {
 	clog *CLog
 }
 
-// Clone deep-copies the snapshot so callers can hold it independently
-// from manager internals.
+// Clone returns a copy of the snapshot that callers can hold independently of
+// manager internals.
+//
+// review/260831 TA-2: it used to deep-copy both XID arrays. It no longer does,
+// because those arrays are immutable after capture — the ONLY code that writes
+// them is captureSnapshot, which builds fresh slices, and insertSortedXID,
+// which is copy-on-write (TA-1). WithCLog has documented and relied on that
+// same immutability all along. A repeatable-read or serializable transaction
+// clones its pinned snapshot once per statement, so the copies were pure cost
+// proportional to the number of concurrent transactions and past aborts.
+//
+// The invariant this rests on: nothing may mutate Snapshot.InProgress or
+// Snapshot.Aborted in place. Build a new slice instead.
 func (s Snapshot) Clone() Snapshot {
-	out := Snapshot{
-		Xmin:                 s.Xmin,
-		Xmax:                 s.Xmax,
-		InProgress:           make([]storage.TransactionID, len(s.InProgress)),
-		Aborted:              make([]storage.TransactionID, len(s.Aborted)),
-		clog:                 s.clog,
-		PartitionDetachEpoch: s.PartitionDetachEpoch,
-	}
-	copy(out.InProgress, s.InProgress)
-	copy(out.Aborted, s.Aborted)
-	return out
+	return s
 }
 
 // WithCLog returns a copy of the snapshot whose visibility checks consult the
