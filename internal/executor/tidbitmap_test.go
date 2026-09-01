@@ -500,3 +500,64 @@ func TestTIDBitmapNextPageMultipleCallsMatchNext(t *testing.T) {
 		}
 	}
 }
+
+// TestTIDBitmapIteratorEveryLossyPageYielded is the review/260831-2 ES-5 guard:
+// the iterator used to carry a `lossyVisited` toggle that flipped on every
+// lossy entry, so the SECOND lossy page (and the fourth, …) was `continue`d
+// past after `it.idx` had already advanced — silently dropping every other
+// lossy page's rows from a bitmap heap scan. Every lossy page must be yielded
+// exactly once, from both iteration entry points, whatever the exact/lossy
+// interleaving is.
+func TestTIDBitmapIteratorEveryLossyPageYielded(t *testing.T) {
+	// Blocks 0..4: lossy, exact, lossy, lossy, exact — covers the
+	// lossy→exact→lossy and the back-to-back lossy→lossy shapes.
+	lossyBlocks := map[storage.BlockNumber]bool{0: true, 2: true, 3: true}
+
+	newBitmap := func() *TIDBitmap {
+		tbm := &TIDBitmap{}
+		for b := storage.BlockNumber(0); b < 5; b++ {
+			tbmAddTuples(tbm, []storage.ItemPointer{{Block: b, Offset: 1}}, false)
+		}
+		for b := range lossyBlocks {
+			e := tbm.entries[b]
+			e.isLossy = true
+			e.bitmap = nil
+			tbm.npages--
+			tbm.nchunks++
+		}
+		return tbm
+	}
+
+	seen := map[storage.BlockNumber]int{}
+	it := tbmBeginIterate(newBitmap())
+	var result BitmapPageResult
+	for it.nextPage(&result) {
+		if result.Lossy != lossyBlocks[result.Block] {
+			t.Errorf("block %d: lossy=%v, want %v", result.Block, result.Lossy, lossyBlocks[result.Block])
+		}
+		seen[result.Block]++
+	}
+	for b := storage.BlockNumber(0); b < 5; b++ {
+		if seen[b] != 1 {
+			t.Errorf("nextPage: block %d yielded %d times, want 1", b, seen[b])
+		}
+	}
+
+	seenNext := map[storage.BlockNumber]int{}
+	it = tbmBeginIterate(newBitmap())
+	for {
+		block, _, lossy, _, ok := it.next()
+		if !ok {
+			break
+		}
+		if lossy != lossyBlocks[block] {
+			t.Errorf("next: block %d: lossy=%v, want %v", block, lossy, lossyBlocks[block])
+		}
+		seenNext[block]++
+	}
+	for b := storage.BlockNumber(0); b < 5; b++ {
+		if seenNext[b] != 1 {
+			t.Errorf("next: block %d yielded %d times, want 1", b, seenNext[b])
+		}
+	}
+}

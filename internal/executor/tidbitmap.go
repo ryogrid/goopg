@@ -301,9 +301,6 @@ type tbmIterator struct {
 	// For the current exact page (per-offset iteration):
 	offsets []uint16 // sorted offsets extracted from bitmap
 	offIdx  int
-
-	// For the current lossy page:
-	lossyVisited bool // have we yielded the lossy marker for this block?
 }
 
 // tbmBeginIterate creates an iterator over the bitmap.
@@ -364,11 +361,6 @@ func (it *tbmIterator) nextPage(result *BitmapPageResult) bool {
 		it.idx++
 
 		if e.isLossy {
-			if it.lossyVisited {
-				it.lossyVisited = false
-				continue
-			}
-			it.lossyVisited = true
 			result.Block = block
 			result.Lossy = true
 			result.Recheck = e.recheck
@@ -407,11 +399,6 @@ func (it *tbmIterator) next() (block storage.BlockNumber, offset uint16, lossy, 
 		it.idx++
 
 		if e.isLossy {
-			if it.lossyVisited {
-				it.lossyVisited = false
-				continue // already yielded this lossy page
-			}
-			it.lossyVisited = true
 			// For lossy pages: yield (block, 0, lossy=true).
 			// The caller iterates all offsets on the page.
 			return block, 0, true, e.recheck, true

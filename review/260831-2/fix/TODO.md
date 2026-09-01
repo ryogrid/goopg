@@ -29,13 +29,13 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | id | sev | finding | verdict | status | commit |
 |---|---|---|---|---|---|
 | EO2-1 | high | `executor/operators_indexonly.go:Rescan` — LowOp/HighOp strictness ignored, bounds always inclusive | BUG | [x] | `5360b7e79` |
-| ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | ? | [ ] | |
+| ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | BUG | [x] | this commit |
 | NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | BUG | [x] | `dafe96692` |
 | ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | BUG | [x] | `e4b3b7ff3` |
 | ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | BUG | [x] | `8ca6a5a8d` |
 | TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | BUG | [x] | `98a9a11a6` |
 | CP-1 | high | `postmaster/txn_verb.go:applyTransactionVerb` — DDL in a failed block survives COMMIT-as-ROLLBACK | BUG | [x] | `574dd707b` |
-| CM-1 | high | `cmd/goopg/standby.go:Promote` — `promoting` atomic never reset; failed promote wedges permanently | BUG | [x] | see progress log |
+| CM-1 | high | `cmd/goopg/standby.go:Promote` — `promoting` atomic never reset; failed promote wedges permanently | BUG | [x] | 2723c742a |
 
 ## B. Medium severity (claimed)
 
@@ -237,3 +237,16 @@ landed.
   whose receiverDone stays open so the first attempt fails deterministically on
   a cancelled context; the retry after closing it must succeed (it returned
   "promotion already in progress" before the fix).
+
+- 2026-09-01 **ES-5 = BUG (fixed).** `tbmIterator` carried a `lossyVisited`
+  flag whose intent was "do not return the same lossy page twice", but the
+  flag was set on every lossy page yielded and only cleared on the *next*
+  lossy page — so with a run of lossy pages every second one was skipped
+  entirely, silently losing all its tuples from a bitmap heap scan. There is
+  no such de-duplication state in PG's `tbm_iterate`: the chunk cursor
+  already advances monotonically, so a page can never repeat. Fix: drop the
+  field and both guard blocks in `nextPage`/`next`. Guard:
+  `TestTIDBitmapIteratorEveryLossyPageYielded` (red before the fix: it
+  observed only the odd-numbered lossy pages). Gates: units green;
+  TPC-DS SF0.5 sweep on this build PASS=95 MISMATCH=0 CKMISMATCH=0
+  ERROR=0 TIMEOUT=0, plan shapes 99/99 identical.
