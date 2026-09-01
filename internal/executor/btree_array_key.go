@@ -100,7 +100,7 @@ func encodeArrayBTreeKey(ctx *Context, v Datum, col *catalog.Column, pos int) ([
 		return nil, &ExecError{Code: "22P02", Pos: pos,
 			Message: fmt.Sprintf("malformed array literal: %q", v.StringValue())}
 	}
-	if strings.ContainsRune(s[1:len(s)-1], '{') {
+	if arrayLiteralHasNestedBrace(s[1 : len(s)-1]) {
 		return nil, &ExecError{Code: "0A000", Pos: pos,
 			Message: fmt.Sprintf("btree v0 cannot index multidimensional array column %q", col.Name)}
 	}
@@ -369,4 +369,28 @@ func arrayKeyElemRendererPGImage(name string, st array.OutputStyle) func(Datum) 
 // `pgEpoch.Add(micros)` the key decoder applies.
 func pgTimestampMicrosOfDatum(d Datum) int64 {
 	return d.TimeValue().UTC().UnixMicro() - pgEpochUnixMicros
+}
+
+// arrayLiteralHasNestedBrace reports whether the INNER text of an array
+// literal opens a nested array, i.e. contains a `{` outside quotes. The scan
+// has to respect quoting and backslash escapes exactly as
+// parseTextArrayElems does: a plain byte search rejected a perfectly ordinary
+// 1-D value whose quoted TEXT element merely contains a brace — `{"a{b"}`
+// probed as `0A000 cannot index multidimensional array column`, while PG
+// indexes and matches it (review/260831-2 EC-3).
+func arrayLiteralHasNestedBrace(inner string) bool {
+	inQuotes := false
+	for i := 0; i < len(inner); i++ {
+		switch inner[i] {
+		case '\\':
+			i++ // escaped byte is data, whatever it is
+		case '"':
+			inQuotes = !inQuotes
+		case '{':
+			if !inQuotes {
+				return true
+			}
+		}
+	}
+	return false
 }
