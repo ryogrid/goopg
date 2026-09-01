@@ -3685,6 +3685,33 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Da
 	return o.finishBuiltinAgg(st, call), nil
 }
 
+// foldIntLaneIntoNumeric merges the int-lane running sum into the numeric lane
+// so a group that used BOTH lanes reports their total.
+//
+// aggRuntime carries two accumulators for sum/avg — `sum` for KindInt inputs
+// and `numericSum` for KindNumeric ones — and the finalizers below return the
+// numeric lane whenever it is live, which silently discarded whatever the int
+// lane held. A group mixes the lanes whenever its argument's Kind varies per
+// row (`sum(CASE WHEN a = 1 THEN 1 ELSE 1.5 END)` returned 4.5 where PG 18.3
+// returns 5.5), and the parallel combine can mix them across workers too
+// (parallel_agg_combine.go:combineNumericSum, review/260831-2 ES-1).
+//
+// An overflow in the fold leaves the state untouched: finishBuiltinAgg has no
+// error channel, and reporting the numeric lane alone is the pre-existing
+// behaviour for that (unreachable in practice) case.
+func foldIntLaneIntoNumeric(st aggRuntime) aggRuntime {
+	if st.numericSum.Kind != KindNumeric || st.sum == 0 {
+		return st
+	}
+	total, err := numericAdd(st.numericSum, numericFromInt(st.sum))
+	if err != nil {
+		return st
+	}
+	st.numericSum = total
+	st.sum = 0
+	return st
+}
+
 // finishBuiltinAgg finalizes a built-in aggregate. Split out of finishAgg by
 // M0125-0025 so that adding the error channel the user-defined path needs did
 // not have to touch this body's ~100 returns, none of which can fail.
@@ -3706,6 +3733,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
 		}
+		st = foldIntLaneIntoNumeric(st)
 		if st.numericSum.Kind == KindNumeric {
 			// For float4 input, PostgreSQL uses float4 as the transition type
 			// (float4pl accumulation with intermediate float32 rounding). Simulate
@@ -3738,6 +3766,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
 		}
+		st = foldIntLaneIntoNumeric(st)
 		// avg(float4/float8) returns float8 — use float64 division and format
 		// with %.15g to match PostgreSQL's float8out. M0097-0020.
 		if strings.EqualFold(call.Type.Name, "float8") || strings.EqualFold(call.Type.Name, "float4") {
