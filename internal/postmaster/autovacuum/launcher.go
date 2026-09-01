@@ -406,12 +406,27 @@ func freezeCutoff(nextXID, oldestXmin storage.TransactionID, p avParams, relopti
 	if capHalf := p.freezeMaxAge / 2; eff > capHalf {
 		eff = capHalf
 	}
-	fb := nextXID - storage.TransactionID(eff)
+	// Compute in SIGNED space. `nextXID - eff` in uint32 wraps when the
+	// cluster is younger than freeze_min_age (the normal case for the first
+	// ~50M transactions of any cluster's life), and the `fb > oldestXmin`
+	// clamp below then silently rewrote that near-4-billion value to
+	// oldestXmin — i.e. goopg froze EVERY dead-to-all tuple on every pass,
+	// where PG freezes none. (The `fb < 0` test that was meant to catch this
+	// is dead: storage.TransactionID is uint32.)
+	//
+	// Upstream keeps the wrapped value and compares it with
+	// TransactionIdPrecedes (vacuum.c:1204-1209), whose modular ordering puts
+	// it freeze_min_age transactions in the PAST, so nothing qualifies. goopg's
+	// consumer compares plainly (`xmin < FreezeBelow`, commands/vacuum), so the
+	// same outcome is expressed as "no freezing this pass": FreezeBelow == 0
+	// disables freezing. (review/260831-2 CP-3)
+	signed := int64(nextXID) - eff
+	if signed < int64(storage.FrozenTransactionID)+1 {
+		return 0
+	}
+	fb := storage.TransactionID(signed)
 	if fb > oldestXmin {
 		fb = oldestXmin
-	}
-	if fb < 0 {
-		return 0
 	}
 	return fb
 }
