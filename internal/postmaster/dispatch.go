@@ -2398,16 +2398,37 @@ func planCacheKey(sql string, connDBOid uint32) string {
 	return strconv.FormatUint(uint64(catalog.NamespaceDBOid(connDBOid)), 10) + "\x00" + normalizeCompatSQL(sql)
 }
 
-// normalizeSQLPreservingLiterals lowercases SQL outside string literals
-// and collapses whitespace. String literal contents are preserved verbatim
-// so that INSERT ('A') and INSERT ('a') get distinct cache keys.
+// normalizeSQLPreservingLiterals lowercases SQL outside string literals and
+// quoted identifiers, and collapses whitespace. Literal contents are preserved
+// verbatim so that INSERT ('A') and INSERT ('a') get distinct cache keys, and
+// quoted identifiers likewise: PG's lexer downcases only UNquoted identifiers
+// (scan.l's {identifier} rule calls downcase_truncate_identifier, while
+// <xd> yields the delimited text as-is), so "Foo" and "foo" are two different
+// tables. Folding them together handed `SELECT * FROM "foo"` the plan cached
+// for `SELECT * FROM "Foo"` — a wrong-results bug, not just a cache-key nicety.
 func normalizeSQLPreservingLiterals(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	inSingleQuote := false
+	inDoubleQuote := false
 	prevWasSpace := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
+		if inDoubleQuote {
+			// Inside a quoted identifier — preserve case exactly.
+			b.WriteByte(c)
+			if c == '"' {
+				// A doubled double quote is an escaped quote, not the end.
+				if i+1 < len(s) && s[i+1] == '"' {
+					b.WriteByte('"')
+					i++
+				} else {
+					inDoubleQuote = false
+				}
+			}
+			prevWasSpace = false
+			continue
+		}
 		if inSingleQuote {
 			// Inside a string literal — preserve case exactly.
 			b.WriteByte(c)
@@ -2425,6 +2446,12 @@ func normalizeSQLPreservingLiterals(s string) string {
 		}
 		if c == '\'' {
 			inSingleQuote = true
+			b.WriteByte(c)
+			prevWasSpace = false
+			continue
+		}
+		if c == '"' {
+			inDoubleQuote = true
 			b.WriteByte(c)
 			prevWasSpace = false
 			continue
