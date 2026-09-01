@@ -97,7 +97,7 @@ not, with the reason) / empty (not judged yet).
 | NB-8 | nbtree-amcheck | medium | `btree.go:resetPageItems` — byte-by-byte zeroing of the whole data area on every page rewrite | | | | | [ ] |
 | NB-9 | nbtree-amcheck | medium | `btree.go:findChildBlockDirect` / `btree.go:insertItemSorted` — per-probe key copies inside descent/insert binary search | | | | | [ ] |
 | NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | REJECT (maintainability) | plausible | — | pageItems returns an EXPANDED item list (one entry per heap TID), so items do not map 1:1 to line pointers; a lazy binary search would have to rework that invariant and its VACUUM-side readers | [x] no change |
-| NB-11 | nbtree-amcheck | low/medium | `btree.go:EncodeNumericKey` — fresh big.Int allocation per trailing-zero strip iteration | | | | | [ ] |
+| NB-11 | nbtree-amcheck | low/medium | `btree.go:EncodeNumericKey` — fresh big.Int allocation per trailing-zero strip iteration | ADOPT | numeric index key with trailing zeros: 506 ns -> 251 ns (2.0x), 128 B / 15 allocs -> 48 B / 5 | a differential test compares the key bytes against the old two-division strip loop | two scratch values and a swap, plus a package-level ten | [x] fixed |
 | NB-15 | nbtree-amcheck | low/medium | `amcheck/heapallindexed.go:fingerprintLeafEntry` — a fresh buffer allocation per element, twice per element | | | | | [ ] |
 | NB-17 | nbtree-amcheck | high | `pglz.go:Compress` — brute-force O(n·window·matchlen) match search | ADOPT | 64KiB inputs: random 377ms -> 1.0ms (379x), nodetree 8.1ms -> 0.26ms (32x), text 30.0ms -> 1.5ms (20x) | the output is now byte-identical to upstream pglz_compress (golden test); the ratio worsens slightly (below) | same hash chain + good_match/good_drop as upstream pg_lzcompress.c, with PG defaults | [x] fixed |
 | NB-18 | nbtree-amcheck | low/medium | `pglz.go:Decompress` — byte-by-byte run-length copy even for non-overlapping matches | ADOPT | text 78.9us -> 43.6us (1.8x), nodetree 44.6us -> 26.1us (1.7x) | overlapping matches (off < length) keep the byte loop; the round-trip test pins it | one added branch | [x] fixed |
@@ -106,8 +106,8 @@ not, with the reason) / empty (not judged yet).
 | TA-1 | transam | medium | `manager.go:captureSnapshot` — Full copy of `abortedXIDs` on every snapshot capture | ADOPT | with 10,000 aborts: 15.0us -> 1.13us (13x), 41KB -> 89B per snapshot | honours the existing contract that Aborted is immutable after capture; the insert side became copy-on-write | contained in one insert helper | [x] fixed |
 | TA-2 | transam | medium | `manager.go:SnapshotFor` — Deep-`Clone()` of the pinned snapshot on every RR/SSI statement | ADOPT | per statement in RR/SSI: 9.7 ns -> 1.4 ns with no aborts, 116 ns -> 1.4 ns with 100 aborts, 6.9us -> 1.4 ns (41KB -> 0) with 10,000 | rests on the invariant WithCLog already documents: the XID arrays are immutable after capture. captureSnapshot builds fresh slices and insertSortedXID is copy-on-write (TA-1); nothing else writes them | Clone keeps its name and contract, with the invariant spelled out | [x] fixed |
 | TA-8 | transam | medium | `multixact/store.go:Members` — Allocates + copies the member slice on every call, and takes the global mutex | | | | | [ ] |
-| PN-1 | parser-nodes | medium | `internal/parser/adapter.go:mapToken` — Per-token `resolve()` map lookup for every terminal | | | | | [ ] |
-| PN-2 | parser-nodes | medium | `internal/parser/adapter.go:next()` — Double `strings.ToLower` per token | | | | | [ ] |
+| PN-1 | parser-nodes | medium | `internal/parser/adapter.go:mapToken` — Per-token `resolve()` map lookup for every terminal | ADOPT (small) | pgbench-shaped statements: SELECT 6.28us -> 5.94us, UPDATE 6.33us -> 6.05us, INSERT 10.19us -> 9.81us (4-5%) | the terminal numbers are the same constants, resolved at init instead of per token | strictly less work: one map lookup per keyword instead of two, and the fixed terminals become package vars | [x] fixed |
+| PN-2 | parser-nodes | medium | `internal/parser/adapter.go:next()` — Double `strings.ToLower` per token | REJECT (no benefit, and a behaviour risk) | `strings.ToLower` does not allocate when the input is already lower-case, and the token strings are short — a scan of a few bytes | dropping the second call is NOT equivalent: a string literal such as `SELECT 'DATE' 'x'` currently reaches the typed-literal fold through the lowered text, and would stop doing so | — | [x] no change |
 | CP-3 | catalog-postmaster | medium | `catalog.go:InheritanceChildren` / `PartitionChildren` — O(children × tables) lookup by scanning the whole namespace map per child | ADOPT | 300 unrelated tables: 4 children 4.77us -> 3.18us (1.5x), 64 children 105us -> 10.1us (10.4x) | registration order and the "child OID with no table is skipped" rule pinned by a test | one shared helper, no cached index to keep in sync | [x] fixed |
 | CP-4 | catalog-postmaster | medium | `catalog.go:RoleIsMemberOf` / `IsAdminOfRole` / `HasPrivsOfRole` / `SelectBestAdmin` — BFS re-scans the entire `roleMembers` map per queue level (O(V×E)) | | | | | [ ] |
 | CP-5 | catalog-postmaster | medium | `catalog.go:LookupTableByOIDAllDBs` / `tableByOID` — linear scan of all tables per OID lookup | REJECT (maintainability) | plausible — `tableByOID` is O(tables) and runs per row for `tableoid::regclass` | — | an OID index would have to be maintained at ~100 sites that assign into or delete from `ns.tables`; there is no central setTable/dropTable helper to hang it on. Revisit once those writes are funnelled through one place | [x] no change |
@@ -911,3 +911,59 @@ Measured:
 - **Maintainability**: acceptable. Digit appends are more code than a Sprintf,
   but they are the boring kind, they sit behind the same function names, and
   the differential tests document exactly what they must produce.
+
+### PN-1 — ADOPT (resolve terminal numbers once, not per token)
+
+`mapToken` runs for every token of every statement. For a keyword it did two
+map lookups — text to `keywordDef`, then the def's terminal NAME to its number —
+and the fixed terminals (`IDENT`, `SCONST`, `ICONST`, …) were resolved by name
+per token as well, even though they are constants of the generated grammar.
+They are resolved once at init now, and `keywordTerm` maps a keyword's text
+straight to its terminal number.
+
+Measured (`internal/parser/parse_alloc_bench_test.go`, pgbench-shaped
+statements, two runs each):
+
+| statement | before | after |
+|---|---|---|
+| SELECT abalance | 6.28 us | 5.94 us |
+| UPDATE accounts | 6.33 us | 6.05 us |
+| INSERT history | 10.19 us | 9.81 us |
+| BEGIN | 1.48 us | 1.44 us |
+
+- **Benefit**: yes, but modest — 4-5% of parse time; parsing is dominated by
+  the grammar machinery and the node allocations, not by these lookups.
+- **No regression**: yes. The same numbers, computed earlier.
+- **Maintainability**: yes. Strictly less indirection.
+
+### PN-2 — REJECT (no benefit, and not behaviour-preserving)
+
+`strings.ToLower` returns its input unchanged, without allocating, when the
+string is already lower-case, and these are short tokens — the "double" call
+costs a scan of a few bytes. Removing it is also not a no-op: `next()` folds a
+typed literal by matching the LOWERED token text, so a string-literal token
+would stop matching (`SELECT 'DATE' 'x'` currently reaches that fold and would
+not afterwards). Not worth changing behaviour, however odd that corner is, for
+a few nanoseconds.
+
+### NB-11 — ADOPT (stop allocating a big.Int per stripped digit)
+
+`EncodeNumericKey` strips trailing zeros before building the index key. The loop
+allocated a fresh `big.Int` for the quotient `QuoRem` computes and discards, a
+fresh 10 and 0 to divide and compare against, and then divided a SECOND time to
+keep the quotient it had just thrown away. It now reuses two scratch values,
+swaps the quotient in, compares with `Sign()`, and shares one package-level ten.
+
+Measured (`internal/access/nbtree/numeric_key_bench_test.go`, a mantissa with
+nine trailing zeros):
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| before | 506.3 | 128 | 15 |
+| after | 251.3 | 48 | 5 |
+
+- **Benefit**: yes. 2x on every NUMERIC index key written or probed.
+- **No regression**: yes. `TestEncodeNumericKeyStripMatchesReference` compares
+  the produced key bytes against the old two-division strip loop over
+  positive, negative, zero, huge and negatively-scaled values.
+- **Maintainability**: yes. The loop got shorter.
