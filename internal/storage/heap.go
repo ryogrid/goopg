@@ -1124,7 +1124,13 @@ func CollectDeadHeapSlots(p Page, isDead func(HeapTupleHeader) bool) ([]uint16, 
 		if off < 0 || ln < 0 || off+ln > len(p) {
 			return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, idx+1, off, ln)
 		}
-		t, err := ParseHeapTuple(p[off : off+ln])
+		// review/260831 ST-1: header-only inspection, so take the aliasing
+		// decode. The caller holds the page's exclusive content lock for the
+		// whole call (see the contract on VacuumHeapPageBySlots) and t never
+		// outlives this iteration — ParseHeapTuple's two defensive copies of
+		// Data and Bitmap were pure churn on every tuple of every page VACUUM
+		// scans.
+		t, err := parseHeapTupleAlias(p[off : off+ln])
 		if err != nil {
 			return nil, err
 		}
