@@ -74,7 +74,7 @@ not, with the reason) / empty (not judged yet).
 | XL-14 | xlog | medium | format.go:encodeRecordXLog / wrapXLogMainData — two allocations per WAL record | ADOPT | 64-byte payload 84.5 ns -> 51.8 ns (1.6x), 4096-byte payload 1.75us -> 0.92us (1.9x), 2 allocs -> 1 | the emitted bytes are identical; the chunk header is written in place instead of in a temporary | `wrapXLogMainData` is gone rather than left as a second, unused copy of the rule | [x] fixed |
 | XL-21 | xlog | medium | pg_assembled_emit.go — envelope + body + mainData allocation chain per PG record | | | | | [ ] |
 | XL-24 | xlog | medium | pg_xlog_decode.go:parseXLogRecordData — cloneXLogBytes per block/main-data chunk | REJECT (the copy is the boundary) | one copy per block/main-data chunk during decode | those copies are what make a decoded record independent of the reader buffer; removing them means proving every caller passes a freshly allocated buffer AND accepting that a retained record pins the whole record buffer | — | [x] no change |
-| XL-25 | xlog | medium | pgoutput.go:pgoPhysEpoch — reconstructs the PG epoch per column decode | | | | | [ ] |
+| XL-25 | xlog | medium | pgoutput.go:pgoPhysEpoch — reconstructs the PG epoch per column decode | ADOPT (small) | 9.79 ns -> 0.90 ns per call (10.8x); called per decoded timestamp column | a package-level value instead of rebuilding the same time.Time | one var | [x] fixed |
 | XL-31 | xlog | medium | reader.go:readStreamFrom — stream slice grows without a capacity hint | ADOPT (no micro-benchmark) | a WAL segment is 16MB and there is usually more than one, so growing from zero capacity re-copied the whole stream at every doubling; the first segment size is known up front | pure capacity hint, the bytes are identical | one argument to make() | [x] fixed |
 | XL-38 | xlog | medium | reorder.go:foldChanges — allocates a copy even when nothing folds | ADOPT | the common no-fold case: 6244 ns -> 117 ns (53x), 24,576 B -> 0 allocs | two tests pin both paths: no fold returns the input, and a fold in the middle still produces the UPDATE with its neighbours intact | one scan before the allocation | [x] fixed |
 | XL-39 | xlog | medium | recovery.go:Decode* helpers — defensive tuple copies per record | | | | | [ ] |
@@ -90,12 +90,12 @@ not, with the reason) / empty (not judged yet).
 | ST-6 | storage | medium | `fsm.go:GetPageWithFreeSpace` — full linear scan of the block array per lookup | ADOPT | 100k-page relation: GetCandidates 23.6us -> 192ns (123x), GetPageWithFreeSpace 24.4us -> 163ns (150x), one insert round trip 23.7us -> 304ns (78x) | a differential test pins equivalence with the full-scan version, tie-breaking included | one-level summary per 512 blocks; relations of one chunk or less keep the plain scan | [x] fixed |
 | ST-8 | storage | medium | `fsm_fork.go:buildFSMTree` — re-parses every built page just to recover the max category | ADOPT | building a 100k-page relation FSM: 346us -> 244us (1.42x), 322KB / 66 allocs -> 216KB / 40 | fp_nodes[0] IS the max-tree root buildFSMPage computes; a test compares it against parseFSMPage over several fill levels | one accessor replaces a full page re-parse (and ST-9 in Appendix A, the same parseFSMPage waste, disappears with it) | [x] fixed |
 | ST-10 | storage | medium | `vm_fork.go:parseVMPage` — allocates a full `vmMaxHeapPagesPerPage` slice per page during `ReadVMFork` | ADOPT | decoding a 16-page VM fork: 1.02ms -> 0.43ms (2.4x), 2.51MB / 10 allocs -> 524KB / 1 | the decode rule is unchanged, it just appends into the caller buffer; parseVMPage keeps its signature for the redo test | one helper, one pre-sized result | [x] fixed |
-| ST-14 | storage | medium | `lmgr/lockmgr.go:grantedExcept` — O(number of holders) recomputation when the cached mask already has the answer | | | | | [ ] |
+| ST-14 | storage | medium | `lmgr/lockmgr.go:grantedExcept` — O(number of holders) recomputation when the cached mask already has the answer | ADOPT | 16 holders, requester not among them: 140.0 ns -> 4.83 ns (29x) | `granted` is the cached OR that every acquire and release already maintains; a test compares the fast path against the holder walk over several holder sets | two early returns | [x] fixed |
 | ST-16 | storage | medium | `aio/read_stream.go:refill` — allocates a fresh BlockSize buffer per prefetched block | REJECT (needs an API contract, not a fix) | real allocation per prefetched block | the buffer BECOMES the caller data: ReadStream.Next hands those bytes out, so recycling needs a release call and a "do not retain" contract on every consumer | out of scope for a per-finding fix | [ ] deferred |
 | ST-17 | storage | medium | `bufpool.go:Prefetch` — allocates a fresh 8KB buffer per prefetch | REJECT (unsafe to pool) | real 8KB allocation per prefetch | the buffer must stay alive until the async read completes, and the handle is dropped — reusing one buffer across in-flight prefetches means concurrent kernel writes into it. A pool would have to be tied to IO completion, which the AIO layer does not expose | out of scope for a per-finding fix | [ ] deferred |
 | NB-4 | nbtree-amcheck | low/medium | `pgpage.go:pgFirstDataSlot` — opaque re-decoded on every accessor call inside loops | ADOPT | 1.563 ns -> 0.382 ns per call (4.1x), and it is called per item inside page loops | a test compares the narrow read against PGFirstDataKey(ReadPGOpaque) over rightmost and non-rightmost pages | reads one field instead of five, with the P_RIGHTMOST rule spelled out | [x] fixed |
 | NB-8 | nbtree-amcheck | medium | `btree.go:resetPageItems` — byte-by-byte zeroing of the whole data area on every page rewrite | ADOPT | 1811 ns -> 118 ns per page rewrite (15.3x) | `clear` over the same byte range; the high key is still re-stamped afterwards, which the existing TestResetPageItemsKeepsTheHighKey pins | one line | [x] fixed |
-| NB-9 | nbtree-amcheck | medium | `btree.go:findChildBlockDirect` / `btree.go:insertItemSorted` — per-probe key copies inside descent/insert binary search | | | | | [ ] |
+| NB-9 | nbtree-amcheck | medium | `btree.go:findChildBlockDirect` / `btree.go:insertItemSorted` — per-probe key copies inside descent/insert binary search | ADOPT | in-page insert search 1666 ns -> 1375 ns (17%), 36 -> 27 allocs; a point Search over a 200k-key tree 21.3us -> 20.9us, 443 -> 431 allocs | the probed item is compared and dropped inside the loop while the page is pinned — the same no-copy contract parseNoCopy already documents for the range-scan hot path | parse -> parseNoCopy at the two ordering probes, with the contract written at readPageItem | [x] fixed |
 | NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | REJECT (maintainability) | plausible | — | pageItems returns an EXPANDED item list (one entry per heap TID), so items do not map 1:1 to line pointers; a lazy binary search would have to rework that invariant and its VACUUM-side readers | [x] no change |
 | NB-11 | nbtree-amcheck | low/medium | `btree.go:EncodeNumericKey` — fresh big.Int allocation per trailing-zero strip iteration | ADOPT | numeric index key with trailing zeros: 506 ns -> 251 ns (2.0x), 128 B / 15 allocs -> 48 B / 5 | a differential test compares the key bytes against the old two-division strip loop | two scratch values and a swap, plus a package-level ten | [x] fixed |
 | NB-15 | nbtree-amcheck | low/medium | `amcheck/heapallindexed.go:fingerprintLeafEntry` — a fresh buffer allocation per element, twice per element | | | | | [ ] |
@@ -1272,3 +1272,30 @@ WAL record independent of the reader's buffer. Removing them means proving
 every caller hands in a freshly allocated buffer and accepting that any
 retained record pins the whole record buffer. On the recovery path that trade
 is not worth a per-record copy of a few hundred bytes.
+
+### NB-9 / XL-25 / ST-14 — ADOPT
+
+**NB-9** — two btree binary searches probed with the COPYING item parse:
+`findChildBlockDirect` (every internal page of every descent) and
+`insertItemSorted` (every in-page insertion). Each probe copied the probed key
+out of the page and threw it away after one comparison. Both now use
+`parseNoCopy`, whose contract — the key aliases the pinned page — is exactly
+what an ordering probe needs, and is already what the range-scan hot path uses.
+
+| | before | after |
+|---|---|---|
+| in-page insert search | 1666 ns, 681 B, 36 allocs | 1375 ns, 618 B, 27 allocs |
+| point Search, 200k keys | 21,308 ns, 443 allocs | 20,903 ns, 431 allocs |
+
+The Search number moves little because most of its allocation is the leaf decode
+(NB-10, rejected above), not the descent.
+
+**XL-25** — `pgoPhysEpoch` rebuilt the same `time.Time` on every call, and it is
+called per decoded timestamp column: 9.79 ns -> 0.90 ns.
+
+**ST-14** — `grantedExcept` walked the holder map even though `granted`, the
+cached OR that every acquire and release maintains, already answers when the
+asking backend holds nothing on the tag — which is the common case. With 16
+holders: 140.0 ns -> 4.83 ns. `TestGrantedExceptMatchesWalk` compares the fast
+path against the walk over several holder sets, including the requester being
+the only holder.
