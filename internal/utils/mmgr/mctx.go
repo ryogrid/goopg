@@ -286,10 +286,17 @@ func (c *Context) Usage() (allocated int64, peak int64) {
 // Release returns chunks to the pool, cascades Release to children, and
 // removes c from the registry. After Release, c must not be used.
 func (c *Context) Release() {
-	for _, child := range c.children {
+	// review/260831-2 UT-4: detach the children BEFORE releasing them. Each
+	// child's Release() removes itself from its parent's children slice, so
+	// ranging over the live slice let the shift skip every second child (its
+	// chunks never returned to the pool) and release another one twice.
+	// Clearing c.parent first makes the child's removal scan a no-op.
+	children := c.children
+	c.children = nil
+	for _, child := range children {
+		child.parent = nil
 		child.Release()
 	}
-	c.children = c.children[:0]
 	for i := range c.chunks {
 		putChunk(c.cs, c.chunks[i].buf)
 		c.chunks[i].buf = nil

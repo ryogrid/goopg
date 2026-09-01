@@ -65,8 +65,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | XL-4 | med | `wal/slot_decoder.go:Run` — ConfirmedFlushLSN never advances for PG-format commit records | ? | [ ] | |
 | CP-2 | med | `postmaster/dispatch.go:normalizeSQLPreservingLiterals` — plan-cache key collision on quoted identifiers | ? | [ ] | |
 | UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | BUG | [x] | 306709703 |
-| UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | BUG | [x] | this commit |
-| UT-4 | med | `utils/mmgr/mctx.go:Context.Release` — mutates `c.children` while ranging over it | ? | [ ] | |
+| UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | BUG | [x] | 00e35fbab |
+| UT-4 | med | `utils/mmgr/mctx.go:Context.Release` — mutates `c.children` while ranging over it | BUG | [x] | this commit |
 | CM-3 | med | `cmd/plan-snapshot/main.go:planEqual` — `rowsRegexp` never matches the real EXPLAIN format | ? | [ ] | |
 
 ## C. Low severity (claimed)
@@ -366,3 +366,16 @@ landed.
   longest float-parseable prefix — exactly strtod's rule — and the rest is
   the suffix. Guard: `TestSetRealAcceptsScientificNotation`. Gates: units
   green; pgbench smoke green.
+
+- 2026-09-01 **UT-4 = BUG (fixed).** `Context.Release` ranged over
+  `c.children` while each child's own `Release` spliced itself out of that
+  same slice. The range keeps the original length but the splice shifts the
+  not-yet-visited elements down, so with N children every second one was
+  never released — its chunks never returned to the pool and its own
+  subtree stayed alive — while another child was released twice. Measured
+  by the guard: with 5 children, children 1 and 3 kept their id, their
+  chunk and their parent pointer. Fix: detach the slice first
+  (`children := c.children; c.children = nil`) and clear each child's
+  parent before releasing it, so the child's removal scan is a no-op.
+  Guard: `TestReleaseCascadesToEveryChild`. Gates: units green; pgbench
+  smoke green.
