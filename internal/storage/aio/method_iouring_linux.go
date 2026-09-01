@@ -510,6 +510,13 @@ func (m *methodIOUring) reap() {
 	}
 }
 
+// sqRingFull reports whether the submission queue has no free SQE at `tail`.
+// The kernel consumes entries at sqHead, so the queue holds tail-head entries
+// (unsigned subtraction, so the 32-bit wrap both counters take is handled).
+func (m *methodIOUring) sqRingFull(tail uint32) bool {
+	return tail-atomic.LoadUint32(m.sqHead) >= m.sqEntries
+}
+
 // pokeWake submits a NOP SQE with the closeWake sentinel so a
 // reaper currently blocked in io_uring_enter(GETEVENTS) drains
 // it as a CQE and reaches the m.closed select branch. Closing
@@ -520,6 +527,16 @@ func (m *methodIOUring) pokeWake() error {
 	defer m.submitMu.Unlock()
 
 	tail := atomic.LoadUint32(m.sqTail)
+	// The wake NOP is submitted outside the slot semaphore, so unlike
+	// submitOne it has no budget guaranteeing a free SQE: with the ring full
+	// (slots is sized to sqEntries) tail&sqMask aliases an SQE the kernel has
+	// not consumed yet, and overwriting it would turn a real read/write into
+	// a NOP whose completion never arrives. A full ring means there ARE ops
+	// in flight, and their CQEs wake the reaper by themselves, so skipping
+	// the NOP loses nothing (review/260831-2 ST-9).
+	if m.sqRingFull(tail) {
+		return nil
+	}
 	idx := tail & m.sqMask
 	sqe := &m.sqes[idx]
 	*sqe = ioSqe{Opcode: iorOpNop, UserData: closeWakeUserData}
