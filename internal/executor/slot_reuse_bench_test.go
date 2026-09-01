@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // BenchmarkAggregateEmit measures the aggregate operator's emission path
@@ -101,5 +103,51 @@ func BenchmarkGeneratedColumnInsert(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		run(stmt)
+	}
+}
+
+// BenchmarkAnalyzeRelation measures the ANALYZE sampling scan over a table
+// much larger than the sample (review/260831 EO1-4): every visible tuple used
+// to be decoded into a fresh Row and then usually dropped by the reservoir
+// test. It calls analyzeRelationCtx directly — the SQL-level ANALYZE does not
+// reach the sampler from this fixture.
+func BenchmarkAnalyzeRelation(b *testing.B) {
+	ctx, cleanup := newVMFixture(b)
+	defer cleanup()
+	run := func(sql string) { benchExecSQL(b, ctx, sql) }
+
+	run("CREATE TABLE anabench (id int, a int, bb int, c text)")
+	const n = 60000
+	for chunk := 0; chunk < n/1000; chunk++ {
+		var vals strings.Builder
+		for i := 0; i < 1000; i++ {
+			if i > 0 {
+				vals.WriteString(",")
+			}
+			v := chunk*1000 + i
+			fmt.Fprintf(&vals, "(%d, %d, %d, 'row%06d')", v, v%97, v%31, v)
+		}
+		run("INSERT INTO anabench VALUES " + vals.String())
+	}
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "anabench"})
+	if !ok {
+		b.Fatal("table not found")
+	}
+	// Commit the seeding transaction so the sampler's fresh snapshot sees the
+	// rows — the same reason operators_analyze_test.go commits before calling
+	// analyzeRelation.
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		st, err := analyzeRelation(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if st.RowCount != n {
+			b.Fatalf("RowCount = %d, want %d", st.RowCount, n)
+		}
 	}
 }

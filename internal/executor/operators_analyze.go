@@ -552,30 +552,42 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 			if !transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
 				continue
 			}
+			stats.RowCount++
+			totalBytes += int64(int(t.Header.Hoff) + len(t.Data))
+
+			// review/260831 EO1-4: decode ONLY the tuples the reservoir keeps.
+			// Every visible tuple used to be decoded into a fresh Row — a full
+			// per-column decode plus an allocation — and then dropped by the
+			// sampling test below, so a 10M-row table paid 10M decodes to keep
+			// a few thousand rows. The RNG is still consulted once per row past
+			// the cap, in the same order, so the sample is the same sample.
+			//
+			// Decode the PG-physical tuple body using the header (natts +
+			// null bitmap). Single on-disk row format since M0111-0002.
+			// Algorithm R: fill the reservoir, then for each
+			// subsequent row replace a uniformly-chosen slot
+			// with probability sampleCap/seen. `keep` is decided BEFORE the
+			// decode, and -1 means "this tuple is not in the sample".
+			keep := -1
+			if seen < int64(sampleCap) {
+				keep = len(reservoir)
+				reservoir = append(reservoir, nil)
+			} else if j := rng.Int63n(seen + 1); j < int64(sampleCap) {
+				keep = int(j)
+			}
+			seen++
+			if keep < 0 {
+				continue
+			}
 			// Decode the PG-physical tuple body using the header (natts +
 			// null bitmap). Single on-disk row format since M0111-0002.
 			row := make(Row, len(tbl.Columns))
 			natts := int(t.Header.Infomask2 & 0x07FF)
-			derr := DecodeRowIntoMctxPGTuple(row, tbl.Columns, t.Data, t.Bitmap, natts, nil)
-			if derr != nil {
+			if derr := DecodeRowIntoMctxPGTuple(row, tbl.Columns, t.Data, t.Bitmap, natts, nil); derr != nil {
 				pool.Unpin(slot)
 				return nil, fmt.Errorf("ANALYZE %s slot=%d: %w", tbl.QualifiedName(), s, derr)
 			}
-			stats.RowCount++
-			totalBytes += int64(int(t.Header.Hoff) + len(t.Data))
-
-			// Algorithm R: fill the reservoir, then for each
-			// subsequent row replace a uniformly-chosen slot
-			// with probability sampleCap/seen.
-			if seen < int64(sampleCap) {
-				reservoir = append(reservoir, row)
-			} else {
-				j := rng.Int63n(seen + 1)
-				if j < int64(sampleCap) {
-					reservoir[j] = row
-				}
-			}
-			seen++
+			reservoir[keep] = row
 		}
 		pool.Unpin(slot)
 	}
