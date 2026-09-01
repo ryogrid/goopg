@@ -220,9 +220,21 @@ func (o *utilitySettingsOp) nextShow(stmt *parser.ShowStmt) (TupleSlot, error) {
 				return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SHOW ALL is not supported in this executor context"}
 			}
 			settings := allSettings()
+			descs := o.gucShortDescriptions()
 			o.rows = make([]Row, 0, len(settings))
 			for _, kv := range settings {
-				o.rows = append(o.rows, Row{NewStringDatum(kv.Name), NewStringDatum(kv.Value)})
+				// PG's SHOW ALL is `SELECT name, setting, short_desc FROM
+				// pg_settings` — three columns. goopg emitted only the first
+				// two, so any client reading the third by index (or by name)
+				// broke (review/260831-2 EO2-8). The description comes from the
+				// same pg_settings rows the catalog already serves; GUCs that
+				// view does not carry yet get an empty description rather than
+				// invented text.
+				o.rows = append(o.rows, Row{
+					NewStringDatum(kv.Name),
+					NewStringDatum(kv.Value),
+					NewStringDatum(descs[strings.ToLower(kv.Name)]),
+				})
 			}
 		} else {
 			getSetting := o.ctx.GetSettingDisplay
@@ -245,4 +257,25 @@ func (o *utilitySettingsOp) nextShow(stmt *parser.ShowStmt) (TupleSlot, error) {
 	row := o.rows[o.rowIdx]
 	o.rowIdx++
 	return SlotFromRow(o.plan.Output(), row), nil
+}
+
+// gucShortDescriptions maps GUC name -> pg_settings.short_desc, the text PG's
+// SHOW ALL prints in its third column. Returns an empty (non-nil) map when the
+// catalog has no pg_settings view, so callers can index it unconditionally.
+func (o *utilitySettingsOp) gucShortDescriptions() map[string]string {
+	out := map[string]string{}
+	if o.ctx == nil || o.ctx.Catalog == nil {
+		return out
+	}
+	tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_settings"})
+	if !ok || tbl == nil || tbl.VirtualRows == nil {
+		return out
+	}
+	const shortDescCol = 4 // pg_settings column ordinal
+	for _, r := range tbl.VirtualRows() {
+		if len(r) > shortDescCol {
+			out[strings.ToLower(r[0])] = r[shortDescCol]
+		}
+	}
+	return out
 }

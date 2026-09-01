@@ -75,11 +75,11 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 
 | id | sev | finding | verdict | status | commit |
 |---|---|---|---|---|---|
-| EC-3 | low | `executor/btree_array_key.go` — multidimensional guard false-positives on a quoted `{` | ? | [ ] | |
-| EC-5 | low | `executor/codec.go:decodePhysicalPGValueLowered` — date/timestamp int64 overflow at PG range extremes | ? | [ ] | |
-| EC-6 | low | `executor/copy_binary.go:datumToCopyBinary` — int4 arm missing range check | ? | [ ] | |
-| EC-7 | low | `executor/copy_binary.go:copyBinaryToDatum` — infinity sentinels not handled | ? | [ ] | |
-| EC-8 | low | `executor/codec_aclitem.go:aclModeFromPrivLetters` — shift-after-guard pattern (report says not a live bug) | ? | [ ] | |
+| EC-3 | low | `executor/btree_array_key.go` — multidimensional guard false-positives on a quoted `{` | BUG | [x] fixed + guarded | this commit |
+| EC-5 | low | `executor/codec.go:decodePhysicalPGValueLowered` — date/timestamp int64 overflow at PG range extremes | BUG | [x] fixed + guarded | this commit |
+| EC-6 | low | `executor/copy_binary.go:datumToCopyBinary` — int4 arm missing range check | NOT A BUG | [x] refuted (unreachable) | - |
+| EC-7 | low | `executor/copy_binary.go:copyBinaryToDatum` — infinity sentinels not handled | BUG | [x] fixed + guarded | this commit |
+| EC-8 | low | `executor/codec_aclitem.go:aclModeFromPrivLetters` — shift-after-guard pattern (report says not a live bug) | NOT A BUG | [x] refuted (self-declared) | - |
 | EO1-2 | low | `executor/operators.go:limitOp.Open` — stale limitCount survives a NULL-limit re-Open | BUG | [x] fixed + guarded | this commit |
 | EO1-4 | low | `executor/operators_bitmap.go:lookupBounds` — index out of range with a zero-key-column index | NOT A BUG | [x] | — |
 | EO1-5 | low | `executor/operators_generate_series.go:generateSeriesOp.Next` — int64 overflow near MaxInt64 | BUG (dup EO2-3) | [x] | 5c60e8551 |
@@ -88,8 +88,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EO1-8 | low | `executor/operators_ddl.go:execCreateTable` — fallback column path drops serial's implicit NOT NULL | NOT A BUG | [x] | — |
 | EO1-9 | low | `executor/operators_fk.go:checkConstraints` — CHECK VALUES built from `Format()` text | BUG | [x] fixed + guarded | this commit |
 | EO1-10 | low | `executor/operators_from_unnest.go` and sibling SRFs — `SlotFromRow(nil, …)` nil schema | NOT A BUG | [x] refuted | - |
-| EO2-6 | low | `executor/operators_pg_options_to_table.go:Open` — lateral binding via ctx.OuterRows, no BindLateralOuter | ? | [ ] | |
-| EO2-7 | low | `executor/operators_generated.go:evalGenExpr` — ColumnRef bounds check after EqualFold | ? | [ ] | |
+| EO2-6 | low | `executor/operators_pg_options_to_table.go:Open` — lateral binding via ctx.OuterRows, no BindLateralOuter | BUG | [x] fixed + guarded | this commit |
+| EO2-7 | low | `executor/operators_generated.go:evalGenExpr` — ColumnRef bounds check after EqualFold | NOT A BUG | [x] refuted | - |
 | EO2-8 | low | `executor/operators_utility_settings.go:nextShow` — `SHOW ALL` emits 2 columns vs PG's 3 | BUG | [x] fixed + guarded | this commit |
 | ES-1 | low | `executor/parallel_agg_combine.go:combineNumericSum` — Int-lane contribution dropped when lanes disagree | ? | [ ] | |
 | ES-2 | low | `executor/parallel_agg_split.go:aggPartialAccum.merge` — silent break on state-count mismatch | ? | [ ] | |
@@ -113,30 +113,33 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | TA-4 | low | `transam/manager.go:AcquireConnSlot` — int32 cursor overflow → negative modulo | BUG | [x] fixed + guarded | this commit |
 | TA-5 | low | `transam/clog.go:GetStatus` — nil `pool` dereference vs the nil-safe contract elsewhere | NOT A BUG | [x] | — |
 | TA-6 | low | `multixact/multixact.go:StatusesConflict` — invalid Status indexes out of bounds | NOT A BUG | [x] | — |
-| NP-2 | low | `plpgsql/parser.go:parseSQLStmt` — `SELECT INTO x FROM t` yields a malformed query | ? | [ ] | |
+| NP-2 | low | `plpgsql/parser.go:parseSQLStmt` — `SELECT INTO x FROM t` yields a malformed query | NOT A BUG | [x] refuted (PG does the same) | - |
 | NP-3 | low | `nodes/outfuncs.go:outDatum` — by-value Const with short/nil Datum panics | ? | [ ] | |
 | NP-4 | low | `nodes/readfuncs.go:readDatum` — negative/zero by-reference length silently accepted | ? | [ ] | |
-| NP-6 | low | `plpgsql/parser.go:parseStmt` — `<<label>>` / `label: LOOP` forms mis-parse | ? | [ ] | |
-| OP1-1 | low | `optimizer/copy.go:validateCopyOptions` — REJECT_LIMIT accepted with ON_ERROR=STOP | ? | [ ] | |
+| NP-6 | low | `plpgsql/parser.go:parseStmt` — `<<label>>` / `label: LOOP` forms mis-parse | NOT A BUG | [x] unimplemented feature, not a regression | - |
+| OP1-1 | low | `optimizer/copy.go:validateCopyOptions` — REJECT_LIMIT accepted with ON_ERROR=STOP | BUG | [x] fixed + guarded | this commit |
 | OP1-4 | low | `optimizer/cardinality.go:indexScanRows` — unique-index shortcut ignores range bounds | ? | [ ] | |
 | OP1-5 | low | `optimizer/costbitmap.go:computeBitmapPagesLooped` — lossy-page adjustment computed then discarded | ? | [ ] | |
 | OP1-6 | low | `optimizer/cardinality.go:EstimateRows` — `LIMIT 0` returns 0 read as "no estimate" | ? | [ ] | |
-| OP2-1 | low | `optimizer/foldconst.go:foldCaseExpr` — dead THEN under a NULL simple-CASE operand is folded | ? | [ ] | |
-| XL-1 | low | `wal/append_xlog_payload.go:appendXLogPayload` — error from emitWithPageHeaders swallowed | ? | [ ] | |
-| XL-2 | low | `wal/insert_pos.go:reserveLocked` — `onCrossSegment` padded return discarded | ? | [ ] | |
+| OP2-1 | low | `optimizer/foldconst.go:foldCaseExpr` — dead THEN under a NULL simple-CASE operand is folded | BUG | [x] fixed + guarded | this commit |
+| XL-1 | low | `wal/append_xlog_payload.go:appendXLogPayload` — error from emitWithPageHeaders swallowed | NOT A BUG | [x] refuted (no error is returned) | - |
+| XL-2 | low | `wal/insert_pos.go:reserveLocked` — `onCrossSegment` padded return discarded | NOT A BUG | [x] refuted (unmounted legacy path) | - |
 | XL-3 | low | `wal/pgoutput.go:encodePgoTuplePhysical` — column-offset walk mis-advances on null columns | NOT A BUG | [x] | — |
 | XL-5 | med | `wal/pgoutput.go:pgoPhysicalAlign` — alignment table drifted from the executor decoder's (found while checking XL-3) | BUG | [x] fixed + guarded | this commit |
-| CP-3 | low | `postmaster/autovacuum/launcher.go:freezeCutoff` — dead signedness check / unsigned wrap reliance | ? | [ ] | |
-| CP-4 | low | `replication/logicalwalsender.go:walsenderPgoutputAdapter.Write` — LSN underflow on empty write | ? | [ ] | |
-| CP-5 | low | `postmaster/server.go:isReplicationStartupParam` — overly broad match | ? | [ ] | |
+| CP-3 | low | `postmaster/autovacuum/launcher.go:freezeCutoff` — dead signedness check / unsigned wrap reliance | BUG | [x] fixed + guarded | this commit |
+| CP-4 | low | `replication/logicalwalsender.go:walsenderPgoutputAdapter.Write` — LSN underflow on empty write | BUG | [x] fixed + guarded | this commit |
+| CP-5 | low | `postmaster/server.go:isReplicationStartupParam` — overly broad match | BUG | [x] fixed + guarded | this commit |
 | UT-3 | low | `utils/misc/guc.go:convertUnit` — int64 overflow on cross-unit conversion | BUG | [x] fixed + guarded | this commit |
 | UT-5 | low | `utils/activity/stats/counter.go:Add` — index out of range when GOMAXPROCS > 256 | BUG | [x] fixed + guarded | this commit |
 | UT-6 | low | `utils/adt/datetime/normalize.go:padTimeFields` — run-together time expansion not implemented | ? | [ ] | |
-| UT-7 | low | `utils/misc/session.go:EndTransaction` — rollback fires `invokeOnChange` for unchanged values | ? | [ ] | |
+| UT-7 | low | `utils/misc/session.go:EndTransaction` — rollback fires `invokeOnChange` for unchanged values | NOT A BUG | [x] refuted (callbacks idempotent) | - |
 | CM-2 | low | `cmd/goopg/standby.go:Promote` — `sc.replayer.ApplyLSN()` without a nil guard | ? | [ ] | |
-| CM-4 | low | `cmd/gen-*-coverage/main.go:loadCSV` — `row[statusIdx]` out of bounds on malformed CSV | ? | [ ] | |
-| CM-5 | low | `cmd/estimate-audit/main.go:selectQueries` — `Atoi` errors ignored, negative query numbers pass | ? | [ ] | |
-| CM-6 | low | `cmd/gen-pg-operator-data/main.go:parseOperatorDat` — right-unary operator kind `'r'` unhandled | ? | [ ] | |
+| CM-4 | low | `cmd/gen-*-coverage/main.go:loadCSV` — `row[statusIdx]` out of bounds on malformed CSV | NOT A BUG | [x] refuted (csv enforces field count) | - |
+| CM-5 | low | `cmd/estimate-audit/main.go:selectQueries` — `Atoi` errors ignored, negative query numbers pass | BUG | [x] fixed + guarded | this commit |
+| CM-6 | low | `cmd/gen-pg-operator-data/main.go:parseOperatorDat` — right-unary operator kind `'r'` unhandled | NOT A BUG | [x] refuted (PG has no postfix operators) | - |
+| X-1 | low | *(not in the review — found while verifying OP2-1)* `optimizer/foldconst.go` — `COALESCE(1, 1/0)` raises at plan time; PG returns 1 | BUG | [ ] not fixed | |
+| X-2 | low | *(not in the review — found while verifying NP-2)* `'x' \|\| true` yields `xt`; PG yields `xtrue` (bool→text in concat takes the 1-char form) | BUG | [ ] not fixed | |
+| X-3 | low | *(not in the review — found while verifying NP-2)* plpgsql `FOUND` stays false after a successful `SELECT … INTO`; PG sets it true | BUG | [ ] not fixed | |
 
 ---
 
@@ -592,6 +595,202 @@ test: `TestCreateNestLoopBitmapJoinRechecksProbeClause`
 (`internal/optimizer/createplannl_bitmap_recheck_test.go`), proven red against
 the pre-fix code — `Predicate is nil`.
 
+### OP1-1 — BUG (fixed, guard added)
+
+Confirmed against PG 18.3: `COPY t FROM STDIN (ON_ERROR stop, REJECT_LIMIT 5)`
+raises `COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE` there, while
+goopg accepted it and silently ignored the limit. Upstream's test is
+`opts_out->reject_limit && !opts_out->on_error`
+(postgres/src/backend/commands/copy.c:960) and `COPY_ON_ERROR_STOP` is the enum
+zero value, so an explicit STOP reads exactly like an omitted ON_ERROR — only
+IGNORE licenses REJECT_LIMIT. goopg tested `!onErrorSpecified`, which the
+explicit form passes. Fixed to `(!onErrorSpecified || onErrorIsStop)`.
+
+Guard: a new row in `TestPlanCopyIncorrectOptions`
+(`internal/optimizer/copy_test.go`), red before the fix ("expected error").
+
+### OP2-1 — BUG (fixed, guard added)
+
+Confirmed: `SELECT CASE NULL::int WHEN 1 THEN 1/0 ELSE 42 END` returns 42 on
+PG 18.3 and raised `ERROR: division by zero` on goopg. `toLiteralValue` does not
+cover `*NullConst`, so the simple-CASE constant shortcut was skipped and every
+dead THEN was folded as "potentially reachable". A NULL operand makes every
+branch dead (`NULL = x` is NULL for any x, `WHEN NULL` included), so the fix
+skips those branches outright — the same outcome PG reaches from the other
+side, by only taking its constant-CASE path for a non-null `Const` arg. The
+NULL test sees through the casts a typed NULL literal leaves behind
+(`isNullConstExpr`).
+
+Guard: `TestFoldSimpleCaseNullOperandSuppressesDivisionByZero`
+(`internal/optimizer/foldconst_test.go`), covering both the typed and untyped
+operand; red before the fix (panic → plan error).
+
+Side finding, filed as row **X-1** and NOT fixed here: the same plan-time
+eagerness hits `SELECT COALESCE(1, 1/0)` — PG returns 1, goopg raises division
+by zero. It is a different folder (not `foldCaseExpr`) and out of this row's
+scope.
+
+### NP-2 — NOT A BUG
+
+PG's own plpgsql performs the identical reconstruction. Asking both engines for
+`SELECT INTO x FROM no_such_tbl` inside a function, PG 18.3 reports
+`QUERY: SELECT        FROM no_such_tbl_np2` — i.e. it also cuts the INTO
+targets out of the text and leaves an empty select list — and `SELECT FROM t`
+has been legal SQL since 9.4, so nothing is malformed. goopg parses the same
+text and raises the same 42P01. Value-wise the two agree as well:
+`SELECT INTO x FROM np2` leaves `x` NULL on both.
+
+Two unrelated divergences surfaced while probing this and are filed as rows
+**X-2** and **X-3** (both unfixed, outside this review's scope): `'x' || true`
+returns `xt` on goopg vs `xtrue` on PG, and plpgsql `FOUND` stays false after a
+successful `SELECT … INTO` (`7/found=false` vs PG's `7/found=true`).
+
+### NP-6 — NOT A BUG (unimplemented feature)
+
+Confirmed missing, and the report says so itself ("out of scope per the AST
+comments … a documented limitation rather than a regression"). `<<top>> LOOP …
+EXIT top WHEN … END LOOP` returns 3 on PG 18.3 and fails on goopg at CREATE
+FUNCTION time with `plpgsql: syntax error at byte 27: unsupported PL/pgSQL
+statement`. It fails loudly at definition time — there is no silent
+misbehaviour to fix — and statement labels (`<<lbl>>`, `lbl:`, `EXIT lbl`,
+`CONTINUE lbl`) are a parser+executor feature, not a defect in existing code.
+
+### CM-4 — NOT A BUG
+
+`encoding/csv` cannot hand these loaders a short row. `Reader.FieldsPerRecord`
+defaults to 0, which locks the count to the header's on the first `Read`, and
+every later record with a different count fails with `wrong number of fields`
+(verified with a standalone probe: header `a,b,c` + row `1,2` → `rec=["1" "2"]
+err=record on line 2: wrong number of fields`). All three loaders return that
+error from the `read csv row` wrap, so the `row[statusIdx]` access is reached
+only for rows at least as long as the header, and `statusIdx` comes from the
+header. The adjacent `itemPathIdx >= len(row)` checks the report contrasts with
+are themselves dead for the same reason.
+
+### CM-5 — BUG (fixed, guard added)
+
+Real, and the worse case is the one the report mentions second: with both Atoi
+errors dropped, `--queries 5-` parsed `hi` as 0, the `for q := lo; q <= hi`
+loop ran zero times, and the tool audited **no queries at all** while exiting
+successfully — a silent no-op, not just a stray negative index. Fixed by
+requiring both bounds to parse, rejecting `lo < 1` and `hi < lo`, and failing on
+an unparsable bare number instead of skipping it.
+
+Guard: `cmd/estimate-audit/main_test.go` — `TestSelectQueriesParsesValidSpecs`
+pins the accepted forms and `TestSelectQueriesRejectsMalformedSpecs` re-execs
+the test binary for each bad spec (`5-`, `-5`, `3-x`, `abc`, `0`, `9-4`) and
+requires a non-zero exit, since `selectQueries` reports through `fatal`.
+
+### CM-6 — NOT A BUG
+
+PostgreSQL has no right-unary (postfix) operators any more: `CREATE OPERATOR`
+answers a missing right argument with `operator right argument type must be
+specified` / `DETAIL: Postfix operators are not supported.`
+(postgres/src/backend/commands/operatorcmds.c:184), and the oracle's
+`pg_operator.dat` carries `oprkind => 'l'` 41 times and no `'r'` at all (the
+rest default to `'b'`). The generator reads that file, so the `'r'` branch
+cannot be reached from any PG 18 tree; adding it would be dead code.
+
+### CP-5 — BUG (fixed, guard added)
+
+Real, and confirmed at the wire against PG 18.3 by connecting with a
+`replication=` startup parameter: PG answers `bogus`, `truex`, `databas` and
+`2` with `FATAL: invalid value for parameter "replication": "…"` plus
+`HINT: Valid values are: "false", 0, "true", 1, "database".`, while goopg
+completed the handshake and ran `select 1` for all of them. `off` / `no` / `of`
+/ `n` connect normally on PG (parse_bool takes any non-empty prefix of
+true/false/yes/no/on/off, case-insensitively, plus 1/0) but were routed to the
+walsender path by goopg's "anything not in {0,false,FALSE,False} is
+replication" rule.
+
+Fixed by mirroring `backend_startup.c:751`: `database` first, then
+`parse_bool_with_len`'s prefix rule (`parseStartupBool`), and a third result —
+"unparsable" — which the startup path answers with the same FATAL 22023 and
+HINT (new `writeFatalHint`). Out of scope and left alone: goopg's replication
+connections still fall back to the SQL dispatcher, where PG says `cannot
+execute SQL commands in WAL sender for physical replication`; the report notes
+that fallback as intended.
+
+Guard: `internal/postmaster/replication_startup_param_test.go` — a table of 22
+spellings, every one checked against the oracle, plus a wire test asserting the
+FATAL/22023/HINT for `replication=bogus`. Red before the fix (the wire half read
+message type 'R', i.e. the handshake proceeded).
+
+### UT-7 — NOT A BUG
+
+The redundant call is real: on rollback `invokeOnChange` fires for every
+journalled key even when the restored value equals the pre-restore one, while
+the `onReportableChange` sibling two lines above is gated on `after != before`.
+It has no observable effect, though. Every registered callback is an idempotent
+per-value setter — `enable_nestloop_index` / `enable_memoize` /
+`enable_presorted_aggregate` / `enable_hashagg` (cmd/goopg/main.go) assign a
+planner flag, and `application_name` / `track_io_timing` /
+`backend_flush_after` (internal/postmaster/server.go) write one field of the
+calling backend's activity slot. Re-assigning the value a variable already
+holds changes nothing and costs a map lookup per rolled-back SET. Left as-is;
+gating it would be cosmetic.
+
+### XL-1 — NOT A BUG (misread signature)
+
+`emitWithPageHeaders` returns `(out []byte, leading int)`
+(`internal/access/transam/xlog/xlog_emit.go:62`) — there is no error to
+propagate. The discarded second value is the leading page-header byte count,
+which this composer does not need: `AppendBuiltEmitted` hands `leading` to the
+build closure as an *input*, computed by `predictEmittedSize` before the record
+is built. Nothing is swallowed.
+
+### XL-2 — NOT A BUG (unmounted legacy path, and the live path already does this)
+
+The observation describes `reserveLocked`, which serves `reserve` /
+`reserveAndPublish` → `stripeAppend` / `stripeAppendBuild` — none of which any
+production caller reaches. The live PG-compat write path is
+`state.append → core.AppendXLogPayload → AppendBuiltEmitted →
+reserveEmittedAndPublish`, and that path already implements exactly the
+requested rule: it takes the hook's `padded` result and advances `t.prev` only
+when a real pad record was written, with a long comment explaining that a gap
+below `xlogMinimumRecordSize` is zero-filled (PG's AdvanceXLInsertBuffer
+behaviour, M0131-S30.6) and must not be linked to. `reserveLocked`'s own
+comment already records the divergence as deliberate for the legacy path.
+Nothing to fix; if the legacy path is ever mounted it should be deleted rather
+than patched.
+
+### CP-3 — BUG, worse than reported (fixed, guard added)
+
+The report calls the observable result "currently correct"; it is not. With
+`fb := nextXID - storage.TransactionID(eff)` in uint32, every cluster younger
+than `vacuum_freeze_min_age` (the default 50M — i.e. essentially every goopg
+cluster that has ever run) wrapped to a value near 2^32, and the very next line,
+`if fb > oldestXmin { fb = oldestXmin }`, rewrote that to oldestXmin. So goopg
+froze EVERY dead-to-all tuple on every autovacuum pass, where PG freezes none:
+upstream keeps the wrapped value and compares it with `TransactionIdPrecedes`
+(vacuum.c:1204-1209), whose modular ordering places it 50M transactions in the
+past, so no tuple qualifies. The `if fb < 0` line is dead as reported.
+
+Fixed by computing in signed space and returning 0 — goopg's `FreezeBelow`
+consumer (`internal/commands/vacuum`) compares plainly (`xmin < FreezeBelow`)
+and treats 0 as "freezing off", which is how the wrapped-limit outcome has to be
+expressed here. Reproducing PG's wrapped value literally would require
+wraparound-aware comparisons throughout the freeze path; that is a separate
+piece of work.
+
+Guard: `internal/postmaster/autovacuum/freeze_cutoff_test.go` — six points
+across the young/mature/clamped/reloption space; red before the fix (fresh
+cluster returned 90 instead of 0).
+
+### CP-4 — BUG (fixed, guard added)
+
+Real, and the damage outlives the frame: `endLSN := nextLSN + len(p) - 1`
+underflows on an empty write, so the adapter emitted a 30-byte `'w'` frame with
+EndLSN ≈ 2^64 AND set `nextLSN = endLSN + 1 = 0`, after which the next real
+message was advertised as `StartLSN=100 EndLSN=99` — the LSN stream is
+corrupted from then on, not just for the empty frame. Fixed by returning
+`(0, nil)` for an empty payload before any LSN arithmetic.
+
+Guard: `TestWalsenderPgoutputAdapterEmptyWriteIsDropped`
+(`internal/replication/logicalwalsender_test.go`) — nothing on the wire, nextLSN
+unmoved, and the following write still framed 100..102. Red before the fix on
+all three.
+
 ### UT-5 — BUG (fixed, guard added)
 
 `Counter.Add` indexed the 256-entry shard table with `runtimeshim.PinP()`,
@@ -871,3 +1070,127 @@ behaviourally: `FOR r IN SELECT * FROM unnest(ARRAY[10,20]) AS t(x) LOOP acc
 := acc || r.x` returns "10 20 ", i.e. field-by-name binding through an SRF
 works today. Worth tidying if the SRFs are touched again, but nothing is
 broken.
+
+### EO2-6 — BUG (fixed) — root cause is in the planner, not the operator
+
+Real, and the missing `BindLateralOuter` was only half of it.
+`pg_options_to_table` was absent from *both* lateral mechanisms: the operator
+read `ctx.OuterRows` and implemented no `BindLateralOuter`, and — the actual
+blocker — `optimizer.nodeReferencesOuter` had no `*PgOptionsToTable` case, so
+the wrapping Join was never marked `Lateral` and `openLateral` (the only code
+that binds an outer row per iteration) never ran at all. Result, on goopg
+before the fix:
+
+    SELECT z.id, t.option_name, t.option_value
+      FROM zopts z, LATERAL pg_options_to_table(z.opts) t;
+    ERROR: XX000 column ref opts/1 on nil slot
+
+PG 18.3 returns `(1,a,1) (1,b,2) (2,c,3)` for the same fixture (verified on
+the oracle). The correlated-subquery spelling pg_dump itself uses
+(`(SELECT count(*) FROM pg_options_to_table(z.opts))`) worked, which is why
+this stayed hidden.
+
+Fix: a `*PgOptionsToTable` arm in `nodeReferencesOuter` returning
+`exprContainsColumnRef(x.Arg)`, plus `BindLateralOuter` on the operator with
+`evalExprSlot` against the bound slot, falling back to the `ctx.OuterRows` top
+when no slot is bound (keeps the pg_dump path intact).
+
+Guard: `executor/pg_options_to_table_lateral_test.go` — both spellings, exact
+PG row set. Red before the fix with the "nil slot" error above.
+
+### EO2-7 — NOT A BUG
+
+Two claims, neither holds. (a) "`i < len(row)` is checked after EqualFold, so
+a matching name past the row's end silently returns NULL": both orderings
+behave identically — when the bound check fails the loop just continues, and
+since a table cannot have two columns of the same name, the continue always
+runs out and returns `NullDatum` either way. The proposed reordering changes
+no observable behaviour. (b) "`row[i] = val` panics on a short row": every
+caller sizes the row to the column list it passes — `computeGeneratedColumns`
+is always called with the table (or leaf partition) the row was just built or
+remapped for (`remapRowForPartition` re-sizes to `part.Columns` before the
+partition-level call), and `applyDefaultsForMissing`'s `missing` slice is
+built alongside the row from the same column list at all five call sites
+(upsert, COPY, MERGE, apply worker, insert). No reachable short-row path.
+
+### EC-3 — BUG (fixed)
+
+Real. `encodeArrayBTreeKey`'s multidimensional refusal scanned the raw literal
+text for any `{` byte, with no regard for quoting, so a plain 1-D `text[]`
+value whose element merely contains a brace was rejected. On goopg before the
+fix, with an index on the column:
+
+    SELECT count(*) FROM zbrace WHERE a = '{"a{b"}';
+    ERROR: 0A000 btree v0 cannot index multidimensional array column "a"
+
+PG 18.3 (oracle) indexes the same value and returns 1. Fix: a new
+`arrayLiteralHasNestedBrace` scan that tracks quotes and backslash escapes the
+way `parseTextArrayElems` does, so only a top-level `{` counts as nesting.
+
+Guard: `executor/btree_array_key_brace_test.go` — the quoted-brace element now
+probes to 1 row, and a genuinely nested literal (`{{1,2},{3,4}}`) still raises
+0A000. Red before the fix with the error above.
+
+### EC-5 — BUG, narrowed (fixed on the decode side)
+
+Partly real. The SQL-facing half is already covered: goopg's date/timestamp
+*input* refuses anything outside Go's time range with an explicit error —
+`INSERT … '5874897-12-31'` → 22007, `'4714-11-24 BC'` → `22008 date/time
+value out of range for date … (goopg stores date between 1677-09-21 and
+2262-04-11)` — so no wrap can be reached from SQL, and the ±infinity
+sentinels are intercepted before the arithmetic in both the timestamp and
+date arms.
+
+What is genuinely unguarded is the decode of a heap real PG wrote: PG's date
+range runs to 5874897 AD, and `int64(days)*86400*1e6` overflows around
+294247 AD, turning a far-future date into a plausible near-past one with no
+error at all. Fixed by bounding `days` against the representable micros range
+and returning an error instead. The encoder needs no counterpart: a Datum
+outside Go's range cannot be constructed in the first place.
+
+Guard: `executor/codec_date_range_test.go` — out-of-range day counts (±1.43e9,
+PG's own extreme) now error, both infinity sentinels still decode, and an
+ordinary date still round-trips. Red before the fix (both extremes decoded
+"successfully").
+
+### EC-6 — NOT A BUG (unreachable)
+
+The observation is factually right — the `int2` arm range-checks and the `int4`
+arm does not — but no out-of-range int4 Datum can reach it. Every ingress into
+an `int4` column rejects the value first: `INSERT INTO t(i int4) VALUES
+(2147483648)` → `integer out of range`, `… VALUES (2147483647::int8 + 1)` →
+same, and text `COPY … FROM STDIN` with `9999999999` → `value is out of range
+for type integer`. The one case that *does* produce an oversized value,
+`SELECT 2147483647::int4 + 1`, is typed `bigint` by goopg (PG errors instead —
+a separate, unrelated divergence) and so takes the int8 arm and ships 8 bytes.
+The report itself notes "not triggered by normal operation". Left as-is rather
+than adding an unreachable branch.
+
+### EC-7 — BUG, narrowed (fixed, both directions)
+
+Real for `date` / `timestamp` / `timestamptz`, and worse than "decode only":
+the *encode* side was wrong too. `datumToCopyBinary` passed the ±infinity
+KindTime carrier (Int = INT64 extreme *nanoseconds*) through `TimeValue()`, so
+`COPY … TO STDOUT (FORMAT binary)` shipped `'infinity'::date` as `00017632`
+(= 2262-04-11) and `'infinity'::timestamp` as `001d679a6aab73f7`, where PG 18.3
+ships `7fffffff` / `7fffffffffffffff` (verified against the oracle on 65438).
+`copyBinaryToDatum` then reconstructed those as ordinary finite values, so a
+binary dump/restore silently rewrote infinity to a year-2262 timestamp. The
+heap codec (`codec.go`) had handled the sentinels since #5(d-iv); this is the
+sibling-paths-must-agree pattern again. Fixed by intercepting
+DT_NOEND/DT_NOBEGIN and DATEVAL_NOEND/DATEVAL_NOBEGIN in all four arms.
+
+Narrowed on two of the reported types: `interval` already round-trips
+correctly (its sentinel *is* the wire value — `7fffffffffffffff7fffffff
+7fffffff` — so the plain encoder is accidentally right), and `timetz` has no
+infinity in PG at all, so nothing is missing there.
+
+Guard: `executor/copy_binary_infinity_test.go` — the six wire forms are pinned
+to the bytes captured from PG 18.3 and the round trip must preserve the
+sentinel and its sign. Red before the fix on all six.
+
+### EC-8 — NOT A BUG
+
+The report says so itself ("the `if idx < 0` guard catches this before the
+shift, so this is not a live panic … no change needed"). Recorded as reviewed;
+nothing to fix.

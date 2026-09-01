@@ -492,15 +492,13 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	switch {
 	case upper == "SHOW ALL":
 		rows := sess.AllDisplay()
+		descs := s.gucShortDescriptions()
 		out := make([][][]byte, 0, len(rows))
 		for _, kv := range rows {
-			out = append(out, [][]byte{[]byte(kv.Name), []byte(kv.Value)})
+			out = append(out, [][]byte{[]byte(kv.Name), []byte(kv.Value), []byte(descs[strings.ToLower(kv.Name)])})
 		}
 		return &extendedQueryResult{
-			Fields: []libpq.FieldDescription{
-				{Name: "name", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-				{Name: "setting", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-			},
+			Fields:     showAllFields(),
 			Rows:       out,
 			CommandTag: "SHOW",
 		}, nil
@@ -508,15 +506,13 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 		name := strings.TrimSpace(matchable[len("SHOW "):])
 		if strings.EqualFold(name, "ALL") {
 			rows := sess.AllDisplay()
+			descs := s.gucShortDescriptions()
 			out := make([][][]byte, 0, len(rows))
 			for _, kv := range rows {
-				out = append(out, [][]byte{[]byte(kv.Name), []byte(kv.Value)})
+				out = append(out, [][]byte{[]byte(kv.Name), []byte(kv.Value), []byte(descs[strings.ToLower(kv.Name)])})
 			}
 			return &extendedQueryResult{
-				Fields: []libpq.FieldDescription{
-					{Name: "name", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-					{Name: "setting", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-				},
+				Fields:     showAllFields(),
 				Rows:       out,
 				CommandTag: "SHOW",
 			}, nil
@@ -667,18 +663,12 @@ func (s *Server) describeExtendedQuery(query string, sess *misc.SessionRegistry,
 	}
 	switch {
 	case upper == "SHOW ALL":
-		return []libpq.FieldDescription{
-			{Name: "name", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-			{Name: "setting", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-		}
+		return showAllFields()
 	case strings.HasPrefix(upper, "SHOW "):
 		name := strings.TrimSpace(matchable[len("SHOW "):])
 		name = strings.Trim(name, " \"'")
 		if strings.EqualFold(name, "ALL") {
-			return []libpq.FieldDescription{
-				{Name: "name", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-				{Name: "setting", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-			}
+			return showAllFields()
 		}
 		if name == "" {
 			name = "?column?"

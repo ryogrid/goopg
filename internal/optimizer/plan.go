@@ -2377,9 +2377,13 @@ func (n *Utility) Output() Schema {
 	switch stmt := n.Stmt.(type) {
 	case *parser.ShowStmt:
 		if stmt.All {
+			// PG: `SHOW ALL` is name/setting/description (guc.c
+			// ShowAllGUCConfig) — the third column was missing
+			// (review/260831-2 EO2-8).
 			return Schema{
 				{Name: "name", Type: catalog.Type{Name: "text"}},
 				{Name: "setting", Type: catalog.Type{Name: "text"}},
+				{Name: "description", Type: catalog.Type{Name: "text"}},
 			}
 		}
 		return Schema{{Name: stmt.Name, Type: catalog.Type{Name: "text"}}}

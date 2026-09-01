@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 )
 
@@ -489,19 +490,49 @@ func (s *Server) handleShow(w *libpq.FrameWriter, sess *misc.SessionRegistry, na
 	return w.ReadyForQuery()
 }
 
-// handleShowAll returns every variable as (name, setting). Upstream also
-// emits a description column; we include name + setting only and leave
-// description for milestone 5 (catalog) work.
-func (s *Server) handleShowAll(w *libpq.FrameWriter, sess *misc.SessionRegistry) error {
-	if err := w.WriteRowDescription([]libpq.FieldDescription{
+// showAllFields is the RowDescription PG's SHOW ALL sends: name, setting and
+// description (guc.c ShowAllGUCConfig). goopg used to omit the description
+// column, so a client reading the third field — by index or by name — broke
+// (review/260831-2 EO2-8). Every SHOW ALL path (simple query here, and the two
+// extended-protocol arms) shares this so they cannot disagree.
+func showAllFields() []libpq.FieldDescription {
+	return []libpq.FieldDescription{
 		{Name: "name", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
 		{Name: "setting", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
-	}); err != nil {
+		{Name: "description", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+	}
+}
+
+// gucShortDescriptions maps GUC name -> pg_settings.short_desc, the text SHOW
+// ALL prints in its description column. GUCs the pg_settings view does not
+// carry yet come back with an empty description rather than invented text.
+func (s *Server) gucShortDescriptions() map[string]string {
+	out := map[string]string{}
+	if s.cfg.Catalog == nil {
+		return out
+	}
+	tbl, ok := s.cfg.Catalog.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_settings"})
+	if !ok || tbl == nil || tbl.VirtualRows == nil {
+		return out
+	}
+	const shortDescCol = 4 // pg_settings column ordinal
+	for _, r := range tbl.VirtualRows() {
+		if len(r) > shortDescCol {
+			out[strings.ToLower(r[0])] = r[shortDescCol]
+		}
+	}
+	return out
+}
+
+// handleShowAll returns every variable as (name, setting, description).
+func (s *Server) handleShowAll(w *libpq.FrameWriter, sess *misc.SessionRegistry) error {
+	if err := w.WriteRowDescription(showAllFields()); err != nil {
 		return err
 	}
+	descs := s.gucShortDescriptions()
 	rows := sess.AllDisplay()
 	for _, kv := range rows {
-		if err := w.WriteDataRow([][]byte{[]byte(kv.Name), []byte(kv.Value)}); err != nil {
+		if err := w.WriteDataRow([][]byte{[]byte(kv.Name), []byte(kv.Value), []byte(descs[strings.ToLower(kv.Name)])}); err != nil {
 			return err
 		}
 	}
