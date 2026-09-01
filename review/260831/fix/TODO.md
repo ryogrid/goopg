@@ -40,7 +40,7 @@ not, with the reason) / empty (not judged yet).
 | EO1-1 | executor-operators-1 | medium | `operators.go:sortOp.lessRows` — Sort key expressions re-evaluated on every comparison | REJECT (already done) | — | — | — | [x] no change |
 | EO1-13 | executor-operators-1 | medium | `operators_gather_merge.go:lessRows` — Sort key expressions re-evaluated on every heap comparison (promoted from Appendix A) | ADOPT | 4 sources x 2000 rows: 2.63ms -> 1.94ms (1.36x), allocs 42,652 -> 23,988 | comparison rule unchanged verbatim; keys evaluated once, when the row is pulled | same shape as EO2-2 / sortOp | [x] fixed |
 | EO1-4 | executor-operators-1 | medium | `operators_analyze.go:analyzeRelationWith` — Decodes every visible tuple but only keeps a fraction | | | | | [ ] |
-| EO1-7 | executor-operators-1 | medium | `operators_bitmap.go:bitmapIndexScanOp.buildBitmap` — Allocates a slice per index entry in hot loop | | | | | [ ] |
+| EO1-7 | executor-operators-1 | medium | `operators_bitmap.go:bitmapIndexScanOp.buildBitmap` — Allocates a slice per index entry in hot loop | ADOPT (finding partly wrong) | 17.0 ns -> 12.8 ns per index entry (1.33x). The claimed allocation does NOT happen — escape analysis keeps the one-element slice on the stack, 0 allocs either way | same insertion path (addOne); recheckAny is still only set when a tuple is added | three lines, and the call now says what it does | [x] fixed |
 | EO1-10 | executor-operators-1 | medium | `operators_generate_series.go:generateSeriesOp.Next` — Allocates a Row per emitted value | | | | | [ ] |
 | EO1-11 | executor-operators-1 | medium | `operators_fk.go:fkRowMatches` — Per-row linear column-name lookup on every row of a table scan | ADOPT | 16-column table, FK columns last: 262 ns -> 24 ns per row (10.7x) | a differential test compares the new form against the old name-resolving one, unknown-column and case-insensitive cases included | the resolution is hoisted to the top of each scan; the old function is gone, not duplicated | [x] fixed |
 | EO2-1 | executor-operators-2 | high | `operators_join_agg.go:applyAgg` — string_agg O(n²) string concatenation | ADOPT | 4000 rows in one group: 34.99ms -> 1.89ms (18.5x), 229MB -> 1.5MB allocated | concatenation order, delimiter placement and the bytea path are identical; the ORDER BY path already used a Builder | one field swapped: `strResult` string -> `strAccum []byte` | [x] fixed |
@@ -104,7 +104,7 @@ not, with the reason) / empty (not judged yet).
 | NB-19 | nbtree-amcheck | low/medium | `backup/basebackup.go:baseBackupStreamer.Write` / `streamBackupManifest` — fresh frame buffer allocated per chunk | | | | | [ ] |
 | NB-20 | nbtree-amcheck | low/medium | `backup/basebackup.go:emitBaseBackupTar` / `emitTablespaceTar` — whole-file buffering | | | | | [ ] |
 | TA-1 | transam | medium | `manager.go:captureSnapshot` — Full copy of `abortedXIDs` on every snapshot capture | ADOPT | with 10,000 aborts: 15.0us -> 1.13us (13x), 41KB -> 89B per snapshot | honours the existing contract that Aborted is immutable after capture; the insert side became copy-on-write | contained in one insert helper | [x] fixed |
-| TA-2 | transam | medium | `manager.go:SnapshotFor` — Deep-`Clone()` of the pinned snapshot on every RR/SSI statement | | | | | [ ] |
+| TA-2 | transam | medium | `manager.go:SnapshotFor` — Deep-`Clone()` of the pinned snapshot on every RR/SSI statement | ADOPT | per statement in RR/SSI: 9.7 ns -> 1.4 ns with no aborts, 116 ns -> 1.4 ns with 100 aborts, 6.9us -> 1.4 ns (41KB -> 0) with 10,000 | rests on the invariant WithCLog already documents: the XID arrays are immutable after capture. captureSnapshot builds fresh slices and insertSortedXID is copy-on-write (TA-1); nothing else writes them | Clone keeps its name and contract, with the invariant spelled out | [x] fixed |
 | TA-8 | transam | medium | `multixact/store.go:Members` — Allocates + copies the member slice on every call, and takes the global mutex | | | | | [ ] |
 | PN-1 | parser-nodes | medium | `internal/parser/adapter.go:mapToken` — Per-token `resolve()` map lookup for every terminal | | | | | [ ] |
 | PN-2 | parser-nodes | medium | `internal/parser/adapter.go:next()` — Double `strings.ToLower` per token | | | | | [ ] |
@@ -773,3 +773,53 @@ Measured (`internal/access/transam/xlog/assemble_bench_test.go`):
 - **No regression**: yes. The emitted bytes are identical; the package's format
   tests pin the header, the padding and the chunk encoding.
 - **Maintainability**: yes. One function fewer.
+
+### EO1-7 — ADOPT, with the finding partly corrected
+
+The claim was that `buildBitmap` "allocates a slice per index entry". It does
+write `[]storage.ItemPointer{ptr}` per entry, but escape analysis keeps that on
+the stack: both forms measure 0 allocs/op. What the wrapper does cost is the
+slice construction and the loop inside `tbmAddTuples` around a single element.
+The scan now calls `tbm.addOne` directly; the two things `tbmAddTuples` does
+before its loop (create the entry map, note that recheck was requested) are
+hoisted, with `recheckAny` still set only when a tuple is actually added.
+
+Measured (`internal/executor/tidbitmap_add_bench_test.go`, one iteration = one
+index entry):
+
+| | ns/op | allocs/op |
+|---|---|---|
+| one-element slice (old) | 17.03 | 0 |
+| addOne (new) | 12.84 | 0 |
+
+- **Benefit**: yes, but smaller than the finding implies — 25% of the per-entry
+  add, no allocation saved. Over a million-entry bitmap scan, ~4 ms.
+- **No regression**: yes. Same insertion path and the same recheck semantics.
+- **Maintainability**: yes. The call now names what it does.
+
+### TA-2 — ADOPT (a snapshot clone no longer copies its XID arrays)
+
+A repeatable-read or serializable transaction clones its pinned snapshot once
+per statement, and `Clone` deep-copied both XID arrays every time — cost
+proportional to the number of concurrent transactions and to every abort the
+manager had ever seen. Nothing mutates those arrays: the only writers are
+`captureSnapshot`, which builds fresh slices, and `insertSortedXID`, which
+became copy-on-write in TA-1. `WithCLog` has documented and relied on exactly
+that immutability all along, so `Clone` now shares them, and the invariant is
+written down where it can be found.
+
+Measured (`internal/access/transam/capture_snapshot_bench_test.go`):
+
+| aborts tracked | before | after |
+|---|---|---|
+| 0 | 9.70 ns, 0 B | 1.39 ns, 0 B |
+| 100 | 116.0 ns, 416 B | 1.39 ns, 0 B |
+| 10,000 | 6942 ns, 40,960 B | 1.42 ns, 0 B |
+
+- **Benefit**: yes. Per statement, and it grows with cluster activity — exactly
+  the shape of cost that gets worse as a server stays up.
+- **No regression**: yes, given the invariant above, which was checked by
+  grepping every write to `Snapshot.InProgress` / `Snapshot.Aborted` in the
+  tree: `captureSnapshot` and the old `Clone` were the only ones.
+- **Maintainability**: yes. One function shrank, and the rule it depends on is
+  now stated in the place that depends on it.
