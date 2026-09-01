@@ -1769,14 +1769,29 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 		if ci < len(tbl.NamedChecks) && tbl.NamedChecks[ci].NotEnforced {
 			continue
 		}
-		// Build actual-value from clause for this row.
+		// Build actual-value from clause for this row. The values ride as
+		// bound parameters ($1, $2, …), not as interpolated text: a Datum's
+		// Format() output is a DISPLAY rendering, not necessarily a literal
+		// that re-parses to the same value in its own type. A `date` column
+		// under a CHECK constraint made that concrete — Format() renders
+		// "05-06-2020", which the re-parse rejects, so a valid INSERT died
+		// with XX000 "could not evaluate check constraint"
+		// (review/260831-2 EO1-9). Parameters skip the render/re-parse round
+		// trip entirely.
 		colVals := make([]string, len(tbl.Columns))
+		params := make([]Datum, 0, len(tbl.Columns))
 		for i, col := range tbl.Columns {
+			// An array column carries its ELEMENT name in Type.Name plus
+			// IsArray, so the cast has to re-add the "[]".
+			typeName := col.Type.Name
+			if col.Type.IsArray {
+				typeName += "[]"
+			}
 			if i < len(row) && !row[i].IsNull() {
-				v := row[i].Format()
-				colVals[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::" + col.Type.Name
+				params = append(params, row[i])
+				colVals[i] = fmt.Sprintf("$%d::%s", len(params), typeName)
 			} else {
-				colVals[i] = "NULL::" + col.Type.Name
+				colVals[i] = "NULL::" + typeName
 			}
 		}
 		colVals = append(colVals, fmt.Sprintf("%d::oid", tbl.OID))
@@ -1814,6 +1829,7 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 			return unevaluable("build", err)
 		}
 		synthCtx := *ctx
+		synthCtx.Params = params
 		if err := op.Open(&synthCtx); err != nil {
 			op.Close()
 			return unevaluable("open", err)
@@ -1980,9 +1996,17 @@ func checkRowConstraintsForWrite(ctx *Context, tbl *catalog.Table, cols []catalo
 // plan/build failures are treated as a pass (matches checkConstraints' leniency)
 // rather than blocking the DML statement on an internal evaluation gap.
 func evalDomainCheckExpr(ctx *Context, exprSQL string, v Datum, baseType string) (bool, error) {
+	// Bound parameter, not interpolated Format() text — same reason as
+	// checkConstraints (review/260831-2 EO1-9): a `date` value renders as
+	// "05-06-2020", which does not re-parse as a date, and every failure in
+	// this function is treated as a PASS, so a domain CHECK over such a type
+	// was silently NOT ENFORCED (PG 18.3: `value for domain zzdd violates
+	// check constraint "zzdd_check"`).
 	valSQL := "NULL::" + baseType
+	var params []Datum
 	if !v.IsNull() {
-		valSQL = "'" + strings.ReplaceAll(v.Format(), "'", "''") + "'::" + baseType
+		params = []Datum{v}
+		valSQL = "$1::" + baseType
 	}
 	fullSQL := "SELECT (" + exprSQL + ") FROM (VALUES (" + valSQL + ")) AS _chk(value)"
 	stmts, err := parser.Parse(fullSQL)
@@ -1998,6 +2022,7 @@ func evalDomainCheckExpr(ctx *Context, exprSQL string, v Datum, baseType string)
 		return true, nil
 	}
 	synthCtx := *ctx
+	synthCtx.Params = params
 	if err := op.Open(&synthCtx); err != nil {
 		op.Close()
 		return true, nil
