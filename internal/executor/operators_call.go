@@ -7,7 +7,6 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/pl/plpgsql"
 )
 
 // callOp executes `CALL proc(...)` (M0015 Stage B).
@@ -438,7 +437,7 @@ func (o *callOp) Next() (TupleSlot, error) {
 		return asSlot(sch, result), nil
 	}
 
-	block, err := plpgsql.Parse(r.Body)
+	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return nil, &ExecError{Code: "P0000", Pos: o.plan.Stmt.Pos(),
 			Message: fmt.Sprintf("invalid PL/pgSQL body for procedure %s: %v", r.QualifiedName(), err)}

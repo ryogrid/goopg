@@ -49,6 +49,27 @@ func wrapSQLFunctionContext(err error, funcName string, stmtNum int) error {
 // paid three compilations per call. The key set is the set of argument
 // identifiers appearing in the database's routines, so it is bounded by the
 // schema, not by traffic.
+// plpgsqlBlockCache maps a routine BODY to its parsed PL/pgSQL block.
+//
+// review/260831 ES-9: the body was re-parsed on every call and every trigger
+// firing — a full PL/pgSQL parse per row for a row-level trigger. The
+// interpreter only READS the block (it lowers each statement into fresh
+// optimizer/expression values as it goes), and the key is the body text itself,
+// so a CREATE OR REPLACE simply lands on a different key.
+var plpgsqlBlockCache sync.Map // string -> *plpgsql.Block
+
+func parsePLpgSQLBody(body string) (*plpgsql.Block, error) {
+	if v, ok := plpgsqlBlockCache.Load(body); ok {
+		return v.(*plpgsql.Block), nil
+	}
+	blk, err := plpgsql.Parse(body)
+	if err != nil {
+		return nil, err
+	}
+	plpgsqlBlockCache.Store(body, blk)
+	return blk, nil
+}
+
 var namedParamREs sync.Map // string -> *regexp.Regexp
 
 func namedParamRE(name string) *regexp.Regexp {
@@ -964,7 +985,7 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 			}
 		}
 	}
-	block, err := plpgsql.Parse(r.Body)
+	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return nil, &ExecError{Code: "P0000", Pos: pos, Message: fmt.Sprintf("invalid PL/pgSQL body for function %s: %v", r.QualifiedName(), err)}
 	}
@@ -1226,7 +1247,7 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 			}
 		}
 	}
-	block, err := plpgsql.Parse(r.Body)
+	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return Datum{}, &ExecError{Code: "P0000", Pos: pos, Message: fmt.Sprintf("invalid PL/pgSQL body for function %s: %v", r.QualifiedName(), err)}
 	}
@@ -3052,7 +3073,7 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 		// postgres/src/backend/commands/trigger.c ExecCallTriggerFunc.
 		return nil, false, nil
 	}
-	block, err := plpgsql.Parse(r.Body)
+	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return nil, false, &ExecError{Code: "P0000", Message: fmt.Sprintf("invalid trigger body for %s: %v", r.QualifiedName(), err)}
 	}
