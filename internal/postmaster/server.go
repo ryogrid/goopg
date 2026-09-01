@@ -963,7 +963,20 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// route IDENTIFY_SYSTEM / START_REPLICATION etc. through the
 	// walsender path instead of the regular SQL dispatcher. See
 	// docs/design/0005-0001-streaming-replication-architecture.md.
-	isReplication := isReplicationStartupParam(params["replication"])
+	isReplication, replValid := isReplicationStartupParam(params["replication"])
+	if !replValid {
+		// PG parses this parameter with parse_bool and FATALs on anything it
+		// does not understand (backend_startup.c:765). goopg used to treat
+		// EVERY value outside {"", 0, false, FALSE, False} as "replication
+		// requested", so `replication=off` / `no` silently took the walsender
+		// route and `replication=bogus` connected instead of being rejected.
+		// (review/260831-2 CP-5)
+		s.writeFatalHint(w, errcodes.InvalidParameterValue,
+			fmt.Sprintf("invalid value for parameter %q: %q", "replication", params["replication"]),
+			`Valid values are: "false", 0, "true", 1, "database".`)
+		logger.Info("startup failed", "err", "invalid replication parameter")
+		return
+	}
 	if isReplication {
 		logger = logger.With("replication", true)
 	}
@@ -1266,12 +1279,14 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
-// parameter the way upstream PostgreSQL does: case-insensitive `true`
-// or `1` enables physical replication mode; `database` enables logical
-// replication (deferred in v0; treated as physical for now); empty /
-// `false` / `0` / unrecognised values mean "not a replication
-// connection". Mirrors postgres/src/backend/replication/walsender.c
-// (`got_STOPPING`, `EnableReplicationOriginCmd`).
+// parameter the way upstream PostgreSQL does (backend_startup.c:751): the
+// literal `database` enables logical replication (deferred in v0; treated as
+// physical for now), anything else must parse as a boolean via parse_bool —
+// so `true`/`on`/`yes`/`1` and their prefixes request replication mode and
+// `false`/`off`/`no`/`0` and their prefixes do not. An unparsable value is
+// NOT "no replication": ok=false, and the caller answers with PG's FATAL
+// 22023 `invalid value for parameter "replication"`.
+// (review/260831-2 CP-5)
 // isSuperuserRoleName reports whether roleName is the bootstrap
 // superuser. goopg has no CREATE ROLE ... SUPERUSER attribute tracking
 // (the whole privilege model is the bootstrap "postgres" role vs.
@@ -1314,14 +1329,38 @@ func parsePGOptions(opts string) map[string]string {
 	return result
 }
 
-func isReplicationStartupParam(v string) bool {
-	switch v {
-	case "":
-		return false
-	case "0", "false", "FALSE", "False":
-		return false
+func isReplicationStartupParam(v string) (isRepl bool, ok bool) {
+	if v == "" {
+		return false, true
 	}
-	return true
+	if v == "database" {
+		return true, true
+	}
+	return parseStartupBool(v)
+}
+
+// parseStartupBool mirrors upstream parse_bool_with_len
+// (postgres/src/backend/utils/adt/bool.c:37): the comparison is
+// pg_strncasecmp(value, "true", len) with len the INPUT's length, so every
+// non-empty prefix of true/false/yes/no/on/off is accepted case-insensitively,
+// plus the digits 1 and 0. Anything else fails, and the caller turns that into
+// PG's FATAL. (review/260831-2 CP-5)
+func parseStartupBool(v string) (value bool, ok bool) {
+	lower := strings.ToLower(v)
+	for _, cand := range []struct {
+		word string
+		val  bool
+	}{
+		{"true", true}, {"false", false},
+		{"yes", true}, {"no", false},
+		{"on", true}, {"off", false},
+		{"1", true}, {"0", false},
+	} {
+		if len(lower) <= len(cand.word) && lower == cand.word[:len(lower)] {
+			return cand.val, true
+		}
+	}
+	return false, false
 }
 
 // checkAuth runs the configured Policy and the corresponding wire
@@ -1892,6 +1931,19 @@ func (s *Server) writeFatal(w *libpq.FrameWriter, code errcodes.Code, msg string
 		{Code: libpq.FieldSeverityNonLocal, Value: "FATAL"},
 		{Code: libpq.FieldSQLState, Value: string(code)},
 		{Code: libpq.FieldMessage, Value: msg},
+	})
+	_ = w.Flush()
+}
+
+// writeFatalHint is writeFatal plus a HINT field, for the startup-time errors
+// whose upstream counterpart carries one. (review/260831-2 CP-5)
+func (s *Server) writeFatalHint(w *libpq.FrameWriter, code errcodes.Code, msg, hint string) {
+	_ = w.WriteErrorResponse([]libpq.ErrorField{
+		{Code: libpq.FieldSeverity, Value: "FATAL"},
+		{Code: libpq.FieldSeverityNonLocal, Value: "FATAL"},
+		{Code: libpq.FieldSQLState, Value: string(code)},
+		{Code: libpq.FieldMessage, Value: msg},
+		{Code: libpq.FieldHint, Value: hint},
 	})
 	_ = w.Flush()
 }
