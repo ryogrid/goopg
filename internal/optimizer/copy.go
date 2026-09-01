@@ -481,7 +481,13 @@ func validateCopyOptions(s *parser.CopyStmt) error {
 	if binary && onErrorSpecified && !onErrorIsStop {
 		return &PlanError{Pos: s.Pos(), Code: "42601", Message: "only ON_ERROR STOP is allowed in BINARY mode"}
 	}
-	if rejectLimitSpecified && !onErrorSpecified {
+	// PG tests `opts_out->reject_limit && !opts_out->on_error` where
+	// COPY_ON_ERROR_STOP is the zero value (postgres/src/include/commands/
+	// copy.h:39), so an EXPLICIT `ON_ERROR stop` is rejected exactly like an
+	// omitted ON_ERROR — only IGNORE licenses REJECT_LIMIT. Testing
+	// !onErrorSpecified alone let `(ON_ERROR stop, REJECT_LIMIT 5)` through,
+	// where the limit is then silently ignored. (review/260831-2 OP1-1)
+	if rejectLimitSpecified && (!onErrorSpecified || onErrorIsStop) {
 		return &PlanError{Pos: s.Pos(), Code: "22023", Message: "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE"}
 	}
 	return nil
