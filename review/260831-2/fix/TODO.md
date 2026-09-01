@@ -33,8 +33,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | BUG | [x] | `dafe96692` |
 | ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | BUG | [x] | `e4b3b7ff3` |
 | ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | BUG | [x] | `8ca6a5a8d` |
-| TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | BUG | [x] | see progress log |
-| CP-1 | high | `postmaster/txn_verb.go:applyTransactionVerb` — DDL in a failed block survives COMMIT-as-ROLLBACK | ? | [ ] | |
+| TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | BUG | [x] | `98a9a11a6` |
+| CP-1 | high | `postmaster/txn_verb.go:applyTransactionVerb` — DDL in a failed block survives COMMIT-as-ROLLBACK | BUG | [x] | see progress log |
 | CM-1 | high | `cmd/goopg/standby.go:Promote` — `promoting` atomic never reset; failed promote wedges permanently | ? | [ ] | |
 
 ## B. Medium severity (claimed)
@@ -207,3 +207,17 @@ landed.
   `TestTupleVisibleXmaxCommittedHintRespectsSnapshot` — a snapshot with the
   deleter still in progress keeps seeing the row, the subxact twin agrees, and a
   deleter below Xmin stays invisible.
+
+- 2026-09-01 **CP-1 = BUG (fixed).** `applyTransactionVerb`'s COMMIT-in-a-failed-
+  block arm (which is a ROLLBACK per PG semantics) went straight to
+  `TxnMgr.Rollback` without first running `executor.ProcessRollbackUndos` — the
+  step the explicit `TxRollback` arm right below it does run. In-memory catalog
+  registrations are not transactional, so `BEGIN; CREATE TABLE t; <error>;
+  COMMIT;` left `t` alive and writable in the catalog while its
+  pg_class/pg_attribute rows had been rolled back. Verified on a live capped
+  server before the fix (`failblk` survived and accepted an INSERT). Fix: run
+  the undos on this path too. Guard:
+  `internal/testport/failed_block_commit_ddl_undo_test.go` — one session, four
+  messages; after the failed-block COMMIT `pg_class` must have no `failblk` row
+  and the INSERT must fail with "does not exist" (red before the fix on both
+  assertions).
