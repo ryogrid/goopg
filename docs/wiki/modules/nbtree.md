@@ -373,6 +373,180 @@ like `InsertLogRecordsForBlockAfter`, `FlushSnapshotRecordsForBlock`,
 harness can replay and verify that no two goroutines contended on the same page
 with stale content.
 
+## Latch control
+
+The per-page content latch lives on `storage.Slot.contentMu` — a
+`sync.RWMutex` whose four accessors are `Lock()`, `Unlock()`, `RLock()`, and
+`RUnlock()` (`internal/storage/bufpool.go:81-95`). The nbtree layer calls them
+indirectly through two pairs of helpers on `*BTree`, plus a panic-safe holder
+type for the exclusive latch:
+
+### `pinR` / `unpinR` — shared (read) latch
+
+```go
+func (bt *BTree) pinR(blk storage.BlockNumber) (*storage.Slot, error) {
+    s, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+    if err != nil {
+        return nil, err
+    }
+    s.RLock()
+    return s, nil
+}
+
+func (bt *BTree) unpinR(s *storage.Slot) {
+    s.RUnlock()
+    bt.pool.Unpin(s)
+}
+```
+
+Used by every read path: `Search` (point lookup), `RangeScan*` (range scan),
+`descendToLeaf` (descent), `pageItems*` and the btree verification stress
+tests. Multiple goroutines can hold the shared latch on the same page
+simultaneously.
+
+### `pinW` / `unpinW` — exclusive (write) latch
+
+```go
+func (bt *BTree) pinW(blk storage.BlockNumber) (*storage.Slot, error) {
+    s, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+    if err != nil {
+        return nil, err
+    }
+    s.Lock()
+    bt.recordContentMuLock(blk, s.Page())
+    return s, nil
+}
+
+func (bt *BTree) unpinW(s *storage.Slot) {
+    bt.recordContentMuUnlock(s.Tag().Block, s.Page())
+    s.Unlock()
+    bt.pool.Unpin(s)
+}
+```
+
+Used at every mutation site: `Insert`, `tryInsertNoSplit`, `insertIntoBlock`,
+`finishSplit`, `createNewRoot`, `dedupConsolidate`, `CompleteDeferredSplits`,
+`updateRootMeta`. An exclusive latch blocks both other exclusive holders AND
+all shared readers, so a page is never read while mid-mutation.
+
+### `wlatch` — panic-safe exclusive latch holder
+
+```go
+type wlatch struct {
+    bt *BTree
+    s  *storage.Slot
+}
+func (w *wlatch) hold(s *storage.Slot) { w.s = s }
+func (w *wlatch) release() {
+    if w.s == nil { return }
+    s := w.s
+    w.s = nil
+    w.bt.unpinW(s)
+}
+```
+
+Every entry into `insertIntoBlock` (the root of every mutation path — no-split
+insert, split, parent-chain propagation) creates a local `wlatch{bt: bt}` and
+defers `held.release()` **before** calling `pinW`. If the page mutation panics
+(insertItemSorted panicked with "not enough free space in page" on AI-20260806,
+stranding the exclusive latch for the rest of the process), the deferred call
+releases it. `release()` is idempotent: every normal exit path also calls
+`held.release()` manually, and the deferred call becomes a no-op.
+
+This is goopg's equivalent of PostgreSQL's `LWLockReleaseAll()`, which PG calls
+from `AbortTransaction()` after `elog(ERROR)`'s longjmp. Go has no longjmp;
+the deferred `release()` is the local analogue.
+
+### Latch discipline during descent
+
+`descendToLeaf` holds the shared latch on each internal page only for the
+duration of its own binary search, then releases with `unpinR` before moving to
+the child. There is **no lock coupling** — no read latch is retained on the
+parent while the child is being examined. This matches PG's B-tree descent
+convention.
+
+### Lehman-Yao move-right
+
+When `insertIntoBlock` pins the leaf and discovers the search key overshoots
+the page's high key (a concurrent split moved the key range rightward), it
+releases the exclusive latch (`held.release()`), follows `op.Next` to the right
+sibling, and re-pins. (`tryInsertNoSplit` does NOT move right — it returns
+`errNeedsSplit` on a high-key overshoot and lets `insertIntoBlock`'s own
+move-right loop handle it.)
+
+### Latch transfer during a split
+
+The split path (`insertIntoBlock` → `finishSplit`) holds **up to four**
+exclusive latches simultaneously:
+1. the original (left) page — the `held` wlatch from `insertIntoBlock`;
+2. the newly-extended right page (`pinNewOrRecycled`, which returns a slot
+   that is already content-locked);
+3. conditionally the old right sibling (`sibSlot`, pinned with `pinW`) when a
+   non-rightmost page splits, so its `btpo_prev` back-pointer can be relinked;
+4. conditionally the child page (`childSlot`, pinned with `pinW`) when the
+   frame being pushed up completes a lower split (clears the child's
+   `BTIncompleteSplit` flag).
+
+All are released (in reverse) after the items are redistributed and the high
+key is stamped. When the parent is reached to insert the new separator, the
+split path acquires a fresh exclusive latch on the parent page.
+
+### `splitMu` — tree-structure serialisation
+
+In addition to the per-page content latch, `BTree` carries a `splitMu`
+(`btree.go:928`) that serialises **structural** changes: split propagation,
+root lift, metapage rewrite, and `unlinkEmptyLeaf` (the B-tree VACUUM path in
+`btree_vacuum.go:456`). The fast path (`tryInsertNoSplit`) never takes
+`splitMu` — writers touching different leaves only contend on that leaf's page
+latch, not on a tree-wide mutex. Only split/unlink paths lock `splitMu`,
+ensuring that at most one goroutine is adjusting the tree structure at any
+moment.
+
+### Cache-miss reload and `contentMu`
+
+When the buffer pool has a cache miss (`Pool.Pin` → `pool.pinLoad`), it
+independently locks the same `Slot.contentMu` around its `ReadBlock`
+(`bufpool.go ~1991-2002`). This is the **other** holder of `contentMu`
+besides the caller's `pinW` — the pool locks it briefly to ensure the
+freshly-read page is not observed mid-read by another goroutine. The two
+holders are distinguishable in `DebugTraceContentMu` tracing: one is the
+caller's `recordContentMuLock`/`recordContentMuUnlock` pair, the other is
+the pool's `pinLoad` hold which has no tracing hook at the nbtree layer.
+
+### `DebugTraceContentMu`
+
+Setting `bt.DebugTraceContentMu = true` arms per-block page-item snapshots:
+`recordContentMuLock` captures `pageItems()` immediately after `pinW`'s
+`s.Lock()`, and `recordContentMuUnlock` captures it again just before
+`unpinW`'s `s.Unlock()`. The two snapshots are paired by block number and
+logged as a `ContentMuEvent` so a stress-test harness can assert that no
+other goroutine modified the page inside the exclusive-latch window. The
+pinLoad reload gap noted above means an `Unlock` → `Lock` trace gap can
+still show page changes — those are expected and come from the pool's own
+lock-ReadBlock-unlock sequence, observable via `DebugTraceReloads` instead.
+
+### Unprotected windows
+
+`wlatch` currently guards `insertIntoBlock` — the path the observed wedge was
+found on. The split path's additional latches (`rightSlot`/`sibSlot`/`childSlot`)
+and the non-btree `Slot.Lock()` sites in `internal/executor` (sys_catalog_*,
+toast, sequences) are **not** panic-protected. A panic inside those windows
+still strands the latch (same wedge signature as the original root cause);
+fixing them needs a general per-backend release-all, which requires latch
+ownership plumbed through `Context` (a milestone of its own). See
+`.ralph/deferral_ledger.md` for the tracked list.
+
+### Comparison with PostgreSQL
+
+| Aspect | PostgreSQL | goopg |
+|---|---|---|
+| Latch type | `LWLock` (reader-writer spinlock) | `sync.RWMutex` |
+| Acquisition | `_bt_getbuf` → `LWLockAcquire` | `pinW` → `s.Lock()` |
+| Release on panic | `elog(ERROR)` → longjmp → `AbortTransaction()` → `LWLockReleaseAll()` | `defer held.release()` on `wlatch` |
+| Structure serialisation | `B-tree metapage lock` (relation-level LWLock) | `splitMu` (in-process `sync.Mutex`) |
+| Descent coupling | None (shared latch released before child) | None (shared latch released before child) |
+| Move-right | `_bt_findinsertloc` | Lehman-Yao `op.Next` follow |
+
 ## Key flow: UPSERT arbiter duplicate check
 
 ```mermaid
