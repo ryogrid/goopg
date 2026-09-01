@@ -80,3 +80,65 @@ func BenchmarkEncodeRecordXLog(b *testing.B) {
 		})
 	}
 }
+
+// TestFoldChangesNoFoldReturnsInput pins review/260831 XL-38: when no
+// delete+insert pair folds, foldChanges must return the input untouched (and,
+// as the point of the change, without copying it).
+func TestFoldChangesNoFoldReturnsInput(t *testing.T) {
+	in := []Change{
+		{Kind: ChangeInsert, Rel: benchRel(1)},
+		{Kind: ChangeInsert, Rel: benchRel(1)},
+		{Kind: ChangeDelete, Rel: benchRel(1)},
+		{Kind: ChangeInsert, Rel: benchRel(2)}, // different relation: not a fold
+	}
+	out := foldChanges(in)
+	if len(out) != len(in) {
+		t.Fatalf("folded %d changes into %d, want no fold", len(in), len(out))
+	}
+	for i := range in {
+		if out[i].Kind != in[i].Kind || out[i].Rel != in[i].Rel {
+			t.Fatalf("change %d changed: %+v vs %+v", i, out[i], in[i])
+		}
+	}
+}
+
+// TestFoldChangesStillFolds keeps the folding behaviour itself pinned, with
+// the pair in the middle so the "copy the prefix" path runs.
+func TestFoldChangesStillFolds(t *testing.T) {
+	in := []Change{
+		{Kind: ChangeInsert, Rel: benchRel(1)},
+		{Kind: ChangeDelete, Rel: benchRel(2), Block: 7},
+		{Kind: ChangeInsert, Rel: benchRel(2), Block: 9},
+		{Kind: ChangeInsert, Rel: benchRel(3)},
+	}
+	out := foldChanges(in)
+	if len(out) != 3 {
+		t.Fatalf("got %d changes, want 3", len(out))
+	}
+	if out[1].Kind != ChangeUpdate || out[1].Rel != benchRel(2) || out[1].Block != 9 {
+		t.Fatalf("middle change = %+v, want an UPDATE on rel 2 block 9", out[1])
+	}
+	if out[0].Kind != ChangeInsert || out[0].Rel != benchRel(1) || out[2].Rel != benchRel(3) {
+		t.Fatalf("surrounding changes were not preserved: %+v", out)
+	}
+}
+
+// BenchmarkFoldChangesNoFold is the common shape: a transaction of inserts
+// with nothing to fold.
+func BenchmarkFoldChangesNoFold(b *testing.B) {
+	in := make([]Change, 256)
+	for i := range in {
+		in[i] = Change{Kind: ChangeInsert, Rel: benchRel(1)}
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if len(foldChanges(in)) != len(in) {
+			b.Fatal("unexpected fold")
+		}
+	}
+}
+
+// benchRel builds a distinct RelFileNode for the fold tests.
+func benchRel(oid uint32) storage.RelFileNode {
+	return storage.RelFileNode{DBOid: 1, RelOid: oid}
+}
