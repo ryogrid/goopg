@@ -42,8 +42,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | id | sev | finding | verdict | status | commit |
 |---|---|---|---|---|---|
 | EC-1 | med | `executor/codec.go:parseIntegerInput` — base-0 ParseInt treats leading `0` as octal | BUG | [x] | ed634f2c9 |
-| EC-2 | med | `executor/btree_array_key.go:encodeArrayBTreeKey` — quoted `"NULL"` element encoded as SQL NULL | BUG | [x] | this commit |
-| EC-4 | med | `executor/copy.go:PushBinaryData` — binary COPY FROM skips defaults / NOT NULL / CHECK | ? | [ ] | |
+| EC-2 | med | `executor/btree_array_key.go:encodeArrayBTreeKey` — quoted `"NULL"` element encoded as SQL NULL | BUG | [x] | 9000565e7 |
+| EC-4 | med | `executor/copy.go:PushBinaryData` — binary COPY FROM skips defaults / NOT NULL / CHECK | BUG | [x] | this commit |
 | EO1-1 | med | `executor/operators_call.go:callOp.Next` — IN/INOUT arg after an OUT param reads the wrong slot | ? | [ ] | |
 | EO1-3 | med | `executor/operators.go:limitOp.Next` — `LIMIT 0 ... WITH TIES` panics on nil tieKeyVals | ? | [ ] | |
 | EO2-2 | med | `executor/operators_sequence.go:seqState.nextVal` — int64 overflow wraps instead of raising 2200H | ? | [ ] | |
@@ -275,3 +275,18 @@ landed.
   other callers are unchanged. Guard:
   `TestEncodeArrayBTreeKeyQuotedNullIsNotNull`. Gates: units green;
   TPC-DS SF0.5 sweep PASS=95 MISMATCH=0, plan shapes 99/99 identical.
+
+- 2026-09-01 **EC-4 = BUG (fixed).** The text/CSV COPY path routed every row
+  through `insertSourceRow`, which scatters the parsed columns into the
+  table's row shape AND applies column defaults, NOT NULL and CHECK
+  constraints before storing. `PushBinaryData` (BINARY COPY FROM) called
+  only the scatter half and stored the row directly, so a binary load could
+  write NULLs into NOT NULL columns, skip DEFAULT/serial filling for
+  omitted columns and violate CHECK constraints — a durable corruption of
+  the table's declared invariants. PG runs one `CopyFrom` loop for all
+  formats and calls `ExecConstraints` per tuple regardless (copyfrom.c).
+  Fix: split `insertSourceRow` into `scatterSourceRow` + `storeCopyRow`
+  and have the binary loop call both, so the two siblings cannot drift
+  again. Guard: `internal/executor/copy_binary_constraints_test.go`
+  (NOT NULL, CHECK and DEFAULT cases). Gates: units green; TPC-DS SF0.5
+  sweep PASS=95 MISMATCH=0; TPC-H spotcheck Q12/Q13 PASS.
