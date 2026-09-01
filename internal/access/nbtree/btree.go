@@ -2461,7 +2461,7 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.Bl
 		if err != nil {
 			return true // will surface at the final error check
 		}
-		it, err := f.parse(raw)
+		it, err := f.parseNoCopy(raw)
 		if err != nil {
 			return true
 		}
@@ -2480,7 +2480,12 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.Bl
 	if err != nil {
 		return 0, err
 	}
-	it, err := f.parse(raw)
+	// review/260831 NB-9: parseNoCopy, not parse. Every probe of this binary
+	// search used to COPY the probed key out of the page — O(log n) key copies
+	// per internal page, on every descent of every index lookup — and the copy
+	// was thrown away after one comparison. The page is pinned under a shared
+	// content latch for the whole call and only the child block number escapes.
+	it, err := f.parseNoCopy(raw)
 	if err != nil {
 		maybeDumpPageOnParseErr(p, "findChildBlockDirect: parseItem")
 		return 0, err
@@ -3858,6 +3863,10 @@ func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) 
 // (M0047-0003) it returns the FIRST tid bundled in the posting
 // — that's enough for the binary search since all posting tids
 // share the same key.
+// The returned item's key ALIASES the page bytes (review/260831 NB-9): both
+// callers are ordering probes that compare and discard while holding the page
+// pinned, and copying the key per probe made a binary search allocate O(log n)
+// times per insert.
 func (f indexFormat) readPageItem(p storage.Page, idx int) (item, error) {
 	// C3-S1: AllowDead — this is a binary-search ordering probe; Dead
 	// items retain valid key bytes until purged, and result filtering
@@ -3881,7 +3890,7 @@ func (f indexFormat) readPageItem(p storage.Page, idx int) (item, error) {
 		// what an ordering probe against the run wants.
 		return item{ptr: ptr, key: key}, nil
 	}
-	it, perr := f.parse(raw)
+	it, perr := f.parseNoCopy(raw)
 	if perr != nil {
 		maybeDumpPageOnParseErr(p, "readPageItem: parseItem")
 	}
