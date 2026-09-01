@@ -61,7 +61,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | NB-2 | med | `pglz/pglz.go:Decompress` — match length clamped instead of erroring on corrupt streams | NOT A BUG | [x] | — |
 | TA-2 | med | `transam/manager.go:AssignXID` — non-atomic read-check-allocate-store allows XID leak/double-assign | NOT A BUG | [x] | — |
 | NP-1 | med | `plpgsql/parser.go:parseFor` — FOR-query scan truncates on a `loop` identifier inside the SQL text | NOT A BUG | [x] | — |
-| NP-5 | med | `plpgsql/parser.go:parseFor` — `isQueryFor` peeks only the first token; parenthesized bound misroutes | BUG | [ ] | pending gate |
+| NP-5 | med | `plpgsql/parser.go:parseFor` — `isQueryFor` peeks only the first token; parenthesized bound misroutes | BUG | [x] | this commit |
 | OP1-2 | med | `optimizer/exprwalk.go:exprChildSlots` — FuncCall child slots omit Filter/Over/OrderBy/WithinGroup/Variadic | NOT A BUG | [x] | — |
 | OP1-3 | med | `optimizer/createplannl.go:createNestLoopBitmapJoinPlan` — `bhs.BitmapQual = nil` drops recheck quals | BUG | [ ] | pending gate |
 | XL-4 | med | `wal/slot_decoder.go:Run` — ConfirmedFlushLSN never advances for PG-format commit records | BUG | [ ] | pending gate |
