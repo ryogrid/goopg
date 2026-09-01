@@ -50,8 +50,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EO2-3 | med | `executor/operators_project_set.go:openSelectSrfMode` — generate_series int64 overflow spins forever | BUG | [x] | this commit |
 | EO2-4 | med | `executor/operators_recursive_cte.go:recursiveUnionOp.Open` — phase state not reset on re-open | NOT A BUG | [x] | — |
 | EO2-5 | med | `executor/opnode.go:limitOpNext` — `FETCH FIRST 0 ROWS WITH TIES` panics on nil tieKeyVals | BUG | [x] | 0e50eb19a |
-| ES-8 | med | `executor/plpgsql_runtime.go` — float8 arithmetic inside PL/pgSQL is evaluated as numeric (`(5::float8/2)::text` = `2.5000000000000000`, PG: `2.5`) | BUG | [ ] | found while scoping ES-7 |
-| ES-9 | med | `executor/plpgsql_runtime.go` — `RETURN <expr>::text` fails 42804 | BUG | [ ] | found while scoping ES-7 |
+| X-5 | med | *(not in the review — found while scoping ES-7)* `executor/plpgsql_runtime.go` — float8 arithmetic inside PL/pgSQL is evaluated as numeric (`(5::float8/2)::text` = `2.5000000000000000`, PG: `2.5`) | BUG | [ ] | found while scoping ES-7 |
+| X-6 | med | *(not in the review — found while scoping ES-7)* `executor/plpgsql_runtime.go` — `RETURN <expr>::text` fails 42804 | BUG | [ ] | found while scoping ES-7 |
 | ES-6 | med | `executor/plpgsql_runtime.go:executePLpgSQLStmt (ForStmt)` — BY step not validated; zero/negative step infinite-loops | BUG | [x] | db8e39358 |
 | ES-7 | med | `executor/plpgsql_runtime.go:lowerPLpgSQLExpr (CastExpr)` — cast dropped in PL/pgSQL expressions | BUG | [x] | f41be5f8e |
 | IN-2 | med | `initdb/catalog_cache.go:readCatalogCache` — silent partial catalog on TryRegisterUserTable failure | NOT A BUG | [x] | — |
@@ -91,36 +91,36 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EO2-6 | low | `executor/operators_pg_options_to_table.go:Open` — lateral binding via ctx.OuterRows, no BindLateralOuter | BUG | [x] fixed + guarded | this commit |
 | EO2-7 | low | `executor/operators_generated.go:evalGenExpr` — ColumnRef bounds check after EqualFold | NOT A BUG | [x] refuted | - |
 | EO2-8 | low | `executor/operators_utility_settings.go:nextShow` — `SHOW ALL` emits 2 columns vs PG's 3 | BUG | [x] fixed + guarded | this commit |
-| ES-1 | low | `executor/parallel_agg_combine.go:combineNumericSum` — Int-lane contribution dropped when lanes disagree | ? | [ ] | |
-| ES-2 | low | `executor/parallel_agg_split.go:aggPartialAccum.merge` — silent break on state-count mismatch | ? | [ ] | |
-| ES-3 | low | `executor/pgstat_relations.go:dropTable` — trigger counters not cleaned up | ? | [ ] | |
-| ES-4 | low | `executor/pg18_user_catalog_rows.go:pgAttTypmod` — numeric typmod bit manipulation | ? | [ ] | |
-| ES-8 | low | `executor/reg_identifier.go:regIdentifierInput` — schema qualifier dropped for user types | ? | [ ] | |
-| IN-1 | low | `initdb/pgcontrol.go:BackupControlImage` — uint64 underflow on redoLSN == 0 | ? | [ ] | |
-| IN-3 | low | `initdb/xact_recovery.go:replayCLogFromWAL` — latent native-record collision hazard | ? | [ ] | |
-| IN-4 | low | `initdb/initdb.go:mappedLocalCatalogPlaceholderOIDs` — duplicate OID 3764 | ? | [ ] | |
-| IN-5 | low | `initdb/open.go:Open` (RunningXactsFn) — latent uint32 underflow if Xmax == 0 | ? | [ ] | |
-| IN-6 | low | `initdb/information_schema_tables.go` — CRLF / non-`\N` NULL handling | ? | [ ] | |
+| ES-1 | low | `executor/parallel_agg_combine.go:combineNumericSum` — Int-lane contribution dropped when lanes disagree | BUG | [x] fixed + guarded | this commit |
+| ES-2 | low | `executor/parallel_agg_split.go:aggPartialAccum.merge` — silent break on state-count mismatch | NOT A BUG | [x] verified, no change | — |
+| ES-3 | low | `executor/pgstat_relations.go:dropTable` — trigger counters not cleaned up | BUG | [x] fixed + guarded | this commit |
+| ES-4 | low | `executor/pg18_user_catalog_rows.go:pgAttTypmod` — numeric typmod bit manipulation | NOT A BUG | [x] verified; adjacent gap fixed (X-4) | — |
+| ES-8 | low | `executor/reg_identifier.go:regIdentifierInput` — schema qualifier dropped for user types | BUG | [x] fixed + guarded | this commit |
+| IN-1 | low | `initdb/pgcontrol.go:BackupControlImage` — uint64 underflow on redoLSN == 0 | NOT A BUG | [x] verified, no change | — |
+| IN-3 | low | `initdb/xact_recovery.go:replayCLogFromWAL` — latent native-record collision hazard | BUG (latent) | [x] fixed + guarded | this commit |
+| IN-4 | low | `initdb/initdb.go:mappedLocalCatalogPlaceholderOIDs` — duplicate OID 3764 | NOT A BUG | [x] verified, no change | — |
+| IN-5 | low | `initdb/open.go:Open` (RunningXactsFn) — latent uint32 underflow if Xmax == 0 | NOT A BUG | [x] verified, no change | — |
+| IN-6 | low | `initdb/information_schema_tables.go` — CRLF / non-`\N` NULL handling | NOT A BUG | [x] verified, no change | — |
 | ST-4 | low | `storage/bufpool.go:WriteDirtyPages` — bgwriter scan cursor never advances | BUG | [x] fixed + guarded | this commit |
 | ST-5 | low | `storage/bufmap.go:Lookup` — probe bound off by one | NOT A BUG | [x] | — |
 | ST-6 | low | `storage/bgwriter.go:Stop` — double-close panic / hang on Stop-without-Start | NOT A BUG | [x] | — |
-| ST-9 | low | `aio/method_iouring_linux.go:pokeWake` — NOP written without checking SQ ring fullness | ? | [ ] | |
-| ST-10 | low | `storage/writeback.go:accountWrite` — `pendingBlocks.Store(0)` races a concurrent `Add` | ? | [ ] | |
-| NB-3 | low | `access/nbtree/btree_vacuum.go:readInternalFirstChildBlock` — wrong downlink block (dead code) | ? | [ ] | |
-| NB-4 | low | `access/nbtree/btree.go:descendToLeaf` — wrong sentinel disables the rightmost-leaf cache | ? | [ ] | |
-| NB-5 | low | `access/nbtree/btree.go:tryInsertOnCachedRightmost` — no deleted/half-dead page check | ? | [ ] | |
-| TA-3 | low | `transam/manager.go:Begin` — auto-assign path skips isolation-level validation | ? | [ ] | |
+| ST-9 | low | `aio/method_iouring_linux.go:pokeWake` — NOP written without checking SQ ring fullness | BUG | [x] fixed + guarded | this commit |
+| ST-10 | low | `storage/writeback.go:accountWrite` — `pendingBlocks.Store(0)` races a concurrent `Add` | NOT A BUG | [x] verified, no change | — |
+| NB-3 | low | `access/nbtree/btree_vacuum.go:readInternalFirstChildBlock` — wrong downlink block (dead code) | BUG | [x] fixed + guarded | this commit |
+| NB-4 | low | `access/nbtree/btree.go:descendToLeaf` — wrong sentinel disables the rightmost-leaf cache | BUG | [x] fixed + guarded | this commit |
+| NB-5 | low | `access/nbtree/btree.go:tryInsertOnCachedRightmost` — no deleted/half-dead page check | BUG | [x] fixed + guarded | this commit |
+| TA-3 | low | `transam/manager.go:Begin` — auto-assign path skips isolation-level validation | BUG | [x] fixed + guarded | this commit |
 | TA-4 | low | `transam/manager.go:AcquireConnSlot` — int32 cursor overflow → negative modulo | BUG | [x] fixed + guarded | this commit |
 | TA-5 | low | `transam/clog.go:GetStatus` — nil `pool` dereference vs the nil-safe contract elsewhere | NOT A BUG | [x] | — |
 | TA-6 | low | `multixact/multixact.go:StatusesConflict` — invalid Status indexes out of bounds | NOT A BUG | [x] | — |
 | NP-2 | low | `plpgsql/parser.go:parseSQLStmt` — `SELECT INTO x FROM t` yields a malformed query | NOT A BUG | [x] refuted (PG does the same) | - |
-| NP-3 | low | `nodes/outfuncs.go:outDatum` — by-value Const with short/nil Datum panics | ? | [ ] | |
-| NP-4 | low | `nodes/readfuncs.go:readDatum` — negative/zero by-reference length silently accepted | ? | [ ] | |
+| NP-3 | low | `nodes/outfuncs.go:outDatum` — by-value Const with short/nil Datum panics | NOT A BUG | [x] verified, no change | — |
+| NP-4 | low | `nodes/readfuncs.go:readDatum` — negative/zero by-reference length silently accepted | NOT A BUG | [x] verified, no change | — |
 | NP-6 | low | `plpgsql/parser.go:parseStmt` — `<<label>>` / `label: LOOP` forms mis-parse | NOT A BUG | [x] unimplemented feature, not a regression | - |
 | OP1-1 | low | `optimizer/copy.go:validateCopyOptions` — REJECT_LIMIT accepted with ON_ERROR=STOP | BUG | [x] fixed + guarded | this commit |
-| OP1-4 | low | `optimizer/cardinality.go:indexScanRows` — unique-index shortcut ignores range bounds | ? | [ ] | |
-| OP1-5 | low | `optimizer/costbitmap.go:computeBitmapPagesLooped` — lossy-page adjustment computed then discarded | ? | [ ] | |
-| OP1-6 | low | `optimizer/cardinality.go:EstimateRows` — `LIMIT 0` returns 0 read as "no estimate" | ? | [ ] | |
+| OP1-4 | low | `optimizer/cardinality.go:indexScanRows` — unique-index shortcut ignores range bounds | NOT A BUG | [x] verified, no change | — |
+| OP1-5 | low | `optimizer/costbitmap.go:computeBitmapPagesLooped` — lossy-page adjustment computed then discarded | BUG | [x] fixed + guarded | this commit |
+| OP1-6 | low | `optimizer/cardinality.go:EstimateRows` — `LIMIT 0` returns 0 read as "no estimate" | NOT A BUG | [x] verified, no change | — |
 | OP2-1 | low | `optimizer/foldconst.go:foldCaseExpr` — dead THEN under a NULL simple-CASE operand is folded | BUG | [x] fixed + guarded | this commit |
 | XL-1 | low | `wal/append_xlog_payload.go:appendXLogPayload` — error from emitWithPageHeaders swallowed | NOT A BUG | [x] refuted (no error is returned) | - |
 | XL-2 | low | `wal/insert_pos.go:reserveLocked` — `onCrossSegment` padded return discarded | NOT A BUG | [x] refuted (unmounted legacy path) | - |
@@ -131,15 +131,18 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | CP-5 | low | `postmaster/server.go:isReplicationStartupParam` — overly broad match | BUG | [x] fixed + guarded | this commit |
 | UT-3 | low | `utils/misc/guc.go:convertUnit` — int64 overflow on cross-unit conversion | BUG | [x] fixed + guarded | this commit |
 | UT-5 | low | `utils/activity/stats/counter.go:Add` — index out of range when GOMAXPROCS > 256 | BUG | [x] fixed + guarded | this commit |
-| UT-6 | low | `utils/adt/datetime/normalize.go:padTimeFields` — run-together time expansion not implemented | ? | [ ] | |
+| UT-6 | low | `utils/adt/datetime/normalize.go:padTimeFields` — run-together time expansion not implemented | NOT A BUG | [x] verified, no change | — |
 | UT-7 | low | `utils/misc/session.go:EndTransaction` — rollback fires `invokeOnChange` for unchanged values | NOT A BUG | [x] refuted (callbacks idempotent) | - |
-| CM-2 | low | `cmd/goopg/standby.go:Promote` — `sc.replayer.ApplyLSN()` without a nil guard | ? | [ ] | |
+| CM-2 | low | `cmd/goopg/standby.go:Promote` — `sc.replayer.ApplyLSN()` without a nil guard | NOT A BUG | [x] verified, no change | — |
 | CM-4 | low | `cmd/gen-*-coverage/main.go:loadCSV` — `row[statusIdx]` out of bounds on malformed CSV | NOT A BUG | [x] refuted (csv enforces field count) | - |
 | CM-5 | low | `cmd/estimate-audit/main.go:selectQueries` — `Atoi` errors ignored, negative query numbers pass | BUG | [x] fixed + guarded | this commit |
 | CM-6 | low | `cmd/gen-pg-operator-data/main.go:parseOperatorDat` — right-unary operator kind `'r'` unhandled | NOT A BUG | [x] refuted (PG has no postfix operators) | - |
 | X-1 | low | *(not in the review — found while verifying OP2-1)* `optimizer/foldconst.go` — `COALESCE(1, 1/0)` raises at plan time; PG returns 1 | BUG | [ ] not fixed | |
 | X-2 | low | *(not in the review — found while verifying NP-2)* `'x' \|\| true` yields `xt`; PG yields `xtrue` (bool→text in concat takes the 1-char form) | BUG | [ ] not fixed | |
 | X-3 | low | *(not in the review — found while verifying NP-2)* plpgsql `FOUND` stays false after a successful `SELECT … INTO`; PG sets it true | BUG | [ ] not fixed | |
+| X-4 | med | *(not in the review — found while verifying ES-4)* `executor/pg18_user_catalog_rows.go:pgAttTypmod` — no arm for time/timetz/timestamp/timestamptz, so `time(3)` reports atttypmod -1 (PG: 3) | BUG | [x] fixed + guarded | this commit |
+| X-7 | med | *(not in the review — found while verifying ES-8)* a literal `'int4'::regtype` in a SELECT list is never resolved: goopg prints `int4` (PG: `integer`, via format_type) and `'int4'::regtype::oid` errors `invalid input syntax for type oid`. The regtype COLUMN path is correct, so the literal-cast path bypasses `regIdentifierInput` entirely. `'pg_class'::regclass::oid` works, so this is regtype-only | BUG | [ ] not fixed | |
+| X-8 | med | *(not in the review — found while probing)* `enable_indexscan` / `enable_bitmapscan` / `enable_indexonlyscan` are accepted but ignored: with all three `off` in a fresh session, `SELECT * FROM t WHERE a = 42` still plans `Index Only Scan` at cost 0.00..0.00 (PG switches to `Seq Scan`). The zero cost suggests a planner fast path that never consults the GUCs | BUG | [ ] not fixed | |
 
 ---
 
@@ -506,7 +509,7 @@ landed.
   that uncast integer division must STAY integer division.
   Two gaps found while scoping this and NOT introduced by it (both verified to
   fail on the pre-fix build too, so they are separate findings, added to the
-  table as ES-8/ES-9): float8 arithmetic inside PL/pgSQL is evaluated as
+  table as X-5/X-6): float8 arithmetic inside PL/pgSQL is evaluated as
   numeric, and `RETURN <expr>::text` fails 42804.
 
 - 2026-09-01 **IN-2 = NOT A BUG (the error cannot occur).** `readCatalogCache`
@@ -790,6 +793,314 @@ Guard: `TestWalsenderPgoutputAdapterEmptyWriteIsDropped`
 (`internal/replication/logicalwalsender_test.go`) — nothing on the wire, nextLSN
 unmoved, and the following write still framed 100..102. Red before the fix on
 all three.
+
+### IN-1 — NOT A BUG
+
+`BackupControlImage` has exactly one caller (`internal/backup/basebackup.go:334`)
+and it sits inside `if redoLSN > 0`. The companion `ckptRecLSN - 1` on the next
+line is guarded too — lines 292-293 replace a zero `ckptRecLSN` with `redoLSN`
+before either subtraction. The underflow is unreachable.
+
+### IN-4 — NOT A BUG
+
+3764 really is listed twice, but the list is consumed only by
+`bootstrapMappedLocalCatalogHeaps`, which does `os.WriteFile(path, heapPage)`
+per OID: writing the same empty 8 KiB page twice is idempotent. What is wrong is
+the COMMENT on the first of the two entries ("pg_ts_config (stale — true
+pg_ts_config OID is 3602)"): 3764 is pg_ts_template, and 3602 is already listed
+on its own line. Cosmetic; no behaviour to fix.
+
+### IN-5 — NOT A BUG
+
+`snap.Xmax` is `m.xidgen.Peek()` (`captureSnapshot`, manager.go:1355) — the next
+XID to hand out, which starts at `FirstNormalTransactionID` and only ever moves
+forward. `Xmax == 0` cannot occur, so `uint32(snap.Xmax - 1)` cannot wrap.
+
+### ST-10 — NOT A BUG
+
+The race is real but the counter is a writeback HINT scheduler, not an
+accounting record: an increment lost between `Add` and `Store(0)` delays the
+next `sync_file_range` hint by at most one threshold's worth of blocks, and the
+kernel writes the pages out regardless. Upstream's equivalent
+(`ScheduleBufferTagForWriteback` / `IssuePendingWritebacks`, bufmgr.c) resets
+`nr_pending = 0` without any atomicity either — it is per-backend there, which
+is exactly why the pattern is not written to be race-free. No correctness
+consequence; not worth a lock on this path.
+
+### CM-2 — NOT A BUG
+
+`sc.replayer` cannot be nil: `startStandbyReplayer` (cmd/goopg/main.go:958) has
+no nil return path, and `standbyController` is only ever constructed by
+`startStandby`, which assigns its result. The nil checks at lines 219/238/298
+are defensive, not evidence of a reachable nil, so the un-guarded
+`sc.replayer.ApplyLSN()` in the "replay drained" log line is safe. Left as is
+rather than adding a fourth guard for a state that cannot exist.
+
+### NP-3 / NP-4 — NOT A BUG (both)
+
+Both ends of the Const datum round-trip are already closed against the shapes
+the report worries about.
+
+NP-3: `outDatum`'s by-value arm indexes `c.Datum[0..7]` unconditionally, so a
+by-value Const whose Datum is shorter than 8 bytes would panic — but no such
+Const can be built. Every by-value constructor in `internal/nodes/datum.go`
+fills the datum through `byvalWord`, which always returns 8 bytes, and there is
+no assignment to `ConstByval` anywhere outside those literals. The byte count is
+also PG-correct: upstream prints `datumGetSize` (== typlen for by-value) as the
+length and then `sizeof(Datum)` == 8 bytes of body (outfuncs.c:355-362), which
+is what the Go code does with `ConstLen` + 8 bytes.
+
+NP-4: `readDatum` already forces `n = 8` for by-value and `n = 0` for
+`length <= 0` (readfuncs.go:219-224), so a negative or zero declared length on a
+by-reference datum reads an empty body rather than looping negatively. The
+by-reference nil case also matches upstream's literal `0 [ ]` rendering
+(outfuncs.c:366-367) because `len(nil) == 0`.
+
+### OP1-4 — NOT A BUG
+
+Returning 1 when a unique index has every key column pinned by equality is
+exactly PG's `btcostestimate` shortcut, and additional range bounds cannot make
+the answer smaller in a model that clamps at one row (`clamp_row_est`). The
+extra `lowKey`/`highKey` are redundant restrictions on a set already known to
+hold at most one row.
+
+### OP1-6 — NOT A BUG
+
+`LIMIT 0` does return 0 from `EstimateRows`, but no consumer turns that into a
+wrong answer: PG itself floors the Limit node at one row, and goopg prints the
+same. Oracle vs goopg, both `Limit … rows=1`:
+
+```
+explain select * from t limit 0;
+explain select * from (select * from t limit 0) s join t on s.a = t.a;
+```
+
+Since the observable estimate already agrees with PG, changing the internal
+sentinel would be churn.
+
+### UT-6 — NOT A BUG
+
+Run-together times ARE expanded — just not in `padTimeFields`. Every form the
+report names round-trips identically on goopg and the PG 18.3 oracle:
+
+| input | PG | goopg |
+|---|---|---|
+| `time '040506'` | 04:05:06 | 04:05:06 |
+| `time '0405'` | 04:05:00 | 04:05:00 |
+| `time '040506.25'` | 04:05:06.25 | 04:05:06.25 |
+| `time '0405 PM'` | 16:05:00 | 16:05:00 |
+| `timetz '040506+05'` | 04:05:06+05 | 04:05:06+05 |
+| `timestamp '20010203 040506'` | 2001-02-03 04:05:06 | 2001-02-03 04:05:06 |
+| `time '04'` | error 22007 | error 22007, same text |
+
+### ES-1 — BUG, and wider than reported (fixed, guard added)
+
+The report frames this as a parallel-combine concern; it is a wrong-results bug
+in the SERIAL path too. `aggRuntime` keeps two accumulators for sum/avg — `sum`
+for KindInt arguments, `numericSum` for KindNumeric ones — and
+`finishBuiltinAgg` returns the numeric lane whenever it is live, so everything
+the int lane held is discarded. Any group whose argument Kind varies per row
+mixes the lanes:
+
+```
+create table es1(a int); insert into es1 select g from generate_series(1,4) g;
+select sum(case when a = 1 then 1 else 1.5 end),
+       avg(case when a = 1 then 1 else 1.5 end) from es1;
+PG 18.3 : 5.5 | 1.3750000000000000
+goopg   : 4.5 | 1.12500000000000000000
+```
+
+`combineNumericSum` is the second way into the same state (it adds the int
+lanes, then takes src's numeric lane wholesale), which is what the report saw.
+
+Fixed at the finalizer instead of at either producer: `foldIntLaneIntoNumeric`
+merges the int lane into the numeric one before the sum/avg arms read it, so
+both the serial path and every combine order land on the same total. The
+divergent avg scale in the trace above was a symptom of the same defect — with
+the lanes folded, goopg's avg matches PG's rendering exactly.
+
+Guard: `internal/executor/agg_mixed_lane_test.go` — the mixed-lane group at 1,
+2 and 4 partials, plus the two single-lane shapes so the fold cannot disturb
+them. Red before the fix on every mixed row (4.5 / 1.125…).
+
+### ES-2 — NOT A BUG
+
+The `break` guards a length mismatch that cannot arise: every group's state
+slice is `make([]aggRuntime, len(o.plan.Aggs))` (operators_join_agg.go:2022,
+2077, 2494) and the `aggs` argument merge is called with is that same
+`o.plan.Aggs`, from the same plan node, in every worker. There is no path that
+reaches merge with differently-sized slices.
+
+### ES-3 — BUG (fixed, guard added)
+
+`dropTable` cleared `shared`, `pending`, `staging` and `prepared` but left the
+`triggers` map — the autovacuum inputs (n_dead_tup, n_ins_since_vacuum,
+n_mod_since_analyze) — untouched. Upstream drops the whole
+`PgStat_StatTabEntry` in `pgstat_drop_relation`, trigger inputs included. The
+leftover entry both leaks and, on an OID a later relation inherits, hands that
+relation a head start toward an autovacuum it never earned. One `delete` added
+alongside the other four.
+
+Guard: `TestRelStatsDropTableClearsAutovacuumTriggers` — red before the fix with
+`dead=40 ins=100 mod=140` surviving the drop.
+
+### OP1-5 — BUG (fixed, guard added)
+
+Confirmed and worth fixing: `compute_bitmap_pages`' lossiness correction raises
+`tuples_fetched` (costsize.c:6564-6588) because a lossy page forces the heap
+node to recheck every tuple on it, and goopg computed the correction into
+`lossyTuples`/`exactTuples` and then discarded both with `_ =`. The caller
+charges `cpu_tuple_cost * tuplesFetched`, so every work_mem-bound bitmap scan
+was under-priced in exactly the regime where it should start losing to a seq
+scan.
+
+The discarded formula was also not PG's — it keyed off the loop-prorated
+`pages` instead of the single-scan `heap_pages`, compared against `maxEntries`
+rather than `maxEntries / 2`, and approximated tuples-per-lossy-page as
+`T/pages`. The port now follows upstream line for line, and
+`computeBitmapPages`/`computeBitmapPagesLooped` return the adjusted tuple count
+(taking `relTuples`) so all six call sites cost the heap side with it.
+
+Guard: `TestComputeBitmapPages_LossyAdjustment` — the arithmetic worked through
+in the test body (400 pages, 15125 tuples), plus the two non-lossy shapes
+(budget >= heap pages, and the unlimited budget) that must leave the estimate
+alone. The test previously asserted nothing at all: it ended with `_ = pages //
+at minimum, it should not panic`.
+
+### ES-4 — NOT A BUG (but the function had a real hole next door: X-4)
+
+The numeric arithmetic is right. Checked against the PG 18.3 oracle,
+`atttypmod` for `numeric(10,2)` is 655366 on both engines, `numeric(10)` 655364,
+bare `numeric` -1, and `varchar(5)`/`char(5)`/`bit(3)`/`interval hour to minute`
+all agree too.
+
+What the same function was missing is the whole time/timestamp family — see X-4
+below, fixed in the same commit as it was found in this function's body.
+
+### X-4 — BUG found while checking ES-4 (fixed, guard added)
+
+`pgAttTypmod` had no arm for `time`/`timetz`/`timestamp`/`timestamptz`
+(1083/1266/1114/1184), so every one of them reported `atttypmod = -1`:
+
+| column | PG 18.3 | goopg (before) |
+|---|---|---|
+| `time(3)` | 3 | -1 |
+| `timetz(4)` | 4 | -1 |
+| `timestamp(2)` | 2 | -1 |
+| `timestamptz(5)` | 5 | -1 |
+
+Their typmod is the fractional-seconds precision stored raw (`anytime_typmodin`
+/ `anytimestamp_typmodin` return `p` with no VARHDRSZ offset). Any client that
+rebuilds a column's type from the catalog — pg_dump first among them — silently
+dropped the precision.
+
+Guard: `TestPgAttTypmodEveryTypmodCarryingType` — all twelve typmod-carrying
+spellings, oracle-pinned. Red before the fix on exactly the four rows above.
+
+- 2026-09-01 **ES-8 = BUG (fixed, guard added).** `regIdentifierInput`'s
+  `regtype` arm split `schema.name` only so the bare name would reach
+  `TypeNameToOID`/`userTypeOIDForName` — the schema half was then discarded.
+  PG's `regtypein` hands the parsed name to `parseTypeString` ->
+  `LookupTypeName`, which resolves the namespace FIRST (3F000 if it does not
+  exist) and then searches that namespace only. Oracle (PG 18.3, values pushed
+  through a `regtype` column so the literal-cast path is not in the way) vs the
+  pre-fix build: `pg_catalog.int4` 23 / 23, `public.int4` error / 23,
+  `nosuchschema.int4` error / 23, `nosuchschema.ct` error / the OID of
+  `public.ct`. The sibling `regclass` arm was checked and already gets this
+  right (`nosuchschema.e9` -> 42704, `public.pg_class` -> error), so the defect
+  is confined to `regtype`. Fix: raise 3F000 for an unknown schema, let a
+  built-in answer only to `pg_catalog` (or no qualifier), and fall back to the
+  user-type lookup for any other existing schema. That last step stays a
+  bare-name lookup on purpose: goopg's catalog has no per-schema type
+  namespace at all (a second `CREATE TYPE s2.ct` is rejected as a duplicate),
+  so per-schema user-type resolution is a separate, larger gap and not this
+  row. Guard `internal/executor/reg_identifier_regtype_schema_test.go` pins the
+  eight spellings; reverting the hunk turns four of them red.
+
+- 2026-09-01 **TA-3 = BUG (fixed, guard added).** Confirmed by reading
+  `internal/access/transam/manager.go:262`: the variadic auto-assign branch
+  initialises the slot and `return`s at line 302, and the isolation switch sat
+  at line 304 — reachable only when the caller passed an explicit `procNum`.
+  So `Begin(IsolationLevel(99))` returned `{Handle:2 Isolation:unknown(99)}`
+  while `Begin(IsolationLevel(99), 3)` errored. The second half is worse than
+  the asymmetry: the auto-assign branch CASes `inTxn` to 1 before it returns,
+  so any error return after that point abandons a proc slot (the guard
+  measures this — the pre-fix run shows free slots 1024 -> 1023). Fix: hoist
+  the switch to the top of `Begin`, ahead of both branches and ahead of the
+  CAS. No production caller is affected (all pass a parsed level), which is
+  why this stayed latent. Guard
+  `internal/access/transam/begin_isolation_validation_test.go` pins both
+  branches rejecting, no slot leak, and the three valid levels still passing.
+
+- 2026-09-01 **IN-3 = BUG, latent (fixed, guarded).** Both startup WAL
+  scanners in `internal/initdb/xact_recovery.go` — `replayCLogFromWAL` and
+  `walHasXactRecords` — switched on `r.Payload[0]` as a goopg RecordKind
+  without asking `xlog.IsGoopgNativeRecord` first. That function's own
+  documentation names these scanners as callers that must ask: a structurally
+  real PG record carries raw struct bytes at that offset (a checkpoint's
+  redo-LSN low byte, say) which can equal `RecordKindXactCommit`, and the
+  scanners would then stamp an unrelated XID committed / force the
+  crash-recovery branch on a cluster with no transaction history. It is latent
+  today only because PG-format records reach these loops with a nil `Payload`.
+  Fix: one shared `nativeKindByte(r, minLen)` predicate used by both loops.
+  Guard `internal/initdb/xact_recovery_native_guard_test.go` feeds it a
+  PG-format record whose payload byte collides; it is accepted without the
+  fix.
+
+- 2026-09-01 **IN-6 = NOT A BUG.** The claim is about CRLF line endings and
+  non-`\N` NULLs in the embedded TSV captures. All seven git-tracked TSVs
+  under `internal/initdb/` are LF-clean (`grep -c $'\r'` = 0 on each), and
+  they are `go:embed`ed from the repo, so no runtime input path exists — a
+  Windows-edited capture is a re-capture hygiene question, not a defect in
+  `infoSchemaTableRows`. A CRLF file would also not corrupt silently: the
+  trailing `\r` lands in the last column's string and the field-count check
+  fires on any row whose column count shifts. No change.
+
+- 2026-09-01 **ST-9 = BUG (fixed, guard added).** `pokeWake` writes the
+  close-time wake NOP straight at `tail & sqMask` with no fullness check.
+  Every other submission goes through `Submit`, which first takes a token
+  from `m.slots` — sized to `sqEntries` (`method_iouring_linux.go:269`) — so
+  the ring can be exactly full of unconsumed SQEs when `Close` pokes. The NOP
+  then overwrites a live read/write SQE, and that operation's completion
+  never arrives. Fix: `sqRingFull(tail)` (unsigned `tail-head >= sqEntries`,
+  which is wrap-safe because both counters are free-running uint32s) and an
+  early return — a full ring has ops in flight whose CQEs wake the reaper
+  anyway, so nothing is lost. Guard
+  `internal/storage/aio/iouring_sq_full_test.go` pins the arithmetic across
+  the wrap and pins `pokeWake` leaving a full ring's SQE untouched.
+
+- 2026-09-01 **NB-3 = BUG (fixed, guard added).** `readInternalFirstChildBlock`
+  decoded the downlink as `binary.LittleEndian.Uint32(raw[2:6])`. A pivot
+  tuple's downlink is a `t_tid`: `bi_hi` at [0:2], `bi_lo` at [2:4], with the
+  offset/status half at [4:6]. The expression therefore dropped the high 16
+  bits of the block number and folded the status half in. The review calls it
+  dead code and it is — the function had no callers, which is why nothing
+  noticed. Fix: call the shared `BTreeTupleGetDownLink`. Guard
+  `internal/access/nbtree/internal_first_child_test.go` is now its caller; it
+  stamps a downlink that uses both halves plus a non-zero status half, where
+  the old expression returns 0x72345 for 0x12345. (Note the weaker first
+  draft of this test passed against the bug: a small tree only produces block
+  numbers under 65536 with a zero status half, where the two decoders agree.)
+
+- 2026-09-01 **NB-4 + NB-5 = BUG (fixed together, guards added).** The
+  rightmost-leaf insert cache was dead. `descendToLeaf` stored the block only
+  when `op.Next == 0`, but `readOpaque` maps the on-disk `P_NONE` sibling to
+  `storage.InvalidBlockNumber` (`legacySibling`, pgpage.go:297), so the
+  condition was never true on a rightmost page; `tryInsertOnCachedRightmost`'s
+  mirror test `op.Next != 0` would have called every entry stale anyway. Every
+  append-shaped insert paid a full descent. Fixing the sentinel is NB-4; doing
+  only that would arm a path that has never executed, which is exactly NB-5:
+  the entry point never checked for a deleted / half-dead page, so an insert
+  could land on a page `unlinkEmptyLeaf` is about to unlink and
+  `pinNewOrRecycled` re-initialise under a different key range. The check also
+  covers an incomplete split, which upstream's `_bt_findinsertloc` resolves via
+  `_bt_finish_split` before inserting and which only the descent path here
+  knows how to handle. Both land in one commit because the first without the
+  second is the corruption. Guard
+  `internal/access/nbtree/rightmost_cache_test.go` pins the cache being
+  populated and actually taken (the cached leaf gains the next ascending key
+  without a descent) and the three unlinkable page states missing to the
+  descent with the cache cleared.
 
 ### UT-5 — BUG (fixed, guard added)
 
