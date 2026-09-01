@@ -856,14 +856,22 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 					}
 					return NewStringDatum(typName), nil
 				}
-				// Try as a type name → return OID, across all four
-				// user-type kinds (enum/domain/composite/range/multirange),
-				// mirroring userTypeNameForOID's reverse direction.
-				if oid, ok := userTypeOIDForName(ctx.Catalog, typName); ok {
-					return NewIntDatum(int64(oid)), nil
-				}
-				// Built-in type name → return itself
-				return v, nil
+				// Delegate the whole NAME path to regIdentifierInput — the
+				// shared regtypein port (reg_identifier.go), exactly as the
+				// regclass arm above delegates to the regclassin port. This arm
+				// used to resolve USER types to an OID here and then FALL
+				// THROUGH for a built-in name, returning the raw string: so
+				// `'int4'::regtype` printed `int4` where PG's regtypeout prints
+				// `integer` (format_type_be), and chaining `::oid` failed with a
+				// nonsense `invalid input syntax for type oid: "int4"` because
+				// the datum was never the OID that a reg* datum is defined to be
+				// (the model documented at the reg*→string cast guard below).
+				// An unknown name fell through the same way instead of raising
+				// regtypein's 42704 (regproc.c:1176 parseTypeString). Delegating
+				// also picks up the schema qualifier (3F000 for a schema that
+				// does not exist) the shared port already honors.
+				// review/260831-2 X-7.
+				return regIdentifierInput(v, "regtype", ctx, x.Pos())
 			case KindInt:
 				// OID integer → type name; InvalidOid (0) renders as "-" (see above).
 				if v.Int == 0 {
