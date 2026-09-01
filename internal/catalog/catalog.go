@@ -24852,6 +24852,19 @@ type SearchPathCatalog struct {
 	// false in the default (toggle-untouched) case so legacy plans are unchanged.
 	// Design 0118-0103 (M0118-0009 horizons enabler).
 	DisableSeqScan bool
+	// DisableIndexScan / DisableBitmapScan / DisableIndexOnlyScan mirror the
+	// querying session's `enable_indexscan` / `enable_bitmapscan` /
+	// `enable_indexonlyscan` GUCs, exactly as DisableSeqScan mirrors
+	// enable_seqscan. They were accepted-and-ignored declarations until
+	// review/260831-2 X-8: `SET enable_indexscan = off` left every index plan
+	// in place, where PG (costsize.c's disabled-node accounting) falls back to
+	// a bitmap and then to a seq scan. The planner reads them through the same
+	// carrier walk (IndexScanDisabled/BitmapScanDisabled/IndexOnlyScanDisabled)
+	// and DECLINES the corresponding scan shape; false (toggle untouched) is
+	// the default, so legacy plans are unchanged.
+	DisableIndexScan     bool
+	DisableBitmapScan    bool
+	DisableIndexOnlyScan bool
 	// DBOid is the querying connection's real, physical database oid
 	// (executor.Context.CurrentDatabaseOid, resolved via ResolveDatabaseOid).
 	// Zero for connection-less contexts (embedded/test callers, or a
@@ -24882,6 +24895,19 @@ func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken 
 // (dropping the Sort). The planner discovers it via a seqScanToggleCarrier
 // interface walk over the catalog wrapper chain. Design 0118-0103 (horizons).
 func (c *SearchPathCatalog) SeqScanDisabled() bool { return c.DisableSeqScan }
+
+// IndexScanDisabled / BitmapScanDisabled / IndexOnlyScanDisabled report the
+// querying session's enable_indexscan / enable_bitmapscan / enable_indexonlyscan
+// GUCs so the planner can decline that scan shape. Siblings of
+// SeqScanDisabled, discovered by the same carrier-interface walk over the
+// catalog wrapper chain. review/260831-2 X-8.
+func (c *SearchPathCatalog) IndexScanDisabled() bool { return c.DisableIndexScan }
+
+// BitmapScanDisabled — see IndexScanDisabled.
+func (c *SearchPathCatalog) BitmapScanDisabled() bool { return c.DisableBitmapScan }
+
+// IndexOnlyScanDisabled — see IndexScanDisabled.
+func (c *SearchPathCatalog) IndexOnlyScanDisabled() bool { return c.DisableIndexOnlyScan }
 
 // CurrentPartitionDetachEpoch returns the querying statement's snapshot
 // partition-detach epoch so the planner's partition-expansion site can apply

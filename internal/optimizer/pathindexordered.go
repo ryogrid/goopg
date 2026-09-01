@@ -47,18 +47,31 @@ import (
 // they compete in the same rel's pathlist, so generating one without the other
 // hands `addPath` an incomplete field.
 func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
-	s.addParameterizedIndexPaths(cat)
-	s.addOrderedIndexPaths(cat)
+	// review/260831-2 X-8: the session's enable_indexscan / enable_bitmapscan /
+	// enable_indexonlyscan decide which of these four producers may contribute
+	// a candidate at all. Skipping the producer is this seam's stand-in for
+	// upstream's disabled-node pricing (see currentIndexScanDisabled): the
+	// remaining producers — and, if none contributes, the seq-scan path
+	// generateScanPaths always adds — take over, which is the plan PG lands on.
+	indexOff := currentIndexScanDisabled(cat)
+	if !indexOff {
+		s.addParameterizedIndexPaths(cat)
+		s.addOrderedIndexPaths(cat)
+	}
 	// M0128-P2.4: bitmap scan paths compete alongside index scan paths in
 	// add_path for every usable index. They are always generated — PG's
 	// create_index_paths generates both indexscan and bitmap paths for every
 	// index, and add_path keeps the cheaper one in each cost regime.
-	s.addBaseRelBitmapPaths(cat)
-	s.addParameterizedBitmapPaths(cat)
+	if !currentBitmapScanDisabled(cat) {
+		s.addBaseRelBitmapPaths(cat)
+		s.addParameterizedBitmapPaths(cat)
+	}
 	// M0134-0187: `create_index_path(..., indexonly=true)` for every index
 	// covering what the statement reads from the relation — generated here
 	// because it competes in the same rel's pathlist as the rest.
-	s.addIndexOnlyPaths(cat)
+	if !indexOnlyScanRejected(cat) {
+		s.addIndexOnlyPaths(cat)
+	}
 }
 
 // addOrderedIndexPaths generates, for every base relation, the unparameterised

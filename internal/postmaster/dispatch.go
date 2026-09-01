@@ -1152,7 +1152,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// plan, cache, then execute.
 		var precached optimizer.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !plannerScanTogglesActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -1774,6 +1774,28 @@ func inheritanceChangePending(base catalog.Catalog) bool {
 // own namespace (M0122-0007 slice 4c, design 0122-0018). Pass 0 for
 // connection-less/embedded callers — effectiveDBOid falls back to
 // DefaultDBOid. M0097-0022.
+// plannerScanTogglesActive reports whether the session turned any scan-method
+// toggle (enable_seqscan / enable_indexscan / enable_bitmapscan /
+// enable_indexonlyscan) off. Such a session plans DIFFERENTLY from every other
+// one, and the cross-session plan cache keys only on (dbOid, normalized SQL) —
+// so it must neither read from nor write to the shared cache, exactly as a
+// session with temp inheritance children bypasses it. Cheap: four Get calls on
+// the miss path of a cache lookup that is itself only taken for
+// single-statement queries. review/260831-2 X-8 (the toggles became real
+// planner input there; before that every session planned identically).
+func plannerScanTogglesActive(sess *misc.SessionRegistry) bool {
+	if sess == nil {
+		return false
+	}
+	for _, name := range [...]string{"enable_seqscan", "enable_indexscan",
+		"enable_bitmapscan", "enable_indexonlyscan"} {
+		if _, eff, ok := sess.Get(name); ok && strings.EqualFold(eff, "off") {
+			return true
+		}
+	}
+	return false
+}
+
 func sessionPlanCatalog(sess *misc.SessionRegistry, base catalog.Catalog, dbOid uint32) catalog.Catalog {
 	if sess == nil {
 		return base
@@ -1795,6 +1817,16 @@ func sessionPlanCatalog(sess *misc.SessionRegistry, base catalog.Catalog, dbOid 
 	if _, eff, ok := sess.Get("enable_seqscan"); ok && strings.EqualFold(eff, "off") {
 		wrapped.DisableSeqScan = true
 	}
+	// ... and the three index-side toggles, which the planner honors by
+	// declining that scan shape (review/260831-2 X-8; they used to be accepted
+	// and ignored).
+	sessOff := func(name string) bool {
+		_, eff, ok := sess.Get(name)
+		return ok && strings.EqualFold(eff, "off")
+	}
+	wrapped.DisableIndexScan = sessOff("enable_indexscan")
+	wrapped.DisableBitmapScan = sessOff("enable_bitmapscan")
+	wrapped.DisableIndexOnlyScan = sessOff("enable_indexonlyscan")
 	return wrapped
 }
 
@@ -1857,6 +1889,14 @@ func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog
 	if v, ok := getSetting("enable_seqscan"); ok && strings.EqualFold(v, "off") {
 		wrapped.DisableSeqScan = true
 	}
+	// Sibling of sessionPlanCatalog's index-side toggles (review/260831-2 X-8).
+	ctxOff := func(name string) bool {
+		v, ok := getSetting(name)
+		return ok && strings.EqualFold(v, "off")
+	}
+	wrapped.DisableIndexScan = ctxOff("enable_indexscan")
+	wrapped.DisableBitmapScan = ctxOff("enable_bitmapscan")
+	wrapped.DisableIndexOnlyScan = ctxOff("enable_indexonlyscan")
 	return wrapped
 }
 

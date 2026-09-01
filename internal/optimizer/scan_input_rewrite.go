@@ -51,6 +51,15 @@ func rewriteScanInputsWithSingleTablePredicates(n Node, cat catalog.Catalog) Nod
 	if n == nil || cat == nil {
 		return n
 	}
+	// Every rewrite this pass performs turns a SeqScan into an IndexScan, so a
+	// session with `enable_indexscan = off` must not run it at all — otherwise
+	// the shape planIndexScanFromWhere just declined for that session reappears
+	// here (this pass, not that producer, is what put an Index Scan back under
+	// `SET enable_indexscan = off` while X-8 was being fixed).
+	// review/260831-2 X-8.
+	if currentIndexScanDisabled(cat) {
+		return n
+	}
 	// M0127-P5.9-b (08 §3): a searched subtree keeps its own leaves. This pass
 	// absorbs conjuncts DOWNWARD out of a `*Filter` into the scan below it,
 	// addressing both in FROM-cumulative coordinates; inside a searched tree

@@ -1729,7 +1729,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// clauses. FOR UPDATE / FOR SHARE rely on the IndexScan leaf being
 	// accessible via lockRowsOp's currentTIDProvider chain.
 	var out Node
-	if len(s.Locking) == 0 {
+	// ... and only when the session left the index-only shape enabled
+	// (review/260831-2 X-8): tryPromoteIndexOnlyScan takes no catalog, so the
+	// toggle is read here, at its single call site.
+	if len(s.Locking) == 0 && !indexOnlyScanRejected(cat) {
 		if promoted := tryPromoteIndexOnlyScan(proj); promoted != proj {
 			out = promoted
 		} else if promoted := tryPromoteOrderedIndexOnlyScan(proj, cat); promoted != proj {
@@ -3473,6 +3476,82 @@ func currentSeqScanDisabled(cat catalog.Catalog) bool {
 		} else {
 			return false
 		}
+	}
+}
+
+// currentIndexScanDisabled / currentBitmapScanDisabled /
+// currentIndexOnlyScanDisabled are the enable_indexscan / enable_bitmapscan /
+// enable_indexonlyscan siblings of currentSeqScanDisabled, walking the same
+// catalog wrapper chain for the same kind of carrier. Until review/260831-2
+// X-8 the three GUCs were accepted and ignored (defaults.go's "v0's planner
+// ignores them" registration), so `SET enable_indexscan = off` left the index
+// plan in place where PG falls back to a bitmap and then to a seq scan.
+//
+// Upstream prices a disabled node instead of removing it (costsize.c's
+// disabled-node accounting), so PG can still pick a disabled shape when it is
+// the ONLY one; goopg's scan choice is rule-based, so the toggle instead makes
+// the producer DECLINE and the caller fall through to the next shape. The
+// observable matrix on the PG 18.3 oracle is reproduced either way:
+//
+//	enable_indexonlyscan=off            IndexOnlyScan -> IndexScan
+//	enable_indexscan=off                Index/IndexOnlyScan -> BitmapHeapScan
+//	enable_indexscan+bitmapscan=off     -> SeqScan
+//
+// Note the second row: an IndexOnlyScan is costed by cost_index too, so
+// enable_indexscan=off disables it as well — indexOnlyScanRejected below is
+// the OR of the two toggles, not enable_indexonlyscan alone.
+func currentIndexScanDisabled(cat catalog.Catalog) bool {
+	return scanToggleDisabled(cat, func(c any) (bool, bool) {
+		t, ok := c.(interface{ IndexScanDisabled() bool })
+		if !ok {
+			return false, false
+		}
+		return t.IndexScanDisabled(), true
+	})
+}
+
+// currentBitmapScanDisabled — see currentIndexScanDisabled.
+func currentBitmapScanDisabled(cat catalog.Catalog) bool {
+	return scanToggleDisabled(cat, func(c any) (bool, bool) {
+		t, ok := c.(interface{ BitmapScanDisabled() bool })
+		if !ok {
+			return false, false
+		}
+		return t.BitmapScanDisabled(), true
+	})
+}
+
+// indexOnlyScanRejected reports whether an IndexOnlyScan shape is off the table
+// for this session — enable_indexonlyscan = off, or enable_indexscan = off
+// (which disables the index-only shape too; see currentIndexScanDisabled).
+func indexOnlyScanRejected(cat catalog.Catalog) bool {
+	if currentIndexScanDisabled(cat) {
+		return true
+	}
+	return scanToggleDisabled(cat, func(c any) (bool, bool) {
+		t, ok := c.(interface{ IndexOnlyScanDisabled() bool })
+		if !ok {
+			return false, false
+		}
+		return t.IndexOnlyScanDisabled(), true
+	})
+}
+
+// scanToggleDisabled peels the catalog wrapper chain (Unwrap, exactly as
+// currentSeqScanDisabled) and reports whether any carrier answers "disabled"
+// through read. Returns false when no carrier is attached (internal/test
+// contexts), so legacy rule-based plans are unchanged. review/260831-2 X-8.
+func scanToggleDisabled(cat catalog.Catalog, read func(any) (bool, bool)) bool {
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if disabled, ok := read(cat); ok && disabled {
+			return true
+		}
+		u, ok := cat.(unwrapper)
+		if !ok {
+			return false
+		}
+		cat = u.Unwrap()
 	}
 }
 
@@ -9203,7 +9282,43 @@ func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *Colu
 	}
 }
 
+// planIndexScanFromWhere is the rule-based WHERE -> index producer; it wraps
+// planIndexScanFromWhereShape so that EVERY shape the inner function can hand
+// back passes the session's scan toggles (review/260831-2 X-8). Filtering the
+// RESULT rather than gating the entry keeps the three toggles independent: the
+// inner function returns an IndexScan on one arm and a BitmapHeapScan on
+// another (bitmapOverCorrelatedProbe), and `enable_indexscan = off` must drop
+// only the first. Declining here returns the caller to its non-index fallback,
+// which is the Seq Scan (or bitmap path) PG lands on.
 func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.Catalog, enforceInheritanceFanout bool) (Node, bool, error) {
+	n, ok, err := planIndexScanFromWhereShape(where, ctx, cat, enforceInheritanceFanout)
+	if err != nil || !ok {
+		return n, ok, err
+	}
+	if scanShapeDisabled(n, cat) {
+		return nil, false, nil
+	}
+	return n, ok, nil
+}
+
+// scanShapeDisabled reports whether n's scan shape is one the session turned
+// off. Only the node itself is inspected — these producers return a bare scan
+// (or a bitmap heap scan over its index scan), never a deep tree, and a plan
+// that merely CONTAINS an index scan somewhere below is not this predicate's
+// business. review/260831-2 X-8.
+func scanShapeDisabled(n Node, cat catalog.Catalog) bool {
+	switch n.(type) {
+	case *IndexScan:
+		return currentIndexScanDisabled(cat)
+	case *IndexOnlyScan:
+		return indexOnlyScanRejected(cat)
+	case *BitmapHeapScan, *BitmapIndexScan:
+		return currentBitmapScanDisabled(cat)
+	}
+	return false
+}
+
+func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat catalog.Catalog, enforceInheritanceFanout bool) (Node, bool, error) {
 	if len(ctx.bindings) != 1 {
 		return nil, false, nil
 	}
@@ -9554,7 +9669,11 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		// agg column (the IOS decodes just the covered column; any other ref would be
 		// out-of-range on the 1-wide row — e.g. `min(unique1) WHERE ten = 3` stays on
 		// the SeqScan fallback, as PG would leave it a heap-fetch residual).
+		// The index-only shape is off the table when the session disabled it
+		// (review/260831-2 X-8) — the SeqScan+Agg fallback below is what PG
+		// falls back to as well.
 		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil); idx != nil &&
+			!indexOnlyScanRejected(cat) &&
 			(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
 			covered, ok := cat.LookupColumn(tbl, argCR.Name)
 			if !ok {
@@ -9602,7 +9721,8 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		// non-leading agg column works exactly when a WHERE equality binds the
 		// leading prefix.
 		if inner == nil {
-			if idx, prefixQuals, k, ok := findCompositePrefixIndexForColumn(cat, tbl, argCR.Name, wherePred); ok {
+			if idx, prefixQuals, k, ok := findCompositePrefixIndexForColumn(cat, tbl, argCR.Name, wherePred); ok &&
+				!indexOnlyScanRejected(cat) { // review/260831-2 X-8, as the single-column arm above
 				// Covered + ios.schema in index-column order idx.Columns[0..k] —
 				// the prefix columns then the agg column, each at SourceTableIdx 1
 				// (the fresh inner scan's own single source). The agg column's type
@@ -14769,6 +14889,12 @@ func tryPromoteOrderedIndexOnlyScan(proj *Project, cat catalog.Catalog) Node {
 		return proj
 	}
 	if !currentSeqScanDisabled(cat) {
+		return proj
+	}
+	// ... and not when the session ALSO turned the index-only shape off — with
+	// enable_seqscan and enable_indexonlyscan (or enable_indexscan) both off PG
+	// keeps the Sort rather than promoting. review/260831-2 X-8.
+	if indexOnlyScanRejected(cat) {
 		return proj
 	}
 	sort, ok := proj.Child.(*Sort)
