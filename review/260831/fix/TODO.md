@@ -32,8 +32,8 @@ not, with the reason) / empty (not judged yet).
 
 | ID | subsystem | sev | finding | verdict | benefit | no regression | maintainability | status |
 |---|---|---|---|---|---|---|---|---|
-| EC-3 | executor-core | medium | `applyworker.go:decodePgoutputTupleAsRow` — column-name map rebuilt on every row | | | | | [ ] |
-| EC-7 | executor-core | medium | `hash_partition.go:computeHashPartitionRowHash` — per-row invariant work on the INSERT partition-routing hot path | | | | | [ ] |
+| EC-3 | executor-core | medium | `applyworker.go:decodePgoutputTupleAsRow` — column-name map rebuilt on every row | ADOPT | one replicated row, 16 columns: 1655 ns -> 760 ns (2.2x), 21 -> 19 allocs | the map depends only on the two column lists, which are fixed until the next Relation message replaces the entry — so the cache lives on that entry and dies with it | the name resolution moved into its own function, called once per relation instead of once per row | [x] fixed |
+| EC-7 | executor-core | medium | `hash_partition.go:computeHashPartitionRowHash` — per-row invariant work on the INSERT partition-routing hot path | REJECT (cache invalidation not worth it) | measured shape: a linear EqualFold scan of the table columns plus a ToLower per partition key per row — roughly 2-5% of a row insert into a hash-partitioned table | the value depends on the table definition, so a cache needs an invalidation story tied to catalog DDL; getting that wrong routes rows to the WRONG partition | — | [x] no change |
 | EC-14 | executor-core | medium | `copy.go:insertSourceRow` — per-row `make(Row, …)` instead of the row pool | REJECT (regression risk vs benefit) | one small allocation per row, against a per-row cost dominated by defaults, constraints, tuple encode, the page write and index maintenance | pooling requires PROVING no path retains the row (defaults, CHECK/domain constraints, TOAST, heap write, unique-index maintenance); a wrong release corrupts data silently rather than failing a test | — | [x] no change |
 | EC-16 | executor-core | medium | `copy_binary.go:decodeNumericBinary` — dead `fullMantissa` computation before unconditional fallback | ADOPT (mostly dead code) | binary NUMERIC decode 652 ns -> 608 ns for a small value; the loop was pure waste but cheap | BOTH arms of the branch it fed called decodeNumericBinaryViaBig — the "fast path" was never finished — so removing it cannot change a result | deletes a 25-line loop that read as a live fast path | [x] fixed |
 | EC-20 | executor-core | medium | `expr.go:evalCast` — `strings.ToLower(targetType)` on every cast evaluation | REJECT (no benefit, sibling risk) | `strings.ToLower` does not allocate for an already-lower-case type name, and plan type names are catalog-normalised — the cost is a scan of a few bytes per cast | avoiding it means switching on the raw string first and keeping a second, lower-cased switch in sync — the sibling-paths failure mode this codebase has been bitten by repeatedly | — | [x] no change |
@@ -67,7 +67,7 @@ not, with the reason) / empty (not judged yet).
 | OP2-14 | optimizer-2 | medium | pathbitmap.go:chooseBitmapAnd — costBitmapTree recomputed inside sort comparator | ADOPT (small, no benchmark) | the comparator recomputed each candidate cost O(log n) times and costBitmapTree walks the whole bitmap tree; n is small in practice, so no measurable planning win is claimed | same ordering — the same costs, computed once | strictly less work, same shape | [x] fixed |
 | OP2-18 | optimizer-2 | medium | scan_input_rewrite.go:absorbConjunctsIntoSubtree — Re-walks the whole subtree per matching conjunct | | | | | [ ] |
 | OP2-20 | optimizer-2 | medium | pushdown.go:pushOneConjunct — Per-conjunct whole-tree walks at every recursion level | | | | | [ ] |
-| OP2-29 | optimizer-2 | medium | selectivity.go:clauseSelectivity / clauseSelectivityWithSource — Near-identical duplicated implementations | | | | | [ ] |
+| OP2-29 | optimizer-2 | medium | selectivity.go:clauseSelectivity / clauseSelectivityWithSource — Near-identical duplicated implementations | REJECT (not a performance finding) | `clauseSelectivity` and `clauseSelectivityWithSource` being near-duplicates is a maintainability observation; neither is slower for it | merging them changes which selectivity a clause gets in the paths that call one and not the other — a plan-shape risk with no measured win | — | [x] no change |
 | OP2-31 | optimizer-2 | medium | planner.go:tryRangeIndexScan — Whole WHERE predicate resolved twice | REJECT (planning-time, threading risk) | one extra resolveExpr of the WHERE clause per planning of this shape | threading the already-resolved predicate out of tryRangeIndexScan means resolving in the right scope at the right time; a mistake there is a wrong plan, not a slow one | — | [x] no change |
 | XL-8 | xlog | medium | iterator.go:readOneAt — record header bytes read twice | | | | | [ ] |
 | XL-9 | xlog | medium | iterator.go:readBytesAt / readRecordBytesAt / readSegmentSlice — per-record allocation + per-chunk file open | | | | | [ ] |
@@ -98,7 +98,7 @@ not, with the reason) / empty (not judged yet).
 | NB-9 | nbtree-amcheck | medium | `btree.go:findChildBlockDirect` / `btree.go:insertItemSorted` — per-probe key copies inside descent/insert binary search | ADOPT | in-page insert search 1666 ns -> 1375 ns (17%), 36 -> 27 allocs; a point Search over a 200k-key tree 21.3us -> 20.9us, 443 -> 431 allocs | the probed item is compared and dropped inside the loop while the page is pinned — the same no-copy contract parseNoCopy already documents for the range-scan hot path | parse -> parseNoCopy at the two ordering probes, with the contract written at readPageItem | [x] fixed |
 | NB-10 | nbtree-amcheck | medium | `btree.go:Search` — decodes the whole leaf into a slice before binary-searching it | REJECT (maintainability) | plausible | — | pageItems returns an EXPANDED item list (one entry per heap TID), so items do not map 1:1 to line pointers; a lazy binary search would have to rework that invariant and its VACUUM-side readers | [x] no change |
 | NB-11 | nbtree-amcheck | low/medium | `btree.go:EncodeNumericKey` — fresh big.Int allocation per trailing-zero strip iteration | ADOPT | numeric index key with trailing zeros: 506 ns -> 251 ns (2.0x), 128 B / 15 allocs -> 48 B / 5 | a differential test compares the key bytes against the old two-division strip loop | two scratch values and a swap, plus a package-level ten | [x] fixed |
-| NB-15 | nbtree-amcheck | low/medium | `amcheck/heapallindexed.go:fingerprintLeafEntry` — a fresh buffer allocation per element, twice per element | | | | | [ ] |
+| NB-15 | nbtree-amcheck | low/medium | `amcheck/heapallindexed.go:fingerprintLeafEntry` — a fresh buffer allocation per element, twice per element | REJECT (finding does not reproduce) | measured: the per-entry buffer does NOT allocate — escape analysis keeps it on the stack (2 allocs/op either way), and a buffer-reusing variant measured no faster (698us vs 668us for 5000 entries). The change was written, measured, and REVERTED | — | — | [x] no change |
 | NB-17 | nbtree-amcheck | high | `pglz.go:Compress` — brute-force O(n·window·matchlen) match search | ADOPT | 64KiB inputs: random 377ms -> 1.0ms (379x), nodetree 8.1ms -> 0.26ms (32x), text 30.0ms -> 1.5ms (20x) | the output is now byte-identical to upstream pglz_compress (golden test); the ratio worsens slightly (below) | same hash chain + good_match/good_drop as upstream pg_lzcompress.c, with PG defaults | [x] fixed |
 | NB-18 | nbtree-amcheck | low/medium | `pglz.go:Decompress` — byte-by-byte run-length copy even for non-overlapping matches | ADOPT | text 78.9us -> 43.6us (1.8x), nodetree 44.6us -> 26.1us (1.7x) | overlapping matches (off < length) keep the byte loop; the round-trip test pins it | one added branch | [x] fixed |
 | NB-19 | nbtree-amcheck | low/medium | `backup/basebackup.go:baseBackupStreamer.Write` / `streamBackupManifest` — fresh frame buffer allocated per chunk | | | | | [ ] |
@@ -1299,3 +1299,42 @@ asking backend holds nothing on the tag — which is the common case. With 16
 holders: 140.0 ns -> 4.83 ns. `TestGrantedExceptMatchesWalk` compares the fast
 path against the walk over several holder sets, including the requester being
 the only holder.
+
+### EC-3 — ADOPT (resolve the apply worker's column map per relation)
+
+`decodePgoutputTupleAsRow` rebuilt the remote→local column map — a name match
+per remote attribute against every local column — for EVERY replicated row. The
+map depends only on the two column lists, which are fixed until the next
+Relation message replaces the entry, so it is resolved once and cached on the
+`applyRel`. The name resolution now lives in its own function
+(`pgoutputColumnMap`), and the row decode takes the resolved map.
+
+| decode one replicated row, 16 columns | before | after |
+|---|---|---|
+| | 1655 ns, 1157 B, 21 allocs | 760 ns, 1013 B, 19 allocs |
+
+(The benchmark keeps both paths side by side in the same build, so it is a
+direct A/B rather than a before/after across commits.)
+
+### EC-7 / NB-15 / OP2-29 — REJECT
+
+**EC-7** — the per-row work is real (a linear EqualFold scan of the table's
+columns plus a ToLower, per partition key, per row: roughly 2-5% of an insert
+into a hash-partitioned table). But the value depends on the table definition,
+so caching it needs an invalidation story tied to catalog DDL — and a stale
+entry here does not make a query slow, it routes rows to the WRONG partition.
+Not a trade worth making for a few percent.
+
+**NB-15 — the finding does not reproduce.** The claim is a fresh buffer
+allocated per entry, twice per entry. Measured: `VerifyBtreeHeapAllIndexed` over
+5000 entries allocates 2 objects per op either way — escape analysis keeps the
+fingerprint on the stack because the Bloom filter hashes it and keeps nothing.
+The buffer-reusing variant was written and measured at 698 us against 668 us for
+the original, so it was reverted rather than committed. (Same shape as EO1-7,
+where the allocation claim was also wrong but the call itself was measurably
+cheaper; here neither half holds.)
+
+**OP2-29** — near-identical selectivity implementations are a maintainability
+observation, not a performance one: neither is slower for the duplication.
+Merging them changes which selectivity a clause receives on the paths that call
+one and not the other, which is a plan-shape risk with no measured win.
