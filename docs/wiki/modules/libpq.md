@@ -22,7 +22,7 @@ Package total: **4,093 LOC** across 11 production files (4 parent + 7 `auth/`).
 | `protocol.go` | 122 | Protocol constants: `ProtocolVersion3_0`, message type bytes (`MsgQuery`, `MsgParse`, `MsgBind`, `MsgExecute`, `MsgDataRow`, …), authentication codes (`AuthenticationOK`, `AuthenticationSASL`, …), transaction-status enums, `CancelRequestCode`, `MaxStartupPacketLength`/`MaxRegularMessageLength`. |
 | `auth/auth.go` | 330 | `Policy` interface, `RuleSet`/`Rule`/`Request`/`Decision` structs; `DefaultPolicy`; pg_hba-style rule matching (`connTypeMatches`, `nameListMatches`, `addressMatches`); `Method*` constants. |
 | `auth/exchange.go` | 320 | The auth exchange driver — decides which method to run and drives the challenge/response state machine. |
-| `auth/scram.go` | 510 | SCRAM-SHA-256 server implementation (RFC 5802) — nonce/verifier exchange, `SaltedVerifier`, channel binding. |
+| `auth/scram.go` | 510 | SCRAM-SHA-256 server implementation (RFC 5802) — nonce/verifier exchange, `SCRAMSecret`, channel binding. |
 | `auth/saslprep.go` | 145 | SASLprep string normalization (RFC 4013) — high-level API. |
 | `auth/saslprep_tables.go` | 862 | SASLprep Unicode tables (prohibited characters, mapping categories). |
 | `auth/parser.go` | 348 | pg_hba.conf parser — reads rules from file, builds `RuleSet`. |
@@ -257,7 +257,7 @@ flowchart TD
         D -->|scram-sha-256| SASL[AuthenticationSASL mechanisms]
         D -->|reject| REJ[ErrorResponse FATAL]
         SASL --> E[auth/exchange.go state machine]
-        E --> SCRAM[scram.go: SaltedVerifier challenge]
+        E --> SCRAM[scram.go: SCRAMSecret challenge]
         SCRAM --> OK
     end
 ```
@@ -266,7 +266,7 @@ flowchart TD
 Database, Address}` is matched against pg_hba-style rules (host/local + address +
 user/database lists + method), producing a `Decision` naming the auth method.
 `auth/exchange.go` drives the wire exchange; `auth/scram.go` implements
-SCRAM-SHA-256 (RFC 5802) with `SaltedVerifier`, nonce, and channel binding;
+SCRAM-SHA-256 (RFC 5802) with `SCRAMSecret`, nonce, and channel binding;
 `auth/saslprep.go` normalizes SASLprep (RFC 4013); `auth/parser.go` parses
 `pg_hba.conf`; `auth/userstore.go` looks up stored credentials (cleartext, MD5
 hash, SCRAM verifier) keyed by user/role.
@@ -393,7 +393,7 @@ checks the version word:
 - `CancelRequestCode` (80877102, 0x04D2162E) → the postmaster answers with a
   `CancelRequest` response (no auth, just `K` with the backend key) rather than
   starting a normal session.
-- `SSLRequestCode` (80877103) / `GSSENCRequestCode` (80877104) → negotiation
+- `NegotiateSSLCode` (80877103) / `NegotiateGSSCode` (80877104) → negotiation
   requests handled by the accept loop before the normal handshake.
 
 The startup packet body is a sequence of `key\0value\0` pairs terminated by a
@@ -421,7 +421,7 @@ const (
 ```
 
 `ConnType` mirrors the pg_hba.conf first field: `ConnLocal`, `ConnHost`,
-`ConnHostSSL`, `ConnHostNoSSL`, `ConnHostGSSEnc`, `ConnHostGSSEncNo`.
+`ConnHostSSL`, `ConnHostNoSSL`, `ConnHostGSSEnc`, `ConnHostNoGSSEnc`.
 
 The `Decision` struct returned by `Policy.MatchRequest` names the method plus
 any method-specific options (e.g. `password_encryption`, `scram_iterations`).
@@ -446,16 +446,14 @@ The `UserStore` interface:
 
 ```go
 type UserStore interface {
-    LookupSCRAM(user string) (*SCRAMSecret, bool)
-    LookupMD5(user string) ([16]byte, bool)  // MD5 hash of "password<user>"
-    LookupPassword(user string) (string, bool) // cleartext fallback
+    Lookup(user string) (Credential, bool)
 }
 ```
 
-`Exchange` selects the method and pulls the matching credential:
-- SCRAM-SHA-256 → `LookupSCRAM` → `SCRAMServer.Step`.
-- MD5 → `LookupMD5` → verify `md5(password+user)` against the stored hash.
-- Password (cleartext) → `LookupPassword` → constant-time compare.
+`Exchange` selects the method and pulls the matching credential via `Lookup`:
+- SCRAM-SHA-256 → `Credential` with `PasswordSCRAMSHA256` type → `SCRAMServer.Step`.
+- MD5 → `Credential` with `PasswordMD5` type → verify `md5(password+user)` against the stored hash.
+- Password (cleartext) → `Credential` with `PasswordPlaintext` type → constant-time compare.
 
 A role's `Password` field in the catalog stores either `SCRAM-SHA-256$...`
 (the verifier string) or `md5<hex>`. `ParseSCRAMSecret` parses the former;
@@ -548,7 +546,7 @@ are `"ERROR"`, `"FATAL"`, `"PANIC"`, `"WARNING"`, `"NOTICE"`, `"INFO"`,
 
 ## SCRAM protocol details
 
-### SaltedVerifier
+### SCRAMSecret
 
 `SCRAMSecret` (scram.go:53) stores the salt, iterations, and the server key:
 
@@ -570,14 +568,14 @@ catalog format.
 ### The exchange state machine
 
 `Exchange` (exchange.go:35) is the top-level driver. It switches on the
-`Decision.Method` and runs the matching sub-routine:
+`Decision.Method`:
 
-- `runTrust` — sends `AuthenticationOk` immediately.
-- `runCleartext` — sends `AuthenticationCleartextPassword`, reads the
-  password message, compares with the store's cleartext.
-- `runMD5` — sends `AuthenticationMD5Password` with a random 4-byte salt,
-  reads the salted hash, compares with the store's MD5.
-- `runSCRAM` — drives `SCRAMServer.Step` through the SASL challenge.
+- `MethodTrust` — handled inline in `Exchange`: sends `AuthenticationOk` immediately.
+- `MethodPassword` → `runCleartext` — sends `AuthenticationCleartextPassword`, reads the
+  password message, compares with the store's credential.
+- `MethodMD5` → `runMD5` — sends `AuthenticationMD5Password` with a random 4-byte salt,
+  reads the salted hash, compares with the store's MD5 credential.
+- `MethodSCRAMSHA256` → `runSCRAM` — drives `SCRAMServer.Step` through the SASL challenge.
 
 `readSASLInitial`/`readSASLResponse`/`readPasswordMessage` are the frame
 readers for the password/auth messages.
@@ -619,7 +617,7 @@ key or value) with an error.
 ## Gotcha: SSL/negotiation frame handling
 
 The accept loop must distinguish a startup packet from an SSL request before
-calling `ReadStartupPacket` — the SSLRequestCode (80877103) and GSSENC
+calling `ReadStartupPacket` — the NegotiateSSLCode (80877103) and NegotiateGSSCode
 (80877104) are 8-byte packets (length + code) with NO parameter block. The
 postmaster's accept loop peeks the first 8 bytes, handles negotiation, and
 then calls `ReadStartupPacket` only for genuine v3 startups.

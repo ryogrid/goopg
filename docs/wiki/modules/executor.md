@@ -93,7 +93,9 @@ ROLLBACK/savepoints, `transactionOp`, `setTransactionOp`, `setConstraintsOp`),
 `workTableScanOp`), `operators_cte_dml.go` (DML CTEs), `operators_setop.go`
 (UNION/INTERSECT/EXCEPT), `operators_distinct.go` (DISTINCT/DISTINCT ON),
 `operators_material.go`, `operators_memoize.go`, `operators_project_set.go`,
-`operators_ordinality.go`, `operators_rowsfrom`, `operators_generate_series.go`,
+`operators_ordinality.go`, `operators_from_unnest.go`,
+`operators_from_regexp_matches.go`, `operators_from_regexp_split_to_table.go`,
+`operators_generate_series.go`,
 `operators_ts_token_type.go`, `operators_pg_*` (many system-function operators),
 `instrument.go` (EXPLAIN ANALYZE instrumentation).
 
@@ -141,8 +143,8 @@ Key `Context` methods: `CommandCounterIncrement`, `SetCmdCounter`,
 `Datum` kind constants (`datum.go`): `KindNull`, `KindBool`, `KindInt`,
 `KindString`, `KindBytes`, `KindTime`, `KindInterval`, `KindNumeric`,
 `KindToastPointer`, `KindEnum`. `TimeSubtype` distinguishes `TimeSubDate`,
-`TimeSubTime`, `TimeSubTimetz`, `TimeSubTimestamp`,
-`TimeSubTimestamptz` within the `KindTime` carrier.
+`TimeSubTime`, `TimeSubTimeTZ`, `TimeSubTimestamp`,
+`TimeSubTimestampTZ` within the `KindTime` carrier.
 
 ## Internal structure
 
@@ -463,14 +465,17 @@ handles:
 
 `newJoinOp` dispatches on the join algorithm:
 
-- **Hash join**: `hashJoinState` builds a hash table on the inner side keyed
-  by the join key, then probes with each outer row. Spill to disk via the
+- **Hash join**: `openLazyHashJoin`/`buildLazyHashTable` builds a hash table on
+  the inner side keyed by the join key, then probes with each outer row via
+  `nextLazy`. Spill to disk uses `hashBatchState` (join_batch.go) with
   `hashsize`-computed `nbuckets`/`nbatch`.
-- **Merge join**: `mergeJoinState` merges two sorted inputs by advancing both
-  cursors; ties produce the joined rows.
-- **Nested loop**: `nestLoopState` drives the outer, re-opens the inner per
-  outer row.
-- **Lateral**: inner rows can reference outer columns via PARAM_EXEC.
+- **Merge join**: `openMergeJoin`/`nextMerge` merges two sorted inputs by
+  advancing both cursors; ties produce the joined rows. `mergeJoinStream`
+  carries the per-stream state.
+- **Nested loop**: `openNestedLoop`/`nextNL` drives the outer, re-opens the
+  inner per outer row.
+- **Lateral**: `openLateral`/`nextLateral` uses `lateralJoinStream`; inner rows
+  can reference outer columns via PARAM_EXEC.
 
 `groupRuntime`/`aggRuntime` carry per-group and per-aggregate state for the
 `aggregateOp`.
@@ -486,7 +491,7 @@ outer key distinct count is low, caching inner results by key.
 
 - `windowOp`: partitions, orders, and computes window functions per frame.
 - `recursiveUnionOp` + `workTableScanOp`: recursive CTE execution.
-- `unionOp`/`intersectOp`/`exceptOp` (`operators_setop.go`): set operations
+- `setOp` (`operators_setop.go`): set operations
   with dedup or ALL semantics.
 - `distinctOp`: `DISTINCT`/`DISTINCT ON` dedup.
 - `limitOp`: LIMIT/OFFSET with `maxRows`-style suspension.

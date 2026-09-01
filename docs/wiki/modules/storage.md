@@ -546,19 +546,26 @@ detection, matching PG's `CheckDeadlock`).
 ## Deadlock detection (`lmgr/deadlock.go`)
 
 The deadlock detector builds a wait-for-graph from the lock manager's state
-and runs cycle detection. `RunDeadlockDetection` is called periodically from
-the checkpointer goroutine. When a cycle is found, the youngest transaction
-in the cycle is aborted (40P01).
+and runs cycle detection. `CheckDeadlocksNow()` runs one synchronous pass
+(used deterministically by tests), while the timer path
+(`runDeadlockCheckFor`) is the `time.AfterFunc` target scheduled by a parked
+backend's `Acquire` when its deadlock timeout fires. When a cycle is found,
+the firing (youngest) backend is aborted (40P01); soft cycles are resolved by
+reordering wait queues instead.
 
-`lockwait/` implements `LockWaitSet` — a per-backend wait primitive that
-combines the lock wait with a timeout and a cancel function.
+`lockwait/` carries the `lock_timeout` budget through the wait primitives:
+`WithTimeout(ctx, d)` attaches the budget, `Timeout(ctx)` reads it back, and
+`ErrLockTimeout` is the sentinel error returned when the budget elapses.
 
 ## `fastpath.go`
 
-The fastpath gives a backend a small cache of lock tags it has already
-acquired (`AccessShareLock`/`RowShareLock`). An `Acquire` for a fastpath
-hit skips the lock manager entirely. `fastpathEntry` is a 16-entry ring
-buffer per backend.
+The fastpath lets a weak relation-lock request (`EligibleForFastPath` — every
+mode below `ShareUpdateExclusiveLock`) skip the lock manager entirely when no
+strong lock is present on the tag's hash bucket. `NoConflictFastPath`
+performs that check against a `fastPathStrongBuckets` (1024-entry) strong-lock
+counter array (`strongCounts`), reconciled on every strong-lock grant/release
+by `syncStrongLocked`. It is used only by the transient
+acquire-then-release path, never for locks held to end-of-transaction.
 
 ## Buffer pool read/write timing
 
@@ -567,9 +574,10 @@ and EXPLAIN (BUFFERS). The counters are exposed via `BufferCounters()`.
 
 ## Background writer (`bgwriter.go`)
 
-`backgroundWriter` is a goroutine that periodically runs `WriteDirtyPages`
-to flush a batch of dirty pages. The batch size is `PoolConfig.DirtyPageBatch`
-(default 32). The bgwriter cooperates with the checkpointer: the checkpointer
+`Bgwriter` (`NewBgwriter(pool, delay, maxPages)`) is a goroutine that
+periodically runs `WriteDirtyPages` to flush a batch of dirty pages — one tick
+every `BgwriterDelay` (default 200 ms), at most `BgwriterMaxPages` pages per
+tick. The bgwriter cooperates with the checkpointer: the checkpointer
 flushes all dirty pages at checkpoint time; the bgwriter flushes continuously
 to reduce the checkpoint burst.
 
@@ -714,10 +722,10 @@ completion was never awaited.
 
 | Fork | Suffix |
 |---|---:|
-| `MainForkNumber` | `.rel` (the file itself) |
-| `FSMForkNumber` | `_fsm` |
-| `VisibilityMapForkNumber` | `_vm` |
-| `InitForkNumber` | `_init` |
+| `MainFork` | `.rel` (the file itself) |
+| `FSMFork` | `_fsm` |
+| `VisibilityMapFork` | `_vm` |
+| `InitFork` | `_init` |
 
 The directory is `base/<dbOid>/` for per-database relations or `global/`
 for shared catalogs (DBOid == 0). The filename is the relfilenode OID with

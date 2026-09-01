@@ -65,7 +65,7 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 | `replication_views.go` | 747 | Replication-related pg_catalog view seed rows |
 | `pg_proc_view.go` | 629 | `pg_proc` virtual row helpers |
 | `pgcontrol.go` | 337 | pg_control write (`writePgControl`, `BackupControlImage`, `buildPgControl`) |
-| `xact_recovery.go` | 290 | Transaction recovery: `XID-in-progress checks`, `TransactionIdDidCommit`, abort sweep |
+| `xact_recovery.go` | 290 | Transaction recovery: snapshot/proc-array XID-in-progress checks, `TransactionIdDidCommit`, abort sweep |
 | `pg_type_seed_data.go` | 403 | Seed data constants for pg_type (type OID map) |
 | `system_view_oid_pins.go` | 437 | Fixed OID assignments for system views (12000–16383 band) |
 | `pg_cast_bootstrap.go` | 307 | pg_cast bootstrap rows |
@@ -142,21 +142,19 @@ The bootstrap chain in detail:
 9. `bootstrapPgAmopTuples` / `bootstrapPgAmprocTuples` — access method operators/functions
 10. `bootstrapPgOperatorTuples` — pg_operator
 11. `bootstrapPgCollationTuples` — pg_collation
-12. `bootstrapPgStatisticTuples` — pg_statistic
-13. `bootstrapPgConstraintTuples` — pg_constraint
-14. `bootstrapPgCastTuples` — pg_cast
-15. `bootstrapPgConversionTuples` — pg_conversion
-16. `bootstrapPgExtentionTuples` — pg_extension
-17. `bootstrapPgRewiteTuples` — pg_rewrite (+ TOAST pair for ev_action)
-18. `bootstrapPgDatabaseTuples` — pg_database (postgres, template1, template0)
-19. `bootstrapPgAuthidTuples` — pg_authid (superuser role)
-20+ Nailed view seed data (80 views) + information_schema view seed (65 views)
+12. `bootstrapPgConstraintTuples` — pg_constraint
+13. `bootstrapPgCastTuples` — pg_cast
+14. `bootstrapPgConversionTuples` — pg_conversion
+15. `bootstrapPgRewriteTuples` — pg_rewrite (+ TOAST pair for ev_action)
+16. `bootstrapPostgresDatabase` — pg_database (postgres, template1, template0); btree indexes via `bootstrapPgDatabaseOidIndex` / `bootstrapPgDatabaseDatnameIndex`
+17. `bootstrapPostgresRole` / `bootstrapPostgresRoleWithPassword` — pg_authid (superuser role)
+18+ Nailed view seed data (80 views) + information_schema view seed (65 views)
 
 Each `bootstrap*Tuple` call:
 1. Builds heap rows with `executor.EncodeRowPG`
 2. Writes them via `appendCatalogRows` (multi-page heap insert)
 3. Builds the matching btree index file via `btree_index_bootstrap.go`:
-   `scanRelationBlocks` → `writeCatalogIndex` → `buildPage`/`buildRoot`
+   `pgBuildBtreeBulkLoad`/`pgBuildBtreeBulkLoadSized` → `pgBuildBtreeLeafPage`/`pgBuildBtreeInternalRootPage` + `pgBuildBtreeMetapageWithRoot`
 
 ### The catalog-pass chain
 
@@ -177,8 +175,8 @@ sequenceDiagram
     CATS->>HEAP: write heap rows
     INIT->>CATS: remaining bootstrap*Tuples passes
     CATS->>HEAP: write heap rows
-    INIT->>IDX: build btree index files<br/>(scanRelationBlocks → writeCatalogIndex)
-    IDX->>IDX: buildPage / buildRoot (PG-conformant index images)
+    INIT->>IDX: build btree index files<br/>(pgBuildBtreeBulkLoad → pgBuildBtreeLeafPage / pgBuildBtreeInternalRootPage)
+    IDX->>IDX: pgBuildBtreeMetapageWithRoot (PG-conformant index images)
     INIT->>REW: bootstrap pg_rewrite + TOAST pairs
     REW->>HEAP: ev_action blobs + pg_rewrite_toast chunks (2838/2839)
     INIT->>INIT: CLOG/SLRU placeholders → relcache init files
@@ -225,7 +223,7 @@ The ordered reload passes (captured in `runCatalogReloads`):
    - `reloadForeignDataFromHeap` / `reloadFdwsFromHeap` / `reloadForeignServersFromHeap`
    - `reloadUserExtensionsFromHeap` — pg_extension
    - `reloadUserAccessMethodsFromHeap` — pg_am
-   - `reloadStatisticsExtFromHeapForDB` — pg_statistic_ext
+   - `loadStatisticsExtFromHeapForDB` — pg_statistic_ext
    - `reloadDbRoleSettingsFromHeap` — pg_db_role_setting
 
 ### Startup recovery flow
@@ -455,7 +453,7 @@ type catalogCache struct {
 
 On a clean shutdown, `SaveCatalog` writes a JSON snapshot of the
 pg_class/pg_attribute in-memory state. On the next `Open`, if the snapshot is
-present and valid, `loadCatalogCache` restores the catalog without scanning
+present and valid, `readCatalogCache` restores the catalog without scanning
 the pg_class/pg_attribute heaps — a material startup win for benchmark
 restart cycles. The cache is invalidated on any non-clean shutdown (the
 `DB_IN_PRODUCTION` state test in pg_control).
@@ -497,7 +495,7 @@ runtime to resolve function OIDs.
 
 ## bootstrap pg_authid
 
-`bootstrapPgAuthidTuples` writes the superuser role (pg_authid OID 10) plus
+`bootstrapPostgresRole` / `bootstrapPostgresRoleWithPassword` writes the superuser role (pg_authid OID 10) plus
 any roles from a `pg_auth` overlay file. The bootstrap superuser:
 - Default name `postgres` (or `-U`).
 - `rolsuper = true`, `rolcreaterole = true`, `rolcreatedb = true`,

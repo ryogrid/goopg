@@ -230,12 +230,14 @@ the many Query fields that must stay at view-default values are validated on
 Read, and any deviation (aggregates, sublinks, joins) is an error → caller
 falls back to SQL text.
 
-The `Query` node (`ir_query.go`) is a faithful subset of PG's `Query`:
-`commandType`, `querySource`, `canSetTag`, `utilityStmt`, `resultRelation`,
-`hasAggs`/`hasWindowFuncs`/`hasSubLinks`/`hasDistinctOn`, `jointree`,
-`targetList`, `rtable`, `rtablePermissions`, `cteList`, and `returningList`.
-Every modeled field is emitted and validated; fields outside the subset must
-stay at their zero values.
+The `Query` node (`ir_query.go`) is a faithful subset of PG's `Query` with
+only five Go fields — `CommandType`, `Rtable`, `RtePermInfos`, `Jointree`,
+`TargetList`. `Out` emits the full fixed skeleton around them so the bytes
+match PostgreSQL exactly, with every other Query field (`querySource`,
+`canSetTag`, `utilityStmt`, `resultRelation`, `hasAggs`, `hasWindowFuncs`,
+`hasSubLinks`, `hasDistinctOn`, `cteList`, `returningList`, …) fixed at its
+view-default value. `Read` validates those fixed fields; deviation is an error
+→ the caller falls back to SQL text.
 
 ### Numeric storage (`numeric_storage.go`)
 
@@ -413,10 +415,9 @@ annotated field names:
   resorigcol, resjunk}`.
 - **`RangeTblEntry`** — `{rtekind, relid, relkind, rellockmode, tablesample,
   subquery, jointype, alias, eref, perminfoindex, ...}`.
-- **`Query`** — the view-rule subset: `{commandType, querySource, canSetTag,
-  utilityStmt, resultRelation, hasAggs, hasWindowFuncs, hasSubLinks,
-  hasDistinctOn, hasRecursive, hasModifyingCTE, hasForUpdate, cteList,
-  targetList, returningList, jointree, rtable, rtablePermissions}`.
+- **`Query`** — the view-rule subset: `{CommandType, Rtable, RtePermInfos,
+  Jointree, TargetList}` (the serializer emits the full fixed skeleton with
+  every other field at its view-default value).
 
 ## Tokenizer grammar (`readfuncs.go`)
 
@@ -497,11 +498,11 @@ known destination type. Key sub-resolvers:
   coercion (e.g., `'abc'::varchar(2)`).
 - `resolveCaseExpr` — searched form (list of `CaseWhen` + ELSE) or simple
   form (an `arg` + `CaseTestExpr` placeholder).
-- `resolveBoolExpr` — AND/OR/NOT.
+- `resolveBoolBinary` / `resolveBoolNot` — AND/OR/NOT.
 - `resolveNullTest` — `IS NULL`/`IS NOT NULL`.
 - `resolveBooleanTest` — `IS TRUE`/`IS NOT TRUE`/`IS FALSE`/`IS NOT FALSE`/
   `IS UNKNOWN`/`IS NOT UNKNOWN`.
-- `resolveDistinctExpr` — `IS [NOT] DISTINCT FROM` via the `=` operator,
+- `resolveDistinctFrom` — `IS [NOT] DISTINCT FROM` via the `=` operator,
   tagged `DISTINCTEXPR`.
 
 Each resolver has a `…With` sibling that takes a destination type parameter
@@ -648,11 +649,11 @@ path and by the `pg_get_expr` function that reconstructs SQL text from stored
 func Rebuild(n Node) (parser.Expr, error)
 ```
 
-`Rebuild` dispatches on the node type: `RebuildBoolExpr`,
-`RebuildNullTest`, `RebuildBooleanTest`, `RebuildCaseExpr`,
-`RebuildFuncExpr`, `RebuildRelabelType`, etc. Each `*With` variant takes a
-custom `rec` function so the caller can intercept sub-expression
-reconstruction.
+`Rebuild` dispatches on the node type through unexported helpers:
+`rebuildBoolExpr`, `rebuildNullTest`, `rebuildBooleanTest`, `rebuildCaseExpr`,
+`rebuildFuncExpr`, `rebuildRelabelType`, etc. Each has a `*With` variant
+(`rebuildBoolExprWith`, `rebuildNullTestWith`, …) that takes a custom `rec`
+function so the caller can intercept sub-expression reconstruction.
 
 `rebuild_query.go` provides `RebuildViewQuery(q *Query) (*parser.SelectStmt, error)`
 — the inverse of `ResolveViewQuery`, reconstructing a `SELECT` parse tree

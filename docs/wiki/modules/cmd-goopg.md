@@ -393,7 +393,7 @@ same effect as SIGQUIT upstream (skip the shutdown checkpoint), which is how
 
 `runRestart` (main.go:1143) stops then re-enters `runStart` in-process:
 
-1. Calls `runStopWithMode` to stop the running server (default mode `fast`).
+1. Sends `STOP` (or `STOPIMMEDIATE` for `-mode immediate`) over the control socket via `control.Send` to stop the running server.
 2. If the stop succeeded (exit 0), calls `runStart` with the same arguments
    (minus the `restart` subcommand).
 3. The `runStart` calls `initdb.Open`, which is safe because the previous

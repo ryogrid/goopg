@@ -357,7 +357,11 @@ sequenceDiagram
 - **Launcher restarts are delegated** — the apply launcher does NOT retry failed workers; the receiver's own reconnect loop owns retry policy (M0103-0003), so a worker error is logged and the launcher just spawns a fresh worker on the next reconcile.
 - **Table-sync state machine is `pg_subscription_rel`-driven** — sync only advances to `'r'` after the COPY batch fully drains; a `CopyFail` leaves the relation in a retryable state for the next manager sweep.
 - **`parsePrimaryConninfo` vs `parsePrimaryConninfoFull`** — the former returns just the address; the latter returns the full parsed tuple (addr, appName, user, sslmode). Both must be kept in sync with `parseSubscriptionConninfo`.
-- **`default_publication_names` GUC** — the logical receiver reads `default_publication_names` from the registry, falling back to `'{all}'` when unset, so a subscription without explicit `publication_names` publishes all tables.
+- **Empty `Publications` = all publications** — the logical receiver sends
+  `"publication_names" '<comma-joined list>'`; an empty `Publications` list
+  means "all visible publications", matching upstream's
+  `publication_names`-as-empty fallback (there is no
+  `default_publication_names` GUC).
 - **Synthetic LSNs for metadata** — the logical walsender assigns strictly-increasing synthetic LSNs to non-WAL messages (relation metadata, type info) so the ack protocol stays monotonic even when no WAL records are being decoded.
 - **`StartWalReceiver` launcher config** — `WalReceiverLauncherConfig` wraps `WalReceiverConfig` with `Registry` and `Logger` for GUC-driven `primary_conninfo` re-reads on reconnect; the launcher reads `primary_conninfo`, `primary_slot_name`, `wal_receiver_status_interval`, and `wal_receiver_timeout` from the registry on each reconnect attempt.
 
@@ -443,7 +447,8 @@ stream bytes).
 
 `replyTimelineHistory` ships the requested timeline's `.history` file:
 
-1. `parseTimelineHistoryArgs` extracts the TLI from `TIMELINE_HISTORY <tli>`.
+1. Parses the TLI inline — `replyTimelineHistory` tokenizes
+   `TIMELINE_HISTORY <tli>` with `strings.Fields` + `strconv.ParseUint`.
 2. Reads `<WALDirPath>/<tli>.history` (e.g. `00000002.history`).
 3. If found, ships the file contents as a single `CopyData` frame followed by
    `CopyDone`.

@@ -115,34 +115,42 @@ The date/time/interval output formatting engine, mirroring PG's `datetime.c`,
 
 | File | LOC | Role |
 |---|---|---|
-| `pg_datetime_format.go` | 223 | `FormatDateTime` (a port of PG's `do_to_timestamp`/`datetime_format`): the `to_char`/`to_timestamp` template engine. |
-| `normalize.go` | 528 | `NormalizeTimestamp`/`NormalizeInterval` (time-unit overflow/underflow carry, e.g. 90s → 1min 30s). |
-| `timeofday.go` | 424 | `TimeOfDay` (the `now()`/`timeofday()` wall-clock), `TzNames`, timezone name resolution. |
+| `pg_datetime_format.go` | 223 | `FormatDate`/`FormatTime`/`FormatTimestamp`/`FormatTimestampTZUTC`/`FormatTimeTZ` — PG-faithful renderers for the wire/on-disk integer forms of date/time/timestamp/timestamptz/timetz, ported from PG's `datetime.c`/`date.c`/`timestamp.c`. Used by both the array-element decoder and WAL's pgoutput. |
+| `normalize.go` | 528 | `NormalizeInput`/`NormalizeDateTimeInput` — date/time input-text normalization (separators, Zulu folding, run-together dates, month/day validation, BC handling). |
+| `timeofday.go` | 424 | `TimeOfDay` struct + `ParseTimeOfDay`: the `now()`/`timeofday()` wall-clock, parsing, `Normalize()` (time-unit overflow/underflow carry, e.g. 90s → 1min 30s), canonicalization. |
 | `interval_format.go` | 110 | `FormatInterval` (ISO 8601, PostgreSQL abbreviated, SQL standard styles). |
-| `interval_typmod.go` | 136 | interval typmod decode (precision/fields, e.g. `INTERVAL DAY TO SECOND(3)`). |
-| `era.go` | 119 | era name lookup (AD/BC, and CE/BCE for Gregorian). |
+| `interval_typmod.go` | 136 | `AdjustIntervalForTypmod` — interval typmod decode/adjust (precision/fields, e.g. `INTERVAL DAY TO SECOND(3)`). |
+| `era.go` | 119 | `SplitEra`/`ApplyEra`/`AstronomicalYear`/`EraYear` — era handling (AD/BC, and CE/BCE for Gregorian). |
 | `monthname.go` | 203 | month/day name tables (full and abbreviated, with case handling). |
 | `adjust_typmod.go` | 34 | typmod → precision/scale adjustment for timestamps. |
 
 ```go
-func FormatDateTime(t time.Time, format string) (string, error)
-func FormatInterval(months, days, micros int64, style string) string
-func NormalizeTimestamp(...) / NormalizeInterval(...)
-func TimeOfDay(...)
-func ParseIntervalTypmod(typmod int32) (fields int, precision int)
+func FormatDate(days int32) string
+func FormatTime(micros int64) string
+func FormatTimestamp(micros int64) string
+func FormatTimestampTZUTC(micros int64) string
+func FormatTimeTZ(micros int64, zoneSecs int32) string
+func FormatInterval(months, days int32, micros int64) string
+func NormalizeInput(s string) string
+func NormalizeDateTimeInput(s string, bc bool) string
+func ParseTimeOfDay(s string) (TimeOfDay, error)
+func AdjustIntervalForTypmod(months, days int32, micros int64, typmod int32) (int32, int32, int64)
 ```
 
-**Formatting details** — `FormatDateTime` walks the template one token at a
-time, interpreting PG's template patterns (`YYYY`, `MM`, `DD`, `HH24`, `MI`,
-`SS`, `MS`/`US` (milliseconds/microseconds), `AM`/`PM`, `TZ`, `OF`, `BC`/`AD`,
-day-name and month-name with `FMTM`/`FX` modifiers, quoted literals, and
-`"text"` escapes). `normalize.go` carries time-unit overflow/underflow:
-`NormalizeInterval` converts e.g. `(0 months, 0 days, 86400_000_000 micros)`
-into `(0, 1, 0)` and handles negative carry. `interval_typmod.go` decodes the
-packed interval typmod into a field mask (`YEAR`, `MONTH`, `DAY`, `HOUR`,
-`MINUTE`, `SECOND`, and `TO`-range combinations) plus seconds precision.
-`era.go`/`monthname.go` supply the display-name tables (`eraName`, month and
-day full/abbreviated names) used by the template engine.
+**Formatting details** — `FormatDate`/`FormatTimestamp` walk the wire/on-disk
+integer forms and render them PG-style (`YYYY`, `MM`, `DD`, `HH24`, `MI`,
+`SS`, `MS`/`US`-style fractions, `BC`/`AD`, day/month names) — matching
+PG's `date_out`/`timestamp_out` under the ISO DateStyle; the `to_char` /
+`to_timestamp` template engine lives in `internal/executor/expr.go`.
+`normalize.go` normalizes *input* text (not value carry): `NormalizeInput`
+folds separators and Zulu timezone, expands run-together dates, and validates
+month/day fields. Time-unit overflow/underflow carry is `TimeOfDay.Normalize`
+in `timeofday.go` (e.g. `(0, 0, 86400_000_000 micros)` → `(0, 1, 0)`).
+`interval_typmod.go`'s `AdjustIntervalForTypmod` decodes the packed interval
+typmod into a field mask (`YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`,
+and `TO`-range combinations) plus seconds precision.
+`era.go`/`monthname.go` supply the era/display-name helpers (`SplitEra`,
+`ApplyEra`, `AstronomicalYear`, `EraYear`) used by the input parser.
 
 ### `internal/utils/mb` — multi-byte encoding
 
@@ -279,7 +287,8 @@ into a Go `regexp` for `LIKE`-style pattern matching (rewriting `%`→`.*`,
 
 The `pgarray.go` file (529 LOC) provides array element type name resolution /
 lookup helpers used by the catalog and executor, plus array-output formatting
-helpers (`array_elem_output_style`, `bytea_output_escape`).
+helpers (`RenderText`/`RenderTextStyled`, and the `bytea_output` family
+`ByteaOutHex`/`ByteaOutEscape`/`ByteaOutStyled`).
 
 ## Key flow: memory context reset cascade
 
@@ -552,7 +561,7 @@ Key groups:
 | `57XXX` | Operator intervention |
 | `58XXX` | System error (IO error, etc.) |
 | `F0000` | Config file error |
-| `HVXXX` | FDW error |
+| `HV000` | FDW error (`FDWError`) |
 | `P0000` | PL/pgSQL error |
 | `XX000` | Internal error |
 
@@ -594,7 +603,8 @@ context) so it survives without per-statement Reset.
 ### `adt/array` (`pgarray.go`)
 
 The `array` package provides:
-- `arrayElemOutputStyle` / `byteaOutputEscape` — array output formatting.
+- `RenderText`/`RenderTextStyled` (array output rendering), `ByteaOutHex`/
+  `ByteaOutEscape`/`ByteaOutStyled` (bytea output per `bytea_output` GUC).
 - Array element type name resolution / lookup helpers used by the catalog
   and executor.
 
@@ -602,9 +612,13 @@ The `array` package provides:
 
 No such `utils/adt` subpackages exist. Bit/varbit operators, inet/macaddr
 parsing, and text-search functions are implemented as builtins in
-`internal/executor/expr.go` (`evalPgLSNBinary`, `parseMacaddrLiteral`,
-`parseInetLiteral`, etc.). Text search configs/dictionaries are resolved via
-the catalog's `UserTSConfig`/`UserTSDict` registries.
+`internal/executor` (`evalPgLSNBinary`, `parseMacaddrLiteral`,
+`parseMacaddr8Literal`, `parseBoxLiteral`, `parseCircleLiteral`,
+`parseLineLiteral`, `parseLsegLiteral`, `parsePathLiteral`,
+`parsePointLiteral`, `parsePolygonLiteral` in `expr.go`; inet/cidr text lives
+in `operators_ddl.go` as `parseInetKeyText`/`normalizeInetCidrText`). Text
+search configs/dictionaries are resolved via the catalog's `UserTSConfig`/
+`UserTSDict` registries.
 
 ## `internal/utils/activity` wait-event constants
 
