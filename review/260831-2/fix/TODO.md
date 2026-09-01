@@ -101,7 +101,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | IN-4 | low | `initdb/initdb.go:mappedLocalCatalogPlaceholderOIDs` — duplicate OID 3764 | ? | [ ] | |
 | IN-5 | low | `initdb/open.go:Open` (RunningXactsFn) — latent uint32 underflow if Xmax == 0 | ? | [ ] | |
 | IN-6 | low | `initdb/information_schema_tables.go` — CRLF / non-`\N` NULL handling | ? | [ ] | |
-| ST-4 | low | `storage/bufpool.go:WriteDirtyPages` — bgwriter scan cursor never advances | BUG | [ ] | pending gate |
+| ST-4 | low | `storage/bufpool.go:WriteDirtyPages` — bgwriter scan cursor never advances | BUG | [x] fixed + guarded | this commit |
 | ST-5 | low | `storage/bufmap.go:Lookup` — probe bound off by one | NOT A BUG | [x] | — |
 | ST-6 | low | `storage/bgwriter.go:Stop` — double-close panic / hang on Stop-without-Start | NOT A BUG | [x] | — |
 | ST-9 | low | `aio/method_iouring_linux.go:pokeWake` — NOP written without checking SQ ring fullness | ? | [ ] | |
