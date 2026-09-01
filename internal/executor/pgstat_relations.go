@@ -494,6 +494,13 @@ func (m *relationStatsManager) dropTable(oid uint32) {
 	for _, rec := range m.prepared {
 		delete(rec, oid)
 	}
+	// The autovacuum-trigger inputs are part of the relation's stats entry too:
+	// upstream's pgstat_drop_relation drops the whole PgStat_StatTabEntry, dead
+	// tuples and n_ins_since_vacuum included. Leaving them behind kept a
+	// dropped relation's counters alive for whatever later relation inherits
+	// the OID, which would hand it a head start toward an autovacuum it has not
+	// earned (review/260831-2 ES-3).
+	delete(m.triggers, oid)
 }
 
 // resetAll zeroes every shared relation counter in place (the relation-stats

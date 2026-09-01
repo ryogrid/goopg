@@ -210,3 +210,25 @@ func TestRelStatsDropTable(t *testing.T) {
 		t.Fatalf("dropTable: stale counters revived the dropped OID")
 	}
 }
+
+// TestRelStatsDropTableClearsAutovacuumTriggers pins the second half of
+// pgstat_drop_relation: the autovacuum-trigger inputs (n_dead_tup,
+// n_ins_since_vacuum, n_mod_since_analyze) belong to the same stats entry and
+// must not outlive the relation, or an OID reused by a later relation starts
+// life already part-way to an autovacuum. review/260831-2 ES-3.
+func TestRelStatsDropTableClearsAutovacuumTriggers(t *testing.T) {
+	m := newRelationStatsManager()
+	const oid = uint32(4242)
+	m.recordInsert(1, oid, 100)
+	m.recordUpdate(1, oid, 40)
+	m.commitXact(1)
+	m.flush(1)
+	if dead, ins, mod := m.triggerSnapshot(oid); dead == 0 && ins == 0 && mod == 0 {
+		t.Fatalf("setup: expected non-zero trigger counters, got dead=%d ins=%d mod=%d", dead, ins, mod)
+	}
+
+	m.dropTable(oid)
+	if dead, ins, mod := m.triggerSnapshot(oid); dead != 0 || ins != 0 || mod != 0 {
+		t.Errorf("after dropTable: dead=%d ins=%d mod=%d, want all zero", dead, ins, mod)
+	}
+}
