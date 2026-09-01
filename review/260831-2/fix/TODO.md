@@ -64,8 +64,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | OP1-3 | med | `optimizer/createplannl.go:createNestLoopBitmapJoinPlan` — `bhs.BitmapQual = nil` drops recheck quals | ? | [ ] | |
 | XL-4 | med | `wal/slot_decoder.go:Run` — ConfirmedFlushLSN never advances for PG-format commit records | ? | [ ] | |
 | CP-2 | med | `postmaster/dispatch.go:normalizeSQLPreservingLiterals` — plan-cache key collision on quoted identifiers | ? | [ ] | |
-| UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | BUG | [x] | this commit |
-| UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | ? | [ ] | |
+| UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | BUG | [x] | 306709703 |
+| UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | BUG | [x] | this commit |
 | UT-4 | med | `utils/mmgr/mctx.go:Context.Release` — mutates `c.children` while ranging over it | ? | [ ] | |
 | CM-3 | med | `cmd/plan-snapshot/main.go:planEqual` — `rowsRegexp` never matches the real EXPLAIN format | ? | [ ] | |
 
@@ -352,3 +352,17 @@ landed.
   `coldFromBackend` (new `parseWallString`) and fall back to registration
   time when the caller left it unset. Guard:
   `TestRegisterKeepsBackendStart`. Gates: units green; pgbench smoke green.
+
+- 2026-09-01 **UT-2 = BUG (fixed).** `canonicalizeFrom`'s TypeReal arm split
+  the value into number and unit suffix with a hand-rolled scan that
+  accepted only sign, digits and `.`, so an exponent landed in the
+  "suffix": `1e-2` became number `1` + suffix `e-2`, and since a unitless
+  GUC ignores its suffix the stored value was 1 — a silent 100x error on a
+  planner cost knob. Measured on PG 18.3 (127.0.0.1:65438):
+  `set seq_page_cost = 1e-2; show seq_page_cost;` → `0.01`; `1E2` → `100`;
+  `2.5e1` → `25`; `set cursor_tuple_fraction = 5e-1` → `0.5` (goopg
+  rejected the last one as out of range, having read it as 5). PG parses
+  reals with strtod (`parse_real`). Fix: `realNumericPrefixLen` takes the
+  longest float-parseable prefix — exactly strtod's rule — and the rest is
+  the suffix. Guard: `TestSetRealAcceptsScientificNotation`. Gates: units
+  green; pgbench smoke green.
