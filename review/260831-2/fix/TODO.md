@@ -130,7 +130,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | CP-4 | low | `replication/logicalwalsender.go:walsenderPgoutputAdapter.Write` — LSN underflow on empty write | ? | [ ] | |
 | CP-5 | low | `postmaster/server.go:isReplicationStartupParam` — overly broad match | ? | [ ] | |
 | UT-3 | low | `utils/misc/guc.go:convertUnit` — int64 overflow on cross-unit conversion | BUG | [ ] | pending gate |
-| UT-5 | low | `utils/activity/stats/counter.go:Add` — index out of range when GOMAXPROCS > 256 | BUG | [ ] | pending gate |
+| UT-5 | low | `utils/activity/stats/counter.go:Add` — index out of range when GOMAXPROCS > 256 | BUG | [x] fixed + guarded | this commit |
 | UT-6 | low | `utils/adt/datetime/normalize.go:padTimeFields` — run-together time expansion not implemented | ? | [ ] | |
 | UT-7 | low | `utils/misc/session.go:EndTransaction` — rollback fires `invokeOnChange` for unchanged values | ? | [ ] | |
 | CM-2 | low | `cmd/goopg/standby.go:Promote` — `sc.replayer.ApplyLSN()` without a nil guard | ? | [ ] | |

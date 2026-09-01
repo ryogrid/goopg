@@ -54,8 +54,18 @@ type Counter struct {
 // may concurrently sample the shard via GC stack walks.
 func (c *Counter) Add(delta int64) {
 	pid := runtimeshim.PinP()
-	c.shards[pid].n.Add(delta)
+	c.shardFor(pid).n.Add(delta)
 	runtimeshim.UnpinP()
+}
+
+// shardFor maps a P index onto the fixed shard table. PinP returns an index in
+// [0, GOMAXPROCS), which is NOT bounded by maxShards: a machine (or a test)
+// with GOMAXPROCS > 256 would index past the table and panic in Add. Folding
+// the index keeps the counter correct — two Ps then share a shard, which costs
+// a little cache-line contention but never a wrong or missing count.
+// maxShards is a power of two, so the mask is the modulo.
+func (c *Counter) shardFor(pid int) *shard {
+	return &c.shards[pid&(maxShards-1)]
 }
 
 // Sum returns the aggregate count across all shards. Performed via
