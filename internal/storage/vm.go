@@ -163,7 +163,11 @@ func PageAllVisible(p Page, horizon TransactionID) bool {
 			return false
 		}
 		// Tuple must have a committed xmin before the global horizon.
-		if t.Header.Xmin == InvalidTransactionID || t.Header.Xmin >= horizon {
+		// review/260831-2 ST-7: the comparison is circular (PG's
+		// TransactionIdPrecedes in heap_page_is_all_visible); a plain `>=`
+		// reads every pre-wraparound xmin as newer than a post-wraparound
+		// horizon and permanently refuses the ALL_VISIBLE bit.
+		if t.Header.Xmin == InvalidTransactionID || !XIDPrecedes(t.Header.Xmin, horizon) {
 			return false
 		}
 		// Tuple must not be deleted. An updater-bearing multixact xmax
@@ -207,7 +211,8 @@ func PageAllFrozen(p Page, freezeBelow TransactionID) bool {
 		if err != nil {
 			return false
 		}
-		if t.Header.Xmin == InvalidTransactionID || t.Header.Xmin >= freezeBelow {
+		// review/260831-2 ST-7: circular comparison, as in PageAllVisible.
+		if t.Header.Xmin == InvalidTransactionID || !XIDPrecedes(t.Header.Xmin, freezeBelow) {
 			return false
 		}
 		if t.Header.Xmax != InvalidTransactionID && !IsHeapTupleLockOnly(t.Header.Infomask) {

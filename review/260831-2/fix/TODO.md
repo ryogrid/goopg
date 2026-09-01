@@ -45,16 +45,16 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EC-2 | med | `executor/btree_array_key.go:encodeArrayBTreeKey` — quoted `"NULL"` element encoded as SQL NULL | BUG | [x] | 9000565e7 |
 | EC-4 | med | `executor/copy.go:PushBinaryData` — binary COPY FROM skips defaults / NOT NULL / CHECK | BUG | [x] | 7f9f16784 |
 | EO1-1 | med | `executor/operators_call.go:callOp.Next` — IN/INOUT arg after an OUT param reads the wrong slot | BUG | [x] | cf2eae0e2 |
-| EO1-3 | med | `executor/operators.go:limitOp.Next` — `LIMIT 0 ... WITH TIES` panics on nil tieKeyVals | BUG | [x] | this commit |
+| EO1-3 | med | `executor/operators.go:limitOp.Next` — `LIMIT 0 ... WITH TIES` panics on nil tieKeyVals | BUG | [x] | 0e50eb19a |
 | EO2-2 | med | `executor/operators_sequence.go:seqState.nextVal` — int64 overflow wraps instead of raising 2200H | ? | [ ] | |
 | EO2-3 | med | `executor/operators_project_set.go:openSelectSrfMode` — generate_series int64 overflow spins forever | ? | [ ] | |
 | EO2-4 | med | `executor/operators_recursive_cte.go:recursiveUnionOp.Open` — phase state not reset on re-open | ? | [ ] | |
-| EO2-5 | med | `executor/opnode.go:limitOpNext` — `FETCH FIRST 0 ROWS WITH TIES` panics on nil tieKeyVals | BUG | [x] | this commit |
+| EO2-5 | med | `executor/opnode.go:limitOpNext` — `FETCH FIRST 0 ROWS WITH TIES` panics on nil tieKeyVals | BUG | [x] | 0e50eb19a |
 | ES-6 | med | `executor/plpgsql_runtime.go:executePLpgSQLStmt (ForStmt)` — BY step not validated; zero/negative step infinite-loops | ? | [ ] | |
 | ES-7 | med | `executor/plpgsql_runtime.go:lowerPLpgSQLExpr (CastExpr)` — cast dropped in PL/pgSQL expressions | ? | [ ] | |
 | IN-2 | med | `initdb/catalog_cache.go:readCatalogCache` — silent partial catalog on TryRegisterUserTable failure | ? | [ ] | |
 | ST-3 | med | `storage/bufpool.go:pinLoad/evictVictim` — dirty victim content discarded when the flush fails | ? | [ ] | |
-| ST-7 | med | `storage/vm.go:PageAllVisible/PageAllFrozen` — plain XID comparison breaks under wraparound | ? | [ ] | |
+| ST-7 | med | `storage/vm.go:PageAllVisible/PageAllFrozen` — plain XID comparison breaks under wraparound | BUG | [x] | this commit |
 | ST-8 | med | `storage/freeze.go:PageFreezeOldTuples` — plain XID comparison breaks under wraparound | ? | [ ] | |
 | NB-2 | med | `pglz/pglz.go:Decompress` — match length clamped instead of erroring on corrupt streams | ? | [ ] | |
 | TA-2 | med | `transam/manager.go:AssignXID` — non-atomic read-check-allocate-store allows XID leak/double-assign | ? | [ ] | |
@@ -317,3 +317,15 @@ landed.
   `TestLimitZeroWithTiesReturnsNoRowsFast` (BuildFast) — each was verified
   red by stashing only its own sibling's file. Gates: units green; TPC-DS
   SF0.5 sweep PASS=95 MISMATCH=0; TPC-H spotcheck Q12/Q13 PASS.
+
+- 2026-09-01 **ST-7 = BUG (fixed).** `PageAllVisible` and `PageAllFrozen`
+  compared each tuple's xmin against the horizon with a plain unsigned
+  `>=`. XIDs are a circular 32-bit space: once the counter wraps, every
+  pre-wraparound xmin (numerically huge) reads as NEWER than the small
+  post-wrap horizon, so VACUUM could never set ALL_VISIBLE / ALL_FROZEN on
+  an old page again — index-only scans lose their visibility fast path and
+  freezing stalls exactly when wraparound pressure is highest. PG compares
+  with `TransactionIdPrecedes` (heap_page_is_all_visible). Fix: use the
+  repo's existing circular primitive `XIDPrecedes` (same primitive as the
+  ST-2 fix). Guard: `TestPageAllVisibleAcrossWraparound`. Gates: units
+  green; pgbench smoke green (commit hook).
