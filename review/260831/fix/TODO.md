@@ -49,7 +49,7 @@ not, with the reason) / empty (not judged yet).
 | EO2-7 | executor-operators-2 | medium | `operators_indexonly.go:decodeRowFromKey` / `operators_indexonly.go:decodeRowFromHeap` — per-row map allocation + O(covered × columns) projection | ADOPT (not measurable end to end) | removes a map[string]Datum allocated per row plus the per-row name lookups | same projection, same errors; the IOS tests pass | positions resolved once per scan; the map-based projectCovered is gone rather than left beside the new path | [x] fixed |
 | EO2-8 | executor-operators-2 | medium | `operators_generated.go:evalGeneratedExpr` — re-parses expression string per row | ADOPT | 200 rows into a table with one generated column: 1.85ms -> 0.77ms (2.4x), 456KB / 8844 allocs -> 275KB / 5645 | evalGenExpr only READS the tree, and the key is the expression text, so a changed column definition lands on a different key | one sync.Map behind an accessor | [x] fixed |
 | EO2-9 | executor-operators-2 | medium | `operators_storage.go:checkUniqueIndexesForInsert` / `maintainUniqueIndexesForInsert` — per-row per-index btree open | REJECT (risk over reward) | measured: openIndexBTree is 159 ns / 416 B / 2 allocs per row per index — about 1-3% of a row insert | caching a tree across rows means invalidating it on index DDL, a CONCURRENTLY swap or a relfilenode change mid-statement; getting that wrong writes entries into the wrong tree | — | [x] no change |
-| EO2-11 | executor-operators-2 | medium | `operators_join_agg.go:aggregateOp.Open` — per-row allocations for group key values | | | | | [ ] |
+| EO2-11 | executor-operators-2 | medium | `operators_join_agg.go:aggregateOp.Open` — per-row allocations for group key values | REJECT (empirically unsafe) | the two per-row vectors do look throwaway — every consumer copies them into the group own slice | NOT throwaway: the sorted-grouping path keeps the PREVIOUS row key vector to detect the group boundary (`sameGroupKey(curParts, parts)`). Reusing the buffers was written and measured (20,199 vs 28,197 allocs) and REVERTED — it fails TestAggSortedGrouping, TestAggregateOrderByPerGroup and the two index-ordered grouping tests | — | [x] no change |
 | EO2-12 | executor-operators-2 | medium | `operators_merge.go:mergedRow` — per-candidate-pair allocation | ADOPT | 400 target x 100 source rows: 6.47ms -> 4.34ms (1.5x), 9.10MB / 83,476 allocs -> 1.40MB / 43,476 (exactly the 40,000 pairs) | nothing retains the concatenated row — the pending mod stores its own copies of the source and target rows — so one scan buffer serves the whole page | one helper next to mergedRow, which stays for the callers that do need an owned row | [x] fixed |
 | EO2-14 | executor-operators-2 | medium | `operators_project_set.go:openSelectSrfMode` — per-step output row allocation | REJECT (not waste) | the per-step rows ARE the operator output: openSelectSrfMode materialises them into o.rows and Next hands them out, so each allocation is a retained row, not a temporary | — | — | [x] no change |
 | EO2-24 | executor-operators-2 | medium | `slot.go:asSlot` (callers: nextMerge, recursiveUnionOp, workTableScanOp) — MaterializedSlot allocated per emitted row | ADOPT | GROUP BY over 1000 groups: 2.54ms -> 2.39ms, 29,197 -> 28,197 allocs (exactly one per emitted row), 2.23MB -> 2.17MB | the established slot-reuse idiom and its documented "valid until the next Next()" contract (indexScanOp, M0092-0007) | one field per operator, four call sites | [x] fixed |
@@ -63,7 +63,7 @@ not, with the reason) / empty (not judged yet).
 | OP1-3 | optimizer-1 | medium | `cardinality.go:EstimateRows` — no memoization on recursive estimates | REJECT (unsafe to memoize) | within one call the recursion visits each node once; the repetition comes from the join search calling it on many candidate subtrees | a memo keyed by node pointer goes stale the moment a rewrite mutates a node, and the search builds fresh nodes per candidate anyway | — | [x] no change |
 | OP2-3 | optimizer-2 | medium | foldconst.go:FoldConstants — Always allocates fresh nodes/slices even when nothing folds | REJECT (contract risk) | planning-time only, once per query | FoldConstants returning fresh nodes is what makes the later in-place rewrites safe; returning the input when nothing folded would alias the caller tree, and every mutating pass would have to be surveyed first | — | [x] no change |
 | OP2-11 | optimizer-2 | medium | joinsearchseam.go:tryPGShapedJoinSearch — searchConsumes rebuilds restrict infos per conjunct | REJECT (planning-time) | rebuilding restrict infos per conjunct inside the join search is O(conjuncts x clauses) with both counts small | threading a prebuilt set through the search seam risks feeding a candidate the wrong clause set — a plan-shape bug | — | [x] no change |
-| OP2-12 | optimizer-2 | medium | joinselectivity.go:examineJoinVar / columnStatsByName — Linear column lookup per operand | | | | | [ ] |
+| OP2-12 | optimizer-2 | medium | joinselectivity.go:examineJoinVar / columnStatsByName — Linear column lookup per operand | REJECT (planning-time) | a linear column lookup per join-selectivity operand, during planning | same class as the other planner walks: microseconds per plan, and the fix is threading resolved column stats through the estimator seam | — | [x] no change |
 | OP2-14 | optimizer-2 | medium | pathbitmap.go:chooseBitmapAnd — costBitmapTree recomputed inside sort comparator | ADOPT (small, no benchmark) | the comparator recomputed each candidate cost O(log n) times and costBitmapTree walks the whole bitmap tree; n is small in practice, so no measurable planning win is claimed | same ordering — the same costs, computed once | strictly less work, same shape | [x] fixed |
 | OP2-18 | optimizer-2 | medium | scan_input_rewrite.go:absorbConjunctsIntoSubtree — Re-walks the whole subtree per matching conjunct | REJECT (planning-time) | the re-walk is O(conjuncts x subtree nodes), both small in practice | the pass decides WHERE a predicate lands, which is plan correctness; restructuring it for microseconds is a bad trade | — | [x] no change |
 | OP2-20 | optimizer-2 | medium | pushdown.go:pushOneConjunct — Per-conjunct whole-tree walks at every recursion level | REJECT (planning-time) | same shape as OP2-18: 20 conjuncts over a 20-node tree is 400 visits, microseconds | same risk: pushdown placement is correctness | — | [x] no change |
@@ -72,12 +72,12 @@ not, with the reason) / empty (not judged yet).
 | XL-8 | xlog | medium | iterator.go:readOneAt — record header bytes read twice | REJECT (mitigated, and splitting the read is delicate) | the header bytes are still read twice, but after XL-9 that is a second pread on a cached handle rather than a second open | reading the remainder separately means re-deriving the page-header walk for a partial read — the arithmetic that decides where a record continues after a page boundary | — | [x] no change |
 | XL-9 | xlog | medium | iterator.go:readBytesAt / readRecordBytesAt / readSegmentSlice — per-record allocation + per-chunk file open | ADOPT (no micro-benchmark) | the segment file was opened and closed on EVERY read, and readOneAt reads twice per record — two open/close pairs per replayed record. The handle is cached on the iterator and closed with it | reads are the same pread calls on the same bytes; a failed read drops the handle so the next read re-opens | one cached handle + Close; the uncached helper is gone rather than left beside it | [x] fixed |
 | XL-14 | xlog | medium | format.go:encodeRecordXLog / wrapXLogMainData — two allocations per WAL record | ADOPT | 64-byte payload 84.5 ns -> 51.8 ns (1.6x), 4096-byte payload 1.75us -> 0.92us (1.9x), 2 allocs -> 1 | the emitted bytes are identical; the chunk header is written in place instead of in a temporary | `wrapXLogMainData` is gone rather than left as a second, unused copy of the rule | [x] fixed |
-| XL-21 | xlog | medium | pg_assembled_emit.go — envelope + body + mainData allocation chain per PG record | | | | | [ ] |
+| XL-21 | xlog | medium | pg_assembled_emit.go — envelope + body + mainData allocation chain per PG record | ADOPT | one pre-assembled PG record: 157.5 ns -> 109.2 ns (1.44x), 3 -> 2 allocs, 432 B -> 288 B | a test compares the framed assembly byte-for-byte against assemble-then-frame, with no image, a holed image and a whole-page image | the envelope is a prefix argument; 23 emit sites collapse to one call each | [x] fixed |
 | XL-24 | xlog | medium | pg_xlog_decode.go:parseXLogRecordData — cloneXLogBytes per block/main-data chunk | REJECT (the copy is the boundary) | one copy per block/main-data chunk during decode | those copies are what make a decoded record independent of the reader buffer; removing them means proving every caller passes a freshly allocated buffer AND accepting that a retained record pins the whole record buffer | — | [x] no change |
 | XL-25 | xlog | medium | pgoutput.go:pgoPhysEpoch — reconstructs the PG epoch per column decode | ADOPT (small) | 9.79 ns -> 0.90 ns per call (10.8x); called per decoded timestamp column | a package-level value instead of rebuilding the same time.Time | one var | [x] fixed |
 | XL-31 | xlog | medium | reader.go:readStreamFrom — stream slice grows without a capacity hint | ADOPT (no micro-benchmark) | a WAL segment is 16MB and there is usually more than one, so growing from zero capacity re-copied the whole stream at every doubling; the first segment size is known up front | pure capacity hint, the bytes are identical | one argument to make() | [x] fixed |
 | XL-38 | xlog | medium | reorder.go:foldChanges — allocates a copy even when nothing folds | ADOPT | the common no-fold case: 6244 ns -> 117 ns (53x), 24,576 B -> 0 allocs | two tests pin both paths: no fold returns the input, and a fold in the middle still produces the UPDATE with its neighbours intact | one scan before the allocation | [x] fixed |
-| XL-39 | xlog | medium | recovery.go:Decode* helpers — defensive tuple copies per record | | | | | [ ] |
+| XL-39 | xlog | medium | recovery.go:Decode* helpers — defensive tuple copies per record | REJECT (the copy is the boundary) | defensive tuple copies per decoded record during recovery | same as XL-24: the copies are what make a decoded record independent of the reader buffer. Removing them needs proof that every caller passes a fresh buffer and does not outlive it — on the recovery path, for a few hundred bytes per record | — | [x] no change |
 | XL-50 | xlog | medium | slots.go:writeSlotLocked — full rewrite + double fsync per slot update | REJECT (PG-faithful durability) | not waste: `postgres/src/common/file_utils.c durable_rename` fsyncs the file under its NEW name after the rename AND the parent directory, which is exactly what writeSlotLocked does | removing either fsync weakens slot durability below upstream | — | [x] no change |
 | XL-68 | xlog | medium | xlog_assemble.go:assembleXLogRecord — header/payload built via repeated append with no capacity hint | ADOPT | one block ref: 207 ns -> 107 ns (data only), 293 ns -> 132 ns (image with a hole), 6.5us -> 3.1us (whole-page image); 6-8 allocs -> 2 | byte-identical output; the WAL/pg_waldump parity tests in the package cover it | sizes computed up front by one shared hole helper, so the estimate cannot drift from what is written | [x] fixed |
 | IN-4 | initdb | medium | `pg_aggregate_view.go:registerPgAggregateView` — pgAggregateInitialEntries() rebuilt on every query | ADOPT | one query against pg_aggregate: 96.2us -> 6.3us (15.3x), 87.6KB / 1515 allocs -> 9.5KB / 28 | the BKI half is constant; consumers only read the rows (they build their own Row per output), so sharing the cached slices is safe | one sync.OnceValue and a shorter closure | [x] fixed |
@@ -101,8 +101,8 @@ not, with the reason) / empty (not judged yet).
 | NB-15 | nbtree-amcheck | low/medium | `amcheck/heapallindexed.go:fingerprintLeafEntry` — a fresh buffer allocation per element, twice per element | REJECT (finding does not reproduce) | measured: the per-entry buffer does NOT allocate — escape analysis keeps it on the stack (2 allocs/op either way), and a buffer-reusing variant measured no faster (698us vs 668us for 5000 entries). The change was written, measured, and REVERTED | — | — | [x] no change |
 | NB-17 | nbtree-amcheck | high | `pglz.go:Compress` — brute-force O(n·window·matchlen) match search | ADOPT | 64KiB inputs: random 377ms -> 1.0ms (379x), nodetree 8.1ms -> 0.26ms (32x), text 30.0ms -> 1.5ms (20x) | the output is now byte-identical to upstream pglz_compress (golden test); the ratio worsens slightly (below) | same hash chain + good_match/good_drop as upstream pg_lzcompress.c, with PG defaults | [x] fixed |
 | NB-18 | nbtree-amcheck | low/medium | `pglz.go:Decompress` — byte-by-byte run-length copy even for non-overlapping matches | ADOPT | text 78.9us -> 43.6us (1.8x), nodetree 44.6us -> 26.1us (1.7x) | overlapping matches (off < length) keep the byte loop; the round-trip test pins it | one added branch | [x] fixed |
-| NB-19 | nbtree-amcheck | low/medium | `backup/basebackup.go:baseBackupStreamer.Write` / `streamBackupManifest` — fresh frame buffer allocated per chunk | | | | | [ ] |
-| NB-20 | nbtree-amcheck | low/medium | `backup/basebackup.go:emitBaseBackupTar` / `emitTablespaceTar` — whole-file buffering | | | | | [ ] |
+| NB-19 | nbtree-amcheck | low/medium | `backup/basebackup.go:baseBackupStreamer.Write` / `streamBackupManifest` — fresh frame buffer allocated per chunk | ADOPT | streaming 1 MiB of backup: 163.7us -> 34.7us (4.7x), 1,180,730 B / 16 allocs -> 228 B / 0 | WriteCopyData writes the frame synchronously and keeps nothing, so one buffer serves every chunk | one field on the streamer, one local in the manifest path | [x] fixed |
+| NB-20 | nbtree-amcheck | low/medium | `backup/basebackup.go:emitBaseBackupTar` / `emitTablespaceTar` — whole-file buffering | REJECT (needs streaming, not a buffer tweak) | real: a whole relation file (up to 1 GB) is read into memory before it is written into the tar stream | the fix is to stream the file through a fixed-size buffer, which changes how tar headers and sizes are produced and how errors mid-file are reported | feature-sized; recorded as deferred | [ ] deferred |
 | TA-1 | transam | medium | `manager.go:captureSnapshot` — Full copy of `abortedXIDs` on every snapshot capture | ADOPT | with 10,000 aborts: 15.0us -> 1.13us (13x), 41KB -> 89B per snapshot | honours the existing contract that Aborted is immutable after capture; the insert side became copy-on-write | contained in one insert helper | [x] fixed |
 | TA-2 | transam | medium | `manager.go:SnapshotFor` — Deep-`Clone()` of the pinned snapshot on every RR/SSI statement | ADOPT | per statement in RR/SSI: 9.7 ns -> 1.4 ns with no aborts, 116 ns -> 1.4 ns with 100 aborts, 6.9us -> 1.4 ns (41KB -> 0) with 10,000 | rests on the invariant WithCLog already documents: the XID arrays are immutable after capture. captureSnapshot builds fresh slices and insertSortedXID is copy-on-write (TA-1); nothing else writes them | Clone keeps its name and contract, with the invariant spelled out | [x] fixed |
 | TA-8 | transam | medium | `multixact/store.go:Members` — Allocates + copies the member slice on every call, and takes the global mutex | ADOPT (small) | serial unchanged (18.7 -> 18.5 ns), 16-way parallel 32.5 ns -> 25.3 ns (1.29x); the map lookup and the member copy dominate, so the lock was not the whole cost | reads only; `go test -race` on the package passes | Mutex -> RWMutex, three call sites | [x] fixed |
@@ -1383,3 +1383,49 @@ tree the planner rewrites in place (the OP2-3 staleness problem) or threading
 prebuilt state through a seam that decides WHERE a predicate lands. Those are
 plan-correctness mechanisms; trading a microsecond for a chance of the wrong
 plan is the wrong direction.
+
+### XL-21 / NB-19 — ADOPT; NB-20 / EO2-11 / OP2-12 / XL-39 — REJECT
+
+**XL-21** — a pre-assembled PG record was assembled into one buffer and then
+copied again into a second buffer carrying the 7-byte goopg envelope. The
+envelope is now passed to the assembler as a prefix, so the record is built in
+one allocation. 23 emit sites that had the shape "assemble, check err, frame"
+became a single `framedAssemble` call each.
+
+| one record | before | after |
+|---|---|---|
+| | 157.5 ns, 432 B, 3 allocs | 109.2 ns, 288 B, 2 allocs |
+
+`TestFramedAssembleMatchesFrameOfAssemble` compares the bytes against
+assemble-then-frame for a record with no image, one with a holed image and one
+with a whole-page image.
+
+**NB-19** — the base-backup CopyData path allocated a fresh 64 KiB payload
+buffer per chunk, on both the tar stream and the manifest stream, although
+`WriteCopyData` writes the frame synchronously and keeps nothing.
+
+| streaming 1 MiB | before | after |
+|---|---|---|
+| | 163,683 ns, 1,180,730 B, 16 allocs | 34,653 ns, 228 B, 0 allocs |
+
+**NB-20 — REJECT (deferred).** Reading a whole relation file (up to 1 GB) into
+memory before writing it into the tar stream is real, but the fix is to stream
+through a fixed-size buffer, which changes how tar headers and sizes are
+produced and how a mid-file error is reported. That is a feature, not a
+per-finding fix.
+
+**EO2-11 — REJECT, empirically.** The two per-row vectors look throwaway —
+every consumer copies them into the group's own slice — so reusing them was
+written and measured (28,197 -> 20,199 allocations on the GROUP BY benchmark).
+It is wrong: the sorted-grouping path keeps the PREVIOUS row's key vector to
+detect the group boundary (`sameGroupKey(curParts, parts)`), so a reused buffer
+compares a row against itself. `TestAggSortedGrouping`,
+`TestAggregateOrderByPerGroup` and both index-ordered grouping tests fail. The
+change was reverted; a correct version would have to give the sorted path its
+own vector, which is most of the allocation back.
+
+**OP2-12 / XL-39 — REJECT.** OP2-12 is a linear column lookup per
+join-selectivity operand during planning — the same microseconds-per-plan class
+as the other planner walks, against threading resolved stats through the
+estimator seam. XL-39's defensive tuple copies are, like XL-24's, the boundary
+that makes a decoded record independent of the reader's buffer.
