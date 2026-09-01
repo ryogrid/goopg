@@ -139,8 +139,22 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	}
 
 	// Scan the B-tree and feed TIDs into the bitmap.
+	//
+	// review/260831 EO1-7: this used to wrap each TID in a one-element slice
+	// and call tbmAddTuples, allocating once per index entry — a bitmap index
+	// scan over a million matching rows allocated a million single-element
+	// slices to throw away. addOne is what tbmAddTuples loops over anyway; the
+	// two things it does before that loop (create the entry map, remember that
+	// recheck was requested) are done here instead, and recheckAny is still
+	// only set when a tuple is actually added, as it was.
+	if tbm.entries == nil {
+		tbm.entries = make(map[storage.BlockNumber]*pageEntry)
+	}
 	scanFn := func(_ []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
-		tbmAddTuples(tbm, []storage.ItemPointer{ptr}, recheck)
+		if recheck {
+			tbm.recheckAny = true
+		}
+		tbm.addOne(ptr.Block, ptr.Offset, recheck)
 		return true, nil
 	}
 	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, false, false, scanFn); err != nil {
