@@ -9182,7 +9182,7 @@ func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *Colu
 	idxCost := costIndexScan(cp, in)
 	bmIdxCost := costBitmapIndexScan(cp, in)
 	tuples := clampRowEst(sel * relTuples)
-	pages := computeBitmapPages(tuples, T, indexPages, T, cp.effectiveCacheSize, bitmapMaxEntries(cp.workMem))
+	pages, tuples := computeBitmapPages(tuples, relTuples, T, indexPages, T, cp.effectiveCacheSize, bitmapMaxEntries(cp.workMem))
 	bm := costBitmapHeapScan(cp, bmIdxCost, pages, tuples, T)
 	if bm.Total >= idxCost.Total {
 		return nil
