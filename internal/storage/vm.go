@@ -158,7 +158,11 @@ func PageAllVisible(p Page, horizon TransactionID) bool {
 		if off < 0 || ln < 0 || off+ln > len(p) {
 			return false
 		}
-		t, err := ParseHeapTuple(p[off : off+ln])
+		// review/260831 ST-2: only the header is read below, and t does not
+		// escape the iteration — the caller (VACUUM's per-page pass) holds the
+		// page pinned and content-locked across the call, so the aliasing
+		// decode is safe and skips two copies per tuple.
+		t, err := parseHeapTupleAlias(p[off : off+ln])
 		if err != nil {
 			return false
 		}
@@ -207,7 +211,11 @@ func PageAllFrozen(p Page, freezeBelow TransactionID) bool {
 		if off < 0 || ln < 0 || off+ln > len(p) {
 			return false
 		}
-		t, err := ParseHeapTuple(p[off : off+ln])
+		// review/260831 ST-2: only the header is read below, and t does not
+		// escape the iteration — the caller (VACUUM's per-page pass) holds the
+		// page pinned and content-locked across the call, so the aliasing
+		// decode is safe and skips two copies per tuple.
+		t, err := parseHeapTupleAlias(p[off : off+ln])
 		if err != nil {
 			return false
 		}
