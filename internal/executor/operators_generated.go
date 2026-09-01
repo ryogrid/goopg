@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -80,19 +81,42 @@ func applyDefaultsForMissing(cols []catalog.Column, row Row, missing []bool, dbO
 // against the current row.  Column references are resolved by name against
 // the provided cols slice.
 func evalGeneratedExpr(exprStr string, cols []catalog.Column, row Row) (Datum, error) {
+	expr, err := generatedExprAST(exprStr)
+	if err != nil {
+		return NullDatum, err
+	}
+	return evalGenExpr(expr, cols, row)
+}
+
+// generatedExprCache maps a generated column's expression TEXT to its parsed
+// expression.
+//
+// review/260831 EO2-8: the text was re-parsed for every row written — a full
+// parser run per generated column per INSERT/UPDATE. The stored expression text
+// is fixed by the column definition, and evalGenExpr only READS the tree (it is
+// a recursive evaluator, not a rewriter), so one parse per distinct expression
+// is enough. The key set is bounded by the schema's generated columns.
+var generatedExprCache sync.Map // string -> parser.Expr
+
+func generatedExprAST(exprStr string) (parser.Expr, error) {
+	if v, ok := generatedExprCache.Load(exprStr); ok {
+		return v.(parser.Expr), nil
+	}
 	// Wrap in SELECT so the parser can produce a full statement.
 	stmts, err := parser.Parse("SELECT " + exprStr)
 	if err != nil {
-		return NullDatum, fmt.Errorf("generated column expr parse: %w", err)
+		return nil, fmt.Errorf("generated column expr parse: %w", err)
 	}
 	if len(stmts) == 0 {
-		return NullDatum, fmt.Errorf("generated column expr: empty")
+		return nil, fmt.Errorf("generated column expr: empty")
 	}
 	sel, ok := stmts[0].(*parser.SelectStmt)
 	if !ok || len(sel.Targets) == 0 {
-		return NullDatum, fmt.Errorf("generated column expr: not a select")
+		return nil, fmt.Errorf("generated column expr: not a select")
 	}
-	return evalGenExpr(sel.Targets[0].Expr, cols, row)
+	expr := sel.Targets[0].Expr
+	generatedExprCache.Store(exprStr, expr)
+	return expr, nil
 }
 
 // evalGenExpr is a recursive evaluator for simple expressions used in

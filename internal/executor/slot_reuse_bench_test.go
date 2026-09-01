@@ -78,3 +78,28 @@ func BenchmarkMergeOnCondition(b *testing.B) {
 			"WHEN MATCHED THEN UPDATE SET v = s.v")
 	}
 }
+
+// BenchmarkGeneratedColumnInsert measures writing rows into a table with a
+// generated column (review/260831 EO2-8): the stored expression text used to be
+// re-parsed for every row.
+func BenchmarkGeneratedColumnInsert(b *testing.B) {
+	ctx, cleanup := newVMFixture(b)
+	defer cleanup()
+	run := func(sql string) { benchExecSQL(b, ctx, sql) }
+
+	run("CREATE TABLE genbench (id int, v int, doubled int GENERATED ALWAYS AS (v * 2 + 1) STORED)")
+	const n = 200
+	var vals strings.Builder
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			vals.WriteString(",")
+		}
+		fmt.Fprintf(&vals, "(%d, %d)", i, i)
+	}
+	stmt := "INSERT INTO genbench (id, v) VALUES " + vals.String()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		run(stmt)
+	}
+}
