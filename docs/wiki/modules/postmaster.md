@@ -404,9 +404,9 @@ materializes ALL rows into `extendedQueryResult`), then drains the portal by
 `twophase.go` implements `PREPARE TRANSACTION` / `COMMIT PREPARED` /
 `ROLLBACK PREPARED`:
 
-- `preparedState` map: `globalGID` → `*preparedTransaction` (with tx, snap,
+- `preparedState` map: `global/2PC transaction tracking` → `*preparedTransaction` (with tx, snap,
   xid, preparedTime, tempTables, etc.).
-- `PreparedTransactionCount` returns the count for `pg_prepared_xacts`.
+- `transaction count helpers` returns the count for `pg_prepared_xacts`.
 - `PrepareTransaction` persists the transaction state to a sidecar file under
   `pg_twophase/` using the `pg_twophase` format.
 - `CommitPrepared` / `RollbackPrepared` replay the state from the file.
@@ -446,8 +446,8 @@ type notifyHub struct {
 
 `QueueNotify` enqueues a notification into `pending` for the session.
 `bufferNotify`/`notifySavepoint`/`notifyReleaseSavepoint`/`notifyRollbackToSavepoint`
-handle savepoint scoping of buffered notifications. `deliverNotifies` scans
-`pending` and routes matching listeners. `ConnTxState` carries `pendingNotifications`
+handle savepoint scoping of buffered notifications. `deliverNotifications` scans
+`pending` and routes matching listeners. `ConnTxState` carries `pendingNotify`
 for the savepoint scope.
 
 ## DDL bypass chain reference
@@ -627,7 +627,7 @@ the catalog `Type`:
 - `text`/`varchar`/`bpchar`/`char` → raw bytes.
 - `date`/`time`/`timestamp`/`timestamptz` → `appendTimeText` with the
   session DateStyle.
-- `numeric` → `FormatNumeric`.
+- `numeric` → `numeric/float formatting`.
 - `bool` → `t`/`f`.
 - `bytea` → `\x...` hex (or escape format per `bytea_output`).
 

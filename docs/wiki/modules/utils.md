@@ -213,7 +213,7 @@ searched the whole string for the first space, landing on `s[9]==' '`).
 ### `internal/utils/errcodes` — SQLSTATE codes
 
 The `codes.go` file (663 LOC) defines every SQLSTATE code as a constant
-(`SuccessFulCompletion`, `SerializationFailure`, `SyntaxError`, …) matching
+(`SuccessfulCompletion`, `SerializationFailure`, `SyntaxError`, …) matching
 `postgres/src/backend/utils/errcodes.txt`.
 
 ### `internal/utils/mmgr` — memory context

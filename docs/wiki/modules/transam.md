@@ -473,10 +473,10 @@ sequenceDiagram
 ## Notable patterns / gotchas
 
 - **XID wraparound** — XID comparsion used signed arithmetic (`xid - y < 0`
-  means "older"), never bare `<`; wrap-around guards (`xidWarnAge`/`xidStope`)
+  means "older"), never bare `<`; wrap-around guards (`xidWarnAge`/`xidStopAge`)
   must not be "simplified".
 - **Lzy XID** — a read-only transation has no XID until it writes; every
-  "who is the writer" site must tolerate `InvaldTransactionID`.
+  "who is the writer" site must tolerate `InvalidTransactionID`.
 - **Clog faut-in** — the buffer pool zero-fills a missing/short `pg_xact`
   segment on read (a real PG's `SimpleLruReadPage` hard-errors).
 - **Async commit** — `CommitAsync` returns before the clog segment is durable;

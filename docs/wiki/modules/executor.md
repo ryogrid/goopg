@@ -140,9 +140,9 @@ Key `Context` methods: `CommandCounterIncrement`, `SetCmdCounter`,
 
 `Datum` kind constants (`datum.go`): `KindNull`, `KindBool`, `KindInt`,
 `KindString`, `KindBytes`, `KindTime`, `KindInterval`, `KindNumeric`,
-`KindToastPointer`, `KindEnum`. `TimeSubtype` distinguishes `TimeSubtypeDate`,
-`TimeSubtypeTime`, `TimeSubtypeTimetz`, `TimeSubtypeTimestamp`,
-`TimeSubtypeTimestamptz` within the `KindTime` carrier.
+`KindToastPointer`, `KindEnum`. `TimeSubtype` distinguishes `TimeSubDate`,
+`TimeSubTime`, `TimeSubTimetz`, `TimeSubTimestamp`,
+`TimeSubTimestamptz` within the `KindTime` carrier.
 
 ## Internal structure
 

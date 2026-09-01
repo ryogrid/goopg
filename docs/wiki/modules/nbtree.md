@@ -4,7 +4,7 @@ The **B-tree index access method** — a faithful port of PostgreSQL's
 `nbtree` (`src/backend/access/nbtree/`). It implements search, insert, page
 split, deduplication, posting-list compression, and WAL-logged mutations, all
 in a **PG-18 byte-identical on-disk format** (8 KiB pages, BTPageOpaque layout,
-pivot / posting-list items, `BtMetaPageData`).
+pivot / posting-list items, `pgMetaPageData`).
 
 This is the index layer that `CREATE INDEX` builds, `SELECT`/`UPDATE`/`DELETE`
 scans, and VACUUM purges dead entries from. All operator-facing code paths
@@ -25,7 +25,7 @@ flowchart TD
         TRACE[insert/rewrite/flush tracing]
     end
     subgraph page_layer
-        META[BtMetaPageData]
+        META[pgMetaPageData]
         OPAQUE[BTPageOpaque]
         ITEMS[PageItem / PageItemKeys]
         POST[posting-list]
@@ -66,13 +66,13 @@ flowchart TD
 |---|---|---|
 | `btree.go` | 4,227 | `BTree` struct: `Open`/`OpenWithOptions`/`Create`/`Search`/`Insert`/`RangeScan`/`RangeScanWithPos`, page pinning (`pinR`/`pinW`), descent (`descendToLeaf`), split (`finishSplit`/`createNewRoot`/`refillDeduplicated`), dedup (`dedupConsolidate`), page-item iteration (`pageItems`/`PageItemKeys`), block recycling (`pinNewOrRecycled`/`recycleBlock`/`popRecycledBlock`), `Options` |
 | `btree_vacuum.go` | 1,508 | Index vacuum: `btreeVacuumIndex`, `readInternalFirstChildBlock`, dead-item cleanup |
-| `bulkload.go` | 835 | Bulk-load construction (`bulkload` / `buildBulkLoadTree`) for `CREATE INDEX` and sorted inserts |
+| `bulkload.go` | 835 | Bulk-load construction (`bulkload` / `bulk-load tree built`) for `CREATE INDEX` and sorted inserts |
 | `pgtuple.go` | 748 | Tuple encoding/decoding: `PGBTItemRaw`/`PGBTPivotRaw`, key-at-prefix, posting-list entry marshal |
 | `replay.go` | 601 | WAL redo replay for btree opcodes (insert, split, dedup, delete, newroot, mark-page-halfdead, unlink-page, vacuum, meta-cleanup, reuse-page) |
 | `pgcompare_types.go` | 568 | Per-type key comparison functions (int4, int8, int128, numeric, varchar, char, timestamp, float8, oid, uuid, inet, enum, text, bpchar, bytea, date, time, timetz) |
-| `posting.go` | 396 | Posting-list helpers: `SwapPosting`, `PGBTPostingRaw`, `PostingLen`, `PostingDecode`, `PostingEncode` |
+| `posting.go` | 396 | Posting-list helpers: `SwapPosting`, `PGBTPostingRaw`, `postingBounds`, `parsePostingRaw`, `marshalPosting` |
 | `pgsplitleft.go` | 374 | Left split page construction (`pgsplitleft`, posting-aware refill) |
-| `pgpage.go` | 343 | B-tree page opaque data (`BTPageOpaque`), line-pointer helpers, `PageItemID`/`PGBTCycleId` |
+| `pgpage.go` | 343 | B-tree page opaque data (`BTPageOpaque`), line-pointer helpers, `item pointer / line pointer`/`btpo_cycleid field` |
 | `pgcompare.go` | 332 | Key comparison dispatch: `CompareKeys`, `indexFormat.compare` |
 | `pgitemcodec.go` | 278 | Item codec: `encodeItem`/`decodeItem`, `itemEncodedSize`, key-datum flattener, suffix truncation |
 | `pgformat.go` | 265 | Index format descriptors: `indexFormat` with `pageItems`/`parse`/`compare`/`encode`/`decode` by type family |
@@ -83,7 +83,7 @@ flowchart TD
 | `pgnewroot.go` | 144 | New-root creation (`pgnewroot`) |
 | `pgsplit.go` | 108 | Split-point selection (`pgsplit`) |
 | `dead_purge.go` | 103 | Dead-item purge |
-| `lpdead_kill.go` | 80 | `killTID` / `killRange` for LP_DEAD entry reuse |
+| `lpdead_kill.go` | 80 | `KillItems` / `KillItems` for LP_DEAD entry reuse |
 | `latch_release.go` | 79 | Latch-based page-lock release for concurrent access |
 | `parse_err_dump.go` | 79 | Page-dump helper for corrupt-page diagnostics |
 
@@ -97,8 +97,8 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error)   // poin
 func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error
 func (bt *BTree) RangeScan(lo, hi []byte, fn func(key, ptr) bool) error
 func (bt *BTree) RangeScanWithPos(lo, hi []byte, loExclusive, hiExclusive bool, ...) error
-func (bt *BTree) BtreeVacuumIndex(pool, vis, ctx) error
-func (bt *BTree) Bulkload(sortedKeys []BulkloadEntry) error
+func (bt *BTree) VacuumIndexPages(pool, vis, ctx) error
+func (bt *BTree) BulkCreate(sortedKeys []BulkCreateEntry) error
 type Options struct{ FillFactor int; DeduplicateItems *bool; FastUpdate *bool; ... }
 func (bt *BTree) Format() IndexFormat
 func (bt *BTree) Stats() BTreeStats / ResetStats() / RecycledPageCount() int
@@ -146,7 +146,7 @@ func compareItemPointers(a, b storage.ItemPointer) int
 // Posting lists (posting.go, pgitemcodec.go)
 func SwapPosting(p []byte, i, j int)
 func PGBTPostingRaw(key []byte, tids []storage.ItemPointer) []byte
-func PostingLen(raw []byte) int / PostingDecode(raw) / PostingEncode(...)
+func postingBounds(raw []byte) int / parsePostingRaw(raw) / marshalPosting(...)
 type LeafEntry struct{ Key []byte; Tid storage.ItemPointer }
 type LeafItem struct{ ... }
 type Downlink struct{ ... }
@@ -181,7 +181,7 @@ sibling.
 The metapage (block 0) carries:
 
 ```go
-type BtMetaPageData struct {
+type pgMetaPageData struct {
     magic     uint32 // BTreeMagic = 0x0539
     version   uint32 // BTreeVersion = 4
     root      BlockNumber
@@ -300,18 +300,18 @@ layout when it gains a right sibling.
 A posting list packs multiple heap TIDs under one key (`PGBTPostingRaw`).
 `appendSorted` appends TIDs; `SwapPosting` exchanges TIDs during
 insert-into-posting. Dedup (`dedupConsolidate`) collapses same-key items into
-postings. `PostingEncode`/`PostingDecode` handle the binary format.
+postings. `marshalPosting`/`parsePostingRaw` handle the binary format.
 
 The posting-list binary layout: `[4-byte total size][key length varint][key
-bytes][4-byte TID count][TIDs × 6 bytes]`. `PostingLen` reads the total size
+bytes][4-byte TID count][TIDs × 6 bytes]`. `postingBounds` reads the total size
 without decoding the whole body; `SwapPosting` reorders TIDs in place when a
 new TID must be inserted mid-list.
 
 ### Key encoding
 
 `pgformat.go` dispatches per-type encoders/decoders (`EncodeInt4`,
-`EncodeVarchar`, `EncodeNumericKey`, `EncodeTimestamp`, `EncodeUUID`,
-`EncodeInet`, `EncodeEnum`, etc.). The key format is PG-identical (4-byte
+`EncodeVarchar`, `EncodeNumericKey`, `EncodeTimestamp`, `UUID key encode`,
+`inet key encode`, `enum key encode`, etc.). The key format is PG-identical (4-byte
 prefix + datum bytes). `pgitemcodec.go` handles the item encoding:
 `encodeItem` takes a `(key, TID)` pair and produces the on-disk bytes;
 `decodeItem` reverses it. Suffix truncation (`encodeItem` with allowTrunc)
@@ -341,7 +341,7 @@ attribute-by-attribute, treating heap TIDs as the tiebreaker.
 
 `bulkload.go` constructs a sorted B-tree from sorted input, building pages
 bottom-up during `CREATE INDEX` and `B-tree bulk inserts` (e.g., CREATE INDEX
-on a populated table). `buildBulkLoadTree` allocates leaf pages, fills them
+on a populated table). `bulk-load tree built` allocates leaf pages, fills them
 with sorted entries, then constructs internal pages from the leaf high-keys.
 The bulk-load path does NOT WAL-log individual page mutations; it logs the
 whole index creation as a single smgr-create record.
@@ -462,7 +462,7 @@ sequenceDiagram
 - **`initPage` vs `InitPGMetaPage`** — the metapage is initialized by
   `InitPGMetaPage` (which also writes the "all equal" image when the root is a
   single empty page); regular pages go through `initPage`. A metapage written
-  by the wrong path produces an `InvalidMetaPage` on first read.
+  by the wrong path produces an `B-tree metadata page` on first read.
 - **Numeric-key ordering is byte-comparison** — `EncodeNumericKey` must
   preserve PG's numeric ordering under `bytes.Compare`. A sign or exponent
   encoding change that keeps numeric equality but breaks byte ordering

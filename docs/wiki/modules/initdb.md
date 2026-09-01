@@ -65,7 +65,7 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 | `replication_views.go` | 747 | Replication-related pg_catalog view seed rows |
 | `pg_proc_view.go` | 629 | `pg_proc` virtual row helpers |
 | `pgcontrol.go` | 337 | pg_control write (`writePgControl`, `BackupControlImage`, `buildPgControl`) |
-| `xact_recovery.go` | 290 | Transaction recovery: `TransactionIdIsInProgress`, `TransactionIdDidCommit`, abort sweep |
+| `xact_recovery.go` | 290 | Transaction recovery: `XID-in-progress checks`, `TransactionIdDidCommit`, abort sweep |
 | `pg_type_seed_data.go` | 403 | Seed data constants for pg_type (type OID map) |
 | `system_view_oid_pins.go` | 437 | Fixed OID assignments for system views (12000–16383 band) |
 | `pg_cast_bootstrap.go` | 307 | pg_cast bootstrap rows |
@@ -74,7 +74,7 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 | `pg_rewrite_toast_bootstrap.go` | 293 | TOAST for oversized pg_rewrite ev_action blobs |
 | `pg_rewrite_toast_writer.go` | 262 | writer for TOAST pairs |
 | `pg_collation_bootstrap.go` | 120 | pg_collation bootstrap rows |
-| `locale.go` | 245 | Locale resolution (`DetectLocale`, `localeSetings`) |
+| `locale.go` | 245 | Locale resolution (`resolveLocale`, `localeSettings`) |
 | `catalog_cache.go` | — | M0114 fast-start JSON snapshot |
 | `timeline.go` | — | Timeline ID management (`LoadOrCreateTimelineID`) |
 | `wal_bootstrap.go` | — | Bootstrap WA segment (`WriteBootstrapWAL`) |
