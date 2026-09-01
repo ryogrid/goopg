@@ -2,7 +2,22 @@
 
 ## Status
 
-Draft — not yet implemented.
+**IMPLEMENTED and MERGED** — not a draft. The implementation landed in
+`internal/optimizer/geqo.go` (commit `7609d15ef`), wired at
+`relfromjoinlist.go:searchOneProblem` (`GeqoEnabled() && len(items) >=
+GeqoThreshold()`), with the GUC bridge in `cmd/goopg/main.go` and wiki
+documentation in `docs/wiki/modules/optimizer.md`.
+
+Both required agent reviews were performed and are recorded in
+`review/geqo-0190/README.md`:
+
+- **Design-doc review** (pre-implementation): 4 findings, all fixed
+  (the >16 dispatch contradiction, pool-sizing `ceil`/bypass details,
+  line-reference drift, missing initial `sort_pool`).
+- **Implementation review** (post-implementation logic-bug check): 5 findings,
+  all fixed — including one CRITICAL (`mergeClump` missing `setCheapest`
+  meant GEQO could never plan ≥3-relation queries). `go build ./...` and the
+  full `go test ./internal/optimizer/ -count=1` suite PASS after the fixes.
 
 ## Motivation
 
