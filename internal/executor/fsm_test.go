@@ -10,7 +10,7 @@ import (
 
 // newFSMFixture creates an executor context with a fresh FSM wired in,
 // using separate transaction management so multiple commit/begin cycles work.
-func newFSMFixture(t *testing.T) (*Context, func()) {
+func newFSMFixture(t testing.TB) (*Context, func()) {
 	t.Helper()
 	ctx, _, cleanup := newHOTFixture(t)
 	ctx.FSM = storage.NewFSM()

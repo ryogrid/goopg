@@ -1864,7 +1864,14 @@ type aggRuntime struct {
 	// Extended aggregate accumulators (M0097-0007).
 	boolResult bool   // for bool_and / bool_or / every
 	intResult  int64  // for bit_and / bit_or / bit_xor
-	strResult  string // for string_agg
+	strResult  string // for bit_and/bit_or/bit_xor's BIT(n) width tag
+	// strAccum is string_agg's unordered accumulator. review/260831 EO2-1:
+	// this used to be `strResult += delim + piece`, which reallocates and
+	// recopies the whole accumulator per input row — O(n^2) bytes copied for
+	// one group. Appending to a byte slice amortises the growth, and it holds
+	// bytea mode's RAW bytes just as well as text mode's UTF-8 (finishAgg
+	// renders bytea through byteaOutMode at the end either way).
+	strAccum []byte
 	// arrayElems holds the accumulated element format-strings for
 	// array_agg(expr); arrayElemNull[i] marks element i as NULL
 	// (reserved — current applyAgg skips NULL inputs, so this is
@@ -1882,7 +1889,7 @@ type aggRuntime struct {
 	// PostgreSQL sorts the transition inputs before running the transition
 	// function (nodeAgg.c process_ordered_aggregate_single), so the delimiter
 	// that separates two adjacent pieces is the *right-hand* row's own second
-	// argument — which is only knowable after the sort. strResult stays the
+	// argument — which is only knowable after the sort. strAccum stays the
 	// accumulator for the far more common unordered case.
 	strElems    []string
 	strDelims   []string
@@ -2854,7 +2861,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			}
 		}
 	case "string_agg":
-		// string_agg(expr, delimiter) — accumulate in strResult with delimiter.
+		// string_agg(expr, delimiter) — accumulate in strAccum with delimiter.
 		// For bytea values, st.boolResult=true signals bytea mode: the RAW
 		// bytes are accumulated (a Go string is just a byte sequence — no hex
 		// encoding here), and finishAgg's "string_agg" case renders the
@@ -2896,12 +2903,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 				st.hasValue = true
 				break
 			}
-			if !st.hasValue {
-				st.strResult = raw
-				st.hasValue = true
-			} else {
-				st.strResult += delimRaw + raw
+			if st.hasValue {
+				st.strAccum = append(st.strAccum, delimRaw...)
 			}
+			st.strAccum = append(st.strAccum, raw...)
+			st.hasValue = true
 			break
 		}
 		// Text string_agg: evaluate the delimiter from Arg2.
@@ -2925,12 +2931,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			st.hasValue = true
 			break
 		}
-		if !st.hasValue {
-			st.strResult = sv
-			st.hasValue = true
-		} else {
-			st.strResult += delim + sv
+		if st.hasValue {
+			st.strAccum = append(st.strAccum, delim...)
 		}
+		st.strAccum = append(st.strAccum, sv...)
+		st.hasValue = true
 	case "array_agg":
 		// array_agg(expr [ORDER BY sort_list]) — accumulate per-row elements.
 		// NULLs are included as array elements (PostgreSQL semantics).
@@ -3818,7 +3823,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		if !st.hasValue {
 			return NullDatum
 		}
-		out := st.strResult
+		out := string(st.strAccum)
 		// The aggregate's own ORDER BY deferred concatenation to here
 		// (M0125-0019). Each piece carries the delimiter it was collected
 		// with, and PG emits the delimiter of the RIGHT-hand piece between

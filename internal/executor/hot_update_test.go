@@ -13,7 +13,7 @@ import (
 // storage manager and an in-memory catalog. It exposes the
 // storage.Manager so callers can inspect heap pages directly after
 // calling ctx.Pool.FlushAll().
-func newHOTFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
+func newHOTFixture(t testing.TB) (*Context, catalog.Catalog, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
