@@ -1,0 +1,15 @@
+{
+  "name": "mermaid-validator",
+  "version": "1.0.0",
+  "description": "Validate every Mermaid diagram in the goopg wiki (or any given set of Markdown files) using a real headless browser, matching GitHub's client-side rendering.",
+  "type": "module",
+  "main": "validate.mjs",
+  "scripts": {
+    "validate": "node validate.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "mermaid": "^11.17.2",
+    "puppeteer": "^25.9.0"
+  }
+}
