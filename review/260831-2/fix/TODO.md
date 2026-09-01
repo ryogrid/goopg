@@ -55,7 +55,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | IN-2 | med | `initdb/catalog_cache.go:readCatalogCache` — silent partial catalog on TryRegisterUserTable failure | ? | [ ] | |
 | ST-3 | med | `storage/bufpool.go:pinLoad/evictVictim` — dirty victim content discarded when the flush fails | ? | [ ] | |
 | ST-7 | med | `storage/vm.go:PageAllVisible/PageAllFrozen` — plain XID comparison breaks under wraparound | BUG | [x] | 3f13f584e |
-| ST-8 | med | `storage/freeze.go:PageFreezeOldTuples` — plain XID comparison breaks under wraparound | BUG | [x] | this commit |
+| ST-8 | med | `storage/freeze.go:PageFreezeOldTuples` — plain XID comparison breaks under wraparound | BUG | [x] | 8d5028fb3 |
 | NB-2 | med | `pglz/pglz.go:Decompress` — match length clamped instead of erroring on corrupt streams | ? | [ ] | |
 | TA-2 | med | `transam/manager.go:AssignXID` — non-atomic read-check-allocate-store allows XID leak/double-assign | ? | [ ] | |
 | NP-1 | med | `plpgsql/parser.go:parseFor` — FOR-query scan truncates on a `loop` identifier inside the SQL text | ? | [ ] | |
@@ -64,7 +64,7 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | OP1-3 | med | `optimizer/createplannl.go:createNestLoopBitmapJoinPlan` — `bhs.BitmapQual = nil` drops recheck quals | ? | [ ] | |
 | XL-4 | med | `wal/slot_decoder.go:Run` — ConfirmedFlushLSN never advances for PG-format commit records | ? | [ ] | |
 | CP-2 | med | `postmaster/dispatch.go:normalizeSQLPreservingLiterals` — plan-cache key collision on quoted identifiers | ? | [ ] | |
-| UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | ? | [ ] | |
+| UT-1 | med | `utils/activity/registry.go:coldFromBackend` — `BackendStart` never copied; pg_stat_activity.backend_start empty | BUG | [x] | this commit |
 | UT-2 | med | `utils/misc/guc.go:canonicalizeFrom` (TypeReal) — unit suffix / scientific notation mis-parsed | ? | [ ] | |
 | UT-4 | med | `utils/mmgr/mctx.go:Context.Release` — mutates `c.children` while ranging over it | ? | [ ] | |
 | CM-3 | med | `cmd/plan-snapshot/main.go:planEqual` — `rowsRegexp` never matches the real EXPLAIN format | ? | [ ] | |
@@ -340,3 +340,15 @@ landed.
   for both comparisons. Guard: `TestPageFreezeAcrossWraparound` (a
   pre-wrap tuple must be frozen and the post-wrap one reported as
   MinUnfrozenXID). Gates: units green; pgbench smoke green.
+
+- 2026-09-01 **UT-1 = BUG (fixed).** `coldFromBackend` copied every
+  immutable slot field except `BackendStart`, so although
+  postmaster/server.go stamps the connection time at registration, the
+  activity slot kept 0 and `formatNanos(0)` returns "" — every row of
+  pg_stat_activity reported an EMPTY backend_start (PG's is never null;
+  monitoring queries date sessions from it). The field also changes
+  representation at the boundary (RFC3339Nano string in, unix nanos in the
+  slot), which is how the omission stayed invisible. Fix: parse it in
+  `coldFromBackend` (new `parseWallString`) and fall back to registration
+  time when the caller left it unset. Guard:
+  `TestRegisterKeepsBackendStart`. Gates: units green; pgbench smoke green.
