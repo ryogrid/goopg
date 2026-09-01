@@ -419,6 +419,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	registry.OnChange("enable_hashagg", func(value string) {
 		optimizer.SetHashAggEnabled(value == "on" || value == "true" || value == "1")
 	})
+	// GEQO: bridge `SET geqo = off|on` and `SET geqo_threshold = N` to the
+	// planner's process-global atomic knobs, so the GUCs stop being pure
+	// no-op compatibility stubs and actually control the GEQO-vs-DP dispatch.
+	registry.OnChange("geqo", func(value string) {
+		optimizer.SetGeqoEnabled(value == "on" || value == "true" || value == "1")
+	})
+	registry.OnChange("geqo_threshold", func(value string) {
+		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+			optimizer.SetGeqoThreshold(n)
+		}
+	})
 	if *confPath != "" {
 		entries, err := misc.ParseConfigFile(*confPath)
 		if err != nil {
