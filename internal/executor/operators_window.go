@@ -66,23 +66,47 @@ func (o *windowOp) Open(ctx *Context) error {
 	}
 
 	if len(o.plan.PartitionBy) > 0 || len(o.plan.OrderBy) > 0 {
+		// review/260831 EO2-2: the comparator used to call evalExpr twice per
+		// key per comparison, so a window over n rows evaluated the PARTITION
+		// BY / ORDER BY expressions O(n log n) times each instead of once per
+		// row. Evaluate them once up front and sort a permutation over the
+		// precomputed keys, the way sortOp.sortChunk already does. The
+		// comparison rule below is the old one verbatim; only the evaluation
+		// moved.
+		nkeys := len(o.plan.PartitionBy) + len(o.plan.OrderBy)
+		keys := make([][]Datum, len(o.rows))
+		flat := make([]Datum, len(o.rows)*nkeys)
+		for i, row := range o.rows {
+			kv := flat[i*nkeys : (i+1)*nkeys : (i+1)*nkeys]
+			for j, pe := range o.plan.PartitionBy {
+				v, err := evalExpr(pe, row, ctx)
+				if err != nil {
+					return err
+				}
+				kv[j] = v
+			}
+			for j, ok := range o.plan.OrderBy {
+				v, err := evalExpr(ok.Expr, row, ctx)
+				if err != nil {
+					return err
+				}
+				kv[len(o.plan.PartitionBy)+j] = v
+			}
+			keys[i] = kv
+		}
+
 		var sortErr error
-		sort.SliceStable(o.rows, func(i, j int) bool {
+		perm := make([]int, len(o.rows))
+		for i := range perm {
+			perm[i] = i
+		}
+		sort.SliceStable(perm, func(x, y int) bool {
 			if sortErr != nil {
 				return false
 			}
-			for _, pe := range o.plan.PartitionBy {
-				a, err := evalExpr(pe, o.rows[i], ctx)
-				if err != nil {
-					sortErr = err
-					return false
-				}
-				b, err := evalExpr(pe, o.rows[j], ctx)
-				if err != nil {
-					sortErr = err
-					return false
-				}
-				cmp, decided, err := compareSortDatums(a, b, pe.Pos(), false, false)
+			a, b := keys[perm[x]], keys[perm[y]]
+			for j, pe := range o.plan.PartitionBy {
+				cmp, decided, err := compareSortDatums(a[j], b[j], pe.Pos(), false, false)
 				if err != nil {
 					sortErr = err
 					return false
@@ -91,18 +115,9 @@ func (o *windowOp) Open(ctx *Context) error {
 					return cmp < 0
 				}
 			}
-			for _, ok := range o.plan.OrderBy {
-				a, err := evalExpr(ok.Expr, o.rows[i], ctx)
-				if err != nil {
-					sortErr = err
-					return false
-				}
-				b, err := evalExpr(ok.Expr, o.rows[j], ctx)
-				if err != nil {
-					sortErr = err
-					return false
-				}
-				cmp, decided, err := compareSortDatums(a, b, ok.Expr.Pos(), ok.Desc, ok.NullsFirst)
+			off := len(o.plan.PartitionBy)
+			for j, ok := range o.plan.OrderBy {
+				cmp, decided, err := compareSortDatums(a[off+j], b[off+j], ok.Expr.Pos(), ok.Desc, ok.NullsFirst)
 				if err != nil {
 					sortErr = err
 					return false
@@ -119,6 +134,11 @@ func (o *windowOp) Open(ctx *Context) error {
 		if sortErr != nil {
 			return sortErr
 		}
+		sorted := make([]Row, len(perm))
+		for i, p := range perm {
+			sorted[i] = o.rows[p]
+		}
+		o.rows = sorted
 	}
 
 	if n := len(o.plan.Funcs); n > 0 {

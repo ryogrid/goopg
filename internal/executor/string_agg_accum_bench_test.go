@@ -4,9 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/parser"
 )
 
 // BenchmarkStringAggUnordered measures the unordered string_agg accumulator
@@ -18,41 +15,7 @@ func BenchmarkStringAggUnordered(b *testing.B) {
 	ctx, cleanup := newVMFixture(b)
 	defer cleanup()
 
-	run := func(sql string) {
-		b.Helper()
-		ctx.CommandCounterIncrement()
-		ctx.CmdID = ctx.GetCurrentCommandId(true)
-		stmts, err := parser.Parse(sql)
-		if err != nil {
-			b.Fatalf("Parse(%q): %v", sql, err)
-		}
-		plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
-		if err != nil {
-			b.Fatalf("Plan(%q): %v", sql, err)
-		}
-		op, err := Build(plan)
-		if err != nil {
-			b.Fatalf("Build(%q): %v", sql, err)
-		}
-		if err := op.Open(ctx); err != nil {
-			b.Fatalf("Open(%q): %v", sql, err)
-		}
-		for {
-			row, err := op.Next()
-			if err == EOF {
-				break
-			}
-			if err != nil {
-				b.Fatalf("Next(%q): %v", sql, err)
-			}
-			if row == nil {
-				break
-			}
-		}
-		if err := op.Close(); err != nil {
-			b.Fatalf("Close(%q): %v", sql, err)
-		}
-	}
+	run := func(sql string) { benchExecSQL(b, ctx, sql) }
 
 	run("CREATE TABLE sagg (id int, t text)")
 	const n = 4000
