@@ -20,6 +20,13 @@ type generateSeriesOp struct {
 	step    int64
 	started bool
 	done    bool
+
+	// row and slot are reused across emissions (review/260831 EO1-10): the
+	// series used to allocate a one-column Row AND a MaterializedSlot per
+	// value. Same "valid until the next Next()" contract as indexScanOp
+	// (M0092-0007).
+	row  Row
+	slot MaterializedSlot
 }
 
 func newGenerateSeriesOp(p *optimizer.GenerateSeries) *generateSeriesOp {
@@ -96,7 +103,12 @@ func (o *generateSeriesOp) Next() (TupleSlot, error) {
 	} else {
 		o.current += o.step
 	}
-	return SlotFromRow(nil, Row{val}), nil
+	if o.row == nil {
+		o.row = make(Row, 1)
+	}
+	o.row[0] = val
+	o.slot.row = o.row
+	return &o.slot, nil
 }
 
 // generateSubscriptsOp implements generate_subscripts(arr, dim[, rev]) SRF.
@@ -109,6 +121,10 @@ type generateSubscriptsOp struct {
 	step    int64
 	started bool
 	done    bool
+
+	// row and slot are reused across emissions (review/260831 EO1-10).
+	row  Row
+	slot MaterializedSlot
 }
 
 func newGenerateSubscriptsOp(p *optimizer.GenerateSubscripts) *generateSubscriptsOp {
@@ -175,5 +191,10 @@ func (o *generateSubscriptsOp) Next() (TupleSlot, error) {
 
 	val := NewIntDatum(o.current)
 	o.current += o.step
-	return SlotFromRow(nil, Row{val}), nil
+	if o.row == nil {
+		o.row = make(Row, 1)
+	}
+	o.row[0] = val
+	o.slot.row = o.row
+	return &o.slot, nil
 }
