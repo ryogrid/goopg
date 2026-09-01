@@ -203,6 +203,20 @@ Non-testport items from the same run:
 - [ ] **testport/TestPort_PgStatActivity (AI-20260901-010436-005)**.
 - [ ] **testport/TestSyntax_Catalog_PgStatActivity (AI-20260901-010436-007)**.
 
+### Nightly run 20260902-005256 (sha `c11e55d253ff`, 8 items) — filed 2026-09-02
+- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260902-005256-001)**. New
+  tonight; possibly the M0131-S4 "FAIL-WHEN-FIXED" assertion flipping red
+  because a Theme F fix landed rather than a real regression — re-run repro
+  and check the M0131 Theme F findings list before treating as a bug.
+  (`testport/TestPort_IsolationIntraGrantInplace`,
+  `testport/TestPort_IsolationStats`,
+  `testport/TestPort_LockRowsSortOverJoinTakesRowLock`,
+  `testport/TestPort_PgDumpConnectionSetup`, `testport/TestPort_PgStatActivity`,
+  `testport/TestPort_RegressSuite`, `testport/TestSyntax_Catalog_PgStatActivity`
+  — remaining 7 items of this run all already have an open task above,
+  AI-20260827-052222-037/-071/-080/-107, AI-20260901-010436-005/-007; no new
+  line filed for those per the "do not add another" rule.)
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
 M0130 (Cluster-directory compat with PG 18.3 + PG physical replication).
