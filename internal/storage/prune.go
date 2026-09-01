@@ -105,7 +105,11 @@ func TupleDeadToAll(hdr HeapTupleHeader, oldestXmin TransactionID) bool {
 		}
 		effXmax = upd
 	}
-	if effXmax >= oldestXmin {
+	// Modular (wraparound-safe) order, as PG's HeapTupleSatisfiesVacuum does
+	// via TransactionIdPrecedes: a plain `effXmax >= oldestXmin` flips once the
+	// counter wraps past 2^31 and would declare a NEWER deleter's tuple
+	// dead-to-all — i.e. reclaim a live row (review/260831-2 ST-2).
+	if !XIDPrecedes(effXmax, oldestXmin) {
 		return false
 	}
 	// C3-S3 blocker fix B: the deleter must have COMMITTED. An aborted

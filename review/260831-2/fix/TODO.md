@@ -31,8 +31,8 @@ changes additionally need `scripts/tpch-spotcheck.sh`.
 | EO2-1 | high | `executor/operators_indexonly.go:Rescan` — LowOp/HighOp strictness ignored, bounds always inclusive | BUG | [x] | `5360b7e79` |
 | ES-5 | high | `executor/tidbitmap.go:tbmIterator.next/nextPage` — lossy page dropped after exact-page interleaving | ? | [ ] | |
 | NB-1 | high | `access/heap/vacuum.go:vacuumCore` — VM-skip branch does not update `lastNonEmpty` (tail truncation drops live blocks) | BUG | [x] | `dafe96692` |
-| ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | BUG | [x] | see progress log |
-| ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | ? | [ ] | |
+| ST-1 | high | `storage/fsm_fork.go:ReadFSMFork` — FSM level reconstruction wrong for >1 leaf page | BUG | [x] | `e4b3b7ff3` |
+| ST-2 | high | `storage/prune.go:TupleDeadToAll` — plain XID comparison wrong under wraparound | BUG | [x] | see progress log |
 | TA-1 | high | `transam/visibility.go:TupleVisible` — HeapXmaxCommitted hint-bit branch returns false unconditionally | ? | [ ] | |
 | CP-1 | high | `postmaster/txn_verb.go:applyTransactionVerb` — DDL in a failed block survives COMMIT-as-ROLLBACK | ? | [ ] | |
 | CM-1 | high | `cmd/goopg/standby.go:Promote` — `promoting` atomic never reset; failed promote wedges permanently | ? | [ ] | |
@@ -185,3 +185,12 @@ landed.
   count, so scan for the count whose tree is exactly this file); a file matching
   no leaf count is now a hard error rather than a silent partial read. Guard:
   `TestFSMForkRoundTripBeyondOneLeafPage` (fsmSlotsPerPage+100 blocks).
+
+- 2026-09-01 **ST-2 = BUG (fixed).** `TupleDeadToAll` compared the effective
+  xmax against the horizon with a plain `effXmax >= oldestXmin`. XIDs are
+  modular: once the counter wraps past 2^31 the plain compare inverts, so a
+  tuple deleted by a transaction NEWER than the horizon is reported dead-to-all
+  and pruning reclaims a row that concurrent snapshots can still see. PG uses
+  `TransactionIdPrecedes` here (`HeapTupleSatisfiesVacuum`). Fix:
+  `!XIDPrecedes(effXmax, oldestXmin)`. Guard: `TestTupleDeadToAllWraparound`
+  (horizon 0xFFFFFF00, deleter 50 — i.e. just after a wrap).

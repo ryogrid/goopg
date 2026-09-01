@@ -160,3 +160,30 @@ func TestMarkDirtyHintFlushBarrier(t *testing.T) {
 		t.Fatalf("page written with WAL flushed only to %d; hint barrier 12345 ignored (async-commit hole)", rec.maxFlushed)
 	}
 }
+
+// TestTupleDeadToAllWraparound is the review/260831-2 ST-2 guard: the
+// horizon test used a plain unsigned `effXmax >= oldestXmin`, so once the XID
+// counter wrapped past 2^31 a deleter that is NEWER than the horizon but
+// numerically smaller compared as "older" and its tuple was declared
+// dead-to-all — VACUUM/prune would then reclaim a row that is still visible.
+// PG compares with TransactionIdPrecedes (modular), which is XIDPrecedes here.
+func TestTupleDeadToAllWraparound(t *testing.T) {
+	// horizon just below the wrap point; deleter just past it, i.e. NEWER
+	// than the horizon in modular order but numerically far smaller.
+	const horizon = TransactionID(0xFFFFFF00)
+	const deleter = TransactionID(50)
+	if !XIDPrecedes(horizon, deleter) {
+		t.Fatalf("test setup: %d must precede %d in modular order", horizon, deleter)
+	}
+
+	hdr := NewHeapTuple(TransactionID(0xFFFFFE00), deleter, []byte("x")).Header
+	if TupleDeadToAll(hdr, horizon) {
+		t.Fatal("deleter NEWER than the horizon (modular order) treated as dead-to-all")
+	}
+
+	// Sanity: a genuinely older deleter across the same wrap is still dead.
+	hdrOld := NewHeapTuple(TransactionID(0xFFFFFD00), TransactionID(0xFFFFFE00), []byte("x")).Header
+	if !TupleDeadToAll(hdrOld, horizon) {
+		t.Fatal("deleter older than the horizon must be dead-to-all")
+	}
+}
