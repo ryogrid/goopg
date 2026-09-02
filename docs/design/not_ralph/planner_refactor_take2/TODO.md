@@ -972,8 +972,27 @@ not grow; no query slower than 1.2×.
       values; TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0,
       verdict-changes none, **plan shapes: 99 same / 0 changed**, one runtime
       move and it is faster (Q61 5s->2s).
-      Still open: `num_sa_scans` for ScalarArrayOp and the per-tuple index qual
-      cost.
+      **The per-tuple index qual cost was implemented, MEASURED, and reverted
+      (2026-09-03).** PG charges
+      `numIndexTuples * (cpu_index_tuple_cost + qual_op_cost)` where
+      `qual_op_cost = cpu_operator_cost * len(indexQuals)` (selfuncs.c:7228-7234);
+      goopg charges only the first term, so testing an index qual is free. The
+      term is faithful and it is NOT double-charged — goopg's heap side charges
+      `cpu_tuple_cost` in PG's filter-qual slot, and `costSeqscan` already takes
+      `numQualOps`, so seq scans pay for their quals too and the change is
+      symmetric. It still cost TPC-DS SF0.5 **1115s -> 1152s (+3.3%)**, with 60
+      plan shapes changed and ten of the twelve movers >=3s being regressions.
+      That is OUTSIDE the sweep-to-sweep variance band measured on this harness
+      the same day (1110 / 1115 / 1119 s across three sweeps, +/-0.4%), so it is
+      a real regression, not noise. The gate did not catch it: PASS=95,
+      MISMATCH=0, verdict-changes none, runtime-moves 0 — every individual query
+      stayed under the 2.0x threshold while the aggregate moved.
+      Adding one correct PG term to a cost model missing its neighbours made
+      outcomes worse, which is the bundle's own recorded lesson ("cost-term
+      tuning alone never fixed a query"). It should land with the rest of
+      `btcostestimate`, not alone, and its acceptance test is the aggregate
+      sweep total rather than the per-query gate.
+      Still open: `num_sa_scans` for ScalarArrayOp, and this term.
 - [ ] **P2-10** `compute_semi_anti_join_factors` and the semi/anti early-out in
       nestloop and hashjoin costing. *design: 08 §5.3.*
 - [ ] **P2-11** `estimate_hash_bucket_stats`: bucket-size and MCV-frequency
