@@ -16249,6 +16249,26 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt, tempTables bool) error {
 		}
 	}
 
+	// take2 P1-03b: the relation is now empty, so its statistics describe a
+	// table that no longer exists. Measured before this reset — goopg kept
+	// reporting relpages/reltuples 222/50000 and estimating 50000 rows for an
+	// empty table, where PostgreSQL resets to 0/-1 and estimates its 10-page
+	// floor (2550 on the same fixture).
+	//
+	// Clearing Stats returns the relation to the never-analyzed state, which is
+	// what makes the block-derived fallback fire and produce PG's answer. The
+	// zeroed size row is persisted for the same reason VACUUM's is (P1-03): an
+	// in-memory-only reset would come back stale after a restart.
+	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
+		if hasIM {
+			im.UpdateRelStats(entry.tbl, 0, 0)
+		}
+		entry.tbl.Stats = nil
+		// Non-fatal, as in the VACUUM path: a TRUNCATE that has already done
+		// its work must not fail on a statistics write.
+		_ = persistRelSize(o.ctx, entry.tbl, 0, 0)
+	}
+
 	// Fire AFTER TRUNCATE FOR EACH STATEMENT triggers on all tables.
 	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
 		if err := fireStatementTriggers(o.ctx, entry.tbl, "after", "truncate"); err != nil {

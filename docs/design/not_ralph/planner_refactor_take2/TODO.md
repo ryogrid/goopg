@@ -320,9 +320,25 @@ slower than 1.2×, S-cold/WARM gap narrows.
       Non-fatal on write failure: a VACUUM that has done its real work must not
       fail on a statistics write, the same convention
       `persistStatsToPGStatistic` uses for a column it cannot fit.
-- [ ] **P1-03b** `TRUNCATE` resets `Table.Stats`; `ANALYZE` invalidates the
-      cached plans of the relations it touched (today it is planned as a
-      `Utility` statement and only DDL invalidates). *design: 08 §4.1.*
+- [x] **P1-03b** *(first half)* `TRUNCATE` resets `Table.Stats` — units,
+      `internal/{executor,optimizer,catalog}`. Measured, same fixture:
+
+      | | goopg before | goopg after | PG |
+      |---|---|---|---|
+      | `pg_class` | `222 / 50000` | `0 / 0` | `0 / -1` |
+      | scan estimate | **50000** | **2550** | **2550** |
+
+      goopg was estimating 50 000 rows for an empty table. Clearing `Stats`
+      returns the relation to the never-analyzed state, which makes the
+      block-derived fallback fire and produce PG's 10-page-floor answer exactly.
+      The zeroed size row is persisted for the same reason VACUUM's is (P1-03) —
+      an in-memory-only reset would come back stale after a restart. `reltuples`
+      renders `0` where PG renders `-1`; goopg's virtual `pg_class` already uses
+      `0` as its unknown sentinel elsewhere.
+      *Still open:* the second half — `ANALYZE` invalidating cached plans for the
+      relations it touched. It is planned as a `Utility` statement and only DDL
+      invalidates, so a session that ANALYZEs and then re-runs a cached query
+      still gets the pre-ANALYZE plan.
 - [x] **P1-04** — **verified already satisfied**, no code change. Index-only
       costing already uses the real visible fraction:
       `pathindexonly.go:109` passes `relAllVisibleFraction(tbl, relPages)`,
