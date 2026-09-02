@@ -1092,8 +1092,37 @@ not grow; no query slower than 1.2×.
       flattered this change to -4.3%. The honest figure is against the last
       clean sweep (1115s), which is the -1.2% above. Always check which report
       the delta used.
-- [ ] **P2-12** `mergejoinscansel` start/end selectivities in merge-join
+- [x] **P2-12** `mergejoinscansel` start/end selectivities in merge-join
       costing. *design: 08 §5.3.*
+      **Landed 2026-09-03, END selectivities only.** A merge join stops once one
+      side passes the other's maximum key, so only that fraction of each input's
+      RUN cost is paid; `mergeJoinCost` charged a full pass over both.
+      *The sort caveat, resolved.* The scoping note below feared that scaling a
+      sorted input would price a scan the executor never performs. PG's own code
+      settles it (costsize.c:3686-3745): BOTH branches scale identically, and
+      the sort's own `startup_cost` — where the full input read lives — is
+      charged UNSCALED, with only the read-out portion scaled. goopg's
+      `sortPathFor` has the same shape, so the scaling is safe either way.
+      *Not implemented:* PG's START selectivities. They model a seek to the
+      first match that goopg's merge does not perform, and both are reported as
+      0 so the omission is a no-op rather than an approximation.
+      *A trap found on the way:* histogram bounds are stored as STRINGS, so
+      every comparison needs the column's type — `histCmp` falls back to
+      `strings.Compare` without it, which orders "10" before "9".
+      `joinVarStats` now carries `typeName`, and a missing type refuses the
+      estimate rather than guessing.
+      Gates: TPC-H 215.01s against 215.62s (neutral), 24 MATCH on values.
+      TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0,
+      verdict-changes none, 5 plan shapes changed.
+      **The aggregate arm read +2.1% and that reading was NOT this change.**
+      Splitting the sweep by plan attribution: the 5 queries whose plans moved
+      are net **-1s**; the 90 whose plans are IDENTICAL are net **+23s**. The
+      three queries the per-query arm named (Q61, Q45, Q12) all have unchanged
+      plans. So the aggregate move is environmental drift.
+      *That is the lesson to carry:* the `TOTAL` arm and the plan capture are
+      complementary and neither is sufficient alone — TOTAL catches the broad
+      shallow regression the per-query arm misses, and the plan capture is what
+      says whether a move is yours.
       **Scoped 2026-09-03 — implementable, with one caveat that must not be
       skipped.** The arithmetic is reachable: `mergejoinscansel` needs
       `get_variable_range` and `scalarineqsel`, and goopg already has the

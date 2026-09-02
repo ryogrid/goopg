@@ -98,6 +98,12 @@ type joinVarStats struct {
 	stats  *catalog.ColumnStats
 	tuples float64
 	isBool bool
+
+	// typeName is the column's catalog type. Histogram bounds are stored as
+	// STRINGS, so every comparison against them needs the type to know whether
+	// to compare numerically or byte-wise — `histCmp` falls back to
+	// strings.Compare without it, which orders "10" before "9". take2 P2-12.
+	typeName string
 }
 
 // examineJoinVar resolves ONE operand of a join clause to its base relation's
@@ -127,6 +133,14 @@ type joinVarStats struct {
 func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	var v joinVarStats
 	i, cr, ok := s.resolveJoinVarColumn(key, relids)
+	if ok && i >= 0 && i < len(s.relInfos) && s.relInfos[i].table != nil && cr != nil {
+		for _, c := range s.relInfos[i].table.Columns {
+			if c.Name == cr.Name {
+				v.typeName = c.Type.Name
+				break
+			}
+		}
+	}
 	if cr != nil {
 		// PG's BOOLOID arm of `get_variable_numdistinct`: a boolean column has
 		// two values whether or not anyone has analysed it. Recorded even for
@@ -496,4 +510,76 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 		}
 	}
 	return best
+}
+
+// mergeJoinScanSel is `mergejoinscansel` (selfuncs.c) reduced to its END
+// selectivities: what FRACTION of each input a merge join actually consumes
+// before the other side's key range is exhausted. take2 P2-12.
+//
+// A merge join over `a.k = b.k` stops as soon as one side passes the other's
+// maximum key. When the two ranges overlap only partly — a fact-table scan
+// joined to a filtered dimension, say — a large share of the bigger input is
+// never read, and goopg charged a FULL pass over both.
+//
+// PG's start selectivities (the "skip to the first match" half) are NOT
+// implemented here and both are reported as 0. They are the smaller term, and
+// they model a seek goopg's merge does not perform: it consumes from the
+// beginning of each sorted input. Reporting 0 makes the omission a no-op rather
+// than an approximation.
+//
+// Returns (1, 1) — charge everything, i.e. today's behaviour — whenever either
+// side's range cannot be established. That is the safe direction: this term can
+// only ever REDUCE a merge join's cost, so an unknown must not.
+func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet) (outerEnd, innerEnd float64) {
+	if len(clauses) == 0 {
+		return 1, 1
+	}
+	// PG keys the estimate on the FIRST merge clause: it is the leading sort
+	// column, and it alone determines when the scan can stop.
+	ri := clauses[0]
+	if ri == nil || ri.leftKey == nil || ri.rightKey == nil {
+		return 1, 1
+	}
+	outerKey, outerRels := ri.leftKey, ri.leftRelids
+	innerKey, innerRels := ri.rightKey, ri.rightRelids
+	if !relsSubset(outerRels, outerRelids) {
+		outerKey, outerRels, innerKey, innerRels = innerKey, innerRels, outerKey, outerRels
+	}
+	if !relsSubset(outerRels, outerRelids) {
+		return 1, 1
+	}
+
+	ov := s.examineJoinVar(outerKey, outerRels)
+	iv := s.examineJoinVar(innerKey, innerRels)
+	oMax, oOK := histogramMax(ov.stats)
+	iMax, iOK := histogramMax(iv.stats)
+	if !oOK || !iOK {
+		return 1, 1
+	}
+
+	// The outer is scanned until it passes the INNER's maximum, and vice
+	// versa: `leftend = scalarineqsel(left <= right_max)`.
+	outerEnd = fractionAtMost(ov.stats, iMax, ov.typeName)
+	innerEnd = fractionAtMost(iv.stats, oMax, iv.typeName)
+	return clampSelectivity(outerEnd), clampSelectivity(innerEnd)
+}
+
+// histogramMax is `get_variable_range`'s upper bound: the last histogram
+// boundary, which ANALYZE stores in ascending order.
+func histogramMax(cs *catalog.ColumnStats) (string, bool) {
+	if cs == nil || len(cs.Histogram) == 0 {
+		return "", false
+	}
+	return cs.Histogram[len(cs.Histogram)-1], true
+}
+
+// fractionAtMost is `scalarineqsel(<=)` over the column's histogram: the share
+// of the column at or below `bound`.
+func fractionAtMost(cs *catalog.ColumnStats, bound, typeName string) float64 {
+	if cs == nil || len(cs.Histogram) < 2 || typeName == "" {
+		// No type means histCmp would compare byte-wise, which misorders every
+		// numeric column. Refuse rather than guess.
+		return 1
+	}
+	return histogramOpSelectivity(parser.OpLe, cs.Histogram, bound, typeName)
 }

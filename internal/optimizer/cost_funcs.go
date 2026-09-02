@@ -456,10 +456,28 @@ func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerR
 // merge. A cost_sort on an unsorted input is added by the caller when the input's
 // pathkeys do not satisfy the merge clause (design ch. 06 §3.2) — the whole
 // reason pathkeys exist.
-func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows float64) Cost {
+func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows, outerEndSel, innerEndSel float64) Cost {
 	startup := outer.Startup + inner.Startup
-	run := (outer.Total - outer.Startup) + (inner.Total - inner.Startup) +
-		cp.cpuOperatorCost*(outerRows+innerRows) + cp.cpuTupleCost*outputRows
+	// take2 P2-12, `mergejoinscansel` applied as final_cost_mergejoin does
+	// (costsize.c:3686-3745): a merge join stops once one side passes the
+	// other's maximum key, so only that FRACTION of each input's RUN cost is
+	// paid. Both branches of PG's sort/no-sort split scale the same way — the
+	// sort's own startup, which is where the full input read lives, is charged
+	// UNSCALED, and only the read-out portion scales. goopg's sortPathFor has
+	// that same shape, so applying the scaling to (Total - Startup) is correct
+	// whether or not the input needed sorting.
+	//
+	// 1 means "no information" and charges the full pass, i.e. the behaviour
+	// before this term. The scaling can only ever REDUCE cost, so an unknown
+	// must not be allowed to.
+	if outerEndSel <= 0 || outerEndSel > 1 {
+		outerEndSel = 1
+	}
+	if innerEndSel <= 0 || innerEndSel > 1 {
+		innerEndSel = 1
+	}
+	run := (outer.Total-outer.Startup)*outerEndSel + (inner.Total-inner.Startup)*innerEndSel +
+		cp.cpuOperatorCost*(outerRows*outerEndSel+innerRows*innerEndSel) + cp.cpuTupleCost*outputRows
 	return Cost{Startup: startup, Total: startup + run}
 }
 

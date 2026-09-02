@@ -198,7 +198,10 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			mergeTuplesFor := func(res []*restrictInfo) float64 {
 				return s.mergeJoinTuples(joinrel.Rows, res, outer.Rows, inner.Rows)
 			}
-			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor)
+			scanSelFor := func(mc []*restrictInfo) (float64, float64) {
+				return s.mergeJoinScanSel(mc, outer.Relids)
+			}
+			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor)
 			// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 			// and arm 4 — so a merge over an already-ordered outer is offered
 			// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -206,7 +209,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// here; goopg's nested-loop halves (`addNestLoopPath` /
 			// `addNLIPaths`) were landed separately and still run after the
 			// hash arm, which can only change a hash-vs-nestloop exact tie.
-			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor)
+			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor)
 			// take2 P2-11: the inner side is the BUILD side here, so the
 			// bucket fraction is measured on its keys. Computed at this site
 			// because the searchCtx — and so the statistics — is in scope,
