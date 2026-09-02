@@ -216,3 +216,56 @@ func coveredAvgVarBytes(tbl *catalog.Table, covered []catalog.Column) float64 {
 	}
 	return sum
 }
+
+// narrowLeafToNeededColumns returns a copy of a BARE seq-scan leaf that emits
+// only the columns the statement reads, plus that copy's column count and
+// variable payload — take2 P4-01's second slice.
+//
+// WHY. Q14 references two of `part`'s nine columns. goopg carried all nine into
+// the hash build, which at `work_mem = 64MB` is a 104 MB table where PG's
+// projected 6-byte rows fit in 14.6 MB — so goopg batched, the hash join's cost
+// tripled, and a merge join over a full 6 M-row index scan won instead. That is
+// the measured bottleneck (impl/FINDING-workmem-advantage.md §2b).
+//
+// The narrowing is applied to the PATH's node, never to `rel.baseLeaf`. The
+// search's coordinate space is fixed before the search runs — `joinsearchseam.go`
+// asserts that the concatenated leaf widths equal the analyzer's
+// `rangeBinding.offset` progression, and narrowing a leaf there makes the seam
+// decline and silently fall back to the legacy plan. `baseRelLayout` re-bases
+// the emitted node's columns BY NAME and `boundaryMap`'s filler pads what was
+// pruned, which is exactly how the index-only path already emits a narrower
+// schema (createplanindex.go).
+//
+// Declines unless the leaf is a BARE `*SeqScan`: a leaf carrying local quals is
+// a `*Filter` whose ColumnRefs are written against the FULL leaf schema, so
+// narrowing underneath it would re-point them. Same refusal the index-only
+// producer makes, for the same reason.
+func narrowLeafToNeededColumns(leaf Node, tbl *catalog.Table, needed []catalog.Column) (Node, int, float64, bool) {
+	scan, ok := leaf.(*SeqScan)
+	if !ok || scan.Table == nil || tbl == nil || len(needed) == 0 {
+		return nil, 0, 0, false
+	}
+	if len(needed) >= len(scan.schema) {
+		// Nothing to prune.
+		return nil, 0, 0, false
+	}
+	narrowed := make(Schema, 0, len(needed))
+	for _, c := range needed {
+		at := -1
+		for j := range scan.schema {
+			if strings.EqualFold(scan.schema[j].Name, c.Name) {
+				at = j
+				break
+			}
+		}
+		if at < 0 {
+			// A needed column the leaf does not publish: decline rather than
+			// emit a schema that cannot answer the query.
+			return nil, 0, 0, false
+		}
+		narrowed = append(narrowed, scan.schema[at])
+	}
+	cp := *scan
+	cp.schema = narrowed
+	return &cp, len(narrowed), coveredAvgVarBytes(tbl, needed), true
+}

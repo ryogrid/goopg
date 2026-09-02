@@ -867,6 +867,31 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
 
 ## Phase 4 — Upper planner as paths
 
+- [!] **P4-01b** *(second slice — leaf narrowing: CODE LANDED BUT DORMANT)*
+      `narrowLeafToNeededColumns` narrows a **bare** seq-scan leaf to the
+      columns the statement reads and sets the path's `NCols`/`AvgVarBytes`. It
+      is applied to the **path's node**, never `rel.baseLeaf`, so the seam's
+      offset invariant holds (narrowing there makes the seam decline and fall
+      back to the legacy plan — P4-A §4).
+      **It does not fire on TPC-H, because `neededColsKnown` is false.**
+      Instrumented and measured on Q14: `narrow-guard known=false table=part
+      leaf=*optimizer.SeqScan` — the leaf is exactly the bare seq scan the
+      helper wants, and the *needed-column set* is what is unavailable. That is
+      also why the code comment in `pathindexonly.go` records the index-only
+      path "fired zero times across all 22 TPC-H queries": **the same flag
+      gates both.**
+      **Resume point:** find why `neededColumnNames` / its carry to `searchCtx`
+      yields `known=false` for a plain `SELECT agg(...) FROM a, b WHERE ...`.
+      None of `collectStmtColumnNames`' documented decline conditions
+      (`SetOp`, `With`, `ValuesRows`, `GroupingSets`, `WindowClause`,
+      `Locking`, natural join, table function, LATERAL) apply to Q14, and the
+      expression-level `default:` arm was instrumented and never fired — so the
+      decline is in the statement walk or in the carry through
+      `relfromjoinlist.go` / `geqo.go` / `joinsearchseam.go`. Fixing it unlocks
+      **both** this narrowing and index-only paths on the whole corpus.
+      **Treat the helper as unverified until then** — an unwinnable path is an
+      untested path, and this one has never executed in production.
+
 - [x] **P4-01a** *(first slice — per-path width)* Paths carry their own
       `NCols`/`AvgVarBytes` — gate: `TestPathCarriesItsOwnWidth`, units.
       `pathgen.go` read column counts from the **rels**, under a comment
