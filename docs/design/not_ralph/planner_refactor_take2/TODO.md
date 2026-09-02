@@ -1029,10 +1029,23 @@ not grow; no query slower than 1.2×.
       here; before it, the gate could not.
 - [ ] **P2-12** `mergejoinscansel` start/end selectivities in merge-join
       costing. *design: 08 §5.3.*
-- [ ] **P2-13** Bitmap lossy-page handling to match `tbm_calculate_entries`
+- [x] **P2-13** Bitmap lossy-page handling to match `tbm_calculate_entries`
       **and** removal of the double charge, in ONE commit. Landing the removal
       alone is a known regression (TPC-DS Q72 73 s → timeout). *design: 08 §5.4;
       gate: plan-parity + timing both suites, all bitmap queries.*
+      **Already done in-tree; verified and closed 2026-09-03** (the work is
+      earlier commits of this bundle, not this entry's — what was missing was
+      the bookkeeping). Both halves confirmed by reading the code, not the
+      comments: `costbitmap.go` computes `lossyPages` and USES it, where it
+      once discarded the pair with `_ =`; and `costBitmapHeapScan` returns
+      `startup + runCost`, with no second `indexCost.Total`.
+      Acceptance evidence is the census 08 §5.4 names. The recorded failure mode
+      for landing the removal ALONE was 22-24 bitmap scans against PG's 6.
+      Measured now, both halves in: **goopg 9, PG 6** over the same TPC-H 22.
+      TPC-DS Q72 — the query the design records going 73 s -> timeout when the
+      two were unpaired — runs **105 s PASS** in this session's sweeps, with
+      TIMEOUT=0 across all 99.
+      The residual 9-vs-6 is plan-parity work, not these two cost errors.
 
 ---
 
