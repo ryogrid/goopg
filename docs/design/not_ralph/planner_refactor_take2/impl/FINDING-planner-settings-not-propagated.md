@@ -116,3 +116,69 @@ for reading another session's GUCs.
 Gate it by asserting the propagation directly: plan a subquery-wrapped statement
 under a non-default `work_mem` and assert the resulting `costParams.workMem`,
 rather than trusting a timing A/B.
+
+---
+
+# ROOT CAUSE (2026-09-03) — it is the missing projection, not the plumbing
+
+The derived-table slice was threaded again, **by hand**, one variable at a time.
+It builds, passes the unit suites, and is still not shippable: TPC-H Q9 goes
+15.4 s -> 187 s. A memory-GUCs-only variant (session `work_mem` /
+`hash_mem_multiplier`, every other field left at the defaults) gives 192 s, so
+`work_mem` alone accounts for it. The earlier "non-monotonic" reading was an
+artefact of comparing arms whose derived tables had *different* propagation
+states; with propagation held on, the relationship is monotonic —
+1 GB -> 15 s, 128 MB -> ~190 s.
+
+So the question is why goopg needs a gigabyte where PostgreSQL needs tens of
+megabytes. `EXPLAIN ANALYZE` on the same query, same cluster, same 64MB
+`work_mem` x 2 answers it:
+
+| | PostgreSQL 18.3 | goopg |
+|---|---|---|
+| tuple widths through the join tree | 23 / 32 / 54 / 81 B | 1542 / 2616 / 3164 B |
+| peak hash memory | 38 MB, `Batches: 1` everywhere | 97 MB, `Batches: 8` |
+| rows through the middle join | ~319 k | 24,005,020 |
+| Q9 total | 6.2 s | 187 s |
+
+goopg's tuples are roughly **39x wider** than PostgreSQL's at the same point in
+the same plan, because there is no `PathTarget` and therefore no projection: the
+join tree carries every column of every base relation from the leaves to the
+top. A hash table over those tuples needs ~39x the memory for the same rows, so
+at PostgreSQL's configured budget goopg batches where PostgreSQL does not, and
+its multi-batch path is slow enough to cost two orders of magnitude.
+
+## What this explains
+
+- **Why the 512MB default was load-bearing.** It is 8x PG's `work_mem`, which
+  is roughly what a 39x-wide tuple needs to stay single-batch on this corpus.
+- **Why P2-03 won 37 %.** Doubling the budget via `hash_mem_multiplier` bought
+  headroom against the width, rather than fixing a mis-costing.
+- **Why P4-01 was attractive and why it produced wrong answers.** Narrowing the
+  leaf schema attacks exactly this, and is the right idea; the reverted attempt
+  failed on the mechanism (it disabled the join search's seam offsets), not on
+  the diagnosis.
+- **Why P2-02b cannot land.** Correcting `work_mem` to PG's 4MB removes the
+  headroom the width depends on.
+
+## Consequence for the plan
+
+P2-02b is **not blocked on settings propagation** — that was the intermediate
+diagnosis, and it is wrong. It is blocked on **P4-01: a real `PathTarget` with
+projection**. The remaining propagation work (derived tables, set operations,
+scalar subqueries) is correct and should land, but it must land *after* the
+width is fixed, or each slice pays the same regression.
+
+Recommended order, replacing the bundle's:
+
+1. **P4-01 proper** — `PathTarget` + `setrefs`-style projection, so a join
+   carries only the columns above it need. Gate on `tpch-runner -digest`
+   (values, not row counts — the reverted attempt matched 21/24 and Q18's row
+   count while returning wrong tuples).
+2. Then the derived-table / set-op / scalar-subquery propagation slices.
+3. Then P2-02b, which should be close to free once 1 and 2 are in.
+
+The hand-threaded derived-table patch is not committed; it is a two-line change
+(`planSelectWithParent` takes the settings and calls `planSelectWithSettings`,
+`planSubqueryRangeVar` forwards them) and is trivially reproducible when step 1
+lands.

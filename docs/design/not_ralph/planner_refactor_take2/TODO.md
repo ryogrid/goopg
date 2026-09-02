@@ -765,6 +765,13 @@ not grow; no query slower than 1.2×.
       real planning, not a fallback. Fix the propagation first, then this item
       is safe. Full evidence, including the four hypotheses ruled out by
       measurement: `impl/FINDING-planner-settings-not-propagated.md`.
+      **Re-diagnosed 2026-09-03: this is blocked on P4-01, not on propagation.**
+      goopg's tuples are ~39x wider than PG's at the same point in the same plan
+      (1542-3164 B vs 23-81 B) because there is no PathTarget projection, so its
+      hash tables need ~39x the memory for the same rows. At PG's `work_mem`
+      goopg batches (`Batches: 8`, 97 MB) where PG does not (`Batches: 1`,
+      38 MB), and Q9 goes 6.2 s (PG) vs 187 s (goopg). The 512MB default was
+      buying exactly the headroom the width needs. Fix the width first.
 - [ ] **P2-02c** Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner
