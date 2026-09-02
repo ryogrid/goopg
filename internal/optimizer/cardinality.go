@@ -617,7 +617,13 @@ func estimateJoin(j *Join) int64 {
 			// SEMI/ANTI path has used since P5.6-e-ii. Before that the
 			// right side of an equi-join never entered `max(nd)` at all,
 			// so a PK-FK join divided by the FK side's ndistinct only.
-			if nd := pairNDistinct(j, p); nd > 0 {
+			if mcvSel, ok := eqjoinselInnerMCV(j, p); ok {
+				// take2 P1-15: both sides have MCV lists, so upstream's
+				// pairwise branch is available and is strictly better
+				// informed than 1/max(nd).
+				sel *= mcvSel
+				measured = true
+			} else if nd := pairNDistinct(j, p); nd > 0 {
 				sel /= float64(nd)
 				measured = true
 			} else {
@@ -1422,7 +1428,6 @@ func constInt(e Expr) (int64, bool) {
 	return 0, false
 }
 
-
 // estimateDistinctRows sizes `SELECT DISTINCT` — a grouping over every output
 // column — through the same estimate_num_groups analogue GROUP BY uses.
 //
@@ -1460,4 +1465,112 @@ func estimateDistinctOnRows(d *DistinctOn, child Node) int64 {
 		exprs = append(exprs, &ColumnRef{Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx})
 	}
 	return estimateNumGroups(exprs, child, in)
+}
+
+// eqjoinselInnerMCV is `eqjoinsel_inner`'s MCV branch (selfuncs.c) for ONE
+// equi-pair: the estimate available when BOTH sides carry an MCV list.
+//
+// take2 P1-15. Without it every inner equi-join was priced at
+// `1/max(nd1, nd2)` — upstream's no-statistics fallback — even when the
+// statistics needed to do better were present. The difference matters most
+// exactly where it is most expensive to be wrong: a join between two skewed
+// columns, where a handful of values carry most of the rows and the flat
+// `1/max(nd)` estimate is off by the skew factor.
+//
+// Returns ok=false when either side lacks an MCV list, leaving the caller on
+// the `1/max(nd)` path, which is also what upstream does.
+//
+// The pairing rule and its justification are upstream's: "each MCV will match
+// at most one member of the other MCV list … if the operator isn't really
+// equality, there could be multiple matches --- but we don't look for them,
+// both for speed and because the math wouldn't add up".
+func eqjoinselInnerMCV(j *Join, p JoinKeyPair) (float64, bool) {
+	st1 := keyColumnStats(p.Left, j.Left)
+	st2 := rightExprStats(j, p.Right)
+	if st1 == nil || st2 == nil || len(st1.MCV) == 0 || len(st2.MCV) == 0 {
+		return 0, false
+	}
+	nd1 := float64(keyNDistinct(p.Left, j.Left))
+	nd2 := float64(rightExprNDistinct(j, p.Right))
+	if nd1 <= 0 || nd2 <= 0 {
+		return 0, false
+	}
+
+	// Pair the two lists, each entry consumed at most once. Indexed rather
+	// than nested-loop for the reason recorded on the semi arm (review/260831
+	// OP1-2): a nested loop is statistics_target^2 comparisons per estimate.
+	firstByValue := make(map[string]int, len(st2.MCV))
+	for k := len(st2.MCV) - 1; k >= 0; k-- {
+		firstByValue[st2.MCV[k].Value] = k
+	}
+	matched1 := make([]bool, len(st1.MCV))
+	matched2 := make([]bool, len(st2.MCV))
+	matchprodfreq, nmatches := 0.0, 0
+	for i := range st1.MCV {
+		k, ok := firstByValue[st1.MCV[i].Value]
+		if !ok {
+			continue
+		}
+		for k < len(st2.MCV) && matched2[k] && st2.MCV[k].Value == st1.MCV[i].Value {
+			k++
+		}
+		if k >= len(st2.MCV) || matched2[k] || st2.MCV[k].Value != st1.MCV[i].Value {
+			continue
+		}
+		matched1[i], matched2[k] = true, true
+		matchprodfreq += st1.MCV[i].Frequency * st2.MCV[k].Frequency
+		nmatches++
+	}
+	matchprodfreq = clampProbability(matchprodfreq)
+
+	sumFreq := func(mcv []catalog.MCVEntry, matched []bool, want bool) float64 {
+		total := 0.0
+		for i := range mcv {
+			if matched[i] == want {
+				total += mcv[i].Frequency
+			}
+		}
+		return clampProbability(total)
+	}
+	matchfreq1 := sumFreq(st1.MCV, matched1, true)
+	unmatchfreq1 := sumFreq(st1.MCV, matched1, false)
+	matchfreq2 := sumFreq(st2.MCV, matched2, true)
+	unmatchfreq2 := sumFreq(st2.MCV, matched2, false)
+
+	// Total frequency of non-null values NOT in the MCV lists.
+	otherfreq1 := clampProbability(1.0 - st1.NullFrac - matchfreq1 - unmatchfreq1)
+	otherfreq2 := clampProbability(1.0 - st2.NullFrac - matchfreq2 - unmatchfreq2)
+
+	n1, n2 := float64(len(st1.MCV)), float64(len(st2.MCV))
+	nm := float64(nmatches)
+
+	// From relation 1's point of view: known selectivity for matched MCVs,
+	// plus unmatched MCVs assumed to match random members of relation 2's
+	// non-MCV population, plus non-MCV values assumed to match random members
+	// of relation 2's unmatched MCVs plus its non-MCV values.
+	totalsel1 := matchprodfreq
+	if nd2 > n2 {
+		totalsel1 += unmatchfreq1 * otherfreq2 / (nd2 - n2)
+	}
+	if nd2 > nm {
+		totalsel1 += otherfreq1 * (otherfreq2 + unmatchfreq2) / (nd2 - nm)
+	}
+	totalsel2 := matchprodfreq
+	if nd1 > n1 {
+		totalsel2 += unmatchfreq2 * otherfreq1 / (nd1 - n1)
+	}
+	if nd1 > nm {
+		totalsel2 += otherfreq2 * (otherfreq1 + unmatchfreq1) / (nd1 - nm)
+	}
+
+	// "Use the smaller of the two estimates … to a first approximation, we
+	// are estimating from the point of view of the relation with smaller nd."
+	sel := totalsel1
+	if totalsel2 < sel {
+		sel = totalsel2
+	}
+	if sel <= 0 {
+		return 0, false
+	}
+	return clampProbability(sel), true
 }

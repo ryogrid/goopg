@@ -150,3 +150,77 @@ func TestDistinctIsSizedNotPassedThrough(t *testing.T) {
 		t.Errorf("DISTINCT rows = %d, want roughly the column's distinct count (~101)", out)
 	}
 }
+
+// TestEqjoinselInnerMCVBeatsFlatNDistinct pins take2 P1-15. Without the MCV
+// branch every inner equi-join was priced at 1/max(nd1, nd2) — upstream's
+// NO-STATISTICS fallback — even when the statistics needed to do better were
+// present. The gap is widest exactly where being wrong is most expensive: two
+// skewed columns, where a few values carry most of the rows.
+func TestEqjoinselInnerMCVBeatsFlatNDistinct(t *testing.T) {
+	cat := catalog.NewInMemory()
+	mk := func(name string, rows int64, mcv []catalog.MCVEntry, nd int64) *catalog.Table {
+		tbl, err := cat.CreateTable(parser.ObjectName{Name: name},
+			[]catalog.Column{{Name: "k", Type: catalog.Type{Name: "int4"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tbl.Stats = &catalog.TableStats{
+			RowCount: rows, Analyzed: true,
+			Columns: []catalog.ColumnStats{{NDistinct: nd, MCV: mcv}},
+		}
+		return tbl
+	}
+	// Both sides dominated by the SAME value: a real join between them
+	// produces far more rows than 1/max(nd) predicts.
+	skew := []catalog.MCVEntry{{Value: "7", Frequency: 0.8}}
+	l := mk("jl", 10000, skew, 100)
+	r := mk("jr", 10000, skew, 100)
+
+	j := &Join{
+		Left:  &SeqScan{Table: l, EstRelRows: 10000},
+		Right: &SeqScan{Table: r, EstRelRows: 10000},
+		LeftKey: &ColumnRef{Name: "k", Index: 0, SourceTableIdx: 1,
+			Type: catalog.Type{Name: "int4"}},
+		RightKey: &ColumnRef{Name: "k", Index: 0, SourceTableIdx: 2,
+			Type: catalog.Type{Name: "int4"}},
+	}
+	pair := JoinKeyPair{Left: j.LeftKey, Right: j.RightKey}
+
+	sel, ok := eqjoinselInnerMCV(j, pair)
+	if !ok {
+		t.Fatal("both sides carry MCV lists; the MCV branch must fire")
+	}
+	flat := 1.0 / float64(pairNDistinct(j, pair))
+	// matchprodfreq alone is 0.8*0.8 = 0.64, far above 1/100.
+	if sel <= flat {
+		t.Errorf("MCV selectivity %.4f is not above the flat 1/max(nd) = %.4f; "+
+			"two columns sharing an 80%% value must join far more than uniformly", sel, flat)
+	}
+	if sel < 0.6 {
+		t.Errorf("MCV selectivity %.4f: matchprodfreq alone is 0.64, so the "+
+			"estimate should be at least that", sel)
+	}
+}
+
+// TestEqjoinselInnerMCVDeclinesWithoutBothLists keeps the caller on the
+// 1/max(nd) path when either side lacks an MCV list — which is what upstream
+// does, and what the no-statistics fallback exists for.
+func TestEqjoinselInnerMCVDeclinesWithoutBothLists(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "one"},
+		[]catalog.Column{{Name: "k", Type: catalog.Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl.Stats = &catalog.TableStats{RowCount: 100, Analyzed: true,
+		Columns: []catalog.ColumnStats{{NDistinct: 10}}}
+	j := &Join{
+		Left:     &SeqScan{Table: tbl, EstRelRows: 100},
+		Right:    &SeqScan{Table: tbl, EstRelRows: 100},
+		LeftKey:  &ColumnRef{Name: "k", Index: 0, SourceTableIdx: 1, Type: catalog.Type{Name: "int4"}},
+		RightKey: &ColumnRef{Name: "k", Index: 0, SourceTableIdx: 2, Type: catalog.Type{Name: "int4"}},
+	}
+	if _, ok := eqjoinselInnerMCV(j, JoinKeyPair{Left: j.LeftKey, Right: j.RightKey}); ok {
+		t.Error("with no MCV list on either side the MCV branch must decline")
+	}
+}

@@ -499,10 +499,20 @@ slower than 1.2×, S-cold/WARM gap narrows.
 
 ### 1e — Join selectivity
 
-- [ ] **P1-15** MCV pairing in `eqjoinsel_inner` (pairwise match through the
-      equality operator; `matchprodfreq`/`unmatchfreq`/remainder terms), with
-      MCV equality compared by `oprcode` rather than rendered text.
-      *design: 08 §4.5; gate: plan-parity + timing both suites.*
+- [x] **P1-15** MCV pairing in `eqjoinsel_inner` — gates:
+      `TestEqjoinselInnerMCVBeatsFlatNDistinct`,
+      `TestEqjoinselInnerMCVDeclinesWithoutBothLists`, units. Every inner
+      equi-join had been priced at `1/max(nd1, nd2)` — upstream's
+      **no-statistics fallback** — even when both sides carried MCV lists. Full
+      `matchprodfreq` / `unmatchfreq` / `otherfreq` / `totalsel1`-`totalsel2`
+      formula ported, taking the smaller of the two viewpoints as upstream does.
+      Pairing is indexed rather than nested-loop, for the reason already
+      recorded on the semi arm (review/260831 OP1-2): a nested loop is
+      `statistics_target²` comparisons per estimate.
+      *Not done:* MCV equality is still compared by **rendered text**, not
+      `oprcode`. That half of the item stands — it matters for types whose text
+      form is not injective (float, numeric with trailing zeros), and the semi
+      arm has the same limitation, so the two should move together.
 - [ ] **P1-16** Re-diagnose TPC-H Q9's cardinality error with `estimate-audit`.
       Its recorded explanation — single-`nd` pricing of a two-column join — was
       retired by M0127-P5.6-f, which folds every equi-pair in both estimator
