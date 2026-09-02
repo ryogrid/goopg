@@ -440,12 +440,82 @@ const upstreamDefaultStatsTarget = 100
 // `do_analyze_rel`.
 const upstreamSampleMultiplier = 300
 
-// mcvFreqMargin is upstream's MCV_THRESHOLD margin from
-// postgres/src/backend/commands/analyze.c `compute_scalar_stats`:
-// a value qualifies for the MCV list when its sample frequency
-// exceeds the average frequency of the remaining values by at
-// least this multiplier.
-const mcvFreqMargin = 1.25
+// analyzeMCVList is upstream's `analyze_mcv_list`
+// (postgres/src/backend/commands/analyze.c:2980), which decides how many of the
+// most-common values are worth keeping.
+//
+// take2 P1-08. goopg used a `mcvFreqMargin = 1.25` greedy forward walk, under a
+// comment claiming it was "upstream's MCV_THRESHOLD margin from
+// compute_scalar_stats". That comment was FALSE for PG 18.3: there is no 1.25
+// anywhere in analyze.c. Upstream replaced the ratio test with the
+// hypergeometric significance test below, and the difference is not cosmetic —
+// the ratio rule over-admits on near-uniform columns, and every admitted MCV
+// entry displaces a histogram bound, so a column with no genuinely common
+// values spends its whole stats budget describing noise.
+//
+// The direction of the walk is load-bearing and upstream says why: values are
+// REMOVED from the full list rather than added to an empty one, because
+// "the latter approach can fail to add any values if all the most common values
+// have around the same frequency and make up the majority of the table" — which
+// is exactly the shape goopg's forward walk mishandles.
+//
+// mcvCounts must be sorted by count descending. Returns the number of leading
+// entries to keep.
+func analyzeMCVList(mcvCounts []int, numMCV int, staDistinct, staNullFrac float64, sampleRows int, totalRows float64) int {
+	// "If the entire table was sampled, keep the whole list. This also
+	// protects us against division by zero in the code below."
+	if float64(sampleRows) == totalRows || totalRows <= 1.0 {
+		return numMCV
+	}
+
+	// Re-extract the estimated number of distinct nonnull values in the table.
+	ndistinctTable := staDistinct
+	if ndistinctTable < 0 {
+		ndistinctTable = -ndistinctTable * totalRows
+	}
+
+	// sumcount tracks the total count of all but the last (least common) value.
+	sumcount := 0.0
+	for i := 0; i < numMCV-1; i++ {
+		sumcount += float64(mcvCounts[i])
+	}
+
+	for numMCV > 0 {
+		// Selectivity the least common value would have if it were NOT in the
+		// list (c.f. eqsel).
+		selec := 1.0 - sumcount/float64(sampleRows) - staNullFrac
+		if selec < 0.0 {
+			selec = 0.0
+		}
+		if selec > 1.0 {
+			selec = 1.0
+		}
+		otherdistinct := ndistinctTable - float64(numMCV-1)
+		if otherdistinct > 1 {
+			selec /= otherdistinct
+		}
+
+		// Lower end of a continuity-corrected Wald-type interval on a
+		// hypergeometric distribution: keep the value only when its observed
+		// count is significantly above what non-MCV membership would predict.
+		N := totalRows
+		n := float64(sampleRows)
+		K := N * float64(mcvCounts[numMCV-1]) / n
+		variance := n * K * (N - K) * (N - n) / (N * N * (N - 1))
+		stddev := math.Sqrt(variance)
+
+		if float64(mcvCounts[numMCV-1]) > selec*float64(sampleRows)+2*stddev+0.5 {
+			// Significantly more common: keep it and everything above it.
+			break
+		}
+		numMCV--
+		if numMCV == 0 {
+			break
+		}
+		sumcount -= float64(mcvCounts[numMCV-1])
+	}
+	return numMCV
+}
 
 // analyzeRelationCtx is the Context-aware entry point that
 // honours StatsTarget / AnalyzeRandSeed.
@@ -916,42 +986,39 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		return buckets[i].count > buckets[j].count
 	})
 
-	// MCV split: a value qualifies when its sample frequency
-	// exceeds avg_freq(remaining) * mcvFreqMargin. We walk the
-	// sorted list greedily, growing the MCV slot until the
-	// condition fails or we hit the statsTarget cap.
-	mcvCap := statsTarget
-	if mcvCap > len(buckets) {
-		mcvCap = len(buckets)
+	// MCV split — take2 P1-08, following compute_scalar_stats
+	// (analyze.c:2670-2700) rather than the 1.25 ratio rule that used to live
+	// here.
+	//
+	// Upstream keeps the WHOLE tracked list when it is complete and fits:
+	// "if we can fit all the values seen so far in the MCV list, then we
+	// should do so and thus provide the planner with complete information".
+	// Otherwise the list is incomplete, and it is "generally worth being more
+	// selective" — which is what analyzeMCVList decides.
+	mcvCount := statsTarget
+	if mcvCount > len(buckets) {
+		mcvCount = len(buckets)
 	}
-	mcvCount := 0
-	for mcvCount < mcvCap {
-		// Frequency of the next candidate vs the average of
-		// what's left after admitting it.
-		candidate := buckets[mcvCount]
-		remaining := nonNull
-		for k := 0; k <= mcvCount; k++ {
-			remaining -= buckets[k].count
+	// `track_cnt == ndistinct && toowide_cnt == 0 && stadistinct > 0 &&
+	// track_cnt <= num_mcv`: every distinct value was seen and they all fit,
+	// so the list is complete and is kept whole.
+	completeAndFits := len(buckets) <= statsTarget
+	if !completeAndFits && mcvCount > 0 {
+		counts := make([]int, mcvCount)
+		for i := 0; i < mcvCount; i++ {
+			counts[i] = buckets[i].count
 		}
-		distinctRemaining := len(buckets) - (mcvCount + 1)
-		if distinctRemaining <= 0 {
-			// Only candidate left — admit if the column shows
-			// any duplication at all (otherwise skip; a
-			// single-row "MCV" carries no information).
-			if candidate.count > 1 {
-				mcvCount++
-			}
-			break
-		}
-		avgRemaining := float64(remaining) / float64(distinctRemaining)
-		if avgRemaining <= 0 {
-			break
-		}
-		freqCandidate := float64(candidate.count)
-		if freqCandidate < mcvFreqMargin*avgRemaining {
-			break
-		}
-		mcvCount++
+		// staDistinct here is the absolute distinct count this sample implies;
+		// analyzeMCVList accepts PG's signed convention and this is the
+		// positive form.
+		mcvCount = analyzeMCVList(counts, mcvCount, float64(len(buckets)),
+			stats.NullFrac, len(sample), float64(totalRows))
+	}
+	// A single-occurrence "most common value" carries no information; upstream
+	// reaches the same place via its `dups_cnt > 0` tracking, which never
+	// enters a value seen once into the track list at all.
+	for mcvCount > 0 && buckets[mcvCount-1].count <= 1 {
+		mcvCount--
 	}
 
 	if mcvCount > 0 {

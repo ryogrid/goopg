@@ -347,9 +347,27 @@ slower than 1.2×, S-cold/WARM gap narrows.
       sampled fraction exceeds 10 %. The Haas–Stokes estimator itself is
       already correct (07 §3.11 item 1); ledger row 777 is stale and should be
       closed.~~ *design: 08 §4.2.*
-- [ ] **P1-08** Adopt 18.3's `analyze_mcv_list` admission rule; goopg's 1.25×
-      margin over-admits MCV entries on near-uniform columns, and each admitted
-      entry displaces a histogram bound. *design: 08 §4.2.*
+- [x] **P1-08** `analyze_mcv_list` — gate:
+      `TestAnalyzeMCVListMatchesUpstream`, units. The 1.25 margin sat under a
+      comment calling it "upstream's MCV_THRESHOLD margin"; **PG 18.3 contains
+      no `1.25` in `analyze.c` at all**. Replaced with the hypergeometric
+      significance test (`analyze.c:2980`), including upstream's
+      complete-list-fits short-circuit (`:2676`). Measured MCV counts:
+
+      | column | before | after | PG |
+      |---|---|---|---|
+      | `l_orderkey` | **100** | **0** | **0** |
+      | `l_shipdate` | 100 | 23 | 21 |
+      | `l_returnflag` | 1 | **3** | **3** |
+      | `p_type` | 0 | 4 | 1 |
+
+      `l_orderkey` is a ~1.5 M-distinct key and had **100 MCV entries**, so
+      every `l_orderkey = ?` lookup was answered from a bogus MCV frequency
+      instead of `ndistinct`. `l_returnflag` has three values and had one; it
+      now has all three, matching PG — that is the column TPC-H Q1 groups by.
+      The walk direction is load-bearing and upstream explains why: values are
+      REMOVED from the full list, never added to an empty one, or a column whose
+      common values all share a frequency admits nothing.
 - [ ] **P1-09** Histogram bound count `min(stattarget, ndistinct - num_mcv)`
       over the non-MCV portion. *design: 08 §4.2.*
 - [ ] **P1-10** `compute_index_stats` for expression indexes. *design: 08 §4.2.*
