@@ -104,7 +104,7 @@ func TestDefaultPlannerSettingsMatchTheHardWiredParams(t *testing.T) {
 // make an unthreaded path catastrophic rather than merely unimproved: a zero
 // PlannerSettings prices every page and tuple at 0.0.
 func TestUnstampedContextGetsDefaultsNotZeroes(t *testing.T) {
-	ctx := newResolveContext(nil, nil)
+	ctx := newResolveContext(nil, nil, DefaultPlannerSettings())
 	if got := ctx.settings; got != DefaultPlannerSettings() {
 		t.Errorf("fresh resolveContext settings = %+v, want the defaults", got)
 	}

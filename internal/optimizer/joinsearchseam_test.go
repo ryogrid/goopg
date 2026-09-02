@@ -53,7 +53,7 @@ func seamFixture(names []string, rows []int64) (Node, *resolveContext) {
 		root = &Join{Type: JoinTypeCross, Left: root, Right: leaf,
 			schema: appendSchema(root.Output(), leaf.Output())}
 	}
-	ctx := newResolveContext(bindings, root.Output())
+	ctx := newResolveContext(bindings, root.Output(), DefaultPlannerSettings())
 	ctx.joinlist = deconstructRangeVars(len(names))
 	return root, ctx
 }

@@ -248,7 +248,7 @@ func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int, 
 	if innerNames != nil {
 		resolveTbl = viewProxyTable(base, innerNames, innerColMap)
 	}
-	ctx := singleBindingContext(resolveTbl, alias)
+	ctx := singleBindingContext(resolveTbl, alias, DefaultPlannerSettings())
 	ctx.cat = cat
 	return resolveExpr(tbl.View.Where, ctx)
 }

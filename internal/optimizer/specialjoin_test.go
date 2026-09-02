@@ -262,7 +262,7 @@ func TestSpecialJoinInfoResolveContextPopulated(t *testing.T) {
 		t.Fatal(err)
 	}
 	sel := stmts[0].(*parser.SelectStmt)
-	_, rctx, err := planFromClause(sel, cat)
+	_, rctx, err := planFromClause(sel, cat, DefaultPlannerSettings())
 	if err != nil {
 		t.Fatal(err)
 	}

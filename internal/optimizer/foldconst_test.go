@@ -455,7 +455,7 @@ func parseSingleExpr(t *testing.T, expr string) (Expr, error) {
 		return nil, nil
 	}
 	// Convert the parser expression to a planner expression via resolveExpr.
-	resolved, err := resolveExpr(sel.Targets[0].Expr, newResolveContext(nil, nil))
+	resolved, err := resolveExpr(sel.Targets[0].Expr, newResolveContext(nil, nil, DefaultPlannerSettings()))
 	if err != nil {
 		return nil, err
 	}
