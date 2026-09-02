@@ -522,23 +522,42 @@ slower than 1.2×, S-cold/WARM gap narrows.
 - [ ] **P1-17** `eqjoinsel_semi` MCV arm, `nd2` clamped by inner rows, the
       `(1-nullfrac1)` factor. Note MCV pairing exists in production **only** in
       the semi/anti arm (`semiPairMatchFraction`). *design: 08 §4.5.*
-- [ ] **P1-18** Port `calc_joinrel_size_estimate`'s full jointype switch into
+- [!] **P1-18** **BLOCKED on P3-04** *(established empirically 2026-09-02)*.
+      The search cannot see a non-inner join at all, so there is no arm to add a
+      jointype switch to. `DPTRACE` for
+      `customer LEFT JOIN orders ON c_custkey = o_custkey` reports
+      `problem nrels=1 rels=customer … pairs=0`: `splitOuterSpine` peeled the
+      outer join and only `customer` entered the search. `joinrelsize.go:100-102`
+      states the same thing from the code's side. The item's premise — "the arm
+      that chooses the plan sizes an outer join as an inner join" — is therefore
+      not quite right: it never sizes one. Port the switch **after** P3-04
+      deletes `splitOuterSpine`, or it will be dead code.
+      ~~Port `calc_joinrel_size_estimate`'s full jointype switch into
       the search arm. `calcJoinrelSize` has **no join-type branch at all** —
       the LEFT/FULL floors and SEMI/ANTI arms live only in the legacy
       `estimateJoin`, so the arm that chooses the plan sizes an outer join as
       an inner join and a LEFT can estimate fewer rows than its preserved
-      input. *design: 08 §4.5; gate: plan-parity + timing both suites.*
+      input.~~ *design: 08 §4.5.*
 - [ ] **P1-19** `isunique` in the `examine_variable` analogue via
       `has_unique_index`, with PG's nullfrac derating in the FK formula.
       *design: 08 §4.5.*
 - [ ] **P1-20** `nconst_ec` correction — EquivalenceClasses carry a const flag
       so `1/ref_tuples` stops double-counting a pushed-down `var = const`.
       *design: 08 §4.5.*
-- [ ] **P1-21** Delete the `max(outer,inner)` fallback cap (M0126-0010), which
+- [ ] **P1-21** **Precondition NOT met by P1-15 — restated 2026-09-02.** The
+      item says to delete the cap "once P1-15/16 show the backstop unneeded".
+      P1-15 improved the **measured** equi-join path (both sides have MCV
+      lists); this cap sits in the **unmeasurable fallback**
+      (`cardinality.go:655-666`), which fires only when *no key was proven*.
+      MCV pairing cannot reach it, so P1-15 does not discharge the
+      precondition. Deleting it now would move those joins from
+      `min(l·r·0.005, max(l,r))` to `l·r·0.005` — a large increase on big
+      inputs, with no evidence the backstop is unneeded.
+      ~~Delete the `max(outer,inner)` fallback cap (M0126-0010), which
       has no upstream counterpart, once P1-15/16 show the backstop unneeded.
       It is guarded (it fires only when no key was proven and every residual
-      factor was a default), so this is a cleanup, not a correctness fix.
-      *design: 08 §4.5; gate: plan-parity + timing.*
+      factor was a default), so this is a cleanup, not a correctness fix.~~
+      *design: 08 §4.5.*
 - [x] **P1-28** `pg_stats.correlation` — `86b3b96a2`; gate:
       `TestPgStatsRendersCorrelation`, units. Confirmed exactly as recorded: the
       view rendered a hard-coded NULL behind a header comment claiming ANALYZE
@@ -576,8 +595,20 @@ slower than 1.2×, S-cold/WARM gap narrows.
       `examine_variable` analogue over a single node-type arm list; an
       index-probed leaf gains MCV and histogram access. *design: 08 §4.8;
       sibling rule.*
-- [ ] **P1-27** CTE output statistics, replacing the `initialRelRows` body-count
-      fallback that over-estimates filtered CTE scans. *design: 08 §4.7.*
+- [ ] **P1-27** CTE output statistics — **scope corrected 2026-09-02.** Plain
+      CTE columns already resolve to their base relation's statistics:
+      `resolveBaseColumn` has a `*CTEScan` arm (`joinkeyproof.go:164-167`) and
+      the `initialRelRows` comment claiming "CTE scans have no per-column
+      statistics" is stale for that case. The real gap is **aggregated** CTE
+      outputs — TPC-DS's `year_total` shape, where the output columns are
+      `sum(...)` and trace to no base column, so `eqsel` falls to
+      `DEFAULT_NUM_DISTINCT` at 0.005 per conjunct.
+      Note that 0.005 is **also what PostgreSQL does** there, so goopg's
+      `rows <= 1` body-count guard is a deviation that happens to help, not a
+      fidelity gap. Replacing it therefore needs genuinely derived statistics
+      (propagating through aggregation), not a closer port — which is a larger
+      item than the wording suggests, and removing the guard without them would
+      regress. *design: 08 §4.7.*
 
 ---
 
