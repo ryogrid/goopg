@@ -22,11 +22,38 @@ server age, `GOGC=100 GOMEMLIMIT=12GiB`.
 | 3 | P1-14 + P1-25 | 246.53 → 248.71 s | +0.88 % (noise) |
 | 4 | **P0-12 cluster alignment** | 248.71 → **403.27 s** | **+62.2 %** |
 | 5 | Phase 1 batch (10 items) | 395.53 → 399.33 s | +0.96 % (noise) |
+| 6 | **P2-03 `hash_mem_multiplier`** | 390.70 → **245.71 s** | **−37.1 %** |
 
 **Row counts identical in every arm of every A/B.** TPC-DS SF0.5 gate: **95
 PASS, 0 MISMATCH** (4 skips, all oracle-side).
 
 Row 4 is not a regression and is the most important number here — see §3.
+Row 6 is the largest win, and it was **verified on VALUES**, not row counts:
+`tpch-runner -digest` + `-diff` reports `24 MATCH … VERDICT: PASS`.
+
+### 1a. P2-03 in detail
+
+goopg budgeted a hash build at `work_mem` alone; PG's budget is
+`work_mem × hash_mem_multiplier` (`get_hash_memory_limit`, nodeHash.c:3622).
+With PG's default of 2.0, **every hash table in goopg had half the memory
+PostgreSQL would give it**.
+
+| query | before | after | |
+|---|---|---|---|
+| Q14 | 11.76 s | **0.46 s** | −96.1 % |
+| Q9 | 87.20 s | **12.90 s** | −85.2 % |
+| Q16 | 3.70 s | 0.71 s | −80.8 % |
+| Q10 | 14.40 s | 3.32 s | −76.9 % |
+| Q7 | 31.92 s | 9.62 s | −69.9 % |
+| Q18 | 90.36 s | 68.86 s | −23.8 % |
+
+Q14 is now **faster than PostgreSQL** (0.46 s against 2.58 s measured on the
+reference cluster), on a query that was 10.6× slower before this session.
+
+This is also the correct fix for the bottleneck §5 diagnosed. P4-01's leaf
+narrowing was an attempt at the same batching problem from the width side; it
+produced wrong answers and was reverted. The budget was the other half, and it
+is safe.
 
 ## 2. The one change that moved time, and why
 
@@ -140,8 +167,11 @@ relation's width while the executor measured the narrowed schema — which
 
 ## 7. What is left, in priority order
 
+0. **Re-measure everything.** P2-03 moved the corpus 37 %; the priorities below
+   were derived before it and several may have changed rank.
 1. **P4-01's remaining slice**: narrow an ordinary heap scan to its needed
-   columns. `P4-01a` removed the per-rel/per-path blocker, so this is now
+   columns. **Attempted and reverted** — see §6a. Lower priority than it was:
+   P2-03 already recovered the batching it targeted. `P4-01a` removed the per-rel/per-path blocker, so this is now
    setting two fields and emitting a narrower schema. It is the measured
    bottleneck (§5). Not started here because a half-finished projection is a
    silent wrong-answer class, and it needs value-level verification
@@ -151,6 +181,26 @@ relation's width while the executor measured the narrowed schema — which
    workers, which is the *second* reason it stays inside 64 MB.
 4. P2-02b (`work_mem` BootVal 512MB → PG's 4MB) — now unblocked, but expect it
    to be large: 512→64MB alone cost 62 %.
+
+## 6a. The attempt that produced wrong answers
+
+P4-01's leaf narrowing was implemented, made to fire, and reverted:
+
+| | pre | post |
+|---|---|---|
+| Q2 | 418 rows | **0 rows** |
+| Q5 | 5 rows | **0 rows** |
+| Q18 | 12 rows | 12 rows, **different tuples** |
+
+21 of 24 matched, and it was **3.6 % faster**. Row counts alone would have
+passed Q18. This is the single clearest justification for 08's risk R5
+requiring value-level comparison on any projection change — and for running it
+even when the target query looks like a clean win, as Q14 did at 11.42 → 3.40 s.
+
+The mechanism the P4-A review recommended is therefore **not sufficient**:
+`baseRelLayout`'s by-name re-basing and `boundaryMap`'s filler do not make a
+pruned base-relation leaf safe inside a join tree. A working version needs the
+real `PathTarget`/`setrefs` work, not a leaf swap.
 
 ## 8. Caveats
 
