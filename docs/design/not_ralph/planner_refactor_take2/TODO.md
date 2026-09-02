@@ -445,11 +445,18 @@ slower than 1.2×, S-cold/WARM gap narrows.
 Exit: every cost GUC demonstrably changes at least one plan; parity budget does
 not grow; no query slower than 1.2×.
 
-- [ ] **P2-01** Introduce the planner context (`PlannerInfo`/`PlannerGlobal`
-      analogue) built once at `optimizer.Plan` entry from the session, carrying
-      `costParams`, collapse limits, GEQO parameters, `enable_*`, and parallel
-      settings. Thread it to both `defaultCostParams()` call sites.
-      *design: 08 §5.1.*
+- [~] **P2-01** Planner context — *design landed and agent-reviewed:*
+      [impl/P2-A-planner-context.md](impl/P2-A-planner-context.md).
+      Scope corrected: this item builds and threads the CARRIER only; no GUC
+      reaches the planner until P2-02. Review found the first design threaded
+      the wrong constructor (the 23 `&resolveContext{` literals never reach a
+      cost site; the real one is `newResolveContext`, 30 sites) and that a
+      `parent`-walking accessor would read **another session's** settings,
+      because `parent` is assigned from the package global `planParent`
+      (`planner.go:13791`, self-documented as goroutine-thread-unsafe). Settings
+      are now a required constructor parameter instead. Also: `bitmapOverCorrelatedProbe`
+      is reached from `planUpdate`/`planDelete` through parentless contexts, so
+      DML is threaded too. *design: 08 §5.1, impl/P2-A.*
 - [ ] **P2-02** Session cost GUCs reach the planner; a test asserts each of
       `seq_page_cost`, `random_page_cost`, `cpu_tuple_cost`,
       `cpu_index_tuple_cost`, `cpu_operator_cost`, `effective_cache_size`,
@@ -476,7 +483,16 @@ not grow; no query slower than 1.2×.
       *design: 08 §5.1; gate: a cross-session isolation test.*
 - [ ] **P2-03** `hash_mem_multiplier` consumed via a `get_hash_memory_limit`
       analogue, shared with the executor's `hashsize`. *design: 08 §5.1.*
-- [ ] **P2-04** Plan-cache correctness under live GUCs — the planner context is
+- [ ] **P2-04** **PREREQUISITE OF P2-02, not a later item** *(established
+      2026-09-02 by review of impl/P2-A)*. `internal/postmaster/plancache.go:42`
+      is a server-level cross-session cache keyed on
+      `(dbOid, normalizeCompatSQL(sql))` with **no GUC fingerprint**
+      (`dispatch.go:1780-1785` states this). Its only guard,
+      `plannerScanTogglesActive` (`dispatch.go:1786`), checks four *scan* GUCs
+      and none of the nine *cost* GUCs. P2-02 converts `dispatch.go:1161`, which
+      sits inside the cache-guarded block — so P2-02 without this would let one
+      session's `random_page_cost` leak into another session's cached plan.
+      Plan-cache correctness under live GUCs — the planner context is
       part of the cache key, or a GUC change invalidates; a test asserts
       `SET random_page_cost` changes the cached plan. Removes the
       `plannerScanTogglesActive` bypass. *design: 08 §5.1, risk R7.*
