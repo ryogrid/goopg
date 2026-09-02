@@ -231,3 +231,53 @@ Two lessons carry forward:
    settings and calls `planSelectWithSettings`; `planSubqueryRangeVar` forwards
    them).
 3. P2-02b, which should be close to free once 1 and 2 are in.
+
+
+---
+
+## 12. Revision 4 (2026-09-03) — the width claim, restated on a fair comparison
+
+Revision 3 claimed a ~39x width gap made goopg batch where PostgreSQL does not,
+and `FINDING-planner-settings-not-propagated.md` withdrew that as a CAUSAL
+story: at the time, goopg's fast and slow arms had identical batching and
+widths, so neither explained the difference between them. The real cause was
+two bugs, both now fixed — a merge join costed on post-filter rows
+(`c281b0830`) and a merge join that dropped an equi-clause entirely
+(`13d53603f`).
+
+With both fixed the comparison is finally fair, and the width claim can be made
+properly — on EQUAL CARDINALITY, which is what was missing before.
+
+TPC-H Q9, SF=1, `work_mem` = PostgreSQL's default on both engines:
+
+| | PostgreSQL 18.3 | goopg |
+|---|---|---|
+| rows through the join tree | ~319 k (63 749.60 x 5 workers) | 321 056 |
+| tuple widths | 23 / 32 / 54 / 81 B | 1098 / 1642 / 2090 / 3164 B |
+| peak hash memory | 38 MB | 97 MB |
+| batches | 1 throughout | **8** |
+| parallelism | Parallel Hash Join, 4 workers | none |
+| Q9 | 6.2 s | 63.8 s |
+
+The row counts now AGREE. The plans compute the same thing, and goopg's tuples
+are 14-39x wider at every level because there is no `PathTarget` and so no
+projection. That is what drives 97 MB against 38 MB and 8 batches against 1.
+
+This is the whole of P2-02b's remaining cost. Correcting `work_mem` to
+PostgreSQL's default is now VALUE-CORRECT (24 MATCH) and costs
+239.7 s -> 295.9 s, of which Q9 is +47.1 s and Q7 +9.7 s; every other query is
+neutral. Both are the same shape: at the smaller budget the plan moves onto
+index-scan-driven joins, which batch more AND are not eligible for goopg's
+parallel post-pass (it drives off sequential scans), so they lose the Gather too.
+
+### Consequences for sequencing
+
+1. **P4-01 (this item) is the remaining blocker for P2-02b**, on evidence that
+   now survives the fair comparison. It was not the blocker for the earlier
+   failures, which were the two merge-join bugs.
+2. The lost `Gather` is a SECOND, independent cause of Q9's +47 s and belongs to
+   Phase 5 (parallelism in the Path model): an index-scan-driven plan cannot be
+   parallelised by a post-pass that only recognises sequential scans. Narrowing
+   the width alone will not recover it.
+3. The gate remains value-level. Both bugs fixed this session returned the
+   CORRECT ROW COUNT while computing the wrong answer or the wrong plan.
