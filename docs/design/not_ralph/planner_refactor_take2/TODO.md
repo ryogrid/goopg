@@ -377,9 +377,21 @@ slower than 1.2×, S-cold/WARM gap narrows.
 
 ### 1b — ANALYZE algorithm
 
-- [ ] **P1-06** Two-stage block sampling (`BlockSampler` + Vitter) at
-      `300 × stattarget`, replacing the full heap scan plus reservoir sample.
-      *design: 08 §4.2; oracle: `acquire_sample_rows`.*
+- [-] **P1-06** **Declined as written — it would trade planner-input accuracy
+      for ANALYZE speed.** *(measured 2026-09-02; see the Dropped table.)*
+      goopg scans every block and counts visible tuples, so `reltuples` is
+      **exact** — `operators_analyze.go:28-32` says so deliberately ("exact, not
+      sample-scaled"). PG samples `300 × stattarget` blocks and *estimates*
+      reltuples via `vac_estimate_reltuples`. Adopting PG's sampling would make
+      ANALYZE ~5.7× faster on `lineitem` (**3.90 s → ~0.69 s**, measured against
+      the reference cluster) and would make the planner's single most-used input
+      an estimate instead of a measurement.
+      ANALYZE is not in the query path, so the cost it saves does not appear in
+      any OLAP figure this project is chasing. **Revisit if** autoanalyze
+      overhead becomes a measured problem at larger scale factors, or if exact
+      `reltuples` is shown not to matter — at which point the sampling and the
+      `vac_estimate_reltuples` scaling must land together, since sampled row
+      counts without the scaling would under-report by the sample fraction.
 - [x] **P1-07** `n_distinct` override — gate:
       `TestNDistinctOverrideBeatsTheSampledFraction`, units. Confirmed exactly
       as recorded. The override wrote only `NDistinct` while `StaDistinct()`
@@ -917,3 +929,4 @@ original wording — negative results are only legible if they survive
 | P0-10 (TPC-DS row anchors inert) | 2026-09-02 | Claim was stale. `ci/batch/lib/summarize.py:651-656` already reads `expected_rows`; fixed by `63056c544` (2026-07-30), a month before the bundle was written. A `git log -S` would have refuted it. | n/a — no defect |
 | P0-08's `PLAN_GATE_REQUIRE=1` "set by ci/batch" | 2026-09-02 | Withdrawn: ci/batch never invokes `make plan-gate`; it calls `make plan-diff` with an explicit pinned `LABEL` (`stage-tpch.sh:234`). The flag would never fire. | n/a |
 | P0-09's standalone oracle re-capture | 2026-09-02 | Rescoped to a timer change only. Field 5 (`secs`) has no readers anywhere in `scripts/` or `ci/batch/`; a re-capture would truncate a git-tracked fixture for no measurable gain. | n/a |
+| P1-06 (two-stage block sampling) | 2026-09-02 | Declined as written. goopg's full scan yields EXACT `reltuples`; PG's sampling estimates it. The change buys ~5.7× on ANALYZE (3.90 s → 0.69 s on `lineitem`) at the cost of making the planner's most-used input an estimate. ANALYZE is not in the query path. Revisit if autoanalyze overhead is measured to matter. | file on revisit |
