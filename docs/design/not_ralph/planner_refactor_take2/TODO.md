@@ -556,9 +556,32 @@ slower than 1.2×, S-cold/WARM gap narrows.
       `rows=1`).
       *Not done:* PG's nullfrac derating in the FK formula — the second half of
       the item, untouched.
-- [ ] **P1-20** `nconst_ec` correction — EquivalenceClasses carry a const flag
-      so `1/ref_tuples` stops double-counting a pushed-down `var = const`.
-      *design: 08 §4.5.*
+- [x] **P1-20** — **the item's premise was inverted, and the real gap was much
+      larger.** `nconst_ec` corrects a DOUBLE-COUNT that arises because
+      `equivclass.c` propagates a constant to every class member. goopg's
+      closure synthesised only column-to-column equalities, so **no constant
+      ever propagated** — there was nothing to double-count, and instead the
+      transformation itself was missing. Measured on the bench clusters for
+      `customer, orders WHERE c_custkey = o_custkey AND c_custkey = 42`:
+
+      | | plan | cost |
+      |---|---|---|
+      | PG | `Index Cond: (o_custkey = '42')`, 16 rows | **13.30** |
+      | goopg before | full scan of all 1 500 000 `orders` | **32249.25** |
+      | goopg after | `Filter: (o_custkey = 42)`, 15 rows | **68.74** |
+
+      A **470× cost reduction**. Gates: `TestEquivClassPropagatesConstants`,
+      `TestEquivClassDoesNotPropagateNonLiterals`, units.
+      Two things the implementation had to get right, both found by tests:
+      the closure had **one caller** (`pushPredicatesIntoCrossJoins`, the legacy
+      path), so with `GOOPG_PGSHAPED_DP` on by default the searched plan never
+      saw it — it is now applied at the seam; and only the **constant** half is
+      given to the search. Adding the transitive `a = c` too hands the search
+      new *join* clauses and reshaped plans broadly, breaking
+      `TestPreDPPinnedSemiKeysResolveAfterDP` on a query with no constants in it.
+      That half stays on its legacy caller pending its own evaluation.
+      `nconst_ec` itself is now *reachable* as a future concern and is not
+      needed yet — goopg has no FK `1/ref_tuples` shortcut to double-count.
 - [ ] **P1-21** **Precondition NOT met by P1-15 — restated 2026-09-02.** The
       item says to delete the cap "once P1-15/16 show the backstop unneeded".
       P1-15 improved the **measured** equi-join path (both sides have MCV

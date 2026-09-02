@@ -123,7 +123,30 @@ func (ec *equivClasses) classes() map[columnIdent][]columnIdent {
 // The returned slice contains fresh `*BinaryOp{Op: OpEq}`
 // nodes; the caller appends them to its conjunct list
 // before buildJoinGraph / enumerateBushyPlans.
+// inferEquivClassConstants is `inferTransitiveEqualities` restricted to its
+// CONSTANT-propagation half — take2 P1-20.
+//
+// The two halves are separated because their blast radii differ by an order of
+// magnitude. Propagating `a = 42` to every member of a's class only ADDS
+// restrictions, so a relation can be filtered earlier and no join order is
+// re-opened. Synthesising the transitive `a = c` from `a = b, b = c` hands the
+// search new JOIN CLAUSES, which changes which orders are legal and reshapes
+// plans broadly — measured: it broke the pinned-semi-join layout
+// TestPreDPPinnedSemiKeysResolveAfterDP asserts, on a query with no constants
+// in it at all.
+//
+// The search therefore takes the constant half only. The transitive half keeps
+// its single legacy caller (pushPredicatesIntoCrossJoins) until it is evaluated
+// on its own, which is a separate item.
+func inferEquivClassConstants(conjuncts []Expr) []Expr {
+	return inferEqualitiesClosure(conjuncts, false)
+}
+
 func inferTransitiveEqualities(conjuncts []Expr) []Expr {
+	return inferEqualitiesClosure(conjuncts, true)
+}
+
+func inferEqualitiesClosure(conjuncts []Expr, emitTransitive bool) []Expr {
 	if len(conjuncts) == 0 {
 		return nil
 	}
@@ -131,6 +154,10 @@ func inferTransitiveEqualities(conjuncts []Expr) []Expr {
 	ec := newEquivClasses()
 	seenPairs := make(map[[2]columnIdent]bool)
 	columnRefByIdent := make(map[columnIdent]*ColumnRef)
+	// take2 P1-20: constants seen against a class member, and the members a
+	// constant has already been stated for. See constant propagation below.
+	constByIdent := make(map[columnIdent]Expr)
+	seenConst := make(map[columnIdent]bool)
 
 	// Pass 1: build equivalence classes from explicit
 	// `ColumnRef = ColumnRef` predicates; record explicit
@@ -149,6 +176,37 @@ func inferTransitiveEqualities(conjuncts []Expr) []Expr {
 		seenPairs[orderedPair(ia, ib)] = true
 		columnRefByIdent[ia] = la
 		columnRefByIdent[ib] = lb
+	}
+
+	// Pass 1b: record `member = const` restrictions — take2 P1-20.
+	//
+	// PostgreSQL's equivalence classes carry constants, and equivclass.c
+	// generates a `var = const` restriction for EVERY member of a class that
+	// has one. goopg's closure synthesised only column-to-column equalities,
+	// so a constant stated against one member never reached the others.
+	//
+	// Measured on the TPC-H bench clusters,
+	// `customer, orders WHERE c_custkey = o_custkey AND c_custkey = 42`:
+	//
+	//	PG     Index Cond: (o_custkey = '42') -> 16 rows, total cost 13.30
+	//	goopg  Parallel Index Only Scan on orders, rows=1500000, cost 32249.25
+	//
+	// A 2400x cost difference, and in execution the whole `orders` relation
+	// scanned instead of one key's worth. This is one of the transformations
+	// equivalence classes exist for.
+	for _, c := range conjuncts {
+		cr, konst, ok := isColumnRefConstEquality(c)
+		if !ok {
+			continue
+		}
+		id := identOf(cr)
+		columnRefByIdent[id] = cr
+		if _, dup := constByIdent[id]; !dup {
+			constByIdent[id] = konst
+		}
+		// The restriction is already stated for this member; only the OTHER
+		// members need one synthesised.
+		seenConst[id] = true
 	}
 
 	// Pass 2: synthesise the closure — for each
@@ -173,7 +231,7 @@ func inferTransitiveEqualities(conjuncts []Expr) []Expr {
 	})
 	for _, root := range roots {
 		members := classMap[root]
-		for i := 0; i < len(members); i++ {
+		for i := 0; emitTransitive && i < len(members); i++ {
 			for j := i + 1; j < len(members); j++ {
 				p := orderedPair(members[i], members[j])
 				if seenPairs[p] {
@@ -192,9 +250,66 @@ func inferTransitiveEqualities(conjuncts []Expr) []Expr {
 				seenPairs[p] = true
 			}
 		}
+
+		// Constant propagation for this class. If ANY member is equated to a
+		// constant, every other member is too — that is what makes the class
+		// an equivalence class. Emitted in the members' own deterministic
+		// order for the same reproducibility reason the pair loop above is
+		// (M0076-0004).
+		var konst Expr
+		for _, m := range members {
+			if k, ok := constByIdent[m]; ok {
+				konst = k
+				break
+			}
+		}
+		if konst == nil {
+			continue
+		}
+		for _, m := range members {
+			if seenConst[m] {
+				continue
+			}
+			ref := columnRefByIdent[m]
+			if ref == nil {
+				continue
+			}
+			added = append(added, &BinaryOp{
+				Op:    parser.OpEq,
+				Left:  ref,
+				Right: konst,
+			})
+			seenConst[m] = true
+		}
 	}
 	return added
 }
+
+// isColumnRefConstEquality recognises `col = const` and `const = col`, the
+// shape that makes an equivalence class `ec_has_const` upstream.
+//
+// Constant-ness is `isConstExpr` (selectivity.go), reused rather than
+// re-written: it already means "a literal the planner may reason about", and a
+// second hand-written Expr switch is the defect class
+// TestExprSwitchInventoryIsPinned exists to catch — it caught this one.
+//
+// The narrowness matters. Only a literal is propagated, so a volatile or
+// parameterised expression is never duplicated onto another relation where it
+// would be evaluated a second time and might not agree with itself.
+func isColumnRefConstEquality(e Expr) (*ColumnRef, Expr, bool) {
+	bo, ok := e.(*BinaryOp)
+	if !ok || bo.Op != parser.OpEq {
+		return nil, nil, false
+	}
+	if cr, isCol := bo.Left.(*ColumnRef); isCol && isConstExpr(bo.Right) {
+		return cr, bo.Right, true
+	}
+	if cr, isCol := bo.Right.(*ColumnRef); isCol && isConstExpr(bo.Left) {
+		return cr, bo.Left, true
+	}
+	return nil, nil, false
+}
+
 
 // smallAnchorRowsThreshold is the design 02 §5 small-anchor
 // row-count limit. A relation whose post-filter rowcount fits

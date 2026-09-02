@@ -312,3 +312,75 @@ func TestColumnStatsResolverIsOneArmList(t *testing.T) {
 		t.Error("the selectivity and cardinality resolvers returned different stats")
 	}
 }
+
+// TestEquivClassPropagatesConstants pins take2 P1-20. An equivalence class is
+// exactly the structure that lets `a = b AND a = 42` imply `b = 42`, and
+// upstream's equivclass.c generates that restriction for every member. goopg's
+// closure synthesised only column-to-column equalities, so the constant stayed
+// on the relation it was written against.
+//
+// Measured on the bench clusters before the fix, for
+// `customer, orders WHERE c_custkey = o_custkey AND c_custkey = 42`:
+// goopg scanned all 1 500 000 orders at cost 32249.25 where PG used an index
+// condition on 16 rows at cost 13.30.
+func TestEquivClassPropagatesConstants(t *testing.T) {
+	a := &ColumnRef{Name: "a", Index: 0, SourceTableIdx: 1, Type: catalog.Type{Name: "int4"}}
+	b := &ColumnRef{Name: "b", Index: 1, SourceTableIdx: 2, Type: catalog.Type{Name: "int4"}}
+	conjuncts := []Expr{
+		&BinaryOp{Op: parser.OpEq, Left: a, Right: b},
+		&BinaryOp{Op: parser.OpEq, Left: a, Right: &IntegerConst{Value: 42}},
+	}
+	got := inferTransitiveEqualities(conjuncts)
+
+	foundBEq42 := false
+	for _, e := range got {
+		bo, ok := e.(*BinaryOp)
+		if !ok || bo.Op != parser.OpEq {
+			continue
+		}
+		cr, isCol := bo.Left.(*ColumnRef)
+		k, isConst := bo.Right.(*IntegerConst)
+		if isCol && isConst && cr.SourceTableIdx == 2 && k.Value == 42 {
+			foundBEq42 = true
+		}
+	}
+	if !foundBEq42 {
+		t.Errorf("`a = b AND a = 42` must imply `b = 42`; synthesised %d clause(s), "+
+			"none of them the constant for b", len(got))
+	}
+
+	// The member the constant was already stated for must NOT get a duplicate.
+	dupes := 0
+	for _, e := range got {
+		if bo, ok := e.(*BinaryOp); ok {
+			if cr, isCol := bo.Left.(*ColumnRef); isCol && cr.SourceTableIdx == 1 {
+				if _, isConst := bo.Right.(*IntegerConst); isConst {
+					dupes++
+				}
+			}
+		}
+	}
+	if dupes > 0 {
+		t.Errorf("re-stated the constant for the member that already had it (%d times)", dupes)
+	}
+}
+
+// TestEquivClassDoesNotPropagateNonLiterals guards the narrowness: only a
+// literal may be restated against another relation. A volatile or
+// parameterised expression duplicated onto a second relation would be
+// evaluated twice and might not agree with itself.
+func TestEquivClassDoesNotPropagateNonLiterals(t *testing.T) {
+	a := &ColumnRef{Name: "a", Index: 0, SourceTableIdx: 1, Type: catalog.Type{Name: "int4"}}
+	b := &ColumnRef{Name: "b", Index: 1, SourceTableIdx: 2, Type: catalog.Type{Name: "int4"}}
+	conjuncts := []Expr{
+		&BinaryOp{Op: parser.OpEq, Left: a, Right: b},
+		&BinaryOp{Op: parser.OpEq, Left: a, Right: &FuncCall{Name: "random"}},
+	}
+	for _, e := range inferTransitiveEqualities(conjuncts) {
+		if bo, ok := e.(*BinaryOp); ok {
+			if _, isFn := bo.Right.(*FuncCall); isFn {
+				t.Error("a function call was propagated across the equivalence class")
+			}
+		}
+	}
+}
