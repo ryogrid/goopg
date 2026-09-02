@@ -53,7 +53,22 @@ reports `changed=0` against a pre-P0 goopg capture.
       (the recursive self-reference is a `CTEScan` over the working table); it
       now renders PG's leaf `WorkTable Scan on <name>`, making goopg's
       WITH RECURSIVE plan structurally identical to PG's.
-- [ ] **P0-02** EXPLAIN emits the chosen path's real `(startup, total)`, `rows`
+- [x] **P0-02** / **P0-03** Real costs on every node — `9cbc7661b`; gates:
+      `TestNoNodeRendersZeroCost`, `TestLegacyDisplayCostIsMonotone`, units.
+      Landed **together**, deliberately: P0-02 alone prices the scan/join region
+      and leaves the legacy upper planner at `0.00`, and a plan MIXING real
+      costs with `0.00` is worse than an all-zero one (a free node and an
+      unpriced node become indistinguishable). Mechanism is `PlanCost` embedded
+      in the node, as PG carries it on `struct Plan` — the side-index design was
+      tried and abandoned (no per-statement context on the chain;
+      `createPlanNode` returns bottom-up; a pointer-keyed map collapses shared
+      CTE subtrees). `rows=` still sources `EstimateRows`. FORMAT JSON gained
+      the three missing cost keys.
+      **First finding from the instrument:** on a filtered TPC-H aggregate goopg
+      renders `width=550` where PG renders `width=2` — goopg carries the whole
+      tuple where PG projects to the two bytes it needs. That is P4-01's
+      `PathTarget` case, now measurable.
+- [ ] ~~**P0-02** EXPLAIN emits the chosen path's real `(startup, total)`, `rows`
       and `width`; `COSTS OFF` suppresses them. Replace both literal
       `cost=0.00..0.00` sites in `internal/executor/operators_explain.go`.
       Carry the numbers onto the plan node at `createPlan` time rather than
@@ -70,9 +85,7 @@ reports `changed=0` against a pre-P0 goopg capture.
       `Path.Rows` is a separate item.
       *design: 08 §3 P0-2, impl/P0-A §3; gate: units + a test comparing rendered
       numbers to `finalPath()`; `estimate-audit` green.*
-- [ ] **P0-03** Nodes above the seam print costs derived from the legacy
-      estimate rather than zeros; a test asserts no node renders
-      `cost=0.00..0.00`. *design: 08 §3; gate: units.*
+      *(closed above, with P0-02)*
 - [x] **P0-04d** Schema qualification followed no mode — `2a63fbe21`; gate:
       `TestSchemaQualificationFollowsVerbosity`, units. **Not in the original
       plan**, found while reading P0-04's numbering rule and larger in impact:
@@ -191,6 +204,19 @@ reports `changed=0` against a pre-P0 goopg capture.
 
 ## Phase 1 — Statistics fidelity
 
+> **READ FIRST: [impl/FINDING-histograms-lost-on-restart.md](impl/FINDING-histograms-lost-on-restart.md).**
+> ANALYZE histograms are computed, are visible in `pg_stats`, and are **gone
+> after a server restart** — for narrow columns (`l_quantity`, `l_shipdate`),
+> not only the wide-text ones P1-11 records. `n_distinct` and the relation size
+> survive; only the histograms are lost. So on any restarted server every range
+> predicate falls to `DEFAULT_INEQ_SEL` and the planner estimates blind, which
+> almost certainly includes **every recorded goopg benchmark figure**, the
+> 227.0 s / 9.9x headline among them. No cost-model work can recover an input
+> that is not there. **Fix this before P1-11b**, and re-measure P1-11b's value
+> afterwards — its stated rationale is wrong in both directions (see §6 of the
+> finding).
+
+
 Exit: estimate ratchet does not regress, parity budget does not grow, no query
 slower than 1.2×, S-cold/WARM gap narrows.
 
@@ -243,7 +269,10 @@ slower than 1.2×, S-cold/WARM gap narrows.
 
 ### 1d — Restriction selectivity
 
-- [ ] **P1-11b** `convert_to_scalar` for non-numeric types —
+- [ ] **P1-11b** *(rationale corrected — see the finding above; the claimed
+      0.31-vs-0.14 error does not hold, because ISO date strings sort in date
+      order so only the WITHIN-bucket fraction is defaulted, ~0.5% at 100
+      buckets)* `convert_to_scalar` for non-numeric types —
       `convert_string_to_scalar`, `convert_timevalue_to_scalar` and the network
       variants. Today `numericValue` handles only the numeric family, so
       `bucketFraction` returns a flat **0.5** for `date`, `timestamp`, `text`,
