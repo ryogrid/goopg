@@ -189,6 +189,12 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// 24,005,020 rows instead of 6,001,255 and the query summed 4.02x the
 	// correct answer while returning the correct ROW COUNT.
 	// impl/FINDING-CRITICAL-mergejoin-wrong-answers.md.
+	// Every candidate below starts from fullResidual, not `residual`: the
+	// clauses whose groups the outer's ordering does not serve are dropped from
+	// mergeClauses ONCE, here, and stay dropped for the truncation search too.
+	// Passing the original `residual` to those calls left the same clauses
+	// evaluated nowhere — the truncation demotion only ever re-adds clauses cut
+	// from the ALREADY-trimmed list.
 	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
 	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor)
 
@@ -225,7 +231,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				// construction and this inner was SELECTED for already being
 				// ordered, so neither side is sorted here.
 				tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-					newClauses, demoteDroppedMergeClauses(residual, mergeClauses, newClauses), mergeTuplesFor)
+					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor)
 			}
 			cheapestTotalInner = ip
 		}
@@ -242,7 +248,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				}
 				if len(newClauses) > 0 {
 					tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-						newClauses, demoteDroppedMergeClauses(residual, mergeClauses, newClauses), mergeTuplesFor)
+						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor)
 				}
 			}
 			cheapestStartupInner = ip
