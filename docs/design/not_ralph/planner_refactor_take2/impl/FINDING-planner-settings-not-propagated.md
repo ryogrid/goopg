@@ -74,6 +74,37 @@ change, not only a session-GUC change.
    cache (conf values are uniform across sessions, so sharing is correct), so it
    is deliberately left alone — but it means the predicate's name overstates it.
 
+## Progress
+
+**Landed (f93ea20dd):** settings are an explicit parameter of
+`newResolveContext`, threaded through the FROM-clause path (`planFromClause`,
+`planFromRangeVars`, `planFromItem`, `planScanRangeVar`) and inherited by the
+aggregate and window stages from their input scope. Gated by
+`TestPlannerSettingsReachSubqueryScan`. TPC-H 242.91 s -> 258.28 s (+6.3 %),
+24 MATCH on values. The slowdown is the correction itself: the bench now plans
+at the 64MB its conf specifies instead of an accidental 1 GB.
+
+**Still open — the derived-table path.** `planSelectWithParent` (planner.go
+~13813) calls `planSelect`, i.e. the defaulting wrapper, so a `(SELECT ...) AS
+alias` FROM item still plans under the defaults. That is Q9's subquery, which is
+why P2-02b remains blocked.
+
+**Second attempt (2026-09-03) — reverted, not merely slower.** Threading
+`planSelectWithParent` / set-operation operands / scalar-subquery sites by a
+mechanical compiler-driven pass, together with P2-02b, produced Q9 = 262 s. That
+is NON-MONOTONIC: the same query is 15 s at a 1 GB budget and 70 s at 8 MB, so
+128 MB cannot legitimately land at 262 s. The pass therefore introduced a bug —
+most likely an argument threaded from the wrong scope by the regex-driven edit —
+rather than merely tightening a budget. It was reverted rather than debugged
+under time pressure.
+
+The lesson for the next attempt: this path must be threaded by hand, one caller
+at a time, each with its own assertion of which scope's settings it should
+inherit. `psFromParent`-style inheritance in particular needs review — the
+P2-A hazard (resolveContext.parent is assigned from the package-global
+planParent) applies to some of these callers and not others, and the mechanical
+pass did not distinguish them.
+
 ## Proposed fix (not yet done)
 
 Thread the statement's `PlannerSettings` to every `newResolveContext` call.
