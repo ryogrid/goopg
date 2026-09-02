@@ -2121,6 +2121,18 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 	case *optimizer.Explain:
 		return "Explain"
 	case *optimizer.CTEScan:
+		// take2 P0-01: a CTEScan whose body is a bare WorkTableScan is the
+		// RECURSIVE SELF-REFERENCE, not an ordinary CTE reference — with.go
+		// registers the working table as the CTE's body while planning the
+		// recursive term. PG renders it as a leaf `WorkTable Scan on <name>`
+		// (oracle: `->  WorkTable Scan on t t_1`), never as a CTE Scan, and
+		// gives it no `CTE <name>` section of its own.
+		if isRecursiveSelfRef(p) {
+			if p.Alias != "" && p.Alias != p.Name {
+				return fmt.Sprintf("WorkTable Scan on %s %s", p.Name, p.Alias)
+			}
+			return fmt.Sprintf("WorkTable Scan on %s", p.Name)
+		}
 		// Mirrors upstream's "CTE Scan on <name>" label; the
 		// alias is rendered separately when distinct so output
 		// like `WITH a AS (SELECT 1) SELECT * FROM a x` shows
@@ -2147,7 +2159,13 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 		// grepping for the PG label read zero even once bitmap scans were being
 		// chosen.
 		if p.Table == nil {
-			return fmt.Sprintf("%T", n)
+			// A nil Table is a producer bug, not a rendering case. Printing
+			// the Go type here was the SAME defect this arm's comment above
+			// describes — and it would also defeat the node-type coverage
+			// test (P0-01), which cannot distinguish a %T returned by a
+			// covered arm from the switch's fallthrough. Render the node
+			// name PG uses and let the missing relation be conspicuous.
+			return "Bitmap Heap Scan"
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return "Bitmap Heap Scan on " + dname
@@ -2156,7 +2174,10 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 	case *optimizer.BitmapIndexScan:
 		// PG names the INDEX here, not the table.
 		if p.Index == nil {
-			return fmt.Sprintf("%T", n)
+			// See the BitmapHeapScan arm above: a %T from a COVERED arm is
+			// indistinguishable from the fallthrough, so P0-01's coverage
+			// test cannot pin this node while it can return a Go type.
+			return "Bitmap Index Scan"
 		}
 		return "Bitmap Index Scan on " + p.Index.QualifiedName()
 	case *optimizer.BitmapAnd:
@@ -2220,8 +2241,131 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 		// (explain.c T_ProjectSet 1382-1384): no `on <funcname>`, no
 		// Function Call detail. Its child renders beneath it.
 		return "ProjectSet"
+
+	// ---------------------------------------------------------------
+	// take2 P0-01: the eighteen node types that had no arm and therefore
+	// rendered their Go type name into user-visible EXPLAIN output. Verified
+	// live before this change — `EXPLAIN SELECT * FROM regexp_matches(...)`
+	// on goopg printed `*optimizer.FromRegexpMatches`, and a WITH RECURSIVE
+	// query printed `*optimizer.RecursiveUnion`. Every label below was read
+	// off PostgreSQL 18.3 (the :65432 reference cluster) rather than guessed;
+	// where PG has no counterpart at all, the comment says so.
+	// ---------------------------------------------------------------
+
+	case *optimizer.RecursiveUnion:
+		// PG: `Recursive Union` (explain.c T_RecursiveUnion). Confirmed on
+		// the oracle with `WITH RECURSIVE t(n) AS (...) SELECT * FROM t`.
+		return "Recursive Union"
+
+	case *optimizer.WorkTableScan:
+		// PG: `WorkTable Scan on <cte> <alias>` — the oracle prints
+		// `WorkTable Scan on t t_1`. goopg's node carries NO name (the
+		// struct is `{pos, schema}`), so the relation half cannot be
+		// rendered and the bare node name is emitted. That missing name is a
+		// real parity gap, not a rendering choice; it is recorded as such
+		// rather than invented here.
+		return "WorkTable Scan"
+
+	case *optimizer.DistinctOn:
+		// PG has no DistinctOn node: `SELECT DISTINCT ON (k) ...` plans as
+		// `Unique` over a Sort, and the oracle confirms the top label is
+		// `Unique`. goopg fuses the two into one node, so the sort is not
+		// separately visible — a shape divergence the parity instrument
+		// should COUNT, which it cannot do while the label is a Go type.
+		return "Unique"
+
+	case *optimizer.RowsFrom:
+		// PG plans `ROWS FROM (f(), g())` as a single FunctionScan and names
+		// the FIRST function: the oracle prints `Function Scan on
+		// generate_series` for `ROWS FROM (generate_series(1,3),
+		// generate_series(1,2))`.
+		if name, _ := srfFunctionCallArgs(firstRowsFromFunc(p)); name != "" {
+			return srfFunctionScanLabel(name, "")
+		}
+		return "Function Scan"
+
+	case *optimizer.ScalarFuncScan:
+		// A non-set-returning function in FROM. PG renders
+		// `Function Scan on <name> <alias>` — confirmed with
+		// `FROM nation n, abs(n.n_nationkey) a`. (A constant-foldable call
+		// such as `FROM abs(-1)` collapses to `Result` on PG before it ever
+		// reaches a scan node, which is a planning difference, not a label.)
+		if fc, ok := p.Func.(*optimizer.FuncCall); ok && fc.Name != "" {
+			return srfFunctionScanLabel(fc.Name, "")
+		}
+		return "Function Scan"
+
+	// The remaining twelve are built-in table functions. PG renders every one
+	// as `Function Scan on <funcname>`; each label below was confirmed
+	// individually against the oracle where the function exists there.
+	case *optimizer.FromRegexpMatches:
+		return srfFunctionScanLabel("regexp_matches", "")
+	case *optimizer.FromRegexpSplitToTable:
+		return srfFunctionScanLabel("regexp_split_to_table", "")
+	case *optimizer.PgAvailableWalSummaries:
+		return srfFunctionScanLabel("pg_available_wal_summaries", "")
+	case *optimizer.PgGetCatalogForeignKeys:
+		return srfFunctionScanLabel("pg_get_catalog_foreign_keys", "")
+	case *optimizer.PgGetPublicationTables:
+		return srfFunctionScanLabel("pg_get_publication_tables", "")
+	case *optimizer.PgGetSequenceData:
+		return srfFunctionScanLabel("pg_get_sequence_data", "")
+	case *optimizer.PgInputErrorInfo:
+		return srfFunctionScanLabel("pg_input_error_info", "")
+	case *optimizer.PgOptionsToTable:
+		return srfFunctionScanLabel("pg_options_to_table", "")
+	case *optimizer.PgPartitionTree:
+		// One node serves two functions; the label must follow the field or
+		// half the plans would name the wrong one.
+		if p.FuncName != "" {
+			return srfFunctionScanLabel(p.FuncName, "")
+		}
+		return srfFunctionScanLabel("pg_partition_tree", "")
+	case *optimizer.PgSequenceParameters:
+		return srfFunctionScanLabel("pg_sequence_parameters", "")
+	case *optimizer.TSTokenType:
+		return srfFunctionScanLabel("ts_token_type", "")
+	case *optimizer.VerifyHeapam:
+		// amcheck's function. Built in to goopg; an extension on PG, so the
+		// reference cluster cannot render it — the label follows the same
+		// `Function Scan on <name>` rule every other table function does.
+		return srfFunctionScanLabel("verify_heapam", "")
+
+	case *optimizer.Call:
+		// PG has NO label for this: `EXPLAIN CALL p()` is a syntax error
+		// upstream, because CALL is not in EXPLAIN's grammar. goopg accepts
+		// it and reaches this renderer, which is itself a divergence — but
+		// one to record, not to fix by printing a Go type name. The label is
+		// goopg's own and is marked as such.
+		return "Call"
 	}
 	return fmt.Sprintf("%T", n)
+}
+
+// isRecursiveSelfRef reports whether a CTEScan is the self-reference inside a
+// WITH RECURSIVE term rather than an ordinary reference to a materialised CTE.
+//
+// internal/optimizer/with.go registers the CTE's body as a bare WorkTableScan
+// while planning the recursive member, so every reference the recursive term
+// makes to its own name resolves to a CTEScan wrapping that node. PG models the
+// same thing as a distinct T_WorkTableScan plan node and renders it as a leaf,
+// with no `CTE <name>` section — so goopg must not hoist a section for it
+// either, or a WITH RECURSIVE plan prints the CTE header twice.
+func isRecursiveSelfRef(p *optimizer.CTEScan) bool {
+	if p == nil {
+		return false
+	}
+	_, ok := p.Child.(*optimizer.WorkTableScan)
+	return ok
+}
+
+// firstRowsFromFunc returns the first function node of a ROWS FROM list, or
+// nil. PG names that function in the FunctionScan label (see the RowsFrom arm).
+func firstRowsFromFunc(p *optimizer.RowsFrom) optimizer.Node {
+	if len(p.Funcs) == 0 {
+		return nil
+	}
+	return p.Funcs[0]
 }
 
 // setOpNodeName renders a SetOp's PG-style label — see the
@@ -2364,6 +2508,12 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 		out = append(out, p.UsingScans...)
 		return out
 	case *optimizer.CTEScan:
+		// The recursive self-reference renders as a LEAF `WorkTable Scan`,
+		// matching PG: descending would print the working table's anchor
+		// schema as a phantom subtree beneath it.
+		if isRecursiveSelfRef(p) {
+			return nil
+		}
 		return []optimizer.Node{p.Child}
 	case *optimizer.LockRows:
 		return []optimizer.Node{p.Child}
@@ -2391,6 +2541,45 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 		return []optimizer.Node{p.Child}
 	case *optimizer.Merge:
 		return []optimizer.Node{p.Source}
+
+	// take2 P0-01: four node types carried children that this walker never
+	// visited, so their ENTIRE SUBTREE was absent from EXPLAIN — the same
+	// class of defect as M0125-0037(i)'s missing SetOp arm above, which
+	// truncated Q5/Q18/Q67 to a four-line plan. Measured before the fix:
+	//
+	//   goopg   SELECT DISTINCT ON (k) ...  ->  "Unique"          (one line)
+	//   PG 18.3 same query                  ->  Unique / Sort / Seq Scan
+	//
+	// A truncated plan is worse for a parity census than a mislabelled one:
+	// the missing rows read as agreement on everything they do not show.
+	case *optimizer.DistinctOn:
+		if p.Child == nil {
+			return nil
+		}
+		return []optimizer.Node{p.Child}
+	case *optimizer.RecursiveUnion:
+		// PG renders the non-recursive term first, then the recursive one
+		// (explain.c walks lefttree then righttree): `-> Result` above
+		// `-> WorkTable Scan on t t_1`.
+		out := make([]optimizer.Node, 0, 2)
+		if p.Anchor != nil {
+			out = append(out, p.Anchor)
+		}
+		if p.Recursive != nil {
+			out = append(out, p.Recursive)
+		}
+		return out
+	case *optimizer.RowsFrom:
+		// PG plans ROWS FROM as ONE FunctionScan with several function
+		// expressions, so it has no children to render there. goopg models
+		// each entry as its own node; walking them keeps the tree honest
+		// rather than silently dropping every entry after the label.
+		return p.Funcs
+	case *optimizer.Copy:
+		if p.Query == nil {
+			return nil
+		}
+		return []optimizer.Node{p.Query}
 	case *optimizer.CTEDMLPrefix:
 		out := make([]optimizer.Node, 0, len(p.DMls)+1)
 		out = append(out, p.DMls...)
