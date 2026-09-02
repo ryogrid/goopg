@@ -810,7 +810,17 @@ not grow; no query slower than 1.2×.
       and is now purely a performance question: it costs 239.7s -> 295.9s
       (+23.4%). Remaining work on P2-02b is closing that gap, not correctness.
       That gap is ENTIRELY Q9 (+47.1s) and Q7 (+9.7s); every other query is
-      neutral. Both have the same two causes, measured at equal cardinality
+      neutral.
+      **Re-measured 2026-09-03 after the ndistinct two-form fix**, which moved
+      TPC-H -8.1% and 79 TPC-DS plan shapes and so invalidated the earlier
+      verdict on its face. It did not help here: P2-02b now costs
+      215.62s -> 265.44s (**+23.1%**, against +23.4% before), and the breakdown
+      is the same two queries with the same character — Q9 11.61->51.68s,
+      Q7 8.68->18.04s, together the whole gap. Values are now correct
+      (24 MATCH), which they were not before the merge-join dropped-clause fix.
+      That is a useful negative result: a 1000x class of estimation error is NOT
+      what makes P2-02b expensive, so the diagnosis stands unchanged — tuple
+      WIDTH (P4-01) and the lost Gather (Phase 5). Both have the same two causes, measured at equal cardinality
       (goopg 321,056 rows vs PG ~319k on the same join): goopg's tuples are
       14-39x wider (1098-3164 B vs 23-81 B) for want of a PathTarget, so it needs
       97 MB and 8 batches where PG needs 38 MB and 1 — P4-01; and at the smaller
