@@ -89,16 +89,55 @@ returns every tuple and the date range is a post-fetch filter. A scan that
 touches 6 M heap tuples is costed at 66 680, which is why a merge join over it
 outbids a hash join.
 
-Two distinct defects are visible and neither is spill:
+### The provenance trace names the cause: it is neither of the above
 
-1. **The full-range ordered index scan is under-costed.** PG's `cost_index`
-   with no index quals uses `indexSelectivity = 1.0` and charges for every tuple
-   the index returns, applying the filter's selectivity only to the OUTPUT row
-   count. goopg's own `costIndexScan` does the right thing and the ordered
-   producer does pass `selectivity: 1.0` — so the number above is not coming
-   from that path, and establishing which producer emitted it is the next step.
-   **P0-11's `DPPATH` provenance trace was built for exactly this question** and
-   is the resume point.
+Running Q14 under `GOOPG_PGSHAPED_DP_TRACE=1` (P0-11's first real use) gives the
+search's own numbers:
+
+```
+DPPATH producer=index.ordered relids={0} rows=6001255 startup=0.38 total=657623.09  accepted
+DPPATH producer=mergejoin    relids={0,1}             startup=0.75 total=754717.55  accepted
+DPPATH producer=join.hash    relids={0,1}         startup=31469.00 total=1811944.24 dominated
+```
+
+**The index scan is NOT under-costed.** `costIndexScan` prices the full-range
+scan at 657 623 for 6 M rows, which is right, and the merge join at 754 717 is a
+correct sum of its inputs. The defect is on the other side: **the hash join is
+costed at 1 811 944**, 2.4× the merge join, so the merge join wins on the
+numbers. At `work_mem = 512MB` the same hash join costs 557 048 and wins.
+
+Why the hash join balloons is the whole finding:
+
+```
+goopg:  Index Scan ... on part  (rows=200000 width=548)   ->  200000 x 548 B = 104.5 MB
+PG:     Index Only Scan on part (rows=200000 width=6)     ->  reported 14.6 MB, Batches: 1
+```
+
+goopg's `part` rows are **548 bytes wide**; PostgreSQL's are **6**. The query
+needs `p_partkey` and `p_type`. PG projects to them; goopg carries the whole
+tuple, because it has **no `PathTarget`** — the hash table is estimated, and
+built, roughly fifty times larger than it needs to be. At 64 MB that forces
+batching, the cost triples, and the planner correctly concludes that a merge
+join is cheaper *given the sizes it was told*.
+
+So the causal chain is:
+
+**no PathTarget → 548-byte rows instead of 6 → a 104 MB hash table instead of
+14 MB → batching at 64 MB → hash join costed at 1.8 M → merge join over a full
+6 M-row index scan wins → 13.9 s where PG takes 1.08 s.**
+
+That is **P4-01**, and it is no longer a Phase 4 tidy-up on a list. It is the
+measured bottleneck, and the `width=550` vs `width=2` observation recorded when
+P0-02 first surfaced real costs was the same defect seen from the other end.
+
+Two further defects are visible and neither is spill:
+
+1. **The displayed cost of that scan (66 680) is a rendering artefact, not the
+   planner's number.** The search costed it at 657 623; the plan text shows
+   `DeriveLegacyDisplayCost`'s derivation because the winning tree was rebuilt
+   above the seam. That is a P0-03 limitation and it briefly sent this
+   investigation down the wrong path — worth recording, since the display cost
+   and the search cost differing by 10× on the same node is itself misleading.
 2. **goopg has no Parallel Hash Join.** PG shares one 14.6 MB hash table across
    five workers; goopg would build a private table per worker. That is P5-06,
    and it is why PG stays comfortably inside 64 MB where goopg's costing thinks
@@ -152,12 +191,13 @@ meaningful because planner and executor now read the same value.
 
 ## 6. Resume points
 
-1. **Identify which producer emits the under-costed full-range index scan.**
-   `costIndexScan` and `pathindexordered.go` both look correct, so the number is
-   coming from somewhere else. Run with `GOOPG_PGSHAPED_DP_TRACE=1` and read the
-   `DPPATH` records (P0-11) for the `lineitem` relid: producer, rows, startup,
-   total, verdict. This is the first use the trace was built for.
+1. **P4-01 (`PathTarget`) is the item to do next**, on this evidence, ahead of
+   the rest of Phase 1 and of Phase 3. It is what makes goopg's hash tables
+   ~50× too large.
 2. Re-measure the PG side in full at the current configuration, rather than
    comparing against the recorded 22.9 s from 2026-08-31.
-3. P5-06 (parallel hash join) is now evidenced, not speculative: PG's 14.6 MB
-   shared table across five workers is why it stays inside 64 MB.
+3. P5-06 (parallel hash join) is evidenced, not speculative: PG's 14.6 MB shared
+   table across five workers is the second reason it stays inside 64 MB.
+4. Consider making `DeriveLegacyDisplayCost` visibly distinguishable from a real
+   path cost in EXPLAIN (a marker, or omitting it), since the two differing by
+   10× on one node is actively misleading (P0-03 follow-up).
