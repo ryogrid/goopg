@@ -445,7 +445,21 @@ slower than 1.2×, S-cold/WARM gap narrows.
 Exit: every cost GUC demonstrably changes at least one plan; parity budget does
 not grow; no query slower than 1.2×.
 
-- [~] **P2-01** Planner context — *design landed and agent-reviewed:*
+- [x] **P2-01** Planner context — gates:
+      `TestPlannerSettingsReachTheJoinSearch` (negative control: reverting the
+      seam to `defaultCostParams()` fails it),
+      `TestDefaultPlannerSettingsMatchTheHardWiredParams`,
+      `TestUnstampedContextGetsDefaultsNotZeroes`, units,
+      `internal/{optimizer,executor,postmaster}`. Both real cost sites now read
+      the carrier; only the display-only `DeriveLegacyDisplayCost` still calls
+      `defaultCostParams()`. Plan-neutral by construction — every `Plan()`
+      caller stays on `DefaultPlannerSettings()`, which is *defined as* what
+      `defaultCostParams()` reads rather than a second copy of the constants.
+      `newResolveContext` initialises `settings` to the DEFAULTS, never the zero
+      value: a zero `PlannerSettings` would price every page and tuple at 0.0,
+      so an unstamped path degrades to today's behaviour instead of nonsense.
+      *design: impl/P2-A-planner-context.md.*
+      ~~*design landed and agent-reviewed:*
       [impl/P2-A-planner-context.md](impl/P2-A-planner-context.md).
       Scope corrected: this item builds and threads the CARRIER only; no GUC
       reaches the planner until P2-02. Review found the first design threaded
@@ -456,7 +470,7 @@ not grow; no query slower than 1.2×.
       (`planner.go:13791`, self-documented as goroutine-thread-unsafe). Settings
       are now a required constructor parameter instead. Also: `bitmapOverCorrelatedProbe`
       is reached from `planUpdate`/`planDelete` through parentless contexts, so
-      DML is threaded too. *design: 08 §5.1, impl/P2-A.*
+      DML is threaded too.~~
 - [ ] **P2-02** Session cost GUCs reach the planner; a test asserts each of
       `seq_page_cost`, `random_page_cost`, `cpu_tuple_cost`,
       `cpu_index_tuple_cost`, `cpu_operator_cost`, `effective_cache_size`,

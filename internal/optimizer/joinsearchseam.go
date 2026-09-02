@@ -334,7 +334,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		relInfos:   relInfos,
 		conjuncts:  searchConjuncts,
 		cumOffsets: cumOffsets,
-		cp:         defaultCostParams(),
+		// take2 P2-01: the search prices with the STATEMENT's settings, not a
+		// hard-wired constant list. tryJoinSearch is reached only from inside
+		// planSelect (predp.go and two sites in planner.go), so this ctx is
+		// always the one planSelect stamped — no parent walk is needed, and
+		// none is safe (see resolveContext.settings).
+		cp:         ctx.settings.costParams(),
 		cat:        cat,
 		// `root->tuple_fraction`, carried on the context because the `*Limit`
 		// node does not exist yet at this point in `planSelect` (see

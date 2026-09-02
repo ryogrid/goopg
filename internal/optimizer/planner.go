@@ -87,7 +87,18 @@ func ResolveIndexPredicate(predicate parser.Expr, tbl *catalog.Table) (Expr, err
 // param-slot space for the whole statement (nested planSelect calls
 // must not each run it, or slot IDs would collide across levels).
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
-	node, err := planStmt(stmt, cat)
+	return PlanWithSettings(stmt, cat, DefaultPlannerSettings())
+}
+
+// PlanWithSettings is Plan with an explicit per-statement planner context.
+//
+// take2 P2-01. `Plan` keeps its signature because it has thirty call sites and
+// most of them (plpgsql, FK checks, DDL) have no session to draw settings from;
+// the postmaster converts its own call sites in P2-02, which is itself blocked
+// on P2-04 because the plan cache is cross-session and carries no GUC
+// fingerprint.
+func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
+	node, err := planStmtWithSettings(stmt, cat, plannerSet)
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +151,10 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 }
 
 func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
+	return planStmtWithSettings(stmt, cat, DefaultPlannerSettings())
+}
+
+func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
 		// Rewrite `(srf(...)).*` target-list indirection-stars into
@@ -153,7 +168,7 @@ func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
-		return planSelect(s, cat)
+		return planSelectWithSettings(s, cat, plannerSet)
 	case *parser.InsertStmt:
 		// M0103-0007 rung 15: substitute bare DEFAULT cells in VALUES rows
 		// with the target column's catalog DefaultExpr (or NULL) before the
@@ -329,6 +344,15 @@ type resolveContext struct {
 	// Var.varlevelsup by counting how many parent links to walk.
 	// nil for the top-level SELECT.
 	parent *resolveContext
+	// settings is the per-statement planner context (plannersettings.go).
+	//
+	// It is resolved DIRECTLY, never by walking `parent`: `parent` is assigned
+	// after construction from the package-level `planParent`, whose own comment
+	// records that it is goroutine-thread-unsafe, so a parent walk could read a
+	// concurrently-planning session's settings and silently produce a plan
+	// costed with another connection's GUCs. Every path that reaches a cost
+	// site stamps this field itself.
+	settings PlannerSettings
 	// lateralSibling marks a lateral context that is at the SAME
 	// correlated-subquery nesting level as its parent — it extends
 	// the current FROM-clause scope horizontally, not vertically.
@@ -492,7 +516,17 @@ func tableSchemaWithSource(t *catalog.Table, sourceIdx int16) Schema {
 }
 
 func newResolveContext(bindings []rangeBinding, schema Schema) *resolveContext {
-	ctx := &resolveContext{schema: schema, bindings: append([]rangeBinding(nil), bindings...)}
+	// settings starts at the DEFAULTS, never at the zero value. A zero
+	// PlannerSettings would price every page and tuple at 0.0, so a context
+	// that some path forgot to stamp would silently produce nonsense rather
+	// than today's behaviour. Defaulting here makes an unstamped context
+	// exactly as correct as the tree was before P2-01, which is what keeps
+	// this commit plan-neutral.
+	ctx := &resolveContext{
+		schema:   schema,
+		bindings: append([]rangeBinding(nil), bindings...),
+		settings: DefaultPlannerSettings(),
+	}
 	if len(ctx.bindings) > 0 {
 		ctx.table = ctx.bindings[0].table
 		ctx.alias = ctx.bindings[0].alias
@@ -738,7 +772,19 @@ func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
 }
 
+// planSelect plans a SELECT under the DEFAULT planner settings.
+//
+// take2 P2-01: this is now a wrapper. Every caller that has a per-statement
+// PlannerSettings in scope should call planSelectWithSettings instead; the
+// remaining callers of this name are the paths that do not yet thread one, and
+// they are enumerated in impl/P2-A §4.3 rather than left to be discovered.
+// Because DefaultPlannerSettings() is exactly what the tree used before this
+// change, every such path behaves identically to before.
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	return planSelectWithSettings(s, cat, DefaultPlannerSettings())
+}
+
+func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
 	// UNION branches) call planSelect directly without going through
@@ -1092,6 +1138,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if ctx != nil {
 		ctx.cat = cat
 		ctx.parent = planParent
+		// take2 P2-01: the per-statement planner context. Stamped DIRECTLY
+		// here, in the same place `cat` and `parent` are, and resolved by the
+		// cost sites from this field alone — never by walking `parent`, which
+		// is assigned from the goroutine-unsafe package global `planParent`
+		// and could therefore yield a concurrently-planning session's GUCs.
+		ctx.settings = plannerSet
 	}
 
 	// preDPUnnested marks that the S5a pre-DP path already ran the
@@ -9234,11 +9286,18 @@ func parserExprKey(e parser.Expr) string {
 // the index scan's does, and `needsRecheck` marks the prefix probe's tuples
 // for recheck against BitmapQual — which carries the very equality this probe
 // binds.
-func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int) Node {
+// take2 P2-01: takes the statement's planner settings rather than calling
+// defaultCostParams(). Its caller passes ctx.settings, which covers all three
+// paths that reach it — planSelect, planUpdate and planDelete. The DML two
+// build their context with singleBindingContext, which today yields the
+// defaults; when P2-02 stamps those contexts the session's GUCs flow here with
+// no further change, which is why the value travels on the context rather than
+// as a separate parameter.
+func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int, ps PlannerSettings) Node {
 	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
 		return nil
 	}
-	cp := defaultCostParams()
+	cp := ps.costParams()
 	relTuples := float64(tbl.Stats.RowCount)
 	relPages := baseRelPages(tbl, relTuples)
 	T := float64(relPages)
@@ -9389,7 +9448,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 			// Reachable only with an outer binding in scope, so the
 			// UPDATE/DELETE callers — whose executors pattern-match
 			// `*IndexScan` — never see the bitmap shape.
-			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos()); bhs != nil {
+			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos(), ctx.settings); bhs != nil {
 				return bhs, true, nil
 			}
 			return &IndexScan{
