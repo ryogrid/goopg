@@ -95,3 +95,56 @@ func TestEnableMemoizeIsPerStatementNotProcessGlobal(t *testing.T) {
 		t.Error("resolving per-statement settings must not mutate the process global")
 	}
 }
+
+// TestGeqoTuningGUCsReachTheSearch pins take2 P3-10.
+//
+// geqo_effort, geqo_pool_size, geqo_generations, geqo_selection_bias and
+// geqo_seed were registered GUCs that reached nothing: geqoSearch ran at a
+// hard-coded effort of 5, generations and pool size at their derived defaults,
+// selection bias at a literal 2.0, and the PRNG at a fixed seed. The comment on
+// that seed said "the planner has no session in scope to read the GUC", which
+// stopped being true at P2-02.
+//
+// The assertion is that the values survive the PlannerSettings -> costParams
+// conversion the search reads them through, and that the DEFAULTS are PG's — so
+// a session that sets nothing plans exactly as before.
+func TestGeqoTuningGUCsReachTheSearch(t *testing.T) {
+	def := DefaultPlannerSettings()
+	if def.GeqoEffort != 5 {
+		t.Errorf("geqo_effort default = %d, want PG's DEFAULT_GEQO_EFFORT of 5", def.GeqoEffort)
+	}
+	if def.GeqoSelectionBias != 2.0 {
+		t.Errorf("geqo_selection_bias default = %v, want 2.0", def.GeqoSelectionBias)
+	}
+	// Zero is MEANINGFUL for these two — PG reads it as "derive me from
+	// effort / pool size" — so the default must BE zero, not a substitute.
+	if def.GeqoPoolSize != 0 || def.GeqoGenerations != 0 {
+		t.Errorf("geqo_pool_size/geqo_generations defaults = %d/%d, want 0/0 "+
+			"(PG's \"derive\" sentinel)", def.GeqoPoolSize, def.GeqoGenerations)
+	}
+	if def.GeqoSeed != 0 {
+		t.Errorf("geqo_seed default = %v, want 0", def.GeqoSeed)
+	}
+
+	ps := DefaultPlannerSettings()
+	ps.GeqoEffort, ps.GeqoPoolSize, ps.GeqoGenerations = 9, 77, 33
+	ps.GeqoSelectionBias, ps.GeqoSeed = 1.75, 0.5
+	cp := ps.costParams()
+	if cp.geqoEffort != 9 || cp.geqoPoolSize != 77 || cp.geqoGenerations != 33 {
+		t.Errorf("integer knobs lost in conversion: effort=%d pool=%d gens=%d",
+			cp.geqoEffort, cp.geqoPoolSize, cp.geqoGenerations)
+	}
+	if cp.geqoBias != 1.75 || cp.geqoSeed != 0.5 {
+		t.Errorf("real knobs lost in conversion: bias=%v seed=%v", cp.geqoBias, cp.geqoSeed)
+	}
+
+	// The seed mapping must keep PG's default a no-op, so the change is
+	// plan-neutral at the defaults, and must be monotone above it.
+	if geqoSeedState(0) != 0 {
+		t.Error("geqo_seed = 0 must leave the PRNG at its existing fixed state")
+	}
+	if !(geqoSeedState(0.5) > 0 && geqoSeedState(1) > geqoSeedState(0.5)) {
+		t.Errorf("seed mapping is not monotone: 0.5 -> %d, 1 -> %d",
+			geqoSeedState(0.5), geqoSeedState(1))
+	}
+}

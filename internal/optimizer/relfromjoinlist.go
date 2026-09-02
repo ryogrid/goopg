@@ -373,7 +373,12 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// that has no session.
 		if prob.cp.geqo && len(items) >= prob.cp.geqoThreshold {
 			s.builder = builder
-			return geqoSearch(s, builder, 5)
+			// take2 P3-10: the session's geqo_effort, not a literal 5.
+			effort := prob.cp.geqoEffort
+			if effort < 1 {
+				effort = 5
+			}
+			return geqoSearch(s, builder, effort)
 		}
 		if _, err := s.joinSearch(s.clauses, builder); err != nil {
 			return nil, err

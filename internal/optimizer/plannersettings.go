@@ -77,6 +77,22 @@ type PlannerSettings struct {
 	// six P2-02c bridges.
 	EnableNestLoopIndex bool
 
+	// The GEQO tuning knobs. take2 P3-10. All five were registered GUCs that
+	// reached nothing: geqoSearch ran at a hard-coded effort of 5, generations
+	// and pool size at their derived defaults, selection bias at a literal 2.0,
+	// and the PRNG at a fixed seed. The comment at that seed said "the planner
+	// has no session in scope to read the GUC", which stopped being true at
+	// P2-02.
+	//
+	// Zero is MEANINGFUL for GeqoPoolSize and GeqoGenerations — PG uses it to
+	// mean "derive me from effort / pool size" — so those two need no separate
+	// unset sentinel.
+	GeqoEffort        int
+	GeqoPoolSize      int
+	GeqoGenerations   int
+	GeqoSelectionBias float64
+	GeqoSeed          float64
+
 	// EnableMemoize is `enable_memoize`. take2 P2-02c.
 	//
 	// It used to reach the planner through a registry.OnChange bridge in
@@ -111,6 +127,11 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnablePresortedAggregate: PresortedAggEnabled(),
 		EnableNestLoopIndex:      NLIEnabled(),
 		Geqo:                     GeqoEnabled(),
+		GeqoEffort:               5,   // DEFAULT_GEQO_EFFORT
+		GeqoPoolSize:             0,   // 0 = derive from effort
+		GeqoGenerations:          0,   // 0 = derive from pool size
+		GeqoSelectionBias:        2.0, // DEFAULT_GEQO_SELECTION_BIAS
+		GeqoSeed:                 0,
 		GeqoThreshold:            GeqoThreshold(),
 		SeqPageCost:        cp.seqPageCost,
 		RandomPageCost:     cp.randomPageCost,
@@ -159,5 +180,10 @@ func (ps PlannerSettings) costParams() costParams {
 		enableMemoize:   ps.EnableMemoize,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,
+		geqoEffort:      ps.GeqoEffort,
+		geqoPoolSize:    ps.GeqoPoolSize,
+		geqoGenerations: ps.GeqoGenerations,
+		geqoBias:        ps.GeqoSelectionBias,
+		geqoSeed:        ps.GeqoSeed,
 	}
 }

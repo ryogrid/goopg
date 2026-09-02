@@ -88,6 +88,11 @@ type costParams struct {
 	enableMemoize   bool
 	geqo            bool
 	geqoThreshold   int
+	geqoEffort      int
+	geqoPoolSize    int
+	geqoGenerations int
+	geqoBias        float64
+	geqoSeed        float64
 }
 
 func defaultCostParams() costParams {
@@ -114,6 +119,8 @@ func defaultCostParams() costParams {
 		enableMemoize:   true,
 		geqo:            GeqoEnabled(),
 		geqoThreshold:   GeqoThreshold(),
+		geqoEffort:      5,
+		geqoBias:        2.0,
 	}
 }
 

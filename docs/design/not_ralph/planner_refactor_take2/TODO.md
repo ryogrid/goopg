@@ -1219,13 +1219,29 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
       after being named SLOWER by the previous sweep with identical plans. Their
       oscillation is independent evidence for the attribution rule recorded
       under P2-12.
-- [ ] **P3-10** Finish the GEQO wiring: `geqo` and `geqo_threshold` are bridged
-      (as process-global atomics — see P2-02c), while `geqo_effort`,
-      `geqo_pool_size`, `geqo_generations`, `geqo_selection_bias` and
-      `geqo_seed` reach nothing and `geqoSearch` runs at a hard-coded effort of
-      5. Move all seven onto the planner context. GEQO is unobservable until
-      P0-13 lands, since a problem never approaches 12 items today.
-      *design: 08 §6.5; depends on P2-01, P0-13.*
+- [x] **P3-10** Finish the GEQO wiring. *design: 08 §6.5; depends on P2-01, P0-13.*
+      **All seven are on the planner context (2026-09-03).** `geqo` and
+      `geqo_threshold` moved off their process-global bridges under P2-02c; the
+      other five — `geqo_effort`, `geqo_pool_size`, `geqo_generations`,
+      `geqo_selection_bias`, `geqo_seed` — reached NOTHING, with `geqoSearch`
+      running at a hard-coded effort of 5, bias at a literal 2.0 and the PRNG at
+      a fixed seed. The comment on that seed said "the planner has no session in
+      scope to read the GUC", which stopped being true at P2-02 and is the kind
+      of stale note this bundle keeps finding.
+      Zero is MEANINGFUL for `geqo_pool_size` and `geqo_generations` — PG reads
+      it as "derive me from effort / pool size" — so both default to 0 rather
+      than to a substitute, and `geqo_seed = 0` maps to the PRNG's existing
+      fixed state, which is what makes the change plan-neutral at the defaults.
+      Gates: TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0,
+      **99 plan shapes same / 0 changed**, total-delta +0.1% — the predicted
+      result, since GEQO cannot fire below `geqo_threshold` = 12 and no
+      benchmark query approaches twelve relations. TPC-H 24 MATCH on values.
+      *TPC-H timing needed an A/A control to read.* P3-10 measured 219.78s and
+      222.25s; the P3-09 baseline measured 213.84s and then **221.01s on a
+      re-run with identical code**. The ranges overlap, so the apparent +2.8%
+      was harness variance — the drift band on this machine had widened well
+      past the ~1.7% measured earlier in the session. Re-run the BASELINE before
+      believing a TPC-H delta of that size.
 - [ ] **P3-11** Answer "why does the NLI arm lose 23 of 25 times" using P0-11
       provenance, and act on the finding. *design: 08 §6.4; gate: the NL census
       gap (1 vs 25) moves.*

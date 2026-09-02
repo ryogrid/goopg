@@ -1911,6 +1911,22 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
 	readBool("geqo", &ps.Geqo)
+	// take2 P3-10: the five remaining GEQO knobs. Zero is MEANINGFUL for
+	// geqo_pool_size and geqo_generations (PG reads it as "derive me"), so they
+	// accept it rather than treating it as unset.
+	readIntMin := func(name string, dst *int, min int) {
+		if eff, ok := get(name); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(eff)); err == nil && n >= min {
+				*dst = n
+			}
+		}
+	}
+	readIntMin("geqo_effort", &ps.GeqoEffort, 1)
+	readIntMin("geqo_pool_size", &ps.GeqoPoolSize, 0)
+	readIntMin("geqo_generations", &ps.GeqoGenerations, 0)
+	readFloat("geqo_selection_bias", &ps.GeqoSelectionBias)
+	readFloat("geqo_seed", &ps.GeqoSeed)
+
 	if eff, ok := get("geqo_threshold"); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(eff)); err == nil && n >= 2 {
 			ps.GeqoThreshold = n
@@ -1978,7 +1994,8 @@ func plannerCostGUCsOverridden(sess *misc.SessionRegistry) bool {
 		"enable_hashjoin", "enable_mergejoin", "enable_nestloop",
 		"enable_memoize", "enable_nestloop_index",
 		"enable_hashagg", "enable_presorted_aggregate",
-		"geqo", "geqo_threshold",
+		"geqo", "geqo_threshold", "geqo_effort", "geqo_pool_size",
+		"geqo_generations", "geqo_selection_bias", "geqo_seed",
 	} {
 		if sess.HasSessionOverride(name) {
 			return true
