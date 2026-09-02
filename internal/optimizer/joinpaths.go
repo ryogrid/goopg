@@ -185,7 +185,20 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 		// order arms are offered in IS the tie-break, and a tie between a merge
 		// and a hash path must resolve the way PG resolves it.
 		if len(keys) > 0 {
-			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual)
+			// mergejointuples: what the merge operator emits, before the
+			// residual filters it to joinrel.Rows. Computed ONCE here, where
+			// the searchCtx (and so the selectivity model) is in scope, and
+			// threaded into both merge arms as a scalar rather than widening
+			// their coupling to the search.
+			// A closure, not a scalar: the match_unsorted_outer arm TRIMS its
+			// merge-clause list per trial and demotes the dropped clauses into
+			// the residual, so its mergejointuples differs per call. Passing
+			// the rule lets each site apply it to its own residual, while the
+			// searchCtx stays out of the merge helpers' signatures.
+			mergeTuplesFor := func(res []*restrictInfo) float64 {
+				return s.mergeJoinTuples(joinrel.Rows, res, outer.Rows, inner.Rows)
+			}
+			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor)
 			// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 			// and arm 4 — so a merge over an already-ordered outer is offered
 			// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -193,7 +206,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// here; goopg's nested-loop halves (`addNestLoopPath` /
 			// `addNLIPaths`) were landed separately and still run after the
 			// hash arm, which can only change a hash-vs-nestloop exact tie.
-			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual)
+			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor)
 			addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
 		}
 		// The nested loop keys on nothing, so the key set rejoins the

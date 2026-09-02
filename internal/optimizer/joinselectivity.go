@@ -393,3 +393,52 @@ func clampSelectivity(s float64) float64 {
 	}
 	return s
 }
+
+// residualSelectivity is the combined selectivity of the join clauses a merge
+// join CANNOT use as merge clauses — PG's qpquals for that path.
+//
+// It exists so the merge arm can recover `mergejointuples`: the joinrel's row
+// count is what survives EVERY clause, while the merge operator emits what
+// survives only the MERGE clauses and lets the residual filter the rest. The
+// two differ exactly by this factor, and costing the operator on the smaller of
+// them is the mispricing recorded in
+// impl/FINDING-mergejoin-costed-on-postfilter-rows.md.
+//
+// Clauses are combined as independent conjuncts, the same assumption
+// clauselist_selectivity makes and the same one calcJoinrelSize already makes
+// for the join as a whole, so this cannot disagree with the row estimate it is
+// dividing into.
+func (s *searchCtx) residualSelectivity(residual []*restrictInfo) float64 {
+	sel := 1.0
+	for _, ri := range residual {
+		sel *= s.joinClauseSelectivity(ri)
+	}
+	return clampSelectivity(sel)
+}
+
+// mergeJoinTuples is `final_cost_mergejoin`'s `mergejointuples`
+// (costsize.c:3960-4045): the number of tuples the merge operator actually
+// emits, before the non-merge quals filter them down to the joinrel's row
+// count.
+//
+// Returns joinrelRows unchanged when there is no residual — the overwhelmingly
+// common case, and the one where the old code was already right.
+func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInfo, outerRows, innerRows float64) float64 {
+	if len(residual) == 0 || joinrelRows <= 0 {
+		return joinrelRows
+	}
+	sel := s.residualSelectivity(residual)
+	if sel <= 0 {
+		return joinrelRows
+	}
+	tuples := joinrelRows / sel
+	// The merge can never emit more pairs than the cross product; the clamp
+	// mirrors the one calcJoinrelSize applies to its own estimate.
+	if cross := math.Max(outerRows, 1) * math.Max(innerRows, 1); tuples > cross {
+		tuples = cross
+	}
+	if tuples < joinrelRows {
+		return joinrelRows
+	}
+	return tuples
+}

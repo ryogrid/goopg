@@ -114,7 +114,7 @@ type mergeOuterMatch struct {
 // outer before reaching this arm, so only the per-outer-path test is made below —
 // the pathlist can hold parameterised paths that the cheapest-total test did not
 // cover.
-func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
+func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64) {
 	innerCheapestTotal := inner.CheapestTotal
 	if innerCheapestTotal == nil {
 		return
@@ -138,13 +138,13 @@ func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, k
 		if pathParamByRel(op, inner) {
 			continue
 		}
-		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, groups, outer.Relids, residual)
+		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, groups, outer.Relids, residual, mergeTuplesFor)
 	}
 }
 
 // generateMergeJoinPaths is `generate_mergejoin_paths` (joinpath.c:1564) for one
 // already-ordered outer path.
-func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo) {
+func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64) {
 	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups)
 	if len(matched) == 0 {
 		return
@@ -175,7 +175,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// matters" — and `tryMergeJoinPath` skips the sort anyway if that path
 	// already delivers the ordering, which is what makes the initialisation
 	// below correct.
-	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, residual)
+	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, residual, mergeTuplesFor)
 
 	// The truncation search (:1685-1782). `cheapestTotalInner` /
 	// `cheapestStartupInner` carry the best inner found SO FAR, and a candidate
@@ -210,7 +210,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				// construction and this inner was SELECTED for already being
 				// ordered, so neither side is sorted here.
 				tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-					newClauses, demoteDroppedMergeClauses(residual, mergeClauses, newClauses))
+					newClauses, demoteDroppedMergeClauses(residual, mergeClauses, newClauses), mergeTuplesFor)
 			}
 			cheapestTotalInner = ip
 		}
@@ -227,7 +227,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				}
 				if len(newClauses) > 0 {
 					tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-						newClauses, demoteDroppedMergeClauses(residual, mergeClauses, newClauses))
+						newClauses, demoteDroppedMergeClauses(residual, mergeClauses, newClauses), mergeTuplesFor)
 				}
 			}
 			cheapestStartupInner = ip
