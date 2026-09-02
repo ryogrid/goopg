@@ -16,9 +16,11 @@
 package optimizer
 
 import (
-	"github.com/goopg/goopg/internal/parser"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/goopg/goopg/internal/parser"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -308,6 +310,37 @@ func numericValue(s, typeName string) (float64, bool) {
 			return 0, false
 		}
 		return v, true
+
+	// take2 P1-11b: `convert_timevalue_to_scalar` (selfuncs.c). Date and
+	// timestamp values become a scalar so histogram interpolation can measure
+	// WHERE in a bucket the literal falls.
+	//
+	// Without this the whole date family fell to `bucketFraction`'s flat 0.5.
+	// Measured on lineitem, `l_shipdate <` at three points:
+	// -0.19 %, -0.99 %, -3.22 % error. So the bucket itself was already found
+	// correctly — ISO-8601 strings sort in date order, which is why the error
+	// is bounded by one bucket rather than unbounded — and this removes the
+	// residual half-bucket. It is a fidelity fix of a few percent, not the
+	// large win the item's original wording implied (07 §4 records the
+	// correction).
+	case "date":
+		if t, err := time.Parse("2006-01-02", strings.TrimSpace(s)); err == nil {
+			// Julian-style day number; only differences matter here.
+			return float64(t.Unix()) / 86400.0, true
+		}
+		return 0, false
+	case "timestamp", "timestamp without time zone", "timestamptz", "timestamp with time zone":
+		for _, layout := range []string{
+			"2006-01-02 15:04:05.999999-07",
+			"2006-01-02 15:04:05.999999",
+			"2006-01-02 15:04:05",
+			"2006-01-02",
+		} {
+			if t, err := time.Parse(layout, strings.TrimSpace(s)); err == nil {
+				return float64(t.UnixNano()) / 1e9, true
+			}
+		}
+		return 0, false
 	}
 	return 0, false
 }

@@ -458,10 +458,20 @@ slower than 1.2×, S-cold/WARM gap narrows.
 
 ### 1d — Restriction selectivity
 
-- [ ] **P1-11b** *(rationale corrected — see the finding above; the claimed
-      0.31-vs-0.14 error does not hold, because ISO date strings sort in date
-      order so only the WITHIN-bucket fraction is defaulted, ~0.5% at 100
-      buckets)* `convert_to_scalar` for non-numeric types —
+- [x] **P1-11b** *(date/timestamp half)* `convert_timevalue_to_scalar` — gate:
+      `TestConvertTimevalueToScalar`, units. Measured on `lineitem.l_shipdate`
+      at three cut points, estimate error fell from
+      **-0.19 % / -0.99 % / -3.22 %** to **-0.06 % / -0.07 % / -0.04 %** — the
+      worst case improving about eightyfold.
+      The corrected rationale held: the error was bounded by *one bucket*
+      because ISO-8601 strings already sort in date order, so this removes a
+      residual half-bucket rather than the 0.31-vs-0.14 collapse the item
+      originally claimed. A few percent, not a large win.
+      *Still open:* `convert_string_to_scalar` for `text`/`varchar` and the
+      network variants — `bucketFraction` still returns the documented 0.5 for
+      those, which the test pins so the fallback cannot become a silent wrong
+      number.
+      ~~`convert_to_scalar` for non-numeric types —
       `convert_string_to_scalar`, `convert_timevalue_to_scalar` and the network
       variants. Today `numericValue` handles only the numeric family, so
       `bucketFraction` returns a flat **0.5** for `date`, `timestamp`, `text`,

@@ -384,3 +384,42 @@ func TestEquivClassDoesNotPropagateNonLiterals(t *testing.T) {
 		}
 	}
 }
+
+// TestConvertTimevalueToScalar pins take2 P1-11b. Before it, `numericValue`
+// handled only the numeric family, so `bucketFraction` returned a flat 0.5 for
+// every date and timestamp and every histogram interpolation landed
+// mid-bucket.
+//
+// Measured on lineitem's l_shipdate at three cut points, the error fell from
+// -0.19% / -0.99% / -3.22% to -0.06% / -0.07% / -0.04% — the worst case
+// improving about eightyfold. Bounded to begin with because ISO-8601 strings
+// sort in date order, so the right BUCKET was already found; this removes the
+// residual half-bucket.
+func TestConvertTimevalueToScalar(t *testing.T) {
+	for _, tc := range []struct {
+		typ, lo, hi, lit string
+		want             float64
+	}{
+		// A literal one quarter through a four-day bucket.
+		{"date", "2024-01-01", "2024-01-05", "2024-01-02", 0.25},
+		{"date", "2024-01-01", "2024-01-05", "2024-01-03", 0.50},
+		{"timestamp", "2024-01-01 00:00:00", "2024-01-01 04:00:00", "2024-01-01 01:00:00", 0.25},
+	} {
+		got := bucketFraction(tc.lo, tc.hi, tc.lit, tc.typ)
+		if math.Abs(got-tc.want) > 0.01 {
+			t.Errorf("%s %q in [%s, %s]: fraction = %.4f, want %.2f",
+				tc.typ, tc.lit, tc.lo, tc.hi, got, tc.want)
+		}
+	}
+
+	// A type still outside convert_to_scalar's reach keeps the documented
+	// half-bucket default rather than silently producing a wrong number.
+	if got := bucketFraction("a", "z", "m", "text"); got != 0.5 {
+		t.Errorf("text bucketFraction = %.4f, want the 0.5 default "+
+			"(convert_string_to_scalar is not ported)", got)
+	}
+	// An unparseable date must also fall back rather than return 0.
+	if got := bucketFraction("2024-01-01", "2024-01-05", "not-a-date", "date"); got != 0.5 {
+		t.Errorf("unparseable date = %.4f, want the 0.5 fallback", got)
+	}
+}
