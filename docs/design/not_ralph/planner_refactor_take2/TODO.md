@@ -274,6 +274,16 @@ slower than 1.2×, S-cold/WARM gap narrows.
 
 ### 1c — Statistics storage
 
+- [x] **P1-11c** *(new)* pg_statistic physical-tuple decode — `f07c20b1f`;
+      gate: `TestPGStatisticRoundTripPreservesHistogram`,
+      `internal/{catalog,executor,initdb,optimizer}`, units. Three silent bugs,
+      each masking the next: element alignment in `decodeTextArray`, the 1-byte
+      short varlena header, and `anyarray`'s `typalign 'd'`. Measured effect:
+      TPC-H total **288.10 s → 257.75 s (−10.5 %)**, Q5 −32.2 %, Q7 −17.2 %,
+      row counts identical on all 24 items. This is **not** P1-11 (TOAST for
+      wide histograms), which remains open — but note the wide-text case may
+      now behave differently, so re-measure P1-11 before starting it.
+
 - [ ] **P1-11** TOAST support in the catalog heap writer so wide-text
       histograms persist; today the row is silently dropped and `orders`,
       `customer` and `partsupp` lost trailing-column rows *and* their size row.
@@ -341,10 +351,12 @@ slower than 1.2×, S-cold/WARM gap narrows.
       It is guarded (it fires only when no key was proven and every residual
       factor was a default), so this is a cleanup, not a correctness fix.
       *design: 08 §4.5; gate: plan-parity + timing.*
-- [ ] **P1-28** `pg_stats.correlation` is always NULL although correlation is
-      collected, persisted in `stakind3` and consumed by the index cost model —
-      a stale-comment bug in `internal/catalog/pgstats.go` that makes the
-      statistic invisible to anyone diagnosing a plan. *design: 08 §4.3.*
+- [x] **P1-28** `pg_stats.correlation` — `86b3b96a2`; gate:
+      `TestPgStatsRendersCorrelation`, units. Confirmed exactly as recorded: the
+      view rendered a hard-coded NULL behind a header comment claiming ANALYZE
+      does not collect correlation. It does, `cost_index` consumes it, and a
+      zero prices every index scan at `max_IO_cost`. Renders NULL when zero,
+      mirroring the writer, which omits the slot rather than storing a zero.
 
 ### 1f — Extended statistics
 
@@ -599,7 +611,7 @@ One row per closed phase. Numbers come from the 09 §6.6 artifact header.
 | phase | closed | commit range | TPC-H total (goopg / PG) | TPC-DS SF0.5 total | plan-parity TPC-H | plan-parity TPC-DS | notes |
 |---|---|---|---|---|---|---|---|
 | baseline | 2026-08-31 | `82c05a5f6` … `6c65ceb20` | 227.0 s / 22.9 s = 9.9× | 1173 s / 536 s = 2.2× | not measured (spine `shape_mismatches` = 46) | not measured | starting state; see 07 §2 |
-| P0 | | | | | | | |
+| P0 (partial) | 2026-09-02 | `f2ac4fdfc` … `8c3e9ac3c` | A/B on this tree: 288.10 s → **257.75 s** (−10.5 %) | not re-measured | instrument built, roll-up not yet captured (P0-05/06/07 open) | not measured | Instruments only — no planner behaviour changed in P0-01…P0-04d. The timing move comes from `f07c20b1f`, a **statistics** fix found *by* the instrument. The 288.10 s control is this A/B's own and is **not** comparable to the 227.0 s baseline (different binary and histogram state). See [analysis/planner-refactor-take2/perf-20260902-pgstatistic-decode.md](../../../../analysis/planner-refactor-take2/perf-20260902-pgstatistic-decode.md). |
 | P1 | | | | | | | |
 | P2 | | | | | | | |
 | P3 | | | | | | | |
