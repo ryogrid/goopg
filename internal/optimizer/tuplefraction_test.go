@@ -128,8 +128,8 @@ func TestGetCheapestFractionalPathAbsoluteAndParameterised(t *testing.T) {
 	rel.ConsiderStartup = true
 	cheapTotal := &Path{Kind: PathSeqScan, Rel: rel, Rows: 1000, Cost: Cost{Startup: 100, Total: 200}}
 	fastStart := &Path{Kind: PathIndexScan, Rel: rel, Rows: 1000, Cost: Cost{Startup: 0, Total: 1000}}
-	addPath(rel, cheapTotal)
-	addPath(rel, fastStart)
+	addPath(rel, cheapTotal, "test")
+	addPath(rel, fastStart, "test")
 	setCheapest(rel)
 	if rel.CheapestTotal != cheapTotal {
 		t.Fatalf("fixture broken: cheapest-total is %v", rel.CheapestTotal.Kind)
@@ -154,7 +154,7 @@ func TestGetCheapestFractionalPathAbsoluteAndParameterised(t *testing.T) {
 	// answer: nothing above can bind its outer.
 	param := &Path{Kind: PathIndexScan, Rel: rel, Rows: 1, RequiredOuter: relsetOf(1),
 		Cost: Cost{Startup: 0, Total: 1}}
-	addPath(rel, param)
+	addPath(rel, param, "test")
 	setCheapest(rel)
 	if got := getCheapestFractionalPath(rel, 10); got == param {
 		t.Errorf("a parameterised path must never be the fractional answer")
@@ -170,8 +170,8 @@ func TestConsiderStartupGatesFastStartRetention(t *testing.T) {
 	add := func(considerStartup bool) []*Path {
 		rel := newRelOptInfo(relsetOf(0), 1000, 32)
 		rel.ConsiderStartup = considerStartup
-		addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: 1000, Cost: Cost{Startup: 100, Total: 200}})
-		addPath(rel, &Path{Kind: PathIndexScan, Rel: rel, Rows: 1000, Cost: Cost{Startup: 0, Total: 1000}})
+		addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: 1000, Cost: Cost{Startup: 100, Total: 200}}, "test")
+		addPath(rel, &Path{Kind: PathIndexScan, Rel: rel, Rows: 1000, Cost: Cost{Startup: 0, Total: 1000}}, "test")
 		return rel.Pathlist
 	}
 	if got := add(false); len(got) != 1 || got[0].Kind != PathSeqScan {
@@ -226,9 +226,9 @@ func (b *twoShapeBuilder) sizeJoinRel(outer, inner *RelOptInfo, _ []*restrictInf
 
 func (b *twoShapeBuilder) addPaths(joinrel, outer, inner *RelOptInfo, _ []*restrictInfo) error {
 	addPath(joinrel, &Path{Kind: PathHashJoin, Rel: joinrel, Rows: joinrel.Rows,
-		Cost: Cost{Startup: 500, Total: 900}})
+		Cost: Cost{Startup: 500, Total: 900}}, "test")
 	addPath(joinrel, &Path{Kind: PathNestLoop, Rel: joinrel, Rows: joinrel.Rows,
-		Cost: Cost{Startup: 0, Total: 20000}})
+		Cost: Cost{Startup: 0, Total: 20000}}, "test")
 	return nil
 }
 

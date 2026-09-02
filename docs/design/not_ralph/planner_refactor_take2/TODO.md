@@ -166,7 +166,20 @@ reports `changed=0` against a pre-P0 goopg capture.
       with an explanatory comment at `:652`; the TPC-H path correctly reads
       `r["rows"]` at `:576-580`. Fixed by `63056c544` (2026-07-30), a month
       before this bundle was written. No code change. *evidence: impl/P0-B §7.*
-- [ ] **P0-11** Path provenance tracing — **extends an existing channel**
+- [x] **P0-11** Path provenance tracing — gates: `TestPathTraceRecordsProducerAndVerdict`,
+      `TestPathTraceVerdictSurvivesEviction`, `TestRelSetBitsIsParseable`, units.
+      **Design deviation, deliberate:** the record uses a DISTINCT `DPPATH` tag
+      rather than a third `DPTRACE path` kind. `enumtrace.go` counts
+      DPTRACE-tagged lines it cannot parse as `Malformed`, so a new DPTRACE kind
+      would couple emitter and parser in one commit *and* make any older parser
+      report a bogus Malformed count on a newer log. A distinct tag has neither
+      problem — `enumtrace.go` ignores it (its anchor is the DPTRACE substring),
+      verified by running that package's tests. Covers `addPath` (12 sites) and
+      `addPartialPath`, `producer` passed as an argument, never recovered from
+      the stack. `pathlistVerdict` checks the list TAIL, not its length: an
+      accepted path can evict several incumbents and shrink the list, which a
+      length comparison would misread as rejection.
+      ~~Path provenance tracing — **extends an existing channel**
       (impl/P0-B §8). `internal/optimizer/joinsearchtrace.go` already emits
       `DPTRACE` blocks under `GOOPG_PGSHAPED_DP_TRACE=1` at *join-pair*
       granularity, parsed by `estimateaudit/enumtrace.go`. Add a third `path`
@@ -176,7 +189,7 @@ reports `changed=0` against a pre-P0 goopg capture.
       arm **must land in one commit**: `enumtrace.go` counts unparseable
       `DPTRACE` lines as `Malformed`, so a lone emitter would look like a
       regression in the existing instrument. *design: 09 §1 R4; gate: units,
-      `Malformed == 0`.*
+      `Malformed == 0`.*~~
 - [!] **P0-12** **BLOCKED on P2-02 — the recorded ordering is unsafe.**
       *(established 2026-09-02 by reading the code, not yet acted on.)*
       Setting `work_mem = 64MB` in goopg's bench conf would make the

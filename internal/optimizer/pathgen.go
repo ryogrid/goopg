@@ -32,7 +32,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 		Rows:         rel.Rows,
 		Cost:         seqCost,
 		ParallelSafe: parallelWorkers > 0,
-	})
+	}, "scan.seq")
 	if parallelWorkers > 0 {
 		// Each worker processes ~1/d of the pages and tuples; the seq scan's
 		// startup is zero, so dividing the total by the divisor is exact.
@@ -44,7 +44,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 			Cost:            Cost{Startup: 0, Total: seqCost.Total / d},
 			ParallelSafe:    true,
 			ParallelWorkers: parallelWorkers,
-		})
+		}, "scan.seq.partial")
 	}
 }
 
@@ -96,7 +96,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 		HashKeys:      keys,
 		Residual:      residual,
 		RequiredOuter: calcNonNestloopRequiredOuter(p, b),
-	})
+	}, "join.hash")
 }
 
 // addNestLoopPath adds a plain nested loop with `outer` driving: for every
@@ -131,7 +131,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 		// A nested loop DISCHARGES an inner parameterised by the outer, so
 		// this is a subtraction, not a union (pathnode.c:2592).
 		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
-	})
+	}, "join.nestloop")
 }
 
 // generateHashJoinPaths adds both build-side orientations of a hash join over the

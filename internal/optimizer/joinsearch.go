@@ -391,7 +391,7 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		// for them again here would double-count (the per-tuple operator
 		// term is what `estimateBaseRelInfo` has already spent).
 		p.Cost = costSeqscan(cp, estScanPages(rows, width), rows, 0)
-		addPath(rel, p)
+		addPath(rel, p, "joinsearch.prebuilt")
 		setCheapest(rel)
 	}
 	return s, nil

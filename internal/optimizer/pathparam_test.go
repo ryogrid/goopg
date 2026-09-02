@@ -194,7 +194,7 @@ func TestAddPathsToJoinrelRefusesParameterizedInputs(t *testing.T) {
 
 	newRelWithPath := func(relids RelSet, reqOuter RelSet) *RelOptInfo {
 		r := newRelOptInfo(relids, 1000, 8)
-		addPath(r, paramPath(r, 0, 100, reqOuter))
+		addPath(r, paramPath(r, 0, 100, reqOuter), "test")
 		setCheapest(r)
 		return r
 	}
@@ -269,13 +269,13 @@ func TestJoinPathRowsComeFromChildPaths(t *testing.T) {
 
 	build := func(innerPathRows float64) float64 {
 		outer := newRelOptInfo(0b0001, 100, 8)
-		addPath(outer, paramPath(outer, 0, 10, 0))
+		addPath(outer, paramPath(outer, 0, 10, 0), "test")
 		setCheapest(outer)
 
 		inner := newRelOptInfo(0b0010, 100000, 8)
 		p := paramPath(inner, 0, 10, 0)
 		p.Rows = innerPathRows // the ppi_rows carrier; rel.Rows stays 100000
-		addPath(inner, p)
+		addPath(inner, p, "test")
 		setCheapest(inner)
 
 		joinrel := newRelOptInfo(0b0011, 100, 16)

@@ -381,7 +381,7 @@ func TestJoinRelBuilderSizesOnceAndAddsPaths(t *testing.T) {
 		if err := s.addRel(rel); err != nil {
 			t.Fatal(err)
 		}
-		addPath(rel, &Path{Kind: PathPrebuilt, Rel: rel, Rows: rows, Cost: Cost{Total: rows}})
+		addPath(rel, &Path{Kind: PathPrebuilt, Rel: rel, Rows: rows, Cost: Cost{Total: rows}}, "test")
 		setCheapest(rel)
 	}
 	s.clauses = &restrictInfoList{all: []*restrictInfo{

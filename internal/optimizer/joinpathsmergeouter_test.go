@@ -29,8 +29,8 @@ import "testing"
 // is the unordered one.
 func orderedPathRel(relids RelSet, rows float64, keys []PathKey, orderedTotal float64) *RelOptInfo {
 	rel := newRelOptInfo(relids, rows, 32)
-	addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: rows, Cost: Cost{Total: 10}})
-	addPath(rel, &Path{Kind: PathIndexScan, Rel: rel, Rows: rows, Cost: Cost{Total: orderedTotal}, Pathkeys: keys})
+	addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: rows, Cost: Cost{Total: 10}}, "test")
+	addPath(rel, &Path{Kind: PathIndexScan, Rel: rel, Rows: rows, Cost: Cost{Total: orderedTotal}, Pathkeys: keys}, "test")
 	setCheapest(rel)
 	return rel
 }
@@ -161,8 +161,8 @@ func TestGenerateMergejoinPaths_TruncationDemotesDroppedClauseToResidual(t *test
 	// the first key only. The cheap prefix-sorted path is what the truncation
 	// loop is for.
 	inner := newRelOptInfo(b, 100, 32)
-	addPath(inner, &Path{Kind: PathSeqScan, Rel: inner, Rows: 100, Cost: Cost{Total: 90}})
-	addPath(inner, &Path{Kind: PathIndexScan, Rel: inner, Rows: 100, Cost: Cost{Total: 20}, Pathkeys: ascKeys(11)})
+	addPath(inner, &Path{Kind: PathSeqScan, Rel: inner, Rows: 100, Cost: Cost{Total: 90}}, "test")
+	addPath(inner, &Path{Kind: PathIndexScan, Rel: inner, Rows: 100, Cost: Cost{Total: 20}, Pathkeys: ascKeys(11)}, "test")
 	setCheapest(inner)
 
 	joinrel := newRelOptInfo(a|b, 100, 32)
@@ -322,10 +322,10 @@ func TestGenerateMergejoinPaths_StrictlyCheaperRuleSuppressesAPointlessTruncatio
 	outer := orderedPathRel(a, 100, ascKeys(10, 20), 40)
 
 	inner := newRelOptInfo(b, 100, 32)
-	addPath(inner, &Path{Kind: PathSeqScan, Rel: inner, Rows: 100, Cost: Cost{Total: 90}})
+	addPath(inner, &Path{Kind: PathSeqScan, Rel: inner, Rows: 100, Cost: Cost{Total: 90}}, "test")
 	// One ordered path, satisfying BOTH keys. Every prefix search finds this
 	// same path, so nothing is ever strictly cheaper than it.
-	addPath(inner, &Path{Kind: PathIndexScan, Rel: inner, Rows: 100, Cost: Cost{Total: 20}, Pathkeys: ascKeys(11, 21)})
+	addPath(inner, &Path{Kind: PathIndexScan, Rel: inner, Rows: 100, Cost: Cost{Total: 20}, Pathkeys: ascKeys(11, 21)}, "test")
 	setCheapest(inner)
 
 	joinrel := newRelOptInfo(a|b, 100, 32)

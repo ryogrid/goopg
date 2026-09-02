@@ -493,7 +493,7 @@ func TestBitmapPathSurvivesAddPathOnLargeTable(t *testing.T) {
 	// Step 3: add both paths and verify the bitmap survives add_path.
 	// The seq scan was already added by buildInitialRels.
 	beforeAdd := len(rel.Pathlist)
-	addPath(rel, bmp)
+	addPath(rel, bmp, "test")
 	afterAdd := len(rel.Pathlist)
 	t.Logf("pathlist size: before=%d after=%d", beforeAdd, afterAdd)
 

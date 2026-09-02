@@ -86,7 +86,7 @@ func memoInnerRel(relids RelSet, param RelSet, probeCost float64) (*RelOptInfo, 
 		Cost:          Cost{Total: probeCost},
 		IndexClauses:  []indexPathClause{{ri: ri, indexCol: 0, key: key}},
 		RequiredOuter: param,
-	})
+	}, "test")
 	setCheapest(rel)
 	return rel, key
 }

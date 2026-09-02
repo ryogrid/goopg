@@ -21,7 +21,7 @@ import "testing"
 // search produces yet.
 func orderedRel(relids RelSet, rows float64, cost Cost, keys []PathKey) *RelOptInfo {
 	rel := newRelOptInfo(relids, rows, 32)
-	addPath(rel, &Path{Kind: PathIndexScan, Rel: rel, Rows: rows, Cost: cost, Pathkeys: keys})
+	addPath(rel, &Path{Kind: PathIndexScan, Rel: rel, Rows: rows, Cost: cost, Pathkeys: keys}, "test")
 	setCheapest(rel)
 	return rel
 }
@@ -34,7 +34,7 @@ func paramRel(relids RelSet, rows float64, by RelSet) *RelOptInfo {
 	addPath(rel, &Path{
 		Kind: PathIndexScan, Rel: rel, Rows: rows,
 		Cost: Cost{Startup: 0, Total: 5}, RequiredOuter: by,
-	})
+	}, "test")
 	setCheapest(rel)
 	return rel
 }

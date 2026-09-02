@@ -552,15 +552,35 @@ func comparePaths(a, b *Path) pathRel {
 // dominates. On an exact tie the incumbent is kept and newPath rejected, so
 // duplicates do not accumulate — matching PG's practical behaviour of keeping the
 // first of two indistinguishable paths.
-func addPath(rel *RelOptInfo, newPath *Path) {
+func addPath(rel *RelOptInfo, newPath *Path, producer string) {
+	before := len(rel.Pathlist)
 	rel.Pathlist = addToPathlist(rel.Pathlist, newPath)
+	// A candidate is accepted when it is present in the resulting list. Length
+	// alone is not sufficient — an accepted path can evict several incumbents
+	// and SHRINK the list — so the tail is checked instead (addToPathlist
+	// appends the survivor last).
+	tracePath(rel, newPath, producer, false, pathlistVerdict(rel.Pathlist, newPath, before))
+}
+
+// pathlistVerdict reports whether newPath survived addToPathlist.
+func pathlistVerdict(list []*Path, newPath *Path, _ int) pathVerdict {
+	if len(list) > 0 && list[len(list)-1] == newPath {
+		return verdictAccepted
+	}
+	return verdictDominated
 }
 
 // addPartialPath is add_partial_path (pathnode.c:798): the same dominance pruning
 // over the partial pathlist, used for parallel candidates (design ch. 08 §2).
 // Present now; exercised from C5.
-func addPartialPath(rel *RelOptInfo, newPath *Path) {
+func addPartialPath(rel *RelOptInfo, newPath *Path, producer string) {
+	before := len(rel.PartialPathlist)
 	rel.PartialPathlist = addToPathlist(rel.PartialPathlist, newPath)
+	// The partial list is traced too: `parallelism` is one of the nine
+	// divergence classes the parity work tracks, so a provenance channel that
+	// covered only addPath could not answer whether a partial path was ever
+	// offered.
+	tracePath(rel, newPath, producer, true, pathlistVerdict(rel.PartialPathlist, newPath, before))
 }
 
 func addToPathlist(list []*Path, newPath *Path) []*Path {

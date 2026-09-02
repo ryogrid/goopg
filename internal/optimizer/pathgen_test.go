@@ -78,7 +78,7 @@ func TestGenerateHashJoinPaths_KeepsCheaperBuildSide(t *testing.T) {
 // setCheapest already run — a convenient stand-in for a DP child rel in tests.
 func relWithScanCost(relids RelSet, rows float64, total float64) *RelOptInfo {
 	rel := newRelOptInfo(relids, rows, 40)
-	addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: rows, Cost: Cost{Total: total}})
+	addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: rows, Cost: Cost{Total: total}}, "test")
 	setCheapest(rel)
 	return rel
 }

@@ -260,7 +260,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 				// rather than hard-coded so the star-schema case is a one-line
 				// relaxation once P5.6's sizer exists.
 				RequiredOuter: req,
-			})
+			}, "nestloop.index")
 		}
 	}
 }

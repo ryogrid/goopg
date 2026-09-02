@@ -72,14 +72,14 @@ func (s *searchCtx) addBaseRelBitmapPaths(cat catalog.Catalog) {
 		// Add single-index paths to the relation's pathlist.
 		added := false
 		for _, p := range singlePaths {
-			addPath(rel, p)
+			addPath(rel, p, "bitmap.heap")
 			added = true
 		}
 
 		// M0129-S5.1: combine into BitmapAnd when beneficial.
 		if len(singlePaths) >= 2 {
 			if andPath := s.chooseBitmapAnd(singlePaths, rel, tbl, relTuples, T, totalPages, maxEntries); andPath != nil {
-				addPath(rel, andPath)
+				addPath(rel, andPath, "bitmap.and")
 				added = true
 			}
 		}
@@ -492,7 +492,7 @@ func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
 			for _, idx := range cat.IndexesOnTable(tbl) {
 				if pth := s.buildOneParameterizedBitmapPath(rel, tbl, idx, cands, req,
 					relPages, relTuples, T, totalPages, maxEntries); pth != nil {
-					addPath(rel, pth)
+					addPath(rel, pth, "bitmap.or")
 					added = true
 				}
 			}

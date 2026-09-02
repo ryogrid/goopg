@@ -406,7 +406,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// `idx` only because every one of its columns is bound.
 		IndexClauses:  clauses,
 		RequiredOuter: req,
-	})
+	}, "index.parameterised")
 	return true
 }
 

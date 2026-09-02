@@ -381,7 +381,7 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 		HashKeys:      mergeClauses,
 		Residual:      residual,
 		RequiredOuter: req,
-	})
+	}, "mergejoin")
 }
 
 // sortPathFor wraps `sub` in an explicit Sort delivering `keys` — PG's

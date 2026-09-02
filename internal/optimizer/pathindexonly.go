@@ -119,7 +119,7 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		IndexOnlyCovered: covered,
 		// No index clauses: this is the full-index-scan shape, and
 		// `createPlan` reads the empty list as exactly that.
-	})
+	}, "indexonly")
 	return true
 }
 
