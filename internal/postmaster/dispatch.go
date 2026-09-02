@@ -831,7 +831,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 				}
 				// Infer result column types and undeclared parameter types by planning/walking.
 				if ectx.Catalog != nil {
-					if plan, planErr := optimizer.Plan(ps.Query, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid)); planErr == nil {
+					if plan, planErr := optimizer.PlanWithSettings(ps.Query, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid), sessionPlannerSettings(sess)); planErr == nil {
 						schema := plan.Output()
 						if len(schema) > 0 {
 							resultTypes := make([]string, len(schema))
@@ -877,7 +877,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 					// without RETURNING, DDL, …) has none, mirroring PG's
 					// fixed_result gate.
 					if len(prepDef.resultTypes) > 0 && ectx.Catalog != nil {
-						if plan, planErr := optimizer.Plan(prepDef.stmt, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid)); planErr == nil {
+						if plan, planErr := optimizer.PlanWithSettings(prepDef.stmt, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid), sessionPlannerSettings(sess)); planErr == nil {
 							schema := plan.Output()
 							changed := len(schema) != len(prepDef.resultTypes)
 							if !changed {
@@ -1158,7 +1158,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 				precached = cached
 			} else {
 				// Cache miss: plan now so we can store it.
-				freshNode, perr := optimizer.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, ectx.CurrentDatabaseOid))
+				freshNode, perr := optimizer.PlanWithSettings(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, ectx.CurrentDatabaseOid), sessionPlannerSettings(sess))
 				if perr != nil {
 					// M0132-S5 (S1 finding (i)): a PLAN-time error must abort
 					// the block too. Every other error path reaches
@@ -1795,6 +1795,88 @@ func plannerScanTogglesActive(sess *misc.SessionRegistry) bool {
 	}
 	return false
 }
+
+// sessionPlannerSettings builds the per-statement planner context from the
+// session's GUCs — take2 P2-02, the item that finally makes `SET
+// random_page_cost` change a plan.
+//
+// Every field starts at the planner's own default and is overwritten only when
+// the GUC parses, so a malformed or missing value degrades to today's behaviour
+// rather than to a zero cost.
+//
+// UNITS. Both memory GUCs are registered `UnitKB`, and the GUC machinery
+// normalises the display form, so `work_mem` reads back as "524288" and
+// `effective_cache_size` as "4194304" — plain KB integers, not "512MB"/"4GB".
+// The planner wants BYTES for work_mem and BLOCKS for effective_cache_size, and
+// the two conversions differ. Getting either wrong is silent: the plan simply
+// comes out costed for the wrong machine. The round-trip is pinned by test.
+func sessionPlannerSettings(sess *misc.SessionRegistry) optimizer.PlannerSettings {
+	if sess == nil {
+		return optimizer.DefaultPlannerSettings()
+	}
+	return plannerSettingsFrom(func(name string) (string, bool) {
+		_, eff, ok := sess.Get(name)
+		return eff, ok
+	})
+}
+
+// ctxPlannerSettings is sessionPlannerSettings for the paths that hold an
+// executor.Context rather than a SessionRegistry — the simple-query route
+// (executeOneSimpleStmt) among them.
+//
+// Both channels must exist because both are real: the extended-protocol and
+// prepared-statement sites have `sess`, while the simple-query site has only
+// `ctx.GetSetting`. Building one from the other is not possible at either site,
+// so they share the BODY instead. Missing this second channel is what made the
+// first live probe of P2-02 show unchanged costs while every unit test passed.
+func ctxPlannerSettings(ctx *executor.Context) optimizer.PlannerSettings {
+	if ctx == nil || ctx.GetSetting == nil {
+		return optimizer.DefaultPlannerSettings()
+	}
+	return plannerSettingsFrom(ctx.GetSetting)
+}
+
+func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSettings {
+	ps := optimizer.DefaultPlannerSettings()
+	readFloat := func(name string, dst *float64) {
+		if eff, ok := get(name); ok {
+			if v, err := strconv.ParseFloat(strings.TrimSpace(eff), 64); err == nil && v >= 0 {
+				*dst = v
+			}
+		}
+	}
+	readFloat("seq_page_cost", &ps.SeqPageCost)
+	readFloat("random_page_cost", &ps.RandomPageCost)
+	readFloat("cpu_tuple_cost", &ps.CPUTupleCost)
+	readFloat("cpu_index_tuple_cost", &ps.CPUIndexTupleCost)
+	readFloat("cpu_operator_cost", &ps.CPUOperatorCost)
+	readFloat("parallel_setup_cost", &ps.ParallelSetupCost)
+	readFloat("parallel_tuple_cost", &ps.ParallelTupleCost)
+
+	// work_mem: KB -> BYTES. The same conversion sessionWorkMem applies for the
+	// executor's hash sizing — planner and executor must agree, which is what
+	// cost_funcs.go's workMem comment demands.
+	if eff, ok := get("work_mem"); ok {
+		if kb, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64); err == nil && kb > 0 {
+			ps.WorkMem = kb * 1024
+		}
+	}
+
+	// effective_cache_size: KB -> BLOCKS.
+	if eff, ok := get("effective_cache_size"); ok {
+		if kb, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64); err == nil && kb > 0 {
+			ps.EffectiveCacheSize = float64(kb) * 1024 / blockSizeBytesForPlanner
+		}
+	}
+	return ps
+}
+
+// blockSizeBytesForPlanner mirrors optimizer's blockSizeBytes (relsize.go). It
+// is restated here rather than exported because the optimizer's copy is the
+// authority and a second EXPORTED constant would invite the two to drift; the
+// unit test asserts the conversion against the planner's own default instead of
+// against this number.
+const blockSizeBytesForPlanner = 8192
 
 // plannerCostGUCsOverridden reports whether the session has SET any GUC that
 // feeds the planner's cost model.
@@ -3469,7 +3551,7 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 		node = cachedNode[0]
 	} else {
 		var err error
-		node, err = optimizer.Plan(stmt, ctxPlanCatalog(ctx, s.cfg.Catalog))
+		node, err = optimizer.PlanWithSettings(stmt, ctxPlanCatalog(ctx, s.cfg.Catalog), ctxPlannerSettings(ctx))
 		if err != nil {
 			code, msg := planErrorFields(err)
 			return s.writeQueryError(w, code, msg, planErrorHintFields(err)...)
@@ -4434,7 +4516,7 @@ func (s *Server) materializeCursor(ectx *executor.Context, cur *cursorEntry, cur
 		return &executor.ExecError{Code: "26000", Message: fmt.Sprintf("cursor \"%s\" query not found", cursorName)}
 	}
 
-	node, planErr := optimizer.Plan(selectStmt, ctxPlanCatalog(ectx, s.cfg.Catalog))
+	node, planErr := optimizer.PlanWithSettings(selectStmt, ctxPlanCatalog(ectx, s.cfg.Catalog), ctxPlannerSettings(ectx))
 	if planErr != nil {
 		code, msg := planErrorFields(planErr)
 		return &executor.ExecError{Code: string(code), Message: msg}

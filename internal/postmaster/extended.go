@@ -713,7 +713,7 @@ func (s *Server) describeViaPlanner(query string, sess *misc.SessionRegistry, db
 				return nil, false
 			}
 			var perr error
-			node, perr = optimizer.Plan(stmts[0], sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
+			node, perr = optimizer.PlanWithSettings(stmts[0], sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid), sessionPlannerSettings(sess))
 			if perr != nil {
 				return nil, false
 			}
@@ -727,7 +727,7 @@ func (s *Server) describeViaPlanner(query string, sess *misc.SessionRegistry, db
 			return nil, false
 		}
 		var perr error
-		node, perr = optimizer.Plan(stmts[0], sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
+		node, perr = optimizer.PlanWithSettings(stmts[0], sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid), sessionPlannerSettings(sess))
 		if perr != nil {
 			return nil, false
 		}

@@ -124,3 +124,81 @@ func topPlanCost(n Node) (PlanCost, bool) {
 	}
 	return PlanCost{}, false
 }
+
+// TestCostGUCsReachTheCostingOnAHashJoin covers the cost GUCs whose effect is
+// observable on a plain two-table hash join. It is deliberately NOT the full
+// nine: several GUCs can only move a plan that contains a shape this fixture
+// does not produce, and a test that stretched one statement to cover all nine
+// would be contrived or would pass for the wrong reason.
+//
+// 09 §5's P2 acceptance row — "every cost GUC demonstrably changes at least one
+// plan" — is therefore only PARTLY discharged here. The remainder is recorded
+// in TODO under P2-02 with the live evidence gathered against the TPC-H bench
+// server, where `SET seq_page_cost = 1000` switched a parallel Hash Join to a
+// Merge Join over index scans and `SET work_mem = '64kB'` repriced the same
+// hash join from 14835 to 23478.
+func TestCostGUCsReachTheCostingOnAHashJoin(t *testing.T) {
+	cat := psProbeCatalog(t)
+	const sql = "SELECT pa.v, pb.v FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3"
+
+	baseCost, ok := topPlanCost(psPlan(t, cat, sql, DefaultPlannerSettings()))
+	if !ok {
+		t.Fatal("baseline plan carries no cost; the statement did not reach the path search")
+	}
+
+	for _, tc := range []struct {
+		name  string
+		apply func(*PlannerSettings)
+	}{
+		{"seq_page_cost", func(p *PlannerSettings) { p.SeqPageCost *= 1000 }},
+		{"cpu_tuple_cost", func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
+		{"cpu_operator_cost", func(p *PlannerSettings) { p.CPUOperatorCost *= 1000 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := DefaultPlannerSettings()
+			tc.apply(&ps)
+			got, ok := topPlanCost(psPlan(t, cat, sql, ps))
+			if !ok {
+				t.Fatalf("%s: plan carries no cost", tc.name)
+			}
+			if got.TotalCost == baseCost.TotalCost && got.StartupCost == baseCost.StartupCost {
+				t.Errorf("%s: costing unchanged at (%.4f..%.4f) after a 1000x move — "+
+					"the GUC does not reach the planner",
+					tc.name, got.StartupCost, got.TotalCost)
+			}
+		})
+	}
+}
+
+// TestCostGUCConversionIsTotal pins that every field of PlannerSettings is
+// carried into costParams. It cannot show that a field CHANGES a plan — that is
+// the test above and the TODO note — but it does show that none is silently
+// dropped on the way in, which is the failure a per-shape test cannot
+// distinguish from "this shape does not use that GUC".
+func TestCostGUCConversionIsTotal(t *testing.T) {
+	ps := PlannerSettings{
+		SeqPageCost: 1.5, RandomPageCost: 2.5,
+		CPUTupleCost: 3.5, CPUIndexTupleCost: 4.5, CPUOperatorCost: 5.5,
+		ParallelSetupCost: 6.5, ParallelTupleCost: 7.5,
+		EffectiveCacheSize: 8.5, WorkMem: 9,
+	}
+	cp := ps.costParams()
+	for _, c := range []struct {
+		name      string
+		got, want float64
+	}{
+		{"seq_page_cost", cp.seqPageCost, ps.SeqPageCost},
+		{"random_page_cost", cp.randomPageCost, ps.RandomPageCost},
+		{"cpu_tuple_cost", cp.cpuTupleCost, ps.CPUTupleCost},
+		{"cpu_index_tuple_cost", cp.cpuIndexTupleCost, ps.CPUIndexTupleCost},
+		{"cpu_operator_cost", cp.cpuOperatorCost, ps.CPUOperatorCost},
+		{"parallel_setup_cost", cp.parallelSetupCost, ps.ParallelSetupCost},
+		{"parallel_tuple_cost", cp.parallelTupleCost, ps.ParallelTupleCost},
+		{"effective_cache_size", cp.effectiveCacheSize, ps.EffectiveCacheSize},
+		{"work_mem", float64(cp.workMem), float64(ps.WorkMem)},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s dropped in conversion: got %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}

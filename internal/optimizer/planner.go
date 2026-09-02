@@ -286,7 +286,14 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		if dc, ok := explainInner.(*parser.DeclareCursorStmt); ok {
 			explainInner = dc.Query
 		}
-		inner, err := Plan(explainInner, cat)
+		// take2 P2-02: EXPLAIN must plan its inner statement under the SAME
+		// settings as the statement itself, or `SET random_page_cost = …;
+		// EXPLAIN …` shows the costs of a plan the session would not get.
+		// This was the gap that made the live probe show unchanged costs while
+		// every unit test passed — EXPLAIN is the only way a user OBSERVES a
+		// cost, so of all the recursive entry points this is the one that must
+		// not default.
+		inner, err := PlanWithSettings(explainInner, cat, plannerSet)
 		if err != nil {
 			return nil, err
 		}

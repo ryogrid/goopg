@@ -17,6 +17,7 @@ package postmaster
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
 
@@ -90,5 +91,67 @@ func TestPlannerSessionInputsActiveCoversBothFamilies(t *testing.T) {
 	}
 	if !plannerSessionInputsActive(cost) {
 		t.Error("cost-GUC family not covered by the combined predicate")
+	}
+}
+
+// TestSessionPlannerSettingsRoundTripsUnits pins take2 P2-02's unit
+// conversions, which are the part of that item that fails SILENTLY.
+//
+// Both memory GUCs are registered UnitKB and read back as plain KB integers
+// (work_mem "524288", effective_cache_size "4194304"), while the planner wants
+// BYTES for one and BLOCKS for the other. A wrong conversion does not error —
+// the plan simply comes out costed for a machine that does not exist.
+//
+// The assertion is against the PLANNER's own defaults rather than against
+// hand-written numbers, so the two cannot drift.
+func TestSessionPlannerSettingsRoundTripsUnits(t *testing.T) {
+	fresh := misc.NewSessionRegistry(misc.BuildDefaultRegistry())
+	got := sessionPlannerSettings(fresh)
+	want := optimizer.DefaultPlannerSettings()
+
+	if got.WorkMem != want.WorkMem {
+		t.Errorf("work_mem: session round-trip gave %d bytes, planner default is %d "+
+			"— the KB->bytes conversion is wrong", got.WorkMem, want.WorkMem)
+	}
+	if got.EffectiveCacheSize != want.EffectiveCacheSize {
+		t.Errorf("effective_cache_size: session round-trip gave %.0f blocks, planner "+
+			"default is %.0f — the KB->blocks conversion is wrong",
+			got.EffectiveCacheSize, want.EffectiveCacheSize)
+	}
+	if got != want {
+		t.Errorf("a fresh session must reproduce the planner defaults exactly:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// TestSessionPlannerSettingsHonoursOverrides is the point of P2-02: a SET must
+// reach the struct the planner costs with.
+func TestSessionPlannerSettingsHonoursOverrides(t *testing.T) {
+	sess := misc.NewSessionRegistry(misc.BuildDefaultRegistry())
+	if err := sess.Set("random_page_cost", "1.1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Set("work_mem", "4MB", false); err != nil {
+		t.Fatal(err)
+	}
+	ps := sessionPlannerSettings(sess)
+	if ps.RandomPageCost != 1.1 {
+		t.Errorf("random_page_cost = %v, want 1.1", ps.RandomPageCost)
+	}
+	if want := int64(4 << 20); ps.WorkMem != want {
+		t.Errorf("work_mem = %d bytes, want %d (4MB)", ps.WorkMem, want)
+	}
+	// And such a session must be off the shared cache, or the plan it produces
+	// under these settings would be published to every other connection.
+	if !plannerSessionInputsActive(sess) {
+		t.Error("a session with cost-GUC overrides must not use the shared plan cache")
+	}
+}
+
+// TestSessionPlannerSettingsDegradesToDefaults guards the failure mode: a
+// malformed or absent value must fall back to the planner default, never to a
+// zero cost.
+func TestSessionPlannerSettingsDegradesToDefaults(t *testing.T) {
+	if got, want := sessionPlannerSettings(nil), optimizer.DefaultPlannerSettings(); got != want {
+		t.Errorf("nil session gave %+v, want the planner defaults %+v", got, want)
 	}
 }

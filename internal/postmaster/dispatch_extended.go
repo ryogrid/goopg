@@ -120,7 +120,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			return &extendedQueryResult{CommandTag: tag}, nil
 		}
 		var perr error
-		node, perr = optimizer.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
+		node, perr = optimizer.PlanWithSettings(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid), sessionPlannerSettings(sess))
 		if perr != nil {
 			return nil, newPlannerExtendedQueryError(perr)
 		}

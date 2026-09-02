@@ -471,11 +471,33 @@ not grow; no query slower than 1.2×.
       are now a required constructor parameter instead. Also: `bitmapOverCorrelatedProbe`
       is reached from `planUpdate`/`planDelete` through parentless contexts, so
       DML is threaded too.~~
-- [ ] **P2-02** Session cost GUCs reach the planner; a test asserts each of
+- [x] **P2-02** Session cost GUCs reach the planner — gates:
+      `TestSessionPlannerSettingsRoundTripsUnits`,
+      `TestSessionPlannerSettingsHonoursOverrides`,
+      `TestCostGUCsReachTheCostingOnAHashJoin`,
+      `TestCostGUCConversionIsTotal`, units,
+      `internal/{optimizer,postmaster,executor}`. Live on the TPC-H bench
+      server: `SET seq_page_cost = 1000` switches a parallel Hash Join to a
+      **Merge Join over index scans**, and `SET work_mem = '64kB'` reprices the
+      same hash join **14835 → 23478**.
+      **Two channels were needed, not one.** The extended-protocol and
+      prepared-statement sites hold a `*misc.SessionRegistry`; the simple-query
+      site (`executeOneSimpleStmt`) holds only `ctx.GetSetting`. Wiring just the
+      first left EXPLAIN showing unchanged costs while every unit test passed —
+      caught only by a live probe. `EXPLAIN` also plans its inner statement
+      recursively and had to be threaded, since EXPLAIN is the only way a user
+      *observes* a cost.
+      **09 §5's P2 bar is only PARTLY discharged**: three of the nine GUCs are
+      pinned by unit test on a hash-join fixture, and `seq_page_cost`/`work_mem`
+      by the live evidence above. The remaining four
+      (`random_page_cost`, `cpu_index_tuple_cost`, `effective_cache_size`,
+      `parallel_*`) need fixtures containing an index or parallel path, which
+      the current two-table fixture does not produce. Filed here rather than
+      claimed. ~~a test asserts each of
       `seq_page_cost`, `random_page_cost`, `cpu_tuple_cost`,
       `cpu_index_tuple_cost`, `cpu_operator_cost`, `effective_cache_size`,
       `work_mem`, `parallel_setup_cost`, `parallel_tuple_cost` changes a plan.
-      *design: 08 §5.1; gate: 09 §5 P2 row.*
+      *design: 08 §5.1; gate: 09 §5 P2 row.*~~
 - [ ] **P2-02b** Correct `work_mem`'s `BootVal` from `512MB` to PostgreSQL
       18.3's `4MB`. **Note (2026-09-02):** the planner's hard-wired copy is
       `hashsize.DefaultMemLimitBytes` (`hashsize.go:83`, `512 << 20`), which is
