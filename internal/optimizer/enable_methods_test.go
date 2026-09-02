@@ -56,3 +56,42 @@ func TestDisabledNodesAccumulatesFromChildren(t *testing.T) {
 		t.Errorf("a nil child must be skipped, not panic: got %d, want 1", got)
 	}
 }
+
+// TestEnableMemoizeIsPerStatementNotProcessGlobal pins take2 P2-02c.
+//
+// enable_memoize used to reach the planner through a registry.OnChange bridge
+// in cmd/goopg/main.go that stored into a process-global atomic, so one
+// session's `SET enable_memoize = off` disabled Memoize for every other session
+// on the server — "the most-recent SET wins process-wide", as that bridge's own
+// comment said. The GUC is a per-statement planner input and now travels on
+// PlannerSettings with the rest.
+//
+// The process global survives as the GOOPG_MEMOIZE env kill-switch and as the
+// legacy arm's gate; what it must no longer carry is a session's SET.
+func TestEnableMemoizeIsPerStatementNotProcessGlobal(t *testing.T) {
+	if !DefaultPlannerSettings().EnableMemoize {
+		t.Fatal("enable_memoize must default to ENABLED")
+	}
+	if !defaultCostParams().enableMemoize {
+		t.Fatal("defaultCostParams must agree with DefaultPlannerSettings")
+	}
+
+	ps := DefaultPlannerSettings()
+	ps.EnableMemoize = false
+	if ps.costParams().enableMemoize {
+		t.Error("costParams() dropped EnableMemoize=false")
+	}
+
+	// Two settings values coexist without touching shared state — the property
+	// the process global could not provide.
+	on, off := DefaultPlannerSettings(), DefaultPlannerSettings()
+	off.EnableMemoize = false
+	if !on.costParams().enableMemoize || off.costParams().enableMemoize {
+		t.Error("two PlannerSettings must resolve independently; one session's " +
+			"setting is leaking into another's")
+	}
+	// The global is untouched by any of the above.
+	if !MemoizeEnabled() {
+		t.Error("resolving per-statement settings must not mutate the process global")
+	}
+}

@@ -817,12 +817,25 @@ not grow; no query slower than 1.2×.
       budget the plan moves onto index-scan-driven joins, which goopg's parallel
       post-pass cannot drive because it only recognises sequential scans, so the
       Gather is lost too — Phase 5. See P4-A rev 4.
-- [ ] **P2-02c** Move the six process-global GUC bridges
+- [~] **P2-02c** *(slice 1 of 6 landed: `enable_memoize`)* Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner
       context. Today a `SET` in one session changes the planner for every
       session, while a cached plan may ignore the same `SET`.
       *design: 08 §5.1; gate: a cross-session isolation test.*
+      **Verified 2026-09-03** — the premise is exactly right, and the bridges
+      are in `cmd/goopg/main.go` (`registry.OnChange`), not under `internal/`.
+      Each writes a package-level `atomic`, and the `enable_nestloop_index`
+      bridge's own comment states the consequence: "most-recent SET wins
+      process-wide". **`enable_memoize` is now per-statement** — carried on
+      `PlannerSettings`, read by `getMemoizePath` from `costParams`, bridge
+      deleted; `SetMemoizeEnabled` survives as the test hook and the
+      `GOOPG_MEMOIZE` env kill-switch. Verified live: session A `SET
+      enable_memoize=off` no longer changes what a fresh session B reads.
+      TPC-H 241.94s, 24 MATCH. Five bridges remain:
+      `enable_nestloop_index`, `enable_hashagg`, `enable_presorted_aggregate`,
+      `geqo`, `geqo_threshold` — each needs its consumer to reach a
+      `costParams`/`PlannerSettings`, which is the whole of the work.
 - [x] **P2-03** `hash_mem_multiplier` — gate:
       `TestHashMemMultiplierReachesTheBudget`, the existing
       `TestCostParamsWorkMemMatchesExecutorFallback` sibling guard, units.

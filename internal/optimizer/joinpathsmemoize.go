@@ -214,7 +214,10 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 // is unconditionally in the strict mode and never in the "logical" one. That is
 // a superset of what PG guarantees here, never a subset. Ledgered.
 func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path, cp costParams) *Path {
-	if !memoizeOn.Load() {
+	// take2 P2-02c: the per-STATEMENT setting, not the process global. The
+	// global remains as the env kill-switch (GOOPG_MEMOIZE) and as the legacy
+	// arm's gate; what it no longer carries is one session's SET.
+	if !cp.enableMemoize || !memoizeOn.Load() {
 		return nil
 	}
 	if outerPath == nil || innerPath == nil || outer == nil {

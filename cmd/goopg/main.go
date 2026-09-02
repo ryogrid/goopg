@@ -398,12 +398,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	registry.OnChange("enable_nestloop_index", func(value string) {
 		optimizer.SetNLIEnabled(value == "on" || value == "true" || value == "1")
 	})
-	// S7: same bridge for `SET enable_memoize` — the upstream planner-method
-	// GUC now gates a real plan shape (Memoize under NLI) instead of being
-	// a registration-only no-op.
-	registry.OnChange("enable_memoize", func(value string) {
-		optimizer.SetMemoizeEnabled(value == "on" || value == "true" || value == "1")
-	})
+	// `enable_memoize` NO LONGER bridges to a process global (take2 P2-02c).
+	// It did, and that made `SET enable_memoize = off` in one session disable
+	// Memoize for every other session on the server — the most-recent SET won
+	// process-wide. It is now a per-statement planner input carried on
+	// PlannerSettings, so a SET affects only the session that issued it.
+	// optimizer.SetMemoizeEnabled survives as the test hook and the
+	// GOOPG_MEMOIZE env kill-switch.
 	// S8 Slice 2a: same bridge for `SET enable_presorted_aggregate` — the
 	// upstream planner-method GUC now gates the presorted-aggregate rule
 	// (adjust_group_pathkeys_for_groupagg port) instead of being a

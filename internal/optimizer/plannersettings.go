@@ -64,6 +64,15 @@ type PlannerSettings struct {
 	EnableMergeJoin bool
 	EnableNestLoop  bool
 
+	// EnableMemoize is `enable_memoize`. take2 P2-02c.
+	//
+	// It used to reach the planner through a registry.OnChange bridge in
+	// cmd/goopg/main.go that wrote a process-global atomic, so `SET
+	// enable_memoize = off` in ONE session silently disabled Memoize for every
+	// other session on the server. It is a per-statement planner input like any
+	// other and now travels with the rest.
+	EnableMemoize bool
+
 	// HashMemMultiplier is `hash_mem_multiplier`. A hash build's budget is
 	// `work_mem * hash_mem_multiplier` (get_hash_memory_limit,
 	// nodeHash.c:3622), NOT work_mem alone — take2 P2-03. Zero means "use the
@@ -83,6 +92,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableHashJoin:  true,
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,
+		EnableMemoize:   true,
 		SeqPageCost:        cp.seqPageCost,
 		RandomPageCost:     cp.randomPageCost,
 		CPUTupleCost:       cp.cpuTupleCost,
@@ -127,5 +137,6 @@ func (ps PlannerSettings) costParams() costParams {
 		enableHashJoin:  ps.EnableHashJoin,
 		enableMergeJoin: ps.EnableMergeJoin,
 		enableNestLoop:  ps.EnableNestLoop,
+		enableMemoize:   ps.EnableMemoize,
 	}
 }

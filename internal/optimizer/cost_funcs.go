@@ -85,6 +85,7 @@ type costParams struct {
 	enableHashJoin  bool
 	enableMergeJoin bool
 	enableNestLoop  bool
+	enableMemoize   bool
 }
 
 func defaultCostParams() costParams {
@@ -108,6 +109,7 @@ func defaultCostParams() costParams {
 		enableHashJoin:  true,
 		enableMergeJoin: true,
 		enableNestLoop:  true,
+		enableMemoize:   true,
 	}
 }
 

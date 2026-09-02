@@ -1906,6 +1906,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_hashjoin", &ps.EnableHashJoin)
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
+	readBool("enable_memoize", &ps.EnableMemoize)
 
 	// work_mem: KB -> BYTES. The same conversion sessionWorkMem applies for the
 	// executor's hash sizing — planner and executor must agree, which is what
@@ -1966,6 +1967,7 @@ func plannerCostGUCsOverridden(sess *misc.SessionRegistry) bool {
 		// take2 P2-05: the method toggles change plans exactly as the cost
 		// GUCs do, so they must take a session off the shared cache too.
 		"enable_hashjoin", "enable_mergejoin", "enable_nestloop",
+		"enable_memoize",
 	} {
 		if sess.HasSessionOverride(name) {
 			return true
