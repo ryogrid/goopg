@@ -385,18 +385,6 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			return nil, err
 		}
 		p := newPrebuiltPath(rel, leaf)
-		// take2 P4-01: emit only the columns the statement reads, when the
-		// needed set is KNOWN and the leaf is bare. The path — not
-		// `rel.baseLeaf` — carries the narrowed node, so the search's
-		// coordinate space is untouched and the seam's offset invariant holds.
-		// See narrowLeafToNeededColumns for why both of those matter.
-		if s.neededColsKnown && relInfos[i].table != nil {
-			if nn, ncols, avb, ok := narrowLeafToNeededColumns(leaf, relInfos[i].table,
-				s.neededColumnsOf(relInfos[i].table)); ok {
-				p.node = nn
-				p.NCols, p.AvgVarBytes = ncols, avb
-			}
-		}
 		// The scan-cost currency of 04 §1 over the rel's own estimate.
 		// numQualOps is 0 because the local quals are already inside the
 		// leaf node and their selectivity is already inside `rows`; charging

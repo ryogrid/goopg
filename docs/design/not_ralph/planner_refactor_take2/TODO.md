@@ -867,7 +867,37 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
 
 ## Phase 4 — Upper planner as paths
 
-- [!] **P4-01b** *(second slice — leaf narrowing: CODE LANDED BUT DORMANT)*
+- [!] **P4-01b** *(second slice — leaf narrowing: ATTEMPTED, REVERTED, WRONG
+      ANSWERS)*. The approach the P4-A review recommended — narrow the leaf on
+      the PATH's node, leave the binding space wide, let `baseRelLayout` re-base
+      by name and `boundaryMap` pad the pruned coordinates — **does not
+      work**. It was implemented, made to fire, and produced **incorrect
+      results**:
+
+      | | pre | post |
+      |---|---|---|
+      | TPC-H Q2 | 418 rows | **0 rows** |
+      | TPC-H Q5 | 5 rows | **0 rows** |
+      | TPC-H Q18 | 12 rows | 12 rows, **different tuples** |
+      | total time | 393.67 s | 379.31 s (**faster, and wrong**) |
+
+      21 of 24 items matched. `cmd/tpch-runner -digest` + `-diff` caught it;
+      **row counts alone would have passed Q18**, which is exactly why 08's
+      risk R5 requires value-level comparison for a projection change.
+      It is reverted. `P4-01a` (per-path width) is independently correct and
+      stays.
+      **What was learned, so the next attempt does not repeat it:** the
+      ordering bug found first (`buildInitialRels` runs eight lines before
+      `s.neededCols` is assigned in `makeRelFromJoinlist`, so the narrowing
+      silently never fired) is real and must be fixed too — but fixing it only
+      exposed the deeper problem. `baseRelLayout`'s by-name re-basing and
+      `boundaryMap`'s filler are **not sufficient** to make a pruned base-relation
+      leaf safe inside a join tree; something above still reads a coordinate
+      the leaf no longer publishes, and a typed-NULL pad turns a join match into
+      a non-match (Q2/Q5 → 0 rows). A working version needs the projection to be
+      visible to whatever computes those coordinates — i.e. the real
+      `PathTarget`/`setrefs` work of P4-01/P6-02/P6-07, not a leaf swap.
+      ~~*(second slice — leaf narrowing: CODE LANDED BUT DORMANT)*
       `narrowLeafToNeededColumns` narrows a **bare** seq-scan leaf to the
       columns the statement reads and sets the path's `NCols`/`AvgVarBytes`. It
       is applied to the **path's node**, never `rel.baseLeaf`, so the seam's
