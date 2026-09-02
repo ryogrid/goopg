@@ -3315,7 +3315,7 @@ func resolveTableSample(ts *parser.RangeTableSample, ctx *resolveContext) (*Tabl
 // byte-identical to the pre-M0125-0003 planner — unless the flag is on, which
 // is what makes the landing commit inert.
 func stage1RelSizeRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
-	return relSizeFallbackRows(1, cat, tbl)
+	return relSizeFallbackRows(cat, tbl)
 }
 
 // remapSubqueryColumnRefs walks the plan tree rooted at n and REPAIRS every

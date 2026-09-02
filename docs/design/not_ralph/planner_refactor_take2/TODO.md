@@ -334,9 +334,22 @@ slower than 1.2×, S-cold/WARM gap narrows.
       `cost_index`. The only unmet part of the item's wording is structural —
       the value is computed per-producer rather than stored on `RelOptInfo` —
       which changes no plan.
-- [ ] **P1-05** Align the never-analyzed fallback with `estimate_rel_size`
-      (density, 10-page floor); make `GOOPG_RELSIZE_FALLBACK` unconditional and
-      retire the flag. *design: 08 §4.1; gate: S-cold arm timing.*
+- [x] **P1-05** — units, `internal/{optimizer,executor,catalog}`.
+      **First half was already done:** `estimateRelSize` already implements
+      `estimate_rel_size`'s density and 10-page floor (`relsize.go`, with
+      dedicated tests `TestEstimateRelSize_DensityFromTupleWidth`,
+      `..._NeverAnalyzedTenPageFloor`). Only the flag retirement remained.
+      `GOOPG_RELSIZE_FALLBACK` is retired: it shipped at stage 2 — every
+      consumer enabled — since M0125-0005, so the only states it still selected
+      were "a planner production does not run", which is the hazard
+      `flaglabels.go`'s header describes and which had already mis-stamped
+      artefacts twice. The `stage` parameter is **removed**, not ignored: a
+      parameter every caller passes a constant to, that nothing reads, is how
+      the next reader concludes the staging still works. Three tests that
+      asserted the now-unreachable "flag off" behaviour were rewritten to assert
+      the positive direction they had been bracketing. No plan changes at the
+      default. `scripts/planner-flags.env` regenerated:
+      `retired(take2-P1-05)`.
 
 ### 1b — ANALYZE algorithm
 

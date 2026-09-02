@@ -103,19 +103,22 @@ func TestCommaFromReorderColdUsesRelSizeFallback(t *testing.T) {
 // consumer (the SeqScan probe side) is shape-neutral by construction and must
 // not leak into the join order; that separation is the whole reason the flag is
 // staged (design §D4).
-func TestCommaFromReorderColdStageGating(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-
-	for _, stage := range []int{0, 1} {
-		stmt, c := newColdReorderFixture(t, nil)
-		c.(*catalog.InMemory).SetRelationSizer(blockSizer(t, c, map[string]int64{
-			"big": 5000, "mid": 500, "small": 50,
-		}))
-		SetRelSizeFallbackStage(stage)
-		_, _, rewrote := reorderCommaFromByCardinality(stmt, c)
-		if rewrote {
-			t.Errorf("stage %d: the fallback must not reach the comma-FROM reorder", stage)
-		}
+// TestCommaFromReorderColdUsesTheFallback replaces
+// TestCommaFromReorderColdStageGating. take2 P1-05 retired
+// GOOPG_RELSIZE_FALLBACK's staging, so "stage 0 and 1 must not reach the
+// comma-FROM reorder" no longer describes a reachable configuration — the
+// fallback is unconditional and stage 2 was already the shipped default, which
+// is the arm the sibling tests below cover.
+//
+// The property kept is the one the staging test bracketed: with a live block
+// count the cold reorder DOES see an estimate and acts on it.
+func TestCommaFromReorderColdUsesTheFallback(t *testing.T) {
+	stmt, c := newColdReorderFixture(t, nil)
+	c.(*catalog.InMemory).SetRelationSizer(blockSizer(t, c, map[string]int64{
+		"big": 5000, "mid": 500, "small": 50,
+	}))
+	if _, _, rewrote := reorderCommaFromByCardinality(stmt, c); !rewrote {
+		t.Error("with a live block count the cold comma-FROM reorder must fire")
 	}
 }
 
@@ -126,9 +129,6 @@ func TestCommaFromReorderColdStageGating(t *testing.T) {
 // order three relations by a row count of 0, which would be a silent
 // source-order-dependent permutation.
 func TestCommaFromReorderNoSizerStillDeclines(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	SetRelSizeFallbackStage(2)
-
 	stmt, c := newColdReorderFixture(t, nil)
 	if _, _, rewrote := reorderCommaFromByCardinality(stmt, c); rewrote {
 		t.Fatalf("with no live block count the pass must decline")

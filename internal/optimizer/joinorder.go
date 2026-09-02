@@ -212,7 +212,7 @@ func reorderCommaFromByCardinality(s *parser.SelectStmt, cat catalog.Catalog) ([
 		// joins that stage rather than adding a fourth one: the
 		// re-evaluation at M0127-P5.6 retired stage 3, and the flag's
 		// `3` is now a documented alias for stage-2 behaviour.
-		if rows := relSizeFallbackRows(2, cat, tbl); rows > 0 {
+		if rows := relSizeFallbackRows(cat, tbl); rows > 0 {
 			rowCounts[i] = rows
 			continue
 		}

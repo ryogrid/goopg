@@ -117,12 +117,6 @@ func SetRelSizeFallbackStage(stage int) int {
 	return int(relsizeFallbackStage.Swap(int64(stage)))
 }
 
-// relSizeFallbackEnabled reports whether the consumer introduced at the given
-// stage should read the fallback.
-func relSizeFallbackEnabled(stage int) bool {
-	return relsizeFallbackStage.Load() >= int64(stage)
-}
-
 // relSizeFallbackRows is the single gated entry point every staged consumer
 // goes through: it returns the block-count relation-size estimate for tbl, or 0
 // when the consumer introduced at `stage` is not enabled. 0 means "no estimate"
@@ -133,10 +127,20 @@ func relSizeFallbackEnabled(stage int) bool {
 // accidentally read the fallback one stage early: stage 1 is stamped by
 // stage1RelSizeRows (planner.go, the SeqScan leaf) and stage 2 by
 // bushySeedRowCounts (bushy.go, the DP seed).
-func relSizeFallbackRows(stage int, cat catalog.Catalog, tbl *catalog.Table) int64 {
-	if !relSizeFallbackEnabled(stage) {
-		return 0
-	}
+// relSizeFallbackRows is the block-derived relation-size estimate, always on.
+//
+// take2 P1-05 retired the GOOPG_RELSIZE_FALLBACK staging. The flag existed to
+// sequence three consumers while the feature was being introduced; it has
+// shipped at stage 2 — every consumer enabled — since M0125-0005, so the only
+// states it still selected were "give this operator a planner production does
+// not run". That is the hazard flaglabels.go's header describes from the other
+// direction, and the flag had already twice caused artefacts to be stamped with
+// a regime they did not measure.
+//
+// The `stage` parameter is gone rather than ignored: a parameter every caller
+// passes a constant to, which nothing reads, is how the next reader concludes
+// the staging still works.
+func relSizeFallbackRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
 	return estimateTableRowsFallback(cat, tbl)
 }
 
@@ -174,7 +178,7 @@ func applyRelSizeFallback(info *baseRelInfo, binding rangeBinding, scan Node, lo
 	if info == nil || info.filteredRows > 0 {
 		return
 	}
-	rows := relSizeFallbackRows(2, cat, binding.table)
+	rows := relSizeFallbackRows(cat, binding.table)
 	if rows <= 0 {
 		return
 	}

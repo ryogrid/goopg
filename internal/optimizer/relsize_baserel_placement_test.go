@@ -163,13 +163,15 @@ func TestRelSizeFallbackPlacementInertWhenRowCountKnown(t *testing.T) {
 		t.Errorf("baseRows = %d; want the ANALYZEd 4242", warm.baseRows)
 	}
 
-	// Flag off: the seam must fall back to the pre-M0125-0003 answer.
-	SetRelSizeFallbackStage(1)
+	// take2 P1-05 retired the staging, so the old "flag off" arm is gone. What
+	// remains worth asserting is the positive direction it was the control
+	// for: a COLD relation does get the block-derived estimate.
 	cold, coldBinding, coldScan, coldPred := newPlacementFixture(nil)
 	info := estimateBaseRelInfo(coldBinding, coldScan, coldPred)
 	applyRelSizeFallback(&info, coldBinding, coldScan, coldPred, cold)
-	if info.baseRows != 0 || info.filteredRows != 0 {
-		t.Errorf("below stage 2 the fallback must not fire: base=%d filtered=%d", info.baseRows, info.filteredRows)
+	if info.baseRows <= 0 || info.filteredRows <= 0 {
+		t.Errorf("a cold relation must receive the fallback estimate: base=%d filtered=%d",
+			info.baseRows, info.filteredRows)
 	}
 
 	// A nil info must not panic the planner (the seam always passes a real

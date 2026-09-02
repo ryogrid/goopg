@@ -76,7 +76,6 @@ func onOff(on bool) string {
 // Nothing here may be a literal that restates a default declared elsewhere —
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
-	"GOOPG_RELSIZE_FALLBACK":  func(v string) string { return strconv.Itoa(parseRelSizeFallbackStage(v)) },
 	"GOOPG_MEMOIZE":           func(v string) string { return onOff(memoizeFromEnv(v)) },
 	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
 	"GOOPG_PGSHAPED_DP":       func(v string) string { return onOff(pgShapedDPFromEnv(v)) },
@@ -141,6 +140,13 @@ var flagProvenanceOrder = []string{
 // dropping it would make older artefacts that DO carry it look like they came
 // from this version of the gate.
 var flagProvenanceRetired = map[string]string{
+	// take2 P1-05. The staging existed to sequence three consumers while the
+	// block-derived relation-size fallback was being introduced; it shipped at
+	// stage 2 — every consumer on — from M0125-0005, so the only states it
+	// still selected were "a planner production does not run". The fallback is
+	// now unconditional and nothing reads the variable.
+	"GOOPG_RELSIZE_FALLBACK": "take2-P1-05",
+
 	"GOOPG_COST_DRIVEN_JOINORDER": "M0127-P5.9",
 	// M0126-0005's measurement-only switch for forcing MultiHashJoin packing
 	// off independently of join-order. M0127-P6.2 deleted the packer, so the
