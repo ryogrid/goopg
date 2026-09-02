@@ -204,7 +204,20 @@ reports `changed=0` against a pre-P0 goopg capture.
 
 ## Phase 1 — Statistics fidelity
 
-> **READ FIRST: [impl/FINDING-histograms-lost-on-restart.md](impl/FINDING-histograms-lost-on-restart.md).**
+> **RESOLVED 2026-09-02 by `f07c20b1f`** — three bugs in the pg_statistic
+> physical-tuple decoder, each silent, each masking the next:
+> (1) `decodeTextArray` advanced by each element's *unpadded* length where PG
+> aligns array elements to the element typalign; (2) `readVarlena` assumed the
+> 4-byte varlena header while the writer emits PG's 1-byte short header for
+> values under 128 bytes; (3) `readVarlena` aligned every slot to 4, but
+> `stavalues*` is `anyarray` with `typalign 'd'` (8). The stats were on disk
+> all along and were read back empty. `l_shipdate` now restores mcv=100
+> hist=101 with no new ANALYZE, and the estimate for a date-range predicate
+> moved from `2000418` (= rows/3, `DEFAULT_INEQ_SEL`) to `2567922` against
+> PostgreSQL's ~2.58 M. Gate: `TestPGStatisticRoundTripPreservesHistogram`.
+>
+> Original finding, kept for the reasoning:
+> **[impl/FINDING-histograms-lost-on-restart.md](impl/FINDING-histograms-lost-on-restart.md).**
 > ANALYZE histograms are computed, are visible in `pg_stats`, and are **gone
 > after a server restart** — for narrow columns (`l_quantity`, `l_shipdate`),
 > not only the wide-text ones P1-11 records. `n_distinct` and the relation size
