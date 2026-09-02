@@ -42,6 +42,68 @@ arm, same server age, `GOGC=100 GOMEMLIMIT=12GiB`):
 
 PG runs the three worst in about a second each, at the **same** `work_mem`.
 
+## 2b. CORRECTION — it is plan choice, not spill
+
+**The first version of this document concluded that the regression was hash-join
+spill efficiency. That was wrong, and it was wrong because it was inferred from
+the timings rather than read off the plans.** Profiling Q14 and Q3 refutes it.
+
+Q14, goopg at `work_mem = 64MB`:
+
+```
+Merge Join (actual time=13317..13861 rows=75001)
+  Merge Cond: (lineitem.l_partkey = part.p_partkey)
+  ->  Index Scan using lineitem_part_supp_fkidx on lineitem
+        (actual rows=6001255)  Rows Removed by Filter: 5926254
+  ->  Index Scan using part_pk on part (actual rows=200000)
+```
+
+PostgreSQL, same query and the same `work_mem`:
+
+```
+Parallel Hash Join (actual rows=15033.80 loops=5)
+  ->  Parallel Seq Scan on lineitem
+  ->  Parallel Hash  Buckets: 262144  Batches: 1  Memory Usage: 14624kB
+```
+
+**PG does not spill — one batch, 14.6 MB.** And goopg does not spill either: Q3's
+hash join reports `Batches: 1  Memory Usage: 15868kB`. Nothing batched in either
+engine.
+
+What actually happened is that reducing `work_mem` made goopg's hash join look
+dearer, which tipped the choice to a **merge join whose outer input is a full
+index scan of `lineitem`** — 6 001 255 rows scanned to yield 75 001, taking
+12.9 s of the 13.9 s total. Q3 is the same shape: a full index scan of
+`lineitem` returning 6 001 255 rows, 17.1 s of a 30.1 s total.
+
+The displayed cost of that scan is the tell:
+
+```
+Index Scan using lineitem_part_supp_fkidx on lineitem
+  (cost=0.00..66680.61 rows=666806 width=550)
+  Filter: (l_shipdate >= '1995-09-01' AND l_shipdate < ...)
+```
+
+There is **no `Index Cond:`** — the index is used purely for its ordering, so it
+returns every tuple and the date range is a post-fetch filter. A scan that
+touches 6 M heap tuples is costed at 66 680, which is why a merge join over it
+outbids a hash join.
+
+Two distinct defects are visible and neither is spill:
+
+1. **The full-range ordered index scan is under-costed.** PG's `cost_index`
+   with no index quals uses `indexSelectivity = 1.0` and charges for every tuple
+   the index returns, applying the filter's selectivity only to the OUTPUT row
+   count. goopg's own `costIndexScan` does the right thing and the ordered
+   producer does pass `selectivity: 1.0` — so the number above is not coming
+   from that path, and establishing which producer emitted it is the next step.
+   **P0-11's `DPPATH` provenance trace was built for exactly this question** and
+   is the resume point.
+2. **goopg has no Parallel Hash Join.** PG shares one 14.6 MB hash table across
+   five workers; goopg would build a private table per worker. That is P5-06,
+   and it is why PG stays comfortably inside 64 MB where goopg's costing thinks
+   it cannot.
+
 ## 3. What it means
 
 **The headline was flattered.** The recorded 227.0 s / 22.9 s = 9.9× compared a
@@ -50,19 +112,20 @@ ratio against PG's recorded 22.9 s is roughly **17.6×** — and that is the hon
 number, because a benchmark that gives one engine eight times the memory is not
 measuring the engines.
 
-**The dominant remaining problem is not the planner.** goopg does not degrade
-gracefully when a hash table stops fitting: Q14 slows 24×, Q3 11×, Q10 4×, while
-PG absorbs the same constraint in about a second. Those are hash joins that now
-BATCH, and the difference is spill efficiency, not plan choice — the plans are
-priced correctly now (P2-02 wired `work_mem` into the planner, so the planner
-knows the tables will batch), and the row counts prove the answers are right.
+**The dominant remaining problem IS the planner — specifically the cost model.**
+§2b shows the mechanism: a mis-costed full-range index scan lets a merge join
+outbid a hash join, and the resulting plan reads 6 M rows to produce 75 000. The
+row counts prove the answers are right; the plan is simply the wrong one.
 
-This sharpens the conclusion already recorded from three selectivity A/Bs
-(`perf-20260902-cumulative.md` §4b): estimator fidelity was not moving TPC-H
-time, and now the reason is visible. **The executor's spill path is a
-first-order cost**, and 07 §6 lists it as an out-of-scope "executor-side
-residual". On this evidence that classification is wrong: it is not a residual,
-it is the largest single lever available.
+This is consistent with, and explains, the conclusion recorded from three
+selectivity A/Bs (`perf-20260902-cumulative.md` §4b): refining CARDINALITY did
+not move TPC-H time, because the binding constraint is on the COST side, not the
+row-estimate side. Those are different halves of the estimator and the project
+had been working the wrong one.
+
+It also means the alignment did not merely expose a slower engine — it exposed a
+costing defect that was previously masked by an over-generous memory budget. The
+512MB arm was hiding a bug, not just flattering a number.
 
 ## 4. Why the alignment is kept
 
@@ -89,9 +152,12 @@ meaningful because planner and executor now read the same value.
 
 ## 6. Resume points
 
-1. Re-measure the PG side in full at the current configuration, rather than
+1. **Identify which producer emits the under-costed full-range index scan.**
+   `costIndexScan` and `pathindexordered.go` both look correct, so the number is
+   coming from somewhere else. Run with `GOOPG_PGSHAPED_DP_TRACE=1` and read the
+   `DPPATH` records (P0-11) for the `lineitem` relid: producer, rows, startup,
+   total, verdict. This is the first use the trace was built for.
+2. Re-measure the PG side in full at the current configuration, rather than
    comparing against the recorded 22.9 s from 2026-08-31.
-2. Profile Q14 and Q3 at `work_mem = 64MB`. They are the cleanest cases: a
-   single hash join each, PG at ~1 s, goopg at 11 s and 29 s.
-3. Reclassify 07 §6's executor-side spill residual as a first-order work item
-   with this evidence attached.
+3. P5-06 (parallel hash join) is now evidenced, not speculative: PG's 14.6 MB
+   shared table across five workers is why it stays inside 64 MB.
