@@ -16,12 +16,20 @@ import (
 // Table.Stats.Columns and must agree (see
 // docs/design/0122-0003-pg-stat-user-tables.md).
 //
-// goopg's ANALYZE collects only the MCV list (upstream STATISTIC_KIND_MCV, slot
-// 1) and the equi-depth histogram (STATISTIC_KIND_HISTOGRAM, slot 2). It does
-// not collect correlation (kind 3), most-common-elements (kind 4), or range-type
-// stats (kinds 5/6), so the corresponding pg_stats columns are always NULL —
-// byte-identical to a real PG 18.3 cluster whose ANALYZE happened to compute no
-// such slots for the column. Only columns with a materialized Table.Stats entry
+// goopg's ANALYZE collects the MCV list (upstream STATISTIC_KIND_MCV, slot 1),
+// the equi-depth histogram (STATISTIC_KIND_HISTOGRAM, slot 2) and the physical
+// correlation (STATISTIC_KIND_CORRELATION, slot 3). It does not collect
+// most-common-elements (kind 4) or range-type stats (kinds 5/6), so those
+// pg_stats columns are always NULL — byte-identical to a real PG 18.3 cluster
+// whose ANALYZE happened to compute no such slots for the column.
+//
+// take2 P1-28: this comment used to say correlation was not collected either,
+// and the view rendered a hard-coded NULL to match. That was stale — ANALYZE
+// has computed correlation for some time, buildUserPGStatisticRow persists it
+// in stakind3/stanumbers3, and cost_index CONSUMES it (a zero correlation
+// prices every index scan at max_IO_cost). So the one statistic whose absence
+// most distorts index costing was invisible to anyone diagnosing a plan
+// through pg_stats. Only columns with a materialized Table.Stats entry
 // appear (mirrors "a column ANALYZE never touched has no pg_statistic row").
 //
 // Simplifications (recorded in the deferral ledger): most_common_vals /
@@ -92,6 +100,15 @@ func (c *InMemory) PGStatsRowsForDBOid(dbOid uint32) [][]string {
 
 			N := VirtualNull
 			avgWidth := strconv.FormatFloat(cs.AvgWidth, 'g', -1, 32)
+			// Correlation is float4 in pg_statistic (stanumbers3[0]). It is
+			// rendered NULL when zero, mirroring the writer, which omits the
+			// slot rather than storing a zero — and mirroring PG, which does
+			// not emit a slot it has nothing for. A genuinely-zero correlation
+			// therefore reads as NULL either way, which is the same answer.
+			correlation := N
+			if cs.Correlation != 0 {
+				correlation = strconv.FormatFloat(cs.Correlation, 'g', -1, 32)
+			}
 			out = append(out, []string{
 				schema,    // 0:  schemaname
 				t.Name,    // 1:  tablename
@@ -103,7 +120,7 @@ func (c *InMemory) PGStatsRowsForDBOid(dbOid uint32) [][]string {
 				mcVals,    // 7:  most_common_vals
 				mcFreqs,   // 8:  most_common_freqs
 				histBounds, // 9: histogram_bounds
-				N,         // 10: correlation (kind 3 not collected)
+				correlation, // 10: correlation (stakind3)
 				N,         // 11: most_common_elems (kind 4)
 				N,         // 12: most_common_elem_freqs (kind 4)
 				N,         // 13: elem_count_histogram (kind 5)
