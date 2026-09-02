@@ -993,10 +993,40 @@ not grow; no query slower than 1.2×.
       `btcostestimate`, not alone, and its acceptance test is the aggregate
       sweep total rather than the per-query gate.
       Still open: `num_sa_scans` for ScalarArrayOp, and this term.
-- [ ] **P2-10** `compute_semi_anti_join_factors` and the semi/anti early-out in
+- [-] **P2-10** `compute_semi_anti_join_factors` and the semi/anti early-out in
       nestloop and hashjoin costing. *design: 08 §5.3.*
+      **BLOCKED on Phase 3 — there are no semi/anti PATHS to cost.**
+      `splitOuterSpine` peels outer/semi/anti links off the chain before the
+      search runs (joinsearchseam.go:50-56), so the DP sees inner joins only —
+      joinpaths.go:220 says as much ("under 03 §4.4's INNER-only pin"). Verified
+      2026-09-03: `JoinTypeSemi` / `JoinTypeAnti` appear in NO cost, path or
+      search code, and neither `hashJoinInputs` nor `nestloopCost` takes a join
+      type at all. There is nowhere to attach an early-out factor. The
+      prerequisite is P3's `deconstruct_jointree` with `SpecialJoinInfo` in the
+      DP, which is precisely the item that brings semi/anti into the search.
+      Same shape as P2-08: a faithful cost term whose consumer does not exist.
 - [ ] **P2-11** `estimate_hash_bucket_stats`: bucket-size and MCV-frequency
       skew terms in hash-join costing. *design: 08 §5.3; depends on P1-15.*
+      **Reachable, unlike P2-10 and P2-08 — hash joins ARE costed — but large.**
+      Scoped 2026-09-03. `hashJoinCost` charges the probe as
+      `cpu_operator_cost * numHashClauses * outerRows + cpu_tuple_cost *
+      outputRows`: it prices hashing the outer key and emitting matches, and
+      charges NOTHING for walking a bucket. PG charges
+      `hash_qual_cost.per_tuple * outer_matched_rows *
+      clamp_row_est(inner_rows * innerbucketsize * innermcvfreq) * 0.5`
+      (final_cost_hashjoin), which is the only term that can see a skewed key.
+      Without it a hash join on a low-NDistinct column is priced identically to
+      one on a unique column — the degeneracy this repo has already been bitten
+      by (`reselectDegenerateHashKeys`, Q78's collapsed bucket).
+      The work is plumbing, not arithmetic: `hashJoinInputs` carries only
+      innerRows/innerCols/avgVarBytes, so the inner key's ndistinct and MCV
+      frequency must reach the cost site from the caller, which holds the rel
+      and the clause list.
+      **Land it with a companion term, not alone.** The per-tuple index qual
+      cost (P2-09) was faithful, symmetric and not double-charged, and still
+      cost the sweep 3.3% on its own. The `TOTAL` arm added to
+      `scripts/tpcds-sweep-diff.py` on 2026-09-03 is what will catch that class
+      here; before it, the gate could not.
 - [ ] **P2-12** `mergejoinscansel` start/end selectivities in merge-join
       costing. *design: 08 §5.3.*
 - [ ] **P2-13** Bitmap lossy-page handling to match `tbm_calculate_entries`
