@@ -867,6 +867,25 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
 
 ## Phase 4 — Upper planner as paths
 
+- [x] **P4-01a** *(first slice — per-path width)* Paths carry their own
+      `NCols`/`AvgVarBytes` — gate: `TestPathCarriesItsOwnWidth`, units.
+      `pathgen.go` read column counts from the **rels**, under a comment
+      justifying it as "a parameterised path returns fewer ROWS than its rel but
+      the same columns". True of parameterisation, **false of projection**: an
+      index-only path emits only the columns its index covers, so the hash
+      geometry was solved for the relation's full width while the executor
+      measured the narrowed node's schema at runtime (`len(o.left.Schema())`).
+      Planner and executor disagreed about the size of the same hash table —
+      the divergence the shared `hashsize.Choose` exists to prevent, live at
+      HEAD and found by the P4-A review.
+      Read through `pathNCols`/`pathAvgVarBytes` so the fallback to the rel's
+      figures lives in one place; zero means "not narrowed".
+      *This is the foundation P4-01's remaining slice needs:* narrowing an
+      ordinary heap scan to the needed columns is now a matter of setting these
+      two fields on its path and emitting the narrowed schema, since the
+      per-rel/per-path blocker is gone.
+
+
 Exit: `aggregation-strategy` and `sort-strategy` diffs decrease; no correctness
 delta.
 

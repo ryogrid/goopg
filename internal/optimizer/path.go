@@ -113,6 +113,14 @@ type Path struct {
 	ParallelSafe    bool
 	ParallelWorkers int
 
+	// NCols / AvgVarBytes describe what THIS PATH emits, when that is narrower
+	// than its relation — PG's `pathtarget` at the granularity goopg needs for
+	// hash sizing. Zero NCols means "not narrowed"; read them through
+	// pathNCols / pathAvgVarBytes, never directly, so the fallback to the
+	// rel's figures stays in one place.
+	NCols       int
+	AvgVarBytes float64
+
 	// DisabledNodes reproduces PG 18's path->disabled_nodes (the count of
 	// enable_*-disabled nodes below this path). goopg has no enable_* GUCs, so it
 	// is always 0 today; carried so the dominance order matches PG and adding
@@ -324,6 +332,44 @@ func newRelOptInfo(relids RelSet, rows float64, width int) *RelOptInfo {
 // is a base rel. Zero is returned only when neither is available, and
 // hashJoinCost reads that as "assume no spill", which is what it did before
 // this function existed.
+// pathNCols is `relNCols` at PATH granularity — take2 P1-20's sibling in
+// P4-01.
+//
+// A path can produce FEWER COLUMNS than its relation. `pathgen.go` used to read
+// the column count from the rel, justified by "a parameterised path returns
+// fewer ROWS than its rel but the same columns". That is true of
+// parameterisation and false of PROJECTION: an index-only path emits only the
+// columns its index covers, so the hash geometry was solved for the relation's
+// full width while the executor measured the narrowed node's schema at runtime
+// (`len(o.left.Schema())`). Planner and executor disagreed about the size of
+// the same hash table.
+//
+// Zero means "this path does not narrow", and the rel's count is used.
+func pathNCols(p *Path) int {
+	if p != nil && p.NCols > 0 {
+		return p.NCols
+	}
+	if p == nil {
+		return 0
+	}
+	return relNCols(p.Rel)
+}
+
+// pathAvgVarBytes is pathNCols' variable-payload twin, and narrows for the same
+// reason: a projected path carries only the payload of the columns it emits.
+func pathAvgVarBytes(p *Path) float64 {
+	if p == nil {
+		return 0
+	}
+	if p.NCols > 0 {
+		return p.AvgVarBytes
+	}
+	if p.Rel != nil {
+		return p.Rel.AvgVarBytes
+	}
+	return 0
+}
+
 func relNCols(r *RelOptInfo) int {
 	if r == nil {
 		return 0

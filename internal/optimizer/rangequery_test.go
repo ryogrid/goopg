@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -421,5 +422,52 @@ func TestConvertTimevalueToScalar(t *testing.T) {
 	// An unparseable date must also fall back rather than return 0.
 	if got := bucketFraction("2024-01-01", "2024-01-05", "not-a-date", "date"); got != 0.5 {
 		t.Errorf("unparseable date = %.4f, want the 0.5 fallback", got)
+	}
+}
+
+// TestPathCarriesItsOwnWidth pins take2 P4-01's first slice: a path that emits
+// FEWER COLUMNS than its relation must be costed on its own width.
+//
+// pathgen.go read column counts from the RELS, justified by a comment saying "a
+// parameterised path returns fewer ROWS than its rel but the same columns".
+// True of parameterisation, false of PROJECTION — an index-only path emits only
+// the columns its index covers. The hash geometry was therefore solved for the
+// relation's full width while the executor measured the narrowed node's schema
+// at runtime (`len(o.left.Schema())`), so planner and executor disagreed about
+// the size of the same hash table. That is exactly what the shared
+// hashsize.Choose exists to prevent.
+func TestPathCarriesItsOwnWidth(t *testing.T) {
+	rel := &RelOptInfo{Relids: 1, NCols: 9, AvgVarBytes: 99}
+
+	// A path that does not narrow inherits the rel's figures.
+	wide := &Path{Kind: PathSeqScan, Rel: rel}
+	if got := pathNCols(wide); got != 9 {
+		t.Errorf("un-narrowed path NCols = %d, want the rel's 9", got)
+	}
+	if got := pathAvgVarBytes(wide); got != 99 {
+		t.Errorf("un-narrowed path AvgVarBytes = %v, want the rel's 99", got)
+	}
+
+	// A projecting path carries its own.
+	narrow := &Path{Kind: PathIndexScan, Rel: rel, NCols: 2, AvgVarBytes: 21}
+	if got := pathNCols(narrow); got != 2 {
+		t.Errorf("projecting path NCols = %d, want its own 2", got)
+	}
+	if got := pathAvgVarBytes(narrow); got != 21 {
+		t.Errorf("projecting path AvgVarBytes = %v, want its own 21", got)
+	}
+
+	// And the difference must reach the hash geometry, which is the whole
+	// point: 9 columns of a 200k-row build batches at 64MB, 2 does not.
+	const rows, mem = 200000.0, 64 << 20
+	wideSizing := hashsize.Choose(rows, pathNCols(wide), pathAvgVarBytes(wide), mem)
+	narrowSizing := hashsize.Choose(rows, pathNCols(narrow), pathAvgVarBytes(narrow), mem)
+	if wideSizing.NBatch <= narrowSizing.NBatch {
+		t.Errorf("narrowing did not reduce batching: wide NBatch=%d, narrow NBatch=%d",
+			wideSizing.NBatch, narrowSizing.NBatch)
+	}
+	if narrowSizing.NBatch != 1 {
+		t.Errorf("the narrowed build should fit in one batch at 64MB, got NBatch=%d",
+			narrowSizing.NBatch)
 	}
 }

@@ -22,7 +22,11 @@ package optimizer
 //   - Only when the needed set is KNOWN (`neededColumnNames`): an index-only
 //     scan that drops a column the query reads returns wrong rows.
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
+)
 
 // addIndexOnlyPaths generates, for every base relation, the index-only paths
 // whose index covers everything the statement reads from that relation.
@@ -117,6 +121,13 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		IndexScanDir:     ForwardScanDirection,
 		IndexOnly:        true,
 		IndexOnlyCovered: covered,
+		// take2 P4-01: this path emits only the covered columns, so it must
+		// carry its own width. Without it the hash geometry was solved for the
+		// relation's FULL column count while the executor measured this
+		// narrowed node's schema — the planner/executor divergence the shared
+		// hashsize.Choose exists to prevent.
+		NCols:       len(covered),
+		AvgVarBytes: coveredAvgVarBytes(tbl, covered),
 		// No index clauses: this is the full-index-scan shape, and
 		// `createPlan` reads the empty list as exactly that.
 	}, "indexonly")
@@ -179,4 +190,29 @@ func relAllVisibleFraction(tbl *catalog.Table, relPages int64) float64 {
 		return 1
 	}
 	return frac
+}
+
+// coveredAvgVarBytes is the variable-width payload of just the columns an
+// index-only path emits — the AvgVarBytes twin of its NCols.
+//
+// `RelOptInfo.AvgVarBytes` sums every column of the relation (joinsearch.go),
+// which is the right figure for a scan that returns every column and an
+// over-count for one that does not.
+func coveredAvgVarBytes(tbl *catalog.Table, covered []catalog.Column) float64 {
+	if tbl == nil || tbl.Stats == nil {
+		return 0
+	}
+	var sum float64
+	for _, c := range covered {
+		for i := range tbl.Columns {
+			if !strings.EqualFold(tbl.Columns[i].Name, c.Name) {
+				continue
+			}
+			if i < len(tbl.Stats.Columns) {
+				sum += tbl.Stats.Columns[i].AvgWidth
+			}
+			break
+		}
+	}
+	return sum
 }

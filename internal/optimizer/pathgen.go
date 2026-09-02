@@ -77,11 +77,15 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 		outerRows: p.Rows, innerRows: b.Rows,
 		outputRows:     joinRel.Rows,
 		numHashClauses: len(keys),
-		// Column counts come from the RELS, not the paths: a parameterised
-		// path returns fewer ROWS than its rel but the same columns.
-		outerCols: relNCols(probe), innerCols: relNCols(build),
-		// AvgVarBytes come from the rels for the same reason (M0128-P3.1).
-		outerAvgVarBytes: probe.AvgVarBytes, innerAvgVarBytes: build.AvgVarBytes,
+		// take2 P4-01: column counts come from the PATHS, falling back to the
+		// rels. The previous comment here read "Column counts come from the
+		// RELS, not the paths: a parameterised path returns fewer ROWS than
+		// its rel but the same columns" — true of parameterisation, false of
+		// PROJECTION. An index-only path emits only the columns its index
+		// covers, so the geometry was solved for the relation's full width
+		// while the executor measured the narrowed node's schema at runtime.
+		outerCols: pathNCols(p), innerCols: pathNCols(b),
+		outerAvgVarBytes: pathAvgVarBytes(p), innerAvgVarBytes: pathAvgVarBytes(b),
 	})
 	// The residual is evaluated only on tuples that already matched on the
 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
