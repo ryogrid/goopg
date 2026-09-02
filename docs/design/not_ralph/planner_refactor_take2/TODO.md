@@ -39,10 +39,20 @@ When closing an item, rewrite its line as:
 Exit: the parity instrument produces a committed baseline for both suites and
 reports `changed=0` against a pre-P0 goopg capture.
 
-- [ ] **P0-01** Node-type EXPLAIN coverage test — assert every node type in
-      `internal/optimizer/plan.go` has a `describePlan` arm; fail the test when
-      a new node type is added without one. *design: 08 §3; gate: units.*
-      Rationale: a census measures its labeller (09 §1 R3).
+- [x] **P0-01** Node-type EXPLAIN coverage test — `7677faaed`; gates:
+      `TestEveryPlanNodeTypeHasAnExplainArm`,
+      `TestEveryPlanNodeWithChildrenIsWalked`,
+      `TestDescribePlanHasExactlyOneTypeNameFallthrough`, units — all green.
+      **Found and fixed more than specified.** 18 node types had no arm and
+      printed their Go type name live (21 regress-diff lines in the
+      2026-09-02 nightly came from three of them). Two *covered* arms returned
+      `%T` themselves. And four types carried children `planChildren` never
+      walked, so `SELECT DISTINCT ON (k)` rendered as **one line** where PG
+      renders Unique/Sort/Seq Scan — the M0125-0037(i) truncation class. Fixing
+      the RecursiveUnion child-walk then exposed a doubled `CTE <name>` header
+      (the recursive self-reference is a `CTEScan` over the working table); it
+      now renders PG's leaf `WorkTable Scan on <name>`, making goopg's
+      WITH RECURSIVE plan structurally identical to PG's.
 - [ ] **P0-02** EXPLAIN emits the chosen path's real `(startup, total)`, `rows`
       and `width`; `COSTS OFF` suppresses them. Replace both literal
       `cost=0.00..0.00` sites in `internal/executor/operators_explain.go`.
@@ -73,14 +83,20 @@ reports `changed=0` against a pre-P0 goopg capture.
       `rows=` from `attachedFilterNode`, the ANALYZE walker from the node, so
       the two modes can print different estimates for the same filtered scan.
       *design: 08 §3 P0-3; gate: units.*
-- [ ] **P0-04c** Add `GOOPG_INDEX_PROBE_MULT` to
+- [x] **P0-04c** — `f2ac4fdfc`; gates: `TestFlagProvenanceEnvIsGenerated`,
+      `TestFlagProvenanceTableCoversPlannerEnv`, new
+      `TestFlagProvenanceDetectorSeesHelperWrappedReads`, full
+      `internal/optimizer` — green. The completeness guard's detector matched
+      only literal `os.Getenv("GOOPG_…")` and this flag is read through a
+      helper, so the row **and** a `go/ast` string-literal detector landed
+      together. Resolved multiplier unchanged at 1.0, so no plan moved.
+      ~~Add `GOOPG_INDEX_PROBE_MULT` to
       `internal/optimizer/flaglabels.go` so it reaches the generated
       `scripts/planner-flags.env` — the one plan-shaping knob artifacts cannot
       currently state. **Also fix the guard that missed it**: the detector
       `flaglabels_test.go:94` matches only literal `os.Getenv("GOOPG_…")`, and
       this flag is read through the `envFloatDefault` helper. Replace it with a
-      `go/ast` string-literal walk (impl/P0-A §7). *design: 08 §3 P0-3; gate:
-      `TestFlagProvenanceEnvIsGenerated`, `TestFlagProvenanceTableCoversPlannerEnv`.*
+      `go/ast` string-literal walk (impl/P0-A §7).~~
 - [ ] **P0-05** `plan-parity` capture mode: capture EXPLAIN from goopg and from
       PG for TPC-H 22 and TPC-DS 99; commit the PG side as a fixture
       (`bench/tpch/plans-pg/`, `bench/tpcds/plans-pg/`). *design: 08 §3, 09
