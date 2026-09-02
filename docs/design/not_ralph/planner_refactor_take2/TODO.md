@@ -177,7 +177,27 @@ reports `changed=0` against a pre-P0 goopg capture.
       `DPTRACE` lines as `Malformed`, so a lone emitter would look like a
       regression in the existing instrument. *design: 09 §1 R4; gate: units,
       `Malformed == 0`.*
-- [ ] **P0-12** Align the goopg TPC-H bench cluster's memory settings with the
+- [!] **P0-12** **BLOCKED on P2-02 — the recorded ordering is unsafe.**
+      *(established 2026-09-02 by reading the code, not yet acted on.)*
+      Setting `work_mem = 64MB` in goopg's bench conf would make the
+      **executor** honour 64MB (`hashsize.EffectiveMemLimit` reads the session)
+      while the **planner** keeps pricing at `hashsize.DefaultMemLimitBytes`
+      = 512MB — `defaultCostParams()` is hard-wired and no session reaches it
+      (`cost_funcs.go`'s `workMem` comment says so outright, and warns: "The two
+      must agree or the planner prices a geometry the executor will not build").
+      Today they agree by accident, both at 512MB. P0-12 alone would break that
+      agreement and make plans worse in a way that looks like a config change.
+      **So P2-02 (session cost GUCs reach the planner) must land first**, and
+      then P0-12 and P2-02b together. The bundle's ordering — P0-12 *before*
+      P2-02b — is right about P2-02b and silent about P2-02, which is the one
+      that actually gates it.
+      Also measured: `shared_buffers` is 4x apart (PG 512MB, goopg 2048MB from
+      `bench/tpch/setup_goopg.sh:55`). That one is a **deliberate architectural
+      divergence**, not drift — goopg's buffer arena is a Go-heap object under
+      `GOMEMLIMIT` (M0032-0001) — so it should be recorded as a permitted
+      difference rather than "aligned" by shrinking goopg to 512MB, which would
+      measure Go's GC rather than the planner.
+      ~~Align the goopg TPC-H bench cluster's memory settings with the
       PG reference cluster's. Today PG sets `work_mem = 64MB` and
       `effective_cache_size = 2GB` explicitly while goopg's conf leaves both at
       boot defaults (512MB and 4GB), so the headline 9.9× is measured with
@@ -186,7 +206,7 @@ reports `changed=0` against a pre-P0 goopg capture.
       (impl/P0-B §2.2), and wider than recorded:** `shared_buffers` is also 4×
       apart (PG 512MB, goopg 2GB). It cannot change a plan (`effective_cache_size`
       is the cost-model input) but it changes runtime, so it is aligned too.
-      All other cost/collapse/parallel GUCs were verified identical. Do this **before**
+      All other cost/collapse/parallel GUCs were verified identical.~~ Do this **before**
       P2-02b, which changes the boot default — doing P2-02b first would swing
       goopg from 8× more memory to 16× less and read as a catastrophic
       regression that is really a configuration change. *design: 09 §6.4; gate:
@@ -406,7 +426,12 @@ not grow; no query slower than 1.2×.
       `work_mem`, `parallel_setup_cost`, `parallel_tuple_cost` changes a plan.
       *design: 08 §5.1; gate: 09 §5 P2 row.*
 - [ ] **P2-02b** Correct `work_mem`'s `BootVal` from `512MB` to PostgreSQL
-      18.3's `4MB`. The planner's copy is hard-wired to the goopg value, so
+      18.3's `4MB`. **Note (2026-09-02):** the planner's hard-wired copy is
+      `hashsize.DefaultMemLimitBytes` (`hashsize.go:83`, `512 << 20`), which is
+      also the executor's no-session fallback — so the two agree today only
+      because both are wrong in the same direction. Changing one without the
+      other is worse than changing neither; this item, P2-02 and P0-12 form one
+      ordered group. The planner's copy is hard-wired to the goopg value, so
       hash tables appear to fit where PostgreSQL's would batch and sorts stay
       in memory where PostgreSQL's would spill. **Requires P0-12 first** — the
       bench clusters must already carry explicit matching values, or this looks
