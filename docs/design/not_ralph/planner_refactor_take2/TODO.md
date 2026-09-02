@@ -752,6 +752,19 @@ not grow; no query slower than 1.2×.
       like a catastrophic regression (09 §6.4). Expect many plans to move;
       lands alone, both suites timed. *design: 08 §5.1; gate: plan-parity +
       timing both suites, `TestSampleConfigCoversRegistry`.*
+      **ATTEMPTED AND REVERTED (2026-09-03) — BLOCKED on settings propagation.**
+      The change itself is three lines (GUC `BootVal`, `postgresql.conf.sample`,
+      `hashsize.DefaultMemLimitBytes`) and all three must move together, as the
+      note above says. Measured on the aligned bench cluster it cost TPC-H
+      245.7 s -> 314.4 s, with Q9 +434 %, Q7 +109 %, Q2 +82 %, at an UNCHANGED
+      `work_mem` of 64MB and an unchanged session GUC. Root cause:
+      `PlanWithSettings` stamps its settings at exactly one site, while
+      `newResolveContext` re-defaults them at 30 — so a subquery's join search
+      (Q9 is entirely inside one) plans under the hard-wired default no matter
+      what the session says. The 512MB default is therefore LOAD-BEARING for
+      real planning, not a fallback. Fix the propagation first, then this item
+      is safe. Full evidence, including the four hypotheses ruled out by
+      measurement: `impl/FINDING-planner-settings-not-propagated.md`.
 - [ ] **P2-02c** Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner
