@@ -71,9 +71,10 @@ for the notification" ends the session, loses the gate result, and forces the
 next loop to re-run the same gates (this once burned 4 consecutive loops on the
 identical `go test`/`tpch-spotcheck` command).
 - Run test/verification gates (`ralph-precommit-test.sh`, `tpch-spotcheck.sh`,
-  `make race-gate`, pgbench) in the FOREGROUND. Bash timeouts are raised for
+  `make race-gate`) in the FOREGROUND. Bash timeouts are raised for
   loop sessions: 15 min default, up to 60 min with an explicit `timeout`
-  parameter on the Bash call.
+  parameter on the Bash call. (pgbench is NOT listed here deliberately — the
+  pre-commit hook already runs it; see AGENT.md §"Pre-commit test gate".)
 - Never pass `-count=1` to gate `go test` invocations (cache policy:
   ci/design/test-gate-speedups/05). If a gate is unexpectedly slow, check
   whether the test cache went cold (branch switch / toolchain change) before
@@ -158,17 +159,13 @@ the test suite is happy.
    before editing `grammar/*.y` or `internal/parser/`, and before changing
    parser behaviour to fix a regress case or to match PostgreSQL. Skip the
    re-read if you already read it this session; do not skip it because the
-   change looks small. That grammar is a PORT of `gram.y`, not a copy: it has
-   synthetic terminals with no upstream counterpart (`TYPEDLIT`, `CHECKBODY`,
-   the `*_LA` family), its own position primitive (`$<p>N` — `lastConsumedPos()`
-   silently returns the wrong token in specific reduce states), four
-   interacting position conventions that feed the wire `ErrorResponse.Position`
-   and are NOT covered by the golden corpus, and ~1.7% of statement classes
-   deliberately left on hand-written token scanners where a grammar rule would
-   make goopg STRICTER than it ships. §12 lists every intentional divergence
-   with its upstream citation. Build with `make gen-parser` (never `go build`
-   alone — it compiles a stale generated parser), and treat the
-   `parity_goldens.txt` diff as the review artifact for the change.
+   change looks small. The full rationale (synthetic terminals, position
+   conventions, intentional divergences, build steps) is in AGENT.md
+   §"Parser code — READ THE PLAYBOOK FIRST"; treat that section as the
+   authoritative statement and this rule as its pointer. Build with
+   `make gen-parser` (never `go build` alone — it compiles a stale generated
+   parser), and treat the `parity_goldens.txt` diff as the review artifact
+   for the change.
 
 ## ⚠️ Memory Guard (OOM protection — a heavy process may be SIGKILLed)
 A resident watchdog (`~/.ralph/mem_guard.py`, one instance per `ralph_loop.sh`
@@ -215,10 +212,14 @@ When performing cleanup, refactoring, or restructuring tasks:
 - Include executed gates in the status RECOMMENDATION line (for auditability)
 - **Long-running pre-commit gate failures:** if a pre-commit gate (e.g.
   `scripts/ralph-precommit-test.sh`, `scripts/tpch-spotcheck.sh`) fails and the
-  fix drags on across multiple turns, commit and push at a natural checkpoint —
-  the tree must build and the in-progress fix must be at a coherent stopping
-  point. Do not let days of uncommitted WIP accumulate behind a red gate;
-  incremental commits reduce blast radius and keep the branch pushable.
+  fix drags on across multiple turns, do NOT accumulate uncommitted WIP — but
+  the tree must never be committed while a suite is red. Commit at a natural
+  checkpoint only when the in-progress fix is at a coherent, **green** stopping
+  point (unit/component suite passing) so the branch stays pushable; if the
+  failure cannot be resolved within the loop, stop and record the blocker per
+  AGENT.md's "Completion and Deferral Discipline" instead of committing around
+  it. (See AGENT.md §"Pre-commit test gate" — this policy is the authoritative
+  statement.)
 
 ## 🔬 PostgreSQL Oracle Test Porting
 
@@ -244,12 +245,10 @@ must-pass set.
 ### Running oracle tests (NOT part of `go test ./...`)
 
 Ported tests are slow and invoke external client binaries. Never run them as
-part of the default suite. Run explicitly:
-
-```bash
-go test -v -run TestPort_ ./internal/testport/        # all ported TAP tests
-go test -v -run TestPort_Psql001Basic ./internal/testport/  # one specific test
-```
+part of the default suite. Run explicitly (`go test -v -run TestPort_ ./internal/testport/`);
+see AGENT.md §"PostgreSQL Oracle Test Port" for the full set of run commands,
+regress-runner, and deferred-suite unlock conditions. The CSV status vocabulary
+below is the authoritative definition of the six status values.
 
 ### When to port a deferred test
 
@@ -388,17 +387,23 @@ EXIT_SIGNAL: true is reserved for genuine completion (every fix_plan item [x] AN
 passing AND specs satisfied). Everything else is EXIT_SIGNAL: false.
 
 ## File Structure
-- .ralph/: Ralph-specific configuration and documentation
-  - specs/: Project specifications and requirements
-  - fix_plan.md: Prioritized TODO list for all of milestones
-  - AGENT.md: Project build and run instructions
-  - PROMPT.md: This file - Ralph development instructions
-  - logs/: Loop execution logs
-- docs/:
-  - design/: agent generated design documents
-  - milestones/: milestone definitions by user
-- src/: Source code implementation
-- examples/: Example usage and test cases
+- `.ralph/`: Ralph-specific configuration and documentation
+  - `specs/`: Project specifications and requirements
+  - `fix_plan.md`: Prioritized TODO list for all of milestones
+  - `AGENT.md`: Project build and run instructions
+  - `PROMPT.md`: This file — Ralph development instructions
+  - `logs/`: Loop execution logs
+  - `deferral_ledger.md`: Deferral tracking ledger
+  - `working_set.md`: Inter-loop state carry
+- `cmd/goopg/`: Top-level CLI entrypoint (replaces postmaster + pg_ctl + initdb)
+- `internal/`: All non-public packages (server, protocol, config, storage, mvcc, catalog, parser, planner, executor, access, auth, …)
+- `docs/`:
+  - `design/`: Agent-generated design documents
+  - `milestones/`: Milestone definitions by user
+  - `wiki/`: Module documentation
+- `postgres/`: READ-ONLY upstream PostgreSQL 18.3 source (reference oracle)
+- `bench/`: Benchmark clusters (TPC-H, TPC-DS)
+- `go.mod`
 
 ## Current Task
 Follow .ralph/fix_plan.md and choose the most important item to implement next.
@@ -413,7 +418,7 @@ Remember: Quality over speed. Build it right the first time. Know when you're do
   `postgres/official_docs_in_md/` — cite/link it for user-visible semantics (GUC
   meanings, SQL behavior) instead of re-deriving from source
 
-## VESION CONTROL RULES
+## VERSION CONTROL RULES
 - add and commit working changes with descriptive messages when you complete a task and push to origin
 
 ## PostgreSQL Compatibility testing

@@ -8,7 +8,8 @@ for the authoritative goals; pick work from `.ralph/fix_plan.md`.
 ## At Start of Session
 
 You MUST execute the following commands at the start of every session.
-- `export GOMEMLIMIT=15GiB`
+- `export GOMEMLIMIT=15GiB` (heavy queries may need lower limits — TPC-H Q21
+  completed at `GOMEMLIMIT=12GiB + GOGC=100`; see CLAUDE.md for details.)
 
 ## Memory-capped execution (WSL2 OOM containment) — MANDATORY
 
@@ -422,9 +423,10 @@ If Go symbol operations fail:
 - One item per loop. Pick the topmost unchecked task in
   `.ralph/fix_plan.md` unless **the `## Current Priority` banner** or a
   dependency forces another order. The banner wins over topmost placement —
-  as of 2026-08-13 it ranks M-NIGHTLY first (standing filing + selection) with
-  M0132 as the next-priority milestone, so "topmost unchecked" is NOT the
-  selection rule today. The banner also outranks
+  as of 2026-09-01 it ranks M-NIGHTLY first (standing filing + selection),
+  M0134 was the next-priority milestone until declared EXHAUSTED 2026-09-01,
+  and active selection now falls through to M0119; M0132 is archived complete.
+  The banner also outranks
   `.ralph/working_set.md`'s "NEXT LOOP" note, which carries state, not
   priority.
 - Search before assuming something is missing. Prefer reading the spec and

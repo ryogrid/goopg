@@ -1,5 +1,7 @@
 # goopg Fix Plan
 
+## Current Priority
+
 Roadmap derived from `.ralph/specs/GOAL_AND_REQUIREMENTS.md` (§10 "Definition of
 Done (Initial Milestone)"). Pick the topmost unchecked item **unless the Current
 Priority banner below or a dependency forces another order**.
@@ -196,12 +198,13 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 
 ## M0131 — Bidirectional cluster-directory cold-start + real-PG system-view hosting (filed 2026-08-11)
 
-> **Demoted from top priority by the 2026-08-13 user directive** — M0132 is now
-> the next-priority milestone after M-NIGHTLY. This section sits at the end of
-> the file for append-safety only — **document order does NOT reflect
-> priority.** The `## Current Priority` banner at the top of this file is the
-> sole ordering authority. Work M0131's remaining tasks after M0132, before any
-> remaining M0130, M0119 or M0122 item.
+> **Demoted from top priority by the 2026-08-13 user directive** — M0134
+> (regress-sql digestion) became the next-priority milestone after M-NIGHTLY in
+> 2026-08-15; M0132 was completed and archived; M0134 was declared exhausted
+> 2026-09-01. This section sits at the end of the file for append-safety only —
+> **document order does NOT reflect priority.** The `## Current Priority` banner
+> at the top of this file is the sole ordering authority. Work M0131's remaining
+> tasks after M0134 and M0119, before any remaining M0122 item.
 
 **Milestone doc:** `docs/milestones/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`
 **Implementation plan:** `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`
@@ -238,7 +241,8 @@ M0132 (Explicit transactions across the extended query protocol), M0133 (informa
 **Priority: next after M-NIGHTLY (user directive 2026-08-15).** The `## Current
 Priority` banner names M0134 immediately after M-NIGHTLY's standing filing
 obligation; work M0134 tasks right after M-NIGHTLY's regression fixes, ahead of
-M0119 and M0122's remaining items. Milestone doc:
+M0119 and M0122's remaining items. **As of 2026-09-01 M0134 is EXHAUSTED** —
+active selection now falls through to M0119 per the banner. Milestone doc:
 `docs/milestones/0134-regress-sql-failed-not-tried-digestion.md`.
 
 **Per-task discipline (binding, from the milestone doc):**
