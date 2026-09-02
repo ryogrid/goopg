@@ -160,6 +160,25 @@ Discriminating praise only, since the rest is noise:
   rather than silently dropped.
 - Doc 05's `parallel_leader_participation` error and doc 04's minor errata are
   noted in the raw reports and not yet folded into those documents.
-- The remaining 22 MINOR findings in `.review-pg.md` are not individually
-  applied. They are imprecisions rather than errors of fact; the file is the
-  work list.
+- The remaining MINOR findings in `.review-pg.md` are not individually applied.
+  They are imprecisions rather than errors of fact; the file is the work list.
+
+## Addendum — five MAJOR findings applied after the first commit
+
+A reviewer sub-agent auditing doc 03 §5–§13 finished after the bundle was first
+committed (`ec220754b`). Its findings were already folded into `.review-pg.md`,
+but only the first had been applied to the document. All five are now fixed and
+re-verified against the source:
+
+| # | Doc 03 | Was | Is | Citation |
+|---|---|---|---|---|
+| 1 | §12.1 | worked example gives `rows=1007`, "matches the manual" | **1006** — `ineq_histogram_selectivity` subtracts `eq_selec` for a strict `<`, which §5.3 of the same document already states. Mechanism confirmed on the live PG 18.3 oracle: `a < 1000` → 1003, `a <= 1000` → 1004, the difference being exactly the `eq_selec` term | `selfuncs.c:1198-1200,1315-1322` |
+| 2 | §7.5 | `mergejoinscansel`'s `nulls_first` shift scales by `(1−start)` | plain addition, no scaling, applied to **both** the start and the end fraction | `selfuncs.c:3230-3249` |
+| 3 | §8.3 | `estimate_hashagg_tablesize` in `planner.c`, formula adds `MAXALIGN(width) + MAXALIGN(SizeofMinimalTupleHeader)` to `hash_agg_entry_size` | it is in **`selfuncs.c:4179`**, and the body is `hash_agg_entry_size(...) * dNumGroups`. `hash_agg_entry_size` already includes those terms, so the old formula was the pre-PG16 shape and **double-counted** | `selfuncs.c:4178-4195`, `nodeAgg.c:1701-1731` |
+| 4 | §9.3 | `dependency_is_compatible_clause` accepts `Var IS NULL` | `dependencies.c` has **no `NullTest` branch** (0 occurrences). `IS NULL` is compatible with **MCV** extended statistics only | `dependencies.c:741-870`, `extended_stats.c:1385-1390` |
+| 5 | §11 | `pg_restore_relation_stats` writes `pg_class` "in place" | it calls `CatalogTupleUpdate` (`relation_stats.c:183`) — an ordinary **transactional** catalog update, not `vac_update_relstats`' in-place write | `relation_stats.c:137-192` |
+
+Findings 3 and 5 are the kind that would have propagated silently: an
+implementer porting `estimate_hashagg_tablesize` from the old formula would
+size every hash-aggregate table too large, and one porting the statistics
+import path would have reached for the wrong write mechanism.

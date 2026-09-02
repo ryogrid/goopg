@@ -917,7 +917,9 @@ if leftend > rightend: leftend = 1  elif leftend < rightend: rightend = 1  else 
 leftstart = scalarineqsel(ltop,  isgt, iseq=false, leftvar,  rightmin)   # fraction of left  <  right min
 rightstart = scalarineqsel(revltop, …,            rightvar, leftmin)
 if leftstart < rightstart: leftstart = 0  elif leftstart > rightstart: rightstart = 0 else both = 0
-if nulls_first: shift each side by its stanullfrac (start += nullfrac*(1-start) etc., clamped)
+if nulls_first: *leftstart += stanullfrac; CLAMP; *leftend += stanullfrac; CLAMP
+                (plain addition, no (1-start) scaling, applied to BOTH start and end;
+                 selfuncs.c:3230-3249)
 ```
 
 A `DEFAULT_INEQ_SEL` result is treated as "unknown" and leaves the default
@@ -1006,8 +1008,11 @@ the covered varinfos from the list.
   both capped by the input rows; result `>= 1`. `planner.c:preprocess_limit`
   turns these into `tuple_fraction` / `limit_tuples` for path selection.
 * Hash agg memory: `estimate_hashagg_tablesize(root, path, agg_costs,
-  dNumGroups)` = `dNumGroups * (MAXALIGN(width) + MAXALIGN(SizeofMinimalTupleHeader)
-  + hash_agg_entry_size(...))` (`src/backend/optimizer/plan/planner.c`).
+  dNumGroups)` = `hash_agg_entry_size(nTrans, width, transitionSpace) *
+  dNumGroups` (`selfuncs.c:4178-4195`). `hash_agg_entry_size`
+  (`nodeAgg.c:1701-1731`) *already* includes
+  `MAXALIGN(MAXALIGN(SizeofMinimalTupleHeader) + tupleWidth)`, so adding those
+  terms again — the pre-PG16 shape — double-counts the header and width.
 * Incremental sort / Memoize / window partitions
   (`costsize.c:cost_incremental_sort`, `cost_memoize_rescan`,
   `get_windowclause_startup_tuples`) all call `estimate_num_groups`.
@@ -1099,9 +1104,12 @@ the clauses fully covered by that object (`stat_clauses`), mark them in
   sel*stat_sel`.
 
 `dependencies_clauselist_selectivity` (`dependencies.c`): only clauses
-compatible with dependencies (`dependency_is_compatible_clause`: `Var = Const`,
-`Var IS NULL`, `Var = ANY(array)` on the OR form, and expression variants
-mapped to pseudo-attnums); repeatedly `find_strongest_dependency` (most
+compatible with dependencies (`dependency_is_compatible_clause`,
+`dependencies.c:741-870`: a binary `OpExpr` whose `oprrest` is `F_EQSEL`, a
+`ScalarArrayOpExpr` with `useOr`, an `is_orclause` BoolExpr, `NOT x`, a bare
+boolean Var, and expression variants mapped to pseudo-attnums. There is **no
+`NullTest` branch** — `IS NULL` is compatible with **MCV** extended statistics
+only, `extended_stats.c:1385-1390`); repeatedly `find_strongest_dependency` (most
 attributes, then highest degree, fully contained in the remaining clause
 attnums), removing the dependent attribute each time; then
 `clauselist_apply_dependencies`: per attribute `attr_sel[a] =
@@ -1223,8 +1231,10 @@ Result `clamp_row_est`ed.
   `src/backend/statistics/attribute_stats.c:pg_restore_attribute_stats` /
   `pg_clear_attribute_stats` accept `(relation, attname, inherited, version,
   null_frac, avg_width, n_distinct, most_common_vals, …)` as variadic
-  name/value pairs and write `pg_class` (in place) and `pg_statistic`
-  (upsert) directly. `pg_dump` (`src/bin/pg_dump/pg_dump.c:dumpRelationStats`)
+  name/value pairs. `relation_stats_update` builds a new tuple with
+  `heap_modify_tuple_by_cols` and calls `CatalogTupleUpdate`
+  (`relation_stats.c:137-192`) — an ordinary **transactional** catalog update,
+  not `vac_update_relstats`' in-place write; `pg_statistic` is upserted. `pg_dump` (`src/bin/pg_dump/pg_dump.c:dumpRelationStats`)
   emits `SELECT * FROM pg_catalog.pg_restore_relation_stats(...)` and
   `pg_restore_attribute_stats(...)` statements when `--statistics` /
   `--statistics-only` is used (`--no-statistics` suppresses them).
@@ -1250,9 +1260,14 @@ puts 1000 in bin `i = 2` (`values[1] = 993`, `values[2] = 1997`);
 `convert_to_scalar` → `binfrac = (1000 - 993)/(1997 - 993) = 0.00697`;
 `histfrac = (1 + 0.00697)/10 = 0.100697`. `scalarineqsel`: `selec = (1 - 0 -
 0) × 0.100697 + 0 = 0.100697`; rows = `10000 × 0.100697 = 1007`. The
-manual's text says `rows=1007`; PG 18.3 itself returns **1006**, because `<`
-subtracts `eq_selec` for the bound value. Verified against the live oracle —
-prefer the measured value over the manual's.
+manual's text says `rows=1007`. PG 18.3 gives **1006**: for `<`,
+`ineq_histogram_selectivity` subtracts `eq_selec = 1/10000 = 0.0001`, so
+`histfrac = 0.100597`. §5.3 step 2 states that subtraction, so the manual's
+figure (which the manual itself calls an oversimplification) contradicts this
+document's own rule. The mechanism was confirmed empirically on the live PG
+18.3 oracle with a 10,000-row temp table: `a < 1000` gives `rows=1003` and
+`a <= 1000` gives `rows=1004`, the `eq_selec` term being exactly the
+difference. An implementer calibrating against 1007 omits the term entirely.
 
 ### 12.2 MCV equality and miss — `tenk1 WHERE stringu1 = 'CRAAAA'` / `'xxx'`
 
