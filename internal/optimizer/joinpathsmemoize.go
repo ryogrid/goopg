@@ -421,3 +421,61 @@ func relationByteSize(rows, avgVarBytes float64, ncols int) float64 {
 	}
 	return rows * w
 }
+
+// nestLoopInnerRescanCost prices a rescan of a nested loop's inner side the way
+// goopg's EXECUTOR actually performs it. take2 P2-06.
+//
+// PG chooses per plan whether to interpose a Material node, pays cost_material
+// for it, and then gets cheap rescans (cost_rescan's T_Material arm). goopg's
+// nested loop does not choose: openNestedLoop ALWAYS wraps the inner in
+// newMaterializeOp (join_nl_stream.go:108), unbounded by default. So the
+// executor is permanently in PG's materialised case, and the cost model was
+// pricing the un-materialised one — charging a full re-execution per outer row
+// for a replay that reads a cache.
+//
+// A `PathMaterial` kind is deliberately NOT introduced. The same reasoning
+// already recorded for the merge arm applies (joinpathsmergeouter.go:52-72): the
+// executor materialises unconditionally, so a path-level Material node would
+// buffer the inner twice.
+//
+// The two halves of cost_material (costsize.c:2485-2507) both land here:
+//
+//	build  — 2 * cpu_operator_cost * tuples, the write-then-read pass, charged
+//	         ONCE, plus a spill charge when the cache exceeds work_mem.
+//	rescan — cpu_operator_cost * tuples, the replay (cost_rescan's T_Material
+//	         arm, costsize.c:4703-4712), charged per additional outer row.
+func nestLoopInnerRescanCost(inner *Path, cp costParams) (build, rescan float64) {
+	if inner == nil {
+		return 0, 0
+	}
+	// A Memoize inner already models its own reuse; do not charge it twice.
+	if inner.Kind == PathMemoize && inner.MemoizeInfo != nil {
+		return 0, inner.MemoizeInfo.rescan.Total - inner.MemoizeInfo.rescan.Startup
+	}
+	// A PARAMETERISED inner cannot be materialised: every outer row supplies
+	// different parameters, so the "cache" would be wrong, and PG's
+	// create_material_path is likewise only reached for unparameterised inners.
+	// Such an inner really is re-executed per outer row, which is the default
+	// cost_rescan arm.
+	if inner.RequiredOuter != 0 {
+		st, tot := pathRescanCost(inner, cp)
+		return 0, tot - st
+	}
+	rows := inner.Rows
+	if rows < 1 {
+		rows = 1
+	}
+	build = 2 * cp.cpuOperatorCost * rows
+	rescan = cp.cpuOperatorCost * rows
+	// The spill arm. goopg's cache runs UNBOUNDED by default
+	// (inner.setUnbounded, join_nl_stream.go:110-124), which is why this is
+	// charged on the work_mem the planner is solving for rather than on a
+	// bound the executor may not apply: the point of the term is to stop the
+	// planner choosing a shape whose cache does not fit, which is the Q54
+	// cliff recorded at that call site.
+	if nbytes := relationByteSize(rows, pathAvgVarBytes(inner), pathNCols(inner)); nbytes > float64(cp.workMem) {
+		build += cp.seqPageCost * math.Ceil(nbytes/blockSizeBytes)
+		rescan += cp.seqPageCost * math.Ceil(nbytes/blockSizeBytes)
+	}
+	return build, rescan
+}

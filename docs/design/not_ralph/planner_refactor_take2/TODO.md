@@ -900,8 +900,33 @@ not grow; no query slower than 1.2×.
       producer-skipping. All `enable_*` GUCs become live; retire
       `enable_nestloop_index`. *design: 08 §5.2; gate: an `enable_X=off` test
       per flag, plan-parity + timing.*
-- [ ] **P2-06** `cost_material` and a Material path; the merge-join
+- [x] **P2-06** `cost_material` and a Material path; the merge-join
       materialise-inner decision becomes a cost comparison. *design: 08 §5.3.*
+      **Landed 2026-09-03, and NOT as written on either half.**
+      (a) *No Material path was introduced, and one would be wrong.* goopg's
+      executor materialises unconditionally on BOTH sides — `openNestedLoop`
+      always wraps the inner in `newMaterializeOp`
+      (join_nl_stream.go:108), and the merge executor buffers per equal-key
+      group (`bufferGroup`). A path-level Material node would buffer twice. The
+      merge half of this reasoning was already recorded at
+      joinpathsmergeouter.go:52-72; the nested-loop half is the same argument.
+      (b) *The merge-join materialise-inner decision cannot become a cost
+      comparison*, for the same reason: goopg's merge executor does not
+      mark/restore, so there is no decision to cost.
+      What DID land is `cost_material`'s substance where goopg actually pays it:
+      the nested loop's inner is priced as materialised — build charged once at
+      `2 * cpu_operator_cost * tuples` plus a spill charge, rescans at
+      `cpu_operator_cost * tuples` — instead of a full re-execution per outer
+      row. A PARAMETERISED inner is excluded (its parameters differ per outer
+      row, so it genuinely re-executes, and PG's create_material_path is
+      likewise unreachable for one).
+      This is the term the Q54 ledger row at join_nl_stream.go:110-124 asked
+      for: "PG never meets that wall because cost_rescan prices exactly this
+      case; costInnerNestLoop has no such term yet."
+      Gates: TPC-H 240.60s, 24 MATCH on values; TPC-DS SF0.5 PASS=95
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, verdict-changes none,
+      **runtime-moves 0**, 27 plan shapes changed (attributable — the baseline
+      is P2-07's sweep). Q54 14s->12s, Q47 12s->11s.
 - [x] **P2-07** `cost_rescan` — nested-loop inner and CTE re-execution stop
       being free. *design: 08 §5.3; gate: plan-parity + timing; expect NL
       counts to move.*

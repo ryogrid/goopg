@@ -124,8 +124,11 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 	// product a plain nested loop evaluates its quals on is therefore
 	// `o.Rows * i.Rows`, which for a parameterised inner is the per-outer-row
 	// count — exactly PG's cost_nestloop (costsize.c:3355-3356).
-	rescanStartup, rescanTotal := pathRescanCost(i, cp)
-	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, rescanStartup, rescanTotal)
+	// take2 P2-06: goopg's nested loop always materialises its inner, so the
+	// rescan is a cache replay and the build is paid once.
+	matBuild, matRescan := nestLoopInnerRescanCost(i, cp)
+	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
+	cost.Total += matBuild
 	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
