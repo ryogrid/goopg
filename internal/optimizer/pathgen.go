@@ -62,7 +62,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 //
 // Child convention: Children[0] is the probe (outer) side, Children[1] is the
 // build (inner) side. createPlan reads it to set the executor Join's BuildLeft.
-func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
+func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, residual []*restrictInfo, innerBucketSize float64) {
 	p, b := probe.CheapestTotal, build.CheapestTotal
 	if p == nil || b == nil {
 		return
@@ -75,8 +75,9 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 	cost := hashJoinCost(cp, hashJoinInputs{
 		outer: p.Cost, inner: b.Cost,
 		outerRows: p.Rows, innerRows: b.Rows,
-		outputRows:     joinRel.Rows,
-		numHashClauses: len(keys),
+		outputRows:      joinRel.Rows,
+		numHashClauses:  len(keys),
+		innerBucketSize: innerBucketSize,
 		// take2 P4-01: column counts come from the PATHS, falling back to the
 		// rels. The previous comment here read "Column counts come from the
 		// RELS, not the paths: a parameterised path returns fewer ROWS than
@@ -153,12 +154,23 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 // The key set is orientation-independent — PG's `clause_sides_match_join`
 // (joinpath.c:2205) accepts an equality whose operands land on the two sides in
 // either order — so both calls pass the same `keys`/`residual`.
-func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
+// take2 P2-11: `bucketFor` reports the inner-bucket fraction for whichever side
+// is being HASHED, so the two orientations get their own figure — they build
+// different relations, and that is the whole point of costing them separately.
+// A nil closure means "no statistics available" and suppresses the term, which
+// is what keeps this function usable from tests that build bare RelOptInfos.
+func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, bucketFor func(RelSet) float64) {
+	bucket := func(build *RelOptInfo) float64 {
+		if bucketFor == nil || build == nil {
+			return 0
+		}
+		return bucketFor(build.Relids)
+	}
 	// Orientation 1: build the inner side.
-	addHashJoinPath(joinRel, outer, inner, cp, keys, residual)
+	addHashJoinPath(joinRel, outer, inner, cp, keys, residual, bucket(inner))
 	// Orientation 2: build the outer side (swap the roles). The join output is
 	// the same; only which side is hashed differs.
-	addHashJoinPath(joinRel, inner, outer, cp, keys, residual)
+	addHashJoinPath(joinRel, inner, outer, cp, keys, residual, bucket(outer))
 }
 
 // The C1-era `generateNLIPath` used to live here. It was retired by

@@ -39,7 +39,7 @@ func nlCollapsedPair(t *testing.T, innerRows float64) *RelOptInfo {
 	// The collapsed estimate: four independent equalities on stats-less inputs.
 	joinRel := newRelOptInfo(RelSet(0b11), 1, 80)
 	keys := []*restrictInfo{{}, {}, {}, {}}
-	generateHashJoinPaths(joinRel, outer, inner, cp, keys, nil)
+	generateHashJoinPaths(joinRel, outer, inner, cp, keys, nil, nil)
 	addNestLoopPath(joinRel, outer, inner, cp, keys)
 	setCheapest(joinRel)
 	return joinRel

@@ -1022,11 +1022,31 @@ not grow; no query slower than 1.2×.
       innerRows/innerCols/avgVarBytes, so the inner key's ndistinct and MCV
       frequency must reach the cost site from the caller, which holds the rel
       and the clause list.
-      **Land it with a companion term, not alone.** The per-tuple index qual
-      cost (P2-09) was faithful, symmetric and not double-charged, and still
-      cost the sweep 3.3% on its own. The `TOTAL` arm added to
-      `scripts/tpcds-sweep-diff.py` on 2026-09-03 is what will catch that class
-      here; before it, the gate could not.
+      **LANDED 2026-09-03.** `estimateHashBucketSize` is
+      `estimate_hash_bucket_stats` reduced to the ndistinct-derived fraction;
+      `hashJoinCost` charges `cpu_operator_cost * numHashClauses * outerRows *
+      clamp_row_est(innerRows * bucketsize) * 0.5`. The bucket fraction is
+      computed per ORIENTATION — the two hash paths build different relations —
+      and arrives as a closure, since `addHashJoinPath` has no `searchCtx`.
+      A zero fraction means "no usable statistic" and SUPPRESSES the term
+      rather than guessing, so a stats-less plan costs exactly as before; a
+      `get_variable_numdistinct` result flagged `isdefault` is treated the same
+      way, for the reason PG's own caller checks that flag.
+      *Not the whole function.* PG also folds in the inner key's MCV frequency;
+      that needs the MCV list at the cost site and is a second plumbing step.
+      Recorded rather than hidden.
+      Gates: TPC-H **234.51s** (best of the bundle, from 237.34s), 24 MATCH on
+      values. TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0,
+      verdict-changes none, **aggregate -1.2%**, 88 plan shapes changed.
+      **Two queries breach the P2 exit bar of "no query slower than 1.2x":
+      Q76 2s->5s (2.5x) and Q12 4s->8s (2.0x).** Both are small in absolute
+      terms and near the gate's integer-second floor, but they are real and are
+      follow-up work, not noise to be waved through.
+      *Baseline hygiene, worth repeating:* the sweep script diffs against the
+      most recent report, which was P2-09's REVERTED qual-cost run (1152s). That
+      flattered this change to -4.3%. The honest figure is against the last
+      clean sweep (1115s), which is the -1.2% above. Always check which report
+      the delta used.
 - [ ] **P2-12** `mergejoinscansel` start/end selectivities in merge-join
       costing. *design: 08 §5.3.*
       **Scoped 2026-09-03 — implementable, with one caveat that must not be

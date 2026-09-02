@@ -207,7 +207,12 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// `addNLIPaths`) were landed separately and still run after the
 			// hash arm, which can only change a hash-vs-nestloop exact tie.
 			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor)
-			addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
+			// take2 P2-11: the inner side is the BUILD side here, so the
+			// bucket fraction is measured on its keys. Computed at this site
+			// because the searchCtx — and so the statistics — is in scope,
+			// exactly as mergeTuplesFor is.
+			addHashJoinPath(joinrel, outer, inner, cp, keys, residual,
+				s.estimateHashBucketSize(keys, inner.Relids))
 		}
 		// The nested loop keys on nothing, so the key set rejoins the
 		// residual: it evaluates every clause, on every pair. Passing

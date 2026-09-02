@@ -301,6 +301,11 @@ type hashJoinInputs struct {
 
 	// outerAvgVarBytes / innerAvgVarBytes are the average total variable-width
 	// payload per row of each side — the `avgVarBytes` parameter of
+	// innerBucketSize is `innerbucketsize` from estimate_hash_bucket_stats:
+	// the share of the inner relation in one bucket. Zero means "no usable
+	// statistic" and suppresses the bucket-walk term entirely. take2 P2-11.
+	innerBucketSize float64
+
 	// `hashsize.Choose`. Populated from RelOptInfo.AvgVarBytes; zero when no
 	// ANALYZE stats exist (correct for fixed-width relations). M0128-P3.1.
 	outerAvgVarBytes, innerAvgVarBytes float64
@@ -338,6 +343,24 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 
 	// The geometry the executor will pick for this build. Skew buckets and the
 	// parallel combined budget are absent on both sides alike (06 §6).
+	// take2 P2-11: the bucket walk. PG charges
+	//
+	//	run_cost += hash_qual_cost.per_tuple * outer_matched_rows *
+	//	            clamp_row_est(inner_path_rows * innerbucketsize) * 0.5
+	//
+	// (final_cost_hashjoin) — the comparisons a probe performs walking its
+	// bucket. Without it a hash join on a low-ndistinct key is priced exactly
+	// like one on a unique key, which is the degeneracy Q78 hit.
+	//
+	// innerBucketSize == 0 means "no usable statistic"; the term is then
+	// SKIPPED rather than guessed, so a stats-less plan costs exactly as it did
+	// before this change.
+	if in.innerBucketSize > 0 {
+		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
+		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
+			in.outerRows * bucketTuples * 0.5
+	}
+
 	// M0128-P3.1: avgVarBytes from column stats replaces the hardcoded zero.
 	sizing := hashsize.Choose(in.innerRows, in.innerCols, in.innerAvgVarBytes, cp.workMem)
 	if sizing.NBatch > 1 {

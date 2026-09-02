@@ -442,3 +442,58 @@ func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInf
 	}
 	return tuples
 }
+
+// estimateHashBucketSize is `estimate_hash_bucket_stats` (selfuncs.c) reduced to
+// the fraction it exists to produce: what share of the inner relation lands in
+// the bucket an average outer probe walks. take2 P2-11.
+//
+// PG's full function also returns the inner key's MCV frequency and folds it in;
+// goopg returns the ndistinct-derived fraction only, and that limit is recorded
+// rather than hidden — the MCV half needs the inner key's MCV list at the cost
+// site, which is a second plumbing step.
+//
+// The point of the term is the one thing goopg's hash cost could not see: a
+// hash join keyed on a LOW-ndistinct column has long buckets, so every probe
+// walks many tuples, while a unique key gives one. Priced without it, the two
+// cost the same — the degeneracy `reselectDegenerateHashKeys` was written to
+// work around (Q78's collapsed bucket, M0125-0035b).
+//
+// Returns 0 when no operand resolves to a statistic. 0 means "no information"
+// and the caller must skip the term entirely rather than substitute a guess:
+// inventing a bucket size without stats would move plans on nothing, which is
+// the failure this bundle keeps recording.
+func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids RelSet) float64 {
+	// PG takes the SMALLEST bucketsize over the hash clauses: "we use the
+	// smallest bucketsize estimated for any individual hashclause", because the
+	// most selective key is the one that spreads the table.
+	best := 0.0
+	for _, ri := range clauses {
+		if ri == nil {
+			continue
+		}
+		// The operand on the INNER side is the one that was hashed.
+		key := ri.rightKey
+		relids := ri.rightRelids
+		if !relsSubset(ri.rightRelids, innerRelids) {
+			key, relids = ri.leftKey, ri.leftRelids
+		}
+		if key == nil || !relsSubset(relids, innerRelids) {
+			continue
+		}
+		v := s.examineJoinVar(key, relids)
+		if v.stats == nil && !v.isBool {
+			continue
+		}
+		nd, isDefault := getVariableNumDistinct(v)
+		if isDefault || nd <= 0 {
+			// A guessed ndistinct is exactly the input that must not steer a
+			// cost term; PG's own caller checks `isdefault` for the same reason.
+			continue
+		}
+		frac := 1.0 / nd
+		if best == 0 || frac < best {
+			best = frac
+		}
+	}
+	return best
+}
