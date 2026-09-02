@@ -538,9 +538,24 @@ slower than 1.2×, S-cold/WARM gap narrows.
       `estimateJoin`, so the arm that chooses the plan sizes an outer join as
       an inner join and a LEFT can estimate fewer rows than its preserved
       input.~~ *design: 08 §4.5.*
-- [ ] **P1-19** `isunique` in the `examine_variable` analogue via
-      `has_unique_index`, with PG's nullfrac derating in the FK formula.
-      *design: 08 §4.5.*
+- [x] **P1-19** *(isunique half)* — gate:
+      `TestUniqueSingleColumnKeyOverridesSampledNDistinct`, units.
+      `get_variable_numdistinct`'s isunique branch (selfuncs.c:6332, "assume it
+      is unique no matter what pg_statistic says") now overrides the sampled
+      distinct count when a column is a unique key **on its own**;
+      `has_unique_index` requires `nkeycolumns == 1` (plancat.c:2244), so a
+      composite key such as Q9's two-column `partsupp` PK correctly says nothing
+      about its members. Reads the scan's stamped `UniqueKeys` rather than
+      looking up catalog indexes — one source, one answer, and
+      `baseColumnOfTable` has no catalog handle.
+      **Recorded as a safety net, not a measured win:** goopg's row count is an
+      exact full-scan figure but its per-column statistics come from a capped
+      reservoir, so this protects against a sample that understates a unique
+      column. On TPC-H the PKs probed already reach the right answer without it
+      (`o_orderkey` reports `n_distinct = -1` on both engines, and both estimate
+      `rows=1`).
+      *Not done:* PG's nullfrac derating in the FK formula — the second half of
+      the item, untouched.
 - [ ] **P1-20** `nconst_ec` correction — EquivalenceClasses carry a const flag
       so `1/ref_tuples` stops double-counting a pushed-down `var = const`.
       *design: 08 §4.5.*

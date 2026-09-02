@@ -224,3 +224,46 @@ func TestEqjoinselInnerMCVDeclinesWithoutBothLists(t *testing.T) {
 		t.Error("with no MCV list on either side the MCV branch must decline")
 	}
 }
+
+// TestUniqueSingleColumnKeyOverridesSampledNDistinct pins take2 P1-19:
+// `get_variable_numdistinct`'s isunique branch (selfuncs.c:6332) — "assume it
+// is unique no matter what pg_statistic says".
+//
+// goopg's per-column statistics come from a CAPPED RESERVOIR even though the
+// row count is an exact full-scan figure, so a unique column whose sample
+// understates its distinct count would otherwise have every equality against it
+// over-estimated and every join on it under-divided.
+func TestUniqueSingleColumnKeyOverridesSampledNDistinct(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "u"},
+		[]catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A deliberately UNDERSTATED sample: 10 000 rows, sample says 50 distinct.
+	tbl.Stats = &catalog.TableStats{
+		RowCount: 10000, Analyzed: true,
+		Columns: []catalog.ColumnStats{{NDistinct: 50}},
+	}
+
+	// Without uniqueness evidence the sampled figure stands.
+	plain := &SeqScan{Table: tbl, EstRelRows: 10000}
+	if got := columnNDistinctForChild(0, plain); got != 50 {
+		t.Errorf("no unique key: ndistinct = %d, want the sampled 50", got)
+	}
+
+	// With a SINGLE-column unique key, the relation's tuple count wins.
+	uniq := &SeqScan{Table: tbl, EstRelRows: 10000, UniqueKeys: [][]string{{"id"}}}
+	if got := columnNDistinctForChild(0, uniq); got != 10000 {
+		t.Errorf("single-column unique key: ndistinct = %d, want the row count 10000", got)
+	}
+
+	// A MULTI-column unique key says nothing about any one column —
+	// plancat.c:2244 requires nkeycolumns == 1. Q9's two-column partsupp PK is
+	// the standing example.
+	multi := &SeqScan{Table: tbl, EstRelRows: 10000, UniqueKeys: [][]string{{"id", "other"}}}
+	if got := columnNDistinctForChild(0, multi); got != 50 {
+		t.Errorf("multi-column unique key: ndistinct = %d, want the sampled 50 "+
+			"(a composite key does not make its members unique)", got)
+	}
+}

@@ -36,6 +36,7 @@ package optimizer
 
 import (
 	"math"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -331,7 +332,47 @@ func baseColumnOfTable(scan Node, tbl *catalog.Table, uniq [][]string, idx int) 
 			ref.stats = &tbl.Stats.Columns[idx]
 		}
 	}
+	// take2 P1-19: `get_variable_numdistinct`'s isunique branch
+	// (selfuncs.c:6332) — "assume it is unique no matter what pg_statistic
+	// says". `examine_variable` sets `vardata->isunique` from
+	// `has_unique_index`, which plancat.c:2244 restricts to SINGLE-column
+	// unique indexes, and the override then reports the relation's tuple count
+	// as the distinct count.
+	//
+	// It matters because goopg's per-column statistics come from a CAPPED
+	// RESERVOIR even though the row count is an exact full-scan figure
+	// (operators_analyze.go): a unique column whose sample happens to
+	// understate its distinct count would otherwise have every equality
+	// against it over-estimated, and every join on it under-divided. On the
+	// TPC-H corpus Haas-Stokes already reaches the right answer for the PKs
+	// probed (`o_orderkey` reports -1 on both engines), so this is a safety
+	// net rather than a measured win — recorded as such rather than claimed
+	// as one.
+	if uniqueSingleColumnKey(uniq, tbl.Columns[idx].Name) && ref.rawRows > 0 {
+		ref.ndistinct = int64(ref.rawRows)
+	}
 	return ref, true
+}
+
+// uniqueSingleColumnKey reports whether the named column is a unique key ON ITS
+// OWN, which is `has_unique_index`'s condition (plancat.c:2244 requires
+// `nkeycolumns == 1`). A multi-column unique key says nothing about any one of
+// its columns — Q9's two-column `partsupp` PK is the standing example.
+//
+// It reads the scan's STAMPED uniqueness evidence rather than looking up
+// indexes in the catalog, because that evidence is already what every other
+// uniqueness argument in this file consumes and `baseColumnOfTable` has no
+// catalog handle. One source, one answer.
+func uniqueSingleColumnKey(uniq [][]string, col string) bool {
+	if col == "" {
+		return false
+	}
+	for _, k := range uniq {
+		if len(k) == 1 && strings.EqualFold(k[0], col) {
+			return true
+		}
+	}
+	return false
 }
 
 // soleBaseScan returns the ONE leaf scan a join input reduces to, or nil when
