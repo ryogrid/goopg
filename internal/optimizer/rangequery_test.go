@@ -128,3 +128,25 @@ func TestNullTestSelectivityFallsBackWithoutStats(t *testing.T) {
 		t.Errorf("IS NOT NULL with no stats = %.5f, want DEFAULT_NOT_UNK_SEL %.5f", got, defaultNotUnkSel)
 	}
 }
+
+// TestDistinctIsSizedNotPassedThrough pins take2 P1-25. `SELECT DISTINCT` is a
+// grouping over every output column, and upstream sizes it with
+// estimate_num_groups (create_distinct_paths). goopg passed the child's row
+// count straight through, so a DISTINCT that collapses a million rows to a
+// hundred was costed — and every node above it sized — as if it collapsed
+// nothing.
+func TestDistinctIsSizedNotPassedThrough(t *testing.T) {
+	scan := rqScan(t) // 10000 rows, one column, 101 distinct
+	d := &Distinct{Child: scan}
+	d.schema = Schema{SchemaColumn{Name: "d", Type: catalog.Type{Name: "int4"}}}
+
+	in := EstimateRows(scan)
+	out := EstimateRows(d)
+	if out >= in {
+		t.Errorf("DISTINCT over %d rows with ~101 distinct values estimated %d rows — "+
+			"it was passed through rather than sized", in, out)
+	}
+	if out < 50 || out > 200 {
+		t.Errorf("DISTINCT rows = %d, want roughly the column's distinct count (~101)", out)
+	}
+}

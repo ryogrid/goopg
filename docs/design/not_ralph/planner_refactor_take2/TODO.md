@@ -412,8 +412,17 @@ slower than 1.2×, S-cold/WARM gap narrows.
 
 ### 1g — Grouping and resolvers
 
-- [ ] **P1-25** Size DISTINCT and set-op outputs through `estimate_num_groups`
-      (today rows pass through unchanged). *design: 08 §4.7.*
+- [x] **P1-25** Size DISTINCT through `estimate_num_groups` — gates:
+      `TestDistinctIsSizedNotPassedThrough`, units. `SELECT DISTINCT l_shipmode
+      FROM lineitem` now estimates **rows=7**, matching PG exactly; it was the
+      child's 6 001 255. Both `Distinct` (all output columns) and `DistinctOn`
+      (the ON list only) are sized. Set-op sizing is left open — `estimateSetOp`
+      already has its own arm and is a separate question.
+      **Exposed a latent executor crash**: `bitmapHeapScanOp` called
+      `o.mctx.Reset()` at two sites without the nil guard `Close()` already had,
+      so a bitmap heap scan running without a memory context segfaulted on its
+      first page boundary. Unreachable until this item changed which plans win —
+      "an unwinnable path is an untested path". Fixed in the same commit.
 - [ ] **P1-26** Collapse the three column-stats resolvers into one
       `examine_variable` analogue over a single node-type arm list; an
       index-probed leaf gains MCV and histogram access. *design: 08 §4.8;

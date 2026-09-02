@@ -74,14 +74,20 @@ func EstimateRows(n Node) int64 {
 	case *Project:
 		return EstimateRows(x.Child)
 	case *Distinct:
-		return EstimateRows(x.Child)
+		// take2 P1-25: SELECT DISTINCT is a grouping over EVERY output column,
+		// so upstream sizes it with estimate_num_groups exactly as it sizes a
+		// GROUP BY (create_distinct_paths -> estimate_num_groups, planner.c).
+		// goopg passed the child's row count straight through, so a DISTINCT
+		// that collapses a million rows to a hundred was costed, and every
+		// node above it sized, as if it collapsed nothing.
+		return estimateDistinctRows(x.schema, x.Child)
 	case *DistinctOn:
 		// M0127-P5.6-g-ii: another of the pass-through wrappers whose absence
 		// zeroes every estimate above it (the M0125-0038 class documented
 		// below). Neither this nor `*Distinct` is SIZED — upstream runs
 		// `estimate_num_groups` over the DISTINCT clause and goopg does not —
 		// which is a ledgered gap, not this arm's business.
-		return EstimateRows(x.Child)
+		return estimateDistinctOnRows(x, x.Child)
 	case *WindowAgg:
 		return EstimateRows(x.Child)
 	case *Join:
@@ -1414,4 +1420,44 @@ func constInt(e Expr) (int64, bool) {
 		return c.Value, true
 	}
 	return 0, false
+}
+
+
+// estimateDistinctRows sizes `SELECT DISTINCT` — a grouping over every output
+// column — through the same estimate_num_groups analogue GROUP BY uses.
+//
+// take2 P1-25. Upstream's create_distinct_paths calls estimate_num_groups over
+// the distinct clause; goopg returned the child count unchanged, which made a
+// DISTINCT look free and left every node above it sized on the ungrouped count.
+func estimateDistinctRows(schema Schema, child Node) int64 {
+	in := EstimateRows(child)
+	if len(schema) == 0 {
+		return in
+	}
+	exprs := make([]Expr, 0, len(schema))
+	for i, c := range schema {
+		exprs = append(exprs, &ColumnRef{Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx})
+	}
+	return estimateNumGroups(exprs, child, in)
+}
+
+// estimateDistinctOnRows sizes `SELECT DISTINCT ON (k, ...)`: the grouping is
+// over the ON list only, not the whole target list.
+func estimateDistinctOnRows(d *DistinctOn, child Node) int64 {
+	in := EstimateRows(child)
+	if len(d.KeyCols) == 0 {
+		return in
+	}
+	out := d.Output()
+	exprs := make([]Expr, 0, len(d.KeyCols))
+	for _, idx := range d.KeyCols {
+		if idx < 0 || idx >= len(out) {
+			// A key outside the output schema cannot be resolved to a
+			// variable; fall back rather than guess.
+			return in
+		}
+		c := out[idx]
+		exprs = append(exprs, &ColumnRef{Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx})
+	}
+	return estimateNumGroups(exprs, child, in)
 }
