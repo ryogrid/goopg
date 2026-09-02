@@ -84,3 +84,29 @@ func TestPGStatisticRoundTripPreservesHistogram(t *testing.T) {
 		})
 	}
 }
+
+// TestNDistinctOverrideBeatsTheSampledFraction pins take2 P1-07.
+//
+// `ALTER TABLE … ALTER COLUMN … SET (n_distinct = N)` wrote only
+// ColumnStats.NDistinct, while ColumnStats.StaDistinct() consults
+// NDistinctFrac FIRST whenever it exceeds 0.1. ANALYZE sets that fraction from
+// the sample, so on any column whose sampled distinct fraction exceeds 10 % —
+// which is most keys — the manual override was written into a field nothing
+// subsequently read, and the planner kept using the measured value.
+func TestNDistinctOverrideBeatsTheSampledFraction(t *testing.T) {
+	// The state ANALYZE leaves behind on a high-cardinality column: a fraction
+	// well above the 0.1 threshold that makes StaDistinct prefer it.
+	cs := catalog.ColumnStats{NDistinct: 1234, NDistinctFrac: 0.9}
+	if got := cs.StaDistinct(); got != -0.9 {
+		t.Fatalf("precondition: StaDistinct()=%v, expected the fraction to win at 0.9", got)
+	}
+
+	// Applying an override must make it win. This mirrors what
+	// analyzeRelationWith now does.
+	cs.NDistinct = 500
+	cs.NDistinctFrac = 0
+	if got := cs.StaDistinct(); got != 500 {
+		t.Errorf("after an n_distinct override StaDistinct()=%v, want 500 — the "+
+			"override is still being shadowed by the sampled fraction", got)
+	}
+}

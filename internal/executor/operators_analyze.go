@@ -609,6 +609,20 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		// so the planner consults it like any other stadistinct value.
 		if nd, ok := columnNDistinctOverride(&tbl.Columns[i], stats.RowCount); ok {
 			stats.Columns[i].NDistinct = nd
+			// take2 P1-07: NDistinctFrac must be cleared too, or the override
+			// is silently discarded. ColumnStats.StaDistinct() consults the
+			// FRACTION first whenever it exceeds 0.1 (catalog.go:1884-1886),
+			// and computeColumnStats above has just set it from the sample —
+			// so on any column whose sampled distinct fraction exceeds 10 %,
+			// which is most keys, the manual n_distinct was written into a
+			// field nothing subsequently read.
+			//
+			// Clearing it here rather than teaching StaDistinct about
+			// overrides keeps the precedence rule in ONE place: an explicit
+			// n_distinct REPLACES what ANALYZE measured, which is upstream's
+			// behaviour (analyze.c applies it to stadistinct itself, leaving
+			// no second field to disagree).
+			stats.Columns[i].NDistinctFrac = 0
 		}
 	}
 	return stats, nil

@@ -313,8 +313,17 @@ slower than 1.2×, S-cold/WARM gap narrows.
 - [ ] **P1-03b** `TRUNCATE` resets `Table.Stats`; `ANALYZE` invalidates the
       cached plans of the relations it touched (today it is planned as a
       `Utility` statement and only DDL invalidates). *design: 08 §4.1.*
-- [ ] **P1-04** `allvisfrac` reaches the search `RelOptInfo`; index-only costing
-      uses the real visible fraction. *design: 08 §4.1.*
+- [x] **P1-04** — **verified already satisfied**, no code change. Index-only
+      costing already uses the real visible fraction:
+      `pathindexonly.go:109` passes `relAllVisibleFraction(tbl, relPages)`,
+      which reads `catalog.RelAllVisible` (wired at `initdb/open.go:2525`).
+      Measured on the bench cluster, `relallvisible` equals `relpages` for
+      `part`/`orders`/`customer` on **both** engines, so the fraction is ~1.0
+      and the saving is real. The other index producers correctly leave it
+      zero: `heapPagesAfterVM` is a no-op unless `indexOnly`, matching
+      `cost_index`. The only unmet part of the item's wording is structural —
+      the value is computed per-producer rather than stored on `RelOptInfo` —
+      which changes no plan.
 - [ ] **P1-05** Align the never-analyzed fallback with `estimate_rel_size`
       (density, 10-page floor); make `GOOPG_RELSIZE_FALLBACK` unconditional and
       retire the flag. *design: 08 §4.1; gate: S-cold arm timing.*
@@ -324,12 +333,20 @@ slower than 1.2×, S-cold/WARM gap narrows.
 - [ ] **P1-06** Two-stage block sampling (`BlockSampler` + Vitter) at
       `300 × stattarget`, replacing the full heap scan plus reservoir sample.
       *design: 08 §4.2; oracle: `acquire_sample_rows`.*
-- [ ] **P1-07** Fix the `ALTER TABLE … SET (n_distinct = …)` override, which
+- [x] **P1-07** `n_distinct` override — gate:
+      `TestNDistinctOverrideBeatsTheSampledFraction`, units. Confirmed exactly
+      as recorded. The override wrote only `NDistinct` while `StaDistinct()`
+      consults `NDistinctFrac` first above 0.1, so on any column whose sampled
+      distinct fraction exceeds 10 % — most keys — it landed in a field nothing
+      read. `NDistinctFrac` is now cleared alongside, which keeps the precedence
+      rule in one place and matches upstream, where `analyze.c` applies the
+      override to `stadistinct` itself and leaves no second field to disagree.
+      ~~Fix the `ALTER TABLE … SET (n_distinct = …)` override, which
       writes only the absolute field while `StaDistinct()` consults the
       fraction first — so the override is silently ignored on any column whose
       sampled fraction exceeds 10 %. The Haas–Stokes estimator itself is
       already correct (07 §3.11 item 1); ledger row 777 is stale and should be
-      closed. *design: 08 §4.2.*
+      closed.~~ *design: 08 §4.2.*
 - [ ] **P1-08** Adopt 18.3's `analyze_mcv_list` admission rule; goopg's 1.25×
       margin over-admits MCV entries on near-uniform columns, and each admitted
       entry displaces a histogram bound. *design: 08 §4.2.*
@@ -777,6 +794,23 @@ One row per closed phase. Numbers come from the 09 §6.6 artifact header.
 | P5 | | | | | | | |
 | P6 | | | | | | | |
 | P7 | | | | | | | |
+
+### Pattern: this Phase-1 list over-states what is missing
+
+Four items so far turned out to be already satisfied, or satisfied by a
+different and better mechanism than the one specified:
+
+| item | as written | actually |
+|---|---|---|
+| P0-10 | TPC-DS anchors inert | fixed a month earlier by `63056c544` |
+| P1-01 | *persist* per-index relpages | read live via `RelNBlocksFunc`, which is what `get_relation_info` does — persisting would add a staleness class PG does not have |
+| P1-02 | retire `estimateIndexGeometry`'s synthesis | already superseded for `relpages` whenever storage answers; only tree height and the partial-index case remain |
+| P1-04 | `allvisfrac` reaches the costing | already does, and measures ~1.0 on the bench cluster |
+
+The bundle was written from a code read that under-credited existing work, so
+**each Phase-1 item should be verified against the tree before it is
+implemented.** Two of the four cost nothing to check and would have cost real
+effort to build.
 
 ### Priority change established by measurement, 2026-09-02
 
