@@ -489,9 +489,9 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		if est <= 0 {
 			est = 1
 		}
-		// Emit PG-compatible cost annotation: (cost=0.00..0.00 rows=N width=0)
-		// The mock 0.00 costs are replaced by 'N' in EXPLAIN normalization.
-		label += fmt.Sprintf("  (cost=0.00..0.00 rows=%d width=0)", est)
+		// PG's cost annotation, from the path the planner chose (take2 P0-02).
+		startup, total, width := explainCostFields(rowSrc, est)
+		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
@@ -1554,7 +1554,8 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if est <= 0 {
 			est = 1
 		}
-		label += fmt.Sprintf("  (cost=0.00..0.00 rows=%d width=0)", est)
+		startup, total, width := explainCostFields(rowSrc, est)
+		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	if s, ok := stats[n]; ok && s != nil {
 		if s.timing {
@@ -1805,9 +1806,19 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 		obj["Strategy"] = "Hashed"
 		obj["Command"] = setOpCommandName(p)
 	}
-	if est := optimizer.EstimateRows(n); est > 0 {
+	est := optimizer.EstimateRows(n)
+	if est > 0 {
 		obj["Plan Rows"] = est
 	}
+	// take2 P0-02: PG's non-text formats carry Startup Cost, Total Cost and
+	// Plan Width alongside Plan Rows (explain.c). goopg emitted only Plan
+	// Rows, so FORMAT JSON stated no cost at all — and once the text walkers
+	// print real costs, a silent JSON would DISAGREE with text rather than
+	// merely lag it.
+	startup, total, width := explainCostFields(n, est)
+	obj["Startup Cost"] = startup
+	obj["Total Cost"] = total
+	obj["Plan Width"] = width
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
 			obj["Output"] = cols
@@ -1865,6 +1876,31 @@ func explainIndexName(i *catalog.Index) string {
 		return ""
 	}
 	return i.Name
+}
+
+
+// explainCostFields returns the (startup, total, width) EXPLAIN prints for a
+// node, and whether they came from the path the planner actually chose.
+//
+// take2 P0-02. Before this, both text walkers printed the literal string
+// `cost=0.00..0.00 ... width=0` on every node of every plan, so no artefact in
+// the repository stated what the planner believed and no artefact could
+// attribute a wrong plan to a wrong cost. The chosen Path carries real numbers;
+// createPlan now stamps them onto the node (optimizer.PlanCost).
+//
+// Nodes the path search did not produce — everything the legacy rewriter builds
+// above the seam — fall to optimizer.DeriveLegacyDisplayCost rather than
+// printing zeros. A plan mixing real costs with 0.00 is WORSE than one where
+// every cost is 0.00: with all-zero, a reader knows nothing is priced; with a
+// mixture, a free node and an unpriced node look identical.
+func explainCostFields(n optimizer.Node, rows int64) (startup, total float64, width int) {
+	if c, ok := n.(optimizer.PlanCostCarrier); ok {
+		if pc, set := c.PlanCostInfo(); set {
+			return pc.StartupCost, pc.TotalCost, pc.PlanWidth
+		}
+	}
+	d := optimizer.DeriveLegacyDisplayCost(n, rows)
+	return d.StartupCost, d.TotalCost, d.PlanWidth
 }
 
 // schemaQualify prepends "public." to an unqualified table name for VERBOSE mode.

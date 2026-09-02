@@ -103,3 +103,70 @@ func TestWalkersAgreeOnRowEstimate(t *testing.T) {
 		}
 	}
 }
+
+// TestNoNodeRendersZeroCost pins P0-02/P0-03's outcome: no rendered node prints
+// the literal `cost=0.00..0.00` that both walkers hard-coded before.
+//
+// The assertion is deliberately about the STRING, not about the numbers being
+// right. A plan mixing real costs with 0.00 is worse than one where every cost
+// is 0.00 — with all-zero a reader knows nothing is priced, with a mixture a
+// genuinely free node and an unpriced one look identical — so the property that
+// has to hold is that NOTHING renders the sentinel.
+func TestNoNodeRendersZeroCost(t *testing.T) {
+	tbl := parallelLabelTestTable(t, "t")
+	scan := &optimizer.SeqScan{Table: tbl, EstRelRows: 10000}
+	// A stack of above-the-seam nodes: each is built by the legacy rewriter
+	// and carries no Path, so each exercises DeriveLegacyDisplayCost.
+	plan := &optimizer.Limit{
+		Child: &optimizer.Sort{
+			Child: &optimizer.Filter{
+				Child: scan,
+				Predicate: &optimizer.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &optimizer.ColumnRef{Name: "a"},
+					Right: &optimizer.IntegerConst{Value: 42},
+				},
+			},
+		},
+		Limit: &optimizer.IntegerConst{Value: 10},
+	}
+	for name, text := range map[string]string{
+		"plain":   renderPlain(t, plan),
+		"analyze": renderAnalyze(t, plan),
+	} {
+		if strings.Contains(text, "cost=0.00..0.00") {
+			t.Errorf("%s walker still renders the zero-cost sentinel:\n%s", name, text)
+		}
+		if !strings.Contains(text, "cost=") {
+			t.Errorf("%s walker rendered no cost at all:\n%s", name, text)
+		}
+	}
+}
+
+// TestLegacyDisplayCostIsMonotone pins the one property
+// DeriveLegacyDisplayCost is allowed to claim: a parent costs at least its
+// child. It is not a cost model and nothing plans against it, but a
+// non-monotone cost column is actively misleading in a diff.
+func TestLegacyDisplayCostIsMonotone(t *testing.T) {
+	tbl := parallelLabelTestTable(t, "t")
+	scan := &optimizer.SeqScan{Table: tbl, EstRelRows: 10000}
+	sorted := &optimizer.Sort{Child: scan}
+	limited := &optimizer.Limit{Child: sorted, Limit: &optimizer.IntegerConst{Value: 10}}
+
+	scanCost := optimizer.DeriveLegacyDisplayCost(scan, optimizer.EstimateRows(scan))
+	sortCost := optimizer.DeriveLegacyDisplayCost(sorted, optimizer.EstimateRows(sorted))
+	limitCost := optimizer.DeriveLegacyDisplayCost(limited, optimizer.EstimateRows(limited))
+
+	if sortCost.TotalCost < scanCost.TotalCost {
+		t.Errorf("Sort total %.2f < child scan total %.2f", sortCost.TotalCost, scanCost.TotalCost)
+	}
+	if limitCost.TotalCost < sortCost.TotalCost {
+		t.Errorf("Limit total %.2f < child sort total %.2f", limitCost.TotalCost, sortCost.TotalCost)
+	}
+	// Sort is blocking: PG's cost_tuplesort puts the whole input cost into
+	// startup, so nothing emerges until the child is fully consumed.
+	if sortCost.StartupCost < scanCost.TotalCost {
+		t.Errorf("Sort is blocking: startup %.2f should be >= child total %.2f",
+			sortCost.StartupCost, scanCost.TotalCost)
+	}
+}

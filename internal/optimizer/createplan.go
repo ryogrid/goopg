@@ -42,6 +42,16 @@ func createPlan(p *Path) Node {
 // package only once P5.5-f composes 03 §10's boundary map from the search
 // root's.
 func createPlanNode(p *Path) (Node, outputLayout) {
+	n, lay := createPlanNodeUnpriced(p)
+	// take2 P0-02: stamp the winning path's cost onto the node it produced.
+	// This is the single funnel every search-produced node passes through, so
+	// a new path kind cannot forget to carry its cost forward — which is why
+	// the stamp lives here rather than in each arm.
+	stampPlanCost(n, p)
+	return n, lay
+}
+
+func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	if p == nil {
 		return nil, nil
 	}
