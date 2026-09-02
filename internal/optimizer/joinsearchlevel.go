@@ -222,13 +222,13 @@ func (s *searchCtx) joinIsLegal(rel1, rel2 *RelOptInfo) (sjinfo *SpecialJoinInfo
 		// — we can perform the SJ at this join (joinrels.c:424-436).
 		if relsSubset(sj.MinLefthand, rel1.Relids) && relsSubset(sj.MinRighthand, rel2.Relids) {
 			if matchSJInfo != nil {
-				return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x matches multiple SpecialJoinInfos — invalid", uint16(rel1.Relids), uint16(rel2.Relids))
+				return nil, false, fmt.Errorf("join search: join %#08x⋈%#08x matches multiple SpecialJoinInfos — invalid", uint32(rel1.Relids), uint32(rel2.Relids))
 			}
 			matchSJInfo = sj
 			matchReversed = false
 		} else if relsSubset(sj.MinLefthand, rel2.Relids) && relsSubset(sj.MinRighthand, rel1.Relids) {
 			if matchSJInfo != nil {
-				return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x matches multiple SpecialJoinInfos — invalid", uint16(rel1.Relids), uint16(rel2.Relids))
+				return nil, false, fmt.Errorf("join search: join %#08x⋈%#08x matches multiple SpecialJoinInfos — invalid", uint32(rel1.Relids), uint32(rel2.Relids))
 			}
 			matchSJInfo = sj
 			matchReversed = true
@@ -242,14 +242,14 @@ func (s *searchCtx) joinIsLegal(rel1, rel2 *RelOptInfo) (sjinfo *SpecialJoinInfo
 			// RHS association (joinrels.c:519-521).
 			mustBeLeftJoin = true
 		} else {
-			return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x violates outer-join constraint (SJ type=%s)", uint16(rel1.Relids), uint16(rel2.Relids), joinTypeName(sj.Jointype))
+			return nil, false, fmt.Errorf("join search: join %#08x⋈%#08x violates outer-join constraint (SJ type=%s)", uint32(rel1.Relids), uint32(rel2.Relids), joinTypeName(sj.Jointype))
 		}
 	}
 
 	// Post-scan: must_be_leftjoin requires matching LEFT SJ with lhs_strict (joinrels.c:542-546).
 	if mustBeLeftJoin {
 		if matchSJInfo == nil || matchSJInfo.Jointype != parser.JoinLeft || !matchSJInfo.LhsStrict {
-			return nil, false, fmt.Errorf("join search: join %#04x⋈%#04x must be a LEFT join with strict LHS clause", uint16(rel1.Relids), uint16(rel2.Relids))
+			return nil, false, fmt.Errorf("join search: join %#08x⋈%#08x must be a LEFT join with strict LHS clause", uint32(rel1.Relids), uint32(rel2.Relids))
 		}
 	}
 
@@ -295,7 +295,7 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 		// last such pair has been offered.
 		for _, rel := range s.levelRels(lev) {
 			if len(rel.Pathlist) == 0 {
-				err := fmt.Errorf("join search: joinrel %#04x has no paths", uint16(rel.Relids))
+				err := fmt.Errorf("join search: joinrel %#08x has no paths", uint32(rel.Relids))
 				s.traceFailed(err)
 				return nil, err
 			}
@@ -527,8 +527,8 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 	// PG asserts this (joinrels.c:706); goopg returns it, because the search
 	// is a fallback-on-error path rather than an assertion-checked one.
 	if relsOverlap(rel1.Relids, rel2.Relids) {
-		return nil, fmt.Errorf("join search: overlapping input relsets %#04x and %#04x",
-			uint16(rel1.Relids), uint16(rel2.Relids))
+		return nil, fmt.Errorf("join search: overlapping input relsets %#08x and %#08x",
+			uint32(rel1.Relids), uint32(rel2.Relids))
 	}
 
 	// join_is_legal (joinrels.c:350, M0128-P1.2 / P1.3): check SpecialJoinInfo

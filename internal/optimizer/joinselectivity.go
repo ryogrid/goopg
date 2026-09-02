@@ -197,7 +197,7 @@ func (s *searchCtx) resolveJoinVarColumn(key Expr, relids RelSet) (int, *ColumnR
 	if relids == 0 || relids&(relids-1) != 0 {
 		return -1, cr, false
 	}
-	i := bits.TrailingZeros16(uint16(relids))
+	i := bits.TrailingZeros32(uint32(relids))
 	if i >= len(s.relInfos) {
 		return -1, cr, false
 	}

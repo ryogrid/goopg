@@ -27,7 +27,7 @@ const stdFuzzFactor = 1.01
 // uint16 bitmask the bushy DP keyed joinrels on; that DP is deleted as of
 // M0127-P6.3 and the width is now the search's own — `maxSearchRels`,
 // joinsearch.go.) This bounds a single query's join at 16 base relations.
-type RelSet uint16
+type RelSet uint32
 
 // Cost is PG's two-number cost, in PG's units (seq_page_cost = 1.0, design ch. 02
 // §3). Startup is the cost expended before the first row emerges; Total is the

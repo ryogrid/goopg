@@ -141,10 +141,10 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 		return fmt.Errorf("join paths: nil input rel")
 	}
 	if outer.CheapestTotal == nil {
-		return fmt.Errorf("join paths: outer rel %#04x has no cheapest path", uint16(outer.Relids))
+		return fmt.Errorf("join paths: outer rel %#08x has no cheapest path", uint32(outer.Relids))
 	}
 	if inner.CheapestTotal == nil {
-		return fmt.Errorf("join paths: inner rel %#04x has no cheapest path", uint16(inner.Relids))
+		return fmt.Errorf("join paths: inner rel %#08x has no cheapest path", uint32(inner.Relids))
 	}
 
 	// 03 §9 rule 2 — PATH_PARAM_BY_REL (joinpath.c:43-47). The two directions

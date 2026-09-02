@@ -16,10 +16,10 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 	}
 	id, rewrap, ok := scanLeafFor(p.Rel.baseLeaf)
 	if !ok {
-		panic(fmt.Sprintf("createPlan: PathBitmapHeapScan over relset %#04x whose leaf is not a rebuildable base scan", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathBitmapHeapScan over relset %#08x whose leaf is not a rebuildable base scan", uint32(p.Rel.Relids)))
 	}
 	if len(p.Children) == 0 || p.Children[0] == nil {
-		panic(fmt.Sprintf("createPlan: PathBitmapHeapScan over relset %#04x has no bitmap qual child", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathBitmapHeapScan over relset %#08x has no bitmap qual child", uint32(p.Rel.Relids)))
 	}
 
 	// Build the bitmap qual subtree (outer) from the child path.
@@ -60,10 +60,10 @@ func createBitmapIndexScanPlan(p *Path) Node {
 	}
 	id, rewrap, ok := scanLeafFor(p.Rel.baseLeaf)
 	if !ok {
-		panic(fmt.Sprintf("createPlan: PathBitmapIndexScan over relset %#04x whose leaf is not a rebuildable base scan", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathBitmapIndexScan over relset %#08x whose leaf is not a rebuildable base scan", uint32(p.Rel.Relids)))
 	}
 	if p.IndexInfo == nil {
-		panic(fmt.Sprintf("createPlan: PathBitmapIndexScan over relset %#04x names no index", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathBitmapIndexScan over relset %#08x names no index", uint32(p.Rel.Relids)))
 	}
 
 	// Build Key/Keys from the index clauses, matching createIndexScanPlan's

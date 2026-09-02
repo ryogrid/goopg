@@ -43,7 +43,13 @@ import (
 // path would hand it 13-16-relation queries it cannot finish, so the deletion
 // happens WITH that DP in P6.3 — which is what 03 §7 says ("deleted with the
 // bushy DP"), and which the P5.8 TODO line stated more loosely. M0127-P5.8.
-const maxSearchRels = 16
+// take2 P3-09: 32, following RelSet's width rather than restating it. The
+// ceiling was 16 because RelSet was uint16, and the comment above calls it
+// "a representation limit on the new search" — so widening the
+// representation IS the change. The old bushy DP's separate 3^n runtime
+// guard, which that comment warned must not be raised alongside this one, no
+// longer exists: bushy.go was deleted with that DP at M0127-P6.3.
+const maxSearchRels = 32
 
 // pgShapedDP gates the whole PG-shaped search (08 §2, S5). **FLIPPED ON
 // 2026-08-06 by M0127-P5.9** — the acceptance event. Every P5 task landed dark
@@ -209,7 +215,7 @@ func (s *searchCtx) findRel(relids RelSet) *RelOptInfo {
 
 // relLevel is the level a relset belongs to: its member count. PG's
 // `bms_num_members(relids)`.
-func relLevel(relids RelSet) int { return bits.OnesCount16(uint16(relids)) }
+func relLevel(relids RelSet) int { return bits.OnesCount32(uint32(relids)) }
 
 // addRel files a rel into its level list and the relset map. The level is
 // derived from the relset, never passed in, so the two indexes cannot disagree
@@ -232,7 +238,7 @@ func (s *searchCtx) addRel(rel *RelOptInfo) error {
 		return fmt.Errorf("join search: rel at level %d exceeds the %d-relation problem", lev, s.nrels)
 	}
 	if prev := s.relMap[rel.Relids]; prev != nil {
-		return fmt.Errorf("join search: relset %#04x already registered", uint16(rel.Relids))
+		return fmt.Errorf("join search: relset %#08x already registered", uint32(rel.Relids))
 	}
 	s.relMap[rel.Relids] = rel
 	s.joinrels[lev] = append(s.joinrels[lev], rel)
@@ -280,7 +286,7 @@ func (s *searchCtx) finalPath() (*Path, error) {
 		// setCheapest leaves every slot nil only for an empty pathlist, which
 		// joinSearch already rejects per level; reaching here means the final
 		// rel was assembled outside that path.
-		return nil, fmt.Errorf("join search: final rel %#04x has no cheapest path", uint16(rel.Relids))
+		return nil, fmt.Errorf("join search: final rel %#08x has no cheapest path", uint32(rel.Relids))
 	}
 	return p, nil
 }

@@ -1199,7 +1199,26 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
 - [ ] **P3-08** `reduce_unique_semijoins` — unique-inner SEMI becomes INNER.
       Blocker to clear first: SEMI's left-only `Output()` re-indexing (ledger
       794). *design: 08 §6.4.*
-- [ ] **P3-09** Widen `RelSet` past 16 base relations. *design: 08 §6.5.*
+- [x] **P3-09** Widen `RelSet` past 16 base relations. *design: 08 §6.5.*
+      **Landed 2026-09-03.** `RelSet` is `uint32` and `maxSearchRels` is 32,
+      following the representation rather than restating it. A FROM clause with
+      more than sixteen base relations could not be REPRESENTED by the search
+      and fell back to the legacy planner entirely.
+      The blocker `joinsearch.go` recorded against this — "deleting the old
+      guard while the old DP is still the production path would hand it
+      13-16-relation queries it cannot finish" — is **gone**: that guard lived
+      in `bushy.go`, which was deleted with the bushy DP at M0127-P6.3. The
+      comment outlived the constraint, which is why this looked riskier than it
+      is.
+      Gates: TPC-H 213.84s against 215.01s, 24 MATCH on values. TPC-DS SF0.5
+      PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, verdict-changes none,
+      **1 plan shape changed of 99** — which is the expected result, since no
+      benchmark query comes near sixteen relations. This is a capability change,
+      not a plan change.
+      *Incidental confirmation:* Q45 and Q61 came back FASTER here (6s->2s each)
+      after being named SLOWER by the previous sweep with identical plans. Their
+      oscillation is independent evidence for the attribution rule recorded
+      under P2-12.
 - [ ] **P3-10** Finish the GEQO wiring: `geqo` and `geqo_threshold` are bridged
       (as process-global atomics — see P2-02c), while `geqo_effort`,
       `geqo_pool_size`, `geqo_generations`, `geqo_selection_bias` and
