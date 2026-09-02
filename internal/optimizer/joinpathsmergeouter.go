@@ -175,7 +175,22 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// matters" — and `tryMergeJoinPath` skips the sort anyway if that path
 	// already delivers the ordering, which is what makes the initialisation
 	// below correct.
-	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, residual, mergeTuplesFor)
+	// The clauses whose groups the outer's ordering does NOT serve are dropped
+	// from `mergeClauses` above — `findMergeClausesForOuterPathkeys` returns a
+	// prefix of the groups, not all of them. They must be demoted into the
+	// residual, exactly as the truncation search below does with
+	// `demoteDroppedMergeClauses`: the merge no longer keys on them, so they
+	// have to be evaluated per surviving tuple instead.
+	//
+	// Omitting this emitted a join that never evaluated the clause AT ALL —
+	// silent WRONG ANSWERS, not a missed optimisation. TPC-H Q9's
+	// `lineitem x partsupp` has two equi-clauses and an outer ordered only on
+	// ps_partkey, so ps_suppkey = l_suppkey was lost: the join emitted
+	// 24,005,020 rows instead of 6,001,255 and the query summed 4.02x the
+	// correct answer while returning the correct ROW COUNT.
+	// impl/FINDING-CRITICAL-mergejoin-wrong-answers.md.
+	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
+	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor)
 
 	// The truncation search (:1685-1782). `cheapestTotalInner` /
 	// `cheapestStartupInner` carry the best inner found SO FAR, and a candidate
@@ -386,4 +401,37 @@ func getCheapestPathForPathkeys(paths []*Path, keys []PathKey, criterion costSel
 		}
 	}
 	return matched
+}
+
+// demoteUnmatchedGroupClauses returns `residual` plus every clause in `groups`
+// that `kept` does not contain.
+//
+// It is the identity-based sibling of `demoteDroppedMergeClauses`. That one may
+// subtract by POSITION because `trimMergeClausesForInnerPathkeys` appends in
+// order and stops, so its result is a genuine prefix. The set dropped here is
+// chosen by which GROUPS the outer's pathkeys serve, which is not a prefix of
+// the clause list, so it must be computed by identity.
+func demoteUnmatchedGroupClauses(residual []*restrictInfo, groups []mergeKeyGroup, kept []*restrictInfo) []*restrictInfo {
+	keptSet := make(map[*restrictInfo]struct{}, len(kept))
+	for _, ri := range kept {
+		keptSet[ri] = struct{}{}
+	}
+	var extra []*restrictInfo
+	for _, g := range groups {
+		for _, ri := range g.clauses {
+			if _, ok := keptSet[ri]; !ok {
+				extra = append(extra, ri)
+			}
+		}
+	}
+	if len(extra) == 0 {
+		return residual
+	}
+	// A fresh slice: `residual` is shared with every other candidate this
+	// relation pair generates, so appending in place would leak one path's
+	// demotions into the others.
+	out := make([]*restrictInfo, 0, len(residual)+len(extra))
+	out = append(out, residual...)
+	out = append(out, extra...)
+	return out
 }
