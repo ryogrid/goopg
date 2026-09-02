@@ -791,8 +791,19 @@ not grow; no query slower than 1.2×.
       charge actually made. Merge cost is work_mem-independent, hash cost is not,
       so at PG's budget the hash path (1,906,774) crosses the under-priced merge
       path (826,630) and Q9 goes 15.4s -> 187s. Full evidence and the fix:
-      `impl/FINDING-mergejoin-costed-on-postfilter-rows.md`. Fixing it is the
-      prerequisite for P2-02b, and P2-02b's cost is that fix's acceptance test.
+      `impl/FINDING-mergejoin-costed-on-postfilter-rows.md`. That mispricing is
+      now FIXED (`c281b0830`, TPC-H 258.28s -> 240.73s, 24 MATCH).
+      **P2-02b still must not land, for a worse reason: it produces WRONG
+      ANSWERS.** With `work_mem` at PG's default, Q9 returns 175 rows — the
+      correct count — with wrong tuples, summing 30,270,658,609.88 against the
+      PG oracle's 7,528,869,517.19 (4.02x). The merge join drops an equi-clause
+      it does not use as a merge clause and emits the unfiltered product
+      (24,005,020 rows where the two-clause join gives 6,001,255). The bug is
+      PRE-EXISTING — identical digest before and after the cost fix, reproduces
+      at session-start HEAD — and goopg's 512MB `work_mem` default (128x PG's)
+      is the only thing hiding it. See
+      `impl/FINDING-CRITICAL-mergejoin-wrong-answers.md`. Fix that first; it is
+      a correctness bug in its own right, not a P2-02b blocker.
 - [ ] **P2-02c** Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner
