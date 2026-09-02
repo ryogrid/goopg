@@ -1489,15 +1489,44 @@ func sessionOpportunisticPrune(sess *misc.SessionRegistry) bool {
 // planner.MaybeAddGather is correspondingly non-mutating: it returns a new
 // root sharing the cached children, because that cached node is being read
 // concurrently by every other session running the same SQL.
+// sessionGetter adapts a SessionRegistry to the plain (name) -> (effective,
+// ok) getter the *From helpers take, so the registry channel and the
+// executor.Context channel share one body per GUC. A nil registry reads as
+// "nothing set", which is what every accessor's nil branch meant.
+func sessionGetter(sess *misc.SessionRegistry) func(string) (string, bool) {
+	if sess == nil {
+		return func(string) (string, bool) { return "", false }
+	}
+	return func(name string) (string, bool) {
+		_, eff, ok := sess.Get(name)
+		return eff, ok
+	}
+}
+
 func applyParallelPostPass(node optimizer.Node, sess *misc.SessionRegistry, ectx *executor.Context) optimizer.Node {
+	return applyParallelPostPassFrom(node, sessionGetter(sess), ectx)
+}
+
+// ctxApplyParallelPostPass is applyParallelPostPass for the paths that hold an
+// executor.Context but no SessionRegistry — the simple-query route, which is
+// the one that plans a statement the cache did not supply. Same two-channel
+// split, and same reason, as sessionPlannerSettings / ctxPlannerSettings.
+func ctxApplyParallelPostPass(node optimizer.Node, ectx *executor.Context) optimizer.Node {
+	if ectx == nil || ectx.GetSetting == nil {
+		return node
+	}
+	return applyParallelPostPassFrom(node, ectx.GetSetting, ectx)
+}
+
+func applyParallelPostPassFrom(node optimizer.Node, get func(string) (string, bool), ectx *executor.Context) optimizer.Node {
 	if node == nil || ectx == nil {
 		return node
 	}
 	return optimizer.MaybeAddGather(node, optimizer.ParallelSettings{
-		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
-		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
-		LeaderParticipates:  sessionParallelLeaderParticipation(sess),
-		DebugParallelQuery:  sessionDebugParallelQuery(sess),
+		MaxWorkersPerGather: maxParallelWorkersPerGatherFrom(get),
+		MinTableScanBlocks:  minParallelTableScanSizeFrom(get),
+		LeaderParticipates:  parallelLeaderParticipationFrom(get),
+		DebugParallelQuery:  debugParallelQueryFrom(get),
 		IsSerializable:      ectx.Tx.Isolation == transam.IsolationSerializable,
 		BlocksForTable:      parallelBlocksForTable(ectx),
 	})
@@ -1553,10 +1582,11 @@ func parallelBlocksForTableFrom(pool *storage.Pool, cat catalog.Catalog) func(*c
 // Zero means "no parallelism" and is a legitimate user setting, not an
 // absence — so an unreadable GUC falls back to 0 (serial), the safe direction.
 func sessionMaxParallelWorkersPerGather(sess *misc.SessionRegistry) int {
-	if sess == nil {
-		return 0
-	}
-	_, eff, ok := sess.Get("max_parallel_workers_per_gather")
+	return maxParallelWorkersPerGatherFrom(sessionGetter(sess))
+}
+
+func maxParallelWorkersPerGatherFrom(get func(string) (string, bool)) int {
+	eff, ok := get("max_parallel_workers_per_gather")
 	if !ok {
 		return 0
 	}
@@ -1594,11 +1624,12 @@ func sessionMaxParallelWorkers(sess *misc.SessionRegistry) int {
 // direction, so an unreadable GUC falls back to PG's default of 1024 blocks
 // (8MB) rather than to zero.
 func sessionMinParallelTableScanSize(sess *misc.SessionRegistry) int64 {
+	return minParallelTableScanSizeFrom(sessionGetter(sess))
+}
+
+func minParallelTableScanSizeFrom(get func(string) (string, bool)) int64 {
 	const pgDefaultBlocks = 1024 // (8 * 1024 * 1024) / BLCKSZ
-	if sess == nil {
-		return pgDefaultBlocks
-	}
-	_, eff, ok := sess.Get("min_parallel_table_scan_size")
+	eff, ok := get("min_parallel_table_scan_size")
 	if !ok {
 		return pgDefaultBlocks
 	}
@@ -1612,10 +1643,11 @@ func sessionMinParallelTableScanSize(sess *misc.SessionRegistry) int64 {
 // sessionParallelLeaderParticipation reads `parallel_leader_participation`.
 // Upstream's default is on; an unreadable GUC keeps that.
 func sessionParallelLeaderParticipation(sess *misc.SessionRegistry) bool {
-	if sess == nil {
-		return true
-	}
-	_, eff, ok := sess.Get("parallel_leader_participation")
+	return parallelLeaderParticipationFrom(sessionGetter(sess))
+}
+
+func parallelLeaderParticipationFrom(get func(string) (string, bool)) bool {
+	eff, ok := get("parallel_leader_participation")
 	if !ok {
 		return true
 	}
@@ -1627,10 +1659,11 @@ func sessionParallelLeaderParticipation(sess *misc.SessionRegistry) bool {
 // ("off" / "on" / "regress"); the P0 synonym work means a user may have
 // written `true`, and canonicalisation has already mapped it to "on".
 func sessionDebugParallelQuery(sess *misc.SessionRegistry) string {
-	if sess == nil {
-		return "off"
-	}
-	_, eff, ok := sess.Get("debug_parallel_query")
+	return debugParallelQueryFrom(sessionGetter(sess))
+}
+
+func debugParallelQueryFrom(get func(string) (string, bool)) string {
+	eff, ok := get("debug_parallel_query")
 	if !ok {
 		return "off"
 	}
@@ -3561,6 +3594,23 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 			code, msg := planErrorFields(err)
 			return s.writeQueryError(w, code, msg, planErrorHintFields(err)...)
 		}
+		// The parallel post-pass belongs to EVERY plan, not just cached ones.
+		//
+		// applyParallelPostPass used to run only inside the dispatch loop's
+		// plan-cache block, so a statement that bypassed the cache was never
+		// considered for a Gather and ran strictly serially. Every cache-bypass
+		// reason triggered it: SET enable_seqscan=off, WHERE CURRENT OF, a
+		// pending partition detach — and, once take2 P2-02b made a conf-file
+		// work_mem count as a session input, the whole TPC-H bench. That last
+		// one is how it surfaced: Q9 went 15.8s -> 69.3s with an unchanged
+		// plan shape and an unchanged work_mem, because the Gather over four
+		// workers had silently disappeared.
+		//
+		// Wrapping here rather than at the cache site keeps the invariant the
+		// cache comment already states — the CACHE holds the serial plan and
+		// the Gather is chosen per statement from this session's GUCs — while
+		// extending it to the statements that never reach the cache.
+		node = ctxApplyParallelPostPass(node, ctx)
 		// Note: plan cache storage happens at the dispatch level (caller
 		// stores if cacheKey was computed). This function only executes.
 		//

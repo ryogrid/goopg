@@ -56,6 +56,17 @@ func batchJoinPlan(leftWidth, estLeft, estRight int) *optimizer.Join {
 // runBatchJoin opens a joinOp over the given rows under workMem and returns
 // the emitted tuples rendered as strings, plus the batch state (nil when the
 // join never batched).
+// unboundedWorkMem is the budget for a reference arm that must hold the whole
+// build in one batch, so its output can be compared against a deliberately
+// batched arm.
+//
+// These arms used to pass 0 ("no session work_mem"), which relied on the
+// fallback budget being large. take2 P2-02b moved that fallback to PG's 4 MB
+// work_mem and the reference arms started batching themselves — caught by
+// their own preconditions. The requirement was never "the default"; it was
+// "big enough not to batch", so they now say so.
+const unboundedWorkMem = 512 << 20
+
 func runBatchJoin(t *testing.T, plan *optimizer.Join, probeRows, buildRows []Row, lw, rw int, workMem int64) ([]string, *hashBatchState) {
 	t.Helper()
 	left := &rowsOp{rows: probeRows, schema: batchSchema("l", lw)}
@@ -110,7 +121,7 @@ func TestHashJoinSpillIsIdentityToMemoryJoin(t *testing.T) {
 	probeRows := intKeyRows(3000, 700, "p")
 	plan := batchJoinPlan(lw, len(probeRows), len(buildRows))
 
-	want, memBS := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 0)
+	want, memBS := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, unboundedWorkMem)
 	if memBS != nil && memBS.innerSpilled != 0 {
 		t.Fatalf("precondition: the 512 MiB-default arm spilled %d rows", memBS.innerSpilled)
 	}
@@ -150,7 +161,7 @@ func TestHashJoinBatchGrowthMidBuildKeepsEveryMatch(t *testing.T) {
 	// real data forces increaseNumBatches.
 	plan := batchJoinPlan(lw, len(probeRows), len(buildRows)/10)
 
-	want, _ := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 0)
+	want, _ := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, unboundedWorkMem)
 	got, bs := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 256<<10)
 	if bs == nil {
 		t.Fatalf("precondition: the bounded arm did not batch")
@@ -178,7 +189,7 @@ func TestHashJoinSkewFreezesGrowthAndStaysCorrect(t *testing.T) {
 	}
 	plan := batchJoinPlan(lw, len(probeRows), len(buildRows))
 
-	want, _ := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 0)
+	want, _ := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, unboundedWorkMem)
 	got, bs := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 256<<10)
 	if bs == nil {
 		t.Fatalf("precondition: the bounded arm did not batch")
@@ -205,7 +216,7 @@ func TestHashJoinSpillWithBuildLeftOrientation(t *testing.T) {
 	plan := batchJoinPlan(lw, len(probeRows), len(buildRows))
 	plan.BuildLeft = true
 	// With BuildLeft the LEFT input is the build side and the right is probed.
-	want, _ := runBatchJoin(t, plan, buildRows, probeRows, lw, rw, 0)
+	want, _ := runBatchJoin(t, plan, buildRows, probeRows, lw, rw, unboundedWorkMem)
 	got, bs := runBatchJoin(t, plan, buildRows, probeRows, lw, rw, 512<<10)
 	if bs == nil {
 		t.Fatalf("precondition: the bounded arm did not batch")
@@ -233,7 +244,7 @@ func TestHashJoinSpillOnStringKeys(t *testing.T) {
 	plan.LeftKey.(*optimizer.ColumnRef).Type = catalog.Type{Name: "text"}
 	plan.RightKey.(*optimizer.ColumnRef).Type = catalog.Type{Name: "text"}
 
-	want, _ := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 0)
+	want, _ := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, unboundedWorkMem)
 	got, bs := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 512<<10)
 	if bs == nil {
 		t.Fatalf("precondition: the bounded arm did not batch")
@@ -369,7 +380,7 @@ func TestFillingJoinsKeepOuterOnlyBatches(t *testing.T) {
 			plan := batchJoinPlan(lw, len(probeRows), 200000)
 			plan.Type = tc.typ
 
-			want, memBS := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 0)
+			want, memBS := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, unboundedWorkMem)
 			if memBS != nil && memBS.nbatch != 1 {
 				t.Fatalf("precondition: the default-work_mem arm batched (nbatch=%d)", memBS.nbatch)
 			}

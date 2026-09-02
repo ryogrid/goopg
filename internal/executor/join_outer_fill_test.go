@@ -213,7 +213,7 @@ func TestHashOuterFillSweepsEveryBatch(t *testing.T) {
 			// Build on the right for both, so RIGHT exercises the sweep too
 			// (the planner's own RIGHT orientation probes the preserved side
 			// and is covered by the oracle test above).
-			want, memBS := runBatchJoin(t, plan, probe, build, lw, rw, 0)
+			want, memBS := runBatchJoin(t, plan, probe, build, lw, rw, unboundedWorkMem)
 			if memBS != nil && memBS.innerSpilled != 0 {
 				t.Fatalf("precondition: the unbounded arm spilled %d rows", memBS.innerSpilled)
 			}
