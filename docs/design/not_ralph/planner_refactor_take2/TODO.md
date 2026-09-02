@@ -770,8 +770,17 @@ not grow; no query slower than 1.2×.
       (1542-3164 B vs 23-81 B) because there is no PathTarget projection, so its
       hash tables need ~39x the memory for the same rows. At PG's `work_mem`
       goopg batches (`Batches: 8`, 97 MB) where PG does not (`Batches: 1`,
-      38 MB), and Q9 goes 6.2 s (PG) vs 187 s (goopg). The 512MB default was
-      buying exactly the headroom the width needs. Fix the width first.
+      38 MB), and Q9 goes 6.2 s (PG) vs 187 s (goopg).
+      **CORRECTED, same day:** that causal story is withdrawn. Batching and
+      widths are IDENTICAL in goopg's fast and slow arms (`Batches: 8`,
+      97482kB, width 3164 in both), so they cannot explain the 12x. What
+      actually differs is a join-method flip — a two-key parallel hash join
+      becomes a single-key merge join, 6.0M rows become 24.0M, and the Gather is
+      lost — and the slow plan is 2.8x MORE expensive by goopg's own cost model
+      (2,941,575 vs 1,047,157), so the cheaper candidate was not available at
+      that budget. Whether it was never generated or was priced higher is the
+      next measurement (instrument `addPath`). P4-01 is a plausible contributor,
+      not a proven blocker.
 - [ ] **P2-02c** Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner

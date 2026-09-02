@@ -182,3 +182,61 @@ The hand-threaded derived-table patch is not committed; it is a two-line change
 (`planSelectWithParent` takes the settings and calls `planSelectWithSettings`,
 `planSubqueryRangeVar` forwards them) and is trivially reproducible when step 1
 lands.
+
+---
+
+# CORRECTION (2026-09-03, later) — the "39x width" causal story above is WRONG
+
+The section above concluded that goopg needs ~39x the hash memory and therefore
+batches where PostgreSQL does not. The width figures are real, but they are
+**not** what separates goopg's fast arm from its slow arm, and the causal claim
+must be withdrawn. `EXPLAIN ANALYZE` on both goopg arms, rather than on goopg
+against PostgreSQL:
+
+| | goopg fast (1 GB budget, 15.4 s) | goopg slow (128 MB budget, 187 s) |
+|---|---|---|
+| top hash join | `Batches: 8  Memory Usage: 97482kB` | `Batches: 8  Memory Usage: 97482kB` |
+| widths | 3164 / 2716 / 2168 / 1094 | 3164 / 2616 / 1542 / 1094 |
+
+**Batching and widths are identical in both.** "goopg batches where PG does not"
+does not distinguish the two arms, so it cannot be the explanation for the 12x.
+
+## What actually differs
+
+| | fast | slow |
+|---|---|---|
+| bottom join | two-key **parallel Hash Join**, `l_suppkey = ps_suppkey AND l_partkey = ps_partkey` | single-key **Merge Join**, `ps_partkey = l_partkey` only |
+| rows out of it | 6,001,255 | **24,005,020** |
+| parallelism | `Gather`, 4 workers | none |
+| goopg's own total cost | 1,047,157 | 2,941,575 |
+
+goopg's merge join uses ONE equi-key, so dropping the two-key hash join for it
+multiplies the intermediate by 4x, and the 24M rows then feed the same 8-batch
+hash join. The plan also loses its `Gather`.
+
+Note the last row: **the slow plan is 2.8x more expensive by goopg's own cost
+model.** A planner does not choose a candidate it scores as worse, so at the
+128 MB budget the two-key hash candidate was either not generated or was priced
+above 2.94M there. Which of those it is has NOT been established, and it is the
+next thing to measure — the repository's own rule applies (*verify both
+candidates were generated before comparing costs*; instrument `addPath`, not the
+cost functions).
+
+## Status of the P4-01 recommendation
+
+Width remains a genuine and large divergence from PostgreSQL (3164 B vs 81 B at
+the same point in the same plan), and it is still a plausible *contributor*:
+wide tuples inflate the hash path's priced cost at a realistic budget, which is
+what could push the search onto the merge join. But that chain is now a
+hypothesis, not a measurement, and this document previously asserted it as
+established. **P4-01 should not be treated as the proven blocker until the
+`addPath` question above is answered.**
+
+The honest summary is narrower than the section above claimed:
+
+- P2-02b costs TPC-H 245.7 s -> 314.4 s. Reproduced, not in doubt.
+- The mechanism is a join-method flip (two-key hash -> single-key merge) with a
+  4x cardinality blowup and lost parallelism. Established.
+- *Why* the tighter budget causes that flip is NOT established. Width is the
+  leading hypothesis; a hash-spill cost term that overreacts to `work_mem` is
+  another, and is cheaper to test.
