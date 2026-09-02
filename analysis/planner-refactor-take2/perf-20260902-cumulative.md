@@ -114,6 +114,7 @@ wrong model.
 | `f07c20b1f` pg_statistic decode | histograms restored (none → 101 bounds) | **−10.5 %** |
 | `71653da23` P1-13 range pairing | 2.04× over → 0.9 % under | +0.45 % (noise) |
 | `ae78cc6eb` P1-14 + P1-25 | `DISTINCT` 6 001 255 → 7, matching PG | +0.88 % (noise) |
+| Phase 1 batch (10 items) | incl. P1-20's 470× cost cut on its shape | +0.96 % (noise) |
 
 Three A/Bs, one conclusion: **restoring statistics that were entirely absent
 moved time; refining statistics that were merely inaccurate did not.** The
@@ -123,6 +124,17 @@ count now matches PostgreSQL's exactly — and the corpus did not care.
 Two queries moved in the third A/B, both under a second absolute: Q2
 1.71 s → 0.74 s (−56.7 %) and Q10 2.88 s → 3.80 s (+31.9 %). Row counts
 identical throughout.
+
+**A fourth measurement, after the P0-12 alignment**: the whole Phase 1 batch
+(P1-01, P1-03, P1-03b, P1-05, P1-07, P1-08, P1-15, P1-19, P1-20, P1-26) moved
+TPC-H from **395.53 s to 399.33 s (+0.96 %, inside noise)**, no query moving
+more than 10 % on more than a second, row counts identical throughout.
+
+That includes P1-20, which is a **470× cost reduction** on the shape it fixes
+(`a = b AND a = 42` propagating the constant to `b`). It does not show on TPC-H
+because **TPC-H contains no query of that shape** — the win is real and the
+corpus simply cannot see it. That is worth stating plainly, because "no change
+on TPC-H" and "no effect" are different claims and only the first is supported.
 
 This is the strongest evidence the project has that **the remaining gap is not
 in the estimator**. It also says something about how to run the rest of Phase 1:
