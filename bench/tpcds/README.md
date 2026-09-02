@@ -248,8 +248,18 @@ probes are skipped as baselines) and prints what moved, by name:
 ```
 TIMEOUT    +Q47  -Q72
 SLOWER     Q57 15s->81s (5.4x)
-=== STATUS-DELTA: compared=99 verdict-changes=yes runtime-moves=20 (>=2.0x, floor 5s, TIMEOUT readings excluded) ===
+TOTAL      1115s -> 1152s (+3.3%)  <== aggregate move; no single query need cross 2.0x for this to matter
+=== STATUS-DELTA: compared=99 verdict-changes=yes runtime-moves=20 total-delta=+3.3% (>=2.0x, floor 5s, total band 2.0%, TIMEOUT readings excluded) ===
 ```
+
+The `TOTAL` arm exists because the per-query arm cannot see a **broad, shallow**
+regression. A change can move sixty plans, slow ten queries by 3–5 s each, and
+report `runtime-moves=0` because no single query crossed 2×. That is not
+hypothetical: planner_refactor_take2's per-tuple index qual cost did exactly
+this (1115 s → 1152 s, +3.3 %, `runtime-moves=0`) and was caught only by summing
+the sweep by hand. The 2 % band is set against measured noise — three sweeps on
+this harness in one day spanned 1110 / 1115 / 1119 s, ±0.4 %. Both totals sum
+the SAME query set: a row is excluded when either side is missing or clipped.
 
 The input is the report itself, so **every archived report is a valid baseline**
 — `delta` answers "what actually moved between those two sweeps?" for runs that

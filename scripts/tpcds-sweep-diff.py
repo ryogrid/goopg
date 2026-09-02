@@ -108,6 +108,13 @@ def main():
     ap.add_argument("new")
     ap.add_argument("--min-secs", type=int, default=5,
                     help="ignore runtime moves where max(old,new) is below this (default 5)")
+    ap.add_argument("--total-pct", type=float, default=2.0,
+                    help="report an AGGREGATE runtime move of at least this "
+                         "percent. Arm 2 is per-query with a --factor floor and "
+                         "cannot see a broad shallow regression; take2's "
+                         "per-tuple index qual cost moved the sweep +3.3%% with "
+                         "runtime-moves=0. Three same-day sweeps spanned "
+                         "+/-0.4%%, so 2%% sits outside the observed noise.")
     ap.add_argument("--factor", type=float, default=2.0,
                     help="report a runtime move at or beyond this factor (default 2.0)")
     ap.add_argument("--strict", action="store_true")
@@ -193,6 +200,36 @@ def main():
         moved = True
         print("FASTER     " + fmt(sorted(faster, key=lambda r: r[3])))
 
+    # --- arm 3: the AGGREGATE total.
+    #
+    # Arm 2 is per-query with a --factor floor, and that is blind to a broad,
+    # shallow regression: a change can move sixty plans, slow ten queries by
+    # 3-5 s each, and report runtime-moves=0 because no single query crossed
+    # 2.0x. That is not hypothetical — take2's per-tuple index qual cost did
+    # exactly this (TPC-DS 1115s -> 1152s, +3.3%, runtime-moves=0), and it was
+    # caught only by summing the sweep by hand.
+    #
+    # The band is deliberately tight. Three sweeps on this harness on one day
+    # sat at 1110 / 1115 / 1119 s — +/-0.4% — so 2% is comfortably outside the
+    # observed noise while still not firing on it.
+    def sweep_total(tbl):
+        # Only rows this comparison can trust: a reading is skipped when EITHER
+        # side is missing or clipped, so both totals sum the SAME query set.
+        return sum(tbl[q][1] for q in shared
+                   if old[q][1] is not None and new[q][1] is not None
+                   and "TIMEOUT" not in old[q][0] and "TIMEOUT" not in new[q][0])
+
+    old_tot, new_tot = sweep_total(old), sweep_total(new)
+    total_moved = False
+    if old_tot > 0:
+        pct = (new_tot - old_tot) / old_tot * 100.0
+        if abs(pct) >= args.total_pct:
+            total_moved = True
+            moved = True
+            print("TOTAL      %ds -> %ds (%+.1f%%)  <== aggregate move; no single "
+                  "query need cross %.1fx for this to matter"
+                  % (old_tot, new_tot, pct, args.factor))
+
     only_old, only_new = sorted(set(old) - shared), sorted(set(new) - shared)
     if only_old:
         print("ONLY-OLD   " + qlist(only_old) + "  (absent from the new report — NOT compared)")
@@ -202,10 +239,15 @@ def main():
     verdict_moved = any(
         {q for q in shared if old[q][0] == vd} != {q for q in shared if new[q][0] == vd}
         for vd in VERDICTS)
+    total_note = "none"
+    if old_tot > 0:
+        total_note = "%+.1f%%" % ((new_tot - old_tot) / old_tot * 100.0)
     print("=== STATUS-DELTA: compared=%d verdict-changes=%s runtime-moves=%d "
-          "(>=%.1fx, floor %ds, TIMEOUT readings excluded) ==="
+          "total-delta=%s (>=%.1fx, floor %ds, total band %.1f%%, "
+          "TIMEOUT readings excluded) ==="
           % (len(shared), "yes" if verdict_moved else "none",
-             len(slower) + len(faster), args.factor, args.min_secs))
+             len(slower) + len(faster), total_note,
+             args.factor, args.min_secs, args.total_pct))
     if not moved:
         print("# every query kept its verdict and stayed within %.1fx — "
               "this is the only form of 'nothing changed' the gate can assert." % args.factor)
