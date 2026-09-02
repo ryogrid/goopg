@@ -93,6 +93,15 @@ var flagResolvedState = map[string]func(string) string{
 		}
 		return "current"
 	},
+	// A float, not a boolean or a mode. It multiplies NL-index probe cost
+	// (cost_funcs.go), so it moves the hash-vs-NL crossover directly — the
+	// single most plan-shaping knob in the package. Rendered through
+	// strconv.FormatFloat with -1 precision so `unset(1)` round-trips: the
+	// token inside `unset(…)` re-exported verbatim reproduces the arm, which
+	// TestFlagLabelsRoundTrip asserts for every row.
+	"GOOPG_INDEX_PROBE_MULT": func(v string) string {
+		return strconv.FormatFloat(indexProbeMultFromEnv(v), 'g', -1, 64)
+	},
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -111,6 +120,12 @@ var flagProvenanceOrder = []string{
 	"GOOPG_INDEXKEY_HARVEST",
 	"GOOPG_NLI_COSTGATE",
 	"GOOPG_HASH_OUTER_JOIN",
+	// Joined at planner-refactor-take2 P0-04c. It multiplies NL-index probe
+	// cost, so it moves the hash-vs-NL crossover on every join — and it had
+	// been readable, and absent from every artefact, since M0126. It escaped
+	// the completeness guard because it is read through envFloatDefault rather
+	// than a literal os.Getenv, which the old regex detector could not see.
+	"GOOPG_INDEX_PROBE_MULT",
 	"GOOPG_MHJ_PACKING_OFF",
 	"GOOPG_GS_SHARE_SOURCE",
 	// Joined at M0125-0040: grouping-sets source sharing changes the plan of

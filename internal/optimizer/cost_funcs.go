@@ -435,7 +435,24 @@ func indexProbeCost(cp costParams) float64 {
 // a hash join over NL-probing a large outer. Overridable via
 // GOOPG_INDEX_PROBE_MULT for measurement; the calibrated default is set once a
 // value is validated on SF1.
-var indexProbeCostMultiplier = envFloatDefault("GOOPG_INDEX_PROBE_MULT", 1.0)
+var indexProbeCostMultiplier = indexProbeMultFromEnv(os.Getenv("GOOPG_INDEX_PROBE_MULT"))
+
+// indexProbeMultFromEnv resolves GOOPG_INDEX_PROBE_MULT's raw value to the
+// multiplier the planner uses. It is a named function rather than an inline
+// envFloatDefault call so the flag-provenance table can resolve the SAME
+// default the process resolves (flaglabels.go's flagResolvedState), which is
+// what makes `unset(1)` a statement about the binary instead of a restated
+// constant. Reading it through a helper is also what hid this flag from
+// TestFlagProvenanceTableCoversPlannerEnv for an entire milestone — see that
+// test's go/ast detector.
+func indexProbeMultFromEnv(v string) float64 {
+	if v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return 1.0
+}
 
 // `multiHashJoinCost` costed goopg's N-way MultiHashJoin under the
 // comparability invariant (design ch. 06 §4.1) — build every dimension hash
