@@ -278,7 +278,13 @@ func matchBitmapIndexQuals(
 			}
 			// Found an equality conjunct matching this index column.
 			stats := columnStatsByName(tbl, colName)
-			colSel := eqSelectivityForColumn(stats, val)
+			// take2 P2-09: the relation's raw tuple count resolves the
+			// relative ndistinct form; the table's own stats carry it here.
+			rawRows := 0.0
+			if tbl.Stats != nil {
+				rawRows = float64(tbl.Stats.RowCount)
+			}
+			colSel := eqSelectivityForColumn(stats, val, rawRows)
 			selectivity *= colSel
 
 			// ri is nil: local quals have no restrictInfo. The Key/Keys

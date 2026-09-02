@@ -81,7 +81,7 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		stats := columnStatsForChild(cr.Index, child)
 		var sel float64
 		for _, v := range e.List {
-			sel += eqSelectivityForColumn(stats, v)
+			sel += eqSelectivityForColumn(stats, v, columnRawRowsForChild(cr.Index, child))
 		}
 		if sel > 1.0 {
 			sel = 1.0
@@ -108,10 +108,13 @@ func eqOpSelectivity(left, right Expr, child Node) float64 {
 		return defaultEqSelectivity
 	}
 	stats := columnStatsForChild(col.Index, child)
-	return eqSelectivityForColumn(stats, val)
+	return eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child))
 }
 
-func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr) float64 {
+// eqSelectivityForColumn prices `col = const`. `tuples` is the relation's RAW
+// tuple count, needed only to resolve the relative ndistinct form; pass 0 when
+// it is unknown and the absolute form will still be used.
+func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr, tuples float64) float64 {
 	literal, ok := formatExprConstant(val)
 	if !ok {
 		return defaultEqSelectivity
@@ -130,7 +133,12 @@ func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr) float64 {
 	for _, mcv := range stats.MCV {
 		mcvMass += mcv.Frequency
 	}
-	remainingDistinct := stats.NDistinct - int64(len(stats.MCV))
+	// take2 P2-09: the RESOLVED ndistinct, not the raw absolute field. A
+	// column whose distinct count scales with the relation stores the relative
+	// form, and reading `.NDistinct` alone saw zero for it — so every equality
+	// against a key column fell to defaultEqSelectivity and an IN-list over one
+	// was out by three orders of magnitude.
+	remainingDistinct := stats.ResolvedNDistinct(tuples) - float64(len(stats.MCV))
 	if remainingDistinct <= 0 {
 		// MCV covers every distinct value — the constant isn't
 		// among them. Selectivity is the residual mass /
@@ -142,7 +150,7 @@ func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr) float64 {
 	if mass <= 0 {
 		return defaultEqSelectivity
 	}
-	return mass / float64(remainingDistinct)
+	return mass / remainingDistinct
 }
 
 // rangeOpSelectivity handles `col <op> const` for `< <= > >=`.
@@ -429,6 +437,17 @@ func formatExprConstant(e Expr) (string, bool) {
 // index `idx` (matches the executor's Output indexing). Returns
 // nil when the column doesn't trace back to a base relation
 // with stats — that's the unanalysed-table fallback.
+// columnRawRowsForChild is columnStatsForChild's companion: the relation's RAW,
+// unfiltered tuple count, which is the divisor the relative ndistinct form
+// needs. Returns 0 when the column does not resolve to a base relation, which
+// ResolvedNDistinct treats as "absolute form only". take2 P2-09.
+func columnRawRowsForChild(idx int, child Node) float64 {
+	if ref, ok := resolveBaseColumn(idx, child); ok {
+		return ref.rawRows
+	}
+	return 0
+}
+
 func columnStatsForChild(idx int, child Node) *catalog.ColumnStats {
 	// take2 P1-26: ONE arm list, not two.
 	//
@@ -514,7 +533,7 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 		}
 		var sel float64
 		for _, v := range e.List {
-			sel += eqSelectivityForColumn(stats, v)
+			sel += eqSelectivityForColumn(stats, v, columnRawRowsForChild(cr.Index, child))
 		}
 		if sel > 1.0 {
 			sel = 1.0
@@ -544,7 +563,7 @@ func eqOpSelectivityWithSource(left, right Expr, child Node) selectivityEstimate
 	if stats == nil {
 		return selectivityEstimate{value: defaultEqSelectivity, reliable: false}
 	}
-	return selectivityEstimate{value: eqSelectivityForColumn(stats, val), reliable: true}
+	return selectivityEstimate{value: eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child)), reliable: true}
 }
 
 // rangeOpSelectivityWithSource is the reliability-tracking twin

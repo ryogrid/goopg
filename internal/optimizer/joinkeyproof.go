@@ -328,7 +328,11 @@ func baseColumnOfTable(scan Node, tbl *catalog.Table, uniq [][]string, idx int) 
 			ref.rawRows = float64(tbl.Stats.RowCount)
 		}
 		if idx < len(tbl.Stats.Columns) {
-			ref.ndistinct = tbl.Stats.Columns[idx].NDistinct
+			// take2 P2-09: resolve BOTH ndistinct forms. Reading
+			// `.NDistinct` alone saw zero for every column whose distinct
+			// count scales with the table — most keys — and every consumer
+			// then fell to a default.
+			ref.ndistinct = int64(tbl.Stats.Columns[idx].ResolvedNDistinct(ref.rawRows))
 			ref.stats = &tbl.Stats.Columns[idx]
 		}
 	}

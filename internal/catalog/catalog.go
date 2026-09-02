@@ -1893,6 +1893,37 @@ func (cs ColumnStats) StaDistinct() float64 {
 	}
 }
 
+// ResolvedNDistinct returns the column's distinct-value count as a COUNT,
+// resolving PG's two-form convention against the relation's tuple count.
+//
+// goopg stores upstream's one signed `stadistinct` as two fields —
+// `NDistinct` (absolute) and `NDistinctFrac` (the negated relative form) — and
+// callers that read `NDistinct` alone silently see ZERO for every column whose
+// distinct count SCALES with the table, which is most key columns. ANALYZE
+// records `l_orderkey` as n_distinct = -0.2 and `p_partkey` as -1; both read as
+// absolute-zero.
+//
+// The consequence was a 1000x class of estimation error: an IN-list on such a
+// column fell all the way to DEFAULT_EQ_SEL per element, so
+// `p_partkey IN (1,2,3,4,5)` estimated 5000 rows against PostgreSQL's 5, and
+// `l_orderkey IN (1,2,3)` estimated 90018 against 51. take2 P2-09.
+//
+// Returns 0 when neither form is populated, which callers must treat as "no
+// information" rather than as zero distinct values.
+func (cs ColumnStats) ResolvedNDistinct(tuples float64) float64 {
+	switch {
+	case cs.NDistinct > 0:
+		return float64(cs.NDistinct)
+	case cs.NDistinctFrac > 0 && tuples > 0:
+		// The relative form is a FRACTION of the relation, exactly as
+		// `get_variable_numdistinct` resolves a negative stadistinct
+		// (selfuncs.c): ndistinct = -stadistinct * ntuples.
+		return cs.NDistinctFrac * tuples
+	default:
+		return 0
+	}
+}
+
 // MCVEntry is one entry in a per-column MCV list. Frequency is
 // the sample frequency (0..1). Mirrors a single (stavalues,
 // stanumbers) pair in upstream's pg_statistic MCV slot.

@@ -992,7 +992,31 @@ not grow; no query slower than 1.2×.
       tuning alone never fixed a query"). It should land with the rest of
       `btcostestimate`, not alone, and its acceptance test is the aggregate
       sweep total rather than the per-query gate.
-      Still open: `num_sa_scans` for ScalarArrayOp, and this term.
+      **`num_sa_scans` is BLOCKED, and looking for it found something bigger.**
+      goopg builds no index path for a ScalarArrayOp at all: `p_partkey IN
+      (1,2,3,4,5)` plans as a Parallel Seq Scan with
+      `Filter: (p_partkey = ANY (...))` where PG uses `Index Scan ... Index
+      Cond: = ANY`. So `num_sa_scans`, which prices the repeated descents such a
+      scan performs, has no consumer — the third item in this phase in that
+      position, after P2-08 and P2-10. The missing PATH is the real gap.
+      **The ndistinct two-form bug (FIXED 2026-09-03).** That probe also showed
+      goopg estimating 5000 rows for the 5-element IN-list against PG's 5.
+      `ColumnStats` stores upstream's one signed `stadistinct` as TWO fields —
+      `NDistinct` (absolute) and `NDistinctFrac` (relative) — and both
+      `eqSelectivityForColumn` and `resolveBaseColumn` read the ABSOLUTE field
+      alone. Every column whose distinct count scales with the relation — most
+      keys — therefore read as ndistinct ZERO and fell to `DEFAULT_EQ_SEL`.
+      `ColumnStats.ResolvedNDistinct(tuples)` now applies PG's convention
+      (`get_variable_numdistinct`: `ndistinct = -stadistinct * ntuples`) and both
+      call sites use it.
+      Measured: `p_partkey IN (1..5)` 5000 -> **5**, exactly PG's;
+      `l_orderkey IN (1,2,3)` 90018 -> **14** against PG's 51 — a 1765x error
+      reduced to under 4x, in the safe direction.
+      Gates: TPC-H **215.62s** from 234.51s (**-8.1%**, and -12.2% across this
+      bundle), 24 MATCH on values. TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0
+      ERROR=0 TIMEOUT=0, verdict-changes none, **aggregate -3.6%**, 79 plan
+      shapes changed, two runtime moves and BOTH are faster (Q20 5s->1s,
+      Q76 5s->2s). No regression on either suite.
 - [-] **P2-10** `compute_semi_anti_join_factors` and the semi/anti early-out in
       nestloop and hashjoin costing. *design: 08 §5.3.*
       **BLOCKED on Phase 3 — there are no semi/anti PATHS to cost.**
