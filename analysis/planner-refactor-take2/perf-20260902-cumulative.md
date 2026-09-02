@@ -22,7 +22,9 @@ identical server age, `GOGC=100 GOMEMLIMIT=12GiB`, 180 s per-query cap.
 | + pg_statistic decode fix (`f07c20b1f`) | **257.75 s** | **−10.5 %** |
 | + range-bound pairing (`71653da23`) | **254.65 s** | +0.45 % vs its own control (noise) |
 
-Net across the session: **288.10 s → ~255 s, about −11 %.** Row counts identical
+| + P1-14 / P1-25 (`ae78cc6eb`) | **248.71 s** | +0.88 % vs its own control (noise) |
+
+Net across the session: **288.10 s → ~249 s, about −13 %.** Row counts identical
 on all 24 items in every arm.
 
 The second A/B's own control ran at 253.51 s where the first arm's `after` ran
@@ -104,6 +106,29 @@ join search, no `PathTarget`, cost GUCs that never reach the planner. It also
 tempers the design bundle's framing: Phase 1 items are judged by an estimate
 ratchet for a reason, and expecting each to pay for itself in seconds is the
 wrong model.
+
+## 4b. The pattern, now on three measurements
+
+| change | cardinality effect | TPC-H time |
+|---|---|---|
+| `f07c20b1f` pg_statistic decode | histograms restored (none → 101 bounds) | **−10.5 %** |
+| `71653da23` P1-13 range pairing | 2.04× over → 0.9 % under | +0.45 % (noise) |
+| `ae78cc6eb` P1-14 + P1-25 | `DISTINCT` 6 001 255 → 7, matching PG | +0.88 % (noise) |
+
+Three A/Bs, one conclusion: **restoring statistics that were entirely absent
+moved time; refining statistics that were merely inaccurate did not.** The
+second and third changes made estimates markedly more PG-like — the DISTINCT
+count now matches PostgreSQL's exactly — and the corpus did not care.
+
+Two queries moved in the third A/B, both under a second absolute: Q2
+1.71 s → 0.74 s (−56.7 %) and Q10 2.88 s → 3.80 s (+31.9 %). Row counts
+identical throughout.
+
+This is the strongest evidence the project has that **the remaining gap is not
+in the estimator**. It also says something about how to run the rest of Phase 1:
+those items should be judged by the estimate ratchet 09 defines, not by
+expecting each to pay for itself in seconds, and it would be a mistake to keep
+spending measurement time on per-item TPC-H A/Bs for them.
 
 ## 5. Instruments, which is what Phase 0 was for
 

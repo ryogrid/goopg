@@ -353,6 +353,14 @@ slower than 1.2×, S-cold/WARM gap narrows.
       Confirmed exactly as recorded. Also makes expressible the
       `nulltestsel(IS_NULL)` term P1-13 had to omit; wiring it into the pairing
       is a follow-up.
+> **Measurement guidance for the rest of Phase 1** (established by three A/Bs,
+> 2026-09-02): restoring statistics that were entirely ABSENT moved TPC-H time
+> by −10.5 %; refining statistics that were merely INACCURATE did not move it at
+> all (P1-13 +0.45 %, P1-14/P1-25 +0.88 %, both inside noise) — even though both
+> made estimates markedly more PG-like. Judge the remaining Phase 1 items by the
+> 09 estimate ratchet, not by per-item TPC-H timing, and do not spend a
+> half-hour A/B on each. See analysis/planner-refactor-take2/perf-20260902-cumulative.md §4b.
+
 - [ ] **P1-14b** Remaining per-clause estimators: general `scalararraysel`,
       `patternsel` for LIKE/regex beyond the access-path prefix rewrite,
       `rowcomparesel`, `booltestsel`, `var_eq_non_const`; align every
