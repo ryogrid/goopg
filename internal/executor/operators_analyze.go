@@ -397,20 +397,39 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 			firstErr = fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
 		}
 	}
+	if err := persistRelSize(ctx, tbl, stats.RowCount, stats.Pages); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// persistRelSize writes one relation's ANALYZE/VACUUM-measured size to the
+// goopg-private sidecar heap (catalog.GoopgRelStatsRelationId).
+//
+// take2 P1-03: extracted from persistStatsToPGStatistic so VACUUM can call it
+// too. VACUUM measures reltuples and relpages — vacuum.Analyze returns both and
+// catalog.UpdateRelStats stored them — but the update was IN MEMORY ONLY, so an
+// autovacuum-maintained cluster planned from stale sizes after every restart
+// and only an explicit SQL ANALYZE ever reached disk. Upstream has no such
+// split: vac_update_relstats writes pg_class for both paths.
+func persistRelSize(ctx *Context, tbl *catalog.Table, rowCount int64, pages int) error {
+	if ctx == nil || ctx.Pool == nil || tbl == nil {
+		return nil
+	}
 	relStatsRel := storage.RelFileNode{
-		DBOid:  dbOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.GoopgRelStatsRelationId,
 		Fork:   storage.MainFork,
 	}
 	sizeRow := Row{
-		NewIntDatum(int64(tbl.OID)),     // starelid
-		NewIntDatum(stats.RowCount),     // rowcount (reltuples)
-		NewIntDatum(int64(stats.Pages)), // pages (relpages)
+		NewIntDatum(int64(tbl.OID)), // starelid
+		NewIntDatum(rowCount),       // rowcount (reltuples)
+		NewIntDatum(int64(pages)),   // pages (relpages)
 	}
-	if _, err := writeHeapRowCanonical(ctx, relStatsRel, GoopgRelStatsColumns(), sizeRow); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("goopg_relstats %q: %w", tbl.Name, err)
+	if _, err := writeHeapRowCanonical(ctx, relStatsRel, GoopgRelStatsColumns(), sizeRow); err != nil {
+		return fmt.Errorf("goopg_relstats %q: %w", tbl.Name, err)
 	}
-	return firstErr
+	return nil
 }
 
 // GoopgRelStatsColumns is the row layout of the goopg-private relation-size

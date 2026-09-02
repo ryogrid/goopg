@@ -306,10 +306,20 @@ slower than 1.2×, S-cold/WARM gap narrows.
       height and the partial-index `indexTuples` case, not `relpages`.
       ~~`costIndexScan` reads the real index geometry; retire
       `estimateIndexGeometry`'s synthesis.~~ *design: 08 §4.1.*
-- [ ] **P1-03** VACUUM **and autoanalyze** persist `reltuples`/`relpages`
-      durably; today both update memory only and the sidecar is written by SQL
-      `ANALYZE` alone, so an autovacuum-maintained cluster plans from stale
-      sizes after every restart. *design: 08 §4.1.*
+- [x] **P1-03** VACUUM persists `reltuples`/`relpages` durably — units,
+      `internal/{executor,catalog,optimizer}`. Confirmed exactly as recorded:
+      `catalog.UpdateRelStats` wrote memory only. `persistRelSize` is extracted
+      from `persistStatsToPGStatistic` and called from the VACUUM path.
+      Negative control, same table both arms:
+
+      | | after VACUUM | after restart |
+      |---|---|---|
+      | before | `222 / 0` | **`0 / 0`** |
+      | after | `222 / 50000` | **`222 / 50000`** |
+
+      Non-fatal on write failure: a VACUUM that has done its real work must not
+      fail on a statistics write, the same convention
+      `persistStatsToPGStatistic` uses for a column it cannot fit.
 - [ ] **P1-03b** `TRUNCATE` resets `Table.Stats`; `ANALYZE` invalidates the
       cached plans of the relations it touched (today it is planned as a
       `Utility` statement and only DDL invalidates). *design: 08 §4.1.*
@@ -368,8 +378,15 @@ slower than 1.2×, S-cold/WARM gap narrows.
       The walk direction is load-bearing and upstream explains why: values are
       REMOVED from the full list, never added to an empty one, or a column whose
       common values all share a frequency admits nothing.
-- [ ] **P1-09** Histogram bound count `min(stattarget, ndistinct - num_mcv)`
-      over the non-MCV portion. *design: 08 §4.2.*
+- [x] **P1-09** — **verified already satisfied**, no code change. goopg computes
+      `bucketCount = min(statsTarget, len(nonMCV)-1)` and emits `bucketCount+1`
+      bounds, i.e. `min(statsTarget+1, ndistinct − num_mcv)` — algebraically the
+      same as `analyze.c:2744-2746` (`num_hist = ndistinct − num_mcv; if
+      (num_hist > num_bins) num_hist = num_bins + 1`), and PG's `ndistinct`
+      there is the SAMPLE's distinct count, as goopg's is. Measured agreement on
+      all five probed columns after P1-08, including the `l_returnflag` case
+      where three distinct values are all MCVs and both engines emit no
+      histogram at all.
 - [ ] **P1-10** `compute_index_stats` for expression indexes. *design: 08 §4.2.*
 
 ### 1c — Statistics storage
