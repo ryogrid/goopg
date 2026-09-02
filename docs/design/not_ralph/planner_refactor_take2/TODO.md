@@ -946,11 +946,34 @@ not grow; no query slower than 1.2×.
       re-execution is NOT covered — `cost_rescan`'s T_CteScan/T_WorkTableScan
       arm has no goopg path kind to attach to yet, so that half of this item
       remains with Phase 4's upper-planner work.
-- [ ] **P2-08** `cost_subplan` in `(startup, total)` PG units with hashed and
+- [-] **P2-08** `cost_subplan` in `(startup, total)` PG units with hashed and
       non-hashed arms. *design: 08 §5.3.*
-- [ ] **P2-09** `btcostestimate` completeness: descent cost, `num_sa_scans` for
+      **PREMATURE — its output would feed nothing.** goopg has no SubPlan path
+      kind and no site where a subplan's cost reaches `addPath`. The existing
+      `estimateSubplanCostPerCall` (subplan_cost.go) is a ROW-COUNT proxy,
+      explicitly "ordering safety" only, and it has **zero production callers**:
+      of its 12 references, 11 are its own recursion and the 12th is a comment
+      in unnest.go:3734. Converting it to PG `(startup, total)` units today
+      would be writing a cost function nothing consults. The prerequisite is
+      that SubPlan costs participate in path comparison at all, which belongs
+      with Phase 4's upper-planner work.
+- [~] **P2-09** `btcostestimate` completeness: descent cost, `num_sa_scans` for
       ScalarArrayOp, the unique-index single-tuple clamp, per-tuple index qual
       cost. *design: 08 §5.3.*
+      **Descent cost was already present** (`btreeIndexAMCost`, tree height + 1
+      at 50 `cpu_operator_cost`). **The unique-index single-tuple clamp landed
+      2026-09-03**: a UNIQUE index with equality on every key column matches at
+      most one tuple, whatever the selectivity arithmetic says. The selectivity
+      route could not reach 1.0 on its own — it multiplies per-column estimates
+      that each carry a floor — so a multi-column unique probe was priced for a
+      range scan the index can never perform. `fullyBound` at
+      pathparamindex.go:360 is exactly PG's "equality on every key column"
+      precondition. Gates: TPC-H 237.34s (best of the session), 24 MATCH on
+      values; TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0,
+      verdict-changes none, **plan shapes: 99 same / 0 changed**, one runtime
+      move and it is faster (Q61 5s->2s).
+      Still open: `num_sa_scans` for ScalarArrayOp and the per-tuple index qual
+      cost.
 - [ ] **P2-10** `compute_semi_anti_join_factors` and the semi/anti early-out in
       nestloop and hashjoin costing. *design: 08 §5.3.*
 - [ ] **P2-11** `estimate_hash_bucket_stats`: bucket-size and MCV-frequency

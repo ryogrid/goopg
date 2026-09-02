@@ -270,3 +270,53 @@ func TestEffectiveCacheSizeMatchesConfigDefault(t *testing.T) {
 			got, boot, want)
 	}
 }
+
+// TestBtreeUniqueIndexClampsToOneTuple pins take2 P2-09's unique-index clamp
+// (btcostestimate, selfuncs.c): a UNIQUE index with an equality qual on every
+// key column matches at most one tuple, whatever the selectivity arithmetic
+// produces.
+//
+// The selectivity route cannot reach 1.0 on its own — it multiplies per-column
+// estimates that each carry their own floor — so before this a multi-column
+// unique probe was priced for a range scan the index can never perform.
+func TestBtreeUniqueIndexClampsToOneTuple(t *testing.T) {
+	cp := defaultCostParams()
+	in := indexScanInputs{
+		relPages:        1000,
+		relTuples:       100000,
+		indexPages:      300,
+		indexTuples:     100000,
+		treeHeight:      2,
+		selectivity:     0.01, // 1000 tuples by the arithmetic
+		totalTablePages: 1000,
+		loopCount:       1,
+	}
+
+	_, loose := btreeIndexAMCost(cp, in)
+	in.uniqueEqualityOnAllKeys = true
+	_, clamped := btreeIndexAMCost(cp, in)
+
+	if !(clamped < loose) {
+		t.Errorf("a unique index bound on every key column must cost LESS than "+
+			"the same scan priced for %g tuples: clamped=%v loose=%v",
+			in.selectivity*in.indexTuples, clamped, loose)
+	}
+
+	// It must land at the single-tuple price, not merely lower: one index page
+	// plus one index tuple plus the descent.
+	want := 1*cp.randomPageCost*indexProbeCostMultiplier +
+		1*cp.cpuIndexTupleCost +
+		float64(in.treeHeight+1)*pageCPUMultiplier*cp.cpuOperatorCost
+	if math.Abs(clamped-want) > 1e-9 {
+		t.Errorf("clamped index cost = %v, want %v (one page, one tuple, one descent)", clamped, want)
+	}
+
+	// The clamp must never RAISE a cost that was already below one tuple.
+	in.selectivity = 1e-9
+	_, tiny := btreeIndexAMCost(cp, in)
+	in.uniqueEqualityOnAllKeys = false
+	_, tinyUnclamped := btreeIndexAMCost(cp, in)
+	if tiny != tinyUnclamped {
+		t.Errorf("the clamp must not move a sub-one-tuple estimate: %v vs %v", tiny, tinyUnclamped)
+	}
+}

@@ -65,6 +65,12 @@ type indexScanInputs struct {
 	// slice generates (the search's clause list holds join clauses, and a
 	// clause used as an index qual would make the path parameterised).
 	selectivity float64
+
+	// uniqueEqualityOnAllKeys is `btcostestimate`'s unique-index clamp
+	// (selfuncs.c): a UNIQUE index with an equality qual on EVERY key column
+	// matches at most one tuple, whatever the selectivity arithmetic says.
+	// take2 P2-09.
+	uniqueEqualityOnAllKeys bool
 	// correlation is `indexCorrelation` — see indexCorrelationFor for why it
 	// is 0 for every index goopg has today.
 	correlation float64
@@ -187,6 +193,19 @@ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64
 	numIndexTuples := in.selectivity * in.indexTuples
 	if numIndexTuples < 0 {
 		numIndexTuples = 0
+	}
+	// The unique-index clamp (btcostestimate, selfuncs.c). PG:
+	//
+	//	if (index->unique && indexBoundQuals != NIL && eqQualHere &&
+	//	    <equality on every key column>)
+	//	        numIndexTuples = 1.0;
+	//
+	// The selectivity route cannot reach 1.0 on its own here: it multiplies
+	// per-column estimates that each carry their own floor, so a multi-column
+	// unique probe came out well above one tuple and the index path was priced
+	// for a range scan it can never perform. take2 P2-09.
+	if in.uniqueEqualityOnAllKeys && numIndexTuples > 1 {
+		numIndexTuples = 1
 	}
 	numIndexPages := 1.0
 	if in.indexPages > 1 && in.indexTuples > 1 {

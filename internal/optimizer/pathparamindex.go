@@ -382,7 +382,12 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		indexTuples:     indexTuples,
 		treeHeight:      treeHeight,
 		selectivity:     sel,
-		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		// take2 P2-09: a unique index bound by equality on every key column
+		// yields at most one tuple. `fullyBound` is exactly PG's "equality on
+		// every key column" precondition — it is what parameterizedIndexSelectivity
+		// already takes for the same reason.
+		uniqueEqualityOnAllKeys: idx != nil && idx.Unique && fullyBound,
+		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 		totalTablePages: totalPages,
 		loopCount:       s.loopCountFor(req),
 	})
