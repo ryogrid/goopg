@@ -781,6 +781,18 @@ not grow; no query slower than 1.2×.
       that budget. Whether it was never generated or was priced higher is the
       next measurement (instrument `addPath`). P4-01 is a plausible contributor,
       not a proven blocker.
+      **ROOT CAUSE FOUND (same day, via DPPATH): the merge join is costed on
+      POST-filter rows while it emits PRE-filter rows.** Both candidates ARE
+      generated for the flipping relation `{2,4}`; the merge path is simply
+      under-priced. `joinpathsmerge.go:362` passes `joinrel.Rows` where PG
+      passes `mergejointuples` — its own comment names the right quantity. The
+      merge emits 24,989,610 tuples and is charged 77,016 for them (0.0031/tuple
+      against a `cpu_tuple_cost` of 0.01); 6,001,255 x 0.01 = 60,012 is the
+      charge actually made. Merge cost is work_mem-independent, hash cost is not,
+      so at PG's budget the hash path (1,906,774) crosses the under-priced merge
+      path (826,630) and Q9 goes 15.4s -> 187s. Full evidence and the fix:
+      `impl/FINDING-mergejoin-costed-on-postfilter-rows.md`. Fixing it is the
+      prerequisite for P2-02b, and P2-02b's cost is that fix's acceptance test.
 - [ ] **P2-02c** Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner
