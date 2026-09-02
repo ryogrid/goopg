@@ -390,14 +390,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// defaults; with one we apply the file's entries on top.
 	registry := misc.BuildDefaultRegistry()
 
-	// M0054-0006e-followup: bridge SQL `SET enable_nestloop_index =
-	// off|on` to the planner's process-global atomic kill-switch.
-	// Sessions can now toggle the rule at runtime; the most-recent
-	// SET wins process-wide (matches the package-level `atomic.Bool`
-	// design).
-	registry.OnChange("enable_nestloop_index", func(value string) {
-		optimizer.SetNLIEnabled(value == "on" || value == "true" || value == "1")
-	})
+	// take2 P2-02c: enable_nestloop_index no longer bridges to a process
+	// global either. All six planner-method bridges are gone; each of them let
+	// the most-recent SET win process-wide, steering every other session's
+	// plans. optimizer.SetNLIEnabled survives as the test hook and the env
+	// default DefaultPlannerSettings seeds from.
 	// `enable_memoize` NO LONGER bridges to a process global (take2 P2-02c).
 	// It did, and that made `SET enable_memoize = off` in one session disable
 	// Memoize for every other session on the server — the most-recent SET won

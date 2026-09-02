@@ -1352,7 +1352,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// on the inner side AND the cost gate accepts. The pass is a
 	// no-op when the package-level kill-switch is off
 	// (`SetNLIEnabled(false)`).
-	node = rewriteJoinsToNLI(node, cat)
+	node = rewriteJoinsToNLI(node, cat, plannerSet)
 	node = remapColumnRefsAfterRewrite(node)
 	// Second pass: use FROM‑clause bindings to correct any
 	// remaining order differences (OID ≠ FROM order).

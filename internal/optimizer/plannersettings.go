@@ -73,6 +73,10 @@ type PlannerSettings struct {
 	Geqo                     bool
 	GeqoThreshold            int
 
+	// EnableNestLoopIndex is goopg's `enable_nestloop_index`, the last of the
+	// six P2-02c bridges.
+	EnableNestLoopIndex bool
+
 	// EnableMemoize is `enable_memoize`. take2 P2-02c.
 	//
 	// It used to reach the planner through a registry.OnChange bridge in
@@ -105,6 +109,7 @@ func DefaultPlannerSettings() PlannerSettings {
 
 		EnableHashAgg:            HashAggEnabled(),
 		EnablePresortedAggregate: PresortedAggEnabled(),
+		EnableNestLoopIndex:      NLIEnabled(),
 		Geqo:                     GeqoEnabled(),
 		GeqoThreshold:            GeqoThreshold(),
 		SeqPageCost:        cp.seqPageCost,

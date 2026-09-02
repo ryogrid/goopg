@@ -817,7 +817,7 @@ not grow; no query slower than 1.2×.
       budget the plan moves onto index-scan-driven joins, which goopg's parallel
       post-pass cannot drive because it only recognises sequential scans, so the
       Gather is lost too — Phase 5. See P4-A rev 4.
-- [~] **P2-02c** *(5 of 6 landed; only `enable_nestloop_index` remains)* Move the six process-global GUC bridges
+- [x] **P2-02c** *(all 6 landed; zero registry.OnChange bridges remain)* Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner
       context. Today a `SET` in one session changes the planner for every
@@ -839,10 +839,13 @@ not grow; no query slower than 1.2×.
       deleted; verified live that a session's SET no longer changes what a fresh
       session reads, and that `SET enable_hashagg=off` still yields
       GroupAggregate. TPC-H 240.52s, 24 MATCH.
-      Only **`enable_nestloop_index`** remains: its consumer is
-      `rewriteJoinsToNLI(n, cat)`, a LEGACY rewrite pass with no `costParams` in
-      scope, so it needs the settings threaded through the legacy arm rather
-      than a one-line change like the others.
+      **`enable_nestloop_index` followed too, and it WAS a one-liner** — the
+      note here previously called it harder on the grounds that
+      `rewriteJoinsToNLI` has no `costParams` in scope. It does not need one:
+      its single caller sits in `planSelectWithSettings`, where `plannerSet` is
+      already in scope. Threading the parameter was the whole change.
+      **Zero `registry.OnChange` bridges remain.** Verified live: after one
+      session sets all six to off, a fresh session reads `on` for every one.
       Note the seed convention this established: a process global now supplies
       only the DEFAULT for a planner call with no session
       (`DefaultPlannerSettings` reads `HashAggEnabled()` / `GeqoEnabled()` /

@@ -63,6 +63,11 @@ func nliCostGateLegacyFromEnv(v string) bool { return v == "legacy" }
 
 // SetNLIEnabled flips the M0054-0006 NLI rule on or off. Test-
 // only API; the production toggle path is the GUC mentioned above.
+// NLIEnabled reports the process-wide enable_nestloop_index SEED — the value a
+// planner call with no session defaults to (take2 P2-02c), not what a session's
+// SET reads.
+func NLIEnabled() bool { return nliEnabled.Load() }
+
 func SetNLIEnabled(on bool) {
 	nliEnabled.Store(on)
 }
@@ -81,11 +86,12 @@ const nliMaxOuterRowsHeuristic int64 = 100000
 // itself is rewritten). Catalog is needed to look up indexes.
 // The package-level kill-switch `nliEnabled` short-circuits the
 // walk when off.
-func rewriteJoinsToNLI(n Node, cat catalog.Catalog) Node {
+func rewriteJoinsToNLI(n Node, cat catalog.Catalog, ps PlannerSettings) Node {
 	if n == nil || cat == nil {
 		return n
 	}
-	if !nliEnabled.Load() {
+	// take2 P2-02c: per-statement, not the process global.
+	if !ps.EnableNestLoopIndex {
 		return n
 	}
 	// Historical note: this walk once had a blanket skip under

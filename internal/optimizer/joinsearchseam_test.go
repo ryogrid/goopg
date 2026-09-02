@@ -450,7 +450,7 @@ func TestSearchedTreeIsOpaqueToTheLegacyRewrites(t *testing.T) {
 
 	t.Run("rewriteJoinsToNLI", func(t *testing.T) {
 		searched := build()
-		if out := rewriteJoinsToNLI(searched, stubCatalogForSeam{}); out != searched {
+		if out := rewriteJoinsToNLI(searched, stubCatalogForSeam{}, DefaultPlannerSettings()); out != searched {
 			t.Fatalf("the NLI pass re-decided the method on a searched tree (%T)", out)
 		}
 	})
