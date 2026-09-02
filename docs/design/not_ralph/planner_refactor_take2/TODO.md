@@ -285,12 +285,27 @@ slower than 1.2×, S-cold/WARM gap narrows.
 
 ### 1a — Relation and index statistics
 
-- [ ] **P1-01** ANALYZE and VACUUM collect and persist per-index `relpages`,
-      `reltuples` and btree tree height; the catalog index carries them.
-      *design: 08 §4.1; oracle: `vac_update_relstats`, `_bt_getrootheight`.*
-- [ ] **P1-02** `costIndexScan` reads the real index geometry; retire
-      `estimateIndexGeometry`'s synthesis. *design: 08 §4.1; gate: plan-parity
-      both suites + timing (this moves index-vs-bitmap crossovers).*
+- [x] **P1-01** *(catalog half)* — index `relpages`/`reltuples` in `pg_class`
+      were hard-wired `"0"` / `"-1"`; they now report real figures. Verified
+      against the bench clusters: `part_pk` 497 pages / 200000 tuples (PG: 551 /
+      200000), `orders_pk` 3707 (PG: 4116). Gates: `internal/{catalog,executor,
+      optimizer}`, units.
+      **Correction to the item as written:** goopg does **not** need to *persist*
+      relpages. It reads the live block count through `catalog.IndexRealPages` →
+      `RelNBlocksFunc`, which is what `get_relation_info` does upstream
+      (`RelationGetNumberOfBlocks`, plancat.c) — there is nothing to keep in
+      sync. This change also **proves that path resolves correctly on a real
+      cluster**, which answers P1-02: the planner was already receiving real
+      index page counts, so `estimateIndexGeometry`'s width-derived synthesis is
+      already superseded whenever storage can answer.
+      *Still open under this item:* btree tree height is derived from the page
+      fanout rather than read via a `_bt_getrootheight` analogue, and
+      `indexTuples` is assumed equal to heap tuples (correct for a complete
+      non-partial index, wrong for a partial one).
+- [ ] **P1-02** *(rescoped by the above)* — the remaining synthesis is tree
+      height and the partial-index `indexTuples` case, not `relpages`.
+      ~~`costIndexScan` reads the real index geometry; retire
+      `estimateIndexGeometry`'s synthesis.~~ *design: 08 §4.1.*
 - [ ] **P1-03** VACUUM **and autoanalyze** persist `reltuples`/`relpages`
       durably; today both update memory only and the sidecar is written by SQL
       `ANALYZE` alone, so an autovacuum-maintained cluster plans from stale
