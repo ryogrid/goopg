@@ -33,8 +33,14 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 	case *BinaryOp:
 		switch e.Op {
 		case parser.OpAnd:
-			// Independence assumption — upstream's default.
-			return clauseSelectivity(e.Left, child) * clauseSelectivity(e.Right, child)
+			// Independence is upstream's default for UNRELATED clauses, but
+			// two inequalities on the SAME variable are not independent:
+			// `x >= a AND x < b` selects the band between them, not the
+			// product of two tail fractions. clauselist_selectivity pairs them
+			// (clausesel.c); conjunctionSelectivity is that pairing, and it
+			// falls back to the independent product for everything else.
+			// take2 P1-13.
+			return conjunctionSelectivity(splitConjuncts(e, nil), child)
 		case parser.OpOr:
 			a := clauseSelectivity(e.Left, child)
 			b := clauseSelectivity(e.Right, child)
