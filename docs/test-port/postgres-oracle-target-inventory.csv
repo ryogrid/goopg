@@ -386,88 +386,88 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,isolation-specs,isolation,postgres/src/test/isolation/specs/vacuum-no-cleanup-lock.spec,pass,yes,-,Promoted to pass-required via runIsoSpecStrict TestPort_IsolationVacuumNoCleanupLock (internal/testport/isolation_port_test.go); matches PG 18.3 byte-for-byte across all generated permutations. M0118.
 ,isolation-specs,isolation,postgres/src/test/isolation/specs/vacuum-skip-locked.spec,pass,yes,-,Promoted to pass-required via runIsoSpecStrict TestPort_IsolationVacuumSkipLocked (internal/testport/isolation_port_test.go); matches PG 18.3 byte-for-byte across all generated permutations. M0118.
 R-001,recovery-tap,tap,postgres/src/test/recovery/t/001_stream_rep.pl,port,yes,-,Ported as TestPort_Recovery001StreamRep in internal/testport/recovery_port_test.go
-,recovery-tap,tap,postgres/src/test/recovery/t/002_archiving.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/003_recovery_targets.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/004_timeline_switch.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/005_replay_delay.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/006_logical_decoding.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/007_sync_rep.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/008_fsm_truncation.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/009_twophase.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/010_logical_decoding_timelines.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/012_subtransactions.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/002_archiving.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/003_recovery_targets.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/004_timeline_switch.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/005_replay_delay.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/006_logical_decoding.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/007_sync_rep.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/008_fsm_truncation.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/009_twophase.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/010_logical_decoding_timelines.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/012_subtransactions.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
 R-013,recovery-tap,tap,postgres/src/test/recovery/t/013_crash_restart.pl,port,yes,-,Ported as TestPort_Recovery013CrashRestart in internal/testport/recovery_port_test.go
-,recovery-tap,tap,postgres/src/test/recovery/t/014_unlogged_reinit.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/015_promotion_pages.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/016_min_consistency.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/017_shm.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/018_wal_optimize.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/014_unlogged_reinit.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/015_promotion_pages.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/016_min_consistency.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/017_shm.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/018_wal_optimize.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
 R-019,recovery-tap,tap,postgres/src/test/recovery/t/019_replslot_limit.pl,port,yes,-,Ported as TestPort_Recovery019ReplslotLimit in internal/testport/recovery_port_test.go
-,recovery-tap,tap,postgres/src/test/recovery/t/020_archive_status.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/021_row_visibility.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/022_crash_temp_files.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/023_pitr_prepared_xact.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/024_archive_recovery.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/026_overwrite_contrecord.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/027_stream_regress.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/028_pitr_timelines.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/029_stats_restart.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/030_stats_cleanup_replica.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/031_recovery_conflict.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/032_relfilenode_reuse.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/033_replay_tsp_drops.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/034_create_database.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/035_standby_logical_decoding.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/036_truncated_dropped.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/037_invalid_database.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/020_archive_status.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/021_row_visibility.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/022_crash_temp_files.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/023_pitr_prepared_xact.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/024_archive_recovery.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/026_overwrite_contrecord.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/027_stream_regress.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/028_pitr_timelines.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/029_stats_restart.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/030_stats_cleanup_replica.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/031_recovery_conflict.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/032_relfilenode_reuse.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/033_replay_tsp_drops.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/034_create_database.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/035_standby_logical_decoding.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/036_truncated_dropped.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/037_invalid_database.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
 R-038,recovery-tap,tap,postgres/src/test/recovery/t/038_save_logical_slots_shutdown.pl,port,yes,-,Ported as TestPort_Recovery038SaveLogicalSlots in internal/testport/recovery_port_test.go
 R-039,recovery-tap,tap,postgres/src/test/recovery/t/039_end_of_wal.pl,port,yes,-,Ported as TestPort_Recovery039EndOfWal in internal/testport/recovery_port_test.go
-,recovery-tap,tap,postgres/src/test/recovery/t/040_standby_failover_slots_sync.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/041_checkpoint_at_promote.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/042_low_level_backup.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/043_no_contrecord_switch.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/044_invalidate_inactive_slots.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/045_archive_restartpoint.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
-,recovery-tap,tap,postgres/src/test/recovery/t/046_checkpoint_logical_slot.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/040_standby_failover_slots_sync.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/041_checkpoint_at_promote.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/042_low_level_backup.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/043_no_contrecord_switch.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/044_invalidate_inactive_slots.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/045_archive_restartpoint.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/046_checkpoint_logical_slot.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
 R-047,recovery-tap,tap,postgres/src/test/recovery/t/047_checkpoint_physical_slot.pl,port,yes,-,Ported as TestPort_Recovery047CheckpointPhysicalSlot in internal/testport/recovery_port_test.go
-,recovery-tap,tap,postgres/src/test/recovery/t/048_vacuum_horizon_floor.pl,failed,no,M0094,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
+,recovery-tap,tap,postgres/src/test/recovery/t/048_vacuum_horizon_floor.pl,not-tried,no,-,Requires replication/failover/recovery semantics not yet fully implemented in goopg v0.
 S-001,subscription-tap,tap,postgres/src/test/subscription/t/001_rep_changes.pl,port,yes,-,Ported as TestPort_Subscription001RepChanges in internal/testport/subscription_port_test.go
-,subscription-tap,tap,postgres/src/test/subscription/t/002_types.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/003_constraints.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/002_types.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/003_constraints.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
 S-004,subscription-tap,tap,postgres/src/test/subscription/t/004_sync.pl,port,yes,-,Ported as TestPort_Subscription004Sync in internal/testport/subscription_port_test.go
-,subscription-tap,tap,postgres/src/test/subscription/t/005_encoding.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/006_rewrite.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/007_ddl.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/008_diff_schema.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/009_matviews.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/010_truncate.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/011_generated.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/012_collation.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/013_partition.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/014_binary.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/015_stream.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/016_stream_subxact.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/017_stream_ddl.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/018_stream_subxact_abort.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/019_stream_subxact_ddl_abort.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/020_messages.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/021_twophase.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/022_twophase_cascade.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/023_twophase_stream.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/024_add_drop_pub.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/025_rep_changes_for_schema.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/005_encoding.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/006_rewrite.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/007_ddl.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/008_diff_schema.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/009_matviews.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/010_truncate.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/011_generated.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/012_collation.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/013_partition.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/014_binary.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/015_stream.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/016_stream_subxact.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/017_stream_ddl.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/018_stream_subxact_abort.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/019_stream_subxact_ddl_abort.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/020_messages.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/021_twophase.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/022_twophase_cascade.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/023_twophase_stream.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/024_add_drop_pub.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/025_rep_changes_for_schema.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
 S-026,subscription-tap,tap,postgres/src/test/subscription/t/026_stats.pl,port,yes,-,Ported as TestPort_Subscription026Stats in internal/testport/subscription_port_test.go
-,subscription-tap,tap,postgres/src/test/subscription/t/027_nosuperuser.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/028_row_filter.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/029_on_error.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/030_origin.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/031_column_list.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/032_subscribe_use_index.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/033_run_as_table_owner.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/034_temporal.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/035_conflicts.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
-,subscription-tap,tap,postgres/src/test/subscription/t/100_bugs.pl,failed,no,M0094,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/027_nosuperuser.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/028_row_filter.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/029_on_error.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/030_origin.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/031_column_list.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/032_subscribe_use_index.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/033_run_as_table_owner.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/034_temporal.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/035_conflicts.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
+,subscription-tap,tap,postgres/src/test/subscription/t/100_bugs.pl,not-tried,no,-,Requires logical replication/subscription semantics not yet fully implemented in goopg v0.
 P-001,client-tools-tap,tap,postgres/src/bin/initdb/t/001_initdb.pl,port,yes,-,Ported to go test as TestPort_Initdb001 in internal/testport/tap_port_test.go
 AC-001,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/001_basic.pl,port,yes,-,Ported as TestPort_PgAmcheck001Basic in internal/testport/pgamcheck_port_test.go (M0110-0003); the pure CLI option-handling tier (program_help_ok/program_version_ok/program_options_handling_ok) — decided by the upstream binary's arg parser before any server connection. Runs the bundled pg_amcheck with LD_LIBRARY_PATH at postgres/local_install/lib (it links PQcancelBlocking which the host libpq may lack). The server-dependent tests are deferred under AC-002.
 AC-002,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/002_nonesuch.pl,port,yes,-,Ported as TestPort_PgAmcheck002Nonesuch in internal/testport/pgamcheck002_port_test.go (M0110-0003): drives the bundled pg_amcheck against a live goopg cluster with CREATE EXTENSION amcheck and the full faithful command_checks_all assertion set (non-existent database/role rejection; unresolvable and substring/superstring --database pattern errors; per-database amcheck-installed skip warnings; ungrammatical dotted-name rejection). Promotion required closing a sequence of general SQL/engine gaps surfaced empirically by pg_amcheck's bootstrap queries: `index` as a CTE name (parser); VALUES-list-as-CTE column derivation (analyzer); non-existent-database connect rejection 3D000 plus template1/template0 registration; fewer-column CTE alias lists; correlated LATERAL c.oid resolution into a FROM-clause SRF; row-valued IS [NOT] NULL semantics for the database-name pattern filter; non-existent-role connection rejection 28000; and per-database pg_extension scoping so amcheck installed in one database is invisible in another (gap #7c). 002_nonesuch needs no verify_heapam() — it is pattern-resolution only. The port also covers the later sections: the big --no-strict-names multi-pattern case (per-argument-kind warnings — no-heap-tables/no-btree-indexes/no-relations/no-connectable-databases — anchored by the existent postgres.pg_catalog.pg_class so exit stays 0) and the cross-database existent-objects-in-the-wrong-database case (template1/another_db/no_such_database). The port now also covers the final --exclude-schema sections (.pl :377-418): both --all --exclude-schema cases (exit 1 no-relations-to-check) — whose exclude-CTE anti-join previously panicked the backend with a build-side column-index out-of-range in the toast sub-CTE — now run to completion after the LEFT JOIN inner-only pushdown shift/classify completion fix (commit 36a085dc M0110-0003 residual #2: shiftColumnRefsBy + walkColumnRefs now enumerate every sub-expr-bearing Expr kind so the inner IS NULL ref is rebased to the build slot width). The final residual — the datconnlimit=-2 invalid-database filter — is now also ported: catalog.InMemory gained a runtime datconnlimit override (SetDatabaseConnLimit/DatabaseConnLimit) plus a dedicated pg_database Virtual-table UPDATE path (updateOp.nextVirtualPgDatabase — since pg_database has no physical heap for the generic UPDATE machinery to rewrite) so `UPDATE pg_database SET datconnlimit = -2 WHERE datname = ...` persists and pg_amcheck's own datconnlimit != -2 filter excludes the invalid database. 002_nonesuch.pl is now fully ported with no remaining residuals (M-NIGHTLY AI-20260707-000712-004 follow-up).
