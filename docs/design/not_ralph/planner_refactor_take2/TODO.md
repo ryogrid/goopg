@@ -150,7 +150,9 @@ reports `changed=0` against a pre-P0 goopg capture.
       `plan_snapshots/take2-p0-<date>.txt`; update `stage-tpch.sh:234`'s
       `LABEL=`; update the hardcoded label in `summarize.py:689`.
       *design: 08 §3 P0-4.*
-- [ ] **P0-09** **Rescoped (impl/P0-B §6).** Change the oracle timer to
+- [x] **P0-09** Oracle timer at millisecond resolution — `71653da23`; gate:
+      `bash -n`. Per the rescope, **no re-capture was triggered**.
+      ~~Rescoped (impl/P0-B §6). Change the oracle timer to
       millisecond resolution (`scripts/tpcds-sf05-regression.sh:498-500`), but
       do **not** trigger a re-capture for it. Corrections: **54** of 95 `OK`
       rows read `0`, not 83; and field 5 (`secs`) is read by *nothing* — the
@@ -306,14 +308,18 @@ slower than 1.2×, S-cold/WARM gap narrows.
 - [ ] **P1-12** Port `clauselist_selectivity` as a real function (replacing the
       inlined AND product), with `RestrictInfo` selectivity caching.
       *design: 08 §4.4; oracle: `clausesel.c`.*
-- [ ] **P1-13** `RangeQueryClause` pairing: `x > a AND x < b` on one variable
-      estimated as `s1 + s2 - 1` with the `DEFAULT_RANGE_INEQ_SEL` floor.
-      With P1-11b this takes a TPC-H Q6-shaped one-year window from ~0.31 to
-      the true ~0.14. *design: 08 §4.4; gate: plan-parity + timing.*
-- [ ] **P1-14** `nulltestsel` — `IS NULL` / `IS NOT NULL` has no arm at all and
-      falls to a generic default, so the `NullFrac` ANALYZE collects and
-      persists is never read for the one clause it exists to answer.
-      *design: 08 §4.4.*
+- [x] **P1-13** `RangeQueryClause` pairing — `71653da23`; gates: three unit
+      tests, units. Measured on lineitem, one-year window:
+      **1 855 086 -> 902 018 against an actual 910 180** (2.04x over -> 0.9%
+      under). **Timing was NEUTRAL**: full 24-item A/B 253.51 s -> 254.65 s
+      (+0.45 %, inside noise), row counts identical. Recorded as a negative
+      result: on this corpus a 2x cardinality correction on the driving scan
+      did not change which plan wins, because the shape is constrained by
+      things this does not touch (Phases 3-6).
+- [x] **P1-14** `nulltestsel` — `13430fc3a`; gates: two unit tests, units.
+      Confirmed exactly as recorded. Also makes expressible the
+      `nulltestsel(IS_NULL)` term P1-13 had to omit; wiring it into the pairing
+      is a follow-up.
 - [ ] **P1-14b** Remaining per-clause estimators: general `scalararraysel`,
       `patternsel` for LIKE/regex beyond the access-path prefix rewrite,
       `rowcomparesel`, `booltestsel`, `var_eq_non_const`; align every
@@ -612,7 +618,7 @@ One row per closed phase. Numbers come from the 09 §6.6 artifact header.
 |---|---|---|---|---|---|---|---|
 | baseline | 2026-08-31 | `82c05a5f6` … `6c65ceb20` | 227.0 s / 22.9 s = 9.9× | 1173 s / 536 s = 2.2× | not measured (spine `shape_mismatches` = 46) | not measured | starting state; see 07 §2 |
 | P0 (partial) | 2026-09-02 | `f2ac4fdfc` … `8c3e9ac3c` | A/B on this tree: 288.10 s → **257.75 s** (−10.5 %) | not re-measured | instrument built, roll-up not yet captured (P0-05/06/07 open) | not measured | Instruments only — no planner behaviour changed in P0-01…P0-04d. The timing move comes from `f07c20b1f`, a **statistics** fix found *by* the instrument. The 288.10 s control is this A/B's own and is **not** comparable to the 227.0 s baseline (different binary and histogram state). See [analysis/planner-refactor-take2/perf-20260902-pgstatistic-decode.md](../../../../analysis/planner-refactor-take2/perf-20260902-pgstatistic-decode.md). |
-| P1 | | | | | | | |
+| P1 (partial) | 2026-09-02 | `f07c20b1f` … `13430fc3a` | 288.10 s → **257.75 s** (−10.5 %) from `f07c20b1f`; P1-13/P1-14 timing-neutral | not re-measured | not yet captured | not measured | P1-11c is the whole timing move. P1-13 corrected a 2.04× cardinality error to 0.9 % with **no time change** — recorded as a negative result, not buried. See [perf-20260902-cumulative.md](../../../../analysis/planner-refactor-take2/perf-20260902-cumulative.md). |
 | P2 | | | | | | | |
 | P3 | | | | | | | |
 | P4 | | | | | | | |
