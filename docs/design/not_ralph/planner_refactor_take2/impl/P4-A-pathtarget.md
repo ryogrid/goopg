@@ -174,3 +174,60 @@ per-rel is adequate — but this constrains slice 2, since `build_joinrel_tlist`
 is inherently per-joinrel and `calcJoinrelSize`'s rows-once discipline
 (`joinrelsize.go:105-117`) will resist it. That gap is already ledgered there in
 the same terms.
+
+---
+
+## 11. Revision 3 (2026-09-03) — this item is the corpus blocker, and it is now quantified
+
+Revision 2 justified this work on Q14 and Q3. Measurement since has shown the
+scope is far wider: **the missing projection is what makes goopg's memory
+budget load-bearing**, and it blocks P2-02b and the remaining P2-02
+propagation slices. Evidence in
+`FINDING-planner-settings-not-propagated.md`; the numbers, taken on the same
+cluster at the same `work_mem = 64MB x hash_mem_multiplier 2`:
+
+| | PostgreSQL 18.3 | goopg |
+|---|---|---|
+| tuple widths through Q9's join tree | 23 / 32 / 54 / 81 B | 1542 / 2616 / 3164 B |
+| peak hash memory | 38 MB, `Batches: 1` throughout | 97 MB, `Batches: 8` |
+| rows through the middle join | ~319 k | 24,005,020 |
+| Q9 | 6.2 s | 187 s |
+
+**≈39x wider tuples at the same point in the same plan.** A hash table over them
+needs ~39x the memory for the same rows, so goopg batches at a budget where
+PostgreSQL does not, and its multi-batch path costs two orders of magnitude.
+
+### What this changes about the plan
+
+- goopg's headline TPC-H numbers depend on a `work_mem` default of 512 MB — 8x
+  PostgreSQL's — which is roughly the headroom a 39x-wide tuple needs to stay
+  single-batch on this corpus. P2-03's 37 % win was bought the same way, by
+  doubling the budget rather than by fixing a mis-costing.
+- Correcting `work_mem` to PostgreSQL's 4 MB (P2-02b) removes that headroom, so
+  P2-02b is blocked **here**, not on the settings plumbing.
+- Propagating real session settings into derived tables is correct and was
+  hand-verified to build and pass the unit suites, but it costs Q9
+  15.4 s -> 187 s for the same reason and must land *after* this item.
+
+### Mechanism note for the next attempt
+
+The reverted P4-01b attempt narrowed the **leaf** schema, which moved the join
+search's seam offsets and returned wrong answers (Q2 418 -> 0 rows, Q5 5 -> 0,
+Q18 different tuples) while being 3.6 % *faster* and matching 21 of 24 queries.
+Two lessons carry forward:
+
+1. Narrowing must not change the coordinate space the seam maps through. A real
+   `PathTarget` — projection expressed as a property of the path, with
+   `setrefs`-style fixup at `create_plan` time — is the mechanism; rewriting the
+   leaf's `Output()` is not.
+2. **Gate on values, not row counts.** Row counts alone would have passed Q18.
+   `cmd/tpch-runner -digest` + `-diff` is the required gate, on all 24 items.
+
+### Sequencing
+
+1. This item (`PathTarget` + projection).
+2. The derived-table / set-op / scalar-subquery propagation slices — a two-line
+   change each once the width is fixed (`planSelectWithParent` takes the
+   settings and calls `planSelectWithSettings`; `planSubqueryRangeVar` forwards
+   them).
+3. P2-02b, which should be close to free once 1 and 2 are in.
