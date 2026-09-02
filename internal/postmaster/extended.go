@@ -704,7 +704,7 @@ func (s *Server) describeViaPlanner(query string, sess *misc.SessionRegistry, db
 	// with search_path/enable_seqscan/temp overrides could see the two disagree.
 	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
 	var node optimizer.Node
-	if s.pc != nil && !plannerScanTogglesActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+	if s.pc != nil && !plannerSessionInputsActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid)); ok {
 			node = cached
 		} else {

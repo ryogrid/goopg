@@ -497,7 +497,20 @@ not grow; no query slower than 1.2×.
       *design: 08 §5.1; gate: a cross-session isolation test.*
 - [ ] **P2-03** `hash_mem_multiplier` consumed via a `get_hash_memory_limit`
       analogue, shared with the executor's `hashsize`. *design: 08 §5.1.*
-- [ ] **P2-04** **PREREQUISITE OF P2-02, not a later item** *(established
+- [x] **P2-04** Plan-cache correctness under live cost GUCs — gates:
+      `TestPlannerCostGUCsOverriddenDetectsEveryCostGUC`,
+      `TestPlannerSessionInputsActiveCoversBothFamilies`, the existing
+      `TestPlannerScanTogglesActiveDetectsEveryToggle`, units,
+      `internal/{postmaster,utils/misc,optimizer}`. Landed **before** P2-02, per
+      the ordering the P2-A review established. A session that has SET any of
+      the nine cost GUCs now neither reads from nor writes to the shared cache,
+      exactly as a scan-toggle session already did. Detection is by
+      **override**, not by value: comparing against `BootVal` would mean parsing
+      unit strings (`4GB` vs `4194304kB`) and would wrongly clear a session that
+      SET a GUC to its default — the test pins that case explicitly. The four
+      guard sites now call one predicate, `plannerSessionInputsActive`, so a
+      third family cannot be added without every site picking it up.
+      ~~**PREREQUISITE OF P2-02, not a later item** *(established
       2026-09-02 by review of impl/P2-A)*. `internal/postmaster/plancache.go:42`
       is a server-level cross-session cache keyed on
       `(dbOid, normalizeCompatSQL(sql))` with **no GUC fingerprint**
@@ -505,8 +518,10 @@ not grow; no query slower than 1.2×.
       `plannerScanTogglesActive` (`dispatch.go:1786`), checks four *scan* GUCs
       and none of the nine *cost* GUCs. P2-02 converts `dispatch.go:1161`, which
       sits inside the cache-guarded block — so P2-02 without this would let one
-      session's `random_page_cost` leak into another session's cached plan.
-      Plan-cache correctness under live GUCs — the planner context is
+      session's `random_page_cost` leak into another session's cached plan.~~
+      *Remaining under this item:* the planner context as part of the cache KEY
+      (rather than a bypass), and removing the bypass once keyed.
+      ~~Plan-cache correctness under live GUCs — the planner context is
       part of the cache key, or a GUC change invalidates; a test asserts
       `SET random_page_cost` changes the cached plan. Removes the
       `plannerScanTogglesActive` bypass. *design: 08 §5.1, risk R7.*

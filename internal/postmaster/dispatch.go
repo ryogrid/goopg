@@ -1152,7 +1152,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// plan, cache, then execute.
 		var precached optimizer.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !plannerScanTogglesActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !plannerSessionInputsActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -1794,6 +1794,49 @@ func plannerScanTogglesActive(sess *misc.SessionRegistry) bool {
 		}
 	}
 	return false
+}
+
+// plannerCostGUCsOverridden reports whether the session has SET any GUC that
+// feeds the planner's cost model.
+//
+// take2 P2-04, and a PREREQUISITE of P2-02 rather than a follow-up to it. The
+// plan cache is server-level and cross-session, keyed on
+// (dbOid, normalized SQL) with no GUC fingerprint. Until P2-01 the nine cost
+// GUCs were inert — defaultCostParams() was hard-wired — so every session
+// planned identically and the cache was safe by accident. The moment P2-02
+// makes the postmaster fill PlannerSettings from the session, a plan costed
+// under one connection's `random_page_cost` becomes servable to every other
+// connection. This is the same hazard, and the same remedy, as
+// plannerScanTogglesActive above: a session with its own planner inputs neither
+// reads from nor writes to the shared cache.
+//
+// The list is the nine cost GUCs PlannerSettings carries. It is checked by
+// OVERRIDE rather than by value, because comparing against BootVal would mean
+// parsing unit strings and would wrongly clear a session that SET a GUC to its
+// default.
+func plannerCostGUCsOverridden(sess *misc.SessionRegistry) bool {
+	if sess == nil {
+		return false
+	}
+	for _, name := range [...]string{
+		"seq_page_cost", "random_page_cost",
+		"cpu_tuple_cost", "cpu_index_tuple_cost", "cpu_operator_cost",
+		"parallel_setup_cost", "parallel_tuple_cost",
+		"effective_cache_size", "work_mem",
+	} {
+		if sess.HasSessionOverride(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// plannerSessionInputsActive is the single predicate the plan-cache guards use:
+// true when this session carries ANY planner input the cache key does not
+// capture. Keeping the two families behind one name means a third family cannot
+// be added later without every guard site picking it up.
+func plannerSessionInputsActive(sess *misc.SessionRegistry) bool {
+	return plannerScanTogglesActive(sess) || plannerCostGUCsOverridden(sess)
 }
 
 func sessionPlanCatalog(sess *misc.SessionRegistry, base catalog.Catalog, dbOid uint32) catalog.Catalog {
