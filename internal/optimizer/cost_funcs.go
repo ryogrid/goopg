@@ -93,7 +93,11 @@ func defaultCostParams() costParams {
 		// 524288. config/defaults.go registers the string form; the unit
 		// conversion is pinned by TestEffectiveCacheSizeMatchesConfigDefault.
 		effectiveCacheSize: 4 * 1024 * 1024 * 1024 / blockSizeBytes,
-		workMem:            hashsize.DefaultMemLimitBytes,
+		// take2 P2-03: the budget is work_mem * hash_mem_multiplier
+		// (get_hash_memory_limit), expressed through the SAME helper the
+		// executor's buildGeometry calls. Writing the bare default here again
+		// is what let the two drift apart in the first place.
+		workMem: hashsize.HashMemLimit(hashsize.DefaultMemLimitBytes, hashsize.DefaultHashMemMultiplier),
 	}
 }
 

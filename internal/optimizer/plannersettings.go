@@ -1,5 +1,7 @@
 package optimizer
 
+import "github.com/goopg/goopg/internal/executor/hashsize"
+
 // PlannerSettings is the per-statement planner context: the session-settable
 // values goopg's cost model reads, PG's PlannerGlobal analogue.
 //
@@ -42,6 +44,12 @@ type PlannerSettings struct {
 	// WorkMem is in BYTES. The GUC is registered `UnitKB` with BootVal
 	// "512MB"; same conversion caveat as above.
 	WorkMem int64
+
+	// HashMemMultiplier is `hash_mem_multiplier`. A hash build's budget is
+	// `work_mem * hash_mem_multiplier` (get_hash_memory_limit,
+	// nodeHash.c:3622), NOT work_mem alone — take2 P2-03. Zero means "use the
+	// default", so a zero-valued PlannerSettings still prices hashes sanely.
+	HashMemMultiplier float64
 }
 
 // DefaultPlannerSettings returns the settings a statement plans under when no
@@ -61,7 +69,13 @@ func DefaultPlannerSettings() PlannerSettings {
 		ParallelSetupCost:  cp.parallelSetupCost,
 		ParallelTupleCost:  cp.parallelTupleCost,
 		EffectiveCacheSize: cp.effectiveCacheSize,
-		WorkMem:            cp.workMem,
+		// The RAW work_mem, not cp.workMem: costParams() applies the
+		// multiplier itself, and cp.workMem has already had it applied. Taking
+		// it from there would square the multiplier — caught by
+		// TestDefaultPlannerSettingsMatchTheHardWiredParams, which is what that
+		// round-trip invariant is for.
+		WorkMem:           hashsize.DefaultMemLimitBytes,
+		HashMemMultiplier: hashsize.DefaultHashMemMultiplier,
 	}
 }
 
@@ -81,6 +95,9 @@ func (ps PlannerSettings) costParams() costParams {
 		parallelSetupCost:  ps.ParallelSetupCost,
 		parallelTupleCost:  ps.ParallelTupleCost,
 		effectiveCacheSize: ps.EffectiveCacheSize,
-		workMem:            ps.WorkMem,
+		// The cost model's hash budget is work_mem * hash_mem_multiplier, the
+		// same figure the executor's buildGeometry solves for. Computing it
+		// here rather than at each cost site keeps the two on one expression.
+		workMem: hashsize.HashMemLimit(ps.WorkMem, ps.HashMemMultiplier),
 	}
 }

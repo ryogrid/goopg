@@ -758,8 +758,23 @@ not grow; no query slower than 1.2×.
       context. Today a `SET` in one session changes the planner for every
       session, while a cached plan may ignore the same `SET`.
       *design: 08 §5.1; gate: a cross-session isolation test.*
-- [ ] **P2-03** `hash_mem_multiplier` consumed via a `get_hash_memory_limit`
-      analogue, shared with the executor's `hashsize`. *design: 08 §5.1.*
+- [x] **P2-03** `hash_mem_multiplier` — gate:
+      `TestHashMemMultiplierReachesTheBudget`, the existing
+      `TestCostParamsWorkMemMatchesExecutorFallback` sibling guard, units.
+      goopg budgeted a hash build at `work_mem` **alone**; PG's budget is
+      `work_mem × hash_mem_multiplier` (`get_hash_memory_limit`,
+      nodeHash.c:3622). With PG's default of 2.0, **every hash table in goopg
+      had half the memory PostgreSQL would give it** — at the aligned
+      `work_mem = 64MB`, a 64MB budget against PG's 128MB. That is a second,
+      independent reason a build PG keeps in one batch spills here, alongside
+      the missing projection (P4-01).
+      `hashsize.HashMemLimit` is the single shared expression; planner and
+      executor both call it, as they both call `Choose`.
+      Two things the invariant tests caught: `defaultCostParams` still wrote the
+      bare default, and `DefaultPlannerSettings` took its `WorkMem` from the
+      already-multiplied `cp.workMem`, **squaring** the multiplier. Also added
+      to the P2-04 cache guard, since it changes plans exactly as `work_mem`
+      does.
 - [x] **P2-04** Plan-cache correctness under live cost GUCs — gates:
       `TestPlannerCostGUCsOverriddenDetectsEveryCostGUC`,
       `TestPlannerSessionInputsActiveCoversBothFamilies`, the existing

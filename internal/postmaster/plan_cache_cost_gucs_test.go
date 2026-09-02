@@ -29,7 +29,7 @@ var costGUCs = []string{
 	"seq_page_cost", "random_page_cost",
 	"cpu_tuple_cost", "cpu_index_tuple_cost", "cpu_operator_cost",
 	"parallel_setup_cost", "parallel_tuple_cost",
-	"effective_cache_size", "work_mem",
+	"effective_cache_size", "work_mem", "hash_mem_multiplier",
 }
 
 func TestPlannerCostGUCsOverriddenDetectsEveryCostGUC(t *testing.T) {

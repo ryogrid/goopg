@@ -188,7 +188,12 @@ func TestHashJoinCost_SpillDependsOnFitNotOnSize(t *testing.T) {
 // two drift, every hash join is priced for a table size the executor will not
 // build.
 func TestCostParamsWorkMemMatchesExecutorFallback(t *testing.T) {
-	if got, want := defaultCostParams().workMem, hashsize.EffectiveMemLimit(0); got != want {
+	// take2 P2-03: the executor's fallback budget is now
+	// HashMemLimit(work_mem, hash_mem_multiplier), not EffectiveMemLimit
+	// alone — buildGeometry calls the same helper. The sibling-path invariant
+	// this test guards is unchanged; only the expression both sides use moved.
+	if got, want := defaultCostParams().workMem,
+		hashsize.HashMemLimit(0, hashsize.DefaultHashMemMultiplier); got != want {
 		t.Fatalf("planner work_mem = %d, executor fallback = %d", got, want)
 	}
 }

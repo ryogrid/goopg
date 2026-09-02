@@ -133,6 +133,38 @@ func EntryBytes(ncols int, avgVarBytes float64) float64 {
 // that want the honest unlimited behaviour pass workMem straight to Choose
 // instead; callers sizing a real allocation want a finite number, because an
 // unlimited budget lets a bad row estimate presize an arbitrarily large map.
+// HashMemLimit is upstream's `get_hash_memory_limit`
+// (postgres/src/backend/executor/nodeHash.c:3622):
+//
+//	mem_limit = work_mem * hash_mem_multiplier * 1024
+//
+// take2 P2-03. goopg budgeted a hash build at `work_mem` alone, so with PG's
+// default `hash_mem_multiplier = 2.0` every hash table in goopg had HALF the
+// memory PostgreSQL would give it. At the aligned `work_mem = 64MB` that is a
+// 64MB budget against PG's 128MB — one of the reasons a build that PG keeps in
+// a single batch spills in goopg.
+//
+// Both the planner's cost model and the executor's sizing must call this, for
+// the same reason they both call Choose: a budget they disagree on prices a
+// geometry that will not be built.
+func HashMemLimit(workMem int64, hashMemMultiplier float64) int64 {
+	if hashMemMultiplier <= 0 {
+		hashMemMultiplier = DefaultHashMemMultiplier
+	}
+	base := EffectiveMemLimit(workMem)
+	lim := float64(base) * hashMemMultiplier
+	// "Clamp in case it doesn't fit in size_t" — nodeHash.c:3630.
+	if lim > float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(lim)
+}
+
+// DefaultHashMemMultiplier is PG 18's `hash_mem_multiplier` boot value
+// (guc_tables.c); goopg registers the same default in
+// internal/utils/misc/defaults.go.
+const DefaultHashMemMultiplier = 2.0
+
 func EffectiveMemLimit(workMem int64) int64 {
 	if workMem > 0 {
 		return workMem

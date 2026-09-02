@@ -1852,6 +1852,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readFloat("cpu_operator_cost", &ps.CPUOperatorCost)
 	readFloat("parallel_setup_cost", &ps.ParallelSetupCost)
 	readFloat("parallel_tuple_cost", &ps.ParallelTupleCost)
+	readFloat("hash_mem_multiplier", &ps.HashMemMultiplier)
 
 	// work_mem: KB -> BYTES. The same conversion sessionWorkMem applies for the
 	// executor's hash sizing — planner and executor must agree, which is what
@@ -1905,6 +1906,10 @@ func plannerCostGUCsOverridden(sess *misc.SessionRegistry) bool {
 		"cpu_tuple_cost", "cpu_index_tuple_cost", "cpu_operator_cost",
 		"parallel_setup_cost", "parallel_tuple_cost",
 		"effective_cache_size", "work_mem",
+		// take2 P2-03: hash_mem_multiplier scales the hash budget, so it
+		// changes plans exactly as work_mem does and must take a session off
+		// the shared cache for the same reason.
+		"hash_mem_multiplier",
 	} {
 		if sess.HasSessionOverride(name) {
 			return true

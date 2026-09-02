@@ -118,7 +118,13 @@ func TestHashJoinSpillIsIdentityToMemoryJoin(t *testing.T) {
 		t.Fatalf("precondition: the in-memory join emitted nothing")
 	}
 
-	got, bs := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 512<<10)
+	// take2 P2-03 halved this from 512 KiB. A hash build's budget is
+	// `work_mem * hash_mem_multiplier` (get_hash_memory_limit,
+	// nodeHash.c:3622), and goopg was budgeting `work_mem` alone; with the
+	// multiplier now applied at PG's default of 2.0, the old figure buys twice
+	// the memory and the build no longer batches. The test wants a MULTI-BATCH
+	// build, so the number that produces one moves with the budget rule.
+	got, bs := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 256<<10)
 	if bs == nil {
 		t.Fatalf("precondition: the bounded arm did not batch — work_mem is not being honoured")
 	}

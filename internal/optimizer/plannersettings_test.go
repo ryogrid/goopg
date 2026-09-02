@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -180,7 +181,7 @@ func TestCostGUCConversionIsTotal(t *testing.T) {
 		SeqPageCost: 1.5, RandomPageCost: 2.5,
 		CPUTupleCost: 3.5, CPUIndexTupleCost: 4.5, CPUOperatorCost: 5.5,
 		ParallelSetupCost: 6.5, ParallelTupleCost: 7.5,
-		EffectiveCacheSize: 8.5, WorkMem: 9,
+		EffectiveCacheSize: 8.5, WorkMem: 9, HashMemMultiplier: 2.0,
 	}
 	cp := ps.costParams()
 	for _, c := range []struct {
@@ -195,10 +196,47 @@ func TestCostGUCConversionIsTotal(t *testing.T) {
 		{"parallel_setup_cost", cp.parallelSetupCost, ps.ParallelSetupCost},
 		{"parallel_tuple_cost", cp.parallelTupleCost, ps.ParallelTupleCost},
 		{"effective_cache_size", cp.effectiveCacheSize, ps.EffectiveCacheSize},
-		{"work_mem", float64(cp.workMem), float64(ps.WorkMem)},
+		// take2 P2-03: workMem is no longer carried through unchanged — the
+		// cost model's budget is work_mem * hash_mem_multiplier
+		// (get_hash_memory_limit), so the conversion asserts the DERIVED
+		// figure. Asserting equality here would pin the pre-P2-03 behaviour.
+		{"work_mem (as the hash budget)", float64(cp.workMem),
+			float64(hashsize.HashMemLimit(ps.WorkMem, ps.HashMemMultiplier))},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s dropped in conversion: got %v, want %v", c.name, c.got, c.want)
 		}
+	}
+}
+
+// TestHashMemMultiplierReachesTheBudget pins take2 P2-03. A hash build's
+// budget is `work_mem * hash_mem_multiplier` (get_hash_memory_limit,
+// nodeHash.c:3622). goopg budgeted `work_mem` alone, so with PG's default
+// multiplier of 2.0 every hash table in goopg had HALF the memory PostgreSQL
+// would give it — at the aligned work_mem=64MB, a 64MB budget against PG's
+// 128MB, which is one reason a build PG keeps in one batch spills here.
+func TestHashMemMultiplierReachesTheBudget(t *testing.T) {
+	ps := DefaultPlannerSettings()
+	if ps.HashMemMultiplier != hashsize.DefaultHashMemMultiplier {
+		t.Errorf("default multiplier = %v, want %v",
+			ps.HashMemMultiplier, hashsize.DefaultHashMemMultiplier)
+	}
+	// The planner's budget must be work_mem * multiplier, not work_mem.
+	ps.WorkMem = 64 << 20
+	ps.HashMemMultiplier = 2.0
+	if got, want := ps.costParams().workMem, int64(128<<20); got != want {
+		t.Errorf("costParams workMem = %d, want %d (64MB * 2.0)", got, want)
+	}
+	// A session that raises it gets more, which is the point of the GUC.
+	ps.HashMemMultiplier = 4.0
+	if got, want := ps.costParams().workMem, int64(256<<20); got != want {
+		t.Errorf("at multiplier 4.0 workMem = %d, want %d", got, want)
+	}
+	// Zero means "use the default", so a zero-valued PlannerSettings still
+	// prices hashes sanely rather than at zero bytes.
+	ps.HashMemMultiplier = 0
+	if got := ps.costParams().workMem; got <= 0 {
+		t.Errorf("zero multiplier produced a %d-byte budget; it must fall back "+
+			"to the default", got)
 	}
 }
