@@ -756,12 +756,34 @@ One row per closed phase. Numbers come from the 09 §6.6 artifact header.
 | baseline | 2026-08-31 | `82c05a5f6` … `6c65ceb20` | 227.0 s / 22.9 s = 9.9× | 1173 s / 536 s = 2.2× | not measured (spine `shape_mismatches` = 46) | not measured | starting state; see 07 §2 |
 | P0 (partial) | 2026-09-02 | `f2ac4fdfc` … `8c3e9ac3c` | A/B on this tree: 288.10 s → **257.75 s** (−10.5 %) | not re-measured | instrument built, roll-up not yet captured (P0-05/06/07 open) | not measured | Instruments only — no planner behaviour changed in P0-01…P0-04d. The timing move comes from `f07c20b1f`, a **statistics** fix found *by* the instrument. The 288.10 s control is this A/B's own and is **not** comparable to the 227.0 s baseline (different binary and histogram state). See [analysis/planner-refactor-take2/perf-20260902-pgstatistic-decode.md](../../../../analysis/planner-refactor-take2/perf-20260902-pgstatistic-decode.md). |
 | P1 (partial) | 2026-09-02 | `f07c20b1f` … `13430fc3a` | 288.10 s → **257.75 s** (−10.5 %) from `f07c20b1f`; P1-13/P1-14 timing-neutral | not re-measured | not yet captured | not measured | P1-11c is the whole timing move. P1-13 corrected a 2.04× cardinality error to 0.9 % with **no time change** — recorded as a negative result, not buried. See [perf-20260902-cumulative.md](../../../../analysis/planner-refactor-take2/perf-20260902-cumulative.md). |
-| P2 | | | | | | | |
+| P2 (partial) | 2026-09-02 | `6b503e47c` … `78ef045c8` | control moves 248.71 s → **403.27 s** — see note | not re-measured | not yet captured | 95 PASS / 0 MISMATCH (SF0.5 gate, first run this session) | P2-01/P2-04/P2-02 landed in the **corrected order** (P2-04 before P2-02, reversing the bundle). `SET random_page_cost` now changes a plan. The timing move is **P0-12**, not a regression: aligning `work_mem` 512MB→64MB with the PG reference removed an 8× memory advantage goopg had been measured with, so 403.27 s is the first *honest* control. It also exposed the bottleneck — see [FINDING-workmem-advantage.md](impl/FINDING-workmem-advantage.md). |
 | P3 | | | | | | | |
 | P4 | | | | | | | |
 | P5 | | | | | | | |
 | P6 | | | | | | | |
 | P7 | | | | | | | |
+
+### Priority change established by measurement, 2026-09-02
+
+The `DPPATH` trace (P0-11) gave the search's own numbers for TPC-H Q14 and
+settled where the remaining gap lives:
+
+```
+producer=index.ordered relids={0} rows=6001255 total=657623.09  accepted
+producer=mergejoin     relids={0,1}            total=754717.55  accepted
+producer=join.hash     relids={0,1}            total=1811944.24 dominated
+```
+
+goopg's `part` rows are **548 bytes** where PostgreSQL's are **6**, because
+there is no `PathTarget` — so the hash table is ~50× oversized, batches at
+64 MB, and a merge join over a full 6 M-row index scan wins on cost. 13.9 s
+against PG's 1.08 s.
+
+**P4-01 is therefore promoted ahead of the rest of Phase 1 and all of Phase 3.**
+Design: [impl/P4-A-pathtarget.md](impl/P4-A-pathtarget.md). Three A/Bs had
+already shown that refining *cardinality* did not move TPC-H time; this explains
+why — the binding constraint is on the **cost** side, and specifically on the
+widths fed into it.
 
 ## Dropped and deferred
 
