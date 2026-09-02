@@ -53,6 +53,23 @@ if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
         echo "listen_addresses = '127.0.0.1'"
         echo "port = ${PG_PORT}"
         echo "shared_buffers = 2048MB"
+        # take2 P0-12: match the PG reference cluster's PLANNER-VISIBLE memory
+        # settings, so a goopg-vs-PG comparison measures the planner rather than
+        # a memory budget. Before this, PG ran with work_mem=64MB /
+        # effective_cache_size=2GB while goopg left both at its boot defaults
+        # (512MB / 4GB) — an 8x work_mem advantage to goopg, which made every
+        # work_mem-sensitive cost comparison between the engines meaningless.
+        #
+        # Only meaningful since P2-01/P2-02: before those, work_mem reached the
+        # EXECUTOR but not the planner, so setting it here would have made the
+        # two disagree — the hazard cost_funcs.go's workMem comment names.
+        #
+        # shared_buffers is deliberately NOT aligned. goopg's buffer arena is a
+        # Go-heap object under GOMEMLIMIT (M0032-0001); shrinking it to PG's
+        # 512MB would measure Go's GC behaviour, not the planner. It is recorded
+        # as a permitted divergence rather than drift.
+        echo "work_mem = 64MB"
+        echo "effective_cache_size = 2GB"
         # M0057-0002: suppress mid-benchmark checkpoints. 24-hour time
         # threshold and 1 TiB WAL threshold are both unreachable in a
         # 2-hour SF=1 power test. A manual CHECKPOINT is issued before

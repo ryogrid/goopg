@@ -190,7 +190,19 @@ reports `changed=0` against a pre-P0 goopg capture.
       `DPTRACE` lines as `Malformed`, so a lone emitter would look like a
       regression in the existing instrument. *design: 09 §1 R4; gate: units,
       `Malformed == 0`.*~~
-- [!] **P0-12** **BLOCKED on P2-02 — the recorded ordering is unsafe.**
+- [x] **P0-12** Bench-cluster memory alignment — landed after P2-02 unblocked
+      it. `work_mem` 512MB→64MB and `effective_cache_size` 4GB→2GB, matching the
+      PG reference cluster. **Result: goopg is 62 % SLOWER (248.71 s →
+      403.27 s), row counts identical** — see
+      [impl/FINDING-workmem-advantage.md](impl/FINDING-workmem-advantage.md).
+      The recorded 9.9× headline was measured with goopg holding an 8×
+      `work_mem` advantage; the honest ratio is nearer **17.6×**. Q14 slows 24×,
+      Q3 11×, Q10 4× — and PG runs all three in about a second at the *same*
+      setting, so **the dominant remaining cost is the executor's spill path,
+      not the planner**. The alignment is kept: the faster arm was measuring a
+      configuration advantage. `shared_buffers` stays divergent by design
+      (Go-heap arena under GOMEMLIMIT).
+      ~~**BLOCKED on P2-02 — the recorded ordering is unsafe.**
       *(established 2026-09-02 by reading the code, not yet acted on.)*
       Setting `work_mem = 64MB` in goopg's bench conf would make the
       **executor** honour 64MB (`hashsize.EffectiveMemLimit` reads the session)
@@ -219,7 +231,10 @@ reports `changed=0` against a pre-P0 goopg capture.
       (impl/P0-B §2.2), and wider than recorded:** `shared_buffers` is also 4×
       apart (PG 512MB, goopg 2GB). It cannot change a plan (`effective_cache_size`
       is the cost-model input) but it changes runtime, so it is aligned too.
-      All other cost/collapse/parallel GUCs were verified identical.~~ Do this **before**
+      All other cost/collapse/parallel GUCs were verified identical.~~
+- [ ] **P2-02b** *(now unblocked)* — with P0-12 landed, the `work_mem` BootVal
+      correction 512MB→4MB can proceed. **Expect it to be large**: dropping
+      512MB→64MB already cost 62 %, and 4MB is a further 16×. Do this **before**
       P2-02b, which changes the boot default — doing P2-02b first would swing
       goopg from 8× more memory to 16× less and read as a catastrophic
       regression that is really a configuration change. *design: 09 §6.4; gate:
