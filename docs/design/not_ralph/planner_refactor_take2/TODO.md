@@ -1038,10 +1038,21 @@ not grow; no query slower than 1.2×.
       Gates: TPC-H **234.51s** (best of the bundle, from 237.34s), 24 MATCH on
       values. TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0,
       verdict-changes none, **aggregate -1.2%**, 88 plan shapes changed.
-      **Two queries breach the P2 exit bar of "no query slower than 1.2x":
-      Q76 2s->5s (2.5x) and Q12 4s->8s (2.0x).** Both are small in absolute
-      terms and near the gate's integer-second floor, but they are real and are
-      follow-up work, not noise to be waved through.
+      *The two apparent regressions were NOT regressions.* The sweep read
+      Q76 2s->5s (2.5x) and Q12 4s->8s (2.0x), which breach the P2 exit bar of
+      "no query slower than 1.2x", and the landing commit recorded them as real
+      follow-up work. Investigated immediately afterwards: **both plans are
+      BYTE-IDENTICAL between the two builds**, in the full sweeps and in an
+      isolated re-run alike, and re-run alone the timings are Q76 2s->2s (no
+      change at all) and Q12 3s->4s. This change moved 88 plan shapes; it did
+      not move these two. Same plan and same data cannot be a cost regression —
+      it is sweep-context variance (server age, cache, GC), the "sweep-tail
+      collapse" trap this repo already records.
+      The lesson is the procedure, not the outcome: **a per-query runtime move
+      is only attributable if that query's PLAN changed.** The sweep's
+      STATUS-DELTA arm reports timing moves without consulting the plan capture
+      sitting beside it, so it will keep naming queries whose plans are
+      identical. Check the plan before believing a per-query move.
       *Baseline hygiene, worth repeating:* the sweep script diffs against the
       most recent report, which was P2-09's REVERTED qual-cost run (1152s). That
       flattered this change to -4.3%. The honest figure is against the last
