@@ -902,9 +902,25 @@ not grow; no query slower than 1.2×.
       per flag, plan-parity + timing.*
 - [ ] **P2-06** `cost_material` and a Material path; the merge-join
       materialise-inner decision becomes a cost comparison. *design: 08 §5.3.*
-- [ ] **P2-07** `cost_rescan` — nested-loop inner and CTE re-execution stop
+- [x] **P2-07** `cost_rescan` — nested-loop inner and CTE re-execution stop
       being free. *design: 08 §5.3; gate: plan-parity + timing; expect NL
       counts to move.*
+      **Landed 2026-09-03.** The defect was the opposite of the item's framing:
+      a rescan was not free, it was charged the inner's FULL total_cost —
+      startup included — on every outer row. `cost_nestloop` charges
+      `inner_run_cost + (outer_rows-1) * inner_rescan_run_cost`, both RUN costs
+      (costsize.c:3304-3327), so the inner's startup is paid once. goopg paid it
+      `outerRows` times, which could only make a nested loop look too EXPENSIVE
+      — so the shapes it suppressed were never observed. `pathRescanCost` is
+      `cost_rescan` (costsize.c:4638) with the Material/Sort arm
+      (`cpu_operator_cost` per tuple, plus a re-read charge on spill) and the
+      default re-execute arm; the Memoize arm already existed.
+      Gates: TPC-H 243.58s against 239.72s (inside the ~1.7% drift), 24 MATCH on
+      values; TPC-DS SF0.5 **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0**,
+      verdict-changes none, one runtime move (Q94 7s->2s FASTER). CTE
+      re-execution is NOT covered — `cost_rescan`'s T_CteScan/T_WorkTableScan
+      arm has no goopg path kind to attach to yet, so that half of this item
+      remains with Phase 4's upper-planner work.
 - [ ] **P2-08** `cost_subplan` in `(startup, total)` PG units with hashed and
       non-hashed arms. *design: 08 §5.3.*
 - [ ] **P2-09** `btcostestimate` completeness: descent cost, `num_sa_scans` for

@@ -401,14 +401,30 @@ func spillPages(rows float64, ncols int, avgVarBytes float64) float64 {
 // innerRows is the INNER PATH's own row count (`inner_path->rows`), so for a
 // parameterised NLI inner it is the per-probe count (`ppi_rows`), not the
 // relation's total — the same number the caller's `qualEvalCost` uses.
-func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanTotal float64) Cost {
+func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanStartup, innerRescanTotal float64) Cost {
 	startup := outer.Startup + inner.Startup
 	// PG's clamp sits at the top of final_cost_nestloop and so reaches only
 	// the tuple count, not the rescan term `initial_cost_nestloop` already
 	// accumulated: a zero path row count would otherwise zero the whole
 	// per-tuple charge.
 	ntuples := math.Max(outerRows, 1) * math.Max(innerRows, 1)
-	run := (outer.Total - outer.Startup) + outerRows*innerRescanTotal + cp.cpuTupleCost*ntuples
+	// take2 P2-07, cost_nestloop (costsize.c:3304-3327):
+	//
+	//     inner_run_cost        = inner.total - inner.startup
+	//     inner_rescan_run_cost = rescan.total - rescan.startup
+	//     run_cost += inner_run_cost
+	//     if outer_path_rows > 1:
+	//         run_cost += (outer_path_rows - 1) * inner_rescan_run_cost
+	//
+	// The inner is scanned ONCE and rescanned outerRows-1 times, and both are
+	// RUN costs: the inner's startup is paid once, at the join's startup, and
+	// was previously being charged again on every outer row.
+	innerRun := inner.Total - inner.Startup
+	innerRescanRun := innerRescanTotal - innerRescanStartup
+	run := (outer.Total - outer.Startup) + innerRun + cp.cpuTupleCost*ntuples
+	if outerRows > 1 {
+		run += (outerRows - 1) * innerRescanRun
+	}
 	return Cost{Startup: startup, Total: startup + run}
 }
 

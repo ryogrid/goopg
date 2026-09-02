@@ -247,7 +247,8 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			// where the inner's unparameterised total would be charged per
 			// outer row. `pathRescanTotal` is the one place that knows a
 			// Memoize wrapper answers differently.
-			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, pathRescanTotal(in))
+			rescanStartup, rescanTotal := pathRescanCost(in, cp)
+			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rescanStartup, rescanTotal)
 			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
 			addPath(joinrel, &Path{
 				Kind:     PathNestLoop,

@@ -369,11 +369,55 @@ func memoizeKeyNDistinct(s *searchCtx, innerPath *Path, outerRelids RelSet) (flo
 // inner cost", rather than a conditional at each call site that could be
 // updated in one place and not the other.
 func pathRescanTotal(p *Path) float64 {
+	st, tot := pathRescanCost(p, defaultCostParams())
+	_ = st
+	return tot
+}
+
+// pathRescanCost is `cost_rescan` (costsize.c:4638): what it costs to run this
+// path AGAIN, which for several node types is far less than running it the
+// first time. take2 P2-07.
+//
+// Before this, every rescan but Memoize's was priced at the path's full
+// total_cost — startup included, on every outer row. A nested loop over an
+// inner that materialises (a Sort, say) was therefore charged its build cost
+// once per outer row, when re-reading stored tuples is all that actually
+// happens. That is a one-directional error: it can only make a nested loop look
+// too EXPENSIVE, so the shapes it suppressed were never seen.
+//
+//	T_Material / T_Sort — "even cheaper to rescan than the ones above. We
+//	charge only cpu_operator_cost per tuple" (costsize.c:4703-4712), plus a
+//	re-read charge when the sort spills.
+//	default — the path is re-executed from scratch: (startup, total) unchanged.
+func pathRescanCost(p *Path, cp costParams) (startup, total float64) {
 	if p == nil {
-		return 0
+		return 0, 0
 	}
-	if p.Kind == PathMemoize && p.MemoizeInfo != nil {
-		return p.MemoizeInfo.rescan.Total
+	switch {
+	case p.Kind == PathMemoize && p.MemoizeInfo != nil:
+		return p.MemoizeInfo.rescan.Startup, p.MemoizeInfo.rescan.Total
+	case p.Kind == PathSort:
+		run := cp.cpuOperatorCost * p.Rows
+		// The spill arm: a sort that did not fit work_mem must be re-read from
+		// disk, so the rescan pays for the pages too (costsize.c:4718-4726).
+		if nbytes := relationByteSize(p.Rows, pathAvgVarBytes(p), pathNCols(p)); nbytes > float64(cp.workMem) {
+			run += cp.seqPageCost * math.Ceil(nbytes/blockSizeBytes)
+		}
+		return 0, run
+	default:
+		return p.Cost.Startup, p.Cost.Total
 	}
-	return p.Cost.Total
+}
+
+// relationByteSize is `relation_byte_size` (costsize.c): rows x per-tuple
+// width, the same figure the sort and hash sizing already solve for.
+func relationByteSize(rows, avgVarBytes float64, ncols int) float64 {
+	w := avgVarBytes
+	if w <= 0 {
+		// No width stats: fall back to the column count at the same per-column
+		// figure hashsize.EntryBytes assumes, rather than inventing a second
+		// width model.
+		w = float64(ncols) * 8
+	}
+	return rows * w
 }
