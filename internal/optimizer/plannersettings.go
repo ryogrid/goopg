@@ -45,6 +45,25 @@ type PlannerSettings struct {
 	// "512MB"; same conversion caveat as above.
 	WorkMem int64
 
+	// EnableHashJoin / EnableMergeJoin / EnableNestLoop are PG's enable_*
+	// planner-method GUCs. take2 P2-05.
+	//
+	// PG does NOT implement these by skipping a producer — it still generates
+	// the path and increments `path->disabled_nodes` (PG 18's replacement for
+	// the old disable_cost), so a query whose ONLY legal plan uses a disabled
+	// method still gets that plan rather than failing. `Path.DisabledNodes` and
+	// the dominance ordering that reads it already existed here; nothing set
+	// them, so all three GUCs were accepted, shown in pg_settings, and had no
+	// effect whatsoever.
+	//
+	// Zero value is false, which would mean "disabled". DefaultPlannerSettings
+	// sets all three true, and every path that builds a PlannerSettings by hand
+	// must start from it rather than from the zero value — the same rule the
+	// cost fields already carry.
+	EnableHashJoin  bool
+	EnableMergeJoin bool
+	EnableNestLoop  bool
+
 	// HashMemMultiplier is `hash_mem_multiplier`. A hash build's budget is
 	// `work_mem * hash_mem_multiplier` (get_hash_memory_limit,
 	// nodeHash.c:3622), NOT work_mem alone — take2 P2-03. Zero means "use the
@@ -61,6 +80,9 @@ type PlannerSettings struct {
 func DefaultPlannerSettings() PlannerSettings {
 	cp := defaultCostParams()
 	return PlannerSettings{
+		EnableHashJoin:  true,
+		EnableMergeJoin: true,
+		EnableNestLoop:  true,
 		SeqPageCost:        cp.seqPageCost,
 		RandomPageCost:     cp.randomPageCost,
 		CPUTupleCost:       cp.cpuTupleCost,
@@ -99,5 +121,11 @@ func (ps PlannerSettings) costParams() costParams {
 		// same figure the executor's buildGeometry solves for. Computing it
 		// here rather than at each cost site keeps the two on one expression.
 		workMem: hashsize.HashMemLimit(ps.WorkMem, ps.HashMemMultiplier),
+		// P2-05: the producers take costParams, not PlannerSettings, so the
+		// method toggles ride along with the cost inputs they are weighed
+		// against.
+		enableHashJoin:  ps.EnableHashJoin,
+		enableMergeJoin: ps.EnableMergeJoin,
+		enableNestLoop:  ps.EnableNestLoop,
 	}
 }

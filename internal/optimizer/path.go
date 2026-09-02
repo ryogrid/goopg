@@ -783,3 +783,25 @@ func setCheapest(rel *RelOptInfo) {
 	rel.CheapestTotal = cheapestTotal
 	rel.CheapestParameterized = parameterized
 }
+
+// disabledNodesFor is PG 18's `disabled_nodes` accumulation
+// (pathnode.c: a path's count is the sum of its children's plus one if this
+// node's method is disabled by an enable_* GUC).
+//
+// PG deliberately does NOT skip the producer: a disabled method still yields a
+// path, so a query whose only legal plan needs that method still plans. The
+// dominance order in comparePathCosts prefers fewer disabled nodes before it
+// looks at cost, which is what makes the GUC a strong preference rather than a
+// prohibition. take2 P2-05.
+func disabledNodesFor(disabled bool, children ...*Path) int {
+	n := 0
+	for _, c := range children {
+		if c != nil {
+			n += c.DisabledNodes
+		}
+	}
+	if disabled {
+		n++
+	}
+	return n
+}

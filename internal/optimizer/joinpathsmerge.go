@@ -384,7 +384,8 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 	cost.Total += qualEvalCost(cp, len(residual), mergeTuples)
 
 	addPath(joinrel, &Path{
-		Kind:     PathMergeJoin,
+		Kind:          PathMergeJoin,
+		DisabledNodes: disabledNodesFor(!cp.enableMergeJoin, op, ip),
 		Rel:      joinrel,
 		Rows:     joinrel.Rows,
 		Cost:     cost,

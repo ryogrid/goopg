@@ -78,6 +78,13 @@ type costParams struct {
 	// session in scope (the same gap `ParallelSettings` exists to bridge for
 	// the parallel post-pass). Deferral ledger 2026-08-05 M0127-P5.7-a.
 	workMem int64
+
+	// enable* are PG's planner-method GUCs (take2 P2-05). True means the
+	// method is enabled; a disabled method still PRODUCES its path and
+	// increments Path.DisabledNodes, as PG 18 does.
+	enableHashJoin  bool
+	enableMergeJoin bool
+	enableNestLoop  bool
 }
 
 func defaultCostParams() costParams {
@@ -97,7 +104,10 @@ func defaultCostParams() costParams {
 		// (get_hash_memory_limit), expressed through the SAME helper the
 		// executor's buildGeometry calls. Writing the bare default here again
 		// is what let the two drift apart in the first place.
-		workMem: hashsize.HashMemLimit(hashsize.DefaultMemLimitBytes, hashsize.DefaultHashMemMultiplier),
+		workMem:         hashsize.HashMemLimit(hashsize.DefaultMemLimitBytes, hashsize.DefaultHashMemMultiplier),
+		enableHashJoin:  true,
+		enableMergeJoin: true,
+		enableNestLoop:  true,
 	}
 }
 

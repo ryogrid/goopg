@@ -93,6 +93,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
 	addPath(joinRel, &Path{
 		Kind:          PathHashJoin,
+		DisabledNodes: disabledNodesFor(!cp.enableHashJoin, p, b),
 		Rel:           joinRel,
 		Rows:          joinRel.Rows,
 		Cost:          cost,
@@ -126,8 +127,9 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, i.Cost.Total)
 	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
-		Kind:     PathNestLoop,
-		Rel:      joinRel,
+		Kind:          PathNestLoop,
+		DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, i),
+		Rel:           joinRel,
 		Rows:     joinRel.Rows,
 		Cost:     cost,
 		Children: []*Path{o, i},

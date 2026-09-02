@@ -1887,6 +1887,26 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readFloat("parallel_tuple_cost", &ps.ParallelTupleCost)
 	readFloat("hash_mem_multiplier", &ps.HashMemMultiplier)
 
+	// take2 P2-05: the planner-method toggles. These were registered GUCs with
+	// no consumer anywhere outside the pg_settings view — `SET
+	// enable_hashjoin = off` was accepted and did nothing. They set
+	// Path.DisabledNodes rather than skipping a producer, which is PG 18's own
+	// mechanism: a query whose only legal plan uses a disabled method still
+	// gets that plan.
+	readBool := func(name string, dst *bool) {
+		if eff, ok := get(name); ok {
+			switch strings.ToLower(strings.TrimSpace(eff)) {
+			case "on", "true", "yes", "1":
+				*dst = true
+			case "off", "false", "no", "0":
+				*dst = false
+			}
+		}
+	}
+	readBool("enable_hashjoin", &ps.EnableHashJoin)
+	readBool("enable_mergejoin", &ps.EnableMergeJoin)
+	readBool("enable_nestloop", &ps.EnableNestLoop)
+
 	// work_mem: KB -> BYTES. The same conversion sessionWorkMem applies for the
 	// executor's hash sizing — planner and executor must agree, which is what
 	// cost_funcs.go's workMem comment demands.
@@ -1943,6 +1963,9 @@ func plannerCostGUCsOverridden(sess *misc.SessionRegistry) bool {
 		// changes plans exactly as work_mem does and must take a session off
 		// the shared cache for the same reason.
 		"hash_mem_multiplier",
+		// take2 P2-05: the method toggles change plans exactly as the cost
+		// GUCs do, so they must take a session off the shared cache too.
+		"enable_hashjoin", "enable_mergejoin", "enable_nestloop",
 	} {
 		if sess.HasSessionOverride(name) {
 			return true
