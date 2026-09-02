@@ -1813,6 +1813,43 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 // for Join), table names (SeqScan / IndexScan), and aggregate
 // shapes that are useful for verifying planner choices without
 // running the query.
+// explainRelName renders a scanned relation the way PG's ExplainTargetRel does
+// (postgres/src/backend/commands/explain.c:4384-4499).
+//
+// PG sets `objectname = get_rel_name(rte->relid)` — the BARE name — and sets
+// `namespace` only when `es->verbose` (:4409-4411). The text branch then emits
+// `on <ns>.<obj>` when a namespace was resolved and `on <obj>` otherwise
+// (:4490-4497). So the schema appears in VERBOSE mode ONLY.
+//
+// goopg qualified in both modes, so every scan node of every plain plan carried
+// a `public.` PostgreSQL does not print — measured against the :65432 reference
+// cluster: `Seq Scan on nation` (PG) vs `Seq Scan on public.nation` (goopg).
+// That is one guaranteed rendering divergence per scan node, corpus-wide, which
+// would have swamped the plan-parity instrument P0-05/06 builds on top of this
+// renderer (take2 P0-04d).
+func explainRelName(t *catalog.Table, verbose bool) string {
+	if t == nil {
+		return ""
+	}
+	if verbose {
+		return t.QualifiedName()
+	}
+	return t.Name
+}
+
+// explainIndexName renders an index the way PG's explain_get_index_name does
+// (explain.c, `result = get_rel_name(indexId)`): the BARE name, in BOTH modes.
+// PG never schema-qualifies an index in EXPLAIN — verified on the oracle, where
+// `EXPLAIN (VERBOSE)` prints `Index Scan using orders_pk on public.orders`: the
+// relation gains the schema, the index does not. goopg qualified the index in
+// both modes.
+func explainIndexName(i *catalog.Index) string {
+	if i == nil {
+		return ""
+	}
+	return i.Name
+}
+
 // schemaQualify prepends "public." to an unqualified table name for VERBOSE mode.
 func schemaQualify(name string) string {
 	if strings.Contains(name, ".") {
@@ -1912,9 +1949,9 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		return parallelPrefix + seqScanLabel(p) + " on " + tname
 	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
+			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
 		}
-		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.IndexOnlyScan:
 		// S6 max rewrite: PG's ExplainIndexScanDetails (explain.c:4330-4336)
 		// puts " Backward" between the scan name and " using".
@@ -1932,9 +1969,9 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), dname)
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
 		}
-		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.Insert:
 		return "Insert on " + schemaQualify(p.Table.QualifiedName())
 	case *optimizer.Update:
@@ -1952,10 +1989,28 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 	case *optimizer.UserSrfScan:
 		return srfFunctionScanLabelQualified(p.Routine.QualifiedName(), p.Routine.Name, p.Alias)
 	}
-	return describePlan(n, nm)
+	// Every node type with no verbose-specific arm above lands here. It must
+	// ask for the VERBOSE rendering, or the schema qualification PG emits in
+	// this mode is dropped for exactly those types.
+	return describePlanMode(n, nm, true)
 }
 
+// describePlan renders the PLAIN (non-verbose) label. It is a thin wrapper so
+// that existing callers keep their meaning; the mode-carrying form below is
+// what the verbose walker falls through to.
 func describePlan(n optimizer.Node, nm *explainNames) string {
+	return describePlanMode(n, nm, false)
+}
+
+// describePlanMode renders a node's label for the given verbosity.
+//
+// The mode has to be threaded because PG's schema qualification depends on it
+// (explain.c:4409-4411 sets `namespace` only when `es->verbose`), and
+// describePlanVerbose delegates HERE for every node type it has no arm of its
+// own for — Bitmap Heap Scan, Insert/Update/Delete, Merge and the rest. Before
+// the mode was threaded, those types rendered identically in both modes: which
+// meant that whichever mode was made correct, the other one was wrong.
+func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 	switch p := n.(type) {
 	case *optimizer.Project:
 		return "Projection"
@@ -2070,14 +2125,14 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 			return parallelPrefix + seqScanLabel(p) + " on " + dname
 		}
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("%s%s on %s %s", parallelPrefix, seqScanLabel(p), p.Table.QualifiedName(), p.Alias)
+			return fmt.Sprintf("%s%s on %s %s", parallelPrefix, seqScanLabel(p), explainRelName(p.Table, verbose), p.Alias)
 		}
-		return fmt.Sprintf("%s%s on %s", parallelPrefix, seqScanLabel(p), p.Table.QualifiedName())
+		return fmt.Sprintf("%s%s on %s", parallelPrefix, seqScanLabel(p), explainRelName(p.Table, verbose))
 	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
+			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
 		}
-		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
+		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.IndexOnlyScan:
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
 		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror
@@ -2099,15 +2154,15 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), dname)
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
 		}
-		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), p.Table.QualifiedName())
+		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.Insert:
-		return fmt.Sprintf("Insert on %s", p.Table.QualifiedName())
+		return fmt.Sprintf("Insert on %s", explainRelName(p.Table, verbose))
 	case *optimizer.Update:
-		return fmt.Sprintf("Update on %s", p.Table.QualifiedName())
+		return fmt.Sprintf("Update on %s", explainRelName(p.Table, verbose))
 	case *optimizer.Delete:
-		return fmt.Sprintf("Delete on %s", p.Table.QualifiedName())
+		return fmt.Sprintf("Delete on %s", explainRelName(p.Table, verbose))
 	case *optimizer.DDL:
 		return fmt.Sprintf("DDL %T", p.Stmt)
 	case *optimizer.Transaction:
@@ -2170,7 +2225,7 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return "Bitmap Heap Scan on " + dname
 		}
-		return "Bitmap Heap Scan on " + schemaQualify(p.Table.QualifiedName())
+		return "Bitmap Heap Scan on " + explainRelName(p.Table, verbose)
 	case *optimizer.BitmapIndexScan:
 		// PG names the INDEX here, not the table.
 		if p.Index == nil {
@@ -2179,7 +2234,7 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 			// test cannot pin this node while it can return a Go type.
 			return "Bitmap Index Scan"
 		}
-		return "Bitmap Index Scan on " + p.Index.QualifiedName()
+		return "Bitmap Index Scan on " + explainIndexName(p.Index)
 	case *optimizer.BitmapAnd:
 		return "BitmapAnd"
 	case *optimizer.BitmapOr:
@@ -2193,7 +2248,7 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 	case *optimizer.Memoize:
 		return "Memoize"
 	case *optimizer.Merge:
-		return fmt.Sprintf("Merge on %s", p.Target.QualifiedName())
+		return fmt.Sprintf("Merge on %s", explainRelName(p.Target, verbose))
 	case *optimizer.CTEDMLPrefix:
 		return "CTE DML"
 	case *optimizer.MaterializedCTEScan:

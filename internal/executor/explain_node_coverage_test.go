@@ -8,6 +8,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // Node-type EXPLAIN coverage — planner-refactor-take2 P0-01.
@@ -144,7 +147,7 @@ func describePlanArms(t *testing.T, funcName string) map[string]bool {
 // if the node genuinely cannot appear in a rendered plan, add it to
 // explainCoverageExempt with the reason.
 func TestEveryPlanNodeTypeHasAnExplainArm(t *testing.T) {
-	arms := describePlanArms(t, "describePlan")
+	arms := describePlanArms(t, "describePlanMode")
 	var uncovered []string
 	for _, name := range planNodeTypes(t) {
 		if arms[name] {
@@ -179,17 +182,17 @@ func TestDescribePlanHasExactlyOneTypeNameFallthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", explainSrcFile, err)
 	}
-	start := strings.Index(string(src), "func describePlan(")
+	start := strings.Index(string(src), "func describePlanMode(")
 	if start < 0 {
-		t.Fatal("describePlan not found")
+		t.Fatal("describePlanMode not found")
 	}
 	end := strings.Index(string(src)[start:], "\n}\n")
 	if end < 0 {
-		t.Fatal("describePlan end not found")
+		t.Fatal("describePlanMode end not found")
 	}
 	body := string(src)[start : start+end]
 	if got := strings.Count(body, `fmt.Sprintf("%T"`); got != 1 {
-		t.Errorf("describePlan contains %d `fmt.Sprintf(\"%%T\"` sites, want exactly 1 "+
+		t.Errorf("describePlanMode contains %d `fmt.Sprintf(\"%%T\"` sites, want exactly 1 "+
 			"(the switch fallthrough). A %%T inside a covered arm prints a Go type name "+
 			"at runtime while looking covered to the arm census.", got)
 	}
@@ -295,3 +298,60 @@ var childWalkExempt = map[string]string{
 // is renderable, and a node that cannot reach EXPLAIN should be argued for here
 // rather than left to the fallthrough.
 var explainCoverageExempt = map[string]string{}
+
+// TestSchemaQualificationFollowsVerbosity pins PG's rule that a scanned
+// relation carries its schema in VERBOSE mode only, and that an index NEVER
+// carries one.
+//
+// PG's ExplainTargetRel (postgres/src/backend/commands/explain.c:4384-4499)
+// sets `objectname = get_rel_name(rte->relid)` — the bare name — and resolves
+// `namespace` only when `es->verbose` (:4409-4411); the text branch emits
+// `on <ns>.<obj>` only when a namespace was resolved (:4490-4497). The index
+// name comes from explain_get_index_name, which is `get_rel_name(indexId)`
+// with no namespace at all.
+//
+// goopg qualified in BOTH modes and qualified the index too, so measured
+// against the :65432 reference cluster:
+//
+//	PG    plain:   Index Scan using orders_pk on orders
+//	PG    verbose: Index Scan using orders_pk on public.orders
+//	goopg (both):  Index Scan using public.orders_pk on public.orders
+//
+// That is a guaranteed rendering divergence on EVERY scan node of EVERY plan,
+// which would have swamped the plan-parity instrument built on this renderer.
+//
+// The regression this guards is specifically the MODE-INDEPENDENT one: whenever
+// describePlanMode stops threading `verbose`, one of the two modes silently
+// becomes wrong, and only a test that checks BOTH can see it.
+func TestSchemaQualificationFollowsVerbosity(t *testing.T) {
+	tbl := &catalog.Table{Schema: "public", Name: "orders"}
+	idx := &catalog.Index{Schema: "public", Name: "orders_pk"}
+
+	for _, tc := range []struct {
+		name        string
+		node        optimizer.Node
+		plain, verb string
+	}{
+		{
+			name:  "seq scan",
+			node:  &optimizer.SeqScan{Table: tbl},
+			plain: "Seq Scan on orders",
+			verb:  "Seq Scan on public.orders",
+		},
+		{
+			name:  "index scan",
+			node:  &optimizer.IndexScan{Table: tbl, Index: idx},
+			plain: "Index Scan using orders_pk on orders",
+			verb:  "Index Scan using orders_pk on public.orders",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := describePlanVerbose(tc.node, false, nil); got != tc.plain {
+				t.Errorf("plain: got %q, want %q", got, tc.plain)
+			}
+			if got := describePlanVerbose(tc.node, true, nil); got != tc.verb {
+				t.Errorf("verbose: got %q, want %q", got, tc.verb)
+			}
+		})
+	}
+}
