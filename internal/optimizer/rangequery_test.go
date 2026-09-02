@@ -267,3 +267,48 @@ func TestUniqueSingleColumnKeyOverridesSampledNDistinct(t *testing.T) {
 			"(a composite key does not make its members unique)", got)
 	}
 }
+
+// TestColumnStatsResolverIsOneArmList pins take2 P1-26. There used to be two
+// full walkers over the plan tree resolving a column to its statistics, and
+// they had DRIFTED: the selectivity-side one had no *IndexScan arm, so a column
+// reached through an index-probed leaf resolved to no statistics and every
+// clause over it fell to a default selectivity — while the ndistinct-side
+// walker resolved the same column fine.
+//
+// The two now share one arm list. This test pins the specific consequence, so a
+// future split would fail rather than silently re-open the gap.
+func TestColumnStatsResolverIsOneArmList(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "ix"},
+		[]catalog.Column{{Name: "k", Type: catalog.Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl.Stats = &catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{{
+			NDistinct: 10,
+			MCV:       []catalog.MCVEntry{{Value: "1", Frequency: 0.5}},
+		}},
+	}
+
+	// A SeqScan leaf always resolved.
+	if got := columnStatsForChild(0, &SeqScan{Table: tbl}); got == nil || len(got.MCV) == 0 {
+		t.Fatal("seq-scan leaf must resolve to the column's statistics")
+	}
+	// An INDEX-probed leaf is the case that used to return nil.
+	ix := &IndexScan{Table: tbl}
+	stats := columnStatsForChild(0, ix)
+	if stats == nil {
+		t.Fatal("index-probed leaf resolved to no statistics — the two resolvers " +
+			"have drifted apart again")
+	}
+	if len(stats.MCV) == 0 {
+		t.Error("index-probed leaf resolved without its MCV list")
+	}
+	// And the two resolvers must agree, which is the property that makes them
+	// one arm list rather than two that happen to match today.
+	if columnStatsForChild(0, ix) != columnStatsForChildBase(0, ix) {
+		t.Error("the selectivity and cardinality resolvers returned different stats")
+	}
+}

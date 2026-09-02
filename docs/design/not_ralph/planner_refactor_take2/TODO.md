@@ -606,10 +606,18 @@ slower than 1.2×, S-cold/WARM gap narrows.
       so a bitmap heap scan running without a memory context segfaulted on its
       first page boundary. Unreachable until this item changed which plans win —
       "an unwinnable path is an untested path". Fixed in the same commit.
-- [ ] **P1-26** Collapse the three column-stats resolvers into one
-      `examine_variable` analogue over a single node-type arm list; an
-      index-probed leaf gains MCV and histogram access. *design: 08 §4.8;
-      sibling rule.*
+- [x] **P1-26** Collapse the column-stats resolvers — gate:
+      `TestColumnStatsResolverIsOneArmList`, units. `columnStatsForChild` was a
+      second full walker duplicating `resolveBaseColumn`'s arms, and its own
+      comment recorded the rule it was breaking ("kept in step with
+      `columnNDistinctForChild`'s arm list — hard-won rule: sibling paths change
+      together"). **They had already drifted**: the selectivity-side walker had
+      no `*IndexScan` arm, so a column reached through an index-probed leaf
+      resolved to *no statistics at all* and every clause over it fell to a
+      default selectivity — while the ndistinct-side walker resolved the same
+      column fine. It now delegates, so the index-probed leaf gains MCV and
+      histogram access and future drift is impossible rather than merely
+      discouraged.
 - [ ] **P1-27** CTE output statistics — **scope corrected 2026-09-02.** Plain
       CTE columns already resolve to their base relation's statistics:
       `resolveBaseColumn` has a `*CTEScan` arm (`joinkeyproof.go:164-167`) and
