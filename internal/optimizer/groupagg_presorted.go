@@ -29,6 +29,10 @@ func init() {
 // SetPresortedAggEnabled flips the presorted-aggregate rule on or off.
 // Test-only API; the production toggle path is the enable_presorted_aggregate
 // GUC bridged in cmd/goopg/main.go.
+// PresortedAggEnabled reports the process-wide enable_presorted_aggregate SEED;
+// see HashAggEnabled for what "seed" means here (take2 P2-02c).
+func PresortedAggEnabled() bool { return presortedAggEnabled.Load() }
+
 func SetPresortedAggEnabled(on bool) {
 	presortedAggEnabled.Store(on)
 }
@@ -38,8 +42,9 @@ func SetPresortedAggEnabled(on bool) {
 // wrapped in a Sort and a grouped aggregate switches to AggStrategySorted.
 // Returns without touching aggNode when the GUC is off, when the query uses
 // grouping sets, or when no aggregate has a usable internal ORDER BY / DISTINCT.
-func applyPresortedAggregateRule(aggNode *Aggregate) {
-	if !presortedAggEnabled.Load() || aggNode.GroupingSets != nil {
+func applyPresortedAggregateRule(aggNode *Aggregate, ps PlannerSettings) {
+	// take2 P2-02c: per-statement enable_presorted_aggregate.
+	if !ps.EnablePresortedAggregate || aggNode.GroupingSets != nil {
 		return
 	}
 

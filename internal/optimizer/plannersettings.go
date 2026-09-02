@@ -64,6 +64,15 @@ type PlannerSettings struct {
 	EnableMergeJoin bool
 	EnableNestLoop  bool
 
+	// EnableHashAgg / EnablePresortedAggregate / Geqo / GeqoThreshold are the
+	// remaining P2-02c bridges. Same defect as EnableMemoize below: each
+	// reached the planner through a registry.OnChange bridge writing a
+	// process-global atomic, so one session's SET steered every session.
+	EnableHashAgg            bool
+	EnablePresortedAggregate bool
+	Geqo                     bool
+	GeqoThreshold            int
+
 	// EnableMemoize is `enable_memoize`. take2 P2-02c.
 	//
 	// It used to reach the planner through a registry.OnChange bridge in
@@ -93,6 +102,11 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,
 		EnableMemoize:   true,
+
+		EnableHashAgg:            HashAggEnabled(),
+		EnablePresortedAggregate: PresortedAggEnabled(),
+		Geqo:                     GeqoEnabled(),
+		GeqoThreshold:            GeqoThreshold(),
 		SeqPageCost:        cp.seqPageCost,
 		RandomPageCost:     cp.randomPageCost,
 		CPUTupleCost:       cp.cpuTupleCost,
@@ -138,5 +152,7 @@ func (ps PlannerSettings) costParams() costParams {
 		enableMergeJoin: ps.EnableMergeJoin,
 		enableNestLoop:  ps.EnableNestLoop,
 		enableMemoize:   ps.EnableMemoize,
+		geqo:            ps.Geqo,
+		geqoThreshold:   ps.GeqoThreshold,
 	}
 }

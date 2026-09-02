@@ -405,32 +405,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// PlannerSettings, so a SET affects only the session that issued it.
 	// optimizer.SetMemoizeEnabled survives as the test hook and the
 	// GOOPG_MEMOIZE env kill-switch.
-	// S8 Slice 2a: same bridge for `SET enable_presorted_aggregate` — the
-	// upstream planner-method GUC now gates the presorted-aggregate rule
-	// (adjust_group_pathkeys_for_groupagg port) instead of being a
-	// registration-only no-op.
-	registry.OnChange("enable_presorted_aggregate", func(value string) {
-		optimizer.SetPresortedAggEnabled(value == "on" || value == "true" || value == "1")
-	})
-	// S8 Slice 2b: same bridge for `SET enable_hashagg` — when off, the
-	// hashed-aggregate strategy is disabled at cost time in PG
-	// (costsize.c:2755-2756 cost_agg), so the sorted path wins. goopg has no
-	// cost model, so the bridge gates the direct sorted-strategy rule
-	// (applyEnableHashAggRule) instead.
-	registry.OnChange("enable_hashagg", func(value string) {
-		optimizer.SetHashAggEnabled(value == "on" || value == "true" || value == "1")
-	})
-	// GEQO: bridge `SET geqo = off|on` and `SET geqo_threshold = N` to the
-	// planner's process-global atomic knobs, so the GUCs stop being pure
-	// no-op compatibility stubs and actually control the GEQO-vs-DP dispatch.
-	registry.OnChange("geqo", func(value string) {
-		optimizer.SetGeqoEnabled(value == "on" || value == "true" || value == "1")
-	})
-	registry.OnChange("geqo_threshold", func(value string) {
-		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
-			optimizer.SetGeqoThreshold(n)
-		}
-	})
+	// take2 P2-02c: enable_presorted_aggregate, enable_hashagg, geqo and
+	// geqo_threshold NO LONGER bridge to process globals. Each did, and each
+	// therefore let one session's SET steer every other session's plans. All
+	// four are per-statement planner inputs on PlannerSettings now. The
+	// optimizer's Set*/Geqo* entry points survive as test hooks and as the
+	// env-default seeds DefaultPlannerSettings reads.
 	if *confPath != "" {
 		entries, err := misc.ParseConfigFile(*confPath)
 		if err != nil {

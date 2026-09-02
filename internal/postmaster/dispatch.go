@@ -1907,6 +1907,14 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
+	readBool("enable_hashagg", &ps.EnableHashAgg)
+	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
+	readBool("geqo", &ps.Geqo)
+	if eff, ok := get("geqo_threshold"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(eff)); err == nil && n >= 2 {
+			ps.GeqoThreshold = n
+		}
+	}
 
 	// work_mem: KB -> BYTES. The same conversion sessionWorkMem applies for the
 	// executor's hash sizing — planner and executor must agree, which is what
@@ -1967,7 +1975,8 @@ func plannerCostGUCsOverridden(sess *misc.SessionRegistry) bool {
 		// take2 P2-05: the method toggles change plans exactly as the cost
 		// GUCs do, so they must take a session off the shared cache too.
 		"enable_hashjoin", "enable_mergejoin", "enable_nestloop",
-		"enable_memoize",
+		"enable_memoize", "enable_hashagg", "enable_presorted_aggregate",
+		"geqo", "geqo_threshold",
 	} {
 		if sess.HasSessionOverride(name) {
 			return true

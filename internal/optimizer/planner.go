@@ -1446,7 +1446,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// already AggStrategySorted (presorted) or the node is no longer
 		// AggStrategyHashed (hashagg bridge). See
 		// internal/optimizer/groupagg_indexorder.go.
-		applyIndexOrderedGroupingRule(agg.node, cat)
+		applyIndexOrderedGroupingRule(agg.node, cat, plannerSet)
 		// S8 Slice 2a (0134-0001 P2) presorted aggregates: port
 		// adjust_group_pathkeys_for_groupagg (planner.c:3229). When ≥1
 		// aggregate carries an internal ORDER BY / DISTINCT clause, choose the
@@ -1456,7 +1456,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the pathkey expressions (which include GroupExprs) are already in
 		// child-output coordinate space. Gated on enable_presorted_aggregate
 		// (default on); the gate is read inside the rule.
-		applyPresortedAggregateRule(agg.node)
+		applyPresortedAggregateRule(agg.node, plannerSet)
 		// S8 Slice 2b (0134-0001 P2) enable_hashagg bridge: with
 		// `SET enable_hashagg = off`, reproduce PG's cost-model outcome
 		// (costsize.c:2755-2756 — the AGG_HASHED arm is disabled, so the sorted
@@ -1465,7 +1465,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// rule so a query that already gained a Sorted strategy (internal ORDER
 		// BY / DISTINCT) is never double-wrapped; the gate is read inside the
 		// rule.
-		applyEnableHashAggRule(agg.node)
+		applyEnableHashAggRule(agg.node, plannerSet)
 	} else if s.Having != nil {
 		return nil, &PlanError{
 			Pos:     s.Having.Pos(),

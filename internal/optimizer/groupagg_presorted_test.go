@@ -156,11 +156,9 @@ func TestPresortedAggregateNonGroupedTiebreak(t *testing.T) {
 // TestPresortedAggregateGucOff: with the GUC kill-switch off, the rule must
 // leave the plan untouched — no Sort child, no Strategy flip.
 func TestPresortedAggregateGucOff(t *testing.T) {
-	SetPresortedAggEnabled(false)
-	defer SetPresortedAggEnabled(true)
 	cat := presortedAggCatalog(t)
 	stmt := parseOne(t, "select sum(two order by two) from tenk1")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, presortedSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,4 +169,12 @@ func TestPresortedAggregateGucOff(t *testing.T) {
 	if a.Strategy != AggStrategyHashed {
 		t.Fatalf("Strategy = %d, want AggStrategyHashed with GUC off", a.Strategy)
 	}
+}
+
+// presortedSettings mirrors hashAggSettings for enable_presorted_aggregate
+// (take2 P2-02c).
+func presortedSettings(on bool) PlannerSettings {
+	ps := DefaultPlannerSettings()
+	ps.EnablePresortedAggregate = on
+	return ps
 }

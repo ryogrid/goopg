@@ -32,8 +32,15 @@ func TestExplainSortGroupKeyParenthesisation(t *testing.T) {
 	// both the Group Key and the child Sort's Sort Key must carry the extra
 	// pair for the non-Var expression g % 10000.
 	t.Run("GroupAggregateWrapsNonVarKey", func(t *testing.T) {
-		optimizer.SetHashAggEnabled(false)
-		defer optimizer.SetHashAggEnabled(true)
+		// take2 P2-02c: enable_hashagg is a per-STATEMENT planner input now.
+		// This package's EXPLAIN harness plans through optimizer.Plan, which
+		// takes the DEFAULTS — the session-GUC-to-planner wiring lives in
+		// internal/postmaster (ctxPlannerSettings), not here. So the setting is
+		// applied where this test can reach it: the process-global seed that
+		// DefaultPlannerSettings reads. Verified separately against a live
+		// server that `SET enable_hashagg = off` yields GroupAggregate and is
+		// per-session.
+		defer hashAggSeed(false)()
 
 		joined := strings.Join(runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT g % 10000, sum(g), count(*) FROM agg_data GROUP BY g % 10000"), "\n")
 		if !strings.Contains(joined, "GroupAggregate") {
@@ -104,8 +111,15 @@ func TestExplainSortGroupKeyParenthesisation(t *testing.T) {
 	// Group Key:/Sort Key: lines as the plain form (this is a rendering
 	// property of the key expression, not of the ANALYZE/VERBOSE options).
 	t.Run("AnalyzeAndVerboseAgreeWithPlain", func(t *testing.T) {
-		optimizer.SetHashAggEnabled(false)
-		defer optimizer.SetHashAggEnabled(true)
+		// take2 P2-02c: enable_hashagg is a per-STATEMENT planner input now.
+		// This package's EXPLAIN harness plans through optimizer.Plan, which
+		// takes the DEFAULTS — the session-GUC-to-planner wiring lives in
+		// internal/postmaster (ctxPlannerSettings), not here. So the setting is
+		// applied where this test can reach it: the process-global seed that
+		// DefaultPlannerSettings reads. Verified separately against a live
+		// server that `SET enable_hashagg = off` yields GroupAggregate and is
+		// per-session.
+		defer hashAggSeed(false)()
 
 		sql := "SELECT g % 10000, sum(g), count(*) FROM agg_data GROUP BY g % 10000"
 		plain := strings.Join(runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) "+sql), "\n")
@@ -122,4 +136,16 @@ func TestExplainSortGroupKeyParenthesisation(t *testing.T) {
 			t.Errorf("EXPLAIN VERBOSE diverges from plain form; got:\n%s", verbose)
 		}
 	})
+}
+
+// hashAggSeed flips the process-global enable_hashagg seed that
+// optimizer.DefaultPlannerSettings reads, and returns the restore func.
+//
+// take2 P2-02c made enable_hashagg a per-statement planner input, so the SEED
+// is all a process global still does: it supplies the default for a planner
+// call that has no session. That is exactly this package's EXPLAIN harness,
+// which plans through optimizer.Plan.
+func hashAggSeed(on bool) func() {
+	optimizer.SetHashAggEnabled(on)
+	return func() { optimizer.SetHashAggEnabled(true) }
 }

@@ -367,7 +367,11 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// enabled, use the genetic query optimizer instead of the DP search.
 	builder := newJoinRelBuilder(s, prob.cat)
 	p, err := func() (*Path, error) {
-		if GeqoEnabled() && len(items) >= GeqoThreshold() {
+		// take2 P2-02c: the per-STATEMENT geqo / geqo_threshold, not the
+		// process globals. DefaultPlannerSettings seeds both from the globals,
+		// so the GOOPG env defaults and the test hooks still steer a planner
+		// that has no session.
+		if prob.cp.geqo && len(items) >= prob.cp.geqoThreshold {
 			s.builder = builder
 			return geqoSearch(s, builder, 5)
 		}

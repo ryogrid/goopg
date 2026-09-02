@@ -24,6 +24,11 @@ func init() {
 // SetHashAggEnabled flips the enable_hashagg kill-switch on or off. Test-only
 // API; the production toggle path is the enable_hashagg GUC bridged in
 // cmd/goopg/main.go.
+// HashAggEnabled reports the process-wide enable_hashagg SEED — the value a
+// planner call with no session defaults to (take2 P2-02c). It is not what a
+// session's SET reads; that travels on PlannerSettings.
+func HashAggEnabled() bool { return hashAggEnabled.Load() }
+
 func SetHashAggEnabled(on bool) {
 	hashAggEnabled.Store(on)
 }
@@ -52,8 +57,9 @@ func SetHashAggEnabled(on bool) {
 // AggStrategySorted && GroupingSets==nil && len(GroupExprs)>0 && Mode==
 // AggModeSimple — exactly the conditions enforced above, so the EXPLAIN label
 // never lies about the executor path.
-func applyEnableHashAggRule(aggNode *Aggregate) {
-	if !(!hashAggEnabled.Load() &&
+func applyEnableHashAggRule(aggNode *Aggregate, ps PlannerSettings) {
+	// take2 P2-02c: per-statement enable_hashagg, not the process global.
+	if !(!ps.EnableHashAgg &&
 		aggNode.Strategy == AggStrategyHashed &&
 		aggNode.GroupingSets == nil &&
 		len(aggNode.GroupExprs) > 0 &&

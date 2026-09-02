@@ -86,6 +86,8 @@ type costParams struct {
 	enableMergeJoin bool
 	enableNestLoop  bool
 	enableMemoize   bool
+	geqo            bool
+	geqoThreshold   int
 }
 
 func defaultCostParams() costParams {
@@ -110,6 +112,8 @@ func defaultCostParams() costParams {
 		enableMergeJoin: true,
 		enableNestLoop:  true,
 		enableMemoize:   true,
+		geqo:            GeqoEnabled(),
+		geqoThreshold:   GeqoThreshold(),
 	}
 }
 

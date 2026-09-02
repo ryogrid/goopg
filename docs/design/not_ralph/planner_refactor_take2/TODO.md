@@ -817,7 +817,7 @@ not grow; no query slower than 1.2×.
       budget the plan moves onto index-scan-driven joins, which goopg's parallel
       post-pass cannot drive because it only recognises sequential scans, so the
       Gather is lost too — Phase 5. See P4-A rev 4.
-- [~] **P2-02c** *(slice 1 of 6 landed: `enable_memoize`)* Move the six process-global GUC bridges
+- [~] **P2-02c** *(5 of 6 landed; only `enable_nestloop_index` remains)* Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner
       context. Today a `SET` in one session changes the planner for every
@@ -832,10 +832,22 @@ not grow; no query slower than 1.2×.
       deleted; `SetMemoizeEnabled` survives as the test hook and the
       `GOOPG_MEMOIZE` env kill-switch. Verified live: session A `SET
       enable_memoize=off` no longer changes what a fresh session B reads.
-      TPC-H 241.94s, 24 MATCH. Five bridges remain:
-      `enable_nestloop_index`, `enable_hashagg`, `enable_presorted_aggregate`,
-      `geqo`, `geqo_threshold` — each needs its consumer to reach a
-      `costParams`/`PlannerSettings`, which is the whole of the work.
+      TPC-H 241.94s, 24 MATCH. **`enable_hashagg`,
+      `enable_presorted_aggregate`, `geqo` and `geqo_threshold` followed** —
+      the three aggregate rules take the settings as a parameter from
+      `planSelect`, and the GEQO dispatch reads `prob.cp`. All four bridges are
+      deleted; verified live that a session's SET no longer changes what a fresh
+      session reads, and that `SET enable_hashagg=off` still yields
+      GroupAggregate. TPC-H 240.52s, 24 MATCH.
+      Only **`enable_nestloop_index`** remains: its consumer is
+      `rewriteJoinsToNLI(n, cat)`, a LEGACY rewrite pass with no `costParams` in
+      scope, so it needs the settings threaded through the legacy arm rather
+      than a one-line change like the others.
+      Note the seed convention this established: a process global now supplies
+      only the DEFAULT for a planner call with no session
+      (`DefaultPlannerSettings` reads `HashAggEnabled()` / `GeqoEnabled()` /
+      …), which is what keeps the `GOOPG_*` env kill-switches and the test hooks
+      working. What a global no longer carries is a session's SET.
 - [x] **P2-03** `hash_mem_multiplier` — gate:
       `TestHashMemMultiplierReachesTheBudget`, the existing
       `TestCostParamsWorkMemMatchesExecutorFallback` sibling guard, units.

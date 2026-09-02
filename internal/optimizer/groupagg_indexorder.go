@@ -60,7 +60,7 @@ import "github.com/goopg/goopg/internal/catalog"
 // chosen index order is recorded in aggNode.GroupKeyOrder — indices into
 // GroupExprs, in index-column order — consumed only by the `Group Key:`
 // EXPLAIN renderer (internal/executor/operators_explain.go).
-func applyIndexOrderedGroupingRule(aggNode *Aggregate, cat catalog.Catalog) {
+func applyIndexOrderedGroupingRule(aggNode *Aggregate, cat catalog.Catalog, ps PlannerSettings) {
 	if aggNode == nil || cat == nil {
 		return
 	}
@@ -80,7 +80,7 @@ func applyIndexOrderedGroupingRule(aggNode *Aggregate, cat catalog.Catalog) {
 	// targets runs inside `SET enable_hashagg = off` (aggregates.sql:1275-
 	// 1370), so mirror applyEnableHashAggRule's own bridge and require the
 	// same session state.
-	if hashAggEnabled.Load() {
+	if ps.EnableHashAgg {
 		return
 	}
 
