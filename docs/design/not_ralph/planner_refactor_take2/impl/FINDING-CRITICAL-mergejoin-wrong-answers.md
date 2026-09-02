@@ -1,6 +1,6 @@
 # CRITICAL — the merge join returns WRONG ANSWERS, and the inflated `work_mem` default is hiding it
 
-**Status:** open, pre-existing, not caused by any commit in this bundle.
+**Status:** FIXED in `13d53603f`. Pre-existing; not caused by any commit in this bundle.
 **Severity:** silent wrong answers on ordinary SELECTs. Row counts are
 unaffected, so a row-count gate passes it.
 
@@ -62,6 +62,30 @@ Merge Join  (cost=0.75..826630.32 rows=24989610 width=1094) (actual rows=2400502
 - **24 005 020 rows emitted** where the two-clause join produces 6 001 255 —
   the single-key product, unfiltered. 24.0M / 6.0M = 4.00, which is the 4.02x
   seen in the sum.
+
+## Root cause (found)
+
+`generateMergeJoinPaths`' FIRST candidate (`joinpathsmergeouter.go:178`) built
+its merge-clause list from `findMergeClausesForOuterPathkeys`, which returns only
+the groups the outer path's ordering serves, and then passed the ORIGINAL
+`residual` through untouched. Clauses in an unmatched group were dropped from the
+merge keys and never added to the residual, so nothing evaluated them.
+
+The other two call sites in the same function already demoted their dropped
+clauses with `demoteDroppedMergeClauses`, so the rule was known; this path missed
+it. The fix adds `demoteUnmatchedGroupClauses`, the identity-based sibling —
+`demoteDroppedMergeClauses` may subtract by POSITION because
+`trimMergeClausesForInnerPathkeys` appends in order and stops, whereas the set
+dropped here is chosen by which GROUPS the outer's pathkeys serve and is not a
+prefix.
+
+## Verification
+
+With `work_mem` at PostgreSQL's default, all 24 TPC-H queries now match the
+known-good run **on values** (previously `Q9 VALUE-DIFF`). At the shipped
+configuration the fix is neutral: 239.72 s vs 240.73 s, 24 MATCH.
+
+## Original analysis
 
 The path itself is built with the residual attached
 (`joinpathsmerge.go`: `Residual: residual`), and `createMergeJoinPlan` passes it

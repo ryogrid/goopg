@@ -802,8 +802,13 @@ not grow; no query slower than 1.2×.
       PRE-EXISTING — identical digest before and after the cost fix, reproduces
       at session-start HEAD — and goopg's 512MB `work_mem` default (128x PG's)
       is the only thing hiding it. See
-      `impl/FINDING-CRITICAL-mergejoin-wrong-answers.md`. Fix that first; it is
-      a correctness bug in its own right, not a P2-02b blocker.
+      `impl/FINDING-CRITICAL-mergejoin-wrong-answers.md`. **FIXED in
+      `13d53603f`**: `generateMergeJoinPaths`' first candidate trimmed its
+      merge-clause list to the groups the outer's ordering serves and passed the
+      original residual through, so the dropped clauses were evaluated nowhere.
+      With that fixed, P2-02b is CORRECT at PG's `work_mem` (24 MATCH on values)
+      and is now purely a performance question: it costs 239.7s -> 295.9s
+      (+23.4%). Remaining work on P2-02b is closing that gap, not correctness.
 - [ ] **P2-02c** Move the six process-global GUC bridges
       (`enable_memoize`, `enable_nestloop_index`, `enable_hashagg`,
       `enable_presorted_aggregate`, `geqo`, `geqo_threshold`) onto the planner
