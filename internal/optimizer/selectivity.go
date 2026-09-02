@@ -53,6 +53,14 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			return rangeOpSelectivity(e.Op, e.Left, e.Right, child)
 		}
+	case *IsNullExpr:
+		// nulltestsel (postgres/src/backend/utils/adt/selfuncs.c). take2 P1-14.
+		//
+		// ANALYZE has always collected NullFrac and persisted it as
+		// stanullfrac, and this is the ONE clause it exists to answer — yet
+		// `IS NULL` had no arm at all and fell through to the generic default
+		// below, so the statistic was never read for its own predicate.
+		return nullTestSelectivity(e, child)
 	case *UnaryOp:
 		if e.Op == parser.OpNot {
 			return 1 - clauseSelectivity(e.Operand, child)
@@ -573,4 +581,49 @@ func rangeOpSelectivityWithSource(op parser.OpCode, left, right Expr, child Node
 	// Histogram present → trust rangeOpSelectivity's interpolation.
 	val := rangeOpSelectivity(op, left, right, child)
 	return selectivityEstimate{value: val, reliable: true}
+}
+
+
+// defaultUnkSel / defaultNotUnkSel are PG's DEFAULT_UNK_SEL and
+// DEFAULT_NOT_UNK_SEL (postgres/src/include/utils/selfuncs.h:55-56), used when
+// no statistics are available for the column under test.
+const (
+	defaultUnkSel    = 0.005
+	defaultNotUnkSel = 1.0 - defaultUnkSel
+)
+
+// nullTestSelectivity estimates `x IS NULL` / `x IS NOT NULL` from the column's
+// recorded null fraction, mirroring nulltestsel.
+//
+// PG reads stats->stanullfrac and returns it directly for IS_NULL, or
+// 1 - stanullfrac for IS NOT NULL; with no statistics it falls back to
+// DEFAULT_UNK_SEL / DEFAULT_NOT_UNK_SEL.
+func nullTestSelectivity(e *IsNullExpr, child Node) float64 {
+	cr, ok := e.Operand.(*ColumnRef)
+	if !ok {
+		// Not a bare column — PG's nulltestsel handles only Var and Const
+		// operands and defaults for anything else.
+		if e.Negated {
+			return defaultNotUnkSel
+		}
+		return defaultUnkSel
+	}
+	cs := columnStatsForChild(cr.Index, child)
+	if cs == nil {
+		if e.Negated {
+			return defaultNotUnkSel
+		}
+		return defaultUnkSel
+	}
+	freqNull := cs.NullFrac
+	if freqNull < 0 {
+		freqNull = 0
+	}
+	if freqNull > 1 {
+		freqNull = 1
+	}
+	if e.Negated {
+		return 1.0 - freqNull
+	}
+	return freqNull
 }

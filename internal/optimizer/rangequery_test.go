@@ -96,3 +96,35 @@ func TestRangeQueryClauseKeepsMoreRestrictiveDuplicate(t *testing.T) {
 		t.Errorf("duplicate lower bounds: selectivity = %.4f, want ~0.20", got)
 	}
 }
+
+// TestNullTestSelectivityReadsNullFrac pins take2 P1-14. ANALYZE has always
+// collected NullFrac and persisted it as stanullfrac, and `IS NULL` is the one
+// clause it exists to answer — but there was no arm for IsNullExpr at all, so
+// the predicate fell to a generic default and the statistic was never read.
+func TestNullTestSelectivityReadsNullFrac(t *testing.T) {
+	scan := rqScan(t)
+	scan.Table.Stats.Columns[0].NullFrac = 0.25
+	col := &ColumnRef{Name: "d", Index: 0, SourceTableIdx: 1, Type: catalog.Type{Name: "int4"}}
+
+	if got := clauseSelectivity(&IsNullExpr{Operand: col}, scan); math.Abs(got-0.25) > 1e-9 {
+		t.Errorf("IS NULL selectivity = %.4f, want 0.25 (the column's NullFrac)", got)
+	}
+	if got := clauseSelectivity(&IsNullExpr{Operand: col, Negated: true}, scan); math.Abs(got-0.75) > 1e-9 {
+		t.Errorf("IS NOT NULL selectivity = %.4f, want 0.75", got)
+	}
+}
+
+// TestNullTestSelectivityFallsBackWithoutStats mirrors nulltestsel's
+// no-statistics arm: DEFAULT_UNK_SEL / DEFAULT_NOT_UNK_SEL.
+func TestNullTestSelectivityFallsBackWithoutStats(t *testing.T) {
+	scan := rqScan(t)
+	scan.Table.Stats = nil
+	col := &ColumnRef{Name: "d", Index: 0, SourceTableIdx: 1, Type: catalog.Type{Name: "int4"}}
+
+	if got := clauseSelectivity(&IsNullExpr{Operand: col}, scan); math.Abs(got-defaultUnkSel) > 1e-9 {
+		t.Errorf("IS NULL with no stats = %.5f, want DEFAULT_UNK_SEL %.5f", got, defaultUnkSel)
+	}
+	if got := clauseSelectivity(&IsNullExpr{Operand: col, Negated: true}, scan); math.Abs(got-defaultNotUnkSel) > 1e-9 {
+		t.Errorf("IS NOT NULL with no stats = %.5f, want DEFAULT_NOT_UNK_SEL %.5f", got, defaultNotUnkSel)
+	}
+}
