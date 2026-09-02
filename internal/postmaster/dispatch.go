@@ -3739,10 +3739,42 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 	}
 	// Invalidate plan cache after DDL so stale schema references are
 	// never reused by concurrent sessions. M0098-0005.
-	if _, isDDL := node.(*optimizer.DDL); isDDL && s.pc != nil {
+	//
+	// take2 P1-03b: statistics-changing utilities invalidate too. ANALYZE and
+	// VACUUM are planned as *optimizer.Utility, not *optimizer.DDL, so before
+	// this a session could ANALYZE a relation and then re-run a cached query
+	// and still get the plan chosen from the OLD statistics — the one case
+	// where a user has explicitly asked the planner to reconsider.
+	//
+	// Upstream reaches the same place by a different route: vac_update_relstats
+	// and the pg_statistic writes emit relcache invalidation messages, which
+	// plancache.c's ResetPlanCache picks up. goopg's cache has no such message
+	// bus, so the trigger is the statement kind.
+	if s.pc != nil && planCacheInvalidatingStmt(node) {
 		s.pc.Invalidate()
 	}
 	return w.WriteCommandComplete(tag)
+}
+
+// planCacheInvalidatingStmt reports whether the executed statement can have
+// changed something a cached plan was built from.
+//
+// DDL changes the schema; ANALYZE and VACUUM change the STATISTICS the planner
+// costed with. Both make a cached plan stale, and goopg has no invalidation
+// message bus to notice the second kind, so it is recognised here by statement
+// kind. VACUUM is included because its Analyze pass updates reltuples/relpages
+// (P1-03) even without the ANALYZE keyword.
+func planCacheInvalidatingStmt(node optimizer.Node) bool {
+	switch n := node.(type) {
+	case *optimizer.DDL:
+		return true
+	case *optimizer.Utility:
+		switch n.Stmt.(type) {
+		case *parser.AnalyzeStmt, *parser.VacuumStmt:
+			return true
+		}
+	}
+	return false
 }
 
 // commandTagFor builds the upstream-shaped CommandComplete tag for

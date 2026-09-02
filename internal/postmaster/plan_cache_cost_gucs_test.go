@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
 
@@ -153,5 +154,37 @@ func TestSessionPlannerSettingsHonoursOverrides(t *testing.T) {
 func TestSessionPlannerSettingsDegradesToDefaults(t *testing.T) {
 	if got, want := sessionPlannerSettings(nil), optimizer.DefaultPlannerSettings(); got != want {
 		t.Errorf("nil session gave %+v, want the planner defaults %+v", got, want)
+	}
+}
+
+// TestPlanCacheInvalidatingStmt pins take2 P1-03b's second half. ANALYZE and
+// VACUUM are planned as *optimizer.Utility, not *optimizer.DDL, so before this
+// a session could ANALYZE a relation, re-run a cached query, and still get the
+// plan chosen from the OLD statistics — the one case where the user has
+// explicitly asked the planner to reconsider.
+//
+// Upstream reaches the same place by a different route: the pg_statistic and
+// relstats writes emit relcache invalidation messages that plancache.c's
+// ResetPlanCache picks up. goopg has no such bus, so the trigger is the
+// statement kind, and that makes it worth pinning.
+func TestPlanCacheInvalidatingStmt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		node optimizer.Node
+		want bool
+	}{
+		{"DDL", &optimizer.DDL{}, true},
+		{"ANALYZE", &optimizer.Utility{Stmt: &parser.AnalyzeStmt{}}, true},
+		{"VACUUM", &optimizer.Utility{Stmt: &parser.VacuumStmt{}}, true},
+		{"SET", &optimizer.Utility{Stmt: &parser.SetStmt{}}, false},
+		{"SHOW", &optimizer.Utility{Stmt: &parser.ShowStmt{}}, false},
+		{"PREPARE", &optimizer.Utility{Stmt: &parser.PrepareStmt{}}, false},
+	} {
+		if got := planCacheInvalidatingStmt(tc.node); got != tc.want {
+			t.Errorf("%s: planCacheInvalidatingStmt = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if planCacheInvalidatingStmt(nil) {
+		t.Error("a nil node must not invalidate")
 	}
 }

@@ -320,7 +320,7 @@ slower than 1.2×, S-cold/WARM gap narrows.
       Non-fatal on write failure: a VACUUM that has done its real work must not
       fail on a statistics write, the same convention
       `persistStatsToPGStatistic` uses for a column it cannot fit.
-- [x] **P1-03b** *(first half)* `TRUNCATE` resets `Table.Stats` — units,
+- [x] **P1-03b** `TRUNCATE` resets `Table.Stats` — units,
       `internal/{executor,optimizer,catalog}`. Measured, same fixture:
 
       | | goopg before | goopg after | PG |
@@ -335,10 +335,18 @@ slower than 1.2×, S-cold/WARM gap narrows.
       an in-memory-only reset would come back stale after a restart. `reltuples`
       renders `0` where PG renders `-1`; goopg's virtual `pg_class` already uses
       `0` as its unknown sentinel elsewhere.
-      *Still open:* the second half — `ANALYZE` invalidating cached plans for the
-      relations it touched. It is planned as a `Utility` statement and only DDL
-      invalidates, so a session that ANALYZEs and then re-runs a cached query
-      still gets the pre-ANALYZE plan.
+      *(second half also done)* `ANALYZE` and `VACUUM` now invalidate the plan
+      cache — gate: `TestPlanCacheInvalidatingStmt`. Both are planned as
+      `*optimizer.Utility`, not `*optimizer.DDL`, so the existing DDL-only
+      trigger missed them and a session could ANALYZE a relation, re-run a
+      cached query, and still get the plan chosen from the OLD statistics — the
+      one case where the user has explicitly asked the planner to reconsider.
+      Upstream reaches the same place differently: the `pg_statistic` and
+      relstats writes emit relcache invalidation messages that `plancache.c`'s
+      `ResetPlanCache` picks up. goopg has no such bus, so the trigger is the
+      statement kind, which is why it is pinned by test. VACUUM is included
+      because its Analyze pass updates `reltuples`/`relpages` (P1-03) even
+      without the ANALYZE keyword.
 - [x] **P1-04** — **verified already satisfied**, no code change. Index-only
       costing already uses the real visible fraction:
       `pathindexonly.go:109` passes `relAllVisibleFraction(tbl, relPages)`,
