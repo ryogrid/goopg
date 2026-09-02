@@ -48,14 +48,18 @@ reports `changed=0` against a pre-P0 goopg capture.
       `cost=0.00..0.00` sites in `internal/executor/operators_explain.go`.
       Carry the numbers onto the plan node at `createPlan` time rather than
       back-pointing to the `Path`.
-      **Sequencing hazard:** `cmd/estimate-audit` parses EXPLAIN text and its
-      committed fixtures contain the literal `cost=0.00..0.00`, so this item
-      breaks the bundle's only existing goopg-vs-PG instrument and invalidates
-      the 2026-08-05 reference capture. Update the audit's parser and re-capture
-      its reference **in the same commit**, and do not start P0-02 until P0-05
-      and P0-06 give an independent parity signal to fall back on.
-      *design: 08 §3 P0-2; gate: units + a test comparing rendered numbers to
-      `finalPath()`; `estimate-audit` runs green on the re-captured reference.*
+      Also add the four cost keys to `planToJSON`, the third render site,
+      which emits none today (impl/P0-A §3.5).
+      **Corrected sequencing (impl/P0-A §3):** `estimate-audit`'s parser accepts
+      arbitrary cost/width (`audit.go:51`) and its `--reference` is the *PG*
+      side, so neither needs updating. What invalidates are the two
+      **goopg-vs-goopg** baselines — `plan-gate`'s snapshot and the TPC-DS SF05
+      `plans-*.txt` channel — re-pinned in the same commit. The "do not start
+      until P0-05/P0-06" precondition is withdrawn.
+      `rows=` keeps sourcing `EstimateRows` in this commit; switching it to
+      `Path.Rows` is a separate item.
+      *design: 08 §3 P0-2, impl/P0-A §3; gate: units + a test comparing rendered
+      numbers to `finalPath()`; `estimate-audit` green.*
 - [ ] **P0-03** Nodes above the seam print costs derived from the legacy
       estimate rather than zeros; a test asserts no node renders
       `cost=0.00..0.00`. *design: 08 §3; gate: units.*
@@ -72,8 +76,11 @@ reports `changed=0` against a pre-P0 goopg capture.
 - [ ] **P0-04c** Add `GOOPG_INDEX_PROBE_MULT` to
       `internal/optimizer/flaglabels.go` so it reaches the generated
       `scripts/planner-flags.env` — the one plan-shaping knob artifacts cannot
-      currently state. *design: 08 §3 P0-3; gate:
-      `TestFlagProvenanceEnvIsGenerated`.*
+      currently state. **Also fix the guard that missed it**: the detector
+      `flaglabels_test.go:94` matches only literal `os.Getenv("GOOPG_…")`, and
+      this flag is read through the `envFloatDefault` helper. Replace it with a
+      `go/ast` string-literal walk (impl/P0-A §7). *design: 08 §3 P0-3; gate:
+      `TestFlagProvenanceEnvIsGenerated`, `TestFlagProvenanceTableCoversPlannerEnv`.*
 - [ ] **P0-05** `plan-parity` capture mode: capture EXPLAIN from goopg and from
       PG for TPC-H 22 and TPC-DS 99; commit the PG side as a fixture
       (`bench/tpch/plans-pg/`, `bench/tpcds/plans-pg/`). *design: 08 §3, 09
@@ -84,24 +91,51 @@ reports `changed=0` against a pre-P0 goopg capture.
       *design: 09 §3.1; gate: unit tests over recorded plan pairs.*
 - [ ] **P0-07** Commit the baseline roll-up for both suites and record it in
       09 §7.1 as the starting numbers for bars A1/A2. *gate: 09 §5 P0 row.*
-- [ ] **P0-08** Re-pin the nightly `make plan-gate` baseline (currently
-      `m0077-final`, May 2026 — 22/22 diverge nightly, no signal).
+- [ ] **P0-08** Re-pin the stale plan baseline. **Corrected (impl/P0-B §5):**
+      the nightly calls `make plan-diff LABEL=m0077-final` from
+      `ci/batch/stages/stage-tpch.sh:234` with `|| true`, *deliberately*
+      informational — it does not use `plan-gate`, and it does not silently pass.
+      Meanwhile `make plan-gate`'s `ls -t` today selects `warm-stats-base.txt`
+      (Aug 2026), not `m0077-final`. The defect is the four-month-stale pin, and
+      the re-pin is **three coordinated edits in one commit**: commit
+      `plan_snapshots/take2-p0-<date>.txt`; update `stage-tpch.sh:234`'s
+      `LABEL=`; update the hardcoded label in `summarize.py:689`.
       *design: 08 §3 P0-4.*
-- [ ] **P0-09** Re-capture the TPC-DS PG oracle with sub-second resolution; the
-      committed one stores integer seconds so 83 of 95 queries read `0s`.
-      *design: 08 §3 P0-5; gate: SF0.5 gate still `MISMATCH=0`.*
-- [ ] **P0-10** Fix TPC-DS row-anchor consumption — `ci/batch/lib/summarize.py`
-      reads `r["rows"]`, the CSV column is `expected_rows`, so every TPC-DS
-      anchor is inert. *design: 08 §3 P0-6; gate: nightly summary shows anchors.*
-- [ ] **P0-11** `addPath` provenance tracing behind a diagnostic flag: which
-      producer offered a path, its relids, kind, `RequiredOuter`, rows, cost,
-      pathkeys, and whether it survived. *design: 09 §1 R4; gate: units.*
+- [ ] **P0-09** **Rescoped (impl/P0-B §6).** Change the oracle timer to
+      millisecond resolution (`scripts/tpcds-sf05-regression.sh:498-500`), but
+      do **not** trigger a re-capture for it. Corrections: **54** of 95 `OK`
+      rows read `0`, not 83; and field 5 (`secs`) is read by *nothing* — the
+      compare path takes fields 2/3/4 only (`:796-801`) and the fixture header
+      says `secs are machine-specific; rows and ck are the fixture`. A
+      standalone re-capture would truncate a git-tracked fixture for a column
+      with no readers. The resolution lands on the next capture required for
+      another reason, under design D5. *design: 08 §3 P0-5.*
+- [-] **P0-10** ~~Fix TPC-DS row-anchor consumption~~ — **already fixed; claim
+      was stale.** `ci/batch/lib/summarize.py:651-656` reads `r["expected_rows"]`
+      with an explanatory comment at `:652`; the TPC-H path correctly reads
+      `r["rows"]` at `:576-580`. Fixed by `63056c544` (2026-07-30), a month
+      before this bundle was written. No code change. *evidence: impl/P0-B §7.*
+- [ ] **P0-11** Path provenance tracing — **extends an existing channel**
+      (impl/P0-B §8). `internal/optimizer/joinsearchtrace.go` already emits
+      `DPTRACE` blocks under `GOOPG_PGSHAPED_DP_TRACE=1` at *join-pair*
+      granularity, parsed by `estimateaudit/enumtrace.go`. Add a third `path`
+      record type from `addPath` (`path.go:555`) **and `addPartialPath`
+      (`:562`)** — 12 + 1 call sites, `producer` passed as an argument, never
+      recovered from the stack. The emitter and the matching `EnumPath` parser
+      arm **must land in one commit**: `enumtrace.go` counts unparseable
+      `DPTRACE` lines as `Malformed`, so a lone emitter would look like a
+      regression in the existing instrument. *design: 09 §1 R4; gate: units,
+      `Malformed == 0`.*
 - [ ] **P0-12** Align the goopg TPC-H bench cluster's memory settings with the
       PG reference cluster's. Today PG sets `work_mem = 64MB` and
       `effective_cache_size = 2GB` explicitly while goopg's conf leaves both at
       boot defaults (512MB and 4GB), so the headline 9.9× is measured with
       goopg holding an **8× `work_mem` advantage** and any `work_mem`-sensitive
-      cost comparison between the engines is meaningless. Do this **before**
+      cost comparison between the engines is meaningless. **Measured 2026-09-02
+      (impl/P0-B §2.2), and wider than recorded:** `shared_buffers` is also 4×
+      apart (PG 512MB, goopg 2GB). It cannot change a plan (`effective_cache_size`
+      is the cost-model input) but it changes runtime, so it is aligned too.
+      All other cost/collapse/parallel GUCs were verified identical. Do this **before**
       P2-02b, which changes the boot default — doing P2-02b first would swing
       goopg from 8× more memory to 16× less and read as a catastrophic
       regression that is really a configuration change. *design: 09 §6.4; gate:
@@ -504,4 +538,6 @@ original wording — negative results are only legible if they survive
 
 | item | date | reason | ledger row |
 |---|---|---|---|
-| | | | |
+| P0-10 (TPC-DS row anchors inert) | 2026-09-02 | Claim was stale. `ci/batch/lib/summarize.py:651-656` already reads `expected_rows`; fixed by `63056c544` (2026-07-30), a month before the bundle was written. A `git log -S` would have refuted it. | n/a — no defect |
+| P0-08's `PLAN_GATE_REQUIRE=1` "set by ci/batch" | 2026-09-02 | Withdrawn: ci/batch never invokes `make plan-gate`; it calls `make plan-diff` with an explicit pinned `LABEL` (`stage-tpch.sh:234`). The flag would never fire. | n/a |
+| P0-09's standalone oracle re-capture | 2026-09-02 | Rescoped to a timer change only. Field 5 (`secs`) has no readers anywhere in `scripts/` or `ci/batch/`; a re-capture would truncate a git-tracked fixture for no measurable gain. | n/a |
