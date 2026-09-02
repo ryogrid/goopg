@@ -469,9 +469,15 @@ slower than 1.2×, S-cold/WARM gap narrows.
       column lands mid-bucket by construction. **Highest-value single item in
       Phase 1** — date-window predicates are the dominant restriction shape in
       both suites. *design: 08 §4.4; gate: plan-parity + timing both suites.*
-- [ ] **P1-12** Port `clauselist_selectivity` as a real function (replacing the
-      inlined AND product), with `RestrictInfo` selectivity caching.
-      *design: 08 §4.4; oracle: `clausesel.c`.*
+- [x] **P1-12** *(main half — landed with P1-13)* `conjunctionSelectivity`
+      (`rangequery.go`) **is** `clauselist_selectivity`: it takes the flattened
+      conjunct list, pairs range bounds per variable, and multiplies the
+      remainder — replacing the inlined AND product that used to live in
+      `clauseSelectivity`'s `OpAnd` arm.
+      *Still open:* `RestrictInfo` selectivity **caching**. That is a
+      planning-speed optimisation, not a plan-quality one — it changes no
+      estimate — so it is filed under Phase 6 consolidation rather than kept
+      open here as a statistics-fidelity item. *design: 08 §4.4.*
 - [x] **P1-13** `RangeQueryClause` pairing — `71653da23`; gates: three unit
       tests, units. Measured on lineitem, one-year window:
       **1 855 086 -> 902 018 against an actual 910 180** (2.04x over -> 0.9%
@@ -519,9 +525,16 @@ slower than 1.2×, S-cold/WARM gap narrows.
       arms (07 §3.11 item 3). Close ledger rows 779/781/784 as stale and file
       what the audit actually shows. *design: 08 §4.5; gate: `estimate-audit`
       final-joinrel bar on Q9.*
-- [ ] **P1-17** `eqjoinsel_semi` MCV arm, `nd2` clamped by inner rows, the
-      `(1-nullfrac1)` factor. Note MCV pairing exists in production **only** in
-      the semi/anti arm (`semiPairMatchFraction`). *design: 08 §4.5.*
+- [x] **P1-17** — **verified already satisfied**, no code change. All three
+      named parts are present in `semiPairMatchFraction`: the MCV arm, `nd2`
+      clamped by the inner rel's rows, and the `(1-nullfrac1)` factor. Checked
+      line-by-line against `eqjoinsel_semi` — including the part that looked
+      like a divergence: goopg discounts the matched MCVs from both distinct
+      counts before the `nd2/nd1` heuristic, and so does PG
+      (`nd1 -= nmatches; nd2 -= nmatches;` immediately before the comparison).
+      The `isdefault → 0.5` punt matches too. With P1-15 the *inner* arm now has
+      MCV pairing as well, so the note about it existing "only in the semi/anti
+      arm" no longer holds.
 - [!] **P1-18** **BLOCKED on P3-04** *(established empirically 2026-09-02)*.
       The search cannot see a non-inner join at all, so there is no arm to add a
       jointype switch to. `DPTRACE` for
