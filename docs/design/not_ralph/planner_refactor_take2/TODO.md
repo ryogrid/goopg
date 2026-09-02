@@ -1029,6 +1029,29 @@ not grow; no query slower than 1.2×.
       here; before it, the gate could not.
 - [ ] **P2-12** `mergejoinscansel` start/end selectivities in merge-join
       costing. *design: 08 §5.3.*
+      **Scoped 2026-09-03 — implementable, with one caveat that must not be
+      skipped.** The arithmetic is reachable: `mergejoinscansel` needs
+      `get_variable_range` and `scalarineqsel`, and goopg already has the
+      histogram machinery for both (`histogramOpSelectivity`, `bucketFraction`,
+      `histCmp` in selectivity.go). `mergeJoinCost` currently charges a FULL
+      pass over each input — `(outer.Total - outer.Startup) + (inner.Total -
+      inner.Startup)` — with no start/end scaling at all.
+      *The caveat.* The scan selectivities model the merge STOPPING EARLY when
+      one side's key range is exhausted. goopg does that only when both inputs
+      arrive pre-sorted, where `mergeJoinStream` really is streaming ("one row
+      per side plus the current inner group, and nothing else",
+      join_merge_stream.go:444). When an input needs sorting,
+      `mergeSortedSource.fill` drains the whole child into sorted runs first, so
+      the sort reads everything however narrow the join's key overlap is.
+      Applying the selectivities to a sorted input's cost would price a partial
+      scan the executor never performs — the sibling-path divergence this bundle
+      keeps paying for. Check what PG does in `final_cost_mergejoin` for the
+      `outersortkeys != NIL` case before porting; do not assume.
+      *Plumbing.* `tryMergeJoinPath` has no `searchCtx`, so the key columns'
+      stats must arrive as a closure, exactly as `mergeTuplesFor` does (P2-07).
+      *Risk direction.* This makes merge joins CHEAPER. Land it with the
+      `TOTAL` arm of `scripts/tpcds-sweep-diff.py` watching the aggregate — the
+      per-query 2x gate missed a 3.3% move on P2-09's qual cost.
 - [x] **P2-13** Bitmap lossy-page handling to match `tbm_calculate_entries`
       **and** removal of the double charge, in ONE commit. Landing the removal
       alone is a known regression (TPC-DS Q72 73 s → timeout). *design: 08 §5.4;
