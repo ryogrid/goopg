@@ -1493,18 +1493,20 @@ func schemaColumnNames(n optimizer.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
-func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, attachedFilter optimizer.Expr, filterRowsRemoved int64, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
 	if p, ok := n.(*optimizer.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, filterRowsRemoved, reg)
+		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, attachedFilterNode, filterRowsRemoved, reg)
 		return
 	}
 	if f, ok := n.(*optimizer.Filter); ok {
 		next := f.Predicate
+		nextNode := optimizer.Node(f)
 		if attachedFilter != nil {
 			next = attachedFilter
+			nextNode = attachedFilterNode
 		}
 		// A Filter node wraps a scan/join to apply qual(s). Its own
 		// instrumentation entry (when ANALYZE) carries the number of
@@ -1515,7 +1517,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if fs, ok := stats[f]; ok && fs != nil {
 			fr += fs.filterRejected
 		}
-		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, next, fr, reg)
+		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, next, nextNode, fr, reg)
 		return
 	}
 
@@ -1533,7 +1535,22 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	label := prefix + describePlanVerbose(n, opts.Verbose, reg.names())
 	showCostsA := !opts.Set.Costs || opts.Costs
 	if showCostsA {
-		est := optimizer.EstimateRows(n)
+		// SIBLING PAIR with walkPlanFiltered's row-source block (take2
+		// P0-04b). A Filter wrapper collapses into the scan/join line it
+		// wraps, but the row ESTIMATE lives on the wrapper — upstream never
+		// has this split because set_baserel_size_estimates stores rel->rows
+		// already scaled by the restriction clauses' selectivity.
+		//
+		// This walker read the estimate off the collapsed-INTO node and so
+		// printed the UNFILTERED count, while plain EXPLAIN printed the
+		// filtered one. The two modes therefore disagreed on rows= for the
+		// same scan, and every EXPLAIN ANALYZE artefact overstated the
+		// planner's estimate on exactly the nodes where it matters most.
+		rowSrc := n
+		if attachedFilterNode != nil {
+			rowSrc = attachedFilterNode
+		}
+		est := optimizer.EstimateRows(rowSrc)
 		if est <= 0 {
 			est = 1
 		}
@@ -1651,7 +1668,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// reference shares one body Node, so the section IS the subtree that
 	// ran (the later references replay from ctx.CTERowCache). M0125-0049.
 	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
-		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
 	})
 
 	// Sublink subtrees keep their instrumentation: stats is passed
@@ -1659,12 +1676,12 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
-		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
 	}
 }
 

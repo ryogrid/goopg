@@ -73,16 +73,36 @@ reports `changed=0` against a pre-P0 goopg capture.
 - [ ] **P0-03** Nodes above the seam print costs derived from the legacy
       estimate rather than zeros; a test asserts no node renders
       `cost=0.00..0.00`. *design: 08 §3; gate: units.*
+- [x] **P0-04d** Schema qualification followed no mode — `2a63fbe21`; gate:
+      `TestSchemaQualificationFollowsVerbosity`, units. **Not in the original
+      plan**, found while reading P0-04's numbering rule and larger in impact:
+      PG qualifies a relation in VERBOSE only (`explain.c:4409-4411`) and never
+      qualifies an index (`explain_get_index_name`), while goopg qualified both
+      in both modes — one guaranteed rendering divergence on **every scan node
+      of every plan**, which would have swamped the P0-05/06 roll-up. Threading
+      the mode was load-bearing: `describePlanVerbose` delegates to
+      `describePlan` for types with no verbose arm, so a mode-independent
+      renderer makes one of the two modes wrong whichever way it is fixed.
 - [ ] **P0-04** Align EXPLAIN's relation-name suffix numbering with
       `select_rtable_names`. De-duplication already exists
       (`internal/executor/explain_names.go`); the numbering diverges, and the
       `shape_mismatches = 46` figure was attributed to its absence, so
       re-measure after aligning. *design: 08 §3 P0-3; gate: units + regress;
       re-pin the goopg-vs-goopg baseline in the same commit.*
-- [ ] **P0-04b** Fix the EXPLAIN mode asymmetry: the plain walker sources
-      `rows=` from `attachedFilterNode`, the ANALYZE walker from the node, so
-      the two modes can print different estimates for the same filtered scan.
-      *design: 08 §3 P0-3; gate: units.*
+- [x] **P0-04b** EXPLAIN mode asymmetry on `rows=` — `TestWalkersAgreeOnRowEstimate`;
+      units green. Negative control: with the defect reintroduced the plain
+      walker prints `rows=50` and ANALYZE prints `rows=10000` for the same
+      filtered scan — a **200x** overstatement on exactly the nodes where the
+      estimate matters most, in the mode most artefacts are captured in.
+      The test needed a *selective* predicate: with a `true` constant
+      (selectivity 1.0) it passed with the defect present.
+- [ ] **P0-04d** *(new, landed `2a63fbe21`)* — see the closed entry below.
+- [ ] **P0-04e** `planToJSON` does not collapse `Project`/`Filter` wrappers, so
+      `EXPLAIN (FORMAT JSON)` emits a different TREE from the text walker and
+      from PG, which has no such nodes at all. Found while fixing P0-04b;
+      deliberately not half-fixed there, since the JSON defect is tree shape
+      rather than the row estimate. The parity instrument parses TEXT, so this
+      does not block P0-05/06. *design: impl/P0-A §3.5.*
 - [x] **P0-04c** — `f2ac4fdfc`; gates: `TestFlagProvenanceEnvIsGenerated`,
       `TestFlagProvenanceTableCoversPlannerEnv`, new
       `TestFlagProvenanceDetectorSeesHelperWrappedReads`, full
