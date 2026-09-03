@@ -96,12 +96,39 @@ reports `changed=0` against a pre-P0 goopg capture.
       the mode was load-bearing: `describePlanVerbose` delegates to
       `describePlan` for types with no verbose arm, so a mode-independent
       renderer makes one of the two modes wrong whichever way it is fixed.
-- [ ] **P0-04** Align EXPLAIN's relation-name suffix numbering with
-      `select_rtable_names`. De-duplication already exists
-      (`internal/executor/explain_names.go`); the numbering diverges, and the
-      `shape_mismatches = 46` figure was attributed to its absence, so
-      re-measure after aligning. *design: 08 §3 P0-3; gate: units + regress;
-      re-pin the goopg-vs-goopg baseline in the same commit.*
+- [x] **P0-04** EXPLAIN relation-name rendering vs `select_rtable_names`
+      — **CLOSED this commit; the item as written misdiagnosed the gap.**
+      Live goopg-vs-PG probes on aliased self-joins showed the defect is NOT
+      suffix numbering but DROPPED second aliases: `Index Scan using
+      customer_nation_fkidx on customer` + `Index Cond: (c_nationkey =
+      c_nationkey)` where PG prints `on customer c2` + `(c_nationkey =
+      c1.c_nationkey)`. Root causes, both renderer-only: the IndexScan arms
+      (plain + verbose) and the BitmapHeapScan arm had no alias branch while
+      the SeqScan arms did, and `formatIndexCondParts` rendered key sides via
+      `formatExprPGReg` (qualify=false) where PG qualifies the outer Var.
+      Fixed: alias branch mirroring SeqScan in the three arms; new
+      `formatIndexCondKey` qualifying the key side under the existing
+      `rtable_size > 1` mirror (single-relation scans stay bare; shared with
+      the IndexOnly path). The planner already stamps distinct aliases/srcs
+      per occurrence (probed at node level); the unaliased-duplicate `_1`
+      numbering (M0128-P5.1) and a no-alias duplicate being a PG syntax
+      error were verified unchanged. Gates: 3 new hermetic tests, one
+      existing NLI expectation updated to the PG-faithful form (shape
+      unchanged), full executor suite, units gate, regress 4/52 with an
+      IDENTICAL failing set proved by a stashed rerun (join/aggregates diffs
+      shrink: `(unique1 = unique1)` → `(unique1 = t1.unique1)` etc.),
+      spotcheck Q12=2/Q13=34, live goopg-vs-PG naming parity on the probe.
+      `warm-stats-base.txt` carries zero index/bitmap lines, so no live
+      baseline re-pin; historical `analysis/` artefacts stay frozen by
+      design. REMAINING, explicitly out of this slice: `IndexOnlyScan` has
+      no `Alias` field (planner-side stamp needed for PG's `on customer c2`
+      on IOS probes); full-rtable-order numbering needs planner-stamped
+      range-table identity (the M0125-0039 varno deferral, still open).
+      DISCOVERED follow-up (not this item): PG 18 eliminates PK self-joins
+      (`remove_useless_self_joins`: aliased PK self-join plans as a bare
+      `Seq Scan on customer c2`) where goopg plans the full join — join
+      removal parity, Phase-3 territory.
+      *design: 08 §3 P0-3; gate was units + regress.*
 - [x] **P0-04b** EXPLAIN mode asymmetry on `rows=` — `TestWalkersAgreeOnRowEstimate`;
       units green. Negative control: with the defect reintroduced the plain
       walker prints `rows=50` and ANALYZE prints `rows=10000` for the same

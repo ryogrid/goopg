@@ -1007,6 +1007,24 @@ func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
 
+// formatIndexCondKey renders the key side of one Index Cond bound. The
+// index-column side always prints bare (PG prints the catalog column name),
+// but the KEY side is qualified when the query names more than one relation:
+// PG's show_scan_qual names an outer Var with its relation, printing
+// `(c_nationkey = c1.c_nationkey)` for a self-join probe. P0-04: without
+// this, that probe renders `(c_nationkey = c_nationkey)` — a
+// self-comparison that reads as unsatisfiable, the same defect class
+// M0125-0039 removed from Filter lines. A single-relation scan stays bare
+// (reg.names().qualify mirrors upstream's rtable_size > 1 rule), and an
+// unresolvable binding declines to the bare name as before.
+func formatIndexCondKey(e optimizer.Expr, reg *subPlanReg) string {
+	qualify := false
+	if reg != nil {
+		qualify = reg.names().qualify()
+	}
+	return formatExprQual(e, reg, qualify)
+}
+
 // formatIndexCondParts is the shared body of formatIndexCond /
 // formatIndexOnlyCond: sibling paths that must not disagree.
 func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg) string {
@@ -1019,17 +1037,17 @@ func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowK
 	// Multi-column equality probe.
 	if len(p.Keys) > 0 && len(cols) >= len(p.Keys) {
 		if len(p.Keys) == 1 {
-			return wrapParen(cols[0] + " = " + formatExprPGReg(p.Keys[0], reg))
+			return wrapParen(cols[0] + " = " + formatIndexCondKey(p.Keys[0], reg))
 		}
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = cols[i] + " = " + formatExprPGReg(k, reg)
+			parts[i] = cols[i] + " = " + formatIndexCondKey(k, reg)
 		}
 		return wrapParen(strings.Join(parts, " AND "))
 	}
 	// Single-column equality.
 	if p.Key != nil && len(cols) > 0 {
-		return wrapParen(cols[0] + " = " + formatExprPGReg(p.Key, reg))
+		return wrapParen(cols[0] + " = " + formatIndexCondKey(p.Key, reg))
 	}
 	// Range scan.
 	if (p.LowKey != nil || p.HighKey != nil) && len(cols) > 0 {
@@ -1040,14 +1058,14 @@ func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowK
 			if p.LowOp == parser.OpGt {
 				loOp = ">"
 			}
-			parts = append(parts, col+" "+loOp+" "+formatExprPGReg(p.LowKey, reg))
+			parts = append(parts, col+" "+loOp+" "+formatIndexCondKey(p.LowKey, reg))
 		}
 		if p.HighKey != nil {
 			hiOp := "<="
 			if p.HighOp == parser.OpLt {
 				hiOp = "<"
 			}
-			parts = append(parts, col+" "+hiOp+" "+formatExprPGReg(p.HighKey, reg))
+			parts = append(parts, col+" "+hiOp+" "+formatIndexCondKey(p.HighKey, reg))
 		}
 		if len(parts) > 0 {
 			return wrapParen(strings.Join(parts, " AND "))
@@ -2004,6 +2022,12 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
 		}
+		// P0-04: print the FROM-clause alias like the SeqScan arm does, so
+		// a self-join's second scan renders `on customer c2` as PG's
+		// select_rtable_names does, not a bare second `on customer`.
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("Index Scan using %s on %s %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
+		}
 		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.IndexOnlyScan:
 		// S6 max rewrite: PG's ExplainIndexScanDetails (explain.c:4330-4336)
@@ -2185,6 +2209,10 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
 		}
+		// P0-04: same alias branch as the verbose arm above.
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("Index Scan using %s on %s %s", explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
+		}
 		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.IndexOnlyScan:
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
@@ -2277,6 +2305,10 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return "Bitmap Heap Scan on " + dname
+		}
+		// P0-04: alias branch, same rule as the SeqScan arm.
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return "Bitmap Heap Scan on " + explainRelName(p.Table, verbose) + " " + p.Alias
 		}
 		return "Bitmap Heap Scan on " + explainRelName(p.Table, verbose)
 	case *optimizer.BitmapIndexScan:

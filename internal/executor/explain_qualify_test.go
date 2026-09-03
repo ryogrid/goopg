@@ -3,6 +3,9 @@ package executor
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // M0125-0039 — EXPLAIN printed column references unqualified, so a real
@@ -279,5 +282,86 @@ func TestExplainNodeLabelDisambiguatesRepeatedTable(t *testing.T) {
 	if !hasDisambiguated {
 		t.Errorf("expected one Seq Scan on eq_r_1 (disambiguated) line\nplan:\n%s",
 			strings.Join(lines, "\n"))
+	}
+}
+
+// P0-04 — an index scan over an aliased relation must carry the alias in its
+// node header, as PG's select_rtable_names does. The SeqScan arm always did;
+// the index arms dropped it, so a self-join's second scan rendered a bare
+// second `on customer` where PG prints `on customer c2` (live case: NLI
+// probe over customer c2). Hermetic: hand-built nodes through the same
+// header arms the walker uses, so no planner shape is assumed.
+func TestExplainIndexScanHeaderShowsAlias(t *testing.T) {
+	tbl := &catalog.Table{Name: "customer", Schema: "public"}
+	idx := &catalog.Index{Name: "customer_pk"}
+	n := &optimizer.IndexScan{Table: tbl, Index: idx, Alias: "c2"}
+	nm := newExplainNames(n)
+
+	if got := describePlan(n, nm); got != "Index Scan using customer_pk on customer c2" {
+		t.Errorf("plain header = %q, want %q", got, "Index Scan using customer_pk on customer c2")
+	}
+	if got := describePlanVerbose(n, true, nm); got != "Index Scan using customer_pk on public.customer c2" {
+		t.Errorf("verbose header = %q, want %q", got, "Index Scan using customer_pk on public.customer c2")
+	}
+
+	// No alias: rendering unchanged (bare table, schema rules as before).
+	bare := &optimizer.IndexScan{Table: tbl, Index: idx}
+	bm := newExplainNames(bare)
+	if got := describePlan(bare, bm); got != "Index Scan using customer_pk on customer" {
+		t.Errorf("bare plain header = %q, want %q", got, "Index Scan using customer_pk on customer")
+	}
+	if got := describePlanVerbose(bare, true, bm); got != "Index Scan using customer_pk on public.customer" {
+		t.Errorf("bare verbose header = %q, want %q", got, "Index Scan using customer_pk on public.customer")
+	}
+
+	// Alias identical to the table name: no redundant suffix (SeqScan rule).
+	self := &optimizer.IndexScan{Table: tbl, Index: idx, Alias: "customer"}
+	sm := newExplainNames(self)
+	if got := describePlan(self, sm); got != "Index Scan using customer_pk on customer" {
+		t.Errorf("self-aliased header = %q, want %q", got, "Index Scan using customer_pk on customer")
+	}
+}
+
+// P0-04 — same alias rule for the bitmap heap scan header.
+func TestExplainBitmapHeapScanHeaderShowsAlias(t *testing.T) {
+	tbl := &catalog.Table{Name: "customer", Schema: "public"}
+	n := &optimizer.BitmapHeapScan{Table: tbl, Alias: "c2"}
+	nm := newExplainNames(n)
+
+	if got := describePlan(n, nm); got != "Bitmap Heap Scan on customer c2" {
+		t.Errorf("header = %q, want %q", got, "Bitmap Heap Scan on customer c2")
+	}
+}
+
+// P0-04 — a self-join probe's Index Cond qualifies the outer key side:
+// `(c_nationkey = c1.c_nationkey)`, not the self-comparison
+// `(c_nationkey = c_nationkey)` PG would never print. The index-column side
+// stays bare (catalog name, as PG prints it). Hermetic: the probe key is
+// rendered straight through formatIndexCond with a two-binding name table.
+func TestExplainIndexCondQualifiesOuterProbeKey(t *testing.T) {
+	tbl := &catalog.Table{Name: "customer", Schema: "public"}
+	idx := &catalog.Index{Name: "customer_nation_fkidx", Columns: []string{"c_nationkey"}}
+	key := &optimizer.ColumnRef{Name: "c_nationkey", Index: 0, SourceTableIdx: 1}
+	nm := &explainNames{
+		bySource: map[int16]string{1: "c1", 2: "c2"},
+		cols: map[int16]map[string]bool{
+			1: {"c_nationkey": true},
+			2: {"c_nationkey": true},
+		},
+	}
+	reg := &subPlanReg{rel: nm}
+	scan := &optimizer.IndexScan{Table: tbl, Index: idx, Alias: "c2", Key: key}
+
+	if got := formatIndexCond(scan, reg); got != "(c_nationkey = c1.c_nationkey)" {
+		t.Errorf("index cond = %q, want %q", got, "(c_nationkey = c1.c_nationkey)")
+	}
+
+	// Single-relation scan: the key side stays bare, as before.
+	solo := &explainNames{
+		bySource: map[int16]string{1: "customer"},
+		cols:     map[int16]map[string]bool{1: {"c_nationkey": true}},
+	}
+	if got := formatIndexCond(scan, &subPlanReg{rel: solo}); got != "(c_nationkey = c_nationkey)" {
+		t.Errorf("single-relation index cond = %q, want %q", got, "(c_nationkey = c_nationkey)")
 	}
 }
