@@ -450,7 +450,13 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of Slot range %d", cref.Name, cref.Index, w)}
 			}
 		}
-		return slot.Get(cref.Index), nil
+		// EX1-01 tail-poison: a poisoned datum here means some consumer read
+		// a scan column past the deform bound — a walk miss. checkDeformPoison
+		// panics only when the debug flag is armed, so release cost is one
+		// predictable branch.
+		d := slot.Get(cref.Index)
+		checkDeformPoison(d)
+		return d, nil
 	}
 	switch x := e.(type) {
 	case *optimizer.OuterColumnRef:
@@ -465,7 +471,11 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		if x.Index < 0 || x.Index >= len(outer) {
 			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/idx=%d out of range (width=%d)", x.Name, x.Index, len(outer))}
 		}
-		return outer[x.Index], nil
+		// EX1-01 tail-poison: an outer row can be a narrowed scan row replayed
+		// from an enclosing query.
+		d := outer[x.Index]
+		checkDeformPoison(d)
+		return d, nil
 	case *optimizer.ExecParamRef:
 		// PARAM_EXEC slot read (D4.1). The enclosing sublink's eval
 		// site bound the slot via bindSubPlanParams before running

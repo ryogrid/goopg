@@ -405,7 +405,7 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 	}
 
 	// Build the outer operator (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
-	outerOp, err := buildNode(o.plan.Outer)
+	outerOp, err := buildNode(o.plan.Outer, deformBoundFull)
 	if err != nil {
 		return err
 	}
@@ -884,7 +884,7 @@ func (o *bitmapAndOp) Open(ctx *Context) error {
 	o.inputs = make([]Operator, len(o.plan.Inputs))
 	o.inputBitmaps = make([]bitmapProducer, len(o.plan.Inputs))
 	for i, input := range o.plan.Inputs {
-		op, err := buildNode(input)
+		op, err := buildNode(input, deformBoundFull)
 		if err != nil {
 			return err
 		}
@@ -965,7 +965,7 @@ func (o *bitmapOrOp) Open(ctx *Context) error {
 	o.inputs = make([]Operator, len(o.plan.Inputs))
 	o.inputBitmaps = make([]bitmapProducer, len(o.plan.Inputs))
 	for i, input := range o.plan.Inputs {
-		op, err := buildNode(input)
+		op, err := buildNode(input, deformBoundFull)
 		if err != nil {
 			return err
 		}

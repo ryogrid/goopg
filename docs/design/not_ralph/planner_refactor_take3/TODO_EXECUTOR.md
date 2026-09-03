@@ -91,9 +91,7 @@ Exit: decode/detoast proportional to referenced columns on witnesses; Q9
 narrowed width recorded; values clean; plans unchanged. Consumes planner
 P4-01 target lists — general fix waits on P4-01 (13 §8.6).
 
-- [ ] EX1-01 Scan projection pushdown — `seqScanOp` decodes only target-list
-      columns; extend to index-only/batch paths as they gain targets.
-      *design: 13 §3; gate: values-diff both suites + pin + alloc arm.*
+- [x] EX1-01 Scan projection pushdown — this commit; gates: 30 unit tests + poison runs, TPC-H values 24/24 MATCH, TPC-DS PASS=95, plan-gate 22/22, Q6 3.2–4.0 s (vs 5.48 s baseline), alloc 0.97 GB (vs 1.06 GB); artifacts: `internal/executor/{scan_deform,executor,operators_storage,expr,exprnode,operators_bitmap}.go`, `internal/executor/scan_deform_bound_test.go`
 - [ ] EX1-02 Deform-some-attributes — generalise take5's 6-of-16 into the
       decode path: stop at the highest referenced attribute per consumer
       (`slot_getsomeattrs` analogue, 10 §3). Whole-row deform survives only

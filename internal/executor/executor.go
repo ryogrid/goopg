@@ -19,7 +19,7 @@ import (
 // rows/loops/timing counters. nil-scope (the default) returns
 // raw operators byte-for-byte unchanged.
 func Build(plan optimizer.Node) (Operator, error) {
-	return buildNode(plan)
+	return buildNode(plan, deformBoundNone)
 }
 
 // BuildWorker is the per-worker entry point for Gather/GatherMerge
@@ -30,10 +30,10 @@ func Build(plan optimizer.Node) (Operator, error) {
 // build. The entry point stays because gatherOp/gatherMergeOp and
 // join_worker_path_test.go name it as the worker seam.
 func BuildWorker(plan optimizer.Node) (Operator, error) {
-	return buildNode(plan)
+	return buildNode(plan, deformBoundNone)
 }
 
-func buildNode(plan optimizer.Node) (Operator, error) {
+func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 	switch p := plan.(type) {
 	case *optimizer.Values:
 		return maybeInstrument(p, newValuesOp(p)), nil
@@ -46,7 +46,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.FromUnnest:
 		return maybeInstrument(p, newFromUnnestOp(p)), nil
 	case *optimizer.OrdinalityWrap:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
@@ -54,7 +54,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.RowsFrom:
 		children := make([]Operator, len(p.Funcs))
 		for i, f := range p.Funcs {
-			c, err := Build(f)
+			c, err := buildNode(f, deformBoundFull)
 			if err != nil {
 				return nil, err
 			}
@@ -78,7 +78,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.VerifyHeapam:
 		return maybeInstrument(p, newVerifyHeapamOp(p)), nil
 	case *optimizer.ProjectSet:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
@@ -109,7 +109,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 	case *optimizer.MaterializedCTEScan:
 		return maybeInstrument(p, newMaterializedCTEScanOp(p)), nil
 	case *optimizer.Project:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -119,7 +119,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// — no borrow contract needed.
 		return maybeInstrument(p, newProjectOp(p, child)), nil
 	case *optimizer.Filter:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -152,7 +152,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// filter itself to BorrowedRow.
 		return maybeInstrument(p, newFilterOp(p, child)), nil
 	case *optimizer.Limit:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -161,23 +161,26 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// parent via SetBorrow.
 		return maybeInstrument(p, newLimitOp(p, child)), nil
 	case *optimizer.Sort:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newSortOp(p, child)), nil
 	case *optimizer.Join:
-		left, err := Build(p.Left)
+		// EX1-01: deformBoundBelow examines the side-local keys first
+		// and resets to full width below on both sides.
+		joinBound := deformBoundBelow(p, bound)
+		left, err := buildNode(p.Left, joinBound)
 		if err != nil {
 			return nil, err
 		}
-		right, err := Build(p.Right)
+		right, err := buildNode(p.Right, joinBound)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newJoinOp(p, left, right)), nil
 	case *optimizer.NestedLoopIndexJoin:
-		outer, err := Build(p.Outer)
+		outer, err := buildNode(p.Outer, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +214,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// needed at this boundary.
 		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan)), nil
 	case *optimizer.Aggregate:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -222,13 +225,19 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// read, no borrow contract needed.
 		return maybeInstrument(p, newAggregateOp(p, child)), nil
 	case *optimizer.WindowAgg:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newWindowOp(p, child)), nil
 	case *optimizer.SeqScan:
-		return maybeInstrument(p, newSeqScanOp(p)), nil
+		// EX1-01: stamp the threaded bound. effectiveDeformBound maps
+		// None/Full to full width; a narrow bound narrows the survivor
+		// deform in Next. Unset (0) also means full (safe default for
+		// directly-constructed scans that bypass both Build paths).
+		op := newSeqScanOp(p)
+		op.deformBound = effectiveDeformBound(bound, len(op.cols))
+		return maybeInstrument(p, op), nil
 	case *optimizer.IndexScan:
 		return maybeInstrument(p, newIndexScanOp(p)), nil
 	case *optimizer.IndexOnlyScan:
@@ -237,7 +246,7 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		if p.Child != nil {
 			// Result-with-child (S6 Slice 3d const-arg rewrite): build the inner
 			// scan so the One-Time Filter can stream projected rows through it.
-			child, err := Build(p.Child)
+			child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 			if err != nil {
 				return nil, err
 			}
@@ -247,13 +256,13 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// Targets once and emits exactly one row. No child to Build.
 		return maybeInstrument(p, newResultOp(p, nil)), nil
 	case *optimizer.LockRows:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newLockRowsOp(p, child)), nil
 	case *optimizer.Insert:
-		child, err := Build(p.Source)
+		child, err := buildNode(p.Source, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
@@ -270,44 +279,52 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		// Deliberately NOT migrated to the slab path: buildRec's default arm
 		// wraps this in an OpAdapter, so the live BuildFastIterator path
 		// reaches it with no slab changes and no shared per-node state.
+		//
+		// EX1-01: the bound is captured into the worker buildChild closure
+		// so every worker's private tree narrows the same leaves. A worker
+		// built through the public BuildWorker entry (no bound in scope)
+		// declines to full deform.
+		workerBound := deformBoundBelow(p, bound)
 		return maybeInstrument(p, newGatherOp(p, func() (Operator, error) {
-			return BuildWorker(p.Child)
+			return buildNode(p.Child, workerBound)
 		})), nil
 	case *optimizer.GatherMerge:
 		// Same per-worker construction as Gather; the difference is entirely in
-		// how the leader consumes the streams.
+		// how the leader consumes the streams. The GatherMerge keys (folded
+		// by deformBoundBelow) are leader-side consumers of the worker rows.
+		workerMergeBound := deformBoundBelow(p, bound)
 		return maybeInstrument(p, newGatherMergeOp(p, func() (Operator, error) {
-			return BuildWorker(p.Child)
+			return buildNode(p.Child, workerMergeBound)
 		})), nil
 	case *optimizer.Distinct:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newDistinctOp(p, child)), nil
 	case *optimizer.DistinctOn:
-		child, err := Build(p.Child)
+		child, err := buildNode(p.Child, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newDistinctOnOp(p, child)), nil
 	case *optimizer.SetOp:
-		left, err := Build(p.Left)
+		left, err := buildNode(p.Left, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
-		right, err := Build(p.Right)
+		right, err := buildNode(p.Right, deformBoundFull)
 		if err != nil {
 			left.Close()
 			return nil, err
 		}
 		return maybeInstrument(p, newSetOp(p, left, right)), nil
 	case *optimizer.RecursiveUnion:
-		anchor, err := Build(p.Anchor)
+		anchor, err := buildNode(p.Anchor, deformBoundFull)
 		if err != nil {
 			return nil, err
 		}
-		recursive, err := Build(p.Recursive)
+		recursive, err := buildNode(p.Recursive, deformBoundFull)
 		if err != nil {
 			anchor.Close()
 			return nil, err
@@ -482,14 +499,18 @@ func unwrapSeqScanOp(op Operator) *seqScanOp {
 	return nil
 }
 
-// buildRec is the recursive tree builder for BuildFast.
-func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
+// buildRec is the recursive tree builder for BuildFast. It threads the
+// EX1-01 deform bound exactly like buildNode; see scan_deform.go.
+func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) {
 	switch p := plan.(type) {
 	case *optimizer.SeqScan:
-		return tree.add(OpNode{Kind: OpSeqScan, childA: noChild, childB: noChild, state: newSeqScanOp(p)}), nil
+		// Same stamping as the buildNode SeqScan arm.
+		op := newSeqScanOp(p)
+		op.deformBound = effectiveDeformBound(bound, len(op.cols))
+		return tree.add(OpNode{Kind: OpSeqScan, childA: noChild, childB: noChild, state: op}), nil
 
 	case *optimizer.Filter:
-		childIdx, err := tree.buildRec(p.Child)
+		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return noChild, err
 		}
@@ -520,7 +541,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 			state: &filterState{predIdx: predIdx}}), nil
 
 	case *optimizer.Project:
-		childIdx, err := tree.buildRec(p.Child)
+		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return noChild, err
 		}
@@ -537,7 +558,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 			state: &projectState{schemaIdx: schemaIdx, targExprs: targExprs}}), nil
 
 	case *optimizer.Limit:
-		childIdx, err := tree.buildRec(p.Child)
+		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return noChild, err
 		}
@@ -562,7 +583,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 			}}), nil
 
 	case *optimizer.Sort:
-		childIdx, err := tree.buildRec(p.Child)
+		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
 		if err != nil {
 			return noChild, err
 		}
@@ -589,7 +610,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 		return tree.add(OpNode{Kind: OpDelete, childA: noChild, childB: noChild, state: &deleteOpState{op: op}}), nil
 
 	case *optimizer.Insert:
-		childIdx, err := tree.buildRec(p.Source)
+		childIdx, err := tree.buildRec(p.Source, deformBoundFull)
 		if err != nil {
 			return noChild, err
 		}
@@ -602,11 +623,14 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 		return tree.add(OpNode{Kind: OpInsert, childA: noChild, childB: noChild, state: &insertOpState{op: newInsertOp(p, childOp)}}), nil
 
 	case *optimizer.Join:
-		leftIdx, err := tree.buildRec(p.Left)
+		// Same terminator rule as the buildNode Join arm: keys examined
+		// first, full width below on both sides.
+		joinBound := deformBoundBelow(p, bound)
+		leftIdx, err := tree.buildRec(p.Left, joinBound)
 		if err != nil {
 			return noChild, err
 		}
-		rightIdx, err := tree.buildRec(p.Right)
+		rightIdx, err := tree.buildRec(p.Right, joinBound)
 		if err != nil {
 			return noChild, err
 		}
@@ -619,7 +643,11 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 		// For non-migrated operators, build the legacy Operator tree
 		// and wrap in an adapter. This path preserves the existing
 		// operator semantics exactly — Open/Next/Close are forwarded.
-		legacyOp, err := Build(plan)
+		// The incoming bound threads through (not a fresh root Build)
+		// so ancestors folded above the adapter boundary still cover
+		// the leaves inside; reshape boundaries below drop it again by
+		// the same rules.
+		legacyOp, err := buildNode(plan, bound)
 		if err != nil {
 			return noChild, err
 		}
@@ -637,7 +665,7 @@ func BuildFast(plan optimizer.Node) (*opTreeSlab, int32, error) {
 		plans:   make(planTreeSlab, 0, 8),
 		schemas: make([]optimizer.Schema, 0, 4),
 	}
-	rootIdx, err := tree.buildRec(plan)
+	rootIdx, err := tree.buildRec(plan, deformBoundNone)
 	if err != nil {
 		return nil, noChild, err
 	}

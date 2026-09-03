@@ -1038,6 +1038,15 @@ type seqScanOp struct {
 	// and docs/design/not_ralph/tpch-q6-numeric-decode/.
 	prefilter    scanPrefilter
 	prefilterSet bool
+	// deformBound is the EX1-01 exclusive deform width: the survivor path
+	// deforms columns [0, deformBound) instead of the full row, because the
+	// Build-time consumer walk proved no consumer reads past it. Stamped by
+	// both Build paths (buildNode / buildRec); 0 means unset and behaves as
+	// full width (the safe default for directly-constructed scans that
+	// bypass both paths, e.g. COPY's scan). scanRow/schema stay full-width —
+	// only the deform window narrows, so bound == len(cols) takes the exact
+	// pre-EX1-01 path. See scan_deform.go.
+	deformBound int
 	// scanSlot is the boxed SlotView over scanRow, cached because
 	// converting a slice to an interface heap-allocates
 	// (runtime.convTslice) and scanRow's identity does not change
@@ -1805,6 +1814,9 @@ func (o *seqScanOp) releaseScanState() {
 		o.activePage = nil
 	}
 	if o.scanRow != nil {
+		// EX1-01: scrub tail poison before the pooled row is released so
+		// a poisoned buffer never leaks into a later flag-off scan.
+		scrubDeformPoison(o.scanRow)
 		releaseRow(o.scanRow)
 		o.scanRow = nil
 	}
@@ -1836,6 +1848,8 @@ func (o *seqScanOp) rewind() error {
 		o.activePage = nil
 	}
 	if o.scanRow != nil {
+		// EX1-01: same poison scrub as releaseScanState.
+		scrubDeformPoison(o.scanRow)
 		releaseRow(o.scanRow)
 		o.scanRow = nil
 	}
@@ -2087,6 +2101,17 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// the schema. HeapNattsMask = 0x07FF; storedNatts==0 means natts
 			// was not explicitly set (legacy goopg rows without PG format).
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			// EX1-01: the narrowed survivor width. Unset (0) or full
+			// width takes the exact pre-EX1-01 path below; otherwise
+			// only [0, deformBound) is deformed and the tail keeps its
+			// previous contents (poisoned at deform time when the debug
+			// flag is armed). The bound always covers the prefilter
+			// prefix: the walk folds the same predicate it derives
+			// MaxCols from.
+			survivorBound := len(o.cols)
+			if o.deformBound > 0 && o.deformBound < survivorBound {
+				survivorBound = o.deformBound
+			}
 			if o.prefilterSet {
 				// Two-phase deform, PG's slot_getsomeattrs discipline: decode
 				// only the columns the predicate reads, test it, and pay for
@@ -2119,12 +2144,24 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 					// perr != nil: fall through and let filterOp raise it, so
 					// the error surfaces from exactly where it did before.
 				}
-				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, o.prefilter.MaxCols, len(o.cols), off); derr != nil {
+				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, o.prefilter.MaxCols, survivorBound, off); derr != nil {
 					if o.pinned != nil {
 						o.pinned.RUnlock()
 					}
 					continue
 				}
+				// EX1-01: stamp the undeformed tail when the debug flag is
+				// armed; any consumer read past survivorBound then panics
+				// instead of observing a stale Datum.
+				poisonDeformTail(o.scanRow, survivorBound)
+			} else if survivorBound < len(o.cols) {
+				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, 0, survivorBound, 0); derr != nil {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
+				poisonDeformTail(o.scanRow, survivorBound)
 			} else if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
