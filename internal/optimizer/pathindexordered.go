@@ -178,6 +178,9 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 
 		totalTablePages: totalPages,
 	})
+	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+	// path-creation time. Assert-only — never applied, never costed.
+	tgt, tgtKnown := scanPathTarget(rel)
 	addPath(rel, &Path{
 		Kind: PathIndexScan,
 		Rel:  rel,
@@ -203,6 +206,8 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		//
 		// Empty, and that is the entire point of the slice.
 		RequiredOuter: 0,
+		Target:        tgt,
+		TargetKnown:   tgtKnown,
 	}, "index.ordered")
 	return true
 }

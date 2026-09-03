@@ -117,6 +117,38 @@ func narrowPlanOutput(n Node, lay outputLayout, keep []int) (Node, outputLayout)
 	return &Project{Child: n, Targets: targets, schema: schema}, newLay
 }
 
+// scanPathTarget computes a scan path's Slice-1 Target (planner-p4-01-target
+// DESIGN, "Slice 1"): the ascending leaf-output positions of the statement's
+// needed columns, read off rel at path-creation time.
+//
+// The second return is false ("unknown", decline) when the needed set carries
+// no information (NeededColsKnown false or a nil set — the P4-01b lesson-1
+// ordering hazard: any scan path created before `stampNeededColsOnRels` runs
+// must record unknown rather than a wrong list) or when the rel carries no
+// leaf schema to take positions from. The range loop below is the cheap
+// invariant check at path creation: neededKeepSet derives its indices from
+// this same schema, so a violation can never fire on valid input — and on
+// invalid input it declines rather than panics, since no user query may panic.
+func scanPathTarget(rel *RelOptInfo) ([]int, bool) {
+	if rel == nil || !rel.NeededColsKnown || rel.NeededCols == nil || rel.baseLeaf == nil {
+		return nil, false
+	}
+	out := rel.baseLeaf.Output()
+	keep := neededKeepSet(out, rel.NeededCols)
+	if keep == nil {
+		// neededKeepSet returns nil only for a nil needed set, excluded
+		// above; a known-but-empty set yields a non-nil empty slice. This
+		// arm can never fire — decline rather than invent.
+		return nil, false
+	}
+	for _, c := range keep {
+		if c < 0 || c >= len(out) {
+			return nil, false
+		}
+	}
+	return keep, true
+}
+
 // neededKeepSet returns the ascending indices of n's output columns whose names
 // are in `needed`.
 //

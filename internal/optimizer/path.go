@@ -121,6 +121,27 @@ type Path struct {
 	NCols       int
 	AvgVarBytes float64
 
+	// Target / TargetKnown is the scan's emitted-column list — take2 P4-01
+	// Slice 1 (planner-p4-01-target DESIGN, "Slice 1"): the ordered
+	// emitted-column list computed from NeededCols at path-creation time,
+	// extending the landed NCols/AvgVarBytes pair toward a column list. SCAN
+	// paths only (PathSeqScan/PathIndexScan); unset on every other kind.
+	//
+	// Stored in EMITTED-SCHEMA order — ascending leaf-output positions, the
+	// shape `neededKeepSet` returns — so Slice 2's ascending checks pass
+	// without guard loosening. NEVER applied: no createPlan change, no cost
+	// change — behaviour-neutral by construction (modulo allocator noise: one
+	// small slice header per path). TargetKnown false means "unknown": the
+	// collector declined (NeededColsKnown false) or the rel carries no leaf
+	// schema, and no narrowing may be attempted. It is NOT the same as an
+	// empty list.
+	//
+	// Must-avoid list: comparePaths dims (Target stays out), cost readers
+	// (pathNCols/pathAvgVarBytes read NCols/AvgVarBytes only), DPPATH format,
+	// EXPLAIN output, any Path equality/golden.
+	Target      []int
+	TargetKnown bool
+
 	// DisabledNodes reproduces PG 18's path->disabled_nodes (the count of
 	// enable_*-disabled nodes below this path). goopg has no enable_* GUCs, so it
 	// is always 0 today; carried so the dominance order matches PG and adding

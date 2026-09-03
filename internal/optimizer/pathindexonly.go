@@ -112,6 +112,9 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		indexOnly:       true,
 		allVisFrac:      relAllVisibleFraction(tbl, relPages),
 	})
+	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+	// path-creation time (see the Target comment on the literal below).
+	tgt, tgtKnown := scanPathTarget(rel)
 	addPath(rel, &Path{
 		Kind:             PathIndexScan,
 		Rel:              rel,
@@ -128,6 +131,11 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		// hashsize.Choose exists to prevent.
 		NCols:       len(covered),
 		AvgVarBytes: coveredAvgVarBytes(tbl, covered),
+		// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+		// path-creation time. Assert-only — never applied, never costed; the
+		// NCols/AvgVarBytes pair above is unchanged.
+		Target:      tgt,
+		TargetKnown: tgtKnown,
 		// No index clauses: this is the full-index-scan shape, and
 		// `createPlan` reads the empty list as exactly that.
 	}, "indexonly")

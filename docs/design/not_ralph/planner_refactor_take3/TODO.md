@@ -510,7 +510,10 @@ sufficient per P4-01b above):
 - [ ] P4-01 `PathTarget` + projection: per-path targets
       (`make_group_input_target`, `make_window_input_target`,
       `make_sort_input_target`, `apply_scanjoin_target_to_paths`; 01 §3) with
-      setrefs-style fixup at `create_plan` time. Gate on **values**
+      setrefs-style fixup at `create_plan` time. Progress 2026-09-04:
+      Slice 1 landed (scan-Path `Target` payload, assert-only, changed=0 +
+      values-identical); Slices 2/3 per `docs/design/planner-p4-01-target/DESIGN.md`.
+      Gate on **values**
       (`tpch-runner -digest` + `-diff`, all items), `NBatch` 2→1 on the
       witness (TPC-H Q9 hash build, EXPLAIN `Batches:` at `work_mem` 64 MB
       S-cold), `DPPATH` hash total below merge total. Threshold correction:

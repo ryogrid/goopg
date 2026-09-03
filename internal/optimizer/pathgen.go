@@ -26,12 +26,17 @@ package optimizer
 // count of the scan's restriction qual.
 func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOps, parallelWorkers int, leaderParticipates bool) {
 	seqCost := costSeqscan(cp, relPages, rel.Rows, numQualOps)
+	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+	// path-creation time. Assert-only — never applied, never costed.
+	tgt, tgtKnown := scanPathTarget(rel)
 	addPath(rel, &Path{
 		Kind:         PathSeqScan,
 		Rel:          rel,
 		Rows:         rel.Rows,
 		Cost:         seqCost,
 		ParallelSafe: parallelWorkers > 0,
+		Target:       tgt,
+		TargetKnown:  tgtKnown,
 	}, "scan.seq")
 	if parallelWorkers > 0 {
 		// Each worker processes ~1/d of the pages and tuples; the seq scan's
@@ -44,6 +49,8 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 			Cost:            Cost{Startup: 0, Total: seqCost.Total / d},
 			ParallelSafe:    true,
 			ParallelWorkers: parallelWorkers,
+			Target:          tgt,
+			TargetKnown:     tgtKnown,
 		}, "scan.seq.partial")
 	}
 }
