@@ -247,3 +247,8 @@ nightly batch already running (lock: /home/ryo/.ralph/locks/goopg-nightly-run.lo
 2026-09-03T01:13:28+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-09-03T01:43:41+09:00 [RUN]	S1 barrier reached
 2026-09-03T02:20:52+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-09-03T02:22:35+09:00 [RUN]	log-push: committed + pushed batch logs to origin/planner-refac-bigbang
+2026-09-04T01:37:03+09:00 [RUN]	start run_id=20260904-013702 sha=0873087e dirty=27 src_fp=166545909682a89a stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-09-04T01:37:14+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-09-04T02:05:54+09:00 [RUN]	S1 barrier reached
+2026-09-04T02:28:40+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
