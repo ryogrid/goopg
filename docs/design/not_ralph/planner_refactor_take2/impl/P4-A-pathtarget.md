@@ -542,7 +542,17 @@ per §13.5.
 
 ---
 
-## 16. Revision 8 (2026-09-03) — where the `Project` goes, and why not at the join
+## 16. Revision 8 — **PARTLY SUPERSEDED by §18; see the note**
+
+> Its diagnosis stands: a `Project` bolted on AFTER `joinInputsFor` has computed
+> `merged` trips the layout/schema panic. Its PRESCRIPTION — "the child's own
+> `createPlan` arm must emit the Project" — is superseded. §18 narrows the
+> `(node, layout)` PAIR *inside* `joinInputsFor`, between
+> `createPlanNode(innerPath)` and that same panic, which satisfies the
+> constraint without touching every arm. Take the constraint from here and the
+> insertion point from §18.
+
+## 16 (historical). Revision 8 (2026-09-03) — where the `Project` goes, and why not at the join
 
 Rev 7 decided the mechanism. Attempting the insertion surfaced a placement
 constraint the design did not state; recorded here because it is the difference
@@ -667,6 +677,20 @@ a consistent pair, and the existing panic guards the helper on the first mistake
 
 This is why rev 8's "wrap at the join arm" is wrong and this is not: the wrap
 must happen where BOTH halves are still in hand.
+
+### Restrict to `PathHashJoin`
+
+`joinInputsFor` is SHARED — `createMergeJoinPlan` calls it with
+`"PathMergeJoin"` — so an unguarded narrowing there also narrows merge-join
+inputs. Guard on `kind == "PathHashJoin"`.
+
+The reason is not caution but cost: it is the build side's RESIDENCY that pays
+`48 bytes × columns × rows`, and only a hash join has one. A merge join streams
+and a nested loop rescans, so neither recovers memory from narrowing while both
+would still pay the projection's per-row cost. Narrowing them is a pure loss.
+
+`createHashJoinPlan` passes the literal `"PathHashJoin"` and hashes the INNER
+(`Right: in.inner`, `BuildLeft` false), so `innerPath` is the build side.
 
 ### The keep-rule
 

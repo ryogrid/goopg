@@ -906,10 +906,20 @@ not grow; no query slower than 1.2×.
       part of the cache key, or a GUC change invalidates; a test asserts
       `SET random_page_cost` changes the cached plan. Removes the
       `plannerScanTogglesActive` bypass. *design: 08 §5.1, risk R7.*
-- [ ] **P2-05** `enable_*` via `Path.DisabledNodes` as PG 18 does; delete
+- [~] **P2-05** `enable_*` via `Path.DisabledNodes` as PG 18 does; delete
       producer-skipping. All `enable_*` GUCs become live; retire
       `enable_nestloop_index`. *design: 08 §5.2; gate: an `enable_X=off` test
       per flag, plan-parity + timing.*
+      **JOIN METHODS LANDED (`656236ab1`).** `enable_hashjoin`, `enable_mergejoin`
+      and `enable_nestloop` had exactly one reference outside their registration
+      — the `pg_settings` view — so `SET enable_hashjoin = off` was accepted and
+      did nothing. They now set `Path.DisabledNodes` via `disabledNodesFor`,
+      which is PG 18's mechanism: the producer still runs, so a query whose only
+      legal plan uses a disabled method still plans. Verified live
+      (Hash Join -> Merge Join, same answer). TPC-H 242.38s, 24 MATCH.
+      Still open, hence `[~]`: producer-skipping for the SCAN toggles
+      (`enable_seqscan` and friends) is untouched, and `enable_nestloop_index`
+      is not retired — it was made per-session under P2-02c instead.
 - [x] **P2-06** `cost_material` and a Material path; the merge-join
       materialise-inner decision becomes a cost comparison. *design: 08 §5.3.*
       **Landed 2026-09-03, and NOT as written on either half.**
@@ -1039,8 +1049,14 @@ not grow; no query slower than 1.2×.
       prerequisite is P3's `deconstruct_jointree` with `SpecialJoinInfo` in the
       DP, which is precisely the item that brings semi/anti into the search.
       Same shape as P2-08: a faithful cost term whose consumer does not exist.
-- [ ] **P2-11** `estimate_hash_bucket_stats`: bucket-size and MCV-frequency
+- [~] **P2-11** `estimate_hash_bucket_stats`: bucket-size and MCV-frequency
       skew terms in hash-join costing. *design: 08 §5.3; depends on P1-15.*
+      **BUCKET-SIZE TERM LANDED (`bb32b976c`)** — TPC-H 234.51s, 24 MATCH;
+      TPC-DS PASS=95 MISMATCH=0, aggregate -1.2%. The MCV-frequency half is NOT
+      done: PG folds the inner key's MCV frequency in too, which needs the MCV
+      list at the cost site — a second plumbing step. Hence `[~]`.
+      The scoping note below predates the implementation and is kept for its
+      reasoning:
       **Reachable, unlike P2-10 and P2-08 — hash joins ARE costed — but large.**
       Scoped 2026-09-03. `hashJoinCost` charges the probe as
       `cpu_operator_cost * numHashClauses * outerRows + cpu_tuple_cost *
