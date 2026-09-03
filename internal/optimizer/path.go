@@ -27,7 +27,7 @@ const stdFuzzFactor = 1.01
 // uint16 bitmask the bushy DP keyed joinrels on; that DP is deleted as of
 // M0127-P6.3 and the width is now the search's own — `maxSearchRels`,
 // joinsearch.go.) This bounds a single query's join at 16 base relations.
-type RelSet uint16
+type RelSet uint32
 
 // Cost is PG's two-number cost, in PG's units (seq_page_cost = 1.0, design ch. 02
 // §3). Startup is the cost expended before the first row emerges; Total is the
@@ -112,6 +112,14 @@ type Path struct {
 	// only for partial paths (design ch. 08 §2). Unused until C5.
 	ParallelSafe    bool
 	ParallelWorkers int
+
+	// NCols / AvgVarBytes describe what THIS PATH emits, when that is narrower
+	// than its relation — PG's `pathtarget` at the granularity goopg needs for
+	// hash sizing. Zero NCols means "not narrowed"; read them through
+	// pathNCols / pathAvgVarBytes, never directly, so the fallback to the
+	// rel's figures stays in one place.
+	NCols       int
+	AvgVarBytes float64
 
 	// DisabledNodes reproduces PG 18's path->disabled_nodes (the count of
 	// enable_*-disabled nodes below this path). goopg has no enable_* GUCs, so it
@@ -229,6 +237,24 @@ type RelOptInfo struct {
 	// that does not care, which `relNCols` reads as "unknown".
 	NCols int
 
+	// NeededCols / NeededColsKnown carry the statement's needed-column set down
+	// to createPlan time, where `Path.Rel` is the only route to it:
+	// `createPlanNode` is a free function with no searchCtx, threading a
+	// parameter through every arm is churn, and a package global is what the
+	// P2-A review rejected for reading another session's state. So it travels
+	// as DATA on the rel, the way NCols and AvgVarBytes already do.
+	//
+	// take2 P4-01 rev 10 step 1. Nothing reads these yet — the consumer is the
+	// build-side narrowing in `joinInputsFor`, which lands behind
+	// GOOPG_NARROW_BUILD in a later slice. Added first, and separately, so that
+	// commit changes one thing.
+	//
+	// NeededColsKnown false means "no information": the collector declined the
+	// statement, and no narrowing may be attempted. It is NOT the same as an
+	// empty set.
+	NeededCols      map[string]bool
+	NeededColsKnown bool
+
 	// AvgVarBytes is the average total variable-width payload per row, in
 	// bytes — the sum of the per-column average widths (ColumnStats.AvgWidth)
 	// across every column of this relation. It feeds `hashsize.EntryBytes` as
@@ -324,6 +350,44 @@ func newRelOptInfo(relids RelSet, rows float64, width int) *RelOptInfo {
 // is a base rel. Zero is returned only when neither is available, and
 // hashJoinCost reads that as "assume no spill", which is what it did before
 // this function existed.
+// pathNCols is `relNCols` at PATH granularity — take2 P1-20's sibling in
+// P4-01.
+//
+// A path can produce FEWER COLUMNS than its relation. `pathgen.go` used to read
+// the column count from the rel, justified by "a parameterised path returns
+// fewer ROWS than its rel but the same columns". That is true of
+// parameterisation and false of PROJECTION: an index-only path emits only the
+// columns its index covers, so the hash geometry was solved for the relation's
+// full width while the executor measured the narrowed node's schema at runtime
+// (`len(o.left.Schema())`). Planner and executor disagreed about the size of
+// the same hash table.
+//
+// Zero means "this path does not narrow", and the rel's count is used.
+func pathNCols(p *Path) int {
+	if p != nil && p.NCols > 0 {
+		return p.NCols
+	}
+	if p == nil {
+		return 0
+	}
+	return relNCols(p.Rel)
+}
+
+// pathAvgVarBytes is pathNCols' variable-payload twin, and narrows for the same
+// reason: a projected path carries only the payload of the columns it emits.
+func pathAvgVarBytes(p *Path) float64 {
+	if p == nil {
+		return 0
+	}
+	if p.NCols > 0 {
+		return p.AvgVarBytes
+	}
+	if p.Rel != nil {
+		return p.Rel.AvgVarBytes
+	}
+	return 0
+}
+
 func relNCols(r *RelOptInfo) int {
 	if r == nil {
 		return 0
@@ -552,15 +616,35 @@ func comparePaths(a, b *Path) pathRel {
 // dominates. On an exact tie the incumbent is kept and newPath rejected, so
 // duplicates do not accumulate — matching PG's practical behaviour of keeping the
 // first of two indistinguishable paths.
-func addPath(rel *RelOptInfo, newPath *Path) {
+func addPath(rel *RelOptInfo, newPath *Path, producer string) {
+	before := len(rel.Pathlist)
 	rel.Pathlist = addToPathlist(rel.Pathlist, newPath)
+	// A candidate is accepted when it is present in the resulting list. Length
+	// alone is not sufficient — an accepted path can evict several incumbents
+	// and SHRINK the list — so the tail is checked instead (addToPathlist
+	// appends the survivor last).
+	tracePath(rel, newPath, producer, false, pathlistVerdict(rel.Pathlist, newPath, before))
+}
+
+// pathlistVerdict reports whether newPath survived addToPathlist.
+func pathlistVerdict(list []*Path, newPath *Path, _ int) pathVerdict {
+	if len(list) > 0 && list[len(list)-1] == newPath {
+		return verdictAccepted
+	}
+	return verdictDominated
 }
 
 // addPartialPath is add_partial_path (pathnode.c:798): the same dominance pruning
 // over the partial pathlist, used for parallel candidates (design ch. 08 §2).
 // Present now; exercised from C5.
-func addPartialPath(rel *RelOptInfo, newPath *Path) {
+func addPartialPath(rel *RelOptInfo, newPath *Path, producer string) {
+	before := len(rel.PartialPathlist)
 	rel.PartialPathlist = addToPathlist(rel.PartialPathlist, newPath)
+	// The partial list is traced too: `parallelism` is one of the nine
+	// divergence classes the parity work tracks, so a provenance channel that
+	// covered only addPath could not answer whether a partial path was ever
+	// offered.
+	tracePath(rel, newPath, producer, true, pathlistVerdict(rel.PartialPathlist, newPath, before))
 }
 
 func addToPathlist(list []*Path, newPath *Path) []*Path {
@@ -716,4 +800,26 @@ func setCheapest(rel *RelOptInfo) {
 	rel.CheapestStartup = cheapestStartup
 	rel.CheapestTotal = cheapestTotal
 	rel.CheapestParameterized = parameterized
+}
+
+// disabledNodesFor is PG 18's `disabled_nodes` accumulation
+// (pathnode.c: a path's count is the sum of its children's plus one if this
+// node's method is disabled by an enable_* GUC).
+//
+// PG deliberately does NOT skip the producer: a disabled method still yields a
+// path, so a query whose only legal plan needs that method still plans. The
+// dominance order in comparePathCosts prefers fewer disabled nodes before it
+// looks at cost, which is what makes the GUC a strong preference rather than a
+// prohibition. take2 P2-05.
+func disabledNodesFor(disabled bool, children ...*Path) int {
+	n := 0
+	for _, c := range children {
+		if c != nil {
+			n += c.DisabledNodes
+		}
+	}
+	if disabled {
+		n++
+	}
+	return n
 }

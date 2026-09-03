@@ -1521,17 +1521,74 @@ func DecodePGStatisticPhysicalRow(data []byte, bitmap []byte) (PGStatisticRow, e
 	// We only care about stanumbers1 (col 22) and stavalues1-2 (cols 27, 28).
 	off := pgStatisticPhysicalFixed
 
+	// Alignment is PER COLUMN TYPE, from pg_type.dat:
+	//   stanumbers1-5 are float4[] -> typalign 'i' (4 bytes)
+	//   stavalues1-5  are anyarray -> typalign 'd' (8 bytes)
+	// This walker used 4 for both, so a stavalues slot landing on a 4-aligned
+	// but not 8-aligned offset was read four bytes early. A column carrying a
+	// correlation (stanumbers3, 28 bytes, ending 4-aligned) followed by a
+	// histogram is exactly that case — which is why the histograms of analyzed
+	// relations did not survive a restart.
+	align := func(col int) int {
+		if col >= 27 { // stavalues1-5: anyarray, typalign 'd'
+			return 8
+		}
+		return 4 // stanumbers1-5: float4[], typalign 'i'
+	}
+
 	readVarlena := func(col int) ([]byte, error) {
 		if isNull(col) {
 			return nil, nil
 		}
-		// Align to 4 bytes (oidvector/anyarray/_float4 all use 'i' alignment).
-		off = (off + 3) &^ 3
+		a := align(col)
+		// PG's three varlena header forms, in the order postgres.h tests them.
+		// This walker previously assumed the 4-byte form unconditionally, but
+		// the WRITER (executor.encodeRowPG) follows heap_fill_tuple and emits
+		// the ONE-BYTE short header for any value of 127 bytes or less. So a
+		// small stanumbers slot — a correlation array is 29 bytes with its
+		// header — desynchronised the walk, and every column decoded after it
+		// was read from the wrong offset.
+		//
+		// That is why ANALYZE's histograms did not survive a restart: a column
+		// with a correlation (stanumbers3, short header) followed by a large
+		// histogram (stavalues2, 4-byte header) had the histogram read from a
+		// garbage offset and silently decoded as empty, so the planner fell
+		// back to DEFAULT_INEQ_SEL for every range predicate.
+		if off >= len(data) {
+			return nil, fmt.Errorf("pg_statistic col %d: varlena header truncated", col)
+		}
+		// VARATT_IS_1B_E: an external (TOAST pointer) datum. goopg writes a
+		// 13-byte pointer (executor's decodePhysicalPGVarlena sibling); it
+		// carries no inline array to decode.
+		if data[off] == 0x01 {
+			const toastPointerLen = 13
+			if off+toastPointerLen > len(data) {
+				return nil, fmt.Errorf("pg_statistic col %d: toast pointer truncated", col)
+			}
+			off += toastPointerLen
+			return nil, nil
+		}
+		// VARATT_IS_1B: the one-byte short header. Length INCLUDES the header
+		// byte, and a short varlena is never preceded by alignment padding.
+		if data[off]&0x01 == 0x01 {
+			sz := int(data[off]) >> 1
+			if sz < 1 || off+sz > len(data) {
+				return nil, fmt.Errorf("pg_statistic col %d: short varlena truncated", col)
+			}
+			blob := data[off : off+sz]
+			off += sz
+			// The array decoders below expect the 4-byte-header layout, whose
+			// body starts 4 bytes in. Re-frame the short form to match rather
+			// than teaching every decoder both shapes.
+			return reframeShortVarlena(blob), nil
+		}
+		// The 4-byte form, aligned per the column's typalign.
+		off = (off + a - 1) &^ (a - 1)
 		if off+4 > len(data) {
 			return nil, fmt.Errorf("pg_statistic col %d: varlena header truncated", col)
 		}
 		sz := int(binary.LittleEndian.Uint32(data[off:off+4]) >> 2)
-		if off+sz > len(data) {
+		if sz < 4 || off+sz > len(data) {
 			return nil, fmt.Errorf("pg_statistic col %d: varlena body truncated", col)
 		}
 		blob := data[off : off+sz]
@@ -1613,6 +1670,29 @@ func decodeTextArray(blob []byte) []string {
 	out := make([]string, 0, n)
 	off := hdrSize
 	for i := 0; i < n; i++ {
+		// PG aligns each array element to the element type's typalign before
+		// reading it — att_align_pointer (postgres/src/include/access/tupmacs.h),
+		// and text is typalign 'i' (4 bytes). The writer pads accordingly
+		// (executor.pgTextArrayBytes rounds every element up to a 4-byte
+		// boundary), so a decoder that advances by the element's UNPADDED
+		// length drifts backwards by up to 3 bytes per element.
+		//
+		// That drift is what this loop did, and it silently destroyed every
+		// multi-element text array whose elements were not a multiple of 4
+		// bytes long. The visible consequence was that ANALYZE's MCV lists and
+		// HISTOGRAMS did not survive a restart: they were written correctly,
+		// and read back as one element or none, so the planner fell to
+		// DEFAULT_INEQ_SEL for every range predicate on a restarted server.
+		// Ten-character ISO dates (n = 14, padded to 16) drift 2 bytes per
+		// element and corrupt on the second one.
+		//
+		// The alignment is CONDITIONAL, following att_align_pointer exactly: a
+		// short-header varlena (low bit set in its first byte) is never
+		// preceded by padding, and padding bytes are zero — so align only when
+		// the byte at the current offset is a pad byte.
+		if off < len(blob) && blob[off] == 0 {
+			off = (off + 3) &^ 3
+		}
 		// Each text element in an array has a 4-byte varlena header.
 		if off+4 > len(blob) {
 			break
@@ -2046,4 +2126,23 @@ func PGFloatOut(f float64, bitSize int) string {
 	}
 	b.WriteString(es)
 	return b.String()
+}
+
+// reframeShortVarlena rewrites a 1-byte-header varlena into the equivalent
+// 4-byte-header form, so the array decoders can assume a single layout.
+//
+// PG's short header exists to save three bytes on small values; both forms
+// describe the same payload, and the array decoders here index from a 4-byte
+// offset. Converting once at the read boundary is cheaper than giving
+// decodeTextArray and decodeFloat4Array a second shape to handle, and it keeps
+// the "which header form is this" decision in exactly one place.
+func reframeShortVarlena(blob []byte) []byte {
+	if len(blob) < 1 {
+		return nil
+	}
+	payload := blob[1:]
+	out := make([]byte, 4+len(payload))
+	binary.LittleEndian.PutUint32(out[0:4], uint32(4+len(payload))<<2)
+	copy(out[4:], payload)
+	return out
 }

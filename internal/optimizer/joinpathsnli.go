@@ -247,7 +247,13 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			// where the inner's unparameterised total would be charged per
 			// outer row. `pathRescanTotal` is the one place that knows a
 			// Memoize wrapper answers differently.
-			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, pathRescanTotal(in))
+			// take2 P2-06: as the plain nested loop above. An NLI inner is a
+			// parameterised index probe, so its "cache" is per-probe and the
+			// Memoize arm of nestLoopInnerRescanCost is the one that fires
+			// when a Memoize sits between.
+			matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
+			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan)
+			cost.Total += matBuild
 			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
 			addPath(joinrel, &Path{
 				Kind:     PathNestLoop,
@@ -260,7 +266,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 				// rather than hard-coded so the star-schema case is a one-line
 				// relaxation once P5.6's sizer exists.
 				RequiredOuter: req,
-			})
+			}, "nestloop.index")
 		}
 	}
 }

@@ -141,10 +141,10 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 		return fmt.Errorf("join paths: nil input rel")
 	}
 	if outer.CheapestTotal == nil {
-		return fmt.Errorf("join paths: outer rel %#04x has no cheapest path", uint16(outer.Relids))
+		return fmt.Errorf("join paths: outer rel %#08x has no cheapest path", uint32(outer.Relids))
 	}
 	if inner.CheapestTotal == nil {
-		return fmt.Errorf("join paths: inner rel %#04x has no cheapest path", uint16(inner.Relids))
+		return fmt.Errorf("join paths: inner rel %#08x has no cheapest path", uint32(inner.Relids))
 	}
 
 	// 03 §9 rule 2 — PATH_PARAM_BY_REL (joinpath.c:43-47). The two directions
@@ -185,7 +185,23 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 		// order arms are offered in IS the tie-break, and a tie between a merge
 		// and a hash path must resolve the way PG resolves it.
 		if len(keys) > 0 {
-			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual)
+			// mergejointuples: what the merge operator emits, before the
+			// residual filters it to joinrel.Rows. Computed ONCE here, where
+			// the searchCtx (and so the selectivity model) is in scope, and
+			// threaded into both merge arms as a scalar rather than widening
+			// their coupling to the search.
+			// A closure, not a scalar: the match_unsorted_outer arm TRIMS its
+			// merge-clause list per trial and demotes the dropped clauses into
+			// the residual, so its mergejointuples differs per call. Passing
+			// the rule lets each site apply it to its own residual, while the
+			// searchCtx stays out of the merge helpers' signatures.
+			mergeTuplesFor := func(res []*restrictInfo) float64 {
+				return s.mergeJoinTuples(joinrel.Rows, res, outer.Rows, inner.Rows)
+			}
+			scanSelFor := func(mc []*restrictInfo) (float64, float64) {
+				return s.mergeJoinScanSel(mc, outer.Relids)
+			}
+			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor)
 			// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 			// and arm 4 — so a merge over an already-ordered outer is offered
 			// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -193,8 +209,13 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// here; goopg's nested-loop halves (`addNestLoopPath` /
 			// `addNLIPaths`) were landed separately and still run after the
 			// hash arm, which can only change a hash-vs-nestloop exact tie.
-			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual)
-			addHashJoinPath(joinrel, outer, inner, cp, keys, residual)
+			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor)
+			// take2 P2-11: the inner side is the BUILD side here, so the
+			// bucket fraction is measured on its keys. Computed at this site
+			// because the searchCtx — and so the statistics — is in scope,
+			// exactly as mergeTuplesFor is.
+			addHashJoinPath(joinrel, outer, inner, cp, keys, residual,
+				s.estimateHashBucketSize(keys, inner.Relids))
 		}
 		// The nested loop keys on nothing, so the key set rejoins the
 		// residual: it evaluates every clause, on every pair. Passing

@@ -631,6 +631,8 @@ type TableSampleSpec struct {
 func (t *TableSampleSpec) Pos() int { return t.pos }
 
 type SeqScan struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	// searchedTree: a one-relation search root is a bare scan (searchedtree.go).
 	searchedTree
 	pos    int
@@ -752,6 +754,8 @@ func (n *SeqScan) Output() Schema { return n.schema }
 //   - HighKey non-nil means inclusive upper bound (col <= HighKey).
 //   - Either bound may be nil for an open-ended range.
 type IndexScan struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	// searchedTree: see *SeqScan above (searchedtree.go).
 	searchedTree
 	pos   int
@@ -832,6 +836,8 @@ func (n *IndexScan) Output() Schema { return n.schema }
 // inner probe yields no rows, the operator emits `outer ++
 // nullRow(innerWidth)` to preserve outer rows.
 type NestedLoopIndexJoin struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	// searchedTree: the parameterised arm of createNestLoopPlan (searchedtree.go).
 	searchedTree
 	pos       int
@@ -912,6 +918,8 @@ func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
 // for initial sizing (cost_memoize_rescan analog); the executor clamps
 // by the runtime memory budget.
 type Memoize struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	pos        int
 	Child      *IndexScan
 	KeyExprs   []Expr
@@ -930,6 +938,8 @@ func (n *Memoize) Output() Schema { return n.Child.Output() }
 // of the full table schema). When the VM bit is not set for a page the
 // executor falls back to a regular heap fetch.
 type IndexOnlyScan struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	pos   int
 	Table *catalog.Table
 	Index *catalog.Index
@@ -1030,6 +1040,8 @@ const (
 // Merge join sorts both sides on their keys and merges the two
 // ordered streams.
 type Join struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	// searchedTree: the usual search root — every join arm but the
 	// parameterised nested loop emits one (searchedtree.go).
 	searchedTree
@@ -1566,6 +1578,8 @@ type SortKey struct {
 }
 
 type Sort struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	// searchedTree: the PathSort arm's root (searchedtree.go).
 	searchedTree
 	pos   int
@@ -2612,6 +2626,8 @@ func (n *WorkTableScan) Output() Schema { return n.schema }
 // MultiExec-style whole-result producer called once by BitmapHeapScan.
 // (M0128-P2.3: P2.2 design doc §3.2)
 type BitmapIndexScan struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	pos   int
 	Table *catalog.Table
 	Alias string
@@ -2631,6 +2647,8 @@ func (n *BitmapIndexScan) Output() Schema { return n.schema }
 // (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
 // (M0128-P2.3: P2.2 design doc §3.2)
 type BitmapHeapScan struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	pos   int
 	Table *catalog.Table
 	Alias string
@@ -2674,6 +2692,8 @@ func (n *BitmapHeapScan) Output() Schema { return n.schema }
 // BitmapAnd combines multiple bitmap sub-trees via intersection.
 // (M0128-P2.3: P2.2 design doc §3.2)
 type BitmapAnd struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	pos    int
 	Inputs []Node // []*BitmapIndexScan or nested []*BitmapAnd/[]*BitmapOr
 	schema Schema
@@ -2685,6 +2705,8 @@ func (n *BitmapAnd) Output() Schema { return n.schema }
 // BitmapOr combines multiple bitmap sub-trees via union.
 // (M0128-P2.3: P2.2 design doc §3.2)
 type BitmapOr struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
 	pos    int
 	Inputs []Node
 	schema Schema

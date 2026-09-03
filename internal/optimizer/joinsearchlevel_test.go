@@ -68,7 +68,7 @@ func (b *recordingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses [
 		// Distinct per direction so add_path's dominance test has something
 		// to work with; the outer relset is an arbitrary tie-break.
 		Cost: Cost{Startup: float64(outer.Relids), Total: joinrel.Rows + float64(outer.Relids)},
-	})
+	}, "test")
 	return nil
 }
 
@@ -86,7 +86,7 @@ func jslCtx(t *testing.T, n int) *searchCtx {
 		if err := s.addRel(rel); err != nil {
 			t.Fatalf("addRel %d: %v", i, err)
 		}
-		addPath(rel, &Path{Kind: PathPrebuilt, Rel: rel, Rows: rel.Rows, Cost: Cost{Total: rel.Rows}})
+		addPath(rel, &Path{Kind: PathPrebuilt, Rel: rel, Rows: rel.Rows, Cost: Cost{Total: rel.Rows}}, "test")
 		setCheapest(rel)
 	}
 	return s

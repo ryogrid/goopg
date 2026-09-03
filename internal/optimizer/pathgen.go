@@ -32,7 +32,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 		Rows:         rel.Rows,
 		Cost:         seqCost,
 		ParallelSafe: parallelWorkers > 0,
-	})
+	}, "scan.seq")
 	if parallelWorkers > 0 {
 		// Each worker processes ~1/d of the pages and tuples; the seq scan's
 		// startup is zero, so dividing the total by the divisor is exact.
@@ -44,7 +44,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 			Cost:            Cost{Startup: 0, Total: seqCost.Total / d},
 			ParallelSafe:    true,
 			ParallelWorkers: parallelWorkers,
-		})
+		}, "scan.seq.partial")
 	}
 }
 
@@ -62,7 +62,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 //
 // Child convention: Children[0] is the probe (outer) side, Children[1] is the
 // build (inner) side. createPlan reads it to set the executor Join's BuildLeft.
-func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
+func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, residual []*restrictInfo, innerBucketSize float64) {
 	p, b := probe.CheapestTotal, build.CheapestTotal
 	if p == nil || b == nil {
 		return
@@ -75,13 +75,18 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 	cost := hashJoinCost(cp, hashJoinInputs{
 		outer: p.Cost, inner: b.Cost,
 		outerRows: p.Rows, innerRows: b.Rows,
-		outputRows:     joinRel.Rows,
-		numHashClauses: len(keys),
-		// Column counts come from the RELS, not the paths: a parameterised
-		// path returns fewer ROWS than its rel but the same columns.
-		outerCols: relNCols(probe), innerCols: relNCols(build),
-		// AvgVarBytes come from the rels for the same reason (M0128-P3.1).
-		outerAvgVarBytes: probe.AvgVarBytes, innerAvgVarBytes: build.AvgVarBytes,
+		outputRows:      joinRel.Rows,
+		numHashClauses:  len(keys),
+		innerBucketSize: innerBucketSize,
+		// take2 P4-01: column counts come from the PATHS, falling back to the
+		// rels. The previous comment here read "Column counts come from the
+		// RELS, not the paths: a parameterised path returns fewer ROWS than
+		// its rel but the same columns" — true of parameterisation, false of
+		// PROJECTION. An index-only path emits only the columns its index
+		// covers, so the geometry was solved for the relation's full width
+		// while the executor measured the narrowed node's schema at runtime.
+		outerCols: pathNCols(p), innerCols: pathNCols(b),
+		outerAvgVarBytes: pathAvgVarBytes(p), innerAvgVarBytes: pathAvgVarBytes(b),
 	})
 	// The residual is evaluated only on tuples that already matched on the
 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
@@ -89,6 +94,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
 	addPath(joinRel, &Path{
 		Kind:          PathHashJoin,
+		DisabledNodes: disabledNodesFor(!cp.enableHashJoin, p, b),
 		Rel:           joinRel,
 		Rows:          joinRel.Rows,
 		Cost:          cost,
@@ -96,7 +102,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 		HashKeys:      keys,
 		Residual:      residual,
 		RequiredOuter: calcNonNestloopRequiredOuter(p, b),
-	})
+	}, "join.hash")
 }
 
 // addNestLoopPath adds a plain nested loop with `outer` driving: for every
@@ -119,11 +125,16 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 	// product a plain nested loop evaluates its quals on is therefore
 	// `o.Rows * i.Rows`, which for a parameterised inner is the per-outer-row
 	// count — exactly PG's cost_nestloop (costsize.c:3355-3356).
-	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, i.Cost.Total)
+	// take2 P2-06: goopg's nested loop always materialises its inner, so the
+	// rescan is a cache replay and the build is paid once.
+	matBuild, matRescan := nestLoopInnerRescanCost(i, cp)
+	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
+	cost.Total += matBuild
 	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
-		Kind:     PathNestLoop,
-		Rel:      joinRel,
+		Kind:          PathNestLoop,
+		DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, i),
+		Rel:           joinRel,
 		Rows:     joinRel.Rows,
 		Cost:     cost,
 		Children: []*Path{o, i},
@@ -131,7 +142,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 		// A nested loop DISCHARGES an inner parameterised by the outer, so
 		// this is a subtraction, not a union (pathnode.c:2592).
 		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
-	})
+	}, "join.nestloop")
 }
 
 // generateHashJoinPaths adds both build-side orientations of a hash join over the
@@ -143,12 +154,23 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 // The key set is orientation-independent — PG's `clause_sides_match_join`
 // (joinpath.c:2205) accepts an equality whose operands land on the two sides in
 // either order — so both calls pass the same `keys`/`residual`.
-func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
+// take2 P2-11: `bucketFor` reports the inner-bucket fraction for whichever side
+// is being HASHED, so the two orientations get their own figure — they build
+// different relations, and that is the whole point of costing them separately.
+// A nil closure means "no statistics available" and suppresses the term, which
+// is what keeps this function usable from tests that build bare RelOptInfos.
+func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, bucketFor func(RelSet) float64) {
+	bucket := func(build *RelOptInfo) float64 {
+		if bucketFor == nil || build == nil {
+			return 0
+		}
+		return bucketFor(build.Relids)
+	}
 	// Orientation 1: build the inner side.
-	addHashJoinPath(joinRel, outer, inner, cp, keys, residual)
+	addHashJoinPath(joinRel, outer, inner, cp, keys, residual, bucket(inner))
 	// Orientation 2: build the outer side (swap the roles). The join output is
 	// the same; only which side is hashed differs.
-	addHashJoinPath(joinRel, inner, outer, cp, keys, residual)
+	addHashJoinPath(joinRel, inner, outer, cp, keys, residual, bucket(outer))
 }
 
 // The C1-era `generateNLIPath` used to live here. It was retired by

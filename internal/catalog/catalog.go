@@ -1893,6 +1893,37 @@ func (cs ColumnStats) StaDistinct() float64 {
 	}
 }
 
+// ResolvedNDistinct returns the column's distinct-value count as a COUNT,
+// resolving PG's two-form convention against the relation's tuple count.
+//
+// goopg stores upstream's one signed `stadistinct` as two fields —
+// `NDistinct` (absolute) and `NDistinctFrac` (the negated relative form) — and
+// callers that read `NDistinct` alone silently see ZERO for every column whose
+// distinct count SCALES with the table, which is most key columns. ANALYZE
+// records `l_orderkey` as n_distinct = -0.2 and `p_partkey` as -1; both read as
+// absolute-zero.
+//
+// The consequence was a 1000x class of estimation error: an IN-list on such a
+// column fell all the way to DEFAULT_EQ_SEL per element, so
+// `p_partkey IN (1,2,3,4,5)` estimated 5000 rows against PostgreSQL's 5, and
+// `l_orderkey IN (1,2,3)` estimated 90018 against 51. take2 P2-09.
+//
+// Returns 0 when neither form is populated, which callers must treat as "no
+// information" rather than as zero distinct values.
+func (cs ColumnStats) ResolvedNDistinct(tuples float64) float64 {
+	switch {
+	case cs.NDistinct > 0:
+		return float64(cs.NDistinct)
+	case cs.NDistinctFrac > 0 && tuples > 0:
+		// The relative form is a FRACTION of the relation, exactly as
+		// `get_variable_numdistinct` resolves a negative stadistinct
+		// (selfuncs.c): ndistinct = -stadistinct * ntuples.
+		return cs.NDistinctFrac * tuples
+	default:
+		return 0
+	}
+}
+
 // MCVEntry is one entry in a per-column MCV list. Frequency is
 // the sample frequency (0..1). Mirrors a single (stavalues,
 // stanumbers) pair in upstream's pg_statistic MCV slot.
@@ -6616,6 +6647,30 @@ func (c *InMemory) tableByOID(oid uint32, dbOid uint32) (*Table, bool) {
 			return t, true
 		}
 	}
+	// System catalogs (pg_class, pg_attribute, ...) are registered exactly
+	// once, under DefaultDBOid, by registerSystemTables — CREATE DATABASE
+	// never seeds a fresh namespace with its own copies of them. LookupTable
+	// (name-based) already falls back to DefaultDBOid's namespace for exactly
+	// this case (lookupSystemCatalogTableLocked, M0122-0007 4e), but this
+	// OID-based twin had drifted: without the same fallback, an OID lookup
+	// scoped to any genuinely distinct dbOid could never resolve a system
+	// catalog's own oid (e.g. verify_heapam(1259) — pg_class's own oid —
+	// while connected to a non-default database), even though the object
+	// plainly exists. Scoped to pg_catalog/information_schema tables only,
+	// so a distinct dbOid's OID lookup still can never resolve DefaultDBOid's
+	// real *user* tables (which stay correctly isolated via the loop above).
+	// M0119-0006bp.
+	if dbOid != DefaultDBOid {
+		for _, t := range c.ns(DefaultDBOid).tables {
+			if t.OID != oid {
+				continue
+			}
+			if strings.EqualFold(t.Schema, "pg_catalog") || strings.EqualFold(t.Schema, "information_schema") {
+				return t, true
+			}
+			break
+		}
+	}
 	return nil, false
 }
 
@@ -7800,6 +7855,32 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				idxRelam = strconv.Itoa(int(amOID))
 			}
 		}
+		// relpages / reltuples — take2 P1-01. These were hard-wired to "0" and
+		// "-1", so `SELECT relpages FROM pg_class` reported nothing for any
+		// index while PostgreSQL reports the real figures (part_pk: 551 pages,
+		// 200000 tuples). That made index geometry undiagnosable from SQL,
+		// which cost this project a wrong hypothesis while tracking down why a
+		// merge join was outbidding a hash join.
+		//
+		// relpages comes from the same source `get_relation_info` uses —
+		// `RelationGetNumberOfBlocks` (plancat.c), read live rather than
+		// persisted, which is why there is nothing to keep in sync. When
+		// storage cannot answer (no RelNBlocksFunc bound, e.g. a unit-test
+		// catalog) the old "0" stands, matching a never-vacuumed relation.
+		//
+		// reltuples: a complete, non-partial index has one entry per live heap
+		// tuple, so it reports the table's own count. `-1` is retained for the
+		// unanalysed case — PG 14+ uses it to mean "unknown", distinct from a
+		// genuine zero.
+		idxRelPages := "0"
+		if pages, ok := IndexRealPages(idx); ok && pages > 0 {
+			idxRelPages = strconv.FormatInt(pages, 10)
+		}
+		idxRelTuples := "-1"
+		if idx.Table != nil && idx.Table.Stats != nil && idx.Table.Stats.Analyzed {
+			idxRelTuples = strconv.FormatInt(idx.Table.Stats.RowCount, 10)
+		}
+
 		idxPers := "p"
 		if idx.Table != nil {
 			if idx.Table.Unlogged {
@@ -7844,8 +7925,8 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			idxRelam,                    // 6:  relam
 			idxFilenode,                 // 7:  relfilenode (0 for a partitioned index, relkind 'I' — M0134-0164)
 			idxTablespace,               // 8:  reltablespace
-			"0",                         // 9:  relpages
-			"-1",                        // 10: reltuples (-1 = unknown for indexes)
+			idxRelPages,                 // 9:  relpages
+			idxRelTuples,                // 10: reltuples
 			"0",                         // 11: relallvisible (indexes: none)
 			"0",                         // 12: relallfrozen
 			"0",                         // 13: reltoastrelid

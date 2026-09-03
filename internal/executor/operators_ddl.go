@@ -1945,12 +1945,44 @@ func restoreTempShadow(ctx *Context, key string) {
 // SELECT INTO), which is why the shadow is threaded through the ddlOp
 // receiver rather than a parameter. M0134-0023.
 func (o *ddlOp) createTableHonoringPendingDrop(name parser.ObjectName, cols []catalog.Column, dbOid uint32) (*catalog.Table, error) {
+	var tbl *catalog.Table
+	var err error
 	if o.pendingDropShadow != nil {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-			return im.CreateTableReplacingPendingDrop(name, cols, dbOid)
+			tbl, err = im.CreateTableReplacingPendingDrop(name, cols, dbOid)
+		} else {
+			tbl, err = o.ctx.Catalog.CreateTable(name, cols, dbOid)
 		}
+	} else {
+		tbl, err = o.ctx.Catalog.CreateTable(name, cols, dbOid)
 	}
-	return o.ctx.Catalog.CreateTable(name, cols, dbOid)
+	if err != nil {
+		return nil, err
+	}
+	if terr := o.touchHeapMainForkFile(tbl); terr != nil {
+		return nil, terr
+	}
+	return tbl, nil
+}
+
+// touchHeapMainForkFile eagerly creates tbl's on-disk main-fork file,
+// mirroring PostgreSQL's RelationCreateStorage → smgrcreate call inside
+// heap_create_with_catalog (heap.c): every heap relation gets a (possibly
+// zero-block) main-fork file at CREATE TABLE time, regardless of whether any
+// row is ever inserted. Without this, goopg's lazy on-first-write file
+// creation (storage.Manager.relFile opens O_CREATE) leaves a genuinely-empty
+// table with no on-disk file — indistinguishable from a file removed after
+// having data, which made verify_heapam's Pool.Exists missing-fork check
+// (added for the pg_amcheck file-removal corruption scenario, see
+// operators_verify_heapam.go) misreport a healthy empty table as corrupt
+// (`could not open file ...: No such file or directory`). A nil Pool (the
+// storage-less CTAS probe path, execCreateTableAs's "no storage" branch) is a
+// no-op — there is nothing to touch. M0119-0006.
+func (o *ddlOp) touchHeapMainForkFile(tbl *catalog.Table) error {
+	if o.ctx.Pool == nil || tbl == nil {
+		return nil
+	}
+	return o.ctx.Pool.CreateFile(o.ctx.Catalog.RelFileNode(tbl))
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
@@ -5231,6 +5263,12 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Eagerly create the on-disk main-fork file (mirrors PG's smgrcreate at
+	// CREATE TABLE time) so a partition child that never receives a write
+	// still has a backing file for verify_heapam / pg_amcheck. M0119-0006.
+	if terr := o.touchHeapMainForkFile(tbl); terr != nil {
+		return terr
 	}
 	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
 	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
@@ -16209,6 +16247,26 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt, tempTables bool) error {
 				}
 			}
 		}
+	}
+
+	// take2 P1-03b: the relation is now empty, so its statistics describe a
+	// table that no longer exists. Measured before this reset — goopg kept
+	// reporting relpages/reltuples 222/50000 and estimating 50000 rows for an
+	// empty table, where PostgreSQL resets to 0/-1 and estimates its 10-page
+	// floor (2550 on the same fixture).
+	//
+	// Clearing Stats returns the relation to the never-analyzed state, which is
+	// what makes the block-derived fallback fire and produce PG's answer. The
+	// zeroed size row is persisted for the same reason VACUUM's is (P1-03): an
+	// in-memory-only reset would come back stale after a restart.
+	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
+		if hasIM {
+			im.UpdateRelStats(entry.tbl, 0, 0)
+		}
+		entry.tbl.Stats = nil
+		// Non-fatal, as in the VACUUM path: a TRUNCATE that has already done
+		// its work must not fail on a statistics write.
+		_ = persistRelSize(o.ctx, entry.tbl, 0, 0)
 	}
 
 	// Fire AFTER TRUNCATE FOR EACH STATEMENT triggers on all tables.

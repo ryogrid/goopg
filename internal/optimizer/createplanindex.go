@@ -322,10 +322,10 @@ func createIndexScanPlan(p *Path) Node {
 	}
 	id, rewrap, ok := scanLeafFor(p.Rel.baseLeaf)
 	if !ok {
-		panic(fmt.Sprintf("createPlan: PathIndexScan over relset %#04x whose leaf is not a rebuildable base scan", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathIndexScan over relset %#08x whose leaf is not a rebuildable base scan", uint32(p.Rel.Relids)))
 	}
 	if p.IndexInfo == nil {
-		panic(fmt.Sprintf("createPlan: PathIndexScan over relset %#04x names no index", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathIndexScan over relset %#08x names no index", uint32(p.Rel.Relids)))
 	}
 	if p.IndexScanDir != ForwardScanDirection {
 		panic(fmt.Sprintf("createPlan: PathIndexScan with %s; goopg's *IndexScan has no direction to set", p.IndexScanDir))

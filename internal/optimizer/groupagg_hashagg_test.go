@@ -17,11 +17,9 @@ import (
 // false — the aggregates.out:3457 shape (`set enable_hashagg = false` →
 // GroupAggregate → Sort → Seq Scan).
 func TestEnableHashAggOffForcesSorted(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	cat := presortedAggCatalog(t)
 	stmt := parseOne(t, "select sum(unique1) from tenk1 group by ten")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,11 +71,9 @@ func TestEnableHashAggDefaultInert(t *testing.T) {
 // presorted set [ten, two] — a wrongful re-wrap by the hashagg rule would
 // replace them with the bare group-key set [ten].
 func TestEnableHashAggSkipsAlreadySorted(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	cat := presortedAggCatalog(t)
 	stmt := parseOne(t, "select sum(unique1 order by two) from tenk1 group by ten")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,11 +89,9 @@ func TestEnableHashAggSkipsAlreadySorted(t *testing.T) {
 // them, so the rule must leave the node Hashed with no Sort child even with
 // the GUC off.
 func TestEnableHashAggSkipsGroupingSets(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	cat := presortedAggCatalog(t)
 	stmt := parseOne(t, "select sum(unique1) from tenk1 group by grouping sets ((ten), (two))")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,11 +108,9 @@ func TestEnableHashAggSkipsGroupingSets(t *testing.T) {
 // aggregate is non-grouped and must keep its plain label — no Sort child, no
 // Strategy flip.
 func TestEnableHashAggSkipsUngrouped(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	cat := presortedAggCatalog(t)
 	stmt := parseOne(t, "select sum(unique1) from tenk1")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,18 +128,25 @@ func TestEnableHashAggSkipsUngrouped(t *testing.T) {
 // Plan() in this harness, so construct the Aggregate node directly: the rule
 // must leave both the Strategy and the child untouched.
 func TestEnableHashAggSkipsNonSimpleMode(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	aggNode := &Aggregate{
 		GroupExprs: []Expr{&ColumnRef{Name: "ten"}},
 		Mode:       AggModePartial,
 		Strategy:   AggStrategyHashed,
 	}
-	applyEnableHashAggRule(aggNode)
+	applyEnableHashAggRule(aggNode, hashAggSettings(false))
 	if aggNode.Strategy != AggStrategyHashed {
 		t.Fatalf("Strategy = %d, want AggStrategyHashed (Mode != AggModeSimple must skip)", aggNode.Strategy)
 	}
 	if aggNode.Child != nil {
 		t.Fatalf("rule wrapped the child on a Mode != AggModeSimple node: got %T", aggNode.Child)
 	}
+}
+
+// hashAggSettings is the take2 P2-02c replacement for SetHashAggEnabled in
+// these tests: enable_hashagg is now a per-statement planner input, so a test
+// states the setting it wants rather than mutating a process global.
+func hashAggSettings(on bool) PlannerSettings {
+	ps := DefaultPlannerSettings()
+	ps.EnableHashAgg = on
+	return ps
 }

@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"math/bits"
 	"os"
 	"testing"
 
@@ -343,5 +344,50 @@ func TestPgShapedDPKillSwitchPolarity(t *testing.T) {
 		if got := pgShapedDPFromEnv(tc.env); got != tc.want {
 			t.Errorf("pgShapedDPFromEnv(%q) = %v, want %v", tc.env, got, tc.want)
 		}
+	}
+}
+
+// TestRelSetRepresentsMoreThanSixteenRelations pins take2 P3-09.
+//
+// RelSet was uint16 and maxSearchRels was 16 to match, so a FROM clause with
+// more than sixteen base relations could not be REPRESENTED by the search and
+// fell back to the legacy planner entirely. The ceiling was a representation
+// limit, not a cost or safety one — joinsearch.go's own comment said so — and
+// the separate 3^n runtime guard it warned about belonged to the bushy DP,
+// which no longer exists.
+//
+// The assertion is on the representation, not on a plan: a relation index at
+// and beyond the old ceiling must set a distinct bit that survives the
+// round-trip every search operation depends on.
+func TestRelSetRepresentsMoreThanSixteenRelations(t *testing.T) {
+	if maxSearchRels <= 16 {
+		t.Fatalf("maxSearchRels = %d; P3-09 raises it past the old uint16 ceiling", maxSearchRels)
+	}
+
+	// Every index below the ceiling must be a distinct, recoverable bit.
+	seen := map[RelSet]int{}
+	for i := 0; i < maxSearchRels; i++ {
+		bit := RelSet(1) << uint(i)
+		if bit == 0 {
+			t.Fatalf("relation %d overflows RelSet — the type is too narrow for maxSearchRels=%d",
+				i, maxSearchRels)
+		}
+		if prev, dup := seen[bit]; dup {
+			t.Fatalf("relations %d and %d collide on the same bit", prev, i)
+		}
+		seen[bit] = i
+	}
+
+	// The cases that used to be unrepresentable: a set spanning the old
+	// boundary must hold both members and report the right size.
+	spanning := RelSet(1)<<15 | RelSet(1)<<16 | RelSet(1)<<31
+	if got := bits.OnesCount32(uint32(spanning)); got != 3 {
+		t.Errorf("a set spanning the old 16-relation boundary holds %d members, want 3", got)
+	}
+	if !relsSubset(RelSet(1)<<31, spanning) {
+		t.Error("relation 31 is not recognised as a member of a set that contains it")
+	}
+	if relsOverlap(RelSet(1)<<30, spanning) {
+		t.Error("relation 30 reported as overlapping a set that does not contain it")
 	}
 }

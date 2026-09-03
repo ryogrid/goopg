@@ -148,10 +148,15 @@ func TestDistinctSubqueryIsUniqueOnlyWhenItHasOneColumn(t *testing.T) {
 	one := &Distinct{Child: &Project{Child: scan, Targets: []Expr{jrCol(0)},
 		schema: Schema{SchemaColumn{Name: "c", Type: catalog.Type{Name: "int4"}}}}}
 	one.schema = Schema{SchemaColumn{Name: "c", Type: catalog.Type{Name: "int4"}}}
-	if got, want := columnNDistinctForChild(0, one), int64(5000); got != want {
-		// *Distinct passes EstimateRows through unchanged (goopg does not size
-		// it), so the answer is the child's row count — still the faithful
-		// `rel->tuples` reading, and still an upper bound on the true count.
+	// take2 P1-25 changed the expected value here from 5000 to 700, and the
+	// change is the point of that item. *Distinct is now SIZED by
+	// estimate_num_groups instead of passing its child's row count through, so
+	// a one-column DISTINCT over a column with 700 distinct values produces 700
+	// rows — and the column is unique in that output, so its ndistinct is the
+	// same 700. The two numbers move together and stay consistent; the old
+	// 5000 was the child's `rel->tuples`, which was an upper bound rather than
+	// an estimate.
+	if got, want := columnNDistinctForChild(0, one), int64(700); got != want {
 		t.Fatalf("ndistinct through a one-column DISTINCT = %d, want %d", got, want)
 	}
 
@@ -264,17 +269,21 @@ func TestDistinctOnKeyColumnIsUnique(t *testing.T) {
 	// ON" (selfuncs.c): `SELECT DISTINCT ON (a) a, b` has a one-element
 	// distinctClause, so `a` is unique in the output and `b` is not.
 	//
-	// The `*DistinctOn` pass-through arm of `EstimateRows` went in with this:
-	// without it the node estimated 0 and zeroed every estimate above it (the
-	// M0125-0038 class), which would also have made this arm permanently dead.
+	// The `*DistinctOn` arm of `EstimateRows` went in with this: without it the
+	// node estimated 0 and zeroed every estimate above it (the M0125-0038
+	// class), which would also have made this arm permanently dead. It started
+	// as a pass-through and is sized properly as of take2 P1-25.
 	scan := scanWithStats("t", 5000, 700, 90)
 	don := &DistinctOn{Child: scan, KeyCols: []int{0}}
 	don.schema = tableSchema(scan.Table)
 
-	if got, want := EstimateRows(don), int64(5000); got != want {
-		t.Fatalf("DistinctOn rows = %d, want %d (pass-through)", got, want)
+	// take2 P1-25: sized by estimate_num_groups over the ON list, not passed
+	// through. `DISTINCT ON (a)` over a column with 700 distinct values emits
+	// 700 rows, and `a` is unique in that output, so its ndistinct is 700 too.
+	if got, want := EstimateRows(don), int64(700); got != want {
+		t.Fatalf("DistinctOn rows = %d, want %d (sized over the ON list)", got, want)
 	}
-	if got, want := columnNDistinctForChild(0, don), int64(5000); got != want {
+	if got, want := columnNDistinctForChild(0, don), int64(700); got != want {
 		t.Fatalf("ndistinct of the DISTINCT ON key = %d, want %d", got, want)
 	}
 	if got := columnNDistinctForChild(1, don); got != 0 {

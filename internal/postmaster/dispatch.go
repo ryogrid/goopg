@@ -831,7 +831,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 				}
 				// Infer result column types and undeclared parameter types by planning/walking.
 				if ectx.Catalog != nil {
-					if plan, planErr := optimizer.Plan(ps.Query, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid)); planErr == nil {
+					if plan, planErr := optimizer.PlanWithSettings(ps.Query, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid), sessionPlannerSettings(sess)); planErr == nil {
 						schema := plan.Output()
 						if len(schema) > 0 {
 							resultTypes := make([]string, len(schema))
@@ -877,7 +877,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 					// without RETURNING, DDL, …) has none, mirroring PG's
 					// fixed_result gate.
 					if len(prepDef.resultTypes) > 0 && ectx.Catalog != nil {
-						if plan, planErr := optimizer.Plan(prepDef.stmt, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid)); planErr == nil {
+						if plan, planErr := optimizer.PlanWithSettings(prepDef.stmt, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid), sessionPlannerSettings(sess)); planErr == nil {
 							schema := plan.Output()
 							changed := len(schema) != len(prepDef.resultTypes)
 							if !changed {
@@ -1152,13 +1152,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// plan, cache, then execute.
 		var precached optimizer.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !plannerScanTogglesActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !plannerSessionInputsActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
 			} else {
 				// Cache miss: plan now so we can store it.
-				freshNode, perr := optimizer.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, ectx.CurrentDatabaseOid))
+				freshNode, perr := optimizer.PlanWithSettings(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, ectx.CurrentDatabaseOid), sessionPlannerSettings(sess))
 				if perr != nil {
 					// M0132-S5 (S1 finding (i)): a PLAN-time error must abort
 					// the block too. Every other error path reaches
@@ -1489,15 +1489,44 @@ func sessionOpportunisticPrune(sess *misc.SessionRegistry) bool {
 // planner.MaybeAddGather is correspondingly non-mutating: it returns a new
 // root sharing the cached children, because that cached node is being read
 // concurrently by every other session running the same SQL.
+// sessionGetter adapts a SessionRegistry to the plain (name) -> (effective,
+// ok) getter the *From helpers take, so the registry channel and the
+// executor.Context channel share one body per GUC. A nil registry reads as
+// "nothing set", which is what every accessor's nil branch meant.
+func sessionGetter(sess *misc.SessionRegistry) func(string) (string, bool) {
+	if sess == nil {
+		return func(string) (string, bool) { return "", false }
+	}
+	return func(name string) (string, bool) {
+		_, eff, ok := sess.Get(name)
+		return eff, ok
+	}
+}
+
 func applyParallelPostPass(node optimizer.Node, sess *misc.SessionRegistry, ectx *executor.Context) optimizer.Node {
+	return applyParallelPostPassFrom(node, sessionGetter(sess), ectx)
+}
+
+// ctxApplyParallelPostPass is applyParallelPostPass for the paths that hold an
+// executor.Context but no SessionRegistry — the simple-query route, which is
+// the one that plans a statement the cache did not supply. Same two-channel
+// split, and same reason, as sessionPlannerSettings / ctxPlannerSettings.
+func ctxApplyParallelPostPass(node optimizer.Node, ectx *executor.Context) optimizer.Node {
+	if ectx == nil || ectx.GetSetting == nil {
+		return node
+	}
+	return applyParallelPostPassFrom(node, ectx.GetSetting, ectx)
+}
+
+func applyParallelPostPassFrom(node optimizer.Node, get func(string) (string, bool), ectx *executor.Context) optimizer.Node {
 	if node == nil || ectx == nil {
 		return node
 	}
 	return optimizer.MaybeAddGather(node, optimizer.ParallelSettings{
-		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
-		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
-		LeaderParticipates:  sessionParallelLeaderParticipation(sess),
-		DebugParallelQuery:  sessionDebugParallelQuery(sess),
+		MaxWorkersPerGather: maxParallelWorkersPerGatherFrom(get),
+		MinTableScanBlocks:  minParallelTableScanSizeFrom(get),
+		LeaderParticipates:  parallelLeaderParticipationFrom(get),
+		DebugParallelQuery:  debugParallelQueryFrom(get),
 		IsSerializable:      ectx.Tx.Isolation == transam.IsolationSerializable,
 		BlocksForTable:      parallelBlocksForTable(ectx),
 	})
@@ -1553,10 +1582,11 @@ func parallelBlocksForTableFrom(pool *storage.Pool, cat catalog.Catalog) func(*c
 // Zero means "no parallelism" and is a legitimate user setting, not an
 // absence — so an unreadable GUC falls back to 0 (serial), the safe direction.
 func sessionMaxParallelWorkersPerGather(sess *misc.SessionRegistry) int {
-	if sess == nil {
-		return 0
-	}
-	_, eff, ok := sess.Get("max_parallel_workers_per_gather")
+	return maxParallelWorkersPerGatherFrom(sessionGetter(sess))
+}
+
+func maxParallelWorkersPerGatherFrom(get func(string) (string, bool)) int {
+	eff, ok := get("max_parallel_workers_per_gather")
 	if !ok {
 		return 0
 	}
@@ -1594,11 +1624,12 @@ func sessionMaxParallelWorkers(sess *misc.SessionRegistry) int {
 // direction, so an unreadable GUC falls back to PG's default of 1024 blocks
 // (8MB) rather than to zero.
 func sessionMinParallelTableScanSize(sess *misc.SessionRegistry) int64 {
+	return minParallelTableScanSizeFrom(sessionGetter(sess))
+}
+
+func minParallelTableScanSizeFrom(get func(string) (string, bool)) int64 {
 	const pgDefaultBlocks = 1024 // (8 * 1024 * 1024) / BLCKSZ
-	if sess == nil {
-		return pgDefaultBlocks
-	}
-	_, eff, ok := sess.Get("min_parallel_table_scan_size")
+	eff, ok := get("min_parallel_table_scan_size")
 	if !ok {
 		return pgDefaultBlocks
 	}
@@ -1612,10 +1643,11 @@ func sessionMinParallelTableScanSize(sess *misc.SessionRegistry) int64 {
 // sessionParallelLeaderParticipation reads `parallel_leader_participation`.
 // Upstream's default is on; an unreadable GUC keeps that.
 func sessionParallelLeaderParticipation(sess *misc.SessionRegistry) bool {
-	if sess == nil {
-		return true
-	}
-	_, eff, ok := sess.Get("parallel_leader_participation")
+	return parallelLeaderParticipationFrom(sessionGetter(sess))
+}
+
+func parallelLeaderParticipationFrom(get func(string) (string, bool)) bool {
+	eff, ok := get("parallel_leader_participation")
 	if !ok {
 		return true
 	}
@@ -1627,10 +1659,11 @@ func sessionParallelLeaderParticipation(sess *misc.SessionRegistry) bool {
 // ("off" / "on" / "regress"); the P0 synonym work means a user may have
 // written `true`, and canonicalisation has already mapped it to "on".
 func sessionDebugParallelQuery(sess *misc.SessionRegistry) string {
-	if sess == nil {
-		return "off"
-	}
-	_, eff, ok := sess.Get("debug_parallel_query")
+	return debugParallelQueryFrom(sessionGetter(sess))
+}
+
+func debugParallelQueryFrom(get func(string) (string, bool)) string {
+	eff, ok := get("debug_parallel_query")
 	if !ok {
 		return "off"
 	}
@@ -1794,6 +1827,189 @@ func plannerScanTogglesActive(sess *misc.SessionRegistry) bool {
 		}
 	}
 	return false
+}
+
+// sessionPlannerSettings builds the per-statement planner context from the
+// session's GUCs — take2 P2-02, the item that finally makes `SET
+// random_page_cost` change a plan.
+//
+// Every field starts at the planner's own default and is overwritten only when
+// the GUC parses, so a malformed or missing value degrades to today's behaviour
+// rather than to a zero cost.
+//
+// UNITS. Both memory GUCs are registered `UnitKB`, and the GUC machinery
+// normalises the display form, so `work_mem` reads back as "524288" and
+// `effective_cache_size` as "4194304" — plain KB integers, not "512MB"/"4GB".
+// The planner wants BYTES for work_mem and BLOCKS for effective_cache_size, and
+// the two conversions differ. Getting either wrong is silent: the plan simply
+// comes out costed for the wrong machine. The round-trip is pinned by test.
+func sessionPlannerSettings(sess *misc.SessionRegistry) optimizer.PlannerSettings {
+	if sess == nil {
+		return optimizer.DefaultPlannerSettings()
+	}
+	return plannerSettingsFrom(func(name string) (string, bool) {
+		_, eff, ok := sess.Get(name)
+		return eff, ok
+	})
+}
+
+// ctxPlannerSettings is sessionPlannerSettings for the paths that hold an
+// executor.Context rather than a SessionRegistry — the simple-query route
+// (executeOneSimpleStmt) among them.
+//
+// Both channels must exist because both are real: the extended-protocol and
+// prepared-statement sites have `sess`, while the simple-query site has only
+// `ctx.GetSetting`. Building one from the other is not possible at either site,
+// so they share the BODY instead. Missing this second channel is what made the
+// first live probe of P2-02 show unchanged costs while every unit test passed.
+func ctxPlannerSettings(ctx *executor.Context) optimizer.PlannerSettings {
+	if ctx == nil || ctx.GetSetting == nil {
+		return optimizer.DefaultPlannerSettings()
+	}
+	return plannerSettingsFrom(ctx.GetSetting)
+}
+
+func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSettings {
+	ps := optimizer.DefaultPlannerSettings()
+	readFloat := func(name string, dst *float64) {
+		if eff, ok := get(name); ok {
+			if v, err := strconv.ParseFloat(strings.TrimSpace(eff), 64); err == nil && v >= 0 {
+				*dst = v
+			}
+		}
+	}
+	readFloat("seq_page_cost", &ps.SeqPageCost)
+	readFloat("random_page_cost", &ps.RandomPageCost)
+	readFloat("cpu_tuple_cost", &ps.CPUTupleCost)
+	readFloat("cpu_index_tuple_cost", &ps.CPUIndexTupleCost)
+	readFloat("cpu_operator_cost", &ps.CPUOperatorCost)
+	readFloat("parallel_setup_cost", &ps.ParallelSetupCost)
+	readFloat("parallel_tuple_cost", &ps.ParallelTupleCost)
+	readFloat("hash_mem_multiplier", &ps.HashMemMultiplier)
+
+	// take2 P2-05: the planner-method toggles. These were registered GUCs with
+	// no consumer anywhere outside the pg_settings view — `SET
+	// enable_hashjoin = off` was accepted and did nothing. They set
+	// Path.DisabledNodes rather than skipping a producer, which is PG 18's own
+	// mechanism: a query whose only legal plan uses a disabled method still
+	// gets that plan.
+	readBool := func(name string, dst *bool) {
+		if eff, ok := get(name); ok {
+			switch strings.ToLower(strings.TrimSpace(eff)) {
+			case "on", "true", "yes", "1":
+				*dst = true
+			case "off", "false", "no", "0":
+				*dst = false
+			}
+		}
+	}
+	readBool("enable_hashjoin", &ps.EnableHashJoin)
+	readBool("enable_mergejoin", &ps.EnableMergeJoin)
+	readBool("enable_nestloop", &ps.EnableNestLoop)
+	readBool("enable_memoize", &ps.EnableMemoize)
+	readBool("enable_nestloop_index", &ps.EnableNestLoopIndex)
+	readBool("enable_hashagg", &ps.EnableHashAgg)
+	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
+	readBool("geqo", &ps.Geqo)
+	// take2 P3-10: the five remaining GEQO knobs. Zero is MEANINGFUL for
+	// geqo_pool_size and geqo_generations (PG reads it as "derive me"), so they
+	// accept it rather than treating it as unset.
+	readIntMin := func(name string, dst *int, min int) {
+		if eff, ok := get(name); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(eff)); err == nil && n >= min {
+				*dst = n
+			}
+		}
+	}
+	readIntMin("geqo_effort", &ps.GeqoEffort, 1)
+	readIntMin("geqo_pool_size", &ps.GeqoPoolSize, 0)
+	readIntMin("geqo_generations", &ps.GeqoGenerations, 0)
+	readFloat("geqo_selection_bias", &ps.GeqoSelectionBias)
+	readFloat("geqo_seed", &ps.GeqoSeed)
+
+	if eff, ok := get("geqo_threshold"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(eff)); err == nil && n >= 2 {
+			ps.GeqoThreshold = n
+		}
+	}
+
+	// work_mem: KB -> BYTES. The same conversion sessionWorkMem applies for the
+	// executor's hash sizing — planner and executor must agree, which is what
+	// cost_funcs.go's workMem comment demands.
+	if eff, ok := get("work_mem"); ok {
+		if kb, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64); err == nil && kb > 0 {
+			ps.WorkMem = kb * 1024
+		}
+	}
+
+	// effective_cache_size: KB -> BLOCKS.
+	if eff, ok := get("effective_cache_size"); ok {
+		if kb, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64); err == nil && kb > 0 {
+			ps.EffectiveCacheSize = float64(kb) * 1024 / blockSizeBytesForPlanner
+		}
+	}
+	return ps
+}
+
+// blockSizeBytesForPlanner mirrors optimizer's blockSizeBytes (relsize.go). It
+// is restated here rather than exported because the optimizer's copy is the
+// authority and a second EXPORTED constant would invite the two to drift; the
+// unit test asserts the conversion against the planner's own default instead of
+// against this number.
+const blockSizeBytesForPlanner = 8192
+
+// plannerCostGUCsOverridden reports whether the session has SET any GUC that
+// feeds the planner's cost model.
+//
+// take2 P2-04, and a PREREQUISITE of P2-02 rather than a follow-up to it. The
+// plan cache is server-level and cross-session, keyed on
+// (dbOid, normalized SQL) with no GUC fingerprint. Until P2-01 the nine cost
+// GUCs were inert — defaultCostParams() was hard-wired — so every session
+// planned identically and the cache was safe by accident. The moment P2-02
+// makes the postmaster fill PlannerSettings from the session, a plan costed
+// under one connection's `random_page_cost` becomes servable to every other
+// connection. This is the same hazard, and the same remedy, as
+// plannerScanTogglesActive above: a session with its own planner inputs neither
+// reads from nor writes to the shared cache.
+//
+// The list is the nine cost GUCs PlannerSettings carries. It is checked by
+// OVERRIDE rather than by value, because comparing against BootVal would mean
+// parsing unit strings and would wrongly clear a session that SET a GUC to its
+// default.
+func plannerCostGUCsOverridden(sess *misc.SessionRegistry) bool {
+	if sess == nil {
+		return false
+	}
+	for _, name := range [...]string{
+		"seq_page_cost", "random_page_cost",
+		"cpu_tuple_cost", "cpu_index_tuple_cost", "cpu_operator_cost",
+		"parallel_setup_cost", "parallel_tuple_cost",
+		"effective_cache_size", "work_mem",
+		// take2 P2-03: hash_mem_multiplier scales the hash budget, so it
+		// changes plans exactly as work_mem does and must take a session off
+		// the shared cache for the same reason.
+		"hash_mem_multiplier",
+		// take2 P2-05: the method toggles change plans exactly as the cost
+		// GUCs do, so they must take a session off the shared cache too.
+		"enable_hashjoin", "enable_mergejoin", "enable_nestloop",
+		"enable_memoize", "enable_nestloop_index",
+		"enable_hashagg", "enable_presorted_aggregate",
+		"geqo", "geqo_threshold", "geqo_effort", "geqo_pool_size",
+		"geqo_generations", "geqo_selection_bias", "geqo_seed",
+	} {
+		if sess.HasSessionOverride(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// plannerSessionInputsActive is the single predicate the plan-cache guards use:
+// true when this session carries ANY planner input the cache key does not
+// capture. Keeping the two families behind one name means a third family cannot
+// be added later without every guard site picking it up.
+func plannerSessionInputsActive(sess *misc.SessionRegistry) bool {
+	return plannerScanTogglesActive(sess) || plannerCostGUCsOverridden(sess)
 }
 
 func sessionPlanCatalog(sess *misc.SessionRegistry, base catalog.Catalog, dbOid uint32) catalog.Catalog {
@@ -3426,11 +3642,28 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 		node = cachedNode[0]
 	} else {
 		var err error
-		node, err = optimizer.Plan(stmt, ctxPlanCatalog(ctx, s.cfg.Catalog))
+		node, err = optimizer.PlanWithSettings(stmt, ctxPlanCatalog(ctx, s.cfg.Catalog), ctxPlannerSettings(ctx))
 		if err != nil {
 			code, msg := planErrorFields(err)
 			return s.writeQueryError(w, code, msg, planErrorHintFields(err)...)
 		}
+		// The parallel post-pass belongs to EVERY plan, not just cached ones.
+		//
+		// applyParallelPostPass used to run only inside the dispatch loop's
+		// plan-cache block, so a statement that bypassed the cache was never
+		// considered for a Gather and ran strictly serially. Every cache-bypass
+		// reason triggered it: SET enable_seqscan=off, WHERE CURRENT OF, a
+		// pending partition detach — and, once take2 P2-02b made a conf-file
+		// work_mem count as a session input, the whole TPC-H bench. That last
+		// one is how it surfaced: Q9 went 15.8s -> 69.3s with an unchanged
+		// plan shape and an unchanged work_mem, because the Gather over four
+		// workers had silently disappeared.
+		//
+		// Wrapping here rather than at the cache site keeps the invariant the
+		// cache comment already states — the CACHE holds the serial plan and
+		// the Gather is chosen per statement from this session's GUCs — while
+		// extending it to the statements that never reach the cache.
+		node = ctxApplyParallelPostPass(node, ctx)
 		// Note: plan cache storage happens at the dispatch level (caller
 		// stores if cacheKey was computed). This function only executes.
 		//
@@ -3614,10 +3847,42 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 	}
 	// Invalidate plan cache after DDL so stale schema references are
 	// never reused by concurrent sessions. M0098-0005.
-	if _, isDDL := node.(*optimizer.DDL); isDDL && s.pc != nil {
+	//
+	// take2 P1-03b: statistics-changing utilities invalidate too. ANALYZE and
+	// VACUUM are planned as *optimizer.Utility, not *optimizer.DDL, so before
+	// this a session could ANALYZE a relation and then re-run a cached query
+	// and still get the plan chosen from the OLD statistics — the one case
+	// where a user has explicitly asked the planner to reconsider.
+	//
+	// Upstream reaches the same place by a different route: vac_update_relstats
+	// and the pg_statistic writes emit relcache invalidation messages, which
+	// plancache.c's ResetPlanCache picks up. goopg's cache has no such message
+	// bus, so the trigger is the statement kind.
+	if s.pc != nil && planCacheInvalidatingStmt(node) {
 		s.pc.Invalidate()
 	}
 	return w.WriteCommandComplete(tag)
+}
+
+// planCacheInvalidatingStmt reports whether the executed statement can have
+// changed something a cached plan was built from.
+//
+// DDL changes the schema; ANALYZE and VACUUM change the STATISTICS the planner
+// costed with. Both make a cached plan stale, and goopg has no invalidation
+// message bus to notice the second kind, so it is recognised here by statement
+// kind. VACUUM is included because its Analyze pass updates reltuples/relpages
+// (P1-03) even without the ANALYZE keyword.
+func planCacheInvalidatingStmt(node optimizer.Node) bool {
+	switch n := node.(type) {
+	case *optimizer.DDL:
+		return true
+	case *optimizer.Utility:
+		switch n.Stmt.(type) {
+		case *parser.AnalyzeStmt, *parser.VacuumStmt:
+			return true
+		}
+	}
+	return false
 }
 
 // commandTagFor builds the upstream-shaped CommandComplete tag for
@@ -4391,7 +4656,7 @@ func (s *Server) materializeCursor(ectx *executor.Context, cur *cursorEntry, cur
 		return &executor.ExecError{Code: "26000", Message: fmt.Sprintf("cursor \"%s\" query not found", cursorName)}
 	}
 
-	node, planErr := optimizer.Plan(selectStmt, ctxPlanCatalog(ectx, s.cfg.Catalog))
+	node, planErr := optimizer.PlanWithSettings(selectStmt, ctxPlanCatalog(ectx, s.cfg.Catalog), ctxPlannerSettings(ectx))
 	if planErr != nil {
 		code, msg := planErrorFields(planErr)
 		return &executor.ExecError{Code: string(code), Message: msg}

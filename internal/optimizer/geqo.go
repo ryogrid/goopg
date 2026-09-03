@@ -131,14 +131,21 @@ func initTour(tour []Gene, rng *geqoRNG) {
 // effort is Geqo_effort (1-10, default 5).
 func geqoSearch(s *searchCtx, builder joinRelBuilder, effort int) (*Path, error) {
 	nrels := s.nrels
-	ps := poolSize(nrels, effort)
-	gens := numberGenerations(ps, 0) // 0 = use default
+	// take2 P3-10: the pool size and generation count come from the session's
+	// GUCs. PG treats 0 in either as "derive me" — geqo_pool_size from effort,
+	// geqo_generations from the pool size — so the override is simply a
+	// non-zero value.
+	ps := s.cp.geqoPoolSize
+	if ps <= 0 {
+		ps = poolSize(nrels, effort)
+	}
+	gens := numberGenerations(ps, s.cp.geqoGenerations)
 
-	// PRNG: geqo_seed controls reproducibility in PG. v0 uses a fixed seed
-	// (deterministic per query) since the planner has no session in scope to
-	// read the GUC; the other GEQO tuning GUCs (effort/generations/bias) also
-	// use PG's defaults — effort 5, generations = pool size, bias 2.0.
-	rng := newGeqoRNG(0)
+	// PRNG: geqo_seed controls reproducibility (geqo_main.c). take2 P3-10 —
+	// the planner DOES have the session in scope now, so this reads the GUC
+	// rather than a fixed 0. PG's default of 0 keeps today's behaviour, which
+	// is what makes this change plan-neutral at the defaults.
+	rng := newGeqoRNG(geqoSeedState(s.cp.geqoSeed))
 
 	pool := allocPool(ps, nrels)
 	defer freePool(pool)
@@ -166,7 +173,11 @@ func geqoSearch(s *searchCtx, builder joinRelBuilder, effort int) (*Path, error)
 
 	for gen := 0; gen < gens; gen++ {
 		// Selection: pick two parents using linear bias.
-		geqoSelection(pool, 2.0, momma, daddy, rng)
+		bias := s.cp.geqoBias
+		if bias <= 0 {
+			bias = 2.0
+		}
+		geqoSelection(pool, bias, momma, daddy, rng)
 
 		// ERX crossover: edge table from parents.
 		gimmeEdgeTable(momma.string, daddy.string, nrels, edgeTable)
@@ -647,6 +658,23 @@ func edgeFailure(et *edgeTable, gene []Gene, index, numGene int, rng *geqoRNG) i
 // geqoRNG is a seeded PRNG for GEQO.
 type geqoRNG struct {
 	state uint64
+}
+
+// geqoSeedState maps geqo_seed, a double in [0,1], onto the integer state
+// goopg's PRNG takes. PG seeds its own generator from the double directly
+// (geqo_set_seed -> pg_prng_fseed); the mapping matters only in that a given
+// seed must reproduce a given plan, not that it match PG's bit-for-bit.
+//
+// 0 — PG's default — returns 0 so newGeqoRNG keeps its existing fixed state,
+// which is what makes take2 P3-10 plan-neutral at the defaults.
+func geqoSeedState(seed float64) int64 {
+	if seed <= 0 {
+		return 0
+	}
+	if seed >= 1 {
+		seed = 1
+	}
+	return int64(seed * float64(math.MaxInt64/2))
 }
 
 func newGeqoRNG(seed int64) *geqoRNG {

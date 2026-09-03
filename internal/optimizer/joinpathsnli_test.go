@@ -49,7 +49,7 @@ func nliInnerRelBinding(relids RelSet, rows float64, param RelSet, probeCost flo
 		Cost:          Cost{Total: probeCost},
 		IndexClauses:  cls,
 		RequiredOuter: param,
-	})
+	}, "test")
 	setCheapest(rel)
 	return rel
 }

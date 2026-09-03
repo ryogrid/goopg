@@ -98,6 +98,12 @@ type joinVarStats struct {
 	stats  *catalog.ColumnStats
 	tuples float64
 	isBool bool
+
+	// typeName is the column's catalog type. Histogram bounds are stored as
+	// STRINGS, so every comparison against them needs the type to know whether
+	// to compare numerically or byte-wise — `histCmp` falls back to
+	// strings.Compare without it, which orders "10" before "9". take2 P2-12.
+	typeName string
 }
 
 // examineJoinVar resolves ONE operand of a join clause to its base relation's
@@ -127,6 +133,14 @@ type joinVarStats struct {
 func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	var v joinVarStats
 	i, cr, ok := s.resolveJoinVarColumn(key, relids)
+	if ok && i >= 0 && i < len(s.relInfos) && s.relInfos[i].table != nil && cr != nil {
+		for _, c := range s.relInfos[i].table.Columns {
+			if c.Name == cr.Name {
+				v.typeName = c.Type.Name
+				break
+			}
+		}
+	}
 	if cr != nil {
 		// PG's BOOLOID arm of `get_variable_numdistinct`: a boolean column has
 		// two values whether or not anyone has analysed it. Recorded even for
@@ -183,7 +197,7 @@ func (s *searchCtx) resolveJoinVarColumn(key Expr, relids RelSet) (int, *ColumnR
 	if relids == 0 || relids&(relids-1) != 0 {
 		return -1, cr, false
 	}
-	i := bits.TrailingZeros16(uint16(relids))
+	i := bits.TrailingZeros32(uint32(relids))
 	if i >= len(s.relInfos) {
 		return -1, cr, false
 	}
@@ -392,4 +406,180 @@ func clampSelectivity(s float64) float64 {
 		return 1
 	}
 	return s
+}
+
+// residualSelectivity is the combined selectivity of the join clauses a merge
+// join CANNOT use as merge clauses — PG's qpquals for that path.
+//
+// It exists so the merge arm can recover `mergejointuples`: the joinrel's row
+// count is what survives EVERY clause, while the merge operator emits what
+// survives only the MERGE clauses and lets the residual filter the rest. The
+// two differ exactly by this factor, and costing the operator on the smaller of
+// them is the mispricing recorded in
+// impl/FINDING-mergejoin-costed-on-postfilter-rows.md.
+//
+// Clauses are combined as independent conjuncts, the same assumption
+// clauselist_selectivity makes and the same one calcJoinrelSize already makes
+// for the join as a whole, so this cannot disagree with the row estimate it is
+// dividing into.
+func (s *searchCtx) residualSelectivity(residual []*restrictInfo) float64 {
+	sel := 1.0
+	for _, ri := range residual {
+		sel *= s.joinClauseSelectivity(ri)
+	}
+	return clampSelectivity(sel)
+}
+
+// mergeJoinTuples is `final_cost_mergejoin`'s `mergejointuples`
+// (costsize.c:3960-4045): the number of tuples the merge operator actually
+// emits, before the non-merge quals filter them down to the joinrel's row
+// count.
+//
+// Returns joinrelRows unchanged when there is no residual — the overwhelmingly
+// common case, and the one where the old code was already right.
+func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInfo, outerRows, innerRows float64) float64 {
+	if len(residual) == 0 || joinrelRows <= 0 {
+		return joinrelRows
+	}
+	sel := s.residualSelectivity(residual)
+	if sel <= 0 {
+		return joinrelRows
+	}
+	tuples := joinrelRows / sel
+	// The merge can never emit more pairs than the cross product; the clamp
+	// mirrors the one calcJoinrelSize applies to its own estimate.
+	if cross := math.Max(outerRows, 1) * math.Max(innerRows, 1); tuples > cross {
+		tuples = cross
+	}
+	if tuples < joinrelRows {
+		return joinrelRows
+	}
+	return tuples
+}
+
+// estimateHashBucketSize is `estimate_hash_bucket_stats` (selfuncs.c) reduced to
+// the fraction it exists to produce: what share of the inner relation lands in
+// the bucket an average outer probe walks. take2 P2-11.
+//
+// PG's full function also returns the inner key's MCV frequency and folds it in;
+// goopg returns the ndistinct-derived fraction only, and that limit is recorded
+// rather than hidden — the MCV half needs the inner key's MCV list at the cost
+// site, which is a second plumbing step.
+//
+// The point of the term is the one thing goopg's hash cost could not see: a
+// hash join keyed on a LOW-ndistinct column has long buckets, so every probe
+// walks many tuples, while a unique key gives one. Priced without it, the two
+// cost the same — the degeneracy `reselectDegenerateHashKeys` was written to
+// work around (Q78's collapsed bucket, M0125-0035b).
+//
+// Returns 0 when no operand resolves to a statistic. 0 means "no information"
+// and the caller must skip the term entirely rather than substitute a guess:
+// inventing a bucket size without stats would move plans on nothing, which is
+// the failure this bundle keeps recording.
+func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids RelSet) float64 {
+	// PG takes the SMALLEST bucketsize over the hash clauses: "we use the
+	// smallest bucketsize estimated for any individual hashclause", because the
+	// most selective key is the one that spreads the table.
+	best := 0.0
+	for _, ri := range clauses {
+		if ri == nil {
+			continue
+		}
+		// The operand on the INNER side is the one that was hashed.
+		key := ri.rightKey
+		relids := ri.rightRelids
+		if !relsSubset(ri.rightRelids, innerRelids) {
+			key, relids = ri.leftKey, ri.leftRelids
+		}
+		if key == nil || !relsSubset(relids, innerRelids) {
+			continue
+		}
+		v := s.examineJoinVar(key, relids)
+		if v.stats == nil && !v.isBool {
+			continue
+		}
+		nd, isDefault := getVariableNumDistinct(v)
+		if isDefault || nd <= 0 {
+			// A guessed ndistinct is exactly the input that must not steer a
+			// cost term; PG's own caller checks `isdefault` for the same reason.
+			continue
+		}
+		frac := 1.0 / nd
+		if best == 0 || frac < best {
+			best = frac
+		}
+	}
+	return best
+}
+
+// mergeJoinScanSel is `mergejoinscansel` (selfuncs.c) reduced to its END
+// selectivities: what FRACTION of each input a merge join actually consumes
+// before the other side's key range is exhausted. take2 P2-12.
+//
+// A merge join over `a.k = b.k` stops as soon as one side passes the other's
+// maximum key. When the two ranges overlap only partly — a fact-table scan
+// joined to a filtered dimension, say — a large share of the bigger input is
+// never read, and goopg charged a FULL pass over both.
+//
+// PG's start selectivities (the "skip to the first match" half) are NOT
+// implemented here and both are reported as 0. They are the smaller term, and
+// they model a seek goopg's merge does not perform: it consumes from the
+// beginning of each sorted input. Reporting 0 makes the omission a no-op rather
+// than an approximation.
+//
+// Returns (1, 1) — charge everything, i.e. today's behaviour — whenever either
+// side's range cannot be established. That is the safe direction: this term can
+// only ever REDUCE a merge join's cost, so an unknown must not.
+func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet) (outerEnd, innerEnd float64) {
+	if len(clauses) == 0 {
+		return 1, 1
+	}
+	// PG keys the estimate on the FIRST merge clause: it is the leading sort
+	// column, and it alone determines when the scan can stop.
+	ri := clauses[0]
+	if ri == nil || ri.leftKey == nil || ri.rightKey == nil {
+		return 1, 1
+	}
+	outerKey, outerRels := ri.leftKey, ri.leftRelids
+	innerKey, innerRels := ri.rightKey, ri.rightRelids
+	if !relsSubset(outerRels, outerRelids) {
+		outerKey, outerRels, innerKey, innerRels = innerKey, innerRels, outerKey, outerRels
+	}
+	if !relsSubset(outerRels, outerRelids) {
+		return 1, 1
+	}
+
+	ov := s.examineJoinVar(outerKey, outerRels)
+	iv := s.examineJoinVar(innerKey, innerRels)
+	oMax, oOK := histogramMax(ov.stats)
+	iMax, iOK := histogramMax(iv.stats)
+	if !oOK || !iOK {
+		return 1, 1
+	}
+
+	// The outer is scanned until it passes the INNER's maximum, and vice
+	// versa: `leftend = scalarineqsel(left <= right_max)`.
+	outerEnd = fractionAtMost(ov.stats, iMax, ov.typeName)
+	innerEnd = fractionAtMost(iv.stats, oMax, iv.typeName)
+	return clampSelectivity(outerEnd), clampSelectivity(innerEnd)
+}
+
+// histogramMax is `get_variable_range`'s upper bound: the last histogram
+// boundary, which ANALYZE stores in ascending order.
+func histogramMax(cs *catalog.ColumnStats) (string, bool) {
+	if cs == nil || len(cs.Histogram) == 0 {
+		return "", false
+	}
+	return cs.Histogram[len(cs.Histogram)-1], true
+}
+
+// fractionAtMost is `scalarineqsel(<=)` over the column's histogram: the share
+// of the column at or below `bound`.
+func fractionAtMost(cs *catalog.ColumnStats, bound, typeName string) float64 {
+	if cs == nil || len(cs.Histogram) < 2 || typeName == "" {
+		// No type means histCmp would compare byte-wise, which misorders every
+		// numeric column. Refuse rather than guess.
+		return 1
+	}
+	return histogramOpSelectivity(parser.OpLe, cs.Histogram, bound, typeName)
 }

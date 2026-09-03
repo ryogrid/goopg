@@ -149,8 +149,8 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 	// existing refusal panic at PLAN time rather than reading the wrong
 	// column at run time. (M0134-0187, DESIGN §15/§21.)
 	if width > len(leaf) {
-		panic(fmt.Sprintf("createPlan: rebuilt leaf for relset %#04x is %d columns wide but the recorded leaf is only %d; the schema was synthesised, not carried",
-			uint16(rel.Relids), width, len(leaf)))
+		panic(fmt.Sprintf("createPlan: rebuilt leaf for relset %#08x is %d columns wide but the recorded leaf is only %d; the schema was synthesised, not carried",
+			uint32(rel.Relids), width, len(leaf)))
 	}
 	lay := make(outputLayout, width)
 	for i, col := range out {
@@ -162,8 +162,8 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 			}
 		}
 		if at < 0 {
-			panic(fmt.Sprintf("createPlan: narrowed leaf for relset %#04x emits column %q, which the recorded leaf does not have; the schema was synthesised, not narrowed",
-				uint16(rel.Relids), col.Name))
+			panic(fmt.Sprintf("createPlan: narrowed leaf for relset %#08x emits column %q, which the recorded leaf does not have; the schema was synthesised, not narrowed",
+				uint32(rel.Relids), col.Name))
 		}
 		lay[i] = rel.baseOffset + at
 	}
@@ -277,6 +277,13 @@ type joinInputs struct {
 func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs {
 	outerNode, outerLay := createPlanNode(outerPath)
 	innerNode, innerLay := createPlanNode(innerPath)
+	// Take2 P4-01 rev 10 step 3 (default ON since step 5): narrow the build-side
+	// pair where BOTH halves are still in hand — after this point the schema
+	// check (:289), `merged` (:293) and the concatenated layout (:299) all see
+	// a consistent pair.
+	// The PathHashJoin-only restriction is enforced inside narrowBuildInput
+	// (only a hash join has a resident build side) — see narrowoutput.go.
+	innerNode, innerLay = narrowBuildInput(kind, innerNode, innerLay, innerPath)
 	if outerNode == nil || innerNode == nil {
 		panic(fmt.Sprintf("createPlan: %s over a child path that built no node", kind))
 	}
@@ -303,7 +310,7 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 	outerRelids := childRelids(outerPath)
 	innerRelids := childRelids(innerPath)
 	if want := outerRelids | innerRelids; p.Rel != nil && p.Rel.Relids != want {
-		panic(fmt.Sprintf("createPlan: %s over relset %#04x whose children span %#04x", kind, uint16(p.Rel.Relids), uint16(want)))
+		panic(fmt.Sprintf("createPlan: %s over relset %#08x whose children span %#08x", kind, uint32(p.Rel.Relids), uint32(want)))
 	}
 
 	return joinInputs{
@@ -350,8 +357,8 @@ func (in joinInputs) keyPairs(kind string, keys []*restrictInfo) []JoinKeyPair {
 		case relsSubset(ri.rightRelids, in.outerRelids) && relsSubset(ri.leftRelids, in.innerRelids):
 			outerKey, innerKey = ri.rightKey, ri.leftKey
 		default:
-			panic(fmt.Sprintf("createPlan: %s key %d splits %#04x/%#04x, which does not match the join's %#04x/%#04x sides",
-				kind, i, uint16(ri.leftRelids), uint16(ri.rightRelids), uint16(in.outerRelids), uint16(in.innerRelids)))
+			panic(fmt.Sprintf("createPlan: %s key %d splits %#08x/%#08x, which does not match the join's %#08x/%#08x sides",
+				kind, i, uint32(ri.leftRelids), uint32(ri.rightRelids), uint32(in.outerRelids), uint32(in.innerRelids)))
 		}
 		pairs = append(pairs, JoinKeyPair{
 			Left:  translateToLayout("join clause", outerKey, in.lay, in.index),
@@ -434,8 +441,8 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		panic("createPlan: PathHashJoin with no hash keys; a hash join keys on nothing only as a nested loop")
 	}
 	if p.RequiredOuter != 0 {
-		panic(fmt.Sprintf("createPlan: parameterised PathHashJoin over relset %#04x; a hash join propagates a parameter rather than binding it",
-			uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: parameterised PathHashJoin over relset %#08x; a hash join propagates a parameter rather than binding it",
+			uint32(p.Rel.Relids)))
 	}
 
 	in := joinInputsFor(p, "PathHashJoin", p.Children[0], p.Children[1])
@@ -536,8 +543,8 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		panic("createPlan: PathMergeJoin with no merge clauses; a merge join has no ordering to merge on")
 	}
 	if p.RequiredOuter != 0 {
-		panic(fmt.Sprintf("createPlan: parameterised PathMergeJoin over relset %#04x; a merge join propagates a parameter rather than binding it",
-			uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: parameterised PathMergeJoin over relset %#08x; a merge join propagates a parameter rather than binding it",
+			uint32(p.Rel.Relids)))
 	}
 	for i, pk := range p.Pathkeys {
 		if !pk.SortAsc || pk.NullsFirst {

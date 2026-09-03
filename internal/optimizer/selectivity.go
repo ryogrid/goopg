@@ -16,9 +16,11 @@
 package optimizer
 
 import (
-	"github.com/goopg/goopg/internal/parser"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/goopg/goopg/internal/parser"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -31,10 +33,22 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 	}
 	switch e := expr.(type) {
 	case *BinaryOp:
+		// Row-constructor comparison: estimate from the leading pair
+		// (take2 P1-14b, rowcomparesel). Checked before the operator
+		// dispatch because the operands are rows, not scalars.
+		if sel, ok := rowCompareSelectivity(e.Op, e.Left, e.Right, child); ok {
+			return sel
+		}
 		switch e.Op {
 		case parser.OpAnd:
-			// Independence assumption — upstream's default.
-			return clauseSelectivity(e.Left, child) * clauseSelectivity(e.Right, child)
+			// Independence is upstream's default for UNRELATED clauses, but
+			// two inequalities on the SAME variable are not independent:
+			// `x >= a AND x < b` selects the band between them, not the
+			// product of two tail fractions. clauselist_selectivity pairs them
+			// (clausesel.c); conjunctionSelectivity is that pairing, and it
+			// falls back to the independent product for everything else.
+			// take2 P1-13.
+			return conjunctionSelectivity(splitConjuncts(e, nil), child)
 		case parser.OpOr:
 			a := clauseSelectivity(e.Left, child)
 			b := clauseSelectivity(e.Right, child)
@@ -46,7 +60,26 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 			return 1 - eq
 		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			return rangeOpSelectivity(e.Op, e.Left, e.Right, child)
+		case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
+			// patternsel (like_support.c) — take2 P1-14b. LIKE with no
+			// estimator fell through to defaultGenericSelectivity (1/3);
+			// TPC-H Q9's `part LIKE '%green%'` priced 66,666 vs ~10.6k.
+			return patternClauseSelectivity(e.Op, e.Left, e.Right, child)
 		}
+	case *IsNullExpr:
+		// nulltestsel (postgres/src/backend/utils/adt/selfuncs.c). take2 P1-14.
+		//
+		// ANALYZE has always collected NullFrac and persisted it as
+		// stanullfrac, and this is the ONE clause it exists to answer — yet
+		// `IS NULL` had no arm at all and fell through to the generic default
+		// below, so the statistic was never read for its own predicate.
+		return nullTestSelectivity(e, child)
+	case *IsBoolExpr:
+		// booltestsel (selfuncs.c:1545) — take2 P1-14b. IS TRUE/FALSE had
+		// no arm at all and fell through to the generic default, so a
+		// boolean column's statistics were never read for their own
+		// predicate — the same defect P1-14 just closed for IS NULL.
+		return boolTestSelectivity(e, child)
 	case *UnaryOp:
 		if e.Op == parser.OpNot {
 			return 1 - clauseSelectivity(e.Operand, child)
@@ -63,13 +96,7 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 			return defaultGenericSelectivity
 		}
 		stats := columnStatsForChild(cr.Index, child)
-		var sel float64
-		for _, v := range e.List {
-			sel += eqSelectivityForColumn(stats, v)
-		}
-		if sel > 1.0 {
-			sel = 1.0
-		}
+		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
 		if e.Negated {
 			return 1 - sel
 		}
@@ -83,19 +110,158 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 	return defaultGenericSelectivity
 }
 
+// inListSelectivity estimates `operand <op> ANY|ALL (elements)` by
+// applying the element operator's own estimator per element and merging
+// OR (ANY) or AND (ALL) — PG's scalararraysel (selfuncs.c:1821) structure,
+// reusing goopg's per-operator estimators instead of re-deriving them.
+//
+// `e.AnyOp == 0` (plain IN) means equality; `e.AllOp` selects AND-merging;
+// `e.NotEqualAny` (M0097-0067, `x != ANY`) means each element compares by
+// `<>`. Negation (NOT IN) is applied by the caller, matching the old arm.
+// The equality-ANY disjoint sum is accepted exactly when PG accepts it
+// (in [0,1]); in the common small-sum case that reproduces the old plain
+// sum bit-for-bit, and out-of-range sums fall back to the OR merge.
+func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tuples float64, child Node) float64 {
+	useOr := !e.AllOp
+	isEquality := (e.AnyOp == 0 || e.AnyOp == parser.OpEq) && !e.NotEqualAny
+	isInequality := e.AnyOp == parser.OpNe
+	s1 := 0.0
+	if !useOr {
+		s1 = 1.0
+	}
+	s1disjoint := s1
+	for _, elem := range e.List {
+		s2 := inListElementSelectivity(e, cr, elem, stats, tuples, child)
+		if useOr {
+			s1 = s1 + s2 - s1*s2
+			if isEquality {
+				s1disjoint += s2
+			}
+		} else {
+			s1 = s1 * s2
+			if isInequality {
+				s1disjoint += s2 - 1.0
+			}
+		}
+	}
+	if ((useOr && isEquality) || (!useOr && isInequality)) && s1disjoint >= 0.0 && s1disjoint <= 1.0 {
+		s1 = s1disjoint
+	}
+	return clampProbability(s1)
+}
+
+// inListElementSelectivity prices one `operand <op> element` comparison
+// with the estimator for the element operator: equality reuses the MCV /
+// histogram machinery, ranges reuse the inequality estimator, LIKE reuses
+// patternsel, and anything without an estimator declines to the generic
+// default (PG punts operator-less shapes to 0.5; the file-local default
+// applies here pending P1-14b's DEFAULT_* alignment).
+func inListElementSelectivity(e *InExpr, cr *ColumnRef, elem Expr, stats *catalog.ColumnStats, tuples float64, child Node) float64 {
+	if e.NotEqualAny {
+		// OR of `<>`: one minus the equality mass per element.
+		return 1 - eqSelectivityForColumn(stats, elem, tuples)
+	}
+	switch e.AnyOp {
+	case 0, parser.OpEq:
+		return eqSelectivityForColumn(stats, elem, tuples)
+	case parser.OpNe:
+		return 1 - eqSelectivityForColumn(stats, elem, tuples)
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return rangeOpSelectivity(e.AnyOp, cr, elem, child)
+	case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
+		return patternClauseSelectivity(e.AnyOp, cr, elem, child)
+	default:
+		return defaultGenericSelectivity
+	}
+}
+
+// rowCompareLeadingPair returns the leading elements when both sides of
+// a comparison are non-empty row constructors — the only input PG's
+// rowcomparesel uses. Anything else (row vs scalar, row vs subquery,
+// empty rows) declines to the pre-existing default.
+func rowCompareLeadingPair(left, right Expr) (Expr, Expr, bool) {
+	lr, ok := left.(*RowExpr)
+	if !ok || len(lr.Elems) == 0 {
+		return nil, nil, false
+	}
+	rr, ok := right.(*RowExpr)
+	if !ok || len(rr.Elems) == 0 {
+		return nil, nil, false
+	}
+	return lr.Elems[0], rr.Elems[0], true
+}
+
+// rowCompareSelectivity estimates `(a, ...) OP (b, ...)` from the LEADING
+// pair alone as an ordinary scalar comparison, mirroring rowcomparesel
+// (selfuncs.c:2204): refining with later columns would need multi-column
+// statistics goopg does not keep. Join-side row comparisons stay as they
+// were — this covers the restriction path the item scopes.
+func rowCompareSelectivity(op parser.OpCode, left, right Expr, child Node) (float64, bool) {
+	l, r, ok := rowCompareLeadingPair(left, right)
+	if !ok {
+		return 0, false
+	}
+	switch op {
+	case parser.OpEq:
+		return eqOpSelectivity(l, r, child), true
+	case parser.OpNe:
+		return 1 - eqOpSelectivity(l, r, child), true
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return rangeOpSelectivity(op, l, r, child), true
+	default:
+		return 0, false
+	}
+}
+
+// rowCompareSelectivityWithSource is the reliability-tracking twin: the
+// delegated estimator's reliability is the answer's.
+func rowCompareSelectivityWithSource(op parser.OpCode, left, right Expr, child Node) (selectivityEstimate, bool) {
+	l, r, ok := rowCompareLeadingPair(left, right)
+	if !ok {
+		return selectivityEstimate{}, false
+	}
+	switch op {
+	case parser.OpEq, parser.OpNe:
+		est := eqOpSelectivityWithSource(l, r, child)
+		if op == parser.OpNe {
+			return selectivityEstimate{value: 1 - est.value, reliable: est.reliable}, true
+		}
+		return est, true
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return rangeOpSelectivityWithSource(op, l, r, child), true
+	default:
+		return selectivityEstimate{}, false
+	}
+}
+
 // eqOpSelectivity handles `col = const` (or the swapped `const =
 // col`). Returns the MCV frequency on a hit, the non-MCV fallback,
 // or — when stats are missing — the upstream `1/200` constant.
 func eqOpSelectivity(left, right Expr, child Node) float64 {
 	col, val, ok := normalizeColumnConst(left, right)
 	if !ok {
+		// `col = <non-const>`: column-column and column-expression
+		// equality (take2 P1-14b). This delegates to the existing
+		// var_eq_non_const port rather than open-coding it a second
+		// time — its no-statistics branch returns 1/200, which IS the
+		// old default (defaultEqSelectivity), so the delegation is
+		// bit-identical where there are no statistics and
+		// stats-driven where there are.
+		if cr, isCol := left.(*ColumnRef); isCol {
+			return varEqNonConstSelectivity(columnStatsForChild(cr.Index, child), columnRawRowsForChild(cr.Index, child))
+		} else if cr, isCol := right.(*ColumnRef); isCol {
+			return varEqNonConstSelectivity(columnStatsForChild(cr.Index, child), columnRawRowsForChild(cr.Index, child))
+		}
 		return defaultEqSelectivity
 	}
 	stats := columnStatsForChild(col.Index, child)
-	return eqSelectivityForColumn(stats, val)
+	return eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child))
 }
 
-func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr) float64 {
+// eqSelectivityForColumn prices `col = const`. `tuples` is the relation's RAW
+// tuple count, needed only to resolve the relative ndistinct form; pass 0 when
+// it is unknown and the absolute form will still be used.
+func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr, tuples float64) float64 {
 	literal, ok := formatExprConstant(val)
 	if !ok {
 		return defaultEqSelectivity
@@ -114,7 +280,12 @@ func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr) float64 {
 	for _, mcv := range stats.MCV {
 		mcvMass += mcv.Frequency
 	}
-	remainingDistinct := stats.NDistinct - int64(len(stats.MCV))
+	// take2 P2-09: the RESOLVED ndistinct, not the raw absolute field. A
+	// column whose distinct count scales with the relation stores the relative
+	// form, and reading `.NDistinct` alone saw zero for it — so every equality
+	// against a key column fell to defaultEqSelectivity and an IN-list over one
+	// was out by three orders of magnitude.
+	remainingDistinct := stats.ResolvedNDistinct(tuples) - float64(len(stats.MCV))
 	if remainingDistinct <= 0 {
 		// MCV covers every distinct value — the constant isn't
 		// among them. Selectivity is the residual mass /
@@ -126,7 +297,7 @@ func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr) float64 {
 	if mass <= 0 {
 		return defaultEqSelectivity
 	}
-	return mass / float64(remainingDistinct)
+	return mass / remainingDistinct
 }
 
 // rangeOpSelectivity handles `col <op> const` for `< <= > >=`.
@@ -294,6 +465,37 @@ func numericValue(s, typeName string) (float64, bool) {
 			return 0, false
 		}
 		return v, true
+
+	// take2 P1-11b: `convert_timevalue_to_scalar` (selfuncs.c). Date and
+	// timestamp values become a scalar so histogram interpolation can measure
+	// WHERE in a bucket the literal falls.
+	//
+	// Without this the whole date family fell to `bucketFraction`'s flat 0.5.
+	// Measured on lineitem, `l_shipdate <` at three points:
+	// -0.19 %, -0.99 %, -3.22 % error. So the bucket itself was already found
+	// correctly — ISO-8601 strings sort in date order, which is why the error
+	// is bounded by one bucket rather than unbounded — and this removes the
+	// residual half-bucket. It is a fidelity fix of a few percent, not the
+	// large win the item's original wording implied (07 §4 records the
+	// correction).
+	case "date":
+		if t, err := time.Parse("2006-01-02", strings.TrimSpace(s)); err == nil {
+			// Julian-style day number; only differences matter here.
+			return float64(t.Unix()) / 86400.0, true
+		}
+		return 0, false
+	case "timestamp", "timestamp without time zone", "timestamptz", "timestamp with time zone":
+		for _, layout := range []string{
+			"2006-01-02 15:04:05.999999-07",
+			"2006-01-02 15:04:05.999999",
+			"2006-01-02 15:04:05",
+			"2006-01-02",
+		} {
+			if t, err := time.Parse(layout, strings.TrimSpace(s)); err == nil {
+				return float64(t.UnixNano()) / 1e9, true
+			}
+		}
+		return 0, false
 	}
 	return 0, false
 }
@@ -382,71 +584,33 @@ func formatExprConstant(e Expr) (string, bool) {
 // index `idx` (matches the executor's Output indexing). Returns
 // nil when the column doesn't trace back to a base relation
 // with stats — that's the unanalysed-table fallback.
-func columnStatsForChild(idx int, child Node) *catalog.ColumnStats {
-	switch x := child.(type) {
-	case *SeqScan:
-		if x.Table == nil || x.Table.Stats == nil {
-			return nil
-		}
-		if idx < 0 || idx >= len(x.Table.Stats.Columns) {
-			return nil
-		}
-		return &x.Table.Stats.Columns[idx]
-	case *Filter:
-		return columnStatsForChild(idx, x.Child)
-	case *Sort:
-		return columnStatsForChild(idx, x.Child)
-
-	// M0127-P5.6-e-ii: the Project arm used to pass `idx` straight
-	// through, which is only right when the target list is the
-	// identity — its ndistinct twin has remapped through `Targets`
-	// since M0125-0038. A reordering or narrowing Project therefore
-	// returned ANOTHER column's MCV list and histogram, which is worse
-	// than returning none. The divergence became reachable far more
-	// often with the *Join arm below, since a join input is routinely
-	// Project-wrapped.
-	case *Project:
-		if idx >= 0 && idx < len(x.Targets) {
-			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
-				return columnStatsForChild(cr.Index, x.Child)
-			}
-		}
-		return nil
-
-	// The remaining pass-through wrappers, kept in step with
-	// `columnNDistinctForChild`'s arm list (hard-won rule: sibling
-	// paths change together). Each preserves its child's schema
-	// position for position.
-	case *Limit:
-		return columnStatsForChild(idx, x.Child)
-	case *LockRows:
-		return columnStatsForChild(idx, x.Child)
-	case *Gather:
-		return columnStatsForChild(idx, x.Child)
-	case *GatherMerge:
-		return columnStatsForChild(idx, x.Child)
-	case *CTEScan:
-		return columnStatsForChild(idx, x.Child)
-
-	// M0127-P5.6-e-ii: the *Join twin of `columnNDistinctForChild`'s
-	// arm — see the long comment there for the coordinate rule. Without
-	// it a join-level restriction (Q19's three-branch OR over `part` and
-	// `lineitem`) resolved no stats at all and every one of its branches
-	// collapsed to the `defaultEq`/`defaultIneq` constants.
-	case *Join:
-		if x.Left == nil || x.Right == nil {
-			return nil
-		}
-		lw := len(x.Left.Output())
-		if lw == 0 {
-			return nil
-		}
-		if idx >= lw {
-			return columnStatsForChild(idx-lw, x.Right)
-		}
-		return columnStatsForChild(idx, x.Left)
+// columnRawRowsForChild is columnStatsForChild's companion: the relation's RAW,
+// unfiltered tuple count, which is the divisor the relative ndistinct form
+// needs. Returns 0 when the column does not resolve to a base relation, which
+// ResolvedNDistinct treats as "absolute form only". take2 P2-09.
+func columnRawRowsForChild(idx int, child Node) float64 {
+	if ref, ok := resolveBaseColumn(idx, child); ok {
+		return ref.rawRows
 	}
-	return nil
+	return 0
+}
+
+func columnStatsForChild(idx int, child Node) *catalog.ColumnStats {
+	// take2 P1-26: ONE arm list, not two.
+	//
+	// This used to be a second full walker over the plan tree, duplicating
+	// resolveBaseColumn's arms — and its own comment recorded the rule it was
+	// breaking: "kept in step with columnNDistinctForChild's arm list
+	// (hard-won rule: sibling paths change together)". Keeping two walkers in
+	// step by hand is what the sibling-paths rule exists to prevent, and the
+	// pair had already drifted: this one had NO *IndexScan arm, so a column
+	// reached through an index-probed leaf resolved to no statistics at all
+	// and every clause over it fell to a default selectivity, while the
+	// ndistinct twin resolved it fine.
+	//
+	// Delegating gives the index-probed leaf MCV and histogram access and
+	// makes future drift impossible rather than merely discouraged.
+	return columnStatsForChildBase(idx, child)
 }
 
 // selectivityEstimate carries a clause's selectivity together
@@ -480,6 +644,11 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 	}
 	switch e := expr.(type) {
 	case *BinaryOp:
+		// Same row-constructor check as clauseSelectivity above, through
+		// the reliability-tracking estimators.
+		if est, ok := rowCompareSelectivityWithSource(e.Op, e.Left, e.Right, child); ok {
+			return est
+		}
 		switch e.Op {
 		case parser.OpAnd:
 			a := clauseSelectivityWithSource(e.Left, child)
@@ -496,7 +665,14 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 			return selectivityEstimate{value: 1 - eq.value, reliable: eq.reliable}
 		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			return rangeOpSelectivityWithSource(e.Op, e.Left, e.Right, child)
+		case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
+			return patternClauseSelectivityWithSource(e.Op, e.Left, e.Right, child)
 		}
+	case *IsBoolExpr:
+		if v, ok := boolTestSelectivityInner(e, child); ok {
+			return selectivityEstimate{value: v, reliable: true}
+		}
+		return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 	case *UnaryOp:
 		if e.Op == parser.OpNot {
 			sub := clauseSelectivityWithSource(e.Operand, child)
@@ -514,13 +690,7 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 		if stats == nil {
 			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 		}
-		var sel float64
-		for _, v := range e.List {
-			sel += eqSelectivityForColumn(stats, v)
-		}
-		if sel > 1.0 {
-			sel = 1.0
-		}
+		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
 		if e.Negated {
 			return selectivityEstimate{value: 1 - sel, reliable: true}
 		}
@@ -540,13 +710,24 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 func eqOpSelectivityWithSource(left, right Expr, child Node) selectivityEstimate {
 	col, val, ok := normalizeColumnConst(left, right)
 	if !ok {
+		// Same delegation as eqOpSelectivity above; reliable iff the
+		// column resolves against statistics.
+		if cr, isCol := left.(*ColumnRef); isCol {
+			if stats := columnStatsForChild(cr.Index, child); stats != nil {
+				return selectivityEstimate{value: varEqNonConstSelectivity(stats, columnRawRowsForChild(cr.Index, child)), reliable: true}
+			}
+		} else if cr, isCol := right.(*ColumnRef); isCol {
+			if stats := columnStatsForChild(cr.Index, child); stats != nil {
+				return selectivityEstimate{value: varEqNonConstSelectivity(stats, columnRawRowsForChild(cr.Index, child)), reliable: true}
+			}
+		}
 		return selectivityEstimate{value: defaultEqSelectivity, reliable: false}
 	}
 	stats := columnStatsForChild(col.Index, child)
 	if stats == nil {
 		return selectivityEstimate{value: defaultEqSelectivity, reliable: false}
 	}
-	return selectivityEstimate{value: eqSelectivityForColumn(stats, val), reliable: true}
+	return selectivityEstimate{value: eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child)), reliable: true}
 }
 
 // rangeOpSelectivityWithSource is the reliability-tracking twin
@@ -567,4 +748,171 @@ func rangeOpSelectivityWithSource(op parser.OpCode, left, right Expr, child Node
 	// Histogram present → trust rangeOpSelectivity's interpolation.
 	val := rangeOpSelectivity(op, left, right, child)
 	return selectivityEstimate{value: val, reliable: true}
+}
+
+// defaultUnkSel / defaultNotUnkSel are PG's DEFAULT_UNK_SEL and
+// DEFAULT_NOT_UNK_SEL (postgres/src/include/utils/selfuncs.h:55-56), used when
+// no statistics are available for the column under test.
+const (
+	defaultUnkSel    = 0.005
+	defaultNotUnkSel = 1.0 - defaultUnkSel
+)
+
+// boolTestSelectivity estimates `x IS [NOT] TRUE/FALSE/UNKNOWN` from the
+// column's statistics, mirroring booltestsel
+// (postgres/src/backend/utils/adt/selfuncs.c:1545).
+//
+// A boolean column has at most two distinct values, so MCV[0] plus the null
+// fraction determines everything: when MCV[0] is TRUE its frequency is the
+// TRUE mass, otherwise the TRUE mass is 1 - freq(MCV[0]) - nullfrac, and the
+// FALSE mass is whatever remains. Without MCV data the null fraction still
+// answers UNKNOWN, and TRUE/FALSE split the non-null mass 50/50.
+//
+// Two deliberate deviations, both recorded: (1) with NO statistics at all
+// the estimator declines to the pre-existing generic default rather than
+// following PG's recurse-into-the-argument rule — goopg has no bare-boolean
+// estimator for that recursion to land on, so PG's rule has no honest
+// target here; (2) a non-column operand likewise keeps the old default, as
+// does an MCV[0] whose rendered form is not recognisably boolean (which
+// falls through to the no-MCV rule).
+func boolTestSelectivity(e *IsBoolExpr, child Node) float64 {
+	est, _ := boolTestSelectivityInner(e, child)
+	return est
+}
+
+// boolTestKind maps the test flags onto PG's BoolTestType vocabulary.
+func boolTestKind(e *IsBoolExpr) string {
+	switch {
+	case e.TestTrue && !e.TestFalse && !e.Negated:
+		return "true"
+	case e.TestTrue && !e.TestFalse && e.Negated:
+		return "nottrue"
+	case !e.TestTrue && e.TestFalse && !e.Negated:
+		return "false"
+	case !e.TestTrue && e.TestFalse && e.Negated:
+		return "notfalse"
+	case !e.TestTrue && !e.TestFalse && !e.Negated:
+		return "unknown"
+	default:
+		return "notunknown"
+	}
+}
+
+// isTrueMCVValue / isFalseMCVValue recognise a boolean MCV entry's
+// rendered form. MCV values compare by rendered text throughout the
+// estimator (take2 P1-15), so the match is textual: the full words in any
+// case plus the single-letter/numeral abbreviations datasets use.
+func isTrueMCVValue(v string) bool {
+	switch strings.ToLower(v) {
+	case "true", "t", "1":
+		return true
+	}
+	return false
+}
+
+func isFalseMCVValue(v string) bool {
+	switch strings.ToLower(v) {
+	case "false", "f", "0":
+		return true
+	}
+	return false
+}
+
+func boolTestSelectivityInner(e *IsBoolExpr, child Node) (float64, bool) {
+	cr, ok := e.Operand.(*ColumnRef)
+	if !ok {
+		return defaultGenericSelectivity, false
+	}
+	cs := columnStatsForChild(cr.Index, child)
+	if cs == nil {
+		return defaultGenericSelectivity, false
+	}
+	freqNull := cs.NullFrac
+	if freqNull < 0 {
+		freqNull = 0
+	}
+	if freqNull > 1 {
+		freqNull = 1
+	}
+	// MCV[0] decides the split when it is recognisably boolean; anything
+	// else (including no MCV at all) uses the nullfrac-adjusted 50/50.
+	freqTrue, freqFalse := -1.0, -1.0
+	if len(cs.MCV) > 0 {
+		if isTrueMCVValue(cs.MCV[0].Value) {
+			freqTrue = cs.MCV[0].Frequency
+		} else if isFalseMCVValue(cs.MCV[0].Value) {
+			freqTrue = 1.0 - cs.MCV[0].Frequency - freqNull
+		}
+	}
+	if freqTrue >= 0 {
+		freqFalse = 1.0 - freqTrue - freqNull
+	}
+	var sel float64
+	switch boolTestKind(e) {
+	case "unknown":
+		sel = freqNull
+	case "notunknown":
+		sel = 1.0 - freqNull
+	case "true":
+		if freqTrue >= 0 {
+			sel = freqTrue
+		} else {
+			sel = (1.0 - freqNull) / 2.0
+		}
+	case "false":
+		if freqTrue >= 0 {
+			sel = freqFalse
+		} else {
+			sel = (1.0 - freqNull) / 2.0
+		}
+	case "nottrue":
+		if freqTrue >= 0 {
+			sel = 1.0 - freqTrue
+		} else {
+			sel = (freqNull + 1.0) / 2.0
+		}
+	case "notfalse":
+		if freqTrue >= 0 {
+			sel = 1.0 - freqFalse
+		} else {
+			sel = (freqNull + 1.0) / 2.0
+		}
+	}
+	return clampProbability(sel), true
+}
+
+// nullTestSelectivity estimates `x IS NULL` / `x IS NOT NULL` from the column's
+// recorded null fraction, mirroring nulltestsel.
+//
+// PG reads stats->stanullfrac and returns it directly for IS_NULL, or
+// 1 - stanullfrac for IS NOT NULL; with no statistics it falls back to
+// DEFAULT_UNK_SEL / DEFAULT_NOT_UNK_SEL.
+func nullTestSelectivity(e *IsNullExpr, child Node) float64 {
+	cr, ok := e.Operand.(*ColumnRef)
+	if !ok {
+		// Not a bare column — PG's nulltestsel handles only Var and Const
+		// operands and defaults for anything else.
+		if e.Negated {
+			return defaultNotUnkSel
+		}
+		return defaultUnkSel
+	}
+	cs := columnStatsForChild(cr.Index, child)
+	if cs == nil {
+		if e.Negated {
+			return defaultNotUnkSel
+		}
+		return defaultUnkSel
+	}
+	freqNull := cs.NullFrac
+	if freqNull < 0 {
+		freqNull = 0
+	}
+	if freqNull > 1 {
+		freqNull = 1
+	}
+	if e.Negated {
+		return 1.0 - freqNull
+	}
+	return freqNull
 }

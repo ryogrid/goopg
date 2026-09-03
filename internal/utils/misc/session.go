@@ -105,6 +105,29 @@ func (s *SessionRegistry) Get(name string) (*Variable, string, bool) {
 	return v, v.Value, true
 }
 
+// HasSessionOverride reports whether this session has explicitly SET the named
+// GUC (at session or transaction-local scope), as opposed to inheriting the
+// startup/boot value.
+//
+// It exists for the cross-session plan cache. That cache keys only on
+// (dbOid, normalized SQL), so a plan produced under one session's GUCs must not
+// be served to another session — and the only reliable test is "did this
+// session override it", not "does its value differ from BootVal". Comparing
+// against BootVal would mean parsing unit strings ("4GB" against "4194304kB")
+// and would call a session that SET a GUC to its default value uncacheable-safe
+// when it is not.
+func (s *SessionRegistry) HasSessionOverride(name string) bool {
+	if s == nil {
+		return false
+	}
+	key := lowerGUCName(name)
+	if _, ok := s.local[key]; ok {
+		return true
+	}
+	_, ok := s.session[key]
+	return ok
+}
+
 // lowerGUCName is strings.ToLower with an early exit. GUC names are ASCII and
 // almost always already lowercase; strings.ToLower scans the whole string
 // before deciding, whereas this stops at the first uppercase byte.

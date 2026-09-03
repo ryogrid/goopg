@@ -188,7 +188,12 @@ func TestHashJoinCost_SpillDependsOnFitNotOnSize(t *testing.T) {
 // two drift, every hash join is priced for a table size the executor will not
 // build.
 func TestCostParamsWorkMemMatchesExecutorFallback(t *testing.T) {
-	if got, want := defaultCostParams().workMem, hashsize.EffectiveMemLimit(0); got != want {
+	// take2 P2-03: the executor's fallback budget is now
+	// HashMemLimit(work_mem, hash_mem_multiplier), not EffectiveMemLimit
+	// alone — buildGeometry calls the same helper. The sibling-path invariant
+	// this test guards is unchanged; only the expression both sides use moved.
+	if got, want := defaultCostParams().workMem,
+		hashsize.HashMemLimit(0, hashsize.DefaultHashMemMultiplier); got != want {
 		t.Fatalf("planner work_mem = %d, executor fallback = %d", got, want)
 	}
 }
@@ -256,3 +261,47 @@ func TestCostParamsMatchConfigDefaults(t *testing.T) {
 // (08 §4). The property they guarded — the DP's hash cost is exactly
 // hashJoinCost, with spill priced by the real batch geometry — is now pinned
 // at the cost-function level by the hashsize.Choose tests above.
+
+// TestHashJoinBucketWalkIsCharged pins take2 P2-11's bucket term.
+//
+// PG charges the comparisons a probe performs walking its bucket
+// (final_cost_hashjoin): `hash_qual_cost.per_tuple * outer_rows *
+// clamp_row_est(inner_rows * innerbucketsize) * 0.5`. Without it, a hash join
+// keyed on a LOW-ndistinct column — long buckets, many comparisons per probe —
+// is priced exactly like one on a unique key. That is the degeneracy
+// reselectDegenerateHashKeys was written to work around.
+func TestHashJoinBucketWalkIsCharged(t *testing.T) {
+	cp := defaultCostParams()
+	mk := func(bucket float64) Cost {
+		return hashJoinCost(cp, hashJoinInputs{
+			outerRows: 100000, innerRows: 100000, outputRows: 100000,
+			numHashClauses: 1, outerCols: 4, innerCols: 4,
+			innerBucketSize: bucket,
+		})
+	}
+
+	// No statistic: the term is skipped, so the cost is exactly what it was
+	// before this change. That is the property that keeps a stats-less plan
+	// from moving on a guess.
+	none := mk(0)
+	// A unique key: one inner row per bucket.
+	unique := mk(1.0 / 100000)
+	// A key with 10 distinct values: 10,000 rows per bucket.
+	skewed := mk(1.0 / 10)
+
+	if unique.Total <= none.Total {
+		t.Errorf("a resolved bucket size must add a charge: unique=%v none=%v",
+			unique.Total, none.Total)
+	}
+	if !(skewed.Total > unique.Total) {
+		t.Fatalf("a 10-distinct-value key must cost far more to probe than a "+
+			"unique one: skewed=%v unique=%v", skewed.Total, unique.Total)
+	}
+	// The gap is the bucket walk itself: outerRows * bucketTuples * 0.5 extra
+	// comparisons, at one cpu_operator_cost each per hash clause.
+	wantGap := cp.cpuOperatorCost * 1 * 100000 *
+		(clampRowEst(100000*(1.0/10)) - clampRowEst(100000*(1.0/100000))) * 0.5
+	if got := skewed.Total - unique.Total; math.Abs(got-wantGap) > 1e-6 {
+		t.Errorf("bucket-walk delta = %v, want %v", got, wantGap)
+	}
+}

@@ -72,14 +72,14 @@ func (s *searchCtx) addBaseRelBitmapPaths(cat catalog.Catalog) {
 		// Add single-index paths to the relation's pathlist.
 		added := false
 		for _, p := range singlePaths {
-			addPath(rel, p)
+			addPath(rel, p, "bitmap.heap")
 			added = true
 		}
 
 		// M0129-S5.1: combine into BitmapAnd when beneficial.
 		if len(singlePaths) >= 2 {
 			if andPath := s.chooseBitmapAnd(singlePaths, rel, tbl, relTuples, T, totalPages, maxEntries); andPath != nil {
-				addPath(rel, andPath)
+				addPath(rel, andPath, "bitmap.and")
 				added = true
 			}
 		}
@@ -278,7 +278,13 @@ func matchBitmapIndexQuals(
 			}
 			// Found an equality conjunct matching this index column.
 			stats := columnStatsByName(tbl, colName)
-			colSel := eqSelectivityForColumn(stats, val)
+			// take2 P2-09: the relation's raw tuple count resolves the
+			// relative ndistinct form; the table's own stats carry it here.
+			rawRows := 0.0
+			if tbl.Stats != nil {
+				rawRows = float64(tbl.Stats.RowCount)
+			}
+			colSel := eqSelectivityForColumn(stats, val, rawRows)
 			selectivity *= colSel
 
 			// ri is nil: local quals have no restrictInfo. The Key/Keys
@@ -492,7 +498,7 @@ func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
 			for _, idx := range cat.IndexesOnTable(tbl) {
 				if pth := s.buildOneParameterizedBitmapPath(rel, tbl, idx, cands, req,
 					relPages, relTuples, T, totalPages, maxEntries); pth != nil {
-					addPath(rel, pth)
+					addPath(rel, pth, "bitmap.or")
 					added = true
 				}
 			}

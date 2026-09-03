@@ -2132,6 +2132,9 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				continue
 			}
 			row := o.scanRow
+	// take2: the invariant P4-01b broke — this operator's row must be as wide
+	// as the schema it advertises. Off unless GOOPG_ASSERT_ROW_SHAPE=1.
+	assertRowShapeInline("seqScanOp", o.schema, len(row))
 			// Detoast any out-of-line column values (M0046-0006).
 			// DetoastRow may return a fresh row when it allocates
 			// large detoasted strings; either way the result is

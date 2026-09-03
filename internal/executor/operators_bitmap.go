@@ -525,8 +525,16 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 				o.exactPages++
 			}
 
-			// Reset per-page arena.
-			o.mctx.Reset()
+			// Reset per-page arena. The arena is only acquired when the
+			// executor Context carries one (see Open), and Close already
+			// guards the same way — these two Reset sites did not, so a
+			// bitmap heap scan running without a memory context crashed on
+			// its first page boundary. Reachable since take2 P1-25 changed
+			// DISTINCT sizing and with it which plans win: an unwinnable path
+			// is an untested path.
+			if o.mctx != nil {
+				o.mctx.Reset()
+			}
 		}
 
 		// For lossy pages, iterate ALL offsets. The iterator yields
@@ -602,7 +610,11 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 		o.pinned = slot
 		o.pageBuf = slot.Page()
 		o.pageBlock = block
-		o.mctx.Reset()
+		// Sibling of the serial path's guard above — both Reset sites must
+		// tolerate a nil arena or only one of the two code paths is safe.
+		if o.mctx != nil {
+			o.mctx.Reset()
+		}
 
 		if entry.isLossy {
 			o.lossyPages++

@@ -362,14 +362,28 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
 	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
+	// take2 P4-01 rev 10 step 1: publish the set onto the base rels, AFTER the
+	// assignment above. buildInitialRels ran eight lines earlier and could not
+	// have seen it — that ordering is what made P4-01b's first version silently
+	// dormant, so the stamp is deliberately here and not there.
+	s.stampNeededColsOnRels()
 	s.addBaseRelIndexPaths(prob.cat)
 	// GEQO: when the query has >= geqo_threshold base relations and geqo is
 	// enabled, use the genetic query optimizer instead of the DP search.
 	builder := newJoinRelBuilder(s, prob.cat)
 	p, err := func() (*Path, error) {
-		if GeqoEnabled() && len(items) >= GeqoThreshold() {
+		// take2 P2-02c: the per-STATEMENT geqo / geqo_threshold, not the
+		// process globals. DefaultPlannerSettings seeds both from the globals,
+		// so the GOOPG env defaults and the test hooks still steer a planner
+		// that has no session.
+		if prob.cp.geqo && len(items) >= prob.cp.geqoThreshold {
 			s.builder = builder
-			return geqoSearch(s, builder, 5)
+			// take2 P3-10: the session's geqo_effort, not a literal 5.
+			effort := prob.cp.geqoEffort
+			if effort < 1 {
+				effort = 5
+			}
+			return geqoSearch(s, builder, effort)
 		}
 		if _, err := s.joinSearch(s.clauses, builder); err != nil {
 			return nil, err

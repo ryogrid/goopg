@@ -489,9 +489,9 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		if est <= 0 {
 			est = 1
 		}
-		// Emit PG-compatible cost annotation: (cost=0.00..0.00 rows=N width=0)
-		// The mock 0.00 costs are replaced by 'N' in EXPLAIN normalization.
-		label += fmt.Sprintf("  (cost=0.00..0.00 rows=%d width=0)", est)
+		// PG's cost annotation, from the path the planner chose (take2 P0-02).
+		startup, total, width := explainCostFields(rowSrc, est)
+		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
@@ -1007,6 +1007,24 @@ func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
 
+// formatIndexCondKey renders the key side of one Index Cond bound. The
+// index-column side always prints bare (PG prints the catalog column name),
+// but the KEY side is qualified when the query names more than one relation:
+// PG's show_scan_qual names an outer Var with its relation, printing
+// `(c_nationkey = c1.c_nationkey)` for a self-join probe. P0-04: without
+// this, that probe renders `(c_nationkey = c_nationkey)` — a
+// self-comparison that reads as unsatisfiable, the same defect class
+// M0125-0039 removed from Filter lines. A single-relation scan stays bare
+// (reg.names().qualify mirrors upstream's rtable_size > 1 rule), and an
+// unresolvable binding declines to the bare name as before.
+func formatIndexCondKey(e optimizer.Expr, reg *subPlanReg) string {
+	qualify := false
+	if reg != nil {
+		qualify = reg.names().qualify()
+	}
+	return formatExprQual(e, reg, qualify)
+}
+
 // formatIndexCondParts is the shared body of formatIndexCond /
 // formatIndexOnlyCond: sibling paths that must not disagree.
 func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg) string {
@@ -1019,17 +1037,17 @@ func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowK
 	// Multi-column equality probe.
 	if len(p.Keys) > 0 && len(cols) >= len(p.Keys) {
 		if len(p.Keys) == 1 {
-			return wrapParen(cols[0] + " = " + formatExprPGReg(p.Keys[0], reg))
+			return wrapParen(cols[0] + " = " + formatIndexCondKey(p.Keys[0], reg))
 		}
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = cols[i] + " = " + formatExprPGReg(k, reg)
+			parts[i] = cols[i] + " = " + formatIndexCondKey(k, reg)
 		}
 		return wrapParen(strings.Join(parts, " AND "))
 	}
 	// Single-column equality.
 	if p.Key != nil && len(cols) > 0 {
-		return wrapParen(cols[0] + " = " + formatExprPGReg(p.Key, reg))
+		return wrapParen(cols[0] + " = " + formatIndexCondKey(p.Key, reg))
 	}
 	// Range scan.
 	if (p.LowKey != nil || p.HighKey != nil) && len(cols) > 0 {
@@ -1040,14 +1058,14 @@ func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowK
 			if p.LowOp == parser.OpGt {
 				loOp = ">"
 			}
-			parts = append(parts, col+" "+loOp+" "+formatExprPGReg(p.LowKey, reg))
+			parts = append(parts, col+" "+loOp+" "+formatIndexCondKey(p.LowKey, reg))
 		}
 		if p.HighKey != nil {
 			hiOp := "<="
 			if p.HighOp == parser.OpLt {
 				hiOp = "<"
 			}
-			parts = append(parts, col+" "+hiOp+" "+formatExprPGReg(p.HighKey, reg))
+			parts = append(parts, col+" "+hiOp+" "+formatIndexCondKey(p.HighKey, reg))
 		}
 		if len(parts) > 0 {
 			return wrapParen(strings.Join(parts, " AND "))
@@ -1493,18 +1511,20 @@ func schemaColumnNames(n optimizer.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
-func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, attachedFilter optimizer.Expr, filterRowsRemoved int64, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
 	if p, ok := n.(*optimizer.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, filterRowsRemoved, reg)
+		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, attachedFilterNode, filterRowsRemoved, reg)
 		return
 	}
 	if f, ok := n.(*optimizer.Filter); ok {
 		next := f.Predicate
+		nextNode := optimizer.Node(f)
 		if attachedFilter != nil {
 			next = attachedFilter
+			nextNode = attachedFilterNode
 		}
 		// A Filter node wraps a scan/join to apply qual(s). Its own
 		// instrumentation entry (when ANALYZE) carries the number of
@@ -1515,7 +1535,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if fs, ok := stats[f]; ok && fs != nil {
 			fr += fs.filterRejected
 		}
-		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, next, fr, reg)
+		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, next, nextNode, fr, reg)
 		return
 	}
 
@@ -1533,11 +1553,27 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	label := prefix + describePlanVerbose(n, opts.Verbose, reg.names())
 	showCostsA := !opts.Set.Costs || opts.Costs
 	if showCostsA {
-		est := optimizer.EstimateRows(n)
+		// SIBLING PAIR with walkPlanFiltered's row-source block (take2
+		// P0-04b). A Filter wrapper collapses into the scan/join line it
+		// wraps, but the row ESTIMATE lives on the wrapper — upstream never
+		// has this split because set_baserel_size_estimates stores rel->rows
+		// already scaled by the restriction clauses' selectivity.
+		//
+		// This walker read the estimate off the collapsed-INTO node and so
+		// printed the UNFILTERED count, while plain EXPLAIN printed the
+		// filtered one. The two modes therefore disagreed on rows= for the
+		// same scan, and every EXPLAIN ANALYZE artefact overstated the
+		// planner's estimate on exactly the nodes where it matters most.
+		rowSrc := n
+		if attachedFilterNode != nil {
+			rowSrc = attachedFilterNode
+		}
+		est := optimizer.EstimateRows(rowSrc)
 		if est <= 0 {
 			est = 1
 		}
-		label += fmt.Sprintf("  (cost=0.00..0.00 rows=%d width=0)", est)
+		startup, total, width := explainCostFields(rowSrc, est)
+		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	if s, ok := stats[n]; ok && s != nil {
 		if s.timing {
@@ -1651,7 +1687,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// reference shares one body Node, so the section IS the subtree that
 	// ran (the later references replay from ctx.CTERowCache). M0125-0049.
 	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
-		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
 	})
 
 	// Sublink subtrees keep their instrumentation: stats is passed
@@ -1659,12 +1695,12 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
-		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, nil, 0, reg)
 	}
 }
 
@@ -1677,8 +1713,21 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 // "Shared I/O Read/Write Time" gating below) and is threaded unchanged
 // through the recursive Plans re-render.
 func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool) map[string]any {
-	obj := planToJSON(n, opts)
-	if s, ok := stats[n]; ok && s != nil {
+	// P0-04e: one name table for the whole plan, as in planToJSON.
+	nm := newExplainNames(n)
+	return planToJSONWithStatsNamed(n, opts, stats, trackIOTiming, &subPlanReg{rel: nm})
+}
+
+// planToJSONWithStatsNamed is planToJSONWithStats with the shared render
+// state threaded through, so collapsed Filter predicates qualify exactly
+// like the text walker's.
+func planToJSONWithStatsNamed(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool, reg *subPlanReg) map[string]any {
+	obj := planToJSONNamed(n, opts, reg)
+	// P0-04e: stats follow VISIBLE nodes. The text walker never prints
+	// wrapper lines, so wrapper stats were invisible there too; stating
+	// the surviving child's numbers is what makes the two walkers agree.
+	surviving, _, _ := jsonCollapse(n)
+	if s, ok := stats[surviving]; ok && s != nil {
 		obj["Actual Rows"] = s.rowsOut
 		obj["Actual Loops"] = s.loops
 		if s.timing {
@@ -1688,7 +1737,7 @@ func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nod
 		// "Heap Fetches" is an IndexOnlyScan-only field upstream emits under
 			// ANALYZE (design 0118-0102). horizons.spec reads it via
 			// ...->'Plan'->'Heap Fetches'.
-			if _, isIOS := n.(*optimizer.IndexOnlyScan); isIOS {
+			if _, isIOS := surviving.(*optimizer.IndexOnlyScan); isIOS {
 				obj["Heap Fetches"] = s.heapFetches
 			}
 			// M0128-P5.2: "Rows Removed by Filter" and "Rows Removed by Join
@@ -1754,16 +1803,44 @@ func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nod
 		}
 	}
 	// Re-render Plans recursively with stats, replacing the
-	// stats-free children that planToJSON installed.
-	children := planChildren(n)
+	// stats-free children that planToJSONNamed installed. Children come
+	// from the SURVIVING node (wrappers collapsed above must not reappear
+	// as entries) through the same shared table.
+	children := planChildren(surviving)
 	if len(children) > 0 {
 		plans := make([]map[string]any, 0, len(children))
 		for _, c := range children {
-			plans = append(plans, planToJSONWithStats(c, opts, stats, trackIOTiming))
+			plans = append(plans, planToJSONWithStatsNamed(c, opts, stats, trackIOTiming, reg))
 		}
 		obj["Plans"] = plans
 	}
 	return obj
+}
+
+// jsonCollapse skips Project/Filter wrapper nodes exactly like
+// walkPlanFiltered does, so FORMAT JSON emits the same TREE as the text
+// walker (and as PG, which has neither node): a Project vanishes, and the
+// OUTERMOST Filter's predicate is carried to be rendered as the surviving
+// node's "Filter" property. filterNode is the wrapper the predicate came
+// from — the text walker's rowSrc rule reports that node's estimate, and
+// the JSON costs below do the same. A nil node (or one that is only
+// wrappers above nil) collapses to nils; callers must handle that as the
+// text walker does by rendering nothing.
+func jsonCollapse(n optimizer.Node) (surviving optimizer.Node, filter optimizer.Expr, filterNode optimizer.Node) {
+	for {
+		if p, ok := n.(*optimizer.Project); ok {
+			n = p.Child
+			continue
+		}
+		if f, ok := n.(*optimizer.Filter); ok {
+			if filter == nil {
+				filter, filterNode = f.Predicate, f
+			}
+			n = f.Child
+			continue
+		}
+		return n, filter, filterNode
+	}
 }
 
 // planToJSON renders n as the upstream-style JSON object an
@@ -1773,6 +1850,28 @@ func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nod
 // where columns are part of VERBOSE output, not the default
 // JSON shape).
 func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
+	// P0-04e: one name table for the whole plan, shared down the
+	// recursion — a per-node table would count only that subtree's
+	// relations and qualify differently from the text walker.
+	nm := newExplainNames(n)
+	return planToJSONNamed(n, opts, &subPlanReg{rel: nm})
+}
+
+// planToJSONNamed is planToJSON with the shared render state threaded
+// through. Wrapper collapse happens here (not in the caller) so every
+// level — including planToJSONWithStats' re-rendered children below —
+// sees the same tree the text walker does.
+func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanReg) map[string]any {
+	orig := n
+	n, filter, filterNode := jsonCollapse(n)
+	if n == nil {
+		// Degenerate wrapper-over-nil: no surviving node to render.
+		// Fall back to the old behaviour (the single type-name
+		// fallthrough arm) rather than inventing a node type PG
+		// has no word for.
+		n = orig
+		filter, filterNode = nil, nil
+	}
 	obj := map[string]any{
 		"Node Type": describePlan(n, nil),
 	}
@@ -1788,8 +1887,35 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 		obj["Strategy"] = "Hashed"
 		obj["Command"] = setOpCommandName(p)
 	}
-	if est := optimizer.EstimateRows(n); est > 0 {
+	est := optimizer.EstimateRows(n)
+	// P0-04e: when a Filter wrapper collapsed above, the text walker
+	// reports the WRAPPER's post-qual estimate on this line (its rowSrc
+	// rule) — the child's pre-qual count would overstate by exactly the
+	// filter's selectivity. Mirror it so the two walkers agree.
+	costNode := n
+	if filterNode != nil {
+		costNode = filterNode
+		est = optimizer.EstimateRows(costNode)
+	}
+	if est > 0 {
 		obj["Plan Rows"] = est
+	}
+	// take2 P0-02: PG's non-text formats carry Startup Cost, Total Cost and
+	// Plan Width alongside Plan Rows (explain.c). goopg emitted only Plan
+	// Rows, so FORMAT JSON stated no cost at all — and once the text walkers
+	// print real costs, a silent JSON would DISAGREE with text rather than
+	// merely lag it.
+	startup, total, width := explainCostFields(costNode, est)
+	obj["Startup Cost"] = startup
+	obj["Total Cost"] = total
+	obj["Plan Width"] = width
+	// P0-04e: the collapsed Filter's predicate rides as PG's "Filter"
+	// property on the surviving node. Same outermost-only rule and same
+	// qualify decision as the text walker's `Filter:` detail line, so the
+	// two walkers state the same qual.
+	if filter != nil {
+		fqual := reg.names().qualify() && !explainIsScanNode(n)
+		obj["Filter"] = wrapParen(formatExprQual(filter, reg, fqual))
 	}
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
@@ -1800,7 +1926,9 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 	if len(children) > 0 {
 		plans := make([]map[string]any, 0, len(children))
 		for _, c := range children {
-			plans = append(plans, planToJSON(c, opts))
+			// Same shared name table (P0-04e header comment): a fresh
+			// per-child table would qualify differently from text.
+			plans = append(plans, planToJSONNamed(c, opts, reg))
 		}
 		obj["Plans"] = plans
 	}
@@ -1813,6 +1941,68 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 // for Join), table names (SeqScan / IndexScan), and aggregate
 // shapes that are useful for verifying planner choices without
 // running the query.
+// explainRelName renders a scanned relation the way PG's ExplainTargetRel does
+// (postgres/src/backend/commands/explain.c:4384-4499).
+//
+// PG sets `objectname = get_rel_name(rte->relid)` — the BARE name — and sets
+// `namespace` only when `es->verbose` (:4409-4411). The text branch then emits
+// `on <ns>.<obj>` when a namespace was resolved and `on <obj>` otherwise
+// (:4490-4497). So the schema appears in VERBOSE mode ONLY.
+//
+// goopg qualified in both modes, so every scan node of every plain plan carried
+// a `public.` PostgreSQL does not print — measured against the :65432 reference
+// cluster: `Seq Scan on nation` (PG) vs `Seq Scan on public.nation` (goopg).
+// That is one guaranteed rendering divergence per scan node, corpus-wide, which
+// would have swamped the plan-parity instrument P0-05/06 builds on top of this
+// renderer (take2 P0-04d).
+func explainRelName(t *catalog.Table, verbose bool) string {
+	if t == nil {
+		return ""
+	}
+	if verbose {
+		return t.QualifiedName()
+	}
+	return t.Name
+}
+
+// explainIndexName renders an index the way PG's explain_get_index_name does
+// (explain.c, `result = get_rel_name(indexId)`): the BARE name, in BOTH modes.
+// PG never schema-qualifies an index in EXPLAIN — verified on the oracle, where
+// `EXPLAIN (VERBOSE)` prints `Index Scan using orders_pk on public.orders`: the
+// relation gains the schema, the index does not. goopg qualified the index in
+// both modes.
+func explainIndexName(i *catalog.Index) string {
+	if i == nil {
+		return ""
+	}
+	return i.Name
+}
+
+
+// explainCostFields returns the (startup, total, width) EXPLAIN prints for a
+// node, and whether they came from the path the planner actually chose.
+//
+// take2 P0-02. Before this, both text walkers printed the literal string
+// `cost=0.00..0.00 ... width=0` on every node of every plan, so no artefact in
+// the repository stated what the planner believed and no artefact could
+// attribute a wrong plan to a wrong cost. The chosen Path carries real numbers;
+// createPlan now stamps them onto the node (optimizer.PlanCost).
+//
+// Nodes the path search did not produce — everything the legacy rewriter builds
+// above the seam — fall to optimizer.DeriveLegacyDisplayCost rather than
+// printing zeros. A plan mixing real costs with 0.00 is WORSE than one where
+// every cost is 0.00: with all-zero, a reader knows nothing is priced; with a
+// mixture, a free node and an unpriced node look identical.
+func explainCostFields(n optimizer.Node, rows int64) (startup, total float64, width int) {
+	if c, ok := n.(optimizer.PlanCostCarrier); ok {
+		if pc, set := c.PlanCostInfo(); set {
+			return pc.StartupCost, pc.TotalCost, pc.PlanWidth
+		}
+	}
+	d := optimizer.DeriveLegacyDisplayCost(n, rows)
+	return d.StartupCost, d.TotalCost, d.PlanWidth
+}
+
 // schemaQualify prepends "public." to an unqualified table name for VERBOSE mode.
 func schemaQualify(name string) string {
 	if strings.Contains(name, ".") {
@@ -1912,9 +2102,15 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		return parallelPrefix + seqScanLabel(p) + " on " + tname
 	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
+			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
 		}
-		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+		// P0-04: print the FROM-clause alias like the SeqScan arm does, so
+		// a self-join's second scan renders `on customer c2` as PG's
+		// select_rtable_names does, not a bare second `on customer`.
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("Index Scan using %s on %s %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
+		}
+		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.IndexOnlyScan:
 		// S6 max rewrite: PG's ExplainIndexScanDetails (explain.c:4330-4336)
 		// puts " Backward" between the scan name and " using".
@@ -1932,9 +2128,9 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), dname)
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
 		}
-		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.Insert:
 		return "Insert on " + schemaQualify(p.Table.QualifiedName())
 	case *optimizer.Update:
@@ -1952,10 +2148,28 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 	case *optimizer.UserSrfScan:
 		return srfFunctionScanLabelQualified(p.Routine.QualifiedName(), p.Routine.Name, p.Alias)
 	}
-	return describePlan(n, nm)
+	// Every node type with no verbose-specific arm above lands here. It must
+	// ask for the VERBOSE rendering, or the schema qualification PG emits in
+	// this mode is dropped for exactly those types.
+	return describePlanMode(n, nm, true)
 }
 
+// describePlan renders the PLAIN (non-verbose) label. It is a thin wrapper so
+// that existing callers keep their meaning; the mode-carrying form below is
+// what the verbose walker falls through to.
 func describePlan(n optimizer.Node, nm *explainNames) string {
+	return describePlanMode(n, nm, false)
+}
+
+// describePlanMode renders a node's label for the given verbosity.
+//
+// The mode has to be threaded because PG's schema qualification depends on it
+// (explain.c:4409-4411 sets `namespace` only when `es->verbose`), and
+// describePlanVerbose delegates HERE for every node type it has no arm of its
+// own for — Bitmap Heap Scan, Insert/Update/Delete, Merge and the rest. Before
+// the mode was threaded, those types rendered identically in both modes: which
+// meant that whichever mode was made correct, the other one was wrong.
+func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 	switch p := n.(type) {
 	case *optimizer.Project:
 		return "Projection"
@@ -2070,14 +2284,18 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 			return parallelPrefix + seqScanLabel(p) + " on " + dname
 		}
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("%s%s on %s %s", parallelPrefix, seqScanLabel(p), p.Table.QualifiedName(), p.Alias)
+			return fmt.Sprintf("%s%s on %s %s", parallelPrefix, seqScanLabel(p), explainRelName(p.Table, verbose), p.Alias)
 		}
-		return fmt.Sprintf("%s%s on %s", parallelPrefix, seqScanLabel(p), p.Table.QualifiedName())
+		return fmt.Sprintf("%s%s on %s", parallelPrefix, seqScanLabel(p), explainRelName(p.Table, verbose))
 	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
+			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
 		}
-		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
+		// P0-04: same alias branch as the verbose arm above.
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("Index Scan using %s on %s %s", explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
+		}
+		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.IndexOnlyScan:
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
 		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror
@@ -2099,15 +2317,15 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), dname)
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
 		}
-		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, p.Index.QualifiedName(), p.Table.QualifiedName())
+		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.Insert:
-		return fmt.Sprintf("Insert on %s", p.Table.QualifiedName())
+		return fmt.Sprintf("Insert on %s", explainRelName(p.Table, verbose))
 	case *optimizer.Update:
-		return fmt.Sprintf("Update on %s", p.Table.QualifiedName())
+		return fmt.Sprintf("Update on %s", explainRelName(p.Table, verbose))
 	case *optimizer.Delete:
-		return fmt.Sprintf("Delete on %s", p.Table.QualifiedName())
+		return fmt.Sprintf("Delete on %s", explainRelName(p.Table, verbose))
 	case *optimizer.DDL:
 		return fmt.Sprintf("DDL %T", p.Stmt)
 	case *optimizer.Transaction:
@@ -2121,6 +2339,18 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 	case *optimizer.Explain:
 		return "Explain"
 	case *optimizer.CTEScan:
+		// take2 P0-01: a CTEScan whose body is a bare WorkTableScan is the
+		// RECURSIVE SELF-REFERENCE, not an ordinary CTE reference — with.go
+		// registers the working table as the CTE's body while planning the
+		// recursive term. PG renders it as a leaf `WorkTable Scan on <name>`
+		// (oracle: `->  WorkTable Scan on t t_1`), never as a CTE Scan, and
+		// gives it no `CTE <name>` section of its own.
+		if isRecursiveSelfRef(p) {
+			if p.Alias != "" && p.Alias != p.Name {
+				return fmt.Sprintf("WorkTable Scan on %s %s", p.Name, p.Alias)
+			}
+			return fmt.Sprintf("WorkTable Scan on %s", p.Name)
+		}
 		// Mirrors upstream's "CTE Scan on <name>" label; the
 		// alias is rendered separately when distinct so output
 		// like `WITH a AS (SELECT 1) SELECT * FROM a x` shows
@@ -2147,18 +2377,31 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 		// grepping for the PG label read zero even once bitmap scans were being
 		// chosen.
 		if p.Table == nil {
-			return fmt.Sprintf("%T", n)
+			// A nil Table is a producer bug, not a rendering case. Printing
+			// the Go type here was the SAME defect this arm's comment above
+			// describes — and it would also defeat the node-type coverage
+			// test (P0-01), which cannot distinguish a %T returned by a
+			// covered arm from the switch's fallthrough. Render the node
+			// name PG uses and let the missing relation be conspicuous.
+			return "Bitmap Heap Scan"
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return "Bitmap Heap Scan on " + dname
 		}
-		return "Bitmap Heap Scan on " + schemaQualify(p.Table.QualifiedName())
+		// P0-04: alias branch, same rule as the SeqScan arm.
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return "Bitmap Heap Scan on " + explainRelName(p.Table, verbose) + " " + p.Alias
+		}
+		return "Bitmap Heap Scan on " + explainRelName(p.Table, verbose)
 	case *optimizer.BitmapIndexScan:
 		// PG names the INDEX here, not the table.
 		if p.Index == nil {
-			return fmt.Sprintf("%T", n)
+			// See the BitmapHeapScan arm above: a %T from a COVERED arm is
+			// indistinguishable from the fallthrough, so P0-01's coverage
+			// test cannot pin this node while it can return a Go type.
+			return "Bitmap Index Scan"
 		}
-		return "Bitmap Index Scan on " + p.Index.QualifiedName()
+		return "Bitmap Index Scan on " + explainIndexName(p.Index)
 	case *optimizer.BitmapAnd:
 		return "BitmapAnd"
 	case *optimizer.BitmapOr:
@@ -2172,7 +2415,7 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 	case *optimizer.Memoize:
 		return "Memoize"
 	case *optimizer.Merge:
-		return fmt.Sprintf("Merge on %s", p.Target.QualifiedName())
+		return fmt.Sprintf("Merge on %s", explainRelName(p.Target, verbose))
 	case *optimizer.CTEDMLPrefix:
 		return "CTE DML"
 	case *optimizer.MaterializedCTEScan:
@@ -2220,8 +2463,131 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 		// (explain.c T_ProjectSet 1382-1384): no `on <funcname>`, no
 		// Function Call detail. Its child renders beneath it.
 		return "ProjectSet"
+
+	// ---------------------------------------------------------------
+	// take2 P0-01: the eighteen node types that had no arm and therefore
+	// rendered their Go type name into user-visible EXPLAIN output. Verified
+	// live before this change — `EXPLAIN SELECT * FROM regexp_matches(...)`
+	// on goopg printed `*optimizer.FromRegexpMatches`, and a WITH RECURSIVE
+	// query printed `*optimizer.RecursiveUnion`. Every label below was read
+	// off PostgreSQL 18.3 (the :65432 reference cluster) rather than guessed;
+	// where PG has no counterpart at all, the comment says so.
+	// ---------------------------------------------------------------
+
+	case *optimizer.RecursiveUnion:
+		// PG: `Recursive Union` (explain.c T_RecursiveUnion). Confirmed on
+		// the oracle with `WITH RECURSIVE t(n) AS (...) SELECT * FROM t`.
+		return "Recursive Union"
+
+	case *optimizer.WorkTableScan:
+		// PG: `WorkTable Scan on <cte> <alias>` — the oracle prints
+		// `WorkTable Scan on t t_1`. goopg's node carries NO name (the
+		// struct is `{pos, schema}`), so the relation half cannot be
+		// rendered and the bare node name is emitted. That missing name is a
+		// real parity gap, not a rendering choice; it is recorded as such
+		// rather than invented here.
+		return "WorkTable Scan"
+
+	case *optimizer.DistinctOn:
+		// PG has no DistinctOn node: `SELECT DISTINCT ON (k) ...` plans as
+		// `Unique` over a Sort, and the oracle confirms the top label is
+		// `Unique`. goopg fuses the two into one node, so the sort is not
+		// separately visible — a shape divergence the parity instrument
+		// should COUNT, which it cannot do while the label is a Go type.
+		return "Unique"
+
+	case *optimizer.RowsFrom:
+		// PG plans `ROWS FROM (f(), g())` as a single FunctionScan and names
+		// the FIRST function: the oracle prints `Function Scan on
+		// generate_series` for `ROWS FROM (generate_series(1,3),
+		// generate_series(1,2))`.
+		if name, _ := srfFunctionCallArgs(firstRowsFromFunc(p)); name != "" {
+			return srfFunctionScanLabel(name, "")
+		}
+		return "Function Scan"
+
+	case *optimizer.ScalarFuncScan:
+		// A non-set-returning function in FROM. PG renders
+		// `Function Scan on <name> <alias>` — confirmed with
+		// `FROM nation n, abs(n.n_nationkey) a`. (A constant-foldable call
+		// such as `FROM abs(-1)` collapses to `Result` on PG before it ever
+		// reaches a scan node, which is a planning difference, not a label.)
+		if fc, ok := p.Func.(*optimizer.FuncCall); ok && fc.Name != "" {
+			return srfFunctionScanLabel(fc.Name, "")
+		}
+		return "Function Scan"
+
+	// The remaining twelve are built-in table functions. PG renders every one
+	// as `Function Scan on <funcname>`; each label below was confirmed
+	// individually against the oracle where the function exists there.
+	case *optimizer.FromRegexpMatches:
+		return srfFunctionScanLabel("regexp_matches", "")
+	case *optimizer.FromRegexpSplitToTable:
+		return srfFunctionScanLabel("regexp_split_to_table", "")
+	case *optimizer.PgAvailableWalSummaries:
+		return srfFunctionScanLabel("pg_available_wal_summaries", "")
+	case *optimizer.PgGetCatalogForeignKeys:
+		return srfFunctionScanLabel("pg_get_catalog_foreign_keys", "")
+	case *optimizer.PgGetPublicationTables:
+		return srfFunctionScanLabel("pg_get_publication_tables", "")
+	case *optimizer.PgGetSequenceData:
+		return srfFunctionScanLabel("pg_get_sequence_data", "")
+	case *optimizer.PgInputErrorInfo:
+		return srfFunctionScanLabel("pg_input_error_info", "")
+	case *optimizer.PgOptionsToTable:
+		return srfFunctionScanLabel("pg_options_to_table", "")
+	case *optimizer.PgPartitionTree:
+		// One node serves two functions; the label must follow the field or
+		// half the plans would name the wrong one.
+		if p.FuncName != "" {
+			return srfFunctionScanLabel(p.FuncName, "")
+		}
+		return srfFunctionScanLabel("pg_partition_tree", "")
+	case *optimizer.PgSequenceParameters:
+		return srfFunctionScanLabel("pg_sequence_parameters", "")
+	case *optimizer.TSTokenType:
+		return srfFunctionScanLabel("ts_token_type", "")
+	case *optimizer.VerifyHeapam:
+		// amcheck's function. Built in to goopg; an extension on PG, so the
+		// reference cluster cannot render it — the label follows the same
+		// `Function Scan on <name>` rule every other table function does.
+		return srfFunctionScanLabel("verify_heapam", "")
+
+	case *optimizer.Call:
+		// PG has NO label for this: `EXPLAIN CALL p()` is a syntax error
+		// upstream, because CALL is not in EXPLAIN's grammar. goopg accepts
+		// it and reaches this renderer, which is itself a divergence — but
+		// one to record, not to fix by printing a Go type name. The label is
+		// goopg's own and is marked as such.
+		return "Call"
 	}
 	return fmt.Sprintf("%T", n)
+}
+
+// isRecursiveSelfRef reports whether a CTEScan is the self-reference inside a
+// WITH RECURSIVE term rather than an ordinary reference to a materialised CTE.
+//
+// internal/optimizer/with.go registers the CTE's body as a bare WorkTableScan
+// while planning the recursive member, so every reference the recursive term
+// makes to its own name resolves to a CTEScan wrapping that node. PG models the
+// same thing as a distinct T_WorkTableScan plan node and renders it as a leaf,
+// with no `CTE <name>` section — so goopg must not hoist a section for it
+// either, or a WITH RECURSIVE plan prints the CTE header twice.
+func isRecursiveSelfRef(p *optimizer.CTEScan) bool {
+	if p == nil {
+		return false
+	}
+	_, ok := p.Child.(*optimizer.WorkTableScan)
+	return ok
+}
+
+// firstRowsFromFunc returns the first function node of a ROWS FROM list, or
+// nil. PG names that function in the FunctionScan label (see the RowsFrom arm).
+func firstRowsFromFunc(p *optimizer.RowsFrom) optimizer.Node {
+	if len(p.Funcs) == 0 {
+		return nil
+	}
+	return p.Funcs[0]
 }
 
 // setOpNodeName renders a SetOp's PG-style label — see the
@@ -2364,6 +2730,12 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 		out = append(out, p.UsingScans...)
 		return out
 	case *optimizer.CTEScan:
+		// The recursive self-reference renders as a LEAF `WorkTable Scan`,
+		// matching PG: descending would print the working table's anchor
+		// schema as a phantom subtree beneath it.
+		if isRecursiveSelfRef(p) {
+			return nil
+		}
 		return []optimizer.Node{p.Child}
 	case *optimizer.LockRows:
 		return []optimizer.Node{p.Child}
@@ -2391,6 +2763,45 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 		return []optimizer.Node{p.Child}
 	case *optimizer.Merge:
 		return []optimizer.Node{p.Source}
+
+	// take2 P0-01: four node types carried children that this walker never
+	// visited, so their ENTIRE SUBTREE was absent from EXPLAIN — the same
+	// class of defect as M0125-0037(i)'s missing SetOp arm above, which
+	// truncated Q5/Q18/Q67 to a four-line plan. Measured before the fix:
+	//
+	//   goopg   SELECT DISTINCT ON (k) ...  ->  "Unique"          (one line)
+	//   PG 18.3 same query                  ->  Unique / Sort / Seq Scan
+	//
+	// A truncated plan is worse for a parity census than a mislabelled one:
+	// the missing rows read as agreement on everything they do not show.
+	case *optimizer.DistinctOn:
+		if p.Child == nil {
+			return nil
+		}
+		return []optimizer.Node{p.Child}
+	case *optimizer.RecursiveUnion:
+		// PG renders the non-recursive term first, then the recursive one
+		// (explain.c walks lefttree then righttree): `-> Result` above
+		// `-> WorkTable Scan on t t_1`.
+		out := make([]optimizer.Node, 0, 2)
+		if p.Anchor != nil {
+			out = append(out, p.Anchor)
+		}
+		if p.Recursive != nil {
+			out = append(out, p.Recursive)
+		}
+		return out
+	case *optimizer.RowsFrom:
+		// PG plans ROWS FROM as ONE FunctionScan with several function
+		// expressions, so it has no children to render there. goopg models
+		// each entry as its own node; walking them keeps the tree honest
+		// rather than silently dropping every entry after the label.
+		return p.Funcs
+	case *optimizer.Copy:
+		if p.Query == nil {
+			return nil
+		}
+		return []optimizer.Node{p.Query}
 	case *optimizer.CTEDMLPrefix:
 		out := make([]optimizer.Node, 0, len(p.DMls)+1)
 		out = append(out, p.DMls...)

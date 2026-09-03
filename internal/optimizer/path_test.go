@@ -53,8 +53,8 @@ func TestComparePathCostsFuzzily_WithinFuzzIsEqual(t *testing.T) {
 
 func TestAddPath_RejectsDominated(t *testing.T) {
 	rel := &RelOptInfo{}
-	addPath(rel, costPath(0, 10))
-	addPath(rel, costPath(0, 100)) // strictly dearer -> rejected
+	addPath(rel, costPath(0, 10), "test")
+	addPath(rel, costPath(0, 100), "test") // strictly dearer -> rejected
 	if len(rel.Pathlist) != 1 || rel.Pathlist[0].Cost.Total != 10 {
 		t.Fatalf("dominated path not rejected: %+v", rel.Pathlist)
 	}
@@ -62,8 +62,8 @@ func TestAddPath_RejectsDominated(t *testing.T) {
 
 func TestAddPath_RemovesDominatedIncumbent(t *testing.T) {
 	rel := &RelOptInfo{}
-	addPath(rel, costPath(0, 100))
-	addPath(rel, costPath(0, 10)) // cheaper -> removes the dearer incumbent
+	addPath(rel, costPath(0, 100), "test")
+	addPath(rel, costPath(0, 10), "test") // cheaper -> removes the dearer incumbent
 	if len(rel.Pathlist) != 1 || rel.Pathlist[0].Cost.Total != 10 {
 		t.Fatalf("dominated incumbent not removed: %+v", rel.Pathlist)
 	}
@@ -71,8 +71,8 @@ func TestAddPath_RemovesDominatedIncumbent(t *testing.T) {
 
 func TestAddPath_KeepsIncomparable(t *testing.T) {
 	rel := &RelOptInfo{}
-	addPath(rel, costPath(1, 100))  // cheap startup, dear total
-	addPath(rel, costPath(50, 50))  // dear startup, cheap total
+	addPath(rel, costPath(1, 100), "test")  // cheap startup, dear total
+	addPath(rel, costPath(50, 50), "test")  // dear startup, cheap total
 	if len(rel.Pathlist) != 2 {
 		t.Fatalf("incomparable paths should both survive, got %d", len(rel.Pathlist))
 	}
@@ -80,8 +80,8 @@ func TestAddPath_KeepsIncomparable(t *testing.T) {
 
 func TestAddPath_RejectsExactDuplicate(t *testing.T) {
 	rel := &RelOptInfo{}
-	addPath(rel, costPath(5, 50))
-	addPath(rel, costPath(5, 50)) // identical -> incumbent kept, new rejected
+	addPath(rel, costPath(5, 50), "test")
+	addPath(rel, costPath(5, 50), "test") // identical -> incumbent kept, new rejected
 	if len(rel.Pathlist) != 1 {
 		t.Fatalf("exact duplicate should not accumulate, got %d", len(rel.Pathlist))
 	}
@@ -92,8 +92,8 @@ func TestAddPath_ParallelSafeIsNotDominatedByCheaper(t *testing.T) {
 	// A cheaper non-parallel-safe path and a dearer parallel-safe path are
 	// incomparable: cheaper wins on cost, parallel-safe wins on the parallel
 	// axis. Both must survive so C5 can gather the parallel-safe one.
-	addPath(rel, &Path{Cost: Cost{Total: 10}, ParallelSafe: false})
-	addPath(rel, &Path{Cost: Cost{Total: 20}, ParallelSafe: true})
+	addPath(rel, &Path{Cost: Cost{Total: 10}, ParallelSafe: false}, "test")
+	addPath(rel, &Path{Cost: Cost{Total: 20}, ParallelSafe: true}, "test")
 	if len(rel.Pathlist) != 2 {
 		t.Fatalf("parallel-safe path must not be dominated by a cheaper unsafe one, got %d", len(rel.Pathlist))
 	}
@@ -103,8 +103,8 @@ func TestAddPath_WithinFuzzKeepsFirst(t *testing.T) {
 	rel := &RelOptInfo{}
 	first := costPath(0, 100)
 	second := costPath(0, 100.5) // within 1% -> incumbent kept
-	addPath(rel, first)
-	addPath(rel, second)
+	addPath(rel, first, "test")
+	addPath(rel, second, "test")
 	if len(rel.Pathlist) != 1 || rel.Pathlist[0] != first {
 		t.Fatalf("within-fuzz should keep the first path deterministically, got %+v", rel.Pathlist)
 	}
@@ -112,8 +112,8 @@ func TestAddPath_WithinFuzzKeepsFirst(t *testing.T) {
 
 func TestSetCheapest(t *testing.T) {
 	rel := &RelOptInfo{}
-	addPath(rel, costPath(1, 100)) // cheapest startup
-	addPath(rel, costPath(50, 50)) // cheapest total
+	addPath(rel, costPath(1, 100), "test") // cheapest startup
+	addPath(rel, costPath(50, 50), "test") // cheapest total
 	setCheapest(rel)
 	if rel.CheapestTotal == nil || rel.CheapestTotal.Cost.Total != 50 {
 		t.Fatalf("CheapestTotal wrong: %+v", rel.CheapestTotal)
@@ -129,7 +129,7 @@ func TestAddPath_Deterministic(t *testing.T) {
 	build := func() []*Path {
 		rel := &RelOptInfo{}
 		for _, p := range []*Path{costPath(1, 100), costPath(50, 50), costPath(0, 200), costPath(2, 90)} {
-			addPath(rel, p)
+			addPath(rel, p, "test")
 		}
 		return rel.Pathlist
 	}

@@ -332,22 +332,19 @@ func TestParseRelSizeFallbackStage(t *testing.T) {
 	}
 }
 
-func TestRelSizeFallbackStageGating(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-
-	SetRelSizeFallbackStage(0)
-	for stage := 1; stage <= 3; stage++ {
-		if relSizeFallbackEnabled(stage) {
-			t.Fatalf("stage %d must be disabled when the flag is off", stage)
-		}
-	}
-	// A stage enables every consumer up to and including itself.
-	SetRelSizeFallbackStage(2)
-	if !relSizeFallbackEnabled(1) || !relSizeFallbackEnabled(2) {
-		t.Fatal("stage 2 must enable consumers 1 and 2")
-	}
-	if relSizeFallbackEnabled(3) {
-		t.Fatal("stage 2 must not enable consumer 3")
+// TestRelSizeFallbackIsUnconditional replaces TestRelSizeFallbackStageGating.
+//
+// take2 P1-05 retired GOOPG_RELSIZE_FALLBACK's staging: the fallback is always
+// on. The property worth keeping from the old test is that the fallback FIRES
+// for a cold relation, which the staging test asserted only indirectly by
+// checking which consumers were gated.
+func TestRelSizeFallbackIsUnconditional(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl := &catalog.Table{Name: "t", Columns: []catalog.Column{{Type: catalog.Type{Name: "int4"}}}}
+	cat.SetRelationSizer(func(storage.RelFileNode) (int64, bool) { return 100, true })
+	if got := relSizeFallbackRows(cat, tbl); got <= 0 {
+		t.Errorf("relSizeFallbackRows = %d; the block-derived estimate must fire "+
+			"unconditionally for a relation with no stored row count", got)
 	}
 }
 
@@ -422,9 +419,6 @@ func TestSeqScanRowsFallbackOnlyWhenRowCountAbsent(t *testing.T) {
 // (0), never "zero rows". A catalog with no storage behind it — every planner
 // unit test, and any embedded caller — must therefore see no behavior change.
 func TestEstimateTableRowsFallbackNoCatalogSizer(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	SetRelSizeFallbackStage(1)
-
 	cat := catalog.NewInMemory()
 	tbl := &catalog.Table{Name: "t", Columns: []catalog.Column{{Type: catalog.Type{Name: "int4"}}}}
 	if got := estimateTableRowsFallback(cat, tbl); got != 0 {
@@ -437,14 +431,15 @@ func TestEstimateTableRowsFallbackNoCatalogSizer(t *testing.T) {
 		t.Fatalf("nil table must yield 0, got %d", got)
 	}
 
-	// With a sizer installed the estimate flows through, and the flag still
-	// gates the stamping helper.
+	// With a sizer installed the estimate flows through. take2 P1-05 retired
+	// the staging, so the former "flag off stamps 0" assertion is gone — the
+	// stamping helper is now unconditional and the sizer's presence is the
+	// only gate, which is what the three checks above cover.
 	cat.SetRelationSizer(func(storage.RelFileNode) (int64, bool) { return 100, true })
 	if got := estimateTableRowsFallback(cat, tbl); got == 0 {
 		t.Fatal("an installed sizer must produce a non-zero estimate")
 	}
-	SetRelSizeFallbackStage(0)
-	if got := stage1RelSizeRows(cat, tbl); got != 0 {
-		t.Fatalf("flag off must stamp 0, got %d", got)
+	if got := stage1RelSizeRows(cat, tbl); got == 0 {
+		t.Fatal("the stamping helper must pass the estimate through unconditionally")
 	}
 }

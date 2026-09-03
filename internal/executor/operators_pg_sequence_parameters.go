@@ -54,7 +54,7 @@ func (o *pgSequenceParametersOp) Open(ctx *Context) error {
 	if argVal.IsNull() {
 		return nil
 	}
-	tbl, ok := verifyHeapamResolveTable(argVal, im)
+	tbl, ok := verifyHeapamResolveTable(argVal, im, ctx.CurrentDatabaseOid)
 	if !ok || !tbl.IsSequence {
 		// Not a sequence relation → no rows. PG raises 42809 "is not a
 		// sequence" here; goopg mirrors pg_get_sequence_data's precedent of

@@ -76,7 +76,6 @@ func onOff(on bool) string {
 // Nothing here may be a literal that restates a default declared elsewhere —
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
-	"GOOPG_RELSIZE_FALLBACK":  func(v string) string { return strconv.Itoa(parseRelSizeFallbackStage(v)) },
 	"GOOPG_MEMOIZE":           func(v string) string { return onOff(memoizeFromEnv(v)) },
 	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
 	"GOOPG_PGSHAPED_DP":       func(v string) string { return onOff(pgShapedDPFromEnv(v)) },
@@ -85,6 +84,10 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_UNNEST_PREDP":      func(v string) string { return onOff(unnestPreDPFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
+	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
+	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
+	// opts back out to the un-narrowed arm.
+	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -92,6 +95,15 @@ var flagResolvedState = map[string]func(string) string{
 			return "legacy"
 		}
 		return "current"
+	},
+	// A float, not a boolean or a mode. It multiplies NL-index probe cost
+	// (cost_funcs.go), so it moves the hash-vs-NL crossover directly — the
+	// single most plan-shaping knob in the package. Rendered through
+	// strconv.FormatFloat with -1 precision so `unset(1)` round-trips: the
+	// token inside `unset(…)` re-exported verbatim reproduces the arm, which
+	// TestFlagLabelsRoundTrip asserts for every row.
+	"GOOPG_INDEX_PROBE_MULT": func(v string) string {
+		return strconv.FormatFloat(indexProbeMultFromEnv(v), 'g', -1, 64)
 	},
 }
 
@@ -111,11 +123,20 @@ var flagProvenanceOrder = []string{
 	"GOOPG_INDEXKEY_HARVEST",
 	"GOOPG_NLI_COSTGATE",
 	"GOOPG_HASH_OUTER_JOIN",
+	// Joined at planner-refactor-take2 P0-04c. It multiplies NL-index probe
+	// cost, so it moves the hash-vs-NL crossover on every join — and it had
+	// been readable, and absent from every artefact, since M0126. It escaped
+	// the completeness guard because it is read through envFloatDefault rather
+	// than a literal os.Getenv, which the old regex detector could not see.
+	"GOOPG_INDEX_PROBE_MULT",
 	"GOOPG_MHJ_PACKING_OFF",
 	"GOOPG_GS_SHARE_SOURCE",
 	// Joined at M0125-0040: grouping-sets source sharing changes the plan of
 	// every ROLLUP/CUBE/GROUPING SETS query, so a TPC-DS artefact that does
 	// not name it cannot say which arm it measured.
+	// Joined at take2 P4-01 rev 10 step 3: narrows hash-join build sides,
+	// default ON since step 5 (P4-A §18 steps 3-5).
+	"GOOPG_NARROW_BUILD",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the
@@ -126,6 +147,13 @@ var flagProvenanceOrder = []string{
 // dropping it would make older artefacts that DO carry it look like they came
 // from this version of the gate.
 var flagProvenanceRetired = map[string]string{
+	// take2 P1-05. The staging existed to sequence three consumers while the
+	// block-derived relation-size fallback was being introduced; it shipped at
+	// stage 2 — every consumer on — from M0125-0005, so the only states it
+	// still selected were "a planner production does not run". The fallback is
+	// now unconditional and nothing reads the variable.
+	"GOOPG_RELSIZE_FALLBACK": "take2-P1-05",
+
 	"GOOPG_COST_DRIVEN_JOINORDER": "M0127-P5.9",
 	// M0126-0005's measurement-only switch for forcing MultiHashJoin packing
 	// off independently of join-order. M0127-P6.2 deleted the packer, so the

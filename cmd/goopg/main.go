@@ -390,46 +390,24 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// defaults; with one we apply the file's entries on top.
 	registry := misc.BuildDefaultRegistry()
 
-	// M0054-0006e-followup: bridge SQL `SET enable_nestloop_index =
-	// off|on` to the planner's process-global atomic kill-switch.
-	// Sessions can now toggle the rule at runtime; the most-recent
-	// SET wins process-wide (matches the package-level `atomic.Bool`
-	// design).
-	registry.OnChange("enable_nestloop_index", func(value string) {
-		optimizer.SetNLIEnabled(value == "on" || value == "true" || value == "1")
-	})
-	// S7: same bridge for `SET enable_memoize` — the upstream planner-method
-	// GUC now gates a real plan shape (Memoize under NLI) instead of being
-	// a registration-only no-op.
-	registry.OnChange("enable_memoize", func(value string) {
-		optimizer.SetMemoizeEnabled(value == "on" || value == "true" || value == "1")
-	})
-	// S8 Slice 2a: same bridge for `SET enable_presorted_aggregate` — the
-	// upstream planner-method GUC now gates the presorted-aggregate rule
-	// (adjust_group_pathkeys_for_groupagg port) instead of being a
-	// registration-only no-op.
-	registry.OnChange("enable_presorted_aggregate", func(value string) {
-		optimizer.SetPresortedAggEnabled(value == "on" || value == "true" || value == "1")
-	})
-	// S8 Slice 2b: same bridge for `SET enable_hashagg` — when off, the
-	// hashed-aggregate strategy is disabled at cost time in PG
-	// (costsize.c:2755-2756 cost_agg), so the sorted path wins. goopg has no
-	// cost model, so the bridge gates the direct sorted-strategy rule
-	// (applyEnableHashAggRule) instead.
-	registry.OnChange("enable_hashagg", func(value string) {
-		optimizer.SetHashAggEnabled(value == "on" || value == "true" || value == "1")
-	})
-	// GEQO: bridge `SET geqo = off|on` and `SET geqo_threshold = N` to the
-	// planner's process-global atomic knobs, so the GUCs stop being pure
-	// no-op compatibility stubs and actually control the GEQO-vs-DP dispatch.
-	registry.OnChange("geqo", func(value string) {
-		optimizer.SetGeqoEnabled(value == "on" || value == "true" || value == "1")
-	})
-	registry.OnChange("geqo_threshold", func(value string) {
-		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
-			optimizer.SetGeqoThreshold(n)
-		}
-	})
+	// take2 P2-02c: enable_nestloop_index no longer bridges to a process
+	// global either. All six planner-method bridges are gone; each of them let
+	// the most-recent SET win process-wide, steering every other session's
+	// plans. optimizer.SetNLIEnabled survives as the test hook and the env
+	// default DefaultPlannerSettings seeds from.
+	// `enable_memoize` NO LONGER bridges to a process global (take2 P2-02c).
+	// It did, and that made `SET enable_memoize = off` in one session disable
+	// Memoize for every other session on the server — the most-recent SET won
+	// process-wide. It is now a per-statement planner input carried on
+	// PlannerSettings, so a SET affects only the session that issued it.
+	// optimizer.SetMemoizeEnabled survives as the test hook and the
+	// GOOPG_MEMOIZE env kill-switch.
+	// take2 P2-02c: enable_presorted_aggregate, enable_hashagg, geqo and
+	// geqo_threshold NO LONGER bridge to process globals. Each did, and each
+	// therefore let one session's SET steer every other session's plans. All
+	// four are per-statement planner inputs on PlannerSettings now. The
+	// optimizer's Set*/Geqo* entry points survive as test hooks and as the
+	// env-default seeds DefaultPlannerSettings reads.
 	if *confPath != "" {
 		entries, err := misc.ParseConfigFile(*confPath)
 		if err != nil {

@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
 
@@ -268,5 +269,118 @@ func TestEffectiveCacheSizeMatchesConfigDefault(t *testing.T) {
 	if got := defaultCostParams().effectiveCacheSize; !approxCost(got, want) {
 		t.Fatalf("costParams.effectiveCacheSize = %v pages but the GUC boot value %q is %v pages — drift",
 			got, boot, want)
+	}
+}
+
+// TestBtreeUniqueIndexClampsToOneTuple pins take2 P2-09's unique-index clamp
+// (btcostestimate, selfuncs.c): a UNIQUE index with an equality qual on every
+// key column matches at most one tuple, whatever the selectivity arithmetic
+// produces.
+//
+// The selectivity route cannot reach 1.0 on its own — it multiplies per-column
+// estimates that each carry their own floor — so before this a multi-column
+// unique probe was priced for a range scan the index can never perform.
+func TestBtreeUniqueIndexClampsToOneTuple(t *testing.T) {
+	cp := defaultCostParams()
+	in := indexScanInputs{
+		relPages:        1000,
+		relTuples:       100000,
+		indexPages:      300,
+		indexTuples:     100000,
+		treeHeight:      2,
+		selectivity:     0.01, // 1000 tuples by the arithmetic
+		totalTablePages: 1000,
+		loopCount:       1,
+	}
+
+	_, loose := btreeIndexAMCost(cp, in)
+	in.uniqueEqualityOnAllKeys = true
+	_, clamped := btreeIndexAMCost(cp, in)
+
+	if !(clamped < loose) {
+		t.Errorf("a unique index bound on every key column must cost LESS than "+
+			"the same scan priced for %g tuples: clamped=%v loose=%v",
+			in.selectivity*in.indexTuples, clamped, loose)
+	}
+
+	// It must land at the single-tuple price, not merely lower: one index page
+	// plus one index tuple plus the descent.
+	want := 1*cp.randomPageCost*indexProbeCostMultiplier +
+		1*cp.cpuIndexTupleCost +
+		float64(in.treeHeight+1)*pageCPUMultiplier*cp.cpuOperatorCost
+	if math.Abs(clamped-want) > 1e-9 {
+		t.Errorf("clamped index cost = %v, want %v (one page, one tuple, one descent)", clamped, want)
+	}
+
+	// The clamp must never RAISE a cost that was already below one tuple.
+	in.selectivity = 1e-9
+	_, tiny := btreeIndexAMCost(cp, in)
+	in.uniqueEqualityOnAllKeys = false
+	_, tinyUnclamped := btreeIndexAMCost(cp, in)
+	if tiny != tinyUnclamped {
+		t.Errorf("the clamp must not move a sub-one-tuple estimate: %v vs %v", tiny, tinyUnclamped)
+	}
+}
+
+// P1-02: a partial index holds only its predicate's rows, so its tuple
+// count is the heap count scaled by the predicate's selectivity — the
+// quantity PG reads measured off the index's own pg_class row. Each guard
+// below names the fabrication it prevents; without them an unknown or
+// default-driven selectivity would zero the index out from under the
+// pages math.
+func TestEstimateIndexGeometryPartialScalesTuples(t *testing.T) {
+	statsTable := func() *catalog.Table {
+		return makeStatsTable(&catalog.TableStats{
+			RowCount: 1000, Analyzed: true,
+			Columns: []catalog.ColumnStats{
+				{NDistinct: 500, NullFrac: 0,
+					Histogram: []string{"1", "100", "200", "300", "400", "500"}},
+			},
+		}, []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0}})
+	}
+	mkPartial := func(t *testing.T, tbl *catalog.Table) *catalog.Index {
+		t.Helper()
+		pe, err := parser.ParseExpr("id < 200")
+		if err != nil {
+			t.Fatalf("ParseExpr: %v", err)
+		}
+		return &catalog.Index{Name: "t_id_prtl", Columns: []string{"id"}, HasPredicate: true, Predicate: pe}
+	}
+
+	// Histogram [1..500], id<200 -> 0.4: 1000 heap rows become 400 index rows.
+	tbl := statsTable()
+	_, tuples, _ := estimateIndexGeometry(mkPartial(t, tbl), tbl, 1000)
+	if tuples != 400 {
+		t.Errorf("partial index tuples = %v, want 400 (1000 x 0.4)", tuples)
+	}
+
+	// Non-partial index on the same shape keeps the heap count.
+	plain := &catalog.Index{Name: "t_id", Columns: []string{"id"}}
+	if _, tuples, _ := estimateIndexGeometry(plain, tbl, 1000); tuples != 1000 {
+		t.Errorf("plain index tuples = %v, want 1000", tuples)
+	}
+
+	// No statistics: decline to the heap count rather than fabricate from
+	// a default-driven selectivity.
+	bare := makeStatsTable(nil, []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0}})
+	bareIdx := &catalog.Index{Name: "t_id_prtl", Columns: []string{"id"}, HasPredicate: true}
+	if pe, err := parser.ParseExpr("id < 200"); err == nil {
+		bareIdx.Predicate = pe
+	}
+	if _, tuples, _ := estimateIndexGeometry(bareIdx, bare, 1000); tuples != 1000 {
+		t.Errorf("unanalysed partial index tuples = %v, want 1000 (declined)", tuples)
+	}
+
+	// Unanalysed despite a stats struct (Analyzed false): same decline.
+	unanalyzed := statsTable()
+	unanalyzed.Stats.Analyzed = false
+	if _, tuples, _ := estimateIndexGeometry(mkPartial(t, unanalyzed), unanalyzed, 1000); tuples != 1000 {
+		t.Errorf("unanalysed partial index tuples = %v, want 1000 (declined)", tuples)
+	}
+
+	// Unresolvable predicate (nil): decline, never "keep nothing".
+	nilPred := &catalog.Index{Name: "t_id_prtl", Columns: []string{"id"}, HasPredicate: true}
+	if _, tuples, _ := estimateIndexGeometry(nilPred, tbl, 1000); tuples != 1000 {
+		t.Errorf("nil-predicate partial index tuples = %v, want 1000 (declined)", tuples)
 	}
 }

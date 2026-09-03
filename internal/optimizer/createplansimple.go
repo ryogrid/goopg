@@ -77,16 +77,16 @@ func createSeqScanPlan(p *Path) Node {
 	}
 	id, rewrap, ok := scanLeafFor(p.Rel.baseLeaf)
 	if !ok {
-		panic(fmt.Sprintf("createPlan: PathSeqScan over relset %#04x whose leaf is not a rebuildable base scan", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathSeqScan over relset %#08x whose leaf is not a rebuildable base scan", uint32(p.Rel.Relids)))
 	}
 	if p.RequiredOuter != 0 {
-		panic(fmt.Sprintf("createPlan: parameterised PathSeqScan over relset %#04x; a seq scan reads no parameter, so nothing can discharge it", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: parameterised PathSeqScan over relset %#08x; a seq scan reads no parameter, so nothing can discharge it", uint32(p.Rel.Relids)))
 	}
 	if len(p.Pathkeys) != 0 {
-		panic(fmt.Sprintf("createPlan: PathSeqScan over relset %#04x claims an ordering; a heap scan delivers none", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathSeqScan over relset %#08x claims an ordering; a heap scan delivers none", uint32(p.Rel.Relids)))
 	}
 	if p.IndexInfo != nil || len(p.IndexClauses) != 0 {
-		panic(fmt.Sprintf("createPlan: PathSeqScan over relset %#04x carries index detail; a costed probe was labelled a seq scan", uint16(p.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: PathSeqScan over relset %#08x carries index detail; a costed probe was labelled a seq scan", uint32(p.Rel.Relids)))
 	}
 	return rewrap(&SeqScan{
 		pos:   id.pos,

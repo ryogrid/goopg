@@ -235,7 +235,7 @@ func mergeInnerSortKeys(groups []mergeKeyGroup, outerKeys []PathKey, outer RelSe
 // subtree). The base order is therefore the clause order, which is stable and
 // deterministic; the heuristic is a ranking of paths that all get generated
 // anyway, so its absence costs a tie-break, not a path. Ledgered.
-func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
+func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
 		// PG's `if (extra->mergeclause_list == NIL) return` (:1372). A pair
@@ -263,7 +263,7 @@ func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, r
 		// pathkeys makes that a property of the construction instead of a
 		// check — the groups partition `keys`, so the concatenation is a
 		// permutation of it.
-		addMergeJoinPath(joinrel, outer, inner, cp, outerKeys, innerKeys, mergeClauses, residual)
+		addMergeJoinPath(joinrel, outer, inner, cp, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor)
 	}
 }
 
@@ -307,7 +307,7 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     goopg keeps it whole, which can only leave `addPath` distinguishing two
 //     paths PG would have merged — more paths considered, never fewer, and
 //     never a different winner on cost. Ledgered.
-func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo) {
+func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
 	if o == nil || i == nil {
 		return
@@ -316,7 +316,7 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 	// sort keys ARE the result's pathkeys. The arm that consumes an ordering it
 	// did not choose (P5.4c-ii-c) passes a different pair, which is why
 	// `tryMergeJoinPath` takes the two separately.
-	tryMergeJoinPath(joinrel, o, i, cp, outerKeys, outerKeys, innerKeys, mergeClauses, residual)
+	tryMergeJoinPath(joinrel, o, i, cp, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor)
 }
 
 // tryMergeJoinPath is `try_mergejoin_path` proper (joinpath.c:1029) over two
@@ -333,7 +333,7 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 // `outerSortKeys` / `innerSortKeys` are PG's `outersortkeys` / `innersortkeys`
 // with PG's NIL convention: an empty list means "this side needs no sort". The
 // explicit re-check below (:1091-1097) makes passing them harmless either way.
-func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo) {
+func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
 	if o == nil || i == nil {
 		return
 	}
@@ -359,15 +359,34 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 	// a parameterised input this is still the per-parameterisation count —
 	// which the refusal above has already ruled out, but the rule is written
 	// once rather than per-arm.
-	cost := mergeJoinCost(cp, op.Cost, ip.Cost, op.Rows, ip.Rows, joinrel.Rows)
+	// `mergejointuples` (costsize.c:3960-4045), NOT joinrel.Rows.
+	//
+	// joinrel.Rows is what survives EVERY join clause. The merge operator emits
+	// what survives only the MERGE clauses; the `residual` filters the rest
+	// afterwards. When the merge uses a strict subset of the equi-clauses the
+	// two differ, and charging the smaller under-prices the operator by exactly
+	// the residual's selectivity. PG charges the larger:
+	//
+	//     run_cost += cpu_per_tuple * mergejointuples;   costsize.c:4045
+	//
+	// TPC-H Q9's `lineitem x partsupp` has two equi-clauses and goopg's merge
+	// uses one: it emits 24,989,610 tuples and used to be charged for
+	// 6,001,255 — 0.0031 per tuple against a cpu_tuple_cost of 0.01. Since the
+	// merge cost is work_mem-independent and the hash cost is not, that
+	// undercharge made the merge path win at PostgreSQL's work_mem and lose at
+	// goopg's inflated default, which is what made that default load-bearing.
+	// impl/FINDING-mergejoin-costed-on-postfilter-rows.md.
+	mergeTuples := mergeTuplesFor(residual)
+	outerEndSel, innerEndSel := scanSelFor(mergeClauses)
+	cost := mergeJoinCost(cp, op.Cost, ip.Cost, op.Rows, ip.Rows, mergeTuples, outerEndSel, innerEndSel)
 	// The residual is evaluated on the tuples that already matched on the
-	// merge keys, i.e. the join's output — the same charge the hash arm makes
-	// (`final_cost_mergejoin`'s qpqual term on `mergejointuples`,
-	// costsize.c:4045).
-	cost.Total += qualEvalCost(cp, len(residual), joinrel.Rows)
+	// merge keys — that is `mergeTuples`, which is what the comment here always
+	// said and what the code now passes.
+	cost.Total += qualEvalCost(cp, len(residual), mergeTuples)
 
 	addPath(joinrel, &Path{
-		Kind:     PathMergeJoin,
+		Kind:          PathMergeJoin,
+		DisabledNodes: disabledNodesFor(!cp.enableMergeJoin, op, ip),
 		Rel:      joinrel,
 		Rows:     joinrel.Rows,
 		Cost:     cost,
@@ -381,7 +400,7 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 		HashKeys:      mergeClauses,
 		Residual:      residual,
 		RequiredOuter: req,
-	})
+	}, "mergejoin")
 }
 
 // sortPathFor wraps `sub` in an explicit Sort delivering `keys` — PG's

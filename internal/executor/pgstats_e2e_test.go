@@ -78,3 +78,45 @@ func TestPgStatsOmitsUnanalyzedTable(t *testing.T) {
 		t.Fatalf("unanalyzed items produced %d pg_stats rows, want 0", len(rows))
 	}
 }
+
+// TestPgStatsRendersCorrelation pins take2 P1-28: pg_stats.correlation was a
+// hard-coded NULL, justified by a comment claiming ANALYZE did not collect the
+// statistic. It does — buildUserPGStatisticRow persists it in
+// stakind3/stanumbers3, and cost_index consumes it, where a zero correlation
+// prices every index scan at max_IO_cost. So the one statistic whose absence
+// most distorts index costing was invisible to anyone diagnosing a plan.
+func TestPgStatsRendersCorrelation(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "items"})
+	if !ok {
+		t.Fatal("items table missing from fixture")
+	}
+	tbl.Stats = &catalog.TableStats{
+		RowCount: 3,
+		Columns: []catalog.ColumnStats{
+			{NDistinct: 3, Correlation: 0.875},
+			// Column 1 leaves Correlation at zero, which must render NULL —
+			// the writer omits the slot rather than storing a zero, so NULL is
+			// the honest round-trip.
+			{NDistinct: 2},
+		},
+	}
+
+	rows := runQueryRows(t, ctx,
+		"SELECT attname, correlation FROM pg_stats WHERE tablename = 'items' ORDER BY attname")
+	if len(rows) != 2 {
+		t.Fatalf("row count = %d, want 2", len(rows))
+	}
+	var got = map[string]string{}
+	for _, r := range rows {
+		got[r[0].Format()] = r[1].Format()
+	}
+	if c := got["id"]; c != "0.875" {
+		t.Errorf("items.id correlation = %q, want %q", c, "0.875")
+	}
+	if c, ok := got["label"]; ok && c != "" {
+		t.Errorf("items.label correlation = %q, want NULL (empty)", c)
+	}
+}

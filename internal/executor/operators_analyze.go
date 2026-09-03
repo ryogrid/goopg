@@ -397,20 +397,39 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 			firstErr = fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
 		}
 	}
+	if err := persistRelSize(ctx, tbl, stats.RowCount, stats.Pages); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// persistRelSize writes one relation's ANALYZE/VACUUM-measured size to the
+// goopg-private sidecar heap (catalog.GoopgRelStatsRelationId).
+//
+// take2 P1-03: extracted from persistStatsToPGStatistic so VACUUM can call it
+// too. VACUUM measures reltuples and relpages — vacuum.Analyze returns both and
+// catalog.UpdateRelStats stored them — but the update was IN MEMORY ONLY, so an
+// autovacuum-maintained cluster planned from stale sizes after every restart
+// and only an explicit SQL ANALYZE ever reached disk. Upstream has no such
+// split: vac_update_relstats writes pg_class for both paths.
+func persistRelSize(ctx *Context, tbl *catalog.Table, rowCount int64, pages int) error {
+	if ctx == nil || ctx.Pool == nil || tbl == nil {
+		return nil
+	}
 	relStatsRel := storage.RelFileNode{
-		DBOid:  dbOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.GoopgRelStatsRelationId,
 		Fork:   storage.MainFork,
 	}
 	sizeRow := Row{
-		NewIntDatum(int64(tbl.OID)),     // starelid
-		NewIntDatum(stats.RowCount),     // rowcount (reltuples)
-		NewIntDatum(int64(stats.Pages)), // pages (relpages)
+		NewIntDatum(int64(tbl.OID)), // starelid
+		NewIntDatum(rowCount),       // rowcount (reltuples)
+		NewIntDatum(int64(pages)),   // pages (relpages)
 	}
-	if _, err := writeHeapRowCanonical(ctx, relStatsRel, GoopgRelStatsColumns(), sizeRow); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("goopg_relstats %q: %w", tbl.Name, err)
+	if _, err := writeHeapRowCanonical(ctx, relStatsRel, GoopgRelStatsColumns(), sizeRow); err != nil {
+		return fmt.Errorf("goopg_relstats %q: %w", tbl.Name, err)
 	}
-	return firstErr
+	return nil
 }
 
 // GoopgRelStatsColumns is the row layout of the goopg-private relation-size
@@ -440,12 +459,82 @@ const upstreamDefaultStatsTarget = 100
 // `do_analyze_rel`.
 const upstreamSampleMultiplier = 300
 
-// mcvFreqMargin is upstream's MCV_THRESHOLD margin from
-// postgres/src/backend/commands/analyze.c `compute_scalar_stats`:
-// a value qualifies for the MCV list when its sample frequency
-// exceeds the average frequency of the remaining values by at
-// least this multiplier.
-const mcvFreqMargin = 1.25
+// analyzeMCVList is upstream's `analyze_mcv_list`
+// (postgres/src/backend/commands/analyze.c:2980), which decides how many of the
+// most-common values are worth keeping.
+//
+// take2 P1-08. goopg used a `mcvFreqMargin = 1.25` greedy forward walk, under a
+// comment claiming it was "upstream's MCV_THRESHOLD margin from
+// compute_scalar_stats". That comment was FALSE for PG 18.3: there is no 1.25
+// anywhere in analyze.c. Upstream replaced the ratio test with the
+// hypergeometric significance test below, and the difference is not cosmetic —
+// the ratio rule over-admits on near-uniform columns, and every admitted MCV
+// entry displaces a histogram bound, so a column with no genuinely common
+// values spends its whole stats budget describing noise.
+//
+// The direction of the walk is load-bearing and upstream says why: values are
+// REMOVED from the full list rather than added to an empty one, because
+// "the latter approach can fail to add any values if all the most common values
+// have around the same frequency and make up the majority of the table" — which
+// is exactly the shape goopg's forward walk mishandles.
+//
+// mcvCounts must be sorted by count descending. Returns the number of leading
+// entries to keep.
+func analyzeMCVList(mcvCounts []int, numMCV int, staDistinct, staNullFrac float64, sampleRows int, totalRows float64) int {
+	// "If the entire table was sampled, keep the whole list. This also
+	// protects us against division by zero in the code below."
+	if float64(sampleRows) == totalRows || totalRows <= 1.0 {
+		return numMCV
+	}
+
+	// Re-extract the estimated number of distinct nonnull values in the table.
+	ndistinctTable := staDistinct
+	if ndistinctTable < 0 {
+		ndistinctTable = -ndistinctTable * totalRows
+	}
+
+	// sumcount tracks the total count of all but the last (least common) value.
+	sumcount := 0.0
+	for i := 0; i < numMCV-1; i++ {
+		sumcount += float64(mcvCounts[i])
+	}
+
+	for numMCV > 0 {
+		// Selectivity the least common value would have if it were NOT in the
+		// list (c.f. eqsel).
+		selec := 1.0 - sumcount/float64(sampleRows) - staNullFrac
+		if selec < 0.0 {
+			selec = 0.0
+		}
+		if selec > 1.0 {
+			selec = 1.0
+		}
+		otherdistinct := ndistinctTable - float64(numMCV-1)
+		if otherdistinct > 1 {
+			selec /= otherdistinct
+		}
+
+		// Lower end of a continuity-corrected Wald-type interval on a
+		// hypergeometric distribution: keep the value only when its observed
+		// count is significantly above what non-MCV membership would predict.
+		N := totalRows
+		n := float64(sampleRows)
+		K := N * float64(mcvCounts[numMCV-1]) / n
+		variance := n * K * (N - K) * (N - n) / (N * N * (N - 1))
+		stddev := math.Sqrt(variance)
+
+		if float64(mcvCounts[numMCV-1]) > selec*float64(sampleRows)+2*stddev+0.5 {
+			// Significantly more common: keep it and everything above it.
+			break
+		}
+		numMCV--
+		if numMCV == 0 {
+			break
+		}
+		sumcount -= float64(mcvCounts[numMCV-1])
+	}
+	return numMCV
+}
 
 // analyzeRelationCtx is the Context-aware entry point that
 // honours StatsTarget / AnalyzeRandSeed.
@@ -609,6 +698,20 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		// so the planner consults it like any other stadistinct value.
 		if nd, ok := columnNDistinctOverride(&tbl.Columns[i], stats.RowCount); ok {
 			stats.Columns[i].NDistinct = nd
+			// take2 P1-07: NDistinctFrac must be cleared too, or the override
+			// is silently discarded. ColumnStats.StaDistinct() consults the
+			// FRACTION first whenever it exceeds 0.1 (catalog.go:1884-1886),
+			// and computeColumnStats above has just set it from the sample —
+			// so on any column whose sampled distinct fraction exceeds 10 %,
+			// which is most keys, the manual n_distinct was written into a
+			// field nothing subsequently read.
+			//
+			// Clearing it here rather than teaching StaDistinct about
+			// overrides keeps the precedence rule in ONE place: an explicit
+			// n_distinct REPLACES what ANALYZE measured, which is upstream's
+			// behaviour (analyze.c applies it to stadistinct itself, leaving
+			// no second field to disagree).
+			stats.Columns[i].NDistinctFrac = 0
 		}
 	}
 	return stats, nil
@@ -902,42 +1005,39 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		return buckets[i].count > buckets[j].count
 	})
 
-	// MCV split: a value qualifies when its sample frequency
-	// exceeds avg_freq(remaining) * mcvFreqMargin. We walk the
-	// sorted list greedily, growing the MCV slot until the
-	// condition fails or we hit the statsTarget cap.
-	mcvCap := statsTarget
-	if mcvCap > len(buckets) {
-		mcvCap = len(buckets)
+	// MCV split — take2 P1-08, following compute_scalar_stats
+	// (analyze.c:2670-2700) rather than the 1.25 ratio rule that used to live
+	// here.
+	//
+	// Upstream keeps the WHOLE tracked list when it is complete and fits:
+	// "if we can fit all the values seen so far in the MCV list, then we
+	// should do so and thus provide the planner with complete information".
+	// Otherwise the list is incomplete, and it is "generally worth being more
+	// selective" — which is what analyzeMCVList decides.
+	mcvCount := statsTarget
+	if mcvCount > len(buckets) {
+		mcvCount = len(buckets)
 	}
-	mcvCount := 0
-	for mcvCount < mcvCap {
-		// Frequency of the next candidate vs the average of
-		// what's left after admitting it.
-		candidate := buckets[mcvCount]
-		remaining := nonNull
-		for k := 0; k <= mcvCount; k++ {
-			remaining -= buckets[k].count
+	// `track_cnt == ndistinct && toowide_cnt == 0 && stadistinct > 0 &&
+	// track_cnt <= num_mcv`: every distinct value was seen and they all fit,
+	// so the list is complete and is kept whole.
+	completeAndFits := len(buckets) <= statsTarget
+	if !completeAndFits && mcvCount > 0 {
+		counts := make([]int, mcvCount)
+		for i := 0; i < mcvCount; i++ {
+			counts[i] = buckets[i].count
 		}
-		distinctRemaining := len(buckets) - (mcvCount + 1)
-		if distinctRemaining <= 0 {
-			// Only candidate left — admit if the column shows
-			// any duplication at all (otherwise skip; a
-			// single-row "MCV" carries no information).
-			if candidate.count > 1 {
-				mcvCount++
-			}
-			break
-		}
-		avgRemaining := float64(remaining) / float64(distinctRemaining)
-		if avgRemaining <= 0 {
-			break
-		}
-		freqCandidate := float64(candidate.count)
-		if freqCandidate < mcvFreqMargin*avgRemaining {
-			break
-		}
-		mcvCount++
+		// staDistinct here is the absolute distinct count this sample implies;
+		// analyzeMCVList accepts PG's signed convention and this is the
+		// positive form.
+		mcvCount = analyzeMCVList(counts, mcvCount, float64(len(buckets)),
+			stats.NullFrac, len(sample), float64(totalRows))
+	}
+	// A single-occurrence "most common value" carries no information; upstream
+	// reaches the same place via its `dups_cnt > 0` tracking, which never
+	// enters a value seen once into the track list at all.
+	for mcvCount > 0 && buckets[mcvCount-1].count <= 1 {
+		mcvCount--
 	}
 
 	if mcvCount > 0 {

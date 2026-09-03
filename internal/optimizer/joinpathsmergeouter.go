@@ -114,7 +114,7 @@ type mergeOuterMatch struct {
 // outer before reaching this arm, so only the per-outer-path test is made below —
 // the pathlist can hold parameterised paths that the cheapest-total test did not
 // cover.
-func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo) {
+func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
 	innerCheapestTotal := inner.CheapestTotal
 	if innerCheapestTotal == nil {
 		return
@@ -138,13 +138,13 @@ func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, k
 		if pathParamByRel(op, inner) {
 			continue
 		}
-		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, groups, outer.Relids, residual)
+		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor)
 	}
 }
 
 // generateMergeJoinPaths is `generate_mergejoin_paths` (joinpath.c:1564) for one
 // already-ordered outer path.
-func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo) {
+func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
 	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups)
 	if len(matched) == 0 {
 		return
@@ -175,7 +175,28 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// matters" — and `tryMergeJoinPath` skips the sort anyway if that path
 	// already delivers the ordering, which is what makes the initialisation
 	// below correct.
-	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, residual)
+	// The clauses whose groups the outer's ordering does NOT serve are dropped
+	// from `mergeClauses` above — `findMergeClausesForOuterPathkeys` returns a
+	// prefix of the groups, not all of them. They must be demoted into the
+	// residual, exactly as the truncation search below does with
+	// `demoteDroppedMergeClauses`: the merge no longer keys on them, so they
+	// have to be evaluated per surviving tuple instead.
+	//
+	// Omitting this emitted a join that never evaluated the clause AT ALL —
+	// silent WRONG ANSWERS, not a missed optimisation. TPC-H Q9's
+	// `lineitem x partsupp` has two equi-clauses and an outer ordered only on
+	// ps_partkey, so ps_suppkey = l_suppkey was lost: the join emitted
+	// 24,005,020 rows instead of 6,001,255 and the query summed 4.02x the
+	// correct answer while returning the correct ROW COUNT.
+	// impl/FINDING-CRITICAL-mergejoin-wrong-answers.md.
+	// Every candidate below starts from fullResidual, not `residual`: the
+	// clauses whose groups the outer's ordering does not serve are dropped from
+	// mergeClauses ONCE, here, and stay dropped for the truncation search too.
+	// Passing the original `residual` to those calls left the same clauses
+	// evaluated nowhere — the truncation demotion only ever re-adds clauses cut
+	// from the ALREADY-trimmed list.
+	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
+	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor)
 
 	// The truncation search (:1685-1782). `cheapestTotalInner` /
 	// `cheapestStartupInner` carry the best inner found SO FAR, and a candidate
@@ -210,7 +231,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				// construction and this inner was SELECTED for already being
 				// ordered, so neither side is sorted here.
 				tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-					newClauses, demoteDroppedMergeClauses(residual, mergeClauses, newClauses))
+					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor)
 			}
 			cheapestTotalInner = ip
 		}
@@ -227,7 +248,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				}
 				if len(newClauses) > 0 {
 					tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-						newClauses, demoteDroppedMergeClauses(residual, mergeClauses, newClauses))
+						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor)
 				}
 			}
 			cheapestStartupInner = ip
@@ -386,4 +407,37 @@ func getCheapestPathForPathkeys(paths []*Path, keys []PathKey, criterion costSel
 		}
 	}
 	return matched
+}
+
+// demoteUnmatchedGroupClauses returns `residual` plus every clause in `groups`
+// that `kept` does not contain.
+//
+// It is the identity-based sibling of `demoteDroppedMergeClauses`. That one may
+// subtract by POSITION because `trimMergeClausesForInnerPathkeys` appends in
+// order and stops, so its result is a genuine prefix. The set dropped here is
+// chosen by which GROUPS the outer's pathkeys serve, which is not a prefix of
+// the clause list, so it must be computed by identity.
+func demoteUnmatchedGroupClauses(residual []*restrictInfo, groups []mergeKeyGroup, kept []*restrictInfo) []*restrictInfo {
+	keptSet := make(map[*restrictInfo]struct{}, len(kept))
+	for _, ri := range kept {
+		keptSet[ri] = struct{}{}
+	}
+	var extra []*restrictInfo
+	for _, g := range groups {
+		for _, ri := range g.clauses {
+			if _, ok := keptSet[ri]; !ok {
+				extra = append(extra, ri)
+			}
+		}
+	}
+	if len(extra) == 0 {
+		return residual
+	}
+	// A fresh slice: `residual` is shared with every other candidate this
+	// relation pair generates, so appending in place would leak one path's
+	// demotions into the others.
+	out := make([]*restrictInfo, 0, len(residual)+len(extra))
+	out = append(out, residual...)
+	out = append(out, extra...)
+	return out
 }

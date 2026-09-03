@@ -267,6 +267,16 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 			// M0118-0008 (vacuum-no-cleanup-lock).
 			if as, aerr := vacuum.Analyze(o.ctx.Pool, o.ctx.TxnMgr, rel, o.ctx.MultiXact); aerr == nil {
 				o.ctx.Catalog.UpdateRelStats(tbl, as.Pages, int64(as.Rows))
+				// take2 P1-03: and PERSIST it. UpdateRelStats writes memory
+				// only, so before this an autovacuum-maintained cluster planned
+				// from stale sizes after every restart and only an explicit SQL
+				// ANALYZE ever reached disk. Upstream has no such split —
+				// vac_update_relstats writes pg_class for both paths.
+				//
+				// Non-fatal: a failed size write must not fail the VACUUM,
+				// which has already done its real work. The same convention
+				// persistStatsToPGStatistic uses for a column it cannot fit.
+				_ = persistRelSize(o.ctx, tbl, int64(as.Rows), as.Pages)
 			}
 		}
 		if err == nil {

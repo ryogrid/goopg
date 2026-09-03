@@ -65,6 +65,12 @@ type indexScanInputs struct {
 	// slice generates (the search's clause list holds join clauses, and a
 	// clause used as an index qual would make the path parameterised).
 	selectivity float64
+
+	// uniqueEqualityOnAllKeys is `btcostestimate`'s unique-index clamp
+	// (selfuncs.c): a UNIQUE index with an equality qual on EVERY key column
+	// matches at most one tuple, whatever the selectivity arithmetic says.
+	// take2 P2-09.
+	uniqueEqualityOnAllKeys bool
 	// correlation is `indexCorrelation` — see indexCorrelationFor for why it
 	// is 0 for every index goopg has today.
 	correlation float64
@@ -187,6 +193,19 @@ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64
 	numIndexTuples := in.selectivity * in.indexTuples
 	if numIndexTuples < 0 {
 		numIndexTuples = 0
+	}
+	// The unique-index clamp (btcostestimate, selfuncs.c). PG:
+	//
+	//	if (index->unique && indexBoundQuals != NIL && eqQualHere &&
+	//	    <equality on every key column>)
+	//	        numIndexTuples = 1.0;
+	//
+	// The selectivity route cannot reach 1.0 on its own here: it multiplies
+	// per-column estimates that each carry their own floor, so a multi-column
+	// unique probe came out well above one tuple and the index path was priced
+	// for a range scan it can never perform. take2 P2-09.
+	if in.uniqueEqualityOnAllKeys && numIndexTuples > 1 {
+		numIndexTuples = 1
 	}
 	numIndexPages := 1.0
 	if in.indexPages > 1 && in.indexTuples > 1 {
@@ -319,6 +338,38 @@ func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples flo
 	indexTuples = relTuples
 	if indexTuples < 1 {
 		indexTuples = 1
+	}
+	// Partial-index tuple count (take2 P1-02): a partial index holds only
+	// the rows its predicate admits, so sizing it at the heap count
+	// overstates it by 1/selectivity — against PG, which reads the measured
+	// count off the index's own pg_class row. goopg keeps no per-index
+	// measurement (its pg_class row reports the heap count), so the count
+	// is derived from the predicate's selectivity instead: the same
+	// quantity PG measured, computed rather than read.
+	//
+	// Guards, each naming the fabrication it prevents:
+	//   - non-partial indexes keep the heap count (a complete index has one
+	//     entry per live heap tuple — the same rule pg_class reports by);
+	//   - unresolvable predicates decline (an unknown predicate must not
+	//     read as "keep nothing");
+	//   - unanalysed relations decline (without column statistics the
+	//     selectivity is default-driven, and a DEFAULT-sized index is a
+	//     fabricated number, not an estimate);
+	//   - selectivity outside (0,1] declines (an empty or meaningless
+	//     result must not zero the index out from under the pages math).
+	// The predicate is evaluated against a bare SeqScan over the table:
+	// selectivity resolution reads only table statistics, never plan
+	// coordinates, so no search context is needed here.
+	if idx != nil && idx.HasPredicate && tbl != nil &&
+		tbl.Stats != nil && tbl.Stats.Analyzed && len(tbl.Stats.Columns) > 0 {
+		if rp, err := ResolveIndexPredicate(idx.Predicate, tbl); err == nil && rp != nil {
+			if sel := clauseSelectivity(rp, &SeqScan{Table: tbl}); sel > 0 && sel <= 1 {
+				indexTuples = relTuples * sel
+				if indexTuples < 1 {
+					indexTuples = 1
+				}
+			}
+		}
 	}
 	width := indexTupleWidth(idx, tbl)
 	fill := btreeDefaultFillfactor

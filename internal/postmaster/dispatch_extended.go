@@ -48,7 +48,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
 	var node optimizer.Node
 	cacheHit := false
-	if s.pc != nil && !plannerScanTogglesActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+	if s.pc != nil && !plannerSessionInputsActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid)); ok {
 			node = cached
 			cacheHit = true
@@ -120,11 +120,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			return &extendedQueryResult{CommandTag: tag}, nil
 		}
 		var perr error
-		node, perr = optimizer.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
+		node, perr = optimizer.PlanWithSettings(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid), sessionPlannerSettings(sess))
 		if perr != nil {
 			return nil, newPlannerExtendedQueryError(perr)
 		}
-		if s.pc != nil && !plannerScanTogglesActive(sess) && planCacheIsCacheable(node) {
+		if s.pc != nil && !plannerSessionInputsActive(sess) && planCacheIsCacheable(node) {
 			s.pc.Put(planCacheKey(query, connDBOid), node)
 		}
 	} else {

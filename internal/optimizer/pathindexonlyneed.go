@@ -198,14 +198,25 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 			return collectStmtColumnNames(x.Subquery, dst)
 		}
 		return true
+	case *parser.ExtractExpr:
+		// `extract(field from src)` reads only `src`; the field is a literal
+		// keyword, not a column. Declining it cost more than it looks: the
+		// default arm below returns false for the WHOLE statement, so a single
+		// extract anywhere made `neededColsKnown` false and disabled both
+		// index-only scans and any needed-column narrowing for that query.
+		// TPC-H Q7, Q8 and Q9 all use `extract(year from ...)` — Q9's sits
+		// inside the derived table that owns its six-way join tree, which is
+		// exactly the plan take2 P4-01 is justified by.
+		return collectExprColumnNames(x.Source, dst)
 	case *parser.ExistsExpr:
 		return collectStmtColumnNames(x.Subquery, dst)
 	case *parser.SubqueryExpr:
 		return collectStmtColumnNames(x.Inner, dst)
 	default:
-		// `StarExpr`, `IndirectionStar`, `RowExpr`, the array and extract
-		// forms, and any node added after this file was written. Declining is
-		// the only answer that cannot silently drop a column.
+		// `StarExpr`, `IndirectionStar`, `RowExpr`, the array forms, and any
+		// node added after this file was written. Declining is the only answer
+		// that cannot silently drop a column. (`ExtractExpr` was in this list
+		// and is now handled above — it was declining TPC-H Q7/Q8/Q9.)
 		return false
 	}
 }

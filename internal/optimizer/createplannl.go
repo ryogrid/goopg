@@ -119,8 +119,8 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 		panic(fmt.Sprintf("createPlan: PathNestLoop carries %d hash keys; a nested loop keys on nothing and would ignore them", len(p.HashKeys)))
 	}
 	if p.RequiredOuter != 0 {
-		panic(fmt.Sprintf("createPlan: parameterised PathNestLoop over relset %#04x; nothing above the search root binds a parameter",
-			uint16(relsOf(p))))
+		panic(fmt.Sprintf("createPlan: parameterised PathNestLoop over relset %#08x; nothing above the search root binds a parameter",
+			uint32(relsOf(p))))
 	}
 
 	innerPath := p.Children[1]
@@ -199,8 +199,8 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		// contain, and `translateToLayout` below would refuse it — but it is
 		// checked here because THIS is the fact that was violated, and the
 		// message that names it is the one that finds the producer.
-		panic(fmt.Sprintf("createPlan: NLI inner is parameterised by %#04x, which the outer relset %#04x does not supply",
-			uint16(unsupplied), uint16(outerPath.Rel.Relids)))
+		panic(fmt.Sprintf("createPlan: NLI inner is parameterised by %#08x, which the outer relset %#08x does not supply",
+			uint32(unsupplied), uint32(outerPath.Rel.Relids)))
 	}
 
 	in := joinInputsFor(p, "PathNestLoop(NLI)", outerPath, innerPath)

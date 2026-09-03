@@ -203,7 +203,7 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		//
 		// Empty, and that is the entire point of the slice.
 		RequiredOuter: 0,
-	})
+	}, "index.ordered")
 	return true
 }
 

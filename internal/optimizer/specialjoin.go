@@ -131,10 +131,11 @@ func hasEqualityOperator(e parser.Expr) bool {
 func joinlistRelSet(jl joinlist) RelSet {
 	var rs RelSet
 	for _, leaf := range jl.leaves(nil) {
-		if leaf >= 16 {
-			// RelSet is uint16; a FROM clause with ≥16 base relations
-			// would overflow. The search itself has the same ceiling
-			// (maxSearchRels=14), so this is a producer invariant check.
+		if leaf >= maxSearchRels {
+			// A FROM clause with more base relations than RelSet can
+			// represent would overflow the mask. The search carries the
+			// same ceiling by construction, so this is a producer
+			// invariant check. take2 P3-09.
 			continue
 		}
 		rs |= 1 << leaf

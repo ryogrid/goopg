@@ -714,8 +714,12 @@ func (o *joinOp) buildGeometry(ctx *Context, buildNode optimizer.Node, buildWidt
 		buildRows = float64(optimizer.EstimateRows(buildNode))
 	}
 	avgVarBytes := o.plan.AvgVarBytes
+	// take2 P2-03: the budget is work_mem * hash_mem_multiplier
+	// (get_hash_memory_limit), not work_mem alone — and it must be the SAME
+	// expression the planner's costParams.workMem uses, or the executor builds
+	// a geometry the planner did not price.
 	return hashsize.Choose(buildRows, buildWidth, avgVarBytes,
-		hashsize.EffectiveMemLimit(workMem))
+		hashsize.HashMemLimit(workMem, ctxHashMemMultiplier(ctx)))
 }
 
 // presizeLazyHash allocates the build-side table with its bucket count already
@@ -5036,4 +5040,23 @@ func percentileDiscOneFloat(orderedVals []Datum, n int, pf float64) Datum {
 func evalExprFromRow(expr optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 	slot := SlotFromRow(nil, row)
 	return evalExprSlot(expr, slot, ctx)
+}
+
+
+// ctxHashMemMultiplier reads the session's `hash_mem_multiplier`, falling back
+// to PG's default when the session does not carry one (a background worker, or
+// a Context built outside the wire path).
+func ctxHashMemMultiplier(ctx *Context) float64 {
+	if ctx == nil || ctx.GetSetting == nil {
+		return hashsize.DefaultHashMemMultiplier
+	}
+	v, ok := ctx.GetSetting("hash_mem_multiplier")
+	if !ok {
+		return hashsize.DefaultHashMemMultiplier
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil || f <= 0 {
+		return hashsize.DefaultHashMemMultiplier
+	}
+	return f
 }

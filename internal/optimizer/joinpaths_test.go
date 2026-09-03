@@ -100,8 +100,8 @@ func TestSplitJoinClauses_OperandOrderDoesNotMatter(t *testing.T) {
 	for _, tc := range []struct{ outer, inner RelSet }{{a, b}, {b, a}} {
 		keys, residual := splitJoinClauses(tc.outer, tc.inner, []*restrictInfo{ri})
 		if len(keys) != 1 || len(residual) != 0 {
-			t.Fatalf("outer=%#04x inner=%#04x: got %d keys / %d residual, want 1 / 0",
-				uint16(tc.outer), uint16(tc.inner), len(keys), len(residual))
+			t.Fatalf("outer=%#08x inner=%#08x: got %d keys / %d residual, want 1 / 0",
+				uint32(tc.outer), uint32(tc.inner), len(keys), len(residual))
 		}
 	}
 }
@@ -326,8 +326,8 @@ func TestQualPlacementIsExactlyOncePerJoinTree(t *testing.T) {
 
 		for _, ri := range list.all {
 			if applied[ri] != 1 {
-				t.Errorf("%s: clause %#04x applied %d times, want exactly 1",
-					tr.name, uint16(ri.relids), applied[ri])
+				t.Errorf("%s: clause %#08x applied %d times, want exactly 1",
+					tr.name, uint32(ri.relids), applied[ri])
 			}
 		}
 	}

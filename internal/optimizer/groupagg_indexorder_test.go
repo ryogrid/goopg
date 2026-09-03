@@ -72,11 +72,9 @@ func indexOrderAggPlan(t *testing.T, node Node) *Aggregate {
 // a hash aggregate — aggregates.sql's own btg block runs entirely inside
 // `SET enable_hashagg = off`.
 func TestIndexOrderedGroupingCanonical(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	cat, _, idx := btgIndexOrderCatalog(t)
 	stmt := parseOne(t, "select count(*) from btg group by y, x")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,11 +129,9 @@ func TestIndexOrderedGroupingCanonical(t *testing.T) {
 // (Incremental Sort) is deferred — the rule must leave the plan for Slice
 // 2a/2b's ordinary Sort to claim.
 func TestIndexOrderedGroupingPartialPrefixNotClaimed(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	cat, _, _ := btgIndexOrderCatalog(t)
 	stmt := parseOne(t, "select count(*) from btg group by z, y, w, x")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,12 +151,10 @@ func TestIndexOrderedGroupingPartialPrefixNotClaimed(t *testing.T) {
 // descending leading column cannot satisfy an ascending full-range scan, so
 // the rule must not claim it even though the column-name SET matches.
 func TestIndexOrderedGroupingDescendingIndexNotClaimed(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	cat, _, idx := btgIndexOrderCatalog(t)
 	idx.ColDescending = []bool{true, false}
 	stmt := parseOne(t, "select count(*) from btg group by y, x")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,11 +171,9 @@ func TestIndexOrderedGroupingDescendingIndexNotClaimed(t *testing.T) {
 // expression group key, which is out of Slice 2c-i's scope (design section:
 // "GROUP BY x*x is out of scope") — the rule must not fire.
 func TestIndexOrderedGroupingExpressionKeyNotClaimed(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	cat, _, _ := btgIndexOrderCatalog(t)
 	stmt := parseOne(t, "select count(*) from btg group by x + 0, y")
-	node, err := Plan(stmt, cat)
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,8 +189,6 @@ func TestIndexOrderedGroupingExpressionKeyNotClaimed(t *testing.T) {
 // TestIndexOrderedGroupingNoIndexNotClaimed: a table with no index at all
 // must leave the plan untouched.
 func TestIndexOrderedGroupingNoIndexNotClaimed(t *testing.T) {
-	SetHashAggEnabled(false)
-	defer SetHashAggEnabled(true)
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "btg"}, []catalog.Column{
 		{Name: "x", Type: catalog.Type{Name: "int4"}},
@@ -207,7 +197,7 @@ func TestIndexOrderedGroupingNoIndexNotClaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 	stmt := parseOne(t, "select count(*) from btg group by y, x")
-	node, err := Plan(stmt, c)
+	node, err := PlanWithSettings(stmt, c, hashAggSettings(false))
 	if err != nil {
 		t.Fatal(err)
 	}

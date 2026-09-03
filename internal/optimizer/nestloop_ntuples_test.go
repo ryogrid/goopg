@@ -39,7 +39,7 @@ func nlCollapsedPair(t *testing.T, innerRows float64) *RelOptInfo {
 	// The collapsed estimate: four independent equalities on stats-less inputs.
 	joinRel := newRelOptInfo(RelSet(0b11), 1, 80)
 	keys := []*restrictInfo{{}, {}, {}, {}}
-	generateHashJoinPaths(joinRel, outer, inner, cp, keys, nil)
+	generateHashJoinPaths(joinRel, outer, inner, cp, keys, nil, nil)
 	addNestLoopPath(joinRel, outer, inner, cp, keys)
 	setCheapest(joinRel)
 	return joinRel
@@ -83,9 +83,9 @@ func TestNestLoopCollapsedPairMarginIsNotAFluke(t *testing.T) {
 func TestNestLoopTupleChargeScalesWithBothSides(t *testing.T) {
 	cp := defaultCostParams()
 	// Rescan cost zero, so the only term that varies is the per-tuple charge.
-	base := nestloopCost(cp, Cost{}, Cost{}, 100, 100, 0).Total
-	wideOuter := nestloopCost(cp, Cost{}, Cost{}, 200, 100, 0).Total
-	wideInner := nestloopCost(cp, Cost{}, Cost{}, 100, 200, 0).Total
+	base := nestloopCost(cp, Cost{}, Cost{}, 100, 100, 0, 0).Total
+	wideOuter := nestloopCost(cp, Cost{}, Cost{}, 200, 100, 0, 0).Total
+	wideInner := nestloopCost(cp, Cost{}, Cost{}, 100, 200, 0, 0).Total
 
 	if want := 2 * base; wideOuter != want {
 		t.Errorf("doubling the outer should double the tuple charge: got %v, want %v", wideOuter, want)
@@ -105,10 +105,10 @@ func TestNestLoopTupleChargeScalesWithBothSides(t *testing.T) {
 func TestNestLoopClampsZeroRowSides(t *testing.T) {
 	cp := defaultCostParams()
 	one := cp.cpuTupleCost
-	if got := nestloopCost(cp, Cost{}, Cost{}, 0, 0, 0).Total; got != one {
+	if got := nestloopCost(cp, Cost{}, Cost{}, 0, 0, 0, 0).Total; got != one {
 		t.Errorf("both sides zero should still cost one tuple: got %v, want %v", got, one)
 	}
-	if got := nestloopCost(cp, Cost{}, Cost{}, 0, 50, 0).Total; got != 50*cp.cpuTupleCost {
+	if got := nestloopCost(cp, Cost{}, Cost{}, 0, 50, 0, 0).Total; got != 50*cp.cpuTupleCost {
 		t.Errorf("a zero outer must not zero the inner's tuples: got %v, want %v", got, 50*cp.cpuTupleCost)
 	}
 }

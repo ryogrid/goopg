@@ -686,7 +686,7 @@ def analyze(run_dir, repo_root, run_id):
             it.notes.append(f"stage {name}: {stg['status']}")
     plan_log = read_file(os.path.join(run_dir, "tpch", "plan-gate.log"))
     if plan_log and re.search(r"differs|mismatch|changed", plan_log, re.I):
-        it.notes.append("plan-drift: structural plan diff vs m0077-final reported differences (informational; see tpch/plan-gate.log)")
+        it.notes.append("plan-drift: structural plan diff vs take2-p0-20260903 reported differences (informational; see tpch/plan-gate.log)")
 
     # must-pass presence check (warning only): port/yes rows whose pinned Go
     # func never appeared in the testport log. Aggregated to one note so a

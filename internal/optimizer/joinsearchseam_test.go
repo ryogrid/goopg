@@ -53,7 +53,7 @@ func seamFixture(names []string, rows []int64) (Node, *resolveContext) {
 		root = &Join{Type: JoinTypeCross, Left: root, Right: leaf,
 			schema: appendSchema(root.Output(), leaf.Output())}
 	}
-	ctx := newResolveContext(bindings, root.Output())
+	ctx := newResolveContext(bindings, root.Output(), DefaultPlannerSettings())
 	ctx.joinlist = deconstructRangeVars(len(names))
 	return root, ctx
 }
@@ -450,7 +450,7 @@ func TestSearchedTreeIsOpaqueToTheLegacyRewrites(t *testing.T) {
 
 	t.Run("rewriteJoinsToNLI", func(t *testing.T) {
 		searched := build()
-		if out := rewriteJoinsToNLI(searched, stubCatalogForSeam{}); out != searched {
+		if out := rewriteJoinsToNLI(searched, stubCatalogForSeam{}, DefaultPlannerSettings()); out != searched {
 			t.Fatalf("the NLI pass re-decided the method on a searched tree (%T)", out)
 		}
 	})

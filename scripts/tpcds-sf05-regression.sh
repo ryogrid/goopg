@@ -495,9 +495,16 @@ cmd_oracle() {
         qf="${QDIR}/query${q}.sql"
         [[ -f "$qf" ]] || { echo "${q}|MISSING|0|n/a|0" >> "${ORACLE}"; continue; }
         res="${OUTDIR}/pg_q${q}_result.txt"
-        start=$SECONDS
+        # Millisecond resolution (take2 P0-09). bash's SECONDS is integer, so
+        # 54 of the 95 OK rows in the committed fixture read `0` and the column
+        # said nothing. EPOCHREALTIME is bash 5 and costs no subprocess.
+        # NOTE: `secs` is informational — the fixture is `rows` and `ck` (see
+        # this file's oracle header) — so this does NOT justify a re-capture on
+        # its own; the resolution lands on the next capture required for another
+        # reason, under design D5.
+        start=${EPOCHREALTIME/./}
         timeout "${ORACLE_TIMEOUT}" ${PG_PSQL} -f "$qf" > "$res" 2>&1 && rc=0 || rc=$?
-        secs=$((SECONDS - start))
+        secs=$(awk -v us=$(( ${EPOCHREALTIME/./} - start )) 'BEGIN{printf "%.3f", us/1000000}')
         ck="n/a"
         if [[ $rc -eq 124 ]]; then
             status="TIMEOUT"; rows=0

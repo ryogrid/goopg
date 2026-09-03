@@ -76,7 +76,9 @@ func ResolveIndexPredicate(predicate parser.Expr, tbl *catalog.Table) (Expr, err
 	if predicate == nil {
 		return nil, nil
 	}
-	ctx := singleBindingContext(tbl, tbl.Name)
+	// DDL predicate resolution: no session, and no cost decision is taken
+	// from this context, so the planner defaults are the honest value.
+	ctx := singleBindingContext(tbl, tbl.Name, DefaultPlannerSettings())
 	return resolveExpr(predicate, ctx)
 }
 
@@ -87,7 +89,18 @@ func ResolveIndexPredicate(predicate parser.Expr, tbl *catalog.Table) (Expr, err
 // param-slot space for the whole statement (nested planSelect calls
 // must not each run it, or slot IDs would collide across levels).
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
-	node, err := planStmt(stmt, cat)
+	return PlanWithSettings(stmt, cat, DefaultPlannerSettings())
+}
+
+// PlanWithSettings is Plan with an explicit per-statement planner context.
+//
+// take2 P2-01. `Plan` keeps its signature because it has thirty call sites and
+// most of them (plpgsql, FK checks, DDL) have no session to draw settings from;
+// the postmaster converts its own call sites in P2-02, which is itself blocked
+// on P2-04 because the plan cache is cross-session and carries no GUC
+// fingerprint.
+func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
+	node, err := planStmtWithSettings(stmt, cat, plannerSet)
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +153,10 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 }
 
 func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
+	return planStmtWithSettings(stmt, cat, DefaultPlannerSettings())
+}
+
+func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
 		// Rewrite `(srf(...)).*` target-list indirection-stars into
@@ -153,7 +170,7 @@ func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
-		return planSelect(s, cat)
+		return planSelectWithSettings(s, cat, plannerSet)
 	case *parser.InsertStmt:
 		// M0103-0007 rung 15: substitute bare DEFAULT cells in VALUES rows
 		// with the target column's catalog DefaultExpr (or NULL) before the
@@ -271,7 +288,14 @@ func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		if dc, ok := explainInner.(*parser.DeclareCursorStmt); ok {
 			explainInner = dc.Query
 		}
-		inner, err := Plan(explainInner, cat)
+		// take2 P2-02: EXPLAIN must plan its inner statement under the SAME
+		// settings as the statement itself, or `SET random_page_cost = …;
+		// EXPLAIN …` shows the costs of a plan the session would not get.
+		// This was the gap that made the live probe show unchanged costs while
+		// every unit test passed — EXPLAIN is the only way a user OBSERVES a
+		// cost, so of all the recursive entry points this is the one that must
+		// not default.
+		inner, err := PlanWithSettings(explainInner, cat, plannerSet)
 		if err != nil {
 			return nil, err
 		}
@@ -329,6 +353,15 @@ type resolveContext struct {
 	// Var.varlevelsup by counting how many parent links to walk.
 	// nil for the top-level SELECT.
 	parent *resolveContext
+	// settings is the per-statement planner context (plannersettings.go).
+	//
+	// It is resolved DIRECTLY, never by walking `parent`: `parent` is assigned
+	// after construction from the package-level `planParent`, whose own comment
+	// records that it is goroutine-thread-unsafe, so a parent walk could read a
+	// concurrently-planning session's settings and silently produce a plan
+	// costed with another connection's GUCs. Every path that reaches a cost
+	// site stamps this field itself.
+	settings PlannerSettings
 	// lateralSibling marks a lateral context that is at the SAME
 	// correlated-subquery nesting level as its parent — it extends
 	// the current FROM-clause scope horizontally, not vertically.
@@ -491,8 +524,18 @@ func tableSchemaWithSource(t *catalog.Table, sourceIdx int16) Schema {
 	return out
 }
 
-func newResolveContext(bindings []rangeBinding, schema Schema) *resolveContext {
-	ctx := &resolveContext{schema: schema, bindings: append([]rangeBinding(nil), bindings...)}
+func newResolveContext(bindings []rangeBinding, schema Schema, ps PlannerSettings) *resolveContext {
+	// settings starts at the DEFAULTS, never at the zero value. A zero
+	// PlannerSettings would price every page and tuple at 0.0, so a context
+	// that some path forgot to stamp would silently produce nonsense rather
+	// than today's behaviour. Defaulting here makes an unstamped context
+	// exactly as correct as the tree was before P2-01, which is what keeps
+	// this commit plan-neutral.
+	ctx := &resolveContext{
+		schema:   schema,
+		bindings: append([]rangeBinding(nil), bindings...),
+		settings: ps,
+	}
 	if len(ctx.bindings) > 0 {
 		ctx.table = ctx.bindings[0].table
 		ctx.alias = ctx.bindings[0].alias
@@ -520,16 +563,16 @@ func mergeResolveContexts(outer, inner *resolveContext) *resolveContext {
 		bindings = append(bindings, b)
 	}
 	schema := appendSchema(outer.schema, inner.schema)
-	return newResolveContext(bindings, schema)
+	return newResolveContext(bindings, schema, outer.settings)
 }
 
-func singleBindingContext(table *catalog.Table, alias string) *resolveContext {
+func singleBindingContext(table *catalog.Table, alias string, ps PlannerSettings) *resolveContext {
 	// Single-binding scope (INSERT/UPDATE/DELETE/COPY targets,
 	// view substitution helpers): SourceTableIdx 1 because the
 	// scope only ever has one binding and disambiguation isn't
 	// needed; 0 stays reserved for "unknown / derived".
 	b := rangeBinding{table: table, alias: alias, offset: 0, sourceIdx: 1}
-	return newResolveContext([]rangeBinding{b}, tableSchemaWithSource(table, 1))
+	return newResolveContext([]rangeBinding{b}, tableSchemaWithSource(table, 1), ps)
 }
 
 // ResolveAlterColumnTypeUsing resolves a USING expression from
@@ -540,7 +583,8 @@ func singleBindingContext(table *catalog.Table, alias string) *resolveContext {
 // tablecmds.c:14373), and the executor then evaluates it per old tuple
 // (ATRewriteTable, tablecmds.c:6126). M0134-0002 C2 slice 5.
 func ResolveAlterColumnTypeUsing(table *catalog.Table, e parser.Expr) (Expr, error) {
-	return resolveExpr(e, singleBindingContext(table, ""))
+	// As ResolveIndexPredicate above: expression resolution only.
+	return resolveExpr(e, singleBindingContext(table, "", DefaultPlannerSettings()))
 }
 
 func appendSchema(left, right Schema) Schema {
@@ -565,9 +609,9 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 // operation. Per SQL, sort keys reference the combined result's output
 // columns only — by 1-based position or by output column name — not arbitrary
 // expressions over the input relations. M0097-0024.
-func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (Node, error) {
+func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
 	out := node.Output()
-	ctx := newResolveContext(nil, out)
+	ctx := newResolveContext(nil, out, ps)
 	ctx.cat = cat
 
 	var keys []SortKey
@@ -738,7 +782,19 @@ func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
 }
 
+// planSelect plans a SELECT under the DEFAULT planner settings.
+//
+// take2 P2-01: this is now a wrapper. Every caller that has a per-statement
+// PlannerSettings in scope should call planSelectWithSettings instead; the
+// remaining callers of this name are the paths that do not yet thread one, and
+// they are enumerated in impl/P2-A §4.3 rather than left to be discovered.
+// Because DefaultPlannerSettings() is exactly what the tree used before this
+// change, every such path behaves identically to before.
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	return planSelectWithSettings(s, cat, DefaultPlannerSettings())
+}
+
+func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
 	// UNION branches) call planSelect directly without going through
@@ -978,7 +1034,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// operation and references the combined output columns by name
 		// or 1-based position (PostgreSQL §7.6). copyselect uses
 		// `… UNION … ORDER BY 1`. M0097-0024.
-		return wrapSetOpSortLimit(s, left, cat)
+		return wrapSetOpSortLimit(s, left, cat, plannerSet)
 	}
 	// A grouping node stands for a parenthesised set-op operand with nothing
 	// left of its own chain to fold — `(A UNION B) ORDER BY 1 LIMIT 2`, or the
@@ -992,7 +1048,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wrapSetOpSortLimit(s, operand, cat)
+		return wrapSetOpSortLimit(s, operand, cat, plannerSet)
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
@@ -1020,11 +1076,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// M0097-0049. Return directly after building the node and applying
 		// ORDER BY / LIMIT so we don't pass through the target-list projection
 		// path (which would collapse to 0 columns for empty Targets).
-		return planStandaloneValuesSelect(s, cat)
+		return planStandaloneValuesSelect(s, cat, plannerSet)
 	} else if len(s.From) == 0 {
 		// Constant SELECT — `SELECT 1`. The target list resolves
 		// against the empty schema.
-		ctx = newResolveContext(nil, nil)
+		ctx = newResolveContext(nil, nil, plannerSet)
 		node = &Values{
 			pos:    s.Pos(),
 			Rows:   [][]Expr{{}},
@@ -1038,7 +1094,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// dispatch live in one place. SourceTableIdx 1 — only
 		// one binding ever in this branch (0 is the
 		// "unknown / derived" sentinel).
-		nrv, b, err := planScanRangeVar(rv, cat, 1, nil)
+		nrv, b, err := planScanRangeVar(rv, cat, 1, nil, plannerSet)
 		if err != nil {
 			return nil, err
 		}
@@ -1058,24 +1114,19 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				schema[i] = SchemaColumn{Name: c.Name, Type: ty, SourceTableIdx: b.sourceIdx}
 			}
 		}
-		ctx = newResolveContext([]rangeBinding{b}, schema)
+		ctx = newResolveContext([]rangeBinding{b}, schema, plannerSet)
 	} else {
 		// Cost-based join-order reordering: when every comma-FROM
-		// table has ANALYZE statistics, permute the FROM list so
-		// small-cardinality relations join first. Operates on a
-		// SelectStmt copy so we don't mutate the caller's parser
-		// AST. Falls through to source order when stats are
-		// missing or the FROM list isn't a pure comma chain.
-		// See docs/design/0003-0016-join-order-reordering.md.
-		stmt := s
-		if reFE, reFR, rewrote := reorderCommaFromByCardinality(s, cat); rewrote {
-			c := *s
-			c.FromExprs = reFE
-			c.From = reFR
-			stmt = &c
-		}
+		// take2 P3-12: the pre-search greedy FROM-list permutation
+		// (reorderCommaFromByCardinality) is GONE. It placed
+		// small-cardinality relations first, which was a join-ORDER
+		// decision taken before the cost-based search ran — so it
+		// biased the search's input rather than informing it, and the
+		// search then had to re-derive an order from a list already
+		// permuted on a different rule. The search chooses join order
+		// on cost; a greedy pre-pass can only take that choice away.
 		var err error
-		node, ctx, err = planFromClause(stmt, cat)
+		node, ctx, err = planFromClause(s, cat, plannerSet)
 		if err != nil {
 			return nil, err
 		}
@@ -1092,6 +1143,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if ctx != nil {
 		ctx.cat = cat
 		ctx.parent = planParent
+		// take2 P2-01: the per-statement planner context. Stamped DIRECTLY
+		// here, in the same place `cat` and `parent` are, and resolved by the
+		// cost sites from this field alone — never by walking `parent`, which
+		// is assigned from the goroutine-unsafe package global `planParent`
+		// and could therefore yield a concurrently-planning session's GUCs.
+		ctx.settings = plannerSet
 	}
 
 	// preDPUnnested marks that the S5a pre-DP path already ran the
@@ -1290,7 +1347,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// on the inner side AND the cost gate accepts. The pass is a
 	// no-op when the package-level kill-switch is off
 	// (`SetNLIEnabled(false)`).
-	node = rewriteJoinsToNLI(node, cat)
+	node = rewriteJoinsToNLI(node, cat, plannerSet)
 	node = remapColumnRefsAfterRewrite(node)
 	// Second pass: use FROM‑clause bindings to correct any
 	// remaining order differences (OID ≠ FROM order).
@@ -1384,7 +1441,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// already AggStrategySorted (presorted) or the node is no longer
 		// AggStrategyHashed (hashagg bridge). See
 		// internal/optimizer/groupagg_indexorder.go.
-		applyIndexOrderedGroupingRule(agg.node, cat)
+		applyIndexOrderedGroupingRule(agg.node, cat, plannerSet)
 		// S8 Slice 2a (0134-0001 P2) presorted aggregates: port
 		// adjust_group_pathkeys_for_groupagg (planner.c:3229). When ≥1
 		// aggregate carries an internal ORDER BY / DISTINCT clause, choose the
@@ -1394,7 +1451,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// the pathkey expressions (which include GroupExprs) are already in
 		// child-output coordinate space. Gated on enable_presorted_aggregate
 		// (default on); the gate is read inside the rule.
-		applyPresortedAggregateRule(agg.node)
+		applyPresortedAggregateRule(agg.node, plannerSet)
 		// S8 Slice 2b (0134-0001 P2) enable_hashagg bridge: with
 		// `SET enable_hashagg = off`, reproduce PG's cost-model outcome
 		// (costsize.c:2755-2756 — the AGG_HASHED arm is disabled, so the sorted
@@ -1403,7 +1460,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// rule so a query that already gained a Sorted strategy (internal ORDER
 		// BY / DISTINCT) is never double-wrapped; the gate is read inside the
 		// rule.
-		applyEnableHashAggRule(agg.node)
+		applyEnableHashAggRule(agg.node, plannerSet)
 	} else if s.Having != nil {
 		return nil, &PlanError{
 			Pos:     s.Having.Pos(),
@@ -1455,7 +1512,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// reads from the ProjectSet's expanded output, not the
 			// aggregate. Reset ctx + agg so the existing branches
 			// hit the non-aggregate path.
-			ctx = newResolveContext(nil, ps.Output())
+			ctx = newResolveContext(nil, ps.Output(), plannerSet)
 			ctx.cat = cat
 			agg = nil
 			break
@@ -1484,7 +1541,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// in the PS output schema but CAN be resolved in the child schema,
 			// sort before PS (so base-table columns are visible).
 			if len(s.OrderBy) > 0 {
-				psCtx := newResolveContext(nil, srfPS.schema)
+				psCtx := newResolveContext(nil, srfPS.schema, plannerSet)
 				psCtx.cat = cat
 				for _, sb := range s.OrderBy {
 					expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
@@ -1521,7 +1578,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		sortCtx := ctx // default: child schema (also used for pre-sort)
 		if selectSrfPending != nil && !selectSrfPreSort {
 			// SRF post-sort: resolve against PS output
-			sortCtx = newResolveContext(nil, selectSrfPending.schema)
+			sortCtx = newResolveContext(nil, selectSrfPending.schema, plannerSet)
 			sortCtx.cat = cat
 		}
 		keys = make([]SortKey, 0, len(s.OrderBy))
@@ -1571,7 +1628,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		selectSrfPending.Child = node
 		node = selectSrfPending
 		ps = selectSrfPending
-		ctx = newResolveContext(nil, selectSrfPending.schema)
+		ctx = newResolveContext(nil, selectSrfPending.schema, plannerSet)
 		ctx.cat = cat
 		// Post-sort: sort AFTER PS expansion. ORDER BY may reference output
 		// columns by alias (ColumnRef) or 1-based position (IntegerConst).
@@ -1926,7 +1983,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// M0097-0046.
 		if len(s.OrderBy) > 0 {
 			distinctOut := out.Output()
-			outerCtx := newResolveContext(nil, distinctOut)
+			outerCtx := newResolveContext(nil, distinctOut, plannerSet)
 			outerCtx.cat = cat
 			outerKeys := make([]SortKey, 0, len(s.OrderBy))
 			for _, sb := range s.OrderBy {
@@ -2434,9 +2491,9 @@ func fixColumnRefsInExpr(e Expr, posMap map[columnKey]int) {
 	}
 }
 
-func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveContext, error) {
+func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSettings) (Node, *resolveContext, error) {
 	if len(s.FromExprs) == 0 {
-		return planFromRangeVars(s.From, cat)
+		return planFromRangeVars(s.From, cat, ps)
 	}
 	var root Node
 	var bindings []rangeBinding
@@ -2449,9 +2506,9 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 		// item's SRF args see siblings to its left.
 		var lateralCtx *resolveContext
 		if len(bindings) > 0 {
-			lateralCtx = newResolveContext(bindings, root.Output())
+			lateralCtx = newResolveContext(bindings, root.Output(), ps)
 		}
-		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx)
+		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2479,7 +2536,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	if root == nil {
 		return nil, nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
-	rctx := newResolveContext(bindings, root.Output())
+	rctx := newResolveContext(bindings, root.Output(), ps)
 	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
 	// walk that numbered these bindings is still the current walk (collapse.go).
 	// Inert until P5.9 — nothing reads `joinlist` yet.
@@ -2491,7 +2548,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	return root, rctx, nil
 }
 
-func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *resolveContext, error) {
+func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSettings) (Node, *resolveContext, error) {
 	var root Node
 	var bindings []rangeBinding
 	// Counter starts at 1; zero is reserved as the "unknown /
@@ -2504,9 +2561,9 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 		// against earlier FROM items. nil for the first item.
 		var lateralCtx *resolveContext
 		if len(bindings) > 0 {
-			lateralCtx = newResolveContext(bindings, root.Output())
+			lateralCtx = newResolveContext(bindings, root.Output(), ps)
 		}
-		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx, lateralCtx)
+		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx, lateralCtx, ps)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2530,7 +2587,7 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	if root == nil {
 		return nil, nil, &PlanError{Pos: 0, Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
-	rctx := newResolveContext(bindings, root.Output())
+	rctx := newResolveContext(bindings, root.Output(), ps)
 	// M0127-P5.8: a JOIN-free FROM list is one search problem of `len(from)`
 	// relations whatever the collapse GUCs say — upstream's unconditional
 	// `sub_members <= 1` merge (collapse.go, 03 §6).
@@ -2659,13 +2716,13 @@ func exprContainsColumnRef(e Expr) bool {
 	return found
 }
 
-func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext) (Node, []rangeBinding, error) {
-	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx, lateralCtx)
+func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext, ps PlannerSettings) (Node, []rangeBinding, error) {
+	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx, lateralCtx, ps)
 	if err != nil {
 		return nil, nil, err
 	}
 	*nextSourceIdx++
-	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output())
+	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output(), ps)
 	// M0134-0011c: give every per-join resolve context a catalog handle
 	// so IN (subquery) / EXISTS in a JOIN ... ON clause can plan the
 	// sublink via planInExpr (planner.go's `ctx.cat == nil` guard) the
@@ -2678,7 +2735,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// left side. Merge the outer lateralCtx with the current
 		// leftCtx so SRF args on the right see both. M0103-0008.
 		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
-		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx)
+		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2691,10 +2748,10 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// those column names against the right table. M0097-0003.
 		usingCols := j.Using
 		if j.Natural {
-			usingCols = naturalJoinColumns(leftCtx, newResolveContext([]rangeBinding{rightBinding}, rightNode.Output()))
+			usingCols = naturalJoinColumns(leftCtx, newResolveContext([]rangeBinding{rightBinding}, rightNode.Output(), ps))
 		}
 
-		rightCtx := newResolveContext([]rangeBinding{rightBinding}, appendSchema(leftCtx.schema, rightNode.Output()))
+		rightCtx := newResolveContext([]rangeBinding{rightBinding}, appendSchema(leftCtx.schema, rightNode.Output()), ps)
 		rightCtx.cat = cat
 		// Build a separate right binding for the merged context with usingHidden set.
 		// This hides the right-side copy of USING columns from unqualified lookup
@@ -2707,7 +2764,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		mergedBindings = append(mergedBindings, leftCtx.bindings...)
 		mergedBindings = append(mergedBindings, mergedRightBinding)
 		mergedSchema := appendSchema(leftCtx.schema, rightNode.Output())
-		mergedCtx := newResolveContext(mergedBindings, mergedSchema)
+		mergedCtx := newResolveContext(mergedBindings, mergedSchema, ps)
 		mergedCtx.cat = cat
 
 		pred, err := planJoinPredicate(j, leftCtx, rightCtx, mergedCtx)
@@ -2919,7 +2976,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 	return leftNode, leftCtx.bindings, nil
 }
 
-func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings) (Node, rangeBinding, error) {
 	if rv.Subquery != nil {
 		return planSubqueryRangeVar(rv, cat, sourceIdx, lateralCtx)
 	}
@@ -3020,7 +3077,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		renamedTbl.Columns = renamedCols
 		b.table = &renamedTbl
 	}
-	ctx := newResolveContext([]rangeBinding{b}, baseSchema)
+	ctx := newResolveContext([]rangeBinding{b}, baseSchema, ps)
 	// TABLESAMPLE (M0134-0175). Resolved ONCE, above the inheritance and
 	// partition expansions below, because upstream applies the sample to
 	// every leaf of an expanded Append — `select count(*) from person
@@ -3256,7 +3313,7 @@ func resolveTableSample(ts *parser.RangeTableSample, ctx *resolveContext) (*Tabl
 // byte-identical to the pre-M0125-0003 planner — unless the flag is on, which
 // is what makes the landing commit inert.
 func stage1RelSizeRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
-	return relSizeFallbackRows(1, cat, tbl)
+	return relSizeFallbackRows(cat, tbl)
 }
 
 // remapSubqueryColumnRefs walks the plan tree rooted at n and REPAIRS every
@@ -3795,7 +3852,7 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 // Columns are named "column1", "column2", ... (PostgreSQL convention). Types
 // are inferred from the first row's expressions. ORDER BY / LIMIT are applied
 // inline. M0097-0049.
-func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
 	rows := s.ValuesRows
 	if len(rows) == 0 {
 		return nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "VALUES must have at least one row"}
@@ -3829,7 +3886,7 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node
 	var node Node = &Values{pos: s.Pos(), Rows: planRows, schema: schema}
 
 	// Apply ORDER BY if present (e.g. VALUES (3),(1) ORDER BY 1).
-	sortCtx := newResolveContext(nil, schema)
+	sortCtx := newResolveContext(nil, schema, ps)
 	sortCtx.cat = cat
 	if len(s.OrderBy) > 0 {
 		keys := make([]SortKey, 0, len(s.OrderBy))
@@ -6407,7 +6464,7 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 			schema:      outputSchema,
 		}
 		currentChild = windowNode
-		currentCtx = newResolveContext(nil, outputSchema)
+		currentCtx = newResolveContext(nil, outputSchema, inputCtx.settings)
 
 		for k, v := range byKey {
 			combinedByKey[k] = v
@@ -7406,7 +7463,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		GroupingMasks: groupingMasks,
 	}
 
-	outputCtx := newResolveContext(nil, outputSchema)
+	outputCtx := newResolveContext(nil, outputSchema, inputCtx.settings)
 	surface := &aggregateSurface{
 		input:               inputCtx,
 		output:              outputCtx,
@@ -9234,11 +9291,18 @@ func parserExprKey(e parser.Expr) string {
 // the index scan's does, and `needsRecheck` marks the prefix probe's tuples
 // for recheck against BitmapQual — which carries the very equality this probe
 // binds.
-func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int) Node {
+// take2 P2-01: takes the statement's planner settings rather than calling
+// defaultCostParams(). Its caller passes ctx.settings, which covers all three
+// paths that reach it — planSelect, planUpdate and planDelete. The DML two
+// build their context with singleBindingContext, which today yields the
+// defaults; when P2-02 stamps those contexts the session's GUCs flow here with
+// no further change, which is why the value travels on the context rather than
+// as a separate parameter.
+func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int, ps PlannerSettings) Node {
 	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
 		return nil
 	}
-	cp := defaultCostParams()
+	cp := ps.costParams()
 	relTuples := float64(tbl.Stats.RowCount)
 	relPages := baseRelPages(tbl, relTuples)
 	T := float64(relPages)
@@ -9389,7 +9453,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 			// Reachable only with an outer binding in scope, so the
 			// UPDATE/DELETE callers — whose executors pattern-match
 			// `*IndexScan` — never see the bitmap shape.
-			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos()); bhs != nil {
+			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos(), ctx.settings); bhs != nil {
 				return bhs, true, nil
 			}
 			return &IndexScan{
@@ -9906,7 +9970,9 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 
 	out := rewritten
 	if len(s.OrderBy) > 0 {
-		orderCtx := newResolveContext(nil, outSchema)
+		// ORDER BY expression resolution only — no cost decision is taken from
+	// this context, so the planner defaults are the honest value.
+	orderCtx := newResolveContext(nil, outSchema, DefaultPlannerSettings())
 		orderCtx.cat = cat
 		keys := make([]SortKey, 0, len(s.OrderBy))
 		for _, sb := range s.OrderBy {
@@ -10984,7 +11050,8 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		if resolveTbl != nil {
 			retAlias = viewResolveAlias(s.Target.Alias, viewName)
 		}
-		retCtx := singleBindingContext(retTbl, retAlias)
+		// RETURNING expression resolution only; see the note in planSelect.
+	retCtx := singleBindingContext(retTbl, retAlias, DefaultPlannerSettings())
 		retCtx.cat = cat
 		// When this INSERT has ON CONFLICT DO UPDATE, add `excluded` to the
 		// RETURNING scope as notReferenceable. This lets resolveColumnRefAt
@@ -11065,7 +11132,8 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl 
 			if hasExpr {
 				// Build a single-binding resolve context for the target table
 				// so expression ColumnRefs resolve against the insert row.
-				exprCtx := singleBindingContext(scopeTbl, scopeAlias)
+				// ON CONFLICT expression resolution only; see the note in planSelect.
+	exprCtx := singleBindingContext(scopeTbl, scopeAlias, DefaultPlannerSettings())
 				exprCtx.cat = cat
 				out.ArbiterExprs = make([]Expr, len(ords))
 				for i, o2 := range ords {
@@ -11125,7 +11193,7 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl 
 	mergedSchema := make(Schema, 0, 2*n)
 	mergedSchema = append(mergedSchema, tableSchemaWithSource(scopeTbl, 1)...)
 	mergedSchema = append(mergedSchema, tableSchemaWithSource(scopeTbl, 2)...)
-	ctx := newResolveContext(bindings, mergedSchema)
+	ctx := newResolveContext(bindings, mergedSchema, DefaultPlannerSettings())
 	ctx.cat = cat
 
 	out.UpdateSet = make([]Expr, n)
@@ -11170,7 +11238,7 @@ func resolveDefaultDoNothingArbiter(tbl *catalog.Table, targetAlias string, cat 
 		if colName == "" {
 			ords = append(ords, -1)
 			if exprCtx == nil {
-				exprCtx = singleBindingContext(tbl, targetAlias)
+				exprCtx = singleBindingContext(tbl, targetAlias, DefaultPlannerSettings())
 				exprCtx.cat = cat
 				exprs = make([]Expr, len(chosen.Columns))
 			}
@@ -11643,7 +11711,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		offset := len(tbl.Columns)
 		for idx, rv := range s.From {
 			si := int16(idx + 2) // sourceIdx 2, 3, … for FROM tables
-			fromNode, fromBinding, err2 := planScanRangeVar(rv, cat, si, nil)
+			fromNode, fromBinding, err2 := planScanRangeVar(rv, cat, si, nil, DefaultPlannerSettings())
 			if err2 != nil {
 				return nil, err2
 			}
@@ -11673,7 +11741,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 			fromScans = append(fromScans, fromNode)
 			offset += len(fromTbl.Columns)
 		}
-		ctx := newResolveContext(bindings, sch)
+		ctx := newResolveContext(bindings, sch, DefaultPlannerSettings())
 		ctx.cat = cat
 		// Apply the WHERE predicate (no index optimization for UPDATE FROM). M0097-0065.
 		var pred Expr
@@ -11712,7 +11780,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		return wrapDMLCTEPrefix(upd, dmlPlans), nil
 	}
 
-	ctx := singleBindingContext(resolveScope, targetAlias)
+	ctx := singleBindingContext(resolveScope, targetAlias, DefaultPlannerSettings())
 	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
@@ -11823,7 +11891,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		offset := len(tbl.Columns)
 		for idx, rv := range s.Using {
 			si := int16(idx + 2) // sourceIdx 2, 3, … for USING tables
-			usingNode, usingBinding, err2 := planScanRangeVar(rv, cat, si, nil)
+			usingNode, usingBinding, err2 := planScanRangeVar(rv, cat, si, nil, DefaultPlannerSettings())
 			if err2 != nil {
 				return nil, err2
 			}
@@ -11849,7 +11917,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 			usingScans = append(usingScans, usingNode)
 			offset += len(useTbl.Columns)
 		}
-		ctx := newResolveContext(bindings, sch)
+		ctx := newResolveContext(bindings, sch, DefaultPlannerSettings())
 		ctx.cat = cat
 		var pred Expr
 		if s.Where != nil {
@@ -11879,7 +11947,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		return wrapDMLCTEPrefix(del, dmlPlans), nil
 	}
 
-	ctx := singleBindingContext(resolveScope, targetAlias)
+	ctx := singleBindingContext(resolveScope, targetAlias, DefaultPlannerSettings())
 	// When an explicit alias is set, using the original table name in WHERE
 	// must produce the PostgreSQL-specific error. M0097-0003.
 	if s.Target.Alias != "" {
@@ -11938,7 +12006,7 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 
 	// Plan the USING source.
 	var srcIdx int16 = 2
-	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx, nil)
+	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx, nil, DefaultPlannerSettings())
 	if err != nil {
 		return nil, err
 	}
@@ -11960,14 +12028,14 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 	mergedSchema := make(Schema, 0, n+len(sourceSchema))
 	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 1)...)
 	mergedSchema = append(mergedSchema, sourceSchema...)
-	mergedCtx := newResolveContext([]rangeBinding{targetBinding, sourceBinding}, mergedSchema)
+	mergedCtx := newResolveContext([]rangeBinding{targetBinding, sourceBinding}, mergedSchema, DefaultPlannerSettings())
 	mergedCtx.cat = cat
 
 	// Source-only context for NOT MATCHED INSERT VALUES.
 	sourceOnly := newResolveContext([]rangeBinding{{
 		table: sourceBinding.table, alias: sourceBinding.alias,
 		offset: 0, sourceIdx: srcIdx,
-	}}, sourceSchema)
+	}}, sourceSchema, DefaultPlannerSettings())
 	sourceOnly.cat = cat
 
 	onExpr, err := resolveExpr(s.On, mergedCtx)
@@ -12045,7 +12113,7 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 			{table: tbl, alias: targetAlias, offset: 0, sourceIdx: 1},
 			{table: tbl, alias: "old", offset: nn, sourceIdx: 2, qualifiedOnly: true, mergeRowKind: 1},
 			{table: tbl, alias: "new", offset: 2 * nn, sourceIdx: 3, qualifiedOnly: true, mergeRowKind: 2},
-		}, retSchema)
+		}, retSchema, DefaultPlannerSettings())
 		retCtx.cat = cat
 		retCtx.allowMergeAction = true
 		exprs, schema, err := resolveTargets(s.Returning, retCtx)

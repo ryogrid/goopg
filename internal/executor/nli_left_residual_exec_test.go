@@ -95,13 +95,15 @@ const nliLeftQuery = "SELECT c_key, o_total FROM cust LEFT JOIN ordr " +
 //
 // The NLI renders PG's label `Nested Loop Left Join`, which a plain nested
 // loop shares, so the discriminator is the inner `Index Cond` binding an
-// OUTER column (`o_key = c_key`): only the NLI binds outer values into a
-// per-outer index probe. The `Filter:` line is the residual Predicate this
+// OUTER column (`o_key = cust.c_key`): only the NLI binds outer values into a
+// per-outer index probe. The outer side carries its relation name per PG's
+// show_scan_qual (P0-04); a bare `(o_key = c_key)` would read as a
+// self-comparison. The `Filter:` line is the residual Predicate this
 // test exists to exercise.
 func requireNLILeftPlan(t *testing.T, ctx *Context) {
 	t.Helper()
 	plan := nliResidualExplain(t, ctx, nliLeftQuery)
-	for _, want := range []string{"Nested Loop Left Join", "Index Cond: (o_key = c_key)", "Filter:"} {
+	for _, want := range []string{"Nested Loop Left Join", "Index Cond: (o_key = cust.c_key)", "Filter:"} {
 		if !strings.Contains(plan, want) {
 			t.Fatalf("expected an index-driven LEFT NLI with a residual (missing %q); plan:\n%s", want, plan)
 		}

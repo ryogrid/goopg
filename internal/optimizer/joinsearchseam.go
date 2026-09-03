@@ -300,6 +300,25 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	for _, q := range onQuals {
 		conjuncts = append(conjuncts, splitAnd(q)...)
 	}
+	// take2 P1-20: give the SEARCH the equivalence class's CONSTANTS.
+	//
+	// The closure had one caller — `pushPredicatesIntoCrossJoins` (pushdown.go)
+	// — on the legacy path, so with GOOPG_PGSHAPED_DP on by default the
+	// searched plan never saw it. Applying it here, BEFORE the conjuncts are
+	// partitioned into join clauses and per-relation locals, is what lets a
+	// propagated `var = const` become a relation-local restriction the search
+	// pushes into a leaf.
+	//
+	// CONSTANTS ONLY, deliberately. Propagating `a = 42` across a class only
+	// adds restrictions and re-opens no join order. Adding the transitive
+	// `a = c` would hand the search new JOIN clauses and reshape plans broadly
+	// — measured: it broke the pinned-semi-join layout
+	// TestPreDPPinnedSemiKeysResolveAfterDP asserts, on a query containing no
+	// constants at all. That half stays on its legacy caller pending its own
+	// evaluation.
+	if synth := inferEquivClassConstants(conjuncts); len(synth) > 0 {
+		conjuncts = append(conjuncts, synth...)
+	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
 	leaves := make([]Node, nprefix)
 	relInfos := make([]baseRelInfo, nprefix)
@@ -334,7 +353,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		relInfos:   relInfos,
 		conjuncts:  searchConjuncts,
 		cumOffsets: cumOffsets,
-		cp:         defaultCostParams(),
+		// take2 P2-01: the search prices with the STATEMENT's settings, not a
+		// hard-wired constant list. tryJoinSearch is reached only from inside
+		// planSelect (predp.go and two sites in planner.go), so this ctx is
+		// always the one planSelect stamped — no parent walk is needed, and
+		// none is safe (see resolveContext.settings).
+		cp:         ctx.settings.costParams(),
 		cat:        cat,
 		// `root->tuple_fraction`, carried on the context because the `*Limit`
 		// node does not exist yet at this point in `planSelect` (see

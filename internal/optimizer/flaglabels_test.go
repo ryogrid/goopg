@@ -1,9 +1,13 @@
 package optimizer
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -89,46 +93,92 @@ func TestFlagProvenanceTableIsResolvable(t *testing.T) {
 	}
 }
 
-// goopgEnvRead matches the planner's env reads. Any GOOPG_* variable this
-// package consults shapes plans unless something says otherwise.
-var goopgEnvRead = regexp.MustCompile(`os\.Getenv\("(GOOPG_[A-Z0-9_]+)"\)`)
+// goopgEnvName matches a GOOPG_* variable name. It is applied to the CONTENTS
+// of string literals recovered from the AST, never to raw source — see
+// plannerEnvNames.
+var goopgEnvName = regexp.MustCompile(`^GOOPG_[A-Z0-9_]+$`)
+
+// plannerEnvNames returns every GOOPG_* name that appears as a string literal
+// in the package's non-test sources, with the file it appeared in.
+//
+// It walks the AST rather than matching `os.Getenv("GOOPG_…")` in raw text,
+// because the regex form had a hole that was silently exploited for an entire
+// milestone: GOOPG_INDEX_PROBE_MULT is read through the envFloatDefault helper
+// (cost_funcs.go), not a literal os.Getenv call, so the detector never saw it
+// and the flag that multiplies every NL-index probe cost was absent from every
+// benchmark artefact this table exists to stamp. Any read path — direct,
+// helper-wrapped, or one this package has not invented yet — puts the name in a
+// string literal, so that is what the detector looks at.
+//
+// Matching literals rather than raw text also keeps flag names quoted in
+// COMMENTS out of the result (flaglabels.go's own doc comments quote several),
+// which a raw-text regex would report as reads.
+func plannerEnvNames(t *testing.T) map[string]string {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package dir: %v", err)
+	}
+	found := map[string]string{}
+	for _, pkg := range pkgs {
+		for name, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				v, err := strconv.Unquote(lit.Value)
+				if err != nil || !goopgEnvName.MatchString(v) {
+					return true
+				}
+				if _, seen := found[v]; !seen {
+					found[v] = filepath.Base(name)
+				}
+				return true
+			})
+		}
+	}
+	return found
+}
 
 // TestFlagProvenanceTableCoversPlannerEnv fails when a plan-shaping env flag is
 // added to the planner and named in neither the stamp nor the exemption list.
 // Without this, the table would go stale the same silent way the printf did:
 // the six flags this table gained at M0127-P5.9-q had been readable by the
-// planner — and absent from every artefact — for entire milestones.
+// planner — and absent from every artefact — for entire milestones, and
+// GOOPG_INDEX_PROBE_MULT then repeated it through a detector hole.
 func TestFlagProvenanceTableCoversPlannerEnv(t *testing.T) {
 	stamped := map[string]bool{}
 	for _, f := range FlagProvenanceTable() {
 		stamped[f.Env] = true
 	}
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read package dir: %v", err)
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+	for env, file := range plannerEnvNames(t) {
+		if stamped[env] {
 			continue
 		}
-		src, err := os.ReadFile(name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
+		if _, ok := flagProvenanceExempt[env]; ok {
+			continue
 		}
-		for _, m := range goopgEnvRead.FindAllStringSubmatch(string(src), -1) {
-			env := m[1]
-			if stamped[env] {
-				continue
-			}
-			if _, ok := flagProvenanceExempt[env]; ok {
-				continue
-			}
-			t.Errorf("%s reads %s, which no benchmark artefact names.\n"+
-				"Add it to flagProvenanceOrder+flagResolvedState (and regenerate "+
-				"scripts/planner-flags.env), or to flagProvenanceExempt with the reason "+
-				"it cannot change a plan.", name, env)
-		}
+		t.Errorf("%s names %s, which no benchmark artefact names.\n"+
+			"Add it to flagProvenanceOrder+flagResolvedState (and regenerate "+
+			"scripts/planner-flags.env), or to flagProvenanceExempt with the reason "+
+			"it cannot change a plan.", file, env)
+	}
+}
+
+// TestFlagProvenanceDetectorSeesHelperWrappedReads pins the hole itself. The
+// previous detector matched only a literal os.Getenv call, so a flag read
+// through a helper was invisible to the guard above. GOOPG_INDEX_PROBE_MULT is
+// exactly that shape (cost_funcs.go reads it via os.Getenv into
+// indexProbeMultFromEnv, and earlier via envFloatDefault), so its presence in
+// the detector's output is the regression test for the detector.
+func TestFlagProvenanceDetectorSeesHelperWrappedReads(t *testing.T) {
+	names := plannerEnvNames(t)
+	if _, ok := names["GOOPG_INDEX_PROBE_MULT"]; !ok {
+		t.Fatal("detector did not see GOOPG_INDEX_PROBE_MULT; the helper-wrapped-read hole is back")
 	}
 }
 

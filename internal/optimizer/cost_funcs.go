@@ -78,6 +78,21 @@ type costParams struct {
 	// session in scope (the same gap `ParallelSettings` exists to bridge for
 	// the parallel post-pass). Deferral ledger 2026-08-05 M0127-P5.7-a.
 	workMem int64
+
+	// enable* are PG's planner-method GUCs (take2 P2-05). True means the
+	// method is enabled; a disabled method still PRODUCES its path and
+	// increments Path.DisabledNodes, as PG 18 does.
+	enableHashJoin  bool
+	enableMergeJoin bool
+	enableNestLoop  bool
+	enableMemoize   bool
+	geqo            bool
+	geqoThreshold   int
+	geqoEffort      int
+	geqoPoolSize    int
+	geqoGenerations int
+	geqoBias        float64
+	geqoSeed        float64
 }
 
 func defaultCostParams() costParams {
@@ -93,7 +108,19 @@ func defaultCostParams() costParams {
 		// 524288. config/defaults.go registers the string form; the unit
 		// conversion is pinned by TestEffectiveCacheSizeMatchesConfigDefault.
 		effectiveCacheSize: 4 * 1024 * 1024 * 1024 / blockSizeBytes,
-		workMem:            hashsize.DefaultMemLimitBytes,
+		// take2 P2-03: the budget is work_mem * hash_mem_multiplier
+		// (get_hash_memory_limit), expressed through the SAME helper the
+		// executor's buildGeometry calls. Writing the bare default here again
+		// is what let the two drift apart in the first place.
+		workMem:         hashsize.HashMemLimit(hashsize.DefaultMemLimitBytes, hashsize.DefaultHashMemMultiplier),
+		enableHashJoin:  true,
+		enableMergeJoin: true,
+		enableNestLoop:  true,
+		enableMemoize:   true,
+		geqo:            GeqoEnabled(),
+		geqoThreshold:   GeqoThreshold(),
+		geqoEffort:      5,
+		geqoBias:        2.0,
 	}
 }
 
@@ -281,6 +308,11 @@ type hashJoinInputs struct {
 
 	// outerAvgVarBytes / innerAvgVarBytes are the average total variable-width
 	// payload per row of each side — the `avgVarBytes` parameter of
+	// innerBucketSize is `innerbucketsize` from estimate_hash_bucket_stats:
+	// the share of the inner relation in one bucket. Zero means "no usable
+	// statistic" and suppresses the bucket-walk term entirely. take2 P2-11.
+	innerBucketSize float64
+
 	// `hashsize.Choose`. Populated from RelOptInfo.AvgVarBytes; zero when no
 	// ANALYZE stats exist (correct for fixed-width relations). M0128-P3.1.
 	outerAvgVarBytes, innerAvgVarBytes float64
@@ -318,6 +350,24 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 
 	// The geometry the executor will pick for this build. Skew buckets and the
 	// parallel combined budget are absent on both sides alike (06 §6).
+	// take2 P2-11: the bucket walk. PG charges
+	//
+	//	run_cost += hash_qual_cost.per_tuple * outer_matched_rows *
+	//	            clamp_row_est(inner_path_rows * innerbucketsize) * 0.5
+	//
+	// (final_cost_hashjoin) — the comparisons a probe performs walking its
+	// bucket. Without it a hash join on a low-ndistinct key is priced exactly
+	// like one on a unique key, which is the degeneracy Q78 hit.
+	//
+	// innerBucketSize == 0 means "no usable statistic"; the term is then
+	// SKIPPED rather than guessed, so a stats-less plan costs exactly as it did
+	// before this change.
+	if in.innerBucketSize > 0 {
+		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
+		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
+			in.outerRows * bucketTuples * 0.5
+	}
+
 	// M0128-P3.1: avgVarBytes from column stats replaces the hardcoded zero.
 	sizing := hashsize.Choose(in.innerRows, in.innerCols, in.innerAvgVarBytes, cp.workMem)
 	if sizing.NBatch > 1 {
@@ -381,14 +431,30 @@ func spillPages(rows float64, ncols int, avgVarBytes float64) float64 {
 // innerRows is the INNER PATH's own row count (`inner_path->rows`), so for a
 // parameterised NLI inner it is the per-probe count (`ppi_rows`), not the
 // relation's total — the same number the caller's `qualEvalCost` uses.
-func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanTotal float64) Cost {
+func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanStartup, innerRescanTotal float64) Cost {
 	startup := outer.Startup + inner.Startup
 	// PG's clamp sits at the top of final_cost_nestloop and so reaches only
 	// the tuple count, not the rescan term `initial_cost_nestloop` already
 	// accumulated: a zero path row count would otherwise zero the whole
 	// per-tuple charge.
 	ntuples := math.Max(outerRows, 1) * math.Max(innerRows, 1)
-	run := (outer.Total - outer.Startup) + outerRows*innerRescanTotal + cp.cpuTupleCost*ntuples
+	// take2 P2-07, cost_nestloop (costsize.c:3304-3327):
+	//
+	//     inner_run_cost        = inner.total - inner.startup
+	//     inner_rescan_run_cost = rescan.total - rescan.startup
+	//     run_cost += inner_run_cost
+	//     if outer_path_rows > 1:
+	//         run_cost += (outer_path_rows - 1) * inner_rescan_run_cost
+	//
+	// The inner is scanned ONCE and rescanned outerRows-1 times, and both are
+	// RUN costs: the inner's startup is paid once, at the join's startup, and
+	// was previously being charged again on every outer row.
+	innerRun := inner.Total - inner.Startup
+	innerRescanRun := innerRescanTotal - innerRescanStartup
+	run := (outer.Total - outer.Startup) + innerRun + cp.cpuTupleCost*ntuples
+	if outerRows > 1 {
+		run += (outerRows - 1) * innerRescanRun
+	}
 	return Cost{Startup: startup, Total: startup + run}
 }
 
@@ -397,10 +463,28 @@ func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerR
 // merge. A cost_sort on an unsorted input is added by the caller when the input's
 // pathkeys do not satisfy the merge clause (design ch. 06 §3.2) — the whole
 // reason pathkeys exist.
-func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows float64) Cost {
+func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows, outerEndSel, innerEndSel float64) Cost {
 	startup := outer.Startup + inner.Startup
-	run := (outer.Total - outer.Startup) + (inner.Total - inner.Startup) +
-		cp.cpuOperatorCost*(outerRows+innerRows) + cp.cpuTupleCost*outputRows
+	// take2 P2-12, `mergejoinscansel` applied as final_cost_mergejoin does
+	// (costsize.c:3686-3745): a merge join stops once one side passes the
+	// other's maximum key, so only that FRACTION of each input's RUN cost is
+	// paid. Both branches of PG's sort/no-sort split scale the same way — the
+	// sort's own startup, which is where the full input read lives, is charged
+	// UNSCALED, and only the read-out portion scales. goopg's sortPathFor has
+	// that same shape, so applying the scaling to (Total - Startup) is correct
+	// whether or not the input needed sorting.
+	//
+	// 1 means "no information" and charges the full pass, i.e. the behaviour
+	// before this term. The scaling can only ever REDUCE cost, so an unknown
+	// must not be allowed to.
+	if outerEndSel <= 0 || outerEndSel > 1 {
+		outerEndSel = 1
+	}
+	if innerEndSel <= 0 || innerEndSel > 1 {
+		innerEndSel = 1
+	}
+	run := (outer.Total-outer.Startup)*outerEndSel + (inner.Total-inner.Startup)*innerEndSel +
+		cp.cpuOperatorCost*(outerRows*outerEndSel+innerRows*innerEndSel) + cp.cpuTupleCost*outputRows
 	return Cost{Startup: startup, Total: startup + run}
 }
 
@@ -435,7 +519,24 @@ func indexProbeCost(cp costParams) float64 {
 // a hash join over NL-probing a large outer. Overridable via
 // GOOPG_INDEX_PROBE_MULT for measurement; the calibrated default is set once a
 // value is validated on SF1.
-var indexProbeCostMultiplier = envFloatDefault("GOOPG_INDEX_PROBE_MULT", 1.0)
+var indexProbeCostMultiplier = indexProbeMultFromEnv(os.Getenv("GOOPG_INDEX_PROBE_MULT"))
+
+// indexProbeMultFromEnv resolves GOOPG_INDEX_PROBE_MULT's raw value to the
+// multiplier the planner uses. It is a named function rather than an inline
+// envFloatDefault call so the flag-provenance table can resolve the SAME
+// default the process resolves (flaglabels.go's flagResolvedState), which is
+// what makes `unset(1)` a statement about the binary instead of a restated
+// constant. Reading it through a helper is also what hid this flag from
+// TestFlagProvenanceTableCoversPlannerEnv for an entire milestone — see that
+// test's go/ast detector.
+func indexProbeMultFromEnv(v string) float64 {
+	if v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return 1.0
+}
 
 // `multiHashJoinCost` costed goopg's N-way MultiHashJoin under the
 // comparability invariant (design ch. 06 §4.1) — build every dimension hash

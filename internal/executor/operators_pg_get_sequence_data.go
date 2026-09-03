@@ -63,7 +63,7 @@ func (o *pgGetSequenceDataOp) Open(ctx *Context) error {
 	if argVal.IsNull() {
 		return nil
 	}
-	tbl, ok := verifyHeapamResolveTable(argVal, im)
+	tbl, ok := verifyHeapamResolveTable(argVal, im, ctx.CurrentDatabaseOid)
 	if !ok || !tbl.IsSequence || tbl.VirtualRows == nil {
 		// Not a sequence relation → no rows (mirrors PG's "is not a sequence"
 		// being unreachable here because pg_dump only feeds discovered

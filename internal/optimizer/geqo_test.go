@@ -262,7 +262,7 @@ func TestGeqoSearchReturnsValidFullRelPath(t *testing.T) {
 		}
 		all := RelSet(1)<<uint(n) - 1
 		if p.Rel.Relids != all {
-			t.Errorf("n=%d: final relids=%#04x, want full relset %#04x", n, uint16(p.Rel.Relids), uint16(all))
+			t.Errorf("n=%d: final relids=%#08x, want full relset %#08x", n, uint32(p.Rel.Relids), uint32(all))
 		}
 		if !(p.Cost.Total > 0) {
 			t.Errorf("n=%d: total cost %v not positive", n, p.Cost.Total)

@@ -714,6 +714,10 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		}
 		o.slot.schema = o.Schema()
 		o.slot.row = row
+		// take2, sibling of the seqScanOp check: this operator decodes at
+		// len(o.plan.Table.Columns) while advertising o.plan.Output(), the same
+		// pairing P4-01b broke. Off unless GOOPG_ASSERT_ROW_SHAPE=1.
+		assertRowShapeInline("indexScanOp", o.slot.schema, len(o.slot.row))
 		return &o.slot, nil
 	}
 }

@@ -55,7 +55,7 @@ func TestGenerateHashJoinPaths_KeepsCheaperBuildSide(t *testing.T) {
 	joinRel := newRelOptInfo(RelSet(0b11), 1000000, 100)
 	// One hash key, no residual. The clause's contents do not matter here —
 	// only its count reaches hashJoinCost.
-	generateHashJoinPaths(joinRel, fact, dim, cp, []*restrictInfo{{}}, nil)
+	generateHashJoinPaths(joinRel, fact, dim, cp, []*restrictInfo{{}}, nil, nil)
 	setCheapest(joinRel)
 
 	if joinRel.CheapestTotal == nil {
@@ -78,7 +78,7 @@ func TestGenerateHashJoinPaths_KeepsCheaperBuildSide(t *testing.T) {
 // setCheapest already run — a convenient stand-in for a DP child rel in tests.
 func relWithScanCost(relids RelSet, rows float64, total float64) *RelOptInfo {
 	rel := newRelOptInfo(relids, rows, 40)
-	addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: rows, Cost: Cost{Total: total}})
+	addPath(rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: rows, Cost: Cost{Total: total}}, "test")
 	setCheapest(rel)
 	return rel
 }
@@ -141,7 +141,7 @@ func TestGenerateHashJoinPaths_NoChildCheapestIsNoop(t *testing.T) {
 	joinRel := newRelOptInfo(RelSet(0b11), 10, 10)
 	outer := newRelOptInfo(RelSet(0b01), 10, 10) // no paths -> CheapestTotal nil
 	inner := newRelOptInfo(RelSet(0b10), 10, 10)
-	generateHashJoinPaths(joinRel, outer, inner, cp, []*restrictInfo{{}}, nil)
+	generateHashJoinPaths(joinRel, outer, inner, cp, []*restrictInfo{{}}, nil, nil)
 	if len(joinRel.Pathlist) != 0 {
 		t.Fatalf("no join paths should be generated without child cheapest paths")
 	}

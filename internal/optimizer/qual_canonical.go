@@ -231,3 +231,33 @@ func boolChain(parts []parser.Expr, op parser.OpCode) parser.Expr {
 	}
 	return out
 }
+
+// flattenOrBranches returns the operands of a left- or right-deep OR chain as a
+// flat list, so `a OR b OR c` yields three branches rather than a nested pair.
+//
+// take2 P3-12 moved this here from joinorder.go, which was deleted with the
+// pre-search greedy FROM reorder. This file is its only consumer.
+func flattenOrBranches(e parser.Expr) []parser.Expr {
+	bin, ok := e.(*parser.BinaryOp)
+	if !ok || bin.Op != parser.OpOr {
+		return []parser.Expr{e}
+	}
+	out := flattenOrBranches(bin.Left)
+	out = append(out, flattenOrBranches(bin.Right)...)
+	return out
+}
+
+// walkConjuncts descends `AND`-trees and visits each leaf
+// conjunct. The WHERE clause `a AND (b AND c)` produces three
+// callbacks: a, b, c. NULL input is a no-op.
+func walkConjuncts(e parser.Expr, visit func(parser.Expr)) {
+	if e == nil {
+		return
+	}
+	if bin, ok := e.(*parser.BinaryOp); ok && bin.Op == parser.OpAnd {
+		walkConjuncts(bin.Left, visit)
+		walkConjuncts(bin.Right, visit)
+		return
+	}
+	visit(e)
+}

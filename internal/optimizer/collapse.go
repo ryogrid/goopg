@@ -76,11 +76,12 @@ package optimizer
 // and `GOOPG_PGSHAPED_DP` defaults ON, so the header's former claim that
 // "nothing READS the result yet" is false.
 //
-// What IS still off is the narrower thing — `pgShapedCollapse`
-// (`GOOPG_PGSHAPED_COLLAPSE`, `v == "1"`, default off) gates only explicit
-// INNER JOIN FLATTENING. So production consumes a joinlist whose SHAPE is
-// today's (a JOIN chain still enters as one opaque item) via a live reader.
-// Do not read "the collapse flag is off" as "this file cannot move a plan".
+// What was still off until take2 P0-13 is the narrower thing —
+// `pgShapedCollapse` (`GOOPG_PGSHAPED_COLLAPSE`, `=0` opts out, default on
+// since P0-13) gates only explicit INNER JOIN FLATTENING. With it on, an
+// explicit JOIN chain flattens into the enclosing search problem instead of
+// entering as one opaque item. Do not read the pre-flip history ("the
+// collapse flag is off") as "this file cannot move a plan".
 //
 // The pass is pure, allocation-light and cannot fail — it has no error return
 // because there is no malformed FROM clause it could reject that the parser
@@ -149,7 +150,9 @@ var pgShapedCollapse = pgShapedCollapseFromEnv(os.Getenv("GOOPG_PGSHAPED_COLLAPS
 // pgShapedCollapseFromEnv is the flag's polarity, factored out so the
 // provenance table (flaglabels.go) can render the unset default from the same
 // function production resolves it with — mirrors pgShapedDPFromEnv.
-func pgShapedCollapseFromEnv(v string) bool { return v == "1" }
+// Default ON since take2 P0-13: the positive-control gate (TPC-H changed=0,
+// exactly TPC-DS {Q72,Q75} moved) cleared it; `=0` opts back out.
+func pgShapedCollapseFromEnv(v string) bool { return v != "0" }
 
 // pgShapedCollapseEnabled reports whether explicit INNER JOIN chains flatten
 // into the enclosing search problem. Exposed as a function so the flag keeps a

@@ -450,6 +450,21 @@ func (m *Manager) Exists(rel RelFileNode) bool {
 	return err == nil
 }
 
+// CreateFile eagerly creates rel's main-fork file on disk with zero blocks,
+// mirroring PostgreSQL's smgrcreate call inside RelationCreateStorage
+// (heap_create_with_catalog, heap.c): every heap relation gets an on-disk
+// file at CREATE TABLE time, whether or not any row is ever written. Without
+// this, relFile's O_CREATE-on-first-touch semantics leave a genuinely-empty,
+// never-written table with NO backing file — indistinguishable from a file
+// removed after having data, which made the Exists-based missing-fork check
+// (added for the pg_amcheck file-removal corruption scenario) misreport a
+// healthy empty table as corrupt. It is idempotent: relFile's cache and
+// O_CREATE open both no-op on a file that already exists. M0119-0006.
+func (m *Manager) CreateFile(rel RelFileNode) error {
+	_, err := m.relFile(rel)
+	return err
+}
+
 // RelPath returns rel's fork path relative to the data directory, using forward
 // slashes (e.g. "base/5/16407"). It mirrors PostgreSQL's relpath() so callers
 // can build the upstream-verbatim `could not open file "%s"` message when a

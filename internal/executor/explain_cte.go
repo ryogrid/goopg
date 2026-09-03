@@ -105,6 +105,13 @@ func collectCTEHoist(root optimizer.Node) *cteHoist {
 			return
 		}
 		if scan, ok := n.(*optimizer.CTEScan); ok && scan.Child != nil {
+			if isRecursiveSelfRef(scan) {
+				// The recursive self-reference (with.go registers the working
+				// table as the CTE body while planning the recursive term).
+				// PG renders it as a leaf WorkTable Scan with NO section of
+				// its own; claiming one here prints `CTE <name>` twice.
+				return
+			}
 			key := scan.DeclKey()
 			if _, claimed := h.byDecl[key]; claimed {
 				// A second reference to an already-claimed name. Do NOT

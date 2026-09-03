@@ -89,53 +89,32 @@ const q85SQL = `select 1
 	   and wr_returned_date_sk = d_date_sk
 	   and r_reason_sk = wr_reason_sk`
 
-// TestJoinOrderQ85AliasTieIsDeterministic re-plans Q85's FROM list many
-// times IN-PROCESS. Go randomises map iteration order on every `range`,
-// so a map-order-dependent tie-break diverges within a single process
-// and does not need an actual server restart to reproduce — that is why
-// this runs as a unit test rather than as a three-restart shell probe.
+// TestPlanQ85IsDeterministic runs the WHOLE planner on Q85 repeatedly and
+// compares alias-bearing fingerprints: any map-order-dependent site in the
+// planner fails here.
 //
-// 200 iterations makes a 50/50 flip a ~1-in-2^199 miss.
-func TestJoinOrderQ85AliasTieIsDeterministic(t *testing.T) {
+// It was written as the end-to-end guard behind two FROM-order tests that
+// take2 P3-12 deleted with reorderCommaFromByCardinality. The property it
+// guards — a plan does not depend on Go map iteration order — is independent
+// of that reorder and outlives it, so this one stays.
+func TestPlanQ85IsDeterministic(t *testing.T) {
 	c := tpcdsQ85Catalog(t)
-	var first []string
-	for i := 0; i < 200; i++ {
-		stmt := parseOne(t, q85SQL).(*parser.SelectStmt)
-		_, newFR, rewrote := reorderCommaFromByCardinality(stmt, c)
-		if !rewrote {
-			t.Fatalf("iteration %d: expected Q85's list to be reordered", i)
+	var first string
+	for i := 0; i < 100; i++ {
+		node, err := Plan(parseOne(t, q85SQL), c)
+		if err != nil {
+			t.Fatalf("iteration %d: Plan: %v", i, err)
 		}
-		got := fromNames(t, newFR)
-		if first == nil {
+		got := planFingerprint(node)
+		if i == 0 {
 			first = got
 			continue
 		}
-		for k := range first {
-			if got[k] != first[k] {
-				t.Fatalf("iteration %d: FROM order %v, first iteration gave %v"+
-					" — the permutation depends on map iteration order", i, got, first)
-			}
+		if got != first {
+			t.Fatalf("iteration %d: plan differs from the first iteration"+
+				"\n--- first ---\n%s\n--- got ---\n%s", i, first, got)
 		}
 	}
-}
-
-// TestJoinOrderQ85AliasTieBreaksOnSourceOrder pins WHICH of the two
-// permutations the total order must produce. Ties break on the FROM
-// index, so `cd1` — written first in the query — is placed first. That
-// choice is not arbitrary: it matches the rule `smallestUnused` and
-// `orderByConnectivity` already used ("ties broken by lowest index"),
-// so all three pickers in this file now share one tie-break.
-func TestJoinOrderQ85AliasTieBreaksOnSourceOrder(t *testing.T) {
-	c := tpcdsQ85Catalog(t)
-	stmt := parseOne(t, q85SQL).(*parser.SelectStmt)
-	_, newFR, rewrote := reorderCommaFromByCardinality(stmt, c)
-	if !rewrote {
-		t.Fatalf("expected Q85's list to be reordered")
-	}
-	assertOrder(t, fromNames(t, newFR), []string{
-		"reason", "web_returns", "customer_address", "date_dim",
-		"web_sales", "web_page", "cd1", "cd2",
-	})
 }
 
 // planFingerprint renders a whole plan tree as a stable string, by
@@ -191,56 +170,4 @@ func planFingerprint(n Node) string {
 	}
 	walk(reflect.ValueOf(n), 0)
 	return b.String()
-}
-
-// TestPlanQ85IsDeterministic is the end-to-end guard behind the two
-// FROM-order tests: it runs the WHOLE planner on Q85 repeatedly and
-// compares alias-bearing fingerprints, so a second map-order-dependent
-// site anywhere downstream of the reorder would fail here even though
-// the FROM permutation itself is now stable.
-func TestPlanQ85IsDeterministic(t *testing.T) {
-	c := tpcdsQ85Catalog(t)
-	var first string
-	for i := 0; i < 100; i++ {
-		node, err := Plan(parseOne(t, q85SQL), c)
-		if err != nil {
-			t.Fatalf("iteration %d: Plan: %v", i, err)
-		}
-		got := planFingerprint(node)
-		if i == 0 {
-			first = got
-			continue
-		}
-		if got != first {
-			t.Fatalf("iteration %d: plan differs from the first iteration"+
-				"\n--- first ---\n%s\n--- got ---\n%s", i, first, got)
-		}
-	}
-}
-
-// TestPickNextByEdgeTieBreaksOnIndex is the defect at its own level:
-// two unplaced relations with EQUAL row counts, both edge-connected to
-// the placed one. Called directly and repeatedly so the failure names
-// `pickNextByEdge` rather than a whole permutation, and so the guard
-// survives if Q85's fixture is ever retuned above.
-func TestPickNextByEdgeTieBreaksOnIndex(t *testing.T) {
-	// rel 0 is placed; rels 1 and 2 tie at 100 rows and both have an
-	// edge to rel 0.
-	rowCounts := []int64{10, 100, 100}
-	edges := []map[int]struct{}{
-		{1: {}, 2: {}},
-		{0: {}},
-		{0: {}},
-	}
-	for i := 0; i < 200; i++ {
-		used := []bool{true, false, false}
-		got, ok := pickNextByEdge([]int{0}, used, edges, rowCounts)
-		if !ok {
-			t.Fatalf("iteration %d: expected an edge-connected candidate", i)
-		}
-		if got != 1 {
-			t.Fatalf("iteration %d: pickNextByEdge = %d, want 1 (lowest index"+
-				" among equal row counts)", i, got)
-		}
-	}
 }
