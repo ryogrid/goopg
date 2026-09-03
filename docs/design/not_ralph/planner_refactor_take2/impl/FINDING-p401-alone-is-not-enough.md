@@ -71,6 +71,29 @@ it is co-dominant with it for this particular goal.
    Once `neededCols` is consulted at the join levels, re-run this table with the
    collector's real answer before trusting the 2–4× figure.
 
+## Two cheap alternatives, ruled out
+
+Before accepting that the 48 bytes are real work rather than a modelling
+artefact, both easier explanations were checked:
+
+1. **"The cost model overstates the runtime footprint."** It does not.
+   `unsafe.Sizeof(Datum{})` is **48** and `unsafe.Sizeof(Row{})` is **24**, so
+   `EntryBytes = ncols×48 + 24 + avgVarBytes` is a faithful model of what the
+   executor actually allocates. The planner is not over-pricing hash builds; the
+   memory is really there.
+2. **"Then just shrink `Datum`."** Already done, and pinned. The layout
+   (`datum.go:171-187`) packs `Kind`/`Flags`/`ArenaID`/`Scale`/`TimeSub` into
+   the first 8 bytes — `Kind` was narrowed from `int` to a 1-byte
+   `DatumKind` at M0107-0002 — and a compile-time assertion
+   (`const _ uintptr = 48 - unsafe.Sizeof(Datum{})`) holds it at exactly 48. The
+   largest remaining field is the 24-byte `Buf []byte` slice header, which is
+   what makes a `Datum` self-describing.
+
+So the lever is not the width of a `Datum`; it is **not storing `[]Datum` rows
+in the hash table at all** — PostgreSQL stores a packed `MinimalTuple`, goopg
+stores a tagged-union array. That is the shape of the change, and it is why this
+is a genuine subsystem item rather than a tuning one.
+
 ## What this does not say
 
 It does not say P4-01 is not worth doing, and it does not say the Datum change
