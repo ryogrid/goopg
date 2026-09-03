@@ -575,6 +575,9 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			rows = 1
 		}
 		joinrel = newRelOptInfo(joinrelids, rows, width)
+		// take2 P4-01 rev 10 step 1: a join rel is built during the search,
+		// after s.neededCols is published, so it takes the set directly.
+		joinrel.NeededCols, joinrel.NeededColsKnown = s.neededCols, s.neededColsKnown
 		// A join row is the concatenation of its two inputs' rows — the
 		// executor's Join emits left++right — so the column count adds
 		// (M0127-P5.7-a).

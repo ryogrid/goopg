@@ -461,3 +461,23 @@ func leafBaseScan(n Node) Node {
 		n = f.Child
 	}
 }
+
+// stampNeededColsOnRels copies the statement's needed-column set onto every rel
+// the search has built so far. take2 P4-01 rev 10 step 1.
+//
+// The set is a statement property, so every rel gets the same map by reference
+// rather than a copy — it is read-only from here on, and `createPlanNode`
+// reaches it through `Path.Rel`.
+func (s *searchCtx) stampNeededColsOnRels() {
+	if s == nil {
+		return
+	}
+	for _, level := range s.joinrels {
+		for _, r := range level {
+			if r == nil {
+				continue
+			}
+			r.NeededCols, r.NeededColsKnown = s.neededCols, s.neededColsKnown
+		}
+	}
+}

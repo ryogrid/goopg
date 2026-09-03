@@ -362,6 +362,11 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
 	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
+	// take2 P4-01 rev 10 step 1: publish the set onto the base rels, AFTER the
+	// assignment above. buildInitialRels ran eight lines earlier and could not
+	// have seen it — that ordering is what made P4-01b's first version silently
+	// dormant, so the stamp is deliberately here and not there.
+	s.stampNeededColsOnRels()
 	s.addBaseRelIndexPaths(prob.cat)
 	// GEQO: when the query has >= geqo_threshold base relations and geqo is
 	// enabled, use the genetic query optimizer instead of the DP search.

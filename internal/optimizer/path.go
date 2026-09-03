@@ -237,6 +237,24 @@ type RelOptInfo struct {
 	// that does not care, which `relNCols` reads as "unknown".
 	NCols int
 
+	// NeededCols / NeededColsKnown carry the statement's needed-column set down
+	// to createPlan time, where `Path.Rel` is the only route to it:
+	// `createPlanNode` is a free function with no searchCtx, threading a
+	// parameter through every arm is churn, and a package global is what the
+	// P2-A review rejected for reading another session's state. So it travels
+	// as DATA on the rel, the way NCols and AvgVarBytes already do.
+	//
+	// take2 P4-01 rev 10 step 1. Nothing reads these yet — the consumer is the
+	// build-side narrowing in `joinInputsFor`, which lands behind
+	// GOOPG_NARROW_BUILD in a later slice. Added first, and separately, so that
+	// commit changes one thing.
+	//
+	// NeededColsKnown false means "no information": the collector declined the
+	// statement, and no narrowing may be attempted. It is NOT the same as an
+	// empty set.
+	NeededCols      map[string]bool
+	NeededColsKnown bool
+
 	// AvgVarBytes is the average total variable-width payload per row, in
 	// bytes — the sum of the per-column average widths (ColumnStats.AvgWidth)
 	// across every column of this relation. It feeds `hashsize.EntryBytes` as

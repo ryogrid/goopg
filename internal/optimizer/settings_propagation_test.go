@@ -63,3 +63,56 @@ func TestPlannerSettingsReachSubqueryScan(t *testing.T) {
 		t.Errorf("costParams().workMem fell back to the hard-wired default (%d)", got)
 	}
 }
+
+// TestNeededColsReachTheRelOptInfo pins take2 P4-01 rev 10 step 1.
+//
+// The build-side narrowing lands in `joinInputsFor`, which runs inside
+// `createPlanNode` — a free function with no searchCtx. `Path.Rel` is the only
+// route to the statement's needed-column set from there, so the set has to be
+// published onto the rels.
+//
+// The ORDERING is the point of this test. `buildInitialRels` runs eight lines
+// before `s.neededCols` is assigned (relfromjoinlist.go), so a stamp placed
+// inside it sees nil — which is exactly what made P4-01b's first version
+// silently dormant. This asserts the set is present on the rel a Path points
+// at, which is the only thing the consumer cares about.
+func TestNeededColsReachTheRelOptInfo(t *testing.T) {
+	cat := catalog.NewInMemory()
+	for _, tbl := range []string{"nc_a", "nc_b"} {
+		if _, err := cat.CreateTable(parser.ObjectName{Name: tbl}, []catalog.Column{
+			{Name: tbl + "_k", Type: catalog.Type{Name: "int4"}},
+			{Name: tbl + "_v", Type: catalog.Type{Name: "int4"}},
+			{Name: tbl + "_unused", Type: catalog.Type{Name: "int4"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stmts, err := parser.Parse(
+		"select nc_a.nc_a_v from nc_a, nc_b where nc_a.nc_a_k = nc_b.nc_b_k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel := stmts[0].(*parser.SelectStmt)
+
+	// What the collector says for this statement, independently of the search.
+	names, known := neededColumnNames(sel)
+	if !known {
+		t.Fatal("collector declined a plain two-table join; the fixture is wrong")
+	}
+	// The unused columns must NOT be in the set, or narrowing would be a no-op.
+	for _, unused := range []string{"nc_a_unused", "nc_b_unused"} {
+		if names[unused] {
+			t.Errorf("%q is in the needed set but no clause references it", unused)
+		}
+	}
+	for _, needed := range []string{"nc_a_v", "nc_a_k", "nc_b_k"} {
+		if !names[needed] {
+			t.Errorf("%q is referenced by the statement but missing from the needed set", needed)
+		}
+	}
+
+	if _, err := PlanWithSettings(sel, cat, DefaultPlannerSettings()); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+}
