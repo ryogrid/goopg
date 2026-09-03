@@ -70,14 +70,7 @@ claimed.
 - [x] EX0-03c Minimal `sortOp` method/space counters — this commit; gates: 7 tests (serial main line, parallel worker lines count==launched, rescan reset, failed-Open nothing, spill external-merge, worker-0 promotion, empty-carrier byte-identical), executor suite green, `-race` clean; artifacts: `internal/executor/{operators,context,parallel_worker_ctx,operators_gather,operators_gather_merge,parallel_hash_build,operators_explain}.go`, `internal/executor/explain_sort_workers_test.go`
 - [x] EX0-04 Per-operator timing harness — this commit; gates: Q6 anchor re-cut ×3 (residual-ratio 11.3% mean, null control clean, values identical), slices published Q6/Q9/Q13/Q4/Q7 + G-EX6 remainder list (decode: int/float 66%, numeric 32%), plan-gate 22/22 MATCH changed=0; artifacts: `bench/tpch/profile_slices.sh`, `bench/tpch/profile_slices_classify.py`, `analysis/executor-refactor/ex0-04-20260903/README.md`
 - [x] EX0-05 Batch/width counters — this commit; gates: Q9 both arms report (witness Batches: 2, widths ~700–1100, no width≈6 degenerate), tripwire fired once (lazy-map build Build-Time-only → ledgered `take3-EX0-lazy-hash-geometry`, non-witness, gate unaffected), plan-gate 22/22 MATCH; artifacts: `analysis/executor-refactor/ex0-05-20260903/README.md` (+1 ledger row)
-- [ ] EX0-06 Re-baseline the Q6 chain end-to-end under the protocol —
-      serial 3.792 s / parallel 0.838 s (take7) re-measured with timing +
-      alloc arms + headers — and record per-query timing+alloc baselines
-      on both suites (TPC-H SF=1 + TPC-DS SF0.5, same protocol). The Q6
-      chain is the executor baseline every later item diffs against; the
-      per-query tables are E1's denominator.
-      *design: 13 §2.3; gate: conforming artifact (Q6 chain + per-query
-      tables both suites), no behaviour change.*
+- [x] EX0-06 Re-baseline the Q6 chain end-to-end under the protocol — this commit; gates: Q6 serial 5.48 s + parallel 2.25 s (full capture sets), TPC-H per-query tables (252 s / 284 s), TPC-DS SF0.5 both arms PASS=95 (986.2 s / 996.5 s, ms-stamped), no behaviour change (sweep ms-patch is harness-additive); artifacts: `analysis/executor-refactor/ex0-06-20260903/README.md`
 
 Landed foundations (record, not work):
 
