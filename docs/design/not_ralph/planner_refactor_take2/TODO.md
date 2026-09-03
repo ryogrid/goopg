@@ -1450,8 +1450,25 @@ difference explained and timed.
       boundary assertions. This deletes the project's largest silent
       wrong-answer bug class. *design: 08 §9.2; gate: value-level
       `tpch-runner -diff`, never row counts (risk R5).*
-- [ ] **P6-03** Delete `rewriteScanInputsWithSingleTablePredicates`.
+- [-] **P6-03** Delete `rewriteScanInputsWithSingleTablePredicates`.
       *design: 08 §9.3; gate: byte-identical plans.*
+      **ATTEMPTED 2026-09-03 — the pass is LOAD-BEARING and the gate fails
+      decisively.** It is not a legacy leftover the search has superseded.
+      The unit suite catches it first:
+      `TestIndexKeyRangeCorrelationStaysSubPlan` fails with "range-correlated
+      EXISTS must NOT decorrelate to a semi/anti join".
+      The item's own gate — byte-identical plans — then fails on TPC-H Q20:
+      cost **16035.65 -> 104591.20**, 6.5x, and the correlated SubPlan's
+      `Index Cond: (l_partkey = $1)` with its `l_suppkey = $0 AND l_shipdate
+      ...` filter collapses to `Filter: (true)`. The pass is what pushes a
+      correlated predicate into the scan input so the probe can use an index;
+      without it the predicate is lost and the subplan degenerates.
+      This is one of the four passes joinsearchseam.go:127 lists as REWRITING a
+      searched tree, and it correctly skips searched subtrees — so what it still
+      serves is the shapes the search declines, which is exactly why deleting it
+      is not neutral. Retiring it needs the costed producers to cover the
+      correlated-scan-input case first, which is Phase 4 work, not a Phase 6
+      cleanup.
 - [ ] **P6-04** Delete `rewriteJoinsToNLI` and `GOOPG_NLI_COSTGATE`.
       *design: 08 §9.3; depends on P3-11.*
 - [-] **P6-05** Delete the dead `reconcileNLILayout`. *design: 08 §9.3.*
