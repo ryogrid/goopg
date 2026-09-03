@@ -629,6 +629,20 @@ slower than 1.2×, S-cold/WARM gap narrows.
       zero LIKE clauses — mechanically unreachable by this change, which
       fires only on those opcodes and touches no shared function),
       spotcheck Q12=2/Q13=34.
+      **Row-constructor comparison (`rowcomparesel`) LANDED this commit:**
+      `(a,…) OP (b,…)` resolves to a scalar `BinaryOp` with row operands
+      (probed live) that every estimator arm declined to the generic
+      default. Now the leading pair estimates as an ordinary scalar
+      comparison in `clauseSelectivity` AND the `WithSource` twin
+      (reliability = the delegated estimator's), mirroring PG's
+      first-columns-only rule; row-vs-scalar, empty rows and
+      non-comparison ops decline to each operator's pre-existing default,
+      and join-side row comparisons stay as they were. Gates: 2 unit
+      tests (leading-pair MCV hit + scalar-range equivalence + twin
+      agreement; decline pins), optimizer suite, units gate, regress 4/52
+      identical set (join/window sizes byte-identical to the pre-change
+      run; upstream row-ctor WHEREs sit inside already-failing cases
+      whose verdicts cannot worsen), spotcheck Q12=2/Q13=34.
       **Scalar-array combining (`scalararraysel`) LANDED this commit:** the
       `InExpr` arm ignored `AnyOp`/`AllOp`/`NotEqualAny` and summed
       equality selectivities for every list form — wrong estimator for

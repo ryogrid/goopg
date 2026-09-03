@@ -446,3 +446,68 @@ func TestScalarArrayNonEqualityRoutesByOperator(t *testing.T) {
 		t.Errorf("c != ANY(a,b) = %v, want 0.94", got)
 	}
 }
+
+// P1-14b rowcomparesel slice: a row-constructor comparison estimates from
+// its LEADING pair as an ordinary scalar comparison (selfuncs.c:2204).
+func TestRowCompareSelectivityLeadingPair(t *testing.T) {
+	tbl := makeStatsTable(&catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{
+			{NDistinct: 100, NullFrac: 0,
+				MCV:       []catalog.MCVEntry{{Value: "1", Frequency: 0.25}},
+				Histogram: []string{"1", "100", "200", "300", "400", "500"}},
+			{NDistinct: 10, NullFrac: 0},
+		},
+	}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "b", Type: catalog.Type{Name: "int4"}, Ordinal: 1},
+	})
+	ca := &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}}
+	cb := &ColumnRef{Index: 1, Name: "b", Type: catalog.Type{Name: "int4"}}
+	row := func(x, y Expr) *RowExpr { return &RowExpr{Elems: []Expr{x, y}} }
+	one := &IntegerConst{Value: 1}
+	two := &IntegerConst{Value: 2}
+
+	// Equality on the leading pair: MCV hit 0.25; later pairs ignored.
+	eq := &BinaryOp{Op: parser.OpEq, Left: row(ca, cb), Right: row(one, two)}
+	if got := clauseSelectivity(eq, &SeqScan{Table: tbl}); math.Abs(got-0.25) > 1e-9 {
+		t.Errorf("(a,b)=(1,2) = %v, want leading-pair MCV 0.25", got)
+	}
+	// Inequality routes through the range estimator: pin structural
+	// equivalence with the scalar call, not a golden.
+	gt := &BinaryOp{Op: parser.OpGt, Left: row(ca, cb), Right: row(one, two)}
+	want := rangeOpSelectivity(parser.OpGt, ca, one, &SeqScan{Table: tbl})
+	if got := clauseSelectivity(gt, &SeqScan{Table: tbl}); got != want {
+		t.Errorf("(a,b)>(1,2) = %v, want scalar range %v", got, want)
+	}
+	// Twin agrees and reports reliable with stats.
+	est := clauseSelectivityWithSource(eq, &SeqScan{Table: tbl})
+	if !est.reliable || math.Abs(est.value-0.25) > 1e-9 {
+		t.Errorf("twin (a,b)=(1,2) = %+v, want {0.25 true}", est)
+	}
+}
+
+// Non-row shapes decline to the pre-existing default: row-vs-scalar,
+// empty rows, and non-comparison operators over rows.
+func TestRowCompareSelectivityDeclines(t *testing.T) {
+	tbl := makeStatsTable(&catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{{NDistinct: 100, NullFrac: 0}},
+	}, []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0}})
+	ca := &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}}
+	row := func(x, y Expr) *RowExpr { return &RowExpr{Elems: []Expr{x, y}} }
+	one := &IntegerConst{Value: 1}
+	for _, tc := range []struct {
+		name string
+		expr Expr
+		want float64
+	}{
+		{"row-vs-scalar", &BinaryOp{Op: parser.OpEq, Left: row(ca, one), Right: one}, defaultEqSelectivity},
+		{"empty-row", &BinaryOp{Op: parser.OpEq, Left: &RowExpr{}, Right: row(ca, one)}, defaultEqSelectivity},
+		{"non-comparison", &BinaryOp{Op: parser.OpLike, Left: row(ca, one), Right: row(ca, one)}, defaultMatchSelectivity},
+	} {
+		if got := clauseSelectivity(tc.expr, &SeqScan{Table: tbl}); got != tc.want {
+			t.Errorf("%s = %v, want default %v", tc.name, got, tc.want)
+		}
+	}
+}

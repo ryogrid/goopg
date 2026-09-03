@@ -33,6 +33,12 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 	}
 	switch e := expr.(type) {
 	case *BinaryOp:
+		// Row-constructor comparison: estimate from the leading pair
+		// (take2 P1-14b, rowcomparesel). Checked before the operator
+		// dispatch because the operands are rows, not scalars.
+		if sel, ok := rowCompareSelectivity(e.Op, e.Left, e.Right, child); ok {
+			return sel
+		}
 		switch e.Op {
 		case parser.OpAnd:
 			// Independence is upstream's default for UNRELATED clauses, but
@@ -166,6 +172,65 @@ func inListElementSelectivity(e *InExpr, cr *ColumnRef, elem Expr, stats *catalo
 		return patternClauseSelectivity(e.AnyOp, cr, elem, child)
 	default:
 		return defaultGenericSelectivity
+	}
+}
+
+// rowCompareLeadingPair returns the leading elements when both sides of
+// a comparison are non-empty row constructors — the only input PG's
+// rowcomparesel uses. Anything else (row vs scalar, row vs subquery,
+// empty rows) declines to the pre-existing default.
+func rowCompareLeadingPair(left, right Expr) (Expr, Expr, bool) {
+	lr, ok := left.(*RowExpr)
+	if !ok || len(lr.Elems) == 0 {
+		return nil, nil, false
+	}
+	rr, ok := right.(*RowExpr)
+	if !ok || len(rr.Elems) == 0 {
+		return nil, nil, false
+	}
+	return lr.Elems[0], rr.Elems[0], true
+}
+
+// rowCompareSelectivity estimates `(a, ...) OP (b, ...)` from the LEADING
+// pair alone as an ordinary scalar comparison, mirroring rowcomparesel
+// (selfuncs.c:2204): refining with later columns would need multi-column
+// statistics goopg does not keep. Join-side row comparisons stay as they
+// were — this covers the restriction path the item scopes.
+func rowCompareSelectivity(op parser.OpCode, left, right Expr, child Node) (float64, bool) {
+	l, r, ok := rowCompareLeadingPair(left, right)
+	if !ok {
+		return 0, false
+	}
+	switch op {
+	case parser.OpEq:
+		return eqOpSelectivity(l, r, child), true
+	case parser.OpNe:
+		return 1 - eqOpSelectivity(l, r, child), true
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return rangeOpSelectivity(op, l, r, child), true
+	default:
+		return 0, false
+	}
+}
+
+// rowCompareSelectivityWithSource is the reliability-tracking twin: the
+// delegated estimator's reliability is the answer's.
+func rowCompareSelectivityWithSource(op parser.OpCode, left, right Expr, child Node) (selectivityEstimate, bool) {
+	l, r, ok := rowCompareLeadingPair(left, right)
+	if !ok {
+		return selectivityEstimate{}, false
+	}
+	switch op {
+	case parser.OpEq, parser.OpNe:
+		est := eqOpSelectivityWithSource(l, r, child)
+		if op == parser.OpNe {
+			return selectivityEstimate{value: 1 - est.value, reliable: est.reliable}, true
+		}
+		return est, true
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return rangeOpSelectivityWithSource(op, l, r, child), true
+	default:
+		return selectivityEstimate{}, false
 	}
 }
 
@@ -579,6 +644,11 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 	}
 	switch e := expr.(type) {
 	case *BinaryOp:
+		// Same row-constructor check as clauseSelectivity above, through
+		// the reliability-tracking estimators.
+		if est, ok := rowCompareSelectivityWithSource(e.Op, e.Left, e.Right, child); ok {
+			return est
+		}
 		switch e.Op {
 		case parser.OpAnd:
 			a := clauseSelectivityWithSource(e.Left, child)
