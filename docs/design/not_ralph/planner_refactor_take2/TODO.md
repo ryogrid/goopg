@@ -627,8 +627,22 @@ slower than 1.2×, S-cold/WARM gap narrows.
       gate, regress 4/52 identical set (join/window diffs show run-to-run
       nondeterministic flips in queries containing zero boolean-test and
       zero LIKE clauses — mechanically unreachable by this change, which
-      fires only on those opcodes and touches no shared function),
-      spotcheck Q12=2/Q13=34.
+       fires only on those opcodes and touches no shared function),
+       spotcheck Q12=2/Q13=34.
+      **Column-to-nonconst equality (`var_eq_non_const`) LANDED this
+      commit:** `col = col` / `col = expr` fell through to flat 0.005
+      (5000x over on unique keys, 100x under on booleans). Now delegates to
+      the EXISTING port in `pathparamindex.go` (found mid-implementation;
+      the first draft duplicated it and was replaced — no second formula)
+      in both estimator arms. Its no-stats branch (1/200) coincides with
+      the old default, so previously-unestimated shapes keep bit-identical
+      numbers. Gates: 3 unit tests (ndistinct split, MCV cap, defaults),
+      optimizer suite, units gate, regress 4/52 identical set, spotcheck
+      Q12=2/Q13=34. Regress note: join/window diffs churn between runs in
+      queries with no boolean/LIKE clauses; an A/A rerun on the same tree
+      confirms run-to-run flips — the runner performs no ANALYZE while
+      autoanalyze (60s naptime) can fire mid-run, so stats presence (and
+      every stats-gated estimator, not just this one) varies by timing.
 
 ### 1e — Join selectivity
 

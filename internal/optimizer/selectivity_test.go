@@ -305,3 +305,65 @@ func TestBoolTestSelectivityDefaults(t *testing.T) {
 		t.Errorf("non-column IS TRUE = %v, want default %v", got, defaultGenericSelectivity)
 	}
 }
+
+// P1-14b var_eq_non_const slice: column-to-nonconst equality splits the
+// non-null mass across the distinct count, capped at the top MCV
+// frequency — not the flat 0.005 the fallthrough used for every shape.
+func TestVarEqNonConstSplitsByNDistinct(t *testing.T) {
+	tbl := makeStatsTable(&catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{
+			{NDistinct: 100, NullFrac: 0.1},
+		},
+	}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "b", Type: catalog.Type{Name: "int4"}, Ordinal: 1},
+	})
+	ca := &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}}
+	cb := &ColumnRef{Index: 1, Name: "b", Type: catalog.Type{Name: "int4"}}
+	// (1 - 0.1) / 100 = 0.009, resolved against the LEFT column.
+	got := clauseSelectivity(&BinaryOp{Op: parser.OpEq, Left: ca, Right: cb}, &SeqScan{Table: tbl})
+	if math.Abs(got-0.009) > 1e-9 {
+		t.Errorf("col=col selectivity = %v, want 0.009", got)
+	}
+	est := clauseSelectivityWithSource(&BinaryOp{Op: parser.OpEq, Left: ca, Right: cb}, &SeqScan{Table: tbl})
+	if !est.reliable || math.Abs(est.value-0.009) > 1e-9 {
+		t.Errorf("WithSource col=col = %+v, want {0.009 true}", est)
+	}
+}
+
+// The MCV cross-check caps the answer at the commonest value: raw
+// (1-0)/2 = 0.5 must not exceed MCV frequency 0.4.
+func TestVarEqNonConstCappedByMCV(t *testing.T) {
+	tbl := makeStatsTable(&catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{
+			{NDistinct: 2, NullFrac: 0,
+				MCV: []catalog.MCVEntry{{Value: "7", Frequency: 0.4}}},
+		},
+	}, []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0}})
+	ca := &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}}
+	cb := &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}}
+	if got := clauseSelectivity(&BinaryOp{Op: parser.OpEq, Left: ca, Right: cb}, &SeqScan{Table: tbl}); math.Abs(got-0.4) > 1e-9 {
+		t.Errorf("MCV-capped col=col = %v, want 0.4", got)
+	}
+}
+
+// No statistics, or no column on either side: the pre-existing default,
+// reported unreliable by the twin.
+func TestVarEqNonConstDefaults(t *testing.T) {
+	bare := makeStatsTable(nil, []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0}})
+	ca := &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}}
+	cb := &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}}
+	expr := &BinaryOp{Op: parser.OpEq, Left: ca, Right: cb}
+	if got := clauseSelectivity(expr, &SeqScan{Table: bare}); got != defaultEqSelectivity {
+		t.Errorf("no-stats col=col = %v, want default %v", got, defaultEqSelectivity)
+	}
+	if est := clauseSelectivityWithSource(expr, &SeqScan{Table: bare}); est.reliable {
+		t.Errorf("no-stats col=col marked reliable: %+v", est)
+	}
+	nocol := &BinaryOp{Op: parser.OpEq, Left: &IntegerConst{Value: 1}, Right: &IntegerConst{Value: 2}}
+	if got := clauseSelectivity(nocol, &SeqScan{Table: bare}); got != defaultEqSelectivity {
+		t.Errorf("const=const = %v, want default %v", got, defaultEqSelectivity)
+	}
+}

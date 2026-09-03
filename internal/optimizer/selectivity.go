@@ -116,6 +116,18 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 func eqOpSelectivity(left, right Expr, child Node) float64 {
 	col, val, ok := normalizeColumnConst(left, right)
 	if !ok {
+		// `col = <non-const>`: column-column and column-expression
+		// equality (take2 P1-14b). This delegates to the existing
+		// var_eq_non_const port rather than open-coding it a second
+		// time — its no-statistics branch returns 1/200, which IS the
+		// old default (defaultEqSelectivity), so the delegation is
+		// bit-identical where there are no statistics and
+		// stats-driven where there are.
+		if cr, isCol := left.(*ColumnRef); isCol {
+			return varEqNonConstSelectivity(columnStatsForChild(cr.Index, child), columnRawRowsForChild(cr.Index, child))
+		} else if cr, isCol := right.(*ColumnRef); isCol {
+			return varEqNonConstSelectivity(columnStatsForChild(cr.Index, child), columnRawRowsForChild(cr.Index, child))
+		}
 		return defaultEqSelectivity
 	}
 	stats := columnStatsForChild(col.Index, child)
@@ -575,6 +587,17 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 func eqOpSelectivityWithSource(left, right Expr, child Node) selectivityEstimate {
 	col, val, ok := normalizeColumnConst(left, right)
 	if !ok {
+		// Same delegation as eqOpSelectivity above; reliable iff the
+		// column resolves against statistics.
+		if cr, isCol := left.(*ColumnRef); isCol {
+			if stats := columnStatsForChild(cr.Index, child); stats != nil {
+				return selectivityEstimate{value: varEqNonConstSelectivity(stats, columnRawRowsForChild(cr.Index, child)), reliable: true}
+			}
+		} else if cr, isCol := right.(*ColumnRef); isCol {
+			if stats := columnStatsForChild(cr.Index, child); stats != nil {
+				return selectivityEstimate{value: varEqNonConstSelectivity(stats, columnRawRowsForChild(cr.Index, child)), reliable: true}
+			}
+		}
 		return selectivityEstimate{value: defaultEqSelectivity, reliable: false}
 	}
 	stats := columnStatsForChild(col.Index, child)
