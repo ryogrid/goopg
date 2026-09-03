@@ -759,8 +759,12 @@ func (o *limitOp) tiesRowMatches(row Row) bool {
 // flagged for large sorts.
 type sortOp struct {
 	child Operator
-	keys  []optimizer.SortKey
-	ctx   *Context
+	// plan is the Sort plan node this operator executes. Retained (unlike
+	// the pre-EX0-03c shape that kept only Keys) so Open can publish the
+	// node's EXPLAIN ANALYZE SortStat keyed by plan-node identity.
+	plan *optimizer.Sort
+	keys []optimizer.SortKey
+	ctx  *Context
 
 	// chunk size threshold for triggering a spill. Default 256 MiB.
 	chunkLimitBytes int64
@@ -800,6 +804,15 @@ type sortOp struct {
 	heap       *sortHeap
 	mergeReady bool
 
+	// peakBytes is the high-water mark of the in-memory chunkBytes
+	// accumulator maintained in Open (sampled as rows are pulled, so it
+	// covers both flushed chunks and the final tail). EXPLAIN ANALYZE
+	// reports it as the Memory-form SpaceKB. Reset to 0 at every Open
+	// start — the Stage-9 Close+Open rescan contract, same
+	// unconditionally-correct pattern as distinctOp/limitOp — so a
+	// rescan never carries a stale max. EX0-03c.
+	peakBytes int64
+
 	sortErr error
 }
 
@@ -812,7 +825,28 @@ type sortCTID struct {
 }
 
 func newSortOp(plan *optimizer.Sort, child Operator) *sortOp {
-	return &sortOp{child: child, keys: plan.Keys}
+	return &sortOp{plan: plan, child: child, keys: plan.Keys}
+}
+
+// SortStat is the per-plan-node sort instrumentation EXPLAIN (ANALYZE)
+// reports as PG's `Sort Method:` line, verbatim from show_sort_info
+// (postgres/src/backend/commands/explain.c:3105):
+// `Sort Method: %s  %s: %dkB`.
+//
+// Method is the PG subset goopg can produce (`quicksort` for the fully
+// in-memory path, `external merge` once at least one chunk spilled);
+// SpaceType is `Memory` / `Disk` respectively; SpaceKB is the peak
+// in-memory KiB (peakBytes, rounded up) or, when spilled, the on-disk
+// spill-file sum in KiB (best-effort os.Stat, errors tolerated).
+//
+// Worker tags the execution site, but ONLY inside the leader's
+// SortWorkerStats carrier: the leader's own SortStats entry leaves it
+// zero (the main line never renders it). EX0-03c.
+type SortStat struct {
+	Method    string
+	SpaceType string
+	SpaceKB   int64
+	Worker    int
 }
 
 // sortChunkBytes is the in-memory threshold at which a sort chunk
@@ -832,6 +866,9 @@ func (o *sortOp) chunkLimit() int64 {
 
 func (o *sortOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// Rescan contract (see peakBytes' doc comment): a stale max from a
+	// previous Open must not survive into this one.
+	o.peakBytes = 0
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
@@ -871,6 +908,12 @@ func (o *sortOp) Open(ctx *Context) error {
 		}
 		chunkBytes += estimatedRowBytes(row)
 		pulled++
+		// EX0-03c: track the high-water mark. Sampling the accumulator as
+		// rows are pulled covers both flushed chunks (chunkBytes is at its
+		// max just before each flushChunk) and the final in-memory tail.
+		if chunkBytes > o.peakBytes {
+			o.peakBytes = chunkBytes
+		}
 		if chunkBytes >= limit {
 			if err := o.flushChunk(); err != nil {
 				return err
@@ -890,7 +933,42 @@ func (o *sortOp) Open(ctx *Context) error {
 	if o.sortErr != nil {
 		return o.sortErr
 	}
+	// EX0-03c: publish exactly once, at the end of a successful Open.
+	// Failed Opens (child error, cancel, sort error above) publish
+	// nothing, so their nodes render no `Sort Method:` line. Spilled-ness
+	// is sampled here — the only valid point, since Close clears
+	// spillFiles.
+	o.publishSortStat()
 	return nil
+}
+
+// publishSortStat records this Open's SortStat into the statement's
+// Context map keyed by plan node. The map is allocated lazily so serial
+// statements that never sort (or sorts built without a plan node, as in
+// unit fixtures) cost nothing. Never fails the query: a nil ctx/plan
+// skips, and spill-file sizes are best-effort.
+func (o *sortOp) publishSortStat() {
+	if o.ctx == nil || o.plan == nil {
+		return
+	}
+	st := SortStat{Method: "quicksort", SpaceType: "Memory"}
+	if len(o.spillFiles) > 0 {
+		st.Method, st.SpaceType = "external merge", "Disk"
+		var total int64
+		for _, p := range o.spillFiles {
+			if fi, err := os.Stat(p); err == nil {
+				total += fi.Size()
+			}
+		}
+		st.SpaceKB = (total + 1023) / 1024
+	} else {
+		// kB rounds UP, PG's BYTES_TO_KILOBYTES (same as the hash line).
+		st.SpaceKB = (o.peakBytes + 1023) / 1024
+	}
+	if o.ctx.SortStats == nil {
+		o.ctx.SortStats = make(map[*optimizer.Sort]SortStat)
+	}
+	o.ctx.SortStats[o.plan] = st
 }
 
 // sortKeyVals evaluates every ORDER BY key for one row, once. This is the ONLY

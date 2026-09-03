@@ -150,7 +150,11 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	for i := 0; i < n; i++ {
 		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		o.arenas = append(o.arenas, arena)
-		o.workers = append(o.workers, NewWorkerContext(ctx, arena, o.group.Context()))
+		wctx := NewWorkerContext(ctx, arena, o.group.Context())
+		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
+		// this worker's sort entries with an explicit index.
+		wctx.workerSlot = i
+		o.workers = append(o.workers, wctx)
 		o.chans = append(o.chans, make(chan rowBatch, gatherChanDepth))
 	}
 	o.launched = n

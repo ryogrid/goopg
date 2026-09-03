@@ -67,10 +67,7 @@ claimed.
 - [x] EX0-02 Commit the measurement protocol — `503f12cf7` (design) + conforming artifact this commit; gates: protocol doc merged, `EX0-02-q6-serial-scold` full header (serial 5.48 s, values ×9 identical, alloc 1.06 GB/Q6, perf 56.6B instr/Q6); artifacts: `docs/design/executor-ex0-02-protocol/DESIGN.md`, `analysis/executor-refactor/ex0-02-20260903/README.md`
 - [x] EX0-03 Surface per-worker hash/sort counters in EXPLAIN ANALYZE — this commit; gates: 3 new tests (`TestMergeWorkerContextMaxMergesHashJoinStats`, `TestExplainAnalyzeParallelWorkersLaunchedAndHashMerge`, `TestExplainSerialPlanHasNoWorkersLaunched`), executor suite green, serial plans byte-identical, no timing claim; artifacts: `internal/executor/{parallel_worker_ctx,instrument,context,operators_gather,operators_gather_merge,operators_explain}.go`, `internal/executor/explain_parallel_workers_test.go`
 - [x] EX0-03b Per-worker rows/loops/time lines — this commit; gates: fold unit test (exact carrier) + shape/presence golden (count==launched both runs, SHAPE identical, no exact rows) + empty-carrier byte-identical pin, executor suite green, `-race` clean on all worker tests; artifacts: `internal/executor/{instrument,operators_gather,operators_gather_merge,parallel_hash_build,operators_cte_dml,context,operators_explain}.go`, tests in `explain_parallel_workers_test.go`
-- [ ] EX0-03c Minimal `sortOp` method/space counters with one `Sort
-      Method:` line per worker (PG `explain.c:3125-3166`).
-      *design: executor-ex0-03-workers §2; gate: golden test, pin
-      `changed=0`, no timing claim.*
+- [x] EX0-03c Minimal `sortOp` method/space counters — this commit; gates: 7 tests (serial main line, parallel worker lines count==launched, rescan reset, failed-Open nothing, spill external-merge, worker-0 promotion, empty-carrier byte-identical), executor suite green, `-race` clean; artifacts: `internal/executor/{operators,context,parallel_worker_ctx,operators_gather,operators_gather_merge,parallel_hash_build,operators_explain}.go`, `internal/executor/explain_sort_workers_test.go`
 - [ ] EX0-04 Per-operator timing harness — repeatable breakdown (scan
       decode / prefilter / clone / join-probe / sort-compare / spill write)
       on Q6-class, Q9-class, Q4/Q7/Q13-class shapes. Validate against the

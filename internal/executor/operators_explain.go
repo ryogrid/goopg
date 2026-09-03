@@ -119,7 +119,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats)
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -230,6 +230,13 @@ func formatHashJoinInfoLine(hs *HashJoinStats) string {
 		parts = append(parts, fmt.Sprintf("Build Time: %.3f ms", float64(hs.BuildTimeNs)/1e6))
 	}
 	return strings.Join(parts, "  ")
+}
+
+// formatSortStatLine renders one SortStat in PG's text form, verbatim
+// from show_sort_info (postgres/src/backend/commands/explain.c:3105):
+// `Sort Method: %s  %s: %dkB`. EX0-03c.
+func formatSortStatLine(st SortStat) string {
+	return fmt.Sprintf("Sort Method: %s  %s: %dkB", st.Method, st.SpaceType, st.SpaceKB)
 }
 
 func formatBuffersLine(s *nodeStats) string {
@@ -1168,6 +1175,16 @@ type subPlanReg struct {
 	// `SubPlan N` subtree must render as a leaf too. nil when the plan has
 	// no CTE, and nil-receiver tolerant either way.
 	cte *cteHoist
+	// sortStats / sortWorkers carry EX0-03c's per-Sort execution stats for
+	// this render (the leader's main-line entries and the folded per-worker
+	// carrier). They live here rather than in their own walker parameters
+	// because subPlanReg is already the one piece of per-EXPLAIN state
+	// threaded through every walker call — same reason as rel above — so
+	// the Sort arm stays reachable without re-signaturing the walker. Nil
+	// (or empty) renders no `Sort Method:` lines, so serial plans,
+	// unexecuted nodes, and reg-less callers stay byte-identical.
+	sortStats   map[*optimizer.Sort]SortStat
+	sortWorkers map[*optimizer.Sort][]SortStat
 }
 
 // ancestorNode returns the plan node currently being rendered, or nil.
@@ -1511,8 +1528,10 @@ func schemaColumnNames(n optimizer.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat) {
+	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)}
+	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }
 
 func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
@@ -1668,6 +1687,38 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	if j, isJoin := n.(*optimizer.Join); isJoin && j.Algo == optimizer.JoinAlgoHash {
 		if line := formatHashJoinInfoLine(hashStats[j]); line != "" {
 			*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+		}
+	}
+
+	// EX0-03c: a Sort emits PG's `Sort Method:` line under ANALYZE, text
+	// format only (no JSON twin, same escape clause as EX0-03/03b). The
+	// main line comes from the leader's SortStats entry when present;
+	// with leader non-participation the leader never Opens its Sort, so
+	// worker 0's stats are promoted to the main line instead (PG's
+	// explain.c:3116-3124 rule). Then one flat `Worker N:` line per
+	// carrier entry, sorted by slot (EX0-03b's discipline). No entry
+	// anywhere renders no lines; nil-map reads are safe, so a nil/empty
+	// carrier is unreachable output-wise.
+	if srt, isSort := n.(*optimizer.Sort); isSort && reg != nil {
+		if st, ok := reg.sortStats[srt]; ok {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + formatSortStatLine(st))})
+		} else if ws := reg.sortWorkers[srt]; len(ws) > 0 {
+			promoted := ws[0]
+			for _, w := range ws[1:] {
+				if w.Worker < promoted.Worker {
+					promoted = w
+				}
+			}
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + formatSortStatLine(promoted))})
+		}
+		if ws := reg.sortWorkers[srt]; len(ws) > 0 {
+			ordered := make([]SortStat, len(ws))
+			copy(ordered, ws)
+			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
+			for _, w := range ordered {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
+					"Worker %d:  %s", w.Worker, formatSortStatLine(w)))})
+			}
 		}
 	}
 

@@ -437,7 +437,11 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	for i := 0; i < maxProducers; i++ {
 		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		arenas = append(arenas, arena)
-		workerCtxs = append(workerCtxs, NewWorkerContext(ctx, arena, group.Context()))
+		wctx := NewWorkerContext(ctx, arena, group.Context())
+		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
+		// this producer's sort entries with an explicit index.
+		wctx.workerSlot = i
+		workerCtxs = append(workerCtxs, wctx)
 	}
 
 	// Launch producers.

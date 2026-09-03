@@ -221,6 +221,31 @@ type Context struct {
 	// EX0-03b (new).
 	GatherWorkerStats workerNodeStatsTable
 
+	// SortStats carries the per-Sort ANALYZE counters (method / space),
+	// keyed by plan node like HashJoinStats. Published at the end of a
+	// successful sortOp.Open; failed Opens publish nothing, so their nodes
+	// render no `Sort Method:` line. The leader's own entry renders the
+	// main line; worker entries render the per-worker lines via
+	// SortWorkerStats below. EX0-03c.
+	SortStats map[*optimizer.Sort]SortStat
+
+	// SortWorkerStats carries one entry per worker per executed Sort node,
+	// folded post-join in MergeWorkerContext with each worker's explicit
+	// fan-out slot (never bare call order). Rendered as
+	// `Worker N:  Sort Method: …` lines, sorted by slot at render time —
+	// the same discipline as GatherWorkerStats. The leader's own SortStats
+	// entry is NEVER merged into this list. EX0-03c.
+	SortWorkerStats map[*optimizer.Sort][]SortStat
+
+	// workerSlot is this worker Context's fan-out slot (0..n-1), stamped by
+	// the leader when the worker is created (gatherOp/gatherMergeOp/Open,
+	// parallel_hash_build.go). MergeWorkerContext tags the worker's sort
+	// entries with it — the EX0-03b slot discipline (foldGatherWorkerStats'
+	// explicit index), applied to a per-worker merge call that otherwise
+	// carries no index. A Context that never fanned out reads as slot 0.
+	// EX0-03c.
+	workerSlot int
+
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
 	// pointer (as uintptr). Cleared by the update executor at the start of

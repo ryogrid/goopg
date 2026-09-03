@@ -218,4 +218,21 @@ func MergeWorkerContext(leader, worker *Context) {
 			ls.BuildTimeNs = ws.BuildTimeNs
 		}
 	}
+
+	// EX0-03c: fold the worker's sort instrumentation into the leader
+	// carrier, tagging each entry with the worker's stamped fan-out slot
+	// (ctx.workerSlot) — the EX0-03b slot discipline: an EXPLICIT worker
+	// index on every entry, render-side sorted, never bare call order. A
+	// worker that sorted nothing contributes nothing (its map is nil) and
+	// leaves the leader carrier nil. The leader's own SortStats entry is
+	// NEVER merged into the list: it renders the main line, these render
+	// the per-worker lines.
+	for node, ws := range worker.SortStats {
+		if leader.SortWorkerStats == nil {
+			leader.SortWorkerStats = make(map[*optimizer.Sort][]SortStat)
+		}
+		cp := ws
+		cp.Worker = worker.workerSlot
+		leader.SortWorkerStats[node] = append(leader.SortWorkerStats[node], cp)
+	}
 }
