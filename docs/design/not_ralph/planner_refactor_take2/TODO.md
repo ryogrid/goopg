@@ -627,8 +627,23 @@ slower than 1.2×, S-cold/WARM gap narrows.
       gate, regress 4/52 identical set (join/window diffs show run-to-run
       nondeterministic flips in queries containing zero boolean-test and
       zero LIKE clauses — mechanically unreachable by this change, which
-       fires only on those opcodes and touches no shared function),
-       spotcheck Q12=2/Q13=34.
+      fires only on those opcodes and touches no shared function),
+      spotcheck Q12=2/Q13=34.
+      **Scalar-array combining (`scalararraysel`) LANDED this commit:** the
+      `InExpr` arm ignored `AnyOp`/`AllOp`/`NotEqualAny` and summed
+      equality selectivities for every list form — wrong estimator for
+      non-equality ANY, wrong combinator for ALL, meaningless for `!= ANY`.
+      Now each element routes through its operator's own estimator
+      (equality, range, LIKE-patternsel, else generic default) merged OR
+      (ANY) or AND (ALL) per PG, with PG's disjoint-sum rule for
+      equality-ANY (in-range sums reproduce the old plain sum bit-for-bit;
+      out-of-range falls back to the OR merge instead of capping at 1.0)
+      and OR-of-`<>` for `NotEqualAny`; `NOT IN` negation composes
+      unchanged. Both estimator arms move together. Gates: 3 unit tests
+      (disjoint, out-of-range OR-merge, per-op routing incl. ALL product
+      and `!= ANY`), optimizer suite, units gate, regress 4/52 identical
+      set (join/window delta hunks contain no IN/ANY/ALL constructs —
+      established autoanalyze-timing noise), spotcheck Q12=2/Q13=34.
       **Column-to-nonconst equality (`var_eq_non_const`) LANDED this
       commit:** `col = col` / `col = expr` fell through to flat 0.005
       (5000x over on unique keys, 100x under on booleans). Now delegates to

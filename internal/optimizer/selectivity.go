@@ -90,13 +90,7 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 			return defaultGenericSelectivity
 		}
 		stats := columnStatsForChild(cr.Index, child)
-		var sel float64
-		for _, v := range e.List {
-			sel += eqSelectivityForColumn(stats, v, columnRawRowsForChild(cr.Index, child))
-		}
-		if sel > 1.0 {
-			sel = 1.0
-		}
+		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
 		if e.Negated {
 			return 1 - sel
 		}
@@ -108,6 +102,71 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		return 0.0
 	}
 	return defaultGenericSelectivity
+}
+
+// inListSelectivity estimates `operand <op> ANY|ALL (elements)` by
+// applying the element operator's own estimator per element and merging
+// OR (ANY) or AND (ALL) — PG's scalararraysel (selfuncs.c:1821) structure,
+// reusing goopg's per-operator estimators instead of re-deriving them.
+//
+// `e.AnyOp == 0` (plain IN) means equality; `e.AllOp` selects AND-merging;
+// `e.NotEqualAny` (M0097-0067, `x != ANY`) means each element compares by
+// `<>`. Negation (NOT IN) is applied by the caller, matching the old arm.
+// The equality-ANY disjoint sum is accepted exactly when PG accepts it
+// (in [0,1]); in the common small-sum case that reproduces the old plain
+// sum bit-for-bit, and out-of-range sums fall back to the OR merge.
+func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tuples float64, child Node) float64 {
+	useOr := !e.AllOp
+	isEquality := (e.AnyOp == 0 || e.AnyOp == parser.OpEq) && !e.NotEqualAny
+	isInequality := e.AnyOp == parser.OpNe
+	s1 := 0.0
+	if !useOr {
+		s1 = 1.0
+	}
+	s1disjoint := s1
+	for _, elem := range e.List {
+		s2 := inListElementSelectivity(e, cr, elem, stats, tuples, child)
+		if useOr {
+			s1 = s1 + s2 - s1*s2
+			if isEquality {
+				s1disjoint += s2
+			}
+		} else {
+			s1 = s1 * s2
+			if isInequality {
+				s1disjoint += s2 - 1.0
+			}
+		}
+	}
+	if ((useOr && isEquality) || (!useOr && isInequality)) && s1disjoint >= 0.0 && s1disjoint <= 1.0 {
+		s1 = s1disjoint
+	}
+	return clampProbability(s1)
+}
+
+// inListElementSelectivity prices one `operand <op> element` comparison
+// with the estimator for the element operator: equality reuses the MCV /
+// histogram machinery, ranges reuse the inequality estimator, LIKE reuses
+// patternsel, and anything without an estimator declines to the generic
+// default (PG punts operator-less shapes to 0.5; the file-local default
+// applies here pending P1-14b's DEFAULT_* alignment).
+func inListElementSelectivity(e *InExpr, cr *ColumnRef, elem Expr, stats *catalog.ColumnStats, tuples float64, child Node) float64 {
+	if e.NotEqualAny {
+		// OR of `<>`: one minus the equality mass per element.
+		return 1 - eqSelectivityForColumn(stats, elem, tuples)
+	}
+	switch e.AnyOp {
+	case 0, parser.OpEq:
+		return eqSelectivityForColumn(stats, elem, tuples)
+	case parser.OpNe:
+		return 1 - eqSelectivityForColumn(stats, elem, tuples)
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return rangeOpSelectivity(e.AnyOp, cr, elem, child)
+	case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
+		return patternClauseSelectivity(e.AnyOp, cr, elem, child)
+	default:
+		return defaultGenericSelectivity
+	}
 }
 
 // eqOpSelectivity handles `col = const` (or the swapped `const =
@@ -561,13 +620,7 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 		if stats == nil {
 			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 		}
-		var sel float64
-		for _, v := range e.List {
-			sel += eqSelectivityForColumn(stats, v, columnRawRowsForChild(cr.Index, child))
-		}
-		if sel > 1.0 {
-			sel = 1.0
-		}
+		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
 		if e.Negated {
 			return selectivityEstimate{value: 1 - sel, reliable: true}
 		}

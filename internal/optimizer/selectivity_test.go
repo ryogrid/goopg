@@ -367,3 +367,82 @@ func TestVarEqNonConstDefaults(t *testing.T) {
 		t.Errorf("const=const = %v, want default %v", got, defaultEqSelectivity)
 	}
 }
+
+// P1-14b scalararraysel slice: per-element operator estimators merged
+// OR (ANY) or AND (ALL), with PG's disjoint-sum rule for equality-ANY.
+func saFixture() (*catalog.Table, *ColumnRef) {
+	tbl := makeStatsTable(&catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{
+			{NDistinct: 10, NullFrac: 0,
+				MCV: []catalog.MCVEntry{
+					{Value: "a", Frequency: 0.2},
+					{Value: "b", Frequency: 0.3},
+				}},
+		},
+	}, []catalog.Column{{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0}})
+	return tbl, &ColumnRef{Index: 0, Name: "c", Type: catalog.Type{Name: "text"}}
+}
+
+func TestScalarArrayEqualityANYDisjoint(t *testing.T) {
+	tbl, col := saFixture()
+	// 0.2 + 0.3 = 0.5, in range: the disjoint sum (and the old plain sum).
+	in := &InExpr{Operand: col, List: []Expr{&StringConst{Value: "a"}, &StringConst{Value: "b"}}}
+	if got := clauseSelectivity(in, &SeqScan{Table: tbl}); math.Abs(got-0.5) > 1e-9 {
+		t.Errorf("IN (a,b) = %v, want disjoint 0.5", got)
+	}
+	// NOT IN negates it.
+	nin := &InExpr{Operand: col, List: []Expr{&StringConst{Value: "a"}}, Negated: true}
+	if got := clauseSelectivity(nin, &SeqScan{Table: tbl}); math.Abs(got-0.8) > 1e-9 {
+		t.Errorf("NOT IN (a) = %v, want 0.8", got)
+	}
+}
+
+func TestScalarArrayOutOfRangeFallsBackToORMerge(t *testing.T) {
+	tbl := makeStatsTable(&catalog.TableStats{
+		RowCount: 100000, Analyzed: true,
+		Columns: []catalog.ColumnStats{
+			{NDistinct: 1000, NullFrac: 0,
+				Histogram: []string{"1", "100", "200", "300", "400", "500"}},
+		},
+	}, []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0}})
+	// 1500 distinct non-MCV values at ~0.001 each: disjoint sum 1.5 is out
+	// of range, so the OR merge (~0.777) must win over the old cap-at-1.0.
+	list := make([]Expr, 0, 1500)
+	for i := 0; i < 1500; i++ {
+		list = append(list, &IntegerConst{Value: int64(1000 + i)})
+	}
+	col := &ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}
+	got := clauseSelectivity(&InExpr{Operand: col, List: list}, &SeqScan{Table: tbl})
+	want := 1 - math.Pow(0.999, 1500)
+	if math.Abs(got-want) > 1e-9 {
+		t.Errorf("saturated IN = %v, want OR-merge %v (not the old cap 1.0)", got, want)
+	}
+}
+
+func TestScalarArrayNonEqualityRoutesByOperator(t *testing.T) {
+	tbl, col := saFixture()
+	// `c < ANY('m','z')`: range estimates OR-merged. Each side is priced by
+	// the range estimator, so the result must equal the manual OR merge —
+	// and must NOT equal the equality-sum the old arm computed.
+	lo := rangeOpSelectivity(parser.OpLt, col, &StringConst{Value: "m"}, &SeqScan{Table: tbl})
+	hi := rangeOpSelectivity(parser.OpLt, col, &StringConst{Value: "z"}, &SeqScan{Table: tbl})
+	want := lo + hi - lo*hi
+	in := &InExpr{Operand: col, AnyOp: parser.OpLt,
+		List: []Expr{&StringConst{Value: "m"}, &StringConst{Value: "z"}}}
+	if got := clauseSelectivity(in, &SeqScan{Table: tbl}); math.Abs(got-want) > 1e-9 {
+		t.Errorf("c < ANY = %v, want OR-merged ranges %v", got, want)
+	}
+	// `c = ALL('a','b')`: AND of equalities = product.
+	all := &InExpr{Operand: col, AllOp: true,
+		List: []Expr{&StringConst{Value: "a"}, &StringConst{Value: "b"}}}
+	if got := clauseSelectivity(all, &SeqScan{Table: tbl}); math.Abs(got-0.06) > 1e-9 {
+		t.Errorf("c = ALL(a,b) = %v, want product 0.06", got)
+	}
+	// `c != ANY('a','b')`: OR of inequalities.
+	neq := &InExpr{Operand: col, NotEqualAny: true,
+		List: []Expr{&StringConst{Value: "a"}, &StringConst{Value: "b"}}}
+	if got := clauseSelectivity(neq, &SeqScan{Table: tbl}); math.Abs(got-0.94) > 1e-9 {
+		t.Errorf("c != ANY(a,b) = %v, want 0.94", got)
+	}
+}
