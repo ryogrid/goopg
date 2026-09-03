@@ -49,7 +49,7 @@ not found is listed under Unresolved instead of claimed.
 | M8 | MAJOR | 04 §1 bypass predicate | now 24 planner-input GUCs with the stale `dispatch.go:1975` comment called out | 04:168 |
 | M9 | MAJOR | stale code comments | docs mark each stale site inline; comment edits need code commits | 04:168, 04:514–515; deferred U3 |
 | m10 | minor | 04 §10 `drivingScan` | now SeqScan/BitmapHeapScan/IndexOnlyScan + Filter/Project/join-probe wrappers | 04:447–449; sweep below |
-| m11–m12 | minor | 04 §12.3 / §2.1 enumerations | not re-verified this pass; raw report is the work list | U6 |
+| m11–m12 | minor | 04 §12.3 / §2.1 enumerations | §12.3 now enumerates every defaulting `planSelect` site (CTE/copy/top-level/set-op/scalar + `planSelectWithParent` callers); §2.1 step 9 cites the `unnestPreDPOn` flag + `predp.go:73`, `:424` scoped to the post-pass | 04:554–557; 04:200, 04:202 |
 | m13–m14 | minor | mirror/measurement labels | 06 §12 header notes no 03 counterpart; timings marked as-measured | 06:6, 05:11–12 |
 
 ## Design and sequencing — all 3 blockers + 13 majors applied
@@ -119,13 +119,20 @@ downstream consumers still quoted the old values and were updated here:
   (index-only already admitted).
 - U5 — FIXED post-review — 03 §11 item 6 now cites `plancat.c` +
   `table_block_relation_estimate_size`, aligned with 01:663.
-- U6 — m11/m12 and F18 naming drift were not re-verified in this pass; the
-  raw dotfiles remain the work list for them.
+- U6 — FIXED this pass — m11: Grep confirms `with.go:205/:264/:334/:395`,
+  `copy.go:41`, `planner.go:58/:915/:943/:1047/:10933` all call defaulting
+  `planSelect`, as 04:554–557 enumerates. m12: `unnest.go:424` is the post-pass
+  `unnestSubqueriesInPlan`, the pre-DP flag is `unnestPreDPOn` (`:57`, set at
+  `:45`, read at `:64`), `predp.go:73` the search def — as 04:200 scopes them
+  (post-pass at 04:202). F18: P1-29 wording in 07 §2.1 (07:89) + §5 (07:383),
+  census exclusion rule (07:385–386), README map row (README:47), Status
+  qualification (README:78–79), different-binary caveat (README:15–21) all
+  present.
 
 ## Final verdict
 
 **ACCEPT take3 as the planning baseline.** All three reviewers'
 APPROVE-WITH-CHANGES conditions are met in the documents: PG 8/8, goopg
-M1–M9 + m10/m13/m14 in docs, design F1–F17 in docs. U1–U6 are follow-ups,
+M1–M9 + m10–m14 in docs, design F1–F18 in docs. U1–U5 are follow-ups,
 not blockers — none misstates a mechanism, and each names its file and line.
 Next docs pass should clear U1, U2, U4, U5; code passes own U3.

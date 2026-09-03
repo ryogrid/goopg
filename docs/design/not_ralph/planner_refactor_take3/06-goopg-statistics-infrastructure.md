@@ -23,7 +23,7 @@ scalar) · `71653da23` P1-12/13 (conjunction + RangeQuery pairing) +
 `13430fc3a` P1-14 (nulltestsel) · `b0097a2af` P1-15 (eqjoin MCV) ·
 `ca9328ed0` P1-19 (isunique) · `7ef387324` P1-20 (equiv constants) · P1-25
 (DISTINCT sizing) · `4c8ea479f` P1-26 (resolver collapse) · `86b3b96a2` P1-28
-(correlation view) · `dd22e656c` (ndistinct two-form fix, −8.1%) · P2-03/P2-04
+(correlation view) · `dd22e656c` P1-29 (ndistinct two-form fix, −8.1%) · P2-03/P2-04
 (cache-relevant sizing/guard) · P1-17 verified-satisfied · P1-09
 verified-satisfied · P1-06 declined (exact reltuples kept) · P1-18 blocked on
 P3-04 · P1-21 precondition restated (cap stays).
@@ -77,7 +77,7 @@ identical. Almost certainly every recorded benchmark figure (including the
 remains open but must be re-measured — the wide-text case may behave
 differently now.
 
-### 0.4 NEW: ndistinct was read in one of its two forms (`dd22e656c`)
+### 0.4 NEW: ndistinct was read in one of its two forms (P1-29, `dd22e656c`)
 
 `ColumnStats` stores upstream's one signed `stadistinct` as two fields, and
 both `eqSelectivityForColumn` and `resolveBaseColumn` read the absolute
