@@ -137,12 +137,21 @@ reports `changed=0` against a pre-P0 goopg capture.
       The test needed a *selective* predicate: with a `true` constant
       (selectivity 1.0) it passed with the defect present.
 - [ ] **P0-04d** *(new, landed `2a63fbe21`)* — see the closed entry below.
-- [ ] **P0-04e** `planToJSON` does not collapse `Project`/`Filter` wrappers, so
-      `EXPLAIN (FORMAT JSON)` emits a different TREE from the text walker and
-      from PG, which has no such nodes at all. Found while fixing P0-04b;
-      deliberately not half-fixed there, since the JSON defect is tree shape
-      rather than the row estimate. The parity instrument parses TEXT, so this
-      does not block P0-05/06. *design: impl/P0-A §3.5.*
+- [x] **P0-04e** `planToJSON` collapsed `Project`/`Filter` wrappers —
+      **CLOSED this commit.** FORMAT JSON emitted `[Projection Filter Seq
+      Scan …]` trees (pinned by the new test's negative control) where the
+      text walker and PG have neither node. Fixed by `jsonCollapse`
+      mirroring `walkPlanFiltered` exactly (Project vanishes; OUTERMOST
+      Filter predicate rides as the surviving node's `"Filter"` property
+      with the text walker's qualify rule), one shared name table per plan
+      (a per-node table would qualify differently from text), costs/rows
+      from the text walker's rowSrc node, and stats following VISIBLE nodes
+      in the ANALYZE path. Gates: new tree-agreement test (fails pre-fix
+      with the exact old shape), full executor suite, units gate, spotcheck
+      Q12=2/Q13=34. REMAINING, explicitly out: other JSON-vs-text property
+      gaps (Sort Key / Index Cond / Hash Cond properties are absent from
+      JSON — tree shape only here); verbose `Output` on a collapsed node
+      shows the surviving child's widths.
 - [x] **P0-04c** — `f2ac4fdfc`; gates: `TestFlagProvenanceEnvIsGenerated`,
       `TestFlagProvenanceTableCoversPlannerEnv`, new
       `TestFlagProvenanceDetectorSeesHelperWrappedReads`, full

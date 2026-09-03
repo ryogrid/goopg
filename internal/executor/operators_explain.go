@@ -1713,8 +1713,21 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 // "Shared I/O Read/Write Time" gating below) and is threaded unchanged
 // through the recursive Plans re-render.
 func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool) map[string]any {
-	obj := planToJSON(n, opts)
-	if s, ok := stats[n]; ok && s != nil {
+	// P0-04e: one name table for the whole plan, as in planToJSON.
+	nm := newExplainNames(n)
+	return planToJSONWithStatsNamed(n, opts, stats, trackIOTiming, &subPlanReg{rel: nm})
+}
+
+// planToJSONWithStatsNamed is planToJSONWithStats with the shared render
+// state threaded through, so collapsed Filter predicates qualify exactly
+// like the text walker's.
+func planToJSONWithStatsNamed(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool, reg *subPlanReg) map[string]any {
+	obj := planToJSONNamed(n, opts, reg)
+	// P0-04e: stats follow VISIBLE nodes. The text walker never prints
+	// wrapper lines, so wrapper stats were invisible there too; stating
+	// the surviving child's numbers is what makes the two walkers agree.
+	surviving, _, _ := jsonCollapse(n)
+	if s, ok := stats[surviving]; ok && s != nil {
 		obj["Actual Rows"] = s.rowsOut
 		obj["Actual Loops"] = s.loops
 		if s.timing {
@@ -1724,7 +1737,7 @@ func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nod
 		// "Heap Fetches" is an IndexOnlyScan-only field upstream emits under
 			// ANALYZE (design 0118-0102). horizons.spec reads it via
 			// ...->'Plan'->'Heap Fetches'.
-			if _, isIOS := n.(*optimizer.IndexOnlyScan); isIOS {
+			if _, isIOS := surviving.(*optimizer.IndexOnlyScan); isIOS {
 				obj["Heap Fetches"] = s.heapFetches
 			}
 			// M0128-P5.2: "Rows Removed by Filter" and "Rows Removed by Join
@@ -1790,16 +1803,44 @@ func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nod
 		}
 	}
 	// Re-render Plans recursively with stats, replacing the
-	// stats-free children that planToJSON installed.
-	children := planChildren(n)
+	// stats-free children that planToJSONNamed installed. Children come
+	// from the SURVIVING node (wrappers collapsed above must not reappear
+	// as entries) through the same shared table.
+	children := planChildren(surviving)
 	if len(children) > 0 {
 		plans := make([]map[string]any, 0, len(children))
 		for _, c := range children {
-			plans = append(plans, planToJSONWithStats(c, opts, stats, trackIOTiming))
+			plans = append(plans, planToJSONWithStatsNamed(c, opts, stats, trackIOTiming, reg))
 		}
 		obj["Plans"] = plans
 	}
 	return obj
+}
+
+// jsonCollapse skips Project/Filter wrapper nodes exactly like
+// walkPlanFiltered does, so FORMAT JSON emits the same TREE as the text
+// walker (and as PG, which has neither node): a Project vanishes, and the
+// OUTERMOST Filter's predicate is carried to be rendered as the surviving
+// node's "Filter" property. filterNode is the wrapper the predicate came
+// from — the text walker's rowSrc rule reports that node's estimate, and
+// the JSON costs below do the same. A nil node (or one that is only
+// wrappers above nil) collapses to nils; callers must handle that as the
+// text walker does by rendering nothing.
+func jsonCollapse(n optimizer.Node) (surviving optimizer.Node, filter optimizer.Expr, filterNode optimizer.Node) {
+	for {
+		if p, ok := n.(*optimizer.Project); ok {
+			n = p.Child
+			continue
+		}
+		if f, ok := n.(*optimizer.Filter); ok {
+			if filter == nil {
+				filter, filterNode = f.Predicate, f
+			}
+			n = f.Child
+			continue
+		}
+		return n, filter, filterNode
+	}
 }
 
 // planToJSON renders n as the upstream-style JSON object an
@@ -1809,6 +1850,28 @@ func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nod
 // where columns are part of VERBOSE output, not the default
 // JSON shape).
 func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
+	// P0-04e: one name table for the whole plan, shared down the
+	// recursion — a per-node table would count only that subtree's
+	// relations and qualify differently from the text walker.
+	nm := newExplainNames(n)
+	return planToJSONNamed(n, opts, &subPlanReg{rel: nm})
+}
+
+// planToJSONNamed is planToJSON with the shared render state threaded
+// through. Wrapper collapse happens here (not in the caller) so every
+// level — including planToJSONWithStats' re-rendered children below —
+// sees the same tree the text walker does.
+func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanReg) map[string]any {
+	orig := n
+	n, filter, filterNode := jsonCollapse(n)
+	if n == nil {
+		// Degenerate wrapper-over-nil: no surviving node to render.
+		// Fall back to the old behaviour (the single type-name
+		// fallthrough arm) rather than inventing a node type PG
+		// has no word for.
+		n = orig
+		filter, filterNode = nil, nil
+	}
 	obj := map[string]any{
 		"Node Type": describePlan(n, nil),
 	}
@@ -1825,6 +1888,15 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 		obj["Command"] = setOpCommandName(p)
 	}
 	est := optimizer.EstimateRows(n)
+	// P0-04e: when a Filter wrapper collapsed above, the text walker
+	// reports the WRAPPER's post-qual estimate on this line (its rowSrc
+	// rule) — the child's pre-qual count would overstate by exactly the
+	// filter's selectivity. Mirror it so the two walkers agree.
+	costNode := n
+	if filterNode != nil {
+		costNode = filterNode
+		est = optimizer.EstimateRows(costNode)
+	}
 	if est > 0 {
 		obj["Plan Rows"] = est
 	}
@@ -1833,10 +1905,18 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 	// Rows, so FORMAT JSON stated no cost at all — and once the text walkers
 	// print real costs, a silent JSON would DISAGREE with text rather than
 	// merely lag it.
-	startup, total, width := explainCostFields(n, est)
+	startup, total, width := explainCostFields(costNode, est)
 	obj["Startup Cost"] = startup
 	obj["Total Cost"] = total
 	obj["Plan Width"] = width
+	// P0-04e: the collapsed Filter's predicate rides as PG's "Filter"
+	// property on the surviving node. Same outermost-only rule and same
+	// qualify decision as the text walker's `Filter:` detail line, so the
+	// two walkers state the same qual.
+	if filter != nil {
+		fqual := reg.names().qualify() && !explainIsScanNode(n)
+		obj["Filter"] = wrapParen(formatExprQual(filter, reg, fqual))
+	}
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
 			obj["Output"] = cols
@@ -1846,7 +1926,9 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 	if len(children) > 0 {
 		plans := make([]map[string]any, 0, len(children))
 		for _, c := range children {
-			plans = append(plans, planToJSON(c, opts))
+			// Same shared name table (P0-04e header comment): a fresh
+			// per-child table would qualify differently from text.
+			plans = append(plans, planToJSONNamed(c, opts, reg))
 		}
 		obj["Plans"] = plans
 	}

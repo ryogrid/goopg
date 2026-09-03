@@ -6,6 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // M0125-0039 — EXPLAIN printed column references unqualified, so a real
@@ -363,5 +364,67 @@ func TestExplainIndexCondQualifiesOuterProbeKey(t *testing.T) {
 	}
 	if got := formatIndexCond(scan, &subPlanReg{rel: solo}); got != "(c_nationkey = c_nationkey)" {
 		t.Errorf("single-relation index cond = %q, want %q", got, "(c_nationkey = c_nationkey)")
+	}
+}
+
+// P0-04e — FORMAT JSON emits the same TREE as the text walker: Project and
+// Filter wrappers collapse in both, because PG has neither node. The
+// collapsed predicate is preserved as the surviving node's "Filter"
+// property (text: the `Filter:` detail line), not dropped with the wrapper.
+func TestJSONCollapsesProjectFilterWrappersLikeText(t *testing.T) {
+	tbl := parallelLabelTestTable(t, "t")
+	scan := &optimizer.SeqScan{Table: tbl, EstRelRows: 10000}
+	pred := &optimizer.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &optimizer.ColumnRef{Name: "a"},
+		Right: &optimizer.IntegerConst{Value: 42},
+	}
+	proj := &optimizer.Project{
+		Child:   &optimizer.Filter{Child: scan, Predicate: pred},
+		Targets: []optimizer.Expr{&optimizer.ColumnRef{Name: "a"}},
+	}
+
+	// TEXT: no wrapper node lines, but the predicate survives as detail.
+	text := renderPlain(t, proj)
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		trimmed = strings.TrimPrefix(trimmed, "->  ")
+		if strings.HasPrefix(trimmed, "Projection") || strings.HasPrefix(trimmed, "Filter ") {
+			t.Errorf("text walker emitted a wrapper node line %q:\n%s", line, text)
+		}
+	}
+	if findLine(strings.Split(text, "\n"), "Filter: (a = 42)") == "" {
+		t.Errorf("text walker dropped the collapsed predicate:\n%s", text)
+	}
+
+	// JSON: same tree — no wrapper Node Types anywhere, Filter preserved.
+	var types []string
+	var filters []string
+	var walkJSON func(m map[string]any)
+	walkJSON = func(m map[string]any) {
+		if nt, ok := m["Node Type"].(string); ok {
+			types = append(types, nt)
+		}
+		if f, ok := m["Filter"].(string); ok {
+			filters = append(filters, f)
+		}
+		if plans, ok := m["Plans"].([]map[string]any); ok {
+			for _, c := range plans {
+				walkJSON(c)
+			}
+		}
+	}
+	obj := planToJSON(proj, parser.ExplainOptions{})
+	walkJSON(obj)
+	for _, nt := range types {
+		if nt == "Projection" || nt == "Filter" {
+			t.Errorf("JSON tree contains wrapper node type %q (types: %v)", nt, types)
+		}
+	}
+	if len(types) != 1 || !strings.HasPrefix(types[0], "Seq Scan on t") {
+		t.Errorf("JSON tree = %v, want a single Seq Scan node", types)
+	}
+	if len(filters) != 1 || filters[0] != "(a = 42)" {
+		t.Errorf("JSON Filter properties = %v, want [(a = 42)]", filters)
 	}
 }
