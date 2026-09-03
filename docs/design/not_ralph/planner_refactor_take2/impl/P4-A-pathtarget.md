@@ -538,3 +538,61 @@ downstream residual.
 Run it under `GOOPG_ASSERT_ROW_SHAPE=1` (both scan paths are instrumented) and
 gate on `tpch-runner -digest` against the PG oracle at BOTH `work_mem` budgets,
 per §13.5.
+
+
+---
+
+## 16. Revision 8 (2026-09-03) — where the `Project` goes, and why not at the join
+
+Rev 7 decided the mechanism. Attempting the insertion surfaced a placement
+constraint the design did not state; recorded here because it is the difference
+between a working slice and a plan-time panic.
+
+### The obvious place does not work
+
+Wrapping the build child at the hash-join arm — after `joinInputsFor` has run —
+is wrong. `joinInputsFor` derives the join's schema from its children:
+
+    outerSchema, innerSchema := outerNode.Output(), innerNode.Output()
+    merged := <outerSchema ++ innerSchema>        // createplanjoin.go:288-295
+
+and immediately above that it PANICS when "child layouts disagree with child
+schemas" (`:290`). A `Project` inserted after that point changes
+`innerNode.Output()` without changing the layout the child returned, so the
+check fires.
+
+### Where it must go
+
+**The child's own `createPlan` arm must emit the `Project` and return an
+`outputLayout` consistent with the narrowed schema.** Every arm already returns
+that pair; the narrowing has to be produced by the same code that produces the
+layout, not bolted onto its result.
+
+That is the same shape as the rev 7 decision one level up: the width and the
+thing that describes it must come from a single place. At the operator level
+that is `projectOp`'s `targets`; at the plan level it is the arm's
+`(Node, outputLayout)` return.
+
+### The reassuring part
+
+`createplanjoin.go:290` means the layout-vs-schema disagreement class is caught
+**at plan time, by a panic**. It is not the class that produced P4-01b's wrong
+answers — that one is planner-vs-executor row shape, which no plan-time check
+can see, and which `GOOPG_ASSERT_ROW_SHAPE` now covers on both scan paths.
+
+So the two failure modes of this change now have distinct, existing guards:
+
+| failure | guard | when |
+|---|---|---|
+| child layout disagrees with child schema | `createplanjoin.go:290` panic | plan time, already present |
+| emitted row disagrees with advertised schema | `GOOPG_ASSERT_ROW_SHAPE` | run time, added this session |
+
+### Remaining unknown, stated plainly
+
+Whether narrowing a leaf's `Output()` at `createPlan` time disturbs the seam's
+recorded widths. `extractSearchLeaves` computes `widths[i] = len(n.Output())`
+from the PRE-search chain leaves, and the review's reading is that nothing in
+the search or in `createPlan` can move that. That reading should be CONFIRMED
+against the offset check (`joinsearchseam.go:244-263`) before the first slice
+lands — it is the one place where rev 5 §13.2's "the seam is genuinely safe"
+has not been tested by executing a narrowed plan.
