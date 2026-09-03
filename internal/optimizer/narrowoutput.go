@@ -1,5 +1,45 @@
 package optimizer
 
+import "os"
+
+// narrowBuild resolves GOOPG_NARROW_BUILD at process start. Default OFF:
+// narrowing the build side changes plans (fewer batches at a fixed
+// work_mem), so it lands behind a flag and is measured (P4-A §18 step 4)
+// before any default flip (step 5). Read once, in the server: putting it on
+// a client command line sets it where nothing reads it (handover §2).
+var narrowBuild = narrowBuildFromEnv(os.Getenv("GOOPG_NARROW_BUILD"))
+
+// narrowBuildFromEnv is the flag's polarity, factored out so tests and the
+// flag-provenance table resolve the same default the process starts with
+// (flaglabels.go's contract: no literal restating a default elsewhere).
+func narrowBuildFromEnv(v string) bool { return v == "1" }
+
+// narrowBuildInput narrows a hash-join build side (node, layout) pair to the
+// statement's needed columns. Take2 P4-01, rev 10 step 3: the call site is
+// `joinInputsFor`, immediately after `createPlanNode(innerPath)` and before
+// the layout/schema panic, so everything downstream sees a consistent pair
+// and the pre-existing panic guards the helper on the first mistake.
+//
+// The `kind == "PathHashJoin"` guard lives HERE rather than at the call site
+// so no future caller can narrow a merge join's inputs by forgetting it:
+// only a hash join has a resident build side, and narrowing a streaming
+// merge input would pay the projection for no memory saving (P4-A §18).
+//
+// Every refusal returns the pair untouched: flag off (the shipped default),
+// a non-hash join, no node, no path/rel, or an unknown needed set
+// (NeededColsKnown false — the collector declined, which must not be read
+// as "keep nothing"). With the flag off the shipped path is untouched, so
+// this step's gate measures the flag rather than the commit.
+func narrowBuildInput(kind string, innerNode Node, innerLay outputLayout, innerPath *Path) (Node, outputLayout) {
+	if !narrowBuild || kind != "PathHashJoin" {
+		return innerNode, innerLay
+	}
+	if innerNode == nil || innerPath == nil || innerPath.Rel == nil || !innerPath.Rel.NeededColsKnown {
+		return innerNode, innerLay
+	}
+	return narrowPlanOutput(innerNode, innerLay, neededKeepSet(innerNode.Output(), innerPath.Rel.NeededCols))
+}
+
 // Build-side output narrowing — take2 P4-01, rev 10 step 2.
 //
 // A join's build side carries every column of every relation beneath it, and a

@@ -99,6 +99,90 @@ func TestNarrowPlanOutputDeclinesRatherThanCorrupts(t *testing.T) {
 	}
 }
 
+// TestNarrowBuildFromEnvPolarity: the flag defaults OFF and only "1" opts in.
+// The shipped path must be untouched unless the operator explicitly asks.
+func TestNarrowBuildFromEnvPolarity(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"", false},
+		{"0", false},
+		{"off", false},
+		{"1", true},
+	} {
+		if got := narrowBuildFromEnv(tc.value); got != tc.want {
+			t.Errorf("narrowBuildFromEnv(%q) = %t, want %t", tc.value, got, tc.want)
+		}
+	}
+}
+
+// narrowBuildTestPath is a build-side path whose rel carries the given needed
+// set, enough to drive narrowBuildInput without a real search.
+func narrowBuildTestPath(known bool, names ...string) *Path {
+	needed := map[string]bool{}
+	for _, n := range names {
+		needed[n] = true
+	}
+	var m map[string]bool
+	if known {
+		m = needed
+	}
+	return &Path{Rel: &RelOptInfo{NeededCols: m, NeededColsKnown: known}}
+}
+
+// TestNarrowBuildInputWiring pins rev 10 step 3's contract: only a hash join,
+// only with the flag on, only with a known needed set — everything else
+// returns the pair untouched, so the shipped default path cannot move.
+func TestNarrowBuildInputWiring(t *testing.T) {
+	old := narrowBuild
+	defer func() { narrowBuild = old }()
+
+	node := func() *noNode { return &noNode{sch: noSchema("k", "v", "unused")} }
+	lay := func() outputLayout { return outputLayout{4, 5, 6} }
+	known := narrowBuildTestPath(true, "k", "v")
+
+	narrowBuild = true
+	got, gotLay := narrowBuildInput("PathHashJoin", node(), lay(), known)
+	p, ok := got.(*Project)
+	if !ok {
+		t.Fatalf("flag on + hash join: expected a *Project, got %T", got)
+	}
+	if len(p.Output()) != 2 || len(gotLay) != 2 || gotLay[0] != 4 || gotLay[1] != 5 {
+		t.Errorf("flag on + hash join: schema/layout = %v/%v, want [k v]/[4 5]",
+			p.Output(), gotLay)
+	}
+
+	for _, tc := range []struct {
+		name string
+		flag bool
+		kind string
+		path *Path
+	}{
+		{"flag off leaves the pair untouched", false, "PathHashJoin", known},
+		{"merge join is never narrowed", true, "PathMergeJoin", known},
+		{"unknown needed set declines", true, "PathHashJoin", narrowBuildTestPath(false, "k")},
+		{"nil rel declines", true, "PathHashJoin", &Path{}},
+		{"nil path declines", true, "PathHashJoin", nil},
+	} {
+		narrowBuild = tc.flag
+		n := node()
+		got, gotLay := narrowBuildInput(tc.kind, n, lay(), tc.path)
+		if got != Node(n) {
+			t.Errorf("%s: returned a rewritten node %T; it must decline", tc.name, got)
+		}
+		if len(gotLay) != 3 {
+			t.Errorf("%s: layout changed to %v; it must decline", tc.name, gotLay)
+		}
+	}
+
+	// A nil node must decline, not panic on Output().
+	narrowBuild = true
+	if got, _ := narrowBuildInput("PathHashJoin", nil, lay(), known); got != nil {
+		t.Errorf("nil node: got %v, want nil", got)
+	}
+}
+
 // TestNeededKeepSetPreservesJoinKeysAndDropsUnused pins the keep-rule's two
 // halves. nil means "the collector declined" and must never be read as
 // "keep nothing".

@@ -1478,8 +1478,22 @@ delta.
       38176kB, and 15.9 s against 6.8 s. Two caveats recorded rather than
       smoothed over: goopg emits no per-node `actual rows` for joins under a
       `Gather`, so per-LEVEL cardinality equality cannot be shown from this plan;
-      and "97 MB vs 38 MB" is not one comparison, since goopg's figure is one
-      batch of eight (≈780 MB total) against PG's single-batch total.
+       and "97 MB vs 38 MB" is not one comparison, since goopg's figure is one
+       batch of eight (≈780 MB total) against PG's single-batch total.
+      **Rev 10 steps 1–3 LANDED (this commit completes step 3; steps 1–2 were
+      `aab14de3e` + `8dc298e92`):** `RelOptInfo.NeededCols/NeededColsKnown`
+      stamped from the searchCtx, `narrowPlanOutput` + `neededKeepSet`
+      unit-tested, and `joinInputsFor` now narrows the build-side pair via
+      `narrowBuildInput` behind `GOOPG_NARROW_BUILD=1`, default OFF (flag
+      registered in `flaglabels.go` + regenerated `planner-flags.env`). The
+      `kind` guard lives inside the helper so no future caller can narrow a
+      merge input. Gates this commit: `go build`, `go vet`, full
+      `internal/optimizer` suite, units gate, TPC-H spotcheck Q12=2/Q13=34 —
+      all green; shipped path untouched by construction (flag off).
+      Handover §3's open question (post-plan passes touching narrowed build
+      sides) is explicitly NOT settled here — it gates step 5 (the default
+      flip), which additionally needs the step-4 value gate (PG-oracle
+      digest at both `work_mem` budgets + TPC-DS SF0.5 sweep, NBatch 2–4×).
 - [ ] **P4-02** Upper `RelOptInfo`s (`GROUP_AGG`, `WINDOW`, `DISTINCT`,
       `ORDERED`, `FINAL`) with pathlists. *design: 08 §7.*
 - [ ] **P4-03** Promote `PathSort` to an upper-rel path. It already has a

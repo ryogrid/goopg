@@ -84,6 +84,10 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_UNNEST_PREDP":      func(v string) string { return onOff(unnestPreDPFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
+	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
+	// statement's needed columns. Default off; lands unflipped with its own
+	// measurement (P4-A §18 steps 3-5).
+	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -130,6 +134,9 @@ var flagProvenanceOrder = []string{
 	// Joined at M0125-0040: grouping-sets source sharing changes the plan of
 	// every ROLLUP/CUBE/GROUPING SETS query, so a TPC-DS artefact that does
 	// not name it cannot say which arm it measured.
+	// Joined at take2 P4-01 rev 10 step 3: narrows hash-join build sides,
+	// default off (P4-A §18 steps 3-5).
+	"GOOPG_NARROW_BUILD",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the
