@@ -1512,6 +1512,26 @@ difference explained and timed.
       `GOOPG_INDEXKEY_HARVEST`, `GOOPG_HASH_OUTER_JOIN`,
       `GOOPG_INDEX_PROBE_MULT` — regenerating `scripts/planner-flags.env` from
       `flaglabels.go` each time. *design: 08 §9.4.*
+      **`GOOPG_HASH_OUTER_JOIN` measured 2026-09-03 — safe now, but not a win,
+      so NOT flipped.** Its deferral condition (ledger 2026-08-04) was "once
+      doc 04's cost currency can say when a sort is actually cheaper", and this
+      bundle's cost work (P2-06, P2-07, P2-11, P2-12, the ndistinct fix) made
+      that testable. With the flag on: TPC-DS SF0.5 PASS=95 MISMATCH=0
+      **CKMISMATCH=0** — which is the answer to the recorded worry that the hash
+      path "keeps every row but changes their ORDER" — total-delta +0.0%, and
+      only **2 plan shapes changed of 99**. Both are attributable: Q51
+      14s->11s, Q97 11s->15s, net **+1s**. The three queries the per-query arm
+      named (Q53, Q37, Q12) all have IDENTICAL plans. TPC-H 216.41s against
+      221.29s, 24 MATCH on values.
+      So the risk is gone and the benefit is not there: the cost model still
+      cannot tell when the sort is cheaper, it merely breaks even. Flipping a
+      default on a wash would be churn. Re-measure after the remaining
+      `btcostestimate` terms.
+      *The other five flags are not retirable yet, for a reason this bundle
+      established today:* `GOOPG_PGSHAPED_DP`'s off path is the legacy planner,
+      and P6-03/P6-04 showed the legacy REWRITE passes are still load-bearing
+      (6.5x on Q20, 12.5x on Q4). Retiring that flag means deleting a path the
+      search cannot yet replace.
 - [ ] **P6-07** Add a `setrefs` phase if P6-02 shows the executor still needs
       explicit column resolution. *design: 08 §9.5.*
 
