@@ -338,8 +338,31 @@ slower than 1.2×, S-cold/WARM gap narrows.
       fanout rather than read via a `_bt_getrootheight` analogue, and
       `indexTuples` is assumed equal to heap tuples (correct for a complete
       non-partial index, wrong for a partial one).
-- [ ] **P1-02** *(rescoped by the above)* — the remaining synthesis is tree
-      height and the partial-index `indexTuples` case, not `relpages`.
+- [x] **P1-02** *(rescoped by P1-01; CLOSED this commit in two halves)*
+      *(a) Tree height — DECLINED with measurement, not implemented.* A
+      throwaway probe on a realistic index cost (1.5M rows, sel 0.01) showed
+      ±1 height level moves the total 0.12–0.13 on 34673 (0.0004%; five
+      levels: 0.63). Structure agrees: the fanout derivation already reads
+      REAL pages (`IndexRealPages`) and re-derived fanout, so a meta-page
+      `_bt_getrootheight` read could only differ on a degenerate tree — and
+      even there, per level costs ~0.13 units. No storage hook is warranted;
+      the derivation stands.
+      *(b) Partial-index `indexTuples` — LANDED.* `estimateIndexGeometry`
+      now scales the heap count by the resolved predicate's selectivity
+      (`ResolveIndexPredicate` + `clauseSelectivity` over a bare table scan;
+      selectivity resolution reads only table statistics) when the index
+      `HasPredicate`, guarded four ways: non-partial keeps heap count;
+      unresolvable/nil predicates decline; unanalysed or column-stat-less
+      relations decline (no default-driven fabrication); selectivity outside
+      (0,1] declines; floor at 1 kept. This matches PG's semantics (its
+      measured index `reltuples`, which goopg does not keep — its pg_class
+      row reports the heap count) including PG's own approximation for
+      proven partial use. Gates: new `TestEstimateIndexGeometryPartialScales`
+      `Tuples` (400 = 1000×0.4 histogram exact, plus four decline pins),
+      full optimizer suite, units gate, regress 4/52 identical set, spotcheck
+      Q12=2/Q13=34. No benchmark plan can move: all three PG reference DBs
+      (`tpch`, `tpcds`, `tpcds05`) carry zero partial indexes and the goopg
+      clusters share their DDL, so the guard never fires there.
       ~~`costIndexScan` reads the real index geometry; retire
       `estimateIndexGeometry`'s synthesis.~~ *design: 08 §4.1.*
 - [x] **P1-03** VACUUM persists `reltuples`/`relpages` durably — units,

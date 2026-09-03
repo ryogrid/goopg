@@ -339,6 +339,38 @@ func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples flo
 	if indexTuples < 1 {
 		indexTuples = 1
 	}
+	// Partial-index tuple count (take2 P1-02): a partial index holds only
+	// the rows its predicate admits, so sizing it at the heap count
+	// overstates it by 1/selectivity — against PG, which reads the measured
+	// count off the index's own pg_class row. goopg keeps no per-index
+	// measurement (its pg_class row reports the heap count), so the count
+	// is derived from the predicate's selectivity instead: the same
+	// quantity PG measured, computed rather than read.
+	//
+	// Guards, each naming the fabrication it prevents:
+	//   - non-partial indexes keep the heap count (a complete index has one
+	//     entry per live heap tuple — the same rule pg_class reports by);
+	//   - unresolvable predicates decline (an unknown predicate must not
+	//     read as "keep nothing");
+	//   - unanalysed relations decline (without column statistics the
+	//     selectivity is default-driven, and a DEFAULT-sized index is a
+	//     fabricated number, not an estimate);
+	//   - selectivity outside (0,1] declines (an empty or meaningless
+	//     result must not zero the index out from under the pages math).
+	// The predicate is evaluated against a bare SeqScan over the table:
+	// selectivity resolution reads only table statistics, never plan
+	// coordinates, so no search context is needed here.
+	if idx != nil && idx.HasPredicate && tbl != nil &&
+		tbl.Stats != nil && tbl.Stats.Analyzed && len(tbl.Stats.Columns) > 0 {
+		if rp, err := ResolveIndexPredicate(idx.Predicate, tbl); err == nil && rp != nil {
+			if sel := clauseSelectivity(rp, &SeqScan{Table: tbl}); sel > 0 && sel <= 1 {
+				indexTuples = relTuples * sel
+				if indexTuples < 1 {
+					indexTuples = 1
+				}
+			}
+		}
+	}
 	width := indexTupleWidth(idx, tbl)
 	fill := btreeDefaultFillfactor
 	if idx != nil && idx.Fillfactor >= 10 && idx.Fillfactor <= 100 {
