@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -118,7 +119,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats)
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -1510,13 +1511,13 @@ func schemaColumnNames(n optimizer.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, nil, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable) {
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
-func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
 	if p, ok := n.(*optimizer.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, attachedFilter, attachedFilterNode, filterRowsRemoved, reg)
+		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, attachedFilter, attachedFilterNode, filterRowsRemoved, reg)
 		return
 	}
 	if f, ok := n.(*optimizer.Filter); ok {
@@ -1535,7 +1536,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if fs, ok := stats[f]; ok && fs != nil {
 			fr += fs.filterRejected
 		}
-		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, next, nextNode, fr, reg)
+		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, next, nextNode, fr, reg)
 		return
 	}
 
@@ -1643,6 +1644,24 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		}
 	}
 
+	// EX0-03b (new): per-worker `Worker N:` lines from the Context-keyed
+	// carrier folded post-join in gatherOp/gatherMergeOp.Close. Text
+	// format only (no JSON twin, per design). Unreachable when the carrier
+	// is empty — a nil/empty map, or a node with no entries, renders
+	// nothing, so serial plans and unexecuted nodes stay byte-identical.
+	if len(workerStats) > 0 {
+		if ws, ok := workerStats[n]; ok && len(ws) > 0 {
+			ordered := make([]workerNodeStat, len(ws))
+			copy(ordered, ws)
+			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
+			for _, w := range ordered {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
+					"Worker %d:  actual time=%.3f..%.3f rows=%.2f loops=%d",
+					w.Worker, nsToMs(w.StartupNs), nsToMs(w.TotalNs), float64(w.RowsOut), w.Loops))})
+			}
+		}
+	}
+
 	// A hash join emits PG's hash-table line under ANALYZE. Upstream hangs it
 	// off the HASH node; goopg has no Hash node (the build lives inside
 	// joinOp), so it hangs off the Hash Join. M0127-P3.5 / design 06 §4.
@@ -1698,7 +1717,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// reference shares one body Node, so the section IS the subtree that
 	// ran (the later references replay from ctx.CTERowCache). M0125-0049.
 	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
-		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, nil, nil, 0, reg)
+		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	})
 
 	// Sublink subtrees keep their instrumentation: stats is passed
@@ -1706,12 +1725,12 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
-		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, nil, nil, 0, reg)
+		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, nil, nil, 0, reg)
+		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	}
 }
 

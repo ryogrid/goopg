@@ -143,7 +143,11 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 	if !optimizer.HasShareableHashJoin(plan) {
 		return nil, nil
 	}
-	tree, err := buildChild()
+	// EX0-03b: prebuild throwaway tree — scope explicitly NIL
+	// (uninstrumented, exactly today's behavior; covers both Gather and
+	// GatherMerge prebuild call sites). Its drains would double-count the
+	// same plan keys into a worker/leader table.
+	tree, err := buildUnderNilScope(buildChild)
 	if err != nil {
 		return nil, err
 	}
@@ -440,7 +444,12 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	for i := 0; i < maxProducers; i++ {
 		wctx := workerCtxs[i]
 		group.Go(func(workerCtx context.Context) error {
-			tree, err := BuildWorker(buildPlan)
+			// EX0-03b: coop throwaway tree — scope explicitly NIL
+			// (uninstrumented, exactly today's behavior). Producer
+			// goroutines build concurrently, so the mutex-serialized
+			// NIL handoff also keeps a concurrent Gather site's fresh
+			// table out of this tree.
+			tree, err := buildUnderNilScope(func() (Operator, error) { return BuildWorker(buildPlan) })
 			if err != nil {
 				return err
 			}

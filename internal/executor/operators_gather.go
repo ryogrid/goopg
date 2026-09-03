@@ -104,6 +104,41 @@ type gatherOp struct {
 	// already there, so every tree — leader and workers alike — walks it and
 	// keeps only the leaf blocks it claims first.
 	pidx *parallelIndexScanState
+
+	// EX0-03b (new): scope is the instrumenter active on this op's own
+	// Build() call, handed over by maybeInstrument (instrumentScopeCarrier).
+	// workerTables holds one FRESH nodeStatsTable per execution site —
+	// worker i fills slot i, the leader fills slot n — folded post-join in
+	// Close into ctx.GatherWorkerStats. Pre-sized in Open; nil (unarmed)
+	// when no instrumentation scope was stored.
+	scope        *instrumenter
+	workerTables []nodeStatsTable
+}
+
+// EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
+// storing the scope live at this op's own Build() time. Only the timing
+// bool is ever inherited from it — each execution site mints its own
+// fresh table via buildUnderFreshScope, so the stored table is never
+// reused.
+func (o *gatherOp) setInstrumentScope(s *instrumenter) { o.scope = s }
+
+// EX0-03b (new): buildChildForSlot builds one child tree for the given
+// execution slot. Instrumented sites (workers, leader) mint a FRESH table
+// under the mutex and file it into the pre-sized slot; uninstrumented
+// builds (no stored scope) still serialize through an explicit NIL scope
+// so a concurrent site's fresh table cannot leak into this tree.
+func (o *gatherOp) buildChildForSlot(slot int) (Operator, error) {
+	if o.scope == nil {
+		return buildUnderNilScope(o.buildChild)
+	}
+	op, tab, err := buildUnderFreshScope(o.scope.timing, o.buildChild)
+	if err != nil {
+		return nil, err
+	}
+	if slot >= 0 && slot < len(o.workerTables) {
+		o.workerTables[slot] = tab
+	}
+	return op, nil
 }
 
 func newGatherOp(p *optimizer.Gather, buildChild func() (Operator, error)) *gatherOp {
@@ -128,7 +163,11 @@ func (o *gatherOp) prebuildBitmapScan(ctx *Context) error {
 	if !optimizer.HasBitmapScan(o.plan.Child) {
 		return nil
 	}
-	tree, err := o.buildChild()
+	// EX0-03b: prebuild throwaway tree — scope explicitly NIL
+	// (uninstrumented, exactly today's behavior). Its drains would
+	// double-count the same plan keys into a worker/leader table, and
+	// the bitmap tree is never even closed, so its loops would leak.
+	tree, err := buildUnderNilScope(o.buildChild)
 	if err != nil {
 		return err
 	}
@@ -262,6 +301,13 @@ func (o *gatherOp) Open(ctx *Context) error {
 	o.launched = n
 	ctx.recordGatherLaunched(o.plan, n)
 
+	// EX0-03b (new): pre-size the indexed per-site table slots (workers
+	// 0..n-1, leader slot n) when instrumentation is armed. Indexes are
+	// disjoint across goroutines, so no mutex is needed for the stores.
+	if o.scope != nil {
+		o.workerTables = make([]nodeStatsTable, n+1)
+	}
+
 	// Leader participation. PG's parallel_leader_participation has the leader
 	// execute a share as well as drain; goopg honours it — and with ZERO
 	// workers it is not optional but load-bearing, because a Gather whose
@@ -293,7 +339,8 @@ func (o *gatherOp) Open(ctx *Context) error {
 	o.startChannelCloser()
 
 	if o.leaderRuns {
-		child, err := o.buildChild()
+		// EX0-03b: leader instrumented site — fresh table into slot n.
+		child, err := o.buildChildForSlot(n)
 		if err != nil {
 			return err
 		}
@@ -335,7 +382,8 @@ func (o *gatherOp) startChannelCloser() {
 // runWorker builds this worker's own operator tree and streams materialised
 // batches to the leader.
 func (o *gatherOp) runWorker(idx int, wctx *Context) error {
-	child, err := o.buildChild()
+	// EX0-03b: worker instrumented site — fresh table into slot idx.
+	child, err := o.buildChildForSlot(idx)
 	if err != nil {
 		return err
 	}
@@ -471,6 +519,11 @@ func (o *gatherOp) Close() error {
 	}
 	// 3. Join. Worker lifetime is strictly nested inside the statement.
 	err := o.group.Wait()
+
+	// EX0-03b (new): fold the per-site fresh tables post-join (the Wait
+	// above supplies the happens-before edge) into the Context-keyed
+	// carrier, copying only rows/loops/time per node.
+	foldGatherWorkerStats(o.ctx, o.workerTables)
 
 	// 4. Fold per-worker notices back, then release the arenas the leader
 	//    allocated. Both happen after the join, which supplies the

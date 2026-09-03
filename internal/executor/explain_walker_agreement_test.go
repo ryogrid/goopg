@@ -44,7 +44,7 @@ func renderAnalyze(t *testing.T, n optimizer.Node) string {
 	t.Helper()
 	var rows []Row
 	walkPlanAnalyzeFiltered(n, 0, &rows, parser.ExplainOptions{Analyze: true},
-		nil, nil, nil, nil, nil, nil, nil, 0,
+		nil, nil, nil, nil, nil, nil, nil, nil, 0,
 		&subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 	return joinRowText(rows)
 }

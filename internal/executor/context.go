@@ -213,6 +213,14 @@ type Context struct {
 	// EXPLAIN renders nothing. EX0-03 (b).
 	GatherLaunched gatherLaunchedTable
 
+	// GatherWorkerStats carries the per-worker (plus leader) per-node
+	// rows/loops/time EXPLAIN ANALYZE renders as `Worker N:` lines, keyed
+	// by inner plan node like GatherLaunched. Folded post-join in
+	// gatherOp/gatherMergeOp.Close via foldGatherWorkerStats; only entries
+	// for executed sites exist, so plans without a Gather render nothing.
+	// EX0-03b (new).
+	GatherWorkerStats workerNodeStatsTable
+
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
 	// pointer (as uintptr). Cleared by the update executor at the start of

@@ -138,7 +138,7 @@ func TestExplainParallelSeqScanLabelAnalyze(t *testing.T) {
 	}
 
 	var rows []Row
-	walkPlanAnalyzeFiltered(parallelRoot, 0, &rows, parser.ExplainOptions{Analyze: true}, nil, nil, nil, nil, nil, nil, nil, 0, &subPlanReg{rel: newExplainNames(parallelRoot), cte: collectCTEHoist(parallelRoot)})
+	walkPlanAnalyzeFiltered(parallelRoot, 0, &rows, parser.ExplainOptions{Analyze: true}, nil, nil, nil, nil, nil, nil, nil, nil, 0, &subPlanReg{rel: newExplainNames(parallelRoot), cte: collectCTEHoist(parallelRoot)})
 	var lines []string
 	for _, r := range rows {
 		if len(r) > 0 && r[0].Kind == KindString {

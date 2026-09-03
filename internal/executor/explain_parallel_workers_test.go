@@ -11,6 +11,8 @@ package executor
 
 import (
 	"fmt"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -253,5 +255,179 @@ func TestExplainSerialPlanHasNoWorkersLaunched(t *testing.T) {
 	}
 	if !strings.Contains(plain, "Gather") {
 		t.Errorf("precondition: plain EXPLAIN lost the Gather node:\n%s", plain)
+	}
+}
+
+// TestFoldGatherWorkerStatsCopiesFourFields is the deterministic unit half
+// of EX0-03b (design §4): synthetic per-site tables fold post-join into the
+// Context-keyed carrier with exact Worker/rows/loops/time contents.
+//
+// The fold copies ONLY rowsOut/loops/startupNs/totalNs (B4 collection
+// invariant) — the source stats carry buffer/WAL/memory noise to prove it
+// travels nowhere (workerNodeStat has no such fields by construction).
+// Nil slots (a site that never built) and nil entries contribute nothing,
+// and a nil Context is a no-op.
+func TestFoldGatherWorkerStatsCopiesFourFields(t *testing.T) {
+	n1 := &optimizer.SeqScan{}
+	n2 := &optimizer.SeqScan{}
+	mk := func(rows, loops, startup, total int64) *nodeStats {
+		return &nodeStats{
+			rowsOut: rows, loops: loops, startupNs: startup, totalNs: total,
+			bufHit: 7, bufRead: 8, walRecords: 9, walBytes: 10,
+			memAllocated: 11, memPeak: 12,
+		}
+	}
+	w0 := nodeStatsTable{n1: mk(10, 1, 100, 200), n2: mk(5, 2, 11, 22)}
+	w1 := nodeStatsTable{n1: mk(30, 1, 300, 400)}
+	var nilSlot nodeStatsTable
+	leader := nodeStatsTable{n1: mk(4, 1, 40, 50), n2: nil}
+
+	ctx := NewContext()
+	foldGatherWorkerStats(ctx, []nodeStatsTable{w0, w1, nilSlot, leader})
+
+	wantN1 := []workerNodeStat{
+		{Worker: 0, RowsOut: 10, Loops: 1, StartupNs: 100, TotalNs: 200},
+		{Worker: 1, RowsOut: 30, Loops: 1, StartupNs: 300, TotalNs: 400},
+		{Worker: 3, RowsOut: 4, Loops: 1, StartupNs: 40, TotalNs: 50},
+	}
+	if got := ctx.GatherWorkerStats[n1]; !reflect.DeepEqual(got, wantN1) {
+		t.Errorf("carrier[n1] = %+v, want %+v", got, wantN1)
+	}
+	wantN2 := []workerNodeStat{
+		{Worker: 0, RowsOut: 5, Loops: 2, StartupNs: 11, TotalNs: 22},
+	}
+	if got := ctx.GatherWorkerStats[n2]; !reflect.DeepEqual(got, wantN2) {
+		t.Errorf("carrier[n2] = %+v, want %+v", got, wantN2)
+	}
+	if len(ctx.GatherWorkerStats) != 2 {
+		t.Errorf("carrier holds %d keys, want 2 (nil slot/entry must add none)", len(ctx.GatherWorkerStats))
+	}
+
+	// All-nil slots leave the carrier nil, and a nil Context is a no-op
+	// rather than a panic.
+	empty := NewContext()
+	foldGatherWorkerStats(empty, []nodeStatsTable{nil, nil})
+	if empty.GatherWorkerStats != nil {
+		t.Errorf("folding nil slots must not allocate the carrier, got %+v", empty.GatherWorkerStats)
+	}
+	foldGatherWorkerStats(nil, []nodeStatsTable{w0})
+}
+
+// workerLineRe matches a rendered per-worker line without matching
+// `Workers Planned:` / `Workers Launched:` (`Worker` followed by `s`).
+var workerLineRe = regexp.MustCompile(`Worker \d+:`)
+
+// workerShapeRes normalize the schedule-dependent numbers (per-worker
+// rows=, actual time= ranges, summary times) so two runs can be compared
+// for SHAPE identity. Loops and line structure stay literal.
+var workerShapeRes = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`rows=\d+\.\d+`), "rows=N"},
+	{regexp.MustCompile(`actual time=\d+\.\d+\.\.\d+\.\d+`), "actual time=T..T"},
+	{regexp.MustCompile(`(Planning Time|Execution Time): \d+\.\d+ ms`), "$1: M ms"},
+}
+
+func workerShape(lines []string) string {
+	s := strings.Join(lines, "\n")
+	for _, nr := range workerShapeRes {
+		s = nr.re.ReplaceAllString(s, nr.repl)
+	}
+	return s
+}
+
+// TestExplainAnalyzeParallelWorkerLinesShape is the golden half of EX0-03b
+// (design §4): a forced small parallel plan (single SeqScan under Gather,
+// so exactly one visited inner node carries entries) run under EXPLAIN
+// (ANALYZE, TIMING OFF) twice.
+//
+// Asserted on BOTH runs: rendered `Worker \d+:` line count == launched
+// count, with `Worker 0:` … `Worker N-1:` each present, and identical
+// SHAPE. Deliberately NOT asserted: exact per-worker rows= (schedule-
+// dependent). Leader participation is off so the leader builds no table —
+// the count pins workers only.
+func TestExplainAnalyzeParallelWorkerLinesShape(t *testing.T) {
+	ctx := spillFixture(t, 200, 200, 40)
+	ctx.WorkMem = 0
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = false
+
+	const scanSQL = `SELECT * FROM sp_probe`
+	gathered := planGatheredJoin(t, ctx, scanSQL, 2)
+	gatherNode, planned, ok := findGatherNode(gathered)
+	if !ok {
+		t.Fatalf("gathered plan has no Gather node")
+	}
+	launched := planned
+	if launched > ctx.MaxParallelWorkers {
+		launched = ctx.MaxParallelWorkers
+	}
+	if launched <= 0 {
+		t.Fatalf("precondition: launched=%d — the count assertion needs workers", launched)
+	}
+
+	run := func() []string {
+		// Production hands every statement a fresh Context; the reused
+		// test context must drop the previous run's fold (the fold
+		// appends — same precedent as ctx.HashJoinStats = nil in the
+		// spill-identity test).
+		ctx.GatherWorkerStats = nil
+		return runExplainOverChild(t, ctx, "EXPLAIN (ANALYZE, TIMING OFF) "+scanSQL, gathered)
+	}
+
+	for runIdx := 0; runIdx < 2; runIdx++ {
+		lines := run()
+		joined := strings.Join(lines, "\n")
+		if !strings.Contains(joined, "Gather") {
+			t.Fatalf("run %d: no Gather node in ANALYZE output:\n%s", runIdx, joined)
+		}
+		if want := fmt.Sprintf("Workers Launched: %d", launched); !strings.Contains(joined, want) {
+			t.Fatalf("run %d: missing %q in ANALYZE output:\n%s", runIdx, want, joined)
+		}
+		if got := len(workerLineRe.FindAllString(joined, -1)); got != launched {
+			t.Errorf("run %d: %d Worker lines, want launched count %d:\n%s", runIdx, got, launched, joined)
+		}
+		for w := 0; w < launched; w++ {
+			if want := fmt.Sprintf("Worker %d:", w); !strings.Contains(joined, want) {
+				t.Errorf("run %d: missing %q in ANALYZE output:\n%s", runIdx, want, joined)
+			}
+		}
+		if got, ok := ctx.GatherLaunched[gatherNode]; !ok || got != launched {
+			t.Errorf("run %d: carrier GatherLaunched = %d, %v; want %d, present", runIdx, got, ok, launched)
+		}
+	}
+
+	// SHAPE identity across reruns: reset, run twice more, compare the
+	// normalized outputs for byte equality.
+	first := workerShape(run())
+	second := workerShape(run())
+	if first != second {
+		t.Errorf("worker-line SHAPE differs between runs:\n--- first ---\n%s\n--- second ---\n%s", first, second)
+	}
+}
+
+// TestExplainAnalyzeEmptyWorkerCarrierByteIdentical is the item-class pin
+// for EX0-03b (design §4): the walker change is unreachable when the
+// carrier is empty, so a render with a nil carrier and one with an empty
+// (but non-nil) carrier — even beside a populated stats table — must be
+// byte-identical. Serial plans (no Gather ever folds) take the same path.
+func TestExplainAnalyzeEmptyWorkerCarrierByteIdentical(t *testing.T) {
+	tbl := parallelLabelTestTable(t, "t")
+	root := optimizer.MaybeAddGather(&optimizer.SeqScan{Table: tbl}, parallelLabelTestSettings())
+	g, ok := root.(*optimizer.Gather)
+	if !ok {
+		t.Fatalf("expected a Gather at the root, got %T", root)
+	}
+	stats := nodeStatsTable{g.Child: &nodeStats{rowsOut: 5, loops: 1}}
+	render := func(carrier workerNodeStatsTable) string {
+		var rows []Row
+		walkPlanAnalyzeFiltered(root, 0, &rows, parser.ExplainOptions{Analyze: true},
+			stats, nil, nil, nil, nil, carrier, nil, nil, 0,
+			&subPlanReg{rel: newExplainNames(root), cte: collectCTEHoist(root)})
+		return joinRowText(rows)
+	}
+	if nilOut, emptyOut := render(nil), render(workerNodeStatsTable{}); nilOut != emptyOut {
+		t.Errorf("empty-carrier render differs:\n--- nil ---\n%s\n--- empty ---\n%s", nilOut, emptyOut)
 	}
 }

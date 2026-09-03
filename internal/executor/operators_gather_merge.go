@@ -67,6 +67,41 @@ type gatherMergeOp struct {
 
 	// ownsSharedBuilds — see gatherOp; P8 hash tables published on ctx.
 	ownsSharedBuilds bool
+
+	// EX0-03b (new): scope is the instrumenter active on this op's own
+	// Build() call, handed over by maybeInstrument (instrumentScopeCarrier).
+	// workerTables holds one FRESH nodeStatsTable per execution site —
+	// worker i fills slot i, the leader fills slot n — folded post-join in
+	// Close into ctx.GatherWorkerStats. Pre-sized in Open; nil (unarmed)
+	// when no instrumentation scope was stored.
+	scope        *instrumenter
+	workerTables []nodeStatsTable
+}
+
+// EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
+// storing the scope live at this op's own Build() time. Only the timing
+// bool is ever inherited from it — each execution site mints its own
+// fresh table via buildUnderFreshScope, so the stored table is never
+// reused.
+func (o *gatherMergeOp) setInstrumentScope(s *instrumenter) { o.scope = s }
+
+// EX0-03b (new): buildChildForSlot builds one child tree for the given
+// execution slot. Instrumented sites (workers, leader) mint a FRESH table
+// under the mutex and file it into the pre-sized slot; uninstrumented
+// builds (no stored scope) still serialize through an explicit NIL scope
+// so a concurrent site's fresh table cannot leak into this tree.
+func (o *gatherMergeOp) buildChildForSlot(slot int) (Operator, error) {
+	if o.scope == nil {
+		return buildUnderNilScope(o.buildChild)
+	}
+	op, tab, err := buildUnderFreshScope(o.scope.timing, o.buildChild)
+	if err != nil {
+		return nil, err
+	}
+	if slot >= 0 && slot < len(o.workerTables) {
+		o.workerTables[slot] = tab
+	}
+	return op, nil
 }
 
 func newGatherMergeOp(p *optimizer.GatherMerge, buildChild func() (Operator, error)) *gatherMergeOp {
@@ -121,6 +156,13 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	o.launched = n
 	ctx.recordGatherLaunched(o.plan, n)
 
+	// EX0-03b (new): pre-size the indexed per-site table slots (workers
+	// 0..n-1, leader slot n) when instrumentation is armed. Indexes are
+	// disjoint across goroutines, so no mutex is needed for the stores.
+	if o.scope != nil {
+		o.workerTables = make([]nodeStatsTable, n+1)
+	}
+
 	for i := 0; i < n; i++ {
 		wctx, idx := o.workers[i], i
 		o.group.Go(func(gctx context.Context) error {
@@ -131,7 +173,9 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	// Leader participation: with zero workers it is not optional, or the node
 	// returns nothing.
 	if n == 0 || ctx.ParallelLeaderParticipation {
-		child, err := o.buildChild()
+		// EX0-03b: leader Open-time instrumented site — fresh table into
+		// slot n.
+		child, err := o.buildChildForSlot(n)
 		if err != nil {
 			return err
 		}
@@ -192,7 +236,8 @@ func (h *gmHeap) Pop() any {
 }
 
 func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
-	child, err := o.buildChild()
+	// EX0-03b: worker instrumented site — fresh table into slot idx.
+	child, err := o.buildChildForSlot(idx)
 	if err != nil {
 		return err
 	}
@@ -401,6 +446,11 @@ func (o *gatherMergeOp) Close() error {
 		}
 	}
 	err := o.group.Wait()
+
+	// EX0-03b (new): fold the per-site fresh tables post-join (the Wait
+	// above supplies the happens-before edge) into the Context-keyed
+	// carrier, copying only rows/loops/time per node.
+	foldGatherWorkerStats(o.ctx, o.workerTables)
 
 	for _, w := range o.workers {
 		MergeWorkerContext(o.ctx, w)

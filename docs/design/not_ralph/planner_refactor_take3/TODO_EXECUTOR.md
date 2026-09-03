@@ -66,12 +66,7 @@ claimed.
 - [x] EX0-01 File the executor backlog ledger — `6ace9567e` (design) + ledger rows this commit; gates: 8 `take3-EX0-G-EXn` rows merged, `git diff --stat` docs-only; artifacts: `docs/design/executor-ex0-01-ledger/DESIGN.md`, `.ralph/deferral_ledger.md`
 - [x] EX0-02 Commit the measurement protocol — `503f12cf7` (design) + conforming artifact this commit; gates: protocol doc merged, `EX0-02-q6-serial-scold` full header (serial 5.48 s, values ×9 identical, alloc 1.06 GB/Q6, perf 56.6B instr/Q6); artifacts: `docs/design/executor-ex0-02-protocol/DESIGN.md`, `analysis/executor-refactor/ex0-02-20260903/README.md`
 - [x] EX0-03 Surface per-worker hash/sort counters in EXPLAIN ANALYZE — this commit; gates: 3 new tests (`TestMergeWorkerContextMaxMergesHashJoinStats`, `TestExplainAnalyzeParallelWorkersLaunchedAndHashMerge`, `TestExplainSerialPlanHasNoWorkersLaunched`), executor suite green, serial plans byte-identical, no timing claim; artifacts: `internal/executor/{parallel_worker_ctx,instrument,context,operators_gather,operators_gather_merge,operators_explain}.go`, `internal/executor/explain_parallel_workers_test.go`
-- [ ] EX0-03b Per-worker rows/loops/time lines (new instrumentation path:
-      fresh per-worker instrumenter, Context-keyed report carrier,
-      leader-participation + GatherMerge coverage; golden asserts
-      shape/presence + self-consistent max only).
-      *design: executor-ex0-03-workers §2; gate: golden test, pin
-      `changed=0`, no timing claim.*
+- [x] EX0-03b Per-worker rows/loops/time lines — this commit; gates: fold unit test (exact carrier) + shape/presence golden (count==launched both runs, SHAPE identical, no exact rows) + empty-carrier byte-identical pin, executor suite green, `-race` clean on all worker tests; artifacts: `internal/executor/{instrument,operators_gather,operators_gather_merge,parallel_hash_build,operators_cte_dml,context,operators_explain}.go`, tests in `explain_parallel_workers_test.go`
 - [ ] EX0-03c Minimal `sortOp` method/space counters with one `Sort
       Method:` line per worker (PG `explain.c:3125-3166`).
       *design: executor-ex0-03-workers §2; gate: golden test, pin

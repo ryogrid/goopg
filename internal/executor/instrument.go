@@ -7,6 +7,7 @@ package executor
 // See docs/design/0018-0003-explain-analyze-instrumentation.md.
 
 import (
+	"sync"
 	"time"
 
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -329,6 +330,101 @@ func withInstrumentation(timing bool, fn func() (Operator, error)) (Operator, no
 		return nil, nil, err
 	}
 	return op, cur.table, nil
+}
+
+// EX0-03b (new): instrumentScopeMu serializes every tree-construction
+// handoff through the package-global instrumentScope. The CTE precedent's
+// unguarded save/restore is safe only because the CTE path is serial —
+// Gather workers build concurrently (leader build vs worker builds, worker
+// vs worker), so an unguarded global would leak one site's fresh table into
+// another's tree. The mutex covers set + Build + restore only (fast, no
+// I/O); execution stays parallel.
+var instrumentScopeMu sync.Mutex
+
+// EX0-03b (new): buildUnderFreshScope runs fn (a Gather child-tree build)
+// with the package-global instrumentScope pointed at a FRESH instrumenter
+// that inherits only the stored scope's timing flag. Same plan keys across
+// tables cannot collide (different maps); the mutex keeps the global from
+// leaking across goroutines. Returns the built tree and its table; the
+// caller files the table into its indexed slot.
+func buildUnderFreshScope(timing bool, fn func() (Operator, error)) (Operator, nodeStatsTable, error) {
+	instrumentScopeMu.Lock()
+	defer instrumentScopeMu.Unlock()
+	prev := instrumentScope
+	fresh := &instrumenter{timing: timing, table: make(nodeStatsTable)}
+	instrumentScope = fresh
+	defer func() { instrumentScope = prev }()
+	op, err := fn()
+	if err != nil {
+		return nil, nil, err
+	}
+	return op, fresh.table, nil
+}
+
+// EX0-03b (new): buildUnderNilScope runs fn (a prebuild/coop throwaway-tree
+// build) with the package-global instrumentScope explicitly NIL —
+// uninstrumented, exactly today's behavior. The mutex is still required:
+// without it a concurrent instrumented build's fresh scope would leak into
+// this tree (double-counting the same plan keys into a worker/leader table,
+// or instrumenting a bitmap tree that is never closed so its loops leak).
+func buildUnderNilScope(fn func() (Operator, error)) (Operator, error) {
+	instrumentScopeMu.Lock()
+	defer instrumentScopeMu.Unlock()
+	prev := instrumentScope
+	instrumentScope = nil
+	defer func() { instrumentScope = prev }()
+	return fn()
+}
+
+// EX0-03b (new): workerNodeStat is one worker's (or the leader's) folded
+// per-plan-node counters for EXPLAIN ANALYZE's `Worker N:` lines. Only
+// these four fields travel — rows/loops/time are final at EOF+flush
+// (touched only in Open/Next), while Close's accountBuffers mutates
+// buf/WAL/memory only, so copying nothing else is both sufficient and
+// load-bearing for the collection invariant.
+type workerNodeStat struct {
+	Worker    int
+	RowsOut   int64
+	Loops     int64
+	StartupNs int64
+	TotalNs   int64
+}
+
+// EX0-03b (new): workerNodeStatsTable maps a shared inner-plan Node back
+// to one entry per execution site (worker slots 0..n-1, leader slot n),
+// folded post-join in gatherOp/gatherMergeOp.Close. Carried on Context
+// like gatherLaunchedTable and threaded through the ANALYZE walkers.
+type workerNodeStatsTable map[optimizer.Node][]workerNodeStat
+
+// EX0-03b (new): foldGatherWorkerStats appends each non-nil slot table's
+// four copied fields into ctx's carrier. Slots are visited in index order
+// so each node's slice is deterministically ordered by Worker; map
+// iteration only chooses which node is visited first, never slice order.
+// Nil slots (a site that never built) and nil entries contribute nothing.
+func foldGatherWorkerStats(ctx *Context, tables []nodeStatsTable) {
+	if ctx == nil {
+		return
+	}
+	for idx, tab := range tables {
+		if tab == nil {
+			continue
+		}
+		for node, st := range tab {
+			if node == nil || st == nil {
+				continue
+			}
+			if ctx.GatherWorkerStats == nil {
+				ctx.GatherWorkerStats = make(workerNodeStatsTable)
+			}
+			ctx.GatherWorkerStats[node] = append(ctx.GatherWorkerStats[node], workerNodeStat{
+				Worker:    idx,
+				RowsOut:   st.rowsOut,
+				Loops:     st.loops,
+				StartupNs: st.startupNs,
+				TotalNs:   st.totalNs,
+			})
+		}
+	}
 }
 
 // maybeInstrument is called by Build right before each switch arm
