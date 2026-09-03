@@ -596,3 +596,51 @@ the search or in `createPlan` can move that. That reading should be CONFIRMED
 against the offset check (`joinsearchseam.go:244-263`) before the first slice
 lands — it is the one place where rev 5 §13.2's "the seam is genuinely safe"
 has not been tested by executing a narrowed plan.
+
+
+---
+
+## 17. Revision 9 (2026-09-03) — the seam question is answered by shipped behaviour
+
+Rev 8 left one unknown: whether narrowing a leaf's `Output()` disturbs the seam's
+recorded widths, noting it was "the one place where rev 5 §13.2's 'the seam is
+genuinely safe' has not been tested by executing a narrowed plan."
+
+It has been, for some time. From the current TPC-H plan census (Q13):
+
+    ->  Hash Left Join  (cost=0.25..33245.50 rows=800725 width=1072)
+          Hash Cond: (customer.c_custkey = orders.o_custkey)
+          ->  Index Only Scan using customer_pk on customer   width=32
+          ->  Seq Scan on orders                              width=448
+
+An `IndexOnlyScan` emits ONLY the columns its index covers — width 32 against
+`customer`'s full row — and it sits directly under a join, beside a full-width
+sibling. Q9's plan has the same shape with a `Parallel Index Only Scan on
+partsupp` (width 64), and Q13 appears again at width 32 under another join.
+
+All 24 TPC-H queries return correct values in this configuration, verified
+repeatedly this session.
+
+### What that settles
+
+**A narrowed leaf under a join already works end to end.** The seam's recorded
+widths, `baseRelLayout`'s by-name re-basing and `boundaryMap`'s licensed `fill`
+all handle it, and they do so in the shipped default path rather than under a
+flag. Rev 5 §13.2's reading was right, and it is no longer an inference.
+
+It also makes the rev 7 decision concrete rather than analogical.
+`IndexOnlyScan` is not merely *evidence for* a projecting node class — it is a
+working instance of exactly the shape P4-01 needs: a node whose schema and
+emitted row are both narrowed, from one source, sitting under a join whose
+layout machinery copes. A `Project` over a build side is the same pattern with a
+different producer.
+
+### What is still untested
+
+`IndexOnlyScan` narrows a LEAF. P4-01 narrows a build side that may be a join
+subtree, so the `Project` can sit above an arbitrary plan rather than above a
+scan. The layout machinery is the same, but the case is not identical, and the
+first slice should still run under `GOOPG_ASSERT_ROW_SHAPE=1` against the PG
+oracle at both budgets per §13.5.
+
+With this, every unknown rev 5 raised is closed. The item is ready to implement.

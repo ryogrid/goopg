@@ -1438,6 +1438,14 @@ delta.
       of scope. P4-01 keeps its own justification (2-4x fewer batches) but does
       not unblock P2-02b on its own. See
       `impl/FINDING-p401-alone-is-not-enough.md`.
+      **READY TO IMPLEMENT (P4-A rev 9).** The last open question — whether a
+      narrowed leaf disturbs the seam — is answered by shipped behaviour, not by
+      reading code: TPC-H Q13 already runs
+      `Hash Left Join <- Index Only Scan on customer (width=32)` beside a
+      full-width `Seq Scan on orders (width=448)`, and Q9 the same with a
+      `Parallel Index Only Scan on partsupp`. A narrowed leaf under a join works
+      end to end in the DEFAULT path, with all 24 queries correct. Still
+      untested: `Project` above a join SUBTREE rather than above a scan.
       **Mechanism DECIDED (P4-A rev 7): insert a real `Project` below the build
       side; do NOT make the scans project.** `projectOp` sizes
       `o.out = acquireRow(len(o.targets))` and takes its schema from the same
