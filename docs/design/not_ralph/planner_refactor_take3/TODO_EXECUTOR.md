@@ -63,11 +63,7 @@ re-baselined), worker stats surface, per-operator slices published for the
 three witness shapes, batch counters report. No plan moved, no timing
 claimed.
 
-- [ ] EX0-01 File the executor backlog ledger — one
-      `.ralph/deferral_ledger.md` row per open 12 gap (G-EX1…G-EX8) with
-      the 10 § upstream citation. (Replaces the absent `take2-P7-03*` rows;
-      only `take2-executor-residual` exists under that key, 12 §13.)
-      *design: 13 §2.2; gate: ledger rows merged, no code.*
+- [x] EX0-01 File the executor backlog ledger — `6ace9567e` (design) + ledger rows this commit; gates: 8 `take3-EX0-G-EXn` rows merged, `git diff --stat` docs-only; artifacts: `docs/design/executor-ex0-01-ledger/DESIGN.md`, `.ralph/deferral_ledger.md`
 - [ ] EX0-02 Commit the measurement protocol — artifact header + executor
       additions (GOGC/GOMEMLIMIT, `work_mem` + `effective_cache_size` per
       arm, alloc arm, flamegraph/perf invocation from take6/round5).
