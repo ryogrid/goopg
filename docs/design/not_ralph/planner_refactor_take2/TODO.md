@@ -1575,9 +1575,24 @@ difference explained and timed.
       `analysis/planner-refactor-take2/acceptance-<date>/README.md` with the
       09 §6.6 header, before/after roll-ups, and an explicit statement of
       everything that got worse. *gate: 09 §9.*
-- [ ] **P7-03** Update the deferral ledger for every item left open, and record
+- [x] **P7-03** Update the deferral ledger for every item left open, and record
       the executor-side residuals (07 §6) as their own follow-up with resume
       points. *gate: 08 §1 P6.*
+      **Done 2026-09-03** — 11 rows appended to `.ralph/deferral_ledger.md`,
+      one per item this bundle left open or determined must-not-be-done, each
+      with its MEASUREMENT and a resume point:
+      `take2-P2-02b` (+23.1%, blocked on P4-01 and Phase 5),
+      `take2-P2-08` / `take2-P2-10` / `take2-P2-09-saop` (all three blocked on
+      an absent consumer, resume after Phase 3/4),
+      `take2-P2-09-qualcost` (faithful but -3.3%; land with the rest of
+      btcostestimate),
+      `take2-P6-03` (6.5x) / `take2-P6-04` (12.5x) / `take2-P6-05` (a live
+      tripwire's oracle) — the three Phase 6 "cleanups" that are load-bearing,
+      `take2-P6-06` (flip safe but a wash),
+      `take2-P3-01` (name-resolution blocker plus the underestimate hazard),
+      and `take2-executor-residual` — 07 §6's width gap, measured at EQUAL
+      cardinality for the first time (1098-3164 B vs PG's 23-81 B; 97 MB and 8
+      batches against 38 MB and 1; Q9 63.8s vs 6.2s).
 
 ---
 
