@@ -1438,6 +1438,15 @@ delta.
       of scope. P4-01 keeps its own justification (2-4x fewer batches) but does
       not unblock P2-02b on its own. See
       `impl/FINDING-p401-alone-is-not-enough.md`.
+      **Mechanism DECIDED (P4-A rev 7): insert a real `Project` below the build
+      side; do NOT make the scans project.** `projectOp` sizes
+      `o.out = acquireRow(len(o.targets))` and takes its schema from the same
+      target list, so it narrows row and schema together BY CONSTRUCTION and
+      cannot reproduce P4-01b — where `newSeqScanOp` holds the width in two
+      places (`schema: p.Output()` vs `cols: p.Table.Columns`) and P4-01b moved
+      one. §7's objection that the parallel leaf switches block this is wrong:
+      `drivingScan` already has `case *Project` (parallel.go:457) and
+      `extractSeqScanFromPlan` likewise (parallel_hash_build.go:320).
       **§12's table has now been re-taken on current HEAD (P4-A rev 6).** Widths
       per node — goopg 3164/2716/2168/1094 B against PG's 81/54/32/23 — top-level
       cardinality 321,056 against 318,748 (0.7 % apart, so the equal-cardinality

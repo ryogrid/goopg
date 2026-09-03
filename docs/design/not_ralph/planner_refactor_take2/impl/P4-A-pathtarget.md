@@ -476,3 +476,65 @@ batches to 64 at PostgreSQL's `work_mem` — not to 1 — because
 `EntryBytes = ncols × 48 + 24` makes the per-column footprint co-dominant with
 the column count. **P4-01 remains justified on its own terms and no longer
 carries the claim that it unblocks P2-02b.**
+
+
+---
+
+## 15. Revision 7 (2026-09-03) — the mechanism decision §13.2 forced
+
+§13.2 established that a `PathTarget` with `setrefs` fixup is necessary but not
+sufficient, and left two options. Decided here, on the code rather than on
+preference.
+
+### The deciding property
+
+`projectOp` sizes its output from the SAME list its schema comes from:
+
+- `o.out = acquireRow(len(o.targets))` (`operators.go:341`)
+- `schema: plan.Output()`, which is the projected target list
+  (`newProjectOp`, `operators.go:334-335`)
+
+So a `Project` narrows the row and the schema **together, by construction**. It
+cannot produce the P4-01b failure, because there is no second place holding the
+old width.
+
+The scan operators are the opposite: `newSeqScanOp` takes `schema: p.Output()`
+but `cols: p.Table.Columns`, and sizes `scanRow` from `cols`. The width lives in
+two places, and P4-01b moved one of them.
+
+### Decision: **insert a real `Project`, do not make the scans project**
+
+| | Project below the build side | scans project |
+|---|---|---|
+| invariant | satisfied **by construction** | must be maintained by hand across every decode path |
+| sites to change | planner inserts a node | `newSeqScanOp`, `decodeScanRow`, `decodeScanRowRange`, the `Next` emit block, `parallel_hash_build.go`'s scan extraction, and `operators_index.go`'s equivalents — in lockstep |
+| failure mode if wrong | a missing column is a *plan* error, caught at build | a width mismatch is a *silent wrong answer* |
+| parallel machinery | already descends it — `drivingScan` has `case *Project` (`parallel.go:457`), `extractSeqScanFromPlan` likewise (`parallel_hash_build.go:320`) | scan-shaped, but every extraction site must agree |
+
+§7 dismissed the `Project` option on the grounds that the parallel
+leaf-recognition switches would need updating and that "parallel.go matters
+most". That is **wrong**: those switches already have `*Project` arms, added for
+other reasons. §7's objection should be struck.
+
+### The cost of the chosen option, stated
+
+An extra operator over the build side: one `evalExprSlot` per target per row.
+For the `*ColumnRef` targets a projection is made of, that is a slot read, not an
+expression evaluation — but it is not free, and it is paid on the BUILD side
+only, which is where the memory is saved. That trade is the thing to measure
+first: a narrowed build that costs one slot read per column per row against a
+hash table that no longer batches.
+
+### What still gates implementation
+
+`FINDING-p401-alone-is-not-enough.md`: narrowing takes the Q9 build from 128
+batches to **64** at PostgreSQL's `work_mem`, not to 1, because
+`EntryBytes = ncols × 48 + 24` makes per-column footprint co-dominant. So this
+mechanism is now decided, and the item is still not sufficient on its own for
+P2-02b. It should be implemented for its own 2–4× batch reduction, with the
+`MinimalTuple`-shaped work (07 §6) tracked as its partner rather than as a
+downstream residual.
+
+Run it under `GOOPG_ASSERT_ROW_SHAPE=1` (both scan paths are instrumented) and
+gate on `tpch-runner -digest` against the PG oracle at BOTH `work_mem` budgets,
+per §13.5.
