@@ -110,8 +110,17 @@ downstream consumers still quoted the old values and were updated here:
 
 - U1 — M3 downstream: FIXED post-review — 07:176, 08:341, TODO:437 now cite
   `specialjoin.go:54` (def) / `collapse.go:416` (call).
-- U2 — M7 residual: only spot-fixed here. Either re-pin every `path:line`
-  cite mechanically at the merge HEAD or drop line numbers for symbols.
+- U2 — M7 residual: RESOLVED by verification — no code under
+  `internal/optimizer/`, `internal/catalog/`, `operators_analyze.go` or
+  `operators_explain.go` changed since the re-pin HEAD (`b4e68c574`;
+  `git log b4e68c574..HEAD` on those paths is empty), and all re-pinned
+  cites re-verified current by Grep (`sortPathFor` at
+  `joinpathsmerge.go:423`, `searchTupleFraction` at
+  `joinsearchseam.go:653`, `addPath` at `path.go:601`,
+  `pathNCols`/`pathAvgVarBytes` at `path.go:348`/:360,
+  `makeSpecialJoinInfo` at `specialjoin.go:54`,
+  `columnStatsForChildBase` at `cardinality.go:899`). No mechanical
+  re-pin needed; next code-touching commit should re-check.
 - U3 — M9 code side: stale comments (`dispatch.go:1975`,
   `plannersettings.go:8-15`, `cost_funcs.go:77-79`, `path.go`, `joinsearch.go`,
   `relsize.go`, `joinkeyproof.go`) need code commits; docs already flag them.
