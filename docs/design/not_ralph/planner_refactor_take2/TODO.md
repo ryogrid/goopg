@@ -1270,9 +1270,26 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
       A targeted NLI adjustment would be exactly the "cost-term tuning" this
       bundle's own lessons warn never fixed a query, and at these margins it
       would be tuning to the benchmark.
-- [ ] **P3-12** Delete `reorderCommaFromByCardinality` — the pre-search greedy
+- [~] **P3-12** Delete `reorderCommaFromByCardinality` — the pre-search greedy
       reorder that biases the search's input. *design: 08 §6.6; gate:
       plan-parity + timing both suites, own commit.*
+      **The BEHAVIOUR is gone (2026-09-03); the dead code is not yet deleted.**
+      `planSelectWithSettings` no longer permutes the FROM list before planning.
+      It was a join-ORDER decision taken before the cost-based search ran, so it
+      biased the search's input rather than informing it.
+      Gates: TPC-H 220.98s, inside the 219.78-222.25s range the previous item
+      measured for an unchanged binary, 24 MATCH on values. TPC-DS SF0.5 PASS=95
+      MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, verdict-changes none,
+      **aggregate -3.2%**, 64 plan shapes changed.
+      Split by attribution: the 64 queries whose plans MOVED are **-41s**; the
+      35 whose plans are identical are +7s. All three queries the per-query arm
+      named (Q12, Q91 slower; Q76 faster) have IDENTICAL plans and are not
+      attributable. So the real effect is -41s on the queries it touched.
+      *Still to do:* delete the ~500 dead lines in `joinorder.go` (everything
+      but `flattenOrBranches`, which has two external users) and the 19 tests
+      that exercise the removed entry point. That is a mechanical cleanup and
+      belongs with Phase 6's other dead-code removals (P6-05), not mixed into a
+      measured behaviour change.
 
 ---
 

@@ -1117,21 +1117,16 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx = newResolveContext([]rangeBinding{b}, schema, plannerSet)
 	} else {
 		// Cost-based join-order reordering: when every comma-FROM
-		// table has ANALYZE statistics, permute the FROM list so
-		// small-cardinality relations join first. Operates on a
-		// SelectStmt copy so we don't mutate the caller's parser
-		// AST. Falls through to source order when stats are
-		// missing or the FROM list isn't a pure comma chain.
-		// See docs/design/0003-0016-join-order-reordering.md.
-		stmt := s
-		if reFE, reFR, rewrote := reorderCommaFromByCardinality(s, cat); rewrote {
-			c := *s
-			c.FromExprs = reFE
-			c.From = reFR
-			stmt = &c
-		}
+		// take2 P3-12: the pre-search greedy FROM-list permutation
+		// (reorderCommaFromByCardinality) is GONE. It placed
+		// small-cardinality relations first, which was a join-ORDER
+		// decision taken before the cost-based search ran — so it
+		// biased the search's input rather than informing it, and the
+		// search then had to re-derive an order from a list already
+		// permuted on a different rule. The search chooses join order
+		// on cost; a greedy pre-pass can only take that choice away.
 		var err error
-		node, ctx, err = planFromClause(stmt, cat, plannerSet)
+		node, ctx, err = planFromClause(s, cat, plannerSet)
 		if err != nil {
 			return nil, err
 		}
