@@ -1469,8 +1469,24 @@ difference explained and timed.
       is not neutral. Retiring it needs the costed producers to cover the
       correlated-scan-input case first, which is Phase 4 work, not a Phase 6
       cleanup.
-- [ ] **P6-04** Delete `rewriteJoinsToNLI` and `GOOPG_NLI_COSTGATE`.
+- [-] **P6-04** Delete `rewriteJoinsToNLI` and `GOOPG_NLI_COSTGATE`.
       *design: 08 §9.3; depends on P3-11.*
+      **ATTEMPTED 2026-09-03 — load-bearing, and P3-11 explains exactly why.**
+      Removing the call changes 99 plan lines. TPC-H Q4's semi-join goes
+      **8694.33 -> 109043.90 (12.5x)**: the `Nested Loop Semi Join` disappears
+      and is replaced by a `Hash Semi Join` over a full `Seq Scan on lineitem`
+      (2,000,418 rows). Q21's anti-join degrades the same way.
+      This is the OTHER HALF of P3-11's finding, and the two must be read
+      together. P3-11 measured the search's own `nestloop.index` producer at 23
+      accepted out of 694 offered, losing by margins as small as 0.05%.
+      `rewriteJoinsToNLI` is what supplies the NLI shapes the search does not
+      win. Deleting it while the search still under-selects NLI removes the
+      compensation without fixing the cause.
+      The dependency recorded on P3-11 is therefore right, but the implication
+      is the reverse of what the item assumes: P3-11 does not clear this for
+      deletion — it shows the search cannot yet replace it. Retire it once the
+      search selects NLI on its own merits, which P3-11 says is a calibration
+      question spread across the remaining `btcostestimate` and hash terms.
 - [-] **P6-05** Delete the dead `reconcileNLILayout`. *design: 08 §9.3.*
       **DO NOT DELETE — it is not dead (verified 2026-09-03).** It has no
       direct production call site, which is what the item's premise rests on,
