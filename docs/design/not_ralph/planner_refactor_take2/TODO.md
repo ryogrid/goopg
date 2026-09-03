@@ -588,12 +588,21 @@ slower than 1.2×, S-cold/WARM gap narrows.
       `oprcode`. That half of the item stands — it matters for types whose text
       form is not injective (float, numeric with trailing zeros), and the semi
       arm has the same limitation, so the two should move together.
-- [ ] **P1-16** Re-diagnose TPC-H Q9's cardinality error with `estimate-audit`.
-      Its recorded explanation — single-`nd` pricing of a two-column join — was
-      retired by M0127-P5.6-f, which folds every equi-pair in both estimator
-      arms (07 §3.11 item 3). Close ledger rows 779/781/784 as stale and file
-      what the audit actually shows. *design: 08 §4.5; gate: `estimate-audit`
-      final-joinrel bar on Q9.*
+- [x] **P1-16** Re-diagnosed TPC-H Q9 with `estimate-audit` (report
+      `/tmp/take3-audit/take3-p116-q9.txt`; ledger rows 779/781/784 closed
+      as stale, new `take2-P1-16` row filed). The single-`nd` story is GONE
+      at the join it blamed: the two-column `lineitem ⋈ partsupp` joinrel is
+      now 6,001,255 vs 6,001,255 (1.0× exact), both estimator arms folding
+      every pair. Q9's residual final-joinrel error is 2,000,398 vs 321,056
+      (**6.2× over**, excess 3.6× vs PG's 1.8× under) and enters ONE level
+      higher, from a restriction: `part.p_name LIKE '%green%'` has no
+      `OpLike` arm in `clauseSelectivity` (`selectivity.go:99` falls to
+      `defaultGenericSelectivity` 1/3), pricing `part` at 66,666 vs actual
+      ~10.6k (PG `patternsel`: 6,061) — the 6.25× propagates linearly
+      through key-constrained 1:1 fanouts above. No plan decision changes
+      (spine mismatch is structural, 07 §3.1/§3.10). Follow-up routed to
+      **P1-14b** (already scoped: "`patternsel` for LIKE/regex"); no new
+      item. Gate was the `estimate-audit` final-joinrel bar.
 - [x] **P1-17** — **verified already satisfied**, no code change. All three
       named parts are present in `semiPairMatchFraction`: the MCV arm, `nd2`
       clamped by the inner rel's rows, and the `(1-nullfrac1)` factor. Checked
