@@ -639,3 +639,378 @@ replaces the product in `estimate_num_groups`.
 40. Ext build: per-combo Duj1 (d), supporting-rows ratio (f, zero dropped), MCV 4%-error cut + base frequencies, expr stats serialised; MCV-first-then-dependencies; best object ≥ 2 covered (fewest-keys tiebreak); `mcv_sel + clamp(simple−base, 0, 1−total)`; dependency chain weakest→strongest; NullTest MCV-only. (`statistics/`, `extended_stats.c:1981`)
 41. FK: keep fully-matched only; `1/max(ref_tuples,1)` (SEMI/ANTI `ref_rows/ref_tuples`); exact-count pruning; const-EC division; no null derating; join-size table (§10). (`initsplan.c`, `costsize.c:5651,5501`)
 42. In-place `pg_class` writes invalidate cached plans; generic after 5 customs when cheaper; `plan_cache_mode` overrides; PG18 stats import/export + `pg_dump --statistics`. (`heapam.c`, `plancache.c`, `statistics/`)
+
+---
+
+## 12. Worked selectivity examples (synthetic inputs)
+
+All inputs in this section are SYNTHETIC and hand-constructed for
+illustration. They are not measurements from the live PG 18.3 oracle.
+Each example names the estimator in
+`postgres/src/backend/utils/adt/selfuncs.c` it exercises and shows every
+arithmetic step. All arithmetic below was verified with `python3 -c`.
+
+### 12.1 Scalar inequality via histogram interpolation (`scalarineqsel` / `ineq_histogram_selectivity`)
+
+SYNTHETIC INPUT: column `t.x` with `stanullfrac = 0.1`, MCV total
+`sumcommon = 0.2`, satisfying-MCV part `mcv_selec = 0.05`, histogram
+bounds `nvalues = 5` with values `[0, 10, 20, 30, 40]`, constant `25`,
+operator `<` (`isgt = False`, `iseq = False`), `ndistinct = 22`,
+`nMCV = 2`.
+
+1. Binary search for the first bound failing `op(bound, const)`: bounds
+   `0`, `10`, `20` satisfy `< 25`; bound `30` fails. Hence bin index
+   `i = 4` with `low = 20` and `high = 30`.
+2. `binfrac = (val - low) / (high - low) = (25 - 20) / (30 - 20) =
+   5 / 10 = 0.5`.
+3. `histfrac = ((i - 1) + binfrac) / (nvalues - 1) = (3 + 0.5) / 4 =
+   3.5 / 4 = 0.875`.
+4. Because `isgt == iseq` (`False == False`), compute `eq_selec = 1 /
+   (ndistinct - nMCV) = 1 / (22 - 2) = 1 / 20 = 0.05` and subtract it:
+   `hist = histfrac - eq_selec = 0.875 - 0.05 = 0.825`.
+5. Cutoff is `0.01 / (nvalues - 1) = 0.01 / 4 = 0.0025`, so the allowed
+   interval is `[0.0025, 0.9975]`. `0.825` is inside, no clamp.
+6. `scalarineqsel` combination: `selec = (1 - nullfrac - sumcommon) *
+   hist + mcv_selec = (1 - 0.1 - 0.2) * 0.825 + 0.05 = 0.7 * 0.825 +
+   0.05 = 0.5775 + 0.05 = 0.6275`.
+7. On `N = 10000` rows, `rows = 10000 * 0.6275 = 6275` after rounding
+   (`python3 -c` gives `6274.999999999999`, which rounds to `6275`).
+
+This is the `ineq_histogram_selectivity` path in
+`postgres/src/backend/utils/adt/selfuncs.c:ineq_histogram_selectivity`
+called from `scalarineqsel`, with the `convert_to_scalar` linear
+interpolation inside the bin and the `isgt == iseq` boundary correction
+from §5.3.
+
+### 12.2 Equality via MCV plus histogram remainder (`var_eq_const`)
+
+SYNTHETIC INPUT: `stanullfrac = 0.05`, MCV slot with three entries
+`A = 0.3`, `B = 0.15`, `C = 0.05`, `ndistinct = 10`, `nnumbers = 3`.
+Exercised estimator:
+`postgres/src/backend/utils/adt/selfuncs.c:var_eq_const` after
+`examine_simple_variable` loads the `STATRELATTINH` tuple.
+
+1. `sumcommon = 0.3 + 0.15 + 0.05 = 0.5`.
+2. Hit case: constant equals `B`, so `selec = 0.15`. On `N = 10000`,
+   `rows = 10000 * 0.15 = 1500.0`.
+3. Miss case: constant equals `D` (not in the MCV list). Remainder is
+   `1 - sumcommon - nullfrac = 1 - 0.5 - 0.05 = 0.45`.
+4. `otherdistinct = ndistinct - nnumbers = 10 - 3 = 7`.
+5. Uncapped miss selectivity is `0.45 / 7 = 0.0642857142857143`.
+6. Cap at the least-common MCV frequency `0.05`: because
+   `0.0642857142857143 > 0.05` is true, `selec = 0.05`. On
+   `N = 10000`, `rows = 10000 * 0.05 = 500.0`.
+7. Negated form (`<>`, `negate = True`) on the hit case is `1 - selec -
+   nullfrac = 1 - 0.15 - 0.05 = 0.8`, followed by
+   `CLAMP_PROBABILITY`.
+
+Without stats the same call would fall back to `1 / ndistinct = 1 / 10
+= 0.1`; with `isunique` and `tuples = 1000` it would return `1 / 1000 =
+0.001` (both fallback arms of `var_eq_const` in §5.2).
+
+### 12.3 Inner equi-join MCV pairing (`eqjoinsel_inner`)
+
+SYNTHETIC INPUT: left MCVs `{A: 0.5, B: 0.3, C: 0.1}` with `nd1 = 5`
+and `nullfrac1 = 0.0`; right MCVs `{A: 0.25, B: 0.25, D: 0.25}` with
+`nd2 = 4` and `nullfrac2 = 0.0`. Estimator:
+`postgres/src/backend/utils/adt/selfuncs.c:eqjoinsel_inner`, both-MCV
+branch from §7.2.
+
+1. Pairwise match with the join operator finds `A` and `B`, so
+   `nmatches = 2`.
+2. `matchprodfreq = 0.5 * 0.25 + 0.3 * 0.25 = 0.125 + 0.075 = 0.2`.
+3. Left side: `matchfreq1 = 0.5 + 0.3 = 0.8`, `unmatchfreq1 = 0.1`,
+   `otherfreq1 = 1 - 0.0 - 0.8 - 0.1 = 0.1`.
+4. Right side: `matchfreq2 = 0.25 + 0.25 = 0.5`, `unmatchfreq2 = 0.25`,
+   `otherfreq2 = 1 - 0.0 - 0.5 - 0.25 = 0.25`.
+5. `totalsel1 = matchprodfreq + unmatchfreq1 * otherfreq2 / (nd2 -
+   nvalues2) + otherfreq1 * (otherfreq2 + unmatchfreq2) / (nd2 -
+   nmatches) = 0.2 + 0.1 * 0.25 / 1 + 0.1 * 0.5 / 2 = 0.2 + 0.025 +
+   0.025 = 0.25`. Here `nvalues2 = 3`, so `nd2 - nvalues2 = 4 - 3 = 1`
+   and `nd2 - nmatches = 4 - 2 = 2`.
+6. `totalsel2 = 0.2 + 0.25 * 0.1 / (5 - 3) + 0.25 * (0.1 + 0.1) / (5 -
+   2) = 0.2 + 0.0125 + 0.016666666666666666 = 0.22916666666666669`.
+   The two terms are `0.25 * 0.1 / 2 = 0.0125` and `0.25 * 0.2 / 3 =
+   0.016666666666666666`.
+7. `selec = min(totalsel1, totalsel2) = min(0.25,
+   0.22916666666666669) = 0.22916666666666669`.
+8. With `1000` outer rows and `4` inner rows, the INNER join estimate is
+   `1000 * 4 * 0.22916666666666669 = 916.6666666666667`, i.e. `917`
+   after `clamp_row_est` rounding.
+
+Without MCVs the same inputs would use `(1 - 0.0) * (1 - 0.0) / max(5,
+4) = 1 / 5 = 0.2`.
+
+### 12.4 Multivariate ndistinct and functional-dependency down-weighting
+
+SYNTHETIC INPUT (ndistinct): table `t(a, b)` with `N = 10000` rows,
+`ndistinct(a) = 100`, `ndistinct(b) = 100`. Estimators:
+`postgres/src/backend/utils/adt/selfuncs.c:estimate_num_groups` with
+`estimate_multivariate_ndistinct`.
+
+1. Independence product is `100 * 100 = 10000`.
+2. Multi-column clamp is `0.1 * 10000 = 1000.0`. Hence `min(10000,
+   1000) = 1000` without extended statistics.
+3. With a `STATS_EXT_NDISTINCT` object storing `ndistinct(a, b) = 100`,
+   the product is replaced by `100`.
+
+SYNTHETIC INPUT (dependencies): `WHERE a = 1 AND b = 1` with
+`s1 = 0.01` and `s2 = 0.01`, dependency `a -> b` of degree `f = 0.9`.
+Estimator: `clauselist_apply_dependencies` in
+`postgres/src/backend/statistics/dependencies.c` via
+`extended_stats.c:statext_clauselist_selectivity`.
+
+1. Independence gives `s1 * s2 = 0.01 * 0.01 = 0.0001`.
+2. Because `s1 <= s2` (`0.01 <= 0.01`), `attr[b] = f + (1 - f) * s2 =
+   0.9 + 0.1 * 0.01 = 0.9 + 0.001 = 0.901`.
+3. Result is `s1 * attr[b] = 0.01 * 0.901 = 0.00901`. On `N = 10000`,
+   `10000 * 0.00901 = 90.10000000000001` (about `90` rows) versus `10000
+   * 0.0001 = 1.0` row under independence.
+
+Second branch illustration with `s1 = 0.1`, `s2 = 0.02`, `f = 0.8`
+(`s1 > s2`): `attr[b] = f * s2 / s1 + (1 - f) * s2 = 0.8 * 0.02 / 0.1
++ 0.2 * 0.02 = 0.16 + 0.004 = 0.164`; result `0.1 * 0.164 = 0.0164`
+versus independence `0.1 * 0.02 = 0.002`; on `N = 10000` that is
+`164.0` rows versus `20.0` rows.
+
+### 12.5 `estimate_num_groups` on a small distinct-count example
+
+SYNTHETIC INPUT: `GROUP BY a, b` with `ndistinct(a) = 5`,
+`ndistinct(b) = 4`, `rel->tuples = 1000`, `rel->rows = 1000`,
+`input_rows = 1000`. Estimator:
+`postgres/src/backend/utils/adt/selfuncs.c:estimate_num_groups`.
+
+1. Product is `5 * 4 = 20`.
+2. With `2` grouping variables the clamp is `0.1 * 1000 = 100.0`, and
+   `min(20, 100) = 20`.
+3. No Yao restriction scaling applies because `rows = 1000` equals
+   `tuples = 1000`. After `ceil` and clamping to `[1, 1000]`, groups
+   `= 20`.
+
+Yao scaling illustration with `D = 500`, `tuples = 1000`, `rows = 100`:
+
+1. Remaining fraction is `(1000 - 100) / 1000 = 900 / 1000 = 0.9`.
+2. Exponent is `tuples / D = 1000 / 500 = 2.0`.
+3. `0.9 ** 2.0 = 0.81`, so `D * (1 - 0.81) = 500 * 0.19 = 95.0`
+   (`python3 -c` gives `94.99999999999997`, i.e. `95.0`). After `ceil`
+   and clamping to `[1, 100]`, groups `= 95`.
+
+Near-unity illustration with `D = 20`, `tuples = 1000`, `rows = 500`:
+remaining fraction `500 / 1000 = 0.5`, exponent `1000 / 20 = 50.0`,
+`0.5 ** 50.0 = 8.881784197001252e-16`, `20 * (1 -
+8.881784197001252e-16) = 19.999999999999982` (about `20.0`), so almost
+no reduction when the subset still covers half the table.
+
+### 12.6 Nullfrac-corrected conjunction (`clauselist_selectivity`)
+
+SYNTHETIC INPUT: `WHERE x > 10 AND x < 20` on the same `equal()` variable
+with low-bound selectivity `lo = 0.6`, high-bound selectivity `hi = 0.7`,
+and `P(x IS NULL) = 0.02` from `nulltestsel`. Estimator:
+`postgres/src/backend/optimizer/path/clausesel.c:clauselist_selectivity_ext`
+range pairing from §6.
+
+1. Valid-range case: `s2 = hi + lo - 1.0 + P(NULL) = 0.7 + 0.6 - 1.0 +
+   0.02 = 1.3 - 1.0 + 0.02 = 0.3 + 0.02 = 0.32` (`python3 -c` gives
+   `0.31999999999999984`, i.e. `0.32`). On `N = 10000`, `rows = 10000 *
+   0.32 = 3200.0`.
+2. Contradictory-bounds case with `hi = 0.3` and `lo = 0.4`:
+   `0.3 + 0.4 - 1.0 + 0.02 = 0.7 - 1.0 + 0.02 = -0.3 + 0.02 = -0.28`.
+   Because `-0.28 < -0.01`, the pair falls back to
+   `DEFAULT_RANGE_INEQ_SEL = 0.005`. On `N = 10000`, `rows = 10000 *
+   0.005 = 50.0`.
+3. Near-zero case with `hi = 0.5`, `lo = 0.49`, `P(NULL) = 0.005`:
+   `0.5 + 0.49 - 1.0 + 0.005 = 0.99 - 1.0 + 0.005 = -0.01 + 0.005 =
+   -0.005000000000000009` (about `-0.005`), which lies in `[-0.01, 0]`
+   and therefore yields `1e-10`.
+
+---
+
+## 13. Extended checklist appendix (items 43-72)
+
+This appendix continues the §11 numbering (last existing item is `42`)
+and restores take2 checklist substance that §11 condenses. It adds the
+per-estimator fallback chains, the `DEFAULT_*` constants table, the
+extended-statistics `d`/`f`/`m`/`e` application order, the `ANALYZE`
+sampling parameters, the invalidation message flow, and the per-type
+`pg_statistic` slot layout. Existing §11 items and the catalog-layout
+tables in §1-§3 are untouched.
+
+### 13.1 `DEFAULT_*` and pattern constants (verified against take2 §5.1)
+
+| constant | value | used by |
+|---|---|---|
+| `DEFAULT_EQ_SEL` | `0.005` | `eqsel` with no var/const, `neqjoinsel` fallback |
+| `DEFAULT_INEQ_SEL` | `0.3333333333333333` | `scalarineqsel` without stats, inequality joins |
+| `DEFAULT_RANGE_INEQ_SEL` | `0.005` | `clauselist` range-pair fallback |
+| `DEFAULT_MULTIRANGE_INEQ_SEL` | `0.005` | multirange operators |
+| `DEFAULT_MATCH_SEL` | `0.005` | `LIKE`/regex without stats |
+| `DEFAULT_MATCHING_SEL` | `0.01` | generic matching operators |
+| `DEFAULT_NUM_DISTINCT` | `200` | `get_variable_numdistinct` |
+| `DEFAULT_UNK_SEL` | `0.005` | `IS NULL` / `IS UNKNOWN` without stats |
+| `DEFAULT_NOT_UNK_SEL` | `0.995` | `IS NOT NULL` / `IS NOT UNKNOWN` (`1 - 0.005 = 0.995`) |
+| `FIXED_CHAR_SEL` | `0.2` | `like_selectivity` per literal char |
+| `CHAR_RANGE_SEL` | `0.25` | `like_selectivity` per char range |
+| `ANY_CHAR_SEL` | `0.9` | `like_selectivity` per `_` |
+| `FULL_WILDCARD_SEL` | `5.0` | `like_selectivity` per `%`, regex anchoring |
+| `PARTIAL_WILDCARD_SEL` | `2.0` | `like_selectivity` partial prefix |
+| pattern clamp | `[0.0001, 0.9999]` | `patternsel_common` result clamp |
+| range-pair epsilon | `1e-10` | `clauselist` near-zero range result |
+| hash-bucket clamp | `[1e-6, 1]` | `estimate_hash_bucket_stats` |
+| histogram cutoff base | `0.01` | `ineq_histogram_selectivity` cutoff `0.01 / (nvalues - 1)` |
+
+Header: `postgres/src/include/utils/selfuncs.h`; pattern constants:
+`postgres/src/backend/utils/adt/like_support.c`.
+
+### 13.2 New checklist items
+
+**Per-estimator fallback chains**
+
+43. Neither side is a single-rel variable in `eqsel_internal` yields
+`DEFAULT_EQ_SEL = 0.005`, negated `1 - 0.005 = 0.995`. (`selfuncs.c:eqsel`)
+44. `var_eq_const` with a `NULL` constant yields `0.0`; unique variable
+with `rel->tuples = 1000` yields `1 / 1000 = 0.001`; no stats and no
+unique yields `1 / ndistinct` (e.g. `1 / 10 = 0.1` with `ndistinct =
+10`). (`selfuncs.c:var_eq_const`)
+45. `scalarineqsel` without stats uses `ctid` block-fraction arithmetic
+and otherwise `DEFAULT_INEQ_SEL = 0.3333333333333333`; a failed
+`convert_to_scalar` contributes `0.5` of the bin; a missing histogram
+contributes `hist = 0.5`. (`selfuncs.c:scalarineqsel`,
+`ineq_histogram_selectivity`)
+46. `nulltestsel` on system columns (`varattno < 0`) yields `0` for `IS
+NULL` and `1` for `IS NOT NULL`; `booltestsel` without stats maps
+`IS TRUE` and `IS NOT FALSE` to the argument selectivity; bare
+`boolvarsel` without stats yields `0.5`. (`selfuncs.c:nulltestsel`,
+`booltestsel`, `boolvarsel`)
+47. `patternsel_common` without stats or without a usable histogram
+(`hist_size < 10`) falls back to the heuristic; `hist_size < 100`
+blends histogram and heuristic by `hist_size / 100`; the result is
+clamped to `[0.0001, 0.9999]` and then MCV-adjusted with `1 - nullfrac
+- sumcommon`. (`like_support.c:patternsel_common`)
+48. `scalararraysel` on a non-constant array assumes `10` elements via
+`estimate_array_length`; `= ANY` uses the disjoint sum while it stays in
+`[0, 1]` and otherwise OR-combines with `s1 + s2 - s1 * s2`; `<> ALL`
+uses the dual `1 - s1disjoint` form. (`selfuncs.c:scalararraysel`)
+49. `neqjoinsel` without a negator yields `1 - DEFAULT_EQ_SEL = 1 - 0.005
+= 0.995`; `<`, `<=`, `>`, `>=` joins unconditionally yield
+`DEFAULT_INEQ_SEL = 0.3333333333333333`; `mergejoinscansel` leaves the
+`0`/`1` defaults in place on `DEFAULT_INEQ_SEL` inputs and resets
+degenerate `start >= end` to `0`/`1`. (`selfuncs.c:neqjoinsel`,
+`scalarltjoinsel`, `mergejoinscansel`)
+50. `estimate_num_groups` with a volatile constant-free expression
+returns `input_rows`; constant expressions are skipped; unknown
+`LIMIT`/`OFFSET` assume `0.1` of input (e.g. `0.1 * 1000 = 100.0`);
+`function_selectivity` defaults to `0.5`; unhandled
+`clause_selectivity_ext` nodes yield `0.5`. (`selfuncs.c:3449`,
+`pathnode.c:adjust_limit_rows_costs`, `clausesel.c:667`)
+
+**`ANALYZE` sampling parameters**
+
+51. `minrows = 300 * attstattarget`: target `100` gives `300 * 100 =
+30000`; target `1` gives `300 * 1 = 300`; target `10000` gives `300 *
+10000 = 3000000`; `targrows = max(100, max minrows)` (e.g.
+`max(100, 30000) = 30000`). (`analyze.c:std_typanalyze`,
+`do_analyze_rel`)
+52. The `300` multiplier cites Chaudhuri-Motwani-Narasayya with `f =
+ 0.5`, `gamma = 0.01`, `n = 1000000`: `4 * log(2 * n / gamma) / (f * f)`
+evaluates to `305.821246792197` (about `305.82`), rounded down to `300`.
+(`analyze.c:std_typanalyze`)
+53. Block sampling reads `min(targrows, nblocks)` blocks with Knuth
+Algorithm S; row sampling is Vitter reservoir sampling; the sample is
+sorted by `TID` when the reservoir filled (`numrows = 30000` with
+`targrows = 30000` sorts). Live/dead counting uses
+`HeapTupleSatisfiesVacuum` against `OldestXmin`.
+(`analyze.c:acquire_sample_rows`, `sampling.c`)
+54. Extrapolation is `floor(liverows / blocks_read * totalblocks +
+0.5)`; inherited sampling budgets `rint(targrows * childblocks /
+totalblocks)` per child with `convert_tuples_by_name` mapping.
+(`analyze.c:acquire_sample_rows`, `acquire_inherited_sample_rows`)
+55. Values with raw size above `WIDTH_THRESHOLD = 1024` are counted in
+`stawidth` but excluded from value stats and treated as distinct;
+`stanullfrac = null_cnt / samplerows`; `stawidth` averages over
+non-nulls. (`analyze.c:compute_scalar_stats`)
+56. `stadistinct` above `0.1 * totalrows` (e.g. `0.1 * 10000 = 1000.0`)
+is stored as the negative fraction `-stadistinct / totalrows`; the
+all-distinct case stores `-(1 - nullfrac)` (e.g. `-(1 - 0.05) = -0.95`
+with `nullfrac = 0.05`). (`analyze.c:compute_scalar_stats`)
+57. Kept MCVs pass the continuity-corrected hypergeometric test
+`count_last > selec * samplerows + 2 * stddev + 0.5` from the least
+common upward; the pre-PG11 `1.25 * average` rule does not exist.
+(`analyze.c:analyze_mcv_list`)
+58. Extended MCV build cuts below `get_mincount_for_mcv_list(n, N) = n *
+(N - n) / (N - n + 0.04 * n * (N - 1))`; with `n = 30000` and `N =
+1000000` the cutoff is `24.230437959753825` (about `24.23`) sample
+occurrences, capped at `stattarget` items. (`mcv.c:statext_mcv_build`)
+
+**`pg_statistic` slot layout per type**
+
+59. `STATISTIC_NUM_SLOTS = 5`; kind codes are `1`, `2`, `3`, `4`, `5`,
+`6`, `7` for `MCV`, `HISTOGRAM`, `CORRELATION`, `MCELEM`, `DECHIST`,
+`RANGE_LENGTH_HISTOGRAM`, `BOUNDS_HISTOGRAM`. (`pg_statistic.h`)
+60. `MCELEM` (`4`) stores most-common elements in element order with
+per-element fractions of non-null rows plus `2` extra entries (minimum
+and maximum frequency) and an optional third null-element entry; its
+`staop` is the element `=`. (`pg_statistic.h`, array `selfuncs.c`)
+61. `DECHIST` (`5`) stores a distinct-count histogram with no values and
+last numbers entry equal to the average; `RANGE_LENGTH_HISTOGRAM`
+(`6`) stores a length histogram whose single numbers entry is the empty
+fraction; `BOUNDS_HISTOGRAM` (`7`) stores lower/upper bounds as ranges
+with `NULL` numbers. (`pg_statistic.h`)
+62. `CORRELATION` (`3`) stores exactly `1` numbers entry in `[-1, 1]`
+with `NULL` values and `staop = <`; `HISTOGRAM` (`2`) stores `>= 2`
+bounds with `NULL` numbers and `staop = <`; `MCV` (`1`) stores
+frequencies of all rows with `staop = =`. (`pg_statistic.h`,
+`analyze.c`)
+
+**Extended-statistics kinds and application order**
+
+63. Build order per object is `d` (`mvdistinct.c` Duj1 per combination of
+size `2` to `k`), `f` (`dependencies.c` supporting-rows ratio, zero
+degree dropped), `m` (`mcv.c` `4` percent relative-error cut with
+`base_frequency` as the independence product), `e` (normal
+`compute_stats` serialised into `stxdexpr`) from the same sample.
+(`extended_stats.c:BuildRelationExtStatistics`)
+64. `statext_clauselist_selectivity` runs MCV first on `AND` lists only,
+then multiplies by the dependencies result; `OR` returns the MCV result
+directly. Covered clauses are marked in `estimatedclauses`.
+(`extended_stats.c:1981`)
+65. `choose_best_statistics` needs at least `2` covered
+attributes-plus-expressions (`best_num_matched` starts at `2`);
+ties break toward fewer keys. (`extended_stats.c`)
+66. MCV combination is `sel = mcv_sel + clamp(simple_sel - basesel, 0, 1
+- totalsel)` (e.g. `simple_sel = 0.0001`, `basesel = 0.0001`,
+`mcv_sel = 0.01` gives `other_sel = 0.0` and `sel = 0.01`).
+(`mcv.c:mcv_combine_selectivities`)
+67. Dependencies apply weakest to strongest with `attr[b] = f + (1 - f)
+* s2` when `s1 <= s2` and `f * s2 / s1 + (1 - f) * s2` otherwise (e.g.
+`f = 0.9`, `s2 = 0.01` gives `0.901`); `IS NULL` has no dependency
+branch and is MCV-only. (`dependencies.c`)
+68. Expression statistics (`e`) supply a full `pg_statistic` tuple so
+scalar estimators work unchanged; multivariate ndistinct needs at least
+`2` matched keys in `estimate_multivariate_ndistinct`.
+(`extended_stats.c`, `selfuncs.c`)
+
+**Invalidation message flow and related behavior**
+
+69. `vac_update_relstats` finishes through
+`systable_inplace_update_finish` into
+`heap_inplace_update_and_unlock`, which calls
+`CacheInvalidateHeapTupleInplace` before unlocking; `pg_statistic`
+writes use transactional `CatalogTupleUpdate` with `STATRELATTINH`
+syscache invalidations read under the catalog snapshot.
+(`vacuum.c`, `heapam.c`, `analyze.c:update_attstats`)
+70. `PlanCacheRelCallback` marks cached plans on the relation invalid;
+`ANALYZE` therefore invalidates plans referencing the table.
+`choose_custom_plan` runs `5` custom plans first, then picks generic
+when cheaper than the average custom cost; `plan_cache_mode` overrides.
+(`plancache.c`)
+71. `pg_restore_relation_stats` and `pg_restore_attribute_stats` perform
+transactional upserts (`heap_modify_tuple_by_cols` plus
+`CatalogTupleUpdate`), not in-place writes; `pg_dump --statistics`
+emits them; standbys replay the same WAL and plan with the primary
+statistics. (`statistics/relation_stats.c`,
+`statistics/attribute_stats.c`, `pg_dump.c:dumpRelationStats`)
+72. The plan-time endpoint probe uses `SnapshotNonVacuumable`, needs a
+non-partial btree-orderable index with `canreturn[0]`, stops after
+`100` visited heap pages (`VISITED_PAGES_LIMIT = 100`), and widens
+histogram endpoints with MCVs (MCV-only when `sum(mcv) + nullfrac >
+0.99999`, e.g. `0.9 + 0.09999 = 0.99999`). (`selfuncs.c:6581`)
