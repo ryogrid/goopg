@@ -93,7 +93,7 @@ P4-01 target lists — general fix waits on P4-01 (13 §8.6).
 
 - [x] EX1-01 Scan projection pushdown — this commit; gates: 30 unit tests + poison runs, TPC-H values 24/24 MATCH, TPC-DS PASS=95, plan-gate 22/22, Q6 3.2–4.0 s (vs 5.48 s baseline), alloc 0.97 GB (vs 1.06 GB); artifacts: `internal/executor/{scan_deform,executor,operators_storage,expr,exprnode,operators_bitmap}.go`, `internal/executor/scan_deform_bound_test.go`
 - [x] EX1-02 Deform-some-attributes — this commit; gates: join/project unit tests + poison runs (incl. unrebased-semi regression), TPC-H 24/24 MATCH, TPC-DS PASS=95 (Q16 CKMISMATCH found, root-caused to index-space key split, fixed positionally, checksum-verified), plan-gate 22/22, Q6 pinned 3.1 s, Q9 14.5 s (vs 18.4 s); artifacts: `internal/executor/scan_deform.go`, tests, `docs/design/executor-ex1-02-join/DESIGN.md`
-- [~] EX1-02b Index/bitmap/IOS bound threading — design `docs/design/executor-ex1-02b-index/DESIGN.md` (reviewed, no blockers); implementation still to run before close.
+- [x] EX1-02b Index/bitmap/IOS bound threading — this commit; gates: 21 index/bitmap/NLI/IOS subtests + poison/lossy runs, TPC-H 24/24 MATCH, TPC-DS PASS=95, plan-gate 22/22, Q6 3.02 s unchanged, Q4 1.54 s, Q13 6.80 s; NLI probe-key outer hole found in review and fixed with regression test; artifacts: `internal/executor/{scan_deform,executor,operators_index,operators_bitmap,operators_indexonly}.go`, `internal/executor/index_deform_bound_test.go`
 - [ ] EX1-03 Lazy detoast — per-attribute resolution on first use instead
       of whole-row `DetoastRow` at scan time (11 §14). Witness: TOAST-heavy
       TPC-DS shapes, not Q6.

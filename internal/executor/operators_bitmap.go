@@ -300,6 +300,16 @@ type bitmapHeapScanOp struct {
 
 	// scanRow is reused per Next() — zero allocation per tuple.
 	scanRow Row
+	// deformBound is the EX1-02b exclusive deform width: the heap-fetch
+	// path deforms columns [0, deformBound) instead of the full row,
+	// because the Build-time walk proved no consumer reads past it
+	// (BitmapQual recheck refs + Cond refs folded first, then unioned
+	// with the parent walk — either declining re-widens the whole
+	// bound). Stamped by both Build paths; 0 means unset and behaves as
+	// full width. scanRow stays full-width — only the deform window
+	// narrows, so a bound equal to the column count takes the exact
+	// pre-EX1-02b path.
+	deformBound int
 	// mctx is the per-page byte arena for varlena payloads.
 	mctx *mmgr.Context
 	// slot is the embedded MaterializedSlot reused every Next().
@@ -434,6 +444,9 @@ func (o *bitmapHeapScanOp) Close() error {
 		o.mctx = nil
 	}
 	if o.scanRow != nil {
+		// EX1-02b: scrub tail poison before the pooled row is released so
+		// a poisoned buffer never leaks into a later flag-off scan.
+		scrubDeformPoison(o.scanRow)
 		releaseRow(o.scanRow)
 		o.scanRow = nil
 	}
@@ -1030,7 +1043,25 @@ func (o *bitmapOrOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 // routes through the styled decoder only when the relation has an array column,
 // so the two scan shapes render the same array text under the same session
 // GUCs. M0119-0006.
+//
+// EX1-02b: when a narrowed deformBound is stamped, only [0, deformBound) is
+// deformed and the tail is poisoned when the debug flag is armed. The bound
+// already covers the recheck (BitmapQual) and Cond readers — they were folded
+// first at build — so the recheck below never reads past the window. A bound
+// equal to the width takes the exact pre-EX1-02b path.
 func (o *bitmapHeapScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
+	st := array.DefaultOutputStyle()
+	if o.arrayStyleLive {
+		st = o.arrayStyle
+	}
+	if o.deformBound > 0 && o.deformBound < len(o.cols) {
+		_, err := DecodeRowRangeIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.mctx, st, 0, o.deformBound, 0)
+		if err != nil {
+			return err
+		}
+		poisonDeformTail(o.scanRow, o.deformBound)
+		return nil
+	}
 	if o.arrayStyleLive {
 		return DecodeRowIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.mctx, o.arrayStyle)
 	}

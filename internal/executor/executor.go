@@ -192,13 +192,46 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 		// optimizer; both operators satisfy `nliInner`, which is what lets
 		// the join driver stay ignorant of which one it got.
 		var innerScan nliInner
+		// EX1-02b: the inner probe's consumer set is plan-static (the join
+		// Predicate's inner-side refs plus the probe-local Cond, plus the
+		// parent refs mapped to inner-output space), so the bound threads
+		// once at build into the probe's deformBound field and Rescan does
+		// no per-call work. The Predicate evaluates per joined pair against
+		// the merged (outer++inner) row, so its refs split by the exprSide
+		// cutoff exactly like the outer half of the frozen left-side rule
+		// (index-space split, never face-value). Key probe exprs are never
+		// folded — they index outer space on an inner. The Memoize wrap
+		// below preserves the stamped child untouched.
+		outerW := deformSideWidth(p.Outer)
 		switch in := p.Inner.(type) {
 		case *optimizer.IndexScan:
-			innerScan = newIndexScanOp(in)
+			iop := newIndexScanOp(in)
+			innerW := deformNLIInnerWidth(in)
+			_, innerPred := deformSplitPredicate(p.Predicate, outerW, innerW)
+			innerAbove := deformUnionBound(deformNLIMappedInner(bound, outerW, innerW), innerPred)
+			innerNcols := 0
+			if in.Table != nil {
+				innerNcols = len(in.Table.Columns)
+			}
+			iop.deformBound = effectiveDeformBound(deformIndexLeafBound(
+				innerAbove, in.Cond, in.Index, in.Table), innerNcols)
+			innerScan = iop
 		case *optimizer.IndexOnlyScan:
+			// No plan walk: the consumer is the Covered list (local fixes
+			// in operators_indexonly.go).
 			innerScan = newIndexOnlyScanOp(in)
 		case *optimizer.BitmapHeapScan:
-			innerScan = newBitmapHeapScanOp(in)
+			bop := newBitmapHeapScanOp(in)
+			innerW := deformNLIInnerWidth(in)
+			_, innerPred := deformSplitPredicate(p.Predicate, outerW, innerW)
+			innerAbove := deformUnionBound(deformNLIMappedInner(bound, outerW, innerW), innerPred)
+			bitmapNcols := 0
+			if in.Table != nil {
+				bitmapNcols = len(in.Table.Columns)
+			}
+			bop.deformBound = effectiveDeformBound(deformBitmapLeafBound(
+				innerAbove, in.BitmapQual, in.Cond), bitmapNcols)
+			innerScan = bop
 		default:
 			return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
 				Message: fmt.Sprintf("NestedLoopIndexJoin inner is a %T, which is not a re-probeable scan", p.Inner)}
@@ -242,7 +275,20 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 		op.deformBound = effectiveDeformBound(bound, len(op.cols))
 		return maybeInstrument(p, op), nil
 	case *optimizer.IndexScan:
-		return maybeInstrument(p, newIndexScanOp(p)), nil
+		// EX1-02b: stamp the threaded bound — union of the parent walk and
+		// the leaf-local Cond refs, belt-and-braces widened with the index
+		// key columns. Key probe exprs are never folded at face value (on
+		// an NLI inner they index outer space). Unset (0) stays full for
+		// directly-constructed scans. The buildRec slab twin reaches this
+		// arm through its default branch with the bound forwarded, so both
+		// Build paths thread it.
+		indexOp := newIndexScanOp(p)
+		indexNcols := 0
+		if p.Table != nil {
+			indexNcols = len(p.Table.Columns)
+		}
+		indexOp.deformBound = effectiveDeformBound(deformIndexLeafBound(bound, p.Cond, p.Index, p.Table), indexNcols)
+		return maybeInstrument(p, indexOp), nil
 	case *optimizer.IndexOnlyScan:
 		return maybeInstrument(p, newIndexOnlyScanOp(p)), nil
 	case *optimizer.Result:
@@ -408,7 +454,18 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 	case *optimizer.BitmapIndexScan:
 		return maybeInstrument(p, newBitmapIndexScanOp(p)), nil
 	case *optimizer.BitmapHeapScan:
-		return maybeInstrument(p, newBitmapHeapScanOp(p)), nil
+		// EX1-02b: stamp the threaded bound — BitmapQual recheck refs and
+		// Cond refs folded first, then unioned with the parent walk; either
+		// declining re-widens the whole bound. Inner bitmap builds (the
+		// BitmapIndexScan/And/Or subtrees) stay bound-free: they build TID
+		// sets, not rows. Reached from both Build paths like IndexScan.
+		bitmapOp := newBitmapHeapScanOp(p)
+		bitmapNcols := 0
+		if p.Table != nil {
+			bitmapNcols = len(p.Table.Columns)
+		}
+		bitmapOp.deformBound = effectiveDeformBound(deformBitmapLeafBound(bound, p.BitmapQual, p.Cond), bitmapNcols)
+		return maybeInstrument(p, bitmapOp), nil
 	case *optimizer.BitmapAnd:
 		return maybeInstrument(p, newBitmapAndOp(p)), nil
 	case *optimizer.BitmapOr:

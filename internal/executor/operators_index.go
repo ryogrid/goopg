@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/adt/array"
 )
 
 // followHOTChain walks the HOT chain starting at startSlot on the given
@@ -233,6 +234,17 @@ type indexScanOp struct {
 	// Acquired in openPrep from the rowPool (M0068-0004), released
 	// in Close.
 	scanRow Row
+
+	// deformBound is the EX1-02b exclusive deform width: the heap-fetch
+	// path deforms columns [0, deformBound) instead of the full row,
+	// because the Build-time consumer walk proved no consumer reads past
+	// it (union of the parent walk, the leaf-local Cond refs, and the
+	// index key columns as belt-and-braces over-widening — never the key
+	// probe exprs, which index outer space on an NLI inner). Stamped by
+	// both Build paths; 0 means unset and behaves as full width.
+	// scanRow stays full-width — only the deform window narrows, so a
+	// bound equal to the column count takes the exact pre-EX1-02b path.
+	deformBound int
 
 	// M0092-0007: embedded slot reused across every Next() call so
 	// we don't allocate a fresh MaterializedSlot per emission.
@@ -608,7 +620,25 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {
 			o.scanRow = acquireRow(len(o.plan.Table.Columns))
 		}
-		decErr := DecodeHeapTupleRowInto(o.scanRow, o.plan.Table.Columns, tuple, nil)
+		// EX1-02b: narrowed heap deform, same discipline as seqScanOp — only
+		// [0, deformBound) is deformed and the tail keeps its previous
+		// contents (poisoned at deform time when the debug flag is armed).
+		// A bound equal to the width takes the exact pre-EX1-02b path.
+		cols := o.plan.Table.Columns
+		survivorBound := len(cols)
+		if o.deformBound > 0 && o.deformBound < survivorBound {
+			survivorBound = o.deformBound
+		}
+		var decErr error
+		if survivorBound < len(cols) {
+			// Tuple-decompose + range-decode by name: there is NO HeapTuple
+			// range helper, so natts comes from Infomask2 at this site.
+			natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
+			_, decErr = DecodeRowRangeIntoMctxPGTupleStyled(o.scanRow, cols, tuple.Data, tuple.Bitmap, natts, nil, array.DefaultOutputStyle(), 0, survivorBound, 0)
+			poisonDeformTail(o.scanRow, survivorBound)
+		} else {
+			decErr = DecodeHeapTupleRowInto(o.scanRow, cols, tuple, nil)
+		}
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if decErr != nil {
@@ -729,6 +759,9 @@ func (o *indexScanOp) Close() error {
 	o.killList = nil
 	o.hasLast = false
 	if o.scanRow != nil {
+		// EX1-02b: scrub tail poison before the pooled row is released so
+		// a poisoned buffer never leaks into a later flag-off scan.
+		scrubDeformPoison(o.scanRow)
 		releaseRow(o.scanRow)
 		o.scanRow = nil
 	}

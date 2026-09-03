@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -556,7 +557,127 @@ func deformNLIOuterBound(p *optimizer.NestedLoopIndexJoin, incoming int) int {
 		}
 	}
 	outerKeys, _ := deformSplitPredicate(p.Predicate, outerW, rightW)
+	// EX1-02b fix (NLI probe-key hole): the inner probe's Key/Keys/
+	// LowKey/HighKey evaluate against the OUTER slot
+	// (lookupKey/lookupKeys/lookupRangeBounds via o.outerSlot), so their
+	// outer-space refs are genuine outer consumers. Without this fold, an
+	// outer bound narrowed past a probe-key column starves the per-row
+	// re-probe (stale tail read; poison-caught on Q4-class shapes).
+	outerKeys = deformFoldRefs(outerKeys, deformNLIOuterKeyExprs(p.Inner)...)
 	return deformUnionBound(above, outerKeys)
+}
+
+// deformNLIOuterKeyExprs collects the inner probe's key exprs, which read
+// outer-row columns (never inner deform). Both closed inner kinds carry
+// the same four slots. Non-ColumnRef shapes (OuterRef indirection, CASE)
+// decline via deformScanRefs → full outer, the safe direction.
+func deformNLIOuterKeyExprs(inner optimizer.Node) []optimizer.Expr {
+	switch in := inner.(type) {
+	case *optimizer.IndexScan:
+		out := make([]optimizer.Expr, 0, len(in.Keys)+3)
+		out = append(out, in.Key, in.LowKey, in.HighKey)
+		return append(out, in.Keys...)
+	case *optimizer.IndexOnlyScan:
+		out := make([]optimizer.Expr, 0, len(in.Keys)+3)
+		out = append(out, in.Key, in.LowKey, in.HighKey)
+		return append(out, in.Keys...)
+	default:
+		return nil
+	}
+}
+
+// deformIndexLeafBound computes the EX1-02b bound an IndexScan leaf deforms:
+// the union of the incoming parent-walk bound and the leaf-local Cond refs,
+// belt-and-braces widened with the index's heap key-column ordinals.
+//
+// The key PROBE exprs (Key/Keys/LowKey/HighKey) are NEVER folded here: on an
+// NLI inner they reference OUTER columns (outer-space indexes), so folding
+// them at face value files outer coordinates into the inner bound —
+// widening-only but wrong. The key COLUMNS (heap ordinals of Index.Columns)
+// are safe to union instead: the descent reads them before the heap fetch,
+// and unioning can only widen the consumer-derived bound (when no consumer
+// is recorded at all, any bound is safe).
+func deformIndexLeafBound(incoming int, cond optimizer.Expr, index *catalog.Index, table *catalog.Table) int {
+	bound := deformFoldRefs(incoming, cond)
+	if bound == deformBoundFull {
+		return bound
+	}
+	if index != nil && table != nil {
+		for _, kc := range index.Columns {
+			for j, tc := range table.Columns {
+				if tc.Name == kc {
+					if j > bound {
+						bound = j
+					}
+					break
+				}
+			}
+		}
+	}
+	return bound
+}
+
+// deformBitmapLeafBound computes the EX1-02b bound a BitmapHeapScan leaf
+// deforms. The BitmapQual recheck readers and the Cond readers are genuine
+// consumers — folded FIRST — then unioned with the incoming parent bound; a
+// decline in either fails the whole bound (re-widen, never narrow past a
+// recheck reader).
+func deformBitmapLeafBound(incoming int, bitmapQual []optimizer.Expr, cond optimizer.Expr) int {
+	bound := deformFoldRefs(deformBoundNone, bitmapQual...)
+	bound = deformFoldRefs(bound, cond)
+	return deformUnionBound(bound, incoming)
+}
+
+// deformNLIMappedInner maps an incoming NLI-output-space (outer++inner)
+// prefix bound to the inner-output share: the tail past the outer width. A
+// prefix ending inside the outer side contributes nothing; a tail reaching
+// past the inner width cannot map and fails to full.
+func deformNLIMappedInner(incoming, outerW, innerW int) int {
+	if incoming == deformBoundFull {
+		return deformBoundFull
+	}
+	if incoming < 0 {
+		return deformBoundNone
+	}
+	if outerW <= 0 || innerW <= 0 {
+		return deformBoundFull
+	}
+	if incoming < outerW {
+		return deformBoundNone
+	}
+	if r := incoming - outerW; r < innerW {
+		return r
+	}
+	return deformBoundFull
+}
+
+// deformNLIInnerWidth reports the output width of an NLI inner probe.
+// Planner-stamped Output() is authoritative; hand-built nodes carry no
+// schema, so the width falls back to the probe's table shape (an IndexScan
+// or BitmapHeapScan emits full heap rows, an IndexOnlyScan its Covered
+// list). Anything else reports 0 and the caller declines to full.
+func deformNLIInnerWidth(n optimizer.Node) int {
+	if w := len(n.Output()); w > 0 {
+		return w
+	}
+	switch x := n.(type) {
+	case *optimizer.IndexScan:
+		if x.Table != nil {
+			return len(x.Table.Columns)
+		}
+	case *optimizer.IndexOnlyScan:
+		if len(x.Covered) > 0 {
+			return len(x.Covered)
+		}
+		if x.Table != nil {
+			return len(x.Table.Columns)
+		}
+	case *optimizer.BitmapHeapScan:
+		if x.Table != nil {
+			return len(x.Table.Columns)
+		}
+	}
+	return 0
 }
 
 // effectiveDeformBound resolves the threaded bound to the exclusive deform
