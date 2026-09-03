@@ -64,8 +64,7 @@ three witness shapes, batch counters report. No plan moved, no timing
 claimed.
 
 - [x] EX0-01 File the executor backlog ledger — `6ace9567e` (design) + ledger rows this commit; gates: 8 `take3-EX0-G-EXn` rows merged, `git diff --stat` docs-only; artifacts: `docs/design/executor-ex0-01-ledger/DESIGN.md`, `.ralph/deferral_ledger.md`
-- [~] EX0-02 Commit the measurement protocol — design `docs/design/executor-ex0-02-protocol/DESIGN.md` (reviewed, 5 blocking findings fixed); conforming artifact `EX0-02-q6-serial-scold` still to run before close.
-  *design: 13 §2.2–2.3; gate: protocol doc + one conforming artifact.*
+- [x] EX0-02 Commit the measurement protocol — `503f12cf7` (design) + conforming artifact this commit; gates: protocol doc merged, `EX0-02-q6-serial-scold` full header (serial 5.48 s, values ×9 identical, alloc 1.06 GB/Q6, perf 56.6B instr/Q6); artifacts: `docs/design/executor-ex0-02-protocol/DESIGN.md`, `analysis/executor-refactor/ex0-02-20260903/README.md`
 - [ ] EX0-03 Surface per-worker hash/sort counters in EXPLAIN ANALYZE —
       thread existing worker counts to the leader (PG shows them; 11 §10
       notes they die with the worker). Counting already happens; plumbing
