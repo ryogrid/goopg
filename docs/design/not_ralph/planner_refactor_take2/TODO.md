@@ -1571,10 +1571,23 @@ difference explained and timed.
 - [ ] **P7-01** Full acceptance run: both suites, S-cold and WARM, plan-parity
       roll-up, `estimate-audit --reference` ratchet, complete timing table.
       *gate: 09 §7 bars A1–A5, B5, C1–C4.*
-- [ ] **P7-02** Verdict document under
+- [~] **P7-02** Verdict document under
       `analysis/planner-refactor-take2/acceptance-<date>/README.md` with the
       09 §6.6 header, before/after roll-ups, and an explicit statement of
       everything that got worse. *gate: 09 §9.*
+      **INTERIM document written 2026-09-03**
+      (`analysis/planner-refactor-take2/acceptance-20260903/README.md`). It is
+      explicitly NOT the acceptance document 09 §6.6 specifies, and says so in
+      its first paragraph: Phases 4 and 5 have not started, so the 09 §7 bars
+      (A1-A5, B5, C1-C4) cannot be evaluated and P7-01 cannot run meaningfully.
+      What it does carry is the shape 09 §6.6 asks for over the work that DID
+      land — the stage-by-stage TPC-H roll-up, the five correctness bugs, the
+      four things that got WORSE and why each was kept or reverted, the three
+      measurement-methodology defects found by being wrong first, the six items
+      determined must-not-be-done, and 07 §6's width residual measured at equal
+      cardinality. Rewrite it as the real acceptance document when Phases 3-5
+      land; do not delete it, since the "what got worse" and methodology
+      sections are the parts that do not reproduce themselves.
 - [x] **P7-03** Update the deferral ledger for every item left open, and record
       the executor-side residuals (07 §6) as their own follow-up with resume
       points. *gate: 08 §1 P6.*
