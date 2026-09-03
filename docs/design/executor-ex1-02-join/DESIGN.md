@@ -20,12 +20,17 @@ executor evaluates against the merged row, `join_merge_key.go:67-70`).
 There is no remap-free narrowing. The single mapping rule, applied to
 keys, residual refs, AND above-join refs alike:
 
-- `leftWidth = len(Left.Output())`. Canonical source: `Join.Predicate`
-  split by the `exprSide` cutoff (`Index < leftWidth` → left as-is,
-  else right at `Index - leftWidth`; `planner.go:6097-6107`) —
-  uniformly for keys and residual (they are folded into one
-  Predicate); `LeftKey`/`RightKey` are the same merged-space
-  information, not a second source.
+- `leftWidth = len(Left.Output())`. Canonical key source is
+  POSITIONAL, not index-space: the executor evaluates pair `k.Left`
+  against left rows and `k.Right` against right rows
+  (`join_composite_key.go` build/probe split), so key refs fold at
+  face value per side from `HashKeys` pairs (`LeftKey`/`RightKey`
+  fallback when the pair list is empty). Decorrelated/semi keys may
+  be unrebased (both operands indexed in outer space — Q16's
+  `cs1.x = cs1.x` semi Hash Cond starved the right scan until this
+  was positional; poison-caught, checksum-verified). The RESIDUAL
+  keeps the index-space Predicate split (it evaluates against merged
+  rows); keys inside it double-cover by union, which is safe.
 - Above-join refs map through the join's OUTPUT layout: inner/left/
   right/full output is left++right (split by leftWidth); semi/anti
   output is left-only (all above refs to the left; the right side

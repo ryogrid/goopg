@@ -168,13 +168,14 @@ func TestScanDeformBoundChains(t *testing.T) {
 		if !ok {
 			t.Fatalf("built %T, want *joinOp", op)
 		}
-		// Both sides go full even though the keys only reference column 0:
-		// the walk terminates at the first join.
-		if b, n := seqLeafBound(t, jo.left); b != 8 || n != 8 {
-			t.Fatalf("left bound=%d ncols=%d, want full 8/8", b, n)
+		// EX1-02: the merged-space predicate maps per side (col 0 → left 0,
+		// col 8 → right 0) and unions with the below-walk refs (the left
+		// filter reads column 1): left covers {0,1}, right covers {0}.
+		if b, n := seqLeafBound(t, jo.left); b != 2 || n != 8 {
+			t.Fatalf("left bound=%d ncols=%d, want 2/8", b, n)
 		}
-		if b, n := seqLeafBound(t, jo.right); b != 8 || n != 8 {
-			t.Fatalf("right bound=%d ncols=%d, want full 8/8", b, n)
+		if b, n := seqLeafBound(t, jo.right); b != 1 || n != 8 {
+			t.Fatalf("right bound=%d ncols=%d, want 1/8", b, n)
 		}
 	})
 
@@ -591,4 +592,364 @@ func testPlanDeform(t *testing.T, ctx *Context, sql string) (optimizer.Node, err
 		return nil, fmt.Errorf("Parse(%q): %d stmts", sql, len(stmts))
 	}
 	return optimizer.Plan(stmts[0], ctx.Catalog)
+}
+
+// TestScanDeformJoinKeyMapping pins the §2 merged-space remap on synthetic
+// joins: keys split by the exprSide cutoff (Index < leftWidth → left as-is,
+// else right at Index-leftWidth), range-checked per side, unioned with the
+// below-walk refs.
+func TestScanDeformJoinKeyMapping(t *testing.T) {
+	scan8 := func() *optimizer.SeqScan { return &optimizer.SeqScan{Table: deformTable(8)} }
+	join := func(pred optimizer.Expr) *optimizer.Join {
+		return &optimizer.Join{
+			Type: optimizer.JoinTypeInner, Algo: optimizer.JoinAlgoNestedLoop,
+			Left: scan8(), Right: scan8(), Predicate: pred,
+		}
+	}
+	sides := func(t *testing.T, plan *optimizer.Join) (lb, ln, rb, rn int) {
+		t.Helper()
+		op := mustBuildDeform(t, plan)
+		jo, ok := op.(*joinOp)
+		if !ok {
+			t.Fatalf("built %T, want *joinOp", op)
+		}
+		lb, ln = seqLeafBound(t, jo.left)
+		rb, rn = seqLeafBound(t, jo.right)
+		return lb, ln, rb, rn
+	}
+
+	t.Run("both-sides", func(t *testing.T) {
+		// Predicate col2 < col10: col2 < leftWidth 8 → left 2; col10 →
+		// right 10-8 = 2. No above refs, no below-walk refs.
+		lb, ln, rb, rn := sides(t, join(deformLt(deformCol(2), deformCol(10))))
+		if lb != 3 || ln != 8 {
+			t.Fatalf("left bound=%d ncols=%d, want 3/8", lb, ln)
+		}
+		if rb != 3 || rn != 8 {
+			t.Fatalf("right bound=%d ncols=%d, want 3/8", rb, rn)
+		}
+	})
+
+	t.Run("width-cap-unmappable", func(t *testing.T) {
+		// Predicate col1 < col20: col1 → left 1; col20 → right 12, past
+		// the right width 8 → the right side fails to full while the left
+		// still narrows.
+		lb, ln, rb, rn := sides(t, join(deformLt(deformCol(1), deformCol(20))))
+		if lb != 2 || ln != 8 {
+			t.Fatalf("left bound=%d ncols=%d, want 2/8", lb, ln)
+		}
+		if rb != 8 || rn != 8 {
+			t.Fatalf("right bound=%d ncols=%d, want full 8/8", rb, rn)
+		}
+	})
+
+	t.Run("keys-without-predicate-map-positionally", func(t *testing.T) {
+		// Keys map by pair position even with no Predicate: LeftKey reads
+		// left-row columns, RightKey right-row columns (the executor
+		// evaluates them positionally — Q16's unrebased semi keys). The
+		// old decline-to-full expectation was the bug.
+		p := join(nil)
+		p.LeftKey, p.RightKey = deformCol(0), deformCol(0)
+		lb, ln, rb, rn := sides(t, p)
+		if lb != 1 || ln != 8 {
+			t.Fatalf("left bound=%d ncols=%d, want 1/8", lb, ln)
+		}
+		if rb != 1 || rn != 8 {
+			t.Fatalf("right bound=%d ncols=%d, want 1/8", rb, rn)
+		}
+	})
+	t.Run("unrebased-semi-keys-map-positionally", func(t *testing.T) {
+		// Q16 regression: decorrelated semi keys unrebased — both
+		// operands in left space (`cs1.x = cs1.x`). Index-space split
+		// would file the right key on the left and starve the right
+		// scan; pair position maps it right. Semi with no above refs.
+		p := &optimizer.Join{
+			Type: optimizer.JoinTypeSemi, Algo: optimizer.JoinAlgoHash,
+			Left: scan8(), Right: scan8(),
+			HashKeys: []optimizer.JoinKeyPair{
+				{Left: deformCol(2), Right: deformCol(2)},
+			},
+		}
+		lb, ln, rb, rn := sides(t, p)
+		if lb != 3 || ln != 8 {
+			t.Fatalf("left bound=%d ncols=%d, want 3/8", lb, ln)
+		}
+		if rb != 3 || rn != 8 {
+			t.Fatalf("right bound=%d ncols=%d, want 3/8", rb, rn)
+		}
+	})
+}
+
+// TestScanDeformJoinAbovePayload is the above-ref regression test: a payload
+// column read ONLY above the join must still deform below it. Project(col12)
+// reads merged column 12 — right-side column 4 — so the right scan must cover
+// it; the keys-only bound (right 1/8) would be a wrong answer.
+func TestScanDeformJoinAbovePayload(t *testing.T) {
+	scan8 := func() *optimizer.SeqScan { return &optimizer.SeqScan{Table: deformTable(8)} }
+	plan := &optimizer.Join{
+		Type: optimizer.JoinTypeInner, Algo: optimizer.JoinAlgoNestedLoop,
+		Left: scan8(), Right: scan8(),
+		Predicate: deformLt(deformCol(0), deformCol(8)),
+	}
+	proj := &optimizer.Project{Child: plan, Targets: []optimizer.Expr{deformCol(12)}}
+	op := mustBuildDeform(t, proj)
+	po, ok := op.(*projectOp)
+	if !ok {
+		t.Fatalf("built %T, want *projectOp", op)
+	}
+	jo, ok := po.child.(*joinOp)
+	if !ok {
+		t.Fatalf("project child is %T, want *joinOp", po.child)
+	}
+	// Above prefix 12 through left++right (8+8): the left share clamps to 7
+	// (full left), the right share is 12-8 = 4; union the keys {0}/{0}.
+	if b, n := seqLeafBound(t, jo.left); b != 8 || n != 8 {
+		t.Fatalf("left bound=%d ncols=%d, want full 8/8", b, n)
+	}
+	if b, n := seqLeafBound(t, jo.right); b != 5 || n != 8 {
+		t.Fatalf("right bound=%d ncols=%d, want 5/8", b, n)
+	}
+}
+
+// TestScanDeformSemiJoinLeftOnly pins the semi/anti output layout: the output
+// is the left side alone, so above-join refs land on the left only while the
+// right narrows by keys+residual alone.
+func TestScanDeformSemiJoinLeftOnly(t *testing.T) {
+	scan8 := func() *optimizer.SeqScan { return &optimizer.SeqScan{Table: deformTable(8)} }
+	plan := &optimizer.Join{
+		Type: optimizer.JoinTypeSemi, Algo: optimizer.JoinAlgoNestedLoop,
+		Left: scan8(), Right: scan8(),
+		Predicate: deformLt(deformCol(1), deformCol(9)),
+	}
+	above := &optimizer.Filter{Child: plan, Predicate: deformLt(deformCol(5), deformInt(1))}
+	op := mustBuildDeform(t, above)
+	fo, ok := op.(*filterOp)
+	if !ok {
+		t.Fatalf("built %T, want *filterOp", op)
+	}
+	jo, ok := fo.child.(*joinOp)
+	if !ok {
+		t.Fatalf("filter child is %T, want *joinOp", fo.child)
+	}
+	// Above prefix 5 (< leftWidth 8) lands on the left intact; the right
+	// takes no above share. Keys: col1 → left 1; col9 → right 9-8 = 1.
+	// Left covers {5, 1} → 6; right covers {1} → 2.
+	if b, n := seqLeafBound(t, jo.left); b != 6 || n != 8 {
+		t.Fatalf("left bound=%d ncols=%d, want 6/8", b, n)
+	}
+	if b, n := seqLeafBound(t, jo.right); b != 2 || n != 8 {
+		t.Fatalf("right bound=%d ncols=%d, want 2/8", b, n)
+	}
+}
+
+// TestScanDeformNLIOuterBound pins the NLI left-side rule without storage:
+// the outer takes its share of the above prefix plus the outer-side
+// predicate refs; inner-side refs are discarded; an unattributable predicate
+// fails the outer to full (the inner probes always run full, EX1-02b).
+func TestScanDeformNLIOuterBound(t *testing.T) {
+	outer := func() *optimizer.SeqScan { return &optimizer.SeqScan{Table: deformTable(8)} }
+	nli := func(incoming int, pred optimizer.Expr) int {
+		return deformNLIOuterBound(&optimizer.NestedLoopIndexJoin{Outer: outer(), Predicate: pred}, incoming)
+	}
+	// Predicate col2 < col10: col2 is outer-side (2 < 8), col10 is
+	// inner-side (discarded). No above refs → outer bound 2.
+	if got := nli(deformBoundNone, deformLt(deformCol(2), deformCol(10))); got != 2 {
+		t.Fatalf("outer=%d, want 2", got)
+	}
+	// Above prefix 5 unions with the outer key ref 2 → 5.
+	if got := nli(5, deformLt(deformCol(2), deformCol(10))); got != 5 {
+		t.Fatalf("outer=%d, want 5", got)
+	}
+	// An above prefix past the outer width clamps to the full outer width.
+	if got := nli(12, deformLt(deformCol(2), deformCol(10))); got != 7 {
+		t.Fatalf("outer=%d, want 7", got)
+	}
+	// An unattributable predicate fails the outer to full.
+	badPred := &optimizer.FuncCall{Name: "abs", Args: []optimizer.Expr{deformCol(0)}}
+	if got := nli(deformBoundNone, badPred); got != deformBoundFull {
+		t.Fatalf("outer=%d, want Full", got)
+	}
+	// Full stays full.
+	if got := nli(deformBoundFull, deformLt(deformCol(2), deformCol(10))); got != deformBoundFull {
+		t.Fatalf("outer=%d, want Full", got)
+	}
+}
+
+// TestScanDeformProjectThrough pins the EX1-02 project arm: an
+// order-preserving all-bare projection maps through by folding its targets
+// (bound = max mapped); expressions and consts reset to full. Reordered bare
+// targets keep resetting (pinned by project-reorder-terminator, unchanged).
+func TestScanDeformProjectThrough(t *testing.T) {
+	scan8 := func() *optimizer.SeqScan { return &optimizer.SeqScan{Table: deformTable(8)} }
+	proj := func(targets ...optimizer.Expr) *optimizer.Project {
+		return &optimizer.Project{Child: scan8(), Targets: targets}
+	}
+
+	t.Run("ordered-bare-maps", func(t *testing.T) {
+		// Targets [0, 2]: the projection materialises child columns {0, 2}.
+		op := mustBuildDeform(t, proj(deformCol(0), deformCol(2)))
+		if b, n := seqLeafBound(t, op); b != 3 || n != 8 {
+			t.Fatalf("bound=%d ncols=%d, want 3/8", b, n)
+		}
+	})
+
+	t.Run("ordered-bare-with-above", func(t *testing.T) {
+		// The filter above reads output column 1; the projection itself
+		// reads {0, 2}. Bound covers both.
+		plan := &optimizer.Filter{
+			Child:     proj(deformCol(0), deformCol(2)),
+			Predicate: deformLt(deformCol(1), deformInt(1)),
+		}
+		op := mustBuildDeform(t, plan)
+		if b, n := seqLeafBound(t, op); b != 3 || n != 8 {
+			t.Fatalf("bound=%d ncols=%d, want 3/8", b, n)
+		}
+	})
+
+	t.Run("expression-resets", func(t *testing.T) {
+		p := proj(&optimizer.BinaryOp{Op: parser.OpAdd, Left: deformCol(0), Right: deformInt(1)})
+		op := mustBuildDeform(t, p)
+		if b, n := seqLeafBound(t, op); b != 8 || n != 8 {
+			t.Fatalf("bound=%d ncols=%d, want full 8/8", b, n)
+		}
+	})
+
+	t.Run("const-target-resets", func(t *testing.T) {
+		p := proj(deformCol(0), deformInt(1))
+		op := mustBuildDeform(t, p)
+		if b, n := seqLeafBound(t, op); b != 8 || n != 8 {
+			t.Fatalf("bound=%d ncols=%d, want full 8/8", b, n)
+		}
+	})
+}
+
+// joinSideBounds builds plan and reports the effective deform bounds of the
+// scans under the first Join below the root, following single-child
+// pass-throughs. It fails the test when no Join is present.
+func joinSideBounds(t *testing.T, plan optimizer.Node) (lb, ln, rb, rn int) {
+	t.Helper()
+	op := mustBuildDeform(t, plan)
+	var find func(o Operator) *joinOp
+	find = func(o Operator) *joinOp {
+		switch n := o.(type) {
+		case *joinOp:
+			return n
+		case *filterOp:
+			return find(n.child)
+		case *projectOp:
+			return find(n.child)
+		case *sortOp:
+			return find(n.child)
+		case *limitOp:
+			return find(n.child)
+		case *aggregateOp:
+			return find(n.child)
+		case *distinctOp:
+			return find(n.child)
+		case *lockRowsOp:
+			return find(n.child)
+		case *resultOp:
+			if n.child == nil {
+				return nil
+			}
+			return find(n.child)
+		default:
+			return nil
+		}
+	}
+	jo := find(op)
+	if jo == nil {
+		t.Fatalf("no joinOp under %T", op)
+	}
+	lb, ln = seqLeafBound(t, jo.left)
+	rb, rn = seqLeafBound(t, jo.right)
+	return lb, ln, rb, rn
+}
+
+// TestScanDeformQ9ShapeBound pins the Q9 witness shape — an aggregate over a
+// filter over a join — in both halves:
+//
+//   - Synthetic bound half: Aggregate(Arg col1) → Filter(col5) → Join(col0 =
+//     col8, left Filter(col3) over scan8, right scan8). Walk: the aggregate
+//     folds {1}, the filter folds {5}, the join splits incoming 5 into
+//     leftAbove 5 / rightAbove none and unions keys {0}/{0} → left 5,
+//     right 0; the left below-walk filter folds {3}. Left covers {5, 3, 0}
+//     → 6, right covers {0} → 1: both < ncols under the join.
+//   - Execution half: a real self-join runs poison-armed (proving every new
+//     arm — join remap, const-pad project reset, pruned ordered-bare
+//     projects below the join — excludes nothing any consumer reads) with
+//     values identical to the full-deform variant. (The real plan carries a
+//     const-padding Project above the join, which declines by design, so
+//     narrowing itself is pinned by the synthetic half, not the plan.)
+func TestScanDeformQ9ShapeBound(t *testing.T) {
+	scan8 := func() *optimizer.SeqScan { return &optimizer.SeqScan{Table: deformTable(8)} }
+	shape := &optimizer.Aggregate{
+		Child: &optimizer.Filter{
+			Child: &optimizer.Join{
+				Type: optimizer.JoinTypeInner, Algo: optimizer.JoinAlgoNestedLoop,
+				Left: &optimizer.Filter{
+					Child:     scan8(),
+					Predicate: deformLt(deformCol(3), deformInt(1)),
+				},
+				Right:     scan8(),
+				Predicate: deformLt(deformCol(0), deformCol(8)),
+			},
+			Predicate: deformLt(deformCol(5), deformInt(1)),
+		},
+		Aggs: []optimizer.AggregateCall{
+			{Name: "sum", Arg: deformCol(1), Type: catalog.Type{Name: "int8"}},
+		},
+	}
+	lb, ln, rb, rn := joinSideBounds(t, shape)
+	t.Logf("Q9-shape (agg+filter+join) leaf bounds left=%d/%d right=%d/%d", lb, ln, rb, rn)
+	if ln != 8 || rn != 8 {
+		t.Fatalf("ncols=%d/%d, want 8/8", ln, rn)
+	}
+	if lb != 6 || rb != 1 {
+		t.Fatalf("bounds left=%d right=%d, want 6/8 and 1/8", lb, rb)
+	}
+
+	ctx := deformW8Fixture(t)
+
+	// The full variant adds the always-true t2.h > 0 (right column 7) to pin
+	// the right side full with identical values.
+	narrowSQL := `SELECT sum(t1.b) FROM w t1 JOIN w t2 ON t1.a = t2.a WHERE t1.c < 33`
+	fullSQL := `SELECT sum(t1.b) FROM w t1 JOIN w t2 ON t1.a = t2.a WHERE t1.c < 33 AND t2.h > 0`
+	// c < 33 keeps fixture rows 1..3 (c = 12, 22, 32); the equi-join pairs
+	// each with itself; b = 11, 21, 31 → 63.
+	want := []string{"63"}
+
+	fullPlan, err := testPlanDeform(t, ctx, fullSQL)
+	if err != nil {
+		t.Fatalf("plan full: %v", err)
+	}
+	if _, _, frb, frn := joinSideBounds(t, fullPlan); frb != 8 || frn != 8 {
+		t.Fatalf("full right bound=%d ncols=%d, want 8/8", frb, frn)
+	}
+	if plan, err := testPlanDeform(t, ctx, narrowSQL); err != nil {
+		t.Fatalf("plan narrow: %v", err)
+	} else if lb, ln, rb, rn := joinSideBounds(t, plan); ln != 8 || rn != 8 {
+		t.Fatalf("narrow ncols=%d/%d, want 8/8", ln, rn)
+	} else {
+		t.Logf("Q9-shape execution-plan leaf bounds left=%d/%d right=%d/%d", lb, ln, rb, rn)
+	}
+
+	old := seqScanDeformPoison
+	seqScanDeformPoison = true
+	defer func() { seqScanDeformPoison = old }()
+	narrowRows, err := runQueryWithErr(ctx, narrowSQL)
+	if err != nil {
+		t.Fatalf("narrow run: %v", err)
+	}
+	seqScanDeformPoison = false
+
+	fullRows, err := runQueryWithErr(ctx, fullSQL)
+	if err != nil {
+		t.Fatalf("full run: %v", err)
+	}
+	for name, rows := range map[string][]Row{"narrow+poison": narrowRows, "full": fullRows} {
+		if got := renderDeformRows(rows); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%s rows = %v, want %v", name, got, want)
+		}
+	}
 }

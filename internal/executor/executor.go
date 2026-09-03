@@ -167,20 +167,23 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 		}
 		return maybeInstrument(p, newSortOp(p, child)), nil
 	case *optimizer.Join:
-		// EX1-01: deformBoundBelow examines the side-local keys first
-		// and resets to full width below on both sides.
-		joinBound := deformBoundBelow(p, bound)
-		left, err := buildNode(p.Left, joinBound)
+		// EX1-02: per-side bounds from the merged-space remap
+		// (deformJoinBounds): above-join refs mapped through the output
+		// layout unioned with the remapped keys/residual.
+		leftBound, rightBound := deformJoinBounds(p, bound)
+		left, err := buildNode(p.Left, leftBound)
 		if err != nil {
 			return nil, err
 		}
-		right, err := buildNode(p.Right, joinBound)
+		right, err := buildNode(p.Right, rightBound)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newJoinOp(p, left, right)), nil
 	case *optimizer.NestedLoopIndexJoin:
-		outer, err := buildNode(p.Outer, deformBoundFull)
+		// EX1-02: the outer follows the left-side rule; inner rescans
+		// stay out (EX1-02b).
+		outer, err := buildNode(p.Outer, deformNLIOuterBound(p, bound))
 		if err != nil {
 			return nil, err
 		}
@@ -623,14 +626,13 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) 
 		return tree.add(OpNode{Kind: OpInsert, childA: noChild, childB: noChild, state: &insertOpState{op: newInsertOp(p, childOp)}}), nil
 
 	case *optimizer.Join:
-		// Same terminator rule as the buildNode Join arm: keys examined
-		// first, full width below on both sides.
-		joinBound := deformBoundBelow(p, bound)
-		leftIdx, err := tree.buildRec(p.Left, joinBound)
+		// Same per-side remap as the buildNode Join arm.
+		leftBound, rightBound := deformJoinBounds(p, bound)
+		leftIdx, err := tree.buildRec(p.Left, leftBound)
 		if err != nil {
 			return noChild, err
 		}
-		rightIdx, err := tree.buildRec(p.Right, joinBound)
+		rightIdx, err := tree.buildRec(p.Right, rightBound)
 		if err != nil {
 			return noChild, err
 		}
