@@ -644,3 +644,81 @@ first slice should still run under `GOOPG_ASSERT_ROW_SHAPE=1` against the PG
 oracle at both budgets per §13.5.
 
 With this, every unknown rev 5 raised is closed. The item is ready to implement.
+
+
+---
+
+## 18. Revision 10 (2026-09-03) — the concrete first slice
+
+Rev 9 closed the last unknown. This is the implementation plan at the level of
+files and functions, derived by attempting the change rather than by sketching
+it.
+
+### The insertion point
+
+`joinInputsFor` (`createplanjoin.go:277`) calls
+
+    innerNode, innerLay := createPlanNode(innerPath)      // :279
+
+and four lines later panics if the layout and schema disagree (`:289`). Narrowing
+the PAIR immediately after that call is the correct hook: everything downstream —
+the schema check, `merged` (`:293`), the concatenated layout (`:299`) — then sees
+a consistent pair, and the existing panic guards the helper on the first mistake.
+
+This is why rev 8's "wrap at the join arm" is wrong and this is not: the wrap
+must happen where BOTH halves are still in hand.
+
+### The keep-rule
+
+Keep output column *i* of the build child iff its name is in the statement's
+needed-column set.
+
+That rule preserves the join keys automatically, and the reason is worth stating
+because it is what makes the slice safe: `neededColumnNames` walks the WHOLE
+statement — targets, WHERE, GROUP BY — so any column a join key references is in
+the set by construction. No separate key-preservation pass is required, and
+there is no ordering hazard between the two.
+
+### The plumbing
+
+`createPlanNode(p *Path)` is a free function with no `searchCtx`, and
+`neededCols` lives on `searchCtx` (`joinsearch.go:177`). Do NOT thread a
+parameter through every `createPlan` arm, and do NOT use a package global — the
+P2-A review rejected exactly that for reading another session's state.
+
+Carry it as DATA on the rel, the way `NCols` and `AvgVarBytes` already travel:
+
+    // RelOptInfo (path.go:221)
+    NeededCols      map[string]bool
+    NeededColsKnown bool
+
+stamped in `buildInitialRels` and `makeJoinRel` from the searchCtx, and read at
+`createPlanNode` via `p.Rel`. `Path.Rel` (`path.go:87`) already reaches it.
+
+### The helper
+
+    func narrowPlanOutput(n Node, lay outputLayout, keep []int) (Node, outputLayout)
+
+builds a `*Project` whose `Targets` are `*ColumnRef`s at the kept indices, whose
+schema is the kept subset of `n.Output()`, and whose layout is the kept subset
+of `lay`. All three come from the same `keep` slice — the single-source property
+rev 7 chose this mechanism for.
+
+### Order, and the guards at each step
+
+1. Add the two `RelOptInfo` fields and stamp them. No behaviour change; gate on
+   the unit suites.
+2. Add `narrowPlanOutput` with unit tests over a hand-built node/layout pair.
+   No call site yet.
+3. Wire it into `joinInputsFor` behind `GOOPG_NARROW_BUILD=1`, default OFF. The
+   shipped path is untouched, so the gate measures the flag rather than the
+   commit.
+4. Measure with the flag on: `tpch-runner -digest` against the PG oracle at BOTH
+   `work_mem` budgets, under `GOOPG_ASSERT_ROW_SHAPE=1`, plus the TPC-DS SF0.5
+   sweep. Expect `NBatch` to fall 2–4× and the corpus to be VALUE-identical.
+5. Flip the default only if step 4 is clean on both suites.
+
+Three independent guards are in place before step 3 runs: the plan-time layout
+panic (`createplanjoin.go:289`, pre-existing), the run-time row-shape assertion
+on both scan paths (added this session), and the value digest against the
+oracle. P4-01b had none of them.
