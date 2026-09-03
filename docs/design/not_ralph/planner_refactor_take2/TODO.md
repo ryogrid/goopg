@@ -1429,10 +1429,17 @@ delta.
       NOT return the Gather (Q9 at 4MB is 56.94s against 55.42s before,
       unchanged), so width and Gather do not share a gate and the 87/13 split in
       `MEASUREMENT-p202b-width-vs-gather.md` stands.
-      Outstanding before code: re-take §12's EXPLAIN table on current HEAD (it
-      predates nine planner commits), and run `hashsize.Choose` at the NARROWED
-      ncols for Q9's four join levels — if `NBatch` still exceeds 1 there, this
-      item is mis-scoped.
+      **That check has now been RUN, and the answer is that the item IS
+      mis-scoped as P2-02b's blocker.** Narrowing `orders` to Q9's two needed
+      columns takes it from 128 batches to **64** at PG's `work_mem` — not to 1;
+      the 2.0M-row intermediate goes 512 -> 256. `hashsize.EntryBytes` charges
+      `ncols x 48 + 24`, so **48 bytes per column** is co-dominant with the
+      column COUNT, and that is 07 §6's Datum residual, currently listed as out
+      of scope. P4-01 keeps its own justification (2-4x fewer batches) but does
+      not unblock P2-02b on its own. See
+      `impl/FINDING-p401-alone-is-not-enough.md`.
+      Still outstanding before code: re-take §12's EXPLAIN table on current HEAD
+      (it predates nine planner commits).
 - [ ] **P4-02** Upper `RelOptInfo`s (`GROUP_AGG`, `WINDOW`, `DISTINCT`,
       `ORDERED`, `FINAL`) with pathlists. *design: 08 §7.*
 - [ ] **P4-03** Promote `PathSort` to an upper-rel path. It already has a
