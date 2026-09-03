@@ -57,7 +57,7 @@ Constraints, not preferences. Each was paid for (take2 §4.3, carried).
 `selfuncs.c` approximates, goopg reproduces the approximation (take3 02 §7,
 03 §5–§7). A better estimate that produces a different plan is a failure of
 this project even when it is a better estimate. Deviations require a
-committed measurement and a ledger row (09 §7.4).
+committed measurement and a ledger row (09 §4.3 C7 + §4.4).
 
 **P2 — Structure before calibration.** Every attempt to fix a slow query by
 moving a cost term has failed: inferred-edge penalties (M0076), accurate
@@ -163,7 +163,8 @@ five queries). Take3 refines the ordering with take2's measurements:
 
 ## 3. Phase 0 — Instruments (complete what take2 started)
 
-Take2 landed P0-01/02/03/04b/04d/04c/11/12 (take3 04 §0). Remainder:
+Take2 landed P0-01, P0-02, P0-03, P0-04b, P0-04c, P0-04d, P0-09, P0-11,
+P0-12 (take3 04 §0). Remainder:
 
 **P0-05/06/07 plan-parity capture/diff/baseline.** New capture/diff mode
 covering both suites with the PG side committed as a fixture (like the SF0.5
@@ -200,7 +201,7 @@ reporting anything else measures itself wrong. Re-opens the voided NO-GO
 suites + Q72/Q75 timing.
 
 **P0 exit:** parity instrument produces a committed baseline roll-up for
-both suites (bars A1/A2 set as `baseline + N`, 09 §7.1), and `PP changed=0`
+both suites (bars A1/A2 set as `baseline + N`, 09 §4.1), and `PP changed=0`
 against pre-P0 goopg capture — P0 moves no plan.
 
 ---
@@ -208,8 +209,10 @@ against pre-P0 goopg capture — P0 moves no plan.
 ## 4. Phase 1 — Statistics fidelity (finish the tail; ratchet, not timing)
 
 Target: the planner reads what PG's planner would read (take3 03 oracle).
-Take2 closed P1-01/03/03b/05/07/08/11b/11c/12/13/14/15/19/20/25/26/28,
-verified P1-04/09/17 satisfied, declined P1-06, blocked P1-18/P1-21 (take3
+Take2 closed P1-01, P1-03, P1-03b, P1-05, P1-07, P1-08, P1-11b, P1-11c,
+P1-12, P1-13, P1-14, P1-15, P1-19, P1-20, P1-25, P1-26, P1-28, P1-29,
+verified P1-04, P1-09, P1-17 satisfied, declined P1-06, blocked P1-18,
+P1-21 (take3
 06 §0). Remainder, in landing order:
 
 **P1-11 TOAST.** Wide-text histograms dropped + size-row loss (`orders`,
@@ -307,7 +310,7 @@ confirmed present; per-tuple qual cost reverted +3.3% lands with the batch;
 take3 05 §3.4) with acceptance on the **aggregate sweep TOTAL**, not the
 per-query gate (07 §7 item 6).
 
-### 5.3 MCV-frequency half (P2-11 remainder)
+### 5.3 MCV-frequency half (P2-11b; P2-11 landed the ndistinct half)
 
 `estimateHashBucketSize` covers the ndistinct fraction (take3 05 §5.7);
 plumb the inner key's MCV list to the cost site for the skew term (take3 02
@@ -427,7 +430,7 @@ fraction ≥1 ÷ rows, parameterised excluded, `disabled_nodes` first);
 P4-09 window + set-op paths. Grouping sets (`groupingsets.go` interaction),
 `remove_useless_joins`, `reduce_outer_joins.go` interaction, and
 FROM-subquery pull-up coverage each need a scoped item before the phase
-starts (take2 08 §11.1 — still unscheduled).
+starts (P4-00; take2 08 §11.1 — still unscheduled).
 
 **P4 exit:** `aggregation-strategy` / `sort-strategy` diffs strictly
 decrease; no correctness delta (values, not counts).
@@ -436,17 +439,17 @@ decrease; no correctness delta (values, not counts).
 
 ## 8. Phase 5 — Parallelism in the path model (costed, not forced)
 
-`consider_parallel` per rel; `create_plain_partial_paths` populating
-`PartialPathlist` (`computeParallelWorkers` moves into generation);
+`consider_parallel` per rel (P5-01); `create_plain_partial_paths` populating
+`PartialPathlist` (`computeParallelWorkers` moves into generation) (P5-02);
 eligibility as property not arm list — P5-03 extends `drivingScan` to plain
 `IndexScan`/bitmap (index-only already admitted; Parallel Index Scan counterpart; take2 §3.6;
 take3 04 §10); `generate_useful_gather_paths` (`Gather`/`Gather Merge`
 priced by `cost_gather`/`cost_gather_merge`, take3 02 §3.6) with
-`createPlanNode` arms; parallel hash as `parallel_aware` path (P5-06,
+`createPlanNode` arms (P5-04); parallel hash as `parallel_aware` path (P5-06,
 executor counterpart the parallel hash build/probe,
 `parallel_hash_build.go`, with a consumer check in the gate); partial agg
-paths replacing `splitAggregate` (depends on P4-06); re-decide
-`Gather Merge → Sort → Parallel scan` by **cost** (record as permitted
+paths replacing `splitAggregate` (depends on P4-06) (P5-07); re-decide
+`Gather Merge → Sort → Parallel scan` by **cost** (P5-05; record as permitted
 divergence with the committed q16/q10/q13 measurement if leader-side still
 wins; take2 §8); retire `MaybeAddGather` (P5-08). Note the ordering trap
 measured early: at small budgets the plan moves onto index-driven joins the
@@ -462,7 +465,7 @@ unchanged.
 
 1. **P6-01** one cardinality estimator: delete legacy
    `estimateJoin`/`EstimateRows` + `joinkeyproof.go` mirror; everything reads
-   `calcJoinrelSize`. Prerequisite: EXPLAIN `rows=` from the path (P0-2
+   `calcJoinrelSize`. Prerequisite: EXPLAIN `rows=` from the path (P0-02
    remainder) + legacy consumers gone (P4).
 2. **P6-02** `PathTarget` + range table replacing `baseLeaf`/`baseOffset`;
    delete `joinlayout.go` remapping + `createplanroot.go` boundary
@@ -474,10 +477,11 @@ unchanged.
    the oracle for the live `assertSearchedTreeNeedsNoReconcile` tripwire on
    every searched plan (take3 04 §2.2) — deleting it removes the check, not
    the code. If the pass is ever removed, replace the oracle first.
-4. **P6-06** retire flags one per commit (P6-06a…e:
-    `GOOPG_INDEXKEY_HARVEST`, `GOOPG_INDEX_PROBE_MULT`,
-    `GOOPG_HASH_OUTER_JOIN`, `GOOPG_NLI_COSTGATE`, `GOOPG_PGSHAPED_DP`
-    last), regenerating `planner-flags.env` each time, each with a
+4. **P6-06** retire flags one per commit (P6-06a, P6-06b, P6-06c, P6-06d,
+    P6-06e:
+    `GOOPG_INDEXKEY_HARVEST` (a), `GOOPG_INDEX_PROBE_MULT` (b),
+    `GOOPG_HASH_OUTER_JOIN` (c), `GOOPG_NLI_COSTGATE` (d), `GOOPG_PGSHAPED_DP`
+    (e) last), regenerating `planner-flags.env` each time, each with a
     before/after parity roll-up + timing table. (`GOOPG_RELSIZE_FALLBACK`
     staging already retired take2-P1-05; `GOOPG_PGSHAPED_COLLAPSE`
     retires once in P3-05, not here.)

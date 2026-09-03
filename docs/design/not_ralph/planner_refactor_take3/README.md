@@ -43,6 +43,7 @@ BootVal work it blocks.
 | [08-target-design.md](08-target-design.md) | The design: one planner, PG statistics, PG cost inputs, delete the rest; Phases 0–6 in PathTarget-first order, with sequencing constraints and a risk register. |
 | [09-verification-and-acceptance.md](09-verification-and-acceptance.md) | What is measured and what counts as done: gate failures R1–R8, instruments, bars A/B/C, per-phase gates, methodology, the acceptance run. |
 | [TODO.md](TODO.md) | The execution checklist for the remaining work. One checkbox ≈ one commit. Progress log at the end. |
+| [REVIEW.md](REVIEW.md) | Take3 agent-review synthesis (PG 8/8, goopg M1–M9, design F1–F17 verdicts with fix evidence); raw reports in `.review-pg.md`, `.review-goopg.md`, `.review-design.md`. |
 | [.review-design.md](.review-design.md) | Agent-review record: findings and how each was resolved. |
 
 ## Reading order

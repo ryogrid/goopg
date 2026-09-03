@@ -18,7 +18,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[-]` dropped
 When closing an item, rewrite its line as:
 
 ```
-- [x] P1-04 <title> — <commit>; gates: <list>; artifacts: <paths>
+- [x] P0-00 <title> — <commit>; gates: <list>; artifacts: <paths>
 ```
 
 Each item below names its design pointer (08 §) and its gate (09 §) in 2–4
@@ -372,7 +372,7 @@ Remaining:
       acceptance on the **aggregate sweep TOTAL**, not the per-query gate
       (R6).
       *design: 08 §5.2; gate: 09 §5 P2 + TOTAL arm with plan attribution.*
-- [ ] P2-11 MCV-frequency half: plumb the inner key's MCV list to the cost site
+- [ ] P2-11b MCV-frequency half (P2-11 remainder): plumb the inner key's MCV list to the cost site
       for the skew term (02 §5.4: `estimate_hash_bucket_stats`, clamp
       [1e-6,1]); per-orientation closures as landed. Zero/isdefault fraction
       suppresses the term rather than guessing.
@@ -603,7 +603,7 @@ difference explained and timed.
 
 - [ ] P6-01 One cardinality estimator: delete legacy `estimateJoin`/
       `EstimateRows` + the `joinkeyproof.go` mirror; everything reads
-      `calcJoinrelSize`. Prerequisite: EXPLAIN `rows=` from the path (P0-2
+      `calcJoinrelSize`. Prerequisite: EXPLAIN `rows=` from the path (P0-02
       remainder) + legacy consumers gone (P4).
       *design: 08 §9; gate: 09 §5 P6 (PP + EA ratchet).*
 - [ ] P6-02 `PathTarget` + range table replacing `baseLeaf`/`baseOffset`;

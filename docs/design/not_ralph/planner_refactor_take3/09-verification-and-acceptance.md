@@ -125,10 +125,10 @@ Measured by §2.2 `PP` on both suites, S-cold and WARM.
 
 | bar | metric | current | target |
 |---|---|---|---|
-| A1 | TPC-H PG-identical plan trees | **unmeasured** — set by P0-07 | `baseline + N` (N argued from category counts; below 100% — correct cost-difference divergences permitted, 09 §7.4) |
+| A1 | TPC-H PG-identical plan trees | **unmeasured** — set by P0-07 | `baseline + N` (N argued from category counts; below 100% — correct cost-difference divergences permitted, 09 §4.4) |
 | A2 | TPC-DS SF0.5 PG-identical plan trees | **unmeasured** — set by P0-07 | same form as A1 |
 | A3 | `MISSING-NODE` (Incremental Sort, bounded Sort, plain Parallel Index Scan; `Hash` excluded by normalisation) | ≥3 | **0** (Incremental Sort excluded until its executor counterpart lands, per P4-05) |
-| A4 | join-spine parity | violations 0, mismatches 46 (STALE), matched 32 | violations 0; mismatches/matched numberless until the P0-04 re-measurement, then set as `baseline + N` exactly like A1/A2 (09 §7.1) |
+| A4 | join-spine parity | violations 0, mismatches 46 (STALE), matched 32 | violations 0; mismatches/matched numberless until the P0-04 re-measurement, then set as `baseline + N` exactly like A1/A2 (09 §4.1) |
 | A5 | per-joinrel estimate ratchet | slack 10.0, floor 100.0, 0 violations | tighten to smallest holding value end of P1; ratchet down per phase |
 
 A1/A2 deliberately numberless until P0-07 measures (inventing targets for
