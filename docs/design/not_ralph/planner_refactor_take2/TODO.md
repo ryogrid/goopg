@@ -1454,7 +1454,26 @@ difference explained and timed.
       *design: 08 §9.3; gate: byte-identical plans.*
 - [ ] **P6-04** Delete `rewriteJoinsToNLI` and `GOOPG_NLI_COSTGATE`.
       *design: 08 §9.3; depends on P3-11.*
-- [ ] **P6-05** Delete the dead `reconcileNLILayout`. *design: 08 §9.3.*
+- [-] **P6-05** Delete the dead `reconcileNLILayout`. *design: 08 §9.3.*
+      **DO NOT DELETE — it is not dead (verified 2026-09-03).** It has no
+      direct production call site, which is what the item's premise rests on,
+      but `assertSearchedTreeNeedsNoReconcile` (searchedtree.go:200) calls
+      `reconcileNLILayoutBody(n)` and PANICS if the pass moved any column
+      reference. That assertion runs UNCONDITIONALLY at
+      `createplanroot.go:137` — no build tag, no env gate — on every searched
+      plan.
+      So the pass executes in production on every plan the search produces. It
+      is the ORACLE for a live correctness tripwire: the assertion's own comment
+      says "it lets the real pass run and then compares. That is safe precisely
+      because the claim is that it changes nothing; if it changed something the
+      tree was already wrong and the process is about to stop."
+      Deleting the function would delete the tripwire that catches a createPlan
+      arm binding a join key to the wrong column — the failure mode that
+      produces a plan which RUNS and joins on the wrong column, which is the
+      hardest class this bundle has to defend against.
+      If the goal is to remove the pass, the assertion must first be replaced by
+      an independent oracle; retiring both together removes the check, not just
+      the code. The item as written would do exactly that.
 - [ ] **P6-06** Retire the planner flags — `GOOPG_PGSHAPED_DP`,
       `GOOPG_PGSHAPED_COLLAPSE`, `GOOPG_RELSIZE_FALLBACK`,
       `GOOPG_INDEXKEY_HARVEST`, `GOOPG_HASH_OUTER_JOIN`,
