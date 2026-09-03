@@ -65,12 +65,24 @@ claimed.
 
 - [x] EX0-01 File the executor backlog ledger — `6ace9567e` (design) + ledger rows this commit; gates: 8 `take3-EX0-G-EXn` rows merged, `git diff --stat` docs-only; artifacts: `docs/design/executor-ex0-01-ledger/DESIGN.md`, `.ralph/deferral_ledger.md`
 - [x] EX0-02 Commit the measurement protocol — `503f12cf7` (design) + conforming artifact this commit; gates: protocol doc merged, `EX0-02-q6-serial-scold` full header (serial 5.48 s, values ×9 identical, alloc 1.06 GB/Q6, perf 56.6B instr/Q6); artifacts: `docs/design/executor-ex0-02-protocol/DESIGN.md`, `analysis/executor-refactor/ex0-02-20260903/README.md`
-- [ ] EX0-03 Surface per-worker hash/sort counters in EXPLAIN ANALYZE —
-      thread existing worker counts to the leader (PG shows them; 11 §10
-      notes they die with the worker). Counting already happens; plumbing
-      + golden test only.
+- [~] EX0-03 Surface per-worker hash/sort counters in EXPLAIN ANALYZE —
+      scoped to (a) worker `HashJoinStats` MAX-merge + (b) `Workers
+      Launched:` via a Context-keyed carrier (design
+      `docs/design/executor-ex0-03-workers/DESIGN.md`, reviewed — (c)
+      scope-fix and (d) sortOp counters split out per the
+      one-checkbox-one-commit rule).
       *design: 13 §2.2; gate: golden test, plans byte-identical, no timing
       claim.*
+- [ ] EX0-03b Per-worker rows/loops/time lines (new instrumentation path:
+      fresh per-worker instrumenter, Context-keyed report carrier,
+      leader-participation + GatherMerge coverage; golden asserts
+      shape/presence + self-consistent max only).
+      *design: executor-ex0-03-workers §2; gate: golden test, pin
+      `changed=0`, no timing claim.*
+- [ ] EX0-03c Minimal `sortOp` method/space counters with one `Sort
+      Method:` line per worker (PG `explain.c:3125-3166`).
+      *design: executor-ex0-03-workers §2; gate: golden test, pin
+      `changed=0`, no timing claim.*
 - [ ] EX0-04 Per-operator timing harness — repeatable breakdown (scan
       decode / prefilter / clone / join-probe / sort-compare / spill write)
       on Q6-class, Q9-class, Q4/Q7/Q13-class shapes. Validate against the
