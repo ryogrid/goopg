@@ -812,15 +812,21 @@ cmd_sweep() {
         fi
         qf="${QDIR}/query${q}.sql"
         start=$SECONDS
+        # Millisecond arm (EX0-06): EPOCHREALTIME costs no subprocess; the
+        # integer `secs` above stays the parsed field (sweep-diff.py's
+        # TIMED_RE anchors `(\d+)s\b`, which an appended `(Nms)` suffix
+        # does not disturb) — ms rides alongside, additively.
+        mstart=${EPOCHREALTIME/./}
         # Captured to a file rather than a shell variable so the checksum tool
         # can parse the very same bytes the verdict is drawn from. The file is
         # reused per query and only kept (under a per-query name) when the
         # verdict is bad — a passing gate must not litter the results dir.
         timeout "${TIMEOUT_SEC}" ${GOOPG_PSQL} -f "$qf" > "$resfile" 2>&1 && rc=0 || rc=$?
         secs=$((SECONDS - start))
+        msecs=$(awk -v us=$(( ${EPOCHREALTIME/./} - mstart )) 'BEGIN{printf "%.0f", us/1000}')
         if [[ $rc -eq 124 ]]; then
             verdict="TIMEOUT"; gto=$((gto+1))
-            printf "Q%-3s TIMEOUT  %4ss (oracle %s rows)\n" "$q" "$secs" "$orows" | tee -a "$report"
+            printf "Q%-3s TIMEOUT  %4ss (%sms) (oracle %s rows)\n" "$q" "$secs" "$msecs" "$orows" | tee -a "$report"
             if [[ "${RESTART_AFTER_TIMEOUT:-1}" == "1" ]]; then
                 echo "      (restarting goopg to drop accumulated heap)" | tee -a "$report"
                 sf05_goopg_start
@@ -830,7 +836,7 @@ cmd_sweep() {
             # psql exit 2) carries no ERROR: prefix and previously fell through
             # to the row-count comparison below — judging error text as rows.
             verdict="ERROR"; gerr=$((gerr+1))
-            printf "Q%-3s ERROR    %4ss %s\n" "$q" "$secs" \
+            printf "Q%-3s ERROR    %4ss (%sms) %s\n" "$q" "$secs" "$msecs" \
                 "$(grep -E '(ERROR|FATAL|PANIC):|connection to server' "$resfile" | head -1 | cut -c1-90)" | tee -a "$report"
             # A dead server presents as a connection error on the NEXT query;
             # probe and restart so one crash doesn't cascade.
@@ -839,24 +845,24 @@ cmd_sweep() {
             read -r grows gck < <(result_rows_ck "$resfile" "$qf")
             if [[ "$grows" != "$orows" ]]; then
                 verdict="MISMATCH"; mismatch=$((mismatch+1))
-                printf "Q%-3s MISMATCH %4ss goopg=%s oracle=%s\n" "$q" "$secs" "$grows" "$orows" | tee -a "$report"
+                printf "Q%-3s MISMATCH %4ss (%sms) goopg=%s oracle=%s\n" "$q" "$secs" "$msecs" "$grows" "$orows" | tee -a "$report"
                 cp -f "$resfile" "${OUTDIR}/goopg_q${q}_result.txt"
             elif [[ "$ock" != "n/a" && "$gck" != "n/a" && "$gck" != "$ock" ]]; then
                 # The right number of WRONG rows — the more alarming of the two
                 # failures, and the one this whole column exists to catch (Q75
                 # PASSed for weeks at 100 rows over a corrupt CTE).
                 verdict="CKMISMATCH"; ckmismatch=$((ckmismatch+1))
-                printf "Q%-3s CKMISMATCH %2ss %8s rows  goopg ck=%s oracle ck=%s\n" \
-                    "$q" "$secs" "$grows" "$gck" "$ock" | tee -a "$report"
+                printf "Q%-3s CKMISMATCH %2ss (%sms) %8s rows  goopg ck=%s oracle ck=%s\n" \
+                    "$q" "$secs" "$msecs" "$grows" "$gck" "$ock" | tee -a "$report"
                 cp -f "$resfile" "${OUTDIR}/goopg_q${q}_result.txt"
             else
                 verdict="PASS"; pass=$((pass+1))
                 if [[ "$ock" != "n/a" && "$gck" == "$ock" ]]; then
                     ckver=$((ckver+1))
-                    printf "Q%-3s PASS     %4ss %8s rows  ck=%s\n" "$q" "$secs" "$grows" "$gck" | tee -a "$report"
+                    printf "Q%-3s PASS     %4ss (%sms) %8s rows  ck=%s\n" "$q" "$secs" "$msecs" "$grows" "$gck" | tee -a "$report"
                 else
                     ckna=$((ckna+1))
-                    printf "Q%-3s PASS     %4ss %8s rows  ck=n/a\n" "$q" "$secs" "$grows" | tee -a "$report"
+                    printf "Q%-3s PASS     %4ss (%sms) %8s rows  ck=n/a\n" "$q" "$secs" "$msecs" "$grows" | tee -a "$report"
                 fi
             fi
         fi
