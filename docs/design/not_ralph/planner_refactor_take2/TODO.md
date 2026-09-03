@@ -176,15 +176,20 @@ reports `changed=0` against a pre-P0 goopg capture.
       *design: 09 §3.1; gate: unit tests over recorded plan pairs.*
 - [ ] **P0-07** Commit the baseline roll-up for both suites and record it in
       09 §7.1 as the starting numbers for bars A1/A2. *gate: 09 §5 P0 row.*
-- [ ] **P0-08** Re-pin the stale plan baseline. **Corrected (impl/P0-B §5):**
-      the nightly calls `make plan-diff LABEL=m0077-final` from
-      `ci/batch/stages/stage-tpch.sh:234` with `|| true`, *deliberately*
-      informational — it does not use `plan-gate`, and it does not silently pass.
-      Meanwhile `make plan-gate`'s `ls -t` today selects `warm-stats-base.txt`
-      (Aug 2026), not `m0077-final`. The defect is the four-month-stale pin, and
-      the re-pin is **three coordinated edits in one commit**: commit
-      `plan_snapshots/take2-p0-<date>.txt`; update `stage-tpch.sh:234`'s
-      `LABEL=`; update the hardcoded label in `summarize.py:689`.
+- [x] **P0-08** Re-pinned the stale plan baseline — **CLOSED this commit
+      (three coordinated edits as specified):** captured
+      `plan_snapshots/take2-p0-20260903.txt` (22 queries, EXPLAIN-only,
+      post-narrowing widths e.g. Q9 top width=1096) from the bench cluster
+      at HEAD; `stage-tpch.sh:234` `LABEL=` → `take2-p0-20260903`;
+      `summarize.py` drift-note string likewise. Verified the pin works
+      end to end: `make plan-gate` selects the new file by mtime and
+      self-diffs all-MATCH. Gates: `bash -n`, `py_compile`, gate self-diff;
+      no live `m0077-final` references remain (design doc §C + old run logs
+      are historical records, untouched). DISCOVERED, not fixed here:
+      `plan-gate` reports SKIP-not-reachable when `pg_isready` is absent
+      from PATH (it is not in this repo's default PATH; the oracle tools
+      live under `postgres/local_install/bin`) — the gate silently skips
+      instead of failing, which is how a dead baseline hid for months.
       *design: 08 §3 P0-4.*
 - [x] **P0-09** Oracle timer at millisecond resolution — `71653da23`; gate:
       `bash -n`. Per the rescope, **no re-capture was triggered**.

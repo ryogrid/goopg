@@ -231,7 +231,7 @@ done < "${TPCH_DIR}/explain-run.log"
 # PLAN_PORT points at OUR clone server; PLAN_DB/USER/PASS must be the resolved
 # gate target — the Makefile defaults (tpch/tpch) don't survive the fresh
 # restart (that's why the probe above fell back to superuser@postgres).
-make -C "${REPO_ROOT}" plan-diff LABEL=m0077-final MODE=structural \
+make -C "${REPO_ROOT}" plan-diff LABEL=take2-p0-20260903 MODE=structural \
     PLAN_PORT="${RUN_PORT}" PLAN_DB="${GATE_DB}" PLAN_USER="${GATE_USER}" PLAN_PASS="${GATE_PASS}" \
     > "${TPCH_DIR}/plan-gate.log" 2>&1 || true
 
