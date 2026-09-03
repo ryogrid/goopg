@@ -141,6 +141,16 @@ the bundle's ordering suggests.
   makes per-column footprint co-dominant with column count. The 48-byte Datum
   (07 §6, currently "out of scope") is P4-01's partner, not a downstream
   residual. `impl/FINDING-p401-alone-is-not-enough.md`.
+  Read that finding's **Correction** paragraph before acting on it: the fix is
+  PG's slot duality — retained rows packed, only the row in flight deformed into
+  a per-slot scratch array — and NOT a hash-table patch. `[]Row` is retained by
+  sort, materialize and the CTE caches too, not only the hash join. goopg has
+  both halves already: the packed encoding (`appendRowPayload` /
+  `spillReader.ReadRowInto`, used on the spill path) and the seam
+  (`TupleSlot.Row()`'s "for a future `VirtualSlot` this materializes lazily").
+  Doing the hash join alone is a MEASUREMENT of the encode/decode cost, not the
+  design; stopping there leaves two retention formats and the sibling-path
+  hazard that implies.
 - **P2-02b's remaining +23.1 % is 87 % width / 13 % Gather**, measured.
   `impl/MEASUREMENT-p202b-width-vs-gather.md`.
 - **P3-01's hazard:** `min = syn` is the SAFE direction. An *under*estimated

@@ -477,6 +477,11 @@ batches to 64 at PostgreSQL's `work_mem` — not to 1 — because
 the column count. **P4-01 remains justified on its own terms and no longer
 carries the claim that it unblocks P2-02b.**
 
+Note the partner item's shape, corrected 2026-09-03: it is PG's slot duality
+(retained rows packed, only the row in flight deformed into a per-slot scratch
+array), not a hash-table patch — `[]Row` is retained by sort, materialize and
+the CTE caches as well. See that finding's Correction paragraph.
+
 
 ---
 

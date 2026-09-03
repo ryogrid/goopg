@@ -89,10 +89,54 @@ artefact, both easier explanations were checked:
    largest remaining field is the 24-byte `Buf []byte` slice header, which is
    what makes a `Datum` self-describing.
 
-So the lever is not the width of a `Datum`; it is **not storing `[]Datum` rows
-in the hash table at all** — PostgreSQL stores a packed `MinimalTuple`, goopg
-stores a tagged-union array. That is the shape of the change, and it is why this
-is a genuine subsystem item rather than a tuning one.
+So the lever is not the width of a `Datum`. **Correction, 2026-09-03 (later):**
+an earlier revision of this paragraph said the lever was "not storing `[]Datum`
+rows in the hash table". That is too narrow, and naming only the hash table made
+a local workaround look like the design.
+
+The hash table is not special — it is simply where the pain was measured first.
+`[]Row` is RETAINED in every operator that accumulates:
+
+| site | field |
+|---|---|
+| hash join build | `lazyHash map[string][]Row`, `lazyIntHash map[int64][]Row` (`operators_join_agg.go:53,71`) |
+| sort | `rows []Row` (`operators.go:769`) |
+| materialize | `mem []Row` (`operators_material.go:68`) |
+| CTE cache / recursive worktable | `CTERowCache`, `WorkTableRows` (`context.go:623,364`) |
+
+Every one pays `48 × columns` per retained row.
+
+**The shape of the change is PostgreSQL's slot duality, not a hash-table patch.**
+PG keeps *stored* tuples packed and deforms only the row currently in flight into
+a per-slot scratch array (`tts_values`), lazily and only up to the attribute
+asked for (`slot_getattr`). The `Datum` array does not disappear in that design —
+it is demoted from **storage format** (millions of rows) to **per-operator
+working buffer** (one row).
+
+That demotion is what makes the 48 bytes stop mattering, and it is why the
+`unsafe`-union idea (which can reach ~32 B, GC-safely, by overlaying only
+non-pointer words) is the wrong investment: it buys ~33 % on a quantity that
+should not be multiplied by row count at all.
+
+goopg already has both halves of the mechanism:
+
+- the packed encoding — `appendRowPayload` / `spillReader.ReadRowInto`
+  (`spill.go`), already used on the spill path, and whose own comment cites PG's
+  `ExecHashJoinSaveTuple` and stores the hash value ahead of the row exactly as
+  PG does;
+- the abstraction seam — `TupleSlot.Row()`'s doc says "for a **future
+  `VirtualSlot`** this materializes lazily" (`slot.go`). The lazily-deforming
+  slot was anticipated; it was never built.
+
+**Sequencing.** The hash join is still the right FIRST target, but as a
+measurement rather than as the design: it is where the cost is quantified
+(128→64 batches at PG's `work_mem`), it is bounded, and it prices the
+encode/decode CPU before that cost is committed to pervasively. Landing it must
+not be mistaken for finishing the item — if it stops there, the codebase is left
+with two retention formats and the sibling-path hazard that implies.
+
+Not in scope, checked: `executor.Run(op, ctx) ([]Row, error)` accumulates a whole
+result set, but it has no non-test callers — the server streams.
 
 ## What this does not say
 
