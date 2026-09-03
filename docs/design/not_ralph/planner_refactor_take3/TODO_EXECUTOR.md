@@ -333,6 +333,7 @@ One row per closed phase. Numbers come from the 13 §2.3 artifact header.
 
 | phase | closed | commit range | Q6 serial (goopg / PG) | Q6 parallel (goopg / PG) | witness alloc delta | notes |
 |---|---|---|---|---|---|---|
+| EX0 | 2026-09-03 | 6ace9567e..e8c7400f9 | 5.48 s / 0.99 s (GOGC=100; take7 3.79 @off non-comparable) | 2.25 s / 0.20 s (GOGC=100; take7 0.84 @off non-comparable) | Q6 1.06 GB serial / ~107 MB parallel-warm (pool-fill hypothesis) | ledger+protocol+worker stats+slices+batches+baseline; TPC-H 252/284 s, TPC-DS 986/997 s; +2 ledger rows (G-EX split b/c, lazy-hash tripwire) |
 
 ## Dropped
 
