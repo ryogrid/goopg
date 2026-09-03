@@ -567,10 +567,28 @@ slower than 1.2×, S-cold/WARM gap narrows.
 > 09 estimate ratchet, not by per-item TPC-H timing, and do not spend a
 > half-hour A/B on each. See analysis/planner-refactor-take2/perf-20260902-cumulative.md §4b.
 
-- [ ] **P1-14b** Remaining per-clause estimators: general `scalararraysel`,
-      `patternsel` for LIKE/regex beyond the access-path prefix rewrite,
-      `rowcomparesel`, `booltestsel`, `var_eq_non_const`; align every
-      `DEFAULT_*` constant with PG. *design: 08 §4.4.*
+- [~] **P1-14b** Remaining per-clause estimators: general `scalararraysel`,
+      `rowcomparesel`, `booltestsel`, `var_eq_non_const`; regex-pattern
+      selectivity; align every `DEFAULT_*` constant with PG. *design: 08 §4.4.*
+      **LIKE/ILIKE `patternsel` LANDED this commit (the measured Q9 slice):**
+      new `patternsel.go` ports `patternsel_common` (like_support.c) — exact
+      patterns delegate to equality, else MCV exact-match + histogram-bound
+      match fraction (n_skip=1, min size 10), <100-bound heuristic blend
+      (prefix range via the range estimator + `like_selectivity` remainder),
+      [0.0001, 0.9999] clamp, nullfrac merge, negate rule, DEFAULT_MATCH_SEL
+      0.005 fallback — wired into `clauseSelectivity` AND the `WithSource`
+      twin (reliable iff shape-matched with stats; the twin marked every
+      LIKE unreliable before, keeping the search's `initialRelRows` at full
+      rows). No double-count with the access-path prefix rewrite: injected
+      bounds feed only `planIndexScanFromWhere`, never the estimator.
+      Live: Q9 `part` rows 66666 → 8080 (actual ~10.6k, PG 6061), final
+      joinrel toward ~1x with unchanged bushy-hash shape. Gates: 5 unit
+      tests (incl. backtracking matcher + negative-control-grade
+      expectations), full optimizer suite, expr-switch census pin +
+      prescribed ledger row, units gate, regress 4/52 byte-identical set
+      (strings/case/select diffs header-only), spotcheck Q12=2/Q13=34.
+      REMAINING in this item: regex ops, small-hist prefix-range precision
+      (text-scalar P1-11b gap), multibyte case-folding.
 
 ### 1e — Join selectivity
 

@@ -54,6 +54,11 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 			return 1 - eq
 		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			return rangeOpSelectivity(e.Op, e.Left, e.Right, child)
+		case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
+			// patternsel (like_support.c) — take2 P1-14b. LIKE with no
+			// estimator fell through to defaultGenericSelectivity (1/3);
+			// TPC-H Q9's `part LIKE '%green%'` priced 66,666 vs ~10.6k.
+			return patternClauseSelectivity(e.Op, e.Left, e.Right, child)
 		}
 	case *IsNullExpr:
 		// nulltestsel (postgres/src/backend/utils/adt/selfuncs.c). take2 P1-14.
@@ -513,6 +518,8 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 			return selectivityEstimate{value: 1 - eq.value, reliable: eq.reliable}
 		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			return rangeOpSelectivityWithSource(e.Op, e.Left, e.Right, child)
+		case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
+			return patternClauseSelectivityWithSource(e.Op, e.Left, e.Right, child)
 		}
 	case *UnaryOp:
 		if e.Op == parser.OpNot {

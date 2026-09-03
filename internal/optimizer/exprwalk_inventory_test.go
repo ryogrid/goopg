@@ -246,6 +246,12 @@ var exprSwitchInventory = map[string]walkerRole{
 	"planner.go:withinGroupDirectArgColumnName":  walkerPending, // 2 of 32 arms
 	"predp.go:remapSublinkOuterRefs":             walkerPending, // 3 of 32 arms
 	"predp.go:whereEligibleForPreDPUnnest":       nonRecursiveClassifier,
+	// Added by take2 P1-14b (patternsel slice): a 2-arm shape recogniser
+	// (StringConst / LikeEscapePattern) with decline-by-default — an
+	// unenumerated type falls through to the match default, the
+	// pre-existing conservative behaviour, so completing it is not
+	// required for correctness.
+	"patternsel.go:patternConstString":          nonRecursiveClassifier,
 	"pushdown.go:walkColumnRefsImpl":             walkerPending, // 18 of 32 arms
 	"selectivity.go:clauseSelectivity":           walkerPending, // 4 of 32 arms
 	"selectivity.go:clauseSelectivityWithSource": walkerPending, // 4 of 32 arms
