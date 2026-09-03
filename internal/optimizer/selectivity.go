@@ -68,6 +68,12 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		// `IS NULL` had no arm at all and fell through to the generic default
 		// below, so the statistic was never read for its own predicate.
 		return nullTestSelectivity(e, child)
+	case *IsBoolExpr:
+		// booltestsel (selfuncs.c:1545) — take2 P1-14b. IS TRUE/FALSE had
+		// no arm at all and fell through to the generic default, so a
+		// boolean column's statistics were never read for their own
+		// predicate — the same defect P1-14 just closed for IS NULL.
+		return boolTestSelectivity(e, child)
 	case *UnaryOp:
 		if e.Op == parser.OpNot {
 			return 1 - clauseSelectivity(e.Operand, child)
@@ -521,6 +527,11 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 		case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
 			return patternClauseSelectivityWithSource(e.Op, e.Left, e.Right, child)
 		}
+	case *IsBoolExpr:
+		if v, ok := boolTestSelectivityInner(e, child); ok {
+			return selectivityEstimate{value: v, reliable: true}
+		}
+		return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 	case *UnaryOp:
 		if e.Op == parser.OpNot {
 			sub := clauseSelectivityWithSource(e.Operand, child)
@@ -600,6 +611,129 @@ const (
 	defaultUnkSel    = 0.005
 	defaultNotUnkSel = 1.0 - defaultUnkSel
 )
+
+// boolTestSelectivity estimates `x IS [NOT] TRUE/FALSE/UNKNOWN` from the
+// column's statistics, mirroring booltestsel
+// (postgres/src/backend/utils/adt/selfuncs.c:1545).
+//
+// A boolean column has at most two distinct values, so MCV[0] plus the null
+// fraction determines everything: when MCV[0] is TRUE its frequency is the
+// TRUE mass, otherwise the TRUE mass is 1 - freq(MCV[0]) - nullfrac, and the
+// FALSE mass is whatever remains. Without MCV data the null fraction still
+// answers UNKNOWN, and TRUE/FALSE split the non-null mass 50/50.
+//
+// Two deliberate deviations, both recorded: (1) with NO statistics at all
+// the estimator declines to the pre-existing generic default rather than
+// following PG's recurse-into-the-argument rule — goopg has no bare-boolean
+// estimator for that recursion to land on, so PG's rule has no honest
+// target here; (2) a non-column operand likewise keeps the old default, as
+// does an MCV[0] whose rendered form is not recognisably boolean (which
+// falls through to the no-MCV rule).
+func boolTestSelectivity(e *IsBoolExpr, child Node) float64 {
+	est, _ := boolTestSelectivityInner(e, child)
+	return est
+}
+
+// boolTestKind maps the test flags onto PG's BoolTestType vocabulary.
+func boolTestKind(e *IsBoolExpr) string {
+	switch {
+	case e.TestTrue && !e.TestFalse && !e.Negated:
+		return "true"
+	case e.TestTrue && !e.TestFalse && e.Negated:
+		return "nottrue"
+	case !e.TestTrue && e.TestFalse && !e.Negated:
+		return "false"
+	case !e.TestTrue && e.TestFalse && e.Negated:
+		return "notfalse"
+	case !e.TestTrue && !e.TestFalse && !e.Negated:
+		return "unknown"
+	default:
+		return "notunknown"
+	}
+}
+
+// isTrueMCVValue / isFalseMCVValue recognise a boolean MCV entry's
+// rendered form. MCV values compare by rendered text throughout the
+// estimator (take2 P1-15), so the match is textual: the full words in any
+// case plus the single-letter/numeral abbreviations datasets use.
+func isTrueMCVValue(v string) bool {
+	switch strings.ToLower(v) {
+	case "true", "t", "1":
+		return true
+	}
+	return false
+}
+
+func isFalseMCVValue(v string) bool {
+	switch strings.ToLower(v) {
+	case "false", "f", "0":
+		return true
+	}
+	return false
+}
+
+func boolTestSelectivityInner(e *IsBoolExpr, child Node) (float64, bool) {
+	cr, ok := e.Operand.(*ColumnRef)
+	if !ok {
+		return defaultGenericSelectivity, false
+	}
+	cs := columnStatsForChild(cr.Index, child)
+	if cs == nil {
+		return defaultGenericSelectivity, false
+	}
+	freqNull := cs.NullFrac
+	if freqNull < 0 {
+		freqNull = 0
+	}
+	if freqNull > 1 {
+		freqNull = 1
+	}
+	// MCV[0] decides the split when it is recognisably boolean; anything
+	// else (including no MCV at all) uses the nullfrac-adjusted 50/50.
+	freqTrue, freqFalse := -1.0, -1.0
+	if len(cs.MCV) > 0 {
+		if isTrueMCVValue(cs.MCV[0].Value) {
+			freqTrue = cs.MCV[0].Frequency
+		} else if isFalseMCVValue(cs.MCV[0].Value) {
+			freqTrue = 1.0 - cs.MCV[0].Frequency - freqNull
+		}
+	}
+	if freqTrue >= 0 {
+		freqFalse = 1.0 - freqTrue - freqNull
+	}
+	var sel float64
+	switch boolTestKind(e) {
+	case "unknown":
+		sel = freqNull
+	case "notunknown":
+		sel = 1.0 - freqNull
+	case "true":
+		if freqTrue >= 0 {
+			sel = freqTrue
+		} else {
+			sel = (1.0 - freqNull) / 2.0
+		}
+	case "false":
+		if freqTrue >= 0 {
+			sel = freqFalse
+		} else {
+			sel = (1.0 - freqNull) / 2.0
+		}
+	case "nottrue":
+		if freqTrue >= 0 {
+			sel = 1.0 - freqTrue
+		} else {
+			sel = (freqNull + 1.0) / 2.0
+		}
+	case "notfalse":
+		if freqTrue >= 0 {
+			sel = 1.0 - freqFalse
+		} else {
+			sel = (freqNull + 1.0) / 2.0
+		}
+	}
+	return clampProbability(sel), true
+}
 
 // nullTestSelectivity estimates `x IS NULL` / `x IS NOT NULL` from the column's
 // recorded null fraction, mirroring nulltestsel.

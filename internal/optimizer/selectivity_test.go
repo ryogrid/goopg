@@ -223,3 +223,85 @@ func TestSelectivityInExprSumsValues(t *testing.T) {
 		t.Errorf("clauseSelectivity(label IN (F,O))=%v want 0.8", got)
 	}
 }
+
+// P1-14b booltestsel slice: IS [NOT] TRUE/FALSE/UNKNOWN over a boolean
+// column with MCV [{true @0.6}] and nullfrac 0.1 -> true 0.6, false 0.3.
+func TestBoolTestSelectivityMCV(t *testing.T) {
+	tbl := makeStatsTable(&catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{
+			{NDistinct: 2, NullFrac: 0.1,
+				MCV: []catalog.MCVEntry{{Value: "true", Frequency: 0.6}}},
+		},
+	}, []catalog.Column{{Name: "b", Type: catalog.Type{Name: "bool"}, Ordinal: 0}})
+	col := func() *ColumnRef { return &ColumnRef{Index: 0, Name: "b", Type: catalog.Type{Name: "bool"}} }
+	for _, tc := range []struct {
+		name                 string
+		expr                 *IsBoolExpr
+		want                 float64
+	}{
+		{"IS TRUE", &IsBoolExpr{Operand: col(), TestTrue: true}, 0.6},
+		{"IS FALSE", &IsBoolExpr{Operand: col(), TestFalse: true}, 0.3},
+		{"IS NOT TRUE", &IsBoolExpr{Operand: col(), TestTrue: true, Negated: true}, 0.4},
+		{"IS NOT FALSE", &IsBoolExpr{Operand: col(), TestFalse: true, Negated: true}, 0.7},
+		{"IS UNKNOWN", &IsBoolExpr{Operand: col()}, 0.1},
+		{"IS NOT UNKNOWN", &IsBoolExpr{Operand: col(), Negated: true}, 0.9},
+	} {
+		if got := clauseSelectivity(tc.expr, &SeqScan{Table: tbl}); math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("%s = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// MCV[0] false: TRUE mass = 1 - 0.5 - 0.1.
+	tbl2 := makeStatsTable(&catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{
+			{NDistinct: 2, NullFrac: 0.1,
+				MCV: []catalog.MCVEntry{{Value: "false", Frequency: 0.5}}},
+		},
+	}, []catalog.Column{{Name: "b", Type: catalog.Type{Name: "bool"}, Ordinal: 0}})
+	if got := clauseSelectivity(&IsBoolExpr{Operand: col(), TestTrue: true}, &SeqScan{Table: tbl2}); math.Abs(got-0.4) > 1e-9 {
+		t.Errorf("MCV[0]=false IS TRUE = %v, want 0.4", got)
+	}
+}
+
+// No MCV: nullfrac answers UNKNOWN, everything else splits non-null 50/50.
+func TestBoolTestSelectivityNoMCV(t *testing.T) {
+	tbl := makeStatsTable(&catalog.TableStats{
+		RowCount: 1000, Analyzed: true,
+		Columns: []catalog.ColumnStats{{NDistinct: 2, NullFrac: 0.2}},
+	}, []catalog.Column{{Name: "b", Type: catalog.Type{Name: "bool"}, Ordinal: 0}})
+	col := &ColumnRef{Index: 0, Name: "b", Type: catalog.Type{Name: "bool"}}
+	for _, tc := range []struct {
+		name string
+		expr *IsBoolExpr
+		want float64
+	}{
+		{"IS TRUE", &IsBoolExpr{Operand: col, TestTrue: true}, 0.4},
+		{"IS FALSE", &IsBoolExpr{Operand: col, TestFalse: true}, 0.4},
+		{"IS NOT TRUE", &IsBoolExpr{Operand: col, TestTrue: true, Negated: true}, 0.6},
+		{"IS UNKNOWN", &IsBoolExpr{Operand: col}, 0.2},
+		{"IS NOT UNKNOWN", &IsBoolExpr{Operand: col, Negated: true}, 0.8},
+	} {
+		if got := clauseSelectivity(tc.expr, &SeqScan{Table: tbl}); math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("%s = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// No statistics, non-column operand: the pre-existing default, and the
+// WithSource twin reports it unreliable — except the shape+stats arm,
+// which is reliable.
+func TestBoolTestSelectivityDefaults(t *testing.T) {
+	bare := makeStatsTable(nil, []catalog.Column{{Name: "b", Type: catalog.Type{Name: "bool"}, Ordinal: 0}})
+	expr := &IsBoolExpr{Operand: &ColumnRef{Index: 0, Name: "b"}, TestTrue: true}
+	if got := clauseSelectivity(expr, &SeqScan{Table: bare}); got != defaultGenericSelectivity {
+		t.Errorf("no-stats IS TRUE = %v, want default %v", got, defaultGenericSelectivity)
+	}
+	if est := clauseSelectivityWithSource(expr, &SeqScan{Table: bare}); est.reliable {
+		t.Errorf("no-stats IS TRUE marked reliable: %+v", est)
+	}
+	noncol := &IsBoolExpr{Operand: &BooleanConst{Value: true}, TestTrue: true}
+	if got := clauseSelectivity(noncol, &SeqScan{Table: bare}); got != defaultGenericSelectivity {
+		t.Errorf("non-column IS TRUE = %v, want default %v", got, defaultGenericSelectivity)
+	}
+}

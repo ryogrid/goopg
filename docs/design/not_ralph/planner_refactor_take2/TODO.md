@@ -613,6 +613,22 @@ slower than 1.2×, S-cold/WARM gap narrows.
       (strings/case/select diffs header-only), spotcheck Q12=2/Q13=34.
       REMAINING in this item: regex ops, small-hist prefix-range precision
       (text-scalar P1-11b gap), multibyte case-folding.
+      **IS [NOT] TRUE/FALSE/UNKNOWN `booltestsel` LANDED this commit:**
+      `IsBoolExpr` had no estimator arm at all (same defect class P1-14
+      closed for IS NULL). New `boolTestSelectivity` ports the MCV[0]-derived
+      true/false split + nullfrac (no-MCV: nullfrac answers UNKNOWN, 50/50
+      non-null split otherwise), wired into `clauseSelectivity` AND the
+      `WithSource` twin (reliable iff column + stats). Two deliberate
+      deviations recorded in code: no-stats and non-column operands keep the
+      old default (PG's recurse-into-argument rule has no honest target —
+      goopg has no bare-boolean estimator), and unrecognised MCV[0] forms
+      fall to the 50/50 rule. Gates: 3 unit tests (MCV true/false heads,
+      no-MCV splits, defaults + reliability), full optimizer suite, units
+      gate, regress 4/52 identical set (join/window diffs show run-to-run
+      nondeterministic flips in queries containing zero boolean-test and
+      zero LIKE clauses — mechanically unreachable by this change, which
+      fires only on those opcodes and touches no shared function),
+      spotcheck Q12=2/Q13=34.
 
 ### 1e — Join selectivity
 
