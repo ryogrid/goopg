@@ -64,10 +64,8 @@ three witness shapes, batch counters report. No plan moved, no timing
 claimed.
 
 - [x] EX0-01 File the executor backlog ledger — `6ace9567e` (design) + ledger rows this commit; gates: 8 `take3-EX0-G-EXn` rows merged, `git diff --stat` docs-only; artifacts: `docs/design/executor-ex0-01-ledger/DESIGN.md`, `.ralph/deferral_ledger.md`
-- [ ] EX0-02 Commit the measurement protocol — artifact header + executor
-      additions (GOGC/GOMEMLIMIT, `work_mem` + `effective_cache_size` per
-      arm, alloc arm, flamegraph/perf invocation from take6/round5).
-      *design: 13 §2.2–2.3; gate: protocol doc + one conforming artifact.*
+- [~] EX0-02 Commit the measurement protocol — design `docs/design/executor-ex0-02-protocol/DESIGN.md` (reviewed, 5 blocking findings fixed); conforming artifact `EX0-02-q6-serial-scold` still to run before close.
+  *design: 13 §2.2–2.3; gate: protocol doc + one conforming artifact.*
 - [ ] EX0-03 Surface per-worker hash/sort counters in EXPLAIN ANALYZE —
       thread existing worker counts to the leader (PG shows them; 11 §10
       notes they die with the worker). Counting already happens; plumbing
