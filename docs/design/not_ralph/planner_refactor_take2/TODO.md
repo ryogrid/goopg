@@ -1175,6 +1175,35 @@ Q72-class queries produce one search problem; `join-order` diffs decrease.
       with the full field set (`min_lefthand`, `min_righthand`, `syn_*`,
       `lhs_strict`, `semi_can_hash`, `semi_operators`, `semi_rhs_exprs`).
       *design: 08 §6.1.*
+      **Scoped 2026-09-03 — the field set already exists; the blocker is name
+      resolution, and a partial fix is UNSAFE.**
+      `SpecialJoinInfo` (specialjoin.go:16) already declares every field the
+      item lists: `MinLefthand`, `MinRighthand`, `Syn*`, `Jointype`, `Ojrelid`,
+      the four `Commute*` sets, `LhsStrict`, `SemiCanBtree`, `SemiCanHash`,
+      `SemiOperators`, `SemiRhsExprs`. What is missing is POPULATION:
+      `Syn*`, `Jointype` and an optimistic `SemiCan*` are filled;
+      `MinLefthand`/`MinRighthand` are set to the `Syn*` sets as a deliberate
+      conservative overestimate; `LhsStrict`, `Commute*`, `Ojrelid`,
+      `SemiOperators` and `SemiRhsExprs` are never populated.
+      *The blocker.* PG derives `min_lefthand`/`min_righthand` from the rels the
+      join qual REFERENCES. goopg cannot: `makeSpecialJoinInfo` is called from
+      `deconstructFromItem(item, firstRel, lim, collapseJoins)`
+      (collapse.go:398), which has no catalog, no bindings and no resolver, and
+      `parser.ColumnRef` carries only `{Schema, Table, Column}` — names, not a
+      relation index. PG has no equivalent problem because by
+      `deconstruct_jointree` time every Var already carries `varno`.
+      *The hazard, and why this must not be done by halves.* `min = syn` is not
+      laziness, it is the SAFE direction: an overestimate only forbids join
+      orders. An UNDERestimate permits a reordering PG forbids, which is a
+      wrong-answer class, not a slow-plan one. Any implementation that resolves
+      qualified references (`a.x = b.y` via the FROM items' aliases) but cannot
+      resolve bare ones must therefore fall back to `syn` on ANY uncertainty
+      rather than use a partial set.
+      *Two routes:* thread a name-to-leaf map built from the FROM items into
+      deconstruction, or run deconstruction after resolution. The first is
+      smaller and keeps the phase order; the second is what PG effectively does.
+      Neither is a small change, and neither is observable until P3-03/P3-04
+      consume the result — P3-01 alone moves no plan.
 - [ ] **P3-02** `distribute_qual_to_rels` with outer-join delay rules
       (`check_outerjoin_delay`); a qual is **placed**, not copied down.
       Supersedes `pushInnerJoinInputQuals` copying (ledger 802: the executor
