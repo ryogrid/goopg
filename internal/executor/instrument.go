@@ -275,6 +275,29 @@ type joinFilterRemoveCounter interface {
 // for each visited node.
 type nodeStatsTable map[optimizer.Node]*nodeStats
 
+// gatherLaunchedTable maps a planner Gather/GatherMerge node back to the
+// worker count its operator actually launched, which EXPLAIN ANALYZE renders
+// as PG's `Workers Launched:` line. The renderer sees plan nodes, never
+// operators, so the count must travel keyed by plan node — the same reason
+// hash-join stats travel via ctx.HashJoinStats. Recorded in
+// gatherOp/gatherMergeOp.Open; a node with no entry (plain EXPLAIN, which
+// never executes) renders no line.
+type gatherLaunchedTable map[optimizer.Node]int
+
+// recordGatherLaunched records how many workers a Gather/GatherMerge
+// actually launched, keyed by plan node. Nil-receiver safe so Open paths can
+// call it unconditionally; the map is allocated lazily so serial statements
+// never grow one.
+func (c *Context) recordGatherLaunched(n optimizer.Node, launched int) {
+	if c == nil || n == nil {
+		return
+	}
+	if c.GatherLaunched == nil {
+		c.GatherLaunched = make(gatherLaunchedTable)
+	}
+	c.GatherLaunched[n] = launched
+}
+
 // instrumentScope wires the package-local instrumentation state
 // the Build dispatch consults. When non-nil, every successful
 // Build returns an *instrumentedOp wrapping its result so child-

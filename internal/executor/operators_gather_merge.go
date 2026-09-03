@@ -119,6 +119,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 		o.chans = append(o.chans, make(chan rowBatch, gatherChanDepth))
 	}
 	o.launched = n
+	ctx.recordGatherLaunched(o.plan, n)
 
 	for i := 0; i < n; i++ {
 		wctx, idx := o.workers[i], i

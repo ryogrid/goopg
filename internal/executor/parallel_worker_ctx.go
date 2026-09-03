@@ -43,6 +43,7 @@ package executor
 import (
 	"context"
 
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
@@ -176,4 +177,45 @@ func MergeWorkerContext(leader, worker *Context) {
 	leader.Notices = append(leader.Notices, worker.Notices...)
 	leader.NoticesWithDetail = append(leader.NoticesWithDetail, worker.NoticesWithDetail...)
 	leader.Warnings = append(leader.Warnings, worker.Warnings...)
+
+	// EX0-03 (a): fold the worker's hash-join instrumentation into the
+	// leader map, PER KEY, taking the MAX of each of the 6 fields
+	// independently (NBuckets, OrigNBuckets, NBatch, OrigNBatch, SpacePeak,
+	// BuildTimeNs). That is PG's rule (ExecHashAccumInstrumentation aside,
+	// the merge itself is explain.c:3398-3422's independent-field Max),
+	// including its cross-worker field-mixing quirk: the merged row may
+	// take NBuckets from one worker and NBatch from another. The leader map
+	// is allocated lazily so a worker that built nothing leaves it nil.
+	for j, ws := range worker.HashJoinStats {
+		if ws == nil {
+			continue
+		}
+		if leader.HashJoinStats == nil {
+			leader.HashJoinStats = make(map[*optimizer.Join]*HashJoinStats)
+		}
+		ls, ok := leader.HashJoinStats[j]
+		if !ok {
+			cp := *ws
+			leader.HashJoinStats[j] = &cp
+			continue
+		}
+		if ws.NBuckets > ls.NBuckets {
+			ls.NBuckets = ws.NBuckets
+		}
+		if ws.OrigNBuckets > ls.OrigNBuckets {
+			ls.OrigNBuckets = ws.OrigNBuckets
+		}
+		if ws.NBatch > ls.NBatch {
+			ls.NBatch = ws.NBatch
+		}
+		if ws.OrigNBatch > ls.OrigNBatch {
+			ls.OrigNBatch = ws.OrigNBatch
+		}
+		if ws.SpacePeak > ls.SpacePeak {
+			ls.SpacePeak = ws.SpacePeak
+		}
+		if ws.BuildTimeNs > ls.BuildTimeNs {
+			ls.BuildTimeNs = ws.BuildTimeNs
+		}
+	}
 }

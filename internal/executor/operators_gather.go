@@ -260,6 +260,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 		o.workers = append(o.workers, NewWorkerContext(ctx, arena, o.group.Context()))
 	}
 	o.launched = n
+	ctx.recordGatherLaunched(o.plan, n)
 
 	// Leader participation. PG's parallel_leader_participation has the leader
 	// execute a share as well as drain; goopg honours it — and with ZERO

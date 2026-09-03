@@ -206,6 +206,13 @@ type Context struct {
 	// maps above. Lazily allocated by hashJoinStat. M0127-P3.5.
 	HashJoinStats map[*optimizer.Join]*HashJoinStats
 
+	// GatherLaunched carries the per-Gather/GatherMerge worker count EXPLAIN
+	// ANALYZE renders as PG's `Workers Launched:` line, keyed by plan node
+	// like HashJoinStats. Recorded in gatherOp/gatherMergeOp.Open via
+	// recordGatherLaunched; only entries for executed nodes exist, so plain
+	// EXPLAIN renders nothing. EX0-03 (b).
+	GatherLaunched gatherLaunchedTable
+
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
 	// pointer (as uintptr). Cleared by the update executor at the start of
