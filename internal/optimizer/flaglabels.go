@@ -85,8 +85,8 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
 	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
-	// statement's needed columns. Default off; lands unflipped with its own
-	// measurement (P4-A §18 steps 3-5).
+	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
+	// opts back out to the un-narrowed arm.
 	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
@@ -135,7 +135,7 @@ var flagProvenanceOrder = []string{
 	// every ROLLUP/CUBE/GROUPING SETS query, so a TPC-DS artefact that does
 	// not name it cannot say which arm it measured.
 	// Joined at take2 P4-01 rev 10 step 3: narrows hash-join build sides,
-	// default off (P4-A §18 steps 3-5).
+	// default ON since step 5 (P4-A §18 steps 3-5).
 	"GOOPG_NARROW_BUILD",
 }
 

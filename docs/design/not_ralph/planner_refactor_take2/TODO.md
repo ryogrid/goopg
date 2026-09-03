@@ -1494,6 +1494,33 @@ delta.
       sides) is explicitly NOT settled here — it gates step 5 (the default
       flip), which additionally needs the step-4 value gate (PG-oracle
       digest at both `work_mem` budgets + TPC-DS SF0.5 sweep, NBatch 2–4×).
+      **Step 4 MEASURED clean (this session):** TPC-H 24/24 value-identical
+      flag-on at 64/4/512 MB and flag-off-vs-on at 4 MB, PG-oracle divergence
+      pattern identical on/off (pre-existing data-load diffs), Q9 build
+      batches 8→4 at 64 MB and 128→64 at 4 MB (the FINDING's number), no-op
+      at 512 MB; TPC-DS SF0.5 flag-on PASS=95 MISMATCH=0 with a same-binary
+      flag-off control at total-delta +0.0% (reports `sweep-20260903-141631`
+      on / `-143602` off); plan diffs widths-only, zero structural moves;
+      zero `GOOPG_ASSERT_ROW_SHAPE` panics on every run.
+      **Handover §3 DECIDED from code (step 5):** narrowing Projects exist
+      ONLY in searched subtrees (`joinInputsFor` is reachable solely via the
+      searched `createPlan` arms — hash/merge/nestloop `Path` arms; the
+      legacy chain never calls it; the nestloop arms pass other `kind`s the
+      guard excludes). All three post-plan passes skip searched subtrees by
+      tag (`rewriteScanInputsWithSingleTablePredicates`,
+      `rewriteJoinsToNLI` descend through `*Project` transparently anyway),
+      and `assertSearchedTreeNeedsNoReconcile` (`createplanroot.go:137`) runs
+      the REAL reconcile over every searched subtree on EVERY plan and
+      panics on any move — it passed on all ~200 measured flag-on executions,
+      including Q20 (single-table-predicate load-bearing) and Q4 (NLI
+      load-bearing). Legacy subtrees can never contain a narrowing Project
+      (no call path), so those passes are unchanged there by construction.
+      **Step 5 FLIPPED (this commit):** `GOOPG_NARROW_BUILD` defaults ON
+      (`=0` opts out); `planner-flags.env` re-stamped `unset(on)`. Gates on
+      the flipped default: build, vet, full optimizer suite, units gate,
+      spotcheck Q12=2/Q13=34, hook pgbench smoke — all green. P4-01 keeps
+      its stated scope (2–4× fewer batches, NOT P2-02b's unblocker — the
+      48-byte Datum partner work in 07 §6 stands).
 - [ ] **P4-02** Upper `RelOptInfo`s (`GROUP_AGG`, `WINDOW`, `DISTINCT`,
       `ORDERED`, `FINAL`) with pathlists. *design: 08 §7.*
 - [ ] **P4-03** Promote `PathSort` to an upper-rel path. It already has a

@@ -277,10 +277,10 @@ type joinInputs struct {
 func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs {
 	outerNode, outerLay := createPlanNode(outerPath)
 	innerNode, innerLay := createPlanNode(innerPath)
-	// Take2 P4-01 rev 10 step 3: narrow the build-side pair where BOTH halves
-	// are still in hand — after this point the schema check (:289), `merged`
-	// (:293) and the concatenated layout (:299) all see a consistent pair.
-	// Behind GOOPG_NARROW_BUILD, default off; the shipped path is untouched.
+	// Take2 P4-01 rev 10 step 3 (default ON since step 5): narrow the build-side
+	// pair where BOTH halves are still in hand — after this point the schema
+	// check (:289), `merged` (:293) and the concatenated layout (:299) all see
+	// a consistent pair.
 	// The PathHashJoin-only restriction is enforced inside narrowBuildInput
 	// (only a hash join has a resident build side) — see narrowoutput.go.
 	innerNode, innerLay = narrowBuildInput(kind, innerNode, innerLay, innerPath)

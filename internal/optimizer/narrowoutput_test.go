@@ -99,17 +99,16 @@ func TestNarrowPlanOutputDeclinesRatherThanCorrupts(t *testing.T) {
 	}
 }
 
-// TestNarrowBuildFromEnvPolarity: the flag defaults OFF and only "1" opts in.
-// The shipped path must be untouched unless the operator explicitly asks.
+// TestNarrowBuildFromEnvPolarity: opt-out polarity — the flag defaults ON
+// and only "=0" selects the old arm. Matches GOOPG_PGSHAPED_DP's idiom.
 func TestNarrowBuildFromEnvPolarity(t *testing.T) {
 	for _, tc := range []struct {
 		value string
 		want  bool
 	}{
-		{"", false},
-		{"0", false},
-		{"off", false},
+		{"", true},
 		{"1", true},
+		{"0", false},
 	} {
 		if got := narrowBuildFromEnv(tc.value); got != tc.want {
 			t.Errorf("narrowBuildFromEnv(%q) = %t, want %t", tc.value, got, tc.want)
