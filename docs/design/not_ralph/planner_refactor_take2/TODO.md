@@ -280,16 +280,22 @@ reports `changed=0` against a pre-P0 goopg capture.
       goopg from 8× more memory to 16× less and read as a catastrophic
       regression that is really a configuration change. *design: 09 §6.4; gate:
       plan-parity + timing both suites; expect plans to move.*
-- [ ] **P0-13** **Flip `GOOPG_PGSHAPED_COLLAPSE` on**, as the parity
-      instrument's **positive control**. Pre-registered blast radius, pinned by
-      two git-tracked tests: `TestCollapseIsAControlOnTheTPCHCorpus` (0 of 22
-      TPC-H eligible) and `TestCollapseEligibilityOfTheTPCDSCorpus` ({Q72, Q75}
-      of 99). So the expected result is **TPC-H `changed=0`** and **exactly two
-      TPC-DS plans moved** — an instrument that reports anything else is
-      measuring itself wrong, which is what makes this a control rather than a
-      structural change. It also re-opens a NO-GO that the tree itself records
-      as void (07 §4.2). Zero dependency on P1 or P2. *design: 08 §6.2; gate:
-      plan-parity both suites + timing for Q72/Q75.*
+- [x] **P0-13** **Flipped `GOOPG_PGSHAPED_COLLAPSE` on** (`=0` opts out) —
+      **CLOSED this commit; the positive control behaved exactly as
+      pre-registered.** TPC-H `changed=0` (24/24 values MATCH both arms,
+      plan snapshots byte-identical), TPC-DS exactly {Q72, Q75} moved
+      (same-binary off-capture vs on-sweep diff), rowcounts PASS=95
+      MISMATCH=0 both arms, Q72 128s→5s (25.6×, isolated by a
+      same-binary `QUERIES="72 75"` off-probe: 128s/13s vs 5s/9s) and
+      sweep TOTAL -10.1%. Reports `sweep-20260903-183556` (on) with
+      off-capture `plans-20260903-183539` + off-probe in the same dir.
+      (Stamp note: these runs exported the flags explicitly, so the line
+      reads `COLLAPSE=unset(on)` via default and `NARROW_BUILD=1` via
+      export — same behavior the committed defaults produce unset.)
+      Gates: corpus pinning tests, full optimizer suite, units gate; the
+      plan-parity assertions ran through the TPC-DS plans channel +
+      plan-snapshot captures (P0-05/06 still open for the standing
+      instrument). The voided NO-GO stays void.
 
 ---
 
