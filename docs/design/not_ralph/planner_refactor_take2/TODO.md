@@ -1242,9 +1242,34 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
       was harness variance — the drift band on this machine had widened well
       past the ~1.7% measured earlier in the session. Re-run the BASELINE before
       believing a TPC-H delta of that size.
-- [ ] **P3-11** Answer "why does the NLI arm lose 23 of 25 times" using P0-11
+- [x] **P3-11** Answer "why does the NLI arm lose 23 of 25 times" using P0-11
       provenance, and act on the finding. *design: 08 §6.4; gate: the NL census
       gap (1 vs 25) moves.*
+      **Answered 2026-09-03 — and the premise was wrong in two ways.**
+      *The "1 vs 25" baseline is stale.* Measured over the TPC-H 22: goopg emits
+      **18** Nested Loops against PG's **30**. A binary from the START of this
+      bundle already emitted 19, so the gap was never 1-vs-25 in this tree, and
+      the cost work landed since (P2-06, P2-07) moved the census by ONE (19->18)
+      — it is not what closed the gap, and nothing in this bundle did.
+      *NLI is not being crushed; it loses NARROWLY.* `DPPATH` over the whole
+      corpus: `nestloop.index` is offered **694** times and accepted **23**
+      (3.3%), against `mergejoin` 1108 accepted / 303 dominated (79%) and
+      `join.hash` 246 / 520. But comparing the cheapest NLI against the cheapest
+      ACCEPTED path for the same relation set:
+      `{0..7}` 197199.66 vs 197093.62 (**0.05%**), `{0..6}` 555436.63 vs
+      548039.97 (1.3%), `{0..5,7}` 209059.05 vs 197045.82 (6%), `{0..5}`
+      472155.50 vs 420956.23 (12%).
+      **The finding, and the action.** There is no single mispricing to fix: at
+      a 0.05% margin the winner is decided by accumulated small errors, not by
+      one defect. So the action is NOT a targeted NLI change — it is the
+      remaining `btcostestimate` and hash-bucket terms, each of which will flip
+      a few of these either way. That also explains an observation from this
+      bundle that would otherwise be puzzling: cost fixes moved 79-88 TPC-DS
+      plan shapes while the NL census barely moved. Tight margins flip in both
+      directions.
+      A targeted NLI adjustment would be exactly the "cost-term tuning" this
+      bundle's own lessons warn never fixed a query, and at these margins it
+      would be tuning to the benchmark.
 - [ ] **P3-12** Delete `reorderCommaFromByCardinality` — the pre-search greedy
       reorder that biases the search's input. *design: 08 §6.6; gate:
       plan-parity + timing both suites, own commit.*
