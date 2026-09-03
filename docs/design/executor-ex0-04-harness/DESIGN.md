@@ -59,6 +59,12 @@ re-pinned anchor; secondary — pp-of-total as mean-of-3 within ±0.25 pp
 join/sort/spill slices ~0 (null control). Q9 probe slice > 0 and stable
 ±10% relative. Failure = harness or mapping bug, never a perf claim.
 
+CALIBRATION (2026-09-03, from the re-cut anchor — supersedes the
+tolerances above): observed run spread ±1.4pp ratio across the three
+anchor runs, so the enforced gate is ±2pp absolute of the 11.3% anchor
+(ratio) and mean-of-3 within ±0.5pp of 2.93% (pp-of-total). The design
+tolerances were proposals; the data is the gate.
+
 ## 4. Slice provenance (re-collect — the old corpus cannot be reused)
 
 The `bench/tpch/pprof/` `q{9,4,7,13}_cpu.pb.gz` corpus (mtime
