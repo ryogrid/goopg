@@ -506,7 +506,20 @@ slower than 1.2×, S-cold/WARM gap narrows.
       all five probed columns after P1-08, including the `l_returnflag` case
       where three distinct values are all MCVs and both engines emit no
       histogram at all.
-- [ ] **P1-10** `compute_index_stats` for expression indexes. *design: 08 §4.2.*
+- [-] **P1-10** ~~`compute_index_stats` for expression indexes~~ —
+      **Declined: no consumer exists.** Verified against the tree 2026-09-03:
+      ANALYZE never visits indexes (`operators_analyze.go` has zero index
+      mentions); no access path matches index expressions
+      (`findBTreeIndexForColumn` takes a plain column name; ordered/bitmap
+      routes decline or ignore them); no estimator resolves functional
+      expressions (`selectivity.go`, `cardinality.go`, `joinkeyproof.go`
+      and `rangequery.go` carry zero FuncCall arms and zero indexprs
+      reads). Collecting expression statistics now would change no
+      estimate, no plan, and no gate could observe it — a placeholder by
+      another name. Resume point, filed as a ledger row: expression-index
+      ACCESS paths first, then `compute_index_stats` collection, then
+      estimator matching of index expressions. *design: 08 §4.2 (one line;
+      the design never named a consumer either).*
 
 ### 1c — Statistics storage
 
