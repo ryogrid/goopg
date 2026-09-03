@@ -1270,7 +1270,7 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
       A targeted NLI adjustment would be exactly the "cost-term tuning" this
       bundle's own lessons warn never fixed a query, and at these margins it
       would be tuning to the benchmark.
-- [~] **P3-12** Delete `reorderCommaFromByCardinality` — the pre-search greedy
+- [x] **P3-12** Delete `reorderCommaFromByCardinality` — the pre-search greedy
       reorder that biases the search's input. *design: 08 §6.6; gate:
       plan-parity + timing both suites, own commit.*
       **The BEHAVIOUR is gone (2026-09-03); the dead code is not yet deleted.**
@@ -1285,11 +1285,16 @@ positive control rather than a Phase 3 structural item. See 09 §5.)*
       35 whose plans are identical are +7s. All three queries the per-query arm
       named (Q12, Q91 slower; Q76 faster) have IDENTICAL plans and are not
       attributable. So the real effect is -41s on the queries it touched.
-      *Still to do:* delete the ~500 dead lines in `joinorder.go` (everything
-      but `flattenOrBranches`, which has two external users) and the 19 tests
-      that exercise the removed entry point. That is a mechanical cleanup and
-      belongs with Phase 6's other dead-code removals (P6-05), not mixed into a
-      measured behaviour change.
+      *Cleanup done in a second commit:* `joinorder.go` is deleted along with
+      three of its four test files — **1327 lines removed, 48 added**.
+      Two things were KEPT rather than deleted with it, and neither was obvious
+      from the item:
+      `flattenOrBranches` and `walkConjuncts` have live users outside the file
+      (`qual_canonical.go` and its test), so both moved there; and
+      `TestPlanQ85IsDeterministic` guards a property that OUTLIVES the reorder —
+      that a plan does not depend on Go map iteration order — so it stays, with
+      its comment retargeted away from the FROM-order tests it was written to
+      back. Gated: TPC-H 221.29s, 24 MATCH on values, all package suites green.
 
 ---
 
