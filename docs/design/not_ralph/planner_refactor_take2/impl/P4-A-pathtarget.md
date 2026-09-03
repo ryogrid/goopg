@@ -111,7 +111,14 @@ space wide.**
 automatically. Revision 1 called this "the substance of the design"; it is
 nearly free.
 
-## 5. **[R2]** A live desync this closes
+## 5. **[CLOSED — P4-01a landed]**
+
+> `pathindexonly.go:129-130` sets `NCols: len(covered)` and
+> `AvgVarBytes: coveredAvgVarBytes(...)`, and `relNCols` (`path.go`) prefers
+> `r.NCols`. The planner/executor width desync this section described is fixed
+> and survived the P4-01b revert. Section retained for the reasoning only.
+
+## 5 (historical). **[R2]** A live desync this closes
 
 The index-only paths **already** narrow the emitted node without narrowing
 `rel.NCols`: the cost model prices the build at full `relNCols`
@@ -177,7 +184,16 @@ the same terms.
 
 ---
 
-## 11. Revision 3 (2026-09-03) — this item is the corpus blocker, and it is now quantified
+## 11. Revision 3 — **SUPERSEDED, DO NOT CITE** (see §12 and §13)
+
+> Kept for history only. Its table is the UNEQUAL-cardinality comparison, and
+> the 24,005,020-row plan it measures is now known to be the dropped-equi-clause
+> merge join that RETURNED WRONG ANSWERS
+> (`FINDING-CRITICAL-mergejoin-wrong-answers.md`, fixed in `13d53603f` /
+> `a96c65978`). These numbers were taken on a plan computing the wrong result.
+> The "8x" below is also wrong: PostgreSQL's `work_mem` default is 4 MB, so
+> 512 MB is **128x**, not 8x — the 8x figure is goopg-vs-the-bench-conf's 64 MB
+> and does not belong in a sentence about PostgreSQL's default.
 
 Revision 2 justified this work on Q14 and Q3. Measurement since has shown the
 scope is far wider: **the missing projection is what makes goopg's memory
@@ -281,3 +297,120 @@ parallel post-pass (it drives off sequential scans), so they lose the Gather too
    the width alone will not recover it.
 3. The gate remains value-level. Both bugs fixed this session returned the
    CORRECT ROW COUNT while computing the wrong answer or the wrong plan.
+
+
+---
+
+## 13. Revision 5 (2026-09-03) — agent review, and the two things it changed
+
+Rev 4 was reviewed. Two findings are structural enough to change the plan; one
+prediction the review made was tested and did not hold. Recorded here rather
+than silently folded, so the next reader can see which claims were checked.
+
+### 13.1 The collector declined the query this item is justified by — FIXED
+
+`collectExprColumnNames` had no `*parser.ExtractExpr` arm, so `extract(field
+from src)` fell to the `default:` arm and returned false — and
+`neededColumnNames` returns false for the WHOLE statement on any decline. A
+single `extract` set `neededColsKnown = false`, disabling index-only scans
+(`pathindexonly.go:34`) and every narrowing mechanism in §4.
+
+TPC-H **Q7, Q8 and Q9** all use `extract(year from ...)`, and Q9's sits inside
+the derived table that owns its six-way join tree. **P4-01 as designed could not
+have touched its own motivating query.**
+
+Fixed in `915ce7882`, and verified rather than assumed: `neededColsKnown` is
+`false` before and `true` after, for a bare `extract` and for Q9's
+derived-table shape. Gated at Q12=2 / Q13=34 and 24 MATCH.
+
+### 13.2 The mechanism in §4/§7 is the one that returned wrong answers
+
+This is the correction that matters, and rev 4 got it wrong.
+
+The seam's coordinate space is **safe**. `extractSearchLeaves` computes
+`widths[i]` from the PRE-search chain leaves, and `baseRelLayout` +
+`boundaryMap`'s licensed `fill` already handle a narrowed leaf's coordinates.
+§3's rows about those are accurate; the revert message's "they are NOT
+sufficient" was right for the wrong reason.
+
+The invariant that actually broke is **"a node's `Output()` equals the row its
+operator emits"**:
+
+- `newSeqScanOp` (`operators_storage.go:1338-1350`) takes `schema: p.Output()`
+  but `cols: p.Table.Columns`; `scanRow` is sized `len(o.cols)` (`:2081`) and
+  `decodeRowRangeInfo` decodes every table column in table order (`:1383`).
+- `indexScanOp` is identical (`operators_index.go:608-611`).
+
+So narrowing a leaf's `schema` re-bases the planner onto narrowed positions
+while the executor still emits table-order rows: ColumnRef *i* reads table
+column *i*. That is exactly Q2/Q5 → 0 rows and Q18 → same count, wrong tuples,
+and it is why every plan-time tripwire passed — the *layout* was self-consistent;
+the row shape was not.
+
+`IndexOnlyScan` works only because it is a different node class with a genuinely
+projecting operator. §3 cites it as precedent FOR a schema field; it is evidence
+against.
+
+**Therefore:** a `PathTarget` with `setrefs`-style fixup is necessary but NOT
+sufficient. Either the scan operators must project (changing `newSeqScanOp`,
+`decodeScanRow`, `decodeScanRowRange`, the `Next` emit block, the parallel
+sibling in `parallel_hash_build.go`, and `operators_index.go`), or a real
+`Project` node goes below the build side. §4 dismissed the Project option; §7's
+argument that "parallel.go matters most" is largely wrong, since
+`stampParallelScan`, `drivingScan` and `extractSeqScanFromPlan` all already have
+`*Project` arms. **Re-cost the Project option honestly before choosing.**
+
+### 13.3 A review prediction that did NOT hold
+
+The review argued width and the lost Gather share a gate: that fixing
+`neededColsKnown` would let an index-only-driven plan become Gather-eligible
+(`drivingScan` does accept `*IndexOnlyScan`), making §12's two-causes framing
+overstated.
+
+Tested directly, which is cheaper than arguing. With the `ExtractExpr` fix in
+and `neededColsKnown` true, Q9 at PG's 4 MB is **56.94 s against 55.42 s
+before** — unchanged, with no Gather and no index-only scan in the plan. The
+gate was necessary and not sufficient. §12's split stands, and
+`MEASUREMENT-p202b-width-vs-gather.md` quantifies it: width ~87 %, Gather ~13 %.
+
+### 13.4 Accepted corrections not yet actioned
+
+- **§12's absolute numbers are stale.** They predate nine planner commits; the
+  current figures are 215.62 → 265.44 s and Q9 +40.1 s (`7d03fc0cf`). **The §12
+  EXPLAIN table has not been re-taken since** and must be before it is used as
+  the evidentiary base.
+- **§12 argues in the wrong currency.** §1's own [R2] established that goopg's
+  hash geometry is driven by COLUMN COUNT —
+  `EntryBytes = 48*ncols + 24 + avgVarBytes` (`hashsize.go:120-128`) — and
+  `seqScanOp` allocates a 48-byte Datum slot per TABLE column. §12 reverts to
+  byte-width language. Same conclusion, wrong units.
+- **The equal-cardinality table needs a row per measured node**, not one
+  cardinality line for four width levels.
+- **"97 MB vs 38 MB" is not like-for-like:** goopg is at `Batches: 8`, so its
+  figure is one batch's residency, and PG's is a Parallel Hash shared total.
+
+### 13.5 The gate, corrected
+
+§11/§12 narrowed §8's gate to `tpch-runner -digest` alone. Restore §8 in full,
+and add three things the review is right about:
+
+1. **Diff against the PG oracle, not a goopg baseline.** Both merge-join bugs
+   were invisible goopg-vs-goopg.
+2. **Run the gate at BOTH budgets.** P4-01 exists to change plan shapes at the
+   SMALL `work_mem`; gating only at 512 MB validates it under the plans it does
+   not affect. "The default is not a safeguard, it is camouflage."
+3. **Add a planner-vs-executor row-shape assertion** — under a debug flag,
+   assert `len(row) == len(op.Schema())` on the first row of every operator.
+   Every existing tripwire is plan-time and self-consistent, which is why
+   P4-01b passed them all. This turns the whole failure class into a unit-test
+   failure.
+
+### 13.6 Status
+
+**Not ready to implement against.** §13.1 is fixed; §13.2 changes the mechanism
+and must be re-decided; §13.4's re-measurement is outstanding. The review's
+recommended pre-implementation order — now that §13.1 is done and §13.3 is
+answered — is: re-take the §12 EXPLAIN table on current HEAD, then run
+`hashsize.Choose` at the NARROWED ncols for each of Q9's four join levels to see
+whether `NBatch` still exceeds 1. If it does, width is not the dominant cause
+and this item is mis-scoped.

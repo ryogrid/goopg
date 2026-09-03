@@ -1410,6 +1410,29 @@ delta.
       `make_group_input_target` / `make_window_input_target` /
       `make_sort_input_target` / `apply_scanjoin_target_to_paths`.
       *design: 08 §7; unlocks P6-02.*
+      **Agent-reviewed 2026-09-03; P4-A is at rev 5 and is NOT ready to
+      implement against.** Two structural findings:
+      (1) *The needed-column collector declined this item's own motivating
+      query.* `collectExprColumnNames` had no `ExtractExpr` arm, so a single
+      `extract()` set `neededColsKnown = false` for the whole statement —
+      disabling index-only scans and every narrowing mechanism. TPC-H Q7, Q8 and
+      Q9 all use `extract(year from ...)`. **FIXED in `915ce7882`** and verified
+      false-before / true-after.
+      (2) *The mechanism §4 chose is the one that returned wrong answers.* The
+      seam's coordinates are safe; the invariant P4-01b broke is "a node's
+      `Output()` equals the row its operator emits" — `newSeqScanOp` takes
+      `schema: p.Output()` but `cols: p.Table.Columns` and decodes the full
+      table width. So a `PathTarget` with setrefs fixup is necessary but NOT
+      sufficient: either the scan operators project, or a real `Project` goes
+      below the build side. The Project option §4 dismissed must be re-costed.
+      A review prediction was TESTED and did not hold: fixing the collector does
+      NOT return the Gather (Q9 at 4MB is 56.94s against 55.42s before,
+      unchanged), so width and Gather do not share a gate and the 87/13 split in
+      `MEASUREMENT-p202b-width-vs-gather.md` stands.
+      Outstanding before code: re-take §12's EXPLAIN table on current HEAD (it
+      predates nine planner commits), and run `hashsize.Choose` at the NARROWED
+      ncols for Q9's four join levels — if `NBatch` still exceeds 1 there, this
+      item is mis-scoped.
 - [ ] **P4-02** Upper `RelOptInfo`s (`GROUP_AGG`, `WINDOW`, `DISTINCT`,
       `ORDERED`, `FINAL`) with pathlists. *design: 08 §7.*
 - [ ] **P4-03** Promote `PathSort` to an upper-rel path. It already has a
