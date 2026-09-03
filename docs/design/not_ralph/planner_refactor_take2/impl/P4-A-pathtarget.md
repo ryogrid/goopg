@@ -414,3 +414,65 @@ answered — is: re-take the §12 EXPLAIN table on current HEAD, then run
 `hashsize.Choose` at the NARROWED ncols for each of Q9's four join levels to see
 whether `NBatch` still exceeds 1. If it does, width is not the dominant cause
 and this item is mis-scoped.
+
+
+---
+
+## 14. Revision 6 (2026-09-03) — §12's table re-taken on current HEAD
+
+§13.4 recorded that §12's evidence predated nine planner commits and had three
+methodological defects. Re-taken at `f65e7c154`, with those corrected.
+
+### The measurement
+
+TPC-H Q9, both engines at their own defaults, `EXPLAIN (ANALYZE, TIMING off)`.
+
+**Join-tree tuple widths, per node:**
+
+| level | goopg | PostgreSQL 18.3 |
+|---|---:|---:|
+| top join | 3164 B | 81 B |
+| 2 | 2716 B | 54 B |
+| 3 | 2168 B | 32 B |
+| 4 | 1094 B | 23 B |
+| (supplier ⋈ nation) | 1074 B | — |
+
+**Cardinality at the top:** goopg 321,056; PostgreSQL 63,749.60 × 5 loops =
+318,748. **0.7 % apart** — the two clusters are separately loaded by HammerDB,
+so exact equality is not expected and this is as close as the comparison gets.
+The equal-cardinality premise holds.
+
+**Batching and memory:** goopg `Batches: 8, Memory Usage: 97482kB`;
+PostgreSQL `Batches: 1, Memory Usage: 38176kB`.
+
+**Execution:** goopg 15,946 ms; PostgreSQL 6,776 ms.
+
+### Three corrections §13.4 asked for
+
+1. **A row per node, not one cardinality line.** Done above. Note the caveat it
+   exposes: goopg does not emit per-node `actual rows` for join nodes UNDER a
+   `Gather`, so per-LEVEL cardinality equality cannot be shown from this plan —
+   only the top-level figure is measured on both sides. The width rows are
+   plan-time on both engines and directly comparable.
+2. **"97 MB vs 38 MB" was not like-for-like, and still is not.** goopg is at
+   `Batches: 8`, so 97482kB is ONE batch's residency — bounded by the budget
+   almost by construction. The comparable total is ≈ 8 × 97 MB ≈ 780 MB against
+   PostgreSQL's single 38 MB. That makes the gap larger, not smaller, but the
+   pair "97 vs 38" should not be quoted as if it were one.
+3. **Do not quote a single width ratio.** Level-for-level the ratios are 39×,
+   50×, 68× and 48×, but the two join trees are not the same shape, so those
+   pairings are not guaranteed to be like-for-like. The defensible statement is
+   the RANGE: goopg carries 1094–3164 B where PostgreSQL carries 23–81 B.
+
+### What did not change
+
+The direction and the order of magnitude are unchanged from rev 4, now on
+current HEAD and with the arithmetic stated honestly. §12's *numbers* are
+superseded by this section; its *conclusion* stands.
+
+What changed materially since rev 4 is elsewhere: `FINDING-p401-alone-is-not-enough.md`
+shows that narrowing to Q9's needed columns takes the batching build from 128
+batches to 64 at PostgreSQL's `work_mem` — not to 1 — because
+`EntryBytes = ncols × 48 + 24` makes the per-column footprint co-dominant with
+the column count. **P4-01 remains justified on its own terms and no longer
+carries the claim that it unblocks P2-02b.**

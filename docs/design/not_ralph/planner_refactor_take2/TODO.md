@@ -1438,8 +1438,15 @@ delta.
       of scope. P4-01 keeps its own justification (2-4x fewer batches) but does
       not unblock P2-02b on its own. See
       `impl/FINDING-p401-alone-is-not-enough.md`.
-      Still outstanding before code: re-take §12's EXPLAIN table on current HEAD
-      (it predates nine planner commits).
+      **§12's table has now been re-taken on current HEAD (P4-A rev 6).** Widths
+      per node — goopg 3164/2716/2168/1094 B against PG's 81/54/32/23 — top-level
+      cardinality 321,056 against 318,748 (0.7 % apart, so the equal-cardinality
+      premise holds), goopg `Batches: 8` at 97482kB against PG's `Batches: 1` at
+      38176kB, and 15.9 s against 6.8 s. Two caveats recorded rather than
+      smoothed over: goopg emits no per-node `actual rows` for joins under a
+      `Gather`, so per-LEVEL cardinality equality cannot be shown from this plan;
+      and "97 MB vs 38 MB" is not one comparison, since goopg's figure is one
+      batch of eight (≈780 MB total) against PG's single-batch total.
 - [ ] **P4-02** Upper `RelOptInfo`s (`GROUP_AGG`, `WINDOW`, `DISTINCT`,
       `ORDERED`, `FINAL`) with pathlists. *design: 08 §7.*
 - [ ] **P4-03** Promote `PathSort` to an upper-rel path. It already has a
