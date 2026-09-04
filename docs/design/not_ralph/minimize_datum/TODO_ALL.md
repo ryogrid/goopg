@@ -227,12 +227,13 @@ are EPICS — split into one-checkbox-per-commit items before starting
   out-of-line storage (M0125-0029).
   Artifacts: `internal/executor/operators_analyze.go`,
   `internal/executor/pgstatistic_truncate_test.go`.
-- [ ] **B-03 P1-14b remainder.** Landed so far: LIKE `patternsel`,
-  `booltestsel`, `rowcomparesel`, `scalararraysel`, `var_eq_non_const`.
-  Remaining: regex ops, small-hist prefix-range precision (text-scalar
-  P1-31 gap), multibyte case-folding. Judge by the EA ratchet, never by
-  per-item timing.
-  *design: take3 08 §4; gate: EA ratchet (take3 09 §4.1 A5).*
+- [-] **B-03 P1-14b remainder.** CLOSED 2026-09-05 with no
+  implementation — all three sub-items predict zero EA-ratchet
+  movement: regex ops (no `~` in either suite — dead path; resume =
+  port regex_selectivity_sub + prefix analogue); prefix-range precision
+  (blend cell unreachable; belongs to B-08, then eq-clamp tail);
+  multibyte case-folding (ASCII-only data; executor-owned correctness).
+  Ledger `take3-B-03-declined` (+ EA file-level baseline note).
 - [ ] **B-04 P1-21 `max(outer,inner)` fallback cap — verify-and-keep.**
   Precondition NOT met (cap sits in the unmeasurable fallback
   `cardinality.go:655-666`, unreachable from P1-15). Verify and ledger as
