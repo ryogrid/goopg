@@ -205,6 +205,15 @@ are EPICS — split into one-checkbox-per-commit items before starting
   sites and after `applyIndexOrderedGroupingRule`,
   splitAggregate Final-decline (Partial keeps).
   Gates: 22 group tests; optimizer suite; PP zero drift; TPC-H 24/24.
+  Slice 3 (window-input) LANDED 2026-09-05: prerequisite walker
+  widening first (`walkPlanExprs` Aggregate Filter/Passthrough +
+  WindowAgg Funcs.Args/Filter/frame offsets; all 15 callers audited —
+  sole mutator `remapOuterRefsInSubplan` now covers previously-missed
+  same-scope refs = fix; readers flip to bail at worst) +
+  `WindowAgg.InputTarget` payload + `window_input_target.go` (no
+  field-level decline — every field enumerated post-widening; collector
+  veto only) + keys-only construction stamps per spec.
+  Gates: 29 new tests; optimizer suite; PP zero drift; TPC-H 24/24.
 - [ ] **B-02 P1-11 TOAST in the catalog heap writer.** Re-measure FIRST
   post-`f07c20b1f` — the wide-text case may behave differently now (take3
   06 §2.11). Acceptable interim: bounded-width with a ledger row.

@@ -1398,6 +1398,28 @@ type WindowAgg struct {
 	// ROWS/GROUPS/RANGE frame (M0122-0004 frame-clause slice).
 	Frame  *WindowFrame
 	schema Schema
+
+	// InputTarget / InputTargetKnown is the window's input-column keep list —
+	// B-01c third cut (COMPUTE-ONLY window_input_target): the ascending
+	// child-output positions of the window-input columns (PartitionBy ∪
+	// OrderBy key columns ∪ func args ∪ func Filters ∪ frame offsets) plus
+	// the columns needed above the WindowAgg, derived from existing walkers
+	// only (window inputs per walkPlanExprs' WindowAgg arm, above-chain
+	// scopes per enclosingNodeScopeOf).
+	//
+	// NEVER applied: no Project insertion, no schema change, no cost
+	// change — behaviour-neutral by construction (one small slice header
+	// per WindowAgg). InputTargetKnown false means "unknown": a window or
+	// above-chain expression could not be enumerated, and no narrowing may
+	// be attempted. It is NOT the same as an empty list. Read by nothing
+	// except assertWindowInputTargetCoversKeys (window_input_target.go) and
+	// its unit tests.
+	//
+	// Must-avoid list: cost readers (plancost.go descends to Child only),
+	// EXPLAIN output, plan equality/goldens, copy/clone paths (a clone
+	// that drops the stamp reads as unknown, the safe direction).
+	InputTarget      []int
+	InputTargetKnown bool
 }
 
 // WindowFrame is the planner-resolved form of parser.WindowFrame:

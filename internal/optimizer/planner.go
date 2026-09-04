@@ -6677,6 +6677,10 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 			Frame:       frame,
 			schema:      outputSchema,
 		}
+		// B-01c third cut: keys-only construction stamp (above not yet
+		// built). Payload-only, no plan change — mirrors the Aggregate
+		// (buildAggregateStage) and Sort construction stamps.
+		stampWindowInputTarget(windowNode, nil)
 		currentChild = windowNode
 		currentCtx = newResolveContext(nil, outputSchema, inputCtx.settings)
 		// A-01(ii) cut 2: derived stage contexts inherit the statement

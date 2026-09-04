@@ -25,11 +25,14 @@ import "fmt"
 //     WithinGroupOrderBy key Expr — the same per-expression enumeration
 //     walkPlanExprs' Aggregate arm performs (unnest.go:1054-1075), minus the
 //     two fields that arm omits:
-//   - any AggregateCall.Filter present → UNKNOWN. The arm never walks
-//     Filter, so no node-level walker enumerates it; declining keeps a
-//     future applying cut from dropping a column the filter reads.
-//   - any Aggregate.Passthrough present → UNKNOWN. The arm never walks
-//     Passthrough either. (enclosingNodeScopeOf does — enclosingtree.go:143
+//   - any AggregateCall.Filter present → UNKNOWN. walkPlanExprs' Aggregate
+//     arm now walks Filter (B-01c window cut), but the group derivation
+//     keeps the field-level decline anyway: a future applying cut must
+//     re-prove the filter's evaluation scope before consuming it, and the
+//     decline is the safe side. (Same for Passthrough below.)
+//   - any Aggregate.Passthrough present → UNKNOWN. walkPlanExprs now walks
+//     Passthrough too (same cut), with the same intentional decline here.
+//     (enclosingNodeScopeOf does — enclosingtree.go:143
 //     — but that is the above-chain walker, whose extra width only ever
 //     widens a keep; the stamped node's own reads need the node-level
 //     walker, which omits it.)

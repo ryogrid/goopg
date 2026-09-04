@@ -1056,6 +1056,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, g := range n.GroupExprs {
 			walkExprTree(g, visit)
 		}
+		for _, p := range n.Passthrough {
+			walkExprTree(p, visit)
+		}
 		for _, a := range n.Aggs {
 			if a.Arg != nil {
 				walkExprTree(a.Arg, visit)
@@ -1065,6 +1068,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 			}
 			for _, ea := range a.ExtraArgs {
 				walkExprTree(ea, visit)
+			}
+			if a.Filter != nil {
+				walkExprTree(a.Filter, visit)
 			}
 			for _, sk := range a.OrderBy {
 				walkExprTree(sk.Expr, visit)
@@ -1138,6 +1144,22 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 		for _, k := range n.OrderBy {
 			walkExprTree(k.Expr, visit)
+		}
+		for _, f := range n.Funcs {
+			for _, a := range f.Args {
+				walkExprTree(a, visit)
+			}
+			if f.Filter != nil {
+				walkExprTree(f.Filter, visit)
+			}
+		}
+		if n.Frame != nil {
+			if n.Frame.StartOffset != nil {
+				walkExprTree(n.Frame.StartOffset, visit)
+			}
+			if n.Frame.EndOffset != nil {
+				walkExprTree(n.Frame.EndOffset, visit)
+			}
 		}
 	case *Values:
 		for _, row := range n.Rows {
