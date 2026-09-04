@@ -280,7 +280,7 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 		if slot == nil {
 			continue
 		}
-		batch = append(batch, MaterializeForTransfer(slot.Row()))
+		batch = append(batch, transferRowForQueue(slot))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}
@@ -326,8 +326,8 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 		}
 		// The leader's own rows do not cross a goroutine boundary, but they DO
 		// have to survive until the heap pops them — several Next() calls
-		// later — so they must be materialised like any retained row.
-		src.cur = MaterializeForTransfer(slot.Row())
+		// later — so they must be transferred like any retained row.
+		src.cur = transferRowForQueue(slot)
 		return true, nil
 	}
 	for len(src.pending) == 0 {

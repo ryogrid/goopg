@@ -427,10 +427,10 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 		if slot == nil {
 			continue
 		}
-		// The ownership boundary. Materialize — never cloneRow, never
+		// The ownership boundary. Transfer — never cloneRow, never
 		// Slot.CopyTo — because both are shallow, preserve ArenaID, and are
 		// silently wrong exactly here while passing every serial test.
-		batch = append(batch, MaterializeForTransfer(slot.Row()))
+		batch = append(batch, transferRowForQueue(slot))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}

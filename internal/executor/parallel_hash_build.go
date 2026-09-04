@@ -477,7 +477,7 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 				if err != nil {
 					return err
 				}
-				batch = append(batch, MaterializeForTransfer(slot.Row()))
+				batch = append(batch, transferRowForQueue(slot))
 				if len(batch) >= gatherBatchRows {
 					select {
 					case ch <- batch:

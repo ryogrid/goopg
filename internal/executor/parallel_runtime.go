@@ -43,6 +43,42 @@ func MaterializeForTransfer(row Row) Row {
 	return cloneRowOwned(row)
 }
 
+// transferRowForQueue is the EX2-02c first cut: ownership transfer across the
+// gather worker queue under the arena rules above.
+//
+// MaterializeForTransfer unconditionally copies: acquireRow + O(width) Datum
+// promotion on every row. That copy defeats BOTH hazards (slot aliasing and
+// arena lifetime), but only one hazard applies to every slot kind:
+//
+//   - *VirtualSlot.Row() allocates a FRESH pooled row per call (slot.go:174;
+//     audit A12) that no producer ever reuses — the slice is sole-owned by
+//     the caller the moment it returns. Only the arena hazard remains, and
+//     it is directly testable with rowHasArena. When the row is arena-free
+//     the fresh buffer transfers as-is (zero further copies); otherwise it
+//     is promoted with cloneRowOwned and the source buffer is released back
+//     to the pool (today that buffer leaks — A12 churn).
+//   - Every other slot kind (*Slot, *MaterializedSlot) returns a view over
+//     a producer-reused buffer (slab Cells, projectOp.o.out, scanRow), so
+//     the slice MUST be copied regardless of arena content. That path stays
+//     exactly MaterializeForTransfer.
+//
+// Sharing owned (ArenaID == 0) Datum payloads across the queue is safe: ints
+// and other value kinds copy by value, and owned Buf bytes are never mutated
+// in place (read-only convention, cf. cloneRow). Use AssertTransferable in
+// tests to pin the contract; it is O(width) and not for the send path.
+func transferRowForQueue(slot TupleSlot) Row {
+	if vs, ok := slot.(*VirtualSlot); ok {
+		row := vs.Row()
+		if !rowHasArena(row) {
+			return row
+		}
+		owned := cloneRowOwned(row)
+		releaseRow(row)
+		return owned
+	}
+	return MaterializeForTransfer(slot.Row())
+}
+
 // AssertTransferable reports whether every datum in row is safe to read from
 // another goroutine, returning a descriptive error when one is not.
 //

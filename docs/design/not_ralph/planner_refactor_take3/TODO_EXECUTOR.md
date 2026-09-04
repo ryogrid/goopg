@@ -126,12 +126,16 @@ tripwires green, values clean, plans unchanged.
       (sources alias reused producer slot; whole-aggregation lifetimes;
       MaterializeArena already minimal, no fold/gate). Ledger
       `take3-EX2-02b-dropped` (+ WithinGroup latent-hazard follow-up).
-- [ ] EX2-02c Ownership passing at gather transfer (= 13 EX2-04) —
-      workers stream materialised rows today
-      (`operators_gather.go:334-336`); move to ownership transfer across
-      the queue under arena rules (`parallel_runtime.go:31-71`); serial
-      control arm mandatory. Separate commit from 02b (EX-P3).
-      *design: 13 §4; gate: alloc arm; values + pin + serial arm.*
+- [x] EX2-02c Ownership passing at gather transfer (= 13 EX2-04) —
+      this commit: `transferRowForQueue` (VirtualSlot fast path: fresh
+      pooled buffer transfers as-is when arena-free, clone+release when
+      arena-backed; other slot kinds stay byte-identical
+      MaterializeForTransfer); 4 call-site swaps (G1–G4);
+      gates: 4 new transfer tests + gather/parallel suite, TPC-H 24/24
+      serial + 24/24 parallel (arms values-identical), plan-gate 22/22,
+      TPC-DS PASS=95 MISMATCH=0;
+      artifacts: `internal/executor/{parallel_runtime,operators_gather,operators_gather_merge,parallel_hash_build}.go`,
+      `internal/executor/parallel_transfer_test.go`
 - [ ] EX2-03 Pool sizing — tune `acquireRow` widths/return discipline
       against EX0-04 slices, after the audit. Measure, do not guess.
       *design: 13 §4; gate: pool-hit + alloc + timing arms; pin.*
