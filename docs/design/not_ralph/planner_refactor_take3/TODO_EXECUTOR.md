@@ -233,7 +233,9 @@ Sequenced after EX1 (13 §1 EX-P7).
       0.73 steady-state — Stage 1 already took the 34%);
       artifacts: `internal/executor/{operators,operators_lockrows,operators_join_agg,executor,opnode}.go`,
       tests in `ctid_function_arg_test.go`, `operators_lockrows_test.go`,
-      `sort_external_test.go`. Cut B (per-key kind specialization) queued.
+      `sort_external_test.go`. Cut B (per-key kind specialization) [-]
+      DROPPED as verified no-win 2026-09-04: fires (count→KindInt) yet
+      Q16 wall-neutral; ledger `take3-EX3-05-cutB-dropped`.
 - [ ] EX3-06 Skew residency + single-pass build — MCV-pinned hot keys
       (needs planner P2-11b input) + collapse two-pass/two-map build.
       Last in EX3 (13 §8.4).
