@@ -108,9 +108,11 @@ MD-01, MD-02, MD-03, MD-03.5 and MD-1x carry no geometry and are unblocked by
       PostgreSQL's `work_mem`, retained bytes, wall time and allocation count,
       and it may return a negative result.
       *design: 04 §4.1, §5 (D-3), §9.4 (R-3) · gate: 06 §3 MD-04 (model-vs-
-      reality test; batch-count witness against the recorded 128 full / 64
-      narrowed) · files: `operators_join_agg.go`, `parallel_hash_build.go`,
-      `hashsize/hashsize.go`*
+       reality test; batch-count witness against the measured pre-state —
+       Q9 witness `Batches:` 2→1, narrowed width ≈100 (the modelled 128
+       full / 64 narrowed from `FINDING-p401-alone-is-not-enough.md` is
+       superseded; see TODO_ALL.md D-05) · files: `operators_join_agg.go`,
+       `parallel_hash_build.go`, `hashsize/hashsize.go`*
       **Stopping rule: 05 §6. If the measurement says stop, revert MD-04 —
       do not keep it and stop (R-4).**
 
@@ -221,10 +223,13 @@ carries its `work_mem` and its arm.
 | item | closed | commit | batches @ PG work_mem | retained bytes | wall | allocs | notes |
 |---|---|---|---|---|---|---|---|
 
-Pre-state for the batch-count column, from
-`impl/FINDING-p401-alone-is-not-enough.md`: Q9's `orders` build side at
-`work_mem` 4 MB × `hash_mem_multiplier` 2 — **128 batches at full width, 64
-narrowed**.
+Pre-state for the batch-count column: Q9 witness `Batches:` 2→1 at
+`work_mem` 64 MB, narrowed width ≈100
+(`docs/design/planner-p4-01-target/DESIGN.md:61-71`). The older modelled
+figure from `impl/FINDING-p401-alone-is-not-enough.md` (`orders` build
+side at `work_mem` 4 MB × `hash_mem_multiplier` 2 — **128 batches at full
+width, 64 narrowed**) is superseded for gating purposes; report the
+post-state against the measured pair (see TODO_ALL.md D-05).
 
 ---
 
