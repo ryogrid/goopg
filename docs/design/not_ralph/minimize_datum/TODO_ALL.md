@@ -106,12 +106,12 @@ tracks recorded.*
   Artifacts: `docs/design/executor-a01ii-rtable-identity/DESIGN.md`
   (F1–F10 folded), `analysis/planner-refactor-take3/a01ii-cut4-20260905/`,
   `analysis/leftdeep-joins/a01ii-cut3*.txt`.
-- [ ] **A-02 P0-05 plan-parity capture.** EXPLAIN from goopg and PG for
-  TPC-H 22 + TPC-DS 99; commit the PG side as fixtures
-  (`bench/tpch/plans-pg/`, `bench/tpcds/plans-pg/`, re-captured only on
-  query/dataset change).
-  *design: take3 08 §3; gate: take3 09 §5 P0 — capture runs and is
-  reproducible.*
+- [x] **A-02 P0-05 plan-parity capture.** Committed 2026-09-05:
+  `bench/tpch/plans-pg/` (22, split from the paired PG capture) +
+  `bench/tpcds/plans-pg/` (99, captured per-query vs 65438/tpcds05
+  SF0.5 with the sweep's EXPLAIN-prefix trick; Q36/70/86 SKIP per
+  oracle) + re-capture policy READMEs. Reproducible: capture commands
+  recorded in the READMEs; fixtures byte-stable (EXPLAIN-only).
 - [ ] **A-03 P0-06 plan-parity diff.** Normalised tree comparison
   (costs/rows/widths/times in a separate column), per-query verdicts
   `MATCH` / `SHAPE-DIFF` / `MISSING-NODE` / `ERROR` / `TIMEOUT`, the
