@@ -190,9 +190,8 @@ Sequenced after EX1 (13 §1 EX-P7).
 - [ ] EX3-04 Sort spill runs + merge discipline — run formation on
       `flushChunk`, tape-style merge-back (logtape analogue, 10 §9).
       *design: 13 §5; gate: spilling-sort shapes; values + pin.*
-- [ ] EX3-05 Sort-compare fast path — close `lessRows` / CTID-tail cost
-      (q16 34%) on the decoded-vector keys. Pure-timing gate; no plan can
-      move. Do first if EX3-01 stalls.
+- [ ] EX3-05 Sort-compare fast path — Cut A implemented, gates pending
+      TPC-DS sweep (TPC-H 24/24 MATCH, plan-gate 22/22 so far).
       *design: 13 §5; gate: sort-compare slice down; pin (trivially holds).*
 - [ ] EX3-06 Skew residency + single-pass build — MCV-pinned hot keys
       (needs planner P2-11b input) + collapse two-pass/two-map build.
