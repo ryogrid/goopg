@@ -179,9 +179,24 @@ Sequenced after EX1 (13 §1 EX-P7).
       14.97→11.48 s (−23%) Q13 6.89→4.69 s (−32%) values identical
       (single-sample); artifacts: `internal/executor/spill.go`.
       NOT gated on Q14/Q3/Q10 (STALE witnesses, 12 §13).
-- [ ] EX3-02 Dense-chunk build rows — contiguous packing (`dense_alloc`
-      analogue, 10 §6) replacing per-row build allocations.
-      *design: 13 §5; gate: alloc arm (primary) + timing; values + pin.*
+- [x] EX3-02 Dense-chunk build rows — Cut 0 (census: GO stratum-B-first,
+      64 KB kept) + Cut 1 landed (this commit): build-only
+      `materializeInto`-style helper (`materializeBuildDatum`) routes
+      arena String/Bytes + big-numeric bodies into a per-joinOp
+      statement-parented mmgr arena; headers stay per-row;
+      `MaterializeArena`/`cloneRowOwned` bit-identical (F3); shared-build
+      adoption recorded (F2/F5); `Buf` carriers legacy-pathed (F1).
+      Gates: 7 new poison tests + 252-test gate suite green; unit allocs
+      A 5.00→2.00 / C 6.00→2.00 exact; TPC-H 24/24 MATCH, plan-gate
+      22/22, TPC-DS PASS=95 MISMATCH=0, Q9 values identical, live
+      `retainBuildRow` on-path; timing within fresh-server band (no win
+      claimed, single samples).
+      Artifacts: `internal/executor/{dense_build,operators_join_agg,parallel_hash_build}.go`,
+      `internal/executor/dense_build_cut1_test.go`,
+      `analysis/planner-refactor-take3/{ex302-census,ex302-cut1}-20260904/`.
+      Design: `docs/design/executor-ex3-02-dense-build/DESIGN.md`
+      (reviewed, F1–F7 folded). Cut 2 (stratum D, F1-blocked shape) +
+      Cut 3 (oversize + teardown) queued.
 - [ ] EX3-03 Batch-file discipline per PG semantics — symmetric probe-side
       spill, batch-pair re-reads, peak near `work_mem`. Measured at both
       budgets; EX0-05 counters gate alongside time.

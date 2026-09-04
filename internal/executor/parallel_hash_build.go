@@ -55,6 +55,12 @@ type sharedHashBuild struct {
 	// other one without re-deriving the rule.
 	probeIsLeft bool
 
+	// EX3-02 Cut 1 (stratum B): the builder's buildBytes arena, parented to
+	// the statement context. Adopted by workers (applySharedBuild) so
+	// chunk-backed rows stay valid after the prebuild throwaway tree is
+	// gone; reclaimed at statement end (Cut 3 owns the explicit teardown).
+	buildBytes *mmgr.Context
+
 	preserveBuildSide bool
 	antiBuildRows     int
 	antiBuildHasNull  bool
@@ -76,6 +82,7 @@ func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
 		antiBuildHasNull:  o.antiBuildHasNull,
 		leftWidth:         o.lazyLW,
 		rightWidth:        o.lazyRW,
+		buildBytes:        o.buildBytes,
 	}
 }
 
@@ -94,6 +101,11 @@ func (o *joinOp) applySharedBuild(sb *sharedHashBuild) {
 	o.antiBuildHasNull = sb.antiBuildHasNull
 	o.lazyLW = sb.leftWidth
 	o.lazyRW = sb.rightWidth
+	// EX3-02 Cut 1: adopt the shared stratum-B arena. Marked shared so
+	// Close only dereferences it — the builder (never Closed on this path)
+	// and the statement-end Release own its lifetime.
+	o.buildBytes = sb.buildBytes
+	o.buildBytesShared = true
 }
 
 // lookupSharedHashBuild returns the published table for a plan node, or nil

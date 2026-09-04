@@ -17,6 +17,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // joinRowCTID carries the heap tuple identifier captured for one left-side row
@@ -70,6 +71,14 @@ type joinOp struct {
 	// column yields a datum that is not int64-representable.
 	lazyIntHash   map[int64][]Row
 	lazyHashIsInt bool
+
+	// EX3-02 Cut 1 (stratum B): per-joinOp build arena for variable-width
+	// payloads (dense_build.go). Parented to the statement context, released
+	// at Close in the serial case; a shared-adopted arena (applySharedBuild)
+	// is owned by sharedHashBuild until statement end (buildBytesShared).
+	// Row headers stay per-row — this covers payloads only.
+	buildBytes       *mmgr.Context
+	buildBytesShared bool
 
 	// M0127-P2.2 (05 §5, stage E4): the executor's key plan, resolved once
 	// per Open from planner.Join.ExecHashKeyPlan. execKeys holds EVERY
@@ -555,6 +564,9 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	o.fillNullIdx = 0
 	o.probeEOF = false
 	o.fillSweepReset()
+	// EX3-02 Cut 1: a re-Open that skipped Close must not inherit the
+	// previous run's stratum-B arena (nor keep a stale shared adoption).
+	o.releaseBuildBytes()
 	// M0054-0005b: hoist the per-iteration `nullRow(...)` allocation
 	// out of the build loop. The hash-key evaluation only needs the
 	// other-side columns to be present so column-index resolution
@@ -581,6 +593,11 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// map[int64] table can never be built for a join that probes with a
 	// composite key.
 	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
+
+	// EX3-02 Cut 1: stratum-B arena for this build, parented to the
+	// statement context. Covers the serial loops below and the cooperative
+	// parallel consumer (single leader loop by construction, §3.7).
+	o.ensureBuildBytes(ctx)
 
 	// M0129-S4.1: cooperative parallel hash build — N goroutines scan+filter
 	// the build table while one goroutine owns the hash map
@@ -816,9 +833,9 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 				return err
 			}
 			if ok {
-				o.fileCompositeBuildRow(ownedBuildRow(l))
+				o.fileCompositeBuildRow(o.retainBuildRow(l))
 			} else {
-				o.recordBuildNullKey(ownedBuildRow(l))
+				o.recordBuildNullKey(o.retainBuildRow(l))
 			}
 			continue
 		}
@@ -829,10 +846,10 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 		if !ok {
 			// M0127-P4.2: a NULL key matches nothing, which under RIGHT/FULL
 			// is precisely why the row has to be kept.
-			o.recordBuildNullKey(ownedBuildRow(l))
+			o.recordBuildNullKey(o.retainBuildRow(l))
 			continue
 		}
-		if err := o.insertBuildRow(kd, ownedBuildRow(l)); err != nil {
+		if err := o.insertBuildRow(kd, o.retainBuildRow(l)); err != nil {
 			return err
 		}
 	}
@@ -886,9 +903,9 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 				return err
 			}
 			if ok {
-				o.fileCompositeBuildRow(ownedBuildRow(r))
+				o.fileCompositeBuildRow(o.retainBuildRow(r))
 			} else {
-				o.recordBuildNullKey(ownedBuildRow(r))
+				o.recordBuildNullKey(o.retainBuildRow(r))
 			}
 			continue
 		}
@@ -905,7 +922,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 			}
 			// M0127-P4.2: see buildLoopLeft — under RIGHT/FULL the NULL-key
 			// row is unmatched by construction, not absent.
-			o.recordBuildNullKey(ownedBuildRow(r))
+			o.recordBuildNullKey(o.retainBuildRow(r))
 			continue
 		}
 		// M0127-P0.3 (05 §4, stage E3): Semi/Anti go through the same
@@ -915,7 +932,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 		// made up front there is nothing left for them to opt out of.
 		// Their NullAware / emit-once invariants live in the counters above
 		// and in nextLazy, neither of which reads the key representation.
-		if err := o.insertBuildRow(kd, ownedBuildRow(r)); err != nil {
+		if err := o.insertBuildRow(kd, o.retainBuildRow(r)); err != nil {
 			return err
 		}
 	}
@@ -928,6 +945,9 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 // because the producer's next Next may Reset the arena, while the non-arena
 // case keeps the cheap O(width) struct copy. Dropping either half re-opens the
 // M0097-0058 aliasing class — build rows must never alias a scan buffer.
+// EX3-02 Cut 1: the build loops now retain through retainBuildRow (stratum-B
+// payloads); this stays as the no-arena-context fallback and the
+// cross-path primitive — semantics bit-identical by pin.
 func ownedBuildRow(row Row) Row {
 	if rowHasArena(row) {
 		return cloneRowOwned(row)
@@ -1795,6 +1815,10 @@ func (o *joinOp) Close() error {
 	o.closeLateralStream()
 	o.lazyHash = nil
 	o.lazyIntHash = nil
+	// EX3-02 Cut 1: drop the stratum-B arena with the table. A
+	// shared-adopted arena is only dereferenced here (statement end
+	// reclaims it); the serial arena is Released eagerly.
+	o.releaseBuildBytes()
 	o.lazyProbe = nil
 	o.lazyProbeSrc = nil
 	o.lazyMatches = nil
