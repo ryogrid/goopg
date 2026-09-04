@@ -190,9 +190,20 @@ Sequenced after EX1 (13 §1 EX-P7).
 - [ ] EX3-04 Sort spill runs + merge discipline — run formation on
       `flushChunk`, tape-style merge-back (logtape analogue, 10 §9).
       *design: 13 §5; gate: spilling-sort shapes; values + pin.*
-- [ ] EX3-05 Sort-compare fast path — Cut A implemented, gates pending
-      TPC-DS sweep (TPC-H 24/24 MATCH, plan-gate 22/22 so far).
-      *design: 13 §5; gate: sort-compare slice down; pin (trivially holds).*
+- [x] EX3-05 Sort-compare fast path — this commit Cut A: `sortOp.wantCTIDs`
+      gates the TID side-channel (per-row append, third perm pass,
+      re-attach branch) on a consumer; markers at LockRows (unconditional)
+      + project/filter/aggregate/result (CTIDExpr-gated) + slab twins;
+      window/projectSet need none (eval against materialized rows);
+      joins/NLI correctly stop the walk (own scan-cursor sidecars, never
+      propagate sort-fed ctids); resultOp hole found in review and pinned.
+      Gates: sort/lock/CTID suites incl. 3 new resultOp pin tests
+      (negative-controlled), TPC-H 24/24 MATCH, plan-gate 22/22, TPC-DS
+      PASS=95 MISMATCH=0, Q16 timing-neutral (0.93→0.99 sweep noise,
+      0.73 steady-state — Stage 1 already took the 34%);
+      artifacts: `internal/executor/{operators,operators_lockrows,operators_join_agg,executor,opnode}.go`,
+      tests in `ctid_function_arg_test.go`, `operators_lockrows_test.go`,
+      `sort_external_test.go`. Cut B (per-key kind specialization) queued.
 - [ ] EX3-06 Skew residency + single-pass build — MCV-pinned hot keys
       (needs planner P2-11b input) + collapse two-pass/two-map build.
       Last in EX3 (13 §8.4).

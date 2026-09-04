@@ -1963,6 +1963,39 @@ func newAggregateOp(plan *optimizer.Aggregate, child Operator) *aggregateOp {
 	return &aggregateOp{plan: plan, child: child, schema: plan.Output()}
 }
 
+// aggPlanUsesCTID reports whether an Aggregate plan evaluates any expression
+// against its child slots that can observe the TID side-channel — i.e.
+// whether any group key, aggregate argument, FILTER, ORDER BY / WITHIN GROUP
+// key, or passthrough expression contains a *optimizer.CTIDExpr. Only the
+// node's OWN expressions are scanned (never the child's): a ctid buried in
+// the subtree below the sort is some other operator's concern. EX3-05 Cut A.
+func aggPlanUsesCTID(p *optimizer.Aggregate) bool {
+	if p == nil {
+		return false
+	}
+	if exprTreeUsesCTID(p.GroupExprs...) || exprTreeUsesCTID(p.Passthrough...) {
+		return true
+	}
+	for i := range p.Aggs {
+		call := &p.Aggs[i]
+		if exprTreeUsesCTID(call.Arg, call.Arg2, call.Filter) ||
+			exprTreeUsesCTID(call.ExtraArgs...) {
+			return true
+		}
+		for _, sk := range call.OrderBy {
+			if exprTreeUsesCTID(sk.Expr) {
+				return true
+			}
+		}
+		for _, sk := range call.WithinGroupOrderBy {
+			if exprTreeUsesCTID(sk.Expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (o *aggregateOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.idx = 0 // reset read cursor — o.rows is rebuilt below, so always start at 0
@@ -1980,6 +2013,14 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		defer delete(ctx.PartialAggStates, o.plan.PartialSource)
 	}
 
+	// EX3-05 Cut A: aggregate args/group keys/passthrough are evaluated
+	// against the child slots (evalExprSlot), so a ctid reference there
+	// (`SELECT max(ctid::text) ...` over a sorted grouping) reads the sort's
+	// TID side-channel. Enable it on the spine below before the child
+	// drains; otherwise leave sorts disabled.
+	if aggPlanUsesCTID(o.plan) {
+		markSortWantCTIDs(o.child)
+	}
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}

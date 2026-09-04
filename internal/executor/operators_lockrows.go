@@ -704,6 +704,11 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			return err
 		}
 	}
+	// EX3-05 Cut A: this LockRows is the TID side-channel's consumer
+	// (drainAndStamp's ms.hasCTID fallback). Enable sortOp.wantCTIDs on the
+	// spine below BEFORE the child drains — the sort records TIDs only when
+	// asked. Must precede child.Open: sortOp.Open pulls every row up front.
+	markSortWantCTIDs(o.child)
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}

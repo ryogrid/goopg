@@ -337,6 +337,12 @@ func newProjectOp(plan *optimizer.Project, child Operator) *projectOp {
 
 func (o *projectOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// EX3-05 Cut A: a projected ctid (`SELECT ctid ... ORDER BY ...`) reads
+	// the sort's TID side-channel, so enable it on the spine below before
+	// the child drains. No CTIDExpr in the targets → leave sorts disabled.
+	if exprTreeUsesCTID(o.targets...) {
+		markSortWantCTIDs(o.child)
+	}
 	if cap(o.out) < len(o.targets) {
 		o.out = acquireRow(len(o.targets))
 	} else {
@@ -455,6 +461,13 @@ func (o *resultOp) Open(ctx *Context) error {
 		}
 	}
 	if o.child != nil {
+		// EX3-05 Cut A: Result-with-child evaluates targets against the
+		// child slot (Next, evalExprSlot), so a ctid target reads the
+		// sort's TID side-channel. Same consumer contract as projectOp.
+		// (The one-time qual above reads a nil slot, never a TID.)
+		if exprTreeUsesCTID(o.targets...) {
+			markSortWantCTIDs(o.child)
+		}
 		return o.child.Open(ctx)
 	}
 	if cap(o.out) < len(o.targets) {
@@ -536,7 +549,17 @@ func newFilterOp(plan *optimizer.Filter, child Operator) *filterOp {
 	return &filterOp{child: child, pred: plan.Predicate}
 }
 
-func (o *filterOp) Open(ctx *Context) error { o.ctx = ctx; return o.child.Open(ctx) }
+func (o *filterOp) Open(ctx *Context) error {
+	o.ctx = ctx
+	// EX3-05 Cut A: same consumer contract as projectOp — a ctid predicate
+	// above a sort (`WHERE ctid = ...` over an ORDER BY subquery) reads the
+	// side-channel. The planner pushes quals below sorts, so this rarely
+	// fires; it is pinned for shape-completeness.
+	if exprTreeUsesCTID(o.pred) {
+		markSortWantCTIDs(o.child)
+	}
+	return o.child.Open(ctx)
+}
 func (o *filterOp) Schema() optimizer.Schema  { return o.child.Schema() }
 func (o *filterOp) Close() error            { return o.child.Close() }
 
@@ -798,6 +821,16 @@ type sortOp struct {
 	ctids         []sortCTID
 	ctidsDisabled bool
 
+	// wantCTIDs gates the TID side-channel above: it is set only when a
+	// consumer above the sort needs per-row TIDs — a parent LockRows
+	// (ORDER BY ... FOR UPDATE, via markSortWantCTIDs from lockRowsOp.Open)
+	// or an ancestor that evaluates *optimizer.CTIDExpr against the sort's
+	// output slots (Project/Filter/Aggregate above a sort, same marker).
+	// When false (the common case: plain ORDER BY with no such consumer)
+	// Open skips the per-row append, sortTailWithCTIDs sorts rows+keyvals
+	// only, and Next skips the re-attach branch. EX3-05 Cut A.
+	wantCTIDs bool
+
 	// External-sort state. Populated only when at least one spill
 	// has occurred during Open().
 	spillFiles []string
@@ -903,7 +936,10 @@ func (o *sortOp) Open(ctx *Context) error {
 		}
 		o.rows = append(o.rows, row)
 		o.keyvals = append(o.keyvals, kv)
-		if !o.ctidsDisabled {
+		// EX3-05 Cut A: maintain the TID side-channel only when a consumer
+		// above needs it (wantCTIDs, set by markSortWantCTIDs). Otherwise
+		// skip the per-row append entirely.
+		if o.wantCTIDs && !o.ctidsDisabled {
 			o.ctids = append(o.ctids, sortCTID{block: ms.ctidBlock, off: ms.ctidOff, has: ms.hasCTID})
 		}
 		chunkBytes += estimatedRowBytes(row)
@@ -1075,10 +1111,15 @@ func applySortPerm(perm []int, rows []Row, keyvals [][]Datum, ctids []sortCTID) 
 }
 
 // sortTailWithCTIDs sorts the final in-memory tail (o.rows). When the TID
-// side-channel is live (no spill occurred), it reorders o.ctids in lockstep
-// with o.rows via a permutation so each emitted row keeps its own ctid.
-// Falls back to the plain row sort when ctids are disabled/absent.
+// side-channel is live (a consumer set wantCTIDs and no spill occurred), it
+// reorders o.ctids in lockstep with o.rows via a permutation so each emitted
+// row keeps its own ctid. Falls back to the plain row sort when ctids are
+// disabled/absent — and, since EX3-05 Cut A, when no consumer wants them.
 func (o *sortOp) sortTailWithCTIDs() {
+	if !o.wantCTIDs {
+		o.sortChunk(o.rows)
+		return
+	}
 	if o.ctidsDisabled || len(o.ctids) != len(o.rows) {
 		o.sortChunk(o.rows)
 		return
@@ -1098,6 +1139,76 @@ func (o *sortOp) sortTailWithCTIDs() {
 		return
 	}
 	applySortPerm(perm, o.rows, o.keyvals, o.ctids)
+}
+
+// markSortWantCTIDs enables the TID side-channel (sortOp.wantCTIDs) on every
+// sortOp on the single-child spine below op, recursing through the
+// single-child pass-through operators a slot's hasCTID survives — the same
+// vocabulary findScanLeaf uses (project/filter/sort/limit/distinct/
+// distinctOn/ordinality/window/projectSet/materialize, plus the
+// instrumentedOp wrapper). It stops at the first operator with any other
+// shape (joins, scans, gathers, set-ops, ...): those either consume slots
+// row-wise (CTIDExpr reads NULL there already) or rebuild them (the CTID is
+// already lost), so a sort below one has no live consumer and staying
+// disabled is observably identical. Idempotent: setting wantCTIDs twice is
+// the same as once. EX3-05 Cut A.
+//
+// Callers are the side-channel's consumers, each before opening its child:
+// lockRowsOp (unconditional — ORDER BY ... FOR UPDATE reads the channel via
+// drainAndStamp's ms.hasCTID fallback) and the operators that evaluate
+// *optimizer.CTIDExpr against child slots (project/filter/aggregate, gated
+// on exprTreeUsesCTID).
+func markSortWantCTIDs(op Operator) {
+	for {
+		switch v := op.(type) {
+		case *sortOp:
+			v.wantCTIDs = true
+			op = v.child
+		case *projectOp:
+			op = v.child
+		case *filterOp:
+			op = v.child
+		case *limitOp:
+			op = v.child
+		case *distinctOp:
+			op = v.child
+		case *distinctOnOp:
+			op = v.child
+		case *ordinalityOp:
+			op = v.child
+		case *windowOp:
+			op = v.child
+		case *projectSetOp:
+			op = v.child
+		case *materializeOp:
+			op = v.child
+		case *instrumentedOp:
+			op = v.inner
+		default:
+			return
+		}
+	}
+}
+
+// exprTreeUsesCTID reports whether evaluating any of exprs against a child
+// slot can observe the TID side-channel, i.e. whether any expression tree
+// contains a *optimizer.CTIDExpr (which reads MaterializedSlot/Slot.hasCTID
+// in evalExprSlot). Consumers gate their markSortWantCTIDs call on this so a
+// plain `SELECT a ... ORDER BY` (no ctid reference anywhere) leaves every
+// sort below disabled. EX3-05 Cut A.
+func exprTreeUsesCTID(exprs ...optimizer.Expr) bool {
+	uses := false
+	for _, e := range exprs {
+		if e == nil || uses {
+			continue
+		}
+		optimizer.WalkExprTree(e, func(sub optimizer.Expr) {
+			if _, ok := sub.(*optimizer.CTIDExpr); ok {
+				uses = true
+			}
+		})
+	}
+	return uses
 }
 
 // isRegSortFamilyTypeName reports whether name is one of the reg* OID-alias
@@ -1255,8 +1366,9 @@ func (o *sortOp) Next() (TupleSlot, error) {
 		row := o.rows[o.idx]
 		slot := SlotFromRow(o.Schema(), row)
 		// Re-attach the per-row TID side-channel so a parent LockRows can stamp
-		// row locks (ORDER BY ... FOR UPDATE). M0118-0003.
-		if !o.ctidsDisabled && o.idx < len(o.ctids) && o.ctids[o.idx].has {
+		// row locks (ORDER BY ... FOR UPDATE). M0118-0003. Maintained only
+		// when a consumer asked for it (EX3-05 Cut A: wantCTIDs).
+		if o.wantCTIDs && !o.ctidsDisabled && o.idx < len(o.ctids) && o.ctids[o.idx].has {
 			slot.hasCTID = true
 			slot.ctidBlock = o.ctids[o.idx].block
 			slot.ctidOff = o.ctids[o.idx].off

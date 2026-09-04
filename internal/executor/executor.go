@@ -598,7 +598,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) 
 		// only the predIdx — no GC-traced planner.Expr reference needed.
 		predIdx := tree.exprs.buildExpr(p.Predicate)
 		return tree.add(OpNode{Kind: OpFilter, childA: childIdx, childB: noChild,
-			state: &filterState{predIdx: predIdx}}), nil
+			state: &filterState{predIdx: predIdx, needsCTID: exprTreeUsesCTID(p.Predicate)}}), nil
 
 	case *optimizer.Project:
 		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))
@@ -615,7 +615,7 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) 
 		schemaIdx := int32(len(tree.schemas))
 		tree.schemas = append(tree.schemas, p.Output())
 		return tree.add(OpNode{Kind: OpProject, childA: childIdx, childB: noChild,
-			state: &projectState{schemaIdx: schemaIdx, targExprs: targExprs}}), nil
+			state: &projectState{schemaIdx: schemaIdx, targExprs: targExprs, needsCTID: exprTreeUsesCTID(p.Targets...)}}), nil
 
 	case *optimizer.Limit:
 		childIdx, err := tree.buildRec(p.Child, deformBoundBelow(p, bound))

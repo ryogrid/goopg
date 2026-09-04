@@ -342,6 +342,142 @@ func TestLockRowsStampsTupleLockOnlyXmax(t *testing.T) {
 	}
 }
 
+// TestLockRowsStampsTupleLockOnlyXmaxThroughSort pins the ORDER BY ... FOR
+// UPDATE shape (LockRows above Sort): the TID side-channel must survive the
+// sort — lockRowsOp.Open enables it via markSortWantCTIDs (EX3-05 Cut A) —
+// so every returned row still stamps its own heap tuple. Without the marker
+// drainAndStamp's ms.hasCTID fallback finds no TID and the statement silently
+// degrades to the relation-level lock only.
+func TestLockRowsStampsTupleLockOnlyXmaxThroughSort(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.LockMgr = lmgr.New()
+	ctx.BackendID = 1
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	rows, err := runForUpdate(t, ctx, "SELECT id FROM items ORDER BY id FOR UPDATE")
+	if err != nil {
+		t.Fatalf("runForUpdate: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("FOR UPDATE ... ORDER BY returned %d rows, want 3", len(rows))
+	}
+	for i, want := range []int64{1, 2, 3} {
+		if rows[i][0].Int != want {
+			t.Fatalf("row %d: id = %d, want %d (sort order regressed)", i, rows[i][0].Int, want)
+		}
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+	pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Pool.Unpin(pinned)
+	pinned.RLock()
+	defer pinned.RUnlock()
+	page := pinned.Page()
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stampedCount := 0
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(page, slot)
+		if err != nil {
+			continue
+		}
+		parsed, err := storage.ParseHeapTuple(raw)
+		if err != nil {
+			continue
+		}
+		if parsed.Header.Xmax != ctx.Tx.XID {
+			continue
+		}
+		if parsed.Header.Infomask&storage.HeapXmaxLockOnly == 0 {
+			t.Errorf("slot %d: xmax stamped but HeapXmaxLockOnly not set (Infomask=%#x)", slot, parsed.Header.Infomask)
+			continue
+		}
+		if parsed.Header.Infomask&storage.HeapXmaxExclLock == 0 {
+			t.Errorf("slot %d: HeapXmaxExclLock not set (Infomask=%#x)", slot, parsed.Header.Infomask)
+			continue
+		}
+		stampedCount++
+	}
+	if stampedCount != len(rows) {
+		t.Errorf("stamped %d tuples through sort, want %d (TID side-channel lost in sort?)", stampedCount, len(rows))
+	}
+}
+
+// TestLockRowsStampsTupleLockOnlyXmaxThroughSortSelfJoin is the STRONG pin
+// for the sort TID side-channel (EX3-05 Cut A). A self-join FOR UPDATE leaves
+// the resjunk-ctid column path unwired (CtidResno stays -1; AI-007), so the
+// ONLY way per-row TIDs reach drainAndStamp is the slot side-channel:
+// join (preserveCTIDRel) → sort (wantCTIDs) → ms.hasCTID fallback. With the
+// marker disabled the statement still returns every row but stamps nothing —
+// a silent downgrade to the relation-level lock — so this test fails loudly
+// while the single-table ThroughSort variant above keeps passing.
+func TestLockRowsStampsTupleLockOnlyXmaxThroughSortSelfJoin(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.LockMgr = lmgr.New()
+	ctx.BackendID = 1
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	rows, err := runForUpdate(t, ctx, "SELECT a.id FROM items a, items b WHERE a.id = b.id ORDER BY a.id FOR UPDATE OF a")
+	if err != nil {
+		t.Fatalf("runForUpdate: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("self-join FOR UPDATE OF ... ORDER BY returned %d rows, want 3", len(rows))
+	}
+	for i, want := range []int64{1, 2, 3} {
+		if rows[i][0].Int != want {
+			t.Fatalf("row %d: id = %d, want %d (sort order regressed)", i, rows[i][0].Int, want)
+		}
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+	pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Pool.Unpin(pinned)
+	pinned.RLock()
+	defer pinned.RUnlock()
+	page := pinned.Page()
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stampedCount := 0
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(page, slot)
+		if err != nil {
+			continue
+		}
+		parsed, err := storage.ParseHeapTuple(raw)
+		if err != nil {
+			continue
+		}
+		if parsed.Header.Xmax != ctx.Tx.XID {
+			continue
+		}
+		if parsed.Header.Infomask&storage.HeapXmaxLockOnly == 0 {
+			t.Errorf("slot %d: xmax stamped but HeapXmaxLockOnly not set (Infomask=%#x)", slot, parsed.Header.Infomask)
+			continue
+		}
+		if parsed.Header.Infomask&storage.HeapXmaxExclLock == 0 {
+			t.Errorf("slot %d: HeapXmaxExclLock not set (Infomask=%#x)", slot, parsed.Header.Infomask)
+			continue
+		}
+		stampedCount++
+	}
+	if stampedCount != len(rows) {
+		t.Errorf("stamped %d tuples through sort self-join, want %d (TID side-channel lost in sort?)", stampedCount, len(rows))
+	}
+}
+
 // TestUpdateBlocksOnForeignTupleLock — the headline tuple-level
 // step 2b property: a SELECT FOR UPDATE in session 1 stamps a
 // tuple lock; a UPDATE in session 2 hitting the same row blocks
