@@ -197,11 +197,19 @@ Sequenced after EX1 (13 §1 EX-P7).
       Design: `docs/design/executor-ex3-02-dense-build/DESIGN.md`
       (reviewed, F1–F7 folded). Cut 2 (stratum D, F1-blocked shape) +
       Cut 3 (oversize + teardown) queued.
-- [ ] EX3-03 Batch-file discipline per PG semantics — symmetric probe-side
-      spill, batch-pair re-reads, peak near `work_mem`. Measured at both
-      budgets; EX0-05 counters gate alongside time.
-      *design: 13 §5; gate: counter equality + values + pin at 64 MB and
-      512 MB-equivalent arms.*
+- [x] EX3-03 Batch-file discipline per PG semantics — Cut 1-step-1 landed
+      (this commit): `estimatedRowBytes` counts enum-label + big-numeric
+      bytes, byte-identical logic to the stats ruler
+      `datumVariablePayloadWidth` (runtime and planner rulers agree;
+      planner untouched, zero plan movement by construction); probe
+      established the symmetric machinery is landed and the remaining gap
+      is budget disagreement (planner 1 GiB vs executor 128 MB at 64 MB)
+      + this ruler gap. Gates: spill/batch/estimate/analyze suites +
+      growth tripwire green, TPC-H 24/24 MATCH, plan-gate 22/22, TPC-DS
+      PASS=95 MISMATCH=0; artifacts: `internal/executor/spill.go`,
+      `internal/executor/spill_test.go`. Step-2 (session work_mem
+      threading) designed (`docs/design/executor-ex3-03-workmem/DESIGN.md`,
+      reviewed F1–F7 folded) — implementation queued.
 - [ ] EX3-04 Sort spill runs + merge discipline — run formation on
       `flushChunk`, tape-style merge-back (logtape analogue, 10 §9).
       *design: 13 §5; gate: spilling-sort shapes; values + pin.*

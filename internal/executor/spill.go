@@ -544,6 +544,9 @@ func decodeDatum(data []byte) (Datum, int, error) {
 }
 
 // estimatedRowBytes returns a rough size estimate for a Row.
+// EX3-03 Cut 1-step-1: counts enum-label bytes and big-numeric body bytes,
+// mirroring the stats ruler datumVariablePayloadWidth
+// (operators_analyze.go). Runtime ruler only — planner untouched.
 func estimatedRowBytes(row Row) int64 {
 	n := int64(len(row) * 48) // Datum struct fixed overhead
 	for _, d := range row {
@@ -552,6 +555,16 @@ func estimatedRowBytes(row Row) int64 {
 			n += int64(len(d.StringValue()))
 		case KindBytes:
 			n += int64(len(d.BytesValue()))
+		case KindEnum:
+			if d.ArenaID != 0 {
+				n += int64(uint32(d.Int & 0xFFFFFFFF))
+			} else {
+				n += int64(len(d.Buf))
+			}
+		case KindNumeric:
+			if d.Flags&flagBigNumeric != 0 {
+				n += int64(uint32(d.Int & 0xFFFFFFFF))
+			}
 		}
 	}
 	return n
