@@ -1,0 +1,23 @@
+Limit  (cost=30162.58..30162.59 rows=5 width=87)
+  ->  Sort  (cost=30162.58..30162.59 rows=5 width=87)
+        Sort Key: (sum(store_sales.ss_ext_sales_price)) DESC, item.i_brand_id
+        ->  GroupAggregate  (cost=30162.41..30162.52 rows=5 width=87)
+              Group Key: item.i_brand, item.i_brand_id
+              ->  Sort  (cost=30162.41..30162.42 rows=5 width=61)
+                    Sort Key: item.i_brand, item.i_brand_id
+                    ->  Gather  (cost=1005.36..30162.35 rows=5 width=61)
+                          Workers Planned: 1
+                          ->  Nested Loop  (cost=5.36..29161.85 rows=3 width=61)
+                                ->  Nested Loop  (cost=5.06..28380.36 rows=7951 width=65)
+                                      ->  Parallel Seq Scan on item  (cost=0.00..1416.35 rows=99 width=59)
+                                            Filter: (i_manager_id = 52)
+                                      ->  Bitmap Heap Scan on store_sales  (cost=5.06..271.48 rows=88 width=14)
+                                            Recheck Cond: (ss_item_sk = item.i_item_sk)
+                                            ->  Bitmap Index Scan on store_sales_pkey  (cost=0.00..5.04 rows=88 width=0)
+                                                  Index Cond: (ss_item_sk = item.i_item_sk)
+                                ->  Memoize  (cost=0.30..0.33 rows=1 width=4)
+                                      Cache Key: store_sales.ss_sold_date_sk
+                                      Cache Mode: logical
+                                      ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.32 rows=1 width=4)
+                                            Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                            Filter: ((d_moy = 11) AND (d_year = 2000))

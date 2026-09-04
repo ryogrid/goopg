@@ -1,0 +1,14 @@
+=== Q13
+Sort  (cost=67427.22..67427.72 rows=200 width=16)
+  Sort Key: (count(*)) DESC, (count(orders.o_orderkey)) DESC
+  ->  HashAggregate  (cost=67417.58..67419.58 rows=200 width=16)
+        Group Key: count(orders.o_orderkey)
+        ->  HashAggregate  (cost=63667.58..65167.58 rows=150000 width=14)
+              Group Key: customer.c_custkey
+              ->  Hash Right Join  (cost=5781.42..56243.29 rows=1484859 width=12)
+                    Hash Cond: (orders.o_custkey = customer.c_custkey)
+                    ->  Seq Scan on orders  (cost=0.00..46564.00 rows=1484859 width=12)
+                          Filter: ((o_comment)::text !~~ '%special%requests%'::text)
+                    ->  Hash  (cost=3906.42..3906.42 rows=150000 width=6)
+                          ->  Index Only Scan using customer_pk on customer  (cost=0.42..3906.42 rows=150000 width=6)
+

@@ -1,0 +1,19 @@
+Limit  (cost=34917.96..34917.99 rows=10 width=91)
+  ->  Sort  (cost=34917.96..34917.99 rows=10 width=91)
+        Sort Key: (sum(store_sales.ss_ext_sales_price)) DESC, item.i_category_id, item.i_category
+        ->  GroupAggregate  (cost=34917.57..34917.79 rows=10 width=91)
+              Group Key: item.i_category_id, item.i_category
+              ->  Sort  (cost=34917.57..34917.59 rows=10 width=65)
+                    Sort Key: item.i_category_id, item.i_category
+                    ->  Gather  (cost=3069.06..34917.40 rows=10 width=65)
+                          Workers Planned: 3
+                          ->  Nested Loop  (cost=2069.06..33916.40 rows=3 width=65)
+                                ->  Parallel Hash Join  (cost=2068.78..33859.76 rows=182 width=14)
+                                      Hash Cond: (store_sales.ss_sold_date_sk = dt.d_date_sk)
+                                      ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=14)
+                                      ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=8)
+                                            ->  Parallel Seq Scan on date_dim dt  (cost=0.00..2068.55 rows=18 width=8)
+                                                  Filter: ((d_moy = 11) AND (d_year = 1998))
+                                ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=59)
+                                      Index Cond: (i_item_sk = store_sales.ss_item_sk)
+                                      Filter: (i_manager_id = 1)

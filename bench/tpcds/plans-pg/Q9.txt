@@ -1,0 +1,107 @@
+Seq Scan on reason  (cost=511731.58..511733.03 rows=1 width=160)
+  Filter: (r_reason_sk = 1)
+  InitPlan 1
+    ->  Finalize Aggregate  (cost=34113.24..34113.25 rows=1 width=8)
+          ->  Gather  (cost=34112.92..34113.23 rows=3 width=8)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33112.92..33112.93 rows=1 width=8)
+                      ->  Parallel Seq Scan on store_sales  (cost=0.00..32893.85 rows=87630 width=0)
+                            Filter: ((ss_quantity >= 1) AND (ss_quantity <= 20))
+  InitPlan 2
+    ->  Finalize Aggregate  (cost=34113.25..34113.26 rows=1 width=32)
+          ->  Gather  (cost=34112.92..34113.23 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33112.92..33112.93 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_1  (cost=0.00..32893.85 rows=87630 width=6)
+                            Filter: ((ss_quantity >= 1) AND (ss_quantity <= 20))
+  InitPlan 3
+    ->  Finalize Aggregate  (cost=34113.25..34113.26 rows=1 width=32)
+          ->  Gather  (cost=34112.92..34113.23 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33112.92..33112.93 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_2  (cost=0.00..32893.85 rows=87630 width=6)
+                            Filter: ((ss_quantity >= 1) AND (ss_quantity <= 20))
+  InitPlan 4
+    ->  Finalize Aggregate  (cost=34115.45..34115.46 rows=1 width=8)
+          ->  Gather  (cost=34115.13..34115.44 rows=3 width=8)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33115.13..33115.14 rows=1 width=8)
+                      ->  Parallel Seq Scan on store_sales store_sales_3  (cost=0.00..32893.85 rows=88513 width=0)
+                            Filter: ((ss_quantity >= 21) AND (ss_quantity <= 40))
+  InitPlan 5
+    ->  Finalize Aggregate  (cost=34115.46..34115.47 rows=1 width=32)
+          ->  Gather  (cost=34115.13..34115.44 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33115.13..33115.14 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_4  (cost=0.00..32893.85 rows=88513 width=6)
+                            Filter: ((ss_quantity >= 21) AND (ss_quantity <= 40))
+  InitPlan 6
+    ->  Finalize Aggregate  (cost=34115.46..34115.47 rows=1 width=32)
+          ->  Gather  (cost=34115.13..34115.44 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33115.13..33115.14 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_5  (cost=0.00..32893.85 rows=88513 width=6)
+                            Filter: ((ss_quantity >= 21) AND (ss_quantity <= 40))
+  InitPlan 7
+    ->  Finalize Aggregate  (cost=34115.83..34115.84 rows=1 width=8)
+          ->  Gather  (cost=34115.51..34115.82 rows=3 width=8)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33115.51..33115.52 rows=1 width=8)
+                      ->  Parallel Seq Scan on store_sales store_sales_6  (cost=0.00..32893.85 rows=88667 width=0)
+                            Filter: ((ss_quantity >= 41) AND (ss_quantity <= 60))
+  InitPlan 8
+    ->  Finalize Aggregate  (cost=34115.84..34115.85 rows=1 width=32)
+          ->  Gather  (cost=34115.52..34115.83 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33115.52..33115.53 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_7  (cost=0.00..32893.85 rows=88667 width=6)
+                            Filter: ((ss_quantity >= 41) AND (ss_quantity <= 60))
+  InitPlan 9
+    ->  Finalize Aggregate  (cost=34115.84..34115.85 rows=1 width=32)
+          ->  Gather  (cost=34115.52..34115.83 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33115.52..33115.53 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_8  (cost=0.00..32893.85 rows=88667 width=6)
+                            Filter: ((ss_quantity >= 41) AND (ss_quantity <= 60))
+  InitPlan 10
+    ->  Finalize Aggregate  (cost=34114.01..34114.02 rows=1 width=8)
+          ->  Gather  (cost=34113.70..34114.01 rows=3 width=8)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33113.70..33113.71 rows=1 width=8)
+                      ->  Parallel Seq Scan on store_sales store_sales_9  (cost=0.00..32893.85 rows=87940 width=0)
+                            Filter: ((ss_quantity >= 61) AND (ss_quantity <= 80))
+  InitPlan 11
+    ->  Finalize Aggregate  (cost=34114.03..34114.04 rows=1 width=32)
+          ->  Gather  (cost=34113.70..34114.01 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33113.70..33113.71 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_10  (cost=0.00..32893.85 rows=87940 width=6)
+                            Filter: ((ss_quantity >= 61) AND (ss_quantity <= 80))
+  InitPlan 12
+    ->  Finalize Aggregate  (cost=34114.03..34114.04 rows=1 width=32)
+          ->  Gather  (cost=34113.70..34114.01 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33113.70..33113.71 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_11  (cost=0.00..32893.85 rows=87940 width=6)
+                            Filter: ((ss_quantity >= 61) AND (ss_quantity <= 80))
+  InitPlan 13
+    ->  Finalize Aggregate  (cost=34118.58..34118.59 rows=1 width=8)
+          ->  Gather  (cost=34118.26..34118.57 rows=3 width=8)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33118.26..33118.27 rows=1 width=8)
+                      ->  Parallel Seq Scan on store_sales store_sales_12  (cost=0.00..32893.85 rows=89766 width=0)
+                            Filter: ((ss_quantity >= 81) AND (ss_quantity <= 100))
+  InitPlan 14
+    ->  Finalize Aggregate  (cost=34118.59..34118.60 rows=1 width=32)
+          ->  Gather  (cost=34118.26..34118.57 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33118.26..33118.27 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_13  (cost=0.00..32893.85 rows=89766 width=6)
+                            Filter: ((ss_quantity >= 81) AND (ss_quantity <= 100))
+  InitPlan 15
+    ->  Finalize Aggregate  (cost=34118.59..34118.60 rows=1 width=32)
+          ->  Gather  (cost=34118.26..34118.57 rows=3 width=32)
+                Workers Planned: 3
+                ->  Partial Aggregate  (cost=33118.26..33118.27 rows=1 width=32)
+                      ->  Parallel Seq Scan on store_sales store_sales_14  (cost=0.00..32893.85 rows=89766 width=6)
+                            Filter: ((ss_quantity >= 81) AND (ss_quantity <= 100))

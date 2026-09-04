@@ -1,0 +1,23 @@
+Limit  (cost=6629.46..6629.68 rows=1 width=125)
+  ->  GroupAggregate  (cost=6629.46..6629.68 rows=1 width=125)
+        Group Key: store.s_store_name, store.s_company_id, store.s_street_number, store.s_street_name, store.s_street_type, store.s_suite_number, store.s_city, store.s_county, store.s_state, store.s_zip
+        ->  Nested Loop  (cost=6629.46..6629.59 rows=1 width=93)
+              ->  Gather Merge  (cost=6629.16..6629.28 rows=1 width=93)
+                    Workers Planned: 1
+                    ->  Sort  (cost=5629.15..5629.16 rows=1 width=93)
+                          Sort Key: store.s_store_name, store.s_company_id, store.s_street_number, store.s_street_name, store.s_street_type, store.s_suite_number, store.s_city, store.s_county, store.s_state, store.s_zip
+                          ->  Nested Loop  (cost=2069.34..5629.14 rows=1 width=93)
+                                ->  Nested Loop  (cost=2069.20..5628.99 rows=1 width=12)
+                                      ->  Parallel Hash Join  (cost=2068.78..5582.38 rows=35 width=16)
+                                            Hash Cond: (store_returns.sr_returned_date_sk = d2.d_date_sk)
+                                            ->  Parallel Seq Scan on store_returns  (cost=0.00..3292.04 rows=84404 width=16)
+                                            ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=4)
+                                                  ->  Parallel Seq Scan on date_dim d2  (cost=0.00..2068.55 rows=18 width=4)
+                                                        Filter: ((d_year = 2001) AND (d_moy = 8))
+                                      ->  Index Scan using store_sales_pkey on store_sales  (cost=0.43..1.32 rows=1 width=20)
+                                            Index Cond: ((ss_item_sk = store_returns.sr_item_sk) AND (ss_ticket_number = store_returns.sr_ticket_number))
+                                            Filter: (store_returns.sr_customer_sk = ss_customer_sk)
+                                ->  Index Scan using store_pkey on store  (cost=0.14..0.15 rows=1 width=89)
+                                      Index Cond: (s_store_sk = store_sales.ss_store_sk)
+              ->  Index Only Scan using date_dim_pkey on date_dim d1  (cost=0.29..0.31 rows=1 width=4)
+                    Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)

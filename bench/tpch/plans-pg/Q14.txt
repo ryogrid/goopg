@@ -1,0 +1,9 @@
+=== Q14
+Aggregate  (cost=229465.19..229465.20 rows=1 width=32)
+  ->  Hash Join  (cost=8699.00..228221.84 rows=71048 width=33)
+        Hash Cond: (lineitem.l_partkey = part.p_partkey)
+        ->  Seq Scan on lineitem  (cost=0.00..219336.34 rows=71048 width=18)
+              Filter: ((l_shipdate >= '1995-09-01'::date) AND (l_shipdate < '1995-10-01 00:00:00'::timestamp without time zone))
+        ->  Hash  (cost=6199.00..6199.00 rows=200000 width=27)
+              ->  Seq Scan on part  (cost=0.00..6199.00 rows=200000 width=27)
+

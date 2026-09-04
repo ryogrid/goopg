@@ -1,0 +1,37 @@
+Limit  (cost=50704.73..50715.23 rows=100 width=136)
+  ->  Subquery Scan on y  (cost=50704.73..50934.29 rows=2186 width=136)
+        Filter: (y.web_cumulative > y.store_cumulative)
+        ->  WindowAgg  (cost=50704.73..50852.30 rows=6559 width=136)
+              Window: w1 AS (PARTITION BY (CASE WHEN (web_sales.ws_item_sk IS NOT NULL) THEN web_sales.ws_item_sk ELSE store_sales.ss_item_sk END) ORDER BY (CASE WHEN (date_dim.d_date IS NOT NULL) THEN date_dim.d_date ELSE date_dim_1.d_date END) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+              ->  Sort  (cost=50704.73..50721.12 rows=6559 width=72)
+                    Sort Key: (CASE WHEN (web_sales.ws_item_sk IS NOT NULL) THEN web_sales.ws_item_sk ELSE store_sales.ss_item_sk END), (CASE WHEN (date_dim.d_date IS NOT NULL) THEN date_dim.d_date ELSE date_dim_1.d_date END)
+                    ->  Merge Full Join  (cost=48955.25..50288.91 rows=6559 width=72)
+                          Merge Cond: ((web_sales.ws_item_sk = store_sales.ss_item_sk) AND (date_dim.d_date = date_dim_1.d_date))
+                          ->  WindowAgg  (cost=13976.24..14243.76 rows=1717 width=40)
+                                Window: w1 AS (PARTITION BY web_sales.ws_item_sk ORDER BY date_dim.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                                ->  GroupAggregate  (cost=13976.24..14213.71 rows=1717 width=40)
+                                      Group Key: web_sales.ws_item_sk, date_dim.d_date
+                                      ->  Gather Merge  (cost=13976.24..14179.37 rows=1717 width=14)
+                                            Workers Planned: 3
+                                            ->  Sort  (cost=12976.20..12977.58 rows=554 width=14)
+                                                  Sort Key: web_sales.ws_item_sk, date_dim.d_date
+                                                  ->  Parallel Hash Join  (cost=2071.11..12950.95 rows=554 width=14)
+                                                        Hash Cond: (web_sales.ws_sold_date_sk = date_dim.d_date_sk)
+                                                        ->  Parallel Seq Scan on web_sales  (cost=0.00..10575.46 rows=115946 width=14)
+                                                        ->  Parallel Hash  (cost=2068.55..2068.55 rows=205 width=8)
+                                                              ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=205 width=8)
+                                                                    Filter: ((d_month_seq >= 1212) AND (d_month_seq <= 1223))
+                          ->  WindowAgg  (cost=34979.02..36000.95 rows=6559 width=40)
+                                Window: w1 AS (PARTITION BY store_sales.ss_item_sk ORDER BY date_dim_1.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                                ->  GroupAggregate  (cost=34979.02..35886.17 rows=6559 width=40)
+                                      Group Key: store_sales.ss_item_sk, date_dim_1.d_date
+                                      ->  Gather Merge  (cost=34979.02..35754.99 rows=6559 width=14)
+                                            Workers Planned: 3
+                                            ->  Sort  (cost=33978.98..33984.27 rows=2116 width=14)
+                                                  Sort Key: store_sales.ss_item_sk, date_dim_1.d_date
+                                                  ->  Parallel Hash Join  (cost=2071.11..33862.10 rows=2116 width=14)
+                                                        Hash Cond: (store_sales.ss_sold_date_sk = date_dim_1.d_date_sk)
+                                                        ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=14)
+                                                        ->  Parallel Hash  (cost=2068.55..2068.55 rows=205 width=8)
+                                                              ->  Parallel Seq Scan on date_dim date_dim_1  (cost=0.00..2068.55 rows=205 width=8)
+                                                                    Filter: ((d_month_seq >= 1212) AND (d_month_seq <= 1223))

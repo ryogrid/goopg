@@ -1,0 +1,27 @@
+Limit  (cost=24841.19..24941.72 rows=72 width=115)
+  ->  Finalize GroupAggregate  (cost=24841.19..24941.72 rows=72 width=115)
+        Group Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, call_center.cc_name
+        ->  Gather Merge  (cost=24841.19..24936.36 rows=223 width=115)
+              Workers Planned: 3
+              ->  Partial GroupAggregate  (cost=23841.15..23910.12 rows=72 width=115)
+                    Group Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, call_center.cc_name
+                    ->  Sort  (cost=23841.15..23843.88 rows=1089 width=83)
+                          Sort Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, call_center.cc_name
+                          ->  Hash Join  (cost=2074.81..23786.22 rows=1089 width=83)
+                                Hash Cond: (catalog_sales.cs_call_center_sk = call_center.cc_call_center_sk)
+                                ->  Hash Join  (cost=2073.68..23777.48 rows=1094 width=61)
+                                      Hash Cond: (catalog_sales.cs_warehouse_sk = warehouse.w_warehouse_sk)
+                                      ->  Hash Join  (cost=2072.56..23771.04 rows=1100 width=47)
+                                            Hash Cond: (catalog_sales.cs_ship_mode_sk = ship_mode.sm_ship_mode_sk)
+                                            ->  Parallel Hash Join  (cost=2071.11..23766.08 rows=1105 width=20)
+                                                  Hash Cond: (catalog_sales.cs_ship_date_sk = date_dim.d_date_sk)
+                                                  ->  Parallel Seq Scan on catalog_sales  (cost=0.00..21084.70 rows=232470 width=20)
+                                                  ->  Parallel Hash  (cost=2068.55..2068.55 rows=205 width=4)
+                                                        ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=205 width=4)
+                                                              Filter: ((d_month_seq >= 1194) AND (d_month_seq <= 1205))
+                                            ->  Hash  (cost=1.20..1.20 rows=20 width=35)
+                                                  ->  Seq Scan on ship_mode  (cost=0.00..1.20 rows=20 width=35)
+                                      ->  Hash  (cost=1.05..1.05 rows=5 width=22)
+                                            ->  Seq Scan on warehouse  (cost=0.00..1.05 rows=5 width=22)
+                                ->  Hash  (cost=1.06..1.06 rows=6 width=16)
+                                      ->  Seq Scan on call_center  (cost=0.00..1.06 rows=6 width=16)

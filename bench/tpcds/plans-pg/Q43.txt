@@ -1,0 +1,23 @@
+Limit  (cost=34891.88..34974.38 rows=8 width=246)
+  ->  Incremental Sort  (cost=34891.88..34974.38 rows=8 width=246)
+        Sort Key: store.s_store_name, store.s_store_id, (sum(CASE WHEN (date_dim.d_day_name = 'Sunday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END)), (sum(CASE WHEN (date_dim.d_day_name = 'Monday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END)), (sum(CASE WHEN (date_dim.d_day_name = 'Tuesday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END)), (sum(CASE WHEN (date_dim.d_day_name = 'Wednesday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END)), (sum(CASE WHEN (date_dim.d_day_name = 'Thursday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END)), (sum(CASE WHEN (date_dim.d_day_name = 'Friday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END)), (sum(CASE WHEN (date_dim.d_day_name = 'Saturday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END))
+        Presorted Key: store.s_store_name, store.s_store_id
+        ->  Finalize GroupAggregate  (cost=34880.13..34974.02 rows=8 width=246)
+              Group Key: store.s_store_name, store.s_store_id
+              ->  Gather Merge  (cost=34880.13..34972.80 rows=25 width=246)
+                    Workers Planned: 3
+                    ->  Partial GroupAggregate  (cost=33880.09..33969.82 rows=8 width=246)
+                          Group Key: store.s_store_name, store.s_store_id
+                          ->  Sort  (cost=33880.09..33885.36 rows=2106 width=38)
+                                Sort Key: store.s_store_name, store.s_store_id
+                                ->  Hash Join  (cost=1965.10..33763.84 rows=2106 width=38)
+                                      Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                      ->  Parallel Hash Join  (cost=1963.80..33754.79 rows=2207 width=20)
+                                            Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                            ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=14)
+                                            ->  Parallel Hash  (cost=1961.12..1961.12 rows=214 width=14)
+                                                  ->  Parallel Seq Scan on date_dim  (cost=0.00..1961.12 rows=214 width=14)
+                                                        Filter: (d_year = 2000)
+                                      ->  Hash  (cost=1.15..1.15 rows=12 width=26)
+                                            ->  Seq Scan on store  (cost=0.00..1.15 rows=12 width=26)
+                                                  Filter: (s_gmt_offset = '-5'::numeric)

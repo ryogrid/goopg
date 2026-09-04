@@ -1,0 +1,28 @@
+Limit  (cost=24824.00..24829.41 rows=33 width=84)
+  ->  Finalize GroupAggregate  (cost=24824.00..24829.41 rows=33 width=84)
+        Group Key: warehouse.w_state, item.i_item_id
+        ->  Gather Merge  (cost=24824.00..24828.40 rows=34 width=84)
+              Workers Planned: 3
+              ->  Partial GroupAggregate  (cost=23823.96..23824.37 rows=11 width=84)
+                    Group Key: warehouse.w_state, item.i_item_id
+                    ->  Sort  (cost=23823.96..23823.98 rows=11 width=36)
+                          Sort Key: warehouse.w_state, item.i_item_id
+                          ->  Nested Loop  (cost=2069.67..23823.76 rows=11 width=36)
+                                ->  Nested Loop Left Join  (cost=2069.53..23822.69 rows=11 width=37)
+                                      ->  Nested Loop  (cost=2069.24..23819.15 rows=11 width=39)
+                                            ->  Parallel Hash Join  (cost=2068.95..23763.92 rows=174 width=22)
+                                                  Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+                                                  ->  Parallel Seq Scan on catalog_sales  (cost=0.00..21084.70 rows=232470 width=22)
+                                                  ->  Parallel Hash  (cost=2068.55..2068.55 rows=32 width=8)
+                                                        ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=32 width=8)
+                                                              Filter: ((d_date >= '2001-04-02 00:00:00'::timestamp without time zone) AND (d_date <= '2001-06-01 00:00:00'::timestamp without time zone))
+                                            ->  Index Scan using item_pkey on item  (cost=0.29..0.32 rows=1 width=21)
+                                                  Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                                                  Filter: ((i_current_price >= 0.99) AND (i_current_price <= 1.49))
+                                      ->  Index Scan using catalog_returns_pkey on catalog_returns  (cost=0.29..0.32 rows=1 width=14)
+                                            Index Cond: ((cr_item_sk = catalog_sales.cs_item_sk) AND (cr_order_number = catalog_sales.cs_order_number))
+                                ->  Memoize  (cost=0.14..0.16 rows=1 width=7)
+                                      Cache Key: catalog_sales.cs_warehouse_sk
+                                      Cache Mode: logical
+                                      ->  Index Scan using warehouse_pkey on warehouse  (cost=0.13..0.15 rows=1 width=7)
+                                            Index Cond: (w_warehouse_sk = catalog_sales.cs_warehouse_sk)

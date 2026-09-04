@@ -1,0 +1,30 @@
+=== Q5
+Sort  (cost=212851.65..212851.72 rows=25 width=58)
+  Sort Key: (sum((lineitem.l_extendedprice * ('1'::numeric - lineitem.l_discount)))) DESC
+  ->  GroupAggregate  (cost=212759.56..212851.07 rows=25 width=58)
+        Group Key: nation.n_name
+        ->  Sort  (cost=212759.56..212777.80 rows=7296 width=38)
+              Sort Key: nation.n_name
+              ->  Hash Join  (cost=568.04..212291.42 rows=7296 width=38)
+                    Hash Cond: ((lineitem.l_suppkey = supplier.s_suppkey) AND (customer.c_nationkey = supplier.s_nationkey))
+                    ->  Nested Loop  (cost=93.04..210858.62 rows=182435 width=51)
+                          ->  Nested Loop  (cost=92.61..53420.37 rows=45614 width=40)
+                                ->  Nested Loop  (cost=92.18..3647.37 rows=30000 width=40)
+                                      ->  Nested Loop  (cost=0.14..13.95 rows=5 width=30)
+                                            Join Filter: (nation.n_regionkey = region.r_regionkey)
+                                            ->  Index Scan using nation_pk on nation  (cost=0.14..12.51 rows=25 width=34)
+                                            ->  Materialize  (cost=0.00..1.07 rows=1 width=4)
+                                                  ->  Seq Scan on region  (cost=0.00..1.06 rows=1 width=4)
+                                                        Filter: (r_name = 'ASIA'::bpchar)
+                                      ->  Bitmap Heap Scan on customer  (cost=92.04..666.68 rows=6000 width=10)
+                                            Recheck Cond: (c_nationkey = nation.n_nationkey)
+                                            ->  Bitmap Index Scan on customer_nation_fkidx  (cost=0.00..90.54 rows=6000 width=0)
+                                                  Index Cond: (c_nationkey = nation.n_nationkey)
+                                ->  Index Scan using order_customer_fkidx on orders  (cost=0.43..1.64 rows=2 width=12)
+                                      Index Cond: (o_custkey = customer.c_custkey)
+                                      Filter: ((o_orderdate >= '1994-01-01'::date) AND (o_orderdate < '1995-01-01 00:00:00'::timestamp without time zone))
+                          ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.43..3.28 rows=17 width=23)
+                                Index Cond: (l_orderkey = orders.o_orderkey)
+                    ->  Hash  (cost=325.00..325.00 rows=10000 width=9)
+                          ->  Seq Scan on supplier  (cost=0.00..325.00 rows=10000 width=9)
+

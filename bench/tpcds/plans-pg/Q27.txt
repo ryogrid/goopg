@@ -1,0 +1,29 @@
+Limit  (cost=35908.14..35908.39 rows=100 width=152)
+  ->  Sort  (cost=35908.14..35908.59 rows=181 width=152)
+        Sort Key: item.i_item_id, store.s_state
+        ->  GroupAggregate  (cost=35885.28..35901.35 rows=181 width=152)
+              Group Key: item.i_item_id, store.s_state
+              Group Key: item.i_item_id
+              Group Key: ()
+              ->  Gather Merge  (cost=35885.28..35895.93 rows=90 width=39)
+                    Workers Planned: 3
+                    ->  Sort  (cost=34885.24..34885.31 rows=29 width=39)
+                          Sort Key: item.i_item_id, store.s_state
+                          ->  Nested Loop  (cost=1965.88..34884.53 rows=29 width=39)
+                                ->  Nested Loop  (cost=1965.59..34875.58 rows=29 width=26)
+                                      ->  Hash Join  (cost=1965.16..33763.90 rows=2106 width=30)
+                                            Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                            ->  Parallel Hash Join  (cost=1963.80..33754.79 rows=2207 width=31)
+                                                  Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                  ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=35)
+                                                  ->  Parallel Hash  (cost=1961.12..1961.12 rows=214 width=4)
+                                                        ->  Parallel Seq Scan on date_dim  (cost=0.00..1961.12 rows=214 width=4)
+                                                              Filter: (d_year = 1999)
+                                            ->  Hash  (cost=1.21..1.21 rows=12 width=7)
+                                                  ->  Seq Scan on store  (cost=0.00..1.21 rows=12 width=7)
+                                                        Filter: (s_state = ANY ('{TN,TN,TN,TN,TN,TN}'::bpchar[]))
+                                      ->  Index Scan using customer_demographics_pkey on customer_demographics  (cost=0.43..0.53 rows=1 width=4)
+                                            Index Cond: (cd_demo_sk = store_sales.ss_cdemo_sk)
+                                            Filter: ((cd_gender = 'M'::bpchar) AND (cd_marital_status = 'W'::bpchar) AND (cd_education_status = 'Secondary'::bpchar))
+                                ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=21)
+                                      Index Cond: (i_item_sk = store_sales.ss_item_sk)

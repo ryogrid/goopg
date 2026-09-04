@@ -1,0 +1,20 @@
+Limit  (cost=4407.79..4409.46 rows=2 width=125)
+  ->  Group  (cost=4407.79..4409.46 rows=2 width=125)
+        Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+        ->  Nested Loop  (cost=4407.79..4409.13 rows=44 width=125)
+              ->  Gather Merge  (cost=4407.37..4407.48 rows=1 width=133)
+                    Workers Planned: 1
+                    ->  Sort  (cost=3407.36..3407.36 rows=1 width=133)
+                          Sort Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                          ->  Nested Loop  (cost=0.72..3407.35 rows=1 width=133)
+                                ->  Nested Loop  (cost=0.43..3369.75 rows=118 width=137)
+                                      ->  Parallel Seq Scan on item  (cost=0.00..1495.76 rows=1 width=129)
+                                            Filter: ((i_current_price >= '29'::numeric) AND (i_current_price <= '59'::numeric) AND (i_manufact_id = ANY ('{705,742,777,944}'::integer[])))
+                                      ->  Index Scan using inventory_pkey on inventory  (cost=0.43..1871.91 rows=207 width=8)
+                                            Index Cond: (inv_item_sk = item.i_item_sk)
+                                            Filter: ((inv_quantity_on_hand >= 100) AND (inv_quantity_on_hand <= 500))
+                                ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.32 rows=1 width=4)
+                                      Index Cond: (d_date_sk = inventory.inv_date_sk)
+                                      Filter: ((d_date >= '2002-03-29'::date) AND (d_date <= '2002-05-28 00:00:00'::timestamp without time zone))
+              ->  Index Only Scan using catalog_sales_pkey on catalog_sales  (cost=0.42..1.20 rows=44 width=4)
+                    Index Cond: (cs_item_sk = inventory.inv_item_sk)

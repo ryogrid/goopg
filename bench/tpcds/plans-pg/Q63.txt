@@ -1,0 +1,29 @@
+Limit  (cost=8732.24..8732.77 rows=3 width=68)
+  ->  Incremental Sort  (cost=8732.24..8732.77 rows=3 width=68)
+        Sort Key: tmp1.i_manager_id, tmp1.avg_monthly_sales, tmp1.sum_sales
+        Presorted Key: tmp1.i_manager_id
+        ->  Subquery Scan on tmp1  (cost=8732.03..8732.63 rows=3 width=68)
+              Filter: (CASE WHEN (tmp1.avg_monthly_sales > '0'::numeric) THEN (abs((tmp1.sum_sales - tmp1.avg_monthly_sales)) / tmp1.avg_monthly_sales) ELSE NULL::numeric END > 0.1)
+              ->  WindowAgg  (cost=8732.03..8732.41 rows=10 width=72)
+                    Window: w1 AS (PARTITION BY item.i_manager_id)
+                    ->  GroupAggregate  (cost=8732.03..8732.26 rows=10 width=40)
+                          Group Key: item.i_manager_id, date_dim.d_moy
+                          ->  Sort  (cost=8732.03..8732.06 rows=10 width=14)
+                                Sort Key: item.i_manager_id, date_dim.d_moy
+                                ->  Gather  (cost=1006.70..8731.86 rows=10 width=14)
+                                      Workers Planned: 1
+                                      ->  Nested Loop  (cost=6.70..7730.86 rows=6 width=14)
+                                            ->  Hash Join  (cost=6.38..7275.79 rows=1302 width=14)
+                                                  Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                                  ->  Nested Loop  (cost=5.11..7269.74 rows=1364 width=18)
+                                                        ->  Parallel Seq Scan on item  (cost=0.00..1681.06 rows=17 width=8)
+                                                              Filter: (((i_category = ANY ('{Books,Children,Electronics}'::bpchar[])) AND (i_class = ANY ('{personal,portable,reference,self-help}'::bpchar[])) AND (i_brand = ANY ('{"scholaramalgamalg #14","scholaramalgamalg #7","exportiunivamalg #9","scholaramalgamalg #9"}'::bpchar[]))) OR ((i_category = ANY ('{Women,Music,Men}'::bpchar[])) AND (i_class = ANY ('{accessories,classical,fragrances,pants}'::bpchar[])) AND (i_brand = ANY ('{"amalgimporto #1","edu packscholar #1","exportiimporto #1","importoamalg #1"}'::bpchar[]))))
+                                                        ->  Bitmap Heap Scan on store_sales  (cost=5.11..327.87 rows=88 width=18)
+                                                              Recheck Cond: (item.i_item_sk = ss_item_sk)
+                                                              ->  Bitmap Index Scan on store_sales_pkey  (cost=0.00..5.09 rows=88 width=0)
+                                                                    Index Cond: (ss_item_sk = item.i_item_sk)
+                                                  ->  Hash  (cost=1.12..1.12 rows=12 width=4)
+                                                        ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=4)
+                                            ->  Index Scan using date_dim_pkey on date_dim  (cost=0.32..0.35 rows=1 width=8)
+                                                  Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                                  Filter: (d_month_seq = ANY ('{1222,1223,1224,1225,1226,1227,1228,1229,1230,1231,1232,1233}'::integer[]))

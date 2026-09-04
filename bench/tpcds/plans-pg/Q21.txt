@@ -1,0 +1,22 @@
+Limit  (cost=48147.27..48185.64 rows=26 width=51)
+  ->  GroupAggregate  (cost=48147.27..48185.64 rows=26 width=51)
+        Group Key: warehouse.w_warehouse_name, item.i_item_id
+        Filter: (((CASE WHEN (sum(CASE WHEN (date_dim.d_date < '1999-06-22'::date) THEN inventory.inv_quantity_on_hand ELSE 0 END) > 0) THEN (sum(CASE WHEN (date_dim.d_date >= '1999-06-22'::date) THEN inventory.inv_quantity_on_hand ELSE 0 END) / sum(CASE WHEN (date_dim.d_date < '1999-06-22'::date) THEN inventory.inv_quantity_on_hand ELSE 0 END)) ELSE NULL::bigint END)::numeric >= 0.66666666666666666667) AND ((CASE WHEN (sum(CASE WHEN (date_dim.d_date < '1999-06-22'::date) THEN inventory.inv_quantity_on_hand ELSE 0 END) > 0) THEN (sum(CASE WHEN (date_dim.d_date >= '1999-06-22'::date) THEN inventory.inv_quantity_on_hand ELSE 0 END) / sum(CASE WHEN (date_dim.d_date < '1999-06-22'::date) THEN inventory.inv_quantity_on_hand ELSE 0 END)) ELSE NULL::bigint END)::numeric <= 1.5000000000000000))
+        ->  Gather Merge  (cost=48147.27..48175.07 rows=235 width=43)
+              Workers Planned: 3
+              ->  Sort  (cost=47147.23..47147.42 rows=76 width=43)
+                    Sort Key: warehouse.w_warehouse_name, item.i_item_id
+                    ->  Hash Join  (cost=2070.39..47144.85 rows=76 width=43)
+                          Hash Cond: (inventory.inv_warehouse_sk = warehouse.w_warehouse_sk)
+                          ->  Nested Loop  (cost=2069.28..47143.37 rows=76 width=29)
+                                ->  Parallel Hash Join  (cost=2068.99..46755.08 rows=1248 width=16)
+                                      Hash Cond: (inventory.inv_date_sk = date_dim.d_date_sk)
+                                      ->  Parallel Seq Scan on inventory  (cost=0.00..40697.55 rows=1519355 width=16)
+                                      ->  Parallel Hash  (cost=2068.55..2068.55 rows=35 width=8)
+                                            ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=35 width=8)
+                                                  Filter: ((d_date >= '1999-05-23 00:00:00'::timestamp without time zone) AND (d_date <= '1999-07-22 00:00:00'::timestamp without time zone))
+                                ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=21)
+                                      Index Cond: (i_item_sk = inventory.inv_item_sk)
+                                      Filter: ((i_current_price >= 0.99) AND (i_current_price <= 1.49))
+                          ->  Hash  (cost=1.05..1.05 rows=5 width=22)
+                                ->  Seq Scan on warehouse  (cost=0.00..1.05 rows=5 width=22)

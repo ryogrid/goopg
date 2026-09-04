@@ -1,0 +1,23 @@
+Limit  (cost=56352.11..56352.36 rows=100 width=236)
+  ->  Sort  (cost=56352.11..56531.75 rows=71857 width=236)
+        Sort Key: (avg(inventory.inv_quantity_on_hand)), item.i_product_name, item.i_brand, item.i_class, item.i_category
+        ->  GroupAggregate  (cost=49764.03..53605.78 rows=71857 width=236)
+              Group Key: item.i_product_name, item.i_brand, item.i_class, item.i_category
+              Group Key: item.i_product_name, item.i_brand, item.i_class
+              Group Key: item.i_product_name, item.i_brand
+              Group Key: item.i_product_name
+              Group Key: ()
+              ->  Gather Merge  (cost=49764.03..52426.28 rows=22503 width=208)
+                    Workers Planned: 3
+                    ->  Sort  (cost=48763.99..48782.14 rows=7259 width=208)
+                          Sort Key: item.i_product_name, item.i_brand, item.i_class, item.i_category
+                          ->  Parallel Hash Join  (cost=3593.34..48298.49 rows=7259 width=208)
+                                Hash Cond: (inventory.inv_item_sk = item.i_item_sk)
+                                ->  Parallel Hash Join  (cost=2071.11..46757.20 rows=7259 width=8)
+                                      Hash Cond: (inventory.inv_date_sk = date_dim.d_date_sk)
+                                      ->  Parallel Seq Scan on inventory  (cost=0.00..40697.55 rows=1519355 width=12)
+                                      ->  Parallel Hash  (cost=2068.55..2068.55 rows=205 width=4)
+                                            ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=205 width=4)
+                                                  Filter: ((d_month_seq >= 1200) AND (d_month_seq <= 1211))
+                                ->  Parallel Hash  (cost=1389.88..1389.88 rows=10588 width=208)
+                                      ->  Parallel Seq Scan on item  (cost=0.00..1389.88 rows=10588 width=208)

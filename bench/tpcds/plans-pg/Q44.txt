@@ -1,0 +1,65 @@
+Limit  (cost=145235.27..145251.19 rows=100 width=110)
+  ->  Nested Loop  (cost=145235.27..168970.98 rows=149058 width=110)
+        ->  Nested Loop  (cost=145234.97..158234.41 rows=149058 width=63)
+              ->  Merge Join  (cost=145234.67..147497.84 rows=149058 width=16)
+                    Merge Cond: (v11.rnk = v21.rnk)
+                    ->  Sort  (cost=72617.34..72630.99 rows=5460 width=12)
+                          Sort Key: v11.rnk
+                          ->  Subquery Scan on v11  (cost=72128.28..72278.42 rows=5460 width=12)
+                                ->  WindowAgg  (cost=72128.28..72223.82 rows=5460 width=44)
+                                      Window: w1 AS (ORDER BY v1.rank_col ROWS UNBOUNDED PRECEDING)
+                                      Run Condition: (rank() OVER w1 < 11)
+                                      ->  Sort  (cost=72128.27..72141.92 rows=5460 width=36)
+                                            Sort Key: v1.rank_col
+                                            ->  Subquery Scan on v1  (cost=71502.71..71789.34 rows=5460 width=36)
+                                                  ->  Finalize HashAggregate  (cost=71502.71..71789.34 rows=5460 width=36)
+                                                        Group Key: ss1.ss_item_sk
+                                                        Filter: (avg(ss1.ss_net_profit) > (0.9 * (InitPlan 1).col1))
+                                                        InitPlan 1
+                                                          ->  Finalize GroupAggregate  (cost=1000.00..32741.24 rows=1 width=36)
+                                                                ->  Gather  (cost=1000.00..32741.21 rows=3 width=36)
+                                                                      Workers Planned: 3
+                                                                      ->  Partial GroupAggregate  (cost=0.00..31740.91 rows=1 width=36)
+                                                                            ->  Parallel Seq Scan on store_sales  (cost=0.00..31732.87 rows=3212 width=10)
+                                                                                  Filter: ((ss_hdemo_sk IS NULL) AND (ss_store_sk = 4))
+                                                        ->  Gather  (cost=33098.42..38380.66 rows=50775 width=36)
+                                                              Workers Planned: 3
+                                                              ->  Partial HashAggregate  (cost=32098.42..32303.16 rows=16379 width=36)
+                                                                    Group Key: ss1.ss_item_sk
+                                                                    ->  Parallel Seq Scan on store_sales ss1  (cost=0.00..31732.87 rows=73110 width=10)
+                                                                          Filter: (ss_store_sk = 4)
+                    ->  Sort  (cost=72617.34..72630.99 rows=5460 width=12)
+                          Sort Key: v21.rnk
+                          ->  Subquery Scan on v21  (cost=72128.28..72278.42 rows=5460 width=12)
+                                ->  WindowAgg  (cost=72128.28..72223.82 rows=5460 width=44)
+                                      Window: w1 AS (ORDER BY v2.rank_col ROWS UNBOUNDED PRECEDING)
+                                      Run Condition: (rank() OVER w1 < 11)
+                                      ->  Sort  (cost=72128.27..72141.92 rows=5460 width=36)
+                                            Sort Key: v2.rank_col DESC
+                                            ->  Subquery Scan on v2  (cost=71502.71..71789.34 rows=5460 width=36)
+                                                  ->  Finalize HashAggregate  (cost=71502.71..71789.34 rows=5460 width=36)
+                                                        Group Key: ss1_1.ss_item_sk
+                                                        Filter: (avg(ss1_1.ss_net_profit) > (0.9 * (InitPlan 2).col1))
+                                                        InitPlan 2
+                                                          ->  Finalize GroupAggregate  (cost=1000.00..32741.24 rows=1 width=36)
+                                                                ->  Gather  (cost=1000.00..32741.21 rows=3 width=36)
+                                                                      Workers Planned: 3
+                                                                      ->  Partial GroupAggregate  (cost=0.00..31740.91 rows=1 width=36)
+                                                                            ->  Parallel Seq Scan on store_sales store_sales_1  (cost=0.00..31732.87 rows=3212 width=10)
+                                                                                  Filter: ((ss_hdemo_sk IS NULL) AND (ss_store_sk = 4))
+                                                        ->  Gather  (cost=33098.42..38380.66 rows=50775 width=36)
+                                                              Workers Planned: 3
+                                                              ->  Partial HashAggregate  (cost=32098.42..32303.16 rows=16379 width=36)
+                                                                    Group Key: ss1_1.ss_item_sk
+                                                                    ->  Parallel Seq Scan on store_sales ss1_1  (cost=0.00..31732.87 rows=73110 width=10)
+                                                                          Filter: (ss_store_sk = 4)
+              ->  Memoize  (cost=0.30..1.29 rows=1 width=55)
+                    Cache Key: v11.item_sk
+                    Cache Mode: logical
+                    ->  Index Scan using item_pkey on item i1  (cost=0.29..1.28 rows=1 width=55)
+                          Index Cond: (i_item_sk = v11.item_sk)
+        ->  Memoize  (cost=0.30..1.29 rows=1 width=55)
+              Cache Key: v21.item_sk
+              Cache Mode: logical
+              ->  Index Scan using item_pkey on item i2  (cost=0.29..1.28 rows=1 width=55)
+                    Index Cond: (i_item_sk = v21.item_sk)

@@ -1,0 +1,36 @@
+Limit  (cost=850384.72..850384.76 rows=17 width=11)
+  InitPlan 1
+    ->  Unique  (cost=2520.50..2520.66 rows=31 width=4)
+          ->  Sort  (cost=2520.50..2520.58 rows=31 width=4)
+                Sort Key: date_dim.d_month_seq
+                ->  Seq Scan on date_dim  (cost=0.00..2519.73 rows=31 width=4)
+                      Filter: ((d_year = 2002) AND (d_moy = 3))
+  ->  Sort  (cost=847864.06..847864.10 rows=17 width=11)
+        Sort Key: (count(*)), a.ca_state
+        ->  GroupAggregate  (cost=34879.13..847863.71 rows=17 width=11)
+              Group Key: a.ca_state
+              Filter: (count(*) >= 10)
+              ->  Nested Loop  (cost=34879.13..847862.18 rows=179 width=3)
+                    ->  Gather Merge  (cost=34878.84..34942.37 rows=537 width=7)
+                          Workers Planned: 3
+                          ->  Sort  (cost=33878.80..33879.23 rows=173 width=7)
+                                Sort Key: a.ca_state
+                                ->  Nested Loop  (cost=1961.93..33872.37 rows=173 width=7)
+                                      ->  Nested Loop  (cost=1961.64..33810.35 rows=173 width=8)
+                                            ->  Parallel Hash Join  (cost=1961.35..33752.34 rows=182 width=8)
+                                                  Hash Cond: (s.ss_sold_date_sk = d.d_date_sk)
+                                                  ->  Parallel Seq Scan on store_sales s  (cost=0.00..30571.90 rows=464390 width=12)
+                                                  ->  Parallel Hash  (cost=1961.12..1961.12 rows=18 width=4)
+                                                        ->  Parallel Seq Scan on date_dim d  (cost=0.00..1961.12 rows=18 width=4)
+                                                              Filter: (d_month_seq = (InitPlan 1).col1)
+                                            ->  Index Scan using customer_pkey on customer c  (cost=0.29..0.32 rows=1 width=8)
+                                                  Index Cond: (c_customer_sk = s.ss_customer_sk)
+                                      ->  Index Scan using customer_address_pkey on customer_address a  (cost=0.29..0.36 rows=1 width=7)
+                                            Index Cond: (ca_address_sk = c.c_current_addr_sk)
+                    ->  Index Scan using item_pkey on item i  (cost=0.29..1513.82 rows=1 width=4)
+                          Index Cond: (i_item_sk = s.ss_item_sk)
+                          Filter: (i_current_price > (1.2 * (SubPlan 2)))
+                          SubPlan 2
+                            ->  Aggregate  (cost=1513.49..1513.50 rows=1 width=32)
+                                  ->  Seq Scan on item j  (cost=0.00..1509.00 rows=1796 width=6)
+                                        Filter: (i_category = i.i_category)

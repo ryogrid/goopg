@@ -1,0 +1,22 @@
+Sort  (cost=34958.66..34959.08 rows=167 width=291)
+  Sort Key: item.i_category, item.i_class, item.i_item_id, item.i_item_desc, ((((sum(store_sales.ss_ext_sales_price)) * '100'::numeric) / sum((sum(store_sales.ss_ext_sales_price))) OVER w1))
+  ->  WindowAgg  (cost=34948.76..34952.50 rows=167 width=291)
+        Window: w1 AS (PARTITION BY item.i_class)
+        ->  Sort  (cost=34948.74..34949.16 rows=167 width=259)
+              Sort Key: item.i_class
+              ->  GroupAggregate  (cost=34918.22..34942.57 rows=167 width=259)
+                    Group Key: item.i_category, item.i_class, item.i_item_id, item.i_item_desc, item.i_current_price
+                    ->  Gather Merge  (cost=34918.22..34937.98 rows=167 width=233)
+                          Workers Planned: 3
+                          ->  Sort  (cost=33918.18..33918.32 rows=54 width=233)
+                                Sort Key: item.i_category, item.i_class, item.i_item_id, item.i_item_desc, item.i_current_price
+                                ->  Nested Loop  (cost=2069.06..33916.63 rows=54 width=233)
+                                      ->  Parallel Hash Join  (cost=2068.78..33859.76 rows=182 width=10)
+                                            Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                            ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=14)
+                                            ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=4)
+                                                  ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=18 width=4)
+                                                        Filter: ((d_date >= '1999-02-05'::date) AND (d_date <= '1999-03-07 00:00:00'::timestamp without time zone))
+                                      ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=231)
+                                            Index Cond: (i_item_sk = store_sales.ss_item_sk)
+                                            Filter: (i_category = ANY ('{Men,Sports,Jewelry}'::bpchar[]))
