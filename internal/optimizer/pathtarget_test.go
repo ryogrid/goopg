@@ -876,7 +876,9 @@ func TestDeriveJoinKeepsWitnessShape(t *testing.T) {
 		[]string{"s_suppkey", "s_name"}) {
 		t.Errorf("supp keep = %v, want [s_suppkey s_name]", got)
 	}
-	// Outer sides are never narrowed: no stamps on the outer rels.
+	// Hash outer sides are never narrowed: no stamps on the outer rels.
+	// (Merge outer sides DO derive keeps — B-01a, pinned in
+	// TestDeriveJoinKeepsMergeStampsBothSides; this tree is hash-only.)
 	for _, name := range []string{"W", "R", "orders", "line", "ps"} {
 		if rels[name].JoinKeepKnown {
 			t.Errorf("outer rel %s carries a keep; only build sides derive one", name)
@@ -935,13 +937,17 @@ func TestDeriveJoinKeepsDeclines(t *testing.T) {
 		}
 	})
 	t.Run("merge build side", func(t *testing.T) {
+		// B-01a: a WELL-FORMED merge level stamps both sides (see
+		// TestDeriveJoinKeepsMergeStampsBothSides). What still declines
+		// is a MALFORMED merge — here a single-child node no producer
+		// emits — which must stamp nothing rather than mis-derive.
 		root, rels := mkTree(t, func(w *Path, j2 *Path) {
 			m := &Path{Kind: PathMergeJoin, Rel: j2.Rel, Children: []*Path{j2}, HashKeys: w.HashKeys}
 			w.Children[1] = m
 		})
 		deriveJoinKeeps(root)
 		if rels["J2"].JoinKeepKnown {
-			t.Error("merge-rooted build side stamped; merge inputs are out of scope (F2)")
+			t.Error("malformed single-child merge stamped; want fallback")
 		}
 	})
 	t.Run("ctid qual vetoes", func(t *testing.T) {
@@ -1308,8 +1314,9 @@ func slice3HasSearchedTree(n Node) bool {
 
 // TestJoinSubtreeNarrowablePrebuiltBoundary pins the second-cut gate change
 // and its carry-overs: a prebuilt leaf is a narrowable boundary, a hash tree
-// over prebuilt leaves derives, and merge/nested-loop subtrees still decline
-// (F2 hash-only, F3 fixup inventory — untouched).
+// over prebuilt leaves derives, and nested-loop subtrees still decline (F3
+// fixup inventory — untouched). B-01a admits merge subtrees (sort-key
+// preservation proved in narrowMergeInput) and transparent sorts.
 func TestJoinSubtreeNarrowablePrebuiltBoundary(t *testing.T) {
 	pre := &Path{Kind: PathPrebuilt}
 	seq := &Path{Kind: PathSeqScan}
@@ -1323,8 +1330,16 @@ func TestJoinSubtreeNarrowablePrebuiltBoundary(t *testing.T) {
 	if !joinSubtreeNarrowable(hash) {
 		t.Error("hash over prebuilt/scan: got false, want true")
 	}
-	if joinSubtreeNarrowable(&Path{Kind: PathMergeJoin, Children: []*Path{pre, seq}}) {
-		t.Error("merge subtree: got true, want false (F2: merge inputs out of scope)")
+	if !joinSubtreeNarrowable(&Path{Kind: PathMergeJoin, Children: []*Path{pre, seq}}) {
+		t.Error("merge over prebuilt/scan: got false, want true (B-01a admits merge inputs)")
+	}
+	if !joinSubtreeNarrowable(&Path{Kind: PathSort, Children: []*Path{seq}}) {
+		t.Error("sort over scan: got false, want true (absorbed sorts are transparent)")
+	}
+	if joinSubtreeNarrowable(&Path{Kind: PathSort, Children: []*Path{
+		{Kind: PathNestLoop, Children: []*Path{pre, seq}},
+	}}) {
+		t.Error("sort over nested-loop: got true, want false (transparency is not a pardon)")
 	}
 	if joinSubtreeNarrowable(&Path{Kind: PathNestLoop, Children: []*Path{pre, seq}}) {
 		t.Error("nested-loop subtree: got true, want false (F3: probe internals uninventoried)")
@@ -1797,6 +1812,349 @@ func TestSlice3CorrelatedBodyDeclinesParentAware(t *testing.T) {
 	}(); agg == nil {
 		t.Error("Q2 scalar aggregate no longer decorrelates; corrAbove over-declines or the body lost its group key")
 	}
+}
+
+// ---- B-01a P4-01 deferred slice (a): merge/NL input policy ----
+//
+// Merge inputs narrow under the same keep rule as hash build sides, on both
+// sides, with the sort-key-preservation proof enforced in code
+// (narrowMergeInput + mergeKeepCoversSortKeys). Nested-loop inputs decline
+// (the NL policy: parameterised probe internals no qual walk can inventory,
+// and a Project above the probe is a plan-time panic). These tests pin the
+// two-sided derivation, the poison arms, the side-oriented coverage gate,
+// key-tuple order preservation through narrowing, and the NL decline.
+
+// mergeWitnessTree builds a Q12-shaped merge tree — merge(orders ⋈ lineitem)
+// on o_orderkey = l_orderkey, with the above-tree set holding only the
+// grouping key — the shape the B-01a gate prediction is stated in.
+func mergeWitnessTree(t *testing.T) (root *Path, rels map[string]*RelOptInfo, needed, out map[string]bool) {
+	t.Helper()
+	out = map[string]bool{"l_shipmode": true}
+	needed = map[string]bool{
+		"l_shipmode": true,
+		"o_orderkey": true, "l_orderkey": true,
+		"l_commitdate": true, "l_receiptdate": true, "l_shipdate": true,
+		"o_orderstatus": true,
+	}
+	rels = make(map[string]*RelOptInfo)
+	var pOrders, pLine *Path
+	rels["orders"], pOrders = slice3Base(t, 1,
+		[]string{"o_orderkey", "o_custkey", "o_orderstatus", "o_orderdate"}, needed, out)
+	rels["line"], pLine = slice3Base(t, 2,
+		[]string{"l_orderkey", "l_shipmode", "l_commitdate", "l_receiptdate", "l_shipdate", "l_comment"}, needed, out)
+	jrel := newRelOptInfo(1|2, 1000, 32)
+	jrel.NeededCols, jrel.NeededColsKnown = needed, true
+	jrel.OutputCols, jrel.OutputColsKnown = out, true
+	rels["M"] = jrel
+	root = &Path{Kind: PathMergeJoin, Rel: jrel, Rows: 1000,
+		Children: []*Path{pOrders, pLine},
+		HashKeys: []*restrictInfo{slice3Key("o_orderkey", "l_orderkey", 1, 2)}}
+	return root, rels, needed, out
+}
+
+// TestDeriveJoinKeepsMergeStampsBothSides: a well-formed merge level stamps
+// both inputs with out ∪ ancestors ∪ at-parent. The lineitem side drops from
+// the statement-wide 5 to the parent-aware 2 (leaf-local filter columns run
+// below the narrow point); the orders side drops to the bare sort key. Every
+// sort-key column is in its side's keep — the preservation construction.
+func TestDeriveJoinKeepsMergeStampsBothSides(t *testing.T) {
+	root, rels, _, _ := mergeWitnessTree(t)
+	deriveJoinKeeps(root)
+
+	if !rels["orders"].JoinKeepKnown || !rels["line"].JoinKeepKnown {
+		t.Fatalf("keeps known = (%v, %v), want (true, true): a merge stamps both sides",
+			rels["orders"].JoinKeepKnown, rels["line"].JoinKeepKnown)
+	}
+	if got := slice3KeepNames(t, rels["line"], rels["line"].baseLeaf.Output()); !slice3EqualNames(got,
+		[]string{"l_orderkey", "l_shipmode"}) {
+		t.Errorf("line keep = %v, want [l_orderkey l_shipmode]", got)
+	}
+	if got := slice3KeepNames(t, rels["orders"], rels["orders"].baseLeaf.Output()); !slice3EqualNames(got,
+		[]string{"o_orderkey"}) {
+		t.Errorf("orders keep = %v, want [o_orderkey]", got)
+	}
+	for _, drop := range []string{"l_commitdate", "l_receiptdate", "l_shipdate", "l_comment", "o_orderstatus"} {
+		if rels["line"].JoinKeep[drop] || rels["orders"].JoinKeep[drop] {
+			t.Errorf("below-point column %q kept; want it dropped", drop)
+		}
+	}
+}
+
+// TestMergeNarrowWidthDeltaPrediction states the B-01a per-level gate
+// prediction (F6) in columns: the statement-wide widths against the derived
+// widths on the Q12-shaped merge, with the sort keys pinned present.
+func TestMergeNarrowWidthDeltaPrediction(t *testing.T) {
+	_, rels, needed, _ := mergeWitnessTree(t)
+	deriveJoinKeeps(mergeRootFor(rels))
+	lineSch := rels["line"].baseLeaf.Output()
+	ordersSch := rels["orders"].baseLeaf.Output()
+	if got := len(neededKeepSet(lineSch, needed)); got != 5 {
+		t.Fatalf("statement-wide line width = %d, want 5", got)
+	}
+	if got := len(neededKeepSet(lineSch, rels["line"].JoinKeep)); got != 2 {
+		t.Fatalf("derived line width = %d, want 2 (sort key + grouping key)", got)
+	}
+	if got := len(neededKeepSet(ordersSch, needed)); got != 2 {
+		t.Fatalf("statement-wide orders width = %d, want 2", got)
+	}
+	if got := len(neededKeepSet(ordersSch, rels["orders"].JoinKeep)); got != 1 {
+		t.Fatalf("derived orders width = %d, want 1 (bare sort key)", got)
+	}
+}
+
+// mergeRootFor rebuilds the witness merge root from derived rels (the
+// prediction test derives on a fresh tree to pin width arithmetic
+// independently of the stamp test's tree).
+func mergeRootFor(rels map[string]*RelOptInfo) *Path {
+	oScan := &Path{Kind: PathSeqScan, Rel: rels["orders"]}
+	lScan := &Path{Kind: PathSeqScan, Rel: rels["line"]}
+	return &Path{Kind: PathMergeJoin, Rel: rels["M"], Rows: 1000,
+		Children: []*Path{oScan, lScan},
+		HashKeys: []*restrictInfo{slice3Key("o_orderkey", "l_orderkey", 1, 2)}}
+}
+
+// TestDeriveJoinKeepsMergePoison: an uncollectable merge qual stamps nothing
+// at or below the merge, while a stamp from a hash join above still lands
+// (poison propagates down, never up).
+func TestDeriveJoinKeepsMergePoison(t *testing.T) {
+	out := map[string]bool{"o_v": true}
+	needed := map[string]bool{"o_v": true, "o_k": true, "a_k": true, "b_k": true, "a_v": true, "b_v": true}
+	rels := make(map[string]*RelOptInfo)
+	var pO, pA, pB *Path
+	rels["o"], pO = slice3Base(t, 1, []string{"o_k", "o_v"}, needed, out)
+	rels["a"], pA = slice3Base(t, 4, []string{"a_k", "a_v"}, needed, out)
+	rels["b"], pB = slice3Base(t, 8, []string{"b_k", "b_v"}, needed, out)
+	mRel := newRelOptInfo(4|8, 100, 32)
+	mRel.NeededCols, mRel.NeededColsKnown = needed, true
+	mRel.OutputCols, mRel.OutputColsKnown = out, true
+	rels["m"] = mRel
+	m := &Path{Kind: PathMergeJoin, Rel: mRel, Rows: 100, Children: []*Path{pA, pB},
+		HashKeys: []*restrictInfo{slice3Key("a_k", "b_k", 4, 8)},
+		Residual: []*restrictInfo{{clause: &OuterColumnRef{}}}}
+	hRel := newRelOptInfo(1|4|8, 100, 32)
+	hRel.NeededCols, hRel.NeededColsKnown = needed, true
+	hRel.OutputCols, hRel.OutputColsKnown = out, true
+	root := &Path{Kind: PathHashJoin, Rel: hRel, Rows: 100, Children: []*Path{pO, m},
+		HashKeys: []*restrictInfo{slice3Key("o_k", "a_k", 1, 4|8)}}
+	deriveJoinKeeps(root)
+
+	if !mRel.JoinKeepKnown {
+		t.Error("merge rel lost its stamp from the hash above; poison must not propagate up")
+	}
+	for _, name := range []string{"a", "b", "o"} {
+		if rels[name].JoinKeepKnown {
+			t.Errorf("rel %s stamped under an uncollectable merge qual; want fallback", name)
+		}
+	}
+}
+
+// TestNarrowMergeInputSortKeyPreservation pins the enforcement half of the
+// proof: the cut runs exactly when every side-operand sort-key column
+// survives in the keep, and declines (pair untouched) otherwise.
+func TestNarrowMergeInputSortKeyPreservation(t *testing.T) {
+	old := narrowBuild
+	narrowBuild = true
+	defer func() { narrowBuild = old }()
+
+	mkSide := func(joinKeep map[string]bool) (*noNode, outputLayout, *Path) {
+		rel := newRelOptInfo(2, 100, 32)
+		rel.baseLeaf = &noNode{sch: noSchema("k2", "v", "x")}
+		rel.NeededCols, rel.NeededColsKnown = map[string]bool{"k2": true, "v": true, "x": true}, true
+		rel.JoinKeep, rel.JoinKeepKnown = joinKeep, true
+		return &noNode{sch: noSchema("k2", "v", "x")}, outputLayout{21, 22, 23},
+			&Path{Kind: PathSeqScan, Rel: rel}
+	}
+	mkJoin := func(keys ...*restrictInfo) *Path {
+		return &Path{Kind: PathMergeJoin, HashKeys: keys}
+	}
+	keys := []*restrictInfo{slice3Key("k", "k2", 1, 2)}
+
+	t.Run("narrows keeping the sort key", func(t *testing.T) {
+		node, lay, side := mkSide(map[string]bool{"k2": true, "v": true})
+		got, gotLay := narrowMergeInput(node, lay, side, mkJoin(keys...))
+		proj, ok := got.(*Project)
+		if !ok {
+			t.Fatalf("expected a *Project, got %T", got)
+		}
+		out := proj.Output()
+		if len(out) != 2 || out[0].Name != "k2" || out[1].Name != "v" {
+			t.Errorf("schema = %v, want [k2 v] (sort key first, in order)", out)
+		}
+		if len(gotLay) != 2 || gotLay[0] != 21 || gotLay[1] != 22 {
+			t.Errorf("layout = %v, want the kept coordinates [21 22]", []int(gotLay))
+		}
+	})
+
+	t.Run("other side's operand is not asked of this schema", func(t *testing.T) {
+		// The join key names {k, k2}; the inner keep {k2, v} cannot contain
+		// the outer-only k — the gate is side-oriented, so the cut runs.
+		node, lay, side := mkSide(map[string]bool{"k2": true, "v": true})
+		if got, _ := narrowMergeInput(node, lay, side, mkJoin(keys...)); got == nil {
+			t.Fatal("side-oriented gate declined a keep holding every own-side sort key")
+		} else if _, ok := got.(*Project); !ok {
+			t.Fatalf("expected a *Project, got %T", got)
+		}
+	})
+
+	t.Run("declines when the keep drops a sort key", func(t *testing.T) {
+		node, lay, side := mkSide(map[string]bool{"v": true})
+		got, gotLay := narrowMergeInput(node, lay, side, mkJoin(keys...))
+		if _, ok := got.(*Project); ok {
+			t.Error("emitted a Project dropping sort key k2; want the pair untouched")
+		}
+		if len(gotLay) != 3 || gotLay[0] != 21 {
+			t.Errorf("layout moved to %v; a decline returns the pair untouched", []int(gotLay))
+		}
+	})
+
+	t.Run("declines on an unwalkable own-side key", func(t *testing.T) {
+		node, lay, side := mkSide(map[string]bool{"k2": true, "v": true})
+		bad := &restrictInfo{
+			leftKey: &ColumnRef{Name: "k"}, rightKey: &OuterColumnRef{},
+			leftRelids: 1, rightRelids: 2, isEquijoin: true,
+		}
+		if got, _ := narrowMergeInput(node, lay, side, mkJoin(bad)); got == nil {
+			t.Fatal("nil node back; a decline returns the pair untouched, never nil")
+		} else if _, ok := got.(*Project); ok {
+			t.Error("emitted a Project over an uninventoried sort key; want fallback")
+		}
+	})
+
+	t.Run("declines keyless and flag-off", func(t *testing.T) {
+		node, lay, side := mkSide(map[string]bool{"k2": true, "v": true})
+		if got, _ := narrowMergeInput(node, lay, side, mkJoin()); got == nil {
+			t.Fatal("nil node back; a decline returns the pair untouched")
+		} else if _, ok := got.(*Project); ok {
+			t.Error("keyless merge narrowed; a join with no keys has no ordering to preserve")
+		}
+		narrowBuild = false
+		defer func() { narrowBuild = true }()
+		if got, _ := narrowMergeInput(node, lay, side, mkJoin(keys...)); got == nil {
+			t.Fatal("nil node back; a decline returns the pair untouched")
+		} else if _, ok := got.(*Project); ok {
+			t.Error("narrowed with the flag off; want the pair untouched")
+		}
+	})
+}
+
+// TestNarrowMergeInputKeyOrderPreserved: the key tuple order (the merge's
+// sort order) survives narrowing — pairs come out in HashKeys list order,
+// translated onto the narrowed merged row.
+func TestNarrowMergeInputKeyOrderPreserved(t *testing.T) {
+	old := narrowBuild
+	narrowBuild = true
+	defer func() { narrowBuild = old }()
+
+	boundKey := func(name string, index int, ids RelSet) *ColumnRef {
+		return &ColumnRef{Index: index, Name: name}
+	}
+	mkKey := func(l, r string, li, ri int) *restrictInfo {
+		lk, rk := boundKey(l, li, 1), boundKey(r, ri, 2)
+		return &restrictInfo{leftKey: lk, rightKey: rk,
+			leftRelids: 1, rightRelids: 2, isEquijoin: true,
+			clause: &BinaryOp{Op: parser.OpEq, Left: lk, Right: rk}}
+	}
+	keys := []*restrictInfo{mkKey("a", "c", 10, 20), mkKey("b", "d", 11, 21)}
+	join := &Path{Kind: PathMergeJoin, HashKeys: keys}
+
+	oRel := newRelOptInfo(1, 100, 32)
+	oRel.baseLeaf = &noNode{sch: noSchema("a", "b", "ax")}
+	oRel.NeededCols, oRel.NeededColsKnown = map[string]bool{"a": true, "b": true, "ax": true}, true
+	oRel.JoinKeep, oRel.JoinKeepKnown = map[string]bool{"a": true, "b": true}, true
+	iRel := newRelOptInfo(2, 100, 32)
+	iRel.baseLeaf = &noNode{sch: noSchema("c", "d", "dx")}
+	iRel.NeededCols, iRel.NeededColsKnown = map[string]bool{"c": true, "d": true, "dx": true}, true
+	iRel.JoinKeep, iRel.JoinKeepKnown = map[string]bool{"c": true, "d": true}, true
+	oPath, iPath := &Path{Kind: PathSeqScan, Rel: oRel}, &Path{Kind: PathSeqScan, Rel: iRel}
+
+	outer, outerLay := narrowMergeInput(&noNode{sch: noSchema("a", "b", "ax")}, outputLayout{10, 11, 12}, oPath, join)
+	inner, innerLay := narrowMergeInput(&noNode{sch: noSchema("c", "d", "dx")}, outputLayout{20, 21, 22}, iPath, join)
+	if _, ok := outer.(*Project); !ok {
+		t.Fatalf("outer: expected a *Project, got %T", outer)
+	}
+	if _, ok := inner.(*Project); !ok {
+		t.Fatalf("inner: expected a *Project, got %T", inner)
+	}
+	merged := append(append(Schema(nil), outer.Output()...), inner.Output()...)
+	lay := append(append(outputLayout(nil), outerLay...), innerLay...)
+	in := joinInputs{outer: outer, inner: inner, outerRelids: 1, innerRelids: 2,
+		merged: merged, lay: lay, index: lay.bindingIndex()}
+	pairs := in.keyPairs("PathMergeJoin", keys)
+	if len(pairs) != 2 {
+		t.Fatalf("pairs = %d, want 2 in HashKeys list order", len(pairs))
+	}
+	at := func(e Expr) int {
+		cr, ok := e.(*ColumnRef)
+		if !ok {
+			t.Fatalf("pair operand = %T, want *ColumnRef", e)
+		}
+		return cr.Index
+	}
+	// Narrowed merged positions: [a b c d] = [0 1 2 3]; the tuple order is
+	// the HashKeys order (a,c) then (b,d).
+	for i, want := range [][2]int{{0, 2}, {1, 3}} {
+		if got := [2]int{at(pairs[i].Left), at(pairs[i].Right)}; got != want {
+			t.Errorf("pair %d = %v, want %v: key-tuple order moved under narrowing", i, got, want)
+		}
+	}
+}
+
+// TestNestedLoopInputsDeclinePolicy pins the B-01a NL verdict: no NL input
+// narrows, at any level. A Project above an NLI probe would trip the
+// `innerBase.(*IndexScan)` assertion (createplannl.go), and the probe keys
+// live on the inner path's IndexClauses in outer coordinates — no qual walk
+// over the join path can inventory them — so the policy is decline, with the
+// plain-inner shape noted as a future resume point, not part of this cut.
+func TestNestedLoopInputsDeclinePolicy(t *testing.T) {
+	old := narrowBuild
+	narrowBuild = true
+	defer func() { narrowBuild = old }()
+
+	t.Run("narrowBuildInput refuses NL kinds", func(t *testing.T) {
+		rel := ptRel([]string{"a", "b"}, map[string]bool{"a": true}, true)
+		p := ptScanPath(rel)
+		node := rel.baseLeaf
+		lay := outputLayout{1, 2}
+		for _, kind := range []string{"PathNestLoop", "PathMergeJoin"} {
+			got, gotLay := narrowBuildInput(kind, node, lay, p)
+			if _, ok := got.(*Project); ok {
+				t.Errorf("kind %s: hash-only entry narrowed; merge goes through narrowMergeInput, NL never", kind)
+			}
+			if len(gotLay) != 2 {
+				t.Errorf("kind %s: layout moved; a refusal returns the pair untouched", kind)
+			}
+		}
+	})
+
+	t.Run("derivation poisons NL subtrees", func(t *testing.T) {
+		out := map[string]bool{"o_v": true}
+		needed := map[string]bool{"o_v": true, "o_k": true, "a_k": true, "b_k": true}
+		rels := make(map[string]*RelOptInfo)
+		var pO, pA *Path
+		rels["o"], pO = slice3Base(t, 1, []string{"o_k", "o_v"}, needed, out)
+		rels["a"], pA = slice3Base(t, 4, []string{"a_k", "a_v"}, needed, out)
+		rels["b"], _ = slice3Base(t, 8, []string{"b_k", "b_v"}, needed, out)
+		// Parameterised NLI shape: the inner carries an outer-bound probe
+		// key no join-path qual walk can see.
+		probe := &Path{Kind: PathIndexScan, Rel: rels["b"], RequiredOuter: 1,
+			IndexClauses: []indexPathClause{{indexCol: 0, key: &ColumnRef{Name: "o_k", Index: 0}}}}
+		nRel := newRelOptInfo(4|8, 100, 32)
+		nRel.NeededCols, nRel.NeededColsKnown = needed, true
+		nRel.OutputCols, nRel.OutputColsKnown = out, true
+		rels["n"] = nRel
+		n := &Path{Kind: PathNestLoop, Rel: nRel, Rows: 100, Children: []*Path{pA, probe}}
+		hRel := newRelOptInfo(1|4|8, 100, 32)
+		hRel.NeededCols, hRel.NeededColsKnown = needed, true
+		hRel.OutputCols, hRel.OutputColsKnown = out, true
+		root := &Path{Kind: PathHashJoin, Rel: hRel, Rows: 100, Children: []*Path{pO, n},
+			HashKeys: []*restrictInfo{slice3Key("o_k", "a_k", 1, 4|8)}}
+		deriveJoinKeeps(root)
+		for _, name := range []string{"n", "a", "b", "o"} {
+			if rels[name].JoinKeepKnown {
+				t.Errorf("rel %s stamped under a nested loop; probe internals are uninventoried", name)
+			}
+		}
+	})
 }
 
 // TestSlice3LiveDeltaModelArithmetic states the live-shape gate in MODEL

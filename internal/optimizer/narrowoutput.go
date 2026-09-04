@@ -23,9 +23,12 @@ func narrowBuildFromEnv(v string) bool { return v != "0" }
 // and the pre-existing panic guards the helper on the first mistake.
 //
 // The `kind == "PathHashJoin"` guard lives HERE rather than at the call site
-// so no future caller can narrow a merge join's inputs by forgetting it:
-// only a hash join has a resident build side, and narrowing a streaming
-// merge input would pay the projection for no memory saving (P4-A §18).
+// so no future caller can narrow a join's inputs by forgetting it:
+// narrowBuildInput is the HASH-only entry point. Merge inputs narrow through
+// `narrowMergeInput` instead (B-01a: same Project shape, plus the
+// sort-key-coverage gate), and nested-loop inputs do not narrow at all (the
+// NL policy in `deriveJoinKeepsAt`: parameterised probe internals no qual
+// walk can inventory).
 //
 // Every refusal returns the pair untouched: flag explicitly off (`=0`),
 // a non-hash join, no node, no path/rel, or an unknown needed set
@@ -60,6 +63,138 @@ func narrowBuildInput(kind string, innerNode Node, innerLay outputLayout, innerP
 		return narrowPlanOutput(innerNode, innerLay, keep)
 	}
 	return narrowPlanOutput(innerNode, innerLay, neededKeepSet(innerNode.Output(), innerPath.Rel.NeededCols))
+}
+
+// narrowMergeInput narrows one merge-join input (node, layout) pair — outer
+// or inner, the mechanism is symmetric — to the derived keep-set, behind the
+// same flag as the hash arm. B-01a (P4-01 deferred slice (a)). The call site
+// is `joinInputsFor` for `kind == "PathMergeJoin"`, after both children are
+// built and before the layout/schema panic, so everything downstream sees a
+// consistent pair exactly as in the hash arm.
+//
+// SORT-KEY-PRESERVATION PROOF (why a Project here cannot drop or shift a
+// column the merge sorts on):
+//
+//  1. Execution sorts each side by its own key-operand tuple in `HashKeys`
+//     list order. `keyPairs` preserves the order it is given
+//     (createplanjoin.go), the pairs become the join's key list in that
+//     order, and the executor keys and sorts each side on its own operands
+//     in that order (`mergeSideKeyExprs`, join_merge_key.go; the merge
+//     comparator, join_merge_stream.go). Narrowing never touches
+//     `p.HashKeys` and the keep is ascending, so the tuple order is
+//     invariant under the cut.
+//  2. The absorbed PathSort children impose nothing further: they are
+//     stepped over, never emitted (`absorbMergeSort`), so their Pathkeys
+//     are never evaluated. Moreover they cannot name a column outside the
+//     merge clauses — the sort keys ARE clause operands (`mergeKeyGroups`
+//     builds each group's outer/inner PathKey from its first clause's
+//     operand, joinpathsmerge.go; `mergeInnerSortKeys` re-derives per
+//     clause; the ordered-outer arm sorts nothing). Dropped clauses are
+//     demoted to the residual, still inventoried.
+//  3. Hence every side's sort-key columns are that side's HashKeys-operand
+//     columns, and `collectJoinQualNames` walks every HashKeys operand —
+//     so the derived keep (out ∪ ancestors ∪ at-parent) contains every
+//     sort-key column by construction, on whichever derivation arm
+//     produced it.
+//  4. `mergeKeepCoversSortKeys` enforces 3. directly, side-oriented (the
+//     other side's operands are never in this schema): whatever arm
+//     derived the keep, a sort-key column missing from it declines the cut
+//     (pair untouched) instead of emitting a Project the key translation
+//     would trip on. `translateToLayout`'s missing-column panic remains the
+//     final tripwire.
+//
+// `side` is the post-absorb child path the node was built from (the merge
+// arm absorbs its PathSort children before `joinInputsFor` runs); `join` is
+// the merge path carrying the HashKeys the coverage gate inventories.
+//
+// Every refusal returns the pair untouched, like the hash arm.
+func narrowMergeInput(node Node, lay outputLayout, side, join *Path) (Node, outputLayout) {
+	if !narrowBuild || node == nil || side == nil || side.Rel == nil || !side.Rel.NeededColsKnown {
+		return node, lay
+	}
+	var keep []int
+	if k, ok := joinKeepSet(node, side); ok {
+		keep = k
+	} else if k, ok := buildKeepSet(node, side); ok {
+		keep = k
+	} else {
+		keep = neededKeepSet(node.Output(), side.Rel.NeededCols)
+	}
+	if !mergeKeepCoversSortKeys(node.Output(), keep, side, join) {
+		return node, lay
+	}
+	return narrowPlanOutput(node, lay, keep)
+}
+
+// mergeSortKeyNames returns every column name the merge path sorts THIS
+// side's input on — the side's own operand of each HashKeys entry, oriented
+// by relids — and whether the answer is COMPLETE.
+// The executor re-sorts each side on its own operand tuple (proof step 1
+// above), so this side-oriented set is the preservation inventory: the other
+// side's operands are never in this schema and must not be asked of it. An
+// entry whose operands do not land one per side is unorientable (the
+// `clause_sides_match_join` refusal `keyPairs` also enforces) and declines.
+// Incomplete (false) means "decline": an unenumerated key expression must
+// keep its columns, the Slice-2 precedent (F3). A keyless merge path reports
+// incomplete: it has no ordering to preserve, and the plan arm refuses to
+// build it.
+func mergeSortKeyNames(join *Path, side RelSet) (map[string]bool, bool) {
+	if join == nil || len(join.HashKeys) == 0 {
+		return nil, false
+	}
+	names := make(map[string]bool, 8)
+	complete := true
+	for _, ri := range join.HashKeys {
+		if ri == nil {
+			continue
+		}
+		var e Expr
+		switch {
+		case relsSubset(ri.leftRelids, side) && !relsSubset(ri.rightRelids, side):
+			e = ri.leftKey
+		case relsSubset(ri.rightRelids, side) && !relsSubset(ri.leftRelids, side):
+			e = ri.rightKey
+		default:
+			return nil, false
+		}
+		if e == nil {
+			continue
+		}
+		if !visitColumnRefsByName(e, func(name string) { names[name] = true }) {
+			complete = false
+		}
+	}
+	if !complete {
+		return nil, false
+	}
+	return names, true
+}
+
+// mergeKeepCoversSortKeys reports whether the derived keep (positions into
+// out) retains every sort-key column this side sorts on. The last
+// enforcement of the preservation proof: a keep that would drop a sort key —
+// from whichever derivation arm — declines instead of narrowing.
+func mergeKeepCoversSortKeys(out Schema, keep []int, side, join *Path) bool {
+	if side == nil || side.Rel == nil {
+		return false
+	}
+	sortNames, ok := mergeSortKeyNames(join, side.Rel.Relids)
+	if !ok || len(keep) == 0 {
+		return false
+	}
+	kept := make(map[string]bool, len(keep))
+	for _, c := range keep {
+		if c < 0 || c >= len(out) {
+			return false
+		}
+		kept[out[c].Name] = true
+	}
+	for name := range sortNames {
+		if !kept[name] {
+			return false
+		}
+	}
+	return true
 }
 
 // joinKeepSet derives the hash-build keep-set from the inner rel's Slice-3
@@ -167,25 +302,73 @@ func deriveJoinKeepsAt(p *Path, out map[string]bool, anc map[string]bool, poison
 		deriveJoinKeepsAt(outer, out, childAnc, childPoison)
 		deriveJoinKeepsAt(inner, out, childAnc, childPoison)
 	case PathMergeJoin:
-		// HASH-BUILD-ONLY carries forward (F2): merge inputs are OUT of
-		// scope for the first cut (goopg merge join order lives in the
-		// HashKeys list order; projecting a merge input can drop/shift a
-		// sort-key column sortInnerAndOuter/absorbMergeSort assume present),
-		// so a merge join poisons its subtree — no stamps at or below it,
-		// and its quals are not collected as ancestors either. Merge-input
-		// narrowing needs its own slice with a sort-key-preservation proof.
-		return
+		// B-01a (P4-01 deferred slice (a)): merge inputs narrow under the
+		// same keep rule as hash build sides — out ∪ ancestors ∪
+		// at-parent — on BOTH sides (a merge join sorts and streams both
+		// inputs, so both carry full rows into work_mem-bounded runs).
+		// Sort-key preservation holds by construction plus a gate (see
+		// `narrowMergeInput`): the executor sorts each side by the key
+		// tuple in `HashKeys` list order, and `collectJoinQualNames`
+		// walks every HashKeys operand, so every sort-key column is in
+		// the at-parent set; the absorbed PathSort children are never
+		// emitted and impose nothing further. Each side stamps only when
+		// its own subtree is narrowable; a non-narrowable side simply
+		// falls back bit-identically while the other still derives.
+		if len(p.Children) != 2 || p.Children[0] == nil || p.Children[1] == nil {
+			return
+		}
+		at, ok := collectJoinQualNames(p)
+		outer, inner := p.Children[0], p.Children[1]
+		if !poisoned && ok {
+			for _, side := range []*Path{outer, inner} {
+				if side.Rel == nil || !joinSubtreeNarrowable(side) {
+					continue
+				}
+				keep := make(map[string]bool, len(out)+len(anc)+len(at))
+				for name := range out {
+					keep[name] = true
+				}
+				for name := range anc {
+					keep[name] = true
+				}
+				for name := range at {
+					keep[name] = true
+				}
+				side.Rel.JoinKeep, side.Rel.JoinKeepKnown = keep, true
+			}
+		}
+		childAnc, childPoison := anc, poisoned || !ok
+		if ok {
+			childAnc = unionNameSets(anc, at)
+		}
+		deriveJoinKeepsAt(outer, out, childAnc, childPoison)
+		deriveJoinKeepsAt(inner, out, childAnc, childPoison)
 	case PathNestLoop, PathMemoize, PathPrebuilt,
 		PathBitmapHeapScan, PathBitmapIndexScan, PathBitmapAnd, PathBitmapOr,
 		PathAgg, PathGather, PathGatherMerge:
-		// F3-conservative: a nested-loop (parameterised probe internals no
-		// qual walk can inventory), a memoize/bitmap/agg/gather node, or
-		// anything unrecognised poisons its subtree — no stamps at or below
-		// it. Levels above it are unaffected (it sits below them). A
-		// prebuilt path reaches this arm only as the walk's recursion
-		// terminator: it has no path children to descend into, and
-		// joinSubtreeNarrowable already treats it as a narrowable boundary
-		// leaf, so nothing is lost by not descending.
+		// F3-conservative, B-01a NL policy (decline): a nested-loop
+		// poisons its subtree — no stamps at or below it, and levels
+		// above it are unaffected. The parameterised (NLI) shape is
+		// un-narrowable, not merely unproven:
+		//   - the probe keys live on the INNER path's IndexClauses in
+		//     OUTER-node coordinates, not on the join path (a
+		//     PathNestLoop carries no HashKeys by construction —
+		//     createNestLoopPlan panics on any), so no qual walk over
+		//     the join path can inventory the outer columns the probe
+		//     reads per outer row;
+		//   - the NLI arm requires the built inner's base to be an
+		//     *IndexScan (`innerBase.(*IndexScan)`, createplannl.go),
+		//     so a Project above the probe is a plan-time panic, not a
+		//     narrower plan.
+		// The plain (non-parameterised) inner is mechanism-identical to
+		// a hash build side, but it is NOT admitted here: it is a second
+		// variable (rescan-per-outer-row economics, its own gate) and
+		// stays the resume point, not part of this cut. A memoize/
+		// bitmap/agg/gather node, or anything unrecognised, poisons the
+		// same way. A prebuilt path reaches this arm only as the walk's
+		// recursion terminator: it has no path children to descend into,
+		// and joinSubtreeNarrowable already treats it as a narrowable
+		// boundary leaf, so nothing is lost by not descending.
 		return
 	case PathSort:
 		// Transparent: an absorbed merge sort is never emitted as a node
@@ -238,13 +421,23 @@ func collectJoinQualNames(p *Path) (map[string]bool, bool) {
 	return dst, true
 }
 
-// joinSubtreeNarrowable reports whether the build-side subtree rooted at p
-// may carry a derived keep: every node in it must be a shape whose internal
-// column needs are either below the narrow point (scan filters, absorbed
-// sorts, prebuilt interiors) or inventoried above it (hash join quals).
-// Anything else — merge/NL/bitmap/memoize/agg/gather/sort — declines THIS
-// level (levels inside still derive via the walk). Name-keyed, so self-joins
+// joinSubtreeNarrowable reports whether the subtree rooted at p may carry a
+// derived keep: every node in it must be a shape whose internal column needs
+// are either below the narrow point (scan filters, absorbed sorts, prebuilt
+// interiors) or inventoried above it (join quals at and above the narrow
+// level). Anything else — NL/bitmap/memoize/agg/gather — declines THIS level
+// (levels inside still derive via the walk). Name-keyed, so self-joins
 // over-keep rather than misattribute (F4).
+//
+// A merge join is narrowable when both its inputs are: its quals are
+// inventoried exactly like a hash join's (collectJoinQualNames over the same
+// HashKeys/Residual fields), and its sort children are transparent (below).
+// A PathSort is transparent: sortPathFor is its only producer, its sorts sit
+// only under merge joins, and the merge arm absorbs them — the sort node is
+// never emitted, so a narrowable child stays narrowable through it. (The
+// sort's keys still survive narrowing: they are the merge's HashKeys operands
+// — see narrowMergeInput — which is why transparency here needs no separate
+// key inventory.)
 //
 // A PathPrebuilt is a narrowable BOUNDARY leaf, not a poison node. It wraps
 // an already-built executor Node — a base-table leaf (bare or Filter-wrapped
@@ -282,6 +475,16 @@ func joinSubtreeNarrowable(p *Path) bool {
 			return false
 		}
 		return joinSubtreeNarrowable(p.Children[0]) && joinSubtreeNarrowable(p.Children[1])
+	case PathMergeJoin:
+		if len(p.Children) != 2 {
+			return false
+		}
+		return joinSubtreeNarrowable(p.Children[0]) && joinSubtreeNarrowable(p.Children[1])
+	case PathSort:
+		if len(p.Children) != 1 {
+			return false
+		}
+		return joinSubtreeNarrowable(p.Children[0])
 	default:
 		return false
 	}

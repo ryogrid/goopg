@@ -162,14 +162,23 @@ else sequences freely but lands one variable per commit. B-05 and D-08
 are EPICS — split into one-checkbox-per-commit items before starting
 (ground rule 11).
 
-- [ ] **B-01a P4-01 deferred slice (a): merge/NL input policy.**
-  Merge-input narrowing needs its own slice with a sort-key-preservation
-  proof (merge join order lives in `HashKeys` list order; projecting a
-  merge input can drop/shift a sort-key column). Unblocks the EX1-04
-  merged half (take3 TODO_EXECUTOR:99 — currently ownerless).
-  *design: `docs/design/planner-p4-01-target/DESIGN.md` Slice 3+ F2/F5;
-  gate: per-commit gate F6 (predicted delta + NBatch before measuring,
-  widths-only PP movement, values at 64/4/512 MB).*
+- [x] **B-01a P4-01 deferred slice (a): merge/NL input policy.**
+  Landed 2026-09-05: `deriveJoinKeepsAt` stamps both merge inputs
+  (each gated on own `joinSubtreeNarrowable`); `narrowMergeInput`
+  with `mergeKeepCoversSortKeys` gate (side-oriented via relids,
+  fail-closed); NL = decline policy (probe keys live on inner
+  `IndexClauses`, not the join path; `Project` above probe trips
+  `innerBase` — plain-inner left as resume point).
+  Sort-key-preservation proof: HashKeys order untouched (ascending
+  keep), absorbed sorts impose nothing (keys ARE clause operands),
+  keep ⊇ sort keys by construction + gate enforcement +
+  `translateToLayout` tripwire.
+  Gates: 6 new tests (2 existing assertions updated for the policy
+  flip); TPC-H 24/24 MATCH; PP zero shape-kind changes (estimate/text
+  only); Q12 merge 998→172 live; identical hashes at 64/4/512 MB;
+  TPC-DS PASS=95 MISMATCH=0.
+  Artifacts: `internal/optimizer/{narrowoutput,createplanjoin}.go`,
+  `pathtarget_test.go`.
 - [ ] **B-01b P4-01 deferred slice (b): scan-node application.**
   Narrowing at `createPlanNode` with fixup (narrowing the node without
   layout trips the seam; narrowing both replays the P4-01b leaf-schema

@@ -284,6 +284,16 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 	// The PathHashJoin-only restriction is enforced inside narrowBuildInput
 	// (only a hash join has a resident build side) — see narrowoutput.go.
 	innerNode, innerLay = narrowBuildInput(kind, innerNode, innerLay, innerPath)
+	if kind == "PathMergeJoin" {
+		// B-01a (P4-01 deferred slice (a)): narrow BOTH merge inputs. The
+		// merge arm absorbs its PathSort children before calling, so
+		// outerPath/innerPath are the post-absorb children the nodes were
+		// built from — the contract narrowMergeInput requires. Sort-key
+		// preservation is proved and gated there; nested-loop inputs stay
+		// declined (the NL policy in narrowoutput.go).
+		outerNode, outerLay = narrowMergeInput(outerNode, outerLay, outerPath, p)
+		innerNode, innerLay = narrowMergeInput(innerNode, innerLay, innerPath, p)
+	}
 	if outerNode == nil || innerNode == nil {
 		panic(fmt.Sprintf("createPlan: %s over a child path that built no node", kind))
 	}
