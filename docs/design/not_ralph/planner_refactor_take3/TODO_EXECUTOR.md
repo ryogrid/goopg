@@ -113,10 +113,7 @@ Landed narrow fix (record, not work):
 Exit: alloc arm down on witnesses, timing neutral-or-better, per-seam
 tripwires green, values clean, plans unchanged.
 
-- [ ] EX2-01 Retention-boundary audit — enumerate every `cloneRowOwned` /
-      `MaterializeArena` / `acquireRow` site with its retention reason.
-      Document only, no behaviour change; later items execute against it.
-      *design: 13 §4; gate: audit doc reviewed, no code.*
+- [x] EX2-01 Retention-boundary audit — this commit; gates: audit reviewed (8-family spot-check exact; rework for truncation/memoize/gather/C6-C7 completed and verified), no code; artifacts: `analysis/planner-refactor-take3/ex201-audit-20260904/README.md` (45 sites: 18 cloneRowOwned + 14 MaterializeArena + 13 acquireRow; top EX2-02 candidates: A12/C17 virtual-row seam, C9, C10, C11; C8 scoped-caution: source aliases producer slot)
 - [ ] EX2-02a Ownership passing at join seams — sole-owner bounded-lifetime
       clones become transfers. Join seams first (G-EX3 cascade product
       shrinks here too).
