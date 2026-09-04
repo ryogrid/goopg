@@ -515,8 +515,15 @@ sufficient per P4-01b above):
       (`make_group_input_target`, `make_window_input_target`,
       `make_sort_input_target`, `apply_scanjoin_target_to_paths`; 01 §3) with
       setrefs-style fixup at `create_plan` time. Progress 2026-09-04:
-      Slice 1 landed (scan-Path `Target` payload, assert-only, changed=0 +
-      values-identical); Slices 2/3 per `docs/design/planner-p4-01-target/DESIGN.md`.
+      Slices 1–3 landed per `docs/design/planner-p4-01-target/DESIGN.md`
+      (Slice 1 scan-Path `Target` payload assert-only; Slice 2
+      Target-driven build keep-set behaviour-neutral + model proof; Slice 3
+      per-joinrel keep-sets with LIVE FLIP — Q9 witness Batches 2→1,
+      widths down, delta 10→7, gates 24/24 + 22/22 + TPC-DS PASS=95).
+      DEFERRED to follow-up: (a) merge/NL input policy, (b) scan-node
+      application at `createPlanNode`, (c) upper targets
+      (`make_group/window/sort_input_target`) — see DESIGN.md Slice 3+
+      (reviewed) and wrap-up ledger `take3-wrapup-deferred`.
       Gate on **values**
       (`tpch-runner -digest` + `-diff`, all items), `NBatch` 2→1 on the
       witness (TPC-H Q9 hash build, EXPLAIN `Batches:` at `work_mem` 64 MB

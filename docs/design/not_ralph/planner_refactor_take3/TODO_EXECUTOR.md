@@ -384,5 +384,31 @@ original wording — negative results are only legible if they survive
 | item | date | reason | ledger row |
 |---|---|---|---|
 | EX1-03 | 2026-09-04 | owner-directed skip: TPC-DS cannot witness (varchar(200) max < 2000 threshold, zero pointers at any SF); synthetic-only value with a silent-corruption risk class on every walk miss; revisit iff a TOAST-heavy corpus appears | take3-EX1-03-dropped |
+| EX2-02b | 2026-09-04 | infeasible as scoped: all 12 agg-input M-sites fail sole-owner transfer on both ends (sources alias reused producer slot; whole-aggregation lifetimes; MaterializeArena already minimal) | take3-EX2-02b-dropped |
+| EX3-05 Cut B | 2026-09-04 | verified no-win: fires (count→KindInt) yet Q16 wall-neutral; Stage 1 already captured the comparator win | take3-EX3-05-cutB-dropped |
+
+## Wrap-up 2026-09-04 (goal close-out, owner-directed)
+
+Executor workstream pauses after EX3-02 Cut 2 with all gates green
+(TPC-H 24/24 MATCH, plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0 on every
+landed commit). Deferred with resume points — NOT verified-out-of-scope,
+workload-based exclusion explicitly not taken (goal terms); each item
+resumes from its cited design:
+
+- EX3-02 Cut 3 (oversize-dedicated chunks + explicit shared teardown):
+  `docs/design/executor-ex3-02-dense-build/DESIGN.md` §5 + F2/F5/F6 rules.
+- EX3-04 sort spill runs + merge discipline (13 §5).
+- EX3-06 skew residency (needs planner P2-11b MCV input).
+- EX4-01/02/03 expression compilation (13 §6; independent).
+- EX4-04 (blocked on EX5-01); EX5-01–04 parallel executor (13 §7).
+- EX3-03 step-2 (own blocked row `take3-EX3-03-step2-blocked`).
+- P4-01 deferred slices (a)/(b)/(c) (`docs/design/planner-p4-01-target/DESIGN.md`
+  Slice 3+); (c) unblocks the EX1-04 sort half.
+- Take2 (43 open) / take3 (62 open) planner TODOs remain the planner
+  program's scope — consumed here as dependencies only (P4-01 slices 1–3;
+  progress noted in take3 TODO.md).
+
+Ledger: `take3-wrapup-deferred`. Final performance report:
+`analysis/planner-refactor-take3/wrapup-20260904/PERF-REPORT.md`.
 
 (End of file)
