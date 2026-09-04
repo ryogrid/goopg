@@ -93,45 +93,19 @@ P2-08/P2-10 resume after Phase 3/4 consumers exist (take3 ledger
 suites; plan pin non-skippable; take3-owner acceptance for the MD code
 tracks recorded.*
 
-- [~] **A-01 P0-04 suffix numbering.** Align EXPLAIN relation-name suffix
-  numbering with `select_rtable_names`; re-measure the spine
-  `shape_mismatches`. Progress 2026-09-04: (i) IOS `Alias` stamp LANDED
-  (`IndexOnlyScan.Alias` field + all 5 promotion sites carry it +
-  EXPLAIN alias arms both renderers + unit test; live-verified
-  `Index Only Scan using supplier_pk on supplier s`; gates TPC-H 24/24
-  MATCH, plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0) — plus a drive-by
-  fix of the same hole on the rule-based IndexScan producers
-  (`planIndexScanFromWhereShape`/`tryRangeIndexScan` now stamp
-  `ctx.alias`; previously the alias was silently dropped there).
-  Remaining: (ii) planner-stamped global range-table identity, designed
-  (`docs/design/executor-a01ii-rtable-identity/DESIGN.md`, reviewed
-  F1–F10 folded) — cut 1 LANDED 2026-09-04 (`rtableScope` created in
-  `PlanWithSettings`/`PlanSchemaOnly`, threaded through
-  FROM-planning chain, additive `RTID int32` on the §4 minimal set;
-  nested paths get RTID 0 → zero rendering movement; gates: full
-  optimizer suite + 3 new RTID pins, TPC-H 24/24 MATCH, plan-gate 22/22).
-  Cut 2 LANDED 2026-09-04 (scope threaded through `planSelectWithParent`
-  + 4 Expr sublink planners via `rtScope` on resolveContext + derived/
-  CTE/set-op/DML paths; DML targets stamped; dead `planSelect` wrapper
-  deleted; F3 walker extended to Expr-hanging subplan bodies via
-  `optimizer.NodeSubplans`; Q30-shape + 12-shape + determinism pins;
-  gates: optimizer + Explain suites, TPC-H 24/24 MATCH, PP 20/22 with 2
-  label-only DIFFERs in the designed direction — Q11/Q22 sublink scans
-  now registered as `_1`, costs/rows byte-identical).
-  Cut 3 LANDED 2026-09-05 (explain_names re-keyed by RTID: bySource/seen/
-  cols int32, bySrc walk-order translation, claimName high-water counter,
-  nodeLabels in RTID order, BitmapHeapScan switch extension, 7 PG-rule
-  tests; RTID propagation fixed at 8 substitution sites — promotion,
-  full-range, scan_input_rewrite, NLI, groupagg, createplanindex,
-  createplanbitmap, rule-based producers via `rangeBinding.rtid` — plus
-  a drive-by compile fix threading alias/rtid into
-  `bitmapOverCorrelatedProbe`; gates: optimizer + Explain suites incl.
-  7/7 new, TPC-H 24/24 MATCH, PP 13/22 with all 9 DIFFERs in the
-  PG-faithful direction — bare columns gaining correct qualifiers,
-  costs/rows byte-identical).
-  Cut 4 (re-pin baseline + spine re-measure) next.
-  *design: take3 08 §3; gate: take3 09 §5 P0 + units/regress; re-pin the
-  goopg-vs-goopg baseline in the same commit.*
+- [x] **A-01 P0-04 suffix numbering.** Aligned 2026-09-05: (i) IOS
+  `Alias` stamp + rule-based IndexScan alias fix; (ii) planner-stamped
+  global RTID (cuts 1–3: scope, threading, explain_names migration +
+  substitution propagation at 8 sites + `rangeBinding.rtid`); (iv) cut 4
+  re-measure — ZERO duplicate printed scan labels across 21 planned
+  queries (was: Q8/Q17/Q18 lost comparisons + Q11 unresolvable); Q11
+  fully pairs; the 46 "upper bound" qualifier discharged (absolute
+  parity count re-measured at C-21).
+  Gates per cut: optimizer + Explain suites, TPC-H 24/24 MATCH, PP
+  label-only DIFFERs all PG-faithful, TPC-DS PASS=95 (cuts 1–2).
+  Artifacts: `docs/design/executor-a01ii-rtable-identity/DESIGN.md`
+  (F1–F10 folded), `analysis/planner-refactor-take3/a01ii-cut4-20260905/`,
+  `analysis/leftdeep-joins/a01ii-cut3*.txt`.
 - [ ] **A-02 P0-05 plan-parity capture.** EXPLAIN from goopg and PG for
   TPC-H 22 + TPC-DS 99; commit the PG side as fixtures
   (`bench/tpch/plans-pg/`, `bench/tpcds/plans-pg/`, re-captured only on
