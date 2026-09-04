@@ -176,6 +176,17 @@ type searchCtx struct {
 	// planner assumed unconditionally. Consumed by `addIndexOnlyPaths`.
 	neededCols      map[string]bool
 	neededColsKnown bool
+
+	// outputCols / outputColsKnown are the statement's ABOVE-TREE
+	// needed-column set (outputColumnNames), the union needed above the
+	// scan/join tree. Take2 P4-01 Slice 3: per-joinrel keep-sets derive
+	// from it. outputEligible folds the positional gates (statement-top
+	// problem, no pinned spine above, no outer-scope reads): only an
+	// eligible problem stamps the set onto its rels, so the derivation
+	// declines everywhere else by construction.
+	outputCols      map[string]bool
+	outputColsKnown bool
+	outputEligible  bool
 }
 
 // newSearchCtx allocates the level lists for an nrels-relation join problem.
@@ -478,6 +489,28 @@ func (s *searchCtx) stampNeededColsOnRels() {
 				continue
 			}
 			r.NeededCols, r.NeededColsKnown = s.neededCols, s.neededColsKnown
+		}
+	}
+}
+
+// stampOutputColsOnRels copies the statement's above-tree needed-column set
+// onto every rel the search has built so far. Take2 P4-01 Slice 3: the union
+// needed above the scan/join tree, from which per-joinrel keep-sets derive.
+//
+// Called only when s.outputEligible (the statement-top problem with no pinned
+// spine above it and no outer-scope reads); every other problem leaves the
+// zero value on its rels and the derivation declines there. Same by-reference
+// sharing as the needed set.
+func (s *searchCtx) stampOutputColsOnRels() {
+	if s == nil || !s.outputEligible {
+		return
+	}
+	for _, level := range s.joinrels {
+		for _, r := range level {
+			if r == nil {
+				continue
+			}
+			r.OutputCols, r.OutputColsKnown = s.outputCols, s.outputColsKnown
 		}
 	}
 }

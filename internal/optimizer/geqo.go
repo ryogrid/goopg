@@ -343,6 +343,12 @@ func (s *searchCtx) freshEvalCtx() *searchCtx {
 		joinInfoList:   s.joinInfoList,
 		neededCols:     s.neededCols,
 		neededColsKnown: s.neededColsKnown,
+		// Take2 P4-01 Slice 3: the above-tree set and its eligibility ride
+		// along, so joinrels a GEQO tour creates stamp exactly as the DP
+		// ones do.
+		outputCols:      s.outputCols,
+		outputColsKnown: s.outputColsKnown,
+		outputEligible:  s.outputEligible,
 	}
 	// Re-register the base rels (level 1), sharing the same *RelOptInfo
 	// pointers. gimmeTree reads them by index; makeJoinRel may ADD paths to a

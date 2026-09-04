@@ -116,6 +116,34 @@ type joinlistProblem struct {
 	// the STATEMENT, not of a FROM subset.
 	neededCols      map[string]bool
 	neededColsKnown bool
+
+	// outputCols / outputColsKnown carry the statement's above-tree
+	// needed-column set (outputColumnNames) to `searchCtx`. Take2 P4-01
+	// Slice 3: the union needed above the scan/join tree from which
+	// per-joinrel keep-sets derive.
+	outputCols      map[string]bool
+	outputColsKnown bool
+
+	// spineAbove reports that a pinned outer spine sits above this
+	// problem's tree: the spine's ON quals read the searched subtree's
+	// output from above, so parent-aware narrowing is declined here (the
+	// Slice-2 arms still run). Set by the seam, which owns the spine.
+	spineAbove bool
+
+	// pinAbove reports that a pinned semi/anti spine sits above this
+	// problem's tree (runJoinSearchBelowPinned): same decline, same
+	// reason. Carried on the resolve context the seam reads.
+	pinAbove bool
+
+	// corrAbove reports that this problem's statement reads an outer query
+	// level (a current-scope OuterColumnRef in its WHERE or searched ON
+	// quals): post-hoc machinery above the tree reads body-local columns no
+	// statement-level collector can see — the unnest rewrite's decorrelated
+	// group keys and probe keys. Parent-aware narrowing is declined here
+	// (the Slice-2 arms still run). Set by the seam, which owns the
+	// resolved predicate; subquery interiors are stepped over, so only the
+	// body's own correlation declines it. Take2 P4-01 Slice 3.
+	corrAbove bool
 }
 
 // joinlistRel is what a joinlist item resolves to: goopg's stand-in for the
@@ -362,11 +390,23 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
 	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
+	s.outputCols, s.outputColsKnown = prob.outputCols, prob.outputColsKnown
+	// Take2 P4-01 Slice 3: parent-aware narrowing is eligible only for the
+	// problem covering its statement's whole prefix (a strict sub-joinlist
+	// publishes to an enclosing problem whose quals this derivation cannot
+	// see) with no pinned spine above it (outer or semi/anti — both read
+	// the searched output from above) and no outer-scope reads (a
+	// correlated statement's unnest group/probe keys read body-local
+	// columns above the tree that no collector sees). Anything else keeps
+	// the zero value on its rels, and the derivation declines there by
+	// construction.
+	s.outputEligible = lo == 0 && hi == len(prob.bindings) && !prob.spineAbove && !prob.pinAbove && !prob.corrAbove
 	// take2 P4-01 rev 10 step 1: publish the set onto the base rels, AFTER the
 	// assignment above. buildInitialRels ran eight lines earlier and could not
 	// have seen it — that ordering is what made P4-01b's first version silently
 	// dormant, so the stamp is deliberately here and not there.
 	s.stampNeededColsOnRels()
+	s.stampOutputColsOnRels()
 	s.addBaseRelIndexPaths(prob.cat)
 	// GEQO: when the query has >= geqo_threshold base relations and geqo is
 	// enabled, use the genetic query optimizer instead of the DP search.
@@ -395,10 +435,15 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	}
 	return joinlistRel{
 		// The hole-filler licenses a PADDED boundary slot for exactly the
-		// coordinates a narrowed index-only leaf legitimately dropped: the
-		// column must be provably outside the statement's needed set. Any
-		// other hole still panics — the totality assertion stays loud for
-		// real producer bugs (M0134-0187, DESIGN §21).
+		// coordinates a narrowed leaf legitimately dropped. Take2 P4-01
+		// Slice 3: besides the statement-unneeded columns (the Slice-2
+		// holes), a below-only join key — read by the statement but by
+		// nothing above this root — may be padded, so the license is the
+		// above-tree set when it is known and the needed set otherwise.
+		// Anything the filler does not license still panics, and the seam
+		// falls the search back when the above-root residual references a
+		// padded coordinate — the totality assertion stays loud for real
+		// producer bugs (M0134-0187, DESIGN §21).
 		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
 			if !prob.neededColsKnown {
 				return SchemaColumn{}, false
@@ -411,7 +456,16 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 						return SchemaColumn{}, false
 					}
 					col := leafSchema[pos]
-					if col.Name == "" || prob.neededCols[col.Name] {
+					if col.Name == "" {
+						return SchemaColumn{}, false
+					}
+					if prob.outputColsKnown && prob.outputCols != nil {
+						if prob.outputCols[col.Name] {
+							return SchemaColumn{}, false
+						}
+						return col, true
+					}
+					if prob.neededCols[col.Name] {
 						return SchemaColumn{}, false
 					}
 					return col, true

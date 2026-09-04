@@ -421,6 +421,20 @@ type resolveContext struct {
 	// and the search boundary can license padded holes (M0134-0187).
 	neededCols      map[string]bool
 	neededColsKnown bool
+
+	// outputCols / outputColsKnown: the statement's above-tree needed-column
+	// set (outputColumnNames, pathindexonlyneed.go), computed beside
+	// neededCols. Take2 P4-01 Slice 3: the union needed above the scan/join
+	// tree from which per-joinrel keep-sets derive. Unknown (or nil) means
+	// "narrow nothing beyond the statement-wide set".
+	outputCols      map[string]bool
+	outputColsKnown bool
+
+	// pinAbove marks a context whose join search runs below a pinned
+	// semi/anti spine (runJoinSearchBelowPinned): the spine's quals and
+	// retained filters read the searched subtree's output from above, so
+	// parent-aware narrowing is declined there. Take2 P4-01 Slice 3.
+	pinAbove bool
 }
 
 type rangeBinding struct {
@@ -1248,6 +1262,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// `searchTupleFraction` for why they are not resolved early.
 			ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 			ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
+			ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 			if unnestPreDPEnabled() && whereEligibleForPreDPUnnest(pred) {
 				// S5a (D3.1): pull up sublinks BEFORE join-order
 				// search — matching upstream's pull_up_sublinks-
@@ -1312,6 +1327,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// WHERE arm populates them: the search reads both.
 		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
+		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
 			node = newChild
 		} else if newChild != node {

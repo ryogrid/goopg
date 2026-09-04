@@ -578,6 +578,12 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// take2 P4-01 rev 10 step 1: a join rel is built during the search,
 		// after s.neededCols is published, so it takes the set directly.
 		joinrel.NeededCols, joinrel.NeededColsKnown = s.neededCols, s.neededColsKnown
+		// Take2 P4-01 Slice 3: the above-tree set travels the same way, but
+		// only on eligible problems (see searchOneProblem) — anything else
+		// keeps the zero value and the keep derivation declines there.
+		if s.outputEligible {
+			joinrel.OutputCols, joinrel.OutputColsKnown = s.outputCols, s.outputColsKnown
+		}
 		// A join row is the concatenation of its two inputs' rows — the
 		// executor's Join emits left++right — so the column count adds
 		// (M0127-P5.7-a).

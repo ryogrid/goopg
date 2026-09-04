@@ -123,7 +123,19 @@ descend:
 	oldSchema := append(Schema(nil), f.Child.Output()...)
 
 	// The historical DP block, verbatim (planner.go legacy position).
+	//
+	// Take2 P4-01 Slice 3: when a pinned spine sits above the searched
+	// subtree, its quals and retained filters read that subtree's output
+	// from above — references the per-joinrel derivation cannot see — so
+	// parent-aware narrowing is declined for this search (the Slice-2
+	// arms still run). The flag is save/restored: the context outlives
+	// this call.
 	var newTarget Node = f
+	if ctx != nil && len(spineJoins)+len(spineFilters) > 0 {
+		saved := ctx.pinAbove
+		ctx.pinAbove = true
+		defer func() { ctx.pinAbove = saved }()
+	}
 	if newChild, newPred := tryJoinSearch(f.Child, f.Predicate, ctx, cat); newPred == nil {
 		newTarget = newChild // all conjuncts consumed → remove Filter
 	} else if newChild != f.Child {

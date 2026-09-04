@@ -58,6 +58,17 @@ counts would not have). Every slice below is values-gated.
   Slice 2 (this commit) lands Target-driven keep-set + model-currency
   proof + identity/decline pins, gates 24/24 + 22/22 both arms +
   TPC-DS PASS=95.
+- Progress 2026-09-04: Slice 3 first cut (statement-wide → joinrel
+  source) was dormant on live Q9 (bit-identical EXPLAIN — root cause:
+  prebuilt-leaf veto, NOT subproblem ineligibility); second cut lifts
+  the veto (prebuilt as boundary leaf, walk never descends) + adds
+  `corrAbove` decline (preserves Q2 decorrelation). LIVE FLIP: Q9
+  witness Batches 2→1, widths 1096→776/896→640/896→736/710→582,
+  delta 10→7 (below-point keys drop; orders-link order keeps 3 keys —
+  gate asserts the rule, not literal 6). Gates: 24/24 values,
+  plan-gate 22/22 (shape unchanged, widths-only movement), TPC-DS
+  PASS=95 MISMATCH=0, Q9 serial 14.66→10.80 s, identical hashes at
+  64/4/512 MB, GOOPG_ASSERT_ROW_SHAPE=1 on.
 
 ## Slice 3+ — Per-joinrel keep-sets; scan-node targets with fixup; upper targets last (reviewed 2026-09-04: proceed-with-changes, all six amendments below folded in)
 

@@ -276,6 +276,36 @@ type RelOptInfo struct {
 	NeededCols      map[string]bool
 	NeededColsKnown bool
 
+	// OutputCols / OutputColsKnown carry the statement's ABOVE-TREE
+	// needed-column set (outputColumnNames, pathindexonlyneed.go): the
+	// names read by consumers above the scan/join tree rather than by
+	// tree-internal quals. Take2 P4-01 Slice 3 (planner-p4-01-target
+	// DESIGN, "Slice 3+"): the union needed above the tree from which
+	// per-joinrel keep-sets derive (F1).
+	//
+	// Like NeededCols it is a statement property travelling by reference,
+	// stamped by the search alongside NeededCols — but ONLY on problems
+	// eligible for parent-aware narrowing (the statement-top problem with
+	// no pinned spine above it; subproblems and spine prefixes keep the
+	// zero value, and the derivation declines there by construction).
+	// OutputColsKnown false, or a nil map, means "no information": narrow
+	// nothing beyond the statement-wide set.
+	OutputCols      map[string]bool
+	OutputColsKnown bool
+
+	// JoinKeep / JoinKeepKnown is this rel's DERIVED joinrel tlist (F1):
+	// the column names the built node for this rel must still emit when
+	// consumed as a hash-join build side — the union of the above-tree
+	// set, the ancestor join quals and the parent join's own quals,
+	// intersected with what this rel supplies. Stamped by the
+	// deriveJoinKeeps pre-pass over the CHOSEN tree (narrowoutput.go),
+	// never by a parent onto a shared path: rels are per-relset singletons
+	// with one position in the chosen tree, while paths are shared across
+	// candidate parents via CheapestTotal. JoinKeepKnown false, or a nil
+	// map, means "no derivation": fall back to the Slice-2 arms.
+	JoinKeep      map[string]bool
+	JoinKeepKnown bool
+
 	// AvgVarBytes is the average total variable-width payload per row, in
 	// bytes — the sum of the per-column average widths (ColumnStats.AvgWidth)
 	// across every column of this relation. It feeds `hashsize.EntryBytes` as

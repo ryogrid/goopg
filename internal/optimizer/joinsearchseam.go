@@ -369,6 +369,21 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// *parser.SelectStmt; the search boundary sees resolved nodes only.
 		neededCols:      ctx.neededCols,
 		neededColsKnown: ctx.neededColsKnown,
+		// Take2 P4-01 Slice 3: the above-tree set, plus the pinned-spine
+		// gates and the correlated-statement gate. A non-empty outer spine
+		// reads the prefix output from above (its ON quals); a pinned
+		// semi/anti spine does the same (predp). A current-scope outer
+		// reference in the searched predicate or ON quals marks a
+		// correlated statement, whose unnest group/probe keys read
+		// body-local columns above the tree that no collector sees
+		// (corrAbove): parent-aware narrowing is declined there, while the
+		// Slice-2 arms still run. Subquery interiors are stepped over, so
+		// only the body's own correlation declines it.
+		outputCols:      ctx.outputCols,
+		outputColsKnown: ctx.outputColsKnown,
+		spineAbove:      len(spine) > 0,
+		pinAbove:        ctx.pinAbove,
+		corrAbove:       exprHasOuterRef(pred) || exprHasOuterRefList(onQuals),
 		// joinInfoList is root->join_info_list from jointree deconstruction,
 		// consumed by join_is_legal/joinOrderRestricted/hasJoinRestriction
 		// inside the search (M0128-P1.2).
@@ -390,6 +405,18 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	residual = nil
 	if len(left) > 0 {
 		residual = combineAnd(left)
+	}
+	// Take2 P4-01 Slice 3: the above-root residual is evaluated ABOVE the
+	// searched subtree, positionally in binding coordinates, so every column
+	// it names must have survived narrowing — a padded (dropped) column
+	// would read back a NULL. When the residual references a padded
+	// coordinate, fall back to the syntactic shape (03 §4.2) rather than
+	// plan a query that runs: Slice-2 pads (statement-unneeded columns) can
+	// never trip this, so the check only fires on the narrower Slice-3
+	// keeps. Name-keyed, erring toward fallback.
+	if residual != nil && searchedResidualHitsPad(residual, searched, ctx.neededCols) {
+		traceSeamDecline("residual-hits-pad", nrels, nprefix)
+		return node, pred, false
 	}
 	if len(spine) == 0 {
 		return searched, residual, true

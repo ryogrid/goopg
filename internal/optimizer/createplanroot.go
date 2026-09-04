@@ -115,6 +115,11 @@ func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (Schem
 	if base < 0 {
 		panic(fmt.Sprintf("createPlan: search root asked to publish binding coordinates from %d", base))
 	}
+	// Take2 P4-01 Slice 3: derive per-joinrel keep-sets over the chosen tree
+	// before the recursion builds nodes. A no-op wherever the sets are
+	// unknown (ineligible problems, hand-built test trees): the Slice-2 arms
+	// and the NeededCols fallback are untouched.
+	deriveJoinKeeps(p)
 	n, lay := createPlanNode(p)
 	if n == nil {
 		panic("createPlan: search root path built no node")

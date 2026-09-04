@@ -596,3 +596,1256 @@ func TestSlice2WitnessModelArithmetic(t *testing.T) {
 		t.Errorf("after total = %.0f, want below the 754717 bar", after.Total)
 	}
 }
+
+// ---- P4-01 Slice 3 FIRST CUT: parent-aware joinrel keep-sets ----
+//
+// Slice 3 changes the keep-set SOURCE at the Slice-2 site
+// (joinInputsFor → narrowBuildInput) from the statement-wide NeededCols to
+// the parent-aware joinrel derivation: one scanjoin target from the union
+// needed above the scan/join tree (F1), hash-only (F2), fixup-complete by
+// fail-closed walks (F3), name-keyed with provably-safe over-keep on
+// self-joins (F4). The three Slice-2 guards carry over unchanged. These
+// tests pin the above-tree collector, the top-down derivation on a
+// Q9-witness-shaped tree (11→6 at the witness level), the decline arms,
+// the never-stamp-paths rule, and the model numbers the flip is stated in.
+
+// TestOutputColumnNamesSkipsTreeInternalRefs: join keys and filter columns
+// live in WHERE/ON — placed in-tree or residual-checked — so the above-tree
+// set holds only the SELECT/GROUP/ORDER names.
+func TestOutputColumnNamesSkipsTreeInternalRefs(t *testing.T) {
+	stmts, err := parser.Parse("select a.a_v from pt_a a, pt_b b where a.a_k = b.b_k group by a.a_v order by a.a_v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, known := outputColumnNames(stmts[0].(*parser.SelectStmt))
+	if !known {
+		t.Fatal("plain join declined; want a known above-tree set")
+	}
+	if !out["a_v"] {
+		t.Errorf("projected/grouped/ordered a_v missing from %v", out)
+	}
+	for _, name := range []string{"a_k", "b_k"} {
+		if out[name] {
+			t.Errorf("tree-internal %q present in the above-tree set %v", name, out)
+		}
+	}
+}
+
+// TestOutputColumnNamesDeclinesLikeNeeded: every shape the needed collector
+// declines, the above-tree collector declines too — an unaccounted
+// above-tree reader is a dropped column.
+func TestOutputColumnNamesDeclinesLikeNeeded(t *testing.T) {
+	for _, sql := range []string{
+		"select * from pt_a a",
+		"with x as (select 1) select a.a_v from pt_a a",
+		"select rank() over (order by a.a_v) from pt_a a",
+	} {
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, known := outputColumnNames(stmts[0].(*parser.SelectStmt)); known || out != nil {
+			t.Errorf("%q: got (%v, %v); want (nil, false)", sql, out, known)
+		}
+	}
+}
+
+// TestOutputColumnNamesCollectsSublinkOuters: EXISTS correlations and IN
+// operands are read above the tree (unnested spine / subplan), so the walk
+// descends into sublink constructs alone — plain WHERE conjuncts still
+// contribute nothing.
+func TestOutputColumnNamesCollectsSublinkOuters(t *testing.T) {
+	exists, err := parser.Parse("select a.a_v from pt_a a where exists (select 1 from pt_b b where b.b_k = a.a_k)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, known := outputColumnNames(exists[0].(*parser.SelectStmt))
+	if !known {
+		t.Fatal("exists query declined; want a known set")
+	}
+	for _, name := range []string{"a_v", "a_k", "b_k"} {
+		if !out[name] {
+			t.Errorf("sublink outer %q missing from %v", name, out)
+		}
+	}
+
+	in, err := parser.Parse("select a.a_v from pt_a a where a.a_k in (select b.b_k from pt_b b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, known = outputColumnNames(in[0].(*parser.SelectStmt))
+	if !known {
+		t.Fatal("in query declined; want a known set")
+	}
+	for _, name := range []string{"a_v", "a_k", "b_k"} {
+		if !out[name] {
+			t.Errorf("in outer %q missing from %v", name, out)
+		}
+	}
+
+	plain, err := parser.Parse("select a.a_v from pt_a a where a.a_k = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, known = outputColumnNames(plain[0].(*parser.SelectStmt))
+	if !known {
+		t.Fatal("plain filter declined; want a known set")
+	}
+	if out["a_k"] {
+		t.Errorf("plain filter column a_k present in %v; plain conjuncts are tree-internal", out)
+	}
+}
+
+// slice3Key builds an equijoin restrictInfo over two named columns, the
+// shape the search places in HashKeys.
+func slice3Key(l, r string, lids, rids RelSet) *restrictInfo {
+	lk := &ColumnRef{Name: l}
+	rk := &ColumnRef{Name: r}
+	return &restrictInfo{
+		leftKey: lk, rightKey: rk,
+		leftRelids: lids, rightRelids: rids,
+		isEquijoin: true,
+		clause:     &BinaryOp{Op: parser.OpEq, Left: lk, Right: rk},
+	}
+}
+
+// slice3Base builds a base rel + scan path pair over the named leaf columns.
+func slice3Base(t *testing.T, ids RelSet, names []string, needed, out map[string]bool) (*RelOptInfo, *Path) {
+	t.Helper()
+	rel := newRelOptInfo(ids, 1000, 32)
+	rel.baseLeaf = &noNode{sch: noSchema(names...)}
+	rel.NCols = len(names)
+	rel.NeededCols, rel.NeededColsKnown = needed, needed != nil
+	rel.OutputCols, rel.OutputColsKnown = out, out != nil
+	return rel, &Path{Kind: PathSeqScan, Rel: rel, Rows: rel.Rows}
+}
+
+// slice3Join builds a hash-join path over two child paths.
+func slice3Join(ids RelSet, outer, inner *Path, keys ...*restrictInfo) (*RelOptInfo, *Path) {
+	rel := newRelOptInfo(ids, 1000, 32)
+	rel.NCols = 0
+	return rel, &Path{Kind: PathHashJoin, Rel: rel, Rows: 1000, Children: []*Path{outer, inner}, HashKeys: keys}
+}
+
+// slice3WitnessTree builds the Q9-witness-shaped tree the Slice-3 gate is
+// stated in: R(W(orders ⋈ J2(ps ⋈ J(line ⋈ part))) ⋈ supp), with the
+// statement-wide needed set (11 names on the J2 build) and the above-tree
+// set (the amount/expression columns). Returns the root path and the rels
+// and schemas the assertions need.
+func slice3WitnessTree(t *testing.T) (root *Path, rels map[string]*RelOptInfo, needed, out map[string]bool) {
+	t.Helper()
+	out = map[string]bool{
+		"l_extendedprice": true, "l_discount": true, "l_quantity": true,
+		"ps_supplycost": true, "o_orderdate": true, "s_name": true,
+	}
+	needed = map[string]bool{
+		"l_extendedprice": true, "l_discount": true, "l_quantity": true,
+		"ps_supplycost": true, "o_orderdate": true, "s_name": true,
+		"o_orderkey": true, "l_orderkey": true,
+		"l_partkey": true, "p_partkey": true,
+		"ps_partkey": true, "ps_suppkey": true,
+		"l_suppkey": true, "s_suppkey": true,
+		"p_name": true,
+	}
+	rels = make(map[string]*RelOptInfo)
+	var pPart, pLine, pPS, pOrders, pSupp *Path
+	rels["part"], pPart = slice3Base(t, 1, []string{"p_partkey", "p_name", "p_mfgr"}, needed, out)
+	rels["line"], pLine = slice3Base(t, 2, []string{"l_orderkey", "l_partkey", "l_suppkey", "l_extendedprice", "l_discount", "l_quantity", "l_comment"}, needed, out)
+	rels["ps"], pPS = slice3Base(t, 4, []string{"ps_partkey", "ps_suppkey", "ps_supplycost", "ps_comment"}, needed, out)
+	rels["orders"], pOrders = slice3Base(t, 8, []string{"o_orderkey", "o_custkey"}, needed, out)
+	rels["supp"], pSupp = slice3Base(t, 16, []string{"s_suppkey", "s_name"}, needed, out)
+
+	var pJ, pJ2, pW *Path
+	rels["J"], pJ = slice3Join(1|2, pLine, pPart, slice3Key("l_partkey", "p_partkey", 2, 1))
+	rels["J"].NeededCols, rels["J"].NeededColsKnown = needed, true
+	rels["J"].OutputCols, rels["J"].OutputColsKnown = out, true
+	rels["J2"], pJ2 = slice3Join(1|2|4, pPS, pJ,
+		slice3Key("ps_partkey", "l_partkey", 4, 1|2),
+		slice3Key("ps_suppkey", "l_suppkey", 4, 1|2))
+	rels["J2"].NeededCols, rels["J2"].NeededColsKnown = needed, true
+	rels["J2"].OutputCols, rels["J2"].OutputColsKnown = out, true
+	rels["W"], pW = slice3Join(1|2|4|8, pOrders, pJ2, slice3Key("o_orderkey", "l_orderkey", 8, 1|2|4))
+	rels["W"].NeededCols, rels["W"].NeededColsKnown = needed, true
+	rels["W"].OutputCols, rels["W"].OutputColsKnown = out, true
+	var pR *Path
+	rels["R"], pR = slice3Join(1|2|4|8|16, pW, pSupp, slice3Key("l_suppkey", "s_suppkey", 1|2|4|8, 16))
+	rels["R"].NeededCols, rels["R"].NeededColsKnown = needed, true
+	rels["R"].OutputCols, rels["R"].OutputColsKnown = out, true
+	return pR, rels, needed, out
+}
+
+// slice3KeepNames resolves a stamped JoinKeep against a schema to the kept
+// names in schema order.
+func slice3KeepNames(t *testing.T, rel *RelOptInfo, sch Schema) []string {
+	t.Helper()
+	if !rel.JoinKeepKnown {
+		t.Fatalf("rel %#08x has no derived keep; want one", uint32(rel.Relids))
+	}
+	keep := neededKeepSet(sch, rel.JoinKeep)
+	got := make([]string, len(keep))
+	for i, c := range keep {
+		got[i] = sch[c].Name
+	}
+	return got
+}
+
+func slice3EqualNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestDeriveJoinKeepsWitnessShape: the top-down derivation on the
+// Q9-witness-shaped tree. The witness build (J2) drops from the
+// statement-wide 11 to the parent-aware 6 (below-only join keys and the
+// part filter column fall out); every level keeps what the joins above it
+// read; and no PATH is written (F1: derived joinrel tlists, never
+// parent-stamped shared paths).
+func TestDeriveJoinKeepsWitnessShape(t *testing.T) {
+	root, rels, needed, _ := slice3WitnessTree(t)
+
+	type pathSnap struct {
+		tgt   []int
+		known bool
+		ncols int
+	}
+	var paths []*Path
+	var snaps []pathSnap
+	var collect func(p *Path)
+	collect = func(p *Path) {
+		if p == nil {
+			return
+		}
+		paths = append(paths, p)
+		snaps = append(snaps, pathSnap{p.Target, p.TargetKnown, p.NCols})
+		for _, c := range p.Children {
+			collect(c)
+		}
+	}
+	collect(root)
+
+	deriveJoinKeeps(root)
+
+	for i, p := range paths {
+		s := snaps[i]
+		if !ptEqualInts(p.Target, s.tgt) || p.TargetKnown != s.known || p.NCols != s.ncols {
+			t.Errorf("path %d mutated: target (%v,%v)/NCols %d, want (%v,%v)/%d",
+				i, p.Target, p.TargetKnown, p.NCols, s.tgt, s.known, s.ncols)
+		}
+		if p.Rel.NeededColsKnown {
+			got := 0
+			for k := range p.Rel.NeededCols {
+				if needed[k] {
+					got++
+				}
+			}
+			if got != len(needed) {
+				t.Errorf("path %d rel NeededCols no longer the statement set", i)
+			}
+		}
+	}
+
+	j2sch := append(append(append(Schema(nil),
+		rels["ps"].baseLeaf.Output()...),
+		rels["line"].baseLeaf.Output()...),
+		rels["part"].baseLeaf.Output()...)
+	if got := slice3KeepNames(t, rels["J2"], j2sch); !slice3EqualNames(got,
+		[]string{"ps_supplycost", "l_orderkey", "l_suppkey", "l_extendedprice", "l_discount", "l_quantity"}) {
+		t.Errorf("J2 keep = %v, want [ps_supplycost l_orderkey l_suppkey l_extendedprice l_discount l_quantity]", got)
+	}
+	if got := neededKeepSet(j2sch, needed); len(got) != 11 {
+		t.Errorf("statement-wide J2 keep = %d columns, want 11 (the Slice-2 width)", len(got))
+	}
+
+	jsch := append(append(Schema(nil), rels["line"].baseLeaf.Output()...), rels["part"].baseLeaf.Output()...)
+	if got := slice3KeepNames(t, rels["J"], jsch); !slice3EqualNames(got,
+		[]string{"l_orderkey", "l_partkey", "l_suppkey", "l_extendedprice", "l_discount", "l_quantity"}) {
+		t.Errorf("J keep = %v, want [l_orderkey l_partkey l_suppkey l_extendedprice l_discount l_quantity]", got)
+	}
+	if got := slice3KeepNames(t, rels["part"], rels["part"].baseLeaf.Output()); !slice3EqualNames(got,
+		[]string{"p_partkey"}) {
+		t.Errorf("part keep = %v, want [p_partkey] (the filter column drops above its own join)", got)
+	}
+	if got := slice3KeepNames(t, rels["supp"], rels["supp"].baseLeaf.Output()); !slice3EqualNames(got,
+		[]string{"s_suppkey", "s_name"}) {
+		t.Errorf("supp keep = %v, want [s_suppkey s_name]", got)
+	}
+	// Outer sides are never narrowed: no stamps on the outer rels.
+	for _, name := range []string{"W", "R", "orders", "line", "ps"} {
+		if rels[name].JoinKeepKnown {
+			t.Errorf("outer rel %s carries a keep; only build sides derive one", name)
+		}
+	}
+}
+
+// TestDeriveJoinKeepsDeclines: every shape the derivation cannot prove safe
+// stamps nothing and the caller falls back bit-identically.
+func TestDeriveJoinKeepsDeclines(t *testing.T) {
+	mkTree := func(t *testing.T, mutate func(w *Path, j2 *Path)) (root *Path, rels map[string]*RelOptInfo) {
+		t.Helper()
+		root, rels, _, _ = slice3WitnessTree(t)
+		// Find W (parent of J2) and J2 in the fixed shape: root R children
+		// are [W, supp], W children are [orders, J2].
+		w := root.Children[0]
+		j2 := w.Children[1]
+		mutate(w, j2)
+		return root, rels
+	}
+	t.Run("unknown above-tree set", func(t *testing.T) {
+		root, rels, _, _ := slice3WitnessTree(t)
+		for _, r := range rels {
+			r.OutputCols, r.OutputColsKnown = nil, false
+		}
+		deriveJoinKeeps(root)
+		for name, r := range rels {
+			if r.JoinKeepKnown {
+				t.Errorf("rel %s stamped without an above-tree set", name)
+			}
+		}
+	})
+	t.Run("uncollectable parent qual", func(t *testing.T) {
+		root, rels := mkTree(t, func(w *Path, j2 *Path) {
+			w.Residual = []*restrictInfo{{clause: &OuterColumnRef{}}}
+		})
+		deriveJoinKeeps(root)
+		if rels["J2"].JoinKeepKnown {
+			t.Error("J2 stamped under an uncollectable parent qual; want fallback")
+		}
+		if rels["J"].JoinKeepKnown || rels["part"].JoinKeepKnown {
+			t.Error("levels below an uncollectable qual stamped; the poison must propagate down")
+		}
+		if !rels["supp"].JoinKeepKnown {
+			t.Error("sibling level above the failure lost its stamp; the poison must not propagate up")
+		}
+	})
+	t.Run("nested-loop build side", func(t *testing.T) {
+		root, rels := mkTree(t, func(w *Path, j2 *Path) {
+			nl := &Path{Kind: PathNestLoop, Rel: j2.Rel, Children: []*Path{j2}, HashKeys: w.HashKeys}
+			w.Children[1] = nl
+		})
+		deriveJoinKeeps(root)
+		if rels["J2"].JoinKeepKnown {
+			t.Error("nested-loop-rooted build side stamped; NLI probe internals are uninventoried (F3)")
+		}
+	})
+	t.Run("merge build side", func(t *testing.T) {
+		root, rels := mkTree(t, func(w *Path, j2 *Path) {
+			m := &Path{Kind: PathMergeJoin, Rel: j2.Rel, Children: []*Path{j2}, HashKeys: w.HashKeys}
+			w.Children[1] = m
+		})
+		deriveJoinKeeps(root)
+		if rels["J2"].JoinKeepKnown {
+			t.Error("merge-rooted build side stamped; merge inputs are out of scope (F2)")
+		}
+	})
+	t.Run("ctid qual vetoes", func(t *testing.T) {
+		root, rels := mkTree(t, func(w *Path, j2 *Path) {
+			w.Residual = []*restrictInfo{{clause: &CTIDExpr{}}}
+		})
+		deriveJoinKeeps(root)
+		if rels["J2"].JoinKeepKnown {
+			t.Error("J2 stamped under a CTID qual; want fallback")
+		}
+	})
+}
+
+// TestNarrowBuildInputJoinKeepArm: end to end through narrowBuildInput, the
+// parent-aware arm emits the narrower Project — and where it declines, the
+// Slice-2 arms run unchanged.
+func TestNarrowBuildInputJoinKeepArm(t *testing.T) {
+	old := narrowBuild
+	narrowBuild = true
+	defer func() { narrowBuild = old }()
+
+	root, rels, _, _ := slice3WitnessTree(t)
+	deriveJoinKeeps(root)
+	j2rel := rels["J2"]
+	j2sch := append(append(append(Schema(nil),
+		rels["ps"].baseLeaf.Output()...),
+		rels["line"].baseLeaf.Output()...),
+		rels["part"].baseLeaf.Output()...)
+	node := &noNode{sch: j2sch}
+	lay := make(outputLayout, len(j2sch))
+	for i := range lay {
+		lay[i] = 100 + i
+	}
+	j2path := &Path{Kind: PathHashJoin, Rel: j2rel}
+
+	got, gotLay := narrowBuildInput("PathHashJoin", node, lay, j2path)
+	proj, ok := got.(*Project)
+	if !ok {
+		t.Fatalf("stamped join build: expected a *Project, got %T", got)
+	}
+	wantNames := []string{"ps_supplycost", "l_orderkey", "l_suppkey", "l_extendedprice", "l_discount", "l_quantity"}
+	out := proj.Output()
+	if len(out) != len(wantNames) {
+		t.Fatalf("schema = %v, want the 6-column parent-aware keep", out)
+	}
+	for i, name := range wantNames {
+		if out[i].Name != name {
+			t.Errorf("schema[%d] = %q, want %q", i, out[i].Name, name)
+		}
+		if cr, isCol := proj.Targets[i].(*ColumnRef); !isCol || cr.Index < 0 || j2sch[cr.Index].Name != name {
+			t.Errorf("target %d does not address %q in the child schema", i, name)
+		}
+		if gotLay[i] != lay[proj.Targets[i].(*ColumnRef).Index] {
+			t.Errorf("layout[%d] = %d, want the kept coordinate", i, gotLay[i])
+		}
+	}
+}
+
+// TestJoinKeepSetEmptyDeclinesToSlice2: a derivation naming nothing in the
+// built schema declines to the Slice-2 arms rather than emitting an empty
+// (or full-width) Project.
+func TestJoinKeepSetEmptyDeclinesToSlice2(t *testing.T) {
+	old := narrowBuild
+	narrowBuild = true
+	defer func() { narrowBuild = old }()
+
+	rel := ptRel([]string{"a", "b", "c", "d"}, map[string]bool{"b": true, "d": true}, true)
+	rel.JoinKeep, rel.JoinKeepKnown = map[string]bool{"zzz": true}, true
+	p := ptScanPath(rel)
+	node := rel.baseLeaf
+	lay := outputLayout{10, 11, 12, 13}
+
+	got, _ := narrowBuildInput("PathHashJoin", node, lay, p)
+	proj, ok := got.(*Project)
+	if !ok {
+		t.Fatalf("expected the Target-arm *Project, got %T", got)
+	}
+	if out := proj.Output(); len(out) != 2 || out[0].Name != "b" || out[1].Name != "d" {
+		t.Errorf("schema = %v, want the Slice-2 Target keep [b d]", out)
+	}
+}
+
+// TestJoinKeepSetSelfJoinOverkeeps: same-named columns of different sources
+// are kept together (F4) — the derivation never wrong-narrows a self-join,
+// it just narrows less.
+func TestJoinKeepSetSelfJoinOverkeeps(t *testing.T) {
+	old := narrowBuild
+	narrowBuild = true
+	defer func() { narrowBuild = old }()
+
+	int4 := catalog.Type{Name: "int4"}
+	sch := Schema{
+		{Name: "n_nationkey", Type: int4, SourceTableIdx: 1},
+		{Name: "n_name", Type: int4, SourceTableIdx: 1},
+		{Name: "n_nationkey", Type: int4, SourceTableIdx: 2},
+		{Name: "n_name", Type: int4, SourceTableIdx: 2},
+	}
+	rel := newRelOptInfo(3, 100, 32)
+	rel.NeededCols, rel.NeededColsKnown = map[string]bool{"n_nationkey": true}, true
+	rel.JoinKeep, rel.JoinKeepKnown = map[string]bool{"n_nationkey": true}, true
+	p := &Path{Kind: PathHashJoin, Rel: rel}
+	lay := outputLayout{1, 2, 3, 4}
+
+	got, gotLay := narrowBuildInput("PathHashJoin", &noNode{sch: sch}, lay, p)
+	proj, ok := got.(*Project)
+	if !ok {
+		t.Fatalf("expected a *Project, got %T", got)
+	}
+	out := proj.Output()
+	if len(out) != 2 || len(gotLay) != 2 {
+		t.Fatalf("schema/layout = %v/%v, want both nationkey copies kept", out, gotLay)
+	}
+	for i, wantSrc := range []int16{1, 2} {
+		if out[i].Name != "n_nationkey" || out[i].SourceTableIdx != wantSrc {
+			t.Errorf("kept[%d] = (%q, source %d), want (n_nationkey, source %d)",
+				i, out[i].Name, out[i].SourceTableIdx, wantSrc)
+		}
+	}
+}
+
+// TestSlice3WitnessModelArithmetic states the Slice-3 gate in MODEL currency
+// — `hashsize.Choose` NBatch and `hashJoinCost` DPPATH totals, the same
+// functions the search calls — for the widths the derivation produces: the
+// statement-wide 11 at the witness build against the parent-aware 6. The
+// NBatch flip (2→1) and the join.hash bar crossing are the per-commit
+// predictions (§13.6 lesson); the byte count pins "width ≈100, not 6".
+func TestSlice3WitnessModelArithmetic(t *testing.T) {
+	const mb = int64(1) << 20
+
+	root, rels, needed, _ := slice3WitnessTree(t)
+	deriveJoinKeeps(root)
+	j2sch := append(append(append(Schema(nil),
+		rels["ps"].baseLeaf.Output()...),
+		rels["line"].baseLeaf.Output()...),
+		rels["part"].baseLeaf.Output()...)
+	stmtWidth := len(neededKeepSet(j2sch, needed))
+	derivedWidth := len(neededKeepSet(j2sch, rels["J2"].JoinKeep))
+	if stmtWidth != 11 {
+		t.Fatalf("statement-wide witness width = %d, want 11", stmtWidth)
+	}
+	if derivedWidth != 6 {
+		t.Fatalf("parent-aware witness width = %d, want 6", derivedWidth)
+	}
+
+	// The pinned regime (bench work_mem 64 MB × hash_mem_multiplier 2):
+	// estimate and actual rows alike, the statement width batches once and
+	// the derived width fits.
+	for _, rows := range []float64{242450, 321056} {
+		if got := hashsize.Choose(rows, stmtWidth, 0, 128*mb); got.NBatch != 2 {
+			t.Errorf("statement width (%.0f rows, %dc): NBatch = %d, want 2", rows, stmtWidth, got.NBatch)
+		}
+		if got := hashsize.Choose(rows, derivedWidth, 0, 128*mb); got.NBatch != 1 {
+			t.Errorf("derived width (%.0f rows, %dc): NBatch = %d, want 1", rows, derivedWidth, got.NBatch)
+		}
+	}
+	// The literal 10→6 prediction from the live witness behaves the same.
+	for _, rows := range []float64{242450, 321056} {
+		if got := hashsize.Choose(rows, 10, 0, 128*mb); got.NBatch != 2 {
+			t.Errorf("live statement width (%.0f rows, 10c): NBatch = %d, want 2", rows, got.NBatch)
+		}
+		if got := hashsize.Choose(rows, 6, 0, 128*mb); got.NBatch != 1 {
+			t.Errorf("live derived width (%.0f rows, 6c): NBatch = %d, want 1", rows, got.NBatch)
+		}
+	}
+
+	// Threshold correction: the narrowed build is ≈100 MB of inner bytes at
+	// actual rows (decimal MB, the unit the retake README uses).
+	if got := 321056 * hashsize.EntryBytes(6, 0); got < 99e6 || got > 101e6 {
+		t.Errorf("narrowed inner bytes = %.1f MB, want ≈100 MB", got/1e6)
+	}
+
+	// DPPATH currency on the witness join (same anchors as the Slice-2
+	// gate): the derived width costs join.hash below the 754 717 bar.
+	cp := defaultCostParams()
+	cp.workMem = 128 * mb
+	outer := costSeqscan(cp, 82273, 1500000, 0)
+	inner := Cost{Startup: 493404.33, Total: 563110.84}
+	inputs := func(innerCols int) hashJoinInputs {
+		return hashJoinInputs{
+			outer: outer, inner: inner,
+			outerRows: 1500000, innerRows: 242450, outputRows: 242450,
+			numHashClauses: 1, outerCols: 9, innerCols: innerCols,
+		}
+	}
+	if got := hashJoinCost(cp, inputs(derivedWidth)); got.Total >= 754717 {
+		t.Errorf("derived join.hash = %.0f, want below the 754717 bar", got.Total)
+	}
+	if wide, narrow := hashJoinCost(cp, inputs(stmtWidth)), hashJoinCost(cp, inputs(derivedWidth)); narrow.Total >= wide.Total {
+		t.Errorf("derived total %.0f not below statement total %.0f", narrow.Total, wide.Total)
+	}
+}
+
+// ---- P4-01 Slice 3 SECOND CUT: wake the derivation over prebuilt leaves,
+// decline correlated bodies ----
+//
+// Diagnosis (instrumented, not assumed): on the TPC-H Q9 witness shape the
+// first cut is dormant — OutputCols IS stamped (the DT inner statement is
+// the top problem of its own planSelect call, so outputEligible holds and
+// the seed is the 6 above-tree names) — but zero JoinKeeps land, because
+// every leaf path in the chosen tree is a PathPrebuilt (leaf-local filters
+// such as p_name LIKE '%green%' force the prebuilt, and cost ties keep it
+// elsewhere), and joinSubtreeNarrowable vetoed prebuilt subtrees. The
+// sub-joinlist-ineligibility hypothesis is refuted for this shape: the
+// problem is flat and eligible; the veto is the dormancy.
+//
+// The wake-up treats PathPrebuilt as a narrowable boundary leaf: keeps apply
+// ABOVE the built subtree by name, interiors run below. The correlated-body
+// decline (corrAbove) is its load-bearing companion, found by the Q2
+// acceptance test: an unnest agg body's group/probe keys read body-local
+// columns above the body tree that no collector sees, so a correlated body
+// narrows by the Slice-2 arms only. LATERAL needs no new code (seam + needed
+// declines already cover it) and is pinned below.
+
+// slice3Q9Catalog builds the six TPC-H relations at realistic widths with
+// analyzed stats (no indexes — the live Q9 baseline is all seq scans), so
+// the 6-way comma join plans as hash joins the derivation can narrow.
+func slice3Q9Catalog(t *testing.T) catalog.Catalog {
+	t.Helper()
+	c := catalog.NewInMemory()
+	types := map[string]string{"p_name": "text", "o_orderdate": "date"}
+	rows := map[string]int64{
+		"part": 200_000, "supplier": 10_000, "lineitem": 6_000_000,
+		"partsupp": 800_000, "orders": 1_500_000, "nation": 25,
+	}
+	mk := func(name string, cols ...string) {
+		t.Helper()
+		cc := make([]catalog.Column, len(cols))
+		for i, cn := range cols {
+			ty := "int4"
+			if v, ok := types[cn]; ok {
+				ty = v
+			}
+			cc[i] = catalog.Column{Name: cn, Type: catalog.Type{Name: ty}}
+		}
+		tbl, err := c.CreateTable(parser.ObjectName{Name: name}, cc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true})
+	}
+	mk("part", "p_partkey", "p_name", "p_mfgr", "p_brand", "p_type", "p_size", "p_container", "p_retailprice", "p_comment")
+	mk("supplier", "s_suppkey", "s_name", "s_address", "s_nationkey", "s_phone", "s_acctbal", "s_comment")
+	mk("lineitem", "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment")
+	mk("partsupp", "ps_partkey", "ps_suppkey", "ps_availqty", "ps_supplycost", "ps_comment")
+	mk("orders", "o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate", "o_orderpriority", "o_clerk", "o_shippriority", "o_comment")
+	mk("nation", "n_nationkey", "n_name", "n_regionkey", "n_comment")
+	return c
+}
+
+// slice3Q9Inner is the live Q9 derived-table body verbatim in shape: six
+// comma joins, equi-keys, and the single-table p_name LIKE filter.
+const slice3Q9Inner = `select n_name as nation, extract(year from o_orderdate) as o_year, l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount from part, supplier, lineitem, partsupp, orders, nation where s_suppkey = l_suppkey and ps_suppkey = l_suppkey and ps_partkey = l_partkey and p_partkey = l_partkey and o_orderkey = l_orderkey and s_nationkey = n_nationkey and p_name like '%green%'`
+
+// slice3Q9Full is the live Q9 shape: the six-way tree owned by derived
+// table profit, consumed under published aliases.
+const slice3Q9Full = `select nation, o_year, sum(amount) as sum_profit from (` + slice3Q9Inner + `) profit group by nation, o_year order by nation, o_year desc`
+
+// slice3BuildProjects collects the build-side narrowing Projects: a Project
+// that is a direct input of a *Join, strictly narrower than its own child,
+// and renaming nothing (a narrowing Project keeps a name-subset of its
+// child's schema in order). Target, boundary-republish (never narrower than
+// its child) and aggregate-input Projects never match — only a build-side
+// narrow sits directly under a join while dropping columns. In particular a
+// derived table's own target list (which renames, e.g. l_orderkey AS o)
+// never matches even where it feeds a lateral join directly.
+func slice3BuildProjects(n Node) []*Project {
+	return slice3BuildProjectsExcept(n, nil)
+}
+
+// slice3ProjectNames returns a Project's output column names in order.
+func slice3ProjectNames(p *Project) []string {
+	out := p.Output()
+	got := make([]string, len(out))
+	for i, c := range out {
+		got[i] = c.Name
+	}
+	return got
+}
+
+// slice3NameSet returns the output names as a set.
+func slice3NameSet(p *Project) map[string]bool {
+	dst := make(map[string]bool, len(p.Output()))
+	for _, c := range p.Output() {
+		dst[c.Name] = true
+	}
+	return dst
+}
+
+// slice3SetEqual reports whether got holds exactly the want names.
+func slice3SetEqual(got map[string]bool, want ...string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		if !got[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// slice3FiltersMentioning returns every *Filter whose predicate mentions the
+// named column at the current scope.
+func slice3FiltersMentioning(n Node, col string) []*Filter {
+	var out []*Filter
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil {
+			return
+		}
+		if f, ok := n.(*Filter); ok && f.Predicate != nil {
+			seen := false
+			if walkExprRefs(f.Predicate, scopeIgnore, exprVisitor{
+				Visit: func(e Expr) bool {
+					if cr, isCol := e.(*ColumnRef); isCol && cr.Name == col {
+						seen = true
+						return false
+					}
+					return true
+				},
+			}) && seen {
+				out = append(out, f)
+			}
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// slice3NullPads counts the NULL-padded targets of a boundary Project.
+func slice3NullPads(p *Project) int {
+	n := 0
+	for _, tg := range p.Targets {
+		if _, isPad := tg.(*NullConst); isPad {
+			n++
+		}
+	}
+	return n
+}
+
+// slice3HasSearchedTree reports whether any subtree root carries the
+// searched-tree tag.
+func slice3HasSearchedTree(n Node) bool {
+	found := false
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil || found {
+			return
+		}
+		if isSearchedTree(n) {
+			found = true
+			return
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return found
+}
+
+// TestJoinSubtreeNarrowablePrebuiltBoundary pins the second-cut gate change
+// and its carry-overs: a prebuilt leaf is a narrowable boundary, a hash tree
+// over prebuilt leaves derives, and merge/nested-loop subtrees still decline
+// (F2 hash-only, F3 fixup inventory — untouched).
+func TestJoinSubtreeNarrowablePrebuiltBoundary(t *testing.T) {
+	pre := &Path{Kind: PathPrebuilt}
+	seq := &Path{Kind: PathSeqScan}
+	if !joinSubtreeNarrowable(pre) {
+		t.Error("PathPrebuilt leaf: got false, want true (narrowable boundary)")
+	}
+	if !joinSubtreeNarrowable(seq) {
+		t.Error("PathSeqScan leaf: got false, want true")
+	}
+	hash := &Path{Kind: PathHashJoin, Children: []*Path{pre, seq}}
+	if !joinSubtreeNarrowable(hash) {
+		t.Error("hash over prebuilt/scan: got false, want true")
+	}
+	if joinSubtreeNarrowable(&Path{Kind: PathMergeJoin, Children: []*Path{pre, seq}}) {
+		t.Error("merge subtree: got true, want false (F2: merge inputs out of scope)")
+	}
+	if joinSubtreeNarrowable(&Path{Kind: PathNestLoop, Children: []*Path{pre, seq}}) {
+		t.Error("nested-loop subtree: got true, want false (F3: probe internals uninventoried)")
+	}
+	if joinSubtreeNarrowable(nil) {
+		t.Error("nil path: got true, want false")
+	}
+}
+
+// TestSlice3LiveQ9ShapeDerivation is regression test (a): the live Q9 shape
+// derivation. The DT-owned six-way tree narrows the witness build 10→7 —
+// not the 10→6 of the task brief, corrected with justification: the three
+// dropped columns are exactly the below-point join keys (s_suppkey consumed
+// at the witness root, s_nationkey/n_nationkey inside it); the surviving
+// l_orderkey/l_partkey/l_suppkey are read by joins ABOVE the witness level
+// in this join order. A 10→6 needs the orders link inside the witness
+// subtree (consuming l_orderkey below the narrow point) — same rule, one
+// order step away. Widths and per-level sets below are the gate prediction.
+func TestSlice3LiveQ9ShapeDerivation(t *testing.T) {
+	cat := slice3Q9Catalog(t)
+	plan, err := Plan(parseOne(t, slice3Q9Full), cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	njoins := 0
+	var walkJoins func(n Node)
+	walkJoins = func(n Node) {
+		if n == nil {
+			return
+		}
+		if j, ok := n.(*Join); ok {
+			njoins++
+			if j.Algo != JoinAlgoHash {
+				t.Errorf("join algo = %v, want JoinAlgoHash (the witness shape is hash-only)", j.Algo)
+			}
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			walkJoins(c)
+		}
+	}
+	walkJoins(plan)
+	if njoins != 5 {
+		t.Fatalf("joins = %d, want 5", njoins)
+	}
+
+	builds := slice3BuildProjects(plan)
+	if len(builds) != 5 {
+		t.Fatalf("narrow builds = %d, want 5 (every hash build narrows)", len(builds))
+	}
+	wantSets := []map[string]bool{
+		{"l_orderkey": true, "l_partkey": true, "l_suppkey": true, "l_quantity": true, "l_extendedprice": true, "l_discount": true, "n_name": true},
+		{"s_suppkey": true, "n_name": true},
+		{"n_nationkey": true, "n_name": true},
+		{"p_partkey": true},
+		{"ps_partkey": true, "ps_suppkey": true, "ps_supplycost": true},
+	}
+	matched := make([]bool, len(wantSets))
+	for _, b := range builds {
+		got := slice3NameSet(b)
+		hit := -1
+		for i, want := range wantSets {
+			if !matched[i] && slice3SetEqual(got, keysOf(want)...) {
+				hit = i
+				break
+			}
+		}
+		if hit < 0 {
+			t.Errorf("unexpected narrow build %v", slice3ProjectNames(b))
+			continue
+		}
+		matched[hit] = true
+	}
+	for i, want := range wantSets {
+		if !matched[i] {
+			t.Errorf("missing narrow build %v", keysOf(want))
+		}
+	}
+
+	if out := plan.Output(); len(out) != 3 || out[0].Name != "nation" || out[1].Name != "o_year" || out[2].Name != "sum_profit" {
+		t.Errorf("outer output = %v, want [nation o_year sum_profit]", out)
+	}
+	// The narrowed-away columns leave licensed holes at the search boundary:
+	// positions stay aligned (pads), so every above-tree reader is stable.
+	pads := 0
+	var walkBoundary func(n Node)
+	walkBoundary = func(n Node) {
+		if n == nil {
+			return
+		}
+		if p, isProj := n.(*Project); isProj && isSearchedTree(n) {
+			pads += slice3NullPads(p)
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			walkBoundary(c)
+		}
+	}
+	walkBoundary(plan)
+	if pads == 0 {
+		t.Error("no NULL pads at any searched boundary; the dropped columns must leave licensed holes")
+	}
+}
+
+// keysOf returns the keys of a name set (for diagnostics).
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestSlice3FilterColumnSurvivesNarrowing is regression test (b): Q9's p_name
+// LIKE filter survives parent-aware narrowing. Trace: p_name is in NEITHER
+// the out seed (WHERE refs are tree-internal by design) NOR any ancestor/at
+// qual set (single-relation, leaf-local) — it survives because its Filter
+// runs BELOW every narrow point, inside the part prebuilt leaf. The part
+// build drops p_name (2→1) while the LIKE still filters.
+func TestSlice3FilterColumnSurvivesNarrowing(t *testing.T) {
+	cat := slice3Q9Catalog(t)
+	plan, err := Plan(parseOne(t, slice3Q9Inner), cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	like := slice3FiltersMentioning(plan, "p_name")
+	if len(like) != 1 {
+		t.Fatalf("p_name filters = %d, want exactly 1 (the leaf-local LIKE)", len(like))
+	}
+	// The LIKE runs on un-narrowed rows: its subtree reaches a scan whose
+	// schema still carries p_name.
+	found := false
+	var walkScan func(n Node)
+	walkScan = func(n Node) {
+		if n == nil || found {
+			return
+		}
+		if s, ok := n.(*SeqScan); ok {
+			for _, c := range s.Output() {
+				if c.Name == "p_name" {
+					found = true
+					return
+				}
+			}
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			walkScan(c)
+		}
+	}
+	walkScan(like[0])
+	if !found {
+		t.Error("LIKE filter has no p_name-carrying scan below it; the filter must run before narrowing")
+	}
+	// And no narrow build above it keeps p_name: the column is dropped after
+	// filtering, never before.
+	for _, b := range slice3BuildProjects(plan) {
+		if slice3NameSet(b)["p_name"] {
+			t.Errorf("narrow build %v keeps p_name; filter columns drop after filtering", slice3ProjectNames(b))
+		}
+	}
+	partKept := false
+	for _, b := range slice3BuildProjects(plan) {
+		if slice3SetEqual(slice3NameSet(b), "p_partkey") {
+			partKept = true
+		}
+	}
+	if !partKept {
+		t.Error("no [p_partkey]-only part build; want the 2→1 filter-column drop")
+	}
+	// No above-root residual sits over the searched tree reading dropped
+	// columns: every WHERE conjunct is placed in-tree or leaf-local here.
+	var checkResidual func(n Node, aboveBoundary bool)
+	checkResidual = func(n Node, aboveBoundary bool) {
+		if n == nil {
+			return
+		}
+		if _, isProj := n.(*Project); isProj && isSearchedTree(n) {
+			aboveBoundary = false
+		}
+		if _, isFilter := n.(*Filter); isFilter && aboveBoundary {
+			t.Errorf("Filter above the search boundary: %T would read narrowed-away columns", n)
+			return
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			checkResidual(c, aboveBoundary)
+		}
+	}
+	checkResidual(plan, true)
+}
+
+// TestSlice3LateralDeclinesDerivation is regression test (c): LATERAL
+// derived tables decline. The outer statement's needed set is unknown (a
+// lateral rangevar declines the collector), so no outer build narrows; the
+// correlated body is corrAbove-marked (its WHERE reads the outer level), so
+// it narrows by the Slice-2 arms only — the orders build keeps the filter
+// column o_orderpriority (3 cols) that parent-aware keeps would drop (2).
+func TestSlice3LateralDeclinesDerivation(t *testing.T) {
+	c := catalog.NewInMemory()
+	mk := func(name string, rows int64, cols ...string) {
+		t.Helper()
+		cc := make([]catalog.Column, len(cols))
+		for i, cn := range cols {
+			ty := "int4"
+			switch cn {
+			case "o_orderdate":
+				ty = "date"
+			case "o_orderpriority":
+				ty = "text"
+			}
+			cc[i] = catalog.Column{Name: cn, Type: catalog.Type{Name: ty}}
+		}
+		tbl, err := c.CreateTable(parser.ObjectName{Name: name}, cc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows, Pages: int(rows / 100), Analyzed: true})
+	}
+	mk("supplier", 10_000, "s_suppkey", "s_name", "s_address", "s_nationkey", "s_phone", "s_acctbal", "s_comment")
+	mk("nation", 500_000, "n_nationkey", "n_name", "n_regionkey", "n_comment")
+	mk("lineitem", 6_000_000, "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment")
+	mk("orders", 1_500_000, "o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate", "o_orderpriority", "o_clerk", "o_shippriority", "o_comment")
+	sql := `select s_name, n_name, dt.o, dt.od from supplier s, nation n, lateral (select l_orderkey as o, o_orderdate as od from lineitem l, orders o where l_orderkey = o_orderkey and l_suppkey = s.s_suppkey and o_orderpriority = '1-URGENT') dt where s_nationkey = n_nationkey`
+	stmt := parseOne(t, sql)
+	if nc, known := neededColumnNames(stmt.(*parser.SelectStmt)); known || nc != nil {
+		t.Errorf("outer needed = (%v, %v); a lateral rangevar must decline the set", nc, known)
+	}
+	plan, err := Plan(stmt, c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	lat := findLateralJoin(plan)
+	if lat == nil {
+		t.Fatal("no Lateral join in the plan; the shape under test is gone")
+	}
+	if out := plan.Output(); len(out) != 4 || out[0].Name != "s_name" || out[1].Name != "n_name" || out[2].Name != "o" || out[3].Name != "od" {
+		t.Errorf("outer output = %v, want [s_name n_name o od]", out)
+	}
+	// The outer statement is never searched (seam lateral decline)…
+	if slice3HasSearchedTreeExcept(plan, lat.Right) {
+		t.Error("searched subtree outside the lateral body; the outer search must decline on lateral")
+	}
+	// …so no outer build narrows (the needed set is unknown there)…
+	for _, b := range slice3BuildProjectsExcept(plan, lat.Right) {
+		t.Errorf("outer narrow build %v; lateral statements narrow nothing outside the body", slice3ProjectNames(b))
+	}
+	// …while the correlated body IS searched (order selection still runs)…
+	if !slice3HasSearchedTree(lat.Right) {
+		t.Error("no searched subtree in the lateral body; the body search must still run")
+	}
+	// …but narrows by the Slice-2 arms only: the orders build keeps the
+	// leaf-local filter column (3 cols, not the parent-aware 2).
+	bodyBuilds := slice3BuildProjects(lat.Right)
+	if len(bodyBuilds) != 1 {
+		t.Fatalf("body narrow builds = %d, want 1 (the orders build side)", len(bodyBuilds))
+	}
+	if got := slice3NameSet(bodyBuilds[0]); !slice3SetEqual(got, "o_orderkey", "o_orderdate", "o_orderpriority") {
+		t.Errorf("body orders build = %v, want [o_orderkey o_orderdate o_orderpriority] (statement-wide, filter kept)", slice3ProjectNames(bodyBuilds[0]))
+	}
+}
+
+// slice3IsNarrowBuild reports whether p is a build-side narrowing Project:
+// strictly narrower than its child and renaming nothing.
+func slice3IsNarrowBuild(p *Project) bool {
+	if p == nil || p.Child == nil || len(p.Output()) >= len(p.Child.Output()) {
+		return false
+	}
+	childNames := make(map[string]bool, len(p.Child.Output()))
+	for _, c := range p.Child.Output() {
+		childNames[c.Name] = true
+	}
+	for _, c := range p.Output() {
+		if !childNames[c.Name] {
+			return false
+		}
+	}
+	return true
+}
+
+// slice3HasSearchedTreeExcept reports a searched tag anywhere outside skip.
+func slice3HasSearchedTreeExcept(n, skip Node) bool {
+	found := false
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil || found || n == skip {
+			return
+		}
+		if isSearchedTree(n) {
+			found = true
+			return
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return found
+}
+
+// slice3BuildProjectsExcept collects narrow builds outside skip.
+func slice3BuildProjectsExcept(n, skip Node) []*Project {
+	var out []*Project
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil || n == skip {
+			return
+		}
+		if j, ok := n.(*Join); ok {
+			for _, side := range []Node{j.Left, j.Right} {
+				if p, isProj := side.(*Project); isProj && slice3IsNarrowBuild(p) {
+					out = append(out, p)
+				}
+			}
+		}
+		for _, c := range boundaryWalkChildren(n) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// TestSlice3DerivedTableAliasMapping is regression test (d1): published
+// names never enter the inner tree. The DT publishes px/py while leaves
+// carry base names; the inner derivation is self-consistent per level — the
+// t1 build keeps base [k x] (dropping the filter column f1 after filtering)
+// and no narrow output names px/py.
+func TestSlice3DerivedTableAliasMapping(t *testing.T) {
+	c := catalog.NewInMemory()
+	mk := func(name string, rows int64, cols ...string) {
+		t.Helper()
+		cc := make([]catalog.Column, len(cols))
+		for i, cn := range cols {
+			cc[i] = catalog.Column{Name: cn, Type: catalog.Type{Name: "int4"}}
+		}
+		tbl, err := c.CreateTable(parser.ObjectName{Name: name}, cc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows, Pages: int(rows / 100), Analyzed: true})
+	}
+	mk("t1", 300_000, "k", "x", "f1", "f2")
+	mk("t2", 500_000, "k", "y", "g1", "g2")
+	plan, err := Plan(parseOne(t, `select px, sum(py) from (select a.x as px, b.y as py from t1 a, t2 b where a.k = b.k and a.f1 > 10) dt group by px`), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	builds := slice3BuildProjects(plan)
+	if len(builds) != 1 {
+		t.Fatalf("narrow builds = %d, want 1 (the t1 build side)", len(builds))
+	}
+	if got := slice3ProjectNames(builds[0]); !slice3EqualNames(got, []string{"k", "x"}) {
+		t.Errorf("t1 build = %v, want [k x] (base names; f1 drops after filtering)", got)
+	}
+	for _, b := range builds {
+		for _, name := range slice3ProjectNames(b) {
+			if name == "px" || name == "py" {
+				t.Errorf("narrow build %v names a published alias; outer names never enter the inner tree", slice3ProjectNames(b))
+			}
+		}
+	}
+	if f := slice3FiltersMentioning(plan, "f1"); len(f) != 1 {
+		t.Errorf("f1 filters = %d, want exactly 1 (leaf-local, below the narrow point)", len(f))
+	}
+	if out := plan.Output(); len(out) != 2 || out[0].Name != "px" || out[1].Name != "sum" {
+		t.Errorf("outer output = %v, want [px sum]", out)
+	}
+}
+
+// TestSlice3SelfJoinInDerivedTable is regression test (d2): a self-join
+// inside a derived table over-keeps symmetric copies (F4). The (nation a ⋈
+// nation b) build keeps BOTH n_name copies (and both n_regionkey copies the
+// at-names match on both sides) — never exactly one of a pair — while
+// below-only columns still drop.
+func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
+	c := catalog.NewInMemory()
+	mk := func(name string, rows int64, cols ...string) {
+		t.Helper()
+		cc := make([]catalog.Column, len(cols))
+		for i, cn := range cols {
+			ty := "int4"
+			if cn == "n_name" || cn == "n_comment" || cn == "r_name" || cn == "r_comment" {
+				ty = "text"
+			}
+			cc[i] = catalog.Column{Name: cn, Type: catalog.Type{Name: ty}}
+		}
+		tbl, err := c.CreateTable(parser.ObjectName{Name: name}, cc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows, Pages: int(rows / 100), Analyzed: true})
+	}
+	mk("nation", 200_000, "n_nationkey", "n_name", "n_regionkey", "n_comment")
+	mk("region", 1_000_000_000, "r_regionkey", "r_name", "r_comment")
+	plan, err := Plan(parseOne(t, `select x, count(*) from (select a.n_name as x, r.r_name as y from nation a, nation b, region r where a.n_nationkey = b.n_regionkey and b.n_regionkey = r.r_regionkey and a.n_regionkey > 1) dt group by x`), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	selfKept := false
+	for _, b := range slice3BuildProjects(plan) {
+		got := slice3ProjectNames(b)
+		if slice3EqualNames(got, []string{"n_name", "n_regionkey", "n_name", "n_regionkey"}) {
+			selfKept = true
+		}
+		// F4 pair rule: a name occurring twice in the narrowed child's
+		// schema is kept twice or not at all — never exactly once.
+		counts := map[string]int{}
+		for _, name := range got {
+			counts[name]++
+		}
+		childCounts := map[string]int{}
+		for _, col := range b.Child.Output() {
+			childCounts[col.Name]++
+		}
+		for name, n := range counts {
+			if childCounts[name] == 2 && n != 2 {
+				t.Errorf("build %v keeps %d of 2 %q copies; self-joins over-keep symmetric pairs", got, n, name)
+			}
+		}
+	}
+	if !selfKept {
+		t.Error("no [n_name n_regionkey n_name n_regionkey] self-join build; want the symmetric over-keep")
+	}
+	if out := plan.Output(); len(out) != 2 || out[0].Name != "x" || out[1].Name != "count" {
+		t.Errorf("outer output = %v, want [x count]", out)
+	}
+}
+
+// TestSlice3CorrelatedBodyDeclinesParentAware pins the corrAbove gate at the
+// unit level: a current-scope outer reference declines, a plain predicate
+// does not, and an outer reference sealed inside a subplan does not (it
+// belongs to the body's own scope — scopeIgnore steps over it).
+func TestSlice3CorrelatedBodyDeclinesParentAware(t *testing.T) {
+	outer := &OuterColumnRef{Name: "p_partkey", Index: 3}
+	local := func(name string, idx int) *ColumnRef { return &ColumnRef{Name: name, Index: idx} }
+	corr := &BinaryOp{Op: parser.OpEq, Left: local("ps_partkey", 0), Right: outer}
+	if !exprHasOuterRef(corr) {
+		t.Error("correlated equality: got false, want true")
+	}
+	plain := &BinaryOp{Op: parser.OpEq, Left: local("a", 0), Right: local("b", 1)}
+	if exprHasOuterRef(plain) {
+		t.Error("plain equality: got true, want false")
+	}
+	if exprHasOuterRef(nil) {
+		t.Error("nil expr: got true, want false")
+	}
+	sealed := &SubqueryExpr{Plan: &Filter{Predicate: corr}}
+	if exprHasOuterRef(sealed) {
+		t.Error("subplan-sealed outer ref: got true, want false (inner scopes are stepped over)")
+	}
+	if exprHasOuterRefList([]Expr{plain, nil}) {
+		t.Error("plain list: got true, want false")
+	}
+	if !exprHasOuterRefList([]Expr{plain, corr}) {
+		t.Error("mixed list: got false, want true")
+	}
+	// End to end, the correlated Q2 scalar-aggregate body still decorrelates
+	// (the acceptance test that caught the first interaction): the decline
+	// keeps the group key in the body's searched output.
+	if agg := func() *Aggregate {
+		saved := pgShapedDP
+		pgShapedDP = true
+		defer func() { pgShapedDP = saved }()
+		stmts, err := parser.Parse(jsgQ2SQL)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		plan, err := Plan(stmts[0], jsgCatalog(t))
+		if err != nil {
+			t.Fatalf("plan: %v", err)
+		}
+		return jsgDecorrelatedAgg(plan)
+	}(); agg == nil {
+		t.Error("Q2 scalar aggregate no longer decorrelates; corrAbove over-declines or the body lost its group key")
+	}
+}
+
+// TestSlice3LiveDeltaModelArithmetic states the live-shape gate in MODEL
+// currency for the measured 10→7 delta (same functions the search calls,
+// pinned regime: bench work_mem 64 MB × hash_mem_multiplier 2).
+func TestSlice3LiveDeltaModelArithmetic(t *testing.T) {
+	const mb = int64(1) << 20
+	// Estimate rows flip 2→1; actual rows stay 2→2 (honest: the 10→7 delta
+	// buys one batch at estimate, not at actuals — the task's 10→6 flips
+	// both, needing the orders link inside the witness subtree).
+	if got := hashsize.Choose(242450, 10, 0, 128*mb); got.NBatch != 2 {
+		t.Errorf("statement width @estimate: NBatch = %d, want 2", got.NBatch)
+	}
+	if got := hashsize.Choose(242450, 7, 0, 128*mb); got.NBatch != 1 {
+		t.Errorf("derived width @estimate: NBatch = %d, want 1", got.NBatch)
+	}
+	if got := hashsize.Choose(321056, 10, 0, 128*mb); got.NBatch != 2 {
+		t.Errorf("statement width @actual: NBatch = %d, want 2", got.NBatch)
+	}
+	if got := hashsize.Choose(321056, 7, 0, 128*mb); got.NBatch != 2 {
+		t.Errorf("derived width @actual: NBatch = %d, want 2 (no flip at actuals)", got.NBatch)
+	}
+	// Width ≈116 MB, not 6 columns: EntryBytes(7) = 360.
+	if got := hashsize.EntryBytes(7, 0); got != 360 {
+		t.Errorf("EntryBytes(7) = %.0f, want 360", got)
+	}
+	if got := 321056 * hashsize.EntryBytes(7, 0); got < 115e6 || got > 116e6 {
+		t.Errorf("narrowed inner bytes = %.1f MB, want ≈115.6 MB", got/1e6)
+	}
+	// DPPATH currency on the witness join (Slice-2 gate anchors): the
+	// derived width costs join.hash below the 754717 bar.
+	cp := defaultCostParams()
+	cp.workMem = 128 * mb
+	outer := costSeqscan(cp, 82273, 1500000, 0)
+	inner := Cost{Startup: 493404.33, Total: 563110.84}
+	inputs := func(innerCols int) hashJoinInputs {
+		return hashJoinInputs{
+			outer: outer, inner: inner,
+			outerRows: 1500000, innerRows: 242450, outputRows: 242450,
+			numHashClauses: 1, outerCols: 9, innerCols: innerCols,
+		}
+	}
+	if got := hashJoinCost(cp, inputs(10)); got.Total < 754717 {
+		t.Errorf("statement join.hash = %.0f, want at/above the 754717 bar", got.Total)
+	}
+	if got := hashJoinCost(cp, inputs(7)); got.Total >= 754717 {
+		t.Errorf("derived join.hash = %.0f, want below the 754717 bar", got.Total)
+	}
+	if wide, narrow := hashJoinCost(cp, inputs(10)), hashJoinCost(cp, inputs(7)); narrow.Total >= wide.Total {
+		t.Errorf("derived total %.0f not below statement total %.0f", narrow.Total, wide.Total)
+	}
+}
