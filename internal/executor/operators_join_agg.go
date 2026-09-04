@@ -4137,18 +4137,15 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 			return nil, err
 		}
 		row := slotRow(slot)
-		// Always make an independent copy: clone the slice AND
-		// materialize any arena-backed Datums so each entry stays
-		// valid regardless of the producer's slot reuse or arena
-		// reset.  (M0097-0058 CTE-left cross join fix.)
-		// Always make an independent copy: clone the slice AND materialize
-		// any arena-backed Datums so each entry stays valid regardless of
-		// the producer's slot reuse or arena reset.
-		dup := make(Row, len(row))
-		copy(dup, row)
-		if rowHasArena(row) {
-			dup = cloneRowOwned(dup)
-		}
+		// Always make an independent copy: cloneRowOwned clones the
+		// slice AND materializes any arena-backed Datums so each entry
+		// stays valid regardless of the producer's slot reuse or arena
+		// reset. A single cloneRowOwned covers both: the slice copy
+		// owns non-arena Datums, and MaterializeArena detaches
+		// arena-backed ones (no-op per Datum otherwise), so no
+		// separate make+copy is needed. (M0097-0058 CTE-left cross
+		// join fix; EX2-02a fold of the arena-path double copy.)
+		dup := cloneRowOwned(row)
 		rows = append(rows, dup)
 		n++
 	}
@@ -4175,12 +4172,12 @@ func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([
 			return nil, nil, err
 		}
 		row := slotRow(slot)
-		// Always make an independent copy (see drainRowsCtx above).
-		dup := make(Row, len(row))
-		copy(dup, row)
-		if rowHasArena(row) {
-			dup = cloneRowOwned(dup)
-		}
+		// Always make an independent copy (see drainRowsCtx above:
+		// single cloneRowOwned; EX2-02a fold). The TID sidecar below
+		// comes from scanLeaf.currentTID() (scan-operator cursor
+		// state), not from the row buffer, so it is unaffected by
+		// the row-copy fold.
+		dup := cloneRowOwned(row)
 		rows = append(rows, dup)
 		if scanLeaf != nil {
 			rel, ptr, ok := scanLeaf.currentTID()

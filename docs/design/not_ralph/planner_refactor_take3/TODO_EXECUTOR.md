@@ -114,11 +114,13 @@ Exit: alloc arm down on witnesses, timing neutral-or-better, per-seam
 tripwires green, values clean, plans unchanged.
 
 - [x] EX2-01 Retention-boundary audit — this commit; gates: audit reviewed (8-family spot-check exact; rework for truncation/memoize/gather/C6-C7 completed and verified), no code; artifacts: `analysis/planner-refactor-take3/ex201-audit-20260904/README.md` (45 sites: 18 cloneRowOwned + 14 MaterializeArena + 13 acquireRow; top EX2-02 candidates: A12/C17 virtual-row seam, C9, C10, C11; C8 scoped-caution: source aliases producer slot)
-- [ ] EX2-02a Ownership passing at join seams — sole-owner bounded-lifetime
-      clones become transfers. Join seams first (G-EX3 cascade product
-      shrinks here too).
-      *design: 13 §4; gate: alloc arm down; seam tripwire tests; values +
-      pin.*
+- [x] EX2-02a Ownership passing at join seams — this commit (first cut:
+      C9/C10 `drainRowsCtx`/`drainRowsCtxCTID` make+copy folded into
+      single `cloneRowOwned`; TID sidecar verified buffer-independent);
+      gates: executor drain/join/agg + poison tests, TPC-H 24/24 MATCH,
+      plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0, Q15b-MAIN 25.29→20.93 s
+      alloc window 12.57→11.56 GB values identical (single-sample);
+      artifacts: `internal/executor/operators_join_agg.go`
 - [ ] EX2-02b Ownership passing at agg input — sole-owner
       bounded-lifetime clones become transfers. Separate commit from 02a
       (one seam family per commit, EX-P3).
