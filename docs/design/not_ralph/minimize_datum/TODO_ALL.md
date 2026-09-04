@@ -57,7 +57,7 @@ tree (`git log -S` / `--grep`) on 2026-09-04; the **tree verdict** governs.
 | EX0 instruments | n/a (take3 work) | all `[x]`, phase closed | **Confirmed** — `6ace9567e`/`503f12cf7`/`b6254f911` (EX0-01/02), `eaff87ee0`/`a7e2f86f6`/`eedc924de` (EX0-03/03b/03c), `86bf7473f` (EX0-04), `14f8d8f1a` (EX0-05), `e8c7400f9` (EX0-06). MD blocker (3) is discharged. |
 | EX1 narrowing | n/a | EX1-01/02/02b `[x]`, EX1-03 dropped, EX1-04 cut 1 `[x]` | **Confirmed** — incl. `230a32bd0` (EX1-03 drop), `134324df6` (EX1-04 Cut 0 + unblock review). |
 | EX2 clone elimination | n/a | audit + 02a/02c `[x]`, 02b dropped, 03 measure-only | **Confirmed** — incl. `efbca66e4` (EX2-01 audit: 45 sites), `fe2808bc9` (02b drop). MD-04 consumes the EX2-01 audit; no second audit. |
-| EX3 spill/sort/hash | n/a | 01/02/03-step1/05-cutA `[x]`, step2 blocked, cutB dropped | **Confirmed** — incl. `53e41fdbf` (EX3-01), `7c586eaf7` (step-2 blocked + resume patch), `a9cf79c81` (cut-B drop). |
+| EX3 spill/sort/hash | n/a | 01/02/03-step1/05-cutA `[x]`, step2 blocked, cutB dropped | **Confirmed** — incl. `53e41fdbf` (EX3-01), `7c586eaf7` (step-2 blocked + resume patch), `a9cf79c81` (cut-B drop). **Plus post-reconciliation landings: EX3-02 Cut 2 (`68ccd68c3`, stratum-D chunk views, unit 2.002→0.005) and EX3-05 Cut A (`fd2e2ae7a`, wantCTIDs gate) with full gates; E-12's "Cut 2 blocked" premise is stale (corrected inline). |
 
 ---
 
@@ -653,8 +653,10 @@ per arm; values never counts for projection/join-adjacent changes).*
   legal outcomes: wire with depth policy + timing/alloc gate, or
   ledger-decline (pool hints + workers suffice). Not a commitment.
   *design: take3 13 §7; gate: A/B or ledger row.*
-- [!] **E-12 EX3-02 Cut 2 (stratum D) + Cut 3 (oversize + teardown) —
-  BLOCKED on E-14.** Queued behind landed Cut 0/1; arena sizing is
+- [!] **E-12 EX3-02 Cut 3 (oversize + teardown) — BLOCKED on E-14.**
+  (Record correction 2026-09-04: Cut 2 already LANDED — `68ccd68c3`,
+  unit headers 2.002→0.005, TPC-H 24/24 + PP 22/22 + TPC-DS PASS=95;
+  only Cut 3 remains here.) Queued behind landed Cut 0/1/2; arena sizing is
   batching geometry over the redesigned build rows.
   *design: `docs/design/executor-ex3-02-dense-build/DESIGN.md`; gate:
   poison tests + gate suite + values + pin.*
