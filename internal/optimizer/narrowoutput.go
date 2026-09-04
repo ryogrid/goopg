@@ -32,6 +32,17 @@ func narrowBuildFromEnv(v string) bool { return v != "0" }
 // (NeededColsKnown false — the collector declined, which must not be read
 // as "keep nothing"). The pre-flip behaviour is one export away, so any
 // future gate measures the flag rather than the commit.
+//
+// Take2 P4-01 Slice 2 (planner-p4-01-target DESIGN, "Slice 2"): the keep-set
+// comes from the inner path's Slice-1 Target — the ordered emitted-column
+// list computed from NeededCols at path-creation time — via `buildKeepSet`
+// below, instead of being re-derived from NeededCols by name at plan time.
+// Where the Target does not apply (unknown, or a narrowed scan whose schema
+// is not the Target's coordinate space) the derivation falls back to today's
+// NeededCols path bit-identically, so the only observable change is the
+// SOURCE of an identical list. `narrowPlanOutput`'s ascending/unique/in-range
+// guard is untouched: a Target in emitted-schema order passes it without
+// loosening, and anything else declines with the pair untouched.
 func narrowBuildInput(kind string, innerNode Node, innerLay outputLayout, innerPath *Path) (Node, outputLayout) {
 	if !narrowBuild || kind != "PathHashJoin" {
 		return innerNode, innerLay
@@ -39,7 +50,64 @@ func narrowBuildInput(kind string, innerNode Node, innerLay outputLayout, innerP
 	if innerNode == nil || innerPath == nil || innerPath.Rel == nil || !innerPath.Rel.NeededColsKnown {
 		return innerNode, innerLay
 	}
+	if keep, ok := buildKeepSet(innerNode, innerPath); ok {
+		return narrowPlanOutput(innerNode, innerLay, keep)
+	}
 	return narrowPlanOutput(innerNode, innerLay, neededKeepSet(innerNode.Output(), innerPath.Rel.NeededCols))
+}
+
+// buildKeepSet derives the hash-build keep-set from the inner path's Slice-1
+// Target, reporting false ("unknown", fall back) wherever the Target does not
+// apply. The fallback is today's NeededCols derivation, unchanged.
+//
+// The second arm below — the coordinate-identity precondition — is
+// load-bearing, and it is a tightening, not a loosening, of the decline
+// contract. `scanPathTarget` records positions into the REL's leaf output, but
+// not every scan path builds a node with that schema: `IndexOnlyScan` emits
+// its covered columns in INDEX order (createplanindex.go:351-365), so leaf
+// positions applied to it would keep an in-range-but-shifted column — exactly
+// the permutation wrong-answer class the P4-01b lesson forbids, and one the
+// ascending/unique/in-range guard in `narrowPlanOutput` cannot catch (a
+// shifted position is still ascending, unique and in range, while the
+// name-based derivation gets it right). A narrowed scan therefore falls back
+// rather than misselect.
+//
+// Conversely the Target arm runs only where it is provably identical to the
+// fallback: `scanPathTarget` IS `neededKeepSet` over this same leaf schema and
+// set, so on a coordinate-identical node the two derivations are the same
+// function of the same inputs, and the keep list is the same one.
+func buildKeepSet(innerNode Node, innerPath *Path) ([]int, bool) {
+	if innerPath == nil || !innerPath.TargetKnown || innerPath.Target == nil {
+		return nil, false
+	}
+	if innerPath.Rel == nil || innerPath.Rel.baseLeaf == nil {
+		// No leaf schema to check coordinates against (a unit-built path, or
+		// any non-scan shape carrying a target it should not have): decline
+		// rather than index a schema that is not there.
+		return nil, false
+	}
+	if innerNode == nil || !sameOutputColumns(innerNode.Output(), innerPath.Rel.baseLeaf.Output()) {
+		return nil, false
+	}
+	return innerPath.Target, true
+}
+
+// sameOutputColumns reports whether two schemas carry the same columns in the
+// same order — the coordinate-identity precondition `buildKeepSet` needs
+// before a leaf-position list may index a built node. Names IN ORDER (not a
+// set) is the comparison: a full-coverage index emitting every column in index
+// order is the same set as the leaf but a different coordinate space, and a
+// set comparison would admit it.
+func sameOutputColumns(a, b Schema) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
 }
 
 // Build-side output narrowing — take2 P4-01, rev 10 step 2.

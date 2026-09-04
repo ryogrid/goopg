@@ -37,19 +37,27 @@ counts would not have). Every slice below is values-gated.
   mechanism (`narrowoutput.go` — row and schema narrow together,
   the rev-7 proven-safe shape), driven by the Slice-1 target instead
   of `NeededCols`-by-name; costing through the landed
-  `pathNCols`/`pathAvgVarBytes` readers. Gate in MODEL currency:
-  `NBatch` 2→1 (P4-A §8 table); runtime `Batches:` recorded, not
-  gated — landed step-4 measured 8→4 @64MB (48 B/column Datum is
-  co-dominant, out of scope), so 8→1 as a runtime gate is already
-  falsified. Width ≈100 not 6, DPPATH join.hash below 754717,
-  values both suites + timing, both-suites PP (widths-only, zero
-  structural), regress suite, three-budget (64/4/512 MB) value gate.
-- Dependency precision (for EX1-04): Slice 1 unblocks NOTHING at
-  execution (assert-only). EX1-04's build chain needs Slice 2
-  minimum (only an applied narrowed schema moves runtime batch
-  geometry); its sort-input chain needs Slice 3
-  (`make_sort_input_target`). "Blocking EX1-04" is true of the
-  plan, not of this item.
+  `pathNCols`/`pathAvgVarBytes` readers. Coordinate-identity
+  precondition (length + names-in-order) guards the arm — an
+  IndexOnlyScan leaf (index-ordered subset output) falls back rather
+  than misselecting shifted columns. Unknown target → bit-identical
+  fallback. No scan `NCols` stamping (would desync planner-prices /
+  executor-builds).
+- CALIBRATION (as built): the Target arm is provably identical to the
+  fallback where it runs, so Slice 2 is behaviour-neutral — it does
+  NOT flip live `Batches:2→1` (that needs the 10→6 column delta from
+  per-joinrel keep-sets = Slice 3). Gate: `changed=0` PP both suites
+  + `-digest`/`-diff` values-identical + model-currency proof in unit
+  harness (30 cols→NBatch 4, 10→2, 6→1 @128MB; DPPATH join.hash
+  923247→669589 crossing 754717; narrowed inner bytes ≈100 ✓).
+  The live flip (runtime `Batches:` + widths) gates Slice 3.
+- Progress 2026-09-04: Slice 1 landed `588aa5fb5` (assert-only Target
+  payload; 24/24 + 22/22 both arms); §12 re-taken on HEAD
+  (`analysis/planner-refactor-take3/p401-retake-20260904/README.md`:
+  witness now Batches:2, widths 1096/896/896/710, Q9 14.7 s serial);
+  Slice 2 (this commit) lands Target-driven keep-set + model-currency
+  proof + identity/decline pins, gates 24/24 + 22/22 both arms +
+  TPC-DS PASS=95.
 
 ## Slice 3+ — Scan-node targets with fixup; join/upper targets last
 
