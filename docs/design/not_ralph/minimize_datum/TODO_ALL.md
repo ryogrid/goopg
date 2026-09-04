@@ -110,8 +110,15 @@ tracks recorded.*
   FROM-planning chain, additive `RTID int32` on the §4 minimal set;
   nested paths get RTID 0 → zero rendering movement; gates: full
   optimizer suite + 3 new RTID pins, TPC-H 24/24 MATCH, plan-gate 22/22).
-  Cuts 2–4 (re-entrant threading, explain_names migration, re-measure)
-  next.
+  Cut 2 LANDED 2026-09-04 (scope threaded through `planSelectWithParent`
+  + 4 Expr sublink planners via `rtScope` on resolveContext + derived/
+  CTE/set-op/DML paths; DML targets stamped; dead `planSelect` wrapper
+  deleted; F3 walker extended to Expr-hanging subplan bodies via
+  `optimizer.NodeSubplans`; Q30-shape + 12-shape + determinism pins;
+  gates: optimizer + Explain suites, TPC-H 24/24 MATCH, PP 20/22 with 2
+  label-only DIFFERs in the designed direction — Q11/Q22 sublink scans
+  now registered as `_1`, costs/rows byte-identical).
+  Cuts 3–4 (explain_names migration, re-measure) next.
   *design: take3 08 §3; gate: take3 09 §5 P0 + units/regress; re-pin the
   goopg-vs-goopg baseline in the same commit.*
 - [ ] **A-02 P0-05 plan-parity capture.** EXPLAIN from goopg and PG for

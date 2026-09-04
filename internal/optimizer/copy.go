@@ -21,7 +21,12 @@ import (
 // resulting Project node — the wire layer's row formatter takes
 // over from there. Query-form is only valid with TO; the parser
 // already enforces that.
-func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
+//
+// scope is the statement's rtableScope (A-01(ii) cut 2): the inner
+// SELECT allocates from it. (The QueryDML arm below plans through the
+// top-level Plan entry, which mints its own scope — still globally
+// unique within that plan tree.)
+func planCopy(s *parser.CopyStmt, cat catalog.Catalog, scope *rtableScope) (Node, error) {
 	if s.Query != nil {
 		// PostgreSQL's grammar accepts `SELECT … INTO …` inside
 		// COPY (...) but DoCopy rejects it (copyto.c: CreateTableAsStmt
@@ -38,7 +43,8 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 		// Plan the inner SELECT just like a top-level one. The
 		// resulting Node tree's Output() schema is what the wire
 		// layer uses for the CopyOutResponse column list.
-		inner, err := planSelect(s.Query, cat)
+		// A-01(ii) cut 2: shares the statement scope.
+		inner, err := planSelectWithSettings(s.Query, cat, DefaultPlannerSettings(), scope)
 		if err != nil {
 			return nil, err
 		}

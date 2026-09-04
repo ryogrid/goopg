@@ -149,6 +149,18 @@ func (nm *explainNames) collect(n optimizer.Node) {
 		for _, c := range planChildren(node) {
 			walk(c)
 		}
+		// A-01(ii) cut 2 (F3): sublink bodies hang off Expr fields
+		// (SubqueryExpr.Plan, InExpr.Plan, ExistsExpr, ArraySubqueryExpr,
+		// MultiAssignSubqRow), not Node children, so the Node walk above
+		// never reaches them. Walk each hanging body too, or no
+		// sublink-internal scan registers — not just childless-Result
+		// InitPlans. Registration order still favours the root tree:
+		// children are walked before hanging bodies, so on a
+		// per-level SourceTableIdx collision register's first-wins
+		// rule keeps the outer name (see register).
+		for _, sp := range optimizer.NodeSubplans(node) {
+			walk(sp)
+		}
 	}
 	walk(n)
 	sort.SliceStable(found, func(i, j int) bool { return found[i].src < found[j].src })
@@ -308,6 +320,11 @@ func (nm *explainNames) resolveInAncestor(anc optimizer.Node, colName string) st
 		}
 		for _, c := range planChildren(node) {
 			walk(c)
+		}
+		// A-01(ii) cut 2 (F3): same Expr-hanging bodies as collect —
+		// the exposing scan may sit inside a sibling sublink.
+		for _, sp := range optimizer.NodeSubplans(node) {
+			walk(sp)
 		}
 	}
 	walk(anc)

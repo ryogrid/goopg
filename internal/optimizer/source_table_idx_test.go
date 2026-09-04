@@ -128,11 +128,12 @@ func TestRTIDDistinctForTopLevelSelfJoin(t *testing.T) {
 	}
 }
 
-// TestRTIDZeroForNestedScans pins A-01(ii) cut 1's fallback: paths not
-// yet threaded (derived tables here; sublink/CTE/DML/set-op branches go
-// through the same planSelect entry) plan with a nil scope, so inner
-// scans keep RTID 0 → today's rendering, while the outer scan is stamped.
-func TestRTIDZeroForNestedScans(t *testing.T) {
+// TestRTIDThreadedIntoDerivedTable pins A-01(ii) cut 2's threading of
+// the re-entrant paths: derived-table bodies now share the statement
+// scope created in Plan(), so the inner scan gets its own nonzero RTID
+// instead of cut 1's RTID-0 fallback. (Supersedes cut 1's
+// TestRTIDZeroForNestedScans, which pinned the fallback.)
+func TestRTIDThreadedIntoDerivedTable(t *testing.T) {
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
 		{Name: "l_orderkey", Type: catalog.Type{Name: "numeric"}},
@@ -154,16 +155,13 @@ func TestRTIDZeroForNestedScans(t *testing.T) {
 	if len(scans) != 2 {
 		t.Fatalf("expected 2 SeqScans (1 inner + 1 outer), got %d", len(scans))
 	}
-	var zero, nonzero int
-	for _, s := range scans {
+	for i, s := range scans {
 		if s.RTID == 0 {
-			zero++
-		} else {
-			nonzero++
+			t.Errorf("SeqScan[%d] RTID is 0 (no identity); cut 2 threads derived tables, expected >= 1", i)
 		}
 	}
-	if zero != 1 || nonzero != 1 {
-		t.Errorf("want 1 nested (RTID 0) + 1 top-level (RTID != 0) SeqScan, got %d zero / %d nonzero", zero, nonzero)
+	if scans[0].RTID == scans[1].RTID {
+		t.Errorf("inner and outer scans share RTID %d; must differ", scans[0].RTID)
 	}
 }
 

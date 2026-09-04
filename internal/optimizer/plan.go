@@ -723,12 +723,12 @@ type SeqScan struct {
 	// inheritance-child scan. M0118-0008 (alter-table-4 perm 4: concurrent
 	// `ALTER TABLE c1 ALTER COLUMN a TYPE float`).
 	InheritParentOID uint32
-	// RTID is the statement-unique range-table identity (A-01(ii) cut 1):
+	// RTID is the statement-unique range-table identity (A-01(ii)):
 	// this scan's FROM-clause entry allocation from the statement's
 	// rtableScope, stamped in planScanRangeVar (each partition /
 	// inheritance fan-out leaf consumes its own — F7). 0 means "no
-	// identity" (nested scope not yet threaded, or a scan built outside
-	// the FROM path) and keeps today's rendering. Only explain_names.go
+	// identity" (a scan built outside a threaded planning path) and
+	// keeps today's rendering. Only explain_names.go
 	// will read this field (a later cut); value, cost, and executor
 	// paths never do.
 	RTID int32
