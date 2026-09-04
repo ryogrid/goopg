@@ -136,9 +136,13 @@ tripwires green, values clean, plans unchanged.
       TPC-DS PASS=95 MISMATCH=0;
       artifacts: `internal/executor/{parallel_runtime,operators_gather,operators_gather_merge,parallel_hash_build}.go`,
       `internal/executor/parallel_transfer_test.go`
-- [ ] EX2-03 Pool sizing — tune `acquireRow` widths/return discipline
-      against EX0-04 slices, after the audit. Measure, do not guess.
-      *design: 13 §4; gate: pool-hit + alloc + timing arms; pin.*
+- [x] EX2-03 Pool sizing — closed MEASURE-ONLY 2026-09-04 (this
+      commit): pool-hit 1 alloc/24B/~40ns vs make 352–896B; per-row hit
+      rate ≈0% by construction (retained buffers correctly never
+      return); buckets 0–64 pool all widths identically so P4-01's
+      narrowing only moves traffic between identical buckets; predicted
+      effect on clone slice ~0. Artifact:
+      `analysis/planner-refactor-take3/ex203-measure-20260904/README.md`.
 
 Landed foundations (record, not work):
 
