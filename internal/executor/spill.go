@@ -154,6 +154,7 @@ func (w *spillWriter) Path() string { return w.path }
 // spillReader reads rows written by spillWriter.
 type spillReader struct {
 	f    *os.File
+	br   *bufio.Reader
 	path string
 
 	// M0054-0005b: reusable byte buffer for ReadRow's per-row
@@ -177,7 +178,7 @@ func newSpillReader(path string) (*spillReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("spillReader: open %s: %w", path, err)
 	}
-	r := &spillReader{f: f, path: path}
+	r := &spillReader{f: f, path: path, br: bufio.NewReaderSize(f, hashsize.FileBufferBytes)}
 	if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
 		r.reg = reg
 		r.procNum = procNum
@@ -240,7 +241,7 @@ func (r *spillReader) readFrame() ([]byte, error) {
 	if r.hasReg {
 		r.reg.WaitEventStart(r.procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
-	_, errLen := io.ReadFull(r.f, lenBuf[:])
+	_, errLen := io.ReadFull(r.br, lenBuf[:])
 	if r.hasReg {
 		r.reg.WaitEventEnd(r.procNum)
 	}
@@ -259,7 +260,7 @@ func (r *spillReader) readFrame() ([]byte, error) {
 	if r.hasReg {
 		r.reg.WaitEventStart(r.procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
-	_, errData := io.ReadFull(r.f, data)
+	_, errData := io.ReadFull(r.br, data)
 	if r.hasReg {
 		r.reg.WaitEventEnd(r.procNum)
 	}
@@ -310,8 +311,13 @@ func (r *spillReader) Close() error {
 // the group — the analogue of PG's ExecRestrPos, which rewinds the inner side
 // to the marked position instead (nodeMergejoin.c EXEC_MJ_TESTOUTER).
 func (r *spillReader) rewind() error {
-	_, err := r.f.Seek(0, io.SeekStart)
-	return err
+	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	// The buffered reader may hold prefetched bytes from before the seek;
+	// discard them so the replay starts at frame zero.
+	r.br.Reset(r.f)
+	return nil
 }
 
 // closeKeepFile closes the descriptor WITHOUT unlinking. Close's unlink is the

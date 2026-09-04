@@ -165,16 +165,20 @@ Exit: spilling shapes I/O-dominated; batch counters match PG semantics at
 both budgets; sort-compare share down; values clean; plans unchanged.
 Sequenced after EX1 (13 §1 EX-P7).
 
-- [ ] EX3-01 Verify the `runtime.Stack` elimination, then price the
-      remaining spill cost — elimination LANDED (`1d6b1e396`;
-      `spill.go:78-85,121-135,181`); re-measure the superseded 69–86% /
-      3.3–7.3× projections on Q4/Q7/Q13-class shapes to close the
-      Stack-walk claim, then price per-row WaitEvent instrumentation +
-      encode + file I/O with a reader-path audit; spill accounting moves
-      in the same commit.
-      *design: 13 §5; gate: top-slice re-measured on spilling shapes;
-      counters + pin + alloc arm. NOT gated on Q14/Q3/Q10 (STALE
-      witnesses, 12 §13).*
+- [x] EX3-01 Verify the `runtime.Stack` elimination, then price the
+      remaining spill cost — this commit: elimination confirmed in-tree
+      (constructors cache registry handle; zero per-row `runtime.Stack`;
+      gls fast path first); reader-path cut = buffered spill reads
+      symmetric with the writer (`bufio.ReaderSize` 8192; `rewind` +
+      `br.Reset`; framing/codec + WaitEvent pairs untouched; only Seek
+      is rewind-to-zero); reader-path audit ranked I/O > decode >
+      post-decode cloneRow > WaitEvent > framing (residual spill
+      single-digit %, not the 69–86% Stack era).
+      Gates: spill unit + WaitEvent tests 27 PASS, TPC-H 24/24 MATCH,
+      plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0, spill shapes Q7
+      14.97→11.48 s (−23%) Q13 6.89→4.69 s (−32%) values identical
+      (single-sample); artifacts: `internal/executor/spill.go`.
+      NOT gated on Q14/Q3/Q10 (STALE witnesses, 12 §13).
 - [ ] EX3-02 Dense-chunk build rows — contiguous packing (`dense_alloc`
       analogue, 10 §6) replacing per-row build allocations.
       *design: 13 §5; gate: alloc arm (primary) + timing; values + pin.*
