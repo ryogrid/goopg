@@ -1,0 +1,1119 @@
+diff --git a/internal/optimizer/copy.go b/internal/optimizer/copy.go
+index 586511a26..9f9147545 100644
+--- a/internal/optimizer/copy.go
++++ b/internal/optimizer/copy.go
+@@ -21,7 +21,9 @@ import (
+ // resulting Project node — the wire layer's row formatter takes
+ // over from there. Query-form is only valid with TO; the parser
+ // already enforces that.
+-func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
++//
++// EX3-03 cut 1: the inner SELECT prices under the statement's settings.
++func planCopy(s *parser.CopyStmt, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
+ 	if s.Query != nil {
+ 		// PostgreSQL's grammar accepts `SELECT … INTO …` inside
+ 		// COPY (...) but DoCopy rejects it (copyto.c: CreateTableAsStmt
+@@ -38,7 +40,7 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
+ 		// Plan the inner SELECT just like a top-level one. The
+ 		// resulting Node tree's Output() schema is what the wire
+ 		// layer uses for the CopyOutResponse column list.
+-		inner, err := planSelect(s.Query, cat)
++		inner, err := planSelectWithSettings(s.Query, cat, ps)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -59,8 +61,8 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
+ 		// it runs (and commits, in the wire layer's COPY transaction);
+ 		// the RETURNING rows are what gets streamed out. PostgreSQL
+ 		// requires the RETURNING clause — without it there are no rows
+-		// to copy.
+-		inner, err := Plan(s.QueryDML, cat)
++		// to copy. EX3-03 cut 1: under ps, like any other DML path.
++		inner, err := PlanWithSettings(s.QueryDML, cat, ps)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/internal/optimizer/joinpathsmemoize.go b/internal/optimizer/joinpathsmemoize.go
+index b61968913..ae0f379df 100644
+--- a/internal/optimizer/joinpathsmemoize.go
++++ b/internal/optimizer/joinpathsmemoize.go
+@@ -368,6 +368,16 @@ func memoizeKeyNDistinct(s *searchCtx, innerPath *Path, outerRelids RelSet) (flo
+ // It exists so `addNLIPaths` has ONE expression for "what does re-running this
+ // inner cost", rather than a conditional at each call site that could be
+ // updated in one place and not the other.
++//
++// EX3-03 cut 1 (§2.5 resolution — DOCUMENTED, not threaded): this helper is
++// TEST-ONLY (sole callers: joinpathsmemoize_test.go); production rescan
++// pricing takes an explicit cp via nestLoopInnerRescanCost below. The
++// hard-wired defaultCostParams() here is a latent 1GiB trap: wiring this
++// into a production path would silently reintroduce the planner/executor
++// work_mem disagreement. Either thread cp through it or delete it before
++// any production caller appears — the F7 grep-gate in
++// settings_propagation_test.go fails the build if a fourth production
++// defaultCostParams caller shows up.
+ func pathRescanTotal(p *Path) float64 {
+ 	st, tot := pathRescanCost(p, defaultCostParams())
+ 	_ = st
+diff --git a/internal/optimizer/planner.go b/internal/optimizer/planner.go
+index 2073e10a3..0380c1aa6 100644
+--- a/internal/optimizer/planner.go
++++ b/internal/optimizer/planner.go
+@@ -183,7 +183,12 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
+ 		if err := analyzer.Analyze(s, cat); err != nil {
+ 			return nil, toPlanError(err)
+ 		}
+-		return planInsert(s, cat)
++		// EX3-03 cut 1 (F2): DML statements receive the session settings —
++		// INSERT…SELECT, UPDATE…FROM and DELETE…USING all run join searches
++		// and subquery interiors that must price in the statement's currency.
++		// Scoping DML out was the alternative; the join-bearing shapes above
++		// are why threading won.
++		return planInsert(s, cat, plannerSet)
+ 	case *parser.UpdateStmt:
+ 		// M0103-0007 rung 16: substitute bare DEFAULT cells on the RHS of
+ 		// SET assignments with the target column's catalog DefaultExpr (or
+@@ -195,14 +200,16 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
+ 		if err := analyzer.Analyze(s, cat); err != nil {
+ 			return nil, toPlanError(err)
+ 		}
+-		return planUpdate(s, cat)
++		return planUpdate(s, cat, plannerSet)
+ 	case *parser.DeleteStmt:
+ 		if err := analyzer.Analyze(s, cat); err != nil {
+ 			return nil, toPlanError(err)
+ 		}
+-		return planDelete(s, cat)
++		return planDelete(s, cat, plannerSet)
+ 	case *parser.MergeStmt:
+-		return planMerge(s, cat)
++		// EX3-03 cut 1 (F2): MERGE's USING source routinely holds a join
++		// tree, so it threads settings like the other DML entry points.
++		return planMerge(s, cat, plannerSet)
+ 
+ 	case *parser.CreateTableStmt, *parser.DropTableStmt,
+ 		*parser.CreateIndexStmt, *parser.DropIndexStmt,
+@@ -302,7 +309,9 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
+ 		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner}, nil
+ 
+ 	case *parser.CopyStmt:
+-		return planCopy(s, cat)
++		// EX3-03 cut 1: COPY (SELECT …) plans a full SELECT, so it threads
++		// the statement's settings like every other SELECT-bearing path.
++		return planCopy(s, cat, plannerSet)
+ 
+ 	case *parser.CallStmt:
+ 		return &Call{pos: s.Pos(), Stmt: s}, nil
+@@ -831,7 +840,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
+ 	// substitute them in. Restorer pops the CTE scope back to
+ 	// the caller's view when this Plan call returns. nil-WITH
+ 	// returns a no-op restorer.
+-	restore, dmlPlans, err := preplanWithClause(s.With, cat)
++	// EX3-03 cut 1: CTE bodies routinely contain the join tree — they plan
++	// under the statement's settings.
++	restore, dmlPlans, err := preplanWithClause(s.With, cat, plannerSet)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -926,7 +937,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
+ 		// whole chain's sort/limit. When s is a grouping node this recursion
+ 		// lands on the SetOpOperand branch below and plans the parenthesised
+ 		// operand — including that operand's own ORDER BY / LIMIT.
+-		left, err := planSelect(s, cat)
++		// EX3-03 cut 1: the statement's settings travel into every branch so
++		// each prices under the same work_mem the executor builds with.
++		left, err := planSelectWithSettings(s, cat, plannerSet)
+ 		// Restore everything (plan cache may reuse the AST).
+ 		s.SetOp = savedSetOps[0]
+ 		for i, seg := range segments {
+@@ -954,7 +967,8 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
+ 			if seg.cutAt != nil {
+ 				seg.cutAt.SetOp = nil
+ 			}
+-			right, rerr := planSelect(seg.stmt, cat)
++			// EX3-03 cut 1: plannerSet, not the hard-wired default.
++			right, rerr := planSelectWithSettings(seg.stmt, cat, plannerSet)
+ 			if seg.cutAt != nil {
+ 				seg.cutAt.SetOp = savedSetOps[i+1] // restore for plan-cache
+ 			}
+@@ -1058,7 +1072,8 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
+ 	// operand's output columns, exactly as a trailing set-op sort/limit does.
+ 	// M0125-0020.
+ 	if s.SetOpOperand != nil {
+-		operand, err := planSelect(s.SetOpOperand, cat)
++		// EX3-03 cut 1: the statement's settings travel into the operand.
++		operand, err := planSelectWithSettings(s.SetOpOperand, cat, plannerSet)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -1420,7 +1435,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
+ 	if rewritten, ok, err := rewriteMinMaxAggregates(s, ctx, cat); err != nil {
+ 		return nil, err
+ 	} else if ok {
+-		if wrapped, wrapOK := wrapMinMaxOrderByDistinct(s, rewritten, cat); wrapOK {
++		// EX3-03 cut 1: ORDER BY items can hide scalar subqueries — resolve
++		// them under the statement's scope settings, not the default.
++		if wrapped, wrapOK := wrapMinMaxOrderByDistinct(s, rewritten, cat, ctx.settings); wrapOK {
+ 			return wrapped, nil
+ 		}
+ 	}
+@@ -2994,7 +3011,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
+ 
+ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings) (Node, rangeBinding, error) {
+ 	if rv.Subquery != nil {
+-		return planSubqueryRangeVar(rv, cat, sourceIdx, lateralCtx)
++		return planSubqueryRangeVar(rv, cat, sourceIdx, lateralCtx, ps)
+ 	}
+ 	if rv.TableFunc != nil {
+ 		node, b, err := planTableFuncRangeVar(rv, cat, sourceIdx, lateralCtx)
+@@ -3874,7 +3891,9 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog, ps Pl
+ 		return nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "VALUES must have at least one row"}
+ 	}
+ 	nCols := len(rows[0])
+-	innerCtx := &resolveContext{cat: cat} // no outer column refs in standalone VALUES
++	// EX3-03 cut 1 (F5 audit): a scalar subquery inside VALUES prices under
++	// the statement's settings — stamp ps, not the zero value.
++	innerCtx := &resolveContext{cat: cat, settings: ps} // no outer column refs in standalone VALUES
+ 	planRows := make([][]Expr, len(rows))
+ 	for i, row := range rows {
+ 		if len(row) != nCols {
+@@ -3958,12 +3977,14 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog, ps Pl
+ // non-nil, qualified star expressions like `n.*` are expanded to the columns
+ // of the named table binding (may be 0 columns for a table with no columns).
+ // M0097-0020.
+-func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
++func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings) (Node, rangeBinding, error) {
+ 	rows := rv.Subquery.ValuesRows
+ 	if len(rows) == 0 {
+ 		return nil, rangeBinding{}, &PlanError{Pos: rv.Pos(), Code: "0A000", Message: "VALUES must have at least one row"}
+ 	}
+-	ctx := &resolveContext{cat: cat} // cat needed so scalar subqueries inside VALUES can be planned. M0097-0020.
++	// EX3-03 cut 1 (F5 audit): cat is set so scalar subqueries inside VALUES
++	// can be planned (M0097-0020) — those price under ps, not zero.
++	ctx := &resolveContext{cat: cat, settings: ps}
+ 	if lateralCtx != nil {
+ 		ctx.parent = lateralCtx
+ 	}
+@@ -4060,11 +4081,11 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
+ // never registered in the catalog — it lives only to satisfy
+ // the rangeBinding contract that downstream column resolution
+ // uses.
+-func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
++func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings) (Node, rangeBinding, error) {
+ 	// Handle bare VALUES(...) subquery: `FROM (VALUES (r1), (r2)) AS t(c1, c2)`.
+ 	// M0097-0003. Pass lateralCtx so qualified star (n.*) can be expanded. M0097-0020.
+ 	if len(rv.Subquery.ValuesRows) > 0 {
+-		return planValuesSubquery(rv, cat, sourceIdx, lateralCtx)
++		return planValuesSubquery(rv, cat, sourceIdx, lateralCtx, ps)
+ 	}
+ 	// LATERAL subquery: use planSelectWithParent so the inner SELECT can
+ 	// resolve correlated references to outer-scope columns. M0097-0064.
+@@ -4095,7 +4116,12 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
+ 			// This fixes OFFSET/LIMIT expressions that reference outer variables
+ 			// inside lateral subqueries nested within scalar subqueries. M0097-0065.
+ 		}
+-		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat)
++		// EX3-03 cut 1: the inner SELECT prices under the statement's
++		// settings (ps), not the hard-wired default. lateralCtx, when
++		// present, carries the same value — ps is passed explicitly
++		// rather than read off it so an unstamped legacy context can
++		// never inject zero costs (see planSelectWithParent).
++		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat, ps)
+ 	} else {
+ 		// Non-correlated derived table. Plan via planSelectWithParent
+ 		// (nil outer scope) rather than Plan(): the outer statement's
+@@ -4109,7 +4135,9 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
+ 		// planSelectWithParent skips the analyzer re-pass and inherits
+ 		// the package-level planCTEs map so the CTE substitutes in.
+ 		// Mirrors the lateral branch above. M0110-0003 AC-002 gap #4.
+-		inner, err = planSelectWithParent(rv.Subquery, cat, nil)
++		// EX3-03 cut 1: nil parent carries no scope, so the statement's
++		// settings arrive on the explicit ps channel instead.
++		inner, err = planSelectWithParent(rv.Subquery, cat, nil, ps)
+ 	}
+ 	if err != nil {
+ 		// LATERAL subquery fallback: when the inner subquery references outer
+@@ -4920,7 +4948,10 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
+ 				// resolve — mirrors the generate_series /
+ 				// pg_options_to_table arg-context construction above.
+ 				// M0134-0126.
+-				ctx := &resolveContext{cat: cat, parent: planParent}
++				// EX3-03 cut 1 (F5 audit): no session in scope on this
++				// fallback — stamp the defaults, never the zero value
++				// (a subquery in an SRF arg prices at defaults, as today).
++				ctx := &resolveContext{cat: cat, parent: planParent, settings: DefaultPlannerSettings()}
+ 				if lateralCtx != nil {
+ 					if lateralCtx.parent == nil {
+ 						cp := *lateralCtx
+@@ -4986,7 +5017,8 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
+ 	}
+ 	// Build arg context: lateral siblings + outer-scope parent chain so
+ 	// correlated references like pr.prattrs in generate_series args resolve.
+-	argCtx := &resolveContext{cat: cat, parent: planParent}
++	// EX3-03 cut 1 (F5 audit): fallback stamps the defaults, never zero.
++	argCtx := &resolveContext{cat: cat, parent: planParent, settings: DefaultPlannerSettings()}
+ 	if lateralCtx != nil {
+ 		if lateralCtx.parent == nil {
+ 			cp := *lateralCtx
+@@ -5250,7 +5282,8 @@ func planPgOptionsToTable(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
+ 	// `ARRAY(SELECT … FROM pg_options_to_table(fdwoptions))` where
+ 	// fdwoptions references the outer pg_foreign_data_wrapper row — resolves
+ 	// up the lexical scope. Mirrors generate_series. DU-002 slice 18.
+-	argCtx := &resolveContext{cat: cat, parent: planParent}
++	// EX3-03 cut 1 (F5 audit): fallback stamps the defaults, never zero.
++	argCtx := &resolveContext{cat: cat, parent: planParent, settings: DefaultPlannerSettings()}
+ 	if lateralCtx != nil {
+ 		if lateralCtx.parent == nil {
+ 			cp := *lateralCtx
+@@ -7637,6 +7670,10 @@ func buildHavingParentCtx(agg *aggregateSurface) *resolveContext {
+ 		cat:       agg.input.cat,
+ 		parent:    agg.input.parent,
+ 		havingAgg: agg,
++		// EX3-03 cut 1 (F5 audit): this parent carries HAVING subqueries,
++		// so it inherits the scope's settings — a zero here would price
++		// the subquery's search at 0.0 instead of the statement's budget.
++		settings: agg.input.settings,
+ 	}
+ }
+ 
+@@ -9964,7 +10001,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
+ // substituteMinMaxOrderByExpr). The caller then falls through to today's
+ // exact (pre-S19) behavior — a declined rewrite is always correct, a wrong
+ // wrap is not.
+-func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog.Catalog) (Node, bool) {
++func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog.Catalog, ps PlannerSettings) (Node, bool) {
+ 	if len(s.DistinctOn) > 0 {
+ 		return nil, false
+ 	}
+@@ -9986,9 +10023,10 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
+ 
+ 	out := rewritten
+ 	if len(s.OrderBy) > 0 {
+-		// ORDER BY expression resolution only — no cost decision is taken from
+-	// this context, so the planner defaults are the honest value.
+-	orderCtx := newResolveContext(nil, outSchema, DefaultPlannerSettings())
++		// ORDER BY expression resolution runs under ps: no cost decision is
++		// taken from this context itself, but a scalar subquery hiding in an
++		// ORDER BY item prices under it (EX3-03 cut 1).
++		orderCtx := newResolveContext(nil, outSchema, ps)
+ 		orderCtx.cat = cat
+ 		keys := make([]SortKey, 0, len(s.OrderBy))
+ 		for _, sb := range s.OrderBy {
+@@ -10849,8 +10887,8 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
+ 	return nil
+ }
+ 
+-func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+-	restore, dmlPlans, err := preplanWithClause(s.With, cat)
++func planInsert(s *parser.InsertStmt, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
++	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -10880,7 +10918,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+ 		if !autoOK {
+ 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdInsert)
+ 		}
+-		_, checked, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
++		_, checked, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat, ps)
+ 		if qerr != nil {
+ 			return nil, qerr
+ 		}
+@@ -10944,9 +10982,10 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+ 		}
+ 	}
+ 	// INSERT … SELECT: plan the SELECT and use it as the source.
++	// EX3-03 cut 1: under the statement's settings — this is a join search.
+ 	var source Node
+ 	if s.Select != nil {
+-		sel, err := planSelect(s.Select, cat)
++		sel, err := planSelectWithSettings(s.Select, cat, ps)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -11007,7 +11046,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+ 				targets[i] = &ColumnRef{pos: s.Pos(), Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+ 				outSchema[i] = c
+ 			}
+-			ctx := &resolveContext{cat: cat}
++			ctx := &resolveContext{cat: cat, settings: ps}
+ 			for _, ord := range appended {
+ 				col := tbl.Columns[ord]
+ 				pe, perr := resolveExpr(col.DefaultExpr, ctx)
+@@ -11037,7 +11076,9 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+ 				}
+ 			}
+ 			row := make([]Expr, 0, len(r))
+-			ctx := &resolveContext{cat: cat} // VALUES rows have no input columns but may contain scalar subqueries
++			// EX3-03 cut 1: VALUES rows have no input columns but may
++			// contain scalar subqueries — those price under ps.
++			ctx := &resolveContext{cat: cat, settings: ps}
+ 			for _, e := range r {
+ 				pe, err := resolveExpr(e, ctx)
+ 				if err != nil {
+@@ -11051,7 +11092,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+ 	}
+ 	insert := &Insert{pos: s.Pos(), Table: tbl, Source: source, ColumnIndex: colIndex, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
+ 	if s.OnConflict != nil {
+-		oc, err := planOnConflict(s.OnConflict, tbl, resolveTbl, viewName, s.Target.Alias, cat)
++		oc, err := planOnConflict(s.OnConflict, tbl, resolveTbl, viewName, s.Target.Alias, cat, ps)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -11066,8 +11107,9 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+ 		if resolveTbl != nil {
+ 			retAlias = viewResolveAlias(s.Target.Alias, viewName)
+ 		}
+-		// RETURNING expression resolution only; see the note in planSelect.
+-	retCtx := singleBindingContext(retTbl, retAlias, DefaultPlannerSettings())
++		// RETURNING can hold scalar subqueries, so it resolves under ps —
++		// expression resolution only otherwise; see the note in planSelect.
++	retCtx := singleBindingContext(retTbl, retAlias, ps)
+ 		retCtx.cat = cat
+ 		// When this INSERT has ON CONFLICT DO UPDATE, add `excluded` to the
+ 		// RETURNING scope as notReferenceable. This lets resolveColumnRefAt
+@@ -11105,7 +11147,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+ // name-resolution scope below must bind against resolveTbl rather
+ // than tbl (the real base relation) — root-0025 deferred item 1's
+ // "Known residual".
+-func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl *catalog.Table, viewName string, targetAlias string, cat catalog.Catalog) (*OnConflictPlan, error) {
++func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl *catalog.Table, viewName string, targetAlias string, cat catalog.Catalog, ps PlannerSettings) (*OnConflictPlan, error) {
+ 	out := &OnConflictPlan{}
+ 
+ 	switch oc.Action {
+@@ -11148,8 +11190,9 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl
+ 			if hasExpr {
+ 				// Build a single-binding resolve context for the target table
+ 				// so expression ColumnRefs resolve against the insert row.
++				// EX3-03 cut 1: under ps — arbiter exprs can hide subqueries.
+ 				// ON CONFLICT expression resolution only; see the note in planSelect.
+-	exprCtx := singleBindingContext(scopeTbl, scopeAlias, DefaultPlannerSettings())
++				exprCtx := singleBindingContext(scopeTbl, scopeAlias, ps)
+ 				exprCtx.cat = cat
+ 				out.ArbiterExprs = make([]Expr, len(ords))
+ 				for i, o2 := range ords {
+@@ -11164,7 +11207,7 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl
+ 			}
+ 		}
+ 	} else if out.Action == OnConflictActionNothing && cat != nil {
+-		idx, ords, exprs, err := resolveDefaultDoNothingArbiter(tbl, targetAlias, cat)
++		idx, ords, exprs, err := resolveDefaultDoNothingArbiter(tbl, targetAlias, cat, ps)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -11209,7 +11252,7 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl
+ 	mergedSchema := make(Schema, 0, 2*n)
+ 	mergedSchema = append(mergedSchema, tableSchemaWithSource(scopeTbl, 1)...)
+ 	mergedSchema = append(mergedSchema, tableSchemaWithSource(scopeTbl, 2)...)
+-	ctx := newResolveContext(bindings, mergedSchema, DefaultPlannerSettings())
++	ctx := newResolveContext(bindings, mergedSchema, ps)
+ 	ctx.cat = cat
+ 
+ 	out.UpdateSet = make([]Expr, n)
+@@ -11228,7 +11271,7 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl
+ 	return out, nil
+ }
+ 
+-func resolveDefaultDoNothingArbiter(tbl *catalog.Table, targetAlias string, cat catalog.Catalog) (*catalog.Index, []int, []Expr, error) {
++func resolveDefaultDoNothingArbiter(tbl *catalog.Table, targetAlias string, cat catalog.Catalog, ps PlannerSettings) (*catalog.Index, []int, []Expr, error) {
+ 	if cat == nil {
+ 		return nil, nil, nil, nil
+ 	}
+@@ -11254,7 +11297,8 @@ func resolveDefaultDoNothingArbiter(tbl *catalog.Table, targetAlias string, cat
+ 		if colName == "" {
+ 			ords = append(ords, -1)
+ 			if exprCtx == nil {
+-				exprCtx = singleBindingContext(tbl, targetAlias, DefaultPlannerSettings())
++				// EX3-03 cut 1: arbiter index expressions resolve under ps.
++				exprCtx = singleBindingContext(tbl, targetAlias, ps)
+ 				exprCtx.cat = cat
+ 				exprs = make([]Expr, len(chosen.Columns))
+ 			}
+@@ -11628,7 +11672,9 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
+ 		case *parser.SubqueryExpr:
+ 			// Subquery form: (c1, c2) = (SELECT x, y FROM ...).
+ 			// Build the inner plan once and create MultiAssignSubqElem per column.
+-			innerPlan, err := planSelectWithParent(rhs.Inner, cat, ctx)
++			// EX3-03 cut 1: the multi-assign subquery prices under the
++			// UPDATE's own scope settings.
++			innerPlan, err := planSelectWithParent(rhs.Inner, cat, ctx, ctx.settings)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -11667,8 +11713,8 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
+ 	return nil
+ }
+ 
+-func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
+-	restore, dmlPlans, err := preplanWithClause(s.With, cat)
++func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
++	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -11694,7 +11740,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
+ 		if !autoOK {
+ 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
+ 		}
+-		all, checked, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
++		all, checked, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat, ps)
+ 		if qerr != nil {
+ 			return nil, qerr
+ 		}
+@@ -11727,7 +11773,8 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
+ 		offset := len(tbl.Columns)
+ 		for idx, rv := range s.From {
+ 			si := int16(idx + 2) // sourceIdx 2, 3, … for FROM tables
+-			fromNode, fromBinding, err2 := planScanRangeVar(rv, cat, si, nil, DefaultPlannerSettings())
++			// EX3-03 cut 1: FROM-table subqueries price under ps.
++			fromNode, fromBinding, err2 := planScanRangeVar(rv, cat, si, nil, ps)
+ 			if err2 != nil {
+ 				return nil, err2
+ 			}
+@@ -11757,7 +11804,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
+ 			fromScans = append(fromScans, fromNode)
+ 			offset += len(fromTbl.Columns)
+ 		}
+-		ctx := newResolveContext(bindings, sch, DefaultPlannerSettings())
++		// EX3-03 cut 1: the UPDATE…FROM scope carries ps so SET/WHERE
++		// subqueries price in the statement's currency.
++		ctx := newResolveContext(bindings, sch, ps)
+ 		ctx.cat = cat
+ 		// Apply the WHERE predicate (no index optimization for UPDATE FROM). M0097-0065.
+ 		var pred Expr
+@@ -11796,7 +11845,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
+ 		return wrapDMLCTEPrefix(upd, dmlPlans), nil
+ 	}
+ 
+-	ctx := singleBindingContext(resolveScope, targetAlias, DefaultPlannerSettings())
++	ctx := singleBindingContext(resolveScope, targetAlias, ps)
+ 	ctx.cat = cat
+ 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
+ 	if s.Where != nil {
+@@ -11852,8 +11901,8 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
+ 	return wrapDMLCTEPrefix(upd, dmlPlans), nil
+ }
+ 
+-func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
+-	restore, dmlPlans, err := preplanWithClause(s.With, cat)
++func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
++	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -11877,7 +11926,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
+ 		if !autoOK {
+ 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
+ 		}
+-		all, _, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
++		all, _, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat, ps)
+ 		if qerr != nil {
+ 			return nil, qerr
+ 		}
+@@ -11907,7 +11956,8 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
+ 		offset := len(tbl.Columns)
+ 		for idx, rv := range s.Using {
+ 			si := int16(idx + 2) // sourceIdx 2, 3, … for USING tables
+-			usingNode, usingBinding, err2 := planScanRangeVar(rv, cat, si, nil, DefaultPlannerSettings())
++			// EX3-03 cut 1: USING-table subqueries price under ps.
++			usingNode, usingBinding, err2 := planScanRangeVar(rv, cat, si, nil, ps)
+ 			if err2 != nil {
+ 				return nil, err2
+ 			}
+@@ -11933,7 +11983,9 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
+ 			usingScans = append(usingScans, usingNode)
+ 			offset += len(useTbl.Columns)
+ 		}
+-		ctx := newResolveContext(bindings, sch, DefaultPlannerSettings())
++		// EX3-03 cut 1: the DELETE…USING scope carries ps so WHERE and
++		// RETURNING subqueries price in the statement's currency.
++		ctx := newResolveContext(bindings, sch, ps)
+ 		ctx.cat = cat
+ 		var pred Expr
+ 		if s.Where != nil {
+@@ -11963,7 +12015,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
+ 		return wrapDMLCTEPrefix(del, dmlPlans), nil
+ 	}
+ 
+-	ctx := singleBindingContext(resolveScope, targetAlias, DefaultPlannerSettings())
++	ctx := singleBindingContext(resolveScope, targetAlias, ps)
+ 	// When an explicit alias is set, using the original table name in WHERE
+ 	// must produce the PostgreSQL-specific error. M0097-0003.
+ 	if s.Target.Alias != "" {
+@@ -12013,7 +12065,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
+ 
+ // planMerge converts a MERGE INTO statement into a Merge plan node.
+ // M0096-0010.
+-func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
++func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
+ 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
+ 	if !ok {
+ 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01",
+@@ -12021,8 +12073,9 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
+ 	}
+ 
+ 	// Plan the USING source.
++	// EX3-03 cut 1: the USING source can hold a join tree — price it under ps.
+ 	var srcIdx int16 = 2
+-	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx, nil, DefaultPlannerSettings())
++	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx, nil, ps)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -12044,14 +12097,14 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
+ 	mergedSchema := make(Schema, 0, n+len(sourceSchema))
+ 	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 1)...)
+ 	mergedSchema = append(mergedSchema, sourceSchema...)
+-	mergedCtx := newResolveContext([]rangeBinding{targetBinding, sourceBinding}, mergedSchema, DefaultPlannerSettings())
++	mergedCtx := newResolveContext([]rangeBinding{targetBinding, sourceBinding}, mergedSchema, ps)
+ 	mergedCtx.cat = cat
+ 
+ 	// Source-only context for NOT MATCHED INSERT VALUES.
+ 	sourceOnly := newResolveContext([]rangeBinding{{
+ 		table: sourceBinding.table, alias: sourceBinding.alias,
+ 		offset: 0, sourceIdx: srcIdx,
+-	}}, sourceSchema, DefaultPlannerSettings())
++	}}, sourceSchema, ps)
+ 	sourceOnly.cat = cat
+ 
+ 	onExpr, err := resolveExpr(s.On, mergedCtx)
+@@ -12129,7 +12182,7 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
+ 			{table: tbl, alias: targetAlias, offset: 0, sourceIdx: 1},
+ 			{table: tbl, alias: "old", offset: nn, sourceIdx: 2, qualifiedOnly: true, mergeRowKind: 1},
+ 			{table: tbl, alias: "new", offset: 2 * nn, sourceIdx: 3, qualifiedOnly: true, mergeRowKind: 2},
+-		}, retSchema, DefaultPlannerSettings())
++		}, retSchema, ps)
+ 		retCtx.cat = cat
+ 		retCtx.allowMergeAction = true
+ 		exprs, schema, err := resolveTargets(s.Returning, retCtx)
+@@ -13594,7 +13647,9 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
+ 	if parent == nil || parent.cat == nil {
+ 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "subqueries are not supported in this context"}
+ 	}
+-	inner, err := planSelectWithParent(x.Inner, parent.cat, parent)
++	// EX3-03 cut 1: the scalar subquery prices under its lexical scope's
++	// settings — the same value the enclosing statement threads down.
++	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, parent.settings)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -13608,7 +13663,8 @@ func planArraySubqueryExpr(x *parser.ArraySubqueryExpr, parent *resolveContext)
+ 	if parent == nil || parent.cat == nil {
+ 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "subqueries are not supported in this context"}
+ 	}
+-	inner, err := planSelectWithParent(x.Inner, parent.cat, parent)
++	// EX3-03 cut 1: same scope-settings threading as planSubqueryExpr.
++	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, parent.settings)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -13688,7 +13744,8 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
+ 		if ctx == nil || ctx.cat == nil {
+ 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}
+ 		}
+-		inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx)
++		// EX3-03 cut 1: the IN subquery prices under its lexical scope's settings.
++		inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx, ctx.settings)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -13714,7 +13771,8 @@ func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error)
+ 	if parent == nil || parent.cat == nil {
+ 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "EXISTS not supported in this context"}
+ 	}
+-	inner, err := planSelectWithParent(x.Subquery, parent.cat, parent)
++	// EX3-03 cut 1: the EXISTS subquery prices under its lexical scope's settings.
++	inner, err := planSelectWithParent(x.Subquery, parent.cat, parent, parent.settings)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -13821,7 +13879,16 @@ func planHasEscapingOuterRef(node Node, depth int) bool {
+ // the analyzer's outer-scope channel (so the recursive
+ // Analyze pass that Plan() invokes also sees the outer
+ // scope). Both are restored on return.
+-func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext) (Node, error) {
++//
++// EX3-03 cut 1 (F1): ps is the STATEMENT's settings, threaded explicitly by
++// value — never derived by walking parent (resolveContext.settings documents
++// why: planParent is goroutine-thread-unsafe, so a parent walk could price
++// with another session's GUCs). Every subquery shape funnels through here,
++// so this is where the Q9-pattern join tree inside FROM (select ...) picks
++// up the session work_mem. A zero ps (a resolveContext literal that predates
++// the F5 constructor rule) falls back to the defaults — exactly today's
++// behaviour — rather than pricing pages and tuples at 0.0.
++func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext, ps PlannerSettings) (Node, error) {
+ 	prevParent := planParent
+ 	planParent = parent
+ 	defer func() { planParent = prevParent }()
+@@ -13841,7 +13908,10 @@ func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *
+ 	// (b,a)=(SELECT ... FROM cte) where cte lives in planCTEs
+ 	// but not in the catalog). Mirrors preplanWithClause's
+ 	// planSelect(cte.Query, cat) pattern for CTE bodies.
+-	return planSelect(stmt, cat)
++	if ps == (PlannerSettings{}) {
++		ps = DefaultPlannerSettings()
++	}
++	return planSelectWithSettings(stmt, cat, ps)
+ }
+ 
+ // buildAnalyzerOuterScope walks a resolveContext chain and
+diff --git a/internal/optimizer/settings_propagation_test.go b/internal/optimizer/settings_propagation_test.go
+index d3701917f..e9a288048 100644
+--- a/internal/optimizer/settings_propagation_test.go
++++ b/internal/optimizer/settings_propagation_test.go
+@@ -1,6 +1,13 @@
+ package optimizer
+ 
+ import (
++	"go/ast"
++	goparser "go/parser"
++	"go/token"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/goopg/goopg/internal/catalog"
+@@ -116,3 +123,290 @@ func TestNeededColsReachTheRelOptInfo(t *testing.T) {
+ 		t.Fatalf("plan: %v", err)
+ 	}
+ }
++
++// workMemProbeCatalog is a two-table fixture whose join is work_mem-sensitive:
++// both sides carry a 2M-row stat so whichever side the hash builds on, the
++// ~240MB build fits the ~1GiB default budget single-batch (NBatch == 1, no
++// spill term) but spills under a kilobyte budget. The spill term
++// (hashJoinCost's NBatch > 1 arm) then separates a search priced at the
++// session work_mem from one priced at the default — deterministically, with
++// no timing and no golden plan shape.
++func workMemProbeCatalog(t *testing.T) catalog.Catalog {
++	t.Helper()
++	cat := catalog.NewInMemory()
++	mk := func(name string, rows int64) {
++		tbl, err := cat.CreateTable(parser.ObjectName{Name: name}, []catalog.Column{
++			{Name: "a", Type: catalog.Type{Name: "int4"}},
++			{Name: "b", Type: catalog.Type{Name: "text"}},
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		if rows > 0 {
++			tbl.Stats = &catalog.TableStats{RowCount: rows, Analyzed: true}
++		}
++	}
++	mk("pj1", 2_000_000)
++	mk("pj2", 2_000_000)
++	return cat
++}
++
++// searchedInnerJoinCosts walks a finished plan tree and returns the TotalCost
++// of every search-produced (CostSet) INNER join. The stamp is the load-bearing
++// assumption: stampPlanCost records the SEARCH path's cost on the node, so
++// these numbers are the budget the join search priced under — not the
++// display-only derivation. CostSet==false nodes (legacy rewriter output above
++// the seam) are skipped, never priced.
++func searchedInnerJoinCosts(n Node) []float64 {
++	var out []float64
++	var walk func(m Node)
++	walkExprs := func(m Node) {
++		walkPlanExprs(m, func(e Expr) {
++			// walkPlanExprs visits the host scope's expressions only;
++			// each subquery shape carries its inner plan on a Plan
++			// field the display walker never descends into.
++			var inner Node
++			switch x := e.(type) {
++			case *SubqueryExpr:
++				inner = x.Plan
++			case *ArraySubqueryExpr:
++				inner = x.Plan
++			case *InExpr:
++				inner = x.Plan
++			case *ExistsExpr:
++				inner = x.Plan
++			}
++			if inner != nil {
++				walk(inner)
++			}
++		})
++	}
++	walk = func(m Node) {
++		if m == nil {
++			return
++		}
++		if j, ok := m.(*Join); ok && j.Type == JoinTypeInner && j.CostSet {
++			out = append(out, j.TotalCost)
++		}
++		for _, c := range legacyDisplayChildren(m) {
++			walk(c)
++		}
++		// Arms the display walker never descends into: CTE bodies and
++		// the DML source.
++		if cte, ok := m.(*CTEScan); ok {
++			walk(cte.Child)
++		}
++		if ins, ok := m.(*Insert); ok {
++			walk(ins.Source)
++		}
++		walkExprs(m)
++	}
++	walk(n)
++	return out
++}
++
++// planWorkMemProbe plans q under ps and returns the searched inner-join costs.
++// It fails the test when the shape under probe carries no searched join — a
++// fixture that lost its sensitivity must be loud, not vacuously green.
++func planWorkMemProbe(t *testing.T, q string, cat catalog.Catalog, ps PlannerSettings) []float64 {
++	t.Helper()
++	stmts, err := parser.Parse(q)
++	if err != nil {
++		t.Fatal(err)
++	}
++	node, err := PlanWithSettings(stmts[0], cat, ps)
++	if err != nil {
++		t.Fatal(err)
++	}
++	costs := searchedInnerJoinCosts(node)
++	if len(costs) == 0 {
++		t.Fatalf("probe query planned with no searched inner join; the fixture lost its sensitivity: %s", q)
++	}
++	return costs
++}
++
++// assertWorkMemReachesInterior is the shared assertion for every EX3-03 cut-1
++// family: the same statement priced under a kilobyte work_mem must cost MORE
++// than under the default (shrinking the budget can only add spill charges —
++// every path's cost is monotone in work_mem), and the default-priced plan is
++// the behaviour-neutrality anchor the whole suite re-pins.
++func assertWorkMemReachesInterior(t *testing.T, q string, cat catalog.Catalog) {
++	t.Helper()
++	def := DefaultPlannerSettings()
++	tiny := DefaultPlannerSettings()
++	tiny.WorkMem = 4096
++
++	defCosts := planWorkMemProbe(t, q, cat, def)
++	tinyCosts := planWorkMemProbe(t, q, cat, tiny)
++	if len(defCosts) != len(tinyCosts) {
++		t.Fatalf("join count moved with work_mem (%d vs %d); the probe is not comparing like with like: %s",
++			len(defCosts), len(tinyCosts), q)
++	}
++	for i := range defCosts {
++		if tinyCosts[i] <= defCosts[i] {
++			t.Errorf("join %d priced %.2f under work_mem=4KB vs %.2f at default — "+
++				"the session value never reached the interior search (still on the hard-wired ~1GiB)",
++				i, tinyCosts[i], defCosts[i])
++		}
++	}
++}
++
++// TestInnerSelectSearchCarriesWorkMem is the F1 pin: the Q9 pattern — a join
++// tree inside FROM (select …) — plans its inner search through
++// planSelectWithParent, which used to end in a bare planSelect and discard
++// the statement's settings. Pre-cut this test fails with identical costs on
++// both arms (the interior is deaf); post-cut the kilobyte arm spills.
++func TestInnerSelectSearchCarriesWorkMem(t *testing.T) {
++	cat := workMemProbeCatalog(t)
++	assertWorkMemReachesInterior(t,
++		"select s.a from (select j1.a from pj1 j1, pj2 j2 where j1.a = j2.a) s", cat)
++}
++
++// TestCTEBodySearchCarriesWorkMem pins the §2.2 family through the same
++// observable: a join inside a non-recursive CTE body prices under the
++// statement's settings via the threaded preplanWithClause.
++func TestCTEBodySearchCarriesWorkMem(t *testing.T) {
++	cat := workMemProbeCatalog(t)
++	assertWorkMemReachesInterior(t,
++		"with q as (select j1.a from pj1 j1, pj2 j2 where j1.a = j2.a) select a from q", cat)
++}
++
++// TestExistsSubquerySearchCarriesWorkMem pins the scalar/EXISTS half of the
++// F1 family through the same observable: a join inside WHERE EXISTS prices
++// under the statement's settings via planExistsExpr's scope threading.
++func TestExistsSubquerySearchCarriesWorkMem(t *testing.T) {
++	cat := workMemProbeCatalog(t)
++	assertWorkMemReachesInterior(t,
++		"select j1.a from pj1 j1 where exists (select 1 from pj1 x, pj2 y where x.a = y.a)", cat)
++}
++
++// TestSubqueryFunnelCarriesWorkMem pins planSelectWithParent itself — the
++// funnel every scalar/array/IN/EXISTS shape shares. A nil parent (the
++// non-correlated derived-table path) prices under the explicit ps; a live
++// parent prices under its scope settings.
++func TestSubqueryFunnelCarriesWorkMem(t *testing.T) {
++	cat := workMemProbeCatalog(t)
++	inner := "select j1.a from pj1 j1, pj2 j2 where j1.a = j2.a"
++	stmts, err := parser.Parse(inner)
++	if err != nil {
++		t.Fatal(err)
++	}
++	sel := stmts[0].(*parser.SelectStmt)
++
++	tiny := DefaultPlannerSettings()
++	tiny.WorkMem = 4096
++
++	// Nil-parent arm: the statement's settings arrive on ps alone.
++	nilParent, err := planSelectWithParent(sel, cat, nil, tiny)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defCosts := planWorkMemProbe(t, inner, cat, DefaultPlannerSettings())
++	nilCosts := searchedInnerJoinCosts(nilParent)
++	if len(nilCosts) == 0 {
++		t.Fatal("nil-parent funnel planned with no searched inner join")
++	}
++	if nilCosts[0] <= defCosts[0] {
++		t.Errorf("nil-parent funnel priced %.2f under work_mem=4KB vs %.2f at default — ps was dropped",
++			nilCosts[0], defCosts[0])
++	}
++
++	// Live-parent arm: the scope's settings carry through.
++	parent := newResolveContext(nil, nil, tiny)
++	parent.cat = cat
++	withParent, err := planSelectWithParent(sel, cat, parent, parent.settings)
++	if err != nil {
++		t.Fatal(err)
++	}
++	parentCosts := searchedInnerJoinCosts(withParent)
++	if len(parentCosts) == 0 {
++		t.Fatal("parent funnel planned with no searched inner join")
++	}
++	if parentCosts[0] <= defCosts[0] {
++		t.Errorf("parent funnel priced %.2f under work_mem=4KB vs %.2f at default — scope settings were dropped",
++			parentCosts[0], defCosts[0])
++	}
++}
++
++// TestInsertSelectSearchCarriesWorkMem pins the F2 family: INSERT…SELECT plans
++// a full SELECT as its source, and that source's search must price in the
++// statement's currency via the threaded planInsert.
++func TestInsertSelectSearchCarriesWorkMem(t *testing.T) {
++	cat := workMemProbeCatalog(t)
++	if _, err := cat.CreateTable(parser.ObjectName{Name: "dst"}, []catalog.Column{
++		{Name: "a", Type: catalog.Type{Name: "int4"}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	assertWorkMemReachesInterior(t,
++		"insert into dst select j1.a from pj1 j1, pj2 j2 where j1.a = j2.a", cat)
++}
++
++// TestProductionDefaultCostParamsCallersAreExactlyThree is the F7 grep-gate.
++//
++// After the cut, production callers of defaultCostParams() must be exactly:
++// DefaultPlannerSettings (definitional — plannersettings.go),
++// DeriveLegacyDisplayCost (display-only — plancost.go), and pathRescanTotal
++// (test-only — joinpathsmemoize.go, documented at its definition). Any other
++// production caller is a missed fringe site silently pricing at ~1GiB, and any
++// FEWER means one of the three was threaded without updating this gate —
++// either way the cut's accounting is wrong, so the gate fails closed.
++//
++// The walk is syntactic (go/ast CallExpr), so comments and the definition
++// itself can never trip it; _test.go files are out of scope (~200 test sites
++// mutate a local copy deliberately).
++func TestProductionDefaultCostParamsCallersAreExactlyThree(t *testing.T) {
++	_, thisFile, _, ok := runtime.Caller(0)
++	if !ok {
++		t.Fatal("runtime.Caller failed")
++	}
++	dir := filepath.Dir(thisFile)
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// file -> enclosing function names calling defaultCostParams().
++	found := map[string][]string{}
++	fset := token.NewFileSet()
++	for _, e := range entries {
++		name := e.Name()
++		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
++			continue
++		}
++		f, err := goparser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var enclosing string
++		ast.Inspect(f, func(n ast.Node) bool {
++			switch x := n.(type) {
++			case *ast.FuncDecl:
++				enclosing = x.Name.Name
++				return true
++			case *ast.CallExpr:
++				if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "defaultCostParams" {
++					found[name] = append(found[name], enclosing)
++				}
++			}
++			return true
++		})
++	}
++	want := map[string]string{
++		"plannersettings.go":  "DefaultPlannerSettings",
++		"plancost.go":         "DeriveLegacyDisplayCost",
++		"joinpathsmemoize.go": "pathRescanTotal",
++	}
++	if len(found) != len(want) {
++		t.Fatalf("production defaultCostParams() callers = %v, want exactly %v", found, want)
++	}
++	for file, fn := range want {
++		got, ok := found[file]
++		if !ok {
++			t.Errorf("missing production caller in %s (want %s); got %v", file, fn, found)
++			continue
++		}
++		if len(got) != 1 || got[0] != fn {
++			t.Errorf("%s: caller(s) = %v, want exactly [%s]", file, got, fn)
++		}
++	}
++}
+diff --git a/internal/optimizer/view_dml.go b/internal/optimizer/view_dml.go
+index 4af19fb25..94add2bf2 100644
+--- a/internal/optimizer/view_dml.go
++++ b/internal/optimizer/view_dml.go
+@@ -202,7 +202,7 @@ func viewProxyTable(base *catalog.Table, names []string, colMap []int) *catalog.
+ //     inner level's own CheckOption setting; a LOCAL check option checks
+ //     only levels that themselves specify CHECK OPTION. checked is nil when
+ //     no level in the chain triggers a check.
+-func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *catalog.Table, cat catalog.Catalog) (all, checked Expr, err error) {
++func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *catalog.Table, cat catalog.Catalog, ps PlannerSettings) (all, checked Expr, err error) {
+ 	forceCascade := false
+ 	for i, lvl := range chain {
+ 		var innerNames []string
+@@ -211,7 +211,7 @@ func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *cata
+ 			innerNames = viewColumnNames(chain[i+1])
+ 			innerColMap = colMaps[i+1]
+ 		}
+-		q, qerr := viewQualOnBase(lvl, innerNames, innerColMap, base, cat)
++		q, qerr := viewQualOnBase(lvl, innerNames, innerColMap, base, cat, ps)
+ 		if qerr != nil {
+ 			return nil, nil, qerr
+ 		}
+@@ -235,7 +235,10 @@ func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *cata
+ // onto base's physical layout first; when the immediate FROM is base
+ // itself, its names already are base's own names and no translation is
+ // needed. Returns nil when the view has no WHERE clause.
+-func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int, base *catalog.Table, cat catalog.Catalog) (Expr, error) {
++//
++// EX3-03 cut 1: the view's stored WHERE can hide a scalar subquery over a
++// join, so it resolves under the enclosing DML statement's settings.
++func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int, base *catalog.Table, cat catalog.Catalog, ps PlannerSettings) (Expr, error) {
+ 	if tbl.View.Where == nil {
+ 		return nil, nil
+ 	}
+@@ -248,7 +251,7 @@ func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int,
+ 	if innerNames != nil {
+ 		resolveTbl = viewProxyTable(base, innerNames, innerColMap)
+ 	}
+-	ctx := singleBindingContext(resolveTbl, alias, DefaultPlannerSettings())
++	ctx := singleBindingContext(resolveTbl, alias, ps)
+ 	ctx.cat = cat
+ 	return resolveExpr(tbl.View.Where, ctx)
+ }
+diff --git a/internal/optimizer/with.go b/internal/optimizer/with.go
+index d4a22e24d..f1ddffcf6 100644
+--- a/internal/optimizer/with.go
++++ b/internal/optimizer/with.go
+@@ -88,7 +88,11 @@ var planCTEs map[string]*plannedCTE
+ //
+ // Returns nil restorer when with is nil so the caller can defer
+ // unconditionally with `defer restore()` and a no-op stub.
+-func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore func(), dmlPlans []dmlCTEPlan, err error) {
++//
++// EX3-03 cut 1: ps is the enclosing statement's settings. CTE bodies
++// routinely contain the join tree (the Q9 pattern), so these are the
++// highest-value conversions — every body below prices under ps.
++func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerSettings) (restore func(), dmlPlans []dmlCTEPlan, err error) {
+ 	if with == nil {
+ 		return func() {}, nil, nil
+ 	}
+@@ -105,7 +109,7 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
+ 		restore = func() { planCTEs = prev }
+ 
+ 		for _, cte := range with.CTEs {
+-			body, err := planRecursiveCTE(cte, cat)
++			body, err := planRecursiveCTE(cte, cat, ps)
+ 			if err != nil {
+ 				restore()
+ 				return nil, nil, err
+@@ -161,7 +165,7 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
+ 	for _, cte := range with.CTEs {
+ 		// Data-modifying CTE (INSERT/UPDATE/DELETE/MERGE body).
+ 		if cte.DMLBody != nil {
+-			body, dmlErr := planDMLCTEBody(cte.DMLBody, cat)
++			body, dmlErr := planDMLCTEBody(cte.DMLBody, cat, ps)
+ 			if dmlErr != nil {
+ 				restore()
+ 				return nil, nil, dmlErr
+@@ -202,7 +206,8 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
+ 		// FROM a) ...`. Calling planSelect directly skips Analyze
+ 		// while still seeing the in-progress planCTEs map so an
+ 		// earlier sibling is visible to a later one.
+-		body, err := planSelect(cte.Query, cat)
++		// EX3-03 cut 1: under ps — the CTE body holds the join tree.
++		body, err := planSelectWithSettings(cte.Query, cat, ps)
+ 		if err != nil {
+ 			restore()
+ 			return nil, nil, err
+@@ -254,14 +259,17 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
+ // planRecursiveCTE plans a WITH RECURSIVE CTE body as a RecursiveUnion.
+ // The CTE must have a UNION ALL body; the left side is the anchor
+ // and the right side is the recursive member.
+-func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, error) {
++//
++// EX3-03 cut 1: ps is the enclosing statement's settings — anchor and
++// recursive member both price under it.
++func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
+ 	key := strings.ToLower(cte.Name)
+ 
+ 	// PostgreSQL allows WITH RECURSIVE CTEs whose bodies don't actually
+ 	// recurse (no UNION self-reference). In that case, treat the CTE as a
+ 	// regular non-recursive CTE — plan it with planSelect and register it.
+ 	if cte.Query.SetOp == nil {
+-		body, err := planSelect(cte.Query, cat)
++		body, err := planSelectWithSettings(cte.Query, cat, ps)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -331,7 +339,8 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
+ 	}
+ 	savedSetOp := cte.Query.SetOp
+ 	cte.Query.SetOp = nil
+-	anchor, err := planSelect(cte.Query, cat)
++	// EX3-03 cut 1: anchor prices under ps.
++	anchor, err := planSelectWithSettings(cte.Query, cat, ps)
+ 	cte.Query.SetOp = savedSetOp
+ 	if err != nil {
+ 		if hadEntry {
+@@ -392,7 +401,8 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
+ 		return nil, err
+ 	}
+ 
+-	rec, err := planSelect(cte.Query.SetOp.Right, cat)
++	// EX3-03 cut 1: recursive member prices under ps.
++	rec, err := planSelectWithSettings(cte.Query.SetOp.Right, cat, ps)
+ 	if err != nil {
+ 		if hadEntry {
+ 			planCTEs[key] = savedEntry
+@@ -573,16 +583,18 @@ type dmlCTEPlan struct {
+ // planDMLCTEBody plans an INSERT/UPDATE/DELETE/MERGE statement that
+ // appears as a CTE body. The plan's Output() schema reflects the
+ // RETURNING columns (empty if no RETURNING clause).
+-func planDMLCTEBody(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
++//
++// EX3-03 cut 1: the DML body receives the enclosing statement's settings.
++func planDMLCTEBody(stmt parser.Stmt, cat catalog.Catalog, ps PlannerSettings) (Node, error) {
+ 	switch s := stmt.(type) {
+ 	case *parser.InsertStmt:
+-		return planInsert(s, cat)
++		return planInsert(s, cat, ps)
+ 	case *parser.UpdateStmt:
+-		return planUpdate(s, cat)
++		return planUpdate(s, cat, ps)
+ 	case *parser.DeleteStmt:
+-		return planDelete(s, cat)
++		return planDelete(s, cat, ps)
+ 	case *parser.MergeStmt:
+-		return planMerge(s, cat)
++		return planMerge(s, cat, ps)
+ 	default:
+ 		return nil, &PlanError{Code: "0A000", Message: "unsupported DML statement in CTE body"}
+ 	}

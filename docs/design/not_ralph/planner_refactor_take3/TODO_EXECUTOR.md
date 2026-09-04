@@ -209,7 +209,14 @@ Sequenced after EX1 (13 §1 EX-P7).
       PASS=95 MISMATCH=0; artifacts: `internal/executor/spill.go`,
       `internal/executor/spill_test.go`. Step-2 (session work_mem
       threading) designed (`docs/design/executor-ex3-03-workmem/DESIGN.md`,
-      reviewed F1–F7 folded) — implementation queued.
+      reviewed F1–F7 folded) and IMPLEMENTED unit-green, but [!] BLOCKED
+      on spill-cost calibration at bench: plumbing alone moves Q7/Q9 plans
+      (bench work_mem=64MB; the designed 8× interior fix) to slower merge
+      shapes — Q7 +58%, Q9 +31%, values identical; same-server forced-hash
+      proof 10.65 s vs chosen merge 14.38 s while model prices hash above
+      merge. Ledger `take3-EX3-03-step2-blocked`; resume artifact
+      `analysis/planner-refactor-take3/ex303-step2-deferred-20260904/`
+      (README + clean-applying plumbing.patch).
 - [ ] EX3-04 Sort spill runs + merge discipline — run formation on
       `flushChunk`, tape-style merge-back (logtape analogue, 10 §9).
       *design: 13 §5; gate: spilling-sort shapes; values + pin.*
