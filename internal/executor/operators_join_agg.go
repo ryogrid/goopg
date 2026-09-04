@@ -80,6 +80,16 @@ type joinOp struct {
 	buildBytes       *mmgr.Context
 	buildBytesShared bool
 
+	// EX3-02 Cut 2 (stratum D): per-joinOp build arena for Datum cells.
+	// The struct copy lands in buildCells.AllocAligned(w*48, 8) and the
+	// retained Row is a view over the chunk. Same statement-parenting and
+	// serial teardown as stratum B; no shared flag — workers never retain
+	// (single leader build loop by construction), so shared-adopted cells
+	// cannot exist (see ensureBuildCells). Buf-carrying rows never enter
+	// this arena (F1 whole-row heap rule); dense rows bypass rowPool and
+	// must never reach releaseRow.
+	buildCells *mmgr.Context
+
 	// M0127-P2.2 (05 §5, stage E4): the executor's key plan, resolved once
 	// per Open from planner.Join.ExecHashKeyPlan. execKeys holds EVERY
 	// equi-pair the hash table is keyed on — goopg carried one since M0003 —
@@ -566,7 +576,9 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	o.fillSweepReset()
 	// EX3-02 Cut 1: a re-Open that skipped Close must not inherit the
 	// previous run's stratum-B arena (nor keep a stale shared adoption).
+	// Cut 2: same for the stratum-D cell arena (never shared-adopted).
 	o.releaseBuildBytes()
+	o.releaseBuildCells()
 	// M0054-0005b: hoist the per-iteration `nullRow(...)` allocation
 	// out of the build loop. The hash-key evaluation only needs the
 	// other-side columns to be present so column-index resolution
@@ -597,7 +609,10 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// EX3-02 Cut 1: stratum-B arena for this build, parented to the
 	// statement context. Covers the serial loops below and the cooperative
 	// parallel consumer (single leader loop by construction, §3.7).
+	// Cut 2: stratum-D cell arena alongside it — the dense path requires
+	// both, and retainBuildRow degrades to legacy unless both are set.
 	o.ensureBuildBytes(ctx)
+	o.ensureBuildCells(ctx)
 
 	// M0129-S4.1: cooperative parallel hash build — N goroutines scan+filter
 	// the build table while one goroutine owns the hash map
@@ -946,8 +961,11 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 // case keeps the cheap O(width) struct copy. Dropping either half re-opens the
 // M0097-0058 aliasing class — build rows must never alias a scan buffer.
 // EX3-02 Cut 1: the build loops now retain through retainBuildRow (stratum-B
-// payloads); this stays as the no-arena-context fallback and the
-// cross-path primitive — semantics bit-identical by pin.
+// payloads); Cut 2 adds the stratum-D cell packing there. This stays as the
+// no-arena-context fallback and the cross-path primitive — semantics
+// bit-identical by pin. It is also the whole-row heap path for rows stratum
+// D cannot take (F1 Buf-carriers, non-arena rows): retainBuildRowHeap shares
+// this header discipline, differing only in payload destination.
 func ownedBuildRow(row Row) Row {
 	if rowHasArena(row) {
 		return cloneRowOwned(row)
@@ -1818,7 +1836,10 @@ func (o *joinOp) Close() error {
 	// EX3-02 Cut 1: drop the stratum-B arena with the table. A
 	// shared-adopted arena is only dereferenced here (statement end
 	// reclaims it); the serial arena is Released eagerly.
+	// Cut 2: drop the stratum-D cell arena alongside it (always owned —
+	// shared-adopted cells cannot exist, so this is unconditionally eager).
 	o.releaseBuildBytes()
+	o.releaseBuildCells()
 	o.lazyProbe = nil
 	o.lazyProbeSrc = nil
 	o.lazyMatches = nil

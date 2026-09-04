@@ -53,14 +53,17 @@ func cut1ArenaBigNumeric(t *testing.T, prod *mmgr.Context, digits string, scale 
 	return newBigNumericInCtx(prod, bi, scale)
 }
 
-// cut1BuildOp returns a joinOp whose retention call targets a fresh
-// stratum-B arena parented to stmt (the statement context). Callers own
-// stmt's Release, which cascades to the arena.
+// cut1BuildOp returns a joinOp whose retention call targets fresh
+// stratum-B and stratum-D arenas parented to stmt (the statement context).
+// Callers own stmt's Release, which cascades to the arenas. EX3-02 Cut 2:
+// retainBuildRow's dense path requires BOTH strata, so the fixture ensures
+// both (Cut 1's payload pins hold unchanged on the full path).
 func cut1BuildOp(stmt *mmgr.Context) *joinOp {
 	o := &joinOp{}
 	o.ensureBuildBytes(&Context{Mctx: stmt})
-	if o.buildBytes == nil {
-		panic("ensureBuildBytes: nil arena with non-nil statement context")
+	o.ensureBuildCells(&Context{Mctx: stmt})
+	if o.buildBytes == nil || o.buildCells == nil {
+		panic("ensureBuildBytes/ensureBuildCells: nil arena with non-nil statement context")
 	}
 	return o
 }
@@ -258,6 +261,7 @@ func TestDenseBuildRightSweepRehomedStrings(t *testing.T) {
 	}
 	o := chainFixture(optimizer.JoinTypeRight, probe, nil, 2, 2)
 	o.ensureBuildBytes(&Context{Mctx: stmt})
+	o.ensureBuildCells(&Context{Mctx: stmt})
 
 	// One keyed-but-unmatched build row (bucket sweep lane) and one NULL-key
 	// row (fillNullBuild lane), both retained through the new path.
@@ -303,6 +307,7 @@ func TestDenseBuildFullSweepRehomedStrings(t *testing.T) {
 	}
 	o := chainFixture(optimizer.JoinTypeFull, probe, nil, 2, 2)
 	o.ensureBuildBytes(&Context{Mctx: stmt})
+	o.ensureBuildCells(&Context{Mctx: stmt})
 
 	matched := o.retainBuildRow(Row{NewIntDatum(1), cut1ArenaString(t, prod, "b1")})
 	if err := o.insertBuildRow(NewIntDatum(1), matched); err != nil {
