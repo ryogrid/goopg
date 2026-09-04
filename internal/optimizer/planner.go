@@ -1628,6 +1628,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	//   - Post-sort (default SRF): resolve against PS output schema.
 	// Build pre-sort keys now; post-sort keys are built after PS is wired in.
 	var keys []SortKey
+	// B-01c Slice 1: the ORDER BY Sort node built below (normal/pre-sort arm
+	// and SRF post-sort arm), for the finalized above-aware re-stamp just
+	// before return. Construction-time stamping is keys-only (above unknown
+	// until the Limit/Project upper tree exists); the re-stamp overwrites it
+	// with keys ∪ above. Both stamps are assert-only — no plan mutation.
+	var orderSort *Sort
 	if len(s.OrderBy) > 0 && (selectSrfPending == nil || selectSrfPreSort) {
 		// Normal path OR SRF pre-sort path.
 		sortCtx := ctx // default: child schema (also used for pre-sort)
@@ -1677,7 +1683,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			}
 			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
-		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+		// B-01c Slice 1: keys-only construction stamp (above not yet built);
+		// the above-aware re-stamp happens before return. Assert-only.
+		orderSort = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+		stampSortInputTarget(orderSort, nil)
+		node = orderSort
 	}
 	// Wire the ProjectSet into the plan (after pre-sort if applicable).
 	// Then build post-sort keys on the PS output if needed.
@@ -1720,7 +1730,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				}
 				keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 			}
-			node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+			// B-01c Slice 1: SRF post-sort arm — same keys-only stamp as the normal arm.
+			orderSort = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+			stampSortInputTarget(orderSort, nil)
+			node = orderSort
 		}
 	}
 	if s.Limit != nil || s.Offset != nil || s.WithTies {
@@ -2098,6 +2111,13 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
 			}
 		}
+	}
+	// B-01c Slice 1: finalized above-aware re-stamp of the ORDER BY Sort
+	// (keys-only at construction, keys ∪ above now). Overwrite-only,
+	// assert-only — no plan mutation. A detached Sort (dropped by the
+	// ordered-index-only promotion) simply re-stamps keys-only-or-unknown.
+	if orderSort != nil {
+		stampSortInputTarget(orderSort, out)
 	}
 	return wrapDMLCTEPrefix(out, dmlPlans), nil
 }

@@ -1625,6 +1625,27 @@ type Sort struct {
 	pos   int
 	Child Node
 	Keys  []SortKey
+
+	// InputTarget / InputTargetKnown is the sort's input-column keep list —
+	// B-01c Slice 1 (COMPUTE-ONLY sort_input_target): the ascending
+	// child-output positions of the sort-key columns plus the columns
+	// needed above the Sort, derived at Sort-construction time from
+	// existing walkers only (sort keys per walkPlanExprs' Sort arm,
+	// above-chain scopes per enclosingNodeScopeOf).
+	//
+	// NEVER applied: no Project insertion, no schema change, no cost
+	// change — behaviour-neutral by construction (one small slice header
+	// per Sort). InputTargetKnown false means "unknown": a key or an
+	// above-chain expression could not be enumerated, and no narrowing
+	// may be attempted. It is NOT the same as an empty list. Read by
+	// nothing except assertSortInputTargetCoversKeys (sort_input_target.go)
+	// and its unit tests.
+	//
+	// Must-avoid list: cost readers (plancost.go reads Keys only),
+	// EXPLAIN output, plan equality/goldens, copy/clone paths (a clone
+	// that drops the stamp reads as unknown, the safe direction).
+	InputTarget      []int
+	InputTargetKnown bool
 }
 
 func (n *Sort) Pos() int       { return n.pos }

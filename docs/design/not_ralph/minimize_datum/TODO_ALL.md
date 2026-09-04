@@ -187,12 +187,19 @@ are EPICS — split into one-checkbox-per-commit items before starting
   scan projection, (ii) narrowing-aware OuterColumnRef/Args rewriter,
   (iii) NLI probe inventory from IndexClauses, (iv) walkPlanExprs
   coverage + consumer. Ledger `take3-B-01b-declined`.
-- [ ] **B-01c P4-01 deferred slice (c): upper targets.**
-  `make_group/window/sort_input_target` above the search root. Unblocks
-  the EX1 sort half, then EX3 geometry, then D-05/D-06.
-  *design: DESIGN.md Slice 3+ F5; gate: F6 per-commit gate.*
-  (Consumes: P4-01 DESIGN.md. B-01a/b/c execute in cut order, each its
-  own commit, each values-gated.)
+- [~] **B-01c P4-01 deferred slice (c): upper targets.**
+  Review verdict: sort-input compute-only first (group second with
+  Filter/Passthrough decline rules; window last after walker coverage;
+  NO applying cut — no narrowing-aware upper rewriter exists).
+  Slice 1 LANDED 2026-09-05: `Sort.InputTarget`/`InputTargetKnown`
+  additive payload + `sort_input_target.go` derivation (keys ∪ above
+  via existing walkers; unknown on unenumerable) + fail-closed assert;
+  keys-only stamp at construction + above-aware re-stamp before return
+  (upper tree built after the Sort).
+  Gates: 17 new tests; optimizer suite; PP identical to B-01a run
+  (zero drift); TPC-H 24/24 MATCH (assert never fired live).
+  Remaining: group-compute, window-compute (walker coverage first),
+  applying cuts (need upper rewriter + key-preservation gate).
 - [ ] **B-02 P1-11 TOAST in the catalog heap writer.** Re-measure FIRST
   post-`f07c20b1f` — the wide-text case may behave differently now (take3
   06 §2.11). Acceptable interim: bounded-width with a ledger row.
