@@ -121,11 +121,11 @@ tripwires green, values clean, plans unchanged.
       plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0, Q15b-MAIN 25.29→20.93 s
       alloc window 12.57→11.56 GB values identical (single-sample);
       artifacts: `internal/executor/operators_join_agg.go`
-- [ ] EX2-02b Ownership passing at agg input — sole-owner
-      bounded-lifetime clones become transfers. Separate commit from 02a
-      (one seam family per commit, EX-P3).
-      *design: 13 §4; gate: alloc arm; seam tripwire tests; values +
-      pin.*
+- [-] EX2-02b Ownership passing at agg input — DROPPED 2026-09-04 as
+      infeasible: all 12 M-sites fail sole-owner transfer on both ends
+      (sources alias reused producer slot; whole-aggregation lifetimes;
+      MaterializeArena already minimal, no fold/gate). Ledger
+      `take3-EX2-02b-dropped` (+ WithinGroup latent-hazard follow-up).
 - [ ] EX2-02c Ownership passing at gather transfer (= 13 EX2-04) —
       workers stream materialised rows today
       (`operators_gather.go:334-336`); move to ownership transfer across
