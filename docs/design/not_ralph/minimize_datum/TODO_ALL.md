@@ -136,18 +136,16 @@ tracks recorded.*
   Gates: plan-snapshot 15/15 (5 new: cost-only detection, SKIP-loud,
   unknown-mode), shell syntax, live dry-runs (FAIL without server,
   SKIP with opt-out, strict diff on fixtures).
-- [ ] **A-06 Take3-owner acceptance for MD tree commits.** MD is a new row
-  representation with no re-proposal path in take3 13 §10 (README §Status,
-  04 §0.2), and reviewer (c) returned "do not start MD-01" (REVIEW.md
-  B1). This item reconciles that with the authorised approach as
-  follows — **no MD commit lands on `master` until written acceptance is
-  recorded here** (owner name + date + pointer + scope confirmation).
-  Until then, MD work proceeds as follows: D-02 (document-only audit) may
-  complete; D-04 (throwaway prototype, deleted code) may run its
-  measurement; D-01/D-03/D-09 may proceed through reviewed design and
-  flag-gated prototype only. "Without prejudice" is not claimed as a
-  licence: landing code without acceptance re-opens B1.
-  *gate: this line rewritten `[x]` with the acceptance pointer.*
+- [x] **A-06 Take3-owner acceptance for MD tree commits.** ACCEPTED
+  2026-09-05 by Ryo Kanbayashi (take3 owner): MD tree commits may land
+  on `master` per the authorised approach in this item (D-02 document-
+  only audit; D-04 throwaway prototype with deleted code; D-01/D-03/D-09
+  through reviewed design and flag-gated prototype only; D-05 onward
+  additionally needs E-14 + B-01c; landing code outside these bounds
+  re-opens REVIEW.md B1). Pointer: this line.
+  Original terms (kept for the record): MD is a new row representation
+  with no re-proposal path in take3 13 §10 (README §Status, 04 §0.2),
+  and reviewer (c) returned "do not start MD-01" (REVIEW.md B1).
 
 ---
 
