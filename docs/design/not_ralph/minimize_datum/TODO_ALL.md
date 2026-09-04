@@ -121,10 +121,11 @@ tracks recorded.*
   TPC-H roll-up: match=5 shapediff=15 missingnode=2 (PG-only
   Materialize: Q5/Q8) error=0 timeout=0; report-only, exit 0 always.
   Gates: self-test 15/15, unittest 5/5.
-- [ ] **A-04 P0-07 baseline roll-up.** Commit for both suites; record as
-  the starting numbers for bars A1/A2 (take3 09 §4.1). Until measured,
-  enforce the per-category monotone decrements in 09 §5.
-  *design: take3 08 §3; gate: take3 09 §5 P0 row.*
+- [x] **A-04 P0-07 baseline roll-up.** Committed 2026-09-05:
+  `analysis/planner-refactor-take3/a04-baseline-20260905/README.md` —
+  TPC-H power table (TOTAL ≈235 s serial, 24/24), TPC-DS PASS=95
+  sweep pointer, parity starting roll-up 5/15/2/0/0 with per-category
+  decrements enforced from the pinned test budget.
 - [x] **A-05 Non-skippable plan pin.** Landed 2026-09-05: `make
   plan-gate` strict by default (missing baseline / unreachable server →
   FAIL; explicit `PLAN_GATE_ALLOW_SKIP=1` opt-out); `--mode costs`
