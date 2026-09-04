@@ -112,13 +112,15 @@ tracks recorded.*
   SF0.5 with the sweep's EXPLAIN-prefix trick; Q36/70/86 SKIP per
   oracle) + re-capture policy READMEs. Reproducible: capture commands
   recorded in the READMEs; fixtures byte-stable (EXPLAIN-only).
-- [ ] **A-03 P0-06 plan-parity diff.** Normalised tree comparison
-  (costs/rows/widths/times in a separate column), per-query verdicts
-  `MATCH` / `SHAPE-DIFF` / `MISSING-NODE` / `ERROR` / `TIMEOUT`, the
-  nine-category taxonomy, corpus roll-up. Report-only with a pinned
-  mismatch budget; declared normalisation (strip PG standalone `Hash`).
-  *design: take3 08 §3; gate: take3 09 §5 P0 — unit tests over recorded
-  plan pairs.*
+- [x] **A-03 P0-06 plan-parity diff.** Landed 2026-09-05:
+  `scripts/pg-plan-parity-diff.py` (normalised tree compare, estimates
+  side-column only; verdicts MATCH/SHAPE-DIFF/MISSING-NODE/ERROR/
+  TIMEOUT; nine-category taxonomy; declared normalisations incl.
+  strip-PG-Hash + alias/suffix canonicalisation) +
+  `scripts/pg-plan-parity-diff-test.py` (budget pinned in-test).
+  TPC-H roll-up: match=5 shapediff=15 missingnode=2 (PG-only
+  Materialize: Q5/Q8) error=0 timeout=0; report-only, exit 0 always.
+  Gates: self-test 15/15, unittest 5/5.
 - [ ] **A-04 P0-07 baseline roll-up.** Commit for both suites; record as
   the starting numbers for bars A1/A2 (take3 09 §4.1). Until measured,
   enforce the per-category monotone decrements in 09 §5.
