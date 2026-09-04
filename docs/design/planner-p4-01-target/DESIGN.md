@@ -59,15 +59,53 @@ counts would not have). Every slice below is values-gated.
   proof + identity/decline pins, gates 24/24 + 22/22 both arms +
   TPC-DS PASS=95.
 
-## Slice 3+ — Scan-node targets with fixup; join/upper targets last
+## Slice 3+ — Per-joinrel keep-sets; scan-node targets with fixup; upper targets last (reviewed 2026-09-04: proceed-with-changes, all six amendments below folded in)
 
-- Scan targets applied at `createPlanNode` (the single funnel) with
-  setrefs-style fixup (`joinInputsFor` per-join site first, then the
-  `createPlanAtSearchRoot`/`boundaryMap` above-tree half) —
-  `make_group_input_target`, `make_window_input_target`,
-  `make_sort_input_target`, `apply_scanjoin_target_to_paths` in that
-  order. Each its own commit, each values-gated (the P4-01b lesson
-  is per-slice, not once).
+- SINGLE-SCANJOIN-TARGET RULE (F1): one scanjoin target for the whole
+  scan/join tree, computed from the union needed above the tree;
+  joinrel tlists derived, NEVER parent-stamped onto shared paths —
+  `addPathsToJoinrel` reads shared `outer.CheapestTotal` /
+  `inner.CheapestTotal` (`joinpaths.go:176`), so a parent-stamped set
+  would silently serve the second parent the first parent's
+  projection (take3 01 §3 pattern).
+- HASH-BUILD-ONLY CARRIES FORWARD (F2): the Slice-2 `kind ==
+  "PathHashJoin"` refusal stays — merge inputs are OUT of scope for
+  the first cut (goopg merge join order lives in `HashKeys` list
+  order, `createplanjoin.go:327-335,371-382`; executor sorts by that
+  order; projecting a merge input can drop/shift a sort-key column
+  `sortInnerAndOuter`/`absorbMergeSort` assume present). Merge-input
+  narrowing needs its own slice with a sort-key-preservation proof.
+- FIXUP INVENTORY (F3): join quals (via `translateToLayout`), sort
+  keys, agg/window args, subplan `Args` + `OuterColumnRef` remap
+  (`joinlayout.go:502-515,553-593`), NLI probe keys. The refusal arms
+  (`createplanjoin.go:194-200,227-244`) must NEVER be loosened —
+  anything uninventoried declines (keeps the column), Slice-2
+  precedent. Intermediate joinrels consumed by NLI probes or
+  `MergeWholeRowRef` inside the tree are NOT boundary-repaired.
+- ATTRIBUTION RULE (F4): name-keyed sets over-state across relations
+  (safe-widening at statement granularity becomes wrong-narrowing at
+  join granularity); self-joins (Q21's three lineitems, Q7's two
+  nations) need RTE/source-qualified attribution or provably-safe
+  fallback — the guard-blind permutation class `buildKeepSet` warns
+  about must not be re-opened.
+- CUT ORDER (F5/F7): FIRST cut = keep-set SOURCE change at the
+  Slice-2 site only (`joinInputsFor` → `narrowBuildInput`,
+  `createplanjoin.go:277-286`; `Project`-based, hash-only, all three
+  Slice-2 guards carried over unchanged). DEFERRED in order: (a)
+  merge/NL input policy, (b) scan-node application at `createPlanNode`
+  with fixup (narrowing node without layout trips `:289`; narrowing
+  both replays the P4-01b leaf-schema incident — proven-safe shape is
+  `Project`-below-build-side only), (c) upper targets
+  (`make_group/window/sort_input_target`) above the search root. Each
+  its own commit, each values-gated.
+- PER-COMMIT GATE (F6): predict per-level column delta (witness
+  10→6) and per-level `hashsize.Choose` `NBatch` BEFORE measuring
+  (§13.6 lesson); width ≈100 not 6; runtime `Batches:` on fresh
+  server, pinned GOGC/GOMEMLIMIT/cgroup, EXPLAIN ANALYZE `work_mem`
+  64 MB S-cold serial; diff against the PG ORACLE not goopg-vs-goopg
+  (§13.5); gate at 64/4/512 MB budgets; `GOOPG_ASSERT_ROW_SHAPE=1`
+  on; PP movement on the flip commit is widths-only — any plan-shape
+  change fails the commit.
 
 ## Pre-code step (take3 TODO.md:503-504)
 
