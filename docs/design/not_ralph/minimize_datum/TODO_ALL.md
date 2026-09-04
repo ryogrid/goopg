@@ -179,11 +179,14 @@ are EPICS — split into one-checkbox-per-commit items before starting
   TPC-DS PASS=95 MISMATCH=0.
   Artifacts: `internal/optimizer/{narrowoutput,createplanjoin}.go`,
   `pathtarget_test.go`.
-- [ ] **B-01b P4-01 deferred slice (b): scan-node application.**
-  Narrowing at `createPlanNode` with fixup (narrowing the node without
-  layout trips the seam; narrowing both replays the P4-01b leaf-schema
-  incident — proven-safe shape is `Project`-below-build-side only).
-  *design: DESIGN.md Slice 3+ F3/F5; gate: F6 per-commit gate.*
+- [-] **B-01b P4-01 deferred slice (b): scan-node application.**
+  DECLINED 2026-09-05 after pre-implementation review (no safe first
+  cut: in-place narrowing replays P4-01b; scan-arm Project lacks
+  ancestor context — NLI/probe/outer-ref/poison — and reopens F4;
+  restricted variant buys zero memory). Revisit needs (i) executor
+  scan projection, (ii) narrowing-aware OuterColumnRef/Args rewriter,
+  (iii) NLI probe inventory from IndexClauses, (iv) walkPlanExprs
+  coverage + consumer. Ledger `take3-B-01b-declined`.
 - [ ] **B-01c P4-01 deferred slice (c): upper targets.**
   `make_group/window/sort_input_target` above the search root. Unblocks
   the EX1 sort half, then EX3 geometry, then D-05/D-06.
