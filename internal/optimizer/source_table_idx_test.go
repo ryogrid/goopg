@@ -92,6 +92,118 @@ WHERE l1.l_orderkey = l2.l_orderkey AND l2.l_orderkey = l3.l_orderkey`), c)
 	}
 }
 
+// TestRTIDDistinctForTopLevelSelfJoin pins A-01(ii) cut 1's FROM-path
+// threading: every top-level FROM-clause RTE consumes its own RTID from
+// the statement scope created in Plan(), so a self-join's two scans get
+// distinct nonzero identities even though they read the same table.
+func TestRTIDDistinctForTopLevelSelfJoin(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
+		{Name: "l_orderkey", Type: catalog.Type{Name: "numeric"}},
+		{Name: "l_suppkey", Type: catalog.Type{Name: "numeric"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, `SELECT * FROM lineitem l1, lineitem l2`), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scans []*SeqScan
+	visit(node, func(n Node) bool {
+		if s, ok := n.(*SeqScan); ok {
+			scans = append(scans, s)
+		}
+		return true
+	})
+	if len(scans) != 2 {
+		t.Fatalf("expected 2 SeqScans, got %d", len(scans))
+	}
+	for i, s := range scans {
+		if s.RTID == 0 {
+			t.Errorf("top-level SeqScan[%d] RTID is 0 (no identity); expected >= 1", i)
+		}
+	}
+	if scans[0].RTID == scans[1].RTID {
+		t.Errorf("self-join siblings share RTID %d; must differ", scans[0].RTID)
+	}
+}
+
+// TestRTIDZeroForNestedScans pins A-01(ii) cut 1's fallback: paths not
+// yet threaded (derived tables here; sublink/CTE/DML/set-op branches go
+// through the same planSelect entry) plan with a nil scope, so inner
+// scans keep RTID 0 → today's rendering, while the outer scan is stamped.
+func TestRTIDZeroForNestedScans(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
+		{Name: "l_orderkey", Type: catalog.Type{Name: "numeric"}},
+		{Name: "l_suppkey", Type: catalog.Type{Name: "numeric"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, `SELECT * FROM (SELECT l_orderkey FROM lineitem) s, lineitem l`), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scans []*SeqScan
+	visit(node, func(n Node) bool {
+		if s, ok := n.(*SeqScan); ok {
+			scans = append(scans, s)
+		}
+		return true
+	})
+	if len(scans) != 2 {
+		t.Fatalf("expected 2 SeqScans (1 inner + 1 outer), got %d", len(scans))
+	}
+	var zero, nonzero int
+	for _, s := range scans {
+		if s.RTID == 0 {
+			zero++
+		} else {
+			nonzero++
+		}
+	}
+	if zero != 1 || nonzero != 1 {
+		t.Errorf("want 1 nested (RTID 0) + 1 top-level (RTID != 0) SeqScan, got %d zero / %d nonzero", zero, nonzero)
+	}
+}
+
+// TestRTIDDistinctViaPlanSchemaOnly pins that PlanSchemaOnly creates its
+// own statement scope (F1): a schema-only self-join plan still stamps
+// distinct nonzero RTIDs.
+func TestRTIDDistinctViaPlanSchemaOnly(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
+		{Name: "l_orderkey", Type: catalog.Type{Name: "numeric"}},
+		{Name: "l_suppkey", Type: catalog.Type{Name: "numeric"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stmt, ok := parseOne(t, `SELECT * FROM lineitem l1, lineitem l2`).(*parser.SelectStmt)
+	if !ok {
+		t.Fatal("expected *parser.SelectStmt")
+	}
+	node, err := PlanSchemaOnly(stmt, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scans []*SeqScan
+	visit(node, func(n Node) bool {
+		if s, ok := n.(*SeqScan); ok {
+			scans = append(scans, s)
+		}
+		return true
+	})
+	if len(scans) != 2 {
+		t.Fatalf("expected 2 SeqScans, got %d", len(scans))
+	}
+	if scans[0].RTID == 0 || scans[1].RTID == 0 {
+		t.Errorf("PlanSchemaOnly SeqScan RTIDs are %d/%d; expected both >= 1", scans[0].RTID, scans[1].RTID)
+	}
+	if scans[0].RTID == scans[1].RTID {
+		t.Errorf("self-join siblings share RTID %d; must differ", scans[0].RTID)
+	}
+}
+
 // TestFindColumnIndexByNameAndSourceDisambiguates pins the
 // findColumnIndexByNameAndSource helper used by predRebind and
 // reresolveJoinByName. A schema with two columns of the same Name

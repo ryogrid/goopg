@@ -723,6 +723,15 @@ type SeqScan struct {
 	// inheritance-child scan. M0118-0008 (alter-table-4 perm 4: concurrent
 	// `ALTER TABLE c1 ALTER COLUMN a TYPE float`).
 	InheritParentOID uint32
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1):
+	// this scan's FROM-clause entry allocation from the statement's
+	// rtableScope, stamped in planScanRangeVar (each partition /
+	// inheritance fan-out leaf consumes its own — F7). 0 means "no
+	// identity" (nested scope not yet threaded, or a scan built outside
+	// the FROM path) and keeps today's rendering. Only explain_names.go
+	// will read this field (a later cut); value, cost, and executor
+	// paths never do.
+	RTID int32
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet override which role's SELECT
 	// grant the executor checks against Table: set by tagViewOwnerScans when
 	// this scan sits inside an inlined, non-security_invoker view (PostgreSQL
@@ -818,6 +827,12 @@ type IndexScan struct {
 	// a SeqScan: the relation's uniqueness evidence is a property of the
 	// relation, not of how this plan chose to read it.
 	UniqueKeys [][]string
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1).
+	// Field exists for the §4 minimal set; stamping of IndexScan nodes is
+	// a later cut, so this stays 0 (today's rendering) throughout cut 1.
+	// Only explain_names.go will read it; value, cost, and executor
+	// paths never do.
+	RTID int32
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
@@ -990,6 +1005,12 @@ type IndexOnlyScan struct {
 	// same name. M0122-0008 (view-owner privilege gap).
 	PrivilegeCheckRole    string
 	PrivilegeCheckRoleSet bool
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1).
+	// Field exists for the §4 minimal set; stamping of IndexOnlyScan
+	// nodes is a later cut, so this stays 0 (today's rendering)
+	// throughout cut 1. Only explain_names.go will read it; value,
+	// cost, and executor paths never do.
+	RTID int32
 }
 
 func (n *IndexOnlyScan) Pos() int       { return n.pos }
@@ -1494,6 +1515,12 @@ type CTEScan struct {
 	// into the body only when no second reference exists. nil for scans built
 	// outside preplanWithClause (tests). M0125-0035 CTE-body arm.
 	cte *plannedCTE
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1):
+	// this consumer's FROM-clause entry allocation, stamped in
+	// planScanRangeVar. 0 means "no identity" (nested scope not yet
+	// threaded) and keeps today's rendering. Only explain_names.go will
+	// read this field (a later cut); value and executor paths never do.
+	RTID int32
 }
 
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
@@ -1519,6 +1546,12 @@ type MaterializedCTEScan struct {
 	Name   string // CTE name (key into ctx.MaterializedCTEs)
 	Alias  string
 	schema Schema
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1):
+	// this consumer's FROM-clause entry allocation, stamped in
+	// planScanRangeVar. 0 means "no identity" (nested scope not yet
+	// threaded) and keeps today's rendering. Only explain_names.go will
+	// read this field (a later cut); value and executor paths never do.
+	RTID int32
 }
 
 func (n *MaterializedCTEScan) Pos() int       { return n.pos }
@@ -2691,6 +2724,12 @@ type BitmapHeapScan struct {
 	// that function's comment for why). Only affects the "Parallel " EXPLAIN
 	// text prefix (operators_explain.go describePlan).
 	Parallel bool
+	// RTID is the statement-unique range-table identity (A-01(ii) cut 1).
+	// Field exists for the §4 minimal set; stamping of BitmapHeapScan
+	// nodes is a later cut, so this stays 0 (today's rendering)
+	// throughout cut 1. Only explain_names.go will read it; value,
+	// cost, and executor paths never do.
+	RTID int32
 }
 
 func (n *BitmapHeapScan) Pos() int       { return n.pos }

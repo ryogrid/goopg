@@ -105,7 +105,13 @@ tracks recorded.*
   `ctx.alias`; previously the alias was silently dropped there).
   Remaining: (ii) planner-stamped global range-table identity, designed
   (`docs/design/executor-a01ii-rtable-identity/DESIGN.md`, reviewed
-  F1–F10 folded) — implement cuts 1–4 next.
+  F1–F10 folded) — cut 1 LANDED 2026-09-04 (`rtableScope` created in
+  `PlanWithSettings`/`PlanSchemaOnly`, threaded through
+  FROM-planning chain, additive `RTID int32` on the §4 minimal set;
+  nested paths get RTID 0 → zero rendering movement; gates: full
+  optimizer suite + 3 new RTID pins, TPC-H 24/24 MATCH, plan-gate 22/22).
+  Cuts 2–4 (re-entrant threading, explain_names migration, re-measure)
+  next.
   *design: take3 08 §3; gate: take3 09 §5 P0 + units/regress; re-pin the
   goopg-vs-goopg baseline in the same commit.*
 - [ ] **A-02 P0-05 plan-parity capture.** EXPLAIN from goopg and PG for

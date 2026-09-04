@@ -295,7 +295,7 @@ func TestJoinlistLeavesMatchBindings(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
-			_, rctx, err := planFromClause(stmts[0].(*parser.SelectStmt), cat, DefaultPlannerSettings())
+			_, rctx, err := planFromClause(stmts[0].(*parser.SelectStmt), cat, DefaultPlannerSettings(), nil)
 			if err != nil {
 				t.Fatalf("planFromClause: %v", err)
 			}

@@ -55,7 +55,10 @@ func PlanSchemaOnly(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if err := analyzer.Analyze(s, cat); err != nil {
 		return nil, toPlanError(err)
 	}
-	node, err := planSelect(s, cat)
+	// A-01(ii) cut 1: one RTID scope per top-level statement (F1 — the
+	// scope is created here, not at the planSelectWithSettings head,
+	// which re-runs on every recursion and would fork the counter).
+	node, err := planSelectWithSettings(s, cat, DefaultPlannerSettings(), newRtableScope())
 	if err != nil {
 		// For 22xxx runtime errors (division by zero etc.), planSelect returns
 		// the partially-folded plan alongside the error. The schema is still
@@ -100,7 +103,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 // on P2-04 because the plan cache is cross-session and carries no GUC
 // fingerprint.
 func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
-	node, err := planStmtWithSettings(stmt, cat, plannerSet)
+	// A-01(ii) cut 1: one RTID scope per top-level statement (F1).
+	node, err := planStmtWithSettings(stmt, cat, plannerSet, newRtableScope())
 	if err != nil {
 		return nil, err
 	}
@@ -153,10 +157,10 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 }
 
 func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
-	return planStmtWithSettings(stmt, cat, DefaultPlannerSettings())
+	return planStmtWithSettings(stmt, cat, DefaultPlannerSettings(), nil)
 }
 
-func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
+func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
 		// Rewrite `(srf(...)).*` target-list indirection-stars into
@@ -170,7 +174,7 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
-		return planSelectWithSettings(s, cat, plannerSet)
+		return planSelectWithSettings(s, cat, plannerSet, scope)
 	case *parser.InsertStmt:
 		// M0103-0007 rung 15: substitute bare DEFAULT cells in VALUES rows
 		// with the target column's catalog DefaultExpr (or NULL) before the
@@ -805,10 +809,15 @@ func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 // Because DefaultPlannerSettings() is exactly what the tree used before this
 // change, every such path behaves identically to before.
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
-	return planSelectWithSettings(s, cat, DefaultPlannerSettings())
+	// A-01(ii) cut 1: the nested-planning entry (subqueries, sublinks,
+	// CTE bodies, set-op branches, DML SELECTs all arrive here via
+	// planSelectWithParent or direct recursion). These paths are NOT yet
+	// threaded, so they plan with a nil scope and every inner scan gets
+	// RTID 0 → today's rendering. Cut 2 threads them.
+	return planSelectWithSettings(s, cat, DefaultPlannerSettings(), nil)
 }
 
-func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
+func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
 	// UNION branches) call planSelect directly without going through
@@ -1107,8 +1116,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// planScanRangeVar so view substitution / virtual-rows
 		// dispatch live in one place. SourceTableIdx 1 — only
 		// one binding ever in this branch (0 is the
-		// "unknown / derived" sentinel).
-		nrv, b, err := planScanRangeVar(rv, cat, 1, nil, plannerSet)
+		// "unknown / derived" sentinel). The statement scope stamps
+		// the scan's RTID (A-01(ii) cut 1).
+		nrv, b, err := planScanRangeVar(rv, cat, 1, nil, plannerSet, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -1140,7 +1150,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// permuted on a different rule. The search chooses join order
 		// on cost; a greedy pre-pass can only take that choice away.
 		var err error
-		node, ctx, err = planFromClause(s, cat, plannerSet)
+		node, ctx, err = planFromClause(s, cat, plannerSet, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -2507,9 +2517,57 @@ func fixColumnRefsInExpr(e Expr, posMap map[columnKey]int) {
 	}
 }
 
-func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSettings) (Node, *resolveContext, error) {
+// rtableScope allocates statement-unique range-table identities (RTIDs)
+// for A-01(ii): PostgreSQL's varno analogue, cut 1.
+//
+// Created once per top-level statement in PlanWithSettings/PlanSchemaOnly
+// (review F1: NOT at the planSelectWithSettings head, which re-runs on
+// every recursion — set-op branches, CTE bodies — and would fork the
+// counter per level, the exact bug being fixed) and threaded explicitly
+// down the FROM-planning chain alongside planParent.
+//
+// It is NOT hung off PlannerSettings (a by-value struct copied at every
+// call site — a counter there would fork) and NOT a package global (the
+// planParent pattern is already documented as goroutine-thread-unsafe
+// technical debt; duplicating it for a second channel would be
+// indefensible).
+//
+// The counter starts at 1; 0 is reserved as "no identity" (nested scopes
+// not yet threaded in cut 1, and legacy/unthreaded paths), which keeps
+// today's unqualified rendering. Allocation order is first-encounter
+// order during planning (outer FROM left-to-right), hence a pure function
+// of (statement, catalog) and plan-cache safe: no session state may feed
+// the allocator.
+//
+// F6 (recorded choice): every FROM-clause RTE consumes one RTID —
+// including VALUES and table-function RTEs, which PG counts in rtindex
+// order too — even though only the §4 minimal-set scan nodes stamp it.
+// An unstamped consumption becomes a numbering hole, which is
+// PG-faithful; losing 1:1 correspondence with PG rtindex would not be.
+//
+// F7 (recorded choice): each partition / inheritance fan-out leaf
+// consumes its own RTID; see planScanRangeVar.
+type rtableScope struct {
+	next int32
+}
+
+func newRtableScope() *rtableScope { return &rtableScope{next: 1} }
+
+// Alloc returns the next statement-unique RTID. Nil-receiver safe: a nil
+// scope (any path not yet threaded in cut 1 — subquery/sublink/CTE/DML,
+// set-op branches) yields 0, i.e. today's rendering.
+func (s *rtableScope) Alloc() int32 {
+	if s == nil {
+		return 0
+	}
+	id := s.next
+	s.next++
+	return id
+}
+
+func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, error) {
 	if len(s.FromExprs) == 0 {
-		return planFromRangeVars(s.From, cat, ps)
+		return planFromRangeVars(s.From, cat, ps, scope)
 	}
 	var root Node
 	var bindings []rangeBinding
@@ -2524,7 +2582,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 		if len(bindings) > 0 {
 			lateralCtx = newResolveContext(bindings, root.Output(), ps)
 		}
-		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps)
+		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps, scope)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2564,7 +2622,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	return root, rctx, nil
 }
 
-func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSettings) (Node, *resolveContext, error) {
+func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, error) {
 	var root Node
 	var bindings []rangeBinding
 	// Counter starts at 1; zero is reserved as the "unknown /
@@ -2579,7 +2637,7 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSe
 		if len(bindings) > 0 {
 			lateralCtx = newResolveContext(bindings, root.Output(), ps)
 		}
-		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx, lateralCtx, ps)
+		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx, lateralCtx, ps, scope)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2732,8 +2790,8 @@ func exprContainsColumnRef(e Expr) bool {
 	return found
 }
 
-func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext, ps PlannerSettings) (Node, []rangeBinding, error) {
-	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx, lateralCtx, ps)
+func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, []rangeBinding, error) {
+	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx, lateralCtx, ps, scope)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2751,7 +2809,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// left side. Merge the outer lateralCtx with the current
 		// leftCtx so SRF args on the right see both. M0103-0008.
 		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
-		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps)
+		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps, scope)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2992,7 +3050,14 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 	return leftNode, leftCtx.bindings, nil
 }
 
-func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings) (Node, rangeBinding, error) {
+func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, rangeBinding, error) {
+	// A-01(ii) cut 1: consume one RTID for this RTE up front (F6 — every
+	// RTE counts, including VALUES / table-function / subquery / view
+	// entries, even though only the §4 minimal-set scans below stamp it;
+	// unstamped consumptions become PG-faithful numbering holes). A nil
+	// scope (any path not yet threaded: subquery/sublink/CTE/DML,
+	// set-op branches) yields 0 → today's rendering.
+	rtid := scope.Alloc()
 	if rv.Subquery != nil {
 		return planSubqueryRangeVar(rv, cat, sourceIdx, lateralCtx)
 	}
@@ -3024,6 +3089,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					Name:   ce.name,
 					Alias:  alias,
 					schema: ce.schema,
+					RTID:   rtid,
 				}
 				return scan, b, nil
 			}
@@ -3041,6 +3107,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				Child:  ce.body,
 				schema: ce.schema,
 				cte:    ce,
+				RTID:   rtid,
 			}
 			return scan, b, nil
 		}
@@ -3207,14 +3274,23 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// as the trailing slot so a `tableoid::regclass`
 				// reference reports the actual leaf relname (M0100-0005y).
 				var root Node
+				// A-01(ii) cut 1 (F7): each fan-out leaf consumes its
+				// own RTID — the first leaf reuses this RTE's
+				// allocation, the rest allocate fresh.
+				firstLeaf := true
 				for _, leaf := range leaves {
+					leafRTID := rtid
+					if !firstLeaf {
+						leafRTID = scope.Alloc()
+					}
+					firstLeaf = false
 					// The SeqScan must use the leaf's OWN physical schema so
 					// the decoder reads columns in the right order. When the leaf
 					// has a different column order from the root partition table,
 					// buildInheritanceRemapProject wraps the scan in a Project
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
-					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID, TableSample: tsSpec,
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID, TableSample: tsSpec, RTID: leafRTID,
 						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf), UniqueKeys: uniqueKeyColumnSets(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
@@ -3251,7 +3327,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		allDesc := collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 
 		if len(allDesc) > 0 {
-			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec,
+			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec, RTID: rtid,
 				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
@@ -3265,7 +3341,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// lock, skip the now-gone child instead of erroring. M0118-0008
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID, TableSample: tsSpec,
+				// A-01(ii) cut 1 (F7): each fan-out leaf consumes its own RTID.
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID, TableSample: tsSpec, RTID: scope.Alloc(),
 					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child), UniqueKeys: uniqueKeyColumnSets(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
@@ -3286,7 +3363,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			return root, b, nil
 		}
 	}
-	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec,
+	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec, RTID: rtid,
 		EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}, b, nil
 }
 
@@ -11730,7 +11807,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		offset := len(tbl.Columns)
 		for idx, rv := range s.From {
 			si := int16(idx + 2) // sourceIdx 2, 3, … for FROM tables
-			fromNode, fromBinding, err2 := planScanRangeVar(rv, cat, si, nil, DefaultPlannerSettings())
+			// A-01(ii) cut 1: DML FROM lists are NOT yet threaded (nil
+			// scope → RTID 0, today's rendering); cut 2 threads them.
+			fromNode, fromBinding, err2 := planScanRangeVar(rv, cat, si, nil, DefaultPlannerSettings(), nil)
 			if err2 != nil {
 				return nil, err2
 			}
@@ -11910,7 +11989,9 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		offset := len(tbl.Columns)
 		for idx, rv := range s.Using {
 			si := int16(idx + 2) // sourceIdx 2, 3, … for USING tables
-			usingNode, usingBinding, err2 := planScanRangeVar(rv, cat, si, nil, DefaultPlannerSettings())
+			// A-01(ii) cut 1: DML USING lists are NOT yet threaded (nil
+			// scope → RTID 0, today's rendering); cut 2 threads them.
+			usingNode, usingBinding, err2 := planScanRangeVar(rv, cat, si, nil, DefaultPlannerSettings(), nil)
 			if err2 != nil {
 				return nil, err2
 			}
@@ -12025,7 +12106,9 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 
 	// Plan the USING source.
 	var srcIdx int16 = 2
-	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx, nil, DefaultPlannerSettings())
+	// A-01(ii) cut 1: MERGE source is NOT yet threaded (nil scope →
+	// RTID 0, today's rendering); cut 2 threads it.
+	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx, nil, DefaultPlannerSettings(), nil)
 	if err != nil {
 		return nil, err
 	}

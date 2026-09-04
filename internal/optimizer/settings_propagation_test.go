@@ -47,7 +47,7 @@ func TestPlannerSettingsReachSubqueryScan(t *testing.T) {
 
 	// The FROM-clause path builds the subquery's resolve context; verify that
 	// building one through it carries the settings rather than re-defaulting.
-	node, ctx, err := planFromClause(stmts[0].(*parser.SelectStmt), cat, ps)
+	node, ctx, err := planFromClause(stmts[0].(*parser.SelectStmt), cat, ps, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
