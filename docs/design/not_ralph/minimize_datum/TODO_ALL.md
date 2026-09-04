@@ -214,13 +214,19 @@ are EPICS — split into one-checkbox-per-commit items before starting
   field-level decline — every field enumerated post-widening; collector
   veto only) + keys-only construction stamps per spec.
   Gates: 29 new tests; optimizer suite; PP zero drift; TPC-H 24/24.
-- [ ] **B-02 P1-11 TOAST in the catalog heap writer.** Re-measure FIRST
-  post-`f07c20b1f` — the wide-text case may behave differently now (take3
-  06 §2.11). Acceptable interim: bounded-width with a ledger row.
-  Wide-text histograms are dropped plus size-row loss today (`orders`,
-  `customer`, `partsupp`).
-  *design: take3 08 §4; gate: take3 09 §5 P1 + full regress (catalog
-  format); re-init the data dir.*
+- [x] **B-02 P1-11 TOAST in the catalog heap writer.** Landed 2026-09-05
+  as the pre-approved bounded-width interim: try-full-then-truncate in
+  `persistStatsToPGStatistic` (pre-write exact measurement; 64 B bound
+  cap UTF-8-safe → even thinning endpoints-kept → MCV-tail drop →
+  scalar-only; scalars never altered; fitting rows bit-for-bit; NO
+  format change, no re-init). Live-verified: c_comment/o_comment/
+  ps_comment histograms persist post-ANALYZE (were dropped).
+  Gates: stats/analyze suites + catalog suite; PP zero drift (ANALYZE
+  changed stats, plans unmoved); TPC-H 24/24 MATCH.
+  Fidelity loss ledgered (`take3-B-02-interim`); remove at TOAST
+  out-of-line storage (M0125-0029).
+  Artifacts: `internal/executor/operators_analyze.go`,
+  `internal/executor/pgstatistic_truncate_test.go`.
 - [ ] **B-03 P1-14b remainder.** Landed so far: LIKE `patternsel`,
   `booltestsel`, `rowcomparesel`, `scalararraysel`, `var_eq_non_const`.
   Remaining: regex ops, small-hist prefix-range precision (text-scalar

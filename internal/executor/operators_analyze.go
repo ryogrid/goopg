@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/multixact"
@@ -380,6 +381,12 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 	// NO trailing-column rows and no size row, while lineitem/part/… — whose
 	// comment histograms fit — persisted fully. Keep the first error for the
 	// caller's (non-fatal) bookkeeping, write everything that fits.
+	//
+	// B-02 bounded-width interim: an oversized row is truncated (bound widths
+	// capped, then bounds thinned evenly with endpoints kept, then the MCV
+	// tail dropped — scalar fields never touched; see truncateColumnStatsToFit)
+	// and the TRUNCATED row is what persists, instead of dropping the column
+	// entirely. A row that fits is written byte-identical (no cap engaged).
 	var firstErr error
 	for i, cs := range stats.Columns {
 		if i >= len(tbl.Columns) {
@@ -393,6 +400,9 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 		}
 		attNum := int16(col.Ordinal + 1)
 		row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
+		if n, serr := pgStatisticRowTupleLen(cols, row); serr == nil && n > storage.MaxHeapTupleSize {
+			row, cs = truncateColumnStatsToFit(tbl.OID, attNum, cols, cs)
+		}
 		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
 		}
@@ -401,6 +411,124 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 		firstErr = err
 	}
 	return firstErr
+}
+
+// pgStatisticMaxBoundBytes caps one histogram/MCV bound's width in the B-02
+// bounded-width interim. Upstream pg_statistic has a toast relation, so wide
+// histograms persist whole; goopg's catalog heap writer does not TOAST, so a
+// per-column row wider than MaxHeapTupleSize (8160 B) was dropped entirely
+// (orders/customer/partsupp comment columns). Truncation is prefix-faithful
+// (UTF-8 boundary aware) and thinning keeps the endpoints, so range
+// selectivity degrades gracefully; scalar fields (nullfrac/distinct/width,
+// correlation) are never touched. A row that fits is returned byte-identical.
+// Remove when pg_statistic gains TOAST/out-of-line storage (ledger M0125-0029).
+const pgStatisticMaxBoundBytes = 64
+
+// truncateUTF8Prefix cuts s to at most maxBytes without splitting a UTF-8
+// encoding (backs off to the last rune boundary at or under the limit).
+func truncateUTF8Prefix(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	t := s[:maxBytes]
+	for len(t) > 0 && !utf8.ValidString(t) {
+		t = t[:len(t)-1]
+	}
+	return t
+}
+
+// thinStatisticBounds keeps an evenly spaced subset of at most maxBounds
+// entries, always including the first and last bound so the histogram still
+// spans the column's full range. The input must be ascending (as the ANALYZE
+// bucketer emits); a subset of an ascending slice stays ascending.
+func thinStatisticBounds(bounds []string, maxBounds int) []string {
+	if maxBounds < 2 {
+		maxBounds = 2
+	}
+	if len(bounds) <= maxBounds {
+		return bounds
+	}
+	out := make([]string, maxBounds)
+	last := len(bounds) - 1
+	for i := range out {
+		out[i] = bounds[i*last/(maxBounds-1)]
+	}
+	return out
+}
+
+// pgStatisticRowTupleLen is the exact on-page tuple length of a
+// pg_statistic row: EncodeRowPG + NullBitmapPG + heap header/hoff, the same
+// construction buildCatalogPGHeapTuple uses (natts/infomask bits carry no
+// length). Compare against storage.MaxHeapTupleSize: anything at or under it
+// is accepted by PageAddHeapTuple on a fresh page.
+func pgStatisticRowTupleLen(cols []catalog.Column, row Row) (int, error) {
+	body, err := EncodeRowPG(cols, row)
+	if err != nil {
+		return 0, err
+	}
+	bitmap := NullBitmapPG(row)
+	var tup storage.HeapTuple
+	if len(bitmap) > 0 {
+		tup = storage.NewHeapTupleWithNulls(1, storage.InvalidTransactionID, bitmap, body)
+	} else {
+		tup = storage.NewHeapTuple(1, storage.InvalidTransactionID, body)
+	}
+	raw, err := tup.MarshalBinary()
+	if err != nil {
+		return 0, err
+	}
+	return len(raw), nil
+}
+
+// pgStatisticRowIfFits builds the row for cs and reports whether its tuple
+// fits on a heap page. Encode failures report not-fits; the caller then falls
+// through to the scalar-only last resort.
+func pgStatisticRowIfFits(tableOID uint32, attNum int16, cols []catalog.Column, cs catalog.ColumnStats) (Row, bool) {
+	row := buildUserPGStatisticRow(tableOID, attNum, cs)
+	n, err := pgStatisticRowTupleLen(cols, row)
+	if err != nil {
+		return row, false
+	}
+	return row, n <= storage.MaxHeapTupleSize
+}
+
+// truncateColumnStatsToFit shrinks cs until its pg_statistic row fits on a
+// heap page, cheapest fidelity loss first: per-bound width cap, then evenly
+// spaced histogram thinning (endpoints kept), then the MCV tail (least
+// frequent entries first — MCV is frequency-ordered), then the histogram
+// outright. The scalar-only last resort (a few hundred bytes) always fits. A
+// cs that already fits is returned unchanged with its byte-identical row.
+func truncateColumnStatsToFit(tableOID uint32, attNum int16, cols []catalog.Column, cs catalog.ColumnStats) (Row, catalog.ColumnStats) {
+	if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, cs); ok {
+		return row, cs
+	}
+	trunc := cs
+	trunc.Histogram = make([]string, len(cs.Histogram))
+	for i, b := range cs.Histogram {
+		trunc.Histogram[i] = truncateUTF8Prefix(b, pgStatisticMaxBoundBytes)
+	}
+	trunc.MCV = make([]catalog.MCVEntry, len(cs.MCV))
+	for i, e := range cs.MCV {
+		trunc.MCV[i] = catalog.MCVEntry{Value: truncateUTF8Prefix(e.Value, pgStatisticMaxBoundBytes), Frequency: e.Frequency}
+	}
+	if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+		return row, trunc
+	}
+	for len(trunc.Histogram) > 2 {
+		trunc.Histogram = thinStatisticBounds(trunc.Histogram, (len(trunc.Histogram)+1)/2)
+		if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+			return row, trunc
+		}
+	}
+	for len(trunc.MCV) > 0 {
+		trunc.MCV = trunc.MCV[:len(trunc.MCV)/2]
+		if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+			return row, trunc
+		}
+	}
+	trunc.Histogram = nil
+	trunc.MCV = nil
+	return buildUserPGStatisticRow(tableOID, attNum, trunc), trunc
 }
 
 // persistRelSize writes one relation's ANALYZE/VACUUM-measured size to the
