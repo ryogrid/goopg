@@ -1493,6 +1493,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// AggStrategyHashed (hashagg bridge). See
 		// internal/optimizer/groupagg_indexorder.go.
 		applyIndexOrderedGroupingRule(agg.node, cat, plannerSet)
+		// B-01c second cut: the rule above may replace the Aggregate's child
+		// with a narrower IndexOnlyScan and remap the group-input indices to
+		// the new positions, so the construction-time keep (projected against
+		// the old child schema) is recomputed-or-unknown here. Keys-only —
+		// the upper tree is not built yet. Payload-only, no plan change.
+		stampAggregateInputTarget(agg.node, nil)
 		// S8 Slice 2a (0134-0001 P2) presorted aggregates: port
 		// adjust_group_pathkeys_for_groupagg (planner.c:3229). When ≥1
 		// aggregate carries an internal ORDER BY / DISTINCT clause, choose the
@@ -7673,6 +7679,10 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		GroupingSets:  gsSets,
 		GroupingMasks: groupingMasks,
 	}
+	// B-01c second cut: keys-only construction stamp (above not yet built,
+	// passthroughs not yet appended — the append sites below re-stamp to
+	// unknown). Assert-only, no plan mutation.
+	stampAggregateInputTarget(aggNode, nil)
 
 	outputCtx := newResolveContext(nil, outputSchema, inputCtx.settings)
 	// A-01(ii) cut 2: derived stage contexts inherit the statement scope
@@ -8064,6 +8074,10 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 				agg.output.schema = append(agg.output.schema, sc)
 				// Passthrough expression references the child/input ColumnRef.
 				agg.node.Passthrough = append(agg.node.Passthrough, col)
+				// B-01c second cut: passthrough presence declines the
+				// group-input target (walkPlanExprs omits it) — re-stamp
+				// flips the payload to unknown. Payload-only, no plan change.
+				stampAggregateInputTarget(agg.node, nil)
 				agg.funcDepCols[col.Index] = outIdx
 				return &ColumnRef{pos: x.Pos(), Index: outIdx, Name: sc.Name, Type: sc.Type}, nil
 			}
@@ -8239,6 +8253,10 @@ func resolveTargetsAfterAggregate(targets []parser.ResTarget, agg *aggregateSurf
 					agg.node.schema = append(agg.node.schema, sc)
 					agg.output.schema = append(agg.output.schema, sc)
 					agg.node.Passthrough = append(agg.node.Passthrough, cr)
+					// B-01c second cut: passthrough presence declines the
+					// group-input target (walkPlanExprs omits it) — re-stamp
+					// flips the payload to unknown. Payload-only, no plan change.
+					stampAggregateInputTarget(agg.node, nil)
 					agg.funcDepCols[cr.Index] = outIdx
 					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: sc.Name, Type: sc.Type}
 				} else {

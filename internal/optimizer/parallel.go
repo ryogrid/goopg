@@ -743,6 +743,14 @@ func splitAggregate(a *Aggregate, workers int) Node {
 	final.Mode = AggModeFinal
 	final.Child = gather
 	final.PartialSource = &partial
+	// B-01c second cut: the Final's child is now the Gather over the
+	// Partial's output row, not the original input row, so the copied
+	// group-input keep (positions into the input schema) no longer
+	// addresses this node's child — decline to unknown, the safe
+	// direction. The Partial keeps the original's stamp: it reads the
+	// same input row (stampParallelScan only labels the scan).
+	// Payload-only, no plan change.
+	final.InputTarget, final.InputTargetKnown = nil, false
 	return &final
 }
 

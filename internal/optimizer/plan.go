@@ -1291,6 +1291,29 @@ type Aggregate struct {
 	// the alternative design (see docs/design/0134-0001-p2-explain-format.md
 	// §"S8 Slice 2c").
 	GroupKeyOrder []int
+
+	// InputTarget / InputTargetKnown is the aggregate's input-column keep list —
+	// B-01c second cut (COMPUTE-ONLY group_input_target): the ascending
+	// child-output positions of the group-input columns (group keys ∪
+	// aggregate args ∪ internal ORDER BY / WITHIN GROUP ORDER BY args) plus
+	// the columns needed above the Aggregate, derived from existing walkers
+	// only (group inputs per walkPlanExprs' Aggregate arm, above-chain scopes
+	// per enclosingNodeScopeOf).
+	//
+	// NEVER applied: no Project insertion, no schema change, no cost
+	// change — behaviour-neutral by construction (one small slice header
+	// per Aggregate). InputTargetKnown false means "unknown": a Filter or
+	// Passthrough is present, or a group/above expression could not be
+	// enumerated, and no narrowing may be attempted. It is NOT the same as
+	// an empty list. Read by nothing except
+	// assertAggregateInputTargetCoversKeys (group_input_target.go) and its
+	// unit tests.
+	//
+	// Must-avoid list: cost readers (plancost.go reads GroupExprs/Child
+	// only), EXPLAIN output, plan equality/goldens, copy/clone paths (a
+	// clone that drops the stamp reads as unknown, the safe direction).
+	InputTarget      []int
+	InputTargetKnown bool
 }
 
 // GroupingMaskColOffset is the index of the first GROUPING(...) output

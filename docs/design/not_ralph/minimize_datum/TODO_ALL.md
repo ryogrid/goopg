@@ -196,8 +196,15 @@ are EPICS — split into one-checkbox-per-commit items before starting
   (upper tree built after the Sort).
   Gates: 17 new tests; optimizer suite; PP identical to B-01a run
   (zero drift); TPC-H 24/24 MATCH (assert never fired live).
-  Remaining: group-compute, window-compute (walker coverage first),
+  Remaining: window-compute (walker coverage first),
   applying cuts (need upper rewriter + key-preservation gate).
+  Slice 2 (group-input) LANDED 2026-09-05: `Aggregate.InputTarget`
+  payload + `group_input_target.go` (keys ∪ above; Filter/Passthrough
+  decline; fail-closed assert) + construction stamp in
+  `buildAggregateStage`, re-stamp-to-unknown at both Passthrough append
+  sites and after `applyIndexOrderedGroupingRule`,
+  splitAggregate Final-decline (Partial keeps).
+  Gates: 22 group tests; optimizer suite; PP zero drift; TPC-H 24/24.
 - [ ] **B-02 P1-11 TOAST in the catalog heap writer.** Re-measure FIRST
   post-`f07c20b1f` — the wide-text case may behave differently now (take3
   06 §2.11). Acceptable interim: bounded-width with a ledger row.
