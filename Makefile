@@ -67,7 +67,7 @@ help:
 	@echo "  make pgbench-compare-matrix Run the full goopg pgbench matrix survey."
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
 	@echo "  make race-gate          Run concurrency-critical packages under -race (Go data race detector)."
-	@echo "  make plan-gate          Diff EXPLAIN plans against latest baseline; SKIP when unavailable."
+	@echo "  make plan-gate          Diff EXPLAIN plans against latest baseline; FAILS when unavailable (strict)."
 	@echo "  make parity-dashboard   Generate docs/parity-dashboard.md (GUC/SQLSTATE/catalog parity vs PG 18.3)."
 	@echo
 	@echo "  scripts/pg-oracle-diff.sh   Run SQL against goopg AND vanilla PG 18.3, diff output."
@@ -369,11 +369,18 @@ pgbench-compare-report:
 #                   ignores cost variance.
 #   strict-text   — byte-for-byte comparison.
 #   semantic-cost — structural + cost ±10% tolerance.
+#   costs         — cost-visible pin for geometry items (A-05):
+#                   shape AND cost/rows/width must match exactly
+#                   (per-line whitespace-trimmed, unlike strict-text),
+#                   so a hashsize reprice without a reshape is a DIFFER.
+#                   Default stays structural for shape pins; geometry
+#                   items run MODE=costs.
 #
 # Usage:
 #   make plan-snapshot-capture LABEL=m0076-baseline-ffc3429
 #   make plan-diff             LABEL=m0076-baseline-ffc3429
 #   make plan-diff             LABEL=m0076-baseline-ffc3429 MODE=strict-text
+#   make plan-diff             LABEL=m0076-baseline-ffc3429 MODE=costs
 #
 # Requires goopg-bench-bin running on 127.0.0.1:65433
 # (the standard tpch-runner port).
@@ -387,6 +394,9 @@ PLAN_USER    ?= tpch
 PLAN_PASS    ?= tpch
 LABEL        ?=
 MODE         ?= structural
+# PLAN_GATE_ALLOW_SKIP=1 restores the pre-A-05 lenient behaviour (SKIP/exit 0
+# when no baseline exists or the server is unreachable). Default is strict:
+# a mandatory pin that silently passes is not a pin.
 
 plan-snapshot-build:
 	@mkdir -p "$(REPO_ROOT)/tmp"
@@ -411,18 +421,29 @@ plan-diff: plan-snapshot-build
 # ---------------------------------------------------------------
 # plan-gate: run plan-diff against the latest baseline if one
 # exists and the TPC-H server is available.  Used as a pre-commit
-# gate for planner/executor changes.  Exits SKIP (0) when there is
-# no data or no baseline so it never hard-blocks loops without data.
+# gate for planner/executor changes.  STRICT BY DEFAULT (A-05): a
+# missing baseline or an unreachable server FAILS (exit 1) — a
+# mandatory pin that silently passes is not a pin.  Loops without
+# data opt out explicitly with PLAN_GATE_ALLOW_SKIP=1 (restores
+# SKIP/exit 0 for that run only).
 # ---------------------------------------------------------------
 plan-gate: plan-snapshot-build
 	@LATEST=$$(ls -t "$(REPO_ROOT)/plan_snapshots"/*.txt 2>/dev/null | head -1); \
 	if [ -z "$$LATEST" ]; then \
-		echo "plan-gate: SKIPPED (no plan_snapshots/*.txt baseline found)"; \
-		exit 0; \
+		if [ "$(PLAN_GATE_ALLOW_SKIP)" = "1" ]; then \
+			echo "plan-gate: SKIPPED (no plan_snapshots/*.txt baseline found; PLAN_GATE_ALLOW_SKIP=1)"; \
+			exit 0; \
+		fi; \
+		echo "plan-gate: FAIL (no plan_snapshots/*.txt baseline found; capture one with 'make plan-snapshot-capture LABEL=<name>', or opt out with PLAN_GATE_ALLOW_SKIP=1)" >&2; \
+		exit 1; \
 	fi; \
 	if ! pg_isready -h "$(PLAN_HOST)" -p $(PLAN_PORT) -U "$(PLAN_USER)" -q 2>/dev/null; then \
-		echo "plan-gate: SKIPPED (goopg not reachable on $(PLAN_HOST):$(PLAN_PORT) — start the bench server first)"; \
-		exit 0; \
+		if [ "$(PLAN_GATE_ALLOW_SKIP)" = "1" ]; then \
+			echo "plan-gate: SKIPPED (goopg not reachable on $(PLAN_HOST):$(PLAN_PORT) — start the bench server first; PLAN_GATE_ALLOW_SKIP=1)"; \
+			exit 0; \
+		fi; \
+		echo "plan-gate: FAIL (goopg not reachable on $(PLAN_HOST):$(PLAN_PORT) — start the bench server first, or opt out with PLAN_GATE_ALLOW_SKIP=1)" >&2; \
+		exit 1; \
 	fi; \
 	LNAME=$$(basename "$$LATEST" .txt); \
 	echo "plan-gate: diffing against baseline $$LNAME (mode=$(MODE))"; \

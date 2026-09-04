@@ -125,16 +125,16 @@ tracks recorded.*
   the starting numbers for bars A1/A2 (take3 09 §4.1). Until measured,
   enforce the per-category monotone decrements in 09 §5.
   *design: take3 08 §3; gate: take3 09 §5 P0 row.*
-- [ ] **A-05 Non-skippable plan pin (owned here; D-01 points at it).**
-  Close the three holes 06 §2 names: `plan-gate` exits 0 on SKIP (missing
-  baseline / `pg_isready` failure must fail, not skip); default
-  `structural` mode strips `cost=/rows=/width=` so `hashsize` moves are
-  invisible (cost-visible mode for geometry items); no TPC-DS plan pin at
-  all. Single owner (this item) — the 06 §2 "MD-01 or an EX0 item" hedge
-  is resolved in favour of Track A; D-01 carries a pointer, not a second
-  work site.
-  *design: 06 §2; gate: forced-SKIP probe fails loudly; cost-only change
-  detected on a fixture.*
+- [x] **A-05 Non-skippable plan pin.** Landed 2026-09-05: `make
+  plan-gate` strict by default (missing baseline / unreachable server →
+  FAIL; explicit `PLAN_GATE_ALLOW_SKIP=1` opt-out); `--mode costs`
+  (shape + cost/rows/width exact; structural stays default); TPC-DS
+  plan-shape tail promotable via `SF05_PLAN_PIN=1` +
+  `SF05_PLANS_BASELINE` (unset-baseline-under-pin is FAIL; accept by
+  re-pointing; `=none` suppresses one run) — no second channel.
+  Gates: plan-snapshot 15/15 (5 new: cost-only detection, SKIP-loud,
+  unknown-mode), shell syntax, live dry-runs (FAIL without server,
+  SKIP with opt-out, strict diff on fixtures).
 - [ ] **A-06 Take3-owner acceptance for MD tree commits.** MD is a new row
   representation with no re-proposal path in take3 13 §10 (README §Status,
   04 §0.2), and reviewer (c) returned "do not start MD-01" (REVIEW.md

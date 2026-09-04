@@ -11,7 +11,7 @@
 //	    runs EXPLAIN against each TPC-H query, normalises
 //	    per-query output, writes plan_snapshots/<name>.txt.
 //
-//	plan-snapshot diff --label <name> [--mode structural|strict-text|semantic-cost]
+//	plan-snapshot diff --label <name> [--mode structural|strict-text|semantic-cost|costs]
 //	    re-captures + compares with the named baseline,
 //	    prints per-query MATCH/DIFFER, exits non-zero on
 //	    any diff.
@@ -26,6 +26,12 @@
 //	    rate; opt-in only).
 //	semantic-cost — structural + cost ±10 % tolerance per
 //	    matched line.
+//	costs — cost-visible pin for geometry items (A-05):
+//	    shape AND cost/rows/width estimates must match
+//	    exactly (per-line whitespace-trimmed, unlike
+//	    strict-text). Any cost-only move — e.g. a hashsize
+//	    change that reprices without reshaping — is a
+//	    DIFFER here while structural stays MATCH.
 //
 // Decision tree (when plan-diff is sufficient vs full sweep):
 //   - planner-only changes (selectivity, transitivity,
@@ -75,7 +81,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: plan-snapshot capture|diff [flags]")
 	fmt.Fprintln(os.Stderr, "  capture --label <name> [--queries 1,2,...]")
-	fmt.Fprintln(os.Stderr, "  diff    --label <name> [--queries 1,2,...] [--mode structural|strict-text|semantic-cost]")
+	fmt.Fprintln(os.Stderr, "  diff    --label <name> [--queries 1,2,...] [--mode structural|strict-text|semantic-cost|costs]")
 	os.Exit(2)
 }
 
@@ -213,7 +219,7 @@ func parseDiffFlags(args []string) *diffFlags {
 	fs.StringVar(&df.pass, "password", "tpch", "password")
 	fs.StringVar(&df.label, "label", "", "baseline label to compare against")
 	fs.StringVar(&df.queries, "queries", "", "comma-or-range list (e.g. 1,3,5-9). empty = all in baseline")
-	fs.StringVar(&df.mode, "mode", "structural", "structural | strict-text | semantic-cost")
+	fs.StringVar(&df.mode, "mode", "structural", "structural | strict-text | semantic-cost | costs")
 	fs.DurationVar(&df.timeout, "timeout", 30*time.Second, "per-EXPLAIN timeout")
 	fs.Parse(args)
 	if df.label == "" {
@@ -222,7 +228,7 @@ func parseDiffFlags(args []string) *diffFlags {
 		os.Exit(2)
 	}
 	switch df.mode {
-	case "structural", "strict-text", "semantic-cost":
+	case "structural", "strict-text", "semantic-cost", "costs":
 	default:
 		fmt.Fprintf(os.Stderr, "unknown --mode %q\n", df.mode)
 		os.Exit(2)
@@ -356,6 +362,24 @@ func planEqual(a, b, mode string) bool {
 		return strings.TrimSpace(a) == strings.TrimSpace(b)
 	case "structural":
 		return rowsRegexp.ReplaceAllString(a, "") == rowsRegexp.ReplaceAllString(b, "")
+	case "costs":
+		// Cost-visible pin for geometry items (A-05): the full
+		// plan text must match exactly after per-line
+		// whitespace trimming, so a cost/rows/width-only move
+		// (invisible to structural) is a DIFFER. Unlike
+		// strict-text, leading/trailing whitespace per line is
+		// not signal.
+		la := splitLines(a)
+		lb := splitLines(b)
+		if len(la) != len(lb) {
+			return false
+		}
+		for i := range la {
+			if la[i] != lb[i] {
+				return false
+			}
+		}
+		return true
 	case "semantic-cost":
 		// Structural match plus per-line cost ±10% tolerance.
 		la := splitLines(rowsRegexp.ReplaceAllString(a, ""))

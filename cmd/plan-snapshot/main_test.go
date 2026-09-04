@@ -122,6 +122,73 @@ func TestRowsRegexpStripsAnnotations(t *testing.T) {
 	}
 }
 
+// TestPlanEqualCostsDetectsCostOnlyChange pins the A-05 cost-visible mode:
+// a hashsize-style reprice that moves cost/rows/width without reshaping is a
+// DIFFER under costs while structural stays MATCH. Fixture pair, not inline
+// trivia: the two texts differ only inside the estimate annotations.
+func TestPlanEqualCostsDetectsCostOnlyChange(t *testing.T) {
+	a := `Sort
+  ->  MultiHashJoin (cost=0.00..1234.50 rows=12345 width=64)
+    ->  SeqScan: orders (cost=0.00..100.00 rows=1500 width=32)
+    ->  SeqScan: lineitem (cost=0.00..600000.00 rows=6000000 width=32)`
+	b := `Sort
+  ->  MultiHashJoin (cost=0.00..1300.00 rows=13000 width=64)
+    ->  SeqScan: orders (cost=0.00..100.00 rows=1500 width=32)
+    ->  SeqScan: lineitem (cost=0.00..600000.00 rows=6000000 width=32)`
+	if !planEqual(a, b, "structural") {
+		t.Errorf("cost-only move should MATCH structural")
+	}
+	if planEqual(a, b, "costs") {
+		t.Errorf("cost-only move should DIFFER under costs")
+	}
+	if !planEqual(a, a, "costs") {
+		t.Errorf("identical plans should MATCH costs")
+	}
+}
+
+// TestPlanEqualCostsIgnoresIndentation pins costs vs strict-text: per-line
+// whitespace is not signal under costs, but it is under strict-text.
+func TestPlanEqualCostsIgnoresIndentation(t *testing.T) {
+	a := "Sort\n  ->  SeqScan: lineitem (cost=0.00..600000.00 rows=6000000 width=0)"
+	b := "Sort\n    ->  SeqScan: lineitem (cost=0.00..600000.00 rows=6000000 width=0)"
+	if !planEqual(a, b, "costs") {
+		t.Errorf("indentation-only difference should MATCH costs")
+	}
+	if planEqual(a, b, "strict-text") {
+		t.Errorf("indentation-only difference should DIFFER strict-text")
+	}
+}
+
+// TestPlanEqualCostsDetectsShapeChange pins that costs is still a shape pin:
+// a node-type move fails under every mode.
+func TestPlanEqualCostsDetectsShapeChange(t *testing.T) {
+	a := "Sort\n  ->  SeqScan: lineitem (cost=0.00..600000.00 rows=6000000 width=0)"
+	c := "Sort\n  ->  IndexScan: lineitem (cost=0.00..600000.00 rows=6000000 width=0)"
+	for _, mode := range []string{"structural", "costs", "strict-text", "semantic-cost"} {
+		if planEqual(a, c, mode) {
+			t.Errorf("node-type move should DIFFER under %s", mode)
+		}
+	}
+}
+
+// TestReadSnapshotMissingFailsLoudly pins the A-05 non-skippable half at the
+// binary level: a missing baseline is an error, never a silent pass. The
+// Makefile gate relies on this — it must not (and no longer does) convert a
+// missing baseline into SKIP-exit-0 itself.
+func TestReadSnapshotMissingFailsLoudly(t *testing.T) {
+	if _, err := readSnapshot("testdata/no-such-baseline.txt"); err == nil {
+		t.Errorf("readSnapshot(missing) = nil error, want a loud failure")
+	}
+}
+
+// TestPlanEqualUnknownModeFalse pins that an unknown mode never matches.
+func TestPlanEqualUnknownModeFalse(t *testing.T) {
+	a := "Sort\n  ->  SeqScan: lineitem"
+	if planEqual(a, a, "no-such-mode") {
+		t.Errorf("unknown mode should never match, even on identical input")
+	}
+}
+
 // TestRowsRegexpMatchesRealExplainOutput is the review/260831-2 CM-3 guard:
 // the annotation shapes actually produced by PG 18.3 and by goopg's EXPLAIN
 // (internal/executor/operators_explain.go) must both be recognised, or

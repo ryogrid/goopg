@@ -79,6 +79,19 @@
 #   PLAN_TIMEOUT=180        per-query timeout for the EXPLAIN-only plan capture
 #   SF05_PLANS_BASELINE=<p> diff the capture against <p> instead of the newest
 #                           plans-*.txt in the results dir; `none` skips the diff
+#   SF05_PLAN_PIN=1         make the plan-shape tail channel BLOCKING (A-05
+#                           TPC-DS plan pin): plan movement vs the baseline fails
+#                           the sweep via tpcds-plan-diff.py --strict. Requires
+#                           an explicit SF05_PLANS_BASELINE — the default
+#                           floating newest-capture baseline would auto-accept
+#                           the movement it just recorded, so an unset baseline
+#                           under the pin is itself a FAIL. Accept a moved plan
+#                           by blessing the new capture
+#                           (SF05_PLANS_BASELINE=<that file>); bootstrap or
+#                           suppress one run with SF05_PLANS_BASELINE=none.
+#                           Default (unset): informational, never changes the
+#                           exit status. No second channel: same capture, same
+#                           diff tool, same baseline mechanism.
 #   SF05_NO_BUILD=1         keep the binary already at GOOPG_BIN instead of
 #                           rebuilding from the tree (bisect probes); the report
 #                           says its provenance is unknown — see sf05_ensure_bin
@@ -269,6 +282,7 @@ sf05_engine_id_at_start=""      # D4a comparability key, captured before the bui
 sf05_bin_sha_at_start=""        # on-disk image the sweep intended to measure
 sf05_report=""                  # cmd_sweep's report path (the restart guard appends)
 sf05_sweep_active=0             # 1 once the sweep loop owns the server
+sf05_plan_pin_failed=0          # 1 when SF05_PLAN_PIN=1 and the plan channel moved
 
 sf05_ensure_bin() {
     local tree_sha dirty built="rebuilt from tree"
@@ -540,6 +554,12 @@ cmd_oracle() {
 # TIMEOUT). For a milestone whose whole subject is the join search, 74 plans
 # moving in silence is the event we most want the artefact to record.
 #
+# A-05 promotion: SF05_PLAN_PIN=1 makes this channel BLOCKING — movement vs
+# an explicit SF05_PLANS_BASELINE fails the sweep (--strict) — so this file
+# is now also the TPC-DS plan pin. No second channel was built: same capture,
+# same diff tool, same baseline mechanism; see SF05_PLAN_PIN in the Env block
+# above and sf05_plan_channel below.
+#
 # The channel is EXPLAIN-without-ANALYZE, so it executes nothing: no timings and
 # no actual rows enter the file, which is what makes the capture byte-stable.
 # P5.6-g-i measured that noise floor directly — the same binary captured twice
@@ -725,7 +745,13 @@ cmd_plans() {
     sf05_capture_plans "${plans}"
     sf05_goopg_stop
     if [[ -n "${baseline}" && -f "${baseline}" ]]; then
-        python3 "${PLAN_DIFF}" "${baseline}" "${plans}"
+        if [[ "${SF05_PLAN_PIN:-0}" == "1" ]]; then
+            python3 "${PLAN_DIFF}" "${baseline}" "${plans}" --strict
+        else
+            python3 "${PLAN_DIFF}" "${baseline}" "${plans}"
+        fi
+    elif [[ "${SF05_PLAN_PIN:-0}" == "1" && "${SF05_PLANS_BASELINE:-}" != "none" ]]; then
+        die "plan pin (SF05_PLAN_PIN=1) has no baseline to diff against — set SF05_PLANS_BASELINE=<blessed capture> (or =none to bless this capture explicitly)"
     else
         log "no baseline capture to diff against (first run, or SF05_PLANS_BASELINE=none)"
     fi
@@ -735,9 +761,14 @@ cmd_plans() {
 # sf05_plan_channel <report> — the sweep's tail. Restarts the server so the
 # capture is S-cold like the sweep itself, captures, diffs, and appends the
 # result to the sweep report. Runs in a subshell and swallows every failure:
-# a broken plan pass must not turn a passing correctness gate red.
+# a broken plan pass must not turn a passing correctness gate red — UNLESS
+# SF05_PLAN_PIN=1 (A-05 TPC-DS plan pin), which promotes the channel to a
+# blocking gate via --strict (movement fails the sweep) and requires an
+# explicit SF05_PLANS_BASELINE (unset baseline under the pin is itself a
+# FAIL; =none is the explicit one-run suppression).
 sf05_plan_channel() {
-    local report="$1" baseline plans rc=0
+    local report="$1" baseline plans rc=0 diff_rc=0 pinned=0
+    [[ "${SF05_PLAN_PIN:-0}" == "1" ]] && pinned=1
     baseline=$(sf05_plan_baseline)
     plans="${report%/*}/plans-${report##*/sweep-}"
     (
@@ -749,13 +780,37 @@ sf05_plan_channel() {
         echo ""
         if [[ "${rc}" -ne 0 ]]; then
             echo "=== PLAN-SHAPE: capture FAILED (rc=${rc}) — see ${SF05_LOG}; the verdict above is unaffected ==="
+            [[ "${pinned}" == "1" ]] && diff_rc=1
+        elif [[ "${pinned}" == "1" && -z "${SF05_PLANS_BASELINE:-}" ]]; then
+            echo "=== PLAN-SHAPE PIN: FAIL — SF05_PLAN_PIN=1 requires an explicit SF05_PLANS_BASELINE (the default floating newest-capture baseline would auto-accept the movement it just recorded); bless with SF05_PLANS_BASELINE=none, or accept by pointing at the blessed capture ==="
+            diff_rc=1
         elif [[ -n "${baseline}" && -f "${baseline}" ]]; then
-            python3 "${PLAN_DIFF}" "${baseline}" "${plans}" 2>&1 || true
+            if [[ "${pinned}" == "1" ]]; then
+                python3 "${PLAN_DIFF}" "${baseline}" "${plans}" --strict 2>&1 || diff_rc=$?
+            else
+                python3 "${PLAN_DIFF}" "${baseline}" "${plans}" 2>&1 || true
+            fi
+            if [[ "${pinned}" == "1" && "${diff_rc}" -ne 0 ]]; then
+                echo "=== PLAN-SHAPE PIN: FAIL — plans moved vs ${baseline}; accept by blessing ${plans} as the new SF05_PLANS_BASELINE ==="
+            fi
+        elif [[ "${pinned}" == "1" ]]; then
+            if [[ "${SF05_PLANS_BASELINE:-}" == "none" ]]; then
+                echo "# plan-shape pin: explicitly suppressed for this run (SF05_PLANS_BASELINE=none) — accepted, not verified"
+            else
+                echo "=== PLAN-SHAPE PIN: FAIL — SF05_PLANS_BASELINE=${SF05_PLANS_BASELINE} names a missing file ==="
+                diff_rc=1
+            fi
         else
             echo "# plan-shape: captured ${plans} (no baseline to diff against yet)"
         fi
-        echo "# The plan channel is NON-BLOCKING: it never changes this gate's exit status."
+        if [[ "${pinned}" == "1" ]]; then
+            echo "# The plan channel is BLOCKING under SF05_PLAN_PIN=1: movement above fails this gate."
+        else
+            echo "# The plan channel is NON-BLOCKING: it never changes this gate's exit status."
+        fi
     } | tee -a "${report}"
+    [[ "${diff_rc}" -ne 0 ]] && sf05_plan_pin_failed=1
+    return 0
 }
 
 # -------------------------------------------------------------------- sweep
@@ -897,8 +952,10 @@ cmd_sweep() {
     log "sweep report: ${report}"
     # Gate semantics: correctness failures are fatal; timeouts are reported but
     # non-fatal (perf tracking, not a correctness gate). CKMISMATCH is a
-    # correctness failure — the right number of wrong rows.
-    [[ $((mismatch + ckmismatch + gerr)) -eq 0 ]]
+    # correctness failure — the right number of wrong rows. Under
+    # SF05_PLAN_PIN=1 a moved plan-shape pin is fatal too (set by
+    # sf05_plan_channel); otherwise the plan channel stays informational.
+    [[ $((mismatch + ckmismatch + gerr + sf05_plan_pin_failed)) -eq 0 ]]
 }
 
 # cmd_delta [OLD [NEW]] — the status channel on its own, over reports that
