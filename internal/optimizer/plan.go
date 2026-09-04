@@ -942,6 +942,13 @@ type IndexOnlyScan struct {
 	PlanCost
 	pos   int
 	Table *catalog.Table
+	// Alias is the FROM-clause alias; empty when not specified. Mirrors
+	// IndexScan.Alias (M0062-0002): every IndexScan→IOS promotion site
+	// carries it so EXPLAIN prints `Index Only Scan on customer c2`
+	// instead of the bare catalog name. The two min/max-agg synthesis
+	// sites leave it empty — they build a fresh inner scan with no alias
+	// in scope, where the bare relation name is the truthful rendering.
+	Alias string
 	Index *catalog.Index
 	Key   Expr
 	// Keys mirrors IndexScan.Keys: a full multi-column equality probe

@@ -323,6 +323,42 @@ func TestExplainIndexScanHeaderShowsAlias(t *testing.T) {
 	}
 }
 
+// A-01(i) — same alias rule for the index-only-scan header. The planner
+// stamps IndexOnlyScan.Alias at every IndexScan/SeqScan→IOS promotion
+// site (mirroring IndexScan.Alias, M0062-0002); the two min/max-agg
+// synthesis sites leave it empty (fresh inner scan, no alias in scope).
+// Hermetic like its IndexScan twin: hand-built nodes, no planner shape.
+func TestExplainIndexOnlyScanHeaderShowsAlias(t *testing.T) {
+	tbl := &catalog.Table{Name: "customer", Schema: "public"}
+	idx := &catalog.Index{Name: "customer_pk"}
+	n := &optimizer.IndexOnlyScan{Table: tbl, Index: idx, Alias: "c2"}
+	nm := newExplainNames(n)
+
+	if got := describePlan(n, nm); got != "Index Only Scan using customer_pk on customer c2" {
+		t.Errorf("plain header = %q, want %q", got, "Index Only Scan using customer_pk on customer c2")
+	}
+	if got := describePlanVerbose(n, true, nm); got != "Index Only Scan using customer_pk on public.customer c2" {
+		t.Errorf("verbose header = %q, want %q", got, "Index Only Scan using customer_pk on public.customer c2")
+	}
+
+	// No alias: rendering unchanged (bare table, schema rules as before).
+	bare := &optimizer.IndexOnlyScan{Table: tbl, Index: idx}
+	bm := newExplainNames(bare)
+	if got := describePlan(bare, bm); got != "Index Only Scan using customer_pk on customer" {
+		t.Errorf("bare plain header = %q, want %q", got, "Index Only Scan using customer_pk on customer")
+	}
+	if got := describePlanVerbose(bare, true, bm); got != "Index Only Scan using customer_pk on public.customer" {
+		t.Errorf("bare verbose header = %q, want %q", got, "Index Only Scan using customer_pk on public.customer")
+	}
+
+	// Alias identical to the table name: no redundant suffix (SeqScan rule).
+	self := &optimizer.IndexOnlyScan{Table: tbl, Index: idx, Alias: "customer"}
+	sm := newExplainNames(self)
+	if got := describePlan(self, sm); got != "Index Only Scan using customer_pk on customer" {
+		t.Errorf("self-aliased header = %q, want %q", got, "Index Only Scan using customer_pk on customer")
+	}
+}
+
 // P0-04 — same alias rule for the bitmap heap scan header.
 func TestExplainBitmapHeapScanHeaderShowsAlias(t *testing.T) {
 	tbl := &catalog.Table{Name: "customer", Schema: "public"}

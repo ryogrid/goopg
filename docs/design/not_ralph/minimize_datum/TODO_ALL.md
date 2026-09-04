@@ -93,13 +93,19 @@ P2-08/P2-10 resume after Phase 3/4 consumers exist (take3 ledger
 suites; plan pin non-skippable; take3-owner acceptance for the MD code
 tracks recorded.*
 
-- [ ] **A-01 P0-04 suffix numbering.** Align EXPLAIN relation-name suffix
+- [~] **A-01 P0-04 suffix numbering.** Align EXPLAIN relation-name suffix
   numbering with `select_rtable_names`; re-measure the spine
-  `shape_mismatches`. Fold in (i) the `IndexOnlyScan` missing `Alias`
-  field (planner-side stamp for PG's `on customer c2` on IOS probes) and
-  (ii) full-rtable-order numbering via planner-stamped range-table
-  identity (take2 P0-04 remainder) — implement or file with a ledger row.
-  P0-04e: `680e88178` landed the JSON collapse — verify, do not redo.
+  `shape_mismatches`. Progress 2026-09-04: (i) IOS `Alias` stamp LANDED
+  (`IndexOnlyScan.Alias` field + all 5 promotion sites carry it +
+  EXPLAIN alias arms both renderers + unit test; live-verified
+  `Index Only Scan using supplier_pk on supplier s`; gates TPC-H 24/24
+  MATCH, plan-gate 22/22, TPC-DS PASS=95 MISMATCH=0) — plus a drive-by
+  fix of the same hole on the rule-based IndexScan producers
+  (`planIndexScanFromWhereShape`/`tryRangeIndexScan` now stamp
+  `ctx.alias`; previously the alias was silently dropped there).
+  Remaining: (ii) planner-stamped global range-table identity, designed
+  (`docs/design/executor-a01ii-rtable-identity/DESIGN.md`, reviewed
+  F1–F10 folded) — implement cuts 1–4 next.
   *design: take3 08 §3; gate: take3 09 §5 P0 + units/regress; re-pin the
   goopg-vs-goopg baseline in the same commit.*
 - [ ] **A-02 P0-05 plan-parity capture.** EXPLAIN from goopg and PG for

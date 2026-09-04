@@ -395,7 +395,7 @@ func buildIndexOrderedScan(seqScan *SeqScan, idx *catalog.Index, aggNode *Aggreg
 	}
 
 	ios := &IndexOnlyScan{
-		pos: seqScan.pos, Table: seqScan.Table, Index: idx,
+		pos: seqScan.pos, Table: seqScan.Table, Alias: seqScan.Alias, Index: idx,
 		Covered: covered, schema: newSchema,
 	}
 	aggNode.GroupExprs = newGroupExprs

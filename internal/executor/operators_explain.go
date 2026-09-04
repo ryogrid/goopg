@@ -2211,6 +2211,13 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
 		}
+		// A-01(i): print the FROM-clause alias like the IndexScan arm
+		// does, so a self-join's IOS probe renders `on customer c2`
+		// as PG's select_rtable_names does, not a bare second
+		// `on customer`.
+		if p.Alias != "" && p.Table != nil && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s %s", parallelPrefix, dir, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
+		}
 		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.Insert:
 		return "Insert on " + schemaQualify(p.Table.QualifiedName())
@@ -2399,6 +2406,10 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
+		}
+		// A-01(i): same alias branch as the verbose arm above.
+		if p.Alias != "" && p.Table != nil && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s %s", parallelPrefix, dir, explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
 		}
 		return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.Insert:

@@ -9475,6 +9475,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 			return &IndexScan{
 				pos:        where.Pos(),
 				Table:      tbl,
+				Alias:      ctx.alias,
 				Index:      idx,
 				Key:        resolvedKey,
 				schema:     ctx.schema,
@@ -9553,6 +9554,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 	return &IndexScan{
 		pos:        where.Pos(),
 		Table:      tbl,
+		Alias:      ctx.alias,
 		Index:      idx,
 		Key:        resolvedKey,
 		schema:     ctx.schema,
@@ -10535,6 +10537,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	scan := &IndexScan{
 		pos:        where.Pos(),
 		Table:      tbl,
+		Alias:      ctx.alias,
 		Index:      chosenIdx,
 		LowKey:     loKey,
 		HighKey:    hiKey,
@@ -14828,6 +14831,7 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	ios := &IndexOnlyScan{
 		pos:     idxScan.pos,
 		Table:   idxScan.Table,
+		Alias:   idxScan.Alias,
 		Index:   idxScan.Index,
 		Key:     idxScan.Key,
 		Keys:    idxScan.Keys,
@@ -15078,6 +15082,7 @@ func tryPromoteOrderedIndexOnlyScan(proj *Project, cat catalog.Catalog) Node {
 		return &IndexOnlyScan{
 			pos:     seqScan.pos,
 			Table:   seqScan.Table,
+			Alias:   seqScan.Alias,
 			Index:   idx,
 			Covered: covered,
 			schema:  proj.schema,

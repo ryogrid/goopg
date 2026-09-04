@@ -1518,6 +1518,7 @@ func indexOnlyNLIInner(inner *IndexScan, residual Expr, outerWidth int) *IndexOn
 	return &IndexOnlyScan{
 		pos:     inner.pos,
 		Table:   inner.Table,
+		Alias:   inner.Alias,
 		Index:   inner.Index,
 		Key:     inner.Key,
 		Keys:    inner.Keys,

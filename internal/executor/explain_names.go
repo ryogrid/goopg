@@ -225,9 +225,9 @@ func explainRelBaseName(n optimizer.Node) (string, bool) {
 			return strings.ToLower(p.Table.Name), true
 		}
 	case *optimizer.IndexOnlyScan:
-		// No Alias field: an IOS is only ever substituted for an
-		// IndexScan on a covered relation, so the catalog name is the
-		// only name available here.
+		if p.Alias != "" {
+			return p.Alias, true
+		}
 		if p.Table != nil {
 			return strings.ToLower(p.Table.Name), true
 		}

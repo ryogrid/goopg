@@ -369,6 +369,7 @@ func createIndexScanPlan(p *Path) Node {
 		return &IndexOnlyScan{
 			pos:                   id.pos,
 			Table:                 id.table,
+			Alias:                 id.alias,
 			Index:                 p.IndexInfo,
 			Covered:               append([]catalog.Column(nil), p.IndexOnlyCovered...),
 			schema:                schema,
