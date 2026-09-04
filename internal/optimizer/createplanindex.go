@@ -89,6 +89,7 @@ type scanIdentity struct {
 	pos      int
 	table    *catalog.Table
 	alias    string
+	rtid     int32
 	schema   Schema
 	smallDim bool
 	// uniqueKeys is the leaf's uniqueness evidence (M0127-P5.6-f), carried
@@ -258,6 +259,7 @@ func scanIdentityOf(n Node) *scanIdentity {
 			pos:                   s.Pos(),
 			table:                 s.Table,
 			alias:                 s.Alias,
+			rtid:                  s.RTID,
 			schema:                s.Output(),
 			smallDim:              s.SmallDim,
 			uniqueKeys:            s.UniqueKeys,
@@ -277,6 +279,7 @@ func scanIdentityOf(n Node) *scanIdentity {
 			pos:                   s.Pos(),
 			table:                 s.Table,
 			alias:                 s.Alias,
+			rtid:                  s.RTID,
 			schema:                s.Output(),
 			smallDim:              s.SmallDim,
 			uniqueKeys:            s.UniqueKeys,
@@ -370,6 +373,7 @@ func createIndexScanPlan(p *Path) Node {
 			pos:                   id.pos,
 			Table:                 id.table,
 			Alias:                 id.alias,
+			RTID:                  id.rtid,
 			Index:                 p.IndexInfo,
 			Covered:               append([]catalog.Column(nil), p.IndexOnlyCovered...),
 			schema:                schema,
@@ -398,6 +402,7 @@ func createIndexScanPlan(p *Path) Node {
 		// The alias, the schema and the small-dimension answer are the leaf's,
 		// not re-derived — see the file header for what each one's loss costs.
 		Alias:      id.alias,
+		RTID:       id.rtid,
 		Index:      p.IndexInfo,
 		schema:     id.schema,
 		SmallDim:   id.smallDim,

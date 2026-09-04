@@ -223,12 +223,12 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 		var newScan *IndexScan
 		if ch.isEquality {
 			newScan = &IndexScan{
-				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, Index: idx,
+				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, RTID: ss.RTID, Index: idx,
 				Key: ch.bounds.eqKey, schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,
 			}
 		} else {
 			newScan = &IndexScan{
-				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, Index: idx,
+				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, RTID: ss.RTID, Index: idx,
 				LowKey: ch.bounds.loKey, HighKey: ch.bounds.hiKey,
 				schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,
 			}

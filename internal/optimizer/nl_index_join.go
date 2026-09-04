@@ -663,6 +663,7 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		// slot base — silently returning a neighbouring table's
 		// columns instead of failing.
 		Alias:  innerScan.Alias,
+		RTID:   innerScan.RTID,
 		Index:  idx,
 		schema: innerScan.Output(),
 		// M0125-0043: promoting the leaf to an index probe must not change
@@ -1519,6 +1520,7 @@ func indexOnlyNLIInner(inner *IndexScan, residual Expr, outerWidth int) *IndexOn
 		pos:     inner.pos,
 		Table:   inner.Table,
 		Alias:   inner.Alias,
+		RTID:    inner.RTID,
 		Index:   inner.Index,
 		Key:     inner.Key,
 		Keys:    inner.Keys,

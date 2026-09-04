@@ -380,8 +380,9 @@ func TestExplainIndexCondQualifiesOuterProbeKey(t *testing.T) {
 	idx := &catalog.Index{Name: "customer_nation_fkidx", Columns: []string{"c_nationkey"}}
 	key := &optimizer.ColumnRef{Name: "c_nationkey", Index: 0, SourceTableIdx: 1}
 	nm := &explainNames{
-		bySource: map[int16]string{1: "c1", 2: "c2"},
-		cols: map[int16]map[string]bool{
+		bySource: map[int32]string{1: "c1", 2: "c2"},
+		bySrc:    map[int16]int32{1: 1, 2: 2},
+		cols: map[int32]map[string]bool{
 			1: {"c_nationkey": true},
 			2: {"c_nationkey": true},
 		},
@@ -395,8 +396,9 @@ func TestExplainIndexCondQualifiesOuterProbeKey(t *testing.T) {
 
 	// Single-relation scan: the key side stays bare, as before.
 	solo := &explainNames{
-		bySource: map[int16]string{1: "customer"},
-		cols:     map[int16]map[string]bool{1: {"c_nationkey": true}},
+		bySource: map[int32]string{1: "customer"},
+		bySrc:    map[int16]int32{1: 1},
+		cols:     map[int32]map[string]bool{1: {"c_nationkey": true}},
 	}
 	if got := formatIndexCond(scan, &subPlanReg{rel: solo}); got != "(c_nationkey = c_nationkey)" {
 		t.Errorf("single-relation index cond = %q, want %q", got, "(c_nationkey = c_nationkey)")

@@ -118,7 +118,18 @@ tracks recorded.*
   gates: optimizer + Explain suites, TPC-H 24/24 MATCH, PP 20/22 with 2
   label-only DIFFERs in the designed direction — Q11/Q22 sublink scans
   now registered as `_1`, costs/rows byte-identical).
-  Cuts 3–4 (explain_names migration, re-measure) next.
+  Cut 3 LANDED 2026-09-05 (explain_names re-keyed by RTID: bySource/seen/
+  cols int32, bySrc walk-order translation, claimName high-water counter,
+  nodeLabels in RTID order, BitmapHeapScan switch extension, 7 PG-rule
+  tests; RTID propagation fixed at 8 substitution sites — promotion,
+  full-range, scan_input_rewrite, NLI, groupagg, createplanindex,
+  createplanbitmap, rule-based producers via `rangeBinding.rtid` — plus
+  a drive-by compile fix threading alias/rtid into
+  `bitmapOverCorrelatedProbe`; gates: optimizer + Explain suites incl.
+  7/7 new, TPC-H 24/24 MATCH, PP 13/22 with all 9 DIFFERs in the
+  PG-faithful direction — bare columns gaining correct qualifiers,
+  costs/rows byte-identical).
+  Cut 4 (re-pin baseline + spine re-measure) next.
   *design: take3 08 §3; gate: take3 09 §5 P0 + units/regress; re-pin the
   goopg-vs-goopg baseline in the same commit.*
 - [ ] **A-02 P0-05 plan-parity capture.** EXPLAIN from goopg and PG for

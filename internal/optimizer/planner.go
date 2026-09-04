@@ -486,6 +486,13 @@ type rangeBinding struct {
 	// assigned" (CTE / subquery-only / ON CONFLICT excluded) and
 	// falls back to Name-only matching in downstream rebinds.
 	sourceIdx int16
+	// rtid is the same RTE's statement-wide range-table identity
+	// (A-01(ii)), consumed in planScanRangeVar alongside the RTID
+	// stamped on the scan node itself. Substitution sites that rebuild
+	// the scan from ctx (no source node in hand) copy this field so the
+	// replacement stamps the identical identity instead of RTID 0, which
+	// the explain_names migration would otherwise drop from registration.
+	rtid int32
 	// mergeRowKind: 0=normal, 1=MERGE old-row, 2=MERGE new-row.
 	// Bare alias references produce a MergeWholeRowRef (NULL-aware composite)
 	// instead of a RowExpr for absent rows in MERGE RETURNING. M0100-0007.
@@ -3194,7 +3201,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				rv.Alias, len(tbl.Columns), len(rv.Columns)),
 		}
 	}
-	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
+	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx, rtid: rtid}
 	baseSchema := tableSchemaWithSource(tbl, sourceIdx)
 	// Apply column alias renaming from FROM tbl AS alias (col1, col2, ...).
 	// The parser stores the alias list in rv.Columns; here we rename both
@@ -9489,7 +9496,7 @@ func parserExprKey(e parser.Expr) string {
 // defaults; when P2-02 stamps those contexts the session's GUCs flow here with
 // no further change, which is why the value travels on the context rather than
 // as a separate parameter.
-func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int, ps PlannerSettings) Node {
+func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int, ps PlannerSettings, alias string, rtid int32) Node {
 	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
 		return nil
 	}
@@ -9524,6 +9531,8 @@ func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *Colu
 	return &BitmapHeapScan{
 		pos:        pos,
 		Table:      tbl,
+		Alias:      alias,
+		RTID:       rtid,
 		BitmapQual: []Expr{queryClause},
 		Outer: &BitmapIndexScan{
 			pos:    pos,
@@ -9644,13 +9653,14 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 			// Reachable only with an outer binding in scope, so the
 			// UPDATE/DELETE callers — whose executors pattern-match
 			// `*IndexScan` — never see the bitmap shape.
-			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos(), ctx.settings); bhs != nil {
+			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos(), ctx.settings, ctx.alias, ctx.bindings[0].rtid); bhs != nil {
 				return bhs, true, nil
 			}
 			return &IndexScan{
 				pos:        where.Pos(),
 				Table:      tbl,
 				Alias:      ctx.alias,
+				RTID:       ctx.bindings[0].rtid,
 				Index:      idx,
 				Key:        resolvedKey,
 				schema:     ctx.schema,
@@ -9730,6 +9740,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 		pos:        where.Pos(),
 		Table:      tbl,
 		Alias:      ctx.alias,
+		RTID:       ctx.bindings[0].rtid,
 		Index:      idx,
 		Key:        resolvedKey,
 		schema:     ctx.schema,
@@ -10713,6 +10724,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		pos:        where.Pos(),
 		Table:      tbl,
 		Alias:      ctx.alias,
+		RTID:       ctx.bindings[0].rtid,
 		Index:      chosenIdx,
 		LowKey:     loKey,
 		HighKey:    hiKey,
@@ -15081,6 +15093,7 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		pos:     idxScan.pos,
 		Table:   idxScan.Table,
 		Alias:   idxScan.Alias,
+		RTID:    idxScan.RTID,
 		Index:   idxScan.Index,
 		Key:     idxScan.Key,
 		Keys:    idxScan.Keys,
@@ -15332,6 +15345,7 @@ func tryPromoteOrderedIndexOnlyScan(proj *Project, cat catalog.Catalog) Node {
 			pos:     seqScan.pos,
 			Table:   seqScan.Table,
 			Alias:   seqScan.Alias,
+			RTID:    seqScan.RTID,
 			Index:   idx,
 			Covered: covered,
 			schema:  proj.schema,

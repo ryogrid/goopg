@@ -10,9 +10,9 @@ import (
 )
 
 // explainNames is EXPLAIN's range-table name table: the mapping from a
-// column's binding-of-origin (planner.ColumnRef.SourceTableIdx, the
-// per-FROM-clause monotonic id M0071-0009 introduced) to the name EXPLAIN
-// prints in front of that column.
+// scan node's statement-unique range-table identity (the planner-stamped
+// RTID, PostgreSQL's varno analogue, A-01(ii)) to the name EXPLAIN prints
+// in front of that node's columns.
 //
 // It exists because goopg's plan expressions are *resolved* references — a
 // ColumnRef carries only the column's name and its slot index, so two
@@ -35,37 +35,57 @@ import (
 // query. The qualification itself — which relation a column came from — is
 // what this table is for and is unaffected.
 type explainNames struct {
-	// bySource maps SourceTableIdx → printed name. Entry 0 is never
-	// populated: sourceIdx 0 means "no identity assigned" (CTE-only /
-	// subquery-only bindings), and those stay unqualified, exactly as
-	// they render today.
-	bySource map[int16]string
-	// taken counts how many relations already claimed a given base name,
-	// so the second `date_dim` becomes `date_dim_1`.
+	// bySource maps statement-unique RTID → printed name. Entry 0 is never
+	// populated: RTID 0 means "no identity assigned" (scan kinds whose
+	// stamping lands in a later cut, nodes built outside a threaded
+	// planning path), and those stay unqualified, exactly as they render
+	// today.
+	bySource map[int32]string
+	// taken is the per-base high-water mark behind printed-name
+	// disambiguation (PostgreSQL's RTENameHashEntry.counter): taken[base]
+	// is the largest _N suffix handed out for base, and every generated
+	// name is itself entered, so a literal alias `x_1` pushes the second
+	// `x` to `x_2`. See claimName.
 	taken map[string]int
-	// seen guards against registering the same subtree twice — a subplan
+	// seen guards against registering the same RTID twice — a subplan
 	// body is collected when its `SubPlan N` subtree is about to render,
-	// and a plan node can be reached more than once that way.
-	seen map[int16]bool
-	// cols is the column set the relation registered for a binding
+	// CTE bodies are *shared* pointers across references (CTEScan.Child
+	// aliases one planned body), and NestedLoopIndexJoin.InnerMemo.Child
+	// aliases Inner — the same node is reachable twice and must register
+	// once.
+	seen map[int32]bool
+	// cols is the column set the relation registered for an RTID
 	// actually exposes, and it is a correctness guard, not a nicety.
-	// planner.go's `nextSourceIdx` restarts at 1 for EVERY query level
-	// (planFromItem / the FROM loop), so a subquery binding in the outer
-	// scope and a base relation inside that subquery can carry the SAME
-	// SourceTableIdx. A ColumnRef naming a derived column then resolves
-	// to an unrelated relation, and EXPLAIN would print a confident,
-	// wrong qualifier — strictly worse than the bare name it replaced.
-	// Requiring the column name to exist in the claimed relation turns
-	// that case back into today's unqualified rendering. See the
-	// M0125-0039 deferral row: the complete fix is a globally unique
-	// range-table id (PostgreSQL's varno), which is planner work.
-	cols map[int16]map[string]bool
+	// A ColumnRef naming a derived column can still resolve to an
+	// unrelated relation through the bySrc translation below, and
+	// EXPLAIN would print a confident, wrong qualifier — strictly worse
+	// than the bare name it replaced. Requiring the column name to exist
+	// in the claimed relation turns that case back into today's
+	// unqualified rendering. (Recorded limit, review F8: on a mixed node
+	// whose outputs carry several identities, cols covers every output
+	// name, so a later column(src=X, derivedName) lookup can still wrongly
+	// qualify. Low-probability; the guard narrows it, it does not close
+	// it.)
+	cols map[int32]map[string]bool
+	// bySrc translates a column reference's per-level SourceTableIdx
+	// (the storage type every SchemaColumn and ColumnRef carries,
+	// M0071-0009) to the RTID registered for it. The planner's
+	// SourceTableIdx counter restarts at 1 for every query level while
+	// RTIDs are statement-unique, so one src value can name several
+	// relations across levels; the first registration in WALK order wins
+	// — root tree before sublink bodies, consumer before CTE body —
+	// which is the outer scope, the name a correlated OuterColumnRef,
+	// the case this table exists for, needs. (Walk order, not RTID
+	// order, deliberately: CTE bodies are allocated before their
+	// consumers, so an allocation-order tie-break would resolve an outer
+	// reference to the body's inner scan.)
+	bySrc map[int16]int32
 	// nodeLabels maps each plan node to its EXPLAIN-node-label name,
-	// disambiguated independently of SourceTableIdx so two distinct
-	// nodes that share a SourceTableIdx (e.g. a SEMI-join outer and
-	// inner side over the same relation) still get distinguishable
-	// labels. Keyed by nodePtr(n). Populated by collect; nil means no
-	// disambiguation was needed.
+	// disambiguated per RTID in allocation order so two distinct nodes
+	// over the same relation (e.g. a SEMI-join outer and inner side
+	// sharing one SourceTableIdx) still get distinguishable labels.
+	// Keyed by nodePtr(n). Populated by collect; absent means no
+	// disambiguation was needed (bare first occurrence).
 	// M0128-P5.1: this is the select_rtable_names_for_explain equivalent
 	// for node labels — the existing bySource/taken/seen serve column
 	// qualification, which has different collision rules.
@@ -78,10 +98,11 @@ func nodePtr(n optimizer.Node) string { return fmt.Sprintf("%p", n) }
 // newExplainNames builds the name table for the plan rooted at n.
 func newExplainNames(n optimizer.Node) *explainNames {
 	nm := &explainNames{
-		bySource:   map[int16]string{},
+		bySource:   map[int32]string{},
 		taken:      map[string]int{},
-		seen:       map[int16]bool{},
-		cols:       map[int16]map[string]bool{},
+		seen:       map[int32]bool{},
+		cols:       map[int32]map[string]bool{},
+		bySrc:      map[int16]int32{},
 		nodeLabels: map[string]string{},
 	}
 	nm.collect(n)
@@ -98,39 +119,47 @@ func (nm *explainNames) qualify() bool {
 }
 
 // name returns the printed relation name for a binding, or "" when the
-// binding has no name (sourceIdx 0, or a node kind that carries no relation).
+// binding has no name (SourceTableIdx with no RTID registered, or a node
+// kind that carries no relation).
 func (nm *explainNames) name(src int16) string {
 	if nm == nil {
 		return ""
 	}
-	return nm.bySource[src]
+	return nm.bySource[nm.bySrc[src]]
 }
 
 // column renders one column reference. prefix is upstream's
 // context->varprefix, resolved by the caller: false renders the bare column
 // name, true renders `<relation>.<column>` whenever the binding is known.
-// A binding with no name (sourceIdx 0, or a node kind that carries no
-// relation) always renders bare — there is nothing truthful to print.
+// A binding with no name (SourceTableIdx with no RTID registered, or a node
+// kind that carries no relation) always renders bare — there is nothing
+// truthful to print.
 func (nm *explainNames) column(src int16, colName string, prefix bool) string {
 	if !prefix {
 		return colName
 	}
-	rel := nm.name(src)
-	if rel == "" || !nm.cols[src][colName] {
+	rtid, ok := nm.bySrc[src]
+	if !ok {
+		return colName
+	}
+	rel := nm.bySource[rtid]
+	if rel == "" || !nm.cols[rtid][colName] {
 		return colName
 	}
 	return rel + "." + colName
 }
 
 // collect walks the plan subtree rooted at n and registers every scan-like
-// node's relation name. Registration is ordered by SourceTableIdx (the
-// FROM-clause order the planner assigned) rather than by tree position, so
-// the `_N` suffixes do not depend on which join shape the planner picked.
+// node's relation name. Registration is ordered by RTID (the statement-wide
+// allocation order, ≈ FROM order across query levels) rather than by tree
+// position, so the `_N` suffixes do not depend on which join shape the
+// planner picked.
 func (nm *explainNames) collect(n optimizer.Node) {
 	if nm == nil || n == nil {
 		return
 	}
 	type entry struct {
+		rtid int32
 		src  int16
 		base string
 		node optimizer.Node
@@ -142,8 +171,14 @@ func (nm *explainNames) collect(n optimizer.Node) {
 			return
 		}
 		if base, ok := explainRelBaseName(node); ok {
-			if src, ok := explainSingleSourceIdx(node); ok {
-				found = append(found, entry{src: src, base: base, node: node})
+			if rtid, ok := explainNodeRTID(node); ok {
+				// The per-level SourceTableIdx rides along for the
+				// bySrc translation only; the registration key is
+				// the RTID. Nodes whose outputs carry no uniform
+				// identity still register — they simply contribute
+				// no translation.
+				src, _ := explainSingleSourceIdx(node)
+				found = append(found, entry{rtid: rtid, src: src, base: base, node: node})
 			}
 		}
 		for _, c := range planChildren(node) {
@@ -154,18 +189,30 @@ func (nm *explainNames) collect(n optimizer.Node) {
 		// MultiAssignSubqRow), not Node children, so the Node walk above
 		// never reaches them. Walk each hanging body too, or no
 		// sublink-internal scan registers — not just childless-Result
-		// InitPlans. Registration order still favours the root tree:
-		// children are walked before hanging bodies, so on a
-		// per-level SourceTableIdx collision register's first-wins
-		// rule keeps the outer name (see register).
+		// InitPlans. Walk order still favours the root tree — children
+		// before hanging bodies, consumer before CTE body — and the
+		// bySrc pass below keeps the outer name on a per-level
+		// SourceTableIdx collision for exactly that reason.
 		for _, sp := range optimizer.NodeSubplans(node) {
 			walk(sp)
 		}
 	}
 	walk(n)
-	sort.SliceStable(found, func(i, j int) bool { return found[i].src < found[j].src })
+	// bySrc first-wins in WALK order (not RTID order): this reproduces
+	// today's collision preference exactly — root tree before sublink
+	// bodies, consumer before CTE body — so a bare SourceTableIdx lookup
+	// resolves to the same name it did before the migration. Only suffix
+	// assignment (below) moves to allocation order.
 	for _, e := range found {
-		nm.register(e.src, e.base, e.node)
+		if e.src != 0 {
+			if _, claimed := nm.bySrc[e.src]; !claimed {
+				nm.bySrc[e.src] = e.rtid
+			}
+		}
+	}
+	sort.SliceStable(found, func(i, j int) bool { return found[i].rtid < found[j].rtid })
+	for _, e := range found {
+		nm.register(e.rtid, e.base, e.node)
 	}
 
 	// M0128-P5.1: assign per-node disambiguated labels for the EXPLAIN
@@ -173,47 +220,83 @@ func (nm *explainNames) collect(n optimizer.Node) {
 	// column qualification (bySource) because two distinct nodes can
 	// share a SourceTableIdx (e.g. SEMI-join sides over the same
 	// relation) — the column-qualification register() skips the second
-	// one via its `seen` guard, but the node label still needs
-	// disambiguation.
+	// visit only when it is literally the same node reached twice, but
+	// the node label still needs disambiguation per node.
 	//
-	// Labels follow PG select_rtable_names_for_explain: first occurrence
-	// of a base name keeps it bare; subsequent ones get _1, _2, etc.
+	// Labels follow PG select_rtable_names_for_explain through the same
+	// claimName rule as column qualification, over the same RTID-ordered
+	// entries with the same first-wins dedup, so label suffixes and
+	// column-qualifier suffixes agree with each other.
 	labelTaken := map[string]int{}
+	labelSeen := map[string]bool{}
 	for _, e := range found {
-		base := e.base
-		n := labelTaken[base]
-		labelTaken[base] = n + 1
-		if n > 0 {
-			base += "_" + strconv.Itoa(n)
-			nm.nodeLabels[nodePtr(e.node)] = base
+		if e.base == "" {
+			continue
+		}
+		ptr := nodePtr(e.node)
+		if labelSeen[ptr] {
+			continue
+		}
+		labelSeen[ptr] = true
+		if name := claimName(labelTaken, e.base); name != e.base {
+			nm.nodeLabels[ptr] = name
 		}
 	}
 }
 
-// register claims a printed name for one binding. First occurrence of a base
-// name keeps it bare; later ones get `_1`, `_2`, … (set_rtable_names).
+// claimName returns the printed name for one more occurrence of base and
+// records the claim in taken, following PostgreSQL's set_rtable_names
+// (ruleutils.c): the first occurrence keeps base bare; each later one takes
+// base_N for the smallest N not already used as a name, and every generated
+// name is itself entered as a base — so with relations named `x`, `x_1`,
+// `x`, the third claims `x_2`, not a second `x_1`.
 //
-// First registration wins for a given binding id. Root-tree relations are
-// collected before any sublink body's, so when a subplan-local binding
-// collides with an outer one (the per-query-level SourceTableIdx counter
-// makes that possible) the outer name is the one kept — which is the name a
-// correlated OuterColumnRef, the case this table exists for, needs.
-func (nm *explainNames) register(src int16, base string, node optimizer.Node) {
-	if src == 0 || base == "" || nm.seen[src] {
+// Parent-namespace preload (take2 P0-A §5 point 2) is deliberately NOT part
+// of this rule: global uniqueness does not subsume it. If the outer entry
+// holding a name produces no node (eliminated/pulled-up), goopg consumes
+// nothing while PG's preload still suffixes the inner first occurrence —
+// the same family as the stated §6 divergence, listed there.
+func claimName(taken map[string]int, base string) string {
+	if _, used := taken[base]; !used {
+		taken[base] = 0
+		return base
+	}
+	n := taken[base]
+	var cand string
+	for {
+		n++
+		cand = base + "_" + strconv.Itoa(n)
+		if _, used := taken[cand]; !used {
+			break
+		}
+	}
+	taken[base] = n
+	taken[cand] = 0
+	return cand
+}
+
+// register claims a printed name for one range-table identity. First
+// occurrence of a base name keeps it bare; later ones go through claimName
+// (`_1`, `_2`, … with collision re-check, set_rtable_names).
+//
+// First registration wins for a given RTID. The same node can be reached
+// twice (shared CTE bodies, InnerMemo aliasing Inner), and the second visit
+// is skipped — which is the node's own identity, never a cross-level tie to
+// break. Cross-level SourceTableIdx collisions no longer meet here at all:
+// each level's scan carries its own RTID and registers its own name, while
+// the bySrc translation (first in walk order wins) plus the cols guard
+// decide what a bare SourceTableIdx lookup resolves to.
+func (nm *explainNames) register(rtid int32, base string, node optimizer.Node) {
+	if rtid == 0 || base == "" || nm.seen[rtid] {
 		return
 	}
-	nm.seen[src] = true
+	nm.seen[rtid] = true
 	cols := map[string]bool{}
 	for _, c := range node.Output() {
 		cols[c.Name] = true
 	}
-	nm.cols[src] = cols
-	n := nm.taken[base]
-	nm.taken[base] = n + 1
-	if n > 0 {
-		base += "_" + strconv.Itoa(n)
-	}
-	nm.bySource[src] = base
+	nm.cols[rtid] = cols
+	nm.bySource[rtid] = claimName(nm.taken, base)
 }
 
 // explainRelBaseName returns the un-disambiguated name a scan-like node
@@ -253,14 +336,22 @@ func explainRelBaseName(n optimizer.Node) (string, bool) {
 			return p.Alias, true
 		}
 		return p.Name, true
+	case *optimizer.BitmapHeapScan:
+		if p.Alias != "" {
+			return p.Alias, true
+		}
+		if p.Table != nil {
+			return strings.ToLower(p.Table.Name), true
+		}
 	}
 	return "", false
 }
 
-// explainSingleSourceIdx returns the binding id every column of n's output
-// carries, when there is exactly one. A scan node's columns all come from
-// one FROM-clause entry, so this is how a plan node is tied back to its
-// range-table identity without the planner having to store it twice.
+// explainSingleSourceIdx returns the per-level binding id every column of
+// n's output carries, when there is exactly one. It is the storage-type
+// fallback for column resolution: a ColumnRef arrives carrying only its
+// SourceTableIdx, and collect records this value in the bySrc translation
+// alongside the RTID-keyed registration.
 func explainSingleSourceIdx(n optimizer.Node) (int16, bool) {
 	var src int16
 	for _, c := range n.Output() {
@@ -276,6 +367,37 @@ func explainSingleSourceIdx(n optimizer.Node) (int16, bool) {
 		}
 	}
 	return src, src != 0
+}
+
+// explainNodeRTID returns the statement-unique range-table identity stamped
+// on n's scan node (A-01(ii)), when it has one. It is explainSingleSourceIdx
+// reshaped: where that helper derives a per-level SourceTableIdx from the
+// node's output columns, this one reads the planner-stamped RTID field
+// directly. RTID 0 ("no identity": legacy callers, derived-only columns,
+// scan kinds whose stamping lands in a later cut) is reported as absent, so
+// those nodes keep today's unqualified rendering.
+func explainNodeRTID(n optimizer.Node) (int32, bool) {
+	var rtid int32
+	switch p := n.(type) {
+	case *optimizer.SeqScan:
+		rtid = p.RTID
+	case *optimizer.IndexScan:
+		rtid = p.RTID
+	case *optimizer.IndexOnlyScan:
+		rtid = p.RTID
+	case *optimizer.CTEScan:
+		rtid = p.RTID
+	case *optimizer.MaterializedCTEScan:
+		rtid = p.RTID
+	case *optimizer.BitmapHeapScan:
+		rtid = p.RTID
+	default:
+		return 0, false
+	}
+	if rtid == 0 {
+		return 0, false
+	}
+	return rtid, true
 }
 
 // resolveInAncestor names the relation an outer (correlated) column
@@ -296,6 +418,10 @@ func explainSingleSourceIdx(n optimizer.Node) (int16, bool) {
 // Returns "" unless exactly one relation in the ancestor subtree exposes the
 // name. An ambiguous match is left unqualified on purpose: a confidently
 // wrong relation name is worse than the bare column this replaced.
+//
+// Recorded limit (review F8): this keys on bare base names, unsuffixed and
+// id-free, so it can disagree with bySource's suffixed names. Safe
+// direction — ambiguous degrades to "" — but not id-keyed.
 func (nm *explainNames) resolveInAncestor(anc optimizer.Node, colName string) string {
 	if nm == nil || anc == nil || colName == "" {
 		return ""
@@ -343,9 +469,9 @@ func (nm *explainNames) resolveInAncestor(anc optimizer.Node, colName string) st
 // This is PG's select_rtable_names_for_explain (ruleutils.c) applied to
 // plan node labels. It reads from nodeLabels, which collect builds in a
 // separate pass from the column-qualification bySource table, because two
-// distinct nodes can share a SourceTableIdx (the column-qualification
-// register() skips the second one via its `seen` guard) but still need
-// distinguishable node labels.
+// distinct nodes need distinguishable node labels even where column
+// qualification resolves both through one bySrc translation entry (e.g.
+// SEMI-join sides over the same relation with the same SourceTableIdx).
 func (nm *explainNames) disambiguatedName(n optimizer.Node) string {
 	if nm == nil || n == nil {
 		return ""
@@ -363,7 +489,8 @@ func (nm *explainNames) disambiguatedName(n optimizer.Node) string {
 func explainIsScanNode(n optimizer.Node) bool {
 	switch n.(type) {
 	case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan,
-		*optimizer.CTEScan, *optimizer.MaterializedCTEScan:
+		*optimizer.CTEScan, *optimizer.MaterializedCTEScan,
+		*optimizer.BitmapHeapScan:
 		return true
 	}
 	return false
