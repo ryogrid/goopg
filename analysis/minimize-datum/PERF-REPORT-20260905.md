@@ -110,6 +110,21 @@ TIMEOUT=0.**
 
 ## 5. What was closed without code, on evidence
 
+- **D-01 TupleDesc descriptor fields** — landed, additive, no consumer yet.
+  Values 24/24, plans byte-identical, plan-gate PASS. Its agreement test
+  spans two of the four in-tree pg_type.dat transcriptions, so they cannot
+  drift further silently.
+- **F-03 pointer-free `Datum`** — dropped under rule 3. The 2x arithmetic
+  is real (`Datum` measures 48 B; `Buf` is exactly the 24 B slice header;
+  only 18 non-test references), but `Buf` is the detach target that gives a
+  retained value a lifetime independent of a resettable producer arena.
+  Removing it leaves only unbounded alternatives, and the one prior attempt
+  returned 0 rows on seven queries. The win is also dominated on the same
+  sites by the packed-row path D-02 just cleared.
+- **E-08 parallel filter compilation** — dropped by dependency on E-04's
+  measurement. **E-07** re-scoped: two of its three justifications died
+  with E-04 and E-08, and the third was already satisfied.
+
 - **F-02 probe-seam re-materialisation** — already satisfied in tree.
   M0127-P1.1's probe-side slot chaining is default ON, and the in-tree
   benchmark (which keeps the old seam runnable behind a kill switch)
