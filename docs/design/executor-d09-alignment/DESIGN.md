@@ -45,14 +45,13 @@ decides only whether to align, never which header form it is**
   `attispackable`, and a type-keyed cache would pack a
   PLAIN-overridden text column short+unaligned where PG writes
   long+aligned (readable cross-engine via peek, but not
-  byte-identical). `encodeRowPGCtx` therefore gains
-  `info []colTypeInfo` (nil = resolve inline per column via
-  `colTypeDescriptor` + `Column.Storage` override — no global cache,
-  so domain DDL (`RegisterDomain`/`DropDomain`) cannot go stale).
-  The hot heap-write path threads operator-Open-resolved info;
-  cold paths pass nil (correct, slightly slower; extended if
-  profiled). No fifth transcription in any mode (D-01 REVIEW
-  M-goopg-2).
+  byte-identical). Resolved INLINE per column per call via
+  `colTypeDescriptor` + `Column.Storage` override — no global cache
+  (so domain DDL (`RegisterDomain`/`DropDomain`) cannot go stale),
+  no signature changes, no threading. Cost (~2 map lookups + ToLower
+  per column) is bounded against per-column `encodeValuePGCtx`;
+  operator-Open threading is a strict follow-up IF profiled, not now.
+  No fifth transcription in any mode (D-01 REVIEW M-goopg-2).
 - **Decode** (`decodeRowRangeInfo` + header-less
   `decodePhysicalPGRowIntoMctx`): for varlena-kind columns, PEEK —
   `data[off] != 0` → no align; else align over the column's align

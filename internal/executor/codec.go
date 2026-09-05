@@ -114,11 +114,15 @@ func encodeRowPGCtx(cols []catalog.Column, row Row, ctx *Context, pos int) ([]by
 			off += 13
 			continue
 		}
-		align := physicalPGTypeAlign(c.Type)
-		off = alignPhysicalPGOffset(off, align)
+		// D-09 att_align_datum: encode first, then place — a
+		// packable short-header varlena skips alignment (PG's
+		// fill_val short arm); everything else aligns as before.
 		buf, err := encodeValuePGCtx(c.Type, d, ctx, pos)
 		if err != nil {
 			return nil, err
+		}
+		if !packableShortColumn(c, buf) {
+			off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
 		}
 		for len(out) < off+len(buf) {
 			out = append(out, 0)
@@ -127,6 +131,50 @@ func encodeRowPGCtx(cols []catalog.Column, row Row, ctx *Context, pos int) ([]by
 		off += len(buf)
 	}
 	return out, nil
+}
+
+// effectiveAttStorage is the column's heap placement storage class for
+// the D-09 packability gate: the per-column override (`ALTER … SET
+// STORAGE`, `Column.Storage`, flushed to pg_attribute heap) wins over
+// the type default from `colTypeDescriptor` (D-01 bridge, no fifth
+// transcription). Resolved inline per call — no global cache, so domain
+// DDL can never go stale. Unknown types fall through to the
+// varlena-shaped default ('x', packable): round-trips hold via the
+// storage-blind peek, but a genuinely STORAGE=PLAIN custom type would
+// pack where PG aligns (placement-only divergence, same class as the
+// 'p'-varlena note in the D-09 design).
+func effectiveAttStorage(col catalog.Column) byte {
+	switch strings.ToLower(col.Storage) {
+	case "plain":
+		return 'p'
+	case "main":
+		return 'm'
+	case "external":
+		return 'e'
+	case "extended":
+		return 'x'
+	}
+	return colTypeDescriptor(col.Type).TypStorage
+}
+
+// isShortVarlenaHeader tests the header FORM, never the length: odd
+// first byte except the 0x01 TOAST-external marker (which can never be
+// a data short header — shortest data header is 0x03 for empty).
+func isShortVarlenaHeader(buf []byte) bool {
+	return len(buf) > 0 && buf[0]&1 == 1 && buf[0] != 0x01
+}
+
+// packableShortColumn is D-09's `att_align_datum`: true iff this value
+// must skip alignment on encode — varlena-kind, packable storage, and
+// actually carrying a short header.
+func packableShortColumn(col catalog.Column, buf []byte) bool {
+	if !pgPhysicalTypeIsVarlena(col.Type) {
+		return false
+	}
+	if effectiveAttStorage(col) == 'p' {
+		return false
+	}
+	return isShortVarlenaHeader(buf)
 }
 
 func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
@@ -1396,7 +1444,10 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 			tname = strings.ToLower(c.Type.Name)
 			align = physicalPGTypeAlignLowered(c.Type, tname)
 		}
-		off = alignPhysicalPGOffset(off, align)
+		// D-09 att_align_pointer: the peek decides only whether to
+		// align (shared rule: catalog.AttAlignPointer). Bounds-safe:
+		// OOB cursor returns unchanged and trips the exhausted arm.
+		off = catalog.AttAlignPointer(data, off, align, pgPhysicalTypeIsVarlena(c.Type))
 		if off >= len(data) {
 			// Data exhausted — treat remaining columns as NULL.
 			dst[i] = NullDatum
@@ -1443,7 +1494,8 @@ func decodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mmgr.C
 func decodePhysicalPGRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mmgr.Context) error {
 	off := 0
 	for i, c := range cols {
-		off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
+		// D-09 att_align_pointer (shared rule: catalog.AttAlignPointer).
+		off = catalog.AttAlignPointer(data, off, physicalPGTypeAlign(c.Type), pgPhysicalTypeIsVarlena(c.Type))
 		if off > len(data) {
 			return fmt.Errorf("DecodePhysicalPGRow: %s: truncated at offset %d", c.Name, off)
 		}
@@ -1489,32 +1541,12 @@ func physicalPGTypeAlignLowered(t catalog.Type, tname string) int {
 // will trip if HEAP_HASVARWIDTH is unset and any column on the
 // fixed-prefix path turns out to be varlena per the TupleDesc. M0106-0010
 // batched-49.
+// pgPhysicalTypeIsVarlena is catalog.PhysicalTypeIsVarlena (moved there by
+// D-09 so the heap codec, pgoutput's walker, and the catalog statistic
+// paths share one transcription instead of drifting). Kept as a thin
+// wrapper so the four call sites read unchanged.
 func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
-	switch strings.ToLower(t.Name) {
-	case "char":
-		// Single-byte internal "char": fixed-length (not varlena).
-		// char(N) with length modifier = bpchar (varlena).
-		return len(t.Args) > 0
-	case "bool", "boolean",
-		"int2", "smallint", "smallserial", "serial2",
-		"int4", "integer", "int", "serial", "serial4",
-		"int8", "bigint", "bigserial", "serial8",
-		"pg_lsn",
-		"oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid",
-		"timestamp", "timestamptz", "date", "time", "timetz",
-		"interval", // typlen 16, not varlena
-		"uuid",     // typlen 16, typalign 'c', typstorage 'p' — not varlena
-		"name",
-		"float4", "real",
-		"float8", "double precision", "double",
-		"xid", "xid8":
-		return false
-	default:
-		// text, varchar, bpchar, numeric, unknown, and all varlena
-		// arrays / oidvector / int2vector / pg_node_tree fall through
-		// to varlena. Mirrors the default branch of encodeValuePG.
-		return true
-	}
+	return catalog.PhysicalTypeIsVarlena(t)
 }
 
 // pgRowHasVarWidth reports whether row, encoded with cols via

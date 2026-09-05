@@ -323,7 +323,9 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 			out = append(out, pgoColNull)
 			continue
 		}
-		off = pgoPhysicalAlign(off, col.Type)
+		// D-09 att_align_pointer (shared rule: catalog.AttAlignPointer):
+		// a packed short varlena no longer desynchronises this walk.
+		off = catalog.AttAlignPointer(body, off, catalog.PhysicalTypeAlignName(col.Type), catalog.PhysicalTypeIsVarlena(col.Type))
 		if off >= len(body) {
 			out = append(out, pgoColNull)
 			continue
@@ -345,6 +347,8 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 // executor's decoder (executor.physicalPGTypeAlignLowered): this used to be a
 // hand-copied subset that had drifted from it, mis-aligning pg_lsn / xid8 /
 // smallserial / serial8 / anyarray columns on the replication wire.
+// Nominal rule only, kept for its unit pins: varlena positions on the live
+// walk use catalog.AttAlignPointer (D-09 packed shorts).
 func pgoPhysicalAlign(off int, t catalog.Type) int {
 	align := catalog.PhysicalTypeAlignName(t)
 	if align <= 1 {

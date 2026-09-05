@@ -100,3 +100,46 @@ func parsePgoTuple(t *testing.T, b []byte) (int, []pgoCol) {
 	}
 	return n, cols
 }
+
+// TestEncodePgoTuplePackedShort pins the D-09 walker: a short varlena at
+// an UNALIGNED offset (int2 + packed short, no pad — what the new
+// encoder emits) must decode in place. The old unconditional align
+// skipped 2 bytes here and desynchronised every following column.
+func TestEncodePgoTuplePackedShort(t *testing.T) {
+	cols := []ColumnDef{
+		{Name: "a", Type: catalog.Type{Name: "int2"}, Ordinal: 0},
+		{Name: "b", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+		{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 2},
+	}
+
+	// PG-physical body, D-09 packed: int2=7, short "hi" at off 2 (no
+	// pad), int4=42 at off 8 (pad 5..7).
+	body := []byte{0x07, 0x00, 0x07, 'h', 'i', 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00}
+	bitmap := []byte{0x07} // all three NOT NULL
+
+	tup := storage.NewHeapTupleWithNulls(storage.FrozenTransactionID, storage.InvalidTransactionID, bitmap, body)
+	tup.Header.SetNatts(len(cols))
+	raw, err := tup.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+
+	out, err := encodePgoTuple(cols, raw, nil)
+	if err != nil {
+		t.Fatalf("encodePgoTuple: %v", err)
+	}
+
+	ncol, vals := parsePgoTuple(t, out)
+	if ncol != 3 {
+		t.Fatalf("ncol = %d, want 3", ncol)
+	}
+	if vals[0].null || string(vals[0].text) != "7" {
+		t.Errorf("col a = %+v, want text 7", vals[0])
+	}
+	if vals[1].null || string(vals[1].text) != "hi" {
+		t.Errorf("col b = %+v, want text hi", vals[1])
+	}
+	if vals[2].null || string(vals[2].text) != "42" {
+		t.Errorf("col c = %+v, want text 42", vals[2])
+	}
+}
