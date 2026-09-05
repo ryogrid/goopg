@@ -300,10 +300,15 @@ are EPICS — split into one-checkbox-per-commit items before starting
   Network half DEFERRED (zero in-suite columns/queries; inequality-only
   would not cover inclusion ops) — ledger `take3-B-08-network-deferred`.
   Artifacts: `selectivity.go`, `patternsel.go`, `rangequery_test.go`.
-- [ ] **B-09 P1-02 tree height + partial-index tuples.** `_bt_getrootheight`
-  analogue for height; `indexTuples = relTuples` is wrong for partial
-  indexes. Own commit, lands before P1-10.
-  *design: take3 08 §4; gate: take3 09 §5 P1 (PP + EA ratchet).*
+- [x] **B-09 P1-02 tree height + partial-index tuples.** Closed
+  2026-09-05 with no code change: partial half already landed
+  (`2bcd6b551`, unit-pinned) — verified (partial test green, PP zero
+  drift, zero partial indexes in bench DDL so gates vacuous by
+  construction); height analogue declined-deferred (fanout already on
+  real pages; measured 0.0004%; true analogue needs storage hook +
+  nbtree dep for degenerate-only moves). Ledger
+  `take3-B-09-height-deferred` (resume: bloated-tree witness;
+  PG-shaped predicate-fold reshape filed).
 - [ ] **B-10 P1-10 expression-index stats** (`compute_index_stats`). Own
   commit, lands after B-09. (Take2 declined this for lack of a consumer;
   take3 re-lists it — verify the consumer exists before implementing, and
