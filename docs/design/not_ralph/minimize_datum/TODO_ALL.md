@@ -959,13 +959,28 @@ ledger row if the measurement says no.
   Regression guard already in tree: `TestProbeSeamZeroAllocs`
   (`join_slot_chain_test.go`) pins 0 allocs per pass — verified passing.
   No new code; same disposition as F-01.
-- [ ] **F-03 24 B pointer-free `Datum` remainder** (`Buf []byte` hidden
-  behind ~43 non-test references; Kind→1 byte etc. already landed).
-  NOTE: `Datum` re-layout was attempted and reverted (04 §11.2) — treat
-  as hostile until the measurement says otherwise; 04 §0.1's dismissal
-  priced only the weakest ~32 B variant, not this 2× design.
-  *evidence: `docs/design/perf-optimize/02-datum-pointer-free.md`, 05 §3;
-  gate: 2× claim vs MD-arithmetic; values + pin.*
+- [-] **F-03 24 B pointer-free `Datum` remainder.** DROPPED 2026-09-05
+  under §8 **rule 3**. The 2× arithmetic is real and was verified, not
+  waved away: `Datum` measures **48 B** at HEAD and `Buf` is exactly the
+  24 B slice header, with only **18** non-test `.Buf` references — the
+  mechanical surface really is small.
+  The blocker is semantic, reached before any timing question: `Buf` is
+  the **detach target** that gives a retained value a lifetime independent
+  of a resettable producer arena. `MaterializeArena` copies into a fresh
+  `Buf` at every retention boundary and `cloneRowOwned` calls it per
+  column per retained row. A pointer-free `Datum` has nowhere to detach
+  to, leaving only unbounded alternatives (permanent-arena retention, or
+  producer arenas that never reset).
+  This has been paid for once: `aafef4fd4` (2026-05-10) passed the
+  five-query gate and then returned **0 rows on seven queries** in the full
+  sweep, root-caused to arena slot reuse (04 §11.2).
+  Supporting, not load-bearing: the win is dominated on the same retention
+  sites by MD-04/D-05 (measured 1098 B/row vs PG's 23 B), which D-02 has
+  now cleared to PROCEED — an order of magnitude more, without removing
+  the detach mechanism.
+  Report: `analysis/minimize-datum/f03-datum-pointer-free-20260905/README.md`;
+  ledger `take3-F-03-dropped` (three resume conditions inline, incl. that
+  the gate must be a full 21-query sweep, never a narrow set).
 
 ---
 
@@ -1049,6 +1064,7 @@ P6-03/04/05 (load-bearing).
 
 | item | date | reason | ledger row |
 |---|---|---|---|
+| F-03 | 2026-09-05 | rule 3: `Buf` is the arena-detach target; removing it leaves only unbounded retention. Prior attempt returned 0 rows on 7 queries. Win dominated by D-05 on the same sites | `take3-F-03-dropped` |
 | E-04 (EX4-01) | 2026-09-05 | no measured gain (predicted ~0.33 pp is below the noise floor; measured a consistent Q18 +8.5%); mechanism overlaps the scan prefilter | `take3-E-04-dropped` |
 
 (End of file)
