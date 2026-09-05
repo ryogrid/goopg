@@ -406,10 +406,10 @@ are EPICS — split into one-checkbox-per-commit items before starting
   exists by design (executor materialises unconditionally).
   *design: take3 08 §5.4; gate: GUC-effect test
   `TestEnableSortSetsDisabledNodesOnSortPath`.*
-- [ ] **B-17b `disabled_nodes` agg-hashed/mixed setters** (take3 02 §1.2).
-  DECLINED 2026-09-05: no grouping paths exist (P4-06 open), no path to
+- [!] **B-17b `disabled_nodes` agg-hashed/mixed setters** (take3 02 §1.2)
+  — BLOCKED on C-15 (P4-06 grouping paths). DECLINED 2026-09-05: no grouping paths exist (P4-06 open), no path to
   carry the count; `enable_hashagg` stays rule-based. Unblocks when P4-06
-  lands grouping paths.
+  lands grouping paths. Ledger `take3-B-17b-blocked`.
 - [x] **B-17c `disabled_nodes` gather-merge setter** (take3 02 §1.2).
   Landed 2026-09-05 as opt-out `DisableGatherMerge` (zero value keeps the
   merge arm; `EnableGatherMerge` default-false would have killed
@@ -422,11 +422,12 @@ are EPICS — split into one-checkbox-per-commit items before starting
   (indexonlyscan only stays a gate; indexscan-off counts). Hard gates stay
   gates (index-only, memoize; TID/incremental-sort vacuous, no producer).
   *gate: GUC-effect tests incl. `TestIndexOnlyScanGateStaysAGate`.*
-- [ ] **B-17e Retire `enable_nestloop_index`** (take3 08 §6.4).
-  DECLINED 2026-09-05: NLI is not an ordinary parameterised-nestloop path
+- [!] **B-17e Retire `enable_nestloop_index`** (take3 08 §6.4) — BLOCKED
+  on C-20 (P6 single-planner deletion). DECLINED 2026-09-05: NLI is not an ordinary parameterised-nestloop path
   (`addNLIPaths` emits `PathNestLoop` with no `DisabledNodes`; legacy
   `rewriteJoinsToNLI` gated by `EnableNestLoopIndex` is load-bearing,
-  take3 P6-04 Q4 semi 12.5×). Retire only with P6.
+  take3 P6-04 Q4 semi 12.5×). Retire only with P6. Ledger
+  `take3-B-17e-blocked`.
 - [x] **B-18 P2-04 cache-key half, commit 1 (key).** Landed 2026-09-05:
   `planCacheKey(sql, dbOid, fingerprint)` over full `PlannerSettings` +
   4 scan toggles (exact float formatting; `ParallelSettings` excluded —
@@ -459,7 +460,31 @@ rule).*
 - [x] **C-01 P3-01 `SpecialJoinInfo` population.** Landed 2026-09-05: `makeSpecialJoinInfoScoped` (clause/strict relids over ON/USING via name→leaf scope + lower-OJ ordering scan grow-only + FULL early-return + empty-min punt) + `deconstructJointreeScoped`/`deconstructFromItemScoped` threading + `newSjiScope` (leaf order = deconstruct order); fail-closed syn fallback on any uncertainty; ANTI flags aligned to upstream false/false; USING/NATURAL punt filed as follow-up. Gates: 8 new scoped tests + optimizer suite + units precommit scope + pgbench smoke (0 failed) + agent review APPROVE-WITH-NITS (5 minors addressed). No plan-shape move by construction (no consumer reads the new fields yet). Artifacts: `docs/design/planner-c01-sji-population/DESIGN.md`, `internal/optimizer/{specialjoin,collapse,planner}.go`, `specialjoin_scoped_test.go` — `ea8ca9dfe` (code), `2e59cfe49` (design).
 - [x] **C-02a P3-02 delay test (inert).** Landed 2026-09-05: `delayedAboveOJ` pure function (delay iff qual reaches the link's nullable side; no strictness exemption — demotion already ran; FULL always; nil sj delays; SEMI/ANTI fail closed) + 20-case unit table. No callers — no plan/behaviour change by construction. Design `docs/design/planner-c02-qual-placement/DESIGN.md` (reviewed: REQUEST-CHANGES → all 8 resolved → APPROVE; rebased on PG18 `outerjoin_nonnullable`/`incompatible_relids`, slices a–d). Gates: optimizer suite. Artifacts: `internal/optimizer/outerjoin_delay{,_test}.go` — `b90b08d` (code), `0dac569c1` (design).
 - [x] **C-02b P3-02 plan-level delay attribution (inert).** Landed 2026-09-05: `outputRelSet`/`qualSrcRelSet`/`planJoinDelaySJI` make the delay proof computable at plan-tree joins (SourceTableIdx attribution, no joinlist alignment). Deliberately NOT consumed by the copy pass — review-proven vacuous there (legacy side gates already decline every nullable-side qual; the check could only fire on Index-vs-srcIdx disagreement). Verdict parity, not fewer copies. Gates: attribution tables + parity pins + walker-inventory pin; optimizer suite;   review REQUEST-CHANGES → reframed to inert infra → re-review APPROVE-WITH-NITS (2 nits fixed in `6f0232c`). Artifacts: `internal/optimizer/outerjoin_delay.go` (extended), `outerjoin_delay_test.go`, inventory pin — `9c0b549` + `6f0232c`.
-- [ ] **C-02c P3-02 move on all-delay-proven paths.** Drop the residual original when the copy lands with full-path proof + single-side + non-volatile; gate `deriveConstAcrossJoinEquality` seeding on copy-vs-move. *design: C-02 DESIGN.md §5 C-02c; gate: units + R8 both suites + timing + PP.*
+- [x] **C-02c P3-02 move on all-delay-proven paths.** Landed 2026-09-05:
+  `pushTrace` (proven / planted / crossedOuter) carries the full-path delay
+  proof through the copy descent; the residual conjunct is DROPPED only on a
+  fully-attributed all-INNER path with no sibling derivation planted, and a
+  Filter whose every conjunct moved is spliced out (the pass now returns the
+  replacement tree). Copy mechanics stay byte-identical to legacy on every
+  declining path — an unknown prior proof (idempotence hit), an
+  outer-crossing descent (C-02d scope), incomplete attribution, or a planted
+  `deriveConstAcrossJoinEquality` copy all keep the residual. Moved
+  conjuncts are NOT recorded in `PushedBelow`: nothing is duplicated, so the
+  descendant prices them exactly once by construction.
+  Gates (pinned regime, `GOOPG_ANALYZE_SEED=20260905`, autovacuum off,
+  GOGC=100/GOMEMLIMIT=12GiB, fresh server per arm): TPC-H values **24/24
+  MATCH** vs the HEAD baseline arm; plan capture **byte-identical** to
+  baseline; PP roll-up unchanged at match=5 shapediff=15 missingnode=2;
+  Q12=2/Q13=34 canonical; timing within the band on every query
+  (Q9 12.07 -> 12.63 s, Q5 20.13 -> 19.36 s); optimizer suite green with 6
+  new pins (move, derivation-veto, outer-keeps-residual, idempotence-hit,
+  partial move, jointype-mapping).
+  Prerequisite landed first: the gate itself was not reproducible — see
+  `docs/design/planner-gate-reproducibility/DESIGN.md` (`870732855`), which
+  is why the first measured Q9 "2x regression" was a statistics artifact.
+  Ledger `take3-C-02c-noted` records the untouched
+  `pushQualsThroughSingleRefCTEs` duplication (orthogonal, pre-existing).
+  *design: C-02 DESIGN.md §5 C-02c.*
 - [ ] **C-02d P3-02 move across preserved-side outer links.** As C-02c incl. LEFT/RIGHT-preserved descents; nullable-side originals never move. *design: C-02 DESIGN.md §5 C-02d; gate as C-02c.*
 - [ ] **C-03 P3-03 `join_is_legal` on real SJIs.** DP builds outer, semi
   and anti joinrels directly. After B-01.
@@ -915,6 +940,8 @@ P6-03/04/05 (load-bearing).
 | C-02a | 2026-09-05 | b90b08d + 0dac569c1 | per-link OJ delay test, inert | 20-case table; optimizer green; review APPROVE |
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
+| gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| C-02c | 2026-09-05 | (this commit) | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
 
 ## Dropped
 

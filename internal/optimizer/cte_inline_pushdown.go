@@ -97,9 +97,10 @@ func pushQualsThroughSingleRefCTEs(n Node) {
 
 // pushFilterQualsThroughCTEScan applies the transformation described on
 // pushQualsThroughSingleRefCTEs to one Filter-over-CTEScan pair. Each
-// conjunct is DUPLICATED into the body (property 2 of the join pass:
+// conjunct is DUPLICATED into the body (copy-semantics of the join pass:
 // the residual Filter keeps its copy, so a decline anywhere degrades to
-// today's post-aggregate filtering, never to a dropped qual).
+// today's post-aggregate filtering, never to a dropped qual; C-02c moves
+// do not apply here — this pass has no delay proof).
 func pushFilterQualsThroughCTEScan(f *Filter) {
 	if f == nil || f.Predicate == nil {
 		return

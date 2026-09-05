@@ -315,9 +315,10 @@ func TestPlanCommaFromPushesEqualityIntoJoin(t *testing.T) {
 		}
 	})
 
-	// Mixed case: an eq-conjunct should land on the Join while a
-	// single-table filter stays on top.
-	t.Run("non-pushable conjunct stays on Filter", func(t *testing.T) {
+	// Mixed case: an eq-conjunct lands on the Join while a single-table
+	// restriction is PLACED on its input (C-02c move — pre-C-02c it stayed
+	// on a residual Filter above the Join and was evaluated twice).
+	t.Run("single-table conjunct placed on scan input", func(t *testing.T) {
 		sql := "SELECT a.aid FROM pgbench_accounts a, pgbench_history h WHERE a.aid = h.aid AND a.bid = 5"
 		node, err := Plan(parseOne(t, sql), cat)
 		if err != nil {
@@ -327,16 +328,28 @@ func TestPlanCommaFromPushesEqualityIntoJoin(t *testing.T) {
 		if !ok {
 			t.Fatalf("root=%T want *Project", node)
 		}
-		f, ok := proj.Child.(*Filter)
+		j, ok := proj.Child.(*Join)
 		if !ok {
-			t.Fatalf("Project.Child=%T want *Filter (a.bid=5 stays here)", proj.Child)
-		}
-		j, ok := f.Child.(*Join)
-		if !ok {
-			t.Fatalf("Filter.Child=%T want *Join", f.Child)
+			t.Fatalf("Project.Child=%T want *Join (no residual Filter — a.bid=5 moved below)", proj.Child)
 		}
 		if j.Type != JoinTypeInner || j.Algo != JoinAlgoHash {
 			t.Errorf("Join Type=%v Algo=%v want INNER+Hash", j.Type, j.Algo)
+		}
+		lf, ok := j.Left.(*Filter)
+		if !ok {
+			t.Fatalf("Join.Left=%T want *Filter carrying the placed a.bid=5", j.Left)
+		}
+		placed := splitAnd(lf.Predicate)
+		if len(placed) != 1 {
+			t.Fatalf("placed Filter has %d conjuncts, want 1 (a.bid=5)", len(placed))
+		}
+		if cr, ok := placed[0].(*BinaryOp).Left.(*ColumnRef); !ok || cr.Name != "bid" {
+			t.Errorf("placed conjunct is %v, want the a.bid=5 restriction (not an equi-leak)", placed[0])
+		}
+		// The join keeps its equi-clause: only the single-table
+		// restriction moved, not the join predicate.
+		if j.Predicate == nil {
+			t.Error("Join.Predicate nil after placement — the equi-clause must stay on the Join")
 		}
 	})
 }

@@ -493,3 +493,170 @@ func findInnerJoinOverCTEScans(n Node) *Join {
 	}
 	return walk(n)
 }
+
+// --- C-02c moves (drop the residual on full-path proof) ----------------
+
+// srcGt builds `<col at idx named name from src> > <lit>` — a non-equi
+// conjunct, so deriveConstAcrossJoinEquality never seeds (EC arm needs
+// bare `col = const`).
+func srcGt(idx int, name string, src int16, lit int64) Expr {
+	return &BinaryOp{
+		Op:    parser.OpGt,
+		Left:  &ColumnRef{Index: idx, Name: name, Type: catalog.Type{Name: "int4"}, SourceTableIdx: src},
+		Right: &IntegerConst{Value: lit},
+	}
+}
+
+// TestMoveOnProvenInnerPath pins the C-02c move: fully-attributed INNER
+// path, single-side non-const conjunct, no derivation — the copy lands
+// and the residual is dropped (vacuous Filter spliced by the walker).
+func TestMoveOnProvenInnerPath(t *testing.T) {
+	left := srcScan("a", srcCol("x", 1))
+	right := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeInner, left, right)
+	f := &Filter{Child: j, Predicate: srcGt(0, "x", 1, 7)}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if !dropSelf {
+		t.Fatal("proven INNER move must drop the vacuous residual Filter")
+	}
+	nj, ok := newChild.(*Join)
+	if !ok {
+		t.Fatalf("spliced child is %T, want *Join", newChild)
+	}
+	lf, ok := nj.Left.(*Filter)
+	if !ok {
+		t.Fatalf("Join.Left is %T, want *Filter carrying the placed copy", nj.Left)
+	}
+	if got := columnRefIndexes(lf.Predicate); len(got) != 1 || got[0] != 0 {
+		t.Errorf("placed predicate refs = %v, want [0]", got)
+	}
+	// Spliced by the walker too: no Filter above the Join.
+	if got := pushSingleSideQualsIntoInnerJoinInputs(
+		&Filter{Child: srcJoin(JoinTypeInner,
+			srcScan("a", srcCol("x", 1)),
+			srcScan("b", srcCol("y", 2)),
+		), Predicate: srcGt(0, "x", 1, 7)},
+	); true {
+		if _, isFilter := got.(*Filter); isFilter {
+			t.Error("walker must splice a fully-moved residual Filter")
+		}
+	}
+}
+
+// TestPlantedDerivationVetoesMove pins the C-02c EC gate: `x = const`
+// with a spanning join equality seeds the other side, so the residual
+// is KEPT (copy) even on a fully-attributed INNER path.
+func TestPlantedDerivationVetoesMove(t *testing.T) {
+	left := srcScan("a", srcCol("x", 1))
+	right := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeInner, left, right)
+	j.Predicate = &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: 0, Name: "x", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1},
+		Right: &ColumnRef{Index: 1, Name: "y", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2},
+	}
+	f := &Filter{Child: j, Predicate: srcEq(0, "x", 1, 7)}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("planted derivation must veto the move (residual kept)")
+	}
+	if got := len(splitAnd(f.Predicate)); got != 1 {
+		t.Fatalf("residual has %d conjuncts, want 1 (kept)", got)
+	}
+	nj := newChild.(*Join)
+	rf, ok := nj.Right.(*Filter)
+	if !ok {
+		t.Fatalf("Join.Right is %T, want *Filter carrying the derived seed", nj.Right)
+	}
+	if got := columnRefIndexes(rf.Predicate); len(got) != 1 || got[0] != 0 {
+		t.Errorf("derived seed refs = %v, want [0]", got)
+	}
+}
+
+// TestOuterPathKeepsResidual pins C-02c deferral to C-02d: a preserved-side
+// copy on an outer link lands (legacy copy) but the residual is KEPT.
+func TestOuterPathKeepsResidual(t *testing.T) {
+	left := srcScan("a", srcCol("x", 1))
+	right := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeLeft, left, right)
+	f := &Filter{Child: j, Predicate: srcGt(0, "x", 1, 7)}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("outer-link move is C-02d scope: residual must be kept")
+	}
+	nj := newChild.(*Join)
+	if _, ok := nj.Left.(*Filter); !ok {
+		t.Fatalf("Join.Left is %T, want *Filter (legacy copy still lands)", nj.Left)
+	}
+	if got := len(splitAnd(f.Predicate)); got != 1 {
+		t.Fatalf("residual has %d conjuncts, want 1 (kept)", got)
+	}
+}
+
+// TestIdempotenceHitKeepsResidual pins the unknown-prior-proof rule: a
+// copy already present below (legacy-placed, proof unknown) must keep
+// the residual on re-descent.
+func TestIdempotenceHitKeepsResidual(t *testing.T) {
+	left := &Filter{Child: srcScan("a", srcCol("x", 1)), Predicate: srcGt(0, "x", 1, 7)}
+	right := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeInner, left, right)
+	f := &Filter{Child: j, Predicate: srcGt(0, "x", 1, 7)}
+
+	_, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("idempotence-hit descent must keep the residual (prior proof unknown)")
+	}
+	if got := len(splitAnd(f.Predicate)); got != 1 {
+		t.Fatalf("residual has %d conjuncts, want 1 (kept)", got)
+	}
+	// Still exactly one copy below (no duplicate planted).
+	lf := left
+	if got := len(splitAnd(lf.Predicate)); got != 1 {
+		t.Fatalf("lower Filter has %d conjuncts, want 1 (no duplicate)", got)
+	}
+}
+
+// TestPartialMoveKeepsOneConjunct pins the mixed C-02c outcome: one
+// conjunct moves (proven INNER, non-const), one stays (const with a
+// spanning join equality → derivation plants → veto). The residual
+// Filter survives with exactly the kept conjunct, and only it is noted
+// in PushedBelow (exactly-once charging).
+func TestPartialMoveKeepsOneConjunct(t *testing.T) {
+	left := srcScan("a", srcCol("x", 1))
+	right := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeInner, left, right)
+	j.Predicate = &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: 0, Name: "x", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1},
+		Right: &ColumnRef{Index: 1, Name: "y", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2},
+	}
+	// Merged layout: [a.x=0, b.y=1]. Gt moves; Eq seeds (veto).
+	f := &Filter{Child: j, Predicate: combineAnd([]Expr{
+		srcGt(0, "x", 1, 7),
+		srcEq(0, "x", 1, 5),
+	})}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("partial move must keep the residual Filter")
+	}
+	rest := splitAnd(f.Predicate)
+	if len(rest) != 1 {
+		t.Fatalf("residual has %d conjuncts, want 1 (the Eq)", len(rest))
+	}
+	if _, ok := rest[0].(*BinaryOp); !ok || rest[0].(*BinaryOp).Op != parser.OpEq {
+		t.Errorf("residual holds %v, want the x=5 Eq conjunct", rest[0])
+	}
+	if len(f.PushedBelow) != 1 {
+		t.Errorf("PushedBelow has %d entries, want 1 (kept copy only)", len(f.PushedBelow))
+	}
+	nj := newChild.(*Join)
+	lf, ok := nj.Left.(*Filter)
+	if !ok {
+		t.Fatalf("Join.Left is %T, want *Filter", nj.Left)
+	}
+	if got := len(splitAnd(lf.Predicate)); got != 2 {
+		t.Errorf("placed Filter has %d conjuncts, want 2 (moved Gt + kept-copy Eq)", got)
+	}
+}

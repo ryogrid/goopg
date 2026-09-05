@@ -10,6 +10,8 @@ import (
 // of delay).
 func planToParserJoinType(t JoinType) parser.JoinType {
 	switch t {
+	case JoinTypeInner:
+		return parser.JoinInner
 	case JoinTypeLeft:
 		return parser.JoinLeft
 	case JoinTypeRight:

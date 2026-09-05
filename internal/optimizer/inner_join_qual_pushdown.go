@@ -47,11 +47,15 @@ import (
 //     A path where the remap did not run degrades to post-join
 //     evaluation — slower, never wrong.
 //
-//  2. It DUPLICATES rather than moves. The conjunct stays in the residual
-//     Filter as well, so the transformation is idempotent on the result
-//     SET (a filter applied twice selects the same rows) and only the
-//     ERROR behaviour changes, intentionally, to match PG. It also
-//     guarantees the chosen join ORDER cannot move as a side effect.
+//  2. By default it DUPLICATES rather than moves. The conjunct stays in
+//     the residual Filter as well, so the transformation is idempotent
+//     on the result SET (a filter applied twice selects the same rows)
+//     and only the ERROR behaviour changes, intentionally, to match PG.
+//     It also guarantees the chosen join ORDER cannot move as a side
+//     effect. C-02c MOVES the conjunct (drops the residual) when the
+//     copy lands with the full-path delay proof, no sibling derivation,
+//     and an all-INNER path — the placed evaluation then filters exactly
+//     what the residual would, once instead of twice.
 //
 //  3. It places the Filter on the join's INPUT node, never inside a CTE
 //     body. `all_sales` is referenced twice under different restrictions;
@@ -81,33 +85,49 @@ import (
 //   - the immediate-child restriction went in arm (a): a restriction is
 //     now carried down the join spine to the deepest node that can hold
 //     it (pushConjunctIntoSubtree), which is where PG files it.
-func pushSingleSideQualsIntoInnerJoinInputs(n Node) {
+func pushSingleSideQualsIntoInnerJoinInputs(n Node) Node {
 	if n == nil {
-		return
+		return nil
 	}
 	switch x := n.(type) {
 	case *Filter:
-		pushInnerJoinInputQuals(x)
-		pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		newChild, dropSelf := pushInnerJoinInputQuals(x)
+		if dropSelf {
+			// C-02c: every conjunct moved below — the Filter is
+			// vacuous; splice it out and keep walking the survivor.
+			return pushSingleSideQualsIntoInnerJoinInputs(newChild)
+		}
+		x.Child = newChild
+		x.Child = pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		return x
 	case *Join:
-		pushSingleSideQualsIntoInnerJoinInputs(x.Left)
-		pushSingleSideQualsIntoInnerJoinInputs(x.Right)
+		x.Left = pushSingleSideQualsIntoInnerJoinInputs(x.Left)
+		x.Right = pushSingleSideQualsIntoInnerJoinInputs(x.Right)
+		return x
 	case *NestedLoopIndexJoin:
-		pushSingleSideQualsIntoInnerJoinInputs(x.Outer)
-		pushSingleSideQualsIntoInnerJoinInputs(x.Inner)
+		x.Outer = pushSingleSideQualsIntoInnerJoinInputs(x.Outer)
+		x.Inner = pushSingleSideQualsIntoInnerJoinInputs(x.Inner)
+		return x
 	case *CTEScan:
-		pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		x.Child = pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		return x
 	case *Project:
-		pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		x.Child = pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		return x
 	case *Sort:
-		pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		x.Child = pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		return x
 	case *Limit:
-		pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		x.Child = pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		return x
 	case *Aggregate:
-		pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		x.Child = pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		return x
 	case *WindowAgg:
-		pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		x.Child = pushSingleSideQualsIntoInnerJoinInputs(x.Child)
+		return x
 	}
+	return n
 }
 
 // pushInnerJoinInputQuals applies the transformation described on
@@ -120,28 +140,55 @@ func pushSingleSideQualsIntoInnerJoinInputs(n Node) {
 // directly on a CTE reference or a leaf already applies the conjunct
 // exactly where PG would, so descending there would only stack a
 // second, redundant Filter and churn the plan text.
-func pushInnerJoinInputQuals(f *Filter) {
-	if f == nil || f.Predicate == nil {
-		return
+// pushInnerJoinInputQuals applies the transformation described on
+// pushSingleSideQualsIntoInnerJoinInputs to one Filter-over-Join pair,
+// returning the replacement child and whether the Filter itself is
+// vacuous afterwards (every conjunct moved below — C-02c).
+func pushInnerJoinInputQuals(f *Filter) (Node, bool) {
+	if f == nil {
+		return nil, false
+	}
+	if f.Predicate == nil {
+		return f.Child, false
 	}
 	switch child := f.Child.(type) {
 	case *Join:
 		if _, _, pushable := joinRestrictionSides(child); !pushable {
-			return
+			return f.Child, false
 		}
+		var kept []Expr
 		for _, c := range splitAnd(f.Predicate) {
-			// Property 2: the conjunct is DUPLICATED — f.Predicate is left
-			// untouched — so only the error behaviour changes.
-			if repl, ok := pushConjunctIntoSubtree(child, c); ok {
-				f.Child = repl
-				// …only the error behaviour, and (until M0127-P5.6-f-vi)
-				// the estimate: the copy below is priced by the node it
-				// was attached to AND the original is priced here. Record
-				// the duplication so `filterSelectivity` charges it once.
-				f.notePushedBelow(c)
+			repl, ok, tr := pushConjunctIntoSubtreeTraced(child, c)
+			if !ok {
+				kept = append(kept, c)
+				continue
 			}
+			f.Child = repl
+			if tr.proven && !tr.planted && !tr.crossedOuter {
+				// C-02c MOVE: the copy landed on an all-INNER path with
+				// the full-path delay proof and no sibling derivation
+				// was seeded — drop the original from the residual (no
+				// notePushedBelow: nothing is duplicated, and the
+				// descendant prices the placed conjunct exactly once by
+				// construction). Outer-crossing moves are C-02d scope.
+				continue
+			}
+			// Legacy COPY (property 2): the conjunct is DUPLICATED —
+			// the residual keeps it, so only the error behaviour
+			// changes. Record the duplication so `filterSelectivity`
+			// charges it once.
+			kept = append(kept, c)
+			f.notePushedBelow(c)
 		}
+		if len(kept) == 0 {
+			return f.Child, true
+		}
+		if len(kept) != len(splitAnd(f.Predicate)) {
+			f.Predicate = combineAnd(kept)
+		}
+		return f.Child, false
 	}
+	return f.Child, false
 }
 
 // notePushedBelow records that conjunct `c` of f.Predicate has been
@@ -251,7 +298,34 @@ func joinRestrictionSides(j *Join) (left, right, pushable bool) {
 // The recursion is coordinate-correct by construction: a Filter does not
 // change its child's Output(), and shiftConjunctForInput re-bases the
 // copy into the chosen input's space before the next level sees it.
+// pushTrace carries the C-02c move proof across one copy descent:
+// proven = every crossed OJ link passed the delay test with complete
+// attribution throughout; planted = deriveConst seeded a sibling copy
+// during this descent (vetoes the move — the derivation's soundness
+// proof assumes the residual masks match→null-extension flips);
+// crossedOuter = the path crossed an outer link (C-02c moves INNER-only
+// paths; outer-crossing moves are C-02d scope even when proven).
+type pushTrace struct {
+	proven       bool
+	planted      bool
+	crossedOuter bool
+}
+
 func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
+	repl, ok, _ := pushConjunctIntoSubtreeTraced(n, c)
+	return repl, ok
+}
+
+// pushConjunctIntoSubtreeTraced is pushConjunctIntoSubtree with the C-02c
+// move proof reported. Copy mechanics are byte-identical to legacy in
+// every case (declines, derivations, placements); only the report is new.
+func pushConjunctIntoSubtreeTraced(n Node, c Expr) (Node, bool, pushTrace) {
+	st := &pushTrace{proven: true}
+	repl, ok := pushConjunctTraced(n, c, st)
+	return repl, ok, *st
+}
+
+func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 	switch x := n.(type) {
 	case *Filter:
 		// Descend past a Filter only when its child is a Join. If the
@@ -259,7 +333,7 @@ func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
 		// the shorter plan and the idempotence guard below; recursing
 		// would wrap the leaf a second time on every re-walk.
 		if _, isJoin := x.Child.(*Join); isJoin {
-			repl, ok := pushConjunctIntoSubtree(x.Child, c)
+			repl, ok := pushConjunctTraced(x.Child, c, st)
 			if ok {
 				x.Child = repl
 			}
@@ -288,6 +362,10 @@ func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
 		// to the old duplicate, never to a dropped qual.
 		for _, have := range splitAnd(x.Predicate) {
 			if exprEqual(have, c) {
+				// C-02c: a pre-existing equal copy's proof is unknown to
+				// this descent (it may be a legacy unproven copy) — keep
+				// the residual rather than dropping it on unknown proof.
+				st.proven = false
 				return n, true
 			}
 		}
@@ -313,17 +391,35 @@ func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
 		} else if !leftOK {
 			return n, false
 		}
+		if x.Type == JoinTypeLeft || x.Type == JoinTypeRight {
+			st.crossedOuter = true
+		}
 		// M0125-0035 EC arm: while c descends into its own side, a
 		// `col = const` conjunct also seeds the OTHER side through this
 		// join's own equality clauses (see deriveConstAcrossJoinEquality
 		// for why that is safe even on a nullable side this function
 		// would otherwise refuse to touch).
-		deriveConstAcrossJoinEquality(x, c, side, leftWidth)
+		if deriveConstAcrossJoinEquality(x, c, side, leftWidth) {
+			st.planted = true
+		}
+		// C-02c: record the per-link delay proof (conjunctive over the
+		// descent). Incomplete attribution cannot prove — keep the
+		// residual (copy). No early return: copy mechanics stay
+		// byte-identical to legacy whatever the proof says.
+		if qsj, ok := planJoinDelaySJI(x); ok {
+			if qrel, ok := qualSrcRelSet(c); ok {
+				st.proven = st.proven && !delayedAboveOJ(qrel, qsj)
+			} else {
+				st.proven = false
+			}
+		} else {
+			st.proven = false
+		}
 		local, ok := shiftConjunctForInput(c, delta)
 		if !ok {
 			return n, false
 		}
-		repl, ok := pushConjunctIntoSubtree(target, local)
+		repl, ok := pushConjunctTraced(target, local, st)
 		if !ok {
 			return n, false
 		}
@@ -381,10 +477,10 @@ func innerJoinPushEligibleInput(n Node) bool {
 //     "Slice A regresses Q8 / Q21 from PASS to CANCEL" recorded, and why
 //     its rollout stays gated and snapshot-pinned.
 //   - This pass runs LAST (planner.go, after remapWithBindings and
-//     pushSingleSourceFiltersAfterRemap) and DUPLICATES rather than moves
-//     (property 2). The join order is already fixed when it runs, so
-//     admitting a leaf changes what a scan EMITS, never which join is
-//     built first.
+//     pushSingleSourceFiltersAfterRemap) and copies by default
+//     (property 2; C-02c moves on proven all-INNER paths). The join
+//     order is already fixed when it runs, so admitting a leaf changes
+//     what a scan EMITS, never which join is built first.
 //
 // A Filter wrapping such a leaf carries LEAF-LOCAL ColumnRefs by the
 // M0077-0001 convention — attachRelationLocalFilters sets the same flag
@@ -504,13 +600,17 @@ func innerJoinPushTarget(c Expr, j *Join, leftWidth int) (joinSide, bool) {
 // 1); and the two columns must agree on type name — goopg has no
 // opfamily model, and cross-type equality transitivity is exactly what
 // PG makes the opfamily prove.
-func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int) {
+//
+// Reports whether any derived copy was planted (C-02c: a planted
+// derivation vetoes dropping the original — the derivation's soundness
+// proof assumes the residual masks match→null-extension flips).
+func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int) (planted bool) {
 	if j.Predicate == nil {
-		return
+		return false
 	}
 	eq, ok := c.(*BinaryOp)
 	if !ok || eq.Op != parser.OpEq {
-		return
+		return false
 	}
 	colRef, okc := eq.Left.(*ColumnRef)
 	constOperand := eq.Right
@@ -519,7 +619,7 @@ func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int
 		constOperand = eq.Left
 	}
 	if !okc || !isConstantPlanExpr(constOperand) {
-		return
+		return false
 	}
 	leftOut, rightOut := j.Left.Output(), j.Right.Output()
 	validRef := func(cr *ColumnRef) bool {
@@ -603,15 +703,18 @@ func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int
 			} else {
 				j.Right = repl
 			}
+			planted = true
 		}
 	}
+	return planted
 }
 
 // shiftConjunctForInput returns a deep copy of c with every
 // ColumnRef.Index shifted by delta, so the copy reads in the target
 // input's own coordinate space. The copy is essential: c stays in the
-// residual Filter (property 2), and planner expression nodes are shared
-// far more often than they look.
+// residual Filter on copy paths (property 2; C-02c drops it on proven
+// moves), and planner expression nodes are shared far more often than
+// they look.
 func shiftConjunctForInput(c Expr, delta int) (Expr, bool) {
 	if delta == 0 {
 		return cloneExprRefs(c, scopeVeto, exprRewriter{})

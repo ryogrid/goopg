@@ -1430,7 +1430,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// before that walker runs would land in the wrong coordinate space, and
 	// (in the packed-node shape RC-1b hit) would never be revisited at all.
 	// Design: docs/design/0125-0004-q75-join-residual-evaluation-order.md.
-	pushSingleSideQualsIntoInnerJoinInputs(node)
+	// C-02c: the pass may splice out Filters whose every conjunct moved
+	// below, so it returns the replacement tree.
+	node = pushSingleSideQualsIntoInnerJoinInputs(node)
 
 	// Aggregate sublink promotion: when the outer SELECT has exactly one target
 	// that is a scalar subquery containing a single aggregate referencing outer

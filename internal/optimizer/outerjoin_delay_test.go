@@ -213,3 +213,23 @@ func TestDelaySkippedOnUnknownAttribution(t *testing.T) {
 		t.Error("unknown attribution must keep the legacy copy (INNER)")
 	}
 }
+
+func TestPlanToParserJoinTypeMapping(t *testing.T) {
+	// C-02c lives or dies on this mapping: JoinTypeInner must map to
+	// parser.JoinInner (delay=false), or every path would map to the
+	// fail-closed default and proven would always be false.
+	cases := map[JoinType]parser.JoinType{
+		JoinTypeInner: parser.JoinInner,
+		JoinTypeLeft:  parser.JoinLeft,
+		JoinTypeRight: parser.JoinRight,
+		JoinTypeFull:  parser.JoinFull,
+		JoinTypeCross: parser.JoinCross,
+		JoinTypeSemi:  parser.JoinSemi,
+		JoinTypeAnti:  parser.JoinAnti,
+	}
+	for in, want := range cases {
+		if got := planToParserJoinType(in); got != want {
+			t.Errorf("planToParserJoinType(%v) = %v, want %v", in, got, want)
+		}
+	}
+}
