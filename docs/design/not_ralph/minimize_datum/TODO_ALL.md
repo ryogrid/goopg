@@ -914,11 +914,24 @@ larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
 - [x] **F-01 Delete the duplicate build map** — already satisfied in-tree by `514913912` (M0127-P0.3: plan-typed single-map build, `lazyHashFinalize`/`lazyBuildAllInt64` deleted; enforced by `join_single_map_build_test.go` dual-map-build-back guard); gates: executor join suites green at that commit; artifacts: `internal/executor/operators_join_agg.go`, `internal/executor/join_single_map_build_test.go`.
-- [ ] **F-02 Probe-seam re-materialisation** (hash cascade re-materialises
-  probe input at every level, twice, both paths; ~18 M pool round-trips,
-  ~2×2.3 GB `Datum` traffic Q9-class). Bounded, split before start if it
-  touches two seams.
-  *evidence: take2 07 §6; gate: traffic delta measured; values + pin.*
+- [x] **F-02 Probe-seam re-materialisation** — already satisfied in-tree,
+  audit-only close 2026-09-05. The premise (take2 07 §6, evidence from
+  `analysis/cost-driven-second-try-200731` Stage 0) is stale: M0127-P1.1
+  landed probe-side slot chaining, default ON
+  (`joinSlotChainOn`, `operators_join_agg.go:1289-1299`;
+  `GOOPG_JOIN_SLOT_CHAIN=off` restores the old seam), so the probe child's
+  slot is no longer flattened into a pooled `Row` on every pull.
+  Measured at HEAD with the in-tree benchmark, which keeps the pre-fix seam
+  runnable through the kill switch so the delta stays reproducible:
+  `BenchmarkProbeSeam/chained` **432.2 ns/op, 8 B/op, 0 allocs/op** vs
+  `/off` **1115 ns/op, 879 B/op, 10 allocs/op** — the pool round-trips the
+  item was filed against are gone, not reduced.
+  Applies to both paths: the chain lives on `joinOp` (`ensureLazyVirtual`),
+  and workers build their own `joinOp`s through `buildRec`, so the parallel
+  arm is covered by construction rather than by a second mechanism.
+  Regression guard already in tree: `TestProbeSeamZeroAllocs`
+  (`join_slot_chain_test.go`) pins 0 allocs per pass — verified passing.
+  No new code; same disposition as F-01.
 - [ ] **F-03 24 B pointer-free `Datum` remainder** (`Buf []byte` hidden
   behind ~43 non-test references; Kind→1 byte etc. already landed).
   NOTE: `Datum` re-layout was attempted and reverted (04 §11.2) — treat
@@ -999,6 +1012,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| F-02 | 2026-09-05 | (pre-existing M0127-P1.1) | probe seam already chained: 432 ns/op 0 allocs vs 1115 ns/op 10 allocs for the old seam | audit-only close; no new code; guard `TestProbeSeamZeroAllocs` verified passing |
 | D-02 | 2026-09-05 | c6468238f + (this commit) | verdict PROCEED: 0 declining columns of 160,302, 0 retention sites of 985 | corrected 04 section 3.1's packableType definition, which would have produced a false STOP; 3 latent on-disk bugs ledgered |
 | C-02d | 2026-09-05 | (this commit) | qual moves across preserved-side outer links; proof gains positive containment | values 24/24, plans byte-identical, plan-gate PASS, TPC-DS CKMISMATCH=0; review found no counterexample |
 | C-02c | 2026-09-05 | 2305241f4 | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
