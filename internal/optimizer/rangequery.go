@@ -116,7 +116,14 @@ func rangeVarKey(cr *ColumnRef) string {
 // conjunctionSelectivity is goopg's clauselist_selectivity: it estimates an
 // AND-list, pairing inequality bounds on the same variable instead of
 // multiplying them as independent events.
+//
+// B-05b: extended statistics run first, exactly as clauselist_selectivity_ext
+// calls statext_clauselist_selectivity before the range-pairing loop: clauses
+// consumed there (estimatedclauses) are skipped below. With nothing
+// registered the ext call returns 1.0 with no clause marked and the loop is
+// bit-identical to the pre-B-05b one.
 func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
+	extSel, estimated := statextClauselistSelectivity(conjuncts, child)
 	var groups []*rangeQueryClause
 	find := func(key string) *rangeQueryClause {
 		for _, g := range groups {
@@ -129,8 +136,13 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
 		return g
 	}
 
-	s1 := 1.0
-	for _, c := range conjuncts {
+	s1 := extSel
+	for idx, c := range conjuncts {
+		if estimated[idx] {
+			// Consumed by extended statistics (clausesel.c's
+			// bms_is_member(estimatedclauses) skip).
+			continue
+		}
 		key, isLo, ok := rangeBoundOf(c)
 		if !ok {
 			// Not a pairable bound: multiply it in as before.

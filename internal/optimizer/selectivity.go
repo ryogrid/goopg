@@ -651,9 +651,23 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 		}
 		switch e.Op {
 		case parser.OpAnd:
-			a := clauseSelectivityWithSource(e.Left, child)
-			b := clauseSelectivityWithSource(e.Right, child)
-			return selectivityEstimate{value: a.value * b.value, reliable: a.reliable && b.reliable}
+			// B-05b: extended statistics over the flattened conjuncts
+			// first (clauselist_selectivity_ext order), with the
+			// reliability-tracking twin pricing consumed clauses.
+			// Empty registry => ext value 1.0, reliable, nothing
+			// marked: identical to the old pairwise product.
+			conjuncts := splitConjuncts(e, nil)
+			ext, extEstimated := statextClauselistSelectivityWithSource(conjuncts, child)
+			v, rel := ext.value, ext.reliable
+			for i, c := range conjuncts {
+				if extEstimated[i] {
+					continue
+				}
+				sub := clauseSelectivityWithSource(c, child)
+				v *= sub.value
+				rel = rel && sub.reliable
+			}
+			return selectivityEstimate{value: v, reliable: rel}
 		case parser.OpOr:
 			a := clauseSelectivityWithSource(e.Left, child)
 			b := clauseSelectivityWithSource(e.Right, child)

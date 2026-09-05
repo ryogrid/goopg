@@ -165,8 +165,20 @@ func filterSelectivity(f *Filter) float64 {
 		return clauseSelectivity(f.Predicate, f.Child)
 	}
 	sel := 1.0
+	kept := make([]Expr, 0, len(splitAnd(f.Predicate)))
 	for _, c := range splitAnd(f.Predicate) {
 		if f.pricedBelow(c) {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	// B-05b: extended statistics over the kept conjuncts first
+	// (clauselist_selectivity_ext order); consumed clauses are skipped by
+	// the base product below. Empty registry => 1.0 with nothing marked.
+	extSel, estimated := statextClauselistSelectivity(kept, f.Child)
+	sel *= extSel
+	for i, c := range kept {
+		if estimated[i] {
 			continue
 		}
 		sel *= clauseSelectivity(c, f.Child)
