@@ -239,14 +239,25 @@ are EPICS — split into one-checkbox-per-commit items before starting
   proven both directions (MCV-fires ⟹ measured path; fallback-fires ⟹
   P1-15 declined); deleting moves 6M×800k 6M→2.4e13. Pinned by
   `cardinality_fallbackcap_test.go` (6 tests). Ledger `take3-B-04-kept`.
-- [ ] **B-05 P1-22/23/24 extended statistics [EPIC — split before start].**
-  Build (`BuildRelationExtStatistics` → `pg_statistic_ext_data`), then
-  `statext_clauselist_selectivity` (+ `estimatedclauses` bitmap,
-  `choose_best_statistics`), then `estimate_multivariate_ndistinct` for
-  GROUP BY — one checkbox per slice. P1-24 is the
-  Phase-1 item most likely to move TPC-DS shapes (correlated predicates).
-  *design: take3 08 §4; gate: full regress (catalog-adjacent) + EA
-  ratchet + PP.*
+- [x] **B-05a P1-22 extended-statistics build.** Landed 2026-09-05:
+  `_data` write path + ndistinct + dependencies builders (oracle
+  magics/layouts pinned); `StatisticsObjectsForTable` accessor; hook
+  at end of `analyzeRelationWith`; stattarget incl. 0-skip; reload
+  decoder (consumer = later phase); codec KindBytes arms for the 4
+  blob types. MCV/expressions explicitly deferred (TOAST +
+  `_pg_statistic` encoding). Gates: 12 round-trip tests; catalog +
+  initdb suites; live CREATE STATISTICS + ANALYZE builds a decodable
+  3429 row; TPC-H 24/24 MATCH (Q1 stats-driven partial-agg move is
+  values-correct); PP zero drift otherwise; TPC-DS PASS=95 MISMATCH=0.
+  Artifacts: `extstats_{build,ndistinct,dependencies}.go`,
+  `sys_pg_statistic_ext_data.go`, `extstats_build_test.go`.
+- [ ] **B-05b P1-23 `statext_clauselist_selectivity`.** + `estimatedclauses`
+  bitmap, `choose_best_statistics`. Consumes B-05a.
+  *design: take3 08 §4; gate: EA ratchet + PP.*
+- [ ] **B-05c P1-24 `estimate_multivariate_ndistinct` for GROUP BY.**
+  Phase-1 item most likely to move TPC-DS shapes (correlated
+  predicates). Consumes B-05a.
+  *design: take3 08 §4; gate: EA ratchet + PP.*
 - [ ] **B-06 P1-27 CTE-agg statistics.** Rescoped: plain-CTE columns
   already resolve; the gap is aggregated outputs (`year_total` →
   0.005/conjunct, same as PG) plus goopg's helping `rows ≤ 1` guard.

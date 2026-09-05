@@ -1019,6 +1019,22 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		// (e.g. relpartbound when relispartition=true). Empty varlena.
 		s := d.StringValue()
 		return varlenaTextBytes(s), nil
+	case "pg_ndistinct", "pg_dependencies", "pg_mcv_list", "_pg_statistic":
+		// B-05a: extended-statistics varlena blobs (pg_statistic_ext_data
+		// stxdndistinct/stxddependencies/stxdmcv/stxdexpr,
+		// postgres/src/include/catalog/pg_statistic_ext_data.h). All four
+		// are typlen=-1 varlenas carrying private binary formats (magic +
+		// LE scalars, NOT text), so the default text arm below would
+		// corrupt them. The writer passes the complete varlena (4-byte
+		// length header included, as statext_*_serialize's SET_VARSIZE
+		// emits) via KindBytes and it is spliced verbatim — the same
+		// pre-built-blob pattern as pg_node_tree/int2vector/oidvector.
+		// A non-bytes datum is a caller bug: fail loudly (like int2vector)
+		// rather than storing text PG would misread as a magic number.
+		if d.Kind != KindBytes {
+			return nil, fmt.Errorf("expected bytes for %s, got kind %d", t.Name, d.Kind)
+		}
+		return d.BytesValue(), nil
 	case "xml":
 		// M0134-0188: the physical-encode path is a SIBLING of evalCast's
 		// `::xml` arm (xmltypes.go) and must apply the same well-formedness
@@ -1941,6 +1957,17 @@ func decodePhysicalPGValueLowered(t catalog.Type, tname string, data []byte, sct
 			return newStringArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewStringDatum(string(payload)), n, nil
+	case "pg_ndistinct", "pg_dependencies", "pg_mcv_list", "_pg_statistic":
+		// B-05a decode twin of the encode arm above: return the FULL varlena
+		// (length header included) as KindBytes — the aclitem[] pattern —
+		// so the extstats deserializers see exactly what statext_*_load
+		// hands statext_*_deserialize (a bytea* with its header). Decoding
+		// to text (the default arm) would destroy the binary magic/scalars.
+		_, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode %q as varlena: %w", t.Name, err)
+		}
+		return NewBytesDatum(append([]byte(nil), data[:n]...)), n, nil
 	case "aclitem[]", "_aclitem":
 		// A heap-backed catalog stores an ACL column (pg_type.typacl —
 		// M0119-0004-ACLHEAP) as a PG-native _aclitem ArrayType varlena whose

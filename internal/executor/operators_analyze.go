@@ -842,6 +842,17 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 			stats.Columns[i].NDistinctFrac = 0
 		}
 	}
+	// B-05a: extended statistics (pg_statistic_ext_data _data write path).
+	// reservoir/tbl/target/stats.RowCount are all in scope here — the same
+	// inputs BuildRelationExtStatistics consumes (sample rows, relation,
+	// computed target, totalrows). dsCtx carries the heap-write handles;
+	// the test-only analyzeRelation wrapper passes nil and skips the write
+	// (its contexts have no Pool). Best-effort: a _data write failure must
+	// never fail ANALYZE itself, matching persistStatsToPGStatistic's
+	// non-fatal contract at the analyzeOp.Next call site.
+	if dsCtx != nil {
+		_ = buildAndStoreExtStatistics(dsCtx, tbl, target, reservoir, stats.RowCount)
+	}
 	return stats, nil
 }
 

@@ -4356,6 +4356,31 @@ func (c *InMemory) AllStatistics() []*StatisticsObject {
 	return out
 }
 
+// StatisticsObjectsForTable returns a snapshot of the statistics objects
+// defined on the table with the given OID (pg_statistic_ext.stxrelid), in
+// name order for determinism. B-05a: the ANALYZE extended-statistics hook
+// (fetch_statentries_for_relation in
+// postgres/src/backend/statistics/extended_stats.c:128) needs exactly this
+// per-relation lookup; the pre-existing AllStatistics snapshot would force
+// every ANALYZE to filter the whole registry itself.
+func (c *InMemory) StatisticsObjectsForTable(tableOID uint32) []*StatisticsObject {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []*StatisticsObject
+	for _, obj := range c.statisticsObjs {
+		if obj.TableOID == tableOID {
+			out = append(out, obj)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Schema != out[j].Schema {
+			return out[i].Schema < out[j].Schema
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
 // StatisticsByOID finds a statistics object by its pg_statistic_ext OID. DU-002 slice 314.
 func (c *InMemory) StatisticsByOID(oid uint32) (*StatisticsObject, bool) {
 	c.mu.RLock()
