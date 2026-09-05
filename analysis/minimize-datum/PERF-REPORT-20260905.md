@@ -223,6 +223,38 @@ records as not existing, and a separately ledgered finding that each of
 five parallel workers builds all 1.5 M rows privately, a 5× multiplier
 nothing in this bundle addresses.
 
+## 5.6. Following the evidence: the entry-width fix, and its refutation
+
+D-04's stopping rule said "fix the model first", and named `avgVarBytes` as
+prerequisite #1. That fix was implemented and measured.
+
+**The defect was real.** The entry model was half priced on the narrowed
+row and half on the full one: `ncols` came from the build child's schema,
+already cut by the narrowing work, while `avgVarBytes` was summed over
+every column of the *table*. On Q9's `orders` build those 74 bytes are
+`o_comment` + `o_clerk` + `o_orderpriority` + `o_orderstatus`, all columns
+the build drops. Model 194 B/row against the executor's own accounting of
+120.2. Fixed; the model now reads 120.0.
+
+**And it bought nothing.** D-04 predicted the correction alone would halve
+the batch count. It does not: `nbatch` is **non-monotone** in entry size,
+because a smaller entry buys more buckets and the bucket array is charged
+too. Two batches need ≤111.8 B/row, and two retained Datums plus their
+slice header are already 120 — so **D-04's own "ideal packed ~63 B/row"
+lands back on 4 batches**, the bucket array having taken back more than the
+rows gave up.
+
+The lever on this witness is therefore the bucket array
+(`MapSlotBytes = 48`), not the row format. That is the finding: two
+successive measurements, each disproving the previous one's prediction,
+have moved the target from "pack the rows" to "charge the table".
+
+The fix was kept rather than reverted because it is correct, costs nothing
+(timing-neutral, values 24 MATCH, plans byte-identical, TPC-DS
+PASS=95 CKMISMATCH=0), and errs high. A larger divergence it exposed is
+ledgered rather than bundled: the planner's **cost** side still prices the
+un-narrowed build, at 530 B/row and 8 batches where the executor runs 4.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
