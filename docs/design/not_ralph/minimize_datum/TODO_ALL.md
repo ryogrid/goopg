@@ -309,11 +309,13 @@ are EPICS — split into one-checkbox-per-commit items before starting
   nbtree dep for degenerate-only moves). Ledger
   `take3-B-09-height-deferred` (resume: bloated-tree witness;
   PG-shaped predicate-fold reshape filed).
-- [ ] **B-10 P1-10 expression-index stats** (`compute_index_stats`). Own
-  commit, lands after B-09. (Take2 declined this for lack of a consumer;
-  take3 re-lists it — verify the consumer exists before implementing, and
-  decline again with a ledger row if it does not.)
-  *design: take3 08 §4; gate: take3 09 §5 P1 (EA ratchet).*
+- [-] **B-10 P1-10 expression-index stats.** DECLINED 2026-09-05, same
+  test take2 applied: NO consumer — every estimate path resolves bare
+  ColumnRef→table-column stats (joinselectivity gap comments,
+  pathkeysindex/pathparamindex/indexordered/planner guards, executor
+  errors on expression keys); ANALYZE iterates table columns only;
+  zero expression indexes in either suite. Ledger `take3-B-10-declined`
+  (resume: access paths → collection → matching).
 - [ ] **B-11 P1-16 re-diagnose Q9.** The single-`nd` explanation is RETIRED;
   close ledger rows 779/781/784 as stale and file what `estimate-audit`
   actually shows on the final joinrel.
