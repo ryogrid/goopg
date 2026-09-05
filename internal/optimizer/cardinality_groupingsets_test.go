@@ -51,8 +51,8 @@ func TestEstimateAggregateSumsOverGroupingSets(t *testing.T) {
 	want := estimateNumGroups([]Expr{a, b}, child, inputRows) +
 		estimateNumGroups([]Expr{a}, child, inputRows) +
 		estimateNumGroups(nil, child, inputRows)
-	if want > inputRows {
-		want = inputRows
+	if ceiling := inputRows * int64(len(sets)); want > ceiling {
+		want = ceiling
 	}
 	if got != want {
 		t.Fatalf("estimateAggregate over 3 sets = %d, want the sum %d", got, want)
@@ -81,19 +81,51 @@ func TestEstimateAggregatePlainUnchanged(t *testing.T) {
 	}
 }
 
-// TestEstimateAggregateGroupingSetsClamped pins the input-row clamp: N sets
-// must not multiply a small input into a larger output than the input has
-// rows, which is unreachable for a grouping aggregate.
-func TestEstimateAggregateGroupingSetsClamped(t *testing.T) {
+// TestEstimateAggregateGroupingSetsCeiling pins the CORRECTED ceiling.
+//
+// The first version of this clamped to `inputRows` and cited upstream for
+// it. Upstream does not clamp the total at all — get_number_of_groups
+// accumulates per-rollup with the clamp inside each per-set call — and the
+// bound was wrong anyway: each of k sets can emit up to inputRows groups,
+// so the sound ceiling is k*inputRows. A 4-row input under ROLLUP(a,b) can
+// legitimately produce 6 output rows, which the old clamp cut back to 4 —
+// under-stating, which is the same direction as the bug this function
+// exists to fix.
+func TestEstimateAggregateGroupingSetsCeiling(t *testing.T) {
 	child := gsChild(3)
 	exprs := []Expr{gsCol(0, "a"), gsCol(1, "b")}
 	sets := [][]int{{0, 1}, {0}, {1}, {}}
 	got := estimateAggregate(gsAgg(child, exprs, sets))
-	if in := EstimateRows(child); got > in {
-		t.Fatalf("estimate %d exceeds the input row count %d", got, in)
+	in := EstimateRows(child)
+	if ceiling := in * int64(len(sets)); got > ceiling {
+		t.Fatalf("estimate %d exceeds the k*inputRows ceiling %d", got, ceiling)
 	}
 	if got < 1 {
-		t.Fatalf("estimate %d is below the clamp floor of 1", got)
+		t.Fatalf("estimate %d is below the floor of 1", got)
+	}
+}
+
+// TestEstimateAggregateMayExceedInputRows is the counter-pin for the
+// correction: the estimate is ALLOWED to exceed the input row count,
+// because k sets each emit their own groups. If someone reinstates the
+// inputRows clamp, this fails.
+func TestEstimateAggregateMayExceedInputRows(t *testing.T) {
+	// 4 distinct rows, ROLLUP(a, b) = {a,b}, {a}, {} — the grouped output
+	// is legitimately larger than the input.
+	child := gsChild(4)
+	exprs := []Expr{gsCol(0, "a"), gsCol(1, "b")}
+	sets := [][]int{{0, 1}, {0}, {}}
+	got := estimateAggregate(gsAgg(child, exprs, sets))
+	in := EstimateRows(child)
+	sum := estimateNumGroups([]Expr{exprs[0], exprs[1]}, child, in) +
+		estimateNumGroups([]Expr{exprs[0]}, child, in) +
+		estimateNumGroups(nil, child, in)
+	if sum <= in {
+		t.Skipf("fixture does not exercise the case: per-set sum %d <= input %d", sum, in)
+	}
+	if got <= in {
+		t.Fatalf("estimate %d was clamped to the input row count %d; k sets may "+
+			"legitimately emit more rows than the input has", got, in)
 	}
 }
 

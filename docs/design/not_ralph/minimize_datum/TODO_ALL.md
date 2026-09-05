@@ -1167,10 +1167,33 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   five private per-worker copies (sharing is declined for a spilling
   build) nor the table memory. Q5/Q7/Q9/Q10 all flip WHICH SIDE IS BUILT
   once the deterrent is removed.
-  **The honest sequence is now: (1) charge what a build actually costs,
-  (2) THEN narrow the width and re-apply both preserved patches.** Ledger
-  `take3-D-05-buildcost-underpriced`; guard
-  `TestSlice3LiveQ9ShapeDerivation`; artifact
+  ~~**The honest sequence is now: (1) charge what a build actually costs**~~
+  **5th measurement, 2026-09-06 — done, REVERTED at +22.3%, and it names
+  the structural root.** The build-cost charge was implemented from a
+  derivation (5× participant multiplier on a spilling build, the executor's
+  own sharing-decline rule; errs HIGH on spilling builds, exactly 1× on
+  resident ones so Q14 cannot flip) and confirmed on a live witness: all
+  five participants scan `orders` privately, Build Time 2979 of 8062 ms
+  charged once. Values 24 MATCH, TPC-DS PASS=95 CKMISMATCH=0. Q5 +444%,
+  Q10 +221%, Q9 +115%. **They did not lose a build-side choice — they lost
+  PARALLELISM.** A Merge Join on the driving path makes the whole plan
+  serial (`drivingScan` admits only a hash join under a Gather), and
+  `MaybeAddGather` runs AFTER the search.
+  **goopg's cost model has no parallel dimension.** Three
+  individually-correct corrections (entry width, bucket charge, build cost)
+  have now each failed on exactly this mechanism: every one transferred
+  work away from a hash join, and in goopg a hash join is the only join a
+  Gather can sit on. **Until the search can prefer a plan BECAUSE it will
+  parallelise — C-19a…h — any term that makes a hash join dearer trades a
+  real 5× speedup for a modelled saving.** D-05 is therefore blocked on
+  C-19, not on its own cost terms. Ledger
+  `take3-D-05-parallel-blind-costmodel`; artifact
+  `analysis/minimize-datum/d05-buildcost-20260906/README.md`.
+  Two cheaper facts from the same run: the bucket-array term decides
+  NOTHING on TPC-H (zero plans move at multiplier 1) and is dropped from
+  this list; and the narrowing patch narrows the INNER only while PG
+  narrows both sides of `page_size` — a cheap independent defect.
+  Earlier ledger `take3-D-05-buildcost-underpriced`; artifact
   `analysis/minimize-datum/d05-costside-20260906/README.md`.
   Also required by D-04's evidence but out of this bundle's stated scope: a
   dense byte arena plus an allocation-free encoder, since packing every
@@ -1495,6 +1518,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| build-cost charge | 2026-09-06 | (reverted; patch in tmp/) | 5x participant multiplier, derived and witness-confirmed; **+22.3%** — Q5/Q9/Q10 lost PARALLELISM, not a build side | **names the root: goopg's cost model has no parallel dimension**; D-05 is blocked on C-19, not on its own terms |
 | cost-side narrowing | 2026-09-06 | (reverted; patch in tmp/) | cost side made to agree with the executor exactly; **+10.3%** — it removed an accidental deterrent | **names the real defect: hashJoinCost under-prices BUILDING a large hash table**; confirms the bucket-charge coupling (Q14 no longer flips) |
 | D-05 prereq #2 | 2026-09-06 | (reverted; patch in tmp/) | MapSlotBytes 48 was a guess and 2x low (measured 96 B/slot); honest value halved bucket heap 586->286 MB, batches unchanged — but **Q14 flipped to a nested loop, +10.4% total** | premise refuted again (buckets WERE already charged); blocker moves to the cost side pricing an un-narrowed build |
 | D-05 prereq #1 | 2026-09-06 | (this commit) | entry model fixed 194 -> 120 B/row (was half-narrowed, half-full-width); **nbatch unchanged — D-04's claim refuted** | non-monotone: 2 batches need <=111.8 B/row; packed 63 B/row lands back on 4. The lever is MapSlotBytes, not the entry |

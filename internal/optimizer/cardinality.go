@@ -1126,12 +1126,26 @@ func estimateAggregate(a *Aggregate) int64 {
 	if total < 1 {
 		return 1
 	}
-	// Upstream clamps the accumulated total to the input row count in
-	// `create_grouping_paths`; more output rows than input rows is not
-	// reachable for a grouping aggregate, and an unclamped sum would let N
-	// sets multiply a small input into a large estimate.
-	if inputRows > 0 && total > inputRows {
-		return inputRows
+	// CORRECTION (2026-09-06, C-10a scope review): an earlier version of
+	// this clamped the accumulated total to `inputRows` and attributed that
+	// to upstream. **Upstream does not do it.**
+	// `get_number_of_groups` (postgres/src/backend/optimizer/plan/planner.c)
+	// accumulates `dNumGroups += rollup->numGroups` with NO clamp on the
+	// total; the clamp lives inside each per-set `estimate_num_groups` call,
+	// which this function inherits by calling `estimateNumGroups` per set.
+	//
+	// And the old bound was simply wrong. Each of k sets can legitimately
+	// emit up to `inputRows` groups, so the sound ceiling is `k*inputRows`,
+	// not `inputRows`: a 4-row input under ROLLUP(a,b) really can produce 6
+	// output rows, which the `inputRows` clamp would have under-stated back
+	// to 4 — the same direction as the bug this function exists to fix.
+	//
+	// The ceiling is kept (rather than dropped entirely) as an overflow
+	// guard, since `total` is a sum of k independently-clamped estimates.
+	if inputRows > 0 {
+		if ceiling := inputRows * int64(len(a.GroupingSets)); total > ceiling {
+			return ceiling
+		}
 	}
 	return total
 }
