@@ -263,12 +263,18 @@ are EPICS — split into one-checkbox-per-commit items before starting
   PP zero drift (Q1 MATCH — fresh-server shape; the B-05a-run partial
   was ANALYZE-warmed stats, see `take3-stats-persistence-gap`);
   TPC-H 24/24 MATCH on a clean fresh-server sweep (prior sweep
-  invalidated by mid-sweep server stop — relaunched).
+  invalidated by mid-sweep server stop — relaunched);
+  TPC-DS PASS=95 MISMATCH=0.
   Artifacts: `internal/optimizer/extstats.go`, `extstats_test.go`.
-- [ ] **B-05c P1-24 `estimate_multivariate_ndistinct` for GROUP BY.**
-  Phase-1 item most likely to move TPC-DS shapes (correlated
-  predicates). Consumes B-05a.
-  *design: take3 08 §4; gate: EA ratchet + PP.*
+- [x] **B-05c P1-24 `estimate_multivariate_ndistinct` for GROUP BY.**
+  Landed 2026-09-05: exact-set combo lookup first (order-independent),
+  fallback to untouched product; clamp/Yao paths unchanged; subset/
+  superset fall back (iterative remainder = resume point).
+  Gates: 9 tests; optimizer suite; PP zero drift; TPC-H 24/24 MATCH.
+  Zero movement by construction (no production registry writer yet —
+  loader is the resume point with the 3429 decoder).
+  Artifacts: `internal/optimizer/{extstats,cardinality}.go`,
+  `extstats_ndistinct_test.go`.
 - [ ] **B-06 P1-27 CTE-agg statistics.** Rescoped: plain-CTE columns
   already resolve; the gap is aggregated outputs (`year_total` →
   0.005/conjunct, same as PG) plus goopg's helping `rows ≤ 1` guard.

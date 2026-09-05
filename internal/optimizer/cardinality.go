@@ -1054,6 +1054,9 @@ type groupVarKey struct {
 
 // groupVarInfo is upstream's GroupVarInfo (selfuncs.c:3310) minus `isdefault`,
 // which only feeds the SELFLAG_USED_DEFAULT bit no goopg caller reads yet.
+// tableOID/attnum carry the variable's catalog identity for the
+// estimate_multivariate_ndistinct consumption (B-05c): both are zero when the
+// variable resolved to no base relation, and the combo lookup then declines.
 type groupVarInfo struct {
 	// rel is the leaf scan the variable resolved to, nil when it resolved to
 	// no base relation. A nil-rel variable skips the per-relation clamp
@@ -1064,6 +1067,12 @@ type groupVarInfo struct {
 	// rawRows is the relation's unfiltered tuple count — upstream's
 	// `rel->tuples`, the clamp denominator.
 	rawRows float64
+	// tableOID is the base table's catalog OID (0 when unknown). Registry
+	// lookups key on it; 0 is fail-closed because no real table has OID 0.
+	tableOID uint32
+	// attnum is the 1-based catalog attnum (column Ordinal+1), 0 when the
+	// column name matched nothing (dropped columns, unresolvable keys).
+	attnum int16
 }
 
 // estimateAggregate returns the group count via `estimateNumGroups`.
@@ -1101,12 +1110,14 @@ func estimateAggregate(a *Aggregate) int64 {
 //
 // Three upstream refinements are deliberately absent and ledgered rather than
 // faked: the equivalence-class de-duplication of step 3 (goopg's planner has
-// no EC structure at estimate time), extended-statistics ndistinct
-// (`estimate_multivariate_ndistinct` — goopg collects no multivariate stats),
-// and the boolean short-circuit ("a boolean expression contributes 2 groups"),
-// which needs an `exprType` this package does not have. A boolean COLUMN still
-// answers 2 through its own ANALYZE ndistinct; only boolean-valued
-// EXPRESSIONS fall through to the default.
+// no EC structure at estimate time), the ITERATIVE remainder of
+// estimate_multivariate_ndistinct (B-05c consumes only the exact-set hit; a
+// partial combo match falls back to the full independence product rather than
+// pricing the remainder separately), and the boolean short-circuit ("a
+// boolean expression contributes 2 groups"), which needs an `exprType` this
+// package does not have. A boolean COLUMN still answers 2 through its own
+// ANALYZE ndistinct; only boolean-valued EXPRESSIONS fall through to the
+// default.
 func estimateNumGroups(groupExprs []Expr, child Node, inputRows int64) int64 {
 	rows := float64(inputRows)
 	if rows < 1 {
@@ -1167,10 +1178,20 @@ func estimateNumGroups(groupExprs []Expr, child Node, inputRows int64) int64 {
 		vis := byRel[rel]
 		reldistinct := 1.0
 		relmax := 1.0
-		for _, vi := range vis {
-			reldistinct *= vi.ndistinct
-			if relmax < vi.ndistinct {
-				relmax = vi.ndistinct
+		if mv, ok := groupComboNDistinct(vis); ok {
+			// estimate_multivariate_ndistinct exact-set hit (B-05c): the
+			// measured combo replaces the independence product. The clamp
+			// and the Yao/Dell'Era restriction term below apply unchanged —
+			// upstream applies them to the multivariate value too — and
+			// relmax takes the combo so the floor ("surely at least that
+			// many groups") stays consistent with the value in use.
+			reldistinct, relmax = mv, mv
+		} else {
+			for _, vi := range vis {
+				reldistinct *= vi.ndistinct
+				if relmax < vi.ndistinct {
+					relmax = vi.ndistinct
+				}
 			}
 		}
 		tuples := vis[0].rawRows
@@ -1245,11 +1266,19 @@ func groupVarsOfExpr(e Expr) ([]*ColumnRef, bool) {
 func examineGroupVar(cr *ColumnRef, child Node) (groupVarKey, groupVarInfo) {
 	if cr.Index >= 0 {
 		if ref, ok := resolveBaseColumn(cr.Index, child); ok {
+			var oid uint32
+			var attnum int16
+			if ref.table != nil {
+				oid = ref.table.OID
+				attnum, _ = attnumOfColumn(ref.table, ref.col)
+			}
 			return groupVarKey{rel: ref.scan, col: ref.col},
 				groupVarInfo{
 					rel:       ref.scan,
 					ndistinct: groupVarNDistinct(float64(ref.ndistinct), ref.rawRows),
 					rawRows:   ref.rawRows,
+					tableOID:  oid,
+					attnum:    attnum,
 				}
 		}
 		// `get_variable_numdistinct`'s isunique branch: a column that is the
@@ -1281,6 +1310,37 @@ func groupVarNDistinct(nd, rawRows float64) float64 {
 		return rawRows
 	}
 	return defaultNumDistinct
+}
+
+// groupComboNDistinct is the exact-set cut of estimate_multivariate_ndistinct
+// (selfuncs.c:4220) for one relation's grouping variables: the registered
+// combo ndistinct when the relation's whole GROUP BY attnum set equals one
+// registered combination, false (caller's independence product stands) for
+// everything else.
+//
+// Decline cases, each fail-closed toward today's arithmetic:
+//   - fewer than two variables (combos cover k>=2; one column's own ndistinct
+//     is already the exact answer — upstream requires two matches too);
+//   - mixed table OIDs, unknown OID (0), or unknown attnum (0): the set is
+//     not one table's columns (cross-relation sets multiply in step 5);
+//   - no registered combo with exactly this attnum set (subset, superset, or
+//     nothing registered — the empty-registry production case today).
+func groupComboNDistinct(vis []groupVarInfo) (float64, bool) {
+	if len(vis) < 2 {
+		return 0, false
+	}
+	oid := vis[0].tableOID
+	if oid == 0 {
+		return 0, false
+	}
+	attnums := make([]int16, 0, len(vis))
+	for _, vi := range vis {
+		if vi.tableOID != oid || vi.attnum <= 0 {
+			return 0, false
+		}
+		attnums = append(attnums, vi.attnum)
+	}
+	return plannerMultivariateNDistinct(oid, attnums)
 }
 
 // relFilteredRows answers upstream's `rel->rows` — the estimated row count of

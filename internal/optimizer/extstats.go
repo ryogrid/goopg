@@ -73,15 +73,35 @@ type PlannerExtDependency struct {
 	Attrs  []int16
 }
 
+// PlannerExtNDistinctItem is one MVNDistinctItem as the planner sees it: the
+// estimated distinct count for one combination of columns. Attrs holds
+// 1-based catalog attnums (column Ordinal+1) in ascending order, the same
+// convention B-05a serializes (executor.ExtNDistinctItem, mirrored here
+// field-for-field without importing it — executor imports optimizer, so an
+// import would cycle; see the file header). Only k>=2 combinations are ever
+// stored — B-05a builds k=2..n, and single-column counts already live in
+// pg_statistic.
+type PlannerExtNDistinctItem struct {
+	NDistinct float64
+	Attrs     []int16
+}
+
 // PlannerExtStatsObject is one dependencies-kind statistics object as the
 // planner sees it: the full member key set (for choose_best_statistics'
 // coverage counting) plus the built dependencies. Only non-inherited,
 // dependencies-kind objects are ever registered — B-05a writes inh=false
 // rows exclusively — so no kind/inherit fields are carried.
+//
+// NDistinct carries the object's multivariate-ndistinct combinations
+// (STATS_EXT_NDISTINCT, B-05c consumer). It is empty for objects registered
+// before B-05c and for dependencies-only tests; an empty NDistinct never
+// changes an estimate.
 type PlannerExtStatsObject struct {
 	StatsOID uint32
 	Keys     []int16
 	Deps     []PlannerExtDependency
+	// NDistinct holds the combo ndistinct values keyed by exact attnum set.
+	NDistinct []PlannerExtNDistinctItem
 }
 
 var (
@@ -132,6 +152,80 @@ func plannerExtStatsLive() bool {
 	plannerExtStatsMu.RLock()
 	defer plannerExtStatsMu.RUnlock()
 	return len(plannerExtStatsByTable) != 0
+}
+
+// plannerMultivariateNDistinct is the exact-set cut of
+// estimate_multivariate_ndistinct (selfuncs.c:4220) for one relation's GROUP
+// BY attnum set: the combo ndistinct registered for EXACTLY attnums, or false
+// when nothing matches.
+//
+// Upstream picks the statistics object covering the most still-unmatched vars
+// and consumes its matched subset iteratively, so vars {a,b,c} with stats on
+// {a,b} price as ndistinct(a,b)*ndistinct(c). This cut does only the exact
+// case — the relation's whole GROUP BY set must equal one registered combo —
+// and declines everything else (subset, superset, multi-object splits) to the
+// caller's per-column product. The iterative remainder is a documented resume
+// point, not faked: a partial match that silently dropped the unmatched
+// columns would UNDER-estimate.
+//
+// Corrupt-registry guards mirror the dependency path below: NaN and
+// non-positive values cannot come out of B-05a's Duj1 builder (clamped to
+// [d, N], N >= 1), but a hand-populated registry could smuggle one in, and a
+// zero would collapse the whole group estimate through the product.
+//
+// With an empty registry this returns false after one mutex read, so every
+// caller reduces to exactly its pre-B-05c arithmetic.
+func plannerMultivariateNDistinct(tableOID uint32, attnums []int16) (float64, bool) {
+	if tableOID == 0 || len(attnums) < 2 || !plannerExtStatsLive() {
+		return 0, false
+	}
+	for _, obj := range plannerExtStatsForTable(tableOID) {
+		for _, item := range obj.NDistinct {
+			if math.IsNaN(item.NDistinct) || item.NDistinct <= 0 {
+				continue
+			}
+			if attnumSetsEqual(item.Attrs, attnums) {
+				return item.NDistinct, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// attnumSetsEqual reports whether a and b hold the same attnums regardless
+// of order. Combo items serialize ascending but the GROUP BY set arrives in
+// GROUP BY order, so the comparison is order-independent.
+func attnumSetsEqual(a, b []int16) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[int16]int, len(a))
+	for _, x := range a {
+		counts[x]++
+	}
+	for _, x := range b {
+		counts[x]--
+		if counts[x] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// attnumOfColumn maps a base-table column name to its 1-based catalog attnum
+// (column Ordinal+1, the convention B-05a stores). Dropped columns never
+// match — B-05a cannot build on them either.
+func attnumOfColumn(table *catalog.Table, col string) (int16, bool) {
+	if table == nil {
+		return 0, false
+	}
+	for i := range table.Columns {
+		c := &table.Columns[i]
+		if c.Name == col && !c.Dropped {
+			return int16(c.Ordinal + 1), true
+		}
+	}
+	return 0, false
 }
 
 // chooseBestPlannerExtStats ports choose_best_statistics
@@ -363,11 +457,8 @@ func resolveExtDepColumn(cr *ColumnRef, child Node) (Node, *catalog.Table, int16
 	if !isOK || ref.table == nil {
 		return nil, nil, 0, false
 	}
-	for i := range ref.table.Columns {
-		col := &ref.table.Columns[i]
-		if col.Name == ref.col && !col.Dropped {
-			return ref.scan, ref.table, int16(col.Ordinal + 1), true
-		}
+	if attnum, ok := attnumOfColumn(ref.table, ref.col); ok {
+		return ref.scan, ref.table, attnum, true
 	}
 	return nil, nil, 0, false
 }
