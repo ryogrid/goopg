@@ -36,6 +36,15 @@
 #   NO_BUILD   1 = trust the existing images (use this to hold ONE binary across
 #              both arms, which is what makes them comparable)
 #   FORCE      1 = run even if the nightly CI batch holds the host
+#   GOOPG_ANALYZE_SEED
+#              Pins ANALYZE's reservoir sample for the arm's server (default
+#              20260905). goopg's statistics are per-connection and ANALYZE is
+#              sampled, so an unpinned arm plans against a different sample
+#              than its counterpart: measured A/A noise of 455 estimate lines
+#              and 27 plan-shape lines, including whole join-method flips,
+#              which is LARGER than the A/B signal most planner changes carry.
+#              Set to 0 to restore wall-clock seeding.
+#              See docs/design/planner-gate-reproducibility/DESIGN.md.
 #
 set -uo pipefail
 
@@ -69,6 +78,9 @@ DIGEST="${DIGEST:-1}"
 # the first big query and every later timing reads as a regression
 # (CLAUDE.md "sweep-tail collapse"; memory cgroup_high_below_gomemlimit).
 export GOMEMLIMIT="${GOMEMLIMIT:-12GiB}" GOGC="${GOGC:-off}"
+# Statistics envelope: pinned by default so the two arms of an A/B plan against
+# the SAME sample (see the GOOPG_ANALYZE_SEED note above).
+export GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"
 export GOOPG_MEM_HIGH="${GOOPG_MEM_HIGH:-20G}" GOOPG_MEM_MAX="${GOOPG_MEM_MAX:-24G}"
 export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -664,6 +665,66 @@ func analyzeMCVList(mcvCounts []int, numMCV int, staDistinct, staNullFrac float6
 	return numMCV
 }
 
+// analyzeSeedEnv is the process-wide fallback seed for ANALYZE's reservoir
+// sampler, read once from `GOOPG_ANALYZE_SEED`. Zero (the unset case) keeps
+// upstream behaviour: every ANALYZE draws a fresh wall-clock-seeded sample,
+// exactly as PG's acquire_sample_rows does
+// (postgres/src/backend/commands/analyze.c — `random()` seeded per backend).
+//
+// Why it exists: a *measurement* problem, not a semantics one. goopg's
+// statistics are per-connection, so the plan-capture harness
+// (`cmd/estimate-audit -warm-stats`, on by default) re-ANALYZEs every table at
+// the start of each capture session. With a wall-clock seed each capture sees
+// a different sample, so two captures of the SAME binary disagree — measured
+// 2026-09-05 at 455 differing estimate lines and 27 differing plan-shape lines
+// between two back-to-back A/A captures, including whole join-method flips
+// (TPC-H Q3 Nested Loop vs Merge Join, Q9 hash vs merge spine). That noise is
+// larger than the signal every planner A/B in
+// `docs/design/not_ralph/minimize_datum/TODO_ALL.md` is trying to read, and it
+// makes the plan-shape pin (A-05) report changes no commit caused.
+//
+// Setting the variable pins the sample so a capture is reproducible. It is a
+// harness knob: production and every unset run are bit-for-bit unchanged.
+var analyzeSeedEnv = func() int64 {
+	v := strings.TrimSpace(os.Getenv("GOOPG_ANALYZE_SEED"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}()
+
+// analyzeSeedFor returns the sampler seed for one relation when no
+// Context-level seed was set: the pinned harness seed when
+// `GOOPG_ANALYZE_SEED` is set, otherwise a fresh wall-clock draw (upstream
+// behaviour).
+//
+// The pinned seed is mixed with the relation OID. One seed shared by every
+// relation would make each table's reservoir replay the identical random
+// stream, correlating which sample POSITIONS survive across all tables — the
+// pinned statistics would then be systematically less representative than an
+// unpinned draw, so the gate would pin a plan set production would not
+// necessarily pick. Mixing keeps a run fully reproducible (the OID is stable
+// for a given cluster) while leaving the per-table samples independent.
+//
+// An explicit `GOOPG_ANALYZE_SEED=0` means "unset" and keeps the wall clock:
+// zero is the sentinel, so there is no way to request the all-zero seed. A
+// mistyped or overflowing value is likewise indistinguishable from unset (see
+// analyzeSeedEnv) — fail-open, because the alternative pins every sample to a
+// single draw that nobody asked for.
+func analyzeSeedFor(tbl *catalog.Table) int64 {
+	if analyzeSeedEnv == 0 {
+		return time.Now().UnixNano()
+	}
+	if tbl == nil {
+		return analyzeSeedEnv
+	}
+	return analyzeSeedEnv ^ int64(tbl.OID)
+}
+
 // analyzeRelationCtx is the Context-aware entry point that
 // honours StatsTarget / AnalyzeRandSeed.
 func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, error) {
@@ -673,18 +734,18 @@ func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, 
 	}
 	seed := ctx.AnalyzeRandSeed
 	if seed == 0 {
-		seed = time.Now().UnixNano()
+		seed = analyzeSeedFor(tbl)
 	}
 	return analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(seed)), ctx.MultiXact, ctx)
 }
 
 // analyzeRelation is kept as a thin wrapper for tests that don't
 // thread a Context — it uses the upstream-default stats target
-// and a wall-clock-seeded sampler.
+// and a wall-clock-seeded sampler (pinned when `GOOPG_ANALYZE_SEED` is set).
 func analyzeRelation(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
 	// nil store: analyzeRelation is the test-only convenience wrapper with no
 	// executor.Context (hence no MultiXact) in scope. M0118-0003.
-	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())), nil, nil)
+	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(analyzeSeedFor(tbl))), nil, nil)
 }
 
 // analyzeRelationWith walks every block of tbl under a fresh
@@ -1283,13 +1344,13 @@ func sortDatumsAscending(ds []Datum) error {
 
 // AnalyzeRelationSampled runs the executor-grade sampled analyzer for one
 // relation without an executor Context: upstream-default stats target,
-// wall-clock-seeded reservoir, full column stats (NDistinct/NullFrac/MCV/
-// histogram/correlation). The autovacuum launcher calls this instead of the
+// wall-clock-seeded reservoir (pinned when `GOOPG_ANALYZE_SEED` is set),
+// full column stats (NDistinct/NullFrac/MCV/histogram/correlation). The autovacuum launcher calls this instead of the
 // simplified commands/vacuum.Analyze so autoanalyze produces planner-grade
 // statistics. pg_statistic heap persistence still requires a Context and is
 // therefore skipped here; the catalog TableStats sidecar (which the planner
 // consumes via internal/optimizer/relsize.go) IS updated by the caller.
 func AnalyzeRelationSampled(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
 	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget,
-		rand.New(rand.NewSource(time.Now().UnixNano())), nil, nil)
+		rand.New(rand.NewSource(analyzeSeedFor(tbl))), nil, nil)
 }

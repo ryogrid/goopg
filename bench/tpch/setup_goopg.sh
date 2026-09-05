@@ -76,6 +76,19 @@ if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
         # the power test starts (M0054-0007-checkpoint-before-run).
         echo "checkpoint_timeout = 24h"
         echo "max_wal_size = 1024GB"
+        # Gate determinism (2026-09-05): the autovacuum launcher runs a
+        # SAMPLED ANALYZE every autovacuum_naptime (60 s), so on a cluster
+        # used as a measurement instrument the planner's inputs move DURING
+        # a run — measured effect: statistics changed between the two arms
+        # of an A/B and even between two queries of one arm, flipping whole
+        # join methods (Q3 Nested Loop vs Merge Join, Q9 hash vs merge
+        # spine). Pinned here, in the tracked generator, so a --reset does
+        # not silently restore the noise.
+        # Consequence to remember: nothing sets visibility-map bits on this
+        # cluster any more, so index-only paths are priced pessimistically.
+        # Run one manual VACUUM after a fresh load.
+        # See docs/design/planner-gate-reproducibility/DESIGN.md.
+        echo "autovacuum = off"
     } >>"${PGDATA}/postgresql.conf"
 
     # HammerDB connects with user=postgres password=postgres. Goopg's

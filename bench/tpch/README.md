@@ -142,3 +142,22 @@ Logs accumulate in `bench/tpch/logs/`; delete them at will.
 - HammerDB connects via the libpq compiled into its binary, not the one
   in `postgres/local_install/lib`, so the server only needs to be wire-
   protocol compatible (PostgreSQL 18.3 is fine).
+- **The goopg bench cluster runs with `autovacuum = off` (written by
+  `setup_goopg.sh`, so it survives `--reset`) and pins `GOOPG_ANALYZE_SEED`
+  in `env_goopg.sh`, which `setup_goopg.sh` and `scripts/tpch-spotcheck.sh`
+  source and `scripts/tpch-acceptance-arm.sh` sets for its own server**
+  (2026-09-05). The seed must reach the SERVER's environment: ANALYZE runs
+  server-side and reads it once at process start. goopg's statistics are per-connection
+  and ANALYZE is a sampled reservoir scan, so an unpinned capture plans
+  against a fresh random sample every time; with the autovacuum launcher
+  also re-analyzing every 60 s, statistics moved *between the arms of an
+  A/B* and even between two queries of one arm. Measured A/A noise before
+  pinning: 455 differing estimate lines and 27 differing plan-shape lines
+  between two back-to-back captures of the SAME binary, including whole
+  join-method flips (Q3 Nested Loop vs Merge Join, Q9 hash vs merge spine).
+  After pinning, two captures are byte-identical. Re-enable autovacuum only
+  for a test that is specifically about autovacuum, and re-pin the row
+  anchors afterwards if it changes the data. One consequence: with autovacuum
+  off nothing sets visibility-map bits, and the index-only cost path reads
+  `allvisfrac` from them — run a manual `VACUUM` once after each fresh load.
+  See `docs/design/planner-gate-reproducibility/DESIGN.md`.
