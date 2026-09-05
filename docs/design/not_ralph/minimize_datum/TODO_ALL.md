@@ -1116,6 +1116,29 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   3. **Re-measure the premise.** The 5× width claim is 1.9× post-EX1, on
      ~14% of the join's peak. Whether that justifies ~900 LOC is a
      different question from the one the bundle was scoped against.
+  **3rd and 4th measurements, 2026-09-06 — the blocker moved again, and is
+  now precisely located.** The cost-side narrowing fix
+  (`take3-D-05-costside-unnarrowed`) was implemented and measured: it makes
+  the cost side agree exactly with the executor (Q9 `orders` 530.3 → 120.0
+  B/row), errs HIGH, keeps values 24 MATCH, passes TPC-DS PASS=95
+  CKMISMATCH=0, and moves plan parity **toward** PG — and it costs
+  **+10.3%** (Q5 +216%, Q10 +162%, Q9 +74%, Q7 +62%; Q18 −19% and Q12 −12%
+  the other way). Reverted.
+  It also **confirmed the coupling hypothesis**: with it applied, the
+  bucket-charge patch no longer flips Q14 (0.42 → 0.43 s, against 14.55 s
+  alone). So prerequisite #2 is unblocked but free, and the pair still
+  costs +11.1%.
+  **Why: the inflated build width was an ACCIDENTAL DETERRENT.**
+  `hashJoinCost` under-prices *building* a large hash table — it charges
+  only `cpu_tuple_cost × rows` plus the child cost, modelling neither the
+  five private per-worker copies (sharing is declined for a spilling
+  build) nor the table memory. Q5/Q7/Q9/Q10 all flip WHICH SIDE IS BUILT
+  once the deterrent is removed.
+  **The honest sequence is now: (1) charge what a build actually costs,
+  (2) THEN narrow the width and re-apply both preserved patches.** Ledger
+  `take3-D-05-buildcost-underpriced`; guard
+  `TestSlice3LiveQ9ShapeDerivation`; artifact
+  `analysis/minimize-datum/d05-costside-20260906/README.md`.
   Also required by D-04's evidence but out of this bundle's stated scope: a
   dense byte arena plus an allocation-free encoder, since packing every
   build row while deforming only matches costs +39% allocations.
@@ -1439,6 +1462,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| cost-side narrowing | 2026-09-06 | (reverted; patch in tmp/) | cost side made to agree with the executor exactly; **+10.3%** — it removed an accidental deterrent | **names the real defect: hashJoinCost under-prices BUILDING a large hash table**; confirms the bucket-charge coupling (Q14 no longer flips) |
 | D-05 prereq #2 | 2026-09-06 | (reverted; patch in tmp/) | MapSlotBytes 48 was a guess and 2x low (measured 96 B/slot); honest value halved bucket heap 586->286 MB, batches unchanged — but **Q14 flipped to a nested loop, +10.4% total** | premise refuted again (buckets WERE already charged); blocker moves to the cost side pricing an un-narrowed build |
 | D-05 prereq #1 | 2026-09-06 | (this commit) | entry model fixed 194 -> 120 B/row (was half-narrowed, half-full-width); **nbatch unchanged — D-04's claim refuted** | non-monotone: 2 batches need <=111.8 B/row; packed 63 B/row lands back on 4. The lever is MapSlotBytes, not the entry |
 | D-04 | 2026-09-05 | (this commit) | **STOP: batches 4->4 unchanged, time +6.8%, allocs +39%, retained bytes -14/-24%** | fires 05 section 6's "fix the model first" arm; premise found stale (5x width claim is 1.9x post-EX1) |
