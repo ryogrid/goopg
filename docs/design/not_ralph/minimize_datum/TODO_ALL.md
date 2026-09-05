@@ -325,12 +325,16 @@ are EPICS — split into one-checkbox-per-commit items before starting
   `take3-B-11-filed`: correction unmasked parameterized-NL fanout
   undercount (d13 estimates outer-only; excess 3.6×→50.4×, ratchet
   holds via floor) — join-size track work, not this item.
-- [ ] **B-12d Derived-table propagation: thread the settings by hand
-  through `planSelectWithParent` for `(SELECT …) AS alias` FROM items.**
-  After B-01a/b/c per take3 08 §10.1. The reverted mechanical attempt
-  threaded from the wrong scope — hand-thread only.
-  *design: take2 07 §3.3 + 04 §12.3 + take3 08 §5.1; gate: take3 09 §5 P2
-  (GUC-effect + both-suites timing).*
+- [x] **B-12d Derived-table propagation.** Landed 2026-09-05:
+  `planSelectWithParent` gains `ps` (resolves directly from the
+  parameter, never parent/lateral — the reverted attempt's lesson);
+  `planSubqueryRangeVar` forwards; out-of-scope callers (multi-assign,
+  scalar/ARRAY/IN/EXISTS) pass explicit defaults marked B-12e/f.
+  Gates: GUC-effect pin (5 arms fail pre-fix via stash, pass post) +
+  unchanged-default pin; PP zero drift (Q7 scare = stale-stats
+  artifact: ANALYZE mid-gate moved Q7 to merge; values identical;
+  reproducible pre/post on demand); TPC-H 24/24 MATCH.
+  Artifacts: `planner.go`, `settings_propagation_test.go`.
 - [ ] **B-12e Set-operation operand propagation:** same hand-threading for
   set-operation operands. After B-01a/b/c.
   *design: take2 07 §3.3 + 04 §12.3 + take3 08 §5.1; gate: take3 09 §5 P2

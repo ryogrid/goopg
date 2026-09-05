@@ -3155,7 +3155,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// 0 → today's rendering.
 	rtid := scope.Alloc()
 	if rv.Subquery != nil {
-		return planSubqueryRangeVar(rv, cat, sourceIdx, lateralCtx, scope)
+		return planSubqueryRangeVar(rv, cat, sourceIdx, lateralCtx, ps, scope)
 	}
 	if rv.TableFunc != nil {
 		node, b, err := planTableFuncRangeVar(rv, cat, sourceIdx, lateralCtx)
@@ -4249,7 +4249,13 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 // never registered in the catalog — it lives only to satisfy
 // the rangeBinding contract that downstream column resolution
 // uses.
-func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, scope *rtableScope) (Node, rangeBinding, error) {
+//
+// ps is the outer statement's PlannerSettings (B-12d): forwarded
+// untouched to planSelectWithParent so the inner join search prices
+// under the session's settings, never the hard-wired defaults.
+// Never parent.settings / lateralCtx.settings — see
+// planSelectWithParent's wrong-scope note.
+func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, rangeBinding, error) {
 	// Handle bare VALUES(...) subquery: `FROM (VALUES (r1), (r2)) AS t(c1, c2)`.
 	// M0097-0003. Pass lateralCtx so qualified star (n.*) can be expanded. M0097-0020.
 	if len(rv.Subquery.ValuesRows) > 0 {
@@ -4290,7 +4296,7 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// The scope also travels as planSelectWithParent's explicit param
 		// (F1: threaded, never created).
 		latCtxWithCat.rtScope = scope
-		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat, scope)
+		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat, ps, scope)
 	} else {
 		// Non-correlated derived table. Plan via planSelectWithParent
 		// (nil outer scope) rather than Plan(): the outer statement's
@@ -4307,7 +4313,9 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// A-01(ii) cut 2: the inner statement shares this statement's
 		// scope (F1: threaded, never created), so its scans cannot
 		// collide with the outer level's.
-		inner, err = planSelectWithParent(rv.Subquery, cat, nil, scope)
+		// B-12d: and this statement's settings (ps), so the inner
+		// join search prices under the session's GUCs.
+		inner, err = planSelectWithParent(rv.Subquery, cat, nil, ps, scope)
 	}
 	if err != nil {
 		// LATERAL subquery fallback: when the inner subquery references outer
@@ -11886,7 +11894,9 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 			if innerScope == nil {
 				innerScope = rtableScopeFrom(ctx)
 			}
-			innerPlan, err := planSelectWithParent(rhs.Inner, cat, ctx, innerScope)
+			// B-12f owns this site (scalar-subquery propagation): still
+			// defaulted until that slice threads it by hand.
+			innerPlan, err := planSelectWithParent(rhs.Inner, cat, ctx, DefaultPlannerSettings(), innerScope)
 			if err != nil {
 				return err
 			}
@@ -13884,7 +13894,9 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 	}
 	// A-01(ii) cut 2 (F4): the inner SELECT shares the statement scope
 	// read off the outer context — threaded, never created (F1).
-	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, rtableScopeFrom(parent))
+	// B-12f owns this site (scalar-subquery propagation): still defaulted
+	// until that slice threads it by hand.
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, DefaultPlannerSettings(), rtableScopeFrom(parent))
 	if err != nil {
 		return nil, err
 	}
@@ -13899,7 +13911,9 @@ func planArraySubqueryExpr(x *parser.ArraySubqueryExpr, parent *resolveContext) 
 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "subqueries are not supported in this context"}
 	}
 	// A-01(ii) cut 2 (F4): shares the statement scope (see planSubqueryExpr).
-	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, rtableScopeFrom(parent))
+	// B-12f owns this site (scalar-subquery propagation): still defaulted
+	// until that slice threads it by hand.
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, DefaultPlannerSettings(), rtableScopeFrom(parent))
 	if err != nil {
 		return nil, err
 	}
@@ -13980,7 +13994,9 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}
 		}
 		// A-01(ii) cut 2 (F4): shares the statement scope (see planSubqueryExpr).
-		inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx, rtableScopeFrom(ctx))
+		// B-12f owns this site (scalar-subquery propagation): still defaulted
+		// until that slice threads it by hand.
+		inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx, DefaultPlannerSettings(), rtableScopeFrom(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -14007,7 +14023,9 @@ func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error) 
 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "EXISTS not supported in this context"}
 	}
 	// A-01(ii) cut 2 (F4): shares the statement scope (see planSubqueryExpr).
-	inner, err := planSelectWithParent(x.Subquery, parent.cat, parent, rtableScopeFrom(parent))
+	// B-12f owns this site (scalar-subquery propagation): still defaulted
+	// until that slice threads it by hand.
+	inner, err := planSelectWithParent(x.Subquery, parent.cat, parent, DefaultPlannerSettings(), rtableScopeFrom(parent))
 	if err != nil {
 		return nil, err
 	}
@@ -14124,7 +14142,21 @@ func planHasEscapingOuterRef(node Node, depth int) bool {
 // rendering. It is NOT hung off PlannerSettings (a by-value struct
 // copied at every call site — a counter there would fork), and NOT a
 // package global.
-func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext, scope *rtableScope) (Node, error) {
+//
+// ps is the statement's PlannerSettings, threaded explicitly like scope.
+// B-12d (take3 08 §5.1): derived-table FROM items inherit the OUTER
+// statement's settings — the value arriving on planScanRangeVar's own ps
+// parameter via the FROM-clause chain — so the inner join search prices
+// under the session's work_mem/cost GUCs. It is resolved DIRECTLY from
+// this parameter, never by reading parent (or the lateral context): `parent`
+// is assigned from the package-global planParent, whose own comment records
+// that it is goroutine-thread-unsafe, so a parent walk could price the inner
+// query with a concurrently-planning session's GUCs — the threaded-from-wrong-
+// scope bug the reverted mechanical attempt shipped (take3 08 §10.1, 04 §12.3;
+// same rule as resolveContext.settings). Callers outside B-12d's derived-table
+// family (set-op operands, scalar subqueries) pass DefaultPlannerSettings()
+// explicitly, preserving today's behaviour until B-12e/B-12f thread them.
+func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	prevParent := planParent
 	planParent = parent
 	defer func() { planParent = prevParent }()
@@ -14147,7 +14179,7 @@ func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *
 	if scope == nil {
 		scope = rtableScopeFrom(parent)
 	}
-	return planSelectWithSettings(stmt, cat, DefaultPlannerSettings(), scope)
+	return planSelectWithSettings(stmt, cat, ps, scope)
 }
 
 // buildAnalyzerOuterScope walks a resolveContext chain and

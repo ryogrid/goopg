@@ -64,8 +64,123 @@ func TestPlannerSettingsReachSubqueryScan(t *testing.T) {
 	}
 }
 
-// TestNeededColsReachTheRelOptInfo pins take2 P4-01 rev 10 step 1.
+// TestPlannerSettingsReachDerivedTableJoin is B-12d's GUC-effect gate
+// (take3 09 §5 P2 row): the session's settings must reach the join search
+// running INSIDE a `(SELECT …) AS alias` FROM item. TPC-H Q9 is the live
+// witness — its entire join tree sits inside such a subquery, which is why
+// P2-02b stays blocked until this slice lands (take3 04 §12.3).
 //
+// The assertion is on the priced inner join, not on timing or shape: before
+// B-12d the inner search planned under hard-wired defaults, so every arm
+// below costed the join at 3.25..151.75 no matter what the session said.
+// After B-12d each arm reprices it, proving the inner search reads the
+// statement's settings.
+//
+// The arms are EXACTLY the P2-02d settings family this fixture can observe:
+// seq_page_cost, cpu_tuple_cost, cpu_operator_cost (each ×1000) and work_mem
+// (16kB, whose hash budget spills at this fixture's build size — the same
+// repricing the bench shows live as `SET work_mem='64kB'` 14835→23478).
+// Deliberately NOT covered here, same honesty rule as
+// TestCostGUCsReachTheCostingOnAHashJoin: random_page_cost,
+// cpu_index_tuple_cost and effective_cache_size need an index shape this
+// seq-scan fixture does not produce; parallel_setup_cost/parallel_tuple_cost
+// need a Gather; the method toggles, memoize, hash_mem_multiplier and GEQO
+// knobs travel on the same PlannerSettings value with conversion pinned by
+// TestCostGUCConversionIsTotal / TestEnableJoinMethodGUCsSetDisabledNodes /
+// TestHashMemMultiplierReachesTheBudget.
+func TestPlannerSettingsReachDerivedTableJoin(t *testing.T) {
+	cat := psProbeCatalog(t)
+	// Q9's shape class: the join tree lives inside the derived table.
+	const sql = "SELECT s.a FROM (SELECT pa.v AS a, pb.v AS b FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3) s"
+	const nestedSQL = "SELECT s.a FROM (SELECT q.a AS a FROM (SELECT pa.v AS a, pb.v AS b FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3) q) s"
+
+	base, ok := topPlanCost(psPlan(t, cat, sql, DefaultPlannerSettings()))
+	if !ok {
+		t.Fatal("baseline derived-table plan carries no cost; the inner join did not reach the path search")
+	}
+
+	for _, tc := range []struct {
+		name  string
+		sql   string
+		apply func(*PlannerSettings)
+	}{
+		{"seq_page_cost", sql, func(p *PlannerSettings) { p.SeqPageCost *= 1000 }},
+		{"cpu_tuple_cost", sql, func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
+		{"cpu_operator_cost", sql, func(p *PlannerSettings) { p.CPUOperatorCost *= 1000 }},
+		{"work_mem", sql, func(p *PlannerSettings) { p.WorkMem = 16 << 10 }},
+		// The settings thread recursively: a derived table inside a derived
+		// table prices under the same statement settings.
+		{"cpu_tuple_cost/nested", nestedSQL, func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := DefaultPlannerSettings()
+			tc.apply(&ps)
+			got, ok := topPlanCost(psPlan(t, cat, tc.sql, ps))
+			if !ok {
+				t.Fatalf("%s: plan carries no cost", tc.name)
+			}
+			if got.TotalCost == base.TotalCost && got.StartupCost == base.StartupCost {
+				t.Errorf("%s: inner join still costed at (%.4f..%.4f) — "+
+					"the settings did not reach the derived table's join search",
+					tc.name, got.StartupCost, got.TotalCost)
+			}
+		})
+	}
+
+	// No cross-session leakage: the threading is an explicit parameter, not
+	// the package-global planParent channel, so planning under one session's
+	// settings must not steer the next statement (the wrong-scope bug the
+	// reverted mechanical attempt shipped — take3 08 §10.1).
+	t.Run("no_leakage", func(t *testing.T) {
+		hot := DefaultPlannerSettings()
+		hot.CPUTupleCost *= 1000
+		if _, ok := topPlanCost(psPlan(t, cat, sql, hot)); !ok {
+			t.Fatal("hot arm carries no cost")
+		}
+		restored, ok := topPlanCost(psPlan(t, cat, sql, DefaultPlannerSettings()))
+		if !ok {
+			t.Fatal("restored arm carries no cost")
+		}
+		if restored != base {
+			t.Errorf("default plan after a hot plan = (%.4f..%.4f), want baseline (%.4f..%.4f) — "+
+				"one statement's settings leaked into the next",
+				restored.StartupCost, restored.TotalCost, base.StartupCost, base.TotalCost)
+		}
+	})
+}
+
+// TestDerivedTablePropagationKeepsDefaultPlan is B-12d's unchanged-default
+// pin: under DefaultPlannerSettings the derived-table path must price exactly
+// as it did when planSelectWithParent hard-wired the defaults — the slice is
+// plan-neutral for sessions that change nothing. The literal cost pins the
+// full chain (FROM threading → planSubqueryRangeVar → planSelectWithParent →
+// inner search); a zero-valued or mis-threaded settings value would reprice
+// it. The lateral and nested variants cover the second threaded call site and
+// the recursion.
+func TestDerivedTablePropagationKeepsDefaultPlan(t *testing.T) {
+	cat := psProbeCatalog(t)
+	const sql = "SELECT s.a FROM (SELECT pa.v AS a, pb.v AS b FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3) s"
+
+	got, ok := topPlanCost(psPlan(t, cat, sql, DefaultPlannerSettings()))
+	if !ok {
+		t.Fatal("derived-table plan carries no cost; the inner join did not reach the path search")
+	}
+	if got.StartupCost != 3.25 || got.TotalCost != 151.75 || got.PlanRows != 100 {
+		t.Errorf("default derived-table join = (%.4f..%.4f rows=%.0f), want (3.25..151.75 rows=100) — "+
+			"the default path moved", got.StartupCost, got.TotalCost, got.PlanRows)
+	}
+
+	// The lateral derived-table call site threads the same value; the lateral
+	// path bypasses the path search (no costed node), so plan-OK is the
+	// observable — it guards the edited call site against breakage.
+	const lateralSQL = "SELECT s.a FROM pa, LATERAL (SELECT pb.v AS a FROM pb WHERE pb.id = pa.id) s"
+	hot := DefaultPlannerSettings()
+	hot.CPUTupleCost *= 1000
+	for _, ps := range []PlannerSettings{DefaultPlannerSettings(), hot} {
+		psPlan(t, cat, lateralSQL, ps)
+	}
+}
+
 // The build-side narrowing lands in `joinInputsFor`, which runs inside
 // `createPlanNode` — a free function with no searchCtx. `Path.Rel` is the only
 // route to the statement's needed-column set from there, so the set has to be
