@@ -450,11 +450,7 @@ parallelism costed not forced; single planner; acceptance run green.
 **Do not start P3-02/03/04 before B-01 lands** (take3 08 §2.3 safety
 rule).*
 
-- [ ] **C-01 P3-01 `SpecialJoinInfo` population.** Field set exists; what is
-  missing is population, blocked on name resolution. Partial fix UNSAFE
-  (underestimate = wrong answers; fall back to `syn` on any uncertainty).
-  Moves no plan alone — unobservable until C-03/C-04 consume it.
-  *design: take3 08 §6.1; gate: units.*
+- [x] **C-01 P3-01 `SpecialJoinInfo` population.** Landed 2026-09-05: `makeSpecialJoinInfoScoped` (clause/strict relids over ON/USING via name→leaf scope + lower-OJ ordering scan grow-only + FULL early-return + empty-min punt) + `deconstructJointreeScoped`/`deconstructFromItemScoped` threading + `newSjiScope` (leaf order = deconstruct order); fail-closed syn fallback on any uncertainty; ANTI flags aligned to upstream false/false; USING/NATURAL punt filed as follow-up. Gates: 8 new scoped tests + optimizer suite + units precommit scope + pgbench smoke (0 failed) + agent review APPROVE-WITH-NITS (5 minors addressed). No plan-shape move by construction (no consumer reads the new fields yet). Artifacts: `docs/design/planner-c01-sji-population/DESIGN.md`, `internal/optimizer/{specialjoin,collapse,planner}.go`, `specialjoin_scoped_test.go` — `ea8ca9dfe` (code), `2e59cfe49` (design).
 - [ ] **C-02 P3-02 `distribute_qual_to_rels` + `check_outerjoin_delay.**
   A qual is **placed**, not copied down. Supersedes
   `pushInnerJoinInputQuals` copying (double evaluation). After B-01.
@@ -912,6 +908,7 @@ P6-03/04/05 (load-bearing).
 | item | closed | commit | effect | notes |
 |---|---|---|---|---|
 | F-01 | 2026-09-05 | 514913912 (pre-existing) | dual-map peak removed; single-map build by plan type | audit-only close; no new code; guard test `join_single_map_build_test.go` |
+| C-01 | 2026-09-05 | ea8ca9dfe + 2e59cfe49 | SJI min/strict populated fail-closed; chained-LEFT shrink verified | 8 scoped tests; review APPROVE-WITH-NITS; smoke 0 failed; USING follow-up filed |
 
 ## Dropped
 
