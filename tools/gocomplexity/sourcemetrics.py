@@ -255,18 +255,36 @@ def maintainability_index(volume: float, avg_cyclomatic: float, loc: float) -> f
     return max(0.0, min(100.0, raw * 100.0 / 171.0))
 
 
-def duplication_pct(
+@dataclass
+class DuplicationResult:
+    """Outcome of duplicate-window detection.
+
+    ``pct`` is the fraction of code lines inside duplicated blocks;
+    ``dup_lines`` / ``total_lines`` are the absolute counts. ``unique_windows``
+    is the number of distinct window signatures that occur at two or more
+    locations, and ``multiplicity_histogram`` maps an occurrence count to the
+    number of windows appearing exactly that many times (keys are always >= 2).
+    """
+
+    pct: float
+    dup_lines: int
+    total_lines: int
+    unique_windows: int = 0
+    multiplicity_histogram: dict[int, int] = field(default_factory=dict)
+
+
+def duplication_analysis(
     sources: dict[str, FileSource], min_lines: int = 6
-) -> tuple[float, int, int]:
-    """Estimate the fraction of code lines inside duplicated blocks.
+) -> DuplicationResult:
+    """Detect duplicated windows and return the full result.
 
     Slides a window of ``min_lines`` consecutive code lines within each file,
     hashes the normalized signatures, and flags every line covered by a window
     whose signature occurs at two or more distinct locations (in any file).
 
-    Returns ``(percentage, duplicated_code_lines, total_code_lines)``. The
-    percentage catches type-1 clones plus literal-normalized (type-2-lite)
-    clones; it is deterministic (files iterated in sorted order).
+    Catches type-1 clones plus literal-normalized (type-2-lite) clones; it is
+    deterministic (files iterated in sorted order). See
+    :class:`DuplicationResult` for the fields.
     """
     # window signature -> list of (file, [line numbers]) occurrences
     windows: dict[tuple[str, ...], list[tuple[str, tuple[int, ...]]]] = defaultdict(list)
@@ -285,12 +303,35 @@ def duplication_pct(
             windows[sig].append((rel, span))
 
     duplicated: dict[str, set[int]] = defaultdict(set)
+    histogram: dict[int, int] = defaultdict(int)
+    unique_windows = 0
     for sig, occ in windows.items():
         if len(occ) < 2:
             continue
+        unique_windows += 1
+        histogram[len(occ)] += 1
         for rel, span in occ:
             duplicated[rel].update(span)
 
     dup_lines = sum(len(s) for s in duplicated.values())
     pct = round(100.0 * dup_lines / total_code, 4) if total_code else 0.0
-    return pct, dup_lines, total_code
+    return DuplicationResult(
+        pct=pct,
+        dup_lines=dup_lines,
+        total_lines=total_code,
+        unique_windows=unique_windows,
+        multiplicity_histogram=dict(histogram),
+    )
+
+
+def duplication_pct(
+    sources: dict[str, FileSource], min_lines: int = 6
+) -> tuple[float, int, int]:
+    """Estimate the fraction of code lines inside duplicated blocks.
+
+    Thin wrapper over :func:`duplication_analysis` returning the
+    ``(percentage, duplicated_code_lines, total_code_lines)`` triple for
+    callers that only need the headline percentage.
+    """
+    r = duplication_analysis(sources, min_lines)
+    return r.pct, r.dup_lines, r.total_lines

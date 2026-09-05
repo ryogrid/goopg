@@ -6,6 +6,7 @@ import unittest
 
 from tools.gocomplexity.sourcemetrics import (
     FileSource,
+    duplication_analysis,
     duplication_pct,
     maintainability_index,
     scan_file,
@@ -83,6 +84,40 @@ class DuplicationTest(unittest.TestCase):
         pct, dup, total = duplication_pct({"a.go": a, "b.go": b}, min_lines=6)
         self.assertEqual(dup, 0)
         self.assertEqual(pct, 0.0)
+
+
+class DuplicationAnalysisTest(unittest.TestCase):
+    def _src(self, rel: str, lines: dict[int, str]) -> FileSource:
+        from tools.gocomplexity.sourcemetrics import Halstead
+
+        return FileSource(file=rel, total_lines=len(lines), loc=len(lines),
+                          halstead=Halstead(), norm_lines=lines)
+
+    def test_unique_windows_and_histogram_two_copies(self) -> None:
+        block = {i: f"tok{i % 3}" for i in range(1, 7)}  # 6 code lines
+        a = self._src("a.go", dict(block))
+        b = self._src("b.go", dict(block))
+        r = duplication_analysis({"a.go": a, "b.go": b}, min_lines=6)
+        self.assertEqual(r.unique_windows, 1)
+        self.assertEqual(r.multiplicity_histogram, {2: 1})
+        self.assertEqual(r.dup_lines, 12)
+        self.assertEqual(r.pct, 100.0)
+
+    def test_histogram_three_copies(self) -> None:
+        block = {i: f"tok{i % 3}" for i in range(1, 7)}
+        a = self._src("a.go", dict(block))
+        b = self._src("b.go", dict(block))
+        c = self._src("c.go", dict(block))
+        r = duplication_analysis({"a.go": a, "b.go": b, "c.go": c}, min_lines=6)
+        self.assertEqual(r.unique_windows, 1)
+        self.assertEqual(r.multiplicity_histogram, {3: 1})
+
+    def test_no_duplication_empty_histogram(self) -> None:
+        a = self._src("a.go", {i: f"unique_a_{i}" for i in range(1, 7)})
+        b = self._src("b.go", {i: f"unique_b_{i}" for i in range(1, 7)})
+        r = duplication_analysis({"a.go": a, "b.go": b}, min_lines=6)
+        self.assertEqual(r.unique_windows, 0)
+        self.assertEqual(r.multiplicity_histogram, {})
 
 
 if __name__ == "__main__":

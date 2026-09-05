@@ -13,7 +13,7 @@ import numpy as np
 
 from .config import Config
 from .models import Aggregate, FunctionMetric, MetricStats, ProjectSummary
-from .sourcemetrics import FileSource, maintainability_index
+from .sourcemetrics import DuplicationResult, FileSource, maintainability_index
 
 
 def _metric_stats(values: list[int], thresholds: list[int]) -> MetricStats:
@@ -99,7 +99,7 @@ def build_summary(
     generated_at: str,
     num_files: int,
     sources: dict[str, FileSource],
-    duplication: tuple[float, int, int],
+    duplication: DuplicationResult,
 ) -> ProjectSummary:
     """Assemble a :class:`ProjectSummary` from function metrics + source scan."""
     thresholds = config.thresholds
@@ -138,7 +138,9 @@ def build_summary(
     else:
         project_mi = 100.0
 
-    dup_pct, dup_lines, total_code = duplication
+    dup_pct = duplication.pct
+    dup_lines = duplication.dup_lines
+    total_code = duplication.total_lines
 
     packages = _aggregate(metrics, lambda m: m.package, file_loc, file_mi)
     directories = _aggregate(metrics, lambda m: m.directory, file_loc, file_mi)
@@ -155,6 +157,8 @@ def build_summary(
         duplicate_code_pct=dup_pct,
         duplicate_code_lines=dup_lines,
         total_code_lines=total_code,
+        duplicate_window_count=duplication.unique_windows,
+        duplicate_multiplicity_histogram=duplication.multiplicity_histogram,
         halstead_volume=round(project_volume, 2),
         cyclomatic=cyc_stats,
         cognitive=cog_stats,

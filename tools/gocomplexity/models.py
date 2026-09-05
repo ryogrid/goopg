@@ -98,6 +98,8 @@ class ProjectSummary:
     packages: list[Aggregate] = field(default_factory=list)
     directories: list[Aggregate] = field(default_factory=list)
     files: list[Aggregate] = field(default_factory=list)
+    duplicate_window_count: int = 0
+    duplicate_multiplicity_histogram: dict[int, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -111,6 +113,10 @@ class ProjectSummary:
             "duplicate_code_pct": self.duplicate_code_pct,
             "duplicate_code_lines": self.duplicate_code_lines,
             "total_code_lines": self.total_code_lines,
+            "duplicate_window_count": self.duplicate_window_count,
+            "duplicate_multiplicity_histogram": {
+                str(k): v for k, v in self.duplicate_multiplicity_histogram.items()
+            },
             "halstead_volume": self.halstead_volume,
             "thresholds": self.thresholds,
             "cyclomatic": self.cyclomatic.to_dict(),
