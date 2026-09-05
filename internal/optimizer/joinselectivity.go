@@ -97,6 +97,11 @@ const (
 type joinVarStats struct {
 	stats  *catalog.ColumnStats
 	tuples float64
+	// rows is the relation's FILTERED (post-qual) row count, PG's
+	// `vardata->rel->rows`. The bucket scaler (B-16) prices the rows actually
+	// hashed, while `tuples` stays raw. Zero when the context was hand-built
+	// without it; the scaler reads that as "no filter info" and skips.
+	rows   float64
 	isBool bool
 
 	// typeName is the column's catalog type. Histogram bounds are stored as
@@ -153,6 +158,7 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	}
 	info := s.relInfos[i]
 	v.tuples = float64(info.baseRows)
+	v.rows = float64(info.filteredRows)
 	v.stats = columnStatsByName(info.table, cr.Name)
 	return v
 }
@@ -457,14 +463,21 @@ func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInf
 	return tuples
 }
 
-// estimateHashBucketSize is `estimate_hash_bucket_stats` (selfuncs.c) reduced to
-// the fraction it exists to produce: what share of the inner relation lands in
-// the bucket an average outer probe walks. take2 P2-11.
+// estimateHashBucketSize is `estimate_hash_bucket_stats` (selfuncs.c:4060)
+// reduced to the fraction it exists to produce: what share of the inner
+// relation lands in the bucket an average outer probe walks. take2 P2-11.
 //
-// PG's full function also returns the inner key's MCV frequency and folds it in;
-// goopg returns the ndistinct-derived fraction only, and that limit is recorded
-// rather than hidden — the MCV half needs the inner key's MCV list at the cost
-// site, which is a second plumbing step.
+// B-16 (P2-11b) landed the MCV half: the 1/ndistinct fraction is scaled up by
+// the most-common-value frequency over the average frequency, clamped to
+// [1e-6, 1], and a default-ndistinct key reports Max(0.1, mcv_freq) instead of
+// being skipped.
+//
+// SCOPE: the 1/nbuckets arm is OUT. PG starts from 1/nbuckets when ndistinct
+// exceeds the executor's bucket count and only then falls to 1/ndistinct;
+// nbuckets is a build-geometry input that would have to be widened through
+// `addHashJoinPath`'s signature to reach this site. Without it a
+// highly-distinct key prices CHEAPER than upstream (1/nd < 1/nbuckets when
+// nd > nbuckets).
 //
 // The point of the term is the one thing goopg's hash cost could not see: a
 // hash join keyed on a LOW-ndistinct column has long buckets, so every probe
@@ -498,13 +511,51 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 		if v.stats == nil && !v.isBool {
 			continue
 		}
+		// `mcv_freq`: the first MCV entry is the most common value
+		// (ColumnStats.MCV is stored Frequency-desc, catalog.go:1809).
+		mcvFreq := 0.0
+		if v.stats != nil && len(v.stats.MCV) > 0 {
+			mcvFreq = v.stats.MCV[0].Frequency
+		}
 		nd, isDefault := getVariableNumDistinct(v)
 		if isDefault || nd <= 0 {
-			// A guessed ndistinct is exactly the input that must not steer a
-			// cost term; PG's own caller checks `isdefault` for the same reason.
+			// PG's isdefault arm: Max(0.1, mcv_freq). An explicit decision,
+			// not an oversight: the old code SKIPPED a default-ndistinct
+			// clause so a guess could never steer the cost, but upstream
+			// deliberately steers here — 0.1 discourages hashing a large
+			// unknown inner, while a known-hot MCV steers harder. As one
+			// smallest-wins candidate it can only lose to a measured
+			// selective key; an all-default key set reports PG's 0.1
+			// instead of "no information".
+			frac := math.Max(0.1, mcvFreq)
+			if best == 0 || frac < best {
+				best = frac
+			}
 			continue
 		}
+		nullFrac := 0.0
+		if v.stats != nil {
+			nullFrac = v.stats.NullFrac
+		}
+		// `avgfreq` is over the RAW relation (unscaled ndistinct) — PG
+		// computes it before the restriction-clause adjustment below.
+		avgFreq := (1.0 - nullFrac) / nd
+		// Restriction clauses are assumed to thin rows uniformly: scale the
+		// distinct count by filtered/raw. Skipped when either count is
+		// unknown (a zero `rows` is a hand-built context without filter
+		// info, not a truly empty relation).
+		if v.rows > 0 && v.tuples > 0 {
+			nd = clampRowEst(nd * v.rows / v.tuples)
+		}
 		frac := 1.0 / nd
+		if avgFreq > 0 && mcvFreq > avgFreq {
+			frac *= mcvFreq / avgFreq
+		}
+		if frac < 1e-6 {
+			frac = 1e-6
+		} else if frac > 1 {
+			frac = 1
+		}
 		if best == 0 || frac < best {
 			best = frac
 		}

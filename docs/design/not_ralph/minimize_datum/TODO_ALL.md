@@ -386,13 +386,13 @@ are EPICS — split into one-checkbox-per-commit items before starting
   `analysis/planner-refactor-take3/b15-deferred-20260905/` (README +
   clean batch.patch). Ledger `take3-B-15-blocked`.
   *design: take3 08 §5.2; gate: take3 09 §5 P2 + TOTAL arm.*
-- [ ] **B-16 P2-11b MCV-frequency half.** Plumb the inner key's MCV list to
-  the cost site for the skew term (`estimate_hash_bucket_stats`, clamp
-  [1e-6,1]); zero/isdefault fraction suppresses the term. Unblocks EX3-06
-  (Track E).
-  *design: take3 08 §5.3; gate: best-of-bundle discipline + TPC-DS
-  aggregate; plan-change attribution before believing per-query moves
-  (R7).*
+- [x] **B-16 P2-11b MCV-frequency half.** Landed 2026-09-05: MCV scale
+  (`mcv/avgfreq` iff hotter than average) + [1e-6,1] clamp +
+  default-ndistinct `Max(0.1,mcv)` decision; nbuckets cap explicitly
+  out (signature widening). Unblocks the E-02 cost half.
+  Gates: skewed/uniform/empty/clamp/isdefault/filtered-scaling pins;
+  optimizer suite; PP zero shape moves; TPC-H 24/24 MATCH.
+  Artifacts: `joinselectivity.go`, `joinselectivity_test.go`.
 - [ ] **B-17a `disabled_nodes` sort + material setters** (take3 02 §1.2).
   Makes the family A/B-able for later phases.
   *design: take3 08 §5.4; gate: GUC-effect test per newly-live GUC
