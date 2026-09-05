@@ -474,9 +474,12 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		RightKey: pairs[0].Right,
 		HashKeys: pairs,
 		schema:   in.merged,
-		// AvgVarBytes from the build-side relation's column stats; zero when
-		// none exist or all columns are fixed-width (M0128-P3.1).
-		AvgVarBytes: p.Children[1].Rel.AvgVarBytes,
+		// AvgVarBytes from the build-side column stats, summed over the
+		// columns `in.inner` actually EMITS — `joinInputsFor` has already
+		// narrowed it — not over the relation's full column list; zero when
+		// no statistics exist or every retained column is fixed-width
+		// (M0128-P3.1, re-summed per entrywidth.go).
+		AvgVarBytes: buildAvgVarBytes(p.Children[1], in.inner.Output()),
 		// Thread the search's filtered row estimates so the executor's hash
 		// sizing reads the same post-qual counts the planner costed (one scan,
 		// one estimate — M0128-P3.2 / 09 §3.23).

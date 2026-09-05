@@ -1069,11 +1069,24 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   2026-09-05: D-04's measurement fired 05 §6's "fix the model first" arm.**
   D-05 must not proceed as written. Ordered prerequisites now, ahead of the
   original A-06/E-14/A-05 list:
-  1. **Fix `avgVarBytes`** so the entry model matches measured retention
-     (194 vs 120 B/row on the Q9 witness). On that witness it alone halves
-     the batch count — which is the outcome D-05 was going to claim.
+  1. ~~**Fix `avgVarBytes`**~~ **DONE 2026-09-06, and it bought nothing.**
+     The entry now reads 120.0 against 120.2 measured (`entrywidth.go`;
+     `RelOptInfo.ColVarBytes` summed over the build's actual output schema,
+     erring HIGH by falling back to the whole-relation sum). **But `nbatch`
+     stays 4, refuting D-04's own prediction**: `nbatch` is NON-MONOTONE in
+     entry size, because a smaller entry buys more buckets and the bucket
+     array is charged too. Two batches need ≤111.8 B/row and two retained
+     Datums plus their slice header are already 120 — and D-04's "ideal
+     packed ~63 B/row" lands back on **4**, since the bucket array doubles
+     and takes back more than the rows gave up. Timing-neutral (−0.4%,
+     inside drift), values PASS, plans byte-identical, TPC-DS
+     PASS=95/CKMISMATCH=0. Artifact:
+     `analysis/minimize-datum/d05-entrywidth-20260906/README.md`.
   2. **Charge the hash table in the counter that drives growth**, not only
-     in the sizing: 506 MB of buckets against 296 MB of rows.
+     in the sizing: 506 MB of buckets against 296 MB of rows. **This is now
+     the ONLY remaining lever on the Q9 witness** — the non-monotone table
+     above shows a packed retention format makes Q9's batching WORSE, not
+     better, until `MapSlotBytes = 48` is addressed first.
   3. **Re-measure the premise.** The 5× width claim is 1.9× post-EX1, on
      ~14% of the join's peak. Whether that justifies ~900 LOC is a
      different question from the one the bundle was scoped against.
@@ -1400,6 +1413,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| D-05 prereq #1 | 2026-09-06 | (this commit) | entry model fixed 194 -> 120 B/row (was half-narrowed, half-full-width); **nbatch unchanged — D-04's claim refuted** | non-monotone: 2 batches need <=111.8 B/row; packed 63 B/row lands back on 4. The lever is MapSlotBytes, not the entry |
 | D-04 | 2026-09-05 | (this commit) | **STOP: batches 4->4 unchanged, time +6.8%, allocs +39%, retained bytes -14/-24%** | fires 05 section 6's "fix the model first" arm; premise found stale (5x width claim is 1.9x post-EX1) |
 | C-10d (measurement half) | 2026-09-05 | (this commit) | AST census: 89 boundaries / 41 of 99 TPC-DS; a full pull-up removes only 39% of the blocking ones | so C-11 must cross the boundary regardless; also found CTEs+views are two more routes to the same leaf |
 | C-10c | 2026-09-05 | (this commit) | Phase-4 OJ qual/target placement contract + 5 fixtures; 3 negative controls | found C-16 retires no arm (no reminder) and that goopg has no PlaceHolderVar equivalent |

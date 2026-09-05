@@ -591,6 +591,10 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// AvgVarBytes adds the same way: a concatenation of two
 		// schemas sums their variable-width payloads (M0128-P3.1).
 		joinrel.AvgVarBytes = rel1.AvgVarBytes + rel2.AvgVarBytes
+		// Its unsummed twin concatenates the same way; a name carried by
+		// both inputs (a self-join's aliases) keeps the WIDER width, so a
+		// collision over-states rather than under-states.
+		joinrel.ColVarBytes = unionColVarBytes(rel1.ColVarBytes, rel2.ColVarBytes)
 		// `joinrel->consider_startup = (root->tuple_fraction > 0)`
 		// (relnode.c:707) — the same query-wide fact every base rel copied in
 		// `buildInitialRels`, not something inherited from the inputs

@@ -318,6 +318,21 @@ type RelOptInfo struct {
 	// M0128-P3.1.
 	AvgVarBytes float64
 
+	// ColVarBytes is the same statistic BEFORE it is summed: column name →
+	// that column's ColumnStats.AvgWidth. It exists because AvgVarBytes is
+	// the whole relation's payload while a hash join's build side retains
+	// only the columns `narrowBuildInput` keeps (narrowoutput.go), so the
+	// two disagree by every dropped column's width — on TPC-H Q9's `orders`
+	// build, 74 B/row of a 194 B/row modelled entry against 120 B/row
+	// measured. `buildAvgVarBytes` (createplanjoin.go) re-sums this over the
+	// schema the build actually emits. nil means "no per-column statistics":
+	// callers fall back to AvgVarBytes, which OVER-states rather than
+	// under-states the entry.
+	//
+	// Set alongside AvgVarBytes by the same two constructors; a join rel's
+	// map is the union of its inputs'.
+	ColVarBytes map[string]float64
+
 	Pathlist        []*Path
 	PartialPathlist []*Path
 

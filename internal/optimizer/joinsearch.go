@@ -387,6 +387,9 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 				sum += cs.AvgWidth
 			}
 			rel.AvgVarBytes = sum
+			// The same widths unsummed, for the build-side narrowing
+			// (see RelOptInfo.ColVarBytes).
+			rel.ColVarBytes = tableColVarBytes(ri.table)
 		}
 		// `rel->consider_startup = (root->tuple_fraction > 0)`
 		// (relnode.c:211): a fast start is worth keeping paths for exactly when
