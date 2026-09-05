@@ -2,7 +2,11 @@
 
 goopg is a from-scratch Go reimplementation of PostgreSQL. Vanilla-PG
 compatibility is absolute; the read-only oracle is PG 18.3 under `./postgres/`
-(never modify it). Build/run/test details: `.ralph/AGENT.md`.
+(never modify it). Build/run/test details: `AGENT.md`.
+
+Also read `AGENT.md` alongside this file before working in the repository — it
+holds the build/run/test procedures and the loop's completion-and-deferral
+discipline.
 
 ## Benchmark clusters (TPC-H / TPC-DS)
 
