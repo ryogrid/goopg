@@ -1367,9 +1367,36 @@ per arm; values never counts for projection/join-adjacent changes).*
   overlaps `seqScanOp`'s prefilter — applies unchanged to workers.
   Resume only if E-04 is ever resumed and clears its own gate on a witness
   shape. Ledger `take3-E-08-dropped`.
-- [ ] **E-09 EX5-02 shared build hardening.** Barrier discipline for
-  build/probe phases, cooperative-stall measurement under skew,
-  worker-count scaling on Q9-class shapes.
+- [ ] **E-09 EX5-02 shared build hardening — SPLIT 2026-09-06** into the
+  three slices below after a static feasibility analysis of the spilling
+  case (ledger `take3-D-04-private-worker-builds`: on Q9 all five Gather
+  participants build the whole 1.5 M-row `orders` table privately, a 5×
+  multiplier that dwarfs everything the minimize-datum bundle proposes on
+  the same query). Design:
+  `docs/design/executor-e09a-shared-spilling-build/DESIGN.md`.
+- [ ] **E-09a Publish a SPILLING shared build (Variant A, private
+  reload).** `captureSharedBuild` carries an immutable batch descriptor
+  (`nbatch`, `bucketBits`, `nbuckets`, `buildIsLeft`, read-only inner
+  files 1..n-1); growth frozen after prebuild (PG's own rule); each
+  participant gets a private `hashBatchState` and reloads batch k by
+  opening its OWN reader on the shared inner file into its own fresh map.
+  **No new synchronisation** — goopg partitions the probe by scan block,
+  so shared OUTER files and batch-level work distribution are not needed.
+  Does NOT depend on E-07. Must land BEFORE C-19f (whose price must
+  describe this executor) and before D-05 is re-measured.
+  *gate: forced-shape values tests per join type at batching work_mem +
+  poison-writer + exactly-once-open counters + -race + cancellation;
+  plans byte-identical; acceptance witness = Q9 workers show
+  `Seq Scan on orders loops=0`, one Build Time. ~250–470 LOC, HIGH risk
+  (silently partial join).*
+- [ ] **E-09b Load-once-per-batch (Variant B).** `sync.Once` per batch +
+  refcount + `ctx.Done()`-aware wait on the shared descriptor — PG's
+  `PHJ_BATCH_LOAD`/`FREE` analogue, and what removes the 5× MEMORY
+  multiplier (D-04's 506 MB live map). The first real cross-worker wait in
+  the executor; cancellation hazard under LIMIT-above-Gather. On top of A.
+  *gate: A's gate + a mandatory cancel-mid-batch test; ~150–200 LOC.*
+- [ ] **E-09c Cooperative-stall measurement under skew + worker-count
+  scaling on Q9-class shapes** — the original E-09 text, now third.
   *design: take3 13 §7; gate: scaling + skew A/B; Datum-safety tests;
   serial arm.*
 - [ ] **E-10 EX5-03 Gather/GatherMerge ordering + exchange.**
