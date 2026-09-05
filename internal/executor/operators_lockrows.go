@@ -768,14 +768,32 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// [0,len(filterCols)). For a non-key UPDATE the join key is preserved on the
 	// successor, so skipping its recheck is correct; key-column changes are still
 	// caught by the CTID-chain logic. M0118-0009 (docs/design/0118-0106).
-	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 &&
-		ix.plan.Key != nil && !exprRefsColumnOrOuter(ix.plan.Key) {
-		if idxPred := indexScanPredicate(ix.plan); idxPred != nil &&
-			filterPredMaxColRef(idxPred) < len(o.filterCols) {
-			if o.filterPred == nil {
-				o.filterPred = idxPred
-			} else {
-				o.filterPred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: o.filterPred, Right: idxPred}
+	// The foldable probe keys: the single Key, or one per SAOP descent
+	// (B-14 — every element is a planner Const by gate, hence row-local
+	// unless the gate is ever widened, which the per-element check
+	// guards). Keys (composite) stays out, as before.
+	probeRowLocal := false
+	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 {
+		switch {
+		case ix.plan.Key != nil:
+			probeRowLocal = !exprRefsColumnOrOuter(ix.plan.Key)
+		case len(ix.plan.SAOPKeys) > 0:
+			probeRowLocal = true
+			for _, k := range ix.plan.SAOPKeys {
+				if exprRefsColumnOrOuter(k) {
+					probeRowLocal = false
+					break
+				}
+			}
+		}
+		if probeRowLocal {
+			if idxPred := indexScanPredicate(ix.plan); idxPred != nil &&
+				filterPredMaxColRef(idxPred) < len(o.filterCols) {
+				if o.filterPred == nil {
+					o.filterPred = idxPred
+				} else {
+					o.filterPred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: o.filterPred, Right: idxPred}
+				}
 			}
 		}
 	}

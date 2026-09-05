@@ -7,18 +7,21 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// TestInListSeqScanCorrectness — M0053-0003 scope-reduction baseline.
+// TestInListSAOPIndexScan — B-14 (P2-09a) baseline update of the M0053-0003
+// pin (TestInListSeqScanCorrectness).
 //
-// IN-list with all-constant values currently goes through SeqScan
-// (no OR-of-IndexScan plan node yet). This test pins the expected
-// SeqScan behaviour so a future M0054 OR-IndexScan implementation
-// is recognized as a deliberate plan-shape change rather than a
-// regression.
+// M0053-0003 recorded that an IN-list with all-constant values went through
+// SeqScan (no OR-of-IndexScan rule yet). B-14 lands the ScalarArrayOp index
+// path — `match_saopclause_to_indexcol` (indxpath.c:3136) at the pipeline's
+// coordinates (trySAOPIndexScan) with multi-descent evaluation in the
+// executor — so the same shape now probes the index, one descent per
+// element. This test pins the NEW baseline: the plan-shape change from
+// SeqScan to IndexScan is deliberate, not a regression.
 //
 // TPC-H Q12 uses `l_shipmode IN ('MAIL', 'SHIP')` but HammerDB does
-// not index l_shipmode, so this gap does not affect M0053-0006
-// run-011 results.
-func TestInListSeqScanCorrectness(t *testing.T) {
+// not index l_shipmode, so this path does not fire for Q12 on the bench
+// schema (the unmoved-shape pins live in saop_index_test.go).
+func TestInListSAOPIndexScan(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
 		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
@@ -37,10 +40,12 @@ func TestInListSeqScanCorrectness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	// Currently the planner routes IN-list to SeqScan (no OR-IndexScan
-	// rule yet). Future M0054 may change this; update the assertion
-	// when that lands.
-	if planContainsIndexScan(node) {
-		t.Fatalf("M0053-0003 baseline: IN-list should currently use SeqScan, got plan with IndexScan")
+	// B-14: the IN-list now probes the index instead of seq-scanning.
+	scan := findIndexScan(node)
+	if scan == nil {
+		t.Fatalf("B-14 baseline: IN-list over an indexed column should use IndexScan, got plan without one")
+	}
+	if len(scan.SAOPKeys) != 2 {
+		t.Fatalf("IndexScan.SAOPKeys has %d elements, want 2 (one descent per IN element)", len(scan.SAOPKeys))
 	}
 }

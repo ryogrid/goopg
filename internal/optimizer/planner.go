@@ -9660,6 +9660,14 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 			}
 		}
 	}
+	// B-14 (P2-09a): ScalarArrayOp (`col IN (consts)`, `col = ANY (...)`) —
+	// PG's `match_saopclause_to_indexcol` shape (indxpath.c:3136) at the
+	// pipeline's coordinates. Handled before the equality arm because an
+	// IN-list is not a BinaryOp and would otherwise fall into the range
+	// path, which declines it back to a SeqScan.
+	if ix, isIn := where.(*parser.InExpr); isIn {
+		return trySAOPIndexScan(ix, tbl, ctx, cat)
+	}
 	b, ok := where.(*parser.BinaryOp)
 	if !ok || b.Op != parser.OpEq {
 		// Not an equality predicate — try range index scan.
@@ -9803,6 +9811,117 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 		RTID:       ctx.bindings[0].rtid,
 		Index:      idx,
 		Key:        resolvedKey,
+		schema:     ctx.schema,
+		SmallDim:   smallDimensionTag(cat, tbl),
+		UniqueKeys: uniqueKeyColumnSets(cat, tbl),
+	}, true, nil
+}
+
+// isSAOPProbeElement reports whether e is a pseudo-constant ScalarArrayOp
+// element goopg can bind as one descent of an index probe. This is
+// `match_saopclause_to_indexcol`'s rightop gate
+// (postgres/src/backend/optimizer/path/indxpath.c:3136: pseudo-constant
+// array, no Vars of the indexed rel, no volatile functions): `isConstantPlanExpr`
+// accepts exactly the row-independent, non-volatile shapes (literals, NULL,
+// and const-foldable wrappers like a cast of a literal — a volatile call
+// such as `random()` is not in its list, so it declines), and a top-level
+// ParamRef joins them (a bind value is constant per execution, as the
+// `col = const` arm already treats it). Columns, outer refs, subqueries and
+// array constructors all decline.
+//
+// Deliberately composed rather than a new hand-written type switch (the
+// RC-1a census in exprwalk_inventory_test.go pins every new one): the gate
+// is a superset of the `=` arm's leaf set (const expressions like `1+2`
+// probe fine — they evaluate once per Rescan), never a subset, so nothing
+// the sibling accepts is refused here.
+func isSAOPProbeElement(e Expr) bool {
+	if isConstantPlanExpr(e) {
+		return true
+	}
+	_, ok := e.(*ParamRef)
+	return ok
+}
+
+// trySAOPIndexScan builds a bare multi-descent `*IndexScan` for a
+// single-table `col = ANY (consts)` / `col IN (consts)` WHERE — the
+// pipeline's `match_saopclause_to_indexcol`
+// (postgres/src/backend/optimizer/path/indxpath.c:3136) arm.
+//
+// The gates reproduce the oracle's, in pipeline coordinates:
+//
+//   - useOr-only: `NOT IN` is ALL-of-`!=`, `!= ANY` is OR-of-`!=`, and ALL is
+//     AND — none is a union of equality descents, so all decline. Only ANY
+//     (OR) of equality remains, which is also what the opfamily gate says:
+//     AnyOp must be unset (plain IN) or `=`; every other operator (`< ANY`,
+//     `~ ANY`, …) is not a btree equality probe.
+//   - left indexkey: the operand must be a bare `*ColumnRef` resolving to
+//     this table's column. An expression (`substr(...) IN (...)`) has no
+//     single index column to descend (goopg has no expression indexes —
+//     see indexableJoinClausesFor), so it declines.
+//   - const array: no subquery (that is the semi-join/unnest path, not a
+//     probe), non-empty, every element a probe Const per isSAOPProbeElement.
+//     Per-element enum wrapping mirrors the equality arm (M0097-0022).
+//   - opfamily: `findBTreeIndexForColumn` admits only btree indexes leading
+//     with the column, which is the equality-opfamily membership this path
+//     can express. Partial indexes are never taken (nil queryClause):
+//     proving `col = ANY (...)` against a partial predicate is P2-09b's
+//     prover work, and an unproven partial probe silently drops rows.
+//
+// A bare scan is returned with no Filter — each descent is an exact equality
+// probe, so the probe implements the qual fully (same drop the equality arm
+// performs). Only a bare IN is matched: `IN AND ...` stays on the SeqScan
+// path, the same single-conjunct limit the equality arm has.
+func trySAOPIndexScan(ix *parser.InExpr, tbl *catalog.Table, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	if ix == nil || ix.Subquery != nil || len(ix.List) == 0 {
+		return nil, false, nil
+	}
+	if ix.Negated || ix.NotEqualAny || ix.AllOp {
+		return nil, false, nil
+	}
+	if ix.AnyOp != parser.OpUnknown && ix.AnyOp != parser.OpEq {
+		return nil, false, nil
+	}
+	operand, ok := ix.Operand.(*parser.ColumnRef)
+	if !ok {
+		return nil, false, nil
+	}
+	resolvedCol, err := resolveColumnRef(operand, ctx)
+	if err != nil {
+		return nil, false, nil
+	}
+	col, ok := resolvedCol.(*ColumnRef)
+	if !ok {
+		return nil, false, nil
+	}
+	keys := make([]Expr, 0, len(ix.List))
+	for _, e := range ix.List {
+		rk, err := resolveExpr(e, ctx)
+		if err != nil {
+			return nil, false, nil
+		}
+		if !isSAOPProbeElement(rk) {
+			return nil, false, nil
+		}
+		if _, isStr := rk.(*StringConst); isStr {
+			if col2 := inMemoryCat(cat); col2 != nil {
+				if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
+					rk = &CastExpr{pos: e.Pos(), Operand: rk, TargetType: col.Type.Name}
+				}
+			}
+		}
+		keys = append(keys, rk)
+	}
+	idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil)
+	if idx == nil {
+		return nil, false, nil
+	}
+	return &IndexScan{
+		pos:        ix.Pos(),
+		Table:      tbl,
+		Alias:      ctx.alias,
+		RTID:       ctx.bindings[0].rtid,
+		Index:      idx,
+		SAOPKeys:   keys,
 		schema:     ctx.schema,
 		SmallDim:   smallDimensionTag(cat, tbl),
 		UniqueKeys: uniqueKeyColumnSets(cat, tbl),
@@ -15089,6 +15208,14 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	}
 	idxScan, ok := child.(*IndexScan)
 	if !ok {
+		return proj
+	}
+	// B-14 (P2-09a): a SAOP probe is never promoted. IndexOnlyScan carries
+	// no SAOPKeys and its operator has no multi-descent, so promotion would
+	// silently widen the probe to a full index scan — right rows only while
+	// a Filter above re-checks, and there is none (the probe consumed the
+	// qual). Declining forgoes the optimisation for this shape, safe.
+	if len(idxScan.SAOPKeys) > 0 {
 		return proj
 	}
 	// M0134-0001 S4 (class 8): an EXCLUSIVE bound used to block promotion,

@@ -781,6 +781,21 @@ type IndexScan struct {
 	// priority over Key. len(Keys) == len(Index.Columns) means a full equality
 	// probe (no suffix padding); a shorter prefix is rejected by the planner
 	// to keep the executor probe path purely equality-shaped.
+	// SAOPKeys holds one probe expression per element of a ScalarArrayOp
+	// (`col = ANY (consts)`, i.e. `col IN (consts)`) over the index's LEADING
+	// column — PG's `match_saopclause_to_indexcol` shape
+	// (postgres/src/backend/optimizer/path/indxpath.c:3136): useOr-only
+	// (ANY, never ALL/NOT IN), bare index column on the left, all-constant
+	// array on the right, equality in the index opfamily. The executor
+	// performs one point descent per element and unions the tids
+	// (B-14/P2-09a). Exactly one probe shape is ever set on a node
+	// (Key, Keys, LowKey/HighKey, or SAOPKeys); the executor checks SAOPKeys
+	// first. A node carrying SAOPKeys is never promoted to IndexOnlyScan
+	// (tryPromoteIndexOnlyScan declines: the IOS operator has no
+	// multi-descent) and DML falls back to its SeqScan+predicate path
+	// (updateViaIndex requires Key; indexScanPredicate rebuilds the IN
+	// qual for the fallback).
+	SAOPKeys []Expr
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
 	// LowOp / HighOp preserve the ORIGINAL comparison operator in its canonical

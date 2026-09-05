@@ -396,12 +396,20 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// decision is finalised by ssiRecordIndexScanGapLock once o.tids is known
 	// (after RangeScan, or on the unbound/NULL-key early returns).
 	isFullKeyProbe := len(o.plan.Index.Columns) == 1 &&
-		(o.plan.Key != nil || len(o.plan.Keys) > 0)
+		(o.plan.Key != nil || len(o.plan.Keys) > 0 || len(o.plan.SAOPKeys) > 0)
 	// A hash index supports only single-column equality, so any full-key probe
 	// over a declared-hash index is a bucket probe (design 0118-0099). Mark it so
 	// the gap-lock and per-tuple-read paths use bucket-grain predicate locking.
 	o.hashBucketScan = isFullKeyProbe && o.plan.Index.DeclaredHash
 	o.hashProbeFingerprint = nil
+
+	// B-14 (P2-09a): ScalarArrayOp multi-descent (`col = ANY (consts)`).
+	// Exactly one probe shape is ever set on the node; SAOPKeys takes
+	// precedence here only as a structural first branch, never alongside
+	// another shape.
+	if len(o.plan.SAOPKeys) > 0 {
+		return o.rescanSAOP()
+	}
 
 	var loBytes, hiBytes []byte
 	if len(o.plan.Keys) > 0 {
@@ -512,6 +520,77 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 	}
 	o.ssiRecordIndexScanGapLock(isFullKeyProbe)
+	return nil
+}
+
+// rescanSAOP performs the ScalarArrayOp multi-descent probe
+// (`col = ANY (consts)` over the index's leading column): one point descent
+// per array element, with the matching TIDs unioned.
+//
+// Two semantics details, both mirroring the Filter(InExpr) path this probe
+// replaces:
+//
+//   - Duplicate elements (`IN (1,1,2)`) descend to the same leaf entries.
+//     The repeat is suppressed so each matching row is emitted once.
+//   - NULL elements match nothing (`col = NULL` is never true) and are
+//     skipped, while the remaining elements still probe: `x IN (1, NULL)`
+//     matches x=1 and excludes everything else, exactly like the filter.
+//
+// Per-descent bounds follow the single-Key branch: a leading-column probe
+// on a composite index pads the inclusive upper bound via
+// compositeUpperBound (M0053-0001). SSI mirrors it too: each descent takes
+// its bucket-grain SIREAD on a hash index, and the gap lock is finalised
+// over the unioned TID set.
+func (o *indexScanOp) rescanSAOP() error {
+	col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	if !ok {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
+	}
+	seen := make(map[storage.ItemPointer]struct{}, len(o.plan.SAOPKeys))
+	scanFn := func(_ []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
+		if _, dup := seen[ptr]; dup {
+			return true, nil
+		}
+		seen[ptr] = struct{}{}
+		o.tids = append(o.tids, ptr)
+		o.poss = append(o.poss, pos) // C3-S2: kill-list coordinates
+		return true, nil
+	}
+	hashRecorded := false
+	for _, ke := range o.plan.SAOPKeys {
+		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
+		if err != nil {
+			return err
+		}
+		if v.IsNull() {
+			continue
+		}
+		parts := []indexProbeKeyPart{{col: col, val: v, pos: ke.Pos()}}
+		key, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+		if encErr != nil {
+			return encErr
+		}
+		o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
+		hiBytes := key
+		if len(o.plan.Index.Columns) > 1 {
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
+		}
+		if o.hashBucketScan && len(o.hashProbeFingerprint) > 0 {
+			ssiRecordHashBucketRead(o.ctx, o.heapRel.DBOid, o.plan.Index.OID, o.hashProbeFingerprint)
+			hashRecorded = true
+		}
+		if err := o.tree.RangeScanWithPos(key, hiBytes, false, false, scanFn); err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+	}
+	if o.hashBucketScan && !hashRecorded {
+		// No fingerprint (a key part this encoder cannot render, or every
+		// element NULL): fall back to the relation-grain gap lock rather
+		// than silently holding no predicate lock at all — mirrors the
+		// single-key tail in Rescan.
+		o.hashBucketScan = false
+	}
+	o.ssiRecordIndexScanGapLock(len(o.plan.Index.Columns) == 1)
 	return nil
 }
 
@@ -662,8 +741,14 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 				}
 			}
 		}
-		if needsDetoast(row) {
-			detoasted, err := DetoastRow(o.ctx, o.heapRel, o.plan.Table.Columns, row)
+	// EX1-03a: bound-narrowed detoast over the same survivor window
+	// the EX1-02b deform above narrowed to — only i < survivorBound is
+	// resolved. Prefix-scoped needsDetoastPrefix pairing is load-bearing:
+	// the undeformed tail still holds the previous tuple's datums (or
+	// poison when armed), so whole-row needsDetoast here could
+	// false-positive on a stale tail pointer and skip a LIVE tuple.
+	if needsDetoastPrefix(row, survivorBound) {
+		detoasted, err := DetoastRowBound(o.ctx, o.heapRel, o.plan.Table.Columns, row, survivorBound)
 			if err != nil {
 				// Skip undetoastable tuple, try the next TID.
 				continue

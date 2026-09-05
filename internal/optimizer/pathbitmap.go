@@ -244,6 +244,16 @@ func flattenExprAnd(expr Expr) []Expr {
 // predicates and disjunctions remain as recheck / residual quals and do
 // not contribute selectivity reduction on the index side.
 //
+// ScalarArrayOp (`col IN (consts)`) is deliberately NOT matched here,
+// though PG wires `match_saopclause_to_indexcol` into its bitmap build too
+// (indxpath.c:3136). The bitmap carrier end-to-end is single-key per column
+// (indexPathClause.key → BitmapIndexScan.Key/Keys → single-descent probe),
+// while SAOP needs a multi-key carrier at every layer; the SAOP probe
+// therefore lives on IndexScan.SAOPKeys (trySAOPIndexScan, planner.go) with
+// multi-descent in indexScanOp. The cost side is already shared —
+// costBitmapIndexScan reads btreeIndexAMCost, which charges num_sa_scans —
+// so a future bitmap SAOP arm prices identically to the plain one (P2-09b).
+//
 // id is the scanIdentity extracted from the leaf (via scanLeafFor); its
 // table provides the column-name→position mapping.
 func matchBitmapIndexQuals(

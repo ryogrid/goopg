@@ -351,7 +351,8 @@ are EPICS — split into one-checkbox-per-commit items before starting
   contexts); `planSelectWithParent` zero-guard (pre-P2-01 literals
   fold to defaults); DML-CTE passes explicit defaults.
   Gates: 22+7 subtests (pre-fix FAIL via stash); PP zero drift;
-  TPC-H 24/24 MATCH. Artifacts: `planner.go`, `with.go`,
+  TPC-H 24/24 MATCH; TPC-DS PASS=95 MISMATCH=0.
+  Artifacts: `planner.go`, `with.go`,
   `settings_propagation_test.go`. Unstamped hosts (HAVING/VALUES/
   ORDER BY/CTE bodies, INSERT…SELECT, ON CONFLICT, DML derived
   tables) stay default — future slices.
@@ -362,11 +363,18 @@ are EPICS — split into one-checkbox-per-commit items before starting
   EX3-03 threading (model misranks merge above hash), NOT P5, NOT
   B-01b/c remainder. Three lines verified unflipped. Ledger
   `take3-B-13-deferred` (re-probe trigger inline).
-- [ ] **B-14 P2-09a ScalarArrayOp index path.** `num_sa_scans` needs the
-  missing *path*: build index `= ANY` descents + `ceil(pages/3)` clamp.
-  Gate on path existence/shape on IN-list fixtures.
-  *design: take3 08 §5.2; gate: take3 09 §5 P2 (PP shape on IN-list
-  fixtures).*
+- [x] **B-14 P2-09a ScalarArrayOp index path.** Landed 2026-09-05:
+  InExpr→clause arm (useOr-only, left indexkey, const array, opfamily)
+  in the rule-based producers + post-search rewrite; `IndexScan.SAOPKeys`
+  one probe per element; cost `numSAScans` + ceil(pages/3) clamp +
+  descent×scans; executor multi-descent (per-element descent, TID union
+  dedupe, NULL skip, gap lock); `tryPromoteIndexOnlyScan` declines SAOP;
+  bitmap deliberately not extended (single-key carrier).
+  Gates: Q45-shape unit proof + unmoved pins (NOT IN/ALL/expr/subquery/
+  unindexed stay SeqScan); TPC-H 24/24 MATCH, PP zero drift (no movable
+  shape in-suite); live Q45 SubPlan 1 → `Index Scan using item_pkey on
+  item_1` with `= ANY` cond, outer expression-ANY stays Filter.
+  Artifacts: planner/cost/executor probe + `saop_index_test.go` ×2.
 - [ ] **B-15 P2-09b `btcostestimate` batch.** Land the remainder whole
   (descent present; the reverted per-tuple qual cost rejoins here), with
   acceptance on the **aggregate sweep TOTAL**, not the per-query gate

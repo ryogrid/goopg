@@ -95,6 +95,19 @@ type indexScanInputs struct {
 	// costing a plain index scan as before.
 	indexOnly  bool
 	allVisFrac float64
+
+	// numSAScans is PG's `num_sa_scans`: the number of index descents a
+	// ScalarArrayOp (`col = ANY (consts)`) scan performs — the product of
+	// the array lengths over the scan's SAOP quals (`genericcostestimate`,
+	// postgres/src/backend/utils/adt/selfuncs.c:7086-7103: multiply by
+	// each array's `estimate_array_length` when > 1, min 1). 0 (unset) or
+	// 1 means a single descent and reproduces the pre-existing cost
+	// exactly. The producer contract is that value; the clamp and the
+	// descent charge below are this function's. P2-09b owns the
+	// search-side SAOP producer that will set this above 1; until then it
+	// is exercised by unit tests (the pipeline SAOP arm is rule-based,
+	// like its `col = const` sibling, and prices nothing).
+	numSAScans float64
 }
 
 // costIndexScan is `cost_index` (costsize.c:520) for a single, non-parallel,
@@ -223,9 +236,26 @@ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64
 	// it is paid before the first tuple emerges, which is what makes an
 	// ordered index path's startup cost non-zero and therefore comparable
 	// against a sort's.
+	//
+	// With SAOP quals the descent is charged once per estimated descent
+	// (`btcostestimate`, selfuncs.c:7762-7782): once to startup, num_sa_scans
+	// times to total. The count itself is clamped to at most a third of the
+	// index's pages (:7718-7719: descents cannot exceed leaf pages, with
+	// headroom for the btree's leaf-level continuation) and at least 1.
+	// numSAScans <= 1 reproduces the pre-existing single-descent charge
+	// exactly. P2-09b's remainder (the numIndexTuples/rint adjustment and
+	// the log2(N) descent term) stays out.
+	numSA := in.numSAScans
+	if numSA < 1 {
+		numSA = 1
+	}
+	if numSA > 1 {
+		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
+		numSA = math.Max(numSA, 1)
+	}
 	descent := float64(in.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
 	startup = descent
-	total += descent
+	total += numSA * descent
 	return startup, total
 }
 

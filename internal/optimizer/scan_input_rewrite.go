@@ -120,15 +120,19 @@ type scanColumnKey struct {
 }
 
 // scanBounds is the per-(scan, column) accumulator: equality key (if
-// any) plus inclusive low/high bounds (if any). The equality wins
-// over range when both are present (`Key` excludes `LowKey`/`HighKey`
-// per `IndexScan` semantics in `internal/planner/plan.go`).
+// any), SAOP key list (if any), plus inclusive low/high bounds (if any).
+// The equality wins over SAOP wins over range when several are present
+// (`Key` excludes `LowKey`/`HighKey` per `IndexScan` semantics in
+// `internal/planner/plan.go`; SAOPKeys likewise excludes the rest —
+// exactly one probe shape is ever set on the node).
 type scanBounds struct {
-	eqKey      Expr // when set: IndexScan.Key
-	loKey      Expr // when set: IndexScan.LowKey
-	hiKey      Expr // when set: IndexScan.HighKey
-	eqConjunct Expr // the original conjunct that supplied eqKey
-	parent     scanParentRef
+	eqKey        Expr   // when set: IndexScan.Key
+	saopKeys     []Expr // when set (and eqKey unset): IndexScan.SAOPKeys
+	loKey        Expr   // when set: IndexScan.LowKey
+	hiKey        Expr   // when set: IndexScan.HighKey
+	eqConjunct   Expr   // the original conjunct that supplied eqKey
+	saopConjunct Expr   // the original conjunct that supplied saopKeys
+	parent       scanParentRef
 }
 
 // absorbConjunctsIntoSubtree walks the AND-tree of `pred`, groups
@@ -152,6 +156,31 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 	}
 	classifs := make([]classified, 0, len(conjs))
 	for _, c := range conjs {
+		// B-14 (P2-09a): ScalarArrayOp (`col IN (consts)`) classifies
+		// alongside equality — one multi-descent probe per (scan,
+		// column), same gates as the single-table arm
+		// (matchSingleTableSAOPPredicate).
+		if col, keys, ok := matchSingleTableSAOPPredicate(c); ok {
+			target, ref, ok := findUniqueSeqScanByColumn(parent.Child, col.Name, parent)
+			if !ok || target == nil {
+				classifs = append(classifs, classified{conj: c})
+				continue
+			}
+			k := scanColumnKey{scan: target, col: col.Name}
+			b, exists := groups[k]
+			if !exists {
+				b = &scanBounds{parent: ref}
+				groups[k] = b
+			}
+			if b.eqKey == nil && b.saopKeys == nil {
+				b.saopKeys = keys
+				b.saopConjunct = c
+			}
+			classifs = append(classifs, classified{
+				conj: c, key: k, matched: true,
+			})
+			continue
+		}
 		col, op, val, ok := matchSingleTableConstantPredicate(c)
 		if !ok {
 			classifs = append(classifs, classified{conj: c})
@@ -189,12 +218,25 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 	}
 
 	// Second pass: pick at most one group per SeqScan to rewrite
-	// (an IndexScan can only point at one index). Equality groups
-	// win over range groups; the first encountered wins ties.
+	// (an IndexScan can only point at one index). Equality ranks first,
+	// SAOP second, range last; the first encountered wins ties within a
+	// rank. The rank formulation is exactly the old boolean
+	// (equality-beats-range, first-wins-ties) with the SAOP middle
+	// inserted.
 	type scanChoice struct {
-		key       scanColumnKey
-		bounds    *scanBounds
-		isEquality bool
+		key    scanColumnKey
+		bounds *scanBounds
+		rank   int
+	}
+	probeRank := func(b *scanBounds) int {
+		switch {
+		case b.eqKey != nil:
+			return 2
+		case b.saopKeys != nil:
+			return 1
+		default:
+			return 0
+		}
 	}
 	chosen := map[*SeqScan]scanChoice{}
 	for k, b := range groups {
@@ -203,30 +245,36 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 			continue
 		}
 		// Skip if no actionable bound was collected.
-		if b.eqKey == nil && b.loKey == nil && b.hiKey == nil {
+		if b.eqKey == nil && b.saopKeys == nil && b.loKey == nil && b.hiKey == nil {
 			continue
 		}
-		isEq := b.eqKey != nil
+		rank := probeRank(b)
 		prev, ok := chosen[k.scan]
-		if !ok || (isEq && !prev.isEquality) {
-			chosen[k.scan] = scanChoice{key: k, bounds: b, isEquality: isEq}
+		if !ok || rank > prev.rank {
+			chosen[k.scan] = scanChoice{key: k, bounds: b, rank: rank}
 		}
 	}
 
 	// Apply chosen rewrites + remember which conjuncts to drop.
-	dropEqConjuncts := make(map[Expr]struct{})
+	dropConjuncts := make(map[Expr]struct{})
 	for ss, ch := range chosen {
 		idx := findBTreeIndexForColumn(cat, ss.Table, ch.key.col, nil)
 		if idx == nil {
 			continue
 		}
 		var newScan *IndexScan
-		if ch.isEquality {
+		switch {
+		case ch.bounds.eqKey != nil:
 			newScan = &IndexScan{
 				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, RTID: ss.RTID, Index: idx,
 				Key: ch.bounds.eqKey, schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,
 			}
-		} else {
+		case ch.bounds.saopKeys != nil:
+			newScan = &IndexScan{
+				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, RTID: ss.RTID, Index: idx,
+				SAOPKeys: ch.bounds.saopKeys, schema: ss.Output(), SmallDim: ss.SmallDim, UniqueKeys: ss.UniqueKeys,
+			}
+		default:
 			newScan = &IndexScan{
 				pos: ss.Pos(), Table: ss.Table, Alias: ss.Alias, RTID: ss.RTID, Index: idx,
 				LowKey: ch.bounds.loKey, HighKey: ch.bounds.hiKey,
@@ -236,18 +284,22 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 		if !replaceNodeAtParentSlot(ch.bounds.parent, ss, newScan) {
 			continue
 		}
-		// Equality conjuncts get dropped (single-column IndexScan
-		// exact-equality probe). Range conjuncts stay so the
-		// surrounding Filter handles strict-bound boundary cases.
-		if ch.isEquality && ch.bounds.eqConjunct != nil {
-			dropEqConjuncts[ch.bounds.eqConjunct] = struct{}{}
+		// Equality and SAOP conjuncts get dropped (exact probes: a
+		// point lookup, or one point lookup per array element). Range
+		// conjuncts stay so the surrounding Filter handles strict-bound
+		// boundary cases.
+		if ch.bounds.eqConjunct != nil && ch.bounds.eqKey != nil {
+			dropConjuncts[ch.bounds.eqConjunct] = struct{}{}
+		}
+		if ch.bounds.saopConjunct != nil && ch.bounds.saopKeys != nil {
+			dropConjuncts[ch.bounds.saopConjunct] = struct{}{}
 		}
 	}
 
-	// Rebuild the predicate, dropping absorbed equality conjuncts.
+	// Rebuild the predicate, dropping absorbed equality/SAOP conjuncts.
 	kept := conjs[:0]
 	for _, c := range conjs {
-		if _, drop := dropEqConjuncts[c]; drop {
+		if _, drop := dropConjuncts[c]; drop {
 			continue
 		}
 		kept = append(kept, c)
@@ -308,6 +360,41 @@ func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, parser.OpCode, Expr,
 		canonOp = flipRangeOpForRewrite(canonOp)
 	}
 	return col, canonOp, key, true
+}
+
+// matchSingleTableSAOPPredicate recognises one shape:
+//
+//   col IN (const, ...)   // including the `col = ANY (...)` spelling —
+//                         // the parser represents both as InExpr
+//
+// and returns the column plus the probe element list. The gates are the
+// resolved-level half of trySAOPIndexScan (planner.go): useOr-only
+// (!Negated, !NotEqualAny, !AllOp), equality opfamily (AnyOp unset or `=`),
+// no subquery (that is the semi-join path), non-empty, bare ColumnRef
+// operand, every element a probe Const per isSAOPProbeElement (which
+// excludes columns, outer refs and subqueries by construction —
+// match_saopclause_to_indexcol's rightop gate, indxpath.c:3136).
+func matchSingleTableSAOPPredicate(f Expr) (*ColumnRef, []Expr, bool) {
+	ix, ok := f.(*InExpr)
+	if !ok || ix.Plan != nil || len(ix.List) == 0 {
+		return nil, nil, false
+	}
+	if ix.Negated || ix.NotEqualAny || ix.AllOp {
+		return nil, nil, false
+	}
+	if ix.AnyOp != parser.OpUnknown && ix.AnyOp != parser.OpEq {
+		return nil, nil, false
+	}
+	col, ok := ix.Operand.(*ColumnRef)
+	if !ok {
+		return nil, nil, false
+	}
+	for _, e := range ix.List {
+		if !isSAOPProbeElement(e) {
+			return nil, nil, false
+		}
+	}
+	return col, ix.List, true
 }
 
 // flipRangeOpForRewrite flips the comparison so the column is
