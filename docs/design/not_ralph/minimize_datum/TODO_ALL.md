@@ -432,12 +432,14 @@ are EPICS — split into one-checkbox-per-commit items before starting
   impl/P2-A-planner-context.md:165-182, take3 04 §1 row 168, 09 §5 P2);
   gate: `SET random_page_cost` separates cached plans + third-execution
   hit, float-exactness, per-field coverage; postmaster suite green.*
-- [ ] **B-18 commits 2-4 (one variable each): GUC-effect fixtures** for
-  `random_page_cost` + `cpu_index_tuple_cost` + `effective_cache_size`
-  (index shape; one fixture may cover all three) and
-  `parallel_setup_cost`/`parallel_tuple_cost` (Gather shape). Post-pass
-  `parallel_*` knobs need no fixture (safe by post-cache-pass design).
-  (file, don't claim).
+- [x] **B-18 commits 2-4: GUC-effect fixtures** (one variable each).
+  Landed 2026-09-05 in `internal/optimizer/cost_guc_effect_test.go`:
+  index shape pins `random_page_cost`, `cpu_index_tuple_cost`,
+  `effective_cache_size`; Gather shape pins `parallel_setup_cost`
+  (startup+total) vs `parallel_tuple_cost` (total only, startup pinned —
+  the discriminator). Post-pass `parallel_*` knobs need no fixture.
+  Gates: B-17+B-18 default traffic — TPC-H 24/24 MATCH, TPC-DS SF0.5
+  sweep PASS=95 MISMATCH=0; optimizer + postmaster suites green.
 
 ---
 
