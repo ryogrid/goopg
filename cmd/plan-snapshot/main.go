@@ -64,6 +64,53 @@ import (
 
 const snapshotDir = "plan_snapshots"
 
+const warmStatsFlagDoc = "ANALYZE every TPC-H table before capturing/diffing, " +
+	"so capture and diff read the same statistics state regardless of what " +
+	"the server did earlier (pin the sample with GOOPG_ANALYZE_SEED)"
+
+// warmStats re-ANALYZEs the TPC-H tables before the EXPLAIN loop.
+//
+// Why a capture harness runs a write statement: goopg's ANALYZE updates the
+// PERSISTED statistics, so what a plan capture sees depends on whether anyone
+// ANALYZEd this data directory earlier. Measured 2026-09-05: a baseline
+// captured on an untouched server and a diff taken after
+// `estimate-audit -warm-stats` (which every plan-parity capture runs, because
+// goopg statistics are per-connection) disagreed on 98 lines — Q1 and Q3
+// reported DIFFER for both arms of an A/B, i.e. for a difference no commit
+// caused. Normalising both sides here makes the pin a function of the code
+// instead of the server's history.
+//
+// Pair it with GOOPG_ANALYZE_SEED on the SERVER (bench/tpch/env_goopg.sh sets
+// it) or the sample is redrawn per run and the normalisation is worthless:
+// see docs/design/planner-gate-reproducibility/DESIGN.md.
+//
+// Failures are reported and ignored: a capture against a cluster where
+// ANALYZE is unavailable is still worth taking, it just carries the server's
+// existing statistics. Silence would be worse than either outcome.
+func warmStats(db *sql.DB, enabled bool, timeout time.Duration) {
+	if !enabled {
+		return
+	}
+	tables := tpch.Tables()
+	ctx, cancel := context.WithTimeout(context.Background(),
+		timeout*time.Duration(len(tables)+1))
+	defer cancel()
+	// One connection for the whole warm-up: goopg statistics are
+	// per-connection, so spreading the ANALYZEs over pool connections would
+	// leave each one holding a different subset.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warm-stats: conn: %v (continuing with existing statistics)\n", err)
+		return
+	}
+	defer conn.Close()
+	for _, t := range tables {
+		if _, err := conn.ExecContext(ctx, "ANALYZE "+t.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "warm-stats: ANALYZE %s: %v (continuing)\n", t.Name, err)
+		}
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -94,6 +141,7 @@ type captureFlags struct {
 	label   string
 	queries string
 	timeout time.Duration
+	warm    bool
 }
 
 func parseCaptureFlags(args []string) *captureFlags {
@@ -107,6 +155,7 @@ func parseCaptureFlags(args []string) *captureFlags {
 	fs.StringVar(&cf.label, "label", "", "baseline label (filename suffix)")
 	fs.StringVar(&cf.queries, "queries", "", "comma-or-range list (e.g. 1,3,5-9). empty = all 22")
 	fs.DurationVar(&cf.timeout, "timeout", 30*time.Second, "per-EXPLAIN timeout (planner+EXPLAIN render only; no execution)")
+	fs.BoolVar(&cf.warm, "warm-stats", true, warmStatsFlagDoc)
 	fs.Parse(args)
 	if cf.label == "" {
 		fmt.Fprintln(os.Stderr, "--label is required")
@@ -121,6 +170,7 @@ func runCapture(args []string) {
 	qs := selectQueries(cf.queries)
 	db := openDB(cf)
 	defer db.Close()
+	warmStats(db, cf.warm, cf.timeout)
 
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		fatal("mkdir %s: %v", snapshotDir, err)
@@ -207,6 +257,7 @@ type diffFlags struct {
 	queries string
 	mode    string
 	timeout time.Duration
+	warm    bool
 }
 
 func parseDiffFlags(args []string) *diffFlags {
@@ -221,6 +272,7 @@ func parseDiffFlags(args []string) *diffFlags {
 	fs.StringVar(&df.queries, "queries", "", "comma-or-range list (e.g. 1,3,5-9). empty = all in baseline")
 	fs.StringVar(&df.mode, "mode", "structural", "structural | strict-text | semantic-cost | costs")
 	fs.DurationVar(&df.timeout, "timeout", 30*time.Second, "per-EXPLAIN timeout")
+	fs.BoolVar(&df.warm, "warm-stats", true, warmStatsFlagDoc)
 	fs.Parse(args)
 	if df.label == "" {
 		fmt.Fprintln(os.Stderr, "--label is required")
@@ -250,6 +302,7 @@ func runDiff(args []string) {
 	}
 	db := openDB(cf)
 	defer db.Close()
+	warmStats(db, df.warm, df.timeout)
 
 	queries := tpch.Queries()
 	wantSet := map[string]bool{}

@@ -99,6 +99,17 @@ was 455). The plan pin now measures the commit.
 
 ## 5. Consequences to carry forward
 
+- **A third drift source, found while re-pinning: goopg's ANALYZE updates
+  the PERSISTED statistics.** So what a capture sees depends on whether
+  anyone ANALYZEd the data directory earlier — and every plan-parity capture
+  does, because `estimate-audit -warm-stats` is on by default. A baseline
+  taken on an untouched server and a diff taken after a capture disagreed on
+  98 lines, reporting Q1/Q3 DIFFER for BOTH arms of an A/B. Fixed by giving
+  `cmd/plan-snapshot` the same `-warm-stats` step (default on, one
+  connection because goopg statistics are per-connection), so capture and
+  diff normalise to the same state whatever the server did before. With the
+  seed pinned this converges: `make plan-gate` now passes 22/22 in
+  `MODE=costs` — cost-EXACT pinning — across a restart and a binary change.
 - **Existing baselines were captured under the old regime.** The plan-gate
   snapshots and the A-04 timing roll-up
   (`analysis/planner-refactor-take3/a04-baseline-20260905/`) predate the pin,
