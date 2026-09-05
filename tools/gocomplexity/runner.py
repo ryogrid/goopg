@@ -6,7 +6,10 @@ Both tools share the same one-line output format::
 
 where ``<function>`` is a single space-free token (a receiver like
 ``(*Context).Foo`` contains no spaces). We therefore split on whitespace with a
-maxsplit of 3 and split the trailing location on its last two colons.
+maxsplit of 3 and split the trailing location on colons. The ``:col`` field is
+occasionally absent: a ``//line`` directive (goyacc's ``//line yaccpar:1``
+skeleton) leaves ``Column == 0``, which ``token.Position.String()`` renders as
+``file:line``.
 """
 
 from __future__ import annotations
@@ -74,15 +77,21 @@ def parse_line(line: str) -> _RawRecord | None:
 
 
 def _split_location(location: str) -> tuple[str, int]:
-    """Split ``file:line:col`` into ``(file, line)`` from the right.
+    """Split ``file:line[:col]`` into ``(file, line)`` from the right.
 
-    File paths never contain a colon in this codebase, but splitting from the
-    right is robust regardless.
+    gocyclo/gocognit normally emit ``file:line:col``, but a ``//line`` directive
+    (goyacc's ``//line yaccpar:1`` skeleton) can leave the column zero, which
+    ``token.Position.String()`` renders as ``file:line`` with no trailing
+    column. File paths never contain a colon in this codebase, so we only need
+    to tolerate the missing third field.
     """
-    try:
-        file, line_s, _col = location.rsplit(":", 2)
-    except ValueError as exc:  # pragma: no cover - defensive
-        raise ValueError(f"unparseable location: {location!r}") from exc
+    parts = location.split(":")
+    if len(parts) == 2:
+        file, line_s = parts  # column omitted (Column == 0)
+    elif len(parts) == 3:
+        file, line_s, _col = parts
+    else:
+        raise ValueError(f"unparseable location: {location!r}")
     return file, int(line_s)
 
 
