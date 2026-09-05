@@ -128,7 +128,7 @@ class ParityDiffTest(unittest.TestCase):
     def test_self_test_passes(self):
         proc = run_tool("--self-test")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("15/15 passed", proc.stdout)
+        self.assertIn("17/17 passed", proc.stdout)
 
     def test_corpus_budget(self):
         """Pinned mismatch budget: any plan move fails here by design."""

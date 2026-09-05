@@ -148,7 +148,10 @@ SCAN_KINDS = (
     "Custom Scan",
     "Subquery Scan",
 )
-AGG_KINDS = ("Aggregate", "HashAggregate", "GroupAggregate")
+AGG_KINDS = ("Aggregate", "HashAggregate", "GroupAggregate", "MixedAggregate")
+# goopg renders grouping-sets aggregates as "HashAggregate (N keys, M grouping
+# sets)"; the suffix is a strategy attribute (kept in detail), not a kind.
+AGG_SUFFIX_RE = re.compile(r"^(%s) (\(\d+ keys, \d+ grouping sets\))$" % "|".join(AGG_KINDS))
 # Generous known-kind universe (PG EXPLAIN node types + goopg renderer arms).
 # Anything outside this set triggers an unknown-kind warning.
 KNOWN_KINDS = frozenset(
@@ -342,8 +345,10 @@ def make_node(body, indent, warnings, line):
                       "Group", "Memoize", "Materialize", "Hash", "HashSetOp",
                       "SetOp", "LockRows", "Gather", "Gather Merge",
                       "Aggregate", "HashAggregate", "GroupAggregate",
-                      "ModifyTable"):
+                      "MixedAggregate", "ModifyTable"):
             kind, detail = text, ""
+        elif AGG_SUFFIX_RE.match(text):
+            kind, detail = AGG_SUFFIX_RE.match(text).groups()
         else:
             kind = text
     if kind not in KNOWN_KINDS:
@@ -1360,6 +1365,37 @@ SELF_TESTS = [
             "  ->  Seq Scan on orders  (cost=0.00..5.00 rows=900 width=12)",
             "  ->  Hash  (cost=3.00..3.00 rows=150 width=6)",
             "        ->  Index Only Scan using customer_pk on customer  (cost=0.25..3.00 rows=150 width=6)",
+        ],
+        "verdict": "MATCH",
+        "cats": set(),
+    },
+    {
+        "name": "SHAPE-DIFF aggregation-strategy (grouping sets: goopg HashAggregate vs PG MixedAggregate)",
+        "goopg": [
+            "HashAggregate (2 keys, 3 grouping sets)  (cost=1.00..2.00 rows=3 width=8)",
+            "  ->  Seq Scan on t  (cost=0.00..1.00 rows=5 width=5)",
+        ],
+        "pg": [
+            "MixedAggregate  (cost=1.00..2.00 rows=3 width=8)",
+            "  Hash Key: t.a, t.b",
+            "  Group Key: ()",
+            "  ->  Seq Scan on t  (cost=0.00..1.00 rows=5 width=5)",
+        ],
+        "verdict": "SHAPE-DIFF",
+        "cats": {"aggregation-strategy"},
+    },
+    {
+        "name": "MATCH grouping sets: goopg HashAggregate suffix vs PG HashAggregate",
+        "goopg": [
+            "HashAggregate (2 keys, 3 grouping sets)  (cost=1.00..2.00 rows=3 width=8)",
+            "  ->  Seq Scan on t  (cost=0.00..1.00 rows=5 width=5)",
+        ],
+        "pg": [
+            "HashAggregate  (cost=1.00..2.00 rows=3 width=8)",
+            "  Hash Key: t.a, t.b",
+            "  Hash Key: t.a",
+            "  Hash Key: ()",
+            "  ->  Seq Scan on t  (cost=0.00..1.00 rows=5 width=5)",
         ],
         "verdict": "MATCH",
         "cats": set(),
