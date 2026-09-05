@@ -223,7 +223,42 @@ records as not existing, and a separately ledgered finding that each of
 five parallel workers builds all 1.5 M rows privately, a 5× multiplier
 nothing in this bundle addresses.
 
-## 5.6. Following the evidence: the entry-width fix, and its refutation
+## 5.6. Four measurements that relocated Track D's blocker
+
+Track D's premise is that goopg retains rows too wide, so packing them will
+cut spilling. Four measurements tested that, each disproving the previous
+one's prediction. **None of them landed a performance win, and together
+they are the most valuable result in this report**, because they moved the
+target from "pack the rows" to a specific, previously unnamed cost-model
+defect.
+
+| # | change | prediction | measured |
+|---|---|---|---|
+| 1 | pack the Q9 build side (D-04) | batches down | **batches 4→4**, time +6.8%, allocs +39% |
+| 2 | fix `avgVarBytes` (executor side) | batches 4→2 | **batches 4→4**; entry 194→120 correct but inert |
+| 3 | honest `MapSlotBytes` (48 is 2× low) | less memory | **bucket heap −51%**, and **+10.4%** time: Q14 flips to a nested loop |
+| 4 | narrow the COST side too | fixes #3's flip | **it does** — and costs **+10.3%** on its own |
+
+**The finding.** Measurement 4 makes the cost model say exactly what the
+executor does, keeps values at 24 MATCH, passes TPC-DS clean, and moves
+plan parity *toward* PG. It still loses 10%, because Q5, Q7, Q9 and Q10 all
+flip **which side is built**. `hashJoinCost` under-prices *building* a
+large hash table — it charges only `cpu_tuple_cost × rows` plus the child
+cost, modelling neither the five private per-worker copies nor the table
+memory. **The un-narrowed build width was an accidental deterrent doing
+that job.**
+
+So the honest sequence, now recorded in the plan, is: charge what a build
+actually costs, *then* narrow the width, then re-apply the two preserved
+patches. Both are kept as patches with a ready-made guard test.
+
+Two things measurement 3 established that outlive it: `MapSlotBytes = 48`
+was a hand-derived guess and is 2× low (go1.25's swisstable costs 96.1 B
+per `map[string][]Row` slot), and `Memory Usage:` omits the bucket array,
+which is why this whole line of work was flying blind — it was reporting
+the smaller of the join's two memory terms.
+
+## 5.7. Following the evidence: the entry-width fix, and its refutation
 
 D-04's stopping rule said "fix the model first", and named `avgVarBytes` as
 prerequisite #1. That fix was implemented and measured.
