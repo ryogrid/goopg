@@ -691,8 +691,41 @@ rule).*
   cannot silently drop the guard.
   *before C-11; fixture before C-15. gate: red-then-green fixture + P4
   values-diff. doc + ~80–150 test LOC, low risk, buys off a high one.*
-- [ ] **C-10d P4-00d FROM-subquery pull-up: measure the boundary, then
-  decide.** The structural one. goopg has **no** `pull_up_subqueries`: a
+- [~] **C-10d P4-00d FROM-subquery pull-up — MEASUREMENT DONE 2026-09-05;
+  the decision is the owner's.** AST-derived census (goopg's own parser, not
+  a regex — the ~41/100 figure was regex-derived and flagged):
+  TPC-H **5** boundaries in 5 queries, TPC-DS **89** boundaries in 41 of 99
+  queries. The query-level count was right; the useful number is that only
+  about half the boundaries sit where they hurt.
+  **ABOVE-BLOCKING** (derived table holds a join tree AND the outer level
+  carries grouping/ordering/window/aggregate): TPC-H 4, TPC-DS 42. Of those,
+  the true Q9 shape — derived table is the outer query's SOLE FROM item, so
+  the whole join search lives one scope down — is TPC-H 4, TPC-DS 24.
+  Q9 verified, not assumed: 6 inner leaves, sole FROM item, outer GROUP BY +
+  aggregate + ORDER BY. Two corrections: **q22 is NOT ABOVE-BLOCKING**, and
+  **q13 is ABOVE-BLOCKING but not pullable** (its own GROUP BY — PG would
+  not pull it up either).
+  **The deciding number: a full `pull_up_subqueries` port removes 18 of 46
+  ABOVE-BLOCKING boundaries (39%), leaving 28.** So C-11's upper rels must
+  be boundary-crossing by construction REGARDLESS, which makes the port an
+  optimisation on top of the struct rather than an alternative to it.
+  Recommendation (not a decision): declare the boundary permanent for
+  C-11's struct, file the pull-up separately. Caveat against it: Q9, which
+  is P4-01's own witness, IS in the pullable set.
+  **Scope correction the item needs:** `RangeVar.Subquery` is one of THREE
+  routes to the same opaque prebuilt leaf — WITH-list CTEs (70 in 30 of 99
+  TPC-DS queries, 61 with a join tree) and views (a fresh top-level
+  planning run, harder) are the others. A pull-up at the subquery site
+  covers only the first, which changes the item's "~46 queries" sizing.
+  Costs of the permanent boundary to C-12 (must always stack a full Sort),
+  C-13 (outer LIMIT cannot push a bound in — and nearly every TPC-DS query
+  ends `order by … limit 100`) and C-17 (the fraction stops at the
+  boundary, so "end-to-end" means "within one scope") recorded.
+  Artifact:
+  `analysis/planner-refactor-take3/c10d-boundary-census-20260905/README.md`.
+  Remaining: the decision itself.
+  Original scope note follows.
+  **C-10d (original).** The structural one. goopg has **no** `pull_up_subqueries`: a
   derived table is planned as an opaque sub-problem admitted as one
   prebuilt leaf (`planSubqueryRangeVar`, `planner.go:4295`), and there is
   no `SubqueryScan` node. TPC-H 5/22 queries carry a FROM-subquery and
@@ -1326,6 +1359,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| C-10d (measurement half) | 2026-09-05 | (this commit) | AST census: 89 boundaries / 41 of 99 TPC-DS; a full pull-up removes only 39% of the blocking ones | so C-11 must cross the boundary regardless; also found CTEs+views are two more routes to the same leaf |
 | C-10c | 2026-09-05 | (this commit) | Phase-4 OJ qual/target placement contract + 5 fixtures; 3 negative controls | found C-16 retires no arm (no reminder) and that goopg has no PlaceHolderVar equivalent |
 | C-07 (derivation half) | 2026-09-05 | (this commit) | query_pathkeys derived with PG's precedence; has_useful_pathkeys completed and made per-rel | inert by design: values 24/24, plans byte-identical; the "motivate index paths" half is evidenced-blocked on C-11/C-12 |
 | D-03 | 2026-09-05 | (this commit) | PackedTuple/PackedSlot unreachable; SEVEN R-0 sites armed (design said six) | review REQUEST-CHANGES -> resolved; values 24/24, plans byte-identical; 25 tests |
