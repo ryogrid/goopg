@@ -1000,6 +1000,15 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
+	// B-14 (P2-09a): ScalarArrayOp probe — PG renders
+	// `Index Cond: (col = ANY (...))`, and so does this.
+	if len(p.SAOPKeys) > 0 && len(p.Index.Columns) > 0 {
+		parts := make([]string, 0, len(p.SAOPKeys))
+		for _, k := range p.SAOPKeys {
+			parts = append(parts, formatIndexCondKey(k, reg))
+		}
+		return wrapParen(p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")")
+	}
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
 

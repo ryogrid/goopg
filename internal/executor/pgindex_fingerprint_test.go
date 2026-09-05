@@ -209,8 +209,11 @@ func TestHashBucketReadCallSitesPassTheFingerprint(t *testing.T) {
 			}
 		}
 	}
-	if sites != 2 {
-		t.Fatalf("found %d ssiRecordHashBucketRead call sites, want 2 (index scan + index-only scan)", sites)
+	// B-14 adds the third: the SAOP multi-descent probe in operators_index.go
+	// records one bucket SIREAD per array element, each handed the
+	// per-descent probe fingerprint (the per-line check above covers it).
+	if sites != 3 {
+		t.Fatalf("found %d ssiRecordHashBucketRead call sites, want 3 (index scan + SAOP descent + index-only scan)", sites)
 	}
 }
 

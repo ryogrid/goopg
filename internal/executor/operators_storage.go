@@ -3542,6 +3542,8 @@ func indexScanColumnRef(ix *optimizer.IndexScan, col string) (*optimizer.ColumnR
 //     `Index.Columns[i] = Keys[i]` per key (takes priority over Key,
 //     matching the planner's own precedence — see the IndexScan doc
 //     comment on plan.go).
+//   - len(ix.SAOPKeys) != 0: ScalarArrayOp probe (B-14) — `col IN (keys)`
+//     as an ANY-semantics InExpr over the leading index column.
 //   - ix.LowKey != nil || ix.HighKey != nil: range scan (M0134-0001 S4
 //     may hand this back with Key == nil and no wrapping Filter — see
 //     extractScan's doc comment). Reconstructs `col >= LowKey` (or
@@ -3586,6 +3588,21 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 			}
 		}
 		return combined
+
+	case len(ix.SAOPKeys) != 0:
+		// B-14 (P2-09a): ScalarArrayOp probe — rebuild `col IN (keys)`
+		// so the SeqScan fallback (updateViaIndex requires Key and
+		// declines this shape) still filters exactly the probed rows.
+		// The reconstructed InExpr carries ANY (OR) semantics by its
+		// zero value, matching the probe's union-of-descents.
+		col := ix.Index.Columns[0]
+		ref, ok := indexScanColumnRef(ix, col)
+		if !ok {
+			return nil
+		}
+		keys := make([]optimizer.Expr, 0, len(ix.SAOPKeys))
+		keys = append(keys, ix.SAOPKeys...)
+		return &optimizer.InExpr{Operand: ref, List: keys}
 
 	case ix.LowKey != nil || ix.HighKey != nil:
 		col := ix.Index.Columns[0]
