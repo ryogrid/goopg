@@ -355,14 +355,13 @@ are EPICS — split into one-checkbox-per-commit items before starting
   `settings_propagation_test.go`. Unstamped hosts (HAVING/VALUES/
   ORDER BY/CTE bodies, INSERT…SELECT, ON CONFLICT, DML derived
   tables) stay default — future slices.
-- [!] **B-13 P2-02b `work_mem` BootVal 512 MB → 4 MB — BLOCKED on B-01a/b/c +
-  B-12d/e/f.** Three lines move together (GUC BootVal,
-  `postgresql.conf.sample`, `hashsize.DefaultMemLimitBytes`) +
-  `TestSampleConfigCoversRegistry`. Lands alone, both suites timed, expect
-  plans to move. Last measurement: +23.1% (entirely Q9+Q7, values
-  correct); the gap to close is tuple WIDTH (B-01a/b/c) + lost Gather
-  (Track C P5).
-  *design: take3 08 §5.1; gate: take3 09 §5 P2 + B2.*
+- [!] **B-13 P2-02b `work_mem` BootVal 512 MB → 4 MB — BLOCKED on
+  spill-cost calibration (re-probed 2026-09-05).** Narrowing bought
+  16→4 batches, not 1: 8 MB budget vs 32 MB witness → Q9 ~1.5–2×,
+  Q7 >1.2× risk — flip now violates B2. Prerequisite is calibration +
+  EX3-03 threading (model misranks merge above hash), NOT P5, NOT
+  B-01b/c remainder. Three lines verified unflipped. Ledger
+  `take3-B-13-deferred` (re-probe trigger inline).
 - [ ] **B-14 P2-09a ScalarArrayOp index path.** `num_sa_scans` needs the
   missing *path*: build index `= ANY` descents + `ceil(pages/3)` clamp.
   Gate on path existence/shape on IN-list fixtures.
