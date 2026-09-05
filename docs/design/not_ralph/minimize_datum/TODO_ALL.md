@@ -609,9 +609,23 @@ rule).*
   group ?: window ?: longer(distinct, sort) ?: setop`) + complete
   `has_useful_pathkeys` so ORDER BY / GROUP BY motivate index paths.
   *design: take3 08 §6.3; gate: take3 09 §5 P3 (PP).*
-- [ ] **C-08 P3-07 `param_source_rels`** (hard-coded 0 today) with
-  `allow_star_schema_join` semantics.
-  *design: take3 08 §6.3; gate: take3 09 §5 P3 (PP).*
+- [x] **C-08 P3-07 `param_source_rels` derivation.** Landed 2026-09-06:
+  per-joinrel PG derivation (`paramSourceRelsForProblem`: RHS rule +
+  FULL symmetric + lateral-0 invariant) with the frame remap rule
+  (single-leaf-consecutive items else 0; RIGHT SJIs skipped);
+  `s.problemItems` stamped per problem; computed once per
+  `addPathsToJoinrel`, threaded to NLI + both merge arms;
+  `allowStarSchemaJoin` untouched. Provably inert until C-04 (no
+  searched joinrel can overlap a peeled-spine SJI's RHS).
+  Gates: derivation table + admit/refuse arm pair + mapping coverage;
+  optimizer + executor suites; units scope; spotcheck PASS; PP TPC-H
+  22/22 MATCH (no sweep triggered per conditional gate); review
+  APPROVE-WITH-NITS (5 addressed: RIGHT guard, admit test, stale
+  comments, ppi_rows ledger row). Artifacts:
+  `internal/optimizer/joinpathsnli.go` (derivation),
+  `joinpaths{,merge,mergeouter}.go` + `joinsearch.go` +
+  `relfromjoinlist.go` (threading/stamp),
+  `joinpathparamsource_test.go` (new) — `b967f38`.
 - [ ] **C-09 P3-08 `reduce_unique_semijoins`** — after clearing SEMI
   left-only `Output()` re-indexing (ledger 794).
   *design: take3 08 §6.3; gate: take3 09 §5 P3 (PP + values-diff).*
@@ -1623,6 +1637,7 @@ P6-03/04/05 (load-bearing).
 | D-02 | 2026-09-05 | c6468238f + (this commit) | verdict PROCEED: 0 declining columns of 160,302, 0 retention sites of 985 | corrected 04 section 3.1's packableType definition, which would have produced a false STOP; 3 latent on-disk bugs ledgered |
 | C-02d | 2026-09-05 | (this commit) | qual moves across preserved-side outer links; proof gains positive containment | values 24/24, plans byte-identical, plan-gate PASS, TPC-DS CKMISMATCH=0; review found no counterexample |
 | C-02c | 2026-09-05 | 2305241f4 | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
+| C-08 | 2026-09-06 | b967f38 | per-joinrel param_source_rels derivation with frame remap; NLI + merge arms threaded; star-schema escape untouched | derivation table + admit/refuse arm pair; suites + units scope + spotcheck PASS; PP TPC-H 22/22 MATCH (provably inert until C-04, no sweep triggered); review APPROVE-WITH-NITS (5 addressed); ppi_rows ledger row |
 
 ## Dropped
 
