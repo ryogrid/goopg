@@ -690,7 +690,15 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   is what keeps the two transcriptions from drifting further); executor
   suite green; TPC-H values 24/24 MATCH; plans byte-identical; plan-gate
   PASS; PP unchanged.
-  Original text follows.
+  **Site count re-derived from the tree on landing (05 §5 obligation),
+  measured with 05 §2's own commands:** retention struct fields **48**
+  (estimate 48 — unchanged); `cloneRowOwned` call sites **20 across 14
+  files** (estimate 19 across 14 — one site added since the estimate, in
+  the same file set); `resolveColTypeInfo` callers **2**. So 05 §2's
+  surface estimate still holds; the delta is +1 ownership-boundary site and
+  no new file. D-01 itself changed **0** call sites (additive fields only),
+  which is why no consumer-side count moved.
+  Original scope note follows.
   **D-01 (original scope note).** `attlen`/`attbyval`/
   `attstorage` on `colTypeInfo`, sharing **one** `pg_type.dat`
   transcription with `userTypeAttrsForOID` (reuse the existing
