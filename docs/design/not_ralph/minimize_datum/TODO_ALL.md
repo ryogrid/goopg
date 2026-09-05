@@ -234,11 +234,11 @@ are EPICS — split into one-checkbox-per-commit items before starting
   (blend cell unreachable; belongs to B-08, then eq-clamp tail);
   multibyte case-folding (ASCII-only data; executor-owned correctness).
   Ledger `take3-B-03-declined` (+ EA file-level baseline note).
-- [ ] **B-04 P1-21 `max(outer,inner)` fallback cap — verify-and-keep.**
-  Precondition NOT met (cap sits in the unmeasurable fallback
-  `cardinality.go:655-666`, unreachable from P1-15). Verify and ledger as
-  a keep decision, one commit — do not delete without evidence.
-  *design: take3 08 §4; gate: units pinning the guard's conditions.*
+- [x] **B-04 P1-21 `max(outer,inner)` fallback cap — verified-and-KEPT**
+  2026-09-05: cap fires iff min(l,r)>200 on the unmeasurable fallback;
+  proven both directions (MCV-fires ⟹ measured path; fallback-fires ⟹
+  P1-15 declined); deleting moves 6M×800k 6M→2.4e13. Pinned by
+  `cardinality_fallbackcap_test.go` (6 tests). Ledger `take3-B-04-kept`.
 - [ ] **B-05 P1-22/23/24 extended statistics [EPIC — split before start].**
   Build (`BuildRelationExtStatistics` → `pg_statistic_ext_data`), then
   `statext_clauselist_selectivity` (+ `estimatedclauses` bitmap,
