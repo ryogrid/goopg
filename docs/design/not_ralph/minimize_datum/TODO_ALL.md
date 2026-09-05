@@ -561,7 +561,40 @@ rule).*
   the only jointree path; `from_collapse_limit`/`join_collapse_limit`
   take upstream meaning. Own commit, both suites timed.
   *design: take3 08 §6.3; gate: take3 09 §5 P3.*
-- [ ] **C-07 P3-06 `standard_qp_callback` analogue** (`query_pathkeys =
+- [~] **C-07 P3-06 — DERIVATION + GATE LANDED 2026-09-05; the "motivate
+  index paths" half is BLOCKED on C-11/C-12.**
+  Landed: `chooseQueryPathkeys` reproduces `standard_qp_callback`'s
+  precedence exactly (group ?: window ?: longer(distinct, sort) ?: setop),
+  derived against the FROM-level resolve context so the pathkeys carry the
+  same `Index`/`SourceTableIdx` the search's clause operands do — without
+  that they would be silently unmatchable. Includes
+  `transformGroupClause`'s sortClause-prefix reuse and
+  `transformDistinctClause`'s ordering. `hasUsefulPathkeys` is now
+  complete and PER-REL, as upstream's is; upstream's three arms reduce to
+  two by PROOF (group non-empty implies query non-empty via the
+  precedence's first case), not by simplification.
+  **Not landed, with evidence:** widening the useful-column set so ORDER BY
+  / GROUP BY motivate index paths. Nothing selects a path for its ordering
+  — `finalPath()` is cost-only, `planJoinlistSearch` DROPS the chosen
+  path's `Pathkeys` at the seam, and the ORDER BY `Sort` is wrapped
+  unconditionally far above it in a different coordinate space. An
+  ordering-only index path could therefore only lose on cost, win
+  `CheapestStartup` under a LIMIT while a redundant Sort still runs, or
+  silently disable `applyIndexOrderedGroupingRule`. That is unmotivated
+  plan churn, so it was not forced. The consumer is C-11 (`ORDERED` upper
+  rel) + C-12 (real upper-rel `PathSort`); once either exists the widening
+  is a map union at one line.
+  Gates: 6 new test groups incl. a DECISION test
+  (`TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot`) that pins
+  the gate saying yes while the producer emits nothing, and names C-11/C-12
+  as the item that flips it red-to-green; optimizer suite; TPC-H values
+  24/24 MATCH; plans BYTE-IDENTICAL; plan-gate PASS.
+  Known divergence recorded: group/sort matching is on the written
+  expression after alias substitution, not PG's `tleSortGroupRef` identity,
+  so `GROUP BY t.a ORDER BY a` misses the match and falls back to ASC —
+  the safe direction, since a wrong-direction claim would be worse.
+  Original scope note follows.
+  **C-07 (original).** (`query_pathkeys =
   group ?: window ?: longer(distinct, sort) ?: setop`) + complete
   `has_useful_pathkeys` so ORDER BY / GROUP BY motivate index paths.
   *design: take3 08 §6.3; gate: take3 09 §5 P3 (PP).*
@@ -1268,6 +1301,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| C-07 (derivation half) | 2026-09-05 | (this commit) | query_pathkeys derived with PG's precedence; has_useful_pathkeys completed and made per-rel | inert by design: values 24/24, plans byte-identical; the "motivate index paths" half is evidenced-blocked on C-11/C-12 |
 | D-03 | 2026-09-05 | (this commit) | PackedTuple/PackedSlot unreachable; SEVEN R-0 sites armed (design said six) | review REQUEST-CHANGES -> resolved; values 24/24, plans byte-identical; 25 tests |
 | C-10a (cardinality half) | 2026-09-05 | (this commit) | grouping-sets aggregates were priced as ONE set; now summed per set and clamped | values 24/24 + TPC-DS CKMISMATCH=0; PP unchanged; 4 new tests |
 | C-20d | 2026-09-05 | (this commit) | **index-probe multiplier calibrated 1.0 -> 2.0: TPC-H suite 138.58 -> 100.79 s (-27%), Q5 5.3x, Q7 2.7x, Q9 1.9x, Q3 2.3x** | values 24/24 + TPC-DS CKMISMATCH=0; plan parity IMPROVED 5/15 -> 6/14; flag retirement stays blocked |

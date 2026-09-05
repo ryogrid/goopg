@@ -77,21 +77,38 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 // addOrderedIndexPaths generates, for every base relation, the unparameterised
 // index paths whose ordering some join clause of that relation could merge on.
 //
-// The gate is `has_useful_pathkeys` (pathkeys.c:2323) reduced to the one arm
-// this seam has: `rel->joininfo != NIL || rel->has_eclass_joins`. PG's other
-// two arms — `root->group_pathkeys` and `root->query_pathkeys` — need the
-// query's own ORDER BY / GROUP BY ordering, which the search boundary does not
-// carry (03 §10 defers the whole query-pathkey question to P5.5). A rel with
-// no join clause therefore produces nothing here, which is also what PG's
-// `truncate_useless_pathkeys` would reduce it to.
+// The gate is `has_useful_pathkeys` (pathkeys.c:2319), and since C-07/P3-06 it
+// is COMPLETE: `hasUsefulPathkeys` (querypathkeys.go) answers both of
+// upstream's live arms — the rel's own join clauses (merging) and
+// `root->query_pathkeys` (ordering), the latter derived by the
+// `standard_qp_callback` analogue from the statement's GROUP BY / window /
+// DISTINCT / ORDER BY.
+//
+// What the gate opens onto is still the merging half alone. The useful-column
+// set below comes from `mergeableColumnExprsFor`, i.e.
+// `pathkeys_useful_for_merging`; `pathkeys_useful_for_ordering` has no
+// counterpart, so a rel that passes the gate on the ORDERING arm and has no
+// join clause still produces nothing. That is deliberate and is C-07's
+// recorded scope line: goopg has no consumer that would SELECT a path for its
+// ordering — `finalPath` (joinsearch.go:298) chooses on cost alone, the search
+// boundary publishes a Node and drops the chosen path's `Pathkeys`
+// (relfromjoinlist.go:218), and the ORDER BY `*Sort` is wrapped on
+// unconditionally above it (planner.go:1720). Generating an ordering-only full
+// index scan there could only lose on total cost, or win `CheapestStartup`
+// under a LIMIT while the redundant Sort still runs. The consumers are C-11
+// (upper `RelOptInfo`s incl. `ORDERED`) and C-12 (a real upper-rel
+// `PathSort`); the widening is a map union at the `colExprs` line below.
 func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
-	if s == nil || cat == nil || s.clauses == nil || len(s.clauses.all) == 0 {
+	if s == nil || cat == nil {
 		return
 	}
 	totalPages := s.totalTablePages()
 	for i, rel := range s.levelRels(1) {
 		if i >= len(s.relInfos) {
 			break
+		}
+		if !s.hasUsefulPathkeys(rel) {
+			continue
 		}
 		tbl := s.relInfos[i].table
 		if tbl == nil {
@@ -102,7 +119,7 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 		if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
 			continue
 		}
-		colExprs := mergeableColumnExprsFor(rel.Relids, s.clauses.all)
+		colExprs := mergeableColumnExprsFor(rel.Relids, s.clausesAll())
 		if len(colExprs) == 0 {
 			continue
 		}

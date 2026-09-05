@@ -422,6 +422,15 @@ type resolveContext struct {
 	// a top-level FROM clause. M0127-P5.9-b; see `searchTupleFraction`.
 	tupleFraction float64
 
+	// queryPathkeys is `PlannerInfo.query_pathkeys`: the ordering the
+	// statement itself wants from the scan/join level, in this context's
+	// binding coordinates (C-07/P3-06, querypathkeys.go). Derived by
+	// `deriveQueryPathkeys` at the same two points `tupleFraction` is fixed,
+	// and for the same reason: the ORDER BY / GROUP BY clauses are not
+	// resolved into SortKeys until far below the search. Empty in every
+	// context that is not a top-level FROM clause.
+	queryPathkeys []PathKey
+
 	// neededCols / neededColsKnown: the statement's needed-column set,
 	// computed once per `planSelect` (pathindexonlyneed.go) and handed to the
 	// join-order search so `addIndexOnlyPaths` can answer `check_index_only`
@@ -1306,6 +1315,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// fraction is derived from the unresolved clauses; see
 			// `searchTupleFraction` for why they are not resolved early.
 			ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
+			// C-07: `standard_qp_callback` runs here for the same reason
+			// `preprocess_limit` does — before `query_planner` builds a rel.
+			ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
 			ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 			ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 			if unnestPreDPEnabled() && whereEligibleForPreDPUnnest(pred) {
@@ -1371,6 +1383,8 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the needed-column set are populated here for the same reason the
 		// WHERE arm populates them: the search reads both.
 		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
+		// C-07: as in the `*Filter` arm above.
+		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {

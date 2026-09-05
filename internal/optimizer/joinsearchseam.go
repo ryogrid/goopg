@@ -364,6 +364,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// node does not exist yet at this point in `planSelect` (see
 		// `searchTupleFraction`).
 		tupleFraction: ctx.tupleFraction,
+		// C-07: `root->query_pathkeys`, derived by `standard_qp_callback`
+		// (deriveQueryPathkeys) at the same point in `planSelect` the
+		// fraction is, and in the SAME binding coordinates the conjuncts
+		// above are written in.
+		queryPathkeys: ctx.queryPathkeys,
 		// The statement's needed-column set (pathindexonlyneed.go), computed
 		// once in `planSelect` — the only frame holding the
 		// *parser.SelectStmt; the search boundary sees resolved nodes only.

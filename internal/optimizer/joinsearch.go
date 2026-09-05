@@ -169,6 +169,14 @@ type searchCtx struct {
 	// the fast path equivalent of an empty list. M0128-P1.2.
 	joinInfoList []*SpecialJoinInfo
 
+	// queryPathkeys is `PlannerInfo.query_pathkeys` (C-07/P3-06,
+	// querypathkeys.go): the ordering the STATEMENT wants from this level,
+	// derived once by `standard_qp_callback` before the first rel exists and
+	// carried here for the same reason `tupleFraction` is — it is a property
+	// of the query, not of a relation. Read by `hasUsefulPathkeys`. Empty
+	// means "no special ordering requested", which is upstream's NIL.
+	queryPathkeys []PathKey
+
 	// neededCols / neededColsKnown are PG's `reltarget` + `attr_needed` for
 	// this statement, by COLUMN NAME — see pathindexonlyneed.go for the
 	// direction of the approximation. `neededColsKnown == false` means

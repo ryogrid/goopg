@@ -124,6 +124,12 @@ type joinlistProblem struct {
 	outputCols      map[string]bool
 	outputColsKnown bool
 
+	// queryPathkeys carries `PlannerInfo.query_pathkeys` (C-07/P3-06,
+	// querypathkeys.go) to `searchCtx`. It is a property of the STATEMENT,
+	// so every sub-problem of one statement shares it — the same rule
+	// neededCols follows.
+	queryPathkeys []PathKey
+
 	// spineAbove reports that a pinned outer spine sits above this
 	// problem's tree: the spine's ON quals read the searched subtree's
 	// output from above, so parent-aware narrowing is declined here (the
@@ -389,6 +395,9 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
+	// C-07: `root->query_pathkeys`, published beside the clause list because
+	// `hasUsefulPathkeys` reads both.
+	s.queryPathkeys = prob.queryPathkeys
 	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
 	s.outputCols, s.outputColsKnown = prob.outputCols, prob.outputColsKnown
 	// Take2 P4-01 Slice 3: parent-aware narrowing is eligible only for the
