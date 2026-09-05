@@ -545,10 +545,21 @@ rule).*
   two-level INNER-above-LEFT move, identity-disagreement copy, constant
   unprovable).
   *design: C-02 DESIGN.md §5 C-02d + the "Realisation" note.*
-- [ ] **C-03 P3-03 `join_is_legal` on real SJIs.** DP builds outer, semi
-  and anti joinrels directly. After B-01.
-  *design: take3 08 §6.2; gate: take3 09 §5 P3 (DPPATH OFFERED/ACCEPTED +
-  `estimate-audit --enum-trace`).*
+- [ ] **C-03a P3-03 `Path.Jointype` field (inert).** Jointype on paths
+  (default Inner), compare-ignore rule, DPPATH label. After B-01.
+  *design: `docs/design/planner-c03-jointype-search/DESIGN.md` §4 C-03a
+  (reviewed APPROVE-WITH-NITS); gate: unit + suites green.*
+- [ ] **C-03b P3-03 jointype-aware `addPaths` (inert).** sjinfo orientation
+  carrier into `addPaths`; OUTER legal direction only; SEMI/ANTI
+  nestloop-only. *design: C-03 DESIGN.md §4 C-03b; gate: DPPATH
+  OFFERED/ACCEPTED units + suites green.*
+- [ ] **C-03c P3-03 `createPlanNode` jointype arms (inert).** Path jointype
+  into `Join.Type` + SEMI/ANTI left-only schema/sizing narrowing; FULL
+  declined with ledger row. *design: C-03 DESIGN.md §4 C-03c; gate:
+  searched-shape units + suites + take3 R8 zero-drift.*
+- [ ] **C-03d P3-03 enum-trace DPPATH evidence.** PG-only pairings OFFERED
+  adjudication on fixtures. *design: C-03 DESIGN.md §4 C-03d; gate:
+  enum-trace fixtures green.*
 - [ ] **C-04 P3-04 delete `splitOuterSpine` + `pinnedOuter()` decline.**
   Mixed comma + `LEFT JOIN` FROM becomes **one** search problem (Q72
   witness). **Unblocks P1-18 (C-05).** After B-01.
