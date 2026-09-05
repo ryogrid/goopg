@@ -954,7 +954,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// A-01(ii) cut 2: branches share the statement scope (uniqueness is
 		// what matters; PG numbers each branch's rtable separately, but
 		// goopg renders one flat plan, so one flat namespace is the model).
-		left, err := planSelectWithSettings(s, cat, DefaultPlannerSettings(), scope)
+		// B-12e: and the statement's settings (plannerSet), resolved
+		// directly from this parameter — never parent/lateral — so each
+		// operand's join search prices under the session's GUCs.
+		left, err := planSelectWithSettings(s, cat, plannerSet, scope)
 		// Restore everything (plan cache may reuse the AST).
 		s.SetOp = savedSetOps[0]
 		for i, seg := range segments {
@@ -982,8 +985,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			if seg.cutAt != nil {
 				seg.cutAt.SetOp = nil
 			}
-			// A-01(ii) cut 2: shares the statement scope (see left branch above).
-			right, rerr := planSelectWithSettings(seg.stmt, cat, DefaultPlannerSettings(), scope)
+		// A-01(ii) cut 2: shares the statement scope (see left branch above).
+		// B-12e: and the statement's settings (plannerSet) — same
+		// hand-threading as the left branch.
+		right, rerr := planSelectWithSettings(seg.stmt, cat, plannerSet, scope)
 			if seg.cutAt != nil {
 				seg.cutAt.SetOp = savedSetOps[i+1] // restore for plan-cache
 			}
@@ -1088,7 +1093,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// M0125-0020.
 	if s.SetOpOperand != nil {
 		// A-01(ii) cut 2: shares the statement scope (see set-op branches above).
-		operand, err := planSelectWithSettings(s.SetOpOperand, cat, DefaultPlannerSettings(), scope)
+		// B-12e: and the statement's settings (plannerSet) — a parenthesised
+		// operand plans under the session's GUCs, never the hard-wired defaults.
+		operand, err := planSelectWithSettings(s.SetOpOperand, cat, plannerSet, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -14154,8 +14161,11 @@ func planHasEscapingOuterRef(node Node, depth int) bool {
 // query with a concurrently-planning session's GUCs — the threaded-from-wrong-
 // scope bug the reverted mechanical attempt shipped (take3 08 §10.1, 04 §12.3;
 // same rule as resolveContext.settings). Callers outside B-12d's derived-table
-// family (set-op operands, scalar subqueries) pass DefaultPlannerSettings()
-// explicitly, preserving today's behaviour until B-12e/B-12f thread them.
+// family (scalar subqueries, B-12f) pass DefaultPlannerSettings()
+// explicitly, preserving today's behaviour until B-12f threads them.
+// Set-operation operands already thread the statement's settings by hand
+// (B-12e: planSelectWithSettings passes its own plannerSet to the leftmost
+// branch, planSegment and SetOpOperand sites).
 func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	prevParent := planParent
 	planParent = parent

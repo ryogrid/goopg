@@ -333,12 +333,16 @@ are EPICS — split into one-checkbox-per-commit items before starting
   Gates: GUC-effect pin (5 arms fail pre-fix via stash, pass post) +
   unchanged-default pin; PP zero drift (Q7 scare = stale-stats
   artifact: ANALYZE mid-gate moved Q7 to merge; values identical;
-  reproducible pre/post on demand); TPC-H 24/24 MATCH.
+  reproducible pre/post on demand); TPC-H 24/24 MATCH;
+  TPC-DS PASS=95 MISMATCH=0.
   Artifacts: `planner.go`, `settings_propagation_test.go`.
-- [ ] **B-12e Set-operation operand propagation:** same hand-threading for
-  set-operation operands. After B-01a/b/c.
-  *design: take2 07 §3.3 + 04 §12.3 + take3 08 §5.1; gate: take3 09 §5 P2
-  (GUC-effect + both-suites timing).*
+- [x] **B-12e Set-operation operand propagation.** Landed 2026-09-05:
+  leftmost branch, `planSegment` right-operand closure, `SetOpOperand`
+  grouping site pass the statement's own settings (line numbers had
+  shifted since the design; grouped site gets own arms + per-operand
+  isolation subtest). Gates: GUC-effect (8 arms fail pre-fix via stash,
+  pass post) + unchanged-default pin; PP zero drift; TPC-H 24/24 MATCH.
+  Artifacts: `planner.go`, `settings_propagation_test.go`.
 - [ ] **B-12f Scalar-subquery propagation:** same hand-threading for
   scalar-subquery sites. After B-01a/b/c.
   *design: take2 07 §3.3 + 04 §12.3 + take3 08 §5.1; gate: take3 09 §5 P2
