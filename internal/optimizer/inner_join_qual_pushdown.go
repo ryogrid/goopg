@@ -52,9 +52,9 @@ import (
 //     on the result SET (a filter applied twice selects the same rows)
 //     and only the ERROR behaviour changes, intentionally, to match PG.
 //     It also guarantees the chosen join ORDER cannot move as a side
-//     effect. C-02c MOVES the conjunct (drops the residual) when the
-//     copy lands with the full-path delay proof, no sibling derivation,
-//     and an all-INNER path — the placed evaluation then filters exactly
+//     effect. C-02c/d MOVES the conjunct (drops the residual) when the
+//     copy lands with the full-path delay proof, side containment, and
+//     no sibling derivation — the placed evaluation then filters exactly
 //     what the residual would, once instead of twice.
 //
 //  3. It places the Filter on the join's INPUT node, never inside a CTE
@@ -164,13 +164,14 @@ func pushInnerJoinInputQuals(f *Filter) (Node, bool) {
 				continue
 			}
 			f.Child = repl
-			if tr.proven && !tr.planted && !tr.crossedOuter {
-				// C-02c MOVE: the copy landed on an all-INNER path with
-				// the full-path delay proof and no sibling derivation
-				// was seeded — drop the original from the residual (no
-				// notePushedBelow: nothing is duplicated, and the
-				// descendant prices the placed conjunct exactly once by
-				// construction). Outer-crossing moves are C-02d scope.
+			if tr.proven && !tr.planted {
+				// C-02c/d MOVE: the copy landed with the full-path delay
+				// proof and no sibling derivation was seeded — drop the
+				// original from the residual (no notePushedBelow: nothing
+				// is duplicated, and the descendant prices the placed
+				// conjunct exactly once by construction). C-02d admits
+				// descents that crossed a preserved-side outer link; see
+				// pushTrace for why that needs no separate veto.
 				continue
 			}
 			// Legacy COPY (property 2): the conjunct is DUPLICATED —
@@ -298,17 +299,29 @@ func joinRestrictionSides(j *Join) (left, right, pushable bool) {
 // The recursion is coordinate-correct by construction: a Filter does not
 // change its child's Output(), and shiftConjunctForInput re-bases the
 // copy into the chosen input's space before the next level sees it.
-// pushTrace carries the C-02c move proof across one copy descent:
+// pushTrace carries the C-02c/d move proof across one copy descent:
 // proven = every crossed OJ link passed the delay test with complete
 // attribution throughout; planted = deriveConst seeded a sibling copy
 // during this descent (vetoes the move — the derivation's soundness
-// proof assumes the residual masks match→null-extension flips);
-// crossedOuter = the path crossed an outer link (C-02c moves INNER-only
-// paths; outer-crossing moves are C-02d scope even when proven).
+// proof assumes the residual masks match→null-extension flips).
+//
+// C-02d: there is deliberately no "crossed an outer link" veto. A descent
+// can only ENTER a preserved side — `joinRestrictionSides` answers
+// left-only for LEFT and right-only for RIGHT (and refuses FULL, SEMI,
+// ANTI and LATERAL outright) — and `proven` additionally requires the
+// conjunct not to reach that link's nullable side. The two together mean
+// a crossed outer link is always a preserved-side descent by a qual that
+// reads only preserved-side columns, which is exactly the case where
+// placing below and filtering above select the same rows: a preserved
+// row rejected below produces no join row at all (matched or
+// null-extended), and every join row it would have produced is one the
+// residual above would have rejected on the same, un-extended values.
+// That is PG filing a single-relation restriction into the relation's
+// `baserestrictinfo` (postgres/src/backend/optimizer/plan/initsplan.c
+// distribute_restrictinfo_to_rels).
 type pushTrace struct {
-	proven       bool
-	planted      bool
-	crossedOuter bool
+	proven  bool
+	planted bool
 }
 
 func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
@@ -391,9 +404,6 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		} else if !leftOK {
 			return n, false
 		}
-		if x.Type == JoinTypeLeft || x.Type == JoinTypeRight {
-			st.crossedOuter = true
-		}
 		// M0125-0035 EC arm: while c descends into its own side, a
 		// `col = const` conjunct also seeds the OTHER side through this
 		// join's own equality clauses (see deriveConstAcrossJoinEquality
@@ -402,15 +412,44 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		if deriveConstAcrossJoinEquality(x, c, side, leftWidth) {
 			st.planted = true
 		}
-		// C-02c: record the per-link delay proof (conjunctive over the
+		// C-02c/d: record the per-link move proof (conjunctive over the
 		// descent). Incomplete attribution cannot prove — keep the
 		// residual (copy). No early return: copy mechanics stay
 		// byte-identical to legacy whatever the proof says.
+		//
+		// Two requirements, deliberately both:
+		//
+		//  1. NEGATIVE — the conjunct must not reach this link's nullable
+		//     side (`delayedAboveOJ`), which is the null-extension test.
+		//  2. POSITIVE — every identity the conjunct reads must lie
+		//     INSIDE the side being descended into. Requirement 1 alone
+		//     leaves two holes, because the side was chosen from
+		//     `ColumnRef.Index` while the proof speaks `SourceTableIdx`:
+		//     at an INNER/CROSS link `delayedAboveOJ` returns false
+		//     without inspecting the qual at all, and
+		//     `innerJoinPushTarget` skips its positional name check for
+		//     an unnamed ref. Containment makes the design's sentence
+		//     ("a qual reading only the columns of the side it descends
+		//     into") literally true rather than true by the conjunction
+		//     of two different notions of identity, and it fails closed
+		//     on a SourceTableIdx pointing outside this join tree.
+		//
+		// A conjunct that reads NO relation (`qrel == 0`, a bare
+		// constant) is unprovable rather than vacuously proven:
+		// `innerJoinPushTarget` refuses column-free conjuncts today, so
+		// this is unreachable, but the ledgered `pseudoconstant` work
+		// would make it reachable and a vacuous proof would then be a
+		// silent move. Fail closed instead of relying on that coupling.
 		if qsj, ok := planJoinDelaySJI(x); ok {
-			if qrel, ok := qualSrcRelSet(c); ok {
-				st.proven = st.proven && !delayedAboveOJ(qrel, qsj)
-			} else {
+			qrel, okQ := qualSrcRelSet(c)
+			side, okS := outputRelSet(target.Output())
+			switch {
+			case !okQ || !okS || qrel == 0:
 				st.proven = false
+			case qrel&^side != 0:
+				st.proven = false
+			default:
+				st.proven = st.proven && !delayedAboveOJ(qrel, qsj)
 			}
 		} else {
 			st.proven = false
@@ -478,9 +517,9 @@ func innerJoinPushEligibleInput(n Node) bool {
 //     its rollout stays gated and snapshot-pinned.
 //   - This pass runs LAST (planner.go, after remapWithBindings and
 //     pushSingleSourceFiltersAfterRemap) and copies by default
-//     (property 2; C-02c moves on proven all-INNER paths). The join
-//     order is already fixed when it runs, so admitting a leaf changes
-//     what a scan EMITS, never which join is built first.
+//     (property 2; C-02c/d moves on proven paths). The join order is
+//     already fixed when it runs, so admitting a leaf changes what a
+//     scan EMITS, never which join is built first.
 //
 // A Filter wrapping such a leaf carries LEAF-LOCAL ColumnRefs by the
 // M0077-0001 convention — attachRelationLocalFilters sets the same flag

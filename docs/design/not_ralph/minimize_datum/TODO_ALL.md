@@ -493,7 +493,30 @@ rule).*
   Ledger `take3-C-02c-noted` records the untouched
   `pushQualsThroughSingleRefCTEs` duplication (orthogonal, pre-existing).
   *design: C-02 DESIGN.md §5 C-02c.*
-- [ ] **C-02d P3-02 move across preserved-side outer links.** As C-02c incl. LEFT/RIGHT-preserved descents; nullable-side originals never move. *design: C-02 DESIGN.md §5 C-02d; gate as C-02c.*
+- [x] **C-02d P3-02 move across preserved-side outer links.** Landed
+  2026-09-05: the outer-crossing veto is REMOVED, not replaced — a
+  descent can only enter a preserved side (`joinRestrictionSides` answers
+  left-only for LEFT, right-only for RIGHT, and refuses FULL/SEMI/ANTI/
+  LATERAL), so a crossed outer link is always a preserved-side descent.
+  Review-driven strengthening in the same commit: the proof now also
+  requires POSITIVE side containment (every identity the conjunct reads
+  lies inside the side descended into) and treats a relation-free
+  conjunct as unprovable — the negative delay test alone returns false at
+  an INNER/CROSS link without inspecting the qual, so containment is what
+  makes the claim hold at every link.
+  Review: APPROVE-WITH-NITS, no counterexample found across
+  Index-vs-SourceTableIdx disagreement, constant quals, multi-level
+  spines, nodes above the Filter, volatile/sublink declines, the
+  idempotence arm, and the untraced CTE callers; all 9 findings applied
+  (2 majors were test gaps, now pinned).
+  Gates (pinned regime): TPC-H values 24/24 MATCH; plans byte-identical
+  to baseline; `make plan-gate` PASS; PP unchanged 5/15/2; TPC-DS SF0.5
+  **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0**; optimizer suite
+  green with 7 new pins (LEFT move, RIGHT move + rebased index,
+  nullable-side never descends, FULL never descends, two-level blocked,
+  two-level INNER-above-LEFT move, identity-disagreement copy, constant
+  unprovable).
+  *design: C-02 DESIGN.md §5 C-02d + the "Realisation" note.*
 - [ ] **C-03 P3-03 `join_is_legal` on real SJIs.** DP builds outer, semi
   and anti joinrels directly. After B-01.
   *design: take3 08 §6.2; gate: take3 09 §5 P3 (DPPATH OFFERED/ACCEPTED +
@@ -949,6 +972,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| C-02d | 2026-09-05 | (this commit) | qual moves across preserved-side outer links; proof gains positive containment | values 24/24, plans byte-identical, plan-gate PASS, TPC-DS CKMISMATCH=0; review found no counterexample |
 | C-02c | 2026-09-05 | 2305241f4 | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
 
 ## Dropped

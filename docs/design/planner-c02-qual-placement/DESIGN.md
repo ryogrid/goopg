@@ -129,6 +129,49 @@ left-only. Nil SJI = delay (fail-closed).
   RIGHT-preserved links (still gated per-link by C-02a; nullable-side
   originals never move). Gate as C-02c.
 
+  **Realisation (2026-09-05).** C-02d needs no new machinery and no new
+  side test: it is the REMOVAL of C-02c's `crossedOuter` veto, because
+  two existing gates already restrict an outer-link descent to exactly
+  the safe case.
+
+  1. `joinRestrictionSides` answers left-only for LEFT and right-only
+     for RIGHT, and refuses FULL, SEMI, ANTI and LATERAL outright. So a
+     descent that crosses an outer link can only ENTER the preserved
+     side.
+  2. `delayedAboveOJ` (via `proven`) additionally requires the conjunct
+     not to reach that link's nullable side, conjunctively over the whole
+     crossed path.
+
+  Together: a crossed outer link is always a preserved-side descent by a
+  qual reading only preserved-side columns. For that case, placing below
+  and filtering above select the same rows — a preserved row rejected
+  below produces no join row at all, and every join row it would have
+  produced (matched or NULL-extended) is one the residual above would
+  have rejected on the same, un-extended values, since the join never
+  null-extends the preserved side. This is precisely PG filing a
+  single-relation restriction into that relation's `baserestrictinfo`
+  (`distribute_restrictinfo_to_rels`, initsplan.c).
+
+  The nullable-side case is refused twice over and is pinned by its own
+  test rather than left implicit, because either gate alone would look
+  correct in isolation while the other was relaxed.
+
+  **The two gates speak different attributions, and that matters.**
+  Gate 1 constrains `ColumnRef.Index` (positional, and what the executor
+  actually evaluates); gate 2 constrains `SourceTableIdx` (identity, and
+  what survives every remap). On disagreement, Index wins for side
+  selection and for execution, while the identity proof fails closed and
+  demotes the move back to a copy — so a stale or permuted schema costs a
+  missed optimisation, never a wrong answer. Because the two notions can
+  disagree, the proof also carries a POSITIVE containment requirement
+  (every identity the conjunct reads lies inside the side descended into),
+  not only the negative "does not reach the nullable side": at an
+  INNER/CROSS link the negative test returns false without inspecting the
+  qual at all, so containment is what makes the claim hold at every link
+  rather than only at outer ones. A conjunct reading no relation at all is
+  unprovable rather than vacuously proven, so the ledgered
+  `pseudoconstant` work cannot turn a vacuous proof into a silent move.
+
 Out of scope (ledgered, not forgotten): FULL-link placement (needs
 USING-coalescing positions — and LEFT/RIGHT `USING` merged vars have
 the same position problem — same blocker as C-01 follow-up);

@@ -201,9 +201,14 @@ func TestInnerJoinQualPushReachesPreservedOuterSide(t *testing.T) {
 	if got := columnRefIndexes(lf.Predicate); len(got) != 1 || got[0] != 0 {
 		t.Errorf("pushed predicate refs = %v, want [0]", got)
 	}
-	// Property 2 still holds across the widening.
+	// Property 2 still holds across the widening. NOTE: this fixture is
+	// UNATTRIBUTED — ijCol leaves SourceTableIdx at 0 — so qualSrcRelSet
+	// declines, no proof exists, and the pass copies. The attributed
+	// version of this same LEFT-preserved shape MOVES; that is pinned by
+	// TestMoveAcrossPreservedLeftLink. Do not "fix" the fixture here
+	// without moving this assertion with it.
 	if got := len(splitAnd(f.Predicate)); got != 1 {
-		t.Errorf("residual Filter has %d conjuncts, want 1 — the pass must DUPLICATE, not move", got)
+		t.Errorf("residual Filter has %d conjuncts, want 1 — unattributed, so copy not move", got)
 	}
 	// Mirror image for RIGHT: index 2 is the preserved (right) input.
 	curr, prev = ijCTEScan("curr_yr"), ijCTEScan("prev_yr")
@@ -574,24 +579,103 @@ func TestPlantedDerivationVetoesMove(t *testing.T) {
 	}
 }
 
-// TestOuterPathKeepsResidual pins C-02c deferral to C-02d: a preserved-side
-// copy on an outer link lands (legacy copy) but the residual is KEPT.
-func TestOuterPathKeepsResidual(t *testing.T) {
+// TestMoveAcrossPreservedLeftLink pins the C-02d move: a qual reading only
+// the PRESERVED side of a LEFT link moves — a preserved row rejected below
+// produces no join row at all, and every join row it would have produced
+// (matched or NULL-extended) is one the residual above would have rejected
+// on the same, un-extended values.
+func TestMoveAcrossPreservedLeftLink(t *testing.T) {
 	left := srcScan("a", srcCol("x", 1))
 	right := srcScan("b", srcCol("y", 2))
 	j := srcJoin(JoinTypeLeft, left, right)
 	f := &Filter{Child: j, Predicate: srcGt(0, "x", 1, 7)}
 
 	newChild, dropSelf := pushInnerJoinInputQuals(f)
-	if dropSelf {
-		t.Fatal("outer-link move is C-02d scope: residual must be kept")
+	if !dropSelf {
+		t.Fatal("C-02d: a preserved-side qual on a LEFT link must MOVE")
 	}
 	nj := newChild.(*Join)
 	if _, ok := nj.Left.(*Filter); !ok {
-		t.Fatalf("Join.Left is %T, want *Filter (legacy copy still lands)", nj.Left)
+		t.Fatalf("Join.Left is %T, want *Filter (the placed conjunct)", nj.Left)
+	}
+	if len(f.PushedBelow) != 0 {
+		t.Fatalf("PushedBelow has %d entries; a MOVE duplicates nothing, so "+
+			"the descendant prices the conjunct once by construction",
+			len(f.PushedBelow))
+	}
+}
+
+// TestMoveAcrossPreservedRightLink is the RIGHT-link mirror: the preserved
+// side is the right one, so the same argument holds with the sides swapped.
+// Both directions are pinned because joinRestrictionSides encodes them
+// separately, and a one-sided fix would look correct in every LEFT test.
+func TestMoveAcrossPreservedRightLink(t *testing.T) {
+	left := srcScan("a", srcCol("x", 1))
+	right := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeRight, left, right)
+	f := &Filter{Child: j, Predicate: srcGt(1, "y", 2, 7)}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if !dropSelf {
+		t.Fatal("C-02d: a preserved-side qual on a RIGHT link must MOVE")
+	}
+	nj := newChild.(*Join)
+	rf, ok := nj.Right.(*Filter)
+	if !ok {
+		t.Fatalf("Join.Right is %T, want *Filter (the placed conjunct)", nj.Right)
+	}
+	// RIGHT is the direction where the rebase is non-zero (delta =
+	// -leftWidth), so the placed index is pinned here specifically.
+	if got := columnRefIndexes(rf.Predicate); len(got) != 1 || got[0] != 0 {
+		t.Errorf("placed predicate refs = %v, want [0] (rebased into the right input)", got)
+	}
+	if len(f.PushedBelow) != 0 {
+		t.Fatalf("PushedBelow has %d entries; a MOVE duplicates nothing", len(f.PushedBelow))
+	}
+}
+
+// TestNullableSideQualNeverDescends is the C-02d safety counter-pin: a qual
+// reading the NULLABLE side of a LEFT link must not be placed below it at
+// all — pushing `b.y > 7` under the link would judge NULL-extended rows on
+// base-row values and drop rows the query keeps. Two independent gates
+// refuse it (joinRestrictionSides answers left-only, and delayedAboveOJ
+// reports delay); this pins the OUTCOME so neither can be relaxed silently.
+func TestNullableSideQualNeverDescends(t *testing.T) {
+	left := srcScan("a", srcCol("x", 1))
+	right := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeLeft, left, right)
+	pred := srcGt(1, "y", 2, 7)
+	f := &Filter{Child: j, Predicate: pred}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("a nullable-side qual must NEVER move: the residual is what " +
+			"masks match -> null-extension flips")
+	}
+	nj := newChild.(*Join)
+	if _, ok := nj.Right.(*Filter); ok {
+		t.Fatal("nullable-side qual was placed below the LEFT link")
 	}
 	if got := len(splitAnd(f.Predicate)); got != 1 {
-		t.Fatalf("residual has %d conjuncts, want 1 (kept)", got)
+		t.Fatalf("residual has %d conjuncts, want 1 (kept intact)", got)
+	}
+}
+
+// TestFullJoinQualNeverDescends pins the FULL case: both sides are
+// nullable, so no descent is legal in either direction.
+func TestFullJoinQualNeverDescends(t *testing.T) {
+	left := srcScan("a", srcCol("x", 1))
+	right := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeFull, left, right)
+	f := &Filter{Child: j, Predicate: srcGt(0, "x", 1, 7)}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("FULL: both sides null-extend, so nothing may move")
+	}
+	nj := newChild.(*Join)
+	if _, ok := nj.Left.(*Filter); ok {
+		t.Fatal("qual was placed below a FULL link")
 	}
 }
 
@@ -658,5 +742,114 @@ func TestPartialMoveKeepsOneConjunct(t *testing.T) {
 	}
 	if got := len(splitAnd(lf.Predicate)); got != 2 {
 		t.Errorf("placed Filter has %d conjuncts, want 2 (moved Gt + kept-copy Eq)", got)
+	}
+}
+
+// --- C-02d multi-level pins (the proof is over the WHOLE path) ---------
+
+// TestNullableSideQualBlockedTwoLevels pins the conjunctive part of the
+// claim on a two-level spine: `(a LJ b) LJ c` with a qual on `b`, which is
+// the NULLABLE side of the LOWER link. The upper link would admit a
+// left-side descent on its own; the lower one must refuse, and the
+// conjunct must survive whole in the residual. A single-level test cannot
+// distinguish "proof is conjunctive over the path" from "proof consults
+// only the top link".
+func TestNullableSideQualBlockedTwoLevels(t *testing.T) {
+	a := srcScan("a", srcCol("x", 1))
+	b := srcScan("b", srcCol("y", 2))
+	c := srcScan("c", srcCol("z", 3))
+	lower := srcJoin(JoinTypeLeft, a, b)
+	upper := srcJoin(JoinTypeLeft, lower, c)
+	f := &Filter{Child: upper, Predicate: srcGt(1, "y", 2, 7)}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("a qual on the LOWER link's nullable side must never move")
+	}
+	nj := newChild.(*Join)
+	lj, ok := nj.Left.(*Join)
+	if !ok {
+		t.Fatalf("upper.Left is %T, want the lower *Join", nj.Left)
+	}
+	if _, ok := lj.Right.(*Filter); ok {
+		t.Fatal("qual was placed on the nullable side of the lower LEFT link")
+	}
+	if got := len(splitAnd(f.Predicate)); got != 1 {
+		t.Fatalf("residual has %d conjuncts, want 1 (kept whole)", got)
+	}
+}
+
+// TestMoveInnerAboveOuterTwoLevels is the positive two-level case:
+// `(a LJ b) JOIN c` with a qual on `a`. The descent crosses an INNER link
+// and then the preserved side of a LEFT link, so both levels prove and the
+// conjunct moves all the way onto `a`.
+func TestMoveInnerAboveOuterTwoLevels(t *testing.T) {
+	a := srcScan("a", srcCol("x", 1))
+	b := srcScan("b", srcCol("y", 2))
+	c := srcScan("c", srcCol("z", 3))
+	lower := srcJoin(JoinTypeLeft, a, b)
+	upper := srcJoin(JoinTypeInner, lower, c)
+	f := &Filter{Child: upper, Predicate: srcGt(0, "x", 1, 7)}
+
+	newChild, dropSelf := pushInnerJoinInputQuals(f)
+	if !dropSelf {
+		t.Fatal("INNER above LEFT, qual on the preserved leaf: must MOVE")
+	}
+	nj := newChild.(*Join)
+	lj, ok := nj.Left.(*Join)
+	if !ok {
+		t.Fatalf("upper.Left is %T, want the lower *Join", nj.Left)
+	}
+	if _, ok := lj.Left.(*Filter); !ok {
+		t.Fatalf("lower.Left is %T, want *Filter (placed on `a`)", lj.Left)
+	}
+}
+
+// TestIdentityDisagreementKeepsResidual pins the one case where the delay
+// proof is the SOLE control: the conjunct's ColumnRef.Index says
+// preserved-side (so innerJoinPushTarget selects the left input and the
+// side gate admits it) while its SourceTableIdx says the qual really reads
+// the NULLABLE side. Index drives execution, so the copy still lands —
+// but the move must be refused, because on that disagreement the identity
+// is what describes the true column. Without this the two attributions
+// could silently diverge and a nullable-side qual would be dropped from
+// the residual.
+func TestIdentityDisagreementKeepsResidual(t *testing.T) {
+	a := srcScan("a", srcCol("x", 1))
+	b := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeLeft, a, b)
+	// Index 0 = left/preserved column; SourceTableIdx 2 = table `b`,
+	// which is this link's nullable side.
+	pred := &BinaryOp{
+		Op:    parser.OpGt,
+		Left:  &ColumnRef{Index: 0, Type: catalog.Type{Name: "int4"}, SourceTableIdx: 2},
+		Right: &IntegerConst{Value: 7},
+	}
+	f := &Filter{Child: j, Predicate: pred}
+
+	_, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("Index/SourceTableIdx disagreement must degrade to a COPY, " +
+			"never a move: the identity describes the true column")
+	}
+	if got := len(splitAnd(f.Predicate)); got != 1 {
+		t.Fatalf("residual has %d conjuncts, want 1 (kept)", got)
+	}
+}
+
+// TestConstantConjunctIsUnprovable pins the fail-closed treatment of a
+// conjunct that reads no relation. innerJoinPushTarget refuses it today,
+// so this asserts the OUTCOME (no move) rather than the mechanism — the
+// ledgered pseudoconstant work would make the delay site reachable with
+// an empty relset, where a vacuous "proven" would be a silent move.
+func TestConstantConjunctIsUnprovable(t *testing.T) {
+	a := srcScan("a", srcCol("x", 1))
+	b := srcScan("b", srcCol("y", 2))
+	j := srcJoin(JoinTypeInner, a, b)
+	f := &Filter{Child: j, Predicate: &BooleanConst{Value: false}}
+
+	_, dropSelf := pushInnerJoinInputQuals(f)
+	if dropSelf {
+		t.Fatal("a column-free conjunct must not move (unprovable, fail-closed)")
 	}
 }

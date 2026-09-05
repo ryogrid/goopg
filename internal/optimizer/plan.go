@@ -1489,11 +1489,11 @@ type Filter struct {
 	// double-counting them because they were not considered in estimating
 	// the sizes of the component rels").
 	//
-	// goopg moves the clause only on the C-02c proof (proven all-INNER
-	// path, no sibling derivation) — otherwise the copy left above the
-	// join is what keeps the join's own residual evaluation correct — so
-	// copies (not moves) are recorded here and `filterSelectivity` skips
-	// those conjuncts. M0127-P5.6-f-vi.
+	// goopg moves the clause only on the C-02c/d proof (full-path delay
+	// proof, side containment, no sibling derivation) — otherwise the
+	// copy left above the join is what keeps the join's own residual
+	// evaluation correct — so copies (not moves) are recorded here and
+	// `filterSelectivity` skips those conjuncts. M0127-P5.6-f-vi.
 	PushedBelow []Expr
 }
 
