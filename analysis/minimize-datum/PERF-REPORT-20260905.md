@@ -185,6 +185,44 @@ TIMEOUT=0.**
   correction: the allow-list definition in `04-target-design.md` §3.1 would
   have declined every text column in both suites and produced a false STOP.
 
+## 5.5. The measurement that stopped a 900-line slice
+
+**D-04 (MD-03.5)** exists to decide D-05 before ~900 LOC is sunk, and it
+was allowed to return a negative result. It did.
+
+| number | result |
+|---|---|
+| batch count | **4 → 4, unchanged** |
+| retained bytes | −14.2% (join accounting), −24.4% (live heap) |
+| wall time | **+6.8%**, n=7 per arm, distributions barely overlapping |
+| allocation count | **+39%** |
+| values | MATCH |
+
+Stopping rule 05 §6, in its own words: *"batches unchanged → the model in
+D-3 is wrong. Fix the model before touching another site."*
+
+Two measured reasons, both independent of packing:
+
+- **`avgVarBytes` is ~62% too high** — the model says 194 B/row where
+  retention measures 120 — and the excess is in a term packing cannot
+  touch. **Correcting it alone takes the batch count 4 → 2 with no packing
+  at all**, which is the outcome D-05 was going to claim.
+- **The model prices rows and ignores the table.** Peak live heap is 506 MB
+  of hash-map buckets against 296 MB of rows. The largest memory consumer
+  in this join is not the retention format.
+
+The stale premise matters more than the verdict. The bundle was scoped
+against 1098 B/row; EX1 narrowing has since taken this build half to
+**120 B/row over two columns**, so the ~5× width premise is **1.9×**, on
+about 14% of the join's peak. And 05 §6's prediction that allocation count
+is "unchanged by construction" is wrong for this tree: the encoder costs
+about six allocations per packed row against one for the legacy retain.
+
+Two harnesses came out of it: the query-level live-heap sampler that 05 §6
+records as not existing, and a separately ledgered finding that each of
+five parallel workers builds all 1.5 M rows privately, a 5× multiplier
+nothing in this bundle addresses.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
