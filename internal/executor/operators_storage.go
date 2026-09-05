@@ -2172,12 +2172,19 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 	// take2: the invariant P4-01b broke — this operator's row must be as wide
 	// as the schema it advertises. Off unless GOOPG_ASSERT_ROW_SHAPE=1.
 	assertRowShapeInline("seqScanOp", o.schema, len(row))
-			// Detoast any out-of-line column values (M0046-0006).
-			// DetoastRow may return a fresh row when it allocates
-			// large detoasted strings; either way the result is
-			// safe to clone.
-			if needsDetoast(row) {
-				detoasted, err := DetoastRow(o.ctx, rel, o.cols, row)
+		// Detoast any out-of-line column values (M0046-0006).
+		// DetoastRowBound may return a fresh row when it allocates
+		// large detoasted strings; either way the result is
+		// safe to clone.
+		// EX1-03a: bound-narrowed detoast over the same survivor
+		// window the deform above narrowed to — only i < survivorBound
+		// is resolved. The prefix-scoped needsDetoastPrefix pairing is
+		// load-bearing: the undeformed tail still holds the previous
+		// tuple's datums (or poison when armed), so a whole-row
+		// needsDetoast here could false-positive on a stale tail
+		// pointer and skip a LIVE tuple via the continue below.
+		if needsDetoastPrefix(row, survivorBound) {
+			detoasted, err := DetoastRowBound(o.ctx, rel, o.cols, row, survivorBound)
 				if err != nil {
 					if o.pinned != nil {
 						o.pinned.RUnlock()
@@ -5490,6 +5497,17 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		if isInheritChild {
 			scanPred = nil
 		}
+		// EX1-03b: attribute the SET-clause column reads once per scanned
+		// table (plan-fixed, not row-dependent) so the per-row eval-row
+		// build below can resolve just those attributes via DetoastAttr.
+		// A declined shape (fullRow=true) keeps the exact pre-EX1-03
+		// whole-row behaviour. Skipped for inheritance children, whose
+		// SET exprs evaluate in parent column space (remapped below).
+		var setRefCols []int
+		var setRefsFullRow bool
+		if !isInheritChild {
+			setRefCols, setRefsFullRow = updateSetRefCols(o.plan.Set, len(captureCols))
+		}
 		if err := scanMatching(o.ctx, scanRel, scanTbl.OID, scanCols, scanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
 			// Clear multi-column subquery cache so each row gets a fresh evaluation.
 			clear(o.ctx.MultiAssignSubqCache)
@@ -5549,19 +5567,20 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				// unmodified out-of-line value keeps its existing TOAST
 				// pointer instead of being needlessly re-toasted — mirrors
 				// PG's behaviour of leaving an unchanged TOASTed datum alone.
+				// EX1-03b: the eval row itself is attr-lazy — only the
+				// SET-referenced attributes are resolved via DetoastAttr
+				// (siblings stay pointers); a declined SET shape falls back
+				// to whole-row detoast inside detoastUpdateEvalRow.
 				var detoastedRow Row
 				for i := range captureCols {
 					setIdx := i
 					if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
 						if detoastedRow == nil {
-							detoastedRow = row
-							if needsDetoast(row) {
-								dr, derr := DetoastRow(o.ctx, scanRel, captureCols, row)
-								if derr != nil {
-									return derr
-								}
-								detoastedRow = dr
+							dr, derr := detoastUpdateEvalRow(o.ctx, scanRel, captureCols, row, setRefCols, setRefsFullRow)
+							if derr != nil {
+								return derr
 							}
+							detoastedRow = dr
 						}
 						v, err := evalExpr(o.plan.Set[setIdx], detoastedRow, o.ctx)
 						if err != nil {

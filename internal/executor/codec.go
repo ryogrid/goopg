@@ -2005,6 +2005,31 @@ func decodePhysicalPGValueLowered(t catalog.Type, tname string, data []byte, sct
 			return NewStringDatum(""), n, nil
 		}
 		return NewStringDatum(catalog.ArrayTextLiteral(elems)), n, nil
+	case "json", "jsonb", "xml":
+		// PG external varlena (VARATT_IS_1B_E = 0x01): our TOAST pointer.
+		// EX1-03 gate: these types are in isToastableType, so oversized
+		// values ARE toasted on write (ToastLargeColumnsIfNeeded) and the
+		// pointer is encoded by the type-independent encodeRowPGCtx arm;
+		// without this arm the shared default below raised "decode %q as
+		// varlena" on the 13-byte pointer blob and the scan silently
+		// skipped the tuple (measured: SELECT v over a toasted json
+		// column returned 0 rows pre-EX1-03). The marker is unambiguous
+		// (same argument as the text arm); inline values take the
+		// identical default path as before.
+		if len(data) >= 13 && data[0] == 0x01 {
+			ptr := make([]byte, 12)
+			copy(ptr, data[1:13])
+			return NewToastPointerDatum(ptr), 13, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode %q as varlena: %w", t.Name, err)
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	default:
 		// Unknown type (e.g. "point", "path", custom types).  goopg's
 		// encodeValuePG stores them as PG varlena text (the default branch

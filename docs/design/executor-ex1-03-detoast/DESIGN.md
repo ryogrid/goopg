@@ -12,10 +12,11 @@ total). The witness is a SYNTHETIC shape: `w(id, narrow text, wide
 text)` with wide >2000 B; matrix {SELECT narrow/wide, WHERE wide,
 ORDER BY wide, join on wide, index on wide} × values-diff vs PG oracle
 + `DetoastValue`-call counts. The TODO line is amended accordingly at
-close. Pointer-producing types only: text/varchar/char/bpchar/bytea
-(numeric/fixed-width never toast — negative test).
+ close. Pointer-producing types: text/varchar/char/bpchar/bytea plus
+ unknown/json/jsonb/xml where verified produced (the `isToastableType`
+ set, not a subset; numeric/fixed-width never toast — negative test).
 
-## 2. Mechanism (three sub-slices, one commit)
+## 2. Mechanism (four sub-slices, one commit)
 
 - (a) Bound-narrowed `DetoastRow`: pass the EX1-01/02 deform/survivor
   bound in; resolve only pointers at `i < bound`. Soundness comes
@@ -35,6 +36,13 @@ close. Pointer-producing types only: text/varchar/char/bpchar/bytea
   the row-lazy UPDATE SET-clause site (which is row-lazy, not
   attr-lazy today). Single-column resolution leaves sibling pointers
   untouched (contract test pins this new behavior).
+- (d) Decode-path arm for json/jsonb/xml TOAST pointers
+  (`codec.go`): the type-independent `encodeRowPGCtx` arm writes
+  pointers for these types but the decoder's json/jsonb/xml arm
+  raised "decode as varlena" on the 13-byte pointer blob and the
+  scan silently skipped the tuple (measured: SELECT over a toasted
+  json column returned 0 rows). Same 13-byte/`0x01` shape argument
+  as the text arms.
 - (c) Barrier audit, KEPT EAGER, tabulated loud-vs-silent (a walk
   miss at a silent sink is wrong answers; at a loud sink an error):
   SILENT — `compareDatum` mixed-kind (string-compares the
