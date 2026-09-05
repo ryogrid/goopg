@@ -555,11 +555,67 @@ rule).*
 - [ ] **C-09 P3-08 `reduce_unique_semijoins`** — after clearing SEMI
   left-only `Output()` re-indexing (ledger 794).
   *design: take3 08 §6.3; gate: take3 09 §5 P3 (PP + values-diff).*
-- [ ] **C-10 P4-00 pre-phase scoping.** Grouping-sets interaction,
-  `remove_useless_joins`, `reduce_outer_joins.go` interaction,
-  FROM-subquery pull-up coverage — each a scoped item before the phase
-  starts.
+- [x] **C-10 P4-00 pre-phase scoping.** Done 2026-09-05: all four areas
+  investigated against the tree and split into the items below. One result
+  is negative and removes a checkbox rather than adding one. Analysis
+  artifact: `analysis/planner-refactor-take3/c10-p400-scoping-20260905/README.md`.
   *design: take3 08 §7; gate: scoped items filed (take3 09 §9 reporting).*
+- [ ] **C-10a P4-00a grouping-sets scope + `dNumGroups` fix.** Before C-11
+  fixes the upper-`RelOptInfo` struct, decide (i) whether `GROUP_AGG`
+  carries a PG-shaped rollup list or keeps the flat
+  `Aggregate.GroupingSets [][]int`, and (ii) whether C-15 ships a
+  grouping-sets arm or pins them to AGG_HASHED as a measured permitted
+  divergence. Land the behaviour-free half now: `estimateAggregate`
+  (`cardinality.go:1087`) ignores `a.GroupingSets` entirely, so an N-set
+  query is priced as one set — an under-estimate up to N× feeding C-15's
+  `cost_agg` and C-17's `tuple_fraction`. The four `GroupingSets != nil`
+  declines (`groupagg_hashagg.go:64`, `groupagg_presorted.go:47`,
+  `groupagg_indexorder.go:68`, `parallel_agg.go:117`) are C-15's retirement
+  checklist — they are what currently keeps grouping sets on the only
+  strategy the executor implements.
+  *before C-11; cardinality half before C-15/C-17. gate: EA ratchet on the
+  12 TPC-DS grouping-sets queries + values unchanged. ~60–150 LOC, medium.*
+- [ ] **C-10b P3-09 `remove_useless_joins` — RECLASSIFIED to Phase 3.**
+  Scoping result: this touches **no** Phase-4 item, so it is not a P4-00
+  blocker. PG runs it below the upper planner entirely, changing the
+  joinlist; none of C-11…C-18 reads or produces one. goopg has no analogue,
+  but both halves of the primitive exist — `joinkeyproof.go:56
+  uniqueKeyColumnSets` is `rel_is_distinct_for` for the base-relation case,
+  and `pathindexonlyneed.go`'s needed/output name sets answer
+  "unused above", both decline-biased.
+  *after C-04, beside C-09. gate: P3 PP + a forced fixture + byte-identical
+  values. ~200–350 LOC, low-medium.*
+- [ ] **C-10c P4-00c outer-join qual-placement contract for upper rels.**
+  `reduceOuterJoins` itself needs no change — it is a prep pass at
+  `planner.go:2716`, before deconstruction, and C-01/C-02 already document
+  their dependence on it. The Phase-4 obligation is the CONSUMER side:
+  `pushSingleSideQualsIntoInnerJoinInputs` descends through `*Aggregate`,
+  `*WindowAgg`, `*Sort` and `*Limit` arms that C-11/C-15/C-16/C-18 delete,
+  and it is the sole consumer of the `delayedAboveOJ` oracle. Name, per
+  Phase-4 checkbox, which arm retires and where the delay test is
+  re-asserted in the replacement, and pin a fixture where narrowing an
+  upper target across a LEFT link would be wrong — so C-15's applying cut
+  cannot silently drop the guard.
+  *before C-11; fixture before C-15. gate: red-then-green fixture + P4
+  values-diff. doc + ~80–150 test LOC, low risk, buys off a high one.*
+- [ ] **C-10d P4-00d FROM-subquery pull-up: measure the boundary, then
+  decide.** The structural one. goopg has **no** `pull_up_subqueries`: a
+  derived table is planned as an opaque sub-problem admitted as one
+  prebuilt leaf (`planSubqueryRangeVar`, `planner.go:4295`), and there is
+  no `SubqueryScan` node. TPC-H 5/22 queries carry a FROM-subquery and
+  TPC-DS ~41/100 (the TPC-DS count is regex-derived and must be re-derived
+  from the AST before it enters a design doc). The shape matters more than
+  the count: **Q9 — P4-01's own witness — puts its entire 6-way join tree
+  inside the derived table**, so the scan/join rel C-11's upper rels must
+  sit above is one planning level down. Decide before C-11 whether upper
+  rels may cross a foreign planning scope or goopg grows a pull-up.
+  `relfromjoinlist.go:26-29` already ledgers what the boundary costs
+  C-12/C-13/C-17 (no differently-sorted path, priced for "produce all
+  rows", so an outer LIMIT cannot reach in).
+  *before C-11 AND before P4-01's applying cut — the tightest ordering
+  constraint of the four. gate: measurement filed; if the port is chosen,
+  values-diff both suites (it moves ~46 corpus queries at once).
+  measurement doc-only; the port would be ~400–700 LOC, high risk.*
 - [ ] **C-11 P4-02 upper `RelOptInfo`s** (`GROUP_AGG`, `WINDOW`,
   `DISTINCT`, `ORDERED`, `FINAL`) with pathlists.
   *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
