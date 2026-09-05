@@ -891,7 +891,44 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   `take3-D-02-jsonb-text` (json/jsonb stored as text varlena).
   Artifact: `analysis/minimize-datum/d02-type-fidelity-20260905/README.md`.
   *design: 04 §3 (D-2), §9.2; gate: 06 §3 MD-02; document only.*
-- [ ] **D-03 MD-03 `PackedTuple` + `PackedSlot`, unreachable.** MinimalTuple
+- [x] **D-03 MD-03 `PackedTuple` + `PackedSlot`, unreachable.** Landed
+  2026-09-05, ~1,950 LOC (740 code, 1,210 tests). PG MinimalTuple layout
+  byte-exact (`t_hoff` on PG's HEAP scale per `heap_form_minimal_tuple`;
+  the negative-offset trick deliberately NOT ported, `dataOffset()`
+  subtracts instead); 4-byte hash prefix matching `spill.go`'s
+  `WriteRowHashed` framing; `(nvalid, off)` watermark; `deformTo` calls the
+  UNEXPORTED `decodeRowRangeInfo` (the exported wrapper hardcodes
+  `info = nil` and would discard D-01's descriptor — REVIEW M-goopg-3).
+  **No producer** — pinned by a repo-wide guard test.
+  **R-0: the design's table of six sites was WRONG — there are seven.**
+  Review found the `CTIDExpr` switch (`expr.go`) unarmed, which would have
+  read `ctid` as NULL *silently*, after two other arms went to the trouble
+  of propagating the tid there. An eighth site (`parallel_runtime.go`) is
+  correct-by-default and is now documented rather than armed. Both are
+  errata against 04 §9.1.
+  **Second blocker fixed: a partially-deformed row could escape.** The
+  error path set `nvalid = width`, so `Row()` early-returned and handed
+  back a slice whose tail held the PREVIOUS tuple's values —
+  `poisonDeformTail` cannot prevent it because it is off in production.
+  `Row()`/`Materialize()` now fail closed on a latched error.
+  Also fixed: the plain-column TOAST check was descriptor-WIDE while its
+  message asserted a per-column fact (accepted a TOAST pointer in the
+  `int4` of an `{int4,text}` row); and the source guard was vacuous — it
+  matched the word "PackedSlot" in a comment, so deleting an arm kept it
+  green. It now counts the construct per site and it CAUGHT the missing
+  seventh arm when rewritten.
+  R-7 (descriptor ownership) and R-8 (scratch reset = tuple Load, into a
+  slot-private arena) both resolved as doc comments at the definitions.
+  Review: REQUEST-CHANGES → all findings addressed (2 blockers, 4 majors).
+  Gates: executor suite green with 25 new tests; TPC-H values 24/24 MATCH;
+  plans byte-identical; plan-gate PASS; PP unchanged 6/14/2.
+  Two ledger rows for narrowed scope: `take3-D-03-attcacheoff-descriptor-only`
+  (descriptor half landed, consuming half not) and
+  `take3-D-03-arena-generation` (a PARENT-context reset cascades and would
+  invalidate a slot's values — a hard requirement on D-05, the first slice
+  with a producer).
+  Original scope note follows.
+  **D-03 (original).** MinimalTuple
   layout, 15-byte header, `hoff`-relative accessors, 4-byte hash prefix;
   `(nvalid, off)` watermark over the real decode wrapper (call
   `decodeRowRangeInfo` or a new exported wrapper taking `info` — NOT
@@ -1231,6 +1268,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| D-03 | 2026-09-05 | (this commit) | PackedTuple/PackedSlot unreachable; SEVEN R-0 sites armed (design said six) | review REQUEST-CHANGES -> resolved; values 24/24, plans byte-identical; 25 tests |
 | C-10a (cardinality half) | 2026-09-05 | (this commit) | grouping-sets aggregates were priced as ONE set; now summed per set and clamped | values 24/24 + TPC-DS CKMISMATCH=0; PP unchanged; 4 new tests |
 | C-20d | 2026-09-05 | (this commit) | **index-probe multiplier calibrated 1.0 -> 2.0: TPC-H suite 138.58 -> 100.79 s (-27%), Q5 5.3x, Q7 2.7x, Q9 1.9x, Q3 2.3x** | values 24/24 + TPC-DS CKMISMATCH=0; plan parity IMPROVED 5/15 -> 6/14; flag retirement stays blocked |
 | D-01 | 2026-09-05 | (this commit) | TupleDesc descriptor fields derived, not transcribed; agreement test spans two pg_type.dat transcriptions | additive, no consumer yet; values 24/24, plans byte-identical, plan-gate PASS |

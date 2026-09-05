@@ -342,6 +342,20 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 			d := s.Get(colIdx)
 			checkDeformPoison(d)
 			return d, nil
+		case *PackedSlot:
+			// R-0 site 2 (04 §9.1), D-03. Without an arm a *PackedSlot falls
+			// past the switch to the unchecked `slot.Get(colIdx)` below, which
+			// loses the bounds guard this whole switch exists to provide — and
+			// an out-of-range index there panics raw in a goroutine outside
+			// ParallelGroup.Go's recover (the TPC-DS Q8 post-mortem above).
+			// Width() is the descriptor's width, not the deform watermark, so
+			// the comparison is the same one every other arm makes.
+			if colIdx < 0 || colIdx >= s.Width() {
+				return evalFastColumnRefErr(n, slot, ctx, colIdx, s.Width())
+			}
+			d := s.Get(colIdx)
+			checkDeformPoison(d)
+			return d, nil
 		case rowSlotView:
 			if colIdx < 0 || colIdx >= len(s) {
 				return evalFastColumnRefErr(n, slot, ctx, colIdx, len(s))

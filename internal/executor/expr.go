@@ -450,6 +450,16 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of Slot range %d", cref.Name, cref.Index, w)}
 			}
 		}
+		// R-0 site 3 (04 §9.1), D-03. The guards above are written per
+		// concrete type, so a slot kind without one is simply not bounds
+		// checked: a stale planner index would panic raw inside PackedSlot.Get
+		// (`s.values[col]`) rather than raising XX000, and a raw panic on this
+		// seam escaped to serveConn once already (see the paragraph above).
+		if ps, ok := slot.(*PackedSlot); ok {
+			if w := ps.Width(); cref.Index < 0 || cref.Index >= w {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of PackedSlot range %d", cref.Name, cref.Index, w)}
+			}
+		}
 		// EX1-01 tail-poison: a poisoned datum here means some consumer read
 		// a scan column past the deform bound — a walk miss. checkDeformPoison
 		// panics only when the debug flag is armed, so release cost is one
@@ -554,6 +564,20 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				return NewStringDatum(fmt.Sprintf("(%d,%d)", s.ctidBlock, s.ctidOff)), nil
 			}
 		case *Slot:
+			if s.hasCTID {
+				return NewStringDatum(fmt.Sprintf("(%d,%d)", s.ctidBlock, s.ctidOff)), nil
+			}
+		case *PackedSlot:
+			// R-0 SEVENTH site (D-03). 04 §9.1's table lists six; this one
+			// was missed there and found by review. It is the ONLY consumer
+			// of a slot's carried tid for `ctid` in an expression —
+			// `evalFastExpr` deliberately does not fold CTIDExpr
+			// (exprnode.go), and WHERE CURRENT OF goes through the `TID()`
+			// interface method instead, which PackedSlot implements.
+			//
+			// Without this arm a PackedSlot falls to the `return NullDatum`
+			// below and `ctid` reads NULL — silently, and after sites 4 and 5
+			// went to the trouble of propagating the tid this far.
 			if s.hasCTID {
 				return NewStringDatum(fmt.Sprintf("(%d,%d)", s.ctidBlock, s.ctidOff)), nil
 			}

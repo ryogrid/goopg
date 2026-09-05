@@ -379,6 +379,13 @@ func (o *projectOp) Next() (TupleSlot, error) {
 		o.slot.hasCTID = v.hasCTID
 		o.slot.ctidBlock = v.ctidBlock
 		o.slot.ctidOff = v.ctidOff
+	case *PackedSlot:
+		// R-0 site 5 (04 §9.1), D-03 — the sibling of opnode.go's
+		// fillFromTupleSlot switch. The two must agree; they are the pair
+		// pattern_sibling_paths_must_agree names.
+		o.slot.hasCTID = v.hasCTID
+		o.slot.ctidBlock = v.ctidBlock
+		o.slot.ctidOff = v.ctidOff
 	default:
 		o.slot.hasCTID = false
 	}

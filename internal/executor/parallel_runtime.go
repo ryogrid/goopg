@@ -57,10 +57,20 @@ func MaterializeForTransfer(row Row) Row {
 //     the fresh buffer transfers as-is (zero further copies); otherwise it
 //     is promoted with cloneRowOwned and the source buffer is released back
 //     to the pool (today that buffer leaks — A12 churn).
-//   - Every other slot kind (*Slot, *MaterializedSlot) returns a view over
-//     a producer-reused buffer (slab Cells, projectOp.o.out, scanRow), so
-//     the slice MUST be copied regardless of arena content. That path stays
-//     exactly MaterializeForTransfer.
+//   - Every other slot kind (*Slot, *MaterializedSlot, *PackedSlot) returns
+//     a view over a producer-reused buffer (slab Cells, projectOp.o.out,
+//     scanRow, or — for a PackedSlot — its own deform scratch), so the slice
+//     MUST be copied regardless of arena content. That path stays exactly
+//     MaterializeForTransfer.
+//
+//     *PackedSlot is named explicitly because this list is what a future
+//     producer will read to decide whether its slot kind needs handling
+//     here, and the answer for a packed slot is "no, the default is already
+//     correct" — its Row() aliases a scratch that the next Load overwrites,
+//     which is exactly the condition the copy exists for. It is therefore
+//     the same class as R-0's documentation-only site (04 §9.1), not a
+//     missing arm. Recorded during the D-03 review, which found this site
+//     absent from both the slice's own list and §9.1's table.
 //
 // Sharing owned (ArenaID == 0) Datum payloads across the queue is safe: ints
 // and other value kinds copy by value, and owned Buf bytes are never mutated

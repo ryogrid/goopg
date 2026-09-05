@@ -105,10 +105,15 @@ func colTypeDescriptor(t catalog.Type) userTypeAttrs {
 // cheaper and provably the same answer.
 var _ = colTypeInfo{}.isTSTZ
 
-// Keep the D-01 payload referenced until D-03 consumes it, so `unused` does
-// not flag fields the next slice is specified to read.
-var (
-	_ = colTypeInfo{}.attLen
-	_ = colTypeInfo{}.attByVal
-	_ = colTypeInfo{}.attStorage
-)
+// D-03 consumed two thirds of the D-01 payload: NewTupleDescFromColumns
+// (packedtuple.go) reads `attLen` for PG's attcacheoff walk and for
+// HEAP_HASVARWIDTH, and `attStorage` to reject a TOAST pointer packed into a
+// plain column.
+//
+// `attByVal` still has no consumer, and the reason is structural rather than
+// an oversight: PG reads attbyval in `fetchatt` (execTuples.c:1085) to decide
+// whether the Datum IS the value or points at it, and goopg's decoder has no
+// such fork — `decodePhysicalPGValueLowered` always materialises a Datum. It
+// gains one at D-09/MD-1x, when the alignment codec unifies with PG's; keep it
+// referenced until then so `unused` does not flag it.
+var _ = colTypeInfo{}.attByVal

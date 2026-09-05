@@ -164,6 +164,17 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 		s.hasCTID = false
 		return
 	}
+	// R-0 site 6 (04 §9.1, "performance only"), D-03. A *PackedSlot
+	// deliberately takes the generic path below, and the decision is written
+	// out rather than left implicit because the obvious "optimisation" is
+	// wrong twice over. VirtualSlot needs the fast path because its Row() is
+	// acquireRow plus a 48-byte Datum copy per column and then drops the
+	// pooled row; PackedSlot.Row() deforms into its OWN reused scratch and
+	// returns it, so the generic path is already allocation-free and one
+	// `copy` beats a per-column Get with a watermark branch. And a
+	// VirtualSlot-shaped arm would early-return past the ctid switch below,
+	// which is where a PackedSlot's carried tid is read — silently setting
+	// hasCTID = false and breaking CTIDExpr / WHERE CURRENT OF.
 	row := ts.Row()
 	if cap(s.Cells) < len(row) {
 		s.Cells = make([]Datum, len(row))
@@ -179,6 +190,13 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 		s.ctidBlock = v.ctidBlock
 		s.ctidOff = v.ctidOff
 	case *Slot:
+		s.hasCTID = v.hasCTID
+		s.ctidBlock = v.ctidBlock
+		s.ctidOff = v.ctidOff
+	case *PackedSlot:
+		// R-0 site 4 (04 §9.1), D-03. Without this arm a PackedSlot's carried
+		// tid falls to `default: hasCTID = false` — silently, and only
+		// CTIDExpr and WHERE CURRENT OF would notice (04 §7).
 		s.hasCTID = v.hasCTID
 		s.ctidBlock = v.ctidBlock
 		s.ctidOff = v.ctidOff
