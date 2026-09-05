@@ -5,7 +5,7 @@ import (
 )
 
 // planToParserJoinType maps a plan-tree join type onto the parser jointype
-// domain SpecialJoinInfo speaks. The two enums name the same six shapes;
+// domain SpecialJoinInfo speaks. The two enums name the same seven shapes;
 // LATERAL is not a type in either (it is a Join flag, declined upstream
 // of delay).
 func planToParserJoinType(t JoinType) parser.JoinType {
@@ -23,7 +23,10 @@ func planToParserJoinType(t JoinType) parser.JoinType {
 	case JoinTypeAnti:
 		return parser.JoinAnti
 	default:
-		return parser.JoinInner
+		// Unreachable (closed 7-value enum, all covered); FULL delays
+		// for any touching qual, so an unknown future type defaults
+		// to delay = fail-closed.
+		return parser.JoinFull
 	}
 }
 
