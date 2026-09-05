@@ -148,7 +148,7 @@ func TestNLIArmDoesNotDuplicateTheUnparameterizedMember(t *testing.T) {
 	// exact tie: the arm contributes NOTHING for an inner whose only
 	// representative is unparameterised.
 	direct := newRelOptInfo(outerRelids|innerRelids, 5000, 64)
-	addNLIPaths(nil, direct, outer, inner, cp, nil)
+	addNLIPaths(nil, direct, outer, inner, cp, nil, 0)
 	if len(direct.Pathlist) != 0 {
 		t.Fatalf("the arm added %d paths for an unparameterised inner, want 0", len(direct.Pathlist))
 	}

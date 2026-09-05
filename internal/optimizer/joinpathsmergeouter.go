@@ -114,7 +114,7 @@ type mergeOuterMatch struct {
 // outer before reaching this arm, so only the per-outer-path test is made below —
 // the pathlist can hold parameterised paths that the cheapest-total test did not
 // cover.
-func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	innerCheapestTotal := inner.CheapestTotal
 	if innerCheapestTotal == nil {
 		return
@@ -138,13 +138,13 @@ func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, k
 		if pathParamByRel(op, inner) {
 			continue
 		}
-		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor)
+		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
 
 // generateMergeJoinPaths is `generate_mergejoin_paths` (joinpath.c:1564) for one
 // already-ordered outer path.
-func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups)
 	if len(matched) == 0 {
 		return
@@ -196,7 +196,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// evaluated nowhere — the truncation demotion only ever re-adds clauses cut
 	// from the ALREADY-trimmed list.
 	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
-	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor)
+	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, cp, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 
 	// The truncation search (:1685-1782). `cheapestTotalInner` /
 	// `cheapestStartupInner` carry the best inner found SO FAR, and a candidate
@@ -231,7 +231,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				// construction and this inner was SELECTED for already being
 				// ordered, so neither side is sorted here.
 				tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor)
+					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 			}
 			cheapestTotalInner = ip
 		}
@@ -248,7 +248,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				}
 				if len(newClauses) > 0 {
 					tryMergeJoinPath(joinrel, outerPath, ip, cp, resultKeys, nil, nil,
-						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor)
+						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 				}
 			}
 			cheapestStartupInner = ip
@@ -392,7 +392,8 @@ func trimMergeClausesForInnerPathkeys(mergeClauses []*restrictInfo, pathkeys []P
 // "Currently we do not consider parameterized inner paths here"). That is not an
 // oversight being reproduced: a merge join discharges no parameter, so a
 // parameterised inner would only produce a parameterised join that
-// `tryMergeJoinPath` then refuses on `param_source_rels` anyway.
+// `tryMergeJoinPath` then refuses unless this joinrel's `param_source_rels`
+// wants it (C-08).
 func getCheapestPathForPathkeys(paths []*Path, keys []PathKey, criterion costSelector) *Path {
 	var matched *Path
 	for _, p := range paths {

@@ -1,5 +1,9 @@
 package optimizer
 
+import (
+	"github.com/goopg/goopg/internal/parser"
+)
+
 // M0127-P5.4b-ii-b-1 — the NLI arm of `match_unsorted_outer`: the one place in
 // the search where a parameterised path is CONSUMED rather than produced.
 //
@@ -30,18 +34,70 @@ package optimizer
 // production plans. Validated by `joinpathsnli_test.go`, no longer in
 // isolation.
 
-// paramSourceRels is PG's `extra->param_source_rels` (joinpath.c:227-263): the
-// relations a join path is allowed to stay parameterised BY, which PG derives
-// entirely from `SpecialJoinInfo` entries and LATERAL references.
+// paramSourceRelsForProblem is PG's per-joinrel `extra->param_source_rels`
+// derivation (joinpath.c:242-276): the relations a join path for THIS
+// joinrel is allowed to stay parameterised BY. For each SJI the joinrel
+// overlaps on the RHS but not the LHS, every baserel outside the RHS may
+// source a parameterisation; FULL constrains symmetrically; the joinrel's
+// lateral relids join unconditionally.
 //
-// It is constant-empty in v1 and that is a derivation, not a placeholder: 03
-// §4.4 pins every outer/semi/anti construct outside the search as an opaque
-// `PathPrebuilt` initial rel, so `join_info_list` has no entry the search can
-// see, and goopg has no LATERAL in the searched shape either. PG's own loop
-// over an empty `join_info_list` produces exactly this. The named constant
-// keeps the admission test below shaped like PG's, so admitting special joins
-// later is a change to this function rather than to the test.
-func paramSourceRels() RelSet { return 0 }
+// FRAME RULE (C-08 design §4 — binding): SJI Min hands are
+// statement-leaf-global while this problem numbers its items 1<<i, so
+// hands are remapped by the problem's item run (`items[i]` owns
+// statement leaf `lo+i`): shift right by lo, mask to n bits. Dropped
+// outside bits cannot change an overlap verdict for problem-internal
+// joinrelids/req — exact, not merely fail-closed (DESIGN §4 proves the
+// identity). The run must be single-leaf-consecutive
+// (`items[i].lo == lo+i && items[i].hi == lo+i+1`); anything else (gaps,
+// multi-leaf items, empty run) returns 0 — today's constant. Lateral
+// union is 0 by invariant (no LATERAL shape reaches path generation;
+// DESIGN §3 anchors the decline paths).
+func paramSourceRelsForProblem(joinrelids RelSet, joinInfoList []*SpecialJoinInfo, items []joinlistRel) RelSet {
+	if len(items) == 0 {
+		return 0
+	}
+	lo := items[0].lo
+	n := len(items)
+	for i, it := range items {
+		if it.lo != lo+i || it.hi != lo+i+1 {
+			return 0
+		}
+	}
+	var all RelSet
+	if n >= 32 {
+		all = ^RelSet(0)
+	} else {
+		all = RelSet(1)<<uint(n) - 1
+	}
+	mask := all
+	var out RelSet
+	for _, sj := range joinInfoList {
+		if sj == nil {
+			continue
+		}
+		// RIGHT joins never reach PG's loop (reduce_outer_joins flips
+		// RIGHT→LEFT in prep_jointree); goopg flips only the first
+		// link, so surviving deeper RIGHT SJIs exist. The LEFT-shaped
+		// rule below would read them backwards (nullable side on the
+		// left), so they contribute nothing — v1 behavior preserved
+		// exactly. Unreachable today regardless (pinned links abort
+		// the search before any prefix joinrel overlaps their RHS);
+		// revisit if pinning ever relaxes.
+		if sj.Jointype == parser.JoinRight {
+			continue
+		}
+		minL := (sj.MinLefthand >> uint(lo)) & mask
+		minR := (sj.MinRighthand >> uint(lo)) & mask
+		if relsOverlap(joinrelids, minR) && !relsOverlap(joinrelids, minL) {
+			out |= all &^ minR
+		}
+		if sj.Jointype == parser.JoinFull &&
+			relsOverlap(joinrelids, minL) && !relsOverlap(joinrelids, minR) {
+			out |= all &^ minL
+		}
+	}
+	return out
+}
 
 // allowStarSchemaJoin is `allow_star_schema_join` (joinpath.c:363): a join path
 // may stay parameterised even when nothing in `param_source_rels` wants it, IF
@@ -197,12 +253,15 @@ func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
 //     rule and is complete, the second is a deferral and is ledgered.
 //
 // The consequence is an invariant worth stating, because the rest of the search
-// silently relies on it: every JOIN path in the search is unparameterised, so
-// `Path.Rows == Rel.Rows` holds for every join path and the only parameterised
-// paths in play are base index scans. That is what lets `addNestLoopPath` and
-// `addHashJoinPath` set `Rows: joinRel.Rows` unconditionally without a
-// `ppi_rows` of their own.
-func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, clauses []*restrictInfo) {
+// silently relies on it: every JOIN path EXCEPT an admitted parameterised
+// merge (C-08: wanted by its joinrel's param_source_rels) is
+// unparameterised, so `Path.Rows == Rel.Rows` holds for every join path but
+// that one, and the only other parameterised paths in play are base index
+// scans. That is what lets `addNestLoopPath` and `addHashJoinPath` set
+// `Rows: joinRel.Rows` unconditionally without a `ppi_rows` of their own —
+// both read `CheapestTotal`-only inputs, which a parameterised path can
+// never win (03 §9 rule 1), so the merge exception cannot reach them.
+func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, clauses []*restrictInfo, paramSrc RelSet) {
 	o := outer.CheapestTotal
 	if o == nil || o.RequiredOuter != 0 {
 		return
@@ -212,9 +271,11 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			continue
 		}
 		req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
-		// try_nestloop_path's test, verbatim (joinpath.c:882-889).
+		// try_nestloop_path's test, verbatim (joinpath.c:882-889),
+		// over this joinrel's param_source_rels (C-08 derivation,
+		// computed once per addPathsToJoinrel call).
 		if req != 0 &&
-			!relsOverlap(req, paramSourceRels()) &&
+			!relsOverlap(req, paramSrc) &&
 			!allowStarSchemaJoin(outer.Relids, i.RequiredOuter) {
 			continue
 		}

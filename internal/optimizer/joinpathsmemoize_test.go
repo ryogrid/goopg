@@ -245,7 +245,7 @@ func TestNLIArmOffersBothCandidates(t *testing.T) {
 	outer := scanRel(outerRelids, 10000, estScanPages(10000, 32))
 	inner, _ := memoInnerRel(innerRelids, outerRelids, indexProbeCost(cp))
 	joinrel := newRelOptInfo(outerRelids|innerRelids, 10000, 64)
-	addNLIPaths(s, joinrel, outer, inner, cp, nil)
+	addNLIPaths(s, joinrel, outer, inner, cp, nil, 0)
 
 	if len(joinrel.Pathlist) != 1 {
 		t.Fatalf("got %d paths, want 1 survivor of the two candidates", len(joinrel.Pathlist))
@@ -260,7 +260,7 @@ func TestNLIArmOffersBothCandidates(t *testing.T) {
 	sBlind := memoTestCtx(t, 10000, 0, false)
 	blindRel := newRelOptInfo(outerRelids|innerRelids, 10000, 64)
 	blindInner, _ := memoInnerRel(innerRelids, outerRelids, indexProbeCost(cp))
-	addNLIPaths(sBlind, blindRel, outer, blindInner, cp, nil)
+	addNLIPaths(sBlind, blindRel, outer, blindInner, cp, nil, 0)
 	if len(blindRel.Pathlist) != 1 {
 		t.Fatalf("got %d paths, want 1", len(blindRel.Pathlist))
 	}

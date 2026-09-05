@@ -235,7 +235,7 @@ func mergeInnerSortKeys(groups []mergeKeyGroup, outerKeys []PathKey, outer RelSe
 // subtree). The base order is therefore the clause order, which is stable and
 // deterministic; the heuristic is a ranking of paths that all get generated
 // anyway, so its absence costs a tie-break, not a path. Ledgered.
-func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
 		// PG's `if (extra->mergeclause_list == NIL) return` (:1372). A pair
@@ -263,7 +263,7 @@ func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, keys, r
 		// pathkeys makes that a property of the construction instead of a
 		// check — the groups partition `keys`, so the concatenation is a
 		// permutation of it.
-		addMergeJoinPath(joinrel, outer, inner, cp, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor)
+		addMergeJoinPath(joinrel, outer, inner, cp, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
 
@@ -292,12 +292,12 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     but it is what makes P5.4c-ii's ordered index paths worth anything, and
 //     writing it now means that slice adds a producer rather than also having to
 //     add the consumer.
-//   - A still-parameterised result is refused (:1073-1081). `param_source_rels`
-//     is empty in v1 (`paramSourceRels`, joinpathsnli.go), so any non-empty
-//     `required_outer` fails PG's own overlap test — no goopg-only gate is
-//     needed here, unlike the NLI arm, because merge has no `allow_star_schema_join`
-//     escape. The two `PATH_PARAM_BY_REL` refusals `sort_inner_and_outer` makes
-//     first (:1397-1399) are the caller's: `addPathsToJoinrel` already made
+//   - A still-parameterised result is refused (:1073-1081) unless this
+//     joinrel's `param_source_rels` wants it (C-08 derivation, threaded
+//     as `paramSrc`). No goopg-only gate is needed here, unlike the NLI
+//     arm, because merge has no `allow_star_schema_join` escape. The two
+//     `PATH_PARAM_BY_REL` refusals `sort_inner_and_outer` makes first
+//     (:1397-1399) are the caller's: `addPathsToJoinrel` already made
 //     them, for both directions, before reaching this arm.
 //   - The join's output ordering is the OUTER's ordering (`build_join_pathkeys`,
 //     pathkeys.c:1295 — "normally the same as the outer path's keys"). For a
@@ -307,7 +307,7 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     goopg keeps it whole, which can only leave `addPath` distinguishing two
 //     paths PG would have merged — more paths considered, never fewer, and
 //     never a different winner on cost. Ledgered.
-func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
 	if o == nil || i == nil {
 		return
@@ -316,7 +316,7 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 	// sort keys ARE the result's pathkeys. The arm that consumes an ordering it
 	// did not choose (P5.4c-ii-c) passes a different pair, which is why
 	// `tryMergeJoinPath` takes the two separately.
-	tryMergeJoinPath(joinrel, o, i, cp, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor)
+	tryMergeJoinPath(joinrel, o, i, cp, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
 // tryMergeJoinPath is `try_mergejoin_path` proper (joinpath.c:1029) over two
@@ -333,16 +333,17 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, outerKey
 // `outerSortKeys` / `innerSortKeys` are PG's `outersortkeys` / `innersortkeys`
 // with PG's NIL convention: an empty list means "this side needs no sort". The
 // explicit re-check below (:1091-1097) makes passing them harmless either way.
-func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64)) {
+func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
 	}
 	// `calc_non_nestloop_required_outer` (:1071): a merge join discharges
 	// nothing, so the result is parameterised by the union of its inputs'
-	// requirements. With an empty `param_source_rels` that is only acceptable
-	// when it is empty.
+	// requirements. Acceptable iff empty or wanted by this joinrel's
+	// `param_source_rels` (C-08 derivation, computed once per
+	// addPathsToJoinrel call).
 	req := calcNonNestloopRequiredOuter(o, i)
-	if req != 0 && !relsOverlap(req, paramSourceRels()) {
+	if req != 0 && !relsOverlap(req, paramSrc) {
 		return
 	}
 
@@ -357,8 +358,12 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 	// Row counts from the CHILD PATHS (03 §9 rule 3), as everywhere else in
 	// path generation. A Sort propagates its subpath's count unchanged, so for
 	// a parameterised input this is still the per-parameterisation count —
-	// which the refusal above has already ruled out, but the rule is written
-	// once rather than per-arm.
+	// which the refusal above has ruled out UNLESS this joinrel's
+	// param_source_rels wants it (C-08). An admitted parameterised merge
+	// therefore carries the full `joinrel.Rows` with no `ppi_rows` sizer
+	// (costing-only overestimate, safe direction; ledgered as the merge
+	// half of the NLI P5.6 deferral — `createPlan` panics loud on a
+	// parameterised merge that ever got chosen, so no wrong-plan path).
 	// `mergejointuples` (costsize.c:3960-4045), NOT joinrel.Rows.
 	//
 	// joinrel.Rows is what survives EVERY join clause. The merge operator emits

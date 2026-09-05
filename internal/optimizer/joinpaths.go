@@ -173,6 +173,15 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	// condition: an outer parameterised by the inner kills this direction
 	// outright, while an inner parameterised by the outer kills only the hash
 	// and plain-NL arms and is precisely what the NLI arm is for.
+	// C-08: PG's per-joinrel param_source_rels, computed ONCE per
+	// add_paths_to_joinrel call (joinpath.c:242-276) and passed down to
+	// the NLI + merge arms — see paramSourceRelsForProblem. Nil search
+	// context (unit fixtures) carries no joinInfoList: 0, the legacy
+	// constant.
+	var paramSrc RelSet
+	if s != nil {
+		paramSrc = paramSourceRelsForProblem(joinrel.Relids, s.joinInfoList, s.problemItems)
+	}
 	o, i := outer.CheapestTotal, inner.CheapestTotal
 	if pathParamByRel(o, inner) {
 		return nil
@@ -201,7 +210,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			scanSelFor := func(mc []*restrictInfo) (float64, float64) {
 				return s.mergeJoinScanSel(mc, outer.Relids)
 			}
-			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor)
+			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 			// and arm 4 — so a merge over an already-ordered outer is offered
 			// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -209,7 +218,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// here; goopg's nested-loop halves (`addNestLoopPath` /
 			// `addNLIPaths`) were landed separately and still run after the
 			// hash arm, which can only change a hash-vs-nestloop exact tie.
-			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor)
+			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			// take2 P2-11: the inner side is the BUILD side here, so the
 			// bucket fraction is measured on its keys. Computed at this site
 			// because the searchCtx — and so the statistics — is in scope,
@@ -226,6 +235,6 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	// PG runs this inside the same `outerrel->pathlist` loop as the arms above
 	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
 	// admits — which under 03 §4.4's INNER-only pin is all of them.
-	addNLIPaths(s, joinrel, outer, inner, cp, clauses)
+	addNLIPaths(s, joinrel, outer, inner, cp, clauses, paramSrc)
 	return nil
 }

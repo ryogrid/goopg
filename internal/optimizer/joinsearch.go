@@ -171,6 +171,14 @@ type searchCtx struct {
 	// the fast path equivalent of an empty list. M0128-P1.2.
 	joinInfoList []*SpecialJoinInfo
 
+	// problemItems is the FROM-item run this problem searches, in order:
+	// item i owns relid 1<<i. Stamped by searchOneProblem beside the
+	// clause list; read by the C-08 param_source_rels derivation, which
+	// must remap statement-global SJI hands into this problem's frame
+	// (an item is NOT always statement leaf lo+i — see the remap rule).
+	// Nil in hand-built test contexts → the derivation yields 0 (legacy).
+	problemItems []joinlistRel
+
 	// queryPathkeys is `PlannerInfo.query_pathkeys` (C-07/P3-06,
 	// querypathkeys.go): the ordering the STATEMENT wants from this level,
 	// derived once by `standard_qp_callback` before the first rel exists and
