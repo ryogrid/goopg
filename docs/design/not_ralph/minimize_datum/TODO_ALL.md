@@ -1315,15 +1315,22 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   *design: 04 §4.1, §8; gate per slice: 06 §2 floor + alloc arm; MD-09
   adds the parallel arm
   (`parallel_substrate_test.go:26-80` pattern).*
-- [ ] **D-09 MD-1x conditional alignment.** `att_align_datum` on encode,
-  `att_align_pointer` on decode, generalising `catalog/codec.go:1693-1695`.
-  **Changes the on-disk format.** Independent of D-03…D-08 (03 §7.2); may
-  land before D-03 or after D-08, never inside another item. Blocked on:
-  D-01.
-  *design: 03 §3 (D1), §3.3, TD-4; gate: 06 §3 MD-1x — byte goldens vs
-  live PG 18.3 (TOAST excluded, reason stated), backward read of old
-  nominal-aligned tuples, forward read of a PG-authored unaligned short
-  varlena.*
+- [x] **D-09 MD-1x conditional alignment.** Landed 2026-09-06:
+  `att_align_datum` (encode-then-place, short-header-form test) +
+  `att_align_pointer` (shared `catalog.AttAlignPointer` peek in heap
+  codec ×2 paths, pgoutput walker, pg_index text tails + vectors) +
+  per-column `attstorage` (override over type default, inline
+  resolution, no cache) + `PhysicalTypeIsVarlena` moved to catalog.
+  On-disk format changed (column padding only); upgrade-direction
+  compatible, downgrade unsupported (stated). Gates: placement/peek/
+  backward/forward/override/round-trip/live-golden tests (goopg bytes
+  byte-identical to live PG 18.3 328B tuple); suites (executor,
+  catalog, xlog, initdb, optimizer) + units scope + spotcheck PASS;
+  TPC-H values 24/24 MATCH; TPC-DS 95 PASS CKMISMATCH=0; plan-gate
+  22/22 MATCH; review APPROVE-WITH-NITS → all fixed → re-review
+  APPROVE (incl. pg_index walker + align-table ledger rows).
+  Artifacts: `docs/design/executor-d09-alignment/DESIGN.md`,
+  `016f67b`.
 - [!] **D-10 MD-last spill payload — BLOCKED on every in-memory
   retention site.** Convert `spill.go`'s payload to the PG format;
   framing (`WriteRowHashed`'s hash-then-tuple) unchanged. The nine
@@ -1637,6 +1644,7 @@ P6-03/04/05 (load-bearing).
 | D-02 | 2026-09-05 | c6468238f + (this commit) | verdict PROCEED: 0 declining columns of 160,302, 0 retention sites of 985 | corrected 04 section 3.1's packableType definition, which would have produced a false STOP; 3 latent on-disk bugs ledgered |
 | C-02d | 2026-09-05 | (this commit) | qual moves across preserved-side outer links; proof gains positive containment | values 24/24, plans byte-identical, plan-gate PASS, TPC-DS CKMISMATCH=0; review found no counterexample |
 | C-02c | 2026-09-05 | 2305241f4 | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
+| D-09 | 2026-09-06 | 016f67b | conditional alignment both directions; on-disk padding matches PG | live-PG byte-identical golden; suites + R8 both suites + plan-gate 22/22; review APPROVE |
 | C-08 | 2026-09-06 | b967f38 | per-joinrel param_source_rels derivation with frame remap; NLI + merge arms threaded; star-schema escape untouched | derivation table + admit/refuse arm pair; suites + units scope + spotcheck PASS; PP TPC-H 22/22 MATCH (provably inert until C-04, no sweep triggered); review APPROVE-WITH-NITS (5 addressed); ppi_rows ledger row |
 
 ## Dropped
