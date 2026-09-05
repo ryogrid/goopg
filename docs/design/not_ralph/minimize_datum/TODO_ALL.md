@@ -316,10 +316,15 @@ are EPICS — split into one-checkbox-per-commit items before starting
   errors on expression keys); ANALYZE iterates table columns only;
   zero expression indexes in either suite. Ledger `take3-B-10-declined`
   (resume: access paths → collection → matching).
-- [ ] **B-11 P1-16 re-diagnose Q9.** The single-`nd` explanation is RETIRED;
-  close ledger rows 779/781/784 as stale and file what `estimate-audit`
-  actually shows on the final joinrel.
-  *design: take3 08 §4; gate: EA final-joinrel bar on Q9.*
+- [x] **B-11 P1-16 re-diagnose Q9.** Filed 2026-09-05: take2 P1-16 had
+  already closed rows 779/781/784 as stale + filed the LIKE-restriction
+  mechanism; live-confirmed post-patternsel via estimate-audit
+  (`analysis/leftdeep-joins/b11-confirm*.txt`): part 66,666→6,060 est
+  (PG-like); final joinrel 6,060 vs 321,056 = 53× under (≤100× bar
+  PASSES, 0 violations, 0 ambiguous). NEW follow-up filed in
+  `take3-B-11-filed`: correction unmasked parameterized-NL fanout
+  undercount (d13 estimates outer-only; excess 3.6×→50.4×, ratchet
+  holds via floor) — join-size track work, not this item.
 - [ ] **B-12d Derived-table propagation: thread the settings by hand
   through `planSelectWithParent` for `(SELECT …) AS alias` FROM items.**
   After B-01a/b/c per take3 08 §10.1. The reverted mechanical attempt

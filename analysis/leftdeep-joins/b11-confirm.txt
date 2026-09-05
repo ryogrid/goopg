@@ -1,0 +1,47 @@
+=== Q9
+  F d4  Hash Join                                est=6060       actual=321056     ratio=53.0x under
+    d7  Hash Join                                est=6060       actual=321056     ratio=53.0x under
+    d10 Hash Join                                est=6060       actual=321056     ratio=53.0x under
+    d13 Nested Loop                              est=6060       actual=321056     ratio=53.0x under
+    d7  Hash Join                                est=10000      actual=10000      ratio=1.0x under
+
+=== SUMMARY (tripwire 1000x; final joinrel 1000x, per-query overrides [Q21<=5000x Q9<=100x])
+  no joinrel over threshold
+  OVERRIDE Q21 final joinrel <=5000x — PG 18.3 estimates rows=1 for the same ANTI against the same actual (neqjoinsel returns 1-nullfrac for JOIN_ANTI by design); closing it would diverge from PG
+  OVERRIDE Q9 final joinrel <=100x — 09 §5's stated demonstration that 04 §3's sizing mechanisms worked
+
+=== PER-JOINREL PARITY vs PG 18.3 (09 §4 ratchet)
+--- Q9
+  F {lineitem+nation+orders+part+partsupp+supplie… goopg     53.0x | PG      1.1x | excess    50.4x
+    {lineitem+orders+part+partsupp}                goopg     53.0x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+part}                                goopg     53.0x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+part+partsupp}                       goopg     53.0x | PG        - | SHAPE (goopg-only joinrel)
+    {nation+supplier}                              goopg      1.0x | PG        - | SHAPE (goopg-only joinrel)
+    {lineitem+nation+part+partsupp+supplier}       goopg        - | PG      1.1x | SHAPE (PG-only joinrel)
+    {nation+part+partsupp+supplier}                goopg        - | PG      1.1x | SHAPE (PG-only joinrel)
+    {part+partsupp}                                goopg        - | PG      1.1x | SHAPE (PG-only joinrel)
+    {part+partsupp+supplier}                       goopg        - | PG      1.1x | SHAPE (PG-only joinrel)
+
+=== PARITY SUMMARY (slack 10x, floor 100x)
+  joinrels compared: 1 matched, 8 shape-divergent, 0 ambiguous (a relation scanned twice without an alias — outermost occurrence compared)
+  no joinrel worse than the reference beyond the ratchet
+  RATCHET parity_violations=0 shape_mismatches=8
+
+=== JOIN SPINE PAIRINGS vs PG 18.3 (09 §4 clause 6)
+--- Q9
+  F goopg d4  BUSHY     {lineitem+orders+part+partsupp} ⋈ {nation+supplier}   GOOPG-ONLY PAIRING
+    goopg d7  left-deep {orders} ⋈ {lineitem+part+partsupp}   GOOPG-ONLY PAIRING
+    goopg d10 left-deep {partsupp} ⋈ {lineitem+part}   GOOPG-ONLY PAIRING
+    goopg d13 left-deep {part} ⋈ {lineitem}   GOOPG-ONLY PAIRING
+    goopg d7  left-deep {supplier} ⋈ {nation}   GOOPG-ONLY PAIRING
+  F PG    d4  left-deep {orders} ⋈ {lineitem+nation+part+partsupp+supplier}   PG-ONLY PAIRING
+    PG    d10 left-deep {nation+part+partsupp+supplier} ⋈ {lineitem}   PG-ONLY PAIRING
+    PG    d13 left-deep {part+partsupp+supplier} ⋈ {nation}   PG-ONLY PAIRING
+    PG    d16 left-deep {part+partsupp} ⋈ {supplier}   PG-ONLY PAIRING
+    PG    d19 left-deep {partsupp} ⋈ {part}   PG-ONLY PAIRING
+
+=== SPINE SUMMARY (09 §4 clause 6)
+  queries compared: 1; pairings: 0 matched, 5 goopg-only, 5 PG-only
+  bushy spine chosen by: goopg 1 (Q9) | PG none
+  no bushy partition PG chose is absent from goopg's plans
+  RATCHET spine_pg_only=5 spine_goopg_only=5 bushy_pg=0 bushy_goopg=1 clause6_candidates=0
