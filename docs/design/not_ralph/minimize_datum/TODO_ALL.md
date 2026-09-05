@@ -1412,10 +1412,19 @@ per arm; values never counts for projection/join-adjacent changes).*
   survivors. Report:
   `analysis/executor-refactor/e04-filterop-compile-20260905/README.md`;
   ledger `take3-E-04-dropped` (resume conditions inline).
-- [ ] **E-05 EX4-02 join residual + key compilation.** `mergeResidualMatch`
-  and per-`plan.Algo` key evaluators through the slab. Values-diff
-  mandatory (join-adjacent, R8).
-  *design: take3 13 §6; gate: twin-parity per arm; values + pin.*
+- [x] **E-05 EX4-02 join residual + key compilation.** Landed 2026-09-06:
+  merge twin of the PS6.1 hash slab (separate `mergeExprs` slab by
+  discipline; `initMergeKeys` compiles + `ensureMergeExprs` guard;
+  hoisted dedicated residual slot, never `o.slot`; nil-schema
+  asserted). Wrapper logic untouched (nil→true, NULL→false, nullKey
+  path) — pure dispatch swap at 2 sites. Gates: 12-case twin-parity
+  corpus (extended outcome harness + mergedKeySlot in shared list) +
+  noExpr pin + compiled-path + 0-alloc assert; suites + units scope;
+  merge-join EXPLAIN-confirmed live; TPC-H values 24/24 MATCH (timing
+  neutral x0.998); TPC-DS 95 PASS CKMISMATCH=0; plan-gate 22/22;
+  spotcheck PASS; review APPROVE-WITH-NITS (7 findings fixed).
+  Artifacts: `docs/design/executor-e05-merge-compile/DESIGN.md`,
+  `39d26c5`.
 - [ ] **E-06 EX4-03 agg transition fast path.** Compile builtin-agg
   `transfn` expressions; `MIXED`/spill behaviour unchanged.
   *design: take3 13 §6; gate: per-row transfn slice down; values + pin.*
@@ -1653,6 +1662,7 @@ P6-03/04/05 (load-bearing).
 | C-02d | 2026-09-05 | (this commit) | qual moves across preserved-side outer links; proof gains positive containment | values 24/24, plans byte-identical, plan-gate PASS, TPC-DS CKMISMATCH=0; review found no counterexample |
 | C-02c | 2026-09-05 | 2305241f4 | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
 | D-09 | 2026-09-06 | 016f67b | conditional alignment both directions; on-disk padding matches PG | live-PG byte-identical golden; suites + R8 both suites + plan-gate 22/22; review APPROVE |
+| E-05 | 2026-09-06 | 39d26c5 | merge residual+keys via separate slab; pure dispatch swap | twin-parity + 0-alloc; R8 both suites; timing neutral; review APPROVE-WITH-NITS |
 | C-08 | 2026-09-06 | b967f38 | per-joinrel param_source_rels derivation with frame remap; NLI + merge arms threaded; star-schema escape untouched | derivation table + admit/refuse arm pair; suites + units scope + spotcheck PASS; PP TPC-H 22/22 MATCH (provably inert until C-04, no sweep triggered); review APPROVE-WITH-NITS (5 addressed); ppi_rows ledger row |
 
 ## Dropped
