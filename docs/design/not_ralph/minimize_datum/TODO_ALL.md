@@ -751,13 +751,8 @@ per arm; values never counts for projection/join-adjacent changes).*
   argument over narrowed rows — last in EX3 for that reason.
   *design: take3 13 §5; gate: skewed-shape A/B; values + pin + alloc
   arm.*
-- [ ] **E-15 EX3-07 input-contract publication spike (unconditional).**
-  The 13 §8.7 tiebreaker owned by someone: publish the executor's
-  presorted-prefix input contract (what a future Incremental Sort input
-  must guarantee) as a doc + contract test against current sort
-  behaviour. Breaks the C-14/E-03 circular wait.
-  *design: take3 13 §8.7; gate: contract doc + test, no behaviour
-  change.*
+- [x] **E-15 EX3-07 input-contract publication spike (unconditional).**
+  Landed 2026-09-05: presorted-prefix contract (input ordered by first-n-keys + contiguous groups + `sortPrefixEqual` framing; executor return: order-equivalence + group-bounded memory; incomparable splits) as doc + `sortPrefixEqual` + order-equivalence oracle vs current full sort (incl. NULL/DESC-first-key variant). Breaks the C-14/E-03 circular wait. Gates: 4 contract tests; executor + optimizer suites green; review APPROVE-WITH-NITS (5 addressed). No behaviour change (pure additive, zero production callers). Artifacts: `docs/design/executor-ex3-07-presorted-contract/DESIGN.md` (`065182d`), `internal/executor/sort_presorted{,_test}.go` (`c7f1f45`).
 - [!] **E-03 EX3-07 presorted-prefix implementation — file ONLY if
   planner C-14 activates.** E-15 already published the contract, so this
   item is purely conditional. Do not absorb silently.
@@ -919,6 +914,7 @@ P6-03/04/05 (load-bearing).
 | B-14fu | 2026-09-05 | afb39bb7c | ANY explain + update fallback predicate (fixes live wrong-answer) + SSI fingerprint | executor + optimizer green; smoke 0 failed |
 | C-02a | 2026-09-05 | b90b08d + 0dac569c1 | per-link OJ delay test, inert | 20-case table; optimizer green; review APPROVE |
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
+| E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 
 ## Dropped
 
