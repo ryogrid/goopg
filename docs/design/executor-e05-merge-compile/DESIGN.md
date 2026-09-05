@@ -72,7 +72,10 @@ join-adjacent).
   same per-row eval count, `OuterColumnRef` error parity,
   `CTIDExpr`-reads-NULL parity, out-of-range ColumnRef error-text
   parity (`join_compiled_key_test.go:88-127` pattern, extended to the
-  residual slot).
+  residual slot), `MergeWholeRowRef`, outer-ref panic parity.
+  Volatile `FuncCall` excluded from value parity by construction
+  (separate evaluations can never agree — falls to ExprAdapter on
+  both twins, same call, same count; inspected, not outcome-tested).
 - NOEXPR PIN (inversion hazard): `evalFastExpr(noExpr)` is NullDatum
   → wrapper NULL→false, but nil-residual must short-circuit →true
   BEFORE eval. Explicit parity test: routing nil through

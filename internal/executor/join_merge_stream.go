@@ -138,6 +138,10 @@ func newMergeSortedSource(o *joinOp, child Operator, isLeft bool) (*mergeSortedS
 			return nil, errMergeKeyNil()
 		}
 	}
+	// E-05: compile the key nodes once per source (not per row in
+	// keyRow) — same split, same moment as keyExprs, so the two can
+	// never disagree.
+	o.ensureMergeExprs()
 	s := &mergeSortedSource{
 		o:        o,
 		child:    child,
@@ -256,8 +260,24 @@ func (s *mergeSortedSource) keyRow(row Row) ([]Datum, bool, error) {
 	}
 	keys := s.keyBlock[:s.nkeys:s.nkeys]
 	s.keyBlock = s.keyBlock[s.nkeys:]
+	// E-05: compiled twin of the key evaluators (nodes compiled at
+	// source construction from the same keyExprs). Wrapper logic below
+	// (NULL → nullKey) is untouched; only dispatch changes. The length
+	// guard is a backstop for hand-built test sources only (production
+	// lengths agree by construction) — never a per-site fallback path.
+	nodes := s.o.mergeKeyNodesL
+	if !s.isLeft {
+		nodes = s.o.mergeKeyNodesR
+	}
+	useCompiled := len(nodes) == len(s.keyExprs)
 	for i, e := range s.keyExprs {
-		v, err := evalExprSlot(e, slot, s.o.ctx)
+		var v Datum
+		var err error
+		if useCompiled {
+			v, err = evalFastExpr(s.o.mergeExprs, nodes[i], slot, s.o.ctx)
+		} else {
+			v, err = evalExprSlot(e, slot, s.o.ctx)
+		}
 		if err != nil {
 			return nil, false, err
 		}

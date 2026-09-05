@@ -143,6 +143,19 @@ type joinOp struct {
 	mergeKeys     []optimizer.JoinKeyPair
 	mergeResidual optimizer.Expr
 
+	// E-05 (EX4-02): the merge twin of the execExprs slab above —
+	// compiled merge-side key accessors + residual, evaluated with
+	// evalFastExpr. Separate slab by discipline (single algo per Open;
+	// both slabs rebuild unconditionally, so neither can go stale).
+	// mergeResidSlot is the DEDICATED reusable residual slot (never
+	// o.slot — nextMerge reuses that for output); rebound per pair.
+	mergeExprs        exprTreeSlab
+	mergeKeyNodesL    []int32
+	mergeKeyNodesR    []int32
+	mergeResidualNode int32
+	mergeResidSlot    *MaterializedSlot
+	mergeCompiled     bool
+
 	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
 	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
 	// merge output is pulled from this state machine instead of being

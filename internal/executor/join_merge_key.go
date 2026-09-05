@@ -48,7 +48,9 @@ import "github.com/goopg/goopg/internal/optimizer"
 func (o *joinOp) initMergeKeys() {
 	o.mergeKeys = nil
 	o.mergeResidual = nil
+	o.mergeCompiled = false
 	if o.plan == nil {
+		o.compileMergeExprs()
 		return
 	}
 	plan := o.plan.ExecMergeKeyPlan()
@@ -62,6 +64,52 @@ func (o *joinOp) initMergeKeys() {
 		o.mergeKeys = []optimizer.JoinKeyPair{{Left: o.plan.LeftKey, Right: o.plan.RightKey}}
 		o.mergeResidual = o.plan.Predicate
 	}
+	o.compileMergeExprs()
+}
+
+// ensureMergeExprs compiles the merge slab for joinOps driven directly
+// (unit tests hand-building mergeKeys without initMergeKeys). O(1) fast
+// path (bool + length compares, no allocation). Length-CHANGING
+// replacements recompile; same-length swaps or residual-only changes
+// do not (mergeKeys/mergeResidual are assigned only inside
+// initMergeKeys, which always recompiles — stronger than the hash
+// arm's nil/bool check, same trust root).
+func (o *joinOp) ensureMergeExprs() {
+	if o.mergeCompiled && len(o.mergeKeyNodesL) == len(o.mergeKeys) {
+		return
+	}
+	o.compileMergeExprs()
+}
+
+// compileMergeExprs compiles the merge-side key accessors and the residual
+// conjunction into this join's merge ExprNode slab (E-05, the merge twin of
+// compileExecExprs). Called from initMergeKeys so the compiled form derives
+// from the SAME key split as the interpreted expressions. Rebuilds
+// unconditionally (same staleness discipline as the hash slab); the
+// residual slot is (re)created here so the per-pair path never allocates.
+func (o *joinOp) compileMergeExprs() {
+	o.mergeExprs = o.mergeExprs[:0]
+	left := o.mergeSideKeyExprs(true)
+	if cap(o.mergeKeyNodesL) < len(left) {
+		o.mergeKeyNodesL = make([]int32, len(left))
+	}
+	o.mergeKeyNodesL = o.mergeKeyNodesL[:len(left)]
+	for i, e := range left {
+		o.mergeKeyNodesL[i] = o.mergeExprs.buildExpr(e)
+	}
+	right := o.mergeSideKeyExprs(false)
+	if cap(o.mergeKeyNodesR) < len(right) {
+		o.mergeKeyNodesR = make([]int32, len(right))
+	}
+	o.mergeKeyNodesR = o.mergeKeyNodesR[:len(right)]
+	for i, e := range right {
+		o.mergeKeyNodesR[i] = o.mergeExprs.buildExpr(e)
+	}
+	o.mergeResidualNode = o.mergeExprs.buildExpr(o.mergeResidual)
+	if o.mergeResidSlot == nil {
+		o.mergeResidSlot = &MaterializedSlot{}
+	}
+	o.mergeCompiled = true
 }
 
 // mergeSideKeyExprs picks one side's key expressions out of the pair list.
@@ -107,7 +155,13 @@ func (o *joinOp) mergeResidualMatch(row Row) (bool, error) {
 	if o.mergeResidual == nil {
 		return true, nil
 	}
-	v, err := evalExpr(o.mergeResidual, row, o.ctx)
+	// E-05: compiled twin (nil short-circuit above stays — routing nil
+	// through noExpr would invert to false). Dedicated hoisted slot,
+	// rebound per pair (never o.slot — nextMerge reuses that for
+	// output); fresh hasCTID forever (rebind sets only .row).
+	o.ensureMergeExprs()
+	o.mergeResidSlot.row = row
+	v, err := evalFastExpr(o.mergeExprs, o.mergeResidualNode, o.mergeResidSlot, o.ctx)
 	if err != nil {
 		return false, err
 	}
