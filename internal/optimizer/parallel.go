@@ -75,6 +75,18 @@ type ParallelSettings struct {
 	// (chapter 11 §1.3). Zero value false is safe: it understates the divisor,
 	// which understates the split's benefit.
 	LeaderParticipates bool
+	// DisableGatherMerge is `enable_gathermerge = off` (B-17c): PG's
+	// cost_gather_merge flag (costsize.c:485). With no GatherMerge path in the
+	// search (P5-04 open) there is no disabled_nodes count to carry, so the
+	// post-pass gates the P7 arm instead: off falls back to the pre-P7 shape
+	// (Gather below the Sort). Plain Gather is unaffected — upstream's
+	// cost_gather has no flag either. Convert to counting when P5-04 lands
+	// real Gather/GatherMerge paths.
+	//
+	// Opt-out on purpose: the zero value keeps the merge arm, so every
+	// struct-literal constructor (production dispatch, executor tests) behaves
+	// as before without setting anything; only an explicit off disables it.
+	DisableGatherMerge bool
 	// BlocksForTable returns a relation's size in blocks. Optional: when nil
 	// the size gate falls back to the row estimate, which is an approximation
 	// and is recorded as such.
@@ -282,6 +294,7 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		// goopg's Sort carries no top-N limit, so there is no per-worker
 		// truncation to reason about: every worker emits its whole partition.
 		if srt, isSort := cur.(*Sort); isSort && len(srt.Keys) > 0 &&
+			!s.DisableGatherMerge &&
 			drivingScan(srt.Child) != nil && sortPartialRootPays(srt) {
 			return partialTarget{node: srt, mergeKeys: srt.Keys}, true
 		}

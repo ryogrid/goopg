@@ -391,25 +391,36 @@ are EPICS — split into one-checkbox-per-commit items before starting
   default-ndistinct `Max(0.1,mcv)` decision; nbuckets cap explicitly
   out (signature widening). Unblocks the E-02 cost half.
   Gates: skewed/uniform/empty/clamp/isdefault/filtered-scaling pins;
-  optimizer suite; PP zero shape moves; TPC-H 24/24 MATCH.
+  optimizer suite; PP zero shape moves; TPC-H 24/24 MATCH; TPC-DS SF0.5
+  sweep PASS=95 MISMATCH=0.
   Artifacts: `joinselectivity.go`, `joinselectivity_test.go`.
-- [ ] **B-17a `disabled_nodes` sort + material setters** (take3 02 §1.2).
-  Makes the family A/B-able for later phases.
-  *design: take3 08 §5.4; gate: GUC-effect test per newly-live GUC
-  (take3 09 §5 P2).*
+- [x] **B-17a `disabled_nodes` sort setter** (take3 02 §1.2). Landed
+  2026-09-05: `sortPathFor` counts `enable_sort` (costsize.c:2144),
+  producer never skipped. Material half declined — no `PathMaterial`
+  exists by design (executor materialises unconditionally).
+  *design: take3 08 §5.4; gate: GUC-effect test
+  `TestEnableSortSetsDisabledNodesOnSortPath`.*
 - [ ] **B-17b `disabled_nodes` agg-hashed/mixed setters** (take3 02 §1.2).
-  *design: take3 08 §5.4; gate: GUC-effect test per newly-live GUC.*
-- [ ] **B-17c `disabled_nodes` gather-merge setter** (take3 02 §1.2).
-  *design: take3 08 §5.4; gate: GUC-effect test per newly-live GUC.*
-- [ ] **B-17d Retire producer-skipping for scans** where PG counts instead
-  of gating. Hard gates stay gates (index-only, TID-except-CURRENT-OF,
-  memoize, incremental-sort; take3 01 §12, 02 §1.2). Own commit — scan
-  shapes change.
-  *design: take3 08 §5.4; gate: GUC-effect test per newly-live GUC.*
-- [ ] **B-17e Retire `enable_nestloop_index`** once NLI is an ordinary
-  parameterised-nestloop path (take3 08 §6.4). Own commit with its own
-  gate.
-  *design: take3 08 §5.4 + §6.4; gate: GUC-effect test (take3 09 §5 P2).*
+  DECLINED 2026-09-05: no grouping paths exist (P4-06 open), no path to
+  carry the count; `enable_hashagg` stays rule-based. Unblocks when P4-06
+  lands grouping paths.
+- [x] **B-17c `disabled_nodes` gather-merge setter** (take3 02 §1.2).
+  Landed 2026-09-05 as opt-out `DisableGatherMerge` (zero value keeps the
+  merge arm; `EnableGatherMerge` default-false would have killed
+  GatherMerge in production). *gate: GUC-effect test
+  `TestEnableGatherMergeOffFallsBackToGatherBelowSort`.*
+- [x] **B-17d Retire producer-skipping for scans** (take3 01 §12, 02 §1.2).
+  Landed 2026-09-05: seqscan/ordered+param index/plain+param bitmap heap
+  always generate + count (`enable_seqscan/indexscan/bitmapscan`);
+  index-only splits legacy OR-gate into `indexOnlyHardDisabled`
+  (indexonlyscan only stays a gate; indexscan-off counts). Hard gates stay
+  gates (index-only, memoize; TID/incremental-sort vacuous, no producer).
+  *gate: GUC-effect tests incl. `TestIndexOnlyScanGateStaysAGate`.*
+- [ ] **B-17e Retire `enable_nestloop_index`** (take3 08 §6.4).
+  DECLINED 2026-09-05: NLI is not an ordinary parameterised-nestloop path
+  (`addNLIPaths` emits `PathNestLoop` with no `DisabledNodes`; legacy
+  `rewriteJoinsToNLI` gated by `EnableNestLoopIndex` is load-bearing,
+  take3 P6-04 Q4 semi 12.5×). Retire only with P6.
 - [ ] **B-18 P2-04 cache-key half.** P2-04 landed the override bypass; the
   planner context as part of the cache KEY (rather than a bypass), and
   removing the bypass once keyed, remains open. Also attach the P2-02

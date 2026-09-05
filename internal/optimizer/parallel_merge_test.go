@@ -204,6 +204,42 @@ func TestGatherMergeRespectsSizeGate(t *testing.T) {
 	}
 }
 
+// TestEnableGatherMergeOffFallsBackToGatherBelowSort pins B-17c.
+//
+// `enable_gathermerge` was a registered GUC with no consumer. PG's
+// cost_gather_merge carries the flag (costsize.c:485); with no GatherMerge
+// path in the search (P5-04 open) there is no count to carry, so the
+// post-pass gates the P7 arm instead. Off must reproduce the pre-P7 shape —
+// the Sort stays whole above a plain Gather — and must never produce the
+// wrong-results shape (plain Gather over per-worker Sorts).
+func TestEnableGatherMergeOffFallsBackToGatherBelowSort(t *testing.T) {
+	tbl := bigTable(t, "gm_guc")
+	root := sortOver(seqScanOver(tbl), testKeys())
+
+	off := parallelTestSettings()
+	off.DisableGatherMerge = true
+	got := MaybeAddGather(root, off)
+
+	if gm := findGatherMerge(got); gm != nil {
+		t.Fatalf("a GatherMerge survived enable_gathermerge=off: %+v", gm)
+	}
+	if g := findPlainGatherOverSort(got); g != nil {
+		t.Fatalf("plain Gather sits above a Sort — the fallback must keep " +
+			"exactly one leader-side sort, not per-worker sorts")
+	}
+	srt, ok := got.(*Sort)
+	if !ok {
+		t.Fatalf("root is %T, want *Sort above the Gather (the pre-P7 shape)", got)
+	}
+	if _, ok := srt.Child.(*Gather); !ok {
+		t.Fatalf("Sort child is %T, want *Gather below it", srt.Child)
+	}
+	// The control arm is unchanged: on still lifts the Sort into the workers.
+	if _, ok := MaybeAddGather(root, parallelTestSettings()).(*GatherMerge); !ok {
+		t.Fatal("enable_gathermerge=on stopped producing GatherMerge")
+	}
+}
+
 // TestKillSwitchSuppressesGatherMerge — the kill switch must cover both
 // variants, or disabling parallelism would leave ordered queries parallel.
 func TestKillSwitchSuppressesGatherMerge(t *testing.T) {

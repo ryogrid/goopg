@@ -35,6 +35,52 @@ func TestEnableJoinMethodGUCsSetDisabledNodes(t *testing.T) {
 	}
 }
 
+// TestEnableSortSetsDisabledNodesOnSortPath pins B-17a.
+//
+// `enable_sort` was a registered GUC with no consumer: sortPathFor built the
+// Sort path unconditionally with DisabledNodes 0. PG's cost_sort adds the
+// input's count plus one when the flag is off (costsize.c:2144); the producer
+// still runs either way.
+func TestEnableSortSetsDisabledNodesOnSortPath(t *testing.T) {
+	if !DefaultPlannerSettings().EnableSort {
+		t.Fatal("enable_sort must default to ENABLED")
+	}
+	if !defaultCostParams().enableSort {
+		t.Fatal("defaultCostParams must agree with DefaultPlannerSettings")
+	}
+	ps := DefaultPlannerSettings()
+	ps.EnableSort = false
+	if ps.costParams().enableSort {
+		t.Error("costParams() dropped EnableSort=false")
+	}
+
+	rel := newRelOptInfo(relsetOf(0), 1000, 32)
+	sub := &Path{Kind: PathSeqScan, Rel: rel, Rows: 1000, Cost: Cost{Startup: 0, Total: 42}}
+	keys := []PathKey{{Expr: col(1), SortAsc: true}}
+
+	on := sortPathFor(sub, keys, DefaultPlannerSettings().costParams())
+	if on.DisabledNodes != 0 {
+		t.Errorf("enabled sort over an enabled input: DisabledNodes = %d, want 0", on.DisabledNodes)
+	}
+	off := sortPathFor(sub, keys, ps.costParams())
+	if off.DisabledNodes != 1 {
+		t.Errorf("disabled sort over an enabled input: DisabledNodes = %d, want 1", off.DisabledNodes)
+	}
+	if off.Cost != on.Cost {
+		t.Errorf("disabling must not reprice the sort: off cost %+v vs on cost %+v", off.Cost, on.Cost)
+	}
+	// Accumulation: a disabled sort over an already-disabled input counts both.
+	subD := &Path{Kind: PathSeqScan, Rel: rel, Rows: 1000, Cost: Cost{Startup: 0, Total: 42}, DisabledNodes: 2}
+	if got := sortPathFor(subD, keys, ps.costParams()); got.DisabledNodes != 3 {
+		t.Errorf("disabled sort over input with 2 disabled nodes: got %d, want 3", got.DisabledNodes)
+	}
+	// The GUC changes the verdict, not just the counter: at identical costs
+	// the enabled sort dominates the disabled one before cost is consulted.
+	if got := comparePathCostsFuzzily(on, off, stdFuzzFactor); got != costsBetter1 {
+		t.Errorf("enabled sort should dominate the identical-cost disabled sort, got %v", got)
+	}
+}
+
 // TestDisabledNodesAccumulatesFromChildren pins the accumulation rule: PG's
 // disabled_nodes is the SUM over the subtree, so two disabled nodes below a
 // path must both be counted, or a plan with one disabled node would be

@@ -433,7 +433,10 @@ func sortPathFor(sub *Path, keys []PathKey, cp costParams) *Path {
 	// exact: a Sort projects nothing, so its output rows are its input's.
 	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel))
 	return &Path{
-		Kind:          PathSort,
+		Kind: PathSort,
+		// B-17a: `cost_sort`'s own flag on top of the input's count
+		// (costsize.c:2144). The producer is not skipped when off.
+		DisabledNodes: disabledNodesFor(!cp.enableSort, sub),
 		Rel:           sub.Rel,
 		Rows:          sub.Rows,
 		Cost:          Cost{Startup: sub.Cost.Total + s.Startup, Total: sub.Cost.Total + s.Total},

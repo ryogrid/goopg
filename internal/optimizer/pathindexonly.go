@@ -120,6 +120,11 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		Rel:              rel,
 		Rows:             rel.Rows,
 		Cost:             cost,
+		// B-17d: an index-only path is costed by cost_index too, so
+		// enable_indexscan = off counts here as well (planner.go's
+		// indexOnlyScanRejected documents the OR). enable_indexonlyscan =
+		// off stays a generation gate at the caller (check_index_only).
+		DisabledNodes:    disabledNodesFor(!s.cp.enableIndexScan),
 		IndexInfo:        idx,
 		IndexScanDir:     ForwardScanDirection,
 		IndexOnly:        true,

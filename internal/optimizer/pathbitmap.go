@@ -193,11 +193,15 @@ func (s *searchCtx) buildOneBitmapPath(
 	}
 
 	// Build the bitmap heap scan path (the outer container).
+	// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on top of
+	// the index child's count (normally zero — the child carries no flag of
+	// its own). The producer always runs.
 	return &Path{
 		Kind:     PathBitmapHeapScan,
 		Rel:      rel,
 		Rows:     rel.Rows, // the rel's post-restriction row count
 		Cost:     totalCost,
+		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, bitmapIdxPath),
 		Children: []*Path{bitmapIdxPath},
 	}
 }
@@ -573,10 +577,18 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	// multiplies by the outer row count without double-counting.
 	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
 		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(req))
+	child := &Path{
+		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
+		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
+		IndexClauses: clauses, RequiredOuter: req,
+	}
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
 		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
 		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T),
+		// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on
+		// top of the index child's count.
+		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, child),
 		RequiredOuter: req,
 		// On the HEAP path, not only the child: `probeEnforcedClauses` and
 		// `memoizeCacheKeys` both read the INNER CANDIDATE's own list, and the
@@ -588,10 +600,6 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		// (~5.0 on Q2's supplier probe) that the sibling index path did not
 		// pay.
 		IndexClauses: clauses,
-		Children: []*Path{{
-			Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
-			BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
-			IndexClauses: clauses, RequiredOuter: req,
-		}},
+		Children:     []*Path{child},
 	}
 }

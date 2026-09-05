@@ -3796,6 +3796,23 @@ func indexOnlyScanRejected(cat catalog.Catalog) bool {
 	})
 }
 
+// indexOnlyHardDisabled is the generation gate that stays a gate under
+// B-17d: `enable_indexonlyscan = off` builds no index-only path
+// (`check_index_only`, indxpath.c), mirroring `enable_memoize` in
+// `get_memoize_path`. Unlike indexOnlyScanRejected it does NOT include
+// `enable_indexscan = off`, which PG counts on the path (cost_index)
+// instead of gating — so the searched index-only producer consults this,
+// while the rule-based legacy choice keeps the OR.
+func indexOnlyHardDisabled(cat catalog.Catalog) bool {
+	return scanToggleDisabled(cat, func(c any) (bool, bool) {
+		t, ok := c.(interface{ IndexOnlyScanDisabled() bool })
+		if !ok {
+			return false, false
+		}
+		return t.IndexOnlyScanDisabled(), true
+	})
+}
+
 // scanToggleDisabled peels the catalog wrapper chain (Unwrap, exactly as
 // currentSeqScanDisabled) and reports whether any carrier answers "disabled"
 // through read. Returns false when no carrier is attached (internal/test

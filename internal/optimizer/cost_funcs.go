@@ -79,13 +79,24 @@ type costParams struct {
 	// the parallel post-pass). Deferral ledger 2026-08-05 M0127-P5.7-a.
 	workMem int64
 
-	// enable* are PG's planner-method GUCs (take2 P2-05). True means the
-	// method is enabled; a disabled method still PRODUCES its path and
-	// increments Path.DisabledNodes, as PG 18 does.
+	// enable* are PG's planner-method GUCs (take2 P2-05, B-17a/B-17d). True
+	// means the method is enabled; a disabled method still PRODUCES its path
+	// and increments Path.DisabledNodes, as PG 18 does.
 	enableHashJoin  bool
 	enableMergeJoin bool
 	enableNestLoop  bool
-	enableMemoize   bool
+	// enableSort is `enable_sort` (B-17a): cost_sort's own flag on top of the
+	// input's count (costsize.c:2144). The Sort producer is sortPathFor.
+	enableSort   bool
+	enableMemoize bool
+	// enableSeqScan / enableIndexScan / enableBitmapScan are `enable_seqscan`
+	// / `enable_indexscan` / `enable_bitmapscan` (B-17d): cost_seqscan's,
+	// cost_index's and cost_bitmap_heap_scan's own flags (costsize.c:295, 560,
+	// 1023). The scan producers always generate the path and count, exactly
+	// as the join producers do since P2-05.
+	enableSeqScan    bool
+	enableIndexScan  bool
+	enableBitmapScan bool
 	geqo            bool
 	geqoThreshold   int
 	geqoEffort      int
@@ -116,6 +127,10 @@ func defaultCostParams() costParams {
 		enableHashJoin:  true,
 		enableMergeJoin: true,
 		enableNestLoop:  true,
+		enableSort:      true,
+		enableSeqScan:   true,
+		enableIndexScan: true,
+		enableBitmapScan: true,
 		enableMemoize:   true,
 		geqo:            GeqoEnabled(),
 		geqoThreshold:   GeqoThreshold(),

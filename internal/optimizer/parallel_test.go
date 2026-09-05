@@ -29,7 +29,9 @@ func parallelTestSettingsBlocks(blocks int64) ParallelSettings {
 		MaxWorkersPerGather: 2,
 		MinTableScanBlocks:  1024,
 		DebugParallelQuery:  "off",
-		BlocksForTable:      func(*catalog.Table) (int64, bool) { return blocks, true },
+		// DisableGatherMerge defaults false (merge arm kept); B-17c flips it
+		// per test rather than here.
+		BlocksForTable: func(*catalog.Table) (int64, bool) { return blocks, true },
 	}
 }
 

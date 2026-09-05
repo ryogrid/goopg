@@ -26,6 +26,9 @@ package optimizer
 // count of the scan's restriction qual.
 func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOps, parallelWorkers int, leaderParticipates bool) {
 	seqCost := costSeqscan(cp, relPages, rel.Rows, numQualOps)
+	// B-17d: `cost_seqscan`'s own flag (costsize.c:295). The producer always
+	// runs; a disabled seqscan is counted, not skipped.
+	seqDisabled := disabledNodesFor(!cp.enableSeqScan)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 	// path-creation time. Assert-only — never applied, never costed.
 	tgt, tgtKnown := scanPathTarget(rel)
@@ -34,6 +37,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 		Rel:          rel,
 		Rows:         rel.Rows,
 		Cost:         seqCost,
+		DisabledNodes: seqDisabled,
 		ParallelSafe: parallelWorkers > 0,
 		Target:       tgt,
 		TargetKnown:  tgtKnown,
@@ -47,6 +51,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 			Rel:             rel,
 			Rows:            rel.Rows / d,
 			Cost:            Cost{Startup: 0, Total: seqCost.Total / d},
+			DisabledNodes:   seqDisabled,
 			ParallelSafe:    true,
 			ParallelWorkers: parallelWorkers,
 			Target:          tgt,

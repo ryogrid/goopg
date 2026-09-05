@@ -143,9 +143,11 @@ type Path struct {
 	TargetKnown bool
 
 	// DisabledNodes reproduces PG 18's path->disabled_nodes (the count of
-	// enable_*-disabled nodes below this path). goopg has no enable_* GUCs, so it
-	// is always 0 today; carried so the dominance order matches PG and adding
-	// enable_* later is a data change, not a code change (design ch. 02 §2.2).
+	// enable_*-disabled nodes below this path). It is assigned by the join
+	// producers (P2-05), the Sort producer (B-17a) and the scan producers
+	// (B-17d) via disabledNodesFor, and read before any cost by the dominance
+	// order, so adding a further enable_* later is a data change at the
+	// producer, not a code change to the comparison.
 	DisabledNodes int
 
 	// RequiredOuter is the set of outer relations a parameterized path depends on

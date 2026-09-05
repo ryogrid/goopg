@@ -399,6 +399,9 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		Rel:      rel,
 		Rows:     rows,
 		Cost:     cost,
+		// B-17d: `cost_index`'s own flag (costsize.c:560). The producer
+		// always runs, parameterised or not.
+		DisabledNodes: disabledNodesFor(!s.cp.enableIndexScan),
 		Pathkeys: keys,
 		// `IndexPath.indexinfo` / `indexscandir` (pathnodes.h:1845/1849): the
 		// index this path's cost and rows were computed FOR, named so P5.5's

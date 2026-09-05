@@ -47,29 +47,29 @@ import (
 // they compete in the same rel's pathlist, so generating one without the other
 // hands `addPath` an incomplete field.
 func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
-	// review/260831-2 X-8: the session's enable_indexscan / enable_bitmapscan /
-	// enable_indexonlyscan decide which of these four producers may contribute
-	// a candidate at all. Skipping the producer is this seam's stand-in for
-	// upstream's disabled-node pricing (see currentIndexScanDisabled): the
-	// remaining producers — and, if none contributes, the seq-scan path
-	// generateScanPaths always adds — take over, which is the plan PG lands on.
-	indexOff := currentIndexScanDisabled(cat)
-	if !indexOff {
-		s.addParameterizedIndexPaths(cat)
-		s.addOrderedIndexPaths(cat)
-	}
+	// B-17d: every producer below always runs. The session's scan toggles
+	// are counted on the paths through s.cp (cost_seqscan / cost_index /
+	// cost_bitmap_heap_scan's own flags, costsize.c:295,560,1023), exactly as
+	// the join producers do since P2-05 — a disabled method is a strong
+	// preference in add_path, not a missing candidate. The one generation
+	// gate that stays a gate is enable_indexonlyscan (check_index_only,
+	// indxpath.c), like enable_memoize in get_memoize_path; TID and
+	// incremental-sort have no producer to gate. The rule-based legacy scan
+	// choice (planIndexScanFromWhere, rewriteScanInputsWithSingleTable-
+	// Predicates) keeps its own declines: it has no cost competition to
+	// express a preference in, and retires with the legacy planner (P6).
+	s.addParameterizedIndexPaths(cat)
+	s.addOrderedIndexPaths(cat)
 	// M0128-P2.4: bitmap scan paths compete alongside index scan paths in
 	// add_path for every usable index. They are always generated — PG's
 	// create_index_paths generates both indexscan and bitmap paths for every
 	// index, and add_path keeps the cheaper one in each cost regime.
-	if !currentBitmapScanDisabled(cat) {
-		s.addBaseRelBitmapPaths(cat)
-		s.addParameterizedBitmapPaths(cat)
-	}
+	s.addBaseRelBitmapPaths(cat)
+	s.addParameterizedBitmapPaths(cat)
 	// M0134-0187: `create_index_path(..., indexonly=true)` for every index
 	// covering what the statement reads from the relation — generated here
 	// because it competes in the same rel's pathlist as the rest.
-	if !indexOnlyScanRejected(cat) {
+	if !indexOnlyHardDisabled(cat) {
 		s.addIndexOnlyPaths(cat)
 	}
 }
@@ -184,6 +184,9 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	addPath(rel, &Path{
 		Kind: PathIndexScan,
 		Rel:  rel,
+		// B-17d: `cost_index`'s own flag (costsize.c:560), on top of nothing
+		// (no input). The producer always runs.
+		DisabledNodes: disabledNodesFor(!s.cp.enableIndexScan),
 		// `path->rows = baserel->rows` (cost_index's unparameterised arm):
 		// the rel's own post-restriction estimate, NOT the pre-restriction
 		// `relTuples` the cost was charged over. The scan reads every tuple

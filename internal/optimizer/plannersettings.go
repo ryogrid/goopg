@@ -64,6 +64,25 @@ type PlannerSettings struct {
 	EnableMergeJoin bool
 	EnableNestLoop  bool
 
+	// EnableSort is PG's `enable_sort` (B-17a): cost_sort's own flag on top of
+	// the input's disabled_nodes count (costsize.c:2144). The producer
+	// (sortPathFor) still builds the Sort path when off, so a query whose
+	// only legal plan sorts still plans.
+	//
+	// There is deliberately no EnableMaterial: goopg builds no Material path
+	// (joinpathsmemoize.go; take2 P2-06), so the flag would have no consumer.
+	EnableSort bool
+
+	// EnableSeqScan / EnableIndexScan / EnableBitmapScan are PG's
+	// `enable_seqscan` / `enable_indexscan` / `enable_bitmapscan` (B-17d):
+	// the scan producers' own flags, counted rather than gating the
+	// producer (costsize.c:295, 560, 1023). The generation gates that stay
+	// gates — enable_indexonlyscan, enable_memoize, and the vacuous TID and
+	// incremental-sort halves (no producer exists) — are NOT here.
+	EnableSeqScan    bool
+	EnableIndexScan  bool
+	EnableBitmapScan bool
+
 	// EnableHashAgg / EnablePresortedAggregate / Geqo / GeqoThreshold are the
 	// remaining P2-02c bridges. Same defect as EnableMemoize below: each
 	// reached the planner through a registry.OnChange bridge writing a
@@ -121,6 +140,10 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableHashJoin:  true,
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,
+		EnableSort:      true,
+		EnableSeqScan:    true,
+		EnableIndexScan:  true,
+		EnableBitmapScan: true,
 		EnableMemoize:   true,
 
 		EnableHashAgg:            HashAggEnabled(),
@@ -177,6 +200,10 @@ func (ps PlannerSettings) costParams() costParams {
 		enableHashJoin:  ps.EnableHashJoin,
 		enableMergeJoin: ps.EnableMergeJoin,
 		enableNestLoop:  ps.EnableNestLoop,
+		enableSort:      ps.EnableSort,
+		enableSeqScan:    ps.EnableSeqScan,
+		enableIndexScan:  ps.EnableIndexScan,
+		enableBitmapScan: ps.EnableBitmapScan,
 		enableMemoize:   ps.EnableMemoize,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,
