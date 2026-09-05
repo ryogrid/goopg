@@ -1152,8 +1152,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// plan, cache, then execute.
 		var precached optimizer.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !plannerSessionInputsActive(sess) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
-			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid)
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid, sessionPlannerFingerprint(sess))
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
 			} else {
@@ -1807,26 +1807,23 @@ func inheritanceChangePending(base catalog.Catalog) bool {
 // own namespace (M0122-0007 slice 4c, design 0122-0018). Pass 0 for
 // connection-less/embedded callers — effectiveDBOid falls back to
 // DefaultDBOid. M0097-0022.
-// plannerScanTogglesActive reports whether the session turned any scan-method
-// toggle (enable_seqscan / enable_indexscan / enable_bitmapscan /
-// enable_indexonlyscan) off. Such a session plans DIFFERENTLY from every other
-// one, and the cross-session plan cache keys only on (dbOid, normalized SQL) —
-// so it must neither read from nor write to the shared cache, exactly as a
-// session with temp inheritance children bypasses it. Cheap: four Get calls on
-// the miss path of a cache lookup that is itself only taken for
-// single-statement queries. review/260831-2 X-8 (the toggles became real
-// planner input there; before that every session planned identically).
-func plannerScanTogglesActive(sess *misc.SessionRegistry) bool {
+// scanToggleGUCs are the four scan-method toggles (enable_seqscan /
+// enable_indexscan / enable_bitmapscan / enable_indexonlyscan) that reach the
+// planner through the catalog wrapper (sessionPlanCatalog), NOT through
+// PlannerSettings — so the cache fingerprint must carry them separately.
+// B-18 commit 1 (take2 P2-04 cache-key half): sessions with a toggle off no
+// longer bypass the shared cache; they key into their own entry.
+var scanToggleGUCs = [...]string{"enable_seqscan", "enable_indexscan",
+	"enable_bitmapscan", "enable_indexonlyscan"}
+
+// sessionScanToggleOff reports whether sess turned the named scan-method
+// toggle off. Bool GUCs normalise to "on"/"off".
+func sessionScanToggleOff(sess *misc.SessionRegistry, name string) bool {
 	if sess == nil {
 		return false
 	}
-	for _, name := range [...]string{"enable_seqscan", "enable_indexscan",
-		"enable_bitmapscan", "enable_indexonlyscan"} {
-		if _, eff, ok := sess.Get(name); ok && strings.EqualFold(eff, "off") {
-			return true
-		}
-	}
-	return false
+	_, eff, ok := sess.Get(name)
+	return ok && strings.EqualFold(eff, "off")
 }
 
 // sessionPlannerSettings builds the per-statement planner context from the
@@ -1958,58 +1955,84 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 // against this number.
 const blockSizeBytesForPlanner = 8192
 
-// plannerCostGUCsOverridden reports whether the session has SET any GUC that
-// feeds the planner's cost model.
+// sessionPlannerFingerprint returns the plan-cache fingerprint for sess: its
+// full PlannerSettings value plus its four scan-method toggles.
 //
-// take2 P2-04, and a PREREQUISITE of P2-02 rather than a follow-up to it. The
-// plan cache is server-level and cross-session, keyed on
-// (dbOid, normalized SQL) with no GUC fingerprint. Until P2-01 the nine cost
-// GUCs were inert — defaultCostParams() was hard-wired — so every session
-// planned identically and the cache was safe by accident. The moment P2-02
-// makes the postmaster fill PlannerSettings from the session, a plan costed
-// under one connection's `random_page_cost` becomes servable to every other
-// connection. This is the same hazard, and the same remedy, as
-// plannerScanTogglesActive above: a session with its own planner inputs neither
-// reads from nor writes to the shared cache.
+// B-18 commit 1 (take2 P2-04 cache-key half). The plan cache is server-level
+// and cross-session; keying on (dbOid, normalized SQL) alone serves a plan
+// costed under one connection's `random_page_cost` to every other connection.
+// Sessions with their own planner inputs now key into their own cache entry
+// instead of bypassing the shared cache.
 //
-// The list is the nine cost GUCs PlannerSettings carries. It is checked by
-// OVERRIDE rather than by value, because comparing against BootVal would mean
-// parsing unit strings and would wrongly clear a session that SET a GUC to its
-// default.
-func plannerCostGUCsOverridden(sess *misc.SessionRegistry) bool {
-	if sess == nil {
-		return false
-	}
-	for _, name := range [...]string{
-		"seq_page_cost", "random_page_cost",
-		"cpu_tuple_cost", "cpu_index_tuple_cost", "cpu_operator_cost",
-		"parallel_setup_cost", "parallel_tuple_cost",
-		"effective_cache_size", "work_mem",
-		// take2 P2-03: hash_mem_multiplier scales the hash budget, so it
-		// changes plans exactly as work_mem does and must take a session off
-		// the shared cache for the same reason.
-		"hash_mem_multiplier",
-		// take2 P2-05: the method toggles change plans exactly as the cost
-		// GUCs do, so they must take a session off the shared cache too.
-		"enable_hashjoin", "enable_mergejoin", "enable_nestloop",
-		"enable_memoize", "enable_nestloop_index",
-		"enable_hashagg", "enable_presorted_aggregate",
-		"geqo", "geqo_threshold", "geqo_effort", "geqo_pool_size",
-		"geqo_generations", "geqo_selection_bias", "geqo_seed",
-	} {
-		if sess.HasSessionOverride(name) {
-			return true
-		}
-	}
-	return false
+// ParallelSettings is deliberately EXCLUDED: MaybeAddGather runs post-cache
+// (applyParallelPostPass), so it never affects the cached serial plan — and it
+// carries a func field (BlocksForTable) that is not formattable.
+func sessionPlannerFingerprint(sess *misc.SessionRegistry) string {
+	ps := sessionPlannerSettings(sess)
+	return plannerCacheFingerprint(ps,
+		sessionScanToggleOff(sess, "enable_seqscan"),
+		sessionScanToggleOff(sess, "enable_indexscan"),
+		sessionScanToggleOff(sess, "enable_bitmapscan"),
+		sessionScanToggleOff(sess, "enable_indexonlyscan"))
 }
 
-// plannerSessionInputsActive is the single predicate the plan-cache guards use:
-// true when this session carries ANY planner input the cache key does not
-// capture. Keeping the two families behind one name means a third family cannot
-// be added later without every guard site picking it up.
-func plannerSessionInputsActive(sess *misc.SessionRegistry) bool {
-	return plannerScanTogglesActive(sess) || plannerCostGUCsOverridden(sess)
+// plannerCacheFingerprint formats every planner input the cache key must
+// capture: the full PlannerSettings value (cost GUCs, method toggles, GEQO
+// knobs, memory budgets) plus the four scan-method toggles, which travel
+// through the catalog wrapper rather than through PlannerSettings.
+//
+// Floats use FormatFloat 'g' with precision -1: the shortest round-trip form,
+// exact, never rounded. A fixed-precision verb (%.6f and friends) would fold
+// distinct costs onto one key and serve a plan costed under the wrong value.
+func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disableIndexScan, disableBitmapScan, disableIndexOnlyScan bool) string {
+	float := func(v float64) string {
+		return strconv.FormatFloat(v, 'g', -1, 64)
+	}
+	bit := func(b bool) string {
+		if b {
+			return "1"
+		}
+		return "0"
+	}
+	// Positional fields in PlannerSettings declaration order, then the four
+	// scan toggles. Positions are fixed, so no field names are needed — but
+	// every field must be present; the per-GUC fingerprint test fails if a
+	// PlannerSettings input ever stops reaching the key.
+	fields := []string{
+		float(ps.SeqPageCost),
+		float(ps.RandomPageCost),
+		float(ps.CPUTupleCost),
+		float(ps.CPUIndexTupleCost),
+		float(ps.CPUOperatorCost),
+		float(ps.ParallelSetupCost),
+		float(ps.ParallelTupleCost),
+		float(ps.EffectiveCacheSize),
+		strconv.FormatInt(ps.WorkMem, 10),
+		bit(ps.EnableHashJoin),
+		bit(ps.EnableMergeJoin),
+		bit(ps.EnableNestLoop),
+		bit(ps.EnableSort),
+		bit(ps.EnableSeqScan),
+		bit(ps.EnableIndexScan),
+		bit(ps.EnableBitmapScan),
+		bit(ps.EnableHashAgg),
+		bit(ps.EnablePresortedAggregate),
+		bit(ps.Geqo),
+		strconv.Itoa(ps.GeqoThreshold),
+		bit(ps.EnableNestLoopIndex),
+		strconv.Itoa(ps.GeqoEffort),
+		strconv.Itoa(ps.GeqoPoolSize),
+		strconv.Itoa(ps.GeqoGenerations),
+		float(ps.GeqoSelectionBias),
+		float(ps.GeqoSeed),
+		bit(ps.EnableMemoize),
+		float(ps.HashMemMultiplier),
+		bit(disableSeqScan),
+		bit(disableIndexScan),
+		bit(disableBitmapScan),
+		bit(disableIndexOnlyScan),
+	}
+	return strings.Join(fields, "\x1f")
 }
 
 func sessionPlanCatalog(sess *misc.SessionRegistry, base catalog.Catalog, dbOid uint32) catalog.Catalog {
@@ -2642,16 +2665,18 @@ func isIdentByte(c byte) bool {
 		(c >= '0' && c <= '9')
 }
 
-// planCacheKey builds the cross-session plan cache key: normalizeCompatSQL's
-// text form prefixed with the querying connection's effective table/index
-// namespace oid (catalog.NamespaceDBOid(connDBOid)). Without the oid prefix,
+// planCacheKey builds the cross-session plan cache key: the planner-context
+// fingerprint plus normalizeCompatSQL's text form, prefixed with the querying
+// connection's effective table/index namespace oid
+// (catalog.NamespaceDBOid(connDBOid)). Without the oid prefix,
 // a plan cached while resolving names against one database's namespace could
 // be replayed for a connection reading a different one — the cache is a
 // single server-wide map shared by every connection (M0122-0007 slice 4c;
 // see plancache.go's doc comment). Two connections whose NamespaceDBOid
-// agrees (e.g. both "postgres") intentionally still share one entry.
-func planCacheKey(sql string, connDBOid uint32) string {
-	return strconv.FormatUint(uint64(catalog.NamespaceDBOid(connDBOid)), 10) + "\x00" + normalizeCompatSQL(sql)
+// agrees (e.g. both "postgres") AND whose planner fingerprints agree
+// intentionally still share one entry.
+func planCacheKey(sql string, connDBOid uint32, fingerprint string) string {
+	return strconv.FormatUint(uint64(catalog.NamespaceDBOid(connDBOid)), 10) + "\x00" + fingerprint + "\x00" + normalizeCompatSQL(sql)
 }
 
 // normalizeSQLPreservingLiterals lowercases SQL outside string literals and

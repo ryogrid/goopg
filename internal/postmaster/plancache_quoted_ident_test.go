@@ -34,7 +34,8 @@ func TestNormalizeCompatSQLPreservesQuotedIdentifierCase(t *testing.T) {
 		t.Errorf("escaped-quote identifier = %q, want %q", got, want)
 	}
 	// Distinct keys are what the wrong-results bug actually hinged on.
-	if planCacheKey(`SELECT * FROM "Foo"`, 5) == planCacheKey(`SELECT * FROM "foo"`, 5) {
+	fp := sessionPlannerFingerprint(nil)
+	if planCacheKey(`SELECT * FROM "Foo"`, 5, fp) == planCacheKey(`SELECT * FROM "foo"`, 5, fp) {
 		t.Error(`planCacheKey collides for "Foo" and "foo"`)
 	}
 }

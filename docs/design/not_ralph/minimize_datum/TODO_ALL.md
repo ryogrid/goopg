@@ -421,14 +421,23 @@ are EPICS — split into one-checkbox-per-commit items before starting
   (`addNLIPaths` emits `PathNestLoop` with no `DisabledNodes`; legacy
   `rewriteJoinsToNLI` gated by `EnableNestLoopIndex` is load-bearing,
   take3 P6-04 Q4 semi 12.5×). Retire only with P6.
-- [ ] **B-18 P2-04 cache-key half.** P2-04 landed the override bypass; the
-  planner context as part of the cache KEY (rather than a bypass), and
-  removing the bypass once keyed, remains open. Also attach the P2-02
-  remainder here: GUC-effect fixtures for `random_page_cost`,
-  `cpu_index_tuple_cost`, `effective_cache_size`, `parallel_*` (file,
-  don't claim).
-  *design: take3 08 §5.1; gate: `SET random_page_cost` changes the cached
-  plan; GUC-effect test per fixture GUC.*
+- [x] **B-18 P2-04 cache-key half, commit 1 (key).** Landed 2026-09-05:
+  `planCacheKey(sql, dbOid, fingerprint)` over full `PlannerSettings` +
+  4 scan toggles (exact float formatting; `ParallelSettings` excluded —
+  post-cache pass, unkeyable func field); deleted
+  `plannerCostGUCsOverridden`/`plannerScanTogglesActive`/
+  `plannerSessionInputsActive` bypass at all 4 guard sites; SET sessions
+  now hit the cache instead of bypassing it.
+  *design: take3 08 §5.1 pointer is half-stale (real pointers: take2
+  impl/P2-A-planner-context.md:165-182, take3 04 §1 row 168, 09 §5 P2);
+  gate: `SET random_page_cost` separates cached plans + third-execution
+  hit, float-exactness, per-field coverage; postmaster suite green.*
+- [ ] **B-18 commits 2-4 (one variable each): GUC-effect fixtures** for
+  `random_page_cost` + `cpu_index_tuple_cost` + `effective_cache_size`
+  (index shape; one fixture may cover all three) and
+  `parallel_setup_cost`/`parallel_tuple_cost` (Gather shape). Post-pass
+  `parallel_*` knobs need no fixture (safe by post-cache-pass design).
+  (file, don't claim).
 
 ---
 
