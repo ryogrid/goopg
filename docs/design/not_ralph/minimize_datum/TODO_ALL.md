@@ -55,7 +55,7 @@ tree (`git log -S` / `--grep`) on 2026-09-04; the **tree verdict** governs.
 | P0-05/06/07 plan-parity instrument | `[ ]` open | `[ ]` remaining | **Consistent** — no capture commits, no `bench/tpch/plans-pg/` or `bench/tpcds/plans-pg/` fixtures exist. Still open. |
 | P4-01 PathTarget/projection | take2: rev-10 steps 1–5 landed, default ON (`00d56df90`) | take3: slice 1 landed, slices 2/3 per DESIGN.md | **Superseded by the tree** — slices 1 (`588aa5fb5`), 2 (`8458b7552`) and 3 (`1d804ae02`) all landed; build-side Project narrowing is live (Q9 witness `Batches:` **2→1**, widths 1096→776/896→640/896→736/710→582 per `docs/design/planner-p4-01-target/DESIGN.md:61-71`; the 8-batch figure is the pre-retake baseline). Remaining: deferred slices (a) merge/NL input policy, (b) scan-node application, (c) upper targets (DESIGN.md:105-110) — owned by B-01a/b/c below. |
 | EX0 instruments | n/a (take3 work) | all `[x]`, phase closed | **Confirmed** — `6ace9567e`/`503f12cf7`/`b6254f911` (EX0-01/02), `eaff87ee0`/`a7e2f86f6`/`eedc924de` (EX0-03/03b/03c), `86bf7473f` (EX0-04), `14f8d8f1a` (EX0-05), `e8c7400f9` (EX0-06). MD blocker (3) is discharged. |
-| EX1 narrowing | n/a | EX1-01/02/02b `[x]`, EX1-03 dropped, EX1-04 cut 1 `[x]` | **Confirmed** — incl. `230a32bd0` (EX1-03 drop), `134324df6` (EX1-04 Cut 0 + unblock review). |
+| EX1 narrowing | n/a | EX1-01/02/02b `[x]`, EX1-03 dropped-then-resumed, EX1-04 cut 1 `[x]` | **Confirmed** — incl. `230a32bd0` (EX1-03 drop), `134324df6` (EX1-04 Cut 0 + unblock review). **Update 2026-09-05:** EX1-03 resumed and landed as a B-14 dependency (`5983b25c5`: DetoastRowBound/DetoastAttr/updateSetRefCols/detoastUpdateEvalRow + counter + json pointer decode arm + per-type contract tests) — B-14 `975ddc059` had committed a `DetoastRowBound` caller without its definition, so HEAD's executor package did not build. Drop-reversal justified by red-tree restoration + reviewed design (`583ff6148`, amended with the codec arm). |
 | EX2 clone elimination | n/a | audit + 02a/02c `[x]`, 02b dropped, 03 measure-only | **Confirmed** — incl. `efbca66e4` (EX2-01 audit: 45 sites), `fe2808bc9` (02b drop). MD-04 consumes the EX2-01 audit; no second audit. |
 | EX3 spill/sort/hash | n/a | 01/02/03-step1/05-cutA `[x]`, step2 blocked, cutB dropped | **Confirmed** — incl. `53e41fdbf` (EX3-01), `7c586eaf7` (step-2 blocked + resume patch), `a9cf79c81` (cut-B drop). **Plus post-reconciliation landings: EX3-02 Cut 2 (`68ccd68c3`, stratum-D chunk views, unit 2.002→0.005) and EX3-05 Cut A (`fd2e2ae7a`, wantCTIDs gate) with full gates; E-12's "Cut 2 blocked" premise is stale (corrected inline). |
 
@@ -376,6 +376,12 @@ are EPICS — split into one-checkbox-per-commit items before starting
   item_1` with `= ANY` cond, outer expression-ANY stays Filter;
   TPC-DS PASS=95 MISMATCH=0 (Q45 7 rows checksummed).
   Artifacts: planner/cost/executor probe + `saop_index_test.go` ×2.
+  Follow-ups landed 2026-09-05 (`afb39bb7c`): `Index Cond: (col = ANY
+  (..))` EXPLAIN rendering; `indexScanPredicate` rebuilds `col IN
+  (keys)` so the SeqScan fallback filters exactly the probed rows
+  (without it UPDATE..WHERE IN deleted 0-vs-3 live — wrong answers);
+  SSI fingerprint 2→3 for the multi-descent site.
+  Gates: executor + optimizer suites green; smoke 0 failed.
 - [!] **B-15 P2-09b `btcostestimate` batch — BLOCKED (E1 failure,
   reverted).** R1–R5 implemented unit-green but flips 14 shapes toward
   NL: Q10 5.6×, Q7 ~4×, Q9 2.3×, Q14 2.4×, Q5 2× (Q3 legitimately
@@ -909,6 +915,8 @@ P6-03/04/05 (load-bearing).
 |---|---|---|---|---|
 | F-01 | 2026-09-05 | 514913912 (pre-existing) | dual-map peak removed; single-map build by plan type | audit-only close; no new code; guard test `join_single_map_build_test.go` |
 | C-01 | 2026-09-05 | ea8ca9dfe + 2e59cfe49 | SJI min/strict populated fail-closed; chained-LEFT shrink verified | 8 scoped tests; review APPROVE-WITH-NITS; smoke 0 failed; USING follow-up filed |
+| EX1-03 | 2026-09-05 | 5983b25c5 | bound-narrowed detoast + DetoastAttr + json pointer decode; build restored | per-type contract tests; suites + spotcheck PASS; review APPROVE-WITH-NITS; 3 gap ledger rows |
+| B-14fu | 2026-09-05 | afb39bb7c | ANY explain + update fallback predicate (fixes live wrong-answer) + SSI fingerprint | executor + optimizer green; smoke 0 failed |
 
 ## Dropped
 
