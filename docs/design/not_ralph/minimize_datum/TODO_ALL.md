@@ -1033,14 +1033,55 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   MD-03 (a test per switch, watermark property test, escape check);
   files: `slot.go`, `opnode.go`, `expr.go`, `exprnode.go`,
   `operators.go`, `codec.go`, new.*
-- [ ] **D-04 MD-03.5 throwaway prototype.** Pack and unpack the Q9 build
+- [x] **D-04 MD-03.5 throwaway prototype — VERDICT: STOP, THE MODEL IS
+  WRONG.** Run 2026-09-05; prototype built, measured, and deleted (tree
+  clean). Stopping rule 05 §6, in its own words: **"batches unchanged →
+  the model in D-3 is wrong. Fix the model before touching another site."**
+  Four numbers: batches **4 → 4 UNCHANGED**; retained bytes −14.2% (join
+  accounting) / −24.4% (live-heap `inuse_space` — the harness 05 §6 says
+  does not exist was BUILT); wall time **+6.8% consistently** (n=7 per arm,
+  distributions barely overlap, so a real penalty inside the noise band);
+  allocations **+39%** — 05 §6's "unchanged by construction" prediction is
+  **wrong for this tree**, `EncodeRowPGCtx` costs ~6 allocations per packed
+  row against ~1 for the legacy retain. Values MATCH.
+  **Two measured reasons the model is wrong:** (i) `avgVarBytes` is ~62%
+  too high (model 194 B/row vs measured 120), and it dominates a term
+  packing cannot touch — **correcting it alone takes nbatch 4 → 2 with no
+  packing at all**; (ii) the model prices rows and ignores the table — peak
+  live heap is 506 MB of hash-map buckets against 296 MB of rows, so **the
+  largest consumer in this join is not the retention format**.
+  **The premise is stale, which matters more than the verdict.** Q9 today
+  is a parallel plan, ~15 s, batching join `orders` at Batches 4 — not the
+  `2→1`/1098 B/63.8 s pre-state recorded below. EX1 narrowing already
+  landed on this build half: **120 B/row, 2 columns**, so the bundle's ~5×
+  width premise is **1.9×** post-EX1, on ~14% of the join's peak. And each
+  of 5 workers builds all 1.5 M rows privately (sharing is declined for a
+  spilling build) — a 5× multiplier no part of this bundle addresses.
+  Artifact: `analysis/minimize-datum/d04-pack-prototype-20260905/README.md`.
+  Ledger `take3-D-04-model-wrong`. Pack and unpack the Q9 build
   side behind a flag with a hardcoded descriptor, measure 05 §6's four
   numbers, **delete the code**. Tests MD-04's hypothesis (incl. the R-3
   encode-cost question — `encodeValuePGCtx` is ~617 lines per column per
   row) before ~900 LOC is sunk.
   *design: 05 §6; gate: values-diff only (the code does not land); not a
   commit to `master`.*
-- [!] **D-05 MD-04 hash join — BLOCKED on A-06 + E-14 + A-05.**
+- [!] **D-05 MD-04 hash join — BLOCKED, and the blocker CHANGED on
+  2026-09-05: D-04's measurement fired 05 §6's "fix the model first" arm.**
+  D-05 must not proceed as written. Ordered prerequisites now, ahead of the
+  original A-06/E-14/A-05 list:
+  1. **Fix `avgVarBytes`** so the entry model matches measured retention
+     (194 vs 120 B/row on the Q9 witness). On that witness it alone halves
+     the batch count — which is the outcome D-05 was going to claim.
+  2. **Charge the hash table in the counter that drives growth**, not only
+     in the sizing: 506 MB of buckets against 296 MB of rows.
+  3. **Re-measure the premise.** The 5× width claim is 1.9× post-EX1, on
+     ~14% of the join's peak. Whether that justifies ~900 LOC is a
+     different question from the one the bundle was scoped against.
+  Also required by D-04's evidence but out of this bundle's stated scope: a
+  dense byte arena plus an allocation-free encoder, since packing every
+  build row while deforming only matches costs +39% allocations.
+  Original blocker text follows.
+  **D-05 (original).**
   Serial and parallel in one commit, `hashsize` model re-derived in the
   same commit. The load-bearing EX1 dependency for hash-join geometry is
   the **build half** (E-14 redesign), not the sort half; EX0 is landed.
@@ -1359,6 +1400,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| D-04 | 2026-09-05 | (this commit) | **STOP: batches 4->4 unchanged, time +6.8%, allocs +39%, retained bytes -14/-24%** | fires 05 section 6's "fix the model first" arm; premise found stale (5x width claim is 1.9x post-EX1) |
 | C-10d (measurement half) | 2026-09-05 | (this commit) | AST census: 89 boundaries / 41 of 99 TPC-DS; a full pull-up removes only 39% of the blocking ones | so C-11 must cross the boundary regardless; also found CTEs+views are two more routes to the same leaf |
 | C-10c | 2026-09-05 | (this commit) | Phase-4 OJ qual/target placement contract + 5 fixtures; 3 negative controls | found C-16 retires no arm (no reminder) and that goopg has no PlaceHolderVar equivalent |
 | C-07 (derivation half) | 2026-09-05 | (this commit) | query_pathkeys derived with PG's precedence; has_useful_pathkeys completed and made per-rel | inert by design: values 24/24, plans byte-identical; the "motivate index paths" half is evidenced-blocked on C-11/C-12 |
