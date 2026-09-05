@@ -402,6 +402,27 @@ func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName
 // bucketFraction returns the fraction of a single histogram
 // bucket [lo, hi] that lies below `lit`. Always in [0, 1].
 func bucketFraction(lo, hi, lit, typeName string) float64 {
+	if isStringScalarType(typeName) {
+		// take2 B-08: `convert_string_to_scalar` (selfuncs.c:4787-4906).
+		// The three scalings share one adaptive range and one
+		// common-prefix strip, so they are scaled jointly — three
+		// independent single-value scalings would strip different
+		// prefixes (e.g. lit "cb" in bucket ["c","d"] strips "c"
+		// while the bounds strip nothing) and misplace the literal.
+		litN, loN, hiN := convertStringBucketScales(lit, lo, hi)
+		if hiN <= loN {
+			// Bin boundaries identical after scaling: PG's
+			// high <= low arm (binfrac = 0.5).
+			return 0.5
+		}
+		if litN <= loN {
+			return 0
+		}
+		if litN >= hiN {
+			return 1
+		}
+		return (litN - loN) / (hiN - loN)
+	}
 	loN, loOK := numericValue(lo, typeName)
 	hiN, hiOK := numericValue(hi, typeName)
 	litN, litOK := numericValue(lit, typeName)
@@ -436,7 +457,9 @@ func rangeOpMatches(op parser.OpCode, cmp int) bool {
 
 // histCmp compares two histogram-bound-formatted strings under
 // the per-type total order. Integer / numeric / time go through
-// numericValue; strings fall back to byte-wise compare.
+// numericValue; text-family types go through the string-scalar
+// path (same function); anything else falls back to byte-wise
+// compare.
 func histCmp(a, b, typeName string) int {
 	if an, ok := numericValue(a, typeName); ok {
 		if bn, ok := numericValue(b, typeName); ok {
@@ -455,16 +478,23 @@ func histCmp(a, b, typeName string) int {
 // numericValue parses a histogram-bound or literal string back to
 // a float64 for numeric / integer / numeric-typed columns. Reports
 // (value, true) when the type is numeric and parsing succeeds;
-// otherwise (0, false). String / bool columns cannot use this
-// path and fall back to byte-wise compare in histCmp.
+// otherwise (0, false). Text-family columns scale through the
+// string-scalar path (convert_one_string_to_scalar over the
+// full-ASCII fallback range — a single-string context cannot
+// derive the bucket-adaptive range, so bucket interpolation
+// scales jointly in bucketFraction instead of coming through
+// here); bool columns cannot use this path and fall back to
+// byte-wise compare in histCmp.
 func numericValue(s, typeName string) (float64, bool) {
 	switch strings.ToLower(typeName) {
-	case "int", "int2", "int4", "int8", "smallint", "integer", "bigint", "numeric", "decimal", "float", "real", "double precision":
+	case "int", "int2", "int4", "int8", "smallint", "integer", "bigint", "numeric", "decimal", "float", "float4", "float8", "real", "double precision":
 		v, err := strconv.ParseFloat(s, 64)
 		if err != nil {
 			return 0, false
 		}
 		return v, true
+	case "text", "varchar", "char", "bpchar", "character varying", "name":
+		return convertOneStringToScalar(s, ' ', 127), true
 
 	// take2 P1-11b: `convert_timevalue_to_scalar` (selfuncs.c). Date and
 	// timestamp values become a scalar so histogram interpolation can measure
@@ -498,6 +528,146 @@ func numericValue(s, typeName string) (float64, bool) {
 		return 0, false
 	}
 	return 0, false
+}
+
+// isStringScalarType reports whether typeName is one of the
+// character-string types `convert_to_scalar` handles
+// (selfuncs.c:4637-4641: CHAROID, BPCHAROID, VARCHAROID, TEXTOID,
+// NAMEOID). Network types (INETOID and kin) are EXPLICITLY OUT —
+// deferred with the rest of B-03's network variants.
+func isStringScalarType(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "text", "varchar", "char", "bpchar", "character varying", "name":
+		return true
+	}
+	return false
+}
+
+// stringScalarRange derives `convert_string_to_scalar`'s digit
+// range (rangelo, rangehi) from a histogram bucket's bounds: the
+// smallest and largest byte seen in either bound, widened to the
+// full A-Z / a-z / 0-9 run when the range touches it, and reset
+// to the full ASCII set (' ' to 127) when the range spans fewer
+// than 10 characters (selfuncs.c:4798-4846).
+func stringScalarRange(lo, hi string) (rangelo, rangehi int) {
+	lob, hib := []byte(lo), []byte(hi)
+	if len(hib) > 0 {
+		rangelo, rangehi = int(hib[0]), int(hib[0])
+	}
+	for _, b := range lob {
+		if rangelo > int(b) {
+			rangelo = int(b)
+		}
+		if rangehi < int(b) {
+			rangehi = int(b)
+		}
+	}
+	for _, b := range hib {
+		if rangelo > int(b) {
+			rangelo = int(b)
+		}
+		if rangehi < int(b) {
+			rangehi = int(b)
+		}
+	}
+	// If range includes any upper-case ASCII chars, make it include all.
+	if rangelo <= 'Z' && rangehi >= 'A' {
+		if rangelo > 'A' {
+			rangelo = 'A'
+		}
+		if rangehi < 'Z' {
+			rangehi = 'Z'
+		}
+	}
+	// Ditto lower-case.
+	if rangelo <= 'z' && rangehi >= 'a' {
+		if rangelo > 'a' {
+			rangelo = 'a'
+		}
+		if rangehi < 'z' {
+			rangehi = 'z'
+		}
+	}
+	// Ditto digits.
+	if rangelo <= '9' && rangehi >= '0' {
+		if rangelo > '0' {
+			rangelo = '0'
+		}
+		if rangehi < '9' {
+			rangehi = '9'
+		}
+	}
+	// If range includes less than 10 chars, assume we have not got
+	// enough data, and make it include the regular ASCII set.
+	if rangehi-rangelo < 9 {
+		rangelo = ' '
+		rangehi = 127
+	}
+	return rangelo, rangehi
+}
+
+// stripStringCommonPrefix drops the common byte prefix shared by
+// all three strings (selfuncs.c:4851-4856) — the "zoom in" that
+// lets a narrow bucket (e.g. one area code's phone numbers) use
+// the full scalar resolution.
+func stripStringCommonPrefix(value, lo, hi string) (string, string, string) {
+	vb, lob, hib := []byte(value), []byte(lo), []byte(hi)
+	for len(lob) > 0 && len(hib) > 0 && len(vb) > 0 && lob[0] == hib[0] && lob[0] == vb[0] {
+		vb, lob, hib = vb[1:], lob[1:], hib[1:]
+	}
+	return string(vb), string(lob), string(hib)
+}
+
+// convertOneStringToScalar ports `convert_one_string_to_scalar`
+// (selfuncs.c:4866-4906): the first 12 bytes as a base-N
+// fraction, where N is the range width + 1. Out-of-range bytes
+// clamp to just outside the range; the empty string scales to 0.
+func convertOneStringToScalar(s string, rangelo, rangehi int) float64 {
+	b := []byte(s)
+	if len(b) == 0 {
+		return 0.0
+	}
+	if len(b) > 12 {
+		b = b[:12]
+	}
+	base := float64(rangehi - rangelo + 1)
+	num, denom := 0.0, base
+	for _, c := range b {
+		ch := int(c)
+		if ch < rangelo {
+			ch = rangelo - 1
+		} else if ch > rangehi {
+			ch = rangehi + 1
+		}
+		num += float64(ch-rangelo) / denom
+		denom *= base
+	}
+	return num
+}
+
+// convertStringToScalar ports `convert_string_to_scalar`
+// (postgres/src/backend/utils/adt/selfuncs.c:4787-4864) for one
+// value: the adaptive digit range from `lo`/`hi`, the common
+// prefix of all three stripped, then the base-N fraction. Byte
+// semantics throughout (unsigned char in C; []byte here), so
+// multibyte bytes order exactly as PG's C-locale path sees them.
+func convertStringToScalar(value, lo, hi string) float64 {
+	rangelo, rangehi := stringScalarRange(lo, hi)
+	stripped, _, _ := stripStringCommonPrefix(value, lo, hi)
+	return convertOneStringToScalar(stripped, rangelo, rangehi)
+}
+
+// convertStringBucketScales scales a bucket literal together with
+// its bounds — the joint form `ineq_histogram_selectivity` needs
+// (selfuncs.c:1230-1258): one range, one common-prefix strip
+// shared by all three, so the literal and the bounds are measured
+// on the same scale.
+func convertStringBucketScales(lit, lo, hi string) (litN, loN, hiN float64) {
+	rangelo, rangehi := stringScalarRange(lo, hi)
+	strippedLit, strippedLo, strippedHi := stripStringCommonPrefix(lit, lo, hi)
+	return convertOneStringToScalar(strippedLit, rangelo, rangehi),
+		convertOneStringToScalar(strippedLo, rangelo, rangehi),
+		convertOneStringToScalar(strippedHi, rangelo, rangehi)
 }
 
 // normalizeColumnConst recognises `col op const` and `const op col`

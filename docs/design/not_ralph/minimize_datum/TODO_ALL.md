@@ -290,10 +290,16 @@ are EPICS — split into one-checkbox-per-commit items before starting
   clamp) predicts ~0 ratchet (fresh endpoints, in-bounds literals).
   Ledger `take3-B-07-deferred`. Resume only on demonstrated
   in-suite out-of-range case or accepted zero-ratchet fidelity.
-- [ ] **B-08 P1-31 text/network scalars** (`convert_string_to_scalar` +
-  network variants; `bucketFraction` 0.5 pinned by test). Date half landed
-  (P1-11b). Judge by the ratchet.
-  *design: take3 08 §4; gate: EA ratchet.*
+- [x] **B-08 P1-31 text/network scalars.** Text half LANDED 2026-09-05:
+  `convertStringToScalar` faithful port (range scan + class widening +
+  <9 ASCII rule + prefix strip + ≤12-char base-N) wired for the text
+  family; 0.5 pin flipped to interpolation; B-03 tail clamp
+  `Max(prefixsel, eq_sel)`; adjacent float4/float8 label fix.
+  Gates: convert/string-histogram/pattern/range suites; PP zero drift;
+  TPC-H 24/24 MATCH (timing neutral as predicted).
+  Network half DEFERRED (zero in-suite columns/queries; inequality-only
+  would not cover inclusion ops) — ledger `take3-B-08-network-deferred`.
+  Artifacts: `selectivity.go`, `patternsel.go`, `rangequery_test.go`.
 - [ ] **B-09 P1-02 tree height + partial-index tuples.** `_bt_getrootheight`
   analogue for height; `indexTuples = relTuples` is wrong for partial
   indexes. Own commit, lands before P1-10.
