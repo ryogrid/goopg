@@ -624,9 +624,36 @@ rule).*
   built from, plain-aggregate-unchanged, clamp, out-of-range fail-safe);
   optimizer suite; TPC-H values 24/24 MATCH, plan-gate PASS, PP unchanged
   6/14/2; TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0.
-  Remaining (the SCOPE half): the two decisions this item also owns —
-  whether `GROUP_AGG` carries a rollup list, and whether C-15 ships a
-  grouping-sets arm or pins them to AGG_HASHED as a measured divergence.
+  **SCOPE HALF DONE 2026-09-06** —
+  `docs/design/planner-c10a-grouping-sets-scope/DESIGN.md` + 3 gate tests.
+  **Decision 1: keep the flat `GroupingSets [][]int`; no rollup list.**
+  goopg's flat form IS PG's `RollupData.gsets` minus the rollup level, and
+  every other `RollupData` field is derivable except `is_hashed` — which is
+  `AGG_MIXED`, not a rollup. A rollup is the unit of ONE SORT ORDER, and
+  goopg has no phases, no intra-operator tuplesort, and keys on the SET
+  index — so the rollup grouping has no consumer on either side. Reversible
+  asymmetrically in favour of flat.
+  **Decision 2: C-15 ships NO grouping-sets arm; pin to AGG_HASHED**, on
+  three conditions (move the guard into the path producer and KEEP the
+  executor gate; the pin is conditional on an unrun SF=1 memory measurement
+  of Q22/Q67; teach the parity tool the labels first).
+  **Two things that changed the author's mind, both verified:** retiring the
+  three planner declines is NOT a wrong-answer risk — a SECOND gate in
+  `aggregateOp.Open` re-tests `GroupingSets == nil`, so retiring them alone
+  buys a redundant `Sort` under a node that ignores it. And "hashed is what
+  PG picks anyway" is FALSE: PG picks 5 GroupAggregate + 3 MixedAggregate
+  and **0 HashAggregate** on this corpus, and structurally cannot pick pure
+  hashed for a ROLLUP (the empty set can't be hashed).
+  **New finding, must land BEFORE C-15:** `scripts/pg-plan-parity-diff.py`
+  **cannot see this divergence** — goopg's label and PG's `MixedAggregate`
+  are both unknown node kinds, so every grouping-sets strategy divergence
+  is mis-filed as `join-order`, and the `aggregation-strategy` bucket the
+  P4 exit criterion reads is empty of the only 8 queries guaranteed to be
+  in it. ~5-line fix.
+  **Corpus correction: 11 of 99, not 12 of 100** (the twelfth was the junk
+  `query_0.sql` concatenation); measurable corpus is **8** after the three
+  dsqgen SKIPs; TPC-H uses grouping sets in **zero** of 22; every corpus
+  query is a single ROLLUP, so nothing needs phases.
   Original scope note follows.
   **C-10a (original).** Before C-11
   fixes the upper-`RelOptInfo` struct, decide (i) whether `GROUP_AGG`
