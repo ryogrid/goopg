@@ -273,14 +273,16 @@ are EPICS — split into one-checkbox-per-commit items before starting
   Gates: 9 tests; optimizer suite; PP zero drift; TPC-H 24/24 MATCH.
   Zero movement by construction (no production registry writer yet —
   loader is the resume point with the 3429 decoder).
+  TPC-DS PASS=95 MISMATCH=0.
   Artifacts: `internal/optimizer/{extstats,cardinality}.go`,
   `extstats_ndistinct_test.go`.
-- [ ] **B-06 P1-27 CTE-agg statistics.** Rescoped: plain-CTE columns
-  already resolve; the gap is aggregated outputs (`year_total` →
-  0.005/conjunct, same as PG) plus goopg's helping `rows ≤ 1` guard.
-  Replacing the guard needs genuinely derived statistics; removing it
-  without them regresses. Keep open with a ledger row if deferred.
-  *design: take3 08 §4; gate: EA ratchet.*
+- [ ] **B-06 P1-27 CTE-agg statistics.** DEFERRED-OPEN 2026-09-05
+  (probe): guard is load-bearing (removal reverts Q74 99s→14s); PG has
+  no answer either (single-key uniqueness; Q74 groups by 4). Genuine
+  fix needs beyond-PG work (OID-less CTE-output synthesis + multi-key
+  per-column ndistinct + FD-bound-only for agg outputs); no safe
+  ratchet-moving increment. Ledger `take3-B-06-deferred` (resume steps
+  inline). Keep open; revisit only with the synthesis design.
 - [ ] **B-07 P1-30 index-endpoint probe + MCV widening** (`get_variable_range`;
   histogram-endpoint drift for monotonic keys). Judge by the ratchet.
   *design: take3 08 §4; gate: EA ratchet.*
