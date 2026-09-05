@@ -1082,11 +1082,37 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
      inside drift), values PASS, plans byte-identical, TPC-DS
      PASS=95/CKMISMATCH=0. Artifact:
      `analysis/minimize-datum/d05-entrywidth-20260906/README.md`.
-  2. **Charge the hash table in the counter that drives growth**, not only
-     in the sizing: 506 MB of buckets against 296 MB of rows. **This is now
-     the ONLY remaining lever on the Q9 witness** — the non-monotone table
-     above shows a packed retention format makes Q9's batching WORSE, not
-     better, until `MapSlotBytes = 48` is addressed first.
+  2. ~~**Charge the hash table**~~ **ATTEMPTED 2026-09-06, REVERTED, and
+     D-04's premise here was ALSO refuted.** The buckets were *already*
+     charged — `join_batch.go` pre-deducts `nbuckets*MapSlotBytes` from
+     `spaceAllowed`, which is algebraically identical to PG's trigger. The
+     real defect was that **`MapSlotBytes = 48` was a hand-derived guess
+     and is 2× low**: measured against go1.25's swisstable runtime, a
+     `map[string][]Row` slot costs **96.1 B** and `map[int64][]Row` **80.1 B**
+     (Q9's `numeric` key takes the string lane × 1,048,576 slots × 5
+     private worker builds = D-04's 506 MB).
+     Fixing it to 96 (plus PG's `bucket_bytes <= budget/2` assert as a
+     clamp) **halved the bucket heap: 586.7 → 286.0 MB live, per-worker
+     peak −34.5%, batches UNCHANGED at 4, Q9 timing neutral, values 24
+     MATCH** — and cost **+10.4% total** because **Q14 flipped Hash Join →
+     Nested Loop (+3364%)**.
+     Q14 diagnosed: it ran `Batches: 1` in BOTH arms — the executor never
+     spilled. The planner priced a **9-column build the executor never
+     builds**, and the honest bucket price pushed that phantom build 1.5%
+     past the budget. So **prerequisite #2 is no longer the lever either:
+     it is blocked behind the cost-side narrowing fix** (ledger
+     `take3-D-05-costside-unnarrowed`), because until the planner prices
+     the build the executor actually builds, correcting `MapSlotBytes`
+     amplifies a phantom build across the budget line and the failure mode
+     is **plan flips, not spilling**. With the narrowed input the same
+     build sits at 53.4 of 134.2 MB — a 2.5× margin, not a 1.5% one.
+     Patch preserved (`tmp/d05p2-bucket-charge.patch`); artifact
+     `analysis/minimize-datum/d05-bucket-charge-20260906/README.md`.
+  2b. **Cheap and independent, worth landing on its own:** `SpacePeak`
+     should include the bucket array as PG's does ("Account for the buckets
+     in spaceUsed (reported in EXPLAIN ANALYZE)", `nodeHash.c`). Zero
+     behavioural effect, and it is **the reason this line of work was
+     flying blind** — `Memory Usage:` omits the join's largest term.
   3. **Re-measure the premise.** The 5× width claim is 1.9× post-EX1, on
      ~14% of the join's peak. Whether that justifies ~900 LOC is a
      different question from the one the bundle was scoped against.
@@ -1413,6 +1439,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| D-05 prereq #2 | 2026-09-06 | (reverted; patch in tmp/) | MapSlotBytes 48 was a guess and 2x low (measured 96 B/slot); honest value halved bucket heap 586->286 MB, batches unchanged — but **Q14 flipped to a nested loop, +10.4% total** | premise refuted again (buckets WERE already charged); blocker moves to the cost side pricing an un-narrowed build |
 | D-05 prereq #1 | 2026-09-06 | (this commit) | entry model fixed 194 -> 120 B/row (was half-narrowed, half-full-width); **nbatch unchanged — D-04's claim refuted** | non-monotone: 2 batches need <=111.8 B/row; packed 63 B/row lands back on 4. The lever is MapSlotBytes, not the entry |
 | D-04 | 2026-09-05 | (this commit) | **STOP: batches 4->4 unchanged, time +6.8%, allocs +39%, retained bytes -14/-24%** | fires 05 section 6's "fix the model first" arm; premise found stale (5x width claim is 1.9x post-EX1) |
 | C-10d (measurement half) | 2026-09-05 | (this commit) | AST census: 89 boundaries / 41 of 99 TPC-DS; a full pull-up removes only 39% of the blocking ones | so C-11 must cross the boundary regardless; also found CTEs+views are two more routes to the same leaf |
