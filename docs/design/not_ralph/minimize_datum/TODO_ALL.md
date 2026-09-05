@@ -632,9 +632,25 @@ rule).*
   `createplanroot.go` boundary assertions. Deletes the largest silent
   wrong-answer class — value-level `tpch-runner -diff`, never counts.
   *design: take3 08 §9; gate: value-level `-diff`, never counts.*
-- [ ] **C-20c P6-06a retire `GOOPG_INDEXKEY_HARVEST`**, regenerating
-  `planner-flags.env`. Own commit with before/after parity roll-up +
-  timing table.
+- [!] **C-20c P6-06a retire `GOOPG_INDEXKEY_HARVEST` — BLOCKED: the flip
+  is not plan-neutral (measured 2026-09-05).** The item's own gate is
+  "byte-identical plans for the flip", and the flip fails it. On/off arms
+  back to back under the pinned regime (SF=1, serial):
+  Q2 0.97 / 1.05, Q4 **2.27 / 1.46**, Q17 0.65 / 0.75, Q20 1.70 / 1.99,
+  Q22 **1.17 / 0.79** (ON / OFF seconds). Q4 and Q22 are materially faster
+  with the harvest OFF while Q2/Q17/Q20 are faster with it ON, so the off
+  path is live, not dead weight, and retiring the flag would lock in the
+  slower side of two queries.
+  Two by-products of the measurement, both landed: the flag's own doc
+  comment claimed "Gated OFF by default" while
+  `indexKeyHarvestFromEnv` answers true for an unset variable (it is ON) —
+  corrected in place; and the historical catastrophe the comment records
+  (Q4 3.87 s → 276.08 s with the harvest) **no longer reproduces**, so the
+  prerequisite execution work landed at some point without this note being
+  updated.
+  Resume: retire only once the search chooses the harvested shape on cost
+  for Q4/Q22-class queries too, i.e. after the semi/anti execution work the
+  original comment names. Ledger `take3-C-20c-blocked`.
   *design: take3 08 §9; gate: byte-identical plans for the flip
   (take3 09 §5 P6).*
 - [ ] **C-20d P6-06b retire `GOOPG_INDEX_PROBE_MULT`**, regenerating
