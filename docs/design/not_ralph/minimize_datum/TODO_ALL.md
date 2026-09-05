@@ -193,7 +193,19 @@ are EPICS — split into one-checkbox-per-commit items before starting
   scan projection, (ii) narrowing-aware OuterColumnRef/Args rewriter,
   (iii) NLI probe inventory from IndexClauses, (iv) walkPlanExprs
   coverage + consumer. Ledger `take3-B-01b-declined`.
-- [~] **B-01c P4-01 deferred slice (c): upper targets.**
+- [x] **B-01c P4-01 deferred slice (c): upper targets — COMPUTE HALF
+  COMPLETE.** Status resolved 2026-09-05: all three compute slices landed
+  (`sort_input_target.go`, `group_input_target.go`,
+  `window_input_target.go`, each with its test file and fail-closed
+  assert). The "Remaining: window-compute" note below predates slice 3 and
+  is stale — window-compute IS slice 3.
+  The APPLYING cuts are not deferred-by-omission, they are **out of this
+  item's accepted scope by its own review verdict** ("NO applying cutting —
+  no narrowing-aware upper rewriter exists"), and stay blocked on two
+  prerequisites that do not exist yet: a narrowing-aware upper rewriter,
+  and a key-preservation gate for it. Filed as ledger
+  `take3-B-01c-applying-blocked` rather than left as an open checkbox that
+  nothing can close.
   Review verdict: sort-input compute-only first (group second with
   Filter/Passthrough decline rules; window last after walker coverage;
   NO applying cut — no narrowing-aware upper rewriter exists).
