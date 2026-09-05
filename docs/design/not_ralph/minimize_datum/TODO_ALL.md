@@ -672,7 +672,26 @@ No wall-time target in acceptance (06 §5).*
 Geometry-free slices (D-01/D-02/D-03/D-04/D-09) proceed per A-06;
 D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
 
-- [ ] **D-01 MD-01 `TupleDesc` + type metadata.** `attlen`/`attbyval`/
+- [x] **D-01 MD-01 `TupleDesc` + type metadata.** Landed 2026-09-05:
+  `attLen`/`attByVal`/`attStorage` on `colTypeInfo`, **derived** through
+  `catalog.TypeNameToOID` → `userTypeAttrsForOID` (the existing
+  name→OID→descriptor bridge, REVIEW M-goopg-2) rather than transcribed —
+  the D-02 audit found FOUR transcriptions of this list already in tree, so
+  a fifth written by hand would be the drift hazard 03 §5 names. Arrays
+  short-circuit to the varlena descriptor (`catalog.Type` carries the
+  ELEMENT name, so an OID lookup would hand back the element's by-value
+  descriptor for an `int4[]` column). Purely additive: no consumer yet, and
+  `align` deliberately stays on `physicalPGTypeAlign` because unifying
+  alignment is D-09's job and changes the on-disk format.
+  Gates: 4 new agreement tests (pg_type.dat values incl. `point`/`money`;
+  array short-circuit; unknown-type fail-safe DIRECTION — varlena, never
+  by-value; and a **sibling-path check that the descriptor's `typalign`
+  agrees with `physicalPGTypeAlign` on every type both recognise**, which
+  is what keeps the two transcriptions from drifting further); executor
+  suite green; TPC-H values 24/24 MATCH; plans byte-identical; plan-gate
+  PASS; PP unchanged.
+  Original text follows.
+  **D-01 (original scope note).** `attlen`/`attbyval`/
   `attstorage` on `colTypeInfo`, sharing **one** `pg_type.dat`
   transcription with `userTypeAttrsForOID` (reuse the existing
   name→OID→descriptor bridge — REVIEW M-goopg-2). Honour
@@ -1012,6 +1031,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| D-01 | 2026-09-05 | (this commit) | TupleDesc descriptor fields derived, not transcribed; agreement test spans two pg_type.dat transcriptions | additive, no consumer yet; values 24/24, plans byte-identical, plan-gate PASS |
 | F-02 | 2026-09-05 | (pre-existing M0127-P1.1) | probe seam already chained: 432 ns/op 0 allocs vs 1115 ns/op 10 allocs for the old seam | audit-only close; no new code; guard `TestProbeSeamZeroAllocs` verified passing |
 | D-02 | 2026-09-05 | c6468238f + (this commit) | verdict PROCEED: 0 declining columns of 160,302, 0 retention sites of 985 | corrected 04 section 3.1's packableType definition, which would have produced a false STOP; 3 latent on-disk bugs ledgered |
 | C-02d | 2026-09-05 | (this commit) | qual moves across preserved-side outer links; proof gains positive containment | values 24/24, plans byte-identical, plan-gate PASS, TPC-DS CKMISMATCH=0; review found no counterexample |

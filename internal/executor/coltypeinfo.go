@@ -33,6 +33,29 @@ type colTypeInfo struct {
 	align int
 	// isTSTZ is isTimestampTZTypeName(Type.Name).
 	isTSTZ bool
+
+	// D-01 (MD-01): the PG TupleDesc descriptor fields the packed-row work
+	// needs — `attlen`, `attbyval`, `attstorage`, mirroring
+	// postgres/src/include/catalog/pg_attribute.h. They are DERIVED here,
+	// not transcribed: `catalog.TypeNameToOID` maps the type name onto its
+	// PG OID and `userTypeAttrsForOID` reads the single in-tree
+	// transcription of pg_type.dat.
+	//
+	// That indirection is the point. The D-02 audit found FOUR independent
+	// transcriptions of the same type list already in tree
+	// (`encodeValuePGCtx`, `decodePhysicalPGValueLowered`,
+	// `pgPhysicalTypeIsVarlena`, `catalog.PhysicalTypeAlign`), which
+	// already disagree about the bare `float` spelling — a fifth written
+	// beside them would be a drift hazard, not a convenience (03 §5,
+	// REVIEW M-goopg-2).
+	//
+	// Nothing reads these yet; they are additive payload for D-03 onward.
+	// The alignment answer deliberately stays on `align` above: unifying
+	// alignment is D-09's job and it changes the on-disk format, which this
+	// item does not.
+	attLen     int16 // -1 == variable length (varlena)
+	attByVal   bool
+	attStorage byte // 'p' plain | 'e' external | 'x' extended | 'm' main
 }
 
 // resolveColTypeInfo resolves one colTypeInfo per column. Call it once, from
@@ -45,13 +68,34 @@ func resolveColTypeInfo(cols []catalog.Column) []colTypeInfo {
 	for i := range cols {
 		t := cols[i].Type
 		lower := strings.ToLower(t.Name)
+		ta := colTypeDescriptor(t)
 		info[i] = colTypeInfo{
-			lower:  lower,
-			align:  physicalPGTypeAlignLowered(t, lower),
-			isTSTZ: isTimestampTZTypeName(t.Name),
+			lower:      lower,
+			align:      physicalPGTypeAlignLowered(t, lower),
+			isTSTZ:     isTimestampTZTypeName(t.Name),
+			attLen:     ta.TypLen,
+			attByVal:   ta.TypByVal,
+			attStorage: ta.TypStorage,
 		}
 	}
 	return info
+}
+
+// colTypeDescriptor resolves one column type to its PG pg_type descriptor
+// through the existing name -> OID -> attrs bridge, so this file adds no new
+// transcription of pg_type.dat (D-01, REVIEW M-goopg-2).
+//
+// Arrays short-circuit: `catalog.Type` carries the ELEMENT name with
+// `IsArray` beside it, so the OID lookup would answer with the element's
+// descriptor. Every PG array type is a varlena (`typlen = -1`,
+// `typbyval = false`, `typstorage = 'x'`) whatever its element is
+// (postgres/src/include/catalog/pg_type.dat, the `_`-prefixed array rows),
+// which is what an array column's stored form actually looks like here.
+func colTypeDescriptor(t catalog.Type) userTypeAttrs {
+	if t.IsArray {
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	}
+	return userTypeAttrsForOID(catalog.TypeNameToOID(t.Name))
 }
 
 // isTSTZ is retained on colTypeInfo for callers outside the decode switch that
@@ -60,3 +104,11 @@ func resolveColTypeInfo(cols []catalog.Column) []colTypeInfo {
 // already exactly one of those literals, so a direct comparison is both
 // cheaper and provably the same answer.
 var _ = colTypeInfo{}.isTSTZ
+
+// Keep the D-01 payload referenced until D-03 consumes it, so `unused` does
+// not flag fields the next slice is specified to read.
+var (
+	_ = colTypeInfo{}.attLen
+	_ = colTypeInfo{}.attByVal
+	_ = colTypeInfo{}.attStorage
+)
