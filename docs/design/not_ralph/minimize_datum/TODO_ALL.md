@@ -283,9 +283,13 @@ are EPICS — split into one-checkbox-per-commit items before starting
   per-column ndistinct + FD-bound-only for agg outputs); no safe
   ratchet-moving increment. Ledger `take3-B-06-deferred` (resume steps
   inline). Keep open; revisit only with the synthesis design.
-- [ ] **B-07 P1-30 index-endpoint probe + MCV widening** (`get_variable_range`;
-  histogram-endpoint drift for monotonic keys). Judge by the ratchet.
-  *design: take3 08 §4; gate: EA ratchet.*
+- [ ] **B-07 P1-30 index-endpoint probe + MCV widening.** DEFERRED-OPEN
+  2026-09-05 (probe): endpoint probe architecturally blocked (no
+  plan-time storage path in the pure planner; PG itself keeps it
+  `#ifdef NOT_USED`); pure half (MCV-widen `histogramMax`, cutoff
+  clamp) predicts ~0 ratchet (fresh endpoints, in-bounds literals).
+  Ledger `take3-B-07-deferred`. Resume only on demonstrated
+  in-suite out-of-range case or accepted zero-ratchet fidelity.
 - [ ] **B-08 P1-31 text/network scalars** (`convert_string_to_scalar` +
   network variants; `bucketFraction` 0.5 pinned by test). Date half landed
   (P1-11b). Judge by the ratchet.
