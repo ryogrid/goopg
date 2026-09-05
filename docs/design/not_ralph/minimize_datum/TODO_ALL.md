@@ -373,14 +373,19 @@ are EPICS — split into one-checkbox-per-commit items before starting
   Gates: Q45-shape unit proof + unmoved pins (NOT IN/ALL/expr/subquery/
   unindexed stay SeqScan); TPC-H 24/24 MATCH, PP zero drift (no movable
   shape in-suite); live Q45 SubPlan 1 → `Index Scan using item_pkey on
-  item_1` with `= ANY` cond, outer expression-ANY stays Filter.
+  item_1` with `= ANY` cond, outer expression-ANY stays Filter;
+  TPC-DS PASS=95 MISMATCH=0 (Q45 7 rows checksummed).
   Artifacts: planner/cost/executor probe + `saop_index_test.go` ×2.
-- [ ] **B-15 P2-09b `btcostestimate` batch.** Land the remainder whole
-  (descent present; the reverted per-tuple qual cost rejoins here), with
-  acceptance on the **aggregate sweep TOTAL**, not the per-query gate
-  (R6 — the per-query gate missed a 3.3% move once).
-  *design: take3 08 §5.2; gate: take3 09 §5 P2 + TOTAL arm with plan
-  attribution.*
+- [!] **B-15 P2-09b `btcostestimate` batch — BLOCKED (E1 failure,
+  reverted).** R1–R5 implemented unit-green but flips 14 shapes toward
+  NL: Q10 5.6×, Q7 ~4×, Q9 2.3×, Q14 2.4×, Q5 2× (Q3 legitimately
+  faster inside the failing batch); values 24/24 (pure ranking
+  failure). Hypothesis: R5 pro-rating collapses looped-probe costs
+  without PG's heap-qpqual counterweight. Resume: unit-confirm bias,
+  calibrate, per-query + TOTAL + plans gates. Artifact:
+  `analysis/planner-refactor-take3/b15-deferred-20260905/` (README +
+  clean batch.patch). Ledger `take3-B-15-blocked`.
+  *design: take3 08 §5.2; gate: take3 09 §5 P2 + TOTAL arm.*
 - [ ] **B-16 P2-11b MCV-frequency half.** Plumb the inner key's MCV list to
   the cost site for the skew term (`estimate_hash_bucket_stats`, clamp
   [1e-6,1]); zero/isdefault fraction suppresses the term. Unblocks EX3-06

@@ -1,0 +1,657 @@
+diff --git a/internal/optimizer/costbitmap_test.go b/internal/optimizer/costbitmap_test.go
+index 9f31eed2e..00c67f119 100644
+--- a/internal/optimizer/costbitmap_test.go
++++ b/internal/optimizer/costbitmap_test.go
+@@ -205,3 +205,40 @@ func TestCostBitmapHeapScan_SmallFraction(t *testing.T) {
+ 		t.Errorf("tiny fraction should have positive run cost")
+ 	}
+ }
++
++// TestCostBitmapIndexScan_SAOPDivisionAndMLPassThrough pins that the bitmap
++// index side reads the SAME btreeIndexAMCost the plain scan reads (B-15 R3
++// division + R5 ML branch included): the bitmap SAOP total is the index-side
++// SAOP total plus the unchanged 0.1*cpu_operator_cost-per-tuple overhead.
++// Fixture: raw 100 tuples over 10 descents -> rint(100/10) = 10 per scan,
++// per-scan pages 1 -> ML(1*10) = 10 pages.
++func TestCostBitmapIndexScan_SAOPDivisionAndMLPassThrough(t *testing.T) {
++	cp := defaultCostParams()
++	in := indexScanInputs{
++		relPages: 100, relTuples: 10000,
++		indexPages: 90, indexTuples: 10000, treeHeight: 2,
++		selectivity: 0.01, correlation: 0, totalTablePages: 200,
++		numSAScans: 10,
++	}
++	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
++	bitmap := costBitmapIndexScan(cp, in)
++	tuplesFetched := clampRowEst(in.selectivity * in.relTuples) // 100
++	overhead := 0.1 * cp.cpuOperatorCost * tuplesFetched        // 0.1 * 0.0025 * 100 = 0.025
++	if diff := bitmap.Total - idxTotal; math.Abs(diff-overhead) > 1e-9 {
++		t.Errorf("bitmap SAOP overhead over the divided index side = %v, want %v", diff, overhead)
++	}
++	if math.Abs(bitmap.Startup-idxStartup) > 1e-9 {
++		t.Errorf("bitmap SAOP startup = %v, want the index-side startup %v", bitmap.Startup, idxStartup)
++	}
++	// And the R1 qual term flows through identically: 2 quals add
++	// 10*10*2*cpu_operator_cost to both sides alike.
++	in.numIndexQuals = 2
++	qIdxStartup, qIdxTotal := btreeIndexAMCost(cp, in)
++	qBitmap := costBitmapIndexScan(cp, in)
++	if math.Abs(qBitmap.Total-qIdxTotal-overhead) > 1e-9 {
++		t.Errorf("qualed bitmap SAOP total = %v, want index side %v + overhead %v", qBitmap.Total, qIdxTotal, overhead)
++	}
++	if math.Abs(qBitmap.Startup-qIdxStartup) > 1e-9 {
++		t.Errorf("qualed bitmap SAOP startup = %v, want %v (quals add no startup)", qBitmap.Startup, qIdxStartup)
++	}
++}
+diff --git a/internal/optimizer/costindex.go b/internal/optimizer/costindex.go
+index 58509e65e..e7867b070 100644
+--- a/internal/optimizer/costindex.go
++++ b/internal/optimizer/costindex.go
+@@ -108,6 +108,23 @@ type indexScanInputs struct {
+ 	// is exercised by unit tests (the pipeline SAOP arm is rule-based,
+ 	// like its `col = const` sibling, and prices nothing).
+ 	numSAScans float64
++
++	// numIndexQuals / numIndexOrderBys are `list_length(indexQuals)` and
++	// `list_length(indexOrderBys)` (`genericcostestimate`, selfuncs.c:7227):
++	// one cpu_operator_cost per qual operator per tuple visited, on top of
++	// cpu_index_tuple_cost (R1). Ordering-only scans pass 0/0; bitmap and
++	// parameterised probes pass their bound-clause counts.
++	numIndexQuals    int
++	numIndexOrderBys int
++	// qualArgCost is `index_other_operands_eval_cost` over quals+orderbys
++	// (selfuncs.c:7227-7228): the one-time cost of reducing complex qual
++	// operands to runtime keys, charged once to startup AND total (R4).
++	// Every index qual goopg builds today binds a Const/Param/outer-Var
++	// operand, which `cost_qual_eval_node` prices at 0, so every caller
++	// passes 0. It travels as a precomputed field rather than a recomputed
++	// walk because goopg's Expr has no qual-cost walk yet (cost_funcs.go
++	// untouched); when one lands, it feeds this field.
++	qualArgCost float64
+ }
+ 
+ // costIndexScan is `cost_index` (costsize.c:520) for a single, non-parallel,
+@@ -190,8 +207,9 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
+ }
+ 
+ // btreeIndexAMCost is the `amcostestimate` callback pair
+-// (`genericcostestimate` + `btcostestimate`'s additions) reduced to the case
+-// this slice generates: a forward B-tree scan with NO index quals.
++// (`genericcostestimate` + `btcostestimate`'s additions) reduced to the cases
++// this slice generates: a forward B-tree scan with zero or more bound index
++// quals and no ORDER BY expressions.
+ //
+ // With no quals the generic estimator's inputs collapse a long way —
+ // `indexSelectivity` is 1, `num_sa_scans` is 1, `qual_arg_cost` and
+@@ -202,7 +220,27 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
+ //
+ // Returns (startup, total) for the index side alone; `costIndexScan` adds the
+ // heap side.
++//
++// Deliberately NOT modelled: the qpqual/cpu_tuple_cost per-tuple heap term
++// stays 0 — `buildInitialRels` passes numQualOps = 0 so the leaf's local
++// quals are priced once, and charging them again here would double-count
++// them against the seq-scan rival.
+ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64) {
++	// The SAOP descent count, clamped once up front because PG clamps it in
++	// `btcostestimate` BEFORE `genericcostestimate` runs (:7718-7719:
++	// descents cannot exceed leaf pages, with headroom for the btree's
++	// leaf-level continuation), so every term below — tuple division,
++	// page ML, both descents — reads the clamped value. numSAScans <= 1
++	// reproduces the pre-existing single-descent charge exactly.
++	numSA := in.numSAScans
++	if numSA < 1 {
++		numSA = 1
++	}
++	if numSA > 1 {
++		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
++		numSA = math.Max(numSA, 1)
++	}
++
+ 	numIndexTuples := in.selectivity * in.indexTuples
+ 	if numIndexTuples < 0 {
+ 		numIndexTuples = 0
+@@ -217,7 +255,26 @@ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64
+ 	// per-column estimates that each carry their own floor, so a multi-column
+ 	// unique probe came out well above one tuple and the index path was priced
+ 	// for a range scan it can never perform. take2 P2-09.
+-	if in.uniqueEqualityOnAllKeys && numIndexTuples > 1 {
++	//
++	// PG invalidates the clamp when an array or NullTest qual is present
++	// (`!found_array && !found_is_null_op`): a SAOP probe is one descent per
++	// element, not a single-tuple probe. goopg carries no NullTest index
++	// quals and its only array shape is SAOP, so `numSA > 1` is the whole of
++	// that invalidation here.
++	if in.uniqueEqualityOnAllKeys && numSA <= 1 && numIndexTuples > 1 {
++		numIndexTuples = 1
++	}
++	// R3 (`genericcostestimate`, selfuncs.c:7128, :7136-7139): the tuple
++	// arithmetic counts every descent's tuples, so divide back to the
++	// per-scan average (rounding to integer here, as PG does with rint),
++	// then bound by the index size in any case and touch at least one
++	// tuple. With numSA == 1 this is rint(sel*tuples) clamped — a no-op on
++	// every estimate the search produces today above one tuple.
++	numIndexTuples = math.RoundToEven(numIndexTuples / numSA)
++	if numIndexTuples > in.indexTuples {
++		numIndexTuples = in.indexTuples
++	}
++	if numIndexTuples < 1 {
+ 		numIndexTuples = 1
+ 	}
+ 	numIndexPages := 1.0
+@@ -225,13 +282,53 @@ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64
+ 		numIndexPages = math.Ceil(numIndexTuples * in.indexPages / in.indexTuples)
+ 	}
+ 
+-	// Index pages are random fetches, so they carry goopg's probe calibration
+-	// (see the file header). With the default multiplier of 1.0 this is PG's
+-	// own arithmetic exactly.
+-	total = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
+-	total += numIndexTuples * cp.cpuIndexTupleCost
++	// R5: the repeated-scan page arm (`genericcostestimate`, :7181-7201).
++	// When `num_scans = num_sa_scans * loop_count > 1` the descents compete
++	// for the cache, so PG runs Mackert-Lohman over the TOTAL page touches
++	// (N = T = the index size, "as if there were one tuple per page") and
++	// pro-rates by the OUTER scans only ("don't pro-rate for
++	// ScalarArrayOpExpr, since that's internal to the indexscan"). The
++	// index pages are random fetches, so they carry goopg's probe
++	// calibration (see the file header). With the default multiplier of 1.0
++	// and num_scans == 1 this is PG's own arithmetic exactly.
++	loopCount := in.loopCount
++	if loopCount < 1 {
++		loopCount = 1
++	}
++	if numScans := numSA * loopCount; numScans > 1 {
++		pagesFetched := indexPagesFetched(numIndexPages*numScans, int64(in.indexPages), in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
++		total = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / loopCount
++	} else {
++		total = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
++	}
++
++	// R4: the one-time qual-operand cost (selfuncs.c:7231-7232).
++	// `indexStartupCost = qual_arg_cost`, and total takes it once as well
++	// (not per descent). Zero from every caller today (Const operands).
++	if in.qualArgCost > 0 {
++		startup += in.qualArgCost
++		total += in.qualArgCost
++	}
++
++	// R1: the per-tuple CPU term (selfuncs.c:7233) — `cpu_index_tuple_cost`
++	// plus one `cpu_operator_cost` per indexqual/orderby operator, times the
++	// per-scan tuples times the descents (numIndexTuples is per-scan after
++	// R3, so the product recovers the cross-descent visit count PG prices).
++	qualOpCost := cp.cpuOperatorCost * float64(in.numIndexQuals+in.numIndexOrderBys)
++	total += numIndexTuples * numSA * (cp.cpuIndexTupleCost + qualOpCost)
++
++	// R2: the B-tree descent comparison charge (selfuncs.c:7764-7766) — about
++	// log2(N) comparisons to descend a tree of N leaf tuples, one
++	// cpu_operator_cost each, guarded on tuples > 1 to avoid log(0). Startup
++	// takes it once (the first descent precedes the first tuple); total
++	// takes it per descent.
++	if in.indexTuples > 1 {
++		logDescent := math.Ceil(math.Log(in.indexTuples)/math.Log(2)) * cp.cpuOperatorCost
++		startup += logDescent
++		total += numSA * logDescent
++	}
+ 
+-	// The B-tree descent (selfuncs.c:7780): tree height plus the leaf page,
++	// The B-tree page descent (selfuncs.c:7780): tree height plus the leaf page,
+ 	// at 50 cpu_operator_cost per page. Charged at startup as well as total —
+ 	// it is paid before the first tuple emerges, which is what makes an
+ 	// ordered index path's startup cost non-zero and therefore comparable
+@@ -239,22 +336,9 @@ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64
+ 	//
+ 	// With SAOP quals the descent is charged once per estimated descent
+ 	// (`btcostestimate`, selfuncs.c:7762-7782): once to startup, num_sa_scans
+-	// times to total. The count itself is clamped to at most a third of the
+-	// index's pages (:7718-7719: descents cannot exceed leaf pages, with
+-	// headroom for the btree's leaf-level continuation) and at least 1.
+-	// numSAScans <= 1 reproduces the pre-existing single-descent charge
+-	// exactly. P2-09b's remainder (the numIndexTuples/rint adjustment and
+-	// the log2(N) descent term) stays out.
+-	numSA := in.numSAScans
+-	if numSA < 1 {
+-		numSA = 1
+-	}
+-	if numSA > 1 {
+-		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
+-		numSA = math.Max(numSA, 1)
+-	}
++	// times to total.
+ 	descent := float64(in.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
+-	startup = descent
++	startup += descent
+ 	total += numSA * descent
+ 	return startup, total
+ }
+diff --git a/internal/optimizer/costindex_test.go b/internal/optimizer/costindex_test.go
+index 25790805d..4b380eb8c 100644
+--- a/internal/optimizer/costindex_test.go
++++ b/internal/optimizer/costindex_test.go
+@@ -120,11 +120,12 @@ func TestCostIndexScanCorrelationInterpolation(t *testing.T) {
+ // touching only this table (total_table_pages = 100).
+ //
+ //	index side (btreeIndexAMCost):
+-//	  numIndexTuples = 1000, numIndexPages = ceil(1000*20/1000) = 20
++//	  numIndexTuples = rint(1000/1) = 1000, numIndexPages = ceil(1000*20/1000) = 20
+ //	  20 * random_page_cost(4)                       =  80
+-//	  1000 * cpu_index_tuple_cost(0.005)             =   5
+-//	  descent = (1+1) * 50 * cpu_operator_cost(.0025)=   0.25   (startup AND total)
+-//	  -> startup 0.25, total 85.25
++//	  1000 * 1 * (cpu_index_tuple_cost(0.005)+0)     =   5
++//	  log descent = ceil(log2(1000)) * .0025 = 10*.0025 = 0.025 (startup AND total, B-15 R2)
++//	  height descent = (1+1) * 50 * cpu_operator_cost(.0025) = 0.25 (startup AND total)
++//	  -> startup 0.275, total 85.275
+ //	heap side:
+ //	  tuples_fetched = 1000
+ //	  T=100, b=ceil(524288*100/120)=436907 -> T<=b branch:
+@@ -133,7 +134,7 @@ func TestCostIndexScanCorrelationInterpolation(t *testing.T) {
+ //	  csquared = 0 -> run += 400
+ //	  cpu = 1000 * cpu_tuple_cost(0.01) = 10
+ //
+-//	startup = 0.25, total = 0.25 + (85.25-0.25) + 400 + 10 = 495.25
++//	startup = 0.275, total = 0.275 + (85.275-0.275) + 400 + 10 = 495.275
+ func TestCostIndexScanFullScanArithmetic(t *testing.T) {
+ 	cp := defaultCostParams()
+ 	got := costIndexScan(cp, indexScanInputs{
+@@ -146,11 +147,11 @@ func TestCostIndexScanFullScanArithmetic(t *testing.T) {
+ 		correlation:     0,
+ 		totalTablePages: 100,
+ 	})
+-	if !approxCost(got.Startup, 0.25) {
+-		t.Errorf("startup = %v; want 0.25 (the B-tree descent)", got.Startup)
++	if !approxCost(got.Startup, 0.275) {
++		t.Errorf("startup = %v; want 0.275 (log descent 0.025 + page descent 0.25)", got.Startup)
+ 	}
+-	if !approxCost(got.Total, 495.25) {
+-		t.Errorf("total = %v; want 495.25", got.Total)
++	if !approxCost(got.Total, 495.275) {
++		t.Errorf("total = %v; want 495.275", got.Total)
+ 	}
+ }
+ 
+@@ -159,6 +160,9 @@ func TestCostIndexScanFullScanArithmetic(t *testing.T) {
+ // else. This is what lets it beat a sort (whose startup is the whole sort) on
+ // a LIMIT query, and it is the reason the descent charge is not folded into
+ // the run cost for convenience.
++//
++// The descent is TWO charges (B-15 R2 + page descent): ceil(log2(N)) comparisons
++// plus (height+1) pages at 50x. Both land at startup.
+ func TestCostIndexScanStartupIsDescentOnly(t *testing.T) {
+ 	cp := defaultCostParams()
+ 	in := indexScanInputs{
+@@ -166,7 +170,8 @@ func TestCostIndexScanStartupIsDescentOnly(t *testing.T) {
+ 		treeHeight: 3, selectivity: 1.0, totalTablePages: 500,
+ 	}
+ 	got := costIndexScan(cp, in)
+-	wantStartup := float64(3+1) * pageCPUMultiplier * cp.cpuOperatorCost
++	// ceil(log2(50000)) = ceil(15.61) = 16 comparisons; (3+1) pages at 50x.
++	wantStartup := (16 + float64(3+1)*pageCPUMultiplier) * cp.cpuOperatorCost
+ 	if !approxCost(got.Startup, wantStartup) {
+ 		t.Fatalf("startup = %v; want the descent %v", got.Startup, wantStartup)
+ 	}
+@@ -304,9 +309,11 @@ func TestBtreeUniqueIndexClampsToOneTuple(t *testing.T) {
+ 	}
+ 
+ 	// It must land at the single-tuple price, not merely lower: one index page
+-	// plus one index tuple plus the descent.
++	// plus one index tuple plus both descents (B-15 R2: ceil(log2(100000)) =
++	// ceil(16.61) = 17 comparisons).
+ 	want := 1*cp.randomPageCost*indexProbeCostMultiplier +
+ 		1*cp.cpuIndexTupleCost +
++		17*cp.cpuOperatorCost +
+ 		float64(in.treeHeight+1)*pageCPUMultiplier*cp.cpuOperatorCost
+ 	if math.Abs(clamped-want) > 1e-9 {
+ 		t.Errorf("clamped index cost = %v, want %v (one page, one tuple, one descent)", clamped, want)
+@@ -384,3 +391,207 @@ func TestEstimateIndexGeometryPartialScalesTuples(t *testing.T) {
+ 		t.Errorf("nil-predicate partial index tuples = %v, want 1000 (declined)", tuples)
+ 	}
+ }
++
++// B-15 R1: the per-tuple qual op cost (`genericcostestimate`, selfuncs.c:7233)
++// — one cpu_operator_cost per indexqual/orderby operator per tuple visited,
++// on top of cpu_index_tuple_cost. It lands on total only (per-tuple work is
++// run cost), and it scales with the R3-divided per-scan tuples times the
++// descents.
++func TestBtreeQualOpCostPerTuple(t *testing.T) {
++	cp := defaultCostParams()
++	base := indexScanInputs{
++		relPages: 100, relTuples: 1000, indexPages: 20, indexTuples: 1000,
++		treeHeight: 1, selectivity: 1.0, totalTablePages: 100,
++	}
++	plain := costIndexScan(cp, base)
++	in := base
++	in.numIndexQuals = 2
++	qualed := costIndexScan(cp, in)
++	// 1000 tuples x (2 x 0.0025); startup untouched.
++	if want := plain.Total + 1000*2*cp.cpuOperatorCost; !approxCost(qualed.Total, want) {
++		t.Errorf("qualed total = %v, want %v (2 quals x 1000 tuples x cpu_operator_cost)", qualed.Total, want)
++	}
++	if qualed.Startup != plain.Startup {
++		t.Errorf("qualed startup = %v, want %v (per-tuple qual work is not startup)", qualed.Startup, plain.Startup)
++	}
++}
++
++// B-15 R4: `indexStartupCost = qual_arg_cost` (selfuncs.c:7231-7232) — the
++// one-time operand-reduction cost lands on startup AND total, once (not per
++// descent). Every caller passes 0 today (Const/Var/Param operands price at
++// 0 under cost_qual_eval_node); this pins the plumbing for a nonzero walk.
++func TestBtreeQualArgCostStartupAndTotal(t *testing.T) {
++	cp := defaultCostParams()
++	base := indexScanInputs{
++		relPages: 100, relTuples: 1000, indexPages: 20, indexTuples: 1000,
++		treeHeight: 1, selectivity: 1.0, totalTablePages: 100,
++	}
++	plain := costIndexScan(cp, base)
++	in := base
++	in.qualArgCost = 1.5
++	got := costIndexScan(cp, in)
++	if !approxCost(got.Startup, plain.Startup+1.5) {
++		t.Errorf("startup = %v, want %v (qual_arg_cost once)", got.Startup, plain.Startup+1.5)
++	}
++	if !approxCost(got.Total, plain.Total+1.5) {
++		t.Errorf("total = %v, want %v (qual_arg_cost once, not per descent)", got.Total, plain.Total+1.5)
++	}
++}
++
++// B-15 R2: the log2(N) comparison descent (selfuncs.c:7764-7766) — guarded
++// on index->tuples > 1 (no log(0)), once to startup, num_sa_scans times to
++// total.
++func TestBtreeLogDescentGuardAndScale(t *testing.T) {
++	cp := defaultCostParams()
++	base := indexScanInputs{
++		relPages: 10, relTuples: 100, indexPages: 5, indexTuples: 100,
++		treeHeight: 0, selectivity: 1.0, totalTablePages: 10,
++	}
++	// ceil(log2(100)) = ceil(6.64) = 7 comparisons.
++	log7 := 7 * cp.cpuOperatorCost
++	s, tot := btreeIndexAMCost(cp, base)
++	if math.Abs(s-(log7+50*cp.cpuOperatorCost)) > 1e-9 {
++		t.Errorf("startup = %v, want log descent %v + page descent %v", s, log7, 50*cp.cpuOperatorCost)
++	}
++	// A single-tuple index takes no comparison descent at all.
++	one := base
++	one.indexTuples = 1
++	s1, _ := btreeIndexAMCost(cp, one)
++	if math.Abs(s1-50*cp.cpuOperatorCost) > 1e-9 {
++		t.Errorf("single-tuple startup = %v, want page descent only %v", s1, 50*cp.cpuOperatorCost)
++	}
++	// SAOP scales the total side only: 2 descents add one more log charge
++	// (plus the R3/R5 tuple/page moves, pinned explicitly). Fixture: raw
++	// 100 tuples -> rint(100/2) = 50 per scan, tuple term 50*2*0.005 = 0.5
++	// (unchanged); per-scan pages ceil(50*5/100) = 3 -> ML(3*2) = 4 pages
++	// against 5 single.
++	sa := base
++	sa.numSAScans = 2
++	if got := indexPagesFetched(3*2, 5, 5, 10, cp.effectiveCacheSize); got != 4 {
++		t.Fatalf("ML(3 pages x 2 scans) = %v, want 4", got)
++	}
++	s2, tot2 := btreeIndexAMCost(cp, sa)
++	if s2 != s {
++		t.Errorf("SAOP startup = %v, want single-descent startup %v", s2, s)
++	}
++	// Page delta (4-5)*4 = -4, tuple delta 0, one more of each descent.
++	if want := tot - 4 + log7 + 50*cp.cpuOperatorCost; math.Abs(tot2-want) > 1e-6 {
++		t.Errorf("SAOP total = %v, want %v", tot2, want)
++	}
++}
++
++// B-15 R3: `numIndexTuples = rint(numIndexTuples / num_sa_scans)` clamped to
++// [1, index->tuples] (selfuncs.c:7128, :7136-7139). The per-scan average is
++// what the page pro-rata and the R1 tuple term read; the clamp bounds it by
++// the index size and touches at least one tuple.
++func TestBtreeSAOPDivisionAndClamp(t *testing.T) {
++	cp := defaultCostParams()
++	base := indexScanInputs{
++		relPages: 100, relTuples: 10000, indexPages: 90, indexTuples: 10000,
++		treeHeight: 2, selectivity: 0.01, totalTablePages: 200, loopCount: 1,
++	}
++	// Raw 100 tuples over 10 descents: rint(100/10) = 10 per scan, so the
++	// tuple term is 10*10*0.005 = 0.5 — identical to the single-scan 100*0.005.
++	// The division is observable only off a non-multiple: selectivity 0.0115
++	// gives raw 115, rint(115/10) = rint(11.5) = 12 (PG's rint rounds
++	// half-to-even, as does RoundToEven), i.e. 12*10*0.005 = 0.6 against
++	// the single-scan 115*0.005 = 0.575. The per-scan page side moves with
++	// it (1 page vs 2), closed via the ML pin below.
++	odd := base
++	odd.selectivity = 0.0115
++	odd.numSAScans = 10
++	_, totOdd := btreeIndexAMCost(cp, odd)
++	single := base
++	single.selectivity = 0.0115
++	_, totSingle := btreeIndexAMCost(cp, single)
++	tupleOdd := 12 * 10 * cp.cpuIndexTupleCost
++	tupleSingle := 115 * cp.cpuIndexTupleCost
++	// Per-scan pages ceil(12*90/10000) = 1 -> ML(1*10)=10 pages -> 40;
++	// single pages ceil(115*90/10000) = 2 -> 8.
++	pagesOdd := indexPagesFetched(1*10, 90, 90, 200, cp.effectiveCacheSize)
++	if pagesOdd != 10 {
++		t.Fatalf("ML(1 page x 10 scans) = %v, want 10", pagesOdd)
++	}
++	want := totSingle + (pagesOdd-2)*cp.randomPageCost*indexProbeCostMultiplier +
++		(tupleOdd - tupleSingle)
++	// Plus the descent scaling both arms share (10 vs 1 descents of
++	// log14 + height terms).
++	logD := math.Ceil(math.Log(10000)/math.Log(2)) * cp.cpuOperatorCost
++	heightD := float64(2+1) * pageCPUMultiplier * cp.cpuOperatorCost
++	want += 9 * (logD + heightD)
++	if math.Abs(totOdd-want) > 1e-6 {
++		t.Errorf("SAOP-divided total = %v, want %v", totOdd, want)
++	}
++
++	// The lower clamp: a tiny estimate still touches one tuple (and prices
++	// one tuple's CPU, not zero).
++	tiny := base
++	tiny.selectivity = 1e-9 // raw 1e-5 tuples -> rint -> 0 -> clamp 1
++	_, totTiny := btreeIndexAMCost(cp, tiny)
++	oneTuple := base
++	oneTuple.selectivity = 1.0 / 10000 // raw exactly 1
++	_, totOne := btreeIndexAMCost(cp, oneTuple)
++	if math.Abs(totTiny-totOne) > 1e-9 {
++		t.Errorf("sub-tuple total = %v, want single-tuple total %v (lower clamp)", totTiny, totOne)
++	}
++
++	// The upper clamp: selectivity above 1 (or a bloated estimate) never
++	// exceeds the index's own tuple count.
++	big := base
++	big.selectivity = 5.0 // raw 50000 > 10000 index tuples
++	_, totBig := btreeIndexAMCost(cp, big)
++	full := base
++	full.selectivity = 1.0
++	_, totFull := btreeIndexAMCost(cp, full)
++	if math.Abs(totBig-totFull) > 1e-9 {
++		t.Errorf("over-index total = %v, want full-index total %v (upper clamp)", totBig, totFull)
++	}
++}
++
++// B-15 R5: the repeated-scan page arm (`genericcostestimate`, :7181-7201) —
++// `num_scans = num_sa_scans * loop_count > 1` runs Mackert-Lohman over the
++// total touches and pro-rates by the OUTER scans only. The loop-only case
++// (no SAOP) is the NLI-inner shape: ML(numPages*L)/L <= numPages, so a
++// re-executed probe's index pages cost LESS than L times one execution.
++func TestBtreeRepeatedScanMLBranch(t *testing.T) {
++	cp := defaultCostParams()
++	base := indexScanInputs{
++		relPages: 100, relTuples: 10000, indexPages: 90, indexTuples: 10000,
++		treeHeight: 2, selectivity: 0.01, totalTablePages: 200,
++	}
++	_, totSingle := btreeIndexAMCost(cp, base)
++	// Loop-only: per-scan pages ceil(100*90/10000) = 1; ML(1*5) over a
++	// 90-page index with a huge cache share: 2*90*5/(180+5) = 900/185 =
++	// 4.86 -> ceil 5; pro-rated 5/5 = 1 page. Same single page here (the
++	// discount bites on larger touches), but the branch must hold: total
++	// equals the single-scan page cost plus identical CPU.
++	looped := base
++	looped.loopCount = 5
++	_, totLooped := btreeIndexAMCost(cp, looped)
++	if math.Abs(totLooped-totSingle) > 1e-9 {
++		t.Errorf("looped total = %v, want single total %v (5/5 pro-rate is exact here)", totLooped, totSingle)
++	}
++	// A larger touch shows the sublinearity: selectivity 1.0 -> per-scan
++	// pages 90; ML(90*5=450, T=90): 2*90*450/(180+450) = 81000/630 =
++	// 128.57 >= T -> capped at 90; pro-rated 90/5 = 18 pages vs 90 single.
++	big := base
++	big.selectivity = 1.0
++	_, totBigSingle := btreeIndexAMCost(cp, big)
++	bigLooped := big
++	bigLooped.loopCount = 5
++	_, totBigLooped := btreeIndexAMCost(cp, bigLooped)
++	pages := indexPagesFetched(90*5, 90, 90, 200, cp.effectiveCacheSize)
++	if pages != 90 {
++		t.Fatalf("ML(90 pages x 5 scans) = %v, want 90 (capped at T)", pages)
++	}
++	wantPage := (pages / 5) * cp.randomPageCost * indexProbeCostMultiplier
++	singlePage := 90 * cp.randomPageCost * indexProbeCostMultiplier
++	if !(wantPage < singlePage) {
++		t.Fatalf("pro-rated pages %v not below single-scan %v — the ML arm is not sublinear", wantPage, singlePage)
++	}
++	// CPU is loop-invariant here (numSA=1, same tuples), so the delta is
++	// exactly the page delta.
++	if want := totBigSingle + (wantPage - singlePage); math.Abs(totBigLooped-want) > 1e-6 {
++		t.Errorf("big looped total = %v, want %v", totBigLooped, want)
++	}
++}
+diff --git a/internal/optimizer/pathbitmap.go b/internal/optimizer/pathbitmap.go
+index c694edeee..cd2a9541f 100644
+--- a/internal/optimizer/pathbitmap.go
++++ b/internal/optimizer/pathbitmap.go
+@@ -166,6 +166,9 @@ func (s *searchCtx) buildOneBitmapPath(
+ 		selectivity:     selectivity,
+ 		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+ 		totalTablePages: totalPages,
++		// B-15 R1: the matched equality conjuncts are the index quals
++		// (Const operands, so qualArgCost stays 0).
++		numIndexQuals: len(indexClauses),
+ 	}
+ 	tuplesFetched := clampRowEst(selectivity * relTuples)
+ 
+@@ -566,6 +569,9 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
+ 		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
+ 		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
+ 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)), totalTablePages: totalPages,
++		// B-15 R1: the bound prefix clauses are the index quals
++		// (outer-Var operands, so qualArgCost stays 0).
++		numIndexQuals: len(clauses),
+ 	})
+ 	// `get_loop_count` (indxpath.c:2328): the smallest row count among the
+ 	// relations supplying the parameter. The path cost stays per-execution — PG
+diff --git a/internal/optimizer/pathparamindex.go b/internal/optimizer/pathparamindex.go
+index f4a0781a9..8e8aef1cd 100644
+--- a/internal/optimizer/pathparamindex.go
++++ b/internal/optimizer/pathparamindex.go
+@@ -390,6 +390,11 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
+ 		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+ 		totalTablePages: totalPages,
+ 		loopCount:       s.loopCountFor(req),
++		// B-15 R1: one cpu_operator_cost per bound indexqual operator per
++		// tuple visited (`genericcostestimate`, selfuncs.c:7233). The
++		// operands are outer Vars (cost_qual_eval_node prices Vars at 0),
++		// so qualArgCost (R4) stays 0.
++		numIndexQuals: len(clauses),
+ 	})
+ 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
+ 	// path-creation time. Assert-only — never applied, never costed.
+diff --git a/internal/optimizer/planner.go b/internal/optimizer/planner.go
+index ee00b24cd..6c45d1d37 100644
+--- a/internal/optimizer/planner.go
++++ b/internal/optimizer/planner.go
+@@ -9579,6 +9579,9 @@ func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *Colu
+ 		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+ 		totalTablePages: T,
+ 		loopCount:       1,
++		// B-15 R1: the single col=const equality is the one index qual
++		// (Const operand, so qualArgCost stays 0).
++		numIndexQuals: 1,
+ 	}
+ 	idxCost := costIndexScan(cp, in)
+ 	bmIdxCost := costBitmapIndexScan(cp, in)
+diff --git a/internal/optimizer/saop_index_test.go b/internal/optimizer/saop_index_test.go
+index 8b92b2bd6..0d2f06440 100644
+--- a/internal/optimizer/saop_index_test.go
++++ b/internal/optimizer/saop_index_test.go
+@@ -233,8 +233,14 @@ func TestSAOPUnmovedShapes(t *testing.T) {
+ }
+ 
+ // TestSAOPNumSAScansCost pins the B-14 cost slice in btreeIndexAMCost
+-// (selfuncs.c:7086-7103, :7718-7719, :7762-7782): the descent charge scales
+-// with the clamped scan count on the total side only.
++// (selfuncs.c:7086-7103, :7718-7719, :7762-7782) as extended by B-15:
++// the descent charges scale with the clamped scan count on the total side
++// only (startup keeps one descent), the tuple count is the R3 per-scan
++// average, and the page term takes the R5 ML branch when num_scans > 1.
++//
++// Fixture: raw 100 tuples, 1 per-scan page, 90-page index. Heights:
++// page descent (2+1)*50*0.0025 = 0.375, log descent ceil(log2(10000))*0.0025
++// = 14*0.0025 = 0.035 — both once to startup, num_sa_scans times to total.
+ func TestSAOPNumSAScansCost(t *testing.T) {
+ 	cp := defaultCostParams()
+ 	base := indexScanInputs{
+@@ -242,11 +248,13 @@ func TestSAOPNumSAScansCost(t *testing.T) {
+ 		indexPages: 90, indexTuples: 10000, treeHeight: 2,
+ 		selectivity: 0.01, correlation: 0, totalTablePages: 200,
+ 	}
+-	descent := float64(base.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
++	pageDescent := float64(base.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
++	logDescent := math.Ceil(math.Log(base.indexTuples)/math.Log(2)) * cp.cpuOperatorCost
++	descent := pageDescent + logDescent
+ 
+ 	single := costIndexScan(cp, base)
+-	if single.Startup != descent {
+-		t.Fatalf("single-descent startup = %v, want descent %v", single.Startup, descent)
++	if math.Abs(single.Startup-descent) > 1e-9 {
++		t.Fatalf("single-descent startup = %v, want both descents %v", single.Startup, descent)
+ 	}
+ 
+ 	// Unset (0) and 1 both mean a single descent: identical costs.
+@@ -259,22 +267,36 @@ func TestSAOPNumSAScansCost(t *testing.T) {
+ 		}
+ 	}
+ 
+-	// 10 descents: startup unchanged (first descent), total up by 9 more.
++	// 10 descents: startup unchanged (first descent). Per-scan tuples
++	// rint(100/10) = 10, so the tuple term (10*10*0.005 = 0.5) equals the
++	// single-scan one (100*0.005) — the division is exact here. Per-scan
++	// pages stay 1, but R5 prices ML(1*10) = 10 pages (pinned below)
++	// instead of 1, and both descents scale: total up by 9 pages' random
++	// cost plus 9 more of each descent.
++	if got := indexPagesFetched(1*10, 90, 90, 200, cp.effectiveCacheSize); got != 10 {
++		t.Fatalf("ML(1 page x 10 scans) = %v, want 10", got)
++	}
+ 	in := base
+ 	in.numSAScans = 10
+ 	multi := costIndexScan(cp, in)
+ 	if multi.Startup != single.Startup {
+ 		t.Fatalf("SAOP startup = %v, want single-descent startup %v", multi.Startup, single.Startup)
+ 	}
+-	if want := single.Total + 9*descent; math.Abs(multi.Total-want) > 1e-9 {
+-		t.Fatalf("SAOP total = %v, want single total + 9 descents = %v", multi.Total, want)
++	if want := single.Total + 9*cp.randomPageCost*indexProbeCostMultiplier + 9*descent; math.Abs(multi.Total-want) > 1e-6 {
++		t.Fatalf("SAOP total = %v, want single total + 9 pages + 9 descents = %v", multi.Total, want)
+ 	}
+ 
+ 	// Clamp: 100000 descents on a 90-page index clamp to ceil(90/3) = 30.
++	// Per-scan tuples rint(100/30) = 3 -> tuple term 3*30*0.005 = 0.45
++	// (0.05 below single's 0.5); per-scan pages ceil(3*90/10000) = 1 ->
++	// ML(1*30) = ceil(2*90*30/210) = ceil(25.71) = 26 pages.
++	if got := indexPagesFetched(1*30, 90, 90, 200, cp.effectiveCacheSize); got != 26 {
++		t.Fatalf("ML(1 page x 30 scans) = %v, want 26", got)
++	}
+ 	in.numSAScans = 100000
+ 	clamped := costIndexScan(cp, in)
+-	if want := single.Total + 29*descent; math.Abs(clamped.Total-want) > 1e-9 {
+-		t.Fatalf("clamped total = %v, want single total + 29 descents = %v", clamped.Total, want)
++	if want := single.Total + 25*cp.randomPageCost*indexProbeCostMultiplier - 0.05 + 29*descent; math.Abs(clamped.Total-want) > 1e-6 {
++		t.Fatalf("clamped total = %v, want single total + 25 pages - 0.05 tuples + 29 descents = %v", clamped.Total, want)
+ 	}
+ 
+ 	// The shared index side feeds the bitmap cost too: the same descent
+@@ -282,7 +304,7 @@ func TestSAOPNumSAScansCost(t *testing.T) {
+ 	bmBase := costBitmapIndexScan(cp, base)
+ 	in.numSAScans = 10
+ 	bmMulti := costBitmapIndexScan(cp, in)
+-	if want := bmBase.Total + 9*descent; math.Abs(bmMulti.Total-want) > 1e-9 {
+-		t.Fatalf("bitmap SAOP total = %v, want bitmap base + 9 descents = %v", bmMulti.Total, want)
++	if want := bmBase.Total + 9*cp.randomPageCost*indexProbeCostMultiplier + 9*descent; math.Abs(bmMulti.Total-want) > 1e-6 {
++		t.Fatalf("bitmap SAOP total = %v, want bitmap base + 9 pages + 9 descents = %v", bmMulti.Total, want)
+ 	}
+ }
