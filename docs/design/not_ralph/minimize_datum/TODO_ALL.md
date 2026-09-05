@@ -1108,11 +1108,17 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
      build sits at 53.4 of 134.2 MB — a 2.5× margin, not a 1.5% one.
      Patch preserved (`tmp/d05p2-bucket-charge.patch`); artifact
      `analysis/minimize-datum/d05-bucket-charge-20260906/README.md`.
-  2b. **Cheap and independent, worth landing on its own:** `SpacePeak`
-     should include the bucket array as PG's does ("Account for the buckets
-     in spaceUsed (reported in EXPLAIN ANALYZE)", `nodeHash.c`). Zero
-     behavioural effect, and it is **the reason this line of work was
-     flying blind** — `Memory Usage:` omits the join's largest term.
+  2b. ~~**`SpacePeak` should include the bucket array**~~ **LANDED
+     2026-09-06.** `Memory Usage:` was reporting the SMALLER of the join's
+     two memory terms — on the Q9 `orders` build it printed 44,026 kB of
+     rows while omitting 98,304 kB of buckets, so it under-reported peak by
+     more than half, and all four measurements in this chain were read
+     against it. Reporting ONLY: the growth trigger is already correct and
+     was deliberately not touched (`spaceAllowed` is pre-deducted by
+     `nbuckets*MapSlotBytes`, making it algebraically identical to PG's
+     test), with a counter-pin test asserting the trigger does not move.
+     Gates: 2 new tests; executor + optimizer suites; TPC-H values 24/24
+     MATCH; plans byte-identical; plan-gate PASS; PP unchanged.
   3. **Re-measure the premise.** The 5× width claim is 1.9× post-EX1, on
      ~14% of the join's peak. Whether that justifies ~900 LOC is a
      different question from the one the bundle was scoped against.

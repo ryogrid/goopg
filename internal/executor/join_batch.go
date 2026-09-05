@@ -208,8 +208,28 @@ func (bs *hashBatchState) publish() {
 	if bs.origNBatch > st.OrigNBatch {
 		st.OrigNBatch = bs.origNBatch
 	}
-	if bs.peakSpace > st.SpacePeak {
-		st.SpacePeak = bs.peakSpace
+	// Report the bucket array alongside the rows, as PG does:
+	// "Account for the buckets in spaceUsed (reported in EXPLAIN ANALYZE)"
+	// — postgres/src/backend/executor/nodeHash.c, ExecHashTableCreate and
+	// ExecHashIncreaseNumBuckets.
+	//
+	// Reporting ONLY, never the growth trigger. The trigger is already
+	// correct and must not be touched: `spaceAllowed` is pre-deducted by
+	// `nbuckets*MapSlotBytes` where it is computed, which makes
+	// `peakSpace > spaceAllowed` algebraically identical to PG's
+	// `spaceUsed + nbuckets*sizeof(HashJoinTuple) > spaceAllowed`. Adding
+	// the buckets here as well would charge them twice and batch early.
+	//
+	// Why this matters beyond tidiness: `Memory Usage:` was reporting the
+	// SMALLER of the join's two memory terms. On the TPC-H Q9 `orders`
+	// build it printed 44,026 kB of rows while omitting 98,304 kB of
+	// buckets — so the line under-reported peak memory by more than half,
+	// and four successive measurements of this join's memory behaviour
+	// (2026-09-05/06, `analysis/minimize-datum/`) were read against it.
+	// Ledger `take3-D-05-spacepeak-reporting`.
+	peak := bs.peakSpace + int64(bs.nbuckets)*hashsize.MapSlotBytes
+	if peak > st.SpacePeak {
+		st.SpacePeak = peak
 	}
 }
 
