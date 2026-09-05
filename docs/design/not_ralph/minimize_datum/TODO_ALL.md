@@ -126,6 +126,14 @@ tracks recorded.*
   TPC-H power table (TOTAL ≈235 s serial, 24/24), TPC-DS PASS=95
   sweep pointer, parity starting roll-up 5/15/2/0/0 with per-category
   decrements enforced from the pinned test budget.
+- [x] **A-05b Plan pin re-pinned under the reproducible regime.** Landed
+  2026-09-05: `plan_snapshots/pinned-stats-20260905.txt` captured with
+  `GOOPG_ANALYZE_SEED=20260905` + bench `autovacuum = off` (`870732855`).
+  The previous baseline (`take2-p0-20260903`) failed structurally against
+  HEAD itself, so the strict pin was failing on staleness rather than on
+  changes. `make plan-gate` now passes **22/22 MATCH in structural mode AND
+  in `MODE=costs`** — cost-exact pinning was not reachable at all while the
+  sampler was unpinned (estimates moved on every server start).
 - [x] **A-05 Non-skippable plan pin.** Landed 2026-09-05: `make
   plan-gate` strict by default (missing baseline / unreachable server →
   FAIL; explicit `PLAN_GATE_ALLOW_SKIP=1` opt-out); `--mode costs`
@@ -941,7 +949,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
-| C-02c | 2026-09-05 | (this commit) | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
+| C-02c | 2026-09-05 | 2305241f4 | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
 
 ## Dropped
 
