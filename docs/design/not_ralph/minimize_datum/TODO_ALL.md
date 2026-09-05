@@ -377,7 +377,23 @@ are EPICS — split into one-checkbox-per-commit items before starting
   ORDER BY/CTE bodies, INSERT…SELECT, ON CONFLICT, DML derived
   tables) stay default — future slices.
 - [!] **B-13 P2-02b `work_mem` BootVal 512 MB → 4 MB — BLOCKED on
-  spill-cost calibration (re-probed 2026-09-05).** Narrowing bought
+  spill-cost calibration (re-probed 2026-09-05).**
+  **Method note added 2026-09-05:** the prerequisite named here — spill-cost
+  calibration — is the SAME class of problem C-20d turned into a 27% suite
+  win, and it now blocks three items (B-13, B-15, E-16). C-20d's method
+  transfers: add a multiplier in front of the charge, measure the suite at
+  several values with values-diff on every arm, and adopt the smallest
+  value that buys the win. The charge to calibrate is `hashJoinCost`'s
+  spill arm (`cost_funcs.go`: `seqPageCost * innerPages` startup and
+  `seqPageCost * (innerPages + 2*outerPages)` run, from `spillPages`).
+  The complication that makes it more than a repeat of C-20d: the symptom
+  ("model prices hash above merge while forced-hash proves faster") is only
+  observable at a reduced `work_mem`, which needs E-16's session-`work_mem`
+  plumbing — and E-16 is itself blocked on this calibration. Breaking that
+  cycle means measuring with the plumbing applied from its filed patch
+  (`analysis/planner-refactor-take3/ex303-step2-deferred-20260904/plumbing.patch`)
+  WITHOUT landing it, exactly as C-20d measured a multiplier before adopting
+  one. Narrowing bought
   16→4 batches, not 1: 8 MB budget vs 32 MB witness → Q9 ~1.5–2×,
   Q7 >1.2× risk — flip now violates B2. Prerequisite is calibration +
   EX3-03 threading (model misranks merge above hash), NOT P5, NOT
