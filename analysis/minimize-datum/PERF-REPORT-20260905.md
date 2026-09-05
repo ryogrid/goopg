@@ -143,6 +143,17 @@ going forward.
 | C-02c qual MOVE on proven all-INNER paths | 24/24 MATCH | byte-identical | within noise |
 | C-02d qual MOVE across preserved-side outer links | 24/24 MATCH | byte-identical | within noise |
 | gate reproducibility (3 commits) | n/a | makes plans reproducible | n/a |
+| C-19a/b consider_parallel + priced partial seq-scan paths | 24/24 MATCH | byte-identical (nothing consumes them yet) | within noise |
+| C-10a grouping-sets cardinality | 24/24 MATCH | byte-identical | within noise |
+| D-05 prereq #1 executor entry width | 24/24 MATCH | byte-identical | within noise |
+| hash `Memory Usage:` includes buckets | 24/24 MATCH | byte-identical | n/a (EXPLAIN text) |
+
+C-19a/b are the direct response to §5.6: the search now HAS partial paths
+and prices them with `cost_seqscan`'s parallel arm, but by construction
+nothing consumes them until C-19d. Review found the parallel-safety
+classifier fail-open in four places; all four were fixed in the same
+commit, since each becomes a wrong answer the moment a partial path is
+chosen.
 
 C-02c and C-02d remove a **double evaluation**: the pass previously copied
 each pushed conjunct onto the join input while leaving the original in the

@@ -1268,9 +1268,17 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   out-of-order rows with no error). Needs two deformed rows at once; a
   `PackedSlot` has one scratch `Row` — R-11, re-priced, not mechanical.
   *design: 04 §4.1; gate: 06 §3 MD-05.*
-- [ ] **D-07 MD-06 materialize** (`operators_material.go:68`).
+- [!] **D-07 MD-06 materialize — BLOCKED by the D-04 stopping rule**
+  (2026-09-06). 05 §6 is explicit: "batches unchanged → the model in D-3 is
+  wrong. **Fix the model before touching another site.**" D-04 fired that
+  arm, and the five follow-up measurements located the model defect in
+  parallel costing (C-19), not in the row format. Converting a second site
+  before the first one's premise is re-measured would be exactly the R-4
+  two-formats hazard 04 §0.2 forbids. Unblocks when D-05 does.
   *design: 04 §4.1; gate: 06 §2 floor + alloc arm.*
-- [ ] **D-08 MD-07…MD-12 Tier B [EPIC — split per site before start].**
+- [!] **D-08 MD-07…MD-12 Tier B [EPIC — split per site before start] —
+  BLOCKED by the D-04 stopping rule** (same reasoning as D-07; the split
+  rule still binds when it unblocks).
   Window (whole partition set, no spill path — report OOM-exposure
   reduction, not batch counts; goopg has no tuplestore, 04 §4.2); memoize
   + CTE cache + recursive worktable + lateral CTE (recursive-CTE
@@ -1300,7 +1308,12 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   unrecorded site keeps D-10 blocked.
   *design: 03 TD-5, 04 §4.1 Tier D; gate: 06 §3 MD-last + round-trip
   across a real spill on a spilling shape.*
-- [ ] **D-11 MD acceptance + open-gap ledgering.** 06 §5 six conditions:
+- [!] **D-11 MD acceptance + open-gap ledgering — BLOCKED** until at least
+  one conversion site (D-05 onward) lands; today the "one retention
+  format" condition is trivially true because none has. The open-gap
+  ledgering half is ALREADY DONE by the chain of D-04/D-05 measurements
+  (`take3-D-04-*`, `take3-D-05-*` rows) and by D-02's three latent-bug rows.
+  Original text: 06 §5 six conditions:
   values unchanged every commit both suites; one retention format (Tier A
   + significant Tier B + spill; R-4 closed by construction); model
   matches storage (test); batch-count witness moved and recorded;
