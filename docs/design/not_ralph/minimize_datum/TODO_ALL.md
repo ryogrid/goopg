@@ -887,15 +887,37 @@ per arm; values never counts for projection/join-adjacent changes).*
 - [ ] **E-06 EX4-03 agg transition fast path.** Compile builtin-agg
   `transfn` expressions; `MIXED`/spill behaviour unchanged.
   *design: take3 13 §6; gate: per-row transfn slice down; values + pin.*
-- [ ] **E-07 EX5-01 slab parity for `Gather`.** `buildRec` `Gather` arm;
-  parallel queries stop falling back to legacy `Build`. Unlocks E-08;
-  re-proves EX1–EX4 wins on workers.
+- [ ] **E-07 EX5-01 slab parity for `Gather` — RE-SCOPED 2026-09-05, two
+  of its three justifications are now void.** Premise re-verified: workers
+  really do take the legacy path (`BuildWorker` → `buildNode`,
+  `executor.go:32`), and `buildRec`'s default arm wraps `Gather` in an
+  `OpAdapter`, so the slab does not reach a parallel plan.
+  What changed: (a) "unlocks E-08" is void — E-08 is EX4-04, parallel
+  `filterOp` compilation, and its serial twin E-04 was **dropped on
+  measurement** (no gain, consistent Q18 +8.5%), so the thing E-07 exists
+  to unlock has no value left; (b) "re-proves EX1 wins on workers" is
+  already true without it — `buildNode` threads the EX1-01 deform bound, so
+  worker trees carry the narrowing today; (c) "re-proves EX4 wins" is void
+  with E-04.
+  What survives: the independent claim that slab dispatch beats the legacy
+  `Operator` interface on worker trees. That claim has never been measured
+  on the parallel path and is NOT inherited from the serial slab result.
+  **Resume: measure the dispatch delta on a parallel witness shape FIRST**
+  (the E-04 lesson: a sub-1% predicted effect cannot be read off a suite
+  total), and only implement the `Gather` arm if it clears the noise band.
   *design: take3 13 §7; gate: parallel slab coverage test; serial arm
   unchanged; pin.*
-- [!] **E-08 EX4-04 `Gather`-arm slab reachability — BLOCKED on E-07.**
-  E-04…E-06 proceed independently.
-  *design: take3 13 §6; gate when unblocked: parallel filterOp compiled;
-  serial arm unchanged.*
+- [-] **E-08 EX4-04 `Gather`-arm slab reachability.** DROPPED 2026-09-05
+  by dependency, not by its own measurement: E-08 IS "compile `filterOp` on
+  the parallel path", and the serial twin E-04 was dropped after three
+  implemented variants showed no repeatable gain and a consistent TPC-H
+  Q18 +8.5% against two agreeing baselines. Compiling the same predicate in
+  a worker cannot be worth more than compiling it in the leader, and the
+  structural reason for the serial non-result — the predicted effect is
+  ~0.33 pp, an order of magnitude below the noise band, and the mechanism
+  overlaps `seqScanOp`'s prefilter — applies unchanged to workers.
+  Resume only if E-04 is ever resumed and clears its own gate on a witness
+  shape. Ledger `take3-E-08-dropped`.
 - [ ] **E-09 EX5-02 shared build hardening.** Barrier discipline for
   build/probe phases, cooperative-stall measurement under skew,
   worker-count scaling on Q9-class shapes.
@@ -1064,6 +1086,7 @@ P6-03/04/05 (load-bearing).
 
 | item | date | reason | ledger row |
 |---|---|---|---|
+| E-08 (EX4-04) | 2026-09-05 | dropped by dependency: it is parallel filterOp compilation, and the serial twin E-04 failed its own measurement | `take3-E-08-dropped` |
 | F-03 | 2026-09-05 | rule 3: `Buf` is the arena-detach target; removing it leaves only unbounded retention. Prior attempt returned 0 rows on 7 queries. Win dominated by D-05 on the same sites | `take3-F-03-dropped` |
 | E-04 (EX4-01) | 2026-09-05 | no measured gain (predicted ~0.33 pp is below the noise floor; measured a consistent Q18 +8.5%); mechanism overlaps the scan prefilter | `take3-E-04-dropped` |
 
