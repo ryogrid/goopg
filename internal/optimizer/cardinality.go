@@ -1085,7 +1085,55 @@ type groupVarInfo struct {
 // grouped scan of 6 surviving rows claim its column's whole-table 18 000
 // distinct values.
 func estimateAggregate(a *Aggregate) int64 {
-	return estimateNumGroups(a.GroupExprs, a.Child, EstimateRows(a.Child))
+	inputRows := EstimateRows(a.Child)
+	if len(a.GroupingSets) == 0 {
+		return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
+	}
+	// C-10a: a GROUPING SETS / ROLLUP / CUBE aggregate emits one row per
+	// group PER SET, so its output is the SUM over the sets — which is what
+	// PG accumulates into `dNumGroups` in `create_grouping_paths` /
+	// `consider_groupingsets_paths`
+	// (postgres/src/backend/optimizer/plan/planner.c, calling
+	// estimate_num_groups once per rollup level).
+	//
+	// Before this, `a.GroupExprs` alone was estimated — the deduplicated
+	// UNION of every set — so an N-set query was priced as though it had one
+	// set. That under-states the row count by up to N×, and the error is
+	// silent: nothing downstream can tell a rolled-up estimate from a plain
+	// one. It reaches `cost_agg` (C-15) and, through `rel.rows`, the
+	// LIMIT-to-fraction conversion in `tuple_fraction` (C-17), so it is
+	// fixed here, before either consumes it.
+	//
+	// The empty set `()` — ROLLUP's grand total — contributes exactly one
+	// row, which `estimateNumGroups` already answers for an empty expression
+	// list.
+	var total int64
+	for _, set := range a.GroupingSets {
+		exprs := make([]Expr, 0, len(set))
+		for _, idx := range set {
+			if idx < 0 || idx >= len(a.GroupExprs) {
+				// Fail-safe: an out-of-range index means the set list and
+				// GroupExprs disagree, which the builder should make
+				// impossible. Price the whole aggregate the old way rather
+				// than silently dropping a dimension, since dropping one
+				// under-states further in the same direction.
+				return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
+			}
+			exprs = append(exprs, a.GroupExprs[idx])
+		}
+		total += estimateNumGroups(exprs, a.Child, inputRows)
+	}
+	if total < 1 {
+		return 1
+	}
+	// Upstream clamps the accumulated total to the input row count in
+	// `create_grouping_paths`; more output rows than input rows is not
+	// reachable for a grouping aggregate, and an unclamped sum would let N
+	// sets multiply a small input into a large estimate.
+	if inputRows > 0 && total > inputRows {
+		return inputRows
+	}
+	return total
 }
 
 // estimateNumGroups is `estimate_num_groups` (selfuncs.c:3449): the number of

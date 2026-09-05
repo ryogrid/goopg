@@ -560,7 +560,26 @@ rule).*
   is negative and removes a checkbox rather than adding one. Analysis
   artifact: `analysis/planner-refactor-take3/c10-p400-scoping-20260905/README.md`.
   *design: take3 08 §7; gate: scoped items filed (take3 09 §9 reporting).*
-- [ ] **C-10a P4-00a grouping-sets scope + `dNumGroups` fix.** Before C-11
+- [~] **C-10a P4-00a grouping-sets scope + `dNumGroups` fix — CARDINALITY
+  HALF LANDED 2026-09-05.** `estimateAggregate` now SUMS
+  `estimateNumGroups` over the grouping sets instead of estimating
+  `GroupExprs` (the deduplicated union) once, which is what PG accumulates
+  into `dNumGroups`. An N-set query was priced as one set, under-stating by
+  up to N×, silently — nothing downstream could tell a rolled-up estimate
+  from a plain one, and it fed C-15's `cost_agg` and C-17's
+  `tuple_fraction`. Clamped to the input row count (upstream does the same;
+  more output rows than input is unreachable for a grouping aggregate) and
+  fail-safe on an out-of-range set index (falls back to the union answer
+  rather than dropping a dimension, which would under-state further).
+  Gates: 4 new tests (sum-over-sets against the single-set answers it is
+  built from, plain-aggregate-unchanged, clamp, out-of-range fail-safe);
+  optimizer suite; TPC-H values 24/24 MATCH, plan-gate PASS, PP unchanged
+  6/14/2; TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0.
+  Remaining (the SCOPE half): the two decisions this item also owns —
+  whether `GROUP_AGG` carries a rollup list, and whether C-15 ships a
+  grouping-sets arm or pins them to AGG_HASHED as a measured divergence.
+  Original scope note follows.
+  **C-10a (original).** Before C-11
   fixes the upper-`RelOptInfo` struct, decide (i) whether `GROUP_AGG`
   carries a PG-shaped rollup list or keeps the flat
   `Aggregate.GroupingSets [][]int`, and (ii) whether C-15 ships a
@@ -1196,6 +1215,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| C-10a (cardinality half) | 2026-09-05 | (this commit) | grouping-sets aggregates were priced as ONE set; now summed per set and clamped | values 24/24 + TPC-DS CKMISMATCH=0; PP unchanged; 4 new tests |
 | C-20d | 2026-09-05 | (this commit) | **index-probe multiplier calibrated 1.0 -> 2.0: TPC-H suite 138.58 -> 100.79 s (-27%), Q5 5.3x, Q7 2.7x, Q9 1.9x, Q3 2.3x** | values 24/24 + TPC-DS CKMISMATCH=0; plan parity IMPROVED 5/15 -> 6/14; flag retirement stays blocked |
 | D-01 | 2026-09-05 | (this commit) | TupleDesc descriptor fields derived, not transcribed; agreement test spans two pg_type.dat transcriptions | additive, no consumer yet; values 24/24, plans byte-identical, plan-gate PASS |
 | F-02 | 2026-09-05 | (pre-existing M0127-P1.1) | probe seam already chained: 432 ns/op 0 allocs vs 1115 ns/op 10 allocs for the old seam | audit-only close; no new code; guard `TestProbeSeamZeroAllocs` verified passing |
