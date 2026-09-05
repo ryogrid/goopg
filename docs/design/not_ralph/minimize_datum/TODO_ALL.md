@@ -560,11 +560,19 @@ rule).*
 - [ ] **C-03d P3-03 enum-trace DPPATH evidence.** PG-only pairings OFFERED
   adjudication on fixtures. *design: C-03 DESIGN.md §4 C-03d; gate:
   enum-trace fixtures green.*
-- [ ] **C-04 P3-04 delete `splitOuterSpine` + `pinnedOuter()` decline.**
-  Mixed comma + `LEFT JOIN` FROM becomes **one** search problem (Q72
-  witness). **Unblocks P1-18 (C-05).** After B-01.
-  *design: take3 08 §2.2 + §6.2; gate: take3 09 §5 P3 — PP both suites +
-  timing.*
+- [ ] **C-04a P3-04 LEFT admission (Q72 witness).** Spine deletion +
+  pinning relax + refusal deletion + leaf-flatten + lateral descend +
+  per-qual delay + LEFT sizing floor, for LEFT links end to end.
+  Implementation starts after C-03a/b/c land (jointype paths).
+  **Unblocks P1-18 (C-05).** After B-01.
+  *design: `docs/design/planner-c04-single-problem/DESIGN.md` (reviewed
+  APPROVE; vertical slices); gate: PP both suites + behavioral Q72 pin
+  + enum-trace + R8 values-diff both suites + timing.*
+- [ ] **C-04b P3-04 RIGHT admission.** Same vertical cut mirrored.
+  *design: C-04 DESIGN.md §5 C-04b; gate as C-04a + DPPATH.*
+- [ ] **C-04c P3-04 below-inner + non-first-comma LEFT links.**
+  Non-spine LEFT admission. *design: C-04 DESIGN.md §5 C-04c; gate as
+  C-04a.*
 - [ ] **C-05 P1-18 outer/semi/anti sizing — executes HERE, after C-04.**
   Port `calc_joinrel_size_estimate`'s jointype switch.
   *design: take3 08 §4 + §6.2; gate: EA ratchet.*
