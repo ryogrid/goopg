@@ -739,10 +739,20 @@ rule).*
   Artifact:
   `analysis/planner-refactor-take3/c20d-probe-calibration-20260905/README.md`.
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
-- [ ] **C-20e P6-06c retire `GOOPG_HASH_OUTER_JOIN`**, regenerating
-  `planner-flags.env`. Measured safe (CKMISMATCH=0) but a wash (+1 s
-  net): NOT flipped; re-measure after the `btcostestimate` batch
-  (B-15). Own commit with before/after parity roll-up + timing table.
+- [!] **C-20e P6-06c retire `GOOPG_HASH_OUTER_JOIN` — still a wash,
+  RE-MEASURED 2026-09-05 under the new cost landscape.** The item asked
+  for a re-measure after the `btcostestimate` batch (B-15, still blocked);
+  it was re-measured after a different and larger landscape change instead
+  — C-20d's index-probe calibration, which moved 95 plan-shape lines and
+  cut the suite 27%. Result unchanged in character: **100.05 s with the
+  flag on vs 100.79 s off, a 0.7% difference inside the ±1.7% run-to-run
+  drift band**, so it is not a claim. Values 24/24 MATCH. Per-query moves
+  are all sub-second and unsigned (Q1 7.48→6.88, Q13 5.27→4.88,
+  Q12 12.78→12.48 for; Q18 30.93→30.99, Q5 4.07→4.09 against).
+  Still NOT flipped and still not retired: a flag that changes nothing
+  measurable cannot be retired on a "byte-identical plans" gate either,
+  because its plans are not byte-identical — it is simply that the
+  differences do not pay. Re-measure again after B-15.
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
 - [ ] **C-20f P6-06d retire `GOOPG_NLI_COSTGATE`**, regenerating
   `planner-flags.env`. Only once the search selects NLI on its own
