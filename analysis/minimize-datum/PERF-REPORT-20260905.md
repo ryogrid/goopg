@@ -223,7 +223,7 @@ records as not existing, and a separately ledgered finding that each of
 five parallel workers builds all 1.5 M rows privately, a 5× multiplier
 nothing in this bundle addresses.
 
-## 5.6. Four measurements that relocated Track D's blocker
+## 5.6. Five measurements that relocated Track D's blocker
 
 Track D's premise is that goopg retains rows too wide, so packing them will
 cut spilling. Four measurements tested that, each disproving the previous
@@ -238,8 +238,9 @@ defect.
 | 2 | fix `avgVarBytes` (executor side) | batches 4→2 | **batches 4→4**; entry 194→120 correct but inert |
 | 3 | honest `MapSlotBytes` (48 is 2× low) | less memory | **bucket heap −51%**, and **+10.4%** time: Q14 flips to a nested loop |
 | 4 | narrow the COST side too | fixes #3's flip | **it does** — and costs **+10.3%** on its own |
+| 5 | charge what a build actually costs (5× private copies) | fixes #4's build-side flips | **+22.3%**: Q5/Q9/Q10 lose *parallelism*, not a build side |
 
-**The finding.** Measurement 4 makes the cost model say exactly what the
+**The finding, revised by measurement 5.** Measurement 4 makes the cost model say exactly what the
 executor does, keeps values at 24 MATCH, passes TPC-DS clean, and moves
 plan parity *toward* PG. It still loses 10%, because Q5, Q7, Q9 and Q10 all
 flip **which side is built**. `hashJoinCost` under-prices *building* a
@@ -248,9 +249,28 @@ cost, modelling neither the five private per-worker copies nor the table
 memory. **The un-narrowed build width was an accidental deterrent doing
 that job.**
 
-So the honest sequence, now recorded in the plan, is: charge what a build
-actually costs, *then* narrow the width, then re-apply the two preserved
-patches. Both are kept as patches with a ready-made guard test.
+Measurement 5 charged that build honestly — a 5× participant multiplier on
+a spilling build, which is the executor's own sharing-decline rule, confirmed
+on a live witness where all five participants scan `orders` privately. It
+costs 22.3%, and **Q5, Q9 and Q10 did not lose a build-side choice. They
+lost parallelism.** A Merge Join on the driving path makes the whole plan
+serial, because goopg's `drivingScan` admits only a hash join under a
+Gather, and `MaybeAddGather` runs *after* the search.
+
+**goopg's cost model has no parallel dimension.** PG's is parallel-aware end
+to end — partial paths, `get_parallel_divisor`, `create_gather_path`,
+`parallel_hash` in the sizing. Three individually-correct cost corrections
+have now each failed on exactly this mechanism: every one transferred work
+away from a hash join, and a hash join is the only join a Gather can sit on.
+Until the search can prefer a plan *because* it will parallelise — which is
+Phase 5, items C-19a through C-19h — any term that makes a hash join dearer
+trades a real 5× speedup for a modelled saving.
+
+**So Track D's D-05 is blocked on Phase 5, not on its own cost terms**, and
+the plan now says so. All three patches are preserved with a guard test.
+Two cheaper facts survive: the bucket-array cost term decides nothing on
+TPC-H and is dropped from the prerequisite list, and the narrowing patch
+narrows the inner only where PG narrows both sides of `page_size`.
 
 Two things measurement 3 established that outlive it: `MapSlotBytes = 48`
 was a hand-derived guess and is 2× low (go1.25's swisstable costs 96.1 B

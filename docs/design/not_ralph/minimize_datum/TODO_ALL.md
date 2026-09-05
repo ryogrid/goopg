@@ -1092,8 +1092,15 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   row) before ~900 LOC is sunk.
   *design: 05 §6; gate: values-diff only (the code does not land); not a
   commit to `master`.*
-- [!] **D-05 MD-04 hash join — BLOCKED, and the blocker CHANGED on
-  2026-09-05: D-04's measurement fired 05 §6's "fix the model first" arm.**
+- [!] **D-05 MD-04 hash join — BLOCKED ON C-19 (Phase 5 parallel costing),
+  established by five successive measurements 2026-09-05/06.** Summary
+  before the detail: packing (D-04) left batches unchanged; fixing the entry
+  width was correct and inert; an honest bucket size halved bucket heap but
+  flipped Q14; narrowing the cost side fixed that and cost 10%; charging the
+  build honestly cost 22% — and the last three all failed on ONE mechanism:
+  goopg's cost model has no parallel dimension, so any term that makes a
+  hash join dearer trades a real 5× parallel speedup for a modelled saving.
+  Detail, in order:
   D-05 must not proceed as written. Ordered prerequisites now, ahead of the
   original A-06/E-14/A-05 list:
   1. ~~**Fix `avgVarBytes`**~~ **DONE 2026-09-06, and it bought nothing.**
