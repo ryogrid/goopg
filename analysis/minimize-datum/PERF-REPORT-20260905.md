@@ -9,9 +9,29 @@ comes from a run recorded in this repository; nothing is modelled.
 
 ## 1. Headline
 
-**No performance regression, and one measurement result that matters more
-than any single optimisation: the benchmark harness could not previously
-tell a real change from a re-run.**
+**TPC-H SF=1 serial: 138.58 s → 100.79 s, a 27% reduction, from a
+one-constant cost-model calibration — with plan parity against PostgreSQL
+improving at the same time.**
+
+| Q | before | after | factor |
+|---|---|---|---|
+| Q5 | 21.60 s | 4.07 s | 5.3x |
+| Q7 | 15.72 s | 5.86 s | 2.7x |
+| Q3 | 6.25 s | 2.67 s | 2.3x |
+| Q9 | 13.17 s | 7.06 s | 1.9x |
+| **suite (21 labels)** | **138.58 s** | **100.79 s** | **1.38x** |
+
+Values 24/24 MATCH; TPC-DS SF0.5 PASS=95 MISMATCH=0 CKMISMATCH=0; no query
+regressed outside the noise band. Plan parity moved
+`match=5 shapediff=15` → `match=6 shapediff=14`, so goopg's plans moved
+*toward* PG's shapes, not merely toward faster ones.
+
+The constant is `indexProbeCostMultiplier`, and the finding is less about
+the number than about how it was found — see §2.5.
+
+**And one measurement result that matters more than any single
+optimisation: the benchmark harness could not previously tell a real change
+from a re-run.**
 
 | | before | after |
 |---|---|---|
@@ -59,6 +79,32 @@ behaviour bit-for-bit.
 Commits: `870732855`, `c5241fecb`, baseline `58313f0b2`.
 Design: `docs/design/planner-gate-reproducibility/DESIGN.md`.
 
+## 2.5. How the 27% was found: by reading a comment against its own code
+
+`indexProbeCostMultiplier` exists because — in its own comment's words —
+PG's constants under-cost goopg's NL-index probe, since goopg materialises
+the whole TID list eagerly per probe, and the cost-driven search would
+therefore pick "ruinous PG-shaped NL plans". The comment ends: *"the
+calibrated default is set once a value is validated on SF1."*
+
+**It shipped at 1.0 — the exact value it was created to replace.** The knob
+was created, documented, and left at the wrong value because the validation
+it was waiting for was never run. The item in the plan (C-20d) proposed to
+*retire* the flag, which at 1.0 would have made the mis-costing permanent.
+
+Measured at 1, 2 and 4; 2 and 4 select the same plans on the probed queries
+and 4 is marginally worse on Q7, so 2 is the smaller departure from PG's
+constants that buys the whole win. The knob is kept, not retired: it is
+load-bearing at 2.0, and its comment expects another recalibration once the
+underlying execution defect is fixed. A validated default beats both an
+unvalidated one and a hard-coded one.
+
+The general lesson, which is why this is in the report rather than only in
+the commit: **a documented-but-unapplied calibration is invisible to every
+gate.** Values pass, plans pass, tests pass — the tests pinned 1.0 as if it
+were a decision. Only reading the comment against the constant it describes
+surfaces it.
+
 ## 3. TPC-H SF=1, serial, current state
 
 Regime: fresh capped server per arm, GOGC=100 / GOMEMLIMIT=12 GiB,
@@ -77,7 +123,8 @@ Two baseline arms bracketing the change arms, so drift is visible.
 | Q8 | 0.45 | | | | |
 
 Total over the 21 timed labels: **138.58 s** (repeat arm 136.21 s, so
-run-to-run drift is ~1.7%).
+run-to-run drift is ~1.7%). **This is the PRE-calibration series**; after
+C-20d the same 21 labels total **100.79 s** (§1).
 
 **This total is NOT comparable to the 235 s recorded in the A-04 baseline**
 (`analysis/planner-refactor-take3/a04-baseline-20260905/README.md`). That
@@ -92,6 +139,7 @@ going forward.
 
 | item | effect on values | effect on plans | effect on time |
 |---|---|---|---|
+| **C-20d index-probe calibration 1.0→2.0** | **24/24 MATCH** | **95 shape lines; parity 5/15→6/14** | **suite −27%** |
 | C-02c qual MOVE on proven all-INNER paths | 24/24 MATCH | byte-identical | within noise |
 | C-02d qual MOVE across preserved-side outer links | 24/24 MATCH | byte-identical | within noise |
 | gate reproducibility (3 commits) | n/a | makes plans reproducible | n/a |
