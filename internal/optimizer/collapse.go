@@ -342,11 +342,24 @@ func (jl joinlist) innerPrefixBelowOuterSpine() (prefix joinlist, spine []parser
 // width rather than its width so far, so the outcome does not depend on which
 // item happens to be processed first.
 func deconstructJointree(from []parser.FromExpr, lim collapseLimits, collapseJoins bool) joinlist {
+	return deconstructJointreeScoped(from, lim, collapseJoins, nil)
+}
+
+// deconstructJointreeScoped is deconstructJointree with C-01 P3-01's
+// name → leaf scope for SpecialJoinInfo population. A nil scope keeps the
+// legacy behaviour (min = syn). The lower slice accumulates already-built
+// SpecialJoinInfos bottom-up across the whole FROM clause — PG's
+// root->join_info_list, which make_outerjoininfo scans for ordering
+// restrictions (initsplan.c:1823); disjoint comma items never overlap so they
+// contribute nothing to each other's scans.
+func deconstructJointreeScoped(from []parser.FromExpr, lim collapseLimits, collapseJoins bool, sc *sjiScope) joinlist {
 	var jl joinlist
 	remaining := len(from)
 	nextRel := 0
+	var lower []*SpecialJoinInfo
 	for i := range from {
-		sub := deconstructFromItem(from[i], nextRel, lim, collapseJoins)
+		sub, made := deconstructFromItemScoped(from[i], nextRel, lim, collapseJoins, sc, i, lower)
+		lower = append(lower, made...)
 		nextRel += fromItemRels(from[i])
 		subMembers := len(sub)
 		remaining--
@@ -399,8 +412,19 @@ func fromItemRels(item parser.FromExpr) int { return 1 + len(item.Joins) }
 // so a future grammar that nests joins needs no change here beyond the
 // recursion.
 func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits, collapseJoins bool) joinlist {
+	jl, _ := deconstructFromItemScoped(item, firstRel, lim, collapseJoins, nil, 0, nil)
+	return jl
+}
+
+// deconstructFromItemScoped is deconstructFromItem with the SJI scope (nil =
+// legacy). It returns the item's joinlist plus the SpecialJoinInfos it built,
+// in bottom-up order, so the caller can extend the lower list PG's
+// commutativity scan reads. lower holds the SJIs built for earlier joins of
+// this item and earlier comma items.
+func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseLimits, collapseJoins bool, sc *sjiScope, itemIdx int, lower []*SpecialJoinInfo) (joinlist, []*SpecialJoinInfo) {
 	left := joinlist{leafItem(firstRel)}
 	next := firstRel + 1
+	var made []*SpecialJoinInfo
 	for _, j := range item.Joins {
 		right := joinlist{leafItem(next)}
 		next++
@@ -416,11 +440,13 @@ func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits,
 			// is no single item to attach to — but the pin is mandatory for
 			// outer/semi/anti until P1.2, so that case does not arise.
 			if pinned && len(left) == 1 && !left[0].isLeaf() {
-				left[0].sjinfo = makeSpecialJoinInfo(j.Type, left[0].sub[0].sub, right, j.On)
+				left[0].sjinfo = makeSpecialJoinInfoScoped(j.Type, left[0].sub[0].sub, right, j.On, sc, itemIdx, lower)
+				lower = append(lower, left[0].sjinfo)
+				made = append(made, left[0].sjinfo)
 			}
 		}
 	}
-	return left
+	return left, made
 }
 
 // joinPinned reports whether a JOIN node must force its own order rather than

@@ -1,6 +1,9 @@
 package optimizer
 
 import (
+	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -52,6 +55,62 @@ type SpecialJoinInfo struct {
 // left/right are the joinlists for the two sides, and joinQual is the ON/USING
 // clause (nil for NATURAL and comma joins — never called for those).
 func makeSpecialJoinInfo(jointype parser.JoinType, left, right joinlist, joinQual parser.Expr) *SpecialJoinInfo {
+	return makeSpecialJoinInfoScoped(jointype, left, right, joinQual, nil, 0, nil)
+}
+
+// C-01 P3-01: name → relid resolution for SpecialJoinInfo population.
+//
+// makeSpecialJoinInfoScoped is make_outerjoininfo's clause-analysis half
+// (initsplan.c:1780-1792, 1794-1808): clause_relids (PG pull_varnos) and
+// strict_relids (PG find_nonnullable_rels) over the ON/USING qual, with the
+// lower-outer-join ordering scan (initsplan.c:1823-1958, grow steps only).
+//
+// The blocker the take3 design names (08 §6.1) is that deconstruction runs on
+// raw parser.FromExprs: parser.ColumnRef carries names, not relation indexes,
+// and the legacy makeSpecialJoinInfo receives no catalog, no bindings and no
+// resolver — so every entry degenerated to min = syn. The scope threads
+// exactly what planFromItem already resolved against (the current comma item's
+// leaves in leaf order, plus the catalog) into deconstruction, so the qual can
+// be mapped to leaf bits the same way production resolution maps it.
+//
+// Safety contract (TODO_ALL.md C-01): min sets only ever SHRINK from syn
+// toward PG's values on fully-resolved evidence; ANY uncertainty (unknown
+// qualifier, ambiguous/unresolvable column, unhandled expression node,
+// subquery/tablefunc/CTE leaves under an unqualified ref) falls back to syn.
+// An underestimate would permit a reordering PG forbids (wrong answers); an
+// overestimate only withholds one (missed optimisation). LhsStrict likewise
+// defaults to false (joinIsLegal's mustBeLeftJoin gate then declines rather
+// than allows). FULL keeps PG's exact early-return (min = syn); RIGHT keeps
+// min = syn because PG rewrites RIGHT→LEFT before make_outerjoininfo and
+// goopg's flat chain can only flip the first join (reduce_outer_joins.go S9.4)
+// — mirroring the computation for a surviving deeper RIGHT is future work.
+//
+// Caller contract: a non-nil scope must carry quals that production
+// resolution already accepted (planFromItem aborts on error before
+// deconstruction runs in planFromClause) — the qualified arm maps a
+// uniquely-matched qualifier straight to its leaf with no column-existence
+// re-check. Do not reuse this with pre-validation quals.
+//
+// Deliberately NOT populated (evidence in the C-01 probe):
+//   - Ojrelid stays 0: goopg has no RT indexes for join RTEs (RelSet is
+//     base-leaves only); the ojrelid adds in PG's scan have no domain here.
+//   - CommuteAbove/Below stay empty: PG keys them by ojrelid (nonexistent
+//     here), and no goopg consumer reads them (joinIsLegal,
+//     joinOrderRestricted, hasJoinRestriction, buildJoinRelRestrictList
+//     consult only Min/Syn/Jointype/LhsStrict). PG's identity-3 shrink step,
+//     which feeds those sets, is skipped for the same reason — skipping a
+//     shrink is the safe direction.
+//   - SemiOperators/SemiRhsExprs stay empty: PG sets them only for SEMI
+//     (compute_semijoin_info returns early otherwise), and SEMI never reaches
+//     deconstruction — the parser produces only INNER/LEFT/RIGHT/FULL/CROSS
+//     from SQL (select.go:1246); SEMI/ANTI are planner-internal, and only
+//     ANTI arrives here (via reduceOuterJoins LEFT→ANTI demotion, which runs
+//     before deconstruction in planFromClause).
+//   - PlaceHolderVar handling is vacuous: goopg has no placeholder machinery.
+//   - PG's FOR UPDATE-on-nullable-side error is not replicated: goopg plans
+//     row marks without that check (planner.go:1874+) — a pre-existing,
+//     orthogonal gap, not SJI population.
+func makeSpecialJoinInfoScoped(jointype parser.JoinType, left, right joinlist, joinQual parser.Expr, sc *sjiScope, item int, lower []*SpecialJoinInfo) *SpecialJoinInfo {
 	sj := &SpecialJoinInfo{
 		SynLefthand:  joinlistRelSet(left),
 		SynRighthand: joinlistRelSet(right),
@@ -61,37 +120,429 @@ func makeSpecialJoinInfo(jointype parser.JoinType, left, right joinlist, joinQua
 
 	// FULL: min = syn, by definition (PG's make_outerjoininfo returns early
 	// for FULL with this exact assignment — initsplan.c:1772-1778).
-	//
-	// LEFT/SEMI/ANTI: the true min_{left,right}hand requires clause analysis
-	// (which rels the qual actually mentions, which are strict). P1.2 adds
-	// that; for P1.1 the syn_ sets are a conservative overestimate that keeps
-	// the pin in force — the search will never consult these entries.
 	if jointype == parser.JoinFull {
 		sj.MinLefthand = sj.SynLefthand
 		sj.MinRighthand = sj.SynRighthand
+		return sj
+	}
+
+	// RIGHT: PG never sees it (reduce_outer_joins flips RIGHT→LEFT first).
+	// goopg flips only the first join of a chain (S9.4); a surviving deeper
+	// RIGHT keeps min = syn (maximally restrictive = safe) with
+	// LhsStrict=false (declines LHS-strict association = safe).
+	if jointype == parser.JoinRight {
+		sj.MinLefthand = sj.SynLefthand
+		sj.MinRighthand = sj.SynRighthand
+		return sj
+	}
+
+	// LEFT/SEMI/ANTI general path. Without a scope there is no resolver, so
+	// min = syn (the legacy conservative overestimate).
+	if sc == nil {
+		sj.MinLefthand = sj.SynLefthand
+		sj.MinRighthand = sj.SynRighthand
+	} else if clause, strict, ok := sjiClauseRelids(joinQual, sc, item); ok {
+		sj.LhsStrict = relsOverlap(strict, sj.SynLefthand)
+		minL := clause & sj.SynLefthand
+		// inner_join_rels (PG's third min_righthand input) is provably empty
+		// here: goopg's chain is strictly left-deep with a single fresh base
+		// leaf on the right (collapse.go deconstructFromItem), and a fresh
+		// leaf cannot participate in an inner join below. Subquery-internal
+		// joins live in that subquery's own deconstruction.
+		minR := clause & sj.SynRighthand
+		// Lower-outer-join ordering scan (initsplan.c:1823-1958), grow steps
+		// only: FULL barrier expansion and the LHS/RHS preserve-ordering
+		// adds. Identity-3 removal is skipped (shrink = unsafe direction to
+		// get wrong; the commute sets it feeds are unpopulated — see above).
+		for _, other := range lower {
+			if other.Jointype == parser.JoinFull {
+				// A full join is an optimisation barrier (initsplan.c:1829).
+				if relsOverlap(sj.SynLefthand, other.SynLefthand|other.SynRighthand) {
+					minL |= other.SynLefthand | other.SynRighthand
+				}
+				if relsOverlap(sj.SynRighthand, other.SynLefthand|other.SynRighthand) {
+					minR |= other.SynLefthand | other.SynRighthand
+				}
+				continue
+			}
+			// Lower OJ in our LHS (initsplan.c:1909-1933, preserve arm).
+			if relsOverlap(sj.SynLefthand, other.SynRighthand) {
+				if relsOverlap(clause, other.SynRighthand) &&
+					(jointype == parser.JoinSemi || jointype == parser.JoinAnti ||
+						!relsOverlap(strict, other.MinRighthand)) {
+					minL |= other.SynLefthand | other.SynRighthand
+				}
+			}
+			// Lower OJ in our RHS (initsplan.c:1951-1990, preserve arm).
+			if relsOverlap(sj.SynRighthand, other.SynRighthand) {
+				if relsOverlap(clause, other.SynRighthand) ||
+					!relsOverlap(clause, other.MinLefthand) ||
+					jointype == parser.JoinSemi || jointype == parser.JoinAnti ||
+					other.Jointype == parser.JoinSemi || other.Jointype == parser.JoinAnti ||
+					!other.LhsStrict {
+					minR |= other.SynLefthand | other.SynRighthand
+				}
+			}
+		}
+		// PG's punt (initsplan.c:2007-2013): an empty min side means "no
+		// constraint found", not "no relations required" — fall back to the
+		// full syntactic side. This is also what makes a nil/USING qual
+		// (no ColumnRefs) safely land on syn.
+		if minL == 0 {
+			minL = sj.SynLefthand
+		}
+		if minR == 0 {
+			minR = sj.SynRighthand
+		}
+		sj.MinLefthand = minL
+		sj.MinRighthand = minR
 	} else {
-		// LEFT/SEMI/ANTI: for now, min = the side that cannot lose rows.
-		// LEFT: left side is preserved, right side is nullable → min_righthand
-		//   must include right-side rels named in the qual (which is all of
-		//   them until we analyse the qual). Conservatively: min = syn for
-		//   both sides.
-		// SEMI/ANTI: similar to LEFT.
+		// Unresolvable qual: syn fallback (safe default), LhsStrict stays
+		// false (safe default).
 		sj.MinLefthand = sj.SynLefthand
 		sj.MinRighthand = sj.SynRighthand
 	}
 
-	// M0128-P1.4: populate semi fields for SEMI/ANTI joins. PG computes these
-	// in compute_semijoin_info (initsplan.c) by checking each equality
-	// operator against pg_am. Goopg sets both flags optimistically when the
-	// qual has equality conjuncts — the actual path generation gate
-	// (splitJoinClauses → op_hashjoinable) filters per-operator regardless, so
-	// an over-estimate here is harmless. Per-operator specificity is deferred
-	// (ledger: semi_can_hash/btree per-operator check).
-	if jointype == parser.JoinSemi || jointype == parser.JoinAnti {
+	// M0128-P1.4: populate semi fields for SEMI joins (PG's
+	// compute_semijoin_info sets them only for JOIN_SEMI — initsplan.c). The
+	// legacy code set them optimistically for ANTI too; PG leaves ANTI at
+	// false/false, so C-01 aligns ANTI with upstream. Both flags remain
+	// unread by path generation (splitJoinClauses filters per-operator), and
+	// SEMI never reaches deconstruction (see above), so this is inert today.
+	if jointype == parser.JoinSemi {
 		sj.SemiCanBtree, sj.SemiCanHash = semiQualCapabilities(joinQual)
 	}
 
 	return sj
+}
+
+// sjiLeaf is one FROM range variable in deconstruct leaf order.
+type sjiLeaf struct {
+	alias  string
+	name   string
+	schema string // RangeVar schema, or the catalog table's for base relations
+	table  *catalog.Table // nil for subquery/tablefunc/CTE/shadowed/unknown
+}
+
+// sjiScope is the name → leaf map threaded into deconstruction (take3 08
+// §6.1, first route: the smaller one, keeping phase order). leaves holds every
+// comma item's range variables consecutively in the same depth-first order
+// deconstructJointree numbers leaves in (Base, then Joins[0].Right, …), so a
+// scope index IS a leaf/RelSet bit. items bounds each FromExpr's slice.
+type sjiScope struct {
+	leaves   []sjiLeaf
+	items    [][2]int // per-FromExpr half-open leaf range
+	cat      catalog.Catalog
+	tableMap map[string]*catalog.Table // qualifier → table, for strictness
+}
+
+// newSjiScope builds the resolution scope for a statement's FROM clause. cat
+// may be nil (tests): then every leaf is table-less — qualified refs still
+// resolve structurally, unqualified ones fall back to syn.
+func newSjiScope(from []parser.FromExpr, cat catalog.Catalog) *sjiScope {
+	sc := &sjiScope{cat: cat, tableMap: make(map[string]*catalog.Table)}
+	for i := range from {
+		start := len(sc.leaves)
+		sc.addLeaf(from[i].Base, cat)
+		for _, j := range from[i].Joins {
+			sc.addLeaf(j.Right, cat)
+		}
+		sc.items = append(sc.items, [2]int{start, len(sc.leaves)})
+	}
+	return sc
+}
+
+// addLeaf appends one range variable's leaf metadata. Catalog lookup mirrors
+// planScanRangeVar's precedence: subqueries/tablefuncs never hit the catalog,
+// and a schemeless name owned by a CTE (lookupPlannedCTE, with.go:428 — the
+// same state planScanRangeVar consults) must not resolve to a same-named
+// catalog table, or unqualified attribution could map a CTE column onto the
+// wrong leaf. A missed lookup leaves table nil, which only ever widens toward
+// syn — never narrows.
+func (sc *sjiScope) addLeaf(rv parser.RangeVar, cat catalog.Catalog) {
+	lf := sjiLeaf{alias: rv.Alias, name: rv.Name, schema: rv.Schema}
+	if rv.Subquery == nil && rv.TableFunc == nil && cat != nil {
+		if rv.Schema == "" && lookupPlannedCTE(rv.Name) != nil {
+			// CTE-owned name: structural (alias) matching only.
+		} else if tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name}); ok {
+			lf.table = tbl
+			lf.schema = tbl.Schema
+		}
+	}
+	if lf.table != nil {
+		key := lf.alias
+		if key == "" {
+			key = lf.name
+		}
+		sc.tableMap[key] = lf.table
+	}
+	sc.leaves = append(sc.leaves, lf)
+}
+
+// sjiLeafMatchesQualifier mirrors bindingMatchesRelation (planner.go:15188):
+// an aliased relation is referenceable ONLY by its alias (EqualFold);
+// otherwise by its relation name; a written schema must match the leaf's.
+func sjiLeafMatchesQualifier(lf sjiLeaf, table, schema string) bool {
+	if schema != "" && !strings.EqualFold(schema, lf.schema) {
+		return false
+	}
+	if lf.alias != "" {
+		return strings.EqualFold(table, lf.alias)
+	}
+	return strings.EqualFold(table, lf.name)
+}
+
+// resolveSjiColumn maps one ON-clause ColumnRef to its leaf bit, mirroring
+// production resolution (resolveColumnRefAt, planner.go:14899) restricted to
+// the current comma item's scope — which is exactly the scope planFromItem
+// resolves that ON against (mergedCtx, planner.go:2945: left leaves plus the
+// current right leaf; lateral/outer scopes excluded). ok=false on ANY
+// uncertainty (no match, ambiguous match, table-less leaf under an
+// unqualified ref): the caller falls back to syn.
+func resolveSjiColumn(ref *parser.ColumnRef, sc *sjiScope, item int) (int, bool) {
+	rng := sc.items[item]
+	if ref.Table != "" || ref.Schema != "" {
+		match := -1
+		for i := rng[0]; i < rng[1]; i++ {
+			if !sjiLeafMatchesQualifier(sc.leaves[i], ref.Table, ref.Schema) {
+				continue
+			}
+			if match != -1 {
+				return 0, false // ambiguous qualifier; production errors
+			}
+			match = i
+		}
+		if match == -1 {
+			return 0, false
+		}
+		// No column-existence re-check: production already resolved this
+		// exact ON successfully (planFromItem aborts on error before
+		// deconstruction runs), so a uniquely-matched qualifier IS the
+		// production leaf. System columns (tableoid/ctid) and whole-row
+		// refs flow through the same arm — pull_varnos counts the rel.
+		return match, true
+	}
+	// Unqualified: mirror the unqualified branch (planner.go:15017-15087) —
+	// column scan first, then the single-candidate tableoid/ctid and
+	// whole-row-alias rules. A table-less leaf (subquery/tablefunc/CTE) in
+	// scope makes the column scan inconclusive: it might hold the column,
+	// so any attribution is a guess → syn fallback. (USING-hidden columns
+	// likewise bail via the multi-candidate arm — safe.)
+	for i := rng[0]; i < rng[1]; i++ {
+		if sc.leaves[i].table == nil {
+			return 0, false
+		}
+	}
+	match := -1
+	for i := rng[0]; i < rng[1]; i++ {
+		if _, ok := sc.cat.LookupColumn(sc.leaves[i].table, ref.Column); !ok {
+			continue
+		}
+		if match != -1 {
+			return 0, false // ambiguous; production errors
+		}
+		match = i
+	}
+	if match != -1 {
+		return match, true
+	}
+	// Whole-row alias match (planner.go:15088): bare name equals a binding
+	// alias (or the unaliased table name) — a composite row Var on that rel.
+	for i := rng[0]; i < rng[1]; i++ {
+		name := sc.leaves[i].alias
+		if name == "" {
+			name = sc.leaves[i].name
+		}
+		if strings.EqualFold(ref.Column, name) {
+			if match != -1 {
+				return 0, false
+			}
+			match = i
+		}
+	}
+	if match == -1 {
+		return 0, false
+	}
+	return match, true
+}
+
+// sjiQualRelids is pull_varnos (PG: which base relids the qual mentions) over
+// the ON expression, with a strict whitelist: transparent scalar containers
+// are descended, constants contribute nothing, and EVERYTHING else (sublinks,
+// array constructors/subscripts, EXTRACT, aggregates/windows, …) bails to
+// ok=false. Bailing is always safe (syn fallback); silently skipping a node
+// that hides a ColumnRef would underestimate.
+func sjiQualRelids(e parser.Expr, sc *sjiScope, item int) (RelSet, bool) {
+	if e == nil {
+		return 0, true
+	}
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		leaf, ok := resolveSjiColumn(x, sc, item)
+		if !ok {
+			return 0, false
+		}
+		if leaf >= maxSearchRels {
+			// Same producer invariant as joinlistRelSet: beyond the RelSet
+			// ceiling the bit is unrepresentable; the side's syn set drops
+			// it identically, so intersecting later stays consistent.
+			return 0, true
+		}
+		return 1 << leaf, true
+	case *parser.BinaryOp:
+		l, ok := sjiQualRelids(x.Left, sc, item)
+		if !ok {
+			return 0, false
+		}
+		r, ok := sjiQualRelids(x.Right, sc, item)
+		if !ok {
+			return 0, false
+		}
+		return l | r, true
+	case *parser.UnaryOp:
+		return sjiQualRelids(x.Operand, sc, item)
+	case *parser.IsNullExpr:
+		return sjiQualRelids(x.Operand, sc, item)
+	case *parser.IsBoolExpr:
+		return sjiQualRelids(x.Operand, sc, item)
+	case *parser.IsDistinctFromExpr:
+		l, ok := sjiQualRelids(x.Left, sc, item)
+		if !ok {
+			return 0, false
+		}
+		r, ok := sjiQualRelids(x.Right, sc, item)
+		if !ok {
+			return 0, false
+		}
+		return l | r, true
+	case *parser.CastExpr:
+		return sjiQualRelids(x.Operand, sc, item)
+	case *parser.CollateExpr:
+		return sjiQualRelids(x.Operand, sc, item)
+	case *parser.FuncCall:
+		if x.Over != nil || x.Filter != nil || len(x.OrderBy) > 0 || len(x.WithinGroup) > 0 {
+			return 0, false
+		}
+		var rs RelSet
+		for _, a := range x.Args {
+			r, ok := sjiQualRelids(a, sc, item)
+			if !ok {
+				return 0, false
+			}
+			rs |= r
+		}
+		return rs, true
+	case *parser.CaseExpr:
+		var rs RelSet
+		if x.Operand != nil {
+			r, ok := sjiQualRelids(x.Operand, sc, item)
+			if !ok {
+				return 0, false
+			}
+			rs |= r
+		}
+		for _, w := range x.Whens {
+			r, ok := sjiQualRelids(w.When, sc, item)
+			if !ok {
+				return 0, false
+			}
+			rs |= r
+			r, ok = sjiQualRelids(w.Then, sc, item)
+			if !ok {
+				return 0, false
+			}
+			rs |= r
+		}
+		if x.Else != nil {
+			r, ok := sjiQualRelids(x.Else, sc, item)
+			if !ok {
+				return 0, false
+			}
+			rs |= r
+		}
+		return rs, true
+	case *parser.RowExpr:
+		var rs RelSet
+		for _, el := range x.Elems {
+			r, ok := sjiQualRelids(el, sc, item)
+			if !ok {
+				return 0, false
+			}
+			rs |= r
+		}
+		return rs, true
+	case *parser.InExpr:
+		// List-form IN (…)/ANY (ARRAY[…]) only; a subquery arm bails.
+		if x.Subquery != nil {
+			return 0, false
+		}
+		var rs RelSet
+		r, ok := sjiQualRelids(x.Operand, sc, item)
+		if !ok {
+			return 0, false
+		}
+		rs |= r
+		for _, el := range x.List {
+			r, ok := sjiQualRelids(el, sc, item)
+			if !ok {
+				return 0, false
+			}
+			rs |= r
+		}
+		return rs, true
+	case *parser.IntegerConst, *parser.StringConst, *parser.NumericConst,
+		*parser.NullConst, *parser.BooleanConst, *parser.ParamRef,
+		*parser.TypedStringLit, *parser.IntervalLit, *parser.DefaultMarker,
+		*parser.StarExpr:
+		return 0, true
+	default:
+		return 0, false
+	}
+}
+
+// sjiClauseRelids computes the (clause_relids, strict_relids) pair PG's
+// make_outerjoininfo derives via pull_varnos + find_nonnullable_rels
+// (initsplan.c:1780-1792). Strictness reuses the existing goopg analogue
+// collectNonNullableTableNames (reduce_outer_joins.go:268 — comparison fast
+// path plus catalog proisstrict, conservative elsewhere), translated from
+// table names to leaf bits through the scope. The translation can only
+// UNDER-approximate strict (unqualified refs are absent from the collector;
+// unmapped names are ignored), and under-strict is the safe direction:
+// LhsStrict false and the preserve-ordering arms firing are what withhold
+// reorderings, never what permit them.
+func sjiClauseRelids(qual parser.Expr, sc *sjiScope, item int) (clause, strict RelSet, ok bool) {
+	clause, ok = sjiQualRelids(qual, sc, item)
+	if !ok {
+		return 0, 0, false
+	}
+	rng := sc.items[item]
+	for name := range collectNonNullableTableNames(qual, sc.tableMap, sc.cat) {
+		match := -1
+		for i := rng[0]; i < rng[1]; i++ {
+			lf := sc.leaves[i]
+			key := lf.alias
+			if key == "" {
+				key = lf.name
+			}
+			if strings.EqualFold(name, key) {
+				if match != -1 {
+					match = -2
+					break
+				}
+				match = i
+			}
+		}
+		if match >= 0 {
+			if match >= maxSearchRels {
+				continue // same producer ceiling as the clause arm
+			}
+			strict |= 1 << match
+		}
+		// match -1 (outer-scope name) or -2 (ambiguous duplicate
+		// alias/name keys across comma items): ignored — both are
+		// under-strict = safe.
+	}
+	return clause, strict, true
 }
 
 // semiQualCapabilities scans a join qual for equality operators and returns

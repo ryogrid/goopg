@@ -2710,9 +2710,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// walk that numbered these bindings is still the current walk (collapse.go).
 	// Inert until P5.9 — nothing reads `joinlist` yet.
 	// M0128-P4.1: reduce outer joins before deconstruction so that
-		// demoted joins enter the joinlist as plain INNER joins.
-		reduceOuterJoins(s.FromExprs, s.Where, cat)
-		rctx.joinlist = deconstructJointree(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
+	// demoted joins enter the joinlist as plain INNER joins.
+	reduceOuterJoins(s.FromExprs, s.Where, cat)
+	// C-01 P3-01: thread the name → leaf scope so SpecialJoinInfo
+	// Min/LhsStrict population can resolve ON-clause names (syn fallback
+	// on any uncertainty — never an underestimate).
+	rctx.joinlist = deconstructJointreeScoped(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), newSjiScope(s.FromExprs, cat))
 	rctx.joinInfoList = rctx.joinlist.collectSpecialJoinInfos(nil)
 	return root, rctx, nil
 }
