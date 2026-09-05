@@ -457,10 +457,10 @@ parallelism costed not forced; single planner; acceptance run green.
 rule).*
 
 - [x] **C-01 P3-01 `SpecialJoinInfo` population.** Landed 2026-09-05: `makeSpecialJoinInfoScoped` (clause/strict relids over ON/USING via name→leaf scope + lower-OJ ordering scan grow-only + FULL early-return + empty-min punt) + `deconstructJointreeScoped`/`deconstructFromItemScoped` threading + `newSjiScope` (leaf order = deconstruct order); fail-closed syn fallback on any uncertainty; ANTI flags aligned to upstream false/false; USING/NATURAL punt filed as follow-up. Gates: 8 new scoped tests + optimizer suite + units precommit scope + pgbench smoke (0 failed) + agent review APPROVE-WITH-NITS (5 minors addressed). No plan-shape move by construction (no consumer reads the new fields yet). Artifacts: `docs/design/planner-c01-sji-population/DESIGN.md`, `internal/optimizer/{specialjoin,collapse,planner}.go`, `specialjoin_scoped_test.go` — `ea8ca9dfe` (code), `2e59cfe49` (design).
-- [ ] **C-02 P3-02 `distribute_qual_to_rels` + `check_outerjoin_delay.**
-  A qual is **placed**, not copied down. Supersedes
-  `pushInnerJoinInputQuals` copying (double evaluation). After B-01.
-  *design: take3 08 §6.2; gate: take3 09 §5 P3 + values-diff (R8).*
+- [x] **C-02a P3-02 delay test (inert).** Landed 2026-09-05: `delayedAboveOJ` pure function (delay iff qual reaches the link's nullable side; no strictness exemption — demotion already ran; FULL always; nil sj delays; SEMI/ANTI fail closed) + 20-case unit table. No callers — no plan/behaviour change by construction. Design `docs/design/planner-c02-qual-placement/DESIGN.md` (reviewed: REQUEST-CHANGES → all 8 resolved → APPROVE; rebased on PG18 `outerjoin_nonnullable`/`incompatible_relids`, slices a–d). Gates: optimizer suite. Artifacts: `internal/optimizer/outerjoin_delay{,_test}.go` — `b90b08d` (code), `0dac569c1` (design).
+- [ ] **C-02b P3-02 consume delay in the copy pass.** `pushConjunctIntoSubtree` `*Join` arm declines descents failing the C-02a proof, evaluated conjunctively at every crossed OJ link. Residual keeps all conjuncts. *design: C-02 DESIGN.md §5 C-02b; gate: units + allowlisted shape moves + decline fixtures + R8.*
+- [ ] **C-02c P3-02 move on all-delay-proven paths.** Drop the residual original when the copy lands with full-path proof + single-side + non-volatile; gate `deriveConstAcrossJoinEquality` seeding on copy-vs-move. *design: C-02 DESIGN.md §5 C-02c; gate: units + R8 both suites + timing + PP.*
+- [ ] **C-02d P3-02 move across preserved-side outer links.** As C-02c incl. LEFT/RIGHT-preserved descents; nullable-side originals never move. *design: C-02 DESIGN.md §5 C-02d; gate as C-02c.*
 - [ ] **C-03 P3-03 `join_is_legal` on real SJIs.** DP builds outer, semi
   and anti joinrels directly. After B-01.
   *design: take3 08 §6.2; gate: take3 09 §5 P3 (DPPATH OFFERED/ACCEPTED +
@@ -917,6 +917,7 @@ P6-03/04/05 (load-bearing).
 | C-01 | 2026-09-05 | ea8ca9dfe + 2e59cfe49 | SJI min/strict populated fail-closed; chained-LEFT shrink verified | 8 scoped tests; review APPROVE-WITH-NITS; smoke 0 failed; USING follow-up filed |
 | EX1-03 | 2026-09-05 | 5983b25c5 | bound-narrowed detoast + DetoastAttr + json pointer decode; build restored | per-type contract tests; suites + spotcheck PASS; review APPROVE-WITH-NITS; 3 gap ledger rows |
 | B-14fu | 2026-09-05 | afb39bb7c | ANY explain + update fallback predicate (fixes live wrong-answer) + SSI fingerprint | executor + optimizer green; smoke 0 failed |
+| C-02a | 2026-09-05 | b90b08d + 0dac569c1 | per-link OJ delay test, inert | 20-case table; optimizer green; review APPROVE |
 
 ## Dropped
 
