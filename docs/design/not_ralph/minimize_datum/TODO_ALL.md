@@ -251,9 +251,20 @@ are EPICS — split into one-checkbox-per-commit items before starting
   values-correct); PP zero drift otherwise; TPC-DS PASS=95 MISMATCH=0.
   Artifacts: `extstats_{build,ndistinct,dependencies}.go`,
   `sys_pg_statistic_ext_data.go`, `extstats_build_test.go`.
-- [ ] **B-05b P1-23 `statext_clauselist_selectivity`.** + `estimatedclauses`
-  bitmap, `choose_best_statistics`. Consumes B-05a.
-  *design: take3 08 §4; gate: EA ratchet + PP.*
+- [x] **B-05b P1-23 `statext_clauselist_selectivity`.** Landed
+  2026-09-05: pure-planner port (in-memory registry keyed by table OID;
+  empty ⇒ bit-identical old arithmetic); `choose_best_statistics` +
+  strongest-dependency + backwards conditional-probability combine;
+  clause compatibility = Var-half (col=const, IN, same-col OR, NOT,
+  bare bool; ranges/joins/expressions decline); wired at
+  conjunction/filter/clause-AND sites (join sizer deliberately NOT
+  wired — oracle never runs ext on join lists).
+  Gates: 15 tests; optimizer suite; units precommit scope green;
+  PP zero drift (Q1 MATCH — fresh-server shape; the B-05a-run partial
+  was ANALYZE-warmed stats, see `take3-stats-persistence-gap`);
+  TPC-H 24/24 MATCH on a clean fresh-server sweep (prior sweep
+  invalidated by mid-sweep server stop — relaunched).
+  Artifacts: `internal/optimizer/extstats.go`, `extstats_test.go`.
 - [ ] **B-05c P1-24 `estimate_multivariate_ndistinct` for GROUP BY.**
   Phase-1 item most likely to move TPC-DS shapes (correlated
   predicates). Consumes B-05a.
