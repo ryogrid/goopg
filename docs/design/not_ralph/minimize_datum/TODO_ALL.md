@@ -653,7 +653,32 @@ rule).*
   "unused above", both decline-biased.
   *after C-04, beside C-09. gate: P3 PP + a forced fixture + byte-identical
   values. ~200–350 LOC, low-medium.*
-- [ ] **C-10c P4-00c outer-join qual-placement contract for upper rels.**
+- [x] **C-10c P4-00c outer-join qual-placement contract for upper rels.**
+  Landed 2026-09-05: `docs/design/planner-c10c-upper-qual-placement/DESIGN.md`
+  + 5 fixture tests. `reduceOuterJoins` confirmed to need NO Phase-4 change
+  (prep pass, one call site, finished before any path exists), with the
+  consequence stated once for all of Phase 4: **every OJ link a Phase-4
+  item can see has already survived demotion, so there is no strictness
+  escape hatch left — only placement.**
+  Per-item re-assert table produced for C-11/C-12/C-13/C-15/C-16/C-17/C-18,
+  each naming the PG equivalent and the goopg site. Two corrections to the
+  scoping doc's loose pairing: **C-16 retires no arm at all** (there is no
+  `*Distinct` case in the pass — so it is the one item with no arm-shaped
+  reminder, and its duty is the negative one of introducing no distinct
+  input target), and `*Limit` was reassigned to **C-13**.
+  The load-bearing finding: PG's guard for the target half is the
+  PlaceHolderVar, and **goopg has none** — so goopg's only guard is "do not
+  evaluate below the link", and row counts never move when it is broken, so
+  every existing gate stays green through the bug.
+  Negative controls run and reported (guard inverted → 4 tests red; guard
+  dropped → 2 red; C-15's applying cut simulated → the tripwire fires with
+  a message naming the design section). Control 2 is the informative
+  asymmetry: dropping the guard is INVISIBLE to the two consumer tests,
+  which is exactly why this item is a fixture rather than a code change.
+  Recorded blind spot: the tripwire calls `stampAggregateInputTarget`
+  directly, so a C-15 that applies its cut in a NEW function will not fire
+  it — which is why the table names a per-item re-assert site and C-15's
+  own gate must stay a values-diff on both suites.
   `reduceOuterJoins` itself needs no change — it is a prep pass at
   `planner.go:2716`, before deconstruction, and C-01/C-02 already document
   their dependence on it. The Phase-4 obligation is the CONSUMER side:
@@ -1301,6 +1326,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| C-10c | 2026-09-05 | (this commit) | Phase-4 OJ qual/target placement contract + 5 fixtures; 3 negative controls | found C-16 retires no arm (no reminder) and that goopg has no PlaceHolderVar equivalent |
 | C-07 (derivation half) | 2026-09-05 | (this commit) | query_pathkeys derived with PG's precedence; has_useful_pathkeys completed and made per-rel | inert by design: values 24/24, plans byte-identical; the "motivate index paths" half is evidenced-blocked on C-11/C-12 |
 | D-03 | 2026-09-05 | (this commit) | PackedTuple/PackedSlot unreachable; SEVEN R-0 sites armed (design said six) | review REQUEST-CHANGES -> resolved; values 24/24, plans byte-identical; 25 tests |
 | C-10a (cardinality half) | 2026-09-05 | (this commit) | grouping-sets aggregates were priced as ONE set; now summed per set and clamped | values 24/24 + TPC-DS CKMISMATCH=0; PP unchanged; 4 new tests |
