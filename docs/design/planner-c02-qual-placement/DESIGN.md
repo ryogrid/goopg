@@ -97,16 +97,19 @@ left-only. Nil SJI = delay (fail-closed).
   incl. PG initsplan.c case table (`= const` on nullable side delays,
   `IS NULL` on nullable side delays, nullable-unmentioned places,
   preserved-side-only places, FULL always delays).
-- **C-02b — consume the delay proof in the copy pass (fewer copies).**
-  `pushConjunctIntoSubtree`'s `*Join` arm additionally declines the
-  descent when `delayedAboveOJ` fires for that link (computed from the
-  plan-level relid attribution + C-01 SJIs collected off the joinlist),
-  evaluated at EVERY crossed OJ link along the descent (conjunctive).
-  The residual keeps every conjunct, so values cannot change. Gate:
-  units + allowlisted shape moves (fewer pushed Filters IS the move —
-  the gate lists them, never "zero moves") + positive decline fixtures
-  (strict-equality vs `IS NULL` vs nullable-unmentioned crossing a
-  preserved edge) + R8 values-diff.
+- **C-02b — plan-level attribution infra (inert).**
+  `outputRelSet` / `qualSrcRelSet` / `planJoinDelaySJI`: the delay proof
+  made computable at plan-tree joins from SourceTableIdx attribution
+  (no joinlist alignment needed). Deliberately NOT consumed by the copy
+  pass: wiring it there is vacuous (review-proven — the legacy side
+  gates already decline every nullable-side qual, so the check can only
+  fire on Index-vs-SourceTableIdx disagreement, where attribution is
+  least trustworthy). Verdict parity with legacy is the gate, not
+  fewer copies: no moves expected, any move is a bug. The proof becomes
+  load-bearing at the C-02c/d moves, where dropping the residual needs
+  a positive placeability proof the legacy declines cannot supply.
+  Gate: units (attribution tables + parity pins with complete
+  attribution + unknown-attribution skip) + walker-inventory pin.
 - **C-02c — move, don't copy, on all-delay-proven paths.**
   When the copy lands AND every crossed link passed the C-02a proof AND
   the conjunct is single-side AND non-volatile (existing FuncCall

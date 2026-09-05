@@ -191,6 +191,15 @@ var exprSwitchInventory = map[string]walkerRole{
 	// same commit — cloneExprRefs left it with a *ColumnRef type
 	// assertion and no switch at all.
 	"local_filters.go:conjunctIsLocalEligible": nonRecursiveClassifier,
+	// Added by C-02b. Built on walkExprRefs (scopeVeto carries the
+	// recursion and the exhaustiveness — sublinks and unenumerated
+	// kinds abort the walk, fail-closed); what the census sees is the
+	// three-arm dispatch inside the Visit closure (veto
+	// *OuterColumnRef / *FuncCall, collect *ColumnRef identities),
+	// attributed to the enclosing function. Same demoted shape as
+	// innerJoinPushTarget above. Fail-open is a DECLINE here: ok=false
+	// keeps the legacy copy-pass verdict and consults no delay proof.
+	"outerjoin_delay.go:qualSrcRelSet": nonRecursiveClassifier,
 	// `mhj_input_rewrite.go` was renamed `scan_input_rewrite.go` by M0127-P6.2,
 	// which deleted its MultiHashJoin half: `cloneExprForShift` and
 	// `pushSingleSourceFiltersIntoMHJTables` went with the node (rows deleted,
