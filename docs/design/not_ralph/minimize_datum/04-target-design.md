@@ -263,11 +263,20 @@ encoder rather than by reasoning about it.
 `encodeValuePGCtx` (`codec.go:440`) dispatches on
 `strings.ToLower(t.Name)` — about 60 arms — and each arm then switches on
 `d.Kind` with an **error** default (`"expected bool, got kind %d"`). But the
-**outer** switch's default arm (`codec.go:1039-1046`) does not error. It falls
-back to `coerceTextLikeDatum` + `varlenaTextBytes`: it packs the value **as
-text**.
+**outer** switch's default arm (`codec.go:1055-1063`, cited as `:1039-1046`
+before the D-02 audit re-verified it) does not error. It falls back to
+`coerceTextLikeDatum` + `varlenaTextBytes`: it packs the value **as text**.
 
-The decoder is symmetric by design and says so (`codec.go:1981-1987`):
+One correction the audit added: the default arm is **not total**.
+`coerceTextLikeDatum` (`codec.go:132`) has arms for `KindString`,
+`KindBytes`, `KindInt`, `KindNumeric`, `KindBool`, `KindTime` and
+`KindInterval`, and a hard error default (`codec.go:156-157`). So a
+`KindEnum` or `KindToastPointer` reaching the default arm fails LOUDLY
+rather than retyping silently — see the ledger row for the enum case,
+which is reachable from the index-scan output path.
+
+The decoder is symmetric by design and says so (`codec.go:2033-2047`, cited
+as `:1981-1987` before the D-02 audit re-verified it):
 
 > Unknown type (e.g. "point", "path", custom types). goopg's `encodeValuePG`
 > stores them as PG varlena text (the default branch calls `varlenaTextBytes`).
@@ -293,13 +302,42 @@ declines. It does not rely on the encoder to fail, because the encoder does not
 fail.**
 
 ```go
-// packableType reports whether t has a named arm in encodeValuePGCtx /
-// decodePhysicalPGValueLowered, i.e. whether a Datum of the corresponding
-// Kind survives the round trip AS THAT KIND. It must be derived from the
-// same list the two switches use — a third transcription is a sibling-path
-// bug waiting to happen (03 §5).
+// packableType reports whether a Datum of t's natural Kind survives the
+// encode/decode round trip AS THAT KIND. It must be derived from the same
+// lists the two switches use — a third transcription is a sibling-path bug
+// waiting to happen (03 §5).
 func packableType(t catalog.Type) bool
 ```
+
+**Correction (D-02 audit, 2026-09-05): "has a named arm" is the WRONG
+predicate and would have produced a false STOP verdict.** Read literally it
+declines `text`, `varchar`, `character varying`, `bpchar`, `character`,
+`json` and `jsonb` — every text column in both benchmark suites (13
+`varchar` columns in TPC-H, 50 in TPC-DS) — because those types have no
+*named encoder* arm: the shared default at `codec.go:1055` already IS their
+correct encoder, and they round-trip `KindString → KindString`.
+
+The predicate is instead:
+
+> the union of the two switches' named arms, PLUS the text-like spellings
+> the shared default handles correctly, MINUS the arms that are not
+> Kind-stable.
+
+The not-Kind-stable set found by the audit: the eleven encoder-only blob
+arms (`oid[]`/`_oid`, `int2[]`/`_int2`, `float4[]`/`_float4`, `anyarray`,
+`char[]`/`_char`, `oidvector`, `int2vector`), plus `text[]`/`_text`, plus
+`unknown`, plus `pg_node_tree` (content-dependent). All of those go in as
+`KindBytes` and come back `KindString`. The blob arms are a deliberate
+convention — `internal/initdb/catalog_heap_reload.go:573-596` re-parses that
+raw payload by hand — so they are not a bug on the on-disk path, but they
+are unpackable for intermediate rows all the same.
+
+Note also that this list is now the **fifth** transcription of the same type
+set in tree, not the third: `encodeValuePGCtx`, `decodePhysicalPGValueLowered`,
+`pgPhysicalTypeIsVarlena` (`codec.go:1492`) and `catalog.PhysicalTypeAlign`
+(`internal/catalog/physical_align.go:18`) already disagree with each other
+(see the `float` ledger row). That strengthens 03 §5's argument for deriving
+rather than transcribing.
 
 A schema containing any non-packable column makes `NewTupleDesc` decline, and
 the operator falls back to `[]Row` retention for that plan node. Declining is
