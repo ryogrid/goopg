@@ -1,4 +1,4 @@
-# D-02 (MD-02) — derived-column type fidelity audit, static half
+# D-02 (MD-02) — derived-column type fidelity audit
 
 Date: 2026-09-05. Item: `docs/design/not_ralph/minimize_datum/TODO_ALL.md`
 D-02. Design under audit: `04-target-design.md` §3, §3.1, §9.2 (risk R-1).
@@ -9,8 +9,75 @@ minimize_datum bundle can pay, by counting how often a plan node's output
 schema carries a column type that `NewTupleDesc` would have to decline.
 **It is allowed to stop the bundle.**
 
-## Verdict (static half): PROCEED-shaped, with one design correction that
-## had to land first
+## Verdict: **PROCEED**
+
+Dynamic census over both corpora: **0 declining columns out of 160,302
+schema columns, 0 of 5,876 plan nodes, 0 of 985 retention sites.** The
+static half below is PROCEED-shaped and the dynamic half confirms it with
+counts. Two qualifications belong in the close-out, not the verdict:
+
+- **The margin is thinner than the zero suggests.** `l_shipdate + interval
+  '1 day'` in a SELECT list types `unknown`, which is NOT Kind-stable;
+  TPC-H only ever writes that in a WHERE clause, where it lands in a
+  `Filter.Predicate` rather than any node's `Output()`. That is luck of the
+  corpus, not a planner property. Likewise `percent_rank`, `cume_dist`,
+  `corr`, `regr_*` and `percentile_cont` all type `float8`, which the
+  derivation shows is also not Kind-stable. D-05's stopping rule should
+  re-run this census on any corpus change.
+- **The row-weighted half is formally unmeasured**, not measured-and-zero:
+  the in-process fixture catalogs carry no statistics, so all 1,865 nodes
+  with a search-produced `PlanRows` report exactly 1.0. Any non-negative
+  weighting of an empty declining set is zero, so the verdict does not turn
+  on it.
+
+## Dynamic census (in-process planning, no server)
+
+| | TPC-H | TPC-DS | total |
+|---|---|---|---|
+| queries planned | 22 of 23 sub-statements | 97 of 100 | — |
+| plan nodes | 281 | 5,595 | 5,876 |
+| schema columns | | | 160,302 |
+| nodes with >= 1 declining column | 0 | 0 | **0** |
+
+| split | nodes | declining |
+|---|---|---|
+| RETAINING (hash build, sort, agg, window, setop, distinct) | 985 | **0** |
+| STREAMING (scan, filter, project, limit, join) | 4,891 | **0** |
+
+Every type name that appears in any schema: `integer` (70,906 columns),
+`char(n)` (41,692), `decimal` (28,296), `varchar` (9,982), `date` (4,062),
+`numeric` (3,554), `int8` (985), `text` (490), `timestamp` (271), `int4`
+(52), `int` (12). All packable. Restricting to DERIVED columns
+(`SourceTableIdx == 0`) gives 10,731 columns drawn from the same eleven
+names — no `unknown`, no `float8`, no `<elem>[]` anywhere.
+
+The reason is mechanical rather than lucky in one respect worth recording:
+`buildAggregateCall` initialises `outType` to `unknown` but its default arm
+overwrites it with `numeric` (`planner.go:9418`), and `buildWindowFunc` has
+a named count/sum/avg/min/max switch ahead of its `unknown` fallback
+(`planner.go:6876-6893`), so `stddev_samp` and `avg(sum(x)) over (...)`
+land on `numeric` rather than `unknown`.
+
+**Positive control** (the instrument is not vacuous): planted against the
+TPC-H catalog, the census correctly flags `array_agg(l_returnflag)` →
+`char[]`, `array_agg(l_quantity)` → `numeric[]`, `percent_rank()` and
+`cume_dist()` → `float8`, `l_comment::bit(3)` → `bit`, and
+`l_shipdate + interval '1 day'` → `unknown`, while correctly NOT flagging
+`stddev_samp(l_quantity)` → `numeric`.
+
+**Queries that did not plan (4, none affecting the verdict):** TPC-H
+Q15-main (fixture limitation — the harness catalog cannot create the view
+Q15 needs; its view body was planned instead) and TPC-DS query36 / query70 /
+query86. The TPC-DS three are a dsqgen fixture defect, not a goopg gap —
+the generated file puts a statement terminator inside a derived table and
+PG rejects it too, which is why the SF0.5 oracle marks them SKIP. Repaired
+in memory they then hit a real goopg gap (ORDER BY referencing a select-list
+alias from inside a `CASE`), filed separately. All three are
+`rollup` + `grouping()` + `rank() over` shapes whose types
+(`int4`, `int8`) are packable, so including them would not have changed the
+count.
+
+## Static half: the design correction that had to land first
 
 Every base-column type in both benchmark suites is packable, and every
 statically reachable derived output-column type is packable. Nothing in the
@@ -41,6 +108,20 @@ the text-like spellings the shared default handles correctly, minus the
 arms that are not Kind-stable.
 
 ## Not Kind-stable (must be excluded from the allow-list)
+
+The dynamic derivation (which extracts both switches mechanically rather
+than transcribing them) found **51 packable spellings and 22 declining**,
+and corrected the static list in two places:
+
+- **`char` splits on `Args`.** `char(n)` is varlena text and Kind-stable;
+  bare `"char"` is NOT — the encoder writes one raw byte and accepts
+  `KindInt`, while the decoder always returns `KindString`. So
+  `packableType` must read `t.Args`, not just `t.Name`.
+- **The whole float family is not Kind-stable** (`float4`, `float8`,
+  `real`, `double precision`, `double`, `float`): `floatTextDatum` returns
+  `KindNumeric` for finite values but `KindString` for NaN and Infinity, so
+  the decoder arm is kind-ambiguous. The static half had not identified
+  this.
 
 | group | names | round trip |
 |---|---|---|

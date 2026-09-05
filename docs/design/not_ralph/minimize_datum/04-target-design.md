@@ -323,11 +323,21 @@ The predicate is instead:
 > the shared default handles correctly, MINUS the arms that are not
 > Kind-stable.
 
-The not-Kind-stable set found by the audit: the eleven encoder-only blob
-arms (`oid[]`/`_oid`, `int2[]`/`_int2`, `float4[]`/`_float4`, `anyarray`,
-`char[]`/`_char`, `oidvector`, `int2vector`), plus `text[]`/`_text`, plus
-`unknown`, plus `pg_node_tree` (content-dependent). All of those go in as
-`KindBytes` and come back `KindString`. The blob arms are a deliberate
+The not-Kind-stable set found by the audit (22 spellings against 51
+packable, both derived mechanically from the two switches): the eleven
+encoder-only blob arms (`oid[]`/`_oid`, `int2[]`/`_int2`,
+`float4[]`/`_float4`, `anyarray`, `char[]`/`_char`, `oidvector`,
+`int2vector`), plus `text[]`/`_text`, plus `unknown`, plus `pg_node_tree`
+(content-dependent), plus two the first pass missed:
+
+- **bare `"char"`** — `packableType` must therefore read `t.Args`, not just
+  `t.Name`: `char(n)` is varlena text and stable, while bare `"char"` is
+  one raw byte, accepts `KindInt` on encode, and always decodes
+  `KindString`.
+- **the whole float family** (`float4`, `float8`, `real`, `double
+  precision`, `double`, `float`) — `floatTextDatum` returns `KindNumeric`
+  for finite values but `KindString` for NaN and Infinity, so the decoder
+  arm is kind-ambiguous. The blob arms are a deliberate
 convention — `internal/initdb/catalog_heap_reload.go:573-596` re-parses that
 raw payload by hand — so they are not a bug on the on-disk path, but they
 are unpackable for intermediate rows all the same.

@@ -683,13 +683,31 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   *design: 04 §3 (D-1), 03 §5 (TD-1); gate: 06 §3 MD-01 (agreement test +
   oracle spot-check); files: `coltypeinfo.go`,
   `pg18_user_catalog_rows.go`, new.*
-- [ ] **D-02 MD-02 R-1 audit — derived-column type fidelity.** Count plan
-  nodes whose output schema contains a column `NewTupleDesc` declines, by
-  reason, raw and weighted by estimated retained rows, over both suites.
-  **Verdict in the words proceed / re-scope / stop. This item can stop
-  the bundle. It is not a formality.** Every declining type name is also
-  a latent on-disk retyping bug on a path that already ships — ledger
-  each whatever the verdict.
+- [x] **D-02 MD-02 R-1 audit — derived-column type fidelity.** Verdict
+  **PROCEED**, 2026-09-05. Census over both suites (in-process planning,
+  classifier extracted mechanically from both codec switches rather than
+  transcribed): **0 declining columns of 160,302; 0 nodes of 5,876; 0
+  retention sites of 985.** All eleven type names the corpora produce are
+  Kind-stable, including the 10,731 derived columns.
+  The load-bearing finding is a design correction that had to land first:
+  04 §3.1's `packableType` definition ("has a named arm") would have
+  declined every text column in both suites (13 + 50 `varchar`) and
+  produced a **false STOP** — those types have no *named encoder* arm
+  because the shared default IS their encoder. Corrected in 04 §3.1, along
+  with two spellings the static pass missed (bare `"char"` splits on
+  `Args`; the whole float family is kind-ambiguous via NaN/Inf).
+  Honest qualifications, both recorded in the report: the margin is
+  corpus-luck-sensitive (`date ± interval` in a SELECT list types
+  `unknown`; TPC-H only writes it in WHERE), and the row-weighted half is
+  formally UNMEASURED (fixture catalogs have no stats, so every PlanRows
+  is 1.0) rather than measured-and-zero — moot, since any weighting of an
+  empty set is zero.
+  Three latent on-disk bugs ledgered per the standing obligation:
+  `take3-D-02-enum-encode` (enum values cannot be encoded at all — loud
+  failure from the index-scan output path), `take3-D-02-float-spelling`
+  (bare `float` missing from two of the FOUR sibling type tables),
+  `take3-D-02-jsonb-text` (json/jsonb stored as text varlena).
+  Artifact: `analysis/minimize-datum/d02-type-fidelity-20260905/README.md`.
   *design: 04 §3 (D-2), §9.2; gate: 06 §3 MD-02; document only.*
 - [ ] **D-03 MD-03 `PackedTuple` + `PackedSlot`, unreachable.** MinimalTuple
   layout, 15-byte header, `hoff`-relative accessors, 4-byte hash prefix;
@@ -822,10 +840,19 @@ per arm; values never counts for projection/join-adjacent changes).*
   *design: `docs/design/executor-ex1-04-owned/DESIGN.md` + unblock review
   (`134324df6`); gate: poison tests on the Project shape (Cut 1 pattern)
   + alloc arm + values + pin.*
-- [ ] **E-04 EX4-01 `filterOp` compilation (serial).** Stop re-interpreting
-  the prefilter predicate. No planner dependency.
-  *design: take3 13 §6; gate: double-evaluation gone from the EX0-04
-  slice; twin-parity tests; values + pin.*
+- [-] **E-04 EX4-01 `filterOp` compilation (serial).** DROPPED 2026-09-05
+  after implementing and measuring three variants (compile-per-Open;
+  slab cached across re-Opens; adapter-root declined). Values 24/24 MATCH
+  and plans byte-identical on every arm, but **no repeatable gain and a
+  consistent TPC-H Q18 +8.5%** (34.48/34.62/34.82 s against two baselines
+  at 31.93/31.87 s). Root cause of the non-result is structural, not a
+  bad attempt: the item's own predicted effect is ~0.33 pp (take3 13 §6),
+  an order of magnitude below the ±17% protocol band, and the mechanism
+  overlaps `seqScanOp`'s prefilter, which already compiles the same
+  predicate pre-deform — so `filterOp` above such a scan only sees
+  survivors. Report:
+  `analysis/executor-refactor/e04-filterop-compile-20260905/README.md`;
+  ledger `take3-E-04-dropped` (resume conditions inline).
 - [ ] **E-05 EX4-02 join residual + key compilation.** `mergeResidualMatch`
   and per-`plan.Algo` key evaluators through the slab. Values-diff
   mandatory (join-adjacent, R8).
@@ -972,6 +999,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| D-02 | 2026-09-05 | c6468238f + (this commit) | verdict PROCEED: 0 declining columns of 160,302, 0 retention sites of 985 | corrected 04 section 3.1's packableType definition, which would have produced a false STOP; 3 latent on-disk bugs ledgered |
 | C-02d | 2026-09-05 | (this commit) | qual moves across preserved-side outer links; proof gains positive containment | values 24/24, plans byte-identical, plan-gate PASS, TPC-DS CKMISMATCH=0; review found no counterexample |
 | C-02c | 2026-09-05 | 2305241f4 | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
 
@@ -979,5 +1007,6 @@ P6-03/04/05 (load-bearing).
 
 | item | date | reason | ledger row |
 |---|---|---|---|
+| E-04 (EX4-01) | 2026-09-05 | no measured gain (predicted ~0.33 pp is below the noise floor; measured a consistent Q18 +8.5%); mechanism overlaps the scan prefilter | `take3-E-04-dropped` |
 
 (End of file)
