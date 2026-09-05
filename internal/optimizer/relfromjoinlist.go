@@ -416,6 +416,14 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// dormant, so the stamp is deliberately here and not there.
 	s.stampNeededColsOnRels()
 	s.stampOutputColsOnRels()
+	// C-19a / C-19b: `set_rel_consider_parallel` for every base rel, then
+	// `create_plain_partial_paths` — in PG's order, the flag inside
+	// set_rel_size and the partial seq scan in set_plain_rel_pathlist right
+	// after the serial one and before create_index_paths (allpaths.c:768-790).
+	// Both steps are AFTER stampNeededColsOnRels because the partial path's
+	// Target is computed from NeededCols, like the serial scans' (P4-01).
+	s.setBaseRelConsiderParallel(prob.cat)
+	s.addBaseRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)
 	// GEQO: when the query has >= geqo_threshold base relations and geqo is
 	// enabled, use the genetic query optimizer instead of the DP search.

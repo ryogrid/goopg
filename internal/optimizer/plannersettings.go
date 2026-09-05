@@ -126,6 +126,24 @@ type PlannerSettings struct {
 	// nodeHash.c:3622), NOT work_mem alone — take2 P2-03. Zero means "use the
 	// default", so a zero-valued PlannerSettings still prices hashes sanely.
 	HashMemMultiplier float64
+
+	// MaxParallelWorkersPerGather / MinParallelTableScanSize /
+	// ParallelLeaderParticipation are the three parallel GUCs the PATH MODEL
+	// reads (C-19a/b, take3 08 §8): `compute_parallel_worker` (allpaths.c:4274)
+	// sizes a partial seq scan from the first two, and `get_parallel_divisor`
+	// (costsize.c:6474) prices it with the third. They are the same facts
+	// `ParallelSettings` carries to the post-planning Gather pass
+	// (parallel.go), duplicated here because the post-pass runs OUTSIDE the
+	// search — the whole defect Phase 5 removes — while a partial path has to
+	// be priced INSIDE it. MinParallelTableScanSize is in BLOCKS
+	// (GUC_UNIT_BLOCKS upstream, guc_tables.c:3727).
+	//
+	// Zero MaxParallelWorkersPerGather means "no parallel paths", which is
+	// PG's own reading (`parallelModeOK` requires it > 0, planner.c:339) and
+	// the safe zero value for every hand-built PlannerSettings.
+	MaxParallelWorkersPerGather int
+	MinParallelTableScanSize    int64
+	ParallelLeaderParticipation bool
 }
 
 // DefaultPlannerSettings returns the settings a statement plans under when no
@@ -171,6 +189,9 @@ func DefaultPlannerSettings() PlannerSettings {
 		// round-trip invariant is for.
 		WorkMem:           hashsize.DefaultMemLimitBytes,
 		HashMemMultiplier: hashsize.DefaultHashMemMultiplier,
+		MaxParallelWorkersPerGather: cp.maxParallelWorkersPerGather,
+		MinParallelTableScanSize:    cp.minParallelTableScanBlocks,
+		ParallelLeaderParticipation: cp.parallelLeaderParticipation,
 	}
 }
 
@@ -212,5 +233,8 @@ func (ps PlannerSettings) costParams() costParams {
 		geqoGenerations: ps.GeqoGenerations,
 		geqoBias:        ps.GeqoSelectionBias,
 		geqoSeed:        ps.GeqoSeed,
+		maxParallelWorkersPerGather: ps.MaxParallelWorkersPerGather,
+		minParallelTableScanBlocks:  ps.MinParallelTableScanSize,
+		parallelLeaderParticipation: ps.ParallelLeaderParticipation,
 	}
 }

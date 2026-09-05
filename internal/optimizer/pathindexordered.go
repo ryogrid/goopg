@@ -201,6 +201,8 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	addPath(rel, &Path{
 		Kind: PathIndexScan,
 		Rel:  rel,
+		// create_index_path (pathnode.c:1078): `rel->consider_parallel`. C-19a.
+		ParallelSafe: rel.ParallelSafeForPath(),
 		// B-17d: `cost_index`'s own flag (costsize.c:560), on top of nothing
 		// (no input). The producer always runs.
 		DisabledNodes: disabledNodesFor(!s.cp.enableIndexScan),

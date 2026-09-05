@@ -190,6 +190,8 @@ func (s *searchCtx) buildOneBitmapPath(
 		IndexClauses:      indexClauses,
 		PartialPredicate:  partialPredicate,
 		RequiredOuter:     0,
+		// create_bitmap_index_path: `rel->consider_parallel`. C-19a.
+		ParallelSafe: rel.ParallelSafeForPath(),
 	}
 
 	// Build the bitmap heap scan path (the outer container).
@@ -203,6 +205,9 @@ func (s *searchCtx) buildOneBitmapPath(
 		Cost:     totalCost,
 		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, bitmapIdxPath),
 		Children: []*Path{bitmapIdxPath},
+		// create_bitmap_heap_path (pathnode.c:1149): the rel's flag AND the
+		// bitmapqual's. C-19a.
+		ParallelSafe: parallelSafeWith(rel, bitmapIdxPath),
 	}
 }
 
@@ -448,6 +453,8 @@ func (s *searchCtx) chooseBitmapAnd(
 		Cost:              andCost,
 		BitmapSelectivity: andSelec,
 		Children:          inners,
+		// create_bitmap_and_path (pathnode.c:1189): `rel->consider_parallel`.
+		ParallelSafe: rel.ParallelSafeForPath(),
 	}
 
 	// Recompute heap-access cost atop the AND tree.
@@ -462,6 +469,7 @@ func (s *searchCtx) chooseBitmapAnd(
 		Rows:     rel.Rows,
 		Cost:     totalCost,
 		Children: []*Path{bitmapAndPath},
+		ParallelSafe: parallelSafeWith(rel, bitmapAndPath),
 	}
 }
 
@@ -581,6 +589,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
 		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
 		IndexClauses: clauses, RequiredOuter: req,
+		ParallelSafe: rel.ParallelSafeForPath(),
 	}
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
@@ -601,5 +610,6 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		// pay.
 		IndexClauses: clauses,
 		Children:     []*Path{child},
+		ParallelSafe: parallelSafeWith(rel, child),
 	}
 }

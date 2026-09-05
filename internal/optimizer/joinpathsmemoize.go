@@ -265,6 +265,9 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		RequiredOuter: innerPath.RequiredOuter,
 		Children:      []*Path{innerPath},
 		MemoizeInfo:   &memoizePathInfo{estEntries: est, rescan: rescan},
+		// create_memoize_path (pathnode.c:1694): `subpath->parallel_safe`.
+		// C-19a.
+		ParallelSafe: innerPath.ParallelSafe,
 	}
 }
 

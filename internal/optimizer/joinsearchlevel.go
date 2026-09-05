@@ -600,6 +600,9 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// `buildInitialRels`, not something inherited from the inputs
 		// (M0127-P5.7-b).
 		joinrel.ConsiderStartup = s.tupleFraction > 0
+		// `joinrel->consider_parallel` (relnode.c:842): both inputs AND the
+		// join's own clauses parallel-safe. C-19a (considerparallel.go).
+		joinrel.ConsiderParallel = joinrelConsiderParallel(s, rel1, rel2, clauses)
 		if err := s.addRel(joinrel); err != nil {
 			return nil, err
 		}

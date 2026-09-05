@@ -400,6 +400,8 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 		HashKeys:      mergeClauses,
 		Residual:      residual,
 		RequiredOuter: req,
+			// create_mergejoin_path (pathnode.c:2660). C-19a.
+		ParallelSafe: parallelSafeWith(joinrel, op, ip),
 	}, "mergejoin")
 }
 
@@ -443,6 +445,8 @@ func sortPathFor(sub *Path, keys []PathKey, cp costParams) *Path {
 		Pathkeys:      keys,
 		Children:      []*Path{sub},
 		RequiredOuter: sub.RequiredOuter,
-		ParallelSafe:  sub.ParallelSafe,
+		// create_sort_path (pathnode.c:3065): `rel->consider_parallel &&
+		// subpath->parallel_safe`. C-19a.
+		ParallelSafe: parallelSafeWith(sub.Rel, sub),
 	}
 }

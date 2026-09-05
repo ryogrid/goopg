@@ -104,6 +104,15 @@ type costParams struct {
 	geqoGenerations int
 	geqoBias        float64
 	geqoSeed        float64
+
+	// maxParallelWorkersPerGather / minParallelTableScanBlocks /
+	// parallelLeaderParticipation are the parallel GUCs the path model reads
+	// (C-19a/b; see PlannerSettings for the unit and zero-value rules).
+	// `compute_parallel_worker` reads the first two, `get_parallel_divisor`
+	// the third.
+	maxParallelWorkersPerGather int
+	minParallelTableScanBlocks  int64
+	parallelLeaderParticipation bool
 }
 
 func defaultCostParams() costParams {
@@ -136,6 +145,14 @@ func defaultCostParams() costParams {
 		geqoThreshold:   GeqoThreshold(),
 		geqoEffort:      5,
 		geqoBias:        2.0,
+		// The registered boot values (internal/utils/misc/defaults.go):
+		// max_parallel_workers_per_gather = 4 is a deliberate goopg default
+		// (PG 18.3 ships 2 — workers here are goroutines, not scarce slots);
+		// min_parallel_table_scan_size = 8MB = 1024 blocks and
+		// parallel_leader_participation = on are PG's own.
+		maxParallelWorkersPerGather: 4,
+		minParallelTableScanBlocks:  8 * 1024 * 1024 / blockSizeBytes,
+		parallelLeaderParticipation: true,
 	}
 }
 
@@ -159,12 +176,30 @@ func getParallelDivisor(workers int, leaderParticipates bool) float64 {
 
 // costSeqscan reproduces cost_seqscan (costsize.c:295): sequential page reads
 // plus per-tuple CPU. numQualOps is the number of operator evaluations per tuple
-// from the scan's restriction qual. The parallel case divides the run cost by the
-// divisor (the caller passes a per-worker tuple/page count, or divides after).
+// from the scan's restriction qual. The parallel arm is costParallelSeqscan.
 func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps int) Cost {
 	run := cp.seqPageCost*float64(relPages) +
 		(cp.cpuTupleCost+cp.cpuOperatorCost*float64(numQualOps))*relTuples
 	return Cost{Startup: 0, Total: run}
+}
+
+// costParallelSeqscan is cost_seqscan's `parallel_workers > 0` arm
+// (costsize.c:335-353), the price of ONE worker's share of a partial seq scan.
+// It returns the cost and the per-worker row count.
+//
+// Only the CPU run cost is divided by `get_parallel_divisor`; the disk run
+// cost is charged in full to every worker — upstream's comment: "It may be
+// possible to amortize some of the I/O cost, but probably not very much,
+// because most operating systems already do aggressive prefetching. For now,
+// we assume that the disk run cost can't be amortized at all." The row count
+// is clamp_row_est(rows / divisor), "the number of tuples processed per
+// worker". C-19b (take3 08 §8): this is what makes a partial scan a REAL path
+// with a real cost rather than the post-pass's size rule.
+func costParallelSeqscan(cp costParams, relPages int64, relTuples, rows float64, numQualOps, workers int) (Cost, float64) {
+	d := getParallelDivisor(workers, cp.parallelLeaderParticipation)
+	disk := cp.seqPageCost * float64(relPages)
+	cpu := (cp.cpuTupleCost + cp.cpuOperatorCost*float64(numQualOps)) * relTuples / d
+	return Cost{Startup: 0, Total: disk + cpu}, clampRowEst(rows / d)
 }
 
 // qualEvalCost is `cost_qual_eval`'s contribution to a join (costsize.c:4700):

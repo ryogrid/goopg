@@ -33,8 +33,18 @@ func TestGenerateScanPaths_PartialIsDivided(t *testing.T) {
 	if partial >= serial {
 		t.Fatalf("partial cost %v must be less than serial %v", partial, serial)
 	}
-	if diff := partial - serial/d; diff > 1e-6 || diff < -1e-6 {
-		t.Fatalf("partial cost %v should be serial/%v = %v", partial, d, serial/d)
+	// cost_seqscan's parallel arm (costsize.c:335-353): only the CPU run cost
+	// is divided by the parallel divisor; the disk cost is charged whole to
+	// every worker ("we assume that the disk run cost can't be amortized at
+	// all"). C-19b replaced the earlier whole-total division.
+	disk := cp.seqPageCost * 1000
+	cpu := (cp.cpuTupleCost + cp.cpuOperatorCost*1) * rel.Rows
+	want := disk + cpu/d
+	if diff := partial - want; diff > 1e-6 || diff < -1e-6 {
+		t.Fatalf("partial cost %v should be disk %v + cpu %v / %v = %v", partial, disk, cpu, d, want)
+	}
+	if got, want := rel.PartialPathlist[0].Rows, clampRowEst(rel.Rows/d); got != want {
+		t.Fatalf("partial rows = %v, want clamp_row_est(rows / divisor) = %v", got, want)
 	}
 	if rel.PartialPathlist[0].ParallelWorkers != 2 {
 		t.Fatalf("partial path must carry the worker count")

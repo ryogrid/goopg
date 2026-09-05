@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"math/bits"
 	"os"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // maxSearchRels is the relset width. `RelSet` is a uint16 (path.go:29), so the
@@ -195,6 +197,15 @@ type searchCtx struct {
 	outputCols      map[string]bool
 	outputColsKnown bool
 	outputEligible  bool
+
+	// parallelModeOK is `root->glob->parallelModeOK` for this search
+	// (considerparallel.go); cat is the catalog the qual-safety walk resolves
+	// user routines through. Both are set by `setBaseRelConsiderParallel`,
+	// the C-19a protocol step; a search that skips the step (every direct
+	// test caller) keeps the zero values — no rel considers parallel, no
+	// partial path exists — which is the pre-C-19 regime exactly.
+	parallelModeOK bool
+	cat            catalog.Catalog
 }
 
 // newSearchCtx allocates the level lists for an nrels-relation join problem.

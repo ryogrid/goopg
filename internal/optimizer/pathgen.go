@@ -21,9 +21,13 @@ package optimizer
 
 // generateScanPaths adds the base-relation scan paths to rel: a serial SeqScan
 // and, when the relation clears the parallel size ladder (parallelWorkers > 0), a
-// partial SeqScan whose cost is divided by the parallel divisor (design ch. 06
-// §1.1). relPages is the live block count; numQualOps is the per-tuple operator
-// count of the scan's restriction qual.
+// partial SeqScan priced by cost_seqscan's parallel arm (design ch. 06 §1.1;
+// C-19b, `addPartialSeqScanPath`). relPages is the live block count; numQualOps
+// is the per-tuple operator count of the scan's restriction qual.
+//
+// `leaderParticipates` is honoured by copying it onto cp: the production
+// producer (`addBaseRelPartialPaths`) reads the session's value from costParams,
+// and this test-facing entry keeps its explicit parameter.
 func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOps, parallelWorkers int, leaderParticipates bool) {
 	seqCost := costSeqscan(cp, relPages, rel.Rows, numQualOps)
 	// B-17d: `cost_seqscan`'s own flag (costsize.c:295). The producer always
@@ -38,25 +42,13 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 		Rows:         rel.Rows,
 		Cost:         seqCost,
 		DisabledNodes: seqDisabled,
-		ParallelSafe: parallelWorkers > 0,
+		ParallelSafe: rel.ParallelSafeForPath(),
 		Target:       tgt,
 		TargetKnown:  tgtKnown,
 	}, "scan.seq")
 	if parallelWorkers > 0 {
-		// Each worker processes ~1/d of the pages and tuples; the seq scan's
-		// startup is zero, so dividing the total by the divisor is exact.
-		d := getParallelDivisor(parallelWorkers, leaderParticipates)
-		addPartialPath(rel, &Path{
-			Kind:            PathSeqScan,
-			Rel:             rel,
-			Rows:            rel.Rows / d,
-			Cost:            Cost{Startup: 0, Total: seqCost.Total / d},
-			DisabledNodes:   seqDisabled,
-			ParallelSafe:    true,
-			ParallelWorkers: parallelWorkers,
-			Target:          tgt,
-			TargetKnown:     tgtKnown,
-		}, "scan.seq.partial")
+		cp.parallelLeaderParticipation = leaderParticipates
+		addPartialSeqScanPath(rel, cp, relPages, rel.Rows, numQualOps, parallelWorkers)
 	}
 }
 
@@ -114,6 +106,9 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 		HashKeys:      keys,
 		Residual:      residual,
 		RequiredOuter: calcNonNestloopRequiredOuter(p, b),
+		// create_hashjoin_path (pathnode.c:2740): the rel's flag AND both
+		// inputs'. C-19a.
+		ParallelSafe: parallelSafeWith(joinRel, p, b),
 	}, "join.hash")
 }
 
@@ -154,6 +149,8 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 		// A nested loop DISCHARGES an inner parameterised by the outer, so
 		// this is a subtraction, not a union (pathnode.c:2592).
 		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
+		// create_nestloop_path (pathnode.c:2590). C-19a.
+		ParallelSafe: parallelSafeWith(joinRel, o, i),
 	}, "join.nestloop")
 }
 

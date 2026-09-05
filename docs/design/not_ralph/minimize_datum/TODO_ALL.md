@@ -795,12 +795,42 @@ rule).*
   *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
 - [ ] **C-18 P4-09 `create_window_paths`** + set-operation paths, priced.
   *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
-- [ ] **C-19a P5-01 `consider_parallel` per rel**
-  (`set_rel_consider_parallel`).
+- [x] **C-19a P5-01 `consider_parallel` per rel.** Landed 2026-09-06
+  (`considerparallel.go`): `set_rel_consider_parallel` per base rel (temp,
+  virtual catalog, TABLESAMPLE args, CTE, VALUES, SRF proparallel+args,
+  subquery `limit_needed`, baserestrictinfo, sublinks, exec params) and
+  `build_join_rel`'s "both inputs AND the join's own clauses" propagation;
+  every path stamped `ParallelSafe` from its rel. Review
+  APPROVE-WITH-NITS found the safety classifier **fail-OPEN in four
+  places**, all fixed in the same commit with 16 new pins: `ScalarFuncScan`
+  and the `Pg*` catalog-SRF leaves fell to a default arm whose subtree walk
+  read "no children" as "nothing unsafe"; a subquery leaf's OWN expressions
+  were never checked (`FROM (SELECT nextval('s') …) q` passed);
+  `random`/`random_normal`/`setseed` (proparallel 'r') were missing and a
+  schema-qualified `pg_catalog.nextval` bypassed the table; index/bitmap
+  leaves keep their predicate in `Key/LowKey/HighKey/BitmapQual`, not a
+  Filter, so `WHERE id = nextval('s')` as an index key passed. The subtree
+  walk now REFUSES any node `parallelChildren` does not model rather than
+  descending past it. Three further review items ledgered
+  (`take3-C-19ab-review-deferred`) for C-19c/d, where they first bite.
   *design: take3 08 §8; gate: take3 09 §5 P5 (PP + serial control).*
-- [ ] **C-19b P5-02 `create_plain_partial_paths` populating
-  `PartialPathlist`.** `computeParallelWorkers` moves into path
-  generation.
+- [x] **C-19b P5-02 `create_plain_partial_paths` populating
+  `PartialPathlist`.** Landed 2026-09-06 in the same commit: a partial seq
+  scan is a real `Path` in `PartialPathlist`, sized by
+  `compute_parallel_worker`'s log3 ladder and `max_parallel_workers_per_
+  gather` cap (pinned equal to the post-pass twin), priced by
+  `cost_seqscan`'s `parallel_workers > 0` arm (CPU ÷ `get_parallel_divisor`
+  with the 0.3 leader contribution, disk NOT divided,
+  `clamp_row_est(rows/divisor)`). **Serial control arm unchanged by
+  construction**: `PartialPathlist` has no reader but `addPath` and the
+  trace, `finalPath` reads `Pathlist` only, and `TestPartialPathIsNever
+  TheFinalPath` cannot pass vacuously (it fatals on zero partial paths).
+  Gates (pinned regime, fresh capped server per arm): TPC-H values **24/24
+  MATCH**; plan capture **BYTE-IDENTICAL** to HEAD; `make plan-gate`
+  **22/22 structural AND `MODE=costs`**; TPC-DS SF0.5 **PASS=95 MISMATCH=0
+  CKMISMATCH=0**; optimizer suite green. (An earlier unpinned capture pair
+  the implementing agent took showed a Q9 shape move; re-captured under the
+  pinned seed on both binaries it is 0 lines — the instrument, again.)
   *design: take3 08 §8; gate: take3 09 §5 P5 (PP).*
 - [ ] **C-19c P5-03 parallel eligibility for plain index scans.** Extend
   `drivingScan` (SeqScan/BitmapHeapScan/IndexOnlyScan + wrappers today;
@@ -1553,6 +1583,7 @@ P6-03/04/05 (load-bearing).
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
 | build-cost charge | 2026-09-06 | (reverted; patch in tmp/) | 5x participant multiplier, derived and witness-confirmed; **+22.3%** — Q5/Q9/Q10 lost PARALLELISM, not a build side | **names the root: goopg's cost model has no parallel dimension**; D-05 is blocked on C-19, not on its own terms |
+| C-19a + C-19b | 2026-09-06 | (this commit) | Phase 5 begins: consider_parallel per rel + priced partial seq-scan paths; serial arm byte-identical | review found the safety classifier fail-open in 4 places, fixed + 16 pins; values 24/24, plan-gate 22/22 costs-exact, TPC-DS clean |
 | cost-side narrowing | 2026-09-06 | (reverted; patch in tmp/) | cost side made to agree with the executor exactly; **+10.3%** — it removed an accidental deterrent | **names the real defect: hashJoinCost under-prices BUILDING a large hash table**; confirms the bucket-charge coupling (Q14 no longer flips) |
 | D-05 prereq #2 | 2026-09-06 | (reverted; patch in tmp/) | MapSlotBytes 48 was a guess and 2x low (measured 96 B/slot); honest value halved bucket heap 586->286 MB, batches unchanged — but **Q14 flipped to a nested loop, +10.4% total** | premise refuted again (buckets WERE already charged); blocker moves to the cost side pricing an un-narrowed build |
 | D-05 prereq #1 | 2026-09-06 | (this commit) | entry model fixed 194 -> 120 B/row (was half-narrowed, half-full-width); **nbatch unchanged — D-04's claim refuted** | non-monotone: 2 batches need <=111.8 B/row; packed 63 B/row lands back on 4. The lever is MapSlotBytes, not the entry |

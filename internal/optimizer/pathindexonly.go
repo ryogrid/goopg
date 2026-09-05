@@ -120,6 +120,8 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		Rel:              rel,
 		Rows:             rel.Rows,
 		Cost:             cost,
+		// create_index_path (pathnode.c:1078): `rel->consider_parallel`. C-19a.
+		ParallelSafe:     rel.ParallelSafeForPath(),
 		// B-17d: an index-only path is costed by cost_index too, so
 		// enable_indexscan = off counts here as well (planner.go's
 		// indexOnlyScanRejected documents the OR). enable_indexonlyscan =

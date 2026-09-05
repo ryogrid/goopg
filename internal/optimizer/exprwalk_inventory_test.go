@@ -156,6 +156,14 @@ var exprSwitchInventory = map[string]walkerRole{
 	// whose two-arm veto set this one's is a superset of. Fail-open is not a
 	// hazard here: an unenumerated type aborts cloneExprRefs itself, and the
 	// arm panics on the `!ok`.
+	// C-19a (2026-09-06): `is_parallel_safe` built on walkExprRefs under
+	// scopeVeto; the three-arm dispatch (*FuncCall proparallel lookup,
+	// *OuterColumnRef / *ExecParamRef as PARAM_EXEC) lives inside the Visit
+	// closure and is attributed to the enclosing function — the demoted
+	// shape of local_filters.go:conjunctIsLocalEligible. Fail-closed by
+	// construction: an unenumerated type aborts the walk (OnUnknown) and the
+	// rel is read as parallel-unsafe.
+	"considerparallel.go:isParallelSafeExpr": nonRecursiveClassifier,
 	"createplanjoin.go:translateToLayout": nonRecursiveClassifier,
 	// Added by the M0125-0035 CTE-body arm. Both are built on the
 	// exprwalk primitives — walkExprRefs carries the recursion and

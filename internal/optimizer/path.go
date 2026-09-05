@@ -336,6 +336,22 @@ type RelOptInfo struct {
 	Pathlist        []*Path
 	PartialPathlist []*Path
 
+	// ConsiderParallel is PG's `RelOptInfo.consider_parallel`
+	// (pathnodes.h:911): whether it is worth generating partial paths for
+	// this rel at all — the relation can be read by a worker (not temp, not
+	// a virtual catalog), and its restriction quals and outputs are
+	// parallel-safe. C-19a (take3 08 §8, `set_rel_consider_parallel`,
+	// allpaths.c:589): set per base rel by `setBaseRelConsiderParallel`
+	// (considerparallel.go) and propagated to a join rel in `makeJoinRel` as
+	// "both inputs and the join's own clauses" (build_join_rel,
+	// relnode.c:842).
+	//
+	// false is the zero value and the safe one: a rel that never went
+	// through the step gets no partial paths and marks every path it owns
+	// parallel-unsafe, exactly as `build_simple_rel` initialises it
+	// (relnode.c:213 "might get changed later").
+	ConsiderParallel bool
+
 	CheapestTotal   *Path
 	CheapestStartup *Path
 
@@ -474,7 +490,7 @@ func relNCols(r *RelOptInfo) int {
 // consulted); Rows is taken from the rel. This is the C0 bridge (design ch. 03
 // §3.1).
 func newPrebuiltPath(rel *RelOptInfo, n Node) *Path {
-	return &Path{Kind: PathPrebuilt, Rel: rel, Rows: rel.Rows, node: n}
+	return &Path{Kind: PathPrebuilt, Rel: rel, Rows: rel.Rows, node: n, ParallelSafe: rel.ParallelSafeForPath()}
 }
 
 // pathCostComparison is the result of compare_path_costs_fuzzily.

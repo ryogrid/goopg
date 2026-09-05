@@ -399,6 +399,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		Rel:      rel,
 		Rows:     rows,
 		Cost:     cost,
+		// create_index_path (pathnode.c:1078): `rel->consider_parallel`. C-19a.
+		ParallelSafe: rel.ParallelSafeForPath(),
 		// B-17d: `cost_index`'s own flag (costsize.c:560). The producer
 		// always runs, parameterised or not.
 		DisabledNodes: disabledNodesFor(!s.cp.enableIndexScan),
