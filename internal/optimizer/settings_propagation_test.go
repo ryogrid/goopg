@@ -362,6 +362,251 @@ func findSetOp(n Node) (*SetOp, bool) {
 	return nil, false
 }
 
+// TestPlannerSettingsReachScalarSubqueryJoin is B-12f's GUC-effect gate
+// (take3 09 §5 P2 row): the session's settings must reach the join search
+// running INSIDE a scalar-class sublink — a scalar SubqueryExpr,
+// ARRAY(SELECT ...), IN, EXISTS, and the multi-assign UPDATE RHS. Before
+// B-12f all five sites planned under hard-wired defaults, so every arm
+// below costed the inner join at 3.25..151.75 no matter what the session
+// said. After B-12f each arm reprices it, proving the inner search reads
+// the statement's settings.
+//
+// The arms are EXACTLY the P2-02d settings family this fixture can observe:
+// seq_page_cost, cpu_tuple_cost, cpu_operator_cost (each ×1000) and work_mem
+// (16kB, whose hash budget spills at this fixture's build size — the same
+// repricing the bench shows live as `SET work_mem='64kB'` 14835→23478).
+// Deliberately NOT covered here, same honesty rule as
+// TestCostGUCsReachTheCostingOnAHashJoin,
+// TestPlannerSettingsReachDerivedTableJoin and
+// TestPlannerSettingsReachSetOpOperands: random_page_cost,
+// cpu_index_tuple_cost and effective_cache_size need an index shape this
+// seq-scan fixture does not produce; parallel_setup_cost/parallel_tuple_cost
+// need a Gather; the method toggles, memoize, hash_mem_multiplier and GEQO
+// knobs travel on the same PlannerSettings value with conversion pinned by
+// TestCostGUCConversionIsTotal / TestEnableJoinMethodGUCsSetDisabledNodes /
+// TestHashMemMultiplierReachesTheBudget.
+func TestPlannerSettingsReachScalarSubqueryJoin(t *testing.T) {
+	cat := psProbeCatalog(t)
+	// The multi-assign UPDATE shape needs a two-column target; pa/pb carry
+	// the probe join, tgt only hosts the SET assignment.
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "tgt"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Every shape hides the same probe join inside the sublink; the outer
+	// query is open-ended on purpose so the only priced join is the inner
+	// one. All five sublinks are non-correlated, so the inner SELECT
+	// reaches the path search (a correlated/lateral inner would bypass it
+	// with no costed node, like B-12d's lateral variant).
+	const joinBody = "pa, pb WHERE pa.id = pb.id AND pa.v = 3"
+	shapes := []struct{ name, sql string }{
+		{"scalar", "SELECT (SELECT pa.v FROM " + joinBody + ") FROM pa"},
+		{"array", "SELECT ARRAY(SELECT pa.v FROM " + joinBody + ") FROM pa"},
+		{"in", "SELECT pa.v FROM pa WHERE pa.v IN (SELECT pb.v FROM " + joinBody + ")"},
+		{"exists", "SELECT pa.v FROM pa WHERE EXISTS (SELECT pa.v FROM " + joinBody + ")"},
+		{"multiassign", "UPDATE tgt SET (a, b) = (SELECT pa.v, pb.v FROM " + joinBody + ")"},
+	}
+	// The settings thread recursively: a scalar sublink inside a scalar
+	// sublink's plan prices under the same statement settings.
+	const nestedScalarSQL = "SELECT (SELECT (SELECT pa.v FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3) FROM pa) FROM pa"
+
+	base := make(map[string]PlanCost, len(shapes))
+	for _, sh := range shapes {
+		costs := costedScalarInners(t, cat, sh.sql, DefaultPlannerSettings())
+		if len(costs) != 1 {
+			t.Fatalf("%s: baseline has %d costed inner plans, want 1 — the fixture is wrong", sh.name, len(costs))
+		}
+		base[sh.name] = costs[0]
+	}
+
+	arms := []struct {
+		name  string
+		apply func(*PlannerSettings)
+	}{
+		{"seq_page_cost", func(p *PlannerSettings) { p.SeqPageCost *= 1000 }},
+		{"cpu_tuple_cost", func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
+		{"cpu_operator_cost", func(p *PlannerSettings) { p.CPUOperatorCost *= 1000 }},
+		{"work_mem", func(p *PlannerSettings) { p.WorkMem = 16 << 10 }},
+	}
+	for _, sh := range shapes {
+		for _, arm := range arms {
+			t.Run(sh.name+"/"+arm.name, func(t *testing.T) {
+				ps := DefaultPlannerSettings()
+				arm.apply(&ps)
+				costs := costedScalarInners(t, cat, sh.sql, ps)
+				if len(costs) != 1 {
+					t.Fatalf("%s: hot plan has %d costed inner plans, want 1", sh.name, len(costs))
+				}
+				if costs[0] == base[sh.name] {
+					t.Errorf("%s/%s: inner join still costed at (%.4f..%.4f) — "+
+						"the settings did not reach the subquery's join search",
+						sh.name, arm.name, costs[0].StartupCost, costs[0].TotalCost)
+				}
+			})
+		}
+	}
+
+	t.Run("cpu_tuple_cost/nested", func(t *testing.T) {
+		ps := DefaultPlannerSettings()
+		ps.CPUTupleCost *= 1000
+		defCosts := costedScalarInners(t, cat, nestedScalarSQL, DefaultPlannerSettings())
+		if len(defCosts) != 1 {
+			t.Fatalf("nested baseline has %d costed inner plans, want 1 (the innermost join)", len(defCosts))
+		}
+		hotCosts := costedScalarInners(t, cat, nestedScalarSQL, ps)
+		if len(hotCosts) != 1 {
+			t.Fatalf("nested hot plan has %d costed inner plans, want 1", len(hotCosts))
+		}
+		if hotCosts[0] == defCosts[0] {
+			t.Errorf("nested: innermost join still costed at (%.4f..%.4f) — "+
+				"the settings did not thread through the middle subquery",
+				hotCosts[0].StartupCost, hotCosts[0].TotalCost)
+		}
+	})
+
+	// No cross-session leakage: the threading is an explicit parameter (or
+	// the outer context's stamped field), not the package-global planParent
+	// channel, so planning under one session's settings must not steer the
+	// next statement (the wrong-scope bug the reverted mechanical attempt
+	// shipped — take3 08 §10.1).
+	t.Run("no_leakage", func(t *testing.T) {
+		const sql = "SELECT (SELECT pa.v FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3) FROM pa"
+		hot := DefaultPlannerSettings()
+		hot.CPUTupleCost *= 1000
+		if costs := costedScalarInners(t, cat, sql, hot); len(costs) != 1 {
+			t.Fatalf("hot arm has %d costed inner plans, want 1", len(costs))
+		}
+		restored := costedScalarInners(t, cat, sql, DefaultPlannerSettings())
+		if len(restored) != 1 {
+			t.Fatalf("restored arm has %d costed inner plans, want 1", len(restored))
+		}
+		if restored[0] != base["scalar"] {
+			t.Errorf("default plan after a hot plan = (%.4f..%.4f), want baseline (%.4f..%.4f) — "+
+				"one statement's settings leaked into the next",
+				restored[0].StartupCost, restored[0].TotalCost, base["scalar"].StartupCost, base["scalar"].TotalCost)
+		}
+	})
+}
+
+// TestScalarSubqueryPropagationKeepsDefaultPlan is B-12f's unchanged-default
+// pin: under DefaultPlannerSettings every scalar-class site must price
+// exactly as it did when the sites hard-wired the defaults — the slice is
+// plan-neutral for sessions that change nothing. The literal cost pins the
+// full chain (outer-context threading → planSelectWithParent → inner
+// search); a zero-valued or mis-threaded settings value would reprice it.
+// The nested variant covers the recursion through the middle subquery.
+func TestScalarSubqueryPropagationKeepsDefaultPlan(t *testing.T) {
+	cat := psProbeCatalog(t)
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "tgt"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const joinBody = "pa, pb WHERE pa.id = pb.id AND pa.v = 3"
+	shapes := []struct{ name, sql string }{
+		{"scalar", "SELECT (SELECT pa.v FROM " + joinBody + ") FROM pa"},
+		{"array", "SELECT ARRAY(SELECT pa.v FROM " + joinBody + ") FROM pa"},
+		{"in", "SELECT pa.v FROM pa WHERE pa.v IN (SELECT pb.v FROM " + joinBody + ")"},
+		{"exists", "SELECT pa.v FROM pa WHERE EXISTS (SELECT pa.v FROM " + joinBody + ")"},
+		{"multiassign", "UPDATE tgt SET (a, b) = (SELECT pa.v, pb.v FROM " + joinBody + ")"},
+		{"nested", "SELECT (SELECT (SELECT pa.v FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3) FROM pa) FROM pa"},
+	}
+	for _, sh := range shapes {
+		t.Run(sh.name, func(t *testing.T) {
+			costs := costedScalarInners(t, cat, sh.sql, DefaultPlannerSettings())
+			if len(costs) != 1 {
+				t.Fatalf("%s: default plan has %d costed inner plans, want 1", sh.name, len(costs))
+			}
+			got := costs[0]
+			if got.StartupCost != 3.25 || got.TotalCost != 151.75 || got.PlanRows != 100 {
+				t.Errorf("%s: default inner join = (%.4f..%.4f rows=%.0f), want (3.25..151.75 rows=100) — "+
+					"the default path moved", sh.name, got.StartupCost, got.TotalCost, got.PlanRows)
+			}
+		})
+	}
+}
+
+// scalarInnerPlans returns the inner SELECT plans of every scalar-class
+// sublink in the tree: SubqueryExpr / ArraySubqueryExpr / InExpr /
+// ExistsExpr inner plans, the shared Row plan of a multi-assign UPDATE
+// (reached off Update.Set, which walkPlanExprs does not cover), and the
+// Right side of an unnested non-correlated-IN SemiJoin (which IS the inner
+// plan planInExpr built, re-hung as the join's build side by M0069-0005).
+// It recurses into nested subqueries — a scalar inside a scalar's plan is
+// not reachable via Node children — and dedupes shared plans (both SET
+// elements point at the one Row).
+func scalarInnerPlans(n Node) []Node {
+	var out []Node
+	seen := map[Node]bool{}
+	add := func(p Node) {
+		if p != nil && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	var visitNode func(m Node)
+	visitNode = func(m Node) {
+		if m == nil {
+			return
+		}
+		walkPlanExprs(m, func(e Expr) {
+			walkExprTree(e, func(inner Expr) {
+				switch x := inner.(type) {
+				case *SubqueryExpr:
+					add(x.Plan)
+				case *ArraySubqueryExpr:
+					add(x.Plan)
+				case *InExpr:
+					add(x.Plan)
+				case *ExistsExpr:
+					add(x.Plan)
+				case *MultiAssignSubqRow:
+					add(x.Plan)
+				}
+			})
+		})
+		if u, ok := m.(*Update); ok {
+			for _, e := range u.Set {
+				if e == nil {
+					continue
+				}
+				walkExprTree(e, func(inner Expr) {
+					if x, ok := inner.(*MultiAssignSubqRow); ok {
+						add(x.Plan)
+					}
+				})
+			}
+		}
+		if j, ok := m.(*Join); ok && j.Type == JoinTypeSemi {
+			add(j.Right)
+		}
+		for _, ch := range legacyDisplayChildren(m) {
+			visitNode(ch)
+		}
+	}
+	visitNode(n)
+	for i := 0; i < len(out); i++ {
+		visitNode(out[i])
+	}
+	return out
+}
+
+// costedScalarInners plans sql under ps and returns the search costs of the
+// sublink inner plans (scalarInnerPlans filtered to cost-carrying roots).
+func costedScalarInners(t *testing.T, cat catalog.Catalog, sql string, ps PlannerSettings) []PlanCost {
+	t.Helper()
+	var out []PlanCost
+	for _, p := range scalarInnerPlans(psPlan(t, cat, sql, ps)) {
+		if c, ok := topPlanCost(p); ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // The build-side narrowing lands in `joinInputsFor`, which runs inside
 // `createPlanNode` — a free function with no searchCtx. `Path.Rel` is the only
 // route to the statement's needed-column set from there, so the set has to be

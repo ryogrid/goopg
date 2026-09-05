@@ -199,7 +199,10 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
-		return planUpdate(s, cat, scope)
+		// B-12f: the UPDATE statement's settings ride along so the
+		// multi-assign subquery site (applyUpdateAssign) prices under
+		// the session's GUCs via ctx.settings.
+		return planUpdate(s, cat, plannerSet, scope)
 	case *parser.DeleteStmt:
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
@@ -11901,9 +11904,13 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 			if innerScope == nil {
 				innerScope = rtableScopeFrom(ctx)
 			}
-			// B-12f owns this site (scalar-subquery propagation): still
-			// defaulted until that slice threads it by hand.
-			innerPlan, err := planSelectWithParent(rhs.Inner, cat, ctx, DefaultPlannerSettings(), innerScope)
+			// B-12f: and the statement's settings, read off the explicit
+			// outer context (ctx.settings) — never the package-global
+			// planParent channel — so the inner join search prices under
+			// the session's GUCs. Unstamped hosts (struct-literal contexts
+			// that predate P2-01) carry the zero value, which
+			// planSelectWithParent folds back to the defaults.
+			innerPlan, err := planSelectWithParent(rhs.Inner, cat, ctx, ctx.settings, innerScope)
 			if err != nil {
 				return err
 			}
@@ -11942,7 +11949,7 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 	return nil
 }
 
-func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, scope *rtableScope) (Node, error) {
+func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
 	// A-01(ii) cut 2 (F5): the WITH list, the FROM list, the target
 	// scan, and every SET / WHERE / RETURNING sublink allocate from
 	// the statement scope.
@@ -12041,7 +12048,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, scope *rtableScope) (
 			fromScans = append(fromScans, fromNode)
 			offset += len(fromTbl.Columns)
 		}
-		ctx := newResolveContext(bindings, sch, DefaultPlannerSettings())
+		ctx := newResolveContext(bindings, sch, plannerSet)
 		ctx.cat = cat
 		// A-01(ii) cut 2: SET / WHERE sublinks over UPDATE…FROM allocate
 		// from the statement scope.
@@ -12083,7 +12090,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, scope *rtableScope) (
 		return wrapDMLCTEPrefix(upd, dmlPlans), nil
 	}
 
-	ctx := singleBindingContext(resolveScope, targetAlias, DefaultPlannerSettings())
+	ctx := singleBindingContext(resolveScope, targetAlias, plannerSet)
 	ctx.cat = cat
 	// A-01(ii) cut 2: SET / WHERE sublinks allocate from the statement scope.
 	ctx.rtScope = scope
@@ -13901,9 +13908,12 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 	}
 	// A-01(ii) cut 2 (F4): the inner SELECT shares the statement scope
 	// read off the outer context — threaded, never created (F1).
-	// B-12f owns this site (scalar-subquery propagation): still defaulted
-	// until that slice threads it by hand.
-	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, DefaultPlannerSettings(), rtableScopeFrom(parent))
+	// B-12f: and the statement's settings, read off the explicit outer
+	// context (parent.settings) — never the package-global planParent
+	// channel — so the inner join search prices under the session's
+	// GUCs. Unstamped hosts carry the zero value, which
+	// planSelectWithParent folds back to the defaults.
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, parent.settings, rtableScopeFrom(parent))
 	if err != nil {
 		return nil, err
 	}
@@ -13918,9 +13928,9 @@ func planArraySubqueryExpr(x *parser.ArraySubqueryExpr, parent *resolveContext) 
 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "subqueries are not supported in this context"}
 	}
 	// A-01(ii) cut 2 (F4): shares the statement scope (see planSubqueryExpr).
-	// B-12f owns this site (scalar-subquery propagation): still defaulted
-	// until that slice threads it by hand.
-	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, DefaultPlannerSettings(), rtableScopeFrom(parent))
+	// B-12f: and the statement's settings (parent.settings) — same
+	// hand-threading as planSubqueryExpr.
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, parent.settings, rtableScopeFrom(parent))
 	if err != nil {
 		return nil, err
 	}
@@ -14001,9 +14011,9 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}
 		}
 		// A-01(ii) cut 2 (F4): shares the statement scope (see planSubqueryExpr).
-		// B-12f owns this site (scalar-subquery propagation): still defaulted
-		// until that slice threads it by hand.
-		inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx, DefaultPlannerSettings(), rtableScopeFrom(ctx))
+		// B-12f: and the statement's settings (ctx.settings) — same
+		// hand-threading as planSubqueryExpr.
+		inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx, ctx.settings, rtableScopeFrom(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -14030,9 +14040,9 @@ func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error) 
 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "EXISTS not supported in this context"}
 	}
 	// A-01(ii) cut 2 (F4): shares the statement scope (see planSubqueryExpr).
-	// B-12f owns this site (scalar-subquery propagation): still defaulted
-	// until that slice threads it by hand.
-	inner, err := planSelectWithParent(x.Subquery, parent.cat, parent, DefaultPlannerSettings(), rtableScopeFrom(parent))
+	// B-12f: and the statement's settings (parent.settings) — same
+	// hand-threading as planSubqueryExpr.
+	inner, err := planSelectWithParent(x.Subquery, parent.cat, parent, parent.settings, rtableScopeFrom(parent))
 	if err != nil {
 		return nil, err
 	}
@@ -14160,13 +14170,24 @@ func planHasEscapingOuterRef(node Node, depth int) bool {
 // that it is goroutine-thread-unsafe, so a parent walk could price the inner
 // query with a concurrently-planning session's GUCs — the threaded-from-wrong-
 // scope bug the reverted mechanical attempt shipped (take3 08 §10.1, 04 §12.3;
-// same rule as resolveContext.settings). Callers outside B-12d's derived-table
-// family (scalar subqueries, B-12f) pass DefaultPlannerSettings()
-// explicitly, preserving today's behaviour until B-12f threads them.
+// same rule as resolveContext.settings). Scalar subqueries thread the
+// statement's settings by hand too (B-12f: planSubqueryExpr,
+// planArraySubqueryExpr, planInExpr and planExistsExpr pass the explicit
+// outer context's stamped settings; the multi-assign UPDATE site reads
+// ctx.settings, stamped from the UPDATE statement's own settings).
 // Set-operation operands already thread the statement's settings by hand
 // (B-12e: planSelectWithSettings passes its own plannerSet to the leftmost
 // branch, planSegment and SetOpOperand sites).
+//
+// A zero ps means the caller hosted the sublink on an unstamped
+// struct-literal context (VALUES lists, SRF args, HAVING — all predate P2-01
+// stamping) and folds back to the defaults: exactly today's behaviour at
+// those hosts, never a zero-priced search. Same unstamped-means-default
+// rule as newResolveContext and the PlannerSettings zero-value rule.
 func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	if ps == (PlannerSettings{}) {
+		ps = DefaultPlannerSettings()
+	}
 	prevParent := planParent
 	planParent = parent
 	defer func() { planParent = prevParent }()

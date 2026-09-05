@@ -591,7 +591,10 @@ func planDMLCTEBody(stmt parser.Stmt, cat catalog.Catalog, scope *rtableScope) (
 	case *parser.InsertStmt:
 		return planInsert(s, cat, scope)
 	case *parser.UpdateStmt:
-		return planUpdate(s, cat, scope)
+		// B-12f: CTE-body DML keeps explicit defaults — CTE bodies plan
+		// outside any statement's settings (preplanWithClause carries
+		// none), so there is nothing to thread here.
+		return planUpdate(s, cat, DefaultPlannerSettings(), scope)
 	case *parser.DeleteStmt:
 		return planDelete(s, cat, scope)
 	case *parser.MergeStmt:

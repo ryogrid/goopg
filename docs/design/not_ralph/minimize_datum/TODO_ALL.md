@@ -340,13 +340,21 @@ are EPICS — split into one-checkbox-per-commit items before starting
   leftmost branch, `planSegment` right-operand closure, `SetOpOperand`
   grouping site pass the statement's own settings (line numbers had
   shifted since the design; grouped site gets own arms + per-operand
-  isolation subtest). Gates: GUC-effect (8 arms fail pre-fix via stash,
-  pass post) + unchanged-default pin; PP zero drift; TPC-H 24/24 MATCH.
+  isolation subtest).   Gates: GUC-effect (8 arms fail pre-fix via stash,
+  pass post) + unchanged-default pin; PP zero drift; TPC-H 24/24 MATCH;
+  TPC-DS PASS=95 MISMATCH=0.
   Artifacts: `planner.go`, `settings_propagation_test.go`.
-- [ ] **B-12f Scalar-subquery propagation:** same hand-threading for
-  scalar-subquery sites. After B-01a/b/c.
-  *design: take2 07 §3.3 + 04 §12.3 + take3 08 §5.1; gate: take3 09 §5 P2
-  (GUC-effect + both-suites timing).*
+- [x] **B-12f Scalar-subquery propagation.** Landed 2026-09-05:
+  scalar/ARRAY/IN/EXISTS planners take the explicit outer context's
+  settings (`parent.settings`/`ctx.settings`, never planParent);
+  multi-assign UPDATE via `planUpdate` ps param (both SET/WHERE
+  contexts); `planSelectWithParent` zero-guard (pre-P2-01 literals
+  fold to defaults); DML-CTE passes explicit defaults.
+  Gates: 22+7 subtests (pre-fix FAIL via stash); PP zero drift;
+  TPC-H 24/24 MATCH. Artifacts: `planner.go`, `with.go`,
+  `settings_propagation_test.go`. Unstamped hosts (HAVING/VALUES/
+  ORDER BY/CTE bodies, INSERT…SELECT, ON CONFLICT, DML derived
+  tables) stay default — future slices.
 - [!] **B-13 P2-02b `work_mem` BootVal 512 MB → 4 MB — BLOCKED on B-01a/b/c +
   B-12d/e/f.** Three lines move together (GUC BootVal,
   `postgresql.conf.sample`, `hashsize.DefaultMemLimitBytes`) +
