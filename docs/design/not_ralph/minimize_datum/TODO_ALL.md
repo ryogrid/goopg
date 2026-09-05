@@ -833,12 +833,7 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
-- [ ] **F-01 Delete the duplicate build map** (`lazyHash` + `lazyIntHash`
-  both maintained — peak build memory ~2× on the int-key path). One
-  commit. NOTE: 04 §4.1 lists both maps as things to *convert*, doubling
-  Tier A work — deleting first removes that scope.
-  *evidence: 02 §3, take2 07 §6; gate: ~2× build-side memory verified on
-  a Q9-class shape; values + pin.*
+- [x] **F-01 Delete the duplicate build map** — already satisfied in-tree by `514913912` (M0127-P0.3: plan-typed single-map build, `lazyHashFinalize`/`lazyBuildAllInt64` deleted; enforced by `join_single_map_build_test.go` dual-map-build-back guard); gates: executor join suites green at that commit; artifacts: `internal/executor/operators_join_agg.go`, `internal/executor/join_single_map_build_test.go`.
 - [ ] **F-02 Probe-seam re-materialisation** (hash cascade re-materialises
   probe input at every level, twice, both paths; ~18 M pool round-trips,
   ~2×2.3 GB `Datum` traffic Q9-class). Bounded, split before start if it
@@ -916,6 +911,7 @@ P6-03/04/05 (load-bearing).
 
 | item | closed | commit | effect | notes |
 |---|---|---|---|---|
+| F-01 | 2026-09-05 | 514913912 (pre-existing) | dual-map peak removed; single-map build by plan type | audit-only close; no new code; guard test `join_single_map_build_test.go` |
 
 ## Dropped
 
