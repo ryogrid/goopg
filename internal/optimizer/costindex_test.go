@@ -149,8 +149,12 @@ func TestCostIndexScanFullScanArithmetic(t *testing.T) {
 	if !approxCost(got.Startup, 0.25) {
 		t.Errorf("startup = %v; want 0.25 (the B-tree descent)", got.Startup)
 	}
-	if !approxCost(got.Total, 495.25) {
-		t.Errorf("total = %v; want 495.25", got.Total)
+	// Page terms 480 (80 index + 400 heap) scale with the probe calibration;
+	// CPU terms 15.25 do not. Written as an expression so C-20d's
+	// recalibration does not turn this into a stale literal.
+	want := indexProbeMultCalibrated*480.0 + 15.25
+	if !approxCost(got.Total, want) {
+		t.Errorf("total = %v; want %v", got.Total, want)
 	}
 }
 
@@ -201,7 +205,9 @@ func TestCostIndexScanSharesTheProbeCalibration(t *testing.T) {
 	// The random-page terms (80 index + 400 heap = 480) triple; the CPU terms
 	// (5 + 0.25 + 10) do not, because the multiplier was measured against page
 	// access, not against per-tuple work.
-	want := base.Total + 2.0*480.0
+	// base was computed at the CALIBRATED default, so the delta is
+	// (3 - calibrated) x the page terms, not (3 - 1).
+	want := base.Total + (3.0-indexProbeMultCalibrated)*480.0
 	if !approxCost(scaled.Total, want) {
 		t.Fatalf("multiplier 3 gave %v; want %v (random-page terms scaled, CPU terms not)",
 			scaled.Total, want)

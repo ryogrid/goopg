@@ -532,8 +532,27 @@ func indexProbeCost(cp costParams) float64 {
 // pick ruinous PG-shaped NL plans (measured: Q5/Q9 20-200x). This multiplier
 // recalibrates the probe cost toward goopg's in-memory reality so the DP prefers
 // a hash join over NL-probing a large outer. Overridable via
-// GOOPG_INDEX_PROBE_MULT for measurement; the calibrated default is set once a
-// value is validated on SF1.
+// GOOPG_INDEX_PROBE_MULT for measurement.
+//
+// **Calibrated to 2.0 on 2026-09-05** (C-20d). The knob had shipped at 1.0 —
+// exactly the value this comment says under-costs goopg's probes — because
+// the calibration it was created for was never run. Measured at SF=1, serial,
+// pinned-statistics regime, fresh server per arm, values 24/24 MATCH against
+// the multiplier-1 baseline on every arm:
+//
+//	        mult=1     mult=2     mult=4
+//	Q5      21.60 s     4.07 s     6.84 s
+//	Q7      15.72 s     5.86 s     6.24 s
+//	Q9      13.17 s     7.06 s     7.18 s
+//	Q3       6.25 s     2.67 s        —
+//	suite  138.58 s   100.79 s        —
+//
+// 2 and 4 pick the same plans on the probed queries, so 2 is chosen as the
+// smaller departure from PG's constants that still buys the whole win —
+// raising it further is unjustified without evidence. Every other query moved
+// within the noise band. The multiplier stays a knob rather than becoming a
+// hard-coded 2 so the next recalibration (after the NL-probe execution work
+// this comment describes) can be measured the same way.
 var indexProbeCostMultiplier = indexProbeMultFromEnv(os.Getenv("GOOPG_INDEX_PROBE_MULT"))
 
 // indexProbeMultFromEnv resolves GOOPG_INDEX_PROBE_MULT's raw value to the
@@ -550,8 +569,15 @@ func indexProbeMultFromEnv(v string) float64 {
 			return f
 		}
 	}
-	return 1.0
+	return indexProbeMultCalibrated
 }
+
+// indexProbeMultCalibrated is the validated default (see the block comment on
+// indexProbeCostMultiplier for the measurement that set it). Named rather than
+// inlined so the flag-provenance table resolves the same default the process
+// does — `unset(2)` is then a statement about the binary, not a restated
+// constant.
+const indexProbeMultCalibrated = 2.0
 
 // `multiHashJoinCost` costed goopg's N-way MultiHashJoin under the
 // comparability invariant (design ch. 06 §4.1) — build every dimension hash

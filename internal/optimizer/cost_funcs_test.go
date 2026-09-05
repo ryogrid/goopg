@@ -214,7 +214,10 @@ func TestAggCost_Hashed(t *testing.T) {
 
 func TestIndexProbeCost(t *testing.T) {
 	cp := defaultCostParams()
-	want := 2*4.0 + 0.005 + 0.01 + 0.0025 // 8.0175
+	// Expressed through the calibration constant rather than its value, so
+	// this pins the FORMULA and a recalibration does not require editing an
+	// arithmetic literal here (C-20d set the constant to 2.0).
+	want := indexProbeMultCalibrated * (2*4.0 + 0.005 + 0.01 + 0.0025)
 	if !approx(indexProbeCost(cp), want) {
 		t.Fatalf("indexProbeCost = %v, want %v", indexProbeCost(cp), want)
 	}

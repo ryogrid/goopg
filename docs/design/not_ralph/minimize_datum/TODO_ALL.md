@@ -709,9 +709,35 @@ rule).*
   original comment names. Ledger `take3-C-20c-blocked`.
   *design: take3 08 §9; gate: byte-identical plans for the flip
   (take3 09 §5 P6).*
-- [ ] **C-20d P6-06b retire `GOOPG_INDEX_PROBE_MULT`**, regenerating
-  `planner-flags.env`. Own commit with before/after parity roll-up +
-  timing table.
+- [!] **C-20d P6-06b `GOOPG_INDEX_PROBE_MULT` — flag KEPT, but its default
+  CALIBRATED 1.0 → 2.0. The session's largest performance result.**
+  The knob existed because "PG's constants (multiplier 1) under-cost
+  goopg's NL-index probe … the DP would pick ruinous PG-shaped NL plans",
+  and it **shipped at 1.0** — the value its own comment identifies as
+  wrong — because the validation it was waiting for was never run.
+  Retiring it at 1.0 would have made the mis-costing permanent.
+  Measured (SF=1, serial, pinned statistics, fresh server per arm):
+  **Q5 21.60 → 4.07 s, Q7 15.72 → 5.86 s, Q9 13.17 → 7.06 s,
+  Q3 6.25 → 2.67 s; suite total 138.58 → 100.79 s (−27%)**, no query
+  regressed outside the band. 2 beats 4 (same plans on the probed queries,
+  4 marginally worse on Q7), so 2 is the smaller departure from PG's
+  constants that buys the whole win.
+  Correctness: TPC-H values **24/24 MATCH**; TPC-DS SF0.5 **PASS=95
+  MISMATCH=0 CKMISMATCH=0**; Q12=2/Q13=34.
+  Plans moved deliberately (95 shape lines; NL-index probes over large
+  relations become hash joins) and **plan parity IMPROVED**:
+  `match=5 shapediff=15` → **`match=6 shapediff=14`**, the monotone
+  direction take3 09 §5 requires — the calibration moved goopg toward PG's
+  shapes, not only toward faster. Baseline re-pinned
+  (`plan_snapshots/probe-mult2-20260905.txt`); `make plan-gate` 22/22 in
+  structural AND `MODE=costs`.
+  **Retirement itself stays BLOCKED**: the multiplier is load-bearing at
+  2.0, and the comment expects another recalibration once goopg's NL probe
+  stops materialising the whole TID list eagerly. The knob keeps a
+  validated default instead of an unvalidated one. Ledger
+  `take3-C-20d-calibrated`.
+  Artifact:
+  `analysis/planner-refactor-take3/c20d-probe-calibration-20260905/README.md`.
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
 - [ ] **C-20e P6-06c retire `GOOPG_HASH_OUTER_JOIN`**, regenerating
   `planner-flags.env`. Measured safe (CKMISMATCH=0) but a wash (+1 s
@@ -1160,6 +1186,7 @@ P6-03/04/05 (load-bearing).
 | C-02b | 2026-09-05 | 9c0b549 + 6f0232c | plan-level delay attribution, inert; parity pins | attribution tables + inventory pin; optimizer green; review APPROVE-WITH-NITS |
 | E-15 | 2026-09-05 | 065182d + c7f1f45 | presorted-prefix contract published; C-14/E-03 unblocked | 4 contract tests; suites green; review APPROVE-WITH-NITS; no behaviour change |
 | gate-repro | 2026-09-05 | 870732855 | plan captures reproducible: A/A noise 455 est / 27 shape lines -> 0 | `GOOPG_ANALYZE_SEED` (OID-mixed) + bench `autovacuum = off` in the TRACKED generator; review APPROVE-WITH-NITS, 9/9 applied; prerequisite for every later plan pin |
+| C-20d | 2026-09-05 | (this commit) | **index-probe multiplier calibrated 1.0 -> 2.0: TPC-H suite 138.58 -> 100.79 s (-27%), Q5 5.3x, Q7 2.7x, Q9 1.9x, Q3 2.3x** | values 24/24 + TPC-DS CKMISMATCH=0; plan parity IMPROVED 5/15 -> 6/14; flag retirement stays blocked |
 | D-01 | 2026-09-05 | (this commit) | TupleDesc descriptor fields derived, not transcribed; agreement test spans two pg_type.dat transcriptions | additive, no consumer yet; values 24/24, plans byte-identical, plan-gate PASS |
 | F-02 | 2026-09-05 | (pre-existing M0127-P1.1) | probe seam already chained: 432 ns/op 0 allocs vs 1115 ns/op 10 allocs for the old seam | audit-only close; no new code; guard `TestProbeSeamZeroAllocs` verified passing |
 | D-02 | 2026-09-05 | c6468238f + (this commit) | verdict PROCEED: 0 declining columns of 160,302, 0 retention sites of 985 | corrected 04 section 3.1's packableType definition, which would have produced a false STOP; 3 latent on-disk bugs ledgered |

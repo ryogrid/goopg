@@ -164,7 +164,15 @@ func TestNLIArmAdmission(t *testing.T) {
 	run := func(t *testing.T, innerParam RelSet) int {
 		t.Helper()
 		outer := scanRel(a, 100, estScanPages(100, 32))
-		inner := nliInnerRel(b, 1000, innerParam, indexProbeCost(cp))
+		// The probe cost is a FIXED small value, not the live
+		// indexProbeCost(cp). This test is about try_nestloop_path's
+		// admission verdict, not about the probe calibration: reading the
+		// live constant made it fail the moment C-20d recalibrated the
+		// multiplier from 1.0 to 2.0, because the doubled probe made the
+		// NLI path lose add_path dominance in this synthetic fixture. A
+		// calibration change should move plans, not silently retarget an
+		// admission test.
+		inner := nliInnerRel(b, 1000, innerParam, 1.0)
 		joinrel := newRelOptInfo(a|b, 100, 64)
 		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
