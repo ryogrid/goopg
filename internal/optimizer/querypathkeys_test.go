@@ -374,27 +374,53 @@ func TestHasUsefulPathkeysArms(t *testing.T) {
 	}
 }
 
-// TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot is C-07's recorded
-// scope line, as a test rather than a comment.
+// TestAddOrderedIndexPathsGateIsCompleteButGenerationStaysShut is C-07's
+// recorded scope line, as a test rather than a comment — RE-ADJUDICATED
+// 2026-09-07, after C-11 and C-12 both landed.
 //
 // The rel below has NO join clause and an index whose leading column is
-// exactly what the query's ORDER BY asks for. `has_useful_pathkeys` now says
-// yes — the ordering arm is live — and the producer still emits nothing,
-// because the useful-COLUMN set is `pathkeys_useful_for_merging` alone
+// exactly what the query's ORDER BY asks for. `has_useful_pathkeys` says yes
+// — the ordering arm is live — and the producer still emits nothing, because
+// the useful-COLUMN set is `pathkeys_useful_for_merging` alone
 // (`mergeableColumnExprsFor`); `pathkeys_useful_for_ordering` has no
-// counterpart yet.
+// counterpart.
 //
-// That is deliberate: goopg has nothing that would SELECT a path for its
-// ordering. `finalPath` chooses on cost, the search boundary publishes a Node
-// and drops the chosen path's `Pathkeys`, and the ORDER BY `*Sort` goes on
-// unconditionally above it. An ordering-only full index scan generated here
-// could only lose on total cost or win `CheapestStartup` under a LIMIT while
-// the redundant Sort still runs.
+// The PREVIOUS revision of this test named C-11 (`ORDERED` upper rel) and
+// C-12 (a real upper-rel `PathSort`) as the item that would flip it
+// red-to-green. Both landed (2026-09-06) and NEITHER flipped it. That is the
+// new fact this test records, and it was measured, not reasoned:
 //
-// So this test is a MARKER, not a preference: when C-11 (upper `RelOptInfo`s,
-// incl. `ORDERED`) and C-12 (a real upper-rel `PathSort`) land, it must be
-// flipped deliberately — with the ordered path then asserted to be offered.
-func TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot(t *testing.T) {
+//   - the widening itself works. Unioning the query-pathkey columns into
+//     `colExprs` makes `btg`'s map go `[w]` -> `[w x]` for
+//     `… WHERE btg.w = oth.k ORDER BY btg.x` and `addOneOrderedIndexPath`
+//     then adds a real `index.ordered` path on `btg_x_y_idx`;
+//   - and the plan does not move — not on cost, and not with
+//     `enable_seqscan = off`. The chosen path comes back through
+//     `finalPath` with `pathkeys=0`, `planJoinlistSearch` publishes
+//     `r.node`, and `createOrderedPaths` stacks its Sort on a
+//     `newPrebuiltPath` that carries no ordering at all
+//     (`TestCreateOrderedPathsInputArmIsUnreachableFromANode`).
+//
+// So the widening still buys an ordering-only full index scan that can only
+// lose on total cost, or win `CheapestStartup` under a LIMIT while the
+// redundant Sort above it still runs; and, on a GROUP BY, silently disable
+// the GROUP_AGG producer's index-driven sorted-input variant, which matches
+// on the child being a bare `*SeqScan` (`indexOrderedAggInput`,
+// groupingpaths.go). Unmotivated plan churn, so it is still not forced.
+//
+// One blocker found in the re-adjudication is new and independent of the
+// seam: `addOrderedIndexPaths` runs only INSIDE the PG-shaped join search,
+// and `tryPGShapedJoinSearch` declines at `nrels < 2` (joinsearchseam.go).
+// A single-table `SELECT … FROM t ORDER BY t.pk` — the canonical shape the
+// widening is meant to serve — never reaches the producer at all, whatever
+// the useful-column set says.
+//
+// This test is therefore still a MARKER, not a preference. Its unblocker is
+// now named precisely: a search boundary that publishes the chosen PATH (or
+// at least its `Pathkeys`) instead of a bare Node, so
+// `createOrderedPaths`' `upper.ordered.input` arm becomes reachable. On that
+// day, flip both this test and its consumer-side twin.
+func TestAddOrderedIndexPathsGateIsCompleteButGenerationStaysShut(t *testing.T) {
 	cat, orders, _ := ppiCatalog(t)
 	ppiSetStats(orders, 1_500_000,
 		catalog.ColumnStats{NDistinct: 1_500_000},
@@ -414,9 +440,10 @@ func TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot(t *testing.T) {
 	s.addOrderedIndexPaths(cat)
 
 	if got := orderedPathsOf(rel); len(got) != 0 {
-		t.Fatalf("got %d ordered index paths on the ordering arm alone; want 0 until a consumer "+
-			"exists that selects a path FOR its ordering (C-11 ORDERED upper rel, C-12 upper-rel "+
-			"PathSort). Flipping this test is that item's red-then-green marker", len(got))
+		t.Fatalf("got %d ordered index paths on the ordering arm alone; want 0 until the search "+
+			"boundary carries Pathkeys across the seam (C-11 and C-12 landed and did not: "+
+			"see TestCreateOrderedPathsInputArmIsUnreachableFromANode). Flipping this test is "+
+			"that item's red-then-green marker", len(got))
 	}
 }
 

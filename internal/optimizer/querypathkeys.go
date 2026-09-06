@@ -39,14 +39,39 @@ package optimizer
 // still runs. It would also silently disable the GROUP_AGG producer's
 // index-ordered input variant (groupingpaths.go indexOrderedAggInput),
 // whose GROUP-BY-ordered index promotion matches
-// on the child being a `*SeqScan`. The consumers are filed: C-11 (P4-02 upper
-// `RelOptInfo`s, incl. `ORDERED`), C-12 (P4-03 a real upper-rel `PathSort`),
-// C-15/C-16 (`create_grouping_paths` / `create_distinct_paths`). The widening
-// belongs with them, and is a map union at one line: fold the query-pathkey
-// columns into the `colExprs` map `addOrderedIndexPaths` hands
-// `buildIndexPathkeys` (pathindexordered.go), which is
-// `pathkeys_useful_for_ordering` in the same inside-out form
-// `mergeableColumnExprsFor` already gives `pathkeys_useful_for_merging`.
+// on the child being a `*SeqScan`.
+//
+// # Re-adjudicated 2026-09-07, after C-11 and C-12 landed
+//
+// C-11 (P4-02 upper `RelOptInfo`s, incl. `ORDERED`) and C-12 (P4-03 a real
+// upper-rel `PathSort`) were filed as the consumer that would make the
+// widening motivated. Both landed on 2026-09-06 and NEITHER did, and the
+// re-adjudication was a measurement rather than a re-reading:
+//
+//   - the widening itself is exactly the one-line map union this comment
+//     always described, and it WORKS. Unioning the query-pathkey columns into
+//     `colExprs` takes `btg`'s useful set from `[w]` to `[w x]` on
+//     `… WHERE btg.w = oth.k ORDER BY btg.x` and `addOneOrderedIndexPath`
+//     then adds a real `index.ordered` path on the (x, y) index;
+//   - and no plan moves — not on cost, and not with `enable_seqscan = off`.
+//     `finalPath` returns a path with `pathkeys=0`; `planJoinlistSearch` then
+//     publishes `r.node`; and `createOrderedPaths` (upperordered.go) is a
+//     Node consumer whose only Node→Path bridge, `newPrebuiltPath`, leaves
+//     `Pathkeys` nil. Its `upper.ordered.input` arm is therefore unreachable
+//     from production and its Sort is unconditional in fact, exactly as it
+//     was before C-12 — pinned by
+//     `TestCreateOrderedPathsInputArmIsUnreachableFromANode`.
+//
+// A blocker independent of the seam also came out of the re-adjudication:
+// `addOrderedIndexPaths` runs only inside the PG-shaped join search, and
+// `tryPGShapedJoinSearch` declines at `nrels < 2` (joinsearchseam.go). A
+// single-table `SELECT … FROM t ORDER BY t.pk` — the canonical shape the
+// widening is meant to serve — never reaches the producer at all.
+//
+// So the unblocker is now named precisely, and it is not an upper rel: a
+// search boundary that publishes the chosen PATH (or at least its
+// `Pathkeys`) rather than a bare Node. C-15/C-16 (`create_grouping_paths` /
+// `create_distinct_paths`) sit behind the same seam.
 //
 // So: derivation live and tested, gate complete, generation unchanged.
 

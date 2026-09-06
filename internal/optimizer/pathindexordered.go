@@ -95,9 +95,18 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 // (relfromjoinlist.go:218), and the ORDER BY `*Sort` is wrapped on
 // unconditionally above it (planner.go:1720). Generating an ordering-only full
 // index scan there could only lose on total cost, or win `CheapestStartup`
-// under a LIMIT while the redundant Sort still runs. The consumers are C-11
-// (upper `RelOptInfo`s incl. `ORDERED`) and C-12 (a real upper-rel
-// `PathSort`); the widening is a map union at the `colExprs` line below.
+// under a LIMIT while the redundant Sort still runs.
+//
+// C-11 (upper `RelOptInfo`s incl. `ORDERED`) and C-12 (a real upper-rel
+// `PathSort`) were filed as that consumer. Both landed 2026-09-06 and the
+// re-adjudication on 2026-09-07 measured that neither unblocks this: the
+// widening does generate the path, and no plan moves, because
+// `createOrderedPaths` consumes a NODE and `newPrebuiltPath` carries no
+// `Pathkeys` across the seam. The widening is still the map union at the
+// `colExprs` line below; what it now waits on is a boundary that publishes
+// the chosen path's ordering. See querypathkeys.go's header for the full
+// measurement, and `TestCreateOrderedPathsInputArmIsUnreachableFromANode`
+// for the pin.
 func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 	if s == nil || cat == nil {
 		return

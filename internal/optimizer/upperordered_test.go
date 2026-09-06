@@ -232,3 +232,58 @@ func TestC10cPreservedSideQualMovesThroughOrderedSortArm(t *testing.T) {
 		t.Errorf("a Filter reached the NULLABLE input for a preserved-side qual")
 	}
 }
+
+// TestCreateOrderedPathsInputArmIsUnreachableFromANode is C-12a's blocker,
+// measured rather than asserted from a comment.
+//
+// `addOrderedPaths` has two arms and both are tested above — but the ordered
+// one is reached there only by a seed whose `Pathkeys` the TEST set by hand.
+// Production has no such seed. `createOrderedPaths` is handed a NODE (the
+// search boundary publishes `r.node`, relfromjoinlist.go's
+// `planJoinlistSearch`, and drops the chosen path), and the only bridge from
+// a Node to a Path is `newPrebuiltPath`, which sets `Rows`, `Kind`, `Rel` and
+// `ParallelSafe` and leaves `Pathkeys` nil. `pathkeysContainedIn(nil, keys)`
+// is false for every non-empty `keys`, so the sort arm is the only arm the
+// production entry point can take, WHATEVER ordering the child actually has.
+//
+// That is why C-07's second half ("widen the useful-column set so ORDER BY /
+// GROUP BY motivate index paths") is still not landed even though C-11 and
+// C-12 both are: an ordering-only index path that wins the search cannot
+// remove the Sort above it, because nothing carries the news across the seam.
+//
+// The pin is deliberately strongest-form: the child below is ALREADY in the
+// requested order (it is the Sort the producer itself just built, whose
+// pathkeys are exactly `keys`), and the producer still stacks a second Sort
+// on it. Feeding a correctly-sorted child and getting a redundant Sort is
+// exactly the plan the widening would buy today.
+//
+// Flip this test — Sort-over-Sort becomes the child handed back — in the cut
+// that plumbs `Pathkeys` across the search boundary. It is C-12a's
+// red-then-green marker at the CONSUMER, the twin of
+// `TestAddOrderedIndexPathsGateIsCompleteButGenerationStaysShut` at the
+// producer.
+func TestCreateOrderedPathsInputArmIsUnreachableFromANode(t *testing.T) {
+	cp := defaultCostParams()
+	keys := upperOrderedKeys()
+
+	sorted, ok := createOrderedPaths(newUpperRels(), upperOrderedInput(10), keys, 0, cp, 0, -1).(*Sort)
+	if !ok {
+		t.Fatal("the first call must emit a Sort (it is the unordered arm)")
+	}
+	// `sorted` delivers `keys` by construction. Hand it back as the CHILD.
+	again := createOrderedPaths(newUpperRels(), sorted, keys, 0, cp, 0, -1)
+	if again == Node(sorted) {
+		t.Fatal("the input arm fired from a Node: the seam now carries Pathkeys — " +
+			"flip this test and re-open C-12a (widen addOrderedIndexPaths' useful-column set)")
+	}
+	if _, ok := again.(*Sort); !ok {
+		t.Fatalf("got %T; want a redundant *Sort over an already-sorted child", again)
+	}
+	// The reason, pinned directly rather than inferred: the Node→Path bridge
+	// carries no ordering, so `addOrderedPaths` cannot see one.
+	rel := fetchUpperRel(newUpperRels(), UpperOrdered, 0, 0)
+	sizeUpperRelFromNode(rel, sorted)
+	if seed := newPrebuiltPath(rel, sorted); len(seed.Pathkeys) != 0 {
+		t.Fatalf("newPrebuiltPath now carries %d pathkeys; the seam changed", len(seed.Pathkeys))
+	}
+}

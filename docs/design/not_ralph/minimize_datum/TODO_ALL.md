@@ -763,7 +763,9 @@ rule).*
   captures on the same cluster, one per flag value — and delete the flag
   when they come back identical. Ledger `c06-collapse-flip-moves-q13`.
 - [~] **C-07 P3-06 — DERIVATION + GATE LANDED 2026-09-05; the "motivate
-  index paths" half is BLOCKED on C-11/C-12.**
+  index paths" half RE-ADJUDICATED 2026-09-07 and still BLOCKED — the
+  blocker moved from C-11/C-12 (both landed, neither unblocked it) to the
+  SEARCH BOUNDARY.**
   Landed: `chooseQueryPathkeys` reproduces `standard_qp_callback`'s
   precedence exactly (group ?: window ?: longer(distinct, sort) ?: setop),
   derived against the FROM-level resolve context so the pathkeys carry the
@@ -782,14 +784,50 @@ rule).*
   ordering-only index path could therefore only lose on cost, win
   `CheapestStartup` under a LIMIT while a redundant Sort still runs, or
   silently disable `applyIndexOrderedGroupingRule`. That is unmotivated
-  plan churn, so it was not forced. The consumer is C-11 (`ORDERED` upper
-  rel) + C-12 (real upper-rel `PathSort`); once either exists the widening
-  is a map union at one line.
+  plan churn, so it was not forced. The consumer was filed as C-11
+  (`ORDERED` upper rel) + C-12 (real upper-rel `PathSort`); the widening
+  itself is a map union at one line.
   Gates: 6 new test groups incl. a DECISION test
   (`TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot`) that pins
   the gate saying yes while the producer emits nothing, and names C-11/C-12
   as the item that flips it red-to-green; optimizer suite; TPC-H values
   24/24 MATCH; plans BYTE-IDENTICAL; plan-gate PASS.
+  **RE-ADJUDICATION 2026-09-07 (C-11 and C-12 both `[x]` since 2026-09-06):
+  the blocker is NOT cleared, and the widening stays unlanded.** The three
+  failure modes were re-checked against the current tree and all three are
+  still live, and the check was a MEASUREMENT, not a re-reading — the
+  widening was implemented in a throwaway worktree and instrumented:
+  (i) the widening works — unioning the query-pathkey columns into
+  `colExprs` takes `btg`'s useful set from `[w]` to `[w x]` on
+  `… WHERE btg.w = oth.k ORDER BY btg.x`, and `addOneOrderedIndexPath`
+  adds a real `index.ordered` path on the (x, y) index;
+  (ii) no plan moves — not on cost and not under `enable_seqscan = off`;
+  `finalPath` returns `pathkeys=0`, `planJoinlistSearch` still publishes
+  `r.node`, and `createOrderedPaths` (C-12's producer) consumes a NODE
+  whose only Node→Path bridge, `newPrebuiltPath`, leaves `Pathkeys` nil —
+  so C-12's `upper.ordered.input` arm is unreachable from production and
+  its Sort is unconditional in fact. C-11's ORDERED rel exists but has
+  nothing ordered to receive.
+  (iii) the `indexOrderedAggInput` regression risk is unchanged: it still
+  matches on the child being a bare `*SeqScan`.
+  **New, independent blocker found:** `addOrderedIndexPaths` runs only
+  inside the PG-shaped join search, and `tryPGShapedJoinSearch` declines at
+  `nrels < 2` (joinsearchseam.go), so a single-table
+  `SELECT … FROM t ORDER BY t.pk` — the canonical shape the widening is
+  meant to serve — never reaches the producer at all.
+  **Unblocker, now named precisely:** a search boundary that publishes the
+  chosen PATH (or at least its `Pathkeys`) instead of a bare Node. Ledger
+  row `c07-widening-blocked-on-seam-pathkeys`.
+  Test changes landed with this re-adjudication (comment-and-test only —
+  the production diff is comments, zero behaviour change, so no cluster
+  gate applies): the decision test is RENAMED and rewritten to record the
+  measured verdict rather than the superseded C-11/C-12 prediction
+  (`TestAddOrderedIndexPathsGateIsCompleteButGenerationStaysShut`), and a
+  consumer-side twin was added that pins the blocker itself —
+  `TestCreateOrderedPathsInputArmIsUnreachableFromANode` feeds
+  `createOrderedPaths` a child that is ALREADY in the requested order and
+  asserts it still stacks a redundant Sort. Gates: `go vet` clean,
+  optimizer suite ok, `RALPH_PRECOMMIT_SCOPE=units` full pass.
   Known divergence recorded: group/sort matching is on the written
   expression after alias substitution, not PG's `tleSortGroupRef` identity,
   so `GROUP BY t.a ORDER BY a` misses the match and falls back to ASC —
@@ -2951,6 +2989,7 @@ P6-03/04/05 (load-bearing).
 | C-10d (measurement half) | 2026-09-05 | (this commit) | AST census: 89 boundaries / 41 of 99 TPC-DS; a full pull-up removes only 39% of the blocking ones | so C-11 must cross the boundary regardless; also found CTEs+views are two more routes to the same leaf |
 | C-10c | 2026-09-05 | (this commit) | Phase-4 OJ qual/target placement contract + 5 fixtures; 3 negative controls | found C-16 retires no arm (no reminder) and that goopg has no PlaceHolderVar equivalent |
 | C-07 (derivation half) | 2026-09-05 | (this commit) | query_pathkeys derived with PG's precedence; has_useful_pathkeys completed and made per-rel | inert by design: values 24/24, plans byte-identical; the "motivate index paths" half is evidenced-blocked on C-11/C-12 |
+| C-07 (widening half, re-adjudication) | 2026-09-07 | (this commit) | widening implemented in a throwaway worktree and instrumented: it DOES generate the path (`[w]`→`[w x]`), and no plan moves even at `enable_seqscan=off` | C-11+C-12 landed and did not unblock it — `createOrderedPaths` consumes a Node and `newPrebuiltPath` carries no Pathkeys; plus a new independent blocker, the producer never runs at `nrels<2`. Not forced; decision test rewritten + consumer-side twin added |
 | D-03 | 2026-09-05 | (this commit) | PackedTuple/PackedSlot unreachable; SEVEN R-0 sites armed (design said six) | review REQUEST-CHANGES -> resolved; values 24/24, plans byte-identical; 25 tests |
 | C-10a (cardinality half) | 2026-09-05 | (this commit) | grouping-sets aggregates were priced as ONE set; now summed per set and clamped | values 24/24 + TPC-DS CKMISMATCH=0; PP unchanged; 4 new tests |
 | C-20d | 2026-09-05 | (this commit) | **index-probe multiplier calibrated 1.0 -> 2.0: TPC-H suite 138.58 -> 100.79 s (-27%), Q5 5.3x, Q7 2.7x, Q9 1.9x, Q3 2.3x** | values 24/24 + TPC-DS CKMISMATCH=0; plan parity IMPROVED 5/15 -> 6/14; flag retirement stays blocked |
