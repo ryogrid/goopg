@@ -448,6 +448,74 @@ closes in finite time and depends on the filesystem rather than on a peer
 — no cycle, hence no deadlock. Waiters select on `done` and the
 participant's context, returning 57014.
 
+## 5.11. A whole class of items has no witness in either corpus
+
+C-13a (bounded top-N sort) was stopped by its own go/no-go census before
+a line of it was written, and the census result generalises well past that
+item.
+
+`EXPLAIN ANALYZE` over all 99 TPC-DS SF0.5 queries, reading each Sort's
+input off its CHILD (a Sort under a Limit stops at 100 rows, so its own
+`actual rows` says nothing):
+
+| | goopg | PG 18.3 |
+|---|---:|---:|
+| `Sort` that is a `Limit`'s direct child | **77** | 54 |
+| of those, input ≥ 100 000 rows | 3 | 0 |
+| **sorts that spilled** | **0 of 100** | — |
+| **total time in all 77 bindable sorts** | **≤ 119.8 ms of 802 s = 0.015%** | — |
+
+The structural hypothesis was confirmed — goopg really does stack a
+bindable full Sort where PG avoids one, 77 against 54 — and it buys
+nothing, because 54 of the 77 sort an aggregate or window output whose
+rows have already collapsed. Median input is **145 rows**. The design's
+strongest argument, that a bound removes a spill outright, has **no
+witness at all**: nothing spilled, and the largest footprint was 26 MB
+against the 256 MiB threshold.
+
+Combined with §7's finding that the TPC-H corpus contains no `LIMIT`
+whatsoever, the conclusion is corpus-level rather than item-level:
+**no sort-side item has a runtime witness here.** All sorting is under
+0.2% of corpus wall time. C-14 (Incremental Sort) is not the better
+alternative either — goopg's Q67, which is PG's own incremental-sort
+case, runs 1.0 ms over 115,150 rows.
+
+This is why the item was deferred rather than cancelled: the mechanism is
+cheap and correct, the *evidence* is missing. It should be reconsidered on
+a top-N-over-raw-rows corpus (`ORDER BY <ungrouped column> LIMIT k` over a
+large scan or join), which neither suite provides — TPC-H has no LIMIT and
+TPC-DS's LIMITs sit over grouped output.
+
+### 5.11.1 And the census found something larger than the item
+
+Est-vs-actual on the same 100 Sort nodes exposes two unrelated
+row-estimation defects, both 3–5 orders of magnitude, neither previously
+filed (ledger `take3-tpcds-rowest-3-to-5-orders`):
+
+| | example | est | actual |
+|---|---|---:|---:|
+| collapse to 1 | Q78 Hash Left Join | 1 | 245,587 |
+| | Q47 CTE Scan | 1 | 43,626 |
+| | Q28 Seq Scan on `store_sales` (×6) | 1 | ~15,400–18,400 |
+| over-estimate | Q99 HashAggregate | 720,657 | 90 |
+| | Q62 HashAggregate | 359,432 | 150 |
+| | Q22 HashAggregate (5 grouping sets) | 9,460,201 | 11,987 |
+
+22 of 100 Sort inputs are estimated at exactly 1 against 100+ actual rows.
+The Q28 cases matter most because they are plain base-relation scans — a
+Seq Scan estimated at one row is a selectivity collapse, not a grouping
+artefact. The over-estimates were checked against C-10a and are **not**
+its grouping-sets summing, which is PG-faithful; the error is inside the
+per-set `estimateNumGroups`.
+
+This belongs in a performance report because of what it implies about
+everything else in it: **a cost model cannot rank plans on estimates that
+are wrong by five orders of magnitude.** C-13b's `limit_tuples` branch
+conditions compare against these numbers, C-19f's parallel crossover is a
+cost comparison, and the spill-cost work prices bytes as rows × width. And
+no gate in this repository catches it — the values gate compares results,
+plan parity compares shapes, and neither one looks at `rows=`.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
