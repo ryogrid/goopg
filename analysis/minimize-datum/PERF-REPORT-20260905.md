@@ -1079,6 +1079,74 @@ width** belongs, which would have modelled a 2-column row and suppressed
 the disk charge entirely; the agent declined that line and pinned the
 distinction instead.
 
+## 5.20. Track E closed: three drops, one delivered, all measured
+
+The four remaining executor items were adjudicated rather than assumed.
+Three are dropped and one delivered, and **the executor carries no
+behaviour change from any of them** — the instruments built to decide them
+were reverted and preserved as a patch.
+
+**E-07 (Gather slab parity) — dropped.** Its own resume condition was
+"measure the dispatch delta on a parallel witness shape FIRST". Measured
+in-process, both arms in one binary, over the exact three-node chain a
+worker subtree has: legacy **27.18 ms/iter**, slab **27.84 ms/iter** — the
+slab is **2.2% SLOWER**, ranges overlapping, allocations equal. Per-row
+work is 544 ns, so three saved interface calls cap the effect at ~1.8%
+before a line is written. Two of its three justifications were already
+void.
+
+**E-13 (owned-row tightening) — dropped.** Its gate was "only if a later
+alloc arm shows a residual". Whole-suite census: **509,824 dead Datum
+cells of 228,212,960 — 24.5 MB of 10,954 MB, 0.22%** — from four small
+sites, because every multi-million-row build side already carries
+`bound=deformBoundFull` from P4-01's Project. Second and stronger: E-13's
+mechanism *is* the prefix truncation the EX1-04 review declined, and a
+prefix is a special case of Cut B's keep-set.
+
+**E-14 Cut A — dropped; Cut B quantified.** TPC-H has **4 Semi/Anti hash
+builds against 43 INNER**, and all four are already at `buildWidth = 1`
+— P4-01 got there first, exactly as the design's §8b predicted. Total
+Semi/Anti retained rows suite-wide: **14,747 rows = 0.7 MB against
+10,954 MB, one part in 15,000.** Cut B is where the mass is and now has a
+number for the first time: 99.99% of the 10,954 MB is INNER, largest
+single site **6,001,255 rows × 16 cols = 4,609 MB, 288 MB per dead
+column**. It stays deferred for a *structural* reason rather than the
+previous circumstantial one — its geometry half is forfeited until
+`hashsize.EntryBytes` prices the retained width, so landing it first buys
+the memory and none of the `nbatch` win E-12 and D-05 are waiting on.
+
+**E-09c — delivered.** It is a measurement item, and here is the
+measurement (300k-row cooperative build, 3 reps):
+
+| producers | build wall | producer blocked (each) | consumer blocked |
+|---|---:|---:|---:|
+| 2 | 161.9 ms | 32.9 ms (20%) | 6.0 ms |
+| 4 | **139.6 ms** | 83.5 ms (60%) | 0.0 ms |
+| 8 | 172.0 ms | 132 ms (77%) | 0.0 ms |
+
+**The cooperative build is consumer-bound and saturates at ~4 producers**:
+4 → 8 loses 23% of build wall for 3.2× the stall, and past 4 the consumer
+never waits at all. **Skew does not move the bottleneck** — it is already
+entirely at the consumer, which is the skew half's answer stated as the
+negative result it is.
+
+### 5.20.1 The finding worth more than the items
+
+`parallelBuildLazyHashTable` sets `maxProducers = ctx.MaxParallelWorkers`
+with a floor of 2 and **no ceiling**, so an 8-worker cluster spawns 8
+producer goroutines and 8 arenas for a build that stops improving at 4.
+Routed rather than changed — it is a default and needs its own A/B on a
+quiet host plus a GUC decision. The structural fix is PG's shape:
+`nodeHash.c`'s `PHJ_BUILD_HASH_INNER` has **every participant** call
+`ExecParallelHashTableInsert` behind a barrier, with no single-consumer
+funnel at all. Ledger `take3-E-09c-consumer-bound`.
+
+**Measurement honesty note.** The host was held by three peer agents at
+load 18–30 throughout, so every cluster wall-clock number from that window
+is void as timing and no verdict rests on one. Both timing verdicts
+(E-07, E-09c) were taken **in-process, both arms in the same binary and
+the same run**, which is what makes them survive the contention.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
