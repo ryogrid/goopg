@@ -232,6 +232,31 @@ records what has to be measured before it moves:
   gate for this flip is TIMING, per query, on the moved plans.
 - **TPC-DS SF0.5 sweep** for the values arm.
 
+### 5.1 Measured while writing the pins: a base-rel Gather cannot win today
+
+Sharper than the risk above, and quantitative. With only BASE-relation partial
+paths, **every row of the relation crosses the Gather**:
+
+- charge = `parallel_setup_cost` + `parallel_tuple_cost` × rows = 1000 + **0.1
+  per row**;
+- saving = the CPU share the workers take off = `cpu_tuple_cost` × rows ×
+  (1 − 1/divisor) ≈ **0.0075 per row** at 4 workers.
+
+The charge is an order of magnitude larger, and at a relation big enough to
+clear `min_parallel_table_scan_size` the tuple term alone exceeds the whole
+scan's cost. So `add_path` correctly DOMINATES the base-rel Gather with the
+serial scan at any relation size — no reduction in the subpath's price can
+rescue it. (`addBaseRelPartialPaths` prices CPU over the rel's POST-restriction
+row count, so goopg does not even get PG's selective-scan case, where the
+saving is over `baserel->tuples` and only the survivors cross the boundary.
+That is C-19b's calibration, not this slice's, and it is worth revisiting when
+the mode is measured.)
+
+This is the same reason PG's Gather ends up above joins and aggregates rather
+than over a raw scan, and it is the quantitative form of the paragraph above:
+**C-19d cannot pay for itself until C-19f/g shrink what crosses the boundary.**
+The mechanism is what this slice owes; the win is C-19f's to collect.
+
 Until then the switch is a measurement instrument, which is the same shape
 `GOOPG_INDEX_PROBE_MULT` had before its calibration was run — and that knob's
 history (shipped at the value its own comment called wrong; 1.0→2.0 was worth

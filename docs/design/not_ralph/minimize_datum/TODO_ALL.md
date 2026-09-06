@@ -941,11 +941,47 @@ rule).*
   under the pinned stats (hence byte-identical plans) — it is reachable
   and priced, and the two remaining MISSING-NODE entries are other shapes.
   *design: take3 08 §8; gate: take3 09 §5 P5 (PP).*
-- [ ] **C-19d P5-04 `generate_useful_gather_paths`** producing `PathGather`
+- [x] **C-19d P5-04 `generate_useful_gather_paths`** producing `PathGather`
   and `PathGatherMerge` priced by `cost_gather`/`cost_gather_merge`, with
-  `createPlanNode` arms.
-  *design: take3 08 §8; gate: take3 09 §5 P5 (PP, parallel-on + serial
-  control).*
+  `createPlanNode` arms. LANDED 2026-09-06 (`gatherpaths.go`,
+  `createplangather.go`; design `docs/design/planner-c19d-gather-paths/
+  DESIGN.md`). `PartialPathlist` finally has a reader: the cheapest partial
+  path becomes an ordinary candidate on the serial `Pathlist`, priced by
+  `cost_gather` (costsize.c:446 — `gatherCost`'s first search caller since
+  it was written) and `cost_gather_merge` (new `gatherMergeCost`), rows from
+  `compute_gather_rows`. Call sites are PG's three: per joinrel before
+  `set_cheapest`, the same spot in GEQO's `merge_clump`, and per base rel —
+  the last only for a multi-baserel statement, which goopg gets free (a
+  one-item joinlist never enters the search), so TPC-H Q1's post-pass
+  Finalize/Partial split is untouched. `enable_gathermerge` becomes a
+  COUNTED `disabled_nodes` term, the conversion
+  `ParallelSettings.DisableGatherMerge`'s comment asked P5-04 for.
+  `MaybeAddGather` now declines on a tree that already carries a Gather —
+  the coexistence rule AND a correctness stop, since `terminatesPartial`
+  lists `*Gather` but `findPartialSubtree` DESCENDS through it and would
+  have nested a second one. Two executor facts became refusals rather than
+  hopes: `gatherMergeOp` attaches only the seq-scan block allocator (a
+  Gather Merge over a partial INDEX path returns N copies of every row), and
+  `runWorker` ignores `attachParallelScan`'s return value, so
+  `createGatherPlan` panics unless `drivingScan` reaches the built
+  subtree's scan. **Admission is `GOOPG_GATHER_PATHS` = off (default) /
+  top / all, and the default is an OPEN measured question**: partial paths
+  exist on base rels only until C-19f, so an admitted Gather sits BELOW
+  every join while the post-pass puts one above the whole hash-join
+  subtree. Quantified while writing the pins: with the whole relation
+  crossing the boundary, `parallel_tuple_cost`×rows (0.1/row) exceeds the
+  scan's entire cost while the saving is the 0.01/row CPU share — so a
+  base-rel Gather is DOMINATED at any relation size, which is the same
+  reason PG's Gather sits above joins and aggregates. C-19d therefore
+  cannot pay for itself until C-19f/g shrink what crosses it; flipping the
+  default needs the TPC-H A/B (timing per moved plan — a row-count gate
+  cannot catch this class) that this session did not own the cluster for.
+  Gates: `go build ./...`, `go vet`, full `go test ./internal/optimizer/
+  ./internal/executor/` green; units scope of `ralph-precommit-test.sh`
+  green; pgbench smoke green (commit hook).
+  *design: take3 08 §8 + docs/design/planner-c19d-gather-paths/DESIGN.md;
+  gate: take3 09 §5 P5 (PP, parallel-on + serial control) — outstanding,
+  needs the bench cluster.*
 - [ ] **C-19e P5-05 re-decide Gather Merge → Sort → Parallel scan by
   cost** rather than `sortPartialRootPays`' hard-coded decline. If goopg's
   costs still choose leader-side sorting, record it as a permitted
