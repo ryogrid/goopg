@@ -1,11 +1,17 @@
 # Planner + Executor refactor — performance report
 
 Scope: the `docs/design/not_ralph/minimize_datum/TODO_ALL.md` workstream.
-Branch `plan-narrowing-and-etc`. Date 2026-09-05.
+Branch `plan-narrowing-and-etc`. Dates 2026-09-05 and 2026-09-06.
 
 This report states what changed, what it cost or bought, and — with equal
 weight — what could not be measured and what got worse. Every number below
 comes from a run recorded in this repository; nothing is modelled.
+
+Reading order, if you want the argument rather than the list: §2.5 (how the
+27% was found), §5.6 and §5.9 (the two structural findings, which between
+them relocated the blocker for a whole track twice), §5.8 (the executor's
+own win), then §7 — which is the part most likely to change how you read
+the rest.
 
 ## 1. Headline
 
