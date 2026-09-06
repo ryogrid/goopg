@@ -1125,11 +1125,11 @@ type seqScanOp struct {
 	// claimed from a shared atomic allocator instead of being incremented
 	// locally, so N workers' blocks partition the relation. Everything else
 	// in this struct stays per-worker — the pin, the decode buffer, the
-	// emitted slot, the per-page arena, the ring and the prefetch watermark.
+	// emitted slot, the per-page arena and the ring.
 	// P4 of docs/design/parallel-query/ (chapter 04).
-	pscan *parallelScanState
-	slotMax  int
-	pinned   *storage.Slot
+	pscan   *parallelScanState
+	slotMax int
+	pinned  *storage.Slot
 
 	// activePage holds the current page bytes regardless of source
 	// (pool slot or ring buffer). Set alongside pinned (for pool) or
@@ -1142,11 +1142,6 @@ type seqScanOp struct {
 	// evicting pool pages.  Activated when nBlocks > pool.Capacity()/4.
 	ring *storage.ScanRing
 
-	// prefetchedThru is the highest block (exclusive) we've
-	// already issued a Pool.Prefetch hint for. SeqScan walks
-	// blocks strictly forward, so the prefetcher just needs to
-	// keep `seqScanLookahead` blocks ahead of curBlock.
-	prefetchedThru storage.BlockNumber
 
 	// scanRow is the per-Next() decode buffer (M0054-0005a). The
 	// pre-fix path called `DecodeRow` on every visible tuple,
@@ -1257,53 +1252,6 @@ func renderHeapACLColumnInto(cat catalog.Catalog, tbl *catalog.Table, cols []cat
 		}
 		return
 	}
-}
-
-// seqScanLookaheadDefault is the number of blocks ahead of the current
-// scan position seqScanOp keeps prefetched. Mirrors upstream's
-// `effective_io_concurrency` default scope and is enough to
-// pipeline a single sequential scan against typical SSD
-// latencies. A future loop turns this into a tunable GUC.
-const seqScanLookaheadDefault storage.BlockNumber = 4
-
-// seqScanLookaheadMax bounds the hint window. Same ceiling as
-// aio.MaxReadStreamLookahead so a depth experiment cannot fan an
-// unbounded number of 8 KB prefetch buffers out of Pool.Prefetch.
-const seqScanLookaheadMax storage.BlockNumber = 256
-
-// seqScanLookahead is the effective hint depth, read once from
-// GOOPG_SEQSCAN_LOOKAHEAD (E-11 / EX5-04 depth-policy measurement).
-// Unset or unparsable keeps the default; 0 disables the hints
-// entirely (pure synchronous reads); values above the cap clamp.
-// Measurement knob only — it is not a GUC and has no PG analogue
-// beyond effective_io_concurrency's role in read_stream.c.
-//
-// E-11 CLOSED 2026-09-06 (decline): the sweep over {0,4,16,64,128} is
-// a five-way A/A at the server default, because refillPrefetchWindow
-// below returns early for a parallel scan and every TPC-H plan at
-// bench settings is parallel. With parallelism forced off the window
-// IS live and depth 4 measures WORSE than depth 0 (-12.1% on a serial
-// 7-query subset, -35.0% on Q6, 2.85x the allocation objects) — the
-// cost is Pool.Prefetch discarding its 8 KiB buffer per hint, not the
-// depth. The knob is kept as the apparatus to re-check that after
-// bufpool's Prefetch is fixed; the default is deliberately unchanged.
-// Numbers + protocol: analysis/executor-refactor/e11-depth-sweep-20260906/,
-// ledger take3-E-11-readstream-declined / -prefetch-discards-buffer.
-var seqScanLookahead = seqScanLookaheadFromEnv(os.Getenv("GOOPG_SEQSCAN_LOOKAHEAD"))
-
-func seqScanLookaheadFromEnv(v string) storage.BlockNumber {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return seqScanLookaheadDefault
-	}
-	n, err := strconv.ParseUint(v, 10, 32)
-	if err != nil {
-		return seqScanLookaheadDefault
-	}
-	if storage.BlockNumber(n) > seqScanLookaheadMax {
-		return seqScanLookaheadMax
-	}
-	return storage.BlockNumber(n)
 }
 
 // validateInheritedColumnTypes mirrors PostgreSQL's make_inh_translation_list
@@ -1765,7 +1713,6 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.curBlock = 0
 	o.curSlot = 0
 	o.slotMax = 0
-	o.prefetchedThru = 0
 	// TABLESAMPLE (M0134-0175). Built here rather than in newSeqScanOp because
 	// the arguments are expressions that need a live Context to evaluate, and
 	// upstream likewise defers them to BeginSampleScan (nodeSamplescan.c:225)
@@ -1802,32 +1749,7 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	if o.pscan == nil && ctx.Pool != nil && int(n) > ctx.Pool.Capacity()/4 {
 		o.ring = storage.NewScanRing(ctx.Pool, o.rel)
 	}
-	o.refillPrefetchWindow(o.rel)
 	return nil
-}
-
-// refillPrefetchWindow keeps `seqScanLookahead` blocks ahead of
-// curBlock prefetched via Pool.Prefetch. With prefetching
-// disabled (no AIO engine attached) Pool.Prefetch is a no-op,
-// so this loop is cheap.
-func (o *seqScanOp) refillPrefetchWindow(rel storage.RelFileNode) {
-	// P4 (chapter 04 §4.2): prefetch is disabled for a parallel scan. With a
-	// shared allocator a worker's next block is no longer curBlock+1 — it is
-	// whatever the allocator hands out — so a per-worker lookahead window
-	// prefetches blocks this worker will probably never read, and N workers
-	// would each do it. The I/O concurrency prefetch emulates is supplied
-	// directly by N workers each issuing a synchronous page read.
-	if o.pscan != nil || seqScanLookahead == 0 {
-		return
-	}
-	target := o.curBlock + seqScanLookahead
-	if target > o.nBlocks {
-		target = o.nBlocks
-	}
-	for o.prefetchedThru < target {
-		o.ctx.Pool.Prefetch(storage.BufferTag{Rel: rel, Block: o.prefetchedThru})
-		o.prefetchedThru++
-	}
 }
 
 // releaseScanState drops every resource the scan holds between Open and
@@ -1905,12 +1827,10 @@ func (o *seqScanOp) rewind() error {
 	o.curBlock = 0
 	o.curSlot = 0
 	o.slotMax = 0
-	o.prefetchedThru = 0
 	o.sctx.Reset()
 	if o.pscan == nil && o.ctx.Pool != nil && int(n) > o.ctx.Pool.Capacity()/4 {
 		o.ring = storage.NewScanRing(o.ctx.Pool, o.rel)
 	}
-	o.refillPrefetchWindow(o.rel)
 	return nil
 }
 
@@ -2368,10 +2288,6 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 		if o.sctx != nil {
 			o.sctx.Reset()
 		}
-		// As the scan walks forward, top up the prefetch window
-		// so the next-but-one block is being read by the AIO
-		// engine while we decode the current page.
-		o.refillPrefetchWindow(rel)
 	}
 }
 

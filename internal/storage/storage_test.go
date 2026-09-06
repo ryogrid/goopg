@@ -946,11 +946,19 @@ func TestPrefetchBlockOutOfRange(t *testing.T) {
 	}
 }
 
-// TestPoolPrefetchDisabledIsNoOp pins the default-off behaviour:
-// SetPrefetchEnabled is false at construction so seqScan-style
-// callers that fire Prefetch don't trigger any I/O on
-// AIO-engine-less deployments.
-func TestPoolPrefetchDisabledIsNoOp(t *testing.T) {
+// TestPoolPinFiresNoSpeculativeReads is the regression guard for the
+// Pool.Prefetch removal (docs/design/storage-prefetch-buffer/DESIGN.md).
+// The Pool used to expose Prefetch(tag), which allocated a fresh 8 KiB
+// buffer, submitted a read of the block into it through the AIO engine, and
+// then DROPPED the buffer — the read could never serve the following Pin, so
+// its only effect was warming the OS page cache while costing 63.8% of the
+// process's allocation objects on a serial TPC-H Q6. The Pool must now issue
+// exactly the reads Pin needs and nothing speculative: with an engine
+// attached, walking every block of a relation through Pin returns the right
+// bytes and fires ZERO engine submits (Pin reads synchronously via
+// Manager.ReadBlock). A non-zero count means a speculative read has been
+// reintroduced into the buffer pool.
+func TestPoolPinFiresNoSpeculativeReads(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
@@ -964,62 +972,34 @@ func TestPoolPrefetchDisabledIsNoOp(t *testing.T) {
 	defer pool.Close()
 
 	rel := RelFileNode{DBOid: 1, RelOid: 17100, Fork: MainFork}
-	page := make(Page, BlockSize)
-	_ = InitPage(page)
-	if _, err := mgr.Extend(rel, page); err != nil {
+	const nblk = 6 // > Slots, so the walk also exercises eviction
+	for b := 0; b < nblk; b++ {
+		page := make(Page, BlockSize)
+		_ = InitPage(page)
+		// Stamp the block number so a mixed-up slot is detectable.
+		page[BlockSize-1] = byte(b)
+		if _, err := mgr.Extend(rel, page); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pool.FlushAll(); err != nil {
 		t.Fatal(err)
 	}
+	pool.InvalidateRel(rel)
+	eng.submits = nil
 
-	pool.Prefetch(BufferTag{Rel: rel, Block: 0})
+	for b := 0; b < nblk; b++ {
+		s, err := pool.Pin(BufferTag{Rel: rel, Block: BlockNumber(b)})
+		if err != nil {
+			t.Fatalf("Pin block %d: %v", b, err)
+		}
+		if got := s.Page()[BlockSize-1]; got != byte(b) {
+			t.Errorf("block %d: stamp %d, want %d", b, got, b)
+		}
+		pool.Unpin(s)
+	}
 	if got := len(eng.submits); got != 0 {
-		t.Errorf("disabled Prefetch fired %d submits, want 0", got)
-	}
-}
-
-// TestPoolPrefetchEnabledFiresThroughEngine pins the enabled
-// path: with prefetching on and an engine attached, every
-// non-cached Prefetch call submits one read through the engine.
-// A subsequent Prefetch for an already-cached tag is a no-op.
-func TestPoolPrefetchEnabledFiresThroughEngine(t *testing.T) {
-	dir := t.TempDir()
-	mgr := NewManager(ManagerConfig{DataDir: dir})
-	defer mgr.Close()
-
-	eng := &recordingAIOEngine{}
-	mgr.SetAIO(eng)
-	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	pool.SetPrefetchEnabled(true)
-
-	rel := RelFileNode{DBOid: 1, RelOid: 17101, Fork: MainFork}
-	page := make(Page, BlockSize)
-	_ = InitPage(page)
-	if _, err := mgr.Extend(rel, page); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mgr.Extend(rel, page); err != nil {
-		t.Fatal(err)
-	}
-
-	pool.Prefetch(BufferTag{Rel: rel, Block: 0})
-	pool.Prefetch(BufferTag{Rel: rel, Block: 1})
-	if got := len(eng.submits); got != 2 {
-		t.Errorf("Prefetch fired %d submits, want 2", got)
-	}
-
-	// Pin block 0 so it lands in the pool, then Prefetch it
-	// again — the cached-tag check should suppress the submit.
-	s, err := pool.Pin(BufferTag{Rel: rel, Block: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pool.Unpin(s)
-	pool.Prefetch(BufferTag{Rel: rel, Block: 0})
-	if got := len(eng.submits); got != 2 {
-		t.Errorf("Prefetch on cached tag fired extra submit; submits=%d want 2", got)
+		t.Errorf("Pin walk fired %d speculative engine reads; want 0", got)
 	}
 }
 

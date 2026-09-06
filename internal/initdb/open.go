@@ -963,12 +963,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				" client backends must not drive full-buffer I/O directly")
 		}
 	}
-	// With an AIO engine attached, opt the Pool into prefetching
-	// so heap-scan / future bitmap-scan / ANALYZE callers issuing
-	// `Pool.Prefetch(tag)` hints actually warm the page cache via
-	// the engine's worker pool rather than no-oping.
+	// The Pool's buffer-warming Prefetch hint was removed 2026-09-06 (it
+	// allocated an 8 KiB buffer per hinted block and discarded it; removing
+	// it is 11.2% faster on a cold page cache and 11.1% warm — see
+	// docs/design/storage-prefetch-buffer/DESIGN.md). The engine attachment
+	// still drives the checkpointer's batched flushes below.
 	if aioEngine != nil {
-		pool.SetPrefetchEnabled(true)
 		// Batch dirty-page flushes so the checkpointer's
 		// FlushAllPaced pipelines writes through the engine.
 		// Default batch = 8 (small enough that a checkpoint
