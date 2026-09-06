@@ -1351,10 +1351,11 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   re-measuring at 1× once C-19d lands — before, not after, the packing
   work is re-scoped. Preserved patch `tmp/d05p4-*.patch`; re-derive rather
   than re-apply, since its multiplier is now wrong.
-  MEMORY caveat: E-09a shared the BUILD, not the reloaded batch — each
-  participant still materialises its own copy, so D-04's 506 MB live map
-  is still five maps until E-09b lands. Any memory term in a re-derivation
-  must state which of the two it is charging.
+  MEMORY caveat, RESOLVED by E-09b (`d5ce1bb9b`): E-09a shared the BUILD
+  but not the reloaded batch, so D-04's 506 MB live map was still five
+  maps; E-09b makes it one (measured maxLiveLoads 1 vs 4 with four
+  participants). Any memory term in a re-derivation must still state which
+  of the two it is charging, and must now charge ONE reloaded batch, not N.
   Two cheaper facts from the same run: the bucket-array term decides
   NOTHING on TPC-H (zero plans move at multiplier 1) and is dropped from
   this list; and the narrowing patch narrows the INNER only while PG
@@ -1594,13 +1595,64 @@ per arm; values never counts for projection/join-adjacent changes).*
   with C-19c/E-11: TPC-H 24/24 MATCH, plans byte-identical, plan-gate
   exit=0, TPC-DS PASS=95 CKMISMATCH=0, spotcheck RESULT=PASS
   (Q12=2, Q13=34), `-race` green. Unblocks C-19f and the D-05
-  re-measurement; E-09b still open on top.
-- [ ] **E-09b Load-once-per-batch (Variant B).** `sync.Once` per batch +
-  refcount + `ctx.Done()`-aware wait on the shared descriptor — PG's
-  `PHJ_BATCH_LOAD`/`FREE` analogue, and what removes the 5× MEMORY
-  multiplier (D-04's 506 MB live map). The first real cross-worker wait in
-  the executor; cancellation hazard under LIMIT-above-Gather. On top of A.
-  *gate: A's gate + a mandatory cancel-mid-batch test; ~150–200 LOC.*
+  re-measurement; E-09b (load-once-per-batch) LANDED on top, `d5ce1bb9b`.
+- [x] **E-09b Load-once-per-batch (Variant B).** LANDED `d5ce1bb9b`
+  (mechanism) + `b5647d6fa` (gate); design
+  `docs/design/executor-e09a-shared-spilling-build/DESIGN-E09b.md`
+  (`2662a2183`). The shared descriptor carries one `sharedBatchLoad` slot
+  per batch: the first participant to reach batch k loads it, every other
+  one adopts the SAME maps behind a `ctx.Done()`-aware wait, and a refcount
+  frees them when the last holder leaves — PG's `PHJ_BATCH_LOAD`/`FREE`
+  analogue **without the barrier**, because goopg partitions the probe by
+  scan block, so a participant never waits for another to ARRIVE, only for
+  a load already in flight to FINISH.
+  **Not** `sync.Once`, deliberately: `Once.Do` marks the slot done when its
+  function RETURNS, so a loader that returned early (cancelled, or having
+  recovered a panic) would publish an EMPTY table and every waiter would
+  silently probe nothing — this item's wrong-answer class. The slot is a
+  channel closed by a `defer` with `err` pre-set to
+  `errSharedBatchAbandoned`, so a panicking loader hands waiters an error
+  rather than a channel nobody will close.
+  **Why it cannot deadlock:** the loader never waits and never observes
+  cancellation — its work is a bounded local file read with no channel
+  operation, exactly as uninterruptible as Variant A's private reload
+  already was — so `done` always closes and its closure depends on the
+  filesystem, never on a peer. Waiters select on `done` AND their own
+  `ctx.Done()` (57014 via `lockWaitCancelError`); the reference is taken
+  under the descriptor mutex BEFORE the wait and dropped on every exit path.
+  Freeing on `refs==0` CLEARS the slot, so a straggler re-loads from the
+  still-linked file — which bounds the worst case at exactly Variant A's
+  load count.
+  Gate result: full `go test ./internal/executor/` green; `-race` green
+  (the single `-race` failure, `TestSubquerySemanticsMatrix/M20`,
+  reproduces unchanged at E-09a `67204579c` —
+  `buildUnderNilScope` vs `maybeInstrument` on the coop parallel build's
+  producers, ledger candidate, untouched here). Cancel-mid-batch is tested
+  twice: at the protocol level (`TestSharedBatchLoadCancelsWaiters` — the
+  loader still parked, every waiter returns 57014, no leaked reference) and
+  through the real Gather (`cancelled-with-a-waiter-parked`, which holds
+  the loader until `d.waiting >= 1` before cancelling). Memory evidence,
+  measured with every participant held at the same batch
+  (`TestSharedSpillingBuildLoadsOncePerBatch`, 4 participants, 7 batches):
+  **loadCount 7 where Variant A is 28, maxLiveLoads 1 where Variant A is
+  4, maxLiveBytes 140,775 where Variant A is ~563,100** — one live map
+  where there were four. Mutation-checked: stubbing `releaseHeldBatch` to a
+  no-op takes `maxLiveLoads` to 7 and the gate fails. In-situ (unbarriered)
+  figures on the existing shapes: loadCount 7–10 vs 21–35, maxLiveLoads 2–3
+  vs 3–5.
+  E-09a's exactly-once-open invariant is RESTATED, not deleted: it read
+  "every participant opens each inner file once", which *is* the
+  multiplier. It now reads "every open is a claimed load
+  (opens == `loadCount`), no participant opens a batch twice, and no batch
+  is loaded more times than there are participants".
+  **Bench measurement still owed to the gating pass** (the cluster was held
+  by another agent): TPC-H Q9 `EXPLAIN (ANALYZE)` at bench `work_mem` on
+  port 65433, five participants, comparing `Memory Usage:` and peak RSS
+  against the E-09a witness (`Batches: 4`, Build Time 2978.957 ms,
+  Execution 7.85 s) — E-09b must not regress execution time and should
+  show the reload peak once rather than five times; plus the standard
+  combined gate (TPC-H 24/24 values, plans byte-identical, `make
+  plan-gate`, `scripts/tpch-spotcheck.sh`, TPC-DS SF0.5 sweep).
 - [ ] **E-09c Cooperative-stall measurement under skew + worker-count
   scaling on Q9-class shapes** — the original E-09 text, now third.
   *design: take3 13 §7; gate: scaling + skew A/B; Datum-safety tests;
