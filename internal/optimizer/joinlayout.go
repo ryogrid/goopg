@@ -148,128 +148,18 @@ func visitColumnRefsByName(e Expr, fn func(string)) bool {
 // that guard covered every production call, so the pass was already a no-op
 // before it was deleted.
 
-// remapExprRefsToMHJ walks the plan tree and remaps ColumnRef
-// indices.  It first looks for a MultiHashJoin and uses its
-// table list to build a FROM‑order → output‑order position map.
-// If no MHJ is found, it falls back to building a posMap from
-// the SeqScan leaves of a binary join tree.
-func remapColumnRefsAfterRewrite(node Node) Node {
-	remapPosMapAfterRewrite(node, nil)
-	return node
-}
-
-func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
-	if node == nil {
-		return
-	}
-	// walkSubqueryPlans walks an expression tree and recursively
-	// calls remapPosMapAfterRewrite on any SubqueryExpr.Plan or
-	// InExpr.Plan found within. This handles subquery inner plans
-	// that need their own independent remap pass after the outer
-	// plan tree has been rewritten (e.g. MHJ or bushy DP).
-	var walkSubqueryPlans func(Expr)
-	walkSubqueryPlans = func(e Expr) {
-		if e == nil {
-			return
-		}
-		switch x := e.(type) {
-		case *SubqueryExpr:
-			remapPosMapAfterRewrite(x.Plan, nil)
-		case *MultiAssignSubqRow:
-			remapPosMapAfterRewrite(x.Plan, nil)
-		case *InExpr:
-			if x.Plan != nil {
-				remapPosMapAfterRewrite(x.Plan, nil)
-			}
-		case *BinaryOp:
-			walkSubqueryPlans(x.Left)
-			walkSubqueryPlans(x.Right)
-		case *UnaryOp:
-			walkSubqueryPlans(x.Operand)
-		case *FuncCall:
-			for _, a := range x.Args {
-				walkSubqueryPlans(a)
-			}
-		case *CaseExpr:
-			if x.Operand != nil {
-				walkSubqueryPlans(x.Operand)
-			}
-			for _, w := range x.Whens {
-				walkSubqueryPlans(w.When)
-				walkSubqueryPlans(w.Then)
-			}
-			if x.Else != nil {
-				walkSubqueryPlans(x.Else)
-			}
-		case *ExtractExpr:
-			walkSubqueryPlans(x.Source)
-		}
-	}
-	subRemap := func(exprs []Expr) {
-		for _, e := range exprs {
-			walkSubqueryPlans(e)
-		}
-	}
-
-	switch n := node.(type) {
-	case *Join:
-		remapPosMapAfterRewrite(n.Left, nil)
-		// M0062-0005: Semi / Anti joins carry an isolated subquery
-		// scope on their Right (the cloned EXISTS inner plan). Do
-		// not descend with the outer scope's posMap — the inner
-		// plan was already independently optimised by the
-		// recursive `unnestSubqueriesInPlan` call inside
-		// `unnestExistsExpr`, and its ColumnRefs use inner-scope
-		// indices that must not be remapped against outer
-		// bindings.
-		if n.Type != JoinTypeSemi && n.Type != JoinTypeAnti {
-			remapPosMapAfterRewrite(n.Right, nil)
-		}
-		subRemap([]Expr{n.Predicate, n.LeftKey, n.RightKey})
-		return
-	case *Filter:
-		// M0077-0001: Filter wrappers attached above leaf scans
-		// by Slice A carry leaf-local Predicate ColumnRefs (NOT
-		// FROM-cumulative). Skip the cumulative-space posMap.
-		if n.LeafLocal {
-			return
-		}
-		remapPosMapAfterRewrite(n.Child, nil)
-		// The OID-keyed `mhjPosMapOf` that used to run here returned nil
-		// unconditionally (its own comment: OID order is not FROM order, and
-		// it collapsed self-join duplicates) and M0127-P6.2 deleted it with
-		// the rest of the MHJ family. `remapWithBindings`' bindings-keyed
-		// posMap is and was the pass that actually remaps this arm.
-		subRemap([]Expr{n.Predicate})
-		return
-	case *Project:
-		// M0063-0001: skip isolated-scope Projects (view rename wrapper).
-		if n.IsolatedScope {
-			return
-		}
-		remapPosMapAfterRewrite(n.Child, nil)
-		subRemap(n.Targets)
-		return
-	case *Sort:
-		remapPosMapAfterRewrite(n.Child, nil)
-		for i := range n.Keys {
-			subRemap([]Expr{n.Keys[i].Expr})
-		}
-		return
-	case *Aggregate:
-		remapPosMapAfterRewrite(n.Child, nil)
-		subRemap(n.GroupExprs)
-		for i := range n.Aggs {
-			if n.Aggs[i].Arg != nil {
-				subRemap([]Expr{n.Aggs[i].Arg})
-			}
-			if n.Aggs[i].Arg2 != nil {
-				subRemap([]Expr{n.Aggs[i].Arg2})
-			}
-		}
-		return
-	}
-}
+// `remapColumnRefsAfterRewrite` and `remapPosMapAfterRewrite` lived here until
+// C-20b (take3 08 §9.2, 2026-09-07). They were the first of the three
+// post-rewrite remap passes `planSelect` ran, and by the end they mutated
+// NOTHING: `remapPosMapAfterRewrite` took a `posMap func(int) int`, never read
+// it, and its ~110-line body contained no assignment to any `Index` field —
+// every recursive call passed `nil`. The mutation it once performed was the
+// MHJ posmap, deleted with the node by M0127-P6.2; what survived the deletion
+// was the tree walk around it.
+//
+// This is the one deletion in C-20b that needed no census: "the parameter is
+// never read and the body assigns nothing" is a proof, not a measurement.
+// The measured half is `buildBindingsPosMap`'s family below.
 
 // `binaryTreePosMapOf` (dead — nothing had called it for several milestones)
 // and `remapExprRefsToMHJ` (a one-line alias for `remapColumnRefsAfterRewrite`,

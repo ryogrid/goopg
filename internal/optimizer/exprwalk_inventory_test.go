@@ -139,7 +139,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// entirely loses its line.
 	"joinlayout.go:remapByPosMap":           nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
 	"joinlayout.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms; moved from bushy.go at M0127-P6.3
-	"joinlayout.go:remapPosMapAfterRewrite": walkerPending, // 8 of 32 arms; moved from bushy.go at M0127-P6.3
+	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
+	// was deleted by C-20b: the walker mutated nothing — its posMap parameter
+	// was never read — so there was no conversion to finish, only dead weight
+	// to remove. Deleting the line here is how that is audited.
 	// CONVERTED by M0125-0002 commit 7, the LAST of the series. The
 	// recursion is walkExprRefs (scopeSignal); the surviving switch is the
 	// three-arm "reads row data but names no column" veto inside the Visit

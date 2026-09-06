@@ -1493,7 +1493,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// no-op when the package-level kill-switch is off
 	// (`SetNLIEnabled(false)`).
 	node = rewriteJoinsToNLI(node, cat, plannerSet)
-	node = remapColumnRefsAfterRewrite(node)
+	// `remapColumnRefsAfterRewrite(node)` ran here until C-20b (take3 08
+	// §9.2): a tree walk that had mutated nothing since M0127-P6.2 deleted
+	// the MHJ posmap it was built around. joinlayout.go carries the proof.
 	// Second pass: use FROM‑clause bindings to correct any
 	// remaining order differences (OID ≠ FROM order).
 	if len(ctx.bindings) > 0 {
