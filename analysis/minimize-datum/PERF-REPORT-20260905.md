@@ -1299,6 +1299,79 @@ Two corrections came out of this work, and both were mine to make:
   purely because it is decline-biased. Any future item reasoning about
   "unused above" hits that same wall.
 
+## 5.23. C-04c lands with the session's second real win; C-06 blocked on its own gate
+
+**C-04c** admits below-inner and non-first-comma outer links, completing
+the C-04 cut. It produced the second measured TPC-DS improvement of the
+workstream:
+
+| | before | after |
+|---|---:|---:|
+| **Q40** | 1.50 s | **0.92 s** |
+| **Q80** | 13.54 s | **10.57 s** |
+
+Both are LEFT-below-inner, C-04c's exact subject; TPC-DS plan shapes moved
+on those two queries and no others (97 of 99 identical). TPC-H is
+byte-identical and +0.06% — no movement, as expected, since its corpus has
+one LEFT join in total.
+
+The mechanism is worth stating because it is a *widening*, not a deletion.
+`extractSearchLeaves`' `onSpine` flag was doing two jobs at once: an INNER
+join preserves both inputs, so descending one should carry the flag, and
+C-04a cleared it anyway. What actually has to clear it is descending into
+a side that some link null-extends. And the `base != 0` coordinate decline
+— which the file header called unsafe to lift, correctly, because
+`shiftColumnRefsBy` handles 13 of 32 Expr types and `return e`s the rest —
+is now lifted by a re-baser that is **exhaustive over all 32 types by a
+build-time gate and fail-closed on an unknown one**. That is the property
+the old rewriter lacked, and building it is what made the lift safe rather
+than merely possible.
+
+**Two shapes stay declined, and both were measured rather than inherited.**
+The second is the one I got wrong.
+
+### 5.23.1 A prediction I made that the measurement refuted
+
+I told the agent that C-04b's decline pin
+(`TestSeamDeclinesAnOuterLinkUnderARightLinksNullableSide`) was "expected
+to flip to admit — its comment says so". It admitted the shape, and it
+**returned wrong rows**:
+
+```
+nsj_t LEFT JOIN nsj_p ON t.id=p.id RIGHT JOIN nsj_q ON t.id=q.id
+  goopg (admitted):  NULL, NULL, c
+  PG:                   3, NULL, c
+```
+
+Root cause, read off the plan rather than guessed:
+`buildJoinRelRestrictList` classifies the *lower* link's own ON clause as
+an outer-join filter clause for the *upper* link — its relids are a subset
+of the upper SJI's nullable hand — and re-applies it at the upper join,
+filtering exactly the rows that join exists to null-extend. Upstream
+cannot reach this because an applied clause is removed from the per-rel
+`joininfo` lists; goopg re-scans one flat list per pair.
+
+So the pin stays as C-04b wrote it, **contrary to its own comment**, with
+two executor cases pinning the correct rows through the fallback. Ledger
+`c04c-nested-outer-refilters-lower-on-qual`. That is the third time this
+session a plausible expectation of mine was refuted by a measurement the
+agent ran anyway.
+
+**C-06 (retire `GOOPG_PGSHAPED_COLLAPSE`) — blocked on its own gate, and
+nothing was deleted.** The flip is not byte-identical: TPC-H **Q13 moves**,
+and the OFF plan is the PG-parity one — `Index Only Scan using
+customer_pk` + `Hash Left Join` at cost 66,218, against the ON path's
+`Index Scan` + `Merge Left Join` at 338,223. Runtime is a wash (5.40 s vs
+5.47 s, same session, identical digests). Retiring the flag would delete
+the only reachable spelling of a PG-shaped Q13 for no measurable gain —
+the `GOOPG_INDEXKEY_HARVEST` precedent exactly. The item's premise is also
+unmet: the collapse=0 regime is fully alive after C-04c. Ledger
+`c06-collapse-flip-moves-q13` names the real question — why the search
+wins a Merge Left Join at 5× the cost.
+
+One open observation recorded and deliberately not tuned: Q40's printed
+cost *rises* 24 k → 393 k while its runtime *falls* 1.50 → 0.92 s.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
