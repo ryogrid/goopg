@@ -1041,8 +1041,46 @@ rule).*
   GUC-off Unique live on 3 DISTINCT legs with values 38/38; PP identical.
   No re-pin (zero moves). `*Unique` node explicitly NOT built (reuse
   adopted after review killed the EXPLAIN-parity premise).
-- [ ] **C-17 P4-08 `tuple_fraction` end-to-end** (every upper rel, not only
-  the join search).
+- [x] **C-17 P4-08 `tuple_fraction` end-to-end** (every upper rel, not only
+  the join search). LANDED 2026-09-07 after C-18 made "every upper rel"
+  enumerable. Four gaps, found by census rather than by symptom:
+  (i) `ctx.tupleFraction` was stamped in TWO per-arm places (the `WHERE`
+  arm and the outer-link arm), so a WHERE-less statement —
+  `SELECT … FROM t ORDER BY a LIMIT 10` — reached every upper rel claiming
+  all rows were wanted; it is now stamped ONCE at the convergent block every
+  FROM arm passes through, which is upstream's position (`grouping_planner`
+  folds LIMIT/OFFSET at its top, planner.c:1451, before `query_planner`).
+  The join search is unaffected by the move: both arms that call
+  `tryJoinSearch` already stamped it. (ii) the SETOP producer and (iii) the
+  min/max escape hatch's DISTINCT producer were handed a literal `0`.
+  (iv) a set-op statement's trailing ORDER BY was a bare `&Sort{}` with NO
+  ORDERED upper rel at all — the last top-level sort still priced at zero
+  (pre-C-12 state) and the one shape that could not reach C-13b's bounded
+  arm; it now goes through `createOrderedPaths` with the chain's own fraction
+  and `limitTuplesForOrderedSort` bound.
+  **Neither corpus witnesses it, which was predicted, not discovered**:
+  TPC-H has zero set operations, zero window functions and a WHERE on every
+  query; TPC-DS's UNIONs all sit inside subqueries whose ORDER BY belongs to
+  the OUTER select, so `wrapSetOpSortLimit` never sees one. A direct probe on
+  the TPC-H cluster is therefore the witness, and it is unambiguous —
+  `lineitem UNION ALL orders ORDER BY 1`, 2 000 672 rows: with `LIMIT 10` the
+  Sort's startup falls 344 423.57 → 178 266.51 (C-13b's bounded heap arm,
+  `N log2 2K`, firing for the first time on this shape), and WITHOUT a LIMIT
+  it RISES 344 423.57 → 433 323.57 (`costSortRun`'s external-merge arm over
+  a rel that is now sized — the spill the bare `&Sort{}` never charged).
+  Both directions are the correction, not a regression: the pricing is now
+  the same `cost_tuplesort` every other sort in the tree pays.
+  Gates on isolated C-18+C-17-only A/B: optimizer+executor suites + vet +
+  `RALPH_PRECOMMIT_SCOPE=units` green; TPC-H plan capture byte-identical,
+  digests byte-identical 24/24, plan-gate exit 0, PLAN-PARITY 5/15/2
+  unchanged, timing +1.5% on identical plans (noise); TPC-DS SF0.5 sweep
+  PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, and the raw plan
+  capture (COSTS INCLUDED, not shape-normalised) is BYTE-IDENTICAL to
+  C-18's, 0 diff lines. No re-pin. Pinned by a static census
+  (`tuplefraction_upper_test.go`): no producer may be called with a literal
+  0, `ctx.tupleFraction` may be assigned exactly once, and the producer list
+  itself is checked against every `func create*Paths` in the package so the
+  census cannot silently narrow.
   *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
 - [x] **C-18 P4-09 `create_window_paths`** + set-operation paths, priced.
   DESIGNED 2026-09-07: `docs/design/planner-p4-window-setop-paths/DESIGN.md`

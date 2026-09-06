@@ -678,7 +678,14 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 // operation. Per SQL, sort keys reference the combined result's output
 // columns only — by 1-based position or by output column name — not arbitrary
 // expressions over the input relations. M0097-0024.
-func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+// C-17 (P4-08): `upper` is the statement's upper-rel registry and
+// `tupleFraction` its `root->tuple_fraction`, so the trailing ORDER BY builds
+// the ORDERED upper rel through `createOrderedPaths` instead of a bare
+// `&Sort{}`. Before this, a set-op statement was the one shape whose top-level
+// sort was still priced at zero (the pre-C-12 state) and whose LIMIT could not
+// reach `cost_tuplesort`'s bounded arm (C-13b) — `UNION … ORDER BY … LIMIT n`
+// is the exact shape that arm exists for.
+func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope, upper *upperRels, tupleFraction float64) (Node, error) {
 	out := node.Output()
 	ctx := newResolveContext(nil, out, ps)
 	ctx.cat = cat
@@ -713,7 +720,12 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog, ps
 			}
 			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
-		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+		// C-17: the ORDERED upper rel, with the same `limit_tuples` bound the
+		// non-set-op ORDER BY site derives (`limitTuplesForOrderedSort`,
+		// resolved against `ctx` — the set-op output context built above, the
+		// one the LIMIT clause's own resolution uses a few lines below).
+		node = createOrderedPaths(upper, node, keys, s.Pos(), ps.costParams(),
+			tupleFraction, limitTuplesForOrderedSort(s, ctx))
 	}
 
 	if s.Limit != nil || s.Offset != nil || s.WithTies {
@@ -973,6 +985,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		savedOrderBy := s.OrderBy
 		savedLimit := s.Limit
 		savedOffset := s.Offset
+		// C-17 (P4-08): the WHOLE chain's `root->tuple_fraction`, taken from
+		// the clauses just saved — they are about to be nil'd for the branch
+		// recursion, and this is the only point at which the set-op
+		// statement's own LIMIT/OFFSET are both present and known to belong
+		// to the chain rather than to a branch. It feeds the SETOP rel below
+		// and the ORDERED rel `wrapSetOpSortLimit` builds at the end, which
+		// were the last two producers still being handed a literal 0.
+		setOpTupleFraction := searchTupleFraction(savedLimit, savedOffset)
 		s.OrderBy = nil
 		s.Limit = nil
 		s.Offset = nil
@@ -1049,14 +1069,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// branches and the set work and rebuilds the node through
 			// `createPlanNode`. Single candidate (goopg's `setOp` has one
 			// executor form per node), so the emitted node is field-for-field
-			// the one built here. `tupleFraction` is 0 until C-17 threads the
-			// statement's fraction to this site.
+			// the one built here. C-17 threads the chain's own tuple
+			// fraction in.
 			//
 			// Only the genuine set operation is filed here. The
 			// partition/inheritance fan-outs also build `*SetOp{All: true}`,
 			// but those are PG APPENDRELS below the upper-rel pipeline, not
 			// set operations — see windowsetoppaths.go's header.
-			return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll}, plannerSet, 0)
+			return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll}, plannerSet, setOpTupleFraction)
 		}
 		// foldSetOpRange folds segments[lo:hi) onto acc, honouring PostgreSQL's
 		// set-operator precedence: INTERSECT binds tighter than UNION/EXCEPT
@@ -1123,7 +1143,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// operation and references the combined output columns by name
 		// or 1-based position (PostgreSQL §7.6). copyselect uses
 		// `… UNION … ORDER BY 1`. M0097-0024.
-		return wrapSetOpSortLimit(s, left, cat, plannerSet, scope)
+		return wrapSetOpSortLimit(s, left, cat, plannerSet, scope, upper, setOpTupleFraction)
 	}
 	// A grouping node stands for a parenthesised set-op operand with nothing
 	// left of its own chain to fold — `(A UNION B) ORDER BY 1 LIMIT 2`, or the
@@ -1140,7 +1160,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		if err != nil {
 			return nil, err
 		}
-		return wrapSetOpSortLimit(s, operand, cat, plannerSet, scope)
+		// C-17: a grouping node's own trailing sort/limit belongs to the
+		// parenthesised operand it wraps; its fraction is this statement's.
+		return wrapSetOpSortLimit(s, operand, cat, plannerSet, scope, upper, searchTupleFraction(s.Limit, s.Offset))
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
@@ -1248,6 +1270,26 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// like the fields above. Sublink planners without the pointer
 		// at hand read it back via rtableScopeFrom's parent walk.
 		ctx.rtScope = scope
+		// C-17 (P4-08): `root->tuple_fraction`, stamped HERE — the
+		// convergent point every FROM arm reaches, before the join search
+		// and before any upper rel is fetched. That is upstream's position:
+		// `grouping_planner` folds LIMIT/OFFSET into the fraction at its
+		// very top ("Tweak caller-supplied tuple_fraction if have
+		// LIMIT/OFFSET", planner.c:1451) and only then calls
+		// `query_planner`, so EVERY rel it later fetches — search rels and
+		// the six upper rels alike — sees the same number.
+		//
+		// It used to be stamped in TWO places instead (the `s.Where != nil`
+		// arm and the outer-link arm below), which covered the join search
+		// but left a WHERE-less statement at zero: `SELECT … FROM t ORDER BY
+		// a LIMIT 10` reached `create_ordered_paths` claiming all rows were
+		// wanted, so `ConsiderStartup` was false on the ORDERED rel and
+		// `getCheapestFractionalPath` degenerated to cheapest-total. The
+		// search's own behaviour is unchanged by the move: both arms that
+		// call `tryJoinSearch` already stamped it, and this assignment is
+		// the same pure `searchTupleFraction` call, just earlier and
+		// unconditional.
+		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 	}
 
 	// preDPUnnested marks that the S5a pre-DP path already ran the
@@ -1338,14 +1380,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				return nil, err
 			}
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
-			// M0127-P5.9-b: `root->tuple_fraction`, fixed before the join
-			// search below builds its first rel — upstream's order
-			// (`preprocess_limit` in `subquery_planner`, before
-			// `query_planner`). The `*Limit` node is built ~350 lines below,
-			// far too late to influence which path the search selects, so the
-			// fraction is derived from the unresolved clauses; see
-			// `searchTupleFraction` for why they are not resolved early.
-			ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
+			// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
+			// inside the WHERE arm, until C-17 (P4-08) moved it to the
+			// convergent stamping block above — same call, same value, but
+			// reached by every FROM arm rather than only the two that run the
+			// join search. See the comment there.
 			// C-07: `standard_qp_callback` runs here for the same reason
 			// `preprocess_limit` does — before `query_planner` builds a rel.
 			ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
@@ -1410,10 +1449,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// The search is invoked with a nil predicate (an empty conjunct
 		// list); a declined search returns the tree untouched, and a residual
 		// can only arise from unconsumed ON quals, which the Filter below
-		// preserves exactly as the *Filter arm's does. `tupleFraction` and
-		// the needed-column set are populated here for the same reason the
-		// WHERE arm populates them: the search reads both.
-		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
+		// preserves exactly as the *Filter arm's does. The needed-column set
+		// is populated here for the same reason the WHERE arm populates it:
+		// the search reads it. (`tupleFraction` was stamped for both arms at
+		// the convergent block above — C-17.)
 		// C-07: as in the `*Filter` arm above.
 		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
@@ -1525,7 +1564,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	if rewritten, ok, err := rewriteMinMaxAggregates(s, ctx, cat); err != nil {
 		return nil, err
 	} else if ok {
-		if wrapped, wrapOK := wrapMinMaxOrderByDistinct(s, rewritten, cat, plannerSet); wrapOK {
+		if wrapped, wrapOK := wrapMinMaxOrderByDistinct(s, rewritten, cat, plannerSet, upper, orderTupleFraction); wrapOK {
 			return wrapped, nil
 		}
 	}
@@ -10465,7 +10504,14 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 // substituteMinMaxOrderByExpr). The caller then falls through to today's
 // exact (pre-S19) behavior — a declined rewrite is always correct, a wrong
 // wrap is not.
-func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog.Catalog, ps PlannerSettings) (Node, bool) {
+// C-17 (P4-08): `upper` and `tupleFraction` are the statement's registry and
+// `root->tuple_fraction`, threaded so this escape hatch's ORDER BY / DISTINCT
+// build the same upper rels — under the same fraction — as the ordinary
+// grouping tail. It was the last site handing a producer a literal 0.
+// The rewrite's output is a single InitPlan row, so no selection can turn on
+// the number here; threading it is what makes "every upper rel sees the
+// fraction" a property of the planner rather than of the shapes tested.
+func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog.Catalog, ps PlannerSettings, upper *upperRels, tupleFraction float64) (Node, bool) {
 	if len(s.DistinctOn) > 0 {
 		return nil, false
 	}
@@ -10503,15 +10549,19 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 			}
 			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
-		out = &Sort{pos: s.Pos(), Child: out, Keys: keys}
+		// C-17: the ORDERED upper rel, as the ordinary ORDER BY site builds
+		// it. `limitTuples` is -1: this arm re-attaches ORDER BY / DISTINCT
+		// only, and the statement's LIMIT (if any) is applied above it by the
+		// caller, exactly as on the un-rewritten Aggregate path.
+		out = createOrderedPaths(upper, out, keys, s.Pos(), ps.costParams(), tupleFraction, -1)
 	}
 	if s.Distinct {
-		// C-16: same DISTINCT upper-rel producer as the normal arm (nil
-		// registry — this escape hatch has no planning scope of its own;
-		// single-row output makes the contest trivially one-sided).
-		// DISTINCT ON cannot reach here (declined at entry above).
+		// C-16: same DISTINCT upper-rel producer as the normal arm.
+		// DISTINCT ON cannot reach here (declined at entry above). C-17
+		// replaced the nil registry and the literal 0 fraction with the
+		// statement's own, so this rel is filed and priced like every other.
 		spec := &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
-		dnode, derr := createDistinctPaths(nil, spec, cat, ps, 0)
+		dnode, derr := createDistinctPaths(upper, spec, cat, ps, tupleFraction)
 		if derr != nil {
 			return nil, false
 		}
