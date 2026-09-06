@@ -78,10 +78,11 @@ per-row transfn slice down; values + pin.
   position can produce them — they never reach the compiled nodes).
 - `MIXED`/spill/grouping-set behavior unchanged — enforced as a
   NEGATIVE diff rule (no `groupingsets.go`-style executor lane
-  exists; the executor has one unified set loop): the diff must not
-  touch the grouping-set loop, `openSorted`, `finalizeGroup`,
-  `finishAgg`, `parallel_agg_*.go`, `spill.go`, or `join_batch.go`.
-  A violation = any new branch in those regions.
+  exists; the executor has one unified set loop): no NEW BRANCH in
+  the grouping-set loop, `openSorted`, `finalizeGroup`, `finishAgg`,
+  `parallel_agg_*.go`, `spill.go`, or `join_batch.go` (line-touches
+  that thread an index through a pre-existing call, like the two
+  `applyAgg` call sites, are not branches).
 - Alloc arm MANDATORY (per-row transition is THE hot loop for OLAP):
   per-row delta ≤ 0 vs interpreted (node lists prebuilt; no per-row
   slot alloc — `applyAgg` already receives `slot`).

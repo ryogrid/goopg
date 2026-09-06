@@ -1896,6 +1896,22 @@ type aggregateOp struct {
 	sharedUserStateSet     []bool
 	sharedUserStateVersion []int64 // which currentRowVersion last updated this slot
 	currentRowVersion      int64   // incremented per input row
+
+	// E-06 (EX4-03): compiled per-call transition expressions. Node
+	// lists run parallel to plan.Aggs; extraNodes/orderNodes are
+	// per-call lists. aggDeclined marks whole-call UserAgg declines
+	// (shared transition machinery stays interpreted). Compiled once
+	// per Open; the window helper (bare struct, never Opened) runs
+	// interpreted via the idx<0 path.
+	aggExprs       exprTreeSlab
+	aggArgNodes    []int32
+	aggFilterNodes []int32
+	aggArg2Nodes   []int32
+	aggExtraNodes  [][]int32
+	aggOrderNodes  [][]int32
+	aggWGOrderNodes [][]int32
+	aggDeclined    []bool
+	aggCompiled    bool
 }
 
 // groupRuntime is one accumulated output group: the GROUP BY key values, the
@@ -2096,6 +2112,15 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	o.sharedUserStateVersion = make([]int64, nSlots)
 	o.currentRowVersion = 0
 
+	// E-06: compile the transition expressions once per Open (same-split
+	// discipline: nodes derive from the plan.Aggs calls the loops
+	// evaluate). Rebuilt unconditionally. Direct-driven ops (window
+	// helper, tests) never run this: every eval site falls back to
+	// interpreted unless aggCompiled with matching node lists (same
+	// trust root as the same-length plan: plan.Aggs mutates only at
+	// build, pre-Open).
+	o.compileAggExprs()
+
 	// Sorted aggregation (M0134-0001 S8): when the node is marked
 	// AggStrategySorted the child is expected to deliver rows already ordered
 	// by the GROUP BY keys, so openSorted collapses runs of equal keys instead
@@ -2222,7 +2247,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 						continue
 					}
 				}
-				if err := o.applyAgg(&gr.aggs[i], call, slot); err != nil {
+				if err := o.applyAgg(&gr.aggs[i], call, slot, i); err != nil {
 					return err
 				}
 			}
@@ -2637,7 +2662,7 @@ func (o *aggregateOp) openSorted(ctx *Context) error {
 					continue
 				}
 			}
-			if err := o.applyAgg(&cur.aggs[i], call, slot); err != nil {
+			if err := o.applyAgg(&cur.aggs[i], call, slot, i); err != nil {
 				return err
 			}
 		}
@@ -2662,11 +2687,92 @@ func sameGroupKey(a, b []string) bool {
 	return true
 }
 
-func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slot TupleSlot) error {
+// compileAggExprs compiles each aggregate call's transition expressions
+// into this op's slab (E-06, the agg twin of compileExecExprs). Called
+// once per Open from the plan.Aggs calls the loops evaluate
+// (same-split discipline). Whole-call decline for UserAgg (their args
+// stay interpreted — see aggEvalVal). Rebuilds unconditionally;
+// direct-driven ops (window helper, tests) run interpreted via the
+// idx<0 / uncompiled path in aggEvalVal. Mandates buildExpr (never
+// buildExprCtx — volatile timing must not change).
+func (o *aggregateOp) compileAggExprs() {
+	o.aggExprs = o.aggExprs[:0]
+	o.aggCompiled = false
+	if o.plan == nil {
+		return
+	}
+	n := len(o.plan.Aggs)
+	o.aggArgNodes = make([]int32, n)
+	o.aggFilterNodes = make([]int32, n)
+	o.aggArg2Nodes = make([]int32, n)
+	o.aggExtraNodes = make([][]int32, n)
+	o.aggOrderNodes = make([][]int32, n)
+	o.aggWGOrderNodes = make([][]int32, n)
+	o.aggDeclined = make([]bool, n)
+	for i := range o.plan.Aggs {
+		call := &o.plan.Aggs[i]
+		if call.UserAgg != nil {
+			// Whole-call decline: Filter/Arg/Arg2/ExtraArgs/OrderBy
+			// all stay interpreted (shared transition machinery).
+			o.aggDeclined[i] = true
+			o.aggArgNodes[i] = noExpr
+			o.aggFilterNodes[i] = noExpr
+			o.aggArg2Nodes[i] = noExpr
+			continue
+		}
+		o.aggArgNodes[i] = o.aggExprs.buildExpr(call.Arg)
+		o.aggFilterNodes[i] = o.aggExprs.buildExpr(call.Filter)
+		o.aggArg2Nodes[i] = o.aggExprs.buildExpr(call.Arg2)
+		o.aggExtraNodes[i] = make([]int32, len(call.ExtraArgs))
+		for ei, ea := range call.ExtraArgs {
+			o.aggExtraNodes[i][ei] = o.aggExprs.buildExpr(ea)
+		}
+		o.aggOrderNodes[i] = make([]int32, len(call.OrderBy))
+		for ki, sk := range call.OrderBy {
+			o.aggOrderNodes[i][ki] = o.aggExprs.buildExpr(sk.Expr)
+		}
+		o.aggWGOrderNodes[i] = make([]int32, len(call.WithinGroupOrderBy))
+		for ki, sk := range call.WithinGroupOrderBy {
+			o.aggWGOrderNodes[i][ki] = o.aggExprs.buildExpr(sk.Expr)
+		}
+	}
+	o.aggCompiled = true
+}
+
+// aggEvalList evaluates one transition expression from a per-call node
+// list: the compiled fast path when this call index is compiled and not
+// declined, interpreted otherwise (window helper via idx<0, declined
+// UserAgg calls, direct-driven test ops, length mismatch). Nil
+// expressions yield NullDatum without evaluation on either path.
+func (o *aggregateOp) aggEvalList(nodes []int32, idx int, e optimizer.Expr, slot TupleSlot) (Datum, error) {
+	if e == nil {
+		return NullDatum, nil
+	}
+	if idx >= 0 && idx < len(o.aggDeclined) && !o.aggDeclined[idx] && o.aggCompiled &&
+		idx < len(nodes) {
+		return evalFastExpr(o.aggExprs, nodes[idx], slot, o.ctx)
+	}
+	return evalExprSlot(e, slot, o.ctx)
+}
+
+// aggEvalList2 is aggEvalList for per-call element lists (ExtraArgs,
+// OrderBy keys): sub selects the element. Same fallback contract.
+func (o *aggregateOp) aggEvalList2(nodes [][]int32, idx, sub int, e optimizer.Expr, slot TupleSlot) (Datum, error) {
+	if e == nil {
+		return NullDatum, nil
+	}
+	if idx >= 0 && idx < len(o.aggDeclined) && !o.aggDeclined[idx] && o.aggCompiled &&
+		idx < len(nodes) && sub >= 0 && sub < len(nodes[idx]) {
+		return evalFastExpr(o.aggExprs, nodes[idx][sub], slot, o.ctx)
+	}
+	return evalExprSlot(e, slot, o.ctx)
+}
+
+func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slot TupleSlot, idx int) error {
 	// FILTER (WHERE condition): skip this row if the condition is false/null.
 	// M0097-0007.
 	if call.Filter != nil {
-		fv, ferr := evalExprSlot(call.Filter, slot, o.ctx)
+		fv, ferr := o.aggEvalList(o.aggFilterNodes, idx, call.Filter, slot)
 		if ferr != nil || fv.IsNull() || fv.Kind != KindBool || !fv.BoolValue() {
 			return nil // skip row — filter not satisfied
 		}
@@ -2710,7 +2816,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		// If evaluation fails (e.g. rank('fred') with int ORDER BY), propagate
 		// the error so the caller sees "invalid input syntax" instead of NULL.
 		if !st.withinGroupDirectArgSet && call.Arg != nil {
-			v, verr := evalExprSlot(call.Arg, slot, o.ctx)
+			v, verr := o.aggEvalList(o.aggArgNodes, idx, call.Arg, slot)
 			if verr != nil {
 				return verr
 			}
@@ -2721,7 +2827,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 				st.withinGroupDirectArgs = make([]Datum, 1+len(call.ExtraArgs))
 				st.withinGroupDirectArgs[0] = v
 				for ei, ea := range call.ExtraArgs {
-					ev, eerr := evalExprSlot(ea, slot, o.ctx)
+					ev, eerr := o.aggEvalList2(o.aggExtraNodes, idx, ei, ea, slot)
 					if eerr != nil {
 						return eerr
 					}
@@ -2732,7 +2838,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		row := make([]Datum, len(call.WithinGroupOrderBy))
 		allNull := true
 		for i, sk := range call.WithinGroupOrderBy {
-			v, verr := evalExprSlot(sk.Expr, slot, o.ctx)
+			v, verr := o.aggEvalList2(o.aggWGOrderNodes, idx, i, sk.Expr, slot)
 			if verr != nil {
 				return verr
 			}
@@ -2753,7 +2859,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		st.count++
 		return nil
 	}
-	arg, err := evalExprSlot(call.Arg, slot, o.ctx)
+	arg, err := o.aggEvalList(o.aggArgNodes, idx, call.Arg, slot)
 	if err != nil {
 		return err
 	}
@@ -2768,13 +2874,13 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			return nil
 		}
 		if call.Arg2 != nil {
-			a2, _ := evalExprSlot(call.Arg2, slot, o.ctx)
+			a2, _ := o.aggEvalList(o.aggArg2Nodes, idx, call.Arg2, slot)
 			if a2.IsNull() {
 				return nil
 			}
 		}
-		for _, ea := range call.ExtraArgs {
-			eav, _ := evalExprSlot(ea, slot, o.ctx)
+		for ei, ea := range call.ExtraArgs {
+			eav, _ := o.aggEvalList2(o.aggExtraNodes, idx, ei, ea, slot)
 			if eav.IsNull() {
 				return nil
 			}
@@ -3006,7 +3112,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			raw := string(arg.BytesValue())
 			delimRaw := ""
 			if call.Arg2 != nil {
-				dv, _ := evalExprSlot(call.Arg2, slot, o.ctx)
+				dv, _ := o.aggEvalList(o.aggArg2Nodes, idx, call.Arg2, slot)
 				if !dv.IsNull() {
 					if b, ok := byteaOperand(dv); ok {
 						delimRaw = string(b)
@@ -3017,7 +3123,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			if len(call.OrderBy) > 0 {
 				st.strElems = append(st.strElems, raw)
 				st.strDelims = append(st.strDelims, delimRaw)
-				st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
+				st.strElemKeys = append(st.strElemKeys, o.evalAggOrderByKeys(call.OrderBy, idx, slot))
 				st.hasValue = true
 				break
 			}
@@ -3031,7 +3137,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		// Text string_agg: evaluate the delimiter from Arg2.
 		delim := ""
 		if call.Arg2 != nil {
-			dv, derr := evalExprSlot(call.Arg2, slot, o.ctx)
+			dv, derr := o.aggEvalList(o.aggArg2Nodes, idx, call.Arg2, slot)
 			if derr != nil {
 				break
 			}
@@ -3045,7 +3151,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		if len(call.OrderBy) > 0 {
 			st.strElems = append(st.strElems, sv)
 			st.strDelims = append(st.strDelims, delim)
-			st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
+			st.strElemKeys = append(st.strElemKeys, o.evalAggOrderByKeys(call.OrderBy, idx, slot))
 			st.hasValue = true
 			break
 		}
@@ -3070,16 +3176,10 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		st.arrayElems = append(st.arrayElems, elemStr)
 		st.arrayElemNull = append(st.arrayElemNull, isNull)
 		// Evaluate ORDER BY expressions for later sorting in finishAgg.
+		// E-06: compiled per-key eval (error→NULL preserved verbatim;
+		// materialization inside the helper, as before).
 		if len(call.OrderBy) > 0 {
-			keys := make([]Datum, 0, len(call.OrderBy))
-			for _, sk := range call.OrderBy {
-				kv, kerr := evalExprSlot(sk.Expr, slot, o.ctx)
-				if kerr != nil {
-					kv = NullDatum
-				}
-				keys = append(keys, kv.MaterializeArena())
-			}
-			st.arrayElemKeys = append(st.arrayElemKeys, keys)
+			st.arrayElemKeys = append(st.arrayElemKeys, o.evalAggOrderByKeys(call.OrderBy, idx, slot))
 		}
 		st.hasValue = true
 	case "any_value":
@@ -3262,7 +3362,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			if call.Arg2 == nil {
 				break
 			}
-			arg2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
+			arg2, a2err := o.aggEvalList(o.aggArg2Nodes, idx, call.Arg2, slot)
 			if a2err != nil || arg2.IsNull() {
 				break // skip row if either arg is NULL
 			}
@@ -3293,14 +3393,15 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 // against the current input row and materialises them, so finishAgg can sort
 // the accumulated pieces later. A key that fails to evaluate becomes NULL
 // rather than aborting the aggregate — the pre-existing array_agg behaviour
-// this was factored out of.
-func evalAggOrderByKeys(orderBy []optimizer.SortKey, slot TupleSlot, ctx *Context) []Datum {
+// this was factored out of. E-06: per-key compiled eval via aggEvalList2
+// (error swallowed to NULL exactly as before).
+func (o *aggregateOp) evalAggOrderByKeys(orderBy []optimizer.SortKey, idx int, slot TupleSlot) []Datum {
 	if len(orderBy) == 0 {
 		return nil
 	}
 	keys := make([]Datum, 0, len(orderBy))
-	for _, sk := range orderBy {
-		kv, err := evalExprSlot(sk.Expr, slot, ctx)
+	for ki, sk := range orderBy {
+		kv, err := o.aggEvalList2(o.aggOrderNodes, idx, ki, sk.Expr, slot)
 		if err != nil {
 			kv = NullDatum
 		}
