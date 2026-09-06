@@ -1234,6 +1234,71 @@ deleted — which is the repo's deletion discipline working as intended
 (the same rule that correctly kept `GOOPG_INDEXKEY_HARVEST` when its flip
 failed its own byte-identical-plans gate).
 
+## 5.22. Three more adjudicated, and a pattern across all of them
+
+**C-14 (Incremental Sort) — dropped, 1.26 ms.** Its stated blocker was
+already gone (E-15 published the presorted-prefix contract precisely to
+break the C-14/E-03 wait), so this was build-or-drop. Re-measured on a
+private clone: **Q67 — PG's own canonical Incremental Sort case — sorts
+in 1.259 / 1.312 / 1.247 ms over 376,552 rows**, `quicksort Memory:
+553kB`, no spill, against 13.5–15.2 s Execution Time. That is **0.008% of
+the query**.
+
+The number is *stronger* than the census's earlier 1.0 ms over 115,150
+rows: 3.3× the input rows and still about a millisecond, because
+`sortOp.keyvals` already precomputes the keys. Both of PG's mechanisms
+lack a witness — early-rows-under-a-bound (TPC-H has zero `LIMIT`,
+re-verified independently across all 25 committed query files) and spill
+avoidance (0 of 100 sorts spill).
+
+**E-03 resolved by the same verdict**, not left dangling: its condition is
+"file ONLY if C-14 activates", and it will not be met. E-15's contract
+stays landed and inert, so reopening C-14 reopens E-03 with its
+prerequisite already paid.
+
+**C-10b (`remove_useless_joins`) — dropped. One removable join in 121
+queries, and removing it buys nothing.** Census against `analyzejoins.c`:
+TPC-H has **1** LEFT join in total (Q13), failing both preconditions.
+TPC-DS has 21; **all 21 pass uniqueness, exactly one passes
+`attr_needed`** — q72's `left outer join catalog_returns`, corroborated by
+its absence from the committed PG plan. Hand-A/B'd that one join against
+the exact rewrite the optimisation performs: **arm B was 0.2–0.6%
+slower**, values byte-identical (md5 equal both arms), which also
+empirically confirms the census's uniqueness proof.
+
+**E-09 — closed.** Bookkeeping: the parent states no requirement outside
+E-09a/b/c, and the 5× private-build multiplier that motivated it is
+exactly what E-09a removed.
+
+### 5.22.1 The pattern: real PG optimisations with no witness here
+
+C-14 is the **third sort-side item refuted by the same underlying fact**,
+after C-13a and the parallel-sort design's stage 3. Every one of them
+measured against a sort that the `keyvals` work (M0134-0191) had already
+made cheap. When a subsystem has been optimised once, the items queued
+behind it inherit its result — and the plan did not know that.
+
+C-10b and C-09 land in the same family from a different direction, and the
+agent checked rather than assumed the connection: **C-09's decline does
+not transfer.** Both of C-09's grounds fail for C-10b — join *removal*
+needs no reorder and cannot move a row estimate. C-10b falls on an
+entirely independent ground, corpus incidence. What the two share is only
+the shape of their evidence: a real PG optimisation with no witness in
+goopg's benchmarks.
+
+Two corrections came out of this work, and both were mine to make:
+
+- **I stated a premise wrongly in the task.** PG 18 has **no** unique-inner
+  INNER-join removal; `innerrel_is_unique` is used only to set
+  `extra.inner_unique`, an execution shortcut. The only two removal
+  mechanisms are LEFT-join removal and self-join removal — which shrinks
+  the scope of any future port. Corrected in the ledger.
+- **Uniqueness is never the binding precondition.** 21 of 21 candidates
+  prove unique; 20 of 21 die at `attr_needed`. goopg's missing half is a
+  per-relation needed-set — it has only a whole-statement *name* set, safe
+  purely because it is decline-biased. Any future item reasoning about
+  "unused above" hits that same wall.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
