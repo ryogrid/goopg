@@ -762,7 +762,29 @@ rule).*
   re-run this one-command measurement — two `estimate-audit -plan-only`
   captures on the same cluster, one per flag value — and delete the flag
   when they come back identical. Ledger `c06-collapse-flip-moves-q13`.
-- [~] **C-07 P3-06 — DERIVATION + GATE LANDED 2026-09-05; the "motivate
+- [!] **C-07 P3-06 — reclassified `[~]` -> `[!]` 2026-09-07: the remaining
+  half is BLOCKED, and the blocker is now NAMED and measured.** The row
+  had said "blocked on C-11/C-12"; both landed, so C-07 was re-opened and
+  the widening was *implemented in a throwaway worktree and instrumented*
+  rather than re-argued. Result: **the widening works at the producer and
+  moves no plan.** Unioning the query-pathkey columns takes the useful set
+  from `[w]` to `[w x]` and `addOneOrderedIndexPath` really does add an
+  `index.ordered` path (pathlist 1->2) — and plans stay byte-identical
+  across five join shapes, even with `enable_seqscan = off`.
+  **The real blocker is the seam, confirmed three ways:**
+  `planJoinlistSearch` still returns a Node; C-12's only Node->Path
+  bridge, `newPrebuiltPath`, leaves `Pathkeys` nil, so
+  `pathkeysContainedIn(nil, keys)` is false and the Sort arm is the only
+  arm production can take; and an instrumented `finalPath` prints
+  `pathkeys=0` on every probe. C-11's `ORDERED` rel exists but has nothing
+  ordered to receive.
+  **Second, independent blocker found:** `addOrderedIndexPaths` runs only
+  inside the PG-shaped join search, and `tryPGShapedJoinSearch` declines
+  at `nrels < 2`, so `SELECT ... FROM t ORDER BY t.pk` — the canonical
+  shape the widening serves — never reaches the producer at all.
+  Landed: comments + tests only, zero behaviour change. Ledger
+  `c07-widening-blocked-on-seam-pathkeys`.
+  ORIGINAL ROW FOLLOWS. DERIVATION + GATE LANDED 2026-09-05; the "motivate
   index paths" half RE-ADJUDICATED 2026-09-07 and still BLOCKED — the
   blocker moved from C-11/C-12 (both landed, neither unblocked it) to the
   SEARCH BOUNDARY.**
@@ -868,7 +890,31 @@ rule).*
   is negative and removes a checkbox rather than adding one. Analysis
   artifact: `analysis/planner-refactor-take3/c10-p400-scoping-20260905/README.md`.
   *design: take3 08 §7; gate: scoped items filed (take3 09 §9 reporting).*
-- [~] **C-10a P4-00a grouping-sets scope + `dNumGroups` fix — CARDINALITY
+- [x] **C-10a P4-00a grouping-sets scope + `dNumGroups` fix — CLOSED
+  2026-09-07; the last condition is discharged by measurement.** Decision
+  2 pinned grouping sets to AGG_HASHED *conditional on an unrun SF=1
+  memory measurement of Q22/Q67*. It has now run, on the TPC-DS SF=1
+  cluster (port 65436) under a cgroup cap, with per-session ANALYZE (goopg
+  statistics are per-connection) and `GOOPG_ANALYZE_SEED=20260905`:
+
+  | query | grouping-sets node | hash memory | batches | result |
+  |---|---|---:|---:|---|
+  | Q22 | `HashAggregate (4 keys, 5 grouping sets)` | **24.3 MB** | **1** | completes, 24.95 s |
+  | Q67 | `HashAggregate (8 keys, 9 grouping sets)` | **6.6 MB** | **1** | completes, 26.01 s |
+
+  **`Batches: 1` on every hash table in both plans — nothing spilled**, and
+  the largest grouping-sets hash in the pair is 24 MB. The pin's risk was
+  that hashing every grouping set would exhaust memory where PG's
+  MixedAggregate/GroupAggregate would not; at SF=1 on the two queries the
+  decision named, it does not come close. **The pin stands, now on
+  evidence rather than on a promise.** (Peak server RSS was 5.95 / 6.79 GB,
+  but that is whole-server including a 2 GB buffer pool and is not the
+  figure the decision turns on — the aggregate's own memory is.)
+  Measurement run late and deliberately: it was held earlier in the day
+  while four peer agents held benchmark servers with 12 GB in swap, since
+  a memory measurement taken under memory contention answers a different
+  question.
+  ORIGINAL ROW FOLLOWS. CARDINALITY
   HALF LANDED 2026-09-05.** `estimateAggregate` now SUMS
   `estimateNumGroups` over the grouping sets instead of estimating
   `GroupExprs` (the deduplicated union) once, which is what PG accumulates
@@ -1917,6 +1963,22 @@ rule).*
   Captures are serial (`-serial` defaults true) and therefore blind to a
   parallelism-only plan change (ledger `take3-plan-capture-is-serial-only`).
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
+  **OWNER DECISION 2026-09-07 — the hatch STAYS; C-20f is closed as
+  blocked, not deferred.** The adjudicating agent correctly escalated a
+  real asymmetry rather than deciding it: unlike C-06, here the LOSING arm
+  is the flag's own off path, so retiring the hatch would change no plan
+  production reaches, which makes deletion defensible as a deliberate
+  *exception* to the stated gate rather than a pass of it. Deciding
+  against deletion, for three reasons. (1) The gate as written fails —
+  11.4x is not "byte-identical", and an exception granted once is a
+  precedent the remaining flag-retirement items inherit. (2) Deletion is
+  irreversible and the hatch is a branch, not a maintenance burden of the
+  P6-03/P6-04 kind, so the asymmetry of the mistake runs strongly one way.
+  (3) The hatch's value is precisely "escape if the cost gate misfires on
+  data we have not seen", and we have no evidence about data we have not
+  seen — the 11.4x measured here says the gate is right on THIS corpus,
+  which is not the same claim. Reopen only with a maintenance cost
+  attached to keeping it.
 - [!] **C-20g P6-06e retire `GOOPG_PGSHAPED_DP` last — BLOCKED 2026-09-07,
   re-verified on the current tree rather than inherited. Nothing deleted.**
   The item's own text was checked against the post-C-04c tree (C-04c
