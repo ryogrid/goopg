@@ -150,6 +150,8 @@ going forward.
 | **E-09a shared SPILLING hash build** | 24/24 MATCH | byte-identical | **Q9 8.85 s → 7.85 s (−11%)** |
 | C-19c parallel eligibility for plain index scans | 24/24 MATCH | byte-identical | within noise (shape not yet chosen) |
 | E-11 prefetch-depth knob (instrument only) | 24/24 MATCH | byte-identical | n/a (default unchanged) |
+| E-09b load-once-per-batch | forced-shape values green | n/a | n/a — **memory**: 1 live batch table where there were 4 |
+| C-19d `PathGather`/`PathGatherMerge` priced | 24/24 MATCH | byte-identical (ships default-OFF) | none by construction |
 
 C-19a/b are the direct response to §5.6: the search now HAS partial paths
 and prices them with `cost_seqscan`'s parallel arm, but by construction
@@ -363,6 +365,82 @@ E-09b (`sync.Once` per batch + refcount + a cancellation-aware wait), and
 it is deliberately a separate item because it introduces the executor's
 first cross-worker wait, whose failure mode under a LIMIT above a Gather
 is a deadlock or a silently partial join.
+
+## 5.9. The parallel dimension exists now — and arithmetic says it cannot pay yet
+
+§5.6 established that goopg's cost model had no parallel dimension:
+`MaybeAddGather` was a post-planning size rule, `PartialPathlist` had no
+reader, and only a hash join could carry a Gather. Three correct cost
+fixes each regressed the suite 10–22% by moving work off a hash join and
+losing a 5-worker Gather.
+
+C-19a/b built partial paths, C-19c added partial index scans, and C-19d
+landed `generateUsefulGatherPaths` — `PartialPathlist`'s first reader —
+with `cost_gather`/`cost_gather_merge` and `createPlanNode` arms. The
+machinery is complete and it ships **default-OFF**, for a reason that is
+arithmetic rather than caution:
+
+| term | per row |
+|---|---|
+| charge to cross a Gather (`parallel_tuple_cost`) | **0.1** |
+| saving from 4 workers (`cpu_tuple_cost`'s share) | **≈ 0.0075** |
+
+With only BASE-REL partial paths, the whole relation crosses the
+boundary, so the charge exceeds the entire scan cost and `add_path`
+correctly dominates every base-rel Gather **at any relation size**. This
+is PG's own arithmetic. PG escapes it not by pricing differently but by
+having far fewer rows cross: in PG the join and the aggregation happen
+BELOW the Gather, so what crosses is the join's output, not its input.
+
+So the blocker named in §5.6 has moved and narrowed. It is no longer
+"goopg has no parallel costing" — it is **C-19f**, the partial join path,
+which is what puts a join below the boundary. D-05's re-measurement needs
+C-19d *and* C-19f; a corrected hash cost with no parallel alternative to
+move onto still has nowhere to go.
+
+Two by-products worth recording because both are latent wrong-answer
+classes rather than cost issues:
+
+- `MaybeAddGather` now stands down on an already-gathered tree. That is a
+  correctness stop, not tidiness: `findPartialSubtree` descends through
+  terminating single-child nodes, so the post-pass would have nested a
+  second Gather below the costed one — N workers each launching N.
+- `gatherMergeOp` attaches only `attachParallelScan` and never the
+  index/bitmap claim set, so a Gather Merge over a partial INDEX path
+  would return N copies of every row. The producer therefore admits
+  seq-scan-driven subpaths only, which means no GatherMerge path is
+  produced in production today.
+
+## 5.10. E-09b: the memory multiplier E-09a left behind
+
+§5.8 closed with the qualification that E-09a shared the BUILD but not the
+reloaded batch, so D-04's 506 MB live map was still five maps. E-09b
+closes that, and it is the first cross-worker wait in goopg's executor.
+
+Measured on a 4-participant, 7-batch fixture that holds every participant
+at the same batch (probe keys arrive in runs, so "all four reach every
+batch" is a property of the data, not the scheduler):
+
+| | Variant A (E-09a) | Variant B (E-09b) |
+|---|---|---|
+| batch loads | 28 | **7** |
+| max live loads | 4 | **1** |
+| max live bytes | ~563,100 | **140,775** |
+
+Mutation-checked: stubbing the release path to a no-op takes max live
+loads to 7 and the gate fails.
+
+The cancellation protocol is worth one paragraph because the obvious
+implementation is wrong. `sync.Once` marks its slot done when the function
+RETURNS, so a loader that returned early — cancelled, or having recovered
+a panic — would publish an EMPTY map and every waiter would silently probe
+nothing. That is precisely this item's wrong-answer class. Instead each
+batch carries an explicit `done` channel closed by `defer` on every exit
+including panic, with a pre-set error a successful load overwrites; the
+loader itself never waits and never observes cancellation, so `done`
+closes in finite time and depends on the filesystem rather than on a peer
+— no cycle, hence no deadlock. Waiters select on `done` and the
+participant's context, returning 57014.
 
 ## 6. What was dropped, and what it cost to find out
 
