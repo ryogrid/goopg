@@ -1873,10 +1873,39 @@ per arm; values never counts for projection/join-adjacent changes).*
   scaling on Q9-class shapes** — the original E-09 text, now third.
   *design: take3 13 §7; gate: scaling + skew A/B; Datum-safety tests;
   serial arm.*
-- [ ] **E-10 EX5-03 Gather/GatherMerge ordering + exchange.**
-  Worker-sorted slices, leader heap merge. Cost-decision stays with
-  planner (permitted-divergence candidate).
-  *design: take3 13 §7; gate: ordering tests; pin; serial arm.*
+- [x] **E-10 EX5-03 Gather/GatherMerge ordering + exchange.** Correctness
+  half DONE 2026-09-06; performance half **out of scope, verified**.
+  *design: `docs/design/executor-e10-gather-merge-claimset/DESIGN.md`
+  (take3 13 §7).*
+  C-19f's reported latent wrong-answer **reproduced**: `gatherMergeOp`
+  attached only `attachParallelScan`, never the index/bitmap claim sets,
+  so a Gather Merge over a partial INDEX path returned `(workers+1)`
+  copies of every row **in the correct order** — 5802 / 8703 / 14505 rows
+  at 1 / 2 / 4 workers against a serial 2901. Fixed by hoisting all claim
+  state into one `parallelClaimSet` (`attachAll` + `prebuildBitmap`)
+  embedded by BOTH `gatherOp` and `gatherMergeOp`, so a future claim kind
+  cannot be wired into one sibling only; `TestParallelClaimSetAttachesEveryKind`
+  fails on a field added without an arm. Second bug found in the same
+  function and fixed: `gatherMergeOp.runWorker` deferred `close(chan)`
+  AFTER the child build/Open, so either failing left a live channel with
+  no closer and `Close` parked forever draining it — M0127-P5.9's Q17
+  hang, which `gatherOp` had fixed and this sibling had not.
+  Gate: `TestGatherMergeOverParallelIndexScanIdentity` (values, each row
+  exactly once ascending, ≥2 leaf blocks claimed, workers 1/2/4), full
+  `go test ./internal/executor/` + `-race` on the parallel set,
+  units gate, `scripts/tpch-spotcheck.sh` RESULT=PASS,
+  `tpch-runner -diff` **24 MATCH** on values.
+  Performance half declined with numbers: no sort-side runtime witness
+  exists on either corpus — the C-13a census
+  (`analysis/planner-refactor-take3/c13a-limit-sort-census-20260906/`)
+  puts all sorting at ≤0.015% of TPC-DS SF0.5 corpus wall time, median
+  sort input 145 rows, 0/100 sorts spilled, and TPC-H has no `LIMIT` at
+  all. Tuning the worker-sort/leader-heap exchange there would be reading
+  noise.
+  **Planner follow-up (routed, NOT made — `internal/optimizer/` held by
+  C-03):** drop `return partialPathDrivingKind(sub) == PathSeqScan` from
+  `gatherMergeSubpathIsRunnable` (`gatherpaths.go:267`) — the executor gap
+  its comment cites is now closed; see DESIGN §6.
 - [-] **E-11 EX5-04 AIO `ReadStream` decision.** DECLINED 2026-09-06 —
   outcome (b), the measurement's own second legal outcome. Re-run on a
   quiet host with the sole lock on the bench cluster (the 05:15 sweep,

@@ -53,7 +53,14 @@ type gatherMergeOp struct {
 	chans   []chan rowBatch
 	workers []*Context
 	arenas  []*mmgr.Context
-	pscan   *parallelScanState
+
+	// E-10: the SAME claim set gatherOp uses, embedded so o.pscan / o.pbm /
+	// o.pidx name the individual kinds. Before this, Gather Merge attached
+	// only the sequential-scan allocator, so a Gather Merge over a partial
+	// INDEX path had every participant walk the whole index and returned
+	// (workers+1) copies of every row, correctly ordered. See
+	// parallelClaimSet in parallel_scan.go.
+	*parallelClaimSet
 
 	sources  []*gmSource
 	h        *gmHeap
@@ -129,7 +136,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	}
 
 	o.group = NewParallelGroup(ctx.Ctx)
-	o.pscan = newParallelScanState(0)
+	o.parallelClaimSet = newParallelClaimSet()
 
 	// P8: build shared hash tables once, before fan-out. Same ordering
 	// requirement as gatherOp — before worker contexts, before goroutines.
@@ -140,6 +147,14 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	if prebuilt != nil {
 		ctx.SharedHashBuilds = prebuilt
 		o.ownsSharedBuilds = true
+	}
+
+	// S5.6, via the shared claim set: pre-build the bitmap once so every
+	// participant claims disjoint pages from it. gatherOp has done this since
+	// S5.6; Gather Merge did not, which is the same sibling-drift class as the
+	// index claim set below.
+	if err := o.prebuildBitmap(ctx, o.plan.Child, o.buildChild); err != nil {
+		return err
 	}
 
 	// Unlike plain Gather, each worker gets its OWN channel: the merge needs
@@ -183,7 +198,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		attachParallelScan(child, o.pscan)
+		o.attachAll(child)
 		if err := child.Open(ctx); err != nil {
 			_ = child.Close()
 			return err
@@ -241,16 +256,23 @@ func (h *gmHeap) Pop() any {
 
 func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 	// EX0-03b: worker instrumented site — fresh table into slot idx.
+	// The channel MUST be closed on EVERY exit path, and therefore before the
+	// first `return`: Close drains with `for range ch`, which ends only when
+	// someone closes it. With the close deferred after the build and Open
+	// below, a failure in either left a live channel with no closer and the
+	// statement parked forever inside Close at 0% CPU with the real error
+	// never reaching the client. That is exactly M0127-P5.9's Q17 "hang",
+	// which gatherOp fixed (startChannelCloser) and this sibling did not.
+	defer close(o.chans[idx])
 	child, err := o.buildChildForSlot(idx)
 	if err != nil {
 		return err
 	}
-	attachParallelScan(child, o.pscan)
+	o.attachAll(child)
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {
 		return err
 	}
-	defer close(o.chans[idx])
 
 	batch := make([]Row, 0, gatherBatchRows)
 	flush := func() bool {

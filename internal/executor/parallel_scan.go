@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -318,4 +319,115 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 		return attachParallelIndexScan(x.child, st)
 	}
 	return false
+}
+
+// parallelClaimSet is the COMPLETE set of shared work-claim state a Gather (or
+// Gather Merge) hands to each participant's child tree — one field per claim
+// kind the executor knows about.
+//
+// It exists because `gatherOp` and `gatherMergeOp` are a sibling pair that must
+// agree, and did not: gatherOp attached all three kinds, gatherMergeOp attached
+// only the sequential-scan allocator. A Gather Merge over a partial INDEX path
+// therefore had every worker walk the WHOLE index, and the merge returned
+// (workers+1) copies of every row — in the correct ORDER, which is what made it
+// silent. Measured on the C-19f fixture before this type existed: 5802 / 8703 /
+// 14505 rows at 1 / 2 / 4 workers against a serial 2901.
+//
+// The planner worked around the gap by admitting seq-scan-driven subpaths only
+// (C-19f, docs/design/planner-c19f-parallel-hashjoin/DESIGN.md), so the defect
+// was unreachable from SQL — and unreachable also means untested. Centralising
+// the state here means a future claim kind is added in ONE place and both
+// consumers get it; TestParallelClaimSetAttachesEveryKind fails if a field is
+// added without an arm in attachAll.
+type parallelClaimSet struct {
+	// pscan is the shared block allocator for a parallel sequential scan.
+	pscan *parallelScanState
+	// pbm is the shared page allocator for a parallel bitmap heap scan (S5.6).
+	// Unlike the others it is nil until prebuildBitmap runs, because the leader
+	// must build the TIDBitmap once before fan-out.
+	pbm *parallelBitmapState
+	// pidx is the shared leaf-block claim set for a parallel index or
+	// index-only scan (M0134-0189, C-19c).
+	pidx *parallelIndexScanState
+}
+
+// newParallelClaimSet builds the claim state that needs no pre-pass. pbm is
+// filled in later by prebuildBitmap, when the plan contains a bitmap scan.
+func newParallelClaimSet() *parallelClaimSet {
+	return &parallelClaimSet{
+		pscan: newParallelScanState(0),
+		pidx:  newParallelIndexScanState(),
+	}
+}
+
+// attachAll wires every claim kind into op's driving scan. It reports whether
+// ANY kind attached.
+//
+// The return value is NOT a safe-fallback signal, and no caller treats it as
+// one. A tree with an unattached driving scan does not "stay serial": each
+// participant runs a complete scan and the node returns N copies of every row.
+// What actually keeps that from happening is the planner's producer, which
+// refuses to build a partial subtree whose driving scan it cannot model
+// (createGatherPlan). The executor cannot re-derive that here, because an
+// injected child tree may legitimately be a non-scan source. So: precondition
+// owned by the planner, reported (not enforced) here.
+func (cs *parallelClaimSet) attachAll(op Operator) bool {
+	if cs == nil {
+		return false
+	}
+	attached := attachParallelScan(op, cs.pscan)
+	attached = attachParallelBitmapScan(op, cs.pbm) || attached
+	attached = attachParallelIndexScan(op, cs.pidx) || attached
+	return attached
+}
+
+// prebuildBitmap builds the TIDBitmap once before fan-out so workers
+// share the result rather than each running their own index scan. (S5.6)
+//
+// C-19f/E-10: hoisted off gatherOp so gatherMergeOp runs the same pre-pass.
+// This mirrors the pattern of prebuildSharedHashJoins: the leader builds the bitmap
+// eagerly, publishes the sorted block list in a shared atomic allocator, and
+// workers claim disjoint pages from it.
+func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Node, buildChild func() (Operator, error)) error {
+	// Decide from the PLAN, before building anything.
+	if !optimizer.HasBitmapScan(planChild) {
+		return nil
+	}
+	// EX0-03b: prebuild throwaway tree — scope explicitly NIL
+	// (uninstrumented, exactly today's behavior). Its drains would
+	// double-count the same plan keys into a worker/leader table, and
+	// the bitmap tree is never even closed, so its loops would leak.
+	tree, err := buildUnderNilScope(buildChild)
+	if err != nil {
+		return err
+	}
+	var bmOps []*bitmapHeapScanOp
+	collectBitmapScans(tree, &bmOps)
+	if len(bmOps) == 0 {
+		return nil
+	}
+	// A partial subtree should have exactly one driving scan. If multiple
+	// bitmap scans appear (unexpected), fall back rather than guessing which
+	// one to share.
+	if len(bmOps) > 1 {
+		return nil
+	}
+	bm := bmOps[0]
+	if err := bm.Open(ctx); err != nil {
+		return err
+	}
+	// Build the bitmap.
+	tbm, err := bm.outerBitmap.buildBitmap(ctx)
+	if err != nil {
+		bm.Close()
+		return err
+	}
+	bm.tbm = tbm
+	bm.iter = tbmBeginIterate(tbm)
+	bm.ownBitmap = true
+
+	// Publish the sorted block list for workers.
+	cs.pbm = newParallelBitmapState()
+	cs.pbm.init(tbm)
+	return nil
 }
