@@ -51,7 +51,15 @@ type joinRelBuilder interface {
 	// paths within one rel, and two pairs that disagreed about `rows` would
 	// make those comparisons meaningless. `clauses` is the joinrel's own
 	// restriction list (PG's `build_joinrel_restrictlist` output).
-	sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo) (rows float64, width int)
+	//
+	// `sjinfo` is what `joinIsLegal` matched for the FIRST pair to reach this
+	// relset, post-`reversed` swap — so `outer` covers its LHS. C-04a passes
+	// it for the outer-join row FLOOR only (see `applyOuterJoinRowFloor`); the
+	// full `calc_joinrel_size_estimate` jointype switch is C-05. It is named
+	// in the interface rather than smuggled through the builder because a
+	// relset's size is fixed once and every path in the rel is compared
+	// against it.
+	sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) (rows float64, width int)
 
 	// addPaths is `add_paths_to_joinrel` for ONE direction: it must treat
 	// `outer` as the outer (probe/driving) side and `inner` as the inner
@@ -583,7 +591,7 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 	// later comparison (joinsearchlevel.go:43) (P5.9-l-ii).
 	s.trace.offer(s.tracePhase, rel1.Relids, rel2.Relids, joinrel == nil)
 	if joinrel == nil {
-		rows, width := s.builder.sizeJoinRel(rel1, rel2, clauses)
+		rows, width := s.builder.sizeJoinRel(rel1, rel2, clauses, sjinfo)
 		// The same floor buildInitialRels applies (joinsearch.go:220-240):
 		// a zero-row rel would make every join above it free and the level
 		// above would order itself on noise.

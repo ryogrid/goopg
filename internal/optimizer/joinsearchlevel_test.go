@@ -58,7 +58,7 @@ type recordingBuilder struct {
 	fail    RelSet // when non-zero, addPaths errors on this joinrel
 }
 
-func (b *recordingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo) (float64, int) {
+func (b *recordingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo, _ *SpecialJoinInfo) (float64, int) {
 	b.sized = append(b.sized, outer.Relids|inner.Relids)
 	return outer.Rows * inner.Rows, outer.Width + inner.Width
 }

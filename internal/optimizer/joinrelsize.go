@@ -64,6 +64,7 @@ import (
 	"math"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // searchJoinRelBuilder is the concrete `joinRelBuilder` (joinsearchlevel.go:42)
@@ -90,8 +91,52 @@ func newJoinRelBuilder(s *searchCtx, cat catalog.Catalog) *searchJoinRelBuilder 
 	return &searchJoinRelBuilder{s: s, cat: cat}
 }
 
-func (b *searchJoinRelBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo) (float64, int) {
-	return b.s.calcJoinrelSize(b.cat, outer, inner, clauses)
+func (b *searchJoinRelBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) (float64, int) {
+	rows, width := b.s.calcJoinrelSize(b.cat, outer, inner, clauses)
+	return applyOuterJoinRowFloor(rows, outer, inner, sjinfo), width
+}
+
+// applyOuterJoinRowFloor is C-04a's one-line guard against INNER-join maths
+// pricing an OUTER join, held until C-05 ports
+// `calc_joinrel_size_estimate`'s jointype switch (costsize.c:5499) properly.
+//
+// A LEFT join emits at least one row per PRESERVED-side row: an outer row with
+// no match is null-extended rather than dropped, which is exactly the arm PG
+// writes as
+//
+//	if (nrows < outer_rows) nrows = outer_rows;      (costsize.c:5610-5611)
+//
+// `calcJoinrelSize` computes `|outer| * |inner| * selectivity`, which for a
+// selective join qual is unboundedly BELOW `|outer|` — and it is precisely the
+// newly searchable shapes (an outer join inside the enumeration, C-04a) where
+// that under-estimate would invite a catastrophic choice at the level above.
+// The floor is the preserved side's cardinality, chosen by the SJI's jointype:
+// LEFT preserves the LHS and `makeJoinRel` has already swapped so `outer`
+// covers it; RIGHT preserves the RHS, i.e. `inner`.
+//
+// It is a FLOOR, not an estimate: it never lowers a figure, so on a join whose
+// inner-join maths already exceeds the preserved side it does nothing at all.
+// SEMI/ANTI are not floored here — their true bound is an upper one
+// (`nrows <= outer_rows`), and the rel-level size is still the union width
+// (C-03c), so lowering rows without narrowing width would produce a size
+// estimate that is wrong in two directions at once. C-05 owns that pair.
+func applyOuterJoinRowFloor(rows float64, outer, inner *RelOptInfo, sjinfo *SpecialJoinInfo) float64 {
+	if sjinfo == nil || outer == nil || inner == nil {
+		return rows
+	}
+	var preserved float64
+	switch sjinfo.Jointype {
+	case parser.JoinLeft:
+		preserved = outer.Rows
+	case parser.JoinRight:
+		preserved = inner.Rows
+	default:
+		return rows
+	}
+	if preserved > rows {
+		return preserved
+	}
+	return rows
 }
 
 func (b *searchJoinRelBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) error {

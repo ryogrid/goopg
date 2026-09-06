@@ -314,7 +314,7 @@ type refusingBuilder struct {
 	s *searchCtx
 }
 
-func (r *refusingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo) (float64, int) {
+func (r *refusingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo, _ *SpecialJoinInfo) (float64, int) {
 	return r.s.calcJoinrelSize(nil, outer, inner, clauses)
 }
 
