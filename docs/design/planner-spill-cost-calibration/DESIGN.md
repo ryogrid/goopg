@@ -230,13 +230,76 @@ strictly smaller thing than it appears to. Any spill calibration reasoned
 from suite-wide sort behaviour would be reasoning about nodes the model
 does not price. Referred to the C-11/C-12/C-13 design.
 
-**6.2 Measure the real batch-file bytes per row.** §3.1 asserts a
-direction but no magnitude. Compare `hashsize.EntryBytes(ncols,
-avgVarBytes)` against the actual on-disk size of a Q9 batch file divided
-by its row count. That measured ratio is the *principled* value for
-`spillCostMultiplier`, and the sweep should then confirm it rather than
-discover it — a calibration that lands on its independently measured
-value is far stronger evidence than one fitted to a suite time.
+**6.2 Measure the real batch-file bytes per row — ANSWERED
+ANALYTICALLY, 2026-09-06, and it refutes the scalar-multiplier plan.**
+
+The encoder is fully determined, so the magnitude §3.1 left open can be
+derived rather than measured. From `internal/executor/spill.go`
+(`WriteRowHashed` → `appendRowPayload` → `writeFrame` → `encodeDatum`),
+one spilled row on disk is:
+
+```
+4  frame length (LittleEndian uint32, writeFrame)
+4  join hash value (WriteRowHashed only)
+1  column count (uvarint, ncols < 128)
+   per column: 1 kind byte, then
+        KindNull   0                KindBool  1
+        KindInt    8                KindTime  8 (+ subtype)
+        KindString 4 + len          KindBytes 4 + len
+```
+
+Against `hashsize.EntryBytes(ncols, avgVarBytes) = 48*ncols + 24 +
+avgVarBytes` (`DatumBytes = 48`, `RowSliceBytes = 24`).
+
+Worked points, hashed writer, `v` = total variable-width payload bytes:
+
+| shape | `EntryBytes` | on disk | over-statement |
+|---|---|---|---|
+| n=2, v=0 — the Q9 `orders` build measured at 120.0 B/row | 120 | 27 | **4.4×** |
+| n=5, v=0 | 264 | 54 | 4.9× |
+| n=9, v=0 — the Q14 phantom build | 456 | 90 | 5.1× |
+| n=5, v=100 (2 text cols) | 364 | 154 | 2.4× |
+| n=2, v=400 (wide text) | 520 | 418 | 1.2× |
+
+**The ratio is not a constant — it runs from ~5× down to ~1.2×**, because
+the fixed 48 B/column of the in-memory `Datum` is pure overhead on disk
+while variable-width payload is carried at par. A scalar
+`spillCostMultiplier` would therefore be fitting one corpus's average
+column mix, and would drift the moment the plan set changed. That is the
+same failure mode as pinning a cost test to a literal instead of its
+constant.
+
+**Cut 3 is re-specified accordingly**: introduce a second byte model
+beside `EntryBytes` — call it `hashsize.SpillBytes(ncols, avgVarBytes)`
+— that transcribes the encoder above, and have `spillPages` call it
+instead of `EntryBytes`. Properties this buys that a multiplier cannot:
+
+- it is *derived*, not fitted, so it needs no suite sweep to justify its
+  value and cannot be over-fitted to TPC-H;
+- it is shape-correct across the whole 1.2×–5× range rather than at one
+  average;
+- it keeps §3.4 intact — `hashsize.Choose` still calls `EntryBytes` and
+  still mirrors `joinOp.buildGeometry`, so `NBatch > 1` keeps meaning
+  "the executor will really spill";
+- and it makes `spill.go`'s encoder and `hashsize`'s model an
+  **explicit sibling pair** that must change together, which is this
+  codebase's most reliable silent-bug class (encode/decode,
+  fast-path/interpreted, column-lookup/star-expansion). Pin them with an
+  agreement test that encodes real rows and compares actual byte length
+  against the model, exactly as the D-01 descriptor test pins two
+  transcriptions of `pg_type.dat` against each other.
+
+The suite sweep does not disappear; its role changes from *discovering* a
+value to *confirming* that the derived model does not regress the suite,
+and a `spillCostMultiplier` may still be added on top if the derived
+model proves systematically off. But it starts at 1.0 with a reason.
+
+Two residual unknowns the analysis cannot settle, both to be checked on a
+real batch file when the bench frees up: the `bufio` writer's 8 KiB
+buffer and filesystem block rounding add a per-file, not per-row, term
+that matters only for many small batches; and `KindTime`'s subtype byte
+and any arena-backed kinds not listed above need confirming against
+`encodeDatum`'s full switch.
 
 **6.3 Confirm both candidates exist.** For any query whose plan is
 expected to move, instrument `addPath` to prove the hash and merge paths
