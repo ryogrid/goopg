@@ -594,6 +594,16 @@ rule).*
 - [ ] **C-05 P1-18 outer/semi/anti sizing — executes HERE, after C-04.**
   Port `calc_joinrel_size_estimate`'s jointype switch.
   *design: take3 08 §4 + §6.2; gate: EA ratchet.*
+
+> **WARNING (2026-09-06): the EA ratchet cited as this item's gate HAS
+> NEVER RUN.** No Makefile target, hook, precommit script or ci/batch
+> stage invokes `scripts/tpch-estimate-audit-arm.sh`, and its default
+> pinned PG baseline is not in the tree. `estimate-audit -plan-only` (the
+> plan-capture step) does run and is fine; the est-vs-actual parity
+> ratchet does not. It is also TPC-H-only and joinrel-granular, so it
+> cannot see the base-rel `rows=1` collapse diagnosed in
+> `docs/design/planner-rowest-collapse/DESIGN.md`. Ledger
+> `take3-ea-ratchet-never-ran`. Build the gate before relying on it.
 - [ ] **C-06 P3-05 retire `GOOPG_PGSHAPED_COLLAPSE`.** Once C-04 makes it
   the only jointree path; `from_collapse_limit`/`join_collapse_limit`
   take upstream meaning. Own commit, both suites timed.
@@ -1089,6 +1099,16 @@ rule).*
   everything reads `calcJoinrelSize`. Prerequisite: EXPLAIN `rows=` from
   the path (P0-02 remainder) + legacy consumers gone (C-11…C-18).
   *design: take3 08 §9; gate: take3 09 §5 P6 (PP + EA ratchet).*
+
+> **WARNING (2026-09-06): the EA ratchet cited as this item's gate HAS
+> NEVER RUN.** No Makefile target, hook, precommit script or ci/batch
+> stage invokes `scripts/tpch-estimate-audit-arm.sh`, and its default
+> pinned PG baseline is not in the tree. `estimate-audit -plan-only` (the
+> plan-capture step) does run and is fine; the est-vs-actual parity
+> ratchet does not. It is also TPC-H-only and joinrel-granular, so it
+> cannot see the base-rel `rows=1` collapse diagnosed in
+> `docs/design/planner-rowest-collapse/DESIGN.md`. Ledger
+> `take3-ea-ratchet-never-ran`. Build the gate before relying on it.
 - [ ] **C-20b P6-02 `PathTarget` + range table.** Replace
   `baseLeaf`/`baseOffset`; delete `joinlayout.go` remapping + the
   `createplanroot.go` boundary assertions. Deletes the largest silent
