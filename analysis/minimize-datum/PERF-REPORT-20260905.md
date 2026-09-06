@@ -505,9 +505,48 @@ filed (ledger `take3-tpcds-rowest-3-to-5-orders`):
 22 of 100 Sort inputs are estimated at exactly 1 against 100+ actual rows.
 The Q28 cases matter most because they are plain base-relation scans — a
 Seq Scan estimated at one row is a selectivity collapse, not a grouping
-artefact. The over-estimates were checked against C-10a and are **not**
-its grouping-sets summing, which is PG-faithful; the error is inside the
-per-set `estimateNumGroups`.
+artefact.
+
+**Diagnosed since (`6b987aeab`, `docs/design/planner-rowest-collapse/`),
+and two things stated above turned out to be wrong.** Four mechanisms,
+each confirmed by a probe binary A/B'd on the real dataset rather than
+inferred:
+
+- **A1, the null double-exclusion** — `conjunctionSelectivity` computes
+  `s2 = hibound + lobound - 1.0` and omits PG's next line,
+  `s2 += nulltestsel(IS_NULL)` (`clausesel.c:292-294`). Both bounds
+  already exclude NULLs, so the subtraction double-excludes them. On
+  `ss_quantity`: 0.955955 + 0.040251 − 1 = **−0.003794**, which falls into
+  the small-negative guard and becomes 1e-10, and 1,439,608 × 1e-10 clamps
+  to **1**. TPC-DS fact tables are ~4.4% null nearly everywhere, so *every
+  predicate narrower than the null fraction is destroyed*. Probe fix:
+  1 → 14,932 against 15,410 actual. This is Q28.
+- **B1, the aggregate over-estimate** — `resolveBaseColumn` has **no
+  `*NestedLoopIndexJoin` arm**, so every column above an NLI resolves to
+  nothing, every grouping var prices at `DEFAULT_NUM_DISTINCT = 200`, and
+  the product saturates until `estimateNumGroups` returns its *input* row
+  count. Isolated to the LIMIT: Q99 estimates **90** without
+  `ORDER BY … LIMIT` and **720,657** with it, because the limit flips the
+  shape to NLI+Memoize. Q22's 9,460,201 decomposes exactly as
+  `1 + 200 + 200² + 2×4,710,000`. Probe: Q99 → 90 exact, Q62 → 150 exact,
+  Q22 → 72,001 against PG's 71,857. Seventeen lines.
+- **A2** (latent) — `rangeOpSelectivity` returns `DEFAULT_INEQ_SEL` when
+  the histogram has fewer than two entries, never reaching the MCV loop
+  ten lines below; PG's `scalarineqsel` reads MCVs *first*.
+- **A3** — `LEFT JOIN … WHERE d.id IS NULL` is not converted to an anti
+  join, and prices from `stanullfrac = 0`; the identical `NOT EXISTS`
+  becomes a Hash Anti Join and estimates correctly. This is Q78.
+
+**Correction 1:** my filed guess that B1 lived in the per-set
+independent-ndistinct product "where PG leans on extended statistics" is
+**refuted**. `estimateNumGroups` is PG-faithful and exact once given real
+ndistinct; extended statistics are not involved.
+
+**Correction 2:** Q47 and Q57 are **not defects**. PG 18.3 emits `rows=1`
+on the identical node — seven mutually-implied equi-conditions multiplied
+independently and floored by `clamp_row_est`, and upstream has no
+equivalence-class de-duplication at estimate time either. Q81 and Q89 are
+the same class. They come off the list.
 
 This belongs in a performance report because of what it implies about
 everything else in it: **a cost model cannot rank plans on estimates that
