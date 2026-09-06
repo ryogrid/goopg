@@ -547,8 +547,21 @@ func decodeDatum(data []byte) (Datum, int, error) {
 // EX3-03 Cut 1-step-1: counts enum-label bytes and big-numeric body bytes,
 // mirroring the stats ruler datumVariablePayloadWidth
 // (operators_analyze.go). Runtime ruler only — planner untouched.
+//
+// This is the IN-MEMORY footprint, the same quantity hashsize.EntryBytes
+// models for the planner — hence hashsize.DatumBytes below rather than a
+// second literal 48, which is what DatumBytes' own comment asks for and what
+// this function was quietly doing instead. It is NOT the on-disk size; that is
+// hashsize.SpillBytes, and the two differ by up to 5x on narrow rows.
+//
+// Note the asymmetry in what callers add on top: the hash-join batch state
+// (join_batch.go) adds hashsize.RowSliceBytes per row, matching EntryBytes,
+// while sortOp (operators.go), the merge-stream chunker and materialBuffer do
+// not. That is pre-existing and deliberately not changed here — every one of
+// those sums feeds a spill THRESHOLD, so moving it moves when those operators
+// spill, which is a gated behaviour change and not a comment's business.
 func estimatedRowBytes(row Row) int64 {
-	n := int64(len(row) * 48) // Datum struct fixed overhead
+	n := int64(len(row)) * hashsize.DatumBytes // Datum struct fixed overhead
 	for _, d := range row {
 		switch d.Kind {
 		case KindString:

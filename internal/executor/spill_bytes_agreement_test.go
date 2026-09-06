@@ -122,6 +122,41 @@ func TestSpillBytesAgreesWithEncoderOnRealisticRows(t *testing.T) {
 	}
 }
 
+// TestEstimatedRowBytesAgreesWithEntryBytes pins the THIRD transcription of
+// the in-memory width model.
+//
+// hashsize.EntryBytes is the planner's; estimatedRowBytes (spill.go) is the
+// executor's, and it fed every spill threshold in the tree while carrying its
+// own literal 48. DatumBytes' comment already asked for them not to drift; it
+// had no test behind it. The relation is exact rather than approximate — the
+// executor's ruler is the planner's model minus the per-row slice header,
+// which callers add themselves — so it is worth asserting as an equality.
+func TestEstimatedRowBytesAgreesWithEntryBytes(t *testing.T) {
+	cases := []struct {
+		name     string
+		row      Row
+		varBytes float64
+	}{
+		{"2 fixed cols", Row{NewIntDatum(1), NewIntDatum(2)}, 0},
+		{"1 text col", Row{NewStringDatum("0123456789")}, 10},
+		{"mixed", Row{NewIntDatum(1), NewStringDatum("abcd"), NewBoolDatum(true)}, 4},
+		{"bytes", Row{NewBytesDatum(make([]byte, 64))}, 64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := float64(estimatedRowBytes(tc.row)) + hashsize.RowSliceBytes
+			want := hashsize.EntryBytes(len(tc.row), tc.varBytes)
+			if got != want {
+				t.Errorf("estimatedRowBytes + RowSliceBytes = %.0f, "+
+					"hashsize.EntryBytes = %.0f. The executor's runtime ruler and "+
+					"the planner's width model have drifted — that divergence is a "+
+					"cost model that believes a build fits while the executor "+
+					"spills, or the reverse", got, want)
+			}
+		})
+	}
+}
+
 // TestSpillBytesIsFarBelowEntryBytesOnNarrowRows is the reason the model
 // exists, stated as an assertion rather than a comment.
 //
