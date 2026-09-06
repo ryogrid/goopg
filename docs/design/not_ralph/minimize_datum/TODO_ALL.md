@@ -1431,9 +1431,19 @@ per arm; values never counts for projection/join-adjacent changes).*
   spotcheck PASS; review APPROVE-WITH-NITS (7 findings fixed).
   Artifacts: `docs/design/executor-e05-merge-compile/DESIGN.md`,
   `39d26c5`.
-- [ ] **E-06 EX4-03 agg transition fast path.** Compile builtin-agg
-  `transfn` expressions; `MIXED`/spill behaviour unchanged.
-  *design: take3 13 §6; gate: per-row transfn slice down; values + pin.*
+- [x] **E-06 EX4-03 agg transition fast path.** Landed 2026-09-06:
+  per-call slab (`aggExprs` + node lists parallel to `plan.Aggs`,
+  whole-call UserAgg decline) with dispatch swap at all builtin
+  transition sites (Filter/Arg/Arg2/Extra/WithinGroup/order-keys/
+  delim/regr; UserAgg + group-keys + finishAgg untouched); wrapper
+  logic and per-site error handling verbatim. Gates: twin-parity
+  corpus + wiring/decline/order-key-failure/per-site-Arg2/0-alloc
+  pins; suites + units scope; merge-confirmed parallel Gather shapes
+  in R8 arms; TPC-H values 24/24 MATCH (timing neutral after
+  noise re-run); TPC-DS 95 PASS CKMISMATCH=0; plan-gate 22/22;
+  spotcheck PASS; review APPROVE-WITH-NITS (8 findings fixed).
+  Artifacts: `docs/design/executor-e06-agg-compile/DESIGN.md`,
+  `6aab9dc`.
 - [ ] **E-07 EX5-01 slab parity for `Gather` — RE-SCOPED 2026-09-05, two
   of its three justifications are now void.** Premise re-verified: workers
   really do take the legacy path (`BuildWorker` → `buildNode`,
@@ -1669,6 +1679,7 @@ P6-03/04/05 (load-bearing).
 | C-02c | 2026-09-05 | 2305241f4 | qual MOVED (not copied) on proven all-INNER paths; vacuous Filters spliced | values 24/24, plans byte-identical, PP unchanged, timing in band; 6 new pins |
 | D-09 | 2026-09-06 | 016f67b | conditional alignment both directions; on-disk padding matches PG | live-PG byte-identical golden; suites + R8 both suites + plan-gate 22/22; review APPROVE |
 | E-05 | 2026-09-06 | 39d26c5 | merge residual+keys via separate slab; pure dispatch swap | twin-parity + 0-alloc; R8 both suites; timing neutral; review APPROVE-WITH-NITS |
+| E-06 | 2026-09-06 | 6aab9dc | agg transition via per-call slab; UserAgg whole-call decline | twin-parity + per-site pins + 0-alloc; R8 both suites (parallel shapes incl.); timing neutral; review APPROVE-WITH-NITS |
 | C-08 | 2026-09-06 | b967f38 | per-joinrel param_source_rels derivation with frame remap; NLI + merge arms threaded; star-schema escape untouched | derivation table + admit/refuse arm pair; suites + units scope + spotcheck PASS; PP TPC-H 22/22 MATCH (provably inert until C-04, no sweep triggered); review APPROVE-WITH-NITS (5 addressed); ppi_rows ledger row |
 
 ## Dropped
