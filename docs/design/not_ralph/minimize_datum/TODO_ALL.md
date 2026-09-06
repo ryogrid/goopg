@@ -1664,7 +1664,11 @@ per arm; values never counts for projection/join-adjacent changes).*
     rationale, "so that we needn't recompute it"); `buildKeyOfRow` and
     `batchKeySlot` are retired and nothing derives a build key from a
     RETAINED row. Behaviour-identical, one expression evaluation per
-    reloaded row cheaper.
+    reloaded row cheaper. Gates: executor suite + units scope green,
+    25 batching/spill/shared-build tests uncached green, `-race` on the
+    parallel hash set clean, **TPC-H SF=1 values 24/24 MATCH** on a fresh
+    capped server (`analysis/minimize-datum/e14-keyed-inner-frame-20260906/`;
+    the spilling labels Q9/Q16/Q18/Q21 are among them).
   - **Deferred:** Cut A (Semi/Anti zero-width retention) and Cut B
     (INNER keep-set + the `deformJoinBounds` walk generalised to a set
     and threaded through `executor.go`). Both are width changes on

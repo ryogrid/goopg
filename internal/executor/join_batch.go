@@ -461,6 +461,10 @@ func (bs *hashBatchState) writeKeyed(files []*joinBatchFile, b int, h uint32, k 
 	return nil
 }
 
+// write appends one row in the plain hashed frame. Since E-14 gave inner
+// files a keyed frame (writeKeyed), this is the OUTER side's writer and its
+// only caller is writeOuter: a replayed probe row is never filed in the hash
+// table, so it needs the routing hash and nothing else.
 func (bs *hashBatchState) write(files []*joinBatchFile, b int, h uint32, row Row) error {
 	f := files[b]
 	if f == nil {

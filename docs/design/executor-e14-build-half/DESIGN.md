@@ -452,6 +452,28 @@ Resume point: this section plus §3.1's table; the walk to generalise is
 §4a's prerequisite is now landed, so neither cut has to solve the reload
 key any more.
 
+### 7.1 What the prerequisite actually cleared (measured)
+
+The keyed-frame commit was gated as follows, and the TPC-H arm was taken
+after the cluster freed up mid-session:
+
+- full `go test ./internal/executor/` green; `units` scope green;
+- all 25 batching / spill / shared-build tests re-run uncached, green;
+- `go test -race` on the parallel hash set clean (the pre-existing
+  `TestSubquerySemanticsMatrix/M20` `instrumentScope` race,
+  ledger `take3-instrumentscope-datarace`, is not in that set);
+- **TPC-H SF=1 values: 24/24 MATCH** against the value baseline
+  (`bench/tpch/baseline-digests.txt`), fresh capped server on a
+  flock-held :65433, artifact
+  `analysis/minimize-datum/e14-keyed-inner-frame-20260906/`. The labels
+  that spill at bench `work_mem` — the only ones that reach
+  `loadInnerBatch`, the one path this change alters — are among them
+  (Q9, Q16, Q18, Q21).
+
+No timing arm: the change is inert by construction and the cluster was
+borrowed between two other agents' runs. The deferred cuts (§8, §8b) are
+what still need the full alloc + geometry + timing gate.
+
 ## 8a. Status of this document's cuts
 
 | cut | state |
