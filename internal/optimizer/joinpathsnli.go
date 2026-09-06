@@ -42,16 +42,20 @@ import (
 // lateral relids join unconditionally.
 //
 // FRAME RULE (C-08 design §4 — binding): SJI Min hands are
-// statement-leaf-global while this problem numbers its items 1<<i, so
-// hands are remapped by the problem's item run (`items[i]` owns
-// statement leaf `lo+i`): shift right by lo, mask to n bits. Dropped
-// outside bits cannot change an overlap verdict for problem-internal
-// joinrelids/req — exact, not merely fail-closed (DESIGN §4 proves the
-// identity). The run must be single-leaf-consecutive
-// (`items[i].lo == lo+i && items[i].hi == lo+i+1`); anything else (gaps,
-// multi-leaf items, empty run) returns 0 — today's constant. Lateral
-// union is 0 by invariant (no LATERAL shape reaches path generation;
-// DESIGN §3 anchors the decline paths).
+// statement-leaf-global while this problem numbers its items 1<<i. Since
+// the C-04a Q72 fix the hands arrive ALREADY in item space —
+// `sjInfosInItemSpace` (relfromjoinlist.go) remaps the whole list once per
+// problem, for every consumer — so the shift-by-lo this function used to
+// perform is gone; only the mask to n bits remains (it strips the
+// outside-window marker bit the remap keeps). Dropped outside bits cannot
+// change an overlap verdict for problem-internal joinrelids/req — exact,
+// not merely fail-closed (DESIGN §4 proves the identity). The run must
+// still be single-leaf-consecutive (`items[i].hi == items[i].lo+1`);
+// anything else (multi-leaf items, empty run) returns 0 — today's
+// constant, kept deliberately so this fix moves no plan the remap does
+// not have to (widening it to nested items is its own, measured step).
+// Lateral union is 0 by invariant (no LATERAL shape reaches path
+// generation; DESIGN §3 anchors the decline paths).
 func paramSourceRelsForProblem(joinrelids RelSet, joinInfoList []*SpecialJoinInfo, items []joinlistRel) RelSet {
 	if len(items) == 0 {
 		return 0
@@ -86,8 +90,8 @@ func paramSourceRelsForProblem(joinrelids RelSet, joinInfoList []*SpecialJoinInf
 		if sj.Jointype == parser.JoinRight {
 			continue
 		}
-		minL := (sj.MinLefthand >> uint(lo)) & mask
-		minR := (sj.MinRighthand >> uint(lo)) & mask
+		minL := sj.MinLefthand & mask
+		minR := sj.MinRighthand & mask
 		if relsOverlap(joinrelids, minR) && !relsOverlap(joinrelids, minL) {
 			out |= all &^ minR
 		}

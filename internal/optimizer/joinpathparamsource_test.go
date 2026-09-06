@@ -73,24 +73,112 @@ func TestParamSourceRelsDerivation(t *testing.T) {
 
 func TestParamSourceRelsRemap(t *testing.T) {
 	// Sub-problem over statement leaves [2,4): problem bit i =
-	// statement leaf 2+i. SJI hands stay statement-global.
+	// statement leaf 2+i. SJI hands are statement-global on the way IN and
+	// are put into item space by `sjInfosInItemSpace` (the C-04a Q72 fix
+	// moved the remap there, out of this function, so that every consumer
+	// of the list — `joinIsLegal` first — reads the same coordinates).
 	sj := psSJI(parser.JoinLeft, 0b100, 0b1000) // stmt leaf 2 LEFT JOIN stmt leaf 3
 	items := psItems(2, 2)
+	sjis, err := sjInfosInItemSpace([]*SpecialJoinInfo{sj}, items)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Problem joinrel {1} (= stmt leaf 3, the RHS): overlap RHS,
 	// not LHS → all{0,1} − {1} = {0}.
-	if got := paramSourceRelsForProblem(0b10, []*SpecialJoinInfo{sj}, items); got != 0b01 {
+	if got := paramSourceRelsForProblem(0b10, sjis, items); got != 0b01 {
 		t.Errorf("remapped partial RHS = %04b, want 0001", got)
 	}
 	// Problem joinrel {0} (= stmt leaf 2, the LHS): no RHS overlap → 0.
-	if got := paramSourceRelsForProblem(0b01, []*SpecialJoinInfo{sj}, items); got != 0 {
+	if got := paramSourceRelsForProblem(0b01, sjis, items); got != 0 {
 		t.Errorf("remapped LHS = %04b, want 0", got)
 	}
 	// Remap-exactness: same SJI on the aligned problem (lo=0 run over
 	// the same two leaves renumbered) must agree bit-for-bit.
 	aligned := psSJI(parser.JoinLeft, 0b001, 0b010)
-	if got, want := paramSourceRelsForProblem(0b10, []*SpecialJoinInfo{sj}, items),
+	if got, want := paramSourceRelsForProblem(0b10, sjis, items),
 		paramSourceRelsForProblem(0b10, []*SpecialJoinInfo{aligned}, psItems(0, 2)); got != want {
 		t.Errorf("remap breaks equivalence: sub-problem %04b vs aligned %04b", got, want)
+	}
+}
+
+// TestSJInfosInItemSpace pins the C-04a Q72 mechanism at the function that
+// fixes it. Q72's joinlist after `join_collapse_limit` splits its nine inner
+// links is `[sub(leaves 0..7), d3, promotion, catalog_returns]`: a 4-item
+// problem whose two LEFT SJIs name leaves 9 and 10 as their nullable sides.
+// Un-remapped, no item-space joinrel ever overlaps bit 9 or 10, `joinIsLegal`
+// finds neither SJI relevant, and both LEFT links come back as INNER joins —
+// 100 → 84 rows on the SF0.5 oracle.
+func TestSJInfosInItemSpace(t *testing.T) {
+	items := []joinlistRel{
+		{lo: 0, hi: 8}, // the sub-problem: leaves 0..7 as ONE item
+		{lo: 8, hi: 9},
+		{lo: 9, hi: 10},
+		{lo: 10, hi: 11},
+	}
+	promo := psSJI(parser.JoinLeft, 0b000000001, 0b1000000000)       // {cs} LEFT {promotion}
+	promo.SynLefthand = 0b111111111                                    // the whole 9-leaf chain
+	cr := psSJI(parser.JoinLeft, 0b000000001, 0b10000000000)          // {cs} LEFT {catalog_returns}
+	cr.SynLefthand = 0b1111111111                                      // chain + promotion
+	got, err := sjInfosInItemSpace([]*SpecialJoinInfo{promo, cr}, items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d SJIs, want 2", len(got))
+	}
+	// Both hands land on items: {cs} is inside item 0; promotion IS item 2;
+	// catalog_returns IS item 3.
+	if got[0].MinLefthand != 0b0001 || got[0].MinRighthand != 0b0100 {
+		t.Errorf("promotion SJI = L %04b R %04b, want L 0001 R 0100", got[0].MinLefthand, got[0].MinRighthand)
+	}
+	if got[0].SynLefthand != 0b0011 || got[0].SynRighthand != 0b0100 {
+		t.Errorf("promotion SJI syn = L %04b R %04b, want L 0011 R 0100", got[0].SynLefthand, got[0].SynRighthand)
+	}
+	if got[1].MinLefthand != 0b0001 || got[1].MinRighthand != 0b1000 {
+		t.Errorf("catalog_returns SJI = L %04b R %04b, want L 0001 R 1000", got[1].MinLefthand, got[1].MinRighthand)
+	}
+	// The inputs are untouched: the remap is a copy, because the same list
+	// is remapped again, differently, by every sub-problem.
+	if promo.MinRighthand != 0b1000000000 || cr.MinRighthand != 0b10000000000 {
+		t.Fatal("sjInfosInItemSpace mutated its input")
+	}
+
+	// Inside the 8-leaf sub-problem the same two SJIs have their nullable
+	// sides OUTSIDE the window. They must keep a non-empty RHS (the marker
+	// bit just above the window) so `joinIsLegal`'s first test skips them
+	// exactly as it skipped the leaf-space bits 9 and 10 before — zeroing
+	// the hand would make `relsSubset(0, x)` true in three consumers.
+	sub := make([]joinlistRel, 8)
+	for i := range sub {
+		sub[i] = joinlistRel{lo: i, hi: i + 1}
+	}
+	inner, err := sjInfosInItemSpace([]*SpecialJoinInfo{promo, cr}, sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := RelSet(1) << 8
+	for i, sj := range inner {
+		if sj.MinRighthand != outside {
+			t.Errorf("sub-problem SJI %d RHS = %#x, want the outside marker %#x", i, sj.MinRighthand, outside)
+		}
+		if sj.MinLefthand != 0b1 {
+			t.Errorf("sub-problem SJI %d LHS = %04b, want 0001 ({cs} is leaf 0)", i, sj.MinLefthand)
+		}
+		if got := sj.SynLefthand & (outside - 1); got != 0b11111111 {
+			t.Errorf("sub-problem SJI %d syn LHS window part = %08b, want all eight leaves", i, got)
+		}
+	}
+	// The identity case: single-leaf items from leaf 0 change nothing.
+	id, err := sjInfosInItemSpace([]*SpecialJoinInfo{psSJI(parser.JoinLeft, 0b01, 0b10)}, psItems(0, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id[0].MinLefthand != 0b01 || id[0].MinRighthand != 0b10 {
+		t.Errorf("identity remap = L %04b R %04b", id[0].MinLefthand, id[0].MinRighthand)
+	}
+	// nil in, nil out — the seam's no-outer-join fast paths key on length.
+	if got, _ := sjInfosInItemSpace(nil, items); got != nil {
+		t.Errorf("nil list remapped to %v", got)
 	}
 }
 

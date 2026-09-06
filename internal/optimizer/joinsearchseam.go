@@ -355,13 +355,23 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		conjuncts = append(conjuncts, synth...)
 	}
 	// C-04a: an admitted outer link's `ON` conjuncts join the list only HERE,
-	// after the equivalence-class constant inference has run. Propagating a
-	// constant across an outer join's own equality is arguably sound (the join
-	// clause equates the two columns on every row that matches, and filtering
-	// the nullable side by it drops no matching row), but it is an
-	// optimisation, and admitting it would make C-04a move plans on shapes
-	// that have nothing to do with join ORDER. Withheld deliberately, not
-	// forgotten.
+	// after the equivalence-class constant inference has run, so the closure
+	// never merges a nullable-side column into a preserved-side class (that
+	// would let a WHERE constant on the preserved side be stated as a
+	// PRESERVED-side restriction derived through a nullable member, or a
+	// transitive equality reorder across the link).
+	//
+	// What IS propagated across the link is PG's `reconsider_outer_join_clauses`
+	// (equivclass.c): for an ON conjunct `pres = null` whose preserved-side
+	// column is equated to a constant, the nullable side gains `null = const`
+	// — `deriveOuterLinkConstants` below. C-04a first withheld this as "an
+	// optimisation", and the SF0.5 gate showed it is the optimisation the
+	// pre-admission tree already performed (`deriveConstAcrossJoinEquality`,
+	// inner_join_qual_pushdown.go, on the syntactic LEFT node the seam used to
+	// peel): TPC-DS Q78's `ss LEFT JOIN ws ON ws_sold_year = ss_sold_year …
+	// WHERE ss_sold_year = 1998` lost `ws_sold_year = 1998` on the nullable
+	// CTE reference and, through it, `d_year = 1998` inside the CTE body —
+	// `date_dim` fed the channel unfiltered, 490x larger, 15 s → timeout.
 	//
 	// Each conjunct must then reach a place that is AT or BELOW its link's
 	// join in a way that preserves outer-join semantics, and `outerOnQualsOK`
@@ -390,7 +400,13 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			traceSeamDecline("outer-on-qual", nrels, nprefix)
 			return node, pred, false
 		}
+		// Derived BEFORE the ON conjuncts join the list: the constants it reads
+		// are then exactly the ones the closure above could see, none of which
+		// sits on a nullable side (a WHERE conjunct reaching one was held
+		// above, and the ON conjuncts are not in the list yet).
+		derived := deriveOuterLinkConstants(outerLinks, conjuncts, cumOffsets)
 		conjuncts = append(conjuncts, onOuter...)
+		conjuncts = append(conjuncts, derived...)
 	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
 	leaves := make([]Node, nprefix)
@@ -658,6 +674,102 @@ func outerLinksHaveSJInfos(links []outerChainLink, list []*SpecialJoinInfo) bool
 		}
 	}
 	return true
+}
+
+// deriveOuterLinkConstants is `reconsider_outer_join_clauses` (equivclass.c)
+// for the admitted LEFT links: for each ON conjunct `pres = null` — bare
+// column references of one type, one on the link's preserved side and one on
+// its nullable side — whose preserved column is equated to a constant by the
+// searched conjunct list, it synthesises `null = const` for the nullable side.
+//
+// Soundness (the same argument `deriveConstAcrossJoinEquality` makes for the
+// syntactic tree, restated for the seam): a nullable-side row can only MATCH a
+// preserved row on which `pres = null` holds, and every preserved row that
+// survives to the join satisfies `pres = const`, so a nullable row with
+// `null <> const` was headed for no match at all. Filtering it out before the
+// join removes only rows that produced nothing, and the preserved rows they
+// would not have matched are null-extended exactly as before. That is why the
+// derived conjunct may sit BELOW the outer join where the original constant may
+// not.
+//
+// Two placements are fail-closed here, because the conjunct's only correct
+// destination is the nullable LEAF:
+//
+//   - it is produced only when `partitionConjunctsForJoinPlanning` will make it
+//     leaf-local (`conjunctIsLocalEligible` and a single attributable table —
+//     the same two tests `outerOnQualsOK` applies to a nullable-side-only ON
+//     conjunct). A conjunct the partition would hand to the join list could
+//     end in the residual `Filter` above the tree, where it would drop the
+//     null-extended rows — so it is simply not derived;
+//   - the preserved column must not reach ANY admitted link's nullable side
+//     (stacked LEFT links: the upper link's preserved side contains the lower
+//     link's nullable one). The constants in `conjuncts` cannot name such a
+//     column today (a WHERE conjunct reaching a nullable side is held above),
+//     but the derivation states its own precondition rather than relying on
+//     the caller's.
+//
+// Like the closure it extends it is deterministic in the link and conjunct
+// order it was given, so the synthesised list is reproducible run to run.
+func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, cumOffsets []int) []Expr {
+	if len(links) == 0 {
+		return nil
+	}
+	constByIdent := make(map[columnIdent]Expr)
+	for _, c := range conjuncts {
+		cr, konst, ok := isColumnRefConstEquality(c)
+		if !ok {
+			continue
+		}
+		if _, dup := constByIdent[identOf(cr)]; !dup {
+			constByIdent[identOf(cr)] = konst
+		}
+	}
+	if len(constByIdent) == 0 {
+		return nil
+	}
+	var anyNullable RelSet
+	for _, lk := range links {
+		anyNullable |= lk.nullable
+	}
+	var out []Expr
+	seen := make(map[columnIdent]bool)
+	for _, lk := range links {
+		for _, c := range splitAnd(lk.pred) {
+			a, b, ok := isColumnRefEquality(c) // same-type bare refs only
+			if !ok {
+				continue
+			}
+			ra, okA := relidsOfExpr(a, cumOffsets)
+			rb, okB := relidsOfExpr(b, cumOffsets)
+			if !okA || !okB || ra == 0 || rb == 0 {
+				continue
+			}
+			var pres, null *ColumnRef
+			var rpres RelSet
+			switch {
+			case relsSubset(ra, lk.preserved) && relsSubset(rb, lk.nullable):
+				pres, null, rpres = a, b, ra
+			case relsSubset(rb, lk.preserved) && relsSubset(ra, lk.nullable):
+				pres, null, rpres = b, a, rb
+			default:
+				continue
+			}
+			if relsOverlap(rpres, anyNullable) {
+				continue
+			}
+			konst, ok := constByIdent[identOf(pres)]
+			if !ok || seen[identOf(null)] {
+				continue
+			}
+			d := &BinaryOp{Op: parser.OpEq, Left: null, Right: konst}
+			if !conjunctIsLocalEligible(d) || tableForCol(d, cumOffsets) < 0 {
+				continue
+			}
+			out = append(out, d)
+			seen[identOf(null)] = true
+		}
+	}
+	return out
 }
 
 // outerOnQualsOK proves, per conjunct, that every admitted outer link's `ON`

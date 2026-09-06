@@ -361,6 +361,88 @@ func (prob *joinlistProblem) leafRel(rel int) (joinlistRel, error) {
 	}, nil
 }
 
+// sjInfosInItemSpace rewrites every SpecialJoinInfo hand from statement-leaf
+// coordinates into the coordinates of ONE search problem — PG has no such step
+// because its joinrels are always base-relid sets, so a sub-joinlist's rel
+// simply carries the union of its leaves; goopg's search numbers a problem's
+// ITEMS `1<<i` and a sub-problem is one opaque item, so a leaf-space hand has
+// to be re-expressed before `joinIsLegal`, `joinOrderRestricted`,
+// `hasJoinRestriction`, `sizeJoinRel` and `paramSourceRelsForProblem` read it.
+//
+// The rule, per hand: item i is a member iff the hand overlaps the leaf range
+// `[items[i].lo, items[i].hi)`. For a single-leaf run starting at leaf 0 this
+// is the identity, which is why every C-03/C-04a fixture passed without it.
+// A hand that touches an item only partially (an outer join's `MinLefthand`
+// narrowed by C-01 to one leaf of an 8-leaf sub-problem) maps to the whole
+// item, which is a STRICTER constraint than the statement's — the item is
+// planned as a unit, so "must contain leaf 0" and "must contain the item
+// holding leaf 0" admit the same item-space joinrels.
+//
+// Leaves OUTSIDE this problem's window — the spine above a peeled prefix,
+// or the enclosing problem's other items when this is a sub-problem — are
+// kept, as one bit just above the window (`1<<len(items)`), rather than
+// dropped. A joinrel of this problem never contains that bit, so every
+// overlap/subset test answers exactly as it did when the outside leaves were
+// bits at or above `nprefix` in the un-remapped list: an SJI whose nullable
+// side lies wholly outside is skipped by `joinIsLegal`'s first test, and the
+// FULL arm of `paramSourceRelsForProblem` still sees a non-empty RHS it does
+// not overlap. Zeroing them instead would turn `relsSubset(0, x)` true in
+// three consumers and change verdicts this fix has no business changing.
+//
+// Fail-closed: a hand cannot need the outside bit when the problem already
+// uses all 32 bits (32 single-leaf items cover every statement leaf), so
+// that combination is reported rather than silently truncated.
+func sjInfosInItemSpace(list []*SpecialJoinInfo, items []joinlistRel) ([]*SpecialJoinInfo, error) {
+	if len(list) == 0 {
+		return nil, nil
+	}
+	var window RelSet
+	ranges := make([]RelSet, len(items))
+	for i, it := range items {
+		ranges[i] = leafRangeRelSet(it.lo, it.hi)
+		window |= ranges[i]
+	}
+	outside := RelSet(1) << uint(len(items))
+	remap := func(hand RelSet) (RelSet, error) {
+		var out RelSet
+		for i := range items {
+			if relsOverlap(hand, ranges[i]) {
+				out |= RelSet(1) << uint(i)
+			}
+		}
+		if hand&^window != 0 {
+			if len(items) >= maxSearchRels {
+				return 0, fmt.Errorf("join search: SpecialJoinInfo hand %#08x reaches outside a %d-item problem that has no spare bit",
+					uint32(hand), len(items))
+			}
+			out |= outside
+		}
+		return out, nil
+	}
+	out := make([]*SpecialJoinInfo, 0, len(list))
+	for _, sj := range list {
+		if sj == nil {
+			continue
+		}
+		c := *sj
+		var err error
+		if c.MinLefthand, err = remap(sj.MinLefthand); err != nil {
+			return nil, err
+		}
+		if c.MinRighthand, err = remap(sj.MinRighthand); err != nil {
+			return nil, err
+		}
+		if c.SynLefthand, err = remap(sj.SynLefthand); err != nil {
+			return nil, err
+		}
+		if c.SynRighthand, err = remap(sj.SynRighthand); err != nil {
+			return nil, err
+		}
+		out = append(out, &c)
+	}
+	return out, nil
+}
+
 // searchOneProblem runs the three-step search protocol over a list of items and
 // returns the chosen tree as one rel.
 //
@@ -389,7 +471,22 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	}
 	cum[len(items)] = prob.cumOffsets[hi]
 
-	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, prob.joinInfoList)
+	// C-04a fix (Q72): `root->join_info_list` is written in STATEMENT-LEAF
+	// coordinates, and this problem searches in ITEM coordinates. They are the
+	// same space only for the one shape the C-03/C-04a fixtures exercised — a
+	// run of single-leaf items starting at leaf 0. The moment
+	// `join_collapse_limit` splits a JOIN chain (Q72: nine inner links, so the
+	// first eight leaves become ONE sub-problem item and the two LEFT links
+	// are items 2 and 3 of a 4-item problem), the SJI's `MinRighthand` names a
+	// leaf bit no item-space joinrel ever contains, `joinIsLegal` never finds
+	// it relevant, and the LEFT link is searched as an INNER join — the
+	// sjinfo==nil arm, 100 → 84 rows. The list is remapped here, once per
+	// problem, before anything reads it.
+	sjis, err := sjInfosInItemSpace(prob.joinInfoList, items)
+	if err != nil {
+		return joinlistRel{}, err
+	}
+	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, sjis)
 	if err != nil {
 		return joinlistRel{}, err
 	}
