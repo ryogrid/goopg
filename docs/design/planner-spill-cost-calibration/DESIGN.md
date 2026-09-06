@@ -163,6 +163,20 @@ sort side by Cuts 1–2. Any later scalar must be per-side.
 **Cut 4 — resume the three blocked items** against the calibrated model,
 in their own order (B-13, then B-15, then E-16).
 
+### Status, 2026-09-06
+
+| cut | state |
+|---|---|
+| Cut 1 — sort `avgVarBytes` (§3.3) | **pending** — one-line change in `cost_funcs.go` + `joinpathsmerge.go`, held while C-19d owns those files |
+| Cut 2 — sort spill trigger (§3.2) | **deferred behind Cuts 1/3** by probe 6.1: inert on the current TPC-H plan set; gate it on a forced shape or E-16's reduced `work_mem` |
+| Cut 3 — derived `SpillBytes` model | **half landed** (`53cd7a073`): the model and its three encoder-agreement tests are in `internal/executor/hashsize`, INERT. Wiring `spillPages` to call it, and its plan/timing gate, is the remaining half — also held on `cost_funcs.go` |
+| Cut 4 — resume B-13 / B-15 / E-16 | not started |
+
+Landing Cut 3's model separately from its wiring is deliberate: the model
+is derivable and testable with no bench at all, while the wiring moves
+plans and needs the full arm. It also means the encoder-agreement test is
+already protecting the transcription before anything depends on it.
+
 ## 5. What a negative result looks like, stated in advance
 
 C-20d's method includes the part that makes it honest: sweep several
