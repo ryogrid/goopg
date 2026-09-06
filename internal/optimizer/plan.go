@@ -2653,6 +2653,13 @@ func (n *SetOp) Output() Schema { return n.Left.Output() }
 // the shutdown correct".
 type Gather struct {
 	PlanCost
+	// searchedTree: C-19f. A Gather became a root `createPlanNode` can return
+	// the moment a partial JOIN path made one winnable at a search root
+	// (`generateUsefulGatherPaths` over `try_partial_hashjoin_path`), and
+	// `markSearchedTree` panics rather than silently declining on a kind that
+	// cannot carry the tag — an untagged searched subtree would be walked
+	// again by the legacy posmap family and permuted twice.
+	searchedTree
 	pos   int
 	Child Node
 	// WorkersPlanned is the worker count chosen at plan time. EXPLAIN renders
@@ -2684,6 +2691,8 @@ func NewGather(pos int, child Node, nWorkers int) *Gather {
 // P7 of docs/design/parallel-query/ (chapter 05 §4).
 type GatherMerge struct {
 	PlanCost
+	// searchedTree: see *Gather. C-19e/C-19f make this reachable too.
+	searchedTree
 	pos            int
 	Child          Node
 	WorkersPlanned int

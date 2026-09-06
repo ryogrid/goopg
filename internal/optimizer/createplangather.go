@@ -34,7 +34,14 @@ import "fmt"
 // the same statement `createSortPlan` makes about a sort.
 func createGatherPlan(p *Path) (Node, outputLayout) {
 	child, layout, workers := gatherChildPlan(p, "PathGather")
-	return &Gather{pos: child.Pos(), Child: child, WorkersPlanned: workers}, layout
+	// Through `NewGather`, never a struct literal: the constructor is what
+	// carries `schema: child.Output()`, and a Gather whose schema is unset
+	// reports ZERO output columns. C-19d built the node with a literal, which
+	// no test caught because no Gather path could yet be CHOSEN at a search
+	// root — the moment C-19f made one winnable, `createPlanAtSearchRootRange`
+	// panicked with "search root layout is 5 columns but its output is 0".
+	// An unwinnable path is an untested path.
+	return NewGather(child.Pos(), child, workers), layout
 }
 
 // createGatherMergePlan is `create_gather_merge_plan` (createplan.c:1954): the
@@ -68,7 +75,8 @@ func createGatherMergePlan(p *Path) (Node, outputLayout) {
 		}
 		keys[i] = SortKey{Expr: e, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst}
 	}
-	return &GatherMerge{pos: child.Pos(), Child: child, WorkersPlanned: workers, Keys: keys}, layout
+	// Via the constructor, for the reason createGatherPlan states.
+	return NewGatherMerge(child.Pos(), child, workers, keys), layout
 }
 
 // gatherChildPlan is the preparation both arms share: build the one child,
