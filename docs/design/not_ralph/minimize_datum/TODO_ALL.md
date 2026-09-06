@@ -1044,8 +1044,52 @@ rule).*
 - [ ] **C-17 P4-08 `tuple_fraction` end-to-end** (every upper rel, not only
   the join search).
   *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
-- [ ] **C-18 P4-09 `create_window_paths`** + set-operation paths, priced.
-  *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
+- [x] **C-18 P4-09 `create_window_paths`** + set-operation paths, priced.
+  DESIGNED 2026-09-07: `docs/design/planner-p4-window-setop-paths/DESIGN.md`
+  (written by an agent that ran out of session before any code). LANDED
+  2026-09-07 (`windowsetoppaths.go`): the WINDOW upper rel takes ONE
+  `PathWindow` per spec group stacked into a single candidate and
+  `add_path`ed once (`create_one_window_path`, planner.c:4620 — one path per
+  chain, not per group), priced by `costWindow` = `cost_windowagg`'s three
+  per-input-row terms PLUS the internal sort, which PG stacks as a separate
+  `create_sort_path` and goopg's `windowOp` performs inside the node; the
+  SETOP upper rel takes one `PathSetOp` over TWO seeds (the only two-input
+  upper candidate in the tree), priced by `cost_append` when the executor
+  streams (UNION ALL) and by `create_setop_path`'s hashed arm
+  (pathnode.c:3849) when it buffers — `setOpStreams` mirrors `newSetOp`'s own
+  predicate so price and operator cannot disagree. Both single-candidate by
+  construction: goopg's window executor sorts internally (no presorted
+  variant to offer until C-14) and its set-op executor has one form per node.
+  **Two DESIGN deviations, both deliberate.** (i) The design named three
+  `*SetOp` sites; only `applySetOp` is a set operation — the partition- and
+  inheritance-expansion fan-outs reuse the `*SetOp` NODE but are PG
+  APPENDRELS below the upper-rel pipeline (`add_paths_to_append_rel`), and
+  filing them on the SETOP rel would transcribe a node-reuse coincidence as
+  a PG structure; they are untouched. (ii) The design's
+  `costSortRun(cp, rows, nkeycols, 0, -1)` was wrong in its third argument:
+  `ncols` sizes one ROW for the external-merge arm, so the key count would
+  model a 2-column row and suppress the disk charge — the input's real
+  column count and `AvgVarBytes` are passed, pinned by
+  `TestCostWindowSortTermUsesRowWidthNotKeyCount`. **One real defect found in
+  implementation**: `fetch_upper_rel(SETOP, 0)` shares ONE rel across a
+  chain, so `A INTERSECT B EXCEPT C` had the outer node's
+  `getCheapestFractionalPath` answer with the inner node's candidate and the
+  executor's set-op precedence suite went red (wrong rows, not a cost move).
+  PG keys its SETOP rel by the node's relids (prepunion.c:805);
+  `newUpperRelForNode` allocates one rel per node with a synthetic
+  distinctness key, since goopg has no relids above the seam.
+  Gates on isolated HEAD(866e6fe7e)+C-18-only A/B: optimizer+executor suites
+  + vet green; TPC-H plan capture byte-identical, digests byte-identical
+  24/24, plan-gate exit 0, PLAN-PARITY 5/15/2 unchanged, timing −0.2%
+  (139.4 s → 139.1 s; Q9 +70.9% on an IDENTICAL plan — a known-volatile
+  query, 4.16/7.16 s across arms of the same binary); TPC-DS SF0.5 sweep
+  PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, plan shapes 99/99 same.
+  No re-pin (zero moves). As designed, NOTHING observable moved: the prices
+  are selection-neutral (one candidate) and display-invisible (`*WindowAgg`
+  and `*SetOp` carry no `PlanCost`) — the gate's PASS condition is shape
+  identity, not cost movement.
+  *design: take3 08 §7 + `docs/design/planner-p4-window-setop-paths/DESIGN.md`;
+  gate: take3 09 §5 P4 (PP).*
 - [x] **C-19a P5-01 `consider_parallel` per rel.** Landed 2026-09-06
   (`considerparallel.go`): `set_rel_consider_parallel` per base rel (temp,
   virtual catalog, TABLESAMPLE args, CTE, VALUES, SRF proparallel+args,
@@ -1230,10 +1274,30 @@ rule).*
   `pg-plan-parity-diff.py` cannot judge a parallel plan until they read
   a post-pass-inclusive capture (§10.8); the D-05 re-run at 1× is next
   and must explain Q9.*
-- [ ] **C-19g P5-07 partial aggregation as paths**
+- [~] **C-19g P5-07 partial aggregation as paths**
   (`create_partial_grouping_paths`), replacing `splitAggregate`. Depends
-  on C-15.
-  *design: take3 08 §8; gate: take3 09 §5 P5 (PP + values-diff).*
+  on C-15 (landed `40d7a4667`).
+  *design: `docs/design/planner-c19g-partial-agg/DESIGN.md`; take3 08 §8;
+  gate: take3 09 §5 P5 (PP + values-diff).*
+  **LANDED (`866e6fe7e`), mode-gated `GOOPG_PARTIAL_AGG_PATHS`, default
+  OFF.** `createPartialGroupingPaths` (partialaggpaths.go) replaces
+  `splitAggregateIsProfitable`'s five invented constants with a
+  two-candidate PATH tournament — `PathAgg(partial) → PathGather →
+  PathAgg(finalize)` against `PathAgg(simple) → PathGather(whole input)` —
+  priced by `costAgg` + `gatherCost` through `costParams` and adjudicated
+  by `addPath`/`setCheapest`. No new cost function, no new constant.
+  `splitAggregate` remains the only construction site, so double-splitting
+  is structurally impossible and C-19d's `subtreeHasGather` stand-down is
+  untouched. Executor consumer check green (a priced win executes as
+  Finalize→Gather→Partial with byte-identical VALUES at 1/2/4 workers).
+  Two findings recorded in the design: goopg's Partial node emits ZERO
+  rows, so what crosses the boundary is group-STATES (Q1: 16 vs 5.9 M
+  tuples); and the verdict had to be made homogeneous in the input row
+  count because `TableStats.RowCount` is never restored (ledger pq-P6) —
+  a model needing absolute rows would refuse every split including Q1's.
+  REMAINDER (not this slice): the upper-rel-resident port needs one change
+  in `groupingpaths.go` (owned elsewhere) plus an answer to the plan-cache
+  question — see that design's §8.
 - [ ] **C-19h P5-08 retire `MaybeAddGather`.**
   *design: take3 08 §8; gate: take3 09 §5 P5 — plan-parity both suites,
   parallel and serial arms.*

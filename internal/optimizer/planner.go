@@ -1044,7 +1044,19 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// that string values like 'foo' are validated when the left branch
 			// declares a typed column (e.g. numeric). M0097-0056.
 			right = wrapSetOpBranchWithCasts(seg.opPos, acc.Output(), right)
-			return &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll}, nil
+			// C-18 (P4-09): the SETOP upper rel's path for this node —
+			// `createSetOpPaths` (windowsetoppaths.go) prices the two
+			// branches and the set work and rebuilds the node through
+			// `createPlanNode`. Single candidate (goopg's `setOp` has one
+			// executor form per node), so the emitted node is field-for-field
+			// the one built here. `tupleFraction` is 0 until C-17 threads the
+			// statement's fraction to this site.
+			//
+			// Only the genuine set operation is filed here. The
+			// partition/inheritance fan-outs also build `*SetOp{All: true}`,
+			// but those are PG APPENDRELS below the upper-rel pipeline, not
+			// set operations — see windowsetoppaths.go's header.
+			return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll}, plannerSet, 0)
 		}
 		// foldSetOpRange folds segments[lo:hi) onto acc, honouring PostgreSQL's
 		// set-operator precedence: INTERSECT binds tighter than UNION/EXCEPT
@@ -1663,7 +1675,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	var win *windowSurface
 	if needsWindowStage(s) {
 		var err error
-		node, ctx, win, err = buildWindowStage(s, node, ctx, agg)
+		node, ctx, win, err = buildWindowStage(s, node, ctx, agg, upper, plannerSet, orderTupleFraction)
 		if err != nil {
 			return nil, err
 		}
@@ -6696,7 +6708,20 @@ func needsWindowStage(s *parser.SelectStmt) bool {
 	return false
 }
 
-func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, agg *aggregateSurface) (Node, *resolveContext, *windowSurface, error) {
+// buildWindowStage builds one `*WindowAgg` per distinct window specification
+// and chains them. C-18 (P4-09): each group is additionally the WINDOW upper
+// rel's one path — `createWindowPaths` (windowsetoppaths.go) prices the node
+// (its internal sort included) and rebuilds it through `createPlanNode`, on
+// the same rails C-15/C-16 put the aggregate and DISTINCT stages on. The
+// group IS the unit PG prices (`create_one_window_path` emits one WindowAgg
+// per `activeWindows` entry, planner.c:4620), so the producer runs inside the
+// loop, not once around it. Single candidate ⇒ same node, same fields.
+//
+// `upper` is the statement's upper-rel registry, `ps` its planner settings
+// and `tupleFraction` its `root->tuple_fraction` — all three threaded from
+// `planSelectWithSettings`, because `inputCtx` is replaced per group and a
+// fraction read off a derived context would be zero (the C-12 lesson).
+func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, agg *aggregateSurface, upper *upperRels, ps PlannerSettings, tupleFraction float64) (Node, *resolveContext, *windowSurface, error) {
 	calls, err := collectWindowCalls(s)
 	if err != nil {
 		return nil, nil, nil, err
@@ -6729,6 +6754,10 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 	currentChild := child
 	currentCtx := inputCtx
 	combinedByKey := make(map[string]windowBinding)
+	// C-18 (P4-09): every spec group's `*WindowAgg`, bottom-up — upstream's
+	// `activeWindows` list, which `create_one_window_path` consumes as a
+	// single stack of paths.
+	var windowChain []*WindowAgg
 
 	for _, g := range groups {
 		partition := make([]Expr, 0, len(g.calls[0].Over.PartitionBy))
@@ -6782,8 +6811,14 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		}
 		// B-01c third cut: keys-only construction stamp (above not yet
 		// built). Payload-only, no plan change — mirrors the Aggregate
-		// (buildAggregateStage) and Sort construction stamps.
+		// (buildAggregateStage) and Sort construction stamps. It runs on the
+		// node built here, and the C-18 producer's field copy carries the
+		// stamp into the emitted twin.
 		stampWindowInputTarget(windowNode, nil)
+		// C-18 (P4-09): collect the chain bottom-up for the WINDOW upper
+		// rel's single path, built after the loop (`create_one_window_path`
+		// stacks every clause on ONE path and add_paths it once).
+		windowChain = append(windowChain, windowNode)
 		currentChild = windowNode
 		currentCtx = newResolveContext(nil, outputSchema, inputCtx.settings)
 		// A-01(ii) cut 2: derived stage contexts inherit the statement
@@ -6795,6 +6830,20 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		}
 	}
 
+
+	// C-18 (P4-09): the WINDOW upper rel's one path over the whole chain.
+	// The producer returns a fresh chain of `*WindowAgg`s with the same specs
+	// over the same input (single candidate ⇒ field-for-field the nodes built
+	// above), and the stage adopts its top. The `windowSurface` carries only
+	// contexts and column bindings, both derived from schemas the copies
+	// share, so it needs no rebuild.
+	if len(windowChain) > 0 {
+		built, werr := createWindowPaths(upper, windowChain, child, ps, tupleFraction)
+		if werr != nil {
+			return nil, nil, nil, werr
+		}
+		currentChild = built
+	}
 
 	surface := &windowSurface{input: inputCtx, agg: agg, output: currentCtx, windowByKey: combinedByKey}
 	return currentChild, currentCtx, surface, nil

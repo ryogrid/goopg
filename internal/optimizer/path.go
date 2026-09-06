@@ -66,6 +66,18 @@ const (
 	// consumed only by `createDistinctPlan`, because goopg's executor
 	// expresses the choice as `*Distinct` vs all-columns `*DistinctOn`.
 	PathDistinct
+	// PathWindow is C-18's (P4-09) WINDOW upper-rel candidate: window-function
+	// evaluation over one input. Produced only by `addWindowPaths`
+	// (windowsetoppaths.go) and consumed only by `createWindowPlan`. There is
+	// exactly one form — goopg's `windowOp` sorts internally, so no presorted
+	// variant exists to distinguish (C-14 is the resume point).
+	PathWindow
+	// PathSetOp is C-18's (P4-09) SETOP upper-rel candidate: one
+	// UNION/INTERSECT/EXCEPT node over TWO inputs. It is the only two-input
+	// upper candidate in the tree — `Children` holds left then right, the
+	// order `createSetOpPlan` reads them back in. Produced only by
+	// `addSetOpPaths` and consumed only by `createSetOpPlan`.
+	PathSetOp
 	PathGather
 	PathGatherMerge
 	// PathMemoize is PG's `MemoizePath` (pathnodes.h:2079): a caching wrapper
@@ -167,6 +179,18 @@ type Path struct {
 	// (C-16b). Never pruned on: costs alone decide, exactly as for every
 	// other path attribute above.
 	Unique bool
+
+	// Window is the window SPEC a PathWindow evaluates — the `*WindowAgg`
+	// `buildWindowStage` built for one spec group (PartitionBy, OrderBy,
+	// Funcs, Frame, pos, schema), whose Child the arm replaces with the
+	// built input. nil for every other kind; `createWindowPlan` panics on a
+	// PathWindow without one, as `createAggPlan` does for PathAgg. C-18.
+	Window *WindowAgg
+
+	// SetOp is the set-operation SPEC a PathSetOp performs — the `*SetOp`
+	// the `applySetOp` fold built (Op, All, pos), whose Left/Right the arm
+	// replaces with the two built inputs. nil for every other kind. C-18.
+	SetOp *SetOp
 
 	Rel *RelOptInfo
 

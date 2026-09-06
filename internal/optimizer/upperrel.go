@@ -111,6 +111,43 @@ func fetchUpperRel(u *upperRels, kind UpperRelKind, relids RelSet, tupleFraction
 	return rel
 }
 
+// newUpperRelForNode allocates a FRESH upper rel of `kind`, never reusing an
+// existing one — the allocator for the case PG has and goopg cannot express:
+// an upper rel keyed by a NON-EMPTY relids set.
+//
+// PG's set-operation planning is the whole motivation. `generate_union_paths`
+// and `generate_nonunion_paths` call `fetch_upper_rel(root, UPPERREL_SETOP,
+// relids)` (prepunion.c:805, :1131) with the union of the leaf RT indexes the
+// node covers, so `A UNION B UNION C` gets TWO distinct SETOP rels — {A,B} for
+// the inner node and {A,B,C} for the outer. goopg plans set-op branches as
+// opaque finished Nodes above the search seam and has no relids for them, so
+// keying by 0 would file every node of a chain on ONE rel; `set_cheapest` and
+// `get_cheapest_fractional_path` would then answer the second node's question
+// with the first node's candidates and the fold would return the wrong subtree
+// entirely. (Observed: the executor's set-op precedence suite went red the
+// moment the SETOP producer shared a rel across a chain.)
+//
+// The synthetic `Relids` below is a DISTINCTNESS KEY, not a relation set: it
+// exists only so the registry's linear search keeps finding the right rel, and
+// nothing reads it as a set. That is safe for exactly the reason DESIGN §3.2
+// item 3 gives — upper rels are never filed in `searchCtx.relMap` or
+// `joinrels`, so no join-search code can mistake it for a base-rel mask.
+// Rendered in the DPPATH trace it shows as a bit position rather than `-`,
+// which is the honest signal that this rel is one of several of its kind.
+func newUpperRelForNode(u *upperRels, kind UpperRelKind, tupleFraction float64) *RelOptInfo {
+	if kind < 0 || kind > UpperFinal {
+		panic("newUpperRelForNode: kind out of range")
+	}
+	rel := &RelOptInfo{
+		Relids:               RelSet(len(u.rels[kind]) + 1),
+		ConsiderStartup:      tupleFraction > 0,
+		ConsiderParamStartup: false,
+		ConsiderParallel:     false,
+	}
+	u.rels[kind] = append(u.rels[kind], rel)
+	return rel
+}
+
 // sizeUpperRelFromNode populates the size fields an upper rel's cost functions
 // read, from the finished Node the rel's first path is built over.
 //

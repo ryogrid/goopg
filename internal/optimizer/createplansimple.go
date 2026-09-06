@@ -204,6 +204,63 @@ func createDistinctPlan(p *Path) (Node, outputLayout) {
 	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema}, nil
 }
 
+// createWindowPlan is the PathWindow arm (C-18): emit the path's window
+// spec over the built input. The spec is COPIED, never rebound in place —
+// the same rule `createAggPlan` follows, so a sibling candidate (C-14's
+// presorted window, when an Incremental Sort executor exists) cannot see
+// another candidate's child.
+//
+// The B-01c input-target stamp is NOT applied here: `buildWindowStage`
+// stamps it on the emitted node after the producer returns, the same
+// ordering the aggregate site uses.
+//
+// The returned layout is nil, as for the aggregate and distinct arms: a
+// WindowAgg APPENDS columns to its child's schema, so the child's binding
+// map no longer describes the output, and callers above the seam work in
+// Nodes rather than layouts.
+func createWindowPlan(p *Path) (Node, outputLayout) {
+	if p.Window == nil {
+		panic("createPlan: PathWindow with no window spec")
+	}
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathWindow with %d children, want exactly 1", len(p.Children)))
+	}
+	child, _ := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathWindow over a child path that built no node")
+	}
+	out := *p.Window
+	out.Child = child
+	return &out, nil
+}
+
+// createSetOpPlan is the PathSetOp arm (C-18): emit the path's set-operation
+// spec over the two built inputs. `Children[0]` is the LEFT branch and
+// `Children[1]` the RIGHT — the order `addSetOpPaths` appended them in, and
+// the order the semantics depend on (EXCEPT is not commutative, and
+// `SetOp.Output()` reads the left branch's schema).
+//
+// The returned layout is nil for the same reason the other upper arms return
+// nil: a set operation has two children and therefore no single child layout
+// to pass through, and no caller above the seam reads one.
+func createSetOpPlan(p *Path) (Node, outputLayout) {
+	if p.SetOp == nil {
+		panic("createPlan: PathSetOp with no set-op spec")
+	}
+	if len(p.Children) != 2 {
+		panic(fmt.Sprintf("createPlan: PathSetOp with %d children, want exactly 2", len(p.Children)))
+	}
+	left, _ := createPlanNode(p.Children[0])
+	right, _ := createPlanNode(p.Children[1])
+	if left == nil || right == nil {
+		panic("createPlan: PathSetOp over a child path that built no node")
+	}
+	out := *p.SetOp
+	out.Left = left
+	out.Right = right
+	return &out, nil
+}
+
 func createSortPlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 1 {
 		panic(fmt.Sprintf("createPlan: PathSort with %d children, want exactly 1", len(p.Children)))

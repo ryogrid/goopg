@@ -144,6 +144,13 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	case PathDistinct:
 		// C-16: the DISTINCT upper rel's candidate. createplansimple.go.
 		return createDistinctPlan(p)
+	case PathWindow:
+		// C-18: the WINDOW upper rel's candidate. createplansimple.go.
+		return createWindowPlan(p)
+	case PathSetOp:
+		// C-18: the SETOP upper rel's candidate — the only two-input arm
+		// above the seam. createplansimple.go.
+		return createSetOpPlan(p)
 	default:
 		// PathMultiHash / … do not have arms yet. Reaching here means a phase
 		// constructed a path kind without teaching createPlan to translate it.
