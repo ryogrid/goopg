@@ -501,6 +501,25 @@ are EPICS — split into one-checkbox-per-commit items before starting
   the discriminator). Post-pass `parallel_*` knobs need no fixture.
   Gates: B-17+B-18 default traffic — TPC-H 24/24 MATCH, TPC-DS SF0.5
   sweep PASS=95 MISMATCH=0; optimizer + postmaster suites green.
+- [x] **B-19 rowest-A1 null-double-exclusion correction.** Landed
+  2026-09-06: paired range bands add the column's null fraction back
+  (`s2 += NullFrac` where stats resolve — PG clausesel.c:283), with
+  PG's punt guard (either bound == DEFAULT_INEQ_SEL →
+  DEFAULT_RANGE_INEQ_SEL) and resolved-identity gating
+  (SourceTableIdx != 0). Probe-verified shape from
+  `analysis/planner-refactor-take3/rowest-collapse-20260906/` (the
+  failed-agent item "rowest fixes B1+A1": B1 already landed, this
+  completes A1). Gates: pairing unit + punt + no-stats tests;
+  optimizer suite; units scope; live synthetic reproducer (nz
+  100-149: 217 → 2430 vs true 2500; null-free table byte-identical);
+  TPC-H PP 22/22 MATCH + spotcheck PASS; TPC-DS sweep 95 PASS
+  CKMISMATCH=0; TPC-DS PP 28 moves, all attributed to A1 via
+  clean-vs-dirty capture (clean 99/99 vs baseline), Q28 rows=1 →
+  14932 shape-preserved; review APPROVE-WITH-NITS. Follow-up filed:
+  port band formula to the WithSource twin (bounded pre-existing
+  divergence, empirically plan-shape-preserving).
+  Artifacts: `internal/optimizer/rangequery{,_test}.go`,
+  `selectivity.go` (twin-divergence comment).
 
 ---
 
@@ -2081,6 +2100,7 @@ P6-03/04/05 (load-bearing).
 | D-09 | 2026-09-06 | 016f67b | conditional alignment both directions; on-disk padding matches PG | live-PG byte-identical golden; suites + R8 both suites + plan-gate 22/22; review APPROVE |
 | E-05 | 2026-09-06 | 39d26c5 | merge residual+keys via separate slab; pure dispatch swap | twin-parity + 0-alloc; R8 both suites; timing neutral; review APPROVE-WITH-NITS |
 | E-06 | 2026-09-06 | 6aab9dc | agg transition via per-call slab; UserAgg whole-call decline | twin-parity + per-site pins + 0-alloc; R8 both suites (parallel shapes incl.); timing neutral; review APPROVE-WITH-NITS |
+| B-19 | 2026-09-06 | (this commit) | rowest-A1 paired-band null add-back (failed-agent item completed; B1 already landed) | live reproducer 217→2430 vs true 2500; R8 both suites; PP 28 moves all-attributed, Q28 direction-verified; review APPROVE-WITH-NITS |
 | C-08 | 2026-09-06 | b967f38 | per-joinrel param_source_rels derivation with frame remap; NLI + merge arms threaded; star-schema escape untouched | derivation table + admit/refuse arm pair; suites + units scope + spotcheck PASS; PP TPC-H 22/22 MATCH (provably inert until C-04, no sweep triggered); review APPROVE-WITH-NITS (5 addressed); ppi_rows ledger row |
 
 | E-09a | 2026-09-06 | 67204579c | **spilling shared hash build published**: Q9 workers `rows=1500000 loops=1` -> `rows=0 loops=0`, five Build Times -> one; Q9 8.85 -> 7.85 s | immutable batch descriptor, growth frozen after prebuild (PG's rule), private reload per participant, NO new synchronisation; values 24/24, plans byte-identical, TPC-DS PASS=95 CKMISMATCH=0, -race green. Unblocks C-19f and the D-05 re-measurement |

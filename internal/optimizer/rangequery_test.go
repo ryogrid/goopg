@@ -115,6 +115,45 @@ func TestNullTestSelectivityReadsNullFrac(t *testing.T) {
 	}
 }
 
+// TestRangePairingAddsBackNullFrac pins rowest A1 (PG clausesel.c:283):
+// a paired band (lo+hi-1) double-excludes NULLs, so the column's null
+// fraction is added back. Band 20<=d<30 on a NullFrac=0.2 column must
+// estimate ~0.2 above the same band on a null-free column; without
+// stats the term stays omitted (slight under-estimate, never the
+// independent product).
+func TestRangePairingAddsBackNullFrac(t *testing.T) {
+	loC, hiC := rqBound(parser.OpGe, 20), rqBound(parser.OpLt, 30)
+	withNulls := rqScan(t)
+	withNulls.Table.Stats.Columns[0].NullFrac = 0.2
+	// Per-bound selectivities under the same stats (each bound already
+	// accounts for NULLs its own way); the pairing must add exactly the
+	// column's null fraction back on top (PG clausesel.c:283).
+	lo := clauseSelectivity(loC, withNulls)
+	hi := clauseSelectivity(hiC, withNulls)
+	got := conjunctionSelectivity([]Expr{loC, hiC}, withNulls)
+	if math.Abs(got-(lo+hi-1.0+0.2)) > 0.03 {
+		t.Errorf("paired band = %.4f, want lo+hi-1+NullFrac = %.4f+%.4f-1+0.2",
+			got, lo, hi)
+	}
+	// Punt bounds (histogram too short to read) plus a null fraction
+	// must NOT fabricate confidence: PG falls back to
+	// DEFAULT_RANGE_INEQ_SEL when either bound punted, before any
+	// null correction (0.33+0.33-1+0.5 = +0.16 trusted would be 33x
+	// over PG's 0.005).
+	short := rqScan(t)
+	short.Table.Stats.Columns[0] = catalog.ColumnStats{NDistinct: 2, Histogram: []string{"0"}, NullFrac: 0.5}
+	if got := conjunctionSelectivity([]Expr{loC, hiC}, short); math.Abs(got-defaultRangeIneqSel) > 1e-9 {
+		t.Errorf("paired punt bounds with NullFrac=0.5 = %.4f, want default %.4f", got, defaultRangeIneqSel)
+	}
+	// No stats at all: correction unavailable — falls back to the
+	// default inequality selectivity, never a fabricated correction.
+	nostats := rqScan(t)
+	nostats.Table.Stats = nil
+	if got := conjunctionSelectivity([]Expr{loC, hiC}, nostats); math.Abs(got-defaultRangeIneqSel) > 1e-9 {
+		t.Errorf("paired band without stats = %.4f, want default %.4f", got, defaultRangeIneqSel)
+	}
+}
+
 // TestNullTestSelectivityFallsBackWithoutStats mirrors nulltestsel's
 // no-statistics arm: DEFAULT_UNK_SEL / DEFAULT_NOT_UNK_SEL.
 func TestNullTestSelectivityFallsBackWithoutStats(t *testing.T) {

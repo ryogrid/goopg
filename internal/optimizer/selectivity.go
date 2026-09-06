@@ -802,6 +802,13 @@ type selectivityEstimate struct {
 // (`defaultEqSelectivity`, `defaultIneqSelectivity`) and the
 // generic `defaultGenericSelectivity` are reported as
 // reliable=false. BooleanConst is exact (reliable=true).
+// KNOWN DIVERGENCE (rowest A1): the plain twin pairs range bands
+// (`x>=a AND x<=b` via conjunctionSelectivity, incl. the
+// null-fraction add-back) while this twin's AND arm multiplies
+// pairwise. Same Filter can estimate two ways, differing by up to
+// the null fraction on paired bands. Pre-existing gap (pairing
+// predates A1); porting the band formula here is filed follow-up
+// work, not part of A1.
 //
 // Slice B uses this to gate updates to
 // `baseRelInfo.filteredRows`: when reliability is false, the
