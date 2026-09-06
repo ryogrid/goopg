@@ -907,10 +907,11 @@ rule).*
   byte-identical (shape changed=0). Re-pinned in-commit:
   `plan_snapshots/c12-ordered-sort-20260906.txt`. C-12a (second candidate
   via C-07 widening) explicitly NOT flipped — filed as the next cut.
-- [ ] **C-13 P4-04 bounded / top-N sort** (`cost_sort`'s `limit_tuples`
+- [x] **C-13 P4-04 bounded / top-N sort** (`cost_sort`'s `limit_tuples`
   arm) — the largest recorded `ORDER BY … LIMIT` win. DESIGNED 2026-09-06:
   `docs/design/planner-p4-upper-rels/DESIGN.md` §6 — **RE-SCOPE into two
-  cuts**: C-13a the executor bound (`sortOp` has none; `parallel.go:294`
+  cuts** (C-13a DEFERRED per Probe P2 NO-GO below; C-13b LANDED above as a
+  cost-model correctness item with NO timing claim): C-13a the executor bound (`sortOp` has none; `parallel.go:294`
   says so) which carries the whole runtime claim and depends on NEITHER
   C-11 nor C-12, and C-13b `cost_tuplesort`'s middle branch, which needs
   C-12. Planner plumbing is one line: `preprocessLimit` already returns
@@ -942,11 +943,25 @@ rule).*
   which TPC-H (no LIMIT) and TPC-DS (LIMIT over grouped output) both lack.
   Note the gate that looks like it covers C-13a does not: the SF0.5 harness
   reports `ck=n/a` for exactly the LIMIT-saturated queries C-13a touches.
-  **C-13b — KEEP, with C-12, as a cost-model correctness item and NO timing
-  claim**; the census adds a warning the design lacked — `limit_tuples`'
-  branch conditions compare against the estimates above, so C-13b moves
-  costs on 3-orders-of-magnitude-wrong inputs and needs an in-commit
-  plan-gate re-pin with the diff read line by line.
+  **C-13b — LANDED 2026-09-06** (`costSortRun` gains `limit_tuples`:
+  output selection, disk branch keyed on OUTPUT bytes with input-sized
+  page/run math, bounded `N log2 K` arm continuous at `tuples == 2*output`,
+  run cost on input tuples; `sortPathForBounded` split keeps the merge side
+  byte-identical; `orderLimitTuples` plumbed to the normal ORDER BY arm,
+  SRF arm `-1`, WITH TIES declines conservatively, literals-only resolution
+  skipping). Agent review APPROVE-WITH-NITS (formula exactly faithful;
+  WITH TIES comment corrected to cite the executor; literal pre-check
+  added after proving no-folding; resolver + disk-identity pins added).
+  Gates on isolated HEAD+C-13b-only A/B: optimizer suite + units precommit
+  green; TPC-H structural AND costs plan-gate **22/22 MATCH** (no LIMIT in
+  suite — byte-identical numbers, the strongest pin a cost change can get
+  there); `tpch-runner -digest` vs pre-cut binary + `-diff` VERDICT: PASS
+  24/24, ten longest no slower; TPC-DS SF0.5 sweep PASS=95 MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=0, TOTAL **-1.0%**, cost-normalized plans
+  byte-identical (18 queries move cost-only on Limit-rooted Sorts +
+  Limit/Gather rollups; bounded Sorts price DOWN, e.g. 1485→1133 on
+  11 940 rows). NO timing claim per the re-scope. No re-pin: the TPC-H
+  baseline is unchanged byte-for-byte (TPC-DS plans are untracked).
   **C-14 is not the better item here either**: goopg's Q67 sort — PG's own
   Incremental Sort case — is 1.0 ms over 115 150 rows. General finding: no
   sort-side item has a runtime witness in this corpus; all sorting in all 99
