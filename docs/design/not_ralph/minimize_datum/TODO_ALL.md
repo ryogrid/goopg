@@ -705,6 +705,30 @@ rule).*
   the only jointree path; `from_collapse_limit`/`join_collapse_limit`
   take upstream meaning. Own commit, both suites timed.
   *design: take3 08 §6.3; gate: take3 09 §5 P3.*
+  **BLOCKED ON ITS OWN GATE, measured 2026-09-07 after C-04c.** The gate
+  is "byte-identical plans for the flip" and the flip is NOT byte-
+  identical: with C-04c in the binary, `GOOPG_PGSHAPED_COLLAPSE=0` and
+  `=1` produce different TPC-H plans for **Q13**, and the OFF plan is the
+  PG-parity one the seam's own header names as the target — `Index Only
+  Scan using customer_pk` + `Hash Left Join` (cost 66 218) against the ON
+  path's `Index Scan` + `Merge Left Join` (cost 338 223). Runtime is a
+  wash (5.40 s OFF vs 5.47 s ON, same-session, values identical), so
+  retiring the flag would delete the only reachable spelling of a
+  PG-shaped Q13 and buy nothing. That is the `GOOPG_INDEXKEY_HARVEST`
+  precedent (ledger `take3-C-20c-blocked`) exactly: a flag whose OFF path
+  is not worse stays.
+  The item's premise is also not met. "Once C-04 makes it the only
+  jointree path" describes a state C-04c does not reach: the collapse=0
+  regime is fully alive (every INNER/LEFT/RIGHT link pins,
+  `pinnedOverAPinnedSide` fires, the seam peels the spine and
+  `makeRelFromJoinlist` plans the pinned two-item problems), and C-04c
+  changed none of it. Nothing was deleted.
+  Resume: the blocker is the ON path's Q13 plan, not the flag. Close the
+  Q13 gap on the searched path (why the search prices a Merge Left Join
+  over the index-only Hash Left Join at 5x the cost and still wins), then
+  re-run this one-command measurement — two `estimate-audit -plan-only`
+  captures on the same cluster, one per flag value — and delete the flag
+  when they come back identical. Ledger `c06-collapse-flip-moves-q13`.
 - [~] **C-07 P3-06 — DERIVATION + GATE LANDED 2026-09-05; the "motivate
   index paths" half is BLOCKED on C-11/C-12.**
   Landed: `chooseQueryPathkeys` reproduces `standard_qp_callback`'s
