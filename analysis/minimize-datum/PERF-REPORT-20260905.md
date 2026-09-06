@@ -1147,6 +1147,93 @@ is void as timing and no verdict rests on one. Both timing verdicts
 (E-07, E-09c) were taken **in-process, both arms in the same binary and
 the same run**, which is what makes them survive the contention.
 
+## 5.21. The gate that never ran now runs — and the estimates it scores
+
+§5.11.1 diagnosed two row-estimation defects and noted that **no gate in
+this repository catches them**: the values gate compares results, plan
+parity compares shapes, and neither looks at `rows=`. The gate four
+TODO_ALL items *cited* — the EA ratchet — had never executed.
+
+C-20a built one. `make ea-ratchet` runs `EXPLAIN ANALYZE` over TPC-DS
+SF0.5 and scores estimated against actual, keyed by relation set so
+base-rel and joinrel granularity come out of one keying — the old tool was
+joinrel-only, which is why Q28's base-rel `rows=1` was not a candidate
+even in principle. The bar is **PG-relative**, `qerr > max(10, PG_qerr×2)`,
+which is the only bar that correctly passes Q47 (PG emits `rows=1` there
+too) and fails Q99. It ratchets on finding *identities*, not a count.
+First run: 99/99 queries, 844 nodes scored, 178 findings pinned.
+
+Scored against the c13a census baseline, the estimate fixes land like
+this:
+
+| query | before | after | actual |
+|---|---:|---:|---:|
+| **Q99** | 720,657 (8007×) | **72** (1.25×) | 90 |
+| **Q62** | 359,432 (2396×) | **120** (1.25×) | 150 |
+| **Q22** | 9,460,201 (789×) | **71,857** (6.0×) | 11,987 |
+| Q12 | 107,310 | 5,066 | 932 |
+| Q28 | 1 (15,410× low) | — | 15,410 |
+| Q78 | 1 | 1 (unchanged) | 245,587 |
+
+Q78 is unchanged and expected: the A3 mechanism is firewalled, not fixed
+(§5.16.1), and its 8 findings are the firewall showing through.
+
+Two parser defects the ratchet exposed on itself are worth recording,
+because either would have made the gate lie in the confident direction:
+**`loops=0` is not zero rows** — goopg annotates hash-join build sides
+that way, and a *correctly* estimated 464,390-row scan headed the findings
+table at a fictitious q-error of 464,390 — and goopg prints the **alias**
+where PG prints the relation, leaving 662 of 1131 nodes unmatched until
+`_<digits>` normalisation brought it to 369.
+
+### 5.21.1 EXPLAIN reports a different estimator than the planner chooses with
+
+C-20a's consumer census turned up something that changes what every
+estimate figure in this report *means*.
+
+`PlanCost.PlanRows` already carries the **winning path's** row count on
+every search-produced node, through one funnel (`stampPlanCost`). **And
+EXPLAIN never reads it.** `explainCostFields` takes Startup, Total and
+Width off that carrier and then computes `rows=` as
+`optimizer.EstimateRows(rowSrc)` at all four sites.
+
+So on a searched plan the planner **chooses** with `calcJoinrelSize` and
+EXPLAIN **reports** `estimateJoin` — two independent estimators. And
+everything that reads a plan reads the reported one: plan-gate
+`MODE=semantic-cost`, `estimate-audit`, the c13a census figures above, and
+the new ratchet.
+
+They are not known to disagree, and `cardinality_two_estimators_test.go`
+now pins agreement on the control and composite-superkey shapes through
+entirely separate code. But nothing had ever checked. The practical
+consequence for reading this report: **an estimate-accuracy number here
+describes the reporting estimator**, and a plan-choice consequence has to
+be traced to `calcJoinrelSize` separately rather than assumed to follow
+from it.
+
+### 5.21.2 C-20a itself deleted nothing, and that is the result
+
+The item was "delete the legacy `estimateJoin`/`EstimateRows` plus the
+`joinkeyproof.go` mirror; everything reads `calcJoinrelSize`". The census
+says it is not executable as written:
+
+- `EstimateRows` has **28 live call sites across 15 files**, three of them
+  in `internal/executor/` (EXPLAIN, hash-table geometry, correlated-
+  subquery cache budget) where no `RelOptInfo` exists or ever will.
+  `calcJoinrelSize` is a `searchCtx` method over `*RelOptInfo`;
+  `EstimateRows` walks the plan `Node` tree. That is a coordinate-space
+  problem, not a call-site migration.
+- **`joinkeyproof.go` is not a mirror** and is struck from the item. Only
+  `superkeyJoinEstimate` belongs to `estimateJoin`; `resolveBaseColumn`
+  serves three other callers, `uniqueKeyColumnSets` serves eight scan
+  sites, and `columnsSubset` is a live dependency of C-05's own
+  `joinrelsize.go`.
+
+All three deletion targets measured as load-bearing, so nothing was
+deleted — which is the repo's deletion discipline working as intended
+(the same rule that correctly kept `GOOPG_INDEXKEY_HARVEST` when its flip
+failed its own byte-identical-plans gate).
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
