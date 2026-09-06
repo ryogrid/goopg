@@ -634,9 +634,15 @@ rule).*
   `joinpaths{,merge,mergeouter}.go` + `joinsearch.go` +
   `relfromjoinlist.go` (threading/stamp),
   `joinpathparamsource_test.go` (new) — `b967f38`.
-- [ ] **C-09 P3-08 `reduce_unique_semijoins`** — after clearing SEMI
-  left-only `Output()` re-indexing (ledger 794).
-  *design: take3 08 §6.3; gate: take3 09 §5 P3 (PP + values-diff).*
+- [-] **C-09 P3-08 `reduce_unique_semijoins`.** DECLINED 2026-09-06
+  with verification (SKIP policy 1): unique-inner SEMI has no
+  structural value — reorder unavailable (pinned outside search),
+  estimates already unique-aware (ledger-794 Q18 inert), exec bounded
+  by early-break; plan-rewrite re-indexing risk exceeds any bounded
+  gain. Resume only if SEMI enters the search or a measured exec win
+  exists. Ledger `take3-C-09-declined`; record
+  `docs/design/planner-c09-unique-semi/DESIGN.md` (review
+  REQUEST-CHANGES → decline).
 - [x] **C-10 P4-00 pre-phase scoping.** Done 2026-09-05: all four areas
   investigated against the tree and split into the items below. One result
   is negative and removes a checkbox rather than adding one. Analysis
@@ -1672,5 +1678,6 @@ P6-03/04/05 (load-bearing).
 | E-08 (EX4-04) | 2026-09-05 | dropped by dependency: it is parallel filterOp compilation, and the serial twin E-04 failed its own measurement | `take3-E-08-dropped` |
 | F-03 | 2026-09-05 | rule 3: `Buf` is the arena-detach target; removing it leaves only unbounded retention. Prior attempt returned 0 rows on 7 queries. Win dominated by D-05 on the same sites | `take3-F-03-dropped` |
 | E-04 (EX4-01) | 2026-09-05 | no measured gain (predicted ~0.33 pp is below the noise floor; measured a consistent Q18 +8.5%); mechanism overlaps the scan prefilter | `take3-E-04-dropped` |
+| C-09 (P3-08) | 2026-09-06 | unique-inner SEMI has no structural value (pinned→no reorder; estimates already unique-aware; exec early-break-bounded); plan-rewrite re-indexing risk exceeds any bounded gain | `take3-C-09-declined` |
 
 (End of file)
