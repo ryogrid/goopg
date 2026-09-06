@@ -932,6 +932,42 @@ Final gates: TPC-H 24/24 by values; TPC-DS SF0.5 `PASS=95 MISMATCH=0
 CKMISMATCH=0 TIMEOUT=0`, plan shapes 99/99, total delta +0.0%; plan-gate
 22/22 in both modes, re-pinned with the Q13 hunk as the only diff.
 
+## 5.17. Phase 4: the upper planner becomes a path search
+
+Five items landed in sequence overnight, each gated on both suites. They
+are grouped here because individually none of them moves a number, and
+together they are the structural half of the plan — the point at which
+goopg's upper planner stops being a chain of post-passes and becomes a
+path search PG would recognise.
+
+| item | what landed | gate |
+|---|---|---|
+| **C-11** | upper-rel registry (`fetch_upper_rel`), **inert** | TPC-H 24/24; plan-gate 22/22 both modes |
+| **C-12** | ORDERED upper rel gets a real `PathSort` | 24/24; costs move on Sort lines only; TPC-DS PASS=95 |
+| **C-13b** | `cost_tuplesort`'s `limit_tuples` middle branch | 22/22 both modes; TPC-DS PASS=95, total −1.0% |
+| **C-15** | GROUP_AGG upper rel, `cost_agg` paths, **three aggregate rules retired** | TPC-DS PASS=95, zero shape change |
+| **C-16** | DISTINCT upper rel via DistinctOn reuse | 22/22 both modes, timing flat, shapes 99/99 |
+
+The one that changes the most is C-12, and what it changes is honesty
+rather than speed. Before it, `costSortRun` had exactly one production
+caller — merge-join input sorts — so **every top-level Sort in the suite
+was priced at zero** by `DeriveLegacyDisplayCost`. Q18's
+`Sort (rows=1565307 width=204)`, the largest in the corpus and in its
+slowest query, contributed nothing to any path comparison. C-12 makes it
+cost something; the costs move on Sort lines and the plans do not.
+
+C-15's retirement of three aggregate rules is the deletion half of the
+same story: the rules existed because there were no grouping paths to
+compare, and once `cost_agg` prices them the rules have nothing left to
+decide.
+
+**None of these is a speed result and none is presented as one.** The
+suite totals across the five range from −1.0% to +2.5%, all inside the
+run-to-run spread. What they buy is that Phase 5 and Phase 6 have
+something to delete *into* — C-19g replaces `splitAggregate` with paths
+because C-15 made grouping paths exist, and C-20a can delete the legacy
+estimators only once every consumer reads the path model.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
