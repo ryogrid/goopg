@@ -145,6 +145,35 @@ func createSeqScanPlan(p *Path) Node {
 // the keys are emitted as written; the only producer that can reach this is the
 // bridge, whose subtree was never expressed in binding coordinates in the first
 // place.
+// createAggPlan is the PathAgg arm (C-15): emit the path's aggregate spec
+// over the built input with the path's strategy. The spec is COPIED, never
+// rebound in place — sibling candidates share it, and the index-driven
+// variant's narrowed clone must not leak into them. The B-01c input-target
+// stamp is NOT applied here: the planner recomputes it on the emitted node
+// after the producer returns (same site as today), ordered after any
+// index-narrowing remap.
+//
+// The returned layout is nil: an Aggregate reorders columns (group keys +
+// agg outputs + passthrough), so no binding map of the child survives it —
+// the same nil `baseRelLayout` yields for any upper rel without a baseLeaf.
+// Callers above the seam work in Nodes (Output schemas), never layouts.
+func createAggPlan(p *Path) (Node, outputLayout) {
+	if p.Agg == nil {
+		panic("createPlan: PathAgg with no aggregate spec")
+	}
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathAgg with %d children, want exactly 1", len(p.Children)))
+	}
+	child, _ := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathAgg over a child path that built no node")
+	}
+	out := *p.Agg
+	out.Child = child
+	out.Strategy = p.AggStrategy
+	return &out, nil
+}
+
 func createSortPlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 1 {
 		panic(fmt.Sprintf("createPlan: PathSort with %d children, want exactly 1", len(p.Children)))

@@ -343,6 +343,80 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 	return Cost{Startup: startup, Total: startup + cp.cpuOperatorCost*tuples}
 }
 
+// costAgg is `cost_agg` (costsize.c:2682) for SORTED and HASHED — C-15's
+// replacement for the three aggregate rules' outcome-guessing. (The PLAIN
+// candidate is priced by the HASHED arm at 0 group columns and 1 group,
+// which is term-for-term PG's PLAIN arm: no grouping comparisons, trans
+// per input tuple, final once, emit once. No third enum value exists, by
+// the same zero-value discipline that keeps ungrouped nodes hashed today.)
+// Inputs mirror upstream's: per-aggregate trans/final costs, group-column
+// count, group count, and the input's cost/rows. inNcols/inAvgVarBytes are
+// the OMITTED spill arm's future inputs (kept so the resume does not
+// re-plumb callers) — see the NO-spill note at the function tail.
+//
+// AggClauseCosts (F3): goopg's catalog HAS procost but the planner never
+// reads it, so trans charges cpu_operator_cost per aggregate per input row
+// and final charges cpu_operator_cost per output group, with zero startup
+// terms — the legacy display number's shape with upstream's trans/final,
+// per-input/per-group structure, which is what lets real procost plug in
+// later. SORTED and HASHED therefore share exactly the same total CPU cost
+// and differ only in startup (streams vs blocking), so sorted-wins-iff-
+// input-ordered falls out without a special case (costsize.c:2720-2732).
+//
+// No spill arm exists (see the NO-spill note at the function tail):
+// `aggregateOp` performs grouped aggregation in memory with no spill path,
+// so there is nothing to charge. inNcols/inAvgVarBytes are its future
+// inputs, kept so the resume does not re-plumb callers.
+func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inNcols int, inAvgVarBytes float64) Cost {
+	tuples := inputRows
+	if tuples < 0 {
+		tuples = 0
+	}
+	groups := numGroups
+	if groups < 1 {
+		groups = 1
+	}
+	transPerTuple := cp.cpuOperatorCost * float64(nAggs)
+	finalPerGroup := cp.cpuOperatorCost * float64(nAggs)
+	groupCmpPerTuple := cp.cpuOperatorCost * float64(numGroupCols)
+
+	if strategy == AggStrategySorted {
+		// Streams: startup is the input's; total adds trans + grouping
+		// comparisons per input tuple, final + emit per group.
+		startup := inputStartup
+		total := inputTotal + transPerTuple*tuples + groupCmpPerTuple*tuples +
+			finalPerGroup*groups + cp.cpuTupleCost*groups
+		return Cost{Startup: startup, Total: total}
+	}
+
+	// SORTED and HASHED block on the input the same way: startup is the
+	// input's total, plus trans per input tuple. (PLAIN reaches here only
+	// via the HASHED arm at 0 group columns / 1 group — see above.)
+	startup := inputTotal + transPerTuple*tuples
+	if strategy == AggStrategyHashed {
+		// Hash computation per input tuple.
+		startup += groupCmpPerTuple * tuples
+	}
+	total := startup + finalPerGroup*groups + cp.cpuTupleCost*groups
+
+	// NO spill arm — deliberately, not an omission. PG's arm charges
+	// batches the executor actually writes; goopg's `aggregateOp`
+	// "performs grouped aggregation in memory"
+	// (operators_join_agg.go:1973) with no spill path at all, so every
+	// spill page charged here would be I/O that never happens — and a
+	// fictional charge flips real plans (measured: it drove Q3/Q10/Q13/Q18
+	// to sorted, Q13 5.67 s → 8.71 s, all four away from PG's hash). A
+	// memory-blind model that picks hash for a 100M-group query risks the
+	// OOM instead, but that failure already exists today and a fake I/O
+	// number does not fix it. Resume WITH executor spill support, pricing
+	// the batches the executor really writes (the JOIN spill currency in
+	// `spillPages` is the template, not PG's depth loop — goopg has no
+	// recursive hash partitioning).
+	// (inNcols/inAvgVarBytes are the spill arm's future inputs — kept so
+	// the resume does not re-plumb every caller.)
+	return Cost{Startup: startup, Total: total}
+}
+
 // tuplesortMergeOrder is `tuplesort_merge_order` (tuplesort.c): how many input
 // tapes one merge pass can afford out of `allowedMem`, which is what turns a
 // run count into a PASS count.

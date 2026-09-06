@@ -1299,8 +1299,8 @@ type Aggregate struct {
 	Strategy AggStrategy
 
 	// GroupKeyOrder is an EXPLAIN-only permutation: indices into GroupExprs,
-	// in the order applyIndexOrderedGroupingRule's chosen index lays its key
-	// columns out (S8 Slice 2c-i, 0134-0001 P2). GroupExprs itself is NEVER
+	// in the order the GROUP_AGG producer's chosen index lays its key
+	// columns out (C-15 index-driven sorted input). GroupExprs itself is NEVER
 	// reordered — every output-column binding downstream of buildAggregateStage
 	// (target list, HAVING, ORDER BY) is fixed to GroupExprs' written
 	// position, and finalizeGroup's group-boundary test

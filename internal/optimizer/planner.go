@@ -1537,45 +1537,26 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		if len(savedBindings) > 0 {
 			remapAggExprsWithBindings(node, savedBindings)
 		}
-		// S8 Slice 2c-i (0134-0001 P2) index-ordered grouping input: port of
-		// the "path already sorted" half of get_useful_group_keys_orderings
-		// (pathkeys.c:466-550). When every GROUP BY key is a plain column of
-		// the scanned table and some ordering of them is exactly a leading
-		// prefix of a usable btree index, replace the child with an
-		// ascending full-range IndexOnlyScan/IndexScan and switch Strategy
-		// to AggStrategySorted WITHOUT inserting a Sort. Runs FIRST — before
-		// applyPresortedAggregateRule / applyEnableHashAggRule — so neither
-		// of those ever gets the chance to wrap this rule's Sort-free child
-		// in a redundant Sort; both bail immediately once Strategy is
-		// already AggStrategySorted (presorted) or the node is no longer
-		// AggStrategyHashed (hashagg bridge). See
-		// internal/optimizer/groupagg_indexorder.go.
-		applyIndexOrderedGroupingRule(agg.node, cat, plannerSet)
-		// B-01c second cut: the rule above may replace the Aggregate's child
-		// with a narrower IndexOnlyScan and remap the group-input indices to
-		// the new positions, so the construction-time keep (projected against
-		// the old child schema) is recomputed-or-unknown here. Keys-only —
-		// the upper tree is not built yet. Payload-only, no plan change.
+		// C-15 (P4-06): the aggregate is the GROUP_AGG upper rel's path
+		// now — `create_grouping_paths` over the finished child, priced
+		// by `cost_agg` (groupingpaths.go) — and no longer the bare node
+		// three GUC-gated rules mutate. The S8 rules' outcome logic
+		// (index-ordered input, presorted keys, enable_hashagg bridge)
+		// survives inside the producer as candidate builders; what is
+		// gone is GUC-gated outcome-forcing with no price comparison.
+		// Same spec, winning strategy, priced input. The producer writes the
+		// winner back onto agg.node in place (the rules mutated in place,
+		// so node, the HAVING filter, and agg.node alias it).
+		if _, gerr := createGroupingPaths(upper, agg.node, cat, plannerSet, orderTupleFraction); gerr != nil {
+			return nil, gerr
+		}
+		// B-01c second cut: the producer above may replace the
+		// Aggregate's child with a narrower IndexOnlyScan and remap the
+		// group-input indices to the new positions, so the
+		// construction-time keep (projected against the old child
+		// schema) is recomputed-or-unknown here. Keys-only — the upper
+		// tree is not built yet. Payload-only, no plan change.
 		stampAggregateInputTarget(agg.node, nil)
-		// S8 Slice 2a (0134-0001 P2) presorted aggregates: port
-		// adjust_group_pathkeys_for_groupagg (planner.c:3229). When ≥1
-		// aggregate carries an internal ORDER BY / DISTINCT clause, choose the
-		// covering set of pathkeys, wrap the Aggregate's child in a Sort, and
-		// (grouped queries only) switch Strategy to AggStrategySorted so EXPLAIN
-		// shows GroupAggregate instead of HashAggregate. Runs AFTER the remap so
-		// the pathkey expressions (which include GroupExprs) are already in
-		// child-output coordinate space. Gated on enable_presorted_aggregate
-		// (default on); the gate is read inside the rule.
-		applyPresortedAggregateRule(agg.node, plannerSet)
-		// S8 Slice 2b (0134-0001 P2) enable_hashagg bridge: with
-		// `SET enable_hashagg = off`, reproduce PG's cost-model outcome
-		// (costsize.c:2755-2756 — the AGG_HASHED arm is disabled, so the sorted
-		// path wins) by forcing a plain grouped aggregate to AggStrategySorted
-		// over an ascending Sort on the group keys. Runs AFTER the presorted
-		// rule so a query that already gained a Sorted strategy (internal ORDER
-		// BY / DISTINCT) is never double-wrapped; the gate is read inside the
-		// rule.
-		applyEnableHashAggRule(agg.node, plannerSet)
 	} else if s.Having != nil {
 		return nil, &PlanError{
 			Pos:     s.Having.Pos(),

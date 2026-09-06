@@ -18,33 +18,26 @@ import "github.com/goopg/goopg/internal/catalog"
 // (partial-prefix matches need Incremental Sort — Slice 2c-ii, deferred; an
 // ORDER-BY-aware ordering choice is Slice 2c-iii, deferred).
 //
-// Runs BEFORE applyPresortedAggregateRule / applyEnableHashAggRule so those
-// never get the chance to wrap the child this rule has already made
-// sorted-and-index-driven in a redundant Sort.
+// Retired by C-15 as a mutating rule; survives as the GROUP_AGG producer's
+// index-driven sorted-input builder (groupingpaths.go indexOrderedAggInput):
+// the catalog matcher + buildIndexOrderedScan below, minus the
+// enable_hashagg proxy gate (price competition replaces it).
 
-// applyIndexOrderedGroupingRule mutates aggNode in place: on a match the
-// child is replaced with an ascending full-range *IndexOnlyScan or
-// *IndexScan (nil Key/Keys/LowKey/HighKey — the executor RangeScans the
-// whole index in ascending key order) and Strategy becomes
-// AggStrategySorted, with NO Sort inserted. It returns without touching
-// aggNode unless ALL of the following hold:
+// (Retired by C-15.) applyIndexOrderedGroupingRule used to mutate aggNode
+// in place: on a match the child was replaced with an ascending full-range
+// *IndexOnlyScan or *IndexScan (nil Key/Keys/LowKey/HighKey — the executor
+// RangeScans the whole index in ascending key order) and Strategy became
+// AggStrategySorted, with NO Sort inserted. It fired only when ALL of the
+// following held:
 //
-//   - the node is a plain grouped aggregate: Mode == AggModeSimple, no
-//     grouping sets, len(GroupExprs) > 0, and Strategy is not already
-//     AggStrategySorted (a query with an internal ORDER BY / DISTINCT
-//     aggregate, or an already-sorted parallel Partial/Final split, has
-//     already been handled and must not be double-touched);
-//   - every GroupExpr is a plain column reference on the scanned table
-//     (GROUP BY x*x and friends are out of scope — bail);
-//   - the child is a bare *SeqScan, or *Filter{Child: *SeqScan};
-//   - cat.IndexesOnTable(seqScan.Table) has a usable btree index: Method ==
-//     "btree" (or unset), not HasPredicate, not DeclaredHash, and every
-//     consumed leading column is default-ordered (!ColDescending[i] &&
-//     !ColNullsFirst[i]) — mirrors tryPromoteOrderedIndexOnlyScan's filters
-//     (planner.go:13349-13375) exactly;
-//   - the group-key column NAMES equal idx.Columns[:len(GroupExprs)] as a
-//     SET, i.e. the keys are a permutation of an exact leading prefix.
-//     Partial prefixes fall through untouched (Slice 2c-ii, deferred).
+//   - the node was a plain grouped aggregate: Mode == AggModeSimple, no
+//     grouping sets, len(GroupExprs) > 0, and Strategy not already Sorted;
+//   - every GroupExpr a plain column reference (expressions bailed);
+//   - the child a bare *SeqScan, or *Filter{Child: *SeqScan};
+//   - a usable btree leading-prefix index match (filters below, mirroring
+//     tryPromoteOrderedIndexOnlyScan, planner.go:13349-13375);
+//   - the enable_hashagg proxy gate (deleted: price competition replaces
+//     it; the GUC-on PK-FD pin adjudicates).
 //
 // Deliberately NOT gated on DisableSeqScan / enable_seqscan: PG picks this
 // index by cost, and the regress fixture only sets enable_seqscan = off to
@@ -60,142 +53,6 @@ import "github.com/goopg/goopg/internal/catalog"
 // chosen index order is recorded in aggNode.GroupKeyOrder — indices into
 // GroupExprs, in index-column order — consumed only by the `Group Key:`
 // EXPLAIN renderer (internal/executor/operators_explain.go).
-func applyIndexOrderedGroupingRule(aggNode *Aggregate, cat catalog.Catalog, ps PlannerSettings) {
-	if aggNode == nil || cat == nil {
-		return
-	}
-	if aggNode.Mode != AggModeSimple || aggNode.GroupingSets != nil ||
-		len(aggNode.GroupExprs) == 0 || aggNode.Strategy == AggStrategySorted {
-		return
-	}
-	// Without a cost model, goopg cannot tell whether an index-ordered
-	// sorted plan actually beats a hash aggregate the way PG's cost_agg
-	// does (the design section's "cost comparison ... simply falls back to
-	// the original" — goopg has no such comparison to run). Firing
-	// unconditionally regresses aggregates.sql's primary-key functional-
-	// dependency block (`t1 group by a,b,c,d`, reduced elsewhere to `a,b`
-	// before this rule ever sees it, with enable_hashagg left ON): PG picks
-	// HashAggregate there, but this rule would wrongly promote it to
-	// GroupAggregate + Index Only Scan. Every btg regress probe this rule
-	// targets runs inside `SET enable_hashagg = off` (aggregates.sql:1275-
-	// 1370), so mirror applyEnableHashAggRule's own bridge and require the
-	// same session state.
-	if ps.EnableHashAgg {
-		return
-	}
-
-	// Every GroupExpr must be a plain column reference (bail on expressions
-	// — the design's explicit scope line).
-	groupCols := make([]string, len(aggNode.GroupExprs))
-	for i, g := range aggNode.GroupExprs {
-		cr, ok := g.(*ColumnRef)
-		if !ok {
-			return
-		}
-		groupCols[i] = cr.Name
-	}
-	groupSet := make(map[string]bool, len(groupCols))
-	for _, n := range groupCols {
-		if groupSet[n] {
-			// Duplicate GROUP BY column names (e.g. `GROUP BY x, x`) cannot
-			// be a permutation of a distinct-column index prefix; bail
-			// conservatively rather than guess a mapping.
-			return
-		}
-		groupSet[n] = true
-	}
-
-	// Child must be a bare *SeqScan, or *Filter{Child: *SeqScan}. The
-	// *Filter wrapping, if present, is kept around the replacement scan
-	// unchanged in shape (its predicate is not turned into an Index Cond —
-	// out of scope).
-	var filt *Filter
-	var seqScan *SeqScan
-	switch c := aggNode.Child.(type) {
-	case *SeqScan:
-		seqScan = c
-	case *Filter:
-		ss, ok := c.Child.(*SeqScan)
-		if !ok {
-			return
-		}
-		filt = c
-		seqScan = ss
-	default:
-		return
-	}
-	if seqScan.Table == nil {
-		return
-	}
-
-	for _, idx := range cat.IndexesOnTable(seqScan.Table) {
-		if idx == nil || idx.DeclaredHash || idx.HasPredicate {
-			continue
-		}
-		if idx.Method != "" && idx.Method != "btree" {
-			continue
-		}
-		if len(idx.Columns) < len(groupCols) {
-			continue
-		}
-		prefix := idx.Columns[:len(groupCols)]
-		ordered := true
-		prefixSet := make(map[string]bool, len(prefix))
-		for i, c := range prefix {
-			if i < len(idx.ColDescending) && idx.ColDescending[i] {
-				ordered = false
-				break
-			}
-			if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
-				ordered = false
-				break
-			}
-			prefixSet[c] = true
-		}
-		if !ordered || len(prefixSet) != len(groupSet) {
-			continue
-		}
-		match := true
-		for c := range groupSet {
-			if !prefixSet[c] {
-				match = false
-				break
-			}
-		}
-		if !match {
-			continue
-		}
-
-		newChild, ok := buildIndexOrderedScan(seqScan, idx, aggNode, filt)
-		if !ok {
-			continue
-		}
-		// The rule replaces the SeqScan with an IndexScan or an IndexOnlyScan;
-		// a session that turned that shape off keeps its SeqScan (the toggles
-		// are read through the same carrier walk currentSeqScanDisabled uses).
-		// review/260831-2 X-8.
-		if scanShapeDisabled(newChild, cat) {
-			continue
-		}
-
-		// GroupKeyOrder: indices into GroupExprs, in index-column order.
-		order := make([]int, len(prefix))
-		for i, c := range prefix {
-			for gi, gc := range groupCols {
-				if gc == c {
-					order[i] = gi
-					break
-				}
-			}
-		}
-
-		aggNode.Child = newChild
-		aggNode.Strategy = AggStrategySorted
-		aggNode.GroupKeyOrder = order
-		return
-	}
-}
-
 // buildIndexOrderedScan builds the replacement child for aggNode: an
 // ascending full-range *IndexOnlyScan (nil Key/Keys/LowKey/HighKey) when idx
 // (key + INCLUDE columns) covers every column referenced above the scan —

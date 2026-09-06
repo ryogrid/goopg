@@ -117,6 +117,35 @@ type Path struct {
 	// with the enumeration that produces it.
 	Jointype parser.JoinType
 
+	// AggStrategy is the aggregation this path PERFORMS — PG's
+	// `AggPath.aggstrategy`, set per path by `add_paths_to_grouping_rel`
+	// (planner.c:7114). Same carrier rule as Jointype above: the PATH, never
+	// the `RelOptInfo`, because sorted and hashed candidates coexist on one
+	// GROUP_AGG rel and the rel cannot hold one strategy.
+	//
+	// C-15 (docs/design/planner-p4-grouping-paths/DESIGN.md §3.1): the field
+	// lands with its first producer. `AggStrategyHashed` is the zero value
+	// (`plan.go:1356`), so every path that does not set it — every non-agg
+	// path, every test fixture — reads as hashed and behaves exactly as
+	// before. Unordered (non-grouped) aggregates also carry Hashed: today
+	// they keep the zero value with the plain "Aggregate" label, and the
+	// producer preserves that mapping (no Plain enum value exists).
+	//
+	// Same must-avoid list as Jointype: strategy is decided by the producer,
+	// costs alone decide dominance.
+	AggStrategy AggStrategy
+
+	// Agg is the aggregate SPEC a PathAgg performs — the `*Aggregate`
+	// `buildAggregateStage` built (GroupExprs, Aggs, GroupingSets, Mode,
+	// Passthrough, GroupingMasks, GroupKeyOrder, pos, schema), whose Child
+	// the arm replaces with the built input and whose Strategy it sets from
+	// AggStrategy. One spec per candidate: the Sort-driven variants share
+	// the built spec, the index-driven variant carries the narrowed clone
+	// (`buildIndexOrderedScan` remaps to narrowed positions). nil for every
+	// other kind; `createAggPlan` panics on a PathAgg without one, the same
+	// way `createSortPlan` panics on a Sort without pathkeys.
+	Agg *Aggregate
+
 	Rel *RelOptInfo
 
 	Cost Cost

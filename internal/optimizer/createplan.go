@@ -138,6 +138,9 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 		// M0128-P2.4: bitmap union combinator.
 		n := buildBitmapAndOrPlan(p, false)
 		return n, baseRelLayout(p.Rel, n)
+	case PathAgg:
+		// C-15: the GROUP_AGG upper rel's candidate. createplansimple.go.
+		return createAggPlan(p)
 	default:
 		// PathMultiHash / … do not have arms yet. Reaching here means a phase
 		// constructed a path kind without teaching createPlan to translate it.

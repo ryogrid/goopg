@@ -260,39 +260,35 @@ currency:
   (blocking). The note in `costsize.c:2720-2732` becomes a unit test: with
   identical CPU terms, sorted-wins-iff-input-ordered falls out of startup
   alone — pin it rather than trust it.
-- **Spill arm** (HASHED only): batches from the hash entry size. goopg's
-  existing currency is `hashsize.EntryBytes` + `HashMemLimit` (take2 P2-03,
-  the same helper `defaultCostParams` uses for `workMem`) and the
-  `spillPages` reconciliation `costSortRun` was built for. Port PG's
-  batch/depth loop against those two inputs; writes accrue to startup AND
-  total, reads to total only. If the loop's depth math proves unportable
-  without the executor's batch layout, fall back to the hash-join spill
-  charge shape (`spillPages`-equivalent) with the fallback NAMED in code —
-  but do not ship a hashed path with no spill term at all: an unpriced
-  1.5M-group hash is Q18's sort trap in the other direction.
+- **Spill arm**: OMITTED — deliberately, not deferred (gate-measured,
+  2026-09-06). PG's arm charges batches the executor actually writes;
+  goopg's `aggregateOp` "performs grouped aggregation in memory"
+  (`operators_join_agg.go:1973`) with no spill path at all, so every spill
+  page charged is I/O that never happens. With the arm in, the gate drove
+  Q3/Q10/Q13/Q18 to sorted (Q13 5.67 s → 8.71 s), all four away from PG's
+  hash — the §5 negative firing as written. The signature keeps input-side
+  width parameters so the resume does not re-plumb callers. Resume WITH
+  executor spill support, pricing the batches the executor really writes
+  (the JOIN spill currency in `spillPages`, not PG's depth loop — goopg
+  has no recursive hash partitioning); per-transition-state space stays
+  ignored (no trans-state width model). A pinned test asserts the omission
+  (`TestCostAggHashedNeverChargesSpill`), so the resume cannot land
+  silently — it must delete that test loudly.
 
 `numGroups` ← `estimateNumGroups(GroupExprs, child, inputRows)`; input
 cost/rows ← the seed's legacy stamp (C-12's door, same monotonicity
 argument); `numGroupCols ← len(GroupExprs)`; `nAggs ← len(Aggs)`.
-Input-side width for the spill arm comes from the SEED's child (input
-ncols/avgVarBytes — the width of the rows being hashed), NEVER from the
-GROUP_AGG rel's output sizing (§3.4): PG's spill pages are
-`relation_byte_size(input_tuples, input_width)`, and the output width is the
-wrong number by construction (narrower after grouping). The hash entry bytes
-are `hashsize.EntryBytes` over the INPUT columns; per-transition-state space
-is ignored and NAMED (PG sizes `hashentrysize` with transitionSpace —
-goopg has no trans-state width model; the ignore direction under-prices
-spill and is pinned as such by the spill test). `memLimit ← cp.workMem`
-(`cost_funcs.go:144`). `PlanRows float64 → int64` at the boundary; pinned-
-regime staleness applies as elsewhere.
+The kept input-side width parameters are the spill arm's future inputs.
+`PlanRows float64 → int64` at the boundary; pinned-regime staleness applies
+as elsewhere.
 
 ### 3.4 Sizing the GROUP_AGG rel (`sizeGroupingRelFromAgg`)
 
 `Rows ← max(1, estimateNumGroups(...))`, `Width ←
 nodeTupleWidth(aggNode.Output())`, `NCols ← len(aggNode.Output())`,
 `AvgVarBytes ← nodeAvgVarBytes(...)` — the §4.3 duty, stated here so the
-review checks it. A zero `NCols` would suppress the spill arm exactly as it
-suppressed the sort disk arm; the spill test below is the tripwire. (The
+review checks it. (No spill tripwire here: with no spill arm, NCols sizes
+only the hypothetical resume, and the omission test pins that.) (The
 volatile-`GROUP BY`-expression gap ledgered at `cardinality.go:1236-1239`
 rides along unchanged — `estimateNumGroups` is read, not fixed, here.)
 PG's `GroupPath` arm (GROUP BY without aggregates) needs no analogue:
@@ -351,10 +347,16 @@ queries (which required `enable_hashagg = off` to fire at all). The gate
 reads every such move line by line; a move AWAY from PG is a defect in the
 port, not "the model disagrees".
 
-Costs move everywhere an Aggregate is priced (legacy blocking number →
-`cost_agg` arms). `make plan-gate` needs an in-commit re-pin with the diff
-attributed Sort-style: every changed line must be an Aggregate line or its
-rollup.
+What moves, precisely — and what does not. The `*Aggregate` node carries
+no PlanCost (no `planCostSetter`: EXPLAIN recomputes the legacy display
+number from the child), so `cost_agg` SELECTS but never displays: an
+Aggregate EXPLAIN line moves only as a rollup of a moved child. With no
+spill arm, hashed winners keep byte-identical subtrees (same child, same
+legacy recompute — no move at all); sorted winners show the new Sort input
+line (legacy bare-`&Sort` rewrite → `cost_sort`-priced, the same move C-12
+made for ORDER BY sorts) plus rollups. `make plan-gate` needs an in-commit
+re-pin with the diff attributed Sort-style: every changed line must be a
+Sort-input line or its rollup, never a strategy flip away from PG.
 
 ---
 
@@ -371,18 +373,18 @@ rollup.
 | 7 | timing | T on every strategy-moved query (bar B2, 1.2×); ten longest A/A both suites (hold server age constant — sweep-tail collapse mimics regression, 09 §6) |
 | 8 | PP both suites | `scripts/pg-plan-parity-diff.py` vs the A-04 baseline: aggregation-strategy diffs do not increase (grouping-sets residuals ledgered, §4); other categories unchanged |
 
-Negative results, stated in advance:
+Negative results, stated in advance (one fired during the gate — recorded,
+not removed):
 
-- *A strategy move AWAY from PG.* The port misprices (most likely the spill
-  arm or the trans/final flat terms on wide aggregations). Fix the arm;
-  do not re-add a rule to force it back.
+- *A strategy move AWAY from PG.* The port misprices; fix the arm, do not
+  re-add a rule to force it back. FIRED 2026-09-06: the spill arm as first
+  written drove Q3/Q10/Q13/Q18 to sorted (Q13 5.67 s → 8.71 s), all four
+  away from PG's hash — because the executor has no hash-agg spill path,
+  so every charged spill page was fiction. Resolution: the arm was DELETED
+  (see §3.3), not tuned; the omission is pinned by test.
 - *`set_cheapest` keeps two paths and the rescan-visible EXPLAIN flaps.*
   Single candidate per input shape by construction (one hashed, one sorted,
   one plain max) — if the pathlist holds more, the producer over-generates.
-- *A new `cost_agg` number is LOWER than the legacy display cost on a
-  spilling hash.* Then the spill arm did not fire — the §4.3 NCols tripwire
-  (spill test) should have caught it; if it passed and production still
-  underprices, the rel sizing (not the formula) is wrong.
 - *Timing regresses with no shape change.* Not C-15 (same executor work,
   modulo strategy picks which ARE shape changes). Re-run the baseline
   (late-session drift ~1.7% documented).
@@ -392,9 +394,10 @@ Negative results, stated in advance:
 ## 6. Scope estimate
 
 **~350–500 LOC production + ~300 test LOC.** Producer + arm (~150), `costAgg`
-+ spill (~120), rule deletions (~-800 gross, the actual retirement),
-migrated tests. Estimate, per the grep-oversizing lesson: make the change
-and run `go build`.
+(no spill — the arm was deleted after the gate fired the §5 negative),
+rule deletions (~-800 gross, the actual retirement), migrated tests.
+Estimate, per the grep-oversizing lesson: make the change and run
+`go build`.
 
 ## 7. C-10c re-assert table (per-item duty, C-10c)
 

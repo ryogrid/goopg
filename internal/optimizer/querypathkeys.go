@@ -36,8 +36,9 @@ package optimizer
 // An ordering-only full index scan that nothing selects FOR its ordering is a
 // path that can only lose on total cost — or, worse, win `CheapestStartup`
 // under a LIMIT and be picked for a fraction while the redundant Sort above it
-// still runs. It would also silently disable `applyIndexOrderedGroupingRule`
-// (groupagg_indexorder.go:63), whose GROUP-BY-ordered index promotion matches
+// still runs. It would also silently disable the GROUP_AGG producer's
+// index-ordered input variant (groupingpaths.go indexOrderedAggInput),
+// whose GROUP-BY-ordered index promotion matches
 // on the child being a `*SeqScan`. The consumers are filed: C-11 (P4-02 upper
 // `RelOptInfo`s, incl. `ORDERED`), C-12 (P4-03 a real upper-rel `PathSort`),
 // C-15/C-16 (`create_grouping_paths` / `create_distinct_paths`). The widening

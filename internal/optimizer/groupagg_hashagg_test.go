@@ -124,21 +124,25 @@ func TestEnableHashAggSkipsUngrouped(t *testing.T) {
 }
 
 // TestEnableHashAggSkipsNonSimpleMode: a Mode != AggModeSimple node (parallel
-// Partial/Final) is not shaped by the GUC. Not reachable via a single-statement
-// Plan() in this harness, so construct the Aggregate node directly: the rule
-// must leave both the Strategy and the child untouched.
+// Partial/Final) is not shaped by the producer either — the retired rule's
+// skip survives as createGroupingPaths' pass-through. Not reachable via a
+// single-statement Plan() in this harness, so drive the producer directly:
+// the node must come back by identity, unpriced and untouched.
 func TestEnableHashAggSkipsNonSimpleMode(t *testing.T) {
 	aggNode := &Aggregate{
 		GroupExprs: []Expr{&ColumnRef{Name: "ten"}},
 		Mode:       AggModePartial,
 		Strategy:   AggStrategyHashed,
 	}
-	applyEnableHashAggRule(aggNode, hashAggSettings(false))
-	if aggNode.Strategy != AggStrategyHashed {
-		t.Fatalf("Strategy = %d, want AggStrategyHashed (Mode != AggModeSimple must skip)", aggNode.Strategy)
+	got, err := createGroupingPaths(nil, aggNode, nil, hashAggSettings(false), 0)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if aggNode.Child != nil {
-		t.Fatalf("rule wrapped the child on a Mode != AggModeSimple node: got %T", aggNode.Child)
+	if got != Node(aggNode) {
+		t.Fatalf("non-Simple node came back as %T, want the same node untouched", got)
+	}
+	if aggNode.Strategy != AggStrategyHashed || aggNode.Child != nil {
+		t.Fatalf("non-Simple node was touched: strategy=%d child=%T", aggNode.Strategy, aggNode.Child)
 	}
 }
 
