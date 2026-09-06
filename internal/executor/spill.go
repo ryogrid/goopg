@@ -108,6 +108,136 @@ func (w *spillWriter) WriteRowHashed(hashValue uint32, row Row) error {
 	return w.writeFrame()
 }
 
+// ── E-14: keyed INNER frames ────────────────────────────────────────────────
+//
+// A spilled INNER (build-side) row is reloaded by loadInnerBatch, which used
+// to recover the row's hash-table key by RE-EVALUATING the build key
+// expression against the reloaded row (buildKeyOfRow). That makes the key
+// columns permanently live in every retained build row, which is exactly the
+// dead weight E-14 set out to remove (design
+// docs/design/executor-e14-build-half/DESIGN.md §2: 6 of 15 retained columns
+// on the Q9 fixture are this join's own key columns that nothing above reads).
+// It is also redundant work: the key was already computed once, at build time.
+//
+// PG stores the hash value ahead of the tuple for the same reason —
+// "so that we needn't recompute it" (ExecHashJoinSaveTuple,
+// postgres/src/backend/executor/nodeHashjoin.c) — and its bucket search needs
+// nothing else, because PG's buckets ARE hash buckets. goopg's table is keyed
+// by the key's CANONICAL FORM (an int64 for the int lane, a datumKey string
+// otherwise), so the 32-bit hash alone does not identify a bucket here; the
+// canonical key has to ride along too.
+//
+// The frame is therefore [4B hash][1B tag][key][payload] where the payload is
+// exactly appendRowPayload's, unchanged. encode and decode are the sibling
+// pair this file's header names: they change together, and the test is the
+// ROUND TRIP (spill_keyed_frame_test.go), in both directions and at width 0.
+
+const (
+	// spillKeyNone is a row whose join key was NULL. It cannot be filed in
+	// the table at all; the reload path routes it the way the build loop
+	// does. Never produced by today's writers (the build loop diverts NULL
+	// keys before they can spill) — decoded defensively so a future writer
+	// cannot make it a silent mis-file.
+	spillKeyNone uint8 = 0
+	// spillKeyInt is the int64 fast-path key (o.lazyIntHash).
+	spillKeyInt uint8 = 1
+	// spillKeyStr is the canonical datumKey string (o.lazyHash).
+	spillKeyStr uint8 = 2
+)
+
+// spillRowKey is the hash-table key carried beside a spilled inner row. It is
+// the CANONICAL form the map is keyed by, not the key Datum: the two lanes
+// canonicalise differently and demoteIntHash's re-key is defined over the
+// canonical forms, so carrying those is what makes a reload land in the same
+// bucket as the original insert.
+type spillRowKey struct {
+	tag uint8
+	i   int64
+	s   string
+}
+
+// spillIntKey / spillStrKey are the two constructors, named so a call site
+// reads as the lane it belongs to.
+func spillIntKey(v int64) spillRowKey  { return spillRowKey{tag: spillKeyInt, i: v} }
+func spillStrKey(s string) spillRowKey { return spillRowKey{tag: spillKeyStr, s: s} }
+
+// WriteRowKeyed writes an inner-batch frame: the 32-bit routing hash, the
+// canonical hash-table key, then the row payload.
+func (w *spillWriter) WriteRowKeyed(hashValue uint32, k spillRowKey, row Row) error {
+	w.buf = w.buf[:0]
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, hashValue)
+	w.buf = appendSpillRowKey(w.buf, k)
+	w.buf = appendRowPayload(w.buf, row)
+	return w.writeFrame()
+}
+
+// appendSpillRowKey encodes the key. The int lane is fixed-width (the key is
+// a full-range int64, so a varint would cost a byte on negatives for nothing);
+// the string lane is length-prefixed because datumKey strings are binary.
+func appendSpillRowKey(buf []byte, k spillRowKey) []byte {
+	buf = append(buf, k.tag)
+	switch k.tag {
+	case spillKeyInt:
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(k.i))
+	case spillKeyStr:
+		buf = binary.AppendUvarint(buf, uint64(len(k.s)))
+		buf = append(buf, k.s...)
+	}
+	return buf
+}
+
+// ReadRowKeyedInto is ReadRowHashedInto for frames written by WriteRowKeyed.
+// The returned key's string field, when present, is a fresh string — the row
+// itself keeps ReadRowInto's "valid until the next read" contract, but a map
+// key must outlive the buffer it was decoded from.
+func (r *spillReader) ReadRowKeyedInto(dst Row) (uint32, spillRowKey, Row, error) {
+	data, err := r.readFrame()
+	if err != nil {
+		return 0, spillRowKey{}, nil, err
+	}
+	if len(data) < 5 {
+		return 0, spillRowKey{}, nil, fmt.Errorf("spillReader: keyed frame shorter than its hash+tag prefix")
+	}
+	hashValue := binary.LittleEndian.Uint32(data[:4])
+	k, n, err := decodeSpillRowKey(data[4:])
+	if err != nil {
+		return 0, spillRowKey{}, nil, err
+	}
+	row, err := decodeRowPayload(data[4+n:], dst)
+	if err != nil {
+		return 0, spillRowKey{}, nil, err
+	}
+	return hashValue, k, row, nil
+}
+
+// decodeSpillRowKey decodes one key, returning the bytes consumed.
+func decodeSpillRowKey(data []byte) (spillRowKey, int, error) {
+	if len(data) < 1 {
+		return spillRowKey{}, 0, fmt.Errorf("spillReader: keyed frame missing key tag")
+	}
+	switch tag := data[0]; tag {
+	case spillKeyNone:
+		return spillRowKey{tag: spillKeyNone}, 1, nil
+	case spillKeyInt:
+		if len(data) < 9 {
+			return spillRowKey{}, 0, fmt.Errorf("spillReader: truncated int64 spill key")
+		}
+		return spillIntKey(int64(binary.LittleEndian.Uint64(data[1:9]))), 9, nil
+	case spillKeyStr:
+		n, adv := binary.Uvarint(data[1:])
+		if adv <= 0 {
+			return spillRowKey{}, 0, fmt.Errorf("spillReader: invalid spill key length")
+		}
+		start := 1 + adv
+		if uint64(len(data)-start) < n {
+			return spillRowKey{}, 0, fmt.Errorf("spillReader: truncated string spill key")
+		}
+		return spillStrKey(string(data[start : start+int(n)])), start + int(n), nil
+	default:
+		return spillRowKey{}, 0, fmt.Errorf("spillReader: unknown spill key tag %d", tag)
+	}
+}
+
 // appendRowPayload encodes one Row (column count + datums) onto buf.
 func appendRowPayload(buf []byte, row Row) []byte {
 	buf = binary.AppendUvarint(buf, uint64(len(row)))

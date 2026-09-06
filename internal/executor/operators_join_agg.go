@@ -247,11 +247,13 @@ type joinOp struct {
 	// it did before batching existed. noBatch is a caller-side decline that
 	// nothing sets today (E-09a publishes a spilling shared build; each
 	// participant then holds a PRIVATE state over the shared inner files —
-	// join_batch.go newParticipantBatchState). batchKeySlot re-presents a row
-	// reloaded from an inner batch file to the build key expression.
-	batches      *hashBatchState
-	noBatch      bool
-	batchKeySlot *MaterializedSlot
+	// join_batch.go newParticipantBatchState).
+	//
+	// E-14 removed batchKeySlot along with buildKeyOfRow: a reloaded inner
+	// row now carries its canonical hash-table key in the spill frame, so
+	// nothing re-presents it to the build key expression.
+	batches *hashBatchState
+	noBatch bool
 
 	// M0122-0011: NullAware (NOT IN) anti-join build-side state,
 	// computed once in openLazyHashJoin's build loop. Real NOT IN
@@ -1221,6 +1223,61 @@ func (o *joinOp) lazyHashInsertDatum(keyDatum Datum, row Row) {
 	}
 	sk := datumKey(keyDatum)
 	o.lazyHash[sk] = append(o.lazyHash[sk], row)
+}
+
+// spillKeyOfDatum canonicalises a build key Datum into the form the hash
+// table is keyed by, so a spilled inner row can be re-filed on reload without
+// re-evaluating the build key expression (E-14; spill.go's keyed-frame
+// header). It mirrors lazyHashInsertDatum's lane choice EXACTLY, including
+// the int-lane fallback: a datum the int64 lane cannot represent is filed
+// under datumKey, which is the same string demoteIntHash would have produced
+// for it. The two must agree — a disagreement files a reloaded row in a
+// bucket no probe visits, which is a silent lost-rows bug, not a slow one.
+func (o *joinOp) spillKeyOfDatum(keyDatum Datum) spillRowKey {
+	if o.lazyHashIsInt {
+		if ik, ok := datumToInt64Key(keyDatum); ok {
+			return spillIntKey(ik)
+		}
+	}
+	return spillStrKey(datumKey(keyDatum))
+}
+
+// lazyHashInsertKeyed files a reloaded row under a canonical key recovered
+// from its spill frame, rather than from a key Datum.
+//
+// The lane the key was WRITTEN in and the lane the table is in NOW can differ:
+// a build that demoted mid-flight (demoteIntHash) spilled int-lane keys before
+// the demotion and is a string table afterwards. That case is handled by the
+// same conversion demoteIntHash performs — canonicalNumericKey(ik, 0) — which
+// its own comment establishes is exact.
+//
+// The reverse (a string key arriving at an int table) cannot happen: the table
+// only ever leaves the int lane, never returns to it. It is still handled,
+// by demoting, because "cannot happen" is how rows get lost silently.
+func (o *joinOp) lazyHashInsertKeyed(k spillRowKey, row Row) {
+	switch k.tag {
+	case spillKeyInt:
+		if o.lazyHashIsInt {
+			if o.lazyIntHash == nil {
+				o.lazyIntHash = make(map[int64][]Row)
+			}
+			o.lazyIntHash[k.i] = append(o.lazyIntHash[k.i], row)
+			return
+		}
+		if o.lazyHash == nil {
+			o.lazyHash = make(map[string][]Row)
+		}
+		sk := canonicalNumericKey(k.i, 0)
+		o.lazyHash[sk] = append(o.lazyHash[sk], row)
+	case spillKeyStr:
+		if o.lazyHashIsInt {
+			o.demoteIntHash()
+		}
+		if o.lazyHash == nil {
+			o.lazyHash = make(map[string][]Row)
+		}
+		o.lazyHash[k.s] = append(o.lazyHash[k.s], row)
+	}
 }
 
 // demoteIntHash abandons the int64 representation mid-build and re-keys

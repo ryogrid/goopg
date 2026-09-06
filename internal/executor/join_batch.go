@@ -422,6 +422,45 @@ func (bs *hashBatchState) batchOf(h uint32) int {
 	return int((h >> bs.bucketBits) & uint32(bs.nbatch-1))
 }
 
+// batchFileFor returns batch b's file in `files`, creating it on first use.
+// It is the half of `write` that both frame shapes share (E-14: inner files
+// carry a keyed frame, outer files the plain hashed one).
+func (bs *hashBatchState) batchFileFor(files []*joinBatchFile, b int) (*joinBatchFile, error) {
+	f := files[b]
+	if f == nil {
+		w, err := newSpillWriter(bs.ctx)
+		if err != nil {
+			return nil, err
+		}
+		f = &joinBatchFile{w: w, path: w.Path(), createdNBatch: bs.nbatch}
+		files[b] = f
+	}
+	if f.w == nil {
+		// A frozen file (freezeForSharing) has no writer by construction.
+		// Reaching it is a bug in the caller, never a data condition.
+		return nil, &ExecError{
+			Code:    "XX000",
+			Message: fmt.Sprintf("hash join attempted to write frozen batch file %d", b),
+		}
+	}
+	return f, nil
+}
+
+// writeKeyed appends one INNER row to batch b's file, carrying the canonical
+// hash-table key beside the routing hash so the reload never has to
+// re-evaluate the build key expression (E-14; spill.go's keyed-frame header).
+func (bs *hashBatchState) writeKeyed(files []*joinBatchFile, b int, h uint32, k spillRowKey, row Row) error {
+	f, err := bs.batchFileFor(files, b)
+	if err != nil {
+		return err
+	}
+	if err := f.w.WriteRowKeyed(h, k, row); err != nil {
+		return err
+	}
+	f.rows++
+	return nil
+}
+
 func (bs *hashBatchState) write(files []*joinBatchFile, b int, h uint32, row Row) error {
 	f := files[b]
 	if f == nil {
@@ -447,7 +486,7 @@ func (bs *hashBatchState) write(files []*joinBatchFile, b int, h uint32, row Row
 	return nil
 }
 
-func (bs *hashBatchState) writeInner(b int, h uint32, row Row) error {
+func (bs *hashBatchState) writeInner(b int, h uint32, k spillRowKey, row Row) error {
 	if bs.innerShared {
 		// E-09a invariant: a participant never writes a shared inner file.
 		// Every legitimate writer (the build loop, growth, the forward
@@ -461,7 +500,7 @@ func (bs *hashBatchState) writeInner(b int, h uint32, row Row) error {
 		}
 	}
 	bs.innerSpilled++
-	return bs.write(bs.inner, b, h, row)
+	return bs.writeKeyed(bs.inner, b, h, k, row)
 }
 
 func (bs *hashBatchState) writeOuter(b int, h uint32, row Row) error {
@@ -483,7 +522,13 @@ func (bs *hashBatchState) insertBuildRow(o *joinOp, kd Datum, row Row) error {
 	if bs.nbatch > 1 {
 		h := joinBatchHash(kd)
 		if b := bs.batchOf(h); b != bs.curBatch {
-			return bs.writeInner(b, h, row)
+			// E-14: the canonical key travels with the row, so the reload
+			// files it in the same bucket this insert would have without
+			// re-evaluating the build key expression against the reloaded
+			// row. The lane is chosen exactly as lazyHashInsertDatum
+			// chooses it, including the int-lane fallback to the canonical
+			// string when the datum is not int64-representable.
+			return bs.writeInner(b, h, o.spillKeyOfDatum(kd), row)
 		}
 	}
 	o.lazyHashInsertDatum(kd, row)
@@ -536,7 +581,7 @@ func (bs *hashBatchState) increaseNumBatches(o *joinOp) error {
 				continue
 			}
 			for _, r := range rows {
-				if err := bs.writeInner(b, h, r); err != nil {
+				if err := bs.writeInner(b, h, spillIntKey(ik), r); err != nil {
 					return err
 				}
 				bs.spaceUsed -= estimatedRowBytes(r) + hashsize.RowSliceBytes
@@ -554,7 +599,7 @@ func (bs *hashBatchState) increaseNumBatches(o *joinOp) error {
 				continue
 			}
 			for _, r := range rows {
-				if err := bs.writeInner(b, h, r); err != nil {
+				if err := bs.writeInner(b, h, spillStrKey(sk), r); err != nil {
 					return err
 				}
 				bs.spaceUsed -= estimatedRowBytes(r) + hashsize.RowSliceBytes
@@ -694,7 +739,7 @@ func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
 	}
 	var buf Row
 	for {
-		h, row, err := r.ReadRowHashedInto(buf)
+		h, k, row, err := r.ReadRowKeyedInto(buf)
 		if err == io.EOF {
 			return nil
 		}
@@ -704,27 +749,31 @@ func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
 		buf = row
 		if b := bs.batchOf(h); b != bs.curBatch {
 			// Re-spilled straight from the read buffer: the encode completes
-			// before the next ReadRowHashedInto can overwrite it.
-			if err := bs.writeInner(b, h, row); err != nil {
+			// before the next ReadRowKeyedInto can overwrite it. The key
+			// rides along unchanged — a forward re-route does not re-derive
+			// it any more than the batch decision does.
+			if err := bs.writeInner(b, h, k, row); err != nil {
 				return err
 			}
 			continue
 		}
 		owned := cloneRow(row)
-		kd, ok, err := o.buildKeyOfRow(owned)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			// A NULL key cannot match anything; it was only spilled because
-			// the build loop files rows before it knows that. Dropping it
-			// here matches the in-memory build, which never inserts it —
-			// and, since M0127-P4.2, retains it for the fill sweep on the
-			// two join types where "matches nothing" still emits.
+		// E-14: the canonical key came out of the frame. Before, this line
+		// re-evaluated the build key EXPRESSION against `owned`, which is
+		// what pinned the key columns live in every retained build row
+		// (design executor-e14-build-half §2) and cost one expression
+		// evaluation per reloaded row for a value the build already had.
+		if k.tag == spillKeyNone {
+			// A NULL key cannot match anything. Today's writers divert such
+			// rows before they can spill, so this is defensive: it keeps the
+			// in-memory build's behaviour (never inserted; retained for the
+			// fill sweep on the two join types where "matches nothing" still
+			// emits, M0127-P4.2) rather than filing them under a synthetic
+			// bucket.
 			o.recordBuildNullKey(owned)
 			continue
 		}
-		o.lazyHashInsertDatum(kd, owned)
+		o.lazyHashInsertKeyed(k, owned)
 		bs.spaceUsed += estimatedRowBytes(owned) + hashsize.RowSliceBytes
 		if bs.spaceUsed > bs.peakSpace {
 			bs.peakSpace = bs.spaceUsed
@@ -1101,7 +1150,7 @@ func (bs *hashBatchState) runSharedLoad(o *joinOp, ld *sharedBatchLoad, b int, f
 	var nulls []Row
 	var buf Row
 	for {
-		h, row, rerr := r.ReadRowHashedInto(buf)
+		h, k, row, rerr := r.ReadRowKeyedInto(buf)
 		if rerr == io.EOF {
 			break
 		}
@@ -1119,12 +1168,9 @@ func (bs *hashBatchState) runSharedLoad(o *joinOp, ld *sharedBatchLoad, b int, f
 			return
 		}
 		owned := cloneRow(row)
-		kd, ok, kerr := o.buildKeyOfRow(owned)
-		if kerr != nil {
-			ld.err = kerr
-			return
-		}
-		if !ok {
+		// E-14: keyed frame — the canonical key came out of the file, so no
+		// participant re-evaluates the build key expression on reload.
+		if k.tag == spillKeyNone {
 			// A NULL key matches nothing; it was only spilled because the
 			// build loop files rows before it knows that. It is carried in
 			// the payload rather than recorded on the loader's operator, so
@@ -1134,7 +1180,7 @@ func (bs *hashBatchState) runSharedLoad(o *joinOp, ld *sharedBatchLoad, b int, f
 			}
 			continue
 		}
-		o.lazyHashInsertDatum(kd, owned)
+		o.lazyHashInsertKeyed(k, owned)
 		used += estimatedRowBytes(owned) + hashsize.RowSliceBytes
 	}
 	ld.hash, ld.intHash, ld.hashIsInt = o.lazyHash, o.lazyIntHash, o.lazyHashIsInt
@@ -1272,7 +1318,10 @@ func (bs *hashBatchState) settleInnerFiles() error {
 		bs.inner[k] = nf
 		var buf Row
 		for {
-			h, row, err := r.ReadRowHashedInto(buf)
+			// E-14: inner files are keyed frames, so settling copies the
+			// key through untouched — a settle is a re-file, never a
+			// re-derivation.
+			h, kk, row, err := r.ReadRowKeyedInto(buf)
 			if err == io.EOF {
 				break
 			}
@@ -1290,14 +1339,14 @@ func (bs *hashBatchState) settleInnerFiles() error {
 				}
 			}
 			if b == k {
-				if err := nf.w.WriteRowHashed(h, row); err != nil {
+				if err := nf.w.WriteRowKeyed(h, kk, row); err != nil {
 					r.closeKeepFile()
 					return err
 				}
 				nf.rows++
 				continue
 			}
-			if err := bs.write(bs.inner, b, h, row); err != nil {
+			if err := bs.writeKeyed(bs.inner, b, h, kk, row); err != nil {
 				r.closeKeepFile()
 				return err
 			}
@@ -1435,21 +1484,6 @@ func (o *joinOp) resetHashTable() {
 			o.lazyHash = make(map[string][]Row)
 		}
 	}
-}
-
-// buildKeyOfRow re-evaluates the build-side join key of a row reloaded from a
-// batch file, through the same merged key slot the build loop used.
-func (o *joinOp) buildKeyOfRow(row Row) (Datum, bool, error) {
-	if o.batchKeySlot == nil {
-		o.batchKeySlot = &MaterializedSlot{}
-	}
-	o.batchKeySlot.row = row
-	realWidth, nullWidth := o.lazyRW, o.lazyLW
-	if o.batches.buildIsLeft {
-		realWidth, nullWidth = o.lazyLW, o.lazyRW
-	}
-	keySlot := o.lazyBuildKeySlot.rebind(o.batchKeySlot, realWidth, nullWidth, o.batches.buildIsLeft)
-	return o.evalHashKeyDatumSlot(o.buildKeyNodes[0], keySlot)
 }
 
 // routeProbeRow decides whether a probe row belongs to the current batch. When

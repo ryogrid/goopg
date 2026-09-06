@@ -244,6 +244,57 @@ gates must still pass unchanged, and are re-run.
 
 ---
 
+## 4a. THE STRUCTURAL BLOCKER, and the prerequisite that removes it
+
+Implementation found a blocker that neither the EX1-04 design nor its
+review names, and that applies to **both** cuts, not one of them:
+
+> `loadInnerBatch` recovered a reloaded build row's hash-table key by
+> **re-evaluating the build key expression against the reloaded row**
+> (`buildKeyOfRow` → `evalHashKeyDatumSlot`).
+
+That makes every key column permanently live in every retained build row
+— not because a consumer reads its VALUE, but because the reload path
+re-derives the key from it. And the key columns are exactly the dead
+weight §2 measured. Any narrowing that drops a key column silently loses
+the row on reload: the key evaluates to NULL, and the `!ok` arm files it
+as a null-key row (dropped for INNER/Semi/Anti). Row counts would move,
+but only on shapes that actually spill, and only at bench `work_mem`.
+
+It is not avoidable by declining to narrow when batching, either:
+`presizeLazyHash` installs a `hashBatchState` for **every**
+`joinBatchEligible` join, including `nbatch == 1` ("a single-batch state
+costs one add and one compare per build row"), and growth can fire
+mid-build on any of them. So `o.batches != nil` is the normal case, not
+the spilling case, and a decline gated on it would disable E-14
+everywhere.
+
+**Prerequisite (landed with this design, inert): carry the key in the
+frame.** PG stores the hash value ahead of a saved tuple precisely "so
+that we needn't recompute it" (`ExecHashJoinSaveTuple`,
+`postgres/src/backend/executor/nodeHashjoin.c`). goopg already stored the
+32-bit hash — and then threw the saving away, because its buckets are
+keyed by the key's CANONICAL FORM (an int64 for the int lane, a
+`datumKey` string otherwise), which 32 bits do not identify. The inner
+frame becomes `[4B hash][1B tag][key][payload]`; the payload encoding is
+untouched.
+
+This is behaviour-identical by construction (the same key, read instead
+of recomputed), strictly less work (one expression evaluation per
+reloaded row removed), and it retires `buildKeyOfRow` and `batchKeySlot`
+outright — after which nothing in the executor derives a build key from a
+RETAINED row, only from a LIVE build-side row before retention. That is
+the property both cuts need.
+
+Lane agreement is the one hazard, and it is pinned:
+`spillKeyOfDatum` must choose the lane `lazyHashInsertDatum` chooses
+(including the int-lane fallback to `datumKey` for a datum the int64 lane
+cannot represent), and `lazyHashInsertKeyed` must handle a frame written
+before a `demoteIntHash` arriving at a demoted table — via the SAME
+`canonicalNumericKey(ik, 0)` conversion `demoteIntHash` performs, whose
+own comment establishes it is exact. Both are unit-pinned
+(`spill_keyed_frame_test.go`).
+
 ## 5. The spill round trip
 
 `appendRowPayload`/`encodeDatum` and `ReadRowInto`/`decodeDatum` are the
@@ -251,11 +302,17 @@ sibling pair a codec change once broke in six regress tests at once. This
 design **does not change the codec**: it changes only which Row is handed
 to it.
 
-- `WriteRowHashed(h, row)` writes `uvarint(len(row))` then one encoded
-  Datum per column. A narrowed row is a shorter, entirely well-formed
-  frame. A zero-width row is `uvarint(0)` and no datums — legal by the
-  format, and exercised by an explicit round-trip test rather than
-  assumed.
+- `WriteRowKeyed(h, k, row)` writes the hash, the tagged key, then
+  `uvarint(len(row))` and one encoded Datum per column. A narrowed row is
+  a shorter, entirely well-formed frame. A zero-width row is `uvarint(0)`
+  and no datums — legal by the format, and exercised by an explicit
+  round-trip test rather than assumed. The outer (probe) files keep the
+  plain `WriteRowHashed` frame: a replayed probe row is never filed in
+  the table and needs no key.
+- A decoded string key is COPIED out of the reader's reusable payload
+  buffer. A map key aliasing `dataBuf` would be rewritten by the next
+  read — the reader's own "valid until the next call" contract — and
+  that is pinned by its own test, not left to the comment.
 - The decoder allocates by the count it reads, so it reconstructs the
   retained width without being told. **The round trip is the test**, in
   both directions and at width 0.
@@ -268,6 +325,20 @@ to it.
   `TestEstimatedRowBytesAgreesWithEntryBytes` pins the FUNCTION against
   `hashsize.EntryBytes` for a given Row; passing a narrower Row does not
   move that agreement and the test stands unmodified.
+
+### 5.0 The frame grew — a second model note
+
+An inner frame is now 9 bytes larger than a hashed one on the int lane
+(1 tag + 8 key) and `1 + uvarint + len(key)` on the string lane.
+`hashsize.SpillBytes` — the planner's on-disk row model, landed inert
+(`53cd7a073`) and pinned by `TestSpillBytesAgreesWithEncoder*` against
+the UNKEYED writer — therefore under-charges an inner batch file by that
+much per row. It is inert and the agreement tests still hold (they
+measure the plain payload frame, which is unchanged), so nothing is
+broken today. **Required follow-up, with the spill-cost calibration
+item:** `SpillBytes` needs a keyed-inner variant, or the charge needs to
+say which of the two frames it is modelling. `internal/executor/hashsize/`
+is another agent's this session.
 
 ### 5.1 The model/reality gap this opens — reported, not fixed
 
@@ -377,7 +448,45 @@ Deferred because:
    only by row counts is the 43× class.
 
 Resume point: this section plus §3.1's table; the walk to generalise is
-`scan_deform.go:deformJoinBounds`; the seam is unchanged from Cut A.
+`scan_deform.go:deformJoinBounds`; the seam is unchanged from Cut A; and
+§4a's prerequisite is now landed, so neither cut has to solve the reload
+key any more.
+
+## 8a. Status of this document's cuts
+
+| cut | state |
+|---|---|
+| §4a keyed inner frames (prerequisite for BOTH cuts) | **landed, inert** — behaviour-identical, one expression evaluation per reloaded row removed, `buildKeyOfRow`/`batchKeySlot` retired |
+| Cut A (Semi/Anti reader-set retention) | **not landed.** See §8b — P4-01 already achieves it at plan level, so the executor cut is worth 0 on the Project shape and only the zero-width case remains |
+| Cut B (INNER keep-set + above-walk) | specified, deferred (§8) |
+
+## 8b. Why Cut A did not land as its own commit
+
+Cut A's premise was "the Semi/Anti build payload is dead except the
+residual". It is — but `narrowBuildInput`'s keep-set is
+`needed-above ∪ quals-at-and-above`, and for a Semi/Anti join
+`needed-above` over the BUILD side is empty by the same
+`Output() == Left.Output()` structure Cut A's proof rests on. So P4-01
+already narrows a Semi/Anti build input to exactly
+`keys ∪ residual columns` — the set Cut A would compute. Everything Cut A
+could drop, the planner has dropped.
+
+What is left is only the narrower claim that the KEY columns themselves
+are dead once the key is in the map (now true, per §4a) — i.e. the
+**zero-width** retention for a pure equi Semi/Anti join. That is a real
+win (`24 + w*48 + payload` → `24` bytes per build row) and it is now
+unblocked, but it is a width change on retained rows: it needs the
+`ensureLazyVirtual` null-source seam of §3.1, and its acceptance is a
+values-plus-geometry argument on spilling shapes, which is precisely
+what cannot be validated while the TPC-H cluster is held (§9). Landing a
+width change on retained rows without that gate is the class the
+"0 rows on seven TPC-H queries" precedent warns about.
+
+Resume point for Cut A: §3.1's seam table plus this section; the decline
+predicate is `Type ∈ {Semi, Anti} ∧ execResidual has no build-side ref ∧
+¬preserveBuildSide ∧ ¬Lateral ∧ ¬BuildLeft`; the only reader to remap is
+`ensureLazyVirtual`'s build-side `virtualCol` entries plus the build-side
+NULL pad width.
 
 ---
 

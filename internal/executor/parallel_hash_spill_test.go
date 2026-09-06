@@ -439,7 +439,7 @@ func TestSharedSpillingBuildFilesAreSettled(t *testing.T) {
 		var n int64
 		var buf Row
 		for {
-			h, row, err := r.ReadRowHashedInto(buf)
+			h, _, row, err := r.ReadRowKeyedInto(buf)
 			if err != nil {
 				break
 			}
@@ -480,7 +480,7 @@ func TestSharedInnerFilesRefuseParticipantWrites(t *testing.T) {
 	if bs.growEnabled {
 		t.Fatalf("participant state has growth enabled")
 	}
-	err := bs.writeInner(2, 0, Row{NewIntDatum(1)})
+	err := bs.writeInner(2, 0, spillIntKey(1), Row{NewIntDatum(1)})
 	var ee *ExecError
 	if err == nil || !errorsAs(err, &ee) || ee.Code != "XX000" {
 		t.Fatalf("writeInner on a shared state returned %v, want XX000", err)
