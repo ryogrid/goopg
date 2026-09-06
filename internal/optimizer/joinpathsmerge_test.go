@@ -229,7 +229,7 @@ func TestSortInnerAndOuter_SkipsSortWhenInputAlreadyOrdered(t *testing.T) {
 		t.Fatalf("skipping the sort must be cheaper: %v vs %v", pre.Cost.Total, plain.Cost.Total)
 	}
 	// The saving must be the sort's own cost, not a rounding difference.
-	if want := costSortRun(cp, 10000, relNCols(unordered)).Total; plain.Cost.Total-pre.Cost.Total < want*0.9 {
+	if want := costSortRun(cp, 10000, relNCols(unordered), relAvgVarBytes(unordered)).Total; plain.Cost.Total-pre.Cost.Total < want*0.9 {
 		t.Fatalf("saving %v is far below the sort cost %v — the sort was charged twice or not at all",
 			plain.Cost.Total-pre.Cost.Total, want)
 	}
@@ -346,7 +346,7 @@ func TestSortPathFor_ChargesTheSortOnTopOfItsInput(t *testing.T) {
 	keys := []PathKey{{Expr: col(1), SortAsc: true}}
 
 	s := sortPathFor(sub, keys, cp)
-	run := costSortRun(cp, 1000, relNCols(rel))
+	run := costSortRun(cp, 1000, relNCols(rel), relAvgVarBytes(rel))
 	if s.Cost.Startup != sub.Cost.Total+run.Startup {
 		t.Fatalf("sort startup = %v, want input total + comparison cost %v", s.Cost.Startup, sub.Cost.Total+run.Startup)
 	}

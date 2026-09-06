@@ -45,10 +45,10 @@ func TestCostSortRun_StartupHeavy(t *testing.T) {
 	cp := defaultCostParams()
 	// `cost_tuplesort` clamps `tuples` to 2 rather than returning zero
 	// ("mustn't do log(0)"), so a degenerate input still costs something.
-	if tiny := costSortRun(cp, 1, 0); !(tiny.Total > 0) {
+	if tiny := costSortRun(cp, 1, 0, 0); !(tiny.Total > 0) {
 		t.Fatalf("a 1-row sort must be clamped to PG's 2-tuple floor, got %+v", tiny)
 	}
-	c := costSortRun(cp, 1000, 0)
+	c := costSortRun(cp, 1000, 0, 0)
 	// startup = 2*0.0025 * 1000 * log2(1000)
 	wantStartup := 2 * 0.0025 * 1000 * math.Log2(1000)
 	if !approx(c.Startup, wantStartup) {

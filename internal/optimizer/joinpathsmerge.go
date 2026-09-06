@@ -440,8 +440,10 @@ func sortPathFor(sub *Path, keys []PathKey, cp costParams) *Path {
 	// `hashJoinCost` prices its batch files with, so the merge candidate and the
 	// hash candidate for one joinrel are charged for the same bytes at the same
 	// rate. Passing `relNCols(sub.Rel)` rather than the SORT path's own width is
-	// exact: a Sort projects nothing, so its output rows are its input's.
-	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel))
+	// exact: a Sort projects nothing, so its output rows are its input's. The
+	// rel's `AvgVarBytes` rides along for the same reason (spill-calibration
+	// Cut 1): it is the statistic `hashJoinCost` sizes the rival's build with.
+	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel), relAvgVarBytes(sub.Rel))
 	return &Path{
 		Kind: PathSort,
 		// B-17a: `cost_sort`'s own flag on top of the input's count

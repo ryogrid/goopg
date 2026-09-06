@@ -272,7 +272,16 @@ func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
 // means "column count unknown" and suppresses the disk arm, matching
 // `hashJoinCost`'s reading of a zero `innerCols` as "assume no spill": an
 // unknown width must not invent an I/O charge.
-func costSortRun(cp costParams, inputRows float64, ncols int) Cost {
+//
+// `avgVarBytes` is the row's variable-width payload, the second argument of
+// that same `EntryBytes` — the one `hashJoinCost` has passed as the real
+// `innerAvgVarBytes` since M0128-P3.1 while this function passed a literal 0
+// (`docs/design/planner-spill-cost-calibration/DESIGN.md` §3.3, Cut 1). A
+// sort of text-heavy rows was sized as if every column were fixed-width,
+// which under-charges the spill in the direction §3.2 already errs. Callers
+// hand in the rel's `AvgVarBytes`; zero stays a legitimate value ("no
+// ANALYZE, or every column fixed-width") and changes nothing.
+func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float64) Cost {
 	// "We want to be sure the cost of a sort is never estimated as zero, even
 	// if passed-in tuple count is zero. Besides, mustn't do log(0)..."
 	// (costsize.c) — PG clamps rather than returning zero, and a zero here
@@ -286,7 +295,7 @@ func costSortRun(cp costParams, inputRows float64, ncols int) Cost {
 	startup := comparisonCost * tuples * math.Log2(tuples)
 
 	if ncols > 0 && cp.workMem > 0 {
-		inputBytes := tuples * hashsize.EntryBytes(ncols, 0)
+		inputBytes := tuples * hashsize.EntryBytes(ncols, avgVarBytes)
 		sortMemBytes := float64(cp.workMem)
 		if inputBytes > sortMemBytes {
 			npages := math.Ceil(inputBytes / blockSizeBytes)

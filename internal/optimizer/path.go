@@ -496,6 +496,15 @@ func newRelOptInfo(relids RelSet, rows float64, width int) *RelOptInfo {
 // is a base rel. Zero is returned only when neither is available, and
 // hashJoinCost reads that as "assume no spill", which is what it did before
 // this function existed.
+// relAvgVarBytes is `relNCols`' variable-payload twin at REL granularity: the
+// statistic `RelOptInfo.AvgVarBytes` carries, nil-safe for the same callers.
+func relAvgVarBytes(r *RelOptInfo) float64 {
+	if r == nil {
+		return 0
+	}
+	return r.AvgVarBytes
+}
+
 // pathNCols is `relNCols` at PATH granularity — take2 P1-20's sibling in
 // P4-01.
 //
