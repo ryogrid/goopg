@@ -409,6 +409,13 @@ func mergeClump(s *searchCtx, clumps []*clump, newClump *clump, numGene int, for
 				// inside merge_clump (geqo_eval.c:280). Without it, the
 				// joinrel has no CheapestTotal and the next merge using
 				// this clump as input fails.
+				//
+				// C-19d: and immediately BEFORE it, upstream calls
+				// `generate_useful_gather_paths(root, joinrel, false)` — the
+				// GEQO arm's counterpart of the DP arm's per-level call
+				// (joinsearchlevel.go). Same ordering reason: a Gather path
+				// offered after set_cheapest could never be CheapestTotal.
+				s.generateUsefulGatherPaths(joinrel)
 				setCheapest(joinrel)
 				// Absorb new clump into old.
 				oldClump.joinrel = joinrel

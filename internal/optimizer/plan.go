@@ -2652,6 +2652,7 @@ func (n *SetOp) Output() Schema { return n.Left.Output() }
 // space. The risk correspondingly moves from "is the transport correct" to "is
 // the shutdown correct".
 type Gather struct {
+	PlanCost
 	pos   int
 	Child Node
 	// WorkersPlanned is the worker count chosen at plan time. EXPLAIN renders
@@ -2682,6 +2683,7 @@ func NewGather(pos int, child Node, nWorkers int) *Gather {
 //
 // P7 of docs/design/parallel-query/ (chapter 05 §4).
 type GatherMerge struct {
+	PlanCost
 	pos            int
 	Child          Node
 	WorkersPlanned int

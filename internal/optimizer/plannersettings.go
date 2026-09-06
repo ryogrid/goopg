@@ -83,6 +83,20 @@ type PlannerSettings struct {
 	EnableIndexScan  bool
 	EnableBitmapScan bool
 
+	// EnableGatherMerge is PG's `enable_gathermerge` (C-19d): cost_gather_
+	// merge's own flag (costsize.c:536), counted onto the path's
+	// DisabledNodes rather than gating the producer, exactly as the join and
+	// scan toggles above are. `enable_gather` does not exist upstream —
+	// cost_gather carries no flag — so there is no field beside it.
+	//
+	// Like the four parallel fields below it is NOT read from the session
+	// yet (`plannerSettingsFrom` reads no parallel GUC), so it sits at its
+	// default; the post-pass's boolean twin
+	// (`ParallelSettings.DisableGatherMerge`) is not wired either. Both
+	// channels are P2-02's remainder, and the post-pass half retires with
+	// C-19h.
+	EnableGatherMerge bool
+
 	// EnableHashAgg / EnablePresortedAggregate / Geqo / GeqoThreshold are the
 	// remaining P2-02c bridges. Same defect as EnableMemoize below: each
 	// reached the planner through a registry.OnChange bridge writing a
@@ -165,6 +179,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableSeqScan:    true,
 		EnableIndexScan:  true,
 		EnableBitmapScan: true,
+		EnableGatherMerge: true,
 		EnableMemoize:   true,
 
 		EnableHashAgg:            HashAggEnabled(),
@@ -229,6 +244,7 @@ func (ps PlannerSettings) costParams() costParams {
 		enableSeqScan:    ps.EnableSeqScan,
 		enableIndexScan:  ps.EnableIndexScan,
 		enableBitmapScan: ps.EnableBitmapScan,
+		enableGatherMerge: ps.EnableGatherMerge,
 		enableMemoize:   ps.EnableMemoize,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,

@@ -97,6 +97,13 @@ type costParams struct {
 	enableSeqScan    bool
 	enableIndexScan  bool
 	enableBitmapScan bool
+	// enableGatherMerge is `enable_gathermerge` (C-19d): cost_gather_merge's
+	// own flag (costsize.c:536, `path->path.disabled_nodes = input_disabled_
+	// nodes + (enable_gathermerge ? 0 : 1)`). It is the COUNTING form of
+	// `ParallelSettings.DisableGatherMerge`, whose comment asked for exactly
+	// this conversion once P5-04 landed real GatherMerge paths. `cost_gather`
+	// has no flag upstream, so there is no enableGather beside it.
+	enableGatherMerge bool
 	geqo            bool
 	geqoThreshold   int
 	geqoEffort      int
@@ -142,6 +149,7 @@ func defaultCostParams() costParams {
 		enableSeqScan:   true,
 		enableIndexScan: true,
 		enableBitmapScan: true,
+		enableGatherMerge: true,
 		enableMemoize:   true,
 		geqo:            GeqoEnabled(),
 		geqoThreshold:   GeqoThreshold(),
@@ -553,6 +561,77 @@ func gatherCost(cp costParams, sub Cost, outputRows float64) Cost {
 	startup := sub.Startup + cp.parallelSetupCost
 	total := sub.Total + cp.parallelSetupCost + cp.parallelTupleCost*outputRows
 	return Cost{Startup: startup, Total: total}
+}
+
+// gatherMergeCost reproduces cost_gather_merge (costsize.c:485): a Gather that
+// MERGES its workers' already-ordered streams instead of interleaving them, so
+// it pays for a k-way heap on top of everything cost_gather pays for.
+//
+// `sub` is the partial subpath's cost (upstream's input_startup_cost /
+// input_total_cost, which create_gather_merge_path reads off the subpath),
+// `workers` is `path->num_workers` — the SUBPATH's parallel_workers — and
+// `outputRows` is compute_gather_rows(subpath), the same figure gatherCost
+// takes.
+//
+// The five terms, in upstream's order (:510-533):
+//
+//	N               = num_workers + 1   // "add one … to account for the leader"
+//	comparison_cost = 2.0 * cpu_operator_cost
+//	startup        += comparison_cost * N * log2(N)   // heap creation
+//	run            += rows * comparison_cost * log2(N) // per-tuple maintenance
+//	run            += cpu_operator_cost * rows        // "like cost_merge_append"
+//	startup        += parallel_setup_cost
+//	run            += parallel_tuple_cost * rows * 1.05
+//
+// The 1.05 is upstream's, and so is its reason: "Since Gather Merge, unlike
+// Gather, requires us to block until a tuple is available from every worker,
+// we bump the IPC cost up a little bit as compared with Gather. For lack of a
+// better idea, charge an extra 5%."
+//
+// `workers` must be > 0 (upstream asserts it): a zero-worker Gather Merge is
+// the single_copy shape, which C-19d's producer refuses rather than builds
+// (docs/design/planner-c19d-gather-paths/DESIGN.md §4.3). The clamp here is
+// belt-and-braces so an N of 1 cannot make log2(N) zero and price the merge
+// free.
+func gatherMergeCost(cp costParams, sub Cost, workers int, outputRows float64) Cost {
+	if workers < 1 {
+		workers = 1
+	}
+	n := float64(workers) + 1
+	logN := math.Log2(n)
+	comparisonCost := 2.0 * cp.cpuOperatorCost
+
+	startup := comparisonCost*n*logN + cp.parallelSetupCost
+	run := outputRows*comparisonCost*logN +
+		cp.cpuOperatorCost*outputRows +
+		cp.parallelTupleCost*outputRows*gatherMergeIPCFactor
+
+	return Cost{
+		Startup: startup + sub.Startup,
+		Total:   startup + run + sub.Total,
+	}
+}
+
+// gatherMergeIPCFactor is cost_gather_merge's extra 5% on the IPC term
+// (costsize.c:533). Named rather than written inline so a test can express the
+// relationship "a Gather Merge's tuple transfer costs more than a Gather's"
+// through the constant instead of pinning 1.05.
+const gatherMergeIPCFactor = 1.05
+
+// computeGatherRows reproduces compute_gather_rows (costsize.c:6625): a partial
+// path's `rows` is the PER-WORKER count (cost_seqscan's parallel arm divides by
+// get_parallel_divisor), so the Gather above it multiplies the same divisor
+// back to recover the relation's own row count.
+//
+// It reads the divisor from the SUBPATH's worker count, never from the rel or
+// the GUC, because that is the count the subpath was priced with — pricing a
+// Gather with a divisor the child did not use is how a row estimate silently
+// stops matching the cost beside it.
+func computeGatherRows(sub *Path, cp costParams) float64 {
+	if sub == nil {
+		return 0
+	}
+	return clampRowEst(sub.Rows * getParallelDivisor(sub.ParallelWorkers, cp.parallelLeaderParticipation))
 }
 
 // indexProbeCost is the cost of one equality probe of a selective/unique index

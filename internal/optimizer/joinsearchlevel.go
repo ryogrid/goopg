@@ -299,6 +299,14 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 				s.traceFailed(err)
 				return nil, err
 			}
+			// C-19d: `generate_useful_gather_paths(root, rel, false)` sits
+			// immediately before `set_cheapest` here in upstream
+			// (allpaths.c:3503-3517), and the order matters — a Gather path
+			// offered after set_cheapest could never become CheapestTotal and
+			// would be invisible to the level above. It is a no-op until a
+			// joinrel has partial paths (C-19f) and while GOOPG_GATHER_PATHS
+			// is off.
+			s.generateUsefulGatherPaths(rel)
 			setCheapest(rel)
 		}
 	}

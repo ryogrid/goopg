@@ -88,6 +88,12 @@ var flagResolvedState = map[string]func(string) string{
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
 	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
+	// C-19d: a MODE, not a boolean — off / top / all. It decides whether the
+	// search may choose a Gather at all, and at which rels, so an artefact
+	// that does not name it cannot say whether the plans it holds were free
+	// to parallelise. Rendered through the same label function the resolver
+	// uses, so the token inside `unset(…)` re-exported reproduces the arm.
+	"GOOPG_GATHER_PATHS": func(v string) string { return gatherPathModeLabel(gatherPathModeFromEnv(v)) },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -137,6 +143,10 @@ var flagProvenanceOrder = []string{
 	// Joined at take2 P4-01 rev 10 step 3: narrows hash-join build sides,
 	// default ON since step 5 (P4-A §18 steps 3-5).
 	"GOOPG_NARROW_BUILD",
+	// Joined at take3 C-19d (P5-04): admits `PathGather` / `PathGatherMerge`
+	// into the search. Default `off` pending the TPC-H A/B that decides it
+	// (docs/design/planner-c19d-gather-paths/DESIGN.md §5).
+	"GOOPG_GATHER_PATHS",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

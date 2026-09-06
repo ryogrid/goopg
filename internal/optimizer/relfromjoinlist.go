@@ -429,6 +429,21 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	s.setBaseRelConsiderParallel(prob.cat)
 	s.addBaseRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)
+	// C-19d: `generate_useful_gather_paths` for every BASE rel, which
+	// upstream runs at the end of `set_rel_pathlist` (allpaths.c) — after
+	// every base path producer, before the rel's set_cheapest — and ONLY when
+	// the statement has more than one base rel (`bms_membership(root->
+	// all_baserels) != BMS_SINGLETON`), so that a single-relation statement's
+	// parallelism is decided by the upper planner (partial aggregation)
+	// instead. goopg gets that exclusion for free: a one-item joinlist returns
+	// its rel directly (makeRelFromJoinlist) and never reaches this function,
+	// which is what keeps TPC-H Q1's `Finalize Agg -> Gather -> Partial Agg`
+	// (built by the post-pass) out of this slice's blast radius.
+	//
+	// It runs before the level-2 search reads `CheapestTotal`, and is a no-op
+	// unless GOOPG_GATHER_PATHS is `all` — see DESIGN.md §5 for why `top` is
+	// the arm to measure first.
+	s.addBaseRelGatherPaths()
 	// GEQO: when the query has >= geqo_threshold base relations and geqo is
 	// enabled, use the genetic query optimizer instead of the DP search.
 	builder := newJoinRelBuilder(s, prob.cat)

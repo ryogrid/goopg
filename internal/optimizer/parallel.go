@@ -102,6 +102,31 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 		return root
 	}
 
+	// C-19d COEXISTENCE RULE — the path model wins.
+	//
+	// The search can now produce a `PathGather` / `PathGatherMerge` priced by
+	// cost_gather / cost_gather_merge (gatherpaths.go), so a plan reaching
+	// this pass may ALREADY carry a Gather that add_path chose. Re-deciding
+	// that with a size rule is precisely the defect Phase 5 removes, so the
+	// post-pass stands down: the costed placement is kept as it is.
+	//
+	// This is not tidiness, it is a correctness stop. `terminatesPartial`
+	// lists *Gather / *GatherMerge, and `findPartialSubtree` DESCENDS through
+	// a terminating single-child node — so without this rule the post-pass
+	// would nest a second Gather BELOW the path model's one: N workers each
+	// launching N workers, and `gatherOp.prebuildHashJoins`'s "a Gather never
+	// appears inside another Gather's partial subtree" comment silently
+	// falsified.
+	//
+	// `EXPLAIN <query>` answers identically without a special case: an
+	// *Explain root has no `parallelChildren` arm, so the scan finds nothing
+	// here and the unwrap below re-enters MaybeAddGather on `ex.Child`, where
+	// the check runs against the real plan. It is the check C-19h deletes
+	// together with the pass.
+	if subtreeHasGather(root) {
+		return root
+	}
+
 	// EXPLAIN carries the real plan in Child. Descend so `EXPLAIN <query>`
 	// renders the SAME plan the query would execute — otherwise EXPLAIN would
 	// systematically under-report parallelism, which is worse than useless: it
@@ -149,6 +174,32 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	}
 
 	return rebuildWithGather(root, tgt, workers)
+}
+
+// subtreeHasGather reports whether the tree already carries a Gather or a
+// Gather Merge anywhere — the C-19d coexistence test.
+//
+// The walk is `parallelChildren`'s, the same one `findPartialSubtree` descends,
+// so "already gathered" is judged over exactly the nodes the post-pass would
+// have considered placing a Gather among. A node `parallelChildren` does not
+// model reads as having no children, which for THIS question fails toward
+// "no Gather found" — i.e. toward the post-pass acting. That is the safe
+// direction only because the path model cannot put a Gather under an
+// unmodelled node in the first place: `createGatherPlan` panics unless
+// `drivingScan` reaches the subtree's scan through this same walk.
+func subtreeHasGather(n Node) bool {
+	switch n.(type) {
+	case nil:
+		return false
+	case *Gather, *GatherMerge:
+		return true
+	}
+	for _, c := range parallelChildren(n) {
+		if subtreeHasGather(c) {
+			return true
+		}
+	}
+	return false
 }
 
 // partialTarget is where the Gather goes and what kind it must be.
