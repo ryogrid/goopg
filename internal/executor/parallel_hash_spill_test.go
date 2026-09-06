@@ -46,6 +46,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -733,20 +734,31 @@ func TestParallelHashJoinSpillingSharedBuildRunsOnce(t *testing.T) {
 }
 
 // TestParallelHashJoinSpillingSharedBuildCancel: LIMIT above the Gather,
-// cancelled while a participant is in batch 1 — no hang, files released.
+// cancelled while a participant is in batch 1 — no hang, files released, and
+// (E-09b) no load reference left behind.
+//
+// The third arm is E-09b's integration half of the mandatory cancel-mid-batch
+// test: the loader is parked INSIDE a batch load until a peer is provably
+// blocked waiting on it, and only then is the statement cancelled. The
+// protocol half, where the exact error and the exact refcount are asserted, is
+// TestSharedBatchLoadCancelsWaiters.
 func TestParallelHashJoinSpillingSharedBuildCancel(t *testing.T) {
 	ctx, cleanup := pqSpillFixture(t)
 	defer cleanup()
 	for _, arm := range []struct {
-		name  string
-		limit int
+		name        string
+		limit       int
+		blockLoader bool
 	}{
 		// LIMIT satisfied out of batch 0: Close cancels workers that are
 		// still reloading later batches.
-		{"limit-satisfied", 3},
+		{"limit-satisfied", 3, false},
 		// LIMIT larger than the result, so the query reaches batch 1; the
 		// statement is cancelled from inside the first batch-1 reload.
-		{"statement-cancelled-mid-batch-1", 1000000},
+		{"statement-cancelled-mid-batch-1", 1000000, false},
+		// Same, but cancelled only once another participant is parked on the
+		// load in flight — the wait this item introduces.
+		{"cancelled-with-a-waiter-parked", 1000000, true},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			sql := fmt.Sprintf("SELECT f.fid, d.dname FROM ps_fact f JOIN ps_dim d ON f.fk = d.dk LIMIT %d", arm.limit)
@@ -756,12 +768,41 @@ func TestParallelHashJoinSpillingSharedBuildCancel(t *testing.T) {
 			counter := &innerOpenCounter{}
 			var once sync.Once
 			var fired int32
-			if arm.limit > 3 {
+			var sawWaiter int32
+			if arm.limit > 3 && !arm.blockLoader {
 				counter.onOpen = func(b int) {
 					if b >= 1 {
 						once.Do(func() { fired = 1; cancel() })
 					}
 				}
+			}
+			if arm.blockLoader {
+				testHookSharedBatchLoading = func(d *sharedBatchDesc, b int) {
+					if b < 1 {
+						return
+					}
+					once.Do(func() {
+						atomic.StoreInt32(&fired, 1)
+						// Park the loader until a peer is demonstrably
+						// waiting on it, then cancel. The deadline keeps a
+						// scheduling accident from hanging the gate; it
+						// records that the strict arm did not fire rather
+						// than pretending it did.
+						deadline := time.Now().Add(20 * time.Second)
+						for time.Now().Before(deadline) {
+							d.mu.Lock()
+							w := d.waiting
+							d.mu.Unlock()
+							if w >= 1 {
+								atomic.StoreInt32(&sawWaiter, 1)
+								break
+							}
+							time.Sleep(time.Millisecond)
+						}
+						cancel()
+					})
+				}
+				defer func() { testHookSharedBatchLoading = nil }()
 			}
 			counter.install()
 			defer counter.uninstall()
@@ -831,12 +872,26 @@ func TestParallelHashJoinSpillingSharedBuildCancel(t *testing.T) {
 			if sb == nil {
 				return
 			}
-			if arm.limit > 3 && fired == 0 {
+			if arm.limit > 3 && atomic.LoadInt32(&fired) == 0 {
 				t.Fatalf("no participant reached batch 1, so nothing was cancelled mid-batch")
+			}
+			if arm.blockLoader && atomic.LoadInt32(&sawWaiter) == 0 {
+				t.Logf("no peer parked on the load within the deadline; this arm " +
+					"only asserted that the cancellation did not hang")
 			}
 			if sb.batches == nil || sb.batches.nbatch <= 1 {
 				t.Fatalf("precondition: the shared build did not batch")
 			}
+			// E-09b: every reference is dropped on the cancellation path too,
+			// so nothing is left holding a batch table.
+			sb.batches.mu.Lock()
+			liveLoads, liveBytes := sb.batches.liveLoads, sb.batches.liveBytes
+			maxLive, loads := sb.batches.maxLiveLoads, sb.batches.loadCount
+			sb.batches.mu.Unlock()
+			if liveLoads != 0 || liveBytes != 0 {
+				t.Fatalf("cancellation leaked %d batch table(s) / %d bytes", liveLoads, liveBytes)
+			}
+			t.Logf("E-09b: loadCount=%d maxLiveLoads=%d", loads, maxLive)
 			if ctx.SharedHashBuilds != nil {
 				t.Fatalf("Close left the publication in place")
 			}
@@ -852,4 +907,535 @@ func TestParallelHashJoinSpillingSharedBuildCancel(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ── E-09b: load-once-per-batch ──────────────────────────────────────────
+//
+// Design: DESIGN-E09b.md. Three things need pinning and they need different
+// instruments:
+//
+//   - the PROTOCOL (acquire / wait / publish / release) is a concurrency
+//     contract, so it is driven directly rather than through a join: a race
+//     that resolves the wrong way in a join shows up as a wrong row count
+//     days later, and a cancellation that leaks a reference shows up as
+//     nothing at all;
+//   - CANCELLATION is mandatory for this item and is tested at both levels —
+//     waiters parked on a load in flight, and the real Gather under a LIMIT;
+//   - the MEMORY claim is an object count, so it is asserted as one, with
+//     every participant held at the same batch so "one live table where there
+//     were four" is deterministic rather than a timing observation.
+
+// sharedLoadTestDesc is a descriptor with no files: enough for the protocol,
+// which never touches one.
+func sharedLoadTestDesc(nbatch int) *sharedBatchDesc {
+	return &sharedBatchDesc{
+		nbatch: nbatch, origNBatch: nbatch, bucketBits: 10,
+		spaceAllowed: 1 << 20,
+		inner:        make([]*joinBatchFile, nbatch),
+	}
+}
+
+// runFakeLoad mirrors runSharedLoad's publish discipline exactly — pessimistic
+// error, payload, publish from a defer — over a payload the test supplies, so
+// the protocol can be exercised without a file or an operator. runSharedLoad
+// itself is under test through the operator harnesses further down (including
+// its panic path).
+func runFakeLoad(d *sharedBatchDesc, ld *sharedBatchLoad, gate <-chan struct{}, rows map[int64][]Row, fail error) {
+	ld.err = errSharedBatchAbandoned
+	defer d.publishLoad(ld)
+	if gate != nil {
+		<-gate
+	}
+	if fail != nil {
+		ld.err = fail
+		return
+	}
+	ld.intHash = rows
+	ld.hashIsInt = true
+	ld.spaceUsed = 4096
+	ld.err = nil
+}
+
+// waitForWaiting blocks until n participants are parked on a load, which is
+// what makes "the waiter really was blocked when we cancelled" an assertion
+// rather than a hope.
+func waitForWaiting(t *testing.T, d *sharedBatchDesc, n int) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		d.mu.Lock()
+		got := d.waiting
+		d.mu.Unlock()
+		if got >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d participant(s) parked on the load, want %d", got, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestSharedBatchLoadProtocol: N participants race for one batch. Exactly one
+// loads, every other one adopts the SAME maps, and the last one out frees
+// them. This is the whole of E-09b's memory claim in one assertion —
+// loadCount 1 and maxLiveLoads 1 where Variant A had N of each.
+func TestSharedBatchLoadProtocol(t *testing.T) {
+	const n = 5
+	d := sharedLoadTestDesc(4)
+	rows := map[int64][]Row{7: {Row{NewIntDatum(7)}}}
+	gate := make(chan struct{})
+	start := make(chan struct{})
+	var loaders int32
+	held := make([]*sharedBatchLoad, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			bs := &hashBatchState{ctx: &Context{}, desc: d}
+			ld, mine := d.acquireLoad(1)
+			held[i] = ld
+			if mine {
+				atomic.AddInt32(&loaders, 1)
+				runFakeLoad(d, ld, gate, rows, nil)
+				return
+			}
+			errs[i] = bs.waitSharedLoad(d, ld)
+		}(i)
+	}
+	close(start)
+	waitForWaiting(t, d, n-1)
+	// While the load is in flight the slot is already accounted as resident:
+	// a table being built costs the same memory as one that is built.
+	d.mu.Lock()
+	if d.loadCount != 1 || d.liveLoads != 1 || d.maxLiveLoads != 1 {
+		t.Errorf("in flight: loadCount=%d liveLoads=%d maxLiveLoads=%d, want 1/1/1",
+			d.loadCount, d.liveLoads, d.maxLiveLoads)
+	}
+	if d.loads[1] == nil || d.loads[1].refs != n {
+		t.Errorf("slot holds %v refs, want %d", d.loads[1], n)
+	}
+	d.mu.Unlock()
+	close(gate)
+	wg.Wait()
+
+	if loaders != 1 {
+		t.Fatalf("%d participants ran the load, want exactly 1", loaders)
+	}
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("participant %d: %v", i, errs[i])
+		}
+		if held[i] != held[0] {
+			t.Fatalf("participant %d adopted a different load than participant 0", i)
+		}
+		if held[i].err != nil {
+			t.Fatalf("participant %d saw err %v", i, held[i].err)
+		}
+		if len(held[i].intHash) != 1 || len(held[i].intHash[7]) != 1 {
+			t.Fatalf("participant %d adopted the wrong table: %v", i, held[i].intHash)
+		}
+	}
+	d.mu.Lock()
+	if d.maxLiveLoads != 1 || d.loadCount != 1 {
+		t.Errorf("loaded: loadCount=%d maxLiveLoads=%d, want 1/1 "+
+			"(Variant A would be %d/%d)", d.loadCount, d.maxLiveLoads, n, n)
+	}
+	if d.maxLiveBytes != 4096 {
+		t.Errorf("maxLiveBytes=%d, want 4096 — one table, not %d", d.maxLiveBytes, n)
+	}
+	d.mu.Unlock()
+
+	// Everyone leaves: the maps go immediately, not at statement end.
+	for i := 0; i < n; i++ {
+		d.releaseLoad(1, held[i])
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.loads[1] != nil {
+		t.Errorf("the slot survived the last holder")
+	}
+	if d.liveLoads != 0 || d.liveBytes != 0 {
+		t.Errorf("liveLoads=%d liveBytes=%d after the last holder left, want 0/0", d.liveLoads, d.liveBytes)
+	}
+	if held[0].intHash != nil || held[0].hash != nil || held[0].nullBuild != nil {
+		t.Errorf("the freed load still holds its payload")
+	}
+}
+
+// TestSharedBatchLoadCancelsWaiters is the mandatory cancel-mid-batch test at
+// the protocol level: waiters parked on a load in flight, cancelled while the
+// loader is STILL parked. They must return 57014 rather than wait for a batch
+// nobody will probe — and every reference must come back.
+func TestSharedBatchLoadCancelsWaiters(t *testing.T) {
+	const n = 4
+	d := sharedLoadTestDesc(4)
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gate := make(chan struct{})
+
+	ld, mine := d.acquireLoad(2)
+	if !mine {
+		t.Fatalf("the first acquire did not claim the slot")
+	}
+	loaderDone := make(chan struct{})
+	go func() {
+		defer close(loaderDone)
+		runFakeLoad(d, ld, gate, map[int64][]Row{1: {Row{NewIntDatum(1)}}}, nil)
+	}()
+
+	waiters := make([]*sharedBatchLoad, n-1)
+	errs := make([]error, n-1)
+	var wg sync.WaitGroup
+	for i := 0; i < n-1; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			bs := &hashBatchState{ctx: &Context{Ctx: cctx}, desc: d}
+			w, m := d.acquireLoad(2)
+			waiters[i] = w
+			if m {
+				t.Errorf("waiter %d claimed the slot", i)
+				return
+			}
+			errs[i] = bs.waitSharedLoad(d, w)
+			// The reference is dropped on the cancellation path too, exactly
+			// as loadSharedInnerBatch does.
+			d.releaseLoad(2, w)
+		}(i)
+	}
+	waitForWaiting(t, d, n-1)
+	cancel()
+
+	// The waiters must be gone WHILE the loader is still parked on the gate.
+	joined := make(chan struct{})
+	go func() { wg.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("waiters did not return after cancellation — the wait is not ctx-aware")
+	}
+	select {
+	case <-loaderDone:
+		t.Fatalf("the loader finished; the waiters were not cancelled mid-load")
+	default:
+	}
+	for i, err := range errs {
+		var ee *ExecError
+		if err == nil || !errorsAs(err, &ee) || ee.Code != "57014" {
+			t.Fatalf("waiter %d returned %v, want SQLSTATE 57014", i, err)
+		}
+	}
+	d.mu.Lock()
+	if d.waiting != 0 {
+		t.Errorf("waiting=%d after every waiter returned", d.waiting)
+	}
+	// The loader still holds its own reference, so the slot must still stand.
+	if d.loads[2] != ld || ld.refs != 1 {
+		t.Errorf("slot=%v refs=%d after the waiters left, want the loader's single ref", d.loads[2], ld.refs)
+	}
+	d.mu.Unlock()
+
+	// Rule 1: the loader is unaffected by the cancellation and finishes.
+	close(gate)
+	<-loaderDone
+	if ld.err != nil {
+		t.Fatalf("the loader failed: %v", ld.err)
+	}
+	d.releaseLoad(2, ld)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.loads[2] != nil || d.liveLoads != 0 || d.liveBytes != 0 {
+		t.Fatalf("cancellation leaked a reference: slot=%v liveLoads=%d liveBytes=%d",
+			d.loads[2], d.liveLoads, d.liveBytes)
+	}
+}
+
+// TestSharedBatchLoadLateArrivalReloads pins the free rule of DESIGN-E09b.md
+// §4: freeing on refs==0 CLEARS the slot, so a straggler that reaches the
+// batch after everyone else has passed it re-loads from the still-linked file
+// rather than adopting a table that has been dropped.
+func TestSharedBatchLoadLateArrivalReloads(t *testing.T) {
+	d := sharedLoadTestDesc(4)
+	first, mine := d.acquireLoad(3)
+	if !mine {
+		t.Fatalf("the first acquire did not claim the slot")
+	}
+	runFakeLoad(d, first, nil, map[int64][]Row{1: {Row{NewIntDatum(1)}}}, nil)
+	d.releaseLoad(3, first)
+
+	second, mine := d.acquireLoad(3)
+	if !mine {
+		t.Fatalf("the late arrival adopted a freed load instead of re-loading it")
+	}
+	if second == first {
+		t.Fatalf("the late arrival got the freed slot back")
+	}
+	runFakeLoad(d, second, nil, map[int64][]Row{2: {Row{NewIntDatum(2)}}}, nil)
+	d.releaseLoad(3, second)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.loadCount != 2 {
+		t.Fatalf("loadCount=%d, want 2 — the re-load was not counted", d.loadCount)
+	}
+	// The bound the design claims: never worse than Variant A, which would
+	// have loaded once per participant.
+	if d.maxLiveLoads != 1 {
+		t.Fatalf("maxLiveLoads=%d, want 1 — the two loads overlapped", d.maxLiveLoads)
+	}
+}
+
+// TestSharedBatchLoadPublishesErrors: a load that fails hands every waiter the
+// error. Nobody adopts an empty table, which is the silently-partial-join
+// failure mode plain sync.Once would produce here.
+func TestSharedBatchLoadPublishesErrors(t *testing.T) {
+	d := sharedLoadTestDesc(4)
+	boom := &ExecError{Code: "XX000", Message: "load failed"}
+	ld, _ := d.acquireLoad(1)
+	gate := make(chan struct{})
+	go runFakeLoad(d, ld, gate, nil, boom)
+
+	got := make(chan error, 1)
+	go func() {
+		bs := &hashBatchState{ctx: &Context{}, desc: d}
+		w, mine := d.acquireLoad(1)
+		if mine {
+			got <- fmt.Errorf("the waiter claimed the slot")
+			return
+		}
+		if err := bs.waitSharedLoad(d, w); err != nil {
+			got <- err
+			return
+		}
+		got <- w.err
+	}()
+	waitForWaiting(t, d, 1)
+	close(gate)
+	select {
+	case err := <-got:
+		if err != boom {
+			t.Fatalf("the waiter saw %v, want the loader's error", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the waiter hung on a failed load")
+	}
+	// A failed load is never charged as resident memory.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.liveBytes != 0 || d.maxLiveBytes != 0 {
+		t.Fatalf("a failed load was charged %d bytes (peak %d)", d.liveBytes, d.maxLiveBytes)
+	}
+}
+
+// sharedSpillDesc prebuilds one shared spilling build and returns the context,
+// the plan and the descriptor. The caller owns the release.
+func sharedSpillDesc(t *testing.T, workMem int64) (*Context, *optimizer.Join, *sharedHashBuild) {
+	t.Helper()
+	const lw, rw = 2, 2
+	buildRows := spillRows(6000, 900, 0, "b")
+	probeRows := spillRows(100, 900, 0, "p")
+	plan := spillPlan(spillShapes()[0], lw, len(probeRows), len(buildRows))
+	ctx := &Context{WorkMem: workMem, tempFiles: newTempFileRegistry()}
+	tree := newJoinOp(plan,
+		&rowsOp{rows: probeRows, schema: batchSchema("l", lw)},
+		&rowsOp{rows: buildRows, schema: batchSchema("r", rw)})
+	builds, err := prebuildSharedHashJoins(ctx, plan, func() (Operator, error) { return tree, nil })
+	if err != nil {
+		t.Fatalf("prebuild: %v", err)
+	}
+	ctx.SharedHashBuilds = builds
+	sb := builds[plan]
+	if sb == nil || sb.batches == nil || sb.batches.nbatch <= 1 {
+		t.Fatalf("precondition: the shared build did not batch")
+	}
+	return ctx, plan, sb
+}
+
+// TestSharedBatchLoaderPanicPublishesError drives the REAL runSharedLoad over
+// a real frozen file with a loader that panics inside it. The waiter must be
+// handed an error, not a channel nobody will close — rule 2 of the
+// cancellation protocol, and the reason this is a channel and not a
+// sync.Once.
+func TestSharedBatchLoaderPanicPublishesError(t *testing.T) {
+	const lw, rw = 2, 2
+	ctx, plan, sb := sharedSpillDesc(t, 128<<10)
+	defer func() {
+		releaseSharedHashBuilds(ctx)
+		ctx.ReleaseSpillFiles()
+	}()
+	d := sb.batches
+	batch := -1
+	for b, f := range d.inner {
+		if f != nil {
+			batch = b
+			break
+		}
+	}
+	if batch < 0 {
+		t.Fatalf("precondition: the descriptor carries no inner file")
+	}
+
+	gate := make(chan struct{})
+	testHookSharedBatchLoading = func(_ *sharedBatchDesc, _ int) {
+		<-gate
+		panic("loader exploded mid-batch")
+	}
+	defer func() { testHookSharedBatchLoading = nil }()
+
+	bs := newParticipantBatchState(ctx, plan, d)
+	bs.curBatch = batch
+	o := newJoinOp(plan,
+		&rowsOp{rows: nil, schema: batchSchema("l", lw)},
+		&poisonBuildOp{schema: batchSchema("r", rw)})
+	ld, mine := d.acquireLoad(batch)
+	if !mine {
+		t.Fatalf("the first acquire did not claim the slot")
+	}
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		bs.runSharedLoad(o, ld, batch, d.inner[batch])
+	}()
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		wbs := &hashBatchState{ctx: &Context{}, desc: d}
+		w, m := d.acquireLoad(batch)
+		if m {
+			waiterErr <- fmt.Errorf("the waiter claimed the slot")
+			return
+		}
+		if err := wbs.waitSharedLoad(d, w); err != nil {
+			waiterErr <- err
+			return
+		}
+		waiterErr <- w.err
+		d.releaseLoad(batch, w)
+	}()
+	waitForWaiting(t, d, 1)
+	close(gate)
+
+	if p := <-panicked; p == nil {
+		t.Fatalf("the loader did not panic, so nothing was proven")
+	}
+	select {
+	case err := <-waiterErr:
+		if err != errSharedBatchAbandoned {
+			t.Fatalf("the waiter saw %v, want errSharedBatchAbandoned", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the waiter hung on a panicking loader — `done` was not closed")
+	}
+	d.releaseLoad(batch, ld)
+}
+
+// batchBarrier holds every participant at the same batch. It is what turns
+// E-09b's memory claim into a deterministic assertion: released together, the
+// participants cannot be staggered across batches, so exactly one table is
+// resident at any moment and each batch is loaded exactly once.
+type batchBarrier struct {
+	t  *testing.T
+	n  int
+	mu sync.Mutex
+	at map[int]int
+	ch map[int]chan struct{}
+}
+
+func newBatchBarrier(t *testing.T, n int) *batchBarrier {
+	return &batchBarrier{t: t, n: n, at: map[int]int{}, ch: map[int]chan struct{}{}}
+}
+
+func (b *batchBarrier) arrive(batch int) {
+	b.mu.Lock()
+	c := b.ch[batch]
+	if c == nil {
+		c = make(chan struct{})
+		b.ch[batch] = c
+	}
+	b.at[batch]++
+	full := b.at[batch] == b.n
+	b.mu.Unlock()
+	if full {
+		close(c)
+		return
+	}
+	select {
+	case <-c:
+	case <-time.After(60 * time.Second):
+		b.mu.Lock()
+		got := b.at[batch]
+		b.mu.Unlock()
+		b.t.Errorf("barrier for batch %d timed out with %d of %d arrivals", batch, got, b.n)
+	}
+}
+
+// TestSharedSpillingBuildLoadsOncePerBatch is the memory gate. Every
+// participant is held at the same batch, so the figures are exact: ONE live
+// batch table where Variant A had four, and one load per batch where Variant
+// A had four. The rows are still identity-checked against the serial join,
+// because a shared table adopted wrongly is a silently partial join.
+func TestSharedSpillingBuildLoadsOncePerBatch(t *testing.T) {
+	const lw, rw, n = 2, 2, 4
+	buildRows := spillRows(6000, 900, 0, "b")
+	// Probe keys in RUNS of n, so each round-robin slice spillParticipants
+	// hands out covers EVERY key. That makes "all four participants reach
+	// every batch that has an inner file" a property of the data rather than
+	// of the scheduler — which is what lets the barrier below always
+	// complete, and what makes the exact figures meaningful.
+	probeRows := make([]Row, 3600)
+	for i := range probeRows {
+		probeRows[i] = Row{
+			NewIntDatum(int64((i / n) % 900)),
+			NewStringDatum(fmt.Sprintf("p%d-%s", i, strings.Repeat("x", 40))),
+		}
+	}
+	plan := spillPlan(spillShapes()[0], lw, len(probeRows), len(buildRows))
+	want, _ := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, unboundedWorkMem)
+	if len(want) == 0 {
+		t.Fatalf("precondition: the serial join returned nothing")
+	}
+
+	bar := newBatchBarrier(t, n)
+	testHookSharedBatchAcquire = bar.arrive
+	defer func() { testHookSharedBatchAcquire = nil }()
+
+	counter := &innerOpenCounter{}
+	got, sb := spillParticipants(t, plan, probeRows, buildRows, lw, rw, 128<<10, n, counter)
+	d := sb.batches
+	if d == nil || d.nbatch <= 1 {
+		t.Fatalf("precondition: the shared build did not batch")
+	}
+	assertSameRows(t, want, got)
+
+	files := 0
+	for _, f := range d.inner {
+		if f != nil {
+			files++
+		}
+	}
+	if files < 2 {
+		t.Fatalf("precondition: only %d inner file(s); the gate asserts nothing", files)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.loadCount != files {
+		t.Fatalf("loadCount=%d with %d inner files and %d participants — "+
+			"want exactly %d (Variant A would be %d)", d.loadCount, files, n, files, files*n)
+	}
+	if d.maxLiveLoads != 1 {
+		t.Fatalf("maxLiveLoads=%d, want 1 — the 5x multiplier is still there "+
+			"(Variant A would be %d)", d.maxLiveLoads, n)
+	}
+	if d.liveLoads != 0 || d.liveBytes != 0 {
+		t.Fatalf("liveLoads=%d liveBytes=%d after every participant finished", d.liveLoads, d.liveBytes)
+	}
+	if d.maxLiveBytes <= 0 {
+		t.Fatalf("maxLiveBytes=%d — nothing was measured", d.maxLiveBytes)
+	}
+	t.Logf("E-09b memory: %d batches, loadCount=%d (Variant A: %d), "+
+		"maxLiveLoads=%d (Variant A: %d), maxLiveBytes=%d (Variant A: ~%d)",
+		files, d.loadCount, files*n, d.maxLiveLoads, n, d.maxLiveBytes, d.maxLiveBytes*int64(n))
 }

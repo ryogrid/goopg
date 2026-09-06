@@ -205,7 +205,7 @@ var testHookInnerBatchOpened func(bs *hashBatchState, b int, path string)
 // read. The cancellation test parks the loader here so it can prove that a
 // waiter really was blocked on `done` when the statement was cancelled. nil in
 // production, installed/cleared around a Gather exactly like the hook above.
-var testHookSharedBatchLoading func(b int)
+var testHookSharedBatchLoading func(d *sharedBatchDesc, b int)
 
 // testHookSharedBatchAcquire, when non-nil, is called by EVERY participant on
 // entry to loadSharedInnerBatch, before it claims or joins the batch's load.
@@ -1095,7 +1095,7 @@ func (bs *hashBatchState) runSharedLoad(o *joinOp, ld *sharedBatchLoad, b int, f
 		testHookInnerBatchOpened(bs, b, r.path)
 	}
 	if testHookSharedBatchLoading != nil {
-		testHookSharedBatchLoading(b)
+		testHookSharedBatchLoading(bs.desc, b)
 	}
 	var used int64
 	var nulls []Row
