@@ -143,22 +143,22 @@ shapes, and the probe in §6.1 decides between them:
 (a) is the smaller change and preserves the "cost mirrors executor"
 property; (b) is more PG-faithful. Do not pick before the probe.
 
-**Cut 3 — the calibration proper.** A named multiplier in front of the
-spill charge, defaulting to a value chosen by measurement, following
-C-20d's shape:
+**Cut 3 — the derived spill byte model.** *(Re-specified after probe
+6.2; the original text proposed a fitted scalar multiplier, which §6.2
+refutes.)* Add `hashsize.SpillBytes(ncols, avgVarBytes)` transcribing
+`spill.go`'s encoder, and have `spillPages` call it instead of
+`EntryBytes`. `hashsize.Choose` keeps calling `EntryBytes`, preserving
+§3.4. Ship with an encoder-vs-model agreement test.
 
-```go
-// spillCostMultiplier corrects `spillPages`' known over-statement:
-// EntryBytes measures the in-memory entry, spillWriter.WriteRow frames
-// datums with uvarint lengths. Ledger M0127-P5.7-a.
-const spillCostMultiplierCalibrated = /* measured */
-```
+This is *derivation*, not calibration, so it carries no swept constant.
+A `spillCostMultiplier` in front of the derived model remains available
+if the suite shows it is systematically off — but it would then start at
+1.0 with a reason, which is the opposite of the situation C-20d found
+(a constant shipped at the value its own comment called wrong).
 
-Two constants, not one, because §3 shows the two sides are biased
-oppositely: `spillCostMultiplier` (hash, expected < 1) and
-`sortSpillCostMultiplier` (sort, expected ≥ 1 once Cuts 1–2 land). A
-single shared constant would be fitting the difference between two
-errors and would not survive either side changing.
+Note the two sides stay biased oppositely even after this cut, so they
+must keep separate treatment: the hash side is corrected by Cut 3, the
+sort side by Cuts 1–2. Any later scalar must be per-side.
 
 **Cut 4 — resume the three blocked items** against the calibrated model,
 in their own order (B-13, then B-15, then E-16).
@@ -172,11 +172,13 @@ because 4 bought nothing extra.
 
 The negative outcomes, any of which is a complete deliverable:
 
-- No multiplier value beats 1.0 outside the ±17% per-query band on a
-  reproducible pair of runs ⇒ record the measurement, leave the constant
-  at 1.0 with the sweep table beside it, and downgrade §4 Cut 3 to a
-  ledger row. Cuts 1 and 2 are still correct on fidelity grounds and can
-  land regardless.
+- The derived model changes no plan and no timing outside the ±17%
+  per-query band ⇒ that is a **success on fidelity and a null on
+  performance**, and it should be recorded as exactly that: land it
+  (it removes a ledgered approximation and adds a sibling-agreement
+  test), state plainly that no speed-up was measured, and do not go
+  looking for a multiplier to manufacture one. Cuts 1 and 2 are likewise
+  correct on fidelity grounds and can land on a null.
 - A value wins on the suite but moves plan parity AWAY from PG
   (`match` falls) ⇒ that is not adoptable; take3 09 §5 requires the
   monotone direction, and C-20d's calibration is credible precisely
