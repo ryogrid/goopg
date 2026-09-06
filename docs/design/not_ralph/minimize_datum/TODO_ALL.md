@@ -1761,6 +1761,14 @@ P6-03/04/05 (load-bearing).
 | E-06 | 2026-09-06 | 6aab9dc | agg transition via per-call slab; UserAgg whole-call decline | twin-parity + per-site pins + 0-alloc; R8 both suites (parallel shapes incl.); timing neutral; review APPROVE-WITH-NITS |
 | C-08 | 2026-09-06 | b967f38 | per-joinrel param_source_rels derivation with frame remap; NLI + merge arms threaded; star-schema escape untouched | derivation table + admit/refuse arm pair; suites + units scope + spotcheck PASS; PP TPC-H 22/22 MATCH (provably inert until C-04, no sweep triggered); review APPROVE-WITH-NITS (5 addressed); ppi_rows ledger row |
 
+| E-09a | 2026-09-06 | 67204579c | **spilling shared hash build published**: Q9 workers `rows=1500000 loops=1` -> `rows=0 loops=0`, five Build Times -> one; Q9 8.85 -> 7.85 s | immutable batch descriptor, growth frozen after prebuild (PG's rule), private reload per participant, NO new synchronisation; values 24/24, plans byte-identical, TPC-DS PASS=95 CKMISMATCH=0, -race green. Unblocks C-19f and the D-05 re-measurement |
+| C-19c | 2026-09-06 | dbb14ca25 | partial index paths + `min_parallel_index_scan_size` + `IndexScan.Parallel` + workers claim index leaf blocks | reachable and priced, but **no TPC-H plan moves to the shape at SF=1** under the pinned stats (plans byte-identical) — recorded as such rather than claimed as a win |
+| E-11 (instrument) | 2026-09-06 | c6af781f4 | `GOOPG_SEQSCAN_LOOKAHEAD` knob; default 4 unchanged byte-for-byte | item stays `[~]`: the first depth sweep ran against a contended machine and is not attributable. Instrument only, so the decision can be measured quiet |
+| D-05 (correction) | 2026-09-06 | c94326cf6 | E-09a invalidates the 5x multiplier in the reverted build-cost charge; on a spilling build it is now 1x | NOT an unblock — the structural finding stands and the other two refutations never used the multiplier. Re-DERIVE at 1x after C-19d |
+| spill-cost (design) | 2026-09-06 | 169711fe3..73d851b68 | one design for B-13/B-15/E-16's shared prerequisite; two probes answered without a bench | hash and sort spill charges biased in OPPOSITE directions; `costSortRun` fires at 1 GiB while `sortOp` spills at 256 MiB; probe 6.2 derived the over-statement at 5.1x..1.2x, which **refutes the scalar multiplier** the plan assumed |
+| spill-cost Cut 3 (model) | 2026-09-06 | 53cd7a073 + b416786f1 | `hashsize.SpillBytes` derived from spill.go's encoder, INERT; `estimatedRowBytes` reads `hashsize.DatumBytes` | 4 agreement tests pin encoder-vs-model and the executor's runtime ruler vs the planner's width model; wiring `spillPages` waits on `cost_funcs.go` ownership |
+| MapSlotBytes (doc) | 2026-09-06 | 61450d37f | constant marked KNOWN 2x LOW with the measurement (96.1 B/slot) and the blocker | value deliberately unchanged — 96 costs +10.4% via Q14's phantom-build flip. Same class as C-20d: a comment describing an intention read as a decision |
+
 ## Dropped
 
 | item | date | reason | ledger row |
