@@ -356,27 +356,27 @@ func TestPartialHashJoinRefusals(t *testing.T) {
 		}
 
 		for _, tc := range []struct {
-			name  string
-			break_ func(s *searchCtx, joinrel, outer, inner *RelOptInfo)
+			name     string
+			sabotage func(s *searchCtx, joinrel, outer, inner *RelOptInfo)
 		}{
 			{
 				// A rel that does not consider parallel has no business
 				// producing a partial path; addPartialPath refuses it too.
-				name: "joinrel does not consider parallel",
-				break_: func(_ *searchCtx, joinrel, _, _ *RelOptInfo) { joinrel.ConsiderParallel = false },
+				name:     "joinrel does not consider parallel",
+				sabotage: func(_ *searchCtx, joinrel, _, _ *RelOptInfo) { joinrel.ConsiderParallel = false },
 			},
 			{
 				// No partial outer at all — upstream's first condition
 				// (`outerrel->partial_pathlist != NIL`, joinpath.c:2421).
-				name: "outer has no partial path",
-				break_: func(_ *searchCtx, _, outer, _ *RelOptInfo) { outer.PartialPathlist = nil },
+				name:     "outer has no partial path",
+				sabotage: func(_ *searchCtx, _, outer, _ *RelOptInfo) { outer.PartialPathlist = nil },
 			},
 			{
 				// try_partial_hashjoin_path returns early on a parameterised
 				// inner (:1317): a hash build is materialised in full before
 				// the probe, so there is no per-outer-row binding to supply.
 				name: "every inner path is parameterised",
-				break_: func(_ *searchCtx, _, _, inner *RelOptInfo) {
+				sabotage: func(_ *searchCtx, _, _, inner *RelOptInfo) {
 					for _, p := range inner.Pathlist {
 						p.RequiredOuter = RelSet(1)
 					}
@@ -389,7 +389,7 @@ func TestPartialHashJoinRefusals(t *testing.T) {
 				// could land on the build side of a join whose build the
 				// leader runs inside gatherOp.Open.
 				name: "no parallel-safe inner path (a Gather on the build side)",
-				break_: func(_ *searchCtx, _, _, inner *RelOptInfo) {
+				sabotage: func(_ *searchCtx, _, _, inner *RelOptInfo) {
 					for _, p := range inner.Pathlist {
 						p.ParallelSafe = false
 					}
@@ -402,7 +402,7 @@ func TestPartialHashJoinRefusals(t *testing.T) {
 				// "stay serial" — every worker reads the whole relation and the
 				// Gather returns N copies of every row.
 				name: "the partial outer's shape is not one the attach walks model",
-				break_: func(_ *searchCtx, _, outer, _ *RelOptInfo) {
+				sabotage: func(_ *searchCtx, _, outer, _ *RelOptInfo) {
 					for _, p := range outer.PartialPathlist {
 						p.Kind = PathPrebuilt
 					}
@@ -411,7 +411,7 @@ func TestPartialHashJoinRefusals(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				s, joinrel, outer, inner, keys := build(t)
-				tc.break_(s, joinrel, outer, inner)
+				tc.sabotage(s, joinrel, outer, inner)
 				addPartialHashJoinPath(s, joinrel, outer, inner, s.cp, keys, nil, 0)
 				if len(joinrel.PartialPathlist) != 0 {
 					t.Errorf("filed %d partial path(s) despite the refusal", len(joinrel.PartialPathlist))
