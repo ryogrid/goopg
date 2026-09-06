@@ -981,6 +981,17 @@ rule).*
   CKMISMATCH=0**. Honest note: no TPC-H plan MOVES to the shape at SF=1
   under the pinned stats (hence byte-identical plans) — it is reachable
   and priced, and the two remaining MISSING-NODE entries are other shapes.
+  **CORRECTION 2026-09-06: that inference over-claimed.** The plan capture
+  is taken by `estimate-audit`, whose `-serial` flag defaults to TRUE and
+  sets `max_parallel_workers_per_gather = 0` on the audit session
+  (`cmd/estimate-audit/main.go:30-36`, deliberate — goopg does not merge
+  per-worker Instrumentation, so nodes under a Gather report no actual
+  rows). A serial capture is structurally blind to a PARALLEL index scan,
+  which is exactly what C-19c adds. "Byte-identical" is therefore a valid
+  serial-control-arm statement and nothing more; whether a parallel plan
+  moved is UNMEASURED here and needs a `-serial=false` capture against a
+  parallel-mode PG baseline that does not yet exist. Ledger
+  `take3-plan-capture-is-serial-only`.
   *design: take3 08 §8; gate: take3 09 §5 P5 (PP).*
 - [x] **C-19d P5-04 `generate_useful_gather_paths`** producing `PathGather`
   and `PathGatherMerge` priced by `cost_gather`/`cost_gather_merge`, with
