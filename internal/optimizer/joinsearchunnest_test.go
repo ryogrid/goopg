@@ -249,35 +249,13 @@ func TestQ17DecorrelatedAggregateCoordinates(t *testing.T) {
 	}
 }
 
-// TestBuildBindingsPosMapStopsAtJoinInputAggregate is defect 1 stated directly
-// against `buildBindingsPosMap`, independent of Q17's plan shape: an
-// *Aggregate reached inside the walked tree is a distinct planning scope, so
-// its scans must not enter `scanMap`. `applyJoinTreePosMap` has always
-// returned at an *Aggregate ("aggregate expressions are a different scope"),
-// and build and apply must stop at the same nodes — the rule that
-// M0125-0012 (*Project) and RC-2 (*SetOp / *WindowAgg) already established.
-func TestBuildBindingsPosMapStopsAtJoinInputAggregate(t *testing.T) {
-	cat := jsuCatalog(t)
-	lineitem, ok := cat.LookupTable(parser.ObjectName{Name: "lineitem"})
-	if !ok {
-		t.Fatalf("lookup lineitem: not found")
-	}
+// `TestBuildBindingsPosMapStopsAtJoinInputAggregate` lived here until C-20b
+// (take3 08 §9.2). It stated defect 1 directly against `buildBindingsPosMap`:
+// an *Aggregate reached inside the walked tree is a distinct planning scope,
+// so its scans must not enter `scanMap`, because build and apply must stop at
+// the same nodes. `buildBindingsPosMap` was deleted with the rest of the
+// bindings-posmap family on a census showing it moved zero ColumnRefs across
+// TPC-H and TPC-DS on both `GOOPG_PGSHAPED_DP` arms; the Q17 plan-shape half
+// of the same defect is still pinned by the tests above, which assert the
+// join's own key and Predicate indices rather than the deleted map.
 
-	// A tree whose ONLY lineitem scan sits under an *Aggregate, at offset 25.
-	// (Q17's exact situation once the searched outer side records no entry.)
-	scan := &SeqScan{Table: lineitem}
-	agg := &Aggregate{
-		Child:  scan,
-		schema: Schema{{Name: "l_partkey"}, {Name: "avg"}},
-	}
-
-	// Without the opacity, `collect` records lineitem at whatever offset the
-	// aggregate occupies and every lineitem binding is remapped onto it. With
-	// it, no entry is recorded, the map has nothing to say, and
-	// buildBindingsPosMap declines — the identity, which is the truth.
-	bindings := []rangeBinding{{table: lineitem, offset: 0}}
-	if m := buildBindingsPosMap(agg, bindings); m != nil {
-		t.Fatalf("buildBindingsPosMap descended into a join-input *Aggregate: "+
-			"l_quantity/4 -> %d (want a nil map — the aggregate is a foreign scope)", m(4))
-	}
-}

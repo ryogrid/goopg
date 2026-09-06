@@ -1496,11 +1496,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// `remapColumnRefsAfterRewrite(node)` ran here until C-20b (take3 08
 	// §9.2): a tree walk that had mutated nothing since M0127-P6.2 deleted
 	// the MHJ posmap it was built around. joinlayout.go carries the proof.
-	// Second pass: use FROM‑clause bindings to correct any
-	// remaining order differences (OID ≠ FROM order).
-	if len(ctx.bindings) > 0 {
-		remapWithBindings(node, ctx.bindings)
-	}
+	// `remapWithBindings(node, ctx.bindings)` was the second pass here —
+	// "use FROM-clause bindings to correct any remaining order differences
+	// (OID != FROM order)" — until C-20b measured it moving zero ColumnRefs
+	// across TPC-H and TPC-DS on both GOOPG_PGSHAPED_DP arms. joinlayout.go
+	// carries the census.
 	// RC-1b's `pushSingleSourceFiltersAfterRemap` ran here — after the remap,
 	// so that ColumnRef indices and table offsets finally shared one
 	// coordinate space — until M0127-P6.2 deleted it with the node it pushed
@@ -1572,7 +1572,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	}
 
 	var agg *aggregateSurface
-	savedBindings := ctx.bindings
+	// `savedBindings := ctx.bindings` was taken here because
+	// `buildAggregateStage` replaces ctx with the aggregate's own scope,
+	// and the two bindings-keyed remap passes below (aggregate exprs, top
+	// Project) had to run against the FROM-clause bindings the targets were
+	// resolved in. Both passes were deleted by C-20b, and the snapshot with
+	// them.
 	if needsAggregateStage(s, cat) {
 		var having Expr
 		var err error
@@ -1583,13 +1588,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		if having != nil {
 			node = &Filter{pos: s.Having.Pos(), Child: node, Predicate: having}
 		}
-		// The aggregate stage resolves GroupExprs / Agg.Arg against
-		// ctx.bindings (FROM‑clause order).  Remap only those two
-		// fields — not the HAVING predicate, which uses aggregate‑
-		// output column indices and must not be touched.
-		if len(savedBindings) > 0 {
-			remapAggExprsWithBindings(node, savedBindings)
-		}
+		// `remapAggExprsWithBindings` ran here, remapping the aggregate
+		// stage's GroupExprs / Agg.Arg (never the HAVING predicate, which
+		// uses aggregate-output indices) from FROM-clause order onto the
+		// actual scan offsets — until C-20b measured it moving nothing on
+		// either corpus. joinlayout.go carries the census.
 		// C-15 (P4-06): the aggregate is the GROUP_AGG upper rel's path
 		// now — `create_grouping_paths` over the finished child, priced
 		// by `cost_agg` (groupingpaths.go) — and no longer the bare node
@@ -1993,23 +1996,17 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	if out == nil {
 		out = Node(proj)
 	}
-	// resolveTargets resolves SELECT targets against ctx.bindings,
-	// which holds FROM‑clause offsets — but rewriteMultiWayChain /
-	// bushy DP may have re‑laid out the underlying join tree
-	// (e.g. OID‑sorted MHJ output). Remap the freshly‑added
-	// Project's targets (and any Sort keys above the join tree)
-	// using the same bindings posMap so they land at actual scan
-	// offsets. For aggregate queries the targets reference
-	// aggregate‑output indices (small and outside any FROM
-	// binding's range) so the remap is a no‑op. Inline‑view
-	// subqueries (TPC‑H Q7/Q8/Q9) hit this path with FROM‑order
-	// indices and need the remap to fire. We deliberately do NOT
-	// walk below the Project's join‑tree boundary — those nodes
-	// were already remapped by the earlier remapWithBindings call,
-	// and walking them again would double‑remap.
-	if agg == nil && len(savedBindings) > 0 {
-		remapTopProjection(out, savedBindings)
-	}
+	// `remapTopProjection` ran here. resolveTargets resolves SELECT targets
+	// against ctx.bindings, which holds FROM-clause offsets — but
+	// rewriteMultiWayChain / bushy DP could re-lay out the underlying join
+	// tree (e.g. OID-sorted MHJ output), so the pass remapped the
+	// freshly-added Project's targets (and any Sort keys above the join
+	// tree) with the same bindings posMap, so they landed at actual scan
+	// offsets — the inline-view subqueries (TPC-H Q7/Q8/Q9) were the shape
+	// it was for.
+	// Deleted by C-20b: measured over both corpora and both
+	// GOOPG_PGSHAPED_DP arms, it was reached up to 194 times and moved
+	// nothing, and the plans are byte-identical without it.
 	if len(s.Locking) > 0 {
 		// M0021-0002 — wrap the SELECT plan in a LockRows
 		// node carrying the resolved per-relation locking

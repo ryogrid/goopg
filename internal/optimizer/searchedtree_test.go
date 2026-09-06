@@ -115,106 +115,25 @@ func TestMarkSearchedTreeRefusesAnUntaggableRoot(t *testing.T) {
 	markSearchedTree(&Limit{})
 }
 
-// TestLegacyPosMapAlreadyStoppedAtTheBoundaryProject records the half that was
-// already covered, and by what.
+// Four tests lived here until C-20b (take3 08 §9.2, 2026-09-07), and all four
+// were pins on the searched subtree's OPACITY to the legacy bindings-posmap
+// family: `TestLegacyPosMapAlreadyStoppedAtTheBoundaryProject`,
+// `TestElidedSearchRootIsTheHoleTheTagCloses`,
+// `TestBuildBindingsPosMapAdvancesPastASearchedTree` and
+// `TestApplyJoinTreePosMapDoesNotDescendIntoASearchedTree`.
 //
-// M0125-0012 (TPC-DS Q8) made EVERY `*Project` in a join tree an opaque scope
-// boundary on both sides of the map — `collect` advances past one, and
-// `applyJoinTreePosMap` returns at one. The boundary Project inherited that for
-// free. This test states the inheritance explicitly so that a later change to
-// the Project rule, made for FROM-subquery reasons, cannot quietly remove the
-// search's protection without a failure naming it.
-func TestLegacyPosMapAlreadyStoppedAtTheBoundaryProject(t *testing.T) {
-	a, b := cpjTwoRel()
-	root := createPlanAtSearchRoot(stHashRoot(b, a), 5).(*Project)
-	root.fromJoinSearch = false // as the pass would have seen it before this task
-
-	if pm := buildBindingsPosMap(root, stBindings(a, b)); pm != nil {
-		t.Errorf("buildBindingsPosMap descended into a boundary Project; the *Project arm is supposed to stop there")
-	}
-}
-
-// TestElidedSearchRootIsTheHoleTheTagCloses is the other half: with no Project
-// to stop at, the legacy family walks the searched joins.
+// They went with `buildBindingsPosMap` / `applyJoinTreePosMap` themselves —
+// deleted on a census showing the family moved zero ColumnRefs over TPC-H and
+// TPC-DS on both `GOOPG_PGSHAPED_DP` arms, with byte-identical plans without
+// it (joinlayout.go carries the numbers). An opacity pin outlives neither the
+// pass it is opaque to nor the map it declines to build.
 //
-// Untagged, `collect` reaches the leaves and builds a map — numerically the
-// identity here, since an elided root by definition publishes binding order.
-// The point is not the arithmetic. It is that reaching the leaves is what puts
-// the searched `*Join` in `applyJoinTreePosMap`'s path, where
-// `reresolveJoinByName` rebinds its keys by NAME over a layout that was derived
-// by coordinate one node earlier.
-func TestElidedSearchRootIsTheHoleTheTagCloses(t *testing.T) {
-	a, b := cpjTwoRel()
-	root := createPlanAtSearchRoot(stHashRoot(a, b), 5)
-	bindings := stBindings(a, b)
-
-	root.(*Join).fromJoinSearch = false
-	if pm := buildBindingsPosMap(root, bindings); pm == nil {
-		t.Fatalf("untagged, an elided search root was already opaque — this test no longer describes the hole it was written for")
-	}
-
-	root.(*Join).fromJoinSearch = true
-	if pm := buildBindingsPosMap(root, bindings); pm != nil {
-		t.Errorf("the tag did not make the elided search root opaque to buildBindingsPosMap")
-	}
-}
-
-// TestBuildBindingsPosMapAdvancesPastASearchedTree: the searched subtree is an
-// opaque LEAF, not a stop sign. A scan sitting to its right in the enclosing
-// tree still needs an offset that accounts for the searched tree's full width —
-// omitting the advance is the RC-2 / M0097-0058 defect (`off` too low, so every
-// scan to the right is remapped into another table's columns).
-func TestBuildBindingsPosMapAdvancesPastASearchedTree(t *testing.T) {
-	a, b := cpjTwoRel()
-	searched := createPlanAtSearchRoot(stHashRoot(b, a), 5) // 5 columns, tagged
-
-	// A third relation `c` at binding columns 5-6, joined above the searched
-	// subtree — the shape a pinned spine leaves behind (predp.go).
-	c := cpjLeafRel(2, 5, 2, "c")
-	top := &Join{Type: JoinTypeInner, Left: searched, Right: c.baseLeaf,
-		schema: append(append(Schema{}, searched.Output()...), c.baseLeaf.Output()...)}
-
-	bindings := append(stBindings(a, b), rangeBinding{
-		table: c.baseLeaf.(*SeqScan).Table, alias: c.baseLeaf.(*SeqScan).Alias, offset: 5})
-
-	pm := buildBindingsPosMap(top, bindings)
-	if pm == nil {
-		t.Fatalf("buildBindingsPosMap declined; `c` still needs remapping")
-	}
-	// `c` starts at binding column 5 and the searched tree publishes 5
-	// columns, so `c`'s first column is at plan offset 5 — unchanged. Had the
-	// advance been omitted it would have come out 0, landing inside `a`.
-	for i := 0; i < 2; i++ {
-		if got := pm(5 + i); got != 5+i {
-			t.Errorf("binding column %d (c%d) maps to plan offset %d, want %d — the searched tree's width was not accounted for",
-				5+i, i, got, 5+i)
-		}
-	}
-	// The searched tree's own bindings have no scan entry, so the closure
-	// leaves them alone — the identity, which is what the boundary published.
-	for i := 0; i < 5; i++ {
-		if got := pm(i); got != i {
-			t.Errorf("binding column %d inside the searched tree was remapped to %d; it is already where the bindings put it", i, got)
-		}
-	}
-}
-
-// TestApplyJoinTreePosMapDoesNotDescendIntoASearchedTree: the applier must stop
-// at the same node the collector stopped at (CLAUDE.md "sibling paths must
-// change together" — and the explicit rule M0125-0012 wrote into the *Project
-// arm). A deliberately non-identity map is used so that any descent shows up.
-func TestApplyJoinTreePosMapDoesNotDescendIntoASearchedTree(t *testing.T) {
-	a, b := cpjTwoRel()
-	root := createPlanAtSearchRoot(stHashRoot(a, b), 5).(*Join)
-	before := []int{root.LeftKey.(*ColumnRef).Index, root.RightKey.(*ColumnRef).Index}
-
-	applyJoinTreePosMap(root, func(i int) int { return (i + 1) % 5 })
-
-	after := []int{root.LeftKey.(*ColumnRef).Index, root.RightKey.(*ColumnRef).Index}
-	if before[0] != after[0] || before[1] != after[1] {
-		t.Errorf("applyJoinTreePosMap rewrote a searched join's keys from %v to %v", before, after)
-	}
-}
+// The tag itself is NOT deleted with them, and neither is the rest of this
+// file: `isSearchedTree` has eight surviving consumers (narrowoutput.go,
+// pushdown.go, createplanroot.go, nl_index_join.go, enclosingtree.go,
+// scan_input_rewrite.go), and `reconcileNLILayout` — whose skip the next test
+// pins — is still the oracle `assertSearchedTreeNeedsNoReconcile` runs on
+// every searched plan.
 
 // TestReconcileNLILayoutSkipsASearchedTree: the skip has to be observable, not
 // just asserted. A join key is deliberately left pointing at a column whose

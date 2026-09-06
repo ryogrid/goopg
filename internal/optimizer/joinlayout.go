@@ -25,31 +25,36 @@ package optimizer
 // so no enumeration-time layout state survives to be merged.
 //
 // The SEARCH-BOUNDARY half — `buildBindingsPosMap` and `applyJoinTreePosMap` —
-// is deliberately HELD BACK until the 03 §10 boundary map is proven in
-// production. They are today's boundary translation, the pinned-spine
-// re-resolution (predp.go) consumes them, and 08 §4 names deleting them before
-// the replacement is validated as the S7 change most likely to regress. The
-// standing deferral pointer in IMPLEMENTATION-TODO carries the resume point.
+// was held back until the 03 §10 boundary map was proven in production. C-20b
+// took that measurement (take3 08 §9.2, 2026-09-07) and the pair is GONE: over
+// TPC-H (22 queries) and TPC-DS (99), on both `GOOPG_PGSHAPED_DP` arms, the
+// three passes that drove it were reached up to 408 times and moved ZERO
+// ColumnRefs, and `EXPLAIN` text is byte-identical without them. The tombstone
+// above `remapByPosMap` carries the table.
 //
-// `reconcileNLILayout` stays for the same reason, one level weaker: 08 §3 says
-// it keeps running until a searched plan is shown never to need it, and the
-// assertion that proves that has not been taken yet.
+// What is left in this file is therefore NOT the boundary translation any
+// more. It is two things:
+//
+//   - `remapByPosMap` / `remapOuterRefsInSubplan`, a posMap APPLIER with no
+//     posMap builder of its own — `predp.go`'s pinned-spine re-resolution
+//     brings its own map; and
+//   - the by-NAME re-resolvers (`reresolveJoinByName`, `reconcileNLILayout`
+//     and friends), which `predp.go` and `nl_index_join.go` call directly and
+//     which `assertSearchedTreeNeedsNoReconcile` runs as the searched tree's
+//     independent oracle on every searched plan.
+//
+// `reconcileNLILayout` stays for the reason 08 §3/§9.3 gives and C-20b did not
+// disturb: it is the ORACLE for that live tripwire, so deleting it removes the
+// check, not the code.
 
-import (
-	"fmt"
+import "fmt"
 
-	"github.com/goopg/goopg/internal/catalog"
-)
-
-// scanKey uniquely identifies a scan by its catalog table pointer and
-// FROM-clause alias. For self-joins (e.g. `nation n1, nation n2`) the alias
-// distinguishes the two instances; for ordinary tables the alias is empty and
-// the table pointer alone is sufficient. `buildBindingsPosMap` keys its
-// pre/post-rewrite leaf correspondence on it.
-type scanKey struct {
-	table *catalog.Table
-	alias string
-}
+// `scanKey` — the (table pointer, alias) pair that keyed `buildBindingsPosMap`'s
+// pre/post-rewrite leaf correspondence, so that a self-join's two instances
+// (`nation n1, nation n2`) did not collapse onto one entry — went with that
+// function in C-20b. The self-join disambiguation itself survives in
+// `lookupColumnIndexByNameAndSource`, keyed on `SchemaColumn.SourceTableIdx`
+// (goopg's `varno`) rather than on the pointer/alias pair.
 
 // `collectMultiHashTables` + `isCanonicalKeyEquality` lived here until
 // M0127-P6.2 (08 §4). They were the MultiHashJoin packer's chain detector:
@@ -166,165 +171,47 @@ func visitColumnRefsByName(e Expr, fn func(string)) bool {
 // kept only because callers predated the rename) were deleted by M0127-P6.2
 // along with the `buildMHJPosMap` they fed.
 
-// remapWithBindings applies a bindings‑based position remap to the
-// join‑tree portion of node (everything below any Aggregate).  It
-// maps FROM‑clause column offsets (as stored in bindings[i].offset)
-// to the actual scan offsets in the current plan output.  Self‑join
-// tables (e.g. `nation n1, nation n2`) are disambiguated via the
-// (table pointer, alias) scanKey.
-func remapWithBindings(node Node, bindings []rangeBinding) {
-	if node == nil || len(bindings) == 0 {
-		return
-	}
-	posMap := buildBindingsPosMap(node, bindings)
-	if posMap == nil {
-		return
-	}
-	applyJoinTreePosMap(node, posMap)
-}
-
-// remapTopProjection applies a bindings‑based posMap to ColumnRefs
-// in the top Project's Targets and any Sort keys above the join
-// tree, stopping as soon as a Filter / Aggregate / Join / MHJ is
-// reached (those were already remapped by the earlier
-// remapWithBindings pass — walking into them would double‑remap).
+// `remapWithBindings`, `remapTopProjection` and `remapAggExprsWithBindings`
+// — the three bindings-keyed posmap passes `planSelect` ran after the legacy
+// rewrites — were deleted by C-20b (take3 08 §9.2, 2026-09-07), together with
+// the `buildBindingsPosMap` / `applyJoinTreePosMap` pair below that built and
+// applied their map, and the `mhjPosMapOf` tombstone that named them as its
+// successor.
 //
-// Used for inline‑view subqueries (TPC‑H Q7/Q8/Q9), whose recursive
-// planSelect resolves Project targets against FROM‑clause bindings
-// after the join tree was rewritten — so the targets carry stale
-// FROM‑order indices that the join‑tree remap already corrected
-// elsewhere.
-func remapTopProjection(out Node, bindings []rangeBinding) {
-	if out == nil || len(bindings) == 0 {
-		return
-	}
-	// Find the join‑tree subtree (the Filter / Join / MHJ node)
-	// to derive the posMap from. Walk down past Project / Sort /
-	// Limit / LockRows wrappers until we hit it.
-	root := out
-	for {
-		// M0127-P5.9-c (08 §3): this descent is the one place the
-		// searched-subtree opacity could be walked THROUGH rather than
-		// stopped at, and it was. The boundary is a `*Project`
-		// (createplanroot.go) and an elided boundary over a sorted root
-		// is a `*Sort`, so both arms below step over the search root and
-		// hand `buildBindingsPosMap` a node INSIDE it. `collect`'s own
-		// guard (bushy.go:2563) then never fires — it is asked about the
-		// searched join, not about the searched root — and the map that
-		// comes back is the search's binding→plan-position permutation.
-		//
-		// Applied to the wrappers, that map is a second permutation on
-		// top of the one the boundary already performed: the enclosing
-		// Project's targets are written in binding coordinates and the
-		// boundary republishes binding order, so the correct action here
-		// is NOTHING. Measured on `select * from customer, orders where
-		// o_custkey = c_custkey and o_orderkey = 1` (P5.9 run 1's
-		// reproducer): every column's value came back one relation-block
-		// away from its name, and the boundary Project's OWN target list
-		// — which is the coordinate map, not a reference into it — was
-		// rewritten along with the targets above it.
-		//
-		// Stopping here rather than teaching `collect` is the correct
-		// half: `collect` is already right, and what was wrong is asking
-		// it a question about the inside of an opaque subtree.
-		if isSearchedTree(root) {
-			return
-		}
-		switch n := root.(type) {
-		case *Project:
-			root = n.Child
-			continue
-		case *Sort:
-			root = n.Child
-			continue
-		case *Limit:
-			root = n.Child
-			continue
-		case *LockRows:
-			root = n.Child
-			continue
-		}
-		break
-	}
-	posMap := buildBindingsPosMap(root, bindings)
-	if posMap == nil {
-		return
-	}
-	// Now walk the wrappers and remap only their direct
-	// expressions.
-	n := out
-	for n != nil {
-		switch x := n.(type) {
-		case *Project:
-			for i := range x.Targets {
-				remapByPosMap(&x.Targets[i], posMap)
-			}
-			n = x.Child
-		case *Sort:
-			for i := range x.Keys {
-				remapByPosMap(&x.Keys[i].Expr, posMap)
-			}
-			n = x.Child
-		case *Limit:
-			n = x.Child
-		case *LockRows:
-			n = x.Child
-		default:
-			return
-		}
-	}
-}
-
-// remapAggExprsWithBindings remaps the GroupExprs and Agg.Arg
-// expressions of the Aggregate node that is at or directly below node
-// (unwrapping at most one Filter wrapper for the HAVING clause).
-// The posMap is built from the Aggregate's child (the join tree), so
-// it maps FROM‑clause offsets to scan offsets without touching the
-// HAVING‑filter predicate, which already uses aggregate‑output
-// indices and must not be remapped.
-func remapAggExprsWithBindings(node Node, bindings []rangeBinding) {
-	if node == nil || len(bindings) == 0 {
-		return
-	}
-	// Unwrap at most one HAVING Filter to find the Aggregate.
-	var aggNode *Aggregate
-	switch n := node.(type) {
-	case *Aggregate:
-		aggNode = n
-	case *Filter:
-		if ag, ok := n.Child.(*Aggregate); ok {
-			aggNode = ag
-		}
-	}
-	if aggNode == nil {
-		return
-	}
-	posMap := buildBindingsPosMap(aggNode.Child, bindings)
-	if posMap == nil {
-		return
-	}
-	for i := range aggNode.GroupExprs {
-		remapByPosMap(&aggNode.GroupExprs[i], posMap)
-	}
-	for i := range aggNode.Aggs {
-		if aggNode.Aggs[i].Arg != nil {
-			remapByPosMap(&aggNode.Aggs[i].Arg, posMap)
-		}
-		if aggNode.Aggs[i].Arg2 != nil {
-			remapByPosMap(&aggNode.Aggs[i].Arg2, posMap)
-		}
-	}
-}
-
-// `mhjPosMapOf` was a position map keyed by table OID, meant to remap
-// FROM-order ColumnRef indices into the MHJ's OID-sorted output order. It was
-// already a permanent `return nil` before M0127-P6.2 deleted it: OID order is
-// FROM order only when the FROM list happens to be in table-creation order
-// (false for most TPC-H queries), and it collapsed duplicate OIDs, so self
-// joins like Q7's `nation n1, nation n2` mapped both scans onto one entry.
-// `buildBindingsPosMap` (via `remapWithBindings`) is the posMap that handles
-// both cases, because it reads the real FROM order off `rangeBinding.offset`
-// and disambiguates self-joins with `scanKey{table, alias}`.
+// They were deleted on MEASUREMENT, to the gate C-20c failed. A census over
+// TPC-H (22 queries) and TPC-DS (99), on both `GOOPG_PGSHAPED_DP` arms,
+// counted every pass ENTRY, every application of a non-nil map, and every
+// `ColumnRef.Index` / `OuterColumnRef.Index` the map actually MOVED:
+//
+//	corpus  DP  withBindings  topProjection  aggExprs  MOVES
+//	TPC-H    1     46 / 38        14 / 13     32 / 25    0
+//	TPC-H    0     46 / 19        11 /  7     32 / 12    0
+//	TPC-DS   1    408 / 101      134 / 47    214 / 54    0
+//	TPC-DS   0    408 / 292      194 / 106   214 / 186   0
+//
+// (entries / applications). The passes ran constantly and moved nothing, and
+// `EXPLAIN` text over both corpora is BYTE-IDENTICAL with them removed on all
+// four arms. The single move observed anywhere was one index under
+// `TestSAOPMultiTableRewriteMoves`, a test that explicitly selects the legacy
+// enumerator; it passes unchanged without the pass.
+//
+// Why they were still running at all: each existed to repair a tree that a
+// LATER pass had reordered in place — the subset-bitmask DP and the MHJ
+// packer. Both were deleted at M0127-P6.2/P6.3, and the PG-shaped search that
+// replaced them answers the question in the opposite direction: every
+// `createPlan` arm translates its own clauses onto its own merged row as it
+// builds it (P5.5-e-i), and the boundary republishes the root in pre-search
+// binding order (P5.5-f-i), so there is nothing left behind to correct. The
+// searched subtree was already opaque to all three (`isSearchedTree`,
+// searchedtree.go). What the census adds is that the LEGACY arm has nothing
+// to correct either.
+//
+// What did NOT go: `remapByPosMap` and `remapOuterRefsInSubplan` below stay —
+// `predp.go`'s pinned-spine re-resolution is a live caller with a map of its
+// own — and so do the by-NAME re-resolvers, which `predp.go` and
+// `nl_index_join.go` call and which `assertSearchedTreeNeedsNoReconcile` runs
+// as the searched tree's independent oracle (take3 08 §9.3: deleting that one
+// removes the check, not the code).
 
 // remapByPosMap rewrites every same-scope ColumnRef.Index in *e through
 // posMap — a position map built from the MultiHashJoin's bindings, so it
@@ -480,356 +367,6 @@ func remapOuterRefsInSubplan(node Node, depth int, posMap func(int) int) {
 		}
 	}
 	walkPlanExprs(node, visit)
-}
-
-// `buildMHJPosMap` — old (FROM-order binary tree) → new (MHJ DFS-order)
-// column positions, keyed by table OID — was deleted with the node by
-// M0127-P6.2. `buildBindingsPosMap` below is the surviving position map.
-
-// buildBindingsPosMap collects all SeqScan leaves from node (in DFS
-// order) and builds a position map from FROM‑clause offsets (as
-// recorded in bindings) to actual plan‑output offsets.  The map uses
-// (table pointer, alias) pairs so self‑joins like `nation n1, nation
-// n2` are disambiguated even when both have the same catalog OID.
-//
-// Returns nil when no scans can be found (e.g. the node is an opaque
-// derived‑table output whose inner scan nodes are already resolved).
-func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
-	type scanEntry struct {
-		key scanKey
-		off int
-	}
-	var entries []scanEntry
-	var off int
-	// declined is set by collect's default arm when it meets a node kind
-	// it cannot classify; see the comment there. Once set, the whole
-	// remap is abandoned rather than applied with a wrong offset.
-	var declined bool
-	var collect func(Node)
-	collect = func(n Node) {
-		if n == nil {
-			return
-		}
-		// M0127-P5.5-f-ii-a: a subtree the PG-shaped search built already
-		// publishes its columns at the positions the bindings put them —
-		// createplanroot.go's boundary is what guarantees it. Treat it as an
-		// opaque leaf, the same treatment the *Project / *CTEScan / SRF arms
-		// below get: advance past its width so scans to its RIGHT keep correct
-		// offsets, record NO scan entry, and let every binding inside it fall
-		// through this function's returned closure unchanged — the identity,
-		// which is the truth.
-		//
-		// When the boundary emitted a Project this arm is redundant with the
-		// *Project arm below, which already stops there (M0125-0012). It is
-		// here for the ELIDED case — a search whose order already was binding
-		// order returns a bare *Join, which `collect` descends into. That
-		// descent is numerically harmless (identity layout ⇒ identity map),
-		// but it is what puts the searched joins in `applyJoinTreePosMap`'s
-		// path, and that pass does more than arithmetic. See searchedtree.go.
-		if isSearchedTree(n) {
-			off += searchedTreeWidth(n)
-			return
-		}
-		switch x := n.(type) {
-		case *SeqScan:
-			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
-			off += len(x.Output())
-		case *IndexScan:
-			// M0062-0002: preserve Alias so self-joins (Q8 `nation n1, nation n2`)
-			// can disambiguate when one side flips to IndexScan.
-			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
-			off += len(x.Output())
-		// A `*MultiHashJoin` arm sat here until M0127-P6.2. Its lesson
-		// outlives it and still governs the arms below: M0125-0013 found it
-		// matching bare scans inline, so a table wrapped in a *Filter by a
-		// pushed-down single-source conjunct recorded no scanEntry AND never
-		// advanced `off` — every table to its right got an offset short by
-		// the skipped width, while the skipped table's own columns kept their
-		// FROM-cumulative index. TPC-DS Q47 returned s_county for d_year with
-		// the row COUNT still correct, because only the top projection was
-		// misremapped. That is why this walker recurses through `collect`
-		// everywhere and declines the whole remap on anything it cannot
-		// classify (the `default:` arm's RC-2 hardening).
-		case *Join:
-			collect(x.Left)
-			collect(x.Right)
-		case *NestedLoopIndexJoin:
-			// M0062-0006: NLI sits between Filter and the join subtree
-			// for Q9-shape plans. Without this case the collect walker
-			// stops at NLI and `buildBindingsPosMap` returns an empty
-			// scanMap, so `p_name`'s ColumnRef.Index is never
-			// re-resolved against the rewritten output layout.
-			collect(x.Outer)
-			collect(x.Inner)
-		case *Filter:
-			collect(x.Child)
-		case *Project:
-			// Any Project in the join-tree subtree passed to collect()
-			// is a subquery-derived table — its inner scans are in a
-			// separate planning scope and must NOT contribute entries to
-			// the outer scanMap (doing so would count their raw scan
-			// widths instead of the projected output width, causing the
-			// outer-scan offsets to be wrong).
-			//
-			// For IsolatedScope=true (M0063-0001 view-rename wrapper) this
-			// was already the contract. Extend it to all Projects:
-			// advance `off` by the projected output width and stop.
-			off += len(x.Output())
-		case *Sort:
-			collect(x.Child)
-		case *Aggregate:
-			// M0127-P5.9-f (TPC-H Q17): opaque leaf, NOT a descent.
-			// `applyJoinTreePosMap` has always stopped at *Aggregate
-			// ("aggregate expressions are a different scope"), so the
-			// entries this arm used to record were never applied inside
-			// the aggregate's own subtree — they only leaked into
-			// `scanMap` and mis-addressed the SAME table elsewhere in the
-			// tree. Build and apply must stop at the same nodes; this is
-			// the third instance of that rule (*Project M0125-0012,
-			// *SetOp/*WindowAgg RC-2).
-			//
-			// The descent was also numerically wrong on its own terms: an
-			// Aggregate's output is group keys + agg results, so
-			// descending advanced `off` by the CHILD's width instead of
-			// the aggregate's, leaving every node to its RIGHT short by
-			// the difference — the identical defect *WindowAgg was moved
-			// out of the descend set for.
-			//
-			// Q17 is where it became visible. `unnestSubquery` (unnest.go)
-			// decorrelates `l_quantity < (select 0.2*avg(l_quantity) from
-			// lineitem where l_partkey = p_partkey)` into a hash join whose
-			// INNER side is a HashAggregate over a CLONE of lineitem — a
-			// separate planning scope. With `GOOPG_PGSHAPED_DP` on, the
-			// outer side is a searched subtree and so records no entries
-			// (the arm above), which left that clone as the FIRST and only
-			// `lineitem` entry, at offset 25. Every outer `lineitem`
-			// binding was then remapped to `25 + col`, and the residual
-			// `l_quantity/4` became `l_quantity/29` against a 27-wide
-			// composed slot: "column ref l_quantity/29 out of VirtualSlot
-			// range 27". Flag OFF hid it only by accident — the untagged
-			// outer join recorded `lineitem` at offset 0 first, and
-			// "first occurrence wins" (below) discarded the clone.
-			//
-			// With this arm opaque, Q17 collects no entries at all and the
-			// remap declines — which is the truth: the search boundary
-			// already publishes binding order, so there is nothing to
-			// correct. See 09 §5.21.
-			off += len(x.Output())
-		case *Values:
-			// Values node with non-empty schema (e.g. FROM (VALUES (r1), (r2)) AS t).
-			// Advance off by the output width so sibling scans stay aligned.
-			off += len(x.Output())
-		case *CTEScan:
-			// CTE Scan (WITH query) contributes its output columns to the
-			// join-tree schema.  Advance off so sibling scans get the
-			// correct scanMap offset; without this, aggregate arguments and
-			// GROUP BY expressions referencing columns to the right of a
-			// CTE are remapped to the wrong indices.  (M0097-0058)
-			off += len(x.Output())
-		case *MaterializedCTEScan:
-			// DML CTE — same offset-advance requirement as CTEScan above.
-			off += len(x.Output())
-		case *FromUnnest, *GenerateSeries, *GenerateSubscripts,
-			*UserSrfScan, *ScalarFuncScan, *PgPartitionTree, *PgOptionsToTable,
-			*PgInputErrorInfo, *PgGetPublicationTables,
-			*PgAvailableWalSummaries, *PgGetSequenceData, *VerifyHeapam,
-			*PgGetCatalogForeignKeys:
-			// FROM-clause set-returning / table functions are leaf
-			// nodes that contribute output columns but carry no
-			// scanKey to remap. Advance `off` by their output width
-			// (mirroring the *Values case) so any scan to their RIGHT
-			// gets the correct scanMap offset. Omitting these made
-			// `off` too low for downstream scans, so remapTopProjection
-			// shifted right-side projection columns down by the SRF's
-			// width — e.g. pg_dump's getTableAttrs
-			// `unnest('{oid}'::oid[]) src JOIN pg_attribute a` returned
-			// a scrambled row (DU-002 slice 46, M0110-0001). Their own
-			// columns need no remap: the posMap returns oldIdx unchanged
-			// for bindings absent from scanMap.
-			off += len(x.Output())
-
-		// --- RC-2 (TPC-DS Q8): opaque leaves that were missing entirely.
-		// Each of these contributes output columns to the join-tree
-		// schema but carries no scanKey. Without an arm, `off` is not
-		// advanced and EVERY scan to their right gets an offset that is
-		// too low, so ColumnRef indices are remapped into another
-		// table's columns. For a set operation inside a FROM subquery
-		// that produced `index out of range [57] with length 1` in
-		// MaterializedSlot.Get, via the hash-join build-side drain that
-		// gatherOp.Open runs in the leader (see
-		// docs/design/tpcds-round2-fixes/README.md §4).
-		//
-		// WindowAgg belongs here, NOT in the descend set: it APPENDS
-		// window-function columns to its child's output, so descending
-		// would leave right-hand scans short by exactly that many
-		// columns — the identical defect SetOp has today.
-		case *SetOp, *RecursiveUnion, *WorkTableScan, *WindowAgg,
-			*ProjectSet, *OrdinalityWrap, *RowsFrom, *IndexOnlyScan:
-			off += len(x.Output())
-
-		// --- Pass-through nodes: schema is exactly the child's, so
-		// descend without advancing.
-		case *Distinct:
-			collect(x.Child)
-		case *DistinctOn:
-			collect(x.Child)
-		case *Limit:
-			collect(x.Child)
-		case *LockRows:
-			collect(x.Child)
-		case *Memoize:
-			collect(x.Child)
-
-		default:
-			// RC-2: an unhandled node used to fall through silently,
-			// leaving `off` un-advanced — a wrong answer or an
-			// out-of-range panic, unconditionally. Declining the whole
-			// remap instead is the safe direction: an unremapped tree is
-			// only wrong when a reorder actually happened, whereas a
-			// mis-advanced offset is always wrong. All three callers
-			// (remapWithBindings, remapTopProjection,
-			// remapAggExprsWithBindings) already nil-check the result.
-			declined = true
-		}
-	}
-	collect(node)
-	if declined || len(entries) == 0 {
-		return nil
-	}
-
-	// Build scanMap: only the FIRST occurrence of each (table,alias)
-	// is stored so that later duplicate aliases don't clobber it.
-	scanMap := make(map[scanKey]int, len(entries))
-	for _, e := range entries {
-		if _, exists := scanMap[e.key]; !exists {
-			scanMap[e.key] = e.off
-		}
-	}
-
-	return func(oldIdx int) int {
-		for i := range bindings {
-			b := &bindings[i]
-			if b.table == nil {
-				continue
-			}
-			w := len(b.table.Columns)
-			if oldIdx >= b.offset && oldIdx < b.offset+w {
-				k := scanKey{table: b.table, alias: b.alias}
-				if scanOff, ok := scanMap[k]; ok {
-					return scanOff + (oldIdx - b.offset)
-				}
-				return oldIdx
-			}
-		}
-		return oldIdx
-	}
-}
-
-// applyJoinTreePosMap walks the join‑tree portion of a plan (below
-// any Aggregate) and applies posMap to all ColumnRefs in Filter
-// predicates, Join predicates, Sort keys, and Project targets.
-// It stops at Aggregate nodes — those are handled separately by
-// remapAggExprsWithBindings so that post‑aggregate ColumnRefs (which
-// reference aggregate output columns, not scan columns) are never
-// inadvertently remapped.
-func applyJoinTreePosMap(node Node, posMap func(int) int) {
-	if node == nil {
-		return
-	}
-	// M0127-P5.5-f-ii-a: stop at a searched subtree, for the same reason the
-	// *Project arm below stops at a Project — build and apply must stop at the
-	// same nodes (`collect` now stops here too). The searched tree's quals were
-	// translated onto their own merged row by the `createPlan` arm that built
-	// it, so there is no correction to make; and this arm does not only apply
-	// posMap, it calls `reresolveJoinByName`, which would rebind those quals by
-	// NAME over a layout that was just derived by coordinate. searchedtree.go.
-	if isSearchedTree(node) {
-		return
-	}
-	switch n := node.(type) {
-	case *Join:
-		applyJoinTreePosMap(n.Left, posMap)
-		// M0062-0005: Semi/Anti joins' Right side is the cloned
-		// EXISTS inner plan — an isolated subquery scope whose
-		// ColumnRefs use inner-scope indices and must NOT be
-		// remapped by the outer FROM-bindings posMap. (The same
-		// rule applies in `remapPosMapAfterRewrite`.)
-		if n.Type != JoinTypeSemi && n.Type != JoinTypeAnti {
-			applyJoinTreePosMap(n.Right, posMap)
-		}
-		// Re‑resolve Join keys/predicate by NAME against the
-		// post‑rewrite child output schemas. The bushy DP produces
-		// subset‑FROM‑order indices, and a later pass may reorder the
-		// inner subtree in place, invalidating them. (Until M0127-P6.2
-		// the reordering pass was `rewriteMultiWayChain` OID-sorting the
-		// MHJ; the by-name re-resolution is what made this arm robust to
-		// it, and stays robust to the passes that remain.)
-		// Looking up by ColumnRef.Name in the
-		// freshly‑exposed schemas is robust to any in‑place
-		// reordering — column names are unique per table
-		// (TPC‑H prefixes p_, s_, l_, …). Self‑joins use SeqScan
-		// alias‑aware schemas; ambiguous matches keep the original
-		// index untouched.
-		reresolveJoinByName(n)
-	case *NestedLoopIndexJoin:
-		// M0065-0001: walk into Outer (so deeper Joins get their
-		// keys reresolved). Don't touch NLI's own keys here —
-		// posMap remap and Name re-resolve both empirically break
-		// Q9's chained-NLI shape (where the existing keys already
-		// align with the runtime row layout). Q21's mismatching
-		// Anti-NLI keys are a separate problem tracked under
-		// M0065-Q21-walker; the safe thing is to leave NLI keys
-		// alone in this walker.
-		applyJoinTreePosMap(n.Outer, posMap)
-	case *Filter:
-		// M0077-0001: Slice A leaf-local Filter wrappers carry
-		// leaf-scoped ColumnRefs; skip both the recursion (Child
-		// is a SeqScan; nothing to remap there) and the predicate
-		// remap (would corrupt local indices).
-		if n.LeafLocal {
-			return
-		}
-		applyJoinTreePosMap(n.Child, posMap)
-		remapByPosMap(&n.Predicate, posMap)
-	case *Project:
-		// M0125-0012 (TPC-DS Q8): EVERY Project in the join tree is a
-		// separate planning scope, not just the M0063-0001
-		// SubqueryAlias-style (`IsolatedScope`) view-rename wrapper.
-		// `posMap` is only defined over the coordinate space that
-		// `buildBindingsPosMap`'s `collect` walked, and `collect`'s
-		// own *Project arm stops at ANY Project ("Extend it to all
-		// Projects: advance `off` by the projected output width and
-		// stop"). Descending here therefore fed posMap indices it
-		// never had a domain for: a FROM-subquery's own target
-		// `ca_zip/0`, correct against its 1-column SetOp child, fell
-		// inside the OUTER binding that happens to start at 0
-		// (`store_sales`) and was rewritten to that table's
-		// MHJ-reordered offset — 57 at SF=1, 6 in the minimal shape.
-		// Execution then read index 57 out of the SetOp's 1-wide
-		// MaterializedSlot ("column ref ca_zip/57 out of
-		// MaterializedSlot range 1").
-		//
-		// Note this is the *build* half's mirror image: `9740fce9`
-		// gave `collect` its opaque-leaf arms so `off` advances past a
-		// SetOp, but left this applier free to walk into the scope
-		// above it. Build and apply must stop at the same nodes or
-		// the map is applied outside its domain (CLAUDE.md "sibling
-		// paths must change together").
-		//
-		// Nothing is lost by stopping: the subquery's inner plan was
-		// already normalised into its own coordinate space by
-		// `remapSubqueryColumnRefs` (planner.go, M0097-0058) when the
-		// derived table was planned, and Projects ABOVE the join tree
-		// are remapped by the separate `remapTopProjection` pass.
-		return
-	case *Sort:
-		applyJoinTreePosMap(n.Child, posMap)
-		for i := range n.Keys {
-			remapByPosMap(&n.Keys[i].Expr, posMap)
-		}
-	case *Aggregate:
-		return // stop — aggregate expressions are a different scope
-	}
 }
 
 // findUniqueColumnIndex returns the unique index of `name` in
