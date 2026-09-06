@@ -27,7 +27,7 @@ func TestJoinInfoListProvenanceMatchesJoinlistWalk(t *testing.T) {
 		{"a LEFT JOIN b ON a.x = b.x LEFT JOIN c ON b.y = c.y", 2},
 		{"a JOIN b ON a.x = b.x LEFT JOIN c ON b.y = c.y", 1},
 		{"a LEFT JOIN b ON a.x = b.x, c JOIN d ON c.x = d.x", 1},
-		{"a RIGHT JOIN b ON a.x = b.x", 0},
+		{"a RIGHT JOIN b ON a.x = b.x", 1}, // C-04b: RIGHT flattens like LEFT
 		{"a FULL JOIN b ON a.x = b.x", 0},
 		{"a JOIN b ON a.x = b.x", 0},
 		{"a, b, c", 0},

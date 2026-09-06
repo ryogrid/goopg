@@ -168,3 +168,25 @@ func TestProblemPairsOuterWithDerivedUntouchedDerived(t *testing.T) {
 		t.Errorf("outer hands that do not touch the derived input must stay searched")
 	}
 }
+
+// TestProblemPairsOuterWithDerivedReducedRightLink is C-04b's unit fixture:
+// a RIGHT link's SpecialJoinInfo is the reduced LEFT one (`reduceRightLink`
+// — hands swapped, the preserved leaf on the LEFT), and the firewall must
+// read it exactly as it reads a LEFT link's: Filter-wrapped CTE leaves under
+// its hands decline. The end-to-end version, through the seam and read off
+// the trace, is TestSeamRightLinkOverDerivedInputsDeclines.
+func TestProblemPairsOuterWithDerivedReducedRightLink(t *testing.T) {
+	prob := &joinlistProblem{
+		scans:    []Node{wrappedCTELeaf("ss"), wrappedCTELeaf("ws"), wrappedCTELeaf("cs")},
+		relInfos: []baseRelInfo{{table: cteTable("ss")}, {table: cteTable("ws")}, {table: cteTable("cs")}},
+	}
+	items := []joinlistRel{{lo: 0, hi: 1}, {lo: 1, hi: 2}, {lo: 2, hi: 3}}
+	jt, synL, synR := reduceRightLink((1<<0)|(1<<1), 1<<2)
+	sjis := []*SpecialJoinInfo{{Jointype: jt, SynLefthand: synL, SynRighthand: synR, MinLefthand: synL, MinRighthand: synR}}
+	if jt != parser.JoinLeft || synL != 1<<2 || synR != (1<<0)|(1<<1) {
+		t.Fatalf("reduceRightLink = (%s, %#x, %#x), want (LEFT, {2}, {0,1})", joinTypeName(jt), synL, synR)
+	}
+	if !problemPairsOuterWithDerived(sjis, items, prob) {
+		t.Errorf("Filter-wrapped CTE leaves under a reduced RIGHT link's hands must decline")
+	}
+}

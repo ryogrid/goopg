@@ -209,10 +209,13 @@ func TestCollapseInstrumentFindsNestedLevels(t *testing.T) {
 			want: false,
 		},
 		{
-			// RIGHT likewise: C-04b's item, not this one.
-			name: "right outer join is pinned in both regimes",
+			// C-04b: RIGHT is collapse-dependent too. The joinlist flattens
+			// both links; whether the SEAM then admits the plan-side shape
+			// is a separate question (a RIGHT under a RIGHT's nullable side
+			// declines there — joinsearchspine_test.go).
+			name: "right outer join chain collapses (C-04b)",
 			sql:  "SELECT * FROM a RIGHT JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x",
-			want: false,
+			want: true,
 		},
 		{
 			name: "flat comma list is one problem either way",

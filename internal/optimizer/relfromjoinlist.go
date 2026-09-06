@@ -323,6 +323,23 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 				"join search: joinlist item %d is a pinned %s join, which the search cannot rebuild",
 				i, joinTypeName(it.jointype))
 		default:
+			// C-04b, and it closes a hole C-04a opened: a pinned LEFT/RIGHT
+			// item — the `GOOPG_PGSHAPED_COLLAPSE=0` regime, or a link over
+			// a FULL pin — is now handed to the search as a two-item
+			// problem, and the search knows it is an OUTER join only through
+			// `root->join_info_list`. The seam checks that list for the
+			// links it flattens (`outerLinksHaveSJInfos`); this is the same
+			// check for the links it did not, and it is FAIL-CLOSED for the
+			// same reason: with the SpecialJoinInfo missing, every pairing
+			// looks inner and the plan drops the unmatched rows. The
+			// production producer attaches the pointer it also accumulates
+			// (`deconstructFromItemScoped`), so this can fire only on a
+			// joinlist built by hand.
+			if it.pinnedOuter() && !joinInfoListHas(prob.joinInfoList, it.sjinfo) {
+				return joinlistRel{}, fmt.Errorf(
+					"join search: joinlist item %d is a pinned %s join with no SpecialJoinInfo in root->join_info_list; searched, it would be planned as an inner join",
+					i, joinTypeName(it.jointype))
+			}
 			r, err = makeRelFromJoinlist(it.sub, prob, 0)
 		}
 		if err != nil {
@@ -360,6 +377,22 @@ func (prob *joinlistProblem) leafRel(rel int) (joinlistRel, error) {
 		lo:      rel,
 		hi:      rel + 1,
 	}, nil
+}
+
+// joinInfoListHas reports whether `sj` is a member of `list` by identity — the
+// accumulation and the pinned item carry the SAME pointer
+// (`deconstructFromItemScoped`), which is what
+// TestJoinInfoListProvenanceMatchesJoinlistWalk pins.
+func joinInfoListHas(list []*SpecialJoinInfo, sj *SpecialJoinInfo) bool {
+	if sj == nil {
+		return false
+	}
+	for _, x := range list {
+		if x == sj {
+			return true
+		}
+	}
+	return false
 }
 
 // sjInfosInItemSpace rewrites every SpecialJoinInfo hand from statement-leaf

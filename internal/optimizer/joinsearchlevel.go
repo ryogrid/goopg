@@ -610,35 +610,34 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		}
 		// A join row is the concatenation of its two inputs' rows — the
 		// executor's Join emits left++right — so the column count adds
-		// (M0127-P5.7-a).
+		// (M0127-P5.7-a)... except for a SEMI or ANTI join, which emits its
+		// LHS alone. C-05 replaced C-03c's deliberate over-wide union with
+		// the real rule, and `joinPublishesInner` (joinrelsize.go) is the ONE
+		// place that states it — the sizer's `Width` reads the same function,
+		// so the rel's three sizing figures and its width cannot disagree
+		// about what the join emits. C-03c's objection that a relset-keyed
+		// singleton cannot carry a jointype is answered there: whether a base
+		// relation's columns are published is a RELSET property under
+		// `joinIsLegal`, so every pair spanning this relset publishes the
+		// same columns and first-writer-wins is safe.
 		//
-		// C-03c: the three sizing figures below (NCols, AvgVarBytes,
-		// ColVarBytes) and ConsiderParallel stay at the CONCATENATION even for
-		// a relset whose paths perform a SEMI or ANTI join, which publishes its
-		// left side alone. That is deliberate and fail-closed in both senses:
-		//
-		//   - Structurally it cannot be otherwise here. A rel is a
-		//     relset-keyed singleton (`findRel`/`addRel`, first-writer-wins)
-		//     and different pairs spanning one relset can match different
-		//     SpecialJoinInfos, so a jointype-dependent width on the REL would
-		//     be arrival-order dependent — the exact reason C-03a put the
-		//     jointype on paths and not here.
-		//   - Numerically over-wide beats under-wide. These figures feed hash
-		//     sizing; over-stating a build side over-allocates, while
-		//     under-stating it under-allocates and spills wrongly.
-		//
-		// C-05 installs the real per-jointype sizing switch, on a carrier that
-		// can hold one. The plan-level publication is already narrow —
-		// `createPlanNode`'s SEMI/ANTI arms emit left-only schema and layout —
-		// so this is a costing over-estimate, not a shape disagreement.
-		joinrel.NCols = relNCols(rel1) + relNCols(rel2)
-		// AvgVarBytes adds the same way: a concatenation of two
-		// schemas sums their variable-width payloads (M0128-P3.1).
-		joinrel.AvgVarBytes = rel1.AvgVarBytes + rel2.AvgVarBytes
-		// Its unsummed twin concatenates the same way; a name carried by
-		// both inputs (a self-join's aliases) keeps the WIDER width, so a
-		// collision over-states rather than under-states.
-		joinrel.ColVarBytes = unionColVarBytes(rel1.ColVarBytes, rel2.ColVarBytes)
+		// These figures feed hash sizing (`hashsize.Choose` via `relNCols`,
+		// `entrywidth.go` via `AvgVarBytes`/`ColVarBytes`) and the parent's
+		// own union, which is how a SEMI child's left-only publication reaches
+		// the joinrel above it (C-05 DESIGN §4.6).
+		joinrel.NCols = relNCols(rel1)
+		joinrel.AvgVarBytes = rel1.AvgVarBytes
+		joinrel.ColVarBytes = rel1.ColVarBytes
+		if joinPublishesInner(sjinfo) {
+			joinrel.NCols += relNCols(rel2)
+			// AvgVarBytes adds the same way: a concatenation of two
+			// schemas sums their variable-width payloads (M0128-P3.1).
+			joinrel.AvgVarBytes += rel2.AvgVarBytes
+			// Its unsummed twin concatenates the same way; a name carried by
+			// both inputs (a self-join's aliases) keeps the WIDER width, so a
+			// collision over-states rather than under-states.
+			joinrel.ColVarBytes = unionColVarBytes(rel1.ColVarBytes, rel2.ColVarBytes)
+		}
 		// `joinrel->consider_startup = (root->tuple_fraction > 0)`
 		// (relnode.c:707) — the same query-wide fact every base rel copied in
 		// `buildInitialRels`, not something inherited from the inputs

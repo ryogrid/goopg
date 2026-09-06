@@ -186,25 +186,32 @@ func TestCollapseFlagOffPinsExplicitJoins(t *testing.T) {
 // C-04a re-pinned this. 03 §4.4's "goopg has no join_is_legal constraint
 // inference" no longer holds: C-01 infers the SpecialJoinInfos and C-03b/c
 // build LEFT paths and plans from them, so LEFT is now collapse-dependent
-// exactly as INNER is. RIGHT (C-04b) and FULL (ledgered, DESIGN §3.6) still
-// pin unconditionally, and FULL's tree-side safety RESTS on that.
+// exactly as INNER is. C-04b did the same for RIGHT (its SpecialJoinInfo is
+// the reduced LEFT one). FULL (ledgered, DESIGN §3.6) still pins
+// unconditionally, and FULL's tree-side safety RESTS on that.
 func TestOuterJoinsStayPinned(t *testing.T) {
 	lim := defaultCollapseLimits()
-	for _, spelling := range []string{"RIGHT JOIN", "FULL JOIN"} {
-		from := "a " + spelling + " b ON a.x = b.x"
-		for _, collapse := range []bool{false, true} {
-			checkJoinlist(t, from, lim, collapse, "[[[0] [1]]]")
-		}
+	for _, collapse := range []bool{false, true} {
+		checkJoinlist(t, "a FULL JOIN b ON a.x = b.x", lim, collapse, "[[[0] [1]]]")
 	}
-	// LEFT: pinned with the flag off, flattened with it on — the INNER rule.
-	checkJoinlist(t, "a LEFT JOIN b ON a.x = b.x", lim, false, "[[[0] [1]]]")
-	checkJoinlist(t, "a LEFT JOIN b ON a.x = b.x", lim, true, "[0 1]")
+	// LEFT and RIGHT: pinned with the flag off, flattened with it on — the
+	// INNER rule.
+	for _, spelling := range []string{"LEFT JOIN", "RIGHT JOIN"} {
+		from := "a " + spelling + " b ON a.x = b.x"
+		checkJoinlist(t, from, lim, false, "[[[0] [1]]]")
+		checkJoinlist(t, from, lim, true, "[0 1]")
+	}
 	// An INNER chain topped by a LEFT link is now ONE three-member problem —
 	// the C-04a payload, and the shape Q72 has.
 	checkJoinlist(t, "a JOIN b ON a.x = b.x LEFT JOIN c ON b.x = c.x",
 		lim, true, "[0 1 2]")
-	// A RIGHT link still pins from that node up.
+	// The same chain topped by a RIGHT link is ONE problem too (C-04b): the
+	// prefix is the link's nullable side, and the search is told so through
+	// the reduced SpecialJoinInfo rather than through a pin.
 	checkJoinlist(t, "a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x",
+		lim, true, "[0 1 2]")
+	// A FULL link still pins from that node up.
+	checkJoinlist(t, "a JOIN b ON a.x = b.x FULL JOIN c ON b.x = c.x",
 		lim, true, "[[[0 1] [2]]]")
 	// CROSS JOIN is upstream's JOIN_INNER with no quals, so it collapses
 	// with the inner arm rather than pinning.

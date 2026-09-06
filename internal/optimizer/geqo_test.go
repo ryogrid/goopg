@@ -315,7 +315,7 @@ type refusingBuilder struct {
 }
 
 func (r *refusingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo, _ *SpecialJoinInfo) (float64, int) {
-	return r.s.calcJoinrelSize(nil, outer, inner, clauses)
+	return r.s.calcJoinrelSize(nil, outer, inner, clauses, nil)
 }
 
 func (r *refusingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) error {

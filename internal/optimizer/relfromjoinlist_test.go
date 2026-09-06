@@ -100,6 +100,29 @@ func rfjAssertBindingOrder(t *testing.T, n Node, names []string) {
 	}
 }
 
+// rfjLeafCount counts the base inputs under a node: every node that is not a
+// join or a unary wrapper counts as one, and a nested-loop index join's probed
+// inner relation counts as one too. C-04b uses it to say WHICH side of a
+// searched outer join holds the preserved leaf.
+func rfjLeafCount(n Node) int {
+	switch t := n.(type) {
+	case nil:
+		return 0
+	case *Join:
+		return rfjLeafCount(t.Left) + rfjLeafCount(t.Right)
+	case *NestedLoopIndexJoin:
+		return rfjLeafCount(t.Outer) + 1
+	case *Project:
+		return rfjLeafCount(t.Child)
+	case *Filter:
+		return rfjLeafCount(t.Child)
+	case *Sort:
+		return rfjLeafCount(t.Child)
+	default:
+		return 1
+	}
+}
+
 // rfjJoins collects every `*Join` in a tree, deepest-last, so a test can talk
 // about "the join below the root" without knowing which side it landed on.
 func rfjJoins(n Node) []*Join {

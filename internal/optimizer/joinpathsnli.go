@@ -80,13 +80,15 @@ func paramSourceRelsForProblem(joinrelids RelSet, joinInfoList []*SpecialJoinInf
 			continue
 		}
 		// RIGHT joins never reach PG's loop (reduce_outer_joins flips
-		// RIGHT→LEFT in prep_jointree); goopg flips only the first
-		// link, so surviving deeper RIGHT SJIs exist. The LEFT-shaped
-		// rule below would read them backwards (nullable side on the
-		// left), so they contribute nothing — v1 behavior preserved
-		// exactly. Unreachable today regardless (pinned links abort
-		// the search before any prefix joinrel overlaps their RHS);
-		// revisit if pinning ever relaxes.
+		// RIGHT→LEFT in prep_jointree), and since C-04b they never reach
+		// this one either: `makeSpecialJoinInfoScoped` performs the same
+		// reduction on the SJI's hands (`reduceRightLink`), so a RIGHT
+		// link is described by a LEFT SpecialJoinInfo and takes the
+		// LEFT-shaped rule below with its nullable side on the right,
+		// which is the orientation that rule reads. The skip is kept as
+		// a fail-safe for any future producer that builds a RIGHT SJI
+		// directly: read backwards, the rule would let a nullable-side
+		// joinrel be parameterised by its own preserved side.
 		if sj.Jointype == parser.JoinRight {
 			continue
 		}

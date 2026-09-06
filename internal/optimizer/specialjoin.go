@@ -110,6 +110,20 @@ func makeSpecialJoinInfo(jointype parser.JoinType, left, right joinlist, joinQua
 //   - PG's FOR UPDATE-on-nullable-side error is not replicated: goopg plans
 //     row marks without that check (planner.go:1874+) — a pre-existing,
 //     orthogonal gap, not SJI population.
+// reduceRightLink is `reduce_outer_joins`' RIGHT→LEFT flip
+// (prepjointree.c:3360-3376) applied to ONE link's sides rather than to the
+// jointree: `left RIGHT JOIN right` is `right LEFT JOIN left`, so the reduced
+// link is a LEFT join whose preserved side is the syntactic RIGHT input and
+// whose nullable side is the syntactic LEFT input. C-04b.
+//
+// Both producers of a link description go through it — `makeSpecialJoinInfoScoped`
+// for `root->join_info_list` and `extractSearchLeaves` for the seam's
+// `outerChainLink` — so the two cannot disagree about which side a RIGHT link
+// null-extends; `outerLinksHaveSJInfos` matches them hand for hand.
+func reduceRightLink(left, right RelSet) (jointype parser.JoinType, preserved, nullable RelSet) {
+	return parser.JoinLeft, right, left
+}
+
 func makeSpecialJoinInfoScoped(jointype parser.JoinType, left, right joinlist, joinQual parser.Expr, sc *sjiScope, item int, lower []*SpecialJoinInfo) *SpecialJoinInfo {
 	sj := &SpecialJoinInfo{
 		SynLefthand:  joinlistRelSet(left),
@@ -126,11 +140,30 @@ func makeSpecialJoinInfoScoped(jointype parser.JoinType, left, right joinlist, j
 		return sj
 	}
 
-	// RIGHT: PG never sees it (reduce_outer_joins flips RIGHT→LEFT first).
-	// goopg flips only the first join of a chain (S9.4); a surviving deeper
-	// RIGHT keeps min = syn (maximally restrictive = safe) with
-	// LhsStrict=false (declines LHS-strict association = safe).
+	// RIGHT: PG never builds one. `reduce_outer_joins` rewrites JOIN_RIGHT as
+	// JOIN_LEFT by swapping the JoinExpr's arms before deconstruction
+	// (prepjointree.c:3360-3376), `deconstruct_recurse` has no JOIN_RIGHT arm
+	// (initsplan.c:1403) and `make_outerjoininfo` asserts it never sees one
+	// (initsplan.c:1728). goopg's S9.4 flip can swap only the FIRST link of a
+	// chain — `parser.FromExpr` is a flat left-deep list and cannot spell a
+	// nested right arm — so a deeper RIGHT reaches here as itself, and C-04b
+	// performs the same reduction on the SJI's HANDS instead of on the tree:
+	// the link's syntactic left side is its nullable side, which is a LEFT
+	// join's SynRighthand. Everything downstream (`join_is_legal`'s LEFT-only
+	// association rule, `jointypeForDirection`, the executor's LEFT arms) then
+	// sees exactly the SJI PG would have built. The reduction is spelled once,
+	// in `reduceRightLink`, because the seam has to apply it to the plan-side
+	// link in the same way for `outerLinksHaveSJInfos` to match the two.
+	//
+	// min = syn, deliberately. The reduced RHS is the whole left prefix, which
+	// may contain inner joins, and PG's min_righthand includes
+	// inner_join_rels precisely so the outer join cannot commute with any of
+	// them (initsplan.c:1804-1805); the LEFT narrowing below assumes an
+	// inner-join-free RHS (see the note there) and does not apply. The LHS is
+	// a single leaf, so min = syn is exact for it. LhsStrict stays false
+	// (declines LHS-strict association = safe).
 	if jointype == parser.JoinRight {
+		sj.Jointype, sj.SynLefthand, sj.SynRighthand = reduceRightLink(sj.SynLefthand, sj.SynRighthand)
 		sj.MinLefthand = sj.SynLefthand
 		sj.MinRighthand = sj.SynRighthand
 		return sj

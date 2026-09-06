@@ -245,16 +245,18 @@ func (it joinlistItem) pinnedOuter() bool {
 //   - `pinnedOuter` is the SPINE walk's question ("is this item's order
 //     forced?"), and a pinned LEFT item's order still is. It stays true, so a
 //     LEFT link that pins anyway — the `GOOPG_PGSHAPED_COLLAPSE=0` regime, or
-//     one sitting over a RIGHT pin (`pinnedOverAPinnedSide`) — is peeled
+//     one sitting over a FULL pin (`pinnedOverAPinnedSide`) — is peeled
 //     exactly as before rather than falling out of both mechanisms at once.
 //   - this is `makeRelFromJoinlist`'s question ("would handing it to the
 //     search emit an inner join where the statement wrote an outer one?").
 //     For LEFT the answer is now NO: `join_is_legal` matches the link's
 //     SpecialJoinInfo, `jointypeForDirection` (C-03b) builds paths in the one
 //     legal orientation and `createPlanNode` (C-03c) emits a LEFT join. That
-//     is C-04a §3.3.
+//     is C-04a §3.3. C-04b adds RIGHT by the same route: its SpecialJoinInfo
+//     is the reduced LEFT one (`reduceRightLink`), so the search builds a
+//     LEFT join with the RIGHT link's preserved side driving.
 func (it joinlistItem) pinnedUnsearchable() bool {
-	return it.pinnedOuter() && it.jointype != parser.JoinLeft
+	return it.pinnedOuter() && it.jointype != parser.JoinLeft && it.jointype != parser.JoinRight
 }
 
 // joinTypeName renders a `parser.JoinType` for the one message that has to name
@@ -503,13 +505,15 @@ func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseL
 // joinPinned reports whether a JOIN node must force its own order rather than
 // offer its sides to the enclosing problem.
 //
-// RIGHT and FULL are still always pinned. Upstream pins only FULL and
-// constrains the rest with `SpecialJoinInfo`; goopg now infers those (C-01),
-// so C-04a relaxes LEFT to the same collapse-dependent rule INNER has, and
-// C-04b will do the same for RIGHT. FULL stays pinned for good: its safety
-// rests on the tree side (FULL link → opaque leaf → leaf-count decline) and on
-// C-03b's path-generation decline, and a FULL that flattened into the search
-// would lose the first of those.
+// Only FULL is still always pinned. Upstream pins only FULL and constrains
+// the rest with `SpecialJoinInfo`; goopg now infers those (C-01), so C-04a
+// relaxed LEFT to the same collapse-dependent rule INNER has and C-04b does
+// the same for RIGHT (whose SpecialJoinInfo is the reduced LEFT one —
+// `reduceRightLink` — so the search sees what upstream's `reduce_outer_joins`
+// would have handed it). FULL stays pinned for good: its safety rests on the
+// tree side (FULL link → opaque leaf → leaf-count decline) and on C-03b's
+// path-generation decline, and a FULL that flattened into the search would
+// lose the first of those.
 //
 // INNER and CROSS are the same case to upstream — `a CROSS JOIN b` parses as a
 // `JoinExpr` with `jointype = JOIN_INNER` and no quals — and are pinned only
@@ -522,7 +526,7 @@ func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseL
 // reorder across the outer join.
 func joinPinned(t parser.JoinType, collapseJoins bool) bool {
 	switch t {
-	case parser.JoinInner, parser.JoinCross, parser.JoinLeft:
+	case parser.JoinInner, parser.JoinCross, parser.JoinLeft, parser.JoinRight:
 		return !collapseJoins
 	default:
 		return true
@@ -534,17 +538,21 @@ func joinPinned(t parser.JoinType, collapseJoins bool) bool {
 // guard rather than a correctness one.
 //
 // The seam's two representations have to agree link for link (`splitOuterSpine`).
-// A LEFT link over, say, a RIGHT pin flattens on the JOINLIST side (LEFT is
-// collapse-dependent now) while the PLAN side still stops at the RIGHT link,
+// A LEFT link over, say, a FULL pin flattens on the JOINLIST side (LEFT is
+// collapse-dependent now) while the PLAN side still stops at the FULL link,
 // which `extractSearchLeaves` returns as one opaque leaf — the leaf count then
 // disagrees with the relation count and the whole statement falls back to the
 // syntactic shape, losing the prefix search the peel used to give it. Keeping
 // the link pinned instead puts it back on the spine, where the pair
-// `[LEFT, RIGHT]` is peeled exactly as it was before C-04a.
+// `[LEFT, FULL]` is peeled exactly as it was before C-04a. (Before C-04b the
+// pinned side was typically a RIGHT link; RIGHT is collapse-dependent now, so
+// a LEFT-over-RIGHT spine is ONE flattened problem and this guard no longer
+// sees it — only a FULL, or any outer pin under `GOOPG_PGSHAPED_COLLAPSE=0`,
+// where every link pins anyway.)
 //
 // It fires only when the left side is a single pinned outer item, so a LEFT
-// link over a flattened INNER chain — the Q72 shape C-04a exists for — is
-// unaffected.
+// or RIGHT link over a flattened INNER chain — the Q72 shape C-04a exists for
+// — is unaffected.
 func pinnedOverAPinnedSide(t parser.JoinType, left joinlist) bool {
 	switch t {
 	case parser.JoinInner, parser.JoinCross:

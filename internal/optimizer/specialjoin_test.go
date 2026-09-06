@@ -83,12 +83,22 @@ func TestSpecialJoinInfoLeftJoin(t *testing.T) {
 }
 
 func TestSpecialJoinInfoRightJoin(t *testing.T) {
-	// RIGHT JOIN is pinned and should produce a SpecialJoinInfo.
-	// PG never sees RIGHT (reduce_outer_joins flips it), but goopg has no
-	// such pass yet, so RIGHT reaches deconstruction as itself.
+	// C-04b: a RIGHT JOIN produces the SpecialJoinInfo PG would have built
+	// AFTER reduce_outer_joins — a LEFT one with the hands swapped
+	// (prepjointree.c:3360-3376; `reduceRightLink`). PG never builds a RIGHT
+	// SJI at all (initsplan.c:1728), and neither does goopg now.
 	got := sjCollect(t, "a RIGHT JOIN b ON a.x = b.x")
-	if got == "(none)" {
-		t.Error("RIGHT JOIN must produce a SpecialJoinInfo")
+	want := "LEFT synL={1} synR={0} minL={1} minR={0}"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+	// A deeper RIGHT link null-extends its whole left prefix, and the prefix
+	// holds an inner join: min = syn on the reduced RHS, as PG's min_righthand
+	// includes inner_join_rels (initsplan.c:1804-1805). No LhsStrict.
+	got = sjCollect(t, "a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x")
+	want = "LEFT synL={2} synR={0,1} minL={2} minR={0,1}"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
 	}
 }
 
