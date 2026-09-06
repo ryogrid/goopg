@@ -268,3 +268,109 @@ mechanical consequence rather than a re-implementation.
 
 `joinkeyproof.go` should be struck from the item entirely: it is not a mirror,
 and only `superkeyJoinEstimate` retires with `estimateJoin`.
+
+---
+
+## 7. First run — 99/99, and what it says
+
+```
+label:    c20a-ea-ratchet-first-pin
+capture:  ea-capture-20260907.txt (+ .header)
+engine:   tmp/c20a/goopg-ea sha256/16 = 01b6b310646a7b76, commit 542a6b765
+suite:    tpcds-sf05, goopg :5534, own clone of data-sf05
+regime:   ANALYZE'd (48 relations reltuples>0), GOGC=100 GOMEMLIMIT=12GiB,
+          cgroup goopg-ea-ratchet, 300 s/query
+result:   99/99 queries, non-zero psql rc: none
+scored:   844 nodes   unmatched-in-PG: 369   FINDINGS: 178
+```
+
+The binary was built from the working tree, which carried other agents' WIP in
+`internal/executor/`; the header records the sha so the arm is attributable.
+That is a caveat on the absolute numbers, not on the ratchet, whose whole
+premise is comparing two runs of the same instrument.
+
+### 7.1 Two parser defects the first scoring run exposed
+
+Both were found by reading the findings table rather than by trusting it, and
+both are recorded because either would have made the gate report nonsense with
+a straight face:
+
+- **`loops=0` is not "zero rows".** goopg annotates a hash join's build side
+  `(actual rows=0.00 loops=0)` even when the join above it emits tens of
+  thousands of rows. **220 of 1131** scored nodes were in this state, and
+  treating a missing measurement as a measured zero put a base relation
+  *correctly* estimated at 464,390 at the head of the findings table with a
+  q-error of 464,390. Now dropped exactly like `never executed` — which is
+  also a real finding about goopg's `EXPLAIN ANALYZE` instrumentation, filed
+  here rather than acted on.
+- **goopg prints the alias where PG prints the relation.** TPC-DS aliases its
+  repeated tables `<table>_1`, `<table>_2`; goopg's EXPLAIN emits
+  `Seq Scan on store_sales_2`. **662 of 1131** nodes had no PG counterpart and
+  fell back to the absolute floor — the bar the tool exists to avoid using.
+  With the `_<digits>` suffix normalised on both sides, unmatched falls to 369.
+
+A third correction: the PG side now keeps **every** occurrence of a relation
+set and the bar asks whether *any* of them shares goopg's error. Keeping only
+the largest-estimate occurrence was wrong on precisely the shape the design is
+built around (§7.3).
+
+### 7.2 The B1/A1 fixes are confirmed at corpus level
+
+The c13a census (2026-09-06, `00688e96c`) is the "before" column; it measured
+the same corpus with the same method one day earlier, before
+`resolveBaseColumn`'s `*NestedLoopIndexJoin` arm (`9b43c67f3`) and
+`conjunctionSelectivity`'s `nulltestsel` term (`adc54800b`) landed.
+
+| query | node | before est | after est | actual | before | after | EA findings now |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Q99 | Sort ← HashAggregate | 720,657 | **72** | 90 | 8007× | **1.25×** | 0 |
+| Q62 | Sort ← HashAggregate | 359,432 | **120** | 150 | 2396× | **1.25×** | 0 |
+| Q22 | Sort ← HashAgg (5 gs) | 9,460,201 | **71,857** | 11,987 | 789× | **6.0×** | 0 |
+| Q12 | WindowAgg ← HashAgg | 107,310 | **5,066** | 932 | ~23× | **5.4×** | 0 |
+| Q28 | six scans | 1 | — | 15,410 | 15,410× | — | 0 |
+
+Five of the corpus's worst estimate defects are gone, and the gate that would
+have caught them now exists and is pinned. Q22's remaining 6× is upstream's
+own error class — PG 18.3 estimates that grouping set at 71,857 too.
+
+Unchanged, and expected to be:
+
+| query | node | est | actual | why |
+|---|---|---:|---:|---|
+| Q78 | `Hash Left Join`, `CTE Scan on ss` | 1 | 245,587 | the **A3** mechanism — `LEFT JOIN … WHERE x IS NULL` is not reduced to an anti-join, so the `IS NULL` prices from `stanullfrac = 0`. Diagnosed in `docs/design/planner-rowest-collapse/DESIGN.md`, firewalled by C-04a's `problemPairsOuterWithDerived`, resume condition B-06's CTE statistics. 8 of the corpus's 178 findings, and the top 8 by q-error after Q82. |
+| Q93 | Sort ← HashAggregate | 41,131 | 0 | over-estimate to an empty result; not in the census's fix set |
+
+### 7.3 Q47/Q57 are in the baseline, and are NOT defects
+
+`Q47:cte:v2` (est 4, actual 43,626) and `Q57:cte:v2` (est 2, actual 17,189)
+appear in the pinned baseline. They are **expected**, and must not be "fixed":
+
+goopg materialises `v2` as a CTE and estimates it at 4. PostgreSQL 18.3
+**inlines** v2, and the corresponding node in its plan
+(`bench/tpcds/plans-pg/Q47.txt:38`, `CTE Scan on v1`) estimates **4** as well.
+Identical estimate, identical information failure — a chain of mutually implied
+equi-join selectivities multiplied independently, which upstream does not
+de-duplicate at estimate time either. They are flagged only because the two
+planners give that node different relation-set keys (`cte:v2` vs a second
+occurrence of `cte:v1`), so the PG-relative arm has nothing to compare against
+and the entry falls to the absolute floor.
+
+Being in the pinned baseline is the correct disposition: the ratchet fails on
+NEW findings, so these never fail it, and they are documented here so a later
+reader does not chase them. Q81 and Q89 (the same class per the ledger) score
+0 and 1 findings respectively and need no annotation.
+
+### 7.4 What the ratchet is for
+
+```
+$ EA_CAPTURE=analysis/.../ea-capture-20260907.txt make ea-ratchet
+RATCHET vs .../ea-baseline.txt
+  baseline findings: 178   current: 178
+EA-RATCHET: PASS
+```
+
+178 entries is a large baseline and is meant to be: it is a *ratchet*, not a
+score. The number it defends is "no relation set gets materially worse than
+PostgreSQL that was not already worse", and the identities — not the count —
+are what is pinned, so one fix cannot pay for one regression. C-05, C-10a and
+C-21 cite the same gate and can now use this one.

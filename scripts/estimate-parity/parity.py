@@ -120,6 +120,27 @@ class Node:
         self.pseudo = pseudo
 
 
+ALIAS_SUFFIX = re.compile(r'_\d+$')
+
+
+def strip_alias_suffix(rel):
+    """`store_sales_2` -> `store_sales`.
+
+    goopg prints the ALIAS where PostgreSQL prints the relation name followed
+    by the alias, and TPC-DS aliases its repeated tables `<table>_1`,
+    `<table>_2`. No TPC-DS table name ends in `_<digits>`, so stripping the
+    suffix is unambiguous, and it is what lets a self-join's two instances key
+    to the same relation on BOTH sides rather than matching nothing. Without
+    it 662 of 1131 nodes in the first SF0.5 capture had no PG counterpart and
+    fell back to the absolute floor — which is the bar this tool exists to
+    avoid using.
+
+    A pure alias goopg prints alone (`d` for `date_dim d`) is beyond rescue
+    here and simply stays unmatched.
+    """
+    return ALIAS_SUFFIX.sub('', rel)
+
+
 def base_relation(name, scope):
     """The base relation this node scans, qualified by its CTE/SubPlan scope.
 
@@ -134,7 +155,7 @@ def base_relation(name, scope):
         # A CTE reference is a leaf here, not a window onto the body: the body
         # is scored separately under its own scope. Naming it `cte:v1` keeps
         # goopg's inlined clone and PG's shared body on the same key.
-        return 'cte:' + m.group('rel')
+        return 'cte:' + strip_alias_suffix(m.group('rel'))
     head = name.split('  ')[0].strip()
     if 'Bitmap Index Scan' in head:
         return None
@@ -142,7 +163,8 @@ def base_relation(name, scope):
         if kind in head:
             m = SCAN_ON.search(head)
             if m:
-                return (scope + '.' if scope else '') + m.group('rel')
+                return ((scope + '.' if scope else '')
+                        + strip_alias_suffix(m.group('rel')))
             return None
     return None
 
@@ -183,7 +205,8 @@ def parse(body):
             while stack and stack[-1][0] >= indent:
                 stack.pop()
             kind, label = mk.group('kind'), mk.group('label')
-            scope = label if kind == 'CTE' else '%s%s' % (kind.lower(), label)
+            scope = (strip_alias_suffix(label) if kind == 'CTE'
+                     else '%s%s' % (kind.lower(), label))
             # A marker is a PSEUDO-NODE and a new ROOT, not a child of the
             # node above it. Attaching a CTE body under the plan node that
             # happens to precede it would fold the body's relations into
@@ -229,13 +252,40 @@ def qerror(est, actual):
     return max(e / a, a / e)
 
 
-def collect(roots, want_actual):
-    """{relset: {'est':…, 'actual':…, 'node':…}} for one query's plan forest.
+def measured_actual(n):
+    """The node's per-loop actual row count, or None if it has none.
 
-    When one key occurs several times (a self-join, a CTE referenced twice,
-    a scan repeated under an Append), the occurrence with the LARGEST actual
-    is kept: it is the one whose misestimate can actually cost time, and it
-    is the one both planners will agree is the interesting instance.
+    `loops=0` is NOT "zero rows". goopg annotates a hash join's build side
+    with `(actual rows=0.00 loops=0)` even when the join above it emitted
+    tens of thousands of rows — the side was drained by the build, not by the
+    node's own executor loop, so no per-loop count was recorded. 220 of the
+    1131 nodes in the first SF0.5 capture were in this state, and scoring
+    them treated a missing measurement as a measured zero: a base relation
+    correctly estimated at 464,390 scored a q-error of 464,390 and headed the
+    findings table. Treat it exactly like `never executed`.
+    """
+    if n.arows is None or not n.loops:
+        return None
+    return n.arows
+
+
+def collect(roots, want_actual):
+    """{relset: record} for the goopg side, {relset: [ests]} for the PG side.
+
+    GOOPG SIDE (want_actual=True). When one key occurs several times (a
+    self-join, a CTE referenced twice, a scan repeated under an Append), the
+    occurrence with the LARGEST actual is kept: it is the one whose
+    misestimate can actually cost time.
+
+    PG SIDE (want_actual=False). EVERY occurrence's estimate is kept, and the
+    scorer asks whether ANY of them shares goopg's error. Keeping only one
+    was wrong on the shape it matters most for. Q47: goopg materialises `v2`
+    as a CTE and estimates it at 4 against 43,626 actual; PostgreSQL 18.3
+    INLINES v2 and estimates the corresponding node at 4 as well — but under
+    the key `cte:v1`, whose other occurrence estimates 7,643. Taking the
+    largest hid the matching 4 and reported PG-correct behaviour as a
+    five-order defect. Q47/Q57/Q81/Q89 are exactly the cases the whole
+    PG-relative design exists to pass.
     """
     out = {}
     for root in roots:
@@ -243,16 +293,17 @@ def collect(roots, want_actual):
         for n in walk(root):
             if n.pseudo or not n.relset:
                 continue
-            if want_actual and n.arows is None:
-                continue                      # `never executed`
             key = tuple(sorted(n.relset))
-            rec = {'est': n.erows, 'actual': n.arows, 'node': n.name.split('  ')[0].strip()}
+            if not want_actual:
+                out.setdefault(key, []).append(n.erows)
+                continue
+            actual = measured_actual(n)
+            if actual is None:
+                continue                      # `never executed`, or loops=0
+            rec = {'est': n.erows, 'actual': actual,
+                   'node': n.name.split('  ')[0].strip()}
             prev = out.get(key)
-            if prev is None:
-                out[key] = rec
-            elif want_actual and (rec['actual'] or 0) > (prev['actual'] or 0):
-                out[key] = rec
-            elif not want_actual and rec['est'] > prev['est']:
+            if prev is None or (rec['actual'] or 0) > (prev['actual'] or 0):
                 out[key] = rec
     return out
 
@@ -310,12 +361,19 @@ def main():
         for key, rec in goopg.items():
             scored += 1
             gq = qerror(rec['est'], rec['actual'])
-            pgrec = pgq.get(key)
-            if pgrec is None:
+            pgests = pgq.get(key)
+            if not pgests:
                 unmatched += 1
-                pq = None
+                pq, pgest = None, None
             else:
-                pq = qerror(pgrec['est'], rec['actual'])
+                # The most forgiving PG occurrence of this relation set: the
+                # question the bar asks is "does PostgreSQL get this
+                # cardinality wrong too?", and one node in its plan that does
+                # is an answer of yes. Being generous here is deliberate — a
+                # gate that fails on PG-equivalent behaviour is a gate someone
+                # switches off.
+                pq = max(qerror(e, rec['actual']) for e in pgests)
+                pgest = max(pgests, key=lambda e: qerror(e, rec['actual']))
             # An unmatched key is scored against an absolute bar only. PG
             # having no node with this relation set usually means the two
             # planners chose different join orders, which is a plan-shape
@@ -326,7 +384,7 @@ def main():
                     'q': q, 'key': list(key), 'node': rec['node'],
                     'est': rec['est'], 'actual': rec['actual'],
                     'qerr': round(gq, 1),
-                    'pg_est': pgrec['est'] if pgrec else None,
+                    'pg_est': pgest,
                     'pg_qerr': round(pq, 1) if pq is not None else None,
                 })
 
