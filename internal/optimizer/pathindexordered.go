@@ -183,7 +183,7 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	// `useful_pathkeys != NIL`, which the non-empty `keys` above just
 	// established.
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
-	cost := costIndexScan(s.cp, indexScanInputs{
+	in := indexScanInputs{
 		relPages:    relPages,
 		relTuples:   relTuples,
 		indexPages:  indexPages,
@@ -194,11 +194,12 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 
 		totalTablePages: totalPages,
-	})
+	}
+	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 	// path-creation time. Assert-only — never applied, never costed.
 	tgt, tgtKnown := scanPathTarget(rel)
-	addPath(rel, &Path{
+	serial := &Path{
 		Kind: PathIndexScan,
 		Rel:  rel,
 		// create_index_path (pathnode.c:1078): `rel->consider_parallel`. C-19a.
@@ -230,8 +231,54 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		RequiredOuter: 0,
 		Target:        tgt,
 		TargetKnown:   tgtKnown,
-	}, "index.ordered")
+	}
+	addPath(rel, serial, "index.ordered")
+
+	// C-19c: the PARTIAL twin — build_index_paths' "if (index->amcanparallel
+	// && rel->consider_parallel && outer_relids == NULL && scantype !=
+	// ST_BITMAPSCAN)" arm (indxpath.c:1039-1062): the same path with
+	// `partial_path = true`, whose cost_index sizes the workers and, when
+	// there are none worth having, is freed. Into PartialPathlist, which
+	// nothing consumes before C-19d: the serial arm is unchanged by
+	// construction.
+	s.addPartialIndexPath(rel, tbl, serial, in, "index.ordered.partial")
 	return true
+}
+
+// addPartialIndexPath offers the partial twin of a plain or index-only index
+// path just added to `rel.Pathlist` — C-19c, `create_index_path(...,
+// partial_path = true)` + `add_partial_path`. `serial` is that path and `in`
+// its costing input, so the twin is the serial path's shape (index, direction,
+// pathkeys, index-only column list, target) priced on exactly the serial
+// path's model with the divisor applied (costPartialIndexScan). It shares no
+// pointer with the serial path: `Pathkeys` and the covered list are read-only
+// after creation, and nothing about the twin is mutated later.
+//
+// The gate is upstream's: `amcanparallel` (btree only — a `USING hash` index
+// rides goopg's btree substrate but is not parallel-capable in PG either),
+// `rel->consider_parallel`, no required outer (every caller here is
+// unparameterised), and the session's parallelModeOK. A twin sized at zero
+// workers is not offered ("just free it").
+func (s *searchCtx) addPartialIndexPath(rel *RelOptInfo, tbl *catalog.Table, serial *Path, in indexScanInputs, producer string) {
+	if s == nil || !s.parallelModeOK || rel == nil || !rel.ConsiderParallel || serial == nil {
+		return
+	}
+	idx := serial.IndexInfo
+	if idx == nil || !isBTreeIndex(idx) || idx.DeclaredHash || serial.RequiredOuter != 0 {
+		return
+	}
+	cost, rows, workers := costPartialIndexScan(s.cp, in, serial.Rows, tableParallelWorkersReloption(tbl))
+	if workers <= 0 {
+		return
+	}
+	twin := *serial
+	twin.Cost = cost
+	twin.Rows = rows
+	// A partial path is parallel-safe by construction (`parallel_safe =
+	// rel->consider_parallel`, checked above).
+	twin.ParallelSafe = true
+	twin.ParallelWorkers = workers
+	addPartialPath(rel, &twin, producer)
 }
 
 // mergeableColumnExprsFor is `pathkeys_useful_for_merging` (pathkeys.c:2166)

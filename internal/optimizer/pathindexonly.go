@@ -95,7 +95,7 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		return false
 	}
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
-	cost := costIndexScan(s.cp, indexScanInputs{
+	in := indexScanInputs{
 		relPages:    relPages,
 		relTuples:   relTuples,
 		indexPages:  indexPages,
@@ -111,11 +111,12 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		loopCount:       1,
 		indexOnly:       true,
 		allVisFrac:      relAllVisibleFraction(tbl, relPages),
-	})
+	}
+	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 	// path-creation time (see the Target comment on the literal below).
 	tgt, tgtKnown := scanPathTarget(rel)
-	addPath(rel, &Path{
+	serial := &Path{
 		Kind:             PathIndexScan,
 		Rel:              rel,
 		Rows:             rel.Rows,
@@ -145,7 +146,14 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		TargetKnown: tgtKnown,
 		// No index clauses: this is the full-index-scan shape, and
 		// `createPlan` reads the empty list as exactly that.
-	}, "indexonly")
+	}
+	addPath(rel, serial, "indexonly")
+	// C-19c: the partial twin, `create_index_path(..., index_only_scan,
+	// ..., partial_path = true)` — the same build_index_paths arm as the
+	// plain scan's; cost_index sizes it on index pages alone
+	// (`rand_heap_pages = -1` when indexonly). Executor counterpart exists
+	// since M0134-0189 (Parallel Index Only Scan).
+	s.addPartialIndexPath(rel, tbl, serial, in, "indexonly.partial")
 	return true
 }
 

@@ -826,8 +826,16 @@ type IndexScan struct {
 	// leaf's `*Filter` wrappers are rebuilt above the scan by `scanLeafFor`'s
 	// rewrapper as before, and Cond stays nil — one predicate evaluated in one
 	// place either way, never both.
-	Cond   Expr
-	schema Schema
+	Cond Expr
+	// Parallel mirrors PostgreSQL's Plan.parallel_aware — see SeqScan's field
+	// of the same name. Stamped once by parallel.go's stampParallelScan,
+	// never inferred at render time. When set, each worker's scan collects
+	// only the TIDs from the index LEAF BLOCKS it claims from the shared
+	// parallelIndexScanState (C-19c, the plain-scan sibling of
+	// IndexOnlyScan.Parallel / M0134-0189), so the union over workers is the
+	// whole scan exactly once.
+	Parallel bool
+	schema   Schema
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
 	// same name. M0122-0008 (view-owner privilege gap).
 	PrivilegeCheckRole    string

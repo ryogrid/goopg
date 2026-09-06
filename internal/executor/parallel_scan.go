@@ -238,17 +238,66 @@ func (s *parallelIndexScanState) claimedBlocks() uint64 {
 	return s.blocks.Load()
 }
 
-// attachParallelIndexScan wires op's driving index-only scan to the shared
-// leaf-block claim set. The walk mirrors attachParallelScan's — row-wise
-// wrappers only, stopping at the first index-only scan — and an unmodelled node
-// is left alone, leaving the tree serial. Declining to parallelise is a missed
-// optimisation; attaching in the wrong place is duplicated or dropped rows.
+// leafClaimMemo is one worker's cached view of the shared leaf-claim set: the
+// verdict per leaf, and the most recent one. The shared claim is a sync.Map
+// operation and a range scan visits ~300 entries per leaf, so consulting it
+// per ENTRY made the parallel index-only scan 3.5x SLOWER than serial (q16
+// 1.6s -> 5.7s). A btree scan walks leaves in key order, so the common case
+// is "same block as the last entry" and costs one comparison. The map is kept
+// so revisiting a block reuses this worker's OWN verdict rather than
+// re-asking the shared set, which would answer "already claimed" about our
+// own claim and silently drop rows.
+//
+// C-19c: extracted from indexOnlyScanOp's fields so the plain index scan
+// (indexScanOp) partitions by the same memo rather than a re-typed sibling.
+type leafClaimMemo struct {
+	owned     map[storage.BlockNumber]bool
+	last      storage.BlockNumber
+	lastOwned bool
+	lastValid bool
+}
+
+// owns reports whether this worker processes entries from leaf block blk,
+// memoising the shared claim. A nil st answers YES for every block (serial).
+func (m *leafClaimMemo) owns(st *parallelIndexScanState, blk storage.BlockNumber) bool {
+	if m.lastValid && m.last == blk {
+		return m.lastOwned
+	}
+	owned, seen := m.owned[blk]
+	if !seen {
+		owned = st.claimLeaf(blk)
+		if m.owned == nil {
+			m.owned = make(map[storage.BlockNumber]bool, 64)
+		}
+		m.owned[blk] = owned
+	}
+	m.last, m.lastOwned, m.lastValid = blk, owned, true
+	return owned
+}
+
+// attachParallelIndexScan wires op's driving index scan — index-only or, since
+// C-19c, a plain index scan — to the shared leaf-block claim set. The walk
+// mirrors attachParallelScan's — row-wise wrappers only, stopping at the first
+// index scan — and an unmodelled node is left alone, leaving the tree serial.
+// Declining to parallelise is a missed optimisation; attaching in the wrong
+// place is duplicated or dropped rows.
+//
+// The plain index scan partitions the SAME way the index-only scan does: both
+// are eager at Open/Rescan (the IOS materialises rows, the plain scan its TID
+// list — operators_index.go's M0092-0001 note), both walk the leaf chain
+// through nbtree.RangeScanWithPosLeafFilter, and the leaf filter decides per
+// leaf block which worker's list an entry lands in. Exactly one worker owns
+// each leaf, so the union over workers is the whole scan exactly once, and the
+// per-Next heap fetch then runs only over that worker's TIDs.
 func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 	if st == nil {
 		return false
 	}
 	switch x := op.(type) {
 	case *indexOnlyScanOp:
+		x.pidx = st
+		return true
+	case *indexScanOp:
 		x.pidx = st
 		return true
 	case *filterOp:

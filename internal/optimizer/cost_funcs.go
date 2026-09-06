@@ -106,12 +106,14 @@ type costParams struct {
 	geqoSeed        float64
 
 	// maxParallelWorkersPerGather / minParallelTableScanBlocks /
-	// parallelLeaderParticipation are the parallel GUCs the path model reads
-	// (C-19a/b; see PlannerSettings for the unit and zero-value rules).
-	// `compute_parallel_worker` reads the first two, `get_parallel_divisor`
-	// the third.
+	// minParallelIndexScanBlocks / parallelLeaderParticipation are the
+	// parallel GUCs the path model reads (C-19a/b/c; see PlannerSettings for
+	// the unit and zero-value rules). `compute_parallel_worker` reads the
+	// first three (the index threshold from C-19c's partial index paths),
+	// `get_parallel_divisor` the last.
 	maxParallelWorkersPerGather int
 	minParallelTableScanBlocks  int64
+	minParallelIndexScanBlocks  int64
 	parallelLeaderParticipation bool
 }
 
@@ -148,10 +150,12 @@ func defaultCostParams() costParams {
 		// The registered boot values (internal/utils/misc/defaults.go):
 		// max_parallel_workers_per_gather = 4 is a deliberate goopg default
 		// (PG 18.3 ships 2 — workers here are goroutines, not scarce slots);
-		// min_parallel_table_scan_size = 8MB = 1024 blocks and
+		// min_parallel_table_scan_size = 8MB = 1024 blocks,
+		// min_parallel_index_scan_size = 512kB = 64 blocks and
 		// parallel_leader_participation = on are PG's own.
 		maxParallelWorkersPerGather: 4,
 		minParallelTableScanBlocks:  8 * 1024 * 1024 / blockSizeBytes,
+		minParallelIndexScanBlocks:  512 * 1024 / blockSizeBytes,
 		parallelLeaderParticipation: true,
 	}
 }

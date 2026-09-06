@@ -344,9 +344,19 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 // comparison. Until that exists this states the one case measurement has
 // actually settled, and states it where the decision is made rather than by
 // disabling the scan type outright.
+//
+// C-19c: a plain `*IndexScan` driving scan declines for the same reason AND a
+// harder one — the Gather Merge operator attaches only the seq-scan block
+// allocator to its workers (operators_gather_merge.go), not the index
+// leaf-claim set, so a per-worker Sort over an index scan under Gather Merge
+// would return every row once per worker. The IOS was already protected by
+// this rule; the plain scan inherits it rather than the hazard.
 func sortPartialRootPays(srt *Sort) bool {
-	_, isIOS := drivingScan(srt.Child).(*IndexOnlyScan)
-	return !isIOS
+	switch drivingScan(srt.Child).(type) {
+	case *IndexOnlyScan, *IndexScan:
+		return false
+	}
+	return true
 }
 
 // terminatesPartial reports whether a Gather must sit at or below this node.
@@ -401,6 +411,16 @@ func stampParallelScan(n Node) Node {
 		c.Parallel = true
 		return &c
 	case *IndexOnlyScan:
+		c := *x
+		c.Parallel = true
+		return &c
+	case *IndexScan:
+		// C-19c. The SAME predicate drivingScan admits on, so the two
+		// functions cannot disagree about a plain index scan: a node
+		// drivingScan refused is returned unchanged here too.
+		if !plainIndexScanIsPartialCapable(x) {
+			return n
+		}
 		c := *x
 		c.Parallel = true
 		return &c
@@ -465,6 +485,31 @@ func drivingScan(n Node) Node {
 		// partition of that materialisation — while an index scan is also the
 		// NLI probe shape, under which a Gather never sits.
 		return x
+	case *IndexScan:
+		// C-19c (P5-03). The plain index scan is eager at Open the same way
+		// the IOS is — it materialises its TID list through one leaf-chain
+		// walk (operators_index.go, M0092-0001) — so the IOS's leaf-block
+		// partition applies to it unchanged: attachParallelIndexScan hands
+		// the worker the shared claim set and RangeScanWithPosLeafFilter
+		// keeps only the leaves it owns. PG's counterpart is a Parallel
+		// Index Scan, which is `amcanparallel` (btree only) and never a
+		// bitmap input (build_index_paths, indxpath.c).
+		//
+		// Admitted only as a bare RANGE or FULL scan. A point probe (Key /
+		// Keys) or a SAOP multi-descent is refused: this post-pass sizes
+		// workers on the TABLE's block count (computeParallelWorkers), not
+		// on what the probe fetches — PG's cost_index passes the fetched
+		// heap pages to compute_parallel_worker, which is what stops a
+		// 1-row probe on a large relation from gathering. Until C-19d makes
+		// that price the decider, the shape rule stands in for it. A SAOP
+		// scan is also the one site (rescanSAOP) that does not consult the
+		// leaf filter, so refusing it here is what keeps that site serial.
+		// The NLI inner probe is not reached at all: terminatesPartial
+		// stops at *NestedLoopIndexJoin.
+		if !plainIndexScanIsPartialCapable(x) {
+			return nil
+		}
+		return x
 	case *Filter:
 		return drivingScan(x.Child)
 	case *Project:
@@ -484,6 +529,14 @@ func drivingScan(n Node) Node {
 		return drivingScan(x.Right)
 	}
 	return nil
+}
+
+// plainIndexScanIsPartialCapable is the one predicate drivingScan (eligibility)
+// and stampParallelScan (label) share for a plain `*IndexScan` — see the
+// drivingScan arm for what each condition protects. C-19c.
+func plainIndexScanIsPartialCapable(x *IndexScan) bool {
+	return x != nil && x.Index != nil && isBTreeIndex(x.Index) && !x.Index.DeclaredHash &&
+		x.Key == nil && len(x.Keys) == 0 && len(x.SAOPKeys) == 0
 }
 
 // The `*MultiHashJoin` arm and its `multiHashJoinIsPartialCapable` approval
@@ -580,8 +633,18 @@ func hashJoinIsPartialCapable(p *Join) bool {
 	return false
 }
 
-// scanTable extracts the *catalog.Table from a scan node (SeqScan or
-// BitmapHeapScan). Returns nil for any other node kind.
+// scanTable extracts the *catalog.Table from a scan node (SeqScan,
+// BitmapHeapScan, IndexOnlyScan or — C-19c — a plain IndexScan). Returns nil
+// for any other node kind.
+//
+// A plain index scan is sized on its TABLE's blocks below, the heap arm of
+// compute_parallel_worker. PG sizes it on min(heap ladder over the heap pages
+// the scan fetches, index ladder over the index pages it reads); the path
+// model's twin (costPartialIndexScan) does exactly that, while this post-pass
+// has only the live block counts. The heap ladder is the binding one for the
+// shapes drivingScan admits (a range or full scan reads most of the heap, and
+// an index is far smaller than its heap against a 16x smaller threshold), so
+// until C-19h retires the post-pass the two agree in practice.
 func scanTable(n Node) *catalog.Table {
 	switch x := n.(type) {
 	case *SeqScan:
@@ -589,6 +652,8 @@ func scanTable(n Node) *catalog.Table {
 	case *BitmapHeapScan:
 		return x.Table
 	case *IndexOnlyScan:
+		return x.Table
+	case *IndexScan:
 		return x.Table
 	}
 	return nil

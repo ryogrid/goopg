@@ -129,7 +129,50 @@ type indexScanInputs struct {
 // correlation statistic, the blend takes effect and the cost interpolates
 // between the random and sequential extremes.
 func costIndexScan(cp costParams, in indexScanInputs) Cost {
-	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
+	cost, _, _ := costIndexScanCore(cp, in, 0)
+	return cost
+}
+
+// costPartialIndexScan is `cost_index`'s `partial_path` arm (costsize.c:
+// 199-230, 257-266) — C-19c. It sizes the worker count the way upstream does,
+// INSIDE the cost function, because the inputs are cost_index's own
+// intermediates: `rand_heap_pages` (the Mackert-Lohman heap page count of the
+// uncorrelated bound — -1 for an index-only scan) and `index_pages` (the AM
+// estimator's page count), handed to compute_parallel_worker with the table's
+// parallel_workers reloption. `workers == 0` means the path is not worth
+// parallelising and the caller drops it (build_index_paths: "if, after
+// costing the path, we find that it's not worth using parallel workers, just
+// free it").
+//
+// With workers > 0 the CPU run cost — cpu_tuple_cost per fetched tuple, plus
+// the qpqual and tlist terms goopg charges elsewhere — is divided by
+// `get_parallel_divisor`, the I/O is NOT (each worker's random fetches are its
+// own), and the row count is `clamp_row_est(rows / divisor)`. The returned
+// rows are the per-worker figure; `rows` is the serial path's.
+func costPartialIndexScan(cp costParams, in indexScanInputs, rows float64, reloptionWorkers int) (Cost, float64, int) {
+	// Size first, at zero workers, to read the page counts the sizing needs;
+	// the first pass is discarded, like upstream's early `return`.
+	_, randHeapPages, indexPages := costIndexScanCore(cp, in, 0)
+	if in.indexOnly {
+		randHeapPages = -1
+	}
+	workers := computeParallelWorker(cp, randHeapPages, indexPages, reloptionWorkers)
+	if workers <= 0 {
+		return Cost{}, 0, 0
+	}
+	cost, _, _ := costIndexScanCore(cp, in, workers)
+	d := getParallelDivisor(workers, cp.parallelLeaderParticipation)
+	return cost, clampRowEst(rows / d), workers
+}
+
+// costIndexScanCore is cost_index's arithmetic with the parallel divisor
+// applied to the CPU run cost when `workers > 0`, and the two page counts the
+// partial arm sizes workers on. At workers == 0 it is the serial function
+// exactly: the CPU term is accumulated in its own variable, as upstream's
+// `cpu_run_cost` is, and added to `run_cost` LAST — the same addition order
+// the serial function always had, so the serial arm is bit-identical.
+func costIndexScanCore(cp costParams, in indexScanInputs, workers int) (cost Cost, randHeapPages, indexPages float64) {
+	idxStartup, idxTotal, numIndexPages := btreeIndexAMCostPages(cp, in)
 	startupCost := idxStartup
 	runCost := idxTotal - idxStartup
 
@@ -150,6 +193,7 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
 		// either bound.
 		pagesFetched := indexPagesFetched(tuplesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
 		pagesFetched = in.heapPagesAfterVM(pagesFetched)
+		randHeapPages = pagesFetched // costsize.c:609, the partial arm's heap figure
 		maxIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
 
 		// The correlated bound applies the same formula one level up, at PAGE
@@ -163,6 +207,7 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
 		// max_IO_cost: the perfectly uncorrelated case (csquared = 0).
 		pagesFetched := indexPagesFetched(tuplesFetched, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
 		pagesFetched = in.heapPagesAfterVM(pagesFetched)
+		randHeapPages = pagesFetched // costsize.c:657
 		maxIOCost = pagesFetched * cp.randomPageCost * indexProbeCostMultiplier
 
 		// min_IO_cost: the perfectly correlated case (csquared = 1). One random
@@ -184,9 +229,16 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
 	// local quals live inside the already-built leaf node and their cost was
 	// spent when `estimateBaseRelInfo` priced it. Charging them again here
 	// would double-count them against the seq-scan rival that does not.
-	runCost += cp.cpuTupleCost * tuplesFetched
+	cpuRunCost := cp.cpuTupleCost * tuplesFetched
 
-	return Cost{Startup: startupCost, Total: startupCost + runCost}
+	// "Adjust costing for parallelism, if used" (costsize.c:257-266): the
+	// CPU cost is divided among all the workers; the I/O above is not.
+	if workers > 0 {
+		cpuRunCost /= getParallelDivisor(workers, cp.parallelLeaderParticipation)
+	}
+	runCost += cpuRunCost
+
+	return Cost{Startup: startupCost, Total: startupCost + runCost}, randHeapPages, numIndexPages
 }
 
 // btreeIndexAMCost is the `amcostestimate` callback pair
@@ -203,6 +255,14 @@ func costIndexScan(cp costParams, in indexScanInputs) Cost {
 // Returns (startup, total) for the index side alone; `costIndexScan` adds the
 // heap side.
 func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64) {
+	startup, total, _ = btreeIndexAMCostPages(cp, in)
+	return startup, total
+}
+
+// btreeIndexAMCostPages is btreeIndexAMCost plus the estimator's third
+// output, `indexPages` (`costs.numIndexPages`, selfuncs.c:7146) — the page
+// count cost_index's partial arm hands to compute_parallel_worker (C-19c).
+func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, indexPages float64) {
 	numIndexTuples := in.selectivity * in.indexTuples
 	if numIndexTuples < 0 {
 		numIndexTuples = 0
@@ -256,7 +316,7 @@ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64
 	descent := float64(in.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
 	startup = descent
 	total += numSA * descent
-	return startup, total
+	return startup, total, numIndexPages
 }
 
 // indexPagesFetched is `index_pages_fetched` (costsize.c:906) — the Mackert

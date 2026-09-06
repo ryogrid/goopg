@@ -212,6 +212,19 @@ type indexScanOp struct {
 	poss     []nbtree.ScanPos
 	killList []nbtree.KillItem
 
+	// pidx is the shared leaf-block claim set when this scan is a Gather
+	// worker's driving scan (C-19c, the plain-index-scan sibling of the IOS's
+	// M0134-0189 field); nil for a serial scan, and a nil receiver claims
+	// every block (parallel_scan.go). leafMemo caches this worker's verdicts.
+	//
+	// Only the single-range site in Rescan consults it. The SAOP multi-descent
+	// (rescanSAOP) and the NLI-driven re-probe are never a Gather's driving
+	// scan — the planner's drivingScan (optimizer/parallel.go) admits a plain
+	// index scan only as a bare range/full scan — so those sites stay serial
+	// by construction rather than by a filter they do not apply.
+	pidx     *parallelIndexScanState
+	leafMemo leafClaimMemo
+
 	// M0054-0006a: state captured at Open() time and reused across
 	// Rescan() calls when the index probe is driven by an outer row
 	// from a parent NestedLoopIndexJoin.
@@ -294,6 +307,13 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		return err
 	}
 	return o.Rescan(nil, 0)
+}
+
+// ownsLeaf reports whether this worker processes entries from leaf block blk
+// (C-19c). The memo makes the shared claim a once-per-leaf cost; see
+// leafClaimMemo.
+func (o *indexScanOp) ownsLeaf(blk storage.BlockNumber) bool {
+	return o.leafMemo.owns(o.pidx, blk)
 }
 
 // openPrep does the one-time setup that is independent of any outer
@@ -502,7 +522,16 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		return true, nil
 	}
 
-	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, scanFn); err != nil {
+	// C-19c: under a Gather the leaf filter partitions the TID list across
+	// workers by index leaf block, exactly as the index-only scan's Open does
+	// (operators_indexonly.go). nil for a serial scan, so the scan behaves
+	// exactly as it always has — RangeScanWithPos IS RangeScanWithPosLeafFilter
+	// with a nil filter.
+	var leafFilter func(storage.BlockNumber) bool
+	if o.pidx != nil {
+		leafFilter = o.ownsLeaf
+	}
+	if err := o.tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, leafFilter, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	if o.hashBucketScan {

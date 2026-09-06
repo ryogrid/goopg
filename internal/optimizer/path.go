@@ -718,17 +718,128 @@ func pathlistVerdict(list []*Path, newPath *Path, _ int) pathVerdict {
 	return verdictDominated
 }
 
-// addPartialPath is add_partial_path (pathnode.c:798): the same dominance pruning
-// over the partial pathlist, used for parallel candidates (design ch. 08 §2).
-// Present now; exercised from C5.
+// addPartialPath is add_partial_path (pathnode.c:798): dominance pruning over
+// the partial pathlist, used for parallel candidates (design ch. 08 §2).
+//
+// C-19c (ledger `take3-C-19ab-review-deferred` item (c)): it does NOT reuse
+// addPath's comparator. Upstream's is deliberately narrower — "Because we
+// don't consider parameterized paths here, we also don't need to consider the
+// row counts as a measure of quality" and "Neither do we need to consider
+// startup costs: parallelism is only used for plans that will be run to
+// completion" (pathnode.c:770-790). So a partial path is judged on TOTAL cost
+// and pathkeys only, plus disabled_nodes. The serial comparator's other three
+// axes would each let a path survive here that PG drops: a lower-startup /
+// higher-total path is "incomparable" on the cost axis to add_path (when its
+// rel considers startup) but simply dearer to add_partial_path; every partial
+// path is parallel-safe, so that axis can only ever be a tie; and none is
+// parameterised (`required_outer == NULL` at every producer), so the
+// required-outer axis is a tie too. The two lists first hold rivals here —
+// a rel with a partial seq scan AND a partial index scan — which is why this
+// slice lands the comparator.
+//
+// The list is kept in ascending total-cost order like upstream's (`insert_at`),
+// so `PartialPathlist[0]` is the cheapest partial path — what
+// generate_useful_gather_paths reads as `linitial(rel->partial_pathlist)`
+// (C-19d).
+//
+// PG asserts `new_path->parallel_safe` and `parent_rel->consider_parallel`.
+// Here both are refused rather than asserted: a partial path that is not
+// parallel-safe, or offered on a rel that does not consider parallel, is not
+// a candidate at all, and refusing fails closed (a path not offered cannot
+// be chosen), where a panic inside the planner would fail the statement.
 func addPartialPath(rel *RelOptInfo, newPath *Path, producer string) {
-	before := len(rel.PartialPathlist)
-	rel.PartialPathlist = addToPathlist(rel.PartialPathlist, newPath)
+	if newPath == nil || !newPath.ParallelSafe || !rel.ConsiderParallel {
+		return
+	}
+	rel.PartialPathlist = addToPartialPathlist(rel.PartialPathlist, newPath)
+	verdict := verdictDominated
+	for _, p := range rel.PartialPathlist {
+		if p == newPath {
+			verdict = verdictAccepted
+			break
+		}
+	}
 	// The partial list is traced too: `parallelism` is one of the nine
 	// divergence classes the parity work tracks, so a provenance channel that
 	// covered only addPath could not answer whether a partial path was ever
 	// offered.
-	tracePath(rel, newPath, producer, true, pathlistVerdict(rel.PartialPathlist, newPath, before))
+	tracePath(rel, newPath, producer, true, verdict)
+}
+
+// addToPartialPathlist is add_partial_path's loop (pathnode.c:820-893). Each
+// incumbent whose pathkeys are comparable with the newcomer's (one a prefix of
+// the other — PATHKEYS_EQUAL / BETTER1 / BETTER2, i.e. not
+// PATHKEYS_DIFFERENT) yields exactly one survivor of the pair:
+//
+//   - disabled_nodes differ: the lower count wins;
+//   - totals differ by more than STD_FUZZ_FACTOR: the cheaper wins unless the
+//     dearer has strictly better pathkeys, in which case both stay;
+//   - totals fuzzily equal: better pathkeys win; with equal pathkeys the
+//     incumbent stays unless the newcomer is cheaper by more than 1e-10
+//     (upstream's 1.0000000001, which is what keeps a re-offered identical
+//     path from replacing the first).
+//
+// Incomparable pathkeys leave both. The newcomer is inserted after the last
+// incumbent whose total cost it does not undercut, which keeps the list
+// sorted by total cost as long as every insertion goes through here.
+func addToPartialPathlist(list []*Path, newPath *Path) []*Path {
+	acceptNew := true
+	insertAt := 0
+	survivors := make([]*Path, 0, len(list)+1)
+	for i, old := range list {
+		removeOld := false
+		keys := comparePathkeysDim(newPath.Pathkeys, old.Pathkeys)
+		if keys != dimIncomparable {
+			switch {
+			case newPath.DisabledNodes != old.DisabledNodes:
+				if newPath.DisabledNodes > old.DisabledNodes {
+					acceptNew = false
+				} else {
+					removeOld = true
+				}
+			case newPath.Cost.Total > old.Cost.Total*stdFuzzFactor:
+				// New path costs more; keep it only if pathkeys are better.
+				if keys != dimBetter1 {
+					acceptNew = false
+				}
+			case old.Cost.Total > newPath.Cost.Total*stdFuzzFactor:
+				// Old path costs more; keep it only if pathkeys are better.
+				if keys != dimBetter2 {
+					removeOld = true
+				}
+			case keys == dimBetter1:
+				// Costs are about the same, new path has better pathkeys.
+				removeOld = true
+			case keys == dimBetter2:
+				// Costs are about the same, old path has better pathkeys.
+				acceptNew = false
+			case old.Cost.Total > newPath.Cost.Total*1.0000000001:
+				// Pathkeys are the same, and the old path costs more.
+				removeOld = true
+			default:
+				// Pathkeys are the same, and new path isn't materially
+				// cheaper.
+				acceptNew = false
+			}
+		}
+		if !removeOld {
+			survivors = append(survivors, old)
+			// New belongs after this old path if it has cost >= old's.
+			if newPath.Cost.Total >= old.Cost.Total {
+				insertAt = len(survivors)
+			}
+		}
+		if !acceptNew {
+			// An incumbent dominates the newcomer: stop scanning, keep the
+			// rest untouched (upstream assumes the newcomer cannot dominate
+			// any later path either).
+			return append(survivors, list[i+1:]...)
+		}
+	}
+	survivors = append(survivors, nil)
+	copy(survivors[insertAt+1:], survivors[insertAt:])
+	survivors[insertAt] = newPath
+	return survivors
 }
 
 func addToPathlist(list []*Path, newPath *Path) []*Path {

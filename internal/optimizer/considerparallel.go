@@ -582,30 +582,68 @@ func (s *searchCtx) addBaseRelPartialPaths() {
 // relation, which is what lets C-19d's Gather paths be compared against the
 // post-pass's placement while both exist.
 func computeParallelWorkerForRel(cp costParams, heapPages int64, reloptionWorkers int) int {
+	return computeParallelWorker(cp, float64(heapPages), -1, reloptionWorkers)
+}
+
+// computeParallelWorker is `compute_parallel_worker` (allpaths.c:4274) in
+// full: BOTH the heap-pages and the index-pages arms. A negative page count
+// means "not applicable" (upstream's -1): create_plain_partial_paths passes
+// (rel->pages, -1); cost_index's partial arm passes (rand_heap_pages,
+// index_pages) for a plain index scan and (-1, index_pages) for an index-only
+// scan, "because the number of heap pages we fetch might be so small as to
+// effectively rule out parallelism, which we don't want to do" (costsize.c).
+//
+// Either applicable count below its threshold — min_parallel_table_scan_size
+// for the heap, min_parallel_index_scan_size for the index — returns 0 (:4300,
+// the RELOPT_BASEREL case; goopg's search has no inheritance children). Each
+// applicable count then climbs its own log3 ladder and, when both apply, the
+// SMALLER of the two answers wins (:4344). C-19c.
+func computeParallelWorker(cp costParams, heapPages, indexPages float64, reloptionWorkers int) int {
 	maxWorkers := cp.maxParallelWorkersPerGather
 	var workers int
 	if reloptionWorkers > 0 {
 		workers = reloptionWorkers
 	} else {
-		if heapPages < cp.minParallelTableScanBlocks {
+		if (heapPages >= 0 && heapPages < float64(cp.minParallelTableScanBlocks)) ||
+			(indexPages >= 0 && indexPages < float64(cp.minParallelIndexScanBlocks)) {
 			return 0
 		}
-		threshold := cp.minParallelTableScanBlocks
-		if threshold < 1 {
-			threshold = 1
+		if heapPages >= 0 {
+			workers = parallelWorkerLadder(heapPages, cp.minParallelTableScanBlocks)
 		}
-		workers = 1
-		for heapPages >= threshold*3 {
-			workers++
-			threshold *= 3
-			if threshold > (1<<31-1)/3 { // INT_MAX / 3, upstream's overflow break
-				break
+		if indexPages >= 0 {
+			indexWorkers := parallelWorkerLadder(indexPages, cp.minParallelIndexScanBlocks)
+			if workers > 0 {
+				workers = min(workers, indexWorkers)
+			} else {
+				workers = indexWorkers
 			}
 		}
 	}
 	// "In no case use more than max_workers" (:4356).
 	if workers > maxWorkers {
 		workers = maxWorkers
+	}
+	return workers
+}
+
+// parallelWorkerLadder is the log3 ladder both arms of compute_parallel_worker
+// share (:4318-4331, :4335-4343): one worker, plus one for every factor of
+// three the page count exceeds the threshold by. Upstream compares against
+// `(BlockNumber) (threshold * 3)`, an integer, so the page count is compared
+// as a whole number here too.
+func parallelWorkerLadder(pages float64, minBlocks int64) int {
+	threshold := minBlocks
+	if threshold < 1 {
+		threshold = 1
+	}
+	workers := 1
+	for pages >= float64(threshold*3) {
+		workers++
+		threshold *= 3
+		if threshold > (1<<31-1)/3 { // INT_MAX / 3, upstream's overflow break
+			break
+		}
 	}
 	return workers
 }

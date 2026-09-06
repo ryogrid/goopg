@@ -48,6 +48,13 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 	}, "scan.seq")
 	if parallelWorkers > 0 {
 		cp.parallelLeaderParticipation = leaderParticipates
+		// C-19c: add_partial_path asserts `parent_rel->consider_parallel`
+		// and goopg's refuses instead. A caller asking this entry for a
+		// partial path is vouching for the rel — the production producer
+		// checks the flag itself (addBaseRelPartialPaths) — so the flag is
+		// stamped here, AFTER the serial path, whose parallel_safe stays
+		// whatever the rel said before.
+		rel.ConsiderParallel = true
 		addPartialSeqScanPath(rel, cp, relPages, rel.Rows, numQualOps, parallelWorkers)
 	}
 }

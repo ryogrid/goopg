@@ -135,14 +135,17 @@ type PlannerSettings struct {
 	// `ParallelSettings` carries to the post-planning Gather pass
 	// (parallel.go), duplicated here because the post-pass runs OUTSIDE the
 	// search — the whole defect Phase 5 removes — while a partial path has to
-	// be priced INSIDE it. MinParallelTableScanSize is in BLOCKS
-	// (GUC_UNIT_BLOCKS upstream, guc_tables.c:3727).
+	// be priced INSIDE it. MinParallelTableScanSize and
+	// MinParallelIndexScanSize are in BLOCKS (GUC_UNIT_BLOCKS upstream,
+	// guc_tables.c:3727); the index threshold is C-19c's, read by
+	// `compute_parallel_worker`'s `index_pages` arm for a partial index path.
 	//
 	// Zero MaxParallelWorkersPerGather means "no parallel paths", which is
 	// PG's own reading (`parallelModeOK` requires it > 0, planner.c:339) and
 	// the safe zero value for every hand-built PlannerSettings.
 	MaxParallelWorkersPerGather int
 	MinParallelTableScanSize    int64
+	MinParallelIndexScanSize    int64
 	ParallelLeaderParticipation bool
 }
 
@@ -191,6 +194,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		HashMemMultiplier: hashsize.DefaultHashMemMultiplier,
 		MaxParallelWorkersPerGather: cp.maxParallelWorkersPerGather,
 		MinParallelTableScanSize:    cp.minParallelTableScanBlocks,
+		MinParallelIndexScanSize:    cp.minParallelIndexScanBlocks,
 		ParallelLeaderParticipation: cp.parallelLeaderParticipation,
 	}
 }
@@ -235,6 +239,7 @@ func (ps PlannerSettings) costParams() costParams {
 		geqoSeed:        ps.GeqoSeed,
 		maxParallelWorkersPerGather: ps.MaxParallelWorkersPerGather,
 		minParallelTableScanBlocks:  ps.MinParallelTableScanSize,
+		minParallelIndexScanBlocks:  ps.MinParallelIndexScanSize,
 		parallelLeaderParticipation: ps.ParallelLeaderParticipation,
 	}
 }

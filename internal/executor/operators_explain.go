@@ -2191,16 +2191,23 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		}
 		return parallelPrefix + seqScanLabel(p) + " on " + tname
 	case *optimizer.IndexScan:
+		// C-19c: "Parallel " prefix, same rule and same source as the SeqScan
+		// and IndexOnlyScan arms — the flag stampParallelScan set, never
+		// inferred from sitting under a Gather.
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
+		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
+			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), dname)
 		}
 		// P0-04: print the FROM-clause alias like the SeqScan arm does, so
 		// a self-join's second scan renders `on customer c2` as PG's
 		// select_rtable_names does, not a bare second `on customer`.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("Index Scan using %s on %s %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
+			return fmt.Sprintf("%sIndex Scan using %s on %s %s", parallelPrefix, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
 		}
-		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
+		return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.IndexOnlyScan:
 		// S6 max rewrite: PG's ExplainIndexScanDetails (explain.c:4330-4336)
 		// puts " Backward" between the scan name and " using".
@@ -2385,14 +2392,19 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		}
 		return fmt.Sprintf("%s%s on %s", parallelPrefix, seqScanLabel(p), explainRelName(p.Table, verbose))
 	case *optimizer.IndexScan:
+		// C-19c: verbose-independent prefix, same source as the plain arm.
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
+		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), dname)
+			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), dname)
 		}
 		// P0-04: same alias branch as the verbose arm above.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("Index Scan using %s on %s %s", explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
+			return fmt.Sprintf("%sIndex Scan using %s on %s %s", parallelPrefix, explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
 		}
-		return fmt.Sprintf("Index Scan using %s on %s", explainIndexName(p.Index), explainRelName(p.Table, verbose))
+		return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.IndexOnlyScan:
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
 		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror

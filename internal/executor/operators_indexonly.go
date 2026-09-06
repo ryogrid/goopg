@@ -30,19 +30,12 @@ type indexOnlyScanOp struct {
 	// worker's driving scan; nil for a serial scan, and a nil receiver
 	// claims every block (parallel_scan.go). M0134-0189.
 	pidx *parallelIndexScanState
-	// leafOwned caches this worker's verdict per leaf, lastLeaf* the most
-	// recent one. The shared claim is a sync.Map operation and a range scan
-	// visits ~300 entries per leaf, so consulting it per ENTRY made the
-	// parallel scan 3.5x SLOWER than serial (q16 1.6s -> 5.7s). A btree scan
-	// walks leaves in key order, so the common case is "same block as the
-	// last entry" and costs one comparison. The map is kept so revisiting a
-	// block reuses this worker's OWN verdict rather than re-asking the
-	// shared set, which would answer "already claimed" about our own claim
-	// and silently drop rows.
-	leafOwned     map[storage.BlockNumber]bool
-	lastLeaf      storage.BlockNumber
-	lastLeafOwned bool
-	lastLeafValid bool
+	// leafMemo caches this worker's verdict per leaf and the most recent one
+	// — see leafClaimMemo (parallel_scan.go) for why the shared set is
+	// consulted at most once per block per worker rather than once per entry
+	// (q16 1.6s -> 5.7s otherwise). Shared with the plain index scan since
+	// C-19c so the two partitions cannot drift.
+	leafMemo leafClaimMemo
 	// arrayStyle is the session DateStyle/TimeZone an array element's output
 	// function reads, resolved once in Open. M0119-0006.
 	arrayStyle array.OutputStyle
@@ -461,22 +454,9 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 // but takes no relation lock and never touches the Visibility Map. Best-effort:
 // any error leaves the page untouched rather than failing the read.
 // ownsLeaf reports whether this worker processes entries from leaf block blk,
-// memoising the shared claim. See the leafOwned field for why the shared set is
-// consulted at most once per block per worker rather than once per entry.
+// memoising the shared claim (leafClaimMemo).
 func (o *indexOnlyScanOp) ownsLeaf(blk storage.BlockNumber) bool {
-	if o.lastLeafValid && o.lastLeaf == blk {
-		return o.lastLeafOwned
-	}
-	owned, seen := o.leafOwned[blk]
-	if !seen {
-		owned = o.pidx.claimLeaf(blk)
-		if o.leafOwned == nil {
-			o.leafOwned = make(map[storage.BlockNumber]bool, 64)
-		}
-		o.leafOwned[blk] = owned
-	}
-	o.lastLeaf, o.lastLeafOwned, o.lastLeafValid = blk, owned, true
-	return owned
+	return o.leafMemo.owns(o.pidx, blk)
 }
 
 func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.RelFileNode) {
