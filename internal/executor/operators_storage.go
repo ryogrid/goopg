@@ -1277,6 +1277,18 @@ const seqScanLookaheadMax storage.BlockNumber = 256
 // entirely (pure synchronous reads); values above the cap clamp.
 // Measurement knob only — it is not a GUC and has no PG analogue
 // beyond effective_io_concurrency's role in read_stream.c.
+//
+// E-11 CLOSED 2026-09-06 (decline): the sweep over {0,4,16,64,128} is
+// a five-way A/A at the server default, because refillPrefetchWindow
+// below returns early for a parallel scan and every TPC-H plan at
+// bench settings is parallel. With parallelism forced off the window
+// IS live and depth 4 measures WORSE than depth 0 (-12.1% on a serial
+// 7-query subset, -35.0% on Q6, 2.85x the allocation objects) — the
+// cost is Pool.Prefetch discarding its 8 KiB buffer per hint, not the
+// depth. The knob is kept as the apparatus to re-check that after
+// bufpool's Prefetch is fixed; the default is deliberately unchanged.
+// Numbers + protocol: analysis/executor-refactor/e11-depth-sweep-20260906/,
+// ledger take3-E-11-readstream-declined / -prefetch-discards-buffer.
 var seqScanLookahead = seqScanLookaheadFromEnv(os.Getenv("GOOPG_SEQSCAN_LOOKAHEAD"))
 
 func seqScanLookaheadFromEnv(v string) storage.BlockNumber {

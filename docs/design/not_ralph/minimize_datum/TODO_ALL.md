@@ -1728,19 +1728,36 @@ per arm; values never counts for projection/join-adjacent changes).*
   Worker-sorted slices, leader heap merge. Cost-decision stays with
   planner (permitted-divergence candidate).
   *design: take3 13 §7; gate: ordering tests; pin; serial arm.*
-- [~] **E-11 EX5-04 AIO `ReadStream` decision.** Measurement item with two
-  legal outcomes: wire with depth policy + timing/alloc gate, or
-  ledger-decline (pool hints + workers suffice). Not a commitment.
-  **Instrument landed `c6af781f4`**, decision still OPEN: `seqScanLookahead`
-  is now a package var read once from `GOOPG_SEQSCAN_LOOKAHEAD` (unset →
-  the old const 4 byte-for-byte, `0` disables the hints, `>256` clamps to
-  `aio.MaxReadStreamLookahead`), so the depth policy can be A/B'd without
-  a rebuild. The first depth sweep was taken while two other agents held
-  the bench cluster and is NOT attributable — it must be re-run on a quiet
-  machine before either outcome is recorded. Behaviour-neutral at the
-  default; gated combined with C-19c/E-09a (TPC-H 24/24, plans
-  byte-identical, TPC-DS PASS=95 CKMISMATCH=0).
-  *design: take3 13 §7; gate: A/B or ledger row.*
+- [-] **E-11 EX5-04 AIO `ReadStream` decision.** DECLINED 2026-09-06 —
+  outcome (b), the measurement's own second legal outcome. Re-run on a
+  quiet host with the sole lock on the bench cluster (the 05:15 sweep,
+  taken while two other agents held the machine, is discarded). One
+  binary `9ad4f30d4` (on-disk `04b4178d65eeda2f`), fresh capped server per
+  arm, `GOOPG_ANALYZE_SEED=20260905`, depths {0,4,16,64,128} × 3 reps.
+  **TPC-H values byte-identical across all 15 arms × 24 queries.** Suite
+  medians 138.4 / 136.6 / 141.2 / 142.4 / 134.1 s for d0/d4/d16/d64/d128 —
+  a 6.1% band with **no ordering in depth** (d128 fastest, d64 slowest)
+  against an observed control-vs-control band of 40.2% worst / 12.0%
+  median per query. The knob is structurally inert at the default:
+  `refillPrefetchWindow` returns early for a parallel scan by design (P4,
+  ch. 04 §4.2) and every TPC-H plan at bench settings is parallel
+  (Q6 = `Gather` / Workers Planned: 4 / `Parallel Seq Scan`), so arm A is
+  a five-way A/A. Forcing `max_parallel_workers_per_gather=0` makes the
+  window live and shows more prefetch is **worse**: removing it is −12.1%
+  on a 7-query serial subset and −35.0% on Q6, repetition ranges disjoint;
+  the alloc arm puts `Pool.Prefetch` at 63.8% of allocation objects
+  (2.85× the object count, 9.9× the bytes vs depth 0). PG's own controller
+  would decline here too (`read_stream.c`: no benefit looking ahead past
+  one block when no I/O is necessary; SF=1 is 1.9 GiB against ~19 GiB of
+  page cache), and goopg's `ReadStream` v0 is offset/`File`-based with the
+  bufmgr-aware variant still deferred — so this is a build, not a hookup.
+  Default `seqScanLookahead = 4` deliberately **unchanged** (the win is
+  warm-cache-only and on a path no bench plan takes; the real defect is
+  that `Pool.Prefetch` discards its buffer, filed separately). Instrument
+  `c6af781f4` retained as the re-check apparatus. Artifact
+  `analysis/executor-refactor/e11-depth-sweep-20260906/README.md`; ledger
+  `take3-E-11-readstream-declined` + `take3-E-11-prefetch-discards-buffer`.
+  *design: take3 13 §7; gate: ledger row (decline path).*
 - [!] **E-12 EX3-02 Cut 3 (oversize + teardown) — BLOCKED on E-14.**
   (Record correction 2026-09-04: Cut 2 already LANDED — `68ccd68c3`,
   unit headers 2.002→0.005, TPC-H 24/24 + PP 22/22 + TPC-DS PASS=95;
