@@ -1857,15 +1857,45 @@ rule).*
   because its plans are not byte-identical — it is simply that the
   differences do not pay. Re-measure again after B-15.
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
-- [ ] **C-20f P6-06d retire `GOOPG_NLI_COSTGATE`**, regenerating
-  `planner-flags.env`. Only once the search selects NLI on its own
-  merits (remaining `btcostestimate` + hash terms, per P3-11). Own commit
-  with before/after parity roll-up + timing table.
+- [!] **C-20f P6-06d retire `GOOPG_NLI_COSTGATE` — BLOCKED 2026-09-07 on
+  its own gate: the flip moves TPC-H Q4. Nothing deleted.**
+  Two `estimate-audit -plan-only` captures on ONE private SF=1 clone
+  (port 5541, fresh capped server per arm, one binary, pinned stats),
+  with an A/A control that came back byte-identical. The flag's only live
+  value is `legacy` (the pre-D6.3a stats-blind semi/anti heuristic,
+  `nl_index_join.go:62`), and it moves exactly one query:
+  **Q4 default `Nested Loop Semi Join` over `idx_lineitem_orderkey_fkidx`,
+  cost 8 672.13, 1.60 s — vs `=legacy` `Hash Semi Join` with a Seq Scan on
+  lineitem, cost 105 656.84, 18.30 s (11.4x)**, the Q4 semi-join class
+  07 §3.8 records at 12.5x.
+  Unlike C-06 / C-20c the LOSING arm here is the flag's own off path, so
+  retiring the hatch would not change what production plans — it would
+  delete the only reachable spelling of the slower plan. That is a
+  deliberate exception to the stated gate (08 §9's "or every difference
+  explained and timed"), not a pass of it, and the deletion is
+  irreversible, so it is left to an explicit decision. `planner-flags.env`
+  untouched. Ledger `take3-C-20f-blocked`; artifact
+  `analysis/planner-refactor-take3/c20fg-flag-retirement-20260907/README.md`.
+  Captures are serial (`-serial` defaults true) and therefore blind to a
+  parallelism-only plan change (ledger `take3-plan-capture-is-serial-only`).
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
-- [ ] **C-20g P6-06e retire `GOOPG_PGSHAPED_DP` last**, regenerating
-  `planner-flags.env`. The off path is unretirable while the legacy
-  rewrites are load-bearing (P6-03/P6-04 must-not-delete). Own commit
-  with before/after parity roll-up + timing table.
+- [!] **C-20g P6-06e retire `GOOPG_PGSHAPED_DP` last — BLOCKED 2026-09-07,
+  re-verified on the current tree rather than inherited. Nothing deleted.**
+  The item's own text was checked against the post-C-04c tree (C-04c
+  changed jointree admission) with the same paired-capture method as
+  C-20f, same clone and same binary: **17 of 22 TPC-H queries move**
+  (587 diff lines; changed lines/query Q2 67, Q8 59, Q11 42, Q5 41,
+  Q7 36, Q9 35, Q21 35, Q10 24, Q3 20, Q18 20, Q20 17, Q13 14, Q12 12,
+  Q16 12, Q17 9, Q14 6, Q19 4), and all 17 change top-level cost — e.g.
+  Q8 184 794.76 → 187.96, Q2 33 460.37 → 287 869.59, Q12
+  1 608 955.75 → 76 169.21 (the arms cost different plan spaces, so the
+  off-arm numbers are not a quality claim about the off arm).
+  The flag selects the ENUMERATOR (M0127-P5.9): `=0` is no search,
+  syntactic order and the legacy rule rewrites — a whole second planner,
+  not dead weight. P6-03/P6-04 stay must-not-delete (6.5x / 12.5x,
+  recorded, NOT re-measured here) and C-04c did not disturb that.
+  `planner-flags.env` untouched. Ledger `take3-C-20g-blocked`; artifact
+  `analysis/planner-refactor-take3/c20fg-flag-retirement-20260907/README.md`.
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
 - [ ] **C-20h P6-07 `setrefs` phase + P6-08 `RestrictInfo` caching.**
   `setrefs` only if C-20b shows the executor still needs explicit column
