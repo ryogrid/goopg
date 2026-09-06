@@ -871,10 +871,20 @@ rule).*
   the implementing agent took showed a Q9 shape move; re-captured under the
   pinned seed on both binaries it is 0 lines — the instrument, again.)
   *design: take3 08 §8; gate: take3 09 §5 P5 (PP).*
-- [ ] **C-19c P5-03 parallel eligibility for plain index scans.** Extend
-  `drivingScan` (SeqScan/BitmapHeapScan/IndexOnlyScan + wrappers today;
-  plain IndexScan still missing) so PG's Parallel Index Scan has a
-  counterpart. Closes a `MISSING-NODE` entry.
+- [x] **C-19c P5-03 parallel eligibility for plain index scans.** LANDED
+  `dbb14ca25`. `drivingScan` now admits a plain IndexScan; partial index
+  paths are priced through `compute_parallel_worker`'s `index_pages` arm,
+  which needed `min_parallel_index_scan_size` (PG's 512kB = 64 blocks)
+  plumbed as `PlannerSettings.MinParallelIndexScanSize`.
+  `IndexScan.Parallel` mirrors `Plan.parallel_aware`, stamped by
+  `stampParallelScan` and printed by both EXPLAIN arms; workers claim
+  index LEAF BLOCKS from the shared `parallelIndexScanState` (the
+  plain-scan sibling of M0134-0189). Gated combined with E-09a/E-11:
+  **TPC-H 24/24 MATCH, plans byte-identical, plan-gate exit=0,
+  PLAN-PARITY match=6 shapediff=14 missingnode=2, TPC-DS PASS=95
+  CKMISMATCH=0**. Honest note: no TPC-H plan MOVES to the shape at SF=1
+  under the pinned stats (hence byte-identical plans) — it is reachable
+  and priced, and the two remaining MISSING-NODE entries are other shapes.
   *design: take3 08 §8; gate: take3 09 §5 P5 (PP).*
 - [ ] **C-19d P5-04 `generate_useful_gather_paths`** producing `PathGather`
   and `PathGatherMerge` priced by `cost_gather`/`cost_gather_merge`, with
@@ -1482,8 +1492,8 @@ per arm; values never counts for projection/join-adjacent changes).*
   multiplier that dwarfs everything the minimize-datum bundle proposes on
   the same query). Design:
   `docs/design/executor-e09a-shared-spilling-build/DESIGN.md`.
-- [ ] **E-09a Publish a SPILLING shared build (Variant A, private
-  reload).** `captureSharedBuild` carries an immutable batch descriptor
+- [x] **E-09a Publish a SPILLING shared build (Variant A, private
+  reload).** LANDED `67204579c`. `captureSharedBuild` carries an immutable batch descriptor
   (`nbatch`, `bucketBits`, `nbuckets`, `buildIsLeft`, read-only inner
   files 1..n-1); growth frozen after prebuild (PG's own rule); each
   participant gets a private `hashBatchState` and reloads batch k by
@@ -1497,6 +1507,14 @@ per arm; values never counts for projection/join-adjacent changes).*
   plans byte-identical; acceptance witness = Q9 workers show
   `Seq Scan on orders loops=0`, one Build Time. ~250–470 LOC, HIGH risk
   (silently partial join).*
+  Gate result: every clause above met. Acceptance witness measured —
+  HEAD `Worker 0..4: rows=1500000.00 loops=1`, Build Time 4307.315 ms,
+  Execution 8.85 s; E-09a `rows=0.00 loops=0` in every worker with one
+  `Batches: 4`, Build Time 2978.957 ms, Execution 7.85 s. Combined gate
+  with C-19c/E-11: TPC-H 24/24 MATCH, plans byte-identical, plan-gate
+  exit=0, TPC-DS PASS=95 CKMISMATCH=0, spotcheck RESULT=PASS
+  (Q12=2, Q13=34), `-race` green. Unblocks C-19f and the D-05
+  re-measurement; E-09b still open on top.
 - [ ] **E-09b Load-once-per-batch (Variant B).** `sync.Once` per batch +
   refcount + `ctx.Done()`-aware wait on the shared descriptor — PG's
   `PHJ_BATCH_LOAD`/`FREE` analogue, and what removes the 5× MEMORY
@@ -1511,9 +1529,18 @@ per arm; values never counts for projection/join-adjacent changes).*
   Worker-sorted slices, leader heap merge. Cost-decision stays with
   planner (permitted-divergence candidate).
   *design: take3 13 §7; gate: ordering tests; pin; serial arm.*
-- [ ] **E-11 EX5-04 AIO `ReadStream` decision.** Measurement item with two
+- [~] **E-11 EX5-04 AIO `ReadStream` decision.** Measurement item with two
   legal outcomes: wire with depth policy + timing/alloc gate, or
   ledger-decline (pool hints + workers suffice). Not a commitment.
+  **Instrument landed `c6af781f4`**, decision still OPEN: `seqScanLookahead`
+  is now a package var read once from `GOOPG_SEQSCAN_LOOKAHEAD` (unset →
+  the old const 4 byte-for-byte, `0` disables the hints, `>256` clamps to
+  `aio.MaxReadStreamLookahead`), so the depth policy can be A/B'd without
+  a rebuild. The first depth sweep was taken while two other agents held
+  the bench cluster and is NOT attributable — it must be re-run on a quiet
+  machine before either outcome is recorded. Behaviour-neutral at the
+  default; gated combined with C-19c/E-09a (TPC-H 24/24, plans
+  byte-identical, TPC-DS PASS=95 CKMISMATCH=0).
   *design: take3 13 §7; gate: A/B or ledger row.*
 - [!] **E-12 EX3-02 Cut 3 (oversize + teardown) — BLOCKED on E-14.**
   (Record correction 2026-09-04: Cut 2 already LANDED — `68ccd68c3`,
