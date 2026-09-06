@@ -140,6 +140,14 @@ func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (Schem
 	// — on the Project itself the claim is false by design (searchedtree.go
 	// explains why that is the sharpest argument for the tag).
 	assertSearchedTreeNeedsNoReconcile(n)
+	// C-20b: `boundaryMap` below proves the layout is a PERMUTATION of the
+	// binding concatenation. It cannot say WHICH column sits at a position,
+	// and a valid permutation that assigns the wrong coordinate to a column
+	// is exactly the silent wrong-answer class P6-02 names — the right row
+	// count carrying a neighbouring relation's values. The range table is
+	// what lets that be stated; rangetable.go carries the reasoning and the
+	// abstention list.
+	assertBoundaryColumnIdentity(n, lay, rangeTableFromPath(p))
 	m, fills := boundaryMap(lay, base, width, fill)
 	if len(fills) == 0 && boundaryMapIsIdentity(m) {
 		// The search's order already IS binding order — the common left-deep
