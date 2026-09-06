@@ -188,3 +188,63 @@ func TestSpillBytesIsFarBelowEntryBytesOnNarrowRows(t *testing.T) {
 			"the column mix", narrow, wide)
 	}
 }
+
+// encodedKeyedRowBytes is what WriteRowKeyed emits for one INNER batch frame:
+// the 4-byte frame length, the 4-byte hash, the lane-tagged canonical key, and
+// the payload.
+func encodedKeyedRowBytes(k spillRowKey, row Row) int {
+	buf := appendSpillRowKey(nil, k)
+	buf = appendRowPayload(buf, row)
+	return 4 + 4 + len(buf)
+}
+
+// TestSpillBytesAgreesWithKeyedEncoder covers the writer the original
+// agreement test missed.
+//
+// When E-14 added keyed inner frames ([4B hash][1B tag][key][payload]) the
+// model above stayed correct for OUTER frames and went 9 B/row short on inner
+// ones — and every test here passed, because they all encoded through
+// WriteRowHashed. That is the sibling-pair failure in miniature: pinning one
+// of two writers is not pinning the pair. The int lane is exact by
+// construction; the string lane is under-charged by the key's own length,
+// which is asserted here rather than left to be discovered.
+func TestSpillBytesAgreesWithKeyedEncoder(t *testing.T) {
+	row := Row{NewIntDatum(1), NewIntDatum(2)}
+
+	t.Run("int lane is exact", func(t *testing.T) {
+		got := float64(encodedKeyedRowBytes(spillIntKey(42), row))
+		want := hashsize.SpillInnerBytes(len(row), 0)
+		if got != want {
+			t.Errorf("keyed int-lane frame: encoder writes %.0f B, "+
+				"SpillInnerBytes models %.0f B — the int lane must be exact "+
+				"(1-byte tag + fixed-width int64)", got, want)
+		}
+	})
+
+	t.Run("inner costs exactly SpillKeyBytes more than outer", func(t *testing.T) {
+		outer := float64(encodedRowBytes(row))
+		inner := float64(encodedKeyedRowBytes(spillIntKey(42), row))
+		if inner-outer != hashsize.SpillKeyBytes {
+			t.Errorf("inner frame is %.0f B larger than outer, SpillKeyBytes says %d",
+				inner-outer, hashsize.SpillKeyBytes)
+		}
+	})
+
+	t.Run("string lane under-charges by the key length", func(t *testing.T) {
+		// Documented and deliberate: the planner has no key-width statistic.
+		// This pins the DIRECTION and the size of the error so it cannot grow
+		// silently into something else.
+		for _, key := range []string{"", "abcd", "0123456789abcdef"} {
+			got := float64(encodedKeyedRowBytes(spillStrKey(key), row))
+			want := hashsize.SpillInnerBytes(len(row), 0)
+			shortfall := got - want
+			// tag(1) + uvarint(len)(1 for len<128) + len, against the model's
+			// 9 for the int lane.
+			expect := float64(1+1+len(key)) - float64(hashsize.SpillKeyBytes)
+			if shortfall != expect {
+				t.Errorf("key %q: model is short by %.0f B, expected %.0f B",
+					key, shortfall, expect)
+			}
+		}
+	})
+}

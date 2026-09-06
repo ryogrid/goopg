@@ -185,6 +185,24 @@ const (
 	// for any row of fewer than 128 columns, which is every row goopg
 	// spills in practice; wider rows are under-charged by a byte or two.
 	SpillCountBytes = 1
+
+	// SpillKeyBytes is the extra prefix an INNER (build-side) batch frame
+	// carries over an outer one: appendSpillRowKey's 1-byte lane tag plus
+	// the canonical hash-table key itself (internal/executor/spill.go,
+	// WriteRowKeyed). E-14 added it so a reloaded build row no longer has to
+	// re-evaluate the build key expression to learn its bucket — PG's
+	// ExecHashJoinSaveTuple rationale, except that goopg's buckets are keyed
+	// by canonical form rather than by hash, so the key has to ride along
+	// and the 32-bit hash alone will not do.
+	//
+	// 9 is the INT lane, exact: 1-byte tag + a fixed-width int64. The string
+	// lane is 1 + uvarint(len) + len, so this UNDER-charges a string-keyed
+	// build by the key's own length. That is the unsafe direction for a
+	// spill charge, and it is deliberate only in the sense that the planner
+	// has no key-width statistic to do better with — recorded here rather
+	// than hidden, and it is the first thing to fix if an inner-file page
+	// count is ever measured short.
+	SpillKeyBytes = 9
 )
 
 // SpillBytes returns the ON-DISK size of one spilled row of ncols columns
@@ -218,6 +236,24 @@ func SpillBytes(ncols int, avgVarBytes float64) float64 {
 	}
 	return SpillFrameBytes + SpillCountBytes +
 		float64(ncols)*SpillColumnBytes + avgVarBytes
+}
+
+// SpillInnerBytes is SpillBytes for an INNER (build-side) batch file, whose
+// frames carry the canonical hash-table key ahead of the payload.
+//
+// The two sides of a hash join spill through different writers —
+// WriteRowKeyed for the inner, WriteRowHashed for the outer — so a cost model
+// that charges both through one function is wrong on one of them. It exists as
+// a separate function rather than a bool parameter so a call site has to say
+// which side it means.
+//
+// This is a drift the agreement test did NOT catch when the keyed frame
+// landed, because the test pinned the outer writer: the model stayed correct
+// for the frames it was tested against and went 9 B/row short on the frames it
+// was not. TestSpillBytesAgreesWithKeyedEncoder (internal/executor) now covers
+// both writers, which is what the sibling-pair rule actually requires.
+func SpillInnerBytes(ncols int, avgVarBytes float64) float64 {
+	return SpillBytes(ncols, avgVarBytes) + SpillKeyBytes
 }
 
 // EffectiveMemLimit maps an executor Context.WorkMem (where 0 means "no limit
