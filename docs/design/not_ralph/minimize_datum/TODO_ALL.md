@@ -1089,7 +1089,15 @@ rule).*
   problem with a named reproducible witness. Method note recorded:
   `estimate-audit -plan-only` does NOT apply `MaybeAddGather`, so its
   captures show zero Gathers on HEAD and any plan census taken with it
-  overstates a parallel change.
+  overstates a parallel change. TPC-DS SF0.5 gate at the shipped default:
+  `PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`, and
+  `PLAN-SHAPE queries=99 same=99 changed=0` — the strongest available
+  statement of this slice's inertness when off. That run's NON-BLOCKING
+  status-delta channel reported `total-delta=+28.0%`; it is recorded and
+  explicitly NOT attributed (DESIGN §10.9): the plan channel in the same
+  run shows 99/99 shapes unchanged, the binary carried another agent's
+  concurrent E-14 executor WIP, and the host had just been running this
+  session's TPC-H arms.
   *design: take3 08 §8 + docs/design/planner-c19f-parallel-hashjoin/
   DESIGN.md; gate: take3 09 §5 P5 (PP). Open: `make plan-gate` /
   `pg-plan-parity-diff.py` cannot judge a parallel plan until they read

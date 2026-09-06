@@ -691,3 +691,38 @@ the arm files.
 - **The D-05 re-run** (§9 item 4) — re-derive the build-cost correction at a 1×
   multiplier with the mode on. Q9's join-order finding above is the first thing
   it will have to explain.
+
+### 10.9 TPC-DS SF0.5 gate
+
+`scripts/tpcds-sf05-regression.sh sweep`, run at the shipped default
+(`GOOPG_GATHER_PATHS` unset ⇒ `off`):
+
+```
+PASS=95 (57 ck-verified, 38 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4
+PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0
+STATUS-DELTA: verdict-changes=none
+```
+
+`same=99 changed=0` is the strongest available statement of this slice's
+inertness at its default: over 99 TPC-DS queries the searched plan shape is
+byte-identical to the pre-C-19f baseline, which is what
+`TestPartialHashJoinIsInertUnderTheDefaultMode` claims structurally.
+
+The same run's NON-BLOCKING status-delta channel reports `total-delta=+28.0%`
+against a 09:59 baseline (Q18 2.3×, Q22 2.2×, Q13 2.0×, Q15 2.0×). **That is
+not attributable to C-19f and is not claimed as a result either way**, for three
+independent reasons, and it is written down rather than quietly dropped:
+
+1. C-19f is inert at this arm's flag setting and the plan channel in the very
+   same run confirms it — 99/99 shapes unchanged. A change that moves no plan
+   cannot move a runtime by 28 %.
+2. The binary was built from a working tree carrying another agent's concurrent
+   executor WIP (`join_batch.go`, `spill.go`, `operators_join_agg.go` — the E-14
+   spilled-inner-row work), so the arm is not a clean A/B against its baseline
+   in the first place.
+3. The host was contended: this session's own TPC-H acceptance arms had been
+   running on the same box shortly before, and the ledger's own rule is that an
+   A/B must hold server age and host load constant.
+
+Attributing it would require a re-run on a quiet host from a clean tree, which
+is a separate measurement and belongs to whoever owns the executor WIP.
