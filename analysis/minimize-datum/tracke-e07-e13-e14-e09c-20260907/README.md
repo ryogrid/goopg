@@ -251,3 +251,34 @@ the same place C-13a independently put it (median sort input 145 rows, 0 of
 
 So the sort half does not rescue E-13 either: the sites with the biggest
 proportional residual are the ones with almost no rows.
+
+---
+
+## Values check on the private clone
+
+The third arm is a full 22-query `-digest` run, so it doubles as a values check
+that the private clone and the instrumented tree still compute what HEAD
+computes:
+
+```
+tpch-runner -diff bench/tpch/baseline-digests.txt tracke-census3.arm.txt
+SUMMARY: 23 MATCH, 1 STATUS-DIFF
+```
+
+The one non-match is **Q9 exceeding the 600 s per-query budget** — in both
+capture arms, under a peer agent's concurrent sweep at load 25–30. It is a
+budget-marginal cell in this project's own D6 taxonomy, not a value
+difference: Q9 got far enough to build its hash tables in both runs (its
+retained-row census lines are present, including the 6,001,255 × 16 site).
+Every other label, including all four spilling ones, is byte-identical to the
+committed baseline.
+
+## Files
+
+| file | what |
+|---|---|
+| `instruments.patch` | the two temporary instruments (retention census, cooperative-stall counters) and the E-09c harness, as applied to HEAD. **Reverted before commit** — the executor carries no behaviour change from this session beyond E-07's benchmark. |
+| `census_aggregate.py` | joins `(width, bound)` Build sites to retained row counts by plan node and reports the dead-cell totals |
+| `private-arm.sh` | port-5535 / private-clone variant of `scripts/tpch-acceptance-arm.sh` |
+| `tracke-census{,2,3}.arm.txt` | the three arm logs (Q1–Q8 at `GOGC=off`; Q9–Q22 at `GOGC=100`; full 22 with the sort counter) |
+| `e09c-stall-scaling-3reps.txt` | raw E-09c producer/consumer stall log, 3 reps × 2 distributions × 3 producer counts |
