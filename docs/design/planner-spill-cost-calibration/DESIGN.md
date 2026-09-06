@@ -185,12 +185,50 @@ The negative outcomes, any of which is a complete deliverable:
 
 ## 6. Probes required before any cut
 
-**6.1 Does the sort actually spill on this suite?** Instrument
-`sortOp`'s flush path and run the TPC-H suite at SF=1. If nothing ever
-reaches 256 MiB, then §3.2's under-charge is real but inert on this
-corpus, Cut 2's ordering drops, and the whole item's expected value
-falls sharply — say so and re-rank. Also run it at the E-16 session
-`work_mem` values, where the merge shapes it complains about appear.
+**6.1 Does the sort actually spill on this suite? — PARTLY ANSWERED
+STATICALLY, 2026-09-06: no, and Cut 2 is therefore inert at the current
+`work_mem`.**
+
+`costSortRun` has exactly ONE production caller, `sortPathFor`
+(`joinpathsmerge.go:441`), so it prices **merge-join input sorts only**.
+Reading the plan capture taken at the E-09a/C-19c/E-11 gate, the TPC-H
+suite at SF=1 contains two Merge Joins (Q12 and, nested under Q18's
+semi-join, the same shape), and **both take index-ordered inputs**:
+
+```
+->  Merge Join  (cost=0.75..1608261.68 rows=6001255 width=168)
+      Merge Cond: (orders.o_orderkey = lineitem.l_orderkey)
+      ->  Index Scan using orders_pk on orders            (rows=1500000)
+      ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem
+```
+
+A startup cost of 0.75 is the tell — there is no Sort beneath either.
+So **zero merge-join input sorts exist in the current plan set**, and
+§3.2's trigger error, though real, decides nothing on this corpus today.
+
+Consequences, and they re-rank the item:
+
+- **Cut 2 drops behind Cut 1 and Cut 3.** It remains a genuine fidelity
+  defect and must still be fixed before B-13 lowers `work_mem` — that is
+  precisely when merge shapes with sorts appear — but it cannot be
+  measured on TPC-H as it stands, so it must be gated on a forced shape
+  or on the reduced-`work_mem` arm, never on the suite total.
+- The dynamic half of this probe is still required, at the **E-16
+  session `work_mem` values**, where the merge shapes E-16 complains
+  about do appear. That is where Cut 2 becomes measurable.
+- The one-caller fact also means Cut 1 (§3.3, `avgVarBytes=0`) has a
+  correspondingly small blast radius — one call site, merge-join sorts
+  only — which makes it cheap to land and cheap to revert.
+
+**6.1b — the larger finding this probe turned up.** Q18's top-level
+`Sort (rows=1565307 width=204)`, the biggest sort in the suite and part
+of the suite's slowest query, is **not priced by any cost function at
+all**: goopg has no upper-rel `PathSort`, so `costSortRun` never sees it.
+That is TODO_ALL **C-12**'s subject, not this item's, and it is recorded
+here because it means "goopg's sort cost model" currently describes a
+strictly smaller thing than it appears to. Any spill calibration reasoned
+from suite-wide sort behaviour would be reasoning about nodes the model
+does not price. Referred to the C-11/C-12/C-13 design.
 
 **6.2 Measure the real batch-file bytes per row.** §3.1 asserts a
 direction but no magnitude. Compare `hashsize.EntryBytes(ncols,
