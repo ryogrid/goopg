@@ -506,10 +506,11 @@ func sjiQualRelids(e parser.Expr, sc *sjiScope, item int) (RelSet, bool) {
 // collectNonNullableTableNames (reduce_outer_joins.go:268 — comparison fast
 // path plus catalog proisstrict, conservative elsewhere), translated from
 // table names to leaf bits through the scope. The translation can only
-// UNDER-approximate strict (unqualified refs are absent from the collector;
-// unmapped names are ignored), and under-strict is the safe direction:
-// LhsStrict false and the preserve-ordering arms firing are what withhold
-// reorderings, never what permit them.
+// UNDER-approximate strict (unresolvable or ambiguous refs are skipped by the
+// collector; unmapped names are ignored), and under-strict is the safe
+// direction: LhsStrict false and the preserve-ordering arms firing are what
+// withhold reorderings, never what permit them. Unqualified refs owned by
+// exactly one scope table resolve through the catalog (unique ownership).
 func sjiClauseRelids(qual parser.Expr, sc *sjiScope, item int) (clause, strict RelSet, ok bool) {
 	clause, ok = sjiQualRelids(qual, sc, item)
 	if !ok {

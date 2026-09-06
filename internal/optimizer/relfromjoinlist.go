@@ -72,6 +72,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // joinlistProblem is everything one statement's joinlist recursion reads. It is
@@ -450,6 +451,104 @@ func sjInfosInItemSpace(list []*SpecialJoinInfo, items []joinlistRel) ([]*Specia
 // must exist before `addBaseRelIndexPaths`, because that is the list an index
 // path is parameterised BY (`create_index_paths` after `deconstruct_jointree`,
 // allpaths.c:191), and every initial rel must already carry its cheapest slots
+// leafIsDerivedInput reports whether a statement leaf is a derived
+// (statistics-less) input: a CTE scan, a recursive CTE's worktable, a
+// FROM-subquery, or a function scan. It tests the leaf's NODE TYPE, and it
+// exists because the obvious test — `relInfos[leaf].table == nil` — is WRONG
+// for the case that matters most. `with.go` hands every CTE binding a
+// synthesised `&catalog.Table{Name: cte.Name, Columns: cols}` so that column
+// resolution works, and that table has no statistics behind it. To the
+// `table == nil` test a CTE scan therefore looks like a base relation, and
+// TPC-DS Q78's three CTE leaves classified as `derived=[false false false]`
+// (traced 2026-09-06): the firewall below was reached with both LEFT sjinfos
+// in hand and declined nothing, and the search ran three rows=1 leaves into
+// an epsilon Nested Loop victory (3.07 vs Hash 3.09) — 15 s became a 327 s
+// timeout. The `table == nil` arm is kept as a fallback for a leaf that has
+// no binding table at all.
+func leafIsDerivedInput(scan Node, info baseRelInfo) bool {
+	// A statement leaf reaches the search WRAPPED: a CTE output with a
+	// pushed-down predicate is `*Filter{Child: *CTEScan}`, not a bare
+	// `*CTEScan`, and a type switch on the top node sees only the Filter.
+	// That is exactly how TPC-DS Q78's three leaves escaped the first
+	// version of this classifier (traced 2026-09-06: `scan=*optimizer.Filter
+	// table=true` for all three, `derived=[false false false]`). Descend
+	// through single-child wrappers to the scan underneath, then classify.
+	for {
+		switch x := scan.(type) {
+		case *Filter:
+			scan = x.Child
+			continue
+		case *Project:
+			scan = x.Child
+			continue
+		}
+		break
+	}
+	switch scan.(type) {
+	case *CTEScan, *WorkTableScan:
+		return true
+	}
+	return info.table == nil
+}
+
+// problemPairsOuterWithDerived reports whether any OUTER hand in sjis
+// (already remapped to this problem's item space by sjInfosInItemSpace)
+// touches an item whose STATEMENT leaves include a derived (table-less)
+// FROM item — a CTE scan, FROM-subquery, or function scan. Derived inputs
+// carry no statistics, so an outer join over them is the catastrophic-choice
+// shape C-04a §4 names and the problem must decline (see the firewall in
+// searchOneProblem).
+//
+// The check reads through to statement leaves (prob.relInfos[leaf].table)
+// rather than trusting items[i].info.table: a searched sub-problem's rel is
+// table-less by construction, and declining on that would refuse every
+// nested outer join, including base-only ones. Syn (not Min) sides are
+// tested — Min can narrow to one leaf of a multi-leaf item, and the question
+// is whether the join READS a derived input, not whether the ordering
+// constraint names it.
+func problemPairsOuterWithDerived(sjis []*SpecialJoinInfo, items []joinlistRel, prob *joinlistProblem) bool {
+	if len(sjis) == 0 || prob == nil {
+		return false
+	}
+	derived := make([]bool, len(items))
+	anyDerived := false
+	for i, it := range items {
+		for leaf := it.lo; leaf < it.hi; leaf++ {
+			if leaf < 0 || leaf >= len(prob.relInfos) {
+				continue
+			}
+			if leafIsDerivedInput(prob.scans[leaf], prob.relInfos[leaf]) {
+				derived[i] = true
+				anyDerived = true
+				break
+			}
+		}
+	}
+	if !anyDerived {
+		return false
+	}
+	for _, sj := range sjis {
+		if sj == nil {
+			continue
+		}
+		switch sj.Jointype {
+		case parser.JoinLeft, parser.JoinRight, parser.JoinFull:
+		default:
+			continue
+		}
+		touched := sj.SynLefthand | sj.SynRighthand
+		for i := range items {
+			if !derived[i] {
+				continue
+			}
+			if touched&(1<<uint(i)) != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // before `joinSearch` compares anything.
 func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction float64) (joinlistRel, error) {
 	lo, hi := items[0].lo, items[len(items)-1].hi
@@ -485,6 +584,31 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	sjis, err := sjInfosInItemSpace(prob.joinInfoList, items)
 	if err != nil {
 		return joinlistRel{}, err
+	}
+	// C-04a firewall (Q78): a problem that pairs an OUTER hand with a
+	// derived (table-less) input declines. Derived inputs — CTE scans,
+	// FROM-subqueries, function scans — carry no statistics (B-06's
+	// CTE-output synthesis is inert; a searched sub-problem's rel is
+	// table-less by construction too, but the check below reads through
+	// to STATEMENT leaves so those never trigger it), so their rows are
+	// defaults and guards. The search's algorithm comparison on those
+	// defaults is the catastrophic-choice shape C-04a §4 names: Q78's
+	// outer problem costed Nested Loop 3.07 against Hash 3.09 with every
+	// path at rows=1 (the surviving IS NULL priced from the base
+	// 	column's stanullfrac=0 — rowest A3), and the epsilon victory ran
+	// Nested Loop with a Join Filter over full multi-year CTE outputs
+	// (15 s Hash shape → 327 s timeout). C-04a's §4 floor
+	// (applyOuterJoinRowFloor) cannot see it: the floor is the
+	// preserved side's rows, and the lie is IN the preserved side's
+	// rows. Declining falls back to the syntactic tree (03 §4.2), whose
+	// legacy rewrites hash outer joins without a cost comparison — the
+	// pre-C-04a shape. Base-leaf outer problems (Q72) are unaffected;
+	// inner-only problems over derived inputs are unaffected (their
+	// rows=1 is A4-expected and values-passing). Resume: lift when B-06
+	// wires CTE-output stats (TODO_ALL B-06 step 4).
+	if problemPairsOuterWithDerived(sjis, items, prob) {
+		traceSeamDecline("outer-over-derived", len(prob.bindings), len(items))
+		return joinlistRel{}, fmt.Errorf("join search: problem pairs an outer join with a derived input, which carries no statistics")
 	}
 	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, sjis)
 	if err != nil {

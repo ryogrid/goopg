@@ -40,8 +40,12 @@ func reduceOuterJoins(from []parser.FromExpr, where parser.Expr, cat catalog.Cat
 	tableMap := buildTableMap(from, cat)
 	upperNN := collectNonNullableTableNames(where, tableMap, cat)
 	// Collect forced-null table names from WHERE (IS NULL predicates).
-	// These drive LEFT→ANTI demotion at S9.3.
-	upperFN := collectForcedNullTableNames(where)
+	// These drive LEFT→ANTI demotion at S9.3. Unqualified refs are
+	// resolved through tableMap+cat (unique column ownership), so a
+	// CTE-shaped `WHERE wr_order_number IS NULL` attributes to web_returns
+	// exactly as PG's analyzer would (varno assignment); ambiguous or
+	// unresolvable refs are skipped (conservative = old behavior).
+	upperFN := collectForcedNullTableNames(where, tableMap, cat)
 	for i := range from {
 		applyDemotion(&from[i], upperNN, upperFN, tableMap, cat)
 	}
@@ -121,7 +125,7 @@ func applyDemotion(item *parser.FromExpr, upperNN, upperFN map[string]bool, tabl
 		// propagate to subsequent joins; for outer joins they only apply
 		// within the nullable side (which may still be null-extended).
 		localNN := collectNonNullableTableNames(j.On, tableMap, cat)
-		localFN := collectForcedNullTableNames(j.On)
+		localFN := collectForcedNullTableNames(j.On, tableMap, cat)
 
 		// ---- demotion check ----
 		switch j.Type {
@@ -293,10 +297,10 @@ func collectNonNullableWalk(e parser.Expr, topLevel bool, tableMap map[string]*c
 	switch x := e.(type) {
 	case *parser.BinaryOp:
 		if isStrictOp(x.Op, x.Left, x.Right, tableMap, cat) {
-			for _, name := range collectColumnRefTableNames(x.Left) {
+			for _, name := range collectColumnRefTableNames(x.Left, tableMap, cat) {
 				result[name] = true
 			}
-			for _, name := range collectColumnRefTableNames(x.Right) {
+			for _, name := range collectColumnRefTableNames(x.Right, tableMap, cat) {
 				result[name] = true
 			}
 		}
@@ -315,7 +319,7 @@ func collectNonNullableWalk(e parser.Expr, topLevel bool, tableMap map[string]*c
 	case *parser.IsNullExpr:
 		// IS NOT NULL: the tested column must be non-null.
 		if x.Negated {
-			for _, name := range collectColumnRefTableNames(x.Operand) {
+			for _, name := range collectColumnRefTableNames(x.Operand, tableMap, cat) {
 				result[name] = true
 			}
 		}
@@ -375,10 +379,15 @@ func resolveExprType(e parser.Expr, tableMap map[string]*catalog.Table, cat cata
 	if !ok {
 		return 0
 	}
-	if colRef.Table == "" {
-		return 0
-	}
 	tbl, ok := tableMap[colRef.Table]
+	if !ok && colRef.Table == "" {
+		// Unqualified ref: resolve through unique column ownership
+		// (same rule as collectColumnRefTableNamesWalk).
+		var owner string
+		if owner, ok = resolveUnqualifiedOwner(colRef.Column, tableMap, cat); ok {
+			tbl, ok = tableMap[owner]
+		}
+	}
 	if !ok {
 		return 0
 	}
@@ -449,12 +458,21 @@ func isStrictCompareOp(op parser.OpCode) bool {
 
 // collectColumnRefTableNames extracts table names from all ColumnRef nodes in
 // an expression tree. Returns deduplicated names.
-func collectColumnRefTableNames(e parser.Expr) []string {
+//
+// Qualified refs record their qualifier. Unqualified refs are resolved through
+// unique column ownership over tableMap (a name/alias → *catalog.Table map as
+// built by buildTableMap): the ref attributes to the scope table iff exactly
+// one scope table owns the column. This mirrors what PG's analyzer does when
+// it assigns varnos (an unqualified column owned by exactly one RTE resolves
+// there; owned by zero or two+ is an error) — except errors become silent
+// skips, which is the conservative direction (fewer demotions, never a wrong
+// answer). tableMap or cat nil → unqualified refs are skipped (old behavior).
+func collectColumnRefTableNames(e parser.Expr, tableMap map[string]*catalog.Table, cat catalog.Catalog) []string {
 	if e == nil {
 		return nil
 	}
 	m := make(map[string]bool)
-	collectColumnRefTableNamesWalk(e, m)
+	collectColumnRefTableNamesWalk(e, m, tableMap, cat)
 	names := make([]string, 0, len(m))
 	for name := range m {
 		names = append(names, name)
@@ -462,7 +480,35 @@ func collectColumnRefTableNames(e parser.Expr) []string {
 	return names
 }
 
-func collectColumnRefTableNamesWalk(e parser.Expr, dst map[string]bool) {
+// resolveUnqualifiedOwner reports the tableMap key of the single scope table
+// owning column, or false when cat/tableMap is unavailable or ownership is
+// not unique (zero or ambiguous). Uniqueness is order-independent, so map
+// iteration order cannot affect the result.
+func resolveUnqualifiedOwner(column string, tableMap map[string]*catalog.Table, cat catalog.Catalog) (string, bool) {
+	if cat == nil || len(tableMap) == 0 || column == "" {
+		return "", false
+	}
+	owner := ""
+	count := 0
+	for key, tbl := range tableMap {
+		if tbl == nil {
+			continue
+		}
+		if _, ok := cat.LookupColumn(tbl, column); ok {
+			owner = key
+			count++
+			if count > 1 {
+				return "", false
+			}
+		}
+	}
+	if count != 1 {
+		return "", false
+	}
+	return owner, true
+}
+
+func collectColumnRefTableNamesWalk(e parser.Expr, dst map[string]bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) {
 	if e == nil {
 		return
 	}
@@ -470,17 +516,19 @@ func collectColumnRefTableNamesWalk(e parser.Expr, dst map[string]bool) {
 	case *parser.ColumnRef:
 		if x.Table != "" {
 			dst[x.Table] = true
+		} else if owner, ok := resolveUnqualifiedOwner(x.Column, tableMap, cat); ok {
+			dst[owner] = true
 		}
 	case *parser.BinaryOp:
-		collectColumnRefTableNamesWalk(x.Left, dst)
-		collectColumnRefTableNamesWalk(x.Right, dst)
+		collectColumnRefTableNamesWalk(x.Left, dst, tableMap, cat)
+		collectColumnRefTableNamesWalk(x.Right, dst, tableMap, cat)
 	case *parser.UnaryOp:
-		collectColumnRefTableNamesWalk(x.Operand, dst)
+		collectColumnRefTableNamesWalk(x.Operand, dst, tableMap, cat)
 	case *parser.IsNullExpr:
-		collectColumnRefTableNamesWalk(x.Operand, dst)
+		collectColumnRefTableNamesWalk(x.Operand, dst, tableMap, cat)
 	case *parser.FuncCall:
 		for _, arg := range x.Args {
-			collectColumnRefTableNamesWalk(arg, dst)
+			collectColumnRefTableNamesWalk(arg, dst, tableMap, cat)
 		}
 	}
 }
@@ -493,11 +541,11 @@ func collectColumnRefTableNamesWalk(e parser.Expr, dst map[string]bool) {
 // Only top-level IS NULL and AND are examined: PG's find_forced_null_vars only
 // checks NullTest IS_NULL at the top level and AND combinations, but does not
 // descend into OR, NOT, or function calls.
-func collectForcedNullTableNames(e parser.Expr) map[string]bool {
-	return collectForcedNullWalk(e, true)
+func collectForcedNullTableNames(e parser.Expr, tableMap map[string]*catalog.Table, cat catalog.Catalog) map[string]bool {
+	return collectForcedNullWalk(e, true, tableMap, cat)
 }
 
-func collectForcedNullWalk(e parser.Expr, topLevel bool) map[string]bool {
+func collectForcedNullWalk(e parser.Expr, topLevel bool, tableMap map[string]*catalog.Table, cat catalog.Catalog) map[string]bool {
 	if e == nil {
 		return nil
 	}
@@ -508,7 +556,7 @@ func collectForcedNullWalk(e parser.Expr, topLevel bool) map[string]bool {
 		// IS NULL (not IS NOT NULL): the column IS forced to be null if the
 		// clause passes.
 		if !x.Negated {
-			for _, name := range collectColumnRefTableNames(x.Operand) {
+			for _, name := range collectColumnRefTableNames(x.Operand, tableMap, cat) {
 				result[name] = true
 			}
 		}
@@ -517,8 +565,8 @@ func collectForcedNullWalk(e parser.Expr, topLevel bool) map[string]bool {
 		// AND: union of children (at top level only — PG's
 		// find_forced_null_vars does not descend into OR).
 		if x.Op == parser.OpAnd && topLevel {
-			left := collectForcedNullWalk(x.Left, true)
-			right := collectForcedNullWalk(x.Right, true)
+			left := collectForcedNullWalk(x.Left, true, tableMap, cat)
+			right := collectForcedNullWalk(x.Right, true, tableMap, cat)
 			for name := range left {
 				result[name] = true
 			}

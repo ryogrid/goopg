@@ -589,37 +589,37 @@ rule).*
 - [x] **C-03b P3-03 jointype-aware `addPaths` (inert).** Landed 2026-09-06: `joinRelBuilder.addPaths` gains the matched `sjinfo` (nil-safe), passed POST-`reversed`-swap to BOTH directions; `jointypeForDirection` (the `populate_joinrel_with_paths` switch, joinrels.c:906-1029, reduced to one direction) decides per call — legality is an ORIENTATION question, not a jointype one, which is why PG gives its two `add_paths_to_joinrel` calls different jointypes (JOIN_LEFT/JOIN_RIGHT at :932-939). OUTER (LEFT/RIGHT/FULL): legal iff outer covers MinLefthand and inner MinRighthand; the reversed direction is DECLINED rather than emitted as PG's JOIN_RIGHT/JOIN_RIGHT_SEMI/JOIN_RIGHT_ANTI (deliberate narrowing — withholding a path cannot produce a wrong answer). SEMI/ANTI: nestloop-only (both merge arms, the serial hash arm and its partial twin decline as one block — goopg has no `create_unique_path` analogue and a keyed SEMI would MULTIPLY rows). `jointype` threaded into every path producer the way PG threads it into `try_*_path`. Inert: `joinIsLegal` returns nil for every pair the search reaches today, so every production call takes the `sjinfo == nil` arm unchanged. Gates: 5 new adjudications (`joinpathsjointype_test.go`: orientation table, inner positive control stated on DPPATH OFFERED not on the pruned pathlist, OUTER legal-direction-only, SEMI/ANTI nestloop-only incl. PartialPathlist, seam sjinfo+swap, DPPATH OFFERED/ACCEPTED per jointype) + optimizer/executor suites + units precommit exit 0. *design: C-03 DESIGN.md §4 C-03b.*
 - [x] **C-03c P3-03 `createPlanNode` jointype arms (inert).** Landed 2026-09-06: all five join arms (hash, merge, plain NL, NLI, bitmap-NLI) read `Path.Jointype` through `planJoinTypeFor` — the SINGLE meeting point of `parser.JoinType` and `optimizer.JoinType`, so a jointype cannot reach a plan by one route and not another; SEMI/ANTI publish left-only SCHEMA and LAYOUT via `joinInputs.publishedSchema`/`publishedLayout` (both halves: `Join.Output` narrows on its own but the layout is returned separately and would misalign every parent, and `NestedLoopIndexJoin.Output` returns the field RAW → executor XX000). FULL DECLINED at path generation in `jointypeForDirection` (empty pathlist → `joinSearch` error → syntactic-shape fallback, the same outcome the pre-C-03 tree reaches), with `planJoinTypeFor` panicking as the second line; ledger row `C-03c FULL-join-search-decline` (resume point = PG's JOIN_FULL arm joinrels.c:938-963 + `useallclauses` joinpath.c:1849-1852). Rel-level sizing (`NCols`/`AvgVarBytes`/`ColVarBytes`/`ConsiderParallel`) deliberately stays at the concatenation: a relset-keyed singleton cannot hold a jointype (C-03a's carrier decision), and over-wide beats under-wide for hash sizing — C-05 installs the real switch. Gates: 4 new searched-shape units (`createplanjointype_test.go`, arms forced through by hand — "an unwinnable path is an untested path") + optimizer/executor suites + units precommit exit 0 + **take3 R8 zero-drift measured against a pre-C-03 binary (f11d4fbcd): TPC-H 24/24 values identical (colsig/ordered/unordered/rows), serial plan capture BYTE-IDENTICAL, PLAN-PARITY 6/14/2 unchanged, `make plan-gate` exit 0**. *design: C-03 DESIGN.md §4 C-03c.*
 - [x] **C-03d P3-03 enum-trace DPPATH evidence.** Landed 2026-09-06: `joinsearchjointype_trace_test.go` drives the SEARCH (not the arm) on a spine-shaped fixture — 3 rels, a LEFT/SEMI SJI with min LHS {a} / min RHS {b} — and adjudicates BOTH provenance channels: DPTRACE through the production reader `estimateaudit.ParseEnumTrace` (LEFT pairing `{a} | {b}` OFFERED at its level; `{b} | {c}` recorded as DECLINED reason=`illegal`, not merely absent — the ambiguity `spine.go` closes on), and DPPATH (paths over relids {0,1} carry `jointype=left`/`semi`, OFFERED and ACCEPTED; for SEMI the keyed producers are absent and `join.nestloop` present, asserted on the trace rather than the pruned pathlist). Plus the DESIGN §5 inertness MECHANISM pin: with the full `joinInfoList` handed unfiltered to a prefix problem, `joinIsLegal` returns `(nil, false, nil)` for every prefix-internal pair via `join_is_legal`'s RHS-overlap fast path (joinrels.c:386-387) — which is *why* C-03a..d are inert, not merely evidence that they are. Gates: 3 new fixtures + optimizer/executor suites + units precommit exit 0. *design: C-03 DESIGN.md §4 C-03d.*
-- [!] **C-04a P3-04 LEFT admission (Q72 witness).** Spine deletion +
-  **BLOCKED 2026-09-06 — landed `f045f545c`, then the TPC-DS SF0.5 gate
-  caught TWO regressions TPC-H is structurally blind to.** (1) **Q72
-  WRONG ANSWER**: 84 rows against the oracle's 100 — both `Nested Loop
-  Left Join`s became plain `Nested Loop`s, i.e. the admitted LEFT links
-  lost their jointype and the ON-condition surfaced as a post-join
-  `Filter` on an INNER join. Q72 is this item's own named witness.
-  (2) **Q78 15 s → >328 s TIMEOUT**: the LEFT joins survive but
-  `d_year = 1998` was DROPPED from the `date_dim` scan (149 → 73,049
-  rows, unfiltered), so the per-qual delay misclassified a
-  non-nullable-side restriction as one that must rise above the outer
-  join. TPC-H values were 24/24 and its one plan move (Q13 Hash Left →
-  Merge Left, −14%, better estimate) is good — which is exactly why the
-  SF0.5 gate is mandatory for a planner item and not a formality. Fix
-  landed as `fb65502` (taken over from the interrupted agent): (1) Q72 —
-  `sjInfosInItemSpace` remaps statement-leaf SJI hands into each
-  problem's item coordinates once per problem (the collapse-limit split
-  made a 4-item problem where MinRighthand named un-overlappable leaf
-  bits, so `joinIsLegal` never fired); the C-08 derivation now consumes
-  the remapped list (shift-by-lo removed); (2) Q78 —
-  `deriveOuterLinkConstants` (`reconsider_outer_join_clauses`) derives
-  nullable-side `ws_sold_year = 1998` from preserved-side constants so
-  `d_year = 1998` survives inside the CTE body. Gates re-run to unblock:
-  optimizer suite green; SF0.5 Q72 values + Q78 timing pending.
-  pinning relax + refusal deletion + leaf-flatten + lateral descend +
-  per-qual delay + LEFT sizing floor, for LEFT links end to end.
-  Implementation starts after C-03a/b/c land (jointype paths).
-  **Unblocks P1-18 (C-05).** After B-01.
-  *design: `docs/design/planner-c04-single-problem/DESIGN.md` (reviewed
-  APPROVE; vertical slices); gate: PP both suites + behavioral Q72 pin
-  + enum-trace + R8 values-diff both suites + timing.*
+- [x] **C-04a P3-04 LEFT admission (Q72 witness).** LANDED `f045f545c`,
+  then FIXED TWICE after the TPC-DS SF0.5 gate caught what TPC-H cannot
+  see (TPC-H was 24/24 by values and its one plan move, Q13, was a −14%
+  improvement). **(1) Q72 WRONG ANSWER**, 84 rows vs oracle 100: the
+  admitted LEFT links lost their jointype through the collapse-limit
+  sub-problem split and planned as INNER. Fixed `fb6550266` (per-problem
+  SJI remap), pinned `TestLeftLinkSurvivesCollapseSplit`. **(2) Q78 15 s →
+  327 s TIMEOUT**: the search admitted `ss LEFT JOIN ws LEFT JOIN cs` with
+  every path at rows=1 and took an epsilon Nested Loop (3.07 vs Hash 3.09)
+  over three full CTE outputs. The `problemPairsOuterWithDerived` firewall
+  exists to decline exactly that and did not fire: its classifier saw the
+  `*Filter` wrapping each CTE output, not the `*CTEScan` beneath, and
+  `with.go`'s synthesised non-nil table defeats `table == nil` anyway.
+  Fixed by classifying on node type AND descending through `*Filter`/
+  `*Project` — reached only after three wrong hypotheses, each plausible
+  from the code and each refuted by one trace line. Pinned
+  `…CTEOuter` + `…WrappedCTE`, both mutation-checked. Q78 → **19 s,
+  checksum-verified**. Full gates on the final tree: TPC-H **24/24 MATCH**
+  by values; **same-session A/B −0.8%** with Q13 **−17.4%** and every
+  other query within ±1.5% (a +5.4% read against a 3-hour-old baseline was
+  entirely host drift — the unchanged pre-C-04a binary itself moved +6.3%
+  over that span; contaminated and stale arms are recorded, not quoted);
+  TPC-DS SF0.5 **PASS=95 MISMATCH=0 CKMISMATCH=0 TIMEOUT=0**, plan shapes
+  99/99, total delta +0.0%; `make plan-gate` 22/22 structural and
+  `MODE=costs`, re-pinned `c04a-fixed-20260906` (diff vs prior pin = the
+  Q13 hunk only); optimizer + executor suites green.
+  Ledger `take3-C-04a-Q72-jointype-loss`, `take3-C-04a-Q78-firewall-classifier`.
+  What C-04b/c inherit: the rows=1 CTE estimate (rowest A3) is NOT fixed,
+  only firewalled; SEMI/ANTI remain nestloop-only (a capability gap, not
+  parity); the reversed OUTER direction is declined so LEFT joinrels carry
+  one orientation.
 - [ ] **C-04b P3-04 RIGHT admission.** Same vertical cut mirrored.
   *design: C-04 DESIGN.md §5 C-04b; gate as C-04a + DPPATH.*
 - [ ] **C-04c P3-04 below-inner + non-first-comma LEFT links.**
