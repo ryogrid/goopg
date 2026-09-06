@@ -1,0 +1,748 @@
+# C-13a Probe P2 — plan excerpts: every Sort node in goopg's TPC-DS SF0.5
+# EXPLAIN ANALYZE capture, with the Limit above it (if any) and its input child.
+# Derived from the full capture by analysis/.../census.py; the full 516 KB
+# capture is a run artefact and is not committed (see README 'Reproducing').
+# C-13a Probe P2 — goopg EXPLAIN ANALYZE census, TPC-DS SF0.5 (:65437)
+# date: 2026-09-06T10:46:28+09:00
+# binary: /home/ryo/work/goopg/goopg/tmp/goopg-c13a-base sha=76740bed9b6075c7
+# commit: 00688e96c docs(planner): spill-cost §6.1b — close the loop with the Phase-4 design
+# timeout: 300s/query
+
+===== Q1 =====
+ Limit  (cost=121.02..121.18 rows=8 width=1076) (actual time=2879.169..2879.204 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=7823.87..7826.79 rows=292 width=40) (actual time=1009.263..1016.905 rows=25581.00 loops=1)
+   ->  Sort  (cost=121.02..121.10 rows=8 width=1076) (actual time=2879.169..2879.204 rows=100.00 loops=1)
+         Sort Key: customer.c_customer_id
+         Sort Method: quicksort  Memory: 26210kB
+         ->  Hash Join  (cost=9.28..120.90 rows=8 width=1076) (actual time=2441.107..2869.668 rows=25329.00 loops=1)
+
+===== Q2 =====
+   ->  Sort  (cost=20.10..21.21 rows=111 width=456)
+         Sort Key: d_week_seq1
+         Worker 0:  actual time=17.655..38.386 rows=1344.00 loops=1
+         Worker 1:  actual time=17.860..70.497 rows=1169.00 loops=1
+         Sort Method: quicksort  Memory: 877kB
+         Worker 0:  Sort Method: quicksort  Memory: 1008kB
+
+===== Q3 =====
+ Limit  (cost=311.37..311.39 rows=1 width=72) (actual time=111.371..111.378 rows=31.00 loops=1)
+         Sort Key: d_year, sum DESC, i_brand_id
+         Sort Method: quicksort  Memory: 7kB
+         ->  HashAggregate  (cost=311.36..311.37 rows=1 width=72) (actual time=111.345..111.360 rows=31.00 loops=1)
+   ->  Sort  (cost=311.37..311.38 rows=1 width=72) (actual time=111.371..111.378 rows=31.00 loops=1)
+               ->  Gather  (cost=144.43..311.36 rows=1 width=1328) (actual time=97.812..111.323 rows=159.00 loops=1)
+
+===== Q4 =====
+ Limit  (cost=15.41..15.43 rows=1 width=1752) (actual time=0.000..0.000 rows=0.00 loops=1)
+     ->  Append  (cost=159033.00..406989.22 rows=2519697 width=292) (actual time=29112.785..29302.304 rows=209849.00 loops=1)
+   ->  Sort  (cost=15.41..15.42 rows=1 width=1752) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: customer_id, customer_first_name, customer_last_name, customer_birth_country
+         Sort Method: quicksort  Memory: 0kB
+         ->  Hash Join  (cost=11.61..15.40 rows=1 width=1752) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q5 =====
+ Limit  (cost=1485.40..1605.80 rows=100 width=160) (actual time=21886.197..21886.219 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=94645.64..94645.70 rows=6 width=160) (actual time=10072.388..10072.392 rows=6.00 loops=1)
+   ->  Sort  (cost=1485.40..1604.80 rows=11940 width=160) (actual time=21886.197..21886.219 rows=100.00 loops=1)
+         Sort Key: channel, id
+         Sort Method: quicksort  Memory: 141kB
+         ->  HashAggregate (2 keys, 3 grouping sets)  (cost=557.45..676.85 rows=11940 width=160) (actual time=21885.966..21886.149 rows=508.00 loops=1)
+
+===== Q6 =====
+ Limit  (cost=911320.86..911322.18 rows=66 width=40) (actual time=13143.891..13143.899 rows=37.00 loops=1)
+         Sort Key: count, ca_state
+         Sort Method: quicksort  Memory: 4kB
+         ->  HashAggregate  (cost=911316.20..911318.86 rows=66 width=40) (actual time=13143.839..13143.875 rows=49.00 loops=1)
+   ->  Sort  (cost=911320.86..911321.52 rows=66 width=40) (actual time=13143.891..13143.898 rows=37.00 loops=1)
+
+===== Q7 =====
+ Limit  (cost=95251.73..95251.75 rows=1 width=160) (actual time=10517.871..10517.894 rows=100.00 loops=1)
+         Sort Key: i_item_id
+         Sort Method: quicksort  Memory: 716kB
+         ->  HashAggregate  (cost=95251.72..95251.73 rows=1 width=160) (actual time=10516.659..10517.680 rows=2847.00 loops=1)
+   ->  Sort  (cost=95251.73..95251.74 rows=1 width=160) (actual time=10517.871..10517.894 rows=100.00 loops=1)
+               ->  Nested Loop  (cost=1.27..95251.70 rows=1 width=1896) (actual time=8439.861..10511.645 rows=3557.00 loops=1)
+
+===== Q8 =====
+ Limit  (cost=95492.07..95492.31 rows=12 width=64) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: s_store_name
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=95491.74..95491.86 rows=12 width=64) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=95492.07..95492.19 rows=12 width=64) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Nested Loop  (cost=2.61..95490.76 rows=78 width=540) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q10 =====
+ Limit  (cost=122783.02..122784.42 rows=70 width=152) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=122780.18..122780.88 rows=70 width=152) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=122783.02..122783.72 rows=70 width=152) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Hash Semi Join  (cost=5400.60..122780.00 rows=70 width=860) (actual time=7231.566..8920.255 rows=13.00 loops=1)
+
+===== Q11 =====
+ Limit  (cost=7.66..7.68 rows=1 width=1168) (actual time=16367.052..16367.054 rows=8.00 loops=1)
+     ->  Append  (cost=159033.00..267060.40 rows=1799040 width=292) (actual time=16141.450..16215.504 rows=135814.00 loops=1)
+   ->  Sort  (cost=7.66..7.67 rows=1 width=1168) (actual time=16367.051..16367.054 rows=8.00 loops=1)
+         Sort Key: customer_id, customer_first_name, customer_last_name, customer_email_address
+         Sort Method: quicksort  Memory: 18kB
+         ->  Hash Join  (cost=5.08..7.65 rows=1 width=1168) (actual time=16359.830..16366.477 rows=8.00 loops=1)
+
+===== Q12 =====
+ Limit  (cost=219454.43..220528.53 rows=100 width=224) (actual time=2834.555..2834.816 rows=100.00 loops=1)
+         Sort Key: i_category, i_class, i_item_id, i_item_desc, (((sum * 100) / sum))
+         Sort Method: quicksort  Memory: 427kB
+         ->  WindowAgg (1 funcs)  (cost=208341.72..210487.92 rows=107310 width=224) (actual time=2831.550..2834.118 rows=932.00 loops=1)
+   ->  Sort  (cost=219454.43..220527.53 rows=107310 width=224) (actual time=2834.554..2834.816 rows=100.00 loops=1)
+               ->  HashAggregate  (cost=208341.72..209414.82 rows=107310 width=192) (actual time=2829.447..2829.907 rows=932.00 loops=1)
+
+===== Q14 =====
+ Limit  (cost=185022.80..185024.93 rows=100 width=84) (actual time=52385.617..52385.660 rows=100.00 loops=1)
+     ->  Hash Join  (cost=52.36..1425.37 rows=212 width=492) (actual time=0.000..0.000 rows=0.00 loops=0)
+   ->  Sort  (cost=185022.80..185023.93 rows=113 width=84) (actual time=52385.616..52385.659 rows=100.00 loops=1)
+         Sort Key: channel, i_brand_id, i_class_id, i_category_id
+         Sort Method: quicksort  Memory: 4916kB
+         ->  HashAggregate (4 keys, 5 grouping sets)  (cost=185017.82..185018.95 rows=113 width=84) (actual time=52362.250..52377.746 rows=17170.00 loops=1)
+ Limit  (cost=2.04..2.06 rows=1 width=168) (actual time=63143.235..63143.313 rows=100.00 loops=1)
+     ->  Hash Join  (cost=52.36..1425.37 rows=212 width=492) (actual time=0.000..0.000 rows=0.00 loops=0)
+   ->  Sort  (cost=2.04..2.05 rows=1 width=168) (actual time=63143.235..63143.313 rows=100.00 loops=1)
+         Sort Key: channel, i_brand_id, i_class_id, i_category_id
+         Sort Method: quicksort  Memory: 332kB
+         ->  Nested Loop  (cost=0.00..2.04 rows=1 width=168) (actual time=62988.659..63142.771 rows=579.00 loops=1)
+
+===== Q15 =====
+ Limit  (cost=61367.39..61369.86 rows=100 width=64) (actual time=5871.801..5871.823 rows=100.00 loops=1)
+         Sort Key: ca_zip
+         Sort Method: quicksort  Memory: 14kB
+         ->  HashAggregate  (cost=61360.63..61362.10 rows=147 width=64) (actual time=5871.746..5871.786 rows=134.00 loops=1)
+   ->  Sort  (cost=61367.39..61368.86 rows=147 width=64) (actual time=5871.801..5871.822 rows=100.00 loops=1)
+               ->  Nested Loop  (cost=1.84..61358.79 rows=147 width=1280) (actual time=3129.071..4038.506 rows=1660.00 loops=1)
+
+===== Q16 =====
+ Limit  (cost=71825.38..71825.40 rows=1 width=72) (actual time=13580.304..13580.304 rows=1.00 loops=1)
+         Sort Key: count
+         Sort Method: quicksort  Memory: 1kB
+         ->  Aggregate  (cost=71825.37..71825.38 rows=1 width=72) (actual time=13580.298..13580.298 rows=1.00 loops=1)
+   ->  Sort  (cost=71825.38..71825.39 rows=1 width=72) (actual time=13580.303..13580.303 rows=1.00 loops=1)
+                     Sort Key: cs1.cs_order_number
+               ->  Sort  (cost=71825.30..71825.34 rows=4 width=2076) (actual time=13580.247..13580.293 rows=71.00 loops=1)
+                     Sort Method: quicksort  Memory: 379kB
+                     ->  Hash Anti Join  (cost=17.88..71825.26 rows=4 width=2076) (actual time=11836.758..13580.118 rows=71.00 loops=1)
+
+===== Q17 =====
+ Limit  (cost=9814.50..9814.52 rows=1 width=312) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: i_item_id, i_item_desc, s_state
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=9814.49..9814.50 rows=1 width=312) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=9814.50..9814.51 rows=1 width=312) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Nested Loop  (cost=9.45..9814.45 rows=1 width=3348) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q18 =====
+ Limit  (cost=59244.10..59247.91 rows=100 width=352) (actual time=31715.155..31715.195 rows=100.00 loops=1)
+         Sort Key: ca_country, ca_state, ca_county, i_item_id
+         Sort Method: quicksort  Memory: 2314kB
+         ->  HashAggregate (4 keys, 5 grouping sets)  (cost=59229.86..59232.67 rows=281 width=352) (actual time=31709.254..31712.640 rows=4130.00 loops=1)
+   ->  Sort  (cost=59244.10..59246.91 rows=281 width=352) (actual time=31715.155..31715.194 rows=100.00 loops=1)
+               ->  Nested Loop  (cost=2.62..59227.94 rows=70 width=2464) (actual time=10656.488..31518.162 rows=1060.00 loops=1)
+
+===== Q19 =====
+ Limit  (cost=780.74..780.76 rows=1 width=104) (actual time=324.485..324.507 rows=100.00 loops=1)
+         Sort Key: sum DESC, i_brand, i_brand_id, i_manufact_id, i_manufact
+         Sort Method: quicksort  Memory: 37kB
+         ->  HashAggregate  (cost=780.73..780.74 rows=1 width=104) (actual time=324.368..324.435 rows=138.00 loops=1)
+   ->  Sort  (cost=780.74..780.75 rows=1 width=104) (actual time=324.485..324.507 rows=100.00 loops=1)
+               ->  Nested Loop  (cost=10.00..780.72 rows=1 width=2308) (actual time=8.014..324.013 rows=601.00 loops=1)
+
+===== Q20 =====
+ Limit  (cost=401660.44..401715.18 rows=100 width=224) (actual time=2373.989..2374.190 rows=100.00 loops=1)
+         Sort Key: i_category, i_class, i_item_id, i_item_desc, (((sum * 100) / sum))
+         Sort Method: quicksort  Memory: 686kB
+         ->  WindowAgg (1 funcs)  (cost=401219.99..401327.47 rows=5374 width=224) (actual time=2369.259..2373.278 rows=1506.00 loops=1)
+   ->  Sort  (cost=401660.44..401714.18 rows=5374 width=224) (actual time=2373.988..2374.190 rows=100.00 loops=1)
+               ->  HashAggregate  (cost=401219.99..401273.73 rows=5374 width=192) (actual time=2366.145..2366.783 rows=1506.00 loops=1)
+
+===== Q21 =====
+ Limit  (cost=106970.89..106977.54 rows=100 width=72) (actual time=2171.691..2171.713 rows=100.00 loops=1)
+         Sort Key: w_warehouse_name, i_item_id
+         Sort Method: quicksort  Memory: 209kB
+         ->  HashAggregate  (cost=106837.61..106945.06 rows=565 width=72) (actual time=2170.148..2171.597 rows=1765.00 loops=1)
+   ->  Sort  (cost=106970.89..106976.54 rows=565 width=72) (actual time=2171.691..2171.713 rows=100.00 loops=1)
+
+===== Q22 =====
+ Limit  (cost=1705895.71..1800498.72 rows=100 width=160) (actual time=10787.635..10787.665 rows=100.00 loops=1)
+         Sort Key: avg, i_product_name, i_brand, i_class, i_category
+         Sort Method: quicksort  Memory: 3223kB
+         ->  HashAggregate (4 keys, 5 grouping sets)  (cost=515166.73..609768.74 rows=9460201 width=160) (actual time=10768.572..10775.623 rows=11987.00 loops=1)
+   ->  Sort  (cost=1705895.71..1800497.72 rows=9460201 width=160) (actual time=10787.634..10787.665 rows=100.00 loops=1)
+               ->  Nested Loop  (cost=1463.25..456291.73 rows=4710000 width=916) (actual time=5737.940..9604.483 rows=780000.00 loops=1)
+
+===== Q23 =====
+ Limit  (cost=89869.04..89869.06 rows=1 width=32) (actual time=40307.139..40307.139 rows=1.00 loops=1)
+     ->  HashAggregate  (cost=97515.90..97673.28 rows=3934 width=48) (actual time=0.000..0.000 rows=0.00 loops=0)
+ Limit  (cost=90466.88..90467.24 rows=18 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+     ->  HashAggregate  (cost=97515.90..97673.28 rows=3934 width=48) (actual time=0.000..0.000 rows=0.00 loops=0)
+   ->  Sort  (cost=90466.88..90467.06 rows=18 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: c_last_name, c_first_name, sales
+         Sort Method: quicksort  Memory: 0kB
+         ->  Append  (cost=60107.56..90466.51 rows=18 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q24 =====
+ Sort  (cost=0.18..0.19 rows=1 width=128) (actual time=0.000..0.000 rows=0.00 loops=1)
+   Sort Key: c_last_name, c_first_name, s_store_name
+   Sort Method: quicksort  Memory: 0kB
+     ->  HashAggregate  (cost=109229.31..109229.46 rows=15 width=324) (actual time=0.000..0.000 rows=0.00 loops=1)
+ Sort  (cost=0.18..0.19 rows=1 width=128) (actual time=0.000..0.000 rows=0.00 loops=1)
+   Sort Key: c_last_name, c_first_name, s_store_name
+   Sort Method: quicksort  Memory: 0kB
+     ->  HashAggregate  (cost=109229.31..109229.46 rows=15 width=324) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q25 =====
+ Limit  (cost=9451.03..9451.05 rows=1 width=224) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: i_item_id, i_item_desc, s_store_id, s_store_name
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=9451.02..9451.03 rows=1 width=224) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=9451.03..9451.04 rows=1 width=224) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Nested Loop  (cost=8.00..9451.00 rows=1 width=3324) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q26 =====
+ Limit  (cost=58987.16..58987.18 rows=1 width=160) (actual time=6624.810..6624.833 rows=100.00 loops=1)
+         Sort Key: i_item_id
+         Sort Method: quicksort  Memory: 458kB
+         ->  HashAggregate  (cost=58987.15..58987.16 rows=1 width=160) (actual time=6623.999..6624.694 rows=1822.00 loops=1)
+   ->  Sort  (cost=58987.16..58987.17 rows=1 width=160) (actual time=6624.809..6624.833 rows=100.00 loops=1)
+               ->  Nested Loop  (cost=1.27..58987.13 rows=1 width=2024) (actual time=5433.744..6620.947 rows=1970.00 loops=1)
+
+===== Q27 =====
+ Limit  (cost=95251.75..95251.81 rows=3 width=196) (actual time=9642.287..9642.313 rows=100.00 loops=1)
+         Sort Key: i_item_id, s_state
+         Sort Method: quicksort  Memory: 2137kB
+         ->  HashAggregate (2 keys, 3 grouping sets)  (cost=95251.70..95251.73 rows=3 width=196) (actual time=9638.579..9641.374 rows=6175.00 loops=1)
+   ->  Sort  (cost=95251.75..95251.78 rows=3 width=196) (actual time=9642.287..9642.313 rows=100.00 loops=1)
+               ->  Nested Loop  (cost=1.27..95251.68 rows=1 width=2152) (actual time=2178.030..9600.904 rows=3759.00 loops=1)
+
+===== Q28 =====
+ Limit  (cost=14396.11..86376.82 rows=1 width=288) (actual time=31699.435..31699.435 rows=1.00 loops=1)
+   ->  Nested Loop  (cost=14396.11..86376.82 rows=1 width=288) (actual time=31699.434..31699.434 rows=1.00 loops=1)
+                                       ->  Sort  (cost=14396.09..14396.10 rows=1 width=428) (actual time=5470.510..5477.659 rows=15410.00 loops=1)
+                                             Sort Key: store_sales.ss_list_price
+                                             Sort Method: quicksort  Memory: 16614kB
+                                             ->  Seq Scan on store_sales  (cost=0.00..14396.09 rows=1 width=428) (actual time=0.200..5457.009 rows=15410.00 loops=1)
+                                       ->  Sort  (cost=14396.09..14396.10 rows=1 width=428) (actual time=5386.218..5396.171 rows=18372.00 loops=1)
+                                             Sort Key: store_sales.ss_list_price
+                                             Sort Method: quicksort  Memory: 19808kB
+                                             ->  Seq Scan on store_sales_1  (cost=0.00..14396.09 rows=1 width=428) (actual time=0.262..5365.897 rows=18372.00 loops=1)
+                                 ->  Sort  (cost=14396.09..14396.10 rows=1 width=428) (actual time=5381.350..5389.235 rows=16276.00 loops=1)
+                                       Sort Key: store_sales.ss_list_price
+                                       Sort Method: quicksort  Memory: 17548kB
+                                       ->  Seq Scan on store_sales_2  (cost=0.00..14396.09 rows=1 width=428) (actual time=1.055..5366.293 rows=16276.00 loops=1)
+                           ->  Sort  (cost=14396.09..14396.10 rows=1 width=428) (actual time=5272.202..5281.386 rows=16563.00 loops=1)
+                                 Sort Key: store_sales.ss_list_price
+                                 Sort Method: quicksort  Memory: 17857kB
+                                 ->  Seq Scan on store_sales_3  (cost=0.00..14396.09 rows=1 width=428) (actual time=0.729..5254.471 rows=16563.00 loops=1)
+                     ->  Sort  (cost=14396.09..14396.10 rows=1 width=428) (actual time=5195.719..5202.844 rows=15406.00 loops=1)
+                           Sort Key: store_sales.ss_list_price
+                           Sort Method: quicksort  Memory: 16610kB
+                           ->  Seq Scan on store_sales_4  (cost=0.00..14396.09 rows=1 width=428) (actual time=0.263..5182.940 rows=15406.00 loops=1)
+               ->  Sort  (cost=14396.09..14396.10 rows=1 width=428) (actual time=4942.219..4951.977 rows=18083.00 loops=1)
+                     Sort Key: store_sales.ss_list_price
+                     Sort Method: quicksort  Memory: 19496kB
+                     ->  Seq Scan on store_sales_5  (cost=0.00..14396.09 rows=1 width=428) (actual time=0.728..4926.428 rows=18083.00 loops=1)
+
+===== Q29 =====
+ Limit  (cost=67979.75..67979.77 rows=1 width=140) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: i_item_id, i_item_desc, s_store_id, s_store_name
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=67979.74..67979.75 rows=1 width=140) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=67979.75..67979.76 rows=1 width=140) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Nested Loop  (cost=59251.14..67979.72 rows=1 width=1768) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q30 =====
+ Limit  (cost=323.76..323.78 rows=1 width=844) (actual time=5520.842..5520.859 rows=31.00 loops=1)
+     ->  HashAggregate  (cost=2638.23..2638.96 rows=73 width=68) (actual time=276.151..277.403 rows=6579.00 loops=1)
+   ->  Sort  (cost=323.76..323.77 rows=1 width=844) (actual time=5520.842..5520.859 rows=31.00 loops=1)
+         Sort Key: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date, ctr_total_return
+         Sort Method: quicksort  Memory: 58kB
+         ->  Hash Join  (cost=25.88..323.76 rows=1 width=844) (actual time=5414.813..5520.196 rows=145.00 loops=1)
+
+===== Q31 =====
+ Sort  (cost=7.81..7.82 rows=1 width=432) (actual time=13878.644..13878.742 rows=19.00 loops=1)
+   Sort Key: ((store_sales / store_sales))
+   Sort Method: quicksort  Memory: 23kB
+     ->  HashAggregate  (cost=156317.00..170713.08 rows=1439608 width=72) (actual time=10354.168..10362.164 rows=30390.00 loops=1)
+
+===== Q32 =====
+ Limit  (cost=79210.46..79210.48 rows=1 width=32) (actual time=4748.940..4748.940 rows=1.00 loops=1)
+   ->  Aggregate  (cost=79210.46..79210.47 rows=1 width=32) (actual time=4748.940..4748.940 rows=1.00 loops=1)
+
+===== Q33 =====
+ Limit  (cost=7.07..8.77 rows=85 width=36) (actual time=14849.235..14849.255 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=96534.16..96534.65 rows=49 width=36) (actual time=7270.685..7270.791 rows=661.00 loops=1)
+   ->  Sort  (cost=7.07..7.92 rows=85 width=36) (actual time=14849.235..14849.255 rows=100.00 loops=1)
+         Sort Key: sum
+         Sort Method: quicksort  Memory: 65kB
+         ->  HashAggregate  (cost=3.49..4.34 rows=85 width=36) (actual time=14848.740..14848.921 rows=689.00 loops=1)
+
+===== Q34 =====
+ Sort  (cost=13.29..13.30 rows=1 width=340) (actual time=8069.303..8069.353 rows=187.00 loops=1)
+   Sort Key: c_last_name, c_first_name, c_salutation, c_preferred_cust_flag DESC, store_sales.ss_ticket_number
+   Sort Method: quicksort  Memory: 198kB
+   ->  Nested Loop  (cost=8.26..13.29 rows=1 width=340) (actual time=8065.737..8069.228 rows=187.00 loops=1)
+
+===== Q35 =====
+ Limit  (cost=1054232.14..1054510.91 rows=100 width=320) (actual time=11708.332..11708.411 rows=100.00 loops=1)
+         Sort Key: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+         Sort Method: quicksort  Memory: 975kB
+         ->  HashAggregate  (cost=1051904.21..1052181.98 rows=27777 width=320) (actual time=11704.904..11707.783 rows=1286.00 loops=1)
+   ->  Sort  (cost=1054232.14..1054509.91 rows=27777 width=320) (actual time=11708.332..11708.411 rows=100.00 loops=1)
+               ->  Hash Semi Join  (cost=3501.38..1051209.78 rows=27777 width=860) (actual time=7103.434..11695.837 rows=11996.00 loops=1)
+
+===== Q37 =====
+ Limit  (cost=1653308.18..1653309.88 rows=85 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: i_item_id
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=1653304.60..1653305.45 rows=85 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=1653308.18..1653309.03 rows=85 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Nested Loop  (cost=1471.64..1653303.75 rows=85 width=1096) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q38 =====
+ Limit  (cost=278622.69..278622.71 rows=1 width=8) (actual time=15905.296..15905.296 rows=1.00 loops=1)
+   ->  Aggregate  (cost=278622.69..278622.70 rows=1 width=8) (actual time=15905.296..15905.296 rows=1.00 loops=1)
+
+===== Q39 =====
+ Sort  (cost=3.97..3.98 rows=1 width=280) (actual time=5118.166..5118.184 rows=75.00 loops=1)
+   Sort Key: inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, d_moy, mean, cov
+   Sort Method: quicksort  Memory: 55kB
+     ->  HashAggregate  (cost=60083.71..60087.18 rows=49 width=108) (actual time=4733.037..5113.806 rows=180000.00 loops=1)
+ Sort  (cost=3.97..3.98 rows=1 width=280) (actual time=4643.453..4643.454 rows=2.00 loops=1)
+   Sort Key: inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, d_moy, mean, cov
+   Sort Method: quicksort  Memory: 2kB
+     ->  HashAggregate  (cost=60083.71..60087.18 rows=49 width=108) (actual time=4263.487..4639.357 rows=180000.00 loops=1)
+
+===== Q40 =====
+ Limit  (cost=24208.76..24256.42 rows=100 width=128) (actual time=1478.881..1478.903 rows=100.00 loops=1)
+         Sort Key: w_state, i_item_id
+         Sort Method: quicksort  Memory: 88kB
+         ->  HashAggregate  (cost=23877.75..23924.41 rows=4666 width=128) (actual time=1478.679..1478.822 rows=425.00 loops=1)
+   ->  Sort  (cost=24208.76..24255.42 rows=4666 width=128) (actual time=1478.881..1478.903 rows=100.00 loops=1)
+               ->  Gather  (cost=0.00..23854.42 rows=4666 width=2208) (actual time=1057.787..1478.147 rows=862.00 loops=1)
+
+===== Q41 =====
+ Sort  (cost=187.29..187.95 rows=66 width=32) (actual time=8824.274..8824.274 rows=1.00 loops=1)
+   Sort Key: i_product_name
+   Sort Method: quicksort  Memory: 1kB
+   ->  Unique  (cost=182.65..185.29 rows=66 width=32) (actual time=8824.273..8824.273 rows=1.00 loops=1)
+         ->  Limit  (cost=182.65..183.97 rows=66 width=480) (actual time=8824.267..8824.267 rows=1.00 loops=1)
+                     Sort Key: i1.i_product_name
+                     Sort Method: quicksort  Memory: 2kB
+                     ->  Seq Scan on item i1  (cost=0.00..180.66 rows=66 width=480) (actual time=0.101..8824.259 rows=18000.00 loops=1)
+               ->  Sort  (cost=182.65..183.31 rows=66 width=480) (actual time=8824.267..8824.267 rows=1.00 loops=1)
+
+===== Q42 =====
+ Limit  (cost=762.80..762.82 rows=1 width=72) (actual time=313.308..313.310 rows=10.00 loops=1)
+         Sort Key: sum DESC, d_year, i_category_id, i_category
+         Sort Method: quicksort  Memory: 2kB
+         ->  HashAggregate  (cost=762.79..762.80 rows=1 width=72) (actual time=313.295..313.302 rows=10.00 loops=1)
+   ->  Sort  (cost=762.80..762.81 rows=1 width=72) (actual time=313.307..313.310 rows=10.00 loops=1)
+               ->  Hash Join  (cost=9.50..762.77 rows=1 width=916) (actual time=8.246..311.692 rows=759.00 loops=1)
+
+===== Q43 =====
+ Limit  (cost=95315.77..95315.79 rows=1 width=288) (actual time=8115.333..8115.335 rows=6.00 loops=1)
+         Sort Key: s_store_name, s_store_id, sum, sum, sum, sum, sum, sum, sum
+         Sort Method: quicksort  Memory: 3kB
+         ->  HashAggregate  (cost=95315.76..95315.77 rows=1 width=288) (actual time=8115.321..8115.328 rows=6.00 loops=1)
+   ->  Sort  (cost=95315.77..95315.78 rows=1 width=288) (actual time=8115.333..8115.335 rows=6.00 loops=1)
+               ->  Nested Loop  (cost=11.35..95315.37 rows=14 width=1144) (actual time=19.494..8115.212 rows=272010.00 loops=1)
+
+===== Q44 =====
+ Limit  (cost=3385.17..3391.22 rows=100 width=984) (actual time=5918.959..5918.964 rows=10.00 loops=1)
+         Sort Key: rnk
+         Sort Method: quicksort  Memory: 27kB
+         ->  Nested Loop  (cost=32.98..3357.44 rows=505 width=984) (actual time=5880.238..5913.009 rows=10.00 loops=1)
+   ->  Sort  (cost=3385.17..3390.22 rows=505 width=984) (actual time=5918.959..5918.964 rows=10.00 loops=1)
+               ->  Hash Join  (cost=24.73..1319.09 rows=505 width=504) (actual time=5880.153..5912.961 rows=10.00 loops=1)
+
+===== Q45 =====
+ Limit  (cost=31207.89..31209.35 rows=73 width=96) (actual time=2859.923..2859.925 rows=7.00 loops=1)
+         Sort Key: ca_zip, ca_city
+         Sort Method: quicksort  Memory: 2kB
+         ->  HashAggregate  (cost=31204.90..31205.63 rows=73 width=96) (actual time=2859.915..2859.919 rows=7.00 loops=1)
+   ->  Sort  (cost=31207.89..31208.62 rows=73 width=96) (actual time=2859.923..2859.925 rows=7.00 loops=1)
+               ->  Nested Loop  (cost=2.09..31203.99 rows=73 width=1760) (actual time=348.401..1994.928 rows=7.00 loops=1)
+
+===== Q46 =====
+ Limit  (cost=2847.87..2851.20 rows=100 width=816) (actual time=35333.493..35333.548 rows=100.00 loops=1)
+         Sort Key: c_last_name, c_first_name, ca_city, bought_city, store_sales.ss_ticket_number
+         Sort Method: quicksort  Memory: 9202kB
+         ->  Nested Loop  (cost=8.51..2838.70 rows=233 width=816) (actual time=7083.722..35328.786 rows=4958.00 loops=1)
+   ->  Sort  (cost=2847.87..2850.20 rows=233 width=816) (actual time=35333.493..35333.548 rows=100.00 loops=1)
+
+===== Q47 =====
+ Limit  (cost=31.54..31.56 rows=1 width=196) (actual time=12093.657..12093.706 rows=100.00 loops=1)
+     ->  WindowAgg (1 funcs)  (cost=96864.13..96958.72 rows=3153 width=208) (actual time=8562.040..8580.491 rows=54915.00 loops=1)
+   ->  Sort  (cost=31.54..31.55 rows=1 width=196) (actual time=12093.657..12093.706 rows=100.00 loops=1)
+         Sort Key: ((sum_sales - avg_monthly_sales)), nsum
+         Sort Method: quicksort  Memory: 12553kB
+         ->  CTE Scan on v2  (cost=0.00..31.54 rows=1 width=196) (actual time=11938.986..12058.005 rows=43626.00 loops=1)
+
+===== Q49 =====
+ Limit  (cost=44485.12..44485.14 rows=1 width=84) (actual time=15735.805..15735.811 rows=25.00 loops=1)
+         Sort Key: channel, return_rank, currency_rank, item
+         Sort Method: quicksort  Memory: 7kB
+         ->  HashSetOp Union  (cost=22896.61..44485.12 rows=1 width=84) (actual time=15735.777..15735.795 rows=25.00 loops=1)
+   ->  Sort  (cost=44485.12..44485.13 rows=1 width=84) (actual time=15735.805..15735.810 rows=25.00 loops=1)
+               ->  HashSetOp Union  (cost=14136.75..21588.43 rows=1 width=84) (actual time=15735.715..15735.742 rows=15.00 loops=1)
+
+===== Q50 =====
+ Limit  (cost=7914.01..7914.03 rows=1 width=332) (actual time=691.259..691.261 rows=6.00 loops=1)
+         Sort Key: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+         Sort Method: quicksort  Memory: 5kB
+         ->  HashAggregate  (cost=7914.00..7914.01 rows=1 width=332) (actual time=691.247..691.255 rows=6.00 loops=1)
+   ->  Sort  (cost=7914.01..7914.02 rows=1 width=332) (actual time=691.259..691.261 rows=6.00 loops=1)
+               ->  Nested Loop  (cost=1.74..7913.97 rows=1 width=1868) (actual time=10.226..690.854 rows=1046.00 loops=1)
+
+===== Q51 =====
+ Limit  (cost=501.26..524.72 rows=100 width=136) (actual time=12710.238..12710.263 rows=100.00 loops=1)
+     ->  WindowAgg (1 funcs)  (cost=38408.32..38441.96 rows=1682 width=72) (actual time=2585.733..2601.000 rows=73440.00 loops=1)
+   ->  Sort  (cost=501.26..523.72 rows=2246 width=136) (actual time=12710.238..12710.262 rows=100.00 loops=1)
+         Sort Key: item_sk, d_date
+         Sort Method: quicksort  Memory: 7362kB
+         ->  WindowAgg (2 funcs)  (cost=0.00..376.23 rows=2246 width=136) (actual time=12614.232..12708.326 rows=324249.00 loops=1)
+
+===== Q52 =====
+ Limit  (cost=762.80..762.82 rows=1 width=72) (actual time=274.362..274.384 rows=100.00 loops=1)
+         Sort Key: d_year, sum DESC, i_brand_id
+         Sort Method: quicksort  Memory: 23kB
+         ->  HashAggregate  (cost=762.79..762.80 rows=1 width=72) (actual time=274.265..274.308 rows=109.00 loops=1)
+   ->  Sort  (cost=762.80..762.81 rows=1 width=72) (actual time=274.362..274.383 rows=100.00 loops=1)
+               ->  Hash Join  (cost=9.50..762.77 rows=1 width=916) (actual time=6.665..272.253 rows=787.00 loops=1)
+
+===== Q53 =====
+ Limit  (cost=397.54..397.56 rows=1 width=68) (actual time=1005.019..1005.041 rows=100.00 loops=1)
+         Sort Key: avg_quarterly_sales, sum_sales, item.i_manufact_id
+         Sort Method: quicksort  Memory: 214kB
+         ->  WindowAgg (1 funcs)  (cost=397.50..397.54 rows=1 width=68) (actual time=999.346..1004.062 rows=1686.00 loops=1)
+   ->  Sort  (cost=397.54..397.55 rows=1 width=68) (actual time=1005.019..1005.041 rows=100.00 loops=1)
+
+===== Q54 =====
+ Limit  (cost=0.02..0.04 rows=1 width=12) (actual time=0.000..0.000 rows=0.00 loops=1)
+     ->  Unique  (cost=16447.26..16455.93 rows=1 width=8) (actual time=7493.043..7493.090 rows=235.00 loops=1)
+   ->  Sort  (cost=0.02..0.03 rows=1 width=12) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: segment, count
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=0.01..0.02 rows=1 width=12) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q55 =====
+ Limit  (cost=762.80..762.82 rows=1 width=68) (actual time=162.301..162.315 rows=73.00 loops=1)
+         Sort Key: sum DESC, i_brand_id
+         Sort Method: quicksort  Memory: 12kB
+         ->  HashAggregate  (cost=762.79..762.80 rows=1 width=68) (actual time=162.250..162.277 rows=73.00 loops=1)
+   ->  Sort  (cost=762.80..762.81 rows=1 width=68) (actual time=162.301..162.315 rows=73.00 loops=1)
+               ->  Hash Join  (cost=9.50..762.77 rows=1 width=912) (actual time=6.101..161.554 rows=447.00 loops=1)
+
+===== Q56 =====
+ Limit  (cost=7.07..8.77 rows=85 width=64) (actual time=13812.809..13812.829 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=96572.11..96572.60 rows=49 width=64) (actual time=6710.359..6710.435 rows=370.00 loops=1)
+   ->  Sort  (cost=7.07..7.92 rows=85 width=64) (actual time=13812.809..13812.829 rows=100.00 loops=1)
+         Sort Key: sum, i_item_id
+         Sort Method: quicksort  Memory: 61kB
+         ->  HashAggregate  (cost=3.49..4.34 rows=85 width=64) (actual time=13812.384..13812.560 rows=554.00 loops=1)
+
+===== Q57 =====
+ Limit  (cost=15.79..15.81 rows=1 width=228) (actual time=6774.933..6774.977 rows=100.00 loops=1)
+     ->  WindowAgg (1 funcs)  (cost=60520.67..60568.01 rows=1578 width=176) (actual time=5528.260..5535.009 rows=22424.00 loops=1)
+   ->  Sort  (cost=15.79..15.80 rows=1 width=228) (actual time=6774.932..6774.977 rows=100.00 loops=1)
+         Sort Key: ((sum_sales - avg_monthly_sales)), avg_monthly_sales
+         Sort Method: quicksort  Memory: 6146kB
+         ->  CTE Scan on v2  (cost=0.00..15.79 rows=1 width=228) (actual time=6715.089..6762.399 rows=17189.00 loops=1)
+
+===== Q58 =====
+ Limit  (cost=4.00..4.02 rows=1 width=192) (actual time=0.000..0.000 rows=0.00 loops=1)
+     ->  HashAggregate  (cost=151411.39..151411.78 rows=39 width=64) (actual time=10415.081..10415.498 rows=2368.00 loops=1)
+   ->  Sort  (cost=4.00..4.01 rows=1 width=192) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: item_id, ss_item_rev
+         Sort Method: quicksort  Memory: 0kB
+         ->  Hash Join  (cost=2.72..3.99 rows=1 width=192) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q59 =====
+ Limit  (cost=38110.97..41628.03 rows=100 width=584) (actual time=10549.891..10550.454 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=154615.51..169011.59 rows=1439608 width=232) (actual time=10512.328..10512.962 rows=1834.00 loops=1)
+   ->  Sort  (cost=38110.97..41627.03 rows=351606 width=584) (actual time=10549.891..10550.454 rows=100.00 loops=1)
+         Sort Key: s_store_name1, s_store_id1, d_week_seq1
+         Sort Method: quicksort  Memory: 14930kB
+         ->  Hash Join  (cost=1107.55..2205.66 rows=351606 width=584) (actual time=10525.714..10545.795 rows=15288.00 loops=1)
+
+===== Q60 =====
+ Limit  (cost=7.07..8.77 rows=85 width=64) (actual time=14779.898..14779.917 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=96534.16..96534.65 rows=49 width=64) (actual time=7484.509..7484.719 rows=1166.00 loops=1)
+   ->  Sort  (cost=7.07..7.92 rows=85 width=64) (actual time=14779.898..14779.917 rows=100.00 loops=1)
+         Sort Key: i_item_id, sum
+         Sort Method: quicksort  Memory: 159kB
+         ->  HashAggregate  (cost=3.49..4.34 rows=85 width=64) (actual time=14779.330..14779.769 rows=1450.00 loops=1)
+
+===== Q61 =====
+ Limit  (cost=30020.64..30020.66 rows=1 width=64) (actual time=2592.697..2592.697 rows=1.00 loops=1)
+         Sort Key: promotions, total
+         Sort Method: quicksort  Memory: 1kB
+         ->  Nested Loop  (cost=15016.62..30020.64 rows=1 width=64) (actual time=2592.693..2592.693 rows=1.00 loops=1)
+   ->  Sort  (cost=30020.64..30020.65 rows=1 width=64) (actual time=2592.697..2592.697 rows=1.00 loops=1)
+               ->  Aggregate  (cost=15016.62..15016.63 rows=1 width=32) (actual time=2592.687..2592.687 rows=1.00 loops=1)
+
+===== Q62 =====
+ Limit  (cost=279859.97..283455.29 rows=100 width=136) (actual time=3159.289..3159.313 rows=100.00 loops=1)
+         Sort Key: substr, sm_type, web_name
+         Sort Method: quicksort  Memory: 61kB
+         ->  HashAggregate  (cost=243098.42..246692.74 rows=359432 width=136) (actual time=3159.188..3159.266 rows=150.00 loops=1)
+   ->  Sort  (cost=279859.97..283454.29 rows=359432 width=136) (actual time=3159.288..3159.313 rows=100.00 loops=1)
+               ->  Nested Loop  (cost=6.49..235011.20 rows=359432 width=1084) (actual time=1.626..3158.970 rows=71742.00 loops=1)
+
+===== Q63 =====
+ Limit  (cost=397.54..397.56 rows=1 width=68) (actual time=914.471..914.491 rows=100.00 loops=1)
+         Sort Key: item.i_manager_id, avg_monthly_sales, sum_sales
+         Sort Method: quicksort  Memory: 104kB
+         ->  WindowAgg (1 funcs)  (cost=397.50..397.54 rows=1 width=68) (actual time=912.191..914.307 rows=818.00 loops=1)
+   ->  Sort  (cost=397.54..397.55 rows=1 width=68) (actual time=914.470..914.491 rows=100.00 loops=1)
+
+===== Q64 =====
+ Sort  (cost=2.10..2.11 rows=1 width=944) (actual time=18957.851..18957.852 rows=2.00 loops=1)
+   Sort Key: product_name, store_name, cnt, s1, s1
+   Sort Method: quicksort  Memory: 4kB
+     ->  HashAggregate  (cost=113474.66..114433.62 rows=23974 width=68) (actual time=5459.856..5466.348 rows=17029.00 loops=1)
+
+===== Q65 =====
+ Limit  (cost=1707.85..1733.81 rows=100 width=1232) (actual time=14868.688..14868.741 rows=100.00 loops=1)
+         Sort Key: s_store_name, item.i_item_desc
+         Sort Method: quicksort  Memory: 4037kB
+         ->  Hash Join  (cost=199.77..1542.05 rows=2496 width=560) (actual time=14814.973..14867.170 rows=1422.00 loops=1)
+   ->  Sort  (cost=1707.85..1732.81 rows=2496 width=1232) (actual time=14868.688..14868.741 rows=100.00 loops=1)
+
+===== Q66 =====
+ Limit  (cost=90274.35..90274.77 rows=21 width=1352) (actual time=7641.148..7641.151 rows=5.00 loops=1)
+         Sort Key: w_warehouse_name
+         Sort Method: quicksort  Memory: 11kB
+         ->  HashAggregate  (cost=90273.68..90273.89 rows=21 width=1352) (actual time=7641.136..7641.143 rows=5.00 loops=1)
+   ->  Sort  (cost=90274.35..90274.56 rows=21 width=1352) (actual time=7641.147..7641.151 rows=5.00 loops=1)
+               ->  Append  (cost=60227.49..90271.79 rows=21 width=968) (actual time=7640.913..7641.079 rows=10.00 loops=1)
+
+===== Q67 =====
+ Limit  (cost=158480.26..158598.64 rows=100 width=212) (actual time=11531.820..11531.857 rows=100.00 loops=1)
+         Sort Key: i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+         Sort Method: quicksort  Memory: 559kB
+         ->  WindowAgg (1 funcs)  (cost=156160.82..157686.84 rows=11738 width=212) (actual time=11494.670..11530.778 rows=115150.00 loops=1)
+   ->  Sort  (cost=158480.26..158597.64 rows=11738 width=212) (actual time=11531.819..11531.856 rows=100.00 loops=1)
+
+===== Q68 =====
+ Limit  (cost=1739.60..1742.02 rows=100 width=848) (actual time=14322.055..14322.117 rows=100.00 loops=1)
+         Sort Key: c_last_name, store_sales.ss_ticket_number
+         Sort Method: quicksort  Memory: 1989kB
+         ->  Nested Loop  (cost=8.51..1734.52 rows=142 width=848) (actual time=7280.684..14321.338 rows=1045.00 loops=1)
+   ->  Sort  (cost=1739.60..1741.02 rows=142 width=848) (actual time=14322.055..14322.117 rows=100.00 loops=1)
+
+===== Q69 =====
+ Limit  (cost=244711.19..244714.06 rows=100 width=140) (actual time=14724.367..14724.393 rows=100.00 loops=1)
+         Sort Key: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+         Sort Method: quicksort  Memory: 117kB
+         ->  HashAggregate  (cost=244702.26..244704.13 rows=187 width=140) (actual time=14724.048..14724.296 rows=391.00 loops=1)
+   ->  Sort  (cost=244711.19..244713.06 rows=187 width=140) (actual time=14724.367..14724.393 rows=100.00 loops=1)
+               ->  Hash Anti Join  (cost=5400.60..244701.79 rows=187 width=860) (actual time=14311.537..14723.106 rows=407.00 loops=1)
+
+===== Q71 =====
+ Sort  (cost=23.68..23.69 rows=1 width=76) (actual time=15434.768..15434.872 rows=580.00 loops=1)
+   Sort Key: sum DESC, i_brand_id
+   Sort Method: quicksort  Memory: 146kB
+   ->  HashAggregate  (cost=23.67..23.68 rows=1 width=76) (actual time=15434.265..15434.503 rows=580.00 loops=1)
+
+===== Q72 =====
+ Limit  (cost=0.03..0.05 rows=1 width=92) (actual time=5897.602..5897.626 rows=100.00 loops=1)
+         Sort Key: count DESC, i_item_desc, w_warehouse_name, d_week_seq
+         Sort Method: quicksort  Memory: 287kB
+         ->  HashAggregate  (cost=0.02..0.03 rows=1 width=92) (actual time=5897.137..5897.477 rows=740.00 loops=1)
+   ->  Sort  (cost=0.03..0.04 rows=1 width=92) (actual time=5897.602..5897.626 rows=100.00 loops=1)
+               ->  Nested Loop Left Join  (cost=0.00..0.01 rows=1 width=3728) (actual time=360.906..2256.438 rows=749.00 loops=1)
+
+===== Q73 =====
+ Sort  (cost=13.29..13.30 rows=1 width=340) (actual time=10197.947..10197.947 rows=1.00 loops=1)
+   Sort Key: cnt DESC, c_last_name
+   Sort Method: quicksort  Memory: 2kB
+   ->  Nested Loop  (cost=8.26..13.29 rows=1 width=340) (actual time=9663.951..9663.951 rows=1.00 loops=1)
+
+===== Q74 =====
+ Limit  (cost=1457.15..1457.17 rows=1 width=656) (actual time=11424.290..11424.294 rows=7.00 loops=1)
+     ->  Append  (cost=101799.89..136911.30 rows=7363 width=164) (actual time=11276.466..11304.875 rows=54056.00 loops=1)
+   ->  Sort  (cost=1457.15..1457.16 rows=1 width=656) (actual time=11424.290..11424.294 rows=7.00 loops=1)
+         Sort Key: customer_id, customer_last_name, customer_first_name
+         Sort Method: quicksort  Memory: 9kB
+         ->  Hash Join  (cost=941.00..1457.15 rows=1 width=656) (actual time=11386.505..11421.597 rows=7.00 loops=1)
+
+===== Q75 =====
+ Limit  (cost=7.83..8.69 rows=43 width=112) (actual time=10654.152..10654.193 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=1086.46..1274.23 rows=18777 width=56) (actual time=10649.310..10650.588 rows=4899.00 loops=1)
+   ->  Sort  (cost=7.83..8.26 rows=43 width=112) (actual time=10654.152..10654.193 rows=100.00 loops=1)
+         Sort Key: ((sales_cnt - sales_cnt)), ((sales_amt - sales_amt))
+         Sort Method: quicksort  Memory: 121kB
+         ->  Hash Join  (cost=3.79..6.66 rows=43 width=112) (actual time=10652.176..10654.043 rows=184.00 loops=1)
+
+===== Q76 =====
+ Limit  (cost=273108.41..273782.93 rows=100 width=144) (actual time=2159.650..2159.675 rows=100.00 loops=1)
+         Sort Key: channel, col_name, d_year, d_qoy, i_category
+         Sort Method: quicksort  Memory: 167kB
+         ->  HashAggregate  (cost=267033.46..267706.98 rows=67352 width=144) (actual time=2159.300..2159.542 rows=470.00 loops=1)
+   ->  Sort  (cost=273108.41..273781.93 rows=67352 width=144) (actual time=2159.650..2159.675 rows=100.00 loops=1)
+               ->  Append  (cost=6863.60..266696.70 rows=67352 width=136) (actual time=211.632..2157.581 rows=34057.00 loops=1)
+
+===== Q77 =====
+ Limit  (cost=252.22..276.11 rows=100 width=132) (actual time=14353.442..14353.451 rows=44.00 loops=1)
+     ->  HashAggregate  (cost=137221.35..137221.47 rows=12 width=68) (actual time=6400.954..6400.961 rows=6.00 loops=1)
+   ->  Sort  (cost=252.22..275.11 rows=2289 width=132) (actual time=14353.442..14353.451 rows=44.00 loops=1)
+         Sort Key: channel, id
+         Sort Method: quicksort  Memory: 11kB
+         ->  HashAggregate (2 keys, 3 grouping sets)  (cost=101.60..124.49 rows=2289 width=132) (actual time=14353.418..14353.434 rows=44.00 loops=1)
+
+===== Q78 =====
+ Limit  (cost=0.09..0.11 rows=1 width=240) (actual time=17911.604..17911.666 rows=45.00 loops=1)
+     ->  HashAggregate  (cost=8286.97..8286.98 rows=1 width=80) (actual time=2871.536..2891.047 rows=64983.00 loops=1)
+   ->  Sort  (cost=0.09..0.10 rows=1 width=240) (actual time=17911.604..17911.666 rows=45.00 loops=1)
+         Sort Key: store_sales.ss_customer_sk, ss_qty DESC, ss_wc DESC, ss_sp DESC, ((coalesce(ws_qty, 0) + coalesce(cs_qty, 0))), ((coalesce(ws_wc, 0) + coalesce(cs_wc, 0))), ((coalesce(ws_sp, 0) + coalesce(cs_sp, 0))), (round((ss_qty / (coalesce(ws_qty, 0) + coalesce(cs_qty, 0))), 2))
+         Sort Method: quicksort  Memory: 38kB
+         ->  Hash Left Join  (cost=0.00..0.09 rows=1 width=240) (actual time=17684.791..17911.582 rows=245587.00 loops=1)
+
+===== Q79 =====
+ Limit  (cost=1577.26..1582.10 rows=100 width=428) (actual time=80382.796..80382.868 rows=100.00 loops=1)
+         Sort Key: c_last_name, c_first_name, (substr(s_city, 1, 30)), profit
+         Sort Method: quicksort  Memory: 8757kB
+         ->  Nested Loop  (cost=8.26..1560.78 rows=384 width=428) (actual time=6862.229..80374.398 rows=7575.00 loops=1)
+   ->  Sort  (cost=1577.26..1581.10 rows=384 width=428) (actual time=80382.796..80382.867 rows=100.00 loops=1)
+
+===== Q80 =====
+ Limit  (cost=3.49..4.63 rows=57 width=160) (actual time=17140.651..17140.673 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=34525.23..34525.29 rows=6 width=128) (actual time=8525.654..8525.657 rows=6.00 loops=1)
+   ->  Sort  (cost=3.49..4.06 rows=57 width=160) (actual time=17140.651..17140.673 rows=100.00 loops=1)
+         Sort Key: channel, id
+         Sort Method: quicksort  Memory: 99kB
+         ->  HashAggregate (2 keys, 3 grouping sets)  (cost=1.26..1.83 rows=57 width=160) (actual time=17140.484..17140.615 rows=356.00 loops=1)
+
+===== Q81 =====
+ Limit  (cost=621.59..621.61 rows=1 width=844) (actual time=7138.927..7138.985 rows=100.00 loops=1)
+     ->  HashAggregate  (cost=5369.12..5370.58 rows=146 width=68) (actual time=514.144..516.912 rows=13619.00 loops=1)
+   ->  Sort  (cost=621.59..621.60 rows=1 width=844) (actual time=7138.927..7138.984 rows=100.00 loops=1)
+         Sort Key: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return
+         Sort Method: quicksort  Memory: 194kB
+         ->  Hash Join  (cost=25.88..621.59 rows=1 width=844) (actual time=6916.542..7138.803 rows=362.00 loops=1)
+
+===== Q82 =====
+ Limit  (cost=2790081.07..2790082.77 rows=85 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: i_item_id
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=2790077.50..2790078.35 rows=85 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=2790081.07..2790081.92 rows=85 width=96) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Nested Loop  (cost=1471.64..2790076.65 rows=85 width=968) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q83 =====
+ Limit  (cost=6.57..7.07 rows=25 width=108) (actual time=2592.394..2592.401 rows=3.00 loops=1)
+     ->  HashAggregate  (cost=20977.01..20978.01 rows=100 width=36) (actual time=1130.440..1130.628 rows=1103.00 loops=1)
+   ->  Sort  (cost=6.57..6.82 rows=25 width=108) (actual time=2592.394..2592.401 rows=3.00 loops=1)
+         Sort Key: item_id, sr_item_qty
+         Sort Method: quicksort  Memory: 1kB
+         ->  Hash Join  (cost=4.08..5.74 rows=25 width=108) (actual time=2592.309..2592.374 rows=3.00 loops=1)
+
+===== Q84 =====
+ Limit  (cost=21913.77..21921.05 rows=100 width=1252) (actual time=667.103..667.122 rows=6.00 loops=1)
+   ->  Gather Merge  (cost=21913.77..21920.05 rows=314 width=1252) (actual time=667.103..667.122 rows=6.00 loops=1)
+         ->  Sort  (cost=21913.77..21916.91 rows=314 width=1252)
+               Sort Key: customer.c_customer_id
+               Worker 0:  actual time=336.990..336.993 rows=2.00 loops=1
+               Worker 1:  actual time=337.288..337.304 rows=4.00 loops=1
+               Sort Method: quicksort  Memory: 13kB
+               Worker 0:  Sort Method: quicksort  Memory: 7kB
+
+===== Q85 =====
+ Limit  (cost=3942.34..3942.36 rows=1 width=128) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: (substr(r_reason_desc, 1, 20)), avg, avg, avg
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=3942.33..3942.34 rows=1 width=128) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=3942.34..3942.35 rows=1 width=128) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Nested Loop  (cost=30.10..3942.32 rows=1 width=1512) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q89 =====
+ Limit  (cost=4148.04..4148.06 rows=1 width=228) (actual time=1637.891..1637.922 rows=100.00 loops=1)
+         Sort Key: ((sum_sales - avg_monthly_sales)), s_store_name
+         Sort Method: quicksort  Memory: 662kB
+         ->  WindowAgg (1 funcs)  (cost=4148.00..4148.04 rows=1 width=228) (actual time=1629.240..1636.313 rows=1730.00 loops=1)
+   ->  Sort  (cost=4148.04..4148.05 rows=1 width=228) (actual time=1637.891..1637.922 rows=100.00 loops=1)
+
+===== Q90 =====
+ Limit  (cost=66602.83..66602.85 rows=1 width=16) (actual time=4780.810..4780.810 rows=1.00 loops=1)
+         Sort Key: ((amc / pmc))
+         Sort Method: quicksort  Memory: 1kB
+         ->  Nested Loop  (cost=33301.39..66602.83 rows=1 width=16) (actual time=4780.764..4780.764 rows=1.00 loops=1)
+   ->  Sort  (cost=66602.83..66602.84 rows=1 width=16) (actual time=4780.810..4780.810 rows=1.00 loops=1)
+               ->  Aggregate  (cost=33301.39..33301.40 rows=1 width=8) (actual time=4780.754..4780.754 rows=1.00 loops=1)
+
+===== Q91 =====
+ Sort  (cost=4213.87..4213.88 rows=1 width=192) (actual time=3024.193..3024.193 rows=1.00 loops=1)
+   Sort Key: sum DESC
+   Sort Method: quicksort  Memory: 1kB
+   ->  HashAggregate  (cost=4213.86..4213.87 rows=1 width=192) (actual time=3024.189..3024.189 rows=1.00 loops=1)
+
+===== Q92 =====
+ Limit  (cost=70994.28..70994.30 rows=1 width=32) (actual time=4846.012..4846.012 rows=1.00 loops=1)
+         Sort Key: sum
+         Sort Method: quicksort  Memory: 1kB
+         ->  Aggregate  (cost=70994.27..70994.28 rows=1 width=32) (actual time=4846.000..4846.000 rows=1.00 loops=1)
+   ->  Sort  (cost=70994.28..70994.29 rows=1 width=32) (actual time=4846.012..4846.012 rows=1.00 loops=1)
+               ->  Hash Join  (cost=39153.61..70994.02 rows=99 width=1492) (actual time=3456.847..3456.847 rows=1.00 loops=1)
+
+===== Q93 =====
+ Limit  (cost=35127.71..35540.02 rows=100 width=36) (actual time=0.000..0.000 rows=0.00 loops=1)
+         Sort Key: sum, ss_customer_sk
+         Sort Method: quicksort  Memory: 0kB
+         ->  HashAggregate  (cost=31564.14..31975.45 rows=41131 width=36) (actual time=0.000..0.000 rows=0.00 loops=1)
+   ->  Sort  (cost=35127.71..35539.02 rows=41131 width=36) (actual time=0.000..0.000 rows=0.00 loops=1)
+               ->  Gather  (cost=0.00..31461.31 rows=41131 width=44) (actual time=0.000..0.000 rows=0.00 loops=1)
+
+===== Q94 =====
+ Limit  (cost=33910.01..33910.03 rows=1 width=72) (actual time=2924.295..2924.295 rows=1.00 loops=1)
+         Sort Key: count
+         Sort Method: quicksort  Memory: 1kB
+         ->  Aggregate  (cost=33910.00..33910.01 rows=1 width=72) (actual time=2924.292..2924.292 rows=1.00 loops=1)
+   ->  Sort  (cost=33910.01..33910.02 rows=1 width=72) (actual time=2924.295..2924.295 rows=1.00 loops=1)
+                     Sort Key: ws1.ws_order_number
+               ->  Sort  (cost=33909.99..33910.00 rows=1 width=2000) (actual time=2924.283..2924.288 rows=2.00 loops=1)
+                     Sort Method: quicksort  Memory: 11kB
+                     ->  Hash Anti Join  (cost=17.88..33909.99 rows=1 width=2000) (actual time=1908.760..2150.204 rows=2.00 loops=1)
+
+===== Q95 =====
+ Limit  (cost=64684.36..64684.38 rows=1 width=72) (actual time=14953.345..14953.345 rows=1.00 loops=1)
+     ->  Merge Join  (cost=122457.11..130566.90 rows=359432 width=16) (actual time=4379.101..8021.123 rows=3316756.00 loops=1)
+   ->  Sort  (cost=64684.36..64684.37 rows=1 width=72) (actual time=14953.345..14953.345 rows=1.00 loops=1)
+         Sort Key: count
+         Sort Method: quicksort  Memory: 1kB
+         ->  Aggregate  (cost=64684.35..64684.36 rows=1 width=72) (actual time=14953.341..14953.341 rows=1.00 loops=1)
+               ->  Sort  (cost=64684.32..64684.34 rows=2 width=2000) (actual time=14953.311..14953.337 rows=28.00 loops=1)
+                     Sort Key: ws1_1.ws_order_number
+                     Sort Method: quicksort  Memory: 143kB
+                     ->  Hash Semi Join  (cost=8616.22..64684.31 rows=2 width=2000) (actual time=13110.758..14936.381 rows=28.00 loops=1)
+
+===== Q96 =====
+ Limit  (cost=95445.91..95445.93 rows=1 width=8) (actual time=7151.006..7151.006 rows=1.00 loops=1)
+         Sort Key: count
+         Sort Method: quicksort  Memory: 1kB
+         ->  Aggregate  (cost=95445.90..95445.91 rows=1 width=8) (actual time=7150.997..7150.997 rows=1.00 loops=1)
+   ->  Sort  (cost=95445.91..95445.92 rows=1 width=8) (actual time=7151.005..7151.005 rows=1.00 loops=1)
+               ->  Nested Loop  (cost=48.99..95445.84 rows=5 width=1124) (actual time=351.272..7127.065 rows=446.00 loops=1)
+
+===== Q97 =====
+ Limit  (cost=213.31..213.32 rows=1 width=24) (actual time=13337.382..13337.382 rows=1.00 loops=1)
+     ->  HashAggregate  (cost=115091.91..115157.53 rows=6562 width=8) (actual time=7726.108..7796.234 rows=276804.00 loops=1)
+
+===== Q98 =====
+ Sort  (cost=54689.92..54695.89 rows=597 width=224) (actual time=3839.658..3841.901 rows=2128.00 loops=1)
+   Sort Key: i_category, i_class, i_item_id, i_item_desc, (((sum * 100) / sum))
+   Sort Method: quicksort  Memory: 965kB
+   ->  WindowAgg (1 funcs)  (cost=54650.45..54662.39 rows=597 width=224) (actual time=3835.499..3838.738 rows=2128.00 loops=1)
+
+===== Q99 =====
+ Limit  (cost=560289.58..567497.15 rows=100 width=136) (actual time=6999.171..6999.196 rows=90.00 loops=1)
+         Sort Key: substr, sm_type, cc_name
+         Sort Method: quicksort  Memory: 37kB
+         ->  HashAggregate  (cost=482966.85..490173.42 rows=720657 width=136) (actual time=6999.099..6999.155 rows=90.00 loops=1)
+   ->  Sort  (cost=560289.58..567496.15 rows=720657 width=136) (actual time=6999.171..6999.195 rows=90.00 loops=1)
+               ->  Nested Loop  (cost=3.95..466752.07 rows=720657 width=1084) (actual time=1418.052..3802.460 rows=143016.00 loops=1)

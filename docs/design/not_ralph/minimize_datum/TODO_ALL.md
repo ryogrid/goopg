@@ -868,11 +868,42 @@ rule).*
   **Corpus correction: goopg's TPC-H suite is HammerDB's templates and has
   NO `LIMIT` in any of the 22 queries** (0 of 22 committed PG plans contain
   a `Limit` node), so the entire measurable surface is TPC-DS (81/99 plans
-  `Limit`-rooted). Probe P2 (the goopg `Limit → Sort(N)` census) is the
-  go/no-go and is unrun.
-  *design: take3 08 §7 + `docs/design/planner-p4-upper-rels/DESIGN.md`;
-  gate: take3 09 §5 P4 (PP + timing; C-13a's real correctness gate is the
-  TPC-DS SF0.5 checksum arm).*
+  `Limit`-rooted).
+  **Probe P2 RUN 2026-09-06 — the go/no-go came back NO-GO for C-13a:**
+  `analysis/planner-refactor-take3/c13a-limit-sort-census-20260906/`
+  (`EXPLAIN ANALYZE` over all 99 SF0.5 queries at `00688e96c`, 99/99 rc=0).
+  The structural hypothesis is CONFIRMED — goopg stacks **77** bindable
+  `Limit → Sort` pairs against PG's 54, counted by the same tool — and it
+  buys nothing: **54 of the 77 sort an aggregate/window output**, so the
+  median actual input is **145 rows**, the largest is 324 249 (Q51, 1.9 ms),
+  and the **total** sort time across all 77 is **≤ 119.8 ms of 802 s
+  (0.015 %)**. **0 of 100 sorts in the corpus spill** (largest footprint
+  26 MB = 10 % of the 256 MiB `sortChunkBytes`), so the design's strongest
+  argument — a bound removes the spill outright — has no witness at all.
+  Estimates could not have answered this: goopg's `Sort` row estimates on
+  these nodes are wrong by 789× (Q22), 8007× (Q99) and 245 587× the other
+  way (Q78).
+  **Dispositions:**
+  **C-13a — DEFERRED** (not cancelled, not wrong): cheap and correct, but
+  neither corpus can measure it; reconsider when a top-N-over-raw-rows
+  corpus exists (`ORDER BY <ungrouped col> LIMIT k` over a large scan/join),
+  which TPC-H (no LIMIT) and TPC-DS (LIMIT over grouped output) both lack.
+  Note the gate that looks like it covers C-13a does not: the SF0.5 harness
+  reports `ck=n/a` for exactly the LIMIT-saturated queries C-13a touches.
+  **C-13b — KEEP, with C-12, as a cost-model correctness item and NO timing
+  claim**; the census adds a warning the design lacked — `limit_tuples`'
+  branch conditions compare against the estimates above, so C-13b moves
+  costs on 3-orders-of-magnitude-wrong inputs and needs an in-commit
+  plan-gate re-pin with the diff read line by line.
+  **C-14 is not the better item here either**: goopg's Q67 sort — PG's own
+  Incremental Sort case — is 1.0 ms over 115 150 rows. General finding: no
+  sort-side item has a runtime witness in this corpus; all sorting in all 99
+  queries is under 0.2 % of corpus wall time.
+  *design: take3 08 §7 + `docs/design/planner-p4-upper-rels/DESIGN.md` §6.6
+  (which prescribed this outcome in advance);
+  measurement: `analysis/planner-refactor-take3/c13a-limit-sort-census-20260906/`;
+  gate when resumed: take3 09 §5 P4 (PP + timing; the SF0.5 checksum arm is
+  NOT a correctness gate for this item — see above).*
 - [ ] **C-14 P4-05 Incremental Sort** node + `create_incremental_sort_path`.
   No executor counterpart exists — BLOCKED: resume after executor support
   and excluded from closure until then. Publish the executor input
