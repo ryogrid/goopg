@@ -244,7 +244,22 @@ That is TODO_ALL **C-12**'s subject, not this item's, and it is recorded
 here because it means "goopg's sort cost model" currently describes a
 strictly smaller thing than it appears to. Any spill calibration reasoned
 from suite-wide sort behaviour would be reasoning about nodes the model
-does not price. Referred to the C-11/C-12/C-13 design.
+does not price. Now settled by that design
+(`docs/design/planner-p4-upper-rels/DESIGN.md`, `bc1fc622c`), which reaches
+the same conclusion from the other side and adds two facts this item
+should carry:
+
+- top-level sorts are priced by `DeriveLegacyDisplayCost`, i.e. at zero,
+  and that function's own header already names Phase 4 as its deleter —
+  so **C-12 is cost-MOVING, not cost-neutral**, and needs an in-commit
+  `plan-gate` re-pin;
+- a fresh upper rel with `NCols == 0` would silently suppress
+  `costSortRun`'s external-merge arm, pricing a 1.5M-row spilling sort as
+  an in-memory quicksort. That is the same defect class as §3.2 and §3.3
+  here — a spill charge that does not fire — so whoever lands C-11 must
+  populate `Rows`/`Width`/`NCols`/`AvgVarBytes`, and Cut 1 of this item
+  should land before or with it so the widened signature is already
+  there.
 
 **6.2 Measure the real batch-file bytes per row — ANSWERED
 ANALYTICALLY, 2026-09-06, and it refutes the scalar-multiplier plan.**
