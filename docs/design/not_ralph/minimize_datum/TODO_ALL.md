@@ -1020,9 +1020,20 @@ rule).*
   Gates: `go build ./...`, `go vet`, full `go test ./internal/optimizer/
   ./internal/executor/` green; units scope of `ralph-precommit-test.sh`
   green; pgbench smoke green (commit hook).
+  **ANSWERED by C-19f (2026-09-06)**: with a joinrel's own partial paths
+  the Gather does become choosable by cost, and the A/B this row asked
+  for was run — 7 TPC-H plans move, values 7/7 MATCH, Q21 −51 %, Q9
+  +94 %, Q10 +30 %, suite total inside its own spread. The default still
+  does not move; the arithmetic and the plans are in
+  `docs/design/planner-c19f-parallel-hashjoin/DESIGN.md` §10. Two of
+  C-19d's own `createPlan` arms were also found broken there and fixed
+  (`125c4c016`): `createGatherPlan` built the node with a struct literal
+  instead of `NewGather` (zero output columns) and `*Gather` did not
+  embed `searchedTree` — both unreachable until a Gather could win at a
+  search root.
   *design: take3 08 §8 + docs/design/planner-c19d-gather-paths/DESIGN.md;
-  gate: take3 09 §5 P5 (PP, parallel-on + serial control) — outstanding,
-  needs the bench cluster.*
+  gate: take3 09 §5 P5 (PP, parallel-on + serial control) — run under
+  C-19f, see that row.*
 - [ ] **C-19e P5-05 re-decide Gather Merge → Sort → Parallel scan by
   cost** rather than `sortPartialRootPays`' hard-coded decline. If goopg's
   costs still choose leader-side sorting, record it as a permitted
