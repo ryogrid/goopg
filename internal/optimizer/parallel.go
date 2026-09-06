@@ -327,7 +327,19 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 			// worker count until after this walk has chosen a target. There is
 			// no circularity — the sizing input (agg.Child) is in scope right
 			// here — so the resolution is simply to size it now.
-			if splitAggregateIsProfitable(agg, computeParallelWorkers(agg.Child, s), s.LeaderParticipates) {
+			//
+			// C-19g (P5-07): the verdict is now a two-candidate PATH
+			// tournament — Finalize->Gather->Partial against
+			// Agg->Gather->input — priced by `costAgg` + `cost_gather` and
+			// adjudicated by `addPath`/`setCheapest`
+			// (partialaggpaths.go). `GOOPG_PARTIAL_AGG_PATHS=off`, the
+			// default until the measurement in
+			// docs/design/planner-c19g-partial-agg/DESIGN.md §6 says
+			// otherwise, delegates to the retired size rule unchanged.
+			// The construction site below is unchanged and is still the
+			// ONLY one, which is what makes double-splitting structurally
+			// impossible.
+			if partialAggSplitPays(agg, computeParallelWorkers(agg.Child, s), s.LeaderParticipates) {
 				return partialTarget{node: agg, splitAgg: true}, true
 			}
 		}
@@ -425,7 +437,7 @@ func terminatesPartial(n Node) bool {
 		*Aggregate, *Sort, *Gather, *GatherMerge:
 		// Aggregate reaches here only when the split was REFUSED — either the
 		// node is not decomposable (aggregateSplitIsSafe) or the cost model
-		// declined (splitAggregateIsProfitable). Terminating is then correct
+		// declined (partialAggSplitPays). Terminating is then correct
 		// and is the fallback the model costs against: the Gather goes below
 		// the aggregate, which is the pre-P9 shape.
 		//

@@ -94,6 +94,9 @@ var flagResolvedState = map[string]func(string) string{
 	// to parallelise. Rendered through the same label function the resolver
 	// uses, so the token inside `unset(…)` re-exported reproduces the arm.
 	"GOOPG_GATHER_PATHS": func(v string) string { return gatherPathModeLabel(gatherPathModeFromEnv(v)) },
+	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
+		return partialAggModeLabel(partialAggModeFromEnv(v))
+	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -147,6 +150,7 @@ var flagProvenanceOrder = []string{
 	// into the search. Default `off` pending the TPC-H A/B that decides it
 	// (docs/design/planner-c19d-gather-paths/DESIGN.md §5).
 	"GOOPG_GATHER_PATHS",
+	"GOOPG_PARTIAL_AGG_PATHS",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the
