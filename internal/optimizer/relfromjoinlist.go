@@ -315,10 +315,11 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 			// Refusing here is a decline of the whole statement, not of this
 			// item — `planJoinlistSearch`'s error makes the seam fall back to
 			// the syntactic tree (03 §4.2), which still carries the outer join
-			// on its own node. The seam peels an outer SPINE off before it gets
-			// here (`splitOuterSpine`, joinsearchseam.go), so what reaches this
-			// arm is an outer join the peel could not lift out: one below an
-			// inner link, or on a non-first comma FROM item.
+			// on its own node. C-04c admitted the last positional shapes the
+			// peel could not lift out (below an inner link, non-first comma
+			// item), so what reaches this arm is a join type the search has no
+			// producer for — FULL — rather than a LEFT/RIGHT link in an
+			// awkward place.
 			return joinlistRel{}, fmt.Errorf(
 				"join search: joinlist item %d is a pinned %s join, which the search cannot rebuild",
 				i, joinTypeName(it.jointype))

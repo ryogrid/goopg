@@ -59,28 +59,60 @@ package optimizer
 // the prefix is the link's left side and the seam pushes conjuncts INTO it (see
 // `splitOuterSpine`).
 //
+// C-04a/b/c: an outer link is no longer peeled at all on the shapes those
+// slices admit. LEFT (C-04a) and RIGHT (C-04b, recorded as the LEFT join it
+// reduces to) enter the flattened chain as LINKS of the search problem, and
+// C-04c removed the last positional restriction — a link below an INNER one,
+// or on a non-first comma FROM item, is admitted by the same per-link
+// machinery. `splitOuterSpine` still exists for what remains pinned (FULL, and
+// every outer link under `GOOPG_PGSHAPED_COLLAPSE=0`).
+//
 // Four shapes are declined and each decline is a correctness statement, not a
 // tuning knob:
 //
-//   - a chain whose outer join is NOT part of the top spine — one below an inner
-//     link, or on a non-first comma FROM item. `extractSearchLeaves` stops at it
-//     and returns that node as a leaf, so the leaf count disagrees with the
-//     prefix's relation count and the statement falls back to the syntactic
-//     shape. `a LEFT JOIN b ON … JOIN c ON …` is therefore still declined whole,
-//     rather than searched from a joinlist whose leaf indices would subscript
-//     bindings the leaves do not correspond to. `makeRelFromJoinlist` declines
-//     it a second time, from the joinlist side (P5.9-s), so a shape that slipped
-//     past the walk cannot be planned as an inner join by accident;
-//   - an `ON` qual on an item that is not the FIRST comma-separated FROM item.
+//   - a chain carrying a join type the search has no jointype-aware producer
+//     for: FULL. `extractSearchLeaves` stops at it and returns that node as a
+//     leaf, so the leaf count disagrees with the prefix's relation count and
+//     the statement falls back to the syntactic shape. `makeRelFromJoinlist`
+//     declines it a second time, from the joinlist side (P5.9-s), so a shape
+//     that slipped past the walk cannot be planned as an inner join by
+//     accident;
+//   - an outer link inside ANOTHER outer link's nullable side. C-04c admitted
+//     this shape, measured it, and put the decline back: `(a LEFT JOIN b)
+//     RIGHT JOIN c` returned rows PG does not, because
+//     `buildJoinRelRestrictList` re-applies the LOWER link's own `ON` clause at
+//     the upper join as an outer-join filter clause — its relids are a subset
+//     of the upper SJI's nullable hand, and goopg re-scans one flat clause list
+//     per pair where upstream removes an applied clause from the per-rel
+//     `joininfo` lists. The clause then filters the rows the upper join exists
+//     to null-extend. Ledger `c04c-nested-outer-refilters-lower-on-qual`;
+//   - an INNER link's `ON` conjunct that reaches the NULLABLE side of an
+//     admitted outer link BELOW it. An inner qual may be placed anywhere at or
+//     above its OWN join, and until C-04c every admitted inner link sat below
+//     every admitted outer one, so that licence implied "at or above every
+//     outer link" for free. It does not once an outer link can sit below an
+//     inner one: `partitionConjunctsForJoinPlanning` has no nullable-side
+//     guard, so a single-relation conjunct becomes a leaf-local filter
+//     evaluated below the join that produces the NULLs, and a spanning one can
+//     be placed at a join inside the nullable side. Upstream's answer is
+//     `check_outerjoin_delay`'s `required_relids` widening, which goopg's
+//     `restrictInfo` has no field for; holding the conjunct above instead
+//     would remove the only join clause between two halves of the problem, a
+//     cross product where the statement wrote a join. So the shape declines —
+//     which is exactly its pre-C-04c verdict — and the widening is ledgered;
+//   - an `ON` qual the seam cannot re-base into the statement's coordinates.
 //     `planFromItem` resolves a chain's quals in that ITEM's coordinates
-//     (planner.go:2178-2190 — `mergedCtx` is built from the item's own
-//     `leftCtx`), while `planFromClause` shifts only the BINDINGS when it
-//     crosses items (planner.go:1985-1999). Re-basing the qual is one call to
-//     `shiftColumnRefsBy`, but that rewriter answers `return e` for an
-//     expression kind it does not know, which would leave a ColumnRef reading
-//     the wrong column instead of failing — a wrong answer, and the class this
-//     milestone exists to remove. So the seam admits the shift-free case (base
-//     0) and declines the rest; ledgered, not silently half-done;
+//     (`mergedCtx` is built from the item's own `leftCtx`), while
+//     `planFromClause` shifts only the BINDINGS when it crosses items, so a
+//     non-first comma item's qual is written `base` columns low. C-04c
+//     re-bases it with `rebaseChainQual`, and the reason that is safe when
+//     the header's earlier judgement said it was not is the REWRITER: the
+//     shift is built on `cloneExprRefs`, whose child-slot primitive a
+//     build-time gate keeps exhaustive over all 32 Expr types and which
+//     ABORTS on one it does not know, where `shiftColumnRefsBy` (13 arms of
+//     32) answers `return e` and would leave a ColumnRef reading the wrong
+//     column. A qual carrying an inner plan is declined outright — a
+//     subquery's coordinate space is not this one;
 //   - a LATERAL item, whose rows depend on an item to its left. The search
 //     chooses an order, so admitting one would be a wrong answer, not a slow
 //     one. The flattened leaf list cannot see the marker — it lives on the
@@ -332,8 +364,39 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			conjuncts = append(conjuncts, c)
 		}
 	}
+	// C-04c: an INNER link's `ON` conjunct that reaches the NULLABLE side of an
+	// admitted outer link BELOW it declines the statement.
+	//
+	// The licence the file header states for an inner qual — "anywhere at or
+	// above its join" — is about the qual's OWN join, and until C-04c every
+	// admitted inner link sat below every admitted outer one, so that licence
+	// implied "at or above every outer link" for free. It does not any more.
+	// `partitionConjunctsForJoinPlanning` has no nullable-side guard, so a
+	// single-relation conjunct on the nullable side becomes a leaf-local filter
+	// evaluated BELOW the join that produces the NULLs (`… JOIN c ON b.y IS
+	// NULL` over `a LEFT JOIN b` then selects `b` rows instead of unmatched
+	// `a` rows), and a spanning one can be placed at a join inside the nullable
+	// side when the search is free to build one.
+	//
+	// The correct answer is upstream's `required_relids` widening: the qual is
+	// delayed to the lowest join covering the outer link's own hands. goopg's
+	// `restrictInfo` has no such field, and holding the conjunct in the residual
+	// `Filter` instead is correct but removes the only join clause between two
+	// halves of the problem — a cross product where the statement wrote a join.
+	// So the shape DECLINES, which is exactly the behaviour it had before C-04c
+	// (the whole statement fell back to the syntactic tree), and the widening is
+	// ledgered as the resume point.
 	for _, q := range onQuals {
-		conjuncts = append(conjuncts, splitAnd(q)...)
+		for _, c := range splitAnd(q.pred) {
+			if q.belowNullable != 0 {
+				rs, attributable := relidsOfExpr(c, cumOffsets)
+				if !attributable || relsOverlap(rs, q.belowNullable) {
+					traceSeamDecline("inner-on-qual-above-outer", nrels, nprefix)
+					return node, pred, false
+				}
+			}
+			conjuncts = append(conjuncts, c)
+		}
 	}
 	// take2 P1-20: give the SEARCH the equivalence class's CONSTANTS.
 	//
@@ -485,7 +548,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		outputColsKnown: ctx.outputColsKnown,
 		spineAbove:      len(spine) > 0,
 		pinAbove:        ctx.pinAbove,
-		corrAbove:       exprHasOuterRef(pred) || exprHasOuterRefList(onQuals),
+		corrAbove:       exprHasOuterRef(pred) || exprHasOuterRefList(chainOnQualPreds(onQuals)),
 		// joinInfoList is root->join_info_list from jointree deconstruction,
 		// consumed by join_is_legal/joinOrderRestricted/hasJoinRestriction
 		// inside the search (M0128-P1.2).
@@ -879,7 +942,7 @@ func outerOnQualsOK(links []outerChainLink, cumOffsets []int) bool {
 //
 // Only multi-leaf nullable sides are tested, so C-04a's shapes take exactly
 // the path they took before: a single-leaf nullable side holds no inner link.
-func innerOnQualsBelowNullableOK(onQuals []Expr, links []outerChainLink, cumOffsets []int) bool {
+func innerOnQualsBelowNullableOK(onQuals []chainOnQual, links []outerChainLink, cumOffsets []int) bool {
 	var nullable RelSet
 	for _, lk := range links {
 		if lk.nullable != 0 && lk.nullable&(lk.nullable-1) != 0 {
@@ -890,7 +953,7 @@ func innerOnQualsBelowNullableOK(onQuals []Expr, links []outerChainLink, cumOffs
 		return true
 	}
 	for _, q := range onQuals {
-		for _, c := range splitAnd(q) {
+		for _, c := range splitAnd(q.pred) {
 			rs, ok := relidsOfExpr(c, cumOffsets)
 			if !ok {
 				// Unattributable: the seam cannot say which side it reads,
@@ -956,66 +1019,94 @@ func searchConsumes(c Expr, cumOffsets []int) bool {
 // numbers a chain's bindings left to right and `planFromClause` appends items
 // in FROM order (03 §6.1's leaf-numbering guarantee), and this walk visits Left
 // before Right at every level.
-func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []Expr, outer []outerChainLink, ok bool) {
+func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []chainOnQual, outer []outerChainLink, ok bool) {
 	width := 0
-	// onSpine marks the path from the chain's ROOT down through LEFT links'
-	// left inputs — C-04a's "LEFT spine". A LEFT link reached any other way
-	// (below an INNER link, or on a LEFT link's own nullable side) is C-04c's
-	// scope and is declined here, so the slice admits exactly the shape it was
-	// gated on. Descending into an INNER link therefore clears the flag for
-	// BOTH of its inputs.
+	// `preserved` marks a subtree NO admitted outer link null-extends, and it
+	// is C-04a/b's `onSpine` flag WIDENED rather than deleted.
 	//
-	// C-04b admits RIGHT links on the same spine, with the flag's meaning
-	// unchanged — it marks PRESERVED-side descent. A RIGHT link null-extends
-	// its LEFT input, so the walk below its left input is a nullable-side
-	// descent and clears the flag: `(a LEFT JOIN b) RIGHT JOIN c` is
-	// `c LEFT JOIN (a LEFT JOIN b)`, an outer link on a nullable side, and
-	// declines for the reason the LEFT-under-LEFT shape does. The INNER links
-	// under it are admitted (an inner chain is exactly what a RIGHT link's
-	// nullable side holds), and the seam then owes a proof that their `ON`
-	// quals stay below the link — `innerOnQualsBelowNullableOK`.
-	var walk func(n Node, onSpine bool) bool
-	walk = func(n Node, onSpine bool) bool {
+	// C-04a cleared the flag for both inputs of an INNER link, so a LEFT link
+	// below an inner one — `a LEFT JOIN b ON … JOIN c ON …` — was declined
+	// together with the genuinely hazardous shapes. That was one restriction
+	// doing two jobs. An inner join PRESERVES both its inputs, so descending
+	// one carries the flag through unchanged (C-04c); what clears it is
+	// descending into a side some link null-extends: a LEFT link's right input,
+	// a RIGHT link's left input.
+	//
+	// An outer link met on a cleared path is still DECLINED, and after C-04c
+	// that is a measured decision rather than an inherited one. The shape
+	// `(a LEFT JOIN b) RIGHT JOIN c` — an outer link inside another's nullable
+	// side — was admitted during C-04c and returned WRONG ROWS:
+	// `buildJoinRelRestrictList` (joinrestrict.go) classifies the LOWER link's
+	// own `ON` clause as an outer-join FILTER clause for the upper link (its
+	// relids are a subset of the upper SJI's nullable hand), and re-applies it
+	// at the upper join — where it filters exactly the rows that join was
+	// supposed to null-extend. Upstream cannot reach that: a clause applied at
+	// a lower join is removed from the per-rel `joininfo` lists, while goopg
+	// re-scans one flat clause list per pair. Ledger row
+	// `c04c-nested-outer-refilters-lower-on-qual`; the pin is
+	// `TestSeamDeclinesAnOuterLinkUnderARightLinksNullableSide`
+	// (joinsearch_rightlink_test.go), which C-04c therefore leaves standing.
+	//
+	// The walk's return value is the union of the NULLABLE sides of every
+	// admitted outer link at or below `n`, which is what an INNER link ABOVE
+	// such a link needs in order to state where its own `ON` qual may go
+	// (`chainOnQual`). It is non-zero only for C-04c's shapes: before them an
+	// admitted inner link always sat below every admitted outer one.
+	var walk func(n Node, preserved bool) (RelSet, bool)
+	walk = func(n Node, preserved bool) (RelSet, bool) {
 		if n == nil {
-			return false
+			return 0, false
 		}
 		j, isJoin := n.(*Join)
 		if !isJoin || (j.Type != JoinTypeCross && j.Type != JoinTypeInner && j.Type != JoinTypeLeft && j.Type != JoinTypeRight) {
 			scans = append(scans, n)
 			widths = append(widths, len(n.Output()))
 			width += len(n.Output())
-			return true
+			return 0, true
 		}
-		if (j.Type == JoinTypeLeft || j.Type == JoinTypeRight) && !onSpine {
-			return false
+		if (j.Type == JoinTypeLeft || j.Type == JoinTypeRight) && !preserved {
+			return 0, false
 		}
 		// The link's own coordinate origin: the leaves to its left have already
 		// been counted, and its qual was resolved against a schema that starts
 		// at its leftmost leaf, so this is the delta between the two spaces.
 		base := width
 		loLeft := len(scans)
-		if !walk(j.Left, onSpine && j.Type == JoinTypeLeft) {
-			return false
+		nullLeft, ok := walk(j.Left, preserved && j.Type != JoinTypeRight)
+		if !ok {
+			return 0, false
 		}
 		loRight := len(scans)
-		if !walk(j.Right, false) {
-			return false
+		nullRight, ok := walk(j.Right, preserved && j.Type != JoinTypeLeft)
+		if !ok {
+			return 0, false
 		}
 		hiRight := len(scans)
+		below := nullLeft | nullRight
 		if j.Type == JoinTypeLeft || j.Type == JoinTypeRight {
-			// The non-zero-offset decline extends to admitted outer links for
-			// the reason it exists on INNER ones (file header): a misattributed
-			// coordinate is a wrong answer, not a lost plan. It is checked even
-			// though the SIDES below are leaf-index ranges (which are global and
-			// need no re-basing), because the link's own `ON` qual does need it.
-			if j.Predicate != nil && base != 0 {
-				return false
+			// C-04c: a non-zero base is no longer a decline. It is the
+			// NON-FIRST COMMA FROM ITEM case of the file header, and the
+			// re-basing it calls unsafe is unsafe only in the spelling it had
+			// in mind (`shiftColumnRefsBy`, which answers `return e` for an
+			// expression kind it does not know and would leave a ColumnRef
+			// reading the wrong column). `rebaseChainQual` is built on
+			// `cloneExprRefs`, whose child-slot primitive is exhaustive over
+			// every Expr type by a build-time gate and which ABORTS on an
+			// unknown one — so an unshiftable qual declines the statement
+			// instead of being silently half-shifted.
+			pred := j.Predicate
+			if pred != nil && base != 0 {
+				shifted, okShift := rebaseChainQual(pred, base)
+				if !okShift {
+					return 0, false
+				}
+				pred = shifted
 			}
 			lk := outerChainLink{
 				jointype:  parser.JoinLeft,
 				preserved: leafRangeRelSet(loLeft, loRight),
 				nullable:  leafRangeRelSet(loRight, hiRight),
-				pred:      j.Predicate,
+				pred:      pred,
 			}
 			if j.Type == JoinTypeRight {
 				// C-04b: the link is recorded as the LEFT join it reduces to
@@ -1027,21 +1118,106 @@ func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []Expr,
 				lk.jointype, lk.preserved, lk.nullable = reduceRightLink(lk.preserved, lk.nullable)
 			}
 			outer = append(outer, lk)
-			return true
+			return below | lk.nullable, true
 		}
 		if j.Predicate == nil {
-			return true
+			return below, true
 		}
-		if j.Type != JoinTypeInner || base != 0 {
-			return false
+		if j.Type != JoinTypeInner {
+			// A CROSS link carrying a qual is a shape `planFromClause` /
+			// `planFromItem` never build, so it is not one this walk may
+			// reinterpret.
+			return 0, false
 		}
-		onQuals = append(onQuals, j.Predicate)
-		return true
+		pred := j.Predicate
+		if base != 0 {
+			shifted, okShift := rebaseChainQual(pred, base)
+			if !okShift {
+				return 0, false
+			}
+			pred = shifted
+		}
+		onQuals = append(onQuals, chainOnQual{pred: pred, belowNullable: below})
+		return below, true
 	}
-	if !walk(node, true) {
+	if _, okWalk := walk(node, true); !okWalk {
 		return nil, nil, nil, nil, false
 	}
 	return scans, widths, onQuals, outer, true
+}
+
+// chainOnQual is one INNER link's `ON` qual as the walk flattened it, plus the
+// union of the nullable sides of every admitted outer link STRICTLY BELOW that
+// link — C-04c.
+//
+// The set is the whole reason the field exists. An inner link's qual may be
+// placed anywhere at or above its own join (file header), and until C-04c every
+// admitted inner link sat BELOW every admitted outer one, so "at or above its
+// own join" was automatically "at or above every outer link" and the licence
+// was unconditional. Admitting an outer link below an inner one breaks that:
+// `a LEFT JOIN b ON a.x = b.x JOIN c ON b.y IS NULL` has an inner `ON` conjunct
+// reading the LEFT link's NULLABLE side, and
+// `partitionConjunctsForJoinPlanning` — which has no nullable-side guard —
+// would make it a leaf-local filter on `b`, evaluated BELOW the join that
+// produces the NULLs. `IS NULL` then selects `b` rows rather than unmatched `a`
+// rows and the statement returns different rows, which is finding-1's shape
+// one level up.
+//
+// `belowNullable` is in leaf-index space, like `outerChainLink`'s sides, so the
+// consumer can test it against `relidsOfExpr(…, cumOffsets)` directly.
+type chainOnQual struct {
+	pred          Expr
+	belowNullable RelSet
+}
+
+// rebaseChainQual re-expresses a chain qual written in ONE FROM item's own
+// coordinates (`planFromItem` resolves a chain's quals against that item's
+// `leftCtx`, which starts at column 0) in the STATEMENT's coordinates, which
+// is what every leaf-index and `cumOffsets` computation below the seam speaks.
+// `delta` is the column offset of the link's leftmost leaf — the item's own
+// start, since a FROM item's chain is left-deep.
+//
+// It is `cloneExprRefs` and not `shiftColumnRefsBy`, and the difference is the
+// one the file header calls a correctness statement. `shiftColumnRefsBy` is a
+// hand-written type switch over a SUBSET of the Expr types (13 of 32, pinned by
+// `exprwalk_inventory_test.go`) that answers `return e` for the rest, so a
+// ColumnRef nested inside an unenumerated node would come back UNSHIFTED —
+// reading a different relation's column, a wrong answer rather than a lost
+// plan. `cloneExprRefs` is built on `exprChildSlots`, which a build-time gate
+// (`exprwalk_exhaustive_test.go`) keeps exhaustive over all 32 types in both
+// directions, and it ABORTS instead of no-opping when it meets one it does not
+// know. So the unsafe half of the header's decline is answered by the driver,
+// not by the caller's diligence.
+//
+// `scopeVeto` declines any qual containing a sublink or other inner plan: the
+// inner plan's own coordinate space is not this one, its correlated references
+// are `OuterColumnRef`s resolved against a scope this shift knows nothing
+// about, and no driver in this package descends a subplan. Declining is the
+// conservative answer — the statement falls back to the syntactic tree, which
+// carries the qual on its own node in its own coordinates.
+func rebaseChainQual(e Expr, delta int) (Expr, bool) {
+	if e == nil {
+		return nil, true
+	}
+	if delta == 0 {
+		return e, true
+	}
+	out, ok := cloneExprRefs(e, scopeVeto, exprRewriter{
+		// The node handed to Rewrite is already the fresh shallow clone
+		// `cloneExprRefs` made, so mutating it cannot touch the tree the
+		// pre-search pipeline still holds (the seam may yet DECLINE, and a
+		// decline must return `node`/`pred` untouched).
+		Rewrite: func(x Expr) Expr {
+			if cr, isCol := x.(*ColumnRef); isCol {
+				cr.Index += delta
+			}
+			return x
+		},
+	})
+	if !ok {
+		return nil, false
+	}
+	return out, true
 }
 
 // outerChainLink is one OUTER link `extractSearchLeaves` admitted into the
@@ -1060,6 +1236,20 @@ type outerChainLink struct {
 	jointype             parser.JoinType
 	preserved, nullable  RelSet
 	pred                 Expr
+}
+
+// chainOnQualPreds is the bare predicate list of a `chainOnQual` slice, for the
+// two consumers that ask a question about the EXPRESSIONS alone (outer-reference
+// detection) rather than about where they sit in the chain.
+func chainOnQualPreds(qs []chainOnQual) []Expr {
+	if len(qs) == 0 {
+		return nil
+	}
+	out := make([]Expr, len(qs))
+	for i, q := range qs {
+		out[i] = q.pred
+	}
+	return out
 }
 
 // leafRangeRelSet is the relset of the half-open leaf range [lo, hi).

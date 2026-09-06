@@ -632,9 +632,52 @@ rule).*
   RIGHT-over-derived fixture). Also closes a hole C-04a opened: a pinned
   LEFT/RIGHT item reaching the search as a two-item problem is now checked
   against `join_info_list`, fail-closed. Gates as C-05 above.
-- [ ] **C-04c P3-04 below-inner + non-first-comma LEFT links.**
+- [x] **C-04c P3-04 below-inner + non-first-comma LEFT links.**
   Non-spine LEFT admission. *design: C-04 DESIGN.md §5 C-04c; gate as
   C-04a.*
+  **LANDED.** `extractSearchLeaves`' `onSpine` flag is WIDENED, not
+  deleted: an INNER join preserves both its inputs, so descending one
+  carries the flag through (C-04a cleared it, which is what declined a
+  LEFT link below an inner one); what clears it is descending into a side
+  some link null-extends. The non-first-comma decline is lifted by
+  `rebaseChainQual`, built on `cloneExprRefs` — exhaustive over all 32
+  Expr types by a build-time gate and fail-closed on an unknown one,
+  which is exactly the property `shiftColumnRefsBy` (13 arms of 32,
+  `return e` for the rest) lacks and the reason the file header called
+  the re-base unsafe. It lifts for INNER links too; the check was one
+  test for both.
+  **Two shapes stay declined, both measured rather than inherited:**
+  (a) an INNER link's `ON` conjunct reaching the nullable side of a link
+  BELOW it — an inner qual's "anywhere at or above its own join" licence
+  stopped implying "at or above every outer link" the moment an outer
+  link could sit below an inner one, and the correct answer is upstream's
+  `required_relids` widening, which `restrictInfo` has no field for
+  (`chainOnQual.belowNullable`; ledger
+  `c04c-inner-on-qual-above-outer-declines`);
+  (b) an outer link inside ANOTHER outer link's nullable side — ADMITTED,
+  MEASURED, RE-DECLINED. `nsj_t LEFT JOIN nsj_p ON t.id = p.id RIGHT JOIN
+  nsj_q ON t.id = q.id` returned `NULL|NULL|c` where PG returns
+  `3|NULL|c`: `buildJoinRelRestrictList` re-applies the LOWER link's own
+  `ON` clause at the upper join as an outer-join filter clause, filtering
+  the rows that join exists to null-extend. C-04b's decline pin
+  `TestSeamDeclinesAnOuterLinkUnderARightLinksNullableSide` therefore
+  STAYS, contrary to its own comment; ledger
+  `c04c-nested-outer-refilters-lower-on-qual`.
+  Tests: `joinsearch_c04c_test.go` (admission + the two declines + the
+  re-base primitive, including its fail-closed sublink arm),
+  `joinsearch_c04c_trace_test.go` (DPPATH jointype=left OFFERED/ACCEPTED
+  for both newly admitted positions, the collapse-split SJI-remap mirror
+  of C-04a's Q72 pin, and the Q78 outer-over-derived firewall verified on
+  the new shape with `with.go`-shaped Filter-wrapped CTE leaves),
+  `internal/executor/c04c_nonspine_join_admission_test.go` (11 VALUES
+  cases, under and over `join_collapse_limit`).
+  Gates: optimizer + executor suites green, vet clean; TPC-H 24/24 MATCH
+  by values, same-session A/B on a private clone 141.59 s -> 141.68 s
+  (+0.06 %), every mover under 0.25 s absolute; TPC-H plans
+  BYTE-IDENTICAL to HEAD; PLAN-PARITY 22/5/15/2 unchanged; plan-gate
+  22/22 structural and 22/22 MODE=costs against pin
+  `c05-c04b-20260907`, no re-pin needed; TPC-DS SF0.5 sweep (see the
+  commit).
 - [x] **C-05 P1-18 outer/semi/anti sizing — executes HERE, after C-04.**
   Port `calc_joinrel_size_estimate`'s jointype switch.
   *design: take3 08 §4 + §6.2; gate: EA ratchet.*

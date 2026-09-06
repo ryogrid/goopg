@@ -339,15 +339,19 @@ func TestPGShapedSeamDeclines(t *testing.T) {
 		}
 	})
 
-	t.Run("leaf count disagrees with binding count", func(t *testing.T) {
+	t.Run("INNER ON qual reading a lower link's nullable side", func(t *testing.T) {
 		node, ctx := seamFixture(names, []int64{100, 100, 100})
-		// `a LEFT JOIN b ON … JOIN c ON …`. M0127-P5.9-r taught the walk to
-		// descend INNER links, but an OUTER one still stops it: its qual is
-		// not a WHERE qual and reordering across it changes the rows. So the
-		// LEFT node comes back as ONE leaf for TWO bindings, the leaf count
-		// disagrees with the binding count, and the statement is declined
-		// whole — the joinlist's leaf indices would otherwise subscript
-		// bindings the leaves do not correspond to.
+		// `a LEFT JOIN b ON a.a0 = b.b0 JOIN c ON b.b0 = c.c0`. Until C-04c the
+		// walk stopped at the LEFT link below the INNER one, returned it as ONE
+		// leaf for TWO bindings, and the leaf count decline refused the
+		// statement. C-04c admits the link — and the statement still declines,
+		// for the reason that shape actually carries: the INNER link's `ON`
+		// qual reads the LEFT link's NULLABLE side from above it, and the seam
+		// has no way to say "place this at or above that link". Same verdict,
+		// a stated reason instead of an accident;
+		// `TestSeamDeclinesAnInnerOnQualReachingALinkBelowItsNullableSide` is
+		// its own pin, and the ADMITTED sibling (a preserved-side inner qual)
+		// is `TestSeamPlansALeftLinkBelowAnInnerLink`.
 		chain := node.(*Join)
 		chain.Left.(*Join).Type = JoinTypeLeft
 		chain.Left.(*Join).Predicate = rfjEq(names, 0, 1)
@@ -367,28 +371,6 @@ func TestPGShapedSeamDeclines(t *testing.T) {
 		node.(*Join).Lateral = true
 		if _, _, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil); used {
 			t.Fatal("the seam reordered an explicit JOIN chain with a LATERAL right side")
-		}
-	})
-
-	t.Run("ON qual on a non-first FROM item", func(t *testing.T) {
-		// `FROM a, b JOIN c ON b.b0 = c.c0`: the ON qual was resolved in the
-		// SECOND item's own coordinates, where `b0` is index 0, while the
-		// statement's space puts it at `rfjWidth`. Re-basing it needs a
-		// rewriter that answers "unchanged" for an expression kind it does not
-		// know, so the seam declines instead of shifting — see the file header.
-		node, ctx := seamFixture(names, []int64{100, 100, 100})
-		a, b, c := seamLeaves(t, node)
-		item := &Join{Type: JoinTypeInner, Left: b, Right: c,
-			schema: appendSchema(b.Output(), c.Output()),
-			Predicate: &BinaryOp{Op: parser.OpEq,
-				Left:  &ColumnRef{Name: "b0", Index: 0, SourceTableIdx: 1},
-				Right: &ColumnRef{Name: "c0", Index: rfjWidth, SourceTableIdx: 2}}}
-		root := &Join{Type: JoinTypeCross, Left: a, Right: item,
-			schema: appendSchema(a.Output(), item.Output())}
-		ctx.joinlist = deconstructJointree(
-			parseFrom(t, "a, b JOIN c ON b.b0 = c.c0"), defaultCollapseLimits(), pgShapedCollapseEnabled())
-		if _, _, used := tryPGShapedJoinSearch(root, seamLocal(names, 0), ctx, nil); used {
-			t.Fatal("the seam searched a chain whose ON qual it cannot re-base")
 		}
 	})
 
