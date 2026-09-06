@@ -161,6 +161,8 @@ going forward.
 | E-11 AIO `ReadStream` | n/a | n/a | **DROPPED** — no depth wins; the mechanism is inert where it ships |
 | C-19f partial hash-join path | 7/7 MATCH x 42 runs | TPC-DS 99/99 identical at default | **Q21 −51%**, Q9 +94%, Q10 +30%; default stays off |
 | E-14 keyed inner spill frames | 24/24 MATCH | byte-identical | neutral; retires `buildKeyOfRow` |
+| rowest B1 + A1 (estimate fixes) | 24/24 MATCH | shapes unchanged, 6 cost/rows lines moved | suite −1.4%, **Q2 −55%** |
+| coop parallel deform-bound fix | **corrects a silent wrong answer** | n/a | n/a |
 
 C-19a/b are the direct response to §5.6: the search now HAS partial paths
 and prices them with `cost_seqscan`'s parallel arm, but by construction
@@ -700,6 +702,96 @@ This is the third time in this workstream that **an unwinnable path turned
 out to be an untested path**. Budget for it: when a cost fix first makes a
 shape reachable, expect execution bugs in it, and force the shape in a test
 rather than trusting the planner to arrive there.
+
+## 5.14. The estimate fixes, and what a correct estimate is worth
+
+§5.11.1 diagnosed two row-estimation defects. Both are now fixed, and
+because an estimate change is a cost change, both needed a full arm.
+
+- **B1** — `resolveBaseColumn` gained its missing `*NestedLoopIndexJoin`
+  arm. Every column read above an NLI had resolved to nothing, so every
+  grouping variable priced at `DEFAULT_NUM_DISTINCT = 200` until the
+  independence product saturated and `estimateNumGroups` returned its own
+  *input* row count.
+- **A1** — `conjunctionSelectivity` now adds PG's
+  `s2 += nulltestsel(IS_NULL)` (`clausesel.c:292-294`). Without it both
+  range bounds excluded NULLs and the subtraction excluded them twice.
+
+Measured against the pre-change tree, fresh capped server per arm, pinned
+statistics:
+
+| | result |
+|---|---|
+| TPC-H values (`-diff`, by value) | **24/24 MATCH** |
+| TPC-H plan **shapes** | unchanged — 0 nodes added, 0 removed |
+| plan lines changed | 6, all of them `cost=`/`rows=` |
+| `make plan-gate` | exit 0 (Q9 MATCH) |
+| plan parity vs PG | 6/14, unchanged |
+| TPC-DS SF0.5 | PASS=95 MISMATCH=0 CKMISMATCH=0 |
+| suite timing | 106.51 s → 105.02 s, **−1.4%** |
+| Q2 | 1.67 s → 0.75 s, **−55%** |
+
+The plan diff is the interesting artifact, because it is exactly what a
+correct estimate fix should look like — no shape moved, and the estimates
+that moved moved toward the truth:
+
+```
+Q4  HashAggregate (cost=8672.02..8674.02 rows=200 …)
+ →  HashAggregate (cost=8672.02..8672.07 rows=5   …)
+```
+
+`rows=200` is `DEFAULT_NUM_DISTINCT` verbatim. That line is B1's signature
+in the plan, and it had been sitting in the committed TPC-H plans the whole
+time.
+
+Two honest caveats. The −1.4% suite figure is inside this suite's own
+run-to-run spread and is not a claim; **Q2's −55% is outside it and is**.
+And the fixes landed ungated because both agents were terminated by a
+session limit mid-gate — the arm above is the gate, run afterwards, and it
+is why this section exists rather than a commit message.
+
+## 5.15. The benchmark was measuring the wrong thing on TPC-DS
+
+Found by a direct question about buffer residency, and it is the kind of
+defect that invalidates measurements rather than code.
+
+goopg turns `shared_buffers` into pool slots as `shared_buffers / 8`. Both
+TPC-DS `postgresql.conf` files **left `shared_buffers` commented out**, so
+both clusters ran on the `128MB` GUC BootVal — 16,384 slots — while TPC-H
+had been explicitly tuned to `2048MB` (262,144 slots) since its setup
+script was written, and the PG TPC-DS reference runs `2GB`.
+
+Measured with `pg_stat_io`, not assumed:
+
+| cluster | pool | working set | evidence |
+|---|---:|---:|---|
+| TPC-H goopg | 2048 MiB | 1.9 GiB | 3 scans of 6M-row `lineitem`: reads **136,393**, evictions **0**, reads unchanged from scan 2 onward |
+| TPC-DS SF0.5 goopg | 128 MiB | 1.113 GiB (75 rels) | 2 scans of `store_sales`: reads **59,522**, evictions **43,138** |
+
+`store_sales` alone is 232 MiB — **1.8× the entire pool** — so nothing was
+ever resident and every scan re-read from the OS. Against PG's 2 GiB
+reference this also made any goopg-vs-PG TPC-DS timing a **16× unfair
+comparison on memory**.
+
+The two consequences are different and must not be conflated:
+
+- **No values gate was affected.** `tpcds-sf05-regression.sh` compares row
+  values against a git-tracked PG oracle; residency cannot change an
+  answer. Every `PASS=95 CKMISMATCH=0` in this report stands.
+- **TPC-DS timing taken before 2026-09-06 is I/O-bound.** The only such
+  numbers published here are the C-13a census wall times, and its
+  conclusion *strengthens*: the 802 s denominator was inflated by I/O the
+  fix removes while the sort times are CPU work, and the no-go rested on
+  median sort input 145 rows, largest sort 1.9 ms, and zero spills — none
+  of which residency touches.
+
+Fixed to `2048MB` on both clusters, with a start-time warning in
+`bench/tpcds/server.sh` so it cannot silently regress. The general lesson
+is the one §5.12 already taught in a different costume: **before believing
+a benchmark result, confirm the configuration under which it was taken.**
+That is twice in one day — once where the code never ran (every TPC-H plan
+being parallel made a prefetch sweep a five-way A/A), and once where the
+memory was 16× off.
 
 ## 6. What was dropped, and what it cost to find out
 
