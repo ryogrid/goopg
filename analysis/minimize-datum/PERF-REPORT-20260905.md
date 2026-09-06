@@ -147,6 +147,9 @@ going forward.
 | C-10a grouping-sets cardinality | 24/24 MATCH | byte-identical | within noise |
 | D-05 prereq #1 executor entry width | 24/24 MATCH | byte-identical | within noise |
 | hash `Memory Usage:` includes buckets | 24/24 MATCH | byte-identical | n/a (EXPLAIN text) |
+| **E-09a shared SPILLING hash build** | 24/24 MATCH | byte-identical | **Q9 8.85 s → 7.85 s (−11%)** |
+| C-19c parallel eligibility for plain index scans | 24/24 MATCH | byte-identical | within noise (shape not yet chosen) |
+| E-11 prefetch-depth knob (instrument only) | 24/24 MATCH | byte-identical | n/a (default unchanged) |
 
 C-19a/b are the direct response to §5.6: the search now HAS partial paths
 and prices them with `cost_seqscan`'s parallel arm, but by construction
@@ -320,6 +323,46 @@ The fix was kept rather than reverted because it is correct, costs nothing
 PASS=95 CKMISMATCH=0), and errs high. A larger divergence it exposed is
 ledgered rather than bundled: the planner's **cost** side still prices the
 un-narrowed build, at 530 B/row and 8 batches where the executor runs 4.
+
+## 5.8. The second real win: removing four redundant hash builds
+
+The 27% of §2.5 came from a cost constant. The second measured win came
+from the executor, and it is worth recording because it was found by
+reading an `EXPLAIN ANALYZE` line that had been visible all along.
+
+goopg partitions a parallel scan by block, so five participants share one
+probe side. Until E-09a it did **not** share the build side whenever the
+build spilled: `captureSharedBuild` published only a NON-spilling hash
+table, and declined the moment the build overflowed `work_mem` into
+batches. Every worker then rebuilt the entire inner side privately. On
+TPC-H Q9 that is five independent builds of the same 1.5M-row `orders`
+scan, and it was legible in every plan capture:
+
+```
+HEAD    Seq Scan on orders ... Worker 0..4: rows=1500000.00 loops=1
+        Build Time: 4307.315 ms          Execution 8.85 s
+E-09a   Worker 0..4:            rows=0.00 loops=0
+        Batches: 4 ...          Build Time: 2978.957 ms   Execution 7.85 s
+```
+
+`rows=1500000.00 loops=1` per worker on a side no worker should be
+scanning is the whole diagnosis. The fix (Variant A) publishes an
+IMMUTABLE batch descriptor — `nbatch`, `bucketBits`, `nbuckets`,
+`buildIsLeft`, read-only inner files — with growth frozen after prebuild,
+which is PG's own rule; each participant reloads a batch through its own
+reader into its own map. It introduces **no new synchronisation**, which
+is why it was separable from the harder half.
+
+Two honest qualifications. First, −11% on one query is close enough to
+this suite's ±17% per-query noise band that it is the WITNESS, not the
+timing, that carries the claim: the worker rows going 1.5M → 0 and the
+build count going 5 → 1 are not noise. Second, the memory multiplier is
+NOT fixed — each participant still materialises its own copy of a
+reloaded batch, so D-04's 506 MB live map is still five maps. That is
+E-09b (`sync.Once` per batch + refcount + a cancellation-aware wait), and
+it is deliberately a separate item because it introduces the executor's
+first cross-worker wait, whose failure mode under a LIMIT above a Gather
+is a deadlock or a silently partial join.
 
 ## 6. What was dropped, and what it cost to find out
 
