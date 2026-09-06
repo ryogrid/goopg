@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch ea-ratchet ea-ratchet-repin
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -68,6 +68,7 @@ help:
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
 	@echo "  make race-gate          Run concurrency-critical packages under -race (Go data race detector)."
 	@echo "  make plan-gate          Diff EXPLAIN plans against latest baseline; FAILS when unavailable (strict)."
+	@echo "  make ea-ratchet         Estimate-accuracy parity ratchet vs PG 18.3 over TPC-DS SF0.5 (~1h)."
 	@echo "  make parity-dashboard   Generate docs/parity-dashboard.md (GUC/SQLSTATE/catalog parity vs PG 18.3)."
 	@echo
 	@echo "  scripts/pg-oracle-diff.sh   Run SQL against goopg AND vanilla PG 18.3, diff output."
@@ -588,3 +589,32 @@ parity-dashboard:
 # ---------------------------------------------------------------
 nightly-batch:
 	@bash "$(REPO_ROOT)/ci/batch/run-nightly.sh"
+
+# ---------------------------------------------------------------
+# ea-ratchet: the estimate-accuracy parity ratchet (C-20a).
+#
+# Four TODO_ALL items (C-05, C-10a, C-20a, C-21) cite an "EA ratchet"
+# as their acceptance gate; ledger `take3-ea-ratchet-never-ran`
+# established that it had never run, because the instrument it named
+# (scripts/tpch-estimate-audit-arm.sh) was wired into no Makefile
+# target, no hook, no precommit script and no ci/batch stage, and its
+# pinned PG baseline was absent from the tree.  THIS target is the
+# wiring: the gate now has a name a person or a stage can invoke, so
+# it cannot silently not-run again.
+#
+# It measures goopg's EXPLAIN ANALYZE estimate against its own actual
+# row count over the TPC-DS SF0.5 corpus, at base-relation AND joinrel
+# granularity, and fails a node only when goopg is materially worse
+# than PostgreSQL 18.3 on the same relation set (bench/tpcds/plans-pg).
+# That PG-relative bar is the only one that passes Q47 — where PG also
+# emits rows=1 — and fails Q99's 8007x.
+#
+# Runs on its own clone and its own port; it never touches the SF0.5
+# gate's cluster on 65437.  ~1 h for a full capture.  To re-score a
+# capture without a server:  EA_CAPTURE=<file> make ea-ratchet
+# ---------------------------------------------------------------
+ea-ratchet:
+	@bash "$(REPO_ROOT)/scripts/estimate-parity-gate.sh"
+
+ea-ratchet-repin:
+	@EA_REPIN=1 bash "$(REPO_ROOT)/scripts/estimate-parity-gate.sh"
