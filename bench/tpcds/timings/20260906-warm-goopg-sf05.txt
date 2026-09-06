@@ -1,0 +1,141 @@
+# TPC-DS SF=0.5 warm-start query timings — goopg
+# captured: 2026-09-06T16:58:57.160522+09:00
+# repo commit at capture: f045f545c
+# engine build: 71307bcac
+# port: 65437  db: postgres
+# settings: shared_buffers=2GB work_mem=512MB effective_cache_size=4GB autovacuum=on
+# protocol: one WARM pass over queries 1..99 discarded, then ONE measured
+#   pass. Only one measured pass here (a pass costs ~40 min on goopg), so
+#   there is NO error bar in this file — unlike the TPC-H timings, a single
+#   query's number here must not be read as reproducible on its own.
+# harness: psql -f over bench/tpcds/runtime_goopg/tpcds-data/queries/
+# FAIL = non-zero exit or 300s timeout; this file records TIMING only, the
+#   correctness gate is scripts/tpcds-sf05-regression.sh against the
+#   git-tracked value oracle.
+# NOTE: seconds are machine-specific.
+#
+#
+# ===== TWO CAVEATS THAT CHANGE HOW THIS FILE READS =====
+#
+# (1) CONCURRENCY. The goopg (:65437) and PG (:65438) captures OVERLAPPED on
+#     this host — goopg finished 16:58, PG 16:52, both running most of that
+#     span together, each with up to 4 parallel workers. Both totals are
+#     therefore INFLATED by CPU contention. The goopg-vs-PG RATIO is the less
+#     damaged figure (both sides paid it), the absolutes are the more damaged.
+#     A quiet-host re-run is owed; ledger `tpcds-timing-concurrent-capture`.
+#
+# (2) THE TOTALS ARE NOT COMPARABLE AS PRINTED. PG's Q4 hit the 300 s budget
+#     and is recorded FAIL, so PG's TOTAL covers 98 queries while goopg's
+#     covers 99. Re-run cleanly afterwards, PG's Q4 still did not finish in
+#     400 s (exit 124); goopg runs the same query in 25.15 s. Adding a
+#     conservative 400 s for it:
+#
+#         goopg   1114.06 s over 99 queries
+#         PG     >= 985    s over 99 queries  (584.90 + >400)
+#
+#     i.e. roughly 1.1x rather than the 1.9x the printed totals suggest. A
+#     comparison that silently drops a timeout credits the engine that timed
+#     out, which is the opposite of conservative.
+#
+# query       secs
+Q1            1.91
+Q2           11.65
+Q3            0.07
+Q4           25.15
+Q5           15.92
+Q6           11.32
+Q7           10.19
+Q8            7.53
+Q9           11.70
+Q10           6.93
+Q11          16.60
+Q12           2.60
+Q13           6.72
+Q14          99.71
+Q15           4.70
+Q16          14.83
+Q17          10.23
+Q18          31.34
+Q19           0.28
+Q20           2.34
+Q21           0.68
+Q22          10.18
+Q23          72.49
+Q24          16.30
+Q25           5.38
+Q26           6.07
+Q27           7.78
+Q28          29.26
+Q29           5.28
+Q30           8.06
+Q31          12.53
+Q32           3.79
+Q33          12.81
+Q34           9.65
+Q35           8.96
+Q36           0.01
+Q37           2.94
+Q38          13.99
+Q39          11.69
+Q40           1.37
+Q41           8.05
+Q42           0.20
+Q43           7.21
+Q44           4.30
+Q45           2.78
+Q46          39.65
+Q47          13.16
+Q48           7.26
+Q49          16.55
+Q50           0.53
+Q51          11.45
+Q52           0.22
+Q53           0.76
+Q54          11.52
+Q55           0.11
+Q56          14.49
+Q57           6.00
+Q58          21.71
+Q59           9.46
+Q60          12.73
+Q61           1.78
+Q62           2.78
+Q63           0.70
+Q64          21.05
+Q65          13.50
+Q66           9.28
+Q67          13.88
+Q68          12.12
+Q69          14.50
+Q70           0.00
+Q71          13.15
+Q72           4.62
+Q73          11.35
+Q74           9.20
+Q75           8.52
+Q76           1.17
+Q77          14.91
+Q78          15.73
+Q79          74.56
+Q80          15.40
+Q81           6.21
+Q82           2.53
+Q83           2.15
+Q84           0.42
+Q85           1.18
+Q86           0.00
+Q87          13.08
+Q88          52.02
+Q89           1.07
+Q90           3.85
+Q91           1.91
+Q92           3.74
+Q93           1.76
+Q94           2.38
+Q95          13.88
+Q96           8.55
+Q97          10.82
+Q98           2.45
+Q99           8.78
+#
+# TOTAL    1114.06   (99 ok, 0 fail)
