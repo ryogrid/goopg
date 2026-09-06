@@ -158,6 +158,7 @@ going forward.
 | E-11 prefetch-depth knob (instrument only) | 24/24 MATCH | byte-identical | n/a (default unchanged) |
 | E-09b load-once-per-batch | forced-shape values green | n/a | n/a — **memory**: 1 live batch table where there were 4 |
 | C-19d `PathGather`/`PathGatherMerge` priced | 24/24 MATCH | byte-identical (ships default-OFF) | none by construction |
+| E-11 AIO `ReadStream` | n/a | n/a | **DROPPED** — no depth wins; the mechanism is inert where it ships |
 
 C-19a/b are the direct response to §5.6: the search now HAS partial paths
 and prices them with `cost_seqscan`'s parallel arm, but by construction
@@ -515,6 +516,69 @@ conditions compare against these numbers, C-19f's parallel crossover is a
 cost comparison, and the spill-cost work prices bytes as rows × width. And
 no gate in this repository catches it — the values gate compares results,
 plan parity compares shapes, and neither one looks at `rows=`.
+
+## 5.12. E-11: a five-way A/A, and the defect it exposed
+
+E-11 asked whether goopg should wire an AIO `ReadStream` with a depth
+policy. Five depths x three reps on one binary, fresh capped server per
+arm, values byte-identical across all fifteen arms x 24 queries:
+
+| depth | median suite total | vs control |
+|--:|--:|--:|
+| 0 | 138.35 s | +1.32% |
+| **4 (shipped default)** | **136.55 s** | — |
+| 16 | 141.17 s | +3.38% |
+| 64 | 142.37 s | +4.26% |
+| 128 | 134.14 s | −1.76% |
+
+The five medians span 6.1% **with no ordering in depth** — the deepest arm
+is the fastest, and d64 the slowest. The observed control-vs-control band
+was 40.2% worst / 12.0% median per query, and the depth-4 totals alone
+span 14.2%. Nothing wins, and nothing could: this is a five-way A/A.
+
+**Why it is an A/A is the finding.** `refillPrefetchWindow` returns early
+for a parallel scan by design, and **every TPC-H plan at bench settings is
+parallel** — captured live, Q6 renders `Gather` / `Workers Planned: 4` /
+`Parallel Seq Scan`. So the prefetch window is not exercised by the suite
+at all. Any future measurement of a serial-scan-path change against the
+TPC-H suite at default settings will measure nothing, in exactly this way.
+
+Forced serial (`-parallel-workers 0`, 7 scan-heavy queries), where the
+window is live, depth 0 is **−12.1%** on the subset and **−35.0%** on Q6,
+with the s0 and s4 repetition ranges disjoint. More prefetch measures
+*worse* where the mechanism actually runs.
+
+### 5.12.1 `Pool.Prefetch` allocates a buffer and throws it away
+
+The allocation arm names the cause. Over 8 serial Q6 executions,
+`Pool.Prefetch` is **63.8% of allocation objects and 90.1% of allocation
+bytes**; depth 4 costs 14.96M objects / 9.92 GB against depth 0's 5.29M /
+1.00 GB — 2.85x the object count, 9.9x the bytes, 50.1 s against 32.9 s
+wall, all far outside the 8.6%-wall / 1.9%-object control band.
+
+`Pool.Prefetch` (`internal/storage/bufpool.go:1346`) is nine lines:
+
+```go
+buf := make([]byte, BlockSize)
+_, _ = p.mgr.PrefetchBlock(tag.Rel, tag.Block, buf)
+```
+
+The buffer is never installed into the pool. I verified the surrounding
+facts rather than taking the report on trust: `io_method`'s BootVal is
+`worker`, so an AIO engine *is* attached in production and the read is
+genuinely issued — this is not a synchronous double-read. But since the
+result is discarded, the only effect that survives is warming the OS page
+cache, and the following `Pin` still performs a full read. PG's equivalent
+installs the buffer it will return (`StartReadBuffers`/`WaitReadBuffers`,
+`postgres/src/backend/storage/buffer/bufmgr.c`, driven from
+`aio/read_stream.c`), so no read is wasted.
+
+**The default was deliberately not flipped to 0**, and that restraint is
+the right call: all the evidence is warm-cache, where page-cache warming
+is worth nothing and only the allocation cost remains. Zeroing the
+constant would bank a warm-cache-only win and hide the actual bug. Ledger
+rows `take3-E-11-readstream-declined` and
+`take3-E-11-prefetch-discards-buffer`.
 
 ## 6. What was dropped, and what it cost to find out
 
