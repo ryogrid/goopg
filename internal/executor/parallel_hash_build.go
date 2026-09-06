@@ -344,7 +344,7 @@ func (s *channelSource) Next() (TupleSlot, error) {
 // planner has split the partial subtree accordingly: a Partial aggregate under
 // the Gather with a Finalize above it (optimizer/parallel.go, splitAgg), and
 // Gather Merge for the sorted case. The cooperative hash build has neither.
-// Its producers each call BuildWorker(buildPlan) and get the WHOLE aggregate,
+// Its producers each rebuild buildPlan and get the WHOLE aggregate,
 // then attachParallelScan partitions the scan beneath it — so N producers would
 // each aggregate their own partition and the consumer would union the partial
 // results into the hash table with no Finalize. For a HAVING sum(...) predicate
@@ -452,10 +452,21 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	buildPlan := o.plan.Right
 	buildSchema := o.right.Schema()
 	otherWidth := o.lazyLW
+	// EX1-01/EX1-02 deform bound. The producers below REBUILD this subtree
+	// from the plan, so they must build it at the bound the serial builder
+	// gave the same side (joinOp.deformLeftBound / deformRightBound). Using
+	// the root bound instead — which is what BuildWorker does — restarts the
+	// walk with no recorded consumer, and a build side such as
+	// `Filter(dk > 3) -> SeqScan(dk, dname)` then narrows to [0,1): the hash
+	// table is loaded with rows whose `dname` was never deformed, and the
+	// join returns the RIGHT NUMBER OF ROWS with a NULL payload. No error,
+	// no row-count change; see TestCoopParallelHashBuildValuesAcrossWorkMem.
+	buildBound := o.deformRightBound
 	if buildLeft {
 		buildPlan = o.plan.Left
 		buildSchema = o.left.Schema()
 		otherWidth = o.lazyRW
+		buildBound = o.deformLeftBound
 	}
 
 	scan := extractSeqScanFromPlan(buildPlan)
@@ -498,7 +509,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 			// goroutines build concurrently, so the mutex-serialized
 			// NIL handoff also keeps a concurrent Gather site's fresh
 			// table out of this tree.
-			tree, err := buildUnderNilScope(func() (Operator, error) { return BuildWorker(buildPlan) })
+			tree, err := buildUnderNilScope(func() (Operator, error) {
+				return buildNode(buildPlan, buildBound)
+			})
 			if err != nil {
 				return err
 			}

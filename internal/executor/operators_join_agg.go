@@ -320,6 +320,28 @@ type joinOp struct {
 	// maybeInstrument; nil when EXPLAIN ANALYZE is not active. Incremented
 	// each time joinPredicateMatchSlot returns false (residual reject).
 	joinFilterRemoved *int64
+
+	// deformLeftBound / deformRightBound are the EX1-02 per-side deform
+	// bounds the tree builder used for THIS join's two children
+	// (deformJoinBounds, scan_deform.go). They are stamped by the Join arms
+	// of buildNode and buildRec purely so the cooperative parallel hash
+	// build can REBUILD the build-side subtree with the identical bound.
+	//
+	// It has to be recorded rather than re-derived because the bound depends
+	// on the `incoming` bound from everything ABOVE the join, which the
+	// build phase cannot see. parallelBuildLazyHashTable used to rebuild the
+	// build subtree through BuildWorker, i.e. at the ROOT bound
+	// (deformBoundNone) — so a build side of the shape `Filter(dk > 3) ->
+	// SeqScan` was rebuilt as if `dk` were the only column anyone reads, the
+	// scan deformed [0,1) and every later column came back NULL. The join
+	// then returned the right number of rows with a NULL payload, silently.
+	// See TestCoopParallelHashBuildValuesAcrossWorkMem.
+	//
+	// Fail-closed: newJoinOp initialises both to deformBoundFull, so a
+	// joinOp built by any path that does NOT stamp them deforms full rows
+	// (slower, never wrong).
+	deformLeftBound  int
+	deformRightBound int
 }
 
 func newJoinOp(plan *optimizer.Join, left, right Operator) *joinOp {
@@ -335,7 +357,13 @@ func newJoinOp(plan *optimizer.Join, left, right Operator) *joinOp {
 	if plan != nil {
 		residual = plan.Predicate
 	}
-	return &joinOp{plan: plan, left: left, right: right, schema: schema, execResidual: residual}
+	return &joinOp{
+		plan: plan, left: left, right: right, schema: schema, execResidual: residual,
+		// Fail-closed default: full deform. Only the tree builders know the
+		// real per-side bounds, and they stamp them right after this call.
+		deformLeftBound:  deformBoundFull,
+		deformRightBound: deformBoundFull,
+	}
 }
 
 func (o *joinOp) setJoinFilterRemoveCounter(p *int64) { o.joinFilterRemoved = p }

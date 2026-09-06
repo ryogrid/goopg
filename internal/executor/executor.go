@@ -179,7 +179,14 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		return maybeInstrument(p, newJoinOp(p, left, right)), nil
+		jop := newJoinOp(p, left, right)
+		// Record the bounds the children were actually built with. The
+		// cooperative parallel hash build rebuilds the build-side subtree
+		// from the plan and must use the SAME bound; deriving it there is
+		// impossible (it depends on `bound`, i.e. on everything above this
+		// join). See joinOp.deformLeftBound.
+		jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
+		return maybeInstrument(p, jop), nil
 	case *optimizer.NestedLoopIndexJoin:
 		// EX1-02: the outer follows the left-side rule; inner rescans
 		// stay out (EX1-02b).
@@ -696,6 +703,8 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) 
 		leftOp := &opNodeOperator{tree: tree, idx: leftIdx, schema: p.Left.Output()}
 		rightOp := &opNodeOperator{tree: tree, idx: rightIdx, schema: p.Right.Output()}
 		op := newJoinOp(p, leftOp, rightOp)
+		// Same stamping as the buildNode Join arm — see joinOp.deformLeftBound.
+		op.deformLeftBound, op.deformRightBound = leftBound, rightBound
 		return tree.add(OpNode{Kind: OpJoin, childA: noChild, childB: noChild, state: &joinOpState{op: op, schema: p.Output()}}), nil
 
 	default:
