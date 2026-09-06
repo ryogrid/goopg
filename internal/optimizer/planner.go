@@ -452,6 +452,15 @@ type resolveContext struct {
 	// parent-aware narrowing is declined there. Take2 P4-01 Slice 3.
 	pinAbove bool
 
+	// upper is this planning scope's upper-relation registry (upperrel.go,
+	// take3 C-11): `PlannerInfo.upper_rels`, constructed once per
+	// `planSelectWithSettings` and carried across that function's context
+	// rebuilds (the SRF arm swaps `ctx` for one over the ProjectSet schema)
+	// so the ORDERED / FINAL rels a later cut reaches for are the same
+	// objects whichever context is current. Nil in every context that is
+	// not a planning scope of its own.
+	upper *upperRels
+
 	// rtScope is the statement's rtableScope (A-01(ii) cut 2): the
 	// allocator that hands out statement-unique range-table identities
 	// (RTIDs, PostgreSQL's varno analogue). Stamped explicitly wherever
@@ -863,6 +872,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// set-op chain's head operand) reach this same idempotent check.
 	prepareGroupingSets(s)
 
+	// C-11: this scope's upper-rel registry. One per invocation — a
+	// subquery, a CTE body and a view body each plan through their own
+	// call and so get their own — and stamped on every context this
+	// function builds below.
+	upper := newUpperRels()
+
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH
@@ -1144,6 +1159,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// Constant SELECT — `SELECT 1`. The target list resolves
 		// against the empty schema.
 		ctx = newResolveContext(nil, nil, plannerSet)
+		ctx.upper = upper
 		node = &Values{
 			pos:    s.Pos(),
 			Rows:   [][]Expr{{}},
@@ -1179,6 +1195,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			}
 		}
 		ctx = newResolveContext([]rangeBinding{b}, schema, plannerSet)
+		ctx.upper = upper
 	} else {
 		// Cost-based join-order reordering: when every comma-FROM
 		// take2 P3-12: the pre-search greedy FROM-list permutation
@@ -1597,6 +1614,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// hit the non-aggregate path.
 			ctx = newResolveContext(nil, ps.Output(), plannerSet)
 			ctx.cat = cat
+			ctx.upper = upper
 			// A-01(ii) cut 2: rebuilt contexts keep the statement scope.
 			ctx.rtScope = scope
 			agg = nil
@@ -1729,6 +1747,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ps = selectSrfPending
 		ctx = newResolveContext(nil, selectSrfPending.schema, plannerSet)
 		ctx.cat = cat
+		ctx.upper = upper
 		// A-01(ii) cut 2: rebuilt contexts keep the statement scope.
 		ctx.rtScope = scope
 		// Post-sort: sort AFTER PS expansion. ORDER BY may reference output
