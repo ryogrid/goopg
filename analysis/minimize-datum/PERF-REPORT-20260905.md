@@ -159,6 +159,8 @@ going forward.
 | E-09b load-once-per-batch | forced-shape values green | n/a | n/a — **memory**: 1 live batch table where there were 4 |
 | C-19d `PathGather`/`PathGatherMerge` priced | 24/24 MATCH | byte-identical (ships default-OFF) | none by construction |
 | E-11 AIO `ReadStream` | n/a | n/a | **DROPPED** — no depth wins; the mechanism is inert where it ships |
+| C-19f partial hash-join path | 7/7 MATCH x 42 runs | TPC-DS 99/99 identical at default | **Q21 −51%**, Q9 +94%, Q10 +30%; default stays off |
+| E-14 keyed inner spill frames | 24/24 MATCH | byte-identical | neutral; retires `buildKeyOfRow` |
 
 C-19a/b are the direct response to §5.6: the search now HAS partial paths
 and prices them with `cost_seqscan`'s parallel arm, but by construction
@@ -618,6 +620,86 @@ is worth nothing and only the allocation cost remains. Zeroing the
 constant would bank a warm-cache-only win and hide the actual bug. Ledger
 rows `take3-E-11-readstream-declined` and
 `take3-E-11-prefetch-discards-buffer`.
+
+## 5.13. C-19f: a Gather becomes choosable, and the first plan it wins is one the post-pass could never reach
+
+§5.9 left the parallel dimension complete but unusable: crossing a Gather
+costs 0.1/row against a 4-worker saving of ~0.0075/row, so with only
+base-rel partial paths the whole relation crosses and `add_path` correctly
+dominates every Gather **at any relation size**. C-19f files a partial
+hash join into the joinrel's `PartialPathlist`, which is what puts a join
+below the boundary.
+
+The crossover, pinned through the named constants in both directions:
+
+```
+(1 − 1/d)·(cpu_tuple_cost + cpu_operator_cost·k)·N
+    > parallel_setup_cost + (parallel_tuple_cost − (1 − 1/d)·cpu_tuple_cost)·J
+```
+
+— i.e. **N > 106,667 + 9.87·J** at 4 workers. A base rel could not satisfy
+this at any size and a single FK join still cannot (J ≈ N), but a join
+*tree* can, because partial paths now propagate upward.
+
+TPC-H SF=1, `off` vs `top`, 3 repetitions, values **7/7 MATCH in all 42
+runs**:
+
+| | off | top | Δ |
+|---|---:|---:|---:|
+| **Q21** | 17.33 s | 8.42 s | **−51%** |
+| Q9 | 7.26 s | 14.06 s | **+94%** |
+| Q10 | 2.75 s | 3.57 s | +30% |
+| suite | 46.06 s | 41.14 s | −10.7%, inside its own spread |
+
+**Q21 is the case only a path model can reach.** At HEAD it gets no Gather
+at all: its root is a Nested Loop Anti Join, and `terminatesPartial` stops
+`findPartialSubtree` before the post-pass can look inside. C-19f gathers
+the hash join *within* it. That is the structural argument for the whole
+Phase-5 track, demonstrated rather than asserted.
+
+**Q9 is not the foreclosure the design predicted.** The parallel scan
+moves from `lineitem` (6M) to `orders` (1.5M) and — the part that matters —
+*which relation is BUILT* flips, so a 6M-row hash table is now built
+undivided at startup while the model called the plan 21% cheaper. The lead
+is the **build** term, not the Gather term: `spillPages` over-states, by
+its own documented caveat, and the correction for that is the
+spill-cost item's Cut 3. Q10's +30% comes with a **byte-identical executed
+shape** and is recorded open rather than attributed.
+
+**The default does not move**, and no new flag was added — C-19f rides
+`GOOPG_GATHER_PATHS`, whose default is off, so the slice is provably inert
+at the default. TPC-DS SF0.5 at the default: PASS=95, MISMATCH=0,
+CKMISMATCH=0, and PLAN-SHAPE **99/99 identical** — inertness measured
+rather than claimed.
+
+**On the cost model that was supposed to describe the executor**: the
+build is charged **once, undivided**, which after E-09a/E-09b is what the
+executor actually does and what `initial_cost_hashjoin` charges. The
+reverted `d05p4` 5× participant multiplier is now refuted by a test that
+fails if anyone reintroduces it. goopg has neither of PG's two parallel
+hash joins — its executor pre-builds once in the leader and shares by
+pointer, which is upstream's `parallel_hash=false` variant with the N-fold
+replication removed; `parallel_hash=true` is refused for want of an
+executor.
+
+### 5.13.1 The consumer test found two bugs that could not previously exist
+
+The item required an *executor* consumer check, not a planner-only test —
+a fixture where the path wins must actually execute as a parallel hash.
+Writing it surfaced two latent defects in C-19d's own `createPlan` arms,
+both unreachable until a Gather could win at a search root:
+
+- `createGatherPlan` built `&Gather{…}` as a struct literal instead of
+  `NewGather`, so the schema was never set and `createPlanAtSearchRootRange`
+  panicked "layout is 5 columns but its output is 0";
+- `*Gather`/`*GatherMerge` did not embed `searchedTree`, so
+  `markSearchedTree` panicked — the tag whose absence lets the legacy
+  posmap family permute a searched subtree twice.
+
+This is the third time in this workstream that **an unwinnable path turned
+out to be an untested path**. Budget for it: when a cost fix first makes a
+shape reachable, expect execution bugs in it, and force the shape in a test
+rather than trusting the planner to arrive there.
 
 ## 6. What was dropped, and what it cost to find out
 
