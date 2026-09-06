@@ -790,11 +790,30 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 	if !nd2Known {
 		nd2 = defaultNumDistinct
 	}
+	// Only the inner INPUT's rows clamp nd2 here; the search-side twin
+	// (`eqJoinSelectivitySemi`, joinselectivity.go) applies upstream's
+	// `vardata2->rel->rows` clamp as well. Ledger `C-05
+	// plan-node-semi-nd2-rel-rows`.
 	if innerRows > 0 && nd2 >= float64(innerRows) {
 		nd2 = float64(innerRows)
 		nd2Known = true
 	}
+	return eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+}
 
+// eqjoinselSemiCore is `eqjoinsel_semi`'s body AFTER the nd2 clamps
+// (selfuncs.c:2668-2760): the MCV arm when both sides carry an MCV list,
+// otherwise the nd heuristic. C-05 factored it out of `semiPairMatchFraction`
+// so that the plan-node estimator (above) and the join search's
+// `eqJoinSelectivitySemi` (joinselectivity.go) compute the SAME number from
+// the same inputs — two copies of this arithmetic are exactly the sibling-path
+// shape that silently diverges (hard-won rule #2). The callers own the nd
+// resolution and the clamps, which is where they legitimately differ.
+//
+// `nd1Known`/`nd2Known` are the complements of upstream's `isdefault1/2`: a
+// clamped nd2 counts as known, because an inner relation smaller than
+// DEFAULT_NUM_DISTINCT bounds its own distinct count exactly.
+func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known, nd2Known bool, nullfrac1 float64) float64 {
 	if st1 != nil && st2 != nil && len(st1.MCV) > 0 && len(st2.MCV) > 0 {
 		// "The clamping above could have resulted in nd2 being less than
 		// sslot2->nvalues; in which case, we assume that precisely the nd2 most

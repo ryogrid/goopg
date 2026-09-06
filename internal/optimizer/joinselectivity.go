@@ -395,6 +395,132 @@ func (s *searchCtx) joinClauseOperands(ri *restrictInfo, bo *BinaryOp) (joinVarS
 	return s.examineJoinVar(bo.Left, 0), s.examineJoinVar(bo.Right, 0)
 }
 
+// joinClauseSelectivityForJoin is `clause_selectivity_ext`'s join arm WITH the
+// jointype PG threads through it (`clauselist_selectivity(root, clauses, 0,
+// jointype, sjinfo)`, costsize.c:5555-5580): the per-clause factor C-05's
+// `calcJoinrelSize` multiplies into `jselec`.
+//
+// INNER, LEFT, RIGHT and FULL dispatch to the inner-join arms above —
+// `eqjoinsel` (selfuncs.c:2280) takes `eqjoinsel_inner` for every jointype
+// except SEMI and ANTI, and `scalarltjoinsel` and the unhandled-clause default
+// have no jointype at all. SEMI and ANTI are the jointypes whose selectivity is
+// DEFINED differently ("the fraction of LHS rows that have matches",
+// costsize.c:5592-5593), and for them:
+//
+//   - `=` is `eqjoinsel_semi`, over operands ORIENTED so that v1 is the outer
+//     (preserved) side. Upstream does that swap through `get_join_variables`'
+//     `join_is_reversed` (selfuncs.c:2312); goopg's `leftKey`/`rightKey` split
+//     is canonical rather than oriented (joinrestrict.go:54), so the sizer
+//     orients by which side `leftRelids` falls in. An operand that resolves to
+//     neither side (a three-relation equality keyed across the pair) keeps
+//     list order — the same "no rel" degradation `examineJoinVar` already
+//     yields.
+//   - `<>` is `neqjoinsel`'s semi arm (selfuncs.c:2843-2861): `1 - nullfrac`
+//     of the OUTER variable, on the argument that with more than one distinct
+//     value on the inside every non-null outer row finds a non-equal partner.
+//     Reported as measured when the outer operand resolved to statistics —
+//     the number is then the column's own null fraction, not a constant.
+//   - everything else is the same selfuncs.h constant as for INNER.
+//
+// `outer`/`inner` are the sizer's post-swap inputs (`makeJoinRel`, C-03b:
+// `outer` covers the SJI's LHS), and `inner.Rows` is `eqjoinsel_semi`'s
+// `inner_rel->rows` clamp on nd2 — the only pathway by which a restriction on
+// the inner side reaches a SEMI/ANTI estimate, since the inner's row count is
+// otherwise unused by the SEMI/ANTI arms.
+func (s *searchCtx) joinClauseSelectivityForJoin(ri *restrictInfo, jt parser.JoinType, outer, inner *RelOptInfo) (float64, bool) {
+	if jt != parser.JoinSemi && jt != parser.JoinAnti {
+		return s.joinClauseSelectivityExt(ri)
+	}
+	if ri == nil || ri.clause == nil {
+		return defaultUnhandledClauseSel, true
+	}
+	bo, ok := ri.clause.(*BinaryOp)
+	if !ok {
+		return defaultUnhandledClauseSel, true
+	}
+	switch bo.Op {
+	case parser.OpEq:
+		v1, v2 := s.semiJoinOperands(ri, bo, outer)
+		return eqJoinSelectivitySemi(v1, v2, relRows(inner))
+	case parser.OpNe:
+		v1, _ := s.semiJoinOperands(ri, bo, outer)
+		nullfrac1 := 0.0
+		if v1.stats != nil {
+			nullfrac1 = v1.stats.NullFrac
+		}
+		return clampSelectivity(1.0 - nullfrac1), v1.stats == nil
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return defaultIneqJoinSel, true
+	default:
+		return defaultUnhandledClauseSel, true
+	}
+}
+
+// semiJoinOperands is `joinClauseOperands` oriented for the semi arms: the
+// first result is the operand on the OUTER side of the join whenever the
+// clause's canonical split lets that be decided.
+func (s *searchCtx) semiJoinOperands(ri *restrictInfo, bo *BinaryOp, outer *RelOptInfo) (joinVarStats, joinVarStats) {
+	v1, v2 := s.joinClauseOperands(ri, bo)
+	if ri.isEquijoin && outer != nil && !relsSubset(ri.leftRelids, outer.Relids) && relsSubset(ri.rightRelids, outer.Relids) {
+		return v2, v1
+	}
+	return v1, v2
+}
+
+// relRows is a nil-tolerant `rel.Rows`, zero meaning "no clamp".
+func relRows(r *RelOptInfo) float64 {
+	if r == nil {
+		return 0
+	}
+	return r.Rows
+}
+
+// eqJoinSelectivitySemi is `eqjoinsel_semi` (selfuncs.c:2642) over the
+// search's statistics: the fraction of OUTER rows (v1's side) that have at
+// least one partner on the inner side, with `*isdefault` carried out as
+// `eqJoinSelectivityExt` does for the inner arm.
+//
+// The two nd2 clamps are BOTH ported (selfuncs.c:2668-2681):
+//
+//	if (nd2 >= vardata2->rel->rows) nd2 = vardata2->rel->rows;   // the base rel's post-filter rows
+//	if (nd2 >= inner_rel->rows)     nd2 = inner_rel->rows;       // the whole inner side's rows
+//
+// and each turns `isdefault2` OFF — a clamped nd2 is a measurement of the
+// relation's size, not a guess about its column. Upstream's reason for
+// clamping nd2 and NOT nd1 is load-bearing and asymmetric: this is the only
+// pathway by which a restriction on the inner relation reaches a SEMI/ANTI
+// estimate, while clamping nd1 as well would double-count the outer's own
+// restrictions, which are already in `outer_rows`. `joinVarStats.rows` is the
+// first clamp's operand (the same post-filter count B-16's bucket scaler
+// reads); `innerRows` is the second's.
+//
+// The arithmetic after the clamps is `eqjoinselSemiCore` (cardinality.go),
+// shared with the plan-node estimator's `semiPairMatchFraction` — one body,
+// two callers that differ only in where their nd and clamps come from.
+func eqJoinSelectivitySemi(v1, v2 joinVarStats, innerRows float64) (float64, bool) {
+	nd1, isdefault1 := getVariableNumDistinct(v1)
+	nd2, isdefault2 := getVariableNumDistinct(v2)
+	if v2.rows > 0 && nd2 >= v2.rows {
+		nd2 = v2.rows
+		isdefault2 = false
+	}
+	if innerRows > 0 && nd2 >= innerRows {
+		nd2 = innerRows
+		isdefault2 = false
+	}
+	nullfrac1 := 0.0
+	if v1.stats != nil {
+		nullfrac1 = v1.stats.NullFrac
+	}
+	sel := eqjoinselSemiCore(v1.stats, v2.stats, nd1, nd2, !isdefault1, !isdefault2, nullfrac1)
+	// The nd arms are a guess when EITHER nd was (upstream's
+	// `!isdefault1 && !isdefault2` gate picks the 0.5 branch otherwise); the
+	// MCV arm is a measurement whatever the nds were, because the matched
+	// frequency mass is measured.
+	haveMCVs := v1.stats != nil && v2.stats != nil && len(v1.stats.MCV) > 0 && len(v2.stats.MCV) > 0
+	return clampSelectivity(sel), !haveMCVs && (isdefault1 || isdefault2)
+}
+
 // clampSelectivity holds a selectivity inside [0, 1] and maps NaN to the
 // unhandled-clause default. PG's `CLAMP_PROBABILITY` (selfuncs.h) does the
 // range half; the NaN half is goopg's, because a NaN selectivity would
