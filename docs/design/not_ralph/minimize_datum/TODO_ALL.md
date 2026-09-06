@@ -2350,6 +2350,8 @@ P6-03/04/05 (load-bearing).
 | C-16 | 2026-09-07 | 9fa1162c4 | DISTINCT upper rel with hashed/unique paths via DistinctOn reuse | structural+costs 22/22, digest 24/24, timing flat; TPC-DS PASS=95 total +0.1%, shapes 99/99 |
 | spill Cut 1 | 2026-09-07 | 247e0ee73 | `costSortRun` takes the rel's `avgVarBytes` — it had passed 0 where `hashJoinCost` passes the real statistic, sizing text-heavy sorts as fixed-width | prerequisite for C-11's upper rels (a fresh rel with `NCols == 0` silently suppresses the external-merge arm) |
 
+| C-19g | 2026-09-07 | 2ebc11d6a + 866e6fe7e + 9e6138f64 | **the parallel track's first real win**: partial aggregation as priced paths. Q1 **8.57 -> 4.14 s (-51.7%)** against a 1.2% off-arm spread — 50x outside the noise floor; suite -4.3%. goopg's Partial node emits ZERO rows, so Q1 crosses **16 group-states, not 5,901,255 rows** (1.6 vs 590,000 at `parallel_tuple_cost`), and the boundary term that kept C-19d and C-19f off essentially disappears | replaces `splitAggregateIsProfitable`'s five invented constants ('calibrated against one query') with a two-candidate path tournament adjudicated by `addPath` — no new cost function, no new constant. Reaches GROUPED aggregates the old rule could not (previously only the three ungrouped ones split). Ships **default-OFF**: the flip moves 3 TPC-H plans and needs a shared-pin re-pin. TPC-H 24/24 both arms; TPC-DS mode-ON PASS=95 all-zero, total -3.9%; plan-gate mode-OFF 22/22 against the shared pin. `MODE=costs` not evaluable on a private clone and NOT claimed. Row stays `[~]`: the upper-rel-resident half is unfinished |
+
 ## Dropped
 
 | item | date | reason | ledger row |
