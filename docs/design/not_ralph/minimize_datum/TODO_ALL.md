@@ -296,7 +296,20 @@ are EPICS — split into one-checkbox-per-commit items before starting
   TPC-DS PASS=95 MISMATCH=0.
   Artifacts: `internal/optimizer/{extstats,cardinality}.go`,
   `extstats_ndistinct_test.go`.
-- [ ] **B-06 P1-27 CTE-agg statistics.** DEFERRED-OPEN 2026-09-05
+- [-] **B-06 P1-27 CTE-agg statistics — OUT OF SCOPE 2026-09-07.** Closed
+  on evidence already gathered, against the standing rule (no gain /
+  infeasible in goopg's design, after verification). Both halves fail it:
+  removing the guard is a **regression, not a gain** (Q74 14 s -> 99 s), and
+  PG has no answer here either — single-key uniqueness against a 4-key
+  GROUP BY — so a faithful port cannot supply one. What remains is
+  beyond-PG work (OID-less CTE-output synthesis + multi-key per-column
+  ndistinct + FD-bound-only agg outputs) with **no safe ratchet-moving
+  increment**, which is the definition of unbounded for this workstream.
+  The synthesis design and its inert implementation slice (pure functions
+  + 16 tests, no consumers wired) stay landed as the resume point; the
+  step-4 guard-removal criterion is unmet and is not reachable from
+  inside this refactor. Ledger `take3-B-06-deferred`.
+  DEFERRED-OPEN 2026-09-05
   (probe): guard is load-bearing (removal reverts Q74 99s→14s); PG has
   no answer either (single-key uniqueness; Q74 groups by 4). Genuine
   fix needs beyond-PG work (OID-less CTE-output synthesis + multi-key
@@ -306,7 +319,16 @@ are EPICS — split into one-checkbox-per-commit items before starting
   reviewed); synthesis implementation slice landed inert (pure
   functions + 16 tests, no consumers wired — guard untouched).
   Keep open until step-4 guard-removal criterion holds.
-- [ ] **B-07 P1-30 index-endpoint probe + MCV widening.** DEFERRED-OPEN
+- [-] **B-07 P1-30 index-endpoint probe + MCV widening — OUT OF SCOPE
+  2026-09-07.** Closed on the probe's own findings. The endpoint probe is
+  architecturally blocked (no plan-time storage path in the pure planner)
+  and **PG itself keeps it `#ifdef NOT_USED`**, so fidelity does not
+  demand it. The pure half that IS reachable — MCV-widen `histogramMax`,
+  cutoff clamp — predicts **~0 ratchet movement** on this corpus: the
+  endpoints are fresh and every literal is in-bounds, so there is no
+  witness to improve. Reopen only on a demonstrated in-suite
+  out-of-range case, which would be new evidence rather than new effort.
+  Ledger `take3-B-07-deferred`. DEFERRED-OPEN
   2026-09-05 (probe): endpoint probe architecturally blocked (no
   plan-time storage path in the pure planner; PG itself keeps it
   `#ifdef NOT_USED`); pure half (MCV-widen `histogramMax`, cutoff
