@@ -109,9 +109,8 @@ type Path struct {
 	Pathkeys []PathKey
 
 	// ParallelSafe / ParallelWorkers describe parallel eligibility. Workers > 0
-	// only for partial paths (design ch. 08 §2). Unused until C5.
-	ParallelSafe    bool
-	ParallelWorkers int
+	// only for partial paths (design ch. 08 §2).
+	ParallelSafe bool
 
 	// ParallelAware is PG's `path->parallel_aware` ("engage parallel-aware
 	// logic?", pathnodes.h) — C-19f. It says this node's OPERATOR behaves
@@ -134,7 +133,14 @@ type Path struct {
 	// `createHashJoinPlan` refusing to build a node it has just declared
 	// parallel-aware when the executor's own `hashJoinIsPartialCapable` would
 	// decline to run it that way.
+	//
+	// Declared between the two `ParallelSafe`/`ParallelWorkers` fields rather
+	// than after them so the two bools share one padding word: this struct is
+	// allocated thousands of times per join search, and appending the bool
+	// after the int would have grown it from 336 to 344 bytes for one bit.
 	ParallelAware bool
+
+	ParallelWorkers int
 
 	// NCols / AvgVarBytes describe what THIS PATH emits, when that is narrower
 	// than its relation — PG's `pathtarget` at the granularity goopg needs for
