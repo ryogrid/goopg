@@ -870,35 +870,43 @@ rule).*
   constraint of the four. gate: measurement filed; if the port is chosen,
   values-diff both suites (it moves ~46 corpus queries at once).
   measurement doc-only; the port would be ~400–700 LOC, high risk.*
-- [ ] **C-11 P4-02 upper `RelOptInfo`s** (`GROUP_AGG`, `WINDOW`,
+- [x] **C-11 P4-02 upper `RelOptInfo`s** (`GROUP_AGG`, `WINDOW`,
   `DISTINCT`, `ORDERED`, `FINAL`) with pathlists. DESIGNED 2026-09-06:
-  `docs/design/planner-p4-upper-rels/DESIGN.md` §1/§3 — lands INERT
-  (registry + `fetchUpperRel`, no producer, no consumer); three decisions
-  settled there (registry is per planning SCOPE not per `searchCtx`;
-  `Relids = 0` so DPPATH renders `relids=-` with no format change; upper
-  rels stay OUT of `relMap`/`joinrels`). Load-bearing extra duty found:
-  `fetchUpperRel` must populate `Rows`/`Width`/`NCols`/`AvgVarBytes`, since
-  a zero `NCols` silently suppresses `costSortRun`'s external-merge arm
-  (DESIGN §4.3); `AvgVarBytes` needs Probe P1 (§9).
+  `docs/design/planner-p4-upper-rels/DESIGN.md` §1/§3 — LANDED 2026-09-06
+  (`fcf049b05`) INERT (registry + `fetchUpperRel`, no producer, no
+  consumer); three decisions settled there (registry is per planning SCOPE
+  not per `searchCtx`; `Relids = 0` so DPPATH renders `relids=-` with no
+  format change; upper rels stay OUT of `relMap`/`joinrels`). Load-bearing
+  extra duty DONE in the same cut: `sizeUpperRelFromNode` populates
+  `Rows`/`Width`/`NCols`/`AvgVarBytes` from the input Node (a zero `NCols`
+  would silently suppress `costSortRun`'s external-merge arm — DESIGN
+  §4.3); `AvgVarBytes` is a schema-derived per-type-width heuristic,
+  PROVISIONAL per the C-12 review (Probe P1 has no witness in either
+  corpus: 0/100 TPC-DS sorts spill).
   *design: take3 08 §7 + `docs/design/planner-p4-upper-rels/DESIGN.md`;
   gate: take3 09 §5 P4 (PP `changed=0`).*
-- [ ] **C-12 P4-03 real upper-rel `PathSort`** (has a `createPlanNode` arm;
+- [x] **C-12 P4-03 real upper-rel `PathSort`** (has a `createPlanNode` arm;
   today only ever a merge-join child, never competing with a hashed
   alternative). DESIGNED 2026-09-06:
-  `docs/design/planner-p4-upper-rels/DESIGN.md` §4/§5. The blocker is NOT
-  the arm's key translation — an upper rel has no `baseLeaf`, so
-  `baseRelLayout` returns nil and `createSortPlan` emits keys as written,
-  which is correct for post-aggregate ORDER BY keys. The real blockers are
-  (i) no rel to `addPath` to, (ii) `sortPathFor` deliberately never offers
-  its `PathSort` to `addPath`, (iii) **`costSortRun` has exactly ONE
-  production caller**, so every top-level Sort is priced at zero by
-  `DeriveLegacyDisplayCost` — C-12 is therefore cost-MOVING, not
-  cost-neutral, and needs an in-commit `plan-gate` re-pin. Shown
-  parallel-neutral: `MaybeAddGather`'s three predicates read structure and
-  sizes, never `PlanCost` (re-verify before landing; C-19d is editing
-  `parallel.go`).
-  *design: take3 08 §7 + `docs/design/planner-p4-upper-rels/DESIGN.md`;
-  gate: take3 09 §5 P4 (PP shape `changed=0` + T on every moved cost).*
+  `docs/design/planner-p4-upper-rels/DESIGN.md` §4/§5 — LANDED 2026-09-06
+  (taken over: `upperordered.go` `createOrderedPaths`/`addOrderedPaths` +
+  two `planner.go` ORDER BY sites, option (b) `PathPrebuilt` seed; reuses
+  `sortPathFor` verbatim instead of a `sortPathOver` sibling —
+  behavior-identical, review-agreed). Agent review APPROVE-WITH-NITS, no
+  blockers (MaybeAddGather re-verified parallel-neutral by reading;
+  AvgVarBytes third-answer deviation recorded provisional; redundant
+  seed.Rows line dropped). Gates, all on an isolated HEAD+C-12-only
+  worktree A/B so concurrent C-05/C-04b WIP cannot contaminate: TPC-H
+  structural plan-gate 22/22 MATCH, costs mode 17 queries move on Sort
+  lines ONLY (34/34 changed lines `Sort (cost=…)`; Q18 1.5M-row spill
+  priced UP 2.07M→2.41M — the §5.7 negative did not occur),
+  `tpch-runner -digest` vs pre-cut binary + `-diff` VERDICT: PASS 24/24,
+  ten longest TPC-H queries no slower (max ratio 1.05), TPC-DS SF0.5 sweep
+  PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 (Q78 17 s 45 rows
+  ck-verified), TOTAL +2.5% (within ±17%), cost-normalized TPC-DS plans
+  byte-identical (shape changed=0). Re-pinned in-commit:
+  `plan_snapshots/c12-ordered-sort-20260906.txt`. C-12a (second candidate
+  via C-07 widening) explicitly NOT flipped — filed as the next cut.
 - [ ] **C-13 P4-04 bounded / top-N sort** (`cost_sort`'s `limit_tuples`
   arm) — the largest recorded `ORDER BY … LIMIT` win. DESIGNED 2026-09-06:
   `docs/design/planner-p4-upper-rels/DESIGN.md` §6 — **RE-SCOPE into two
