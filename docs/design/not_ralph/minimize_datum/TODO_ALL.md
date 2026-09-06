@@ -302,7 +302,10 @@ are EPICS — split into one-checkbox-per-commit items before starting
   fix needs beyond-PG work (OID-less CTE-output synthesis + multi-key
   per-column ndistinct + FD-bound-only for agg outputs); no safe
   ratchet-moving increment. Ledger `take3-B-06-deferred` (resume steps
-  inline). Keep open; revisit only with the synthesis design.
+  inline). Synthesis design landed (`docs/design/planner-b06-cte-stats/DESIGN.md`,
+  reviewed); synthesis implementation slice landed inert (pure
+  functions + 16 tests, no consumers wired — guard untouched).
+  Keep open until step-4 guard-removal criterion holds.
 - [ ] **B-07 P1-30 index-endpoint probe + MCV widening.** DEFERRED-OPEN
   2026-09-05 (probe): endpoint probe architecturally blocked (no
   plan-time storage path in the pure planner; PG itself keeps it

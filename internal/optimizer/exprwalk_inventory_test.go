@@ -177,6 +177,12 @@ var exprSwitchInventory = map[string]walkerRole{
 	// residual copy either way.
 	"cte_inline_pushdown.go:remapConjunctThroughCTEOutput":  nonRecursiveClassifier,
 	"cte_inline_pushdown.go:remapConjunctThroughProjection": nonRecursiveClassifier,
+	// Added by B-06 synthesis. A two-arm classifier (StringConst /
+	// TypedStringLit target at one output position), not a traversal:
+	// no descent, no scope handling, miss (anything else) returns
+	// false and the position stays unknown. Same demoted shape as the
+	// CTE entries above.
+	"cte_stats_synthesis.go:branchLiteralAt": nonRecursiveClassifier,
 	// Added by M0125-0036. See boundedQualSpine's comment: the arm set is
 	// the transformation's NULL-semantics invariant, not an omission.
 	"exists_to_any.go:rewriteExistsToAnyQual": boundedQualSpine,
