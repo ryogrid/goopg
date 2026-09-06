@@ -72,7 +72,7 @@ P4-01 slices 1–3 [x] ──► B-12d/e/f ──► B-13 (P2-02b)
 P3-01 ──► P3-03/P3-04 ──► P1-18 (a jointype switch before P3-04 is dead code)
 B-16 (MCV-frequency half) + EX1 exit ──► E-02 (EX3-06 skew sizing)
 E-07 (Gather slab parity) ──► E-08 (Gather-arm compilation)
-C-14 (Incremental Sort) ◄──► E-15 (contract-publication spike, unconditional) ──► E-03 (conditional implementation)
+C-14 (Incremental Sort) [-] dropped 2026-09-07 ──► E-03 [-] resolved with it; E-15 [x] landed and inert (the contract a future C-14 would build against)
 EX2-01 audit [x] ──► D-05 (consume; never re-audit independently)
 F-01 (duplicate build map) ──► D-05 (deletes a map D-05 would otherwise convert)
 F-02 (probe-seam traffic) ──► D-05 (same assumed win; measure first)
@@ -791,16 +791,75 @@ rule).*
   strategy the executor implements.
   *before C-11; cardinality half before C-15/C-17. gate: EA ratchet on the
   12 TPC-DS grouping-sets queries + values unchanged. ~60–150 LOC, medium.*
-- [ ] **C-10b P3-09 `remove_useless_joins` — RECLASSIFIED to Phase 3.**
-  Scoping result: this touches **no** Phase-4 item, so it is not a P4-00
-  blocker. PG runs it below the upper planner entirely, changing the
-  joinlist; none of C-11…C-18 reads or produces one. goopg has no analogue,
-  but both halves of the primitive exist — `joinkeyproof.go:56
+- [-] **C-10b P3-09 `remove_useless_joins` — DROPPED on a corpus census +
+  a hand A/B, 2026-09-07. One removable join in 121 queries, and removing
+  it by hand buys nothing.**
+  Scoping result (unchanged): this touches **no** Phase-4 item, so it is
+  not a P4-00 blocker. PG runs it below the upper planner entirely,
+  changing the joinlist; none of C-11…C-18 reads or produces one. goopg has
+  no analogue, but both halves of the primitive exist — `joinkeyproof.go:56
   uniqueKeyColumnSets` is `rel_is_distinct_for` for the base-relation case,
   and `pathindexonlyneed.go`'s needed/output name sets answer
   "unused above", both decline-biased.
-  *after C-04, beside C-09. gate: P3 PP + a forced fixture + byte-identical
-  values. ~200–350 LOC, low-medium.*
+  **Census (all 22 TPC-H + all 99 TPC-DS queries, against PG 18.3's rule at
+  `postgres/src/backend/optimizer/plan/analyzejoins.c:155
+  join_is_removable`).** TPC-H: **1** LEFT join in the whole suite (Q13
+  `customer LEFT JOIN orders ON c_custkey = o_custkey`); it fails the
+  uniqueness test (`orders`' PK is `o_orderkey`) AND the unused-above test
+  (`count(o_orderkey)` is in the select list) → **0 removable**. TPC-DS:
+  **21** LEFT joins (q5, q40, q49×3, q72×2, q75×3, q77×2, q78×5, q80×3,
+  q93) plus 2 FULL joins rejected at `:169`. **All 21 pass the uniqueness
+  precondition** — the sales↔returns joins are on the complete returns PK
+  (`third-party/tpcds-postgres/…/tools/tpcds.sql`), and q77/q78's CTE inner
+  sides are `GROUP BY` subqueries whose grouping columns are exactly the
+  join keys (`query_is_distinct_for`, `:1060`). **Exactly one passes the
+  unused-above precondition** (`:214`, `bms_is_subset(attr_needed,
+  inputrelids)`): **q72's `left outer join catalog_returns`**. Corroborated
+  independently against the committed PG plans — a table in the SQL but
+  absent from `bench/tpcds/plans-pg/` is a candidate removal, and after
+  discounting three `SKIP` files and three alias/literal false positives
+  (`item` in q49, `store` in q51/q76), `catalog_returns` in `Q72.txt` is
+  the **only** genuine one, in either corpus. Self-join removal
+  (`:2488`): no candidates (q72's `d1/d2/d3` join on `d_week_seq`, not the
+  PK).
+  **The A/B on that one join** (private SF0.5 clone, port 5536, binary
+  `9a4b464be45d079e` off clean `d0b4f96e4`, 3 interleaved reps): arm A =
+  Q72 as written, arm B = Q72 with the `catalog_returns` line deleted, i.e.
+  the exact rewrite the optimisation performs. **Arm B is 0.2–0.6 %
+  SLOWER**: 4605.6/4794.4/4879.9 ms (A) vs 4633.2/4806.0/4901.2 ms (B), a
+  monotone drift with server age, so the true delta is **0 within noise**.
+  Values byte-identical, 100 rows, md5 `640163d4d519bf741d01c170c4b680ab`
+  both arms — which also empirically confirms the census's uniqueness
+  proof. The reason there is nothing to win is visible in the plan: goopg
+  executes the join as a `Nested Loop Left Join` over **749** outer rows
+  probing `catalog_returns_pkey`, above a `catalog_sales` seq scan that
+  reads 720,657.
+  **Does the C-09 decline transfer? Mostly NO, and saying so is part of the
+  verdict.** `docs/design/planner-c09-unique-semi/DESIGN.md` (ledger
+  `take3-C-09-declined`) declined unique-inner SEMI on two grounds that do
+  **not** apply here: (i) "reorder unavailable" — join REMOVAL needs no
+  reorder, it deletes a rel outright and strictly SHRINKS the search space;
+  (ii) "estimates already unique-aware" — deleting a provably-unique inner
+  cannot move a row estimate at all, so there is no estimate to be already
+  correct. C-10b is refuted on an independent ground: **corpus incidence**.
+  What the two declines share is only the shape of the evidence — a real
+  PG optimisation with no witness in goopg's benchmarks.
+  **No change is needed in `joinkeyproof.go`** (peer-owned for C-20a): the
+  binding precondition is never uniqueness. 21 of 21 candidates prove
+  unique and 20 of 21 die at `attr_needed` — so the missing half is a
+  per-relation needed-set, which goopg does not have (`pathindexonlyneed.go`
+  is a whole-statement NAME set, and a name-based approximation is safe
+  only because it is decline-biased; memory
+  `goopg_optimizer_no_attr_needed_no_ios_path`).
+  **What would change the verdict:** a workload where a query joins a
+  lookup/detail table it does not project — the ORM- and view-generated
+  shape this optimisation exists for (PG's own motivation: a view
+  left-joins a table that a given query never selects from). Hand-written
+  benchmark queries project or filter nearly every table they join, which
+  is precisely why the incidence is 1 in 121. Ledger
+  `take3-C-10b-dropped`.
+  *after C-04, beside C-09. gate if ever resumed: P3 PP + a forced fixture
+  + byte-identical values. ~200–350 LOC, low-medium.*
 - [x] **C-10c P4-00c outer-join qual-placement contract for upper rels.**
   Landed 2026-09-05: `docs/design/planner-c10c-upper-qual-placement/DESIGN.md`
   + 5 fixture tests. `reduceOuterJoins` confirmed to need NO Phase-4 change
@@ -991,11 +1050,51 @@ rule).*
   measurement: `analysis/planner-refactor-take3/c13a-limit-sort-census-20260906/`;
   gate when resumed: take3 09 §5 P4 (PP + timing; the SF0.5 checksum arm is
   NOT a correctness gate for this item — see above).*
-- [ ] **C-14 P4-05 Incremental Sort** node + `create_incremental_sort_path`.
-  No executor counterpart exists — BLOCKED: resume after executor support
-  and excluded from closure until then. Publish the executor input
-  contract first (take3 13 §8.7 tiebreaker), do not absorb silently.
-  *design: take3 08 §7; gate when unblocked: take3 09 §5 P4 (PP).*
+- [-] **C-14 P4-05 Incremental Sort** node + `create_incremental_sort_path`
+  — **DROPPED on measurement 2026-09-07. Out of scope for both corpora.**
+  The item's stated blocker is GONE: E-15 (`065182d` + `c7f1f45`) published
+  the presorted-prefix executor input contract (`sortPrefixEqual` + an
+  order-equivalence oracle, `docs/design/executor-ex3-07-presorted-contract/DESIGN.md`),
+  which is exactly what broke the C-14/E-03 circular wait. So this is no
+  longer "blocked"; it is a build-or-drop call, and the measurement says
+  drop.
+  **The witness, re-measured at `d0b4f96e4` on a private SF0.5 clone
+  (port 5536, cgroup-capped, 3 reps): Q67 — PG's OWN Incremental Sort
+  case — sorts in 1.26 ms.** `Sort.actual_start − WindowAgg.actual_end`
+  = 1.259 / 1.312 / 1.247 ms across three reps, over **376,552 rows**,
+  `quicksort Memory: 553kB`, no spill, against an Execution Time of
+  15,234 / 14,368 / 13,547 ms — the sort is **0.008 % of the query**. This
+  is a STRONGER refutation than the census's (1.0 ms over 115,150 rows,
+  `analysis/planner-refactor-take3/c13a-limit-sort-census-20260906/`):
+  3.3× the input rows and it is still ~1 ms, because
+  `sortOp.keyvals` (M0134-0191) already precomputed the keys. An
+  incremental sort replaces at most that 1.26 ms, and only partially.
+  Corpus-wide the census bounds it further: all sorting in all 99 TPC-DS
+  queries is **≤ 119.8 ms of 802 s = 0.015 %**, median sort input **145
+  rows**, and **0 of 100 sorts spilled** — so BOTH of PG's mechanisms for
+  Incremental Sort have no witness here: the early-rows-under-a-bound
+  mechanism (TPC-H has **no `LIMIT` at all** — re-verified: zero `limit`
+  in all 25 files of
+  `analysis/tpch/goopg-pg-tpch-plan-compare-260718/queries/`) and the
+  memory/spill-avoidance mechanism (nothing spills; largest footprint
+  26 MB against a 256 MiB `sortChunkBytes` threshold).
+  **What would change the verdict** (and the only thing that should
+  reopen this row): a corpus containing a large `ORDER BY a, b` whose `a`
+  is ALREADY sorted by the input path — an index-ordered or merge-join
+  child — with a small `LIMIT` on top, i.e. top-N over raw (ungrouped)
+  rows. Neither benchmark has that shape: 54 of 77 bindable TPC-DS sorts
+  read already-collapsed aggregate or window output, and TPC-H has no
+  bound at all. Plan-parity is not sufficient grounds on its own — PG's
+  Q67 Incremental Sort buys goopg 1.26 ms.
+  **This resolves E-03**, which is `[!] file ONLY if planner C-14
+  activates`: C-14 does not activate, so E-03 is closed with it. E-15's
+  contract stays landed and inert (zero production callers), which is the
+  correct residue — it is what a future C-14 would build against.
+  Ledger `take3-C-14-dropped`.
+  *design: take3 08 §7; measurement:
+  `analysis/planner-refactor-take3/c13a-limit-sort-census-20260906/README.md`
+  §3 + the 3-rep Q67 re-measurement above; gate if ever resumed: take3 09
+  §5 P4 (PP).*
 - [x] **C-15 P4-06 `create_grouping_paths`** (sorted + hashed agg priced by
   `cost_agg`; hash spill arm OMITTED — executor has no agg spill path);
   three aggregate rules retired. DESIGNED 2026-09-06:
@@ -1934,9 +2033,18 @@ per arm; values never counts for projection/join-adjacent changes).*
   arm.*
 - [x] **E-15 EX3-07 input-contract publication spike (unconditional).**
   Landed 2026-09-05: presorted-prefix contract (input ordered by first-n-keys + contiguous groups + `sortPrefixEqual` framing; executor return: order-equivalence + group-bounded memory; incomparable splits) as doc + `sortPrefixEqual` + order-equivalence oracle vs current full sort (incl. NULL/DESC-first-key variant). Breaks the C-14/E-03 circular wait. Gates: 4 contract tests; executor + optimizer suites green; review APPROVE-WITH-NITS (5 addressed). No behaviour change (pure additive, zero production callers). Artifacts: `docs/design/executor-ex3-07-presorted-contract/DESIGN.md` (`065182d`), `internal/executor/sort_presorted{,_test}.go` (`c7f1f45`).
-- [!] **E-03 EX3-07 presorted-prefix implementation — file ONLY if
-  planner C-14 activates.** E-15 already published the contract, so this
-  item is purely conditional. Do not absorb silently.
+- [-] **E-03 EX3-07 presorted-prefix implementation — RESOLVED 2026-09-07
+  by C-14's verdict: its condition will not be met.** The row was `[!] file
+  ONLY if planner C-14 activates`; **C-14 is DROPPED on measurement**
+  (Q67 — PG's own Incremental Sort case — sorts in **1.26 ms** over 376,552
+  rows, 3 reps at `d0b4f96e4`; corpus-wide all sorting is ≤ 119.8 ms of
+  802 s and 0 of 100 sorts spill), so there is no planner consumer to file
+  this against and it is closed rather than left dangling. E-15's contract
+  (`sortPrefixEqual` + the order-equivalence oracle,
+  `docs/design/executor-ex3-07-presorted-contract/DESIGN.md`) STAYS landed
+  and inert — zero production callers, no behaviour change — and is exactly
+  what a future C-14 would build against, so reopening C-14 reopens this
+  row with its prerequisite already paid. Ledger `take3-C-14-dropped`.
 - [!] **E-14 EX1 build-half redesign (no second truncation) — Cut A
   DROPPED on measurement 2026-09-07, Cut B quantified and still blocked.**
   **Cut A (Semi/Anti zero-width retention): DROPPED, 0.0065%.** §8b had
@@ -2125,13 +2233,29 @@ per arm; values never counts for projection/join-adjacent changes).*
   overlaps `seqScanOp`'s prefilter — applies unchanged to workers.
   Resume only if E-04 is ever resumed and clears its own gate on a witness
   shape. Ledger `take3-E-08-dropped`.
-- [ ] **E-09 EX5-02 shared build hardening — SPLIT 2026-09-06** into the
+- [x] **E-09 EX5-02 shared build hardening — CLOSED 2026-09-07 by its three
+  children; the parent carries no residue.** SPLIT 2026-09-06 into the
   three slices below after a static feasibility analysis of the spilling
   case (ledger `take3-D-04-private-worker-builds`: on Q9 all five Gather
   participants build the whole 1.5 M-row `orders` table privately, a 5×
   multiplier that dwarfs everything the minimize-datum bundle proposes on
   the same query). Design:
   `docs/design/executor-e09a-shared-spilling-build/DESIGN.md`.
+  **Closure audit (2026-09-07):** the parent's own text is the split note
+  and the design pointer — it states no requirement outside the three
+  slices, and the 5× private-build multiplier that motivated it is exactly
+  what E-09a removed. Children: **E-09a** `67204579c` (spilling shared
+  build published — Q9 workers `rows=1500000 loops=1` → `rows=0 loops=0`,
+  five Build Times → one, 8.85 → 7.85 s); **E-09b** `d5ce1bb9b` +
+  `b5647d6fa` (load-once-per-batch — one live batch table where there were
+  four, `loadCount` 28 → 7, `maxLiveLoads` 4 → 1); **E-09c** delivered
+  2026-09-07 as its measurement (`455de27aa`) — the cooperative build is
+  **consumer-bound and saturates at ~4 producers** (2→4 buys 14% of build
+  wall, 4→8 loses 23%; `recvWaits` = 0 at ≥4), and **skew does not move the
+  bottleneck**. Nothing in the parent is left unaddressed; the one thing
+  the children ROUTED rather than made — `maxProducers =
+  ctx.MaxParallelWorkers` with no ceiling above the saturation point — is
+  carried by ledger `take3-E-09c-consumer-bound`, not by this row.
 - [x] **E-09a Publish a SPILLING shared build (Variant A, private
   reload).** LANDED `67204579c`. `captureSharedBuild` carries an immutable batch descriptor
   (`nbatch`, `bucketBits`, `nbuckets`, `buildIsLeft`, read-only inner
