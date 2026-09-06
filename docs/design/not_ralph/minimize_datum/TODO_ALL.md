@@ -399,6 +399,15 @@ are EPICS — split into one-checkbox-per-commit items before starting
   EX3-03 threading (model misranks merge above hash), NOT P5, NOT
   B-01b/c remainder. Three lines verified unflipped. Ledger
   `take3-B-13-deferred` (re-probe trigger inline).
+  **Design landed 2026-09-06: `docs/design/planner-spill-cost-calibration/DESIGN.md`.**
+  It finds the hash and sort spill charges biased in OPPOSITE directions
+  (hash over-charges — `EntryBytes` measures the in-memory entry while
+  `spillWriter.WriteRow` uses uvarint framing; sort under-charges twice,
+  and one is a TRIGGER error — `costSortRun` fires at `cp.workMem` = 1 GiB
+  while `sortOp` spills at the hardcoded 256 MiB `sortChunkBytes`), so a
+  single multiplier would fit the difference between two errors. Four
+  separately-gated cuts, three probes, negative outcomes written in
+  advance.
 - [x] **B-14 P2-09a ScalarArrayOp index path.** Landed 2026-09-05:
   InExpr→clause arm (useOr-only, left indexkey, const array, opfamily)
   in the rule-based producers + post-search rewrite; `IndexScan.SAOPKeys`
@@ -427,6 +436,15 @@ are EPICS — split into one-checkbox-per-commit items before starting
   calibrate, per-query + TOTAL + plans gates. Artifact:
   `analysis/planner-refactor-take3/b15-deferred-20260905/` (README +
   clean batch.patch). Ledger `take3-B-15-blocked`.
+  **Design landed 2026-09-06: `docs/design/planner-spill-cost-calibration/DESIGN.md`.**
+  It finds the hash and sort spill charges biased in OPPOSITE directions
+  (hash over-charges — `EntryBytes` measures the in-memory entry while
+  `spillWriter.WriteRow` uses uvarint framing; sort under-charges twice,
+  and one is a TRIGGER error — `costSortRun` fires at `cp.workMem` = 1 GiB
+  while `sortOp` spills at the hardcoded 256 MiB `sortChunkBytes`), so a
+  single multiplier would fit the difference between two errors. Four
+  separately-gated cuts, three probes, negative outcomes written in
+  advance.
   *design: take3 08 §5.2; gate: take3 09 §5 P2 + TOTAL arm.*
 - [x] **B-16 P2-11b MCV-frequency half.** Landed 2026-09-05: MCV scale
   (`mcv/avgfreq` iff hotter than average) + [1e-6,1] clamp +
@@ -1587,6 +1605,15 @@ per arm; values never counts for projection/join-adjacent changes).*
   README + clean-applying `plumbing.patch`, ledger
   `take3-EX3-03-step2-blocked`): recalibrate the spill-cost model first,
   then re-apply the plumbing and re-gate.
+  **Design landed 2026-09-06: `docs/design/planner-spill-cost-calibration/DESIGN.md`.**
+  It finds the hash and sort spill charges biased in OPPOSITE directions
+  (hash over-charges — `EntryBytes` measures the in-memory entry while
+  `spillWriter.WriteRow` uses uvarint framing; sort under-charges twice,
+  and one is a TRIGGER error — `costSortRun` fires at `cp.workMem` = 1 GiB
+  while `sortOp` spills at the hardcoded 256 MiB `sortChunkBytes`), so a
+  single multiplier would fit the difference between two errors. Four
+  separately-gated cuts, three probes, negative outcomes written in
+  advance.
   *design: `docs/design/executor-ex3-03-workmem/DESIGN.md`; gate:
   Q7/Q9 plans at bench `work_mem` + forced-hash proof + values + pin.*
 
