@@ -603,6 +603,26 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// A join row is the concatenation of its two inputs' rows — the
 		// executor's Join emits left++right — so the column count adds
 		// (M0127-P5.7-a).
+		//
+		// C-03c: the three sizing figures below (NCols, AvgVarBytes,
+		// ColVarBytes) and ConsiderParallel stay at the CONCATENATION even for
+		// a relset whose paths perform a SEMI or ANTI join, which publishes its
+		// left side alone. That is deliberate and fail-closed in both senses:
+		//
+		//   - Structurally it cannot be otherwise here. A rel is a
+		//     relset-keyed singleton (`findRel`/`addRel`, first-writer-wins)
+		//     and different pairs spanning one relset can match different
+		//     SpecialJoinInfos, so a jointype-dependent width on the REL would
+		//     be arrival-order dependent — the exact reason C-03a put the
+		//     jointype on paths and not here.
+		//   - Numerically over-wide beats under-wide. These figures feed hash
+		//     sizing; over-stating a build side over-allocates, while
+		//     under-stating it under-allocates and spills wrongly.
+		//
+		// C-05 installs the real per-jointype sizing switch, on a carrier that
+		// can hold one. The plan-level publication is already narrow —
+		// `createPlanNode`'s SEMI/ANTI arms emit left-only schema and layout —
+		// so this is a costing over-estimate, not a shape disagreement.
 		joinrel.NCols = relNCols(rel1) + relNCols(rel2)
 		// AvgVarBytes adds the same way: a concatenation of two
 		// schemas sums their variable-width payloads (M0128-P3.1).

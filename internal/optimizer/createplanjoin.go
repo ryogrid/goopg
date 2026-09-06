@@ -262,6 +262,90 @@ type joinInputs struct {
 	merged                   Schema
 	lay                      outputLayout
 	index                    map[int]int
+	// outerCols is len(outer.Output()) — where the merged row's inner half
+	// begins, and therefore the width of the left-only publication a SEMI or
+	// ANTI join makes. C-03c.
+	outerCols int
+}
+
+// publishedSchema / publishedLayout are what the join NODE exposes upward, as
+// opposed to the merged row it evaluates its own quals against. They differ for
+// exactly two join types.
+//
+// A SEMI or ANTI join emits its OUTER row alone — "its inner is consumed only
+// for matching, never projected" (nl_index_join.go:768) — while its predicate
+// is still evaluated over `outer ++ inner` through the executor's `virtualOut`
+// (operators_nljoin.go:133-141). So the merged schema stays the quals'
+// coordinate space and only the PUBLICATION narrows.
+//
+// Both halves are needed, and this is the sibling-agreement point C-03c exists
+// to get right. The schema is what `nl_index_join.go:684-691` already does for
+// the unnesting producer, and `NestedLoopIndexJoin.Output` returns the field
+// RAW (plan.go:942) — a merged schema there is a wrong answer, not a cosmetic
+// one, and the executor's own width check (operators_nljoin.go:175-181) raises
+// XX000 on it. The LAYOUT is the half a `Join`'s narrowing `Output` does NOT
+// cover: `Join.Output` derives left-only from `Left` (plan.go:1189-1195), but
+// `createPlanNode` returns the layout separately and every parent translates
+// its quals through it, so a merged layout beside a left-only schema is the
+// misalignment the design names.
+func (in joinInputs) publishedSchema(jt JoinType) Schema {
+	if jt == JoinTypeSemi || jt == JoinTypeAnti {
+		return append(Schema(nil), in.merged[:in.outerCols]...)
+	}
+	return in.merged
+}
+
+func (in joinInputs) publishedLayout(jt JoinType) outputLayout {
+	if jt == JoinTypeSemi || jt == JoinTypeAnti {
+		return in.lay[:in.outerCols:in.outerCols]
+	}
+	return in.lay
+}
+
+// planJoinTypeFor maps a path's `parser.JoinType` onto the executor's
+// `JoinType` — C-03c. `kind` names the arm, for the refusal message.
+//
+// PG has no such mapping because it has one JoinType enum; goopg has two, and
+// this is the single place they meet, so a jointype that reaches a plan through
+// one route and not another is impossible by construction.
+//
+// The refusals are producer bugs in createplan.go's sense, and each names the
+// wrong answer it prevents rather than the rule it enforces:
+//
+//   - FULL is refused because goopg's executor has no FULL hash semantics and
+//     the arms below would silently emit a plan that drops the unmatched rows a
+//     full join exists to keep. `jointypeForDirection` (joinpaths.go) declines
+//     it at PATH GENERATION so nothing can arrive here; this is the second
+//     line. Deferral ledger: `C-03c FULL-join-search-decline`.
+//   - CROSS never reaches a path: `joinIsLegal` builds no SpecialJoinInfo for
+//     it and the search treats a clauseless pair as an inner join.
+//
+// An unwinnable path is an untested path (three separate C-19-era bugs), so
+// this is a function with its own test rather than an inline switch.
+func planJoinTypeFor(p *Path, kind string) JoinType {
+	jt := parser.JoinInner
+	if p != nil {
+		jt = p.Jointype
+	}
+	switch jt {
+	case parser.JoinInner:
+		return JoinTypeInner
+	case parser.JoinLeft:
+		return JoinTypeLeft
+	case parser.JoinRight:
+		return JoinTypeRight
+	case parser.JoinSemi:
+		return JoinTypeSemi
+	case parser.JoinAnti:
+		return JoinTypeAnti
+	default:
+		var relids uint32
+		if p != nil && p.Rel != nil {
+			relids = uint32(p.Rel.Relids)
+		}
+		panic(fmt.Sprintf("createPlan: %s over relset %#08x carries jointype %s, which the search must not have generated a path for",
+			kind, relids, joinTypeName(jt)))
+	}
 }
 
 // joinInputsFor runs that prologue. `outerPath` / `innerPath` are passed
@@ -325,6 +409,7 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 
 	return joinInputs{
 		outer:       outerNode,
+		outerCols:   len(outerSchema),
 		inner:       innerNode,
 		outerRelids: outerRelids,
 		innerRelids: innerRelids,
@@ -458,9 +543,14 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 	in := joinInputsFor(p, "PathHashJoin", p.Children[0], p.Children[1])
 	pairs := in.keyPairs("PathHashJoin", p.HashKeys)
 
+	// C-03c: the join the PATH says it performs, not a constant. Today the
+	// search only ever files INNER hash paths — `jointypeForDirection` gives
+	// the keyed arms nothing else, since SEMI/ANTI are nestloop-only and FULL
+	// is declined outright — so this is the same value it always was.
+	jt := planJoinTypeFor(p, "PathHashJoin")
 	j := &Join{
 		pos:  in.outer.Pos(),
-		Type: JoinTypeInner,
+		Type: jt,
 		Algo: JoinAlgoHash,
 		// Outer drives the probe, inner is hashed — see the doc comment for
 		// why BuildLeft stays false rather than being re-decided here.
@@ -473,7 +563,7 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		LeftKey:  pairs[0].Left,
 		RightKey: pairs[0].Right,
 		HashKeys: pairs,
-		schema:   in.merged,
+		schema:   in.publishedSchema(jt),
 		// AvgVarBytes from the build-side column stats, summed over the
 		// columns `in.inner` actually EMITS — `joinInputsFor` has already
 		// narrowed it — not over the relation's full column list; zero when
@@ -487,7 +577,7 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		InnerRows: p.Children[1].Rows,
 	}
 	assertParallelAwareJoinIsRunnable(p, j)
-	return j, in.lay
+	return j, in.publishedLayout(jt)
 }
 
 // assertParallelAwareJoinIsRunnable is C-19f's `parallel_aware` flag's route to
@@ -498,9 +588,10 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 // executor's OWN predicate would decline to run it that way.
 //
 // The two can only disagree if a producer changes. `addPartialHashJoinPath`
-// files only INNER hash joins today (the search's jointype pin, leftdeep-joins
-// 03 §4.4) and `createHashJoinPlan` hard-codes `JoinTypeInner`, so the panic is
-// unreachable from the live search — which is precisely why it is a separate,
+// files only INNER hash joins today — since C-03b it is passed the direction's
+// jointype and declines outright for SEMI/ANTI, and no outer link reaches the
+// search at all (03 §4.4 / C-03 DESIGN §3) — so the panic is unreachable from
+// the live search — which is precisely why it is a separate,
 // directly testable function rather than an inline `if`: an unwinnable path is
 // an untested path. The moment `join_is_legal` inference relaxes the pin and a
 // RIGHT or FULL join reaches here, this fires at plan-build time instead of
@@ -601,9 +692,10 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		absorbMergeSort(p.Children[1], "inner"))
 	pairs := in.keyPairs("PathMergeJoin", p.HashKeys)
 
+	jt := planJoinTypeFor(p, "PathMergeJoin")
 	j := &Join{
 		pos:  in.outer.Pos(),
-		Type: JoinTypeInner,
+		Type: jt, // C-03c; see createHashJoinPlan.
 		Algo: JoinAlgoMerge,
 		// Same child convention as the hash arm: Children[0] is the outer
 		// (streaming left) side. A merge join has no build side, so BuildLeft
@@ -614,9 +706,9 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		LeftKey:   pairs[0].Left,
 		RightKey:  pairs[0].Right,
 		HashKeys:  pairs,
-		schema:    in.merged,
+		schema:    in.publishedSchema(jt),
 	}
-	return j, in.lay
+	return j, in.publishedLayout(jt)
 }
 
 // absorbMergeSort steps over a merge child's explicit `PathSort`, returning the

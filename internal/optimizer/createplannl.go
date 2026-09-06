@@ -132,9 +132,13 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 	// the merged row, exactly like the hash arm's — which is why the prologue
 	// and the predicate builder are shared verbatim rather than restated.
 	in := joinInputsFor(p, "PathNestLoop", p.Children[0], innerPath)
+	// C-03c: the join the PATH says it performs. The plain nested loop is the
+	// one arm a searched SEMI or ANTI join can reach — `jointypeForDirection`
+	// gives them the nestloop arms and nothing else.
+	jt := planJoinTypeFor(p, "PathNestLoop")
 	j := &Join{
 		pos:  in.outer.Pos(),
-		Type: JoinTypeInner,
+		Type: jt,
 		Algo: JoinAlgoNestedLoop,
 		// Children[0] is the OUTER (driving) side, the same convention the hash
 		// and merge arms use. For a nested loop it is also the only one that is
@@ -146,9 +150,9 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 		// one join a plain nested loop is the ONLY available path for
 		// (`Join.Predicate` is documented nil for CROSS JOIN, plan.go:812).
 		Predicate: in.joinPredicate("PathNestLoop", nil, p.Residual),
-		schema:    in.merged,
+		schema:    in.publishedSchema(jt),
 	}
-	return j, in.lay
+	return j, in.publishedLayout(jt)
 }
 
 // createNestLoopIndexJoinPlan is the NLI shape: the inner is a parameterised
@@ -204,6 +208,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 	}
 
 	in := joinInputsFor(p, "PathNestLoop(NLI)", outerPath, innerPath)
+	jtNLI := planJoinTypeFor(p, "PathNestLoop(NLI)")
 	// The leaf's local quals arrive as `*Filter` wrappers that `scanLeafFor`'s
 	// rewrapper rebuilt over the probe. `NestedLoopIndexJoin.Inner` is typed
 	// `*IndexScan` and cannot hold them, so they are absorbed into the scan's
@@ -275,8 +280,13 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 	}
 
 	nli := &NestedLoopIndexJoin{
-		pos:   in.outer.Pos(),
-		Type:  JoinTypeInner,
+		pos: in.outer.Pos(),
+		// C-03c; see createHashJoinPlan. `NestedLoopIndexJoin.Output` returns
+		// the schema field RAW (plan.go:942), so the left-only publication for
+		// SEMI/ANTI is not optional here the way `Join.Output`'s derivation
+		// makes it belt-and-braces there — the executor raises XX000 on the
+		// width mismatch (operators_nljoin.go:175-181).
+		Type:  jtNLI,
 		Outer: in.outer,
 		Inner: is,
 		// The residual is evaluated against `outer ++ inner` through the
@@ -286,7 +296,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		// arm, where the key is enforced only by a hash bucket and must be
 		// re-checked, an index probe enforces its keys exactly.
 		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual),
-		schema:    in.merged,
+		schema:    in.publishedSchema(jtNLI),
 		// InnerMemo is filled below, and only when the SEARCH chose a
 		// `PathMemoize` inner. It is never decided here: attaching a cache to a
 		// join whose cost was computed without one makes the executed plan
@@ -297,7 +307,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 	if memoPath != nil {
 		nli.InnerMemo = memoizeNodeFor(memoPath, is, keys)
 	}
-	return nli, in.lay
+	return nli, in.publishedLayout(jtNLI)
 }
 
 // memoizeNodeFor builds the `Memoize` the search's `PathMemoize` stands for.
@@ -389,10 +399,11 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 			probeClauses = append(probeClauses, c.ri)
 		}
 	}
+	jt := planJoinTypeFor(p, "PathNestLoop(NLI-bitmap)")
 	return &NestedLoopIndexJoin{
-		pos: in.outer.Pos(), Type: JoinTypeInner, Outer: in.outer, Inner: bhs,
+		pos: in.outer.Pos(), Type: jt, Outer: in.outer, Inner: bhs,
 		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)",
 			in.keyPairs("PathNestLoop(NLI-bitmap)", probeClauses), p.Residual),
-		schema: in.merged,
-	}, in.lay
+		schema: in.publishedSchema(jt),
+	}, in.publishedLayout(jt)
 }

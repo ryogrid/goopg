@@ -67,7 +67,7 @@ func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 	}
 
 	for _, jtype := range []parser.JoinType{
-		parser.JoinLeft, parser.JoinRight, parser.JoinFull, parser.JoinSemi, parser.JoinAnti,
+		parser.JoinLeft, parser.JoinRight, parser.JoinSemi, parser.JoinAnti,
 	} {
 		sj := mkSJ(jtype, a, b)
 		if jt, ok := jointypeForDirection(sj, a, b); !ok || jt != jtype {
@@ -78,6 +78,37 @@ func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 				"PG's JOIN_RIGHT/JOIN_RIGHT_SEMI/JOIN_RIGHT_ANTI, which goopg does not "+
 				"generate", jtype)
 		}
+	}
+
+	// FULL: neither direction. C-03c — the executor has no FULL hash semantics,
+	// so there is no `createPlanNode` arm to emit one and a path would be a
+	// plan that silently drops the rows a full join exists to keep.
+	sjFull := mkSJ(parser.JoinFull, a, b)
+	for _, dir := range [][2]RelSet{{a, b}, {b, a}} {
+		if _, ok := jointypeForDirection(sjFull, dir[0], dir[1]); ok {
+			t.Errorf("FULL (%#b as outer) = legal; want declined in BOTH directions",
+				dir[0])
+		}
+	}
+}
+
+// TestAddPaths_FullGeneratesNothing states the FULL decline where it bites: a
+// FULL joinrel comes out of `addPathsToJoinrel` with an EMPTY pathlist, which
+// `joinSearch` turns into an error (joinsearchlevel.go:305) and the planner
+// answers by falling back to the syntactic join shape. That is the same outcome
+// the pre-C-03 tree reaches by declining the whole search for FULL, which is
+// why the decline is inert rather than a regression.
+func TestAddPaths_FullGeneratesNothing(t *testing.T) {
+	a, b, outer, inner, joinrel, clauses := jointypeProblem(t)
+	sj := mkSJ(parser.JoinFull, a, b)
+	for _, dir := range []struct{ o, i *RelOptInfo }{{outer, inner}, {inner, outer}} {
+		if err := addPathsToJoinrel(nil, joinrel, dir.o, dir.i, clauses, defaultCostParams(), sj); err != nil {
+			t.Fatalf("addPathsToJoinrel: %v", err)
+		}
+	}
+	if len(joinrel.Pathlist)+len(joinrel.PartialPathlist) != 0 {
+		t.Errorf("FULL generated %d serial + %d partial paths; want none",
+			len(joinrel.Pathlist), len(joinrel.PartialPathlist))
 	}
 }
 
@@ -121,7 +152,7 @@ func TestAddPaths_InnerUnchanged(t *testing.T) {
 // stamps them with the SJI's jointype; the reversed direction generates
 // nothing at all.
 func TestAddPaths_OuterLegalDirectionOnly(t *testing.T) {
-	for _, jtype := range []parser.JoinType{parser.JoinLeft, parser.JoinRight, parser.JoinFull} {
+	for _, jtype := range []parser.JoinType{parser.JoinLeft, parser.JoinRight} {
 		t.Run(joinTypeName(jtype), func(t *testing.T) {
 			a, b, outer, inner, joinrel, clauses := jointypeProblem(t)
 			sj := mkSJ(jtype, a, b)

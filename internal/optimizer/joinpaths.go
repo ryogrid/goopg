@@ -144,9 +144,14 @@ func isKeyableFor(ri *restrictInfo, outer, inner RelSet) bool {
 // would MULTIPLY rows rather than merely mis-cost them. Declining is the safe
 // direction and costs nothing while the paths are unreachable.
 //
-// FULL is admitted here and declined one slice later (C-03c), where the
-// executor's missing FULL hash semantics is the reason and the deferral ledger
-// is the place it is recorded.
+// FULL is DECLINED outright, in both directions (C-03c). goopg's executor has
+// no FULL hash semantics, so `createPlanNode` has no arm that could emit one and
+// every arm below would silently drop the unmatched rows a full join exists to
+// keep. A FULL joinrel therefore ends the level with an empty pathlist, which
+// `joinSearch` reports as an error (joinsearchlevel.go:305) and the planner
+// answers by falling back to the syntactic join shape — the same outcome the
+// pre-C-03 tree reaches by declining the whole search for FULL, and the reason
+// this is inert. Deferral ledger: `C-03c FULL-join-search-decline`.
 func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner RelSet) (parser.JoinType, bool) {
 	// No SpecialJoinInfo: a plain inner join, which is what `joinIsLegal`
 	// returns for every pair in a query with no outer/semi/anti join at all
@@ -160,7 +165,10 @@ func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner RelSet) (parser.
 		// A SpecialJoinInfo is never built for these, but a caller that
 		// synthesises one must not accidentally take the outer-join path.
 		return parser.JoinInner, true
-	case parser.JoinLeft, parser.JoinRight, parser.JoinFull, parser.JoinSemi, parser.JoinAnti:
+	case parser.JoinFull:
+		// See the FULL note above: no direction, no path, no plan.
+		return parser.JoinFull, false
+	case parser.JoinLeft, parser.JoinRight, parser.JoinSemi, parser.JoinAnti:
 		if relsSubset(sjinfo.MinLefthand, outer) && relsSubset(sjinfo.MinRighthand, inner) {
 			return sjinfo.Jointype, true
 		}
