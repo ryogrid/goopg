@@ -89,6 +89,21 @@ func setGatherPathsModeForTest(m gatherPathMode) func() {
 	return func() { gatherPathsMode = prev }
 }
 
+// SetGatherPathsMode is the same hook across the package boundary, taking the
+// label an operator would export (`off` / `top` / `all`) and resolving it
+// through the SAME function production resolves the environment variable with —
+// so a caller cannot select a mode the env knob could not.
+//
+// It exists for C-19f's executor consumer check: the item requires a fixture
+// where the parallel hash path WINS by cost to actually EXECUTE as a parallel
+// hash, and that test lives in internal/executor, which cannot reach an
+// unexported knob. `SetParallelEnabled` (parallel.go) is the same shape for the
+// post-pass's kill switch. Like it, this is process-global, so a caller must
+// run the returned restore.
+func SetGatherPathsMode(label string) (restore func()) {
+	return setGatherPathsModeForTest(gatherPathModeFromEnv(label))
+}
+
 // generateUsefulGatherPaths is `generate_useful_gather_paths` (allpaths.c:3236)
 // at this slice's scope: its `generate_gather_paths` body (allpaths.c:3099) —
 // one Gather over the cheapest partial path, plus one Gather Merge per partial
@@ -300,6 +315,28 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// offers a partial bitmap path yet; the arm is here so that when one
 		// does, it is admitted by a decision rather than by a default.
 		return PathBitmapHeapScan
+	case PathHashJoin:
+		// C-19f. A hash join is partial through its PROBE side only: the build
+		// is drained ONCE by the leader before fan-out
+		// (`prebuildSharedHashJoins`) and published, and the probe is what the
+		// workers split by scan block. `Children[0]` IS the probe side by this
+		// package's child convention (pathgen.go: "Children[0] is the probe
+		// (outer) side, Children[1] is the build side"), and
+		// `createHashJoinPlan` leaves `BuildLeft` false — so Children[0]
+		// becomes `Join.Left` and `joinProbeSideIsLeft` (= !BuildLeft) returns
+		// true. The path walk and the node walk therefore descend the SAME
+		// side, which is the sibling-agreement rule this whole file turns on.
+		//
+		// Only a path this producer built can appear here: `addPartialPath`
+		// refuses a parameterised or non-parallel-safe path, and
+		// `addPartialHashJoinPath` is the only producer of a partial
+		// PathHashJoin. A parameterised one would still be refused, for the
+		// same reason the index arm refuses one — a hash join propagates a
+		// parameter rather than binding it, and no worker can supply it.
+		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return PathPrebuilt
+		}
+		return partialPathDrivingKind(p.Children[0])
 	default:
 		// PathPrebuilt, joins, Sort, Memoize, Agg: not modelled by any attach
 		// walk at this slice's scope. Refuse.

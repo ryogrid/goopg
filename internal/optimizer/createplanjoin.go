@@ -486,7 +486,37 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		OuterRows: p.Children[0].Rows,
 		InnerRows: p.Children[1].Rows,
 	}
+	assertParallelAwareJoinIsRunnable(p, j)
 	return j, in.lay
+}
+
+// assertParallelAwareJoinIsRunnable is C-19f's `parallel_aware` flag's route to
+// createPlan. The flag carries no executor field — `HasShareableHashJoin` and
+// `attachParallelScan` derive the parallel behaviour by walking the BUILT tree
+// — so what it buys is this fail-closed check at the boundary: the planner
+// refuses to build a node it has just declared parallel-aware when the
+// executor's OWN predicate would decline to run it that way.
+//
+// The two can only disagree if a producer changes. `addPartialHashJoinPath`
+// files only INNER hash joins today (the search's jointype pin, leftdeep-joins
+// 03 §4.4) and `createHashJoinPlan` hard-codes `JoinTypeInner`, so the panic is
+// unreachable from the live search — which is precisely why it is a separate,
+// directly testable function rather than an inline `if`: an unwinnable path is
+// an untested path. The moment `join_is_legal` inference relaxes the pin and a
+// RIGHT or FULL join reaches here, this fires at plan-build time instead of
+// returning a silently partial join, which is the same contract
+// `createGatherPlan` enforces with `drivingScan` (createplangather.go).
+func assertParallelAwareJoinIsRunnable(p *Path, j *Join) {
+	if p == nil || !p.ParallelAware || hashJoinIsPartialCapable(j) {
+		return
+	}
+	var relids uint32
+	if p.Rel != nil {
+		relids = uint32(p.Rel.Relids)
+	}
+	panic(fmt.Sprintf(
+		"createPlan: parallel-aware PathHashJoin over relset %#08x built a %v/%v join the executor will not run with a partial probe; the workers' verdicts are not row-local, so the join would silently drop or duplicate rows",
+		relids, j.Type, j.Algo))
 }
 
 // createMergeJoinPlan is `create_mergejoin_plan` (createplan.c:4444)

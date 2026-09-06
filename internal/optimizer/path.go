@@ -113,6 +113,29 @@ type Path struct {
 	ParallelSafe    bool
 	ParallelWorkers int
 
+	// ParallelAware is PG's `path->parallel_aware` ("engage parallel-aware
+	// logic?", pathnodes.h) — C-19f. It says this node's OPERATOR behaves
+	// differently when several participants run it, as opposed to merely being
+	// safe to run inside one of them (`ParallelSafe`) or being a per-worker
+	// slice of a relation (`ParallelWorkers`).
+	//
+	// Set today by `addPartialHashJoinPath` and by nothing else. goopg's
+	// meaning of "parallel-aware hash join" is not upstream's: PG sets the flag
+	// only for `Parallel Hash` (a partial inner built cooperatively in DSM),
+	// while every hash join inside a goopg Gather's partial subtree is treated
+	// specially by the executor — `HasShareableHashJoin` selects it,
+	// `prebuildSharedHashJoins` runs its build ONCE in the leader, and each
+	// participant adopts the published table. See
+	// docs/design/planner-c19f-parallel-hashjoin/DESIGN.md §5.
+	//
+	// It reaches `createPlan` as a fail-closed ASSERTION rather than as a node
+	// field: the executor derives its parallel behaviour by walking the BUILT
+	// tree, so there is nothing for a flag to carry — what the flag buys is
+	// `createHashJoinPlan` refusing to build a node it has just declared
+	// parallel-aware when the executor's own `hashJoinIsPartialCapable` would
+	// decline to run it that way.
+	ParallelAware bool
+
 	// NCols / AvgVarBytes describe what THIS PATH emits, when that is narrower
 	// than its relation — PG's `pathtarget` at the granularity goopg needs for
 	// hash sizing. Zero NCols means "not narrowed"; read them through

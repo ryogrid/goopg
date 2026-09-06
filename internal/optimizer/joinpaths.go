@@ -223,8 +223,18 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// bucket fraction is measured on its keys. Computed at this site
 			// because the searchCtx — and so the statistics — is in scope,
 			// exactly as mergeTuplesFor is.
-			addHashJoinPath(joinrel, outer, inner, cp, keys, residual,
-				s.estimateHashBucketSize(keys, inner.Relids))
+			bucket := s.estimateHashBucketSize(keys, inner.Relids)
+			addHashJoinPath(joinrel, outer, inner, cp, keys, residual, bucket)
+			// C-19f: `hash_inner_and_outer`'s parallel block (joinpath.c:2418)
+			// sits immediately after the serial `try_hashjoin_path` loop
+			// (:2398), and is passed the SAME hashclauses — so the partial
+			// path and its serial twin are priced from identical inputs and
+			// can differ only in the parallel terms. It files into the
+			// joinrel's PartialPathlist, which nothing but
+			// generateUsefulGatherPaths and the next level's own partial
+			// producer reads; with GOOPG_GATHER_PATHS off it produces nothing
+			// at all (joinpathsparallel.go).
+			addPartialHashJoinPath(s, joinrel, outer, inner, cp, keys, residual, bucket)
 		}
 		// The nested loop keys on nothing, so the key set rejoins the
 		// residual: it evaluates every clause, on every pair. Passing
