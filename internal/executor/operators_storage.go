@@ -1259,12 +1259,40 @@ func renderHeapACLColumnInto(cat catalog.Catalog, tbl *catalog.Table, cols []cat
 	}
 }
 
-// seqScanLookahead is the number of blocks ahead of the current
+// seqScanLookaheadDefault is the number of blocks ahead of the current
 // scan position seqScanOp keeps prefetched. Mirrors upstream's
 // `effective_io_concurrency` default scope and is enough to
 // pipeline a single sequential scan against typical SSD
 // latencies. A future loop turns this into a tunable GUC.
-const seqScanLookahead storage.BlockNumber = 4
+const seqScanLookaheadDefault storage.BlockNumber = 4
+
+// seqScanLookaheadMax bounds the hint window. Same ceiling as
+// aio.MaxReadStreamLookahead so a depth experiment cannot fan an
+// unbounded number of 8 KB prefetch buffers out of Pool.Prefetch.
+const seqScanLookaheadMax storage.BlockNumber = 256
+
+// seqScanLookahead is the effective hint depth, read once from
+// GOOPG_SEQSCAN_LOOKAHEAD (E-11 / EX5-04 depth-policy measurement).
+// Unset or unparsable keeps the default; 0 disables the hints
+// entirely (pure synchronous reads); values above the cap clamp.
+// Measurement knob only — it is not a GUC and has no PG analogue
+// beyond effective_io_concurrency's role in read_stream.c.
+var seqScanLookahead = seqScanLookaheadFromEnv(os.Getenv("GOOPG_SEQSCAN_LOOKAHEAD"))
+
+func seqScanLookaheadFromEnv(v string) storage.BlockNumber {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return seqScanLookaheadDefault
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		return seqScanLookaheadDefault
+	}
+	if storage.BlockNumber(n) > seqScanLookaheadMax {
+		return seqScanLookaheadMax
+	}
+	return storage.BlockNumber(n)
+}
 
 // validateInheritedColumnTypes mirrors PostgreSQL's make_inh_translation_list
 // (optimizer/util/appendinfo.c): for every parent column it finds the child
@@ -1777,7 +1805,7 @@ func (o *seqScanOp) refillPrefetchWindow(rel storage.RelFileNode) {
 	// prefetches blocks this worker will probably never read, and N workers
 	// would each do it. The I/O concurrency prefetch emulates is supplied
 	// directly by N workers each issuing a synchronous page read.
-	if o.pscan != nil {
+	if o.pscan != nil || seqScanLookahead == 0 {
 		return
 	}
 	target := o.curBlock + seqScanLookahead

@@ -799,3 +799,87 @@ func TestSeqScanFiresPrefetchesAcrossBlocks(t *testing.T) {
 		t.Errorf("seqScan fired %d prefetches, exceeds NBlocks=%d", eng.submits, nBlocks)
 	}
 }
+
+// TestSeqScanLookaheadFromEnv pins the E-11 depth knob's parsing:
+// unset / garbage keep the default, 0 is a legal "no hints" value,
+// and oversize values clamp to seqScanLookaheadMax.
+func TestSeqScanLookaheadFromEnv(t *testing.T) {
+	cases := []struct {
+		in   string
+		want storage.BlockNumber
+	}{
+		{"", seqScanLookaheadDefault},
+		{"  ", seqScanLookaheadDefault},
+		{"junk", seqScanLookaheadDefault},
+		{"-1", seqScanLookaheadDefault},
+		{"0", 0},
+		{"1", 1},
+		{"16", 16},
+		{"999999", seqScanLookaheadMax},
+	}
+	for _, c := range cases {
+		if got := seqScanLookaheadFromEnv(c.in); got != c.want {
+			t.Errorf("seqScanLookaheadFromEnv(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestSeqScanLookaheadZeroFiresNoPrefetch is the depth-0 sibling of
+// TestSeqScanFiresPrefetchesAcrossBlocks: with the hint window at 0
+// the scan must read every block synchronously and never touch the
+// AIO engine, while still returning every row.
+func TestSeqScanLookaheadZeroFiresNoPrefetch(t *testing.T) {
+	saved := seqScanLookahead
+	seqScanLookahead = 0
+	defer func() { seqScanLookahead = saved }()
+
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	eng := &recordingExecAIOEngine{}
+	ctx.Pool.Manager().SetAIO(eng)
+	ctx.Pool.SetPrefetchEnabled(true)
+
+	const N = 600
+	rows := make([][]optimizer.Expr, N)
+	for i := range rows {
+		rows[i] = []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i)},
+			&optimizer.StringConst{Value: "row"},
+		}
+	}
+	in := &optimizer.Insert{
+		Table:       tbl,
+		Source:      &optimizer.Values{Rows: rows},
+		ColumnIndex: []int{0, 1},
+	}
+	op, _ := Build(in)
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+	rel := cat.RelFileNode(tbl)
+	if err := ctx.Pool.FlushAll(); err != nil {
+		t.Fatal(err)
+	}
+	ctx.Pool.InvalidateRel(rel)
+	eng.submits = 0
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	scanned, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = scan.Close()
+	if len(scanned) != N {
+		t.Errorf("scanned %d rows, want %d", len(scanned), N)
+	}
+	if eng.submits != 0 {
+		t.Errorf("depth-0 seqScan fired %d prefetches; want 0", eng.submits)
+	}
+}
