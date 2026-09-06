@@ -1001,9 +1001,26 @@ rule).*
   Re-pinned in-commit: `plan_snapshots/c15-grouping-paths-20260907.txt`.
   *design: take3 08 §7 + `docs/design/planner-p4-grouping-paths/DESIGN.md`;
   gate: take3 09 §5 P4 (PP + timing).*
-- [ ] **C-16 P4-07 `create_distinct_paths`** (hashed / sorted /
-  unique-over-sorted). Depends on landed P1-25.
-  *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
+- [x] **C-16 P4-07 `create_distinct_paths`** (hashed / sorted /
+  unique-over-sorted). Depended on landed P1-25. DESIGNED 2026-09-07:
+  `docs/design/planner-p4-distinct-paths/DESIGN.md` (review
+  REQUEST-CHANGES → 2 blockers fixed → APPROVE-WITH-NITS → fixed).
+  LANDED 2026-09-07 as hashed + unique (no third sorted-Distinct: identical
+  price/order to Unique, dies as duplicate): DISTINCT upper rel +
+  `PathDistinct` (+ `Unique` bool) + arm emitting `*Distinct` vs
+  all-columns `DistinctOn` (`distinctOnOp` already streams, both render
+  `"Unique"` — ~0 executor LOC); `enable_hashagg=off` disables (never
+  skips) hashed; DISTINCT ON gated at both wrapper sites
+  (defense-in-depth); min/max site threaded. Code review
+  APPROVE-WITH-NITS, all addressed (`replaceSingleChild` DistinctOn arm,
+  `distinctAllKeyCols` single-sourced, prose swept, tests de-vacuoused).
+  Gates on isolated HEAD+C-16-only A/B: optimizer+executor suites +
+  units precommit green; TPC-H structural+costs 22/22 MATCH, digest/diff
+  PASS 24/24, timing flat; TPC-DS SF0.5 sweep PASS=95 MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=0, TOTAL +0.1%, shape 99/99 same; Q38
+  GUC-off Unique live on 3 DISTINCT legs with values 38/38; PP identical.
+  No re-pin (zero moves). `*Unique` node explicitly NOT built (reuse
+  adopted after review killed the EXPLAIN-parity premise).
 - [ ] **C-17 P4-08 `tuple_fraction` end-to-end** (every upper rel, not only
   the join search).
   *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
