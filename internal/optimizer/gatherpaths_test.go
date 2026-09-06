@@ -292,7 +292,7 @@ func TestGatherPathRefusesUnrunnableSubpaths(t *testing.T) {
 // over a partial INDEX path would give every worker the whole index and return
 // N copies of every row. The producer refuses it; when the executor grows the
 // attachment, this pin is the thing to change.
-func TestGatherMergeRefusesAnythingButASeqScanDrivenSubpath(t *testing.T) {
+func TestGatherMergeAdmitsIndexDrivenSubpathsSinceE10(t *testing.T) {
 	cp := defaultCostParams()
 	rel := newRelOptInfo(RelSet(1), 1000, 8)
 	rel.ConsiderParallel = true
@@ -303,14 +303,29 @@ func TestGatherMergeRefusesAnythingButASeqScanDrivenSubpath(t *testing.T) {
 	if makeGatherMergePath(rel, seq, cp) == nil {
 		t.Fatal("a seq-scan-driven ordered partial path is the shape gatherMergeOp CAN drive")
 	}
+	// The ordered INDEX twin from C-19c. This is the ONLY pathkey-carrying
+	// partial path goopg produces, so admitting it is what gives Gather Merge
+	// any production surface at all.
+	//
+	// This assertion is INVERTED from what it was before 2026-09-06, and the
+	// inversion is the point. It used to require a refusal, because
+	// `gatherMergeOp` attached only `attachParallelScan` and a Gather Merge
+	// over a partial index path returned (workers+1)x every row — measured at
+	// 1/2/4 workers as 5802/8703/14505 against a serial 2901, and in the
+	// CORRECT ORDER, which is why only a values test ever caught it. E-10
+	// (`a22d995c8`) gave both gather operators a shared `parallelClaimSet`
+	// covering all three claim kinds, so the hazard is gone and the refusal
+	// with it. If this ever needs re-inverting, the executor regressed —
+	// check `TestParallelClaimSetAttachesEveryKind` first.
 	idx := gpPartialSeqPath(rel, 500, 2)
 	idx.Kind = PathIndexScan
 	idx.Pathkeys = keys
-	if makeGatherMergePath(rel, idx, cp) != nil {
-		t.Error("gather merge over a partial index path returns N copies of every row (operators_gather_merge.go attaches only attachParallelScan)")
+	if makeGatherMergePath(rel, idx, cp) == nil {
+		t.Error("gather merge over a partial index path must now be OFFERED: E-10 gave gatherMergeOp the index claim set, and this is the only pathkey-carrying partial path goopg produces")
 	}
-	// A plain Gather over that same index path is fine: gatherOp attaches all
-	// three claim sets.
+	// A plain Gather over that same index path was always fine: gatherOp
+	// attached all three claim sets even before E-10. Kept as the control that
+	// distinguishes "the merge arm changed" from "admission changed".
 	if makeGatherPath(rel, idx, cp) == nil {
 		t.Error("a plain Gather over a partial index path is runnable and must be offered")
 	}

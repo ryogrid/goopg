@@ -247,28 +247,39 @@ func gatherSubpathIsRunnable(sub *Path) bool {
 	return partialPathShapeIsGatherable(sub)
 }
 
-// gatherMergeSubpathIsRunnable is the same test PLUS the restriction that makes
-// a Gather Merge safe TODAY: its subpath's driving scan must be a SEQ scan.
+// gatherMergeSubpathIsRunnable is now exactly gatherSubpathIsRunnable. It is
+// kept as a named function because the two questions are genuinely distinct
+// and were answered differently until 2026-09-06 — see below.
 //
-// `gatherMergeOp` attaches only `attachParallelScan` to each worker's tree
-// (internal/executor/operators_gather_merge.go) — not
-// `attachParallelIndexScan`, not `attachParallelBitmapScan`. A Gather Merge
-// over a partial INDEX path would therefore give every worker the whole index
-// and return N copies of every row: a wrong-results bug, not a slow plan. The
-// post-pass records the same executor gap from the other side
-// (`sortPartialRootPays`, parallel.go, C-19c note).
+// It USED to add "and the driving scan must be a SEQ scan", because
+// `gatherMergeOp` attached only `attachParallelScan` to each worker's tree and
+// not the index/bitmap claim sets. A Gather Merge over a partial INDEX path
+// therefore gave every worker the whole index and returned N copies of every
+// row. That was measured before it was fixed, at 1/2/4 workers:
+// 5802 / 8703 / 14505 rows against a serial 2901, i.e. exactly (workers+1)x —
+// and IN THE CORRECT ORDER, which is why no ordering test could have caught it
+// and only a values test did.
 //
-// Consequence, stated plainly: the only pathkey-carrying partial path goopg
-// produces today is the ordered INDEX twin (C-19c), so this refuses all of
-// them and NO Gather Merge path is generated in production. The producer and
-// `cost_gather_merge` exist, are unit-tested, and go live when the executor
-// attaches the index/bitmap claim sets in the merge operator, or when C-19e
-// lands a partial Sort path (whose driving scan is a seq scan).
+// E-10 closed the executor gap (`a22d995c8`): `parallelClaimSet` holds all
+// three claim kinds behind a single `attachAll()` wiring site, and BOTH
+// `gatherOp` and `gatherMergeOp` embed it, with an anti-drift test that fails
+// if a claim kind is added without an `attachAll` arm. So the restriction has
+// no reason left, and keeping it would refuse the only pathkey-carrying
+// partial path goopg produces — the ordered INDEX twin from C-19c — which is
+// what kept Gather Merge at zero production surface.
+//
+// The remaining guards are the ones that still mean something, and they are
+// inherited rather than restated: `gatherSubpathIsRunnable`'s whitelist
+// (`partialPathShapeIsGatherable` → `partialPathDrivingKind != PathPrebuilt`)
+// admits exactly the shapes `attachAll` models, and the `RequiredOuter == 0`
+// refusal for index paths is untouched. Bitmap needs no extra guard here:
+// `generateUsefulGatherPaths` skips subpaths with no `Pathkeys`, and a bitmap
+// heap scan carries none — so a partial bitmap path cannot reach this test at
+// all (ledger `e10-gathermerge-bitmap-untested-e2e` records that this leaves
+// bitmap-under-GatherMerge without an end-to-end test, because no producer
+// offers such a path).
 func gatherMergeSubpathIsRunnable(sub *Path) bool {
-	if !gatherSubpathIsRunnable(sub) {
-		return false
-	}
-	return partialPathDrivingKind(sub) == PathSeqScan
+	return gatherSubpathIsRunnable(sub)
 }
 
 // partialPathShapeIsGatherable reports whether a partial path's shape bottoms

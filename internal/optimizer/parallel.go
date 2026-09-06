@@ -396,12 +396,19 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 // actually settled, and states it where the decision is made rather than by
 // disabling the scan type outright.
 //
-// C-19c: a plain `*IndexScan` driving scan declines for the same reason AND a
-// harder one — the Gather Merge operator attaches only the seq-scan block
-// allocator to its workers (operators_gather_merge.go), not the index
-// leaf-claim set, so a per-worker Sort over an index scan under Gather Merge
-// would return every row once per worker. The IOS was already protected by
-// this rule; the plain scan inherits it rather than the hazard.
+// C-19c: a plain `*IndexScan` driving scan declines for the same reason.
+//
+// It used to decline for a SECOND, harder reason as well — the Gather Merge
+// operator attached only the seq-scan block allocator to its workers, not the
+// index leaf-claim set, so a per-worker Sort over an index scan under Gather
+// Merge would have returned every row once per worker. **That reason is no
+// longer true**: E-10 (`a22d995c8`) gave both gather operators a shared
+// `parallelClaimSet` covering all three claim kinds, with an anti-drift test.
+// The correctness hazard is gone; only the measured cost argument above
+// remains, and it is what still carries this decline (q16 1.5 -> 2.3 s,
+// q13 4.2 -> 6.8 s). Do not read the removal of the hazard as a reason to
+// flip this rule — that needs the cost comparison the rule's own text says
+// goopg's post-pass does not have.
 func sortPartialRootPays(srt *Sort) bool {
 	switch drivingScan(srt.Child).(type) {
 	case *IndexOnlyScan, *IndexScan:
