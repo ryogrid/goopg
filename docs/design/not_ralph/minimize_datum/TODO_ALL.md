@@ -620,12 +620,22 @@ rule).*
   only firewalled; SEMI/ANTI remain nestloop-only (a capability gap, not
   parity); the reversed OUTER direction is declined so LEFT joinrels carry
   one orientation.
-- [ ] **C-04b P3-04 RIGHT admission.** Same vertical cut mirrored.
+- [x] **C-04b P3-04 RIGHT admission.** Same vertical cut mirrored.
   *design: C-04 DESIGN.md §5 C-04b; gate as C-04a + DPPATH.*
+  **LANDED `b1834abb2`.** RIGHT admitted as the LEFT join it reduces to
+  (`reduceRightLink`), through the same reduction `makeSpecialJoinInfoScoped`
+  applies to the SJI, so chain and SJI describe the same hand — mirroring
+  PG, which hands its two directions different jointypes (joinrels.c:906-1029)
+  because legality is an orientation question. Carries both C-04a
+  mechanisms rather than rediscovering them (per-problem SJI remap over the
+  collapse split; the outer-over-derived firewall, verified firing on a
+  RIGHT-over-derived fixture). Also closes a hole C-04a opened: a pinned
+  LEFT/RIGHT item reaching the search as a two-item problem is now checked
+  against `join_info_list`, fail-closed. Gates as C-05 above.
 - [ ] **C-04c P3-04 below-inner + non-first-comma LEFT links.**
   Non-spine LEFT admission. *design: C-04 DESIGN.md §5 C-04c; gate as
   C-04a.*
-- [ ] **C-05 P1-18 outer/semi/anti sizing — executes HERE, after C-04.**
+- [x] **C-05 P1-18 outer/semi/anti sizing — executes HERE, after C-04.**
   Port `calc_joinrel_size_estimate`'s jointype switch.
   *design: take3 08 §4 + §6.2; gate: EA ratchet.*
 
@@ -638,6 +648,16 @@ rule).*
 > cannot see the base-rel `rows=1` collapse diagnosed in
 > `docs/design/planner-rowest-collapse/DESIGN.md`. Ledger
 > `take3-ea-ratchet-never-ran`. Build the gate before relying on it.
+  **LANDED `e7ca37d97`.** All five arms of `calc_joinrel_size_estimate`'s
+  jointype switch, plus `joinPublishesInner` (the rel-level SEMI/ANTI
+  left-only publication C-03c's per-path narrowing had no counterpart
+  for), a dedicated semi selectivity estimator, and `pushedDownSelectivity`
+  separating pushed-down from join clauses. The Q78 firewall is
+  deliberately NOT removed — its resume condition is B-06's CTE stats, and
+  the sweep confirms it still declines. Gates (with C-04b, disjoint by
+  file, gated together): TPC-H 24/24 by values, same-session A/B −0.7%;
+  TPC-DS SF0.5 PASS=95 all-zero, shapes 99/99, verdict-changes=none;
+  plan-gate 22/22 both modes, pin `c05-c04b-20260907`.
 - [ ] **C-06 P3-05 retire `GOOPG_PGSHAPED_COLLAPSE`.** Once C-04 makes it
   the only jointree path; `from_collapse_limit`/`join_collapse_limit`
   take upstream meaning. Own commit, both suites timed.
