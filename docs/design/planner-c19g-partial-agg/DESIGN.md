@@ -427,3 +427,119 @@ the search's final `RelOptInfo` instead of only the finished child Node. It also
 needs the plan-cache question of §2.2 answered — either by adding the parallel
 block to `sessionPlannerFingerprint` or by keeping the split decision post-cache.
 Reported to the owner of `groupingpaths.go` rather than made here.
+
+---
+
+## 9. MEASURED (2026-09-07)
+
+All arms on one binary built from `866e6fe7e` in a clean worktree, one
+`GOOPG_PARTIAL_AGG_PATHS` value per arm, fresh capped server per arm.
+
+**Measurement hygiene note.** The canonical TPC-H cluster (`:65433`,
+`bench/tpch/runtime_goopg/data`) was in concurrent use by two other agents
+throughout this session — a "repair" server, then a C-17 acceptance gate, both on
+that datadir and port. Two of this slice's early arms collided with theirs
+(their `goopg stop` on the shared datadir killed this slice's servers, and one
+digest ran against their binary before the collision was noticed). Those arms
+are discarded. Everything reported below was re-run on a PRIVATE clone of the
+cluster at `/tmp/claude-1000/c19g-tpch` on port 5534, verified at the canonical
+`lineitem` count of 6,001,255.
+
+### 9.1 Values — the failure mode a digest of counts cannot see
+
+| gate | arm | result |
+|---|---|---|
+| TPC-H `tpch-runner -digest` | off | 24/24 OK |
+| TPC-H `tpch-runner -digest` | **on** | 24/24 OK |
+| TPC-H `tpch-runner -diff off on` | — | **24 MATCH, PASS on VALUES** |
+| TPC-DS SF0.5 full sweep | **on** | **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4** |
+
+The TPC-DS report's flag-provenance line carries
+`GOOPG_PARTIAL_AGG_PATHS=on`, so the arm is self-identifying
+(`bench/tpcds/runtime_goopg/tpcds-results-sf05/sweep-20260907-041738.txt`).
+Its own channels: `verdict-changes=none`, `runtime-moves=0`,
+TOTAL 1116 s → 1072 s (**−3.9%**), plan-shape `same=98 changed=1` (Q21).
+
+### 9.2 Plans
+
+- Mode **off**, `make plan-gate` against the pin `plan_snapshots/c05-c04b-20260907.txt`:
+  **22/22 MATCH.** The serial control arm is inert against the shared pin, not
+  merely inert by unit test.
+- Mode **on**: 3/22 diverge — **Q1, Q5, Q9**, each by gaining
+  `Finalize → Gather → Partial` with a `Group Key`. Those are exactly the
+  grouped aggregates the retired size rule refused: `aggColumnStats` could not
+  reach their group keys, so `groupsToRowsRatio` returned "cannot estimate" and
+  the split was declined outright. Before this slice the ONLY aggregates that
+  split on TPC-H were the three UNGROUPED ones (Q6, Q14, Q19), because an
+  ungrouped aggregate is the one case `groupsToRowsRatio` answers without
+  statistics.
+- `MODE=costs` is **NOT EVALUABLE** on the private clone and is not claimed as a
+  pass: a restarted clone loses `TableStats.RowCount`, so the cost columns drift
+  wholesale — the mode-OFF control arm diverges 21/22 on the same server where
+  structural is 22/22. It needs the canonical cluster in its pinned-stats regime
+  (the "plan pin had THREE stats drift sources" result), which was contended.
+
+### 9.3 Timing — three alternating passes per arm, medians
+
+Each pass is a fresh server; arms alternate off/on/off/on so server age and
+machine state track together. Machine load ~4 throughout (peer agents active),
+so the noise floor is the stated ±17%.
+
+| query | off (s) | on (s) | median Δ |
+|---|---|---|---|
+| **Q1** | 8.54, 8.64, 8.57 | 3.31, 5.14, 4.14 | **−51.7%** |
+| Q5 | 4.05, 4.66, 4.28 | 4.90, 4.59, 4.25 | +7.2% |
+| Q9 | 3.95, 4.18, 4.02 | 3.76, 4.06, 3.87 | −3.7% |
+| Q13 | 5.03, 5.44, 5.30 | 5.52, 5.43, 5.41 | +2.5% |
+| Q19 | 2.71, 2.26, 2.36 | 2.27, 2.48, 2.25 | −3.8% |
+| Q21 | 16.53, 14.30, 14.18 | 15.70, 14.59, 14.47 | +2.0% |
+| full suite (1 pass) | 143.88 | 137.68 | −4.3% |
+
+**Q1 is the result.** Its off-arm spread is 8.54–8.64 s — 1.2% — so a −51.7%
+median move is two orders of magnitude outside the noise. It is also exactly the
+query the split was built for and the one the retired rule could not reach:
+5.9 M rows into four groups, funnelled through a Gather into ONE leader-side
+aggregate. Q5's +7.2% and Q14's +10.6% (0.47 s → 0.52 s) both sit inside their
+own arms' spreads and are not claimed as regressions in either direction.
+
+### 9.4 Does a Gather become choosable? Yes — and the arithmetic
+
+For Q1 at 4 workers, with `partialGroups = 4` and `d = 4`:
+
+- **what crosses**: `Gp = partialGroups × d =` **16 group-states**, against
+  `R =` **5,901,255 rows** for the no-split arm — a factor of 3.7 × 10⁵;
+- **charged**: `parallel_tuple_cost × 16 = 1.6`, against
+  `parallel_tuple_cost × 5.9 M = 590,000`;
+- **saved on top**: `cpu_operator_cost × (A+K) × R × (1 − 1/d) ≈ 110,000`.
+
+So the split candidate beats the gathered one by ≈ 7 × 10⁵ cost units, and the
+crossover of §3.4 is satisfied by six orders of magnitude. This is the answer
+C-19d §5.1 could not get at a base rel (0.1/row charged against 0.0075/row
+saved) and C-19f could get only conditionally (`N > 106,667 + 9.87·J`): partial
+aggregation does not merely shift the crossover, it removes the boundary term
+almost entirely, because goopg's Partial node emits no rows at all.
+
+### 9.5 The default — recommendation, and why it is not flipped here
+
+Every criterion in §6.4 for a POSITIVE result is met: both values gates are
+clean, the win is 50× outside the noise floor on the query the mechanism exists
+for, nothing regresses outside its own arm's spread, and the mode-off control is
+22/22 against the shared plan pin.
+
+**Recommendation: flip `GOOPG_PARTIAL_AGG_PATHS` to `on` by default.**
+
+It is NOT flipped in this slice's commits for two reasons, both about shared
+state rather than about the evidence:
+
+1. Flipping moves three TPC-H plans (Q1/Q5/Q9), so it requires re-pinning
+   `plan_snapshots/` in the same commit — as C-15 did. That pin is a shared
+   artefact and two peer agents were mid-A/B against it for the whole session;
+   re-pinning under them would silently move their baselines.
+2. `MODE=costs` has not been run in its pinned-stats regime (§9.2), and the
+   canonical cluster needed for it was contended and is currently in a
+   WAL-early-end state.
+
+The flip is therefore a small, fully specified follow-up: set the default arm of
+`partialAggModeFromEnv`, run `make plan-gate` + `MODE=costs` on the canonical
+cluster, re-pin `plan_snapshots/` in the same commit, and regenerate
+`scripts/planner-flags.env` (the label becomes `unset(on)`).

@@ -1295,6 +1295,21 @@ rule).*
   tuples); and the verdict had to be made homogeneous in the input row
   count because `TableStats.RowCount` is never restored (ledger pq-P6) —
   a model needing absolute rows would refuse every split including Q1's.
+  MEASURED (design §9, private cluster clone — :65433 was contended all
+  session): TPC-H values 24/24 MATCH on VALUES both arms; TPC-DS SF0.5
+  with the mode ON `PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`,
+  total −3.9%, verdict-changes=none; plan-gate mode-OFF **22/22 MATCH**
+  against `c05-c04b-20260907` (the control arm is inert against the shared
+  pin, not just by unit test); mode ON moves 3/22 — Q1/Q5/Q9 gain
+  `Finalize → Gather → Partial`, the grouped aggregates the size rule
+  refused outright. **Q1 8.57 s → 4.14 s median, −51.7%**, over three
+  alternating passes whose off-arm spread is 1.2%; nothing else outside
+  its own arm's spread. `MODE=costs` NOT evaluable on the clone (cold
+  stats drift the control arm 21/22) and is not claimed.
+  **RECOMMENDATION: flip the default to `on`** — every §6.4 criterion for a
+  positive result is met. Not flipped here because the flip needs a re-pin
+  of `plan_snapshots/`, which two peer agents were A/B-ing against all
+  session, plus `MODE=costs` on the canonical cluster.
   REMAINDER (not this slice): the upper-rel-resident port needs one change
   in `groupingpaths.go` (owned elsewhere) plus an answer to the plan-cache
   question — see that design's §8.
