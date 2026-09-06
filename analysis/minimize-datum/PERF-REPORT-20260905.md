@@ -402,6 +402,20 @@ Stated plainly, because the gaps bound every claim above:
   fixture catalogs carry no statistics, so every PlanRows reads 1.0. Any
   weighting of an empty declining set is zero, so the verdict does not turn
   on it, but the number D-02 asked for does not exist.
+- **The TPC-H corpus cannot witness anything LIMIT-dependent.** goopg's
+  suite is HammerDB `pgolap.tcl`'s templates, not the TPC-H spec: none of
+  the 22 query strings contains a `LIMIT`, and none of the 23 committed PG
+  plans contains a `Limit` node. So bounded/top-N sort, `cost_sort`'s
+  `limit_tuples` arm and `tuple_fraction` end-to-end have **no witness in
+  the numbers above** and must be measured on TPC-DS, where 81 of 99 PG
+  plans are `Limit`-rooted. Quoting the spec's `LIMIT 100` on Q18 is a live
+  trap — it is not in this corpus.
+- **Top-level sorts are priced at zero.** `costSortRun` has one production
+  caller, `sortPathFor`, so goopg costs merge-join input sorts and nothing
+  else. Q18's `Sort (rows=1565307 width=204)`, the largest in the suite and
+  in its slowest query, contributes nothing to any path comparison. Any
+  reasoning about "goopg's sort cost model" from suite behaviour is
+  reasoning about a strictly smaller thing than it appears.
 - **No S-warm arm, and no parallel arm.** Everything here is S-cold serial.
 - **TPC-DS timing is not tracked**, only values (PASS/MISMATCH/CKMISMATCH).
 
