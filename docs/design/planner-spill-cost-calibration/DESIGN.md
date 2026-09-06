@@ -169,7 +169,15 @@ in their own order (B-13, then B-15, then E-16).
 |---|---|
 | Cut 1 — sort `avgVarBytes` (§3.3) | **pending** — one-line change in `cost_funcs.go` + `joinpathsmerge.go`, held while C-19d owns those files |
 | Cut 2 — sort spill trigger (§3.2) | **deferred behind Cuts 1/3** by probe 6.1: inert on the current TPC-H plan set; gate it on a forced shape or E-16's reduced `work_mem` |
-| Cut 3 — derived `SpillBytes` model | **half landed** (`53cd7a073`): the model and its three encoder-agreement tests are in `internal/executor/hashsize`, INERT. Wiring `spillPages` to call it, and its plan/timing gate, is the remaining half — also held on `cost_funcs.go` |
+| Cut 3 — derived `SpillBytes` model | **half landed** (`53cd7a073`, extended `027936d8f`): the model and its encoder-agreement tests are in `internal/executor/hashsize`, INERT. Wiring `spillPages` to call it, and its plan/timing gate, is the remaining half — also held on `cost_funcs.go`. **The wiring must now call `SpillInnerBytes` for the inner side and `SpillBytes` for the outer**, because E-14's keyed inner frame made the two sides genuinely different widths |
+
+**A drift, one day old, worth recording as a method note.** The
+agreement test that shipped with `SpillBytes` did not catch E-14's keyed
+inner frame: every case in it encoded through `WriteRowHashed`, so the
+model stayed correct for outer frames and went 9 B/row short on inner
+ones with the test still green. Pinning one of two writers is not pinning
+the pair. Any future model added here must enumerate its writers, not its
+cases.
 | Cut 4 — resume B-13 / B-15 / E-16 | not started |
 
 Landing Cut 3's model separately from its wiring is deliberate: the model
