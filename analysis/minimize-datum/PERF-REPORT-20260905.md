@@ -835,6 +835,57 @@ neither of which depends on buffer residency. What the setup permitted was
 a goopg-vs-PG wall-clock comparison that would have been silently unfair —
 and now does not.
 
+## 5.16. C-04a: TPC-H passed, and the second gate caught a wrong answer
+
+This section exists because it is the cleanest demonstration in the whole
+workstream of why the gate protocol has two suites, and because the first
+measurement of it was wrong in a way worth recording.
+
+C-04a admits `LEFT JOIN` links into the join search — the item that turns
+C-03's inert jointype machinery on. On TPC-H it looked like a clean win:
+
+| | pre-C-04a | C-04a |
+|---|---:|---:|
+| values (`-diff`) | — | **24/24 MATCH** |
+| plans moved | — | 1 (Q13) |
+| Q13 | 5.87 s | **5.05 s (−14%)** |
+| suite | 106.85 s | 109.27 s (+2.3%, inside spread) |
+
+The one plan that moved, moved the right way: Q13's `Hash Left Join`
+became a `Merge Left Join`, the row estimate went from 2,358,304 to
+1,499,850 — the true `orders` cardinality — and the width narrowed
+1072 → 96. The LEFT join was *in* the search, which is the item's entire
+purpose.
+
+**Then the TPC-DS SF0.5 gate returned `MISMATCH=1 TIMEOUT=1`** against a
+prior `PASS=95`:
+
+- **Q72 returned 84 rows; the oracle says 100.** Both `Nested Loop Left
+  Join`s in the plan had become plain `Nested Loop`s — the admitted LEFT
+  links lost their jointype, the null-extended rows were dropped, and the
+  ON-condition surfaced as a post-join `Filter` on an inner join. Q72 is
+  the design's own named witness for this item.
+- **Q78 went from 15 s to a >328 s timeout.** Its LEFT joins survived,
+  but `d_year = 1998` was dropped from the `date_dim` scan (149 rows →
+  73,049, unfiltered), so three hash joins consumed the dimension 490×
+  larger. The per-qual delay had misclassified a non-nullable-side
+  restriction as one that must rise above the outer join.
+
+Neither shape exists in TPC-H. A values gate on one suite is a statement
+about that suite's shapes, and no more.
+
+**The measurement that was wrong.** My first timing of C-04a showed
+**+13.1%** with Q9 +36% and Q7 +31% — taken while my own TPC-DS captures
+and a PG cluster were running. On a quiet host, same session, fresh server
+per arm, it was **+2.3%** with per-query moves mixed in sign (Q1 went from
+−33% to +17.6% between the two runs). That swing is the tell. I had
+written the host-load trap into every agent prompt this session and then
+walked into it myself; the number reported to the agent was wrong and had
+to be corrected.
+
+C-04a is BLOCKED pending a fix of both mechanisms, with revert as the
+fallback. A wrong answer does not stay in the tree while a fix is designed.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
