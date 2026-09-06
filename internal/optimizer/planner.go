@@ -2731,8 +2731,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// C-01 P3-01: thread the name → leaf scope so SpecialJoinInfo
 	// Min/LhsStrict population can resolve ON-clause names (syn fallback
 	// on any uncertainty — never an underestimate).
-	rctx.joinlist = deconstructJointreeScoped(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), newSjiScope(s.FromExprs, cat))
-	rctx.joinInfoList = rctx.joinlist.collectSpecialJoinInfos(nil)
+	// C-04a: the join_info_list comes from the DECONSTRUCTION, not from a
+	// walk of the joinlist's `sjinfo` fields — an outer join that does not
+	// pin has no item to carry one, and losing its ordering constraint would
+	// let the search reorder across the outer join. See
+	// `deconstructJointreeScopedSJI`.
+	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), newSjiScope(s.FromExprs, cat))
 	return root, rctx, nil
 }
 

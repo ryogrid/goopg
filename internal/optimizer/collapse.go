@@ -353,6 +353,28 @@ func deconstructJointree(from []parser.FromExpr, lim collapseLimits, collapseJoi
 // restrictions (initsplan.c:1823); disjoint comma items never overlap so they
 // contribute nothing to each other's scans.
 func deconstructJointreeScoped(from []parser.FromExpr, lim collapseLimits, collapseJoins bool, sc *sjiScope) joinlist {
+	jl, _ := deconstructJointreeScopedSJI(from, lim, collapseJoins, sc)
+	return jl
+}
+
+// deconstructJointreeScopedSJI is deconstructJointreeScoped returning
+// `root->join_info_list` alongside the joinlist.
+//
+// C-04a. Until now the list was recovered AFTER the fact by walking the
+// joinlist for items carrying an `sjinfo` field (`collectSpecialJoinInfos`),
+// which silently made the ordering constraints a function of PINNING: an
+// outer join that does not pin has no item to hang its SpecialJoinInfo on, so
+// relaxing the pin (§3.2) would have deleted the very constraint
+// `join_is_legal` needs to keep the search from reordering across the outer
+// join — wrong answers, not lost plans. Upstream has no such coupling:
+// `deconstruct_recurse` appends to `root->join_info_list` inside
+// `make_outerjoininfo` (initsplan.c:1743) whether or not the `JoinExpr` forces
+// its order, and the joinlist is a separate output. This is that division.
+//
+// The order is bottom-up across the whole FROM clause — `lower` is threaded
+// through every item — which is the order `join_is_legal`'s commutativity scan
+// depends on and the order `collectSpecialJoinInfos` produced.
+func deconstructJointreeScopedSJI(from []parser.FromExpr, lim collapseLimits, collapseJoins bool, sc *sjiScope) (joinlist, []*SpecialJoinInfo) {
 	var jl joinlist
 	remaining := len(from)
 	nextRel := 0
@@ -369,7 +391,7 @@ func deconstructJointreeScoped(from []parser.FromExpr, lim collapseLimits, colla
 			jl = append(jl, subItem(sub))
 		}
 	}
-	return jl
+	return jl, lower
 }
 
 // deconstructRangeVars is `deconstructJointree` for the JOIN-free spelling of a
@@ -429,22 +451,29 @@ func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseL
 		right := joinlist{leafItem(next)}
 		next++
 		pinned := joinPinned(j.Type, collapseJoins)
+		// The left joinlist as it stands BEFORE this link folds it in — the
+		// SpecialJoinInfo's syntactic LHS. Captured rather than recovered from
+		// the folded result (C-04a): when the link pins, `combineJoinlists`
+		// buries it at `left[0].sub[0].sub`, and when it does not pin there is
+		// nothing to recover it from at all.
+		prevLeft := left
 		left = combineJoinlists(j.Type, pinned, left, right, lim.joinCollapseLimit)
 		// M0128-P1.1: build SpecialJoinInfo for every outer/semi/anti join.
-		// For P1.1 the pin stays in force regardless, so the entry is data
-		// only — recorded, not consulted. P1.2 consumes it.
-		if j.Type != parser.JoinInner && j.Type != parser.JoinCross {
-			// When pinned, combineJoinlists returns exactly one pinnedItem;
-			// the SpecialJoinInfo lives on it. When not pinned (future:
-			// collapseJoins=true for INNER-like), the join flattens and there
-			// is no single item to attach to — but the pin is mandatory for
-			// outer/semi/anti until P1.2, so that case does not arise.
-			if pinned && len(left) == 1 && !left[0].isLeaf() {
-				left[0].sjinfo = makeSpecialJoinInfoScoped(j.Type, left[0].sub[0].sub, right, j.On, sc, itemIdx, lower)
-				lower = append(lower, left[0].sjinfo)
-				made = append(made, left[0].sjinfo)
-			}
+		if j.Type == parser.JoinInner || j.Type == parser.JoinCross {
+			continue
 		}
+		sj := makeSpecialJoinInfoScoped(j.Type, prevLeft, right, j.On, sc, itemIdx, lower)
+		// When pinned, combineJoinlists returns exactly one pinnedItem and the
+		// SpecialJoinInfo also lives ON it — `pinnedOuter`'s consumers read it
+		// there. When NOT pinned (C-04a's LEFT relax) the join flattens and
+		// there is no single item to attach to; the SJI reaches
+		// `root->join_info_list` through `made` either way, which is the whole
+		// point of the split (see deconstructJointreeScopedSJI).
+		if pinned && len(left) == 1 && !left[0].isLeaf() {
+			left[0].sjinfo = sj
+		}
+		lower = append(lower, sj)
+		made = append(made, sj)
 	}
 	return left, made
 }
