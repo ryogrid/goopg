@@ -1442,10 +1442,41 @@ rule).*
   *design: take3 08 §8 + docs/design/planner-c19d-gather-paths/DESIGN.md;
   gate: take3 09 §5 P5 (PP, parallel-on + serial control) — run under
   C-19f, see that row.*
-- [ ] **C-19e P5-05 re-decide Gather Merge → Sort → Parallel scan by
-  cost** rather than `sortPartialRootPays`' hard-coded decline. If goopg's
-  costs still choose leader-side sorting, record it as a permitted
-  divergence with the committed measurement (take3 09 §4.4 case 1).
+- [x] **C-19e P5-05 re-decide Gather Merge → Sort → Parallel scan by
+  cost** rather than `sortPartialRootPays`' hard-coded decline. LANDED
+  2026-09-07; design `docs/design/planner-c19e-partial-sort/DESIGN.md`
+  (measurement in its §6). `partialSortRootPays` (partialsortpaths.go) is
+  a two-candidate PATH tournament — `Gather Merge -> Sort -> partial`
+  against `Sort -> Gather -> partial`, the two plans the post-pass
+  actually builds — priced by `costSortRun` + `cost_gather` /
+  `cost_gather_merge` and adjudicated by `addPath`/`setCheapest`, in
+  C-19g's shape. **No new constant**: the rule it replaces had one
+  hard-coded type switch, the replacement has none. Rides a new
+  `GOOPG_PARTIAL_SORT_PATHS`, default `off`, which delegates to the
+  retired switch unchanged, so the default and serial control arms are
+  bit-identical.
+  **No permitted divergence is recorded — the anticipated case did not
+  occur.** goopg's costs choose the WORKER-side sort, disagreeing with the
+  rule, and the measurement backs the costs: exactly one TPC-H plan moves
+  (q16, the query the rule's own note cites) and its median over five
+  paired observations on one engine image is 0.82 s off / **0.70 s on**.
+  The historical q16 1.5 → 2.3 s and q13 4.2 → 6.8 s (M0134-0189) **do not
+  reproduce** — they predate E-10's Gather-Merge claim set — and q13's plan
+  does not move at all under the new verdict. Suite totals inside their own
+  spread (143.80/146.73 and, reversed, 139.37/138.25), so no suite claim.
+  Gate result: `go build`, `go vet`, full `go test` on
+  `./internal/optimizer/ ./internal/executor/` green; `RALPH_PRECOMMIT_SCOPE=units`
+  exit 0; `-race` green on the parallel set; TPC-H `-digest`/`-diff`
+  **24 MATCH both pairs**; `make plan-gate` **22/22 structural AND 22/22
+  MODE=costs** on the default arm, 21/22 on the `on` arm with q16 the only
+  divergence.
+  The mandatory both-arms run FOUND A LATENT EXPLAIN BUG (§6.4):
+  `rebuildWithGather`'s merge arm stamped `stampParallelScan(root)` with
+  root = the `*Sort`, which has no arm there, so the scan under a Gather
+  Merge rendered with **no `Parallel ` label** while the workers split it.
+  Label-only (the flag is read in `operators_explain.go` and nowhere else)
+  and latent since P7 because the shape was unreachable; fixed by stamping
+  the Sort's child, pinned by `TestGatherMergeStampsDrivingScan`.
   *design: take3 08 §8; gate: take3 09 §5 P5 (timing both shapes).*
 - [x] **C-19f P5-06 parallel hash join as a `parallel_aware` hash path,
   priced.** LANDED `e8456fe82` (mechanism) + `125c4c016` (consumer check
@@ -1550,7 +1581,42 @@ rule).*
   REMAINDER (not this slice): the upper-rel-resident port needs one change
   in `groupingpaths.go` (owned elsewhere) plus an answer to the plan-cache
   question — see that design's §8.
-- [ ] **C-19h P5-08 retire `MaybeAddGather`.**
+- [!] **C-19h P5-08 retire `MaybeAddGather` — BLOCKED, and NOT on the
+  default flip. Measured 2026-09-07; evidence
+  `docs/design/planner-c19h-gather-postpass/DESIGN.md`.**
+  The blocker is **C-19g's unfinished upper-rel-resident half**, which was
+  not previously named as this item's prerequisite.
+  1. *At the default the post-pass is the ONLY producer of parallelism.*
+     `generateUsefulGatherPaths` and `addPartialAggPaths` are the only
+     producers of `PathGather`/`PathGatherMerge` and both return at their
+     first line when their knob is `off` — the default for both. SF=1
+     census, one engine image, engine defaults (`GOOPG_PGSHAPED_DP=1`,
+     `GOOPG_PGSHAPED_COLLAPSE=1`): **12/22 queries carry a Gather with the
+     post-pass, 0/22 without it**, and the suite goes **232.35 s →
+     467.03 s (+100.0 %)** (Q18 43→154, Q21 17.7→61.1, Q19 2.6→25.3).
+  2. *The conditional retirement fails too.* A probe build standing the
+     post-pass down wholesale under `GOOPG_GATHER_PATHS=all` +
+     `GOOPG_PARTIAL_AGG_PATHS=on` reaches only **7/22** queries with a
+     Gather against the post-pass's 12: it gains Q21 (C-19f's win, the case
+     only a path model reaches) and **loses Q1, Q6, Q14, Q15a, Q16, Q19**.
+     `top` gives the identical 7.
+  3. *Why Q1 is lost.* C-19g's Q1 8.57 → 4.14 s is delivered THROUGH the
+     post-pass: it replaced the verdict (`partialAggSplitPays` "returns
+     only a boolean and constructs no node") but not the construction —
+     `splitAggregate` (parallel.go) still builds
+     `Finalize -> Gather -> Partial`. That is exactly what C-19g's own
+     `[~]` row means by "the upper-rel-resident half is unfinished".
+  The conditional stand-down was written and **reverted rather than
+  shipped**: landing it would serialise six queries in the very arm on
+  which the default flip is to be judged. C-19d's per-tree
+  `subtreeHasGather` stand-down is unchanged and still correct.
+  **Double-Gather verification (the item's own requirement), done not
+  assumed**: across every arm measured — including `GP=all PA=on` with the
+  post-pass live — no plan carries more than one Gather on any
+  root-to-leaf path.
+  Sequencing: finish C-19g's upper-rel half → re-run the census → retire
+  conditionally on `all` → flip the default (needs the `plan_snapshots/`
+  re-pin) → only then delete. Only the last step is C-19h as written.
   *design: take3 08 §8; gate: take3 09 §5 P5 — plan-parity both suites,
   parallel and serial arms.*
   (Serial control arm unchanged throughout C-19a–h. Ordering trap already
@@ -1620,11 +1686,51 @@ rule).*
 > where PG 18.3 emits the same `rows=1`, and fails Q99's 8007×. Runs on
 > its own clone on port 5534; never touches 65433/65437. C-05, C-10a and
 > C-21 cite the same gate and can now use this one.
-- [ ] **C-20b P6-02 `PathTarget` + range table.** Replace
-  `baseLeaf`/`baseOffset`; delete `joinlayout.go` remapping + the
-  `createplanroot.go` boundary assertions. Deletes the largest silent
-  wrong-answer class — value-level `tpch-runner -diff`, never counts.
-  *design: take3 08 §9; gate: value-level `-diff`, never counts.*
+- [x] **C-20b P6-02 `PathTarget` + range table — LANDED 2026-09-07, with
+  one of its three deletions REFUSED on evidence.** Design:
+  `docs/design/planner-c20b-pathtarget-rangetable/DESIGN.md`.
+  1. **`joinlayout.go` remapping: DELETED** (~580 lines; the file goes
+     1353 → 768). `remapColumnRefsAfterRewrite` /
+     `remapPosMapAfterRewrite` went on a PROOF — the walker took a
+     `posMap func(int) int`, never read it, and its body assigned to no
+     `Index` field. The bindings-posmap family (`remapWithBindings`,
+     `remapTopProjection`, `remapAggExprsWithBindings`,
+     `buildBindingsPosMap`, `applyJoinTreePosMap`, `scanKey`,
+     `searchedTreeWidth`) went on a CENSUS, to the gate C-20c failed:
+     over TPC-H (22) and TPC-DS (99), on both `GOOPG_PGSHAPED_DP` arms,
+     the passes were reached up to 408 times and moved **zero**
+     ColumnRefs, and `EXPLAIN` text is byte-identical without them on
+     all four arms.
+  2. **`createplanroot.go` boundary assertions: NOT deleted, and must
+     not be.** While `ColumnRef.Index` is a POSITION rather than PG's
+     `(varno, varattno)`, `boundaryMap`'s hole / out-of-range /
+     duplicate panics are the DETECTOR for the wrong-answer class this
+     item names, not a symptom of a missing range table — `searchedtree.go`
+     already records that they "remain the primary guard". Deleting them
+     would convert three loud plan-time aborts into three silent
+     wrong-row classes.
+  3. **`baseLeaf`/`baseOffset`: not replaceable, and the premise was
+     wrong.** goopg has HAD a range table since M0071-0009 —
+     `rangeBinding` carries `sourceIdx` (PG's `varno`, stamped onto every
+     column as `SchemaColumn.SourceTableIdx`) and `rtid`; `baseLeaf` /
+     `baseOffset` are its projection onto the search's relid space. What
+     goopg lacks is PG's `Var`. Every consumer of the two fields lives in
+     a file this task did not own; a value-embedded `rangeTblEntry` in
+     `RelOptInfo` would preserve all of them through field promotion and
+     is the recommended shape, but it is ceremony without the `Var`
+     change.
+  Landed in place of (2): `internal/optimizer/rangetable.go` —
+  `rangeTableFromPath` + `assertBoundaryColumnIdentity`. `boundaryMap`
+  proves the root's layout is a PERMUTATION; it cannot say WHICH column
+  sits at a position, and a valid permutation that assigns the wrong
+  coordinate is exactly this item's silent class (right row count,
+  neighbouring relation's values). The new assertion requires every root
+  output column to agree with the range table on `(Name,
+  SourceTableIdx)`, so a swapped self-join instance — invisible to every
+  name-based check in the planner — is caught at plan time. Abstention is
+  transcribed from `assertSearchedTreeNeedsNoReconcile`.
+  *design: take3 08 §9 + planner-c20b DESIGN; gate: value-level `-diff`,
+  never counts.*
 - [!] **C-20c P6-06a retire `GOOPG_INDEXKEY_HARVEST` — BLOCKED: the flip
   is not plan-neutral (measured 2026-09-05).** The item's own gate is
   "byte-identical plans for the flip", and the flip fails it. On/off arms
@@ -1703,7 +1809,19 @@ rule).*
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
 - [ ] **C-20h P6-07 `setrefs` phase + P6-08 `RestrictInfo` caching.**
   `setrefs` only if C-20b shows the executor still needs explicit column
-  resolution; caching is planning-speed, not plan-quality.
+  resolution — **C-20b (2026-09-07) shows exactly that, so the `setrefs`
+  half is NOT moot; it is the actual P6-02.** `ColumnRef.Index` is a
+  position in the pre-search binding concatenation and is the executor's
+  only column address (expression evaluation is a flat slice lookup into
+  the child's materialised slot); `SourceTableIdx` rides beside it as a
+  disambiguation hint that nothing resolves THROUGH. Making the boundary
+  map deletable means (i) `ColumnRef` becomes `(SourceTableIdx, attno)`
+  with `Index` derived, (ii) every producer stops computing positions,
+  (iii) a `setrefs` pass computes them once at the end, (iv) the
+  executor's slot resolution is re-pointed at its output — a change
+  spanning `plan.go`, the parser binder, the whole optimizer and the
+  executor's expression evaluator, which no TODO_ALL row currently
+  carries. Caching is planning-speed, not plan-quality.
   *design: take3 08 §9; gate: take3 09 §5 P6 (P6-08: planning-time
   comparison, plans byte-identical).*
   P6-03/04/05 stay **must-not-delete** (measured 6.5× / 12.5× /

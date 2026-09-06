@@ -356,9 +356,22 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		//
 		// goopg's Sort carries no top-N limit, so there is no per-worker
 		// truncation to reason about: every worker emits its whole partition.
+		//
+		// C-19e (P5-05): the verdict is now a two-candidate PATH tournament —
+		// `Gather Merge -> Sort -> partial` against `Sort -> Gather -> partial`
+		// — priced by `costSortRun` + `cost_gather` / `cost_gather_merge` and
+		// adjudicated by `addPath` / `setCheapest` (partialsortpaths.go).
+		// `GOOPG_PARTIAL_SORT_PATHS=off`, the default until the measurement in
+		// docs/design/planner-c19e-partial-sort/DESIGN.md §5 says otherwise,
+		// delegates to the retired type switch unchanged. The worker count is
+		// sized from `srt.Child` for the same reason the aggregate arm sizes
+		// from `agg.Child`: the divisor that PRICES the candidates must be the
+		// one the built plan RUNS at, and `MaybeAddGather` does not compute it
+		// until after this walk has chosen a target.
 		if srt, isSort := cur.(*Sort); isSort && len(srt.Keys) > 0 &&
 			!s.DisableGatherMerge &&
-			drivingScan(srt.Child) != nil && sortPartialRootPays(srt) {
+			drivingScan(srt.Child) != nil &&
+			partialSortRootPays(srt, computeParallelWorkers(srt.Child, s), s.LeaderParticipates) {
 			return partialTarget{node: srt, mergeKeys: srt.Keys}, true
 		}
 		if terminatesPartial(cur) {
@@ -409,6 +422,13 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 // disabling the scan type outright.
 //
 // C-19c: a plain `*IndexScan` driving scan declines for the same reason.
+//
+// C-19e (P5-05) is the item that gives the post-pass the cost model this
+// comment says it lacks: `partialSortRootPays` (partialsortpaths.go) prices
+// both candidates with `costSortRun` + `cost_gather` / `cost_gather_merge` and
+// lets `addPath` adjudicate. This function is what that tournament DELEGATES TO
+// when `GOOPG_PARTIAL_SORT_PATHS` is `off` — the default — so it is still the
+// production verdict and its measurement still stands.
 //
 // It used to decline for a SECOND, harder reason as well — the Gather Merge
 // operator attached only the seq-scan block allocator to its workers, not the
@@ -847,8 +867,37 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
 	if root == tgt.node {
 		switch {
 		case tgt.mergeKeys != nil:
-			stamped := stampParallelScan(root)
-			return NewGatherMerge(stamped.Pos(), stamped, workers, tgt.mergeKeys)
+			// The target IS the Sort, and `stampParallelScan` has no `*Sort`
+			// arm — deliberately: `terminatesPartial` lists `*Sort`, so a Sort
+			// can never appear INSIDE a partial subtree, and the traversal must
+			// stay identical to `drivingScan`'s (this function's sibling
+			// warning). The one place a Sort sits at the top of a partial
+			// subtree is right here, and `findPartialSubtree` already resolved
+			// it the same asymmetric way: it asked `drivingScan(srt.Child)`,
+			// not `drivingScan(srt)`. So stamp the CHILD, for the same reason
+			// and at the same offset.
+			//
+			// Found by C-19e's TPC-H arm (2026-09-07). Stamping `root` here
+			// fell through every arm and returned the Sort UNCHANGED, so the
+			// scan under a Gather Merge rendered without its `Parallel ` label
+			// — EXPLAIN under-reporting the parallelism that actually ran,
+			// which is the one thing EXPLAIN exists to answer here. Label-only
+			// (the executor reads `Parallel` in operators_explain.go and
+			// nowhere else), and latent since P7 because the shape was
+			// unreachable: `sortPartialRootPays` declines every index driver,
+			// and no TPC-H plan reached it with a seq-scan driver either.
+			// C-19e's cost verdict makes it reachable (q16), which is the
+			// "an unwinnable path is an untested path" pattern again.
+			srt := root.(*Sort)
+			stampedChild := stampParallelScan(srt.Child)
+			if stampedChild == srt.Child {
+				return NewGatherMerge(root.Pos(), root, workers, tgt.mergeKeys)
+			}
+			// Shallow copy: this pass runs on a plan the process-wide cache may
+			// be handing to other sessions right now (file header, property 2).
+			c := *srt
+			c.Child = stampedChild
+			return NewGatherMerge(c.Pos(), &c, workers, tgt.mergeKeys)
 		case tgt.splitAgg:
 			return splitAggregate(root.(*Aggregate), workers)
 		}

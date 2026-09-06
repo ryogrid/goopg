@@ -97,6 +97,13 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
 		return partialAggModeLabel(partialAggModeFromEnv(v))
 	},
+	// C-19e: selects which authority decides `Gather Merge -> Sort -> partial`
+	// — the retired type switch or the priced two-candidate tournament. It
+	// moves the plan of every parallel ORDER BY / merge-input sort, so an
+	// artefact that does not name it cannot say which arm it measured.
+	"GOOPG_PARTIAL_SORT_PATHS": func(v string) string {
+		return partialSortModeLabel(partialSortModeFromEnv(v))
+	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -151,6 +158,9 @@ var flagProvenanceOrder = []string{
 	// (docs/design/planner-c19d-gather-paths/DESIGN.md §5).
 	"GOOPG_GATHER_PATHS",
 	"GOOPG_PARTIAL_AGG_PATHS",
+	// Joined at take3 C-19e (P5-05). Default `off` pending the measurement in
+	// docs/design/planner-c19e-partial-sort/DESIGN.md §5.
+	"GOOPG_PARTIAL_SORT_PATHS",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the
