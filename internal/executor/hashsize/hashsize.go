@@ -51,12 +51,32 @@ const (
 	RowSliceBytes = 24
 
 	// MapSlotBytes is goopg's analogue of PG's `sizeof(HashJoinTuple)` —
-	// the per-bucket cost of the table's index structure. A Go
-	// `map[string][]Row` slot holds a 16-byte string header, a 24-byte
-	// slice header and roughly a byte of tophash plus the load-factor
-	// slack, which rounds to 48. PG's bucket is a bare 8-byte pointer;
-	// using PG's 8 here would let the sizing believe six times as many
-	// buckets fit in work_mem as actually do.
+	// the per-bucket cost of the table's index structure. PG's bucket is a
+	// bare 8-byte pointer; using PG's 8 here would let the sizing believe
+	// six times as many buckets fit in work_mem as actually do.
+	//
+	// KNOWN 2x LOW — 48 is a hand-derived guess, not a measurement, and it
+	// is retained deliberately. The derivation below (a 16-byte string
+	// header, a 24-byte slice header, a tophash byte and load-factor slack,
+	// "which rounds to 48") was checked against go1.25's swisstable runtime
+	// during D-05 and came out at 96.1 B for `map[string][]Row` and 80.1 B
+	// for `map[int64][]Row`.
+	//
+	// Correcting it to 96 was implemented and measured (2026-09-06): it
+	// halved the bucket heap, 586.7 -> 286.0 MB live, per-worker peak
+	// -34.5%, batches unchanged, values 24/24 MATCH — and cost +10.4% on
+	// TPC-H because Q14 flipped Hash Join -> Nested Loop (+3364%). Q14 ran
+	// `Batches: 1` in BOTH arms, so nothing spilled: the PLANNER prices a
+	// 9-column build the executor never builds, and an honest bucket price
+	// pushed that phantom 1.5% past the budget.
+	//
+	// So this constant cannot be fixed on its own. It is blocked behind the
+	// cost-side narrowing fix (deferral ledger `take3-D-05-costside-unnarrowed`);
+	// with the narrowed input the same build sits at 53.4 of 134.2 MB, a
+	// 2.5x margin instead of a 1.5% one. Patch preserved at
+	// `tmp/d05p2-bucket-charge.patch`; artifact
+	// `analysis/minimize-datum/d05-bucket-charge-20260906/README.md`.
+	// Do not raise it without that fix, and do not read 48 as validated.
 	MapSlotBytes = 48
 
 	// MinBuckets mirrors nodeHash.c's "don't let nbuckets be really small"
