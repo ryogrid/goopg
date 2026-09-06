@@ -1357,21 +1357,70 @@ rule).*
   (Serial control arm unchanged throughout C-19a–h. Ordering trap already
   measured: at small budgets the plan moves onto index-driven joins the
   old post-pass cannot drive — take2 07 §3.2.)
-- [ ] **C-20a P6-01 one cardinality estimator.** Delete legacy
+- [ ] **C-20a P6-01 one cardinality estimator — RE-SCOPED 2026-09-07,
+  NOT YET EXECUTABLE.** Original text: delete legacy
   `estimateJoin`/`EstimateRows` + the `joinkeyproof.go` mirror;
-  everything reads `calcJoinrelSize`. Prerequisite: EXPLAIN `rows=` from
-  the path (P0-02 remainder) + legacy consumers gone (C-11…C-18).
-  *design: take3 08 §9; gate: take3 09 §5 P6 (PP + EA ratchet).*
+  everything reads `calcJoinrelSize`. The census
+  (`analysis/planner-refactor-take3/c20a-estimator-census-20260907/DESIGN.md`)
+  found none of the three deletions available, and none of them blocked
+  on remaining call sites:
+  - **`EstimateRows` is a coordinate-space problem.** `calcJoinrelSize`
+    is a `searchCtx` method over `*RelOptInfo`, reachable only inside
+    the search; `EstimateRows` walks the plan `Node` tree. 28 live call
+    sites in 15 files, and three of them are in `internal/executor/`
+    (EXPLAIN, hash-table geometry, correlated-subquery cache budget),
+    where no `RelOptInfo` exists or ever will. C-11…C-18 DID convert
+    their consumers — `groupingpaths`/`distinctpaths`/`partialaggpaths`/
+    `windowsetoppaths`/`upperrel` all read `legacyDisplayCostOf(…).PlanRows`
+    now — they were simply never the majority.
+  - **`joinkeyproof.go` is NOT a mirror; strike it from this item.**
+    Only `superkeyJoinEstimate` belongs to `estimateJoin`.
+    `resolveBaseColumn` serves `selectivity.go`, `extstats.go` and
+    `estimateNumGroups`; `uniqueKeyColumnSets` serves 8 scan-construction
+    sites in `planner.go`; `columnsSubset` is a live dependency of
+    C-05's own `joinrelsize.go`. It is also the subject of
+    `TestResolverFamilyArmListsAgree`, the guard against the missing-arm
+    class that cost 8007× on TPC-DS.
+  - **`estimateJoin` is not separable** — it is the `*Join` arm of
+    `EstimateRows`; deleting it alone re-opens the M0125-0038 collapse.
+  **The real prerequisite is smaller than it looked.** `PlanCost.PlanRows`
+  already carries the winning path's row count on every search-produced
+  node (`stampPlanCost`, one funnel) and EXPLAIN never reads it:
+  `explainCostFields` (`operators_explain.go:2086`) takes
+  StartupCost/TotalCost/PlanWidth from the carrier and computes `rows=`
+  as `EstimateRows(rowSrc)` at all four sites. So the planner CHOOSES
+  with `calcJoinrelSize` and EXPLAIN REPORTS `estimateJoin` — and every
+  estimate artefact in the tree (plan-gate `MODE=semantic-cost`,
+  `estimate-audit`, the c13a census figures, the new EA ratchet) reads
+  the reported one. **Successor:** make those four sites read
+  `PlanCost.PlanRows`, with the `plan_snapshots` re-pin and the
+  `estimateaudit` fixture re-capture in the SAME commit (take2 P0-02's
+  own hazard note; 09 §7.1). It moves no plan — it is a display path —
+  but it moves every `rows=` in every capture.
+  Landed under this item: `internal/optimizer/cardinality_two_estimators_test.go`
+  (the two estimators agree on the control and superkey shapes — by two
+  independent implementations; nothing observed that before) and the EA
+  ratchet below.
+  *design: take3 08 §9 + c20a-estimator-census-20260907; gate: take3 09 §5 P6.*
 
-> **WARNING (2026-09-06): the EA ratchet cited as this item's gate HAS
-> NEVER RUN.** No Makefile target, hook, precommit script or ci/batch
-> stage invokes `scripts/tpch-estimate-audit-arm.sh`, and its default
-> pinned PG baseline is not in the tree. `estimate-audit -plan-only` (the
-> plan-capture step) does run and is fine; the est-vs-actual parity
-> ratchet does not. It is also TPC-H-only and joinrel-granular, so it
-> cannot see the base-rel `rows=1` collapse diagnosed in
-> `docs/design/planner-rowest-collapse/DESIGN.md`. Ledger
-> `take3-ea-ratchet-never-ran`. Build the gate before relying on it.
+> **RESOLVED (2026-09-07): the EA ratchet now exists and runs —
+> `make ea-ratchet`.** It had never run (ledger
+> `take3-ea-ratchet-never-ran`): no Makefile target, hook, precommit
+> script or ci/batch stage invoked `scripts/tpch-estimate-audit-arm.sh`,
+> and its default pinned PG baseline was absent from the tree, so a
+> default-flag run exited before measuring. `estimate-audit -plan-only`
+> (the plan-capture step) does run and is fine; the est-vs-actual parity
+> ratchet did not. The replacement
+> (`scripts/estimate-parity-gate.sh` + `scripts/estimate-parity/`) closes
+> all four gaps: **TPC-DS SF0.5** rather than TPC-H, `EXPLAIN ANALYZE`
+> truth rather than estimates, **base-rel AND joinrel** granularity via
+> relation-set keying (a singleton key IS a base relation, so the
+> `rows=1` collapse in `docs/design/planner-rowest-collapse/DESIGN.md` is
+> now a candidate), and a **PG-relative** bar
+> `qerr > max(10, PG_qerr × 2)` — the only bar that passes Q47/Q57/Q81/Q89,
+> where PG 18.3 emits the same `rows=1`, and fails Q99's 8007×. Runs on
+> its own clone on port 5534; never touches 65433/65437. C-05, C-10a and
+> C-21 cite the same gate and can now use this one.
 - [ ] **C-20b P6-02 `PathTarget` + range table.** Replace
   `baseLeaf`/`baseOffset`; delete `joinlayout.go` remapping + the
   `createplanroot.go` boundary assertions. Deletes the largest silent
