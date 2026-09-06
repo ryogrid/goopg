@@ -976,9 +976,31 @@ rule).*
   and excluded from closure until then. Publish the executor input
   contract first (take3 13 §8.7 tiebreaker), do not absorb silently.
   *design: take3 08 §7; gate when unblocked: take3 09 §5 P4 (PP).*
-- [ ] **C-15 P4-06 `create_grouping_paths`** (sorted + hashed agg priced by
-  `cost_agg` incl. hash spill arm); retire the three aggregate rules.
-  *design: take3 08 §7; gate: take3 09 §5 P4 (PP + timing).*
+- [x] **C-15 P4-06 `create_grouping_paths`** (sorted + hashed agg priced by
+  `cost_agg`; hash spill arm OMITTED — executor has no agg spill path);
+  three aggregate rules retired. DESIGNED 2026-09-06:
+  `docs/design/planner-p4-grouping-paths/DESIGN.md` (review
+  REQUEST-CHANGES → 6 blockers fixed → APPROVE). LANDED 2026-09-07
+  (`groupingpaths.go` producer + `PathAgg` arm + `costAgg`, rules deleted
+  with seeds/helpers surviving as candidate builders). Code review
+  APPROVE-WITH-NITS, all addressed (spill prose, stale rule comments,
+  `scanShapeDisabled` restored, C10c test non-vacuous). Gates on isolated
+  HEAD+C-15-only A/B: optimizer+executor suites + units precommit green;
+  TPC-H structural 21/22 MATCH (Q18 access-path-only move, same numbers —
+  PG-tiebreak-conformant startup win on tied legacy input prices, B-15
+  witness, timing 0.96), costs moves are presorted-Sort pricings + rollups
+  (+ Q17 0.01→0.00 stats noise); `tpch-runner -digest` vs pre-cut binary +
+  `-diff` VERDICT: PASS 24/24, ten longest no slower; TPC-DS SF0.5 sweep
+  PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, TOTAL +1.6%,
+  cost-normalized plans byte-identical (4 cost-only moves on
+  Limit-rooted Sorts/Aggs, all checksum-verified); PP
+  aggregation-strategy 13→14 (Q18 only, direction documented — P4 exit
+  criterion tracks the whole phase, grouping-sets residuals ledgered).
+  Negative fired as written: spill arm drove Q3/Q10/Q13/Q18 away from PG
+  (Q13 5.67 s→8.71 s) → arm DELETED, omission pinned by test, resume named.
+  Re-pinned in-commit: `plan_snapshots/c15-grouping-paths-20260907.txt`.
+  *design: take3 08 §7 + `docs/design/planner-p4-grouping-paths/DESIGN.md`;
+  gate: take3 09 §5 P4 (PP + timing).*
 - [ ] **C-16 P4-07 `create_distinct_paths`** (hashed / sorted /
   unique-over-sorted). Depends on landed P1-25.
   *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
