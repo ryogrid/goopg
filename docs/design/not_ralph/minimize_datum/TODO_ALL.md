@@ -858,6 +858,17 @@ rule).*
   three conditions (move the guard into the path producer and KEEP the
   executor gate; the pin is conditional on an unrun SF=1 memory measurement
   of Q22/Q67; teach the parity tool the labels first).
+  **Condition status 2026-09-07: 3rd DISCHARGED (see the parity-tool note
+  below); 1st discharged by C-15 as shipped; 2nd STILL OWED** — the SF=1
+  memory measurement of Q22/Q67 has still never run, and it is the only
+  thing between C-10a and done. Deliberately NOT run today: it is a
+  memory-exhaustion measurement, and three peer agents held ~6 GB of
+  benchmark servers with 12 GB already in swap, which would both distort
+  the answer and risk OOM-killing their arms. Resume: TPC-DS SF=1 (port
+  65436, `bench/tpcds/runtime_goopg/data`) once the host is quiet — run
+  Q22 and Q67 under the cgroup cap and record peak RSS and completion,
+  since the pin hashes every grouping set where PG's MixedAggregate/
+  GroupAggregate does not.
   **Two things that changed the author's mind, both verified:** retiring the
   three planner declines is NOT a wrong-answer risk — a SECOND gate in
   `aggregateOp.Open` re-tests `GroupingSets == nil`, so retiring them alone
@@ -871,6 +882,23 @@ rule).*
   is mis-filed as `join-order`, and the `aggregation-strategy` bucket the
   P4 exit criterion reads is empty of the only 8 queries guaranteed to be
   in it. ~5-line fix.
+  **DISCHARGED and VERIFIED END-TO-END 2026-09-07.** The fix landed as
+  `0194551f6` (`AGG_KINDS` gains `MixedAggregate`; `AGG_SUFFIX_RE` strips
+  goopg's `(N keys, M grouping sets)` suffix to a kind), i.e. before C-15
+  as required. Verified three ways rather than by reading the code:
+  (i) `pg-plan-parity-diff.py --self-test` 17/17; (ii) a synthetic pair in
+  the REAL divergence shape — goopg `HashAggregate (2 keys, 3 grouping
+  sets)` against PG `MixedAggregate` over the same subtree — now reports
+  `aggregation-strategy=1` and names both labels, where it previously
+  mis-filed as `join-order`; (iii) C-15's own run observed the bucket
+  populated and MOVING (`PP aggregation-strategy 13 -> 14`), which is the
+  production confirmation.
+  **Corpus facts re-confirmed from the git-tracked PG fixtures (no cluster
+  needed):** 12 files match ROLLUP/GROUPING SETS/CUBE, of which
+  `query_0.sql` is the junk concatenation -> **11 real**; Q36/Q70/Q86 have
+  no aggregate node in `bench/tpcds/plans-pg/` (the three dsqgen SKIPs) ->
+  **8 measurable**; and PG's pick is **3 MixedAggregate (Q5, Q77, Q80) + 5
+  GroupAggregate (Q14, Q18, Q22, Q27, Q67)**, exactly as claimed.
   **Corpus correction: 11 of 99, not 12 of 100** (the twelfth was the junk
   `query_0.sql` concatenation); measurable corpus is **8** after the three
   dsqgen SKIPs; TPC-H uses grouping sets in **zero** of 22; every corpus
