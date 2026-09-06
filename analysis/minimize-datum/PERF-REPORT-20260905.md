@@ -883,8 +883,54 @@ written the host-load trap into every agent prompt this session and then
 walked into it myself; the number reported to the agent was wrong and had
 to be corrected.
 
-C-04a is BLOCKED pending a fix of both mechanisms, with revert as the
-fallback. A wrong answer does not stay in the tree while a fix is designed.
+### 5.16.1 Both fixed — and Q78 took three wrong hypotheses to reach
+
+Q72 was the straightforward one: the admitted LEFT links lost their
+jointype through the collapse-limit sub-problem split, fixed by a
+per-problem SJI remap (`fb6550266`), pinned.
+
+Q78 was not. The agent that fixed Q72 had already diagnosed it correctly
+by trace — the search admits the outer `ss LEFT JOIN ws LEFT JOIN cs`
+problem with every path at `rows=1` and takes an epsilon Nested Loop
+victory (**3.07 vs Hash 3.09**) over three full CTE outputs — and had
+written the right instrument, a firewall that declines an outer join over
+statistics-less derived inputs to the syntactic fallback. The firewall was
+wired at the right point, its unit tests passed, and **it never fired.**
+
+I then went through three hypotheses, each plausible from the code, each
+refuted by a single trace line:
+
+| hypothesis | refuted by |
+|---|---|
+| the `d_year = 1998` qual was dropped from the scan | the committed fix had already restored it — the plan showed it on all three `date_dim` scans |
+| a `base != 0` coordinate decline on nested spine links | the seam trace showed the outer chain was **admitted**, not declined; the edit is reverted |
+| the firewall's `table == nil` leaf test | closer — `with.go` gives every CTE binding a synthesised non-nil table — but fixing it *still* changed nothing |
+
+The real root, read off an instrumented firewall: `scan=*optimizer.Filter
+table=true` for all three leaves, `derived=[false false false]`. A CTE
+output with a pushed-down predicate reaches the search as
+`*Filter{Child: *CTEScan}`, and a type switch on the top node sees only
+the Filter. The fix classifies by node type **and descends through
+wrappers**. Both halves are mutation-checked: remove the unwrap and only
+the wrapped-CTE pin fails; remove the node-type switch and only the
+CTE pins fail.
+
+Q78: 327 s timeout → **19 s, checksum-verified**, and its top-level plan is
+byte-identical to pre-C-04a from the outer join down.
+
+**And the timing had to be read three times before it was trustworthy.**
+A first TPC-H arm on the fixed tree read **+9.0%** — taken while the full
+TPC-DS sweep ran on the same host. A quiet re-run read **+5.4%** against
+a three-hour-old baseline. A same-session A/A control on the *unchanged*
+pre-C-04a binary then showed the baseline itself had drifted **+6.3%**
+over those three hours. Same-session A/B: **−0.8%**, every query within
+±1.5% except **Q13 −17.4%**, the intended improvement. C-04a is
+timing-neutral with one real win, and two of the three numbers I could
+have reported were wrong.
+
+Final gates: TPC-H 24/24 by values; TPC-DS SF0.5 `PASS=95 MISMATCH=0
+CKMISMATCH=0 TIMEOUT=0`, plan shapes 99/99, total delta +0.0%; plan-gate
+22/22 in both modes, re-pinned with the Q13 hunk as the only diff.
 
 ## 6. What was dropped, and what it cost to find out
 
