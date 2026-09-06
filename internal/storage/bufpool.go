@@ -210,9 +210,6 @@ type Pool struct {
 	// logger surfaces non-fatal FPI failures.
 	logger *slog.Logger
 
-	// prefetchEnabled gates Pool.Prefetch.
-	prefetchEnabled atomic.Bool
-
 	// asyncFlushBatchSize controls FlushAllPaced batching.
 	asyncFlushBatchSize atomic.Int32
 
@@ -1316,9 +1313,6 @@ func (p *Pool) SyncAllDataFiles() error {
 	return p.mgr.SyncAll()
 }
 
-// SetPrefetchEnabled toggles Pool.Prefetch's behaviour.
-func (p *Pool) SetPrefetchEnabled(on bool) { p.prefetchEnabled.Store(on) }
-
 // SetAsyncFlushBatchSize controls how many dirty slots FlushAllPaced batches.
 func (p *Pool) SetAsyncFlushBatchSize(n int) {
 	if n > MaxFlushBatchSize {
@@ -1342,18 +1336,23 @@ func (p *Pool) flushBatchSize() int {
 	return n
 }
 
-// Prefetch is a hint that the caller is about to Pin tag.
-func (p *Pool) Prefetch(tag BufferTag) {
-	if !p.prefetchEnabled.Load() {
-		return
-	}
-	// Fast check: already cached?
-	if slotIdx, _ := p.bm.Lookup(tag); slotIdx >= 0 {
-		return
-	}
-	buf := make([]byte, BlockSize)
-	_, _ = p.mgr.PrefetchBlock(tag.Rel, tag.Block, buf)
-}
+// NOTE: the Pool has no Prefetch hint. It had one until 2026-09-06 —
+// `Pool.Prefetch(tag)` allocated a fresh 8 KiB buffer, handed it to
+// Manager.PrefetchBlock and then DROPPED it, so the read could never serve
+// the following Pin and its only effect was warming the OS page cache. It
+// measured at 63.8% of allocation objects and 90.1% of allocation bytes on a
+// serial TPC-H Q6, and removing it was 11.2% faster on a COLD page cache as
+// well as 11.1% warm. Upstream reaches the same conclusion normatively:
+// postgres/src/include/storage/read_stream.h:30-36 ("Explicit advice is known
+// to perform worse than letting the kernel (at least Linux) detect sequential
+// access") and heapam.c:1220 passes READ_STREAM_SEQUENTIAL from exactly the
+// sequential heap scan that was this hint's only caller — and goopg's data
+// files are plain buffered (smgr.go:616, no O_DIRECT), so Linux readahead is
+// active. The smgr-level seam Manager.SetAIO/Manager.PrefetchBlock is KEPT:
+// it is the entry point for a real StartReadBuffers/WaitReadBuffers-shaped
+// prefetch, which is what a RANDOM-access caller (bitmap heap scan, or an
+// index scan on a low-correlation index) would need. See
+// docs/design/storage-prefetch-buffer/DESIGN.md.
 
 // InvalidateRel evicts every slot currently bound to rel.
 // TruncateRelationTail drops all blocks >= keep for rel: WAL-first (when the
