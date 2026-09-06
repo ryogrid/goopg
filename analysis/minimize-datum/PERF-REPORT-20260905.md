@@ -1523,6 +1523,88 @@ already in swap. Running it there would distort the answer and risk
 OOM-killing their arms. A late number beats a contaminated one; that
 lesson was learned twice the hard way earlier in this workstream.
 
+## 5.26. The last flag retirements fail their gate; C-10a's pin earns its evidence
+
+**C-20f and C-20g — both blocked, nothing deleted.** Both were "retire a
+flag" items whose gate is *byte-identical plans for the flip*, and both
+fail it, on a private clone with an A/A control that came back
+byte-identical (so every diff below is signal).
+
+`GOOPG_NLI_COSTGATE` moves exactly one query, and moves it hard:
+
+| Q4 arm | join | cost | runtime |
+|---|---|---:|---:|
+| default (cost gate) | Nested Loop Semi Join over the fk index | 8,672 | **1.60 s** |
+| `=legacy` | Hash Semi Join, Seq Scan on lineitem | 105,657 | **18.30 s** |
+
+11.4x — the same Q4 semi-join class the design records at 12.5x.
+`GOOPG_PGSHAPED_DP` is worse: **17 of 22 queries move**, 587 diff lines,
+and all 17 change top-level cost. The `=0` path is a whole second planner
+— no search, syntactic order, legacy rewrites — not dead weight.
+
+C-20f produced a genuine decision rather than a verdict, and the agent
+escalated it instead of taking it, which was right. Unlike C-06, **here
+the losing arm is the flag's own off path**, so retiring the hatch would
+change no plan production reaches. That makes deletion defensible — but
+as a deliberate *exception* to the gate, not a pass of it. I decided
+against: an exception granted once is a precedent the other retirement
+items inherit; deletion is irreversible against a branch that costs
+little to keep; and the hatch's value is escape from a misfiring cost
+gate *on data we have not seen*, which a measurement on this corpus
+cannot speak to. The 11.4x says the gate is right on **this** corpus —
+not the same claim.
+
+### 5.26.1 C-07: the widening works, and still moves nothing
+
+C-07's second half had been blocked on C-11/C-12. Both landed, so it was
+re-opened — and then **implemented and instrumented rather than
+re-argued**, which is what produced a real answer.
+
+The widening works at the producer: the useful set goes `[w]` -> `[w x]`
+and a real `index.ordered` path is added (pathlist 1 -> 2). And **no plan
+moves** — not on cost, not with `enable_seqscan = off`, byte-identical
+across five join shapes. The reason is the seam, confirmed three ways:
+`planJoinlistSearch` still returns a Node, C-12's only Node->Path bridge
+leaves `Pathkeys` nil, so `pathkeysContainedIn(nil, keys)` is false and
+the Sort arm is the only arm production can take. **C-11's `ORDERED` rel
+exists but has nothing ordered to receive.**
+
+A second, independent blocker turned up that nobody had filed:
+`addOrderedIndexPaths` runs only inside the PG-shaped join search, which
+declines at `nrels < 2` — so `SELECT ... FROM t ORDER BY t.pk`, the
+canonical shape the widening exists to serve, never reaches the producer
+at all.
+
+The agent also hit the exact trap this report has now recorded three
+times: the whole optimizer suite passed *with the widening applied*,
+because the shared fixture builds a `baseLeaf` with a nil schema, so a
+rel-membership filter reading `Output()` is invisible to it. The verdict
+came only from end-to-end probes.
+
+### 5.26.2 C-10a's pin stops being a promise
+
+C-10a's AGG_HASHED pin was explicitly conditional on an SF=1 memory
+measurement of Q22/Q67 that had never run. It has now run, under a
+cgroup cap with per-session ANALYZE:
+
+| query | grouping-sets node | hash memory | batches | result |
+|---|---|---:|---:|---|
+| Q22 | `HashAggregate (4 keys, 5 grouping sets)` | 24.3 MB | **1** | 24.95 s |
+| Q67 | `HashAggregate (8 keys, 9 grouping sets)` | 6.6 MB | **1** | 26.01 s |
+
+**`Batches: 1` on every hash table in both plans — nothing spilled.** The
+risk the condition guarded against was that hashing every grouping set
+would exhaust memory where PG's MixedAggregate/GroupAggregate would not;
+at SF=1, on the two queries the decision itself named, it does not come
+close. The pin stands on evidence now.
+
+The measurement was held for several hours and run late on purpose: four
+peer agents held benchmark servers with 12 GB already in swap, and **a
+memory measurement taken under memory contention answers a different
+question**. Earlier in this workstream two timing conclusions were
+contaminated exactly that way; waiting cost hours and bought a number
+that means what it says.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
