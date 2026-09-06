@@ -41,14 +41,22 @@ package executor
 // Three invariants hold on that path and each is pinned by a test: a
 // participant never writes or unlinks a shared inner file (innerShared), growth
 // is frozen (growEnabled=false, PG's "all changes to the number of batches
-// happen during the build phase"), and every participant opens each inner file
-// exactly once.
+// happen during the build phase"), and no participant opens a batch twice.
+//
+// E-09b (DESIGN-E09b.md) then removes the duplicated TABLE that Variant A
+// left behind: the descriptor carries one `sharedBatchLoad` slot per batch, so
+// the first participant to reach batch k loads it and the rest adopt the same
+// maps behind a ctx-aware wait, with a refcount that frees the maps when the
+// last holder leaves. That is PG's PHJ_BATCH_LOAD / PHJ_BATCH_FREE without the
+// barrier — goopg partitions the probe by scan block, so a participant never
+// waits for another to ARRIVE, only for a load already in flight to FINISH.
 
 import (
 	"fmt"
 	"io"
 	"log/slog"
 	"math/bits"
+	"sync"
 
 	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/optimizer"
@@ -172,6 +180,17 @@ type hashBatchState struct {
 	// closeKeepFile. Growth is frozen too, so the reload path can never need
 	// to re-route a row forward (every file was settled before publication).
 	innerShared bool
+
+	// desc is the shared descriptor this participant state was derived from
+	// (E-09b), and the owner of the per-batch load slots. nil on every
+	// private state, which is what selects the private reload path.
+	desc *sharedBatchDesc
+	// held is the shared batch table this participant is currently probing,
+	// and heldBatch the batch number it was acquired under. One reference is
+	// owned for as long as held is non-nil; releaseHeldBatch is the only
+	// thing that drops it, and it is idempotent.
+	held      *sharedBatchLoad
+	heldBatch int
 }
 
 // testHookInnerBatchOpened, when non-nil, is called by loadInnerBatch each
@@ -180,6 +199,20 @@ type hashBatchState struct {
 // before a Gather fans out and cleared after it joins, so the goroutine
 // start/join edges order every access.
 var testHookInnerBatchOpened func(bs *hashBatchState, b int, path string)
+
+// testHookSharedBatchLoading, when non-nil, is called by the participant that
+// claimed a shared batch load (E-09b), inside the load and before the file is
+// read. The cancellation test parks the loader here so it can prove that a
+// waiter really was blocked on `done` when the statement was cancelled. nil in
+// production, installed/cleared around a Gather exactly like the hook above.
+var testHookSharedBatchLoading func(b int)
+
+// testHookSharedBatchAcquire, when non-nil, is called by EVERY participant on
+// entry to loadSharedInnerBatch, before it claims or joins the batch's load.
+// The memory gate uses it as a rendezvous: holding all participants at the
+// same batch is what makes "exactly one live table" a deterministic assertion
+// rather than a timing observation. nil in production.
+var testHookSharedBatchAcquire func(b int)
 
 // HashJoinStats is the per-plan-node hash-join instrumentation EXPLAIN
 // (ANALYZE) reports, PG's HashInstrumentation (nodeHash.h) minus the fields
@@ -598,6 +631,11 @@ func (bs *hashBatchState) batchSkippable(o *joinOp, b int) bool {
 // nodeHashjoin.c:1130); the skip decision is factored into batchSkippable.
 func (bs *hashBatchState) nextBatch(o *joinOp) (bool, error) {
 	bs.closeReplay()
+	// E-09b: the outgoing batch's shared table is no longer needed by this
+	// participant. Dropping the hold HERE — before the next one is loaded —
+	// is what keeps peak memory at one batch per participant instead of two,
+	// and it covers the exhausted case below as well as the advance.
+	bs.releaseHeldBatch(o)
 	bs.curBatch++
 	for bs.curBatch < bs.nbatch && bs.batchSkippable(o, bs.curBatch) {
 		bs.discard(bs.curBatch)
@@ -633,6 +671,14 @@ func (bs *hashBatchState) nextBatch(o *joinOp) (bool, error) {
 // names: the same insert path runs, so a batch that still does not fit is
 // subdivided exactly as the build was.
 func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
+	if bs.innerShared {
+		// E-09b: one participant loads this batch and every other one adopts
+		// the same maps (DESIGN-E09b.md §4). The dispatch is on innerShared,
+		// not on desc, deliberately: the private arm below `defer r.Close()`s
+		// its reader, which UNLINKS the file, so a shared state that somehow
+		// reached it would delete a file its peers are still reading.
+		return bs.loadSharedInnerBatch(o)
+	}
 	o.resetHashTable()
 	bs.spaceUsed = 0
 	if bs.inner[bs.curBatch] == nil {
@@ -642,13 +688,7 @@ func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
 	if err != nil {
 		return err
 	}
-	if bs.innerShared {
-		// The file is the leader's and other participants are reading it:
-		// close the descriptor, never the path.
-		defer r.closeKeepFile()
-	} else {
-		defer r.Close()
-	}
+	defer r.Close()
 	if testHookInnerBatchOpened != nil {
 		testHookInnerBatchOpened(bs, bs.curBatch, r.path)
 	}
@@ -663,16 +703,6 @@ func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
 		}
 		buf = row
 		if b := bs.batchOf(h); b != bs.curBatch {
-			if bs.innerShared {
-				// freezeForSharing settled every file before publication,
-				// so a foreign row here is a broken invariant — report it
-				// rather than skip it (a skipped row is a lost match).
-				return &ExecError{
-					Code: "XX000",
-					Message: fmt.Sprintf("shared hash join batch file %d holds a row of batch %d",
-						bs.curBatch, b),
-				}
-			}
 			// Re-spilled straight from the read buffer: the encode completes
 			// before the next ReadRowHashedInto can overwrite it.
 			if err := bs.writeInner(b, h, row); err != nil {
@@ -773,6 +803,12 @@ func (bs *hashBatchState) close() {
 	// it renders a single line (operators_explain.go).
 	bs.publish()
 	bs.closeReplay()
+	// E-09b: drop this participant's hold on whatever batch table it was
+	// still probing — an error or an early Close reaches here with one held.
+	// The operator is not available at this call site; releaseBatches clears
+	// its pointer first, and by the time close() runs on any other path the
+	// operator is finished with the table anyway.
+	bs.releaseHeldBatch(nil)
 	for b := range bs.inner {
 		bs.discard(b)
 	}
@@ -798,6 +834,356 @@ type sharedBatchDesc struct {
 	// non-nil entry has w == nil and a path readable by any number of
 	// spillReaders at once.
 	inner []*joinBatchFile
+
+	// ── E-09b: the per-batch load slots ──────────────────────────────
+	//
+	// mu guards everything below. It is held only for pointer/counter work,
+	// never across a file read and never across a wait, so it cannot be part
+	// of a cycle.
+	mu sync.Mutex
+	// loads[k] is the live load of batch k, or nil when no participant is
+	// holding it. Cleared when the last holder leaves, so a straggler that
+	// reaches batch k afterwards re-loads it from the (still linked) file.
+	loads []*sharedBatchLoad
+	// waiting is the number of participants currently parked on a load. It
+	// exists so the cancellation test can prove a waiter really was blocked.
+	waiting int
+
+	// Instrumentation — the memory evidence for this item, since the claim
+	// is about an object count (DESIGN-E09b.md §6). Under Variant A the
+	// equivalent figures were loadCount = participants x batches and
+	// maxLiveLoads = participants.
+	loadCount    int   // loads actually run
+	liveLoads    int   // batch tables resident right now
+	maxLiveLoads int   // high-water mark of the above
+	liveBytes    int64 // spaceUsed summed over the resident tables
+	maxLiveBytes int64 // high-water mark of the above
+}
+
+// sharedBatchLoad is one batch's table, loaded once and read by every
+// participant that is probing that batch (E-09b). Its whole life is
+// write-once-then-read-only: the participant that claimed the slot fills the
+// maps, publishes them by closing `done`, and nobody writes anything
+// afterwards — the same rule that makes the batch-0 maps shareable
+// (parallel_hash_build.go's header), applied to a reloaded batch.
+type sharedBatchLoad struct {
+	// done is closed exactly once, by the claiming participant, after err and
+	// the payload are final. Closing it is the happens-before edge that
+	// publishes the maps to every waiter.
+	done chan struct{}
+	err  error
+
+	hash      map[string][]Row
+	intHash   map[int64][]Row
+	hashIsInt bool
+	// nullBuild carries the reloaded build rows whose key was NULL. They are
+	// per-OPERATOR state (fillNullBuild), so the loader must not keep them to
+	// itself: every participant appends its own copy on adopt. Always empty
+	// under today's shareable join set — `recordBuildNullKey` no-ops when
+	// !fillBuildSide() and no shareable join fills the build side — and
+	// carried anyway so widening that set cannot silently lose rows.
+	nullBuild []Row
+	spaceUsed int64
+
+	// refs is the number of participants holding this load. Guarded by the
+	// descriptor's mu, never by the load itself.
+	refs int
+}
+
+// errSharedBatchAbandoned is what a loader publishes when it left without
+// completing — today only by panicking, since the load itself has no early
+// return that skips the payload. It exists so `done` can be closed
+// unconditionally by a defer: a waiter must never be parked on a channel
+// nobody will close, and a waiter must never be handed an EMPTY table as if
+// it were a loaded one. That second half is exactly the failure mode plain
+// `sync.Once` has here — Once.Do marks the slot done when its function
+// RETURNS, success or not — and is why this is a channel and not a Once.
+var errSharedBatchAbandoned = &ExecError{
+	Code:    "XX000",
+	Message: "shared hash join batch load was abandoned by its loader",
+}
+
+// acquireLoad claims batch b's load slot, or joins the load already in it.
+// Returns mine=true to the participant that must run the load. Either way the
+// caller owns ONE reference on return and must releaseLoad it on every exit
+// path — including a cancelled wait, which is why the reference is taken here,
+// under the mutex, rather than after the wait succeeds.
+func (d *sharedBatchDesc) acquireLoad(b int) (*sharedBatchLoad, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.loads == nil {
+		d.loads = make([]*sharedBatchLoad, d.nbatch)
+	}
+	if ld := d.loads[b]; ld != nil {
+		ld.refs++
+		return ld, false
+	}
+	ld := &sharedBatchLoad{done: make(chan struct{}), refs: 1}
+	d.loads[b] = ld
+	d.loadCount++
+	d.liveLoads++
+	if d.liveLoads > d.maxLiveLoads {
+		d.maxLiveLoads = d.liveLoads
+	}
+	return ld, true
+}
+
+// publishLoad closes a load's `done`, making the payload visible to every
+// waiter. Called from a defer in the loader so it runs on every exit, panic
+// included (DESIGN-E09b.md §5 rule 2).
+func (d *sharedBatchDesc) publishLoad(ld *sharedBatchLoad) {
+	d.mu.Lock()
+	if ld.err == nil {
+		d.liveBytes += ld.spaceUsed
+		if d.liveBytes > d.maxLiveBytes {
+			d.maxLiveBytes = d.liveBytes
+		}
+	}
+	d.mu.Unlock()
+	close(ld.done)
+}
+
+// releaseLoad drops one reference. The last one out frees the maps and clears
+// the slot, so the memory goes immediately rather than at statement end and a
+// later arrival re-loads from the file.
+//
+// Reading ld.err here is safe without the channel: refs can only reach zero
+// after the LOADER has released, and the loader releases only after
+// publishLoad, which takes this same mutex.
+func (d *sharedBatchDesc) releaseLoad(b int, ld *sharedBatchLoad) {
+	if d == nil || ld == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ld.refs--
+	if ld.refs > 0 {
+		return
+	}
+	if b >= 0 && b < len(d.loads) && d.loads[b] == ld {
+		d.loads[b] = nil
+	}
+	if ld.err == nil {
+		d.liveBytes -= ld.spaceUsed
+	}
+	d.liveLoads--
+	ld.hash, ld.intHash, ld.nullBuild = nil, nil, nil
+}
+
+// waitSharedLoad parks until the in-flight load finishes, or until this
+// participant's statement is cancelled.
+//
+// It cannot deadlock: the only thing it waits on is `done`, and the loader
+// that closes `done` waits on nothing at all — its work is a bounded local
+// file read with no channel operation and no cancellation check (rule 1), so
+// its completion depends on the filesystem and never on another participant.
+// The ctx arm is the LIMIT-above-Gather case: gatherOp.Close cancels the group
+// before draining, so a worker parked here leaves at once instead of paying
+// for a batch it will never probe.
+func (bs *hashBatchState) waitSharedLoad(d *sharedBatchDesc, ld *sharedBatchLoad) error {
+	select {
+	case <-ld.done:
+		return nil
+	default:
+	}
+	var cancel <-chan struct{}
+	var cancelled func() error
+	if bs.ctx != nil && bs.ctx.Ctx != nil {
+		cancel = bs.ctx.Ctx.Done()
+		cancelled = bs.ctx.Ctx.Err
+	}
+	d.mu.Lock()
+	d.waiting++
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		d.waiting--
+		d.mu.Unlock()
+	}()
+	select {
+	case <-ld.done:
+		return nil
+	case <-cancel:
+		// A nil `cancel` channel blocks forever, which is the right shape for
+		// a participant with no cancellation source: the done arm still fires.
+		if cancelled != nil {
+			if ee := lockWaitCancelError(cancelled()); ee != nil {
+				return ee
+			}
+		}
+		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	}
+}
+
+// loadSharedInnerBatch is the participant arm of loadInnerBatch: acquire the
+// batch's shared table (loading it if this participant got there first) and
+// point the operator at it.
+func (bs *hashBatchState) loadSharedInnerBatch(o *joinOp) error {
+	b := bs.curBatch
+	if testHookSharedBatchAcquire != nil {
+		testHookSharedBatchAcquire(b)
+	}
+	d := bs.desc
+	if d == nil {
+		return &ExecError{
+			Code:    "XX000",
+			Message: "shared hash join participant has no batch descriptor",
+		}
+	}
+	f := bs.inner[b]
+	// The slot is this participant's PRIVATE copy of the descriptor's slice
+	// (newParticipantBatchState), so clearing it records "this participant
+	// has consumed batch b" — exactly what openReader does on the private
+	// path — without touching the descriptor or any peer.
+	bs.inner[b] = nil
+	if f == nil {
+		o.resetHashTable()
+		bs.spaceUsed = 0
+		return nil
+	}
+	ld, mine := d.acquireLoad(b)
+	if mine {
+		bs.runSharedLoad(o, ld, b, f)
+	} else if err := bs.waitSharedLoad(d, ld); err != nil {
+		d.releaseLoad(b, ld)
+		return err
+	}
+	if ld.err != nil {
+		d.releaseLoad(b, ld)
+		return ld.err
+	}
+	bs.held, bs.heldBatch = ld, b
+	o.adoptSharedBatch(ld)
+	// The loader measured this batch; every participant reports the same
+	// peak, which keeps EXPLAIN's Memory Usage identical to Variant A's.
+	bs.spaceUsed = ld.spaceUsed
+	if bs.spaceUsed > bs.peakSpace {
+		bs.peakSpace = bs.spaceUsed
+	}
+	return nil
+}
+
+// runSharedLoad reads batch b's frozen inner file into a fresh table and
+// publishes it. Only ever called by the participant that claimed the slot.
+//
+// It deliberately has no `ctx` check and no early return that skips the
+// payload: whoever claims a batch commits to finishing it. That is not a new
+// liberty — Variant A's private reload is uninterruptible in exactly the same
+// way — and it is what makes every waiter's wait terminate.
+//
+// Growth cannot fire here (growEnabled is false on a participant state), and
+// freezeForSharing settled every file before publication, so a row of another
+// batch is a broken invariant and is reported rather than skipped: a skipped
+// row is a lost match.
+func (bs *hashBatchState) runSharedLoad(o *joinOp, ld *sharedBatchLoad, b int, f *joinBatchFile) {
+	// Pessimistic until proven otherwise: if this function leaves by panic,
+	// the defer still publishes, and what it publishes is a failure rather
+	// than an empty table.
+	ld.err = errSharedBatchAbandoned
+	defer bs.desc.publishLoad(ld)
+
+	o.resetHashTable()
+	r, err := newSpillReader(f.path)
+	if err != nil {
+		ld.err = err
+		return
+	}
+	// The file is the leader's and the descriptor owns it: close the
+	// descriptor, never the path.
+	defer r.closeKeepFile()
+	if testHookInnerBatchOpened != nil {
+		testHookInnerBatchOpened(bs, b, r.path)
+	}
+	if testHookSharedBatchLoading != nil {
+		testHookSharedBatchLoading(b)
+	}
+	var used int64
+	var nulls []Row
+	var buf Row
+	for {
+		h, row, rerr := r.ReadRowHashedInto(buf)
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			ld.err = rerr
+			return
+		}
+		buf = row
+		if got := bs.batchOf(h); got != b {
+			ld.err = &ExecError{
+				Code: "XX000",
+				Message: fmt.Sprintf("shared hash join batch file %d holds a row of batch %d",
+					b, got),
+			}
+			return
+		}
+		owned := cloneRow(row)
+		kd, ok, kerr := o.buildKeyOfRow(owned)
+		if kerr != nil {
+			ld.err = kerr
+			return
+		}
+		if !ok {
+			// A NULL key matches nothing; it was only spilled because the
+			// build loop files rows before it knows that. It is carried in
+			// the payload rather than recorded on the loader's operator, so
+			// every participant gets it (see sharedBatchLoad.nullBuild).
+			if o.fillBuildSide() {
+				nulls = append(nulls, owned)
+			}
+			continue
+		}
+		o.lazyHashInsertDatum(kd, owned)
+		used += estimatedRowBytes(owned) + hashsize.RowSliceBytes
+	}
+	ld.hash, ld.intHash, ld.hashIsInt = o.lazyHash, o.lazyIntHash, o.lazyHashIsInt
+	ld.nullBuild = nulls
+	ld.spaceUsed = used
+	ld.err = nil
+}
+
+// releaseHeldBatch drops this participant's hold on the batch table it is
+// probing. Idempotent, and safe with a nil operator (the close path).
+//
+// The operator's pointer is cleared BEFORE the reference is dropped, and the
+// order is load-bearing: the refcount reaching zero is what frees the maps,
+// and it must not be able to free a table the operator still points at — that
+// would leave two batches resident per participant, which is the very cost
+// this item exists to remove.
+func (bs *hashBatchState) releaseHeldBatch(o *joinOp) {
+	if bs == nil || bs.held == nil {
+		return
+	}
+	if o != nil {
+		o.lazyHash = nil
+		o.lazyIntHash = nil
+		o.lazyMatchedS = nil
+		o.lazyMatchedI = nil
+		o.lazyMatchedCur = nil
+	}
+	bs.desc.releaseLoad(bs.heldBatch, bs.held)
+	bs.held = nil
+}
+
+// adoptSharedBatch points the operator at a loaded batch table.
+//
+// Read-only adoption, exactly like applySharedBuild's adoption of the batch-0
+// maps: nothing here writes into the shared maps, and everything that IS
+// mutated during a probe (the matched bitmaps, the NULL-key fill list) stays
+// per-operator.
+func (o *joinOp) adoptSharedBatch(ld *sharedBatchLoad) {
+	// The bitmaps are parallel to the OUTGOING batch's table and go with it
+	// (resetHashTable's rule, which the loader path gets for free).
+	o.lazyMatchedS = nil
+	o.lazyMatchedI = nil
+	o.lazyMatchedCur = nil
+	o.lazyHash = ld.hash
+	o.lazyIntHash = ld.intHash
+	o.lazyHashIsInt = ld.hashIsInt
+	if len(ld.nullBuild) > 0 && o.fillBuildSide() {
+		o.fillNullBuild = append(o.fillNullBuild, ld.nullBuild...)
+	}
 }
 
 // freezeForSharing turns the leader's just-completed build state into a
@@ -847,6 +1233,9 @@ func (bs *hashBatchState) freezeForSharing() (*sharedBatchDesc, error) {
 		spaceAllowed: bs.spaceAllowed,
 		buildIsLeft:  bs.buildIsLeft,
 		inner:        bs.inner,
+		// E-09b: one load slot per batch, all empty. Batch 0 never has one
+		// (it is the in-memory table the descriptor rides beside).
+		loads: make([]*sharedBatchLoad, bs.nbatch),
 	}
 	// The descriptor owns the files from here: this state must not unlink
 	// them if it is ever closed.
@@ -935,6 +1324,20 @@ func (d *sharedBatchDesc) release(ctx *Context) {
 			ctx.removeSpillFile(f.path)
 		}
 	}
+	// E-09b: the loaded batch tables go with the publication. Every
+	// participant has joined by now, so refs is already zero and every slot
+	// is already nil; clearing is the backstop for a participant that was
+	// torn down without reaching its Close. The COUNTERS are deliberately
+	// left intact — they are what the memory gate reads, after release.
+	d.mu.Lock()
+	for i, ld := range d.loads {
+		if ld != nil {
+			ld.hash, ld.intHash, ld.nullBuild = nil, nil, nil
+			d.loads[i] = nil
+		}
+	}
+	d.liveLoads, d.liveBytes = 0, 0
+	d.mu.Unlock()
 }
 
 // newParticipantBatchState derives one participant's private batch state
@@ -959,6 +1362,9 @@ func newParticipantBatchState(ctx *Context, plan *optimizer.Join, d *sharedBatch
 		nbuckets:       d.nbuckets,
 		stats:          ctx.hashJoinStat(plan),
 		innerShared:    true,
+		// E-09b: the load slots live on the descriptor, so the participant
+		// needs a pointer to it, not just a copy of its geometry.
+		desc: d,
 	}
 	bs.inner = append([]*joinBatchFile(nil), d.inner...)
 	bs.outer = make([]*joinBatchFile, d.nbatch)

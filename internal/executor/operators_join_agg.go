@@ -701,6 +701,10 @@ func (o *joinOp) recordBuildTime(ctx *Context, start time.Time) {
 // where the operator is never Closed at all) is P3.3.
 func (o *joinOp) releaseBatches() {
 	if o.batches != nil {
+		// E-09b: clear this operator's pointer to the shared batch table
+		// before the reference is dropped, so the freeing refcount cannot
+		// leave the operator aliasing a table it no longer holds.
+		o.batches.releaseHeldBatch(o)
 		o.batches.close()
 		o.batches = nil
 	}
@@ -1623,7 +1627,10 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				}
 				// Release the files as soon as the last batch drains, but
 				// keep the state itself: Close() is what retires it, and the
-				// counters are what EXPLAIN reads (P3.5).
+				// counters are what EXPLAIN reads (P3.5). E-09b: nextBatch
+				// already dropped the hold on the last batch's shared table
+				// when it found nothing left, so nothing is still resident
+				// here — the NULL-key sweep below reads fillNullBuild only.
 				o.batches.close()
 			}
 			// The NULL-keyed build rows belong to no batch, so they are swept

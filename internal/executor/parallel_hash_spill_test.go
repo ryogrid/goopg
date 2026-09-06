@@ -16,7 +16,20 @@ package executor
 //   - a participant never writes or unlinks a shared inner file: the files
 //     are made read-only on disk (a poison writer) and writeInner refuses;
 //   - growth is frozen on the reload path;
-//   - every participant opens each inner file it needs exactly once.
+//   - no participant opens an inner file twice.
+//
+// E-09b restated the third invariant rather than deleting it. Under Variant A
+// it read "every participant opens each inner file it needs exactly once",
+// because every participant reloaded every batch privately — which is the
+// 5x memory multiplier E-09b exists to remove. It now reads: every open is a
+// CLAIMED LOAD (opens == descriptor loadCount), no participant opens a batch
+// twice, and no batch is loaded more times than there are participants (the
+// straggler re-load of DESIGN-E09b.md §4 is bounded by Variant A's own count).
+// The load-once accounting and the memory figures it produces have their own
+// tests below: the protocol tests drive acquire/wait/release directly, and
+// TestSharedSpillingBuildLoadsOncePerBatch holds every participant at the same
+// batch so "one live table where there were four" is an assertion, not an
+// observation.
 //
 // Two harnesses. The operator-level one (spillParticipants) builds the shape
 // by hand — the planner is not consulted, per the repo rule that an unwinnable
@@ -104,14 +117,20 @@ func (p *poisonBuildOp) Schema() optimizer.Schema { return p.schema }
 // innerOpenCounter records loadInnerBatch's opens per (participant, batch)
 // through testHookInnerBatchOpened.
 type innerOpenCounter struct {
-	mu     sync.Mutex
-	opens  map[*hashBatchState]map[int]int
-	paths  map[string]bool
-	onOpen func(b int)
+	mu sync.Mutex
+	// opens is per (participant, batch); perBatch aggregates it over
+	// participants, which is the figure E-09b's load-once rule bounds.
+	opens    map[*hashBatchState]map[int]int
+	perBatch map[int]int
+	total    int
+	paths    map[string]bool
+	onOpen   func(b int)
 }
 
 func (c *innerOpenCounter) install() {
 	c.opens = make(map[*hashBatchState]map[int]int)
+	c.perBatch = make(map[int]int)
+	c.total = 0
 	c.paths = make(map[string]bool)
 	testHookInnerBatchOpened = func(bs *hashBatchState, b int, path string) {
 		c.mu.Lock()
@@ -119,6 +138,8 @@ func (c *innerOpenCounter) install() {
 			c.opens[bs] = make(map[int]int)
 		}
 		c.opens[bs][b]++
+		c.perBatch[b]++
+		c.total++
 		c.paths[path] = true
 		fn := c.onOpen
 		c.mu.Unlock()
@@ -130,16 +151,28 @@ func (c *innerOpenCounter) install() {
 
 func (c *innerOpenCounter) uninstall() { testHookInnerBatchOpened = nil }
 
-// assertExactlyOnce checks that no (participant, batch) was opened twice, that
-// at least minParticipants distinct participants reloaded something, and —
-// when strict — that every participant opened every inner file the
-// descriptor carries.
-func (c *innerOpenCounter) assertExactlyOnce(t *testing.T, d *sharedBatchDesc, minParticipants int, strict bool) {
+// assertLoadInvariants is E-09a's per-participant invariant set plus E-09b's
+// load-once accounting.
+//
+// E-09a, unchanged: every opener is a shared, growth-frozen participant state;
+// no (participant, batch) pair is opened twice; nothing is opened that the
+// descriptor does not carry.
+//
+// E-09b: every open is a CLAIMED LOAD, so the total number of opens equals the
+// descriptor's loadCount — an open that was not a claimed load would be a
+// private reload sneaking back in. And no batch is loaded more often than
+// there are participants, which is the bound on the straggler re-load of
+// DESIGN-E09b.md §4: the worst case is exactly Variant A's load count.
+//
+// It deliberately does NOT assert a lower bound tighter than "something was
+// loaded": which participant wins a batch is a race by design.
+// TestSharedSpillingBuildLoadsOncePerBatch is where the exact figures live.
+func (c *innerOpenCounter) assertLoadInvariants(t *testing.T, d *sharedBatchDesc, participants int) {
 	t.Helper()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.opens) < minParticipants {
-		t.Fatalf("%d participant(s) reloaded a batch, want at least %d", len(c.opens), minParticipants)
+	if c.total == 0 {
+		t.Fatalf("no batch was ever loaded, so the gate asserted nothing")
 	}
 	for bs, m := range c.opens {
 		if !bs.innerShared {
@@ -156,17 +189,31 @@ func (c *innerOpenCounter) assertExactlyOnce(t *testing.T, d *sharedBatchDesc, m
 				t.Fatalf("participant opened batch %d, which the descriptor does not carry", b)
 			}
 		}
-		if strict {
-			for b, f := range d.inner {
-				if f == nil {
-					continue
-				}
-				if m[b] != 1 {
-					t.Fatalf("participant opened inner batch %d %d times, want exactly 1", b, m[b])
-				}
-			}
+	}
+	d.mu.Lock()
+	loadCount, maxLive, maxBytes := d.loadCount, d.maxLiveLoads, d.maxLiveBytes
+	live := d.liveLoads
+	d.mu.Unlock()
+	if loadCount != c.total {
+		t.Fatalf("descriptor counted %d loads but %d inner files were opened — "+
+			"an open that was not a claimed load is a private reload", loadCount, c.total)
+	}
+	for b, n := range c.perBatch {
+		if n > participants {
+			t.Fatalf("batch %d was loaded %d times with %d participants", b, n, participants)
 		}
 	}
+	if maxLive > participants {
+		t.Fatalf("%d batch tables were resident at once with %d participants", maxLive, participants)
+	}
+	if live != 0 {
+		t.Fatalf("%d batch table(s) still resident after every participant finished", live)
+	}
+	// The measured artifact: Variant A's figures on the same shape would be
+	// loadCount = participants * batches and maxLiveLoads = participants.
+	t.Logf("E-09b: %d distinct batches, loadCount=%d (Variant A would be %d), "+
+		"maxLiveLoads=%d (Variant A would be %d), maxLiveBytes=%d",
+		len(c.perBatch), loadCount, len(c.perBatch)*participants, maxLive, participants, maxBytes)
 }
 
 // spillParticipants prebuilds one shared build for plan, poisons its files
@@ -343,7 +390,7 @@ func TestSharedSpillingBuildParticipantsMatchSerial(t *testing.T) {
 					// before any batch is reloaded: nothing to count.
 					return
 				}
-				counter.assertExactlyOnce(t, d, 4, true)
+				counter.assertLoadInvariants(t, d, 4)
 			})
 		}
 	}
@@ -628,7 +675,7 @@ func TestParallelHashJoinSpillingSharedBuildIdentity(t *testing.T) {
 				// NOT IN over a NULL-containing build short-circuits before
 				// any batch is reloaded, so the counter has nothing there.
 				if len(want) > 0 {
-					counter.assertExactlyOnce(t, d, 2, false)
+					counter.assertLoadInvariants(t, d, workers+1)
 				}
 				// The descriptor's files must be gone after Close.
 				for _, f := range d.inner {
