@@ -793,6 +793,48 @@ That is twice in one day — once where the code never ran (every TPC-H plan
 being parallel made a prefetch sweep a five-way A/A), and once where the
 memory was 16× off.
 
+### 5.15.1 And the same audit on TPC-H found the asymmetry pointing the other way
+
+Asked the obvious follow-up — what is the PG side set to — the answer was
+`shared_buffers = 512MB` against a 2.1 GiB dataset, while goopg ran
+`2048MB` against 1.9 GiB. So on TPC-H **goopg had 4× the buffer memory**,
+the mirror image of the TPC-DS defect and in goopg's favour.
+
+Both are now aligned, and the alignment was verified live rather than by
+reading the config files — both engines report `shared_buffers = 262144`
+8 kB slots:
+
+| knob | goopg 65433 | PG 65432 | before |
+|---|---|---|---|
+| `shared_buffers` | 2048MB | **2048MB** | PG was 512MB |
+| `autovacuum` | **on** | on | goopg was off |
+| `work_mem` | 64MB | 64MB | already matched |
+| `effective_cache_size` | 2GB | 2GB | already matched |
+
+`effective_cache_size` matching already mattered more than the rest, since
+that is the knob PG's index-cost model reads — **plan-parity and cost
+comparisons were on fair footing all along**; the asymmetry was purely in
+execution.
+
+**The autovacuum alignment costs something real, and it is recorded rather
+than glossed.** `autovacuum = off` was one of the three fixes in §2 that
+took A/A plan-capture noise from 455 estimate lines and 27 shape lines to
+zero — the thing that made `make plan-gate MODE=costs` reachable. Turning
+it on re-exposes that drift, and the two needs are kept separate instead:
+a goopg-vs-PG *timing* arm runs autovacuum on so both engines share one
+maintenance policy; a goopg-internal *plan-pin* arm pins statistics with
+`GOOPG_ANALYZE_SEED` plus an explicit in-session `ANALYZE <table>`. One
+thing improves — autovacuum sets visibility-map bits again, so index-only
+paths stop being priced pessimistically.
+
+**What none of this invalidates:** every timing figure in this report is
+goopg-vs-goopg on one cluster, so the buffer asymmetry never entered any
+of them. The only cross-engine numbers published here are plan parity
+(structural) and row estimates (`Q22 → 72,001 against PG's 71,857`),
+neither of which depends on buffer residency. What the setup permitted was
+a goopg-vs-PG wall-clock comparison that would have been silently unfair —
+and now does not.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
