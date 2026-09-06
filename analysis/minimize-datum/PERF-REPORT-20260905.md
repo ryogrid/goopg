@@ -1023,6 +1023,62 @@ spreads and are not counted either way; and the upper-rel-resident half of
 `create_partial_grouping_paths` is genuinely unfinished, so the item is
 `[~]`, not `[x]`.
 
+## 5.19. C-18 and C-17: two items that correctly show nothing
+
+Both landed, both are worth keeping, and **neither moved a plan on either
+corpus**. Recording them properly matters more than usual, because the
+easy mistake here is to read "no movement" as "no value" — or to go
+hunting for a number until one appears.
+
+**C-18** files WINDOW and SETOP upper rels, pricing two node types that
+were previously free. It cannot move a plan by construction: a window
+spec-group chain becomes ONE stacked candidate `add_path`ed once, which is
+`create_one_window_path`'s own shape (planner.c:4620), and set-ops have a
+single candidate.
+
+**C-17** threads `tuple_fraction` to every upper rel. Its census found
+four real gaps — `ctx.tupleFraction` stamped in two per-arm places, so a
+WHERE-less `… ORDER BY a LIMIT 10` told every upper rel that all rows were
+wanted; two producers passing a literal `0`; and a set-op statement's
+trailing ORDER BY reaching the executor as a bare `&Sort{}` with **no
+ORDERED rel at all** — the last top-level sort still priced at zero after
+C-12, and the one shape that could never reach C-13b's bounded arm.
+
+And it shows nothing on either suite, for a reason worth stating: **TPC-H
+has zero set operations, zero window functions, and a WHERE on every
+query**; TPC-DS's UNIONs all sit inside subqueries whose ORDER BY belongs
+to the outer SELECT. The raw SF0.5 plan capture — costs included, not
+shape-normalised — is byte-identical between the two binaries, 0 diff
+lines.
+
+So the witness is a direct probe rather than a suite number
+(`lineitem UNION ALL orders ORDER BY 1`, 2,000,672 rows):
+
+| Sort startup cost | base | C-17 |
+|---|---:|---:|
+| `… ORDER BY 1 LIMIT 10` | 344,423.57 | **178,266.51** |
+| `… ORDER BY 1` | 344,423.57 | **433,323.57** |
+
+Both directions are the correction: the first is C-13b's bounded heap arm
+firing on this shape for the first time, the second is the external-merge
+charge for a spill the bare `&Sort{}` never paid.
+
+**Neither is credited with a performance number.** C-18 measured −0.2% and
+C-17 +1.5%, both on byte-identical plans, i.e. noise — and in the C-18
+pair Q9 read +70.9% on an identical plan while the *same* query read 4.16 s
+and 7.16 s across two arms of the same binary. That spread is the reason
+this report keeps refusing single-arm numbers.
+
+Two by-products worth keeping. A real defect surfaced while implementing:
+`fetch_upper_rel(SETOP, 0)` shares one rel across a chain, so
+`A INTERSECT B EXCEPT C` had the outer node answer with the inner node's
+candidate — wrong rows, caught by the executor's set-op precedence suite.
+PG keys that rel by relids (prepunion.c:805). And the design's proposed
+`costSortRun(cp, rows, nkeycols, …)` put the **key count** where the **row
+width** belongs, which would have modelled a 2-column row and suppressed
+the disk charge entirely; the agent declined that line and pinned the
+distinction instead.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
