@@ -827,15 +827,52 @@ rule).*
   values-diff both suites (it moves ~46 corpus queries at once).
   measurement doc-only; the port would be ~400–700 LOC, high risk.*
 - [ ] **C-11 P4-02 upper `RelOptInfo`s** (`GROUP_AGG`, `WINDOW`,
-  `DISTINCT`, `ORDERED`, `FINAL`) with pathlists.
-  *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
+  `DISTINCT`, `ORDERED`, `FINAL`) with pathlists. DESIGNED 2026-09-06:
+  `docs/design/planner-p4-upper-rels/DESIGN.md` §1/§3 — lands INERT
+  (registry + `fetchUpperRel`, no producer, no consumer); three decisions
+  settled there (registry is per planning SCOPE not per `searchCtx`;
+  `Relids = 0` so DPPATH renders `relids=-` with no format change; upper
+  rels stay OUT of `relMap`/`joinrels`). Load-bearing extra duty found:
+  `fetchUpperRel` must populate `Rows`/`Width`/`NCols`/`AvgVarBytes`, since
+  a zero `NCols` silently suppresses `costSortRun`'s external-merge arm
+  (DESIGN §4.3); `AvgVarBytes` needs Probe P1 (§9).
+  *design: take3 08 §7 + `docs/design/planner-p4-upper-rels/DESIGN.md`;
+  gate: take3 09 §5 P4 (PP `changed=0`).*
 - [ ] **C-12 P4-03 real upper-rel `PathSort`** (has a `createPlanNode` arm;
   today only ever a merge-join child, never competing with a hashed
-  alternative).
-  *design: take3 08 §7; gate: take3 09 §5 P4 (PP).*
+  alternative). DESIGNED 2026-09-06:
+  `docs/design/planner-p4-upper-rels/DESIGN.md` §4/§5. The blocker is NOT
+  the arm's key translation — an upper rel has no `baseLeaf`, so
+  `baseRelLayout` returns nil and `createSortPlan` emits keys as written,
+  which is correct for post-aggregate ORDER BY keys. The real blockers are
+  (i) no rel to `addPath` to, (ii) `sortPathFor` deliberately never offers
+  its `PathSort` to `addPath`, (iii) **`costSortRun` has exactly ONE
+  production caller**, so every top-level Sort is priced at zero by
+  `DeriveLegacyDisplayCost` — C-12 is therefore cost-MOVING, not
+  cost-neutral, and needs an in-commit `plan-gate` re-pin. Shown
+  parallel-neutral: `MaybeAddGather`'s three predicates read structure and
+  sizes, never `PlanCost` (re-verify before landing; C-19d is editing
+  `parallel.go`).
+  *design: take3 08 §7 + `docs/design/planner-p4-upper-rels/DESIGN.md`;
+  gate: take3 09 §5 P4 (PP shape `changed=0` + T on every moved cost).*
 - [ ] **C-13 P4-04 bounded / top-N sort** (`cost_sort`'s `limit_tuples`
-  arm) — the largest recorded `ORDER BY … LIMIT` win.
-  *design: take3 08 §7; gate: take3 09 §5 P4 (PP + timing).*
+  arm) — the largest recorded `ORDER BY … LIMIT` win. DESIGNED 2026-09-06:
+  `docs/design/planner-p4-upper-rels/DESIGN.md` §6 — **RE-SCOPE into two
+  cuts**: C-13a the executor bound (`sortOp` has none; `parallel.go:294`
+  says so) which carries the whole runtime claim and depends on NEITHER
+  C-11 nor C-12, and C-13b `cost_tuplesort`'s middle branch, which needs
+  C-12. Planner plumbing is one line: `preprocessLimit` already returns
+  `limitEstimates{count,offset}` and `searchTupleFraction`
+  (`joinsearchseam.go:690`) discards it; C-17 is NOT needed (C-13 wants the
+  absolute bound at one rel, not the fraction everywhere).
+  **Corpus correction: goopg's TPC-H suite is HammerDB's templates and has
+  NO `LIMIT` in any of the 22 queries** (0 of 22 committed PG plans contain
+  a `Limit` node), so the entire measurable surface is TPC-DS (81/99 plans
+  `Limit`-rooted). Probe P2 (the goopg `Limit → Sort(N)` census) is the
+  go/no-go and is unrun.
+  *design: take3 08 §7 + `docs/design/planner-p4-upper-rels/DESIGN.md`;
+  gate: take3 09 §5 P4 (PP + timing; C-13a's real correctness gate is the
+  TPC-DS SF0.5 checksum arm).*
 - [ ] **C-14 P4-05 Incremental Sort** node + `create_incremental_sort_path`.
   No executor counterpart exists — BLOCKED: resume after executor support
   and excluded from closure until then. Publish the executor input
