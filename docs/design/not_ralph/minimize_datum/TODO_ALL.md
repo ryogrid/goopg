@@ -1275,6 +1275,31 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   C-19, not on its own cost terms. Ledger
   `take3-D-05-parallel-blind-costmodel`; artifact
   `analysis/minimize-datum/d05-buildcost-20260906/README.md`.
+  **Correction 2026-09-06, AFTER E-09a landed (`67204579c`): the 5×
+  multiplier in the 5th measurement's derivation is no longer true.** That
+  charge was derived from "the executor's own sharing-decline rule" — a
+  spilling build was NOT shared, so five participants each built the whole
+  inner side. E-09a publishes a spilling shared build, and the acceptance
+  witness confirms the change: every worker now reports
+  `Seq Scan on orders rows=0.00 loops=0` against `rows=1500000.00 loops=1`
+  before, with ONE `Build Time` instead of five. So the build-cost term
+  that measured +22.3% was pricing a 5× cost that the executor no longer
+  pays; on a spilling build the correct multiplier is now **1×**, the same
+  as the resident case.
+  This does NOT by itself unblock D-05, and it must not be read as one:
+  the structural finding stands — the search still cannot prefer a plan
+  BECAUSE it will parallelise, and the entry-width and cost-side-narrowing
+  measurements (+10.3%, and the Q5/Q10/Q9 parallelism losses) did not
+  depend on the multiplier at all. What it does change is that **one of
+  the three refuted corrections was refuted against a premise that has
+  since been fixed**, so the build-cost charge is worth re-deriving and
+  re-measuring at 1× once C-19d lands — before, not after, the packing
+  work is re-scoped. Preserved patch `tmp/d05p4-*.patch`; re-derive rather
+  than re-apply, since its multiplier is now wrong.
+  MEMORY caveat: E-09a shared the BUILD, not the reloaded batch — each
+  participant still materialises its own copy, so D-04's 506 MB live map
+  is still five maps until E-09b lands. Any memory term in a re-derivation
+  must state which of the two it is charging.
   Two cheaper facts from the same run: the bucket-array term decides
   NOTHING on TPC-H (zero plans move at multiplier 1) and is dropped from
   this list; and the narrowing patch narrows the INNER only while PG
