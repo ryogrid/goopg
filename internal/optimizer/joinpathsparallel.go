@@ -61,6 +61,8 @@ package optimizer
 // where upstream's parallel block sits relative to its serial one (the
 // `try_hashjoin_path` loop closes at :2398 and the parallel block opens at
 // :2418).
+import "github.com/goopg/goopg/internal/parser"
+
 func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 	keys, residual []*restrictInfo, bucket float64) {
 
@@ -154,6 +156,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 
 	addPartialPath(joinrel, &Path{
 		Kind:          PathHashJoin,
+		Jointype:      parser.JoinInner, // C-03a; see addHashJoinPath.
 		Rel:           joinrel,
 		Rows:          rows,
 		Cost:          cost,

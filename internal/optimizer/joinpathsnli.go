@@ -318,6 +318,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
 			addPath(joinrel, &Path{
 				Kind:     PathNestLoop,
+				Jointype: parser.JoinInner, // C-03a; see addHashJoinPath.
 				Rel:      joinrel,
 				Rows:     joinrel.Rows,
 				Cost:     cost,

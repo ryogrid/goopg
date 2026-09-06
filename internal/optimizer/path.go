@@ -16,7 +16,10 @@ package optimizer
 // startup cost, each within a multiplicative STD_FUZZ_FACTOR (:50) tolerance.
 // add_path (:464) folds in pathkeys, parallel_safe, and required-outer relids.
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // stdFuzzFactor is PG's STD_FUZZ_FACTOR (pathnode.c:50): two costs within 1% are
 // treated as equal, and the tie is broken on the non-cost dimensions. This is the
@@ -84,7 +87,37 @@ const (
 // specific data in a narrow payload rather than a fat struct (design ch. 03 §1).
 type Path struct {
 	Kind PathKind
-	Rel  *RelOptInfo
+
+	// Jointype is the join this path PERFORMS — PG's `JoinPath.jointype`
+	// (pathnodes.h:2119: "JoinPath is used to represent all types of join
+	// nodes", with `JoinType jointype` on the node itself). PG has no
+	// PathSemi/PathAnti kind either: NestPath/MergePath/HashPath each carry
+	// the jointype, and `add_paths_to_joinrel` (joinpath.c:124) is passed one
+	// per call.
+	//
+	// C-03a (docs/design/planner-c03-jointype-search/DESIGN.md §4): the field
+	// lands INERT. `parser.JoinInner` is the zero value
+	// (internal/parser/ast.go:727, pinned by TestPathJointypeDefaultsToInner),
+	// so every path that does not set it — every scan path, every Sort /
+	// Agg / Gather wrapper, every path built by a test fixture — reads as an
+	// inner join and behaves exactly as before. Only C-03b makes a producer
+	// stamp anything else, and only C-03c lets it reach `Join.Type`.
+	//
+	// The carrier is the PATH, never the `RelOptInfo`: a relset-keyed
+	// singleton (findRel/addRel, first-writer-wins) cannot hold one jointype,
+	// because different pairs spanning one relset can match different SJIs and
+	// the rel's jointype would become arrival-order dependent. Mixed-jointype
+	// pathlists coexist on one rel, exactly as in PG.
+	//
+	// Must-avoid list (the sibling precedent is Target/NCols below): jointype
+	// is a CORRECTNESS attribute decided by legality, not a cost dimension, so
+	// it stays out of `comparePathCostsFuzzily`, `comparePaths` and
+	// `comparePathCosts` — costs alone decide dominance, and `setCheapest`
+	// inherits that rule. Any cross-jointype pruning question belongs to C-04,
+	// with the enumeration that produces it.
+	Jointype parser.JoinType
+
+	Rel *RelOptInfo
 
 	Cost Cost
 

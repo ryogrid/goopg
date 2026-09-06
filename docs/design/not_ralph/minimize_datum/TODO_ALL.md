@@ -582,10 +582,7 @@ rule).*
   two-level INNER-above-LEFT move, identity-disagreement copy, constant
   unprovable).
   *design: C-02 DESIGN.md §5 C-02d + the "Realisation" note.*
-- [ ] **C-03a P3-03 `Path.Jointype` field (inert).** Jointype on paths
-  (default Inner), compare-ignore rule, DPPATH label. After B-01.
-  *design: `docs/design/planner-c03-jointype-search/DESIGN.md` §4 C-03a
-  (reviewed APPROVE-WITH-NITS); gate: unit + suites green.*
+- [x] **C-03a P3-03 `Path.Jointype` field (inert).** Landed 2026-09-06: `Path.Jointype parser.JoinType` (zero value = `JoinInner`, so every unstamped path — scans, Sort/Agg/Gather wrappers, test fixtures — is unchanged); the five join producers (`addHashJoinPath`, `addNestLoopPath`, the NLI arm, the merge arm, `addPartialHashJoinPath`) stamp `JoinInner` explicitly so C-03b is a value swap, not a new field; compare-ignore pinned (`comparePaths`/`comparePathCosts`/`addToPathlist` blind to jointype — it is a correctness attribute set by legality, not a cost dimension, and `setCheapest` inherits the rule); DPPATH gains a `jointype=` label appended AFTER `verdict=` so existing readers are unaffected. Carrier is the PATH, never the `RelOptInfo` (a relset-keyed singleton cannot hold one jointype). No consumer reads the field — inert by construction. Gates: 4 new pins (`pathjointype_test.go`: R1 zero-value, producers-stamp-inner, compare-ignore incl. `addToPathlist` non-duplication, DPPATH label rendered off a real stderr pipe with ordering pinned) + optimizer/executor suites + `RALPH_PRECOMMIT_SCOPE=units` exit 0. *design: `docs/design/planner-c03-jointype-search/DESIGN.md` §4 C-03a (reviewed APPROVE-WITH-NITS).*
 - [ ] **C-03b P3-03 jointype-aware `addPaths` (inert).** sjinfo orientation
   carrier into `addPaths`; OUTER legal direction only; SEMI/ANTI
   nestloop-only. *design: C-03 DESIGN.md §4 C-03b; gate: DPPATH

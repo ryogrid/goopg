@@ -56,6 +56,8 @@ package optimizer
 // fallback because a canonical pathkey is per-EC by construction; goopg's
 // pathkeys are syntactic (pathkeys.go, design ch. 04 §2.1) and so can collide
 // without the classifier having said so.
+import "github.com/goopg/goopg/internal/parser"
+
 type mergeKeyGroup struct {
 	outerKey PathKey
 	innerKey PathKey
@@ -391,6 +393,7 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, resultKeys
 
 	addPath(joinrel, &Path{
 		Kind:          PathMergeJoin,
+		Jointype:      parser.JoinInner, // C-03a; see addHashJoinPath.
 		DisabledNodes: disabledNodesFor(!cp.enableMergeJoin, op, ip),
 		Rel:      joinrel,
 		Rows:     joinrel.Rows,

@@ -28,6 +28,8 @@ package optimizer
 // `leaderParticipates` is honoured by copying it onto cp: the production
 // producer (`addBaseRelPartialPaths`) reads the session's value from costParams,
 // and this test-facing entry keeps its explicit parameter.
+import "github.com/goopg/goopg/internal/parser"
+
 func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOps, parallelWorkers int, leaderParticipates bool) {
 	seqCost := costSeqscan(cp, relPages, rel.Rows, numQualOps)
 	// B-17d: `cost_seqscan`'s own flag (costsize.c:295). The producer always
@@ -104,7 +106,12 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, keys, res
 	// `hashjointuples`, costsize.c:4432).
 	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
 	addPath(joinRel, &Path{
-		Kind:          PathHashJoin,
+		Kind: PathHashJoin,
+		// C-03a: stamped explicitly even though `parser.JoinInner` is the zero
+		// value, so the jointype a producer intends is visible at the
+		// constructor rather than inferred from an omission — and so C-03b's
+		// change here is a value swap, not a new field.
+		Jointype:      parser.JoinInner,
 		DisabledNodes: disabledNodesFor(!cp.enableHashJoin, p, b),
 		Rel:           joinRel,
 		Rows:          joinRel.Rows,
@@ -147,6 +154,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, quals []*
 	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
+		Jointype:      parser.JoinInner, // C-03a; see addHashJoinPath.
 		DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, i),
 		Rel:           joinRel,
 		Rows:     joinRel.Rows,
