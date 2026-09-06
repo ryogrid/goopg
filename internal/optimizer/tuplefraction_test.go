@@ -224,7 +224,7 @@ func (b *twoShapeBuilder) sizeJoinRel(outer, inner *RelOptInfo, _ []*restrictInf
 	return 10000, outer.Width + inner.Width
 }
 
-func (b *twoShapeBuilder) addPaths(joinrel, outer, inner *RelOptInfo, _ []*restrictInfo) error {
+func (b *twoShapeBuilder) addPaths(joinrel, outer, inner *RelOptInfo, _ []*restrictInfo, _ *SpecialJoinInfo) error {
 	addPath(joinrel, &Path{Kind: PathHashJoin, Rel: joinrel, Rows: joinrel.Rows,
 		Cost: Cost{Startup: 500, Total: 900}}, "test")
 	addPath(joinrel, &Path{Kind: PathNestLoop, Rel: joinrel, Rows: joinrel.Rows,

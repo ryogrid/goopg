@@ -318,7 +318,7 @@ func (r *refusingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restr
 	return r.s.calcJoinrelSize(nil, outer, inner, clauses)
 }
 
-func (r *refusingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo) error {
+func (r *refusingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) error {
 	return nil // refuse: never add a path
 }
 

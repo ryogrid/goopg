@@ -58,7 +58,7 @@ func TestJoinProducersStampInner(t *testing.T) {
 	outer, inner := scanRel(a, 10000, 100), scanRel(b, 500, 5)
 	joinrel := newRelOptInfo(a|b, 5000, 64)
 	clauses := []*restrictInfo{equiClause(a, b), plainClause(a | b)}
-	if err := addPathsToJoinrel(nil, joinrel, outer, inner, clauses, defaultCostParams()); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, clauses, defaultCostParams(), nil); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	if len(joinrel.Pathlist) == 0 {

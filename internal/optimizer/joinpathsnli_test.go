@@ -79,7 +79,7 @@ func TestNLIArmCostsTheRescanFromTheInnerPath(t *testing.T) {
 	if inner.CheapestTotal.RequiredOuter != 0 {
 		t.Fatal("rule 1 broken: a parameterised path took CheapestTotal")
 	}
-	if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp, nil); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 
@@ -102,7 +102,7 @@ func TestNLIArmCostsTheRescanFromTheInnerPath(t *testing.T) {
 	// plain-NL arm alone produces — the number the NLI has to beat.
 	bare := scanRel(innerRelids, 1_000_000, estScanPages(1_000_000, 32))
 	plainJoinrel := newRelOptInfo(outerRelids|innerRelids, 100, 64)
-	if err := addPathsToJoinrel(nil, plainJoinrel, outer, bare, nil, cp); err != nil {
+	if err := addPathsToJoinrel(nil, plainJoinrel, outer, bare, nil, cp, nil); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	plain := plainJoinrel.Pathlist[0]
@@ -132,7 +132,7 @@ func TestNLIArmDoesNotDuplicateTheUnparameterizedMember(t *testing.T) {
 	if len(inner.CheapestParameterized) != 1 || inner.CheapestParameterized[0].RequiredOuter != 0 {
 		t.Fatalf("fixture: want exactly the prepended unparameterised member, got %d", len(inner.CheapestParameterized))
 	}
-	if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
+	if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp, nil); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	nestloops := 0
@@ -148,7 +148,7 @@ func TestNLIArmDoesNotDuplicateTheUnparameterizedMember(t *testing.T) {
 	// exact tie: the arm contributes NOTHING for an inner whose only
 	// representative is unparameterised.
 	direct := newRelOptInfo(outerRelids|innerRelids, 5000, 64)
-	addNLIPaths(nil, direct, outer, inner, cp, nil, 0)
+	addNLIPaths(nil, direct, outer, inner, cp, parser.JoinInner, nil, 0)
 	if len(direct.Pathlist) != 0 {
 		t.Fatalf("the arm added %d paths for an unparameterised inner, want 0", len(direct.Pathlist))
 	}
@@ -174,7 +174,7 @@ func TestNLIArmAdmission(t *testing.T) {
 		// admission test.
 		inner := nliInnerRel(b, 1000, innerParam, 1.0)
 		joinrel := newRelOptInfo(a|b, 100, 64)
-		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp, nil); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
 		}
 		n := 0
@@ -268,7 +268,7 @@ func TestNLIArmDropsClausesMovableIntoTheInner(t *testing.T) {
 	outer := scanRel(a, 100, estScanPages(100, 32))
 	inner := nliInnerRelBinding(b, 1000, a, indexProbeCost(cp), bound)
 	withDrop := newRelOptInfo(a|b, 100, 64)
-	if err := addPathsToJoinrel(nil, withDrop, outer, inner, []*restrictInfo{bound}, cp); err != nil {
+	if err := addPathsToJoinrel(nil, withDrop, outer, inner, []*restrictInfo{bound}, cp, nil); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}
 	for _, p := range withDrop.Pathlist {

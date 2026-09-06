@@ -42,7 +42,11 @@ package optimizer
 //     becomes reachable code the moment `join_is_legal` inference lands, which
 //     is the same event that relaxes the pin.
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // splitJoinClauses divides a joinrel's restriction list into the clauses a
 // keyed operator can KEY on for this pair of input relsets, and the residual
@@ -103,6 +107,72 @@ func isKeyableFor(ri *restrictInfo, outer, inner RelSet) bool {
 	return relsSubset(ri.leftRelids, inner) && relsSubset(ri.rightRelids, outer)
 }
 
+// jointypeForDirection is `populate_joinrel_with_paths`' per-jointype switch
+// (joinrels.c:906-1029) reduced to the one question `addPathsToJoinrel` must
+// answer for a SINGLE (outer, inner) call: which join does this direction
+// perform, and may it be performed at all? C-03b
+// (docs/design/planner-c03-jointype-search/DESIGN.md §4).
+//
+// Why ORIENTATION and not jointype alone. PG's switch calls
+// `add_paths_to_joinrel` twice per pair and the two calls do not get the same
+// jointype: a LEFT sjinfo yields JOIN_LEFT for (rel1, rel2) and JOIN_RIGHT for
+// (rel2, rel1) (joinrels.c:932-939); SEMI yields JOIN_SEMI and JOIN_RIGHT_SEMI
+// (:983-989); ANTI likewise (:1023-1029). So "is this legal" cannot be decided
+// from the jointype — it is decided by whether THIS call's outer is the side
+// that covers the SJI's LHS.
+//
+// `makeJoinRel` has already applied PG's `reversed` swap (joinrels.c:715-717),
+// so on the FIRST of its two calls `outer` covers MinLefthand and `inner`
+// covers MinRighthand — that is exactly what `joinIsLegal` matched on — and on
+// the SECOND the containments fail. The gate is written as the containment test
+// rather than as "decline the second call" so it stays correct for any caller,
+// including the hand-built fixtures the C-03b/C-03d evidence runs on.
+//
+// The reversed direction is DECLINED rather than emitted as PG's JOIN_RIGHT /
+// JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI. That is a deliberate narrowing, not an
+// oversight: goopg's search would then own two ways to express one join and
+// C-04 would have to prove both correct at once. Withholding a path can only
+// lose an optimisation, never produce a wrong answer, and nothing selects these
+// paths today in any case.
+//
+// SEMI/ANTI contract. PG runs `hash_inner_and_outer` for JOIN_SEMI
+// (joinpath.c:2229) and its executor early-outs on the first inner match.
+// goopg declines the keyed operators for SEMI/ANTI and offers only the nested
+// loops, for the same fail-closed reason: `hash_inner_and_outer`'s semi
+// handling is bound up with `create_unique_path` unique-ification, which goopg
+// has no analogue of, and a semi-join hashed as though it were an inner join
+// would MULTIPLY rows rather than merely mis-cost them. Declining is the safe
+// direction and costs nothing while the paths are unreachable.
+//
+// FULL is admitted here and declined one slice later (C-03c), where the
+// executor's missing FULL hash semantics is the reason and the deferral ledger
+// is the place it is recorded.
+func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner RelSet) (parser.JoinType, bool) {
+	// No SpecialJoinInfo: a plain inner join, which is what `joinIsLegal`
+	// returns for every pair in a query with no outer/semi/anti join at all
+	// (its `len(s.joinInfoList) == 0` fast path). Both directions are legal —
+	// PG's JOIN_INNER arm, joinrels.c:908-921.
+	if sjinfo == nil {
+		return parser.JoinInner, true
+	}
+	switch sjinfo.Jointype {
+	case parser.JoinInner, parser.JoinCross:
+		// A SpecialJoinInfo is never built for these, but a caller that
+		// synthesises one must not accidentally take the outer-join path.
+		return parser.JoinInner, true
+	case parser.JoinLeft, parser.JoinRight, parser.JoinFull, parser.JoinSemi, parser.JoinAnti:
+		if relsSubset(sjinfo.MinLefthand, outer) && relsSubset(sjinfo.MinRighthand, inner) {
+			return sjinfo.Jointype, true
+		}
+		return sjinfo.Jointype, false
+	default:
+		// An unrecognised jointype is PG's `elog(ERROR)` (joinrels.c:1031).
+		// goopg cannot raise from path generation, so it declines the
+		// direction — the fail-closed equivalent.
+		return sjinfo.Jointype, false
+	}
+}
+
 // addPathsToJoinrel is `add_paths_to_joinrel` (joinpath.c:124) for ONE input
 // order: `outer` drives, `inner` is probed or built. `clauses` is the joinrel's
 // own restriction list — what `build_joinrel_restrictlist` produced, which for
@@ -136,7 +206,7 @@ func isKeyableFor(ri *restrictInfo, outer, inner RelSet) bool {
 // "no statistics reachable" — every cache key then fails to resolve and no
 // Memoize path is offered, which is the correct degradation and what the
 // path-generation unit tests run with.
-func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, cp costParams) error {
+func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, cp costParams, sjinfo *SpecialJoinInfo) error {
 	if joinrel == nil || outer == nil || inner == nil {
 		return fmt.Errorf("join paths: nil input rel")
 	}
@@ -146,6 +216,16 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 	if inner.CheapestTotal == nil {
 		return fmt.Errorf("join paths: inner rel %#08x has no cheapest path", uint32(inner.Relids))
 	}
+
+	// C-03b — which join does THIS direction perform, and may it be performed
+	// at all. See jointypeForDirection.
+	jt, legal := jointypeForDirection(sjinfo, outer.Relids, inner.Relids)
+	if !legal {
+		return nil
+	}
+	// SEMI/ANTI are nestloop-only in goopg. See jointypeForDirection's contract
+	// note for why the keyed operators decline rather than being ported.
+	nestloopOnly := jt == parser.JoinSemi || jt == parser.JoinAnti
 
 	// 03 §9 rule 2 — PATH_PARAM_BY_REL (joinpath.c:43-47). The two directions
 	// are refused for genuinely different reasons, so they are named
@@ -193,7 +273,12 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 		// because `addPath` keeps the INCUMBENT on an exact cost tie, so the
 		// order arms are offered in IS the tie-break, and a tie between a merge
 		// and a hash path must resolve the way PG resolves it.
-		if len(keys) > 0 {
+		//
+		// C-03b adds the second conjunct: the keyed arms (both merge arms, the
+		// serial hash arm and its partial twin) are the ones a SEMI/ANTI join
+		// may not use here, so they are gated as a block rather than each
+		// re-deriving the rule.
+		if len(keys) > 0 && !nestloopOnly {
 			// mergejointuples: what the merge operator emits, before the
 			// residual filters it to joinrel.Rows. Computed ONCE here, where
 			// the searchCtx (and so the selectivity model) is in scope, and
@@ -210,7 +295,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			scanSelFor := func(mc []*restrictInfo) (float64, float64) {
 				return s.mergeJoinScanSel(mc, outer.Relids)
 			}
-			sortInnerAndOuter(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+			sortInnerAndOuter(joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 			// and arm 4 — so a merge over an already-ordered outer is offered
 			// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -218,13 +303,13 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// here; goopg's nested-loop halves (`addNestLoopPath` /
 			// `addNLIPaths`) were landed separately and still run after the
 			// hash arm, which can only change a hash-vs-nestloop exact tie.
-			matchUnsortedOuterMerge(joinrel, outer, inner, cp, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+			matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			// take2 P2-11: the inner side is the BUILD side here, so the
 			// bucket fraction is measured on its keys. Computed at this site
 			// because the searchCtx — and so the statistics — is in scope,
 			// exactly as mergeTuplesFor is.
 			bucket := s.estimateHashBucketSize(keys, inner.Relids)
-			addHashJoinPath(joinrel, outer, inner, cp, keys, residual, bucket)
+			addHashJoinPath(joinrel, outer, inner, cp, jt, keys, residual, bucket)
 			// C-19f: `hash_inner_and_outer`'s parallel block (joinpath.c:2418)
 			// sits immediately after the serial `try_hashjoin_path` loop
 			// (:2398), and is passed the SAME hashclauses — so the partial
@@ -234,17 +319,17 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// generateUsefulGatherPaths and the next level's own partial
 			// producer reads; with GOOPG_GATHER_PATHS off it produces nothing
 			// at all (joinpathsparallel.go).
-			addPartialHashJoinPath(s, joinrel, outer, inner, cp, keys, residual, bucket)
+			addPartialHashJoinPath(s, joinrel, outer, inner, cp, jt, keys, residual, bucket)
 		}
 		// The nested loop keys on nothing, so the key set rejoins the
 		// residual: it evaluates every clause, on every pair. Passing
 		// `clauses` whole rather than `append(keys, residual...)` also keeps
 		// the input order.
-		addNestLoopPath(joinrel, outer, inner, cp, clauses)
+		addNestLoopPath(joinrel, outer, inner, cp, jt, clauses)
 	}
 	// PG runs this inside the same `outerrel->pathlist` loop as the arms above
 	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
 	// admits — which under 03 §4.4's INNER-only pin is all of them.
-	addNLIPaths(s, joinrel, outer, inner, cp, clauses, paramSrc)
+	addNLIPaths(s, joinrel, outer, inner, cp, jt, clauses, paramSrc)
 	return nil
 }

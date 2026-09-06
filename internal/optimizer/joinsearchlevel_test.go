@@ -48,7 +48,14 @@ func (p recordedPair) String() string {
 type recordingBuilder struct {
 	sized []RelSet
 	pairs []recordedPair
-	fail  RelSet // when non-zero, addPaths errors on this joinrel
+	// sjinfos[i] is the SpecialJoinInfo makeJoinRel matched for pairs[i] —
+	// nil for a plain inner join (C-03b). Kept alongside rather than inside
+	// recordedPair so the positional literals the enumeration tests compare
+	// against stay readable: those tests assert the PAIR SEQUENCE, and the
+	// sjinfo is a separate contract (the same one reaches both directions,
+	// and the callee decides which orientation may perform the join).
+	sjinfos []*SpecialJoinInfo
+	fail    RelSet // when non-zero, addPaths errors on this joinrel
 }
 
 func (b *recordingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*restrictInfo) (float64, int) {
@@ -56,8 +63,9 @@ func (b *recordingBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*rest
 	return outer.Rows * inner.Rows, outer.Width + inner.Width
 }
 
-func (b *recordingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo) error {
+func (b *recordingBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) error {
 	b.pairs = append(b.pairs, recordedPair{join: joinrel.Relids, outer: outer.Relids, inner: inner.Relids})
+	b.sjinfos = append(b.sjinfos, sjinfo)
 	if b.fail != 0 && joinrel.Relids == b.fail {
 		return fmt.Errorf("test builder refuses %#b", joinrel.Relids)
 	}

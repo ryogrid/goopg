@@ -94,8 +94,8 @@ func (b *searchJoinRelBuilder) sizeJoinRel(outer, inner *RelOptInfo, clauses []*
 	return b.s.calcJoinrelSize(b.cat, outer, inner, clauses)
 }
 
-func (b *searchJoinRelBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo) error {
-	return addPathsToJoinrel(b.s, joinrel, outer, inner, clauses, b.s.cp)
+func (b *searchJoinRelBuilder) addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) error {
+	return addPathsToJoinrel(b.s, joinrel, outer, inner, clauses, b.s.cp, sjinfo)
 }
 
 // calcJoinrelSize is `calc_joinrel_size_estimate` (costsize.c:5499) for the

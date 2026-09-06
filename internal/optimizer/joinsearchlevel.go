@@ -57,7 +57,15 @@ type joinRelBuilder interface {
 	// `outer` as the outer (probe/driving) side and `inner` as the inner
 	// (build/inner-scan) side, and add every path it finds to `joinrel` via
 	// `addPath`. makeJoinRel calls it twice per pair, once per direction.
-	addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo) error
+	//
+	// `sjinfo` is the SpecialJoinInfo `joinIsLegal` matched for this pair, nil
+	// for a plain inner join, and it is passed POST-`reversed`-swap, so the
+	// caller's `outer` on the first of the two calls is the side that covers
+	// the SJI's LHS. C-03b passes it because legality of a given direction is
+	// an ORIENTATION question, not a jointype question — PG's
+	// `populate_joinrel_with_paths` gives its two calls different jointypes for
+	// exactly this reason (joinrels.c:932-939). See jointypeForDirection.
+	addPaths(joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, sjinfo *SpecialJoinInfo) error
 }
 
 // joinOrderRestricted is PG's `have_join_order_restriction` (joinrels.c:1066),
@@ -616,10 +624,14 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		}
 	}
 
-	if err := s.builder.addPaths(joinrel, rel1, rel2, clauses); err != nil {
+	// The two directions of `populate_joinrel_with_paths` (joinrels.c:809-816
+	// and its outer/semi/anti twins). Both calls get the SAME sjinfo — post
+	// swap, so rel1 covers its LHS — and the callee decides per direction what
+	// join, if any, that orientation may perform (C-03b, jointypeForDirection).
+	if err := s.builder.addPaths(joinrel, rel1, rel2, clauses, sjinfo); err != nil {
 		return nil, err
 	}
-	if err := s.builder.addPaths(joinrel, rel2, rel1, clauses); err != nil {
+	if err := s.builder.addPaths(joinrel, rel2, rel1, clauses, sjinfo); err != nil {
 		return nil, err
 	}
 	return joinrel, nil

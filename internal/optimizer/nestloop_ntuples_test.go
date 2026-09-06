@@ -19,7 +19,11 @@ package optimizer
 // the hash by 0.02 on a total of ~968 before rescanning 7 193 rows per outer row
 // at runtime (8 m 40 s against 11-13 s).
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // nlCollapsedPair builds the Q47 shape at path level, with the numbers the
 // search really produced for `{v1,v1_lag} ⋈ v1_lead` (SF0.5): the OUTER is the
@@ -39,8 +43,8 @@ func nlCollapsedPair(t *testing.T, innerRows float64) *RelOptInfo {
 	// The collapsed estimate: four independent equalities on stats-less inputs.
 	joinRel := newRelOptInfo(RelSet(0b11), 1, 80)
 	keys := []*restrictInfo{{}, {}, {}, {}}
-	generateHashJoinPaths(joinRel, outer, inner, cp, keys, nil, nil)
-	addNestLoopPath(joinRel, outer, inner, cp, keys)
+	generateHashJoinPaths(joinRel, outer, inner, cp, parser.JoinInner, keys, nil, nil)
+	addNestLoopPath(joinRel, outer, inner, cp, parser.JoinInner, keys)
 	setCheapest(joinRel)
 	return joinRel
 }
@@ -124,7 +128,7 @@ func TestNestLoopSurvivesForAClauselessPair(t *testing.T) {
 	inner := relWithScanCost(RelSet(0b10), 1000, 50)
 	joinRel := newRelOptInfo(RelSet(0b11), 1000000, 80)
 	// A cartesian pair: no keys, so addPathsToJoinrel would skip the hash arm.
-	addNestLoopPath(joinRel, outer, inner, cp, nil)
+	addNestLoopPath(joinRel, outer, inner, cp, parser.JoinInner, nil)
 	setCheapest(joinRel)
 
 	if joinRel.CheapestTotal == nil || joinRel.CheapestTotal.Kind != PathNestLoop {

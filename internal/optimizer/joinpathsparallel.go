@@ -64,7 +64,7 @@ package optimizer
 import "github.com/goopg/goopg/internal/parser"
 
 func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
-	keys, residual []*restrictInfo, bucket float64) {
+	jt parser.JoinType, keys, residual []*restrictInfo, bucket float64) {
 
 	// The only reader of a partial path is `generateUsefulGatherPaths`, which
 	// is gated by the same mode — so producing under `off` buys nothing and
@@ -156,7 +156,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 
 	addPartialPath(joinrel, &Path{
 		Kind:          PathHashJoin,
-		Jointype:      parser.JoinInner, // C-03a; see addHashJoinPath.
+		Jointype:      jt, // C-03b; see addHashJoinPath.
 		Rel:           joinrel,
 		Rows:          rows,
 		Cost:          cost,

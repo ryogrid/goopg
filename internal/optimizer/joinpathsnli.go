@@ -261,7 +261,7 @@ func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
 // `Rows: joinRel.Rows` unconditionally without a `ppi_rows` of their own —
 // both read `CheapestTotal`-only inputs, which a parameterised path can
 // never win (03 §9 rule 1), so the merge exception cannot reach them.
-func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, clauses []*restrictInfo, paramSrc RelSet) {
+func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, paramSrc RelSet) {
 	o := outer.CheapestTotal
 	if o == nil || o.RequiredOuter != 0 {
 		return
@@ -318,7 +318,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
 			addPath(joinrel, &Path{
 				Kind:     PathNestLoop,
-				Jointype: parser.JoinInner, // C-03a; see addHashJoinPath.
+				Jointype: jt, // C-03b; see addHashJoinPath.
 				Rel:      joinrel,
 				Rows:     joinrel.Rows,
 				Cost:     cost,

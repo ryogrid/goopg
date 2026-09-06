@@ -1,6 +1,10 @@
 package optimizer
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // Phase C3.2 — path generation primitives. Pure functions over RelOptInfo;
 // nothing live calls them yet (C4 wires them into the DP and switches selection).
@@ -65,7 +69,7 @@ func TestGenerateHashJoinPaths_KeepsCheaperBuildSide(t *testing.T) {
 	joinRel := newRelOptInfo(RelSet(0b11), 1000000, 100)
 	// One hash key, no residual. The clause's contents do not matter here —
 	// only its count reaches hashJoinCost.
-	generateHashJoinPaths(joinRel, fact, dim, cp, []*restrictInfo{{}}, nil, nil)
+	generateHashJoinPaths(joinRel, fact, dim, cp, parser.JoinInner, []*restrictInfo{{}}, nil, nil)
 	setCheapest(joinRel)
 
 	if joinRel.CheapestTotal == nil {
@@ -111,7 +115,7 @@ func TestNLIPathRuinousForLargeOuter(t *testing.T) {
 		outer := relWithScanCost(outerRelids, outerRows, outerCost)
 		inner := nliInnerRel(innerRelids, 1000000, outerRelids, indexProbeCost(cp))
 		joinRel := newRelOptInfo(outerRelids|innerRelids, joinRows, 40)
-		addNLIPaths(nil, joinRel, outer, inner, cp, nil, 0)
+		addNLIPaths(nil, joinRel, outer, inner, cp, parser.JoinInner, nil, 0)
 		setCheapest(joinRel)
 		if joinRel.CheapestTotal == nil {
 			t.Fatal("the NLI arm produced no path for a fully-supplied inner")
@@ -151,7 +155,7 @@ func TestGenerateHashJoinPaths_NoChildCheapestIsNoop(t *testing.T) {
 	joinRel := newRelOptInfo(RelSet(0b11), 10, 10)
 	outer := newRelOptInfo(RelSet(0b01), 10, 10) // no paths -> CheapestTotal nil
 	inner := newRelOptInfo(RelSet(0b10), 10, 10)
-	generateHashJoinPaths(joinRel, outer, inner, cp, []*restrictInfo{{}}, nil, nil)
+	generateHashJoinPaths(joinRel, outer, inner, cp, parser.JoinInner, []*restrictInfo{{}}, nil, nil)
 	if len(joinRel.Pathlist) != 0 {
 		t.Fatalf("no join paths should be generated without child cheapest paths")
 	}

@@ -12,7 +12,11 @@ package optimizer
 // gives. That is what this file does, against `set_cheapest` (pathnode.c:272),
 // `calc_nestloop_required_outer` (:2592) and PATH_PARAM_BY_REL (joinpath.c:46).
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // paramPath builds a path over rel with the given cost and parameterisation.
 func paramPath(rel *RelOptInfo, startup, total float64, reqOuter RelSet) *Path {
@@ -205,7 +209,7 @@ func TestAddPathsToJoinrelRefusesParameterizedInputs(t *testing.T) {
 		outer := newRelWithPath(relA, relB)
 		inner := newRelWithPath(relB, 0)
 		joinrel := newRelOptInfo(relA|relB, 5000, 16)
-		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp, nil); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
 		}
 		if len(joinrel.Pathlist) != 0 {
@@ -217,7 +221,7 @@ func TestAddPathsToJoinrelRefusesParameterizedInputs(t *testing.T) {
 		outer := newRelWithPath(relA, 0)
 		inner := newRelWithPath(relB, relA)
 		joinrel := newRelOptInfo(relA|relB, 5000, 16)
-		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp, nil); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
 		}
 		// Hash refuses it outright and the plain nested loop declines because
@@ -244,7 +248,7 @@ func TestAddPathsToJoinrelRefusesParameterizedInputs(t *testing.T) {
 		outer := newRelWithPath(relA, 0)
 		inner := newRelWithPath(relB, 0)
 		joinrel := newRelOptInfo(relA|relB, 5000, 16)
-		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp); err != nil {
+		if err := addPathsToJoinrel(nil, joinrel, outer, inner, nil, cp, nil); err != nil {
 			t.Fatalf("addPathsToJoinrel: %v", err)
 		}
 		if len(joinrel.Pathlist) == 0 {
@@ -279,7 +283,7 @@ func TestJoinPathRowsComeFromChildPaths(t *testing.T) {
 		setCheapest(inner)
 
 		joinrel := newRelOptInfo(0b0011, 100, 16)
-		addNestLoopPath(joinrel, outer, inner, cp, []*restrictInfo{{}})
+		addNestLoopPath(joinrel, outer, inner, cp, parser.JoinInner, []*restrictInfo{{}})
 		return joinrel.Pathlist[0].Cost.Total
 	}
 
