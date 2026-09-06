@@ -603,8 +603,16 @@ rule).*
   join. TPC-H values were 24/24 and its one plan move (Q13 Hash Left →
   Merge Left, −14%, better estimate) is good — which is exactly why the
   SF0.5 gate is mandatory for a planner item and not a formality. Fix
-  agent dispatched with both mechanisms; revert-with-ledger is the
-  fallback. Baseline `c04a-left-admission-20260906` is provisional.
+  landed as `fb65502` (taken over from the interrupted agent): (1) Q72 —
+  `sjInfosInItemSpace` remaps statement-leaf SJI hands into each
+  problem's item coordinates once per problem (the collapse-limit split
+  made a 4-item problem where MinRighthand named un-overlappable leaf
+  bits, so `joinIsLegal` never fired); the C-08 derivation now consumes
+  the remapped list (shift-by-lo removed); (2) Q78 —
+  `deriveOuterLinkConstants` (`reconsider_outer_join_clauses`) derives
+  nullable-side `ws_sold_year = 1998` from preserved-side constants so
+  `d_year = 1998` survives inside the CTE body. Gates re-run to unblock:
+  optimizer suite green; SF0.5 Q72 values + Q78 timing pending.
   pinning relax + refusal deletion + leaf-flatten + lateral descend +
   per-qual delay + LEFT sizing floor, for LEFT links end to end.
   Implementation starts after C-03a/b/c land (jointype paths).
