@@ -642,6 +642,18 @@ do — the *cost* of a partial join is what needs work, and this is a concrete,
 reproducible case to work it against. It is NOT the same defect as C-19d's:
 there, no Gather could ever win; here one wins and picks the wrong side.
 
+The lead for whoever picks it up, because it is visible in the plan text above
+and costs nothing to state: the two arms do not differ only in which scan is
+divided, they differ in **which relation is BUILT**. `off` probes with
+`lineitem` (6 M rows) and builds `orders`; `top` probes with `orders` (1.5 M)
+and builds `lineitem`, so a 6,001,255-row hash table is now constructed at
+startup, undivided, by the leader — and the model still called the plan 21 %
+cheaper end to end (958,237 vs 1,206,554). §3.2's own caveat is the first place
+to look: `spillPages` is derived from the in-memory `hashsize.EntryBytes` while
+the batch FILE encoding is narrower, an approximation whose stated direction is
+to DETER spilling, and it evidently did not deter this one. The build term, not
+the Gather term, is the suspect.
+
 ### 10.6 Q10, +30 %: an unexplained cost-neutral regression
 
 Q10's executed shape is **identical** in both arms — same joins, same order,
