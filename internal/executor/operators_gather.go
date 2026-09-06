@@ -541,8 +541,10 @@ func (o *gatherOp) Close() error {
 	o.workers, o.arenas = nil, nil
 	if o.ownsSharedBuilds && o.ctx != nil {
 		// Retract the published tables so a later serial statement on this
-		// session does not adopt a stale build for the same plan node.
-		o.ctx.SharedHashBuilds = nil
+		// session does not adopt a stale build for the same plan node, and
+		// unlink the batch files of a spilling build (E-09a) now that no
+		// participant can still be reading them.
+		releaseSharedHashBuilds(o.ctx)
 		o.ownsSharedBuilds = false
 	}
 

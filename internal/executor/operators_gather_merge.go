@@ -464,7 +464,8 @@ func (o *gatherMergeOp) Close() error {
 	}
 	o.workers, o.arenas = nil, nil
 	if o.ownsSharedBuilds && o.ctx != nil {
-		o.ctx.SharedHashBuilds = nil
+		// E-09a: retract and unlink the batch files after the join.
+		releaseSharedHashBuilds(o.ctx)
 		o.ownsSharedBuilds = false
 	}
 

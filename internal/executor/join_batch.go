@@ -30,8 +30,19 @@ package executor
 // batched yet, and a LEFT join built on the left side needs the build-side
 // sweep of P4.2. Every declined case behaves exactly as it did before this
 // file existed — `o.batches` stays nil and not one line of the old path
-// changes. A shared (parallel) build no longer declines the SPILL; it declines
-// the SHARE (parallel_hash_build.go, M0127-P3.4).
+// changes.
+//
+// E-09a (docs/design/executor-e09a-shared-spilling-build/DESIGN.md): a shared
+// (parallel) build that spills is PUBLISHED, not declined. The leader's
+// prebuild freezes its batch state into an immutable descriptor
+// (freezeForSharing) and every Gather participant derives a PRIVATE
+// hashBatchState from it (newParticipantBatchState): its own outer files,
+// curBatch and replay, with `inner` pointing at the leader's read-only files.
+// Three invariants hold on that path and each is pinned by a test: a
+// participant never writes or unlinks a shared inner file (innerShared), growth
+// is frozen (growEnabled=false, PG's "all changes to the number of batches
+// happen during the build phase"), and every participant opens each inner file
+// exactly once.
 
 import (
 	"fmt"
@@ -69,8 +80,18 @@ const minBatchSpaceAllowed = 64 << 10
 // numbers). That one-way discipline is what lets `nextBatch` decide a batch is
 // empty by looking at the row counter.
 type joinBatchFile struct {
+	// w is the writer while the file is being filled; nil once the file has
+	// been frozen for sharing (freezeForSharing), after which only path is
+	// consulted and only by readers.
 	w    *spillWriter
+	path string
 	rows int64
+	// createdNBatch is nbatch as it stood when the file was created. A file
+	// created before a later doubling may hold rows the final geometry assigns
+	// to a HIGHER batch (they were routed under the smaller nbatch), and that
+	// is what freezeForSharing uses to decide which files need settling
+	// before they can be read by participants that may not write.
+	createdNBatch int
 }
 
 // hashBatchState is the per-join batching state. nil on a joinOp means the
@@ -141,7 +162,24 @@ type hashBatchState struct {
 	// was built without one (unit fixtures, and any path that never went
 	// through NewContext).
 	stats *HashJoinStats
+
+	// innerShared marks a participant state derived from a shared batch
+	// descriptor (E-09a): `inner` aliases files the leader wrote and froze,
+	// and other participants read the same files concurrently. While it is
+	// set this state must never write to, truncate, or unlink an inner file
+	// — writeInner refuses, openReader leaves the writer alone, discard and
+	// close skip the inner slice, and loadInnerBatch closes its reader with
+	// closeKeepFile. Growth is frozen too, so the reload path can never need
+	// to re-route a row forward (every file was settled before publication).
+	innerShared bool
 }
+
+// testHookInnerBatchOpened, when non-nil, is called by loadInnerBatch each
+// time a batch state opens an inner batch file for reading. It exists for the
+// E-09a exactly-once-open invariant test and is nil in production; it is set
+// before a Gather fans out and cleared after it joins, so the goroutine
+// start/join edges order every access.
+var testHookInnerBatchOpened func(bs *hashBatchState, b int, path string)
 
 // HashJoinStats is the per-plan-node hash-join instrumentation EXPLAIN
 // (ANALYZE) reports, PG's HashInstrumentation (nodeHash.h) minus the fields
@@ -258,10 +296,9 @@ func (bs *hashBatchState) publish() {
 //   - the FOR-UPDATE ctid build keeps `lazyHashCTID` in lockstep with
 //     `lazyHash`, so spilling one without the other would lose the tid a
 //     downstream LockRows needs;
-//   - `noBatch` is the caller-side decline; nothing sets it now that
-//     `prebuildSharedHashJoins` declines the SHARE instead of the SPILL
-//     (parallel_hash_build.go), and it is kept as the knob that decline would
-//     otherwise have to re-invent.
+//   - `noBatch` is the caller-side decline; nothing sets it (E-09a publishes
+//     a spilling shared build instead of declining it), and it is kept as the
+//     knob a future decline would otherwise have to re-invent.
 func (o *joinOp) joinBatchEligible() bool {
 	if o.noBatch || o.multiKey() || o.preserveBuildSide || o.preserveCTIDRel != nil {
 		return false
@@ -359,8 +396,16 @@ func (bs *hashBatchState) write(files []*joinBatchFile, b int, h uint32, row Row
 		if err != nil {
 			return err
 		}
-		f = &joinBatchFile{w: w}
+		f = &joinBatchFile{w: w, path: w.Path(), createdNBatch: bs.nbatch}
 		files[b] = f
+	}
+	if f.w == nil {
+		// A frozen file (freezeForSharing) has no writer by construction.
+		// Reaching it is a bug in the caller, never a data condition.
+		return &ExecError{
+			Code:    "XX000",
+			Message: fmt.Sprintf("hash join attempted to write frozen batch file %d", b),
+		}
 	}
 	if err := f.w.WriteRowHashed(h, row); err != nil {
 		return err
@@ -370,6 +415,18 @@ func (bs *hashBatchState) write(files []*joinBatchFile, b int, h uint32, row Row
 }
 
 func (bs *hashBatchState) writeInner(b int, h uint32, row Row) error {
+	if bs.innerShared {
+		// E-09a invariant: a participant never writes a shared inner file.
+		// Every legitimate writer (the build loop, growth, the forward
+		// re-route on reload) is confined to the leader's prebuild, which
+		// completes before this state exists; this arm is the poison that
+		// turns any future violation into an error rather than a partition
+		// silently read by the other participants.
+		return &ExecError{
+			Code:    "XX000",
+			Message: fmt.Sprintf("hash join participant attempted to write shared inner batch file %d", b),
+		}
+	}
 	bs.innerSpilled++
 	return bs.write(bs.inner, b, h, row)
 }
@@ -515,8 +572,11 @@ func (bs *hashBatchState) batchSkippable(o *joinOp, b int) bool {
 	if hasInner && hasOuter {
 		return false
 	}
-	if hasInner && bs.nbatch != bs.origNBatch {
-		return false // rule 2
+	if hasInner && bs.nbatch != bs.origNBatch && !bs.innerShared {
+		// rule 2 — except on a participant, whose inner files were settled
+		// by freezeForSharing: no row in inner[b] belongs to a later batch,
+		// so there is nothing to re-route and the file may be skipped.
+		return false
 	}
 	if hasOuter && bs.nbatch != bs.nbatchOutstart {
 		return false // rule 3
@@ -582,7 +642,16 @@ func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	if bs.innerShared {
+		// The file is the leader's and other participants are reading it:
+		// close the descriptor, never the path.
+		defer r.closeKeepFile()
+	} else {
+		defer r.Close()
+	}
+	if testHookInnerBatchOpened != nil {
+		testHookInnerBatchOpened(bs, bs.curBatch, r.path)
+	}
 	var buf Row
 	for {
 		h, row, err := r.ReadRowHashedInto(buf)
@@ -594,6 +663,16 @@ func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
 		}
 		buf = row
 		if b := bs.batchOf(h); b != bs.curBatch {
+			if bs.innerShared {
+				// freezeForSharing settled every file before publication,
+				// so a foreign row here is a broken invariant — report it
+				// rather than skip it (a skipped row is a lost match).
+				return &ExecError{
+					Code: "XX000",
+					Message: fmt.Sprintf("shared hash join batch file %d holds a row of batch %d",
+						bs.curBatch, b),
+				}
+			}
 			// Re-spilled straight from the read buffer: the encode completes
 			// before the next ReadRowHashedInto can overwrite it.
 			if err := bs.writeInner(b, h, row); err != nil {
@@ -630,27 +709,52 @@ func (bs *hashBatchState) loadInnerBatch(o *joinOp) error {
 
 // openReader closes the batch's writer and hands back a reader over it,
 // clearing the slot so the file is owned by exactly one of the two.
+//
+// The slot is the CALLER's: on a participant state `inner` is a private copy
+// of the descriptor's slice, so clearing it there says "this participant has
+// consumed batch b" without touching the leader's descriptor or any other
+// participant. A frozen file (w == nil) is simply opened by path.
 func (bs *hashBatchState) openReader(files []*joinBatchFile, b int) (*spillReader, error) {
 	f := files[b]
 	files[b] = nil
-	if err := f.w.Close(); err != nil {
-		return nil, err
+	if f.w != nil {
+		if err := f.w.Close(); err != nil {
+			return nil, err
+		}
 	}
-	return newSpillReader(f.w.Path())
+	return newSpillReader(f.path)
 }
 
 // discard drops both files of a batch that will produce no output.
+//
+// A participant's inner files are the leader's (innerShared): they are only
+// forgotten here, never closed or unlinked — the descriptor's release, or the
+// statement registry, retires them once every participant has joined.
 func (bs *hashBatchState) discard(b int) {
-	for _, files := range [][]*joinBatchFile{bs.inner, bs.outer} {
-		if f := files[b]; f != nil {
-			f.w.Close()
-			// Eager unlink + deregister: a 1024-batch join must not
-			// hold 1024 files open-and-linked to statement end just
-			// because the registry would eventually reclaim them.
-			bs.ctx.removeSpillFile(f.w.Path())
-			files[b] = nil
+	if f := bs.inner[b]; f != nil {
+		if bs.innerShared {
+			bs.inner[b] = nil
+		} else {
+			bs.dropFile(f)
+			bs.inner[b] = nil
 		}
 	}
+	if f := bs.outer[b]; f != nil {
+		bs.dropFile(f)
+		bs.outer[b] = nil
+	}
+}
+
+// dropFile closes a private batch file's writer (if still open) and unlinks
+// it. Eager unlink + deregister: a 1024-batch join must not hold 1024 files
+// open-and-linked to statement end just because the registry would eventually
+// reclaim them.
+func (bs *hashBatchState) dropFile(f *joinBatchFile) {
+	if f.w != nil {
+		f.w.Close()
+		f.w = nil
+	}
+	bs.ctx.removeSpillFile(f.path)
 }
 
 func (bs *hashBatchState) closeReplay() {
@@ -672,6 +776,193 @@ func (bs *hashBatchState) close() {
 	for b := range bs.inner {
 		bs.discard(b)
 	}
+}
+
+// ── E-09a: shared spilling build ────────────────────────────────────────
+
+// sharedBatchDesc is the immutable batch descriptor a spilling shared build
+// carries beside its batch-0 maps (DESIGN.md §4 part 1). It is written once,
+// by the leader's prebuild, before any worker exists, and read by every
+// participant afterwards: the geometry so each can route its own probe rows
+// identically, and the inner files 1..n-1, frozen (no writer, settled under
+// the final nbatch) so each participant can reload batch k through a reader
+// of its own.
+type sharedBatchDesc struct {
+	nbatch       int
+	origNBatch   int
+	nbuckets     int
+	bucketBits   uint
+	spaceAllowed int64
+	buildIsLeft  bool
+	// inner[0] is always nil (batch 0 is the in-memory table); every other
+	// non-nil entry has w == nil and a path readable by any number of
+	// spillReaders at once.
+	inner []*joinBatchFile
+}
+
+// freezeForSharing turns the leader's just-completed build state into a
+// sharedBatchDesc and detaches the files from this state (which is never used
+// again: the prebuild operator does not probe).
+//
+// Settling: PG's own rule (nodeHashjoin.c, "completes all changes to the
+// number of batches during the build phase") is what makes a per-participant
+// reload possible without a cross-worker protocol — but goopg's serial reload
+// also RE-ROUTES rows forward (loadInnerBatch, rule 2): a file written before
+// a doubling may hold rows the final nbatch assigns to a later batch, and the
+// serial path fixes that lazily by appending to the later batch's file when
+// it reads the earlier one. A participant may not append to a shared file, so
+// the leader does that work ONCE here, before publication: every file created
+// under a smaller nbatch is rewritten with its own rows and its foreign rows
+// appended to their final batch's file. Files created after the last doubling
+// are already final and are left alone. After this, no inner file holds a row
+// of another batch, which loadInnerBatch on a participant asserts.
+func (bs *hashBatchState) freezeForSharing() (*sharedBatchDesc, error) {
+	// The build's peak is reported through the leader's sink now; the
+	// participants report only their reload peaks.
+	bs.publish()
+	// Growth is over: nothing after this point may double nbatch, and the
+	// descriptor below is only correct if that holds.
+	bs.growEnabled = false
+	if err := bs.settleInnerFiles(); err != nil {
+		return nil, err
+	}
+	for b, f := range bs.inner {
+		if f == nil {
+			continue
+		}
+		if err := f.w.Close(); err != nil {
+			return nil, err
+		}
+		f.w = nil
+		if f.rows == 0 {
+			bs.ctx.removeSpillFile(f.path)
+			bs.inner[b] = nil
+		}
+	}
+	d := &sharedBatchDesc{
+		nbatch:       bs.nbatch,
+		origNBatch:   bs.origNBatch,
+		nbuckets:     bs.nbuckets,
+		bucketBits:   bs.bucketBits,
+		spaceAllowed: bs.spaceAllowed,
+		buildIsLeft:  bs.buildIsLeft,
+		inner:        bs.inner,
+	}
+	// The descriptor owns the files from here: this state must not unlink
+	// them if it is ever closed.
+	bs.inner = make([]*joinBatchFile, bs.nbatch)
+	return d, nil
+}
+
+// settleInnerFiles rewrites every inner file created before the last doubling
+// so that it holds only rows of its own batch, appending each foreign row to
+// the file of the batch the final geometry assigns it. Rows only ever move
+// FORWARD (the doubling property this file's header explains), so walking
+// batches in ascending order visits every appended row exactly once, in a
+// file that is either final already or settled later in the same walk.
+func (bs *hashBatchState) settleInnerFiles() error {
+	for k := 1; k < bs.nbatch; k++ {
+		f := bs.inner[k]
+		if f == nil || f.createdNBatch == bs.nbatch {
+			continue
+		}
+		if err := f.w.Close(); err != nil {
+			return err
+		}
+		f.w = nil
+		r, err := newSpillReader(f.path)
+		if err != nil {
+			return err
+		}
+		nw, err := newSpillWriter(bs.ctx)
+		if err != nil {
+			r.closeKeepFile()
+			return err
+		}
+		nf := &joinBatchFile{w: nw, path: nw.Path(), createdNBatch: bs.nbatch}
+		bs.inner[k] = nf
+		var buf Row
+		for {
+			h, row, err := r.ReadRowHashedInto(buf)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				r.closeKeepFile()
+				return err
+			}
+			buf = row
+			b := bs.batchOf(h)
+			if b < k {
+				r.closeKeepFile()
+				return &ExecError{
+					Code:    "XX000",
+					Message: fmt.Sprintf("hash join batch file %d holds a row of earlier batch %d", k, b),
+				}
+			}
+			if b == k {
+				if err := nf.w.WriteRowHashed(h, row); err != nil {
+					r.closeKeepFile()
+					return err
+				}
+				nf.rows++
+				continue
+			}
+			if err := bs.write(bs.inner, b, h, row); err != nil {
+				r.closeKeepFile()
+				return err
+			}
+		}
+		r.closeKeepFile()
+		bs.ctx.removeSpillFile(f.path)
+	}
+	return nil
+}
+
+// release unlinks the descriptor's files. Called by the Gather that published
+// the build, after every participant has joined; the statement's temp-file
+// registry is the backstop for the paths that never reach here.
+//
+// Idempotent (removeSpillFile tolerates a missing path), and the descriptor
+// is left intact so a post-mortem — EXPLAIN, a test — can still read the
+// geometry it published.
+func (d *sharedBatchDesc) release(ctx *Context) {
+	if d == nil {
+		return
+	}
+	for _, f := range d.inner {
+		if f != nil {
+			ctx.removeSpillFile(f.path)
+		}
+	}
+}
+
+// newParticipantBatchState derives one participant's private batch state
+// from a shared descriptor (DESIGN.md §4 part 3). Everything a probe mutates
+// is this participant's own — the outer files, curBatch, the replay operator,
+// spaceUsed and the stats sink (ctx is the participant's context, so a
+// worker's EXPLAIN counters merge through MergeWorkerContext exactly as a
+// private build's would). Only `inner` is shared, as a COPY of the slice whose
+// entries alias the leader's frozen files: nextBatch clears a slot when the
+// participant has consumed that batch, and that must not be visible to anyone
+// else.
+func newParticipantBatchState(ctx *Context, plan *optimizer.Join, d *sharedBatchDesc) *hashBatchState {
+	bs := &hashBatchState{
+		nbatch:         d.nbatch,
+		origNBatch:     d.origNBatch,
+		nbatchOutstart: d.nbatch,
+		bucketBits:     d.bucketBits,
+		spaceAllowed:   d.spaceAllowed,
+		growEnabled:    false, // DESIGN.md §4 part 2: frozen after prebuild
+		buildIsLeft:    d.buildIsLeft,
+		ctx:            ctx,
+		nbuckets:       d.nbuckets,
+		stats:          ctx.hashJoinStat(plan),
+		innerShared:    true,
+	}
+	bs.inner = append([]*joinBatchFile(nil), d.inner...)
+	bs.outer = make([]*joinBatchFile, d.nbatch)
+	return bs
 }
 
 // batchReplayOp streams a saved outer batch file back as the probe input.

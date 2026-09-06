@@ -244,10 +244,11 @@ type joinOp struct {
 	// M0127-P3.2 (06 §2.2-2.4): hybrid-hash batching state. nil means the
 	// build was projected to fit work_mem, or batching was declined for this
 	// join shape (joinBatchEligible) — either way every path below behaves as
-	// it did before batching existed. noBatch is the caller-side decline used
-	// by the shared (parallel) build, whose published table workers read
-	// without ever seeing this state. batchKeySlot re-presents a row reloaded
-	// from an inner batch file to the build key expression.
+	// it did before batching existed. noBatch is a caller-side decline that
+	// nothing sets today (E-09a publishes a spilling shared build; each
+	// participant then holds a PRIVATE state over the shared inner files —
+	// join_batch.go newParticipantBatchState). batchKeySlot re-presents a row
+	// reloaded from an inner batch file to the build key expression.
 	batches      *hashBatchState
 	noBatch      bool
 	batchKeySlot *MaterializedSlot
@@ -516,7 +517,7 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	// than shipping it in sharedHashBuild) makes that agreement structural.
 	o.initExecKeys()
 	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
-		o.applySharedBuild(sb)
+		o.applySharedBuild(ctx, sb)
 		return o.openProbeSide(ctx, sb.probeIsLeft)
 	}
 	probeIsLeft, err := o.buildLazyHashTable(ctx)

@@ -395,12 +395,15 @@ func TestDenseBuildSharedOwnership(t *testing.T) {
 	stmt3 := newStmt()
 	defer stmt3.Release()
 	leader := cut1BuildOp(stmt3)
-	sb := leader.captureSharedBuild(true)
+	sb, err := leader.captureSharedBuild(true)
+	if err != nil {
+		t.Fatalf("captureSharedBuild: %v", err)
+	}
 	if sb.buildBytes != leader.buildBytes {
 		t.Fatalf("captureSharedBuild did not publish the stratum")
 	}
 	worker := &joinOp{}
-	worker.applySharedBuild(sb)
+	worker.applySharedBuild(&Context{Mctx: stmt3}, sb)
 	if worker.buildBytes != leader.buildBytes || !worker.buildBytesShared {
 		t.Fatalf("applySharedBuild did not adopt the stratum as shared")
 	}

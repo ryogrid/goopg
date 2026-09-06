@@ -449,55 +449,54 @@ func TestBatchSkipRulesRespectFillAndReassignment(t *testing.T) {
 	}
 }
 
-// M0127-P3.4 — a shared (parallel) build that would spill declines the SHARE,
-// not the SPILL.
-//
-// captureSharedBuild freezes the in-memory table alone; the batch files and the
-// per-batch replay stay on the leader's operator, which no worker ever runs. So
-// publishing a spilled build would hand every worker one partition of the table
-// and lose the rest — silently. P3.2 sidestepped it by disabling the spill,
-// which left the shared build the one hash build in the executor with no
-// work_mem bound at all.
-//
-// Three arms, because the decision is made twice: from the estimate before the
-// build (so the common case wastes no pass) and from the measurement after it
-// (because goopg's estimates are absent often enough that only growth bounds
-// anything).
-func TestSharedHashBuildDeclinesWhenItWouldSpill(t *testing.T) {
+// E-09a — a shared (parallel) build that spills is PUBLISHED, not declined.
+// The full behaviour (participants, invariants, cancellation) is pinned in
+// parallel_hash_spill_test.go; this keeps the three historical arms of the
+// M0127-P3.4 decline test as a witness that each now publishes.
+func TestSharedHashBuildPublishesWhenItSpills(t *testing.T) {
 	const lw, rw = 2, 2
 	buildRows := intKeyRows(4000, 700, "b")
 	probeRows := intKeyRows(2000, 700, "p")
 
-	prebuild := func(t *testing.T, estRight int, workMem int64) map[*optimizer.Join]*sharedHashBuild {
+	prebuild := func(t *testing.T, estRight int, workMem int64) *sharedHashBuild {
 		t.Helper()
 		plan := batchJoinPlan(lw, len(probeRows), estRight)
 		tree := newJoinOp(plan,
 			&rowsOp{rows: probeRows, schema: batchSchema("l", lw)},
 			&rowsOp{rows: buildRows, schema: batchSchema("r", rw)})
 		t.Cleanup(func() { _ = tree.Close() })
-		out, err := prebuildSharedHashJoins(&Context{WorkMem: workMem}, plan,
-			func() (Operator, error) { return tree, nil })
+		ctx := &Context{WorkMem: workMem, tempFiles: newTempFileRegistry()}
+		t.Cleanup(func() { releaseSharedHashBuilds(ctx); ctx.ReleaseSpillFiles() })
+		out, err := prebuildSharedHashJoins(ctx, plan, func() (Operator, error) { return tree, nil })
 		if err != nil {
 			t.Fatalf("prebuild: %v", err)
 		}
-		return out
+		if n := len(out); n != 1 {
+			t.Fatalf("published %d builds, want 1", n)
+		}
+		ctx.SharedHashBuilds = out
+		return out[plan]
 	}
 
-	t.Run("a build that fits is shared", func(t *testing.T) {
-		if n := len(prebuild(t, len(buildRows), 0)); n != 1 {
-			t.Fatalf("published %d builds, want 1 — the sharing regressed", n)
+	t.Run("a build that fits is shared with a one-batch descriptor", func(t *testing.T) {
+		sb := prebuild(t, len(buildRows), unboundedWorkMem)
+		if sb.batches != nil && sb.batches.nbatch != 1 {
+			t.Fatalf("nbatch=%d for a build that fits", sb.batches.nbatch)
 		}
 	})
-	t.Run("an estimate that says spill declines before building", func(t *testing.T) {
-		if n := len(prebuild(t, 200000, 512<<10)); n != 0 {
-			t.Fatalf("published %d builds for a build sized at 200k rows under 512 KiB", n)
+	t.Run("an estimate that says spill publishes a multi-batch descriptor", func(t *testing.T) {
+		sb := prebuild(t, 200000, 512<<10)
+		if sb.batches == nil || sb.batches.nbatch <= 1 {
+			t.Fatalf("a build sized at 200k rows under 512 KiB published without batches")
 		}
 	})
-	t.Run("an estimate that lied declines after building", func(t *testing.T) {
-		// The estimate says a hundred rows; four thousand arrive. Growth is
-		// what discovers it, so only the post-build check can catch this one.
-		if n := len(prebuild(t, 100, 256<<10)); n != 0 {
-			t.Fatalf("published %d builds after the build outgrew work_mem", n)
+	t.Run("an estimate that lied publishes after growth", func(t *testing.T) {
+		// The estimate says a hundred rows; four thousand arrive. Growth
+		// fires during the prebuild and the descriptor carries the final
+		// geometry.
+		sb := prebuild(t, 100, 256<<10)
+		if sb.batches == nil || sb.batches.nbatch <= sb.batches.origNBatch {
+			t.Fatalf("growth did not fire during the prebuild (descriptor %+v)", sb.batches)
 		}
 	})
 }

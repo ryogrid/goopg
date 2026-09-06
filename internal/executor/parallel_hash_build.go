@@ -66,12 +66,22 @@ type sharedHashBuild struct {
 	antiBuildHasNull  bool
 	leftWidth         int
 	rightWidth        int
+
+	// E-09a (docs/design/executor-e09a-shared-spilling-build/DESIGN.md §4):
+	// the batch descriptor of a build that batched. The maps above hold
+	// BATCH 0 ONLY; every other batch is an inner file the leader wrote and
+	// froze, and each participant reloads it privately (join_batch.go,
+	// newParticipantBatchState). nil when the build had no batch state —
+	// then, as before, the maps are the whole table.
+	batches *sharedBatchDesc
 }
 
 // captureSharedBuild snapshots the build-phase results of a joinOp whose
-// buildLazyHashTable has just completed.
-func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
-	return &sharedHashBuild{
+// buildLazyHashTable has just completed, freezing its batch files for
+// shared, read-only reloading. The joinOp's own batch state is detached in
+// the process: the descriptor owns the files from here on.
+func (o *joinOp) captureSharedBuild(probeIsLeft bool) (*sharedHashBuild, error) {
+	sb := &sharedHashBuild{
 		hash:              o.lazyHash,
 		hashCTID:          o.lazyHashCTID,
 		intHash:           o.lazyIntHash,
@@ -84,6 +94,36 @@ func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
 		rightWidth:        o.lazyRW,
 		buildBytes:        o.buildBytes,
 	}
+	if o.batches != nil {
+		d, err := o.batches.freezeForSharing()
+		if err != nil {
+			return nil, err
+		}
+		sb.batches = d
+		o.batches = nil
+	}
+	return sb, nil
+}
+
+// release retires the files a spilling build published. The maps and the
+// arena are garbage-collected / statement-reclaimed as before.
+func (sb *sharedHashBuild) release(ctx *Context) {
+	if sb != nil && sb.batches != nil {
+		sb.batches.release(ctx)
+	}
+}
+
+// releaseSharedHashBuilds retracts a Gather's publication from ctx and
+// unlinks the batch files it carried. Called from Gather / GatherMerge Close
+// AFTER the fan-out has joined — no participant may still be reading.
+func releaseSharedHashBuilds(ctx *Context) {
+	if ctx == nil {
+		return
+	}
+	for _, sb := range ctx.SharedHashBuilds {
+		sb.release(ctx)
+	}
+	ctx.SharedHashBuilds = nil
 }
 
 // applySharedBuild adopts a published table instead of building one.
@@ -91,7 +131,14 @@ func (o *joinOp) captureSharedBuild(probeIsLeft bool) *sharedHashBuild {
 // Every field buildLazyHashTable would have set must be set here too. Leaving
 // one out does not fail loudly — it produces a join that runs and returns the
 // wrong rows.
-func (o *joinOp) applySharedBuild(sb *sharedHashBuild) {
+//
+// ctx is THIS participant's context (a worker's, or the leader's own): the
+// private batch state installed for a spilling build writes its outer files
+// and its EXPLAIN counters through it.
+func (o *joinOp) applySharedBuild(ctx *Context, sb *sharedHashBuild) {
+	// A re-Open that skipped Close must not keep the previous run's private
+	// batch state (its outer files, its curBatch).
+	o.releaseBatches()
 	o.lazyHash = sb.hash
 	o.lazyHashCTID = sb.hashCTID
 	o.lazyIntHash = sb.intHash
@@ -106,6 +153,13 @@ func (o *joinOp) applySharedBuild(sb *sharedHashBuild) {
 	// and the statement-end Release own its lifetime.
 	o.buildBytes = sb.buildBytes
 	o.buildBytesShared = true
+	// E-09a §4 part 3: a spilling build gets a private batch state whose
+	// inner files are the shared, frozen ones. Without it the probe loop
+	// would never route a probe row (routeProbeRow is guarded on
+	// `bs != nil`) and the join would silently return batch 0's partition.
+	if sb.batches != nil {
+		o.batches = newParticipantBatchState(ctx, o.plan, sb.batches)
+	}
 }
 
 // lookupSharedHashBuild returns the published table for a plan node, or nil
@@ -170,63 +224,42 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 	}
 
 	out := make(map[*optimizer.Join]*sharedHashBuild, len(joins))
+	fail := func(err error) (map[*optimizer.Join]*sharedHashBuild, error) {
+		for _, sb := range out {
+			sb.release(ctx)
+		}
+		return nil, err
+	}
 	for _, j := range joins {
 		j.ctx = ctx
-		// M0127-P3.4: decline the SHARE, not the SPILL.
+		// E-09a: a spilling build is published, batch files and all.
 		//
-		// A spilling build cannot be published: captureSharedBuild freezes the
-		// in-memory table alone, while the batch files and the per-batch probe
-		// replay live on THIS operator, which no worker ever runs — a worker
-		// handed that table would probe batch 0 and silently return the rows
-		// of one partition. P3.2 avoided the problem by forcing `noBatch`,
-		// which made the shared build the one hash build in the executor with
-		// no work_mem bound at all. The honest form is the opposite: keep the
-		// bound, give up the sharing, and let each worker build privately (and
-		// batch privately) — 06 §6, which defers real parallel hash outright.
-		//
-		// The check runs twice on purpose. Before the build, the ESTIMATE is
-		// consulted so the common case costs no wasted pass; after it, the
-		// MEASUREMENT is, because goopg's estimates are absent often enough
-		// that growth-on-overrun is the only bound worth relying on.
-		if sharedBuildWouldSpill(ctx, j) {
-			continue
-		}
+		// M0127-P3.4 used to decline the SHARE here whenever the geometry (or,
+		// after the build, the measurement) said nbatch > 1, because the
+		// batch files and the per-batch probe replay lived on THIS operator,
+		// which no worker runs — a worker handed the batch-0 maps alone would
+		// have returned one partition's rows. On TPC-H Q9 that meant all
+		// five participants built the 1.5 M-row `orders` table privately
+		// (DESIGN.md §1). captureSharedBuild now freezes the batch state into
+		// a descriptor and every participant derives a private state from it
+		// (join_batch.go), so the work_mem bound and the sharing coexist.
+		// Growth is still free to fire during THIS build; it is frozen the
+		// moment the descriptor is cut.
 		probeIsLeft, err := j.buildLazyHashTable(ctx)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
-		if j.batches != nil && j.batches.nbatch > 1 {
-			// The estimate said it fit and it did not. Throw the leader's
-			// build away — files included — rather than publish a partition.
+		sb, err := j.captureSharedBuild(probeIsLeft)
+		if err != nil {
 			j.releaseBatches()
-			j.lazyHash, j.lazyIntHash, j.lazyHashCTID = nil, nil, nil
-			continue
+			return fail(err)
 		}
-		out[j.plan] = j.captureSharedBuild(probeIsLeft)
+		out[j.plan] = sb
 	}
 	if len(out) == 0 {
 		return nil, nil
 	}
 	return out, nil
-}
-
-// sharedBuildWouldSpill asks the shared geometry — the same one presizeLazyHash
-// and the batch state use — whether this build is projected to need more than
-// one batch.
-//
-// It answers false for a join that cannot batch anyway (a composite key, the
-// FOR-UPDATE ctid build): declining to share such a build would not bound
-// anything, it would just replace one unbounded build with one per worker.
-func sharedBuildWouldSpill(ctx *Context, j *joinOp) bool {
-	j.initExecKeys()
-	if !j.joinBatchEligible() {
-		return false
-	}
-	buildNode, buildWidth := j.plan.Right, len(j.right.Schema())
-	if !probeSideIsLeft(j.plan) {
-		buildNode, buildWidth = j.plan.Left, len(j.left.Schema())
-	}
-	return j.buildGeometry(ctx, buildNode, buildWidth, !probeSideIsLeft(j.plan)).NBatch > 1
 }
 
 // collectShareableJoins finds the hash joins in a tree whose build side can be
