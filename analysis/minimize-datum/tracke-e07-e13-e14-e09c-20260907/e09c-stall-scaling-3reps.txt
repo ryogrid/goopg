@@ -1,0 +1,41 @@
+== rep 1
+E09CSTALL node=0x11562f36c7e0 type=0 producers=2 buildWallMs=172.4 producerBlockedMs=53.6 consumerBlockedMs=6.3 batches=1171 recvWaits=8
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=2 wall=431.9ms rows=[330000]
+E09CSTALL node=0x11562f36c900 type=0 producers=4 buildWallMs=140.6 producerBlockedMs=342.3 consumerBlockedMs=0.0 batches=1171 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=4 wall=336.2ms rows=[330000]
+E09CSTALL node=0x11562f36c900 type=0 producers=8 buildWallMs=174.1 producerBlockedMs=1062.0 consumerBlockedMs=0.0 batches=1169 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=8 wall=425.1ms rows=[330000]
+E09CSTALL node=0x11562f2bc7e0 type=0 producers=2 buildWallMs=149.0 producerBlockedMs=63.3 consumerBlockedMs=3.7 batches=1171 recvWaits=21
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=2 wall=319.6ms rows=[573000]
+E09CSTALL node=0x11562f2bc6c0 type=0 producers=4 buildWallMs=134.8 producerBlockedMs=325.6 consumerBlockedMs=0.0 batches=1170 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=4 wall=311.5ms rows=[573000]
+E09CSTALL node=0x11562f2bc900 type=0 producers=8 buildWallMs=129.4 producerBlockedMs=796.9 consumerBlockedMs=0.0 batches=1169 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=8 wall=307.7ms rows=[573000]
+== rep 2
+E09CSTALL node=0x34ce26be4900 type=0 producers=2 buildWallMs=265.8 producerBlockedMs=130.5 consumerBlockedMs=54.6 batches=1171 recvWaits=110
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=2 wall=527.2ms rows=[330000]
+E09CSTALL node=0x34ce26d08900 type=0 producers=4 buildWallMs=165.4 producerBlockedMs=346.1 consumerBlockedMs=0.6 batches=1170 recvWaits=1
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=4 wall=382.9ms rows=[330000]
+E09CSTALL node=0x34ce26be4a20 type=0 producers=8 buildWallMs=140.0 producerBlockedMs=858.9 consumerBlockedMs=0.0 batches=1169 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=8 wall=346.9ms rows=[330000]
+E09CSTALL node=0x34ce26be4b40 type=0 producers=2 buildWallMs=149.8 producerBlockedMs=62.1 consumerBlockedMs=6.7 batches=1171 recvWaits=24
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=2 wall=326.8ms rows=[573000]
+E09CSTALL node=0x34ce26d08900 type=0 producers=4 buildWallMs=121.8 producerBlockedMs=273.6 consumerBlockedMs=0.0 batches=1171 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=4 wall=321.1ms rows=[573000]
+E09CSTALL node=0x34ce26d085a0 type=0 producers=8 buildWallMs=169.8 producerBlockedMs=1056.5 consumerBlockedMs=0.0 batches=1168 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=8 wall=439.2ms rows=[573000]
+== rep 3
+E09CSTALL node=0x215e8e0b06c0 type=0 producers=2 buildWallMs=151.3 producerBlockedMs=91.7 consumerBlockedMs=2.5 batches=1171 recvWaits=14
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=2 wall=353.9ms rows=[330000]
+E09CSTALL node=0x215e8e0647e0 type=0 producers=4 buildWallMs=138.5 producerBlockedMs=319.7 consumerBlockedMs=0.0 batches=1170 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=4 wall=330.6ms rows=[330000]
+E09CSTALL node=0x215e8e0b06c0 type=0 producers=8 buildWallMs=198.9 producerBlockedMs=1284.0 consumerBlockedMs=0.0 batches=1168 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=false/workers=8 wall=389.6ms rows=[330000]
+E09CSTALL node=0x215e8e0b05a0 type=0 producers=2 buildWallMs=191.2 producerBlockedMs=68.2 consumerBlockedMs=5.8 batches=1171 recvWaits=12
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=2 wall=413.9ms rows=[573000]
+E09CSTALL node=0x215e8e0b06c0 type=0 producers=4 buildWallMs=177.6 producerBlockedMs=397.4 consumerBlockedMs=0.0 batches=1171 recvWaits=0
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=4 wall=412.8ms rows=[573000]
+E09CSTALL node=0x215e8e0b07e0 type=0 producers=8 buildWallMs=217.3 producerBlockedMs=1166.2 consumerBlockedMs=16.1 batches=1169 recvWaits=3
+    zz_e09c_scaling_test.go:98: E09C skew=true/workers=8 wall=434.9ms rows=[573000]
+
+[exited with code 0]

@@ -1937,7 +1937,54 @@ per arm; values never counts for projection/join-adjacent changes).*
 - [!] **E-03 EX3-07 presorted-prefix implementation — file ONLY if
   planner C-14 activates.** E-15 already published the contract, so this
   item is purely conditional. Do not absorb silently.
-- [~] **E-14 EX1 build-half redesign (no second truncation).** Design
+- [!] **E-14 EX1 build-half redesign (no second truncation) — Cut A
+  DROPPED on measurement 2026-09-07, Cut B quantified and still blocked.**
+  **Cut A (Semi/Anti zero-width retention): DROPPED, 0.0065%.** §8b had
+  already found P4-01 narrows a Semi/Anti build to `keys ∪ residual`,
+  leaving only the zero-width case; §3.3 sized that at
+  `24 + w*48 + payload` → `24` B/row and named Q4/Q16/Q18/Q20/Q21/Q22 as
+  the shapes that would pay. The whole-suite census says they do not. In
+  22 TPC-H queries there are **4 Semi/Anti hash builds** against 43 INNER
+  ones; **every one already has `buildWidth = 1`** (P4-01 narrowed them to
+  the single key column, exactly as §8b predicted); total Semi/Anti rows
+  retained across the suite is **14,747 = 14,747 Datum cells = 0.7 MB**,
+  against **10,954 MB** of retained hash-build cells suite-wide — **one
+  part in 15,000**. The named shapes do not pay because they are not
+  Semi/Anti hash builds in goopg's plans at all: Q4/Q18/Q20/Q21/Q22 emit
+  INNER hash joins here. A width change on retained rows is the "0 rows on
+  seven TPC-H queries" class, and this one buys 0.0065%. Unlike C-13a's
+  deferral the evidence cannot improve with a different corpus — only with
+  a planner that emits Semi/Anti hash joins where it currently does not.
+  **Cut B (INNER keep-set + the above-walk): the prize is now MEASURED,
+  and it is where all the mass is.** Suite-wide retained hash-build
+  storage is **16,803,718 rows / 228,212,960 Datum cells / 10,954 MB**, of
+  which **99.99% is INNER**; the largest single site is **6,001,255 rows ×
+  16 columns = 4,609 MB**, where each dead column is 288 MB. The design's
+  own §2 measurement (6 of 15 retained columns are dead key columns on the
+  Q9 fixture) puts the corpus prize at order **4 GB** of retained Datum
+  cells. That number did not exist before this session — the item said only
+  "deferred for want of an alloc + batch-geometry arm".
+  **Cut B still not taken, for two specific reasons rather than
+  circumstance:** (1) its GEOMETRY half is forfeited at HEAD by
+  construction — §5.1: `hashsize.EntryBytes` prices the build node's
+  SCHEMA width, so after narrowing the planner still sizes batches for
+  storage the executor no longer holds, and the `nbatch` 4→2 that E-12 and
+  D-05 are sequenced behind is unreachable until `EntryBytes` prices the
+  RETAINED width (the D-05 follow-up the design already files). Landing
+  Cut B first buys the memory and none of the geometry. (2) Its acceptance
+  is values + batch geometry on SPILLING shapes, and three peer agents held
+  the host at load 18–30 for the entire session — the one arm that can
+  accept it is the one arm that could not be taken, and a row-count gate
+  cannot substitute (21 of 21 byte-identical while Q2 went 43× slower).
+  Mechanism/resume unchanged (§8: generalise
+  `scan_deform.go:deformJoinBounds` from a prefix bound to a SET, threaded
+  through every `buildNode`/`buildRec` arm with both build paths agreeing;
+  seam is `ensureLazyVirtual`'s `virtualCol` map plus a NULL-pad source).
+  Census instrument, aggregator, arm logs and write-up:
+  `analysis/minimize-datum/tracke-e07-e13-e14-e09c-20260907/`; ledger
+  `take3-E-14-cutA-dropped-cutB-quantified` (supersedes
+  `take3-E-14-cutA-cutB-deferred`).
+  Prior record, unchanged below. Design
   landed 2026-09-06 (`docs/design/executor-e14-build-half/DESIGN.md`)
   with the residual MEASURED, plus the structural prerequisite both cuts
   needed; the narrowing itself is deferred with a resume point
@@ -2165,10 +2212,41 @@ per arm; values never counts for projection/join-adjacent changes).*
   show the reload peak once rather than five times; plus the standard
   combined gate (TPC-H 24/24 values, plans byte-identical, `make
   plan-gate`, `scripts/tpch-spotcheck.sh`, TPC-DS SF0.5 sweep).
-- [ ] **E-09c Cooperative-stall measurement under skew + worker-count
-  scaling on Q9-class shapes** — the original E-09 text, now third.
-  *design: take3 13 §7; gate: scaling + skew A/B; Datum-safety tests;
-  serial arm.*
+- [x] **E-09c Cooperative-stall measurement under skew + worker-count
+  scaling on Q9-class shapes.** DELIVERED 2026-09-07 — this is a
+  measurement item, so the measurement is the deliverable. Apparatus is
+  in-process (host contention hits every arm equally, which matters: three
+  peer agents held the machine at load 18–30 all session): a temporary
+  instrument charges blocked time to whichever half of the cooperative
+  parallel hash build actually waited — `producerBlockedNs` (parked on
+  `ch <- batch`) vs `consumerBlockedNs` + `recvWaits` (the single inserting
+  leader parked on `<-ch` with the channel empty). Fixture: a 300,000-row
+  build under a 330,000-row probe through `parallelBuildLazyHashTable` at
+  `work_mem` = 1 GiB (single batch — the coop path declines at `NBatch>1`),
+  2/4/8 producers × uniform and 10:1-skewed build keys, 3 reps
+  (6 observations per producer count). Raw log + write-up:
+  `analysis/minimize-datum/tracke-e07-e13-e14-e09c-20260907/`.
+  | producers | build wall (median) | producer blocked TOTAL | per producer | consumer blocked | recvWaits |
+  |---|---|---|---|---|---|
+  | 2 | 161.9 ms | 65.8 ms | 32.9 ms (20% of build) | 6.0 ms | 8–110 |
+  | 4 | **139.6 ms** | 334 ms | 83.5 ms (**60%**) | 0.0 ms | 0–1 |
+  | 8 | 172.0 ms | 1059 ms | 132 ms (**77%**) | 0.0 ms | 0 |
+  **Result: the cooperative build is consumer-bound and saturates at about
+  four producers.** 2→4 buys 14% of build wall; 4→8 LOSES 23% and costs
+  3.2× more producer stall. At ≥4 producers the consumer never waits at all
+  (`recvWaits` = 0 in 10 of 12 observations, 1 in another) — the single
+  goroutine that evaluates keys and inserts is the whole critical path.
+  **Skew does not move the bottleneck**, because the bottleneck is already
+  entirely at the consumer: the 10:1 skewed arms have the same signature
+  (149.0 / 134.8 / 129.4 ms at 2/4/8 in rep 1). That is the skew half's
+  answer, stated as the negative result it is.
+  **Routed, NOT made (a tuning default, and this item's mandate is to
+  measure):** `parallelBuildLazyHashTable` sets
+  `maxProducers = ctx.MaxParallelWorkers` with a floor of 2 and NO ceiling,
+  so a cluster configured for 8 workers spawns 8 producers and 8
+  `mmgr.Acquire` arenas for a build that stops improving at 4. Ledger
+  `take3-E-09c-consumer-bound`.
+  *design: take3 13 §7; gate (discharged): scaling + skew A/B.*
 - [x] **E-10 EX5-03 Gather/GatherMerge ordering + exchange.** Correctness
   half DONE 2026-09-06; performance half **out of scope, verified**.
   *design: `docs/design/executor-e10-gather-merge-claimset/DESIGN.md`
@@ -2247,10 +2325,48 @@ per arm; values never counts for projection/join-adjacent changes).*
   not actually moved yet, so sizing to the narrowed width is premature.
   *design: `docs/design/executor-ex3-02-dense-build/DESIGN.md`; gate:
   poison tests + gate suite + values + pin.*
-- [ ] **E-13 EX1-04 Cut 2 (owned-row tightening on Project-declined
-  paths).** Only if a later alloc arm shows a residual. Cut 1 (poison
-  tests on the Project shape) landed.
-  *gate: alloc arm residual demonstrated first.*
+- [-] **E-13 EX1-04 Cut 2 (owned-row tightening on Project-declined
+  paths) — DROPPED 2026-09-07 on its own gate.** The gate was "only if a
+  later alloc arm shows a residual". The arm was taken and there is no
+  residual worth collecting: a whole-suite census of every hash-build
+  retention site (schema width, threaded EX1-01 deform bound, retained row
+  count; instrument + aggregator + arm logs in
+  `analysis/minimize-datum/tracke-e07-e13-e14-e09c-20260907/`) measures
+  **509,824 dead Datum cells out of 228,212,960 = 24.5 MB out of
+  10,954 MB = 0.22%** of retained hash-build storage, from four small
+  sites in 22 queries (150,000 and 29,824 rows at `w8/b7`; 10,000 rows at
+  `w7/b6`; 10,000 rows at `w7/b5`). All five
+  MULTI-MILLION-row retained build sides — including the 6,001,255-row ×
+  16-column one, the suite's largest at 4,609 MB — carry
+  `bound = deformBoundFull`: P4-01's `narrowBuildInput` Project already
+  narrowed the input to what is read, and a second truncation has nothing
+  to take. The residual sites are all small (150,000 / 29,824 / 10,000 /
+  10,000 rows) and each gives back one or two columns.
+  Second, independent reason not to resume it as written, and the stronger
+  one: **E-13's mechanism IS the one the EX1-04 review declined** — copying
+  `row[0:bound]` at a retention site makes a row shorter than the
+  coordinate space its readers address (E-14 DESIGN §1: `slotRow`/`Row`/
+  `Materialize` flatten at `len(schema)`; `nullRow(o.lazyRW)` binds a
+  FULL-width pad into the same slot field as a retained row; the tail of a
+  truncated row is ABSENT, not NULL). The safe replacement is already
+  specified as E-14 §3.1's keep-SET gather with the coordinates moved at
+  the `virtualCol` seam, of which a prefix is a special case — so any
+  residual that ever does appear belongs to **Cut B**, not to a separate
+  item carrying a declined mechanism.
+  The SORT half was captured separately (a third arm added a retained-row
+  counter to `sortOp`) and does not rescue the item either: the per-site
+  dead fractions there ARE large (`childWidth=14/childBound=8`,
+  `childWidth=11/childBound=4`) but the row counts are not — the largest
+  sort input in the suite is **20,451 rows × 8 columns = 7.9 MB** of Datum
+  cells TOTAL, then 11,415×4, 1,302×2, 418×28 and everything else under 40
+  rows. Three orders of magnitude below the hash side, and in the same
+  place C-13a independently put it (median sort input 145 rows, 0 of 100
+  sorts spilled). The sites with the biggest proportional residual are the
+  ones with almost no rows. Re-open only with E-14 Cut B's seam, never
+  with the prefix truncation.
+  Ledger `take3-E-13-dropped`. Cut 1 (poison tests on the Project shape)
+  remains landed.
+  *gate (discharged): alloc arm residual demonstrated first — it was not.*
 - [!] **E-16 EX3-03 step-2 resume — BLOCKED on spill-cost calibration.**
   Session `work_mem` threading is implemented and unit-green but moves
   Q7/Q9 plans to slower merge shapes at bench `work_mem` (model prices
