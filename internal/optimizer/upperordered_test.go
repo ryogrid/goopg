@@ -52,7 +52,7 @@ func TestCreateOrderedPathsEmitsTheRewritesSortWithCostSortsPrice(t *testing.T) 
 	keys := upperOrderedKeys()
 	u := newUpperRels()
 
-	got := createOrderedPaths(u, in, keys, 77, cp, 0)
+	got := createOrderedPaths(u, in, keys, 77, cp, 0, -1)
 
 	srt, ok := got.(*Sort)
 	if !ok {
@@ -84,7 +84,7 @@ func TestCreateOrderedPathsEmitsTheRewritesSortWithCostSortsPrice(t *testing.T) 
 	if !set {
 		t.Fatalf("the Sort carries no PlanCost: createPlanNode's stamp was bypassed")
 	}
-	want := costSortRun(cp, 1000, relNCols(rel), relAvgVarBytes(rel))
+	want := costSortRun(cp, 1000, relNCols(rel), relAvgVarBytes(rel), -1)
 	if !approx(pc.StartupCost, 100+want.Startup) || !approx(pc.TotalCost, 100+want.Total) {
 		t.Fatalf("Sort cost = (%v, %v), want input total 100 + costSortRun (%v, %v)",
 			pc.StartupCost, pc.TotalCost, 100+want.Startup, 100+want.Total)
@@ -117,10 +117,10 @@ func TestCreateOrderedPathsChargesTheSpillOfALargeSort(t *testing.T) {
 	rows := sortRowsFillingBudget(cp.workMem, probe.NCols, 3.0)
 	in := upperOrderedInput(rows)
 
-	srt := createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0).(*Sort)
+	srt := createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0, -1).(*Sort)
 	pc, _ := srt.PlanCostInfo()
 
-	unsized := costSortRun(cp, rows, 0, 0)
+	unsized := costSortRun(cp, rows, 0, 0, -1)
 	if !(pc.StartupCost-100 > unsized.Startup) {
 		t.Fatalf("spilling sort priced at %v, not above the NCols=0 in-memory price %v: the disk arm is suppressed",
 			pc.StartupCost-100, unsized.Startup)
@@ -143,7 +143,7 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	unordered := fetchUpperRel(newUpperRels(), UpperOrdered, 0, 0)
 	sizeUpperRelFromNode(unordered, upperOrderedInput(10))
 	lines := captureTrace(t, func() {
-		addOrderedPaths(unordered, newPrebuiltPath(unordered, upperOrderedInput(10)), keys, cp)
+		addOrderedPaths(unordered, newPrebuiltPath(unordered, upperOrderedInput(10)), keys, cp, -1)
 	})
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedSortProducer+" relids=- ") || !strings.Contains(lines[0], "verdict=accepted") {
 		t.Fatalf("unordered input: trace = %q, want one accepted %s line at relids=-", lines, upperOrderedSortProducer)
@@ -157,7 +157,7 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	seed := newPrebuiltPath(ordered, upperOrderedInput(10))
 	seed.Pathkeys = append(append([]PathKey{}, keys...), PathKey{Expr: &ColumnRef{Index: 2, Name: "w"}, SortAsc: true})
 	lines = captureTrace(t, func() {
-		addOrderedPaths(ordered, seed, keys, cp)
+		addOrderedPaths(ordered, seed, keys, cp, -1)
 	})
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedInputProducer+" relids=- ") {
 		t.Fatalf("ordered input: trace = %q, want one %s line", lines, upperOrderedInputProducer)
@@ -175,7 +175,7 @@ func TestCreateOrderedPathsHonoursEnableSortAsAPreference(t *testing.T) {
 	cp.enableSort = false
 	u := newUpperRels()
 	lines := captureTrace(t, func() {
-		if _, ok := createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, cp, 0).(*Sort); !ok {
+		if _, ok := createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, cp, 0, -1).(*Sort); !ok {
 			t.Errorf("enable_sort=off must still emit the Sort")
 		}
 	})
@@ -190,10 +190,10 @@ func TestCreateOrderedPathsHonoursEnableSortAsAPreference(t *testing.T) {
 func TestCreateOrderedPathsNeverDropsTheSort(t *testing.T) {
 	cp := defaultCostParams()
 	in := upperOrderedInput(10)
-	if got := createOrderedPaths(newUpperRels(), in, nil, 0, cp, 0); got != Node(in) {
+	if got := createOrderedPaths(newUpperRels(), in, nil, 0, cp, 0, -1); got != Node(in) {
 		t.Fatalf("no keys: got %T, want the input back", got)
 	}
-	if _, ok := createOrderedPaths(nil, in, upperOrderedKeys(), 0, cp, 0).(*Sort); !ok {
+	if _, ok := createOrderedPaths(nil, in, upperOrderedKeys(), 0, cp, 0, -1).(*Sort); !ok {
 		t.Fatalf("no registry: the Sort was dropped")
 	}
 }
@@ -211,7 +211,7 @@ func TestC10cPreservedSideQualMovesThroughOrderedSortArm(t *testing.T) {
 	resid := &Filter{Child: j, Predicate: srcGt(0, "id", 1, 7)}
 	keys := []SortKey{{Expr: &ColumnRef{Index: 1, Name: "name", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1}}}
 
-	srt, ok := createOrderedPaths(newUpperRels(), resid, keys, 0, defaultCostParams(), 0).(*Sort)
+	srt, ok := createOrderedPaths(newUpperRels(), resid, keys, 0, defaultCostParams(), 0, -1).(*Sort)
 	if !ok {
 		t.Fatalf("the ORDERED rel did not emit a *Sort")
 	}

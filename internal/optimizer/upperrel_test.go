@@ -156,8 +156,8 @@ func TestSizeUpperRelFromNodePopulatesEveryCostInput(t *testing.T) {
 	// arm where the unsized one cannot.
 	cp := defaultCostParams()
 	rows := sortRowsFillingBudget(cp.workMem, rel.NCols, 4.0)
-	unsized := costSortRun(cp, rows, 0, 0)
-	sized := costSortRun(cp, rows, relNCols(rel), relAvgVarBytes(rel))
+	unsized := costSortRun(cp, rows, 0, 0, -1)
+	sized := costSortRun(cp, rows, relNCols(rel), relAvgVarBytes(rel), -1)
 	if !(sized.Startup > unsized.Startup) {
 		t.Fatalf("a sized upper rel must be charged its spill: sized %v, unsized %v", sized.Startup, unsized.Startup)
 	}

@@ -1503,6 +1503,13 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// the SRF arm each replace `ctx` with one over their own output schema,
 	// and the ORDER BY sites below would read a zero off any of those.
 	orderTupleFraction := ctx.tupleFraction
+	// C-13b: `cost_tuplesort`'s `limit_tuples` as the ORDERED upper rel will
+	// see it, read HERE beside the fraction for the same reason — resolved
+	// against the FROM-clause context, before the aggregate/window/SRF
+	// stages replace it. -1 unless the statement carries a constant
+	// LIMIT (+ optional constant OFFSET) without WITH TIES; the SRF
+	// post-sort arm always passes -1 (`have_postponed_srfs`, planner.c:1856).
+	orderLimitTuples := limitTuplesForOrderedSort(s, ctx)
 	if rewritten, ok, err := rewriteMinMaxAggregates(s, ctx, cat); err != nil {
 		return nil, err
 	} else if ok {
@@ -1750,7 +1757,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// function-local `upper` rather than `ctx.upper`: the aggregate and
 		// window stages hand back contexts of their own, and the rel must
 		// be this scope's whichever context is current.
-		node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction)
+		node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples)
 		if srt, ok := node.(*Sort); ok {
 			// B-01c Slice 1: keys-only construction stamp (above not yet
 			// built); the above-aware re-stamp happens before return.
@@ -1804,9 +1811,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// C-12: the SRF post-sort arm goes through the same ORDERED
 			// rel producer as the normal arm. PG hands this arm no LIMIT
 			// bound (`have_postponed_srfs ? -1.0 : limit_tuples`,
-			// planner.c:1856) — a C-13b concern; the fraction itself is
-			// the statement's, captured above.
-			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction)
+			// planner.c:1856) — the Sort sits above the ProjectSet
+			// expansion, so the pre-expansion count is not a bound on its
+			// input; the fraction itself is the statement's, captured above.
+			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, -1)
 			if srt, ok := node.(*Sort); ok {
 				// B-01c Slice 1: SRF post-sort arm — same keys-only stamp as the normal arm.
 				orderSort = srt

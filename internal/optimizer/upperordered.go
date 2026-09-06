@@ -54,7 +54,11 @@ const (
 // `fetchUpperRel` (`consider_startup`) and the final `getCheapestFractionalPath`
 // selection, exactly where PG reads it; with one path in the list both are
 // identity today.
-func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp costParams, tupleFraction float64) Node {
+//
+// `limitTuples` is `cost_tuplesort`'s `limit_tuples` (C-13b): the absolute
+// count+offset bound, or <= 0 for none (the SRF post-sort arm always passes
+// -1 — `have_postponed_srfs`, planner.c:1856).
+func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp costParams, tupleFraction float64, limitTuples float64) Node {
 	if input == nil || len(keys) == 0 {
 		return input
 	}
@@ -85,7 +89,7 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// so the two agree by construction, not by coincidence.
 	seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 
-	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp)
+	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp, limitTuples)
 	setCheapest(ordered)
 
 	best := getCheapestFractionalPath(ordered, tupleFraction)
@@ -105,10 +109,10 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 // it. One input, so exactly one of the two producers fires per call. Split
 // from `createOrderedPaths` so the input arm — unreachable from a Node today —
 // is driven by a test with a hand-ordered seed rather than left untested.
-func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, cp costParams) {
+func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, cp costParams, limitTuples float64) {
 	if pathkeysContainedIn(input.Pathkeys, sortPathkeys) {
 		addPath(ordered, input, upperOrderedInputProducer)
 		return
 	}
-	addPath(ordered, sortPathFor(input, sortPathkeys, cp), upperOrderedSortProducer)
+	addPath(ordered, sortPathForBounded(input, sortPathkeys, cp, limitTuples), upperOrderedSortProducer)
 }

@@ -259,19 +259,24 @@ func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
 // for five TPC-H queries where the flag-OFF planner hash-joins, at 2-4x the
 // runtime (09 §3.7).
 //
-// Only two of upstream's three branches can be reached from here. PG's middle
-// branch is the bounded heap-sort for a useful LIMIT (`limit_tuples`); goopg
-// has no LIMIT-aware sort path, so `output_tuples == tuples` and
-// `output_bytes == input_bytes` identically, which makes that branch's guard
-// (`tuples > 2 * output_tuples || input_bytes > sort_mem_bytes`) false whenever
-// the disk branch did not already fire. Ledgered with the LIMIT push-down.
+// C-13b (P4-04 cost arm) added the third branch: `limitTuples` is
+// `cost_tuplesort`'s `limit_tuples` (costsize.c:1898) — the absolute
+// count+offset bound the ORDERED upper rel carries, or <= 0 for "no useful
+// LIMIT". With a useful bound the middle branch prices the bounded heap-sort
+// (`N log2 K` comparisons); without one `output == tuples` and the branch's
+// guard is false whenever the disk branch did not fire, which is exactly the
+// two-branch shape this function had before. The merge-join side always
+// passes -1 (no LIMIT context above an input sort).
 //
 // `ncols` sizes one row through `hashsize.EntryBytes` — the SAME byte model
 // `spillPages` uses for the hash rival's batch files, so the two spill charges
 // this function was added to reconcile are denominated in one currency. Zero
 // means "column count unknown" and suppresses the disk arm, matching
 // `hashJoinCost`'s reading of a zero `innerCols` as "assume no spill": an
-// unknown width must not invent an I/O charge.
+// unknown width must not invent an I/O charge. The bounded arm is likewise
+// unreachable at ncols == 0 (output_bytes is unknowable there): a bound sort
+// of unknown width keeps the quicksort price, never a heap price derived
+// from a guessed width.
 //
 // `avgVarBytes` is the row's variable-width payload, the second argument of
 // that same `EntryBytes` — the one `hashJoinCost` has passed as the real
@@ -281,7 +286,7 @@ func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
 // which under-charges the spill in the direction §3.2 already errs. Callers
 // hand in the rel's `AvgVarBytes`; zero stays a legitimate value ("no
 // ANALYZE, or every column fixed-width") and changes nothing.
-func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float64) Cost {
+func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float64, limitTuples float64) Cost {
 	// "We want to be sure the cost of a sort is never estimated as zero, even
 	// if passed-in tuple count is zero. Besides, mustn't do log(0)..."
 	// (costsize.c) — PG clamps rather than returning zero, and a zero here
@@ -292,12 +297,24 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 		tuples = 2.0
 	}
 	comparisonCost := 2.0 * cp.cpuOperatorCost
+	// `output_tuples` (costsize.c:1918): the bound, when useful.
+	output := tuples
+	if limitTuples > 0 && limitTuples < tuples {
+		output = limitTuples
+	}
 	startup := comparisonCost * tuples * math.Log2(tuples)
 
 	if ncols > 0 && cp.workMem > 0 {
 		inputBytes := tuples * hashsize.EntryBytes(ncols, avgVarBytes)
+		outputBytes := output * hashsize.EntryBytes(ncols, avgVarBytes)
 		sortMemBytes := float64(cp.workMem)
-		if inputBytes > sortMemBytes {
+		if outputBytes > sortMemBytes {
+			// Disk-based sort of all the tuples (costsize.c:1936): the
+			// page/run math still sizes the INPUT — every tuple is
+			// written and re-read — while the branch itself is chosen on
+			// the OUTPUT size, so a bounded sort that fits in memory
+			// never spills. Without a bound output == tuples and this
+			// is the old condition exactly.
 			npages := math.Ceil(inputBytes / blockSizeBytes)
 			nruns := inputBytes / sortMemBytes
 			mergeorder := tuplesortMergeOrder(cp.workMem)
@@ -308,6 +325,15 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 			npageaccesses := 2.0 * npages * logRuns
 			// "Assume 3/4ths of accesses are sequential, 1/4th are not."
 			startup += npageaccesses * (cp.seqPageCost*0.75 + cp.randomPageCost*0.25)
+		} else if tuples > 2*output || inputBytes > sortMemBytes {
+			// Bounded heap-sort keeping just K tuples in memory
+			// (costsize.c:1960): N log2 K comparisons with the slightly
+			// higher constant PG tweaks for curve continuity at the
+			// crossover (tuples == 2*output prices identically to the
+			// quicksort arm below). Without a bound output == tuples
+			// and neither disjunct can fire past the disk branch, so
+			// the merge side's number is unchanged.
+			startup = comparisonCost * tuples * math.Log2(2.0*output)
 		}
 	}
 

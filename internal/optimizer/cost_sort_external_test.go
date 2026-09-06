@@ -35,7 +35,7 @@ func TestCostSortRun_InMemorySortChargesNoDiskIO(t *testing.T) {
 	const ncols = 8
 	rows := sortRowsFillingBudget(cp.workMem, ncols, 0.5)
 
-	got := costSortRun(cp, rows, ncols, 0)
+	got := costSortRun(cp, rows, ncols, 0, -1)
 	wantStartup := 2 * cp.cpuOperatorCost * rows * math.Log2(rows)
 	if !approx(got.Startup, wantStartup) {
 		t.Fatalf("startup = %v, want the pure comparison cost %v (a fitting sort must not be charged I/O)", got.Startup, wantStartup)
@@ -57,7 +57,7 @@ func TestCostSortRun_SpillingSortChargesTheMergePasses(t *testing.T) {
 	const ncols = 16
 	rows := sortRowsFillingBudget(cp.workMem, ncols, 2.0)
 
-	got := costSortRun(cp, rows, ncols, 0)
+	got := costSortRun(cp, rows, ncols, 0, -1)
 
 	inputBytes := rows * hashsize.EntryBytes(ncols, 0)
 	npages := math.Ceil(inputBytes / blockSizeBytes)
@@ -93,13 +93,13 @@ func TestCostSortRun_MultiPassMergeCostsMoreThanOnePass(t *testing.T) {
 	}
 	// 50 runs against a fan-in of 6 needs ceil(log(50)/log(6)) = 3 passes.
 	rows := math.Ceil(50 * float64(small.workMem) / rowBytes)
-	multi := costSortRun(small, rows, ncols, 0)
+	multi := costSortRun(small, rows, ncols, 0, -1)
 
 	// The same input under a budget wide enough that one pass suffices. The
 	// comparison term is identical, so any difference is the pass count.
 	wide := small
 	wide.workMem = int64(math.Ceil(rows*rowBytes)) / 2 // exactly 2 runs
-	single := costSortRun(wide, rows, ncols, 0)
+	single := costSortRun(wide, rows, ncols, 0, -1)
 
 	if !(multi.Startup > single.Startup) {
 		t.Fatalf("a 3-pass merge (%v) must cost more than a 1-pass merge (%v) of the same rows", multi.Startup, single.Startup)
@@ -121,12 +121,12 @@ func TestCostSortRun_UnknownWidthChargesNoDiskIO(t *testing.T) {
 	cp := defaultCostParams()
 	rows := sortRowsFillingBudget(cp.workMem, 16, 4.0)
 
-	unknown := costSortRun(cp, rows, 0, 0)
+	unknown := costSortRun(cp, rows, 0, 0, -1)
 	wantStartup := 2 * cp.cpuOperatorCost * rows * math.Log2(rows)
 	if !approx(unknown.Startup, wantStartup) {
 		t.Fatalf("startup = %v, want the pure comparison cost %v", unknown.Startup, wantStartup)
 	}
-	if known := costSortRun(cp, rows, 16, 0); !(known.Startup > unknown.Startup) {
+	if known := costSortRun(cp, rows, 16, 0, -1); !(known.Startup > unknown.Startup) {
 		t.Fatalf("a KNOWN width over the same budget must reach the disk arm: %v vs %v", known.Startup, unknown.Startup)
 	}
 }
@@ -137,9 +137,9 @@ func TestCostSortRun_UnknownWidthChargesNoDiskIO(t *testing.T) {
 // must not make the operator above it free.
 func TestCostSortRun_TinyInputIsClampedNotFree(t *testing.T) {
 	cp := defaultCostParams()
-	two := costSortRun(cp, 2, 4, 0)
+	two := costSortRun(cp, 2, 4, 0, -1)
 	for _, rows := range []float64{0, 0.5, 1} {
-		got := costSortRun(cp, rows, 4, 0)
+		got := costSortRun(cp, rows, 4, 0, -1)
 		if got != two {
 			t.Fatalf("costSortRun(%v) = %+v, want the 2-tuple floor %+v", rows, got, two)
 		}
@@ -164,7 +164,7 @@ func TestSpillingSortAndSpillingHashAreChargedInOneCurrency(t *testing.T) {
 	const ncols = 16
 	rows := sortRowsFillingBudget(cp.workMem, ncols, 8.0)
 
-	sortIO := costSortRun(cp, rows, ncols, 0).Startup - 2*cp.cpuOperatorCost*rows*math.Log2(rows)
+	sortIO := costSortRun(cp, rows, ncols, 0, -1).Startup - 2*cp.cpuOperatorCost*rows*math.Log2(rows)
 	// The hash rival's charge for spilling the SAME rows: `hashJoinCost`'s
 	// batch term, inner side (written once at build, read back at probe).
 	hashIO := cp.seqPageCost * 2 * spillPages(rows, ncols, 0)
@@ -190,13 +190,13 @@ func TestCostSortRun_VarBytesWidenTheSpillCharge(t *testing.T) {
 	const varBytes = 200.0
 
 	fitting := sortRowsFillingBudget(cp.workMem, ncols, 0.25)
-	if a, b := costSortRun(cp, fitting, ncols, 0), costSortRun(cp, fitting, ncols, varBytes); a != b {
+	if a, b := costSortRun(cp, fitting, ncols, 0, -1), costSortRun(cp, fitting, ncols, varBytes, -1); a != b {
 		t.Fatalf("a sort that fits at both payloads must price identically: %+v vs %+v", a, b)
 	}
 
 	rows := sortRowsFillingBudget(cp.workMem, ncols, 2.0)
-	lean := costSortRun(cp, rows, ncols, 0)
-	wide := costSortRun(cp, rows, ncols, varBytes)
+	lean := costSortRun(cp, rows, ncols, 0, -1)
+	wide := costSortRun(cp, rows, ncols, varBytes, -1)
 	if !(wide.Startup > lean.Startup) {
 		t.Fatalf("payload bytes must raise a spilling sort's I/O: lean %v, wide %v", lean.Startup, wide.Startup)
 	}

@@ -426,11 +426,24 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, jt parser.
 // `PathSort` (path.go) finally has a producer. Ledgered as a representational
 // divergence.
 //
-// The Sort is deliberately NOT offered to `addPath`: it belongs to this merge
-// candidate, not to the input relation's pathlist, and adding it there would let
-// a sort generated for one pair change another pair's `CheapestTotal`. PG's
-// equivalent paths are likewise private to the MergePath.
+// The Sort is deliberately NOT offered to `addPath` by the merge caller: it
+// belongs to this merge candidate, not to the input relation's pathlist, and
+// adding it there would let a sort generated for one pair change another pair's
+// `CheapestTotal`. PG's equivalent paths are likewise private to the MergePath.
+// The ORDERED upper rel (`addOrderedPaths`, upperordered.go, C-12) is the one
+// caller that DOES offer the result to `addPath` — there the Sort is the rel's
+// own candidate, which is `create_ordered_paths`' use of `create_sort_path`.
 func sortPathFor(sub *Path, keys []PathKey, cp costParams) *Path {
+	return sortPathForBounded(sub, keys, cp, -1)
+}
+
+// sortPathForBounded is `sortPathFor` with `cost_tuplesort`'s `limit_tuples`
+// (C-13b): the absolute count+offset bound, or <= 0 for none. The merge-join
+// side has no LIMIT context above an input sort and always passes -1, so its
+// number is unchanged; the ORDERED upper rel (`addOrderedPaths`) passes the
+// statement's bound. Split rather than re-signed so the merge callers — and
+// the concurrent work above them — do not move.
+func sortPathForBounded(sub *Path, keys []PathKey, cp costParams, limitTuples float64) *Path {
 	// `cost_sort` charges the comparison work as STARTUP — nothing emerges
 	// until the sort is complete — on top of the subpath's total, and the
 	// per-row emit at run.
@@ -443,7 +456,7 @@ func sortPathFor(sub *Path, keys []PathKey, cp costParams) *Path {
 	// exact: a Sort projects nothing, so its output rows are its input's. The
 	// rel's `AvgVarBytes` rides along for the same reason (spill-calibration
 	// Cut 1): it is the statistic `hashJoinCost` sizes the rival's build with.
-	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel), relAvgVarBytes(sub.Rel))
+	s := costSortRun(cp, sub.Rows, relNCols(sub.Rel), relAvgVarBytes(sub.Rel), limitTuples)
 	return &Path{
 		Kind: PathSort,
 		// B-17a: `cost_sort`'s own flag on top of the input's count
