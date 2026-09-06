@@ -155,6 +155,16 @@ func sizeUpperRelFromNode(rel *RelOptInfo, child Node) {
 // `RelOptInfo.AvgVarBytes` a base rel takes from ANALYZE's per-column
 // `AvgWidth`, for a node that has no ANALYZE to read — the same
 // `get_typavgwidth` fallbacks `typeWidth` already uses for the width column.
+//
+// DESIGN §4.3 / §9 Probe P1 disposition (C-12 review): P1 asked for a
+// measurement choosing between 0 and search-root propagation. It has no
+// witness in either corpus (0/100 TPC-DS sorts spill; the TPC-H Q18 spill is
+// a row-estimate artefact, not a width artefact), so this third answer — a
+// schema-derived heuristic — stands as PROVISIONAL until ANALYZE-backed
+// widths exist above the seam. For the dominant var-width types (`text`,
+// unconstrained `numeric`) it inherits `typeWidth`'s wild guess and likely
+// under-states true widths: the under-charge direction, strictly better than
+// the NCols=0 suppression it replaces.
 func nodeAvgVarBytes(cols []SchemaColumn) float64 {
 	var sum float64
 	for _, c := range cols {

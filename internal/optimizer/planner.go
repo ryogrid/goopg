@@ -454,11 +454,13 @@ type resolveContext struct {
 
 	// upper is this planning scope's upper-relation registry (upperrel.go,
 	// take3 C-11): `PlannerInfo.upper_rels`, constructed once per
-	// `planSelectWithSettings` and carried across that function's context
-	// rebuilds (the SRF arm swaps `ctx` for one over the ProjectSet schema)
-	// so the ORDERED / FINAL rels a later cut reaches for are the same
-	// objects whichever context is current. Nil in every context that is
-	// not a planning scope of its own.
+	// `planSelectWithSettings` and stamped on the contexts that function
+	// builds directly. The stage builders (`buildAggregateStage`,
+	// `buildWindowStage`) return contexts of their own without it, which
+	// is why the ORDERED producer (C-12) reads the function-local registry
+	// rather than this field: the field is the carrier for readers that
+	// only hold a context. Nil in every context that is not a planning
+	// scope of its own.
 	upper *upperRels
 
 	// rtScope is the statement's rtableScope (A-01(ii) cut 2): the
@@ -1495,6 +1497,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// declines (ok=false) and we fall through to the ordinary Aggregate path —
 	// the escape hatch: a declined rewrite is always correct, a wrong wrap is
 	// not.
+	// C-12: `root->tuple_fraction` as the ORDERED upper rel will see it,
+	// read HERE because `ctx` is still the FROM-clause context the join
+	// search stamped it on — `buildAggregateStage`, `buildWindowStage` and
+	// the SRF arm each replace `ctx` with one over their own output schema,
+	// and the ORDER BY sites below would read a zero off any of those.
+	orderTupleFraction := ctx.tupleFraction
 	if rewritten, ok, err := rewriteMinMaxAggregates(s, ctx, cat); err != nil {
 		return nil, err
 	} else if ok {
@@ -1733,11 +1741,23 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			}
 			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
-		// B-01c Slice 1: keys-only construction stamp (above not yet built);
-		// the above-aware re-stamp happens before return. Assert-only.
-		orderSort = &Sort{pos: s.Pos(), Child: node, Keys: keys}
-		stampSortInputTarget(orderSort, nil)
-		node = orderSort
+		// C-12 (P4-03): the ORDER BY Sort is the ORDERED upper rel's path
+		// now — `create_ordered_paths` over the finished child, priced by
+		// `cost_sort` through `addPath` (upperordered.go) — and no longer
+		// the bare `&Sort{…}` rewrite. Same node at the same position with
+		// the same keys; what changed is that the node carries a real
+		// cost, external-merge arm included. The registry is the
+		// function-local `upper` rather than `ctx.upper`: the aggregate and
+		// window stages hand back contexts of their own, and the rel must
+		// be this scope's whichever context is current.
+		node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction)
+		if srt, ok := node.(*Sort); ok {
+			// B-01c Slice 1: keys-only construction stamp (above not yet
+			// built); the above-aware re-stamp happens before return.
+			// Assert-only. `createSortPlan` does not stamp (DESIGN §5.2).
+			orderSort = srt
+			stampSortInputTarget(orderSort, nil)
+		}
 	}
 	// Wire the ProjectSet into the plan (after pre-sort if applicable).
 	// Then build post-sort keys on the PS output if needed.
@@ -1781,10 +1801,17 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				}
 				keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 			}
-			// B-01c Slice 1: SRF post-sort arm — same keys-only stamp as the normal arm.
-			orderSort = &Sort{pos: s.Pos(), Child: node, Keys: keys}
-			stampSortInputTarget(orderSort, nil)
-			node = orderSort
+			// C-12: the SRF post-sort arm goes through the same ORDERED
+			// rel producer as the normal arm. PG hands this arm no LIMIT
+			// bound (`have_postponed_srfs ? -1.0 : limit_tuples`,
+			// planner.c:1856) — a C-13b concern; the fraction itself is
+			// the statement's, captured above.
+			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction)
+			if srt, ok := node.(*Sort); ok {
+				// B-01c Slice 1: SRF post-sort arm — same keys-only stamp as the normal arm.
+				orderSort = srt
+				stampSortInputTarget(orderSort, nil)
+			}
 		}
 	}
 	if s.Limit != nil || s.Offset != nil || s.WithTies {
