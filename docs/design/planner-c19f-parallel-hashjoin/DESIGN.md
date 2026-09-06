@@ -539,3 +539,143 @@ catch a plan-shape regression" (21/21 result sets byte-identical while Q2 went
    `tmp/d05p4-buildcost.patch`), with the mode on, and check whether Q5 / Q9 /
    Q10 still collapse. If they do, the remaining gap is C-19g, not the price of
    a hash join.
+
+---
+
+## 10. MEASURED — TPC-H SF=1, `off` vs `top` (2026-09-06)
+
+The bench cluster was held under `flock /tmp/goopg-65433.lock` for this section.
+Regime: `GOGC=100 GOMEMLIMIT=12GiB GOOPG_ANALYZE_SEED=20260905 PGSHAPED=1
+COLLAPSE=1`, one binary held across every arm (`NO_BUILD=1`), fresh capped
+server per arm via `scripts/tpch-acceptance-arm.sh` (server age 0 s at sweep
+start), values via `tpch-runner -digest`. `top` and `all` produce byte-identical
+plans on TPC-H, so `all` is not reported separately.
+
+### 10.1 First: a methodological correction that changes what the numbers mean
+
+`estimate-audit -plan-only`'s plan capture does **not** apply `MaybeAddGather`.
+Its `off` capture shows ZERO Gathers on all 22 queries, while a real `psql`
+`EXPLAIN` against the same server on the same statement shows
+
+```
+Finalize Aggregate → Gather (Workers Planned: 4) → Partial Aggregate
+  → Hash Join → Parallel Seq Scan on lineitem
+```
+
+So a plan census taken with that tool compares "searched plan" against "searched
+plan + path Gather" and systematically overstates C-19f's effect: it cannot see
+the Gathers HEAD already places. Every plan quoted below is therefore a
+`tpch-runner -explain` capture through the server, which does include the
+post-pass. This is worth recording as a property of the tool, not of this slice.
+
+### 10.2 Values: 7/7 MATCH, in all six arms
+
+Seven queries move (Q3, Q5, Q7, Q8, Q9, Q10, Q21). Across three `off` and three
+`top` repetitions, every one of the 42 query results is byte-identical on
+`colsig`, `ordered` and `unordered` digests. In particular the EXPLAIN rendering
+`Filter: (l_suppkey <> l_suppkey)` on Q21's `top` plan is an ALIAS-rendering
+artefact of the Gather's schema — the predicate itself is unchanged, which is
+what the identical digest proves and what a row-count gate could not have.
+
+### 10.3 Timing — three repetitions, medians
+
+| query | off (s, 3 runs) | top (s, 3 runs) | median off | median top | Δ |
+|---|---|---|---|---|---|
+| Q3  | 4.83 4.49 5.29 | 4.69 4.80 7.67 | 4.83 | 4.80 | −0.6 % |
+| Q5  | 4.34 6.13 5.29 | 4.09 4.15 6.17 | 5.29 | 4.15 | −21.6 % |
+| Q7  | 6.07 7.25 5.87 | 5.13 5.76 7.80 | 6.07 | 5.76 | −5.1 % |
+| Q8  | 0.67 0.85 0.57 | 0.56 0.65 0.85 | 0.67 | 0.65 | −3.0 % |
+| **Q9**  | 6.86 7.26 9.89 | 13.74 14.06 15.18 | 7.26 | 14.06 | **+93.7 %** |
+| **Q10** | 2.72 2.75 4.11 | 3.57 3.30 3.93 | 2.75 | 3.57 | **+29.8 %** |
+| **Q21** | 14.25 17.33 17.97 | 7.29 8.42 9.80 | 17.33 | 8.42 | **−51.4 %** |
+| sum | 39.74 46.06 48.99 | 39.07 41.14 51.40 | 46.06 | 41.14 | −10.7 % |
+
+Read with the ±17 % per-query noise band: Q3/Q7/Q8 are noise, and Q5's arms
+overlap run-for-run so its −21.6 % median is not a claim. **Three movements are
+real**, and two of them disagree in sign — every `top` run of Q9 is slower than
+every `off` run, every `top` run of Q21 is faster than every `off` run. The
+suite total's spread (off 39.7–49.0, top 39.1–51.4) swallows its own −10.7 %, so
+there is no suite-level result to report.
+
+### 10.4 Q21, −51 %: the win only a path model can reach
+
+HEAD's Q21 gets **no Gather at all**. Its root is a `Nested Loop Anti Join` and
+`terminatesPartial` (parallel.go) stops there, so `findPartialSubtree` never
+reaches the `Hash Join` beneath it. C-19f gives that inner join its own partial
+path, `generateUsefulGatherPaths` prices a Gather over it, and `add_path` takes
+it:
+
+```
+Nested Loop Anti Join → Nested Loop Semi Join
+  → Gather (Workers Planned: 4)
+      → Hash Join (l_orderkey = o_orderkey)
+          → Hash Join (l_suppkey = s_suppkey)
+              → Parallel Seq Scan on lineitem l1
+```
+
+This is precisely the class the post-pass is structurally unable to serve: a
+Gather *inside* a subtree whose root terminates partial-ness. 17.33 s → 8.42 s.
+
+### 10.5 Q9, +94 %: a JOIN-ORDER change, not a boundary-placement one
+
+The prediction in §7.2 — that a path Gather would foreclose `splitAggregate` —
+is **not** what happened on these queries. HEAD's Q9 already carries
+`HashAggregate → Gather → Hash Join …` with no Partial Aggregate, so the
+boundary does not move. What moves is the join order and, with it, which
+relation is scanned in parallel:
+
+```
+off : Gather → HJ(l_suppkey=s_suppkey) → HJ(l_orderkey=o_orderkey)
+              → HJ(l_suppkey,l_partkey = ps_*) → HJ(l_partkey=p_partkey)
+              → Parallel Seq Scan on LINEITEM (6,001,255 rows)
+
+top : Gather → HJ(l_suppkey=s_suppkey) → HJ(l_suppkey,l_partkey = ps_*)
+              → HJ(o_orderkey=l_orderkey)
+              → Parallel Seq Scan on ORDERS (1,500,000 rows)
+```
+
+The partial path on `orders` is cheaper in the model than the partial path on
+`lineitem` (fewer pages, fewer rows), so it wins `add_partial_path` at its own
+rel and the search then builds the tree that can use it. At runtime the choice
+is wrong by a factor of two. The mechanism is doing exactly what it was built to
+do — the *cost* of a partial join is what needs work, and this is a concrete,
+reproducible case to work it against. It is NOT the same defect as C-19d's:
+there, no Gather could ever win; here one wins and picks the wrong side.
+
+### 10.6 Q10, +30 %: an unexplained cost-neutral regression
+
+Q10's executed shape is **identical** in both arms — same joins, same order,
+same `Parallel Seq Scan on lineitem`. The only differences in the plan text are
+the Gather's own cost and its reported width (2112 → 1338, the path model's
+narrower target). A 3-second query with an unchanged shape moving +30 % is above
+the noise band but not explained by anything in this plan, and it is recorded
+here as an open question rather than attributed.
+
+### 10.7 The decision
+
+**The default stays `off`, and `top`/`all` remain measurement instruments.** A
+change that halves one query and doubles another, with no suite-level signal
+outside the noise, is not a default flip — flipping it here would be choosing
+which query to be judged on. What C-19f has established is the thing C-19d could
+not: a Gather is now **choosable by cost above a join**, it reaches a shape the
+post-pass structurally cannot (Q21), and its remaining cost is a *calibration*
+problem with a named, reproducible witness (Q9's partial-outer choice) rather
+than a structural one.
+
+Artefacts: `arm-{off,top}[-r2,-r3].txt`, `realplans-{off,top}.txt`,
+`{off,top,all}.plans.txt` under this session's scratchpad; the digests are in
+the arm files.
+
+### 10.8 Still not measured
+
+- The other 15 TPC-H queries were not timed: their searched plans are
+  byte-identical between `off` and `top`, so there is nothing to time. A full
+  24-query `-digest` arm was not run because the DEFAULT does not move and the
+  slice is provably inert at it (`TestPartialHashJoinIsInertUnderTheDefaultMode`).
+- `make plan-gate` / `pg-plan-parity-diff.py` were not run for `top`: both
+  consume `estimate-audit -plan-only` output, whose blind spot §10.1 documents.
+  They must be re-read against a post-pass-inclusive capture before they can
+  judge a parallel plan at all.
+- **The D-05 re-run** (§9 item 4) — re-derive the build-cost correction at a 1×
+  multiplier with the mode on. Q9's join-order finding above is the first thing
+  it will have to explain.

@@ -1018,10 +1018,62 @@ rule).*
   costs still choose leader-side sorting, record it as a permitted
   divergence with the committed measurement (take3 09 §4.4 case 1).
   *design: take3 08 §8; gate: take3 09 §5 P5 (timing both shapes).*
-- [ ] **C-19f P5-06 parallel hash join as a `parallel_aware` hash path,
-  priced.** Executor consumer check required (a fixture where the path
-  wins must execute as parallel hash).
-  *design: take3 08 §8; gate: take3 09 §5 P5 (PP).*
+- [x] **C-19f P5-06 parallel hash join as a `parallel_aware` hash path,
+  priced.** LANDED `e8456fe82` (mechanism) + `125c4c016` (consumer check
+  and two latent fixes); design
+  `docs/design/planner-c19f-parallel-hashjoin/DESIGN.md` (`1e3d0a8b6`).
+  `addPartialHashJoinPath` = `try_partial_hashjoin_path` (joinpath.c:1299)
+  + `hash_inner_and_outer`'s parallel block (:2418): a PARTIAL OUTER over
+  a COMPLETE, parallel-safe, unparameterised INNER, filed into the
+  joinrel's `PartialPathlist`. goopg has NEITHER of PG's two parallel
+  hash joins — its executor pre-builds the table ONCE in the leader and
+  shares it by pointer, so the shape is upstream's `parallel_hash=false`
+  variant with the N-fold build replication removed, and
+  `parallel_hash=true` (a partial inner) is refused for want of an
+  executor. **The build is charged ONCE, undivided** — after E-09a/E-09b
+  that describes the executor, and it is also what
+  `initial_cost_hashjoin` charges (costsize.c:4187); the reverted
+  `tmp/d05p4` 5× participant multiplier is refuted, with a pin. Partial
+  paths now PROPAGATE upward, which is what C-19d §5 named as the thing
+  it lacked. Rides `GOOPG_GATHER_PATHS` (no new flag: the only reader of
+  a partial path is behind that mode, so the slice is provably inert at
+  the default) and **the default STAYS `off`**.
+  Gate result: `go build`, `go vet`, full `go test` on
+  `./internal/optimizer/ ./internal/executor/` green; units scope of
+  `ralph-precommit-test.sh` exit 0; `-race` green on the new shape.
+  Executor consumer check (the item's own requirement) landed in
+  `internal/executor/parallel_hash_path_consumer_test.go` and FOUND TWO
+  LATENT BUGS in C-19d's landed `createPlan` arms, both unreachable
+  until a partial JOIN path made a Gather winnable at a search root:
+  `createGatherPlan` built `&Gather{…}` as a struct literal instead of
+  `NewGather`, so the node reported ZERO output columns; and
+  `*Gather`/`*GatherMerge` did not embed `searchedTree`, so
+  `markSearchedTree` panicked. Witness: `Gather (Workers Planned 2) →
+  Hash Join (Build Time 0.202 ms, ONE) → Parallel Seq Scan on pq_fact`
+  with `Seq Scan on pq_dim … rows=0.00 loops=0` in every worker.
+  **MEASURED, TPC-H SF=1, `off` vs `top`, 3 repetitions, pinned regime**
+  (DESIGN §10): 7 queries move, 7/7 values MATCH in all 42 runs; three
+  movements are real and two disagree in sign — **Q21 17.33→8.42 s
+  (−51 %)**, a Gather *inside* a Nested Loop Anti Join's subtree that
+  `terminatesPartial` structurally prevents the post-pass from ever
+  reaching; **Q9 7.26→14.06 s (+94 %)**, a JOIN-ORDER change (the
+  parallel scan moves from `lineitem` 6 M to `orders` 1.5 M because the
+  cheaper partial path wins `add_partial_path` at its own rel) — NOT the
+  §7.2 `splitAggregate` foreclosure that was predicted; **Q10 +30 %**
+  with a byte-identical executed shape, unexplained and recorded as
+  open. Suite total −10.7 % is inside its own run-to-run spread. So the
+  default does not move: C-19f establishes that a Gather is now
+  CHOOSABLE BY COST above a join (which C-19d could not obtain at a base
+  rel at any size) and reduces the remaining gap to a CALIBRATION
+  problem with a named reproducible witness. Method note recorded:
+  `estimate-audit -plan-only` does NOT apply `MaybeAddGather`, so its
+  captures show zero Gathers on HEAD and any plan census taken with it
+  overstates a parallel change.
+  *design: take3 08 §8 + docs/design/planner-c19f-parallel-hashjoin/
+  DESIGN.md; gate: take3 09 §5 P5 (PP). Open: `make plan-gate` /
+  `pg-plan-parity-diff.py` cannot judge a parallel plan until they read
+  a post-pass-inclusive capture (§10.8); the D-05 re-run at 1× is next
+  and must explain Q9.*
 - [ ] **C-19g P5-07 partial aggregation as paths**
   (`create_partial_grouping_paths`), replacing `splitAggregate`. Depends
   on C-15.
@@ -1553,16 +1605,51 @@ per arm; values never counts for projection/join-adjacent changes).*
 - [!] **E-03 EX3-07 presorted-prefix implementation — file ONLY if
   planner C-14 activates.** E-15 already published the contract, so this
   item is purely conditional. Do not absorb silently.
-- [ ] **E-14 EX1 build-half redesign (no second truncation).** The EX1-04
-  unblock review proved owned-payload shortening unsafe without
-  projection; P4-01 landed projection at the build-side `Project` site,
-  so the hash-build half is unblocked-but-needs-redesign (Cut 0 alloc arm
-  measured: Q9 20.14→13.88 s, alloc 9.43→8.52 GB, values identical).
-  Implement narrowed-width retention on the Project shape without a
-  second `[0,bound)` truncation. Unblocks D-05 geometry pricing.
-  *design: `docs/design/executor-ex1-04-owned/DESIGN.md` + unblock review
-  (`134324df6`); gate: poison tests on the Project shape (Cut 1 pattern)
-  + alloc arm + values + pin.*
+- [~] **E-14 EX1 build-half redesign (no second truncation).** Design
+  landed 2026-09-06 (`docs/design/executor-e14-build-half/DESIGN.md`)
+  with the residual MEASURED, plus the structural prerequisite both cuts
+  needed; the narrowing itself is deferred with a resume point
+  (`take3-E-14-cutA-cutB-deferred`). Note the Cut-0 figures in the old
+  wording (Q9 20.14→13.88 s, alloc 9.43→8.52 GB) were the **P4-01
+  planner flip**, measurement-only — that prize is already banked, not
+  pending.
+  - **Residual, measured** on the in-package Q9 fixture (`obpQ9Catalog`):
+    after P4-01, **6 of the 15 retained build columns across Q9's five
+    hash joins are this join's own key columns that nothing above reads**
+    — and every one of them sits at position 0 of its build side, so the
+    declined `[0,bound)` prefix could not express the opportunity even if
+    it were safe. The replacement shape is a keep-SET gather with the
+    reader coordinates moved at ONE seam (the join's `virtualCol` map,
+    with a NULL-pad source for dropped positions), so the composed width
+    never shrinks and no reader above the join changes.
+  - **Prerequisite LANDED, inert:** keyed INNER spill frames
+    (`[4B hash][1B tag][key][payload]`). `loadInnerBatch` used to recover
+    a reloaded row's key by re-evaluating the build key EXPRESSION
+    against it (`buildKeyOfRow`), which pinned the key columns live in
+    every retained row and defeated both cuts — and could not be dodged
+    by declining when batching, since `presizeLazyHash` installs a batch
+    state for every eligible join, `nbatch==1` included. Now the
+    canonical key travels in the frame (PG's `ExecHashJoinSaveTuple`
+    rationale, "so that we needn't recompute it"); `buildKeyOfRow` and
+    `batchKeySlot` are retired and nothing derives a build key from a
+    RETAINED row. Behaviour-identical, one expression evaluation per
+    reloaded row cheaper.
+  - **Deferred:** Cut A (Semi/Anti zero-width retention) and Cut B
+    (INNER keep-set + the `deformJoinBounds` walk generalised to a set
+    and threaded through `executor.go`). Both are width changes on
+    retained rows whose acceptance is values + batch geometry on
+    SPILLING shapes, and the TPC-H cluster was held all session. Cut A's
+    remaining value also shrank on inspection: P4-01 already narrows
+    Semi/Anti builds to `keys ∪ residual`, so only dropping the keys
+    themselves is left. Also reported, not fixed: `hashsize.EntryBytes`
+    prices the SCHEMA width, so post-narrowing the planner
+    over-estimates (conservative, but forfeits part of the geometry win)
+    — belongs with D-05.
+  *design: `docs/design/executor-e14-build-half/DESIGN.md` (§4a blocker,
+  §8 Cut B, §8b Cut A resume point); superseded input:
+  `docs/design/executor-ex1-04-owned/DESIGN.md` + unblock review
+  (`134324df6`); gate for the deferred cuts: poison tests on the Project
+  shape (Cut 1 pattern) + alloc arm + values + pin.*
 - [-] **E-04 EX4-01 `filterOp` compilation (serial).** DROPPED 2026-09-05
   after implementing and measuring three variants (compile-per-Open;
   slab cached across re-Opens; adapter-root declined). Values 24/24 MATCH
@@ -1763,6 +1850,14 @@ per arm; values never counts for projection/join-adjacent changes).*
   unit headers 2.002→0.005, TPC-H 24/24 + PP 22/22 + TPC-DS PASS=95;
   only Cut 3 remains here.) Queued behind landed Cut 0/1/2; arena sizing is
   batching geometry over the redesigned build rows.
+  **Blocker status 2026-09-06:** E-14 settled the SHAPE the redesigned
+  build rows take (`docs/design/executor-e14-build-half/DESIGN.md` §3.1:
+  a keep-set gather, composed width unchanged, one coordinate move at the
+  join's `virtualCol` map) and landed the prerequisite that made it
+  reachable (keyed inner spill frames), but deferred the width change
+  itself pending the bench gate. So Cut 3 can now size arenas against a
+  DECIDED shape rather than an open question — but the retained width has
+  not actually moved yet, so sizing to the narrowed width is premature.
   *design: `docs/design/executor-ex3-02-dense-build/DESIGN.md`; gate:
   poison tests + gate suite + values + pin.*
 - [ ] **E-13 EX1-04 Cut 2 (owned-row tightening on Project-declined
