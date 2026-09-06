@@ -1976,9 +1976,31 @@ per arm; values never counts for projection/join-adjacent changes).*
   spotcheck PASS; review APPROVE-WITH-NITS (8 findings fixed).
   Artifacts: `docs/design/executor-e06-agg-compile/DESIGN.md`,
   `6aab9dc`.
-- [ ] **E-07 EX5-01 slab parity for `Gather` — RE-SCOPED 2026-09-05, two
-  of its three justifications are now void.** Premise re-verified: workers
-  really do take the legacy path (`BuildWorker` → `buildNode`,
+- [-] **E-07 EX5-01 slab parity for `Gather` — DROPPED 2026-09-07 on its
+  own resume condition.** The item's last surviving justification was "slab
+  dispatch beats the legacy `Operator` interface on worker trees", and its
+  resume point demanded that delta be measured on a parallel witness shape
+  FIRST and implemented only if it cleared the noise band. **Measured: it
+  does not clear the band, and its sign is negative.** Witness
+  `BenchmarkE07WorkerDispatch{Legacy,Slab}`
+  (`internal/executor/e07_worker_dispatch_bench_test.go`) drives the SAME
+  plan — `Project(Filter(SeqScan))` over a 50,000-row heap, i.e. the exact
+  three-migrated-node chain a TPC-H worker subtree has (`OpSeqScan` →
+  `OpFilter` → `OpProject`, confirmed by walking the slab) — through
+  `Build`+`Operator.Next` and through `BuildFast`+`opNext`, 8×30 iterations
+  each, same binary, same process. Legacy median **27.18 ms/iter**, slab
+  median **27.84 ms/iter**: the slab is **+2.2% SLOWER**, ranges overlapping
+  (legacy 26.86–28.82, slab 27.37–28.30), allocations identical to 5 parts in
+  150,969. The structural reason matches E-04's: per-row work on this shape is
+  544 ns (heap read + deform + expression eval), so three saved interface
+  dispatches (~2–4 ns each) put the ceiling at ~1.8% — below the band before
+  a single line is written. Justifications (a) "unlocks E-08" and (c)
+  "re-proves EX4 wins" were already void with E-04/E-08; (b) "re-proves EX1
+  wins on workers" is already true because `buildNode` threads the EX1-01
+  deform bound. Nothing survives. Benchmark retained as the re-check
+  apparatus (E-11 precedent). Ledger `take3-E-07-dropped`.
+  Superseded premise (re-verified, still true): workers really do take the
+  legacy path (`BuildWorker` → `buildNode`,
   `executor.go:32`), and `buildRec`'s default arm wraps `Gather` in an
   `OpAdapter`, so the slab does not reach a parallel plan.
   What changed: (a) "unlocks E-08" is void — E-08 is EX4-04, parallel

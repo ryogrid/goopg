@@ -14,7 +14,7 @@ import (
 // newStorageFixture spins up a per-test buffer pool + manager + mvcc
 // manager + catalog with one table seeded, ready to run heap-touching
 // operators against.
-func newStorageFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
+func newStorageFixture(t testing.TB) (*Context, catalog.Catalog, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
