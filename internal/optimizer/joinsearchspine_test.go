@@ -61,7 +61,13 @@ func seamChainFromSQL(t *testing.T, names []string, rows []int64, from string) (
 			Predicate: rfjEq(names, i, i+1),
 		}
 	}
-	ctx.joinlist = deconstructJointree(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
+	// C-04a: the SpecialJoinInfos travel WITH the joinlist, exactly as
+	// `planFromClause` publishes them — an admitted outer link whose
+	// SpecialJoinInfo is missing is declined by the seam's fail-closed guard,
+	// so a fixture that built only the joinlist would make every LEFT test
+	// pass by declining.
+	ctx.joinlist, ctx.joinInfoList = deconstructJointreeScopedSJI(
+		fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
 	return root, ctx
 }
 
@@ -115,28 +121,45 @@ func spinePlanJoinType(t *testing.T, pt parser.JoinType) JoinType {
 // Before P5.9-s a pinned item was indistinguishable from a
 // `from_collapse_limit` sub-list, so `makeRelFromJoinlist` had no way to tell a
 // forced order from an outer join and searched both alike.
+// C-04a retargeted it from LEFT to RIGHT. LEFT no longer pins and no longer
+// starts a spine (it enters the search itself); RIGHT and FULL still do, and
+// the tag is still what tells `makeRelFromJoinlist` a forced order from an
+// outer join. The LEFT half of this claim now lives in
+// TestSeamPlansALeftLinkInsideOneSearchProblem.
 func TestJoinlistTagsAPinnedOuterJoinWithItsType(t *testing.T) {
 	jl := deconstructJointree(
-		parseFrom(t, "a JOIN b ON a.x = b.x LEFT JOIN c ON b.x = c.x"),
+		parseFrom(t, "a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x"),
 		defaultCollapseLimits(), true)
 
 	if len(jl) != 1 {
-		t.Fatalf("joinlist has %d items, want 1 (the LEFT pin absorbs the chain)", len(jl))
+		t.Fatalf("joinlist has %d items, want 1 (the RIGHT pin absorbs the chain)", len(jl))
 	}
 	if !jl[0].pinnedOuter() {
 		t.Fatalf("the top item is not marked as a pinned outer join (jointype=%s)",
 			joinTypeName(jl[0].jointype))
 	}
-	if jl[0].jointype != parser.JoinLeft {
-		t.Fatalf("pinned item jointype = %s, want LEFT", joinTypeName(jl[0].jointype))
+	if jl[0].jointype != parser.JoinRight {
+		t.Fatalf("pinned item jointype = %s, want RIGHT", joinTypeName(jl[0].jointype))
 	}
 
 	prefix, spine := jl.innerPrefixBelowOuterSpine()
-	if len(spine) != 1 || spine[0] != parser.JoinLeft {
-		t.Fatalf("spine = %v, want one LEFT link", spine)
+	if len(spine) != 1 || spine[0] != parser.JoinRight {
+		t.Fatalf("spine = %v, want one RIGHT link", spine)
 	}
 	if got := prefix.leaves(nil); len(got) != 2 || got[0] != 0 || got[1] != 1 {
 		t.Fatalf("inner prefix leaves = %v, want [0 1] — the two INNER-joined relations", got)
+	}
+
+	// C-04a: a LEFT link in the same position does NOT pin, does NOT start a
+	// spine, and leaves one flat three-relation problem behind.
+	left := deconstructJointree(
+		parseFrom(t, "a JOIN b ON a.x = b.x LEFT JOIN c ON b.x = c.x"),
+		defaultCollapseLimits(), true)
+	if len(left) != 3 {
+		t.Fatalf("LEFT joinlist has %d items, want 3 — the LEFT link must flatten (C-04a)", len(left))
+	}
+	if _, spine := left.innerPrefixBelowOuterSpine(); len(spine) != 0 {
+		t.Fatalf("LEFT spine = %v, want none: a LEFT link belongs in the search now", spine)
 	}
 }
 
@@ -173,97 +196,106 @@ func TestInnerPrefixIsTheIdentityWithoutAnOuterPin(t *testing.T) {
 // unmatched left rows. This test is that decline turned into an invariant, so a
 // future widening of the seam cannot reintroduce it silently.
 func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
-	names := []string{"a", "b"}
-	prob := rfjProblem(names, []int64{1000, 10}, nil)
-	jl := joinlist{pinnedItem(parser.JoinLeft, joinlist{leafItem(0)}, joinlist{leafItem(1)})}
+	// C-04a retargeted this from LEFT to the types that still cannot be
+	// rebuilt. LEFT can: `join_is_legal` matches its SpecialJoinInfo,
+	// `jointypeForDirection` builds paths in the one legal orientation and
+	// `createPlanNode` emits a LEFT join, so the refusal would now be
+	// withholding a correct plan. RIGHT (C-04b) and FULL (ledgered) are
+	// unchanged, and the refusal is what keeps them from being planned as
+	// inner joins.
+	for _, jt := range []parser.JoinType{parser.JoinRight, parser.JoinFull} {
+		names := []string{"a", "b"}
+		prob := rfjProblem(names, []int64{1000, 10}, nil)
+		jl := joinlist{pinnedItem(jt, joinlist{leafItem(0)}, joinlist{leafItem(1)})}
 
-	_, err := planJoinlistSearch(jl, prob)
-	if err == nil {
-		t.Fatal("the search planned a pinned LEFT join — it can only have built an INNER join, " +
-			"which drops the unmatched left rows the statement asked for")
-	}
-	if !strings.Contains(err.Error(), "pinned LEFT join") {
-		t.Fatalf("error %q does not name the shape it refused", err)
+		_, err := planJoinlistSearch(jl, prob)
+		if err == nil {
+			t.Fatalf("the search planned a pinned %s join — it can only have built an INNER join, "+
+				"which drops the unmatched rows the statement asked for", joinTypeName(jt))
+		}
+		if !strings.Contains(err.Error(), "pinned "+joinTypeName(jt)+" join") {
+			t.Fatalf("error %q does not name the shape it refused", err)
+		}
 	}
 }
 
-// TestPGShapedSeamSearchesTheInnerPrefixBelowALeftJoinSpine is P5.9-s's subject
-// and the shape the corpus actually has: an inner chain topped by a LEFT OUTER
-// JOIN (Q72's `… left outer join promotion …`).
+// TestSeamPlansALeftLinkInsideOneSearchProblem is C-04a's witness, and it
+// replaces P5.9-s's peel test on the same fixture: the corpus shape (Q72's
+// `… left outer join promotion …`) is now ONE search problem of four
+// relations rather than a three-relation prefix under a spliced spine.
 //
-// Every qual's destination is asserted, because the prefix chain is DISCARDED by
-// the seam — only its leaves are carried into the search — while the spine is
-// NOT. So there are three distinct ways to be wrong and one assertion each:
-// a prefix `ON` qual that never reached the clause list (a cross product), the
-// spine's `ON` qual pulled into the searched subtree (an inner join where the
-// statement wrote an outer one), and the spine's own node rebuilt (its type or
-// its sides changed).
-func TestPGShapedSeamSearchesTheInnerPrefixBelowALeftJoinSpine(t *testing.T) {
+// Every qual's destination is still asserted, because the ways to be wrong are
+// the same ones and one of them is new:
+//
+//   - a prefix `ON` qual that never reached the clause list (a cross product);
+//   - the LEFT link's `ON` qual missing from the searched tree (it is now the
+//     search's own clause and no longer rides on a spliced node);
+//   - the LEFT link planned as an INNER join, which is the wrong answer the
+//     whole C-03 series exists to prevent.
+func TestSeamPlansALeftLinkInsideOneSearchProblem(t *testing.T) {
 	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
-	spine, isJoin := node.(*Join)
-	if !isJoin || spine.Type != JoinTypeLeft {
-		t.Fatalf("fixture root is %T, want the LEFT spine link", node)
+	if root, isJoin := node.(*Join); !isJoin || root.Type != JoinTypeLeft {
+		t.Fatalf("fixture root is %T, want the LEFT link", node)
 	}
-	spineQual := spine.Predicate
 
 	out, residual, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil)
 	if !used {
-		t.Fatal("the seam declined a 3-relation INNER prefix below a LEFT JOIN — " +
-			"the corpus shape P5.9-s exists for")
+		t.Fatal("the seam declined a 4-relation chain topped by a LEFT JOIN — the C-04a shape")
 	}
 	if residual != nil {
-		t.Fatalf("residual = %v, want nil: the prefix ON quals are join clauses and "+
-			"the WHERE restriction is leaf-local to a prefix relation", residual)
+		t.Fatalf("residual = %v, want nil: every ON qual is a join clause and the WHERE "+
+			"restriction is leaf-local to a PRESERVED-side relation", residual)
 	}
-	// The spine link is the returned root, by identity: it was never rebuilt.
-	if out != Node(spine) {
-		t.Fatalf("the seam returned %T, want the original LEFT join node — the spine must be "+
-			"spliced, not rebuilt", out)
+	if !isSearchedTree(out) {
+		t.Fatalf("the seam returned %T and untagged — the chain was not searched", out)
 	}
-	if spine.Type != JoinTypeLeft {
-		t.Fatalf("the spine link is now %v, want LEFT — an outer join was planned as an inner one",
-			spine.Type)
+	joins := rfjJoins(out)
+	if len(joins) != 3 {
+		t.Fatalf("searched tree has %d joins, want 3 for its 4 relations — the LEFT link is "+
+			"IN the problem now, not stacked above it", len(joins))
 	}
-	if spine.Predicate != spineQual {
-		t.Fatal("the spine's ON qual was replaced; it is enforced by the outer join itself and " +
-			"may not be moved below it")
+	// Exactly one of them is the LEFT join, and it is the search's own node.
+	nleft := 0
+	for _, j := range joins {
+		if j.Type == JoinTypeLeft {
+			nleft++
+		}
+		if j.Type != JoinTypeLeft && j.Type != JoinTypeInner && j.Type != JoinTypeCross {
+			t.Fatalf("searched tree contains a %v join", j.Type)
+		}
 	}
-	if !isSearchedTree(spine.Left) {
-		t.Fatalf("the spine's left input is %T and untagged — the prefix was not searched",
-			spine.Left)
+	if nleft != 1 {
+		t.Fatalf("searched tree has %d LEFT joins, want exactly 1 — a LEFT link planned as an "+
+			"INNER join drops the unmatched left rows the statement asked for", nleft)
 	}
-	// The searched prefix enforces both of its own ON quals and NEITHER the
-	// spine's: `c0=d0` inside the prefix would mean `d` entered the search.
-	got := seamEqualities(spine.Left)
-	for _, want := range []string{"a0=b0", "b0=c0"} {
+	// All three ON quals reach the tree, the LEFT link's included.
+	got := seamEqualities(out)
+	for _, want := range []string{"a0=b0", "b0=c0", "c0=d0"} {
 		if !got[want] {
-			t.Fatalf("the searched prefix does not enforce %s (enforces %v) — a dropped ON qual "+
+			t.Fatalf("the searched tree does not enforce %s (enforces %v) — a dropped ON qual "+
 				"is a cross product, not a slow plan", want, got)
 		}
 	}
-	if got["c0=d0"] {
-		t.Fatalf("the searched prefix enforces the SPINE's qual c0=d0 (enforces %v)", got)
-	}
-	// The whole tree still publishes the pre-search concatenation, which is what
-	// every expression above the join was resolved against.
 	rfjAssertBindingOrder(t, out, names)
-	if n := len(rfjJoins(spine.Left)); n != 2 {
-		t.Fatalf("searched prefix has %d joins, want 2 for its 3 relations", n)
-	}
-	if n := len(seamLeafLocalFilters(spine.Left)); n != 1 {
-		t.Fatalf("found %d leaf-local filters in the prefix, want 1 (the WHERE `a1 > 5`)", n)
+	if n := len(seamLeafLocalFilters(out)); n != 1 {
+		t.Fatalf("found %d leaf-local filters, want 1 (the WHERE `a1 > 5` on the preserved side)", n)
 	}
 }
 
 // TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin is the correctness
-// edge the peel is bounded by. A `WHERE` qual on the LEFT JOIN's NULLABLE side is
-// evaluated on null-extended rows, so it must stay in the residual `Filter`
-// ABOVE the spine; pushing it into the prefix is impossible here (the relation is
-// not in the prefix) and this test proves the seam does not try — it neither
-// hands it to the search nor loses it.
+// edge C-04a is bounded by, and after C-04a it is a LIVE hazard rather than a
+// structural impossibility. While the LEFT link was peeled, `d` was outside the
+// searched window and no clause producer could reach it; now `d` is a leaf of
+// the problem, and `partitionConjunctsForJoinPlanning` has no nullable-side
+// guard of its own — a single-relation `WHERE` conjunct on `d` would become a
+// leaf-local `Filter` UNDER the LEFT join and keep rows that must be dropped.
+//
+// The per-qual delay proof (DESIGN §3.5) is what stops that, and this fixture
+// is its adjudication: the conjunct must come back as the residual, by
+// identity, and no leaf may have acquired a filter.
 func TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin(t *testing.T) {
 	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
@@ -273,16 +305,46 @@ func TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin(t *testing.T) {
 
 	out, residual, used := tryPGShapedJoinSearch(node, nullableQual, ctx, nil)
 	if !used {
-		t.Fatal("the seam declined the spine shape")
+		t.Fatal("the seam declined the C-04a shape")
 	}
 	if residual != nullableQual {
 		t.Fatalf("residual = %v, want the nullable-side qual itself: it may be evaluated only "+
 			"above the outer join that produces the NULLs", residual)
 	}
-	spine := out.(*Join)
-	if n := len(seamLeafLocalFilters(spine.Left)); n != 0 {
-		t.Fatalf("found %d leaf-local filters in the searched prefix, want 0 — a qual on the "+
+	if n := len(seamLeafLocalFilters(out)); n != 0 {
+		t.Fatalf("found %d leaf-local filters in the searched tree, want 0 — a qual on the "+
 			"nullable side was pushed below the outer join", n)
+	}
+}
+
+// TestPGShapedSeamHoldsAMultiRelationNullableSideQual is the other half of
+// §3.5, and the half a single-relation fixture cannot reach. A `WHERE` conjunct
+// spanning a PRESERVED and a NULLABLE relation is not a leaf local — it is a
+// two-relation clause, and `clausesFor` would apply it AT the LEFT join, i.e.
+// as though it had been written in the `ON` clause. That turns "keep the row,
+// null-extended" into "drop the row": too few rows, and no row COUNT on the
+// preserved side alone would notice.
+//
+// The delay test is `qual reaches the nullable side`, not `qual is a leaf
+// local`, precisely so this conjunct is held too.
+func TestPGShapedSeamHoldsAMultiRelationNullableSideQual(t *testing.T) {
+	withPGShapedDP(t)
+	names := []string{"a", "b", "c", "d"}
+	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
+		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
+	// `a0 = d0` — spans the preserved side and the nullable one.
+	spanning := rfjEq(names, 0, 3)
+
+	out, residual, used := tryPGShapedJoinSearch(node, spanning, ctx, nil)
+	if !used {
+		t.Fatal("the seam declined the C-04a shape")
+	}
+	if residual != spanning {
+		t.Fatalf("residual = %v, want the spanning WHERE conjunct itself — placing it AT the "+
+			"LEFT join would make it an ON condition and drop null-extended rows", residual)
+	}
+	if got := seamEqualities(out); got["a0=d0"] {
+		t.Fatalf("the searched tree enforces the delayed WHERE qual a0=d0 (enforces %v)", got)
 	}
 }
 
@@ -453,24 +515,37 @@ func TestPGShapedSeamSearchesAOneRelationPrefixUnderASpine(t *testing.T) {
 	// (TPC-H Q13's covering scan). A one-relation statement with NO spine
 	// stays out — the earlier `nrels < 2` gate — so the single-table paths
 	// keep owning those.
+	// C-04a: there is no spine any more — the LEFT link is a link of the
+	// searched problem — so what this fixture now pins is that the SAME
+	// access-method selection still happens, with the two relations in ONE
+	// two-relation problem and the qual on the preserved side still consumed
+	// into a leaf.
 	out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
 	if !used {
-		t.Fatal("the seam declined a one-relation prefix under a LEFT spine")
+		t.Fatal("the seam declined a two-relation LEFT JOIN")
 	}
-	if out != node {
-		t.Fatal("the splice must keep the spine root: only its Left is replaced")
+	if !isSearchedTree(out) {
+		t.Fatalf("the seam returned %T and untagged — the statement was not searched", out)
 	}
-	// The local qual on `a` is attached to the leaf inside the search
-	// (prefixNullable(LEFT)=false), so nothing survives as residual.
+	joins := rfjJoins(out)
+	if len(joins) != 1 || joins[0].Type != JoinTypeLeft {
+		t.Fatalf("searched tree has %d joins (%v), want one LEFT join", len(joins), joins)
+	}
+	// The local qual on `a` is on the PRESERVED side, so the delay proof
+	// distributes it and it is attached to the leaf inside the search.
 	if residual != nil {
-		t.Fatalf("the prefix-local qual was not consumed: residual=%v", residual)
+		t.Fatalf("the preserved-side qual was not consumed: residual=%v", residual)
+	}
+	if n := len(seamLeafLocalFilters(out)); n != 1 {
+		t.Fatalf("found %d leaf-local filters, want 1 (the WHERE `a1 > 5`)", n)
 	}
 }
 
 // TestPGShapedSeamPeelsATwoLinkSpine: Q72's actual shape is TWO stacked left
-// outer joins, and the recursion has to peel both — a peel that stopped at the
-// first would hand the search a prefix whose last relation is the other spine's
-// right side.
+// outer joins. Before C-04a the recursion had to PEEL both; after it, both are
+// links of a single five-relation problem, and what has to hold is that BOTH
+// survive as LEFT joins in the searched tree — a chain that admitted one and
+// planned the other as an inner join is the failure this fixture is sized for.
 func TestPGShapedSeamPeelsATwoLinkSpine(t *testing.T) {
 	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d", "e"}
@@ -480,22 +555,30 @@ func TestPGShapedSeamPeelsATwoLinkSpine(t *testing.T) {
 
 	out, _, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil)
 	if !used {
-		t.Fatal("the seam declined a 3-relation prefix below TWO stacked LEFT JOINs")
+		t.Fatal("the seam declined a 5-relation chain with TWO stacked LEFT JOINs")
 	}
-	upper, ok := out.(*Join)
-	if !ok || upper.Type != JoinTypeLeft {
-		t.Fatalf("root is %T, want the upper LEFT link", out)
+	if !isSearchedTree(out) {
+		t.Fatalf("the seam returned %T and untagged — the chain was not searched", out)
 	}
-	lower, ok := upper.Left.(*Join)
-	if !ok || lower.Type != JoinTypeLeft {
-		t.Fatalf("root's left is %T, want the lower LEFT link — the spine was rebuilt", upper.Left)
+	joins := rfjJoins(out)
+	if len(joins) != 4 {
+		t.Fatalf("searched tree has %d joins, want 4 for its 5 relations", len(joins))
 	}
-	if !isSearchedTree(lower.Left) {
-		t.Fatalf("the lower link's left input is %T and untagged — the prefix was not searched",
-			lower.Left)
+	nleft := 0
+	for _, j := range joins {
+		if j.Type == JoinTypeLeft {
+			nleft++
+		}
 	}
-	if n := len(rfjJoins(lower.Left)); n != 2 {
-		t.Fatalf("searched prefix has %d joins, want 2 for its 3 relations", n)
+	if nleft != 2 {
+		t.Fatalf("searched tree has %d LEFT joins, want 2 — one of the stacked outer links "+
+			"was planned as an inner join", nleft)
+	}
+	got := seamEqualities(out)
+	for _, want := range []string{"a0=b0", "b0=c0", "c0=d0", "d0=e0"} {
+		if !got[want] {
+			t.Fatalf("the searched tree does not enforce %s (enforces %v)", want, got)
+		}
 	}
 	rfjAssertBindingOrder(t, out, names)
 }

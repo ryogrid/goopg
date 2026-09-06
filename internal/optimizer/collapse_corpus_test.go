@@ -193,8 +193,25 @@ func TestCollapseInstrumentFindsNestedLevels(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "left outer join is pinned in both regimes",
+			// C-04a: LEFT no longer pins, so a LEFT chain collapses into one
+			// problem exactly as an INNER one does and the flag now acts on
+			// it. This case read `false` up to C-04a and is the instrument's
+			// own witness that the pin relaxed.
+			name: "left outer join chain collapses (C-04a)",
 			sql:  "SELECT * FROM a LEFT JOIN b ON a.x = b.x LEFT JOIN c ON b.x = c.x",
+			want: true,
+		},
+		{
+			// FULL still pins in both regimes — C-04 leaves it alone
+			// deliberately (DESIGN §3.6), and its safety rests on that.
+			name: "full outer join is pinned in both regimes",
+			sql:  "SELECT * FROM a FULL JOIN b ON a.x = b.x FULL JOIN c ON b.x = c.x",
+			want: false,
+		},
+		{
+			// RIGHT likewise: C-04b's item, not this one.
+			name: "right outer join is pinned in both regimes",
+			sql:  "SELECT * FROM a RIGHT JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x",
 			want: false,
 		},
 		{
@@ -300,15 +317,19 @@ func TestCollapseEligibilityOfTheTPCDSCorpus(t *testing.T) {
 	sort.Ints(eligible)
 	sort.Ints(unparsed)
 	got := sprintInts(eligible)
-	// Two, not the three a `grep -c ' join '` finds. Q78 spells three inner
-	// JOINs and is still ineligible: each of its chains is
-	// `A LEFT JOIN B … JOIN date_dim …`, and the pinned outer join has already
-	// folded its two sides into ONE joinlist item, so the inner join that
-	// follows offers a two-member problem in both regimes. The lexical count
-	// and the planner's count differ, and the planner's is the one the arm
-	// runs — which is the whole reason this measurement goes through
-	// `deconstructJointree` instead of through a regex.
-	const want = "72,75"
+	// C-04a re-pin: 2 -> 7. The set was {72,75} while LEFT pinned; relaxing
+	// the LEFT pin (DESIGN §3.2) lets the LEFT links of Q40/Q49/Q78/Q80/Q93
+	// flatten into their enclosing problem too, so a chain like Q78's
+	// `A LEFT JOIN B … JOIN date_dim …` — previously ONE opaque item because
+	// the outer link had already folded its two sides together — is now a
+	// three-member problem.
+	//
+	// This IS C-04a's blast radius on the DS05 plan channel: these seven
+	// queries are the ones whose join ORDER the search can now choose. The
+	// measurement goes through `deconstructJointree` rather than a regex for
+	// P5.9-m's reason — the lexical count and the planner's differ, and the
+	// planner's is the one that runs.
+	const want = "40,49,72,75,78,80,93"
 	if got != want {
 		t.Errorf("TPC-DS collapse-eligible set = {%s}, want {%s} (of %d parsed; %d unparseable %v).\n"+
 			"The DS05 clause of the collapse-ON pass is the arm that measures the flag; if this set "+
@@ -404,13 +425,18 @@ func TestCorpusQueriesWithASearchableInnerPrefix(t *testing.T) {
 		}
 	}
 	sort.Ints(peelable)
-	// The same two queries the COLLAPSE arm is eligible on, and for the same
-	// reason: `deconstructJointree` is what decides both, so a chain it pins
-	// into one opaque item (Q78's `A LEFT JOIN B … JOIN date_dim …`, where the
-	// outer link sits BELOW an inner one) is out of reach of the peel as well —
-	// lifting it needs 03 §4.4's `SpecialJoinInfo` inference, not a spine walk.
-	// Zero before this task, so the corpus population went 0 -> 2.
-	const want = "72,75"
+	// C-04a re-pin: 2 -> 0, and EMPTY is the correct answer rather than a
+	// regression. The peel existed because a LEFT link could not enter the
+	// search; now it can, so `pinnedOuter` answers false for LEFT and no LEFT
+	// link ever starts a spine again (DESIGN §3.1/§3.3). The peel survives for
+	// RIGHT and FULL only — C-04b's and the ledger's scope — and the queries
+	// that used to be peeled are now in the collapse-eligible set above, where
+	// their whole chain is ONE problem instead of a prefix under a stack.
+	//
+	// Kept pinned rather than deleted: an empty set is the assertion that LEFT
+	// has LEFT the spine, and a non-empty one would mean a LEFT link found its
+	// way back onto it.
+	const want = ""
 	if got := sprintInts(peelable); got != want {
 		t.Errorf("TPC-DS queries with a searchable INNER prefix below a LEFT spine = {%s}, "+
 			"want {%s} (of %d).\nThis is the DS05 plan channel's blast radius for the peel; "+

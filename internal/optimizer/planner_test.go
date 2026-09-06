@@ -147,8 +147,16 @@ func TestPlanJoinPicksHashAlgo(t *testing.T) {
 		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", true},
 		// Reversed equality flipped at plan time → still hash.
 		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON h.aid = a.aid", true},
-		// LEFT join also takes the hash path.
-		{"SELECT a.aid FROM pgbench_accounts a LEFT JOIN pgbench_history h ON a.aid = h.aid", true},
+		// C-04a: a LEFT link now enters the join SEARCH, which offers merge,
+		// hash and nested loop for it (DPPATH shows all three, all
+		// `jointype=left`). On this catalog neither table has row estimates,
+		// so the hash and nested-loop totals tie EXACTLY and the tie-break
+		// takes the lower startup — the nested loop. That is a cost decision
+		// on an unmeasured fixture, not a lost capability: with real
+		// estimates the LEFT join takes the hash path, which is what
+		// TestPlanJoinHashBuildSidePicksSmaller's LEFT case (smallStats /
+		// bigStats) asserts.
+		{"SELECT a.aid FROM pgbench_accounts a LEFT JOIN pgbench_history h ON a.aid = h.aid", false},
 		// RIGHT/FULL are no longer PINNED to merge (M0127-P4.2 gave the hash
 		// executor outer fill on either side, design leftdeep-joins/07 §3) —
 		// but this catalog carries no row estimates, and with none the
@@ -260,7 +268,16 @@ func TestPlanJoinHashBuildSidePicksSmaller(t *testing.T) {
 			if !ok {
 				t.Fatalf("root=%T want *Project", node)
 			}
-			j, ok := proj.Child.(*Join)
+			child := proj.Child
+			// C-04a: a LEFT link now enters the join search, whose root
+			// republishes the prefix's columns through its own boundary
+			// `*Project` (03 §10). Step over it rather than reaching past
+			// only for the LEFT case, so the INNER cases keep exercising the
+			// same unwrap.
+			if inner, isProj := child.(*Project); isProj {
+				child = inner.Child
+			}
+			j, ok := child.(*Join)
 			if !ok {
 				t.Fatalf("child=%T want *Join", proj.Child)
 			}

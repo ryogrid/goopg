@@ -228,7 +228,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("prefix-not-a-prefix", nrels, nprefix)
 		return node, pred, false
 	}
-	scans, widths, onQuals, ok := extractSearchLeaves(chain)
+	scans, widths, onQuals, outerLinks, ok := extractSearchLeaves(chain)
 	if !ok {
 		traceSeamDecline("chain-not-flattenable", nrels, len(scans))
 		return node, pred, false
@@ -291,11 +291,46 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// quals are unaffected — they originate BELOW the outer join, so upstream
 	// distributes them normally, and suppressing them would cost a cross
 	// product rather than a wrong answer.
+	//
+	// C-04a §3.5: the whole-`WHERE` hold above is the SPINE's rule and only
+	// ever fired on a nullable spine, which after LEFT admission means a
+	// RIGHT/FULL one. The LEFT links are now INSIDE the flattened chain, so
+	// their nullable sides are inside the search's coordinate window, and the
+	// hold is replaced there by a PER-QUAL delay proof: a `WHERE` conjunct
+	// whose relids reach the nullable side of any admitted link is delayed to
+	// above the whole searched tree (upstream's `check_outerjoin_delay` rule,
+	// as `delayedAboveOJ` states it — one delay verdict anywhere stops the
+	// descent). Everything else distributes exactly as before.
+	//
+	// Without this, `partitionConjunctsForJoinPlanning` — which has no
+	// nullable-side guard — would make `WHERE p.y > 5` a leaf-local filter on
+	// `p` and evaluate it BELOW `t LEFT JOIN p`, keeping rows that must be
+	// dropped. That is the finding-1 shape and it is load-bearing, not a
+	// follow-up.
 	var conjuncts, heldAbovePrefix []Expr
-	if prefixNullable(spine) {
+	switch {
+	case prefixNullable(spine):
 		heldAbovePrefix = splitAnd(pred)
-	} else {
+	case len(outerLinks) == 0:
 		conjuncts = splitAnd(pred)
+	default:
+		var nullable RelSet
+		for _, lk := range outerLinks {
+			nullable |= lk.nullable
+		}
+		for _, c := range splitAnd(pred) {
+			rs, attributable := relidsOfExpr(c, cumOffsets)
+			// Unattributable is DELAYED, not distributed: a conjunct whose
+			// relids the seam cannot see exactly is one it cannot prove does
+			// not reach a nullable side. Holding it above is always correct
+			// (the residual `Filter` sits above every admitted link) and only
+			// ever costs a pushdown.
+			if !attributable || relsOverlap(rs, nullable) {
+				heldAbovePrefix = append(heldAbovePrefix, c)
+				continue
+			}
+			conjuncts = append(conjuncts, c)
+		}
 	}
 	for _, q := range onQuals {
 		conjuncts = append(conjuncts, splitAnd(q)...)
@@ -318,6 +353,44 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// evaluation.
 	if synth := inferEquivClassConstants(conjuncts); len(synth) > 0 {
 		conjuncts = append(conjuncts, synth...)
+	}
+	// C-04a: an admitted outer link's `ON` conjuncts join the list only HERE,
+	// after the equivalence-class constant inference has run. Propagating a
+	// constant across an outer join's own equality is arguably sound (the join
+	// clause equates the two columns on every row that matches, and filtering
+	// the nullable side by it drops no matching row), but it is an
+	// optimisation, and admitting it would make C-04a move plans on shapes
+	// that have nothing to do with join ORDER. Withheld deliberately, not
+	// forgotten.
+	//
+	// Each conjunct must then reach a place that is AT or BELOW its link's
+	// join in a way that preserves outer-join semantics, and `outerOnQualsOK`
+	// proves that per conjunct before any of them is admitted (see there for
+	// the two admissible destinations and why a third would be a wrong
+	// answer). A failed proof declines the statement.
+	if len(outerLinks) > 0 {
+		// FAIL-CLOSED, and this is the guard the whole slice rests on. A
+		// flattened outer link is only safe because `join_is_legal` refuses
+		// every pairing that would reorder across it, and `join_is_legal`
+		// knows nothing except what `ctx.joinInfoList` tells it: with an empty
+		// or mismatched list every pairing looks like a plain inner join and
+		// the search would emit an INNER join where the statement wrote an
+		// outer one — unmatched rows silently dropped. That the production
+		// caller populates the list (planner.go, `deconstructJointreeScopedSJI`)
+		// is not something this seam should have to assume, so it is checked.
+		if !outerLinksHaveSJInfos(outerLinks, ctx.joinInfoList) {
+			traceSeamDecline("outer-link-no-sjinfo", nrels, nprefix)
+			return node, pred, false
+		}
+		var onOuter []Expr
+		for _, lk := range outerLinks {
+			onOuter = append(onOuter, splitAnd(lk.pred)...)
+		}
+		if !outerOnQualsOK(outerLinks, cumOffsets) {
+			traceSeamDecline("outer-on-qual", nrels, nprefix)
+			return node, pred, false
+		}
+		conjuncts = append(conjuncts, onOuter...)
 	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
 	leaves := make([]Node, nprefix)
@@ -559,6 +632,102 @@ func spineLinkSearchable(j *Join, t parser.JoinType) bool {
 	return !j.Lateral && !nodeReferencesOuter(j.Right)
 }
 
+// outerLinksHaveSJInfos reports whether every admitted outer link is described
+// by a SpecialJoinInfo in the statement's `root->join_info_list`.
+//
+// The match is on the SYNTACTIC hands and the jointype, which is exactly what
+// `deconstructJointreeScopedSJI` builds them from: the link's own two sides in
+// leaf-index space. `MinLefthand`/`MinRighthand` are deliberately not compared —
+// they are the SJI's own narrowing (C-01) and may legitimately be smaller.
+//
+// A caller that builds a joinlist without its SpecialJoinInfos — a hand-made
+// fixture, or any future producer that forgets — declines the statement here
+// rather than getting an inner join for its outer one.
+func outerLinksHaveSJInfos(links []outerChainLink, list []*SpecialJoinInfo) bool {
+	for _, lk := range links {
+		found := false
+		for _, sj := range list {
+			if sj != nil && sj.Jointype == lk.jointype &&
+				sj.SynLefthand == lk.preserved && sj.SynRighthand == lk.nullable {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// outerOnQualsOK proves, per conjunct, that every admitted outer link's `ON`
+// qual will reach a destination that keeps the link's outer-join semantics.
+//
+// An INNER link's qual may be placed anywhere at or above its join, which is
+// the whole licence the seam relies on for `onQuals` (file header). An OUTER
+// link's may not: it decides which rows MATCH, so evaluating it above the join
+// filters null-extended rows that the join exists to keep (too few rows), and
+// evaluating a PRESERVED-side test below the join drops preserved rows that
+// should have been null-extended instead (also too few). There are therefore
+// exactly two admissible destinations, and each conjunct must land in one:
+//
+//   - SPANNING (it reaches both sides). It becomes a `restrictInfo` and
+//     `clausesFor` applies it at the LOWEST join covering it and touching both
+//     sides. That join is the outer join itself and cannot be anything else:
+//     `join_is_legal` refuses to unite a nullable-side rel with anything
+//     outside the SJ's RHS before the SJ's LHS is complete (joinrels.c:519-529
+//     and the `must_be_leftjoin` post-scan at :542-546), so the first join that
+//     covers a preserved AND a nullable relation IS the link. The proof that
+//     the search will emit it as a clause at all is put to the producer
+//     (`searchConsumes`) rather than re-derived — an OR-of-ANDs contributes its
+//     common equalities and NOT itself (joinrestrict.go:171-177), and such a
+//     conjunct would otherwise fall into the residual `Filter` above the tree,
+//     which is precisely the too-few-rows failure above.
+//   - NULLABLE-SIDE-ONLY. `t LEFT JOIN p ON p.y > 5` is `t LEFT JOIN (σ p.y>5)
+//     p`, so pushing it into `p`'s scan is exact — and that is what
+//     `partitionConjunctsForJoinPlanning` does with a single-relation conjunct.
+//     It only does so for a LOCAL-ELIGIBLE conjunct that attributes to one
+//     binding, so both halves are checked here rather than assumed.
+//
+// Anything else — a preserved-side-only test, a constant, a qual reaching a
+// relation outside the link, an attribution the seam cannot make — declines the
+// statement. Each of those is a shape whose correct placement is AT the link,
+// and the searched tree has no way to say "at this link and nowhere else".
+func outerOnQualsOK(links []outerChainLink, cumOffsets []int) bool {
+	for _, lk := range links {
+		if lk.pred == nil {
+			// A qual-less outer link is a cartesian LEFT join; nothing to
+			// place. `planJoinPredicate` does not build one for a parsed
+			// `LEFT JOIN … ON`, so this is a shape from some later rewrite,
+			// and it is admitted rather than declined only because there is
+			// no qual whose placement could be wrong.
+			continue
+		}
+		for _, c := range splitAnd(lk.pred) {
+			rs, ok := relidsOfExpr(c, cumOffsets)
+			if !ok || rs == 0 || !relsSubset(rs, lk.preserved|lk.nullable) {
+				return false
+			}
+			switch {
+			case relsOverlap(rs, lk.preserved) && relsOverlap(rs, lk.nullable):
+				if !searchConsumes(c, cumOffsets) {
+					return false
+				}
+			case relsSubset(rs, lk.nullable):
+				if !conjunctIsLocalEligible(c) || tableForCol(c, cumOffsets) < 0 {
+					return false
+				}
+			default:
+				// Preserved-side-only: `t LEFT JOIN p ON t.x > 5` keeps every
+				// `t` row and null-extends the ones failing the test. There is
+				// no destination in a searched tree that says that.
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // searchConsumes reports whether the join search placed `c` somewhere in the
 // tree it built, i.e. whether the residual `Filter` may drop it.
 //
@@ -604,26 +773,58 @@ func searchConsumes(c Expr, cumOffsets []int) bool {
 // numbers a chain's bindings left to right and `planFromClause` appends items
 // in FROM order (03 §6.1's leaf-numbering guarantee), and this walk visits Left
 // before Right at every level.
-func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []Expr, ok bool) {
+func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []Expr, outer []outerChainLink, ok bool) {
 	width := 0
-	var walk func(Node) bool
-	walk = func(n Node) bool {
+	// onSpine marks the path from the chain's ROOT down through LEFT links'
+	// left inputs — C-04a's "LEFT spine". A LEFT link reached any other way
+	// (below an INNER link, or on a LEFT link's own nullable side) is C-04c's
+	// scope and is declined here, so the slice admits exactly the shape it was
+	// gated on. Descending into an INNER link therefore clears the flag for
+	// BOTH of its inputs.
+	var walk func(n Node, onSpine bool) bool
+	walk = func(n Node, onSpine bool) bool {
 		if n == nil {
 			return false
 		}
 		j, isJoin := n.(*Join)
-		if !isJoin || (j.Type != JoinTypeCross && j.Type != JoinTypeInner) {
+		if !isJoin || (j.Type != JoinTypeCross && j.Type != JoinTypeInner && j.Type != JoinTypeLeft) {
 			scans = append(scans, n)
 			widths = append(widths, len(n.Output()))
 			width += len(n.Output())
 			return true
 		}
+		if j.Type == JoinTypeLeft && !onSpine {
+			return false
+		}
 		// The link's own coordinate origin: the leaves to its left have already
 		// been counted, and its qual was resolved against a schema that starts
 		// at its leftmost leaf, so this is the delta between the two spaces.
 		base := width
-		if !walk(j.Left) || !walk(j.Right) {
+		loLeft := len(scans)
+		if !walk(j.Left, onSpine && j.Type == JoinTypeLeft) {
 			return false
+		}
+		loRight := len(scans)
+		if !walk(j.Right, false) {
+			return false
+		}
+		hiRight := len(scans)
+		if j.Type == JoinTypeLeft {
+			// The non-zero-offset decline extends to admitted outer links for
+			// the reason it exists on INNER ones (file header): a misattributed
+			// coordinate is a wrong answer, not a lost plan. It is checked even
+			// though the SIDES below are leaf-index ranges (which are global and
+			// need no re-basing), because the link's own `ON` qual does need it.
+			if j.Predicate != nil && base != 0 {
+				return false
+			}
+			outer = append(outer, outerChainLink{
+				jointype:  parser.JoinLeft,
+				preserved: leafRangeRelSet(loLeft, loRight),
+				nullable:  leafRangeRelSet(loRight, hiRight),
+				pred:      j.Predicate,
+			})
+			return true
 		}
 		if j.Predicate == nil {
 			return true
@@ -634,10 +835,34 @@ func extractSearchLeaves(node Node) (scans []Node, widths []int, onQuals []Expr,
 		onQuals = append(onQuals, j.Predicate)
 		return true
 	}
-	if !walk(node) {
-		return nil, nil, nil, false
+	if !walk(node, true) {
+		return nil, nil, nil, nil, false
 	}
-	return scans, widths, onQuals, true
+	return scans, widths, onQuals, outer, true
+}
+
+// outerChainLink is one OUTER link `extractSearchLeaves` admitted into the
+// flattened chain: which leaves it preserves, which it null-extends, and the
+// `ON` qual it was written with. C-04a builds these for LEFT links only.
+//
+// The sides are LEAF-INDEX relsets — bit i is the i'th leaf the walk appended,
+// which is the FROM-binding index (03 §6.1's leaf-numbering guarantee) and
+// therefore the same space `relidsOfExpr(…, cumOffsets)` answers in. That is
+// what lets the seam decide, per conjunct, whether a qual reaches a nullable
+// side without re-deriving the chain.
+type outerChainLink struct {
+	jointype             parser.JoinType
+	preserved, nullable  RelSet
+	pred                 Expr
+}
+
+// leafRangeRelSet is the relset of the half-open leaf range [lo, hi).
+func leafRangeRelSet(lo, hi int) RelSet {
+	var rs RelSet
+	for i := lo; i < hi; i++ {
+		rs |= 1 << uint(i)
+	}
+	return rs
 }
 
 // chainCarriesLateral reports whether the pre-search join chain contains a
@@ -660,7 +885,11 @@ func chainCarriesLateral(n Node) bool {
 	if n == nil {
 		return false
 	}
-	if j, ok := n.(*Join); ok && (j.Type == JoinTypeCross || j.Type == JoinTypeInner) {
+	// C-04a: it descends exactly the links `extractSearchLeaves` flattens,
+	// which now includes LEFT. An admitted LATERAL outer link must not reorder
+	// across its dependency any more than an inner one may, and the marker
+	// lives on the chain node the flattening discards.
+	if j, ok := n.(*Join); ok && (j.Type == JoinTypeCross || j.Type == JoinTypeInner || j.Type == JoinTypeLeft) {
 		return j.Lateral || chainCarriesLateral(j.Left) || chainCarriesLateral(j.Right)
 	}
 	return nodeReferencesOuter(n)

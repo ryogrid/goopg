@@ -180,23 +180,31 @@ func TestCollapseFlagOffPinsExplicitJoins(t *testing.T) {
 	checkJoinlist(t, "a JOIN b ON a.x = b.x, d", lim, true, "[0 1 2]")
 }
 
-// TestOuterJoinsStayPinned pins 03 §4.4: goopg v1 has no `join_is_legal`
-// constraint inference, so LEFT/RIGHT/FULL take upstream's FULL treatment —
-// order forced at the node — regardless of the collapse flag or of
-// `join_collapse_limit`. A flattened outer join without ordering restrictions
-// would let the search emit an illegal order, not merely a slow one.
+// TestOuterJoinsStayPinned pins which outer joins still take upstream's FULL
+// treatment — order forced at the node — regardless of the collapse flag.
+//
+// C-04a re-pinned this. 03 §4.4's "goopg has no join_is_legal constraint
+// inference" no longer holds: C-01 infers the SpecialJoinInfos and C-03b/c
+// build LEFT paths and plans from them, so LEFT is now collapse-dependent
+// exactly as INNER is. RIGHT (C-04b) and FULL (ledgered, DESIGN §3.6) still
+// pin unconditionally, and FULL's tree-side safety RESTS on that.
 func TestOuterJoinsStayPinned(t *testing.T) {
 	lim := defaultCollapseLimits()
-	for _, spelling := range []string{"LEFT JOIN", "RIGHT JOIN", "FULL JOIN"} {
+	for _, spelling := range []string{"RIGHT JOIN", "FULL JOIN"} {
 		from := "a " + spelling + " b ON a.x = b.x"
 		for _, collapse := range []bool{false, true} {
 			checkJoinlist(t, from, lim, collapse, "[[[0] [1]]]")
 		}
 	}
-	// An outer join in the middle of an otherwise inner chain pins from
-	// that node up: with collapse ON, a⋈b folds to [0 1], then the LEFT
-	// JOIN to c forces the order over the pair.
+	// LEFT: pinned with the flag off, flattened with it on — the INNER rule.
+	checkJoinlist(t, "a LEFT JOIN b ON a.x = b.x", lim, false, "[[[0] [1]]]")
+	checkJoinlist(t, "a LEFT JOIN b ON a.x = b.x", lim, true, "[0 1]")
+	// An INNER chain topped by a LEFT link is now ONE three-member problem —
+	// the C-04a payload, and the shape Q72 has.
 	checkJoinlist(t, "a JOIN b ON a.x = b.x LEFT JOIN c ON b.x = c.x",
+		lim, true, "[0 1 2]")
+	// A RIGHT link still pins from that node up.
+	checkJoinlist(t, "a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x",
 		lim, true, "[[[0 1] [2]]]")
 	// CROSS JOIN is upstream's JOIN_INNER with no quals, so it collapses
 	// with the inner arm rather than pinning.
@@ -256,8 +264,9 @@ func TestJoinlistCountsAndLeaves(t *testing.T) {
 		t.Errorf("leaves() = %s, want [0 1 2 3]", got)
 	}
 	// A pinned outer join is ONE joinlist member but still two relations —
-	// the distinction `nrels` exists to make.
-	pinned := deconstructJointree(parseFrom(t, "a LEFT JOIN b ON a.x = b.x"), defaultCollapseLimits(), true)
+	// the distinction `nrels` exists to make. Spelled with FULL since C-04a:
+	// LEFT no longer pins (see TestOuterJoinsStayPinned).
+	pinned := deconstructJointree(parseFrom(t, "a FULL JOIN b ON a.x = b.x"), defaultCollapseLimits(), true)
 	if len(pinned) != 1 {
 		t.Errorf("pinned outer join: %d members, want 1", len(pinned))
 	}

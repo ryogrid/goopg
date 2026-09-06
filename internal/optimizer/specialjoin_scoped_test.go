@@ -33,8 +33,8 @@ func scopedCollect(t *testing.T, from string, cat catalog.Catalog) string {
 	t.Helper()
 	fromExprs := parseFrom(t, from)
 	sc := newSjiScope(fromExprs, cat)
-	jl := deconstructJointreeScoped(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), sc)
-	infos := jl.collectSpecialJoinInfos(nil)
+	// C-04a: from the deconstruction, not the joinlist walk — see sjCollect.
+	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), sc)
 	if len(infos) == 0 {
 		return "(none)"
 	}

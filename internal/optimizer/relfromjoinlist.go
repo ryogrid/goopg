@@ -301,10 +301,12 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 		switch {
 		case it.isLeaf():
 			r, err = prob.leafRel(it.rel)
-		case it.pinnedOuter():
-			// M0127-P5.9-s: the search builds INNER joins, so planning a pinned
-			// outer subproblem would emit an inner join where the statement wrote
-			// an outer one and drop its unmatched rows. Upstream cannot reach
+		case it.pinnedUnsearchable():
+			// M0127-P5.9-s: the search builds INNER joins for the types it has
+			// no jointype-aware producer for, so planning such a pinned outer
+			// subproblem would emit an inner join where the statement wrote an
+			// outer one and drop its unmatched rows. C-04a took LEFT out of
+			// that set — see `pinnedUnsearchable`. Upstream cannot reach
 			// this: its joinlist member IS the `JoinExpr`, and
 			// `make_rel_from_joinlist` hands a pinned one to
 			// `make_join_rel`/`join_is_legal`, which honour `jointype`.

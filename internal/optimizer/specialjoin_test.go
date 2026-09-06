@@ -55,8 +55,11 @@ func fmtJoinRelSet(b *strings.Builder, label string, rs RelSet) {
 func sjCollect(t *testing.T, from string) string {
 	t.Helper()
 	fromExprs := parseFrom(t, from)
-	jl := deconstructJointree(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
-	infos := jl.collectSpecialJoinInfos(nil)
+	// C-04a: read the SpecialJoinInfos from the DECONSTRUCTION, not from a
+	// walk of the joinlist's items — a LEFT join no longer pins, so it has no
+	// item to carry one and the walk would answer "(none)" for every LEFT
+	// fixture in this file. See `deconstructJointreeScopedSJI`.
+	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
 	if len(infos) == 0 {
 		return "(none)"
 	}
@@ -272,16 +275,31 @@ func TestSpecialJoinInfoResolveContextPopulated(t *testing.T) {
 	if len(rctx.joinInfoList) == 0 {
 		t.Error("joinInfoList not populated on resolveContext for LEFT JOIN query")
 	}
-	if len(rctx.joinlist.collectSpecialJoinInfos(nil)) != len(rctx.joinInfoList) {
-		t.Error("joinInfoList and collectSpecialJoinInfos disagree")
+	// C-04a: the joinlist walk no longer sees a LEFT join's SpecialJoinInfo —
+	// the link does not pin, so there is no item to carry it — which is
+	// exactly why `joinInfoList` is now published by the deconstruction. The
+	// walk is a SUBSET, and the invariant that remains is that everything it
+	// does see is in the list. TestJoinInfoListProvenanceMatchesJoinlistWalk
+	// pins the divergence itself.
+	for _, sj := range rctx.joinlist.collectSpecialJoinInfos(nil) {
+		found := false
+		for _, got := range rctx.joinInfoList {
+			if got == sj {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Error("a SpecialJoinInfo on the joinlist is missing from joinInfoList")
+		}
 	}
 }
 
 func TestSpecialJoinInfoFieldsAreSet(t *testing.T) {
 	// Verify that the SpecialJoinInfo fields match PG's expectations.
 	fromExprs := parseFrom(t, "a LEFT JOIN b ON a.x = b.x")
-	jl := deconstructJointree(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled())
-	infos := jl.collectSpecialJoinInfos(nil)
+	// C-04a: from the deconstruction, not the joinlist walk (see sjCollect).
+	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
 	if len(infos) != 1 {
 		t.Fatalf("expected 1 SpecialJoinInfo, got %d", len(infos))
 	}

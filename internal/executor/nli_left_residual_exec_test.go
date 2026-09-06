@@ -73,9 +73,18 @@ func newNLILeftResidualFixture(t *testing.T) (*Context, func()) {
 			{NDistinct: 4}, {NDistinct: 1},
 		}}
 	}
+	// C-04a: the LEFT link now enters the join SEARCH, which prices an index
+	// probe against a hash build instead of taking the legacy NLI rewrite
+	// unconditionally. At the fixture's literal four rows a hash build is
+	// free and wins, so the shape this test exists to exercise would never be
+	// reached — "an unwinnable path is an untested path". The inner is
+	// therefore ADVERTISED as large (the rows on disk are unchanged, so every
+	// row assertion below still reads the same four values): a 200k-row inner
+	// with a selective index makes the per-outer probe the cheap plan, which
+	// is the regime the operator is deployed in.
 	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "ordr"}); ok {
-		tbl.Stats = &catalog.TableStats{RowCount: 4, Columns: []catalog.ColumnStats{
-			{NDistinct: 3}, {NDistinct: 4},
+		tbl.Stats = &catalog.TableStats{RowCount: 200000, Columns: []catalog.ColumnStats{
+			{NDistinct: 200000}, {NDistinct: 200000},
 		}}
 	}
 	return ctx, cleanup
@@ -103,10 +112,23 @@ const nliLeftQuery = "SELECT c_key, o_total FROM cust LEFT JOIN ordr " +
 func requireNLILeftPlan(t *testing.T, ctx *Context) {
 	t.Helper()
 	plan := nliResidualExplain(t, ctx, nliLeftQuery)
-	for _, want := range []string{"Nested Loop Left Join", "Index Cond: (o_key = cust.c_key)", "Filter:"} {
+	for _, want := range []string{"Nested Loop Left Join", "Filter:"} {
 		if !strings.Contains(plan, want) {
 			t.Fatalf("expected an index-driven LEFT NLI with a residual (missing %q); plan:\n%s", want, plan)
 		}
+	}
+	// C-04a: the inner may now be reached by EITHER of the NLI's two index
+	// arms. Both build the same `NestedLoopIndexJoin` with the same leftover
+	// residual — which is the operator this file is about — but the search
+	// prices them against each other now that a LEFT link is inside it, and on
+	// this fixture the BITMAP arm wins (DPPATH: nestloop.index 25.39 vs
+	// 65.40, both `jointype=left`). The bitmap arm's inner renders no
+	// `Index Cond:` line, so requiring one would fail on a plan that is
+	// correct; it was simply unreachable for a LEFT join before C-04a.
+	if !strings.Contains(plan, "Index Cond: (o_key = cust.c_key)") &&
+		!strings.Contains(plan, "Bitmap Index Scan on ordr_key_idx") {
+		t.Fatalf("expected an index-driven inner (neither an outer-bound Index Cond nor a "+
+			"bitmap index scan on ordr_key_idx); plan:\n%s", plan)
 	}
 }
 
