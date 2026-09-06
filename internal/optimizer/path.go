@@ -60,6 +60,12 @@ const (
 	PathNestLoop
 	PathAgg
 	PathSort
+	// PathDistinct is C-16's (P4-07) DISTINCT upper-rel candidate — the
+	// hashed or unique (DistinctOn-emitted) way to deduplicate one
+	// input. Produced only by `addDistinctPaths` (distinctpaths.go) and
+	// consumed only by `createDistinctPlan`, because goopg's executor
+	// expresses the choice as `*Distinct` vs all-columns `*DistinctOn`.
+	PathDistinct
 	PathGather
 	PathGatherMerge
 	// PathMemoize is PG's `MemoizePath` (pathnodes.h:2079): a caching wrapper
@@ -145,6 +151,22 @@ type Path struct {
 	// other kind; `createAggPlan` panics on a PathAgg without one, the same
 	// way `createSortPlan` panics on a Sort without pathkeys.
 	Agg *Aggregate
+
+	// Distinct is the DISTINCT spec a PathDistinct performs — the
+	// `*Distinct` built at the wrapper site (pos, schema), whose Child the
+	// arm replaces with the built input. Shared by both candidates
+	// (hashed, unique); unlike AggStrategy's copy problem there is
+	// nothing per-variant to carry, because the input-child difference
+	// already rides in Children[0]. nil for every other kind.
+	Distinct *Distinct
+
+	// Unique switches a PathDistinct's emitted node kind: false emits
+	// `*Distinct` (hash dedup), true emits `DistinctOn` with all-output-
+	// columns keys (streaming adjacent dedup over the producer-stacked
+	// Sort). Set only by the unique arm, read only by `createDistinctPlan`
+	// (C-16b). Never pruned on: costs alone decide, exactly as for every
+	// other path attribute above.
+	Unique bool
 
 	Rel *RelOptInfo
 

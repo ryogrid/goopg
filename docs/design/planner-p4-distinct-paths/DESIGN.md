@@ -1,4 +1,4 @@
-# C-16 (P4-07) — `create_distinct_paths`: the DISTINCT upper rel with hashed / sorted / unique-over-sorted paths
+# C-16 (P4-07) — `create_distinct_paths`: the DISTINCT upper rel with hashed / unique-over-sorted paths
 
 Status: **design only**. Nothing under `internal/` was modified while it was
 written. Every goopg claim was read out of the tree at `280b99625` (C-15
@@ -45,7 +45,7 @@ render as `"Unique"` in EXPLAIN (`operators_explain.go:2313-2314`,
 `:2604-2610`), and PP keys on rendered text — so reusing `DistinctOn`
 with keys = all output columns for unique-over-sorted needs ~0 executor
 LOC AND prints exactly what PG prints. No new executor node, no new
-executor gate: C-16b is planner-only (a third candidate + arm mapping),
+executor gate: C-16b is planner-only (a second candidate + arm mapping),
 which is why the two slices share one design doc and one gate run. The
 reuse is audited per type-switch site at implementation (any pass
 assuming `KeyCols ⊂ cols` must tolerate `KeyCols == all cols` — the
@@ -99,7 +99,7 @@ imprecision, not this cut's business). Output rows via `estimateDistinctRows`
 
 ---
 
-## 3. Cut C-16a — DISTINCT upper rel, hashed vs sorted
+## 3. Cuts C-16a/b — DISTINCT upper rel, hashed vs unique (one cut, two candidates)
 
 At both wrapper sites, build the `*Distinct` spec once, then (option (b)):
 
@@ -115,7 +115,8 @@ best := getCheapestFractionalPath(distinctRel, tupleFraction)        // + empty�
 node, _ = createPlanNode(best)                                       // PathDistinct arm → *Distinct
 ```
 
-Candidates, at most two:
+Candidates, at most two (single candidate per shape — a pathlist holding
+more means the producer over-generates, §6 negative):
 
 - **HASHED**: `PathDistinct` over the seed. Price = `costAgg`
   HASHED with numGroupCols = output width, numGroups = rel Rows, nAggs = 0
@@ -124,19 +125,17 @@ Candidates, at most two:
   Never offered when `len(s.DistinctOn) > 0` (see gate below — DISTINCT ON
   has its own node and planning; PG never hashes it,
   `planner.c:5195-5198`).
-- **SORTED**: `PathDistinct` over `sortPathForBounded(seed, all-cols
-  keys, cp, -1)`. Price = sort + `cpu_operator` per input row (adjacent
-  comparison if it streamed — it does not yet, see C-16b) +
-  `cpu_tuple` per output row. Same DISTINCT ON gate (a sorted `Distinct`
-  over `DistinctOn` output is harmless but outside the stated blast
-  radius — and under GUC-off it would be a real plan move).
-- **UNIQUE (C-16b)**: `PathDistinct{Unique}` over the Sort input — same
-  Sort as SORTED (shared construction), but the arm emits
-  `DistinctOn{KeyCols: all output positions}` instead of `Distinct`,
-  which `distinctOnOp` streams. Priced sort + `cpu_operator` per input
-  row + `cpu_tuple` per output row (PG's Unique price). Offered only over
-  a Sort the producer stacked (input order guaranteed by construction —
-  never over an unordered seed). Inherits the Sort's `DisabledNodes`.
+- **UNIQUE**: `PathDistinct{Unique}` over the Sort input — the arm emits
+  `DistinctOn` with all-output-columns keys (streaming adjacent dedup)
+  instead of `Distinct`. There is deliberately NO third "sorted Distinct"
+  candidate: hash dedup over the same Sort would price and order
+  identically to Unique and die as a duplicate in `add_path` — offering
+  it would be noise, not choice (PG likewise builds Unique, not
+  sorted-Agg, for the sorted DISTINCT shape). Price = sort +
+  `cpu_operator` per input row + `cpu_tuple` per
+  output row (PG's Unique price). Offered only over a Sort the producer
+  stacked (input order guaranteed by construction — never over an
+  unordered seed). Inherits the Sort's `DisabledNodes`.
 
 `Path` gains `Unique bool` — set only by the unique arm, read only by the
 arm (which emits `DistinctOn` instead of `Distinct`). No strategy enum:
@@ -176,16 +175,16 @@ price though not in fact — same honesty caveat as C-15's display story,
 stated). Everything else keeps hashed by cost (Sort adds cost, same dedup
 work). Values cannot move (same node, same executor).
 
-Out of scope (C-16b or later): Unique node, presorted/index inputs,
+Out of scope (later): presorted/index inputs,
 DISTINCT ON (own node, own planning), partial paths (C-19), LIMIT-1
-collapsing.
+collapsing. (No "Unique node" out-of-scope item remains — reuse adopted.)
 
 ---
 
 ## 4. Cut C-16b — `DistinctOn`-reuse unique-over-sorted (planner-only)
 
-No executor change: the candidate is `PathDistinct{Unique}` over the SAME
-Sort the SORTED arm stacks; the arm emits `DistinctOn{KeyCols: all output
+No executor change: the candidate is `PathDistinct{Unique}` over a
+producer-stacked Sort; the arm emits `DistinctOn{KeyCols: all output
 positions}` instead of `Distinct`, and `distinctOnOp` streams it
 (adjacent `datumKey` compare; NULL encodes as `"n"` so NULLs dedup —
 the NULLS-NOT-DISTINCT semantics, verified against
@@ -284,7 +283,7 @@ Negative results, stated in advance:
 
 C-16a: **~150 LOC production + ~150 test LOC** (producer + arm + rel
 sizing + wrapper tests). C-16b: **~0 executor + ~80 planner + ~150 test
-LOC** (third candidate + arm mapping + adjacent-dedup suite — the
+LOC** (second candidate + arm mapping + adjacent-dedup suite — the
 DistinctOn reuse, not a new node). Estimates.
 
 ---

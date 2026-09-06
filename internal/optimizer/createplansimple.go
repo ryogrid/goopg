@@ -174,6 +174,36 @@ func createAggPlan(p *Path) (Node, outputLayout) {
 	return &out, nil
 }
 
+// createDistinctPlan is the PathDistinct arm (C-16): emit the path's
+// DISTINCT spec over the built input — `*Distinct` (hash dedup), or
+// `DistinctOn` with all-output-columns keys when the path is Unique
+// (streaming adjacent dedup over the producer-stacked Sort, C-16b).
+// The KeyCols cover every output position, which is exactly full-row
+// dedup; the child order contract ("equal keys contiguous") holds because
+// the unique arm is only ever offered over the producer's own Sort.
+//
+// The returned layout is nil, as for the aggregate arm: DISTINCT preserves
+// columns positionally (dedup, not projection), but the layout describes
+// BINDING coordinates and the producers above the seam work in Nodes —
+// the same nil `baseRelLayout` yields for any upper rel without a baseLeaf.
+// Callers above the seam never read it (C-12 precedent).
+func createDistinctPlan(p *Path) (Node, outputLayout) {
+	if p.Distinct == nil {
+		panic("createPlan: PathDistinct with no distinct spec")
+	}
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathDistinct with %d children, want exactly 1", len(p.Children)))
+	}
+	child, _ := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathDistinct over a child path that built no node")
+	}
+	if p.Unique {
+		return &DistinctOn{pos: p.Distinct.pos, Child: child, KeyCols: distinctAllKeyCols(child), schema: p.Distinct.schema}, nil
+	}
+	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema}, nil
+}
+
 func createSortPlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 1 {
 		panic(fmt.Sprintf("createPlan: PathSort with %d children, want exactly 1", len(p.Children)))

@@ -141,6 +141,9 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	case PathAgg:
 		// C-15: the GROUP_AGG upper rel's candidate. createplansimple.go.
 		return createAggPlan(p)
+	case PathDistinct:
+		// C-16: the DISTINCT upper rel's candidate. createplansimple.go.
+		return createDistinctPlan(p)
 	default:
 		// PathMultiHash / … do not have arms yet. Reaching here means a phase
 		// constructed a path kind without teaching createPlan to translate it.

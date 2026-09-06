@@ -920,6 +920,14 @@ func replaceSingleChild(n Node, child Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *DistinctOn:
+		// C-16b: the unique winner is a DistinctOn; without this arm
+		// rebuildWithGather silently drops Gather insertion across it
+		// (safe direction — correct plan, missed parallelization — but
+		// a prior review's requirement must not evaporate silently).
+		c := *x
+		c.Child = child
+		return &c
 	}
 	// Unknown wrapper: refuse rather than guess. Returning n unchanged means
 	// no Gather is inserted, which is always safe.

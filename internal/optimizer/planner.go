@@ -1513,7 +1513,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	if rewritten, ok, err := rewriteMinMaxAggregates(s, ctx, cat); err != nil {
 		return nil, err
 	} else if ok {
-		if wrapped, wrapOK := wrapMinMaxOrderByDistinct(s, rewritten, cat); wrapOK {
+		if wrapped, wrapOK := wrapMinMaxOrderByDistinct(s, rewritten, cat, plannerSet); wrapOK {
 			return wrapped, nil
 		}
 	}
@@ -2108,11 +2108,21 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		}
 		out = &DistinctOn{pos: s.Pos(), Child: out, KeyCols: keyCols, schema: out.Output()}
 	}
-	// SELECT DISTINCT: wrap the full plan with a Distinct node that deduplicates
-	// on the projected output. Applied after sorting so ORDER BY is respected.
-	// M0097-0005.
-	if s.Distinct {
-		out = &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
+	// SELECT DISTINCT: the DISTINCT upper rel's path now (C-16) — hashed
+	// vs unique-over-sorted candidates priced against each other
+	// (distinctpaths.go) — and no longer the bare wrapper. Applied after
+	// sorting so ORDER BY is respected. M0097-0005. Gated on empty
+	// DistinctOn (defense-in-depth: both parsers leave Distinct=false for
+	// DISTINCT ON today, but the ast.go contract claims otherwise).
+	if s.Distinct && len(s.DistinctOn) == 0 {
+		spec := &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
+		// The registry is this scope's function-local `upper` (C-11), as
+		// the ORDER BY and aggregate sites read it.
+		dnode, derr := createDistinctPaths(upper, spec, cat, plannerSet, orderTupleFraction)
+		if derr != nil {
+			return nil, derr
+		}
+		out = dnode
 		// The distinctOp sorts rows internally in ascending order.  When the
 		// query has ORDER BY, that inner sort loses the requested direction.
 		// Re-apply ORDER BY on top of Distinct by resolving each ORDER BY key
@@ -10406,7 +10416,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 // substituteMinMaxOrderByExpr). The caller then falls through to today's
 // exact (pre-S19) behavior — a declined rewrite is always correct, a wrong
 // wrap is not.
-func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog.Catalog) (Node, bool) {
+func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog.Catalog, ps PlannerSettings) (Node, bool) {
 	if len(s.DistinctOn) > 0 {
 		return nil, false
 	}
@@ -10447,7 +10457,16 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 		out = &Sort{pos: s.Pos(), Child: out, Keys: keys}
 	}
 	if s.Distinct {
-		out = &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
+		// C-16: same DISTINCT upper-rel producer as the normal arm (nil
+		// registry — this escape hatch has no planning scope of its own;
+		// single-row output makes the contest trivially one-sided).
+		// DISTINCT ON cannot reach here (declined at entry above).
+		spec := &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
+		dnode, derr := createDistinctPaths(nil, spec, cat, ps, 0)
+		if derr != nil {
+			return nil, false
+		}
+		out = dnode
 	}
 	return out, true
 }
