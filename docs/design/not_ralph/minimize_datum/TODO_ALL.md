@@ -1026,7 +1026,39 @@ rule).*
   cannot silently drop the guard.
   *before C-11; fixture before C-15. gate: red-then-green fixture + P4
   values-diff. doc + ~80–150 test LOC, low risk, buys off a high one.*
-- [~] **C-10d P4-00d FROM-subquery pull-up — MEASUREMENT DONE 2026-09-05;
+- [x] **C-10d P4-00d FROM-subquery pull-up — DECIDED 2026-09-07: the
+  boundary is PERMANENT; `pull_up_subqueries` is NOT ported in this
+  workstream.** The row said the decision was the owner's; here it is,
+  with the reason it is not a close call.
+  **The measurement refutes the port's own structural justification.** A
+  full `pull_up_subqueries` port removes **18 of 46** ABOVE-BLOCKING
+  boundaries (39%), leaving **28**. So C-11's upper rels had to support
+  boundary-crossing construction REGARDLESS — the port is an optimisation
+  on top of that support, never an enabler of it. Paying ~400-700 LOC of
+  high-risk change that moves the values of ~46 corpus queries, to
+  eliminate 39% of a problem you must solve anyway, is the wrong order.
+  **And the decision has in effect already been taken by what shipped:**
+  C-11 (P4-02) and C-12 (P4-03) are both landed and both treat the
+  boundary as permanent — `relfromjoinlist.go` documents it as deliberate
+  and ledgers its two costs (no differently-sorted path for the
+  sub-problem; priced for "produce all rows" so an outer LIMIT cannot
+  reach in). Reopening that assumption now would re-litigate two done
+  items for a fraction of a problem they already handle.
+  **The caveat is recorded, not buried:** Q9 — P4-01's own witness — IS in
+  the pullable set, putting its entire 6-way join tree inside a derived
+  table (verified against the AST, not assumed: 6 inner leaves, sole FROM
+  item, outer GROUP BY + aggregate + ORDER BY). So a real, unmeasured
+  plan-quality case for the port exists on exactly one high-value query.
+  **Successor filed rather than folded in:** port `pull_up_subqueries` as
+  its own item, judged on its own measured plan-quality evidence starting
+  from Q9, not on the structural argument this measurement refuted. Note
+  the scope correction this census also established — `RangeVar.Subquery`
+  is only ONE of THREE routes to the same opaque prebuilt leaf; WITH-list
+  CTEs (70 in 30 of 99 TPC-DS queries, 61 in a join tree) and views are
+  the others, so a pull-up that handles only FROM-subqueries covers less
+  of the corpus than the headline count suggests.
+  Census: `analysis/planner-refactor-take3/c10d-boundary-census-20260905/README.md`.
+  ORIGINAL ROW (measurement, retained verbatim): MEASUREMENT DONE 2026-09-05;
   the decision is the owner's.** AST-derived census (goopg's own parser, not
   a regex — the ~41/100 figure was regex-derived and flagged):
   TPC-H **5** boundaries in 5 queries, TPC-DS **89** boundaries in 41 of 99
