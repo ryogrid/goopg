@@ -968,6 +968,61 @@ something to delete *into* — C-19g replaces `splitAggregate` with paths
 because C-15 made grouping paths exist, and C-20a can delete the legacy
 estimators only once every consumer reads the path model.
 
+## 5.18. C-19g: partial aggregation makes the Gather pay
+
+§5.9 established the arithmetic that kept the parallel path off: crossing
+a Gather costs `parallel_tuple_cost` = 0.1/row against a 4-worker saving
+of ≈0.0075/row, so with only base-rel partial paths **the whole relation
+crosses** and `add_path` correctly dominates every Gather at any size.
+C-19f put the join below the boundary and got Q21 −51%, but Q9 +94% left
+the default off.
+
+C-19g puts the **aggregation** below it, and that changes the arithmetic
+by orders of magnitude rather than by a factor. goopg's Partial node emits
+**zero rows** — group-states cross through a mutex-guarded accumulator —
+so TPC-H Q1 at 4 workers crosses **16 group-states, not 5,901,255 rows**:
+1.6 against 590,000 charged at `parallel_tuple_cost`, plus ~110,000 saved
+on per-worker CPU. The boundary term essentially disappears.
+
+Measured, three alternating passes per arm, medians:
+
+| | off | on | |
+|---|---:|---:|---|
+| **Q1** | 8.57 s | **4.14 s** | **−51.7%** |
+| suite | — | — | −4.3% |
+
+The off-arm spread was 1.2%, so Q1's move is **50× outside the noise
+floor** — the largest single-query result in this workstream after the
+27% calibration, and the first one the parallel track has produced.
+
+Two things make it more than a number:
+
+- It **replaces five invented constants with a path tournament.**
+  `splitAggregateIsProfitable` weighed `cXfer 2.0`, `cTrans 1.0`,
+  `cHash 0.25`, `cMerge 4.0`, `cOut 1.0`, self-described as "calibrated
+  against one query". C-19g prices two candidate paths with `costAgg` +
+  `gatherCost` and lets `addPath`/`setCheapest` adjudicate — no new cost
+  function and no new constant, so the verdict is
+  `compare_path_costs_fuzzily`'s, fuzz band included.
+- It **reaches queries the old rule could not.** Before this slice the
+  only TPC-H aggregates that split were the three *ungrouped* ones,
+  because an ungrouped aggregate is the single case `groupsToRowsRatio`
+  can answer without statistics.
+
+**It ships default-OFF** (`GOOPG_PARTIAL_AGG_PATHS`), and that is not
+timidity: flipping it moves three TPC-H plans and so requires re-pinning
+`plan_snapshots/` in the same commit — a shared artefact two peer agents
+were A/B-ing against all session. The flip is fully specified and is the
+next action, not an open question.
+
+Honest limits, recorded because the result is good enough to be
+over-read: `MODE=costs` is **not evaluable** on a restarted private clone
+(cold-stats drift moves even the mode-OFF control 21/22), so it is not
+claimed; Q5 +7.2% and Q14 +10.6% (0.47→0.52 s) sit inside their own arms'
+spreads and are not counted either way; and the upper-rel-resident half of
+`create_partial_grouping_paths` is genuinely unfinished, so the item is
+`[~]`, not `[x]`.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
