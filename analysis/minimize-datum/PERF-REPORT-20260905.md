@@ -1372,6 +1372,94 @@ wins a Merge Left Join at 5× the cost.
 One open observation recorded and deliberately not tuned: Q40's printed
 cost *rises* 24 k → 393 k while its runtime *falls* 1.50 → 0.92 s.
 
+## 5.24. C-19e lands cost-driven; C-19h reveals the parallel track's keystone
+
+**C-19e (P5-05)** replaces `sortPartialRootPays`' hard-coded decline with
+a two-candidate path tournament — `Gather Merge -> Sort -> partial`
+against `Sort -> Gather -> partial`, the two plans the post-pass actually
+builds — priced by `costSortRun` + `cost_gather`/`cost_gather_merge` and
+adjudicated by `addPath`/`setCheapest`. The accounting worth stating:
+**the rule it replaces had one hard-coded type switch; the replacement has
+none.** It rides `GOOPG_PARTIAL_SORT_PATHS`, default off, delegating to
+the retired switch unchanged, so the default and serial control arms stay
+bit-identical.
+
+The item pre-authorised recording a "permitted divergence" if goopg's
+costs still chose leader-side sorting. **That case did not occur, so
+nothing was recorded.** goopg's costs choose the worker-side sort,
+disagreeing with the old rule, and the measurement backs the costs:
+exactly one TPC-H plan moves — q16, the query the rule's own note cites —
+with a median over five paired observations of 0.82 s off / **0.70 s on**.
+The historical regressions that motivated the decline (q16 1.5 -> 2.3 s,
+q13 4.2 -> 6.8 s, M0134-0189) **do not reproduce**: they predate E-10's
+Gather-Merge claim set, and q13's plan no longer moves at all. Suite
+totals sit inside their own spread in both directions, so no suite claim
+is made.
+
+### 5.24.1 A latent EXPLAIN bug found only because both arms were run
+
+`rebuildWithGather`'s merge arm stamped `stampParallelScan(root)` with
+`root` being the `*Sort` — which has no arm there — so the call fell
+through and returned the Sort unchanged. The scan under a Gather Merge
+therefore rendered **without its `Parallel ` label while the workers were
+splitting it**: EXPLAIN under-reporting the one thing it exists to report.
+
+It is label-only (the flag is read in `operators_explain.go` and nowhere
+else) and has been latent since P7 **because the shape was unreachable** —
+`sortPartialRootPays` declined every index driver, and no TPC-H plan
+reached it with a seq-scan driver either. C-19e's cost verdict makes it
+reachable, and the bug surfaced immediately. This is the third instance
+this session of **an unwinnable path being an untested path**, and the
+second where turning a decline into a priced decision exposed code that
+had never executed.
+
+### 5.24.2 C-19h: blocked, and not on the thing everyone assumed
+
+C-19h (retire `MaybeAddGather`) was expected to be gated on flipping
+`GOOPG_GATHER_PATHS` to on. The measurement says otherwise, and the real
+blocker had never been named as a prerequisite.
+
+At the engine defaults, **the post-pass is the only producer of
+parallelism at all**: `generateUsefulGatherPaths` and `addPartialAggPaths`
+are the sole producers of `PathGather`/`PathGatherMerge` and both return
+at their first line when their knob is off — the default for both.
+
+| arm | queries with a Gather | TPC-H suite |
+|---|---:|---:|
+| post-pass live (default) | **12 / 22** | 232.35 s |
+| post-pass retired | **0 / 22** | **467.03 s (+100.0%)** |
+| stand-down at `GP=all PA=on` | 7 / 22 | — |
+
+Q18 goes 43 -> 154 s, Q21 17.7 -> 61.1 s, Q19 2.6 -> 25.3 s. And the
+conditional retirement — the salvage the item permits — fails too: at
+`GOOPG_GATHER_PATHS=all` + `GOOPG_PARTIAL_AGG_PATHS=on` a stand-down
+build reaches only 7 of 22. It **gains Q21** (C-19f's win, the case only a
+path model reaches) and **loses Q1, Q6, Q14, Q15a, Q16 and Q19**.
+
+Why Q1 is lost is the whole finding: **C-19g replaced the split verdict
+but not the construction.** `partialAggSplitPays` "returns only a boolean
+and constructs no node", while `splitAggregate` in `parallel.go` still
+builds `Finalize -> Gather -> Partial` inside the post-pass. So C-19g's
+own headline win — Q1 8.57 -> 4.14 s — is *delivered through the very
+post-pass C-19h wants to delete*, and dies with it. That is precisely
+what C-19g's `[~]` row meant by "the upper-rel-resident half is
+unfinished"; it had simply never been connected to C-19h.
+
+Two process points. The conditional stand-down was **written and then
+reverted rather than shipped**: landing it would serialise six queries in
+the exact arm on which the default flip is to be judged, and a staging
+position worse than both endpoints is not staging. And the item's own
+double-Gather requirement was **verified rather than assumed** — across
+every arm measured, including `GP=all PA=on` with the post-pass live, no
+plan carries more than one Gather on any root-to-leaf path.
+
+The sequencing this establishes: finish C-19g's upper-rel half -> re-run
+the census -> retire conditionally on `all` -> flip the default (needs the
+`plan_snapshots/` re-pin) -> only then delete. **Only the last step is
+C-19h as written.** This also retires my own standing plan to flip
+`GOOPG_PARTIAL_AGG_PATHS` as an independent step: the flip is not the
+finish line, the construction port is.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
