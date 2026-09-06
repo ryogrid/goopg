@@ -300,3 +300,38 @@ node in column 0 while a goopg `psql` capture indents it by one.
 | `census.tsv` | all 100 `Sort` nodes: bindability, estimated vs **actual** input rows, sort ms, query ms, method, memory, input node |
 | `sort-nodes.txt` | the plan lines the census is read from, per query — the evidence |
 | `census.py` | the measurement instrument (tree reconstruction, classification, timing) |
+
+---
+
+## Addendum 2026-09-06 — the cluster this was measured on was I/O-bound
+
+Discovered after this census was written: the TPC-DS SF0.5 goopg cluster was
+running on the **128MB `shared_buffers` default** (16,384 slots) against a
+**1.113 GiB** working set, because its `postgresql.conf` left `shared_buffers`
+commented out. `store_sales` alone is 232 MiB — 1.8x the entire pool — and two
+sequential scans of it produced **59,522 reads / 43,138 evictions**. Nothing
+was resident; every scan re-read from the OS. Fixed to `2048MB` (commit
+`0df7dc930`), matching TPC-H and the PG TPC-DS reference.
+
+**This strengthens the census's conclusion rather than weakening it.** The
+finding was that all sorting is ≤ 119.8 ms of 802 s = 0.015% of corpus wall
+time. That denominator, 802 s, was inflated by I/O the fix removes; the sort
+times themselves are CPU work and are not. So the true sort share is *higher
+than 0.015% but still bounded by the same absolute 119.8 ms* against a smaller
+total — and the go/no-go argument never rested on the ratio anyway. It rested
+on three facts the residency defect cannot touch:
+
+- median sort input is **145 rows**, and 54 of 77 bindable sorts read
+  already-collapsed aggregate or window output;
+- the largest single sort is Q51 at 324,249 rows = **1.9 ms**;
+- **0 of 100 sorts spilled**, largest footprint 26 MB against the 256 MiB
+  `sortChunkBytes` threshold — so the design's strongest argument, that a bound
+  removes a spill outright, still has no witness.
+
+**What must NOT be reused from this artifact**: the per-query and total wall
+times in `census.tsv` (`sort_ms` is fine; `query_ms` is I/O-inflated), and any
+goopg-vs-PG timing comparison. The est-vs-actual ROW COUNTS are unaffected —
+row estimates and actual row counts do not depend on buffer residency — so the
+row-estimate defect this census found (ledger
+`take3-tpcds-rowest-3-to-5-orders`, diagnosis
+`docs/design/planner-rowest-collapse/DESIGN.md`) stands entirely.
