@@ -76,19 +76,40 @@ if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
         # the power test starts (M0054-0007-checkpoint-before-run).
         echo "checkpoint_timeout = 24h"
         echo "max_wal_size = 1024GB"
-        # Gate determinism (2026-09-05): the autovacuum launcher runs a
-        # SAMPLED ANALYZE every autovacuum_naptime (60 s), so on a cluster
-        # used as a measurement instrument the planner's inputs move DURING
-        # a run — measured effect: statistics changed between the two arms
-        # of an A/B and even between two queries of one arm, flipping whole
-        # join methods (Q3 Nested Loop vs Merge Join, Q9 hash vs merge
-        # spine). Pinned here, in the tracked generator, so a --reset does
-        # not silently restore the noise.
-        # Consequence to remember: nothing sets visibility-map bits on this
-        # cluster any more, so index-only paths are priced pessimistically.
-        # Run one manual VACUUM after a fresh load.
+        # autovacuum: ON, to match PostgreSQL's default and the PG reference
+        # cluster (2026-09-06). CROSS-ENGINE FAIRNESS OVERRIDES GATE
+        # DETERMINISM here, deliberately, and the cost is real — read on
+        # before changing it back.
+        #
+        # This was `off` from 2026-09-05, for a measured reason: the
+        # autovacuum launcher runs a SAMPLED ANALYZE every
+        # autovacuum_naptime (60 s), so on a cluster used as a measurement
+        # instrument the planner's inputs move DURING a run. Statistics
+        # changed between the two arms of an A/B and even between two
+        # queries of one arm, flipping whole join methods (Q3 Nested Loop vs
+        # Merge Join, Q9 hash vs merge spine). Turning it off was one of the
+        # three fixes that took A/A plan-capture noise from 455 estimate
+        # lines and 27 shape lines to ZERO, which is what made the
+        # cost-exact plan pin (`make plan-gate MODE=costs`) possible at all.
         # See docs/design/planner-gate-reproducibility/DESIGN.md.
-        echo "autovacuum = off"
+        #
+        # Turning it back on therefore re-exposes that drift. The two needs
+        # are separable and should be kept separate:
+        #   - a goopg-vs-PG TIMING arm wants autovacuum on, so both engines
+        #     run the same maintenance policy;
+        #   - a goopg-internal PLAN-CAPTURE or plan-pin arm wants it off, or
+        #     wants an explicit in-session `ANALYZE <table>` per table with
+        #     GOOPG_ANALYZE_SEED set, because it is comparing two goopg
+        #     builds and any stats movement is pure noise.
+        # If A/A plan noise returns, that is the expected mechanism and the
+        # answer is to pin stats for that arm, NOT to re-disable autovacuum
+        # for every measurement.
+        #
+        # Side effect that returns with it, and is a benefit: autovacuum
+        # sets visibility-map bits again, so index-only paths stop being
+        # priced pessimistically. The "run one manual VACUUM after a fresh
+        # load" workaround that `off` required is no longer needed.
+        echo "autovacuum = on"
     } >>"${PGDATA}/postgresql.conf"
 
     # HammerDB connects with user=postgres password=postgres. Goopg's

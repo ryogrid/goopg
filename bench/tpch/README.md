@@ -161,3 +161,51 @@ Logs accumulate in `bench/tpch/logs/`; delete them at will.
   off nothing sets visibility-map bits, and the index-only cost path reads
   `allvisfrac` from them — run a manual `VACUUM` once after each fresh load.
   See `docs/design/planner-gate-reproducibility/DESIGN.md`.
+
+## Cross-engine fairness — the settings both clusters must share
+
+Aligned 2026-09-06 after an audit of what each cluster was actually running.
+Two asymmetries existed, pointing in **opposite** directions, and both are now
+closed:
+
+| knob | goopg 65433 | PG 65432 | before |
+|---|---|---|---|
+| `shared_buffers` | 2048MB | 2048MB | PG was **512MB** — goopg had 4x the buffer memory |
+| `autovacuum` | on | on | goopg was **off** — different maintenance policy |
+| `work_mem` | 64MB | 64MB | already matched |
+| `effective_cache_size` | 2GB | 2GB | already matched |
+
+Verified live rather than by reading the files: both engines report
+`shared_buffers = 262144` 8 kB slots, `autovacuum = on`, `work_mem = 64MB`,
+`effective_cache_size = 2GB`.
+
+(The mirror-image defect on TPC-DS — goopg at the 128MB default against PG's
+2GB — is recorded in `bench/tpcds/README.md`.)
+
+### What turning autovacuum back on costs, and how to handle it
+
+`autovacuum = off` was set on 2026-09-05 for a measured reason: the launcher
+runs a sampled ANALYZE every `autovacuum_naptime` (60 s), so the planner's
+inputs move DURING a run. It flipped whole join methods between two arms of an
+A/B and even between two queries of one arm (Q3 Nested Loop vs Merge Join, Q9
+hash vs merge spine). Disabling it was one of three fixes that took A/A
+plan-capture noise from **455 estimate lines / 27 shape lines to zero**, which
+is what made `make plan-gate MODE=costs` possible.
+
+Cross-engine fairness wins over gate determinism here, because the two needs
+are separable:
+
+- a **goopg-vs-PG timing** arm wants autovacuum on, so both engines run the
+  same maintenance policy;
+- a **goopg-internal plan-capture or plan-pin** arm wants stats pinned — set
+  `GOOPG_ANALYZE_SEED` and issue an explicit in-session `ANALYZE <table>` per
+  table, since it compares two goopg builds and any stats movement is pure
+  noise.
+
+If A/A plan noise reappears, that is the expected mechanism. Pin the stats for
+that arm; do not re-disable autovacuum for every measurement.
+
+One side effect returns with it, and it is a benefit: autovacuum sets
+visibility-map bits again, so index-only paths stop being priced
+pessimistically and the "run one manual VACUUM after a fresh load" workaround
+is no longer needed.
