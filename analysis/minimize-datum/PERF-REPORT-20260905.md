@@ -1460,6 +1460,69 @@ C-19h as written.** This also retires my own standing plan to flip
 `GOOPG_PARTIAL_AGG_PATHS` as an independent step: the flip is not the
 finish line, the construction port is.
 
+## 5.25. Four adjudications made from evidence already in hand
+
+Four items were closed this session without new engineering, because the
+evidence that decides them had already been gathered and was sitting
+unread in their own rows. Recording them together, because the pattern is
+the point: **a deferred item accumulates its own verdict, and nobody goes
+back to read it.**
+
+**B-06 (CTE-agg statistics) — out of scope.** Removing the guard is a
+*regression, not a gain*: Q74 goes 14 s -> 99 s. And PG has no answer
+either — single-key uniqueness against a 4-key GROUP BY — so a faithful
+port cannot supply one. What remains is beyond-PG work with no safe
+ratchet-moving increment. The synthesis design and its inert
+implementation slice (pure functions, 16 tests, no consumers wired) stay
+landed as the resume point.
+
+**B-07 (index-endpoint probe + MCV widening) — out of scope.** The
+endpoint probe is architecturally blocked, and **PG itself keeps it
+`#ifdef NOT_USED`**, so fidelity does not demand it. The reachable pure
+half predicts ~0 ratchet movement on this corpus: the endpoints are fresh
+and every literal is in-bounds, so there is no witness to improve.
+Reopening needs a demonstrated out-of-range case — new evidence, not new
+effort.
+
+**C-10d (FROM-subquery pull-up) — decided: the boundary is permanent.**
+The item's own census refutes the port's structural justification. A full
+`pull_up_subqueries` port removes **18 of 46** ABOVE-BLOCKING boundaries
+(39%), leaving 28 — so C-11's upper rels had to support boundary-crossing
+construction *regardless*. The port is an optimisation on top of that
+support, never an enabler of it, and ~400-700 LOC of high-risk change
+moving ~46 queries' values to remove 39% of a problem you must solve
+anyway is the wrong order. The decision was in any case already taken by
+what shipped: C-11 and C-12 both landed treating the boundary as
+permanent, with `relfromjoinlist.go` documenting it as deliberate and
+ledgering its two costs. The caveat is kept visible rather than buried —
+**Q9, P4-01's own witness, IS in the pullable set** — so the successor is
+filed to be judged on its own measured plan-quality evidence starting
+from Q9, not on the argument the census refuted.
+
+**C-10a — one condition discharged and verified, one still owed.** The
+"must land before C-15" finding was that `pg-plan-parity-diff.py` could
+not *see* the grouping-sets divergence at all: goopg's label and PG's
+`MixedAggregate` were both unknown node kinds, so every such divergence
+was mis-filed as `join-order` and the `aggregation-strategy` bucket that
+a P4 exit criterion reads was **empty of the only 8 queries guaranteed to
+be in it** — a gate that could not fail. It is fixed (`0194551f6`), and I
+verified it three ways rather than by reading the code: self-test 17/17;
+a synthetic pair in the real divergence shape now files as
+`aggregation-strategy` and names both labels; and C-15's own run observed
+the bucket populated and *moving* (13 -> 14), which is the production
+confirmation. The corpus facts also re-check exactly against the tracked
+PG fixtures with no cluster: 11 real grouping-sets queries (the twelfth
+is the `query_0` junk concatenation), 8 measurable after three dsqgen
+SKIPs, and PG picking 3 MixedAggregate + 5 GroupAggregate.
+
+What C-10a still owes is one measurement: the SF=1 memory behaviour of
+Q22/Q67, on which Decision 2's AGG_HASHED pin is explicitly conditional.
+It was **deliberately not run today** — it is a memory-exhaustion
+measurement, and four peer agents held benchmark servers with 12 GB
+already in swap. Running it there would distort the answer and risk
+OOM-killing their arms. A late number beats a contaminated one; that
+lesson was learned twice the hard way earlier in this workstream.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
