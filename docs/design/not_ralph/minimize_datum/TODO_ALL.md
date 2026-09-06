@@ -701,9 +701,20 @@ rule).*
   file, gated together): TPC-H 24/24 by values, same-session A/B −0.7%;
   TPC-DS SF0.5 PASS=95 all-zero, shapes 99/99, verdict-changes=none;
   plan-gate 22/22 both modes, pin `c05-c04b-20260907`.
-- [ ] **C-06 P3-05 retire `GOOPG_PGSHAPED_COLLAPSE`.** Once C-04 makes it
-  the only jointree path; `from_collapse_limit`/`join_collapse_limit`
-  take upstream meaning. Own commit, both suites timed.
+- [!] **C-06 P3-05 retire `GOOPG_PGSHAPED_COLLAPSE` — BLOCKED 2026-09-07 on
+  its own byte-identical gate; nothing deleted.** Two `estimate-audit
+  -plan-only` captures on one cluster, one per flag value: the flip is NOT
+  plan-neutral. TPC-H **Q13 moves, and the OFF plan is the PG-parity one** —
+  `Index Only Scan using customer_pk` + `Hash Left Join` (cost 66,218) vs the
+  ON path's `Index Scan` + `Merge Left Join` (338,223). Runtime is a wash
+  (5.40 s OFF / 5.47 s ON, same session, identical digests). Retiring the
+  flag would delete the only reachable spelling of a PG-shaped Q13 for no
+  measurable gain — the `GOOPG_INDEXKEY_HARVEST` precedent. The item's
+  premise is also unmet: the collapse=0 regime is fully alive after C-04c
+  and untouched by it. Real blocker, named in ledger
+  `c06-collapse-flip-moves-q13`: why the search wins a Merge Left Join at 5x
+  the cost. Resume when that is answered — retiring the flag is downstream
+  of it, not a prerequisite.
   *design: take3 08 §6.3; gate: take3 09 §5 P3.*
   **BLOCKED ON ITS OWN GATE, measured 2026-09-07 after C-04c.** The gate
   is "byte-identical plans for the flip" and the flip is NOT byte-
