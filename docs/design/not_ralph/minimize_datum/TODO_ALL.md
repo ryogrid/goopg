@@ -3876,9 +3876,23 @@ ledger row if the measurement says no.
   `(ps_suppkey, ps_partkey)` composite build, whose insertion path
   `fileCompositeBuildRow` the channel-source pattern does not reach) and
   the nested-build-side ordering above.
-  **Gates.** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-  PASS. `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12 rows=2, Q13 rows=34,
-  against a private clone on port 5541, not the shared bench cluster).
+  **Gates — all green.**
+  - `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS.
+  - `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12 rows=2, Q13 rows=34),
+    against a private clone on port 5541, never the shared bench cluster.
+  - **TPC-DS SF0.5 sweep: `PASS=95 (57 ck-verified) MISMATCH=0
+    CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4`** — the all-zero result, on a
+    private clone of the SF0.5 cluster on port 5542.
+  - **TPC-H values in PARALLEL mode, 21/21 ordered-output hashes
+    identical** between knob OFF and ON on one binary, every query rc=0.
+    This is the gate that matters for this item: `estimate-audit` and
+    `scripts/tpch-acceptance-arm.sh` both capture SERIAL, where the
+    cooperative build never runs, so a green arm there would have been an
+    A/A. Two SF0.5 sweeps before this one read `ERROR=95` at 3 ms per
+    query and were setup failures, not regressions (no server, then no
+    query directory in the worktree) — recorded because that is exactly
+    the shape of a gate that lies.
+  - Plans cannot have moved: the diff touches `internal/executor` only.
   `go test -race ./internal/executor/` — one failure,
   `TestSubquerySemanticsMatrix/M20`, which is **PRE-EXISTING and NOT
   introduced here**, verified by stashing the change and re-running: the
