@@ -3774,8 +3774,15 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
-- [~] **E-18 EX5-03 `Parallel Hash` — SLICE 1 LANDED 2026-09-07 (measured
-  −25.3% Q7 / −7.1% Q5 / −7.1% Q21, parallel mode, values identical).**
+- [x] **E-18 EX5-03 `Parallel Hash` — CLOSED 2026-09-08. Three slices
+  landed, every one default ON and measured in PARALLEL mode with values
+  identical: Q9 10.33 → 2.07 s (−80%, slice 3), Q20 1.91 → 0.65 s (−66%,
+  slice 2), Q7 −25.3% / Q5 −7.1% / Q21 −7.1% (slice 1). After slice 3 no
+  TPC-H build site declines for a reason this item can act on — the
+  remaining declines are correct refusals (`smallrel`, `jointype`) or rule
+  3, which is E-20/E-21's territory.**
+  *Slices 1 and 2, and the source findings that reshaped the design, are
+  recorded below unchanged; slice 3 and the closing evidence follow them.*
   **The design doc's premise is CORRECTED by a source finding it missed:
   goopg ALREADY HAS a cooperative parallel hash build.**
   `parallelBuildLazyHashTable` (`internal/executor/parallel_hash_build.go`,
@@ -3876,6 +3883,112 @@ ledger row if the measurement says no.
   `(ps_suppkey, ps_partkey)` composite build, whose insertion path
   `fileCompositeBuildRow` the channel-source pattern does not reach) and
   the nested-build-side ordering above.
+  **Slice 3 (LANDED 2026-09-08, default ON, `d05305b05`) — the composite-key
+  decline retired, and the paragraph above corrected on its operative half.**
+  - **The bottom-up cooperative build ALREADY EXISTS; there was no ordering
+    work and no ordering hazard.** `prebuildSharedHashJoins` calls
+    `buildLazyHashTable` on every join it collects, and that function's own
+    eligibility check re-enters `parallelBuildLazyHashTable`, which prebuilds
+    ITS build subtree in turn. Slice 2's publication is therefore already
+    recursive, bottom-up, once per table. On Q9 the leader does prebuild the
+    composite join before the `orders` join's producers start. "Reaching Q9
+    needs a BOTTOM-UP cooperative build of the whole inner chain" was
+    describing machinery that was already there.
+  - **What was actually left was ONE eligibility line.**
+    `parallelBuildEligible` declined every multi-column key on the stated
+    ground that "composite keys have a different insertion path
+    (`fileCompositeBuildRow`) that the channel-source pattern doesn't reach".
+    The source refutes it: `fileCompositeBuildRow` is called from INSIDE
+    `buildLoopRight` / `buildLoopLeft` (`operators_join_agg.go`:969 / :899) —
+    precisely the loops the cooperative consumer runs, off a `channelSource`.
+    Key encoding (`encodeBuildCompositeKey`, `o.execKeyBuf`) and filing both
+    happen AFTER the channel, on one goroutine. The composite lane is
+    CONSUMER-side, exactly as batching was in slice 1, and a producer/consumer
+    split cannot observe it. Third decline rule in a row whose stated ground
+    did not survive reading the code it names.
+  **Q9 is one build, and this was it.** `EXPLAIN ANALYZE` in parallel mode
+  puts **12,857 ms of Q9's 13.6 s in a single node's Build Time** — the
+  `(ps_suppkey, ps_partkey)` composite join, whose driving scan is the 6 M-row
+  `lineitem` seq scan under the `part` join's probe side. The `orders` join
+  above it was already cooperative (producers partitioning `partsupp`); it was
+  waiting on this.
+
+  Parallel-mode A/B — 22 queries, 3 alternating reps, fresh capped server per
+  arm per rep, private clone of the bench data dir on port 5543,
+  `max_parallel_workers_per_gather=4`, `work_mem=64MB`, same binary except
+  this change. **22/22 ordered-output md5 hashes identical between the arms
+  in all six runs.**
+
+  | query | A (slice-2 tip) | B (slice 3) | delta |
+  |---|---:|---:|---:|
+  | **Q9** | **10.33 s** | **2.07 s** | **−79.9%** — per rep 10.33/10.38/10.06 vs 2.07/2.07/2.10, ranges disjoint |
+  | Q5 | 3.13 s | 2.97 s | −5.2% |
+  | 22-query median-sum | 98.5 s | 90.9 s | −7.7% |
+
+  Every other query moved inside its own A-arm spread except Q16
+  (0.38 → 0.46 s, +80 ms, ranges disjoint), and **that one is not this
+  change**: the per-query census below records Q16's two build sites
+  declining IDENTICALLY before and after slice 3 (1 `ok`, 1 `smallrel`), so
+  slice 3 cannot reach it. Recorded rather than dismissed — an 80 ms
+  environmental delta on a 0.4 s query is what noise looks like here.
+
+  **Eligibility census, re-run at the slice-2 tip and again after slice 3**
+  (TPC-H SF=1, bench settings, 38 build sites, decline reason logged straight
+  out of `parallelBuildEligible`). Rules 3 and 4 are reported SEPARATELY here
+  where the slice-1 census lumped them, which is why the earlier
+  `13 notseqscan` reads as `8 notseqscan + 10 smallrel` now:
+
+  | decline reason | slice-2 tip | after slice 3 |
+  |---|---:|---:|
+  | `ok` — already cooperative | 16 | **18** |
+  | `smallrel` — rule 4, < `MinParallelTableScanBlocks` | 10 | 11 |
+  | `notseqscan` — rule 3, no partitionable driving scan | 8 | 8 |
+  | `multikey` | 3 | **0** |
+  | `jointype` — rule 1 | 1 | 1 |
+  | `multibatch` | retired in slice 1 | — |
+
+  Per query, the three `multikey` sites were **Q9, Q5 and Q7**. Q9's became
+  `ok` (the −80%); Q5's became `ok` (−5.2%); **Q7's became `smallrel`** — its
+  composite build's driving relation is under `MinParallelTableScanBlocks`,
+  so rule 4 declines it and Q7 is unmoved. That is the honest ceiling of this
+  item: of 38 sites, 18 are cooperative, 12 are correctly refused as too
+  small or the wrong join type, and 8 want a driving scan the plan does not
+  offer — which is a PLANNER shape question (E-20/E-21), not an executor one.
+
+  **Gates — slice 3.**
+  - `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+    (rc=0, no FAIL lines).
+  - `scripts/tpch-spotcheck.sh` **RESULT=PASS with Q12 rows=2 and Q13 rows=34
+    read out of the OUTPUT**, never the exit code. It SKIPped twice before it
+    ran: once because `bench/tpch/runtime_goopg/data` does not exist in a
+    fresh worktree, and once more after that was symlinked, because the
+    script's `du -sm` guard does not follow a symlinked leaf and reported
+    0 MB. The RUNTIME DIR has to be the symlink, not `data` inside it — both
+    failures exit 0.
+  - **TPC-DS SF0.5 sweep: `PASS=95 (57 ck-verified) MISMATCH=0
+    CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4`** — the all-zero result, on a
+    private clone of the SF0.5 cluster
+    on port 5545, private `GOOPG_BIN`, private runtime tree (the git-tracked
+    oracle copied in, the SF=1 query/TSV dir symlinked from the canonical
+    tree: the "no query directory in the worktree" setup failure is what
+    produced the earlier `ERROR=95` sweeps that read as regressions).
+  - **TPC-H values in PARALLEL mode: 22/22 ordered hashes identical** across
+    all six arm-runs. `estimate-audit` and `tpch-acceptance-arm.sh` remain
+    BLIND to this item — they capture serial, where the cooperative build
+    never runs, so a green arm there is an A/A.
+  - `go test -race ./internal/executor/...` — the same single failure,
+    `TestSubquerySemanticsMatrix/M20`, verified PRE-EXISTING by reverting the
+    slice-3 files at `HEAD~1` and re-running: identical DATA RACE, identical
+    subtest. Ledger row, not this item's.
+  - Plans cannot have moved: the diff touches `internal/executor` only.
+  **New guard.** `TestCoopParallelHashBuildComposite`
+  (`coop_parallel_composite_test.go`) is slice 3's newly-reachable-path
+  assertion, on the slice-1 pattern: it sweeps 32 `work_mem` values, compares
+  every row against a SERIAL reference run of the same fixture, asserts the
+  composite payload column is never NULL, and asserts
+  `CoopCompositeBuildCount()` moved. Verified to FAIL (on the count assertion)
+  with the decline restored, so it is not vacuous. The payload assertion is
+  the point: `5bf764520` was a correct row count with a NULL payload.
   **Gates — all green.**
   - `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS.
   - `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12 rows=2, Q13 rows=34),
