@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -26,13 +27,14 @@ import (
 // rescan tests (TestSortCloseOpenRescanOrderedTwice) actually re-drain.
 // fakeBorrowSource does NOT reset on Open and cannot serve that test.
 type spillOrderSource struct {
-	rows  []Row
-	ctids []sortCTID
-	idx   int
+	rows   []Row
+	ctids  []sortCTID
+	schema optimizer.Schema
+	idx    int
 }
 
-func (o *spillOrderSource) Open(*Context) error { o.idx = 0; return nil }
-func (o *spillOrderSource) Schema() optimizer.Schema { return nil }
+func (o *spillOrderSource) Open(*Context) error      { o.idx = 0; return nil }
+func (o *spillOrderSource) Schema() optimizer.Schema { return o.schema }
 func (o *spillOrderSource) Close() error             { return nil }
 func (o *spillOrderSource) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
@@ -288,6 +290,7 @@ func TestSortChunkLimitSourcesWorkMem(t *testing.T) {
 		t.Fatalf("override: chunkLimit = %d, want 1024", got)
 	}
 }
+
 // — Close, re-Open, and drain the IDENTICAL ordered sequence a second time,
 // in-memory and spilling. Pre-(E) the spilling arm fails: mergeReady
 // survives Close while heap is nil, so the second Open skips initMerge and
@@ -334,5 +337,131 @@ func TestSortCloseOpenRescanOrderedTwice(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// spillOrderIntSchema is the two-int descriptor the D-06 packed arm
+// needs: FormPackedTuple encodes through NewTupleDesc(o.Schema()), so a
+// nil schema would fail every row LOUDLY (by design — never silently).
+func spillOrderIntSchema() optimizer.Schema {
+	return optimizer.Schema{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+	}
+}
+
+// TestSortPackedOrderingMatrix (D-06 §5.4) runs the §5 matrix through the
+// packed arm and asserts arm equivalence: the same input through the
+// switch OFF and ON produces the identical SEQUENCE. A permutation applied
+// to packed but not to keyvals (or vice versa) fails here and nowhere else.
+func TestSortPackedOrderingMatrix(t *testing.T) {
+	const N = 2048
+	defer SetSortPackedEnabled(false)
+	for _, kc := range spillOrderKeys() {
+		for _, spilling := range []bool{false, true} {
+			name := kc.name
+			if spilling {
+				name += "-spilling"
+			} else {
+				name += "-inmem"
+			}
+			t.Run(name, func(t *testing.T) {
+				var seqs [][]string
+				for _, packed := range []bool{false, true} {
+					SetSortPackedEnabled(packed)
+					rows := spillOrderFixture(N, 0x50DD)
+					s := &sortOp{
+						child: &spillOrderSource{rows: rows, schema: spillOrderIntSchema()},
+						keys:  kc.keys,
+					}
+					if spilling {
+						s.chunkLimitBytes = 1024
+					}
+					if err := s.Open(&Context{}); err != nil {
+						t.Fatalf("packed=%v Open: %v", packed, err)
+					}
+					if !packed {
+						if spilling && len(s.spillFiles) < 8 {
+							t.Fatalf("spill arm produced %d runs, want ≥ 8", len(s.spillFiles))
+						}
+					} else if len(s.packed) == 0 && len(s.spillFiles) == 0 {
+						t.Fatalf("packed arm retained nothing (in-mem) and spilled nothing")
+					}
+					emitted := drainSortOrdered(t, s, kc.keys, rows)
+					sigs := make([]string, len(emitted))
+					for i, r := range emitted {
+						sigs[i] = spillRowSig(r)
+					}
+					seqs = append(seqs, sigs)
+					if err := s.Close(); err != nil {
+						t.Fatalf("packed=%v Close: %v", packed, err)
+					}
+				}
+				if len(seqs[0]) != len(seqs[1]) {
+					t.Fatalf("arm length mismatch: off=%d on=%d", len(seqs[0]), len(seqs[1]))
+				}
+				for i := range seqs[0] {
+					if seqs[0][i] != seqs[1][i] {
+						t.Fatalf("arm sequence mismatch at row %d: off=%q on=%q", i, seqs[0][i], seqs[1][i])
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestSortPackedCTIDFollowsOwnRow (D-06 §5.5, packed side): the TID
+// side-channel rides LoadWithTID through the packed sort and each emitted
+// row carries its own TID.
+func TestSortPackedCTIDFollowsOwnRow(t *testing.T) {
+	const N = 64
+	defer SetSortPackedEnabled(false)
+	SetSortPackedEnabled(true)
+	rng := rand.New(rand.NewSource(0xC71D))
+	perm := rng.Perm(N)
+	rows := make([]Row, 0, N)
+	ctids := make([]sortCTID, 0, N)
+	wantTID := map[int64]sortCTID{}
+	for _, p := range perm {
+		rows = append(rows, Row{NewIntDatum(int64(p))})
+		c := sortCTID{block: 0, off: uint16(p), has: true}
+		ctids = append(ctids, c)
+		wantTID[int64(p)] = c
+	}
+	// Single-column schema for the single-column rows above.
+	schema := optimizer.Schema{{Name: "a", Type: catalog.Type{Name: "int4"}}}
+	s := &sortOp{
+		child:     &spillOrderSource{rows: rows, ctids: ctids, schema: schema},
+		keys:      []optimizer.SortKey{{Expr: &optimizer.ColumnRef{Index: 0}}},
+		wantCTIDs: true,
+	}
+	if err := s.Open(&Context{}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < N; i++ {
+		slot, err := s.Next()
+		if err != nil {
+			t.Fatalf("Next row %d: %v", i, err)
+		}
+		row := slot.Row()
+		if got, want := row[0].Int, int64(i); got != want {
+			t.Fatalf("row %d: key %d, want %d", i, got, want)
+		}
+		ps, ok := slot.(*PackedSlot)
+		if !ok {
+			t.Fatalf("row %d: packed arm returned %T, want *PackedSlot", i, slot)
+		}
+		blk, off, has := ps.TID()
+		want := wantTID[row[0].Int]
+		if !has || blk != want.block || off != want.off {
+			t.Fatalf("row %d (key %d): TID (%d,%d,%v), want (%d,%d,true)",
+				i, row[0].Int, blk, off, has, want.block, want.off)
+		}
+	}
+	if _, err := s.Next(); err != EOF {
+		t.Fatalf("trailing Next: %v, want EOF", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

@@ -3079,31 +3079,23 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   batch-count movement on the named shape class + 06 §2 floor with
   `CKMISMATCH=0`; files: `operators_join_agg.go`,
   `parallel_hash_build.go`, `hashsize/hashsize.go`.*
-- [~] **D-06 MD-05 sort — UNBLOCKED 2026-09-07 by B-01c's applying slices
-  (b) AND (c).** Both sort-side projections this row was waiting on now
-  exist. Slice (b) gave the sort beneath a *sorted aggregation* the
-  narrowed row (`upper_narrow_apply.go` sinks the Aggregate site's
-  narrowing Project below the Sort); slice (c)
-  (`upper_narrow_chain.go`) gave the **general ORDER BY sort** its own,
-  narrowing it from its stamped target and re-basing the whole ancestor
-  chain up to the node that absorbs the change. Key-preservation gate
-  discharged on both paths (`keepPreservesSortKeyList`, position by
-  position, DESC/NULLS included).
-  Scope of what is narrowed, so the conversion work does not assume more
-  than it has: a sort whose ancestor chain reaches a `*Project` or
-  `*Aggregate` through only `*Filter`/`*Limit`/`*Sort`. A chain that meets
-  `*Distinct`/`*DistinctOn`/`*Gather`/`*GatherMerge`/a join/`*Result`/
-  `*CTEScan`/`*Memoize`/`*WindowAgg`, a Sort at the plan root, a Sort with
-  two parent edges, and a keep that is the identity all decline and keep
-  today's full width. The `*WindowAgg` SITE is still open (ledger
-  `take3-B-01c-applying-blocked`).
-  Gate checks **ordering explicitly**, not membership
-  (`operators.go:1010-1015`: mismatched sort/merge comparators emit
-  out-of-order rows with no error). Needs two deformed rows at once; a
-  `PackedSlot` has one scratch `Row` — R-11, re-priced, not mechanical.
-   *design: 04 §4.1 + `docs/design/minimize-datum-d06-sort/DESIGN.md`
-  (design + both adversarial reviews landed; all citations re-verified at
-  `fc76b20fd`); gate: 06 §3 MD-05.*
+- [x] **D-06 MD-05 sort — LANDED 2026-09-07 AS A MEASURED NEGATIVE
+  (switch default OFF).** `o.rows` → `o.packed` under `GOOPG_SORT_PACKED=on`
+  (double-buffered packed tail merge, lessRows fallback replaced by a
+  latched error, deform-at-flush, `LoadWithTID` ctid path). §8 taken with
+  2 reps per arm on a 6M-row serial sort: wall **+103 %** (10.1 → 20.5 s),
+  allocs flat (−2.3 %), retained bytes analytic −25 % but unmeasurable
+  through GC noise — the D-04 numbers reproduced in kind and exceeded, so
+  per §7 the switch stays OFF and revert is one commit. Correctness is
+  NOT what failed: ordering matrix (10 OFF + 10 ON arms) + CTID + rescan
+  green, TPC-H digest **24/24 MATCH** OFF vs ON, executor suite + units
+  scope green, spotcheck Q12=2/Q13=34 PASS, plan `changed=0`.
+  `TestPackedSlotHasNoProducer` admits operators.go with the gates in the
+  same commit, as its contract demands. D-10's stated condition is
+  literally satisfied and substantively empty — re-test that blocker on
+  its own instrument.
+  *design: 04 §4.1 + `docs/design/minimize-datum-d06-sort/DESIGN.md`
+  (§8b measurement record); gate: 06 §3 MD-05.*
 - [-] **D-07 MD-06 materialize — OUT OF SCOPE 2026-09-07 — owner decision: **goopg does not implement its own
   parallel cost calculation; PG 18.3's is adopted as-is.** This item's
   unblocking condition was that goopg's cost model grow a parallel dimension

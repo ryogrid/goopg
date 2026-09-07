@@ -329,6 +329,58 @@ Per 06 §3's per-slice requirement:
 * **the three D-04 numbers** — retained bytes, wall, allocs — reported
   against §3's prediction whichever way they come out.
 
+## 8b. Measurement record — §8 TAKEN 2026-09-07, prediction CONFIRMED (NEGATIVE)
+
+One binary (`tmp/goopg-d06` at the D-06 commit), switch OFF vs ON by env
+at server start. Witness: serial 6,001,255-row 2-column sort
+(`count(*) over lineitem ORDER BY l_orderkey`), `work_mem` 1024 MB so
+neither arm spills (`quicksort`, SpaceKB 562,618 both arms), one fresh
+capped server per arm (age 0 both sides), `GOMEMLIMIT=15GiB`. Heap via
+`/debug/pprof/heap` line 1 (`inuse_bytes` peak-sampled at 1 Hz through
+the run; `alloc_bytes` delta across it). Two reps per arm:
+
+| | OFF rep 1 | OFF rep 2 | ON rep 1 | ON rep 2 |
+|---|---|---|---|---|
+| wall | 10.01 s | 10.24 s | 20.50 s | 20.53 s |
+| peak HeapInuse | 2.18 GB | 3.11 GB | 3.09 GB | 3.09 GB |
+| alloc delta | 4.47 GB | 4.48 GB | 4.37 GB | 4.37 GB |
+
+Reading, against §3's prediction (bytes down < D-04's −24 %, allocs up,
+wall up):
+
+- **Wall: +103 % (10.1 → 20.5 s), both reps rock-stable.** Worse than
+  the predicted "up": every `Next` deforms the full row eagerly
+  (`Row()` → `deformTo(len(values))`) with owned-Go-memory allocation
+  per value (nil-parent slots), while the OFF arm hands back already-
+  materialised Datums for free. A consumer reading few columns still
+  pays the full deform — goopg has no lazy slot, and this is where that
+  absence is priced. The D-04 "wall +6.8 %" is reproduced in kind and
+  exceeded 15×.
+- **Retained bytes: analytic −25 %, measured CONFOUNDED.** Per-row
+  totals incl. the `keyvals` floor: OFF `24 + 48·2 + 24 + 48·1` = 192 B
+  vs ON `32 + (23 + 1 + 16) + 24 + 48·1` = 144 B. But the sampled peak
+  varies 2.18 → 3.11 GB across two IDENTICAL OFF runs — `GOMEMLIMIT`
+  lets garbage (deform temporaries) accumulate until GC pressure, so
+  peak `HeapInuse` measures GC timing, not retention. No retained-bytes
+  claim is made beyond the construction.
+- **Allocs: −2.3 % (flat).** The encoder's per-column allocs on the way
+  in net out against the deform's per-value allocs on the way out.
+
+Sibling parity (the tripwire's demand): TPC-H digest **24/24 MATCH**
+OFF vs ON (ordered + unordered + column signatures, `tmp/` scratch
+logs) — the packed path is values-identical suite-wide across every
+type the corpus sorts. Ordering arm (§5 incl. the packed matrix) green.
+Plan pin: `changed=0` by construction (executor-only change, OFF
+default — production plans are byte-identical).
+
+**Verdict per §7: LAND AS A MEASURED NEGATIVE, switch stays OFF.**
+The D-04 numbers are reproduced in kind (wall up hard, no geometry to
+move — sorts never had an `nbatch` analogue). No other site touched;
+revert is one commit. D-10's stated condition ("unblocks when D-06
+lands") is literally satisfied and substantively empty — the OFF
+switch buys the spill-payload work nothing; re-test that blocker on
+its own instrument rather than inheriting this verdict.
+
 ---
 
 ## 9. Successor filed by this design

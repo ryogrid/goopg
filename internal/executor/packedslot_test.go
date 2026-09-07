@@ -653,12 +653,26 @@ func TestPackedSlotHasNoProducer(t *testing.T) {
 		t.Fatalf("readdir: %v", err)
 	}
 	allowed := map[string]bool{"packedslot.go": true, "packedtuple.go": true}
+	// D-06/MD-05 is the first admitted producer (operators.go, behind the
+	// default-OFF GOOPG_SORT_PACKED switch). Admitted in the SAME commit
+	// that carries the gates this tripwire demands — 06 §3 alloc arm
+	// (DESIGN §8b: wall +103 %, allocs flat, switch stays OFF),
+	// plan-shape pin (changed=0: executor-only, OFF default), sibling-
+	// parity test (TestSortPackedOrderingMatrix OFF-vs-ON identical
+	// sequence + TPC-H digest 24/24 MATCH). A SECOND producer file, or
+	// D-06 flipping its default without re-running those gates, trips
+	// this test again — that is the point. See
+	// docs/design/minimize-datum-d06-sort/DESIGN.md §8b.
+	admitted := map[string]bool{"operators.go": true}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
 		if allowed[name] {
+			continue
+		}
+		if admitted[name] {
 			continue
 		}
 		b, err := os.ReadFile(name)
