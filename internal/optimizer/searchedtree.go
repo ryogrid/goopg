@@ -91,10 +91,29 @@ import "fmt"
 // with the carrier list.
 type searchedTree struct {
 	fromJoinSearch bool
+	// searchPathkeys is the ordering the WINNING path of the search claimed,
+	// re-expressed in — and validated against — the coordinate space this
+	// root PUBLISHES (C-07/P3-06, the seam half). It is empty unless
+	// `createPlanAtSearchRootRange` could prove every key names the column it
+	// claims at the coordinate it claims, so a hole in the boundary map can
+	// never turn into a wrong ordering claim: the validator truncates, it
+	// does not translate. See `validatedSearchPathkeys` (upperorderedinput.go)
+	// for why a PREFIX is always a sound answer.
+	//
+	// Carried on the tag rather than threaded through `planJoinlistSearch`'s
+	// return because the seam publishes a Node: this is the one field already
+	// attached to exactly the node kinds a search root can be, and the
+	// alternative — a second return value through every caller between
+	// `searchOneProblem` and `createOrderedPaths` — would touch fifteen
+	// signatures to carry a list that only one consumer reads.
+	searchPathkeys []PathKey
 }
 
 func (t *searchedTree) markFromJoinSearch()    { t.fromJoinSearch = true }
 func (t *searchedTree) isFromJoinSearch() bool { return t.fromJoinSearch }
+
+func (t *searchedTree) setSearchPathkeys(keys []PathKey) { t.searchPathkeys = keys }
+func (t *searchedTree) searchedPathkeys() []PathKey      { return t.searchPathkeys }
 
 // searchRootNode is the carrier interface. Embedding `searchedTree` in a node
 // type is the whole of implementing it.
@@ -102,6 +121,8 @@ type searchRootNode interface {
 	Node
 	markFromJoinSearch()
 	isFromJoinSearch() bool
+	setSearchPathkeys([]PathKey)
+	searchedPathkeys() []PathKey
 }
 
 // markSearchedTree tags n as the root of a subtree the PG-shaped join search
@@ -130,6 +151,19 @@ func markSearchedTree(n Node) Node {
 func isSearchedTree(n Node) bool {
 	s, ok := n.(searchRootNode)
 	return ok && s.isFromJoinSearch()
+}
+
+// searchedTreePathkeys is the ordering a searched subtree publishes, or nil.
+// A node that cannot carry the tag answers nil, which is the correct answer
+// for every tree the search did not build — "no ordering is claimed" is always
+// sound, because the only consumer (`addOrderedPaths`) responds to nil by
+// stacking the Sort it stacked before.
+func searchedTreePathkeys(n Node) []PathKey {
+	s, ok := n.(searchRootNode)
+	if !ok || !s.isFromJoinSearch() {
+		return nil
+	}
+	return s.searchedPathkeys()
 }
 
 // searchedTreeWidth is the number of columns a searched subtree publishes. It

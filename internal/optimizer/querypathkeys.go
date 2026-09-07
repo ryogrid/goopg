@@ -18,30 +18,21 @@ package optimizer
 //
 // The second half — "so ORDER BY / GROUP BY MOTIVATE index paths", i.e.
 // widening `addOrderedIndexPaths`' useful-column set from the merge-clause
-// columns to the query-pathkey columns — is NOT landed, because goopg has no
-// consumer that could collect the ordering:
+// columns to the query-pathkey columns — LANDED 2026-09-07 as
+// `addQueryPathkeyColumnExprs` (pathindexordered.go). It was held back here
+// because goopg had no consumer that could collect the ordering:
 //
 //   - the search commits to ONE path at its root, `finalPath`
 //     (joinsearch.go:298) = `get_cheapest_fractional_path`, chosen on cost
-//     alone; there is no `create_ordered_paths` asking the final rel for a
+//     alone; there was no `create_ordered_paths` asking the final rel for a
 //     path that already delivers `query_pathkeys`;
 //   - the search boundary publishes a NODE, not a path
 //     (`planJoinlistSearch`, relfromjoinlist.go:218), so the chosen path's
-//     `Pathkeys` are dropped at the seam and nothing above can read them;
-//   - the ORDER BY `*Sort` is wrapped on unconditionally, far above that seam
-//     and in a different coordinate space (planner.go:1720 and the SRF twin at
-//     :1766, whose keys are resolved post-aggregate / post-window), so even a
-//     path that arrived correctly sorted would still be re-sorted.
+//     `Pathkeys` were dropped at the seam and nothing above could read them;
+//   - the ORDER BY `*Sort` was wrapped on unconditionally, far above that seam
+//     and in a different coordinate space.
 //
-// An ordering-only full index scan that nothing selects FOR its ordering is a
-// path that can only lose on total cost — or, worse, win `CheapestStartup`
-// under a LIMIT and be picked for a fraction while the redundant Sort above it
-// still runs. It would also silently disable the GROUP_AGG producer's
-// index-ordered input variant (groupingpaths.go indexOrderedAggInput),
-// whose GROUP-BY-ordered index promotion matches
-// on the child being a `*SeqScan`.
-//
-// # Re-adjudicated 2026-09-07, after C-11 and C-12 landed
+// # Re-adjudicated 2026-09-07, after C-11 and C-12 landed — then UNBLOCKED
 //
 // C-11 (P4-02 upper `RelOptInfo`s, incl. `ORDERED`) and C-12 (P4-03 a real
 // upper-rel `PathSort`) were filed as the consumer that would make the
@@ -53,27 +44,44 @@ package optimizer
 //     `colExprs` takes `btg`'s useful set from `[w]` to `[w x]` on
 //     `… WHERE btg.w = oth.k ORDER BY btg.x` and `addOneOrderedIndexPath`
 //     then adds a real `index.ordered` path on the (x, y) index;
-//   - and no plan moves — not on cost, and not with `enable_seqscan = off`.
-//     `finalPath` returns a path with `pathkeys=0`; `planJoinlistSearch` then
-//     publishes `r.node`; and `createOrderedPaths` (upperordered.go) is a
-//     Node consumer whose only Node→Path bridge, `newPrebuiltPath`, leaves
-//     `Pathkeys` nil. Its `upper.ordered.input` arm is therefore unreachable
-//     from production and its Sort is unconditional in fact, exactly as it
-//     was before C-12 — pinned by
-//     `TestCreateOrderedPathsInputArmIsUnreachableFromANode`.
+//   - and no plan moved — not on cost, and not with `enable_seqscan = off`.
+//     `finalPath` returned a path whose `Pathkeys` `planJoinlistSearch` then
+//     DROPPED, publishing `r.node`; and `createOrderedPaths` (upperordered.go)
+//     is a Node consumer whose only Node→Path bridge, `newPrebuiltPath`,
+//     leaves `Pathkeys` nil. Its `upper.ordered.input` arm was therefore
+//     unreachable from production and its Sort unconditional in fact.
 //
-// A blocker independent of the seam also came out of the re-adjudication:
-// `addOrderedIndexPaths` runs only inside the PG-shaped join search, and
-// `tryPGShapedJoinSearch` declines at `nrels < 2` (joinsearchseam.go). A
-// single-table `SELECT … FROM t ORDER BY t.pk` — the canonical shape the
-// widening is meant to serve — never reaches the producer at all.
+// That re-adjudication named the unblocker precisely — "a search boundary that
+// publishes the chosen PATH (or at least its `Pathkeys`) rather than a bare
+// Node" — and `upperorderedinput.go` is that boundary, landed 2026-09-07. The
+// FIRST and THIRD objections above are gone with it: C-11/C-12 made the ORDER
+// BY Sort a path on the ORDERED upper rel, and the seam half made that rel's
+// input path CARRY an ordering, so `addOrderedPaths` takes its input arm and
+// stacks no Sort when the input already delivers the order. The SECOND is
+// answered WITHOUT translating: the winning path's pathkeys are stamped on the
+// published search root and VALIDATED against the schema that root publishes,
+// truncating at the first key the schema cannot confirm.
 //
-// So the unblocker is now named precisely, and it is not an upper rel: a
-// search boundary that publishes the chosen PATH (or at least its
-// `Pathkeys`) rather than a bare Node. C-15/C-16 (`create_grouping_paths` /
-// `create_distinct_paths`) sit behind the same seam.
+// The blocker the re-adjudication found that is INDEPENDENT of the seam
+// survives, and this cut does not touch it: `addOrderedIndexPaths` runs only
+// inside the PG-shaped join search, and `tryPGShapedJoinSearch` declines at
+// `nrels < 2` (joinsearchseam.go). A single-table `SELECT … FROM t ORDER BY
+// t.pk` — the canonical shape the widening is meant to serve — never reaches
+// the producer at all. Ledger
+// `c07-single-rel-never-reaches-ordered-index-producer`.
 //
-// So: derivation live and tested, gate complete, generation unchanged.
+// The remaining objection in the original note — that an ordering-only index
+// path could "win `CheapestStartup` under a LIMIT while the redundant Sort
+// above it still runs" — is exactly what no longer happens: the Sort is not
+// redundant, it is absent.
+//
+// What still does NOT reach the widened producer is the one-relation shape:
+// `addOrderedIndexPaths` runs only inside the PG-shaped join search and
+// `tryPGShapedJoinSearch` declines at `nrels < 2` (joinsearchseam.go:228), so
+// `SELECT ... FROM t ORDER BY t.pk` never gets there. Ledger row
+// `c07-single-rel-never-reaches-ordered-index-producer`.
+//
+// So: derivation live and tested, gate complete, generation WIDENED.
 
 import (
 	"strings"

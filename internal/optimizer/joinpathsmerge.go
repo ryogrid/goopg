@@ -321,6 +321,30 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, jt parse
 	tryMergeJoinPath(joinrel, o, i, cp, jt, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
+// buildJoinPathkeys is the ONE rule of `build_join_pathkeys` (pathkeys.c:1295)
+// that is not "return the outer's keys unchanged": a FULL or RIGHT join
+// delivers NO ordering.
+//
+// The reason is the null-extended rows. A merge join streams the outer in
+// order, so an INNER or LEFT join's output is in the outer's order — but a
+// FULL or RIGHT join must also emit the inner rows that matched nothing, and
+// those are injected wherever the merge happens to reach them, not at the
+// position the outer ordering would put them. PG returns NIL and so does this.
+//
+// Added 2026-09-07 with C-07's seam half, and the timing is the point. Until
+// then a merge path's `Pathkeys` were read only INSIDE the search, by another
+// merge's sort-skip branch, where an over-claim costs a wrong cost at worst.
+// Now the ordering escapes to the ORDERED upper rel and can DELETE the ORDER BY
+// Sort, so the same over-claim would be a WRONG ANSWER — rows returned out of
+// order with a correct row count, the class that no row-count gate can see.
+func buildJoinPathkeys(jt parser.JoinType, outerKeys []PathKey) []PathKey {
+	switch jt {
+	case parser.JoinFull, parser.JoinRight:
+		return nil
+	}
+	return outerKeys
+}
+
 // tryMergeJoinPath is `try_mergejoin_path` proper (joinpath.c:1029) over two
 // chosen PATHS, split out of `addMergeJoinPath` by P5.4c-ii-c.
 //
@@ -398,7 +422,7 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, cp costParams, jt parser.
 		Rel:      joinrel,
 		Rows:     joinrel.Rows,
 		Cost:     cost,
-		Pathkeys: resultKeys,
+		Pathkeys: buildJoinPathkeys(jt, resultKeys),
 		// Children[0] is the outer (streaming left) side, Children[1] the
 		// inner — the same convention the hash and nested-loop arms use, so
 		// P5.5's createPlan reads one layout for every join kind. When a side

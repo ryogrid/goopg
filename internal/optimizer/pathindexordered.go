@@ -84,29 +84,26 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 // `standard_qp_callback` analogue from the statement's GROUP BY / window /
 // DISTINCT / ORDER BY.
 //
-// What the gate opens onto is still the merging half alone. The useful-column
-// set below comes from `mergeableColumnExprsFor`, i.e.
-// `pathkeys_useful_for_merging`; `pathkeys_useful_for_ordering` has no
-// counterpart, so a rel that passes the gate on the ORDERING arm and has no
-// join clause still produces nothing. That is deliberate and is C-07's
-// recorded scope line: goopg has no consumer that would SELECT a path for its
-// ordering — `finalPath` (joinsearch.go:298) chooses on cost alone, the search
-// boundary publishes a Node and drops the chosen path's `Pathkeys`
-// (relfromjoinlist.go:218), and the ORDER BY `*Sort` is wrapped on
-// unconditionally above it (planner.go:1720). Generating an ordering-only full
-// index scan there could only lose on total cost, or win `CheapestStartup`
-// under a LIMIT while the redundant Sort still runs.
+// What the gate opens onto is BOTH halves since C-07's seam half (2026-09-07).
+// The useful-column set below is the union of `mergeableColumnExprsFor`
+// (`pathkeys_useful_for_merging`) and `addQueryPathkeyColumnExprs`
+// (`pathkeys_useful_for_ordering`), so a rel that passes the gate on the
+// ORDERING arm with no join clause at all now produces an ordered path.
 //
-// C-11 (upper `RelOptInfo`s incl. `ORDERED`) and C-12 (a real upper-rel
-// `PathSort`) were filed as that consumer. Both landed 2026-09-06 and the
-// re-adjudication on 2026-09-07 measured that neither unblocks this: the
-// widening does generate the path, and no plan moves, because
-// `createOrderedPaths` consumes a NODE and `newPrebuiltPath` carries no
-// `Pathkeys` across the seam. The widening is still the map union at the
-// `colExprs` line below; what it now waits on is a boundary that publishes
-// the chosen path's ordering. See querypathkeys.go's header for the full
-// measurement, and `TestCreateOrderedPathsInputArmIsUnreachableFromANode`
-// for the pin.
+// That union was filed as "a map union at one line" on 2026-09-05 and held
+// back, correctly, because nothing SELECTED a path for its ordering: the search
+// boundary published a Node and dropped the chosen path's `Pathkeys`, so an
+// ordering-only index scan could only lose on total cost — or win
+// `CheapestStartup` under a LIMIT while a redundant Sort above it still ran.
+// `upperorderedinput.go` removed both: the seam carries the ordering to the
+// ORDERED upper rel, whose input arm then stacks no Sort at all.
+//
+// C-11/C-12 were filed as that consumer. Both landed 2026-09-06 and the
+// 2026-09-07 re-adjudication measured that neither unblocked it on its own:
+// the widening generated the path and no plan moved, because
+// `createOrderedPaths` consumes a NODE and `newPrebuiltPath` carried no
+// `Pathkeys` across the seam. `upperorderedinput.go` is the boundary that
+// re-adjudication named; see querypathkeys.go's header for the measurement.
 func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 	if s == nil || cat == nil {
 		return
@@ -129,6 +126,13 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 			continue
 		}
 		colExprs := mergeableColumnExprsFor(rel.Relids, s.clausesAll())
+		// C-07 (P3-06) second half, landed 2026-09-07: the union with
+		// `pathkeys_useful_for_ordering`. Unblocked by the seam half
+		// (upperorderedinput.go): the ORDERED upper rel can now RECEIVE an
+		// ordering, so an ordering-only index path finally has a consumer
+		// that selects it FOR its ordering instead of only being able to lose
+		// on cost.
+		addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
 		if len(colExprs) == 0 {
 			continue
 		}
@@ -355,6 +359,54 @@ func mergeableColumnExprsFor(relids RelSet, clauses []*restrictInfo) map[string]
 		out[col.Name] = col
 	}
 	return out
+}
+
+// addQueryPathkeyColumnExprs is `pathkeys_useful_for_ordering` (pathkeys.c:2196)
+// in the same inside-out form `mergeableColumnExprsFor` gives
+// `pathkeys_useful_for_merging`: fold the columns `root->query_pathkeys` names
+// ON THIS REL into the useful-column map `buildIndexPathkeys` consults.
+//
+// This is C-07's "so ORDER BY / GROUP BY motivate index paths" half. It was
+// held back (querypathkeys.go's file header) for one reason: nothing selected a
+// path FOR its ordering, so the extra candidate could only lose on cost or —
+// worse — win `CheapestStartup` under a LIMIT while a redundant Sort still ran
+// above it. Both are gone. C-11/C-12 gave the statement an ORDERED upper rel,
+// and C-07's seam half (upperorderedinput.go) gave that rel an input path that
+// CARRIES the ordering, so the Sort above a genuinely ordered input is no
+// longer stacked at all.
+//
+// REL MEMBERSHIP is by `SourceTableIdx`, not by reading the rel's leaf schema.
+// That is deliberate and was measured: the shared `ppiCtx` unit fixture builds
+// `baseLeaf = &SeqScan{Table: inner}` with a NIL schema, so a membership filter
+// that consulted `baseLeaf.Output()` is invisible to the whole optimizer suite
+// — the suite passed with the widening applied and with it absent. `sourceIdx`
+// is `rangeBinding.sourceIdx` mirrored onto `baseRelInfo` (cardinality.go), the
+// same per-FROM-clause identity `ColumnRef.SourceTableIdx` carries, so the two
+// are comparable by construction and a self-join's siblings do not collide.
+//
+// A rel with `sourceIdx <= 0` has no recorded identity (CTE / subquery-only /
+// ON CONFLICT `excluded`, planner.go:527). Membership is then UNKNOWABLE, and
+// the honest answer is to add nothing: a name-only match would hand one
+// self-join sibling's ordering to another.
+func addQueryPathkeyColumnExprs(out map[string]Expr, keys []PathKey, sourceIdx int16) {
+	if out == nil || len(keys) == 0 || sourceIdx <= 0 {
+		return
+	}
+	for _, pk := range keys {
+		col, isCol := pk.Expr.(*ColumnRef)
+		if !isCol || col.Name == "" || col.SourceTableIdx != sourceIdx {
+			continue
+		}
+		// Same first-wins rule as the merging half, and for the same reason:
+		// two expressions naming the same column of the same rel describe the
+		// same ordering, so the deterministic choice keeps generation
+		// reproducible. The merging half is consulted FIRST because its
+		// expression is the one the join clauses were written with.
+		if _, dup := out[col.Name]; dup {
+			continue
+		}
+		out[col.Name] = col
+	}
 }
 
 // totalTablePages is `root->total_table_pages` (set by `set_base_rel_sizes`,

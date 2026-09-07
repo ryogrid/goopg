@@ -233,36 +233,34 @@ func TestC10cPreservedSideQualMovesThroughOrderedSortArm(t *testing.T) {
 	}
 }
 
-// TestCreateOrderedPathsInputArmIsUnreachableFromANode is C-12a's blocker,
-// measured rather than asserted from a comment.
+// TestCreateOrderedPathsInputArmIsReachableFromANode is C-12a's blocker,
+// FLIPPED red-to-green on 2026-09-07 by C-07's seam half — the flip its own
+// predecessor prescribed ("flip this test — Sort-over-Sort becomes the child
+// handed back — in the cut that plumbs `Pathkeys` across the search
+// boundary").
 //
-// `addOrderedPaths` has two arms and both are tested above — but the ordered
-// one is reached there only by a seed whose `Pathkeys` the TEST set by hand.
-// Production has no such seed. `createOrderedPaths` is handed a NODE (the
-// search boundary publishes `r.node`, relfromjoinlist.go's
-// `planJoinlistSearch`, and drops the chosen path), and the only bridge from
-// a Node to a Path is `newPrebuiltPath`, which sets `Rows`, `Kind`, `Rel` and
-// `ParallelSafe` and leaves `Pathkeys` nil. `pathkeysContainedIn(nil, keys)`
-// is false for every non-empty `keys`, so the sort arm is the only arm the
-// production entry point can take, WHATEVER ordering the child actually has.
+// What it used to pin: `addOrderedPaths` has two arms, and the ordered one was
+// reached only by a seed whose `Pathkeys` the TEST set by hand. Production had
+// no such seed. `createOrderedPaths` is handed a NODE, the only Node->Path
+// bridge is `newPrebuiltPath`, and that bridge left `Pathkeys` nil — so
+// `pathkeysContainedIn(nil, keys)` was false for every non-empty `keys` and
+// the Sort arm was the only arm production could take, WHATEVER ordering the
+// child actually had.
 //
-// That is why C-07's second half ("widen the useful-column set so ORDER BY /
-// GROUP BY motivate index paths") is still not landed even though C-11 and
-// C-12 both are: an ordering-only index path that wins the search cannot
-// remove the Sort above it, because nothing carries the news across the seam.
+// The pin was deliberately strongest-form and it stays that way, inverted: the
+// child below is ALREADY in the requested order — it is the Sort the producer
+// itself just built, whose pathkeys are exactly `keys` — and the producer now
+// hands it straight back instead of stacking a second, redundant Sort.
+// `inputNodePathkeys` (upperorderedinput.go) reads the ordering off that
+// `*Sort` in the Node's own output coordinates.
 //
-// The pin is deliberately strongest-form: the child below is ALREADY in the
-// requested order (it is the Sort the producer itself just built, whose
-// pathkeys are exactly `keys`), and the producer still stacks a second Sort
-// on it. Feeding a correctly-sorted child and getting a redundant Sort is
-// exactly the plan the widening would buy today.
-//
-// Flip this test — Sort-over-Sort becomes the child handed back — in the cut
-// that plumbs `Pathkeys` across the search boundary. It is C-12a's
-// red-then-green marker at the CONSUMER, the twin of
-// `TestAddOrderedIndexPathsGateIsCompleteButGenerationStaysShut` at the
-// producer.
-func TestCreateOrderedPathsInputArmIsUnreachableFromANode(t *testing.T) {
+// The last assertion is UNCHANGED and still holds, which is the point of
+// keeping it: `newPrebuiltPath` still carries no ordering. The fix was NOT to
+// teach the C0 bridge about pathkeys — it has callers (distinct, grouping,
+// partial-agg, window/setop) whose inputs deliver no ordering and must not be
+// made to claim one. `createOrderedPaths` derives the claim itself, from the
+// Node, at the one seam that has an ORDER BY to compare it against.
+func TestCreateOrderedPathsInputArmIsReachableFromANode(t *testing.T) {
 	cp := defaultCostParams()
 	keys := upperOrderedKeys()
 
@@ -272,18 +270,19 @@ func TestCreateOrderedPathsInputArmIsUnreachableFromANode(t *testing.T) {
 	}
 	// `sorted` delivers `keys` by construction. Hand it back as the CHILD.
 	again := createOrderedPaths(newUpperRels(), sorted, keys, 0, cp, 0, -1)
-	if again == Node(sorted) {
-		t.Fatal("the input arm fired from a Node: the seam now carries Pathkeys — " +
-			"flip this test and re-open C-12a (widen addOrderedIndexPaths' useful-column set)")
+	if _, isSort := again.(*Sort); isSort && again != Node(sorted) {
+		t.Fatal("a second Sort was stacked over a child that already delivers the keys: " +
+			"the seam stopped carrying Pathkeys (upperorderedinput.go inputNodePathkeys)")
 	}
-	if _, ok := again.(*Sort); !ok {
-		t.Fatalf("got %T; want a redundant *Sort over an already-sorted child", again)
+	if again != Node(sorted) {
+		t.Fatalf("got %T; want the already-sorted child handed straight back", again)
 	}
-	// The reason, pinned directly rather than inferred: the Node→Path bridge
-	// carries no ordering, so `addOrderedPaths` cannot see one.
+	// The C0 bridge itself still carries no ordering, and must not: its other
+	// callers hand it inputs that deliver none. The derivation lives in
+	// `createOrderedPaths`, not in `newPrebuiltPath`.
 	rel := fetchUpperRel(newUpperRels(), UpperOrdered, 0, 0)
 	sizeUpperRelFromNode(rel, sorted)
 	if seed := newPrebuiltPath(rel, sorted); len(seed.Pathkeys) != 0 {
-		t.Fatalf("newPrebuiltPath now carries %d pathkeys; the seam changed", len(seed.Pathkeys))
+		t.Fatalf("newPrebuiltPath must stay ordering-free, got %d pathkeys", len(seed.Pathkeys))
 	}
 }

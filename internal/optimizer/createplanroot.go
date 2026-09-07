@@ -159,9 +159,25 @@ func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (Schem
 		// optional — but only for the shapes where it does, and
 		// `reconcileNLILayout`'s name resolution can move a self-join's keys
 		// regardless of layout.
-		return markSearchedTree(n)
+		return stampSearchPathkeys(markSearchedTree(n), p)
 	}
-	return markSearchedTree(projectToBindingOrder(n, m, fills))
+	return stampSearchPathkeys(markSearchedTree(projectToBindingOrder(n, m, fills)), p)
+}
+
+// stampSearchPathkeys records, on the published root, the ordering the WINNING
+// path claimed — C-07's seam half. The claim is re-earned against the schema
+// the root actually publishes (`validatedSearchPathkeys`, upperorderedinput.go)
+// rather than translated out of the search's inner coordinate space; a key the
+// published schema cannot confirm truncates the list, and an empty list is the
+// pre-C-07 behaviour exactly. Nothing here can fail the plan.
+func stampSearchPathkeys(root Node, p *Path) Node {
+	if root == nil || p == nil || len(p.Pathkeys) == 0 {
+		return root
+	}
+	if s, ok := root.(searchRootNode); ok {
+		s.setSearchPathkeys(validatedSearchPathkeys(p.Pathkeys, root.Output()))
+	}
+	return root
 }
 
 // boundaryMap composes 03 §10's map from the search root's layout: entry `b` is

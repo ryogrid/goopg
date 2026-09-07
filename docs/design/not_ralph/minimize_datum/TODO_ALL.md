@@ -545,10 +545,34 @@ are EPICS — split into one-checkbox-per-commit items before starting
   exists by design (executor materialises unconditionally).
   *design: take3 08 §5.4; gate: GUC-effect test
   `TestEnableSortSetsDisabledNodesOnSortPath`.*
-- [!] **B-17b `disabled_nodes` agg-hashed/mixed setters** (take3 02 §1.2)
-  — BLOCKED on C-15 (P4-06 grouping paths). DECLINED 2026-09-05: no grouping paths exist (P4-06 open), no path to
-  carry the count; `enable_hashagg` stays rule-based. Unblocks when P4-06
-  lands grouping paths. Ledger `take3-B-17b-blocked`.
+- [x] **B-17b `disabled_nodes` agg-hashed/mixed setters** (take3 02 §1.2).
+  UNBLOCKED and CLOSED 2026-09-07. The 2026-09-05 decline ("no grouping
+  paths exist, no path to carry the count; `enable_hashagg` stays
+  rule-based") was written the same day C-15/C-16 removed its premise, and
+  was stale on arrival: `createGroupingPaths` and `createDistinctPaths` both
+  build the hashed candidate with
+  `DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed)`, and
+  `applyEnableHashAggRule` — the outcome-forcing rule the item existed to
+  retire — is gone (`groupagg_hashagg.go` keeps only the GUC seed). So
+  `enable_hashagg` is a path-carried count adjudicated by
+  `comparePathCostsFuzzily`, exactly as `cost_agg` (costsize.c:2682) does it,
+  not a rule.
+  What this cut adds is the two pins that were missing, both of which fail
+  SILENTLY if broken (one candidate per shape means a wrong count changes no
+  winner and no row count — only an EXPLAIN `Disabled:` line PG does not
+  print): `TestCreateGroupingPathsPlainArmDoesNotCountEnableHashAgg` (PG's
+  `AGG_PLAIN` branch never touches the counter, and goopg's ungrouped
+  candidate is priced through the hashed arm, so the natural mistake is to
+  stamp it) and `TestCreateGroupingPathsGroupingSetsCountEnableHashAgg`.
+  **MIXED is satisfied by proof, not by a second setter.** goopg has no
+  `AGG_MIXED`: `AggStrategy` is Hashed|Sorted and `groupingsets.go` runs
+  every set through one hash table per set, so the grouping-sets shape IS
+  the hashed arm and takes the hashed count. The second test is what makes
+  that proof falsifiable if a sorted grouping-sets strategy is ever added.
+  Not touched: `partialaggpaths.go` (C-19g's knob-gated tournament, inert
+  under the default knob and owned by a live peer slice) — filed as
+  `take3-B-17b-partial-agg-count`.
+  Ledger `take3-B-17b-blocked` CLOSED.
 - [x] **B-17c `disabled_nodes` gather-merge setter** (take3 02 §1.2).
   Landed 2026-09-05 as opt-out `DisableGatherMerge` (zero value keeps the
   merge arm; `EnableGatherMerge` default-false would have killed
@@ -822,33 +846,9 @@ rule).*
   re-run this one-command measurement — two `estimate-audit -plan-only`
   captures on the same cluster, one per flag value — and delete the flag
   when they come back identical. Ledger `c06-collapse-flip-moves-q13`.
-- [!] **C-07 P3-06 — reclassified `[~]` -> `[!]` 2026-09-07: the remaining
-  half is BLOCKED, and the blocker is now NAMED and measured.** The row
-  had said "blocked on C-11/C-12"; both landed, so C-07 was re-opened and
-  the widening was *implemented in a throwaway worktree and instrumented*
-  rather than re-argued. Result: **the widening works at the producer and
-  moves no plan.** Unioning the query-pathkey columns takes the useful set
-  from `[w]` to `[w x]` and `addOneOrderedIndexPath` really does add an
-  `index.ordered` path (pathlist 1->2) — and plans stay byte-identical
-  across five join shapes, even with `enable_seqscan = off`.
-  **The real blocker is the seam, confirmed three ways:**
-  `planJoinlistSearch` still returns a Node; C-12's only Node->Path
-  bridge, `newPrebuiltPath`, leaves `Pathkeys` nil, so
-  `pathkeysContainedIn(nil, keys)` is false and the Sort arm is the only
-  arm production can take; and an instrumented `finalPath` prints
-  `pathkeys=0` on every probe. C-11's `ORDERED` rel exists but has nothing
-  ordered to receive.
-  **Second, independent blocker found:** `addOrderedIndexPaths` runs only
-  inside the PG-shaped join search, and `tryPGShapedJoinSearch` declines
-  at `nrels < 2`, so `SELECT ... FROM t ORDER BY t.pk` — the canonical
-  shape the widening serves — never reaches the producer at all.
-  Landed: comments + tests only, zero behaviour change. Ledger
-  `c07-widening-blocked-on-seam-pathkeys`.
-  ORIGINAL ROW FOLLOWS. DERIVATION + GATE LANDED 2026-09-05; the "motivate
-  index paths" half RE-ADJUDICATED 2026-09-07 and still BLOCKED — the
-  blocker moved from C-11/C-12 (both landed, neither unblocked it) to the
-  SEARCH BOUNDARY.**
-  Landed: `chooseQueryPathkeys` reproduces `standard_qp_callback`'s
+- [x] **C-07 P3-06 — BOTH HALVES LANDED (derivation + gate 2026-09-05, seam
+  + widening 2026-09-07).**
+  Landed 2026-09-05: `chooseQueryPathkeys` reproduces `standard_qp_callback`'s
   precedence exactly (group ?: window ?: longer(distinct, sort) ?: setop),
   derived against the FROM-level resolve context so the pathkeys carry the
   same `Index`/`SourceTableIdx` the search's clause operands do — without
@@ -858,63 +858,87 @@ rule).*
   complete and PER-REL, as upstream's is; upstream's three arms reduce to
   two by PROOF (group non-empty implies query non-empty via the
   precedence's first case), not by simplification.
-  **Not landed, with evidence:** widening the useful-column set so ORDER BY
-  / GROUP BY motivate index paths. Nothing selects a path for its ordering
-  — `finalPath()` is cost-only, `planJoinlistSearch` DROPS the chosen
-  path's `Pathkeys` at the seam, and the ORDER BY `Sort` is wrapped
-  unconditionally far above it in a different coordinate space. An
-  ordering-only index path could therefore only lose on cost, win
-  `CheapestStartup` under a LIMIT while a redundant Sort still runs, or
-  silently disable `applyIndexOrderedGroupingRule`. That is unmotivated
-  plan churn, so it was not forced. The consumer was filed as C-11
-  (`ORDERED` upper rel) + C-12 (real upper-rel `PathSort`); the widening
-  itself is a map union at one line.
-  Gates: 6 new test groups incl. a DECISION test
-  (`TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot`) that pins
-  the gate saying yes while the producer emits nothing, and names C-11/C-12
-  as the item that flips it red-to-green; optimizer suite; TPC-H values
-  24/24 MATCH; plans BYTE-IDENTICAL; plan-gate PASS.
-  **RE-ADJUDICATION 2026-09-07 (C-11 and C-12 both `[x]` since 2026-09-06):
-  the blocker is NOT cleared, and the widening stays unlanded.** The three
-  failure modes were re-checked against the current tree and all three are
-  still live, and the check was a MEASUREMENT, not a re-reading — the
-  widening was implemented in a throwaway worktree and instrumented:
-  (i) the widening works — unioning the query-pathkey columns into
-  `colExprs` takes `btg`'s useful set from `[w]` to `[w x]` on
-  `… WHERE btg.w = oth.k ORDER BY btg.x`, and `addOneOrderedIndexPath`
-  adds a real `index.ordered` path on the (x, y) index;
-  (ii) no plan moves — not on cost and not under `enable_seqscan = off`;
-  `finalPath` returns `pathkeys=0`, `planJoinlistSearch` still publishes
-  `r.node`, and `createOrderedPaths` (C-12's producer) consumes a NODE
-  whose only Node→Path bridge, `newPrebuiltPath`, leaves `Pathkeys` nil —
-  so C-12's `upper.ordered.input` arm is unreachable from production and
-  its Sort is unconditional in fact. C-11's ORDERED rel exists but has
-  nothing ordered to receive.
-  (iii) the `indexOrderedAggInput` regression risk is unchanged: it still
-  matches on the child being a bare `*SeqScan`.
-  **New, independent blocker found:** `addOrderedIndexPaths` runs only
-  inside the PG-shaped join search, and `tryPGShapedJoinSearch` declines at
-  `nrels < 2` (joinsearchseam.go), so a single-table
-  `SELECT … FROM t ORDER BY t.pk` — the canonical shape the widening is
-  meant to serve — never reaches the producer at all.
-  **Unblocker, now named precisely:** a search boundary that publishes the
-  chosen PATH (or at least its `Pathkeys`) instead of a bare Node. Ledger
-  row `c07-widening-blocked-on-seam-pathkeys`.
-  Test changes landed with this re-adjudication (comment-and-test only —
-  the production diff is comments, zero behaviour change, so no cluster
-  gate applies): the decision test is RENAMED and rewritten to record the
-  measured verdict rather than the superseded C-11/C-12 prediction
-  (`TestAddOrderedIndexPathsGateIsCompleteButGenerationStaysShut`), and a
-  consumer-side twin was added that pins the blocker itself —
-  `TestCreateOrderedPathsInputArmIsUnreachableFromANode` feeds
-  `createOrderedPaths` a child that is ALREADY in the requested order and
-  asserts it still stacks a redundant Sort. Gates: `go vet` clean,
-  optimizer suite ok, `RALPH_PRECOMMIT_SCOPE=units` full pass.
+  **Landed 2026-09-07 — the "motivate index paths" half, and the blocker
+  under it.** The 2026-09-05 note recorded the widening as "a map union at
+  one line" waiting on C-11/C-12. Both landed and it still could not work,
+  and the re-measurement named why precisely: the widening DOES add an
+  `index.ordered` path (useful set `[w]` -> `[w x]`, pathlist 1 -> 2) and NO
+  plan moved, because `planJoinlistSearch` returns a **Node**, C-12's only
+  Node->Path bridge `newPrebuiltPath` leaves `Pathkeys` **nil**, and
+  `pathkeysContainedIn(nil, keys)` is false for every non-empty request — so
+  `createOrderedPaths` could only ever take its Sort arm. C-12's own file
+  header admitted it: "the `upper.ordered.input` producer below never fires
+  today".
+  So this cut is TWO things, and the widening alone would have been inert:
+  1. **The seam carries ordering** (`upperorderedinput.go`). The winning
+     path's pathkeys are stamped on the published search root — on the
+     existing `searchedTree` tag, which is already attached to exactly the
+     node kinds a search root can be, rather than threaded through fifteen
+     signatures — and `createOrderedPaths` derives its seed's `Pathkeys`
+     from the finished input Node. Two rules keep it off the coordinate
+     rocks this workstream has hit twice, and NEITHER translates:
+     **validate, never translate** — at the boundary each key must name the
+     column it claims at the coordinate it claims in the schema the root
+     PUBLISHES, and the first failure TRUNCATES (a prefix is always a sound
+     ordering claim; the degenerate answer is the pre-C-07 behaviour
+     exactly); and **descend only through schema-identical wrappers** —
+     the Node walk steps through `*Filter`/`*Limit` only, re-checking the
+     schema at every step, and refuses `*Project` even when its output
+     happens to agree, because a Project is where coordinates are
+     re-assigned. A wrong ordering claim would need a node to lie about its
+     own output schema.
+  2. **The widening** (`addQueryPathkeyColumnExprs`), the union of
+     `pathkeys_useful_for_ordering` into the useful-column map
+     `buildIndexPathkeys` consults. Rel membership is by `SourceTableIdx`,
+     NOT by reading the rel's leaf schema — measured, and the reason is a
+     fixture trap: `ppiCtx` sets `baseLeaf = &SeqScan{Table: inner}` with a
+     NIL schema, so a membership filter reading `baseLeaf.Output()` is
+     invisible to the ENTIRE optimizer suite (it passed identically with the
+     widening applied and absent). A rel with no recorded identity adds
+     nothing rather than falling back to name-only matching, which would
+     hand one self-join sibling's ordering to the other.
+  **Both marker tests INVERTED rather than deleted, which was their stated
+  purpose**, and the 2026-09-07 re-adjudication had named the flipping item
+  precisely — "a search boundary that publishes the chosen PATH (or at least
+  its `Pathkeys`) instead of a bare Node". At the producer,
+  `TestAddOrderedIndexPathsGateIsCompleteButGenerationStaysShut` becomes
+  `TestAddOrderedIndexPathsOrderingArmGeneratesSinceTheSeamCarriesPathkeys`.
+  At the consumer, `TestCreateOrderedPathsInputArmIsUnreachableFromANode`
+  becomes `...IsReachableFromANode`: it keeps its strongest-form shape —
+  hand `createOrderedPaths` a child that is ALREADY in the requested order —
+  and the redundant second Sort it used to assert is gone. Its last
+  assertion is deliberately UNCHANGED and still holds: `newPrebuiltPath`
+  still carries no ordering. The fix was NOT to teach the C0 bridge about
+  pathkeys — its other callers (distinct, grouping, partial-agg,
+  window/setop) hand it inputs that deliver none and must not be made to
+  claim one — so the derivation lives at the one seam that has an ORDER BY
+  to compare against.
+  The ORDERED input arm is additionally asserted END TO END through
+  `PlanWithSettings`, not only with a hand-built seed: the fixture trap above
+  is why. The paired case is the test — the same join shape asking for the
+  merge key loses its Sort, asking for a different column keeps it — so a
+  careless pathkey fails as a plan-shape assertion instead of as a wrong
+  answer.
+  **Third change, forced by the first:** `build_join_pathkeys`' FULL/RIGHT
+  rule (pathkeys.c:1295). A FULL or RIGHT merge join injects its unmatched
+  inner rows wherever the merge reaches them, not where the outer ordering
+  would put them, so PG returns NIL; goopg kept the outer's keys for every
+  join type. Harmless while a merge path's pathkeys were read only inside
+  the search (a wrong cost at worst); a WRONG ANSWER once the ordering can
+  delete the ORDER BY Sort — rows out of order with a correct row count,
+  which no row-count gate can see.
+  **Second blocker, NOT fixed and not forgotten.** `addOrderedIndexPaths`
+  runs only inside the PG-shaped join search, and `tryPGShapedJoinSearch`
+  declines at `nrels < 2` (joinsearchseam.go:228), so `SELECT ... FROM t
+  ORDER BY t.pk` — the canonical single-relation shape the widening serves —
+  never reaches the producer at all. That decline is a SIZE gate on the
+  search and predates C-07: nothing in this item can open it, and forcing it
+  open would route every single-table statement through the search boundary.
+  Ledger `c07-single-rel-never-reaches-ordered-index-producer`.
   Known divergence recorded: group/sort matching is on the written
   expression after alias substitution, not PG's `tleSortGroupRef` identity,
   so `GROUP BY t.a ORDER BY a` misses the match and falls back to ASC —
   the safe direction, since a wrong-direction claim would be worse.
-  Original scope note follows.
   **C-07 (original).** (`query_pathkeys =
   group ?: window ?: longer(distinct, sort) ?: setop`) + complete
   `has_useful_pathkeys` so ORDER BY / GROUP BY motivate index paths.
@@ -1289,7 +1313,8 @@ rule).*
   ck-verified), TOTAL +2.5% (within ±17%), cost-normalized TPC-DS plans
   byte-identical (shape changed=0). Re-pinned in-commit:
   `plan_snapshots/c12-ordered-sort-20260906.txt`. C-12a (second candidate
-  via C-07 widening) explicitly NOT flipped — filed as the next cut.
+  via C-07 widening) explicitly NOT flipped at the time — flipped
+  2026-09-07 by C-07's seam half; see that row.
 - [x] **C-13 P4-04 bounded / top-N sort** (`cost_sort`'s `limit_tuples`
   arm) — the largest recorded `ORDER BY … LIMIT` win. DESIGNED 2026-09-06:
   `docs/design/planner-p4-upper-rels/DESIGN.md` §6 — **RE-SCOPE into two
