@@ -1985,6 +1985,74 @@ precondition — C-19h landing — did not occur. It noted the D-05 result
 gives reason to expect the regression survives, and then declined to
 report that as a measurement. That distinction is the right one.
 
+## 5.31. The crossover question answered — and the arithmetic everyone repeated was wrong
+
+C-19h's remaining blocker is diagnosed (`af8637e8e`), and the answer
+corrects a claim that had propagated into C-19d's design, C-19h's
+TODO_ALL row, two file headers, and this report.
+
+**The repeated claim.** "`add_path` correctly dominates every plain
+base-rel Gather, because `parallel_tuple_cost` is 0.1/row against a
+4-worker `cpu_tuple_cost` saving of ≈0.0075/row." It was stated as a
+*general fact about parallel arithmetic*, and taken to mean goopg's
+refusal was correct and PG must escape it some other way — I repeated it
+in §5.30 and in the dispatch that produced this diagnosis.
+
+**It is not a general fact. It is a consequence of a goopg costing bug.**
+
+PG charges the two terms on **two different row counts**:
+
+| term | PG charges it on |
+|---|---|
+| `cost_seqscan` — `(cpu_tuple_cost + qual cost) × …` | `baserel->tuples` — every tuple **scanned** (and the parallel divisor divides *this*) |
+| `cost_gather` — `parallel_tuple_cost × …` | `baserel->rows` — only the survivors **crossing** the worker boundary |
+
+For a selective scan those are wildly different numbers, and that gap is
+exactly where PG's crossover lives.
+
+**goopg prices a base-rel scan on post-restriction rows for BOTH terms**
+(`joinsearch.go:440` for the serial prebuilt path, `considerparallel.go:567`
+for the partial twin). Substituting one row count into both collapses the
+difference to a closed form:
+
+```
+gather − serial = parallel_setup_cost
+                + (parallel_tuple_cost − per_tuple_cpu × (1 − 1/d)) × rows
+                = 1000 + 0.0906 × rows        (shipped constants)
+```
+
+**Strictly positive for every row count and every selectivity — so no
+crossover exists at all.** That is why `GOOPG_GATHER_PATHS=all` could not
+help and why no measurement was going to find one. Fed PG's inputs, *the
+same goopg constants* cross at about **3% selectivity**, where PG's do.
+
+The defect is therefore in the **scan's cost inputs**, not in any parallel
+term. `cost_gather`, `cost_gather_merge`, `get_parallel_divisor` and
+`add_path` are all faithful transcriptions and are explicitly exonerated.
+It is a PG-parity defect, which puts it squarely inside the owner's
+"adopt PG 18.3's parallel costing as-is" ruling rather than outside it.
+
+Pinned both ways in `gatherpaths_crossover_test.go`: the defect driven
+through the production producers in closed form, and the same constants
+crossing on PG's inputs. Comment, test and documentation only — no
+behaviour change — because the fix is a whole-planner recalibration: a
+0.1%-selective `lineitem` scan moves from **161 to 160,946** priced rows.
+Filed as ledger `c19-baserel-scan-priced-on-output-rows`.
+
+**Why this one matters beyond C-19h.** Every parallel decision in the
+tree has been made against a scan price that under-counts by up to three
+orders of magnitude on a selective scan, and the resulting refusal was
+then *rationalised* as correct arithmetic and written into a design doc.
+Three separate documents and one report section asserted it. The lesson
+is narrow and useful: **a formula that explains an observed refusal is
+not evidence that the refusal is right** — it can equally be the
+signature of a wrong input, and the way to tell is to substitute the
+oracle's inputs into your own formula, which is precisely what settled
+it here.
+
+A second, unrelated fail-open hole was closed on the way
+(`df1c4a049`): `attachParallelScan` now fails closed on non-hash joins.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
