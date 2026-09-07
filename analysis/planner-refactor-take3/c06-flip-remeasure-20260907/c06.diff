@@ -1,0 +1,21 @@
+247c247
+< Sort  (cost=154492.19..154492.69 rows=200 width=16)
+---
+> Sort  (cost=66217.69..66218.19 rows=200 width=16)
+249c249
+<   ->  HashAggregate  (cost=154482.55..154484.55 rows=200 width=16)
+---
+>   ->  HashAggregate  (cost=66208.05..66210.05 rows=200 width=16)
+251c251
+<         ->  HashAggregate  (cost=154478.05..154480.05 rows=200 width=40)
+---
+>         ->  HashAggregate  (cost=66203.55..66205.55 rows=200 width=40)
+253,254c253,255
+<               ->  Hash Right Join  (cost=7101.25..124999.25 rows=2358304 width=480)
+<                     Hash Cond: (orders.o_custkey = customer.c_custkey)
+---
+>               ->  Hash Left Join  (cost=0.25..60307.79 rows=2358304 width=1072)
+>                     Hash Cond: (customer.c_custkey = orders.o_custkey)
+>                     ->  Index Only Scan using customer_pk on customer  (cost=0.25..5226.25 rows=150000 width=32)
+257d257
+<                     ->  Index Only Scan using customer_pk on customer  (cost=0.25..5226.25 rows=150000 width=32)
