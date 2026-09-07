@@ -2112,6 +2112,69 @@ This is the general shape of the work: when a decline is lifted, the
 tests written under it encode the decline as if it were the invariant,
 and separating the two is most of the change.
 
+## 5.33. C-06's blocker did not just clear — it inverted
+
+C-06 (retire `GOOPG_PGSHAPED_COLLAPSE`) had been blocked all session on
+one sentence: *retiring the flag would delete the only reachable
+PG-shaped Q13.* That was true when measured. It is now false, and the
+reason is worth recording because it is not "we found a workaround" — the
+world changed under the blocker.
+
+C-06s taught the search PG's `JOIN_RIGHT` (§5.32). Re-measuring the flip
+on current HEAD, two `estimate-audit -plan-only` captures, one per flag
+value:
+
+| arm | Q13 plan | printed cost |
+|---|---|---:|
+| **ON (shipped default)** | `Hash Right Join`, `Hash Cond: (orders.o_custkey = customer.c_custkey)`, `Index Only Scan using customer_pk` | 124,999 |
+| OFF (`=0`) | `Hash Left Join`, reversed hash cond, same index-only scan | 60,308 |
+
+And PG 18.3's own captured plan (`bench/tpch/plans-pg/Q13.txt`):
+
+```
+->  Hash Right Join  (cost=5781.42..56243.29 rows=1484859 width=12)
+      Hash Cond: (orders.o_custkey = customer.c_custkey)
+      ...
+      ->  Index Only Scan using customer_pk on customer ...
+```
+
+**The ON arm is now the PG-parity plan** — same join type, same hash-cond
+orientation, same index-only scan. The OFF arm is not. Only Q13 differs
+between the arms; the other 21 queries are byte-identical.
+
+**And the ON arm is faster**, three reps each, fresh capped server per
+arm, rows identical at 34:
+
+| arm | reps | best | median |
+|---|---|---:|---:|
+| **ON** | 4.489 / 5.399 / 4.785 s | **4.49** | **4.78** |
+| OFF | 9.241 / 5.819 / 6.662 s | 5.82 | 6.66 |
+
+So the flag now preserves a plan that is **neither PG-shaped nor faster**.
+The argument for keeping it has gone from "it holds the only PG-shaped
+plan" to "it holds a slower non-PG one".
+
+**Two things I am not claiming.** The flip is still *not* byte-identical,
+so the item's literal gate does not pass — retiring is a deliberate,
+evidenced decision rather than a gate pass, and it would be dishonest to
+present it otherwise. And the OFF arm's spread is wide (a 9.24 s high
+against a 5.82 s low), so the defensible claim is the *direction*, not the
+1.30x factor.
+
+**Why the higher-cost plan is the faster one** is the same defect §5.29
+found and §5.31 generalised: on the OFF arm the join never enters the
+search and is priced by the plan-tree estimator, so 124,999 and 60,308 are
+not comparable numbers. This is the `c20a-two-estimators` surface showing
+up for the third time — once as C-06's original misdiagnosis, once as the
+base-rel scan pricing, and now as the reason a flag looked worth keeping.
+
+**Consistency note.** A sibling item went the other way today: **C-20f
+kept its flag**, because there the OFF arm is 11.4x slower and the hatch's
+value is escape from a misfiring cost gate on data we have not seen. The
+two are not in tension. C-20f's flag guards a *cost gate*; C-06's selects
+a *legacy jointree path that C-04 exists to make unnecessary*, and its OFF
+plan is now strictly worse rather than a useful escape.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
