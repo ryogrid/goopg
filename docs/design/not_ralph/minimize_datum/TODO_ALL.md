@@ -14,6 +14,30 @@ blockers in one place:
 - `TODO.md` in this directory (minimize_datum — the packed-retention
   bundle; blocked items marked inline)
 
+## Blocker inversion — the tracking instrument for the `[!]` rows (2026-09-07)
+
+**Policy set by the owner 2026-09-07: a `[!]` row is NOT a terminal state.**
+"Blocked" names a blocker, and a blocker is itself a work item. The only
+legitimate terminal states are **done**, or **out of scope on verified
+grounds** (no performance gain / infeasible in goopg's design / severe
+maintainability loss). Writing an excellent blocked row and moving on had
+become a way to close items without doing them — 23 accumulated that way.
+
+Inverting the ledger: those 23 rows collapse to **7 root blockers**. Work the
+blocker, not the bookkeeping — and **re-test whether each blocker is still
+true before treating it as one** (B-17b below was blocked on something that
+had already completed).
+
+| root blocker | holds | status 2026-09-07 |
+| :-- | :-- | :-- |
+| **spill-cost calibration** | B-13, B-15, E-16 | DESIGN ALREADY LANDED and unimplemented (`docs/design/planner-spill-cost-calibration/DESIGN.md`, 4 gated cuts). IN PROGRESS. |
+| **C-15 grouping paths** | B-17b | **STALE — C-15 landed `[x]`; B-17b is unblocked.** IN PROGRESS. |
+| **the seam drops `Pathkeys`** | C-07 | Named and measured: `newPrebuiltPath` leaves `Pathkeys` nil, so the Sort arm is the only reachable arm. Second blocker: producer unreachable at `nrels < 2`. IN PROGRESS. |
+| **C-19g upper-rel-resident half** | C-19h, D-05 | C-19g replaced the split VERDICT but not the CONSTRUCTION. IN PROGRESS (owns the `plan_snapshots/` pin). |
+| **B-01c *applying* half** | D-06, E-01 | B-01c's compute half is `[x]`; the applying half needs two things that do not exist — a narrowing-aware upper rewriter and a key-preservation gate. NOT STARTED. |
+| **"the flip moves plans"** | C-06, C-20c, C-20d, C-20e, C-20f, C-20g | Not a missing prerequisite but a finding. The attackable question behind it is the cost defect that makes the moved plan win — e.g. C-06: why does the search win a Merge Left Join at 5x the cost? NOT STARTED. |
+| **the D-04 stopping rule / D chain** | D-07, D-08, D-10, D-11, E-02, E-12, E-14, B-17e | Evidence-based stops and chained conversions. Needs per-item re-test of whether the stop still binds. NOT STARTED. |
+
 **One checkbox ≈ one commit.** An item that would move two planner inputs
 (or two executor inputs) at once is split before it is started (take3 08
 §1 P5 / 13 §1 EX-P3).
