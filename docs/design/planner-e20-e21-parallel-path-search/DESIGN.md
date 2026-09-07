@@ -20,6 +20,14 @@ Paths are repo-relative. PG citations are relative to `postgres/`, e.g.
 
 ## 0. Verdict
 
+**REVISED 2026-09-07, by measurement — see §1.1a.** E-21 is NOT small. Its
+operative gate is `isSimpleSingle` in `planSelect` (`planner.go:1235, 1377`),
+one frame above the seam every source pass examined, and closing it means
+replacing the legacy rule-based access-method chooser for every single-table
+statement in both corpora. Cut 1 (the seam floor) is landed, flagged and
+**measured inert**; Cut 1b (the `isSimpleSingle` re-route) is scoped and not
+built. The original verdict line, kept for the record:
+
 **PROCEED on E-21, in two cuts, both PG-faithful and both small.**
 **PROCEED on E-20 in one cut (partial merge join) and DEFER its second
 (partial nested loop) behind an executor prerequisite it does not own.**
@@ -132,6 +140,80 @@ allocates `joinrels` with `nrels+1` entries, so for a one-rel search
 `len(s.joinrels) == 2` and that guard is already false. **The seam is the ONLY
 thing keeping a one-relation statement out**, which makes Cut 1 smaller than
 the draft assumed.
+
+### 1.1a THIRD CORRECTION, found by measuring — the seam is not the first gate
+
+**Added 2026-09-07 after Cut 1 was built, flagged and measured. Cut 1 as
+designed in §1.1 is INERT, and the reason invalidates §1.1's "total" claim.**
+
+Cut 1 lowered the seam floor to one FROM item and was measured on the TPC-H
+SF=1 clone at `max_parallel_workers_per_gather = 4` (§6's method, private
+datadir `/tmp/e20d`, port 5542, own cgroup unit). Three arms, on the two c19h
+census probes plus a small-relation negative twin:
+
+| arm | `select * from lineitem where l_extendedprice > 90000` |
+|---|---|
+| A0 — HEAD | `Gather (cost=0.00..62325.07) → Parallel Seq Scan` |
+| B — `GOOPG_ONEREL_SEARCH=on` | **byte-identical to A0** |
+| C — `=on` + `GOOPG_GATHER_PATHS=all` | **byte-identical to A0** |
+
+`startup = 0.00` identifies all three as the `MaybeAddGather` post-pass's
+Gather, not `cost_gather`'s (which adds `parallel_setup_cost = 1000` to
+startup). So the path model produced nothing, in every arm.
+
+The cause is not a cost decline. With `GOOPG_PGSHAPED_DP_TRACE=1` the
+statement emits **no seam trace at all** — neither a decline nor a search
+block — while a two-relation control query on the same server emits three
+`DPTRACE` lines. The seam is never CALLED.
+
+`planSelect` classifies the statement one layer above the seam
+(`planner.go:1235`):
+
+```go
+isSimpleSingle := len(s.From) == 1 && (len(s.FromExprs) == 0 ||
+    (len(s.FromExprs) == 1 && len(s.FromExprs[0].Joins) == 0))
+```
+
+and at `planner.go:1377` the WHERE arm branches on it: `if isSimpleSingle`
+takes `planIndexScanFromWhere` — the legacy rule-based access-method chooser —
+and returns; only the `else` reaches the `*Filter` arm that calls
+`tryJoinSearch` (`planner.go:1470`). The `else if isSimpleSingle` at
+`planner.go:1261` routes the FROM itself to `planScanRangeVar` for the same
+class.
+
+**So E-21's gate chain has three links, not one**, and §1.1 named only the
+second:
+
+1. `planner.go:1235` / `:1377` — `isSimpleSingle` diverts the statement to the
+   legacy single-table planner before any seam exists. **This is the operative
+   one.**
+2. `joinsearchseam.go:230` — `nrels < 2`, which Cut 1 lowered. Necessary, not
+   sufficient.
+3. `relfromjoinlist.go:357` — the row's cited site, already compensated at
+   `:213`.
+
+**What this costs the row.** E-21 is not a floor change. Closing it means
+routing `isSimpleSingle` statements through the path search *instead of*
+`planIndexScanFromWhere`, i.e. replacing the rule-based access-method choice
+for every single-table statement in both corpora with `add_path`. That is a
+far larger change than either the row or §4's first draft assumed, and it is
+the change §5.2 warned about — except that the warning understated it: the
+legacy chooser is not merely bypassed, it is the *incumbent*, and the two
+disagree by construction (`enable_scan_methods_test.go`'s header records that
+"the rule-based legacy scan choice keeps its own declines … it has no cost
+competition to express a preference in").
+
+**Cut 1 is therefore landed as a PREREQUISITE, not as E-21's fix**, and is
+honestly labelled inert: it removes link 2 so that link 1 can be attacked on
+its own, and its own gate is that it changes nothing (arms B and C above).
+Cut 1b — the `isSimpleSingle` re-route — is scoped in §4 and NOT built here.
+
+**Method note.** This was found by measuring an arm that was expected to work
+and then instrumenting the exit path, not by reading further. Three source
+passes (two mapping, two adversarial) all read `joinsearchseam.go:230` as the
+gate and none of them looked one frame up the call stack, because the question
+they were asked was "is this the gate" rather than "is the seam reached". The
+trace answered it in one line.
 
 **Consequence for the fix.** Deleting or weakening the `len(items) == 1`
 return would be the wrong change: it would alter the nested sub-joinlist
@@ -519,6 +601,36 @@ of one-table statements. **Mitigation: land Cut 1 behind
 `GOOPG_ONEREL_SEARCH` (default off), measure, then flip in a separate commit
 with its own gate run.** Do not bundle the flip with the mechanism.
 
+### Cut 1b (E-21a, second half) — route `isSimpleSingle` through the search
+
+**NOT BUILT. Scoped here because §1.1a showed Cut 1 alone cannot close E-21.**
+
+**Change.** In `planSelect`, stop diverting a one-FROM-item statement to the
+legacy single-table planner: the `isSimpleSingle` arms at `planner.go:1261`
+(FROM) and `planner.go:1377` (WHERE) must fall through to the `*Filter` arm
+that calls `tryJoinSearch` (`planner.go:1470`), under the same
+`GOOPG_ONEREL_SEARCH` knob. Cut 1 has already made the seam accept what
+arrives.
+
+**What it displaces.** `planIndexScanFromWhere` — the rule-based chooser that
+picks the access method for every single-table statement today. After Cut 1b
+that choice is `add_path`'s, made among the paths
+`addBaseRelIndexPaths` / `addBaseRelPartialPaths` file. This is PG's
+arrangement (`set_plain_rel_pathlist`, `allpaths.c:768-799`) and it is also
+the single largest plan-shape change in this track by a wide margin.
+
+**Why it is not built here.** It needs its own measured round: the TPC-DS
+corpus is dominated by single-table statements, the two choosers disagree by
+construction, and no values gate can see an access-method regression — only a
+timing and plan-shape A/B can. Landing it inside E-21's mechanism commit would
+bundle a large, unmeasured plan change with a change whose whole gate is that
+it changes nothing.
+
+**Prerequisites already discharged**: Cut 1 (seam floor);
+`relfromjoinlist.go:213`'s one-relation protocol; `newSearchCtx`'s `nrels >= 1`
+support; and `addBaseRelPartialPaths` filing a partial path on a one-rel
+`searchCtx` (`TestOneRelSearchFilesAPartialPath`).
+
 ### Cut 2 (E-21b) — the deferred top-rel gather
 
 **Change.** `addBaseRelGatherPaths` (`gatherpaths.go:384`) currently gathers
@@ -811,6 +923,20 @@ silently, including the corrections that falsified this document's own claims.
 Neither review can answer whether Cut 1 regresses access-method selection, or
 whether Cut 2's crossover agrees with PG's on a real relation. Those are
 measurements (§6), and no amount of source reading substitutes for them.
+
+---
+
+## 7.4 What the measurement changed, after the reviews
+
+Both adversarial reviews passed on §1.1's gate claim — one confirmed it after
+deliberately trying to falsify it. Neither was wrong about what it read; both
+answered "is `joinsearchseam.go:230` the gate?" and neither asked "is the seam
+reached at all?". A one-line trace answered the second question and moved the
+gate one frame up the call stack (§1.1a).
+
+Recorded as a method finding, not as a complaint about the reviews: **a
+source-falsification pass over the site a design names cannot find a gate the
+design does not name.** The arm that found it was an arm expected to succeed.
 
 ---
 
