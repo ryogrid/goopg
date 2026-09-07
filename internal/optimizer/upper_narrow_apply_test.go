@@ -235,7 +235,7 @@ func TestApplyUpperNarrowingPreservesEmittedOrder(t *testing.T) {
 		t.Fatal("fixture ordering equals input order — the oracle would pass without comparing anything")
 	}
 
-	if !narrowAggregateInput(agg) {
+	if !narrowAggregateInput(agg, upperNarrowRefCounts(agg)) {
 		t.Fatal("the applier refused a sorted-aggregate site whose keep covers every key it reads")
 	}
 	if _, isProj := srt.Child.(*Project); !isProj {
@@ -262,7 +262,7 @@ func TestApplyUpperNarrowingPreservesEmittedOrder(t *testing.T) {
 // FAIL. Without this the passing case could be comparing nothing.
 func TestApplyUpperNarrowingOrderOracleIsNotVacuous(t *testing.T) {
 	agg, srt, keep, rows, keys := unaSortedAggTree()
-	if !narrowAggregateInput(agg) {
+	if !narrowAggregateInput(agg, upperNarrowRefCounts(agg)) {
 		t.Fatal("the applier refused the fixture site")
 	}
 	bad := make([]SortKey, len(srt.Keys))
@@ -341,7 +341,7 @@ func TestNarrowAggregateInputRefuses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			agg := tc.make()
 			before := unaDump(agg, 0)
-			if narrowAggregateInput(agg) {
+			if narrowAggregateInput(agg, upperNarrowRefCounts(agg)) {
 				t.Fatalf("the applier narrowed %s", tc.name)
 			}
 			if after := unaDump(agg, 0); after != before {
@@ -375,7 +375,7 @@ func TestNarrowAggregateInputLeavesNoPartialRewrite(t *testing.T) {
 	}
 	agg.InputTarget, agg.InputTargetKnown = []int{1, 4}, true
 
-	if narrowAggregateInput(agg) {
+	if narrowAggregateInput(agg, upperNarrowRefCounts(agg)) {
 		t.Fatal("the applier narrowed a site with no retention point below it")
 	}
 	if agg.Child != Node(flt) {

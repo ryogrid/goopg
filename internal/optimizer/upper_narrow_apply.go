@@ -117,7 +117,18 @@ func applyUpperNarrowing(n Node) Node {
 	if !narrowUpper || n == nil {
 		return n
 	}
-	applyUpperNarrowingAt(n, map[Node]bool{})
+	// One census of the tree's parent edges, shared by both passes: a node
+	// reachable from two parents cannot be rewritten on one path without
+	// leaving the other reading pre-cut positions. See upperNarrowRefCounts
+	// (upper_narrow_chain.go).
+	refs := upperNarrowRefCounts(n)
+	applyUpperNarrowingAt(n, map[Node]bool{}, refs)
+	// Slice (c): the `*Sort` site, whose output DOES move and which therefore
+	// needs the ancestor-chain walk (upper_narrow_chain.go). It is a SECOND,
+	// TOP-DOWN pass on purpose — a Sort the Aggregate site already narrowed has
+	// had its stamp cleared by then, so the two sites cannot both cut one node,
+	// and no chain is computed against a tree that is still moving.
+	applyUpperSortNarrowing(n, refs)
 	return n
 }
 
@@ -125,16 +136,16 @@ func applyUpperNarrowing(n Node) Node {
 // walk idempotent over a DAG: a node reachable by two paths (the DML/CTE
 // prefix shapes share subtrees) must not be narrowed twice, and a second
 // application would be computed against an already-narrowed row.
-func applyUpperNarrowingAt(n Node, seen map[Node]bool) {
+func applyUpperNarrowingAt(n Node, seen map[Node]bool, refs map[Node]int) {
 	if n == nil || seen[n] {
 		return
 	}
 	seen[n] = true
 	for _, c := range upperNarrowChildren(n) {
-		applyUpperNarrowingAt(c, seen)
+		applyUpperNarrowingAt(c, seen, refs)
 	}
 	if agg, ok := n.(*Aggregate); ok {
-		narrowAggregateInput(agg)
+		narrowAggregateInput(agg, refs)
 	}
 }
 
@@ -196,7 +207,7 @@ func upperNarrowChildren(n Node) []Node {
 // through the sink cannot leave the aggregate rewritten over an un-narrowed
 // row — which would be the silent wrong answer this whole cut is arranged to
 // avoid.
-func narrowAggregateInput(agg *Aggregate) bool {
+func narrowAggregateInput(agg *Aggregate, refs map[Node]int) bool {
 	if agg == nil || agg.Child == nil || !agg.InputTargetKnown {
 		return false
 	}
@@ -230,6 +241,14 @@ func narrowAggregateInput(agg *Aggregate) bool {
 	}
 	sunk, ok := planSinkNarrowingProject(agg.Child, km)
 	if !ok {
+		return false
+	}
+	// A wrapper the sink rewrites must not be reachable from a second parent:
+	// the other path's node would go on reading pre-cut positions. Slice (c)
+	// added the census (`upperNarrowRefCounts`) for its ancestor chain; the
+	// same fact applies below a narrowing site, and applying it here closes the
+	// exposure rather than leaving it to the shape of today's plans.
+	if anyShared(sunk.touched, refs) {
 		return false
 	}
 	// THE RETENTION-SITE CONDITION, and the reason this is a cut and not a
@@ -375,6 +394,25 @@ type sinkPlan struct {
 	root     Node
 	pastSort bool
 	install  []func()
+	// touched lists the EXISTING nodes the plan will rewrite (the wrappers it
+	// descends past). The `Project` it splices in is new and shared with
+	// nothing; the node that Project wraps is not rewritten, only re-parented.
+	// The caller checks these against the tree's parent-edge census before
+	// committing — see `anyShared`.
+	touched []Node
+}
+
+// anyShared reports whether any of nodes has more than one parent edge in the
+// census. A node reachable from two parents cannot be rewritten on one path:
+// the other path would keep reading PRE-CUT positions, which is a wrong column
+// with a correct row count.
+func anyShared(nodes []Node, refs map[Node]int) bool {
+	for _, n := range nodes {
+		if refs[n] > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // planSinkNarrowingProject computes where the narrowing Project goes: as
@@ -436,6 +474,7 @@ func planSinkNarrowingProject(child Node, km keepMap) (sinkPlan, bool) {
 		return sinkPlan{
 			root:     x,
 			pastSort: true,
+			touched:  append(below.touched, x),
 			install: append(below.install, func() {
 				x.Keys = keys
 				x.Child = below.root
@@ -471,6 +510,7 @@ func planSinkNarrowingProject(child Node, km keepMap) (sinkPlan, bool) {
 		return sinkPlan{
 			root:     x,
 			pastSort: below.pastSort,
+			touched:  append(below.touched, x),
 			install: append(below.install, func() {
 				x.Predicate = pred
 				x.PushedBelow = pushed

@@ -94,6 +94,13 @@ var flagResolvedState = map[string]func(string) string{
 	// sorted aggregation carries the narrowed row (upper_narrow_apply.go).
 	// Default ON, `=0` opts back out to the un-narrowed arm.
 	"GOOPG_NARROW_UPPER": func(v string) string { return onOff(narrowUpperFromEnv(v)) },
+	// B-01c applying half, slice (c): narrows the input row of an upper `*Sort`
+	// site — the general ORDER BY sort — re-basing the whole ancestor chain up
+	// to the node that absorbs the change (upper_narrow_chain.go). A separate
+	// flag from GOOPG_NARROW_UPPER because the two sites move different plan
+	// shapes and an A/B that cannot separate them cannot attribute a
+	// regression. Default ON; `=0` opts back out, as does GOOPG_NARROW_UPPER=0.
+	"GOOPG_NARROW_UPPER_SORT": func(v string) string { return onOff(narrowUpperSortFromEnv(v)) },
 	// C-19d: a MODE, not a boolean — off / top / all. It decides whether the
 	// search may choose a Gather at all, and at which rels, so an artefact
 	// that does not name it cannot say whether the plans it holds were free
@@ -164,6 +171,11 @@ var flagProvenanceOrder = []string{
 	// sorted aggregation, so an artefact that does not name it cannot say
 	// which sort payload it measured. Default ON.
 	"GOOPG_NARROW_UPPER",
+	// Joined at take3 B-01c applying half, slice (c): narrows the general
+	// ORDER BY sort's input row and re-bases the ancestor chain above it, so an
+	// artefact that does not name it cannot say which sort payload it measured.
+	// Default ON.
+	"GOOPG_NARROW_UPPER_SORT",
 	// Joined at take3 C-19d (P5-04): admits `PathGather` / `PathGatherMerge`
 	// into the search. Default `off` pending the TPC-H A/B that decides it
 	// (docs/design/planner-c19d-gather-paths/DESIGN.md §5).
