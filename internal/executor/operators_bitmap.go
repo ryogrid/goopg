@@ -335,6 +335,12 @@ type bitmapHeapScanOp struct {
 	// built once by the leader before fan-out. (S5.6)
 	pbm *parallelBitmapState
 
+	// pf is the E-19 S4 look-ahead window: a small FIFO of installing reads
+	// (Pool.StartRead) for blocks the scan has not reached yet. nil unless
+	// GOOPG_HEAP_PREFETCH_DEPTH is set, which is the default — see
+	// bitmap_prefetch.go for why it is off, and why it is serial-only.
+	pf *heapPrefetchWindow
+
 	// ownBitmap flags that this operator built the bitmap itself and must
 	// release it at Close. false when the bitmap is shared (pbm != nil).
 	ownBitmap bool
@@ -373,6 +379,11 @@ func (o *bitmapHeapScanOp) BindOuter(slot SlotView, outerWidth int) {
 func (o *bitmapHeapScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.BindOuter(outerSlot, outerWidth)
 	o.releasePinned()
+	// E-19 S4 drain point. releasePinned is PER-PAGE and deliberately does not
+	// touch the window; Rescan throws the whole bitmap away, so every
+	// outstanding look-ahead is now for a block this operator will never
+	// visit, and every one of them holds a pin.
+	o.pf.drain()
 	o.tbm = nil
 	o.iter = nil
 	o.ownBitmap = false
@@ -411,8 +422,16 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 	// built by the leader and published there. Workers skip building the outer
 	// tree entirely — they claim pages from the shared allocator.
 	if o.pbm != nil {
+		// E-19 S4: no window on the parallel path. A worker claims pages one
+		// at a time from the shared atomic allocator, so it cannot look ahead
+		// at its own future blocks without claiming them — a parallel window
+		// needs a batched-claim API, which is out of scope. See
+		// bitmap_prefetch.go's decision 1: at bench settings every plan is
+		// parallel, so the item has NO WITNESS THERE, and saying so is the
+		// honest reading rather than reporting a zero as a result.
 		return nil
 	}
+	o.pf = newHeapPrefetchWindow(ctx.Pool, o.rel, heapPrefetchDepth())
 
 	// Build the outer operator (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
 	outerOp, err := buildNode(o.plan.Outer, deformBoundFull)
@@ -435,6 +454,7 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 
 func (o *bitmapHeapScanOp) Close() error {
 	o.releasePinned()
+	o.pf.drain() // E-19 S4 drain point: the lifecycle end that always runs
 	if o.outer != nil {
 		o.outer.Close()
 		o.outer = nil
@@ -515,6 +535,7 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 			// length 0" from inside the join's predicate evaluation, on a stack
 			// that names neither this line nor the bitmap scan.
 			o.releasePinned()
+			o.pf.drain() // E-19 S4 drain point
 			return nil, EOF
 		}
 
@@ -522,9 +543,25 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 		if o.pinned == nil || block != o.pageBlock {
 			o.releasePinned()
 
-			slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: o.rel, Block: block})
-			if err != nil {
-				return nil, err
+			// E-19 S4. The window is refilled HERE, at the page transition,
+			// and nowhere else. Not in Next()'s prologue: fetchExact skips a
+			// dead/invisible/filtered tuple by recursing into o.Next()
+			// (§4.2 correction iii), so anything placed there runs once per
+			// skipped tuple. This site is re-entered by that recursion too,
+			// but the `block != o.pageBlock` guard above means the body runs
+			// once per page, which is the cadence a window wants.
+			var slot *storage.Slot
+			if o.pf != nil {
+				o.pf.refill(o.iter.peekBlocks(o.pf.peek))
+				slot = o.pf.take(block)
+			}
+			if slot == nil {
+				var err error
+				slot, err = o.ctx.Pool.Pin(storage.BufferTag{Rel: o.rel, Block: block})
+				if err != nil {
+					o.pf.drain() // E-19 S4 drain point: the error return
+					return nil, err
+				}
 			}
 			slot.RLock()
 			o.pinned = slot
