@@ -106,14 +106,18 @@ func TestSeamRightLinkDPPathOfferedAndAccepted(t *testing.T) {
 		if !strings.HasPrefix(l, "DPPATH") {
 			continue
 		}
-		if strings.Contains(l, "jointype=right") {
-			t.Errorf("a path carries jointype=right: %q", l)
-		}
 		switch {
 		case strings.Contains(l, "relids={0,1,2}"):
 			offered++
-			if !strings.Contains(l, "jointype=left") {
-				t.Errorf("path over the outer joinrel is stamped otherwise: %q", l)
+			// C-06s: LEFT or RIGHT. Before it, `jointypeForDirection` declined
+			// the commuted containment, so this joinrel could only be offered
+			// as LEFT and the pin asserted that literally. The search now also
+			// offers PG's JOIN_RIGHT — the same join with its hands swapped.
+			// What must NEVER appear over this joinrel is an INNER path: that
+			// drops the unmatched rows the RIGHT link exists to keep, and it is
+			// the wrong answer this pin was written to catch.
+			if !strings.Contains(l, "jointype=left") && !strings.Contains(l, "jointype=right") {
+				t.Errorf("path over the outer joinrel is neither left nor right: %q", l)
 			}
 			if strings.Contains(l, "verdict=accepted") {
 				accepted++
@@ -128,7 +132,7 @@ func TestSeamRightLinkDPPathOfferedAndAccepted(t *testing.T) {
 		t.Fatal("no path was offered over the outer joinrel {a,b,c}")
 	}
 	if accepted == 0 {
-		t.Errorf("%d LEFT paths offered over {a,b,c}, none accepted", offered)
+		t.Errorf("%d outer paths offered over {a,b,c}, none accepted", offered)
 	}
 	if inner == 0 {
 		t.Error("the nullable prefix {a,b} produced no inner-join path — it must be complete before c joins")

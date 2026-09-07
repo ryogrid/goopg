@@ -267,9 +267,14 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 			t.Fatalf("pinned %s join WITH its SpecialJoinInfo: %v", joinTypeName(jt), err)
 		}
 		joins := rfjJoins(rel)
-		if len(joins) != 1 || joins[0].Type != JoinTypeLeft {
-			t.Fatalf("pinned %s join WITH its SpecialJoinInfo planned as %v, want one LEFT join "+
-				"(a RIGHT link is planned as the LEFT join it reduces to)", joinTypeName(jt), joins)
+		// C-06s: one outer-preserving join, spelled LEFT or RIGHT. The pin's
+		// point is that the pinned link is PLANNED (not refused) and stays
+		// outer; before C-06s a RIGHT link could only be planned as the LEFT
+		// join it reduces to, and now the commuted spelling can win instead.
+		// An INNER or FULL result is still a failure.
+		if len(joins) != 1 || (joins[0].Type != JoinTypeLeft && joins[0].Type != JoinTypeRight) {
+			t.Fatalf("pinned %s join WITH its SpecialJoinInfo planned as %v, want one "+
+				"outer-preserving join (LEFT or RIGHT)", joinTypeName(jt), joins)
 		}
 	}
 }
@@ -465,26 +470,42 @@ func TestSeamPlansARightLinkInsideOneSearchProblem(t *testing.T) {
 	var outer *Join
 	for _, j := range joins {
 		switch j.Type {
-		case JoinTypeLeft:
+		// C-06s: RIGHT is a legitimate spelling now. Before it,
+		// `jointypeForDirection` declined the commuted containment, so a RIGHT
+		// link could only be planned as the LEFT join it reduces to; the search
+		// may now also win the commuted form, which is the same join with its
+		// hands swapped. FULL is still refused outright and is what `default`
+		// catches.
+		case JoinTypeLeft, JoinTypeRight:
 			if outer != nil {
 				t.Fatalf("searched tree has two outer joins for one RIGHT link")
 			}
 			outer = j
 		case JoinTypeInner, JoinTypeCross:
 		default:
-			t.Fatalf("searched tree contains a %v join — a RIGHT link is planned as the LEFT "+
-				"join it reduces to, never as RIGHT", j.Type)
+			t.Fatalf("searched tree contains a %v join — only LEFT/RIGHT preserve "+
+				"the unmatched rows, and FULL is refused", j.Type)
 		}
 	}
 	if outer == nil {
-		t.Fatal("searched tree has no LEFT join — the RIGHT link was planned as an INNER join, " +
+		t.Fatal("searched tree has no outer join — the RIGHT link was planned as an INNER join, " +
 			"which drops the unmatched `d` rows the statement asked for")
 	}
-	// `d` alone is preserved: it is the LEFT join's outer input, and the whole
-	// prefix is its nullable input. The other way round would preserve the
-	// wrong side — the right row COUNT on a fixture, the wrong rows on data.
-	if nl, nr := rfjLeafCount(outer.Left), rfjLeafCount(outer.Right); nl != 1 || nr != 3 {
-		t.Fatalf("LEFT join preserves %d leaves and null-extends %d, want 1 (d) and 3 (the prefix)", nl, nr)
+	// `d` alone is preserved and the whole prefix is null-extended. The other
+	// way round would preserve the wrong side — the right row COUNT on a
+	// fixture, the wrong rows on data.
+	//
+	// C-06s: read the hands BY JOINTYPE, not by position. A LEFT join preserves
+	// its Left child; a RIGHT join preserves its Right one. A commuted winner
+	// has its children swapped, so a positional read would report the leaf
+	// counts backwards and fail a correct plan.
+	preserved, nullExtended := outer.Left, outer.Right
+	if outer.Type == JoinTypeRight {
+		preserved, nullExtended = outer.Right, outer.Left
+	}
+	if nl, nr := rfjLeafCount(preserved), rfjLeafCount(nullExtended); nl != 1 || nr != 3 {
+		t.Fatalf("%v join preserves %d leaves and null-extends %d, want 1 (d) and 3 (the prefix)",
+			outer.Type, nl, nr)
 	}
 	got := seamEqualities(out)
 	for _, want := range []string{"a0=b0", "b0=c0", "c0=d0"} {
@@ -546,15 +567,18 @@ func TestSeamPlansARightLinkUnderALeftLinkInOneProblem(t *testing.T) {
 	if len(joins) != 3 {
 		t.Fatalf("searched tree has %d joins, want 3 for its 4 relations", len(joins))
 	}
-	nleft := 0
+	// C-06s: count LEFT+RIGHT — either spelling preserves the unmatched rows.
+	// The guard is the COUNT: two outer links must survive, because one of them
+	// planned as an inner join drops rows.
+	nouter := 0
 	for _, j := range joins {
-		if j.Type == JoinTypeLeft {
-			nleft++
+		if j.Type == JoinTypeLeft || j.Type == JoinTypeRight {
+			nouter++
 		}
 	}
-	if nleft != 2 {
-		t.Fatalf("searched tree has %d LEFT joins, want 2 — the RIGHT link reduces to one and "+
-			"the LEFT link is the other; one planned as an inner join drops rows", nleft)
+	if nouter != 2 {
+		t.Fatalf("searched tree has %d outer-preserving joins, want 2 — the RIGHT link is one "+
+			"and the LEFT link is the other; one planned as an inner join drops rows", nouter)
 	}
 	if n := len(seamLeafLocalFilters(out)); n != 0 {
 		t.Fatalf("found %d leaf-local filters, want 0 — `a` is null-extended", n)

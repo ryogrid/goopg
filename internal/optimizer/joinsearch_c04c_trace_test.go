@@ -160,14 +160,11 @@ func TestBelowInnerLeftLinkSurvivesCollapseSplit(t *testing.T) {
 			t.Fatalf("n=%d: the seam declined a below-inner LEFT link whose inner quals "+
 				"are all preserved-side; the pin would be vacuous", n)
 		}
-		nleft := 0
-		for _, j := range rfjJoins(out) {
-			if j.Type == JoinTypeLeft {
-				nleft++
-			}
-		}
-		if nleft != 1 {
-			t.Errorf("n=%d: LEFT link lost through the collapse split (left=%d)", n, nleft)
+		// C-06s: LEFT or RIGHT. The spelling may commute; what the pin guards
+		// is that the link does not become INNER and drop the unmatched rows.
+		if nouter := rfjOuterPreserving(out); nouter != 1 {
+			t.Errorf("n=%d: outer link lost through the collapse split "+
+				"(outer-preserving=%d, want 1)", n, nouter)
 		}
 	}
 }

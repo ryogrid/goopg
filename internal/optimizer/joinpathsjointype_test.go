@@ -51,10 +51,12 @@ func kindsOf(list []*Path) map[PathKind]int {
 
 // TestJointypeForDirection_OrientationDecidesLegality is the mechanism, stated
 // on its own before any path is generated: the SAME sjinfo reaches both
-// directions and only the one whose outer covers MinLefthand may perform the
-// join. That is PG's arrangement — `populate_joinrel_with_paths` hands its two
-// `add_paths_to_joinrel` calls DIFFERENT jointypes (JOIN_LEFT / JOIN_RIGHT at
-// joinrels.c:932-939) precisely because the jointype alone cannot express it.
+// directions. For LEFT both orientations are legal — forward performs
+// JOIN_LEFT, reversed performs JOIN_RIGHT (PG's two add_paths_to_joinrel
+// calls, joinrels.c:932-939; C-06s) — while RIGHT/SEMI/ANTI admit only the
+// forward one. That is PG's arrangement: `populate_joinrel_with_paths` hands
+// its two `add_paths_to_joinrel` calls DIFFERENT jointypes precisely because
+// the jointype alone cannot express orientation.
 func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 	a, b := relsetOf(0), relsetOf(1)
 
@@ -67,7 +69,7 @@ func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 	}
 
 	for _, jtype := range []parser.JoinType{
-		parser.JoinLeft, parser.JoinRight, parser.JoinSemi, parser.JoinAnti,
+		parser.JoinRight, parser.JoinSemi, parser.JoinAnti,
 	} {
 		sj := mkSJ(jtype, a, b)
 		if jt, ok := jointypeForDirection(sj, a, b); !ok || jt != jtype {
@@ -75,9 +77,30 @@ func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 		}
 		if _, ok := jointypeForDirection(sj, b, a); ok {
 			t.Errorf("%v reversed = legal; want declined — the reversed direction is "+
-				"PG's JOIN_RIGHT/JOIN_RIGHT_SEMI/JOIN_RIGHT_ANTI, which goopg does not "+
-				"generate", jtype)
+				"PG's JOIN_RIGHT_SEMI/JOIN_RIGHT_ANTI (or an unadmitted commuted RIGHT), "+
+				"which goopg does not generate", jtype)
 		}
+	}
+
+	// C-06s: LEFT admits the commuted direction as JOIN_RIGHT (PG's second
+	// add_paths_to_joinrel call, joinrels.c:936-939). Forward still wins
+	// ties — PG calls LEFT first — and a pair covering neither orientation
+	// still declines.
+	sjLeft := mkSJ(parser.JoinLeft, a, b)
+	if jt, ok := jointypeForDirection(sjLeft, a, b); !ok || jt != parser.JoinLeft {
+		t.Errorf("LEFT forward = (%v, %v), want (JoinLeft, true)", jt, ok)
+	}
+	if jt, ok := jointypeForDirection(sjLeft, b, a); !ok || jt != parser.JoinRight {
+		t.Errorf("LEFT reversed = (%v, %v), want (JoinRight, true)", jt, ok)
+	}
+	// A disjoint pair covering neither orientation still declines. (With
+	// disjoint outer/inner the two containments are mutually exclusive —
+	// both would need MinLefthand in the empty intersection — so there is
+	// no tie for forward to win; PG likewise calls LEFT first and the
+	// second call only fires on the reversed containment.)
+	c, d := relsetOf(2), relsetOf(3)
+	if jt, ok := jointypeForDirection(sjLeft, c, d); ok || jt != parser.JoinLeft {
+		t.Errorf("LEFT disjoint-neither = (%v, %v), want (JoinLeft, false)", jt, ok)
 	}
 
 	// FULL: neither direction. C-03c — the executor has no FULL hash semantics,
@@ -178,11 +201,81 @@ func TestAddPaths_OuterLegalDirectionOnly(t *testing.T) {
 			if err := addPathsToJoinrel(nil, joinrel, inner, outer, clauses, defaultCostParams(), sj); err != nil {
 				t.Fatalf("reversed direction: %v", err)
 			}
-			if len(joinrel.Pathlist) != before {
+			added := joinrel.Pathlist[before:]
+			if jtype == parser.JoinLeft {
+				// C-06s: the reversed direction is PG's JOIN_RIGHT arm.
+				// Survival is cost-dependent (a right path that loses is
+				// pruned — correctly), so all that is pinned here is the
+				// stamp: anything that DID survive is JoinRight. Generation
+				// itself is adjudicated on the trace by
+				// TestAddPaths_LeftReversedGeneratesTheRightFamily.
+				for _, p := range added {
+					if p.Jointype != parser.JoinRight {
+						t.Errorf("reversed path kind=%d stamped %v, want JoinRight",
+							p.Kind, p.Jointype)
+					}
+				}
+				return
+			}
+			if len(added) != 0 {
 				t.Errorf("reversed direction added %d paths; want 0",
-					len(joinrel.Pathlist)-before)
+					len(added))
 			}
 		})
+	}
+}
+
+// TestAddPaths_LeftReversedGeneratesTheRightFamily pins C-06s where it
+// lives: `addPathsToJoinrel`'s commuted call must OFFER hash and merge
+// paths stamped JoinRight (PG's second add_paths_to_joinrel call,
+// joinrels.c:936-939). Asserted on the DPPATH trace rather than the
+// surviving pathlist, because survival is cost-dependent — a right path
+// that loses is pruned, correctly, and either verdict is a sound
+// `add_path` comparison. What must not happen is silence: no offer at
+// all. (File header: verify both candidates were generated.)
+//
+// The fixture is shaped so the commuted hash is cheap: the SJI's RHS is
+// the 10000-row side, so the forward hash builds big while the commuted
+// hash builds the 500-row side and survives the tournament.
+func TestAddPaths_LeftReversedGeneratesTheRightFamily(t *testing.T) {
+	a, b := relsetOf(0), relsetOf(1)
+	outer := scanRel(a, 500, 5)
+	inner := scanRel(b, 10000, 100)
+	joinrel := newRelOptInfo(a|b, 5000, 64)
+	clauses := []*restrictInfo{equiClause(a, b), plainClause(a | b)}
+	sj := mkSJ(parser.JoinLeft, a, b)
+
+	lines := captureTrace(t, func() {
+		if err := addPathsToJoinrel(nil, joinrel, inner, outer, clauses, defaultCostParams(), sj); err != nil {
+			t.Fatalf("reversed direction: %v", err)
+		}
+	})
+	var hashRight, mergeRight bool
+	for _, l := range lines {
+		if !strings.Contains(l, "jointype=right") {
+			continue
+		}
+		switch {
+		case strings.Contains(l, "producer=join.hash") && strings.Contains(l, "verdict=accepted"):
+			hashRight = true
+		case strings.Contains(l, "producer=mergejoin") && strings.Contains(l, "verdict=accepted"):
+			mergeRight = true
+		}
+	}
+	if !hashRight {
+		t.Errorf("no accepted join.hash jointype=right line;\n%s", strings.Join(lines, "\n"))
+	}
+	if !mergeRight {
+		t.Errorf("no accepted mergejoin jointype=right line;\n%s", strings.Join(lines, "\n"))
+	}
+	// And whatever survived the tournament carries the stamp.
+	if len(joinrel.Pathlist) == 0 {
+		t.Errorf("reversed direction generated no surviving paths")
+	}
+	for _, p := range joinrel.Pathlist {
+		if p.Jointype != parser.JoinRight {
+			t.Errorf("surviving path kind=%d stamped %v, want JoinRight", p.Kind, p.Jointype)
+		}
 	}
 }
 

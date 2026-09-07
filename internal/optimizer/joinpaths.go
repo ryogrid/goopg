@@ -128,12 +128,15 @@ func isKeyableFor(ri *restrictInfo, outer, inner RelSet) bool {
 // rather than as "decline the second call" so it stays correct for any caller,
 // including the hand-built fixtures the C-03b/C-03d evidence runs on.
 //
-// The reversed direction is DECLINED rather than emitted as PG's JOIN_RIGHT /
+// The reversed direction is DECLINED rather than emitted as PG's
 // JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI. That is a deliberate narrowing, not an
-// oversight: goopg's search would then own two ways to express one join and
-// C-04 would have to prove both correct at once. Withholding a path can only
-// lose an optimisation, never produce a wrong answer, and nothing selects these
-// paths today in any case.
+// oversight: goopg's executor has no RIGHT-SEMI/RIGHT-ANTI arms, so emitting
+// them would produce plans nothing can execute. Withholding a path can only
+// lose an optimisation, never produce a wrong answer, and nothing selects
+// these paths today in any case. (C-06s ended the corresponding sentence for
+// LEFT below: the commuted LEFT direction IS emitted now, because C-04a/C-04b
+// put two-table outer joins into the search and Q13 proved the withheld
+// direction is the winner there.)
 //
 // SEMI/ANTI contract. PG runs `hash_inner_and_outer` for JOIN_SEMI
 // (joinpath.c:2229) and its executor early-outs on the first inner match.
@@ -168,7 +171,33 @@ func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner RelSet) (parser.
 	case parser.JoinFull:
 		// See the FULL note above: no direction, no path, no plan.
 		return parser.JoinFull, false
-	case parser.JoinLeft, parser.JoinRight, parser.JoinSemi, parser.JoinAnti:
+	case parser.JoinLeft:
+		// Forward: the outer covers MinLefthand, the inner MinRighthand —
+		// PG's JOIN_LEFT arm (joinrels.c:932-935).
+		if relsSubset(sjinfo.MinLefthand, outer) && relsSubset(sjinfo.MinRighthand, inner) {
+			return parser.JoinLeft, true
+		}
+		// C-06s — the commuted direction: the outer covers MinRighthand,
+		// the inner MinLefthand. PG's JOIN_LEFT arm calls
+		// `add_paths_to_joinrel` a second time with JOIN_RIGHT
+		// (joinrels.c:936-939), and `addPathsToJoinrel` builds hash and
+		// merge paths for it. Without this arm the only hash path the
+		// search can price must build the PRESERVED side (Q13: the 1.5M-row
+		// `orders` build spills and loses to merge at 336 448 vs 316 090);
+		// with it the search prices hashing the nullable side (124 999 —
+		// PG's `Hash Right Join` shape, byte-identical values, ~30% faster
+		// measured). Scope is LEFT ONLY and fail-closed: SEMI/ANTI keep
+		// declining below (no executor arms), FULL above.
+		if relsSubset(sjinfo.MinRighthand, outer) && relsSubset(sjinfo.MinLefthand, inner) {
+			return parser.JoinRight, true
+		}
+		return parser.JoinLeft, false
+	case parser.JoinRight, parser.JoinSemi, parser.JoinAnti:
+		// JoinRight keeps forward-only containment: a surviving JoinRight
+		// SJI names a deep-nested RIGHT link (S9.4 flips first-position
+		// RIGHTs to LEFT at the jointree), whose commuted admission needs
+		// the nested-AST work ledgered there — out of scope for C-06s,
+		// which withholds one direction, never a wrong answer.
 		if relsSubset(sjinfo.MinLefthand, outer) && relsSubset(sjinfo.MinRighthand, inner) {
 			return sjinfo.Jointype, true
 		}

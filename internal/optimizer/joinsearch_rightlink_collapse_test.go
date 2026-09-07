@@ -38,7 +38,10 @@ func TestRightLinkSurvivesCollapseSplit(t *testing.T) {
 		nother := 0
 		for _, j := range rfjJoins(out) {
 			switch j.Type {
-			case JoinTypeLeft:
+			// C-06s: the winner may now come back spelled RIGHT (the commuted
+			// direction PG calls JOIN_RIGHT). Both spellings preserve the
+			// unmatched rows; INNER is what would drop them.
+			case JoinTypeLeft, JoinTypeRight:
 				if outer != nil {
 					t.Errorf("n=%d: two outer joins for one RIGHT link", n)
 				}
@@ -54,8 +57,17 @@ func TestRightLinkSurvivesCollapseSplit(t *testing.T) {
 			t.Errorf("n=%d: RIGHT link lost through the collapse split (planned as INNER)", n)
 			continue
 		}
-		if nl, nr := rfjLeafCount(outer.Left), rfjLeafCount(outer.Right); nl != 1 || nr != n-1 {
-			t.Errorf("n=%d: LEFT join preserves %d leaves and null-extends %d, want 1 and %d", n, nl, nr, n-1)
+		// The preserved hand is Left for a LEFT spelling and Right for a RIGHT
+		// one, so read the sides by jointype rather than by position — a
+		// commuted winner has its children swapped and would otherwise look
+		// like a leaf-count regression.
+		preserved, nullExtended := outer.Left, outer.Right
+		if outer.Type == JoinTypeRight {
+			preserved, nullExtended = outer.Right, outer.Left
+		}
+		if nl, nr := rfjLeafCount(preserved), rfjLeafCount(nullExtended); nl != 1 || nr != n-1 {
+			t.Errorf("n=%d: %v join preserves %d leaves and null-extends %d, want 1 and %d",
+				n, outer.Type, nl, nr, n-1)
 		}
 		if residual != pred {
 			t.Errorf("n=%d: nullable-side WHERE was not delayed above the tree (residual=%v)", n, residual)

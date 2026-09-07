@@ -125,6 +125,34 @@ func rfjLeafCount(n Node) int {
 
 // rfjJoins collects every `*Join` in a tree, deepest-last, so a test can talk
 // about "the join below the root" without knowing which side it landed on.
+// rfjOuterPreserving counts the joins in n that PRESERVE unmatched outer rows,
+// i.e. LEFT and RIGHT together.
+//
+// C-06s (2026-09-07) is why this exists. Before it, `jointypeForDirection`
+// declined the commuted containment, so an admitted LEFT link could only ever
+// come back spelled LEFT and the shape pins below counted `JoinTypeLeft`
+// directly. C-06s offers PG's `JOIN_RIGHT`, so the search may now win the same
+// join with the hands swapped — `Join{Type: Right}` with swapped children is
+// multiset-equal to the written LEFT, which is what JOIN_RIGHT MEANS
+// (postgres/src/backend/optimizer/path/joinrels.c:932-939).
+//
+// The guard those pins exist to enforce is UNCHANGED and is not about the
+// spelling: an INNER join where an outer one belongs DROPS the unmatched rows
+// (the Q72 wrong answer), and a FULL one is still refused outright. So the
+// invariant is "exactly one outer-preserving join", not "exactly one LEFT".
+// Counting LEFT+RIGHT keeps the wrong-answer guard while admitting the
+// equivalent spelling; counting LEFT alone would fail a correct plan, and
+// counting all joins would pass the wrong one.
+func rfjOuterPreserving(n Node) int {
+	c := 0
+	for _, j := range rfjJoins(n) {
+		if j.Type == JoinTypeLeft || j.Type == JoinTypeRight {
+			c++
+		}
+	}
+	return c
+}
+
 func rfjJoins(n Node) []*Join {
 	var out []*Join
 	var walk func(Node)

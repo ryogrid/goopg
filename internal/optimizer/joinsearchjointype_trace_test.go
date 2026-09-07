@@ -120,8 +120,11 @@ func TestEnumTraceAdjudicatesOuterPairing(t *testing.T) {
 			continue
 		}
 		offered++
-		if !strings.Contains(l, "jointype=left") {
-			t.Errorf("path over the LEFT joinrel is stamped otherwise: %q", l)
+		// C-06s: the LEFT joinrel may be offered in either orientation — PG's
+		// JOIN_RIGHT is the same join with its hands swapped. An INNER stamp
+		// here would still be wrong: it drops the rows the LEFT link preserves.
+		if !strings.Contains(l, "jointype=left") && !strings.Contains(l, "jointype=right") {
+			t.Errorf("path over the LEFT joinrel is neither left nor right: %q", l)
 		}
 		if strings.Contains(l, "verdict=accepted") {
 			accepted++

@@ -73,14 +73,11 @@ func TestSeamPlansALeftLinkBelowAnInnerLink(t *testing.T) {
 	if !used {
 		t.Fatal("the seam declined a LEFT link below an INNER link — C-04c's subject")
 	}
-	nleft := 0
-	for _, j := range rfjJoins(out) {
-		if j.Type == JoinTypeLeft {
-			nleft++
-		}
-	}
-	if nleft != 1 {
-		t.Fatalf("searched tree has %d LEFT joins, want exactly 1: the admitted link must keep its jointype", nleft)
+	// C-06s: LEFT or RIGHT — the search may now win the commuted spelling,
+	// which is the same join. INNER here is still the Q72 wrong answer.
+	if n := rfjOuterPreserving(out); n != 1 {
+		t.Fatalf("searched tree has %d outer-preserving joins, want exactly 1: "+
+			"the admitted link must not become INNER (that drops the unmatched rows)", n)
 	}
 	got := seamEqualities(out)
 	for _, want := range []string{"a0=b0", "a0=c0"} {

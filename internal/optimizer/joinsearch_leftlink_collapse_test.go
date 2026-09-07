@@ -30,18 +30,14 @@ func TestLeftLinkSurvivesCollapseSplit(t *testing.T) {
 			t.Logf("n=%d: seam declined", n)
 			continue
 		}
-		nleft, ninner := 0, 0
-		for _, j := range rfjJoins(out) {
-			switch j.Type {
-			case JoinTypeLeft:
-				nleft++
-			default:
-				ninner++
-			}
-		}
-		t.Logf("n=%d: used=%v residual=%v joins: left=%d other=%d", n, used, residual, nleft, ninner)
-		if nleft != 1 {
-			t.Errorf("n=%d: LEFT link lost (left=%d)", n, nleft)
+		// C-06s: count LEFT+RIGHT. The commuted spelling is the same join;
+		// what must never happen is the link becoming INNER, which silently
+		// drops the unmatched rows.
+		nouter := rfjOuterPreserving(out)
+		t.Logf("n=%d: used=%v residual=%v joins: outer-preserving=%d total=%d",
+			n, used, residual, nouter, len(rfjJoins(out)))
+		if nouter != 1 {
+			t.Errorf("n=%d: outer link lost (outer-preserving=%d, want 1)", n, nouter)
 		}
 	}
 }
