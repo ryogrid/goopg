@@ -3599,13 +3599,47 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
-- [ ] **E-17 EX3-08 scan-resident qual — OPEN. Cut 1 is the near-term
-  work and it is small; cut 2 is a separate design.**
-  *Status correction 2026-09-07: I had demoted this row to `[!]` DEFERRED
-  on the grounds that cut 2 lacks a justifying measurement. That was a
-  scope error — cut 2's open question does not block **cut 1**, which the
-  same row calls cheap and safe, and this item was filed at the owner's
-  explicit request. Restored to open.* Filed today from the
+- [ ] **E-17 EX3-08 scan-resident qual — OPEN. The target is CUT 2:
+  evaluate the predicate ONCE inside the scan, as PG does, and delete the
+  `Filter` node.**
+  *Owner direction 2026-09-07: **cut 1 is not the intended shape and is
+  not to be built.** A per-row already-decided flag leaves two evaluators
+  in the tree and adds a third thing (the flag) to keep them consistent —
+  it suppresses the symptom while preserving the divergence. PG has ONE
+  evaluator: the qual lives on the scan node (`SeqScan.qual`, run by
+  `ExecScan`) and there is no Filter node above it. Parity is the point of
+  this workstream, so the deliverable is the PG shape.*
+  *(Earlier status churn, recorded rather than hidden: I demoted this row
+  to `[!]` on cut 2's missing measurement, then restored it to open scoped
+  around cut 1. Both were wrong — the first deferred an item the owner had
+  just requested, the second aimed at the wrong target.)*
+  **What cut 2 must absorb — these are the reasons it is a design, not a
+  patch:**
+  1. `needsDetoastPrefix`: a toasted value in the prefix is currently
+     judged un-detoasted, so the scan ABSTAINS and `filterOp` decides
+     alone. A single evaluator must detoast correctly instead of
+     abstaining.
+  2. The **error-position contract**: on `perr != nil` the scan
+     deliberately falls through so the error is raised by `filterOp`
+     *from exactly where it did before*. One evaluator must reproduce PG's
+     error position and ordering, not merely raise the same error.
+  3. The whitelist's **failure direction is lost**. Today an expression
+     node `prefilterSafeExpr` does not name disables the prefilter — the
+     miss costs performance and never correctness. A complete evaluator
+     has no opt-out to fall back on, so every expression kind must be
+     handled or the miss becomes a wrong answer. Build it exhaustive and
+     fail-closed, the `cloneExprRefs` discipline (all arms under a
+     build-time gate), not the `shiftColumnRefsBy` one (13 of 32 arms,
+     `return e` for the rest).
+  **Also note `planScanPrefilter` never consults selectivity** — it
+  declines only at `need >= ncols`. Under cut 2 that stops mattering,
+  because there is no second evaluation to pay for; the low-selectivity
+  pessimisation disappears by construction rather than needing its own
+  measurement.
+  *Sequence: design doc + agent review first, then implement. gate: values
+  both suites; EXPLAIN output MOVES (the Filter line disappears), so a
+  `plan_snapshots/` re-pin and a PG-parity re-check belong in the same
+  commit, plus an error-position test per absorbed abstain path.* Filed today from the
   format/decode survey; re-scoped here rather than left as an open
   checkbox with no owner.
   **Why it is not being done in this workstream:** the prize is bounded
