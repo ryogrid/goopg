@@ -395,8 +395,13 @@ func extractSeqScanFromPlan(node optimizer.Node) *optimizer.SeqScan {
 //     producers by pointer, reusing the same sharedHashBuild machinery a
 //     Gather uses, so a producer does the driving scan and the probes only.
 //
-// Default OFF until the corpus-wide A/B exists.
-var coopJoinBuildOn = os.Getenv("GOOPG_COOP_JOIN_BUILD") == "1"
+// Default ON (GOOPG_COOP_JOIN_BUILD=off to disable). Measured on TPC-H SF=1
+// in PARALLEL mode (4 workers), fresh capped server per arm per rep, 5
+// alternating reps, every result set md5-identical between the arms:
+// Q20 1.91 -> 0.65 s (-66%, ranges disjoint), Q21 14.63 -> 13.75 s (-6.0%),
+// Q7 4.07 -> 3.79 s, Q9 10.75 -> 10.50 s; Q2/Q5/Q8/Q17/Q18 unchanged. No
+// query regressed in any rep.
+var coopJoinBuildOn = os.Getenv("GOOPG_COOP_JOIN_BUILD") != "off"
 
 // coopDrivingScan finds the scan a cooperative build's producers can partition.
 //

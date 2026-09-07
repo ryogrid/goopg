@@ -3830,24 +3830,69 @@ ledger row if the measurement says no.
   `TestCoopParallelHashBuildValuesAcrossWorkMem` (32 work_mem values)
   now exercises the spilling coop build across its whole sweep and is
   green.
-  **Slice 2 (NOT built, and this is the honest remaining gap): Rule 3.**
-  Q9's own witness is blocked by `notseqscan`, not by `multibatch`.
-  `extractSeqScanFromPlan` descends only Filter/Project, and every one of
-  Q9's four hash builds has a JOIN TREE or a composite key on its build
-  side (measured: 2×`notseqscan`, 1×`multikey`, 1× already-OK `part`).
-  Widening the walker to a join's probe side is what PG's
-  `Parallel Hash`-over-`Nested Loop` shape corresponds to, but the
-  walker's own comment records why it is narrow — descending Aggregate
-  is a SILENT WRONG ANSWER (Q18's `HAVING sum(...)` semi-join build), and
-  descending joins costs (Q18 35.7 → 42.9–44.1 s) because each producer
-  redoes every nested build. Slice 2 is therefore "descend join probe
-  sides ONLY, never Aggregate/Sort, and share the nested builds so the
-  producers do not redo them" — specified here, not built.
-  **Pre-existing race found and NOT introduced by this item** (verified by
-  stashing the change and re-running): `TestSubquerySemanticsMatrix/M20`
-  races on the `maybeInstrument` global — a coop producer builds a
-  SubPlan lazily inside `Next()`, outside `buildUnderNilScope`'s mutex,
-  while a sibling producer is inside it. Ledger row, not this item's.
+  **Slice 2 (LANDED, default ON): Rule 3 widened by exactly one node
+  kind — a hash join's PROBE side.** `coopDrivingScan` is
+  `extractSeqScanFromPlan` plus that arm and still refuses everything
+  else. Both objections the old walker recorded are answered:
+  - *Correctness.* Aggregate and Sort are still refused. N producers each
+    aggregating their own partition with no Finalize above is a silent
+    wrong answer for a `HAVING sum(...)` build side (Q18's semi-join).
+    The walk must also agree with `attachParallelScan`, which does the
+    same walk over the BUILT tree; both call `probeSideIsLeft`, the one
+    shared rule, so they cannot drift apart on one side only.
+  - *Cost.* Each producer used to redo every nested build (Q18 35.7 →
+    42.9–44.1 s). The nested shareable hash joins are now prebuilt ONCE
+    in the leader and published to the producers by pointer — the same
+    `sharedHashBuild` machinery a Gather uses. The publication is merged
+    onto the WORKER contexts, never written onto `ctx`, whose map may
+    already be published to a surrounding Gather's participants.
+
+  Parallel-mode A/B, 5 alternating reps, fresh capped server per arm per
+  rep, every result set md5-identical between arms in all 14 runs:
+
+  | query | knob OFF | knob ON | delta |
+  |---|---:|---:|---:|
+  | Q20 | 1.91 s | **0.65 s** | **−66%** (ranges disjoint) |
+  | Q21 | 14.63 s | 13.75 s | −6.0% |
+  | Q7 | 4.07 s | 3.79 s | −7% |
+  | Q9 | 10.75 s | 10.50 s | −2.3% |
+  | Q2/Q5/Q8/Q17/Q18 | — | — | unchanged |
+
+  No query regressed in any rep, so the knob (`GOOPG_COOP_JOIN_BUILD=off`
+  to disable) defaults ON.
+  **Why Q9 barely moves, and what would move it — the honest gap.**
+  Q9's serial critical path is the 6M-row `lineitem` scan, and it sits on
+  a nested BUILD side. `collectShareableJoins` descends PROBE sides only,
+  by design ("a hash join nested on another join's build side is built as
+  part of that build, serially, and must not be pre-built separately —
+  doing so would run its build twice"). So slice 2 parallelises the
+  driving scan of a join-tree build side but not the builds nested
+  underneath it. Reaching Q9 needs a BOTTOM-UP cooperative build of the
+  whole inner chain — build the deepest shareable join cooperatively
+  first, publish it, then the next one up — which is slice 3 and is not
+  attempted here. Note this is still not PG's shared-batch-file problem;
+  it is an ordering problem in goopg's own prebuild walk.
+  Q9's remaining declines, measured: 1×`multikey` (the
+  `(ps_suppkey, ps_partkey)` composite build, whose insertion path
+  `fileCompositeBuildRow` the channel-source pattern does not reach) and
+  the nested-build-side ordering above.
+  **Gates.** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+  PASS. `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12 rows=2, Q13 rows=34,
+  against a private clone on port 5541, not the shared bench cluster).
+  `go test -race ./internal/executor/` — one failure,
+  `TestSubquerySemanticsMatrix/M20`, which is **PRE-EXISTING and NOT
+  introduced here**, verified by stashing the change and re-running: the
+  baseline fails identically. Values: every TPC-H result set md5-identical
+  across every arm of both slices.
+  **The pre-existing race, recorded because slice 2 widens its exposure.**
+  `maybeInstrument` reads the package global `instrumentScope` while a
+  sibling coop producer is inside `buildUnderNilScope` writing it. The
+  mutex only covers the build call, and a producer can build LAZILY from
+  inside `Next()` — `acquireSubPlanOp` → `Build` — long after that window
+  closed. The real fix is to thread the scope through `Context` instead
+  of a package global; a mutex around the read would remove the race
+  report without giving a lazily-built producer subtree the NIL scope the
+  coop path intends. Out of scope for E-18; ledger row.
   Filed 2026-09-07 at the owner's request, same standing as
   E-17 cut 2: **design doc + agent review + commit the design first, then
   implement.**
