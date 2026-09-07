@@ -3157,7 +3157,23 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   APPROVE (incl. pg_index walker + align-table ledger rows).
   Artifacts: `docs/design/executor-d09-alignment/DESIGN.md`,
   `016f67b`.
-- [!] **D-10 MD-last spill payload — RE-SCOPED 2026-09-07 onto D-06.** The
+- [-] **D-10 MD-last spill payload — OUT OF SCOPE 2026-09-07: blocker
+  re-tested per policy, premise inverted.** D-06's landing (measured-
+  negative, OFF) fired this row's literal condition, so the blocker was
+  re-examined rather than inherited — and TD-5's end state (PG format for
+  storage AND retention, none private) assumed packed retention
+  everywhere, a premise gone with D-06 OFF + D-05/D-07/D-08 out of scope.
+  No-win by construction, verified against the tree: current payload is
+  compact TLV (`spill.go:242-248`; ints 9 B) while MinimalTuple adds a
+  null bitmap + maxalign padding (D-09), so spill I/O cannot decrease;
+  conversion adds encode/decode CPU per spilled row and removes nothing
+  (in-memory stays `[]Row`); corpus spills are ~4 hash queries + 0 sorts
+  (E-01 census), so even a hypothetical byte win is unmeasurable; and
+  `spill.go` is the one path with persistence + three recorded production
+  bugs (TD-5's own words). The D-04 rule binds too (second site, same
+  premise, model unfixed). Ledger `take3-D-10-out-of-scope`; resume ONLY
+  if retention ever goes packed in production. ORIGINAL ROW FOLLOWS.
+  RE-SCOPED 2026-09-07 onto D-06.
   hash-join conversion sites (D-05/D-07/D-08) are now out of scope with the
   parallel-cost decision, so "every in-memory retention site" no longer means
   what it did: the only conversion site still in scope is **D-06 (sort)**,
@@ -3176,7 +3192,17 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   unrecorded site keeps D-10 blocked.
   *design: 03 TD-5, 04 §4.1 Tier D; gate: 06 §3 MD-last + round-trip
   across a real spill on a spilling shape.*
-- [!] **D-11 MD acceptance + open-gap ledgering — RE-SCOPED 2026-09-07.**
+- [x] **D-11 MD acceptance + open-gap ledgering — ACCEPTED 2026-09-07
+  over the D-06-landed-OFF end state**
+  (`analysis/minimize-datum/d11-acceptance-20260907/README.md`): values
+  hold both suites every commit (E-01 sweep 95/0/0, TPC-H digests,
+  D-06 24/24 OFF-vs-ON); one retention format holds in production
+  (packed path OFF-gated, re-opens if the switch flips); model matches
+  storage by construction + test; batch witness vacuous with reason
+  (no production conversion); Datum 48 B compile-pinned; D1 goldens /
+  D2 ledgered-open / D3-D4 non-issues. Ownerless rows filed; no D-08
+  slice ever started so no keep-open owed. No time target per 06 §5.
+  RE-SCOPED 2026-09-07.
   Its condition named "D-05 onward", and D-05/D-07/D-08 are now out of scope
   with the parallel-cost decision. The only conversion site left in scope is
   **D-06**, so this is an acceptance over D-06 alone or it is dropped with it.
