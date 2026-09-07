@@ -910,8 +910,14 @@ rule).*
      that has been timed. All three PASS with checksums and sit far under the
      300 s budget (Q5 20 s, Q40 0.4 s, Q75 5 s), but a passing value is not a
      timing.
-  2. the `plan_snapshots/` re-pin under a NEW name (Q13 is the only TPC-H
-     mover). Do not overwrite a peer's pin.
+  2. ~~the `plan_snapshots/` re-pin~~ **DONE 2026-09-07**: captured under the
+     new name `plan_snapshots/c20a-c06s-plancost-rows-20260907.txt` on a tree
+     carrying both C-06s and C-20a, so one pin covers both movers;
+     `make plan-diff` **22/22 MATCH in `structural` AND `MODE=costs`**.
+     (Capture gotcha worth keeping: the TPC-H cluster needs
+     `PLAN_DB=tpch PLAN_USER=tpch` — with `postgres` the ANALYZE step fails
+     per table, prints `(continuing)`, and still writes a 1.7 KB pin that
+     pins nothing.)
   Handover that produced this: `tmp/c-06s-handover.md`. ORIGINAL ROW FOLLOWS.
   C-06s — offer the COMMUTED direction of a LEFT join to the search
   (PG's `JOIN_RIGHT`).** C-06's diagnosis, filed rather than landed because it
