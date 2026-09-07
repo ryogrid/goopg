@@ -560,8 +560,11 @@ func TestGateRefusesAnUnknownStamp(t *testing.T) {
 // TestUpperNarrowingChangesOutput pins the asymmetry that sequences any
 // applying cut: Sort and WindowAgg republish their child's columns (so a
 // narrowed input is a narrowed output, and every expression ABOVE must be
-// re-based by a rewriter that does not exist yet), while Aggregate's output
-// is built from its OWN expression lists and does not move at all.
+// re-based by an ancestor-chain walk — still open, ledger
+// `take3-B-01c-applying-blocked`), while Aggregate's output is built from its
+// OWN expression lists and does not move at all. That asymmetry is exactly
+// why applying slice (b) (upper_narrow_apply.go) landed the AGGREGATE site
+// and only that one.
 func TestUpperNarrowingChangesOutput(t *testing.T) {
 	if changes, ok := upperNarrowingChangesOutput(&Sort{}); !ok || !changes {
 		t.Fatalf("Sort: (changes=%v, ok=%v), want (true, true)", changes, ok)

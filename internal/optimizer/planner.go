@@ -173,6 +173,19 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// bind that correlation to a PARAM_EXEC slot.
 	node = rewriteExistsToAny(node)
 	node = lowerSubPlanParams(node)
+	// B-01c APPLYING half, slice (b): narrow the upper sites whose stamped
+	// input target the key-preservation gate passes (upper_narrow_apply.go).
+	//
+	// Placed HERE, at Plan()'s tail, and not at the stamp site inside
+	// planSelect: the rewriters above this line — `rewriteExistsToAny`
+	// (which synthesises a host-scope ColumnRef out of a body's
+	// OuterColumnRef) and `lowerSubPlanParams` (which rebinds correlated
+	// refs to PARAM_EXEC slots) — both change the expressions this pass has
+	// to re-base, so running before them would re-base a tree that is then
+	// rewritten again. It runs BEFORE `assertSearchedBoundariesIntact` on
+	// purpose: that assertion is the independent detector for the coordinate
+	// class this pass operates in, and it must see the narrowed tree.
+	node = applyUpperNarrowing(node)
 	// M0127-P2.1: publish every hash/merge join's FULL equi-pair list on
 	// Join.HashKeys. Deliberately the LAST thing Plan() does — the list
 	// aliases expressions the passes above rewrite in place, so deriving

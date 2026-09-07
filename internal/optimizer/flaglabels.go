@@ -88,6 +88,12 @@ var flagResolvedState = map[string]func(string) string{
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
 	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
+	// B-01c applying half, slice (b): narrows the input row of an upper
+	// Aggregate site whose stamped target the key-preservation gate passes,
+	// sinking the cut past order-preserving wrappers so the Sort beneath a
+	// sorted aggregation carries the narrowed row (upper_narrow_apply.go).
+	// Default ON, `=0` opts back out to the un-narrowed arm.
+	"GOOPG_NARROW_UPPER": func(v string) string { return onOff(narrowUpperFromEnv(v)) },
 	// C-19d: a MODE, not a boolean — off / top / all. It decides whether the
 	// search may choose a Gather at all, and at which rels, so an artefact
 	// that does not name it cannot say whether the plans it holds were free
@@ -153,6 +159,11 @@ var flagProvenanceOrder = []string{
 	// Joined at take2 P4-01 rev 10 step 3: narrows hash-join build sides,
 	// default ON since step 5 (P4-A §18 steps 3-5).
 	"GOOPG_NARROW_BUILD",
+	// Joined at take3 B-01c applying half, slice (b): narrows an upper
+	// Aggregate site's input row and sinks the cut past the Sort beneath a
+	// sorted aggregation, so an artefact that does not name it cannot say
+	// which sort payload it measured. Default ON.
+	"GOOPG_NARROW_UPPER",
 	// Joined at take3 C-19d (P5-04): admits `PathGather` / `PathGatherMerge`
 	// into the search. Default `off` pending the TPC-H A/B that decides it
 	// (docs/design/planner-c19d-gather-paths/DESIGN.md §5).

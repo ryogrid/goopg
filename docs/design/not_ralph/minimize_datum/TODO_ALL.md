@@ -34,7 +34,7 @@ had already completed).
 | **C-15 grouping paths** | B-17b | **RESOLVED — the blocker was STALE.** C-15 landed and B-17b needed no engine change (`007765a90`); its decline had been written the same day C-15/C-16 removed its premise. |
 | **the seam drops `Pathkeys`** | C-07 | **RESOLVED** (`007765a90`). Validate-never-translate; forced a latent WRONG-ANSWER fix — `build_join_pathkeys` kept the outer's keys for FULL/RIGHT, which no row-count gate can see. `nrels < 2` survives as its own filed item. |
 | **the parallel dimension stops at the aggregate upper rel** | C-19h | **RE-SCOPED 2026-09-07 by owner decision: goopg does NOT implement its own parallel cost calculation — PG 18.3's is adopted as-is.** D-05 and its chain (D-07, D-08) are therefore OUT OF SCOPE, and D-10/D-11 are re-scoped onto D-06. What remains in scope is **porting PG faithfully**, which is what C-19h needs and is not a goopg cost model: `create_plain_partial_paths`, `generate_useful_gather_paths`, `try_partial_*_path`, `cost_gather`. The concrete defect is unchanged and is a **PG-parity** one — a plain filtered SELECT loses its Gather where vanilla PG 18.3 keeps it, and the census could not see it because every TPC-H query is aggregate-rooted while C-19g's producer is aggregate-only. Do NOT delete `MaybeAddGather` (demotion to a `debug_parallel_query`-gated post-pass is PG-faithful in kind); `splitAggregate` and `sortPartialRootPays` can no longer be deleted at all. |
-| **B-01c *applying* half** | D-06, E-01 | **IN PROGRESS.** Needs both a narrowing-aware upper rewriter (the gap that declined B-01b) and a key-preservation gate. The gate is the load-bearing half: `operators.go:1010-1015` checks ordering explicitly, not membership, so mismatched sort/merge comparators emit out-of-order rows with **no error** — the same silent wrong-answer class C-07 just fixed. |
+| **B-01c *applying* half** | D-06, E-01 | **BOTH PREREQUISITES NOW EXIST (2026-09-07).** Slice (a) landed the key-preservation gate (`upper_narrow_gate.go`); slice (b) landed the narrowing-aware upper rewriter (`upper_narrow_apply.go`) and applies it at the **Aggregate** site, sinking the cut past the Sort beneath a sorted aggregation — which is the sort-side projection D-06 was waiting on, for that shape. What is NOT yet applied is narrowing a `*Sort` or `*WindowAgg` from its OWN target: those move every coordinate above them and need the ancestor-chain walk (ledger `take3-B-01c-applying-blocked`). So D-06/E-01 are unblocked **for the sorted-aggregate shape only** and stay blocked for the general ORDER-BY sort. The gate is still the load-bearing half: `operators.go:1010-1015` checks ordering explicitly, not membership, so mismatched sort/merge comparators emit out-of-order rows with **no error** — the same silent wrong-answer class C-07 just fixed. |
 | **"the flip moves plans"** | C-06, C-20c, C-20d, C-20e, C-20f, C-20g | **DIAGNOSED 2026-09-07 — and my framing of it was WRONG.** I wrote here that "the search wins a Merge Left Join at 338,223 when a 66,218 Hash path exists in the same run". It does not: the two costs are **not comparable**, because on the OFF arm the join never enters the search at all (the LEFT link pins, the seam peels it, and the plan-tree estimator prices it — charging the hash join 0.25 startup with no build and no inner cost). **The search never had the 66,218 plan.** The real verdict is **mis-generation**: both candidates DO reach `addPath` and the merge genuinely is cheaper among them; the candidate set is short by one, because `jointypeForDirection` declines the commuted direction instead of emitting PG's `JOIN_RIGHT`. Filed as **C-06s**. Does NOT transfer to C-20c/d/e/f/g — each has its own measured movement, none is Q13, none switches a join direction. No flag retired. |
 | **D-04 stopping rule / D chain** | D-07, D-08, D-10, D-11 | **CHAINED TO D-05, cascades automatically.** D-07/D-08 say "unblocks when D-05 does"; D-10/D-11 need one conversion site. No separate dispatch needed. |
 | **remaining, unattacked** | B-17e, E-02, E-12, E-14 | B-17e on C-20 single-planner deletion; E-02 on B-16 + EX1 exit; E-12 on E-14; E-14 Cut A DROPPED on measurement (0.0065%), Cut B quantified and still blocked. |
@@ -275,6 +275,37 @@ are EPICS — split into one-checkbox-per-commit items before starting
   `scopeVeto` (pinned in `exprSwitchInventory` as the demoted shape, same
   as `nl_index_join.go:cloneExprShiftIdx`). ZERO production callers by
   design — the applying cut must discharge it before narrowing anything.
+  Applying slice (b) LANDED 2026-09-07 — the narrowing-aware upper
+  rewriter and its first production site: `upper_narrow_apply.go`
+  re-bases an Aggregate's own input-scope expressions through its stamped
+  keep and SINKS a narrowing `Project` past order- and row-preserving
+  wrappers (`*Sort`, `*Filter`), so the sort beneath a sorted aggregation
+  materialises, compares and spills the NARROWED row. Driven from
+  `PlanWithSettings`' tail (after `lowerSubPlanParams`, before
+  `assertSearchedBoundariesIntact`, which is the independent detector for
+  this coordinate class). Committed ONLY when the cut lands below a Sort:
+  above a hash aggregate a narrowing Project is per-row cost with zero
+  bytes retained (TPC-H Q1 would pay seven datum copies on six million
+  rows), so every hash-aggregate plan stays bit-identical. The Aggregate
+  is the one upper site that needs no ancestor-chain walk — its `Output()`
+  is built from its own expression lists, so narrowing its input moves
+  nothing above it (`upperNarrowingChangesOutput`). Flag
+  `GOOPG_NARROW_UPPER`, default ON, in the flag-provenance table.
+  Every write is deferred to a single commit point: an earlier revision
+  mutated wrappers as the sink descended and a later refusal left a
+  half-narrowed tree, which the executor caught as "column ref v/2 out of
+  MaterializedSlot range 2" — one column further left it would have been a
+  silently wrong column. `TestNarrowAggregateInputLeavesNoPartialRewrite`
+  is that regression.
+  Gates: 15 new tests incl. an order-sensitive oracle with its own
+  vacuity guard and a reflection-pinned node-field inventory
+  (`TestUpperNarrowApplyNodeFieldInventory` — a new `Expr`-bearing field
+  on Aggregate/AggregateCall/Sort/Filter fails the build rather than being
+  read in pre-cut coordinates); optimizer + executor suites; units
+  pre-commit scope.
+  STILL OPEN: the `*Sort` and `*WindowAgg` SITES, which need the
+  ancestor-chain walk (both publish a row derived from their child's).
+  Ledger `take3-B-01c-applying-blocked` carries the resume point.
 - [x] **B-02 P1-11 TOAST in the catalog heap writer.** Landed 2026-09-05
   as the pre-approved bounded-width interim: try-full-then-truncate in
   `persistStatsToPGStatistic` (pre-write exact measurement; 64 B bound
@@ -2900,7 +2931,18 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   batch-count movement on the named shape class + 06 §2 floor with
   `CKMISMATCH=0`; files: `operators_join_agg.go`,
   `parallel_hash_build.go`, `hashsize/hashsize.go`.*
-- [!] **D-06 MD-05 sort — BLOCKED on B-01c (sort-side projection).**
+- [!] **D-06 MD-05 sort — PARTIALLY UNBLOCKED 2026-09-07 by B-01c's
+  applying slice (b).** A sort beneath a *sorted aggregation* now receives
+  the NARROWED row: `upper_narrow_apply.go` sinks the Aggregate site's
+  narrowing Project below the Sort, key-preservation gate discharged
+  (`keepPreservesSortKeyList`, position by position, DESC/NULLS included).
+  That is the sort-side projection this row was waiting on — **for that
+  shape**. The general ORDER-BY sort is still un-narrowed: narrowing a
+  `*Sort` from its own stamped target moves every coordinate above it and
+  needs the ancestor-chain walk still open under
+  `take3-B-01c-applying-blocked`. So the conversion work here can start on
+  the sorted-aggregate shape and must not assume a narrowed input at the
+  top-of-plan sort.
   Gate checks **ordering explicitly**, not membership
   (`operators.go:1010-1015`: mismatched sort/merge comparators emit
   out-of-order rows with no error). Needs two deformed rows at once; a
@@ -3011,8 +3053,13 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
 alloc arms together; plan-shape pin `changed=0`; both suites fresh server
 per arm; values never counts for projection/join-adjacent changes).*
 
-- [!] **E-01 EX3-04 sort spill runs + merge discipline — BLOCKED on the
-  EX1 sort half (B-01c).** Run formation on `flushChunk`, tape-style
+- [!] **E-01 EX3-04 sort spill runs + merge discipline — PARTIALLY
+  UNBLOCKED 2026-09-07 (same B-01c slice (b) as D-06).** The EX1 sort half
+  now exists for the sorted-aggregate shape only: that sort spills the
+  narrowed row. The §8.2 "premature on pre-EX1 widths" objection therefore
+  no longer holds for that shape and still holds for every other sort, so
+  a spilling-sort A/B must state which shape it measured.
+  Run formation on `flushChunk`, tape-style
   merge-back (logtape analogue, take3 10 §9). Spill thresholds are
   batching geometry: on pre-EX1 widths this is premature by rule (take3
   13 §8.2, EX-P7).
