@@ -28,15 +28,24 @@ blocker, not the bookkeeping — and **re-test whether each blocker is still
 true before treating it as one** (B-17b below was blocked on something that
 had already completed).
 
-| root blocker | holds | status 2026-09-07 |
+| root blocker | holds | status (updated 2026-09-07, later) |
 | :-- | :-- | :-- |
-| **spill-cost calibration** | B-13, B-15, E-16 | DESIGN ALREADY LANDED and unimplemented (`docs/design/planner-spill-cost-calibration/DESIGN.md`, 4 gated cuts). IN PROGRESS. |
-| **C-15 grouping paths** | B-17b | **STALE — C-15 landed `[x]`; B-17b is unblocked.** IN PROGRESS. |
-| **the seam drops `Pathkeys`** | C-07 | Named and measured: `newPrebuiltPath` leaves `Pathkeys` nil, so the Sort arm is the only reachable arm. Second blocker: producer unreachable at `nrels < 2`. IN PROGRESS. |
-| **C-19g upper-rel-resident half** | C-19h, D-05 | C-19g replaced the split VERDICT but not the CONSTRUCTION. IN PROGRESS (owns the `plan_snapshots/` pin). |
-| **B-01c *applying* half** | D-06, E-01 | B-01c's compute half is `[x]`; the applying half needs two things that do not exist — a narrowing-aware upper rewriter and a key-preservation gate. NOT STARTED. |
-| **"the flip moves plans"** | C-06, C-20c, C-20d, C-20e, C-20f, C-20g | Not a missing prerequisite but a finding. The attackable question behind it is the cost defect that makes the moved plan win — e.g. C-06: why does the search win a Merge Left Join at 5x the cost? NOT STARTED. |
-| **the D-04 stopping rule / D chain** | D-07, D-08, D-10, D-11, E-02, E-12, E-14, B-17e | Evidence-based stops and chained conversions. Needs per-item re-test of whether the stop still binds. NOT STARTED. |
+| **spill-cost calibration** | B-13, B-15, E-16 | **PARTLY RESOLVED.** E-16 `[x]` (`16da44c66`) — its blocker did not reproduce. The instrument is a derived 1.2x-5x ratio, not a multiplier. B-13's arithmetic is now empirical (+24.9% uncalibrated vs -3.0% calibrated at 4 MB); B-15 step 1 discharged (R5 pro-rating collapses a probe 472x). **Cut 3 measured -18.2% and HELD** on Q9's parallel interaction → re-queued behind C-19h. |
+| **C-15 grouping paths** | B-17b | **RESOLVED — the blocker was STALE.** C-15 landed and B-17b needed no engine change (`007765a90`); its decline had been written the same day C-15/C-16 removed its premise. |
+| **the seam drops `Pathkeys`** | C-07 | **RESOLVED** (`007765a90`). Validate-never-translate; forced a latent WRONG-ANSWER fix — `build_join_pathkeys` kept the outer's keys for FULL/RIGHT, which no row-count gate can see. `nrels < 2` survives as its own filed item. |
+| **C-19g upper-rel-resident half** | C-19h, D-05, spill Cut 3 | **RESOLVED — the keystone landed** (`cb4556791`), split is a PATH and the default is on. C-19h and D-05 re-opened; Cut 3's Q9 to be re-tested on top. |
+| **B-01c *applying* half** | D-06, E-01 | **NOT STARTED.** Compute half is `[x]`; the applying half needs two things that do not exist — a narrowing-aware upper rewriter and a key-preservation gate. |
+| **"the flip moves plans"** | C-06, C-20c, C-20d, C-20e, C-20f, C-20g | **DIAGNOSIS IN PROGRESS.** Not a missing prerequisite but a finding. The attackable question is C-06's: the search wins a Merge Left Join at 338,223 when a 66,218 Hash path exists in the same run. Per `planner_verify_both_candidates_generated`, instrument `addPath` before theorising about cost terms. Retiring the flags is NOT the goal — that decision is taken and the hatches stay. |
+| **D-04 stopping rule / D chain** | D-07, D-08, D-10, D-11 | **CHAINED TO D-05, cascades automatically.** D-07/D-08 say "unblocks when D-05 does"; D-10/D-11 need one conversion site. No separate dispatch needed. |
+| **remaining, unattacked** | B-17e, E-02, E-12, E-14 | B-17e on C-20 single-planner deletion; E-02 on B-16 + EX1 exit; E-12 on E-14; E-14 Cut A DROPPED on measurement (0.0065%), Cut B quantified and still blocked. |
+
+**Scoreboard for the inversion exercise:** of the seven root blockers, **four
+are resolved in one day** and **three of those turned out to be stale or
+non-reproducing** — B-17b's premise had been removed by a sibling item the same
+day it was declined, E-16's regression was a property of a tree that no longer
+exists, and C-19h's stated blocker was not the real one. That is the argument
+for the policy: a `[!]` row records what was true when it was written, and
+nobody re-checks it.
 
 **One checkbox ≈ one commit.** An item that would move two planner inputs
 (or two executor inputs) at once is split before it is started (take3 08
