@@ -1799,6 +1799,79 @@ name collides between concurrent agents. `SF05_RESULTS_DIR` (:53) already
 shows the overridable pattern the other three should follow; making them
 match is a cheap follow-up.
 
+## 5.29. C-06's Q13: mis-generation, not mis-costing — and a premise of mine that was false
+
+The six blocked flag items (C-06, C-20c/d/e/f/g) all say "the flip moves
+plans, so the flag cannot be retired". Those are findings, not missing
+prerequisites, so the attackable question was *why the search picks what
+it picks*. C-06's Q13 was the cleanest instance. The answer is
+**mis-generation**, and getting there corrected a premise I had written
+into three places.
+
+**What I claimed, and why it was wrong.** I framed the question as: *the
+search wins a Merge Left Join at 338,223 when a 66,218 Hash path exists
+in the same run*. **The two numbers are not comparable.** On the OFF arm
+the join **never enters the search at all** — the LEFT link pins, the
+seam peels it off, and the join is priced by the *plan-tree estimator*,
+which charges the hash join 0.25 startup with no build and no inner cost,
+prices `orders` at 29,998.50 where the search says 97,273.00, and
+estimates 2,358,304 rows against 1,500,000. **The search never had the
+66,218 plan to reject.** I had compared a searched cost against an
+unsearched one and called the difference a defect.
+
+**The actual mechanism.** Instrumenting first paid off exactly as the
+Q8 precedent said it would. For Q13's `{customer,orders}` joinrel on the
+ON arm **both candidates reach `addPath` and are compared** —
+`mergejoin/left` 316,089.88 accepted, `join.hash/left` 336,448.25
+dominated, `pairs=1 declined=0 status=ok`. So no cost term misbehaves
+between them; the merge really is the cheaper of the two offered. The
+defect is one level up: **the candidate set is short by one.**
+
+`jointypeForDirection` (`joinpaths.go:155`) declines the commuted
+direction of an outer join instead of emitting PG's `JOIN_RIGHT`.
+`makeJoinRel` does call `addPaths` both ways; the second call returns
+nothing. So the only hash the search may price is the one that builds the
+**1.5 M-row `orders` side**, whose `NBatch>1` spill is ~59% of that
+path's cost. The hash join was never going to win — not because it was
+mispriced, but because the cheap spelling of it was never offered.
+
+**The justification for that decline has expired.** Its own comment reads
+*"nothing selects these paths today in any case"* — a claim **C-04a/C-04b
+invalidated** when they made LEFT/RIGHT links collapse-dependent and let a
+two-table LEFT JOIN into the search. This is the same shape as the three
+stale blockers in §5.28: a narrowing that was true when written, still
+in force after the reason went away.
+
+**The counterfactual, priced by goopg's own model.** A throwaway probe
+admitting the direction (never committed; source restored immediately)
+produces `join.hash jointype=right` at **124,999.25 — 2.53× under the
+merge join** — and emits PG's exact `Hash Right Join` shape. Values
+byte-identical to the stock plan on the same cluster; runtime
+**4.36/4.52 s against stock 6.06/6.64 s**. `createPlanNode` already has
+the arm.
+
+**Filed as C-06s rather than landed**, which is the right call: the
+relaxation admits a *family* (`mergejoin jointype=right` too), must stay
+LEFT-only and fail-closed for SEMI/ANTI/FULL, is exactly the
+two-spellings coupling C-03b withheld so C-04 would not prove both at
+once, moves plans, and needs a `plan_snapshots/` re-pin that was
+off-limits with a peer possibly re-pinning.
+
+**Scope, checked rather than assumed.** C-06's own blocker is answered
+but the item stays blocked and `GOOPG_PGSHAPED_COLLAPSE` stays — nothing
+measured makes the flip plan-neutral, and **C-06s is now C-06's
+precondition, not the reverse**. It does **not** transfer to
+C-20c/d/e/f/g: each has its own measured movement, none is Q13, and none
+switches a join *direction*. That is the second time this session an
+agent has explicitly refused to generalise a verdict to an apparent
+sibling, and been right to.
+
+Two secondary findings recorded and not acted on: goopg charges
+~0.0359/row for Q13's `NOT LIKE` qual against PG's 0.0025 (which is why
+124,999 is still 2.2× PG's 56,164), and the plan-tree estimator prints
+the same 29,998.50 for both a seq scan and an index scan of `orders` —
+the two-estimator divergence of §5.21, seen from the other side.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
