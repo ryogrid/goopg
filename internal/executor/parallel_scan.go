@@ -129,6 +129,33 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// side instead would give each worker a PARTITION of the build input,
 		// so every worker's hash table would be missing most of its rows and
 		// the join would silently drop matches.
+		//
+		// FAIL CLOSED on anything but a HASH join (2026-09-07). `joinOp` runs
+		// all three algorithms, and `probeSideIsLeft` answers from `BuildLeft`
+		// — a field a merge join leaves false by construction
+		// (`createMergeJoinPlan`: "a merge join has no build side, so BuildLeft
+		// is meaningless here and stays false"). So for a merge or nested-loop
+		// join this arm used to answer "left" not because left is the partial
+		// side but because the field it reads is unset, and the walk would
+		// descend a subtree whose per-worker semantics nothing here models.
+		//
+		// It is unreachable today: the planner's own twin refuses first —
+		// `drivingScan`'s `*Join` arm is gated on `hashJoinIsPartialCapable`
+		// (Algo == JoinAlgoHash) and the path model's `partialPathDrivingKind`
+		// has an arm for `PathHashJoin` only. That is exactly why the guard is
+		// worth writing: this walk is the LAST line of defence, `runWorker`
+		// IGNORES the return value, and the failure mode of a wrong answer here
+		// is N copies of every row rather than an error. Declining leaves the
+		// subtree serial, which is the direction an ambiguous case must fail.
+		//
+		// A partial merge join (`try_partial_mergejoin_path`, joinpath.c:1218)
+		// is a real PG shape and goopg has no producer for it; when one is
+		// written, this arm gains a `JoinAlgoMerge` case that descends the
+		// OUTER (left) side explicitly, together with its own serial-vs-parallel
+		// identity test.
+		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash {
+			return false
+		}
 		if probeSideIsLeft(x.plan) {
 			return attachParallelScan(x.left, st)
 		}
