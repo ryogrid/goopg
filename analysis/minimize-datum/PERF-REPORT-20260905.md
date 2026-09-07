@@ -2388,6 +2388,155 @@ the plan root — because the root row *is* the query's answer.
 will not descend past `*Limit`/`*Distinct`/`*DistinctOn`/`*Gather`/joins.
 Resume point is in `take3-B-01c-applying-blocked`.
 
+## 5.36. Session 2026-09-07 (evening): E-01 lands, D-06 lands negative, and the sort chain closes
+
+E-01 (sort spill runs) split on inspection: run formation + N-way merge
+already existed (M0068-0006 + M0134-0191), so the row's WORK clause was
+stale. What landed: (D) a 10-arm spilling-sort ordering gate (4 NULLS
+placements + mixed multikey, each in-mem and ≥8-run spilling, against an
+independent oracle comparator, plus multiset equality — the
+`operators.go:1010-1015` silent class); (E) `Close` hygiene clearing
+`keyvals`/`mergeReady`/`sortErr`/`ctidsDisabled` — the rescan test caught
+a nil-heap panic pre-fix, latent at HEAD (no Sort rescan path admits
+it); (B) the spill threshold now sources `ctx.WorkMem` (the planner
+already prices `work_mem`; the executor spilled at a hard-coded 256 MiB
+— a 4× band at bench settings). (B)'s census: TPC-H max Q10 10.4 MB,
+TPC-DS max Q47 12.6 MB, both < 64 MB `work_mem` — so (B) changes no
+corpus behaviour and makes NO timing claim (faithfulness-only, values-
+gated). (C) bounded fan-in ledgered (`take3-E-01-fanin-deferred`).
+Gates: suites + sort-scoped `-race` green (full-package `-race` fails on
+a PRE-EXISTING instrument race, verified at the pre-change commit);
+spotcheck Q12=2/Q13=34; TPC-H 22/22 digest; TPC-DS sweep 95/0/0.
+
+D-06 (sort retention → PackedTuple, behind default-OFF
+`GOOPG_SORT_PACKED`) measured per §8 with 2 reps per arm on a 6M-row
+serial sort (1 GB `work_mem`, no spill either arm, fresh servers):
+**wall +103 % (10.1 → 20.5 s, both reps rock-stable), allocs flat
+(−2.3 %)**. Retained bytes analytic −25 % but unmeasurable through GC
+noise (peak `HeapInuse` varies 2.18 → 3.11 GB across IDENTICAL OFF runs
+— GOMEMLIMIT lets garbage accumulate, so the peak measures GC timing,
+not retention). Mechanism: every `Next` deforms the full row eagerly
+with owned-memory allocation per value, while the OFF arm hands back
+already-materialised Datums. The D-04 numbers reproduced in kind and
+exceeded 15× — so per §7 the switch stays OFF and revert is one commit.
+Correctness is NOT what failed: 10+10 ordering arms + CTID + rescan
+green, TPC-H digest **24/24 MATCH** OFF-vs-ON, suites green.
+D-10 re-tested on D-06's landing and went OUT OF SCOPE (no-win by
+construction: current spill TLV is already compact, MinimalTuple adds
+padding; TD-5's convergence premise assumed packed retention, now gone);
+D-11 accepted over the OFF end state (6/6 conditions, two vacuous with
+reason stated).
+
+## 5.37. E-17 cut 2: the session's one real win — Q6 −32 %, and the double evaluation is gone
+
+Cut 2 absorbs the Filter-above-SeqScan qual into the scan (both build
+paths) and evaluates ONCE — early on the deformed prefix
+(`PlanScanQual`-gated, fail-closed on `walkExprRefs`) or late on the
+finished row (filterOp's old position), never both; early errors promote
+to late (error position/message/ordering byte-identical, pinned
+non-vacuously); EPQ recheck taught the absorbed qual (else silent wrong
+rows on FOR UPDATE). Same-binary A/B, fresh servers:
+
+| Q6 serial | OFF (double eval) | ON (single eval) |
+|---|---|---|
+| rep 1 | 7.86 s | 4.89 s (0.62×) |
+| rep 2 | 7.79 s | 4.19 s (0.54×) |
+| rep 3 warm | 6.19 s | **4.18 s (0.68×, −32 %)** |
+
+The win is rejected-row deform savings (98 % of 6M rows rejected before
+tail deform + deep copy), not surviving-row re-evaluation. Values:
+TPC-H digest **24/24 MATCH** vs baseline; TPC-DS sweep **95/0/0**;
+OFF-vs-ON plans structurally identical (0-line diff — the Filter PLAN
+node is untouched, no re-pin owed); EXPLAIN ANALYZE renders PG's shape
+(`Rows Removed by Filter` on the scan). Appended as the C-21 second
+instalment, per the row's sequencing.
+
+## 5.38. E-20 Cut 3: both partial-mergejoin sites transcribed, zero plan moves (allowed outcome)
+
+`try_partial_mergejoin_path` at PG's two sites (`sort_inner_and_outer`
+loop + `consider_parallel_mergejoin` loop over ordered partial outers —
+the loop matters because the cheapest partial is almost never the
+ORDERED one) with the no-sort gate (sort-under-partial unmodelled:
+no PathSort arm in `partialPathDrivingKind`, no *Sort arm in
+`drivingScan` — a filed sort would be priced then refused or worse),
+per-worker row scaling (`costsize.c:3875-3881`), and the executor
+driving arms (`attachParallelScan` JoinAlgoMerge descending the outer
+explicitly + `mergeJoinIsPartialCapable` + driving-kind arm +
+`createPlan` fail-closed assert). 8 producer tests incl. end-to-end
+filing through `addPathsToJoinrel`; merge-under-Gather identity at 1/2/4
+workers (non-vacuous); suites + units green.
+Parallel-mode A/B at `GOOPG_GATHER_PATHS=all` (serial control identical):
+**0 structural moves on TPC-H** — no corpus shape has an ordered partial
+outer aligning with merge clauses (or the partial merge loses to partial
+hash). The producer is proven live end-to-end by test, so this is a
+missing SHAPE, not a dead producer — exactly the outcome design §5.2
+allows ("may move zero plans... must not claim one it did not
+measure"). Values: TPC-H 24/24 MATCH, TPC-DS 95/0/0, spotcheck.
+D-05 NOTE (load-bearing for whoever re-derives it): the blocker lifts
+ONLY for already-ordered flips — a hash→merge flip needing sorts still
+goes serial.
+
+## 5.39. E-21 Cut 1b: the re-route works, the plans it chooses regress — flip declined
+
+Both `isSimpleSingle` diversions (FROM + WHERE arms) fall through to the
+generic Filter+search machinery under `GOOPG_ONEREL_SEARCH` (default
+OFF): two-line condition change. Unit pins: ON routes a single-table
+WHERE through the search (searched subtree present), OFF inert,
+WHERE-less plans fine. The headline witness:
+`lineitem WHERE l_extendedprice > 90000` gets PG's exact
+`Gather → Parallel Seq Scan` FROM THE PATH MODEL (C-19h's blind spot —
+all 22 TPC-H queries are aggregate-rooted — closed at last).
+Parallel-mode A/B with A/A attribution (stats-noise floor: Q5/Q9):
+Cut-1b's moves are **Q4/Q17/Q20/Q21**. Values hold everywhere (TPC-H
+24/24 MATCH — including Q20's narrowed index Filter, which MOVED rather
+than dropped its conjuncts; TPC-DS sweep **95/0/0 with the re-route
+LIVE**, TPC-DS being full of single-table statements).
+Timing (parallel, fresh servers, 3 reps): Q17/Q20 neutral, but
+**Q4 ~10× (2.5 → 26.5 s)** and **Q21 ~2.3× (18 → 43 s)** — the search
+chooses hash-semi over NL-semi (Q4) and seq over index (Q21 l3) where
+the rule chooser was right. Per design §5.2 this is the valid
+flip-declined outcome: the MECHANISM (E-18/E-20's prerequisite) lands,
+the FLIP waits on cost-model work — recorded as the resume point.
+
+## 5.40. E-18: designed, and the census says the cheap form has no witness
+
+Design landed (`docs/design/executor-ex5-03-parallel-hash/DESIGN.md`,
+both reviews inline): barrier-phased cooperative build with sharded
+inserts + pre-sized growth + serial fallback (Phase 1) and shared batch
+files (Phase 2). Second-witness census from the E-14 retention numbers:
+every paying build site is multi-batch at 64 MB work_mem (4,609 / 648 /
+316 / 197 / 192 MB; spilling labels Q9/Q16/Q18/Q21) — the SOLE ≤64 MB
+candidate is 150K×8 ≈ 57 MB (~100–200 ms build). No second witness for
+Phase 1: specified-not-built. The prize (Q9 included) needs Phase 2's
+shared batch files — scoped in the design, beyond this session.
+
+## 5.41. E-19: S1 sharpened, not started
+
+The installing-prefetch design + Probe 0 (79.9 % recoverable) + both
+reviews stand; S1–S4 remain the implementation. Scoping note added this
+session: "vectored through all three methods" needs ring surgery — the
+io_uring binding DELIBERATELY excludes IORING_OP_READV/WRITEV
+(`method_iouring_linux.go:43`) — plus per-block checksum preservation on
+the vectored path (the review's own checksum saga). A loop-over-
+`ReadBlock` must not be accepted as "vectored": it buys no syscall
+reduction, which is the whole point of `io_combine_limit`.
+
+## 5.42. Session scoreboard (2026-09-07 evening workstream)
+
+Closed this session: E-01, D-06 (measured-negative, OFF), D-10 (verified
+no-win), D-11 (accepted), E-17 (Q6 −32 %), E-20 Cut 3 (zero moves,
+structural), E-21 Cut 1b (mechanism, flip declined). Merged from dead
+agent branches: the `aio.ChecksumFile` durability fix (io_uring writes
+stamped no checksum — a live defect, not a perf item), E-21 Cut 1,
+E-19 design + Probe 0. Designed-not-built: E-18 (no Phase-1 witness),
+E-19 S1–S4 (pending). Measured negatives kept OFF rather than reverted
+(D-06, E-21-flip) so the mechanisms stay available to the cost-model
+work that can flip them. One timing win (−32 %), two measured
+regressions-on-flip (D-06 +103 %, E-21 Q4 10×/Q21 2.3× — both gated
+behind OFF switches, production unaffected), everything else structural
+or faithfulness-only. No corpus timing claim is made for any of them
+beyond the Q6 A/B above.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
