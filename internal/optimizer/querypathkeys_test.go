@@ -374,27 +374,35 @@ func TestHasUsefulPathkeysArms(t *testing.T) {
 	}
 }
 
-// TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot is C-07's recorded
-// scope line, as a test rather than a comment.
+// TestAddOrderedIndexPathsOrderingArmGeneratesSinceTheSeamCarriesPathkeys is
+// C-07's marker test, FLIPPED red-to-green on 2026-09-07 exactly as its
+// predecessor said it must be.
 //
-// The rel below has NO join clause and an index whose leading column is
-// exactly what the query's ORDER BY asks for. `has_useful_pathkeys` now says
-// yes — the ordering arm is live — and the producer still emits nothing,
-// because the useful-COLUMN set is `pathkeys_useful_for_merging` alone
-// (`mergeableColumnExprsFor`); `pathkeys_useful_for_ordering` has no
-// counterpart yet.
+// It used to read `...GateIsCompleteButGenerationStaysShut` and assert ZERO ordered
+// index paths: the rel below has NO join clause and an index whose leading
+// column is exactly what the query's ORDER BY asks for, `has_useful_pathkeys`
+// said yes, and the producer still emitted nothing — because the useful-COLUMN
+// set was `pathkeys_useful_for_merging` alone and
+// `pathkeys_useful_for_ordering` had no counterpart. That was deliberate and
+// its stated condition for flipping was: "when C-11 (upper RelOptInfos, incl.
+// ORDERED) and C-12 (a real upper-rel PathSort) land, it must be flipped
+// deliberately — with the ordered path then asserted to be offered."
 //
-// That is deliberate: goopg has nothing that would SELECT a path for its
-// ordering. `finalPath` chooses on cost, the search boundary publishes a Node
-// and drops the chosen path's `Pathkeys`, and the ORDER BY `*Sort` goes on
-// unconditionally above it. An ordering-only full index scan generated here
-// could only lose on total cost or win `CheapestStartup` under a LIMIT while
-// the redundant Sort still runs.
+// Both landed, and C-07's seam half (upperorderedinput.go) closed the last gap
+// they left: the ORDERED upper rel now RECEIVES an ordering instead of dropping
+// it at the search boundary, so a path chosen for its ordering can actually
+// remove the Sort above it. `addQueryPathkeyColumnExprs` is the map union that
+// was filed as "one line" (pathindexordered.go).
 //
-// So this test is a MARKER, not a preference: when C-11 (upper `RelOptInfo`s,
-// incl. `ORDERED`) and C-12 (a real upper-rel `PathSort`) land, it must be
-// flipped deliberately — with the ordered path then asserted to be offered.
-func TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot(t *testing.T) {
+// NOTE the fixture detail that makes this test real: `sourceIdx` must be set.
+// `orderedCtx` leaves `baseRelInfo.sourceIdx` at its zero value, which the
+// widening reads as "membership unknowable" and declines — and `ppiCtx`'s
+// `baseLeaf` has a NIL schema, so a membership filter reading `baseLeaf.Output()`
+// would have been invisible to the entire optimizer suite. This test therefore
+// stamps the identity the production path stamps, and the companion
+// `TestAddQueryPathkeyColumnExprsDeclinesWithoutARecordedIdentity` pins the
+// decline.
+func TestAddOrderedIndexPathsOrderingArmGeneratesSinceTheSeamCarriesPathkeys(t *testing.T) {
 	cat, orders, _ := ppiCatalog(t)
 	ppiSetStats(orders, 1_500_000,
 		catalog.ColumnStats{NDistinct: 1_500_000},
@@ -403,8 +411,9 @@ func TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot(t *testing.T) {
 	inner := relsetOf(1)
 	// No join clauses at all — the merging arm is shut.
 	s := orderedCtx(t, orders, 1_500_000)
+	s.relInfos[1].sourceIdx = 7
 	// ...and the query wants exactly `orders_pkey`'s ordering.
-	s.queryPathkeys = []PathKey{{Expr: &ColumnRef{Name: "o_orderkey"}, SortAsc: true}}
+	s.queryPathkeys = []PathKey{{Expr: &ColumnRef{Name: "o_orderkey", SourceTableIdx: 7}, SortAsc: true}}
 
 	rel := s.findRel(inner)
 	if !s.hasUsefulPathkeys(rel) {
@@ -413,10 +422,62 @@ func TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot(t *testing.T) {
 
 	s.addOrderedIndexPaths(cat)
 
-	if got := orderedPathsOf(rel); len(got) != 0 {
-		t.Fatalf("got %d ordered index paths on the ordering arm alone; want 0 until a consumer "+
-			"exists that selects a path FOR its ordering (C-11 ORDERED upper rel, C-12 upper-rel "+
-			"PathSort). Flipping this test is that item's red-then-green marker", len(got))
+	got := orderedPathsOf(rel)
+	if len(got) == 0 {
+		t.Fatal("the ordering arm alone must now generate an ordered index path: the useful-column " +
+			"set is the union of pathkeys_useful_for_merging and pathkeys_useful_for_ordering")
+	}
+	var ordered *Path
+	for _, p := range got {
+		if len(p.Pathkeys) > 0 && p.Pathkeys[0].Expr.(*ColumnRef).Name == "o_orderkey" {
+			ordered = p
+		}
+	}
+	if ordered == nil {
+		t.Fatalf("got %d unparameterised index paths, none carrying orders_pkey's ordering", len(got))
+	}
+	if ordered.RequiredOuter != 0 {
+		t.Fatal("the ordering arm's path must be unparameterised: a merge outer and the ORDERED " +
+			"upper rel both refuse a parameterised input")
+	}
+}
+
+// TestAddQueryPathkeyColumnExprsMembershipIsBySourceIdx pins the two halves of
+// the widening's rel-membership rule, which is the whole of its correctness:
+// a query pathkey naming ANOTHER rel's column must not become useful here, and
+// a rel with no recorded identity must add nothing at all rather than fall back
+// to matching on the column NAME (that fallback would hand one self-join
+// sibling's ordering to the other).
+func TestAddQueryPathkeyColumnExprsMembershipIsBySourceIdx(t *testing.T) {
+	keys := []PathKey{
+		{Expr: &ColumnRef{Name: "o_orderkey", SourceTableIdx: 7}, SortAsc: true},
+		{Expr: &ColumnRef{Name: "l_orderkey", SourceTableIdx: 9}, SortAsc: true},
+		{Expr: &BinaryOp{}, SortAsc: true},
+	}
+	out := map[string]Expr{}
+	addQueryPathkeyColumnExprs(out, keys, 7)
+	if len(out) != 1 {
+		t.Fatalf("useful columns = %v, want only this rel's o_orderkey", out)
+	}
+	if _, ok := out["o_orderkey"]; !ok {
+		t.Fatalf("useful columns = %v, want o_orderkey", out)
+	}
+
+	// No recorded identity: add nothing.
+	none := map[string]Expr{}
+	addQueryPathkeyColumnExprs(none, keys, 0)
+	if len(none) != 0 {
+		t.Fatalf("a rel with no sourceIdx must add nothing, got %v", none)
+	}
+
+	// The merging half wins a collision: its expression is the one the join
+	// clauses were written with, and a freshly minted ColumnRef would not
+	// compare equal to it.
+	merged := &ColumnRef{Name: "o_orderkey", SourceTableIdx: 7, Index: 3}
+	pre := map[string]Expr{"o_orderkey": merged}
+	addQueryPathkeyColumnExprs(pre, keys, 7)
+	if pre["o_orderkey"] != Expr(merged) {
+		t.Fatal("the merging half's expression must survive the union")
 	}
 }
 

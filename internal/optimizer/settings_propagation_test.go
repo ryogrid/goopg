@@ -1,6 +1,13 @@
 package optimizer
 
 import (
+	"go/ast"
+	goparser "go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -655,5 +662,294 @@ func TestNeededColsReachTheRelOptInfo(t *testing.T) {
 
 	if _, err := PlanWithSettings(sel, cat, DefaultPlannerSettings()); err != nil {
 		t.Fatalf("plan: %v", err)
+	}
+}
+
+// workMemProbeCatalog is a two-table fixture whose join is work_mem-sensitive:
+// both sides carry a 2M-row stat so whichever side the hash builds on, the
+// ~240MB build fits the ~1GiB default budget single-batch (NBatch == 1, no
+// spill term) but spills under a kilobyte budget. The spill term
+// (hashJoinCost's NBatch > 1 arm) then separates a search priced at the
+// session work_mem from one priced at the default — deterministically, with
+// no timing and no golden plan shape.
+func workMemProbeCatalog(t *testing.T) catalog.Catalog {
+	t.Helper()
+	cat := catalog.NewInMemory()
+	mk := func(name string, rows int64) {
+		tbl, err := cat.CreateTable(parser.ObjectName{Name: name}, []catalog.Column{
+			{Name: "a", Type: catalog.Type{Name: "int4"}},
+			{Name: "b", Type: catalog.Type{Name: "text"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rows > 0 {
+			tbl.Stats = &catalog.TableStats{RowCount: rows, Analyzed: true}
+		}
+	}
+	mk("pj1", 2_000_000)
+	mk("pj2", 2_000_000)
+	return cat
+}
+
+// searchedInnerJoinCosts walks a finished plan tree and returns the TotalCost
+// of every search-produced (CostSet) INNER join. The stamp is the load-bearing
+// assumption: stampPlanCost records the SEARCH path's cost on the node, so
+// these numbers are the budget the join search priced under — not the
+// display-only derivation. CostSet==false nodes (legacy rewriter output above
+// the seam) are skipped, never priced.
+func searchedInnerJoinCosts(n Node) []float64 {
+	var out []float64
+	var walk func(m Node)
+	walkExprs := func(m Node) {
+		walkPlanExprs(m, func(e Expr) {
+			// walkPlanExprs visits the host scope's expressions only;
+			// each subquery shape carries its inner plan on a Plan
+			// field the display walker never descends into.
+			walkExprTree(e, func(inner Expr) {
+				var plan Node
+				switch x := inner.(type) {
+				case *SubqueryExpr:
+					plan = x.Plan
+				case *ArraySubqueryExpr:
+					plan = x.Plan
+				case *InExpr:
+					plan = x.Plan
+				case *ExistsExpr:
+					plan = x.Plan
+				}
+				if plan != nil {
+					walk(plan)
+				}
+			})
+		})
+	}
+	walk = func(m Node) {
+		if m == nil {
+			return
+		}
+		if j, ok := m.(*Join); ok && j.Type == JoinTypeInner && j.CostSet {
+			out = append(out, j.TotalCost)
+		}
+		for _, c := range legacyDisplayChildren(m) {
+			walk(c)
+		}
+		// Arms the display walker never descends into: CTE bodies and
+		// the DML source.
+		if cte, ok := m.(*CTEScan); ok {
+			walk(cte.Child)
+		}
+		if ins, ok := m.(*Insert); ok {
+			walk(ins.Source)
+		}
+		walkExprs(m)
+	}
+	walk(n)
+	return out
+}
+
+// planWorkMemProbe plans q under ps and returns the searched inner-join costs.
+// It fails the test when the shape under probe carries no searched join — a
+// fixture that lost its sensitivity must be loud, not vacuously green.
+func planWorkMemProbe(t *testing.T, q string, cat catalog.Catalog, ps PlannerSettings) []float64 {
+	t.Helper()
+	stmts, err := parser.Parse(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := PlanWithSettings(stmts[0], cat, ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	costs := searchedInnerJoinCosts(node)
+	if len(costs) == 0 {
+		t.Fatalf("probe query planned with no searched inner join; the fixture lost its sensitivity: %s", q)
+	}
+	return costs
+}
+
+// assertWorkMemReachesInterior is the shared assertion for every EX3-03 cut-1
+// family: the same statement priced under a kilobyte work_mem must cost MORE
+// than under the default (shrinking the budget can only add spill charges —
+// every path's cost is monotone in work_mem), and the default-priced plan is
+// the behaviour-neutrality anchor the whole suite re-pins.
+func assertWorkMemReachesInterior(t *testing.T, q string, cat catalog.Catalog) {
+	t.Helper()
+	def := DefaultPlannerSettings()
+	tiny := DefaultPlannerSettings()
+	tiny.WorkMem = 4096
+
+	defCosts := planWorkMemProbe(t, q, cat, def)
+	tinyCosts := planWorkMemProbe(t, q, cat, tiny)
+	if len(defCosts) != len(tinyCosts) {
+		t.Fatalf("join count moved with work_mem (%d vs %d); the probe is not comparing like with like: %s",
+			len(defCosts), len(tinyCosts), q)
+	}
+	for i := range defCosts {
+		if tinyCosts[i] <= defCosts[i] {
+			t.Errorf("join %d priced %.2f under work_mem=4KB vs %.2f at default — "+
+				"the session value never reached the interior search (still on the hard-wired ~1GiB)",
+				i, tinyCosts[i], defCosts[i])
+		}
+	}
+}
+
+// TestInnerSelectSearchCarriesWorkMem is the F1 pin: the Q9 pattern — a join
+// tree inside FROM (select …) — plans its inner search through
+// planSelectWithParent, which used to end in a bare planSelect and discard
+// the statement's settings. Pre-cut this test fails with identical costs on
+// both arms (the interior is deaf); post-cut the kilobyte arm spills.
+func TestInnerSelectSearchCarriesWorkMem(t *testing.T) {
+	cat := workMemProbeCatalog(t)
+	assertWorkMemReachesInterior(t,
+		"select s.a from (select j1.a from pj1 j1, pj2 j2 where j1.a = j2.a) s", cat)
+}
+
+// TestCTEBodySearchCarriesWorkMem pins the §2.2 family through the same
+// observable: a join inside a non-recursive CTE body prices under the
+// statement's settings via the threaded preplanWithClause.
+func TestCTEBodySearchCarriesWorkMem(t *testing.T) {
+	cat := workMemProbeCatalog(t)
+	assertWorkMemReachesInterior(t,
+		"with q as (select j1.a from pj1 j1, pj2 j2 where j1.a = j2.a) select a from q", cat)
+}
+
+// TestExistsSubquerySearchCarriesWorkMem pins the scalar/EXISTS half of the
+// F1 family through the same observable: a join inside WHERE EXISTS prices
+// under the statement's settings via planExistsExpr's scope threading.
+func TestExistsSubquerySearchCarriesWorkMem(t *testing.T) {
+	cat := workMemProbeCatalog(t)
+	assertWorkMemReachesInterior(t,
+		"select j1.a from pj1 j1 where exists (select 1 from pj1 x, pj2 y where x.a = y.a)", cat)
+}
+
+// TestSubqueryFunnelCarriesWorkMem pins planSelectWithParent itself — the
+// funnel every scalar/array/IN/EXISTS shape shares. A nil parent (the
+// non-correlated derived-table path) prices under the explicit ps; a live
+// parent prices under its scope settings.
+func TestSubqueryFunnelCarriesWorkMem(t *testing.T) {
+	cat := workMemProbeCatalog(t)
+	inner := "select j1.a from pj1 j1, pj2 j2 where j1.a = j2.a"
+	stmts, err := parser.Parse(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel := stmts[0].(*parser.SelectStmt)
+
+	tiny := DefaultPlannerSettings()
+	tiny.WorkMem = 4096
+
+	// Nil-parent arm: the statement's settings arrive on ps alone.
+	nilParent, err := planSelectWithParent(sel, cat, nil, tiny, newRtableScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defCosts := planWorkMemProbe(t, inner, cat, DefaultPlannerSettings())
+	nilCosts := searchedInnerJoinCosts(nilParent)
+	if len(nilCosts) == 0 {
+		t.Fatal("nil-parent funnel planned with no searched inner join")
+	}
+	if nilCosts[0] <= defCosts[0] {
+		t.Errorf("nil-parent funnel priced %.2f under work_mem=4KB vs %.2f at default — ps was dropped",
+			nilCosts[0], defCosts[0])
+	}
+
+	// Live-parent arm: the scope's settings carry through.
+	parent := newResolveContext(nil, nil, tiny)
+	parent.cat = cat
+	withParent, err := planSelectWithParent(sel, cat, parent, parent.settings, rtableScopeFrom(parent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentCosts := searchedInnerJoinCosts(withParent)
+	if len(parentCosts) == 0 {
+		t.Fatal("parent funnel planned with no searched inner join")
+	}
+	if parentCosts[0] <= defCosts[0] {
+		t.Errorf("parent funnel priced %.2f under work_mem=4KB vs %.2f at default — scope settings were dropped",
+			parentCosts[0], defCosts[0])
+	}
+}
+
+// TestInsertSelectSearchCarriesWorkMem pins the F2 family: INSERT…SELECT plans
+// a full SELECT as its source, and that source's search must price in the
+// statement's currency via the threaded planInsert.
+func TestInsertSelectSearchCarriesWorkMem(t *testing.T) {
+	cat := workMemProbeCatalog(t)
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "dst"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertWorkMemReachesInterior(t,
+		"insert into dst select j1.a from pj1 j1, pj2 j2 where j1.a = j2.a", cat)
+}
+
+// TestProductionDefaultCostParamsCallersAreExactlyThree is the F7 grep-gate.
+//
+// After the cut, production callers of defaultCostParams() must be exactly:
+// DefaultPlannerSettings (definitional — plannersettings.go),
+// DeriveLegacyDisplayCost (display-only — plancost.go), and pathRescanTotal
+// (test-only — joinpathsmemoize.go, documented at its definition). Any other
+// production caller is a missed fringe site silently pricing at ~1GiB, and any
+// FEWER means one of the three was threaded without updating this gate —
+// either way the cut's accounting is wrong, so the gate fails closed.
+//
+// The walk is syntactic (go/ast CallExpr), so comments and the definition
+// itself can never trip it; _test.go files are out of scope (~200 test sites
+// mutate a local copy deliberately).
+func TestProductionDefaultCostParamsCallersAreExactlyThree(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	dir := filepath.Dir(thisFile)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// file -> enclosing function names calling defaultCostParams().
+	found := map[string][]string{}
+	fset := token.NewFileSet()
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := goparser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var enclosing string
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.FuncDecl:
+				enclosing = x.Name.Name
+				return true
+			case *ast.CallExpr:
+				if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "defaultCostParams" {
+					found[name] = append(found[name], enclosing)
+				}
+			}
+			return true
+		})
+	}
+	want := map[string]string{
+		"plannersettings.go":  "DefaultPlannerSettings",
+		"plancost.go":         "DeriveLegacyDisplayCost",
+		"joinpathsmemoize.go": "pathRescanTotal",
+	}
+	if len(found) != len(want) {
+		t.Fatalf("production defaultCostParams() callers = %v, want exactly %v", found, want)
+	}
+	for file, fn := range want {
+		got, ok := found[file]
+		if !ok {
+			t.Errorf("missing production caller in %s (want %s); got %v", file, fn, found)
+			continue
+		}
+		if len(got) != 1 || got[0] != fn {
+			t.Errorf("%s: caller(s) = %v, want exactly [%s]", file, got, fn)
+		}
 	}
 }

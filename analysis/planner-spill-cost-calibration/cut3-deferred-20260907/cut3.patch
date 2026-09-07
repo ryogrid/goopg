@@ -1,0 +1,328 @@
+diff --git a/internal/optimizer/cost_funcs.go b/internal/optimizer/cost_funcs.go
+index 5002e4d24..cc2dd55fe 100644
+--- a/internal/optimizer/cost_funcs.go
++++ b/internal/optimizer/cost_funcs.go
+@@ -542,8 +542,8 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
+ 	// M0128-P3.1: avgVarBytes from column stats replaces the hardcoded zero.
+ 	sizing := hashsize.Choose(in.innerRows, in.innerCols, in.innerAvgVarBytes, cp.workMem)
+ 	if sizing.NBatch > 1 {
+-		innerPages := spillPages(in.innerRows, in.innerCols, in.innerAvgVarBytes)
+-		outerPages := spillPages(in.outerRows, in.outerCols, in.outerAvgVarBytes)
++		innerPages := spillPagesInner(in.innerRows, in.innerCols, in.innerAvgVarBytes)
++		outerPages := spillPagesOuter(in.outerRows, in.outerCols, in.outerAvgVarBytes)
+ 		startup += cp.seqPageCost * innerPages
+ 		run += cp.seqPageCost * (innerPages + 2*outerPages)
+ 	}
+@@ -551,24 +551,44 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
+ 	return Cost{Startup: startup, Total: startup + run}
+ }
+ 
+-// spillPages is `page_size` (costsize.c:6464) in goopg's width model: how many
+-// BLCKSZ pages `rows` rows of `ncols` columns occupy when written to a batch
+-// file. `relation_byte_size`'s MinimalTuple math is replaced by
+-// `hashsize.EntryBytes`, the one place goopg's per-row footprint is defined, so
+-// the pages this charge prices and the bytes the geometry above solved for come
+-// from the same model.
++// spillPagesInner / spillPagesOuter are `page_size` (costsize.c:6464) in
++// goopg's on-disk width model: how many BLCKSZ pages `rows` rows of `ncols`
++// columns occupy when written to a hash-join batch file.
+ //
+-// The batch FILE encoding is narrower than the in-memory footprint
+-// (`spillWriter.WriteRow` frames datums with uvarint lengths rather than
+-// storing 48-byte structs), so this over-states the I/O of a wide build. That
+-// is deliberate for now and it is the safe direction — it deters spilling — but
+-// it is a real approximation and is recorded as such (deferral ledger
+-// 2026-08-05 M0127-P5.7-a).
+-func spillPages(rows float64, ncols int, avgVarBytes float64) float64 {
++// The byte model is `hashsize.SpillBytes` / `hashsize.SpillInnerBytes`, which
++// transcribe what `internal/executor/spill.go` actually writes, NOT
++// `hashsize.EntryBytes`, which measures the IN-MEMORY entry (a 48-byte Datum
++// struct per column plus a 24-byte slice header). Charging file I/O at the
++// in-memory width over-stated a narrow build's spill by up to ~5x and a wide
++// text build's by ~1.2x — a ratio, not a constant, which is why the
++// calibration is a derived second model rather than a fitted multiplier
++// (`docs/design/planner-spill-cost-calibration/DESIGN.md` §6.2, Cut 3). This
++// retires the ledgered approximation M0127-P5.7-a (2026-08-05), whose own
++// comment named the defect.
++//
++// The two sides spill through DIFFERENT writers — `WriteRowKeyed` for the
++// inner (build) side, which prefixes the canonical hash-table key, and
++// `WriteRowHashed` for the outer — so they get one function each rather than a
++// side flag: a call site has to say which it means. E-14's keyed inner frame
++// is exactly the drift a single shared model hid for a day.
++//
++// What does NOT move: `hashsize.Choose` above still sizes the geometry through
++// `EntryBytes`, because that identity with `joinOp.buildGeometry` is what makes
++// `NBatch > 1` mean "the executor will really write files" (DESIGN §3.4). Only
++// the I/O CHARGE is re-denominated; the spill DECISION is untouched.
++func spillPagesInner(rows float64, ncols int, avgVarBytes float64) float64 {
++	return spillPagesFor(rows, hashsize.SpillInnerBytes(ncols, avgVarBytes))
++}
++
++func spillPagesOuter(rows float64, ncols int, avgVarBytes float64) float64 {
++	return spillPagesFor(rows, hashsize.SpillBytes(ncols, avgVarBytes))
++}
++
++func spillPagesFor(rows float64, bytesPerRow float64) float64 {
+ 	if !(rows > 0) {
+ 		return 0
+ 	}
+-	return math.Ceil(rows * hashsize.EntryBytes(ncols, avgVarBytes) / blockSizeBytes)
++	return math.Ceil(rows * bytesPerRow / blockSizeBytes)
+ }
+ 
+ // nestloopCost reproduces final_cost_nestloop (costsize.c:3349): for each outer
+diff --git a/internal/optimizer/cost_funcs_test.go b/internal/optimizer/cost_funcs_test.go
+index 514621a33..eb239bd15 100644
+--- a/internal/optimizer/cost_funcs_test.go
++++ b/internal/optimizer/cost_funcs_test.go
+@@ -130,8 +130,8 @@ func TestHashJoinCost_SpillTermFiresExactlyWhenTheExecutorSpills(t *testing.T) {
+ 			// PG's charge verbatim (costsize.c:4239-4248): the inner is
+ 			// written during the build (startup), then read back while the
+ 			// outer is written and read (run).
+-			innerPages := spillPages(in.innerRows, ncols, 0)
+-			outerPages := spillPages(in.outerRows, ncols, 0)
++			innerPages := spillPagesInner(in.innerRows, ncols, 0)
++			outerPages := spillPagesOuter(in.outerRows, ncols, 0)
+ 			wantStartup += cp.seqPageCost * innerPages
+ 			wantRun += cp.seqPageCost * (innerPages + 2*outerPages)
+ 			spilled++
+diff --git a/internal/optimizer/cost_sort_external_test.go b/internal/optimizer/cost_sort_external_test.go
+index 783bfc0de..ed55080bc 100644
+--- a/internal/optimizer/cost_sort_external_test.go
++++ b/internal/optimizer/cost_sort_external_test.go
+@@ -167,7 +167,7 @@ func TestSpillingSortAndSpillingHashAreChargedInOneCurrency(t *testing.T) {
+ 	sortIO := costSortRun(cp, rows, ncols, 0, -1).Startup - 2*cp.cpuOperatorCost*rows*math.Log2(rows)
+ 	// The hash rival's charge for spilling the SAME rows: `hashJoinCost`'s
+ 	// batch term, inner side (written once at build, read back at probe).
+-	hashIO := cp.seqPageCost * 2 * spillPages(rows, ncols, 0)
++	hashIO := cp.seqPageCost * 2 * spillPagesInner(rows, ncols, 0)
+ 
+ 	if !(sortIO > 0) {
+ 		t.Fatalf("the sort of %v rows over a %v-byte budget must be charged for spilling", rows, cp.workMem)
+diff --git a/internal/optimizer/pathtarget_test.go b/internal/optimizer/pathtarget_test.go
+index 794445669..f8b49c42b 100644
+--- a/internal/optimizer/pathtarget_test.go
++++ b/internal/optimizer/pathtarget_test.go
+@@ -1,6 +1,7 @@
+ package optimizer
+ 
+ import (
++	"math"
+ 	"testing"
+ 
+ 	"github.com/goopg/goopg/internal/catalog"
+@@ -582,19 +583,39 @@ func TestSlice2WitnessModelArithmetic(t *testing.T) {
+ 		}
+ 	}
+ 	before, after := hashJoinCost(cp, inputs(30)), hashJoinCost(cp, inputs(6))
+-	// De-pricing the spill is exact: inner 43 329 + inner 43 329 + 2× outer
+-	// 83 497 pages at seq_page_cost.
+-	if got, want := before.Total-after.Total, 253652.0; got < want-1 || got > want+1 {
+-		t.Errorf("spill de-priced = %.0f, want %.0f (inner 43329 + inner 43329 + 2×outer 83497)", got, want)
+-	}
+-	// The §8 bar: join.hash 923 247 (above the 754 717 mergejoin bar) drops
+-	// to 669 589 (below it) once the build is costed narrowed.
+-	if before.Total <= 754717 {
+-		t.Errorf("before total = %.0f, want above the 754717 bar", before.Total)
++	// De-pricing the spill is exact, and it is stated through the MODEL, not
++	// through the page literals this test used to carry: the narrowed build
++	// fits (NBatch 1, no charge at all), so the whole difference is the wide
++	// build's batch term — inner written and re-read, outer written and
++	// re-read twice.
++	wantDePriced := cp.seqPageCost * (2*spillPagesInner(242450, 30, 0) +
++		2*spillPagesOuter(1500000, 9, 0))
++	if got := before.Total - after.Total; got < wantDePriced-1 || got > wantDePriced+1 {
++		t.Errorf("spill de-priced = %.0f, want %.0f (2x inner + 2x outer pages at seq_page_cost)", got, wantDePriced)
++	}
++	// The §8 bar: join.hash 923 247 sat above the 754 717 mergejoin bar and
++	// dropped below it once the build was costed narrowed.
++	//
++	// Spill-cost calibration Cut 3 moved the LEFT-HAND side of that statement:
++	// the batch charge is now denominated in the on-disk
++	// `hashsize.SpillInnerBytes`/`SpillBytes` model rather than the in-memory
++	// `EntryBytes`, which is ~5x narrower on a 30-column fixed-width build, so
++	// the WIDE shape now prices below the bar on its own and the narrowing is a
++	// margin widening here rather than a flip. Both facts stay asserted: the
++	// historical flip is reconstructed at the pre-Cut-3 byte model, the present
++	// ordering is asserted as it now stands.
++	if got := before.Total + spillChargeAtEntryBytesModel(cp, inputs(30)); got <= 754717 {
++		t.Errorf("before total at the EntryBytes model = %.0f, want above the 754717 bar", got)
++	}
++	if before.Total >= 754717 {
++		t.Errorf("before total = %.0f, want below the 754717 bar under Cut 3's derived model", before.Total)
+ 	}
+ 	if after.Total >= 754717 {
+ 		t.Errorf("after total = %.0f, want below the 754717 bar", after.Total)
+ 	}
++	if after.Total >= before.Total {
++		t.Errorf("narrowed total %.0f not below wide total %.0f", after.Total, before.Total)
++	}
+ }
+ 
+ // ---- P4-01 Slice 3 FIRST CUT: parent-aware joinrel keep-sets ----
+@@ -2197,8 +2218,11 @@ func TestSlice3LiveDeltaModelArithmetic(t *testing.T) {
+ 			numHashClauses: 1, outerCols: 9, innerCols: innerCols,
+ 		}
+ 	}
+-	if got := hashJoinCost(cp, inputs(10)); got.Total < 754717 {
+-		t.Errorf("statement join.hash = %.0f, want at/above the 754717 bar", got.Total)
++	// Spill-cost calibration Cut 3 re-denominated the batch charge to the
++	// on-disk model, so the statement width prices below the bar on its own
++	// now; the historical claim is reconstructed at the pre-Cut-3 byte model.
++	if got := hashJoinCost(cp, inputs(10)).Total + spillChargeAtEntryBytesModel(cp, inputs(10)); got < 754717 {
++		t.Errorf("statement join.hash at the EntryBytes model = %.0f, want at/above the 754717 bar", got)
+ 	}
+ 	if got := hashJoinCost(cp, inputs(7)); got.Total >= 754717 {
+ 		t.Errorf("derived join.hash = %.0f, want below the 754717 bar", got.Total)
+@@ -2207,3 +2231,31 @@ func TestSlice3LiveDeltaModelArithmetic(t *testing.T) {
+ 		t.Errorf("derived total %.0f not below statement total %.0f", narrow.Total, wide.Total)
+ 	}
+ }
++
++
++// spillChargeAtEntryBytesModel reconstructs the EXTRA batch charge
++// `hashJoinCost` carried BEFORE spill-cost calibration Cut 3
++// (`docs/design/planner-spill-cost-calibration/DESIGN.md` §6.2) re-denominated
++// it from the in-memory `hashsize.EntryBytes` to the on-disk
++// `hashsize.SpillBytes` / `SpillInnerBytes` model.
++//
++// It exists so the two P4-01 witness tests keep pinning the historical claim
++// they were written for — the WIDE build priced above the merge bar, the
++// narrowed one below it — now that the wide build prices below the bar on the
++// derived model alone. Both facts stay asserted, and neither is a literal.
++func spillChargeAtEntryBytesModel(cp costParams, in hashJoinInputs) float64 {
++	if hashsize.Choose(in.innerRows, in.innerCols, in.innerAvgVarBytes, cp.workMem).NBatch <= 1 {
++		return 0
++	}
++	pages := func(rows float64, ncols int, avgVar float64) float64 {
++		if !(rows > 0) {
++			return 0
++		}
++		return math.Ceil(rows * hashsize.EntryBytes(ncols, avgVar) / blockSizeBytes)
++	}
++	oldInner := pages(in.innerRows, in.innerCols, in.innerAvgVarBytes)
++	oldOuter := pages(in.outerRows, in.outerCols, in.outerAvgVarBytes)
++	newInner := spillPagesInner(in.innerRows, in.innerCols, in.innerAvgVarBytes)
++	newOuter := spillPagesOuter(in.outerRows, in.outerCols, in.outerAvgVarBytes)
++	return cp.seqPageCost * ((2*oldInner + 2*oldOuter) - (2*newInner + 2*newOuter))
++}
+diff --git a/internal/optimizer/spill_charge_test.go b/internal/optimizer/spill_charge_test.go
+new file mode 100644
+index 000000000..de87fd39c
+--- /dev/null
++++ b/internal/optimizer/spill_charge_test.go
+@@ -0,0 +1,113 @@
++package optimizer
++
++import (
++	"math"
++	"testing"
++
++	"github.com/goopg/goopg/internal/executor/hashsize"
++)
++
++// Spill-cost calibration Cut 3
++// (`docs/design/planner-spill-cost-calibration/DESIGN.md` §6.2): the hash
++// join's batch-file I/O charge is denominated in the ON-DISK byte model that
++// `internal/executor/spill.go` actually writes, not in the IN-MEMORY
++// `hashsize.EntryBytes`.
++//
++// These pin the three properties the design asks for, each through the named
++// model function rather than a literal page count — pinning the literal is
++// what hid an unapplied calibration for a release cycle (memory
++// `goopg_unapplied_calibration_constants`).
++
++// The two sides spill through different writers, so they must be charged
++// through different models: the inner (build) frame carries the canonical
++// hash-table key that E-14 added, the outer frame does not.
++func TestSpillPagesChargesEachSideThroughItsOwnWriterModel(t *testing.T) {
++	const rows, ncols = 500000.0, 8
++	const avgVar = 40.0
++
++	wantInner := math.Ceil(rows * hashsize.SpillInnerBytes(ncols, avgVar) / blockSizeBytes)
++	if got := spillPagesInner(rows, ncols, avgVar); got != wantInner {
++		t.Errorf("spillPagesInner = %v, want %v (hashsize.SpillInnerBytes)", got, wantInner)
++	}
++	wantOuter := math.Ceil(rows * hashsize.SpillBytes(ncols, avgVar) / blockSizeBytes)
++	if got := spillPagesOuter(rows, ncols, avgVar); got != wantOuter {
++		t.Errorf("spillPagesOuter = %v, want %v (hashsize.SpillBytes)", got, wantOuter)
++	}
++	// The keyed inner frame is strictly wider, and it is the drift the
++	// agreement test missed for a day when it pinned only one writer.
++	if !(spillPagesInner(rows, ncols, avgVar) > spillPagesOuter(rows, ncols, avgVar)) {
++		t.Errorf("inner batch pages %v not above outer %v — the keyed frame is unpriced",
++			spillPagesInner(rows, ncols, avgVar), spillPagesOuter(rows, ncols, avgVar))
++	}
++	if spillPagesInner(0, ncols, avgVar) != 0 || spillPagesOuter(-1, ncols, avgVar) != 0 {
++		t.Error("a zero/negative row count must charge nothing")
++	}
++}
++
++// The correction is a RATIO, not a constant: it is near 5x on a narrow
++// fixed-width row (where the 48-byte Datum is almost pure overhead) and near
++// 1x on a wide text row (where payload is carried at par on both sides). That
++// shape-dependence is precisely why Cut 3 is a derived second model and not the
++// scalar multiplier the item originally planned (DESIGN §6.2).
++func TestSpillChargeCorrectionIsShapeDependentNotAConstant(t *testing.T) {
++	ratio := func(ncols int, avgVar float64) float64 {
++		return hashsize.EntryBytes(ncols, avgVar) / hashsize.SpillBytes(ncols, avgVar)
++	}
++	narrow := ratio(9, 0)   // the Q14 phantom build
++	wide := ratio(2, 400.0) // wide text
++	if !(narrow > 4.0) {
++		t.Errorf("narrow fixed-width over-statement = %.2fx, want > 4x", narrow)
++	}
++	if !(wide < 1.5) {
++		t.Errorf("wide text over-statement = %.2fx, want < 1.5x", wide)
++	}
++	if !(narrow/wide > 3.0) {
++		t.Errorf("correction spans only %.2fx across shapes — a scalar multiplier would have sufficed and Cut 3's premise is refuted",
++			narrow/wide)
++	}
++}
++
++// §3.4, the load-bearing invariant: only the I/O CHARGE moves. The spill
++// DECISION stays on `hashsize.Choose`/`EntryBytes`, because that identity with
++// `joinOp.buildGeometry` is what makes `NBatch > 1` mean "the executor will
++// really write files". A calibration that leaked into the byte model would
++// desynchronise cost from executor — the defect the D-05 chain spent five
++// measurements locating.
++func TestCut3DoesNotMoveTheSpillDecision(t *testing.T) {
++	cp := defaultCostParams()
++	cp.workMem = 128 << 20
++
++	// The witness shape: a build whose IN-MEMORY footprint overflows the
++	// budget while its ON-DISK footprint would fit several times over. This is
++	// the case that separates the two models, and it is the case a calibration
++	// applied inside the byte model would have silently de-spilled.
++	const rows, ncols = 242450.0, 30
++	if got := rows * hashsize.EntryBytes(ncols, 0); !(got > float64(cp.workMem)) {
++		t.Fatalf("witness is not a spilling shape in memory: %.0f bytes vs budget %d", got, cp.workMem)
++	}
++	if got := rows * hashsize.SpillInnerBytes(ncols, 0); !(got < float64(cp.workMem)) {
++		t.Fatalf("witness does not separate the models: %.0f on-disk bytes vs budget %d", got, cp.workMem)
++	}
++	if got := hashsize.Choose(rows, ncols, 0, cp.workMem).NBatch; got <= 1 {
++		t.Fatalf("Choose says NBatch = %d — the spill decision followed the on-disk model", got)
++	}
++
++	in := hashJoinInputs{
++		outerRows: 1500000, innerRows: rows, outputRows: rows,
++		numHashClauses: 1, outerCols: 9, innerCols: ncols,
++	}
++	spilled := hashJoinCost(cp, in)
++	// Same shape, one batch: strip the term by fitting the build, and the
++	// difference must be exactly the derived page charge.
++	fitting := in
++	fitting.innerCols = 2
++	if got := hashsize.Choose(fitting.innerRows, fitting.innerCols, 0, cp.workMem).NBatch; got != 1 {
++		t.Fatalf("control shape batches (%d) — pick a narrower one", got)
++	}
++	want := cp.seqPageCost * (2*spillPagesInner(rows, ncols, 0) + 2*spillPagesOuter(1500000, 9, 0))
++	// The control's own CPU terms differ only in the build width, which
++	// hashJoinCost does not read, so the totals differ by the batch term alone.
++	if got := spilled.Total - hashJoinCost(cp, fitting).Total; math.Abs(got-want) > 1 {
++		t.Errorf("batch term = %.0f, want %.0f — the charge is not the derived model", got, want)
++	}
++}

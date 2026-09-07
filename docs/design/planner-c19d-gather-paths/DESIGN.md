@@ -257,6 +257,59 @@ than over a raw scan, and it is the quantitative form of the paragraph above:
 **C-19d cannot pay for itself until C-19f/g shrink what crosses the boundary.**
 The mechanism is what this slice owes; the win is C-19f's to collect.
 
+### 5.1a CORRECTION (2026-09-07): the arithmetic above is goopg's, not PG's
+
+The parenthetical at the end of §5.1 is the whole story, and filing it as an
+aside was the mistake. Promoted:
+
+**§5.1's conclusion is true of goopg and false of PG, and the difference is in
+the SCAN's inputs, not in any parallel term.** `cost_gather`,
+`cost_gather_merge`, `get_parallel_divisor` and `add_path` are faithful
+transcriptions; every one of them is exonerated.
+
+| | charged over | divided by the divisor |
+|---|---|---|
+| PG `cost_seqscan` CPU | `baserel->tuples` — every tuple SCANNED | yes |
+| PG `cost_gather` transfer | `baserel->rows` — the survivors CROSSING | n/a |
+| goopg base-rel scan CPU | the POST-restriction row count | yes |
+| goopg `cost_gather` transfer | the same POST-restriction row count | n/a |
+
+PG's two terms are two different numbers, so a selective scan has a crossover.
+goopg's are one number, so
+
+```
+gather − serial = parallel_setup_cost
+                + (parallel_tuple_cost − per_tuple_cpu × (1 − 1/divisor)) × rows
+```
+
+= `1000 + 0.0906 × rows` at the shipped constants for a one-operator qual —
+**strictly positive at every row count and every selectivity**. There is no
+crossover for a measurement of the `all` mode to find, which is why
+`GOOPG_GATHER_PATHS=all` does not restore the Gather that vanilla PG 18.3 emits
+for `select * from lineitem where l_extendedprice > 90000`.
+
+The sites: `joinsearch.go:440` prices the serial prebuilt base path as
+`costSeqscan(cp, estScanPages(rows, width), rows, 0)` with `rows =
+baseRelInfo.filteredRows`, and `considerparallel.go:567` prices the partial
+twin on the same inputs *on purpose*, so the two stay comparable — the WORKER
+COUNT already reads the real `baseRelPages`, only the COST does not.
+
+Both statements are pinned in `gatherpaths_crossover_test.go`:
+`TestBaseRelGatherCannotWinAtAnySelectivity` drives the production producers and
+requires the loss AND its closed form;
+`TestPGShapedScanInputsRestoreTheGatherCrossover` shows the SAME constants on
+PG's inputs put the crossover at ~3% selectivity.
+
+**Consequence for the sequencing.** §5.1's "no reduction in the subpath's price
+can rescue it" stands, but its stated remedy (C-19f/g shrinking what crosses)
+only rescues joins and aggregates. The non-aggregate root — every root TPC-H
+cannot see, because all 22 of its queries aggregate at the top — needs the scan
+unified onto `rel->pages` / `rel->tuples`. That is a whole-planner
+recalibration (a 0.1%-selective `lineitem` scan goes 161 → 160 946 cost units),
+so it carries its own TPC-H + TPC-DS campaign; ledger row
+`c19-baserel-scan-priced-on-output-rows`, and it is C-19h's remaining
+prerequisite.
+
 Until then the switch is a measurement instrument, which is the same shape
 `GOOPG_INDEX_PROBE_MULT` had before its calibration was run — and that knob's
 history (shipped at the value its own comment called wrong; 1.0→2.0 was worth

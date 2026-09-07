@@ -371,6 +371,16 @@ func memoizeKeyNDistinct(s *searchCtx, innerPath *Path, outerRelids RelSet) (flo
 // It exists so `addNLIPaths` has ONE expression for "what does re-running this
 // inner cost", rather than a conditional at each call site that could be
 // updated in one place and not the other.
+//
+// EX3-03 cut 1 (§2.5 resolution — DOCUMENTED, not threaded): this helper is
+// TEST-ONLY (sole callers: joinpathsmemoize_test.go); production rescan
+// pricing takes an explicit cp via nestLoopInnerRescanCost below. The
+// hard-wired defaultCostParams() here is a latent 1GiB trap: wiring this
+// into a production path would silently reintroduce the planner/executor
+// work_mem disagreement. Either thread cp through it or delete it before
+// any production caller appears — the F7 grep-gate in
+// settings_propagation_test.go fails the build if a fourth production
+// defaultCostParams caller shows up.
 func pathRescanTotal(p *Path) float64 {
 	st, tot := pathRescanCost(p, defaultCostParams())
 	_ = st

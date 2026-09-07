@@ -14,6 +14,39 @@ blockers in one place:
 - `TODO.md` in this directory (minimize_datum — the packed-retention
   bundle; blocked items marked inline)
 
+## Blocker inversion — the tracking instrument for the `[!]` rows (2026-09-07)
+
+**Policy set by the owner 2026-09-07: a `[!]` row is NOT a terminal state.**
+"Blocked" names a blocker, and a blocker is itself a work item. The only
+legitimate terminal states are **done**, or **out of scope on verified
+grounds** (no performance gain / infeasible in goopg's design / severe
+maintainability loss). Writing an excellent blocked row and moving on had
+become a way to close items without doing them — 23 accumulated that way.
+
+Inverting the ledger: those 23 rows collapse to **7 root blockers**. Work the
+blocker, not the bookkeeping — and **re-test whether each blocker is still
+true before treating it as one** (B-17b below was blocked on something that
+had already completed).
+
+| root blocker | holds | status (updated 2026-09-07, later) |
+| :-- | :-- | :-- |
+| **spill-cost calibration** | B-13, B-15, E-16 | **PARTLY RESOLVED.** E-16 `[x]` (`16da44c66`) — its blocker did not reproduce. The instrument is a derived 1.2x-5x ratio, not a multiplier. B-13's arithmetic is now empirical (+24.9% uncalibrated vs -3.0% calibrated at 4 MB); B-15 step 1 discharged (R5 pro-rating collapses a probe 472x). **Cut 3 measured -18.2% and HELD** on Q9's parallel interaction → re-queued behind C-19h. |
+| **C-15 grouping paths** | B-17b | **RESOLVED — the blocker was STALE.** C-15 landed and B-17b needed no engine change (`007765a90`); its decline had been written the same day C-15/C-16 removed its premise. |
+| **the seam drops `Pathkeys`** | C-07 | **RESOLVED** (`007765a90`). Validate-never-translate; forced a latent WRONG-ANSWER fix — `build_join_pathkeys` kept the outer's keys for FULL/RIGHT, which no row-count gate can see. `nrels < 2` survives as its own filed item. |
+| **the parallel dimension stops at the aggregate upper rel** | C-19h | **RE-SCOPED 2026-09-07 by owner decision: goopg does NOT implement its own parallel cost calculation — PG 18.3's is adopted as-is.** D-05 and its chain (D-07, D-08) are therefore OUT OF SCOPE, and D-10/D-11 are re-scoped onto D-06. What remains in scope is **porting PG faithfully**, which is what C-19h needs and is not a goopg cost model: `create_plain_partial_paths`, `generate_useful_gather_paths`, `try_partial_*_path`, `cost_gather`. The concrete defect is unchanged and is a **PG-parity** one — a plain filtered SELECT loses its Gather where vanilla PG 18.3 keeps it, and the census could not see it because every TPC-H query is aggregate-rooted while C-19g's producer is aggregate-only. Do NOT delete `MaybeAddGather` (demotion to a `debug_parallel_query`-gated post-pass is PG-faithful in kind); `splitAggregate` and `sortPartialRootPays` can no longer be deleted at all. |
+| **B-01c *applying* half** | D-06, E-01 | **IN PROGRESS.** Needs both a narrowing-aware upper rewriter (the gap that declined B-01b) and a key-preservation gate. The gate is the load-bearing half: `operators.go:1010-1015` checks ordering explicitly, not membership, so mismatched sort/merge comparators emit out-of-order rows with **no error** — the same silent wrong-answer class C-07 just fixed. |
+| **"the flip moves plans"** | C-06, C-20c, C-20d, C-20e, C-20f, C-20g | **DIAGNOSED 2026-09-07 — and my framing of it was WRONG.** I wrote here that "the search wins a Merge Left Join at 338,223 when a 66,218 Hash path exists in the same run". It does not: the two costs are **not comparable**, because on the OFF arm the join never enters the search at all (the LEFT link pins, the seam peels it, and the plan-tree estimator prices it — charging the hash join 0.25 startup with no build and no inner cost). **The search never had the 66,218 plan.** The real verdict is **mis-generation**: both candidates DO reach `addPath` and the merge genuinely is cheaper among them; the candidate set is short by one, because `jointypeForDirection` declines the commuted direction instead of emitting PG's `JOIN_RIGHT`. Filed as **C-06s**. Does NOT transfer to C-20c/d/e/f/g — each has its own measured movement, none is Q13, none switches a join direction. No flag retired. |
+| **D-04 stopping rule / D chain** | D-07, D-08, D-10, D-11 | **CHAINED TO D-05, cascades automatically.** D-07/D-08 say "unblocks when D-05 does"; D-10/D-11 need one conversion site. No separate dispatch needed. |
+| **remaining, unattacked** | B-17e, E-02, E-12, E-14 | B-17e on C-20 single-planner deletion; E-02 on B-16 + EX1 exit; E-12 on E-14; E-14 Cut A DROPPED on measurement (0.0065%), Cut B quantified and still blocked. |
+
+**Scoreboard for the inversion exercise:** of the seven root blockers, **four
+are resolved in one day** and **three of those turned out to be stale or
+non-reproducing** — B-17b's premise had been removed by a sibling item the same
+day it was declined, E-16's regression was a property of a tree that no longer
+exists, and C-19h's stated blocker was not the real one. That is the argument
+for the policy: a `[!]` row records what was true when it was written, and
+nobody re-checks it.
+
 **One checkbox ≈ one commit.** An item that would move two planner inputs
 (or two executor inputs) at once is split before it is started (take3 08
 §1 P5 / 13 §1 EX-P3).
@@ -433,6 +466,23 @@ are EPICS — split into one-checkbox-per-commit items before starting
   single multiplier would fit the difference between two errors. Four
   separately-gated cuts, three probes, negative outcomes written in
   advance.
+  **Re-measured 2026-09-07 with both prerequisites in hand** (E-16 landed
+  `16da44c66`; Cut 3 built and measured). STILL FAILS B2, but empirically
+  now rather than by prediction. At clone `work_mem = 4MB` (the proxy for a
+  4MB BootVal), shipped planner defaults, TPC-H SF=1: WITHOUT the
+  calibration TOTAL **+24.9%** (140.02 → 174.84 s) with nine queries over
+  1.2× — Q14 **+2750%** (0.58 → 16.53 s), Q10 +241%, Q7 +194%, Q8 +174%,
+  Q3 +162%. WITH Cut 3 TOTAL **−3.0%** (135.85 s): the calibration recovers
+  −22.3% of the 4MB suite, so PG's real default costs the suite total
+  nothing once the spill charge is honest (Q14 16.53 → 0.91, Q10 9.62 →
+  3.00, Q3 8.41 → 4.40, Q7 16.36 → 9.50). Values 24/24 MATCH in all three
+  arms. The row's own re-probe trigger IS satisfied — Q9 keeps hash+Gather
+  at 4MB. Residual B2 failures at 4MB+Cut3, vs the 64MB baseline: Q2
+  +72.8%, Q3 +37.1%, Q7 +70.9%, Q8 +207.3%, Q9 +73.3%, Q14 +56.9%, Q16
+  +61.9%. So the prerequisite is confirmed as the right instrument and is
+  no longer the only thing in the way. Resume: land Cut 3 (itself blocked
+  on the parallel keystone, ledger `spill-cut3-deferred`), then re-run the
+  4MB arm against those seven. Ledger `take3-B-13-deferred-2`.
 - [x] **B-14 P2-09a ScalarArrayOp index path.** Landed 2026-09-05:
   InExpr→clause arm (useOr-only, left indexkey, const array, opfamily)
   in the rule-based producers + post-search rewrite; `IndexScan.SAOPKeys`
@@ -471,6 +521,25 @@ are EPICS — split into one-checkbox-per-commit items before starting
   separately-gated cuts, three probes, negative outcomes written in
   advance.
   *design: take3 08 §5.2; gate: take3 09 §5 P2 + TOTAL arm.*
+  **Resume step 1 DISCHARGED 2026-09-07; steps 2–4 still blocked.** The
+  batch ports onto today's tip with only TWO conflicts, both mechanical
+  (C-19c split `btreeIndexAMCost` into a `…Pages` variant; C-20d turned a
+  cost literal into `indexProbeMultCalibrated*480.0+15.25` — keep the
+  EXPRESSION, the patch's `495.275` literal is precisely the stale-literal
+  hazard). Ported, builds green; two expected-value tests then fail
+  (975.275 vs 975.25; 32.785 vs 36.785) and are the batch's own remaining
+  work. The filed hypothesis is **confirmed quantitatively**: R5's
+  index-side ML pro-rating collapses a parameterised probe's per-scan total
+  **472×** across the loop range — 4817.18 at loopCount 1, 4685.98 at 10,
+  824.42 at 1e3, 18.78 at 1e5, **10.21 at 933 000** (Q14's outer). The
+  missing counterweight, goopg's deliberately-zero heap qpqual term
+  (`buildInitialRels` numQualOps=0), would be worth ≈6.0 cost units per
+  probe there: ~0.1% of the price at loopCount 1 and ~60% of it at 933 000
+  — a bias that GROWS with loop count, which is exactly the NL-flip
+  signature the batch showed. Step 2 (calibrate the heap per-tuple term
+  and/or `indexProbeCostMultiplier`) still needs the spill calibration
+  landed first per this item's own ordering. Ledger
+  `take3-B-15-blocked-2`.
 - [x] **B-16 P2-11b MCV-frequency half.** Landed 2026-09-05: MCV scale
   (`mcv/avgfreq` iff hotter than average) + [1e-6,1] clamp +
   default-ndistinct `Max(0.1,mcv)` decision; nbuckets cap explicitly
@@ -485,10 +554,34 @@ are EPICS — split into one-checkbox-per-commit items before starting
   exists by design (executor materialises unconditionally).
   *design: take3 08 §5.4; gate: GUC-effect test
   `TestEnableSortSetsDisabledNodesOnSortPath`.*
-- [!] **B-17b `disabled_nodes` agg-hashed/mixed setters** (take3 02 §1.2)
-  — BLOCKED on C-15 (P4-06 grouping paths). DECLINED 2026-09-05: no grouping paths exist (P4-06 open), no path to
-  carry the count; `enable_hashagg` stays rule-based. Unblocks when P4-06
-  lands grouping paths. Ledger `take3-B-17b-blocked`.
+- [x] **B-17b `disabled_nodes` agg-hashed/mixed setters** (take3 02 §1.2).
+  UNBLOCKED and CLOSED 2026-09-07. The 2026-09-05 decline ("no grouping
+  paths exist, no path to carry the count; `enable_hashagg` stays
+  rule-based") was written the same day C-15/C-16 removed its premise, and
+  was stale on arrival: `createGroupingPaths` and `createDistinctPaths` both
+  build the hashed candidate with
+  `DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed)`, and
+  `applyEnableHashAggRule` — the outcome-forcing rule the item existed to
+  retire — is gone (`groupagg_hashagg.go` keeps only the GUC seed). So
+  `enable_hashagg` is a path-carried count adjudicated by
+  `comparePathCostsFuzzily`, exactly as `cost_agg` (costsize.c:2682) does it,
+  not a rule.
+  What this cut adds is the two pins that were missing, both of which fail
+  SILENTLY if broken (one candidate per shape means a wrong count changes no
+  winner and no row count — only an EXPLAIN `Disabled:` line PG does not
+  print): `TestCreateGroupingPathsPlainArmDoesNotCountEnableHashAgg` (PG's
+  `AGG_PLAIN` branch never touches the counter, and goopg's ungrouped
+  candidate is priced through the hashed arm, so the natural mistake is to
+  stamp it) and `TestCreateGroupingPathsGroupingSetsCountEnableHashAgg`.
+  **MIXED is satisfied by proof, not by a second setter.** goopg has no
+  `AGG_MIXED`: `AggStrategy` is Hashed|Sorted and `groupingsets.go` runs
+  every set through one hash table per set, so the grouping-sets shape IS
+  the hashed arm and takes the hashed count. The second test is what makes
+  that proof falsifiable if a sorted grouping-sets strategy is ever added.
+  Not touched: `partialaggpaths.go` (C-19g's knob-gated tournament, inert
+  under the default knob and owned by a live peer slice) — filed as
+  `take3-B-17b-partial-agg-count`.
+  Ledger `take3-B-17b-blocked` CLOSED.
 - [x] **B-17c `disabled_nodes` gather-merge setter** (take3 02 §1.2).
   Landed 2026-09-05 as opt-out `DisableGatherMerge` (zero value keeps the
   merge arm; `EnableGatherMerge` default-false would have killed
@@ -735,8 +828,24 @@ rule).*
   premise is also unmet: the collapse=0 regime is fully alive after C-04c
   and untouched by it. Real blocker, named in ledger
   `c06-collapse-flip-moves-q13`: why the search wins a Merge Left Join at 5x
-  the cost. Resume when that is answered — retiring the flag is downstream
-  of it, not a prerequisite.
+  the cost. **ANSWERED 2026-09-07 (`cd9218645`), diagnosis
+  `analysis/planner-refactor-take3/c06-q13-diagnosis-20260907/README.md`:
+  MIS-GENERATION, not mis-costing and not a discard.** `DPPATH` shows both a
+  hash and a merge path generated and compared for `{customer,orders}`, and the
+  merge really is cheaper (316 090 vs 336 448) — because the only hash the
+  search may price must build the 1.5 M-row `orders` side, whose spill is 59% of
+  its cost. `jointypeForDirection` (joinpaths.go:155) DECLINES the commuted
+  direction rather than emitting PG's `JOIN_RIGHT`; its own comment justifies
+  that with "nothing selects these paths today in any case", which C-04a/C-04b
+  expired by letting a two-table LEFT JOIN into the search. A throwaway probe
+  admitting the direction prices `join.hash jointype=right` at **124 999**
+  (2.53x under the merge join), emits PG's exact `Hash Right Join` shape, gives
+  byte-identical results, and runs 4.4 s against 6.1 s. Also corrected:
+  **66 218 and 338 223 are not comparable** — on the OFF arm the join never
+  enters the search (`DPTRACE problem nrels=1`), so 66 218 is the plan-tree
+  estimator's price, and that estimator charges the hash join 0.25 startup and
+  prices `orders` at 29 998 where the search says 97 273. Successor row
+  **C-06s**. The flag still STAYS: nothing here makes the flip plan-neutral.
   *design: take3 08 §6.3; gate: take3 09 §5 P3.*
   **BLOCKED ON ITS OWN GATE, measured 2026-09-07 after C-04c.** The gate
   is "byte-identical plans for the flip" and the flip is NOT byte-
@@ -762,9 +871,30 @@ rule).*
   re-run this one-command measurement — two `estimate-audit -plan-only`
   captures on the same cluster, one per flag value — and delete the flag
   when they come back identical. Ledger `c06-collapse-flip-moves-q13`.
-- [~] **C-07 P3-06 — DERIVATION + GATE LANDED 2026-09-05; the "motivate
-  index paths" half is BLOCKED on C-11/C-12.**
-  Landed: `chooseQueryPathkeys` reproduces `standard_qp_callback`'s
+- [ ] **C-06s — offer the COMMUTED direction of a LEFT join to the search
+  (PG's `JOIN_RIGHT`).** C-06's diagnosis, filed rather than landed because it
+  is not small. `jointypeForDirection` returns `(sjinfo.Jointype, false)` for
+  the reversed containment; PG's `populate_joinrel_with_paths`
+  (joinrels.c:932-939) returns `JOIN_RIGHT` there and `add_paths_to_joinrel`
+  builds hash and merge paths for it. Scope: **LEFT only, fail-closed** — SEMI
+  and ANTI must keep declining (`JOIN_RIGHT_SEMI`/`JOIN_RIGHT_ANTI` have no
+  goopg executor), FULL likewise. The probe shows the relaxation admits a
+  FAMILY (`join.hash` and `mergejoin` both gain `jointype=right` arms), which is
+  the two-spellings-of-one-join coupling C-03b deliberately withheld so C-04
+  would not have to prove both directions at once — that is the whole reason
+  this is an item and not a patch. Evidence in hand: PG-shape parity on Q13
+  (`Hash Right Join`, PG cost 56 164 / goopg 124 999 against a merge at
+  316 090), values byte-identical to the current plan on the SF=1 cluster, and
+  4.36/4.52 s against 6.06/6.64 s. `createPlanNode` already has the arm.
+  Gate: units + `go vet`; TPC-H 24/24 **by values** plus a timed pass on every
+  query whose plan moved; TPC-DS SF0.5 PASS=95 all-zero; `plan_snapshots/`
+  re-pin (this WILL move plans — coordinate, do not re-pin under a peer).
+  Closing this is C-06's precondition, not the other way round.
+  *diagnosis: `analysis/planner-refactor-take3/c06-q13-diagnosis-20260907/README.md`;
+  ledger `c06-commuted-leftjoin-direction-withheld`.*
+- [x] **C-07 P3-06 — BOTH HALVES LANDED (derivation + gate 2026-09-05, seam
+  + widening 2026-09-07).**
+  Landed 2026-09-05: `chooseQueryPathkeys` reproduces `standard_qp_callback`'s
   precedence exactly (group ?: window ?: longer(distinct, sort) ?: setop),
   derived against the FROM-level resolve context so the pathkeys carry the
   same `Index`/`SourceTableIdx` the search's clause operands do — without
@@ -774,27 +904,87 @@ rule).*
   complete and PER-REL, as upstream's is; upstream's three arms reduce to
   two by PROOF (group non-empty implies query non-empty via the
   precedence's first case), not by simplification.
-  **Not landed, with evidence:** widening the useful-column set so ORDER BY
-  / GROUP BY motivate index paths. Nothing selects a path for its ordering
-  — `finalPath()` is cost-only, `planJoinlistSearch` DROPS the chosen
-  path's `Pathkeys` at the seam, and the ORDER BY `Sort` is wrapped
-  unconditionally far above it in a different coordinate space. An
-  ordering-only index path could therefore only lose on cost, win
-  `CheapestStartup` under a LIMIT while a redundant Sort still runs, or
-  silently disable `applyIndexOrderedGroupingRule`. That is unmotivated
-  plan churn, so it was not forced. The consumer is C-11 (`ORDERED` upper
-  rel) + C-12 (real upper-rel `PathSort`); once either exists the widening
-  is a map union at one line.
-  Gates: 6 new test groups incl. a DECISION test
-  (`TestAddOrderedIndexPathsGateIsCompleteButGenerationIsNot`) that pins
-  the gate saying yes while the producer emits nothing, and names C-11/C-12
-  as the item that flips it red-to-green; optimizer suite; TPC-H values
-  24/24 MATCH; plans BYTE-IDENTICAL; plan-gate PASS.
+  **Landed 2026-09-07 — the "motivate index paths" half, and the blocker
+  under it.** The 2026-09-05 note recorded the widening as "a map union at
+  one line" waiting on C-11/C-12. Both landed and it still could not work,
+  and the re-measurement named why precisely: the widening DOES add an
+  `index.ordered` path (useful set `[w]` -> `[w x]`, pathlist 1 -> 2) and NO
+  plan moved, because `planJoinlistSearch` returns a **Node**, C-12's only
+  Node->Path bridge `newPrebuiltPath` leaves `Pathkeys` **nil**, and
+  `pathkeysContainedIn(nil, keys)` is false for every non-empty request — so
+  `createOrderedPaths` could only ever take its Sort arm. C-12's own file
+  header admitted it: "the `upper.ordered.input` producer below never fires
+  today".
+  So this cut is TWO things, and the widening alone would have been inert:
+  1. **The seam carries ordering** (`upperorderedinput.go`). The winning
+     path's pathkeys are stamped on the published search root — on the
+     existing `searchedTree` tag, which is already attached to exactly the
+     node kinds a search root can be, rather than threaded through fifteen
+     signatures — and `createOrderedPaths` derives its seed's `Pathkeys`
+     from the finished input Node. Two rules keep it off the coordinate
+     rocks this workstream has hit twice, and NEITHER translates:
+     **validate, never translate** — at the boundary each key must name the
+     column it claims at the coordinate it claims in the schema the root
+     PUBLISHES, and the first failure TRUNCATES (a prefix is always a sound
+     ordering claim; the degenerate answer is the pre-C-07 behaviour
+     exactly); and **descend only through schema-identical wrappers** —
+     the Node walk steps through `*Filter`/`*Limit` only, re-checking the
+     schema at every step, and refuses `*Project` even when its output
+     happens to agree, because a Project is where coordinates are
+     re-assigned. A wrong ordering claim would need a node to lie about its
+     own output schema.
+  2. **The widening** (`addQueryPathkeyColumnExprs`), the union of
+     `pathkeys_useful_for_ordering` into the useful-column map
+     `buildIndexPathkeys` consults. Rel membership is by `SourceTableIdx`,
+     NOT by reading the rel's leaf schema — measured, and the reason is a
+     fixture trap: `ppiCtx` sets `baseLeaf = &SeqScan{Table: inner}` with a
+     NIL schema, so a membership filter reading `baseLeaf.Output()` is
+     invisible to the ENTIRE optimizer suite (it passed identically with the
+     widening applied and absent). A rel with no recorded identity adds
+     nothing rather than falling back to name-only matching, which would
+     hand one self-join sibling's ordering to the other.
+  **Both marker tests INVERTED rather than deleted, which was their stated
+  purpose**, and the 2026-09-07 re-adjudication had named the flipping item
+  precisely — "a search boundary that publishes the chosen PATH (or at least
+  its `Pathkeys`) instead of a bare Node". At the producer,
+  `TestAddOrderedIndexPathsGateIsCompleteButGenerationStaysShut` becomes
+  `TestAddOrderedIndexPathsOrderingArmGeneratesSinceTheSeamCarriesPathkeys`.
+  At the consumer, `TestCreateOrderedPathsInputArmIsUnreachableFromANode`
+  becomes `...IsReachableFromANode`: it keeps its strongest-form shape —
+  hand `createOrderedPaths` a child that is ALREADY in the requested order —
+  and the redundant second Sort it used to assert is gone. Its last
+  assertion is deliberately UNCHANGED and still holds: `newPrebuiltPath`
+  still carries no ordering. The fix was NOT to teach the C0 bridge about
+  pathkeys — its other callers (distinct, grouping, partial-agg,
+  window/setop) hand it inputs that deliver none and must not be made to
+  claim one — so the derivation lives at the one seam that has an ORDER BY
+  to compare against.
+  The ORDERED input arm is additionally asserted END TO END through
+  `PlanWithSettings`, not only with a hand-built seed: the fixture trap above
+  is why. The paired case is the test — the same join shape asking for the
+  merge key loses its Sort, asking for a different column keeps it — so a
+  careless pathkey fails as a plan-shape assertion instead of as a wrong
+  answer.
+  **Third change, forced by the first:** `build_join_pathkeys`' FULL/RIGHT
+  rule (pathkeys.c:1295). A FULL or RIGHT merge join injects its unmatched
+  inner rows wherever the merge reaches them, not where the outer ordering
+  would put them, so PG returns NIL; goopg kept the outer's keys for every
+  join type. Harmless while a merge path's pathkeys were read only inside
+  the search (a wrong cost at worst); a WRONG ANSWER once the ordering can
+  delete the ORDER BY Sort — rows out of order with a correct row count,
+  which no row-count gate can see.
+  **Second blocker, NOT fixed and not forgotten.** `addOrderedIndexPaths`
+  runs only inside the PG-shaped join search, and `tryPGShapedJoinSearch`
+  declines at `nrels < 2` (joinsearchseam.go:228), so `SELECT ... FROM t
+  ORDER BY t.pk` — the canonical single-relation shape the widening serves —
+  never reaches the producer at all. That decline is a SIZE gate on the
+  search and predates C-07: nothing in this item can open it, and forcing it
+  open would route every single-table statement through the search boundary.
+  Ledger `c07-single-rel-never-reaches-ordered-index-producer`.
   Known divergence recorded: group/sort matching is on the written
   expression after alias substitution, not PG's `tleSortGroupRef` identity,
   so `GROUP BY t.a ORDER BY a` misses the match and falls back to ASC —
   the safe direction, since a wrong-direction claim would be worse.
-  Original scope note follows.
   **C-07 (original).** (`query_pathkeys =
   group ?: window ?: longer(distinct, sort) ?: setop`) + complete
   `has_useful_pathkeys` so ORDER BY / GROUP BY motivate index paths.
@@ -830,7 +1020,31 @@ rule).*
   is negative and removes a checkbox rather than adding one. Analysis
   artifact: `analysis/planner-refactor-take3/c10-p400-scoping-20260905/README.md`.
   *design: take3 08 §7; gate: scoped items filed (take3 09 §9 reporting).*
-- [~] **C-10a P4-00a grouping-sets scope + `dNumGroups` fix — CARDINALITY
+- [x] **C-10a P4-00a grouping-sets scope + `dNumGroups` fix — CLOSED
+  2026-09-07; the last condition is discharged by measurement.** Decision
+  2 pinned grouping sets to AGG_HASHED *conditional on an unrun SF=1
+  memory measurement of Q22/Q67*. It has now run, on the TPC-DS SF=1
+  cluster (port 65436) under a cgroup cap, with per-session ANALYZE (goopg
+  statistics are per-connection) and `GOOPG_ANALYZE_SEED=20260905`:
+
+  | query | grouping-sets node | hash memory | batches | result |
+  |---|---|---:|---:|---|
+  | Q22 | `HashAggregate (4 keys, 5 grouping sets)` | **24.3 MB** | **1** | completes, 24.95 s |
+  | Q67 | `HashAggregate (8 keys, 9 grouping sets)` | **6.6 MB** | **1** | completes, 26.01 s |
+
+  **`Batches: 1` on every hash table in both plans — nothing spilled**, and
+  the largest grouping-sets hash in the pair is 24 MB. The pin's risk was
+  that hashing every grouping set would exhaust memory where PG's
+  MixedAggregate/GroupAggregate would not; at SF=1 on the two queries the
+  decision named, it does not come close. **The pin stands, now on
+  evidence rather than on a promise.** (Peak server RSS was 5.95 / 6.79 GB,
+  but that is whole-server including a 2 GB buffer pool and is not the
+  figure the decision turns on — the aggregate's own memory is.)
+  Measurement run late and deliberately: it was held earlier in the day
+  while four peer agents held benchmark servers with 12 GB in swap, since
+  a memory measurement taken under memory contention answers a different
+  question.
+  ORIGINAL ROW FOLLOWS. CARDINALITY
   HALF LANDED 2026-09-05.** `estimateAggregate` now SUMS
   `estimateNumGroups` over the grouping sets instead of estimating
   `GroupExprs` (the deduplicated union) once, which is what PG accumulates
@@ -1145,7 +1359,8 @@ rule).*
   ck-verified), TOTAL +2.5% (within ±17%), cost-normalized TPC-DS plans
   byte-identical (shape changed=0). Re-pinned in-commit:
   `plan_snapshots/c12-ordered-sort-20260906.txt`. C-12a (second candidate
-  via C-07 widening) explicitly NOT flipped — filed as the next cut.
+  via C-07 widening) explicitly NOT flipped at the time — flipped
+  2026-09-07 by C-07's seam half; see that row.
 - [x] **C-13 P4-04 bounded / top-N sort** (`cost_sort`'s `limit_tuples`
   arm) — the largest recorded `ORDER BY … LIMIT` win. DESIGNED 2026-09-06:
   `docs/design/planner-p4-upper-rels/DESIGN.md` §6 — **RE-SCOPE into two
@@ -1751,6 +1966,100 @@ rule).*
   transaction; and (b) `debug_parallel_query`, which the upper-rel
   producer does not read, so a forced-parallel regress arm still needs the
   post-pass or an equivalent path-model gate.
+  **STILL BLOCKED, on a THIRD blocker measured 2026-09-07 by an actual
+  retirement probe** (evidence and probe patch:
+  `analysis/planner-refactor-take3/c19h-census-rerun-20260907/`; design §7).
+  The census above was re-run with the ADD half really deleted rather than
+  stood down — `findPartialSubtree`, `partialTarget`, `rebuildWithGather`,
+  `terminatesPartial` gone, the enforcement half kept and renamed
+  `EnforceParallelPermission`, both `dispatch.go` call sites updated,
+  `go build ./...` clean — and it passes by a STRONGER test than the count:
+  `diff` of the two 22-query captures is **EMPTY**, all 22 plans
+  byte-identical, costs included. Blockers 1 and 3 are discharged.
+  **And that is why the census was the wrong instrument.** All 22 TPC-H
+  queries carry an aggregate at the top and C-19g's producer is
+  aggregate-only, so the capture is blind to every plan whose top node is
+  not an aggregate. Probed directly on the same clone:
+  `select * from lineitem where l_extendedprice > 90000` goes from
+  `Gather (Workers Planned: 4) -> Parallel Seq Scan` to a bare `Seq Scan`
+  when the post-pass is deleted, and **vanilla PG 18.3 on :65432 emits the
+  Gather** — so the deletion is a PG-PARITY REGRESSION, not a cleanup.
+  **The prerequisite is NOT the `GOOPG_GATHER_PATHS` default flip.**
+  Measured: at `GOOPG_GATHER_PATHS=all` the retired build STILL emits the
+  bare `Seq Scan`, because the path model declines a plain base-rel Gather
+  on cost for the reason C-19d DESIGN §5.1 gives — `parallel_tuple_cost`
+  0.1/row against a 4-worker `cpu_tuple_cost` saving of ≈0.0075/row, which
+  `add_path` correctly dominates at any relation size. The prerequisite is
+  that CROSSOVER, i.e. a partial path for the top rel that makes a plain
+  Gather winnable; flipping C-19d's knob does not supply it.
+  Requirement (b) is now measured too, and it argues for a DIFFERENT SHAPE
+  than deletion: PG implements `debug_parallel_query` as a post-planning
+  Gather wrap in `standard_planner`
+  (`postgres/src/backend/optimizer/plan/planner.c:465-495`), so a
+  `debug_parallel_query`-gated post-pass is PG-FAITHFUL IN KIND and is what
+  a conditional retirement should become. Deleting it instead leaves the
+  GUC fully unconsumed (`computeParallelWorkers` is its only planner
+  consumer and is reachable only from the deleted `findPartialSubtree`;
+  `considerparallel.go` sizes with `computeParallelWorkerForRel`, which
+  does not read it) and removes the only forced-parallel construction path
+  for 68 call sites in 14 test files covering the executor's parallel
+  operators. Requirement (a) is not at issue: `StripGather` survived the
+  probe intact and is what the enforcement half is made of.
+  Double-Gather verification re-done on all three arms: exactly 1 per query,
+  none nested. `subtreeHasGather` untouched, and it keeps a live second
+  caller at `partialaggupper.go:92`.
+  The blocker is pinned as a test, not left in prose:
+  `TestPostPassOwnsTheNonAggregateGather` (`internal/optimizer/parallel_test.go`).
+  Sequencing now: make a plain base-rel Gather winnable in the path model
+  (C-19d's crossover) → re-probe the non-aggregate cohort against PG → then
+  either delete, or demote the pass to a `debug_parallel_query`-only force
+  pass, which is the PG-faithful end state.
+
+  **THIRD survivor, found 2026-09-07, and it is the load-bearing one: the
+  NON-AGGREGATE root.** The 22-query census above is blind to it — all 22
+  TPC-H queries carry an aggregate at the top, so it measures exactly the
+  one root C-19g's producer serves. Probed directly:
+  `select * from lineitem where l_extendedprice > 90000` gets
+  `Gather -> Parallel Seq Scan` from vanilla PG 18.3 and from goopg's
+  post-pass, and a bare `Seq Scan` from goopg once the post-pass stands
+  down — with `GOOPG_GATHER_PATHS=all`, which does NOT rescue it.
+  **Diagnosed to the mechanism, and it is a PG-PARITY defect in the SCAN's
+  cost inputs, not in any parallel term.** `cost_gather`,
+  `cost_gather_merge`, `get_parallel_divisor` and `add_path` are all
+  faithful transcriptions and all exonerated. PG's `cost_seqscan` charges
+  `(cpu_tuple_cost + qual) × baserel->tuples` — every tuple SCANNED, and
+  that is the term the divisor divides — while `cost_gather` charges
+  `parallel_tuple_cost × baserel->rows`, only the survivors CROSSING the
+  boundary; two different numbers, so a selective scan has a crossover.
+  goopg prices the base-rel scan on the POST-restriction row count for
+  BOTH terms and on a page count derived from that same number
+  (`joinsearch.go:440` `costSeqscan(cp, estScanPages(rows, width), rows, 0)`
+  for the serial prebuilt path; `considerparallel.go:567`
+  `estScanPages(rel.Rows, rel.Width)` for the partial twin, deliberately
+  priced on the serial one's inputs so the two stay comparable). Scanned ==
+  crossed, so
+
+      gather − serial = parallel_setup_cost
+                      + (parallel_tuple_cost
+                         − per_tuple_cpu × (1 − 1/divisor)) × rows
+
+  = 1000 + 0.0906 × rows at the shipped constants — **strictly positive at
+  every row count and every selectivity. There is no crossover to find, so
+  no measurement of the `all` mode can find one.** Pinned both ways by
+  `TestBaseRelGatherCannotWinAtAnySelectivity` (the defect, through the
+  production producers, with the closed form) and
+  `TestPGShapedScanInputsRestoreTheGatherCrossover` (the SAME constants on
+  PG's inputs put the crossover at ~3% selectivity, where PG's is).
+  This also **corrects C-19d DESIGN §5.1** and `joinpathsparallel.go`'s
+  header, both of which state the 0.1-vs-0.0075 arithmetic as a general
+  fact and infer that "PG escapes that arithmetic by putting the join below
+  the Gather". PG does put joins below the Gather, but that is not why its
+  base-rel Gather wins — PG's wins on its own.
+  **Prerequisite, now named:** unify the base-rel scan onto `rel->pages` /
+  `rel->tuples` (ledger `c19-baserel-scan-priced-on-output-rows`). It is a
+  whole-planner recalibration, not a parallel change — a 0.1%-selective
+  `lineitem` scan goes 161 → 160 946 cost units — so it carries its own
+  TPC-H + TPC-DS campaign and cannot ride C-19h's.
   *design: take3 08 §8; gate: take3 09 §5 P5 — plan-parity both suites,
   parallel and serial arms.*
   (Serial control arm unchanged throughout C-19a–h. Ordering trap already
@@ -1953,6 +2262,22 @@ rule).*
   Captures are serial (`-serial` defaults true) and therefore blind to a
   parallelism-only plan change (ledger `take3-plan-capture-is-serial-only`).
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
+  **OWNER DECISION 2026-09-07 — the hatch STAYS; C-20f is closed as
+  blocked, not deferred.** The adjudicating agent correctly escalated a
+  real asymmetry rather than deciding it: unlike C-06, here the LOSING arm
+  is the flag's own off path, so retiring the hatch would change no plan
+  production reaches, which makes deletion defensible as a deliberate
+  *exception* to the stated gate rather than a pass of it. Deciding
+  against deletion, for three reasons. (1) The gate as written fails —
+  11.4x is not "byte-identical", and an exception granted once is a
+  precedent the remaining flag-retirement items inherit. (2) Deletion is
+  irreversible and the hatch is a branch, not a maintenance burden of the
+  P6-03/P6-04 kind, so the asymmetry of the mistake runs strongly one way.
+  (3) The hatch's value is precisely "escape if the cost gate misfires on
+  data we have not seen", and we have no evidence about data we have not
+  seen — the 11.4x measured here says the gate is right on THIS corpus,
+  which is not the same claim. Reopen only with a maintenance cost
+  attached to keeping it.
 - [!] **C-20g P6-06e retire `GOOPG_PGSHAPED_DP` last — BLOCKED 2026-09-07,
   re-verified on the current tree rather than inherited. Nothing deleted.**
   The item's own text was checked against the post-C-04c tree (C-04c
@@ -1986,6 +2311,34 @@ rule).*
   spanning `plan.go`, the parser binder, the whole optimizer and the
   executor's expression evaluator, which no TODO_ALL row currently
   carries. Caching is planning-speed, not plan-quality.
+  **P6-08 LANDED 2026-09-07; P6-07 steps (i)–(iv) DEFERRED,
+  ledger `take3-C-20h-var-migration`.** Three `restrictInfo` memos, all
+  of them PG's own: `norm_selec` on `joinClauseSelectivityExt`, the
+  operand resolution behind `left_relids`/`right_relids` on
+  `joinKeyPairOf`, and `MergeScanSelCache` (upstream `cached_scansel`)
+  on `mergeJoinScanSel` — the last one is where the time was, and the
+  profile said so rather than the guess: `histCmp` under
+  `mergejoinscansel` was 43.7% of planning CPU. SEMI/ANTI selectivity is
+  deliberately NOT memoised (it is a function of the (outer, inner)
+  split, which is why upstream keeps a second field, `outer_selec`).
+  Measured on the SF=1 cluster (private clone, warm stats,
+  `GOOPG_ANALYZE_SEED=20260905`, 3 servers × 3 reps per arm): TPC-H
+  EXPLAIN wall time **73.13 ms → 62.83 ms (−14.1%)**, Q9 −52%, Q21 −34%,
+  Q18 −26%, Q5 −23%, Q2 −22%; in-process over a statistics-bearing
+  catalog (5 interleaved pairs) 37.84 ms → 27.18 ms per 22-query
+  planning pass (−28%). **Plans byte-identical**: all six cost-visible
+  EXPLAIN captures share one md5 (`373aed0c…`). Gates: units 44/44,
+  `go vet`, TPC-H digest **24/24 MATCH on values**, TPC-DS SF0.5 sweep.
+  Cold-vs-warm equality of each memo is pinned by
+  `joinrestrict_cache_test.go` (each assertion mutation-checked).
+  P6-07 step 0 only: `RelOptInfo` embeds a value
+  `rangeTblEntry{baseLeaf, baseOffset}` — C-20b's recommended shape,
+  every existing read preserved through field promotion. The `Var`
+  migration is 102 `ColumnRef{` sites + 237 `SourceTableIdx` references
+  outside tests; steps (i) and (ii) are one commit or none, since an
+  `attno` populated at some producers and read by none is scaffolding
+  later readers would trust. Nothing was deleted from
+  `createplanroot.go` or `rangetable.go` — they remain the detector.
   *design: take3 08 §9; gate: take3 09 §5 P6 (P6-08: planning-time
   comparison, plans byte-identical).*
   P6-03/04/05 stay **must-not-delete** (measured 6.5× / 12.5× /
@@ -2158,7 +2511,21 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   row) before ~900 LOC is sunk.
   *design: 05 §6; gate: values-diff only (the code does not land); not a
   commit to `master`.*
-- [!] **D-05 MD-04 hash join — BLOCKED ON C-19 (Phase 5 parallel costing),
+- [-] **D-05 MD-04 hash join — OUT OF SCOPE 2026-09-07 — owner decision: **goopg does not implement its own
+  parallel cost calculation; PG 18.3's is adopted as-is.** This item's
+  unblocking condition was that goopg's cost model grow a parallel dimension
+  of its own so a search could prefer a plan *because* it will parallelise.
+  That is exactly the goopg-original cost modelling the owner has ruled out,
+  so the item is dropped rather than left blocked on a prerequisite that will
+  never be built. What stays in scope is PORTING PG's model faithfully
+  (`create_plain_partial_paths`, `generate_useful_gather_paths`,
+  `try_partial_*_path`, `cost_gather`) — that is PG-parity work, not a goopg
+  cost model, and C-19h still needs it.
+  Preserved for the record, not for resumption: the five successive measurements that
+  located the defect remain the best evidence in the tree that three
+  individually-correct cost corrections (entry width, bucket charge, build
+  cost) can each fail on one shared mechanism. ORIGINAL ROW FOLLOWS.
+  BLOCKED ON C-19 (Phase 5 parallel costing),
   established by five successive measurements 2026-09-05/06.** Summary
   before the detail: packing (D-04) left batches unchanged; fixing the entry
   width was correct and inert; an honest bucket size halved bucket heap but
@@ -2298,6 +2665,39 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   dense byte arena plus an allocation-free encoder, since packing every
   build row while deforming only matches costs +39% allocations.
   Original blocker text follows.
+  **RE-TESTED 2026-09-07 after C-19g landed, and the blocker STILL BINDS —
+  with its mechanism narrowed** (evidence
+  `analysis/planner-refactor-take3/c19h-census-rerun-20260907/` §5).
+  The hypothesis was that with the Gather produced by a PATH rather than by
+  the `MaybeAddGather` post-pass, a cost change that previously destroyed it
+  might no longer do so. It does. C-19g moved the aggregate Gather's
+  PRODUCER into the search but not its ELIGIBILITY PREDICATE, which is still
+  the same `drivingScan` with the same `hashJoinIsPartialCapable` /
+  `JoinAlgoHash` requirement (`partialaggupper.go:92` calls it). Measured at
+  the engine defaults on a private SF=1 clone, with `partialaggupper` live:
+
+  ```
+  select l_returnflag, sum(l_extendedprice) from lineitem
+    join orders on l_orderkey = o_orderkey
+    where o_orderdate < '1995-01-01' group by l_returnflag
+
+  HashAggregate
+    ->  Merge Join                     <- NO Gather anywhere
+          ->  Index Scan ... lineitem
+          ->  Index Scan ... orders
+  ```
+
+  An aggregate over a merge join still gets no Gather at all. And the
+  hash-vs-merge decision is made one level lower, at the JOIN rel, where the
+  default still has no partial path (`GOOPG_GATHER_PATHS` off), so the
+  comparison that MAKES the choice still cannot see the parallelism it
+  destroys. The statement to carry forward is therefore no longer "goopg's
+  cost model has no parallel dimension" but **"the parallel dimension reaches
+  only the aggregate upper rel, one level above where the hash-vs-merge
+  choice is made"** — which is the same trap with a smaller radius.
+  Unblocking condition, unchanged in kind and now precise: a partial JOIN
+  path admitted at the default, i.e. C-19d/C-19f's crossover — the same
+  prerequisite C-19h's third blocker names.
   **D-05 (original).**
   Serial and parallel in one commit, `hashsize` model re-derived in the
   same commit. The load-bearing EX1 dependency for hash-join geometry is
@@ -2330,7 +2730,19 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   out-of-order rows with no error). Needs two deformed rows at once; a
   `PackedSlot` has one scratch `Row` — R-11, re-priced, not mechanical.
   *design: 04 §4.1; gate: 06 §3 MD-05.*
-- [!] **D-07 MD-06 materialize — BLOCKED by the D-04 stopping rule**
+- [-] **D-07 MD-06 materialize — OUT OF SCOPE 2026-09-07 — owner decision: **goopg does not implement its own
+  parallel cost calculation; PG 18.3's is adopted as-is.** This item's
+  unblocking condition was that goopg's cost model grow a parallel dimension
+  of its own so a search could prefer a plan *because* it will parallelise.
+  That is exactly the goopg-original cost modelling the owner has ruled out,
+  so the item is dropped rather than left blocked on a prerequisite that will
+  never be built. What stays in scope is PORTING PG's model faithfully
+  (`create_plain_partial_paths`, `generate_useful_gather_paths`,
+  `try_partial_*_path`, `cost_gather`) — that is PG-parity work, not a goopg
+  cost model, and C-19h still needs it.
+  Preserved for the record, not for resumption: its blocker was "unblocks when
+  D-05 does", and D-05 is now out of scope. ORIGINAL ROW FOLLOWS.
+  BLOCKED by the D-04 stopping rule**
   (2026-09-06). 05 §6 is explicit: "batches unchanged → the model in D-3 is
   wrong. **Fix the model before touching another site.**" D-04 fired that
   arm, and the five follow-up measurements located the model defect in
@@ -2338,7 +2750,18 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   before the first one's premise is re-measured would be exactly the R-4
   two-formats hazard 04 §0.2 forbids. Unblocks when D-05 does.
   *design: 04 §4.1; gate: 06 §2 floor + alloc arm.*
-- [!] **D-08 MD-07…MD-12 Tier B [EPIC — split per site before start] —
+- [-] **D-08 MD-07…MD-12 Tier B [EPIC] — OUT OF SCOPE 2026-09-07 — owner decision: **goopg does not implement its own
+  parallel cost calculation; PG 18.3's is adopted as-is.** This item's
+  unblocking condition was that goopg's cost model grow a parallel dimension
+  of its own so a search could prefer a plan *because* it will parallelise.
+  That is exactly the goopg-original cost modelling the owner has ruled out,
+  so the item is dropped rather than left blocked on a prerequisite that will
+  never be built. What stays in scope is PORTING PG's model faithfully
+  (`create_plain_partial_paths`, `generate_useful_gather_paths`,
+  `try_partial_*_path`, `cost_gather`) — that is PG-parity work, not a goopg
+  cost model, and C-19h still needs it.
+  Preserved for the record, not for resumption: same chain as D-07.
+  ORIGINAL ROW FOLLOWS.
   BLOCKED by the D-04 stopping rule** (same reasoning as D-07; the split
   rule still binds when it unblocks).
   Window (whole partition set, no spill path — report OOM-exposure
@@ -2368,7 +2791,13 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   APPROVE (incl. pg_index walker + align-table ledger rows).
   Artifacts: `docs/design/executor-d09-alignment/DESIGN.md`,
   `016f67b`.
-- [!] **D-10 MD-last spill payload — BLOCKED on every in-memory
+- [!] **D-10 MD-last spill payload — RE-SCOPED 2026-09-07 onto D-06.** The
+  hash-join conversion sites (D-05/D-07/D-08) are now out of scope with the
+  parallel-cost decision, so "every in-memory retention site" no longer means
+  what it did: the only conversion site still in scope is **D-06 (sort)**,
+  which is blocked on B-01c's applying half and not on parallel costing.
+  Re-read the condition as "unblocks when D-06 lands", and if D-06 is itself
+  dropped, drop this with it. ORIGINAL: BLOCKED on every in-memory
   retention site.** Convert `spill.go`'s payload to the PG format;
   framing (`WriteRowHashed`'s hash-then-tuple) unchanged. The nine
   existing test functions are **re-pointed at the new codec, not
@@ -2377,7 +2806,12 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   unrecorded site keeps D-10 blocked.
   *design: 03 TD-5, 04 §4.1 Tier D; gate: 06 §3 MD-last + round-trip
   across a real spill on a spilling shape.*
-- [!] **D-11 MD acceptance + open-gap ledgering — BLOCKED** until at least
+- [!] **D-11 MD acceptance + open-gap ledgering — RE-SCOPED 2026-09-07.**
+  Its condition named "D-05 onward", and D-05/D-07/D-08 are now out of scope
+  with the parallel-cost decision. The only conversion site left in scope is
+  **D-06**, so this is an acceptance over D-06 alone or it is dropped with it.
+  Note the open-gap ledgering half is ALREADY DONE and survives the re-scope.
+  ORIGINAL: BLOCKED until at least
   one conversion site (D-05 onward) lands; today the "one retention
   format" condition is trivially true because none has. The open-gap
   ledgering half is ALREADY DONE by the chain of D-04/D-05 measurements
@@ -2873,26 +3307,34 @@ per arm; values never counts for projection/join-adjacent changes).*
   Ledger `take3-E-13-dropped`. Cut 1 (poison tests on the Project shape)
   remains landed.
   *gate (discharged): alloc arm residual demonstrated first — it was not.*
-- [!] **E-16 EX3-03 step-2 resume — BLOCKED on spill-cost calibration.**
-  Session `work_mem` threading is implemented and unit-green but moves
-  Q7/Q9 plans to slower merge shapes at bench `work_mem` (model prices
-  hash above merge while forced-hash proves faster). Resume with the
-  filed artifact
-  (`analysis/planner-refactor-take3/ex303-step2-deferred-20260904/`,
-  README + clean-applying `plumbing.patch`, ledger
-  `take3-EX3-03-step2-blocked`): recalibrate the spill-cost model first,
-  then re-apply the plumbing and re-gate.
-  **Design landed 2026-09-06: `docs/design/planner-spill-cost-calibration/DESIGN.md`.**
-  It finds the hash and sort spill charges biased in OPPOSITE directions
-  (hash over-charges — `EntryBytes` measures the in-memory entry while
-  `spillWriter.WriteRow` uses uvarint framing; sort under-charges twice,
-  and one is a TRIGGER error — `costSortRun` fires at `cp.workMem` = 1 GiB
-  while `sortOp` spills at the hardcoded 256 MiB `sortChunkBytes`), so a
-  single multiplier would fit the difference between two errors. Four
-  separately-gated cuts, three probes, negative outcomes written in
-  advance.
-  *design: `docs/design/executor-ex3-03-workmem/DESIGN.md`; gate:
-  Q7/Q9 plans at bench `work_mem` + forced-hash proof + values + pin.*
+- [x] **E-16 EX3-03 step-2 resume.** Landed 2026-09-07 (`16da44c66`).
+  The filed `plumbing.patch` no longer applied (~38 conflicts in
+  `planner.go`) and about half its intent had landed independently in
+  P2-02c/d, so only the remainder was ported: `planCopy`,
+  `preplanWithClause` (+ `planRecursiveCTE`, `planDMLCTEBody`, all four
+  CTE-body plan sites), `planInsert`, `planOnConflict`,
+  `resolveDefaultDoNothingArbiter`, `planDelete`, `planMerge`,
+  `viewChainQuals`/`viewQualOnBase`, `planValuesSubquery`,
+  `buildHavingParentCtx`, `wrapMinMaxOrderByDistinct`'s order context;
+  the three genuinely session-less fallbacks now stamp
+  `DefaultPlannerSettings()` explicitly instead of a zero value. The
+  `planSelectWithParent` zero-guard is preserved verbatim (fail-closed).
+  **The named blocker did not reproduce**: at the shipped planner
+  defaults and bench `work_mem`, the ported plumbing is COST-IDENTICAL on
+  all 22 TPC-H queries — not one plan line moves — because the interiors
+  it threads (CTE bodies, DML, ON CONFLICT, VALUES subqueries) are not
+  exercised by TPC-H, while the subquery/derived/set-op interiors that
+  moved plans on 2026-09-04 landed separately. The 09-04 Q7/Q9 regression
+  was a property of that tree, not of this change.
+  Gates: units suite green; `go vet`; optimizer + postmaster suites green;
+  TPC-H 24/24 MATCH on VALUES against the paired arm; plan capture
+  byte-identical, so no query needed individual timing.
+  Six new pins in `settings_propagation_test.go` (inner-SELECT, CTE body,
+  EXISTS, funnel, INSERT…SELECT, plus the F7 exactly-three-callers gate,
+  which asserts the NAMED three rather than a count). Non-vacuity verified
+  by reverting one production hunk at a time; the inner-SELECT/EXISTS/
+  funnel pins cover behaviour that already existed untested and are
+  recorded as such rather than counted as gating the commit.
 
 ---
 
@@ -2902,6 +3344,57 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
+- [ ] **E-17 EX3-08 scan-resident qual — evaluate the predicate ONCE, as PG
+  does, and delete the `Filter` node above the scan.** Filed 2026-09-07 from
+  the format/decode survey (`DATUM-ROW-FORMAT-AND-PG-COMPAT.md` §5.1.1).
+  **Today the predicate is evaluated TWICE on every surviving row.**
+  `scan_prefilter.go` evaluates it inside the scan over `[0, MaxCols)`, and
+  `filterOp` — deliberately left in place — evaluates the same predicate
+  again on the full row. The file says "The shape is PostgreSQL's", but on
+  this point it is not: PG pushes the qual INTO the scan node
+  (`SeqScan.qual`, run by `ExecScan`), has no separate Filter node, and
+  evaluates **once**.
+  **What the second evaluation does and does not buy** (read off the code,
+  not the comment):
+  - It is NOT the guard against the failure that matters. A prefilter that
+    wrongly says *true* is caught by `filterOp`; a prefilter that wrongly
+    says *false* has already dropped the row at `continue` and `filterOp`
+    never sees it. The wrong-answer direction is guarded by the whitelist,
+    the `MaxCols` bound and `poisonDeformTail` — not by re-evaluation.
+    The comment itself calls the caught direction harmless ("costs nothing
+    but time").
+  - `filterOp` IS load-bearing for two ABSTAIN paths, which any removal must
+    absorb (`operators_storage.go:2095-2107`): `needsDetoastPrefix` true (a
+    toasted prefix value would be judged un-detoasted) and `perr != nil`
+    (the error is deliberately raised by `filterOp` "from exactly where it
+    did before" — an error-position contract, not an accident).
+  - **No selectivity gate exists.** `planScanPrefilter` declines only when
+    `need >= ncols`; it never consults selectivity. A predicate that reads
+    few columns but admits most rows therefore saves no deform work and pays
+    one extra evaluation per row — a net loss, **unmeasured**.
+  **Two cuts, cheapest first; they are independent and cut 1 does not need
+  cut 2.**
+  1. *Skip-flag.* The scan reports "I already decided true" per row and
+     `filterOp` skips its evaluation; the flag stays clear on both abstain
+     paths so those rows are still evaluated exactly once, by `filterOp`.
+     Removes the duplicate work without changing any node shape or any
+     error position. Cheap and reversible.
+  2. *PG's shape.* Make the scan a COMPLETE qual evaluator (all expression
+     kinds, detoast, PG-identical error position and ordering) and delete
+     the `Filter` node. This is a different design from today's deliberate
+     whitelist, and the whitelist's failure direction — an unlisted node
+     disables the prefilter, costing performance not correctness — must not
+     be lost: a complete evaluator has no "opt out" to fall back on.
+  **Measure before cut 2.** The prize for cut 1 is one predicate evaluation
+  per surviving row; the prize for cut 2 is that plus one node's per-row
+  overhead. Q6 survives ~2% of 6 M rows, so the win there is small and the
+  real target is the unmeasured low-selectivity case above — **build that
+  case first**, since it is also the only shape where today's prefilter is a
+  pessimisation.
+  *gate: values both suites; plans byte-identical for cut 1 (no node shape
+  changes); cut 2 moves EXPLAIN output — the Filter line disappears — so it
+  needs a `plan_snapshots/` re-pin and a PG-parity re-check in the same
+  commit, plus an error-position test per abstain path.*
 - [x] **F-01 Delete the duplicate build map** — already satisfied in-tree by `514913912` (M0127-P0.3: plan-typed single-map build, `lazyHashFinalize`/`lazyBuildAllInt64` deleted; enforced by `join_single_map_build_test.go` dual-map-build-back guard); gates: executor join suites green at that commit; artifacts: `internal/executor/operators_join_agg.go`, `internal/executor/join_single_map_build_test.go`.
 - [x] **F-02 Probe-seam re-materialisation** — already satisfied in-tree,
   audit-only close 2026-09-05. The premise (take2 07 §6, evidence from
@@ -3025,6 +3518,7 @@ P6-03/04/05 (load-bearing).
 | C-10d (measurement half) | 2026-09-05 | (this commit) | AST census: 89 boundaries / 41 of 99 TPC-DS; a full pull-up removes only 39% of the blocking ones | so C-11 must cross the boundary regardless; also found CTEs+views are two more routes to the same leaf |
 | C-10c | 2026-09-05 | (this commit) | Phase-4 OJ qual/target placement contract + 5 fixtures; 3 negative controls | found C-16 retires no arm (no reminder) and that goopg has no PlaceHolderVar equivalent |
 | C-07 (derivation half) | 2026-09-05 | (this commit) | query_pathkeys derived with PG's precedence; has_useful_pathkeys completed and made per-rel | inert by design: values 24/24, plans byte-identical; the "motivate index paths" half is evidenced-blocked on C-11/C-12 |
+| C-07 (widening half, re-adjudication) | 2026-09-07 | (this commit) | widening implemented in a throwaway worktree and instrumented: it DOES generate the path (`[w]`→`[w x]`), and no plan moves even at `enable_seqscan=off` | C-11+C-12 landed and did not unblock it — `createOrderedPaths` consumes a Node and `newPrebuiltPath` carries no Pathkeys; plus a new independent blocker, the producer never runs at `nrels<2`. Not forced; decision test rewritten + consumer-side twin added |
 | D-03 | 2026-09-05 | (this commit) | PackedTuple/PackedSlot unreachable; SEVEN R-0 sites armed (design said six) | review REQUEST-CHANGES -> resolved; values 24/24, plans byte-identical; 25 tests |
 | C-10a (cardinality half) | 2026-09-05 | (this commit) | grouping-sets aggregates were priced as ONE set; now summed per set and clamped | values 24/24 + TPC-DS CKMISMATCH=0; PP unchanged; 4 new tests |
 | C-20d | 2026-09-05 | (this commit) | **index-probe multiplier calibrated 1.0 -> 2.0: TPC-H suite 138.58 -> 100.79 s (-27%), Q5 5.3x, Q7 2.7x, Q9 1.9x, Q3 2.3x** | values 24/24 + TPC-DS CKMISMATCH=0; plan parity IMPROVED 5/15 -> 6/14; flag retirement stays blocked |
@@ -3038,7 +3532,6 @@ P6-03/04/05 (load-bearing).
 | E-06 | 2026-09-06 | 6aab9dc | agg transition via per-call slab; UserAgg whole-call decline | twin-parity + per-site pins + 0-alloc; R8 both suites (parallel shapes incl.); timing neutral; review APPROVE-WITH-NITS |
 | B-19 | 2026-09-06 | (this commit) | rowest-A1 paired-band null add-back (failed-agent item completed; B1 already landed) | live reproducer 217→2430 vs true 2500; R8 both suites; PP 28 moves all-attributed, Q28 direction-verified; review APPROVE-WITH-NITS |
 | C-08 | 2026-09-06 | b967f38 | per-joinrel param_source_rels derivation with frame remap; NLI + merge arms threaded; star-schema escape untouched | derivation table + admit/refuse arm pair; suites + units scope + spotcheck PASS; PP TPC-H 22/22 MATCH (provably inert until C-04, no sweep triggered); review APPROVE-WITH-NITS (5 addressed); ppi_rows ledger row |
-
 | E-09a | 2026-09-06 | 67204579c | **spilling shared hash build published**: Q9 workers `rows=1500000 loops=1` -> `rows=0 loops=0`, five Build Times -> one; Q9 8.85 -> 7.85 s | immutable batch descriptor, growth frozen after prebuild (PG's rule), private reload per participant, NO new synchronisation; values 24/24, plans byte-identical, TPC-DS PASS=95 CKMISMATCH=0, -race green. Unblocks C-19f and the D-05 re-measurement |
 | C-19c | 2026-09-06 | dbb14ca25 | partial index paths + `min_parallel_index_scan_size` + `IndexScan.Parallel` + workers claim index leaf blocks | reachable and priced, but **no TPC-H plan moves to the shape at SF=1** under the pinned stats (plans byte-identical) — recorded as such rather than claimed as a win |
 | E-11 (instrument) | 2026-09-06 | c6af781f4 | `GOOPG_SEQSCAN_LOOKAHEAD` knob; default 4 unchanged byte-for-byte | item stays `[~]`: the first depth sweep ran against a contended machine and is not attributable. Instrument only, so the decision can be measured quiet |
@@ -3048,41 +3541,32 @@ P6-03/04/05 (load-bearing).
 | B-06 (synthesis impl) | 2026-09-06 | 1201245 | CTE-output synthesis functions (group-key/aggout-FD/union-literal rules) + 16 tests, inert (no consumers wired; guard untouched) | review REQUEST-CHANGES → both blockers fixed (Project mapping, Op checks) + re-review APPROVE-WITH-NITS; B-06 stays open until step-4 guard-removal criterion |
 | spill-cost Cut 3 (model) | 2026-09-06 | 53cd7a073 + b416786f1 | `hashsize.SpillBytes` derived from spill.go's encoder, INERT; `estimatedRowBytes` reads `hashsize.DatumBytes` | 4 agreement tests pin encoder-vs-model and the executor's runtime ruler vs the planner's width model; wiring `spillPages` waits on `cost_funcs.go` ownership |
 | MapSlotBytes (doc) | 2026-09-06 | 61450d37f | constant marked KNOWN 2x LOW with the measurement (96.1 B/slot) and the blocker | value deliberately unchanged — 96 costs +10.4% via Q14's phantom-build flip. Same class as C-20d: a comment describing an intention read as a decision |
-
 | E-09b | 2026-09-06 | d5ce1bb9b + b5647d6fa | **one live batch table where there were four**: loads 28 -> 7, maxLiveLoads 4 -> 1, maxLiveBytes ~563,100 -> 140,775 on a 4-participant/7-batch fixture; mutation-checked | NOT `sync.Once` — it marks its slot done when the function RETURNS, so a cancelled or panicking loader would publish an EMPTY map and every waiter would silently probe nothing. Explicit `done` channel closed by `defer` on every exit incl. panic; loader never waits, so closure depends on the filesystem not on a peer — no cycle, no deadlock. Cancel-mid-batch tested at the protocol level and through the real Gather. Bench arm still owed |
 | C-19d | 2026-09-06 | a2142383a + e996a4ff2 | `generateUsefulGatherPaths` — `PartialPathlist`'s FIRST reader; `cost_gather` (a function that had existed with no search caller) + new `gatherMergeCost`; `createPlanNode` both arms; `enable_gathermerge` becomes a counted `disabled_nodes` term | **default OFF for an arithmetic reason, not caution**: crossing a Gather costs `parallel_tuple_cost` = 0.1/row against a 4-worker saving of ~0.0075/row, so with only base-rel partial paths the whole relation crosses and `add_path` correctly dominates every Gather at any size. Blocker narrows from "no parallel costing" to **C-19f specifically**. Two latent wrong-answer classes stopped on the way: the post-pass would have nested a second Gather (N workers each launching N) and a Gather Merge over a partial INDEX path would return N copies of every row |
 | instrumentScope race | 2026-09-06 | 0ee17b564 (ledger only) | pre-existing `-race` failure confirmed at `67204579c` in a clean worktree, so not E-09b's | `buildUnderNilScope` swaps the package global under a mutex that `maybeInstrument` never takes; its own comment describes the leak it does not prevent. Ledgered, not fixed inline |
-
 | E-11 | 2026-09-06 | 23ce0a60c | **DROPPED, outcome (b)**: 5 depths x 3 reps, medians 138.35/136.55/141.17/142.37/134.14 s for depth 0/4/16/64/128 — spanning 6.1% with NO ordering in depth, inside a 12.0%-median control band. Values byte-identical across all 15 arms | it was a **five-way A/A**: `refillPrefetchWindow` returns early for a parallel scan and EVERY TPC-H plan at bench settings is parallel (Q6 = `Gather` / Workers Planned: 4). Forced serial, where the window is live, MORE prefetch is WORSE — depth 0 beats depth 4 by 12.1% on the subset, 35.0% on Q6, disjoint ranges. Default deliberately NOT flipped to 0: all evidence is warm-cache, so zeroing would bank a warm-only win and hide the real bug |
 | C-13a | 2026-09-06 | ca2809ab7 (census only) | **NO-GO before implementation**: goopg stacks 77 `Limit`-direct-child sorts vs PG's 54 — structural hypothesis CONFIRMED — and it buys nothing. 54 of 77 sort already-collapsed aggregate/window output; median input 145 rows; total across all 77 is <= 119.8 ms of 802 s (0.015%); **0 of 100 sorts spilled**, so the design's strongest argument has no witness | corpus-level finding: no sort-side item has a runtime witness in EITHER suite (TPC-H has no LIMIT at all; TPC-DS's LIMITs sit over grouped output). C-14 is not the alternative either — goopg's Q67, PG's own incremental-sort case, is 1.0 ms over 115,150 rows. Deferred not cancelled: the mechanism is cheap and correct, the evidence is missing |
 | rowest defect | 2026-09-06 | 56d10d0c0 (ledger) | incidental to C-13a's census: TPC-DS row estimates wrong by 3-5 orders of magnitude in BOTH directions — 22 of 100 Sort inputs est=1 vs up to 245,587 actual (incl. six plain Seq Scans), HashAggregate outputs up to 8007x high | checked and NOT C-10a's grouping-sets summing, which is PG-faithful; the error is inside per-set `estimateNumGroups`. Filed at ledger level because it invalidates the INPUT of every remaining cost item, and no gate catches it — values compare results, plan-parity compares shapes, neither looks at `rows=` |
-
 | C-19f | 2026-09-06 | e8456fe82 + 125c4c016 + 6d94052ec | **a Gather becomes choosable by cost**: crossover `N > 106,667 + 9.87*J` at 4 workers, unreachable for a base rel at any size and for a single FK join, satisfiable by a join TREE. Measured off-vs-top, 3 reps, values 7/7 MATCH in all 42 runs: **Q21 17.33 -> 8.42 s (-51%)**, Q9 +94%, Q10 +30%, suite -10.7% inside its own spread | Q21 is the case only a path model reaches — at HEAD it gets NO Gather (root is a Nested Loop Anti Join; `terminatesPartial` stops `findPartialSubtree`), and C-19f gathers the hash join inside it. Q9 honestly attributed as NOT the predicted foreclosure: the BUILD side flips, 6M rows built undivided, model called it 21% cheaper — lead is the build term (`spillPages` over-states) not the Gather term. Q10 +30% with a byte-identical executed shape, recorded OPEN. Build charged once and undivided (matches the executor after E-09a/E-09b); the reverted `d05p4` 5x multiplier now refused by a test. Default unchanged, no new flag; TPC-DS PASS=95 CKMISMATCH=0 with PLAN-SHAPE 99/99 identical, so inertness is measured. The mandatory executor consumer check found TWO latent `createPlan` bugs unreachable until a Gather could win |
 | E-14 | 2026-09-06 | 10b34c633 + 2039ffa66 | prerequisite landed inert: keyed inner spill frames `[4B hash][1B tag][key][payload]`, so `buildKeyOfRow`/`batchKeySlot` retire and **nothing in the executor derives a build key from a retained row**. TPC-H 24/24 MATCH; -race clean | the item's quoted prize was MISATTRIBUTED — Q9 20.14->13.88 s comes from a measurement-only artifact and belongs to the P4-01 planner flip, already banked. Measured residual instead: 6 of 15 retained columns are the join's own key columns and EVERY one sits at position 0, so a `[0,bound)` prefix cannot describe the opportunity at all. Narrowing (Cut A/B) deferred for want of an alloc + batch-geometry arm; ledger `take3-E-14-cutA-cutB-deferred` |
 | tooling: serial captures | 2026-09-06 | 752aeb7c9 + 885bcd2a6 | `estimate-audit`'s `-serial` defaults TRUE (`max_parallel_workers_per_gather = 0`), deliberately — goopg does not merge per-worker Instrumentation, so nodes under a Gather report no actual rows. The PG reference is captured the same way, hence 0 Gathers in `plans-pg` too | so every 'plans byte-identical' result from these captures is a SERIAL-CONTROL-ARM statement: like-for-like and valid, but it cannot support 'no parallel plan change occurred'. C-19c's inertness claim was corrected on exactly that ground. Prerequisite for judging any parallel item on plan parity is a parallel-mode PG baseline, which does not exist |
-
 | rowest B1 | 2026-09-06 | 9b43c67f3 | `resolveBaseColumn` gains its `*NestedLoopIndexJoin` arm — every column above an NLI had resolved to nothing, so grouping vars priced at `DEFAULT_NUM_DISTINCT=200` until the product saturated and `estimateNumGroups` returned its own INPUT row count. Probe: Q99 720,657 -> **90 exact**, Q62 359,432 -> **150 exact** | the durable half is `TestResolverFamilyArmListsAgree`, which parses both type switches and pins the arm lists mechanically — this was the THIRD instance of the drift the function's doc comment had been warning about in prose |
 | rowest A1 | 2026-09-06 | adc54800b | `conjunctionSelectivity` adds PG's `s2 += nulltestsel(IS_NULL)` (clausesel.c:292-294). Both range bounds already excluded NULLs, so the subtraction excluded them twice: on `ss_quantity` 0.955955+0.040251-1 = -0.003794 -> guard -> 1e-10 -> clamps to 1. TPC-DS fact tables are ~4.4% null nearly everywhere | probe 1 -> 14,932 against 15,410 actual |
 | B1+A1 gate | 2026-09-06 | (measured post-hoc) | both landed UNGATED because their agents were terminated mid-gate by a session limit; the arm was run afterwards. **TPC-H values 24/24 MATCH, plan SHAPES unchanged** (0 added, 0 removed; 6 `cost=`/`rows=` lines moved), plan-gate exit 0, PP 6/14 unchanged, TPC-DS PASS=95 CKMISMATCH=0, suite 106.51 -> 105.02 s (-1.4%, inside spread) with **Q2 1.67 -> 0.75 s (-55%, outside it)** | the plan diff is the artifact: Q4 `HashAggregate rows=200 -> 5`, and 200 is `DEFAULT_NUM_DISTINCT` verbatim — B1's signature, sitting in the committed TPC-H plans all along |
 | coop parallel deform bound | 2026-09-06 | 5bf764520 | **SILENT WRONG ANSWER fixed**: a hash join with a build-side restriction returned the RIGHT ROW COUNT with a NULL payload in every column. `parallelBuildLazyHashTable` rebuilt the build subtree via `BuildWorker`, i.e. at the ROOT deform bound, so `Filter(dk>3) -> SeqScan(dk,dname)` deformed [0,1) and `dname` was never materialised | severity was UNDER-reported and I corrected it by measuring: reported as WorkMem 0/1 and 'correct at >=4096', it actually fails at **25 of 32** work_mem values including **1 GiB** — goopg's own effective hash budget at the default. Only a narrow 1KiB..64KiB band passes, which is where the original spot check landed. `TestCoopParallelHashBuildValuesAcrossWorkMem` sweeps it and asserts VALUES; mutation-checked 25/32 fail without the fix. Real-session reachability still OPEN |
 | bench residency | 2026-09-06 | 0df7dc930 | both TPC-DS clusters ran on the **128MB `shared_buffers` default** (16,384 slots) against 1.113 GiB (SF0.5) / 2.2 GiB (SF1) working sets, while TPC-H had 2048MB and the PG reference 2GB — a **16x unfair** memory comparison. `pg_stat_io`: TPC-DS 2 scans of `store_sales` = reads 59,522 / **evictions 43,138**; TPC-H 3 scans of `lineitem` = reads 136,393 / **evictions 0**, unchanged from scan 2 | VALUES gates unaffected (the SF0.5 oracle is row values; residency cannot change an answer) — every PASS=95 stands. TPC-DS TIMING before today is I/O-bound. `server.sh` now warns when `shared_buffers` is unset |
-
 | C-03a-d | 2026-09-06 | 0d2e7a10c + 4eab748cf + bd2c7c0d0 + 108776383 | jointype-aware paths, all four cuts INERT: `Path.Jointype` (Inner as zero value so unstamped paths are unchanged), sjinfo orientation into `addPaths`, `planJoinTypeFor` as the single meeting point of the two JoinType enums with SEMI/ANTI left-only schema AND layout, enum-trace fixtures through the production reader | inertness REASON pinned, not just observed: `TestSearchIsInertForDisjointJoinInfoList` shows every prefix-internal pair yields a nil SJI via `join_is_legal`'s RHS-overlap fast path, so production always takes the `sjinfo == nil` arm. TPC-H 24/24 identical digests, serial plans byte-identical, PP 6/14 unchanged, plan-gate exit 0, TPC-DS PASS=95 CKMISMATCH=0 with 99/99 plan shapes. FULL declined with ledger row `C-03c FULL-join-search-decline` |
 | E-10 (correctness half) | 2026-09-06 | a22d995c8 | **latent WRONG ANSWER fixed**: `gatherMergeOp` attached only `attachParallelScan`, so a Gather Merge over a partial INDEX path returned `(workers+1)x` every row — reproduced at 1/2/4 workers as 5802/8703/14505 against a serial 2901, **in the correct order**, which is why no ordering test could ever have caught it. `parallelClaimSet` now holds all three claim kinds with `attachAll()` as the single wiring site, embedded by BOTH gather operators | second bug found in the same function: `gatherMergeOp.runWorker` registered `defer close(o.chans[idx])` AFTER the child build and `Open`, so a failure left a live channel with no closer while `Close` drains with `for range` — that is the M0127-P5.9 Q17 hang class, which `gatherOp` had fixed and this sibling still carried. Anti-drift tests fail if a field is added to `parallelClaimSet` without an `attachAll` arm, or if either operator re-declares its own claim state |
 | E-10 (performance half) | 2026-09-06 | (out of scope, verified) | **marked out of scope with numbers**: no runtime witness on either corpus. TPC-DS SF0.5 sorting is 119.8 ms of 802 s = **0.015%**, median direct-child sort input 145 rows, **0/100 sorts spilled**; TPC-H query text contains no `LIMIT`; and no `GatherMerge` path is generated in production at all today, so the exchange has zero production surface until the planner change lands | tuning it would be reading noise |
-
 | C-04a (fix 1: Q72) | 2026-09-06 | fb6550266 | **WRONG ANSWER closed**: Q72 84 -> 100 rows. Admitted LEFT links lost their jointype through the collapse-limit sub-problem split and planned as INNER; per-problem SJI remap (`sjInfosInItemSpace`) carries the sjinfo across the split | pinned `TestLeftLinkSurvivesCollapseSplit`. The agent was terminated by a session limit mid-work and left this committed plus a correct-but-non-firing Q78 firewall in the tree |
 | C-04a (fix 2: Q78) | 2026-09-06 | 3d0aad730 | **20x TIMEOUT closed**: Q78 327 s -> 19 s, checksum-verified, top-level plan byte-identical to pre-C-04a. The `problemPairsOuterWithDerived` firewall was wired right and never fired: `with.go` gives every CTE binding a SYNTHESISED non-nil table (so `table == nil` can never see one) AND the leaves arrive as `*Filter{*CTEScan}` (so a top-node type switch sees only the Filter). Classify by node type, descending through wrappers | reached only after THREE wrong hypotheses, each plausible from the code and each refuted by one trace line (dropped qual — already restored; `base != 0` spine decline — trace showed the chain was ADMITTED; `table == nil` alone — still `derived=[false false false]`). Pins `...CTEOuter` + `...WrappedCTE`, both mutation-checked. Final: TPC-H 24/24, **same-session A/B -0.8%** (a +9.0% under a concurrent sweep and a +5.4% against a 3-hour-old baseline were both wrong — the unchanged binary had drifted +6.3%), Q13 -17.4%; TPC-DS PASS=95 all zeros, shapes 99/99; plan-gate 22/22 both modes, pin `c04a-fixed-20260906` |
-
 | C-11 | 2026-09-07 | fcf049b05 | upper-rel registry (`fetch_upper_rel`) landed INERT — per planning scope, `Relids = 0`, upper rels out of `relMap`/`joinrels` | C-08's pattern. TPC-H 24/24; plan-gate 22/22 both modes |
 | C-12 | 2026-09-07 | 60da43bf9 | ORDERED upper rel gets a real `PathSort`. **The finding**: before this, `costSortRun` had ONE production caller (merge-join input sorts), so every top-level Sort was priced at ZERO by `DeriveLegacyDisplayCost` — Q18's `Sort (rows=1565307 width=204)`, the largest in the corpus and in its slowest query, contributed nothing to any path comparison | isolated HEAD+C-12 A/B: structural 22/22, costs move on Sort lines ONLY, digest 24/24, TPC-DS PASS=95 (Q78 17 s ck-verified), total +2.5% |
 | C-13b | 2026-09-07 | c65801e0f | `cost_tuplesort`'s `limit_tuples` middle branch. C-13a stays deferred on its own census (no runtime witness: 0.015% of TPC-DS corpus wall time in sorting, 0/100 spills, TPC-H has no LIMIT at all) | structural AND costs 22/22, digest 24/24, ten longest no slower; TPC-DS PASS=95 total -1.0%, cost-normalized plans byte-identical (18 queries move cost-only on Limit-rooted Sorts) |
 | C-15 | 2026-09-07 | 40d7a4667 | GROUP_AGG upper rel with `cost_agg` paths; **three aggregate rules retired** — they existed because there were no grouping paths to compare | TPC-H structural 21/22 (Q18 access-path-only move, same numbers, no slower); TPC-DS PASS=95 total +1.6%, ZERO shape change. Unblocks C-19g |
 | C-16 | 2026-09-07 | 9fa1162c4 | DISTINCT upper rel with hashed/unique paths via DistinctOn reuse | structural+costs 22/22, digest 24/24, timing flat; TPC-DS PASS=95 total +0.1%, shapes 99/99 |
 | spill Cut 1 | 2026-09-07 | 247e0ee73 | `costSortRun` takes the rel's `avgVarBytes` — it had passed 0 where `hashJoinCost` passes the real statistic, sizing text-heavy sorts as fixed-width | prerequisite for C-11's upper rels (a fresh rel with `NCols == 0` silently suppresses the external-merge arm) |
-
 | C-19g | 2026-09-07 | 2ebc11d6a + 866e6fe7e + 9e6138f64 | **the parallel track's first real win**: partial aggregation as priced paths. Q1 **8.57 -> 4.14 s (-51.7%)** against a 1.2% off-arm spread — 50x outside the noise floor; suite -4.3%. goopg's Partial node emits ZERO rows, so Q1 crosses **16 group-states, not 5,901,255 rows** (1.6 vs 590,000 at `parallel_tuple_cost`), and the boundary term that kept C-19d and C-19f off essentially disappears | replaces `splitAggregateIsProfitable`'s five invented constants ('calibrated against one query') with a two-candidate path tournament adjudicated by `addPath` — no new cost function, no new constant. Reaches GROUPED aggregates the old rule could not (previously only the three ungrouped ones split). Ships **default-OFF**: the flip moves 3 TPC-H plans and needs a shared-pin re-pin. TPC-H 24/24 both arms; TPC-DS mode-ON PASS=95 all-zero, total -3.9%; plan-gate mode-OFF 22/22 against the shared pin. `MODE=costs` not evaluable on a private clone and NOT claimed. Row stays `[~]`: the upper-rel-resident half is unfinished |
-
 | C-18 | 2026-09-07 | 41d4eb8db | WINDOW + SETOP upper rels; `PathWindow`/`PathSetOp`, `costWindow` (= `cost_windowagg`'s three per-input-row terms PLUS the sort goopg's `windowOp` performs internally), set-op priced by `cost_append` when streaming and the hashed arm when buffering | cannot move a plan BY CONSTRUCTION: a window spec-group chain is ONE stacked candidate `add_path`ed once (`create_one_window_path`, planner.c:4620). Two design deviations, both documented: only `applySetOp` is a real set operation (the partition/inheritance fan-outs reuse the NODE but are PG appendrels), and the design's `costSortRun(cp, rows, nkeycols, …)` put the KEY COUNT where the ROW WIDTH belongs, which would model a 2-column row and suppress the disk charge — declined and pinned. **Found a real defect**: `fetch_upper_rel(SETOP, 0)` shares one rel across a chain, so `A INTERSECT B EXCEPT C` had the outer node answer with the inner node's candidate (wrong rows); PG keys it by relids (prepunion.c:805) |
 | C-17 | 2026-09-07 | 953e64297 | `tuple_fraction` to every upper rel. Census found four gaps: stamped in TWO per-arm places (so a WHERE-less `ORDER BY a LIMIT 10` told every upper rel all rows were wanted), two producers passing a literal 0, and a set-op trailing ORDER BY reaching the executor as a bare `&Sort{}` with NO ORDERED rel — the last top-level sort priced at zero after C-12, and the one shape that could never reach C-13b's bounded arm | shows NOTHING on either corpus and that is the predicted null: TPC-H has zero set ops, zero window functions and a WHERE on every query; TPC-DS's UNIONs sit inside subqueries. Raw SF0.5 capture byte-identical, 0 diff lines. Witness is a direct probe (`lineitem UNION ALL orders ORDER BY 1`): bounded arm 344,423 -> **178,266**, external-merge 344,423 -> **433,323**, both directions the correction. Timing -0.2%/+1.5% on byte-identical plans = noise, NOT credited |
 

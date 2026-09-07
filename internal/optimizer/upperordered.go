@@ -28,14 +28,17 @@ package optimizer
 // merge arm included, and that the path went through the dominance
 // tournament once.
 //
-// What this cut deliberately does NOT do (DESIGN §5.5): give the rel a second
-// candidate. Nothing above the search root carries `Pathkeys` — the seam
-// publishes a Node and drops them — so the input path never delivers the
-// keys and the `upper.ordered.input` producer below never fires today. The
-// arm is kept and unit-tested rather than omitted because it is the line
-// C-12a (widening `addOrderedIndexPaths`' useful-column set) turns live, and
-// "verify both candidates were generated" is then a grep on the two producer
-// strings under GOOPG_PGSHAPED_DP_TRACE=1.
+// SUPERSEDED 2026-09-07 by C-07's seam half (upperorderedinput.go). What this
+// cut deliberately did NOT do (DESIGN §5.5) was give the rel a second
+// candidate: nothing above the search root carried `Pathkeys` — the seam
+// published a Node and dropped them — so the input path never delivered the
+// keys and the `upper.ordered.input` producer never fired. It fires now.
+// `inputNodePathkeys` derives the ordering the finished input Node delivers,
+// in the Node's own output coordinates, from a `*Sort` at the top of the tree
+// or from the pathkeys a searched root carries on its `searchedTree` tag; the
+// seam validates that claim against the schema it publishes rather than
+// translating it. "Verify both candidates were generated" is a grep on the two
+// producer strings under GOOPG_PGSHAPED_DP_TRACE=1.
 
 // Producer strings for the DPPATH trace (pathtrace.go). With `Relids = 0` the
 // lines read `producer=upper.ordered.* relids=-`, which is how an upper-rel
@@ -88,6 +91,13 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// from this same input above) into it, and the sort prices sub.Rows —
 	// so the two agree by construction, not by coincidence.
 	seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
+	// C-07 (P3-06), the seam half: `input_path->pathkeys`. `newPrebuiltPath`
+	// leaves this nil — which is why the input arm below could never fire —
+	// so it is derived from the finished Node in the Node's OWN output
+	// coordinates, the space `keys` were resolved against
+	// (upperorderedinput.go states the two rules that keep it sound). nil is
+	// the pre-C-07 answer and stacks the Sort exactly as before.
+	seed.Pathkeys = inputNodePathkeys(input)
 
 	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp, limitTuples)
 	setCheapest(ordered)

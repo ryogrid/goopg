@@ -232,3 +232,57 @@ func TestC10cPreservedSideQualMovesThroughOrderedSortArm(t *testing.T) {
 		t.Errorf("a Filter reached the NULLABLE input for a preserved-side qual")
 	}
 }
+
+// TestCreateOrderedPathsInputArmIsReachableFromANode is C-12a's blocker,
+// FLIPPED red-to-green on 2026-09-07 by C-07's seam half — the flip its own
+// predecessor prescribed ("flip this test — Sort-over-Sort becomes the child
+// handed back — in the cut that plumbs `Pathkeys` across the search
+// boundary").
+//
+// What it used to pin: `addOrderedPaths` has two arms, and the ordered one was
+// reached only by a seed whose `Pathkeys` the TEST set by hand. Production had
+// no such seed. `createOrderedPaths` is handed a NODE, the only Node->Path
+// bridge is `newPrebuiltPath`, and that bridge left `Pathkeys` nil — so
+// `pathkeysContainedIn(nil, keys)` was false for every non-empty `keys` and
+// the Sort arm was the only arm production could take, WHATEVER ordering the
+// child actually had.
+//
+// The pin was deliberately strongest-form and it stays that way, inverted: the
+// child below is ALREADY in the requested order — it is the Sort the producer
+// itself just built, whose pathkeys are exactly `keys` — and the producer now
+// hands it straight back instead of stacking a second, redundant Sort.
+// `inputNodePathkeys` (upperorderedinput.go) reads the ordering off that
+// `*Sort` in the Node's own output coordinates.
+//
+// The last assertion is UNCHANGED and still holds, which is the point of
+// keeping it: `newPrebuiltPath` still carries no ordering. The fix was NOT to
+// teach the C0 bridge about pathkeys — it has callers (distinct, grouping,
+// partial-agg, window/setop) whose inputs deliver no ordering and must not be
+// made to claim one. `createOrderedPaths` derives the claim itself, from the
+// Node, at the one seam that has an ORDER BY to compare it against.
+func TestCreateOrderedPathsInputArmIsReachableFromANode(t *testing.T) {
+	cp := defaultCostParams()
+	keys := upperOrderedKeys()
+
+	sorted, ok := createOrderedPaths(newUpperRels(), upperOrderedInput(10), keys, 0, cp, 0, -1).(*Sort)
+	if !ok {
+		t.Fatal("the first call must emit a Sort (it is the unordered arm)")
+	}
+	// `sorted` delivers `keys` by construction. Hand it back as the CHILD.
+	again := createOrderedPaths(newUpperRels(), sorted, keys, 0, cp, 0, -1)
+	if _, isSort := again.(*Sort); isSort && again != Node(sorted) {
+		t.Fatal("a second Sort was stacked over a child that already delivers the keys: " +
+			"the seam stopped carrying Pathkeys (upperorderedinput.go inputNodePathkeys)")
+	}
+	if again != Node(sorted) {
+		t.Fatalf("got %T; want the already-sorted child handed straight back", again)
+	}
+	// The C0 bridge itself still carries no ordering, and must not: its other
+	// callers hand it inputs that deliver none. The derivation lives in
+	// `createOrderedPaths`, not in `newPrebuiltPath`.
+	rel := fetchUpperRel(newUpperRels(), UpperOrdered, 0, 0)
+	sizeUpperRelFromNode(rel, sorted)
+	if seed := newPrebuiltPath(rel, sorted); len(seed.Pathkeys) != 0 {
+		t.Fatalf("newPrebuiltPath must stay ordering-free, got %d pathkeys", len(seed.Pathkeys))
+	}
+}

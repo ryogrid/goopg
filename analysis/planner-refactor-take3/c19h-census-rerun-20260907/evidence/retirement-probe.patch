@@ -1,0 +1,416 @@
+diff --git a/internal/optimizer/parallel.go b/internal/optimizer/parallel.go
+index 5c1b2c527..dafc747ff 100644
+--- a/internal/optimizer/parallel.go
++++ b/internal/optimizer/parallel.go
+@@ -93,11 +93,32 @@ type ParallelSettings struct {
+ 	BlocksForTable func(*catalog.Table) (int64, bool)
+ }
+ 
+-// MaybeAddGather returns root wrapped in a Gather when the plan is eligible,
+-// or root unchanged.
++// EnforceParallelPermission is what remains of the `MaybeAddGather` post-pass
++// after C-19h (P5-08) retired its ADD half.
++//
++// The pass used to do two things at once: DECIDE where a Gather goes — a SIZE
++// rule running after planning, which is the defect Phase 5 exists to remove —
++// and ENFORCE the facts that cannot be fingerprinted into the plan cache.
++// C-19d/e/f/g moved the decision into the search as priced paths, and C-19g's
++// upper-rel-resident half (partialaggupper.go) was the last piece. At the
++// engine defaults the path model reaches the SAME twelve of twenty-two TPC-H
++// queries the post-pass reached — Q1 Q3 Q5 Q6 Q7 Q8 Q9 Q10 Q14 Q15a Q16 Q19 —
++// so the ADD half had nothing left to decide. Gone with it:
++// `findPartialSubtree`, `partialTarget`, `rebuildWithGather` and
++// `terminatesPartial`.
++//
++// What CANNOT go is the ENFORCEMENT half, and it is not a "post-pass" at all.
++// Since C-19g the planner may choose a Gather BEFORE the plan-cache lookup, and
++// two of the inputs to that choice are not session GUCs and so cannot be part
++// of `plannerCacheFingerprint`: the transaction's isolation level, and the
++// statement's own shape. Both are enforced HERE, after the lookup, by REMOVING
++// the parallelism rather than by declining to add it. `StripGather` is exact
++// rather than approximate in both shapes it meets: a Gather is semantically
++// transparent, and a split aggregate folds back to the SIMPLE aggregate it was
++// split from.
+ //
+ // It never mutates root or anything below it.
+-func MaybeAddGather(root Node, s ParallelSettings) Node {
++func EnforceParallelPermission(root Node, s ParallelSettings) Node {
+ 	if root == nil {
+ 		return root
+ 	}
+@@ -108,33 +129,14 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
+ 		return StripGather(root)
+ 	}
+ 
+-	// C-19d COEXISTENCE RULE — the path model wins.
+-	//
+-	// The search can now produce a `PathGather` / `PathGatherMerge` priced by
+-	// cost_gather / cost_gather_merge (gatherpaths.go), so a plan reaching
+-	// this pass may ALREADY carry a Gather that add_path chose. Re-deciding
+-	// that with a size rule is precisely the defect Phase 5 removes, so the
+-	// post-pass stands down: the costed placement is kept as it is.
+-	//
+-	// This is not tidiness, it is a correctness stop. `terminatesPartial`
+-	// lists *Gather / *GatherMerge, and `findPartialSubtree` DESCENDS through
+-	// a terminating single-child node — so without this rule the post-pass
+-	// would nest a second Gather BELOW the path model's one: N workers each
+-	// launching N workers, and `gatherOp.prebuildHashJoins`'s "a Gather never
+-	// appears inside another Gather's partial subtree" comment silently
+-	// falsified.
+-	//
+ 	// EXPLAIN carries the real plan in Child. Descend so `EXPLAIN <query>`
+ 	// renders the SAME plan the query would execute — otherwise EXPLAIN would
+-	// systematically under-report parallelism, which is worse than useless: it
+-	// is the tool people use to check whether parallelism happened.
+-	//
+-	// The unwrap runs FIRST (it used to run after the stand-down): every test
+-	// below is about the real plan, and an *Explain root has no
+-	// `parallelChildren` arm, so asking any of them about the wrapper answers
+-	// about nothing.
++	// systematically over-report parallelism a session may not run, which is
++	// worse than useless: it is the tool people use to check whether
++	// parallelism happened. An *Explain root has no `parallelChildren` arm, so
++	// asking the tests below about the wrapper answers about nothing.
+ 	if ex, ok := root.(*Explain); ok {
+-		inner := MaybeAddGather(ex.Child, s)
++		inner := EnforceParallelPermission(ex.Child, s)
+ 		if inner == ex.Child {
+ 			return root
+ 		}
+@@ -143,18 +145,6 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
+ 		return &c
+ 	}
+ 
+-	// ── PERMISSION, and the post-cache ENFORCEMENT that goes with it ────────
+-	//
+-	// C-19g's remainder made the planner able to choose a Gather BEFORE the
+-	// plan-cache lookup, so a plan arriving here may already carry one that
+-	// THIS session may not run. The session GUCs that decide it are now part
+-	// of `plannerCacheFingerprint`, so a cached plan cannot cross that
+-	// boundary; the two facts that are NOT session GUCs — the transaction's
+-	// isolation level and the statement's own shape — cannot be fingerprinted
+-	// at all, and are enforced here by REMOVING the parallelism rather than by
+-	// declining to add it. `StripGather` is exact, not approximate: a Gather is
+-	// semantically transparent and a split aggregate folds back to the simple
+-	// one it was split from.
+ 	if s.MaxWorkersPerGather <= 0 {
+ 		return StripGather(root)
+ 	}
+@@ -167,43 +157,7 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
+ 	if !statementIsParallelSafe(root) {
+ 		return StripGather(root)
+ 	}
+-
+-	// C-19d COEXISTENCE RULE — the path model wins. The costed placement is
+-	// kept as it is; re-deciding it with a size rule is precisely the defect
+-	// Phase 5 removes.
+-	//
+-	// This is not tidiness, it is a correctness stop. `terminatesPartial`
+-	// lists *Gather / *GatherMerge, and `findPartialSubtree` DESCENDS through
+-	// a terminating single-child node — so without this rule the post-pass
+-	// would nest a second Gather BELOW the path model's one: N workers each
+-	// launching N workers, and `gatherOp.prebuildHashJoins`'s "a Gather never
+-	// appears inside another Gather's partial subtree" comment silently
+-	// falsified. It is the check C-19h deletes together with the pass.
+-	if subtreeHasGather(root) {
+-		return root
+-	}
+-
+-	// Find the deepest point at which the subtree below is partial-capable.
+-	tgt, ok := findPartialSubtree(root, s)
+-	if !ok {
+-		return root
+-	}
+-
+-	// Worker count comes from the scan, so a wrapper target (Sort, Aggregate)
+-	// is sized by what it reads rather than by itself.
+-	sized := tgt.node
+-	switch {
+-	case tgt.mergeKeys != nil:
+-		sized = tgt.node.(*Sort).Child
+-	case tgt.splitAgg:
+-		sized = tgt.node.(*Aggregate).Child
+-	}
+-	workers := computeParallelWorkers(sized, s)
+-	if workers <= 0 {
+-		return root
+-	}
+-
+-	return rebuildWithGather(root, tgt, workers)
++	return root
+ }
+ 
+ // subtreeHasGather reports whether the tree already carries a Gather or a
+@@ -232,17 +186,6 @@ func subtreeHasGather(n Node) bool {
+ 	return false
+ }
+ 
+-// partialTarget is where the Gather goes and what kind it must be.
+-type partialTarget struct {
+-	node Node
+-	// mergeKeys non-nil ⇒ the target is a Sort the workers run themselves, so
+-	// the leader must MERGE the streams rather than concatenate them.
+-	mergeKeys []SortKey
+-	// splitAgg ⇒ the target is an Aggregate to split into Partial (in the
+-	// workers) and Finalize (in the leader).
+-	splitAgg bool
+-}
+-
+ // statementIsParallelSafe applies the whole-plan refusals. Each is a case
+ // where the substrate cannot currently guarantee correctness — not a case
+ // where the shape is uninteresting.
+@@ -325,105 +268,6 @@ func tableIsUnsafeForParallel(t *catalog.Table) bool {
+ 	return false
+ }
+ 
+-// findPartialSubtree returns the node whose subtree may run in workers.
+-//
+-// The rule: push the Gather as low as possible while keeping the partial
+-// subtree as large as possible — i.e. immediately below the lowest node that
+-// terminates partial-ness. PG reaches the same placement by costing partial
+-// paths; here it is by construction.
+-func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
+-	cur := root
+-	for {
+-		// P9: an Aggregate over a partial-capable subtree splits rather than
+-		// terminating. Each worker aggregates its own share and publishes
+-		// per-group transition states; the leader combines them. PG's
+-		//
+-		//   Finalize HashAggregate -> Gather -> Partial HashAggregate -> Parallel Seq Scan
+-		//
+-		// This is the placement that matters most on TPC-H. Without it Q1
+-		// funnels ~5.9 M rows through the Gather into ONE leader-side
+-		// aggregate to produce four groups, and measurement shows that serial
+-		// tail pinning the query at ~7.1 s no matter how many workers run.
+-		if agg, isAgg := cur.(*Aggregate); isAgg && aggregateSplitIsSafe(agg) &&
+-			drivingScan(agg.Child) != nil {
+-			// The gate has to run HERE, not after the walk. Refusing must let
+-			// the loop fall through terminatesPartial(*Aggregate) and place
+-			// the Gather BELOW the aggregate — and that fallback is precisely
+-			// the "without the split" alternative the cost model costs
+-			// against.
+-			//
+-			// That is also why the settings are threaded in: the model needs
+-			// the parallel divisor, and MaybeAddGather does not compute the
+-			// worker count until after this walk has chosen a target. There is
+-			// no circularity — the sizing input (agg.Child) is in scope right
+-			// here — so the resolution is simply to size it now.
+-			//
+-			// C-19g (P5-07): the verdict is now a two-candidate PATH
+-			// tournament — Finalize->Gather->Partial against
+-			// Agg->Gather->input — priced by `costAgg` + `cost_gather` and
+-			// adjudicated by `addPath`/`setCheapest`
+-			// (partialaggpaths.go). `GOOPG_PARTIAL_AGG_PATHS=off`, the
+-			// default until the measurement in
+-			// docs/design/planner-c19g-partial-agg/DESIGN.md §6 says
+-			// otherwise, delegates to the retired size rule unchanged.
+-			// The construction site below is unchanged and is still the
+-			// ONLY one, which is what makes double-splitting structurally
+-			// impossible.
+-			if partialAggSplitPays(agg, computeParallelWorkers(agg.Child, s), s.LeaderParticipates) {
+-				return partialTarget{node: agg, splitAgg: true}, true
+-			}
+-		}
+-		// P7: a Sort directly over a partial-capable subtree does not have to
+-		// terminate partial-ness. Each worker sorts its own partition and the
+-		// leader merges the ordered streams — PG's
+-		//
+-		//   Gather Merge -> Sort -> Parallel Seq Scan
+-		//
+-		// which moves the sort, the expensive part, off the leader entirely.
+-		// This is reported to the caller rather than decided here because it
+-		// changes which Gather variant gets built, and building a plain Gather
+-		// over per-worker Sorts would silently return unordered rows.
+-		//
+-		// goopg's Sort carries no top-N limit, so there is no per-worker
+-		// truncation to reason about: every worker emits its whole partition.
+-		//
+-		// C-19e (P5-05): the verdict is now a two-candidate PATH tournament —
+-		// `Gather Merge -> Sort -> partial` against `Sort -> Gather -> partial`
+-		// — priced by `costSortRun` + `cost_gather` / `cost_gather_merge` and
+-		// adjudicated by `addPath` / `setCheapest` (partialsortpaths.go).
+-		// `GOOPG_PARTIAL_SORT_PATHS=off`, the default until the measurement in
+-		// docs/design/planner-c19e-partial-sort/DESIGN.md §5 says otherwise,
+-		// delegates to the retired type switch unchanged. The worker count is
+-		// sized from `srt.Child` for the same reason the aggregate arm sizes
+-		// from `agg.Child`: the divisor that PRICES the candidates must be the
+-		// one the built plan RUNS at, and `MaybeAddGather` does not compute it
+-		// until after this walk has chosen a target.
+-		if srt, isSort := cur.(*Sort); isSort && len(srt.Keys) > 0 &&
+-			!s.DisableGatherMerge &&
+-			drivingScan(srt.Child) != nil &&
+-			partialSortRootPays(srt, computeParallelWorkers(srt.Child, s), s.LeaderParticipates) {
+-			return partialTarget{node: srt, mergeKeys: srt.Keys}, true
+-		}
+-		if terminatesPartial(cur) {
+-			kids := parallelChildren(cur)
+-			if len(kids) != 1 {
+-				return partialTarget{}, false
+-			}
+-			cur = kids[0]
+-			continue
+-		}
+-		// cur is partial-capable if it bottoms out in an eligible seq scan.
+-		if drivingScan(cur) != nil {
+-			return partialTarget{node: cur}, true
+-		}
+-		kids := parallelChildren(cur)
+-		if len(kids) != 1 {
+-			return partialTarget{}, false
+-		}
+-		cur = kids[0]
+-	}
+-}
+-
+ // sortPartialRootPays reports whether moving the sort into the workers — P7's
+ // `Gather Merge -> Sort -> <partial>` — is worth it for this subtree.
+ //
+@@ -479,27 +323,6 @@ func sortPartialRootPays(srt *Sort) bool {
+ 	return true
+ }
+ 
+-// terminatesPartial reports whether a Gather must sit at or below this node.
+-func terminatesPartial(n Node) bool {
+-	switch n.(type) {
+-	case *Limit, *Distinct, *DistinctOn, *WindowAgg, *SetOp,
+-		*RecursiveUnion, *WorkTableScan, *Memoize, *NestedLoopIndexJoin,
+-		*Aggregate, *Sort, *Gather, *GatherMerge:
+-		// Aggregate reaches here only when the split was REFUSED — either the
+-		// node is not decomposable (aggregateSplitIsSafe) or the cost model
+-		// declined (partialAggSplitPays). Terminating is then correct
+-		// and is the fallback the model costs against: the Gather goes below
+-		// the aggregate, which is the pre-P9 shape.
+-		//
+-		// Sort remains listed because it terminates in the GENERAL case — a
+-		// Sort over something that is not a plain partial scan. The one shape
+-		// it does not terminate, Sort directly over a partial-capable subtree,
+-		// is taken by findPartialSubtree before this check runs.
+-		return true
+-	}
+-	return false
+-}
+-
+ // stampParallelScan is drivingScan's copy-on-write sibling: it performs the
+ // EXACT SAME traversal decision (Filter/Project pass-through, Join probe-side
+ // only under hashJoinIsPartialCapable, terminating on *SeqScan/*BitmapHeapScan)
+@@ -890,61 +713,6 @@ func tableParallelWorkersReloption(t *catalog.Table) int {
+ 	return t.ParallelWorkers
+ }
+ 
+-// rebuildWithGather returns a copy of root's spine with target replaced by
+-// Gather{target}. Nodes not on the path are shared by pointer; nothing is
+-// mutated.
+-func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
+-	if root == tgt.node {
+-		switch {
+-		case tgt.mergeKeys != nil:
+-			// The target IS the Sort, and `stampParallelScan` has no `*Sort`
+-			// arm — deliberately: `terminatesPartial` lists `*Sort`, so a Sort
+-			// can never appear INSIDE a partial subtree, and the traversal must
+-			// stay identical to `drivingScan`'s (this function's sibling
+-			// warning). The one place a Sort sits at the top of a partial
+-			// subtree is right here, and `findPartialSubtree` already resolved
+-			// it the same asymmetric way: it asked `drivingScan(srt.Child)`,
+-			// not `drivingScan(srt)`. So stamp the CHILD, for the same reason
+-			// and at the same offset.
+-			//
+-			// Found by C-19e's TPC-H arm (2026-09-07). Stamping `root` here
+-			// fell through every arm and returned the Sort UNCHANGED, so the
+-			// scan under a Gather Merge rendered without its `Parallel ` label
+-			// — EXPLAIN under-reporting the parallelism that actually ran,
+-			// which is the one thing EXPLAIN exists to answer here. Label-only
+-			// (the executor reads `Parallel` in operators_explain.go and
+-			// nowhere else), and latent since P7 because the shape was
+-			// unreachable: `sortPartialRootPays` declines every index driver,
+-			// and no TPC-H plan reached it with a seq-scan driver either.
+-			// C-19e's cost verdict makes it reachable (q16), which is the
+-			// "an unwinnable path is an untested path" pattern again.
+-			srt := root.(*Sort)
+-			stampedChild := stampParallelScan(srt.Child)
+-			if stampedChild == srt.Child {
+-				return NewGatherMerge(root.Pos(), root, workers, tgt.mergeKeys)
+-			}
+-			// Shallow copy: this pass runs on a plan the process-wide cache may
+-			// be handing to other sessions right now (file header, property 2).
+-			c := *srt
+-			c.Child = stampedChild
+-			return NewGatherMerge(c.Pos(), &c, workers, tgt.mergeKeys)
+-		case tgt.splitAgg:
+-			return splitAggregate(root.(*Aggregate), workers)
+-		}
+-		stamped := stampParallelScan(root)
+-		return NewGather(stamped.Pos(), stamped, workers)
+-	}
+-	kids := parallelChildren(root)
+-	if len(kids) != 1 {
+-		return root
+-	}
+-	rebuilt := rebuildWithGather(kids[0], tgt, workers)
+-	if rebuilt == kids[0] {
+-		return root
+-	}
+-	return replaceSingleChild(root, rebuilt)
+-}
+-
+ // splitAggregate turns one Aggregate into Finalize -> Gather -> Partial.
+ //
+ // Both new nodes are SHALLOW COPIES of the original: the post-pass runs on a
+diff --git a/internal/postmaster/dispatch.go b/internal/postmaster/dispatch.go
+index 66d839548..a163aa5a3 100644
+--- a/internal/postmaster/dispatch.go
++++ b/internal/postmaster/dispatch.go
+@@ -1486,7 +1486,7 @@ func sessionOpportunisticPrune(sess *misc.SessionRegistry) bool {
+ // would silently fail to disable parallelism. The cache therefore stores
+ // SERIAL plans, and this wraps per statement.
+ //
+-// planner.MaybeAddGather is correspondingly non-mutating: it returns a new
++// planner.EnforceParallelPermission is correspondingly non-mutating: it returns a new
+ // root sharing the cached children, because that cached node is being read
+ // concurrently by every other session running the same SQL.
+ // sessionGetter adapts a SessionRegistry to the plain (name) -> (effective,
+@@ -1522,7 +1522,7 @@ func applyParallelPostPassFrom(node optimizer.Node, get func(string) (string, bo
+ 	if node == nil || ectx == nil {
+ 		return node
+ 	}
+-	return optimizer.MaybeAddGather(node, optimizer.ParallelSettings{
++	return optimizer.EnforceParallelPermission(node, optimizer.ParallelSettings{
+ 		MaxWorkersPerGather: maxParallelWorkersPerGatherFrom(get),
+ 		MinTableScanBlocks:  minParallelTableScanSizeFrom(get),
+ 		LeaderParticipates:  parallelLeaderParticipationFrom(get),
+@@ -2068,7 +2068,7 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
+ 		bit(ps.EnableMemoize),
+ 		float(ps.HashMemMultiplier),
+ 		// C-19g's remainder: the parallel block. It used to be excluded
+-		// because `MaybeAddGather` ran post-cache and nothing parallel could
++		// because `EnforceParallelPermission` ran post-cache and nothing parallel could
+ 		// be baked into a cached plan. That stopped being true when the
+ 		// GROUP_AGG upper rel gained a `Finalize -> Gather -> Partial`
+ 		// candidate, so these must key sessions apart or one session's
+diff --git a/internal/postmaster/dispatch_extended.go b/internal/postmaster/dispatch_extended.go
+index c5ad41ff2..1037d84cd 100644
+--- a/internal/postmaster/dispatch_extended.go
++++ b/internal/postmaster/dispatch_extended.go
+@@ -157,7 +157,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
+ 		// Note this path reads the GUCs from `sess` directly rather than from an
+ 		// executor context: on the extended protocol, planning happens ~40 lines
+ 		// before ectx exists.
+-		node = optimizer.MaybeAddGather(node, optimizer.ParallelSettings{
++		node = optimizer.EnforceParallelPermission(node, optimizer.ParallelSettings{
+ 			MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
+ 			MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
+ 			LeaderParticipates:  sessionParallelLeaderParticipation(sess),
+diff --git a/postgres b/postgres
+deleted file mode 160000
+index 62d6c7d3d..000000000
+--- a/postgres
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 62d6c7d3df6287f1bd83199c1a746e50d31571a0
+diff --git a/postgres b/postgres
+new file mode 120000
+index 000000000..a96e2fb43
+--- /dev/null
++++ b/postgres
+@@ -0,0 +1 @@
++/home/ryo/work/goopg/goopg/postgres
+\ No newline at end of file

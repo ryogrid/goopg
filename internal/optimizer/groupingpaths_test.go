@@ -265,3 +265,77 @@ func TestCreateGroupingPathsNilAgg(t *testing.T) {
 		t.Fatalf("nil aggregate: want an error, got nil")
 	}
 }
+
+// TestCreateGroupingPathsPlainArmDoesNotCountEnableHashAgg is B-17b's
+// second pin, and it pins a NON-count.
+//
+// `cost_agg` (costsize.c:2682) increments `disabled_nodes` for `AGG_HASHED`
+// and `AGG_MIXED` only; its `AGG_PLAIN` branch (costsize.c:43-53 of the
+// function) never touches the counter. goopg's ungrouped candidate is PRICED
+// through the hashed arm at 0 group columns and 1 group — term-for-term PG's
+// PLAIN arm — so the strategy constant on that path reads
+// `AggStrategyHashed`, and stamping `DisabledNodes` from it would be the
+// natural mistake. It would also be a silent one: an ungrouped aggregate has
+// exactly one candidate, so a spurious disabled node changes no winner and no
+// row count, and would only surface as `Disabled: true` on an EXPLAIN line
+// PostgreSQL does not mark.
+func TestCreateGroupingPathsPlainArmDoesNotCountEnableHashAgg(t *testing.T) {
+	lines := captureTrace(t, func() {
+		cat := presortedAggCatalog(t)
+		stmt := parseOne(t, "select sum(unique1) from tenk1")
+		if _, err := PlanWithSettings(stmt, cat, hashAggSettings(false)); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var plain string
+	for _, l := range lines {
+		if strings.Contains(l, "producer="+groupAggPlainProducer) {
+			plain = l
+		}
+	}
+	if plain == "" {
+		t.Fatalf("no %s line: the ungrouped candidate was not offered", groupAggPlainProducer)
+	}
+	if !strings.Contains(plain, "disabled=0 ") {
+		t.Fatalf("plain line = %q, want disabled=0: cost_agg counts enable_hashagg for "+
+			"AGG_HASHED/AGG_MIXED only, never for AGG_PLAIN", plain)
+	}
+}
+
+// TestCreateGroupingPathsGroupingSetsCountEnableHashAgg is B-17b's
+// AGG_MIXED pin, expressed in the only strategy goopg has for the shape.
+//
+// PG splits a grouping-sets aggregate into AGG_HASHED (every set hashable) and
+// AGG_MIXED (some sets sorted, some hashed), and `cost_agg` counts
+// `!enable_hashagg` for BOTH. goopg has no AGG_MIXED: `groupingsets.go` runs
+// every set through one hash table per set, so the shape is always the hashed
+// arm — which means the MIXED half of B-17b is satisfied by proof rather than
+// by a second setter, and this test is what makes that proof falsifiable. If a
+// sorted grouping-sets strategy is ever added it will need its own count, and
+// this test's comment is where to look.
+//
+// Note the winner is UNAFFECTED: grouping sets have no sorted candidate at all
+// (the executor cannot run them sorted), so the disabled node only propagates
+// upward — which is exactly PG's behaviour when the only path is disabled.
+func TestCreateGroupingPathsGroupingSetsCountEnableHashAgg(t *testing.T) {
+	lines := captureTrace(t, func() {
+		cat := presortedAggCatalog(t)
+		stmt := parseOne(t, "select ten, sum(unique1) from tenk1 group by grouping sets ((ten), ())")
+		if _, err := PlanWithSettings(stmt, cat, hashAggSettings(false)); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var hashed string
+	for _, l := range lines {
+		if strings.Contains(l, "producer="+groupAggHashedProducer) {
+			hashed = l
+		}
+	}
+	if hashed == "" {
+		t.Fatalf("no %s line for a grouping-sets aggregate: %q", groupAggHashedProducer, lines)
+	}
+	if !strings.Contains(hashed, "disabled=1 ") {
+		t.Fatalf("grouping-sets line = %q, want disabled=1: PG's cost_agg counts "+
+			"enable_hashagg for AGG_MIXED as well as AGG_HASHED", hashed)
+	}
+}

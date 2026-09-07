@@ -357,7 +357,27 @@ func (s *searchCtx) joinClauseSelectivity(ri *restrictInfo) float64 {
 // `<>` inherits its operand's flag rather than being called a guess outright:
 // `1 - eqjoinsel` over two measured ndistincts is as measured as the equality
 // it negates.
+//
+// P6-08 (take3 08 §9): the result is memoised on the `restrictInfo` as PG's
+// `norm_selec`. The DP asks for the same clause's selectivity once per joinrel
+// pair that can evaluate it — O(2^n) times for a clause low in the tree — and
+// the answer moves with neither the pair nor anything else that changes during
+// a search (see the cache contract on `restrictInfo`). Planning-speed only:
+// the cached value is bit-identical to the computed one, so plans do not move.
 func (s *searchCtx) joinClauseSelectivityExt(ri *restrictInfo) (float64, bool) {
+	if ri != nil && ri.normSelecValid {
+		return ri.normSelec, ri.normSelecDefault
+	}
+	sel, isdefault := s.joinClauseSelectivityExtUncached(ri)
+	if ri != nil && s != nil {
+		ri.normSelec, ri.normSelecDefault, ri.normSelecValid = sel, isdefault, true
+	}
+	return sel, isdefault
+}
+
+// joinClauseSelectivityExtUncached is the body `joinClauseSelectivityExt`
+// memoises; every caller should go through the memo.
+func (s *searchCtx) joinClauseSelectivityExtUncached(ri *restrictInfo) (float64, bool) {
 	if ri == nil || ri.clause == nil {
 		return defaultUnhandledClauseSel, true
 	}
@@ -707,6 +727,22 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 // Returns (1, 1) — charge everything, i.e. today's behaviour — whenever either
 // side's range cannot be established. That is the safe direction: this term can
 // only ever REDUCE a merge join's cost, so an unknown must not.
+//
+// P6-08 (take3 08 §9): the two end selectivities are memoised on the clause,
+// which is upstream's own arrangement — `mergejoinscansel`'s callers go through
+// `cached_scansel` (costsize.c:3798), whose `MergeScanSelCache` list hangs off
+// the `RestrictInfo`. The reason is the same in both planners: the estimate is
+// re-asked once per merge path considered, the histogram walk behind it is the
+// single most expensive thing in the join search on a statistics-bearing
+// catalog (measured: `histCmp` 43.7% of planning CPU over TPC-H before this
+// cache), and its answer moves with none of what varies between those calls.
+//
+// The memo is stored in the clause's OWN left/right orientation and rotated at
+// return, so both directions of a commuted join share one computation. That is
+// sound because the underlying question is symmetric: the pair
+// (fraction of left at or below right's max, fraction of right at or below
+// left's max) is a property of the clause, and which member is the "outer" end
+// is decided entirely by `outerRelids` here at the return.
 func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet) (outerEnd, innerEnd float64) {
 	if len(clauses) == 0 {
 		return 1, 1
@@ -717,28 +753,43 @@ func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet
 	if ri == nil || ri.leftKey == nil || ri.rightKey == nil {
 		return 1, 1
 	}
-	outerKey, outerRels := ri.leftKey, ri.leftRelids
-	innerKey, innerRels := ri.rightKey, ri.rightRelids
-	if !relsSubset(outerRels, outerRelids) {
-		outerKey, outerRels, innerKey, innerRels = innerKey, innerRels, outerKey, outerRels
-	}
-	if !relsSubset(outerRels, outerRelids) {
+	// Which operand is on the outer side of THIS join. The left operand wins
+	// when it qualifies, exactly as the pre-cache swap did.
+	leftIsOuter := relsSubset(ri.leftRelids, outerRelids)
+	if !leftIsOuter && !relsSubset(ri.rightRelids, outerRelids) {
 		return 1, 1
 	}
-
-	ov := s.examineJoinVar(outerKey, outerRels)
-	iv := s.examineJoinVar(innerKey, innerRels)
-	oMax, oOK := histogramMax(ov.stats)
-	iMax, iOK := histogramMax(iv.stats)
-	if !oOK || !iOK {
-		return 1, 1
+	leftEnd, rightEnd := s.mergeScanSelForClause(ri)
+	if leftIsOuter {
+		return leftEnd, rightEnd
 	}
+	return rightEnd, leftEnd
+}
 
-	// The outer is scanned until it passes the INNER's maximum, and vice
-	// versa: `leftend = scalarineqsel(left <= right_max)`.
-	outerEnd = fractionAtMost(ov.stats, iMax, ov.typeName)
-	innerEnd = fractionAtMost(iv.stats, oMax, iv.typeName)
-	return clampSelectivity(outerEnd), clampSelectivity(innerEnd)
+// mergeScanSelForClause is `mergeJoinScanSel`'s body in the clause's own
+// orientation: (fraction of the LEFT operand at or below the right operand's
+// maximum, fraction of the RIGHT operand at or below the left's). Memoised on
+// the `restrictInfo` — PG's `MergeScanSelCache` — under the cache contract
+// documented on that struct.
+func (s *searchCtx) mergeScanSelForClause(ri *restrictInfo) (leftEnd, rightEnd float64) {
+	if ri.scanSelValid {
+		return ri.scanSelLeftEnd, ri.scanSelRightEnd
+	}
+	leftEnd, rightEnd = 1, 1
+	lv := s.examineJoinVar(ri.leftKey, ri.leftRelids)
+	rv := s.examineJoinVar(ri.rightKey, ri.rightRelids)
+	lMax, lOK := histogramMax(lv.stats)
+	rMax, rOK := histogramMax(rv.stats)
+	if lOK && rOK {
+		// The outer is scanned until it passes the INNER's maximum, and vice
+		// versa: `leftend = scalarineqsel(left <= right_max)`.
+		leftEnd = clampSelectivity(fractionAtMost(lv.stats, rMax, lv.typeName))
+		rightEnd = clampSelectivity(fractionAtMost(rv.stats, lMax, rv.typeName))
+	}
+	if s != nil {
+		ri.scanSelLeftEnd, ri.scanSelRightEnd, ri.scanSelValid = leftEnd, rightEnd, true
+	}
+	return leftEnd, rightEnd
 }
 
 // histogramMax is `get_variable_range`'s upper bound: the last histogram
