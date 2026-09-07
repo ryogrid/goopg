@@ -3732,6 +3732,59 @@ ledger row if the measurement says no.
   NOTE the standing trap — `estimate-audit` defaults to `-serial`, so its
   captures are BLIND to this entire item; judge it with parallel-mode runs.*
 
+- [ ] **E-19 EX5-05 AIO prefetch that actually populates the buffer pool.**
+  Filed 2026-09-07 at the owner's request, same standing as E-17 cut 2 and
+  E-18: **design doc + agent review + commit the design first, then
+  implement.**
+  **The defect is already documented and is not in dispute.**
+  `docs/design/storage-prefetch-buffer/DESIGN.md` §1 quotes the code:
+  `Pool.Prefetch` allocates a fresh 8 KiB buffer, submits a real
+  asynchronous read through `Manager.PrefetchBlock`, and then **drops the
+  buffer when the function returns**. It is never installed into the pool,
+  so the following `Pin` of that block does a full read anyway. Ledger rows
+  `take3-E-11-prefetch-discards-buffer`, `take3-E-11-readstream-declined`;
+  `bufpool.go:1341` says it in the code's own words — *"PrefetchBlock and
+  then DROPPED it, so the read could never serve"*.
+  The only surviving effect is **warming the OS page cache** (files are
+  opened plain buffered, no `O_DIRECT` anywhere in the tree).
+  **Why E-11's decline does NOT settle this.** E-11 measured the *broken*
+  prefetch and correctly removed it: forcing serial made the window live and
+  showed more prefetch is **worse** — −12.1% on a 7-query serial subset,
+  −35.0% on Q6, with `Pool.Prefetch` at **63.8% of allocation objects**
+  (2.85× the object count, 9.9× the bytes against depth 0). That is exactly
+  what a prefetch that pays for I/O and allocation and then discards the
+  result should measure. **It is evidence about a discarding prefetch, not
+  about prefetching.** The existing design's chosen outcome was (B) remove
+  the mechanism; this item is the (A) branch it did not take.
+  **Two structural obstacles the design must address, both already known:**
+  1. **`refillPrefetchWindow` returns early for a parallel scan by design**
+     (ch. 04 §4.2), and **every TPC-H plan at bench settings is parallel**
+     (Q6 = `Gather` / Workers Planned 4 / `Parallel Seq Scan`). So a fixed
+     prefetch would still be **inert at the default** — E-11's five-depth
+     sweep was a five-way A/A for this reason. Either the parallel path gets
+     a window too, or the item has no witness at bench settings and must say
+     so.
+  2. **`Manager.PrefetchBlock` holds the per-block latch**
+     `relFile.lockBlock(blk)` until the AIO op completes, so installing into
+     the pool has to interact with the pinned-but-not-yet-valid slot class
+     the design sketches at §192 — a concurrent `Pin` of an in-flight block
+     must block on validity, not read the block a second time.
+  **And a sizing caveat that must be answered before building:** PG's own
+  `read_stream.c` declines to look ahead past one block when no I/O is
+  necessary, and TPC-H SF=1 is **1.9 GiB against ~19 GiB of page cache** on
+  this host — so at bench scale the data is resident and a correct prefetch
+  may still measure nothing. **Establish a witness where I/O actually
+  happens** (S-cold, a larger scale factor, or a constrained page cache)
+  before committing to the buffer-pool installation work; if no such witness
+  exists in either corpus, that is a legitimate out-of-scope verdict.
+  PG references: `bufmgr.c:1489` and `:1262` (the `PrefetchBuffer` /
+  `StartReadBuffer` path that DOES install), and `read_stream.c` for the
+  look-ahead controller.
+  *gate: values both suites; a cold-cache A/B on the witness shape with the
+  alloc arm (the 63.8%-of-objects figure is the number to beat); plans should
+  NOT move — prefetch is an I/O-path change, so a plan movement means
+  something else happened.*
+
 - [ ] **E-17 EX3-08 scan-resident qual — OPEN. The target is CUT 2:
   evaluate the predicate ONCE inside the scan, as PG does, and delete the
   `Filter` node.**
