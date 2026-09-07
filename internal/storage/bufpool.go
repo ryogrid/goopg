@@ -2055,11 +2055,15 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 
 	// Transition to valid+pinned. Read waiter count under pinMu before
 	// clearing ioInflight so no new waiters can arrive between read and wake.
+	//
+	// E-19 S3: this used to be an absolute Store with the pin hard-coded to 1.
+	// It is now publishValid(extraPin=1) — a CAS that MERGES — so that this
+	// path and ReadOp.Finish (which already holds its caller's pin, taken at
+	// claim time) share one publish and cannot drift. Under pinLoad nothing
+	// can hold a pin here, so the merge is arithmetically identical to the
+	// Store it replaces.
 	n := p.slotWaiters[victimIdx].Load()
-	prevSt := s.state.Load()
-	newSt := slotValidBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
-	s.state.Store(newSt)
-	p.traceSlotEvent(int32(victimIdx), evPinLoadPublish, tag, prevSt, newSt)
+	p.publishValid(s, gen, 1)
 	for i := int32(0); i < n; i++ {
 		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}

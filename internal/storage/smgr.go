@@ -209,7 +209,12 @@ func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (A
 	if err != nil {
 		return nil, err
 	}
-	if blk >= f.nblocks {
+	// f.nBlocks() takes r.mu. Reading f.nblocks bare here was a dormant data
+	// race against relFile.extend's r.nblocks++ (E-19 design §4.1a, the second
+	// unnumbered finding) — dormant only because PrefetchBlock had no
+	// production caller. E-19 S3 gives it one on every look-ahead block, so
+	// the race would have gone hot.
+	if blk >= f.nBlocks() {
 		return preCompletedHandle{err: ErrShortRead}, nil
 	}
 	off := int64(blk) * BlockSize

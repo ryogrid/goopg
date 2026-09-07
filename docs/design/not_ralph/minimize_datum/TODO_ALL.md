@@ -3862,7 +3862,40 @@ ledger row if the measurement says no.
     Three tests; the injected-fault one is also a real assertion about HEAD
     and passes: a failed read leaves no pin, no slot with the IO bit set and
     no bufmap entry, and the same tag reads cleanly afterwards.
-  - S3 `StartRead`/`FinishRead` — pending.
+  - **S3 `StartRead`/`FinishRead` — LANDED 2026-09-07.**
+    `internal/storage/prefetch.go`: `Pool.StartRead(tag) (*ReadOp, error)`,
+    `ReadOp.Finish` / `ReadOp.Abort`. The read lands **in the slot's own
+    page** — the exact thing the deleted `Pool.Prefetch` failed to do — and
+    `TestStartReadInstallsIntoThePool` asserts the payoff directly:
+    consuming the prefetched blocks afterwards issues **zero** further reads.
+    The three review findings the row demanded be honoured in code:
+    (1) **the deadlock** — submission moved out from under `pinMu` AND the
+    completion callback made pool-free (publication happens in `Finish`, on
+    the consumer's goroutine), so neither edge of the cycle survives;
+    `TestStartReadDoesNotHoldPinMuAcrossSubmit` (2-deep queue, 1 worker
+    taking `pinMu` per completion, 8-deep window) was **falsified against a
+    deliberately naive build and hung for the full 60 s timeout** in
+    `Submit` under `pinMu`, then passed on the real one.
+    (2) **checksum verification is not dropped** — it lives one layer down
+    (`relFile.ReadAt` / `readBlock` / `aio.ChecksumFile`) so no caller can
+    bypass it, and `TestStartReadVerifiesChecksums` corrupts a page on disk
+    and asserts `Finish` fails.
+    (3) **a concurrent `Pin` of an in-flight block blocks on validity** —
+    `TestConcurrentPinOfInFlightBlockWaitsForValidity` asserts the waiter
+    parks on the slot semaphore and that the pool-wide read count moves by
+    exactly one, i.e. the block is not read twice.
+    Also fixed here: the publish is now `publishValid`, a CAS that **merges**
+    the pin instead of an absolute `Store` with pin hard-coded to 1 (finding
+    3), shared with `pinLoad` so the two cannot drift; `Abort` keeps the pin
+    until it is done rather than calling `releaseVictimSlot`, which would
+    wipe the generation out from under a `*Slot` the caller still holds
+    (finding 5 — the one a pin-balance test passes while broken); and
+    `PrefetchBlock`'s unlocked `f.nblocks` read became `f.nBlocks()` (the
+    dormant race S3 would have made hot). Seven tests, `-race` green.
+    Finding 6 (a dirty victim's synchronous writeback front-loading up to D
+    inline flushes before any read is in flight) is **documented, not
+    fixed** — it needs a background writer that does not exist, and it is
+    part of why the depth knob defaults to 0.
   - S4 scan-side window — pending.
   **Probe 0 answers the sizing caveat below and answers it POSITIVELY**: on a
   cold, low-correlation, larger-than-pool index fetch (private cluster,
