@@ -429,7 +429,28 @@ The falsification pass took the one-line substitution above at its word and
 broke it six times. Each is a real edit, not a caveat, and together they are
 most of the reason §8 lands where it does.
 
-1. **The substitution silently drops checksum verification.**
+1. ~~**The substitution silently drops checksum verification.**~~
+   **REFUTED 2026-09-07, on the way to S1 — and the refutation found a live
+   shipped bug.** `relFile` implements `ReadAt` (`smgr.go:800-810`) and *that*
+   verifies: `if err == nil && r.checksums && n == BlockSize && off%BlockSize
+   == 0 { verifyOnRead(...) }`, under `r.mu`. `runOp` dispatches `DirRead` to
+   `op.File.ReadAt` (`aio/aio.go:699-702`), and `aioFileAdapter.ReadAt`
+   forwards to it (`initdb/open.go:2729-2731`). So on both the `sync` and
+   `worker` methods — i.e. the production default — `PrefetchBlock` **is**
+   checksum-verified, and `StartRead` inherits that for free. The reviewer
+   compared against `readBlock` and missed the `ReadAt` sibling.
+   **But** the `io_uring` method's raw-fd path bypasses `ReadAt`/`WriteAt`
+   entirely and takes its checksum behaviour from `aio.ChecksumFile`
+   (`method_iouring_linux.go:391`, `:591-592`), which it asserts on `op.File`
+   — the *adapter*, which did not implement it. That hole is not
+   E-19's: it was already live on the **write** path
+   (`Manager.WriteBlockAIO` ← `bufpool.go:2635`), stamping no checksum at all
+   on an `io_method = io_uring` cluster. Fixed as its own commit with its own
+   tests; ledger row `aio-adapter-lost-checksumfile`. The original text is
+   struck rather than deleted because the wrong finding is what found the real
+   one.
+   *(historical text)* **The substitution silently drops checksum
+   verification.**
    `Manager.ReadBlock` → `relFile.readBlock`, whose *last statement* is
    `return r.verifyOnRead(blk, buf)` (`smgr.go:888`, definition `:706-720`),
    preceded by the short-read check and `recordIOTrace` / `PageIdentityObserve`

@@ -2748,6 +2748,46 @@ func (a aioFileAdapter) Fd() uintptr {
 	return ^uintptr(0)
 }
 
+// PrepareWrite / VerifyRead implement aio.ChecksumFile by forwarding to the
+// wrapped storage.AIOFile when it has the hooks (storage.relFile does).
+//
+// These exist because Fd() above makes the io_uring method take its raw-fd
+// fast path, which hands the kernel a pointer straight into the caller's
+// buffer and never calls ReadAt/WriteAt — where relFile does its checksum
+// stamping and verification (smgr.go:804-808, :821-823). aio.ChecksumFile is
+// the hook the io_uring method offers instead (method_iouring_linux.go:391,
+// :591), and it type-asserts on `op.File`, which is THIS adapter, not the
+// relFile underneath. Without these two methods the assertion failed and the
+// hooks were silently skipped: on an `io_method = io_uring` cluster with data
+// checksums enabled, every FlushAllPaced / checkpointer write through
+// Manager.WriteBlockAIO (bufpool.go:2635) landed on disk with **no checksum
+// stamped**, which the next ReadAt then reports as a ChecksumError — a
+// self-inflicted corruption report. No values suite could see it because the
+// suites run at the default `io_method = worker`, whose ReadAt/WriteAt path
+// checksums correctly.
+//
+// Forwarding is conditional, so a wrapped file without the hooks (a plain
+// *os.File, an in-memory test file) keeps exactly the no-checksum behaviour it
+// has on the ReadAt/WriteAt path — the identity PrepareWrite and the nil
+// VerifyRead below are what "no checksum handling either way" means.
+func (a aioFileAdapter) PrepareWrite(buf []byte, off int64) []byte {
+	if cf, ok := a.f.(interface {
+		PrepareWrite([]byte, int64) []byte
+	}); ok {
+		return cf.PrepareWrite(buf, off)
+	}
+	return buf
+}
+
+func (a aioFileAdapter) VerifyRead(buf []byte, off int64) error {
+	if cf, ok := a.f.(interface {
+		VerifyRead([]byte, int64) error
+	}); ok {
+		return cf.VerifyRead(buf, off)
+	}
+	return nil
+}
+
 // aioHandleAdapter unwraps the aio.Result struct into the
 // (n, err) pair storage.AIOHandle exposes.
 type aioHandleAdapter struct {
