@@ -1895,6 +1895,96 @@ Two secondary findings recorded and not acted on: goopg charges
 the same 29,998.50 for both a seq scan and an index scan of `orders` —
 the two-estimator divergence of §5.21, seen from the other side.
 
+## 5.30. C-19h: the census reaches parity and is still the wrong instrument
+
+C-19g's landing was supposed to unblock C-19h. The re-run says the stated
+blockers are gone — and the item still cannot land, for a reason the
+census **structurally cannot see**.
+
+**The census reached parity, by a stronger test than the count.** The
+agent built a *real* retirement rather than a stand-down probe:
+`MaybeAddGather`'s ADD half deleted, enforcement half kept and renamed
+`EnforceParallelPermission`, both `dispatch.go` call sites updated.
+
+| arm | queries with a Gather |
+|---|---|
+| A — post-pass live, defaults | **12/22** |
+| B — post-pass **deleted**, defaults | **12/22** |
+| C — deleted + `GOOPG_GATHER_PATHS=all` | 13/22 (adds Q21) |
+
+`diff armA armB` is **empty**: all 22 plans byte-identical, costs
+included. The +100% suite cost is gone, the six-query loss cohort
+(Q1/Q6/Q14/Q15a/Q16/Q19) is fully recovered, and every TPC-H Gather now
+comes from `partialaggupper.go`. Blockers 1 and 3 from §5.24.2 are
+discharged.
+
+**And the census is blind.** All 22 TPC-H queries carry an aggregate at
+the top, and C-19g's producer is aggregate-only — so a 12/22-versus-12/22
+tie says nothing about any plan whose root is not an aggregate. Probed
+directly:
+
+```
+select * from lineitem where l_extendedprice > 90000
+  arm A (post-pass live):    Gather (Workers Planned: 4) -> Parallel Seq Scan
+  arm B (post-pass deleted): Seq Scan
+  vanilla PG 18.3 (:65432):  Gather
+```
+
+So the deletion is a **PG-parity regression**, not a cleanup — and the
+only reason 22 of 22 agreed is that the corpus has no witness. This is
+the same lesson as §5.11 ("a whole class of items has no witness in
+either corpus"), but sharper: here the *gate itself* was the thing
+without a witness, and it returned a clean pass for a change that breaks
+a shape PG handles.
+
+**`GOOPG_GATHER_PATHS=all` does not rescue it**, and the arithmetic says
+why: `add_path` correctly dominates every plain base-rel Gather, because
+`parallel_tuple_cost` is 0.1/row against a 4-worker `cpu_tuple_cost`
+saving of ≈0.0075/row — C-19d's own DESIGN §5.1 figures. **The
+prerequisite is therefore C-19d's crossover, not C-19d's default flip.**
+That is a different item from the one everyone assumed, and it is the
+third time C-19h's blocker has been re-identified.
+
+**Two corrections to the item's own deletion set**, both found by
+attempting it: `splitAggregate` **cannot** be deleted — it is now the
+path model's constructor via `createplansimple.go` — and
+`sortPartialRootPays` cannot either, because C-19e's tournament delegates
+to it. A deletion list written before two of its entries changed owners.
+
+**The recommendation is demotion, not deletion**, and it is
+PG-faithful: upstream implements `debug_parallel_query` as a
+post-planning Gather wrap in `standard_planner` (planner.c:465-495), so a
+`debug_parallel_query`-gated post-pass is the same *kind* of thing PG
+has. Deleting it instead leaves the GUC fully unconsumed and strips the
+only forced-parallel constructor for 68 call sites across 14 test files.
+The blocker is pinned as a test rather than prose:
+`TestPostPassOwnsTheNonAggregateGather`.
+
+### 5.30.1 D-05: hypothesis refuted, and the two items now unblock together
+
+D-05's re-test was supposed to check whether the parallel blindness had
+lifted. It has not, and the mechanism is now narrower than the standing
+claim.
+
+C-19g moved the aggregate Gather's **producer** into the search but not
+its **eligibility predicate**, which is still `drivingScan` with the same
+`JoinAlgoHash` requirement. Measured at the defaults with
+`partialaggupper` live: **an aggregate over a Merge Join gets no Gather
+at all.** And the hash-versus-merge decision is taken one level lower, at
+the join rel, where the default still offers no partial path.
+
+So the carry-forward statement changes. It is no longer *"the cost model
+has no parallel dimension"* — that was true and is now too coarse. It is:
+**the parallel dimension reaches only the aggregate upper rel, one level
+above where the choice is made.** That is the same defect as C-19h's
+third blocker, which means **C-19h and D-05 now unblock together**, and
+spill-cost Cut 3's held Q9 (§5.27) sits behind the same fix.
+
+The agent explicitly declined to re-test Cut 3's Q9, because its
+precondition — C-19h landing — did not occur. It noted the D-05 result
+gives reason to expect the regression survives, and then declined to
+report that as a measurement. That distinction is the right one.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
