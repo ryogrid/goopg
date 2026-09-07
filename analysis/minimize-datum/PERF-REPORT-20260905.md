@@ -2053,6 +2053,65 @@ it here.
 A second, unrelated fail-open hole was closed on the way
 (`df1c4a049`): `attachParallelScan` now fails closed on non-hash joins.
 
+## 5.32. C-06s lands: the missing spelling, and a 2.2x on the query that had a mechanism
+
+C-06s is the fix §5.29's diagnosis pointed at, and it closes with its
+whole gate discharged. `jointypeForDirection` now returns
+`(JoinRight, true)` on reversed containment — PG's `JOIN_RIGHT` — scoped
+LEFT-only and fail-closed, since SEMI/ANTI have no `JOIN_RIGHT_SEMI`
+executor arm and FULL is refused outright. Nothing downstream needed
+changing: `createPlanNode` already mapped JoinRight, the merge arm
+already built right paths, and the executor already ran `Hash Right
+Join`.
+
+**Plan movement is small and consistently toward PG.**
+
+| suite | movement |
+|---|---|
+| TPC-H | 23 diff lines, **all inside Q13** — `Merge Left Join` -> `Hash Right Join`; 21 queries byte-identical; Q13 5.16 -> 4.45 s |
+| TPC-DS | 96 same / 3 changed — Q5 and Q75 to `Hash Right Join`, Q40 to `Nested Loop Left Join` + index scan |
+
+All three TPC-DS movers land on shapes PG's own captured plans contain
+(`plans-pg/Q5.txt`, `Q75.txt`, `Q40.txt`), which is the strongest
+available statement that the search now sees what PG sees.
+
+**The timed pass, read honestly.** Paired arms, fresh capped server each,
+two reps, base = the same tree minus C-06s so the delta isolates this
+item:
+
+| query | base | C-06s | verdict |
+|---|---|---|---|
+| Q40 | 0.846 / 0.868 s | **0.383 / 0.376 s** | **2.2x — ranges do not overlap** |
+| Q5 | 17.27 / 20.26 s | 15.82 / 18.56 s | faster, but inside the spread |
+| Q75 | 6.69 / 6.86 s | 5.83 / 7.94 s | inside the spread |
+
+**Only Q40 is a claimable win.** Q5 and Q75 have overlapping ranges across
+their reps, so the correct reading is "no regression", not a speed-up.
+Reporting them as gains would be the same error an A/A control caught
+earlier in this workstream when it measured −14.8% of pure warm-up drift
+on an unchanged binary. Q40 is also the one with a mechanism to point at
+— its plan moved onto PG's own shape.
+
+### 5.32.1 Nine pins updated, not deleted — and three had a second defect
+
+The nine failing shape pins asserted *"exactly one LEFT join"*. That was
+only ever true **because the commuted direction was declined**; the
+invariant they exist to guard is that the link must not become **INNER**,
+which drops the unmatched rows and is the Q72 wrong answer no row-count
+gate can see. They now count LEFT+RIGHT through one helper whose comment
+records the distinction. FULL is still refused.
+
+Three of them had a second, subtler defect: they read the join's hands
+**positionally**. A LEFT join preserves its `Left` child and a RIGHT join
+its `Right` one, so a commuted winner has its children swapped — those
+sites would have reported the leaf counts backwards and **failed a
+correct plan**. They now select the preserved and null-extended sides by
+jointype.
+
+This is the general shape of the work: when a decline is lifted, the
+tests written under it encode the decline as if it were the invariant,
+and separating the two is most of the change.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three

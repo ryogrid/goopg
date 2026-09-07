@@ -879,7 +879,7 @@ rule).*
   re-run this one-command measurement — two `estimate-audit -plan-only`
   captures on the same cluster, one per flag value — and delete the flag
   when they come back identical. Ledger `c06-collapse-flip-moves-q13`.
-- [~] **C-06s — LANDED 2026-09-07 (`922a3f444`); TWO GATE ITEMS OUTSTANDING.**
+- [x] **C-06s — LANDED 2026-09-07 (`922a3f444`); GATE COMPLETE.**
   `jointypeForDirection` now returns `(JoinRight, true)` on reversed
   containment, LEFT-only and fail-closed (SEMI/ANTI/FULL keep declining; no
   `JOIN_RIGHT_SEMI`/`JOIN_RIGHT_ANTI` executor arms exist). Downstream needed
@@ -904,12 +904,25 @@ rule).*
   shapes (Q5, Q75 -> `Hash Right Join`, which is literally what
   `plans-pg/Q5.txt` and `Q75.txt` contain; Q40 -> `Nested Loop Left Join`
   with an index scan, matching `plans-pg/Q40.txt`).
-  **STILL OWED, and the row is not `[x]` until both land:**
-  1. the timed pass on the TPC-DS queries whose plans moved (Q5/Q40/Q75) —
-     the gate says "every query whose plan moved", and only the TPC-H side of
-     that has been timed. All three PASS with checksums and sit far under the
-     300 s budget (Q5 20 s, Q40 0.4 s, Q75 5 s), but a passing value is not a
-     timing.
+  **Both formerly-owed gate items are now discharged:**
+  1. ~~the timed pass on the TPC-DS movers~~ **DONE 2026-09-07.** Paired arms
+     on the SF0.5 cluster, fresh capped server per arm, two reps each, base =
+     `d1ce74b66` and gate = the same tree plus C-06s (so the delta isolates
+     this item and nothing else). Row counts identical on every run.
+
+     | query | base | C-06s | verdict |
+     |---|---|---|---|
+     | Q40 | 0.846 / 0.868 s | **0.383 / 0.376 s** | **2.2x faster — ranges do not overlap** |
+     | Q5 | 17.27 / 20.26 s | 15.82 / 18.56 s | faster, but INSIDE the spread |
+     | Q75 | 6.69 / 6.86 s | 5.83 / 7.94 s | INSIDE the spread |
+
+     Stated honestly: **only Q40 is a claimable win.** Q5 and Q75 have
+     overlapping ranges across the two reps, so the right reading is "no
+     regression", not a speed-up — the same discipline that caught a −14.8%
+     A/A warm-up drift elsewhere in this workstream. Q40's move is the one
+     with a mechanism to point at: its plan went to `Nested Loop Left Join`
+     with an index scan, which is what `bench/tpcds/plans-pg/Q40.txt` shows PG
+     doing.
   2. ~~the `plan_snapshots/` re-pin~~ **DONE 2026-09-07**: captured under the
      new name `plan_snapshots/c20a-c06s-plancost-rows-20260907.txt` on a tree
      carrying both C-06s and C-20a, so one pin covers both movers;
