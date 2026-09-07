@@ -173,3 +173,35 @@ the larger corpus.
 | Q21 | 13.43 | 12.86 | 0.96x |
 | Q22 | 0.67 | 0.62 | 0.93x |
 | **TOTAL** | **274.18** | **96.72** | **0.353×** |
+
+---
+
+## Second instalment — E-17 cut 2 delta (appended 2026-09-07, per the row's sequencing)
+
+First instalment above measures the tree WITH the double evaluation
+(scan prefilter + filterOp). Cut 2 (`07c277866`) deletes the Filter
+operator above SeqScan and evaluates the absorbed qual exactly once.
+Same-binary A/B (`tmp/goopg-e17`, `GOOPG_SCAN_PREFILTER=off` vs default),
+fresh capped servers (age 0 both arms), private TPC-H clone.
+
+| witness | OFF (double eval) | ON (single eval) | delta |
+|---|---|---|---|
+| Q6 serial rep 1 | 7.86 s | 4.89 s | 0.62× |
+| Q6 serial rep 2 | 7.79 s | 4.19 s | 0.54× |
+| Q6 serial rep 3 (warm) | 6.19 s | 4.18 s | **0.68× (−32 %)** |
+
+The win is rejected-row deform savings (98 % of 6M rows rejected before
+tail deform + deep copy), not surviving-row re-evaluation — Q6 survives
+~2 %, so one-eval-per-survivor alone could never buy 32 %.
+
+Values parity (the row's gate, not timing): TPC-H digest **24/24 MATCH**
+OFF-vs-ON baseline arm (`tpch-runner -diff`, ordered + unordered +
+column signatures); TPC-DS SF0.5 sweep **PASS=95 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=0 SKIP=4** on the cut-2 binary. Plan-shape pin:
+OFF-vs-ON plan-only captures are **structurally identical (0-line diff
+after cost/rows normalisation)** — the Filter PLAN node is untouched, so
+no `plan_snapshots/` re-pin is owed. EXPLAIN ANALYZE renders PG's shape
+(`Seq Scan ... Filter: ... Rows Removed by Filter: 5887614`, nfiltered1
+on the scan, no Filter node). Error-position pin:
+`TestScanAbsorbedQualErrorPosition` (early-error promotes to late,
+22012 identical both arms, non-vacuity asserted).

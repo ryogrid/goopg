@@ -4000,12 +4000,22 @@ ledger row if the measurement says no.
   crossover must be PG's, per E-20's ruling); values both suites; TPC-DS
   PASS=95 all-zero, since single-table statements are common there.*
 
-- [~] **E-17 EX3-08 scan-resident qual — CUT 2 IMPLEMENTED 2026-09-07,
-  TPC-DS sweep pending.** The target is CUT 2:
-  evaluate the predicate ONCE inside the scan, as PG does, and delete the
-  `Filter` node.** Ported from the `~/e17` agent worktree (design
-  `7341783d5` + implementation; dead-agent salvage, reviewed line-by-line
-  against the design + PG oracle at port time).
+- [x] **E-17 EX3-08 scan-resident qual — CUT 2 LANDED 2026-09-07
+  (`07c277866` + error-position test).** PG's shape: qual absorbed from
+  Filter-above-SeqScan into the scan (both build paths), evaluated ONCE
+  at EARLY (deformed prefix, `PlanScanQual`-gated, fail-closed on the
+  `walkExprRefs` primitive) or LATE (finished row, filterOp's old
+  position) positions, never both; early errors promote to late so error
+  position/message/ordering are byte-identical. EPQ recheck taught the
+  absorbed qual (else silent wrong rows on FOR UPDATE) + pre-existing
+  instrumentedOp-peel gap fixed beside it. EXPLAIN renders PG's shape
+  (`Rows Removed by Filter` on the scan, incl. parallel fold).
+  Gates: executor + optimizer suites + units scope green; TPC-H digest
+  **24/24 MATCH** vs baseline; TPC-DS sweep **PASS=95 all-zero**;
+  OFF-vs-ON plans structurally identical (no re-pin); Q6 serial
+  **−32 %** warm (7.86→4.89 cold, 6.19→4.18 warm), delta appended as
+  C-21 second instalment. Cut 1 never built per owner direction.
+  *gate: values both suites; EXPLAIN moves recorded; error-position pin.*
   *Owner direction 2026-09-07: **cut 1 is not the intended shape and is
   not to be built.** A per-row already-decided flag leaves two evaluators
   in the tree and adds a third thing (the flag) to keep them consistent —
