@@ -3732,10 +3732,41 @@ ledger row if the measurement says no.
   NOTE the standing trap — `estimate-audit` defaults to `-serial`, so its
   captures are BLIND to this entire item; judge it with parallel-mode runs.*
 
-- [ ] **E-19 EX5-05 AIO prefetch that actually populates the buffer pool.**
+- [~] **E-19 EX5-05 AIO prefetch that actually populates the buffer pool.**
   Filed 2026-09-07 at the owner's request, same standing as E-17 cut 2 and
   E-18: **design doc + agent review + commit the design first, then
   implement.**
+  **2026-09-07 — design + two adversarial reviews + Probe 0 landed;
+  implementation NOT started.**
+  `docs/design/storage-prefetch-buffer/E19-INSTALLING-PREFETCH.md`.
+  **Probe 0 answers the sizing caveat below and answers it POSITIVELY**: on a
+  cold, low-correlation, larger-than-pool index fetch (private cluster,
+  port 5537, `shared_buffers = 128MB` vs 774 MB of data, serial, fresh capped
+  server per arm, 3 reps, order permuted) the cold-minus-warm delta is
+  **4,905.8 ms of a 6,139.3 ms query — 79.9%**, ranges disjoint, with the
+  server's own `read_bytes` at 1.07 GB in every cold arm and 0 in the warm
+  ones. That is **28× the 3.3%** the sequential case bounded, so E-11's and
+  `DESIGN.md`'s evidence does not constrain this item. The regime is
+  latency-bound (216 MB/s effective against 1.5-1.7 GB/s sequential;
+  ~130,900 single-block reads at ~37.5 µs, issued one at a time) — exactly
+  what a look-ahead window fixes, and goopg's AIO engine already runs 3
+  workers / 12-deep queue, unused.
+  **The blocker is cost, and the two reviews are why.** The oracle pass found
+  that PG's `PrefetchBuffer` does **not** install either (the item's own
+  citation conflates it with `StartReadBuffers`), that
+  `READ_STREAM_SEQUENTIAL` is a **no-op under the default `io_method`**
+  (`advice_enabled` is also gated on `sync_mode`) so the seq-vs-bitmap
+  dichotomy does not exist, and that `io_combine_limit` read combining — which
+  goopg has **no vectored read anywhere** to support — is the half that pays.
+  The source pass falsified "reuses `pinLoad` unchanged" six times, including
+  a **deadlock** (blocking `Submit` under `pinMu` against a 12-deep queue whose
+  completions need `pinMu`) and a **silently dropped checksum verification**.
+  Slice order in §5.9a: S1 vectored read, S2 pin accounting + test seams,
+  S3 `StartRead`/`FinishRead`, S4 the scan-side window.
+  **And the gate needs deciding first**: TPC-H SF=1 is 1.9 GiB inside a
+  2048 MB pool and all 15 bitmap witnesses are ≤400-row NLI inners, so a
+  correct implementation measures **zero** on both corpora. The A/B must be
+  Probe 0's instrument; the values suites are regression gates only.
   **The defect is already documented and is not in dispute.**
   `docs/design/storage-prefetch-buffer/DESIGN.md` §1 quotes the code:
   `Pool.Prefetch` allocates a fresh 8 KiB buffer, submits a real

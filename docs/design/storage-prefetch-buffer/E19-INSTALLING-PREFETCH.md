@@ -5,12 +5,26 @@ E-19 (§7), filed 2026-09-07 at the owner's request under the same standing as
 E-17 cut 2 and E-18 — *design doc + agent review + commit the design first,
 then implement.*
 
-**Verdict after two adversarial reviews (§7): PROBE FIRST, do not implement
-yet.** The mechanism is buildable but its bill is three missing prerequisites
-and eight reworks of paths the first draft called "unchanged" (§5.9), and every
-witness in the corpus is a per-row-rescanned micro-bitmap on a cluster whose
-buffer pool holds the entire dataset (§3.3, §3.4). §5.0's budget probe is the
-next action and needs no code.
+**Verdict, after two adversarial reviews (§7) and Probe 0 (§5.0a):
+the mechanism is WORTH BUILDING and is NOT built here.**
+
+Probe 0 measured the recoverable budget on a cold, low-correlation,
+larger-than-pool index fetch at **4,905.8 ms of a 6,139.3 ms query — 79.9%**,
+with disjoint ranges and `read_bytes` proving the cold arms cold. That is
+**28× the 3.3% fraction** the sequential case bounded, so `DESIGN.md`'s
+outcome-(B) evidence constrains this item not at all. E-19's "no witness
+exists" escape is therefore **closed**.
+
+What blocks implementation here is cost, not merit: three prerequisites that do
+not exist and eight reworks of paths the first draft wrongly called "unchanged"
+(§5.9, §4.1a) — including a **deadlock** and a **dropped checksum verification**
+that the reviews caught before any code was written. §5.9a sets the slice order.
+
+One structural finding the next owner must not re-learn: **goopg's bench
+corpora cannot score this change.** TPC-H SF=1 is 1.9 GiB inside a 2048 MB
+buffer pool and all 15 bitmap witnesses are ≤400-row NLI inners (§3.3, §3.4), so
+a correct implementation would measure exactly zero there. The A/B must be
+Probe 0's instrument, not a suite median.
 
 This is the **(A) branch** that [`DESIGN.md`](DESIGN.md) (accepted
 2026-09-06, outcome (B) *remove*) declined to take. That document is not
@@ -601,6 +615,85 @@ Probe 0 is cheap, has no correctness surface, and is the only step that can
 turn "we did not measure a gain" into "there was no gain available". It is not
 optional.
 
+### 5.0a Probe 0 RESULT — the budget is real and it is **80% of the query**
+
+**Run 2026-09-07. This inverts the outcome §3.3/§3.4 and both reviews
+predicted, and it is recorded as such rather than smoothed over.**
+
+Instrument: private cluster at `tmp/e19-probe/data`, port **5537**,
+`GOOPG_CG_UNIT=e19-probe`, started only ever through `scripts/goopg-test-run.sh`
+(`GOMEMLIMIT=8GiB GOGC=100`). No peer datadir was touched.
+`shared_buffers = 128MB` (16,384 slots, logged at startup) against a
+**774 MB** `base/` — so the working set cannot be pool-resident.
+`max_parallel_workers_per_gather = 0` (E-11's five-way-A/A trap).
+Table `p (k int, r int, pad char(40))`, 12,000,000 rows, `r` uniform random and
+therefore **uncorrelated with physical order**; btree index on `r`.
+
+Witness query, serial: `SELECT count(k) FROM p WHERE r BETWEEN 1000000 AND
+3000000` → 239,590 rows. Chosen plan, **identical in every arm**:
+
+```
+Aggregate
+  ->  Index Scan using p_r_idx on p   (rows=25505 est)
+        Index Cond: (r >= 1000000 AND r <= 3000000)
+```
+
+This is the *other* shape `DESIGN.md` §4.2 names as the reopening case — "an
+index scan following a low-correlation index". A bitmap plan was not reachable
+here (`enable_indexscan = off` did not dislodge the index scan), so the probe
+measures the index-scan half of the random-access regime. The heap-fetch access
+pattern — scattered single-block `Pin`s driven by index order — is the same one
+the bitmap scan produces, which is what the probe is about.
+
+Method per arm: fresh capped server (**server age 0 s in every arm**);
+`ANALYZE p` and the timed query in **one psql session** (goopg's stats are
+per-connection); the page-cache state re-applied *after* `ANALYZE` via a `\!`
+escape so `ANALYZE`'s own sampling reads cannot warm the arm; cold =
+`posix_fadvise(DONTNEED)` over the whole datadir, warm = every file read to
+`/dev/null`. Arm order permuted (cold, warm, warm, cold, cold, warm).
+
+| arm | rep 1 | rep 2 | rep 3 | median | server `read_bytes` delta |
+| :-- | --: | --: | --: | --: | --: |
+| **cold** | 6139.3 ms | 5777.4 ms | 6507.6 ms | **6139.3 ms** | 1,072,701,440 / 1,072,701,440 / 1,072,799,744 |
+| **warm** | 1187.8 ms | 1233.5 ms | 1759.9 ms | **1233.5 ms** | 0 / 0 / 55,300,096 |
+
+`read_bytes` is the proof the cold arms were cold: **1.07 GB read from the
+block device** in every one, and **0** in two of three warm arms.
+
+Three readings:
+
+1. **The recoverable budget is 4,905.8 ms of a 6,139.3 ms query — 79.9%.**
+   Compare `DESIGN.md` §3.2's sequential figure: **0.175 s of 5.364 s, 3.3%**.
+   The two regimes differ by a factor of **28** in the fraction of the query
+   that is I/O wait. §3.1's refutation of sequential prefetch says nothing
+   whatever about this one, exactly as E-19 suspected.
+2. **The ranges are disjoint by a wide margin.** The *worst* cold arm
+   (5,777 ms) is 3.3× the *worst* warm arm (1,760 ms). No noise band explains
+   this; cold spread is 12.6% and warm 48% (rep 3 leaked 55 MB of real reads),
+   and the effect is an order of magnitude larger than either.
+3. **The regime is latency-bound, not bandwidth-bound — which is precisely
+   what a prefetcher fixes.** 1.07 GB in 4.91 s is an effective **216 MB/s**,
+   against the 1.5-1.7 GB/s this same host sustains on a sequential `dd` of the
+   same size (`DESIGN.md` §3.3). At 8 KiB per read that is ~130,900 reads at
+   **~37.5 µs each, issued one at a time and waited on**. Kernel readahead
+   cannot help — the block order is index order — and goopg's own AIO engine
+   already runs **3 workers with a 12-deep queue** (logged:
+   `aio engine attached method=worker workers=3 max_concurrency=0`), so the
+   overlap a correct `StartRead` window would buy is available and unused.
+   (Note also 130,900 reads against an 87,500-page heap: the 16,384-slot pool
+   thrashes, so pages are fetched more than once — a second, independent
+   argument that the pool-installing half of the design matters.)
+
+**Verdict on Probe 0: the witness EXISTS.** §5.9's step 2 ("close NO-GO on the
+absence of a budget") is therefore **not** available, and its step 3 is the live
+branch. What §3.3/§3.4 established is narrower than it looked and still stands:
+the **corpora** cannot witness this — TPC-H's 1.9 GiB sits inside a 2048 MB
+pool and every bitmap node is a ≤400-row NLI inner. So the honest joint reading
+is: **the mechanism has a large, measured, real-workload-shaped budget in the
+random-access, larger-than-pool regime, and goopg's bench corpora are simply
+not that regime.** A gate built on TPC-H/TPC-DS medians would score a correct
+implementation at zero — which is a fact about the gate, not the change.
+
 **Arm.** Private clone of the TPC-H data dir, a 55xx port, private
 `GOOPG_CG_UNIT`, fresh memory-capped server per arm through
 `scripts/goopg-test-run.sh` (server age 0 s in every arm — the sweep-tail
@@ -699,6 +792,29 @@ whole recoverable I/O budget of a *919 MB sequential* scan at **0.175 s of
 Writing §4 before Probe 0 would be building six reworks and three prerequisites
 to serve a witness that the corpus, the cluster geometry and the upstream
 distance policy all say is not there.
+
+### 5.9a Post-Probe-0 status: step 2 is closed off, step 3 is live
+
+Probe 0 ran (§5.0a) and **the budget is 79.9% of the query**, not the ~3% the
+sequential case bounded. So the prediction above was **wrong**, and the item is
+*not* closable as "no gain available". Step 3 is the branch, in its stated
+order, and it remains a multi-slice piece of work whose bill (§5.9) is
+unchanged by the good news:
+
+| slice | why it is first |
+| :-- | :-- |
+| **S1** vectored read through `Manager`/`AIOEngine`/all three methods | without it the design discards `io_combine_limit`; also the only slice with no buffer-pool correctness surface |
+| **S2** pin accounting + pin-sum accessor + read-error injection seam | §4.2's three hazard tests are unwritable until this lands |
+| **S3** `StartRead`/`FinishRead` with the §4.1a reworks | the six breaks, each of which is a wrong-data or deadlock class, not a perf class |
+| **S4** the `bitmapHeapScanOp` / index-scan window with a **new** drain point | plus the parallel batched-claim API if the parallel path is in scope |
+
+**And the gate needs its own decision before S3 lands.** §6's suites cannot
+score this: TPC-H is 1.9 GiB in a 2048 MB pool, so the arm that would show the
+win is byte-identical to the arm that would show nothing. The A/B that decides
+S3 must be Probe 0's own instrument — a low-correlation fetch on a
+larger-than-pool relation, cold — promoted to a checked-in bench, with the
+values suites retained only as **regression** gates. Recording that here so the
+next owner does not read a flat TPC-H median as a refutation.
 
 ## 6. Gates
 
