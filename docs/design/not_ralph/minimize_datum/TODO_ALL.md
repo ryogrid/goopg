@@ -33,7 +33,7 @@ had already completed).
 | **spill-cost calibration** | B-13, B-15, E-16 | **PARTLY RESOLVED.** E-16 `[x]` (`16da44c66`) — its blocker did not reproduce. The instrument is a derived 1.2x-5x ratio, not a multiplier. B-13's arithmetic is now empirical (+24.9% uncalibrated vs -3.0% calibrated at 4 MB); B-15 step 1 discharged (R5 pro-rating collapses a probe 472x). **Cut 3 measured -18.2% and HELD** on Q9's parallel interaction → re-queued behind C-19h. |
 | **C-15 grouping paths** | B-17b | **RESOLVED — the blocker was STALE.** C-15 landed and B-17b needed no engine change (`007765a90`); its decline had been written the same day C-15/C-16 removed its premise. |
 | **the seam drops `Pathkeys`** | C-07 | **RESOLVED** (`007765a90`). Validate-never-translate; forced a latent WRONG-ANSWER fix — `build_join_pathkeys` kept the outer's keys for FULL/RIGHT, which no row-count gate can see. `nrels < 2` survives as its own filed item. |
-| **the parallel dimension stops at the aggregate upper rel** *(supersedes "C-19g upper-rel-resident half", which is RESOLVED)* | C-19h, D-05, spill Cut 3, and transitively D-07/D-08/D-10/D-11 | **THE CURRENT KEYSTONE.** C-19g landed (`cb4556791`) and the aggregate case is solved — a real retirement gives 12/22 vs 12/22 with an EMPTY diff. But the census is BLIND: every TPC-H query is aggregate-rooted and C-19g's producer is aggregate-only, so it cannot see that a plain filtered SELECT loses its Gather while vanilla PG 18.3 keeps it. Two named sub-blockers: (a) the base-rel crossover — `add_path` dominates every plain Gather at `parallel_tuple_cost` 0.1/row vs a 4-worker saving of ~0.0075/row, and `GOOPG_GATHER_PATHS=all` does not help; (b) the eligibility predicate is still `drivingScan` + `JoinAlgoHash`, so an aggregate over a Merge Join gets NO Gather and the hash-vs-merge choice one level lower has no partial path. **C-19h and D-05 unblock together.** Do NOT delete `MaybeAddGather` — demotion to a `debug_parallel_query`-gated post-pass is PG-faithful in kind; and `splitAggregate`/`sortPartialRootPays` can no longer be deleted at all (they became the path model's constructor and C-19e's delegate). |
+| **the parallel dimension stops at the aggregate upper rel** | C-19h | **RE-SCOPED 2026-09-07 by owner decision: goopg does NOT implement its own parallel cost calculation — PG 18.3's is adopted as-is.** D-05 and its chain (D-07, D-08) are therefore OUT OF SCOPE, and D-10/D-11 are re-scoped onto D-06. What remains in scope is **porting PG faithfully**, which is what C-19h needs and is not a goopg cost model: `create_plain_partial_paths`, `generate_useful_gather_paths`, `try_partial_*_path`, `cost_gather`. The concrete defect is unchanged and is a **PG-parity** one — a plain filtered SELECT loses its Gather where vanilla PG 18.3 keeps it, and the census could not see it because every TPC-H query is aggregate-rooted while C-19g's producer is aggregate-only. Do NOT delete `MaybeAddGather` (demotion to a `debug_parallel_query`-gated post-pass is PG-faithful in kind); `splitAggregate` and `sortPartialRootPays` can no longer be deleted at all. |
 | **B-01c *applying* half** | D-06, E-01 | **IN PROGRESS.** Needs both a narrowing-aware upper rewriter (the gap that declined B-01b) and a key-preservation gate. The gate is the load-bearing half: `operators.go:1010-1015` checks ordering explicitly, not membership, so mismatched sort/merge comparators emit out-of-order rows with **no error** — the same silent wrong-answer class C-07 just fixed. |
 | **"the flip moves plans"** | C-06, C-20c, C-20d, C-20e, C-20f, C-20g | **DIAGNOSED 2026-09-07 — and my framing of it was WRONG.** I wrote here that "the search wins a Merge Left Join at 338,223 when a 66,218 Hash path exists in the same run". It does not: the two costs are **not comparable**, because on the OFF arm the join never enters the search at all (the LEFT link pins, the seam peels it, and the plan-tree estimator prices it — charging the hash join 0.25 startup with no build and no inner cost). **The search never had the 66,218 plan.** The real verdict is **mis-generation**: both candidates DO reach `addPath` and the merge genuinely is cheaper among them; the candidate set is short by one, because `jointypeForDirection` declines the commuted direction instead of emitting PG's `JOIN_RIGHT`. Filed as **C-06s**. Does NOT transfer to C-20c/d/e/f/g — each has its own measured movement, none is Q13, none switches a join direction. No flag retired. |
 | **D-04 stopping rule / D chain** | D-07, D-08, D-10, D-11 | **CHAINED TO D-05, cascades automatically.** D-07/D-08 say "unblocks when D-05 does"; D-10/D-11 need one conversion site. No separate dispatch needed. |
@@ -2465,7 +2465,21 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   row) before ~900 LOC is sunk.
   *design: 05 §6; gate: values-diff only (the code does not land); not a
   commit to `master`.*
-- [!] **D-05 MD-04 hash join — BLOCKED ON C-19 (Phase 5 parallel costing),
+- [-] **D-05 MD-04 hash join — OUT OF SCOPE 2026-09-07 — owner decision: **goopg does not implement its own
+  parallel cost calculation; PG 18.3's is adopted as-is.** This item's
+  unblocking condition was that goopg's cost model grow a parallel dimension
+  of its own so a search could prefer a plan *because* it will parallelise.
+  That is exactly the goopg-original cost modelling the owner has ruled out,
+  so the item is dropped rather than left blocked on a prerequisite that will
+  never be built. What stays in scope is PORTING PG's model faithfully
+  (`create_plain_partial_paths`, `generate_useful_gather_paths`,
+  `try_partial_*_path`, `cost_gather`) — that is PG-parity work, not a goopg
+  cost model, and C-19h still needs it.
+  Preserved for the record, not for resumption: the five successive measurements that
+  located the defect remain the best evidence in the tree that three
+  individually-correct cost corrections (entry width, bucket charge, build
+  cost) can each fail on one shared mechanism. ORIGINAL ROW FOLLOWS.
+  BLOCKED ON C-19 (Phase 5 parallel costing),
   established by five successive measurements 2026-09-05/06.** Summary
   before the detail: packing (D-04) left batches unchanged; fixing the entry
   width was correct and inert; an honest bucket size halved bucket heap but
@@ -2670,7 +2684,19 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   out-of-order rows with no error). Needs two deformed rows at once; a
   `PackedSlot` has one scratch `Row` — R-11, re-priced, not mechanical.
   *design: 04 §4.1; gate: 06 §3 MD-05.*
-- [!] **D-07 MD-06 materialize — BLOCKED by the D-04 stopping rule**
+- [-] **D-07 MD-06 materialize — OUT OF SCOPE 2026-09-07 — owner decision: **goopg does not implement its own
+  parallel cost calculation; PG 18.3's is adopted as-is.** This item's
+  unblocking condition was that goopg's cost model grow a parallel dimension
+  of its own so a search could prefer a plan *because* it will parallelise.
+  That is exactly the goopg-original cost modelling the owner has ruled out,
+  so the item is dropped rather than left blocked on a prerequisite that will
+  never be built. What stays in scope is PORTING PG's model faithfully
+  (`create_plain_partial_paths`, `generate_useful_gather_paths`,
+  `try_partial_*_path`, `cost_gather`) — that is PG-parity work, not a goopg
+  cost model, and C-19h still needs it.
+  Preserved for the record, not for resumption: its blocker was "unblocks when
+  D-05 does", and D-05 is now out of scope. ORIGINAL ROW FOLLOWS.
+  BLOCKED by the D-04 stopping rule**
   (2026-09-06). 05 §6 is explicit: "batches unchanged → the model in D-3 is
   wrong. **Fix the model before touching another site.**" D-04 fired that
   arm, and the five follow-up measurements located the model defect in
@@ -2678,7 +2704,18 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   before the first one's premise is re-measured would be exactly the R-4
   two-formats hazard 04 §0.2 forbids. Unblocks when D-05 does.
   *design: 04 §4.1; gate: 06 §2 floor + alloc arm.*
-- [!] **D-08 MD-07…MD-12 Tier B [EPIC — split per site before start] —
+- [-] **D-08 MD-07…MD-12 Tier B [EPIC] — OUT OF SCOPE 2026-09-07 — owner decision: **goopg does not implement its own
+  parallel cost calculation; PG 18.3's is adopted as-is.** This item's
+  unblocking condition was that goopg's cost model grow a parallel dimension
+  of its own so a search could prefer a plan *because* it will parallelise.
+  That is exactly the goopg-original cost modelling the owner has ruled out,
+  so the item is dropped rather than left blocked on a prerequisite that will
+  never be built. What stays in scope is PORTING PG's model faithfully
+  (`create_plain_partial_paths`, `generate_useful_gather_paths`,
+  `try_partial_*_path`, `cost_gather`) — that is PG-parity work, not a goopg
+  cost model, and C-19h still needs it.
+  Preserved for the record, not for resumption: same chain as D-07.
+  ORIGINAL ROW FOLLOWS.
   BLOCKED by the D-04 stopping rule** (same reasoning as D-07; the split
   rule still binds when it unblocks).
   Window (whole partition set, no spill path — report OOM-exposure
@@ -2708,7 +2745,13 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   APPROVE (incl. pg_index walker + align-table ledger rows).
   Artifacts: `docs/design/executor-d09-alignment/DESIGN.md`,
   `016f67b`.
-- [!] **D-10 MD-last spill payload — BLOCKED on every in-memory
+- [!] **D-10 MD-last spill payload — RE-SCOPED 2026-09-07 onto D-06.** The
+  hash-join conversion sites (D-05/D-07/D-08) are now out of scope with the
+  parallel-cost decision, so "every in-memory retention site" no longer means
+  what it did: the only conversion site still in scope is **D-06 (sort)**,
+  which is blocked on B-01c's applying half and not on parallel costing.
+  Re-read the condition as "unblocks when D-06 lands", and if D-06 is itself
+  dropped, drop this with it. ORIGINAL: BLOCKED on every in-memory
   retention site.** Convert `spill.go`'s payload to the PG format;
   framing (`WriteRowHashed`'s hash-then-tuple) unchanged. The nine
   existing test functions are **re-pointed at the new codec, not
@@ -2717,7 +2760,12 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   unrecorded site keeps D-10 blocked.
   *design: 03 TD-5, 04 §4.1 Tier D; gate: 06 §3 MD-last + round-trip
   across a real spill on a spilling shape.*
-- [!] **D-11 MD acceptance + open-gap ledgering — BLOCKED** until at least
+- [!] **D-11 MD acceptance + open-gap ledgering — RE-SCOPED 2026-09-07.**
+  Its condition named "D-05 onward", and D-05/D-07/D-08 are now out of scope
+  with the parallel-cost decision. The only conversion site left in scope is
+  **D-06**, so this is an acceptance over D-06 alone or it is dropped with it.
+  Note the open-gap ledgering half is ALREADY DONE and survives the re-scope.
+  ORIGINAL: BLOCKED until at least
   one conversion site (D-05 onward) lands; today the "one retention
   format" condition is trivially true because none has. The open-gap
   ledgering half is ALREADY DONE by the chain of D-04/D-05 measurements
