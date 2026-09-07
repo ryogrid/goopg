@@ -1,0 +1,273 @@
+# plan-parity: /tmp/acc/plans/tpcds-before.plans.txt -> bench/tpcds/plans-pg/
+Q1 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=17471.52..17471.56 rows=14 width=17)
+    note: normalisation: drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE customer_total_return'
+    note: PG-only node kinds: Materialize
+Q10 MISSING-NODE [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=145042.08..93944989.88 rows=5 width=100)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q11 MISSING-NODE [join-order,join-method,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=601083.87..646947.12 rows=2 width=480)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE year_total'
+    note: PG-only node kinds: Incremental Sort
+Q12 MISSING-NODE [join-order,join-method,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=13972.53..13972.63 rows=41 width=291)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'WindowAgg (1 funcs)'
+Q13 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=46675.70..46675.71 rows=1 width=128)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize Aggregate'; unknown node kind: 'Partial Aggregate'
+Q14 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=159505.59..159505.60 rows=1 width=168)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE avg_sales'; unknown node kind: 'CTE cross_items'; unknown node kind: 'Finalize Aggregate'; unknown node kind: 'HashSetOp Intersect'; unknown node kind: 'Partial Aggregate'
+Q15 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=9 width=0 | pg cost=24967.71..24981.29 rows=100 width=43)
+    note: normalisation: strip-pg-Hash
+Q16 MISSING-NODE [join-order,join-method,scan-type,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=32777.64..32777.65 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q17 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=6936.76..6937.95 rows=1 width=434)
+    note: normalisation: strip-pg-Hash
+Q18 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=25363.51..25363.74 rows=93 width=272)
+    note: normalisation: strip-pg-Hash
+Q19 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=34923.61..34923.63 rows=9 width=142)
+    note: normalisation: strip-pg-Hash
+Q2 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=365 width=0 | pg cost=89420.46..89661.21 rows=13 width=228)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE wscs'; unknown node kind: 'CTE wswscs'; unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial HashAggregate'
+    note: PG-only node kinds: Materialize
+Q20 MISSING-NODE [join-order,join-method,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=24816.71..24816.94 rows=91 width=291)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'WindowAgg (1 funcs)'
+Q21 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=48147.27..48185.64 rows=26 width=51)
+    note: normalisation: strip-pg-Hash
+Q22 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=56352.11..56352.36 rows=100 width=236)
+    note: normalisation: strip-pg-Hash
+Q23 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=3 width=0 | pg cost=244687.93..244688.18 rows=100 width=84)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE best_ss_customer'; unknown node kind: 'CTE frequent_ss_items'; unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial HashAggregate'
+Q24 MISSING-NODE [join-order,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=37686.20..37686.25 rows=1 width=358)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE ssales'
+Q25 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=7006.90..7008.06 rows=1 width=237)
+    note: normalisation: strip-pg-Hash
+Q26 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=25368.97..25370.79 rows=52 width=145)
+    note: normalisation: strip-pg-Hash
+Q27 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=35908.14..35908.39 rows=100 width=152)
+    note: normalisation: strip-pg-Hash
+Q28 SHAPE-DIFF [join-order,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=260106.01..260106.12 rows=1 width=288)
+Q29 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=0.00..0.00 rows=43 width=0 | pg cost=6871.73..6872.89 rows=1 width=153)
+    note: normalisation: strip-pg-Hash
+Q3 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=5683.04..5701.04 rows=100 width=91)
+    note: PG-only node kinds: Incremental Sort
+Q30 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=4088.92..4088.92 rows=1 width=253)
+    note: normalisation: drop-true-filter
+    note: unknown node kinds: unknown node kind: 'CTE customer_total_return'
+Q31 MISSING-NODE [join-order,join-method,scan-type,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=383460.82..383460.83 rows=1 width=210)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE ss'; unknown node kind: 'CTE ws'
+Q32 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=26356.97..26356.98 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+Q33 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=3 width=0 | pg cost=78391.42..78391.67 rows=100 width=36)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE cs'; unknown node kind: 'CTE ss'; unknown node kind: 'CTE ws'; unknown node kind: 'Merge Append'
+Q34 SHAPE-DIFF [join-order,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=34699.64..34699.71 rows=31 width=77)
+    note: normalisation: strip-pg-Hash
+Q35 MISSING-NODE [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=4131442.33..9905428.41 rows=100 width=259)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort,Materialize
+Q36 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in goopg block
+Q37 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=4407.79..4409.46 rows=2 width=125)
+Q38 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=76589.65..76589.66 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'HashSetOp Intersect'; unknown node kind: 'SetOp Intersect'
+Q39 MISSING-NODE [join-order,scan-type,parallelism,qual-placement,rendering] estimates(goopg cost=0.00..0.00 rows=2 width=0 | pg cost=52082.32..52082.33 rows=1 width=152)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE inv'
+Q4 MISSING-NODE [join-order,join-method,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=1056743.06..1056743.06 rows=1 width=334)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE year_total'
+Q40 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=24824.00..24829.41 rows=33 width=84)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+Q41 SHAPE-DIFF [join-order,parameterisation,sort-strategy] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=72523826.68..72523827.10 rows=84 width=51)
+Q42 SHAPE-DIFF [join-order,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=34917.96..34917.99 rows=10 width=91)
+    note: normalisation: strip-pg-Hash
+Q43 MISSING-NODE [join-order,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=12 width=0 | pg cost=34891.88..34974.38 rows=8 width=246)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+    note: PG-only node kinds: Incremental Sort
+Q44 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=2 width=0 | pg cost=145235.27..145251.19 rows=100 width=110)
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Finalize HashAggregate'; unknown node kind: 'Partial GroupAggregate'; unknown node kind: 'Partial HashAggregate'; unknown node kind: 'WindowAgg (1 funcs)'
+Q45 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=4 width=0 | pg cost=14149.69..14164.30 rows=100 width=52)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+Q46 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=41707.82..41708.07 rows=100 width=138)
+    note: normalisation: strip-pg-Hash
+Q47 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=4 width=0 | pg cost=38375.23..38375.23 rows=1 width=400)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE v1'; unknown node kind: 'CTE v2'; unknown node kind: 'WindowAgg (1 funcs)'
+    note: PG-only node kinds: Materialize
+Q48 SHAPE-DIFF [join-order,join-method,scan-type,parallelism,qual-placement] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=47766.01..47766.02 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+Q49 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=18251.83..18251.99 rows=3 width=84)
+    note: unknown node kinds: unknown node kind: 'HashSetOp Union'; unknown node kind: 'WindowAgg (1 funcs)'
+    note: PG-only node kinds: Incremental Sort
+Q5 MISSING-NODE [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=100350.37..100350.62 rows=100 width=160)
+    note: normalisation: canonicalise-right-join,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE csr'; unknown node kind: 'CTE ssr'; unknown node kind: 'CTE wsr'
+Q50 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=6629.46..6629.68 rows=1 width=125)
+    note: normalisation: strip-pg-Hash
+Q51 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=50704.73..50715.23 rows=100 width=136)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE store_v1'; unknown node kind: 'CTE web_v1'; unknown node kind: 'WindowAgg (1 funcs)'; unknown node kind: 'WindowAgg (2 funcs)'
+Q52 SHAPE-DIFF [join-order,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=34919.83..34919.85 rows=10 width=91)
+    note: normalisation: strip-pg-Hash
+Q53 MISSING-NODE [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=8732.65..8732.66 rows=3 width=68)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'WindowAgg (1 funcs)'
+Q54 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=47 width=0 | pg cost=50779.69..50779.74 rows=2 width=16)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE my_customers'; unknown node kind: 'CTE my_revenue'; unknown node kind: 'CTE segments'
+    note: PG-only node kinds: Incremental Sort
+Q55 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=30162.58..30162.59 rows=5 width=87)
+Q56 MISSING-NODE [join-order,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=15 width=0 | pg cost=37004.74..37004.85 rows=43 width=49)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE cs'; unknown node kind: 'CTE ss'; unknown node kind: 'CTE ws'; unknown node kind: 'Merge Append'
+Q57 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=26774.43..26774.43 rows=1 width=690)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE v1'; unknown node kind: 'CTE v2'; unknown node kind: 'WindowAgg (1 funcs)'
+    note: PG-only node kinds: Materialize
+Q58 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=87118.15..87135.60 rows=2 width=241)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE cs_items'; unknown node kind: 'CTE ss_items'; unknown node kind: 'CTE ws_items'
+    note: PG-only node kinds: Incremental Sort,Materialize
+Q59 MISSING-NODE [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=141675.25..141675.25 rows=1 width=250)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE wss'; unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial HashAggregate'
+    note: PG-only node kinds: Materialize
+Q6 SHAPE-DIFF [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=66 width=0 | pg cost=850384.72..850384.76 rows=17 width=11)
+    note: normalisation: strip-pg-Hash
+Q60 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=3 width=0 | pg cost=58331.76..58343.06 rows=73 width=49)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE cs'; unknown node kind: 'CTE ss'; unknown node kind: 'CTE ws'; unknown node kind: 'Merge Append'
+    note: PG-only node kinds: Incremental Sort
+Q61 SHAPE-DIFF [join-order,join-method,parameterisation,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=69080.80..69080.81 rows=1 width=96)
+    note: normalisation: strip-pg-Hash
+Q62 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=13988.97..14062.95 rows=100 width=110)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+Q63 MISSING-NODE [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=8732.24..8732.77 rows=3 width=68)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'WindowAgg (1 funcs)'
+    note: PG-only node kinds: Incremental Sort
+Q64 MISSING-NODE [join-order,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=25992.46..25992.47 rows=1 width=1310)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE cross_sales'; unknown node kind: 'CTE cs_ui'
+    note: PG-only node kinds: Incremental Sort
+Q65 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=72116.40..72116.65 rows=100 width=202)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q66 MISSING-NODE [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=26 width=0 | pg cost=36913.04..36915.22 rows=8 width=1254)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+Q67 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=43837.60..43844.54 rows=100 width=273)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'WindowAgg (1 funcs)'
+    note: PG-only node kinds: Incremental Sort
+Q68 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=0.00..0.00 rows=17 width=0 | pg cost=37310.98..37311.23 rows=100 width=170)
+    note: normalisation: strip-pg-Hash
+Q69 MISSING-NODE [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=46468.71..66995.95 rows=100 width=64)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q7 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=35896.71..35910.43 rows=91 width=145)
+    note: normalisation: strip-pg-Hash
+Q70 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in goopg block
+Q71 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=72727.29..72727.30 rows=5 width=95)
+    note: normalisation: strip-pg-Hash
+Q72 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=28168.05..28168.06 rows=1 width=148)
+    note: normalisation: strip-pg-Hash
+Q73 SHAPE-DIFF [join-order,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=34463.01..34463.03 rows=9 width=77)
+    note: normalisation: strip-pg-Hash
+Q74 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=54397.78..54397.78 rows=1 width=276)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE year_total'
+Q75 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=138931.28..138931.29 rows=1 width=80)
+    note: normalisation: canonicalise-right-join,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE all_sales'; unknown node kind: 'HashSetOp Union'; unknown node kind: 'Merge Append'
+    note: PG-only node kinds: Materialize
+Q76 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=71304.87..71348.99 rows=100 width=163)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial HashAggregate'
+Q77 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=88290.70..88290.95 rows=100 width=132)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE cr'; unknown node kind: 'CTE cs'; unknown node kind: 'CTE sr'; unknown node kind: 'CTE ss'; unknown node kind: 'CTE wr'; unknown node kind: 'CTE ws'; unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+    note: PG-only node kinds: Materialize
+Q78 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=75790.49..75790.74 rows=100 width=180)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE cs'; unknown node kind: 'CTE ss'; unknown node kind: 'CTE ws'
+    note: PG-only node kinds: Materialize
+Q79 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=2 width=0 | pg cost=41546.63..41546.88 rows=100 width=152)
+    note: normalisation: strip-pg-Hash
+Q8 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=44751.36..44763.57 rows=8 width=37)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'HashSetOp Intersect'
+    note: PG-only node kinds: Materialize
+Q80 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=73701.34..73701.51 rows=67 width=160)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE csr'; unknown node kind: 'CTE ssr'; unknown node kind: 'CTE wsr'; unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+Q81 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=8609.37..8609.37 rows=3 width=236)
+    note: normalisation: drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE customer_total_return'
+Q82 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=4407.79..4411.00 rows=2 width=125)
+Q83 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=27254.28..27259.81 rows=5 width=169)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE cr_items'; unknown node kind: 'CTE sr_items'; unknown node kind: 'CTE wr_items'
+    note: PG-only node kinds: Incremental Sort
+Q84 SHAPE-DIFF [join-order,join-method,scan-type,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=10023.21..10025.95 rows=24 width=49)
+    note: normalisation: strip-pg-Hash
+Q85 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=9 width=0 | pg cost=14064.59..14064.60 rows=1 width=229)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+Q86 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in goopg block
+Q87 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=76686.05..76686.06 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'HashSetOp Except'; unknown node kind: 'SetOp Except'
+Q88 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=280768.18..280768.33 rows=1 width=64)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize Aggregate'; unknown node kind: 'Partial Aggregate'
+Q89 MISSING-NODE [join-order,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=35286.28..35286.43 rows=60 width=266)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'WindowAgg (1 funcs)'
+    note: PG-only node kinds: Incremental Sort
+Q9 MISSING-NODE [scan-type,parameterisation] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=511731.58..511733.03 rows=1 width=160)
+    note: unknown node kinds: unknown node kind: 'Finalize Aggregate'; unknown node kind: 'Partial Aggregate'
+Q90 MISSING-NODE [join-order,scan-type,aggregation-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=24390.95..24390.95 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize Aggregate'; unknown node kind: 'Partial Aggregate'
+Q91 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=4803.62..4803.62 rows=1 width=97)
+Q92 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=15500.10..15500.10 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+Q93 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=7616.27..7616.28 rows=3 width=36)
+    note: normalisation: strip-pg-Hash
+Q94 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=15950.34..15950.35 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+Q95 MISSING-NODE [join-order,join-method,scan-type,parameterisation,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=299442.17..299442.17 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE ws_wh'
+Q96 MISSING-NODE [join-order,aggregation-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=34229.86..34229.87 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize Aggregate'; unknown node kind: 'Partial Aggregate'
+Q97 MISSING-NODE [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=1 width=0 | pg cost=61136.95..61136.96 rows=1 width=24)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'CTE csci'; unknown node kind: 'CTE ssci'
+Q98 MISSING-NODE [join-order,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=0.00..0.00 rows=29 width=0 | pg cost=34958.66..34959.08 rows=167 width=291)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'WindowAgg (1 funcs)'
+Q99 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.00..0.00 rows=100 width=0 | pg cost=24841.19..24941.72 rows=72 width=115)
+    note: normalisation: strip-pg-Hash
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Partial GroupAggregate'
+PLAN-PARITY: queries=99 match=0 shapediff=35 missingnode=61 error=3 timeout=0
+CATEGORIES: join-order=95 join-method=71 scan-type=75 parameterisation=39 aggregation-strategy=85 sort-strategy=82 parallelism=91 qual-placement=11 rendering=31
+NORMALISATION: N1 estimates-to-side-column, N2 strip-PG-Hash, N3 drop-true-filter, N4 alias/suffix-canonicalisation, N5 cast/operator-rendering, N6 qual/key-signatures, N7 right-join-canonicalisation

@@ -2584,7 +2584,30 @@ rule).*
   live-tripwire oracle — record, do not retry without new evidence).
   *design: take3 08 §9; gate: take3 09 §5 P6 byte-identical or
   explained-and-timed.*
-- [ ] **C-21 P7-01 full acceptance run.** Both suites, S-cold and WARM,
+- [x] **C-21 P7-01 full acceptance run — RUN 2026-09-07; bundle acceptance
+  NOT met, and the verdict says so.** Artifact
+  `analysis/planner-refactor-take3/acceptance-20260907/README.md`.
+  **Headline: TPC-H WARM 274.18 s -> 96.72 s (0.353x, 2.83x faster), S-cold
+  284.78 -> 111.93 (0.393x)**, with **all 22 ordered value hashes IDENTICAL**
+  and TPC-DS SF0.5 PASS=95 all-zero on both arms — B1, the correctness floor,
+  passes outright.
+  **Bars that do NOT clear, stated rather than rounded:** B2 fails on **Q1
+  S-cold 7.08 -> 15.51 s (2.19x)**; A2 does not move (TPC-DS match 0 -> 0,
+  missingnode 61 -> 62); A5/B3 fail on both arms (before 50 new estimate
+  findings, tip 40 — improved but below the bar). A1 improves by one query
+  (match 5 -> 6). B4 is directional only and stands at 7.3x against a <=3.0x
+  destination. A4 was NOT separately measured and is recorded as not run.
+  **Attribution caveat carried in the artifact:** the before arm `d93fb9edc`
+  is a RELEASE baseline (2026-09-01), 706 commits back, of which only 373 are
+  this workstream's — the figures are release-over-release.
+  **First execution ever of the EA ratchet**, which the ledger row
+  `take3-ea-ratchet-never-ran` recorded as having no Makefile target; it now
+  has one (`Makefile:616`).
+  Negative results kept verbatim in the artifact, including a discarded
+  after-arm, a stale EA capture that was re-run, and a sweep header that names
+  the checkout rather than the binary.
+  ORIGINAL ROW FOLLOWS.
+  C-21 P7-01 full acceptance run.** Both suites, S-cold and WARM,
   full PP roll-up, EA ratchet, complete timing table, §6 headers on every
   artifact. Bars A1–A5 + B1–B3 + C1–C7 (take3 09 §4); B4 directional only.
   Verdict under `analysis/planner-refactor-take3/acceptance-<date>/`
