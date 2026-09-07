@@ -3909,8 +3909,30 @@ ledger row if the measurement says no.
   NOT move — prefetch is an I/O-path change, so a plan movement means
   something else happened.*
 
-- [ ] **E-20 The parallel dimension does not reach the cost model where the
-  join shape is chosen.** **2026-09-07 EVENING — THREE CORRECTIONS, all
+- [x] **E-20 The parallel dimension does not reach the cost model where the
+  join shape is chosen — CUT 3 LANDED 2026-09-07, zero plan moves (allowed
+  outcome, design §5.2).** `try_partial_mergejoin_path` transcribed at both
+  PG sites (`sort_inner_and_outer` loop + `consider_parallel_mergejoin`
+  loop over ordered partial outers) with the no-sort gate (sort-under-
+  partial unmodelled: no PathSort arm in `partialPathDrivingKind`, no
+  *Sort arm in `drivingScan` — a filed sort would be priced then refused
+  or worse), per-worker row scaling (`costsize.c:3875-3881`), and the
+  executor driving arms (`attachParallelScan` JoinAlgoMerge descending
+  the outer explicitly + `mergeJoinIsPartialCapable` + driving-kind arm +
+  `createPlan` fail-closed assert). 8 producer tests incl. end-to-end
+  filing through `addPathsToJoinrel`, merge-under-Gather identity at
+  1/2/4 workers (non-vacuous), suites + units green.
+  Gates: serial captures byte-identical (control); parallel-mode A/B
+  TPC-H at `GOOPG_GATHER_PATHS=all`: **0 structural moves** — no corpus
+  shape has an ordered partial outer aligning with merge clauses (or the
+  partial merge loses to partial hash); TPC-H digest **24/24 MATCH**;
+  TPC-DS sweep **PASS=95 all-zero**; spotcheck-equivalent Q12=2/Q13=34.
+  D-05 NOTE: the blocker is removed ONLY for already-ordered flips — a
+  hash→merge flip needing sorts still goes serial, so re-deriving D-05
+  must re-measure rather than assume. Cut 4 stays deferred by design.
+  *gate: parallel-mode plan A/B; values both suites; PG functions cited
+  in `docs/design/planner-e20-e21-parallel-path-search/DESIGN.md` §2.4.*
+  **2026-09-07 EVENING — THREE CORRECTIONS, all
   source-verified; read before working the row.** (i) The cost-model
   transcription this row asks for is **already done**:
   `create_plain_partial_paths`, `compute_parallel_worker` (both arms),

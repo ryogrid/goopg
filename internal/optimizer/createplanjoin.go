@@ -708,7 +708,36 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		HashKeys:  pairs,
 		schema:    in.publishedSchema(jt),
 	}
+	assertPartialMergeJoinIsRunnable(p, j)
 	return j, in.publishedLayout(jt)
+}
+
+// assertPartialMergeJoinIsRunnable is the merge twin of
+// assertParallelAwareJoinIsRunnable (E-20 Cut 3): a partial merge path
+// (ParallelWorkers > 0) must build a join the executor's OWN predicate
+// (`mergeJoinIsPartialCapable`, walked by `attachParallelScan`) will run
+// with a partitioned outer. Serial merges (workers == 0) skip the check
+// entirely — it constrains only the shape Cut 3 introduces.
+//
+// The two can only disagree if a producer changes: `addPartialMergeJoinPath`
+// files only INNER joins today (03 §4.4 pins every non-INNER construct
+// outside the search), so the panic is unreachable from the live search —
+// which is precisely why it is a separate, directly testable function
+// rather than an inline `if`: an unwinnable path is an untested path. The
+// moment `join_is_legal` inference relaxes the pin and a RIGHT or FULL join
+// reaches here, this fires at plan-build time instead of returning a
+// silently partial join.
+func assertPartialMergeJoinIsRunnable(p *Path, j *Join) {
+	if p == nil || p.ParallelWorkers <= 0 || mergeJoinIsPartialCapable(j) {
+		return
+	}
+	var relids uint32
+	if p.Rel != nil {
+		relids = uint32(p.Rel.Relids)
+	}
+	panic(fmt.Sprintf(
+		"createPlan: partial PathMergeJoin over relset %#08x built a %v/%v join the executor will not run with a partitioned outer; the workers' verdicts are not row-local, so the join would silently drop or duplicate rows",
+		relids, j.Type, j.Algo))
 }
 
 // absorbMergeSort steps over a merge child's explicit `PathSort`, returning the

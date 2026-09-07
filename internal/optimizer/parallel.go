@@ -563,7 +563,15 @@ func stampParallelScan(n Node) Node {
 	case *Join:
 		// P8 (drivingScan): a hash join is partial through its PROBE side
 		// only. Mirrored here so the same side gets labelled.
-		if !hashJoinIsPartialCapable(x) {
+		//
+		// E-20 Cut 3: a merge join is partial through its OUTER (left)
+		// side only — each worker merge-joins its outer partition against
+		// the whole inner, which it sorts and reads itself. Same
+		// side-descends-side agreement as the hash arm: the path walk
+		// (`partialPathDrivingKind` Children[0]), this label walk, and the
+		// executor walk (`attachParallelScan` JoinAlgoMerge) all descend
+		// the left.
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
 			return n
 		}
 		if joinProbeSideIsLeft(x) {
@@ -640,7 +648,15 @@ func drivingScan(n Node) Node {
 		// what the workers split. Returning the probe's scan also makes the
 		// size rule measure the right relation — the probe is the big side by
 		// the planner's own build-side choice.
-		if !hashJoinIsPartialCapable(x) {
+		//
+		// E-20 Cut 3: a merge join is partial through its OUTER (left) side
+		// only — each worker merge-joins its outer partition against the
+		// whole inner. joinProbeSideIsLeft answers left for a merge join
+		// (BuildLeft is meaningless for merge and stays false), so the
+		// shared side logic below descends the outer with no special case —
+		// which is exactly what must stay true: if BuildLeft ever becomes
+		// meaningful for merge, this arm needs its own side test.
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
 			return nil
 		}
 		if joinProbeSideIsLeft(x) {
@@ -749,6 +765,41 @@ func hashJoinIsPartialCapable(p *Join) bool {
 		return true
 	case JoinTypeLeft:
 		return !p.BuildLeft
+	}
+	return false
+}
+
+// mergeJoinIsPartialCapable states which merge joins may run with a partial
+// outer side (E-20 Cut 3, `try_partial_mergejoin_path`, joinpath.c:1145).
+//
+// The rule is "a merge join whose per-outer-row verdict is worker-local",
+// the same shape as hashJoinIsPartialCapable with the build/probe vocabulary
+// replaced by outer/whole-inner: each worker merge-joins ITS partition of the
+// outer against the WHOLE inner, which it sorts and reads itself (no shared
+// build exists for merge, so there is nothing for prebuildSharedHashJoins to
+// adopt — a partial hash join BELOW a partial merge is built independently by
+// every worker, correctly and N× the memory; see attachParallelScan).
+//
+//   - INNER, SEMI and ANTI decide each outer row against the inner alone, so
+//     partitioning the outer is transparent.
+//   - LEFT emits every outer row (matched or null-padded) with per-row
+//     padding, so partitioning the outer is transparent. Unlike the hash
+//     twin there is no BuildLeft proviso: a merge join has no build side
+//     (`createMergeJoinPlan`: BuildLeft stays false by construction), the
+//     outer is always Children[0]/Left, and the padding needs no
+//     cross-worker state either way.
+//   - FULL and RIGHT would require knowing which INNER rows went unmatched
+//     across ALL workers — the same cross-worker reduction the hash twin
+//     refuses. Refused rather than approximated.
+//
+// LATERAL is excluded on the same ground as the hash twin.
+func mergeJoinIsPartialCapable(p *Join) bool {
+	if p == nil || p.Algo != JoinAlgoMerge || p.Lateral {
+		return false
+	}
+	switch p.Type {
+	case JoinTypeInner, JoinTypeSemi, JoinTypeAnti, JoinTypeLeft:
+		return true
 	}
 	return false
 }

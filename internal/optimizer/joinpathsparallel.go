@@ -196,6 +196,172 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	}, "join.hash.partial")
 }
 
+// addPartialMergeJoinPath is `try_partial_mergejoin_path`
+// (joinpath.c:1145-1214) at one call site's inputs: the rel-level wrapper
+// that selects the partial outer and the complete inner, then files through
+// tryPartialMergeJoinPath. E-20 Cut 3.
+//
+// `outerKeys`/`innerKeys` are the site's merge orderings (PG's `outerkeys`/
+// `innerkeys`): at the `sort_inner_and_outer` site they are the loop's
+// chosen orderings, at the `match_unsorted_outer` site the outer is ordered
+// by construction so `outerSortKeys` is nil. `resultKeys` is the ordering
+// the join DELIVERS (`merge_pathkeys`): the loop's `outerKeys` at site 1,
+// the outer's full ordering at site 2.
+func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
+	jt parser.JoinType, resultKeys, outerSortKeys, innerSortKeys []PathKey,
+	mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
+	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+
+	// Same mode gate as the hash twin: the only reader of a partial path
+	// is `generateUsefulGatherPaths`, and under `off` producing buys
+	// nothing while costing a mergeJoinCost per pair per direction per
+	// level on a search whose planner time the pgbench smoke measures.
+	if gatherPathsMode == gatherPathsOff {
+		return
+	}
+	// `joinrel->consider_parallel` (joinpath.c:2418, via the hash block's
+	// guard which the merge block shares), already propagated by
+	// joinrelConsiderParallel.
+	if s == nil || !s.parallelModeOK || joinrel == nil || !joinrel.ConsiderParallel {
+		return
+	}
+	if outer == nil || inner == nil || len(mergeClauses) == 0 {
+		return
+	}
+	// `outerrel->partial_pathlist != NIL`, cheapest only. This wrapper serves
+	// the `sort_inner_and_outer` site, where PG itself passes the singular
+	// `cheapest_partial_outer` (joinpath.c:1535-1545) — so following the
+	// hash twin's `[0]` rule here is PG-faithful, not merely sibling-
+	// faithful. The `match_unsorted_outer` site is different: PG loops
+	// over the WHOLE partial pathlist there (joinpath.c:2071) because the
+	// cheapest partial is almost never the ORDERED one, and
+	// `matchUnsortedOuterMergePartial` loops with it rather than calling
+	// this wrapper. A producer enumerating more outers than every other
+	// arm would change the search's shape for a reason unrelated to
+	// parallelism — which is why NEITHER site enumerates beyond what PG
+	// does at that site.
+	if len(outer.PartialPathlist) == 0 {
+		return
+	}
+	o := outer.PartialPathlist[0]
+	if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe {
+		return
+	}
+	// `get_cheapest_parallel_safe_total_inner` (pathkeys.c:699), the same
+	// scan the hash twin uses: the inner is read WHOLE by every worker
+	// (no shared build exists for merge), so completeness is required and
+	// partial-ness is not.
+	i := cheapestParallelSafeTotalInner(inner.Pathlist)
+	if i == nil {
+		return
+	}
+	tryPartialMergeJoinPath(s, joinrel, o, i, cp, jt, resultKeys, outerSortKeys, innerSortKeys,
+		mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+}
+
+// tryPartialMergeJoinPath is `try_partial_mergejoin_path` proper over two
+// chosen PATHS: the partial outer and the complete inner. It mirrors
+// tryMergeJoinPath line for line, with three deliberate differences:
+//
+//   - outersortkeys/innersortkeys that are NOT already delivered DECLINE
+//     instead of sorting. A per-worker sort is correct but unmodelled:
+//     `partialPathDrivingKind` has no PathSort arm and `drivingScan` has no
+//     *Sort arm, so a filed sort-under-partial would be priced and then
+//     refused at the Gather — or worse, admitted and mis-executed. The
+//     inner side is the exception it looks like: it is read whole by every
+//     worker, never partitioned, so sorting it needs no driving — but the
+//     same call must stay symmetrical with the serial twin to keep the two
+//     from disagreeing about anything but the parallel terms, and PG offers
+//     the no-sort shape first anyway (unsorted-outer site). Both sides
+//     decline-on-sort here; widening the inner is a follow-up the A/B can
+//     motivate, not a guess.
+//   - the row estimate is the per-worker one: `clamp_row_est` over the
+//     divisor (`final_cost_mergejoin`'s "For partial paths, scale row
+//     estimate", costsize.c:3875-3881), and the merge-tuple and residual
+//     charges ride that same divided figure, exactly as the hash twin's
+//     outputRows does.
+//   - ParallelAware is false: there is no shared prebuild for merge (each
+//     worker sorts and reads the whole inner itself), so the flag whose
+//     whole machinery is the hash twin's sharing protocol is not set.
+func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, cp costParams, jt parser.JoinType,
+	resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo,
+	mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64),
+	paramSrc RelSet) {
+
+	if o == nil || i == nil {
+		return
+	}
+	// No-sort gate (see above): the ordering must already be delivered.
+	if len(outerSortKeys) > 0 && !pathkeysContainedIn(o.Pathkeys, outerSortKeys) {
+		return
+	}
+	if len(innerSortKeys) > 0 && !pathkeysContainedIn(i.Pathkeys, innerSortKeys) {
+		return
+	}
+	// `calc_non_nestloop_required_outer` (joinpath.c:1071), stricter than
+	// the serial twin: the hash twin refuses any nonzero requirement
+	// outright (a partial path propagates a parameter rather than binding
+	// it, and no worker can supply it), and this follows the sibling
+	// rather than the serial arm's admit-if-wanted rule.
+	if o.RequiredOuter != 0 || i.RequiredOuter != 0 {
+		return
+	}
+	if calcNonNestloopRequiredOuter(o, i) != 0 {
+		return
+	}
+	// The filed shape must be drivable END TO END, or it is never even
+	// costed: `runWorker` ignores a failed attach and every worker reads
+	// the whole relation, so an unmodelled subtree does not "stay serial"
+	// (joinpathsparallel.go, hash-twin comment).
+	if !partialPathShapeIsGatherable(o) {
+		return
+	}
+
+	// `final_cost_mergejoin` (costsize.c:3875-3881): "For partial paths,
+	// scale row estimate." One divisor, applied here and undone by
+	// cost_gather's computeGatherRows — not two. The merge-tuple charge
+	// rides the same divided figure: the full-join tuples are what ALL
+	// workers emit together, and each worker emits a 1/divisor share.
+	divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
+	rows := clampRowEst(joinrel.Rows / divisor)
+	mergeTuples := mergeTuplesFor(residual) / divisor
+	outerEndSel, innerEndSel := scanSelFor(mergeClauses)
+	// The partial outer's Rows is ALREADY the per-worker count
+	// (costParallelSeqscan divides it); the inner's are the WHOLE inner,
+	// read complete by every worker — the same asymmetry the hash twin
+	// implements and `final_cost_mergejoin` prices.
+	cost := mergeJoinCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, mergeTuples, outerEndSel, innerEndSel)
+	// The residual rides the join's OUTPUT cardinality, which for a partial
+	// path is the per-worker one — the same rule the serial twin and the
+	// hash twin apply.
+	cost.Total += qualEvalCost(cp, len(residual), rows)
+
+	addPartialPath(joinrel, &Path{
+		Kind:          PathMergeJoin,
+		Jointype:      jt,
+		Rel:           joinrel,
+		Rows:          rows,
+		Cost:          cost,
+		DisabledNodes: disabledNodesFor(!cp.enableMergeJoin, o, i),
+		Children:      []*Path{o, i},
+		HashKeys:      mergeClauses,
+		Residual:      residual,
+		// `build_join_pathkeys` of the delivered ordering (joinpath.c:1932
+		// at the unsorted site; the loop's own ordering at site 1) — NOT
+		// nil like the hash twin ("a hashjoin never has pathkeys",
+		// pathnode.c:2879): a merge join delivers its outer's order, and
+		// FULL/RIGHT deliver none.
+		Pathkeys:      buildJoinPathkeys(jt, resultKeys),
+		RequiredOuter: 0,
+		// create_mergejoin_path field for field, minus parallel_aware:
+		//   parallel_safe   = consider_parallel && both inputs safe
+		//   parallel_workers= outer_path->parallel_workers
+		ParallelSafe:    parallelSafeWith(joinrel, o, i),
+		ParallelWorkers: o.ParallelWorkers,
+		ParallelAware:   false,
+	}, "join.merge.partial")
+}
+
 // cheapestParallelSafeTotalInner is `get_cheapest_parallel_safe_total_inner`
 // (pathkeys.c:699): "the unparameterized parallel-safe path with the least
 // total cost".

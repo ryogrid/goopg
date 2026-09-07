@@ -332,7 +332,7 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			scanSelFor := func(mc []*restrictInfo) (float64, float64) {
 				return s.mergeJoinScanSel(mc, outer.Relids)
 			}
-			sortInnerAndOuter(joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+			sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 			// and arm 4 — so a merge over an already-ordered outer is offered
 			// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -341,6 +341,13 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 			// `addNLIPaths`) were landed separately and still run after the
 			// hash arm, which can only change a hash-vs-nestloop exact tie.
 			matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+			// E-20 Cut 3: PG's `consider_parallel_mergejoin`
+			// (joinpath.c:2071-2097) beside the serial arm above — every
+			// already-ordered partial outer (the cheapest is almost never
+			// the ordered one) against the cheapest parallel-safe complete
+			// inner. First candidate per outer only; the truncation search
+			// is a follow-up the A/B can motivate.
+			matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			// take2 P2-11: the inner side is the BUILD side here, so the
 			// bucket fraction is measured on its keys. Computed at this site
 			// because the searchCtx — and so the statistics — is in scope,

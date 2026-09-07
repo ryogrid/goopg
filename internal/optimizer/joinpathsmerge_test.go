@@ -142,7 +142,7 @@ func TestSortInnerAndOuter_OnePathPerSortKey(t *testing.T) {
 	joinrel := newRelOptInfo(a|b, 2000, 64)
 	keys := []*restrictInfo{equiClauseOn(a, b, 1, 2), equiClauseOn(a, b, 3, 4)}
 
-	sortInnerAndOuter(joinrel, outer, inner, defaultCostParams(), parser.JoinInner, keys, nil, func([]*restrictInfo) float64 { return joinrel.Rows }, func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
+	sortInnerAndOuter(nil, joinrel, outer, inner, defaultCostParams(), parser.JoinInner, keys, nil, func([]*restrictInfo) float64 { return joinrel.Rows }, func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 
 	paths := mergePathsOf(joinrel)
 	if len(paths) != 2 {
@@ -168,7 +168,7 @@ func TestSortInnerAndOuter_OutputOrderingIsTheOuters(t *testing.T) {
 	a, b := relsetOf(0), relsetOf(1)
 	outer, inner := scanRel(a, 1000, 10), scanRel(b, 800, 8)
 	joinrel := newRelOptInfo(a|b, 500, 64)
-	sortInnerAndOuter(joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
+	sortInnerAndOuter(nil, joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
 		[]*restrictInfo{equiClauseOn(a, b, 5, 6)}, nil,
 		func([]*restrictInfo) float64 { return joinrel.Rows },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
@@ -210,7 +210,7 @@ func TestSortInnerAndOuter_SkipsSortWhenInputAlreadyOrdered(t *testing.T) {
 
 	costOf := func(outer *RelOptInfo) *Path {
 		joinrel := newRelOptInfo(a|b, 2000, 64)
-		sortInnerAndOuter(joinrel, outer, inner, cp, parser.JoinInner, keys, nil, func([]*restrictInfo) float64 { return joinrel.Rows }, func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
+		sortInnerAndOuter(nil, joinrel, outer, inner, cp, parser.JoinInner, keys, nil, func([]*restrictInfo) float64 { return joinrel.Rows }, func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 		paths := mergePathsOf(joinrel)
 		if len(paths) != 1 {
 			t.Fatalf("got %d merge paths, want 1", len(paths))
@@ -246,7 +246,7 @@ func TestSortInnerAndOuter_RefusesAParameterisedResult(t *testing.T) {
 	inner := scanRel(b, 500, 5)
 	joinrel := newRelOptInfo(a|b, 200, 64)
 
-	sortInnerAndOuter(joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
+	sortInnerAndOuter(nil, joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
 		[]*restrictInfo{equiClauseOn(a, b, 1, 2)}, nil,
 		func([]*restrictInfo) float64 { return joinrel.Rows },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
@@ -267,7 +267,7 @@ func TestSortInnerAndOuter_AdmitsWantedParameterisation(t *testing.T) {
 	inner := scanRel(b, 500, 5)
 	joinrel := newRelOptInfo(a|b, 200, 64)
 
-	sortInnerAndOuter(joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
+	sortInnerAndOuter(nil, joinrel, outer, inner, defaultCostParams(), parser.JoinInner,
 		[]*restrictInfo{equiClauseOn(a, b, 1, 2)}, nil,
 		func([]*restrictInfo) float64 { return joinrel.Rows },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, c)
@@ -315,11 +315,11 @@ func TestSortInnerAndOuter_ResidualRidesTheJoinOutput(t *testing.T) {
 	residual := []*restrictInfo{plainClause(a | b)}
 
 	withRes := newRelOptInfo(a|b, 2000, 64)
-	sortInnerAndOuter(withRes, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, residual,
+	sortInnerAndOuter(nil, withRes, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, residual,
 		func([]*restrictInfo) float64 { return withRes.Rows },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 	without := newRelOptInfo(a|b, 2000, 64)
-	sortInnerAndOuter(without, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, nil,
+	sortInnerAndOuter(nil, without, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, nil,
 		func([]*restrictInfo) float64 { return without.Rows },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 

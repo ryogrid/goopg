@@ -237,7 +237,7 @@ func mergeInnerSortKeys(groups []mergeKeyGroup, outerKeys []PathKey, outer RelSe
 // subtree). The base order is therefore the clause order, which is stable and
 // deterministic; the heuristic is a ranking of paths that all get generated
 // anyway, so its absence costs a tie-break, not a path. Ledgered.
-func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
 		// PG's `if (extra->mergeclause_list == NIL) return` (:1372). A pair
@@ -266,6 +266,12 @@ func sortInnerAndOuter(joinrel, outer, inner *RelOptInfo, cp costParams, jt pars
 		// check — the groups partition `keys`, so the concatenation is a
 		// permutation of it.
 		addMergeJoinPath(joinrel, outer, inner, cp, jt, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		// E-20 Cut 3: PG's `sort_inner_and_outer` loop offers a partial
+		// mergejoin per ordering (`cheapest_partial_outer` +
+		// `cheapest_safe_inner`, joinpath.c:1535-1545), beside the serial
+		// offer above. The delivered ordering here IS the loop's ordering
+		// (resultKeys == outerKeys), exactly as the serial call passes.
+		addPartialMergeJoinPath(s, joinrel, outer, inner, cp, jt, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
 

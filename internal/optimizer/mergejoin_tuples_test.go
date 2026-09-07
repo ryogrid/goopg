@@ -34,14 +34,14 @@ func TestMergeJoinChargedOnMergeTuplesNotJoinrelRows(t *testing.T) {
 	const joinRows = 2000
 
 	narrow := newRelOptInfo(a|b, joinRows, 64)
-	sortInnerAndOuter(narrow, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, nil,
+	sortInnerAndOuter(nil, narrow, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, nil,
 		func([]*restrictInfo) float64 { return joinRows },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 
 	// The merge emits 4x the joinrel's rows before the residual filters them,
 	// exactly the Q9 ratio.
 	wide := newRelOptInfo(a|b, joinRows, 64)
-	sortInnerAndOuter(wide, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, residual,
+	sortInnerAndOuter(nil, wide, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, residual,
 		func([]*restrictInfo) float64 { return joinRows * 4 },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 

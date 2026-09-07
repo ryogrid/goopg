@@ -153,7 +153,18 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// written, this arm gains a `JoinAlgoMerge` case that descends the
 		// OUTER (left) side explicitly, together with its own serial-vs-parallel
 		// identity test.
+		//
+		// E-20 Cut 3 wrote that producer (`addPartialMergeJoinPath`). Each
+		// worker merge-joins ITS partition of the outer against the WHOLE
+		// inner, so the walk descends the OUTER (left) side explicitly —
+		// never `probeSideIsLeft`, which answers from `BuildLeft`, a field
+		// a merge join leaves false by construction. The inner is left
+		// alone: every worker sorts and reads it whole, which is why the
+		// planner prices it undivided.
 		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash {
+			if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoMerge {
+				return attachParallelScan(x.left, st)
+			}
 			return false
 		}
 		if probeSideIsLeft(x.plan) {

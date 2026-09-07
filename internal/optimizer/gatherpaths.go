@@ -365,6 +365,23 @@ func partialPathDrivingKind(p *Path) PathKind {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(p.Children[0])
+	case PathMergeJoin:
+		// E-20 Cut 3 (`try_partial_mergejoin_path`, joinpath.c:1145). A
+		// merge join is partial through its OUTER side only: each worker
+		// merge-joins its outer partition against the whole inner.
+		// `Children[0]` IS the outer side by the same child convention the
+		// hash arm cites, and `createMergeJoinPlan` leaves `BuildLeft`
+		// false — so Children[0] becomes `Join.Left`, the side
+		// `mergeJoinIsPartialCapable`/`attachParallelScan` descend. Only a
+		// path this track's producer built can appear here:
+		// `addPartialMergeJoinPath` is the only producer of a partial
+		// PathMergeJoin, and it files nothing it did not prove drivable
+		// (no-sort gate + this check's own recursion), so the arm below
+		// cannot meet a shape the executor walks do not model.
+		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return PathPrebuilt
+		}
+		return partialPathDrivingKind(p.Children[0])
 	default:
 		// PathPrebuilt, joins, Sort, Memoize, Agg: not modelled by any attach
 		// walk at this slice's scope. Refuse.
