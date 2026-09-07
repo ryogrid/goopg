@@ -2272,6 +2272,92 @@ last: the default flip, then C-19g's construction, then the base-rel
 crossover, now the single-relation short-circuit. Each was real, and each
 was only visible once its predecessor was removed.
 
+## 5.35. B-01c applies the narrowing — and catches a wrong-answer bug on the way
+
+B-01c's applying half landed (`0d4e934c2`): `upper_narrow_apply.go` plus a
+606-line test file, wired at `PlanWithSettings`' tail — after
+`lowerSubPlanParams`, before `assertSearchedBoundariesIntact` so that
+detector sees the *narrowed* tree rather than the pre-cut one. Flag
+`GOOPG_NARROW_UPPER`, default on.
+
+The Aggregate site applies its stamped target, and the narrowing
+`Project` is **sunk past order- and row-preserving wrappers** (`*Sort`,
+`*Filter`) so the sort beneath a sorted aggregation materialises,
+compares and spills the *narrowed* row. **That is D-06's sort-side
+projection**, which is what D-06 and E-01 were waiting for.
+
+Two scoping judgements worth recording, both of which I would have got
+wrong:
+
+- **The Aggregate site went first for a structural reason**, not
+  convenience: `Aggregate.Output()` is built from its own expression
+  lists, so nothing above it moves and no ancestor-chain walk is needed.
+  Slice (a)'s key-preservation gate is consulted on every applied path.
+- **The cut is committed only when it lands below a Sort.** Above a hash
+  aggregate a narrowing Project is pure per-row cost with *zero bytes
+  retained* — TPC-H Q1 would have paid seven datum copies on six million
+  rows for nothing. Hash-aggregate plans therefore stay bit-identical.
+  A narrowing that is free to compute is not automatically worth applying.
+
+### 5.35.1 The bug it shipped and caught
+
+An earlier revision mutated the wrappers **as the sink descended** and
+tested the retention-site condition afterwards. A refusal then left the
+`Filter` already rewritten and the `Project` already spliced in, while
+the `Aggregate` above still read pre-cut positions. The executor
+surfaced it as:
+
+```
+column ref v/2 out of MaterializedSlot range 2
+```
+
+and the agent's own note is the important part: **one column further
+left, it would have been a silently wrong column instead of a range
+error.** The sink is now two-phase — pure computation, then a single
+commit point — and `TestNarrowAggregateInputLeavesNoPartialRewrite` pins
+it.
+
+This is the third time in this workstream that a coordinate rewrite has
+produced, or nearly produced, a wrong answer rather than a crash (after
+C-07's FULL/RIGHT pathkeys and the `shiftColumnRefsBy` arm gap). The
+pattern is consistent enough to state as a rule: **a rewrite that mutates
+while deciding is a wrong-answer bug waiting for its first refusal.**
+
+### 5.35.2 Gates, including two of the strongest in the tree
+
+- 15 new tests, including an **order-sensitive oracle over the tree the
+  applier actually produced**, with a **vacuity guard** — a one-column
+  mis-base must make it fail, so the oracle cannot pass by not looking.
+- `TestUpperNarrowApplyNodeFieldInventory`, a **reflection pin**: a new
+  `Expr`-bearing field on Aggregate/AggregateCall/Sort/Filter **fails the
+  build** rather than being silently read in pre-cut coordinates. That is
+  the exhaustive-and-fail-closed discipline `cloneExprRefs` established,
+  applied to struct fields instead of Expr types.
+- TPC-DS SF0.5 **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0**,
+  with **57 order-sensitive checksums** — the right gate for a change
+  whose failure mode is ordering, not row counts.
+- TPC-H digest A/B on one binary, flag off versus on: **24/24 MATCH on
+  values**. Plan pin 22/22 in both modes; no re-pin needed.
+
+### 5.35.3 What is unblocked, stated as partial
+
+**D-06 and E-01 are PARTIALLY unblocked, and the row says so.** A sort
+beneath a *sorted aggregation* now receives the narrowed row; the
+**general ORDER BY sort is still un-narrowed**, because narrowing a
+`*Sort` from its own stamped target moves every coordinate above it.
+E-01's "premature on pre-EX1 widths" objection no longer holds for the
+sorted-aggregate shape and still holds elsewhere — so a spilling-sort A/B
+must now state *which shape* it measured. D-10 and D-11 chain off D-06
+and inherit exactly that partial status.
+
+The general case needs an exhaustive fail-closed **ancestor-chain walk**
+(`*Project`/`*Aggregate` absorb, `*Filter`/`*Limit`/`*Sort` propagate,
+everything else refuses) that refuses unless absorption is reached before
+the plan root — because the root row *is* the query's answer.
+`*OuterColumnRef` stays refused rather than rewritten, and the sink still
+will not descend past `*Limit`/`*Distinct`/`*DistinctOn`/`*Gather`/joins.
+Resume point is in `take3-B-01c-applying-blocked`.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
