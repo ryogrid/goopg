@@ -202,7 +202,7 @@ func viewProxyTable(base *catalog.Table, names []string, colMap []int) *catalog.
 //     inner level's own CheckOption setting; a LOCAL check option checks
 //     only levels that themselves specify CHECK OPTION. checked is nil when
 //     no level in the chain triggers a check.
-func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *catalog.Table, cat catalog.Catalog) (all, checked Expr, err error) {
+func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *catalog.Table, cat catalog.Catalog, ps PlannerSettings) (all, checked Expr, err error) {
 	forceCascade := false
 	for i, lvl := range chain {
 		var innerNames []string
@@ -211,7 +211,7 @@ func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *cata
 			innerNames = viewColumnNames(chain[i+1])
 			innerColMap = colMaps[i+1]
 		}
-		q, qerr := viewQualOnBase(lvl, innerNames, innerColMap, base, cat)
+		q, qerr := viewQualOnBase(lvl, innerNames, innerColMap, base, cat, ps)
 		if qerr != nil {
 			return nil, nil, qerr
 		}
@@ -235,7 +235,9 @@ func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *cata
 // onto base's physical layout first; when the immediate FROM is base
 // itself, its names already are base's own names and no translation is
 // needed. Returns nil when the view has no WHERE clause.
-func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int, base *catalog.Table, cat catalog.Catalog) (Expr, error) {
+// EX3-03 cut 1: the view's stored WHERE can hide a scalar subquery over a
+// join, so it resolves under the enclosing DML statement's settings.
+func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int, base *catalog.Table, cat catalog.Catalog, ps PlannerSettings) (Expr, error) {
 	if tbl.View.Where == nil {
 		return nil, nil
 	}
@@ -248,7 +250,7 @@ func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int, 
 	if innerNames != nil {
 		resolveTbl = viewProxyTable(base, innerNames, innerColMap)
 	}
-	ctx := singleBindingContext(resolveTbl, alias, DefaultPlannerSettings())
+	ctx := singleBindingContext(resolveTbl, alias, ps)
 	ctx.cat = cat
 	return resolveExpr(tbl.View.Where, ctx)
 }
