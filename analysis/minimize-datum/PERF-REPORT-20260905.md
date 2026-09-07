@@ -1691,6 +1691,114 @@ difference between a result and an artefact.
   single-budget measurement would adopt a correction whose sign is wrong
   everywhere else.
 
+## 5.28. The keystone lands, and C-07 finds a wrong answer no row-count gate could see
+
+**C-19g landed (`cb4556791`) — the partial-aggregation split is a PATH now,
+and the default is flipped on.** This is the keystone §5.24.2 identified:
+C-19g had replaced the split *verdict* but not the *construction*, which is
+why C-19h could not retire the post-pass without losing six queries. Three
+separate pieces of held work were queued behind it — **C-19h**, **D-05**,
+and the spill-cost **Cut 3** (§5.27) — and all three are now re-testable.
+
+**B-17b closed with no engine change, because its blocker was stale.** The
+2026-09-05 decline said "no grouping paths exist, no path to carry the
+count; `enable_hashagg` stays rule-based" — and it was written *the same
+day* C-15/C-16 removed its premise. At HEAD `createGroupingPaths` and
+`createDistinctPaths` already build the hashed candidate with
+`disabledNodesFor(...)`, and `applyEnableHashAggRule` — the
+outcome-forcing rule the item existed to retire — was already deleted.
+**That is the third stale blocker found today**, after B-17b's sibling
+C-15 dependency and E-16's non-reproducing regression.
+
+MIXED needed no second setter: goopg's `AggStrategy` is Hashed|Sorted
+only and `groupingsets.go` runs every set through one hash table per set,
+so the grouping-sets shape *is* the hashed arm. What was genuinely
+missing were two pins whose failure is **silent** — with one candidate
+per shape a wrong count changes no winner and no row count, only an
+EXPLAIN `Disabled:` line PG does not print. The PLAIN arm must *not*
+count (goopg prices that candidate *through* the hashed arm, so stamping
+it is the natural mistake) and grouping sets must.
+
+### 5.28.1 C-07: the seam carries ordering — and forced a latent wrong-answer fix
+
+The seam now publishes the winning path's pathkeys, so C-11's `ORDERED`
+upper rel finally has something ordered to receive; the trace shows
+`producer=upper.ordered.input` firing from a real `PlanWithSettings` call
+with the ORDER BY `Sort` gone from the plan.
+
+The design avoided the coordinate hazard §5.23 warned about by **not
+translating at all**:
+
+1. **Validate, never translate.** Pathkeys are stamped on the published
+   search root, and each key must name the column it claims *at the
+   coordinate it claims* in the schema that root publishes. First failure
+   truncates — and a prefix is always a sound ordering claim, so the
+   degenerate answer is exactly the pre-C-07 behaviour.
+2. **Descend only through schema-identical wrappers** — `Filter`/`Limit`
+   only, re-checking the schema at each step. `Project` is refused even
+   when its output happens to agree.
+
+**The third change is the one that matters.** PG's `build_join_pathkeys`
+returns NIL for FULL/RIGHT joins, because unmatched inner rows land
+wherever the merge reaches them. **goopg kept the outer's keys for every
+join type.** That was harmless while merge pathkeys were read only inside
+the search — and became a **wrong answer** the moment an ordering claim
+can delete the ORDER BY `Sort`: rows emitted out of order with a
+perfectly correct row count.
+
+This is worth stating plainly because it is the exact failure this
+project's gates are weakest against. §5.20 already recorded that a
+row-count gate cannot see a plan-shape regression; this is stronger —
+**no row-count gate, and no values gate that sorts before comparing, can
+see it at all.** It was found only because enabling the ordering path
+made the latent bug reachable, which is the "an unwinnable path is an
+untested path" pattern for the fourth time in this workstream, and the
+first time it surfaced a correctness bug rather than a dead branch.
+
+Both pinning tests were **inverted rather than deleted**
+(`...GateIsCompleteButGenerationStaysShut` →
+`...OrderingArmGeneratesSinceTheSeamCarriesPathkeys`;
+`...InputArmIsUnreachableFromANode` → `...IsReachableFromANode`), keeping
+the strongest-form shape — a child already in the requested order, with
+the redundant Sort now gone. One assertion is deliberately unchanged and
+still true: `newPrebuiltPath` still carries no ordering, because its
+other callers hand it inputs that deliver none.
+
+The `nrels < 2` blocker survives untouched and is filed
+(`c07-single-rel-never-reaches-ordered-index-producer`): it is a size
+gate on the search that predates C-07, and opening it would route every
+single-table statement through the search boundary — a far wider blast
+radius than the ordering win.
+
+Gates: TPC-H 24/24 on values and **EXPLAIN byte-identical including
+costs (0 diff lines)**, so nothing needed re-timing; TPC-DS SF0.5
+PASS=95 all-zero; re-run in full *after* rebasing onto the C-19g commit
+because it touches the same files.
+
+### 5.28.2 A diagnosis of mine that was wrong
+
+I told the C-07 agent its failed SF0.5 sweep was a port collision with
+the C-19g agent on 65437. **It was not.** Its `SF05_PORT=5543` override
+took effect and the server bound the port; the readiness probe failed
+because the agent worked in a **git worktree**, and `./postgres` is an
+untracked convenience symlink that `git worktree add` does not create —
+so `pg_isready` was not on `PATH`. A missing symlink presents as a server
+that "never becomes ready", which reads exactly like a port problem and
+is neither.
+
+I had a plausible cause — a peer really did hold 65437 — and stopped
+there instead of checking whether the override had worked, which the
+agent's own log would have answered. Confirming evidence for a plausible
+story is not the same as ruling out the alternatives.
+
+What *is* true, and verified in the files: the sf05 gate cannot run
+privately without patching. `SF05_PORT` is overridable, but
+`SF05_GOOPG_DATA` (env_tpcds.sh:45), `SF05_LOG` (:107) and the hardcoded
+`CG_UNIT="goopg-tpcds-sf05"` (script:126) are not — and that cgroup unit
+name collides between concurrent agents. `SF05_RESULTS_DIR` (:53) already
+shows the overridable pattern the other three should follow; making them
+match is a cheap follow-up.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
