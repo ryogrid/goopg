@@ -2422,3 +2422,141 @@ an A/B. Two items were closed by measuring rather than by building, one was
 dropped by measuring, and the two that landed are provably neutral. That is
 a smaller list of optimisations than the plan anticipates, and a larger
 correction to how the plan's remaining items must be judged.
+
+---
+
+## 9. C-21 acceptance run — INTERIM, measured data only (2026-09-07)
+
+**Status: partial. The run is still executing.** This section records what has
+actually been captured so far, so the numbers exist in the repository before
+the run completes. Bars are not adjudicated here; §9.5 lists what is still
+outstanding. Nothing below is a final verdict.
+
+### 9.1 Arms, and one that was discarded
+
+| arm | commit | role |
+|---|---|---|
+| **before** | `d93fb9edc` (2026-09-01) | **release-to-release baseline**, NOT the branch point |
+| **tip** | branch tip (`0d4e934c2` era) | the finished tree |
+| c19pre / c19 | `d77f33b1c` / `bf6109210` | isolation pair for the base-rel scan costing change |
+| ~~after~~ | ~ `bf6109210` | **DISCARDED — see below** |
+
+**The `before` baseline is not this workstream's branch point, and the report
+must not claim otherwise.** The merge-base of `plan-narrowing-and-etc` and
+`master` is `53e000801` (2026-09-03), which is **333 commits after**
+`d93fb9edc`. So:
+
+- `d93fb9edc` -> tip = **706 commits**
+- merge-base -> tip = **373 commits**, and only those are this workstream's
+
+Every figure below is therefore **release-over-release since 2026-09-01**, and
+includes 333 commits of master-side work this workstream did not do. The owner
+accepted the wider baseline deliberately; the attribution caveat travels with
+the numbers.
+
+**A first `after` arm was built and discarded.** Probing the binaries directly
+showed it was missing the last two substantive changes:
+
+```
+binary        GOOPG_NARROW_UPPER   (B-01c slice (b) present?)
+goopg-after            0            no   <- discarded
+goopg-tip              1            yes  <- used
+```
+
+It also predated C-06. Its TPC-DS sweep was killed mid-run rather than
+completed, because a completed run would have produced a plausible number for
+the wrong tree — the failure mode this report has already recorded twice.
+
+### 9.2 A provenance trap in the sweep artifacts
+
+The tip sweep's own header reads:
+
+```
+# goopg: f213b6f5d planner(collapse): retire GOOPG_PGSHAPED_COLLAPSE ...
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown
+# engine-binary: running=4b8cae8e4b603bc9 on-disk=4b8cae8e4b603bc9 (/tmp/acc/goopg-tip)
+```
+
+**The `# goopg:` line names the CHECKOUT, not the binary.** The main checkout
+was deliberately held 8 commits behind origin for the duration of the run (see
+§9.4), so it reports `f213b6f5d` while the binary under test is `goopg-tip`,
+which includes `0d4e934c2`. The script flags the hazard itself
+(`provenance unknown`), and the authoritative line is `engine-binary`.
+
+Recorded because a later reader would otherwise attribute this sweep to C-06.
+
+### 9.3 What is measured
+
+**Bar A1 — TPC-H plan parity against PG 18.3** (22 queries):
+
+| arm | match | shapediff | missingnode | error |
+|---|---:|---:|---:|---:|
+| before | 5 | 15 | 2 | 0 |
+| **tip** | **6** | **14** | 2 | 0 |
+
+One query moved onto PG's shape. Category counts at tip: join-order 14,
+join-method 12, scan-type 12, parameterisation 6, aggregation-strategy 9,
+sort-strategy 7, parallelism 0, qual-placement 7, rendering 8 (before had
+join-order 13 and aggregation-strategy 8).
+
+**Bar A2 — TPC-DS SF0.5 plan parity** (99 queries):
+
+| arm | match | shapediff | missingnode | error |
+|---|---:|---:|---:|---:|
+| before | 0 | 35 | 61 | 3 |
+| **tip** | **0** | **34** | **62** | 3 |
+
+Stated plainly: **match stays 0**, shapediff improves by one, and
+`missingnode` gets one *worse*. TPC-DS parity did not move materially.
+
+**Bar B1 — values** (the correctness floor): TPC-DS SF0.5 at tip is
+**PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4**, matching the
+before arms. No row-count or checksum regression anywhere.
+
+**TPC-DS aggregate timing — a regression, recorded as measured:**
+
+```
+TOTAL 932s -> 1017s (+9.1%)
+STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=16 total-delta=+9.1%
+```
+
+**Caveat that must not be dropped:** this is the sweep's own status-delta
+against *its recorded previous report*, which is not necessarily the
+`d93fb9edc` before-arm. Whether the +9.1% is release-over-release or against a
+nearer baseline is for the completing run to establish. It is reported here
+because it is real and negative, not because its attribution is settled.
+
+### 9.4 Why the main checkout is held behind origin
+
+The sweep script voids a run when the engine source changes underneath it
+(`*** SWEEP VOID: engine source changed mid-sweep ***`, script line 378), and
+computes that identity from the **main checkout's** git state. Syncing the
+checkout during the run would therefore have discarded an hour of measurement.
+It is held 8 commits behind (7 docs plus `0d4e934c2`) until the run completes.
+Each arm is built in its own worktree pinned to an explicit SHA instead.
+
+### 9.5 Still outstanding
+
+- **A5 / B3 — the estimate ratchet.** `make ea-ratchet` is running now
+  (99 TPC-DS queries, 300 s per-query timeout). Note this corrects a standing
+  claim: the ledger row `take3-ea-ratchet-never-ran` says the ratchet has no
+  Makefile target, and it now has one (`Makefile:616`). This is the first time
+  it has actually executed.
+- **A3 / A4** — MISSING-NODE and join-spine parity, to be read off the
+  captures above.
+- **B2** — per-query timing ceilings, both suites, S-cold and WARM.
+- **B4** — engine time against PG (directional only, explicitly not an
+  acceptance bar).
+- **C1–C7** — hygiene audit.
+- The `c19pre`/`c19` isolation pair, which would attribute the base-rel scan
+  costing change on its own.
+- The verdict document under
+  `analysis/planner-refactor-take3/acceptance-<date>/` with the
+  worse-statement.
+
+**Known worse results that belong in the final worse-statement**, carried
+forward from §5.34 so they are not lost if the run is interrupted: Q9 at
+**x1.47** (12.6 -> 18.6 s) after the base-rel costing fix, whose new plan is
+the one PG 18.3 emits — a Parallel Hash Join shape goopg's executor cannot
+serve, so each worker rebuilds the inner side. That is an executor gap a
+parity-correct plan exposes, not a planner error.
