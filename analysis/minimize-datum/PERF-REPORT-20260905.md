@@ -2039,6 +2039,16 @@ behaviour change — because the fix is a whole-planner recalibration: a
 0.1%-selective `lineitem` scan moves from **161 to 160,946** priced rows.
 Filed as ledger `c19-baserel-scan-priced-on-output-rows`.
 
+> **Correction (added with §5.34):** that number is right but the
+> *direction it implies for the suite* was wrong, in the ledger and here.
+> It reads as "scans get dearer". They got **cheaper** on TPC-H, because
+> goopg's `tupleWidth` over-estimates badly (lineitem width 550 against
+> PG's 137) and `estScanPages(rows, width)` was therefore *inflating*
+> pages on unfiltered scans — lineitem 407,529 priced pages against
+> 136,393 real ones. Both statements hold at once: a selective scan is
+> priced far higher than before, and the unfiltered scans that dominate
+> TPC-H are priced lower. See §5.34.
+
 **Why this one matters beyond C-19h.** Every parallel decision in the
 tree has been made against a scan price that under-counts by up to three
 orders of magnitude on a selective scan, and the resulting refusal was
@@ -2174,6 +2184,93 @@ value is escape from a misfiring cost gate on data we have not seen. The
 two are not in tension. C-20f's flag guards a *cost gate*; C-06's selects
 a *legacy jointree path that C-04 exists to make unnecessary*, and its OFF
 plan is now strictly worse rather than a useful escape.
+
+## 5.34. The crossover fix lands — and the one regression is an executor gap, not a planner error
+
+`c19-baserel-scan-priced-on-output-rows` is fixed (`bf6109210`). One
+shared resolver, `baseSeqScanCostInputs`, now serves both production
+sites — `buildInitialRels`' serial prebuilt path and
+`addBaseRelPartialPaths`' partial twin — so a base-table `*SeqScan` leaf
+is priced on `baseRelPages(tbl, baseRows)` / `baseRows` with the filter's
+conjuncts charged per **scanned** tuple, while `addPartialSeqScanPath`
+keeps `rel.Rows` for what **crosses** the Gather. That is PG's two row
+counts, restored. Every other leaf class (index, subquery, CTE, VALUES)
+keeps the legacy pricing deliberately — repricing an index leaf as a full
+sequential scan would be wrong.
+
+`TestBaseRelGatherCannotWinAtAnySelectivity` was **inverted, not
+deleted**, into `TestBaseRelGatherCrossesOverOnASelectiveScan`. It drives
+the real producer chain and pins the Gather **losing** at selectivity 1.0
+and 0.5 and **winning** at 0.01 and 0.001. The crossover §5.31 proved
+absent now exists.
+
+**The suite is unchanged and the one mover is honest.** 24/24 on values;
+4 of 22 plans move shape (Q7, Q8, Q9, Q16), 17 move on cost only; suite
+total **144.00 s -> 144.13 s (x1.001)** against an **A/A floor of x1.044
+total** on the unchanged binary — i.e. inside the noise the harness itself
+generates.
+
+The exception is **Q9: 12.6 s -> 18.6 s (x1.47)**, medians of five
+fresh-server runs per arm. And the diagnosis is the interesting part:
+**Q9's new plan is the one PG 18.3 emits** — `Parallel Seq Scan on orders`
+probing a hash of the lineitem/partsupp/part side, upstream's
+`Parallel Hash Join` shape. goopg has no Parallel Hash, so each worker
+rebuilds the whole inner side.
+
+**So the regression is an executor gap that a parity-correct plan
+exposes, not a planner error.** That distinction matters for what happens
+next: the answer is not to un-fix the costing, it is that adopting PG's
+plan shapes will keep surfacing executor features goopg does not have
+yet. This is the first case in the workstream where becoming *more*
+PG-faithful made a query slower for a reason that is entirely downstream
+of the planner.
+
+### 5.34.1 The predicted direction was backwards — mine and the ledger's
+
+The ledger, my agent brief, and §5.31 above all implied that pricing
+scans on tuples-scanned makes scans **dearer**. On TPC-H it made them
+**cheaper**.
+
+goopg's `tupleWidth` over-estimates badly — lineitem width **550**
+against PG's **137** — so `estScanPages(rows, width)` was *inflating*
+pages on an unfiltered scan: **407,529 priced pages against 136,393 real
+ones** for lineitem, and orders 97,273 -> 43,435 cost units. Both
+statements are true simultaneously: a 0.1%-selective scan is priced far
+higher than before (161 -> 160,946), and the unfiltered scans that
+dominate TPC-H are priced *lower*. The bias the fix removes was against
+the index rivals, which already read `relpages` honestly.
+
+I asserted the direction from the closed-form formula without checking
+the inputs it consumes. That is the same error class as §5.33's — a
+formula that explains a behaviour is not evidence about the magnitudes
+feeding it.
+
+### 5.34.2 C-19h: a fourth blocker, and this one is structural
+
+`MaybeAddGather`'s ADD half **cannot be retired, and cannot be demoted
+either**. A one-relation statement never enters the path search at all:
+`makeRelFromJoinlist` returns `items[0]` when `len(items) == 1` — goopg's
+transcription of *"Single joinlist node, so we're done"*
+(allpaths.c:3399-3404) — so no `RelOptInfo` is built and no partial path
+is ever filed for it.
+
+Measured rather than argued: `EXPLAIN select * from lineitem where
+l_extendedprice > 90000` is **byte-identical** across the fix and across
+`GOOPG_GATHER_PATHS` off and `all`, at `Gather (cost=0.00..62325.07)`.
+The startup cost of **0** is the tell — that is the post-pass's Gather,
+never `cost_gather`'s, whose `parallel_setup_cost` of 1000 is plainly
+visible in PG's own `Gather (cost=1000.00..156795.02)`.
+
+**PG is not symmetric with goopg here:** `query_planner` runs
+`set_base_rel_pathlists` for a single-relation query too, so upstream has
+a base-rel path list where goopg has none. `TestPostPassOwnsTheNonAggregateGather`
+therefore stands unchanged — but now for a *named* reason rather than as
+an unexplained observation.
+
+That is the fourth distinct blocker C-19h has had, each replacing the
+last: the default flip, then C-19g's construction, then the base-rel
+crossover, now the single-relation short-circuit. Each was real, and each
+was only visible once its predecessor was removed.
 
 ## 6. What was dropped, and what it cost to find out
 
