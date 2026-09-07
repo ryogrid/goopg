@@ -316,9 +316,16 @@ func TestCreatePlainPartialPaths_LargeRelGetsAPartialSeqScanDividedByTheDivisor(
 			}
 			d := getParallelDivisor(wantWorkers, cp.parallelLeaderParticipation)
 			// The same inputs buildInitialRels priced the serial scan on
-			// (see addBaseRelPartialPaths): pages from rows × width.
-			disk := cp.seqPageCost * float64(estScanPages(rel.Rows, rel.Width))
-			cpu := cp.cpuTupleCost * rel.Rows
+			// (see addBaseRelPartialPaths / baseSeqScanCostInputs):
+			// `baserel->pages` and `baserel->tuples`, NOT the
+			// post-restriction row count — the split that gives the Gather
+			// a crossover (ledger
+			// c19-baserel-scan-priced-on-output-rows). This fixture has no
+			// local filter, so the qual term is zero; the pages are the
+			// relation's real relpages rather than rows × width.
+			baseTuples := float64(prob.relInfos[i].baseRows)
+			disk := cp.seqPageCost * float64(baseRelPages(tbl, baseTuples))
+			cpu := cp.cpuTupleCost * baseTuples
 			wantTotal := disk + cpu/d
 			if diff := pp.Cost.Total - wantTotal; diff > 1e-6 || diff < -1e-6 {
 				t.Errorf("%s: partial total %.4f, want disk %.2f + cpu %.2f / divisor %.2f = %.4f", tbl.Name, pp.Cost.Total, disk, cpu, d, wantTotal)

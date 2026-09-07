@@ -25,14 +25,22 @@ package optimizer
 // subtree. Flipping the default is a measured decision (TPC-H A/B, timing per
 // moved plan) and this slice does not take it.
 //
-// AND, for a BASE rel, the mode cannot change a plan even at `all`: goopg
-// prices a base-rel scan's CPU over the POST-restriction row count, the same
-// number `cost_gather` charges transfer on, so `gather − serial` is
+// A BASE rel's Gather is WINNABLE since 2026-09-07 (ledger
+// `c19-baserel-scan-priced-on-output-rows`). It was not before: goopg priced a
+// base-rel scan's CPU over the POST-restriction row count, the same number
+// `cost_gather` charges transfer on, so `gather − serial` was
 // `parallel_setup_cost + (parallel_tuple_cost − per_tuple_cpu × (1 − 1/d)) ×
-// rows` — positive everywhere. PG's is not, because its CPU term rides
-// `baserel->tuples`. See DESIGN §5.1a, `gatherpaths_crossover_test.go` and
-// ledger `c19-baserel-scan-priced-on-output-rows`; this is C-19h's remaining
-// prerequisite for the NON-AGGREGATE root.
+// rows` — positive everywhere, and `all` could not change a plan. Both sites
+// now read `baserel->pages` / `baserel->tuples` through
+// `baseSeqScanCostInputs` (joinsearch.go), as PG's `cost_seqscan` does, and
+// the crossover is pinned through the production producers in
+// `gatherpaths_crossover_test.go`. See DESIGN §5.1a.
+//
+// That does NOT discharge C-19h's non-aggregate root, and the reason is not a
+// cost one: a ONE-RELATION statement never enters the path search
+// (`makeRelFromJoinlist` returns at `len(items) == 1`, allpaths.c:3399-3404),
+// so no `RelOptInfo` and no partial path exist for it to read. The post-pass
+// is still the only producer of parallelism there — TODO_ALL C-19h, blocker 4.
 
 import (
 	"os"

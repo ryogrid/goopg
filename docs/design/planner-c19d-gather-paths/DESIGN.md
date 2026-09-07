@@ -307,8 +307,29 @@ cannot see, because all 22 of its queries aggregate at the top — needs the sca
 unified onto `rel->pages` / `rel->tuples`. That is a whole-planner
 recalibration (a 0.1%-selective `lineitem` scan goes 161 → 160 946 cost units),
 so it carries its own TPC-H + TPC-DS campaign; ledger row
-`c19-baserel-scan-priced-on-output-rows`, and it is C-19h's remaining
-prerequisite.
+`c19-baserel-scan-priced-on-output-rows`.
+
+**LANDED 2026-09-07.** Both sites now resolve their inputs through
+`baseSeqScanCostInputs` (joinsearch.go): a base-table `*SeqScan` leaf prices
+its CPU on `baserel->tuples` over `baserel->pages` and charges the local
+filter's conjuncts per tuple SCANNED, while the partial twin keeps `rel.Rows`
+for what CROSSES. `TestBaseRelGatherCannotWinAtAnySelectivity` is INVERTED into
+`TestBaseRelGatherCrossesOverOnASelectiveScan`, which drives the same
+production producers and pins the Gather losing at sel 1.0/0.5 and winning at
+0.01/0.001. TPC-H SF=1: digest 24/24 on values, four plans move shape (Q7, Q8,
+Q9, Q16), suite total x1.001 against an A/A floor of x1.044.
+
+**And it does not discharge the non-aggregate root**, for a reason that is not
+a cost one. A ONE-RELATION statement never enters the path search:
+`makeRelFromJoinlist` returns `items[0]` at `len(items) == 1` — "Single
+joinlist node, so we're done", allpaths.c:3399-3404 — so no `RelOptInfo` is
+built, no partial path is filed, and this file's producer has nothing to read.
+Measured: `EXPLAIN select * from lineitem where l_extendedprice > 90000` is
+byte-identical across the fix and across `GOOPG_GATHER_PATHS` off/all, at
+`Gather (cost=0.00..62325.07)` — startup 0, the post-pass's Gather, never
+`cost_gather`'s. PG is not symmetric here: `query_planner` runs
+`set_base_rel_pathlists` for a single-relation query too. The next slice is
+that parity gap, not a cost one; TODO_ALL C-19h, blocker 4.
 
 Until then the switch is a measurement instrument, which is the same shape
 `GOOPG_INDEX_PROBE_MULT` had before its calibration was run — and that knob's

@@ -432,16 +432,59 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			return nil, err
 		}
 		p := newPrebuiltPath(rel, leaf)
-		// The scan-cost currency of 04 §1 over the rel's own estimate.
-		// numQualOps is 0 because the local quals are already inside the
-		// leaf node and their selectivity is already inside `rows`; charging
-		// for them again here would double-count (the per-tuple operator
-		// term is what `estimateBaseRelInfo` has already spent).
-		p.Cost = costSeqscan(cp, estScanPages(rows, width), rows, 0)
+		// The scan-cost currency of 04 §1, on `cost_seqscan`'s OWN inputs:
+		// `baserel->pages` and `baserel->tuples`, not the post-restriction
+		// row count. See baseSeqScanCostInputs.
+		scanPages, scanTuples, scanQualOps := baseSeqScanCostInputs(ri, leaf, rows, width)
+		p.Cost = costSeqscan(cp, scanPages, scanTuples, scanQualOps)
 		addPath(rel, p, "joinsearch.prebuilt")
 		setCheapest(rel)
 	}
 	return s, nil
+}
+
+// baseSeqScanCostInputs resolves `cost_seqscan`'s three inputs for a base
+// relation's prebuilt leaf path, and is the single place the serial scan and
+// its partial twin (`addBaseRelPartialPaths`) agree on them.
+//
+// PG charges the two halves of a parallel plan on TWO DIFFERENT row counts,
+// and that difference is the entire reason a selective scan has a Gather
+// crossover (costsize.c:295 `cost_seqscan` vs :447 `cost_gather`):
+//
+//	cost_seqscan   (cpu_tuple_cost + qual cost) x baserel->tuples — every
+//	               tuple SCANNED, and that is the term `get_parallel_divisor`
+//	               divides — over seq_page_cost x baserel->pages.
+//	cost_gather    parallel_tuple_cost x baserel->rows — only the survivors
+//	               CROSSING the worker boundary.
+//
+// goopg used to substitute the post-restriction row count into BOTH (and a
+// page count derived from that same number), which collapses the difference to
+// `gather - serial = parallel_setup_cost + (parallel_tuple_cost -
+// per_tuple_cpu x (1 - 1/d)) x rows`: strictly positive at every row count and
+// every selectivity, so no crossover existed at all and a plain filtered
+// SELECT lost the Gather that vanilla PG 18.3 keeps. Ledger
+// `c19-baserel-scan-priced-on-output-rows`; pinned both ways in
+// gatherpaths_crossover_test.go.
+//
+// The qual cost comes back with the tuples it is charged on: the local filter's
+// conjuncts are evaluated on every scanned tuple, which is exactly what pays
+// for the rows the scan then does NOT emit. Charging it was double-counting
+// only while the tuple count was already post-restriction.
+//
+// PG's inputs need a real relation to read them from, so the legacy pricing is
+// kept for every leaf class that is not a plain heap scan of a catalog table:
+// an index leaf is the rule-based planner's own choice standing in for the
+// relation and must not be repriced as a full sequential scan, and a subquery
+// or CTE leaf has no `baserel->tuples` to speak of.
+func baseSeqScanCostInputs(ri baseRelInfo, leaf Node, fallbackRows float64, fallbackWidth int) (pages int64, tuples float64, numQualOps int) {
+	if _, ok := leafBaseScan(leaf).(*SeqScan); !ok || ri.table == nil || ri.baseRows < 1 {
+		return estScanPages(fallbackRows, fallbackWidth), fallbackRows, 0
+	}
+	tuples = float64(ri.baseRows)
+	if ri.localFilter != nil {
+		numQualOps = len(splitConjuncts(ri.localFilter, nil))
+	}
+	return baseRelPages(ri.table, tuples), tuples, numQualOps
 }
 
 // initialRelRows is the initial rel's cardinality: post-local-filter for a base

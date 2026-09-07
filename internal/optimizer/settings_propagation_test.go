@@ -79,7 +79,7 @@ func TestPlannerSettingsReachSubqueryScan(t *testing.T) {
 //
 // The assertion is on the priced inner join, not on timing or shape: before
 // B-12d the inner search planned under hard-wired defaults, so every arm
-// below costed the join at 3.25..151.75 no matter what the session said.
+// below costed the join at 171.25..354.75 no matter what the session said.
 // After B-12d each arm reprices it, proving the inner search reads the
 // statement's settings.
 //
@@ -172,8 +172,8 @@ func TestDerivedTablePropagationKeepsDefaultPlan(t *testing.T) {
 	if !ok {
 		t.Fatal("derived-table plan carries no cost; the inner join did not reach the path search")
 	}
-	if got.StartupCost != 3.25 || got.TotalCost != 151.75 || got.PlanRows != 100 {
-		t.Errorf("default derived-table join = (%.4f..%.4f rows=%.0f), want (3.25..151.75 rows=100) — "+
+	if got.StartupCost != 171.25 || got.TotalCost != 354.75 || got.PlanRows != 100 {
+		t.Errorf("default derived-table join = (%.4f..%.4f rows=%.0f), want (171.25..354.75 rows=100) — "+
 			"the default path moved", got.StartupCost, got.TotalCost, got.PlanRows)
 	}
 
@@ -193,7 +193,7 @@ func TestDerivedTablePropagationKeepsDefaultPlan(t *testing.T) {
 // running INSIDE each set-operation operand. Before B-12e the leftmost
 // branch, every planSegment right operand and the parenthesised
 // SetOpOperand grouping site planned under hard-wired defaults, so every
-// arm below costed the operand join at 3.25..151.75 no matter what the
+// arm below costed the operand join at 171.25..354.75 no matter what the
 // session said. After B-12e each arm reprices it, proving the operands
 // read the statement's settings.
 //
@@ -337,8 +337,8 @@ func TestSetOpPropagationKeepsDefaultPlan(t *testing.T) {
 	if !ok {
 		t.Fatal("set-op plan carries no cost; the operand join did not reach the path search")
 	}
-	if got.StartupCost != 3.25 || got.TotalCost != 151.75 || got.PlanRows != 100 {
-		t.Errorf("default set-op operand join = (%.4f..%.4f rows=%.0f), want (3.25..151.75 rows=100) — "+
+	if got.StartupCost != 171.25 || got.TotalCost != 354.75 || got.PlanRows != 100 {
+		t.Errorf("default set-op operand join = (%.4f..%.4f rows=%.0f), want (171.25..354.75 rows=100) — "+
 			"the default path moved", got.StartupCost, got.TotalCost, got.PlanRows)
 	}
 
@@ -374,7 +374,7 @@ func findSetOp(n Node) (*SetOp, bool) {
 // running INSIDE a scalar-class sublink — a scalar SubqueryExpr,
 // ARRAY(SELECT ...), IN, EXISTS, and the multi-assign UPDATE RHS. Before
 // B-12f all five sites planned under hard-wired defaults, so every arm
-// below costed the inner join at 3.25..151.75 no matter what the session
+// below costed the inner join at 171.25..354.75 no matter what the session
 // said. After B-12f each arm reprices it, proving the inner search reads
 // the statement's settings.
 //
@@ -528,8 +528,8 @@ func TestScalarSubqueryPropagationKeepsDefaultPlan(t *testing.T) {
 				t.Fatalf("%s: default plan has %d costed inner plans, want 1", sh.name, len(costs))
 			}
 			got := costs[0]
-			if got.StartupCost != 3.25 || got.TotalCost != 151.75 || got.PlanRows != 100 {
-				t.Errorf("%s: default inner join = (%.4f..%.4f rows=%.0f), want (3.25..151.75 rows=100) — "+
+			if got.StartupCost != 171.25 || got.TotalCost != 354.75 || got.PlanRows != 100 {
+				t.Errorf("%s: default inner join = (%.4f..%.4f rows=%.0f), want (171.25..354.75 rows=100) — "+
 					"the default path moved", sh.name, got.StartupCost, got.TotalCost, got.PlanRows)
 			}
 		})

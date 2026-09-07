@@ -2121,6 +2121,38 @@ rule).*
   whole-planner recalibration, not a parallel change — a 0.1%-selective
   `lineitem` scan goes 161 → 160 946 cost units — so it carries its own
   TPC-H + TPC-DS campaign and cannot ride C-19h's.
+  **PREREQUISITE DISCHARGED 2026-09-07, and it uncovers a FOURTH blocker.**
+  The base-rel scan is unified onto `baserel->pages` / `baserel->tuples`
+  (ledger `c19-baserel-scan-priced-on-output-rows`, now `[x]`): the crossover
+  is real, pinned through the production producers by
+  `TestBaseRelGatherCrossesOverOnASelectiveScan`, TPC-H digest 24/24 on
+  values, four plans move shape, suite total flat (x1.001 against an A/A
+  floor of x1.044). **But it does not reach C-19h's non-aggregate root**, and
+  the reason is structural rather than a cost one: a ONE-RELATION statement
+  never enters the path search at all. `makeRelFromJoinlist` returns
+  `items[0]` at `len(items) == 1` — "Single joinlist node, so we're done"
+  (allpaths.c:3399-3404) — so `searchOneProblem` / `buildInitialRels` never
+  run, no `RelOptInfo` is built, no partial path is filed and
+  `generateUsefulGatherPaths` has nothing to read. Measured on the same
+  clone, one binary per arm: `EXPLAIN select * from lineitem where
+  l_extendedprice > 90000` is BYTE-IDENTICAL across the fix and across
+  `GOOPG_GATHER_PATHS` off/all — `Gather (cost=0.00..62325.07)`, startup 0,
+  i.e. the post-pass's Gather, never `cost_gather`'s (which would carry
+  `parallel_setup_cost` 1000, as PG's `Gather (cost=1000.00..156795.02)` on
+  :65432 does). The same probe on a TWO-relation statement moves with the
+  fix, which is what separates the two cases.
+  goopg's shortcut is PG-faithful in the joinlist, but PG is not symmetric
+  here: upstream `query_planner` builds base rels and runs
+  `set_base_rel_pathlists` (hence `create_plain_partial_paths` and
+  `generate_useful_gather_paths`) for a single-relation query too. So
+  **`MaybeAddGather`'s ADD half is the ONLY producer of parallelism for
+  every single-relation statement in goopg**, and it cannot be retired —
+  nor demoted to a `debug_parallel_query`-gated pass — until the
+  single-relation case reaches the path model. That is the next slice, and
+  it is a `query_planner` parity item, not a cost one.
+  `TestPostPassOwnsTheNonAggregateGather` therefore stands unchanged: it is
+  still true, and now it is true for a NAMED reason.
+
   *design: take3 08 §8; gate: take3 09 §5 P5 — plan-parity both suites,
   parallel and serial arms.*
   (Serial control arm unchanged throughout C-19a–h. Ordering trap already

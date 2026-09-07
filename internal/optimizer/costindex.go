@@ -224,11 +224,22 @@ func costIndexScanCore(cp costParams, in indexScanInputs, workers int) (cost Cos
 	runCost += maxIOCost + csquared*(minIOCost-maxIOCost)
 
 	// CPU: `cpu_tuple_cost` per tuple actually fetched from the heap. The
-	// qpqual per-tuple term PG adds here is zero for goopg's search, for the
-	// same reason `buildInitialRels` passes numQualOps = 0: a base relation's
-	// local quals live inside the already-built leaf node and their cost was
-	// spent when `estimateBaseRelInfo` priced it. Charging them again here
-	// would double-count them against the seq-scan rival that does not.
+	// qpqual per-tuple term PG adds here is still zero for goopg's search.
+	//
+	// The justification it used to carry — "the same reason `buildInitialRels`
+	// passes numQualOps = 0" — EXPIRED on 2026-09-07: the seq-scan rival now
+	// charges `cpu_operator_cost x conjuncts` on every tuple SCANNED, because
+	// that is what `cost_seqscan` does and it is what gives a base-rel Gather
+	// its crossover (ledger `c19-baserel-scan-priced-on-output-rows`,
+	// `baseSeqScanCostInputs`). So the two rivals in one `addPath` comparison
+	// no longer use one currency for the qual: the index path pays
+	// `cpu_tuple_cost x tuples_fetched` where PG pays
+	// `(cpu_tuple_cost + qpqual) x tuples_fetched` (costsize.c:822-830).
+	//
+	// The asymmetry FAVOURS the index path, and it is small in absolute terms
+	// precisely where index paths win (a selective scan fetches few tuples),
+	// so it is left standing rather than folded into that measurement: adding
+	// it moves plans again and needs its own TPC-H digest + timing table.
 	cpuRunCost := cp.cpuTupleCost * tuplesFetched
 
 	// "Adjust costing for parallelism, if used" (costsize.c:257-266): the

@@ -555,17 +555,17 @@ func (s *searchCtx) addBaseRelPartialPaths() {
 			continue
 		}
 		// COST is priced on the SAME inputs the serial seq scan of this rel
-		// was priced on — `costSeqscan(cp, estScanPages(rows, width), rows,
-		// 0)` in buildInitialRels, with rows = rel.Rows and width =
-		// rel.Width — so the partial path is exactly "the serial scan with
-		// its CPU share divided", which is the relationship C-19d's
-		// Gather-vs-serial comparison must see. The serial prebuilt scan
-		// does NOT read baseRelPages (a pre-C-19 split: it prices pages from
-		// rows × width even on an ANALYZEd relation, while the index rivals
-		// read relpages); unifying it onto rel->pages is a plan-moving
-		// change of its own and is C-19d's to land, not this slice's.
-		pages := estScanPages(rel.Rows, rel.Width)
-		addPartialSeqScanPath(rel, s.cp, pages, rel.Rows, 0, workers)
+		// was priced on — `baseSeqScanCostInputs` is the one resolver both
+		// call — so the partial path is exactly "the serial scan with its
+		// CPU share divided", which is the relationship C-19d's
+		// Gather-vs-serial comparison must see. Those inputs are now
+		// `baserel->pages` / `baserel->tuples` at both sites, so the CPU
+		// term the divisor divides counts tuples SCANNED while
+		// `addPartialSeqScanPath` keeps `rel.Rows` for what CROSSES the
+		// Gather — PG's two row counts, and hence PG's crossover (ledger
+		// `c19-baserel-scan-priced-on-output-rows`).
+		pages, tuples, numQualOps := baseSeqScanCostInputs(s.relInfos[i], rel.baseLeaf, rel.Rows, rel.Width)
+		addPartialSeqScanPath(rel, s.cp, pages, tuples, numQualOps, workers)
 	}
 }
 
