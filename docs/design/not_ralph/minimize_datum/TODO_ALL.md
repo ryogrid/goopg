@@ -2107,7 +2107,28 @@ rule).*
   (Serial control arm unchanged throughout C-19a–h. Ordering trap already
   measured: at small budgets the plan moves onto index-driven joins the
   old post-pass cannot drive — take2 07 §3.2.)
-- [ ] **C-20a P6-01 one cardinality estimator — RE-SCOPED 2026-09-07,
+- [x] **C-20a P6-01 one cardinality estimator — SUCCESSOR LANDED 2026-09-07.**
+  The item's three deletions are all unavailable (census
+  `analysis/planner-refactor-take3/c20a-estimator-census-20260907/`), and the
+  successor it filed instead has now landed: EXPLAIN's `rows=` comes from the
+  SAME carrier as its cost fields. `explainCostFields` returns `PlanRows`
+  alongside StartupCost/TotalCost/PlanWidth, so a plan line can no longer
+  state one estimator's costs beside another's rows. Both text walkers AND
+  `FORMAT JSON`'s `Plan Rows` were changed together — the sibling-path rule,
+  since a JSON that disagreed with text would be worse than one that lagged it.
+  Re-pinned in the SAME commit as the item's own hazard note requires
+  (`plan_snapshots/c20a-c06s-plancost-rows-20260907.txt`), captured on this
+  tree so it also covers C-06s's Q13 move; `make plan-diff` **22/22 MATCH in
+  both `structural` and `MODE=costs`**. Executor and optimizer suites green,
+  `go vet` clean.
+  **What is NOT closed, and is ledgered rather than implied**
+  (`c20a-two-estimators-still-two`): the two estimators both still exist —
+  `calcJoinrelSize` inside the search and `EstimateRows`/`estimateJoin` over
+  the plan Node tree, the latter with 28 live call sites in 15 files including
+  three in `internal/executor` where no `RelOptInfo` exists or ever will. The
+  ONE-node/TWO-estimators defect is closed; the deletions are not.
+  ORIGINAL ROW FOLLOWS.
+  C-20a P6-01 one cardinality estimator — RE-SCOPED 2026-09-07,
   NOT YET EXECUTABLE.** Original text: delete legacy
   `estimateJoin`/`EstimateRows` + the `joinkeyproof.go` mirror;
   everything reads `calcJoinrelSize`. The census

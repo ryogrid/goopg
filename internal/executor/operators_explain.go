@@ -498,7 +498,9 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 			est = 1
 		}
 		// PG's cost annotation, from the path the planner chose (take2 P0-02).
-		startup, total, width := explainCostFields(rowSrc, est)
+		// `rows=` comes from the SAME carrier since C-20a's successor, so the
+		// line no longer states one estimator's costs beside another's rows.
+		est, startup, total, width := explainCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
@@ -1601,7 +1603,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if est <= 0 {
 			est = 1
 		}
-		startup, total, width := explainCostFields(rowSrc, est)
+		est, startup, total, width := explainCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	if s, ok := stats[n]; ok && s != nil {
@@ -1987,6 +1989,13 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 		costNode = filterNode
 		est = optimizer.EstimateRows(costNode)
 	}
+	// `Plan Rows` is set from the carrier below, together with the three cost
+	// fields, so FORMAT JSON and the text walkers cannot state different rows
+	// for the same node (C-20a's successor).
+	estFromCarrier, startup, total, width := explainCostFields(costNode, est)
+	if estFromCarrier > 0 {
+		est = estFromCarrier
+	}
 	if est > 0 {
 		obj["Plan Rows"] = est
 	}
@@ -1995,7 +2004,6 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 	// Rows, so FORMAT JSON stated no cost at all — and once the text walkers
 	// print real costs, a silent JSON would DISAGREE with text rather than
 	// merely lag it.
-	startup, total, width := explainCostFields(costNode, est)
 	obj["Startup Cost"] = startup
 	obj["Total Cost"] = total
 	obj["Plan Width"] = width
@@ -2083,14 +2091,48 @@ func explainIndexName(i *catalog.Index) string {
 // printing zeros. A plan mixing real costs with 0.00 is WORSE than one where
 // every cost is 0.00: with all-zero, a reader knows nothing is priced; with a
 // mixture, a free node and an unpriced node look identical.
-func explainCostFields(n optimizer.Node, rows int64) (startup, total float64, width int) {
+func explainCostFields(n optimizer.Node, rows int64) (est int64, startup, total float64, width int) {
 	if c, ok := n.(optimizer.PlanCostCarrier); ok {
 		if pc, set := c.PlanCostInfo(); set {
-			return pc.StartupCost, pc.TotalCost, pc.PlanWidth
+			return planCostRows(pc.PlanRows, rows), pc.StartupCost, pc.TotalCost, pc.PlanWidth
 		}
 	}
 	d := optimizer.DeriveLegacyDisplayCost(n, rows)
-	return d.StartupCost, d.TotalCost, d.PlanWidth
+	return planCostRows(d.PlanRows, rows), d.StartupCost, d.TotalCost, d.PlanWidth
+}
+
+// planCostRows converts a carrier's `PlanRows` to the integer EXPLAIN prints,
+// falling back to the caller's own estimate when the carrier has none.
+//
+// C-20a's successor (take3 08 §9, census
+// `analysis/planner-refactor-take3/c20a-estimator-census-20260907`). The three
+// deletions the original item asked for are all unavailable — `EstimateRows`
+// has 28 live call sites in 15 files, three of them in `internal/executor`
+// where no `RelOptInfo` exists or ever will — but the DEFECT under them is
+// smaller and is closed here: the planner CHOSE with `calcJoinrelSize` while
+// EXPLAIN REPORTED `estimateJoin`, because `explainCostFields` took
+// StartupCost/TotalCost/PlanWidth from the carrier and then recomputed `rows=`
+// with `EstimateRows`. One node, two estimators, and every estimate artefact
+// in the tree — plan-gate `MODE=semantic-cost`, `estimate-audit`, the c13a
+// census figures, the EA ratchet — read the reported one.
+//
+// `stampPlanCost` is a single funnel, so on a search-produced node this is the
+// WINNING PATH's row count: the number the planner actually compared. Nodes the
+// search did not produce keep the legacy derivation, which is the same
+// asymmetry the three cost fields already carry.
+//
+// The clamp is PG's own (`clamp_row_est`, costsize.c:216): a plan row count is
+// never below 1, and EXPLAIN has never printed `rows=0` for an estimate. A
+// carrier with a zero/negative `PlanRows` predates the stamp for that node kind
+// and falls back rather than printing a floor it did not earn.
+func planCostRows(planRows float64, fallback int64) int64 {
+	if planRows <= 0 {
+		return fallback
+	}
+	if planRows < 1 {
+		return 1
+	}
+	return int64(planRows + 0.5)
 }
 
 // schemaQualify prepends "public." to an unqualified table name for VERBOSE mode.
