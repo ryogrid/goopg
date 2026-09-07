@@ -1,5 +1,50 @@
 # E-18 / EX5-03 — `Parallel Hash`: split the hash BUILD across workers
 
+> **CORRECTION 2026-09-07 (implementation session). Read this before §0.**
+>
+> **goopg already has a cooperative parallel hash build.**
+> `parallelBuildLazyHashTable` (`internal/executor/parallel_hash_build.go`,
+> M0129-S4.1) is a producer/consumer split: N goroutines scan+filter the
+> build side, claiming disjoint blocks from a shared `ParallelScanState`,
+> while ONE consumer goroutine owns the map and inserts. §6.1's source pass
+> read `prebuildSharedHashJoins` (:203) and concluded the build cannot be
+> split at all; the cooperative builder is in the same file, and it fires
+> for 17 of the 38 TPC-H build sites (measured, SF=1, bench settings).
+>
+> Two consequences invalidate §4's phase plan:
+>
+> 1. **Phase 1 is not work.** "Sharded map + phase barrier" is one way to
+>    reach a cooperative build. goopg took a better one — single writer, no
+>    lock, no barrier. There is nothing to build.
+> 2. **Phase 2's hard half — SHARED BATCH FILES — is not needed.** §3.4 and
+>    §4 treat them as the prize's precondition. They are PG's precondition,
+>    not goopg's: `MultiExecParallelHash` needs them because every backend
+>    inserts, so N backends write one batch. goopg has exactly ONE writer,
+>    so batch files stay per-operator and single-writer, and the parallel
+>    build SCAN is obtained with none of that machinery.
+>
+> What was actually missing was **eligibility, not mechanism** —
+> `parallelBuildEligible`'s rules. Decline census over TPC-H SF=1:
+> 17 OK / 13 `notseqscan` / 4 `multibatch` / 3 `multikey` / 1 `jointype`.
+> Slice 1 retired the `multibatch` rule (its premise, "spilling builds
+> can't be shared", was retired by E-09a/E-09b); slice 2 widened the
+> `notseqscan` walker by one node kind, a hash join's PROBE side, and
+> prebuilt the nested joins once in the leader so producers do not redo
+> them. Both landed. Measured, parallel mode, values md5-identical:
+> Q7 −25.3%, Q20 −66%, Q5/Q21 −6..7%.
+>
+> **§0's verdict ("no witness for the cheap half; the prize needs the full
+> port") is therefore wrong in both halves.** The cheap half had witnesses
+> the census could not see because it counted BUILD SIZES rather than
+> ELIGIBILITY DECLINES, and the prize did not need the port.
+>
+> **What §0 was right about is Q9**, and the reason is neither of the ones
+> in this doc. Q9's serial critical path is the 6M-row `lineitem` scan,
+> which sits on a nested BUILD side, and `collectShareableJoins` descends
+> PROBE sides only by design. Reaching it needs a bottom-up cooperative
+> build of the whole inner chain — an ordering problem in goopg's own
+> prebuild walk, not PG's shared-batch-file problem. See TODO_ALL E-18.
+
 *TODO_ALL row: `docs/design/not_ralph/minimize_datum/TODO_ALL.md` E-18.
 Status: DESIGN + second-witness census (2026-09-07). Implementation NOT
 started — this doc is the row's mandated first deliverable ("design doc +
