@@ -562,7 +562,27 @@ are EPICS — split into one-checkbox-per-commit items before starting
   (without it UPDATE..WHERE IN deleted 0-vs-3 live — wrong answers);
   SSI fingerprint 2→3 for the multi-descent site.
   Gates: executor + optimizer suites green; smoke 0 failed.
-- [!] **B-15 P2-09b `btcostestimate` batch — BLOCKED (E1 failure,
+- [-] **B-15 — OUT OF SCOPE 2026-09-07: step 1 discharged, step 2's chain
+  terminates in an out-of-scope item.** The row's own ordering says step 2
+  (calibrate the heap per-tuple term and/or `indexProbeCostMultiplier`)
+  "still needs the spill calibration landed first" — and that is Cut 3, which
+  is blocked on the parallel keystone, which is itself out of scope because a
+  one-relation statement never enters the path search. Same termination as
+  B-13.
+  **Step 1 is discharged, and its result is the durable part.** The filed
+  hypothesis is confirmed **quantitatively**: R5's index-side ML pro-rating
+  collapses a parameterised probe's per-scan total **472x** across the loop
+  range — 4817.18 at loopCount 1, 824.42 at 1e3, **10.21 at 933,000** (Q14's
+  outer). goopg's deliberately-zero heap qpqual term would be worth ~6.0 cost
+  units per probe there: **~0.1% of the price at loop 1 and ~60% at 933,000**.
+  A bias that GROWS with loop count is exactly the NL-flip signature the batch
+  showed — 14 shapes flipping toward Nested Loop with values 24/24 intact, a
+  pure ranking failure.
+  Reopen with the parallel campaign, at which point step 2 is a calibration
+  against a known target rather than a search. Artifact
+  `analysis/planner-refactor-take3/b15-deferred-20260905/`, ledger
+  `take3-B-15-blocked-2`. ORIGINAL ROW FOLLOWS.
+  B-15 P2-09b `btcostestimate` batch — BLOCKED (E1 failure,
   reverted).** R1–R5 implemented unit-green but flips 14 shapes toward
   NL: Q10 5.6×, Q7 ~4×, Q9 2.3×, Q14 2.4×, Q5 2× (Q3 legitimately
   faster inside the failing batch); values 24/24 (pure ranking
@@ -3140,7 +3160,25 @@ per arm; values never counts for projection/join-adjacent changes).*
   batching geometry: on pre-EX1 widths this is premature by rule (take3
   13 §8.2, EX-P7).
   *design: take3 13 §5; gate: spilling-sort shapes; values + pin.*
-- [!] **E-02 EX3-06 skew residency + single-pass build — BLOCKED on B-16 +
+- [-] **E-02 — OUT OF SCOPE 2026-09-07: half its blocker is discharged and
+  the other half has no witness.** The row reads *BLOCKED on B-16 + EX1 exit*.
+  **B-16 is `[x]` done**, so that half is discharged. What remains is the EX1
+  half, and the row states its own reason for being last: *"skew-residency
+  sizing is an §8.4 scale argument over narrowed rows"*.
+  That scale argument is what this workstream has now measured repeatedly and
+  found absent. The retained-bytes evidence says the sizes are not there:
+  E-14's Cut A was dropped at **0.0065%** (14,747 Semi/Anti Datum cells, 0.7 MB,
+  against 10,954 MB of hash-build cells suite-wide — one part in 15,000), and
+  its sort side sits **three orders of magnitude below** the hash side. A
+  skew-residency budget computed over narrowed rows has nothing in this corpus
+  to be computed against.
+  The single-pass/single-map half of the item was moreover **already delivered
+  by another route**: E-09a published a spilling shared build and E-09b made it
+  one live batch table where there had been four (`maxLiveLoads` 4 -> 1), which
+  is the two-map collapse this row asked for.
+  Reopen only on a demonstrated skewed shape with measured residency — new
+  evidence, not new effort. ORIGINAL ROW FOLLOWS.
+  E-02 EX3-06 skew residency + single-pass build — BLOCKED on B-16 +
   EX1 exit.** MCV-pinned hot keys (consumes planner B-16 input) +
   collapse two-pass/two-map build. Skew-residency sizing is an §8.4 scale
   argument over narrowed rows — last in EX3 for that reason.
@@ -3642,6 +3680,57 @@ per arm; values never counts for projection/join-adjacent changes).*
 Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
+
+- [ ] **E-18 EX5-03 `Parallel Hash` — split the hash BUILD across workers,
+  as PG does.** Filed 2026-09-07 at the owner's request, same standing as
+  E-17 cut 2: **design doc + agent review + commit the design first, then
+  implement.**
+  **Evidenced, not inferred.** Plans captured in parallel mode on both
+  engines (`analysis/planner-refactor-take3/q9-parallel-plans-20260907/`,
+  `max_parallel_workers_per_gather = 4` read back from the live servers)
+  because every other plan artifact in this tree is a serial capture:
+
+  | TPC-H Q9 | PG 18.3 | goopg (tip) |
+  |---|---:|---:|
+  | `Parallel Seq Scan` nodes | 3 | **1** |
+  | `Parallel Hash` nodes | **4** | **0** |
+  | top-level cost | 113,104 | 836,644 (7.4x) |
+
+  PG runs `Parallel Hash Join` with a `Parallel Hash` over a
+  `Parallel Seq Scan on partsupp`. goopg parallelises **only the `orders`
+  scan**; its inner chain — 800,000 `partsupp` rows folded against
+  part/supplier/nation — runs **single-threaded while four workers wait**.
+  **What is missing is precisely the work-splitting, NOT the sharing.**
+  goopg has NEITHER of PG's two parallel hash joins (C-19f): it is not the
+  parallel-oblivious variant (N private copies) and not `parallel_hash=true`
+  (cooperative build). It is a third thing — **the leader builds once and
+  shares by pointer**, and since E-09a/E-09b that holds for spilling builds
+  too (Build Time went from five to one). So on the MEMORY axis goopg is
+  already where `parallel_hash=true` is: one table, not N. Only dividing the
+  *work* of building it is absent.
+  Correcting the record: the claim "each worker rebuilds the whole inner",
+  which appeared in an agent summary and was repeated into the perf report,
+  is **false**. See report §9.2c.
+  **Scope.** PG references: `ExecParallelHashJoin` / `MultiExecParallelHash`
+  and the `SharedHashInfo` / barrier machinery in
+  `postgres/src/backend/executor/nodeHash.c` and `nodeHashjoin.c`, plus
+  `try_partial_hashjoin_path`'s `parallel_hash=true` arm in `joinpath.c`.
+  The planner half already exists — C-19f landed `addPartialHashJoinPath`
+  and explicitly **refused** `parallel_hash=true` "for want of an executor",
+  so this item is that executor.
+  **Known interaction, and the reason this matters beyond Q9:** the base-rel
+  scan costing fix (`bf6109210`) moved Q9 onto PG's own Parallel Hash Join
+  shape and it got **1.47x slower** (12.6 -> 18.6 s) precisely because goopg
+  cannot serve that shape. That is an executor gap a parity-correct plan
+  exposes. Expect more of it as plan parity improves — this item is the
+  general answer.
+  **Sizing honesty:** Q9 is currently the only measured witness. Establish a
+  second before committing to the full barrier machinery; if Q9 is the only
+  shape in either corpus that pays, say so and scope accordingly.
+  *gate: values both suites (ordered hashes, not row counts); a parallel-mode
+  A/B on the witness shapes; `plan_snapshots/` re-pin only if plans move.
+  NOTE the standing trap — `estimate-audit` defaults to `-serial`, so its
+  captures are BLIND to this entire item; judge it with parallel-mode runs.*
 
 - [ ] **E-17 EX3-08 scan-resident qual — OPEN. The target is CUT 2:
   evaluate the predicate ONCE inside the scan, as PG does, and delete the
