@@ -3774,16 +3774,80 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
-- [~] **E-18 EX5-03 `Parallel Hash` — DESIGN + SECOND-WITNESS CENSUS
-  LANDED 2026-09-07; implementation NOT started.**
-  `docs/design/executor-ex5-03-parallel-hash/DESIGN.md` (source +
-  oracle reviews recorded inline, with corrections). Second witness
-  verdict: NONE for a single-batch cooperative build — every paying
-  build site is multi-batch at bench work_mem (4.6 GB / 648 / 316 /
-  197 / 192 MB; spilling labels Q9/Q16/Q18/Q21); the sole ≤64 MB
-  candidate is 150K×8 ≈ 57 MB (~100 ms build). So the cheap Phase 1 is
-  specified-not-built and the prize needs shared batch files (Phase 2,
-  full port — scoped in the design, beyond this session).
+- [~] **E-18 EX5-03 `Parallel Hash` — SLICE 1 LANDED 2026-09-07 (measured
+  −25.3% Q7 / −7.1% Q5 / −7.1% Q21, parallel mode, values identical).**
+  **The design doc's premise is CORRECTED by a source finding it missed:
+  goopg ALREADY HAS a cooperative parallel hash build.**
+  `parallelBuildLazyHashTable` (`internal/executor/parallel_hash_build.go`,
+  M0129-S4.1) is a producer/consumer split — N goroutines scan+filter the
+  build side, claiming disjoint blocks from a shared `ParallelScanState`,
+  while ONE consumer goroutine owns the map and inserts. The design's
+  §6.1 source pass looked at `prebuildSharedHashJoins` (same file, :203)
+  and concluded "the build cannot be split at all"; that is wrong for the
+  17 of 38 TPC-H build sites where it already fires (measured, below).
+  **Consequences for the design's phase plan, both load-bearing:**
+  - **Phase 1 is not needed and never was.** "Sharded map + phase barrier"
+    is one way to get a cooperative build; goopg took a better one
+    (single writer, no lock, no barrier). Nothing to build.
+  - **Phase 2's hard half — SHARED BATCH FILES — is not needed either.**
+    PG needs them because in `MultiExecParallelHash` every backend
+    inserts, so N backends write one batch. goopg has exactly ONE writer,
+    so batch files stay per-operator and single-writer, and the parallel
+    build SCAN is obtained with none of that machinery. This is the point
+    where goopg's shape beats the oracle's, and it is why E-18 is a small
+    item, not a full port.
+  **What was actually missing: the eligibility rules, not the mechanism.**
+  Instrumented `parallelBuildEligible` over TPC-H SF=1 at bench settings
+  (`work_mem=64MB`, `max_parallel_workers_per_gather=4`, private clone,
+  port 5541) — 38 build sites, decline reasons:
+  17 OK (already cooperative) / 13 `notseqscan` / 4 `multibatch` /
+  3 `multikey` / 1 `jointype`.
+  **Slice 1 (LANDED): Rule 2 (`NBatch > 1` → decline) retired.** Its
+  stated ground was "spilling builds can't be shared", which E-09a/E-09b
+  made obsolete, and spilling is entirely consumer-side here
+  (`buildLoopRight`/`buildLoopLeft` make ONE pass over the row source and
+  never rescan the child, so a `channelSource` serves a batching build
+  exactly as an operator tree does). Witnesses: Q5, Q7, Q21 each declined
+  an `orders` build at `NBatch=4`.
+  Parallel-mode A/B, fresh capped server per arm per rep, 2 alternating
+  reps, same binary except this change, md5 of every result set identical
+  across arms:
+
+  | query | A (before) | B (slice 1) | delta |
+  |---|---:|---:|---:|
+  | Q7 | 5.29 s | **3.95 s** | **−25.3%** |
+  | Q5 | 4.93 s | 4.58 s | −7.1% |
+  | Q21 | 13.48 s | 12.53 s | −7.1% |
+  | Q9 | 11.00 s | 11.57 s | +5.2% (path unchanged — noise) |
+  | Q18 | 32.81 s | 31.31 s | −4.6% (path unchanged — noise) |
+  | Q1 | 3.00 s | 2.94 s | (path unchanged — noise) |
+
+  The newly reachable path is COUNTED, per the design's own discipline
+  (`CoopSpillingBuildCount`), and `TestCoopParallelHashBuildSpills`
+  asserts the count moves AND that the payload is non-NULL — the
+  `5bf764520` failure mode is a right row count with a NULL payload, so
+  a count assertion would prove nothing.
+  `TestCoopParallelHashBuildValuesAcrossWorkMem` (32 work_mem values)
+  now exercises the spilling coop build across its whole sweep and is
+  green.
+  **Slice 2 (NOT built, and this is the honest remaining gap): Rule 3.**
+  Q9's own witness is blocked by `notseqscan`, not by `multibatch`.
+  `extractSeqScanFromPlan` descends only Filter/Project, and every one of
+  Q9's four hash builds has a JOIN TREE or a composite key on its build
+  side (measured: 2×`notseqscan`, 1×`multikey`, 1× already-OK `part`).
+  Widening the walker to a join's probe side is what PG's
+  `Parallel Hash`-over-`Nested Loop` shape corresponds to, but the
+  walker's own comment records why it is narrow — descending Aggregate
+  is a SILENT WRONG ANSWER (Q18's `HAVING sum(...)` semi-join build), and
+  descending joins costs (Q18 35.7 → 42.9–44.1 s) because each producer
+  redoes every nested build. Slice 2 is therefore "descend join probe
+  sides ONLY, never Aggregate/Sort, and share the nested builds so the
+  producers do not redo them" — specified here, not built.
+  **Pre-existing race found and NOT introduced by this item** (verified by
+  stashing the change and re-running): `TestSubquerySemanticsMatrix/M20`
+  races on the `maybeInstrument` global — a coop producer builds a
+  SubPlan lazily inside `Next()`, outside `buildUnderNilScope`'s mutex,
+  while a sibling producer is inside it. Ledger row, not this item's.
   Filed 2026-09-07 at the owner's request, same standing as
   E-17 cut 2: **design doc + agent review + commit the design first, then
   implement.**

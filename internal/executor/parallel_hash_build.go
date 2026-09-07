@@ -25,6 +25,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -409,17 +410,34 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 		return false
 	}
 
-	// Rule 2: must not be projected to spill.
+	// Rule 2 (E-18 slice 1): RETIRED. It used to decline a build whose
+	// geometry predicted more than one batch, on the stated ground that
+	// "spilling builds can't be shared". Two things make that obsolete:
+	//
+	//  1. E-09a/E-09b made a spilling build shareable — captureSharedBuild
+	//     freezes the batch descriptor and every participant reloads the
+	//     inner files privately (sharedBatchDesc, join_batch.go). Sharing is
+	//     no longer conditional on fitting in one batch.
+	//  2. Spilling is entirely CONSUMER-side here. The cooperative build is a
+	//     producer/consumer split: the producers only scan+filter and hand
+	//     rows over a channel; the single consumer goroutine (the leader)
+	//     evaluates the key and calls insertBuildRow, which is what routes a
+	//     row to a batch file. buildLoopRight/buildLoopLeft make ONE pass
+	//     over the row source and never rescan the child, so a channelSource
+	//     serves a batching build exactly as a child operator tree does.
+	//
+	// This is the point where goopg's producer/consumer shape beats PG's:
+	// PG needs SHARED batch files for `Parallel Hash` because every backend
+	// inserts, so writes to a batch come from N backends at once. goopg has
+	// exactly one writer, so the batch files stay per-operator and
+	// single-writer, and the parallel BUILD SCAN is obtained without any of
+	// the shared-file machinery E-18's design doc scoped as "Phase 2".
+	//
+	// Witnesses at bench work_mem (64MB), TPC-H SF=1: Q5, Q7 and Q21 each
+	// declined an `orders` build at NBatch=4 under the old rule.
 	buildPlan := o.plan.Right
-	buildWidth := o.lazyRW
 	if buildLeft {
 		buildPlan = o.plan.Left
-		buildWidth = o.lazyLW
-	}
-	if o.joinBatchEligible() {
-		if o.buildGeometry(ctx, buildPlan, buildWidth, buildLeft).NBatch > 1 {
-			return false
-		}
 	}
 
 	// Rule 3: build child must be a SeqScan (possibly under Filter).
@@ -436,6 +454,17 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 
 	return true
 }
+
+// coopSpillingBuilds counts cooperative parallel hash builds that ACTUALLY
+// spilled (ended with a live batch descriptor). E-18 slice 1 retired the
+// eligibility rule that declined those, and the design's own discipline is
+// that a newly-reachable path which never fires is an untested one — so the
+// path is counted, and TestCoopParallelHashBuildSpills asserts the count moves.
+var coopSpillingBuilds atomic.Int64
+
+// CoopSpillingBuildCount reports the process-wide number of cooperative
+// parallel hash builds that spilled to batch files. Test/diagnostic use.
+func CoopSpillingBuildCount() int64 { return coopSpillingBuilds.Load() }
 
 // parallelBuildLazyHashTable runs a cooperative parallel hash build.
 //
@@ -616,6 +645,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 		return false, loopErr
 	}
 
+	if o.batches != nil {
+		coopSpillingBuilds.Add(1)
+	}
 	o.recordBuildTime(ctx, buildStart)
 	return probeIsLeft, nil
 }

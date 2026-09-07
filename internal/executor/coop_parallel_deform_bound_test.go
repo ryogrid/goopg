@@ -97,3 +97,50 @@ func workMemName(wm int64) string {
 		return "gib"
 	}
 }
+
+// TestCoopParallelHashBuildSpills is E-18 slice 1's "the newly-reachable path
+// actually fires" assertion.
+//
+// Before slice 1, parallelBuildEligible declined any build whose geometry
+// predicted more than one batch ("Rule 2"), on the ground that a spilling build
+// could not be shared. E-09a/E-09b made spilling builds shareable, and the
+// cooperative build spills entirely in its single consumer goroutine (the
+// producers only scan and filter), so the rule had nothing left to protect.
+//
+// Retiring a rule is only half the change: a path that is now reachable but
+// never taken is untested. This test drives the fixture at a work_mem small
+// enough to force batching and asserts that a cooperative build really did end
+// with a batch descriptor — and, because this repo's standing lesson is that
+// row counts sail past payload corruption, that the values are still right.
+func TestCoopParallelHashBuildSpills(t *testing.T) {
+	const sql = "SELECT f.fid, d.dname FROM pq_fact f JOIN pq_dim d ON f.fk = d.dk WHERE d.dk > 3"
+
+	before := CoopSpillingBuildCount()
+
+	ctx, cleanup := pqJoinFixture(t)
+	defer cleanup()
+	// Small enough that the build geometry predicts more than one batch.
+	ctx.WorkMem = 1
+
+	rows, err := runQueryWithErr(ctx, sql)
+	if err != nil {
+		t.Fatalf("spilling coop build: %v", err)
+	}
+	rendered := renderRows(rows)
+	if len(rendered) != 147 {
+		t.Fatalf("%d rows, want 147", len(rendered))
+	}
+	for _, r := range rendered {
+		if strings.HasSuffix(r, "|NULL") {
+			t.Fatalf("NULL payload in %q — the spilling cooperative build lost "+
+				"its payload columns", r)
+		}
+	}
+
+	if got := CoopSpillingBuildCount(); got == before {
+		t.Fatalf("cooperative spilling build count did not move (%d): the path "+
+			"E-18 slice 1 opened was never taken, so this test proves nothing "+
+			"about it. Either the fixture no longer batches at work_mem=1 or "+
+			"eligibility declines it for another reason", got)
+	}
+}
