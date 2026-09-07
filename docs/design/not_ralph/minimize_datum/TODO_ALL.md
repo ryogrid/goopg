@@ -879,7 +879,41 @@ rule).*
   re-run this one-command measurement — two `estimate-audit -plan-only`
   captures on the same cluster, one per flag value — and delete the flag
   when they come back identical. Ledger `c06-collapse-flip-moves-q13`.
-- [ ] **C-06s — offer the COMMUTED direction of a LEFT join to the search
+- [~] **C-06s — LANDED 2026-09-07 (`922a3f444`); TWO GATE ITEMS OUTSTANDING.**
+  `jointypeForDirection` now returns `(JoinRight, true)` on reversed
+  containment, LEFT-only and fail-closed (SEMI/ANTI/FULL keep declining; no
+  `JOIN_RIGHT_SEMI`/`JOIN_RIGHT_ANTI` executor arms exist). Downstream needed
+  nothing — `createPlanNode` already maps JoinRight, the merge arm already
+  builds right paths, the executor already runs `Hash Right Join`.
+  **Nine shape pins updated, not deleted.** They asserted "exactly one LEFT
+  join", which was only ever true because the commuted direction was declined.
+  The invariant they guard is that the link must not become INNER — the Q72
+  wrong answer, which drops unmatched rows and which no row-count gate can
+  see. They now count LEFT+RIGHT (`rfjOuterPreserving`); FULL is still refused.
+  Three of them also read the hands POSITIONALLY, and a commuted winner has
+  its children swapped, so they now select preserved/null-extended by
+  jointype — otherwise they report leaf counts backwards and fail a correct
+  plan.
+  **Gate status:** units exit 0 (44 ok, 0 fail), `go vet` clean, optimizer +
+  executor suites green — DONE. tpch-spotcheck PASS (Q12=2, Q13=34, the
+  2026-08-26 re-pin) — DONE. TPC-H acceptance **24/24 MATCH by values** —
+  DONE. TPC-DS SF0.5 **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0** —
+  DONE. Plan movement small and toward PG: TPC-H 23 diff lines ALL inside Q13
+  (`Merge Left Join` -> `Hash Right Join`, 21 queries byte-identical, Q13
+  5.16 -> 4.45 s); TPC-DS 96 same / 3 changed, all three toward PG's own
+  shapes (Q5, Q75 -> `Hash Right Join`, which is literally what
+  `plans-pg/Q5.txt` and `Q75.txt` contain; Q40 -> `Nested Loop Left Join`
+  with an index scan, matching `plans-pg/Q40.txt`).
+  **STILL OWED, and the row is not `[x]` until both land:**
+  1. the timed pass on the TPC-DS queries whose plans moved (Q5/Q40/Q75) —
+     the gate says "every query whose plan moved", and only the TPC-H side of
+     that has been timed. All three PASS with checksums and sit far under the
+     300 s budget (Q5 20 s, Q40 0.4 s, Q75 5 s), but a passing value is not a
+     timing.
+  2. the `plan_snapshots/` re-pin under a NEW name (Q13 is the only TPC-H
+     mover). Do not overwrite a peer's pin.
+  Handover that produced this: `tmp/c-06s-handover.md`. ORIGINAL ROW FOLLOWS.
+  C-06s — offer the COMMUTED direction of a LEFT join to the search
   (PG's `JOIN_RIGHT`).** C-06's diagnosis, filed rather than landed because it
   is not small. `jointypeForDirection` returns `(sjinfo.Jointype, false)` for
   the reversed containment; PG's `populate_joinrel_with_paths`
