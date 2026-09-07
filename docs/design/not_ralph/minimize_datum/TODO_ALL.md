@@ -3636,7 +3636,19 @@ ledger row if the measurement says no.
   because there is no second evaluation to pay for; the low-selectivity
   pessimisation disappears by construction rather than needing its own
   measurement.
-  *Sequence: design doc + agent review first, then implement. gate: values
+  **SEQUENCING, set by the owner 2026-09-07 — do not start cut 2 before
+  this order is satisfied:**
+  1. **C-21's acceptance report is produced FIRST, on the current
+     implementation**, and committed/pushed as the first instalment. It
+     measures the tree as it stands, with the double evaluation present.
+  2. **Then** cut 2 is designed, reviewed and implemented.
+  3. **After cut 2 lands**, its delta is APPENDED to the report as a
+     second instalment, against the first instalment's numbers.
+  The reason is not bookkeeping: cut 2 deletes the `Filter` node, so
+  EXPLAIN output moves. Landing it mid-acceptance would leave C-21
+  measuring a tree that changed underneath it — the exact class of
+  contamination this workstream has already paid for twice.
+  *Then: design doc + agent review first, then implement. gate: values
   both suites; EXPLAIN output MOVES (the Filter line disappears), so a
   `plan_snapshots/` re-pin and a PG-parity re-check belong in the same
   commit, plus an error-position test per absorbed abstain path.* Filed today from the
