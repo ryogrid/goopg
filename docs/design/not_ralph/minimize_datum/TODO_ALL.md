@@ -473,7 +473,28 @@ are EPICS — split into one-checkbox-per-commit items before starting
   `settings_propagation_test.go`. Unstamped hosts (HAVING/VALUES/
   ORDER BY/CTE bodies, INSERT…SELECT, ON CONFLICT, DML derived
   tables) stay default — future slices.
-- [!] **B-13 P2-02b `work_mem` BootVal 512 MB → 4 MB — BLOCKED on
+- [-] **B-13 — OUT OF SCOPE 2026-09-07: the prerequisite chain terminates in
+  something already ruled out of scope.** The row's own resume reads *"land
+  Cut 3, then re-run the 4MB arm against those seven"*. Cut 3 is blocked on the
+  parallel keystone (ledger `spill-cut3-deferred`), and that keystone —
+  C-19h — is itself now out of scope: a one-relation statement never enters the
+  path search, so fixing it is a separate PG-parity campaign. The chain has no
+  reachable end inside this workstream.
+  **What the calibration DID establish, and it is worth keeping:** with Cut 3
+  applied, PG's real 4 MB default costs the suite **nothing** — TOTAL −3.0%
+  (135.85 s) against +24.9% (174.84 s) uncalibrated, i.e. the calibration
+  recovers −22.3% of the 4 MB suite. Q14 goes 16.53 s → 0.91 s, Q10 9.62 →
+  3.00, Q3 8.41 → 4.40, Q7 16.36 → 9.50. Values 24/24 MATCH in all three arms,
+  and the row's own re-probe trigger is satisfied (Q9 keeps hash+Gather at
+  4 MB). So the prerequisite was confirmed as the **right instrument**.
+  **Why it still cannot land:** seven queries remain over the 1.2× B2 ceiling
+  at 4MB+Cut3 against the 64 MB baseline — Q8 +207.3%, Q7 +70.9%, Q9 +73.3%,
+  Q2 +72.8%, Q16 +61.9%, Q14 +56.9%, Q3 +37.1%. Shipping PG's default at that
+  cost is not an improvement.
+  Reopen if and when the parallel campaign lands and Cut 3 with it; the 4 MB
+  arm is then a re-run against those seven, not new work. Ledger
+  `take3-B-13-deferred-2`. ORIGINAL ROW FOLLOWS.
+  B-13 P2-02b `work_mem` BootVal 512 MB → 4 MB — BLOCKED on
   spill-cost calibration (re-probed 2026-09-05).**
   **Method note added 2026-09-05:** the prerequisite named here — spill-cost
   calibration — is the SAME class of problem C-20d turned into a 27% suite
