@@ -3912,6 +3912,66 @@ ledger row if the measurement says no.
   changes); cut 2 moves EXPLAIN output — the Filter line disappears — so it
   needs a `plan_snapshots/` re-pin and a PG-parity re-check in the same
   commit, plus an error-position test per abstain path.*
+  **2026-09-07 — cut 1 RULED OUT by the owner; cut 2 DESIGNED, design
+  accepted and committed: `docs/design/executor-ex3-08-scan-resident-qual/DESIGN.md`.**
+  Cut 1 is not to be built: a per-row skip flag leaves two evaluators in the
+  tree and adds a third artefact to keep consistent — it suppresses the
+  symptom and preserves the divergence. Cut 2 is the deliverable. The design
+  passed two adversarial reviews (source-falsification over `internal/`, PG
+  18.3 oracle over `postgres/`); both found real errors in the first draft
+  and the corrections are recorded inline in the doc rather than absorbed
+  silently. Four results that change this row:
+  - **The gate line above is wrong about EXPLAIN.** All three renderers
+    collapse the `*optimizer.Filter` PLAN NODE into the scan's `Filter:`
+    line and key on the plan node, never on the operator
+    (`operators_explain.go:430-446`, `:1553-1570`, `jsonCollapse` `:1921-1937`).
+    Keeping the plan node and deleting only the `filterOp` OPERATOR leaves
+    plain EXPLAIN byte-identical in all three formats — **no re-pin**; the
+    plan gate becomes a regression check against
+    `plan_snapshots/c20a-c06s-plancost-rows-20260907.txt` (66 `Filter:`
+    detail lines, ZERO standalone `-> Filter` nodes). EXPLAIN ANALYZE does
+    move, on two counters, both toward PG (next bullet).
+  - **Cut 2 fixes a three-part instrumentation defect, not just a
+    duplicate evaluation.** `seqScanOp` implements `filterRemoveCounter`
+    nowhere and the prefilter rejects with a bare `continue`
+    (`operators_storage.go:2095-2103`), so `Rows Removed by Filter` is
+    under-reported whenever the prefilter is armed; the JSON renderer reads
+    the counter off a different node than the text renderer
+    (`operators_explain.go:1821` vs `:1566`) and so reports 0 for EVERY
+    `Filter{Scan}`; and `foldGatherWorkerStats` never folds `filterRejected`
+    (`instrument.go:399-425`), so parallel plans — i.e. all TPC-H bench
+    plans — count only the leader. `actual rows` on a collapsed scan line
+    also becomes post-qual, as PG reports it.
+  - **A fourth absorbed responsibility this row does not name.**
+    `findFilterPred` (`operators_lockrows.go:171-181`) recovers the
+    scan-level qual OFF THE `filterOp` — arms for `*filterOp`/`*projectOp`,
+    `default: return nil` — and feeds `epqRecheckFilter`. Deleting the node
+    without absorbing this makes EPQ recheck a silent no-op: **wrong rows
+    under `SELECT … FOR UPDATE` with a concurrent update.** It also fails to
+    peel `*instrumentedOp`, so EPQ recheck already degrades under EXPLAIN
+    ANALYZE. Plus `statReturned` (`:2273`, pg_stat `tuples_returned`) must
+    stay ABOVE the late qual or every scan's `tuples_returned` silently
+    becomes post-qual.
+  - **The exhaustive walker must be built on `walkExprRefs`, and
+    eligibility must NOT be a `Visit` return value.** `Visit` returning
+    false PRUNES without aborting (`exprwalk.go:300-302`, `:333-335`), so a
+    veto expressed that way stops the descent and under-counts `MaxCols` —
+    the exact wrong-answer direction the primitive was chosen to prevent.
+    `Visit` always returns true and records `max(ColumnRef.Index)`;
+    eligibility is a closure-side flag. Placement in `internal/optimizer` is
+    also what puts the walker under the census gate at all
+    (`exprwalk_inventory_test.go:331-344` globs that package only; today's
+    `prefilterSafeExpr` is a 9-arm hand-written switch in `executor`, pinned
+    by nothing).
+  Three PG divergences surfaced by the design are filed in the deferral
+  ledger and are NOT in cut 2's scope: `e17-lazy-detoast-divergence` (PG
+  never detoasts a row; expansion is per-argument inside the called
+  function), `e17-order-qual-clauses-absent` (no `security_level`/cost qual
+  ordering, so RLS / `security_barrier` leak-prevention has no analogue),
+  `e17-qual-first-error-ordering` (PG raises a qual error before any later
+  per-row stage; cut 2 preserves goopg's inverse order deliberately, so a
+  values regression stays attributable). Next step is §6's measurement arm —
+  the unmeasured low-selectivity case — BEFORE any of §4 lands.*
 - [x] **F-01 Delete the duplicate build map** — already satisfied in-tree by `514913912` (M0127-P0.3: plan-typed single-map build, `lazyHashFinalize`/`lazyBuildAllInt64` deleted; enforced by `join_single_map_build_test.go` dual-map-build-back guard); gates: executor join suites green at that commit; artifacts: `internal/executor/operators_join_agg.go`, `internal/executor/join_single_map_build_test.go`.
 - [x] **F-02 Probe-seam re-materialisation** — already satisfied in-tree,
   audit-only close 2026-09-05. The premise (take2 07 §6, evidence from
