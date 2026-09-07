@@ -24,6 +24,15 @@ package optimizer
 // leader — while the post-pass puts one Gather ABOVE the whole hash-join
 // subtree. Flipping the default is a measured decision (TPC-H A/B, timing per
 // moved plan) and this slice does not take it.
+//
+// AND, for a BASE rel, the mode cannot change a plan even at `all`: goopg
+// prices a base-rel scan's CPU over the POST-restriction row count, the same
+// number `cost_gather` charges transfer on, so `gather − serial` is
+// `parallel_setup_cost + (parallel_tuple_cost − per_tuple_cpu × (1 − 1/d)) ×
+// rows` — positive everywhere. PG's is not, because its CPU term rides
+// `baserel->tuples`. See DESIGN §5.1a, `gatherpaths_crossover_test.go` and
+// ledger `c19-baserel-scan-priced-on-output-rows`; this is C-19h's remaining
+// prerequisite for the NON-AGGREGATE root.
 
 import (
 	"os"

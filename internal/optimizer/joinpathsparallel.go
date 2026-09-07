@@ -8,11 +8,25 @@ package optimizer
 // entry in `RelOptInfo.PartialPathlist` belonged to a BASE rel (C-19b's partial
 // seq scan, C-19c's partial index scan), so a Gather chosen by C-19d's reader
 // sat BELOW every join and the whole relation crossed the parallel boundary.
-// C-19d §5.1 quantified what that costs: `parallel_tuple_cost` × rows is
-// 0.1/row while the saving is `cpu_tuple_cost`'s worker share ≈0.0075/row, so
-// `add_path` correctly dominates a base-rel Gather at ANY relation size. PG
-// escapes that arithmetic by putting the join below the Gather. This file is
-// how goopg does the same: a partial hash join runs the join in the workers, so
+// C-19d §5.1 quantified what that costs IN GOOPG: `parallel_tuple_cost` × rows
+// is 0.1/row while the saving is the scan's per-tuple CPU worker share
+// ≈0.0094/row, so `add_path` dominates a base-rel Gather at any relation size
+// and any selectivity.
+//
+// CORRECTION (2026-09-07, C-19d DESIGN §5.1a): that is a statement about goopg,
+// not about PG, and this header used to draw the wrong inference from it ("PG
+// escapes that arithmetic by putting the join below the Gather"). PG puts joins
+// below the Gather, but its BASE-REL Gather wins on its own — `cost_seqscan`
+// divides the CPU term over `baserel->tuples` (every tuple SCANNED) while
+// `cost_gather` charges transfer on `baserel->rows` (the survivors CROSSING),
+// two different numbers, so a selective scan has a crossover. goopg prices the
+// base-rel scan on the post-restriction row count for BOTH, so it has none —
+// pinned by `TestBaseRelGatherCannotWinAtAnySelectivity` and its PG-shaped
+// twin, and fixed only by unifying the scan onto `rel->pages` / `rel->tuples`
+// (ledger `c19-baserel-scan-priced-on-output-rows`).
+//
+// None of which changes what this file is for, only what it does NOT rescue: a
+// partial hash join runs the join in the workers, so
 // only the JOIN'S OUTPUT is charged parallel_tuple_cost — and, because a
 // joinrel's partial path is the partial OUTER of the join above it, the paths
 // propagate upward until one Gather can sit over a whole join tree.

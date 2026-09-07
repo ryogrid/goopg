@@ -2014,6 +2014,52 @@ rule).*
   (C-19d's crossover) → re-probe the non-aggregate cohort against PG → then
   either delete, or demote the pass to a `debug_parallel_query`-only force
   pass, which is the PG-faithful end state.
+
+  **THIRD survivor, found 2026-09-07, and it is the load-bearing one: the
+  NON-AGGREGATE root.** The 22-query census above is blind to it — all 22
+  TPC-H queries carry an aggregate at the top, so it measures exactly the
+  one root C-19g's producer serves. Probed directly:
+  `select * from lineitem where l_extendedprice > 90000` gets
+  `Gather -> Parallel Seq Scan` from vanilla PG 18.3 and from goopg's
+  post-pass, and a bare `Seq Scan` from goopg once the post-pass stands
+  down — with `GOOPG_GATHER_PATHS=all`, which does NOT rescue it.
+  **Diagnosed to the mechanism, and it is a PG-PARITY defect in the SCAN's
+  cost inputs, not in any parallel term.** `cost_gather`,
+  `cost_gather_merge`, `get_parallel_divisor` and `add_path` are all
+  faithful transcriptions and all exonerated. PG's `cost_seqscan` charges
+  `(cpu_tuple_cost + qual) × baserel->tuples` — every tuple SCANNED, and
+  that is the term the divisor divides — while `cost_gather` charges
+  `parallel_tuple_cost × baserel->rows`, only the survivors CROSSING the
+  boundary; two different numbers, so a selective scan has a crossover.
+  goopg prices the base-rel scan on the POST-restriction row count for
+  BOTH terms and on a page count derived from that same number
+  (`joinsearch.go:440` `costSeqscan(cp, estScanPages(rows, width), rows, 0)`
+  for the serial prebuilt path; `considerparallel.go:567`
+  `estScanPages(rel.Rows, rel.Width)` for the partial twin, deliberately
+  priced on the serial one's inputs so the two stay comparable). Scanned ==
+  crossed, so
+
+      gather − serial = parallel_setup_cost
+                      + (parallel_tuple_cost
+                         − per_tuple_cpu × (1 − 1/divisor)) × rows
+
+  = 1000 + 0.0906 × rows at the shipped constants — **strictly positive at
+  every row count and every selectivity. There is no crossover to find, so
+  no measurement of the `all` mode can find one.** Pinned both ways by
+  `TestBaseRelGatherCannotWinAtAnySelectivity` (the defect, through the
+  production producers, with the closed form) and
+  `TestPGShapedScanInputsRestoreTheGatherCrossover` (the SAME constants on
+  PG's inputs put the crossover at ~3% selectivity, where PG's is).
+  This also **corrects C-19d DESIGN §5.1** and `joinpathsparallel.go`'s
+  header, both of which state the 0.1-vs-0.0075 arithmetic as a general
+  fact and infer that "PG escapes that arithmetic by putting the join below
+  the Gather". PG does put joins below the Gather, but that is not why its
+  base-rel Gather wins — PG's wins on its own.
+  **Prerequisite, now named:** unify the base-rel scan onto `rel->pages` /
+  `rel->tuples` (ledger `c19-baserel-scan-priced-on-output-rows`). It is a
+  whole-planner recalibration, not a parallel change — a 0.1%-selective
+  `lineitem` scan goes 161 → 160 946 cost units — so it carries its own
+  TPC-H + TPC-DS campaign and cannot ride C-19h's.
   *design: take3 08 §8; gate: take3 09 §5 P5 — plan-parity both suites,
   parallel and serial arms.*
   (Serial control arm unchanged throughout C-19a–h. Ordering trap already
