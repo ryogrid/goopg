@@ -816,6 +816,44 @@ larger-than-pool relation, cold — promoted to a checked-in bench, with the
 values suites retained only as **regression** gates. Recording that here so the
 next owner does not read a flat TPC-H median as a refutation.
 
+## 5.10 Triage of the `releaseVictimSlot` hazard — UNREACHABLE at HEAD, and E-19 is exactly what makes it reachable
+
+Ordered ahead of S1 because a live slot-recycling bug would outrank the whole
+performance item. It is not live.
+
+`releaseVictimSlot` (`bufpool.go:1480-1492`) does `s.state.Store(0)` — dropping
+validity, the pin count *and* the generation — and has **eight** call sites
+(`:1732`, `:1743`, `:1757`, `:1804`, `:1966`, `:1973`, `:1990`, `:2014`). At
+HEAD **not one of them can run after the slot pointer has escaped to a caller**,
+and the reason is structural rather than lucky: `pinLoad` and `pinNewXID` are
+strictly synchronous, and each returns `*Slot` on exactly one path — the last
+statement, after the state has been published valid-and-pinned. There is no
+program point at which the pool has both handed the pointer out and can still
+take an error branch. Site by site: `:1732`/`:1743`/`:1757` (`pinNewXID`
+evict/`InitPage`/`Extend` failures) and `:1966`/`:1990`/`:2014` (`pinLoad`
+evict/`bmInsert`/read failures) all return `nil`; `:1973` releases *our unused
+victim* and returns a **different**, already-pinned slot; and `:1804` releases a
+slot it had published valid+dirty+pin=1 but never returned — it re-acquires
+through `Pin(tag)` and returns that instead, and while unpublished the slot is
+invisible to `claimVictim` (`statePin != 0`) and to `bm.Lookup` (never
+inserted).
+
+The generation wipe is likewise benign today for a second, independent reason:
+every path reaching `releaseVictimSlot` has already removed the slot's bufmap
+entry or never inserted one — `evictVictim` calls `bmDelete` **before** it
+returns its flush error (`:1585-1595`), so even the failure branch leaves no
+mapping that could later ABA against a recycled generation.
+
+**E-19 is precisely the change that breaks this.** `StartRead` returns the slot
+*before* the read completes, so for the first time the pool holds a slot the
+caller already has while an error branch is still ahead of it — and that branch
+runs on an AIO completion goroutine. S3 must therefore not reuse
+`releaseVictimSlot` on the async error path: the slot has an owner, and the
+correct action is to publish it **failed** (clear `slotIOBit`, wake waiters,
+leave the pin) and let the owner's `FinishRead` observe the error and unpin,
+never to `Store(0)` under it. Recorded here rather than on the ledger because
+there is no defect at HEAD to defer; it is an S3 acceptance condition.
+
 ## 6. Gates
 
 `scripts/tpch-spotcheck.sh` (canonical Q12=2 / Q13=35), values on both corpora
