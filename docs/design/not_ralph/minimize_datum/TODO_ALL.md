@@ -3855,6 +3855,29 @@ ledger row if the measurement says no.
   something else happened.*
 
 - [ ] **E-20 The parallel dimension does not reach the cost model where the
+  join shape is chosen.** **2026-09-07 EVENING — THREE CORRECTIONS, all
+  source-verified; read before working the row.** (i) The cost-model
+  transcription this row asks for is **already done**:
+  `create_plain_partial_paths`, `compute_parallel_worker` (both arms),
+  `cost_gather`, `cost_gather_merge`, `get_parallel_divisor`,
+  `compute_gather_rows`, `add_partial_path` and
+  `try_partial_hashjoin_path(parallel_hash=false)` are faithful in goopg,
+  each with its citation. What is missing is **reachability** (E-21) and the
+  two remaining `try_partial_*` producers. (ii) **`create_partial_join_paths`
+  does not exist in PG 18.3** — named below and in the blocker table, it is
+  not a real function. The merge-join half has **two** independent partial
+  producers, not one: `sort_inner_and_outer` calling
+  `try_partial_mergejoin_path` directly (`joinpath.c:1535-1545`) AND
+  `match_unsorted_outer` via `consider_parallel_mergejoin`; a first draft
+  claimed the former computes unused locals and the oracle review falsified
+  it, doubling that cut's scope. (iii) **The cited cost blocker has moved**:
+  C-19d §5.1a landed `baseSeqScanCostInputs` on 2026-09-07, inverting
+  `TestBaseRelGatherCannotWinAtAnySelectivity`, so the 0.1-vs-0.0075
+  arithmetic below no longer holds. Cut 4 (partial nested loop) deferred with
+  reason: `*NestedLoopIndexJoin` is in `terminatesPartial` and
+  `create_material_path` has no goopg path kind, so it would be a producer
+  whose paths every downstream whitelist refuses. ORIGINAL ROW FOLLOWS.
+  
   join shape is chosen.** Filed 2026-09-07 by the owner. Partial paths exist
   only at upper rels **above the aggregate**; one level down — where hash
   join and merge join are compared — parallelism is invisible, so the join
@@ -3877,6 +3900,35 @@ ledger row if the measurement says no.
   transcribed cited by file:line in the design doc.*
 
 - [ ] **E-21 Single-table statements never enter the path search.**
+  **2026-09-07 EVENING — THE ROW BELOW IS WRONG ON ITS CITED SITE. Corrected
+  by the owning agent, source-verified, arm-measured. Read this block first.**
+  `relfromjoinlist.go:357` is already compensated at `:213` (M0134-0188), so
+  it is not the gate. Neither is the seam's `nrels < 2`
+  (`joinsearchseam.go:230`), which was the first substitute: the arm measured
+  **INERT**, and with `GOOPG_PGSHAPED_DP_TRACE=1` a single-table statement
+  emits *no seam trace at all* while a 2-rel control emits three. **The
+  operative gate is `isSimpleSingle` (`planner.go:1235`)**, which at `:1377`
+  diverts every single-table statement to `planIndexScanFromWhere` — the
+  legacy rule-based access-method chooser — and never reaches the seam.
+  So closing E-21 means **replacing that chooser with `add_path` for every
+  single-table statement on both corpora**, not changing a floor. That is a
+  much larger item than filed, and it is the real prerequisite for E-18/E-20.
+  The PG half of the row is also wrong:
+  `bms_membership(root->all_baserels) != BMS_SINGLETON` exists **nowhere** in
+  PG 18.3's optimizer (it appears in goopg comments). PG's predicate is
+  `!bms_equal(rel->relids, root->all_query_rels)` (`allpaths.c:555-557`), and
+  the topmost rel's Gather is *deferred* to `apply_scanjoin_target_to_paths`
+  (`planner.c:8036`). Partial paths are built by `set_base_rel_pathlists`
+  (`allpaths.c:221`) **before** `make_rel_from_joinlist` (`:226`) — so the
+  row's suspicion that joinlist length is irrelevant was right and its
+  citation was not.
+  Landed on `e20-e21-parallel-path-search`: design + two adversarial reviews
+  recorded inline, and **Cut 1** behind `GOOPG_ONEREL_SEARCH` (default OFF),
+  relabelled a *prerequisite whose stated gate is that it changes nothing*.
+  Cut 1b (the `isSimpleSingle` re-route) is scoped and NOT built — that is
+  the remaining work. **Gates not run** (see the worktree `sun_path` note in
+  `HANDOVER-20260907.md` §7b); inert-by-measurement is not the same claim.
+  ORIGINAL ROW FOLLOWS.
   Filed 2026-09-07 by the owner. `makeRelFromJoinlist` returns immediately
   when the joinlist has one element, so `SELECT … FROM t WHERE …` never
   reaches path generation and **no partial path is ever built for it** — PG
