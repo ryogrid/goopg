@@ -1,0 +1,29 @@
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=836644.24..836656.74 rows=5000 width=144)
+   Sort Key: nation, o_year DESC
+   ->  Finalize HashAggregate  (cost=836287.05..836337.05 rows=5000 width=144)
+         Group Key: nation, o_year
+         ->  Gather  (cost=836174.55..836274.55 rows=5000 width=144)
+               Workers Planned: 4
+               ->  Partial HashAggregate  (cost=836174.55..836224.55 rows=5000 width=144)
+                     Group Key: nation, o_year
+                     ->  Hash Join  (cost=514811.50..829354.96 rows=303093 width=776)
+                           Hash Cond: (lineitem.l_suppkey = supplier.s_suppkey)
+                           ->  Hash Join  (cost=514219.44..824595.37 rows=303093 width=640)
+                                 Hash Cond: (orders.o_orderkey = lineitem.l_orderkey)
+                                 ->  Parallel Seq Scan on orders  (cost=0.00..43435.00 rows=1500000 width=448)
+                                 ->  Hash Join  (cost=283871.84..446331.77 rows=303093 width=736)
+                                       Hash Cond: ((partsupp.ps_suppkey = lineitem.l_suppkey) AND (partsupp.ps_partkey = lineitem.l_partkey))
+                                       ->  Seq Scan on partsupp  (cost=0.00..26916.00 rows=800000 width=544)
+                                       ->  Hash Join  (cost=6775.26..228716.45 rows=303093 width=582)
+                                             Hash Cond: (lineitem.l_partkey = part.p_partkey)
+                                             ->  Seq Scan on lineitem  (cost=0.00..196405.55 rows=6001255 width=550)
+                                             ->  Seq Scan on part  (cost=0.00..2101.01 rows=10101 width=548)
+                                                   Filter: (p_name LIKE '%green%')
+                           ->  Hash Join  (cost=1.56..467.06 rows=10000 width=720)
+                                 Hash Cond: (supplier.s_nationkey = nation.n_nationkey)
+                                 ->  Seq Scan on supplier  (cost=0.00..328.00 rows=10000 width=584)
+                                 ->  Seq Scan on nation  (cost=0.00..1.25 rows=25 width=490)
+(25 rows)
+

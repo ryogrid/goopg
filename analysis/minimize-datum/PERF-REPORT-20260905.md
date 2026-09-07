@@ -2507,6 +2507,47 @@ Two consequences that must travel with the numbers:
    the parallel-shape explanation of Q9 in §5.34 is not yet evidenced at
    the plan level and is carried here as a hypothesis, not a finding.
 
+### 9.2c The parallel plan baseline now exists, and it resolves §5.34 — with a correction
+
+§9.2b downgraded §5.34's account of the Q9 regression to a hypothesis,
+because it rested on a serial plan. The missing parallel-mode pair has now
+been captured (`analysis/planner-refactor-take3/q9-parallel-plans-20260907/`),
+both engines at `max_parallel_workers_per_gather = 4` read back from the
+live servers. The hypothesis is confirmed in substance and **wrong in its
+mechanism**.
+
+| | PG 18.3 | goopg (tip) |
+|---|---|---|
+| `Parallel Seq Scan` nodes | 3 | **1** |
+| `Parallel Hash` nodes | **4** | **0** |
+| top-level cost | 113,104 | 836,644 (7.4x) |
+
+PG runs `Parallel Hash Join` with a `Parallel Hash` over a
+`Parallel Seq Scan on partsupp`. goopg parallelises **only the `orders`
+scan**; its inner chain — 800,000 `partsupp` rows folded against
+part/supplier/nation — runs single-threaded while four workers wait.
+
+**The correction.** §5.34 says "goopg has no Parallel Hash, so each worker
+rebuilds the whole inner". The first clause is right; **the second is
+false**. goopg's executor builds the table ONCE in the leader and shares it
+by pointer, and since E-09a/E-09b that holds for spilling builds too — Build
+Time went from five to one. C-19f states it plainly: *goopg has NEITHER of
+PG's two parallel hash joins*, because it is neither the parallel-oblivious
+variant (N private copies) nor `parallel_hash = true` (cooperative build).
+
+So the gap is **not duplicated building — it is that the build cannot be
+split**. On the memory axis goopg is already where PG's `parallel_hash=true`
+is: one table, not N. What is missing is dividing the *work* of building it,
+and that is what the Q9 regression exposes.
+
+That distinction matters for what to do next: adding a `Parallel Hash`
+producer is a work-partitioning problem in the executor, not a
+memory-sharing one, and the sharing half is already done.
+
+I repeated the wrong mechanism from a sub-agent's summary without checking
+it. It is corrected here and in the artifact rather than silently edited in
+§5.34, so the error and its correction stay visible.
+
 ### 9.3 What is measured
 
 **Bar A1 — TPC-H plan parity against PG 18.3** (22 queries):
