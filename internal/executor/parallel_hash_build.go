@@ -440,13 +440,18 @@ func coopDrivingScan(node optimizer.Node) *optimizer.SeqScan {
 }
 
 // parallelBuildEligible reports whether this hash join's build side can be
-// parallelised. Four conditions must all hold (design §1.3):
+// parallelised. The design (§1.3) filed four rules; two of them have since
+// been retired against the source, and the numbering is kept so the retirement
+// notes below stay findable:
 //
 //  1. The join type permits shared probe (INNER/SEMI/ANTI, or LEFT with
 //     probe on the outer side).
-//  2. The build fits in one batch (spilling builds can't be shared).
-//  3. The build child is a parallel-scannable SeqScan (possibly under
-//     Filter).
+//  2. RETIRED (E-18 slice 1) — "the build fits in one batch". Spilling is
+//     consumer-side; see the note below.
+//  2b. RETIRED (E-18 slice 3) — "single-column key only". The composite lane
+//     is consumer-side too; see the note below.
+//  3. The build child exposes a partitionable driving scan: a SeqScan under
+//     Filter/Project, and (slice 2) under a hash join's probe side.
 //  4. The relation has enough blocks (≥ MinParallelTableScanBlocks).
 //
 // The function never mutates join state.
@@ -466,13 +471,25 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 	if o.preserveCTIDRel != nil {
 		return false
 	}
-	// Multi-key joins force the string map but are otherwise fine.
-	// Composite keys, however, have a different insertion path
-	// (fileCompositeBuildRow) that the channel-source pattern doesn't
-	// reach — declined for now.
-	if o.multiKey() {
-		return false
-	}
+	// Composite (multi-column) keys: RETIRED as a decline in E-18 slice 3.
+	//
+	// The rule's stated ground was that "composite keys have a different
+	// insertion path (fileCompositeBuildRow) that the channel-source pattern
+	// doesn't reach". Reading the source refutes it: fileCompositeBuildRow is
+	// called from inside buildLoopRight / buildLoopLeft
+	// (operators_join_agg.go), the very loops the cooperative build runs in
+	// its single consumer goroutine, from a channelSource instead of from the
+	// child operator tree. The composite lane is therefore entirely
+	// CONSUMER-side, exactly as batching is (slice 1's Rule 2), and the
+	// producer/consumer split cannot observe it: producers only scan, filter
+	// and hand materialised rows over a channel; key encoding
+	// (encodeBuildCompositeKey, o.execKeyBuf) and filing happen after the
+	// channel, on one goroutine.
+	//
+	// Why it matters: TPC-H Q9 spends 12.86 s of its 13.6 s in ONE build —
+	// the (ps_suppkey, ps_partkey) composite join, whose driving scan is the
+	// 6 M-row lineitem seq scan. That build was the item's whole remaining
+	// gap, and this rule was the only thing declining it.
 
 	// Rule 2 (E-18 slice 1): RETIRED. It used to decline a build whose
 	// geometry predicted more than one batch, on the stated ground that
@@ -531,6 +548,17 @@ var coopSpillingBuilds atomic.Int64
 // CoopSpillingBuildCount reports the process-wide number of cooperative
 // parallel hash builds that spilled to batch files. Test/diagnostic use.
 func CoopSpillingBuildCount() int64 { return coopSpillingBuilds.Load() }
+
+// coopCompositeBuilds counts cooperative parallel hash builds on a COMPOSITE
+// (multi-column) key. E-18 slice 3 retired the eligibility rule that declined
+// those; same discipline as coopSpillingBuilds — a newly-reachable path that
+// never fires is an untested one, so the path is counted and
+// TestCoopParallelHashBuildComposite asserts the count moves.
+var coopCompositeBuilds atomic.Int64
+
+// CoopCompositeBuildCount reports the process-wide number of cooperative
+// parallel hash builds that used the composite-key lane. Test/diagnostic use.
+func CoopCompositeBuildCount() int64 { return coopCompositeBuilds.Load() }
 
 // parallelBuildLazyHashTable runs a cooperative parallel hash build.
 //
@@ -749,6 +777,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 
 	if o.batches != nil {
 		coopSpillingBuilds.Add(1)
+	}
+	if o.multiKey() {
+		coopCompositeBuilds.Add(1)
 	}
 	o.recordBuildTime(ctx, buildStart)
 	return probeIsLeft, nil
