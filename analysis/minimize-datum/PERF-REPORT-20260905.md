@@ -2485,6 +2485,28 @@ which includes `0d4e934c2`. The script flags the hazard itself
 
 Recorded because a later reader would otherwise attribute this sweep to C-06.
 
+### 9.2b Measurement conditions differ between the plan and timing artifacts — read them accordingly
+
+**This is a defect in how §9.3 and §2 of this report were originally
+presented, corrected here rather than left implicit.**
+
+| artifact class | parallelism |
+|---|---|
+| **plan captures** (A1, A2, every "plans byte-identical" claim, `bench/tpch/plans-pg/`) | **SUPPRESSED.** `estimate-audit`'s `--serial` defaults true and sets `max_parallel_workers_per_gather = 0` (`cmd/estimate-audit/main.go:34`). The PG reference is captured through the same function, so **`bench/tpch/plans-pg/` contains zero `Gather` nodes** — verified by grep. |
+| **timing tables** (`bench/tpch/timings/`, the goopg-vs-PG ratios) | **NOT suppressed.** The recorded settings are `shared_buffers`, `work_mem`, `effective_cache_size` and `autovacuum` only; neither the harness nor the header sets `max_parallel_workers_per_gather`. "Serial per-query connections" in that README means one connection at a time, **not** serial execution. |
+
+Two consequences that must travel with the numbers:
+
+1. **A1 and A2 are serial-control-arm statements.** They say nothing about
+   whether parallel plans changed — which is exactly the class of change
+   C-19a…h made. Ledger row `take3-plan-capture-is-serial-only`.
+2. **A parallel timing must not be explained with a serial plan.** Any
+   account of the Q9 regression that cites `bench/tpch/plans-pg/Q9.txt` is
+   citing a plan captured with parallelism off, against a runtime measured
+   with it on. **No parallel-mode PG plan baseline exists in the tree**, so
+   the parallel-shape explanation of Q9 in §5.34 is not yet evidenced at
+   the plan level and is carried here as a hypothesis, not a finding.
+
 ### 9.3 What is measured
 
 **Bar A1 — TPC-H plan parity against PG 18.3** (22 queries):
