@@ -267,6 +267,14 @@ are EPICS — split into one-checkbox-per-commit items before starting
   field-level decline — every field enumerated post-widening; collector
   veto only) + keys-only construction stamps per spec.
   Gates: 29 new tests; optimizer suite; PP zero drift; TPC-H 24/24.
+  Gate slice (a) LANDED 2026-09-07, COMPUTE-ONLY:
+  `internal/optimizer/upper_narrow_gate.go` (+ test) proves a keep-list
+  preserves an expression by round trip (forward through the keep, back
+  through its inverse, identity under `exprIdentityKey`) instead of by
+  name inspection; `remapExprIndices` is built on `cloneExprRefs` under
+  `scopeVeto` (pinned in `exprSwitchInventory` as the demoted shape, same
+  as `nl_index_join.go:cloneExprShiftIdx`). ZERO production callers by
+  design — the applying cut must discharge it before narrowing anything.
 - [x] **B-02 P1-11 TOAST in the catalog heap writer.** Landed 2026-09-05
   as the pre-approved bounded-width interim: try-full-then-truncate in
   `persistStatsToPGStatistic` (pre-write exact measurement; 64 B bound

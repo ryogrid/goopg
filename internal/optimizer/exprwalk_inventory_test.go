@@ -311,6 +311,15 @@ var exprSwitchInventory = map[string]walkerRole{
 	"unnest.go:subqueryANDReachable":       walkerPending, // 2 of 32 arms
 	"unnest.go:walkExprTree":               walkerPending, // 8 of 32 arms
 	"unnest.go:walkSubqueryPlansInExpr":    walkerPending, // 9 of 32 arms
+	// Added by B-01c APPLYING half slice (a), 2026-09-07. Built on
+	// cloneExprRefs (which carries both the recursion and the
+	// exhaustiveness); what the census sees is the four-arm dispatch
+	// inside the Rewrite closure — renumber *ColumnRef, refuse
+	// *OuterColumnRef / *CTIDExpr / *MergeWholeRowRef — attributed to the
+	// enclosing function. Same demoted shape as
+	// nl_index_join.go:cloneExprShiftIdx. Fail-closed by construction:
+	// OnUnknown refuses and any refusal aborts the round-trip proof.
+	"upper_narrow_gate.go:remapExprIndices": nonRecursiveClassifier,
 }
 
 // exprSwitchSites runs the census: every package function whose body holds a
