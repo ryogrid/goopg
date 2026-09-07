@@ -1634,6 +1634,27 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		// stats.filterRejected. Mirrors PG's show_instrumentation_count
 		// (nfiltered1 for scan qual rejects, per-loop average). Zero
 		// suppressed in text mode (PG convention).
+		// E-17 / EX3-08 cut 2: the count may live on EITHER node. A Filter
+		// whose filterOp survives (any child that is not a SeqScan) counts on
+		// the collapsed Filter node, carried down in filterRowsRemoved; a
+		// Filter whose qual the SeqScan absorbed has no filterOp at all and
+		// counts on the SCAN node — which is where PG keeps nfiltered1
+		// (execScan.h:245) and where the JSON renderer below has always read
+		// it. Summing both is what keeps the two renderers agreeing; reading
+		// only one of them is how they diverged in the first place.
+		// Parallel plans keep one stats table per EXECUTION SITE (workers
+		// 0..n-1 plus the leader at slot n, gatherOp.workerTables), folded
+		// into workerStats. When those entries exist they are the complete
+		// population — summing them AND stats[n] would count the leader
+		// twice. PG folds every site's nfiltered1 into one total the same
+		// way (instrument.c:187) before dividing by nloops.
+		if ws, ok := workerStats[n]; ok && len(ws) > 0 {
+			for _, w := range ws {
+				filterRowsRemoved += w.FilterRejected
+			}
+		} else if s, ok := stats[n]; ok && s != nil {
+			filterRowsRemoved += s.filterRejected
+		}
 		if filterRowsRemoved > 0 {
 			if s, ok := stats[n]; ok && s != nil && s.loops > 0 {
 				avg := float64(filterRowsRemoved) / float64(s.loops)

@@ -4000,9 +4000,12 @@ ledger row if the measurement says no.
   crossover must be PG's, per E-20's ruling); values both suites; TPC-DS
   PASS=95 all-zero, since single-table statements are common there.*
 
-- [ ] **E-17 EX3-08 scan-resident qual — OPEN. The target is CUT 2:
+- [~] **E-17 EX3-08 scan-resident qual — CUT 2 IMPLEMENTED 2026-09-07,
+  TPC-DS sweep pending.** The target is CUT 2:
   evaluate the predicate ONCE inside the scan, as PG does, and delete the
-  `Filter` node.**
+  `Filter` node.** Ported from the `~/e17` agent worktree (design
+  `7341783d5` + implementation; dead-agent salvage, reviewed line-by-line
+  against the design + PG oracle at port time).
   *Owner direction 2026-09-07: **cut 1 is not the intended shape and is
   not to be built.** A per-row already-decided flag leaves two evaluators
   in the tree and adds a third thing (the flag) to keep them consistent —

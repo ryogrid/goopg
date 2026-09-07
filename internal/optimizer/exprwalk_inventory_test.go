@@ -223,6 +223,16 @@ var exprSwitchInventory = map[string]walkerRole{
 	// not demoted); `matchSingleTableConstantPredicate` survives under the new
 	// path and keeps its classification.
 	"scan_input_rewrite.go:matchSingleTableConstantPredicate": nonRecursiveClassifier,
+	// E-17 / EX3-08 cut 2. Classifier, not a walker: the RECURSION is
+	// walkExprRefs' — this switch lives inside its Visit closure and only
+	// records a column bound / clears an eligibility flag for the node in
+	// front of it. Same demotion as remapByPosMap and cloneExprShiftIdx,
+	// whose dispatch switches likewise survive inside their Rewrite
+	// closures. Being built on the primitive is what makes it fail-closed:
+	// an unenumerated type aborts walkExprRefs and PlanScanQual reports
+	// Early=false, so a missing arm costs a slower qual position, never a
+	// wrong column bound.
+	"scan_qual.go:PlanScanQual": nonRecursiveClassifier,
 	// CONVERTED by M0125-0002 commit 2, and DEMOTED for the same reason
 	// commit 1's remapByPosMap was: the recursion and the exhaustiveness
 	// moved to exprChildSlots (via cloneExprRefs), but a two-arm bottom-up

@@ -132,24 +132,40 @@ func buildNode(plan optimizer.Node, bound int) (Operator, error) {
 			if so := unwrapSeqScanOp(child); so != nil {
 				so.ssiGistPred = p.Predicate
 				so.ssiGinPred = p.Predicate
-				// Same predicate, second use: let the scan reject tuples
-				// before deforming and deep-copying them. Pure
-				// pre-rejection — filterOp still evaluates it on the
-				// survivors — and armed only for expressions
-				// planScanPrefilter proves safe to evaluate twice.
-				// See scan_prefilter.go.
+				// E-17 / EX3-08 cut 2: ABSORB the qual into the scan and
+				// return the scan itself — no filterOp above it. PG's shape
+				// (Scan.plan.qual run once by ExecScanExtended,
+				// execScan.h:223); the predicate is now evaluated exactly
+				// once per row instead of twice. The scan evaluates it EARLY
+				// on the deformed prefix when PlanScanQual allows, otherwise
+				// LATE on the finished row — the position filterOp occupied.
+				// See scan_prefilter.go and
+				// docs/design/executor-ex3-08-scan-resident-qual/DESIGN.md.
+				//
+				// The *optimizer.Filter PLAN node is untouched: all three
+				// EXPLAIN renderers collapse it into the scan's `Filter:`
+				// line and key on the plan node, never on the operator, and
+				// the post-qual row estimate lives on it. Deleting the
+				// OPERATOR therefore leaves plain EXPLAIN byte-identical.
+				so.qual, so.qualSet = p.Predicate, true
 				if pf, pok := planScanPrefilter(p.Predicate, len(so.cols)); pok {
 					so.prefilter, so.prefilterSet = pf, true
 				}
+				// The rejection counter needs no wiring here: the SeqScan
+				// arm's own maybeInstrument already probed the raw seqScanOp
+				// for filterRemoveCounter and handed it
+				// &stats[scanNode].filterRejected. That is the node the
+				// count belongs on — PG keeps nfiltered1 on the scan
+				// (execScan.h:245) and the JSON renderer already reads it
+				// there. Calling maybeInstrument(p, child) instead would
+				// wire NOTHING (child is an *instrumentedOp, which has no
+				// setFilterRemoveCounter forwarder) and double-wrap the scan.
+				return child, nil
 			}
 		}
-		// M0054-0005a-followup: filterOp is a pure pass-through
-		// — it returns its child's row unchanged. So filter's
-		// own borrow contract must MATCH its child's. We leave
-		// the child at the default OwnedRow at Build time;
-		// filterOp.SetBorrow propagates to the child only when
-		// the eventual parent (project, output sink) flips the
-		// filter itself to BorrowedRow.
+		// filterOp is a pure pass-through — it returns its child's row
+		// unchanged — so its borrow contract matches its child's, and the
+		// child is left at the default OwnedRow at Build time.
 		return maybeInstrument(p, newFilterOp(p, child)), nil
 	case *optimizer.Limit:
 		child, err := buildNode(p.Child, deformBoundBelow(p, bound))
@@ -590,15 +606,22 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) 
 			if so, ok2 := tree.ops[childIdx].state.(*seqScanOp); ok2 {
 				so.ssiGistPred = p.Predicate
 				so.ssiGinPred = p.Predicate
-				// Same predicate, second use: let the scan reject tuples
-				// before deforming and deep-copying them. Pure
-				// pre-rejection — filterOp still evaluates it on the
-				// survivors — and armed only for expressions
-				// planScanPrefilter proves safe to evaluate twice.
-				// See scan_prefilter.go.
+				// E-17 / EX3-08 cut 2, SIBLING of the buildNode arm: absorb
+				// the qual and return the scan's node index, emitting no
+				// OpFilter. This is the LIVE server path (BuildFastIterator)
+				// and the one parallel workers build through, so a fix in
+				// buildNode alone would leave every worker evaluating the
+				// predicate twice — this codebase's documented sibling-path
+				// failure mode.
+				//
+				// No instrumentation counter is wired here: buildRec never
+				// calls maybeInstrument, so its nodes carry no nodeStats at
+				// all (the old OpFilter path counted nothing either).
+				so.qual, so.qualSet = p.Predicate, true
 				if pf, pok := planScanPrefilter(p.Predicate, len(so.cols)); pok {
 					so.prefilter, so.prefilterSet = pf, true
 				}
+				return childIdx, nil
 			}
 		}
 		// Phase C.3: predicate compiled into exprTreeSlab; filterState holds

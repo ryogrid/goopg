@@ -169,12 +169,34 @@ func newLockRowsOp(p *optimizer.LockRows, child Operator) *lockRowsOp {
 }
 
 // findFilterPred walks the child chain past Project wrappers and returns the
-// predicate of the first filterOp found. Returns nil when no filter is present.
+// scan-level qual, for lockRowsOp's EPQ recheck (epqRecheckFilter).
+//
+// E-17 / EX3-08 cut 2: the qual is no longer always on a filterOp. When it
+// sits directly above a SeqScan the scan ABSORBS it and no filterOp is built,
+// so this walker must read seqScanOp.qual too. Missing that arm is not a
+// missed optimisation — it makes epqRecheckFilter a silent no-op and returns
+// WRONG ROWS for `SELECT ... FOR UPDATE` against a concurrently updated row,
+// because the re-fetched latest version is never re-tested against the WHERE
+// clause. Pinned by TestLockRowsEPQRechecksAbsorbedScanQual.
+//
+// It also peels *instrumentedOp, which it did not before: under EXPLAIN
+// ANALYZE every operator is wrapped, so the pre-E-17 walker already returned
+// nil there and silently degraded the recheck. findScanLeaf peels it; this
+// is the sibling that did not.
 func findFilterPred(op Operator) optimizer.Expr {
 	for {
 		switch v := op.(type) {
 		case *filterOp:
 			return v.pred
+		case *seqScanOp:
+			// nil when this scan absorbed no qual, which is the same
+			// "no filter present" answer the default arm gives.
+			if v.qualSet {
+				return v.qual
+			}
+			return nil
+		case *instrumentedOp:
+			op = v.inner
 		case *projectOp:
 			op = v.child
 		default:

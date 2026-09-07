@@ -1030,14 +1030,28 @@ type seqScanOp struct {
 	// non-gist scan (the common case) — pure no-op.
 	ssiGistPred optimizer.Expr
 
-	// prefilter is the same Filter predicate, reused to reject tuples before
-	// they are fully deformed and deep-copied. Set only when planScanPrefilter
-	// proves the expression safe to evaluate twice, and disarmed in Open when
-	// any of the post-decode row rewrites are live (they would make the
-	// prefilter see different values than filterOp does). See scan_prefilter.go
-	// and docs/design/not_ralph/tpch-q6-numeric-decode/.
+	// qual is the ABSORBED scan qual (E-17 / EX3-08 cut 2): the predicate of
+	// the Filter that used to sit directly above this scan. When qualSet is
+	// true there is no filterOp above us — this operator is the only
+	// evaluator, exactly as PG's ExecScanExtended is (execScan.h:223) — so
+	// every row this scan yields MUST have been judged by it, at one of the
+	// two positions below. See scan_prefilter.go and
+	// docs/design/executor-ex3-08-scan-resident-qual/DESIGN.md.
+	qual    optimizer.Expr
+	qualSet bool
+	// prefilter is the EARLY position: the same qual evaluated on the deformed
+	// prefix [0, MaxCols) before the tail deform and the deep copy. Armed only
+	// when optimizer.PlanScanQual says the qual can be judged from that
+	// prefix, and DISARMED in Open when any post-decode row rewrite is live
+	// (they would make the prefix values differ from the finished row's).
+	// Disarming does not skip the qual — it moves it to the LATE position.
 	prefilter    scanPrefilter
 	prefilterSet bool
+	// filterRemoved counts rows this scan's qual rejected, at either position.
+	// Mirrors upstream's Instrumentation.nfiltered1, which PG likewise keeps
+	// on the SCAN node (InstrCountFiltered1, execScan.h:245); surfaced by
+	// EXPLAIN ANALYZE as "Rows Removed by Filter". nil when not instrumented.
+	filterRemoved *int64
 	// deformBound is the EX1-01 exclusive deform width: the survivor path
 	// deforms columns [0, deformBound) instead of the full row, because the
 	// Build-time consumer walk proved no consumer reads past it. Stamped by
@@ -1572,10 +1586,12 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			}
 		}
 	}
-	// Disarm the prefilter whenever a post-decode rewrite is live. Each of
-	// these mutates the row AFTER cloneRowOwned, so the prefilter would judge
-	// a tuple on values that differ from the ones filterOp above eventually
-	// sees — and the GiST/GIN hooks additionally do per-tuple SSI bookkeeping
+	// Move the qual to the LATE position whenever a post-decode rewrite is
+	// live. Each of these mutates the row AFTER cloneRowOwned, so an EARLY
+	// evaluation would judge a tuple on values that differ from the ones the
+	// finished row carries. This clears prefilterSet ONLY — qualSet stays
+	// set, so the qual is still evaluated exactly once, just at the position
+	// the deleted filterOp occupied — and the GiST/GIN hooks additionally do per-tuple SSI bookkeeping
 	// that a skipped row must not miss. All are rare; the common scan keeps
 	// the fast path. (The relation-level SIREAD below and the per-tuple heap
 	// SIREAD in Next both run BEFORE the prefilter, so predicate locks are
@@ -1594,12 +1610,11 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		}
 		// All THREE aclitem columns must be listed. pg_database.datacl gets the
 		// identical post-clone KindBytes -> aclitemout rewrite that typacl and
-		// attacl do, and omitting it would let a predicate on datacl be
-		// prefiltered against the raw _aclitem blob while filterOp sees the
-		// rendered text — breaking the "can only remove rows the Filter would
-		// remove anyway" guarantee this block exists to protect. Found by
-		// adversarial review of design-take6.md; exactly the sibling-path
-		// failure mode.
+		// attacl do, and omitting it would let a predicate on datacl be judged
+		// EARLY against the raw _aclitem blob while the finished row carries
+		// the rendered text — a wrong answer now that this scan is the only
+		// evaluator. Found by adversarial review of design-take6.md; exactly
+		// the sibling-path failure mode.
 		if o.gistSSIIdxOID != 0 || o.ginSSIIdxOID != 0 || hasEnum ||
 			o.typeACLColIdx >= 0 || o.attrACLColIdx >= 0 || o.dbACLColIdx >= 0 {
 			o.prefilterSet = false
@@ -1612,9 +1627,9 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// switch, and the fold removes the literals and the constant
 	// `date + interval` subtree that Q6 was re-evaluating per row.
 	o.pfSlab, o.pfIdx = nil, noExpr
-	if o.prefilterSet {
+	if o.qualSet && o.qual != nil {
 		var slab exprTreeSlab
-		if idx := slab.buildExprCtx(o.prefilter.pred, ctx); idx != noExpr {
+		if idx := slab.buildExprCtx(o.qual, ctx); idx != noExpr {
 			o.pfSlab, o.pfIdx = slab, idx
 		}
 	}
@@ -1848,6 +1863,14 @@ func (o *seqScanOp) Close() error {
 
 // nextVisible advances through (block, slot) pairs and returns the
 // next tuple visible to the snapshot, or EOF.
+// setFilterRemoveCounter implements filterRemoveCounter. The scan owns the
+// count because it owns the qual: PG likewise keeps nfiltered1 on the scan
+// node (InstrCountFiltered1, execScan.h:245). Before E-17 this scan rejected
+// rows in the prefilter with a bare `continue` and counted nothing, so
+// "Rows Removed by Filter" under-reported by the whole prefilter rejection
+// count.
+func (o *seqScanOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
+
 func (o *seqScanOp) Next() (TupleSlot, error) {
 	rel := o.rel
 	for {
@@ -2072,6 +2095,12 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if o.deformBound > 0 && o.deformBound < survivorBound {
 				survivorBound = o.deformBound
 			}
+			// earlyDecided records that the absorbed qual already returned a
+			// verdict for this row at the EARLY position, so the LATE
+			// position must not evaluate it again. At most one VERDICT per
+			// row is the invariant; an early attempt that ERRORED produces no
+			// verdict and is retried late.
+			earlyDecided := false
 			if o.prefilterSet {
 				// Two-phase deform, PG's slot_getsomeattrs discipline: decode
 				// only the columns the predicate reads, test it, and pay for
@@ -2093,16 +2122,39 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// which could differ from what filterOp sees. Rare (the
 				// predicate columns are usually fixed-width); when it happens,
 				// finish the row and let filterOp decide alone.
+				// A toasted value in the prefix would be judged
+				// un-detoasted, so it cannot be decided here: the row is
+				// finished and the qual runs at the LATE position, where
+				// DetoastRowBound has already expanded it. (PG has no
+				// analogue because PG never detoasts a row at all —
+				// expansion happens per-argument inside the called function,
+				// fmgr.h:248,292,309. Ledger: e17-lazy-detoast-divergence.)
 				if !needsDetoastPrefix(o.scanRow, o.prefilter.MaxCols) {
 					keep, perr := o.evalPrefilter()
-					if perr == nil && !keep {
-						if o.pinned != nil {
-							o.pinned.RUnlock()
+					if perr == nil {
+						earlyDecided = true
+						if !keep {
+							// Rejected here, by the only evaluator. Count it
+							// as PG counts nfiltered1 on the scan node, and
+							// count the tuple as READ (pg_stat
+							// tuples_returned mirrors seq_tup_read, which is
+							// tuples scanned, not tuples surviving the qual).
+							o.statReturned++
+							if o.filterRemoved != nil {
+								*o.filterRemoved++
+							}
+							if o.pinned != nil {
+								o.pinned.RUnlock()
+							}
+							continue
 						}
-						continue
 					}
-					// perr != nil: fall through and let filterOp raise it, so
-					// the error surfaces from exactly where it did before.
+					// perr != nil: leave earlyDecided false so the row is
+					// re-judged at the LATE position, which raises the error
+					// from exactly where filterOp raised it. Sound because
+					// early-eligible expressions are pure (PlanScanQual
+					// excludes FuncCall, subqueries and params), so the
+					// discarded attempt cannot have had a side effect.
 				}
 				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, o.prefilter.MaxCols, survivorBound, off); derr != nil {
 					if o.pinned != nil {
@@ -2271,6 +2323,40 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			o.slot.ctidBlock = uint32(o.curBlock)
 			o.slot.ctidOff = uint16(o.curSlot - 1)
 			o.statReturned++ // cumulative relation stats (tuples_returned)
+			// LATE position of the absorbed qual (E-17 / EX3-08 cut 2). This
+			// is the exact point the deleted filterOp sat at: the row is
+			// finished — tail-deformed, detoasted, cloned, enum- and
+			// ACL-rewritten, ctid-stamped — so evalQual sees value-for-value
+			// what filterOp saw, and an error surfaces from where filterOp
+			// raised it.
+			//
+			// Reached when the qual could not be judged EARLY (an
+			// early-ineligible expression kind, a live post-decode rewrite, a
+			// toasted prefix) or when the early attempt errored. Rejecting
+			// here and continuing the per-tuple loop is safe: the page RLock
+			// was already released above and the loop re-takes it per tuple,
+			// and the per-page arena is reset only at the block boundary.
+			//
+			// statReturned is incremented ABOVE this on purpose: pg_stat's
+			// tuples_returned mirrors seq_tup_read, which counts tuples READ,
+			// not tuples surviving the qual.
+			if o.qualSet && !earlyDecided {
+				keep, qerr := o.evalQual(&o.slot)
+				if qerr != nil {
+					// Returned VERBATIM — no o.pos stamping. filterOp
+					// returned evalExprSlot's error unwrapped
+					// (operators.go), and every ee.Pos = o.pos site in this
+					// operator is in Open, never in Next; the position comes
+					// from the expression node under either caller.
+					return nil, qerr
+				}
+				if !keep {
+					if o.filterRemoved != nil {
+						*o.filterRemoved++
+					}
+					continue
+				}
+			}
 			return &o.slot, nil
 		}
 		o.releasePinned()

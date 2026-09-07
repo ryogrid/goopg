@@ -388,6 +388,13 @@ type workerNodeStat struct {
 	Loops     int64
 	StartupNs int64
 	TotalNs   int64
+	// FilterRejected is the site's scan-qual rejection count. PG folds
+	// nfiltered1 from every worker into the leader (instrument.c:187) and
+	// EXPLAIN divides the total by nloops; without carrying it here a
+	// parallel plan would report only what the LEADER rejected — and after
+	// E-17 absorbed the qual into the scan, the scan is what runs inside
+	// workers.
+	FilterRejected int64
 }
 
 // EX0-03b (new): workerNodeStatsTable maps a shared inner-plan Node back
@@ -422,6 +429,8 @@ func foldGatherWorkerStats(ctx *Context, tables []nodeStatsTable) {
 				Loops:     st.loops,
 				StartupNs: st.startupNs,
 				TotalNs:   st.totalNs,
+
+				FilterRejected: st.filterRejected,
 			})
 		}
 	}

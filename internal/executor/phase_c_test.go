@@ -351,8 +351,26 @@ func TestBuildFastNodeKinds(t *testing.T) {
 	}{
 		{seqScanPlan, OpSeqScan},
 		{
+			// E-17 / EX3-08 cut 2: a Filter directly above a SeqScan is
+			// ABSORBED — the scan evaluates the qual itself and no OpFilter
+			// is emitted. PG's shape (Scan.plan.qual, no Filter node). The
+			// *optimizer.Filter PLAN node is untouched, so EXPLAIN still
+			// renders its predicate as the scan's `Filter:` line.
 			&optimizer.Filter{
 				Child:     seqScanPlan,
+				Predicate: &optimizer.BooleanConst{Value: true},
+			},
+			OpSeqScan,
+		},
+		{
+			// ...but a Filter whose child is NOT a scan keeps its operator.
+			// The absorption is scoped to Filter{SeqScan}; everything else
+			// still runs through filterOp/OpFilter.
+			&optimizer.Filter{
+				Child: &optimizer.Filter{
+					Child:     seqScanPlan,
+					Predicate: &optimizer.BooleanConst{Value: true},
+				},
 				Predicate: &optimizer.BooleanConst{Value: true},
 			},
 			OpFilter,
@@ -970,22 +988,24 @@ func TestRunFastFilterExprNodePopulated(t *testing.T) {
 		t.Error("exprTreeSlab is empty after BuildFast with filter predicate")
 	}
 
-	// Walk to the Filter node (may be under a Project).
+	// Walk to the scan (may be under a Project). E-17 / EX3-08 cut 2: a
+	// Filter directly above a SeqScan is absorbed into the scan, so there is
+	// no OpFilter here any more — the predicate rides on the scan operator
+	// and is evaluated exactly once.
 	nIdx := rootIdx
 	if tree.ops[nIdx].Kind == OpProject {
 		nIdx = tree.ops[nIdx].childA
 	}
-	if tree.ops[nIdx].Kind != OpFilter {
-		t.Fatalf("expected OpFilter below top-level node, got Kind=%d", tree.ops[nIdx].Kind)
+	if tree.ops[nIdx].Kind != OpSeqScan {
+		t.Fatalf("expected OpSeqScan below top-level node (Filter absorbed), got Kind=%d", tree.ops[nIdx].Kind)
 	}
-	fs := tree.ops[nIdx].state.(*filterState)
-	if fs.predIdx == noExpr {
-		t.Error("filterState.predIdx must not be noExpr for a non-nil predicate")
+	so := tree.ops[nIdx].state.(*seqScanOp)
+	if !so.qualSet || so.qual == nil {
+		t.Error("seqScanOp must carry the absorbed qual after BuildFast with a filter predicate")
 	}
-	// exprs not set yet (set at Open time); predIdx must reference a valid node.
-	if int(fs.predIdx) >= len(tree.exprs) {
-		t.Errorf("predIdx %d out of range (slab len=%d)", fs.predIdx, len(tree.exprs))
-	}
+	// The absorbed qual is compiled at Open, not here (buildExprCtx needs a
+	// *Context for constant folding), so there is no predIdx to range-check
+	// on this path any more — the equivalent pin is qualSet/qual above.
 
 	// Full round-trip: verify results match legacy path.
 	runBothAndCompare(t, plan, ctx)
