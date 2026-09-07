@@ -518,6 +518,19 @@ type Pool struct {
 	// Remove this field once the eviction-race root cause is fixed.
 	DebugValidateCleanEvictions bool
 
+	// DebugReadFault, when non-nil, is consulted on every buffer-pool disk
+	// read just before the read is issued; a non-nil return makes the read
+	// fail exactly as a real I/O error would, with no file to corrupt and no
+	// fake Manager to write.
+	//
+	// E-19 S2. §4.2's leak test has three arms — scan to EOF, mid-scan Close,
+	// and an INJECTED READ ERROR — and the third was unwritable: OnPinWait /
+	// OnPinDone are timing hooks with no error return, and the alternatives
+	// (a fake Manager, a deliberately truncated file) both change the thing
+	// under test. Off by default and nil-checked, so it costs one predicted
+	// branch per miss and nothing per hit.
+	DebugReadFault func(tag BufferTag) error
+
 	// DebugTraceSlotEvents is an M-NIGHTLY investigation aid
 	// (AI-20260708-064334-001), off by default (zero cost when false: the
 	// only always-paid cost is the per-slot ring buffer allocation in
@@ -1181,6 +1194,28 @@ func (p *Pool) AddWriteTimeNanos(n int64) {
 // write_time column (milliseconds).
 func (p *Pool) WriteTimeNanos() int64 {
 	return p.sharedWriteTimeNanos.Load()
+}
+
+// TotalPinCount returns the sum of every slot's pin count, plus the number of
+// slots holding at least one pin. Both are sampled slot-by-slot without any
+// pool-wide lock, so the pair is only exact on a quiesced pool — which is
+// precisely the condition the leak test asserts under (before a scan, after
+// the scan has finished or been closed).
+//
+// E-19 S2. §4.2 hazard 1 — "a prefetch that pins and never unpins" — is a
+// surface no values suite can see: a leaked pin is not a wrong answer, it is a
+// buffer that can never be evicted again. Asserting the balance needs the sum,
+// and before this the only exported readers were SlotPinCount(tag) (which
+// needs a tag the test would have to guess) and Capacity(). getPinCount is
+// unexported, so a test in internal/executor could not compute it at all.
+func (p *Pool) TotalPinCount() (total int64, slotsPinned int) {
+	for i := range p.slots {
+		if n := statePin(p.slots[i].state.Load()); n != 0 {
+			total += int64(n)
+			slotsPinned++
+		}
+	}
+	return total, slotsPinned
 }
 
 // EvictionCount returns the pool-wide cumulative count of real victim
@@ -1997,7 +2032,10 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	if p.OnPinWait != nil {
 		p.OnPinWait()
 	}
-	ioErr := p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
+	ioErr := p.readFault(tag)
+	if ioErr == nil {
+		ioErr = p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
+	}
 	if ioErr == nil && p.OnBlockReload != nil {
 		p.OnBlockReload(tag, s.page)
 	}
@@ -2017,16 +2055,28 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 
 	// Transition to valid+pinned. Read waiter count under pinMu before
 	// clearing ioInflight so no new waiters can arrive between read and wake.
+	//
+	// E-19 S3: this used to be an absolute Store with the pin hard-coded to 1.
+	// It is now publishValid(extraPin=1) — a CAS that MERGES — so that this
+	// path and ReadOp.Finish (which already holds its caller's pin, taken at
+	// claim time) share one publish and cannot drift. Under pinLoad nothing
+	// can hold a pin here, so the merge is arithmetically identical to the
+	// Store it replaces.
 	n := p.slotWaiters[victimIdx].Load()
-	prevSt := s.state.Load()
-	newSt := slotValidBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
-	s.state.Store(newSt)
-	p.traceSlotEvent(int32(victimIdx), evPinLoadPublish, tag, prevSt, newSt)
+	p.publishValid(s, gen, 1)
 	for i := int32(0); i < n; i++ {
 		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}
 	p.sharedReadCount.Add(1)
 	return s, nil
+}
+
+// readFault consults the DebugReadFault seam. Always nil in production.
+func (p *Pool) readFault(tag BufferTag) error {
+	if p.DebugReadFault == nil {
+		return nil
+	}
+	return p.DebugReadFault(tag)
 }
 
 // Capacity returns the total number of buffer slots in the pool.

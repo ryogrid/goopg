@@ -824,7 +824,7 @@ unchanged by the good news:
 
 | slice | why it is first |
 | :-- | :-- |
-| **S1** vectored read through `Manager`/`AIOEngine`/all three methods | without it the design discards `io_combine_limit`; also the only slice with no buffer-pool correctness surface |
+| **S1** vectored read through `Manager` (**LANDED 2026-09-07**) | without it the design discards `io_combine_limit`; also the only slice with no buffer-pool correctness surface |
 | **S2** pin accounting + pin-sum accessor + read-error injection seam | §4.2's three hazard tests are unwritable until this lands |
 | **S3** `StartRead`/`FinishRead` with the §4.1a reworks | the six breaks, each of which is a wrong-data or deadlock class, not a perf class |
 | **S4** the `bitmapHeapScanOp` / index-scan window with a **new** drain point | plus the parallel batched-claim API if the parallel path is in scope |
@@ -844,6 +844,43 @@ surgery + per-method tests + checksum preservation, and do not accept a
 loop-over-`ReadBlock` as "vectored" (it buys no syscall reduction, which
 is the whole point of `io_combine_limit`).
 
+### 5.9b S1 LANDED — `Manager.ReadBlocks`, and the combining is measured
+
+`Manager.ReadBlocks(rel, first, bufs)` → `relFile.readBlocks` → `preadvAt`
+(`preadv_linux.go` / a ReadAt-loop fallback in `preadv_other.go`).
+`MaxIOCombineLimit = 128` and `DefaultIOCombineLimit = 128 KiB / BlockSize = 16`
+transcribe `MAX_IO_COMBINE_LIMIT` / `DEFAULT_IO_COMBINE_LIMIT`
+(`postgres/src/include/storage/bufmgr.h:165-166`).
+
+**Measured, not asserted — and now GATED, not merely reported.** Reading 16
+consecutive blocks costs **18** read syscalls one block at a time and **3**
+through `ReadBlocks` (one `preadv` plus the probe's own two `/proc/self/io`
+reads) — i.e. 16 syscalls collapse to 1. That figure is an assertion in
+`TestReadBlocksIssuesOneSyscallPerRun`, because syscall *count* is the entire
+benefit of the slice: a future refactor that turned `readBlocks` into a loop
+over `readBlock` would keep every other test in the file green while deleting
+the only thing S1 buys.
+
+Three properties `readBlocks` deliberately keeps from `readBlock`, each with a
+test, because a vectored read that relaxed any of them would be a correctness
+regression no values suite could see:
+
+- **Per-block latches over the whole run**, acquired in **ascending** order —
+  which is what makes it deadlock-free against another run (also ascending) and
+  against any single-block reader/writer. `TestReadBlocksLatchesEveryBlockInTheRun`
+  holds block 2's latch and asserts a 0..3 run cannot complete.
+- **The bounds check is under `r.mu`, with the read.** This deliberately does
+  *not* repeat `PrefetchBlock`'s unlocked `f.nblocks` read (`smgr.go:212`,
+  source review finding 8).
+- **Per-block checksum verification**, inside `readBlocks` so no caller can
+  bypass it. `TestReadBlocksVerifiesChecksums` caught a real flaw in the first
+  draft: on a mismatch it returned the *full* block count, which would tell a
+  caller reading count-before-error that the corrupt block had been filled. It
+  now returns only the number of blocks that **verified**.
+- **The `recordIOTrace` / `PageIdentityObserve` pair**, per landed block.
+  Omitting them would make PageIdentity's corruption detector blind to exactly
+  the pages a prefetch window brings in — the class that observer exists for.
+
 **And the gate needs its own decision before S3 lands.** §6's suites cannot
 score this: TPC-H is 1.9 GiB in a 2048 MB pool, so the arm that would show the
 win is byte-identical to the arm that would show nothing. The A/B that decides
@@ -851,6 +888,83 @@ S3 must be Probe 0's own instrument — a low-correlation fetch on a
 larger-than-pool relation, cold — promoted to a checked-in bench, with the
 values suites retained only as **regression** gates. Recording that here so the
 next owner does not read a flat TPC-H median as a refutation.
+
+### 5.9c THE ARM — S4 measured, and it is a NO-GO on the evidence
+
+**Run 2026-09-07, after S1-S4 landed.** Instrument: Probe 0's shape, private
+cluster `/tmp/e19d`, port **5539**, `GOOPG_CG_UNIT=e19-s4`, started only ever
+through `scripts/goopg-test-run.sh` (`GOMEMLIMIT=8GiB GOGC=100`).
+`shared_buffers = 16MB` against a **99 MB** `base/`, so the working set cannot
+be pool-resident. `max_parallel_workers_per_gather = 0` (E-11's five-way-A/A
+trap). Fresh capped server per arm — **server age 0 s in every arm**. `ANALYZE`
+and the timed query in ONE session (goopg's stats are per-connection); the
+page-cache state applied via a `\!` escape *after* `ANALYZE`, so `ANALYZE`'s
+own sampling reads cannot warm the arm. Arm order permuted. One binary, one
+commit, depth switched by the `GOOPG_HEAP_PREFETCH_DEPTH` env only.
+
+**Getting a witness at all was most of the work, and the difficulty is the
+finding.** §3.2 chose the bitmap heap scan as the caller, and Probe 0 could not
+reach a bitmap plan — it measured an *index scan* instead. That is not an
+accident of one query. goopg's single-table scan choice is **rule-based**, and
+its own test says so (`internal/optimizer/scan_toggles_test.go`: *"no bitmap
+producer runs for this single-table rule-based plan"*); `enable_indexscan = off`
+is a no-op for the index path, so a single-table predicate cannot be pushed onto
+a bitmap plan by any means available to a session. A serial `Bitmap Heap Scan`
+is reachable only as an **NLI inner**, which is exactly the census §3.3 already
+reported. The witness is therefore built as one: `big (k, r, pad char(48))`,
+1.2M rows, `r` uniform over 50 values, btree on `r`, joined to a 50-row `dim`
+with `d.d = 7` so a **single** inner bitmap heap scan fetches 23,953 rows
+scattered across the whole heap.
+
+| arm | rep 1 | rep 2 | rep 3 | median | rows | server `read_bytes` delta |
+| :-- | --: | --: | --: | --: | --: | --: |
+| **cold, depth 0** | 82.99 ms | 95.87 ms | 88.20 ms | **88.20 ms** | 23,953 | 82,575,360 (×3) |
+| **cold, depth 16** | 187.73 ms | 120.29 ms | 115.39 ms | **120.29 ms** | 23,953 | 82,575,360 (×3) |
+| **warm, depth 0** | 120.03 ms | 82.51 ms | — | 101.3 ms | 23,953 | 0 |
+| **warm, depth 16** | 111.73 ms | 111.24 ms | — | 111.5 ms | 23,953 | 0 |
+
+**Three readings, and the third is the one that matters.**
+
+1. **The window is 36% SLOWER cold** (120.3 ms vs 88.2 ms) and slower warm.
+   The go/no-go criterion in §5 asked for the window arm to be *faster* than
+   depth 0 by more than the control band; it is slower by more than it. This is
+   the same sign, and roughly the same size, as E-11's −12.1% on the
+   *predecessor* mechanism — and it is not the predecessor's bug: this prefetch
+   really does install into the pool (`TestStartReadInstallsIntoThePool`), and
+   the `read_bytes` delta is **byte-identical** across depth 0 and depth 16, so
+   the window issues no extra I/O and never reads a block twice. What it adds
+   is work: a `claimVictim` + `evictVictim` + `bmInsert` + AIO submit + `Finish`
+   per block, in place of a plain `Pin`, with no I/O wait to hide it behind.
+2. **There is no I/O wait to hide, because this witness has no budget.** Cold
+   (88.2 ms) and warm (101.3 ms) are *indistinguishable* — the cold-minus-warm
+   delta is inside the arms' own spread, and negative at the median. 82.5 MB in
+   ~80 ms is ~1 GB/s, i.e. this is the **bandwidth-bound** regime, where kernel
+   readahead is already doing the work. Probe 0's 79.9% budget is simply not
+   present here.
+3. **And that is structural, not a bad choice of query.** A bitmap heap scan
+   **sorts its block list into ascending order by construction**
+   (`tbmBeginIterate` sorts; `tbmIterator.next` walks it), so its access pattern
+   is the readahead-friendly one — the regime §3.1 already refuted for the
+   sequential scan. Probe 0's 79.9% came from an **index scan**, whose heap
+   fetches arrive in *index* order and are therefore genuinely random. The two
+   facts together say: **the budget E-19 found and the caller E-19 chose are not
+   the same access pattern.** Selectivity cannot bridge them either — at ~100
+   rows per page, any bitmap selective enough to leave pages *unvisited* is also
+   small enough that the whole fetch is a few MB.
+
+**Verdict: NO-GO, in scope** (§5's middle outcome), and it is a stronger
+statement than "measured inside the noise": the mechanism is correct and the
+witness is real, and it still **loses**, because the caller it was designed for
+does not have the access pattern the budget lives in. The code lands **inert at
+depth 0** on the strength of its pin, eviction, deadlock and checksum tests,
+per §4.3's rule. No default changes.
+
+**The resume point, if anyone reopens this:** the budget is on the **index
+scan's** heap fetch, not the bitmap's. Giving *that* path a window is a
+different slice — an index scan has no materialised list of its future blocks
+the way a TID bitmap does, so it would need a look-ahead read of the btree leaf,
+which is a btree change and not a buffer-pool one. S1-S3 are the reusable part
+of this work and are unaffected by the verdict.
 
 ## 5.10 Triage of the `releaseVictimSlot` hazard — UNREACHABLE at HEAD, and E-19 is exactly what makes it reachable
 

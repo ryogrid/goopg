@@ -377,6 +377,24 @@ func (it *tbmIterator) nextPage(result *BitmapPageResult) bool {
 	}
 }
 
+// peekBlocks fills dst with the block numbers the iterator has NOT yet
+// delivered, in ascending order, and returns the filled prefix. It does not
+// advance the iterator.
+//
+// E-19 S4: this is what makes a look-ahead window possible at all. The TBM's
+// block list is materialised and sorted at tbmBeginIterate, so the scan's
+// future is already known — the blocks are simply sitting in it.next()'s way.
+// Ascending order is also what gives the runs that upstream's io_combine_limit
+// exists to merge.
+func (it *tbmIterator) peekBlocks(dst []storage.BlockNumber) []storage.BlockNumber {
+	n := 0
+	for i := it.idx; i < len(it.blocks) && n < len(dst); i++ {
+		dst[n] = it.blocks[i]
+		n++
+	}
+	return dst[:n]
+}
+
 // next advances the iterator and returns the next TID.
 // ok is false when the iterator is exhausted.
 func (it *tbmIterator) next() (block storage.BlockNumber, offset uint16, lossy, recheck bool, ok bool) {

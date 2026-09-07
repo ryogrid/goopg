@@ -3943,13 +3943,128 @@ ledger row if the measurement says no.
   NOTE the standing trap — `estimate-audit` defaults to `-serial`, so its
   captures are BLIND to this entire item; judge it with parallel-mode runs.*
 
-- [~] **E-19 EX5-05 AIO prefetch that actually populates the buffer pool.**
+- [x] **E-19 EX5-05 AIO prefetch that actually populates the buffer pool.**
+  **CLOSED 2026-09-07 — NO-GO, in scope: built, correct, measured, and it
+  loses. S1-S4 land inert at depth 0.**
   Filed 2026-09-07 at the owner's request, same standing as E-17 cut 2 and
   E-18: **design doc + agent review + commit the design first, then
   implement.**
-  **2026-09-07 — design + two adversarial reviews + Probe 0 landed;
-  implementation NOT started.**
+  **2026-09-07 — design + two adversarial reviews + Probe 0 landed.**
   `docs/design/storage-prefetch-buffer/E19-INSTALLING-PREFETCH.md`.
+  **Implementation progress (§5.9a slice order):**
+  - **S1 vectored read — LANDED + gated 2026-09-07.** `Manager.ReadBlocks` /
+    `relFile.readBlocks` / `preadvAt` (`preadv_linux.go`, ReadAt-loop
+    fallback in `preadv_other.go`), `MaxIOCombineLimit = 128` /
+    `DefaultIOCombineLimit = 16` transcribed from `bufmgr.h:165-166`.
+    The payoff is a **gated** fact, not a reported one:
+    `TestReadBlocksIssuesOneSyscallPerRun` measures 16 single-block reads at
+    **18** read syscalls and the same run through `ReadBlocks` at **3** (one
+    `preadv` plus the probe's own two `/proc/self/io` samples). Per-block
+    ascending latches, the bounds check under `r.mu`, per-block checksum
+    verification and the `recordIOTrace`/`PageIdentityObserve` pair are all
+    kept from `readBlock`; six tests, `-race` green. No caller yet, so the
+    slice is inert by construction.
+  - **S2 pin accounting + test seams — LANDED 2026-09-07.**
+    `Pool.TotalPinCount() (total, slotsPinned)` (the pin-sum accessor §4.2
+    said made the leak test unwritable — `getPinCount` is unexported and
+    `SlotPinCount` needs a tag) and `Pool.DebugReadFault func(BufferTag)
+    error`, a read-path fault seam consulted in `pinLoad`, off by default.
+    `EvictionCount()` already existed and is gated as an instrument.
+    Three tests; the injected-fault one is also a real assertion about HEAD
+    and passes: a failed read leaves no pin, no slot with the IO bit set and
+    no bufmap entry, and the same tag reads cleanly afterwards.
+  - **S3 `StartRead`/`FinishRead` — LANDED 2026-09-07.**
+    `internal/storage/prefetch.go`: `Pool.StartRead(tag) (*ReadOp, error)`,
+    `ReadOp.Finish` / `ReadOp.Abort`. The read lands **in the slot's own
+    page** — the exact thing the deleted `Pool.Prefetch` failed to do — and
+    `TestStartReadInstallsIntoThePool` asserts the payoff directly:
+    consuming the prefetched blocks afterwards issues **zero** further reads.
+    The three review findings the row demanded be honoured in code:
+    (1) **the deadlock** — submission moved out from under `pinMu` AND the
+    completion callback made pool-free (publication happens in `Finish`, on
+    the consumer's goroutine), so neither edge of the cycle survives;
+    `TestStartReadDoesNotHoldPinMuAcrossSubmit` (2-deep queue, 1 worker
+    taking `pinMu` per completion, 8-deep window) was **falsified against a
+    deliberately naive build and hung for the full 60 s timeout** in
+    `Submit` under `pinMu`, then passed on the real one.
+    (2) **checksum verification is not dropped** — it lives one layer down
+    (`relFile.ReadAt` / `readBlock` / `aio.ChecksumFile`) so no caller can
+    bypass it, and `TestStartReadVerifiesChecksums` corrupts a page on disk
+    and asserts `Finish` fails.
+    (3) **a concurrent `Pin` of an in-flight block blocks on validity** —
+    `TestConcurrentPinOfInFlightBlockWaitsForValidity` asserts the waiter
+    parks on the slot semaphore and that the pool-wide read count moves by
+    exactly one, i.e. the block is not read twice.
+    Also fixed here: the publish is now `publishValid`, a CAS that **merges**
+    the pin instead of an absolute `Store` with pin hard-coded to 1 (finding
+    3), shared with `pinLoad` so the two cannot drift; `Abort` keeps the pin
+    until it is done rather than calling `releaseVictimSlot`, which would
+    wipe the generation out from under a `*Slot` the caller still holds
+    (finding 5 — the one a pin-balance test passes while broken); and
+    `PrefetchBlock`'s unlocked `f.nblocks` read became `f.nBlocks()` (the
+    dormant race S3 would have made hot). Seven tests, `-race` green.
+    Finding 6 (a dirty victim's synchronous writeback front-loading up to D
+    inline flushes before any read is in flight) is **documented, not
+    fixed** — it needs a background writer that does not exist, and it is
+    part of why the depth knob defaults to 0.
+  - **S4 scan-side window — LANDED 2026-09-07, default OFF.**
+    `internal/executor/bitmap_prefetch.go` + `tbmIterator.peekBlocks`: a FIFO
+    of `Pool.StartRead` ops for blocks the serial bitmap heap scan has not
+    reached, refilled at the page transition (NOT in `Next`'s prologue —
+    `fetchExact` recurses into `o.Next()` per skipped tuple) with a **new**
+    drain point separate from the per-page `releasePinned`, reached from
+    `Close`, `Rescan`, EOF and the page-transition error return. Knob
+    `GOOPG_HEAP_PREFETCH_DEPTH`, default 0 = nil window = inert. Seven tests:
+    pin balance across all three §4.2 arms (EOF, mid-scan drain, injected
+    read error), stale-head drop, and an eviction delta bounded by the depth
+    against a no-window control.
+  - **THE PARALLEL DECISION, stated as the row demands.** The window is
+    **serial-only**, so at bench settings the item has **NO WITNESS** —
+    goopg's parallel bitmap scan claims pages one at a time from a shared
+    atomic allocator, so a worker cannot look ahead without claiming, and a
+    parallel window needs the batched-claim API the design lists as a
+    separate sub-item. Obstacle 1 is therefore answered with its second
+    branch, not its first.
+  - **THE ARM — NO-GO, in scope (§5.9c).** Probe 0's instrument, private
+    cluster `/tmp/e19d` port 5539, `GOOPG_CG_UNIT=e19-s4`, `shared_buffers =
+    16MB` vs 99 MB of data, serial, fresh capped server per arm (age 0 s),
+    `ANALYZE` + query in one session with the cache state applied after it,
+    3 reps, order permuted, one binary. Witness: a single serial
+    `Bitmap Heap Scan` NLI inner fetching 23,953 rows scattered over the
+    whole heap. **Cold median 88.20 ms at depth 0 against 120.29 ms at depth
+    16 — the window is 36% SLOWER**, and slower warm too. Rows identical
+    (23,953) and the server's `read_bytes` delta **byte-identical**
+    (82,575,360) in every cold arm, so the window issues no extra I/O and
+    never double-reads; what it adds is work per block with nothing to hide
+    it behind.
+    **And the witness has no budget at all**: cold 88.2 ms vs warm 101.3 ms
+    are indistinguishable, 82.5 MB in ~80 ms ≈ 1 GB/s — bandwidth-bound,
+    kernel readahead already covering it.
+    **Why, structurally:** a bitmap heap scan **sorts its block list
+    ascending by construction**, so its access pattern is the
+    readahead-friendly one §3.1 already refuted; Probe 0's 79.9% budget came
+    from an **index scan**, whose heap fetches arrive in *index* order and
+    are genuinely random. **The budget E-19 found and the caller E-19 chose
+    are not the same access pattern**, and selectivity cannot bridge them (at
+    ~100 rows/page, a bitmap sparse enough to leave pages unvisited is small
+    enough to be a few MB). A second finding en route: a serial single-table
+    bitmap plan is **unreachable** in goopg — the single-table scan choice is
+    rule-based and `enable_indexscan = off` is a no-op for the index path
+    (`internal/optimizer/scan_toggles_test.go` says so), so a `Bitmap Heap
+    Scan` only ever appears as an NLI inner, exactly the §3.3 census.
+    **Resume point if reopened:** the budget is on the index scan's heap
+    fetch. Giving *that* a window is a btree change (no materialised future
+    block list), not a buffer-pool one. S1-S3 are reusable and unaffected.
+  - **Gates.** `go test -race ./internal/storage/...` green;
+    `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` green with
+    the knob OFF **and** at `GOOPG_HEAP_PREFETCH_DEPTH=8`;
+    `internal/executor` values identical in both arms. TPC-H spotcheck run
+    on a **private clone** of the bench datadir (`/tmp/e19tpch`, port 5540,
+    own cgroup unit — the shared 65433 cluster was never touched):
+    **Q12 = 2, Q13 = 34** against the pinned expectations, both with the knob
+    off and at depth 16 (TPC-H plans are parallel, so the window is inert
+    there by design). The TPC-DS SF0.5 sweep was **not** run: the change is
+    inert at the default and the row closes NO-GO.
   **Probe 0 answers the sizing caveat below and answers it POSITIVELY**: on a
   cold, low-correlation, larger-than-pool index fetch (private cluster,
   port 5537, `shared_buffers = 128MB` vs 774 MB of data, serial, fresh capped
