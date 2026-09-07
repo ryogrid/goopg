@@ -167,6 +167,18 @@ func foldPlanConstantsInner(node Node) {
 		foldPlanConstantsInner(n.Right)
 	case *WindowAgg:
 		foldPlanConstantsInner(n.Child)
+	case *Gather:
+		// C-19g's upper-rel-resident half: a Gather can be in the tree by the
+		// time this pass runs, because the GROUP_AGG upper rel now chooses a
+		// `Finalize -> Gather -> Partial` PATH during planning rather than
+		// having one stamped on afterwards by `MaybeAddGather`. Without these
+		// arms the fold stops at the Gather and the partial subtree keeps an
+		// unfolded predicate — which is not merely cosmetic: EXPLAIN's `rows=`
+		// is recomputed from the predicate, so TPC-H Q6 read `rows=53603`
+		// against the folded plan's 2412 for the identical scan.
+		foldPlanConstantsInner(n.Child)
+	case *GatherMerge:
+		foldPlanConstantsInner(n.Child)
 	case *Distinct:
 		foldPlanConstantsInner(n.Child)
 	case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *WorkTableScan:

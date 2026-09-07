@@ -144,6 +144,15 @@ func TestPlannerCacheFingerprintCoversEveryField(t *testing.T) {
 		func(ps *optimizer.PlannerSettings) { ps.GeqoSeed += 0.25 },
 		func(ps *optimizer.PlannerSettings) { ps.EnableMemoize = !ps.EnableMemoize },
 		func(ps *optimizer.PlannerSettings) { ps.HashMemMultiplier += 0.5 },
+		// C-19g's remainder: the parallel block is part of the key now,
+		// because the pre-cache planner can choose a Gather.
+		func(ps *optimizer.PlannerSettings) { ps.MaxParallelWorkersPerGather++ },
+		func(ps *optimizer.PlannerSettings) { ps.MinParallelTableScanSize++ },
+		func(ps *optimizer.PlannerSettings) { ps.MinParallelIndexScanSize++ },
+		func(ps *optimizer.PlannerSettings) {
+			ps.ParallelLeaderParticipation = !ps.ParallelLeaderParticipation
+		},
+		func(ps *optimizer.PlannerSettings) { ps.EnableGatherMerge = !ps.EnableGatherMerge },
 	}
 	for i, mutate := range mutations {
 		ps := base

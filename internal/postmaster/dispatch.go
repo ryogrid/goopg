@@ -1900,6 +1900,41 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 			}
 		}
 	}
+	// C-19g's remainder (upper-rel-resident partial aggregation): the parallel
+	// block now reaches the PRE-CACHE planner, because the GROUP_AGG upper rel
+	// can choose a `Finalize -> Gather -> Partial` path and has to price it
+	// under the session's own settings rather than the boot defaults. Each is
+	// applied only when the GUC is READABLE — an absent registry keeps
+	// DefaultPlannerSettings' value, which is what every planner-only test
+	// harness relies on, rather than silently reading as 0 and disabling
+	// parallel paths outright.
+	//
+	// The matching half is in `plannerCacheFingerprint`: these three are part
+	// of the plan-cache key now, so a session with its own parallel settings
+	// keys into its own entry instead of borrowing a plan built under
+	// someone else's. The facts that are NOT session GUCs (isolation level,
+	// statement shape) are enforced post-cache by `optimizer.StripGather`.
+	// C-19g's remainder: this is a TOP-LEVEL statement site. Every caller of
+	// `plannerSettingsFrom` plans a statement the client sent; nested scopes
+	// (view bodies, CTE bodies, sublinks, DML sources) build their settings
+	// from `DefaultPlannerSettings` or have the flag cleared on the way in, so
+	// the parallel candidate is refused everywhere else BY DEFAULT.
+	// `PlanWithSettings` narrows it again to a plain SELECT.
+	ps.ParallelStatementOK = true
+
+	if eff, ok := get("max_parallel_workers_per_gather"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(eff)); err == nil && n >= 0 {
+			ps.MaxParallelWorkersPerGather = n
+		}
+	}
+	if eff, ok := get("min_parallel_table_scan_size"); ok {
+		if n, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64); err == nil && n >= 0 {
+			ps.MinParallelTableScanSize = n
+		}
+	}
+	readBool("parallel_leader_participation", &ps.ParallelLeaderParticipation)
+	readBool("enable_gathermerge", &ps.EnableGatherMerge)
+
 	readBool("enable_hashjoin", &ps.EnableHashJoin)
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
@@ -1964,9 +1999,14 @@ const blockSizeBytesForPlanner = 8192
 // Sessions with their own planner inputs now key into their own cache entry
 // instead of bypassing the shared cache.
 //
-// ParallelSettings is deliberately EXCLUDED: MaybeAddGather runs post-cache
-// (applyParallelPostPass), so it never affects the cached serial plan — and it
-// carries a func field (BlocksForTable) that is not formattable.
+// `ParallelSettings` as a STRUCT stays excluded — it carries a func field
+// (BlocksForTable) that is not formattable — but its scalar GUCs no longer are:
+// C-19g's remainder lets the pre-cache planner choose a
+// `Finalize -> Gather -> Partial` path, so `max_parallel_workers_per_gather`,
+// `min_parallel_table_scan_size` and `parallel_leader_participation` travel
+// through `PlannerSettings` into the key. The inputs that are not session GUCs
+// — the transaction's isolation level, and the statement-shape refusals — are
+// enforced after the lookup by `optimizer.StripGather`.
 func sessionPlannerFingerprint(sess *misc.SessionRegistry) string {
 	ps := sessionPlannerSettings(sess)
 	return plannerCacheFingerprint(ps,
@@ -2027,6 +2067,17 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		float(ps.GeqoSeed),
 		bit(ps.EnableMemoize),
 		float(ps.HashMemMultiplier),
+		// C-19g's remainder: the parallel block. It used to be excluded
+		// because `MaybeAddGather` ran post-cache and nothing parallel could
+		// be baked into a cached plan. That stopped being true when the
+		// GROUP_AGG upper rel gained a `Finalize -> Gather -> Partial`
+		// candidate, so these must key sessions apart or one session's
+		// `max_parallel_workers_per_gather` leaks into another's execution.
+		strconv.Itoa(ps.MaxParallelWorkersPerGather),
+		strconv.FormatInt(ps.MinParallelTableScanSize, 10),
+		strconv.FormatInt(ps.MinParallelIndexScanSize, 10),
+		bit(ps.ParallelLeaderParticipation),
+		bit(ps.EnableGatherMerge),
 		bit(disableSeqScan),
 		bit(disableIndexScan),
 		bit(disableBitmapScan),

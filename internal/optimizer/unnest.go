@@ -1073,6 +1073,22 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 	case *OrdinalityWrap:
 		walkPlanExprs(n.Child, visit)
+	case *Gather:
+		// C-19g's upper-rel-resident half: a Gather can now appear in the
+		// tree BEFORE `Plan()`'s tail passes run, where previously the only
+		// producer (`MaybeAddGather`) ran after all of them. Without these two
+		// arms the walker stops dead at the Gather and `lowerSubPlanParams`
+		// never discovers a sublink host inside the partial subtree — the
+		// sublink stays on the legacy OuterRows path (slower, not wrong), and
+		// every other reader of this walker silently under-reports.
+		//
+		// It cannot make the MUTATING readers (remapOuterRefsInSubplan,
+		// collectUnnestParams) see anything new in practice: those run while
+		// planning a sublink's inner plan, and a nested planning scope is
+		// refused a parallel candidate outright (`ParallelStatementOK`).
+		walkPlanExprs(n.Child, visit)
+	case *GatherMerge:
+		walkPlanExprs(n.Child, visit)
 	case *Aggregate:
 		walkPlanExprs(n.Child, visit)
 		for _, g := range n.GroupExprs {

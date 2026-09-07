@@ -269,6 +269,20 @@ func stampAggregateInputTarget(agg *Aggregate, above Node) {
 	if agg == nil {
 		return
 	}
+	// A SPLIT aggregate is not stampable, and this is the same refusal
+	// `splitAggregate` (parallel.go) already makes on the node it builds:
+	// a Finalize node's child is the Gather over the Partial's OUTPUT row, so
+	// positions into "the input row" no longer address anything this node
+	// reads, while its GroupExprs are still written in the original input's
+	// coordinates. Deriving a keep from the wrong schema is not a wrong
+	// payload, it is a panic in `assertAggregateInputTargetCoversKeys` — which
+	// is what C-19g's upper-rel-resident half hit the moment the producer could
+	// hand `planSelectWithSettings` a Finalize node to re-stamp. Decline to
+	// unknown, the safe direction (payload-only, no plan change).
+	if agg.Mode != AggModeSimple {
+		agg.InputTarget, agg.InputTargetKnown = nil, false
+		return
+	}
 	keep, ok := deriveAggregateInputKeep(agg, above)
 	if !ok {
 		agg.InputTarget, agg.InputTargetKnown = nil, false

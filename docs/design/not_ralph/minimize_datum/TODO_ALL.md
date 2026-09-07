@@ -1746,7 +1746,7 @@ rule).*
   `pg-plan-parity-diff.py` cannot judge a parallel plan until they read
   a post-pass-inclusive capture (§10.8); the D-05 re-run at 1× is next
   and must explain Q9.*
-- [~] **C-19g P5-07 partial aggregation as paths**
+- [x] **C-19g P5-07 partial aggregation as paths**
   (`create_partial_grouping_paths`), replacing `splitAggregate`. Depends
   on C-15 (landed `40d7a4667`).
   *design: `docs/design/planner-c19g-partial-agg/DESIGN.md`; take3 08 §8;
@@ -1782,9 +1782,54 @@ rule).*
   positive result is met. Not flipped here because the flip needs a re-pin
   of `plan_snapshots/`, which two peer agents were A/B-ing against all
   session, plus `MODE=costs` on the canonical cluster.
-  REMAINDER (not this slice): the upper-rel-resident port needs one change
-  in `groupingpaths.go` (owned elsewhere) plus an answer to the plan-cache
-  question — see that design's §8.
+  **REMAINDER LANDED 2026-09-07 — this row is now `[x]`.** The
+  upper-rel-resident port is `internal/optimizer/partialaggupper.go`
+  (design §10), and the default is FLIPPED to
+  `GOOPG_PARTIAL_AGG_PATHS=on`. §8's two blockers are answered:
+  *no input rel* — goopg needs no separate partial PLAN, because
+  `gatherOp.runWorker` rebuilds the Gather's child per worker and stamps
+  the driving scan, so the partial plan IS the serial subtree; what a Node
+  cannot supply is the PRICE, and `parallelSeedCost` supplies it as
+  `cost_seqscan`'s own parallel adjustment (run cost / the parallel
+  divisor), stated as the one non-transcribed quantity in the producer.
+  *plan cache* — the parallel block now reaches the pre-cache planner and
+  is part of `plannerCacheFingerprint`, and the inputs that are NOT
+  session GUCs (isolation level, statement shape) are enforced AFTER the
+  lookup by the new `StripGather`, which `MaybeAddGather` calls on any
+  plan it may not parallelise instead of returning it unchanged.
+  `addPartialAggSplitPath` files, on C-15's own GROUP_AGG rel, the split
+  (`PathFinalizeAgg`, whose `createPlan` arm calls the SAME
+  `splitAggregate` the post-pass calls) and the gathered no-split family
+  in the hashed and sorted shapes. Both halves are load-bearing: without
+  the no-split arm the split won Q3 and Q10, which pre-aggregate nothing
+  (~300 k groups from ~300 k rows); with `aggregateSplitIsSafe` gating the
+  whole producer instead of only the split arm, Q16 lost its Gather
+  entirely.
+  MEASURED (private clone, port 5541, `GOOPG_ANALYZE_SEED=20260905`):
+  control arm (knob off) **22/22 MATCH against `c05-c04b-20260907` in BOTH
+  `structural` AND `MODE=costs`** — the cost-exact control C-19g could not
+  obtain; with the default flipped, 3/22 move (Q5 and Q9 GAIN
+  `Finalize → Gather → Partial`; Q16 goes `GroupAggregate`/`Sort`/`Gather`
+  → `HashAggregate`/`Gather`), and the new pin
+  `plan_snapshots/c19g-upper-partialagg-20260907.txt` is **22/22 in both
+  modes**. TPC-H digest **24 MATCH on VALUES** across four arms;
+  **Q1 −41%** (14.54/10.52 s → 8.29/6.50 s; a quieter earlier campaign read
+  8.49/8.82 → 4.46/5.28, −43.7%), Q16 −34.7%, suite −6.9% at the edge of
+  the arms' own spread and not claimed. TPC-DS SF0.5 sweep
+  **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4**,
+  plan-shape `same=99 changed=0`, TOTAL −4.2%
+  (`sweep-20260907-100737.txt`).
+  Four defects the live gates found, each a general rule, are written up in
+  design §10.4: a Finalize node is not `stampAggregateInputTarget`-able;
+  every pass that runs after the aggregate stage must descend through a
+  Gather (`foldPlanConstants` and `walkPlanExprs` did not, and the fold's
+  absence made EXPLAIN read `rows=53603` where the folded plan read 2412);
+  a nested planning scope must be closed BY DEFAULT rather than by
+  enumeration (a VIEW BODY is planned by a re-entrant `Plan` call whose
+  result becomes a search LEAF — it looked like a top-level SELECT and
+  stopped Q15b); and EXPLAIN must be transparent to the statement-shape
+  flag, or it plans a serial aggregate for a statement that executes the
+  split.
 - [!] **C-19h P5-08 retire `MaybeAddGather` — BLOCKED, and NOT on the
   default flip. Measured 2026-09-07; evidence
   `docs/design/planner-c19h-gather-postpass/DESIGN.md`.**
@@ -1821,6 +1866,35 @@ rule).*
   Sequencing: finish C-19g's upper-rel half → re-run the census → retire
   conditionally on `all` → flip the default (needs the `plan_snapshots/`
   re-pin) → only then delete. Only the last step is C-19h as written.
+
+  **UNBLOCKED 2026-09-07.** C-19g's upper-rel half is landed and its
+  default is flipped (that row; design §10). The census was re-run on the
+  same engine image at the engine defaults, EXPLAIN over the 22 TPC-H
+  queries, with a probe build standing the post-pass's ADD half down:
+
+  | arm | queries carrying a Gather |
+  |---|---|
+  | post-pass live, knob `off` (the pre-flip default) | 12/22 |
+  | post-pass live, knob `on` (the new default) | 12/22 |
+  | post-pass **stood down**, knob `off` | **0/22** |
+  | post-pass **stood down**, knob `on` | **12/22** |
+
+  The twelve are the SAME twelve in every non-zero arm — Q1, Q3, Q5, Q6,
+  Q7, Q8, Q9, Q10, Q14, Q15a, Q16, Q19 — so blocker 1 ("at the default the
+  post-pass is the ONLY producer, 12/22 with it and 0/22 without") no
+  longer holds, and the earlier probe's six-query loss cohort (Q1, Q6, Q14,
+  Q15a, Q16, Q19 — every one of them an aggregate query) is fully
+  recovered. Blocker 3 ("Q1's win is delivered THROUGH the post-pass") is
+  answered by construction: Q1 now MATCHES the pin with the post-pass
+  stood down.
+  **Two things must survive the retirement and neither is C-19g's to
+  move**, so this row stays open rather than closing with the census:
+  (a) `StripGather` — the post-CACHE enforcement half of C-19g's
+  plan-cache answer, which is not a "post-pass" at all and must outlive
+  the ADD half or a cached parallel plan reaches a SERIALIZABLE
+  transaction; and (b) `debug_parallel_query`, which the upper-rel
+  producer does not read, so a forced-parallel regress arm still needs the
+  post-pass or an equivalent path-model gate.
   *design: take3 08 §8; gate: take3 09 §5 P5 — plan-parity both suites,
   parallel and serial arms.*
   (Serial control arm unchanged throughout C-19a–h. Ordering trap already

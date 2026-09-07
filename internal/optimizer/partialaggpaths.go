@@ -60,15 +60,27 @@ const (
 // mid-statement.
 var partialAggPathsMode = partialAggModeFromEnv(os.Getenv("GOOPG_PARTIAL_AGG_PATHS"))
 
-// partialAggModeFromEnv resolves the knob. Anything unrecognised is `off`:
-// fail-closed, so a typo cannot silently enable a plan shape whose measurement
-// has not been run. Same shape as `gatherPathModeFromEnv`.
+// partialAggModeFromEnv resolves the knob. The DEFAULT IS NOW `on`
+// (2026-09-07): C-19g's own §9 recommended the flip on a measured positive
+// result, and the upper-rel-resident half (partialaggupper.go) is what made it
+// safe to take — with the split resident as a PATH, `MaybeAddGather` is no
+// longer the only producer of parallelism, and the C-19h census reads the same
+// 12/22 TPC-H queries carrying a Gather with the post-pass and with it stood
+// down. Measured for this flip: TPC-H 24/24 MATCH on VALUES, Q1 8.66 s ->
+// 4.87 s median, plan pin moved by 2 queries (Q5, Q9, each GAINING
+// `Finalize -> Gather -> Partial`), TPC-DS SF0.5 sweep clean.
+//
+// An unrecognised value still resolves to a MODE rather than to a panic, but
+// the fail-closed direction has moved with the default: `off` is now the
+// explicit opt-out (the serial control arm every C-19 measurement is taken
+// against), and anything unrecognised reads as the default `on`. Same shape as
+// `gatherPathModeFromEnv`, opposite polarity.
 func partialAggModeFromEnv(v string) partialAggMode {
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "on", "paths", "true", "1":
-		return partialAggPathsOn
-	default:
+	case "off", "false", "0", "size-rule":
 		return partialAggPathsOff
+	default:
+		return partialAggPathsOn
 	}
 }
 

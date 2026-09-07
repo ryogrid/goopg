@@ -79,6 +79,13 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	}
 
 	addGroupingPaths(grouped, seed, aggNode, child, cat, cp, ps)
+	// C-19g's remainder (that design's §8): the PARALLEL candidate —
+	// `Finalize -> Gather -> Partial` — filed on this same rel and adjudicated
+	// by the same `setCheapest` against the serial arms above, instead of
+	// stamped onto the finished tree by the `MaybeAddGather` post-pass.
+	// Declines to nothing under the default knob and under every fail-closed
+	// refusal in partialaggupper.go.
+	addPartialAggSplitPath(u, grouped, seed, aggNode, child, cp, ps)
 	setCheapest(grouped)
 
 	best := getCheapestFractionalPath(grouped, tupleFraction)

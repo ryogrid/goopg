@@ -103,6 +103,39 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 // on P2-04 because the plan cache is cross-session and carries no GUC
 // fingerprint.
 func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
+	// C-19g's remainder: the STATEMENT-shape half of `statementIsParallelSafe`
+	// (parallel.go). A bare SELECT is the one shape the post-pass has ever
+	// parallelised; every other top-level statement — DML, DDL, utility — is
+	// refused there, so it is refused here.
+	//
+	// This only ever NARROWS. The flag is set by the postmaster's
+	// `plannerSettingsFrom`, which is reached exclusively from the top-level
+	// statement sites, and it is false in `DefaultPlannerSettings` — so every
+	// `optimizer.Plan` caller starts closed. That asymmetry is load-bearing
+	// rather than stylistic: a view body is planned by a RE-ENTRANT `Plan`
+	// call from inside `planScanRangeVar` (planner.go:3440) and its result
+	// becomes a LEAF of the enclosing statement's join search. Deriving the
+	// flag here from the statement shape alone marked that body a top-level
+	// SELECT, the leaf came back carrying `Finalize -> Gather -> Partial`, and
+	// `assertSearchedTreeNeedsNoReconcile` stopped the process on TPC-H Q15b.
+	// A nested scope must be closed BY DEFAULT, not closed by enumeration.
+	switch stmt.(type) {
+	case *parser.SelectStmt:
+		// The one shape that keeps the flag.
+	case *parser.ExplainStmt:
+		// TRANSPARENT, and this is not a convenience. EXPLAIN plans its
+		// inner statement through a recursive `PlanWithSettings` call
+		// (planner.go:325) under the SAME settings, precisely so that what a
+		// user READS is what the session would execute. Clearing the flag on
+		// the wrapper made EXPLAIN show a serial aggregate for a statement
+		// that ran the split — measured: with the post-pass stood down, the
+		// TPC-H census read 0/22 queries carrying a Gather while the digest
+		// arm's Q1 was running 43% faster. The recursion re-tests the inner
+		// statement's shape, so nothing is admitted here that a direct
+		// SELECT would not be.
+	default:
+		plannerSet.ParallelStatementOK = false
+	}
 	// A-01(ii) cut 1: one RTID scope per top-level statement (F1).
 	node, err := planStmtWithSettings(stmt, cat, plannerSet, newRtableScope())
 	if err != nil {
@@ -14535,6 +14568,15 @@ func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *
 	if ps == (PlannerSettings{}) {
 		ps = DefaultPlannerSettings()
 	}
+	// C-19g's remainder: a NESTED planning scope forfeits the parallel
+	// candidate. Not conservatism for its own sake — `parallelChildren`
+	// (parallel.go) has no arm for a subquery node, so a Gather built inside a
+	// subquery is invisible to the post-pass's `subtreeHasGather` stand-down,
+	// and a later Gather placed above a join over that subquery would nest one
+	// inside the other: N workers each launching N. The post-pass cannot see
+	// into a subquery to place one either, so nothing is lost that the engine
+	// could otherwise have had.
+	ps.ParallelStatementOK = false
 	prevParent := planParent
 	planParent = parent
 	defer func() { planParent = prevParent }()
