@@ -378,3 +378,21 @@ placements + mixed multikey, each in-mem and ≥8-run spilling) against
 the independent `spillOracleLess`, plus multiset-equality on every arm,
 `TestSortCTIDFollowsOwnRow`, and the Close+Open rescan test that caught
 §5's nil-heap panic pre-fix. All green with (D)+(E).
+
+### 10.3 Gate status for (B) (`f5516acfb`)
+
+- Ordering gate + executor suite: green. Sort-scoped `-race`
+  (`TestSort*|TestM0068`): green.
+- Full-package `-race`: FAILS on `TestSubquerySemanticsMatrix`
+  (`instrument.go:374` vs `:435`, parallel hash build) — **pre-existing**,
+  verified failing identically at the pre-(B) commit `7d86f172a` in a
+  clean worktree. Same class as the ledgered
+  `take3-instrumentscope-datarace` failure. Not this row's.
+- Spotcheck (fresh (B) server, S-cold): Q12=2/Q13=34 PASS.
+- TPC-H digest values (all 22 OK; canonical row counts throughout):
+  recorded in `/tmp/e01-tpch-digest.log` (scratch — the claim rests on
+  the sweep checksums below, since (B) cannot move plans).
+- Plan check: `changed=0` by construction — (B) touches only the
+  executor `chunkLimit` (unreachable from plan-only captures); planner
+  bytes identical.
+- TPC-DS SF0.5 sweep: see §10.4.
