@@ -74,6 +74,36 @@ No end-to-end suite figure is claimed for the workstream as a whole until
 C-21's acceptance run; the numbers above are per-item and each is sourced
 in its own section.
 
+### 1.2 Three different comparisons — which number answers which question
+
+This report contains three "performance change" figures measured against
+three different baselines. They are not alternatives and none of them
+supersedes the others; quoting one without saying which question it answers
+is the easiest way to misread this document.
+
+| question | comparison | result |
+|---|---|---|
+| **What did the tree gain, release over release?** | `d93fb9edc` (2026-09-01) → branch tip, **C-21** | **TPC-H WARM 274.18 s → 96.72 s = 0.353× (2.83× faster)**; S-cold 284.78 → 111.93 (0.393×) |
+| **What did the single largest item buy?** | the `indexProbeCostMultiplier` calibration alone (§1 headline) | TPC-H 138.58 s → 100.79 s, **27%** |
+| **How far is goopg from PostgreSQL?** | goopg vs PG 18.3, matched settings, 2026-09-06 | **TPC-H total 7.3× slower** (104.9 s vs 14.4 s); per-query 0.4× to 33× |
+
+Three caveats that travel with them:
+
+- **C-21's baseline is a RELEASE point, not the branch point.** `d93fb9edc` →
+  tip is **706 commits, of which only 373 are this workstream's**; the other
+  333 are master-side work. The 2.83× is release-over-release since
+  2026-09-01, **not** this workstream's delta.
+- **The 27% and the 2.83× are measured on different baselines** and must not
+  be added, compared, or presented as a progression.
+- **The goopg-vs-PG ratio is parallel-enabled; the plan-parity figures are
+  serial.** See §9.2b.
+
+**Bundle acceptance was NOT met** (§9): B1 the correctness floor passes
+outright — all 22 ordered value hashes identical, TPC-DS PASS=95 all-zero —
+but B2 fails on Q1 S-cold (7.08 → 15.51 s, 2.19×), A2 does not move (TPC-DS
+parity match 0 → 0), and A5/B3 fail on both arms (50 → 40 new estimate
+findings: improved, still below the bar).
+
 ## 2. The measurement problem, and why it dominated the session
 
 Two captures of the **same binary**, taken back to back on fresh servers
@@ -2425,12 +2455,13 @@ correction to how the plan's remaining items must be judged.
 
 ---
 
-## 9. C-21 acceptance run — INTERIM, measured data only (2026-09-07)
+## 9. C-21 acceptance run (2026-09-07) — COMPLETE; bundle acceptance NOT met
 
-**Status: partial. The run is still executing.** This section records what has
-actually been captured so far, so the numbers exist in the repository before
-the run completes. Bars are not adjudicated here; §9.5 lists what is still
-outstanding. Nothing below is a final verdict.
+**Status: run complete, verdict landed.** Full verdict with every bar and the
+worse-statement: `analysis/planner-refactor-take3/acceptance-20260907/README.md`.
+The headline result is in §1.2 below. §9.3 records the plan-parity and value
+data; §9.5's outstanding list is superseded by the verdict document, with the
+exception noted there (A4 was not separately measured).
 
 ### 9.1 Arms, and one that was discarded
 
