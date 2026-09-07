@@ -1966,6 +1966,54 @@ rule).*
   transaction; and (b) `debug_parallel_query`, which the upper-rel
   producer does not read, so a forced-parallel regress arm still needs the
   post-pass or an equivalent path-model gate.
+  **STILL BLOCKED, on a THIRD blocker measured 2026-09-07 by an actual
+  retirement probe** (evidence and probe patch:
+  `analysis/planner-refactor-take3/c19h-census-rerun-20260907/`; design §7).
+  The census above was re-run with the ADD half really deleted rather than
+  stood down — `findPartialSubtree`, `partialTarget`, `rebuildWithGather`,
+  `terminatesPartial` gone, the enforcement half kept and renamed
+  `EnforceParallelPermission`, both `dispatch.go` call sites updated,
+  `go build ./...` clean — and it passes by a STRONGER test than the count:
+  `diff` of the two 22-query captures is **EMPTY**, all 22 plans
+  byte-identical, costs included. Blockers 1 and 3 are discharged.
+  **And that is why the census was the wrong instrument.** All 22 TPC-H
+  queries carry an aggregate at the top and C-19g's producer is
+  aggregate-only, so the capture is blind to every plan whose top node is
+  not an aggregate. Probed directly on the same clone:
+  `select * from lineitem where l_extendedprice > 90000` goes from
+  `Gather (Workers Planned: 4) -> Parallel Seq Scan` to a bare `Seq Scan`
+  when the post-pass is deleted, and **vanilla PG 18.3 on :65432 emits the
+  Gather** — so the deletion is a PG-PARITY REGRESSION, not a cleanup.
+  **The prerequisite is NOT the `GOOPG_GATHER_PATHS` default flip.**
+  Measured: at `GOOPG_GATHER_PATHS=all` the retired build STILL emits the
+  bare `Seq Scan`, because the path model declines a plain base-rel Gather
+  on cost for the reason C-19d DESIGN §5.1 gives — `parallel_tuple_cost`
+  0.1/row against a 4-worker `cpu_tuple_cost` saving of ≈0.0075/row, which
+  `add_path` correctly dominates at any relation size. The prerequisite is
+  that CROSSOVER, i.e. a partial path for the top rel that makes a plain
+  Gather winnable; flipping C-19d's knob does not supply it.
+  Requirement (b) is now measured too, and it argues for a DIFFERENT SHAPE
+  than deletion: PG implements `debug_parallel_query` as a post-planning
+  Gather wrap in `standard_planner`
+  (`postgres/src/backend/optimizer/plan/planner.c:465-495`), so a
+  `debug_parallel_query`-gated post-pass is PG-FAITHFUL IN KIND and is what
+  a conditional retirement should become. Deleting it instead leaves the
+  GUC fully unconsumed (`computeParallelWorkers` is its only planner
+  consumer and is reachable only from the deleted `findPartialSubtree`;
+  `considerparallel.go` sizes with `computeParallelWorkerForRel`, which
+  does not read it) and removes the only forced-parallel construction path
+  for 68 call sites in 14 test files covering the executor's parallel
+  operators. Requirement (a) is not at issue: `StripGather` survived the
+  probe intact and is what the enforcement half is made of.
+  Double-Gather verification re-done on all three arms: exactly 1 per query,
+  none nested. `subtreeHasGather` untouched, and it keeps a live second
+  caller at `partialaggupper.go:92`.
+  The blocker is pinned as a test, not left in prose:
+  `TestPostPassOwnsTheNonAggregateGather` (`internal/optimizer/parallel_test.go`).
+  Sequencing now: make a plain base-rel Gather winnable in the path model
+  (C-19d's crossover) → re-probe the non-aggregate cohort against PG → then
+  either delete, or demote the pass to a `debug_parallel_query`-only force
+  pass, which is the PG-faithful end state.
   *design: take3 08 §8; gate: take3 09 §5 P5 — plan-parity both suites,
   parallel and serial arms.*
   (Serial control arm unchanged throughout C-19a–h. Ordering trap already
@@ -2557,6 +2605,39 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   dense byte arena plus an allocation-free encoder, since packing every
   build row while deforming only matches costs +39% allocations.
   Original blocker text follows.
+  **RE-TESTED 2026-09-07 after C-19g landed, and the blocker STILL BINDS —
+  with its mechanism narrowed** (evidence
+  `analysis/planner-refactor-take3/c19h-census-rerun-20260907/` §5).
+  The hypothesis was that with the Gather produced by a PATH rather than by
+  the `MaybeAddGather` post-pass, a cost change that previously destroyed it
+  might no longer do so. It does. C-19g moved the aggregate Gather's
+  PRODUCER into the search but not its ELIGIBILITY PREDICATE, which is still
+  the same `drivingScan` with the same `hashJoinIsPartialCapable` /
+  `JoinAlgoHash` requirement (`partialaggupper.go:92` calls it). Measured at
+  the engine defaults on a private SF=1 clone, with `partialaggupper` live:
+
+  ```
+  select l_returnflag, sum(l_extendedprice) from lineitem
+    join orders on l_orderkey = o_orderkey
+    where o_orderdate < '1995-01-01' group by l_returnflag
+
+  HashAggregate
+    ->  Merge Join                     <- NO Gather anywhere
+          ->  Index Scan ... lineitem
+          ->  Index Scan ... orders
+  ```
+
+  An aggregate over a merge join still gets no Gather at all. And the
+  hash-vs-merge decision is made one level lower, at the JOIN rel, where the
+  default still has no partial path (`GOOPG_GATHER_PATHS` off), so the
+  comparison that MAKES the choice still cannot see the parallelism it
+  destroys. The statement to carry forward is therefore no longer "goopg's
+  cost model has no parallel dimension" but **"the parallel dimension reaches
+  only the aggregate upper rel, one level above where the hash-vs-merge
+  choice is made"** — which is the same trap with a smaller radius.
+  Unblocking condition, unchanged in kind and now precise: a partial JOIN
+  path admitted at the default, i.e. C-19d/C-19f's crossover — the same
+  prerequisite C-19h's third blocker names.
   **D-05 (original).**
   Serial and parallel in one commit, `hashsize` model re-derived in the
   same commit. The load-bearing EX1 dependency for hash-join geometry is
