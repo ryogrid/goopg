@@ -1346,6 +1346,21 @@ func (o *sortOp) Close() error {
 	ctx := o.ctx
 	o.rows = nil
 	o.ctids = nil
+	// E-01 (§5): Close must leave no per-Open state. keyvals outliving
+	// rows silently mis-keys a second Open's tail merge (positional
+	// lookup) and trips the sortChunk lessRows fallback; a surviving
+	// mergeReady skips initMerge with heap nil (nil dereference in
+	// popMerge); a surviving sortErr fails the next Open outright; a
+	// surviving ctidsDisabled permanently drops the TID side-channel.
+	// Latent at HEAD (no Sort rescan path exists) but squarely this
+	// row's silent wrong-answer class — three lines in the function
+	// E-01 owns. peakBytes is additionally reset in Open (EX0-03c);
+	// clearing it here too makes Close total.
+	o.keyvals = nil
+	o.mergeReady = false
+	o.sortErr = nil
+	o.ctidsDisabled = false
+	o.peakBytes = 0
 	o.idx = 0
 	o.ctx = nil
 	if o.heap != nil {
