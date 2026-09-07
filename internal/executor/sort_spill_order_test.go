@@ -271,7 +271,23 @@ func TestSortCTIDFollowsOwnRow(t *testing.T) {
 	}
 }
 
-// TestSortCloseOpenRescanOrderedTwice (§6.2): the Close+Open rescan contract
+// TestSortChunkLimitSourcesWorkMem (§6.3): the spill threshold is the
+// number the planner prices — ctx.WorkMem (session work_mem in bytes)
+// when set, today's constant when unset, explicit override first always.
+func TestSortChunkLimitSourcesWorkMem(t *testing.T) {
+	s := &sortOp{}
+	if got := s.chunkLimit(); got != sortChunkBytes {
+		t.Fatalf("unset: chunkLimit = %d, want sortChunkBytes %d", got, sortChunkBytes)
+	}
+	s.ctx = &Context{WorkMem: 64 << 20}
+	if got := s.chunkLimit(); got != 64<<20 {
+		t.Fatalf("WorkMem set: chunkLimit = %d, want %d", got, 64<<20)
+	}
+	s.chunkLimitBytes = 1024
+	if got := s.chunkLimit(); got != 1024 {
+		t.Fatalf("override: chunkLimit = %d, want 1024", got)
+	}
+}
 // — Close, re-Open, and drain the IDENTICAL ordered sequence a second time,
 // in-memory and spilling. Pre-(E) the spilling arm fails: mergeReady
 // survives Close while heap is nil, so the second Open skips initMerge and

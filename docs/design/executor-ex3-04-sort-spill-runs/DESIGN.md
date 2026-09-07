@@ -344,4 +344,37 @@ No correction to the verdict or the landing order.
 
 ## 10. Measurement record
 
-*(pending — §4.1 census at HEAD, §4.2 constructed witness)*
+### 10.1 §4.1 census — HEAD (`7d86f172a` + (D)(E)), 2026-09-07
+
+Instrument: `EXPLAIN (ANALYZE)` over every query, reading the `Sort
+Method:` line `publishSortStat` emits. Private clones (TPC-H SF=1
+`/tmp/e01-census-tpch` :5541, TPC-DS SF0.5 `/tmp/e01-census-ds05` :5542),
+own cgroup units, binary `tmp/goopg-e01`. TPC-H ran S-cold-equivalent
+(no ANALYZE stats — HammerDB's ANALYZE fails and per-DB ANALYZE errors,
+so this matches the S-cold gate regime); TPC-DS likewise stat-less, with
+the inherited WITH-stats census as the upper bound.
+
+- **TPC-H SF=1, all 22:** every sort `quicksort`, 0 spilled. Max
+  footprint **Q10 10,379 kB**; next Q16 3,945 kB, Q3 2,141 kB; Q6/Q14
+  sort nothing (no Sort node). Max = 16 % of `work_mem` (64 MB).
+- **TPC-DS SF0.5, re-measured maxima:** Q47 12,553 kB, Q59 12,482 kB,
+  Q51 7,362 kB, Q57 6,146 kB, Q14 4,916 kB, Q22 3,223 kB — every one
+  `quicksort`, 0 spilled. Inherited WITH-stats census
+  (`c13a-limit-sort-census-20260906`, goopg `00688e96c`, pre-narrowing)
+  put the max at **Q1 26,210 kB**; narrowing only shrinks rows, so that
+  stays the upper bound. Max = 40 % of `work_mem`.
+- **Decision-rule outcome:** no query on either corpus lands in the
+  64 MB–256 MiB band, so (B) changes no corpus plan's behaviour and no
+  timing claim is made for it. (B) lands as a faithfulness/consistency
+  change (planner prices `work_mem`; executor now spills at it) with a
+  `changed=0` plan pin and the values suites as the gate. (C) bounded
+  fan-in is unreachable without (B) changing behaviour first —
+  **ledgered, not attempted** (ledger `take3-E-01-fanin-deferred`).
+
+### 10.2 §4.2 constructed witness — LANDED as (D)
+
+`sort_spill_order_test.go`: 10-arm ordering matrix (4 single-key NULLS
+placements + mixed multikey, each in-mem and ≥8-run spilling) against
+the independent `spillOracleLess`, plus multiset-equality on every arm,
+`TestSortCTIDFollowsOwnRow`, and the Close+Open rescan test that caught
+§5's nil-heap panic pre-fix. All green with (D)+(E).

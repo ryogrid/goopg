@@ -901,6 +901,16 @@ func (o *sortOp) chunkLimit() int64 {
 	if o.chunkLimitBytes > 0 {
 		return o.chunkLimitBytes
 	}
+	// E-01 (B): the spill threshold is the number the planner prices.
+	// costSortRun charges disk-sort I/O against cp.workMem
+	// (cost_funcs.go:306-327), so an executor that spills at a
+	// different constant prices plans for an event that cannot occur
+	// (at bench settings a 4x band: 64 MB priced vs 256 MiB acted on).
+	// ctx.WorkMem carries session work_mem in bytes (0 = unset);
+	// explicit test override still wins, unset keeps today's constant.
+	if o.ctx != nil && o.ctx.WorkMem > 0 {
+		return o.ctx.WorkMem
+	}
 	return sortChunkBytes
 }
 
