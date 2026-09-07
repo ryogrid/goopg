@@ -76,20 +76,29 @@ package optimizer
 // and `GOOPG_PGSHAPED_DP` defaults ON, so the header's former claim that
 // "nothing READS the result yet" is false.
 //
-// What was still off until take2 P0-13 is the narrower thing —
-// `pgShapedCollapse` (`GOOPG_PGSHAPED_COLLAPSE`, `=0` opts out, default on
-// since P0-13) gates only explicit INNER JOIN FLATTENING. With it on, an
-// explicit JOIN chain flattens into the enclosing search problem instead of
-// entering as one opaque item. Do not read the pre-flip history ("the
-// collapse flag is off") as "this file cannot move a plan".
+// Explicit INNER JOIN FLATTENING — an explicit JOIN chain entering the
+// enclosing search problem instead of arriving as one opaque item — used to sit
+// behind its own switch, `GOOPG_PGSHAPED_COLLAPSE`, default ON since take2
+// P0-13. **take3 C-06 retired the flag (2026-09-07)**: flattening is now
+// unconditional and the `=0` regime is gone. Do not read the pre-flip history
+// ("the collapse flag is off") as "this file cannot move a plan".
+//
+// The retirement was a decision rather than a gate pass, and the record should
+// say so: the item's literal bar was a byte-identical flip, and the flip is NOT
+// byte-identical — TPC-H Q13 differs between the arms. What changed is which
+// arm deserves to survive. C-06s taught the search PG's `JOIN_RIGHT`, and after
+// it the flattened (ON) arm is the PG-parity plan — `Hash Right Join` with
+// `Hash Cond: (orders.o_custkey = customer.c_custkey)` over an
+// `Index Only Scan using customer_pk`, matching `bench/tpch/plans-pg/Q13.txt` —
+// and the faster one (best-of-3 4.49 s vs 5.82 s, rows identical). The `=0` arm
+// held a plan that was neither. Evidence:
+// `analysis/planner-refactor-take3/c06-flip-remeasure-20260907/README.md`.
 //
 // The pass is pure, allocation-light and cannot fail — it has no error return
 // because there is no malformed FROM clause it could reject that the parser
 // would have accepted.
 
 import (
-	"os"
-
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -130,34 +139,6 @@ func defaultCollapseLimits() collapseLimits {
 		joinCollapseLimit: defaultJoinCollapseLimit,
 	}
 }
-
-// pgShapedCollapse gates explicit INNER JOIN flattening, and it is a SEPARATE
-// flag from `GOOPG_PGSHAPED_DP` because 08 §2 soaks the two changes
-// independently: the enumerator changes which of the orders goopg already
-// considers wins, while collapse changes WHICH ORDERS EXIST — a query written
-// `FROM a JOIN b ON … JOIN c ON …` has never been reordered by goopg at all.
-// Turning both on at once would leave a plan change with two possible causes.
-//
-// OFF (the default) reproduces today's behaviour exactly: an explicit JOIN node
-// forces its own order, so a JOIN chain enters the search as one opaque item.
-// Note what the flag does NOT touch — a flat comma-FROM list is one search
-// problem either way, because that collapse is unconditional in upstream too.
-//
-// Read once at process start, like `pgShapedDP`, so a plan cannot change shape
-// mid-statement.
-var pgShapedCollapse = pgShapedCollapseFromEnv(os.Getenv("GOOPG_PGSHAPED_COLLAPSE"))
-
-// pgShapedCollapseFromEnv is the flag's polarity, factored out so the
-// provenance table (flaglabels.go) can render the unset default from the same
-// function production resolves it with — mirrors pgShapedDPFromEnv.
-// Default ON since take2 P0-13: the positive-control gate (TPC-H changed=0,
-// exactly TPC-DS {Q72,Q75} moved) cleared it; `=0` opts back out.
-func pgShapedCollapseFromEnv(v string) bool { return v != "0" }
-
-// pgShapedCollapseEnabled reports whether explicit INNER JOIN chains flatten
-// into the enclosing search problem. Exposed as a function so the flag keeps a
-// single read site.
-func pgShapedCollapseEnabled() bool { return pgShapedCollapse }
 
 // joinlistItem is one member of a joinlist: upstream's `RangeTblRef` (a leaf
 // FROM item) or `List` (a sub-joinlist to be planned as its own subproblem),
@@ -244,9 +225,9 @@ func (it joinlistItem) pinnedOuter() bool {
 //
 //   - `pinnedOuter` is the SPINE walk's question ("is this item's order
 //     forced?"), and a pinned LEFT item's order still is. It stays true, so a
-//     LEFT link that pins anyway — the `GOOPG_PGSHAPED_COLLAPSE=0` regime, or
-//     one sitting over a FULL pin (`pinnedOverAPinnedSide`) — is peeled
-//     exactly as before rather than falling out of both mechanisms at once.
+//     LEFT link that pins anyway — one sitting over a FULL pin
+//     (`pinnedOverAPinnedSide`) — is peeled exactly as before rather than
+//     falling out of both mechanisms at once.
 //   - this is `makeRelFromJoinlist`'s question ("would handing it to the
 //     search emit an inner join where the statement wrote an outer one?").
 //     For LEFT the answer is now NO: `join_is_legal` matches the link's
@@ -352,10 +333,6 @@ func (jl joinlist) innerPrefixBelowOuterSpine() (prefix joinlist, spine []parser
 // `deconstruct_recurse` on the query's top `FromExpr` (initsplan.c:1190-1248),
 // whose `fromlist` is goopg's comma-separated `[]parser.FromExpr`.
 //
-// `collapseJoins` is `pgShapedCollapseEnabled()` at the production call site and
-// an explicit argument here so the two regimes are testable without touching
-// process state.
-//
 // The merge rule is upstream's verbatim, and both halves of it matter:
 //
 //	if (sub_members <= 1 ||
@@ -365,8 +342,8 @@ func (jl joinlist) innerPrefixBelowOuterSpine() (prefix joinlist, spine []parser
 // `remaining` term is why the decision is made against the joinlist's FINAL
 // width rather than its width so far, so the outcome does not depend on which
 // item happens to be processed first.
-func deconstructJointree(from []parser.FromExpr, lim collapseLimits, collapseJoins bool) joinlist {
-	return deconstructJointreeScoped(from, lim, collapseJoins, nil)
+func deconstructJointree(from []parser.FromExpr, lim collapseLimits) joinlist {
+	return deconstructJointreeScoped(from, lim, nil)
 }
 
 // deconstructJointreeScoped is deconstructJointree with C-01 P3-01's
@@ -376,8 +353,8 @@ func deconstructJointree(from []parser.FromExpr, lim collapseLimits, collapseJoi
 // root->join_info_list, which make_outerjoininfo scans for ordering
 // restrictions (initsplan.c:1823); disjoint comma items never overlap so they
 // contribute nothing to each other's scans.
-func deconstructJointreeScoped(from []parser.FromExpr, lim collapseLimits, collapseJoins bool, sc *sjiScope) joinlist {
-	jl, _ := deconstructJointreeScopedSJI(from, lim, collapseJoins, sc)
+func deconstructJointreeScoped(from []parser.FromExpr, lim collapseLimits, sc *sjiScope) joinlist {
+	jl, _ := deconstructJointreeScopedSJI(from, lim, sc)
 	return jl
 }
 
@@ -398,13 +375,13 @@ func deconstructJointreeScoped(from []parser.FromExpr, lim collapseLimits, colla
 // The order is bottom-up across the whole FROM clause — `lower` is threaded
 // through every item — which is the order `join_is_legal`'s commutativity scan
 // depends on and the order `collectSpecialJoinInfos` produced.
-func deconstructJointreeScopedSJI(from []parser.FromExpr, lim collapseLimits, collapseJoins bool, sc *sjiScope) (joinlist, []*SpecialJoinInfo) {
+func deconstructJointreeScopedSJI(from []parser.FromExpr, lim collapseLimits, sc *sjiScope) (joinlist, []*SpecialJoinInfo) {
 	var jl joinlist
 	remaining := len(from)
 	nextRel := 0
 	var lower []*SpecialJoinInfo
 	for i := range from {
-		sub, made := deconstructFromItemScoped(from[i], nextRel, lim, collapseJoins, sc, i, lower)
+		sub, made := deconstructFromItemScoped(from[i], nextRel, lim, sc, i, lower)
 		lower = append(lower, made...)
 		nextRel += fromItemRels(from[i])
 		subMembers := len(sub)
@@ -457,8 +434,8 @@ func fromItemRels(item parser.FromExpr) int { return 1 + len(item.Joins) }
 // through `combineJoinlists`, which is written for the general two-sided case,
 // so a future grammar that nests joins needs no change here beyond the
 // recursion.
-func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits, collapseJoins bool) joinlist {
-	jl, _ := deconstructFromItemScoped(item, firstRel, lim, collapseJoins, nil, 0, nil)
+func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits) joinlist {
+	jl, _ := deconstructFromItemScoped(item, firstRel, lim, nil, 0, nil)
 	return jl
 }
 
@@ -467,14 +444,14 @@ func deconstructFromItem(item parser.FromExpr, firstRel int, lim collapseLimits,
 // in bottom-up order, so the caller can extend the lower list PG's
 // commutativity scan reads. lower holds the SJIs built for earlier joins of
 // this item and earlier comma items.
-func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseLimits, collapseJoins bool, sc *sjiScope, itemIdx int, lower []*SpecialJoinInfo) (joinlist, []*SpecialJoinInfo) {
+func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseLimits, sc *sjiScope, itemIdx int, lower []*SpecialJoinInfo) (joinlist, []*SpecialJoinInfo) {
 	left := joinlist{leafItem(firstRel)}
 	next := firstRel + 1
 	var made []*SpecialJoinInfo
 	for _, j := range item.Joins {
 		right := joinlist{leafItem(next)}
 		next++
-		pinned := joinPinned(j.Type, collapseJoins) || pinnedOverAPinnedSide(j.Type, left)
+		pinned := joinPinned(j.Type) || pinnedOverAPinnedSide(j.Type, left)
 		// The left joinlist as it stands BEFORE this link folds it in — the
 		// SpecialJoinInfo's syntactic LHS. Captured rather than recovered from
 		// the folded result (C-04a): when the link pins, `combineJoinlists`
@@ -516,18 +493,19 @@ func deconstructFromItemScoped(item parser.FromExpr, firstRel int, lim collapseL
 // lose the first of those.
 //
 // INNER and CROSS are the same case to upstream — `a CROSS JOIN b` parses as a
-// `JoinExpr` with `jointype = JOIN_INNER` and no quals — and are pinned only
-// while `GOOPG_PGSHAPED_COLLAPSE` is off.
+// `JoinExpr` with `jointype = JOIN_INNER` and no quals. They used to be pinned
+// while `GOOPG_PGSHAPED_COLLAPSE` was off; take3 C-06 retired that switch, so
+// they never pin.
 //
 // Relaxing a pin is only safe because the SpecialJoinInfo no longer rides on
 // the pinned ITEM for the purposes of `root->join_info_list`
 // (`deconstructJointreeScopedSJI`): the ordering constraint survives the
 // flattening, and `join_is_legal` still refuses every pairing that would
 // reorder across the outer join.
-func joinPinned(t parser.JoinType, collapseJoins bool) bool {
+func joinPinned(t parser.JoinType) bool {
 	switch t {
 	case parser.JoinInner, parser.JoinCross, parser.JoinLeft, parser.JoinRight:
-		return !collapseJoins
+		return false
 	default:
 		return true
 	}
@@ -547,8 +525,8 @@ func joinPinned(t parser.JoinType, collapseJoins bool) bool {
 // `[LEFT, FULL]` is peeled exactly as it was before C-04a. (Before C-04b the
 // pinned side was typically a RIGHT link; RIGHT is collapse-dependent now, so
 // a LEFT-over-RIGHT spine is ONE flattened problem and this guard no longer
-// sees it — only a FULL, or any outer pin under `GOOPG_PGSHAPED_COLLAPSE=0`,
-// where every link pins anyway.)
+// sees it — since C-06 retired `GOOPG_PGSHAPED_COLLAPSE` the only pin left for
+// it to sit over is a FULL.)
 //
 // It fires only when the left side is a single pinned outer item, so a LEFT
 // or RIGHT link over a flattened INNER chain — the Q72 shape C-04a exists for

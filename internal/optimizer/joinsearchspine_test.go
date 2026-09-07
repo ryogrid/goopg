@@ -82,7 +82,7 @@ func seamChainFromSQLWrapped(t *testing.T, names []string, rows []int64, from st
 	// so a fixture that built only the joinlist would make every LEFT test
 	// pass by declining.
 	ctx.joinlist, ctx.joinInfoList = deconstructJointreeScopedSJI(
-		fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
+		fromExprs, defaultCollapseLimits(), nil)
 	return root, ctx
 }
 
@@ -145,7 +145,7 @@ func spinePlanJoinType(t *testing.T, pt parser.JoinType) JoinType {
 func TestJoinlistTagsAPinnedOuterJoinWithItsType(t *testing.T) {
 	jl := deconstructJointree(
 		parseFrom(t, "a JOIN b ON a.x = b.x FULL JOIN c ON b.x = c.x"),
-		defaultCollapseLimits(), true)
+		defaultCollapseLimits())
 
 	if len(jl) != 1 {
 		t.Fatalf("joinlist has %d items, want 1 (the FULL pin absorbs the chain)", len(jl))
@@ -171,7 +171,7 @@ func TestJoinlistTagsAPinnedOuterJoinWithItsType(t *testing.T) {
 	for _, spelling := range []string{"LEFT JOIN", "RIGHT JOIN"} {
 		flat := deconstructJointree(
 			parseFrom(t, "a JOIN b ON a.x = b.x "+spelling+" c ON b.x = c.x"),
-			defaultCollapseLimits(), true)
+			defaultCollapseLimits())
 		if len(flat) != 3 {
 			t.Fatalf("%s joinlist has %d items, want 3 — the link must flatten (C-04a/b)", spelling, len(flat))
 		}
@@ -191,7 +191,7 @@ func TestInnerPrefixIsTheIdentityWithoutAnOuterPin(t *testing.T) {
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x",
 	} {
 		t.Run(from, func(t *testing.T) {
-			jl := deconstructJointree(parseFrom(t, from), defaultCollapseLimits(), true)
+			jl := deconstructJointree(parseFrom(t, from), defaultCollapseLimits())
 			prefix, spine := jl.innerPrefixBelowOuterSpine()
 			if len(spine) != 0 {
 				t.Fatalf("spine = %v, want none: %q has no outer link", spine, from)

@@ -2875,7 +2875,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// pin has no item to carry one, and losing its ordering constraint would
 	// let the search reorder across the outer join. See
 	// `deconstructJointreeScopedSJI`.
-	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(s.FromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), newSjiScope(s.FromExprs, cat))
+	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(s.FromExprs, defaultCollapseLimits(), newSjiScope(s.FromExprs, cat))
 	return root, rctx, nil
 }
 

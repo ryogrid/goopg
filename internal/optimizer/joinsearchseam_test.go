@@ -211,7 +211,7 @@ func seamInnerChain(t *testing.T, names []string, rows []int64) (Node, *resolveC
 		schema: appendSchema(lower.Output(), c.Output()), Predicate: rfjEq(names, 1, 2)}
 	ctx.joinlist = deconstructJointree(
 		parseFrom(t, "a JOIN b ON a.a0 = b.b0 JOIN c ON b.b0 = c.c0"),
-		defaultCollapseLimits(), pgShapedCollapseEnabled())
+		defaultCollapseLimits())
 	return root, ctx
 }
 

@@ -824,8 +824,70 @@ rule).*
   file, gated together): TPC-H 24/24 by values, same-session A/B −0.7%;
   TPC-DS SF0.5 PASS=95 all-zero, shapes 99/99, verdict-changes=none;
   plan-gate 22/22 both modes, pin `c05-c04b-20260907`.
-- [!] **C-06 P3-05 retire `GOOPG_PGSHAPED_COLLAPSE` — BLOCKED 2026-09-07 on
-  its own byte-identical gate; nothing deleted.** Two `estimate-audit
+- [x] **C-06 P3-05 retire `GOOPG_PGSHAPED_COLLAPSE` — LANDED 2026-09-07.
+  A DECISION, NOT A GATE PASS: the byte-identical gate did NOT go green, and
+  the flag was retired anyway.** Say that plainly rather than reading the
+  green gates below as the item's own bar. The bar was "byte-identical plans
+  for the flip"; the flip still moves TPC-H Q13, and only Q13 (the other 21
+  queries are byte-identical). What changed today is WHICH ARM DESERVES TO
+  SURVIVE. C-06s (`922a3f444`) taught the search PG's `JOIN_RIGHT`, and after
+  it the shipped ON arm is the PG-parity plan — `Hash Right Join`,
+  `Hash Cond: (orders.o_custkey = customer.c_custkey)`,
+  `Index Only Scan using customer_pk`, cost 124,999, matching
+  `bench/tpch/plans-pg/Q13.txt` line for line — and also the faster one
+  (best-of-3 4.49 s vs 5.82 s; median 4.78 vs 6.66; rows identical at 34).
+  The OFF arm's `Hash Left Join` at 60,308 is neither. Re-measurement:
+  `analysis/planner-refactor-take3/c06-flip-remeasure-20260907/README.md`.
+  The costs are still not comparable across arms — on the OFF arm the join
+  never enters the search and is priced by the plan-tree estimator, which is
+  why the higher printed cost is the faster plan.
+  **Contrast with C-20f, which kept `GOOPG_NLI_COSTGATE` and is not
+  contradicted here**: there the OFF arm is 11.4x slower and the hatch buys
+  escape from a misfiring cost gate on unseen data. `GOOPG_PGSHAPED_COLLAPSE`
+  selected a legacy jointree path C-04 exists to make unnecessary, and its
+  OFF plan is now strictly worse rather than a useful escape.
+  **Deleted**: `pgShapedCollapse`, `pgShapedCollapseFromEnv`,
+  `pgShapedCollapseEnabled`, and the `collapseJoins` parameter threaded
+  through `deconstructJointree` / `…Scoped` / `…ScopedSJI` /
+  `deconstructFromItem` / `…Scoped` / `joinPinned` (collapse.go); the
+  production read at planner.go; the `COLLAPSE` knob and its
+  `export GOOPG_PGSHAPED_COLLAPSE=0` default in `scripts/tpch-acceptance-arm.sh`
+  and `scripts/tpch-estimate-audit-arm.sh` (both were exporting `=0`, so the
+  export had to go rather than become silently inert). `flaglabels.go` moves
+  the row to `flagProvenanceRetired` (`retired(take3-C-06)`) rather than
+  dropping it, and `scripts/planner-flags.env` is regenerated.
+  **Test coverage was re-homed, not dropped.** `TestCollapseFlagOffPinsExplicitJoins`
+  was ABOUT the `=0` regime: its three OFF assertions are deleted with the
+  regime and its ON half survives as `TestExplicitInnerJoinsFlatten`; the
+  pinned shape it asserted is still asserted, on FULL, by
+  `TestOuterJoinsStayPinned`. `collapse_corpus_test.go`'s eligibility
+  instrument was a flag DIFF and is re-based on the question that outlives the
+  flag — which corpus queries have an explicit JOIN whose order the search
+  chooses — with both pinned sets re-measured under the new predicate: TPC-H
+  `{}` -> `{13}` (Q13 is exactly the query the retirement could move, and did)
+  and TPC-DS `{40,49,72,75,78,80,93}` -> `{5,40,49,72,75,77,78,80,93}` (the
+  two additions are two-way joins the old two-armed predicate could not see,
+  because upstream unwraps a one-element side). `TestCollapseReachesTheSearch`
+  and the provenance/relfromjoinlist loops lose their second arm only.
+  **Gate status:** units `RALPH_PRECOMMIT_SCOPE=units` exit 0 — DONE.
+  `go vet ./...` clean for the change (the one warning is pre-existing in
+  `cmd/goopg/main.go`, untouched) — DONE. Plan pin
+  `c20a-c06s-plancost-rows-20260907` **22/22 in `structural` AND `MODE=costs`**
+  — DONE, and note the A/A that made it readable: the main checkout carries a
+  peer's live `considerparallel.go` / gather-paths WIP, and a binary built from
+  it diverged on Q7/Q8/Q9/Q16 while HEAD was 22/22 on the same clone; the
+  22/22 above is from a binary built in a HEAD worktree carrying THIS change
+  only. TPC-H acceptance **24/24 MATCH by values** against a HEAD-binary arm on
+  the same private clone — DONE. Q13 after the change: best-of-3 **4.69 s**
+  (5.04 median, rows 34), plan verified as the `Hash Right Join` /
+  `Index Only Scan using customer_pk` shape at cost 124,999 — DONE.
+  TPC-DS SF0.5 **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4**
+  (`sweep-20260907-143017.txt`, engine-binary `a163dfaf2029b2ce` = the
+  this-change-only build; the gate cannot be isolated, so it was serialised
+  behind two peer sweeps) — DONE.
+  *design: take3 08 §6.3; gate: take3 09 §5 P3.*
+  **HISTORY — the blocked state this row was in until today, kept because the
+  reasoning is what the re-measurement overturned:** two `estimate-audit
   -plan-only` captures on one cluster, one per flag value: the flip is NOT
   plan-neutral. TPC-H **Q13 moves, and the OFF plan is the PG-parity one** —
   `Index Only Scan using customer_pk` + `Hash Left Join` (cost 66,218) vs the

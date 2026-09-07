@@ -33,8 +33,9 @@ package optimizer
 // `JoinTypeCross` and nothing else, so an explicit JOIN arrived as ONE node for
 // N bindings, the leaf count disagreed with the binding count, and the seam
 // declined the whole statement before `ctx.joinlist` was ever consulted — with
-// `GOOPG_PGSHAPED_COLLAPSE` on OR off, which is why the collapse flip was
-// measured as a no-go about a flag that could not move a plan (09 §3.18).
+// the (now retired, take3 C-06) `GOOPG_PGSHAPED_COLLAPSE` on OR off, which is
+// why the collapse flip was measured as a no-go about a flag that could not
+// move a plan (09 §3.18).
 // Upstream has no such restriction: `deconstruct_recurse` (initsplan.c:1250)
 // walks the `JoinExpr` chain and `distribute_qual_to_rels` puts each `ON` qual
 // into the enclosing problem's clause list, which is exactly what the walk's
@@ -64,8 +65,8 @@ package optimizer
 // reduces to) enter the flattened chain as LINKS of the search problem, and
 // C-04c removed the last positional restriction — a link below an INNER one,
 // or on a non-first comma FROM item, is admitted by the same per-link
-// machinery. `splitOuterSpine` still exists for what remains pinned (FULL, and
-// every outer link under `GOOPG_PGSHAPED_COLLAPSE=0`).
+// machinery. `splitOuterSpine` still exists for what remains pinned — since
+// C-06 retired `GOOPG_PGSHAPED_COLLAPSE`, that is FULL and nothing else.
 //
 // Four shapes are declined and each decline is a correctness statement, not a
 // tuning knob:
@@ -122,12 +123,13 @@ package optimizer
 //     (03 §6.2), so a disagreement means the caller's map is not the map the
 //     search would use.
 //
-// What the joinlist does with an admitted chain is the collapse flag's
-// business, not this walk's: with `GOOPG_PGSHAPED_COLLAPSE` off every INNER
-// `JoinExpr` is still pinned into its own two-member subproblem
-// (`joinPinned`, collapse.go), so the written order survives and only the PATHS
-// are chosen; with it on the chain flattens into one problem and the order is
-// searched. Both regimes now reach the search, which is what makes 03 §6's
+// What the joinlist does with an admitted chain is the deconstruction's
+// business, not this walk's: an INNER `JoinExpr` chain flattens into one
+// problem and its order is searched (`joinPinned`, collapse.go). Until take3
+// C-06 retired `GOOPG_PGSHAPED_COLLAPSE` the flag could instead pin each INNER
+// link into its own two-member subproblem, so the written order survived and
+// only the PATHS were chosen. Both regimes reached the search, which is what
+// makes 03 §6's
 // collapse pass a decidable question instead of a dead one.
 //
 // ## 2. Which conjuncts the search consumed

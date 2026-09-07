@@ -3,13 +3,13 @@ package optimizer
 // M0127-P5.8 — the collapse pass (collapse.go, 03 §6).
 //
 // `resolveContext.joinlist` IS read in production since M0127-P5.9
-// (2026-08-06) — `tryPGShapedJoinSearch` consults it — so only the narrower
-// `GOOPG_PGSHAPED_COLLAPSE` arm (explicit INNER JOIN flattening) is still off
-// by default. These tests are therefore no longer the whole specification,
-// though they remain the whole specification of the flattening arm. They are
-// written against the PG behaviours the file claims to
-// port, not against the implementation's shape: each names the upstream line it
-// pins.
+// (2026-08-06) — `tryPGShapedJoinSearch` consults it — and explicit INNER JOIN
+// flattening, which had its own switch `GOOPG_PGSHAPED_COLLAPSE`, is
+// unconditional since take3 C-06 retired that switch (2026-09-07). These tests
+// are therefore no longer the whole specification, though they remain the whole
+// specification of the flattening rule. They are written against the PG
+// behaviours the file claims to port, not against the implementation's shape:
+// each names the upstream line it pins.
 //
 // The acceptance test is `TestFlatCommaListIsOneProblemAtAnyWidth` — the
 // property whose violation would re-introduce the greedy pre-reorder for wide
@@ -70,12 +70,12 @@ func parseFrom(t *testing.T, from string) []parser.FromExpr {
 	return sel.FromExprs
 }
 
-func checkJoinlist(t *testing.T, from string, lim collapseLimits, collapseJoins bool, want string) {
+func checkJoinlist(t *testing.T, from string, lim collapseLimits, want string) {
 	t.Helper()
-	got := fmtJoinlist(deconstructJointree(parseFrom(t, from), lim, collapseJoins))
+	got := fmtJoinlist(deconstructJointree(parseFrom(t, from), lim))
 	if got != want {
-		t.Errorf("FROM %s (from=%d join=%d collapse=%v):\n  got  %s\n  want %s",
-			from, lim.fromCollapseLimit, lim.joinCollapseLimit, collapseJoins, got, want)
+		t.Errorf("FROM %s (from=%d join=%d):\n  got  %s\n  want %s",
+			from, lim.fromCollapseLimit, lim.joinCollapseLimit, got, want)
 	}
 }
 
@@ -97,15 +97,13 @@ func TestFlatCommaListIsOneProblemAtAnyWidth(t *testing.T) {
 		}
 		from := strings.Join(names, ", ")
 		wantStr := "[" + strings.Join(want, " ") + "]"
-		// Both regimes, and the tightest limits the GUCs admit (MinVal 1):
-		// none of the four may split a flat comma list.
+		// The tightest limits the GUCs admit (MinVal 1) as well as the
+		// defaults: neither may split a flat comma list.
 		for _, lim := range []collapseLimits{
 			defaultCollapseLimits(),
 			{fromCollapseLimit: 1, joinCollapseLimit: 1},
 		} {
-			for _, collapse := range []bool{false, true} {
-				checkJoinlist(t, from, lim, collapse, wantStr)
-			}
+			checkJoinlist(t, from, lim, wantStr)
 		}
 		// The JOIN-free parse shape takes the other entry point and must
 		// agree.
@@ -116,7 +114,7 @@ func TestFlatCommaListIsOneProblemAtAnyWidth(t *testing.T) {
 }
 
 // TestJoinCollapseLimitGovernsExplicitJoins pins the `JoinExpr` tail
-// (initsplan.c:1410-1441) with collapse ON: an inner JOIN chain folds into one
+// (initsplan.c:1410-1441): an inner JOIN chain folds into one
 // problem while the two sides fit `join_collapse_limit`, and splits into two
 // subproblems when they do not.
 func TestJoinCollapseLimitGovernsExplicitJoins(t *testing.T) {
@@ -143,7 +141,7 @@ func TestJoinCollapseLimitGovernsExplicitJoins(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			lim := collapseLimits{fromCollapseLimit: defaultFromCollapseLimit, joinCollapseLimit: tc.limit}
-			checkJoinlist(t, tc.from, lim, true, tc.want)
+			checkJoinlist(t, tc.from, lim, tc.want)
 		})
 	}
 }
@@ -156,66 +154,68 @@ func TestJoinCollapseLimitGovernsExplicitJoins(t *testing.T) {
 func TestJoinCollapseLimitOnePinsSyntacticOrder(t *testing.T) {
 	lim := collapseLimits{fromCollapseLimit: defaultFromCollapseLimit, joinCollapseLimit: 1}
 	// Two-way: both members stay at top level, so =1 constrains nothing.
-	checkJoinlist(t, "a JOIN b ON a.x = b.x", lim, true, "[0 1]")
+	checkJoinlist(t, "a JOIN b ON a.x = b.x", lim, "[0 1]")
 	// Three-way: a⋈b must be built before c joins it.
-	checkJoinlist(t, "a JOIN b ON a.x = b.x JOIN c ON b.x = c.x", lim, true, "[[0 1] 2]")
+	checkJoinlist(t, "a JOIN b ON a.x = b.x JOIN c ON b.x = c.x", lim, "[[0 1] 2]")
 	// Four-way: fully left-deep in syntactic order.
 	checkJoinlist(t, "a JOIN b ON a.x = b.x JOIN c ON b.x = c.x JOIN d ON c.x = d.x",
-		lim, true, "[[[0 1] 2] 3]")
+		lim, "[[[0 1] 2] 3]")
 }
 
-// TestCollapseFlagOffPinsExplicitJoins pins the sub-flag's OFF semantics
-// (08 §2): today's behaviour, in which an explicit JOIN is never reordered, so
-// the chain enters the enclosing problem as one opaque item — the same shape
-// upstream gives a FULL JOIN (initsplan.c:1414-1418).
+// TestExplicitInnerJoinsFlatten pins the flattening rule that
+// `GOOPG_PGSHAPED_COLLAPSE` used to gate and take3 C-06 made unconditional: an
+// explicit INNER JOIN offers its sides to the enclosing problem rather than
+// entering it as one opaque item.
 //
-// Note the flat-comma sibling is unaffected: `d` stays a first-class member.
-func TestCollapseFlagOffPinsExplicitJoins(t *testing.T) {
+// This test WAS `TestCollapseFlagOffPinsExplicitJoins`, whose subject was the
+// `=0` regime — `[[[0] [1]]]` for a two-way JOIN, the shape upstream gives only
+// a FULL JOIN (initsplan.c:1414-1418). That regime no longer exists, so those
+// three assertions are deleted rather than rewritten; the flag's ON assertions,
+// which were the second half of the same test, are what survives. The pinned
+// shape itself is still asserted, on the joins that still pin, by
+// `TestOuterJoinsStayPinned` below.
+//
+// Note the flat-comma sibling: `d` stays a first-class member.
+func TestExplicitInnerJoinsFlatten(t *testing.T) {
 	lim := defaultCollapseLimits()
-	checkJoinlist(t, "a JOIN b ON a.x = b.x", lim, false, "[[[0] [1]]]")
-	checkJoinlist(t, "a JOIN b ON a.x = b.x JOIN c ON b.x = c.x", lim, false, "[[[[[0] [1]]] [2]]]")
-	checkJoinlist(t, "a JOIN b ON a.x = b.x, d", lim, false, "[[[0] [1]] 2]")
-	// …and ON, the same two queries open up.
-	checkJoinlist(t, "a JOIN b ON a.x = b.x", lim, true, "[0 1]")
-	checkJoinlist(t, "a JOIN b ON a.x = b.x, d", lim, true, "[0 1 2]")
+	checkJoinlist(t, "a JOIN b ON a.x = b.x", lim, "[0 1]")
+	checkJoinlist(t, "a JOIN b ON a.x = b.x JOIN c ON b.x = c.x", lim, "[0 1 2]")
+	checkJoinlist(t, "a JOIN b ON a.x = b.x, d", lim, "[0 1 2]")
 }
 
 // TestOuterJoinsStayPinned pins which outer joins still take upstream's FULL
-// treatment — order forced at the node — regardless of the collapse flag.
+// treatment — order forced at the node.
 //
 // C-04a re-pinned this. 03 §4.4's "goopg has no join_is_legal constraint
 // inference" no longer holds: C-01 infers the SpecialJoinInfos and C-03b/c
 // build LEFT paths and plans from them, so LEFT is now collapse-dependent
 // exactly as INNER is. C-04b did the same for RIGHT (its SpecialJoinInfo is
 // the reduced LEFT one). FULL (ledgered, DESIGN §3.6) still pins
-// unconditionally, and FULL's tree-side safety RESTS on that.
+// unconditionally, and FULL's tree-side safety RESTS on that. Take3 C-06
+// retired `GOOPG_PGSHAPED_COLLAPSE`, so "still pins" now means FULL and only
+// FULL — the `=0` arms of the assertions below are deleted with the flag.
 func TestOuterJoinsStayPinned(t *testing.T) {
 	lim := defaultCollapseLimits()
-	for _, collapse := range []bool{false, true} {
-		checkJoinlist(t, "a FULL JOIN b ON a.x = b.x", lim, collapse, "[[[0] [1]]]")
-	}
-	// LEFT and RIGHT: pinned with the flag off, flattened with it on — the
-	// INNER rule.
+	checkJoinlist(t, "a FULL JOIN b ON a.x = b.x", lim, "[[[0] [1]]]")
+	// LEFT and RIGHT follow the INNER rule: they flatten.
 	for _, spelling := range []string{"LEFT JOIN", "RIGHT JOIN"} {
-		from := "a " + spelling + " b ON a.x = b.x"
-		checkJoinlist(t, from, lim, false, "[[[0] [1]]]")
-		checkJoinlist(t, from, lim, true, "[0 1]")
+		checkJoinlist(t, "a "+spelling+" b ON a.x = b.x", lim, "[0 1]")
 	}
 	// An INNER chain topped by a LEFT link is now ONE three-member problem —
 	// the C-04a payload, and the shape Q72 has.
 	checkJoinlist(t, "a JOIN b ON a.x = b.x LEFT JOIN c ON b.x = c.x",
-		lim, true, "[0 1 2]")
+		lim, "[0 1 2]")
 	// The same chain topped by a RIGHT link is ONE problem too (C-04b): the
 	// prefix is the link's nullable side, and the search is told so through
 	// the reduced SpecialJoinInfo rather than through a pin.
 	checkJoinlist(t, "a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x",
-		lim, true, "[0 1 2]")
+		lim, "[0 1 2]")
 	// A FULL link still pins from that node up.
 	checkJoinlist(t, "a JOIN b ON a.x = b.x FULL JOIN c ON b.x = c.x",
-		lim, true, "[[[0 1] [2]]]")
+		lim, "[[[0 1] [2]]]")
 	// CROSS JOIN is upstream's JOIN_INNER with no quals, so it collapses
 	// with the inner arm rather than pinning.
-	checkJoinlist(t, "a CROSS JOIN b", lim, true, "[0 1]")
+	checkJoinlist(t, "a CROSS JOIN b", lim, "[0 1]")
 }
 
 // TestFromCollapseLimitGovernsSubJoinlists pins initsplan.c:1233-1238's second
@@ -247,7 +247,7 @@ func TestFromCollapseLimitGovernsSubJoinlists(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(fmt.Sprintf("from_collapse_limit=%d", tc.limit), func(t *testing.T) {
 			lim := collapseLimits{fromCollapseLimit: tc.limit, joinCollapseLimit: defaultJoinCollapseLimit}
-			checkJoinlist(t, from, lim, true, tc.want)
+			checkJoinlist(t, from, lim, tc.want)
 		})
 	}
 }
@@ -259,7 +259,6 @@ func TestJoinlistCountsAndLeaves(t *testing.T) {
 	jl := deconstructJointree(
 		parseFrom(t, "a JOIN b ON a.x = b.x JOIN c ON b.x = c.x, d"),
 		collapseLimits{fromCollapseLimit: 8, joinCollapseLimit: 2},
-		true,
 	)
 	if got, want := fmtJoinlist(jl), "[[0 1] 2 3]"; got != want {
 		t.Fatalf("joinlist:\n  got  %s\n  want %s", got, want)
@@ -273,7 +272,7 @@ func TestJoinlistCountsAndLeaves(t *testing.T) {
 	// A pinned outer join is ONE joinlist member but still two relations —
 	// the distinction `nrels` exists to make. Spelled with FULL since C-04a:
 	// LEFT no longer pins (see TestOuterJoinsStayPinned).
-	pinned := deconstructJointree(parseFrom(t, "a FULL JOIN b ON a.x = b.x"), defaultCollapseLimits(), true)
+	pinned := deconstructJointree(parseFrom(t, "a FULL JOIN b ON a.x = b.x"), defaultCollapseLimits())
 	if len(pinned) != 1 {
 		t.Errorf("pinned outer join: %d members, want 1", len(pinned))
 	}

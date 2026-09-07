@@ -95,7 +95,7 @@ func TestEnumTraceAdmitsALeftLinkOnANonFirstCommaItem(t *testing.T) {
 		schema: appendSchema(a.Output(), item.Output())}
 	ctx.joinlist, ctx.joinInfoList = deconstructJointreeScopedSJI(
 		parseFrom(t, "a, b LEFT JOIN c ON b.b0 = c.c0"),
-		defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
+		defaultCollapseLimits(), nil)
 
 	lines, used := c04cTraceSeam(t, root, seamLocal(names, 0), ctx)
 	if !used {

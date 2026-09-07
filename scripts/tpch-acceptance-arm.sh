@@ -25,7 +25,9 @@
 #              both arms — an unset flag means whatever today's default is, and
 #              the arm stops being well-defined the day the default flips
 #              (the M0125-0031 lesson, transcribed).
-#   COLLAPSE   GOOPG_PGSHAPED_COLLAPSE (default 0)
+#              (COLLAPSE was GOOPG_PGSHAPED_COLLAPSE; take3 C-06 retired the
+#              flag and explicit-JOIN flattening is unconditional, so the
+#              knob is gone rather than silently inert.)
 #   QUERIES    comma-separated query numbers (default: all 22)
 #   PER_Q      per-query wall-clock budget in seconds (default 600)
 #   DIGEST     1 = pass -digest so the arms can be compared on values (default 1)
@@ -84,7 +86,6 @@ export GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"
 export GOOPG_MEM_HIGH="${GOOPG_MEM_HIGH:-20G}" GOOPG_MEM_MAX="${GOOPG_MEM_MAX:-24G}"
 export GOOPG_MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 export GOOPG_PGSHAPED_DP="${PGSHAPED:-0}"
-export GOOPG_PGSHAPED_COLLAPSE="${COLLAPSE:-0}"
 
 # --- pre-flight ------------------------------------------------------------
 # A foreign server on the port would be measured instead of ours, and then
@@ -144,7 +145,7 @@ runner_args=(-host "${PG_HOST}" -port "${PG_PORT}" -db tpch -user tpch -password
 [[ "${DIGEST}" == "1" ]] && runner_args+=(-digest)
 
 {
-    echo "# arm=${ARM} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP} GOOPG_PGSHAPED_COLLAPSE=${GOOPG_PGSHAPED_COLLAPSE}"
+    echo "# arm=${ARM} GOOPG_PGSHAPED_DP=${GOOPG_PGSHAPED_DP}"
     echo "# started $(date -Is)"
     echo "# engine-id: $(bench_engine_id)"
     echo "# engine-binary: on-disk=$(bench_engine_bin_sha "${GOOPG_BIN}") (${GOOPG_BIN#"${REPO_ROOT}/"})"

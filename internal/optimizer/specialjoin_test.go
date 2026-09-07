@@ -59,7 +59,7 @@ func sjCollect(t *testing.T, from string) string {
 	// walk of the joinlist's items — a LEFT join no longer pins, so it has no
 	// item to carry one and the walk would answer "(none)" for every LEFT
 	// fixture in this file. See `deconstructJointreeScopedSJI`.
-	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
+	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), nil)
 	if len(infos) == 0 {
 		return "(none)"
 	}
@@ -309,7 +309,7 @@ func TestSpecialJoinInfoFieldsAreSet(t *testing.T) {
 	// Verify that the SpecialJoinInfo fields match PG's expectations.
 	fromExprs := parseFrom(t, "a LEFT JOIN b ON a.x = b.x")
 	// C-04a: from the deconstruction, not the joinlist walk (see sjCollect).
-	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
+	_, infos := deconstructJointreeScopedSJI(fromExprs, defaultCollapseLimits(), nil)
 	if len(infos) != 1 {
 		t.Fatalf("expected 1 SpecialJoinInfo, got %d", len(infos))
 	}

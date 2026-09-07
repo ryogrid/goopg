@@ -50,7 +50,7 @@ func c04cBelowInner(t *testing.T, names []string, rows []int64, top Expr) (Node,
 		schema: appendSchema(lower.Output(), c.Output()), Predicate: top}
 	ctx.joinlist, ctx.joinInfoList = deconstructJointreeScopedSJI(
 		parseFrom(t, "a LEFT JOIN b ON a.a0 = b.b0 JOIN c ON a.a0 = c.c0"),
-		defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
+		defaultCollapseLimits(), nil)
 	return root, ctx
 }
 
@@ -158,7 +158,7 @@ func TestSeamPlansALeftLinkOnANonFirstCommaItem(t *testing.T) {
 		schema: appendSchema(a.Output(), item.Output())}
 	ctx.joinlist, ctx.joinInfoList = deconstructJointreeScopedSJI(
 		parseFrom(t, "a, b LEFT JOIN c ON b.b0 = c.c0"),
-		defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
+		defaultCollapseLimits(), nil)
 
 	out, _, used := tryPGShapedJoinSearch(root, seamLocal(names, 0), ctx, nil)
 	if !used {
@@ -199,7 +199,7 @@ func TestSeamPlansAnInnerLinkOnANonFirstCommaItem(t *testing.T) {
 		schema: appendSchema(a.Output(), item.Output())}
 	ctx.joinlist, ctx.joinInfoList = deconstructJointreeScopedSJI(
 		parseFrom(t, "a, b JOIN c ON b.b0 = c.c0"),
-		defaultCollapseLimits(), pgShapedCollapseEnabled(), nil)
+		defaultCollapseLimits(), nil)
 
 	out, _, used := tryPGShapedJoinSearch(root, seamLocal(names, 0), ctx, nil)
 	if !used {

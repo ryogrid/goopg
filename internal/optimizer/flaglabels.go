@@ -56,10 +56,11 @@ type FlagProvenance struct {
 }
 
 // onOff spells a boolean flag's resolved state. It describes the VARIABLE, never
-// the feature — so an inverted switch such as GOOPG_PGSHAPED_COLLAPSE resolves
+// the feature — so an inverted switch such as GOOPG_MHJ_PACKING_OFF resolves
 // to `off` ("the off-switch is not engaged"). Reading it the other way would
-// make one row of the stamp mean the opposite of its neighbours. (The pattern's
-// original exemplar, GOOPG_MHJ_PACKING_OFF, was retired by M0127-P6.2.)
+// make one row of the stamp mean the opposite of its neighbours. (Both that
+// exemplar and GOOPG_PGSHAPED_COLLAPSE have since been retired, by M0127-P6.2
+// and take3 C-06.)
 func onOff(on bool) string {
 	if on {
 		return "on"
@@ -79,7 +80,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_MEMOIZE":           func(v string) string { return onOff(memoizeFromEnv(v)) },
 	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
 	"GOOPG_PGSHAPED_DP":       func(v string) string { return onOff(pgShapedDPFromEnv(v)) },
-	"GOOPG_PGSHAPED_COLLAPSE": func(v string) string { return onOff(pgShapedCollapseFromEnv(v)) },
 	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_UNNEST_PREDP":      func(v string) string { return onOff(unnestPreDPFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
@@ -183,6 +183,14 @@ var flagProvenanceRetired = map[string]string{
 	// off independently of join-order. M0127-P6.2 deleted the packer, so the
 	// off-switch has nothing left to turn off.
 	"GOOPG_MHJ_PACKING_OFF": "M0127-P6.2",
+	// take3 C-06. The switch selected explicit-INNER-JOIN flattening, default
+	// ON since take2 P0-13; flattening is now unconditional and the `=0`
+	// branch is deleted. Retiring it was a DECISION, not a gate pass: the flip
+	// is not byte-identical (TPC-H Q13 moves), but after C-06s taught the
+	// search JOIN_RIGHT the flattened arm became both the PG-parity plan and
+	// the faster one, so the `=0` arm held a plan that was neither
+	// (analysis/planner-refactor-take3/c06-flip-remeasure-20260907/README.md).
+	"GOOPG_PGSHAPED_COLLAPSE": "take3-C-06",
 	// M0125-0040's grouping-sets source-sharing knob. M0125-0048 replaced the
 	// UNION-ALL expansion the knob existed to make cheaper with a single-pass
 	// grouping-sets aggregate, so there is no source to share and nothing

@@ -325,8 +325,9 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 				i, joinTypeName(it.jointype))
 		default:
 			// C-04b, and it closes a hole C-04a opened: a pinned LEFT/RIGHT
-			// item — the `GOOPG_PGSHAPED_COLLAPSE=0` regime, or a link over
-			// a FULL pin — is now handed to the search as a two-item
+			// item — a link over a FULL pin; before take3 C-06 retired
+			// `GOOPG_PGSHAPED_COLLAPSE`, also its `=0` regime — is now
+			// handed to the search as a two-item
 			// problem, and the search knows it is an OUTER join only through
 			// `root->join_info_list`. The seam checks that list for the
 			// links it flattens (`outerLinksHaveSJInfos`); this is the same

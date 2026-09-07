@@ -12,8 +12,9 @@ package optimizer
 //     index-only assertion passes for a plan that reads the wrong column; and
 //  2. a sub-joinlist is a SEPARATE search problem whose relations are joined to
 //     each other before anything outside it — the pin `deconstructJointree`
-//     produces for an outer join, and for an explicit JOIN with
-//     `GOOPG_PGSHAPED_COLLAPSE` off.
+//     produces for a FULL outer join. (Until take3 C-06 retired
+//     `GOOPG_PGSHAPED_COLLAPSE`, its `=0` regime produced the same shape for
+//     every explicit JOIN, which is where this fixture's shape comes from.)
 
 import (
 	"strings"
@@ -371,8 +372,10 @@ func TestPlanJoinlistSearchRejectsMalformedInput(t *testing.T) {
 // rests on, on the producer's own output: every sub-joinlist
 // `deconstructJointree` can emit covers one unbroken run of FROM items.
 func TestJoinlistLeafRange(t *testing.T) {
-	// `a, b JOIN c, d` with the JOIN pinned — the production shape while
-	// `GOOPG_PGSHAPED_COLLAPSE` is off.
+	// `a, b JOIN c, d` with the JOIN pinned. Hand-built rather than parsed:
+	// since take3 C-06 retired `GOOPG_PGSHAPED_COLLAPSE` only a FULL JOIN
+	// still pins, but the invariant under test is about the SHAPE, which the
+	// producer can still emit (a FULL link, or `join_collapse_limit`).
 	jl := joinlist{leafItem(0), subItem(joinlist{leafItem(1), leafItem(2)}), leafItem(3)}
 	if lo, hi, ok := jl.leafRange(); !ok || lo != 0 || hi != 4 {
 		t.Fatalf("leafRange = (%d,%d,%v), want (0,4,true)", lo, hi, ok)
@@ -391,22 +394,25 @@ func TestJoinlistLeafRange(t *testing.T) {
 
 // TestDeconstructedJointreeFeedsTheRecursion is the end-to-end seam between
 // P5.8 and this task: the joinlist the PRODUCER emits for a real FROM clause
-// plans without any adjustment, in both collapse regimes, and publishes binding
-// order either way. That the two regimes may pick DIFFERENT trees is the point
-// of the flag; that both publish the same row is the contract.
+// plans without any adjustment and publishes binding order.
+//
+// It used to run both collapse regimes; take3 C-06 retired
+// `GOOPG_PGSHAPED_COLLAPSE`, so the `=0` arm is gone and only the flattened
+// one remains. The pinned shape it used to cover is not lost:
+// `TestPlanJoinlistSearchPinnedSubproblemIsItsOwnSearch` above asserts it on a
+// hand-built pinned joinlist, which is the same shape the producer still emits
+// for a `join_collapse_limit` overflow.
 func TestDeconstructedJointreeFeedsTheRecursion(t *testing.T) {
 	names := []string{"a", "b", "c"}
 	// `FROM a, b JOIN c ON b.b0 = c.c0` with a second clause reaching out of
-	// the explicit JOIN, so both regimes have work to place.
+	// the explicit JOIN, so there is work to place.
 	from := parseFrom(t, "a, b JOIN c ON b.b0 = c.c0")
-	for _, collapse := range []bool{false, true} {
-		jl := deconstructJointree(from, defaultCollapseLimits(), collapse)
-		prob := rfjProblem(names, []int64{1_000_000, 10, 1000},
-			[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
-		n, err := planJoinlistSearch(jl, prob)
-		if err != nil {
-			t.Fatalf("collapse=%v: planJoinlistSearch: %v", collapse, err)
-		}
-		rfjAssertBindingOrder(t, n, names)
+	jl := deconstructJointree(from, defaultCollapseLimits())
+	prob := rfjProblem(names, []int64{1_000_000, 10, 1000},
+		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
+	n, err := planJoinlistSearch(jl, prob)
+	if err != nil {
+		t.Fatalf("planJoinlistSearch: %v", err)
 	}
+	rfjAssertBindingOrder(t, n, names)
 }

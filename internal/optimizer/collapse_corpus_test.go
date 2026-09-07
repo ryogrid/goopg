@@ -1,28 +1,32 @@
 package optimizer
 
-// M0127-P5.9-m — what a COLLAPSE arm of the 09 §3 acceptance bar can and cannot
-// see.
+// M0127-P5.9-m, re-based by take3 C-06 — which corpus queries have an explicit
+// JOIN whose ORDER the search chooses.
 //
-// 08 §2 gates the S5 row on running the bar "once with collapse OFF, then with
-// collapse ON", and the collapse-ON pass gates the `GOOPG_PGSHAPED_COLLAPSE`
-// flip. Running it produced 24/24 value MATCH on TPC-H SF1 at a fixed binary
-// (09 §3.18) — and that green says nothing about the flag, because
-// `GOOPG_PGSHAPED_COLLAPSE` only acts on an explicit INNER/CROSS JOIN and the
-// TPC-H corpus contains none: its one explicit join is Q13's LEFT OUTER JOIN,
-// which `joinPinned` pins in BOTH regimes.
+// The file was written to instrument the `GOOPG_PGSHAPED_COLLAPSE` arm of the
+// 09 §3 acceptance bar: it measured, per corpus query, whether the flag's two
+// values posed a DIFFERENT set of search problems, so that a green arm over a
+// corpus with zero eligible statements could be read as the CONTROL it was.
+// That was the failure mode the milestone kept re-discovering one instrument at
+// a time — §3.15's headline number measured ON→ON, §3.16's provenance label
+// named the opposite of the regime it ran under: gates reporting a number about
+// a variable they did not vary.
 //
-// That is the failure mode this milestone keeps re-discovering one instrument
-// at a time — §3.15's headline number measured ON→ON, §3.16's provenance label
-// named the opposite of the regime it ran under. Both were gates reporting a
-// number about a variable they did not vary. So the corpus's eligibility is
-// pinned here rather than asserted in prose: a COLLAPSE arm over a corpus with
-// zero eligible statements is a CONTROL, and the day someone re-spells a
-// benchmark query with `JOIN … ON` this test fails and says the arm has become
-// a real test.
+// Take3 C-06 retired the flag (2026-09-07): explicit INNER/LEFT/RIGHT/CROSS
+// links flatten unconditionally, and the two-valued question has no second
+// value left to ask. The measurement is kept and re-based on the question that
+// survives the flag, which is the one the sets below were always USED for — the
+// DS05 plan channel's blast radius: for which queries does an explicit JOIN
+// chain enter the enclosing search problem, so the search picks its order,
+// rather than arriving as one opaque pinned item?
 //
-// The measurement runs the production function (`deconstructJointree`) over the
-// production parse of each corpus query, at both flag values, and asks whether
-// any query level's joinlist differs. Nothing here re-implements the rule.
+// The sets are therefore re-measured against the new predicate rather than
+// carried over; the old ones were `{}` (TPC-H) and `{40,49,72,75,78,80,93}`
+// (TPC-DS) under "the flag changes this level's problem set".
+//
+// The measurement runs the production functions (`deconstructJointree`,
+// `deconstructFromItem`) over the production parse of each corpus query.
+// Nothing here re-implements the rule.
 
 import (
 	"os"
@@ -43,36 +47,51 @@ import (
 // when the bench tree is absent; the TPC-H half never does.
 const tpcdsCorpusDir = "../../bench/tpcds/runtime_goopg/tpcds-data/queries"
 
-// collapseEligible reports whether `GOOPG_PGSHAPED_COLLAPSE` changes the search
-// population of any query level in sql, and returns the levels' rendered
-// joinlists for the OFF regime so a failure can name the shape it saw.
+// tpcdsFlatteningSet is the pinned answer of
+// `TestExplicitJoinFlatteningOnTheTPCDSCorpus` — see that test for what the set
+// means and how it has moved.
+const tpcdsFlatteningSet = "5,40,49,72,75,77,78,80,93"
+
+// explicitJoinFlattens reports whether any query level of sql has a comma FROM
+// item written with an explicit `JOIN` whose chain FLATTENS — i.e. the item
+// contributes more than one member to the enclosing joinlist, so the search
+// chooses the order of its links instead of inheriting the written one. It
+// returns the levels' rendered joinlists so a failure can name the shape it saw.
+//
+// This is the post-C-06 spelling of what `collapseEligible` measured. It asks
+// the production deconstruction directly (`deconstructFromItem`, then
+// `canonJoinlist` over the whole level for the diagnostic string) rather than
+// diffing two flag arms, because there is only one arm now.
 //
 // "Query level" is one `*parser.SelectStmt` with a FROM clause the JOIN-aware
-// entry point handles — the same condition planner.go:2008 uses to call
+// entry point handles — the same condition planner.go uses to call
 // `deconstructJointree`. A level whose FROM is the JOIN-free spelling goes to
-// `deconstructRangeVars`, which takes no limits and no flag, so it can never be
-// eligible (collapse.go's own note: a flat comma list is one problem either
-// way).
-func collapseEligible(sql string) (eligible bool, levels []string, err error) {
+// `deconstructRangeVars`, which has no explicit JOIN to flatten, so it can
+// never qualify (collapse.go's own note: a flat comma list is one problem
+// however it is spelled).
+func explicitJoinFlattens(sql string) (flattens bool, levels []string, err error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		return false, nil, err
 	}
+	lim := defaultCollapseLimits()
 	for _, st := range stmts {
 		for _, sel := range selectLevels(st) {
 			if len(sel.FromExprs) == 0 {
 				continue
 			}
-			lim := defaultCollapseLimits()
-			off := fmtJoinlist(canonJoinlist(deconstructJointree(sel.FromExprs, lim, false)))
-			on := fmtJoinlist(canonJoinlist(deconstructJointree(sel.FromExprs, lim, true)))
-			levels = append(levels, off)
-			if off != on {
-				eligible = true
+			levels = append(levels, fmtJoinlist(canonJoinlist(deconstructJointree(sel.FromExprs, lim))))
+			rel := 0
+			for _, item := range sel.FromExprs {
+				sub := deconstructFromItem(item, rel, lim)
+				rel += fromItemRels(item)
+				if len(item.Joins) > 0 && len(sub) > 1 {
+					flattens = true
+				}
 			}
 		}
 	}
-	return eligible, levels, nil
+	return flattens, levels, nil
 }
 
 // canonJoinlist strips the nesting levels that carry no search decision, so two
@@ -167,11 +186,11 @@ func selectLevels(root any) []*parser.SelectStmt {
 }
 
 // TestCollapseInstrumentFindsNestedLevels is the instrument's positive control.
-// A measurement that reports "0 eligible" is only evidence if the same code
-// reports non-zero when an eligible statement IS present — including one where
-// the eligible level is a SUB-select, since a walk that only looked at the top
-// level would under-count every corpus query that hides its joins in a CTE.
-func TestCollapseInstrumentFindsNestedLevels(t *testing.T) {
+// A measurement that reports a small count is only evidence if the same code
+// reports non-zero when a qualifying statement IS present — including one where
+// that level is a SUB-select, since a walk that only looked at the top level
+// would under-count every corpus query that hides its joins in a CTE.
+func TestJoinFlatteningInstrumentFindsNestedLevels(t *testing.T) {
 	cases := []struct {
 		name string
 		sql  string
@@ -193,69 +212,83 @@ func TestCollapseInstrumentFindsNestedLevels(t *testing.T) {
 			want: true,
 		},
 		{
-			// C-04a: LEFT no longer pins, so a LEFT chain collapses into one
-			// problem exactly as an INNER one does and the flag now acts on
-			// it. This case read `false` up to C-04a and is the instrument's
-			// own witness that the pin relaxed.
-			name: "left outer join chain collapses (C-04a)",
+			// C-04a: LEFT no longer pins, so a LEFT chain flattens into one
+			// problem exactly as an INNER one does. This case read `false` up
+			// to C-04a and is the instrument's own witness that the pin
+			// relaxed.
+			name: "left outer join chain flattens (C-04a)",
 			sql:  "SELECT * FROM a LEFT JOIN b ON a.x = b.x LEFT JOIN c ON b.x = c.x",
 			want: true,
 		},
 		{
-			// FULL still pins in both regimes — C-04 leaves it alone
-			// deliberately (DESIGN §3.6), and its safety rests on that.
-			name: "full outer join is pinned in both regimes",
+			// FULL still pins — C-04 leaves it alone deliberately
+			// (DESIGN §3.6), and its safety rests on that. It is the only
+			// join type left that does, since C-06.
+			name: "full outer join is pinned",
 			sql:  "SELECT * FROM a FULL JOIN b ON a.x = b.x FULL JOIN c ON b.x = c.x",
 			want: false,
 		},
 		{
-			// C-04b: RIGHT is collapse-dependent too. The joinlist flattens
-			// both links; whether the SEAM then admits the plan-side shape
-			// is a separate question (a RIGHT under a RIGHT's nullable side
-			// declines there — joinsearchspine_test.go).
-			name: "right outer join chain collapses (C-04b)",
+			// C-04b: RIGHT flattens too. The joinlist flattens both links;
+			// whether the SEAM then admits the plan-side shape is a separate
+			// question (a RIGHT under a RIGHT's nullable side declines there
+			// — joinsearchspine_test.go).
+			name: "right outer join chain flattens (C-04b)",
 			sql:  "SELECT * FROM a RIGHT JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x",
 			want: true,
 		},
 		{
-			name: "flat comma list is one problem either way",
+			name: "flat comma list has no explicit JOIN to flatten",
 			sql:  "SELECT * FROM a, b, c, d WHERE a.x = b.x",
 			want: false,
 		},
 		{
-			name: "two-way inner join is unaffected (one item either way)",
+			// Read `false` under the retired flag — the two arms posed the
+			// SAME problem set for a two-way join, because upstream unwraps a
+			// one-element side (initsplan.c:1428-1436). It reads `true` under
+			// the predicate that replaced it, and correctly so: the item DOES
+			// contribute two members, and the search DOES pick which side
+			// builds. The two questions differ exactly here.
+			name: "two-way inner join flattens into two members",
 			sql:  "SELECT * FROM a JOIN b ON a.x = b.x",
-			want: false,
+			want: true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, levels, err := collapseEligible(tc.sql)
+			got, levels, err := explicitJoinFlattens(tc.sql)
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("collapseEligible(%q) = %v, want %v (levels %v)", tc.sql, got, tc.want, levels)
+				t.Errorf("explicitJoinFlattens(%q) = %v, want %v (levels %v)", tc.sql, got, tc.want, levels)
 			}
 		})
 	}
 }
 
-// TestCollapseIsAControlOnTheTPCHCorpus pins the fact that makes 09 §3.18's
-// green a control: not one of the 22 TPC-H queries contains a join
-// `GOOPG_PGSHAPED_COLLAPSE` can act on, so both arms of the collapse-ON
-// acceptance pass plan byte-identical search problems and any timing difference
-// between them is host noise by construction.
+// TestExplicitJoinFlatteningOnTheTPCHCorpus pins which TPC-H queries have an
+// explicit JOIN whose order the search picks.
 //
-// If this test fails, the corpus changed and the bar's collapse arm now MEASURES
-// something. That is a promotion, not a break: update the count here and re-read
-// the arm's result as evidence about the flag rather than about the host.
-func TestCollapseIsAControlOnTheTPCHCorpus(t *testing.T) {
+// It used to assert ZERO, and to mean something else: under
+// `GOOPG_PGSHAPED_COLLAPSE` the count was the number of queries the flag could
+// act on, and zero was what made 09 §3.18's collapse arm a CONTROL rather than
+// a measurement. Q13's `LEFT OUTER JOIN` did not count, because `joinPinned`
+// pinned it in both regimes.
+//
+// C-04a relaxed the LEFT pin and C-06 retired the flag, so Q13's join now
+// flattens and the honest answer is {13} — which is exactly why C-06's flip was
+// not plan-neutral: Q13 is the ONE TPC-H query the retirement could move, and
+// it did (see the C-06 evidence note in collapse.go's header).
+//
+// If this set changes, the corpus changed and the TPC-H channel's blast radius
+// changed with it.
+func TestExplicitJoinFlatteningOnTheTPCHCorpus(t *testing.T) {
 	queries := tpch.Queries()
 	var eligible []int
 	unparsed := 0
 	for qn, sql := range queries {
-		got, _, err := collapseEligible(sql)
+		got, _, err := explicitJoinFlattens(sql)
 		if err != nil {
 			// A query this planner cannot parse cannot be an arm of any
 			// bar either; count it so the denominator stays honest.
@@ -268,26 +301,25 @@ func TestCollapseIsAControlOnTheTPCHCorpus(t *testing.T) {
 		}
 	}
 	sort.Ints(eligible)
-	if len(eligible) != 0 {
-		t.Errorf("TPC-H corpus: %d collapse-eligible queries %v, want 0 — the bar's "+
-			"collapse arm is no longer a control; re-read 09 §3.18 with this in mind",
-			len(eligible), eligible)
+	if got, want := sprintInts(eligible), "13"; got != want {
+		t.Errorf("TPC-H queries with a flattening explicit JOIN = {%s}, want {%s} — "+
+			"the TPC-H channel's blast radius changed", got, want)
 	}
 	if unparsed != 0 {
 		t.Errorf("TPC-H corpus: %d of %d queries did not parse", unparsed, len(queries))
 	}
-	t.Logf("TPC-H corpus: %d queries, %d collapse-eligible (Q13's LEFT OUTER JOIN is pinned in both regimes)",
-		len(queries), len(eligible))
+	t.Logf("TPC-H corpus: %d queries, flattening explicit JOIN in {%s}",
+		len(queries), sprintInts(eligible))
 }
 
-// TestCollapseEligibilityOfTheTPCDSCorpus is the other half of the same
-// question, on the corpus the DS05 clause of the bar sweeps. Here the answer is
-// NOT zero — three queries are written as inner-JOIN chains — which is why the
-// DS05 arm, not the TPC-H arm, is the collapse pass's decisive channel.
+// TestExplicitJoinFlatteningOnTheTPCDSCorpus is the other half of the same
+// question, on the corpus the DS05 clause of the bar sweeps. It is the larger
+// channel, which is why DS05 rather than TPC-H was the collapse pass's decisive
+// one.
 //
 // Skips when the bench tree is absent (the queries are dsqgen output under
 // bench/, not module data), so this never turns a clean checkout red.
-func TestCollapseEligibilityOfTheTPCDSCorpus(t *testing.T) {
+func TestExplicitJoinFlatteningOnTheTPCDSCorpus(t *testing.T) {
 	entries, err := os.ReadDir(tpcdsCorpusDir)
 	if err != nil {
 		t.Skipf("TPC-DS corpus not present (%v)", err)
@@ -308,7 +340,7 @@ func TestCollapseEligibilityOfTheTPCDSCorpus(t *testing.T) {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
 		total++
-		got, _, perr := collapseEligible(string(sql))
+		got, _, perr := explicitJoinFlattens(string(sql))
 		if perr != nil {
 			unparsed = append(unparsed, qn)
 			continue
@@ -320,25 +352,26 @@ func TestCollapseEligibilityOfTheTPCDSCorpus(t *testing.T) {
 	sort.Ints(eligible)
 	sort.Ints(unparsed)
 	got := sprintInts(eligible)
-	// C-04a re-pin: 2 -> 7. The set was {72,75} while LEFT pinned; relaxing
-	// the LEFT pin (DESIGN §3.2) lets the LEFT links of Q40/Q49/Q78/Q80/Q93
-	// flatten into their enclosing problem too, so a chain like Q78's
-	// `A LEFT JOIN B … JOIN date_dim …` — previously ONE opaque item because
-	// the outer link had already folded its two sides together — is now a
-	// three-member problem.
+	// History of this pin: {72,75} while LEFT pinned; {40,49,72,75,78,80,93}
+	// after C-04a/b relaxed the LEFT and RIGHT pins, under the retired flag's
+	// "does the flag change this level's problem set" predicate; and the set
+	// below under C-06's replacement predicate, which additionally counts the
+	// two-way joins the old one could not see (upstream unwraps a one-element
+	// side, so the old two arms agreed there — see the instrument case above).
 	//
-	// This IS C-04a's blast radius on the DS05 plan channel: these seven
-	// queries are the ones whose join ORDER the search can now choose. The
-	// measurement goes through `deconstructJointree` rather than a regex for
-	// P5.9-m's reason — the lexical count and the planner's differ, and the
-	// planner's is the one that runs.
-	const want = "40,49,72,75,78,80,93"
+	// This IS the DS05 plan channel's blast radius: these are the queries
+	// whose join ORDER the search chooses. The measurement goes through
+	// `deconstructJointree` rather than a regex for P5.9-m's reason — the
+	// lexical count and the planner's differ, and the planner's is the one
+	// that runs.
+	const want = tpcdsFlatteningSet
 	if got != want {
-		t.Errorf("TPC-DS collapse-eligible set = {%s}, want {%s} (of %d parsed; %d unparseable %v).\n"+
-			"The DS05 clause of the collapse-ON pass is the arm that measures the flag; if this set "+
-			"changed, that arm's blast radius changed with it.", got, want, total, len(unparsed), unparsed)
+		t.Errorf("TPC-DS queries with a flattening explicit JOIN = {%s}, want {%s} (of %d parsed; "+
+			"%d unparseable %v).\nThis is the DS05 plan channel's blast radius; if it changed, "+
+			"re-run 09 §3.18's protocol rather than re-quoting its numbers.",
+			got, want, total, len(unparsed), unparsed)
 	}
-	t.Logf("TPC-DS corpus: %d queries, %d unparseable %v, collapse-eligible {%s}",
+	t.Logf("TPC-DS corpus: %d queries, %d unparseable %v, flattening explicit JOIN in {%s}",
 		total, len(unparsed), unparsed, got)
 }
 
@@ -347,8 +380,8 @@ func TestCollapseEligibilityOfTheTPCDSCorpus(t *testing.T) {
 // least two relations below them.
 //
 // It is the production predicate, not a paraphrase — `deconstructJointree` and
-// `innerPrefixBelowOuterSpine` are the same calls the seam makes, at the same
-// flag value — because P5.9-m's whole lesson was that a corpus measurement
+// `innerPrefixBelowOuterSpine` are the same calls the seam makes — because
+// P5.9-m's whole lesson was that a corpus measurement
 // re-derived from the SQL text answers a different question than the planner
 // does (the `72,75` note above: `grep -c ' join '` finds three eligible queries
 // where `deconstructJointree` finds two).
@@ -356,7 +389,7 @@ func TestCollapseEligibilityOfTheTPCDSCorpus(t *testing.T) {
 // The plan-tree half of the seam's check (`splitOuterSpine`) is not modelled: it
 // can only DECLINE what this admits, so the count below is an upper bound on the
 // corpus population, and it is labelled as one.
-func levelHasSearchableInnerPrefix(sql string, collapseJoins bool) (bool, error) {
+func levelHasSearchableInnerPrefix(sql string) (bool, error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		return false, err
@@ -366,7 +399,7 @@ func levelHasSearchableInnerPrefix(sql string, collapseJoins bool) (bool, error)
 			if len(sel.FromExprs) == 0 {
 				continue
 			}
-			jl := deconstructJointree(sel.FromExprs, defaultCollapseLimits(), collapseJoins)
+			jl := deconstructJointree(sel.FromExprs, defaultCollapseLimits())
 			prefix, spine := jl.innerPrefixBelowOuterSpine()
 			if len(spine) == 0 || prefix.nrels() < 2 {
 				continue
@@ -396,10 +429,6 @@ func levelHasSearchableInnerPrefix(sql string, collapseJoins bool) (bool, error)
 // query enters or leaves it, the number of plans the arm can move changed, and
 // the acceptance bar's "same=99" needs re-reading rather than re-quoting.
 //
-// Measured at collapse ON, because that is the regime in which an inner prefix
-// flattens into one searchable problem. With collapse OFF each inner link is
-// itself pinned, so the prefix is a two-member subproblem whose order is forced
-// and only its PATHS are searched — reachable, but not reorderable.
 func TestCorpusQueriesWithASearchableInnerPrefix(t *testing.T) {
 	entries, err := os.ReadDir(tpcdsCorpusDir)
 	if err != nil {
@@ -419,7 +448,7 @@ func TestCorpusQueriesWithASearchableInnerPrefix(t *testing.T) {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
 		total++
-		ok, perr := levelHasSearchableInnerPrefix(string(sql), true)
+		ok, perr := levelHasSearchableInnerPrefix(string(sql))
 		if perr != nil {
 			continue
 		}
@@ -480,12 +509,14 @@ func chainIsInnerOnly(sql string) (innerOnly bool, err error) {
 }
 
 // TestNoCorpusQueryHasAnInnerOnlyJoinChain is the measurement that explains why
-// M0127-P5.9-r changed no plan, and it is the fact the next attempt on the
-// collapse flip has to start from.
+// M0127-P5.9-r changed no plan. It was also the fact the collapse flip had to
+// start from; take3 C-06 has since decided that flip (see this file's header),
+// and the measurement is kept as the standing statement about the corpus.
 //
 // P5.9-r lifted the precondition P5.9-m recorded: the seam now flattens an
 // explicit INNER chain and routes its `ON` quals into the search's clause list,
-// which `TestCollapseReachesTheSearch` demonstrates on a three-relation chain.
+// which `TestExplicitJoinChainReachesTheSearch` demonstrates on a
+// three-relation chain.
 // The DS05 plan A/B nevertheless reported `queries=99 same=99 changed=0` under
 // collapse OFF *and* ON, and this is why: of the 99 TPC-DS queries, **twelve**
 // spell an explicit JOIN and **every one of the twelve** contains an outer join.
@@ -539,21 +570,21 @@ func TestNoCorpusQueryHasAnInnerOnlyJoinChain(t *testing.T) {
 		if ok {
 			innerOnly = append(innerOnly, qn)
 		}
-		if _, _, perr := collapseEligible(string(sql)); perr == nil {
+		if _, _, perr := explicitJoinFlattens(string(sql)); perr == nil {
 			withJoin = append(withJoin, qn)
 		}
 	}
 	sort.Ints(innerOnly)
 	if len(innerOnly) != 0 {
 		t.Errorf("TPC-DS queries with an INNER-only explicit-JOIN chain = {%s}, want none (of %d).\n"+
-			"A corpus query the seam can now flatten means the DS05 plan A/B can finally move, so "+
-			"09 §3.18's collapse protocol should be re-run and M0127-P5.9-m's no-go re-decided.",
+			"A corpus query the seam can now flatten means the DS05 plan A/B can move on an "+
+			"INNER-only chain, which nothing in this corpus has ever exercised.",
 			sprintInts(innerOnly), total)
 	}
 	t.Logf("TPC-DS corpus: %d queries, %d inner-only explicit-JOIN chains", total, len(innerOnly))
 }
 
-// TestCollapseReachesTheSearch is the INVERSION of M0127-P5.9-m's
+// TestExplicitJoinChainReachesTheSearch is the INVERSION of M0127-P5.9-m's
 // `TestCollapseDoesNotReachTheSearch`, and it is the fact that makes 03 §6's
 // collapse pass a decidable question again.
 //
@@ -569,46 +600,35 @@ func TestNoCorpusQueryHasAnInnerOnlyJoinChain(t *testing.T) {
 // Q72's eleven-way level explained.
 //
 // M0127-P5.9-r lifted that precondition (`extractSearchLeaves`,
-// joinsearchseam.go). This test pins the consequence from the collapse side:
-// BOTH regimes now reach the search, so the flag decides a join ORDER rather
-// than deciding nothing, and M0127-P5.9-m's no-go — which was a statement about
-// a flag that could not move a plan — no longer stands on its own evidence and
-// has to be re-measured by 09 §3.18's protocol.
+// joinsearchseam.go). This test pins the consequence: an explicit-JOIN chain
+// reaches the search, so the flattening decides a join ORDER rather than
+// deciding nothing, and M0127-P5.9-m's no-go — which was a statement about a
+// flag that could not move a plan — did not stand on its own evidence.
 //
-// What it deliberately does NOT assert is that the two regimes differ on THIS
-// fixture: three relations under `join_collapse_limit` is a shape where the
-// pinned order and a searched order can legitimately coincide. The claim under
-// test is reachability, which is what was false before.
+// It ran both flag arms until take3 C-06 retired `GOOPG_PGSHAPED_COLLAPSE`.
+// Nothing is lost by dropping the second arm: the test deliberately never
+// asserted that the arms DIFFER on this fixture (three relations under
+// `join_collapse_limit` is a shape where a pinned order and a searched order
+// can legitimately coincide). The claim under test is reachability, which is
+// what was false before P5.9-r, and it is the surviving arm that carries it.
 //
 // Reachability in the PLANNER is not reachability in the CORPUS, and the two
 // must not be confused — confusing them is the exact defect P5.9-m recorded.
-// `TestNoCorpusQueryHasAnInnerOnlyJoinChain` above measures the second: no
-// TPC-DS or TPC-H query is written INNER-only, so the re-run of 09 §3.18's
-// protocol still reports `same=99 changed=0` and the flip is still a no-go.
-// This test says the door is open; that one says nobody walks through it yet.
-func TestCollapseReachesTheSearch(t *testing.T) {
+// `TestNoCorpusQueryHasAnInnerOnlyJoinChain` above measures the second.
+func TestExplicitJoinChainReachesTheSearch(t *testing.T) {
 	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
-	for _, collapse := range []bool{false, true} {
-		prev := pgShapedCollapse
-		pgShapedCollapse = collapse
-		// The chain `planFromItem` builds for that FROM clause, and the
-		// joinlist the flag actually produces for it — so the only thing
-		// varying between the two arms is the regime.
-		node, ctx := seamInnerChain(t, names, []int64{100, 100, 100})
-		out, _, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil)
-		pgShapedCollapse = prev
-		if !used {
-			t.Fatalf("collapse=%v: the seam declined an explicit-JOIN chain — the "+
-				"P5.9-r walk has regressed and the collapse flag is unobservable again",
-				collapse)
-		}
-		got := seamEqualities(out)
-		for _, want := range []string{"a0=b0", "b0=c0"} {
-			if !got[want] {
-				t.Fatalf("collapse=%v: the searched tree does not enforce %s (enforces %v)",
-					collapse, want, got)
-			}
+	// The chain `planFromItem` builds for that FROM clause, and the joinlist
+	// the deconstruction actually produces for it.
+	node, ctx := seamInnerChain(t, names, []int64{100, 100, 100})
+	out, _, used := tryPGShapedJoinSearch(node, seamLocal(names, 0), ctx, nil)
+	if !used {
+		t.Fatal("the seam declined an explicit-JOIN chain — the P5.9-r walk has regressed")
+	}
+	got := seamEqualities(out)
+	for _, want := range []string{"a0=b0", "b0=c0"} {
+		if !got[want] {
+			t.Fatalf("the searched tree does not enforce %s (enforces %v)", want, got)
 		}
 	}
 }
