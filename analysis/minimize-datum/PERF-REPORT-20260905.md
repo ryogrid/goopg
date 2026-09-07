@@ -1605,6 +1605,92 @@ question**. Earlier in this workstream two timing conclusions were
 contaminated exactly that way; waiting cost hours and bought a number
 that means what it says.
 
+## 5.27. Spill-cost calibration: one item resolved, one −18.2% win queued behind the same keystone
+
+The spill-cost calibration was the single root blocker holding **three**
+items (B-13, B-15, E-16), and its design doc had been landed and left
+unimplemented. Working it produced one resolution, one large measured win
+that was deliberately **not** shipped, and two method traps worth more
+than either.
+
+**The instrument is a derived model, not a multiplier — and the design's
+own §6.2 was right to refuse one.** `spillPages` splits into
+`spillPagesInner`/`spillPagesOuter`, charging hash batch I/O through
+`hashsize.SpillInnerBytes`/`SpillBytes` (the on-disk encoder
+transcription) instead of `EntryBytes` (the in-memory entry). The
+correction is a **1.2×–5× ratio**, not a scalar, and a unit test now
+fails if a scalar would have sufficed. `hashsize.Choose` is untouched, so
+the spill *decision* still mirrors the executor.
+
+**E-16 — resolved and landed (`16da44c66`).** The filed patch no longer
+applied and about half its intent had landed meanwhile; only the
+remainder was ported (CTE bodies, DML entry points, ON CONFLICT, VALUES
+subqueries, view quals). **Its blocker did not reproduce**: at the shipped
+defaults the plumbing is *cost-identical* across all 22 TPC-H queries —
+not one plan line moves — because the interiors it threads are not
+exercised by TPC-H. The 2026-09-04 Q7/Q9 regression was a property of
+*that* tree, not of the change. 24/24 MATCH on values, plan capture
+byte-identical. The agent also declined to count three of its six new
+pins as gating, on the grounds that they cover pre-existing untested
+behaviour — the right call.
+
+**Cut 3 — measured, and held.** −18.2% suite total, with Q12 −61.5% and
+Q18 −52.0%, values 24/24. It is not shipped because **Q9 is +62.5%**,
+which fails the B2 bar alone. The diagnosis is what makes it worth
+holding rather than abandoning: at `-parallel-workers 0` the same Q9 is
+**14.6% faster** post-change. The regression is the parallel trap — the
+Parallel Seq Scan moves off `lineitem` (6.0 M rows) onto `orders`
+(1.5 M), so four workers each re-scan all of `lineitem`. That is
+C-19g/C-19h's territory, so Cut 3 now queues behind **the same keystone**
+as C-19h and D-05. Filed as a clean patch with nine arm logs and paired
+plan captures.
+
+**B-13 — still blocked, but its arithmetic is now empirical rather than
+assumed.** At `work_mem=4MB`: **+24.9%** without the calibration (nine
+queries over 1.2×, Q14 **+2750%**), **−3.0%** with it. So the calibration
+recovers −22.3% of the 4 MB suite, and **PG's real default costs the
+suite total nothing once the spill charge is honest**. Seven residual
+>1.2× queries keep it below B2.
+
+**B-15 — step 1 discharged.** The filed hypothesis is now confirmed
+quantitatively: R5's pro-rating collapses a probe's per-scan total
+**472×** (4817 at loop 1 → 10.21 at 933 k), while the missing heap-qpqual
+term would be worth ≈6.0 per probe — 0.1% of the price at loop 1 but
+~60% at 933 k. **A bias that grows with loop count is exactly the NL-flip
+signature**, which is what the 14 shapes flipping toward Nested Loop
+looked like.
+
+### 5.27.1 Two method traps, each of which voided a full round
+
+**Four complete capture rounds showed Cut 3 moving nothing — zero cost
+lines.** The arm scripts, copied from `tpch-acceptance-arm.sh`'s default,
+exported **`GOOPG_PGSHAPED_DP=0`**, while the shipped default is
+`unset(on)`. With the DP search off, `hashJoinCost` **is never called at
+all**, so a change to it is invisible by construction. Static reasoning
+produced two wrong explanations; **instrumenting the function settled it
+in one run — 0 calls versus 767**. This is the same lesson as the Q78
+firewall and the swallowed rewrite-driver error: when a change appears to
+do nothing, instrument the thing that should have run before theorising
+about why it didn't.
+
+**An A/A control measured −14.8% of pure warm-up drift on the suite
+total.** That is nearly as large as Cut 3's entire −18.2% effect. Every
+figure above is best-of-2 over four interleaved arms. This is the third
+time in this workstream that an A/A on the unchanged binary was the
+difference between a result and an artefact.
+
+### 5.27.2 Two corrections to the design doc
+
+- **§6.1 is stale.** `costSortRun` has **four** production callers now,
+  not one, because C-11/C-12 priced the upper-rel sorts. **Cut 2 is
+  therefore live, not inert** — the doc's inertness claim predates those
+  items.
+- **Cut 2's error inverts sign with `work_mem`.** It under-charges only
+  at the 512 MB default and *over*-charges at bench 64 MB, by **32×** at
+  B-13's 4 MB. So Cut 2 must be decided on a sweep across budgets; a
+  single-budget measurement would adopt a correction whose sign is wrong
+  everywhere else.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
