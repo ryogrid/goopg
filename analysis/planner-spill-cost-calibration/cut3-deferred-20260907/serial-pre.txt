@@ -1,0 +1,10 @@
+# arm=serial-pre bin=/tmp/goopg-spill-pre
+# started 2026-09-07T09:47:36+09:00
+# engine-binary: sha=ea897fbe1e93353c
+# host: load 3.18 4.37 5.81
+Q9: OK elapsed=22.32s colsig=d0a60022db317dc9 ordered=208954dc85e230ce unordered=8811d12a8513cace rows=175
+Q12: OK elapsed=14.91s colsig=8c6c14235b8e3d44 ordered=a26b3ee1c5904461 unordered=b36b0103eb864256 rows=2
+Q18: OK elapsed=33.73s colsig=1c632e3bcd2ea332 ordered=80a9bb94790c6b1e unordered=ab15e021b57e434d rows=12
+Q7: OK elapsed=13.09s colsig=effb45ed4c5e2661 ordered=c3c826ecd863cbcc unordered=ac477f88e9a00a71 rows=4
+Q13: OK elapsed=4.75s colsig=9694103490f49d86 ordered=53e93b63e9427009 unordered=9cb9fd0fff7b9300 rows=34
+# finished 2026-09-07T09:49:11+09:00

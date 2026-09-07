@@ -163,27 +163,37 @@ sort side by Cuts 1–2. Any later scalar must be per-side.
 **Cut 4 — resume the three blocked items** against the calibrated model,
 in their own order (B-13, then B-15, then E-16).
 
-### Status, 2026-09-06
+### Status, 2026-09-07 (supersedes the 2026-09-06 table)
 
 | cut | state |
 |---|---|
-| Cut 1 — sort `avgVarBytes` (§3.3) | **pending** — one-line change in `cost_funcs.go` + `joinpathsmerge.go`, held while C-19d owns those files |
-| Cut 2 — sort spill trigger (§3.2) | **deferred behind Cuts 1/3** by probe 6.1: inert on the current TPC-H plan set; gate it on a forced shape or E-16's reduced `work_mem` |
-| Cut 3 — derived `SpillBytes` model | **half landed** (`53cd7a073`, extended `027936d8f`): the model and its encoder-agreement tests are in `internal/executor/hashsize`, INERT. Wiring `spillPages` to call it, and its plan/timing gate, is the remaining half — also held on `cost_funcs.go`. **The wiring must now call `SpillInnerBytes` for the inner side and `SpillBytes` for the outer**, because E-14's keyed inner frame made the two sides genuinely different widths |
+| Cut 1 — sort `avgVarBytes` (§3.3) | **LANDED.** The 09-06 table's "pending" was already wrong when written: every production `costSortRun` call site passes a real `avgVarBytes` (`joinpathsmerge.go:459`, `partialsortpaths.go:242,272`, `windowsetoppaths.go:200`) |
+| Cut 2 — sort spill trigger (§3.2) | **still open, and NO LONGER INERT** — see the §6.1 correction below |
+| Cut 3 — derived `SpillBytes` model | model landed (`53cd7a073`, `027936d8f`); **wiring implemented, measured, and HELD** — `-18.2%` on the TPC-H total but Q9 `+62.5%` through the §7 parallel trap. Artifact `analysis/planner-spill-cost-calibration/cut3-deferred-20260907/`, ledger `spill-cut3-deferred` |
+| Cut 4 — resume B-13 / B-15 / E-16 | **E-16 LANDED** (`16da44c66`); B-13 and B-15 re-measured and still blocked, both now behind Cut 3 rather than behind an unmeasured unknown |
 
-**A drift, one day old, worth recording as a method note.** The
-agreement test that shipped with `SpillBytes` did not catch E-14's keyed
-inner frame: every case in it encoded through `WriteRowHashed`, so the
-model stayed correct for outer frames and went 9 B/row short on inner
-ones with the test still green. Pinning one of two writers is not pinning
-the pair. Any future model added here must enumerate its writers, not its
-cases.
-| Cut 4 — resume B-13 / B-15 / E-16 | not started |
+**§6.1 is stale and must not be re-used as written.** It reasoned from
+`costSortRun` having exactly ONE production caller and from top-level sorts
+being unpriced. Both facts have since changed: there are four callers, and
+C-11/C-12 gave the upper rels their sorts, so §6.1b's "not priced by any cost
+function at all" no longer holds. Cut 2 is therefore live on the suite.
 
-Landing Cut 3's model separately from its wiring is deliberate: the model
-is derivable and testable with no bench at all, while the wiring moves
-plans and needs the full arm. It also means the encoder-agreement test is
-already protecting the transcription before anything depends on it.
+**And its sign inverts with `work_mem`,** which §3.2 did not anticipate.
+`costSortRun` fires at `cp.workMem` while `sortOp` spills at the hardcoded
+256 MiB `sortChunkBytes`. At the 512 MB default `cp.workMem` is 1 GiB, above
+256 MiB — the under-charge §3.2 describes. At bench `work_mem = 64MB` it is
+128 MiB, BELOW 256 MiB, so the model OVER-charges; at B-13's 4 MB it is 8 MiB,
+over-charging by 32x. Cut 2 must therefore be decided against a `work_mem`
+SWEEP, never against one budget.
+
+**§6.3's warning earned itself.** Four full capture rounds showed Cut 3 moving
+nothing at all — zero cost lines, at two different `work_mem` values. The cause
+was not the model: the arm scripts exported `GOOPG_PGSHAPED_DP=0` while the
+shipped default is `unset(on)`, and with the DP search off `hashJoinCost` is
+never called. Instrumenting the function settled it in one run (0 calls vs 767
+at the default) after the static reasoning had produced two wrong explanations.
+Any future arm here must state the flag explicitly AND verify the cost function
+executes.
 
 ## 5. What a negative result looks like, stated in advance
 

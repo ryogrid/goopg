@@ -457,6 +457,23 @@ are EPICS — split into one-checkbox-per-commit items before starting
   single multiplier would fit the difference between two errors. Four
   separately-gated cuts, three probes, negative outcomes written in
   advance.
+  **Re-measured 2026-09-07 with both prerequisites in hand** (E-16 landed
+  `16da44c66`; Cut 3 built and measured). STILL FAILS B2, but empirically
+  now rather than by prediction. At clone `work_mem = 4MB` (the proxy for a
+  4MB BootVal), shipped planner defaults, TPC-H SF=1: WITHOUT the
+  calibration TOTAL **+24.9%** (140.02 → 174.84 s) with nine queries over
+  1.2× — Q14 **+2750%** (0.58 → 16.53 s), Q10 +241%, Q7 +194%, Q8 +174%,
+  Q3 +162%. WITH Cut 3 TOTAL **−3.0%** (135.85 s): the calibration recovers
+  −22.3% of the 4MB suite, so PG's real default costs the suite total
+  nothing once the spill charge is honest (Q14 16.53 → 0.91, Q10 9.62 →
+  3.00, Q3 8.41 → 4.40, Q7 16.36 → 9.50). Values 24/24 MATCH in all three
+  arms. The row's own re-probe trigger IS satisfied — Q9 keeps hash+Gather
+  at 4MB. Residual B2 failures at 4MB+Cut3, vs the 64MB baseline: Q2
+  +72.8%, Q3 +37.1%, Q7 +70.9%, Q8 +207.3%, Q9 +73.3%, Q14 +56.9%, Q16
+  +61.9%. So the prerequisite is confirmed as the right instrument and is
+  no longer the only thing in the way. Resume: land Cut 3 (itself blocked
+  on the parallel keystone, ledger `spill-cut3-deferred`), then re-run the
+  4MB arm against those seven. Ledger `take3-B-13-deferred-2`.
 - [x] **B-14 P2-09a ScalarArrayOp index path.** Landed 2026-09-05:
   InExpr→clause arm (useOr-only, left indexkey, const array, opfamily)
   in the rule-based producers + post-search rewrite; `IndexScan.SAOPKeys`
@@ -495,6 +512,25 @@ are EPICS — split into one-checkbox-per-commit items before starting
   separately-gated cuts, three probes, negative outcomes written in
   advance.
   *design: take3 08 §5.2; gate: take3 09 §5 P2 + TOTAL arm.*
+  **Resume step 1 DISCHARGED 2026-09-07; steps 2–4 still blocked.** The
+  batch ports onto today's tip with only TWO conflicts, both mechanical
+  (C-19c split `btreeIndexAMCost` into a `…Pages` variant; C-20d turned a
+  cost literal into `indexProbeMultCalibrated*480.0+15.25` — keep the
+  EXPRESSION, the patch's `495.275` literal is precisely the stale-literal
+  hazard). Ported, builds green; two expected-value tests then fail
+  (975.275 vs 975.25; 32.785 vs 36.785) and are the batch's own remaining
+  work. The filed hypothesis is **confirmed quantitatively**: R5's
+  index-side ML pro-rating collapses a parameterised probe's per-scan total
+  **472×** across the loop range — 4817.18 at loopCount 1, 4685.98 at 10,
+  824.42 at 1e3, 18.78 at 1e5, **10.21 at 933 000** (Q14's outer). The
+  missing counterweight, goopg's deliberately-zero heap qpqual term
+  (`buildInitialRels` numQualOps=0), would be worth ≈6.0 cost units per
+  probe there: ~0.1% of the price at loopCount 1 and ~60% of it at 933 000
+  — a bias that GROWS with loop count, which is exactly the NL-flip
+  signature the batch showed. Step 2 (calibrate the heap per-tuple term
+  and/or `indexProbeCostMultiplier`) still needs the spill calibration
+  landed first per this item's own ordering. Ledger
+  `take3-B-15-blocked-2`.
 - [x] **B-16 P2-11b MCV-frequency half.** Landed 2026-09-05: MCV scale
   (`mcv/avgfreq` iff hotter than average) + [1e-6,1] clamp +
   default-ndistinct `Max(0.1,mcv)` decision; nbuckets cap explicitly
@@ -2951,26 +2987,34 @@ per arm; values never counts for projection/join-adjacent changes).*
   Ledger `take3-E-13-dropped`. Cut 1 (poison tests on the Project shape)
   remains landed.
   *gate (discharged): alloc arm residual demonstrated first — it was not.*
-- [!] **E-16 EX3-03 step-2 resume — BLOCKED on spill-cost calibration.**
-  Session `work_mem` threading is implemented and unit-green but moves
-  Q7/Q9 plans to slower merge shapes at bench `work_mem` (model prices
-  hash above merge while forced-hash proves faster). Resume with the
-  filed artifact
-  (`analysis/planner-refactor-take3/ex303-step2-deferred-20260904/`,
-  README + clean-applying `plumbing.patch`, ledger
-  `take3-EX3-03-step2-blocked`): recalibrate the spill-cost model first,
-  then re-apply the plumbing and re-gate.
-  **Design landed 2026-09-06: `docs/design/planner-spill-cost-calibration/DESIGN.md`.**
-  It finds the hash and sort spill charges biased in OPPOSITE directions
-  (hash over-charges — `EntryBytes` measures the in-memory entry while
-  `spillWriter.WriteRow` uses uvarint framing; sort under-charges twice,
-  and one is a TRIGGER error — `costSortRun` fires at `cp.workMem` = 1 GiB
-  while `sortOp` spills at the hardcoded 256 MiB `sortChunkBytes`), so a
-  single multiplier would fit the difference between two errors. Four
-  separately-gated cuts, three probes, negative outcomes written in
-  advance.
-  *design: `docs/design/executor-ex3-03-workmem/DESIGN.md`; gate:
-  Q7/Q9 plans at bench `work_mem` + forced-hash proof + values + pin.*
+- [x] **E-16 EX3-03 step-2 resume.** Landed 2026-09-07 (`16da44c66`).
+  The filed `plumbing.patch` no longer applied (~38 conflicts in
+  `planner.go`) and about half its intent had landed independently in
+  P2-02c/d, so only the remainder was ported: `planCopy`,
+  `preplanWithClause` (+ `planRecursiveCTE`, `planDMLCTEBody`, all four
+  CTE-body plan sites), `planInsert`, `planOnConflict`,
+  `resolveDefaultDoNothingArbiter`, `planDelete`, `planMerge`,
+  `viewChainQuals`/`viewQualOnBase`, `planValuesSubquery`,
+  `buildHavingParentCtx`, `wrapMinMaxOrderByDistinct`'s order context;
+  the three genuinely session-less fallbacks now stamp
+  `DefaultPlannerSettings()` explicitly instead of a zero value. The
+  `planSelectWithParent` zero-guard is preserved verbatim (fail-closed).
+  **The named blocker did not reproduce**: at the shipped planner
+  defaults and bench `work_mem`, the ported plumbing is COST-IDENTICAL on
+  all 22 TPC-H queries — not one plan line moves — because the interiors
+  it threads (CTE bodies, DML, ON CONFLICT, VALUES subqueries) are not
+  exercised by TPC-H, while the subquery/derived/set-op interiors that
+  moved plans on 2026-09-04 landed separately. The 09-04 Q7/Q9 regression
+  was a property of that tree, not of this change.
+  Gates: units suite green; `go vet`; optimizer + postmaster suites green;
+  TPC-H 24/24 MATCH on VALUES against the paired arm; plan capture
+  byte-identical, so no query needed individual timing.
+  Six new pins in `settings_propagation_test.go` (inner-SELECT, CTE body,
+  EXISTS, funnel, INSERT…SELECT, plus the F7 exactly-three-callers gate,
+  which asserts the NAMED three rather than a count). Non-vacuity verified
+  by reverting one production hunk at a time; the inner-SELECT/EXISTS/
+  funnel pins cover behaviour that already existed untested and are
+  recorded as such rather than counted as gating the commit.
 
 ---
 
