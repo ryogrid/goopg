@@ -3853,7 +3853,15 @@ ledger row if the measurement says no.
     verification and the `recordIOTrace`/`PageIdentityObserve` pair are all
     kept from `readBlock`; six tests, `-race` green. No caller yet, so the
     slice is inert by construction.
-  - S2 pin accounting + test seams — pending.
+  - **S2 pin accounting + test seams — LANDED 2026-09-07.**
+    `Pool.TotalPinCount() (total, slotsPinned)` (the pin-sum accessor §4.2
+    said made the leak test unwritable — `getPinCount` is unexported and
+    `SlotPinCount` needs a tag) and `Pool.DebugReadFault func(BufferTag)
+    error`, a read-path fault seam consulted in `pinLoad`, off by default.
+    `EvictionCount()` already existed and is gated as an instrument.
+    Three tests; the injected-fault one is also a real assertion about HEAD
+    and passes: a failed read leaves no pin, no slot with the IO bit set and
+    no bufmap entry, and the same tag reads cleanly afterwards.
   - S3 `StartRead`/`FinishRead` — pending.
   - S4 scan-side window — pending.
   **Probe 0 answers the sizing caveat below and answers it POSITIVELY**: on a
