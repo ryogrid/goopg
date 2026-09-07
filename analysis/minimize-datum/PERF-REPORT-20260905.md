@@ -2510,7 +2510,7 @@ candidate is 150K×8 ≈ 57 MB (~100–200 ms build). No second witness for
 Phase 1: specified-not-built. The prize (Q9 included) needs Phase 2's
 shared batch files — scoped in the design, beyond this session.
 
-## 5.41. E-19: S1 sharpened, not started
+## 5.41. E-19: S1 sharpened, not started (superseded by §5.43)
 
 The installing-prefetch design + Probe 0 (79.9 % recoverable) + both
 reviews stand; S1–S4 remain the implementation. Scoping note added this
@@ -2520,6 +2520,64 @@ io_uring binding DELIBERATELY excludes IORING_OP_READV/WRITEV
 the vectored path (the review's own checksum saga). A loop-over-
 `ReadBlock` must not be accepted as "vectored": it buys no syscall
 reduction, which is the whole point of `io_combine_limit`.
+
+## 5.43. E-19 implemented and closed NO-GO — the budget and the caller are
+different access patterns
+
+S1-S4 landed and were measured. The mechanism works and does not pay, and
+the reason is the useful part.
+
+**Measured, Probe 0's instrument** (private cluster port 5539, own cgroup
+unit, `shared_buffers = 16MB` against 99 MB, serial, fresh capped server per
+arm, order permuted; witness a serial Bitmap Heap Scan NLI inner over 23,953
+scattered rows):
+
+| arm | reps (ms) | median |
+|---|---|---|
+| cold, depth 0 | 82.99 / 95.87 / 88.20 | **88.20** |
+| cold, depth 16 | 187.73 / 120.29 / 115.39 | **120.29** |
+
+**36 % slower.** Rows identical in all ten arms, and the server's own
+`read_bytes` is byte-identical (82,575,360) across both depths in every cold
+arm — so there is no extra I/O and no double read hiding the cost; it is
+per-block work with nothing to amortise it against. The witness also has **no
+budget to recover**: cold 88.2 ms against warm 101.3 ms is indistinguishable,
+i.e. 82.5 MB in ~80 ms ≈ 1 GB/s, already at sequential bandwidth.
+
+**The finding.** Probe 0's 79.9 % came from an **index scan**, whose heap
+fetches arrive in *index* order. A **bitmap heap scan** sorts its block list
+ascending by construction — the readahead-friendly pattern §3.1 had already
+refuted. *The budget E-19 found and the caller E-19 chose are not the same
+access pattern*, and selectivity cannot bridge them: at ~100 rows/page a
+bitmap sparse enough to leave pages unvisited spans only a few MB. The
+resume point is therefore not a buffer-pool change at all — the budget sits
+on the index scan's heap fetch and needs a btree look-ahead. S1-S3 are
+reusable for it.
+
+**Parallel: declined with its reason.** goopg's parallel bitmap scan claims
+pages one at a time from a shared atomic allocator, so a worker cannot look
+ahead without claiming. A parallel window needs the batched-claim API the
+design lists separately. That is obstacle 1's second branch, taken
+explicitly: **the item has no witness at bench settings.**
+
+**What the slices bought anyway**, since they are in the tree:
+`Manager.ReadBlocks` -> `preadvAt` with `TestReadBlocksIssuesOneSyscallPerRun`
+pinning the syscall *count* (a refactor to loop-over-`readBlock` would pass
+all six pre-existing tests while destroying the entire point);
+`Pool.TotalPinCount` and `Pool.DebugReadFault`, the latter immediately
+proving a real property of HEAD — a failed read leaves no pin, no IO-bit
+slot, no bufmap entry; and `StartRead`/`Finish`/`Abort` with the three
+review findings honoured in code rather than prose. The deadlock test is the
+one worth naming: **it was falsified against a deliberately naive build,
+where it hung the full 60 s with the stack showing `Submit` under `pinMu`**,
+before it passed. `Abort` keeps the pin rather than calling
+`releaseVictimSlot`, because that is finding 5 — the case a pin-balance test
+passes while broken — so the test asserts ownership instead.
+
+Gates: `-race ./internal/storage/...` green; units green with the knob off
+and at depth 8; TPC-H spotcheck Q12=2 / Q13=34 at knob-off and depth 16, on
+a **private clone** so the shared cluster was never touched. TPC-DS SF0.5
+not run — the change is inert at default and the row closes NO-GO.
 
 ## 5.42. Session scoreboard (2026-09-07 evening workstream)
 
