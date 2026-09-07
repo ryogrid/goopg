@@ -56,7 +56,7 @@ refusals, and one correctness fix:
 
 | | |
 |---|---|
-| TODO_ALL census | **80 done, 15 out of scope, 20 blocked, 5 open** |
+| TODO_ALL census (at that interim point; final is 93/31/0/0 — see §10) | **80 done, 15 out of scope, 20 blocked, 5 open** |
 | further measured wins | TPC-DS Q40 1.50 → 0.92 s and Q80 13.54 → 10.57 s (C-04c); TPC-H planning time −14.1% total, Q9 −52% (C-20h P6-08); Q1 8.57 → 4.14 s (C-19g) |
 | measured and deliberately **held** | spill-cost Cut 3, −18.2% suite (Q12 −61.5%, Q18 −52.0%) — held on Q9 +62.5%, which is a parallel-plan interaction, not a ranking error |
 | measured and **not** landed | C-06s: a probe prices Q13's missing `Hash Right Join` at 2.53× under the merge, 6.06/6.64 s → 4.36/4.52 s, values byte-identical |
@@ -2948,6 +2948,65 @@ Each arm is built in its own worktree pinned to an explicit SHA instead.
 **Known worse results that belong in the final worse-statement**, carried
 forward from §5.34 so they are not lost if the run is interrupted: Q9 at
 **x1.47** (12.6 -> 18.6 s) after the base-rel costing fix, whose new plan is
-the one PG 18.3 emits — a Parallel Hash Join shape goopg's executor cannot
-serve, so each worker rebuilds the inner side. That is an executor gap a
-parity-correct plan exposes, not a planner error.
+the one PG 18.3 emits — a Parallel Hash Join shape goopg's executor could
+not serve. That is an executor gap a parity-correct plan exposes, not a
+planner error.
+
+**Correction, and it is load-bearing:** the clause originally written here,
+"so each worker rebuilds the inner side", was **false**. goopg's leader
+builds once and shares by pointer, and since E-09a/E-09b that holds for
+spilling builds too. The error entered from an agent summary and was
+repeated without checking. **E-18 has since closed this gap** — see
+§5.44: Q9 10.33 -> 2.07 s (-79.9%). The worse-statement stands as a record
+of what the C-21 run measured; the underlying defect no longer exists.
+
+---
+
+## 10. Final state (2026-09-08)
+
+**`TODO_ALL.md` is complete: 93 done, 31 verified out of scope, 0 open, 0
+partial, 0 blocked.**
+
+The 31 out-of-scope rows are closed on the three permitted grounds — no
+measured performance gain, infeasible in goopg's design, or severe
+maintainability loss — each with the measurement or the architectural fact
+that settled it. Work scale closed none of them. Notably, the owner's ruling
+that goopg adopts PG 18.3's parallel costing rather than inventing its own
+closed D-05, D-07 and D-08 outright and re-scoped D-10/D-11.
+
+**What this report does and does not claim.** The three baselines of §1.2
+remain distinct and must not be summed: release-over-release **2.83x**
+(C-21, against a release point 706 commits back of which only 373 are this
+workstream's), single largest item **27%** (`indexProbeCostMultiplier`), and
+distance from PG **7.3x** at the time of that measurement. The C-21
+acceptance bar was **NOT met** (§9): B1 passed, B2 failed on Q1 S-cold,
+A5/B3 failed in both arms, A4 unmeasured.
+
+**The late executor work is the largest single improvement in the
+workstream** and postdates C-21, so it is in none of those figures:
+
+| | before | after | |
+|---|---:|---:|---|
+| Q9 | 10.33 s | 2.07 s | **-79.9%** |
+| Q20 | 1.91 s | 0.65 s | -66% |
+| Q6 | (E-17 cut 2) | | -32% |
+| Q7 | 5.29 s | 3.95 s | -25.3% |
+
+**A recurring pattern, stated because it is the most transferable finding
+here.** Three of this workstream's largest results came from **deleting a
+refusal whose stated justification did not survive reading the code it
+cited** — E-18's three decline rules, the `problemPairsOuterWithDerived`
+firewall that was correct and never fired, and `indexProbeCostMultiplier`
+shipping at the value its own comment called wrong. The corresponding
+discipline: when a guard, constant or decline rule carries a written
+rationale, **verify the rationale against the named source before building
+anything that assumes it.** Several designs in this workstream were wrong on
+exactly that point, including E-18's own.
+
+**Open items deliberately left as ledger rows, not silent gaps:** the
+`instrumentScope` package-global data race (`TestSubquerySemanticsMatrix/M20`
+— pre-existing, verified by revert, widened in exposure by E-18 slice 2; the
+fix is threading the scope through `Context`, not widening the mutex), and
+E-19's resume point (the recoverable I/O budget is on the **index scan's**
+heap fetch and needs a btree look-ahead, not a buffer-pool change; S1-S3 are
+reusable).
