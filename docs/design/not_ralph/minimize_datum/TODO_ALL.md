@@ -2012,6 +2012,34 @@ rule).*
   spanning `plan.go`, the parser binder, the whole optimizer and the
   executor's expression evaluator, which no TODO_ALL row currently
   carries. Caching is planning-speed, not plan-quality.
+  **P6-08 LANDED 2026-09-07; P6-07 steps (i)–(iv) DEFERRED,
+  ledger `take3-C-20h-var-migration`.** Three `restrictInfo` memos, all
+  of them PG's own: `norm_selec` on `joinClauseSelectivityExt`, the
+  operand resolution behind `left_relids`/`right_relids` on
+  `joinKeyPairOf`, and `MergeScanSelCache` (upstream `cached_scansel`)
+  on `mergeJoinScanSel` — the last one is where the time was, and the
+  profile said so rather than the guess: `histCmp` under
+  `mergejoinscansel` was 43.7% of planning CPU. SEMI/ANTI selectivity is
+  deliberately NOT memoised (it is a function of the (outer, inner)
+  split, which is why upstream keeps a second field, `outer_selec`).
+  Measured on the SF=1 cluster (private clone, warm stats,
+  `GOOPG_ANALYZE_SEED=20260905`, 3 servers × 3 reps per arm): TPC-H
+  EXPLAIN wall time **73.13 ms → 62.83 ms (−14.1%)**, Q9 −52%, Q21 −34%,
+  Q18 −26%, Q5 −23%, Q2 −22%; in-process over a statistics-bearing
+  catalog (5 interleaved pairs) 37.84 ms → 27.18 ms per 22-query
+  planning pass (−28%). **Plans byte-identical**: all six cost-visible
+  EXPLAIN captures share one md5 (`373aed0c…`). Gates: units 44/44,
+  `go vet`, TPC-H digest **24/24 MATCH on values**, TPC-DS SF0.5 sweep.
+  Cold-vs-warm equality of each memo is pinned by
+  `joinrestrict_cache_test.go` (each assertion mutation-checked).
+  P6-07 step 0 only: `RelOptInfo` embeds a value
+  `rangeTblEntry{baseLeaf, baseOffset}` — C-20b's recommended shape,
+  every existing read preserved through field promotion. The `Var`
+  migration is 102 `ColumnRef{` sites + 237 `SourceTableIdx` references
+  outside tests; steps (i) and (ii) are one commit or none, since an
+  `attno` populated at some producers and read by none is scaffolding
+  later readers would trust. Nothing was deleted from
+  `createplanroot.go` or `rangetable.go` — they remain the detector.
   *design: take3 08 §9; gate: take3 09 §5 P6 (P6-08: planning-time
   comparison, plans byte-identical).*
   P6-03/04/05 stay **must-not-delete** (measured 6.5× / 12.5× /

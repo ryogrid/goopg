@@ -82,6 +82,57 @@ type restrictInfo struct {
 	// `a.x = b.x` and (inferred) `a.x = c.x` and `b.x = c.x` are one class,
 	// and a join may apply only ONE of them (see selectivityClauses).
 	ecID int
+
+	// --- P6-08 caches (take3 08 §9), all three of them upstream's own:
+	// `norm_selec`, the operand resolution behind `left_relids`/`right_relids`,
+	// and `MergeScanSelCache`. Planning-SPEED only —
+	// every field below is a memo of a pure function of this clause and the
+	// search's base-relation statistics, so the plan is byte-identical with
+	// the caches cold or warm. They are safe because the two inputs are both
+	// immutable for the lifetime of a `restrictInfo`:
+	//
+	//   - the clause list is built ONCE per search problem
+	//     (`relfromjoinlist.go`: `s.clauses = buildRestrictInfos(...)`) and
+	//     the only context that inherits it, GEQO's `freshEvalCtx`, shares
+	//     the SAME `relInfos` slice — same coordinate space, same statistics;
+	//   - `baseRelInfo.baseRows`/`filteredRows` and the catalog statistics
+	//     `examineJoinVar` reads are computed in `buildInitialRels`, before
+	//     the clause list exists, and are read-only from then on.
+	//
+	// All three would be wrong if either fact changed; see the assertions in
+	// `joinrestrict_cache_test.go`, which pin cold == warm on each.
+
+	// normSelec is PG's `RestrictInfo.norm_selec` (pathnodes.h): the
+	// selectivity of this clause for a NORMAL (non-SEMI/ANTI) join, cached
+	// across the O(joinrel pairs) times the DP asks for it. `normSelecValid`
+	// is upstream's `norm_selec >= 0` sentinel spelled out, because goopg's
+	// value can legitimately be 0.
+	//
+	// Deliberately NOT extended to the SEMI/ANTI arms: their selectivity is a
+	// function of the (outer, inner) split as well as the clause, which is
+	// why upstream keeps a SECOND field (`outer_selec`) for them rather than
+	// reusing this one. goopg leaves that arm uncached.
+	normSelec        float64
+	normSelecDefault bool
+	normSelecValid   bool
+
+	// keyPair caches `resolveJoinVarColumn` over the equijoin's two canonical
+	// operands — the (relation, column) resolution `joinKeyPairOf` performs
+	// once per (clause, joinrel pair) while the answer depends on neither the
+	// pair nor anything else that moves. The side test (which operand lands
+	// on the outer) stays per-call, because THAT does depend on the pair.
+	keyPairValid                    bool
+	keyPairLeftRel, keyPairRightRel int
+	keyPairLeftCol, keyPairRightCol string
+	keyPairLeftOK, keyPairRightOK   bool
+
+	// scanSel is PG's `MergeScanSelCache` (costsize.c: `cached_scansel`): the
+	// merge join's two END selectivities, held in the clause's OWN left/right
+	// orientation and rotated by `mergeJoinScanSel` for the join being costed.
+	// One entry rather than upstream's per-(opfamily, collation, strategy,
+	// nulls_first) list, because goopg's estimate reads none of those four.
+	scanSelValid                    bool
+	scanSelLeftEnd, scanSelRightEnd float64
 }
 
 // restrictInfoList is every join clause in one join problem, in a stable order

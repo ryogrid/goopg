@@ -523,6 +523,29 @@ type RelOptInfo struct {
 	// P5.4b-ii reads exactly this list. Empty until parameterised paths exist.
 	CheapestParameterized []*Path
 
+	// rangeTblEntry is the search's range-table entry for this rel — PG's
+	// `RangeTblEntry` reduced to what the search reads (C-20h/P6-07, take3
+	// 08 §9; C-20b's recommended shape). It is EMBEDDED by value, so
+	// `rel.baseLeaf` and `rel.baseOffset` keep working through Go's field
+	// promotion and no consumer moves; what it buys is that the two fields
+	// stop being loose members of a 30-field struct and become the named
+	// thing they have always been — the entry `Var.varno` would address.
+	//
+	// The rest of P6-07 — giving `ColumnRef` a `(varno, attno)` address so
+	// that a `setrefs` pass, not each producer, computes positions — is NOT
+	// landed here and is ledgered (`take3-C-20h-var-migration`). Until it is,
+	// `baseOffset` remains the position half of the coordinate map and the
+	// boundary assertions in `createplanroot.go` remain the detector for the
+	// wrong-answer class that arrangement admits.
+	rangeTblEntry
+}
+
+// rangeTblEntry is one FROM item as the join search sees it: what a base relid
+// MEANS (`baseLeaf`) and where its columns USED TO BE (`baseOffset`). Both
+// halves are set together by `buildInitialRels` (joinsearch.go) from the
+// statement's `rangeBinding` list, and both are meaningful only on level-1
+// rels — a join rel carries the zero value.
+type rangeTblEntry struct {
 	// baseLeaf is the executor Node the pre-search pipeline handed
 	// `buildInitialRels` for this FROM item — the search boundary's half of
 	// 03 §10's coordinate map, recording what a base relid MEANS: the relation,

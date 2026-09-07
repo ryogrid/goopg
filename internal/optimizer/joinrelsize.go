@@ -493,8 +493,7 @@ func (s *searchCtx) joinKeyPairOf(ri *restrictInfo, outer, inner RelSet) (joinKe
 	if ri == nil || !ri.isEquijoin {
 		return p, false
 	}
-	lr, lcr, lok := s.resolveJoinVarColumn(ri.leftKey, ri.leftRelids)
-	rr, rcr, rok := s.resolveJoinVarColumn(ri.rightKey, ri.rightRelids)
+	lr, lcol, lok, rr, rcol, rok := s.joinKeyOperandCols(ri)
 	if !lok || !rok {
 		return p, false
 	}
@@ -504,9 +503,40 @@ func (s *searchCtx) joinKeyPairOf(ri *restrictInfo, outer, inner RelSet) (joinKe
 		return p, false
 	}
 	p.rel = [2]int{lr, rr}
-	p.col = [2]string{lcr.Name, rcr.Name}
+	p.col = [2]string{lcol, rcol}
 	p.usable = true
 	return p, true
+}
+
+// joinKeyOperandCols is `resolveJoinVarColumn` over an equijoin's two canonical
+// operands, memoised on the clause (P6-08, take3 08 §9).
+//
+// The resolution is a pure function of the clause and the search's base
+// relations — `joinKeyPairOf`'s own inputs `outer`/`inner` reach only the SIDE
+// test below it, never this — so recomputing it once per (clause, joinrel pair)
+// re-derives the same two (relation, column) answers O(2^n) times. Only the
+// column NAME is kept: the `*ColumnRef` the resolver also returns is used by
+// `examineJoinVar` for the operand's type, which this caller does not read.
+func (s *searchCtx) joinKeyOperandCols(ri *restrictInfo) (int, string, bool, int, string, bool) {
+	if ri.keyPairValid {
+		return ri.keyPairLeftRel, ri.keyPairLeftCol, ri.keyPairLeftOK,
+			ri.keyPairRightRel, ri.keyPairRightCol, ri.keyPairRightOK
+	}
+	lr, lcr, lok := s.resolveJoinVarColumn(ri.leftKey, ri.leftRelids)
+	rr, rcr, rok := s.resolveJoinVarColumn(ri.rightKey, ri.rightRelids)
+	var lcol, rcol string
+	if lcr != nil {
+		lcol = lcr.Name
+	}
+	if rcr != nil {
+		rcol = rcr.Name
+	}
+	if s != nil {
+		ri.keyPairLeftRel, ri.keyPairLeftCol, ri.keyPairLeftOK = lr, lcol, lok
+		ri.keyPairRightRel, ri.keyPairRightCol, ri.keyPairRightOK = rr, rcol, rok
+		ri.keyPairValid = true
+	}
+	return lr, lcol, lok, rr, rcol, rok
 }
 
 // provenKey is one applicable key: which clauses it covers, what to divide by,
