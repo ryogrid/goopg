@@ -1,0 +1,26 @@
+DPTRACE seam-decline reason=outer-link-no-sjinfo nrels=3 nleaves=3
+DPPATH path producer=upper.ordered.sort relids=- kind=7 reqouter=- rows=1 startup=0.39 total=0.40 disabled=0 pathkeys=2 verdict=accepted jointype=inner
+DPPATH path producer=joinsearch.prebuilt relids={0} kind=0 reqouter=- rows=150000 startup=0.00 total=12960.00 disabled=0 pathkeys=0 verdict=accepted jointype=inner
+DPPATH path producer=joinsearch.prebuilt relids={1} kind=0 reqouter=- rows=1500000 startup=0.00 total=97273.00 disabled=0 pathkeys=0 verdict=accepted jointype=inner
+DPPATH path producer=index.parameterised relids={0} kind=2 reqouter={1} rows=1 startup=0.25 total=8.29 disabled=0 pathkeys=1 verdict=accepted jointype=inner
+DPPATH path producer=index.parameterised relids={1} kind=2 reqouter={0} rows=16 startup=0.38 total=10.13 disabled=0 pathkeys=1 verdict=accepted jointype=inner
+DPPATH path producer=index.ordered relids={0} kind=2 reqouter=- rows=150000 startup=0.25 total=35740.06 disabled=0 pathkeys=1 verdict=accepted jointype=inner
+DPPATH path producer=index.ordered relids={1} kind=2 reqouter=- rows=1500000 startup=0.38 total=261225.77 disabled=0 pathkeys=1 verdict=accepted jointype=inner
+DPPATH path producer=bitmap.or relids={0} kind=15 reqouter={1} rows=1 startup=8.26 total=12.27 disabled=0 pathkeys=0 verdict=dominated jointype=inner
+DPPATH path producer=bitmap.or relids={1} kind=15 reqouter={0} rows=16 startup=8.46 total=12.62 disabled=0 pathkeys=0 verdict=dominated jointype=inner
+DPPATH path producer=indexonly relids={0} kind=2 reqouter=- rows=150000 startup=0.25 total=5226.25 disabled=0 pathkeys=0 verdict=accepted jointype=inner
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=1500000 startup=609094.69 total=632344.67 disabled=0 pathkeys=1 verdict=accepted jointype=left
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=1500000 startup=590972.73 total=649586.59 disabled=0 pathkeys=1 verdict=dominated jointype=left
+DPPATH path producer=mergejoin relids={0,1} kind=4 reqouter=- rows=1500000 startup=0.62 total=316089.88 disabled=0 pathkeys=1 verdict=accepted jointype=left
+DPPATH path producer=join.hash relids={0,1} kind=3 reqouter=- rows=1500000 startup=213116.25 total=336448.25 disabled=0 pathkeys=0 verdict=dominated jointype=left
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=1500000 startup=0.25 total=3375106249.25 disabled=0 pathkeys=0 verdict=dominated jointype=left
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=1500000 startup=0.62 total=1492084.73 disabled=0 pathkeys=0 verdict=dominated jointype=left
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=1500000 startup=0.62 total=1500214.61 disabled=0 pathkeys=0 verdict=dominated jointype=left
+DPTRACE problem nrels=2 rels=customer,orders
+DPTRACE pair phase=1 lev=2 created=1 pair={customer} | {orders} outer={customer} inner={orders}
+DPTRACE end top={customer+orders} pairs=1 declined=0 status=ok
+DPPATH path producer=upper.groupagg.hashed relids=- kind=6 reqouter=- rows=150000 startup=338587.63 total=340462.63 disabled=0 pathkeys=0 verdict=accepted jointype=inner
+DPPATH path producer=upper.groupagg.sort relids=- kind=6 reqouter=- rows=150000 startup=582350.89 total=595474.77 disabled=0 pathkeys=1 verdict=accepted jointype=inner
+DPPATH path producer=upper.groupagg.hashed relids=- kind=6 reqouter=- rows=200 startup=338588.00 total=338590.50 disabled=0 pathkeys=0 verdict=accepted jointype=inner
+DPPATH path producer=upper.groupagg.sort relids=- kind=6 reqouter=- rows=200 startup=350733.96 total=351861.46 disabled=0 pathkeys=1 verdict=accepted jointype=inner
+DPPATH path producer=upper.ordered.sort relids=- kind=7 reqouter=- rows=200 startup=338222.65 total=338223.15 disabled=0 pathkeys=2 verdict=accepted jointype=inner

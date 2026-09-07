@@ -828,8 +828,24 @@ rule).*
   premise is also unmet: the collapse=0 regime is fully alive after C-04c
   and untouched by it. Real blocker, named in ledger
   `c06-collapse-flip-moves-q13`: why the search wins a Merge Left Join at 5x
-  the cost. Resume when that is answered — retiring the flag is downstream
-  of it, not a prerequisite.
+  the cost. **ANSWERED 2026-09-07 (`cd9218645`), diagnosis
+  `analysis/planner-refactor-take3/c06-q13-diagnosis-20260907/README.md`:
+  MIS-GENERATION, not mis-costing and not a discard.** `DPPATH` shows both a
+  hash and a merge path generated and compared for `{customer,orders}`, and the
+  merge really is cheaper (316 090 vs 336 448) — because the only hash the
+  search may price must build the 1.5 M-row `orders` side, whose spill is 59% of
+  its cost. `jointypeForDirection` (joinpaths.go:155) DECLINES the commuted
+  direction rather than emitting PG's `JOIN_RIGHT`; its own comment justifies
+  that with "nothing selects these paths today in any case", which C-04a/C-04b
+  expired by letting a two-table LEFT JOIN into the search. A throwaway probe
+  admitting the direction prices `join.hash jointype=right` at **124 999**
+  (2.53x under the merge join), emits PG's exact `Hash Right Join` shape, gives
+  byte-identical results, and runs 4.4 s against 6.1 s. Also corrected:
+  **66 218 and 338 223 are not comparable** — on the OFF arm the join never
+  enters the search (`DPTRACE problem nrels=1`), so 66 218 is the plan-tree
+  estimator's price, and that estimator charges the hash join 0.25 startup and
+  prices `orders` at 29 998 where the search says 97 273. Successor row
+  **C-06s**. The flag still STAYS: nothing here makes the flip plan-neutral.
   *design: take3 08 §6.3; gate: take3 09 §5 P3.*
   **BLOCKED ON ITS OWN GATE, measured 2026-09-07 after C-04c.** The gate
   is "byte-identical plans for the flip" and the flip is NOT byte-
@@ -855,6 +871,27 @@ rule).*
   re-run this one-command measurement — two `estimate-audit -plan-only`
   captures on the same cluster, one per flag value — and delete the flag
   when they come back identical. Ledger `c06-collapse-flip-moves-q13`.
+- [ ] **C-06s — offer the COMMUTED direction of a LEFT join to the search
+  (PG's `JOIN_RIGHT`).** C-06's diagnosis, filed rather than landed because it
+  is not small. `jointypeForDirection` returns `(sjinfo.Jointype, false)` for
+  the reversed containment; PG's `populate_joinrel_with_paths`
+  (joinrels.c:932-939) returns `JOIN_RIGHT` there and `add_paths_to_joinrel`
+  builds hash and merge paths for it. Scope: **LEFT only, fail-closed** — SEMI
+  and ANTI must keep declining (`JOIN_RIGHT_SEMI`/`JOIN_RIGHT_ANTI` have no
+  goopg executor), FULL likewise. The probe shows the relaxation admits a
+  FAMILY (`join.hash` and `mergejoin` both gain `jointype=right` arms), which is
+  the two-spellings-of-one-join coupling C-03b deliberately withheld so C-04
+  would not have to prove both directions at once — that is the whole reason
+  this is an item and not a patch. Evidence in hand: PG-shape parity on Q13
+  (`Hash Right Join`, PG cost 56 164 / goopg 124 999 against a merge at
+  316 090), values byte-identical to the current plan on the SF=1 cluster, and
+  4.36/4.52 s against 6.06/6.64 s. `createPlanNode` already has the arm.
+  Gate: units + `go vet`; TPC-H 24/24 **by values** plus a timed pass on every
+  query whose plan moved; TPC-DS SF0.5 PASS=95 all-zero; `plan_snapshots/`
+  re-pin (this WILL move plans — coordinate, do not re-pin under a peer).
+  Closing this is C-06's precondition, not the other way round.
+  *diagnosis: `analysis/planner-refactor-take3/c06-q13-diagnosis-20260907/README.md`;
+  ledger `c06-commuted-leftjoin-direction-withheld`.*
 - [x] **C-07 P3-06 — BOTH HALVES LANDED (derivation + gate 2026-09-05, seam
   + widening 2026-09-07).**
   Landed 2026-09-05: `chooseQueryPathkeys` reproduces `standard_qp_callback`'s
