@@ -1,7 +1,7 @@
 # Planner + Executor refactor — performance report
 
 Scope: the `docs/design/not_ralph/minimize_datum/TODO_ALL.md` workstream.
-Branch `plan-narrowing-and-etc`. Dates 2026-09-05 and 2026-09-06.
+Branch `plan-narrowing-and-etc`. Dates 2026-09-05 to 2026-09-07.
 
 This report states what changed, what it cost or bought, and — with equal
 weight — what could not be measured and what got worse. Every number below
@@ -45,11 +45,34 @@ from a re-run.**
 | A/A plan capture, same binary, plan-SHAPE lines differing | 27 | **0** |
 | `make plan-gate` in `MODE=costs` (cost-exact) | not reachable | **22/22 MATCH** |
 
-The work items that landed in this session are **values-neutral and
-timing-neutral by design** (they change where a qual is evaluated, not what
-the query computes). The measurable deliverable is therefore the gate
-itself, plus two items closed as already-satisfied and two closed as
-not-worth-doing on evidence.
+That sentence described the FIRST session honestly and is kept as written.
+It no longer describes the workstream, so the interim position follows.
+
+### 1.1 Interim scoreboard (2026-09-07; superseded by C-21's acceptance run)
+
+The headline 27% above is a single-constant calibration result and still
+stands. What has accumulated since is a mix of measured wins, measured
+refusals, and one correctness fix:
+
+| | |
+|---|---|
+| TODO_ALL census | **80 done, 15 out of scope, 20 blocked, 5 open** |
+| further measured wins | TPC-DS Q40 1.50 → 0.92 s and Q80 13.54 → 10.57 s (C-04c); TPC-H planning time −14.1% total, Q9 −52% (C-20h P6-08); Q1 8.57 → 4.14 s (C-19g) |
+| measured and deliberately **held** | spill-cost Cut 3, −18.2% suite (Q12 −61.5%, Q18 −52.0%) — held on Q9 +62.5%, which is a parallel-plan interaction, not a ranking error |
+| measured and **not** landed | C-06s: a probe prices Q13's missing `Hash Right Join` at 2.53× under the merge, 6.06/6.64 s → 4.36/4.52 s, values byte-identical |
+| correctness fix found on the way | `build_join_pathkeys` kept the outer's keys for FULL/RIGHT joins — a wrong answer (rows out of order, correct row count) that **no row-count gate and no order-insensitive values gate can see** |
+
+**The honest summary of the refusals is that they are the majority of the
+work and most of its value.** Fifteen items are out of scope on measured
+grounds and twenty are blocked with named blockers; several were closed by
+*reading evidence already sitting in their own rows* rather than by new
+engineering. Four separate items turned out to rest on a premise that had
+expired — a narrowing or a decline that was true when written and was
+never re-checked after the reason went away (§5.28, §5.29).
+
+No end-to-end suite figure is claimed for the workstream as a whole until
+C-21's acceptance run; the numbers above are per-item and each is sourced
+in its own section.
 
 ## 2. The measurement problem, and why it dominated the session
 
