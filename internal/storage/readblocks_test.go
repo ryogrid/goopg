@@ -2,6 +2,9 @@ package storage
 
 import (
 	"errors"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -219,4 +222,80 @@ func TestReadBlocksLatchesEveryBlockInTheRun(t *testing.T) {
 		t.Fatalf("ReadBlocks after latch release: %v", err)
 	}
 	wg.Wait()
+}
+
+// readSyscallCount reads /proc/self/io's syscr field — the number of read-ish
+// syscalls this process has issued. Linux-only; the test skips elsewhere.
+func readSyscallCount(t *testing.T) int64 {
+	t.Helper()
+	b, err := os.ReadFile("/proc/self/io")
+	if err != nil {
+		t.Skipf("/proc/self/io unavailable: %v", err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "syscr: "); ok {
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err != nil {
+				t.Fatalf("parse syscr %q: %v", v, err)
+			}
+			return n
+		}
+	}
+	t.Skip("no syscr field in /proc/self/io")
+	return 0
+}
+
+// TestReadBlocksIssuesOneSyscallPerRun is the whole reason S1 exists, as a
+// gated fact rather than a reported measurement. io_combine_limit's payoff is
+// syscall COUNT: N adjacent blocks must cost one read, not N. A future change
+// that quietly turned readBlocks into a loop over readBlock would keep every
+// other test in this file green and silently delete the slice's only benefit.
+//
+// The counter is read via /proc/self/io, which itself costs one read per
+// sample — hence the +2 in the expected figures, and hence measuring the
+// DIFFERENCE of the two arms rather than an absolute.
+func TestReadBlocksIssuesOneSyscallPerRun(t *testing.T) {
+	if !preadvSupported {
+		t.Skip("no vectored read on this platform")
+	}
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
+	defer mgr.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 707, Fork: MainFork}
+	const n = DefaultIOCombineLimit // 16
+	extendN(t, mgr, rel, n)
+
+	// Arm A: n single-block reads.
+	one := blockBufs(n)
+	beforeA := readSyscallCount(t)
+	for i := 0; i < n; i++ {
+		if err := mgr.ReadBlock(rel, BlockNumber(i), one[i]); err != nil {
+			t.Fatalf("ReadBlock %d: %v", i, err)
+		}
+	}
+	afterA := readSyscallCount(t)
+
+	// Arm B: one combined read of the same run.
+	many := blockBufs(n)
+	beforeB := readSyscallCount(t)
+	if full, err := mgr.ReadBlocks(rel, 0, many); err != nil || full != n {
+		t.Fatalf("ReadBlocks = %d, %v; want %d, nil", full, err, n)
+	}
+	afterB := readSyscallCount(t)
+
+	singles := afterA - beforeA // n reads + the 2 /proc samples
+	combined := afterB - beforeB
+	t.Logf("E-19 S1: %d single-block reads = %d read syscalls; combined = %d", n, singles, combined)
+
+	if singles < int64(n) {
+		t.Fatalf("single-block arm issued %d read syscalls for %d blocks — "+
+			"the counter is not measuring what this test thinks", singles, n)
+	}
+	// One preadv plus the two /proc/self/io samples that bracket it.
+	if combined > 4 {
+		t.Fatalf("combined read of %d blocks issued %d read syscalls, want <= 4 "+
+			"(one preadv + the probe's own samples): the run is not being combined",
+			n, combined)
+	}
 }

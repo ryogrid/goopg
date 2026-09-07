@@ -852,9 +852,14 @@ is the whole point of `io_combine_limit`).
 transcribe `MAX_IO_COMBINE_LIMIT` / `DEFAULT_IO_COMBINE_LIMIT`
 (`postgres/src/include/storage/bufmgr.h:165-166`).
 
-**Measured, not asserted:** reading 16 consecutive blocks costs **18** read
-syscalls one block at a time and **3** through `ReadBlocks` (one `preadv` plus
-the probe's own two `/proc/self/io` reads) — i.e. 16 syscalls collapse to 1.
+**Measured, not asserted — and now GATED, not merely reported.** Reading 16
+consecutive blocks costs **18** read syscalls one block at a time and **3**
+through `ReadBlocks` (one `preadv` plus the probe's own two `/proc/self/io`
+reads) — i.e. 16 syscalls collapse to 1. That figure is an assertion in
+`TestReadBlocksIssuesOneSyscallPerRun`, because syscall *count* is the entire
+benefit of the slice: a future refactor that turned `readBlocks` into a loop
+over `readBlock` would keep every other test in the file green while deleting
+the only thing S1 buys.
 
 Three properties `readBlocks` deliberately keeps from `readBlock`, each with a
 test, because a vectored read that relaxed any of them would be a correctness
@@ -872,6 +877,9 @@ regression no values suite could see:
   draft: on a mismatch it returned the *full* block count, which would tell a
   caller reading count-before-error that the corrupt block had been filled. It
   now returns only the number of blocks that **verified**.
+- **The `recordIOTrace` / `PageIdentityObserve` pair**, per landed block.
+  Omitting them would make PageIdentity's corruption detector blind to exactly
+  the pages a prefetch window brings in — the class that observer exists for.
 
 **And the gate needs its own decision before S3 lands.** §6's suites cannot
 score this: TPC-H is 1.9 GiB in a 2048 MB pool, so the arm that would show the

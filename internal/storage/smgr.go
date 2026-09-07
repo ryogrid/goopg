@@ -926,6 +926,16 @@ func (r *relFile) readBlocks(first BlockNumber, bufs [][]byte) (int, error) {
 	if err != nil {
 		return full, err
 	}
+	for i := 0; i < full; i++ {
+		// Trace/observe parity with readBlock (smgr.go readBlock's
+		// recordIOTrace + PageIdentityObserve pair). A vectored read that
+		// skipped these would make PageIdentity's corruption detector blind
+		// to exactly the pages the prefetch window brought in — the class
+		// this observer exists for.
+		tag := BufferTag{Rel: r.rel, Block: first + BlockNumber(i)}
+		recordIOTrace(tag, "postRead", bufs[i])
+		PageIdentityObserve(tag, bufs[i], "postRead")
+	}
 	if r.checksums {
 		for i := 0; i < full; i++ {
 			if verr := r.verifyOnRead(first+BlockNumber(i), bufs[i]); verr != nil {

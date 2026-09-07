@@ -3838,9 +3838,24 @@ ledger row if the measurement says no.
   Filed 2026-09-07 at the owner's request, same standing as E-17 cut 2 and
   E-18: **design doc + agent review + commit the design first, then
   implement.**
-  **2026-09-07 — design + two adversarial reviews + Probe 0 landed;
-  implementation NOT started.**
+  **2026-09-07 — design + two adversarial reviews + Probe 0 landed.**
   `docs/design/storage-prefetch-buffer/E19-INSTALLING-PREFETCH.md`.
+  **Implementation progress (§5.9a slice order):**
+  - **S1 vectored read — LANDED + gated 2026-09-07.** `Manager.ReadBlocks` /
+    `relFile.readBlocks` / `preadvAt` (`preadv_linux.go`, ReadAt-loop
+    fallback in `preadv_other.go`), `MaxIOCombineLimit = 128` /
+    `DefaultIOCombineLimit = 16` transcribed from `bufmgr.h:165-166`.
+    The payoff is a **gated** fact, not a reported one:
+    `TestReadBlocksIssuesOneSyscallPerRun` measures 16 single-block reads at
+    **18** read syscalls and the same run through `ReadBlocks` at **3** (one
+    `preadv` plus the probe's own two `/proc/self/io` samples). Per-block
+    ascending latches, the bounds check under `r.mu`, per-block checksum
+    verification and the `recordIOTrace`/`PageIdentityObserve` pair are all
+    kept from `readBlock`; six tests, `-race` green. No caller yet, so the
+    slice is inert by construction.
+  - S2 pin accounting + test seams — pending.
+  - S3 `StartRead`/`FinishRead` — pending.
+  - S4 scan-side window — pending.
   **Probe 0 answers the sizing caveat below and answers it POSITIVELY**: on a
   cold, low-correlation, larger-than-pool index fetch (private cluster,
   port 5537, `shared_buffers = 128MB` vs 774 MB of data, serial, fresh capped
