@@ -224,10 +224,23 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		return node, pred, false
 	}
 	nrels := len(ctx.bindings)
-	// One relation is not a search (`make_rel_from_joinlist` returns the item);
-	// past `maxSearchRels` the RelSet cannot address the problem at all, and
+	// E-21 Cut 1 (onerelsearch.go): the floor is `minSearchRels()`, which is 2
+	// historically and 1 under `GOOPG_ONEREL_SEARCH`.
+	//
+	// The comment this replaces read "One relation is not a search
+	// (`make_rel_from_joinlist` returns the item)". That is true of the join
+	// ORDER and false of everything else: upstream runs
+	// `set_base_rel_pathlists` (allpaths.c:221) BEFORE
+	// `make_rel_from_joinlist` (allpaths.c:226), so the rel its
+	// `levels_needed == 1` branch returns already carries its `pathlist` AND
+	// its `partial_pathlist`. Declining here is what leaves a single-table
+	// statement with no `RelOptInfo` at all — no access-method comparison and,
+	// the reason E-21 exists, no partial path for `generateUsefulGatherPaths`
+	// to read. See DESIGN §1.1-§1.2.
+	//
+	// Past `maxSearchRels` the RelSet cannot address the problem at all, and
 	// the joinlist's own leaf indices would exceed the clause list's bit width.
-	if nrels < 2 || nrels > maxSearchRels || len(ctx.joinlist) == 0 {
+	if nrels < minSearchRels() || nrels > maxSearchRels || len(ctx.joinlist) == 0 {
 		traceSeamDecline("size-or-no-joinlist", nrels, len(ctx.joinlist))
 		return node, pred, false
 	}
@@ -246,15 +259,22 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// touching one is declined by the clause producer and survives in the
 	// residual `Filter` above the spine.
 	nprefix := jl.nrels()
-	if nprefix < 2 && len(spine) == 0 {
-		// One relation and no spine is not a search — the single-table paths
-		// own that statement. UNDER a spine a one-relation prefix is still
-		// worth planning (M0134-0188): there is no order to choose, but there
-		// IS an access method — base-rel path generation runs, `add_path`
-		// picks among seq / index / index-only, and the boundary republishes
-		// binding order exactly as for a wider prefix. `a LEFT JOIN b`'s left
-		// side is the one place PG chooses a covering scan that no other
-		// goopg seam could reach (TPC-H Q13).
+	if nprefix < minSearchRels() && len(spine) == 0 {
+		// UNDER a spine a one-relation prefix is already planned
+		// (M0134-0188): there is no order to choose, but there IS an access
+		// method — base-rel path generation runs, `add_path` picks among
+		// seq / index / index-only, and the boundary republishes binding
+		// order exactly as for a wider prefix. `a LEFT JOIN b`'s left side is
+		// the one place PG chooses a covering scan that no other goopg seam
+		// could reach (TPC-H Q13).
+		//
+		// E-21 Cut 1 extends that to a one-relation prefix with NO spine —
+		// i.e. a plain single-table statement — under `GOOPG_ONEREL_SEARCH`,
+		// because the argument above never depended on the spine. Upstream
+		// runs base-rel path generation for a one-relation query too
+		// (`set_base_rel_pathlists`, allpaths.c:221, called unconditionally
+		// from `make_one_rel` before the joinlist is looked at). With the
+		// knob off this is the historical decline, unchanged.
 		traceSeamDecline("prefix-size", nrels, nprefix)
 		return node, pred, false
 	}
