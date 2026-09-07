@@ -133,6 +133,15 @@ func TestSessionPlannerSettingsRoundTripsUnits(t *testing.T) {
 			"default is %.0f — the KB->blocks conversion is wrong",
 			got.EffectiveCacheSize, want.EffectiveCacheSize)
 	}
+	// ParallelStatementOK is not a GUC and has no default to round-trip: it is
+	// the STATEMENT-shape flag `plannerSettingsFrom` raises because every one
+	// of its callers plans a top-level statement (C-19g's remainder).
+	// Normalise it out rather than weaken the exact-equality bar, which is
+	// what makes this test worth having.
+	if !got.ParallelStatementOK {
+		t.Error("a top-level statement site must raise ParallelStatementOK")
+	}
+	got.ParallelStatementOK = false
 	if got != want {
 		t.Errorf("a fresh session must reproduce the planner defaults exactly:\n got %+v\nwant %+v", got, want)
 	}

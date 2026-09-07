@@ -98,6 +98,21 @@ const (
 	PathBitmapHeapScan
 	PathBitmapAnd
 	PathBitmapOr
+
+	// PathFinalizeAgg is C-19g's upper-rel-resident partial-aggregation
+	// candidate (partialaggupper.go): the whole
+	// `Finalize -> Gather -> Partial` shape as ONE path on the GROUP_AGG rel.
+	//
+	// It is one kind rather than three stacked ones because goopg's executor
+	// expresses the split as a linked PAIR — `Aggregate.PartialSource` points
+	// at the very `*Aggregate` the Gather runs, and the Partial node publishes
+	// group states through that pointer instead of emitting rows — so the
+	// three nodes cannot be built independently by three createPlan arms. The
+	// path still CARRIES its partial and gather children (they are what the
+	// cost is composed from, and what a trace shows); the arm reads the input
+	// subtree off the bottom of that chain and hands the shape to
+	// `splitAggregate`, the same constructor the post-pass uses.
+	PathFinalizeAgg
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept

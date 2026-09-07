@@ -161,6 +161,30 @@ type PlannerSettings struct {
 	MinParallelTableScanSize    int64
 	MinParallelIndexScanSize    int64
 	ParallelLeaderParticipation bool
+
+	// ParallelStatementOK is the STATEMENT-shape half of
+	// `statementIsParallelSafe` (parallel.go), carried into the pre-cache
+	// planner so an upper-rel producer can refuse for the same reasons the
+	// post-pass refuses at its entry.
+	//
+	// It is NOT a session input and deliberately NOT part of the plan-cache
+	// fingerprint: it is a property of the SQL text, which the cache key
+	// already fixes.
+	//
+	// It travels one way only: the postmaster's `plannerSettingsFrom` sets it
+	// on the top-level statement sites, `PlanWithSettings` clears it for any
+	// statement that is not a plain SELECT, and `planSelectWithParent` clears
+	// it for every nested scope. Every hand-built PlannerSettings —
+	// `DefaultPlannerSettings`, and therefore `optimizer.Plan` — leaves it
+	// false. Fail-closed by DEFAULT rather than by enumeration, which is the
+	// lesson of TPC-H Q15b: a view body is planned by a re-entrant `Plan` call
+	// whose result becomes a search LEAF, and a flag derived from the
+	// statement's own shape called that body a top-level SELECT.
+	//
+	// The residual facts that are neither statement shape nor session GUC —
+	// the transaction's isolation level above all — cannot be known here at
+	// all, and are enforced POST-cache by `StripGather` (parallel.go).
+	ParallelStatementOK bool
 }
 
 // DefaultPlannerSettings returns the settings a statement plans under when no

@@ -345,7 +345,7 @@ func deriveJoinKeepsAt(p *Path, out map[string]bool, anc map[string]bool, poison
 		deriveJoinKeepsAt(inner, out, childAnc, childPoison)
 	case PathNestLoop, PathMemoize, PathPrebuilt,
 		PathBitmapHeapScan, PathBitmapIndexScan, PathBitmapAnd, PathBitmapOr,
-		PathAgg, PathGather, PathGatherMerge:
+		PathAgg, PathGather, PathGatherMerge, PathFinalizeAgg:
 		// F3-conservative, B-01a NL policy (decline): a nested-loop
 		// poisons its subtree — no stamps at or below it, and levels
 		// above it are unaffected. The parameterised (NLI) shape is

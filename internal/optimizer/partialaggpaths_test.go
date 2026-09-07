@@ -325,10 +325,19 @@ func TestPartialAggModeLabelRoundTrips(t *testing.T) {
 			t.Errorf("%q round-tripped to %q", label, got)
 		}
 	}
-	// Fail-closed: a typo must not enable the mode.
-	for _, bogus := range []string{"", "ON!", "yes please", "true-ish"} {
-		if partialAggModeFromEnv(bogus) != partialAggPathsOff {
-			t.Errorf("%q enabled the mode; the switch is not fail-closed", bogus)
+	// The DEFAULT moved to `on` with C-19g's upper-rel-resident half, so the
+	// direction a typo falls in moved with it: `off` is the explicit opt-out
+	// and anything unrecognised reads as the shipped default. What must still
+	// hold is that a typo cannot silently DISABLE the shipped behaviour —
+	// which is the same property, pointed the other way.
+	for _, bogus := range []string{"", "OFF!", "no thanks", "false-ish"} {
+		if partialAggModeFromEnv(bogus) != partialAggPathsOn {
+			t.Errorf("%q disabled the mode; an unrecognised value must read as the default", bogus)
+		}
+	}
+	for _, off := range []string{"off", "OFF", " Off ", "false", "0"} {
+		if partialAggModeFromEnv(off) != partialAggPathsOff {
+			t.Errorf("%q did not select the serial control arm", off)
 		}
 	}
 }

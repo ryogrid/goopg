@@ -543,3 +543,198 @@ The flip is therefore a small, fully specified follow-up: set the default arm of
 `partialAggModeFromEnv`, run `make plan-gate` + `MODE=costs` on the canonical
 cluster, re-pin `plan_snapshots/` in the same commit, and regenerate
 `scripts/planner-flags.env` (the label becomes `unset(on)`).
+
+---
+
+## 10. THE REMAINDER, LANDED (2026-09-07) — §8's upper-rel-resident half
+
+§8 named one change in `groupingpaths.go` plus "the plan-cache question of
+§2.2". Both are done, and the item's `[~]` closes. New file:
+`internal/optimizer/partialaggupper.go`; the DEFAULT is now
+`GOOPG_PARTIAL_AGG_PATHS=on`.
+
+### 10.1 Why it had to be finished before anything else in Phase 5 could move
+
+C-19g replaced the split VERDICT but not its CONSTRUCTION: `splitAggregate`
+(parallel.go) still built `Finalize → Gather → Partial` inside the
+`MaybeAddGather` POST-PASS, so C-19g's own Q1 win was delivered THROUGH the
+post-pass and died with it. C-19h measured the consequence
+(`docs/design/planner-c19h-gather-postpass/DESIGN.md` §3): at the engine
+defaults the post-pass was the ONLY producer of parallelism — 12/22 TPC-H
+queries with it, **0/22** without — and a stand-down probe under
+`GOOPG_GATHER_PATHS=all GOOPG_PARTIAL_AGG_PATHS=on` reached only 7/22, losing
+Q1, Q6, Q14, Q15a, Q16 and Q19. Every one of those six is an aggregate query.
+
+### 10.2 §2.2's two blockers, answered
+
+**"No input rel."** Upstream seeds `partially_grouped_rel` from
+`input_rel->partial_pathlist`, and the rel carrying `PartialPathlist` dies
+inside `planJoinlistSearch` before the aggregate stage runs. The answer is that
+goopg does not need a distinct partial PLAN: `gatherOp.runWorker` builds each
+worker's own copy of the Gather's child subtree and calls `attachParallelScan`
+on it, so the partial plan IS the serial subtree with its driving scan stamped
+— which is what `splitAggregate` has always relied on. What upstream's partial
+path supplies that a Node cannot is the PRICE, and that is supplied by
+`parallelSeedCost`: startup unchanged, RUN cost divided by
+`get_parallel_divisor`. That is `cost_seqscan`'s own parallel adjustment
+applied to a subtree rather than to one scan, and it is the single quantity in
+the producer that is not transcribed from a PG cost function. Its direction is
+known and stated: upstream leaves the per-page I/O term undivided because the
+workers share one relation, so dividing the whole run cost OVERSTATES the
+speedup of an I/O-bound subtree.
+
+**"The parallel decision may not be CACHED."** Answered in two halves, both
+landed here:
+
+1. the parallel block now reaches the pre-cache planner
+   (`plannerSettingsFrom`) and is part of `plannerCacheFingerprint`
+   (`max_parallel_workers_per_gather`, `min_parallel_table_scan_size`,
+   `min_parallel_index_scan_size`, `parallel_leader_participation`,
+   `enable_gathermerge`), so a session with its own parallel settings keys
+   into its own cache entry instead of borrowing a plan built under someone
+   else's;
+2. the inputs that are NOT session GUCs — the transaction's isolation level,
+   and the statement-shape refusals `statementIsParallelSafe` makes — are
+   enforced AFTER the lookup by the new `StripGather` (parallel.go), which
+   `MaybeAddGather` now calls on any plan it is not allowed to parallelise
+   instead of returning it unchanged. `StripGather` is exact rather than
+   approximate in both shapes it meets: a plain Gather is semantically
+   transparent, and a split aggregate folds back to the SIMPLE aggregate it
+   was split from — dropping only its Gather would leave a Finalize over a
+   node that emits no rows at all.
+
+### 10.3 The producer
+
+`addPartialAggSplitPath` files, on the SAME `GROUP_AGG` rel C-15's serial
+candidates sit on, adjudicated by the same `addPath`/`setCheapest`:
+
+- **the split** — `Finalize → Gather → Partial`, one `PathFinalizeAgg` whose
+  `createPlan` arm calls `splitAggregate` itself, so a path-model split and a
+  post-pass split are byte-identical rather than merely similar (rule #2);
+- **the gathered no-split family** — `Agg → Gather → input`, in the hashed and
+  sorted shapes `addGroupingPaths` offers, built as if no usable presorted keys
+  existed (a Gather interleaves its workers' streams, so input order is gone
+  above it).
+
+The no-split family is not optional, and TPC-H proved it twice. Without it the
+serial arms are the only competition, they are priced over the UNDIVIDED input,
+and the split therefore wins on the parallel divisor alone even where it
+pre-aggregates nothing: Q3 and Q10 (≈300 k groups from ≈300 k rows) both took a
+split that reduced nothing. And gating the whole producer on
+`aggregateSplitIsSafe` — rather than gating only the split arm — cost Q16 its
+Gather entirely: a `count(distinct …)` cannot be split, but the Gather still
+belongs below it, which is exactly what `terminatesPartial` makes the post-pass
+do.
+
+Worker sizing is `computeParallelWorkerForRel` — the path model's own entry,
+not the post-pass's `computeParallelWorkers`, which needs a live block count
+through `ParallelSettings.BlocksForTable` and returns 0 without one. The live
+size comes from the new `catalog.TableRealPages`, `IndexRealPages`' sibling and
+PG's own input (`estimate_rel_size` fills `rel->pages` from
+`RelationGetNumberOfBlocks`). Keying it on ANALYZE statistics instead would
+have refused every query on a freshly started server, since
+`TableStats.RowCount`/`Pages` are not restored (ledger pq-P6).
+
+### 10.4 Four defects the live gates found, each a general rule
+
+1. **A Finalize node is not stampable.** `stampAggregateInputTarget` derived a
+   keep from the Gather's output row while the GroupExprs still addressed the
+   input row; `assertAggregateInputTargetCoversKeys` stopped the process on
+   nine TPC-H queries. `splitAggregate` already declined this on the node it
+   built; the producer made a Finalize reach the caller's re-stamp. Fixed by
+   declining for any non-Simple aggregate.
+2. **Passes that run after the aggregate stage must descend through a Gather.**
+   Before this slice the only Gather producer ran AFTER all of them, so
+   `foldPlanConstants` and `walkPlanExprs` had no Gather arm. The fold's
+   absence was not cosmetic: EXPLAIN recomputes `rows=` from the predicate, so
+   Q6 read `rows=53603` against the folded plan's `2412` for the identical
+   scan.
+3. **A nested scope must be closed BY DEFAULT, not by enumeration.** The
+   statement-shape flag was first derived inside `PlanWithSettings` from the
+   statement's own type — and a VIEW BODY is planned by a re-entrant `Plan`
+   call (planner.go:3440) whose result becomes a LEAF of the enclosing
+   statement's join search. The body looked like a top-level SELECT, came back
+   carrying a Gather, and `assertSearchedTreeNeedsNoReconcile` stopped Q15b.
+   The flag now travels one way only: raised by the postmaster's top-level
+   sites, cleared for every other statement shape and every nested scope.
+4. **EXPLAIN must be transparent to that flag.** With `*parser.ExplainStmt`
+   clearing it, EXPLAIN planned a serial aggregate for a statement that
+   executed the split — the census read 0/22 queries carrying a Gather while
+   the digest arm's Q1 ran 43% faster. EXPLAIN is the only way a user OBSERVES
+   a plan; of all the recursive entry points it is the one that must not
+   default.
+
+### 10.5 MEASURED (2026-09-07, private clone of the SF=1 cluster on port 5541)
+
+One binary per campaign, fresh capped server per arm, `GOOPG_ANALYZE_SEED=20260905`,
+`GOMEMLIMIT=12GiB GOGC=off`.
+
+**The control arm is inert, cost-exactly.** With the code landed and the knob
+`off`, `make plan-gate` against the previous pin `c05-c04b-20260907` is
+**22/22 MATCH in BOTH `structural` AND `MODE=costs`** — the cost-exact control
+C-19g could not obtain on its own clone.
+
+**Plans.** With the default flipped, three queries move against that pin, and
+the new pin `plan_snapshots/c19g-upper-partialagg-20260907.txt` is 22/22 in
+both modes:
+
+| query | move |
+|---|---|
+| Q5 | gains `Finalize → Gather → Partial` (25 groups) |
+| Q9 | gains `Finalize → Gather → Partial` (303 093 rows → 5 000 groups) |
+| Q16 | `GroupAggregate` over `Sort` over `Gather` → `HashAggregate` over `Gather` |
+
+Q1 MATCHES the pin: the split it already had is now produced by the PATH rather
+than by the post-pass, which is the whole point of the slice and is what §10.6
+measures.
+
+**Values.** TPC-H `tpch-runner -digest`, four arms (off/on/off/on):
+**24 MATCH, PASS on VALUES** in every pairing. TPC-DS SF0.5 sweep: see §10.7.
+
+**Timing**, two passes per arm, host load 3–14 (peer agents active), so the
+per-query noise band is the stated ±17%:
+
+| query | off (s) | on (s) | mean Δ |
+|---|---|---|---|
+| **Q1** | 14.54, 10.52 | 8.29, 6.50 | **−41.0%** |
+| Q16 | 0.83, 0.84 | 0.48, 0.61 | −34.7% |
+| suite total | 156.8, 151.8 | 138.6, 148.8 | −6.9% |
+
+An earlier, quieter campaign (load ≈4) on the same clone read Q1 8.49/8.82 →
+4.46/5.28 (**−43.7%**) and a suite total of −4.2%. The suite delta sits at the
+edge of the arms' own spread and is not claimed; Q1 and Q16 are outside it.
+
+### 10.6 The C-19h census, re-run — C-19h is UNBLOCKED
+
+Same engine image, engine defaults, EXPLAIN over the 22 TPC-H queries; the
+probe build stands `MaybeAddGather`'s ADD half down while keeping its
+`StripGather` enforcement.
+
+| arm | queries carrying a Gather |
+|---|---|
+| post-pass live, knob **off** (the pre-flip default) | **12/22** |
+| post-pass live, knob **on** (the new default) | **12/22** |
+| post-pass **stood down**, knob **off** | **0/22** |
+| post-pass **stood down**, knob **on** | **12/22** |
+
+The twelve are the SAME twelve in every non-zero arm: Q1, Q3, Q5, Q6, Q7, Q8,
+Q9, Q10, Q14, Q15a, Q16, Q19. C-19h's blocker — "at the default the post-pass
+is the ONLY producer of parallelism, 12/22 with it and 0/22 without" — no
+longer holds: the path model reaches every query the post-pass reaches, and the
+six-query loss cohort (Q1, Q6, Q14, Q15a, Q16, Q19) is fully recovered.
+
+Retiring the post-pass is still NOT taken here. Two things must survive it and
+neither is C-19g's to move: the `StripGather` enforcement (the post-cache half
+of the plan-cache answer above, which is not a "post-pass" at all and must
+outlive the ADD half), and `debug_parallel_query`, which the upper-rel producer
+does not read — a forced-parallel regress arm still needs the post-pass or an
+equivalent path-model gate.
+
+### 10.7 Gates
+
+- `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — green.
+- `go vet ./internal/optimizer/ ./internal/postmaster/` — clean.
+- `make plan-gate` and `make plan-gate MODE=costs` against
+  `c19g-upper-partialagg-20260907` — 22/22 both.
+- TPC-H digest — 24/24 MATCH on VALUES, both arms, twice.
+- TPC-DS SF0.5 sweep — recorded in the TODO_ALL row.

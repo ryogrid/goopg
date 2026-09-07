@@ -174,6 +174,63 @@ func createAggPlan(p *Path) (Node, outputLayout) {
 	return &out, nil
 }
 
+// createFinalizeAggPlan is the PathFinalizeAgg arm (C-19g's remainder): emit
+// the parallel `Finalize -> Gather -> Partial` shape for the GROUP_AGG rel's
+// winning split candidate.
+//
+// It does NOT recurse through its own gather/partial children. Those exist to
+// carry the price (partialaggupper.go composes the cost from all three arms and
+// a trace shows them), but the three NODES cannot be built independently:
+// goopg's Final aggregate holds a `PartialSource` pointer at the very
+// `*Aggregate` its Gather runs, and the Partial publishes group states through
+// that pointer rather than emitting rows. So the arm walks to the bottom of the
+// chain, builds the ONE input subtree, and hands the shape to `splitAggregate`
+// (parallel.go) — the identical constructor `MaybeAddGather` calls, which is
+// what makes a path-model split and a post-pass split byte-identical rather
+// than merely similar (rule #2: sibling paths must agree).
+//
+// Every refusal is a panic, per createplan.go's contract: a path reaching here
+// in one of these shapes is a producer bug.
+func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
+	if p.Agg == nil {
+		panic("createPlan: PathFinalizeAgg with no aggregate spec")
+	}
+	if p.ParallelWorkers <= 0 {
+		panic(fmt.Sprintf("createPlan: PathFinalizeAgg planning %d workers", p.ParallelWorkers))
+	}
+	// Finalize -> Gather -> Partial -> input.
+	if len(p.Children) != 1 || p.Children[0] == nil || p.Children[0].Kind != PathGather {
+		panic("createPlan: PathFinalizeAgg without a PathGather child")
+	}
+	gather := p.Children[0]
+	if len(gather.Children) != 1 || gather.Children[0] == nil || gather.Children[0].Kind != PathAgg {
+		panic("createPlan: PathFinalizeAgg's Gather without a partial PathAgg child")
+	}
+	partial := gather.Children[0]
+	if len(partial.Children) != 1 || partial.Children[0] == nil {
+		panic("createPlan: PathFinalizeAgg's partial aggregate without an input")
+	}
+	child, layout := createPlanNode(partial.Children[0])
+	if child == nil {
+		panic("createPlan: PathFinalizeAgg over a child path that built no node")
+	}
+	simple := *p.Agg
+	simple.Child = child
+	simple.Strategy = p.AggStrategy
+	// `splitAggregate` stamps the driving scan itself (stampParallelScan) and
+	// returns the Final node; the producer has already established that a
+	// driving scan exists, which is the same precondition `gatherChildPlan`
+	// enforces for a plain Gather.
+	built, ok := splitAggregate(&simple, p.ParallelWorkers).(*Aggregate)
+	if !ok || built == nil {
+		panic("createPlan: PathFinalizeAgg: splitAggregate built no aggregate")
+	}
+	if built.PartialSource == nil || drivingScan(built.PartialSource.Child) == nil {
+		panic("createPlan: PathFinalizeAgg over a subtree with no driving scan; every worker would read the whole relation")
+	}
+	return built, layout
+}
+
 // createDistinctPlan is the PathDistinct arm (C-16): emit the path's
 // DISTINCT spec over the built input — `*Distinct` (hash dedup), or
 // `DistinctOn` with all-output-columns keys when the path is Unique

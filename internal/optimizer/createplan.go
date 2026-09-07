@@ -141,6 +141,11 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	case PathAgg:
 		// C-15: the GROUP_AGG upper rel's candidate. createplansimple.go.
 		return createAggPlan(p)
+	case PathFinalizeAgg:
+		// C-19g's remainder: the GROUP_AGG rel's PARALLEL candidate — the
+		// whole Finalize -> Gather -> Partial shape, built by the same
+		// `splitAggregate` the post-pass uses. createplansimple.go.
+		return createFinalizeAggPlan(p)
 	case PathDistinct:
 		// C-16: the DISTINCT upper rel's candidate. createplansimple.go.
 		return createDistinctPlan(p)
