@@ -2980,6 +2980,57 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
+- [ ] **E-17 EX3-08 scan-resident qual — evaluate the predicate ONCE, as PG
+  does, and delete the `Filter` node above the scan.** Filed 2026-09-07 from
+  the format/decode survey (`DATUM-ROW-FORMAT-AND-PG-COMPAT.md` §5.1.1).
+  **Today the predicate is evaluated TWICE on every surviving row.**
+  `scan_prefilter.go` evaluates it inside the scan over `[0, MaxCols)`, and
+  `filterOp` — deliberately left in place — evaluates the same predicate
+  again on the full row. The file says "The shape is PostgreSQL's", but on
+  this point it is not: PG pushes the qual INTO the scan node
+  (`SeqScan.qual`, run by `ExecScan`), has no separate Filter node, and
+  evaluates **once**.
+  **What the second evaluation does and does not buy** (read off the code,
+  not the comment):
+  - It is NOT the guard against the failure that matters. A prefilter that
+    wrongly says *true* is caught by `filterOp`; a prefilter that wrongly
+    says *false* has already dropped the row at `continue` and `filterOp`
+    never sees it. The wrong-answer direction is guarded by the whitelist,
+    the `MaxCols` bound and `poisonDeformTail` — not by re-evaluation.
+    The comment itself calls the caught direction harmless ("costs nothing
+    but time").
+  - `filterOp` IS load-bearing for two ABSTAIN paths, which any removal must
+    absorb (`operators_storage.go:2095-2107`): `needsDetoastPrefix` true (a
+    toasted prefix value would be judged un-detoasted) and `perr != nil`
+    (the error is deliberately raised by `filterOp` "from exactly where it
+    did before" — an error-position contract, not an accident).
+  - **No selectivity gate exists.** `planScanPrefilter` declines only when
+    `need >= ncols`; it never consults selectivity. A predicate that reads
+    few columns but admits most rows therefore saves no deform work and pays
+    one extra evaluation per row — a net loss, **unmeasured**.
+  **Two cuts, cheapest first; they are independent and cut 1 does not need
+  cut 2.**
+  1. *Skip-flag.* The scan reports "I already decided true" per row and
+     `filterOp` skips its evaluation; the flag stays clear on both abstain
+     paths so those rows are still evaluated exactly once, by `filterOp`.
+     Removes the duplicate work without changing any node shape or any
+     error position. Cheap and reversible.
+  2. *PG's shape.* Make the scan a COMPLETE qual evaluator (all expression
+     kinds, detoast, PG-identical error position and ordering) and delete
+     the `Filter` node. This is a different design from today's deliberate
+     whitelist, and the whitelist's failure direction — an unlisted node
+     disables the prefilter, costing performance not correctness — must not
+     be lost: a complete evaluator has no "opt out" to fall back on.
+  **Measure before cut 2.** The prize for cut 1 is one predicate evaluation
+  per surviving row; the prize for cut 2 is that plus one node's per-row
+  overhead. Q6 survives ~2% of 6 M rows, so the win there is small and the
+  real target is the unmeasured low-selectivity case above — **build that
+  case first**, since it is also the only shape where today's prefilter is a
+  pessimisation.
+  *gate: values both suites; plans byte-identical for cut 1 (no node shape
+  changes); cut 2 moves EXPLAIN output — the Filter line disappears — so it
+  needs a `plan_snapshots/` re-pin and a PG-parity re-check in the same
+  commit, plus an error-position test per abstain path.*
 - [x] **F-01 Delete the duplicate build map** — already satisfied in-tree by `514913912` (M0127-P0.3: plan-typed single-map build, `lazyHashFinalize`/`lazyBuildAllInt64` deleted; enforced by `join_single_map_build_test.go` dual-map-build-back guard); gates: executor join suites green at that commit; artifacts: `internal/executor/operators_join_agg.go`, `internal/executor/join_single_map_build_test.go`.
 - [x] **F-02 Probe-seam re-materialisation** — already satisfied in-tree,
   audit-only close 2026-09-05. The premise (take2 07 §6, evidence from
