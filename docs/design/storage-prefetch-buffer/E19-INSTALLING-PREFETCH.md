@@ -824,7 +824,7 @@ unchanged by the good news:
 
 | slice | why it is first |
 | :-- | :-- |
-| **S1** vectored read through `Manager`/`AIOEngine`/all three methods | without it the design discards `io_combine_limit`; also the only slice with no buffer-pool correctness surface |
+| **S1** vectored read through `Manager` (**LANDED 2026-09-07**) | without it the design discards `io_combine_limit`; also the only slice with no buffer-pool correctness surface |
 | **S2** pin accounting + pin-sum accessor + read-error injection seam | §4.2's three hazard tests are unwritable until this lands |
 | **S3** `StartRead`/`FinishRead` with the §4.1a reworks | the six breaks, each of which is a wrong-data or deadlock class, not a perf class |
 | **S4** the `bitmapHeapScanOp` / index-scan window with a **new** drain point | plus the parallel batched-claim API if the parallel path is in scope |
@@ -843,6 +843,35 @@ fired on once. S1 is therefore NOT a thin API shim; scope it as ring
 surgery + per-method tests + checksum preservation, and do not accept a
 loop-over-`ReadBlock` as "vectored" (it buys no syscall reduction, which
 is the whole point of `io_combine_limit`).
+
+### 5.9b S1 LANDED — `Manager.ReadBlocks`, and the combining is measured
+
+`Manager.ReadBlocks(rel, first, bufs)` → `relFile.readBlocks` → `preadvAt`
+(`preadv_linux.go` / a ReadAt-loop fallback in `preadv_other.go`).
+`MaxIOCombineLimit = 128` and `DefaultIOCombineLimit = 128 KiB / BlockSize = 16`
+transcribe `MAX_IO_COMBINE_LIMIT` / `DEFAULT_IO_COMBINE_LIMIT`
+(`postgres/src/include/storage/bufmgr.h:165-166`).
+
+**Measured, not asserted:** reading 16 consecutive blocks costs **18** read
+syscalls one block at a time and **3** through `ReadBlocks` (one `preadv` plus
+the probe's own two `/proc/self/io` reads) — i.e. 16 syscalls collapse to 1.
+
+Three properties `readBlocks` deliberately keeps from `readBlock`, each with a
+test, because a vectored read that relaxed any of them would be a correctness
+regression no values suite could see:
+
+- **Per-block latches over the whole run**, acquired in **ascending** order —
+  which is what makes it deadlock-free against another run (also ascending) and
+  against any single-block reader/writer. `TestReadBlocksLatchesEveryBlockInTheRun`
+  holds block 2's latch and asserts a 0..3 run cannot complete.
+- **The bounds check is under `r.mu`, with the read.** This deliberately does
+  *not* repeat `PrefetchBlock`'s unlocked `f.nblocks` read (`smgr.go:212`,
+  source review finding 8).
+- **Per-block checksum verification**, inside `readBlocks` so no caller can
+  bypass it. `TestReadBlocksVerifiesChecksums` caught a real flaw in the first
+  draft: on a mismatch it returned the *full* block count, which would tell a
+  caller reading count-before-error that the corrupt block had been filled. It
+  now returns only the number of blocks that **verified**.
 
 **And the gate needs its own decision before S3 lands.** §6's suites cannot
 score this: TPC-H is 1.9 GiB in a 2048 MB pool, so the arm that would show the
