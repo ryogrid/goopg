@@ -395,4 +395,8 @@ the independent `spillOracleLess`, plus multiset-equality on every arm,
 - Plan check: `changed=0` by construction — (B) touches only the
   executor `chunkLimit` (unreachable from plan-only captures); planner
   bytes identical.
-- TPC-DS SF0.5 sweep: see §10.4.
+- TPC-DS SF0.5 sweep: **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0
+  SKIP=4** (`/tmp/e01-sweep-out/sweep-20260907-201016.txt`, scratch; (B)
+  binary `tmp/goopg-e01`, main-tree script, shared cluster idle, private
+  binary + scratch results dir). (C) ledgered as
+  `take3-E-01-fanin-deferred`; E-01 CLOSES on this measurement.

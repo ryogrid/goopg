@@ -3217,23 +3217,24 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
 alloc arms together; plan-shape pin `changed=0`; both suites fresh server
 per arm; values never counts for projection/join-adjacent changes).*
 
-- [~] **E-01 EX3-04 sort spill runs + merge discipline — UNBLOCKED
-  2026-09-07 (same B-01c slices (b) AND (c) as D-06).** The EX1 sort half
-  now exists for the sorted-aggregate shape (slice (b)) AND for the general
-  ORDER BY sort (slice (c)): both spill the narrowed row. The §8.2
-  "premature on pre-EX1 widths" objection therefore no longer holds for
-  either, and still holds for the shapes slice (c) declines (the REFUSE
-  list under D-06), so a spilling-sort A/B must still state which shape it
-  measured — but it is no longer choosing between one narrowed shape and
-  everything else.
-  Run formation on `flushChunk`, tape-style
-  merge-back (logtape analogue, take3 10 §9). Spill thresholds are
-  batching geometry: on pre-EX1 widths this is premature by rule (take3
-  13 §8.2, EX-P7).
-   *design: take3 13 §5 + `docs/design/executor-ex3-04-sort-spill-runs/DESIGN.md`
-  (verdict-first: run formation pre-exists, live residue is threshold
-  sourcing + fan-in; both reviews landed, citations re-verified at
-  `fc76b20fd`); gate: spilling-sort shapes; values + pin.*
+- [x] **E-01 EX3-04 sort spill runs + merge discipline — LANDED 2026-09-07
+  (commits `7d86f172a` (D+E), `f5516acfb` (B), `f5713cc6a` (gates).**
+  Verdict-first per design: run formation + merge-back pre-existed
+  (M0068-0006 + M0134-0191), so the WORK clause was stale. Landed: (D)
+  ordering gate (`sort_spill_order_test.go` — 10-arm matrix + CTID +
+  rescan, all green); (E) `Close` hygiene (clears keyvals/mergeReady/
+  sortErr/ctidsDisabled/peakBytes — the rescan test caught a nil-heap
+  panic pre-fix, latent at HEAD); (B) `chunkLimit` sources `ctx.WorkMem`
+  (faithfulness-only: census maxima Q10 10.4 MB / Q1 26.2 MB, no corpus
+  query in the 64–256 MB band, no timing claim). (C) bounded fan-in
+  LEDGERED (`take3-E-01-fanin-deferred`), not attempted — unreachable
+  until (B) changes behaviour on a real shape.
+  Gates: executor suite green; sort-scoped `-race` green (full-package
+  `-race` fails on pre-existing `TestSubquerySemanticsMatrix`
+  instrument race, verified at pre-(B) commit); spotcheck Q12=2/Q13=34
+  PASS; TPC-H digest 22/22 OK; TPC-DS SF0.5 sweep **PASS=95 MISMATCH=0
+  CKMISMATCH=0**; plan `changed=0` by construction (executor-only).
+  *design: take3 13 §5 + `docs/design/executor-ex3-04-sort-spill-runs/DESIGN.md`.*
 - [-] **E-02 — OUT OF SCOPE 2026-09-07: half its blocker is discharged and
   the other half has no witness.** The row reads *BLOCKED on B-16 + EX1 exit*.
   **B-16 is `[x]` done**, so that half is discharged. What remains is the EX1
