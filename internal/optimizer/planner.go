@@ -1258,7 +1258,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			Rows:   [][]Expr{{}},
 			schema: nil,
 		}
-	} else if isSimpleSingle {
+	} else if isSimpleSingle && !oneRelSearchEnabled() {
 		rv := s.From[0]
 		fromOnly = rv.Only
 		// Delegate the simple-single-table case to
@@ -1374,7 +1374,19 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// is shared with the view/rule deparsers, which must keep rendering
 		// the query as written.
 		whereQual := canonicalizeQual(s.Where)
-		if isSimpleSingle {
+		// E-21 Cut 1b: under GOOPG_ONEREL_SEARCH a single-table statement
+		// is planned by the search, not by the rule-based chooser below —
+		// replacing that chooser with `add_path` for every single-table
+		// statement is what closes the row. The generic arm builds
+		// Filter{scan} and runs the full machinery (unnest, tryJoinSearch,
+		// pathkeys derivation); the seam admits one-relation problems at
+		// `minSearchRels()` (Cut 1) and the one-relation protocol picks
+		// the access method on cost. What the rule chooser did that the
+		// generic arm does not (LIKE-range injection, NOT NULL reduction)
+		// is a missed optimisation in the ON arm, never a wrong answer:
+		// both are value-preserving rewrites. Default OFF: the condition
+		// below is the historical branch, byte for byte.
+		if isSimpleSingle && !oneRelSearchEnabled() {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
 			whereForIndex := injectLikeRangePredicates(whereQual)

@@ -3976,7 +3976,32 @@ ledger row if the measurement says no.
   blind to this by construction); values both suites; each PG function
   transcribed cited by file:line in the design doc.*
 
-- [ ] **E-21 Single-table statements never enter the path search.**
+- [x] **E-21 Single-table statements never enter the path search — CUT 1b
+  LANDED 2026-09-07, FLIP DECLINED ON MEASUREMENT (flag stays OFF).**
+  Both `isSimpleSingle` diversions (FROM + WHERE arms) fall through to
+  the generic Filter+search machinery under `GOOPG_ONEREL_SEARCH`
+  (default OFF): two-line condition change, no duplicated sequence.
+  What the rule chooser did that the generic arm does not (LIKE-range
+  injection, NOT NULL reduction) is a missed optimisation in the ON arm,
+  never a wrong answer. Unit pins: ON routes a single-table WHERE
+  through the search (searched subtree present), OFF inert, WHERE-less
+  plans fine.
+  Gates: optimizer suite + units scope green; witness
+  `lineitem WHERE l_extendedprice > 90000` gets PG's exact
+  `Gather → Parallel Seq Scan` from the path model (C-19h's blind spot,
+  closed); parallel-mode A/B with A/A attribution (stats-noise floor:
+  Q5/Q9) → Cut-1b moves are **Q4/Q17/Q20/Q21**; values hold everywhere
+  (TPC-H digest **24/24 MATCH**, TPC-DS sweep **PASS=95 all-zero** with
+  the re-route LIVE).
+  Timing (parallel, fresh servers, 3 reps): Q17/Q20 neutral, but
+  **Q4 ~10× (2.5→26.5 s)** and **Q21 ~2.3× (18→43 s)** — the search
+  chooses hash-semi over NL-semi (Q4) and seq over index (Q21 l3) where
+  the rule chooser was right. Per design §5.2 this is the valid
+  flip-declined outcome: the MECHANISM (E-18/E-20's prerequisite) lands,
+  the FLIP waits on cost-model work that makes the search choose
+  better — recorded as the resume point, not attempted here.
+  **2026-09-07 EVENING correction block above stays as the row's
+  history; the operative gate was `isSimpleSingle` as it states.**
   **2026-09-07 EVENING — THE ROW BELOW IS WRONG ON ITS CITED SITE. Corrected
   by the owning agent, source-verified, arm-measured. Read this block first.**
   `relfromjoinlist.go:357` is already compensated at `:213` (M0134-0188), so
