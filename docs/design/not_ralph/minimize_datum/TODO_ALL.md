@@ -3079,7 +3079,7 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   batch-count movement on the named shape class + 06 §2 floor with
   `CKMISMATCH=0`; files: `operators_join_agg.go`,
   `parallel_hash_build.go`, `hashsize/hashsize.go`.*
-- [ ] **D-06 MD-05 sort — UNBLOCKED 2026-09-07 by B-01c's applying slices
+- [~] **D-06 MD-05 sort — UNBLOCKED 2026-09-07 by B-01c's applying slices
   (b) AND (c).** Both sort-side projections this row was waiting on now
   exist. Slice (b) gave the sort beneath a *sorted aggregation* the
   narrowed row (`upper_narrow_apply.go` sinks the Aggregate site's
@@ -3101,7 +3101,9 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
   (`operators.go:1010-1015`: mismatched sort/merge comparators emit
   out-of-order rows with no error). Needs two deformed rows at once; a
   `PackedSlot` has one scratch `Row` — R-11, re-priced, not mechanical.
-  *design: 04 §4.1; gate: 06 §3 MD-05.*
+   *design: 04 §4.1 + `docs/design/minimize-datum-d06-sort/DESIGN.md`
+  (design + both adversarial reviews landed; all citations re-verified at
+  `fc76b20fd`); gate: 06 §3 MD-05.*
 - [-] **D-07 MD-06 materialize — OUT OF SCOPE 2026-09-07 — owner decision: **goopg does not implement its own
   parallel cost calculation; PG 18.3's is adopted as-is.** This item's
   unblocking condition was that goopg's cost model grow a parallel dimension
@@ -3215,7 +3217,7 @@ D-05 onward additionally needs A-06 acceptance + E-14 + B-01c.
 alloc arms together; plan-shape pin `changed=0`; both suites fresh server
 per arm; values never counts for projection/join-adjacent changes).*
 
-- [ ] **E-01 EX3-04 sort spill runs + merge discipline — UNBLOCKED
+- [~] **E-01 EX3-04 sort spill runs + merge discipline — UNBLOCKED
   2026-09-07 (same B-01c slices (b) AND (c) as D-06).** The EX1 sort half
   now exists for the sorted-aggregate shape (slice (b)) AND for the general
   ORDER BY sort (slice (c)): both spill the narrowed row. The §8.2
@@ -3228,7 +3230,10 @@ per arm; values never counts for projection/join-adjacent changes).*
   merge-back (logtape analogue, take3 10 §9). Spill thresholds are
   batching geometry: on pre-EX1 widths this is premature by rule (take3
   13 §8.2, EX-P7).
-  *design: take3 13 §5; gate: spilling-sort shapes; values + pin.*
+   *design: take3 13 §5 + `docs/design/executor-ex3-04-sort-spill-runs/DESIGN.md`
+  (verdict-first: run formation pre-exists, live residue is threshold
+  sourcing + fan-in; both reviews landed, citations re-verified at
+  `fc76b20fd`); gate: spilling-sort shapes; values + pin.*
 - [-] **E-02 — OUT OF SCOPE 2026-09-07: half its blocker is discharged and
   the other half has no witness.** The row reads *BLOCKED on B-16 + EX1 exit*.
   **B-16 is `[x]` done**, so that half is discharged. What remains is the EX1
