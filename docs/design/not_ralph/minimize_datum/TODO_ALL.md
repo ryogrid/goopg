@@ -33,7 +33,7 @@ had already completed).
 | **spill-cost calibration** | B-13, B-15, E-16 | **PARTLY RESOLVED.** E-16 `[x]` (`16da44c66`) — its blocker did not reproduce. The instrument is a derived 1.2x-5x ratio, not a multiplier. B-13's arithmetic is now empirical (+24.9% uncalibrated vs -3.0% calibrated at 4 MB); B-15 step 1 discharged (R5 pro-rating collapses a probe 472x). **Cut 3 measured -18.2% and HELD** on Q9's parallel interaction → re-queued behind C-19h. |
 | **C-15 grouping paths** | B-17b | **RESOLVED — the blocker was STALE.** C-15 landed and B-17b needed no engine change (`007765a90`); its decline had been written the same day C-15/C-16 removed its premise. |
 | **the seam drops `Pathkeys`** | C-07 | **RESOLVED** (`007765a90`). Validate-never-translate; forced a latent WRONG-ANSWER fix — `build_join_pathkeys` kept the outer's keys for FULL/RIGHT, which no row-count gate can see. `nrels < 2` survives as its own filed item. |
-| **the parallel dimension stops at the aggregate upper rel** | C-19h | **RE-SCOPED 2026-09-07 by owner decision: goopg does NOT implement its own parallel cost calculation — PG 18.3's is adopted as-is.** D-05 and its chain (D-07, D-08) are therefore OUT OF SCOPE, and D-10/D-11 are re-scoped onto D-06. What remains in scope is **porting PG faithfully**, which is what C-19h needs and is not a goopg cost model: `create_plain_partial_paths`, `generate_useful_gather_paths`, `try_partial_*_path`, `cost_gather`. The concrete defect is unchanged and is a **PG-parity** one — a plain filtered SELECT loses its Gather where vanilla PG 18.3 keeps it, and the census could not see it because every TPC-H query is aggregate-rooted while C-19g's producer is aggregate-only. Do NOT delete `MaybeAddGather` (demotion to a `debug_parallel_query`-gated post-pass is PG-faithful in kind); `splitAggregate` and `sortPartialRootPays` can no longer be deleted at all. |
+| **the parallel dimension stops at the aggregate upper rel** | C-19h | **RE-SCOPED 2026-09-07 by owner decision: goopg does NOT implement its own parallel cost calculation — PG 18.3's is adopted as-is.** D-05 and its chain (D-07, D-08) are therefore OUT OF SCOPE, and D-10/D-11 are re-scoped onto D-06. What remains in scope is **porting PG faithfully**, which is what C-19h needs and is not a goopg cost model: `create_plain_partial_paths`, `generate_useful_gather_paths`, `try_partial_*_path`, `cost_gather`. **Successors filed 2026-09-07 by the owner: E-20** (the parallel dimension does not reach the level where hash-vs-merge is chosen) **and E-21** (`makeRelFromJoinlist` returns at `len(items) == 1`, `relfromjoinlist.go:357`, so a single-table statement never enters the search at all). This blocker is no longer tracked here — work the two rows. The concrete defect is unchanged and is a **PG-parity** one — a plain filtered SELECT loses its Gather where vanilla PG 18.3 keeps it, and the census could not see it because every TPC-H query is aggregate-rooted while C-19g's producer is aggregate-only. Do NOT delete `MaybeAddGather` (demotion to a `debug_parallel_query`-gated post-pass is PG-faithful in kind); `splitAggregate` and `sortPartialRootPays` can no longer be deleted at all. |
 | **B-01c *applying* half** | D-06, E-01 | **BOTH PREREQUISITES NOW EXIST (2026-09-07).** Slice (a) landed the key-preservation gate (`upper_narrow_gate.go`); slice (b) landed the narrowing-aware upper rewriter (`upper_narrow_apply.go`) and applies it at the **Aggregate** site, sinking the cut past the Sort beneath a sorted aggregation — which is the sort-side projection D-06 was waiting on, for that shape. What is NOT yet applied is narrowing a `*Sort` or `*WindowAgg` from its OWN target: those move every coordinate above them and need the ancestor-chain walk (ledger `take3-B-01c-applying-blocked`). So D-06/E-01 are unblocked **for the sorted-aggregate shape only** and stay blocked for the general ORDER-BY sort. The gate is still the load-bearing half: `operators.go:1010-1015` checks ordering explicitly, not membership, so mismatched sort/merge comparators emit out-of-order rows with **no error** — the same silent wrong-answer class C-07 just fixed. |
 | **"the flip moves plans"** | C-06, C-20c, C-20d, C-20e, C-20f, C-20g | **DIAGNOSED 2026-09-07 — and my framing of it was WRONG.** I wrote here that "the search wins a Merge Left Join at 338,223 when a 66,218 Hash path exists in the same run". It does not: the two costs are **not comparable**, because on the OFF arm the join never enters the search at all (the LEFT link pins, the seam peels it, and the plan-tree estimator prices it — charging the hash join 0.25 startup with no build and no inner cost). **The search never had the 66,218 plan.** The real verdict is **mis-generation**: both candidates DO reach `addPath` and the merge genuinely is cheaper among them; the candidate set is short by one, because `jointypeForDirection` declines the commuted direction instead of emitting PG's `JOIN_RIGHT`. Filed as **C-06s**. Does NOT transfer to C-20c/d/e/f/g — each has its own measured movement, none is Q13, none switches a join direction. No flag retired. |
 | **D-04 stopping rule / D chain** | D-07, D-08, D-10, D-11 | **CHAINED TO D-05, cascades automatically.** D-07/D-08 say "unblocks when D-05 does"; D-10/D-11 need one conversion site. No separate dispatch needed. |
@@ -3784,6 +3784,45 @@ ledger row if the measurement says no.
   alloc arm (the 63.8%-of-objects figure is the number to beat); plans should
   NOT move — prefetch is an I/O-path change, so a plan movement means
   something else happened.*
+
+- [ ] **E-20 The parallel dimension does not reach the cost model where the
+  join shape is chosen.** Filed 2026-09-07 by the owner. Partial paths exist
+  only at upper rels **above the aggregate**; one level down — where hash
+  join and merge join are compared — parallelism is invisible, so the join
+  shape is chosen on a serial cost and a Gather is bolted on afterwards, if
+  at all. This is the root the earlier work kept hitting from below:
+  C-19d found the whole relation must cross the Gather (`parallel_tuple_cost`
+  0.1/row against a ~0.0075/row 4-worker saving) precisely because only
+  base-rel partial paths existed; C-19f made a Gather choosable by cost only
+  for a join TREE; and D-05's three correct hash-join cost fixes each cost
+  +10..22% **because raising a hash-join term loses the Gather** — the cost
+  model has no term that says "and this shape parallelises".
+  **The owner has ruled that parallel cost calculation must match PG 18.3;
+  goopg will NOT implement its own model.** So this item is a
+  *transcription* task — `create_partial_join_paths`/`try_partial_hashjoin_path`
+  and the `parallel_workers` derivation, followed from `postgres/`, not a
+  goopg-original design. Any goopg-original parallel costing found in scope
+  is to be dropped, not extended.
+  *gate: a parallel-mode plan A/B on both corpora (the serial captures are
+  blind to this by construction); values both suites; each PG function
+  transcribed cited by file:line in the design doc.*
+
+- [ ] **E-21 Single-table statements never enter the path search.**
+  Filed 2026-09-07 by the owner. `makeRelFromJoinlist` returns immediately
+  when the joinlist has one element, so `SELECT … FROM t WHERE …` never
+  reaches path generation and **no partial path is ever built for it** — PG
+  builds one (`set_rel_size` → `create_plain_partial_paths` for every base
+  rel, whatever the joinlist length). This is the structural blocker that
+  closed C-19h out of scope with a successor filed; the successor is this
+  row. It is a prerequisite for E-18 (a single-relation inner) and is where
+  E-20's base-rel partial paths must land.
+  The failure is silent in the obvious direction: single-table statements
+  produce correct rows serially today, so no values gate can see the missing
+  path, and `estimate-audit --serial` suppresses the node that would show it.
+  *gate: a parallel-mode plan capture showing a `Gather` over a single-rel
+  scan where PG has one, and NOT showing one where PG does not (the
+  crossover must be PG's, per E-20's ruling); values both suites; TPC-DS
+  PASS=95 all-zero, since single-table statements are common there.*
 
 - [ ] **E-17 EX3-08 scan-resident qual — OPEN. The target is CUT 2:
   evaluate the predicate ONCE inside the scan, as PG does, and delete the
