@@ -25,6 +25,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -375,6 +376,64 @@ func extractSeqScanFromPlan(node optimizer.Node) *optimizer.SeqScan {
 	}
 }
 
+// coopJoinBuild is E-18 slice 2's knob: OFF by default.
+//
+// It widens the cooperative build's Rule 3 so a build side that is a JOIN TREE
+// can be built cooperatively, which is the shape TPC-H Q9 needs and the one
+// `extractSeqScanFromPlan` refuses. It is a knob, not a default, because the
+// two objections recorded on that walker are both real and only one of them is
+// answered here:
+//
+//   - CORRECTNESS (answered): the widened walk descends a HASH join's PROBE
+//     side only, and refuses every other node kind including Aggregate and
+//     Sort. That is the property `extractSeqScanFromPlan`'s comment protects —
+//     N producers each aggregating their own partition, with no Finalize
+//     above, is a silent wrong answer for a `HAVING sum(...)` build side.
+//   - COST (answered here, but not yet across a corpus): each producer used to
+//     redo every nested build (Q18 35.7 -> 42.9-44.1 s). This path prebuilds
+//     the nested shareable joins ONCE in the leader and publishes them to the
+//     producers by pointer, reusing the same sharedHashBuild machinery a
+//     Gather uses, so a producer does the driving scan and the probes only.
+//
+// Default OFF until the corpus-wide A/B exists.
+var coopJoinBuildOn = os.Getenv("GOOPG_COOP_JOIN_BUILD") == "1"
+
+// coopDrivingScan finds the scan a cooperative build's producers can partition.
+//
+// It is extractSeqScanFromPlan widened by exactly one node kind: a HASH join's
+// PROBE side. Everything else is refused, and the refusal is the safety
+// property — see extractSeqScanFromPlan's comment for why Aggregate and Sort
+// must never be descended, and attachParallelScan's joinOp arm for why the
+// side must be the probe side and the algorithm must be hash.
+//
+// It must agree with attachParallelScan, which does the same walk over the
+// BUILT tree: if this walker names a leaf attachParallelScan would not reach,
+// the producers all scan the whole relation and the build gets N copies of
+// every row. Both call probeSideIsLeft, which is the single shared rule.
+func coopDrivingScan(node optimizer.Node) *optimizer.SeqScan {
+	for {
+		switch n := node.(type) {
+		case *optimizer.SeqScan:
+			return n
+		case *optimizer.Filter:
+			node = n.Child
+		case *optimizer.Project:
+			node = n.Child
+		case *optimizer.Join:
+			if !coopJoinBuildOn || n.Algo != optimizer.JoinAlgoHash || n.Lateral {
+				return nil
+			}
+			if probeSideIsLeft(n) {
+				node = n.Left
+			} else {
+				node = n.Right
+			}
+		default:
+			return nil
+		}
+	}
+}
+
 // parallelBuildEligible reports whether this hash join's build side can be
 // parallelised. Four conditions must all hold (design §1.3):
 //
@@ -440,8 +499,10 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 		buildPlan = o.plan.Left
 	}
 
-	// Rule 3: build child must be a SeqScan (possibly under Filter).
-	scan := extractSeqScanFromPlan(buildPlan)
+	// Rule 3: the build child must expose a partitionable driving scan —
+	// a SeqScan under Filter/Project, and (E-18 slice 2, knob) under a hash
+	// join's probe side.
+	scan := coopDrivingScan(buildPlan)
 	if scan == nil {
 		return false
 	}
@@ -498,9 +559,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 		buildBound = o.deformLeftBound
 	}
 
-	scan := extractSeqScanFromPlan(buildPlan)
+	scan := coopDrivingScan(buildPlan)
 	if scan == nil {
-		return false, fmt.Errorf("parallel build: no SeqScan in build child")
+		return false, fmt.Errorf("parallel build: no driving scan in build child")
 	}
 
 	// Determine worker count. At least 2 producers, capped by
@@ -515,6 +576,29 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	pscan := newParallelScanState(0)
 	ch := make(chan []Row, gatherChanDepth*(maxProducers+1))
 
+	// E-18 slice 2: when the build side is a JOIN TREE, every producer would
+	// otherwise redo each nested build — the cost objection recorded on
+	// extractSeqScanFromPlan (Q18 35.7 -> 42.9-44.1 s). Prebuild those nested
+	// hash joins ONCE here, in the leader, and hand the producers the tables
+	// by pointer, exactly as a Gather does for its own subtree. A producer
+	// then does the driving scan and the probes and nothing else.
+	//
+	// The publication is put on the WORKER contexts, never on ctx: ctx's own
+	// SharedHashBuilds map may already be published to a surrounding Gather's
+	// participants, and mutating it here would be a write to a map those
+	// goroutines are reading.
+	nested, err := prebuildSharedHashJoins(ctx, buildPlan, func() (Operator, error) {
+		return buildNode(buildPlan, buildBound)
+	})
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		for _, sb := range nested {
+			sb.release(ctx)
+		}
+	}()
+
 	// Pre-allocate arenas and worker contexts. mctx.Acquire is NOT
 	// goroutine-safe (appends to parent.children without synchronisation).
 	var workerCtxs []*Context
@@ -526,6 +610,19 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
 		// this producer's sort entries with an explicit index.
 		wctx.workerSlot = i
+		if len(nested) > 0 {
+			// Merge, do not overwrite: a coop build nested under a Gather
+			// must keep seeing the Gather's publication too. The merged map
+			// is fresh per worker and never written after this point.
+			merged := make(map[*optimizer.Join]*sharedHashBuild, len(ctx.SharedHashBuilds)+len(nested))
+			for k, v := range ctx.SharedHashBuilds {
+				merged[k] = v
+			}
+			for k, v := range nested {
+				merged[k] = v
+			}
+			wctx.SharedHashBuilds = merged
+		}
 		workerCtxs = append(workerCtxs, wctx)
 	}
 
