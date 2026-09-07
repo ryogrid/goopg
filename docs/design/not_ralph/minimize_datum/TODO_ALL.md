@@ -3599,8 +3599,13 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
-- [!] **E-17 EX3-08 scan-resident qual — DEFERRED 2026-09-07, cut 1 is the
-  whole near-term value and it is small.** Filed today from the
+- [ ] **E-17 EX3-08 scan-resident qual — OPEN. Cut 1 is the near-term
+  work and it is small; cut 2 is a separate design.**
+  *Status correction 2026-09-07: I had demoted this row to `[!]` DEFERRED
+  on the grounds that cut 2 lacks a justifying measurement. That was a
+  scope error — cut 2's open question does not block **cut 1**, which the
+  same row calls cheap and safe, and this item was filed at the owner's
+  explicit request. Restored to open.* Filed today from the
   format/decode survey; re-scoped here rather than left as an open
   checkbox with no owner.
   **Why it is not being done in this workstream:** the prize is bounded
