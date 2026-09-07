@@ -3774,8 +3774,17 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
-- [ ] **E-18 EX5-03 `Parallel Hash` — split the hash BUILD across workers,
-  as PG does.** Filed 2026-09-07 at the owner's request, same standing as
+- [~] **E-18 EX5-03 `Parallel Hash` — DESIGN + SECOND-WITNESS CENSUS
+  LANDED 2026-09-07; implementation NOT started.**
+  `docs/design/executor-ex5-03-parallel-hash/DESIGN.md` (source +
+  oracle reviews recorded inline, with corrections). Second witness
+  verdict: NONE for a single-batch cooperative build — every paying
+  build site is multi-batch at bench work_mem (4.6 GB / 648 / 316 /
+  197 / 192 MB; spilling labels Q9/Q16/Q18/Q21); the sole ≤64 MB
+  candidate is 150K×8 ≈ 57 MB (~100 ms build). So the cheap Phase 1 is
+  specified-not-built and the prize needs shared batch files (Phase 2,
+  full port — scoped in the design, beyond this session).
+  Filed 2026-09-07 at the owner's request, same standing as
   E-17 cut 2: **design doc + agent review + commit the design first, then
   implement.**
   **Evidenced, not inferred.** Plans captured in parallel mode on both
