@@ -2503,7 +2503,39 @@ rule).*
   `planner-flags.env` untouched. Ledger `take3-C-20g-blocked`; artifact
   `analysis/planner-refactor-take3/c20fg-flag-retirement-20260907/README.md`.
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
-- [ ] **C-20h P6-07 `setrefs` phase + P6-08 `RestrictInfo` caching.**
+- [x] **C-20h — P6-08 LANDED; P6-07 (`setrefs`) OUT OF SCOPE 2026-09-07,
+  filed as its own successor.** P6-08 is done and measured: three
+  `restrictInfo` memos, all of them PG's own fields, giving TPC-H planning
+  time **-14.1% total with Q9 -52%**, plans byte-identical (one md5 across
+  six cost-visible captures).
+  **P6-07 is closed as out of scope under the standing rule** (no
+  performance gain / disproportionate to this workstream), not left
+  blocked, and the grounds are measured rather than estimated:
+  - It is **not a plan-quality change at all.** The `Var` migration makes
+    the boundary map *deletable*; it moves no plan and buys no runtime.
+    Its value is maintainability, which is real but is not what the
+    remaining budget is for.
+  - **Measured size: 102 `ColumnRef{` construction sites and 237
+    `SourceTableIdx` references** outside tests, spanning `plan.go`, the
+    parser binder, the whole optimizer and the executor's expression
+    evaluator. No existing TODO_ALL row carries a change of that shape.
+  - It **cannot be landed incrementally**, which is what makes it a
+    separate campaign rather than a slice: steps (i) and (ii) are one
+    commit or none, because an `attno` populated at some producers and
+    read by none is scaffolding later readers would trust. The one state
+    that must never exist is positions and `(varno, attno)` disagreeing.
+  What DID land toward it, and stays: `RelOptInfo` embeds a value
+  `rangeTblEntry{baseLeaf, baseOffset}` (C-20b's recommended shape), so
+  all 127 reads survive through Go field promotion with zero call sites
+  moved. And `createplanroot.go`'s boundary assertions plus
+  `rangetable.go`'s `assertBoundaryColumnIdentity` are explicitly NOT
+  deleted — they are the detector for the wrong-answer class the migration
+  would otherwise expose, and this workstream has now had three
+  coordinate-rewrite near-misses (C-07's FULL/RIGHT pathkeys, the
+  `shiftColumnRefsBy` arm gap, B-01c's mutate-while-deciding sink).
+  Resume point: ledger `take3-C-20h-var-migration`, four steps in order.
+  ORIGINAL ROW FOLLOWS.
+  C-20h P6-07 `setrefs` phase + P6-08 `RestrictInfo` caching.**
   `setrefs` only if C-20b shows the executor still needs explicit column
   resolution — **C-20b (2026-09-07) shows exactly that, so the `setrefs`
   half is NOT moot; it is the actual P6-02.** `ColumnRef.Index` is a
@@ -3567,7 +3599,32 @@ Priced against the MD bundle; each gets a measurement slice before any
 larger work that assumes the same win (graph edges in §1). SKIP with a
 ledger row if the measurement says no.
 
-- [ ] **E-17 EX3-08 scan-resident qual — evaluate the predicate ONCE, as PG
+- [!] **E-17 EX3-08 scan-resident qual — DEFERRED 2026-09-07, cut 1 is the
+  whole near-term value and it is small.** Filed today from the
+  format/decode survey; re-scoped here rather than left as an open
+  checkbox with no owner.
+  **Why it is not being done in this workstream:** the prize is bounded
+  and the risk is not symmetric. Cut 2 (make the scan a COMPLETE qual
+  evaluator and delete the `Filter` node) must absorb both abstain paths —
+  `needsDetoastPrefix` and the `perr != nil` error-position contract — and
+  must give up the whitelist's failure direction, where an unlisted
+  expression node costs performance and never correctness. A complete
+  evaluator has no opt-out to fall back on. That is a different design,
+  not a slice.
+  **What the measurement would have to show first**, and nobody has run
+  it: the only shape where today's prefilter is a *pessimisation* is a
+  predicate that reads few columns but admits most rows — `planScanPrefilter`
+  declines only when `need >= ncols` and **never consults selectivity**, so
+  such a predicate saves no deform work and pays one extra evaluation per
+  row. Q6 survives ~2% of 6 M rows, so the win there is small; build the
+  low-selectivity case before touching the design.
+  **Cut 1 remains cheap and safe if anyone wants it**: a per-row
+  already-decided flag so `filterOp` skips its evaluation, left clear on
+  both abstain paths. No node shape changes, no error position moves,
+  plans byte-identical.
+  Full analysis: `DATUM-ROW-FORMAT-AND-PG-COMPAT.md` §5.1.1.
+  ORIGINAL ROW FOLLOWS.
+  E-17 EX3-08 scan-resident qual — evaluate the predicate ONCE, as PG
   does, and delete the `Filter` node above the scan.** Filed 2026-09-07 from
   the format/decode survey (`DATUM-ROW-FORMAT-AND-PG-COMPAT.md` §5.1.1).
   **Today the predicate is evaluated TWICE on every surviving row.**
