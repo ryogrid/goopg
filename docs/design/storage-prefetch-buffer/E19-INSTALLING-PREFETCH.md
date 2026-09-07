@@ -829,6 +829,21 @@ unchanged by the good news:
 | **S3** `StartRead`/`FinishRead` with the §4.1a reworks | the six breaks, each of which is a wrong-data or deadlock class, not a perf class |
 | **S4** the `bitmapHeapScanOp` / index-scan window with a **new** drain point | plus the parallel batched-claim API if the parallel path is in scope |
 
+**S1 scoping note (2026-09-07 workstream session):** "vectored through all
+three methods" is harder than it reads. `method_sync`/`method_worker` can
+use `preadv(2)` directly, but the io_uring binding covers a DELIBERATELY
+narrow surface — `method_iouring_linux.go:43` states IORING_OP_READV/WRITEV
+is excluded ("we don't need it") — so S1 needs ring-level surgery to
+submit READV, not just a new `Op` kind on top of per-block `ReadAt`
+(`aio.go:runOp`). And the checksum story follows the op: `relFile.ReadAt`
+verifies per block (`smgr.go:804-808`), so a true single-syscall vectored
+read must preserve per-block verification (or route each block's bytes
+through `VerifyRead`) — the exact class the E-19 source review already
+fired on once. S1 is therefore NOT a thin API shim; scope it as ring
+surgery + per-method tests + checksum preservation, and do not accept a
+loop-over-`ReadBlock` as "vectored" (it buys no syscall reduction, which
+is the whole point of `io_combine_limit`).
+
 **And the gate needs its own decision before S3 lands.** §6's suites cannot
 score this: TPC-H is 1.9 GiB in a 2048 MB pool, so the arm that would show the
 win is byte-identical to the arm that would show nothing. The A/B that decides
