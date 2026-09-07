@@ -2595,6 +2595,96 @@ behind OFF switches, production unaffected), everything else structural
 or faithfulness-only. No corpus timing claim is made for any of them
 beyond the Q6 A/B above.
 
+## 5.44. E-18 Parallel Hash: three decline rules, none of whose stated
+grounds survived reading the code they named
+
+This is the workstream's largest executor result, and it was reached by
+**deleting refusals, not by writing a parallel hash join.**
+
+The design doc's premise was false. goopg **already had** a cooperative
+parallel hash build — `parallelBuildLazyHashTable`
+(`internal/executor/parallel_hash_build.go`): N producer goroutines scan and
+filter the build side over disjoint blocks, one consumer goroutine owns the
+map and inserts. It was already firing at 17 of 38 TPC-H build sites. The
+design's own source pass had read `prebuildSharedHashJoins` *in the same
+file* and concluded the build could not be split at all.
+
+That collapses PG's phase plan. **Phase 1** (sharded map + phase barrier) is
+not work: goopg reached a cooperative build by a better route — single
+writer, no lock, no barrier. **Phase 2's hard half, shared batch files, is
+not needed**: PG requires them because every backend inserts
+(`MultiExecParallelHash`); goopg has exactly one writer, so batch files stay
+per-operator and single-writer. What was missing was **eligibility, not
+mechanism**.
+
+Each slice retired one decline rule, and in each case the rule's stated
+justification was refuted by the source it cited:
+
+| slice | rule retired | why the stated ground was wrong |
+|---|---|---|
+| 1 | `NBatch > 1` (spilling can't be shared) | retired by E-09a/E-09b; spilling is entirely consumer-side — `buildLoopRight` makes one pass and never rescans |
+| 2 | probe side of a hash join not a driving scan | widened by exactly one node kind, still refusing Aggregate/Sort; agrees with `attachParallelScan` via the shared `probeSideIsLeft` |
+| 3 | `multikey` — "`fileCompositeBuildRow` … the channel-source pattern doesn't reach" | **false**: `fileCompositeBuildRow` is called from *inside* `buildLoopRight`/`buildLoopLeft` (`operators_join_agg.go`:969/:899), exactly the loops the cooperative consumer runs off a `channelSource`. The composite lane is consumer-side, like batching in slice 1 |
+
+Slice 3 also retired the brief's own scope: the "bottom-up cooperative
+build" it asked for **already existed** —
+`prebuildSharedHashJoins` → `buildLazyHashTable` →
+`parallelBuildLazyHashTable` → `prebuildSharedHashJoins` is *recursive*, so
+slice 2's publication was already bottom-up, once per table. There was no
+ordering work and no ordering hazard to make safe. What remained was one
+line, located by `EXPLAIN ANALYZE` in parallel mode putting **12,857 ms of
+Q9's 13.6 s in a single node's Build Time**.
+
+**Measured** (parallel mode, 4 workers, `work_mem=64MB`, fresh capped server
+per arm per rep, 3 alternating reps, private clone):
+
+| query | before | after | |
+|---|---:|---:|---|
+| **Q9** (slice 3) | **10.33 s** | **2.07 s** | **−79.9%** — per-rep 10.33/10.38/10.06 vs 2.07/2.07/2.10, disjoint |
+| Q20 (slice 2) | 1.91 s | 0.65 s | −66%, disjoint |
+| Q7 (slice 1) | 5.29 s | 3.95 s | −25.3% |
+| Q21 | 14.63 s | 13.75 s | −6.0% |
+| Q5 | 4.93 s | 2.97 s | −39.8% across slices 1-3 |
+| 22-query median-sum (slice 3 alone) | 98.5 s | 90.9 s | −7.7% |
+
+**22/22 ordered md5 hashes identical in all six arm-runs**, which is the
+gate that matters: a cooperative build's failure mode is `5bf764520` — a
+correct row count with a NULL payload. `TestCoopParallelHashBuildComposite`
+sweeps 32 `work_mem` values against a serial reference, asserts the payload
+non-NULL, and was **verified to FAIL with the decline restored**.
+
+**Eligibility census, re-run over all 38 sites** (rules 3 and 4 split apart,
+which the earlier census lumped):
+
+| reason | slice-2 tip | after slice 3 |
+|---|---:|---:|
+| `ok` | 16 | **18** |
+| `smallrel` | 10 | 11 |
+| `notseqscan` | 8 | 8 |
+| `multikey` | 3 | **0** |
+| `jointype` | 1 | 1 |
+
+The three `multikey` sites were Q9, Q5 and Q7. Q9 and Q5 became `ok`; **Q7
+became `smallrel`** — its composite build's driving relation is under
+`MinParallelTableScanBlocks`, so rule 4 still declines it and Q7 is unmoved
+by slice 3. Nothing actionable by this item remains: `smallrel` and
+`jointype` are correct refusals, and `notseqscan` is a planner-shape
+question owned by E-20/E-21.
+
+One honest caveat: Q16 moved 0.38 → 0.46 s (+80 ms, disjoint) and is
+**shown not to be this change** — its two build sites decline identically
+(1 `ok`, 1 `smallrel`) before and after. Recorded rather than explained
+away.
+
+Gates: units precommit PASS; spotcheck RESULT=PASS with Q12=2 / Q13=34
+**grepped from the output**; TPC-DS SF0.5 `PASS=95 (57 ck-verified)
+MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`. The `-race` failure
+(`TestSubquerySemanticsMatrix/M20`, `instrumentScope` package global) was
+re-verified pre-existing by reverting the slice-3 files at `HEAD~1` —
+identical race, identical subtest. It remains a ledger row; slice 2 widens
+its exposure and the fix is threading the scope through `Context`, not
+widening the mutex.
+
 ## 6. What was dropped, and what it cost to find out
 
 **E-04 (EX4-01) `filterOp` predicate compilation — dropped.** Three
