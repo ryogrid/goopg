@@ -633,7 +633,7 @@ are EPICS — split into one-checkbox-per-commit items before starting
   (indexonlyscan only stays a gate; indexscan-off counts). Hard gates stay
   gates (index-only, memoize; TID/incremental-sort vacuous, no producer).
   *gate: GUC-effect tests incl. `TestIndexOnlyScanGateStaysAGate`.*
-- [!] **B-17e Retire `enable_nestloop_index`** (take3 08 §6.4) — BLOCKED
+- [-] **B-17e — OUT OF SCOPE 2026-09-07: its prerequisite is itself out of scope.** The row reads *retire only with P6*, i.e. with C-20g's single-planner deletion — and C-20g is now closed out of scope because its off path is a whole second planner. NLI is also not an ordinary parameterised-nestloop path (`addNLIPaths` emits `PathNestLoop` with no `DisabledNodes`, and the legacy `rewriteJoinsToNLI` is load-bearing at Q4 12.5x), so nothing here is reachable independently. ORIGINAL ROW FOLLOWS.   B-17e Retire `enable_nestloop_index`** (take3 08 §6.4) — BLOCKED
   on C-20 (P6 single-planner deletion). DECLINED 2026-09-05: NLI is not an ordinary parameterised-nestloop path
   (`addNLIPaths` emits `PathNestLoop` with no `DisabledNodes`; legacy
   `rewriteJoinsToNLI` gated by `EnableNestLoopIndex` is load-bearing,
@@ -2055,7 +2055,7 @@ rule).*
   stopped Q15b); and EXPLAIN must be transparent to the statement-shape
   flag, or it plans a serial aggregate for a statement that executes the
   split.
-- [!] **C-19h P5-08 retire `MaybeAddGather` — BLOCKED, and NOT on the
+- [-] **C-19h — OUT OF SCOPE for this workstream 2026-09-07; successor filed.** Four blockers, each real and each only visible once its predecessor fell: (1) the default flip; (2) C-19g's construction — fixed, C-19g landed; (3) the base-rel crossover — fixed, `bf6109210`; (4) **structural, and the one that ends it**: a one-relation statement never enters the path search at all. `makeRelFromJoinlist` returns `items[0]` at `len == 1` (goopg's transcription of upstream's *Single joinlist node, so we're done*, allpaths.c:3399-3404), so no `RelOptInfo` is built and no partial path is ever filed. Measured, not argued: the probe query is byte-identical across the fix AND across `GOOPG_GATHER_PATHS` off/all at startup cost **0** — the post-pass's Gather, never `cost_gather`'s, whose `parallel_setup_cost` 1000 is plainly visible in PG's own plan. **PG is not symmetric here**: `query_planner` runs `set_base_rel_pathlists` for a single-relation query too. So `MaybeAddGather` can be neither retired nor demoted until goopg builds base-rel path lists for one-relation statements — real PG-parity work, in scope under the owner's ruling, but a **separate campaign**, not a slice of this one. Successor: build single-relation base-rel path lists as PG does, then re-run C-19h's census. `TestPostPassOwnsTheNonAggregateGather` pins the current truth. Two standing corrections survive: `splitAggregate` and `sortPartialRootPays` can no longer be deleted at all. ORIGINAL ROW FOLLOWS.   C-19h P5-08 retire `MaybeAddGather` — BLOCKED, and NOT on the
   default flip. Measured 2026-09-07; evidence
   `docs/design/planner-c19h-gather-postpass/DESIGN.md`.**
   The blocker is **C-19g's unfinished upper-rel-resident half**, which was
@@ -2381,7 +2381,7 @@ rule).*
   transcribed from `assertSearchedTreeNeedsNoReconcile`.
   *design: take3 08 §9 + planner-c20b DESIGN; gate: value-level `-diff`,
   never counts.*
-- [!] **C-20c P6-06a retire `GOOPG_INDEXKEY_HARVEST` — BLOCKED: the flip
+- [-] **C-20c — OUT OF SCOPE 2026-09-07: the flag stays, on a measurement re-run TODAY rather than inherited.** `GOOPG_INDEXKEY_HARVEST=off` moves **103 diff lines** on current HEAD, so retiring it deletes reachable plans and the item's own byte-identical gate fails. (Note the off-value is `off`, not `0` — `v != "off"`; an arm using `=0` measures A/A and I nearly recorded exactly that false result.) Evidence `analysis/planner-refactor-take3/flag-flip-retest-20260907/`. ORIGINAL ROW FOLLOWS.   C-20c P6-06a retire `GOOPG_INDEXKEY_HARVEST` — BLOCKED: the flip
   is not plan-neutral (measured 2026-09-05).** The item's own gate is
   "byte-identical plans for the flip", and the flip fails it. On/off arms
   back to back under the pinned regime (SF=1, serial):
@@ -2402,7 +2402,7 @@ rule).*
   original comment names. Ledger `take3-C-20c-blocked`.
   *design: take3 08 §9; gate: byte-identical plans for the flip
   (take3 09 §5 P6).*
-- [!] **C-20d P6-06b `GOOPG_INDEX_PROBE_MULT` — flag KEPT, but its default
+- [-] **C-20d — OUT OF SCOPE 2026-09-07: decided, the flag stays.** The multiplier is load-bearing at 2 — it is the constant behind the workstream's headline 27% — so this was never a retirement, it was a confirmation, and it is confirmed. ORIGINAL ROW FOLLOWS.   C-20d P6-06b `GOOPG_INDEX_PROBE_MULT` — flag KEPT, but its default
   CALIBRATED 1.0 → 2.0. The session's largest performance result.**
   The knob existed because "PG's constants (multiplier 1) under-cost
   goopg's NL-index probe … the DP would pick ruinous PG-shaped NL plans",
@@ -2432,7 +2432,7 @@ rule).*
   Artifact:
   `analysis/planner-refactor-take3/c20d-probe-calibration-20260905/README.md`.
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
-- [!] **C-20e P6-06c retire `GOOPG_HASH_OUTER_JOIN` — still a wash,
+- [-] **C-20e — OUT OF SCOPE 2026-09-07: TPC-H structurally cannot adjudicate it, and the prize does not justify a TPC-DS campaign.** `GOOPG_HASH_OUTER_JOIN=1` moves **0 diff lines** on TPC-H — but that zero is *guaranteed*, not informative: the flag governs `chooseOuterFillJoinAlgo`, which by its own comment decides only **RIGHT and FULL** joins, and the TPC-H corpus contains **zero of either**. This is C-19h's census-blindness applied to C-20e's own gate. Observation filed for any successor: Q13's default plan is now a `Hash Right Join` while this flag is OFF, so C-06s reaches right-hash through the ordinary hash path — the flag's decision may be partly redundant, which is an argument to re-scope rather than retire. ORIGINAL ROW FOLLOWS.   C-20e P6-06c retire `GOOPG_HASH_OUTER_JOIN` — still a wash,
   RE-MEASURED 2026-09-05 under the new cost landscape.** The item asked
   for a re-measure after the `btcostestimate` batch (B-15, still blocked);
   it was re-measured after a different and larger landscape change instead
@@ -2447,7 +2447,7 @@ rule).*
   because its plans are not byte-identical — it is simply that the
   differences do not pay. Re-measure again after B-15.
   *design: take3 08 §9; gate: byte-identical plans for the flip.*
-- [!] **C-20f P6-06d retire `GOOPG_NLI_COSTGATE` — BLOCKED 2026-09-07 on
+- [-] **C-20f — OUT OF SCOPE 2026-09-07: owner decision taken, the hatch stays.** The flip moves TPC-H Q4 by **11.4x** (Nested Loop Semi Join over the fk index at 1.60 s against a Hash Semi Join + Seq Scan at 18.30 s), so the byte-identical gate fails. The adjudicating agent correctly escalated a real asymmetry — here the LOSING arm is the flag's own off path, so retiring would change no plan production reaches, which makes deletion defensible as an *exception* to the gate rather than a pass of it. Decided against, for three reasons recorded at the time: an exception granted once becomes the precedent every remaining retirement inherits; deletion is irreversible against a branch that costs little to keep; and the hatch's value is escape from a misfiring cost gate **on data we have not seen**, which a measurement on this corpus cannot speak to. Re-opened today's re-test confirms it: `GOOPG_NLI_COSTGATE=legacy` still moves 20 diff lines on current HEAD. Reopen only with a maintenance cost attached to keeping it. ORIGINAL ROW FOLLOWS.   C-20f P6-06d retire `GOOPG_NLI_COSTGATE` — BLOCKED 2026-09-07 on
   its own gate: the flip moves TPC-H Q4. Nothing deleted.**
   Two `estimate-audit -plan-only` captures on ONE private SF=1 clone
   (port 5541, fresh capped server per arm, one binary, pinned stats),
@@ -2485,7 +2485,7 @@ rule).*
   seen — the 11.4x measured here says the gate is right on THIS corpus,
   which is not the same claim. Reopen only with a maintenance cost
   attached to keeping it.
-- [!] **C-20g P6-06e retire `GOOPG_PGSHAPED_DP` last — BLOCKED 2026-09-07,
+- [-] **C-20g — OUT OF SCOPE 2026-09-07: the `=0` path is a whole second planner.** Re-verified on the post-C-04c tree rather than inherited: the flip moves **17 of 22 queries**, 587 diff lines, and all 17 change top-level cost. The off path is no search, syntactic order and legacy rewrites — not dead weight — and P6-03/P6-04 remain must-not-delete on measured 6.5x/12.5x evidence. ORIGINAL ROW FOLLOWS.   C-20g P6-06e retire `GOOPG_PGSHAPED_DP` last — BLOCKED 2026-09-07,
   re-verified on the current tree rather than inherited. Nothing deleted.**
   The item's own text was checked against the post-C-04c tree (C-04c
   changed jointree admission) with the same paired-capture method as
@@ -3116,7 +3116,7 @@ per arm; values never counts for projection/join-adjacent changes).*
   and inert — zero production callers, no behaviour change — and is exactly
   what a future C-14 would build against, so reopening C-14 reopens this
   row with its prerequisite already paid. Ledger `take3-C-14-dropped`.
-- [!] **E-14 EX1 build-half redesign (no second truncation) — Cut A
+- [-] **E-14 — OUT OF SCOPE 2026-09-07: both cuts measured, neither has a witness.** Cut A (Semi/Anti zero-width retention) **DROPPED at 0.0065%** — the whole suite retains 14,747 Semi/Anti Datum cells (0.7 MB) against 10,954 MB of hash-build cells, one part in 15,000, and every Semi/Anti build already has `buildWidth = 1` because P4-01 narrowed it. The named shapes do not pay because they are not Semi/Anti hash builds in goopg's plans at all. Cut B's sort side is **three orders of magnitude below the hash side** — the largest sort input in the suite is 20,451 rows x 8 columns = 7.9 MB total, and the sites with the biggest proportional residual are the ones with almost no rows. Re-open only with a measured witness. ORIGINAL ROW FOLLOWS.   E-14 EX1 build-half redesign (no second truncation) — Cut A
   DROPPED on measurement 2026-09-07, Cut B quantified and still blocked.**
   **Cut A (Semi/Anti zero-width retention): DROPPED, 0.0065%.** §8b had
   already found P4-01 narrows a Semi/Anti build to `keys ∪ residual`,
@@ -3505,7 +3505,7 @@ per arm; values never counts for projection/join-adjacent changes).*
   `analysis/executor-refactor/e11-depth-sweep-20260906/README.md`; ledger
   `take3-E-11-readstream-declined` + `take3-E-11-prefetch-discards-buffer`.
   *design: take3 13 §7; gate: ledger row (decline path).*
-- [!] **E-12 EX3-02 Cut 3 (oversize + teardown) — BLOCKED on E-14.**
+- [-] **E-12 — OUT OF SCOPE 2026-09-07: chained to E-14, whose measurement stopped it.** E-14's Cut A was dropped at **0.0065%** and its sort side sits three orders of magnitude below the hash side, so the teardown/oversize cut has no witness to justify it either. ORIGINAL ROW FOLLOWS.   E-12 EX3-02 Cut 3 (oversize + teardown) — BLOCKED on E-14.**
   (Record correction 2026-09-04: Cut 2 already LANDED — `68ccd68c3`,
   unit headers 2.002→0.005, TPC-H 24/24 + PP 22/22 + TPC-DS PASS=95;
   only Cut 3 remains here.) Queued behind landed Cut 0/1/2; arena sizing is
