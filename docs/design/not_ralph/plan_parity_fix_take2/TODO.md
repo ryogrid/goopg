@@ -339,7 +339,16 @@ measured**: the seam records that adding the transitive `a = c` "would
 hand the search new JOIN clauses and reshape plans broadly — measured:
 it broke the pinned-semi-join layout
 `TestPreDPPinnedSemiKeysResolveAfterDP` asserts ... That half stays on
-its legacy caller pending its own evaluation." So the mechanism EXISTS
+its legacy caller pending its own evaluation."
+    **OBSTACLE READ (K26 §6)**: that test is a **REMAP** test, not a
+    layout test — "every ColumnRef in the semi join's keys/predicate
+    must resolve ... in the post-DP outer schema" — and its fixture
+    (`b1_j = b2_j AND b2_j = s3_j`) is exactly an equivalence class
+    whose closure enables MORE reordering. So the derived equality is
+    not wrong; the pinned semi join's F8 REMAP is incomplete for the
+    wider layouts it makes reachable. **The round's work is in
+    `predp`'s remap, not in `equiv_class.go`.** So the mechanism
+    EXISTS
 (re-wiring, not a port), the round's first obstacle is NAMED in
 advance, and the deferral's reason — "reshapes plans broadly" — is
 precisely what THIS goal's rule permits. That single gap makes

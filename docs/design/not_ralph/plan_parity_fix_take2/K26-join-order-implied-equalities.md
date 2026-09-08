@@ -108,10 +108,7 @@ PG's `generate_join_implied_equalities` (`equivclass.c`) shape: for
 each equivalence class, the join clauses between members on different
 relations.
 
-**Start by re-running `TestPreDPPinnedSemiKeysResolveAfterDP`** and
-understanding what it asserts, before touching anything. It is the
-named, measured obstacle, and slice 2b is the cautionary tale for
-meeting one blind.
+**Read `TestPreDPPinnedSemiKeysResolveAfterDP` first — done, §6.**
 
 **Verify first, per this workstream's repeated lesson**: instrument that
 the synthesised clause reaches the DP and that `{part}|{partsupp}` is
@@ -122,3 +119,50 @@ were each wrong until the input was measured rather than assumed.
 differs in join-method, scan-type, parallelism and rendering. The
 round's success test is `join-order` falling on both corpora, not a
 match.
+
+
+## 6. The named obstacle, read (2026-09-09)
+
+Doing what §5 prescribes, before writing any code. The test's own
+comment:
+
+> *"the mandatory F8 remap test: DP reorders the outer layout below the
+> pinned semi join; every `ColumnRef` in the semi join's keys/predicate
+> must resolve to the column of the same name in the post-DP outer
+> schema."*
+
+and its fixture:
+
+```sql
+SELECT b1_k FROM big1, big2, small3, small4
+WHERE b1_j = b2_j AND b2_j = s3_j AND s3_k = s4_k
+  AND EXISTS (SELECT 1 FROM inner_e WHERE e_k = big1.b1_k)
+```
+
+`b1_j = b2_j AND b2_j = s3_j` is an equivalence class over
+{b1_j, b2_j, s3_j}, whose transitive closure hands the DP `b1_j = s3_j`
+— a join clause that lets it reorder the outer layout in ways it
+otherwise could not.
+
+**So the test is a REMAP test, not a layout-correctness test.** It does
+not assert that some particular join order is right. It asserts that
+after the DP reorders, the pinned semi join's column references still
+resolve by name in the new outer schema.
+
+That reframes the obstacle, and favourably:
+
+- The derived equality is **not wrong**. The reorderings it enables are
+  legitimate — they are the ones PG has and goopg lacks (§2).
+- What breaks is the **pinned semi join's remap**, which is incomplete
+  for the wider set of layouts the new clauses make reachable.
+- So the round is: derive the equalities, then extend the F8 remap to
+  survive the reorderings they enable. That is a bounded, named piece
+  of work on a mechanism that already exists — not a re-litigation of
+  whether transitive equalities belong in the search.
+
+The seam's deferral note said the transitive half "broke the
+pinned-semi-join layout the test asserts". Read closely, the test
+asserts a **remap invariant**, and a remap that cannot follow a legal
+reordering is a gap in the remap. Recording the distinction because it
+decides where the next round spends its effort: in `predp`'s remap, not
+in `equiv_class.go`.
