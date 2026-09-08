@@ -186,6 +186,21 @@ func (o *indexScanOp) flushKills() {
 type indexScanOp struct {
 	plan *optimizer.IndexScan
 	ctx  *Context
+	// enumTypes[i] is non-nil when Table.Columns[i] is a user-defined enum,
+	// resolved ONCE in openPrep. Before this existed, Next() asked the
+	// catalog per column PER ROW — 17.94% of TPC-H CPU on a schema with no
+	// enums at all, two thirds of it RWMutex traffic. nil when the scan has
+	// no enum column, which is every TPC-H and TPC-DS table.
+	// See resolveEnumColumns (enumcols.go).
+	enumTypes []*catalog.EnumType
+	// colInfo is the per-column decode memo (resolveColTypeInfo), resolved
+	// once in openPrep from o.plan.Table.Columns -- the SAME slice Next()
+	// decodes with, which is the positional-indexing precondition
+	// decodeRowIntoInfo documents. Without it this operator decoded through
+	// the public entry points, which hardcode info = nil, so every value
+	// re-derived its type facts from a string: 29.70% of TPC-H CPU reached
+	// decodeRowRangeInfo this way. seqScanOp already threaded its memo.
+	colInfo []colTypeInfo
 	// M0092-0001: TID-list-eager + heap-fetch-lazy.
 	// `tids[i]` holds the (block, index-pointed offset) pair for the
 	// i-th match emitted by btree.RangeScan. The HOT-resolved actual
@@ -329,6 +344,17 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
 	}
 	o.ctx = ctx
+	// Resolve enum columns ONCE here, not per row in Next(). See
+	// resolveEnumColumns (enumcols.go) for the measurement that motivated it.
+	// openPrep runs per execution, which is the lifetime that keeps this
+	// memo DDL-safe -- the same rule the sequential scan and colTypeInfo use.
+	if o.plan.Table != nil {
+		o.enumTypes, _ = resolveEnumColumns(ctx.Catalog, o.plan.Table.Columns)
+		o.colInfo = resolveColTypeInfo(o.plan.Table.Columns)
+	} else {
+		o.enumTypes = nil
+		o.colInfo = nil
+	}
 	o.tids = nil
 	o.poss = nil
 	o.killList = nil
@@ -742,10 +768,11 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			// Tuple-decompose + range-decode by name: there is NO HeapTuple
 			// range helper, so natts comes from Infomask2 at this site.
 			natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
-			_, decErr = DecodeRowRangeIntoMctxPGTupleStyled(o.scanRow, cols, tuple.Data, tuple.Bitmap, natts, nil, array.DefaultOutputStyle(), 0, survivorBound, 0)
+			_, decErr = decodeRowRangeInfo(o.scanRow, cols, o.colInfo, tuple.Data, tuple.Bitmap, natts, nil, array.DefaultOutputStyle(), 0, survivorBound, 0)
 			poisonDeformTail(o.scanRow, survivorBound)
 		} else {
-			decErr = DecodeHeapTupleRowInto(o.scanRow, cols, tuple, nil)
+			natts2 := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
+			decErr = decodeRowIntoInfo(o.scanRow, cols, o.colInfo, tuple.Data, tuple.Bitmap, natts2, nil, array.DefaultOutputStyle())
 		}
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
@@ -755,21 +782,9 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		row := o.scanRow
 		// Convert KindString enum column values to KindEnum (sort order) so
 		// Filter predicates can compare by declaration order. M0097-0022.
-		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-			for i, col := range o.plan.Table.Columns {
-				if et, isEnum := im.LookupEnum(col.Type.Name); isEnum && i < len(row) {
-					if row[i].Kind == KindString {
-						label := row[i].StringValue()
-						for _, ev := range et.Values {
-							if ev.Label == label {
-								row[i] = NewEnumDatum(ev.SortOrder, label)
-								break
-							}
-						}
-					}
-				}
-			}
-		}
+		// Resolved once in openPrep; a no-op (single nil check) when the
+		// scan has no enum column.
+		applyEnumColumns(row, o.enumTypes)
 	// EX1-03a: bound-narrowed detoast over the same survivor window
 	// the EX1-02b deform above narrowed to — only i < survivorBound is
 	// resolved. Prefix-scoped needsDetoastPrefix pairing is load-bearing:

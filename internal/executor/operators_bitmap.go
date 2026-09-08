@@ -264,6 +264,8 @@ func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte,
 // ---------------------------------------------------------------------------
 
 type bitmapHeapScanOp struct {
+	// colInfo is the per-column decode memo; see Open.
+	colInfo []colTypeInfo
 	plan *optimizer.BitmapHeapScan
 	ctx  *Context
 	tbl  *catalog.Table
@@ -408,6 +410,13 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 			o.cols[i] = *col
 		}
 	}
+	// Per-column decode memo, resolved from the slice decodeScanRow walks.
+	// This operator previously decoded through the public entry points,
+	// which hardcode info = nil -- 39.18 s of TPC-DS's 272.72 s reached
+	// decodeRowRangeInfo that way and re-derived every value's type facts
+	// from a string. seqScanOp already threaded its memo; this is the same
+	// divergence. See decodeRowIntoInfo for the positional precondition.
+	o.colInfo = resolveColTypeInfo(o.cols)
 	o.arrayStyleLive = colsHaveArray(o.cols)
 	if o.arrayStyleLive {
 		o.arrayStyle = arrayOutputStyle(ctx)
@@ -1092,7 +1101,7 @@ func (o *bitmapHeapScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) e
 		st = o.arrayStyle
 	}
 	if o.deformBound > 0 && o.deformBound < len(o.cols) {
-		_, err := DecodeRowRangeIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.mctx, st, 0, o.deformBound, 0)
+		_, err := decodeRowRangeInfo(o.scanRow, o.cols, o.colInfo, data, bitmap, storedNatts, o.mctx, st, 0, o.deformBound, 0)
 		if err != nil {
 			return err
 		}
@@ -1100,7 +1109,7 @@ func (o *bitmapHeapScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) e
 		return nil
 	}
 	if o.arrayStyleLive {
-		return DecodeRowIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.mctx, o.arrayStyle)
+		return decodeRowIntoInfo(o.scanRow, o.cols, o.colInfo, data, bitmap, storedNatts, o.mctx, o.arrayStyle)
 	}
-	return DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, data, bitmap, storedNatts, o.mctx)
+	return decodeRowIntoInfo(o.scanRow, o.cols, o.colInfo, data, bitmap, storedNatts, o.mctx, array.DefaultOutputStyle())
 }

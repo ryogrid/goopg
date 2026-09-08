@@ -1415,7 +1415,11 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 		to = n
 	}
 	for i := from; i < to; i++ {
-		c := cols[i]
+		// &, not a copy: catalog.Column is 312 BYTES and this loop runs once
+		// per column per row. Every use below is a field read, so the copy
+		// bought nothing and cost 5.62 s = 2.5% of TPC-DS CPU on this one line
+		// (part 4; Go does not reliably elide it). Do not "simplify" this back.
+		c := &cols[i]
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
 		// M0097-0077: when the column has a precomputed MissingValue Datum
 		// (set by ALTER TABLE ADD COLUMN … DEFAULT <const>), surface it
@@ -1438,22 +1442,27 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 			align int
 			tname string
 		)
+		// isVarlena is the third per-value string derivation this memo
+		// exists to remove; it was previously re-derived here on BOTH
+		// paths, including the one that already had info[i] in hand.
+		var isVarlena bool
 		if info != nil {
-			align, tname = info[i].align, info[i].lower
+			align, tname, isVarlena = info[i].align, info[i].lower, info[i].isVarlena
 		} else {
 			tname = strings.ToLower(c.Type.Name)
 			align = physicalPGTypeAlignLowered(c.Type, tname)
+			isVarlena = pgPhysicalTypeIsVarlena(c.Type)
 		}
 		// D-09 att_align_pointer: the peek decides only whether to
 		// align (shared rule: catalog.AttAlignPointer). Bounds-safe:
 		// OOB cursor returns unchanged and trips the exhausted arm.
-		off = catalog.AttAlignPointer(data, off, align, pgPhysicalTypeIsVarlena(c.Type))
+		off = catalog.AttAlignPointer(data, off, align, isVarlena)
 		if off >= len(data) {
 			// Data exhausted — treat remaining columns as NULL.
 			dst[i] = NullDatum
 			continue
 		}
-		v, consumed, err := decodePhysicalPGValueLowered(c.Type, tname, data[off:], sctx, st)
+		v, consumed, err := decodePhysicalPGValueLowered(&c.Type, tname, data[off:], sctx, st)
 		if err != nil {
 			return off, fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
 		}
@@ -1604,7 +1613,7 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mmgr.Con
 	// M0118-0002. The session DateStyle/TimeZone rides along because goopg
 	// renders the element text here, where upstream's array_out would render it
 	// at output time (M0119-0006).
-	return decodePhysicalPGValueLowered(t, strings.ToLower(t.Name), data, sctx, st)
+	return decodePhysicalPGValueLowered(&t, strings.ToLower(t.Name), data, sctx, st)
 }
 
 // decodePhysicalPGValueLowered is decodePhysicalPGValueMctxStyled with the
@@ -1622,9 +1631,17 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mmgr.Con
 // resolveColTypeInfo is goopg's equivalent, and callers that hold a column list
 // should resolve once and pass it down.
 // (docs/design/not_ralph/perf-optimize-take6/README.md candidate A.)
-func decodePhysicalPGValueLowered(t catalog.Type, tname string, data []byte, sctx *mmgr.Context, st array.OutputStyle) (Datum, int, error) {
+// t is a POINTER because this is called once per column per row and
+// catalog.Type is 48 bytes; passing it by value was part of the 25.69 s flat
+// cost measured on the call site (part 4). The callee only reads fields and
+// never retains t — verified before the signature changed, because a retained
+// pointer here would turn a copy into silent aliasing.
+func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sctx *mmgr.Context, st array.OutputStyle) (Datum, int, error) {
 	if t.IsArray {
-		return decodeArrayValuePGStyled(t, data, st)
+		// The array path is rare and not hot; a copy here keeps the change
+		// contained to this signature rather than cascading through the
+		// array decoder.
+		return decodeArrayValuePGStyled(*t, data, st)
 	}
 	switch tname {
 	case "bool", "boolean":

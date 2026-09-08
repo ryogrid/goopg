@@ -27,7 +27,7 @@ func TestDecodeDateOutOfMicrosRange(t *testing.T) {
 	// Well past the micros range (PG's own max date, 5874897 AD, is ~1.43e9
 	// days from 2000-01-01) — must error, not wrap.
 	for _, days := range []int32{1_430_000_000, -1_430_000_000} {
-		if _, _, err := decodePhysicalPGValueLowered(dateType, "date", enc(days), nil, array.OutputStyle{}); err == nil {
+		if _, _, err := decodePhysicalPGValueLowered(&dateType, "date", enc(days), nil, array.OutputStyle{}); err == nil {
 			t.Errorf("decode of %d days succeeded, want an out-of-range error", days)
 		}
 	}
@@ -37,7 +37,7 @@ func TestDecodeDateOutOfMicrosRange(t *testing.T) {
 		days int32
 		want string
 	}{{math.MaxInt32, "infinity"}, {math.MinInt32, "-infinity"}} {
-		d, _, err := decodePhysicalPGValueLowered(dateType, "date", enc(tc.days), nil, array.OutputStyle{})
+		d, _, err := decodePhysicalPGValueLowered(&dateType, "date", enc(tc.days), nil, array.OutputStyle{})
 		if err != nil {
 			t.Fatalf("decode of the %s sentinel: %v", tc.want, err)
 		}
@@ -47,7 +47,7 @@ func TestDecodeDateOutOfMicrosRange(t *testing.T) {
 	}
 
 	// An ordinary date still round-trips.
-	d, _, err := decodePhysicalPGValueLowered(dateType, "date", enc(7500), nil, array.OutputStyle{})
+	d, _, err := decodePhysicalPGValueLowered(&dateType, "date", enc(7500), nil, array.OutputStyle{})
 	if err != nil {
 		t.Fatalf("decode of an ordinary date: %v", err)
 	}
