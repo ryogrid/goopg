@@ -410,6 +410,36 @@ numbers. Two further implementation facts from the survey:
   scalar. Only raw-pointer loads plus separate scalar accumulator variables
   reached 162 ns. This is a third archsimd pitfall to add to §4.1's two.
 
+## 7c. Implementation landed; end-to-end measurement CUT SHORT (partial data)
+
+Landed at `b8baeee13` as two deliberately separate changes: the unconditional
+scalar rewrite (2131 -> 1017 ns/page, ~2.1x, no flag) and the AVX2 kernel
+(1017 -> 163 ns, ~6.2x further, `goexperiment.simd && amd64` plus a runtime
+`archsimd.X86.AVX2()` check). Equivalence is mutation-checked against the
+production scalar oracle over 259 pages; units and the storage suite are green
+in both build configurations.
+
+**The three-arm TPC-H run was stopped after arm 1 when the owner redirected the
+work.** It is recorded here rather than discarded, because the one arm that
+completed already says something:
+
+```
+arm=base  cold  117.18 s
+arm=base  warm1 117.24 s
+```
+
+**Cold and warm are indistinguishable (0.05%).** On this cluster — TPC-H SF=1,
+1.9 GiB of data inside a 2048 MB buffer pool, on a host whose OS page cache
+holds the rest — a "cold" arm performs essentially no physical reads. Since
+`verifyOnRead` is only on the *physical* read path
+(`internal/storage/smgr.go:766-780`), the checksum barely executes in either
+arm. That is direct corroboration of §7b's profile-based verdict, from a
+completely different instrument: **there is no end-to-end signal to find here,
+and the remaining two arms would have measured the same noise.**
+
+No end-to-end number is claimed for this item. The kernel is correct, fast in
+isolation, and inert at the corpus level — which is the whole finding.
+
 ## 8. Review findings, and what they changed
 
 Two adversarial reviews ran: a **PG 18.3 oracle** pass against `./postgres/`
