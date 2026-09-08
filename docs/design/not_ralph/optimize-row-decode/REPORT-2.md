@@ -86,27 +86,69 @@ Recorded rather than quietly dropped, because the failure mode generalises:
 Part 1's own prediction (17.94% bound, 11.6% delivered) was measured against a
 profile of its own build and behaved as expected. This one was not.
 
-## 5. TPC-DS — PENDING, with the prediction stated in advance
+## 5. TPC-DS — the prediction held: −9.2%
 
-**The TPC-DS SF0.5 sweep has not finished at the time of writing.** It is
-running, with the part-1 baseline sweep queued behind it so both arms see the
-same idle machine. Results will be appended to this document as §6.
+**Predicted before measuring** (and left in the previous revision of this
+document so it could not be retrofitted): TPC-DS *should* move here, unlike
+part 1, because `isVarlena` fixes a cost on the sequential-scan path that
+dominates TPC-DS. The falsification condition was stated as "if TPC-DS comes
+back at approximately zero, that refutes §2.1 of the design."
 
-The prediction, on record before the numbers exist:
+It did not come back at zero.
 
-**TPC-DS should move here, unlike part 1.** Part 1 was TPC-H-only because
-TPC-DS is sequential-scan dominated and `seqScanOp` already threaded its memo.
-Part 2's `isVarlena` change fixes a cost *on that same seq-scan path* —
-`pgPhysicalTypeIsVarlena` was 11.02 s of TPC-DS's 272.72 s (4.0%), the largest
-single `ToLower` caller in that profile.
+| | part-1 baseline | part 2 | delta |
+|---|---:|---:|---:|
+| 95 comparable queries, total | **977.8 s** | **888.3 s** | **−89.6 s, −9.2%** |
 
-**If TPC-DS comes back at approximately zero, that falsifies the claim that
-`isVarlena` does what §2.1 of the design says**, and it will be investigated
-and reported as such rather than written up as an uninteresting null.
+Both sweeps: `PASS=95 (57 ck-verified) MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0 SKIP=4` against the git-tracked PG oracle. The values gate is clean
+on both arms, which is required regardless of timing.
 
-The sweep also serves as the values gate: `PASS=95 MISMATCH=0 CKMISMATCH=0
-ERROR=0 TIMEOUT=0` against the git-tracked PG oracle is required regardless of
-timing.
+Largest movers:
+
+| query | part 1 (s) | part 2 (s) | delta | % |
+|---|---:|---:|---:|---:|
+| Q18 | 147.2 | 122.6 | −24.5 | −16.7% |
+| Q79 | 74.7 | 63.3 | −11.4 | −15.3% |
+| Q14 | 94.4 | 86.1 | −8.4 | −8.8% |
+| Q46 | 33.1 | 26.0 | −7.0 | −21.3% |
+| Q88 | 48.6 | 42.7 | −5.9 | −12.1% |
+| Q28 | 26.3 | 21.6 | −4.7 | −17.8% |
+| Q48 | 9.3 | 6.1 | −3.2 | −34.1% |
+
+**Two limits on this number, both real:**
+
+1. **The arms were NOT alternated.** Each sweep takes about an hour, so the
+   two ran back to back rather than interleaved as the TPC-H arms were. Drift
+   over that window is a confound I cannot exclude here the way I could for
+   TPC-H. The direction and rough magnitude are supported; the second digit is
+   not.
+2. **Each query is a single S-cold run**, so per-query figures are noisy. Four
+   queries moved the *wrong* way by more than 15% (Q22 +31%, Q7 +27%, Q78
+   +20%, Q5 +17%), totalling about 10 s against the 89.6 s gain. On single
+   readings at this granularity that is noise, not a regression signal — but
+   it is listed rather than suppressed, and it is why the per-query table
+   should not be read as a per-query result.
+
+**A number NOT to quote.** The sweep's own banner printed
+`TOTAL 1143s → 887s (−22.4%)` for part 2. That comparison is against
+`f0c9f36e7`, a stored run from the *previous* workstream, so it conflates
+everything landed since that commit plus part 1 plus part 2. **It is not part
+2's effect.** The −9.2% above is the like-for-like pair, both arms run today
+on the same idle machine. Quoting the −22.4% would repeat precisely the
+three-baselines error §1.2 of `PERF-REPORT-20260905.md` was written to stop.
+
+## 5a. Both corpora, both parts
+
+| | master | part 1 | part 2 | part 2 alone | cumulative |
+|---|---:|---:|---:|---:|---:|
+| TPC-H suite | 115.37 s | 101.60 s | **91.90 s** | −9.6% | **−20.3%** |
+| TPC-DS SF0.5 (95 q) | not measured | 977.8 s | **888.3 s** | −9.2% | — |
+
+TPC-DS was not measured against master, so no cumulative figure is claimed for
+it. Part 1's design predicted TPC-DS would show ~nothing from that change, and
+it was not measured then either; that remains an untested prediction rather
+than a confirmed null.
 
 ## 6. Method
 
