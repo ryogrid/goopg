@@ -467,7 +467,21 @@ failure/hang in background wastes the session — goal instruction).
   so Q9 does not become a MATCH — exactly as R10 DESIGN §6 predicted.
   `TestSlice3LiveQ9ShapeDerivation`'s narrow-build failures are a
   consequence of the new build sides, i.e. a justified re-baseline.
-- [ ] **R15 — adjudicate the remaining three** the same way
+- [x] **R15 — the multi-key item, narrowed** — DONE 2026-09-08,
+  findings only. `r15-multikey-adjudication/FINDINGS.md`. The failing
+  arm is the COST-driven enumerator, not the shape-capability one
+  (`splitEqualityForHash`'s own arm still passes), and the test's
+  header documents that a relation the planner cannot size floors at
+  one row where "a nested loop is genuinely the cheaper plan". So this
+  is **not a lost capability** — it is a cost movement, same family as
+  R14's narrow-build changes. NOT settled: whether the price is right,
+  which needs PG's answer for the same shape at the same cardinalities
+  (synthetic fixture -> run the SQL on :65432, do not read a capture).
+- [ ] **R16 — measure PG for the multi-key shape**, adjudicate
+  `TestSlice3FilterColumnSurvivesNarrowing` and
+  `TestOwnedBuildPoisonPrebuiltBoundary`, then land flip + provenance
+  (K20) + stage pin in ONE commit and run R10 DESIGN §5's gates.
+  ORIGINAL R15 SCOPE: the same way
   (`TestSlice3FilterColumnSurvivesNarrowing`,
   `TestSplitEqualityForHashMultiKey`,
   `TestOwnedBuildPoisonPrebuiltBoundary`), then land flip + provenance
@@ -488,31 +502,31 @@ failure/hang in background wastes the session — goal instruction).
   each expected tree against PG rather than against the new output.
   Then land the flip and run R10 DESIGN §5's gates. Everything already
   known is in R10's report so it need not be re-derived.
-- [ ] **R16 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] **R17 — slice (B): let a node below satisfy the ordering** (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
   a finished Node and `windowsetoppaths.go:19` records that above the
   search seam inputs carry no pathkeys. Architectural.
-- [ ] **R17 — heap page fill on bulk load** (K14 remainder). goopg
+- [ ] **R18 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R18 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R19 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
-- [ ] **R19 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R20 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R20 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R21 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R21 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R22 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R22 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R23 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -521,6 +535,12 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R15 done (findings only): the multi-key "fell back to
+  Nested Loop" is the COST arm, not the capability arm — the test's own
+  header explains the one-row-floor mechanism. Narrowed from "possible
+  shape regression" to "cost adjudication pending"; PG measurement for
+  the synthetic shape still owed. 2 of R10's 7 now adjudicated, 1
+  narrowed.
 - 2026-09-08 R14 done (findings only): Q9 adjudicated against PG.
   PG uses Parallel Hash Join twice; goopg with the flip uses it three
   times; without it, none. First evidence (not just principle) that the
