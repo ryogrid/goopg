@@ -249,7 +249,13 @@ failure/hang in background wastes the session — goal instruction).
   a fixture, which breaks any test wanting a serial baseline. Also:
   `scripts/planner-flags.env` records what the default IS, so it must
   be regenerated IN THE SAME COMMIT as a default change, never before.
-- **K21 (measured 2026-09-08 — the flip is NOT unambiguously good).**
+- **K21 (measured 2026-09-08) — ~~the flip costs a hash join PG
+  keeps~~ SUPERSEDED BY R17.** On REAL SF=1 data with the flip on,
+  goopg hash-joins the multi-key shape on both equalities with the
+  residual as a Join Filter — PG's exact structure, same worker count
+  (3), same outer. There is NO nested-loop fallback on the corpus; it
+  exists only at the TEST FIXTURE's synthetic cardinalities, which is a
+  fixture question, not a parity regression. Original (wrong) text:
   PG hash-joins the multi-key shape on both equalities with the
   residual as a Join Filter (verified on :65432, GUCs pinned). goopg
   under `GOOPG_GATHER_PATHS=all` falls back to a nested loop, so the
@@ -257,6 +263,14 @@ failure/hang in background wastes the session — goal instruction).
   mechanism PG uses (R14's Q9). Both measured. R10 DESIGN §7's
   acceptance rule — a category regression must be EXPLAINED, not
   outweighed — applies directly, and this one is not yet explained.
+- **K22 (2026-09-08 — a NEW error variant, mine).** R16 wrote its own
+  caveat correctly ("the SHAPE question is settled; the THRESHOLD
+  question is not") and then, in the same document, asserted a headline
+  about the threshold case generalised to the corpus. **The check was
+  done; the conclusion outran it.** K4 covers concluding without
+  checking — this is concluding PAST a check you already performed.
+  Guard: when a report states a limitation, the headline and the ledger
+  entry must be re-read against that limitation before committing.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -497,7 +511,23 @@ failure/hang in background wastes the session — goal instruction).
   mechanism (R14) and costs a hash join PG keeps. Caveat recorded: the
   fixture's own row counts are synthetic and smaller; the SHAPE
   question is settled, the THRESHOLD question is not.
-- [ ] **R17 — why is the nested loop priced below the hash join under
+- [x] **R17 — the multi-key shape on REAL data** — DONE 2026-09-08.
+  `r17-multikey-on-real-data/FINDINGS.md`. **Corrects R16/K21.** Under
+  the flip goopg produces `Gather(3) -> Parallel Hash Join` with
+  `Hash Cond: (ps_partkey = l_partkey AND ps_suppkey = l_suppkey)` and
+  `Join Filter: (ps_availqty > s)` over `Parallel Seq Scan on partsupp`
+  — **PG's structure, four of seven rows identical including worker
+  count**. The closest goopg has come to a PG plan on a non-trivial
+  shape here. The nested loop exists only at the fixture's synthetic
+  counts. R16 stated this caveat and then reasoned past it in its own
+  headline — see K22.
+- [ ] **R18 — the fixture question**: does the synthetic multi-key
+  fixture still test what it means under the flip, or do its counts now
+  sit on the wrong side of the one-row floor? If the latter, fix the
+  FIXTURE, not the planner.
+- [ ] **R19 — explain `aggregation-strategy` 10 -> 14** (R8's probe),
+  the last unexplained objection to landing the flip per R10 DESIGN §7.
+  ORIGINAL R17 SCOPE: why is the nested loop priced below the hash join under
   the flip?** Instrument `addPath` to confirm the hash candidate is
   generated before theorising about cost terms
   ([[planner_verify_both_candidates_generated]]). Then adjudicate
@@ -530,17 +560,17 @@ failure/hang in background wastes the session — goal instruction).
   each expected tree against PG rather than against the new output.
   Then land the flip and run R10 DESIGN §5's gates. Everything already
   known is in R10's report so it need not be re-derived.
-- [ ] **R18 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] **R20 — slice (B): let a node below satisfy the ordering** (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
   a finished Node and `windowsetoppaths.go:19` records that above the
   search seam inputs carry no pathkeys. Architectural.
-- [ ] **R19 — heap page fill on bulk load** (K14 remainder). goopg
+- [ ] **R21 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R20 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R22 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
 - [ ] **R21 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
@@ -563,6 +593,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R17 done: CORRECTS R16/K21. On real data the flip gives
+  goopg PG's multi-key structure (Parallel Hash Join, both hash keys,
+  same Join Filter, same worker count) — the nested loop is only at the
+  test fixture's synthetic counts. Ninth falsified claim, new variant
+  (K22): the caveat was written and then reasoned past.
 - 2026-09-08 R16 done (findings only): PG hash-joins the multi-key
   shape, so goopg's nested-loop fallback under the flip is a CONFIRMED
   divergence — reversing R15's provisional disposition. The flip now
