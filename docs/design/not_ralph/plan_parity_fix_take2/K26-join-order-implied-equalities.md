@@ -166,3 +166,55 @@ asserts a **remap invariant**, and a remap that cannot follow a legal
 reordering is a gap in the remap. Recording the distinction because it
 decides where the next round spends its effort: in `predp`'s remap, not
 in `equiv_class.go`.
+
+
+## 7. Measured with the transitive half ENABLED (2026-09-09)
+
+Switched the seam from `inferEquivClassConstants` to
+`inferTransitiveEqualities` and ran the suites. The deferral note said
+this "reshapes plans broadly". Measured today, it breaks **three
+tests**, not a corpus:
+
+1. `TestPreDPPinnedSemiKeysResolveAfterDP`
+2. `TestSlice3LiveQ9ShapeDerivation`
+3. `TestSlice3SelfJoinInDerivedTable`
+
+That is a materially smaller blast radius than the note implies, and
+worth re-measuring precisely because the note is old and the tree has
+moved a long way since.
+
+### 7.1 The named obstacle fails INSIDE THE TEST
+
+`TestPreDPPinnedSemiKeysResolveAfterDP` does not fail an assertion. It
+**nil-dereferences in its own helper**: `findSpineSemi` walks
+`Filter`/`Project`/`Sort` and returns `(nil, nil)` at the first `*Join`
+that is not Semi/Anti, and the caller dereferences the result without
+checking.
+
+So the failure presents as a segfault that looks like a planner crash
+and is not one — the fourth time this session a test-side walker has
+produced a planner-shaped symptom (K19).
+
+Extending the walker to descend a non-semi join's children (committed —
+it is strictly more correct regardless) is **not sufficient**: the semi
+join is still not found. So it is not merely relocated above/below an
+inner join; with implied equalities the EXISTS is unnested to a
+different shape entirely, or the pinned semi join is gone.
+
+**That is the open question, and it is now a specific one**: where does
+the pinned semi join go when the DP is given implied join equalities?
+Answer it before touching the remap — the F8 remap may not even be the
+thing that needs changing, and §6's conclusion that it is should be
+treated as a hypothesis, not a finding.
+
+### 7.2 The other two
+
+`TestSlice3LiveQ9ShapeDerivation` and `TestSlice3SelfJoinInDerivedTable`
+are narrow-build/keep assertions of the same family R14 adjudicated as
+justified re-baselines when the join shape legitimately moves. They
+should be adjudicated against PG the same way, not assumed.
+
+### 7.3 State
+
+The seam is REVERTED to constants-only; suites green. The walker fix is
+kept. Nothing about the default behaviour changed.

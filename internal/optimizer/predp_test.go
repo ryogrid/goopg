@@ -90,7 +90,16 @@ func findSpineSemi(node Node) (*Join, *NestedLoopIndexJoin) {
 			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
 				return x, nil
 			}
-			return nil, nil
+			// K26: with implied join equalities the DP can legally place an
+			// inner join ABOVE the pinned semi join, so the semi join is no
+			// longer the first join on the spine. Descend both sides rather
+			// than giving up — returning nil here made the caller nil-deref,
+			// which reads as a planner crash and is a walker gap (K19 again,
+			// fourth walker family).
+			if l, n := findSpineSemi(x.Left); l != nil || n != nil {
+				return l, n
+			}
+			return findSpineSemi(x.Right)
 		case *NestedLoopIndexJoin:
 			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
 				return nil, x

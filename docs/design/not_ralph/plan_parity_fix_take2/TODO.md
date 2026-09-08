@@ -347,7 +347,18 @@ its legacy caller pending its own evaluation."
     whose closure enables MORE reordering. So the derived equality is
     not wrong; the pinned semi join's F8 REMAP is incomplete for the
     wider layouts it makes reachable. **The round's work is in
-    `predp`'s remap, not in `equiv_class.go`.** So the mechanism
+    `predp`'s remap, not in `equiv_class.go`.**
+    **MEASURED 2026-09-09 with the transitive half ENABLED (K26 §7)**:
+    it breaks **3 tests**, not a corpus — far smaller than the old
+    note's "reshapes plans broadly". And the named obstacle fails by
+    NIL-DEREF INSIDE ITS OWN HELPER (`findSpineSemi` returns nil at the
+    first non-semi Join; caller does not check) — a planner-shaped
+    symptom from a test walker, K19's fourth family. Descending joins
+    is NOT enough: the semi join is still not found, so it is not
+    merely relocated. **OPEN, and specific: where does the pinned semi
+    join GO when the DP gets implied equalities?** Answer that before
+    touching the remap — §6's "it's the F8 remap" is a HYPOTHESIS, not
+    a finding. So the mechanism
     EXISTS
 (re-wiring, not a port), the round's first obstacle is NAMED in
 advance, and the deferral's reason — "reshapes plans broadly" — is
@@ -806,6 +817,11 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 K26 §7: enabled the transitive half and measured — breaks
+  only 3 tests, and the named obstacle fails by nil-deref in its OWN
+  helper (K19's 4th walker family), not by an assertion. Descending
+  joins does not find the semi join, so it is not merely relocated.
+  Seam reverted to constants-only, suites green; walker fix kept.
 - 2026-09-09 K26 measured: join-order's dominant cause is that goopg
   never synthesises implied join equalities from its equivalence
   classes, so star-shaped queries can only be joined through the fact
