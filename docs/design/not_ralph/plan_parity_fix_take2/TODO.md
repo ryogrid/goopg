@@ -631,12 +631,27 @@ failure/hang in background wastes the session — goal instruction).
     **Measured enabled: `aggregation-strategy` 14 -> 10 — K23's
     success test MET** — but TPC-H Q9/Q13 crash:
     `Aggregate input target [] drops group-input column "l_year"`.
-    The aggregate's B-01c input target was derived against the GATHER;
-    after the swap it is stale in provenance (a Gather is
-    schema-preserving, so not wrong in content). **Do not weaken the
-    assertion** — dropping a group-input column silently changes GROUP
-    BY. Fix: re-derive the target against the unwrapped child
-    (`stampAggInputTarget`'s path), then uncomment one line.
+    **ATTEMPTS 2 AND 3 CORRECTED THIS, both measured — the guesses
+    below were wrong, read the outcome first.**
+    - Attempt 2 (clear the stale stamp on a copy of the agg spec):
+      SAME PANIC. The target is applied POST-HOC to the emitted node,
+      so a spec copy never reaches the assertion.
+    - Attempt 3: **`deriveAggregateInputKeep` was RIGHT.** It matches
+      child columns to group inputs BY NAME, and Q9 groups on
+      `l_year` — a COMPUTED column made by a `Project` ABOVE the
+      Gather. My helper walked to the Gather at any depth and returned
+      ITS CHILD, discarding that Project, so nothing matched by name.
+      The bug was mine, one frame up from where the panic pointed.
+    - Narrowed to an IMMEDIATE Gather: all 22 plans build, no crash —
+      but `aggregation-strategy` stays 14. **Sound but INERT**: the
+      search's Gather always sits behind a Project.
+    **CORRECT FIX: SPLICE the Gather out of the chain, keeping every
+    wrapper** — `Project(Gather(X))` -> `Project(X)`. A Gather is
+    schema-preserving, so the input row's columns (incl. `l_year`) are
+    unchanged, which is what the name-matched derivation needs. Needs
+    wrapper-cloning machinery. **Do not weaken the assertion** —
+    dropping a group-input column silently changes GROUP BY.
+    SUPERSEDED GUESS: re-derive the target against the unwrapped child.
     Crash verified MINE, not the flip's (R19 captured all 22 under the
     flip cleanly). ORIGINAL: see DESIGN §9.
     Site: new arm in `addPartialAggSplitPath` before the guard. Seed
