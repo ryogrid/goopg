@@ -218,3 +218,56 @@ should be adjudicated against PG the same way, not assumed.
 
 The seam is REVERTED to constants-only; suites green. The walker fix is
 kept. Nothing about the default behaviour changed.
+
+
+## 8. The open question, ANSWERED (2026-09-09)
+
+§7 asked: where does the pinned semi join go when the DP is given
+implied join equalities? Probed by planning the fixture with the
+transitive half on and dumping the tree:
+
+```
+*Project
+  *Filter
+    *NLI type=5          <-- JoinTypeSemi. Still there.
+      *Project
+        *Join type=0 algo=1
+          ...
+```
+
+**The semi join is not lost. It changes FORM** — from the hash-shaped
+`*Join` to a `*NestedLoopIndexJoin`, still `JoinTypeSemi`, still on the
+spine directly under `Project → Filter`.
+
+And the test handles that: it switches on `semi != nil` / `nli != nil`
+with a `default: t.Fatalf("no pinned semi join found")`. The Fatalf
+never fires — the NLI branch is taken.
+
+**The nil-deref is one expression inside that branch:**
+
+```go
+leftKey = nliIn(nli.Inner).Key
+```
+
+`nliIn(nli.Inner)` returns nil for the inner shape the implied
+equalities produce, and `.Key` dereferences it.
+
+So the whole chain, end to end:
+
+1. implied equalities open join orders goopg cannot otherwise reach;
+2. on this fixture the DP's chosen order makes the pinned semi join an
+   NLI rather than a hash join — a legal, plausibly better plan;
+3. the NLI's inner is a shape `nliIn` does not recognise;
+4. the test dereferences `nliIn`'s nil result;
+5. that reads as a segfault, which read as "the transitive half breaks
+   the pinned-semi-join layout", which is why the half was deferred.
+
+**Nothing in that chain is evidence that implied equalities are wrong.**
+The next step is to look at what `nli.Inner` actually is and whether
+`nliIn` should recognise it — a bounded question about one helper, not
+a planner redesign, and emphatically not the F8 remap §6 hypothesised.
+
+That is three successive reframings of the same obstacle, each from
+measurement: "breaks plan layouts" → "breaks a remap" → "one helper
+does not recognise one inner shape". Each was cheaper to answer than
+the last, and none required trusting the previous framing.

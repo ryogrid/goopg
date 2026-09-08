@@ -355,10 +355,14 @@ its legacy caller pending its own evaluation."
     first non-semi Join; caller does not check) — a planner-shaped
     symptom from a test walker, K19's fourth family. Descending joins
     is NOT enough: the semi join is still not found, so it is not
-    merely relocated. **OPEN, and specific: where does the pinned semi
-    join GO when the DP gets implied equalities?** Answer that before
-    touching the remap — §6's "it's the F8 remap" is a HYPOTHESIS, not
-    a finding. So the mechanism
+    merely relocated. **ANSWERED (K26 §8)**: the semi join is NOT lost — it changes FORM to
+    a `*NestedLoopIndexJoin` (still `JoinTypeSemi`, still on the spine).
+    The test handles the NLI branch; the nil-deref is ONE expression in
+    it — `nliIn(nli.Inner).Key`, where `nliIn` returns nil for the
+    inner shape implied equalities produce. **So the next step is: what
+    is `nli.Inner`, and should `nliIn` recognise it?** A bounded
+    question about one helper — NOT the F8 remap (§6's hypothesis is
+    dead) and NOT evidence that implied equalities are wrong. So the mechanism
     EXISTS
 (re-wiring, not a port), the round's first obstacle is NAMED in
 advance, and the deferral's reason — "reshapes plans broadly" — is
@@ -817,6 +821,12 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 K26 §8: open question ANSWERED by probe. Implied
+  equalities turn the pinned semi join into an NLI (legal, plausibly
+  better); the test's NLI branch nil-derefs at `nliIn(nli.Inner).Key`
+  because `nliIn` does not recognise the new inner shape. Obstacle
+  reframed three times by measurement: "breaks layouts" -> "breaks a
+  remap" -> "one helper misses one shape".
 - 2026-09-09 K26 §7: enabled the transitive half and measured — breaks
   only 3 tests, and the named obstacle fails by nil-deref in its OWN
   helper (K19's 4th walker family), not by an assertion. Descending
