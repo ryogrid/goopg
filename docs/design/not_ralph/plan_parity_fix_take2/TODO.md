@@ -204,6 +204,21 @@ failure/hang in background wastes the session — goal instruction).
   [[planner_verify_both_candidates_generated]]: instrument `addPath` to
   learn whether `addPartialHashJoinPath` is never called, called and
   declined, or called and outcompeted — three different fixes.
+- **K17 (measured 2026-09-08 — a real bug, found before flipping a
+  default).** `GOOPG_GATHER_PATHS=all` **crashes the server** on TPC-DS
+  Q5: `assertParallelAwareJoinIsRunnable` fires on a `2/1` =
+  `JoinTypeRight`/`JoinAlgoHash` join — "the workers' verdicts are not
+  row-local, so the join would silently drop or duplicate rows".
+  Cause: **`addPartialHashJoinPath` takes `jt parser.JoinType` and never
+  compares it to anything** — there is no jointype test anywhere in
+  `joinpathsparallel.go`, so it files whatever direction it is handed,
+  including RIGHT. The assertion's own comment claims the producer
+  "declines outright for SEMI/ANTI"; that describes code which does not
+  exist. Sixth stale-comment finding here, same class as K11a/K15.
+  The fail-closed assertion paid for itself the first time its
+  "unreachable" branch became reachable. Fix: derive the filter from
+  `hashJoinIsPartialCapable` rather than hand-listing, so predicate and
+  producer cannot drift again.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -339,35 +354,50 @@ failure/hang in background wastes the session — goal instruction).
   cooperatively. Cheapest identified round with a concrete target
   (Q14 -> MATCH would be +1 on TPC-H) and it is self-verifying.
   Same class as R2's `WindowAgg` label fix.
-- [ ] **R8 — why no partial hash-join path ever wins** (K16). Three
+- [x] **R8 — why no partial hash-join path ever wins** (K16) — DONE
+  2026-09-08, findings only. `r8-partial-path-admission/FINDINGS.md`.
+  Answer: the CONSUMER is off. `GOOPG_GATHER_PATHS` defaults to off, so
+  `generateUsefulGatherPaths` reads nothing and every partial path is
+  discarded. The knob was parked on a TIMING decision (D-05: -10..22%
+  TPC-H) that **this goal's rule voids**. Probed with `=all`:
+  `Parallel Hash Join` 0 -> 19 on TPC-H (PG 9) and 0 -> **132** on
+  TPC-DS (PG 139); TPC-H `parallelism` 18 -> 15, `join-method` 12 -> 11,
+  `qual-placement` 7 -> 5, but `aggregation-strategy` 10 -> 14, match
+  unchanged. **BLOCKED by K17.** Three
   candidate causes, one instrumentation step to distinguish them. This
   is TPC-H's joint-top divergence category and it is a mechanism gap,
   not a label.
-- [ ] **R9 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] **R9 — jointype filter on the partial hash-join producer** (K17,
+  BLOCKING). Derive from `hashJoinIsPartialCapable`; unit pin per
+  jointype; correct the stale comment. Prerequisite for R10.
+- [ ] **R10 — flip `GOOPG_GATHER_PATHS`** (R8 §5), after R9. Full
+  values gates both corpora; adjudicate every moved plan; explain the
+  `aggregation-strategy` 10 -> 14 move before accepting.
+- [ ] **R11 — slice (B): let a node below satisfy the ordering** (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
   a finished Node and `windowsetoppaths.go:19` records that above the
   search seam inputs carry no pathkeys. Architectural.
-- [ ] **R10 — heap page fill on bulk load** (K14 remainder). goopg
+- [ ] **R12 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R11 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R13 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
-- [ ] **R12 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R14 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R13 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R15 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R14 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R16 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R15 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R17 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -376,6 +406,12 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R8 done (findings only): the partial-path CONSUMER is off
+  by default, parked on a timing decision this goal's rule voids.
+  Probed `=all`: Parallel Hash Join 0 -> 132 on TPC-DS (PG 139).
+  Flipping it is BLOCKED by K17 — a real crash on TPC-DS Q5, because
+  addPartialHashJoinPath never filters its jointype and files RIGHT
+  hash joins as parallel-aware. Found by probing before flipping.
 - 2026-09-08 R7 done: parallel-awareness plumbed onto the plan node and
   PG's generic prefix rendered. Premise FALSIFIED as the design said it
   would be if the label did not appear — goopg emits Parallel Hash Join
