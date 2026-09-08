@@ -80,30 +80,51 @@ dense path's comparison vacuous. That job is unchanged.
 
 ## 5. Still outstanding
 
-- **TPC-DS: after-arm complete, before-arm running.** `PASS=95 MISMATCH=0
-  CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4` — values gate clean. Total over 95
-  comparable queries: **867.9 s**.
+- **TPC-DS: COMPLETE. 886.0 s → 867.9 s, −2.0%** over 95 comparable queries,
+  same-session pair on an otherwise idle machine. Both arms
+  `PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4` against the
+  git-tracked PG oracle.
 
-  **Interim, cross-session: 888.3 s → 867.9 s = −2.3%.** The 888.3 s baseline
-  is part 2's sweep, which is legitimate for a cross-check because
-  `0b1bd7e6d → 7642bac63` changes **zero `.go` files** — the same binary
-  functionally — but it spans hours of machine drift, so the same-session
-  before-arm now running is the primary and this figure may move.
+  A cross-session cross-check (part 2's sweep, verified same-binary —
+  `0b1bd7e6d → 7642bac63` changes zero `.go` files) gave −2.3%. The two agree
+  to 0.3 points, so the total is solid.
 
-  **This contradicts the prediction, and the prediction was mine.** `DESIGN-3.md`
-  argued TPC-DS would carry the *larger* half of this item because `acquireRow`
-  was 16.6% of TPC-DS CPU against 8.4% of TPC-H. TPC-H delivered −5.6%; TPC-DS
-  is tracking about −2.3%, i.e. **less than half** the TPC-H gain rather than
-  more.
+  **The prediction was wrong, and it was mine.** `DESIGN-3.md` argued TPC-DS
+  would carry the *larger* half of this item because `acquireRow` was 16.6% of
+  TPC-DS CPU against 8.4% of TPC-H. Measured: TPC-H **−5.6%**, TPC-DS
+  **−2.0%** — well under half the TPC-H gain, not more.
 
-  If the same-session pair confirms it, the conclusion is that **a CPU-share
-  figure again over-predicted wall-clock gain**, and for a specific reason:
-  TPC-DS is more allocation- and I/O-bound than TPC-H, so removing CPU from
-  `acquireRow` exposes a different bottleneck rather than converting to wall
-  time. That would be the **third** time in this series a share was read as a
-  forecast — parts 1 and 2 both over- or under-shot for the same class of
-  reason — and it is the single most repeated methodological error of this
-  workstream.
+  This is the **third** time in this series a CPU share was read as a forecast
+  (part 1 predicted 17.94% and delivered 11.6%; part 2 predicted ≤7.9% from a
+  stale profile and delivered 9.6%). It is the workstream's single most
+  repeated methodological error, and the correct statement of the rule is:
+  **a profile says where cycles are spent, not which cycles are on the
+  critical path.** TPC-DS spends much of its time in spilling sorts, hash
+  builds and I/O, so CPU removed from `acquireRow` partly exposes a different
+  bottleneck instead of converting to wall time.
+
+  **PER-QUERY ATTRIBUTION IS NOT AVAILABLE HERE, and an earlier reading of it
+  was wrong.** Splitting the corpus at 20 s gives directly contradictory
+  answers depending on which baseline is used:
+
+  | subset | cross-session | same-session |
+  |---|---:|---:|
+  | 7 heavy queries (>20 s, ~47% of total) | +0.5% | **+3.8%** |
+  | the other 88 | +3.8% | **+0.5%** |
+
+  The totals agree (+2.3% vs +2.0%) while the attribution **inverts
+  completely**. Each query is a single S-cold run in each arm, so per-query
+  figures are noise-dominated and the split is an artifact. An interim note in
+  this report previously concluded the gain "lives entirely in the lighter
+  queries"; **that conclusion is withdrawn** — the same-session data says the
+  opposite, and neither is trustworthy at that granularity.
+
+  Individual queries behave accordingly: Q28 read +16.9% (slower) against one
+  baseline and −3.5% against the other, i.e. noise. Q23 is slower in both
+  (−12.7% same-session), which makes it the one candidate for a real
+  regression; it is recorded, not explained, and would need repeated runs to
+  confirm.
+
 - **GC pressure — the risk `DESIGN-3.md` §2.1 named — is not yet closed by a
   direct measurement.** §4's allocs/row halving is strong evidence that
   allocation *fell*, but a `GODEBUG=gctrace=1` arm at `GOGC=100` is queued
