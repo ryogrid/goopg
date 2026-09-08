@@ -1483,15 +1483,14 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		o.arrayStyle = arrayOutputStyle(ctx)
 	}
 	// Pre-compute which columns are enum types so Next() can inject KindEnum datums
-	// for correct ORDER BY semantics (M0097-enum).
-	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-		o.enumTypes = make([]*catalog.EnumType, len(o.cols))
-		for i, col := range o.cols {
-			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
-				o.enumTypes[i] = et
-			}
-		}
-	}
+	// for correct ORDER BY semantics (M0097-enum). Shared with the index scan
+	// via resolveEnumColumns (enumcols.go) so the two paths cannot drift apart
+	// again -- the index scan was doing this per ROW, at 17.94% of TPC-H CPU.
+	//
+	// Behaviour change, deliberate: enumTypes is now nil (rather than a slice
+	// of nils) when no column is an enum, so the hasEnum scans below disarm on
+	// a nil check instead of walking every column per scan.
+	o.enumTypes, _ = resolveEnumColumns(ctx.Catalog, o.cols)
 	// M0119-0004-ACLHEAP: arm the pg_type.typacl heap-decode override only when
 	// scanning the heap-backed pg_type catalog. Resolved once here (column
 	// positions are stable) so Next() does a single bool/index check per row.
@@ -1598,9 +1597,10 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// taken on every tuple scanned regardless of whether it survives — which
 	// is also what PostgreSQL does.)
 	if o.prefilterSet {
-		// NB: o.enumTypes is allocated for EVERY scan (one slot per column,
-		// nil where the column is not an enum), so testing the slice for nil
-		// disarms unconditionally. Only an actual enum column matters.
+		// NB: o.enumTypes is nil unless the scan HAS an enum column
+		// (resolveEnumColumns returns nil rather than a slice of nils), so
+		// this range is zero iterations on every TPC-H and TPC-DS table.
+		// It was previously allocated one-slot-per-column for every scan.
 		hasEnum := false
 		for _, et := range o.enumTypes {
 			if et != nil {
