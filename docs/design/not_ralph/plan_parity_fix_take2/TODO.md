@@ -115,9 +115,11 @@ failure/hang in background wastes the session — goal instruction).
   says so). Cause, not symptom, is R3. **Error class: believing a
   comment about what the code does instead of checking — same class as
   the root-causes rev-1 error, see K4.**
-  (b) **worker count is not computed** — goopg always plans 4, PG
-  derives it from relation size (`compute_parallel_worker`, log-scale):
-  3 on DS Q96/Q38, 2 on TPC-H Q19;
+  (b) ~~worker count is not computed~~ **WRONG — corrected by R4 §0.**
+  goopg DOES implement `compute_parallel_worker`
+  (`considerparallel.go:588`). See K14 for the real cause. (Third
+  falsified claim of mine in this workstream, all one shape:
+  concluding about behaviour from reading instead of measuring.);
   (c) **no parallel-aware hash join** — PG emits `Parallel Hash Join`
   /`Parallel Hash`, goopg plain `Hash Join` under a Gather;
   (d) **Sort/Group keys render as output aliases**, PG renders source
@@ -144,6 +146,24 @@ failure/hang in background wastes the session — goal instruction).
   verdict a real row count would not. Needs a real row count
   (`TableStats.RowCount` is not restored at startup — ledger pq-P6),
   not a cost tweak.
+- **K14 (measured 2026-09-08 — a parity floor OUTSIDE the planner).**
+  goopg's heap stores the same rows in a different number of pages than
+  PG. TPC-DS `store_sales`: identical `reltuples` (1,439,608) but
+  `relpages` **29,761 (goopg) vs 25,928 (PG)** — and PG's
+  `compute_parallel_worker` bands are [9216,27648) for 3 workers and
+  [27648,82944) for 4, so BOTH engines computed the worker count
+  correctly from the page count each was given. Systematic and
+  bidirectional, sorted by column type: `inventory` (all `integer`)
+  matches to **0.2%**, numeric-bearing tables run 1.05-1.15x LARGER in
+  goopg, and the two `character(N)` tables run 0.57-0.71x SMALLER.
+  Hypotheses (consistent, unconfirmed): goopg's `numeric` is bigger
+  than PG's and its `character(N)` is not blank-padded.
+  **`relpages` is a planner INPUT** — every page-priced term, the
+  Mackert-Lohman estimate, and the parallel-worker thresholds — so a
+  15% page error separates otherwise-identical plans and **no planner
+  change can close it**. Part of this goal is therefore not planner
+  work; it is on-disk representation, and as such a PG-compat defect in
+  its own right. Detail: `r4-heap-density/FINDINGS.md`.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -250,10 +270,15 @@ failure/hang in background wastes the session — goal instruction).
   requirement never reaches the planner. Oracle:
   `create_grouping_paths` pathkey handling +
   `get_cheapest_fractional_path_for_pathkeys`.
-- [ ] **R5 — compute the worker count** (K11b). PG's
-  `compute_parallel_worker` (allpaths.c) derives workers from relation
-  size on a log scale; goopg always plans 4. Cheap, well-defined, and
-  it moves plans that are otherwise already identical.
+- [x] **R4 — heap density** (was "compute the worker count"; premise
+  K11b falsified) — DONE 2026-09-08, findings only, no code change.
+  `r4-heap-density/FINDINGS.md`. goopg's worker rule is correct; it is
+  fed a page count 14.8% larger than PG's for identical rows. See K14.
+- [ ] **R5 — confirm the per-type storage sizes** (K14 follow-up).
+  Measure single-column tables (`integer`, `numeric(7,2)`,
+  `character(10)`, `varchar`) against PG and locate the divergence in
+  goopg's tuple encoder. Converts K14's hypotheses into facts, cheaply.
+  NOTE: this is an on-disk-format question, not a planner one.
 - [ ] **R6 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
@@ -274,6 +299,13 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R4 done (findings only): K11b falsified — goopg DOES
+  implement compute_parallel_worker. Real cause is HEAP DENSITY (K14):
+  identical reltuples, relpages 29,761 vs 25,928 on store_sales, which
+  straddles PG's 3/4-worker band boundary. Systematic by column type;
+  all-integer table matches to 0.2%. `relpages` is a planner input, so
+  **part of this goal is not planner work** — surfaced early on
+  purpose. Third falsified claim of mine, all the same shape.
 - 2026-09-08 R3 done: PG's hashagg spill arm landed; TPC-DS
   GroupAggregate 1 -> 13 (PG 100), TPC-H unmoved, parity flat both
   corpora, values green both. Prediction only partly held (called the
