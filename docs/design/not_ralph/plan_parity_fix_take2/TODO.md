@@ -831,6 +831,13 @@ anything attempted so far.
   `numQualOps = 0`.
 - [ ] **R22 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
+  **STATUS 2026-09-09: design committed (`r22-plain-index-arm/`),
+  implementation + unit pins DONE in working tree (UNCOMMITTED —
+  `pathindexordered.go` + `pathindexplain_test.go`), gates pending
+  (suites green; TPC-H A/B zero bytes; probe PROVED 145 offers, all
+  pruned as dominated). Interrupted by the R25 redirect; resume with
+  values gates (digest + sweep) + REPORT before any other code lands
+  on top.
 - [x] **R23 — persist correlation** (§7.4) — **STALE 2026-09-09, no
   code change (K27).** Live-verified on a private SF0.5 clone:
   `ANALYZE store_sales` writes slot 3, stop+restart restores
@@ -847,6 +854,16 @@ anything attempted so far.
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
   the flip A/B (values + parallel-mode Gather capture + timing). The
   diversion may become closable.
+- [~] **R25 — decompose the NLI node** (owner direction 2026-09-09).
+  Design `r25-nli-decompose/DESIGN.md` (this round's first deliverable):
+  replace `NestedLoopIndexJoin` (74 referencing files, PG has no such
+  node) with `Join{Algo:NestedLoop}` + parameterized IndexScan, unifying
+  tuple passing on OuterColumnRef + repointed slot (the lateral
+  dialect, PG's nestloop params). Slices: planner construction →
+  executor driver (keeps emit-once semantics, Memoize, deform bounds,
+  TID walks) → EXPLAIN Index Cond → deletion + cost/whitelist
+  migration (terminatesPartial entry goes; partial-NL execution stays
+  deferred — E-20 Cut 4's missing worker story, not removed by this).
 
 ## Log
 
