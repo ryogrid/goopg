@@ -111,9 +111,23 @@ sorted by `l_orderkey`, and satisfied it with a **full index scan of all
 sequential scan feeding a nested-loop index probe. goopg touches roughly
 **1000× more rows** for the same answer.
 
-**(b) The parallel scan does not divide the work.** Every one of the five
-participants reports `rows=6001255 loops=1` — **each worker reads the entire
-table**, so the 6 M-row scan is performed 5 times, ~30 M row-reads total.
+**(b) The merge join's inner is re-read per worker.** Every one of the five
+participants reports `rows=6001255 loops=1` — each worker reads the entire
+inner, so the 6 M-row scan is performed 5 times, ~30 M row-reads total. That
+cost is real: ~94% of this query's runtime is inside that node.
+
+> **CORRECTION (2026-09-08).** An earlier revision titled this "the parallel
+> scan does not divide the work" and called it a bug. **The measurement is
+> right; the label was wrong.** PG does the same thing — a partial join pairs a
+> partial outer with a *complete* inner
+> (`postgres/src/backend/optimizer/path/joinpath.c:1437-1443`,
+> `get_cheapest_parallel_safe_total_inner`), and goopg implements exactly that
+> with the citation at `internal/optimizer/joinpathsparallel.go:250-254`.
+> goopg's work division is correct: the `orders` outer partitions to exactly
+> 1,500,000 rows across the five participants. The right explanation is the E-18
+> one given two paragraphs below — *a parallel merge join re-reads its inner per
+> worker* — and the real defect is the **plan choice** that put a 6 M-row inner
+> there at all. See `docs/design/not_ralph/fix-pworker-bug/DESIGN.md`.
 
 Defect (b) is the merge-join manifestation of the parallel-execution gap the
 previous workstream identified as E-18: goopg has no cooperative build to share
@@ -166,9 +180,17 @@ from ~7.3× to 3.8×. But the remaining gap is not more of the same:
    method selection, and access-path choice. The previous workstream measured
    plan parity against PG at 6/14 matching shapes, which is consistent with
    what is measured here.
-2. **Parallel work division** is a concrete, isolated bug with a witness:
+2. ~~**Parallel work division** is a concrete, isolated bug with a witness:
    every worker scanning the full table in Q12. This is bounded and testable,
-   unlike the general plan-quality problem.
+   unlike the general plan-quality problem.~~
+   **RETRACTED 2026-09-08.** There is no work-division bug — see the correction
+   in §2(b). goopg's division is PG-faithful and exact. What made this look like
+   a bug was a separate, real EXPLAIN defect: collapsed nodes printed
+   **pre-filter** row counts, so the index scan showed all 6,001,255 lineitem
+   rows beside `Rows Removed by Filter: 5,143,567`. That is fixed
+   (`docs/design/not_ralph/fix-pworker-bug/`), with **no runtime change** — it
+   was only ever a reporting bug. Q12's real gap belongs to item 1,
+   plan quality.
 3. **The ~2× executor floor requires design change, not optimisation** —
    a narrower `Datum`, a row-ownership contract, or columnar batches. That is
    recorded in `REPORT-EXHAUSTION.md` §3 as out of scope for incremental work,
