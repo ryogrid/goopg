@@ -310,6 +310,25 @@ failure/hang in background wastes the session — goal instruction).
   test-only; production seed is `newPrebuiltPath`). Every design must
   cite call sites, not files.
 
+## READ FIRST: what "all plans match" requires
+
+`ROADMAP-to-all-match.md` (2026-09-09). **It is a CONJUNCTION, not a
+sequence.** No query has a single divergence — every non-matching query
+differs from PG in 4-7 categories at once, and **zero** queries are
+blocked by join-order alone. So **no single fix flips any query to
+MATCH**, and the match count will stay near zero until nearly all
+category work is done. Judge a round by its CATEGORY, not the match
+count.
+
+Queries blocked, by category (TPC-DS of 99 / TPC-H of 22):
+join-order **95/17**, parallelism 89/16, aggregation-strategy 81/10,
+sort-strategy 79/13, join-method 72/12, scan-type 72/14,
+parameterisation 42/6, rendering 35/7, qual-placement 13/6.
+
+**join-order is the dominant blocker and is UNTOUCHED** — it is the
+join search reproducing PG's `join_search_one_level`, larger than
+anything attempted so far.
+
 ## Rounds
 
 - [x] **R0 — baseline (captured 2026-09-08).** Evidence:
@@ -756,6 +775,13 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-09 Roadmap note added (`ROADMAP-to-all-match.md`): measured
+  that reaching ALL-match is a conjunction of 6 category programs plus
+  2 storage items. join-order blocks 95/99 TPC-DS and 17/22 TPC-H and
+  is untouched. Explains why R1/R3/R6/slice-2b were each correct and
+  each moved the match count by zero — that is arithmetic, not failure.
+  TPC-DS under the flip+splice: no crashes, parity unchanged.
+  Values gate green for the committed default state (PASS=95 all-zero).
 - 2026-09-09 **Slice 2b DONE (attempt 4, splice) — K23 CLOSED.** The
   flip no longer costs the Partial/Finalize split: aggregation-strategy
   14 -> 10, 22/22 plans build, Q9's aggregate matches PG exactly.
