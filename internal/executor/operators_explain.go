@@ -1606,7 +1606,42 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		est, startup, total, width := explainCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
-	if s, ok := stats[n]; ok && s != nil {
+	// A collapsed Filter is rendered as part of THIS line, so the line's
+	// actuals must come from the Filter, not from the child underneath it.
+	// `rowSrc` above already does this for the ESTIMATE; doing it for only
+	// one of the two produced a line that mixed two operators' numbers:
+	// `rows` counted what the child returned (PRE-filter) while
+	// `Rows Removed by Filter` counted what the filter rejected. A
+	// HashAggregate with HAVING printed `rows=7` / `Rows Removed: 6` where
+	// the true answer was 1, and an Index Scan printed all 6,001,255
+	// lineitem rows beside `Rows Removed: 5,143,567`.
+	//
+	// PG has no such split: `rows` is `instrument->ntuples / nloops`
+	// (explain.c:1835) counting only RETURNED tuples (execProcnode.c:487),
+	// and `nfiltered1` lives on the same node (execScan.h:245).
+	//
+	// seqScanOp was the one correct case, and only by accident — E-17 cut 2
+	// absorbed its qual into the operator, so no Filter wraps it and its own
+	// rowsOut is already post-filter. Every other collapsible parent
+	// (Aggregate, Sort, Materialize, SubqueryScan, bitmap and index-only
+	// scans) was wrong. Joins are unaffected: a cross-table qual becomes a
+	// Join Filter counted on the join node itself.
+	// PREFER the Filter's stats, but FALL BACK to the child's when the Filter
+	// has none. The fallback is load-bearing, not defensive: E-17 cut 2
+	// absorbed the seq-scan qual into `seqScanOp` and deleted the `filterOp`
+	// while KEEPING the `*optimizer.Filter` plan node (the renderer keys on
+	// the plan node). So for a seq scan `attachedFilterNode` is non-nil but
+	// has no stats entry, and the scan's own rowsOut is already post-filter
+	// and correct. Substituting unconditionally silently dropped the whole
+	// `(actual ...)` suffix and the `Rows Removed by Filter` line for every
+	// seq scan — caught by TestExplainAnalyzeRowsRemovedByFilter.
+	statSrc := n
+	if attachedFilterNode != nil {
+		if fs, ok := stats[attachedFilterNode]; ok && fs != nil {
+			statSrc = attachedFilterNode
+		}
+	}
+	if s, ok := stats[statSrc]; ok && s != nil {
 		if s.timing {
 			// PG formats rows as float (e.g. "rows=5.00") for ANALYZE output.
 			label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.2f loops=%d)",
@@ -1648,6 +1683,14 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		// population — summing them AND stats[n] would count the leader
 		// twice. PG folds every site's nfiltered1 into one total the same
 		// way (instrument.c:187) before dividing by nloops.
+		// NOTE: this accumulator reads the CHILD's own counter (`n`), NOT
+		// statSrc. The walker has ALREADY added the collapsed Filter's
+		// rejects into `filterRowsRemoved` on the way down
+		// (walkPlanAnalyzeFiltered, `fr += fs.filterRejected`). Reading the
+		// Filter here as well double-counts: a HAVING that rejected 2 groups
+		// printed "Rows Removed by Filter: 4". Only the child's own counter
+		// belongs here — that is seqScanOp, which owns its counter because
+		// E-17 cut 2 absorbed its qual.
 		if ws, ok := workerStats[n]; ok && len(ws) > 0 {
 			for _, w := range ws {
 				filterRowsRemoved += w.FilterRejected
@@ -1656,7 +1699,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			filterRowsRemoved += s.filterRejected
 		}
 		if filterRowsRemoved > 0 {
-			if s, ok := stats[n]; ok && s != nil && s.loops > 0 {
+			// Same source as the actuals above: dividing the filter's
+			// reject count by the CHILD's loops mixed two operators again.
+			if s, ok := stats[statSrc]; ok && s != nil && s.loops > 0 {
 				avg := float64(filterRowsRemoved) / float64(s.loops)
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Rows Removed by Filter: %.0f", avg))})
 			}
@@ -1700,8 +1745,12 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// format only (no JSON twin, per design). Unreachable when the carrier
 	// is empty — a nil/empty map, or a node with no entries, renders
 	// nothing, so serial plans and unexecuted nodes stay byte-identical.
+	// Nodes below a Gather have NO stats[n] entry at all — they exist only
+	// in workerStats — so a main-line-only fix would leave the plan that
+	// motivated this change (TPC-H Q12) printing byte-identical pre-filter
+	// numbers. The same Filter substitution is therefore required here.
 	if len(workerStats) > 0 {
-		if ws, ok := workerStats[n]; ok && len(ws) > 0 {
+		if ws, ok := workerStats[statSrc]; ok && len(ws) > 0 {
 			ordered := make([]workerNodeStat, len(ws))
 			copy(ordered, ws)
 			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
