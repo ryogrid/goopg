@@ -55,6 +55,39 @@ That single gap is what makes the DP's reachable join orders a strict
 subset of PG's, on every query whose joins are star-shaped around one
 fact table — which is most of TPC-H and essentially all of TPC-DS.
 
+## 3a. CORRECTION — it was deliberate, and it has a known first obstacle
+
+§3 implied the transitive half was simply absent. **It was considered,
+measured, and deferred**, and the seam says so six lines below the
+comment quoted above:
+
+> *"CONSTANTS ONLY, deliberately. Propagating `a = 42` across a class
+> only adds restrictions and re-opens no join order. Adding the
+> transitive `a = c` would hand the search new JOIN clauses and reshape
+> plans broadly — **measured: it broke the pinned-semi-join layout
+> `TestPreDPPinnedSemiKeysResolveAfterDP` asserts**, on a query
+> containing no constants at all. That half stays on its legacy caller
+> pending its own evaluation."*
+
+Three things follow, all of which make the round easier rather than
+harder:
+
+1. **The mechanism already exists** on a legacy caller — this is an
+   evaluation and a re-wiring, not a port from scratch.
+2. **The round's first obstacle is named in advance**:
+   `TestPreDPPinnedSemiKeysResolveAfterDP`. Exactly as slice 2b's
+   assertion was, and that one took four attempts precisely because it
+   was met blind.
+3. **"Pending its own evaluation" is the round this workstream is for.**
+   The deferral's stated reason is that it "reshapes plans broadly" —
+   under the previous policy that was a risk; under this goal's rule a
+   plan that matches PG is not a regression however it reshapes.
+
+Reading the deferral before writing the design is what turns a
+"missing feature" into a scoped task with its blocker known. Both of my
+previous roads into unfamiliar code (K11a's stale comment, slice 2b's
+assertion) went wrong by not doing this first.
+
 ## 4. Why this is the right next round
 
 - It is the **dominant** category (95/99, 17/22) and untouched.
@@ -69,9 +102,16 @@ fact table — which is most of TPC-H and essentially all of TPC-DS.
 
 ## 5. What the round must do
 
-Port `generate_join_implied_equalities` (`equivclass.c`): for each
-equivalence class, emit the join clauses between members on different
-relations, and give them to the DP so those pairs stop declining.
+Re-wire the EXISTING transitive-equality half (§3a) from its legacy
+caller into the seam, so the DP receives the derived join clauses —
+PG's `generate_join_implied_equalities` (`equivclass.c`) shape: for
+each equivalence class, the join clauses between members on different
+relations.
+
+**Start by re-running `TestPreDPPinnedSemiKeysResolveAfterDP`** and
+understanding what it asserts, before touching anything. It is the
+named, measured obstacle, and slice 2b is the cautionary tale for
+meeting one blind.
 
 **Verify first, per this workstream's repeated lesson**: instrument that
 the synthesised clause reaches the DP and that `{part}|{partsupp}` is

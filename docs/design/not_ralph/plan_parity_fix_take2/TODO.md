@@ -334,7 +334,15 @@ CLASS: both are equated to `l_partkey`, so
 `generate_join_implied_equalities` (equivclass.c) synthesises
 `p_partkey = ps_partkey`. goopg HAS equivalence classes
 (`equiv_class.go`) but the seam gives the search only "the equivalence
-class's CONSTANTS", never derived JOIN CLAUSES. That single gap makes
+class's CONSTANTS", never derived JOIN CLAUSES — **deliberately, and
+measured**: the seam records that adding the transitive `a = c` "would
+hand the search new JOIN clauses and reshape plans broadly — measured:
+it broke the pinned-semi-join layout
+`TestPreDPPinnedSemiKeysResolveAfterDP` asserts ... That half stays on
+its legacy caller pending its own evaluation." So the mechanism EXISTS
+(re-wiring, not a port), the round's first obstacle is NAMED in
+advance, and the deferral's reason — "reshapes plans broadly" — is
+precisely what THIS goal's rule permits. That single gap makes
 goopg's reachable join orders a strict subset of PG's on any
 star-shaped query — most of TPC-H, essentially all of TPC-DS. It is
 CANDIDATE GENERATION, so no cost work can reach it.
