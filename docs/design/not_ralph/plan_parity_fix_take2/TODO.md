@@ -573,7 +573,19 @@ failure/hang in background wastes the session — goal instruction).
   (`planner.c:7351`) and gathers after (`:7704`); deleting the guard
   would give a double-Gather, not PG's plan.
   **K23 and K12(B) ARE THE SAME ROOT CAUSE** — see K24.
-- [ ] **R21 — the upper-planner seam** (K24, was two separate rounds).
+- [~] **R21 — the upper-planner seam** (K24). Design `3b0322c11`.
+  **SLICE 1 LANDED 2026-09-08** (`r21-upper-planner-seam/REPORT-slice1.md`):
+  `joinlistRel` gains `rel *RelOptInfo`, set from the chosen path's
+  `p.Rel`; `planJoinlistSearch` returns it; `tryPGShapedJoinSearch`
+  discards it with an explicit `_` marking slices 2/3. Gate —
+  **byte-identical plans on BOTH corpora** — passes; suites green.
+  Nothing consumes it yet.
+  - [ ] **Slice 2 (K23)**: partial aggregation from `PartialPathlist`,
+    built BELOW the Gather (`create_partial_grouping_paths`,
+    planner.c:7351). Success test: `aggregation-strategy` 10 -> 14
+    under the flip disappears.
+  - [ ] **Slice 3 (K12 B)**: pathkeys for the ordering contest.
+  ORIGINAL SCOPE:
   Give the grouping and window stages the join rel's PATHS
   (`PartialPathlist`, `Pathkeys`) instead of a finished `Node`.
   Unblocks K23 and K12(B) together. Oracle:
@@ -653,6 +665,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R21 slice 1 LANDED: the search's RelOptInfo now leaves
+  `planJoinlistSearch` instead of dying there. Purely additive — gate is
+  byte-identical plans on both corpora, and it passes. First shipped
+  code toward K24. (The initial TPC-DS diff was K18's temp-path
+  artefact against a pre-R9 baseline, not plan movement.)
 - 2026-09-08 R20 done: K23's cause is one guard —
   `subtreeHasGather(child)` in `addPartialAggSplitPath` — and it is
   deliberate, not an oversight; relaxing it gives a double-Gather, not

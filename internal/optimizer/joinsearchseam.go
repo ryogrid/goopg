@@ -529,7 +529,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		applyRelSizeFallback(&relInfos[i], b, scans[i], local, cat)
 	}
 
-	searched, err := planJoinlistSearch(jl, &joinlistProblem{
+	// R21 slice 1 (plan-parity-fix-take2, K24): the search's own RelOptInfo
+	// now comes back instead of being discarded. Slice 1 CARRIES it only —
+	// `_` here is deliberate and temporary, and its replacement is what lets
+	// partial aggregation see `PartialPathlist` (K23) and the grouping/window
+	// stages see `Pathkeys` (K12 slice B).
+	searched, _, err := planJoinlistSearch(jl, &joinlistProblem{
 		bindings:   ctx.bindings[:nprefix],
 		scans:      leaves,
 		relInfos:   relInfos,

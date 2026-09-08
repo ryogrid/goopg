@@ -171,6 +171,20 @@ type joinlistRel struct {
 	// `table`, which is what makes every base-relation-only producer
 	// (`addParameterizedIndexPaths`, the sizer's uniqueness proofs) decline it.
 	info baseRelInfo
+	// rel is the `RelOptInfo` the search built for this item, carried out
+	// rather than discarded (R21 slice 1, plan-parity-fix-take2, K24).
+	//
+	// It is the object the UPPER stages need and cannot currently see:
+	// `PartialPathlist` (so partial aggregation can be built BELOW a Gather,
+	// as `create_partial_grouping_paths` does from
+	// `input_rel->partial_pathlist`, planner.c:7351 — K23) and `Pathkeys` (so
+	// a path delivering a required ordering is credited for it and a sorted
+	// aggregate can win the contest PG's wins — K12 slice B).
+	//
+	// Slice 1 only CARRIES it. Nothing consumes it yet, so no plan can move;
+	// that is the slice's gate. nil for a leaf item, which has no searched
+	// rel of its own.
+	rel *RelOptInfo
 	// lo, hi is the half-open range of FROM items this rel covers. Contiguity
 	// is an invariant, checked where it is established.
 	lo, hi int
@@ -182,13 +196,19 @@ type joinlistRel struct {
 // `jl` must cover every FROM item exactly once and in order, which is what
 // `deconstructJointree` produces by construction; a joinlist that does not is a
 // producer bug and is reported rather than planned around.
-func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, error) {
+// R21 slice 1 (plan-parity-fix-take2, K24): returns the search's own
+// `*RelOptInfo` alongside the node. It used to be discarded here, which is
+// why every upper stage works on finished Nodes and neither partial
+// aggregation (K23) nor the ordering contest (K12 slice B) can see the
+// paths PG's upper planner consumes. Nil when the search declined or
+// short-circuited to a raw leaf.
+func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, *RelOptInfo, error) {
 	if err := validateJoinlistProblem(jl, prob); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	r, err := makeRelFromJoinlist(jl, prob, prob.tupleFraction)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// M0134-0188: a ONE-leaf problem short-circuits inside makeRelFromJoinlist
 	// ("single joinlist node, so we're done") and comes back as the RAW leaf —
@@ -213,10 +233,10 @@ func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, error) {
 	if _, _, rebuildable := scanLeafFor(r.node); rebuildable && r.info.table != nil && jl.nrels() == 1 {
 		r, err = prob.searchOneProblem([]joinlistRel{r}, prob.tupleFraction)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	return r.node, nil
+	return r.node, r.rel, nil
 }
 
 // validateJoinlistProblem checks the caller's inputs against each other. Every
@@ -777,5 +797,8 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1},
 		lo:      lo,
 		hi:      hi,
+		// R21 slice 1: the chosen path's parent rel — the search's own
+		// RelOptInfo, which used to end here.
+		rel: p.Rel,
 	}, nil
 }

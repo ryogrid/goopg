@@ -202,7 +202,7 @@ func TestPlanJoinlistSearchFlatProblemIsOneSearch(t *testing.T) {
 	prob := rfjProblem(names, []int64{1_000_000, 10, 1000},
 		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
 
-	n, err := planJoinlistSearch(deconstructRangeVars(len(names)), prob)
+	n, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestPlanJoinlistSearchPublishesBindingOrderWhateverTheSearchChose(t *testin
 	prob := rfjProblem(names, []int64{1_000_000, 500_000, 10},
 		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
 
-	n, err := planJoinlistSearch(deconstructRangeVars(len(names)), prob)
+	n, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestPlanJoinlistSearchPinnedSubproblemIsItsOwnSearch(t *testing.T) {
 	// whose own list is upstream's `list_make2(l, r)`.
 	jl := joinlist{leafItem(0), subItem(joinlist{leafItem(1), leafItem(2)})}
 
-	n, err := planJoinlistSearch(jl, prob)
+	n, _, err := planJoinlistSearch(jl, prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestPlanJoinlistSearchPinnedSubproblemIsItsOwnSearch(t *testing.T) {
 	// flat, must not choose b×c — it has no clause and both alternatives do.
 	free := rfjProblem(names, []int64{1_000_000, 10, 20},
 		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 0, 2)})
-	freeTree, err := planJoinlistSearch(deconstructRangeVars(len(names)), free)
+	freeTree, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), free)
 	if err != nil {
 		t.Fatalf("control: planJoinlistSearch: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestPlanJoinlistSearchSingleItemIsThePreSearchLeaf(t *testing.T) {
 	names := []string{"a"}
 	prob := rfjProblem(names, []int64{100}, nil)
 
-	n, err := planJoinlistSearch(joinlist{leafItem(0)}, prob)
+	n, _, err := planJoinlistSearch(joinlist{leafItem(0)}, prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}
@@ -332,12 +332,12 @@ func TestPlanJoinlistSearchNestedPinUnwraps(t *testing.T) {
 		return rfjProblem(names, []int64{1000, 10}, []Expr{rfjEq(names, 0, 1)})
 	}
 
-	nested, err := planJoinlistSearch(
+	nested, _, err := planJoinlistSearch(
 		joinlist{subItem(joinlist{subItem(joinlist{leafItem(0)}), subItem(joinlist{leafItem(1)})})}, mk())
 	if err != nil {
 		t.Fatalf("nested: %v", err)
 	}
-	flat, err := planJoinlistSearch(joinlist{leafItem(0), leafItem(1)}, mk())
+	flat, _, err := planJoinlistSearch(joinlist{leafItem(0), leafItem(1)}, mk())
 	if err != nil {
 		t.Fatalf("flat: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestPlanJoinlistSearchRejectsMalformedInput(t *testing.T) {
 				prob = rfjProblem(names, []int64{100, 100}, nil)
 				tc.mut(prob)
 			}
-			if _, err := planJoinlistSearch(tc.jl, prob); err == nil {
+			if _, _, err := planJoinlistSearch(tc.jl, prob); err == nil {
 				t.Fatal("planJoinlistSearch accepted a malformed problem")
 			}
 		})
@@ -427,7 +427,7 @@ func TestDeconstructedJointreeFeedsTheRecursion(t *testing.T) {
 	jl := deconstructJointree(from, defaultCollapseLimits())
 	prob := rfjProblem(names, []int64{1_000_000, 10, 1000},
 		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
-	n, err := planJoinlistSearch(jl, prob)
+	n, _, err := planJoinlistSearch(jl, prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}

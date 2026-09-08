@@ -224,7 +224,7 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 	names := []string{"a", "b"}
 	prob := rfjProblem(names, []int64{1000, 10}, nil)
 	jl := joinlist{pinnedItem(parser.JoinFull, joinlist{leafItem(0)}, joinlist{leafItem(1)})}
-	_, err := planJoinlistSearch(jl, prob)
+	_, _, err := planJoinlistSearch(jl, prob)
 	if err == nil {
 		t.Fatal("the search planned a pinned FULL join — it can only have built an INNER join, " +
 			"which drops the unmatched rows the statement asked for")
@@ -243,7 +243,7 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinRight} {
 		prob := rfjProblem(names, []int64{1000, 10}, nil)
 		jl := joinlist{pinnedItem(jt, joinlist{leafItem(0)}, joinlist{leafItem(1)})}
-		_, err := planJoinlistSearch(jl, prob)
+		_, _, err := planJoinlistSearch(jl, prob)
 		if err == nil {
 			t.Fatalf("the search planned a pinned %s join with NO SpecialJoinInfo in the list — "+
 				"it can only have built an INNER join", joinTypeName(jt))
@@ -262,7 +262,7 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 		jl[0].sjinfo = sj
 		prob.joinInfoList = []*SpecialJoinInfo{sj}
 		prob.conjuncts = []Expr{rfjEq(names, 0, 1)}
-		rel, err := planJoinlistSearch(jl, prob)
+		rel, _, err := planJoinlistSearch(jl, prob)
 		if err != nil {
 			t.Fatalf("pinned %s join WITH its SpecialJoinInfo: %v", joinTypeName(jt), err)
 		}

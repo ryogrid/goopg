@@ -415,13 +415,13 @@ func TestPartialPathIsNeverTheFinalPath(t *testing.T) {
 		}
 
 		// The whole production seam, both arms: identical trees.
-		on, err := planJoinlistSearch(deconstructRangeVars(len(names)), cpBigProblem(names))
+		on, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), cpBigProblem(names))
 		if err != nil {
 			t.Fatal(err)
 		}
 		offProb := cpBigProblem(names)
 		offProb.cp.maxParallelWorkersPerGather = 0
-		off, err := planJoinlistSearch(deconstructRangeVars(len(names)), offProb)
+		off, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), offProb)
 		if err != nil {
 			t.Fatal(err)
 		}
