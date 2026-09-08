@@ -1,0 +1,4 @@
+BenchmarkSIMDUnrolled-16    	  630878	      3919 ns/op	2090.25 MB/s
+BenchmarkSIMDHoisted-16     	13140900	       194.5 ns/op	42116.36 MB/s
+BenchmarkScalarFair-16      	 1466401	      1733 ns/op	4726.30 MB/s
+BenchmarkSIMDFast-16        	  112220	     19205 ns/op	 426.55 MB/s
