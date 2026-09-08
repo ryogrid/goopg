@@ -1,4 +1,4 @@
-# plan-parity: /tmp/parity-r0/tpch-goopg.sections.txt -> bench/tpch/plans-pg/
+# plan-parity: /tmp/parity-r0/tpch-goopg.sections.txt -> /tmp/parity-r0/tpch-pg.sections.txt
 Q1 MISSING-NODE [join-order,aggregation-strategy,parallelism] estimates(goopg cost=120025.47..120025.48 rows=6 width=248 | pg cost=411160.79..411160.80 rows=6 width=236)
     note: unknown node kinds: unknown node kind: 'Finalize HashAggregate'; unknown node kind: 'Partial HashAggregate'
 Q10 SHAPE-DIFF [join-order,parallelism,rendering] estimates(goopg cost=582598.09..583497.91 rows=359929 width=684 | pg cost=272218.71..272355.52 rows=54723 width=205)
@@ -12,8 +12,8 @@ Q13 MATCH [rendering] estimates(goopg cost=100654.19..100654.69 rows=200 width=1
 Q14 MISSING-NODE [join-order,scan-type,aggregation-strategy,parallelism] estimates(goopg cost=331657.78..331657.79 rows=1 width=64 | pg cost=229465.19..229465.20 rows=1 width=32)
     note: normalisation: strip-pg-Hash
     note: unknown node kinds: unknown node kind: 'Finalize Aggregate'; unknown node kind: 'Partial Aggregate'
-Q15a-VIEWBODY MISSING-NODE [join-order,aggregation-strategy,parallelism] estimates(goopg cost=68572.76..68574.76 rows=200 width=64 | pg cost=266565.93..266690.97 rows=10003 width=37)
-    note: unknown node kinds: unknown node kind: 'Finalize HashAggregate'; unknown node kind: 'Partial HashAggregate'
+Q15a-VIEWBODY MISSING-NODE [join-order,scan-type,sort-strategy,parallelism] estimates(goopg cost=68572.76..68574.76 rows=200 width=64 | pg cost=165444.45..170655.19 rows=9993 width=37)
+    note: unknown node kinds: unknown node kind: 'Finalize GroupAggregate'; unknown node kind: 'Finalize HashAggregate'; unknown node kind: 'Partial HashAggregate'
 Q16 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=33447.57..33487.27 rows=15877 width=152 | pg cost=44235.62..44276.12 rows=16200 width=45)
     note: normalisation: canonicalise-bare-semi-anti,drop-true-filter,strip-pg-Hash
 Q17 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,qual-placement] estimates(goopg cost=30223.33..30223.34 rows=1 width=32 | pg cost=213572.16..213572.18 rows=1 width=32)
@@ -49,5 +49,5 @@ Q9 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,paralleli
     note: normalisation: strip-pg-Hash
     note: unknown node kinds: unknown node kind: 'Finalize HashAggregate'; unknown node kind: 'Partial HashAggregate'
 PLAN-PARITY: queries=22 match=1 shapediff=12 missingnode=9 error=0 timeout=0
-CATEGORIES: join-order=19 join-method=12 scan-type=13 parameterisation=6 aggregation-strategy=16 sort-strategy=8 parallelism=14 qual-placement=4 rendering=8
+CATEGORIES: join-order=19 join-method=12 scan-type=14 parameterisation=6 aggregation-strategy=15 sort-strategy=9 parallelism=14 qual-placement=4 rendering=8
 NORMALISATION: N1 estimates-to-side-column, N2 strip-PG-Hash, N3 drop-true-filter, N4 alias/suffix-canonicalisation, N5 cast/operator-rendering, N6 qual/key-signatures, N7 right-join-canonicalisation

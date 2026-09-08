@@ -69,12 +69,15 @@ failure/hang in background wastes the session — goal instruction).
     `Q15ViewBody()`), TPC-DS from `query1..99.sql`. PG references live on
     :65432 (tpch) / :65438 (ryo@tpcds05). All foreground, per-query
     `timeout 120`, failures recorded inline, none fatal.
-  - **TPC-H: MATCH=1 (Q13 only), SHAPE-DIFF=12, MISSING-NODE=8 over 21**
-    (`pg-plan-parity-diff.py` vs `bench/tpch/plans-pg/`). Caveat: 8
-    MISSING-NODE verdicts are partly tool blindness — the comparator
-    does not know `Finalize/Partial HashAggregate` ("unknown node kind"),
-    so MISSING-NODE ≠ proven real divergence; adjudicate per query in
-    later rounds. (Prior reading match=6/14 was on another branch/commit.)
+  - **TPC-H: MATCH=1 (Q13 only), SHAPE-DIFF=12, MISSING-NODE=9 over 22**
+    (`pg-plan-parity-diff.py` vs `bench/tpch/plans-pg/`; sections
+    Q1–Q14, Q15a-VIEWBODY, Q16–Q22 — the Q15 CREATE VIEW has no plan
+    shape and Q15b-MAIN has no PG fixture, so both are out of parity
+    scope on both sides). Caveat: 9 MISSING-NODE verdicts are partly
+    tool blindness — the comparator does not know `Finalize/Partial
+    HashAggregate` ("unknown node kind"), so MISSING-NODE ≠ proven real
+    divergence; adjudicate per query in later rounds. (Prior reading
+    match=6/14 was on another branch/commit.)
   - **TPC-DS: byte-same=3/99, changed=96** (`tpcds-plan-diff.py`,
     byte-for-byte so cost/rows drift counts). The 3 sames are the
     Q36/70/86 error blocks — identical parse failures on BOTH engines
