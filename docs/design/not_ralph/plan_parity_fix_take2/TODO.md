@@ -271,6 +271,17 @@ failure/hang in background wastes the session — goal instruction).
   checking — this is concluding PAST a check you already performed.
   Guard: when a report states a limitation, the headline and the ledger
   entry must be re-read against that limitation before committing.
+- **K23 (measured 2026-09-08 — the flip's real blocker).** goopg's two
+  parallelism mechanisms are NOT interchangeable at the aggregate.
+  Under `GOOPG_GATHER_PATHS=all`, `generateUsefulGatherPaths` places
+  the Gather at the JOIN level and the aggregate is built above it as
+  an ordinary one — bypassing `partialaggpaths.go`, which the POST-PASS
+  Gather placement does reach. Result: the flip **loses** the
+  `Partial`/`Finalize` split goopg already had and PG emits. Q9: PG
+  `Partial HashAggregate`; goopg flip OFF the same (a MATCH on that
+  node); goopg flip ON plain `HashAggregate`. This is the entire
+  `aggregation-strategy` 10 -> 14 move, and it is a WIRING gap, not a
+  costing error.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -525,7 +536,26 @@ failure/hang in background wastes the session — goal instruction).
   fixture still test what it means under the flip, or do its counts now
   sit on the wrong side of the one-row floor? If the latter, fix the
   FIXTURE, not the planner.
-- [ ] **R19 — explain `aggregation-strategy` 10 -> 14** (R8's probe),
+- [x] **R19 — `aggregation-strategy` 10 -> 14 EXPLAINED** — DONE
+  2026-09-08. `r19-aggregation-strategy/FINDINGS.md`. Re-measured
+  post-R9 (survives unchanged). Exactly four queries gain it — Q5, Q9,
+  Q12, Q19 — and **every one also loses a category** (Q19 goes 5 -> 4,
+  strictly better); the raw count conceals a trade rather than a pure
+  regression. **Cause: under the flip goopg LOSES the Partial/Finalize
+  split it already had.** Q9: PG `Partial HashAggregate`, goopg flip
+  OFF `Partial HashAggregate` (matches!), goopg flip ON plain
+  `HashAggregate`. `generateUsefulGatherPaths` places the Gather at the
+  JOIN level and the aggregate is built above it, bypassing
+  `partialaggpaths.go` — which the post-pass shape does reach. So it is
+  a WIRING gap, not a costing error. R10 DESIGN §7's objection is
+  DISCHARGED; recommendation is to fix R20 first so the flip is
+  strictly toward PG.
+- [ ] **R20 — partial aggregation over the flip's Gather** (K23). The
+  producer exists and is enabled; find why it does not fire under
+  `generateUsefulGatherPaths`' placement. Confirm the candidate is
+  GENERATED before theorising about cost
+  ([[planner_verify_both_candidates_generated]]). True prerequisite for
+  landing the flip. ORIGINAL R19 SCOPE: (R8's probe),
   the last unexplained objection to landing the flip per R10 DESIGN §7.
   ORIGINAL R17 SCOPE: why is the nested loop priced below the hash join under
   the flip?** Instrument `addPath` to confirm the hash candidate is
@@ -560,17 +590,17 @@ failure/hang in background wastes the session — goal instruction).
   each expected tree against PG rather than against the new output.
   Then land the flip and run R10 DESIGN §5's gates. Everything already
   known is in R10's report so it need not be re-derived.
-- [ ] **R20 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] **R21 — slice (B): let a node below satisfy the ordering** (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
   a finished Node and `windowsetoppaths.go:19` records that above the
   search seam inputs carry no pathkeys. Architectural.
-- [ ] **R21 — heap page fill on bulk load** (K14 remainder). goopg
+- [ ] **R22 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R22 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R23 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
 - [ ] **R21 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
@@ -593,6 +623,12 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R19 done: the last unexplained objection to the flip is
+  discharged. aggregation-strategy 10 -> 14 is four queries (Q5/Q9/Q12/
+  Q19), each also LOSING a category, and the cause is that the flip's
+  Gather placement bypasses the partial-aggregation producer — goopg
+  loses a Partial/Finalize split it already had and PG emits (K23).
+  Wiring gap, not costing. Fix R20 first so the flip is strictly toward PG.
 - 2026-09-08 R17 done: CORRECTS R16/K21. On real data the flip gives
   goopg PG's multi-key structure (Parallel Hash Join, both hash keys,
   same Join Filter, same worker count) — the nested loop is only at the
