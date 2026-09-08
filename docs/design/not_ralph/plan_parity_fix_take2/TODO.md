@@ -801,12 +801,19 @@ anything attempted so far.
 - [ ] **R23 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
-- [ ] **R21 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
-  now with K6's evidence: the winning scans in these plans are PREBUILT
-  leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
-  never reached them. Fixing this is the precondition for testing
-  DESIGN §5's suspect #1.
-  Give index leaves their qual charge instead of `numQualOps = 0`.
+- [x] **R21 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`) —
+  **DECLINED 2026-09-09: no witness (census-measured).**
+  `r21-index-leaf-qpqual/REPORT.md`. Implemented, unit-pinned, A/B'd,
+  reverted: instrumented census counts 1282 leaf pricings across both
+  corpora with ZERO index leaves (TPC-H 100/100 SeqScan; TPC-DS
+  1107/51/17/7 Seq/CTE/Project/SetOp), and pre/post-R21 TPC-H captures
+  are byte-identical 22/22. Prebuilt leaves are bare SeqScans;
+  rule-based index choices carry absorbed bounds, not Filter chains
+  (`rewriteScanInputsWithSingleTablePredicates` + C-02c splice-out,
+  read). Follow-up filed: absorbed-leaf `index_qual_cost` needs its
+  own design (Filter-chain counting cannot reach it by construction).
+  ORIGINAL: Give index leaves their qual charge instead of
+  `numQualOps = 0`.
 - [ ] **R22 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
 - [ ] **R23 — persist correlation** (§7.4). Connection-scoped ANALYZE
