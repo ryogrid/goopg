@@ -544,12 +544,23 @@ func TestDenseBuildAllocsPerRow(t *testing.T) {
 	densePerRow := measure(o.retainBuildRow, srcs)
 
 	t.Logf("allocs/row: legacy header-only=%.3f dense header-only=%.3f "+
-		"(predicted ~2.00 acquire → ~0); legacy full=%.3f dense full=%.3f "+
+		"(predicted ~1.00 acquire → ~0); legacy full=%.3f dense full=%.3f "+
 		"(header + 2 payload makes → chunk-amortized ~0); int-lane=1.000 both (predicted 1.00)",
 		legacyHeader, denseHeader, legacyPerRow, densePerRow)
 
-	if legacyHeader < 1.5 {
-		t.Fatalf("legacy header-only = %.3f allocs/row, want >= 1.5 (census baseline moved?)", legacyHeader)
+	// The legacy header-only baseline was ~2.00 allocs/row while acquireRow
+	// drew from a sync.Pool: one for the row itself, plus one for the
+	// runtime.convTslice boxing every Put performed because sync.Pool stores
+	// `any`. Part 3 removed that pool (it hit 0.1% of the time — see
+	// docs/design/not_ralph/optimize-row-decode/DESIGN-3.md), so the boxing
+	// allocation is gone and the baseline is legitimately ~1.00: exactly the
+	// one `make(Row, width)` the row needs.
+	//
+	// The bound is kept as a real assertion rather than deleted, because its
+	// job is unchanged: catch the day the legacy path stops allocating per
+	// row at all, which would make the dense path's comparison vacuous.
+	if legacyHeader < 0.9 {
+		t.Fatalf("legacy header-only = %.3f allocs/row, want >= 0.9 (census baseline moved?)", legacyHeader)
 	}
 	if denseHeader > 0.1 {
 		t.Fatalf("dense header-only = %.3f allocs/row, want <= 0.1 (headers not amortized?)", denseHeader)
