@@ -152,3 +152,50 @@ gate (byte-identical plans on both corpora, since nothing consumes it);
 slice 2b is the behaviour change. The same reasoning that justified
 splitting slice 1 applies with more force here, because the route
 crosses `planner.go`.
+
+
+---
+
+## 9. Slice 2b construction plan (added after the prerequisite landed)
+
+The prerequisite (`REPORT-slice2b-prereq.md`) established by measurement
+that `searchedRelOf(child)` returns a rel with a **non-empty**
+`PartialPathlist` under the flip. The construction site and shape are
+now known too, so slice 2b is fully specified:
+
+**Site**: `addPartialAggSplitPath` (`partialaggupper.go`), a new arm
+placed BEFORE the `subtreeHasGather` guard.
+
+**What the existing code already does**, and which slice 2b mirrors: it
+builds the Gather itself rather than finding one —
+
+```go
+nsGatherCost := gatherCost(cp, pseed.Cost, inputRows)
+nsGather := &Path{Kind: PathGather, Rel: grouped, Rows: inputRows,
+                  Cost: nsGatherCost, Children: []*Path{pseed}}
+```
+
+so the shape is `pseed` → partial agg → `nsGather` → finalise, with
+`addPartialAggSplitArm` assembling the partial/final pair.
+
+**The one difference**: today `pseed` is `newPrebuiltPath(partialRel,
+child)` — a path over the WHOLE child, which under the flip already
+contains a Gather, hence the refusal. Slice 2b instead seeds from
+`searchedRelOf(child).PartialPathlist[0]` (PG takes
+`cheapest_partial_path`, `planner.c:7452`), whose node is obtained via
+`createPlanNode`. That path is BELOW the Gather by construction, so the
+guard is never reached and no double-Gather can arise.
+
+**Row counts** are the correctness-critical part and must not be
+improvised: the existing arm already divides by
+`getParallelDivisor(workers, ps.ParallelLeaderParticipation)` and sizes
+partial groups through `estimateNumGroups` on the per-worker count
+(upstream's `dNumPartialPartialGroups`, `planner.c:7452`). Seeding from
+a partial path means `pseed.Rows` is ALREADY per-worker, so the divisor
+must not be applied twice — this is the specific trap, and it produces
+N+1-copy or short-count results rather than an error.
+
+**Gates**: values all-zero on both corpora are load-bearing here, not a
+formality — a mis-split parallel aggregate returns wrong rows, not an
+error. Success test unchanged: `aggregation-strategy` 10 → 14 under the
+flip disappears.

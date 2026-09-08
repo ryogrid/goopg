@@ -619,7 +619,16 @@ failure/hang in background wastes the session — goal instruction).
     hasGather=true`** — the partial path exists and is reachable, so
     K23 is blocked on nothing unknown. The refusal site carries this
     measurement in a comment.
-  - [ ] **Slice 2b (K23 behaviour)**: add an arm BEFORE the guard —
+  - [ ] **Slice 2b (K23 behaviour)** — FULLY SPECIFIED, see DESIGN §9.
+    Site: new arm in `addPartialAggSplitPath` before the guard. Seed
+    from `searchedRelOf(child).PartialPathlist[0]` (PG's
+    `cheapest_partial_path`, planner.c:7452) instead of
+    `newPrebuiltPath(partialRel, child)`; the rest of the shape
+    (`pseed` -> partial agg -> `nsGather` -> finalise) already exists.
+    **TRAP**: a partial path's `Rows` is ALREADY per-worker, so
+    `getParallelDivisor` must not be applied twice — that yields wrong
+    ROW COUNTS, not an error, which is why the values gates are
+    load-bearing for this slice. Was: add an arm BEFORE the guard —
     when `searchedRelOf(child)` has a non-empty `PartialPathlist`,
     build partial agg -> Gather -> finalise from it. Guard stays for
     the post-pass route. Was: partial aggregation from
@@ -707,6 +716,10 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-09 Slice 2b fully specified (DESIGN §9) but NOT implemented:
+  site, seed, existing shape to reuse, and the double-divisor trap all
+  recorded. Stopped short of the construction deliberately — a
+  mis-split parallel aggregate returns wrong rows rather than an error.
 - 2026-09-09 Slice 2b prerequisite landed: `searchedRelOf` accessor.
   The naive implementation returns nil (the child is a Project wrapping
   the search root) — caught by probing, which would otherwise have made
