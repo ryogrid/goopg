@@ -207,6 +207,9 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 
 		totalTablePages: totalPages,
+		// R1 (plan-parity-fix-take2): with no index quals every local
+		// conjunct is a qpqual, exactly as the seq rival counts them.
+		numQualOps: localQualOpCount(rel.baseLeaf),
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at

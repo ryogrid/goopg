@@ -48,7 +48,7 @@ func costBitmapIndexScan(cp costParams, in indexScanInputs) Cost {
 //
 // pagesFetched is from computeBitmapPages; tuplesFetched is selectivity * relTuples;
 // T is the relation's page count.
-func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetched, T float64) Cost {
+func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetched, T, numQualOps float64) Cost {
 	// PG's `cost_bitmap_heap_scan`: the index side is paid at startup,
 	// and the heap side is the run cost.
 	startup := indexCost.Total
@@ -86,8 +86,13 @@ func costBitmapHeapScan(cp costParams, indexCost Cost, pagesFetched, tuplesFetch
 	runCost := pageCost * pagesFetched
 
 	// CPU: the full restriction qual may need to be re-evaluated per tuple
-	// (PG charges for the lossy recheck case — conservative).
-	runCost += cp.cpuTupleCost * tuplesFetched
+	// (PG charges for the lossy recheck case — conservative). R1
+	// (plan-parity-fix-take2): charge PG's qpqual currency —
+	// `cpu_tuple_cost + cpu_operator_cost` per restriction conjunct
+	// (`costsize.c`, `get_restriction_qual_cost` over the full scan
+	// clauses) — the identical term `costSeqscan` charges per tuple
+	// scanned, so the bitmap rival meets the seq rival in one currency.
+	runCost += (cp.cpuTupleCost + cp.cpuOperatorCost*numQualOps) * tuplesFetched
 
 	// `cost_bitmap_heap_scan` ends (costsize.c):
 	//
@@ -326,21 +331,21 @@ func costBitmapOrCost(cp costParams, paths []*Path) (Cost, float64) {
 // indexPages is the sum of pages of all index paths under the bitmap tree
 // (PG's get_indexpath_pages); totalTablePages is the sum of pages of every
 // base relation in the query. Both feed the cache-aware page-count estimate.
-func bitmapScanCostEst(cp costParams, bitmapPath *Path, relRows, T, indexPages, totalTablePages float64, maxEntries int) Cost {
+func bitmapScanCostEst(cp costParams, bitmapPath *Path, relRows, T, indexPages, totalTablePages float64, maxEntries int, numQualOps float64) Cost {
 	treeCost, selec := costBitmapTree(cp, bitmapPath)
 	tuplesFetched := clampRowEst(selec * relRows)
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relRows, T, indexPages, totalTablePages, cp.effectiveCacheSize, maxEntries)
-	return costBitmapHeapScan(cp, Cost{Total: treeCost}, pagesFetched, tuplesFetched, T)
+	return costBitmapHeapScan(cp, Cost{Total: treeCost}, pagesFetched, tuplesFetched, T, numQualOps)
 }
 
 // bitmapAndScanCostEst estimates the total cost of AND-ing the given paths
 // and then accessing the heap. Used by chooseBitmapAnd to evaluate whether
 // adding a path to the AND group reduces total cost.
-func bitmapAndScanCostEst(cp costParams, paths []*Path, relRows, T, indexPages, totalTablePages float64, maxEntries int) Cost {
+func bitmapAndScanCostEst(cp costParams, paths []*Path, relRows, T, indexPages, totalTablePages float64, maxEntries int, numQualOps float64) Cost {
 	treeCost, selec := costBitmapAndCost(cp, paths)
 	tuplesFetched := clampRowEst(selec * relRows)
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relRows, T, indexPages, totalTablePages, cp.effectiveCacheSize, maxEntries)
-	return costBitmapHeapScan(cp, treeCost, pagesFetched, tuplesFetched, T)
+	return costBitmapHeapScan(cp, treeCost, pagesFetched, tuplesFetched, T, numQualOps)
 }
 
 // indexPagesForPath estimates the total number of pages of all index paths

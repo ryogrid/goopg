@@ -9838,7 +9838,12 @@ func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *Colu
 	bmIdxCost := costBitmapIndexScan(cp, in)
 	tuples := clampRowEst(sel * relTuples)
 	pages, tuples := computeBitmapPages(tuples, relTuples, T, indexPages, T, cp.effectiveCacheSize, bitmapMaxEntries(cp.workMem))
-	bm := costBitmapHeapScan(cp, bmIdxCost, pages, tuples, T)
+	bm := costBitmapHeapScan(cp, bmIdxCost, pages, tuples, T,
+		// Rule-based chooser: no cost competition exists here (shape match,
+		// no addPath), so the qpqual term stays 0 — R1
+		// (plan-parity-fix-take2) prices only the search's candidates.
+		// Dies with the legacy planner (P6).
+		0)
 	if bm.Total >= idxCost.Total {
 		return nil
 	}

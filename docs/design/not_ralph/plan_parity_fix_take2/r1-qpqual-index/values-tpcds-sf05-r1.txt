@@ -1,0 +1,112 @@
+# TPC-DS SF0.5 goopg sweep — 2026-09-08T20:36:07+09:00
+# goopg: b8e145ecc docs(plan-parity): R0 baseline captures + diffs (TPC-H 1/12/9, TPC-DS 3/96)
+# engine-id: 6d7186734fed2e7b97186a9326b9577e9431ace9 adac573515d2f130d75ee99e1dd8fd1f328e9924  diff=2ced3df7126f
+# build: PRE-EXISTING, NOT BUILT BY THIS RUN (SF05_NO_BUILD=1) — provenance unknown [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=02a0b658036199d3 on-disk=02a0b658036199d3 (/home/ryo/work/goopg/goopg/tmp/goopg-parity-r1)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=retired(take2-P1-05) GOOPG_COST_DRIVEN_JOINORDER=retired(M0127-P5.9) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on) GOOPG_PGSHAPED_DP=unset(on) GOOPG_PGSHAPED_COLLAPSE=retired(take3-C-06) GOOPG_EXISTS_TO_ANY=unset(on) GOOPG_UNNEST_PREDP=unset(on) GOOPG_INDEXKEY_HARVEST=unset(on) GOOPG_NLI_COSTGATE=unset(current) GOOPG_HASH_OUTER_JOIN=unset(off) GOOPG_INDEX_PROBE_MULT=unset(2) GOOPG_MHJ_PACKING_OFF=retired(M0127-P6.2) GOOPG_GS_SHARE_SOURCE=retired(M0125-0048) GOOPG_NARROW_BUILD=unset(on) GOOPG_NARROW_UPPER=unset(on) GOOPG_NARROW_UPPER_SORT=unset(on) GOOPG_GATHER_PATHS=unset(off) GOOPG_PARTIAL_AGG_PATHS=unset(on) GOOPG_ONEREL_SEARCH=unset(off) GOOPG_PARTIAL_SORT_PATHS=unset(off)
+Q1   PASS        2s (1409ms)      100 rows  ck=n/a
+Q2   PASS        7s (7716ms)     2513 rows  ck=3553210cd5579ce8
+Q3   PASS        1s (257ms)       31 rows  ck=d50dcb6b3999d248
+Q4   SKIP (oracle: TIMEOUT)
+Q5   PASS       15s (15169ms)      100 rows  ck=n/a
+Q6   PASS       11s (11212ms)       37 rows  ck=5ab14f7c6fb803d7
+Q7   PASS       12s (11758ms)      100 rows  ck=n/a
+Q8   PASS        3s (2725ms)        0 rows  ck=1f18d650d205d71d
+Q9   PASS        9s (9359ms)        1 rows  ck=63ffce9ca5245d88
+Q10  PASS        2s (1690ms)        0 rows  ck=1f18d650d205d71d
+Q11  PASS       12s (11779ms)        8 rows  ck=3567170dea89bdc1
+Q12  PASS        2s (2012ms)      100 rows  ck=n/a
+Q13  PASS        6s (6180ms)        1 rows  ck=ce8ba876bbc6d2e9
+Q14  PASS       85s (85238ms)      200 rows  ck=n/a
+Q15  PASS        4s (4079ms)      100 rows  ck=n/a
+Q16  PASS        6s (5971ms)        1 rows  ck=40dbec0df91d2438
+Q17  PASS        6s (6185ms)        0 rows  ck=1f18d650d205d71d
+Q18  PASS      104s (104253ms)      100 rows  ck=n/a
+Q19  PASS        0s (244ms)      100 rows  ck=n/a
+Q20  PASS        4s (3934ms)      100 rows  ck=n/a
+Q21  PASS        1s (899ms)      100 rows  ck=n/a
+Q22  PASS        7s (6947ms)      100 rows  ck=n/a
+Q23  PASS       37s (36776ms)        1 rows  ck=00f53003bda23764
+Q24  PASS       11s (10441ms)        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS        4s (4135ms)        0 rows  ck=1f18d650d205d71d
+Q26  PASS        5s (5665ms)      100 rows  ck=n/a
+Q27  PASS       10s (9530ms)      100 rows  ck=n/a
+Q28  PASS       23s (22794ms)        1 rows  ck=3fbe61472403ae2f
+Q29  PASS        1s (1177ms)        0 rows  ck=1f18d650d205d71d
+Q30  PASS        5s (4501ms)       31 rows  ck=f47a48499fd7e070
+Q31  PASS       11s (11208ms)       19 rows  ck=2a74acfb556c21a7
+Q32  PASS        4s (3727ms)        1 rows  ck=a55f36d3bf196bce
+Q33  PASS       11s (11129ms)      100 rows  ck=n/a
+Q34  PASS        5s (5235ms)      187 rows  ck=c83808417d7a81d8
+Q35  PASS        4s (3524ms)      100 rows  ck=n/a
+Q36  SKIP (oracle: SKIP_QUERYGEN)
+Q37  PASS        2s (2034ms)        0 rows  ck=1f18d650d205d71d
+Q38  PASS       12s (12418ms)        1 rows  ck=6f66a76c23e12a63
+Q39  PASS        9s (8958ms)       77 rows  ck=4db806a9a11fddfd
+Q40  PASS        1s (364ms)      100 rows  ck=n/a
+Q41  PASS        7s (7596ms)        1 rows  ck=7b2c30faa474fb80
+Q42  PASS        1s (244ms)       10 rows  ck=5004612d9b837c34
+Q43  PASS        1s (1283ms)        6 rows  ck=b70a4026e9b9bb04
+Q44  PASS        4s (3677ms)       10 rows  ck=d76f8301addaff98
+Q45  PASS        2s (2245ms)        7 rows  ck=e09cf591997524ad
+Q46  PASS       24s (23608ms)      100 rows  ck=n/a
+Q47  PASS        5s (5514ms)      100 rows  ck=n/a
+Q48  PASS        6s (6189ms)        1 rows  ck=9a9ece15cb525a79
+Q49  PASS       12s (11368ms)       25 rows  ck=ccb0983b810cf1d0
+Q50  PASS        0s (614ms)        6 rows  ck=3928ecee672e3992
+Q51  PASS        4s (4581ms)      100 rows  ck=n/a
+Q52  PASS        0s (161ms)      100 rows  ck=n/a
+Q53  PASS        1s (685ms)      100 rows  ck=n/a
+Q54  PASS       11s (10617ms)        0 rows  ck=1f18d650d205d71d
+Q55  PASS        0s (107ms)       73 rows  ck=46d35b957845db41
+Q56  PASS       11s (11096ms)      100 rows  ck=n/a
+Q57  PASS        3s (2593ms)      100 rows  ck=n/a
+Q58  PASS        4s (4306ms)        0 rows  ck=1f18d650d205d71d
+Q59  PASS        9s (8818ms)      100 rows  ck=n/a
+Q60  PASS       11s (11579ms)      100 rows  ck=n/a
+Q61  PASS        1s (1517ms)        1 rows  ck=4766027020fae308
+Q62  PASS        3s (2627ms)      100 rows  ck=n/a
+Q63  PASS        0s (629ms)      100 rows  ck=n/a
+Q64  PASS        7s (6832ms)        2 rows  ck=31f0342ff9d55c4a
+Q65  PASS       13s (12734ms)      100 rows  ck=n/a
+Q66  PASS        6s (6143ms)        5 rows  ck=f6613897dd73709a
+Q67  PASS       12s (11568ms)      100 rows  ck=n/a
+Q68  PASS       10s (10589ms)      100 rows  ck=n/a
+Q69  PASS        1s (1928ms)      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  PASS       11s (11745ms)      580 rows  ck=521a7af7606d10c1
+Q72  PASS        5s (4767ms)      100 rows  ck=n/a
+Q73  PASS        7s (7267ms)        1 rows  ck=ec4c67dea8017171
+Q74  PASS        3s (2381ms)        7 rows  ck=2ffc13c77bf53028
+Q75  PASS        5s (5026ms)      100 rows  ck=n/a
+Q76  PASS        1s (1052ms)      100 rows  ck=n/a
+Q77  PASS        3s (2939ms)       44 rows  ck=2afe8ddcd18fad9c
+Q78  PASS       14s (13807ms)       45 rows  ck=8f67acff3895183f
+Q79  PASS       52s (52239ms)      100 rows  ck=n/a
+Q80  PASS        7s (7003ms)      100 rows  ck=n/a
+Q81  PASS        6s (5347ms)      100 rows  ck=n/a
+Q82  PASS        2s (2036ms)        0 rows  ck=1f18d650d205d71d
+Q83  PASS        1s (1239ms)        3 rows  ck=9504298446f22ddc
+Q84  PASS        0s (344ms)        6 rows  ck=073898a18264bd8e
+Q85  PASS        2s (1230ms)        0 rows  ck=1f18d650d205d71d
+Q86  SKIP (oracle: SKIP_QUERYGEN)
+Q87  PASS       11s (11797ms)        1 rows  ck=b363a9287bdd0920
+Q88  PASS       41s (41272ms)        1 rows  ck=272de7cd629d9033
+Q89  PASS        1s (809ms)      100 rows  ck=n/a
+Q90  PASS        0s (606ms)        1 rows  ck=66ceccaa8ce9d2cf
+Q91  PASS        1s (272ms)        1 rows  ck=88b9d5fffed589f8
+Q92  PASS        3s (3783ms)        1 rows  ck=26c02866b1827f1b
+Q93  PASS        2s (1397ms)        0 rows  ck=1f18d650d205d71d
+Q94  PASS        2s (2423ms)        1 rows  ck=04afc1b69831a5ea
+Q95  PASS       12s (12016ms)        1 rows  ck=e498634c02595c29
+Q96  PASS        2s (1123ms)        1 rows  ck=5923f3c62773e705
+Q97  PASS        3s (3320ms)        1 rows  ck=65725195ebe13a3b
+Q98  PASS        2s (2293ms)     2128 rows  ck=be1b9a6d08cb1a3d
+Q99  PASS        5s (5103ms)       90 rows  ck=b10fd5001836fcfb
+
+=== SUMMARY: PASS=95 (57 ck-verified, 38 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=4 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+# status-delta: skipped (SF05_NO_DELTA=1)
+# plan-shape: skipped (SF05_NO_PLANS=1)

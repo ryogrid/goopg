@@ -192,7 +192,7 @@ func TestBitmapPathCost_Positive(t *testing.T) {
 	tuplesFetched := clampRowEst(in.selectivity * relTuples)
 	idxCost := costBitmapIndexScan(s.cp, in)
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, s.totalTablePages(), s.cp.effectiveCacheSize, maxEntries)
-	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T)
+	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, 0)
 
 	// Verify cost components are positive and ordered.
 	if idxCost.Total <= 0 {

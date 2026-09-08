@@ -390,3 +390,126 @@ func TestEstimateIndexGeometryPartialScalesTuples(t *testing.T) {
 		t.Errorf("nil-predicate partial index tuples = %v, want 1000 (declined)", tuples)
 	}
 }
+
+// TestCostIndexScanQpqualCurrency (R1, plan-parity-fix-take2) pins the
+// one-currency rule: for the same conjunct count, the index-side CPU term
+// per fetched tuple is EXACTLY the seq-side term per scanned tuple —
+// `(cpuTupleCost + cpuOperatorCost*n)` — so an addPath comparison cannot
+// favour either rival on the qual. It also pins the zero default (a
+// filter-less fixture prices exactly as before R1) and that startup is
+// untouched by the charge (scope decision: per-tuple only).
+func TestCostIndexScanQpqualCurrency(t *testing.T) {
+	cp := defaultCostParams()
+	base := indexScanInputs{
+		relPages: 10000, relTuples: 1_000_000,
+		indexPages: 2000, indexTuples: 1_000_000, treeHeight: 2,
+		selectivity: 0.01, totalTablePages: 10000,
+	}
+	plain := costIndexScan(cp, base)
+	if plain.Total == 0 {
+		t.Fatal("plain index scan priced at zero")
+	}
+	// Zero default is bit-identical to the unset field: numQualOps defaults
+	// to 0 and must reproduce the pre-R1 price exactly.
+	if again := costIndexScan(cp, base); !approxCost(again.Total, plain.Total) {
+		t.Fatalf("zero numQualOps moved the price: %v vs %v", again.Total, plain.Total)
+	}
+	// The charge: cpu_operator_cost per conjunct per fetched tuple.
+	// tuples_fetched = 0.01 * 1e6 = 10000; 3 conjuncts add
+	// 3 * cpuOperatorCost * 10000 to the run cost and nothing to startup.
+	q := base
+	q.numQualOps = 3
+	charged := costIndexScan(cp, q)
+	tuplesFetched := 0.01 * 1_000_000
+	want := plain.Total + 3*cp.cpuOperatorCost*tuplesFetched
+	if !approxCost(charged.Total, want) {
+		t.Fatalf("3-conjunct index scan = %v, want %v (plain %v + 3*op*tuples)",
+			charged.Total, want, plain.Total)
+	}
+	if !approxCost(charged.Startup, plain.Startup) {
+		t.Fatalf("startup moved %v -> %v; the R1 charge is per-tuple only",
+			plain.Startup, charged.Startup)
+	}
+	// Currency identity with the seq rival: same n on both sides prices
+	// the same per-tuple term. costSeqscan(..., n) - costSeqscan(..., 0)
+	// must equal costIndexScan(..., n) - costIndexScan(..., 0) whenever
+	// the tuple counts coincide (here both range over the full 1e6: the
+	// index fixture's selectivity is 1.0 below).
+	full := base
+	full.selectivity = 1.0
+	fullPlain := costIndexScan(cp, full)
+	full.numQualOps = 3
+	fullCharged := costIndexScan(cp, full)
+	relTuples := 1_000_000.0
+	seqDelta := costSeqscan(cp, 10000, relTuples, 3).Total - costSeqscan(cp, 10000, relTuples, 0).Total
+	idxDelta := fullCharged.Total - fullPlain.Total
+	if !approxCost(seqDelta, 3*cp.cpuOperatorCost*relTuples) {
+		t.Fatalf("seq-side delta = %v, want 3*op*tuples", seqDelta)
+	}
+	if !approxCost(idxDelta, seqDelta) {
+		t.Fatalf("currency mismatch: index-side delta %v != seq-side delta %v", idxDelta, seqDelta)
+	}
+}
+
+// TestLocalQualOpCountMirrorsSeqRivalCount (R1, plan-parity-fix-take2)
+// pins the agreement the currency rests on: the qpqual population the
+// index producers count from the pre-search leaf's Filter chain is the
+// same conjunct list baseSeqScanCostInputs counts from localFilter.
+// Filter{scan,(a AND b)} counts 2; a bare scan counts 0 (filter-less rels
+// price exactly as before on both sides).
+func TestLocalQualOpCountMirrorsSeqRivalCount(t *testing.T) {
+	mkAnd := func(l, r Expr) Expr { return &BinaryOp{Op: parser.OpAnd, Left: l, Right: r} }
+	col := func(i int) Expr { return &ColumnRef{Index: i} }
+	tru := &BooleanConst{Value: true}
+
+	scan := &SeqScan{}
+	if got := localQualOpCount(scan); got != 0 {
+		t.Fatalf("bare scan counts %v, want 0", got)
+	}
+	two := &Filter{Child: scan, Predicate: mkAnd(mkAnd(col(0), col(1)), tru)}
+	if got := localQualOpCount(two); got != 3 {
+		t.Fatalf("three-conjunct filter counts %v, want 3", got)
+	}
+	// Nested Filter wrappers (the extractor walks the whole chain).
+	nested := &Filter{Child: &Filter{Child: scan, Predicate: col(0)}, Predicate: mkAnd(col(1), col(2))}
+	if got := localQualOpCount(nested); got != 3 {
+		t.Fatalf("nested filters count %v, want 3", got)
+	}
+	// relQualOpCount is the nil-safe rel-level form the bitmap sites use.
+	if got := relQualOpCount(nil); got != 0 {
+		t.Fatalf("nil rel counts %v, want 0", got)
+	}
+}
+
+// TestParamIndexQualOpCountAddsPopulations (R1, plan-parity-fix-take2) pins
+// the parameterised site's rule. The first draft SUBTRACTED the index-qual
+// count from the LOCAL conjunct count — two disjoint populations (local
+// restrictions vs movable join clauses), so a rel with no local filter and
+// one probe clause priced at -1 conjunct, CREDITING the index path with the
+// very asymmetry R1 removes. The rule is: local conjuncts + (movable join
+// clauses - those bound as index quals), added, floored at zero.
+func TestParamIndexQualOpCountAddsPopulations(t *testing.T) {
+	mkAnd := func(l, r Expr) Expr { return &BinaryOp{Op: parser.OpAnd, Left: l, Right: r} }
+	col := func(i int) Expr { return &ColumnRef{Index: i} }
+	scan := &SeqScan{}
+	twoLocal := &Filter{Child: scan, Predicate: mkAnd(col(0), col(1))}
+
+	// No local filter, one movable clause fully bound as an index qual:
+	// nothing is rechecked on the heap.
+	if got := paramIndexQualOpCount(scan, 1, 1); got != 0 {
+		t.Fatalf("fully-bound filter-less rel counts %v, want 0", got)
+	}
+	// The pre-fix arithmetic would have yielded -1 here.
+	if got := paramIndexQualOpCount(scan, 0, 1); got != 0 {
+		t.Fatalf("count went negative: %v (a negative CREDITS the index path)", got)
+	}
+	// Two local conjuncts + three movable clauses of which one is an index
+	// qual = 2 + 2 = 4 heap-side conjuncts.
+	if got := paramIndexQualOpCount(twoLocal, 3, 1); got != 4 {
+		t.Fatalf("2 local + (3 bound - 1 index qual) counts %v, want 4", got)
+	}
+	// Local conjuncts are never cancelled by index quals (disjoint sets).
+	if got := paramIndexQualOpCount(twoLocal, 2, 2); got != 2 {
+		t.Fatalf("local conjuncts cancelled by index quals: %v, want 2", got)
+	}
+}

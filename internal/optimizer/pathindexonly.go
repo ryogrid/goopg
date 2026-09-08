@@ -111,6 +111,9 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		loopCount:       1,
 		indexOnly:       true,
 		allVisFrac:      relAllVisibleFraction(tbl, relPages),
+		// R1 (plan-parity-fix-take2): full index scan, no index quals —
+		// every local conjunct is a qpqual, as the seq rival counts them.
+		numQualOps: localQualOpCount(rel.baseLeaf),
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
