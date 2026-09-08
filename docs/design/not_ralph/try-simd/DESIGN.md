@@ -319,6 +319,97 @@ time goes.
   pressure on the write path. If the motivation is write-path CPU, this needs no
   experiment flag and should be priced alongside the kernel.
 
+## 7b. MEASURED VERDICT: the checksum is not hot. The item does not pay.
+
+The share-of-CPU measurement §7 said would decide the item has been taken, and
+it decides against. `pageChecksumBlock` cumulative share, four profiled
+workloads on private clones, `DataChecksumVersion=1` throughout:
+
+| workload | `pageChecksumBlock` cum | share |
+|---|---:|---:|
+| TPC-H SF=1, cold buffers, Q1/6/3/12/13 | 0.05 s / 117.56 s | **0.043%** |
+| TPC-DS SF0.5, 28 queries | 0.23 s / 272.72 s | **0.084%** |
+| pgbench `-i -s 10` COPY load tail | 0.03 s / 7.53 s | **0.4%** |
+| pgbench OLTP `-n -c 8 -j 8`, 1268 tps | 0.17 s / 136.16 s | **0.125%** |
+
+The entire write-side path including `PageSetChecksumCopy`'s 8 KiB
+`make`+copy (§7's "cheaper adjacent win") is **0.13%** of the OLTP profile — so
+that win is not worth taking either.
+
+**A 13.2× kernel over 0.125% buys ~0.11% of one workload. The ceiling, at
+infinite speed, is ~0.4%.** This is exactly the E-19 shape named in §7: a real,
+correctly-built, verified-bit-identical mechanism whose caller is not where the
+time goes.
+
+### 7b.1 Corrections to §2's candidate list, from the profiles
+
+- **`tidbitmap` is NOT a candidate** — this refutes the source review's
+  strongest counterexample and, with it, part of §2's rewrite. There are no word
+  operations: `bitmap` is a 256-byte `[]byte` touched **one bit at a time**
+  through a `map[BlockNumber]*pageEntry` (`addOne`). It is pointer-chasing, not
+  contiguous, and it is absent from every profile.
+- `pglz` (correctly `internal/access/common/pglz`) is below the 0.5% pprof
+  cutoff in every profile.
+- WAL CRC is stdlib `crc32.Castagnoli`, already hardware-dispatched, and absent
+  from all profiles — confirmed.
+- Hash-join key hashing cannot vectorise either way: FNV-1a is a serial per-byte
+  dependency chain within a key, and keys are short and variable-length across
+  keys.
+
+### 7b.2 Columnar is worse than doing nothing — measured, not argued
+
+**`archsimd` exposes no gather or scatter at all** (zero `Gather`/`Scatter`
+symbols in the package). So §2's gather option is not "often no faster"; it is
+*unavailable*. The only route is an explicit scalar pack loop, measured on a
+struct with `Datum`'s exact 48-byte layout, 4096 rows, `int64` column, with no
+NULL/Kind/scale handling at all:
+
+| | ns/op |
+|---|---:|
+| scalar sum off strided `Datum`s (what goopg does today) | 1981 |
+| **pack into `[]int64` alone** | **2964** |
+| pack + scalar sum | 4739 |
+| pack + SIMD sum | 3681 |
+| SIMD sum, already contiguous | 466 |
+
+The kernel is genuinely 4.25× faster, and **the pack alone costs 1.5× the whole
+computation it would replace**. Pack-then-compute is **1.86× slower than doing
+nothing**.
+
+And the Q1/Q6 premise fails on this corpus independently: HammerDB declares
+`l_extendedprice`, `l_discount` and `l_quantity` as **`numeric`**
+(`bench/tpch/cmd/hammerdb_load/dbgen.go:161`), not `float8`. Those aggregates
+run through `NumericInt64FromStoredPayload` and `math/big.nat.scan` over
+variable-width values. **There is no fixed-width float column in TPC-H here to
+vectorise.**
+
+### 7b.3 The incidental find that is worth ~50× this whole item
+
+`strings.ToLower` is **7.3% of TPC-H CPU (8.58 s)** and 3.16% of TPC-DS, called
+from `catalog.PhysicalTypeIsVarlena`, `InMemory.LookupEnum` and
+`decodeRowRangeInfo` — i.e. **lowercasing type names once per value decoded**.
+It is a hoisting/caching fix, not a SIMD one. The genuinely hot code is row
+decode (`decodeRowRangeInfo` 63.5% cum in TPC-DS,
+`decodePhysicalPGValueLowered` 45%, `mallocgc` 18.3%), which is serial and
+data-dependent — varlena headers give the next offset — and structurally
+un-vectorisable.
+
+Filed as a successor item; it is not part of this design.
+
+### 7b.4 What still gets built, and why
+
+The owner asked for the experiment, so the kernel is implemented rather than
+abandoned at the design stage — it is small, gated, and verifiable. But **no
+end-to-end win is claimed or expected**, and the report will say so with these
+numbers. Two further implementation facts from the survey:
+
+- **`go.mod` does NOT need bumping** — verified by building `simd/archsimd`
+  from a module declaring `go 1.25.0`.
+- **`LoadUint32x8Slice(s[i:i+8])` emits a bounds check per load** and nothing is
+  hoisted; that alone left an otherwise-correct kernel 1.8× *slower* than
+  scalar. Only raw-pointer loads plus separate scalar accumulator variables
+  reached 162 ns. This is a third archsimd pitfall to add to §4.1's two.
+
 ## 8. Review findings, and what they changed
 
 Two adversarial reviews ran: a **PG 18.3 oracle** pass against `./postgres/`
