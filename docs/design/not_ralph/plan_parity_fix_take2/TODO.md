@@ -829,15 +829,17 @@ anything attempted so far.
   own design (Filter-chain counting cannot reach it by construction).
   ORIGINAL: Give index leaves their qual charge instead of
   `numQualOps = 0`.
-- [ ] **R22 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
-  `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-  **STATUS 2026-09-09: design committed (`r22-plain-index-arm/`),
-  implementation + unit pins DONE in working tree (UNCOMMITTED —
-  `pathindexordered.go` + `pathindexplain_test.go`), gates pending
-  (suites green; TPC-H A/B zero bytes; probe PROVED 145 offers, all
-  pruned as dominated). Interrupted by the R25 redirect; resume with
-  values gates (digest + sweep) + REPORT before any other code lands
-  on top.
+- [x] **R22 — unconditional plain-index-scan arm** (§7.3) —
+  **DECLINED 2026-09-09: provably unwinnable (dominance proof +
+  production probe).** `r22-plain-index-arm/REPORT.md`. Implemented,
+  unit/driver-pinned, probed (145 offers / 0 survivals across TPC-H),
+  TPC-H A/B zero bytes, reverted in full. A full-fetch index scan is
+  strictly dominated by seq on both cost axes whenever a seq path
+  exists (always); PG's own comparator prunes the same way (live PG
+  shows zero cond-less index scans on TPC-H). The Q5/Q8 nation sites
+  are ordered-arm contests, not plain-arm (plus a width-model gap at
+  Q8 store: 676 vs 20). ORIGINAL: Drop/relax the `hasUsefulPathkeys`
+  gate so a plain index path is always a candidate.
 - [x] **R23 — persist correlation** (§7.4) — **STALE 2026-09-09, no
   code change (K27).** Live-verified on a private SF0.5 clone:
   `ANALYZE store_sales` writes slot 3, stop+restart restores

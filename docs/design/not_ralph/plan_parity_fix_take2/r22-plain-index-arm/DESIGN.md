@@ -2,7 +2,12 @@
 
 *Round of `docs/design/not_ralph/plan_parity_fix_take2/TODO.md` (the R22
 row). Status: DESIGN + self-review (subagent delegation unavailable —
-recorded honestly in §5, not elided).*
+recorded honestly in §5, not elided). **OUTCOME: DECLINED, see
+REPORT.md** — implemented, pinned, probed (145 offers / 0 survivals),
+reverted: a full-fetch index scan is strictly dominated by the seq
+scan on both cost axes whenever a seq path exists (always), so the
+arm can never win. Follow-up: none filed (ordered-arm contest belongs
+to K24/R21-slice-3, already owned).*
 
 ## 0. Problem (§7.3, evidenced — not inferred)
 
