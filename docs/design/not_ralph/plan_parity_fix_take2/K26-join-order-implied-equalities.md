@@ -271,3 +271,65 @@ That is three successive reframings of the same obstacle, each from
 measurement: "breaks plan layouts" → "breaks a remap" → "one helper
 does not recognise one inner shape". Each was cheaper to answer than
 the last, and none required trusting the previous framing.
+
+
+## 9. Obstacle CLEARED, and the hypothesis FALSIFIED (2026-09-09)
+
+### 9.1 The blocker was a type-pinning test helper
+
+§8's bounded question — what is `nli.Inner`, should `nliIn` recognise
+it — is answered six lines below `nliIn` in its own file:
+
+```go
+func nliIn(n Node) *IndexScan { is, _ := n.(*IndexScan); return is }
+```
+
+and immediately after it, `nliProbeKeys`:
+
+> *"A semi/anti inner is promoted to an `*IndexOnlyScan` when nothing
+> reads its columns (`indexOnlyNLIInner`), so a test that asserts on
+> the PROBE **must not also pin the node TYPE** — the probe is the
+> invariant, the node kind is an optimisation."*
+
+Implied equalities make that promotion happen. The test used the
+type-pinning accessor against the codebase's own written rule; switching
+it to `nliProbeKeys` makes **`TestPreDPPinnedSemiKeysResolveAfterDP`
+pass with implied equalities enabled**.
+
+The obstacle that deferred the transitive half was a test helper
+pinning a node kind its own file says is an optimisation. Failures drop
+from 3 to 2, and the two left are the Slice3 keep assertions R14
+already established are justified re-baselines when join shape moves.
+
+### 9.2 But join-order does NOT fall — the round's real finding
+
+Measured on TPC-H with implied equalities on:
+
+| category | before | after |
+|---|---|---|
+| **join-order** | **18** | **18** |
+| join-method | 12 | **10** |
+| aggregation-strategy | 10 | 11 |
+| everything else | — | unchanged |
+| match | 2 | 2 |
+
+**`join-order` is unmoved.**
+
+That falsifies §4's claim, which said: *"It is candidate generation, so
+it cannot be reached by any amount of cost work."* Half right. The
+missing clauses were **necessary** — goopg could not reach PG's orders
+at all — but they are **not sufficient**: given the clauses, goopg's
+cost model still chooses different orders.
+
+So join-order is candidate generation **and** costing, and the
+candidate half is now known to be a small, safe change. What remains is
+the DP choosing PG's order from the same candidate set — which is the
+`join_search_one_level` costing work, and is squarely in the territory
+root-causes' original thesis described.
+
+### 9.3 State
+
+Seam reverted to constants-only (the two Slice3 assertions need
+adjudicating against PG before it lands). **The test fix is KEPT** — it
+is correct independently of the flag, and it removes a trap that cost
+this workstream a deferral and three rounds of misdiagnosis.

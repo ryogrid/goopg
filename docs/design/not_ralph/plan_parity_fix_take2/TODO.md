@@ -821,6 +821,12 @@ anything attempted so far.
 
 ## Log
 
+- 2026-09-09 K26 §9: obstacle CLEARED — it was a test helper pinning a
+  node kind its own file calls an optimisation (`nliIn` vs
+  `nliProbeKeys`); the named test now PASSES with implied equalities.
+  But **join-order does NOT fall** (18 -> 18), falsifying §4: the
+  clauses are necessary, not sufficient. Remaining join-order work is
+  COSTING. Test fix kept; seam reverted pending Slice3 adjudication.
 - 2026-09-09 K26 §8: open question ANSWERED by probe. Implied
   equalities turn the pinned semi join into an NLI (legal, plausibly
   better); the test's NLI branch nil-derefs at `nliIn(nli.Inner).Key`

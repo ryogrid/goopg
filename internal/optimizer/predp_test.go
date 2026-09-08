@@ -137,7 +137,19 @@ func TestPreDPPinnedSemiKeysResolveAfterDP(t *testing.T) {
 		published = semi.Output()
 	case nli != nil:
 		outerSchema = nli.Outer.Output()
-		leftKey = nliIn(nli.Inner).Key
+		// K26: use the TYPE-AGNOSTIC probe accessor. `nliIn` matches only
+		// *IndexScan and returns nil otherwise, and a semi/anti inner is
+		// promoted to an *IndexOnlyScan when nothing reads its columns
+		// (`indexOnlyNLIInner`) — which is what implied join equalities make
+		// happen here. `nliProbeKeys`' own comment states the rule: "a test
+		// that asserts on the PROBE must not also pin the node TYPE — the
+		// probe is the invariant, the node kind is an optimisation."
+		//
+		// Pinning the type is what produced the nil-deref that read as a
+		// planner segfault and got the transitive-equality half deferred.
+		if pk := nliProbeKeys(nli.Inner); len(pk) > 0 {
+			leftKey = pk[0]
+		}
 		pred = nli.Predicate
 		published = nli.Output()
 	default:
