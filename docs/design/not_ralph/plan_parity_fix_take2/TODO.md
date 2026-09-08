@@ -249,6 +249,14 @@ failure/hang in background wastes the session — goal instruction).
   a fixture, which breaks any test wanting a serial baseline. Also:
   `scripts/planner-flags.env` records what the default IS, so it must
   be regenerated IN THE SAME COMMIT as a default change, never before.
+- **K21 (measured 2026-09-08 — the flip is NOT unambiguously good).**
+  PG hash-joins the multi-key shape on both equalities with the
+  residual as a Join Filter (verified on :65432, GUCs pinned). goopg
+  under `GOOPG_GATHER_PATHS=all` falls back to a nested loop, so the
+  flip **costs a hash join PG keeps** while buying the parallel-join
+  mechanism PG uses (R14's Q9). Both measured. R10 DESIGN §7's
+  acceptance rule — a category regression must be EXPLAINED, not
+  outweighed — applies directly, and this one is not yet explained.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -477,7 +485,27 @@ failure/hang in background wastes the session — goal instruction).
   R14's narrow-build changes. NOT settled: whether the price is right,
   which needs PG's answer for the same shape at the same cardinalities
   (synthetic fixture -> run the SQL on :65432, do not read a capture).
-- [ ] **R16 — measure PG for the multi-key shape**, adjudicate
+- [x] **R16 — PG's verdict on the multi-key shape** — DONE
+  2026-09-08, findings only. `r16-pg-multikey-verdict/FINDINGS.md`.
+  The fixture is TPC-H-shaped, so it ran on :65432 directly.
+  **PG HASH-JOINS on both equalities** (`Hash Cond: (ps_partkey =
+  l_partkey AND ps_suppkey = l_suppkey)`) with `ps_availqty > sum` as a
+  Join Filter. So goopg's nested-loop fallback under the flip is a
+  **confirmed divergence from PG**, not a justified re-baseline — the
+  opposite disposition from R14's Slice3 finding. **The flip is
+  therefore not unambiguously good**: it buys PG's parallel-join
+  mechanism (R14) and costs a hash join PG keeps. Caveat recorded: the
+  fixture's own row counts are synthetic and smaller; the SHAPE
+  question is settled, the THRESHOLD question is not.
+- [ ] **R17 — why is the nested loop priced below the hash join under
+  the flip?** Instrument `addPath` to confirm the hash candidate is
+  generated before theorising about cost terms
+  ([[planner_verify_both_candidates_generated]]). Then adjudicate
+  `TestSlice3FilterColumnSurvivesNarrowing` and
+  `TestOwnedBuildPoisonPrebuiltBoundary`, and decide the flip: either
+  fix the nested-loop choice so the flip is strictly toward PG, or land
+  it with a named, measured, EXPLAINED regression per R10 DESIGN §7.
+  ORIGINAL R16 SCOPE: adjudicate
   `TestSlice3FilterColumnSurvivesNarrowing` and
   `TestOwnedBuildPoisonPrebuiltBoundary`, then land flip + provenance
   (K20) + stage pin in ONE commit and run R10 DESIGN §5's gates.
@@ -502,31 +530,31 @@ failure/hang in background wastes the session — goal instruction).
   each expected tree against PG rather than against the new output.
   Then land the flip and run R10 DESIGN §5's gates. Everything already
   known is in R10's report so it need not be re-derived.
-- [ ] **R17 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] **R18 — slice (B): let a node below satisfy the ordering** (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
   a finished Node and `windowsetoppaths.go:19` records that above the
   search seam inputs carry no pathkeys. Architectural.
-- [ ] **R18 — heap page fill on bulk load** (K14 remainder). goopg
+- [ ] **R19 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R19 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R20 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
-- [ ] **R20 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R21 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R21 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R22 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R22 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R23 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R23 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R24 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -535,6 +563,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R16 done (findings only): PG hash-joins the multi-key
+  shape, so goopg's nested-loop fallback under the flip is a CONFIRMED
+  divergence — reversing R15's provisional disposition. The flip now
+  has one measured gain (R14) and one measured loss (K21), and cannot
+  land on the mechanism argument alone.
 - 2026-09-08 R15 done (findings only): the multi-key "fell back to
   Nested Loop" is the COST arm, not the capability arm — the test's own
   header explains the one-row-floor mechanism. Narrowed from "possible
