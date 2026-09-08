@@ -609,7 +609,20 @@ failure/hang in background wastes the session — goal instruction).
     table is in `r21-upper-planner-seam/DESIGN.md` §8. Gate: slice 1's
     — byte-identical plans both corpora, since nothing consumes it.
     `createWindowPaths` needs the same rel for slice 3, so do it once.
-  - [ ] **Slice 2b (K23 behaviour)**: partial aggregation from
+  - [x] **Slice 2b PREREQUISITE landed** 2026-09-09
+    (`REPORT-slice2b-prereq.md`): `searchedRelOf` accessor, gated
+    byte-identical on TPC-H. **The naive version returns nil** — the
+    aggregate's child is a `*Project` WRAPPING the search root, caught
+    by probing rather than assumed; it now descends via
+    `boundaryWalkChildren` (same contract R11 taught about Gather).
+    **Measured under the flip: `rel=true partialPaths=1
+    hasGather=true`** — the partial path exists and is reachable, so
+    K23 is blocked on nothing unknown. The refusal site carries this
+    measurement in a comment.
+  - [ ] **Slice 2b (K23 behaviour)**: add an arm BEFORE the guard —
+    when `searchedRelOf(child)` has a non-empty `PartialPathlist`,
+    build partial agg -> Gather -> finalise from it. Guard stays for
+    the post-pass route. Was: partial aggregation from
     `rel.PartialPathlist`, built BELOW the Gather
     (`create_partial_grouping_paths`, planner.c:7351). Success test:
     `aggregation-strategy` 10 -> 14 under the flip disappears.
@@ -694,6 +707,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-09 Slice 2b prerequisite landed: `searchedRelOf` accessor.
+  The naive implementation returns nil (the child is a Project wrapping
+  the search root) — caught by probing, which would otherwise have made
+  slice 2b look like a costing problem. Measured under the flip:
+  partialPaths=1, so K23's input is confirmed present.
 - 2026-09-09 R21 slice 2a LANDED, and cheaper than designed: the rel
   rides the `searchedTree` tag (the pattern the codebase already uses
   for `searchPathkeys`), so planner.go was never touched. Gate

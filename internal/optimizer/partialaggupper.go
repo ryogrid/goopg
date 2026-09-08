@@ -89,6 +89,18 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// than a post-pass stand-down), and must have a driving scan — without one
 	// every worker reads the whole relation and the Gather returns N+1 copies
 	// of every row (`createplangather.go`'s file header).
+	// R21 slice 2b (K23) resumes HERE, and its prerequisite is measured, not
+	// assumed: with GOOPG_GATHER_PATHS=all, `searchedRelOf(child)` returns a
+	// non-nil rel carrying a NON-EMPTY `PartialPathlist` (probed on TPC-H:
+	// `rel=true partialPaths=1 hasGather=true`). So the partial path PG's
+	// `create_partial_grouping_paths` seeds `partially_grouped_rel` from
+	// (planner.c:7351) IS reachable from this site; the refusal below is the
+	// only thing standing between it and PG's Partial/Finalize shape.
+	//
+	// The guard stays for the post-pass route, which genuinely needs it — two
+	// Gathers means every worker reads the whole relation and N+1 copies come
+	// back. Slice 2b adds an arm BEFORE it that builds below the Gather
+	// instead of above, so it never reaches this test.
 	if subtreeHasUnsafeNode(child) || subtreeHasGather(child) || drivingScan(child) == nil {
 		return nil
 	}

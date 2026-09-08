@@ -159,6 +159,37 @@ type searchRootNode interface {
 	searchedRel() *RelOptInfo
 }
 
+// searchedRelOf returns the search's own upper rel for a node that is a
+// searched-tree root, or nil for anything else (R21 slice 2b).
+//
+// This is the accessor the upper stages use: the aggregate's input IS the
+// search root when the statement's FROM went through the search, so
+// `searchedRelOf(child)` is how `addPartialAggSplitPath` reaches the
+// `PartialPathlist` PG's `create_partial_grouping_paths` seeds from.
+func searchedRelOf(n Node) *RelOptInfo {
+	// The search root is rarely the node handed to an upper stage: measured,
+	// the aggregate's child is a *Project wrapping it. So descend the same
+	// pass-through kinds `boundaryWalkChildren` enumerates — its contract is
+	// exactly "every kind that can sit between a statement's root and a
+	// spliced searched subtree", which is this question — and stop at the
+	// first searched root.
+	//
+	// Bounded: the boundary chain is a handful of unary wrappers, and the
+	// depth cap makes a cycle impossible to hang on.
+	for depth := 0; n != nil && depth < 32; depth++ {
+		if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
+			return s.searchedRel()
+		}
+		kids := boundaryWalkChildren(n)
+		if len(kids) != 1 {
+			// A join, set-op or unknown kind: not on the boundary chain.
+			return nil
+		}
+		n = kids[0]
+	}
+	return nil
+}
+
 // markSearchedTree tags n as the root of a subtree the PG-shaped join search
 // produced, and returns it for chaining.
 //
