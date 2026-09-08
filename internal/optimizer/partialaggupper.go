@@ -86,13 +86,32 @@ const partialAggSplitPathProducer = "upper.groupagg.split"
 //
 // Returns (child, true) only when the unwrap is safe.
 //
-// NOT YET WIRED IN. Enabling the unwrap crashes TPC-H Q9 and Q13 under the
-// flip:
+// NOT ENABLED. Two attempts, both measured, so the next one starts from what
+// is actually true rather than from either of my guesses:
+//
+//  1. Enable the unwrap alone -> TPC-H Q9/Q13 panic (below).
+//  2. Enable it AND clear the stale stamp on a copy of the aggregate spec ->
+//     THE SAME PANIC, unchanged. So the stamp is not carried on the spec the
+//     producer passes down: it is applied POST-HOC to the emitted node by the
+//     caller (the same ordering `createWindowPlan`'s comment describes for
+//     windows — "buildWindowStage stamps it on the emitted node after the
+//     producer returns"). Clearing a spec the assertion never reads changes
+//     nothing.
+//
+// So the real question is why `deriveAggregateInputKeep` returns an EMPTY
+// keep marked KNOWN for the unwrapped shape — `[]` with
+// `InputTargetKnown = true` is what the panic reports, and per plan.go an
+// empty list "is NOT the same as unknown". Either the derivation should
+// return `ok = false` here (unknown, the safe direction), or it is failing to
+// enumerate group inputs through the new child and that is the bug. Start
+// there, in `group_input_target.go`, not in the producer.
+//
+// Original symptom, unchanged across both attempts:
 //
 //	createPlan: Aggregate input target [] drops group-input column "l_year"
 //	of a 26-column input row
 //
-// The aggregate carries a B-01c INPUT TARGET — a keep-list of the child
+// because the aggregate carries a B-01c INPUT TARGET — a keep-list of the child
 // columns it needs — computed against the child it was given, i.e. the
 // GATHER. Swapping in the Gather's child changes what "the input row" is,
 // and the stamped target no longer describes it, so the totality assertion
@@ -165,13 +184,34 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// planner.c:7351/:7704). The guard is then satisfied honestly rather
 	// than bypassed: there is genuinely no Gather left in the input, so the
 	// two-Gather hazard it protects against cannot arise.
-	// DISABLED pending the input-target fix — see the note above
-	// `gatherToUnwrapForPartialAgg`. Enabling this line is slice 2b's
-	// remaining work, and it is one line.
-	//
-	// if g, ok := gatherToUnwrapForPartialAgg(child); ok {
-	// 	child = g
-	// }
+	// STILL DISABLED — see the sharpened note above the helper. Clearing the
+	// spec's stamp (below) is NOT sufficient: the target is stamped POST-HOC
+	// on the emitted node, so the spec copy never reaches the assertion.
+	if g, ok := gatherToUnwrapForPartialAgg(child); ok && false {
+		child = g
+		// The aggregate's B-01c input target was derived against the child
+		// we just replaced (the Gather), so it is STALE IN PROVENANCE — not
+		// wrong in content, since a Gather is schema-preserving, but it no
+		// longer describes "the input row" the assertion checks against.
+		// Leaving it stamped panics `assertAggregateInputTargetCoversKeys`
+		// on TPC-H Q9/Q13.
+		//
+		// Clearing it is what the field's own contract prescribes: the
+		// target is "NEVER applied: no Project insertion, no schema change,
+		// no cost change — behaviour-neutral by construction ... read by
+		// nothing except assertAggregateInputTargetCoversKeys", and
+		// "InputTargetKnown false means unknown ... a clone that drops the
+		// stamp reads as unknown, THE SAFE DIRECTION" (plan.go).
+		//
+		// So this forfeits an assertion, not an optimisation, and forfeits
+		// it only on the arm whose child changed. A shallow copy keeps every
+		// other field (GroupExprs, Aggs, GroupingSets) shared, and the
+		// caller's own aggNode is left untouched for the other arms.
+		unwrapped := *aggNode
+		unwrapped.InputTarget = nil
+		unwrapped.InputTargetKnown = false
+		aggNode = &unwrapped
+	}
 	// The guard stays, and now MEANS something for both routes: after the
 	// unwrap above there is no Gather left, and on the post-pass route there
 	// never was one. Two Gathers would have every worker read the whole

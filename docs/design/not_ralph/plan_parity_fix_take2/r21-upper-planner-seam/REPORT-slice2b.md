@@ -88,9 +88,35 @@ Landing it disabled rather than reverting it keeps the design, the
 narrowness argument, and the measured result together with the one
 obstacle — instead of leaving the next round to re-derive all four.
 
-## 5. Next
+## 5. Second attempt, also measured, also wrong
 
-1. Re-derive the aggregate input target against the unwrapped child.
+§3 concluded the fix was to clear the stale stamp. **It was not**, and
+the correction matters more than the guess:
+
+Clearing the stamp on a copy of the aggregate spec produced **the same
+panic, unchanged**. The target is not carried on the spec the producer
+passes down — it is applied **post-hoc to the emitted node** by the
+caller, the same ordering `createWindowPlan`'s comment describes for
+windows (*"buildWindowStage stamps it on the emitted node after the
+producer returns"*). Clearing a spec the assertion never reads changes
+nothing.
+
+So the live question is narrower and different from both my guesses:
+**why does `deriveAggregateInputKeep` return an EMPTY keep marked
+KNOWN for the unwrapped shape?** The panic reports `[]` with
+`InputTargetKnown = true`, and `plan.go` is explicit that an empty list
+"is NOT the same as unknown". Either the derivation should return
+`ok = false` here — unknown, the safe direction — or it is failing to
+enumerate group inputs through the new child, and that is the bug.
+
+**The next attempt starts in `group_input_target.go`, not in the
+producer.** Both of my producer-side fixes were wrong, and each was
+found wrong by running it rather than by reasoning about it.
+
+## 6. Next
+
+1. Diagnose `deriveAggregateInputKeep`'s empty-but-known result for an
+   unwrapped-Gather child.
 2. Uncomment the call. Expect `aggregation-strategy` 14 → 10 with **22
    plans**, not 20.
 3. Values gates on both corpora — load-bearing here, since a mis-split

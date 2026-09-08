@@ -735,6 +735,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-09 Slice 2b attempt 2 also failed, measured: clearing the
+  agg spec's stamp changes nothing because the target is stamped
+  POST-HOC on the emitted node. Question narrowed to why
+  `deriveAggregateInputKeep` returns empty-but-KNOWN. Next attempt
+  starts in group_input_target.go, not the producer.
 - 2026-09-09 Slice 2b written and measured, landed DISABLED. The unwrap
   design supersedes DESIGN §9 (no partial Path needed — the partial
   plan is the Gather's child). K23's success test MET
