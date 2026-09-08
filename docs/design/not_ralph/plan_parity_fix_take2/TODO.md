@@ -282,6 +282,18 @@ failure/hang in background wastes the session — goal instruction).
   node); goopg flip ON plain `HashAggregate`. This is the entire
   `aggregation-strategy` 10 -> 14 move, and it is a WIRING gap, not a
   costing error.
+- **K24 (2026-09-08 — ONE root cause, two symptoms).** The upper
+  planner receives a **finished `Node`** from the join search, not the
+  join rel's paths. `partialaggupper.go`'s own header says it:
+  *"upstream seeds `partially_grouped_rel` from
+  `input_rel->partial_pathlist`, and the rel carrying `PartialPathlist`
+  DIES inside `planJoinlistSearch` before the aggregate stage runs"* —
+  the same seam `windowsetoppaths.go:19` names for pathkeys. So:
+  **K23** (no partial aggregation over the flip's Gather) needs the
+  join rel's `PartialPathlist`; **K12(B)** (sorted aggregate never wins
+  under a WindowAgg) needs its `Pathkeys`. Same fix, and they must NOT
+  be scheduled as independent rounds. This is the largest single item
+  in the workstream and the flip's true prerequisite.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -550,7 +562,25 @@ failure/hang in background wastes the session — goal instruction).
   a WIRING gap, not a costing error. R10 DESIGN §7's objection is
   DISCHARGED; recommendation is to fix R20 first so the flip is
   strictly toward PG.
-- [ ] **R20 — partial aggregation over the flip's Gather** (K23). The
+- [x] **R20 — located K23's cause exactly** — DONE 2026-09-08,
+  findings only. `r20-partial-agg-over-gather/FINDINGS.md`. One line:
+  `addPartialAggSplitPath` (`partialaggupper.go:92`) refuses when
+  `subtreeHasGather(child)` — a DELIBERATE coexistence guard (two
+  Gathers => every worker reads the whole relation, N+1 copies). Under
+  the flip the Gather is at the join level, so the guard fires. It
+  cannot simply be relaxed: PG never has a Gather below a partial
+  aggregate because it aggregates ON THE PARTIAL PATH first
+  (`planner.c:7351`) and gathers after (`:7704`); deleting the guard
+  would give a double-Gather, not PG's plan.
+  **K23 and K12(B) ARE THE SAME ROOT CAUSE** — see K24.
+- [ ] **R21 — the upper-planner seam** (K24, was two separate rounds).
+  Give the grouping and window stages the join rel's PATHS
+  (`PartialPathlist`, `Pathkeys`) instead of a finished `Node`.
+  Unblocks K23 and K12(B) together. Oracle:
+  `create_partial_grouping_paths` + `gather_grouping_paths`
+  (`planner.c:7351`, `:7704`) and `create_grouping_paths`' pathkey
+  handling. Largest single item in this workstream; the flip stays
+  reverted until it lands. The
   producer exists and is enabled; find why it does not fire under
   `generateUsefulGatherPaths`' placement. Confirm the candidate is
   GENERATED before theorising about cost
@@ -590,7 +620,7 @@ failure/hang in background wastes the session — goal instruction).
   each expected tree against PG rather than against the new output.
   Then land the flip and run R10 DESIGN §5's gates. Everything already
   known is in R10's report so it need not be re-derived.
-- [ ] **R21 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] ~~R22 — slice (B)~~ **MERGED INTO R21** (K24). Was: (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
@@ -623,6 +653,12 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R20 done: K23's cause is one guard —
+  `subtreeHasGather(child)` in `addPartialAggSplitPath` — and it is
+  deliberate, not an oversight; relaxing it gives a double-Gather, not
+  PG's plan. Crucially, K23 and K12(B) turn out to be the SAME root
+  cause (K24): the upper planner gets a finished Node instead of the
+  join rel's paths. Two rounds merged into one seam item (R21).
 - 2026-09-08 R19 done: the last unexplained objection to the flip is
   discharged. aggregation-strategy 10 -> 14 is four queries (Q5/Q9/Q12/
   Q19), each also LOSING a category, and the cause is that the flip's
