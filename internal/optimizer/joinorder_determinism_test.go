@@ -138,11 +138,38 @@ func planFingerprint(n Node) string {
 			if v.IsNil() {
 				return
 			}
+			// `reflect.Value.Interface` PANICS for a value read out of an
+			// unexported field, so the type probes below must be guarded
+			// (R21 slice 2a: `searchedTree.searchRel` is the first
+			// unexported POINTER the walk reaches — `searchPathkeys` is a
+			// slice and never took this branch). Unexported pointers are
+			// planner bookkeeping; printing their presence keeps the
+			// fingerprint sensitive to one appearing or vanishing without
+			// descending into it.
+			if !v.CanInterface() {
+				fmt.Fprintf(&b, "%s<unexported ptr present>\n", strings.Repeat(" ", depth))
+				return
+			}
 			// A *catalog.Table is a leaf: it is shared catalog state,
 			// not plan structure, and recursing into it would walk the
 			// whole schema on every scan.
 			if tbl, ok := v.Interface().(*catalog.Table); ok {
 				fmt.Fprintf(&b, "%stable=%s\n", strings.Repeat(" ", depth), tbl.Name)
+				return
+			}
+			// A *RelOptInfo is a leaf for the SAME reason (R21 slice 2a):
+			// `searchedTree` now carries the search's own upper rel so the
+			// upper stages can reach its PartialPathlist and Pathkeys, and
+			// that pointer is a gateway to the entire path graph — search
+			// bookkeeping, not plan structure. Recursing into it would walk
+			// every Path the search ever built, on every plan, and reach
+			// unexported fields reflect cannot Interface.
+			//
+			// Printing the pointer's presence rather than nothing keeps the
+			// fingerprint sensitive to the rel appearing or disappearing,
+			// which IS plan-relevant, without descending into it.
+			if _, ok := v.Interface().(*RelOptInfo); ok {
+				fmt.Fprintf(&b, "%ssearchRel=present\n", strings.Repeat(" ", depth))
 				return
 			}
 			if _, ok := v.Interface().(Node); ok && v.Kind() == reflect.Ptr {

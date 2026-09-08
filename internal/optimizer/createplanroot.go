@@ -171,12 +171,25 @@ func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (Schem
 // published schema cannot confirm truncates the list, and an empty list is the
 // pre-C-07 behaviour exactly. Nothing here can fail the plan.
 func stampSearchPathkeys(root Node, p *Path) Node {
-	if root == nil || p == nil || len(p.Pathkeys) == 0 {
+	if root == nil || p == nil {
 		return root
 	}
-	if s, ok := root.(searchRootNode); ok {
-		s.setSearchPathkeys(validatedSearchPathkeys(p.Pathkeys, root.Output()))
+	s, ok := root.(searchRootNode)
+	if !ok {
+		return root
 	}
+	// R21 slice 2a (plan-parity-fix-take2, K24): the winning path's own rel,
+	// stamped here because this is the one place the published root and the
+	// path that produced it are both in scope. Unlike the pathkeys below it
+	// is NOT conditional on `len(p.Pathkeys)` — a rel with no useful ordering
+	// still carries the `PartialPathlist` partial aggregation needs (K23).
+	//
+	// Slice 2a: carried only, read by nobody, so no plan can move.
+	s.setSearchRel(p.Rel)
+	if len(p.Pathkeys) == 0 {
+		return root
+	}
+	s.setSearchPathkeys(validatedSearchPathkeys(p.Pathkeys, root.Output()))
 	return root
 }
 

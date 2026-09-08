@@ -294,6 +294,17 @@ failure/hang in background wastes the session — goal instruction).
   under a WindowAgg) needs its `Pathkeys`. Same fix, and they must NOT
   be scheduled as independent rounds. This is the largest single item
   in the workstream and the flip's true prerequisite.
+- **K25 (2026-09-09).** `searchedTree` now carries a `*RelOptInfo`, so
+  **any generic/reflective plan walker has a path into the entire
+  search path graph**. `planFingerprint` (deliberately reflective)
+  descended into it and panicked on `reflect.Value.Interface` for
+  unexported fields. Two rules, both matching precedent already in that
+  file: treat `*RelOptInfo` as a LEAF (as `*catalog.Table` already is —
+  "not plan structure, recursing walks the whole schema"), and guard
+  `Interface()` with `CanInterface()` (`searchRel` is the first
+  unexported POINTER such walks reach; `searchPathkeys` is a slice and
+  never took that branch). Copying, serialisation and deep-equal will
+  hit this too.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -580,7 +591,18 @@ failure/hang in background wastes the session — goal instruction).
   discards it with an explicit `_` marking slices 2/3. Gate —
   **byte-identical plans on BOTH corpora** — passes; suites green.
   Nothing consumes it yet.
-  - [ ] **Slice 2a (plumbing)**: thread the rel
+  - [x] **Slice 2a (plumbing) LANDED** 2026-09-08/09
+    (`REPORT-slice2a.md`). **The §8 hop table was not needed**: the
+    codebase already solved this for `searchPathkeys` by carrying it on
+    the `searchedTree` TAG, with a comment saying threading would touch
+    fifteen signatures. `searchedTree` now carries
+    `searchRel *RelOptInfo`, stamped in `stampSearchPathkeys` (the one
+    site holding both the published root and its path). **Zero
+    signatures changed outside `searchedtree.go`/`createplanroot.go`.**
+    Gate: byte-identical plans BOTH corpora; suites green.
+    **K25**: a `*RelOptInfo` on a node is a gateway to the whole path
+    graph — every generic plan walker now needs a leaf rule for it.
+  - [ ] ~~Slice 2a (plumbing)~~ SUPERSEDED — was: thread the rel
     `tryPGShapedJoinSearch` -> `tryJoinSearch` -> `planSelectWithSettings`
     -> `createGroupingPaths` (which today takes NO rel) and on to
     `addPartialAggSplitPath`. Route crosses `planner.go`; the full hop
@@ -672,6 +694,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-09 R21 slice 2a LANDED, and cheaper than designed: the rel
+  rides the `searchedTree` tag (the pattern the codebase already uses
+  for `searchPathkeys`), so planner.go was never touched. Gate
+  byte-identical both corpora. Yielded K25 — a rel on a node is a
+  gateway to the path graph for every generic walker.
 - 2026-09-08 Slice 2 scoped, not started: the rel's route to the
   consumer crosses `planner.go` (`createGroupingPaths` takes no rel
   today). Hop table recorded in the design §8 and split into 2a

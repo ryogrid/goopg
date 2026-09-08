@@ -107,6 +107,31 @@ type searchedTree struct {
 	// `searchOneProblem` and `createOrderedPaths` — would touch fifteen
 	// signatures to carry a list that only one consumer reads.
 	searchPathkeys []PathKey
+
+	// searchRel is the `RelOptInfo` the winning path belonged to — the
+	// search's own upper rel, carried out instead of dying inside
+	// `planJoinlistSearch` (R21 slice 2a, plan-parity-fix-take2, K24).
+	//
+	// It is here for exactly the reason `searchPathkeys` is here, and the
+	// argument above applies verbatim: the seam publishes a Node, and
+	// threading a second return value from `searchOneProblem` to the upper
+	// stages would touch fifteen signatures across `planner.go` to carry one
+	// pointer that two consumers read.
+	//
+	// The two consumers, both currently blocked on not having it:
+	//   - `addPartialAggSplitPath` needs `PartialPathlist` so a partial
+	//     aggregate can be built BELOW a Gather, the way
+	//     `create_partial_grouping_paths` seeds `partially_grouped_rel` from
+	//     `input_rel->partial_pathlist` (planner.c:7351). Today it refuses on
+	//     `subtreeHasGather` and the flip loses PG's Partial/Finalize split
+	//     (K23).
+	//   - the grouping and window stages need `Pathlist`/`Pathkeys` so a path
+	//     delivering a required ordering is credited for it and a sorted
+	//     aggregate can win the contest PG's wins constantly (K12 slice B).
+	//
+	// Slice 2a only CARRIES it: no consumer reads it yet, so no plan can
+	// move, and that is the slice's gate.
+	searchRel *RelOptInfo
 }
 
 func (t *searchedTree) markFromJoinSearch()    { t.fromJoinSearch = true }
@@ -114,6 +139,11 @@ func (t *searchedTree) isFromJoinSearch() bool { return t.fromJoinSearch }
 
 func (t *searchedTree) setSearchPathkeys(keys []PathKey) { t.searchPathkeys = keys }
 func (t *searchedTree) searchedPathkeys() []PathKey      { return t.searchPathkeys }
+
+// setSearchRel / searchedRel carry the search's own upper rel on the tag
+// (R21 slice 2a). See searchedTree.searchRel for why it rides here.
+func (t *searchedTree) setSearchRel(rel *RelOptInfo) { t.searchRel = rel }
+func (t *searchedTree) searchedRel() *RelOptInfo     { return t.searchRel }
 
 // searchRootNode is the carrier interface. Embedding `searchedTree` in a node
 // type is the whole of implementing it.
@@ -123,6 +153,10 @@ type searchRootNode interface {
 	isFromJoinSearch() bool
 	setSearchPathkeys([]PathKey)
 	searchedPathkeys() []PathKey
+	// R21 slice 2a: the search's own upper rel, for the consumers named on
+	// searchedTree.searchRel.
+	setSearchRel(*RelOptInfo)
+	searchedRel() *RelOptInfo
 }
 
 // markSearchedTree tags n as the root of a subtree the PG-shaped join search
