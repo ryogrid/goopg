@@ -126,20 +126,24 @@ const partialAggSplitPathProducer = "upper.groupagg.split"
 // Verified this crash is MINE and not the flip's: R19 captured all 22 TPC-H
 // plans under `GOOPG_GATHER_PATHS=all` with no failure.
 func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
-	for depth := 0; n != nil && depth < 32; depth++ {
-		if g, ok := n.(*Gather); ok {
-			if g.Child == nil {
-				return nil, false
-			}
-			return g.Child, true
-		}
-		kids := boundaryWalkChildren(n)
-		if len(kids) != 1 {
-			return nil, false
-		}
-		n = kids[0]
+	// IMMEDIATE Gather only. The earlier version walked the boundary chain to
+	// find a Gather at any depth and returned its child — which DISCARDS
+	// everything between, and that is what broke TPC-H Q9/Q13: the aggregate
+	// groups on `l_year`, a COMPUTED column (`EXTRACT(year FROM ...)`)
+	// produced by a Project above the Gather. Dropping to the Gather's child
+	// drops the Project, so no column named `l_year` exists in the new input
+	// row, `deriveAggregateInputKeep` matches nothing by name, and the keep
+	// comes back EMPTY-but-known.
+	//
+	// The derivation was right and my helper was wrong: it was silently
+	// changing what the aggregate's input row contains, not merely removing a
+	// Gather. Only a Gather sitting DIRECTLY under the aggregate can be
+	// unwrapped without changing the input row's columns.
+	g, ok := n.(*Gather)
+	if !ok || g.Child == nil {
+		return nil, false
 	}
-	return nil, false
+	return g.Child, true
 }
 
 func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
@@ -184,10 +188,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// planner.c:7351/:7704). The guard is then satisfied honestly rather
 	// than bypassed: there is genuinely no Gather left in the input, so the
 	// two-Gather hazard it protects against cannot arise.
-	// STILL DISABLED — see the sharpened note above the helper. Clearing the
-	// spec's stamp (below) is NOT sufficient: the target is stamped POST-HOC
-	// on the emitted node, so the spec copy never reaches the assertion.
-	if g, ok := gatherToUnwrapForPartialAgg(child); ok && false {
+	if g, ok := gatherToUnwrapForPartialAgg(child); ok {
 		child = g
 		// The aggregate's B-01c input target was derived against the child
 		// we just replaced (the Gather), so it is STALE IN PROVENANCE — not

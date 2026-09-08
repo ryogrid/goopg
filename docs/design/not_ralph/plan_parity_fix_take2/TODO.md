@@ -735,6 +735,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-09 Slice 2b attempt 3: diagnosis COMPLETE. The derivation was
+  correct; my helper discarded the Project computing the group key.
+  Narrow (immediate-Gather) form is sound but inert. Correct fix
+  identified: splice the Gather out of the chain rather than descend to
+  its child. Landed narrow+enabled (safe), gated byte-identical.
 - 2026-09-09 Slice 2b attempt 2 also failed, measured: clearing the
   agg spec's stamp changes nothing because the target is stamped
   POST-HOC on the emitted node. Question narrowed to why

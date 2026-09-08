@@ -113,10 +113,43 @@ enumerate group inputs through the new child, and that is the bug.
 producer.** Both of my producer-side fixes were wrong, and each was
 found wrong by running it rather than by reasoning about it.
 
-## 6. Next
+## 6. Third attempt — the diagnosis completes, and it was my helper
 
-1. Diagnose `deriveAggregateInputKeep`'s empty-but-known result for an
-   unwrapped-Gather child.
+`deriveAggregateInputKeep` was **right**. It matches child columns to
+group inputs **by name**, and TPC-H Q9 groups on `l_year` — a COMPUTED
+column (`EXTRACT(year FROM ...)`) produced by a `Project` **above** the
+Gather.
+
+My helper walked the boundary chain to find a Gather at any depth and
+returned *its child*, which **discards every node in between** —
+including that Project. So no column named `l_year` existed in the new
+input row, nothing matched, and the keep came back empty-but-known. The
+derivation reported exactly what it found.
+
+I had been looking for the bug in the derivation because the panic
+pointed there. It was in the code I wrote, one frame up.
+
+Narrowed to an **immediate** Gather only and measured under the flip:
+all 22 TPC-H plans build, `unparsed=0`, no crash — and
+`aggregation-strategy` stays at **14**. So the narrow form is **sound
+but inert**: the search's Gather always sits behind a Project, never
+directly under the aggregate.
+
+### The correct fix, now identified
+
+Do not descend to the Gather's child. **Splice the Gather out of the
+chain**, keeping every wrapper between it and the aggregate:
+`Project(Gather(X))` → `Project(X)`. A Gather is schema-preserving, so
+removing only that level leaves the input row's columns — `l_year`
+included — exactly as they were, which is what the name-matched
+derivation needs.
+
+That needs one piece of machinery this attempt lacked: cloning the
+wrapper nodes with a new child.
+
+## 7. Next
+
+1. Splice, don't descend (§6).
 2. Uncomment the call. Expect `aggregation-strategy` 14 → 10 with **22
    plans**, not 20.
 3. Values gates on both corpora — load-bearing here, since a mis-split
