@@ -70,6 +70,59 @@ const partialAggSplitPathProducer = "upper.groupagg.split"
 // Every refusal below is fail-CLOSED, in `considerparallel.go`'s house style: a
 // missing fact means no candidate, never an optimistic one. The order is the
 // cheapest test first.
+// gatherToUnwrapForPartialAgg returns the child of a Gather that the SEARCH
+// placed directly under the aggregate's input, so a partial aggregate can be
+// built below it (R21 slice 2b, K23).
+//
+// Deliberately narrow, because breadth here would be unsound:
+//
+//   - only a Gather reached through the boundary chain's single-child
+//     wrappers is unwrapped. A Gather buried under a join is another rel's
+//     parallelism and is none of this producer's business;
+//   - `*GatherMerge` is NOT unwrapped. It carries an ordering its consumer
+//     may depend on, and dropping it would silently lose that ordering —
+//     the class of change that returns wrong-ordered rows rather than an
+//     error. A GatherMerge input keeps today's refusal.
+//
+// Returns (child, true) only when the unwrap is safe.
+//
+// NOT YET WIRED IN. Enabling the unwrap crashes TPC-H Q9 and Q13 under the
+// flip:
+//
+//	createPlan: Aggregate input target [] drops group-input column "l_year"
+//	of a 26-column input row
+//
+// The aggregate carries a B-01c INPUT TARGET — a keep-list of the child
+// columns it needs — computed against the child it was given, i.e. the
+// GATHER. Swapping in the Gather's child changes what "the input row" is,
+// and the stamped target no longer describes it, so the totality assertion
+// fires (correctly).
+//
+// A Gather is schema-preserving, so the target is not wrong in CONTENT; it
+// is stale in PROVENANCE. The fix is therefore to re-derive the aggregate's
+// input target against the unwrapped child (`stampAggInputTarget`'s path)
+// after the swap, not to weaken the assertion — which is load-bearing:
+// dropping a group-input column silently changes GROUP BY semantics.
+//
+// Verified this crash is MINE and not the flip's: R19 captured all 22 TPC-H
+// plans under `GOOPG_GATHER_PATHS=all` with no failure.
+func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
+	for depth := 0; n != nil && depth < 32; depth++ {
+		if g, ok := n.(*Gather); ok {
+			if g.Child == nil {
+				return nil, false
+			}
+			return g.Child, true
+		}
+		kids := boundaryWalkChildren(n)
+		if len(kids) != 1 {
+			return nil, false
+		}
+		n = kids[0]
+	}
+	return nil, false
+}
+
 func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
 	if partialAggPathsMode != partialAggPathsOn {
 		return nil
@@ -89,18 +142,40 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// than a post-pass stand-down), and must have a driving scan — without one
 	// every worker reads the whole relation and the Gather returns N+1 copies
 	// of every row (`createplangather.go`'s file header).
-	// R21 slice 2b (K23) resumes HERE, and its prerequisite is measured, not
-	// assumed: with GOOPG_GATHER_PATHS=all, `searchedRelOf(child)` returns a
-	// non-nil rel carrying a NON-EMPTY `PartialPathlist` (probed on TPC-H:
-	// `rel=true partialPaths=1 hasGather=true`). So the partial path PG's
-	// `create_partial_grouping_paths` seeds `partially_grouped_rel` from
-	// (planner.c:7351) IS reachable from this site; the refusal below is the
-	// only thing standing between it and PG's Partial/Finalize shape.
+	// R21 slice 2b (K23): UNWRAP a Gather the search already placed, rather
+	// than refusing because of it.
 	//
-	// The guard stays for the post-pass route, which genuinely needs it — two
-	// Gathers means every worker reads the whole relation and N+1 copies come
-	// back. Slice 2b adds an arm BEFORE it that builds below the Gather
-	// instead of above, so it never reaches this test.
+	// Under `GOOPG_GATHER_PATHS=all` the search puts a Gather at the join
+	// level, so `child` contains one, so the guard below refused and goopg
+	// lost the `Partial`/`Finalize` split it emits without the flip — the
+	// whole of `aggregation-strategy` 10 -> 14.
+	//
+	// The fix does not need a partial PATH, and that is this file's own
+	// point (blocker 1 above): "goopg does not need a distinct partial PLAN.
+	// `gatherOp.runWorker` builds each worker's own copy of the Gather's
+	// child subtree ... so the partial plan IS the serial subtree". So the
+	// partial input is simply the Gather's CHILD — a node that already
+	// exists, in the coordinate space the aggregate above already consumes.
+	// Nothing is rebuilt from a Path, so there is no coordinate translation
+	// and no boundary-map hole to fall into.
+	//
+	// Having unwrapped, the EXISTING arm below builds
+	// `partial agg -> Gather -> finalise` over it, which is PG's shape
+	// (`create_partial_grouping_paths` + `gather_grouping_paths`,
+	// planner.c:7351/:7704). The guard is then satisfied honestly rather
+	// than bypassed: there is genuinely no Gather left in the input, so the
+	// two-Gather hazard it protects against cannot arise.
+	// DISABLED pending the input-target fix — see the note above
+	// `gatherToUnwrapForPartialAgg`. Enabling this line is slice 2b's
+	// remaining work, and it is one line.
+	//
+	// if g, ok := gatherToUnwrapForPartialAgg(child); ok {
+	// 	child = g
+	// }
+	// The guard stays, and now MEANS something for both routes: after the
+	// unwrap above there is no Gather left, and on the post-pass route there
+	// never was one. Two Gathers would have every worker read the whole
+	// relation and return N+1 copies of every row.
 	if subtreeHasUnsafeNode(child) || subtreeHasGather(child) || drivingScan(child) == nil {
 		return nil
 	}

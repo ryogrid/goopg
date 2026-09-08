@@ -619,7 +619,26 @@ failure/hang in background wastes the session — goal instruction).
     hasGather=true`** — the partial path exists and is reachable, so
     K23 is blocked on nothing unknown. The refusal site carries this
     measurement in a comment.
-  - [ ] **Slice 2b (K23 behaviour)** — FULLY SPECIFIED, see DESIGN §9.
+  - [~] **Slice 2b (K23 behaviour)** — WRITTEN, MEASURED, NOT ENABLED
+    2026-09-09 (`REPORT-slice2b.md`). **DESIGN §9's plan was wrong**:
+    no partial PATH is needed. This file's own blocker-1 note says the
+    partial plan IS the Gather's child subtree, so slice 2b is an
+    UNWRAP of an existing node — no `createPlanNode`, no coordinate
+    translation, no boundary-map hole. `gatherToUnwrapForPartialAgg`
+    is committed (narrow: boundary-chain Gather only, never
+    `*GatherMerge`, which carries an ordering) with its call site
+    COMMENTED OUT.
+    **Measured enabled: `aggregation-strategy` 14 -> 10 — K23's
+    success test MET** — but TPC-H Q9/Q13 crash:
+    `Aggregate input target [] drops group-input column "l_year"`.
+    The aggregate's B-01c input target was derived against the GATHER;
+    after the swap it is stale in provenance (a Gather is
+    schema-preserving, so not wrong in content). **Do not weaken the
+    assertion** — dropping a group-input column silently changes GROUP
+    BY. Fix: re-derive the target against the unwrapped child
+    (`stampAggInputTarget`'s path), then uncomment one line.
+    Crash verified MINE, not the flip's (R19 captured all 22 under the
+    flip cleanly). ORIGINAL: see DESIGN §9.
     Site: new arm in `addPartialAggSplitPath` before the guard. Seed
     from `searchedRelOf(child).PartialPathlist[0]` (PG's
     `cheapest_partial_path`, planner.c:7452) instead of
@@ -716,6 +735,11 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-09 Slice 2b written and measured, landed DISABLED. The unwrap
+  design supersedes DESIGN §9 (no partial Path needed — the partial
+  plan is the Gather's child). K23's success test MET
+  (aggregation-strategy 14 -> 10) but 2 queries crash on a stale
+  aggregate input target; fix named, assertion kept.
 - 2026-09-09 Slice 2b fully specified (DESIGN §9) but NOT implemented:
   site, seed, existing shape to reuse, and the double-divisor trap all
   recorded. Stopped short of the construction deliberately — a
