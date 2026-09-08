@@ -188,6 +188,22 @@ failure/hang in background wastes the session — goal instruction).
   label appears, the premise held; if it stays `Hash Join`, the path is
   not parallel-aware and that is the finding. Do NOT assume it
   (K11a/K11b/K14-numeric were all assumed and all wrong).
+- **K16 (measured 2026-09-08 — supersedes K15; a MECHANISM difference,
+  not a label).** After threading `Path.ParallelAware` onto
+  `optimizer.Join` and rendering PG's prefix, goopg still emits
+  `Parallel Hash Join` **0** times (PG: 9 TPC-H, 139 TPC-DS). The flag
+  is genuinely false for every hash join goopg plans — checked at the
+  right site (`createplanjoin.go:551`, the one holding
+  `assertParallelAwareJoinIsRunnable`; three Join construction sites
+  exist, so patching one of three would have faked this zero).
+  **goopg parallelises by STAMPING a Gather over a serial subtree
+  (`stampParallelScan`, `createplangather.go:112`, a copy-on-write walk
+  over an already-built tree); PG parallelises by building PARTIAL
+  PATHS and letting them win.** That is what `parallelism=18` on TPC-H
+  really is. Next step per
+  [[planner_verify_both_candidates_generated]]: instrument `addPath` to
+  learn whether `addPartialHashJoinPath` is never called, called and
+  declined, or called and outcompeted — three different fixes.
 - **K4 (rev-1 error pattern, from §6).** Never conclude from a file
   without checking its callers (`pathgen.go`/`generateScanPaths` is
   test-only; production seed is `newPrebuiltPath`). Every design must
@@ -311,38 +327,47 @@ failure/hang in background wastes the session — goal instruction).
   — **all four advance predictions held, including the negative one**.
   Values green on both. The residual 13-vs-6 is now a MEASUREMENT of
   what slice (B) is worth; it was unobservable before.
-- [ ] **R7 — carry parallel-awareness onto the plan node** (K15).
+- [x] **R7 — carry parallel-awareness onto the plan node** (K15) —
+  DONE 2026-09-08. `r7-parallel-aware-label/REPORT.md`. Plumbing landed
+  and is correct; **the premise was FALSIFIED by the measurement it was
+  designed to make** — goopg emits `Parallel Hash Join` ZERO times on
+  either corpus (PG: 9 on TPC-H, 139 on TPC-DS). No parity movement.
+  See K16 for what the category actually is. ORIGINAL SCOPE:
   Add the field to `optimizer.Join`, set it from `Path.ParallelAware`
   in `createplanjoin.go`, and render `Parallel Hash Join` as PG does.
   Accurate rather than cosmetic — goopg really does build the hash
   cooperatively. Cheapest identified round with a concrete target
   (Q14 -> MATCH would be +1 on TPC-H) and it is self-verifying.
   Same class as R2's `WindowAgg` label fix.
-- [ ] **R8 — slice (B): let a node below satisfy the ordering** (K12
+- [ ] **R8 — why no partial hash-join path ever wins** (K16). Three
+  candidate causes, one instrumentation step to distinguish them. This
+  is TPC-H's joint-top divergence category and it is a mechanism gap,
+  not a label.
+- [ ] **R9 — slice (B): let a node below satisfy the ordering** (K12
   remainder, LARGEST identified lever). Convert HashAggregate to
   GroupAggregate where the order is owed anyway. Needs the upper
   planner to compare paths by PATHKEYS; today `createWindowPaths` takes
   a finished Node and `windowsetoppaths.go:19` records that above the
   search seam inputs carry no pathkeys. Architectural.
-- [ ] **R9 — heap page fill on bulk load** (K14 remainder). goopg
+- [ ] **R10 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R10 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R11 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
-- [ ] **R11 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R12 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R12 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R13 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R13 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R14 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R14 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R15 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -351,6 +376,14 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R7 done: parallel-awareness plumbed onto the plan node and
+  PG's generic prefix rendered. Premise FALSIFIED as the design said it
+  would be if the label did not appear — goopg emits Parallel Hash Join
+  0 times on either corpus. K15 corrected to K16: goopg parallelises by
+  STAMPING a Gather over a serial subtree, PG by building partial paths
+  and letting them win. No parity movement; values green both. Fifth
+  falsified hypothesis, and the second in a row killed by the check it
+  asked for rather than surviving as an assertion.
 - 2026-09-08 K15 recorded (investigation, no code): with the corpus
   fully parsed, `parallelism` is TPC-H's top divergence category (18)
   and Q14 differs on it ALONE. goopg has a cooperative parallel hash

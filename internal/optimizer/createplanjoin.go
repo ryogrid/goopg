@@ -576,6 +576,11 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		OuterRows: p.Children[0].Rows,
 		InnerRows: p.Children[1].Rows,
 	}
+	// R7 (plan-parity-fix-take2): the flag is read ONCE, here, for both of
+	// its purposes — the fail-closed assertion below and the node's own
+	// record of it, which is what lets EXPLAIN print PG's "Parallel "
+	// prefix. Before this the fact died at plan construction.
+	j.ParallelAware = p.ParallelAware
 	assertParallelAwareJoinIsRunnable(p, j)
 	return j, in.publishedLayout(jt)
 }

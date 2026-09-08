@@ -1102,6 +1102,21 @@ type Join struct {
 	Left      Node
 	Right     Node
 	Predicate Expr
+
+	// ParallelAware is PG's `Plan.parallel_aware` for this node: the join
+	// participates in parallelism itself rather than merely sitting under a
+	// Gather. It exists so EXPLAIN can print PG's "Parallel " prefix
+	// (explain.c:1630, a generic per-node rule goopg already applies to
+	// SeqScan) — goopg really does build the hash cooperatively
+	// (executor/parallel_hash_build.go), so the label states a fact.
+	//
+	// The EXECUTOR does not read this field: it derives parallel behaviour by
+	// walking the built tree (`HasShareableHashJoin`, `attachParallelScan`).
+	// That is why the field can be added without touching execution, and why
+	// `assertParallelAwareJoinIsRunnable` must keep firing — it remains the
+	// only boundary check between the planner's claim and the executor's own
+	// predicate. R7 (plan-parity-fix-take2).
+	ParallelAware bool
 	LeftKey   Expr // populated when Algo == JoinAlgoHash
 	RightKey  Expr
 	// HashKeys holds EVERY usable equi-pair of this join, not just the

@@ -2417,6 +2417,15 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		if p.Algo == optimizer.JoinAlgoMerge {
 			algo = "Merge"
 		}
+		// R7 (plan-parity-fix-take2): PG's prefix is a single generic rule
+		// over any node with `parallel_aware` set (explain.c:1630), NOT a
+		// hash-join special case — which is why the *optimizer.SeqScan arm
+		// below already applies the same prefix from its own flag. goopg
+		// builds the hash cooperatively (executor/parallel_hash_build.go),
+		// so this states a fact about the node rather than dressing it up.
+		if p.ParallelAware {
+			return "Parallel " + joinLabel(algo, p.Type)
+		}
 		return joinLabel(algo, p.Type)
 	case *optimizer.Gather:
 		return "Gather"
