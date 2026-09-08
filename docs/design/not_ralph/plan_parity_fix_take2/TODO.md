@@ -104,10 +104,17 @@ failure/hang in background wastes the session — goal instruction).
   subject** (the K5 discipline, applied to data).
 - **K11 (adjudicated 2026-09-08, four systematic causes).** From
   reading 10 plan pairs by hand:
-  (a) **goopg's planner never sets `AggStrategySorted`** — its own
-  renderer comment says so (`operators_explain.go`); PG chooses
-  `GroupAggregate` constantly (TPC-DS Q12/Q81, TPC-H Q1), so every such
-  query is unmatchable today;
+  (a) ~~goopg's planner never sets `AggStrategySorted`~~ **WRONG —
+  corrected by R3 §0.** The planner DOES set it, and
+  `addGroupingPaths` builds a plain Sort-then-GroupAggregate candidate
+  on every grouped query; the `operators_explain.go` comment saying
+  otherwise is stale. The real fact is a COSTING inversion: over
+  TPC-DS goopg emits `GroupAggregate` 1x / `HashAggregate` 133x where
+  PG emits 100x / 29x, because `costAgg` has **no spill arm** and so
+  prices the hash table as if memory were infinite (its own comment
+  says so). Cause, not symptom, is R3. **Error class: believing a
+  comment about what the code does instead of checking — same class as
+  the root-causes rev-1 error, see K4.**
   (b) **worker count is not computed** — goopg always plans 4, PG
   derives it from relation size (`compute_parallel_worker`, log-scale):
   3 on DS Q96/Q38, 2 on TPC-H Q19;
@@ -194,12 +201,16 @@ failure/hang in background wastes the session — goal instruction).
   the goal's success condition is unmeasurable. Gate: the tool's own
   test (`scripts/pg-plan-parity-diff-test.py`) plus a hand-adjudicated
   sample of at least 5 reclassified queries per corpus.
-- [ ] **R3 — reachable sorted aggregation** (K11a, NEW, highest value).
-  goopg's planner never sets `AggStrategySorted`, so `GroupAggregate`
-  is unreachable and every query where PG sorts-then-groups is
-  unmatchable. PG's oracle: `create_grouping_paths` /
-  `add_paths_to_grouping_rel` cost BOTH strategies and let addPath
-  choose. Blocks TPC-H Q1 and a large share of TPC-DS.
+- [ ] **R3 — the memory-blind HashAggregate** (K11a as corrected;
+  design `r3-hashagg-spill/DESIGN.md`). `costAgg` has no spill arm, so
+  the hashed candidate is priced as if memory were infinite and beats
+  its sorted rival (which always pays a Sort) on every large grouping —
+  exactly the population where PG spills and picks `GroupAggregate`.
+  Transcribe PG's arm (`costsize.c:2783-2840`, `hash_agg_entry_size` /
+  `hash_agg_set_limits`). It is provably INERT below the memory
+  threshold, so small groupings cannot move. Re-opens a standing
+  objection whose timing leg the goal rule voids and whose parity leg
+  was measured against the invalid references (K9/K10).
 - [ ] **R4 — compute the worker count** (K11b). PG's
   `compute_parallel_worker` (allpaths.c) derives workers from relation
   size on a log scale; goopg always plans 4. Cheap, well-defined, and
