@@ -1,0 +1,16 @@
+# arm=before-r1 sha=c8139df1e2c9a785
+before-r1 discard 91.575882630
+before-r1 m1 82.582217094
+before-r1 m2 85.475402165
+# arm=after-r1 sha=7b533969a9972891
+after-r1 discard 85.744781512
+after-r1 m1 85.440795116
+after-r1 m2 82.295167671
+# arm=before-r2 sha=c8139df1e2c9a785
+before-r2 discard 87.422421511
+before-r2 m1 83.044480600
+before-r2 m2 86.152256491
+# arm=after-r2 sha=7b533969a9972891
+after-r2 discard 85.230983941
+after-r2 m1 87.868653168
+after-r2 m2 86.178068310
