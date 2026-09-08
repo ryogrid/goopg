@@ -185,8 +185,30 @@ func TestCreateWindowPathsEmitsTheSameChainOverTheSameInput(t *testing.T) {
 	if len(inner.Funcs) != len(w1.Funcs) {
 		t.Fatal("inner window spec was not carried across")
 	}
-	if inner.Child != Node(in) {
-		t.Fatalf("bottom child is %T/%p, want the pre-producer input %p — the producer introduced a node", inner.Child, inner.Child, in)
+	// R6 (plan-parity-fix-take2): the producer now stacks the Sort PG's
+	// `create_one_window_path` stacks, so the bottom window's child is that
+	// Sort rather than the input directly. The invariant this walk exists to
+	// protect is unchanged and still checked one level down — the producer
+	// must carry the pre-producer input through by IDENTITY, never substitute
+	// or rebuild it. Only the depth moved.
+	bottomSort, ok := inner.Child.(*Sort)
+	if !ok {
+		t.Fatalf("bottom child is %T, want the *Sort the window producer stacks", inner.Child)
+	}
+	if bottomSort.Child != Node(in) {
+		t.Fatalf("under the Sort the child is %T/%p, want the pre-producer input %p — the producer substituted a node",
+			bottomSort.Child, bottomSort.Child, in)
+	}
+	// The Sort must be the window's OWN ordering, not an arbitrary one.
+	if want := windowSortKeys(w1); !sortKeysEqual(bottomSort.Keys, want) {
+		t.Fatalf("stacked Sort keys %v do not match the window's PARTITION BY ++ ORDER BY %v",
+			bottomSort.Keys, want)
+	}
+	// And exactly ONE sort for the chain: the upper window shares the
+	// ordering, so it must not re-sort (PG's pathkeys-already-satisfied
+	// rule). Asserted by the `inner` type check above plus this flag.
+	if !outer.Presorted || !inner.Presorted {
+		t.Fatal("both windows must be marked Presorted; the executor would sort a second time")
 	}
 }
 

@@ -284,25 +284,39 @@ failure/hang in background wastes the session — goal instruction).
   9 probe tables on both engines: everything matches EXCEPT
   `character(N)`, which PG blank-pads and goopg does not. `numeric`
   falsified. Fact-table gap reassigned to page fill.
-- [ ] **R6 — heap page fill on bulk load** (K14 remainder). goopg
+- [x] **R6 — the window's Sort belongs in the plan** (K12 slice A) —
+  DONE 2026-09-08. `r6-window-sort/REPORT.md`. Planner stacks PG's
+  `create_one_window_path` Sort; executor honours a fail-closed
+  `Presorted` flag. TPC-DS gains 13 Sorts below WindowAgg (PG has 6);
+  `GroupAggregate` unchanged at 13 and parity unchanged on both corpora
+  — **all four advance predictions held, including the negative one**.
+  Values green on both. The residual 13-vs-6 is now a MEASUREMENT of
+  what slice (B) is worth; it was unobservable before.
+- [ ] **R7 — slice (B): let a node below satisfy the ordering** (K12
+  remainder, LARGEST identified lever). Convert HashAggregate to
+  GroupAggregate where the order is owed anyway. Needs the upper
+  planner to compare paths by PATHKEYS; today `createWindowPaths` takes
+  a finished Node and `windowsetoppaths.go:19` records that above the
+  search seam inputs carry no pathkeys. Architectural.
+- [ ] **R8 — heap page fill on bulk load** (K14 remainder). goopg
   leaves ~21.9 bytes/row of free space PG does not (~15% on
   `store_sales`). Compare free space per page directly on both engines
   — do NOT infer from totals again. On-disk question, not planner.
-- [ ] **R7 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+- [ ] **R9 — `character(N)` blank-padding** (R5 §2.1). An on-disk
   PG-compat defect in its own right; shifts `relpages` on every
   `bpchar` table.
-- [ ] **R8 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
+- [ ] **R10 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`),
   now with K6's evidence: the winning scans in these plans are PREBUILT
   leaves priced by `costSeqscan` with `numQualOps = 0`, so R1's charge
   never reached them. Fixing this is the precondition for testing
   DESIGN §5's suspect #1.
   Give index leaves their qual charge instead of `numQualOps = 0`.
-- [ ] **R9 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
+- [ ] **R11 — unconditional plain-index-scan arm** (§7.3). Drop/relax the
   `hasUsefulPathkeys` gate so a plain index path is always a candidate.
-- [ ] **R10 — persist correlation** (§7.4). Connection-scoped ANALYZE
+- [ ] **R12 — persist correlation** (§7.4). Connection-scoped ANALYZE
   loses correlation across restart → `corr = 0` → every index scan at
   `max_IO_cost` (`costindex.go:407-420`).
-- [ ] **R11 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+- [ ] **R13 — re-measure the ONEREL flip.** E-21 Cut 1b routes
   single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
   (default OFF, deliberately — removing the rule chooser made plans
   worse under the §3 asymmetry). After R1/R2 change the prices, re-run
@@ -311,6 +325,14 @@ failure/hang in background wastes the session — goal instruction).
 
 ## Log
 
+- 2026-09-08 R6 done: window Sort moved from executor into the plan
+  (PG's create_one_window_path shape) behind a fail-closed Presorted
+  flag. 13 Sorts appear below WindowAgg on TPC-DS (PG: 6);
+  GroupAggregate unchanged at 13, parity unchanged, values green both.
+  All four advance predictions held. An existing pointer-walk test
+  caught an over-eager first cut that sorted before EVERY window —
+  PG only sorts when the ordering is not already satisfied. The 13-vs-6
+  residual now quantifies slice (B), which becomes R7.
 - 2026-09-08 R5 done (findings only): 9 probe tables, both engines.
   `character(N)` padding CONFIRMED divergent; `numeric` FALSIFIED
   (matches exactly across column counts, digit counts, NULLs). The

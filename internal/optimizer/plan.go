@@ -1412,6 +1412,20 @@ type WindowAgg struct {
 	PartitionBy []Expr
 	OrderBy     []SortKey
 	Funcs       []WindowFunc
+	// Presorted says the plan has ALREADY ordered this node's input by
+	// PartitionBy ++ OrderBy, so `windowOp` must not sort again.
+	//
+	// R6 (plan-parity-fix-take2): PG's `nodeWindowAgg` assumes sorted input
+	// and `create_one_window_path` (planner.c:4620) stacks the Sort above
+	// it; goopg's executor sorted privately instead, which hid the ordering
+	// requirement from the planner entirely (K12) and materialised the whole
+	// input. `createWindowPlan` now emits the Sort as a real plan node and
+	// sets this flag.
+	//
+	// FAIL-CLOSED: the zero value is false, so any WindowAgg built by a path
+	// that did NOT stack a Sort — a hand-built node, an older producer —
+	// still sorts internally and stays correct.
+	Presorted bool
 	// Frame is the resolved window frame clause shared by every
 	// func in this node (nil when no explicit frame clause was
 	// written — the executor's default frame applies). The analyzer

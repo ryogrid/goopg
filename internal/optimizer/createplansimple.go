@@ -287,8 +287,98 @@ func createWindowPlan(p *Path) (Node, outputLayout) {
 		panic("createPlan: PathWindow over a child path that built no node")
 	}
 	out := *p.Window
+	// R6 (plan-parity-fix-take2): stack the Sort PG's
+	// `create_one_window_path` (planner.c:4620) stacks, instead of leaving
+	// the executor to sort privately. Three things this buys, in the order
+	// they matter to plan parity: the plan text gains the `Sort` PG shows;
+	// the whole-input materialisation `windowOp` performed goes away; and —
+	// the point of K12 — the ordering requirement becomes visible to the
+	// planner, so a node below can eventually be credited for satisfying it
+	// rather than every window silently paying for its own sort.
+	//
+	// `costWindow` already prices this sort (windowsetoppaths.go), so the
+	// node is made to EXIST for a cost that was already being charged; no
+	// new cost is introduced here. The window rel has a single candidate,
+	// so nothing is being re-selected either.
+	if keys := windowSortKeys(p.Window); len(keys) > 0 {
+		if childDeliversSortKeys(child, keys) {
+			// The order is already there. PG only stacks a Sort when the
+			// required pathkeys are not already satisfied
+			// (`create_one_window_path`), which is precisely the case of a
+			// window chain whose consecutive specs share an ordering: the
+			// lower WindowAgg emits its input's order untouched, so a second
+			// sort would be both a wasted node and a plan PG never prints.
+			out.Presorted = true
+		} else {
+			child = &Sort{Child: child, Keys: keys}
+			out.Presorted = true
+		}
+	}
 	out.Child = child
 	return &out, nil
+}
+
+// windowSortKeys is the ordering `nodeWindowAgg` requires: PARTITION BY
+// first, then ORDER BY, which is exactly the comparison order `windowOp`
+// applied internally (operators_window.go) and the order
+// `create_one_window_path` builds its pathkeys in. Partition columns carry
+// no direction of their own — PG sorts them ascending — so they are emitted
+// with the zero-value SortKey direction, matching what the executor's
+// comparator did for them.
+// childDeliversSortKeys reports whether `child` already emits rows in `keys`
+// order, so no Sort need be stacked (PG's "pathkeys already satisfied" test).
+//
+// Two shapes qualify, and deliberately no others — an unknown node is assumed
+// UNORDERED, which costs at most a redundant Sort and can never produce wrong
+// results:
+//
+//   - a `*Sort` on exactly these keys (the node this function's caller just
+//     built one level down);
+//   - a `*WindowAgg` that is itself ordered on exactly these keys — a
+//     WindowAgg appends columns and preserves its input's row order, so a
+//     chain of window specs sharing one ordering sorts once, as PG does.
+func childDeliversSortKeys(child Node, keys []SortKey) bool {
+	switch c := child.(type) {
+	case *Sort:
+		return sortKeysEqual(c.Keys, keys)
+	case *WindowAgg:
+		// Only if the lower window is itself known-ordered on those keys.
+		return c.Presorted && sortKeysEqual(windowSortKeys(c), keys)
+	}
+	return false
+}
+
+// sortKeysEqual compares two key lists by expression identity and direction.
+// Conservative: anything `exprEqual` cannot prove equal counts as different,
+// which fails toward stacking a Sort.
+func sortKeysEqual(a, b []SortKey) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Desc != b[i].Desc || a[i].NullsFirst != b[i].NullsFirst {
+			return false
+		}
+		if !exprEqual(a[i].Expr, b[i].Expr) {
+			return false
+		}
+	}
+	return true
+}
+
+func windowSortKeys(w *WindowAgg) []SortKey {
+	if w == nil {
+		return nil
+	}
+	if len(w.PartitionBy) == 0 && len(w.OrderBy) == 0 {
+		return nil
+	}
+	keys := make([]SortKey, 0, len(w.PartitionBy)+len(w.OrderBy))
+	for _, pe := range w.PartitionBy {
+		keys = append(keys, SortKey{Expr: pe})
+	}
+	keys = append(keys, w.OrderBy...)
+	return keys
 }
 
 // createSetOpPlan is the PathSetOp arm (C-18): emit the path's set-operation
